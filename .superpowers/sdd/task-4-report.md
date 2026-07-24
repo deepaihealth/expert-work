@@ -1,88 +1,42 @@
-# Task 4 报告:迁移 0132 存量孤儿 role_binding 清理
+# Task 4 Report: trigger / webhook 删除端点接线(纯接线)
 
-## 状态:完成
+**STATUS**: DONE
 
-## worktree / 分支
+**Commit**: `05c605ab feat(control-plane): trigger/webhook 删除级联投递行(接线既有 delete_for_* 方法)`(worktree 分支 `worktree-agent-a523a219169424791`,基于 `333a541c` = fix-deletion-hygiene-pr3 tip,`git merge --ff-only` 同步成功)
 
-- worktree 路径:`/Users/mac/src/github/jone_qian/expert-work/.claude/worktrees/agent-a1230d7d38323ea69`
-- 分支:`worktree-agent-a1230d7d38323ea69`(本地分支)
-- 起手 `git merge --ff-only fix-deletion-hygiene-pr2` 成功(fast-forward,新增两份 PR2 计划/设计文档,无冲突)。
+## 改动
 
-## 改动文件
+### 实现(2 文件)
 
-- `packages/expert-work-persistence/migrations/versions/0132_role_binding_orphan_cleanup.py`(新建)
-  - `down_revision = "0131_retention_grants"`(唯一 head,`alembic heads` 确认无分叉)。
-  - `upgrade()`:brief §A3 原文逐字 DELETE SQL(join 键
-    `rb.subject_id::text = tm.keycloak_user_id`,谓词 `subject_type='user'` +
-    `platform_scope=false` + `status IN ('revoked','suspended')`)。
-  - `downgrade()`:no-op(`pass`),docstring 说明删除的授权本不该存在、不可逆是设计意图,不重建。
-  - 模块结构(`from __future__ import annotations` / `Sequence` 类型标注 / `__all__`)照 0131 先例。
+- `services/control-plane/src/control_plane/api/triggers.py`
+  - `delete_trigger` 签名新增 `trigger_runs: Annotated[TriggerRunStore, Depends(_get_trigger_run_store)]`(getter 复用既有 :235)。
+  - 权限检查后、`triggers.delete` **前**调 `trigger_runs.delete_for_triggers(trigger_ids=[trigger_id], tenant_id=tenant_id)`(先子后父,崩溃安全,带注释说明)。
+  - `TRIGGER_DELETE` emit 补 `details={"runs_removed": runs_removed}`。
+- `services/control-plane/src/control_plane/api/webhook_endpoints.py`
+  - 新增 `_get_delivery_store` getter(读 `app.state.webhook_delivery_store`,照 :128 `_get_store` 模式);import 补 `WebhookDeliveryStore`。
+  - `delete_endpoint` 签名新增 `deliveries` 依赖;`store.delete` **前**调 `deliveries.delete_for_endpoints(endpoint_ids=[endpoint_id], tenant_id=tenant_id)`。
+  - `WEBHOOK_ENDPOINT_DELETE` emit 补 `details={"deliveries_removed": deliveries_removed}`。
 
-## 测试新增
+### 测试(2 文件,TDD:先红后绿)
 
-- `packages/expert-work-persistence/tests/test_role_binding_orphan_cleanup.py`(新建,
-  `pytest.mark.integration`,真容器 + alembic)
-  - **写法偏离 brief 给的第一选项,采用了 brief 明确认可的后备方案**,原因见文件顶部 docstring:
-    `postgres_container` 是 session 级共享容器,被仓库内所有 integration 测试文件复用。0132 是"一次性
-    数据清理"迁移而非纯 schema 变更 —— 若照 `test_x2_migration_safe_preexisting_tenant_skill` 的
-    "迁到 0131 → 插孤儿数据 → upgrade head" 写法,一旦容器已被更早跑的测试文件先迁到 head(0132 的
-    DELETE 早已在彼时的空数据上跑过、`command.upgrade` 对已应用版本是 no-op、不会重跑),之后插入的
-    孤儿数据永远不会被清理,断言会因测试执行顺序而假性失败,是脆的写法。而 test_x2 那类先例之所以能
-    在共享容器下稳定通过,是因为它验证的是"列默认值"(与迁移是否重跑无关),跟本场景不可比。
-    故照 brief 授权的后备方案:先把容器全量 `upgrade(cfg, "head")`(幂等、保证 schema 就绪),手工插入
-    孤儿数据,再直接执行 `_ORPHAN_CLEANUP_SQL`(与迁移文件 `upgrade()` 里的 SQL 逐字节一致)做等价断言。
-  - 数据矩阵(按 brief Step 2):revoked 成员 + 其孤儿 tenant-scope binding(删)、active 成员的同形态
-    binding(留)、同一 revoked 主体的 platform_scope binding(留,验证 `platform_scope=false` 谓词生效,
-    虽然该场景下 CHECK 约束也顺带保证 tenant_id NULL 使 join 天然不命中——两道防线叠加,不可分离测试)。
-  - 断言:`SELECT id FROM role_binding WHERE id = ANY(...)` 三个已知 id 里,孤儿 id 不在结果集,另两个在。
+- `services/control-plane/tests/test_triggers_api.py`(+2 测试 + 2 小 helper)
+  - `test_delete_trigger_cascades_trigger_runs`:删 trigger 后其 2 条 trigger_run 全消失、他 trigger 的 1 条不动、审计 `details == {"runs_removed": 2}`。
+  - `test_delete_trigger_without_runs_audits_zero`:0 子行时 `details == {"runs_removed": 0}`。
+- `services/control-plane/tests/test_webhook_endpoints_api.py`(+2 测试 + 2 小 helper)
+  - `test_delete_endpoint_cascades_deliveries`:同型,`deliveries_removed == 2`,他 endpoint 的不动。
+  - `test_delete_endpoint_without_deliveries_audits_zero`:0 子行时计 0。
+  - 造子行直接走 `app.state.*_store.create(...)`(照文件内 `app.state.trigger_run_store` 既有用法);审计断言用类型化 `AuditQuery` 查询(CI mypy 扫 tests 教训,避免 object 上加 ignore 链)。
 
-## 变异自验
+## 验证
 
-把测试文件里的 `_ORPHAN_CLEANUP_SQL` join 键从 `tm.keycloak_user_id = rb.subject_id::text` 改成
-`tm.subject_id::text = rb.subject_id::text`(即 brief 警告的错误列)→ 重跑测试 → **变红**(`1 failed`,
-孤儿绑定未被删除,因为测试数据里 `tenant_member.subject_id` 恒为 NULL,`NULL::text` 永不等于任何
-`rb.subject_id::text`)。改回后重跑 → **复绿**(`1 passed`)。
-
-自验对象是测试里内嵌的 SQL 常量(与迁移文件的 SQL 逐字节相同),而非直接调用迁移模块的
-`upgrade()`——因为选用的是后备写法(未走 alembic 版本重放),这点已在测试 docstring 里说明。
-
-## 测试结果
-
-```
-export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
-
-uv run pytest packages/expert-work-persistence/tests/test_role_binding_orphan_cleanup.py -x -q
-→ 1 passed
-
-uv run pytest packages/expert-work-persistence/tests/test_retention_grants.py packages/expert-work-persistence/tests/test_role_binding_orphan_cleanup.py -q
-→ 4 passed（0131 + 0132 两份 integration 测试同容器下均绿，交叉验证链尾无冲突）
-
-cd packages/expert-work-persistence && uv run alembic heads
-→ 0132_role_binding_orphan_cleanup (head)（单一 head，无分叉）
-
-uv run ruff check packages/expert-work-persistence
-→ All checks passed!
-
-uv run ruff format --check packages/expert-work-persistence
-→ 454 files already formatted
-```
-
-## Commit
-
-- 待创建（本报告写完后随迁移文件 + 测试文件一并提交，`.superpowers/sdd/task-4-report.md` 用
-  `git add -f` 强制加入，因该目录被 `.superpowers/sdd/.gitignore` 挡住 —— 照 task-3/5/6 报告先例）。
+- **红**:4 个新测试实现前全 FAIL,失败原因正确(孤儿行残留于 `list_by_trigger` / `list_by_endpoint`)。
+- **绿**:`uv run --group dev pytest services/control-plane/tests/test_triggers_api.py services/control-plane/tests/test_webhook_endpoints_api.py` → **45 passed**(含全部既有测试,无回归)。
+- `uv run ruff check` → All checks passed;`uv run ruff format --check` → 1464 files already formatted。
+- CI mypy 范围不含 control-plane src/tests(ci.yml:75),不适用本改动。
+- 全库 grep 确认无其他测试断言这两个 delete 审计或调用这两个 DELETE 端点(无隐性回归面)。
 
 ## Concerns
 
-1. **共享 session 容器下的测试写法权衡**:如上"测试新增"一节所述，为规避跨测试文件执行顺序导致的假性
-   失败，本测试选用了 brief 明确授权的"后备方案"（内嵌 SQL 副本 + 手工插入 + 直接执行），而非"迁到中间
-   版本"的写法。代价是测试不直接调用迁移文件的 `upgrade()` 函数本体，理论上如果两处 SQL 文本出现漂移
-   （有人改了迁移文件却忘了同步测试里的 `_ORPHAN_CLEANUP_SQL`），测试会继续验证"旧的"谓词而非"新的"。
-   缓解手段：两处 SQL 逐字节相同（已核对），且迁移文件本身是一次性清理、上线后预期不再改动。如果团队
-   更看重"测试即文档、不可能漂移"，可以考虑后续用 `alembic.runtime.migration.MigrationContext` +
-   `alembic.operations.Operations.context()` 手动绑定 `op` 直接调用迁移模块的 `upgrade()`——但仓库测试
-   套件里没有这个模式的先例，且 brief 已明确认可当前的后备写法，故未引入这一更复杂的新模式（避免不必要
-   的抽象）。
-2. **数据层面的存量影响未知**:本迁移会在生产库真实执行 DELETE，此前没有对存量数据量做统计/预估（不在
-   本 task 范围内，brief 也未要求）。如果存量孤儿行数很大，上线时可能有短暂锁等待，建议上线前用只读
-   `SELECT COUNT(*)`（同一 SQL 的计数版本）预估影响面。
+1. **webhook 404 路径下级联先跑**:`delete_endpoint` 没有先 `get` 的存在性检查(既有结构如此),对不存在的 endpoint_id,`delete_for_endpoints` 会先跑(no-op:delivery 行 tenant_id + endpoint_id 双条件过滤,无越租户风险),然后才 404。行为无害且符合 brief「放 store.delete 前」,未加额外前置 get(surgical)。
+2. 日志约束不适用:本 task 未新增任何 log 语句;审计 `details` 只放整型计数,非请求派生字符串。
+3. 本报告文件原有 PR2 时代 task-4 旧内容(迁移 0132 报告,另一 worktree 遗留),已按本次任务指令覆写。
