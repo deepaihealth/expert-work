@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models.run_event import RunEventRow
@@ -95,6 +95,15 @@ class RunEventStore(abc.ABC):
         so a cross-tenant probe returns an empty list rather than raising.
         """
 
+    @abc.abstractmethod
+    async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
+        """Remove ALL events for the given runs. Empty input removes nothing.
+
+        Returns rows removed. Deletion-hygiene PR3 §A — called by the
+        in-memory RunStore mirror; the SQL RunStore empties run_event
+        inside its own delete transaction instead (atomicity).
+        """
+
     async def next_seq(self, *, run_id: UUID) -> int:
         """The next free seq for ``run_id`` — ``max(seq) + 1``, or 0 if none.
 
@@ -151,6 +160,12 @@ class InMemoryRunEventStore(RunEventStore):
         filtered.sort(key=lambda r: r.seq)
         return filtered[:clamped]
 
+    async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
+        removed = 0
+        for rid in run_ids:
+            removed += len(self._events.pop(rid, []))
+        return removed
+
 
 class SqlRunEventStore(RunEventStore):
     """Postgres-backed :class:`RunEventStore` — the ``run_event`` table.
@@ -192,6 +207,16 @@ class SqlRunEventStore(RunEventStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
+
+    async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
+        if not run_ids:
+            return 0
+        async with self._sf() as session:
+            result = await session.execute(
+                delete(RunEventRow).where(RunEventRow.run_id.in_(list(run_ids)))
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     async def next_seq(self, *, run_id: UUID) -> int:
         """``max(seq) + 1`` for ``run_id`` in one query (0 if none)."""

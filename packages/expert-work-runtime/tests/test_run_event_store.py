@@ -142,6 +142,22 @@ async def test_next_seq_continues_past_durable_tail() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_for_runs_removes_only_targeted_runs() -> None:
+    """Deletion-hygiene PR3 §A — purge empties only the targeted runs'
+    frames; empty input removes nothing."""
+    store = InMemoryRunEventStore()
+    run_a, run_b = uuid4(), uuid4()
+    await store.append(make_event_record(run_id=run_a, seq=0, event_name="metadata", data={}))
+    await store.append(make_event_record(run_id=run_a, seq=1, event_name="updates", data={}))
+    await store.append(make_event_record(run_id=run_b, seq=0, event_name="metadata", data={}))
+
+    assert await store.delete_for_runs(run_ids=[run_a]) == 2
+    assert list(await store.list(run_id=run_a)) == []
+    assert len(await store.list(run_id=run_b)) == 1
+    assert await store.delete_for_runs(run_ids=[]) == 0
+
+
+@pytest.mark.asyncio
 async def test_next_seq_pages_beyond_list_limit() -> None:
     """The default paging implementation finds the true max even when the run
     has more frames than ``MAX_LIST_LIMIT`` (single ``list`` call can't)."""
