@@ -620,6 +620,12 @@ def create_app(
     resolved_approval_store: ApprovalStore = approval_repo or (
         sql_stores.approval if sql_stores else InMemoryApprovalStore()
     )
+    # Stream H.3 PR 3 (Mini-ADR H-7) — durable SSE event store. Assembled
+    # before the run store: the in-memory run store empties a purged
+    # thread's ``run_event`` children through it (deletion-hygiene PR3 §A).
+    resolved_run_event_store: RunEventStore = run_event_repo or (
+        sql_stores.run_event if sql_stores else InMemoryRunEventStore()
+    )
     # Stream J.8 closeout follow-up (Mini-ADR J-41) — durable run
     # lifecycle store. The same instance is wired into the RunManager
     # (mirror writes) and read by GET .../runs/{id} as the fallback
@@ -627,11 +633,11 @@ def create_app(
     resolved_run_store: RunStore = run_repo or (
         # Stream RT-4 — the in-memory double needs the thread store to resolve a
         # run → agent for ``list_running_for_agent`` (the SQL store joins).
-        sql_stores.run if sql_stores else InMemoryRunStore(thread_meta_store=resolved_threads)
-    )
-    # Stream H.3 PR 3 (Mini-ADR H-7) — durable SSE event store.
-    resolved_run_event_store: RunEventStore = run_event_repo or (
-        sql_stores.run_event if sql_stores else InMemoryRunEventStore()
+        sql_stores.run
+        if sql_stores
+        else InMemoryRunStore(
+            thread_meta_store=resolved_threads, event_store=resolved_run_event_store
+        )
     )
     # Stream J.10 (Mini-ADR J-26 / J-42) — trigger registry + firing log.
     resolved_trigger_store: TriggerStore = trigger_repo or (

@@ -250,6 +250,9 @@ async def test_store_append_failure_does_not_block_sse() -> None:
         ) -> Sequence[RunEventRecord]:
             return []
 
+        async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
+            return 0
+
     bridge = InMemoryStreamBridge()
     rm = RunManager()
     record = await _new_record(rm)
