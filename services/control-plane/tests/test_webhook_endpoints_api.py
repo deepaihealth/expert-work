@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -12,6 +13,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import AuditAction, AuditQuery, WebhookDeliveryRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -234,3 +236,75 @@ async def test_payload_format_roundtrip(client: AsyncClient) -> None:
 async def test_default_payload_format_is_generic(client: AsyncClient) -> None:
     created = await _create(client, name="default-fmt")
     assert created["payload_format"] == "generic"
+
+
+# --- 删除接口卫生 PR3 — 删 endpoint 级联清 webhook_delivery 孤儿行 -----------
+
+
+async def _seed_delivery(app: object, *, endpoint_id: UUID, event_id: str) -> None:
+    now = datetime.now(UTC)
+    await app.state.webhook_delivery_store.create(  # type: ignore[attr-defined]
+        WebhookDeliveryRecord(
+            id=uuid4(),
+            tenant_id=_DEFAULT_TENANT,
+            endpoint_id=endpoint_id,
+            event_id=event_id,
+            event_type="run.completed",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+async def _delete_audit_entry(audit_store: InMemoryAuditLogStore, *, endpoint_id: str) -> object:
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    return next(
+        e
+        for e in page.entries
+        if e.action is AuditAction.WEBHOOK_ENDPOINT_DELETE and e.resource_id == endpoint_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_cascades_deliveries(
+    client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """删 endpoint 连带删其 webhook_delivery;他 endpoint 的不动;审计计数正确。"""
+    doomed = await _create(client, name="doomed")
+    keeper = await _create(client, name="keeper")
+    doomed_id = UUID(str(doomed["id"]))
+    keeper_id = UUID(str(keeper["id"]))
+
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await _seed_delivery(app, endpoint_id=doomed_id, event_id="run-a:1")
+    await _seed_delivery(app, endpoint_id=doomed_id, event_id="run-a:2")
+    await _seed_delivery(app, endpoint_id=keeper_id, event_id="run-a:1")
+
+    resp = await client.delete(f"/v1/webhook-endpoints/{doomed_id}")
+    assert resp.status_code == 200
+
+    delivery_store = app.state.webhook_delivery_store
+    assert (
+        await delivery_store.list_by_endpoint(endpoint_id=doomed_id, tenant_id=_DEFAULT_TENANT)
+        == []
+    )
+    kept = await delivery_store.list_by_endpoint(endpoint_id=keeper_id, tenant_id=_DEFAULT_TENANT)
+    assert len(kept) == 1
+
+    entry = await _delete_audit_entry(audit_store, endpoint_id=str(doomed_id))
+    assert entry.details == {"deliveries_removed": 2}  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_delete_endpoint_without_deliveries_audits_zero(
+    client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """0 子行时审计 details 记 deliveries_removed=0(而非缺字段)。"""
+    created = await _create(client, name="childless")
+    endpoint_id = str(created["id"])
+
+    resp = await client.delete(f"/v1/webhook-endpoints/{endpoint_id}")
+    assert resp.status_code == 200
+
+    entry = await _delete_audit_entry(audit_store, endpoint_id=endpoint_id)
+    assert entry.details == {"deliveries_removed": 0}  # type: ignore[attr-defined]

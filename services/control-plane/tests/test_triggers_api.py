@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -12,6 +13,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import AuditAction, AuditQuery, TriggerRunRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -696,3 +698,68 @@ async def test_null_owner_trigger_delete_requires_admin(triggers_client: AsyncCl
     async with admin:
         resp = await admin.delete(f"/v1/triggers/{trigger_id}")
     assert resp.status_code == 200
+
+
+# --- 删除接口卫生 PR3 — 删 trigger 级联清 trigger_run 孤儿行 -----------------
+
+
+async def _seed_trigger_run(app: object, *, trigger_id: UUID) -> None:
+    await app.state.trigger_run_store.create(  # type: ignore[attr-defined]
+        TriggerRunRecord(
+            id=uuid4(),
+            tenant_id=_DEFAULT_TENANT,
+            trigger_id=trigger_id,
+            triggered_at=datetime.now(UTC),
+        )
+    )
+
+
+async def _delete_audit_entry(audit_store: InMemoryAuditLogStore, *, trigger_id: str) -> object:
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    return next(
+        e
+        for e in page.entries
+        if e.action is AuditAction.TRIGGER_DELETE and e.resource_id == trigger_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_trigger_cascades_trigger_runs(
+    triggers_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """删 trigger 连带删其 trigger_run;他 trigger 的不动;审计计数正确。"""
+    doomed = await _create_cron(triggers_client, name="doomed")
+    keeper = await _create_cron(triggers_client, name="keeper")
+    doomed_id = UUID(str(doomed["id"]))
+    keeper_id = UUID(str(keeper["id"]))
+
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    await _seed_trigger_run(app, trigger_id=doomed_id)
+    await _seed_trigger_run(app, trigger_id=doomed_id)
+    await _seed_trigger_run(app, trigger_id=keeper_id)
+
+    resp = await triggers_client.delete(f"/v1/triggers/{doomed_id}")
+    assert resp.status_code == 200
+
+    run_store = app.state.trigger_run_store
+    assert await run_store.list_by_trigger(trigger_id=doomed_id, tenant_id=_DEFAULT_TENANT) == []
+    keeper_runs = await run_store.list_by_trigger(trigger_id=keeper_id, tenant_id=_DEFAULT_TENANT)
+    assert len(keeper_runs) == 1
+
+    entry = await _delete_audit_entry(audit_store, trigger_id=str(doomed_id))
+    assert entry.details == {"runs_removed": 2}  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_delete_trigger_without_runs_audits_zero(
+    triggers_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """0 子行时审计 details 记 runs_removed=0(而非缺字段)。"""
+    created = await _create_cron(triggers_client, name="childless")
+    trigger_id = str(created["id"])
+
+    resp = await triggers_client.delete(f"/v1/triggers/{trigger_id}")
+    assert resp.status_code == 200
+
+    entry = await _delete_audit_entry(audit_store, trigger_id=trigger_id)
+    assert entry.details == {"runs_removed": 0}  # type: ignore[attr-defined]

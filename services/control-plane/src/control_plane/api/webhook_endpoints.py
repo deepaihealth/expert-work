@@ -33,7 +33,7 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.url_validation import RemoteURLError, validate_remote_url
-from expert_work.persistence import WebhookEndpointStore
+from expert_work.persistence import WebhookDeliveryStore, WebhookEndpointStore
 from expert_work.protocol import (
     AuditAction,
     WebhookEndpointRecord,
@@ -127,6 +127,10 @@ class _PatchBody(BaseModel):
 
 def _get_store(request: Request) -> WebhookEndpointStore:
     return request.app.state.webhook_endpoint_store  # type: ignore[no-any-return]
+
+
+def _get_delivery_store(request: Request) -> WebhookDeliveryStore:
+    return request.app.state.webhook_delivery_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -308,10 +312,16 @@ def build_webhook_endpoints_router() -> APIRouter:
         endpoint_id: UUID,
         request: Request,
         store: Annotated[WebhookEndpointStore, Depends(_get_store)],
+        deliveries: Annotated[WebhookDeliveryStore, Depends(_get_delivery_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
+        # PR3 孤儿行级联 — 无 FK cascade,先删子行再删父行(崩溃安全:中途
+        # 崩溃父行仍在,重删即可收敛;反序会留永久孤儿)。
+        deliveries_removed = await deliveries.delete_for_endpoints(
+            endpoint_ids=[endpoint_id], tenant_id=tenant_id
+        )
         deleted = await store.delete(endpoint_id=endpoint_id, tenant_id=tenant_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="webhook endpoint not found")
@@ -323,6 +333,7 @@ def build_webhook_endpoints_router() -> APIRouter:
             resource_type="webhook_endpoint",
             resource_id=str(endpoint_id),
             trace_id=current_trace_id_hex(),
+            details={"deliveries_removed": deliveries_removed},
         )
         return JSONResponse(content={"deleted": True})
 
