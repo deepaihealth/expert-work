@@ -148,6 +148,20 @@ def test_orphan_trigger_run_and_webhook_delivery_removed_parented_kept(
                     {"ids": [live_delivery_id, orphan_delivery_id]},
                 )
             }
+
+            # Shared session-scoped container — remove this test's rows so
+            # later store tests (e.g. list_enabled_all_tenants) see a clean
+            # table. AUTOCOMMIT means nothing rolls back on its own.
+            conn.execute(
+                text("DELETE FROM webhook_delivery WHERE tenant_id = :tid"), {"tid": tenant_id}
+            )
+            conn.execute(
+                text("DELETE FROM webhook_endpoint WHERE tenant_id = :tid"), {"tid": tenant_id}
+            )
+            conn.execute(text("DELETE FROM trigger_run WHERE tenant_id = :tid"), {"tid": tenant_id})
+            conn.execute(
+                text("DELETE FROM agent_trigger WHERE tenant_id = :tid"), {"tid": tenant_id}
+            )
     finally:
         engine.dispose()
 
