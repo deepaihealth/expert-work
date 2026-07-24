@@ -1,70 +1,31 @@
-# Task 6 报告 —— platform_config canonical helper + 5 端点密文清理
+# Task 6 Report: CurationCandidateStore.revert_promoted_for_dataset(双实现)
 
-## 做了什么
+## STATUS
+DONE
 
-1. **worktree 对齐**:`git merge --ff-only fix-deletion-hygiene-pr2`(纯快进,无冲突),
-   拿到 T2 `SecretStore.delete`(`LocalDevSecretStore.delete` / `AliyunKmsSecretStore.delete` /
-   `SqlEncryptedSecretStore.delete`),tip 落在 `b630cf7a`。
+## Commit
+- `d102f5d9` `feat(persistence): curation candidate 按 dataset 回退 PENDING(双实现)`(worktree 分支,基于 `333a541c` ff 同步 fix-deletion-hygiene-pr3 后提交)
 
-2. **`_canonical_secret_name` helper**(`services/control-plane/src/control_plane/api/platform_config.py`,
-   模块级,`build_platform_config_router()` 之前):四形态签名与 brief 逐字一致
-   (`provider`/`key_id`/`tool`/`tenant_id` 全 kwonly)。逐个对照 `git show HEAD:` 里原
-   5 处内联拼名后抽取,**逐字节保留原字符串**:
-   - `expert-work/platform/llm/{provider}`(+`/{key_id}` 当 `key_id` 既非 `None` 也非 `"default"`)
-   - `expert-work/platform/tool/{tool}`
-   - `expert-work/platform/tenant/{tenant_id}/llm/{provider}`
-   - `expert-work/platform/tenant/{tenant_id}/tool/{tool}`
-   4 处写点(`_do_upsert_provider` :273-275、`upsert_tool` :363、`upsert_tenant_provider` :623、
-   `upsert_tenant_tool` :667,共 5 处名字构造)全部改用 helper。
+## 改动文件
+- `packages/expert-work-persistence/src/expert_work/persistence/curation/base.py` — `CurationCandidateStore` 追加抽象方法 `revert_promoted_for_dataset(*, dataset_id: UUID, tenant_id: UUID) -> int`(置于 `update` 与 `anonymize_all_for_user` 之间),docstring 写明谓词、一次性双字段写入(PROMOTED 无指针是非法中间态)、其余列不动、回退后可再 promote 铸新行。
+- `packages/expert-work-persistence/src/expert_work/persistence/curation/sql.py` — `SqlCurationCandidateStore` 实现:UPDATE 谓词 `tenant_id == tenant_id AND eval_dataset_id == dataset_id AND status == CandidateStatus.PROMOTED.value`,values `status=PENDING.value, eval_dataset_id=None`;事务模式照同文件 `anonymize_all_for_user`(stmt 构建 → session.execute → commit → rowcount)。
+- `packages/expert-work-persistence/src/expert_work/persistence/curation/memory.py` — `InMemoryCurationCandidateStore` 实现:同序三条件谓词(`tenant_id` → `eval_dataset_id` → `status is CandidateStatus.PROMOTED`),命中行 `model_copy(update={"status": PENDING, "eval_dataset_id": None})` 一次性改两字段(不分两步,frozen 模型校验 PROMOTED 必带指针)。
+- 测试两文件同型新增 `test_revert_promoted_for_dataset_reverts_only_matching_rows`(`packages/expert-work-persistence/tests/test_in_memory_curation_store.py` / `test_sql_curation_store.py`):2 行 PROMOTED→D1 回退成 PENDING+无指针且 `reviewed_at` 不动;PROMOTED→D2 不动;**DISMISSED→D1 不动(变异哨兵)**;他租户 PROMOTED→D1 不动;返回计数 2。
 
-3. **`_delete_managed_secret` helper**(同文件,helper 旁边):`secret_ref == f"secret://{canonical}"`
-   才 best-effort `secret_store.delete(canonical)`(try/except 记 `logger.warning`,失败返回
-   `False`);外部 `secret://`/`kms://` ref 直接短路返回 `False`,**绝不调用 delete**。
+## TDD 过程
+1. Step 1-2(红):先写两侧测试,真跑确认红——in-memory `AttributeError: 'InMemoryCurationCandidateStore' object has no attribute 'revert_promoted_for_dataset'`;SQL 同型 AttributeError(真容器起来后才炸,非 fixture 层)。
+2. Step 3-4(绿):实现后两文件全绿。
+3. **Step 5 变异自验(已做,两侧都做)**:
+   - in-memory 去掉 `status is PROMOTED` 谓词 → 哨兵红:`assert 3 == 2`(DISMISSED 行被扫进计数)→ 恢复后绿。
+   - SQL 去掉 `status == PROMOTED.value` 谓词 → 哨兵红:`assert 3 == 2`(真 Postgres 容器)→ 恢复后绿。
 
-4. **5 个 delete 端点**注入 `secret_store: Annotated[SecretStore, Depends(_get_secret_store)]`
-   (沿用文件既有 `_get_secret_store` 先例),流程照 brief:`bypass_rls_session()` 内
-   先取行(`get_provider` / `get_tool` / 复用已有 `list_providers()` 结果 / 新查
-   `list_tenant_providers` / `list_tenant_tools`,后两者 Protocol 无单行 getter)→
-   `_delete_managed_secret` best-effort → 照旧 `store.delete_*` → 审计 details 加
-   `secret_deleted: bool`(`delete_provider` / `delete_provider_key` / `delete_tool` /
-   `delete_tenant_provider` / `delete_tenant_tool` 五处全覆盖)。
+## 测试摘要
+`DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock uv run pytest packages/expert-work-persistence/tests/test_in_memory_curation_store.py packages/expert-work-persistence/tests/test_sql_curation_store.py` → **33 passed**(含 SQL 集成真容器);`uv run ruff check .` 全库 All checks passed;`ruff format --check` 干净(formatter 折了测试里一根 101 字符长行);CI-scope `mypy` strict → Success, 777 files。
 
-5. **测试**(`services/control-plane/tests/test_platform_config_api.py` 追加 11 个):
-   - `test_canonical_secret_name_matches_legacy_literals`:四形态 + key_id="default"
-     折叠 + 非 default key_id 全部对旧字面量逐字节断言。
-   - 5 端点各一对 paste/ref-mode:paste 模式起造 → 删除 → `LocalDevSecretStore` 里密文
-     真消失(`SecretNotFoundError`)+ 审计 `secret_deleted: true`;ref-mode 先在
-     store 里 `put` 一个外部名哨兵密文、写入行指向 `secret://external/...`,删除后
-     哨兵密文原样 + 审计 `secret_deleted: false`。
-   - 审计断言复用既有仓库先例(`app.state.audit_logger._store._rows.values()`,见
-     `test_platform_embedding_config_api.py`)。
-
-## 验证
-
-```
-uv run pytest services/control-plane/tests/test_platform_config_api.py -q
-# 29 passed(18 原有 + 11 新增)
-
-uv run ruff check services/control-plane
-# All checks passed!
-
-uv run ruff format --check services/control-plane
-# 395 files already formatted
-```
-
-**变异自验**:把 `_delete_managed_secret` 里的比对 `if secret_ref != f"secret://{canonical}":`
-临时改成永假(`if False:`,即"永远走删除分支"),只跑 5 个 ref-mode 测试
-(`pytest -k ref_mode`)→ 全部 5 个变红(`secret_deleted` 断言从 `False` 翻成
-`True`;因为 mutation 版本会去删 canonical 槽位而非外部 ref 指向的真实名字,
-"外部密文原样"断言本身不受影响,但 `secret_deleted` 标记漏出了误删企图,证明
-测试确实在盯这条命门)。恢复原比对后 5 个测试变回绿,配合上面的 29-passed 全绿。
+## 事实核查(实现依据)
+- `eval_dataset_id` 列无 FK(migration `0034_eval_dataset.py:75` 裸 UUID 列)→ 悬空指针前提成立,SQL 测试直接用裸 uuid4 当 dataset id(与既有 promotion 测试同法)。
+- pydantic 校验(`protocol/eval_dataset.py:110-119`)只要求 非PENDING带reviewed_at + PROMOTED带eval_dataset_id;DISMISSED 带指针合法 → 哨兵行可构造;回退后 PENDING+reviewed_at 合法,round-trip 无碍。
+- 全库仅 Sql/InMemory 两个 `CurationCandidateStore` 子类,新抽象方法无第三处断裂。
 
 ## Concerns
-
-- 无阻塞项。`delete_tenant_provider` / `delete_tenant_tool` 的 store Protocol
-  没有单行 `get_tenant_provider`/`get_tenant_tool`,改用
-  `list_tenant_providers(tenant_id)` / `list_tenant_tools(tenant_id)` 全量拉取后
-  客户端过滤——量级是"一个租户的全 catalog 覆盖行",现状足够小,未新增
-  store 方法(遵循最小改动;若后续该表变大,可以补一个单行 getter)。
-- `mcp_servers.py` 删除端点与 `mcp_oauth_api.py` disconnect 的密文清理是设计文档
-  §B2 第 4/5 点,不在本 task 范围(brief 只覆盖 `platform_config.py`)。
+- 无阻塞。仅提示 Task 7 接线:回退行保留 `reviewed_at`(历史),status 回 PENDING——review UI 若按「PENDING 必无 reviewed_at」假设渲染需留意(现有代码未见此假设,列出仅供终审)。

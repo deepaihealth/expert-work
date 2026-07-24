@@ -317,6 +317,68 @@ async def test_candidate_update_cross_tenant_returns_false() -> None:
 
 
 @pytest.mark.asyncio
+async def test_revert_promoted_for_dataset_reverts_only_matching_rows() -> None:
+    store = InMemoryCurationCandidateStore()
+    tenant, d1, d2 = uuid4(), uuid4(), uuid4()
+
+    def _promote(rec: CurationCandidateRecord, dataset_id: UUID) -> CurationCandidateRecord:
+        return rec.model_copy(
+            update={
+                "status": CandidateStatus.PROMOTED,
+                "eval_dataset_id": dataset_id,
+                "reviewed_at": _BASE,
+            }
+        )
+
+    hit_a, hit_b = uuid4(), uuid4()
+    await store.upsert(_promote(_candidate(candidate_id=hit_a, tenant_id=tenant), d1))
+    await store.upsert(_promote(_candidate(candidate_id=hit_b, tenant_id=tenant), d1))
+    # PROMOTED but pointing at another dataset — untouched.
+    other_ds = uuid4()
+    await store.upsert(_promote(_candidate(candidate_id=other_ds, tenant_id=tenant), d2))
+    # DISMISSED row pointing at D1 — mutation sentinel: must stay DISMISSED.
+    dismissed = uuid4()
+    await store.upsert(
+        _candidate(candidate_id=dismissed, tenant_id=tenant).model_copy(
+            update={
+                "status": CandidateStatus.DISMISSED,
+                "eval_dataset_id": d1,
+                "reviewed_at": _BASE,
+            }
+        )
+    )
+    # Same dataset, another tenant — untouched.
+    foreign_tenant, foreign = uuid4(), uuid4()
+    await store.upsert(_promote(_candidate(candidate_id=foreign, tenant_id=foreign_tenant), d1))
+
+    reverted = await store.revert_promoted_for_dataset(dataset_id=d1, tenant_id=tenant)
+    assert reverted == 2
+
+    for cid in (hit_a, hit_b):
+        rec = await store.get(candidate_id=cid, tenant_id=tenant)
+        assert rec is not None
+        assert rec.status is CandidateStatus.PENDING
+        assert rec.eval_dataset_id is None
+        # Other columns untouched — the review history stays.
+        assert rec.reviewed_at == _BASE
+
+    untouched_other = await store.get(candidate_id=other_ds, tenant_id=tenant)
+    assert untouched_other is not None
+    assert untouched_other.status is CandidateStatus.PROMOTED
+    assert untouched_other.eval_dataset_id == d2
+
+    untouched_dismissed = await store.get(candidate_id=dismissed, tenant_id=tenant)
+    assert untouched_dismissed is not None
+    assert untouched_dismissed.status is CandidateStatus.DISMISSED
+    assert untouched_dismissed.eval_dataset_id == d1
+
+    untouched_foreign = await store.get(candidate_id=foreign, tenant_id=foreign_tenant)
+    assert untouched_foreign is not None
+    assert untouched_foreign.status is CandidateStatus.PROMOTED
+    assert untouched_foreign.eval_dataset_id == d1
+
+
+@pytest.mark.asyncio
 async def test_record_retry_increments_and_scopes_by_tenant() -> None:
     store = InMemoryCurationCandidateStore()
     cid, tenant = uuid4(), uuid4()

@@ -158,6 +158,19 @@ class CurationCandidateStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
+        """Deletion hygiene PR3 — revert PROMOTED candidates pointing at a
+        deleted ``eval_dataset`` row back to PENDING.
+
+        Predicate: ``status == PROMOTED AND eval_dataset_id == dataset_id``
+        (tenant-scoped). Writes ``status=PENDING, eval_dataset_id=None`` in
+        one shot (a PROMOTED candidate without a dataset id is an illegal
+        state); every other column (``reviewed_at`` / ``evolved_at`` …) is
+        left untouched. The candidate becomes re-promotable — promoting
+        again mints a fresh ``eval_dataset`` row. Returns the count
+        reverted."""
+
+    @abc.abstractmethod
     async def anonymize_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         """Phase 3a (purge_user) — null ``user_id``, KEEP the candidate rows.
 
