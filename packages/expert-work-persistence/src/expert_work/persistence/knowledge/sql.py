@@ -558,7 +558,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
-    ) -> None:
+    ) -> bool:
         values: dict[str, object] = {
             "status": status.value,
             "error": error,
@@ -572,7 +572,7 @@ class SqlKnowledgeStore(KnowledgeStore):
             values["claimed_at"] = None
             values["lease_until"] = None
         async with self._sf() as session:
-            await session.execute(
+            result = await session.execute(
                 update(KnowledgeDocumentRow)
                 .where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
@@ -581,6 +581,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 .values(**values)
             )
             await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         async with self._sf() as session:

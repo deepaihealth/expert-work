@@ -402,6 +402,56 @@ async def test_delete_document_cascades_chunks() -> None:
     assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
 
 
+@pytest.mark.asyncio
+async def test_set_document_status_reports_document_presence() -> None:
+    """已删文档的状态写回返回 False —— 与 SQL 侧 rowcount 语义平价."""
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")
+    assert (
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+        )
+        is True
+    )
+    assert await store.delete_document(tenant_id=tenant, document_id=doc.id) is True
+    assert (
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_chunks_after_document_delete_raises_and_leaves_no_orphans() -> None:
+    """镜像 SQL 侧 FK(0136):已删文档的写回抛 KeyError,不得重建孤儿 chunk.
+
+    与 ``test_knowledge_chunk_fk.py`` 的
+    ``test_replace_chunks_after_delete_raises_and_leaves_no_orphans`` 同型。
+    """
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")
+    assert await store.delete_document(tenant_id=tenant, document_id=doc.id) is True
+    with pytest.raises(KeyError):
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[
+                _chunk(
+                    tenant_id=tenant,
+                    kb_id=kb_id,
+                    document_id=doc.id,
+                    index=0,
+                    content="stale write-back",
+                    embedding=(1.0,),
+                )
+            ],
+        )
+    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+
+
 # ---------------------------------------------------------------------------
 # chunk search
 # ---------------------------------------------------------------------------
@@ -410,7 +460,8 @@ async def test_delete_document_cascades_chunks() -> None:
 @pytest.mark.asyncio
 async def test_search_orders_by_cosine_distance() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc_id = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc_id = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc_id,
@@ -448,7 +499,8 @@ async def test_search_orders_by_cosine_distance() -> None:
 @pytest.mark.asyncio
 async def test_search_filters_by_kb_ids() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_a, kb_b, doc = uuid4(), uuid4(), uuid4(), uuid4()
+    tenant, kb_a, kb_b = uuid4(), uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_a, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -478,7 +530,8 @@ async def test_search_filters_by_kb_ids() -> None:
 @pytest.mark.asyncio
 async def test_search_is_tenant_scoped() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, other, kb_id, doc = uuid4(), uuid4(), uuid4(), uuid4()
+    tenant, other, kb_id = uuid4(), uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -510,7 +563,8 @@ async def test_search_empty_kb_ids_returns_empty() -> None:
 @pytest.mark.asyncio
 async def test_keyword_search_ranks_by_term_overlap() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -549,7 +603,8 @@ async def test_keyword_search_ranks_by_term_overlap() -> None:
 @pytest.mark.asyncio
 async def test_keyword_search_filters_by_kb_and_tenant() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, other, kb_a, kb_b, doc = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+    tenant, other, kb_a, kb_b = uuid4(), uuid4(), uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_a, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -580,7 +635,8 @@ async def test_keyword_search_filters_by_kb_and_tenant() -> None:
 @pytest.mark.asyncio
 async def test_keyword_search_no_match_returns_empty() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -612,7 +668,8 @@ async def test_keyword_search_empty_kb_ids_returns_empty() -> None:
 @pytest.mark.asyncio
 async def test_search_scored_returns_descending_similarity() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -648,7 +705,8 @@ async def test_search_scored_returns_descending_similarity() -> None:
 @pytest.mark.asyncio
 async def test_keyword_search_scored_carries_rank_and_source() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -672,7 +730,8 @@ async def test_keyword_search_scored_carries_rank_and_source() -> None:
 @pytest.mark.asyncio
 async def test_list_chunks_paginates_and_omits_embedding() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, kb_id, doc = uuid4(), uuid4(), uuid4()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,
@@ -698,7 +757,8 @@ async def test_list_chunks_paginates_and_omits_embedding() -> None:
 @pytest.mark.asyncio
 async def test_list_chunks_is_tenant_scoped() -> None:
     store = InMemoryKnowledgeStore()
-    tenant, other, kb_id, doc = uuid4(), uuid4(), uuid4(), uuid4()
+    tenant, other, kb_id = uuid4(), uuid4(), uuid4()
+    doc = (await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")).id
     await store.replace_chunks(
         tenant_id=tenant,
         document_id=doc,

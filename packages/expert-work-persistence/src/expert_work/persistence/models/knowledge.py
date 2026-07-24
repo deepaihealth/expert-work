@@ -3,9 +3,12 @@
 A tenant's ``knowledge_base`` owns ``knowledge_document`` rows (uploaded
 source files); each document owns ``knowledge_chunk`` rows (embedded
 slices). All three are tenant-scoped only — RLS (migration ``0021``)
-enforces ``app.tenant_id``. There are no foreign keys between the tables
-(a FK into a ``FORCE`` RLS table is a footgun, Mini-ADR J-1a); the
-``KnowledgeStore`` cascades deletes in the application layer.
+enforces ``app.tenant_id``. Originally there were no foreign keys between
+the tables (a FK into a ``FORCE`` RLS table is a footgun, Mini-ADR J-1a);
+the ``KnowledgeStore`` cascades deletes in the application layer. Migration
+``0136`` added ``knowledge_chunk.document_id → knowledge_document.id``
+(ON DELETE CASCADE) as a DB-level backstop against the delete/in-flight-
+ingest race — the app-layer cascade remains the primary path.
 """
 
 from __future__ import annotations

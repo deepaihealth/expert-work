@@ -241,9 +241,11 @@ class KnowledgeStore(abc.ABC):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Update a document's ingestion status. ``chunk_count`` is set
-        only when supplied (on a successful ingest)."""
+        only when supplied (on a successful ingest). Returns ``True`` if a
+        document matched, ``False`` if it no longer exists (e.g. deleted
+        concurrently while its ingest was in flight)."""
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
@@ -257,7 +259,11 @@ class KnowledgeStore(abc.ABC):
         self, *, tenant_id: UUID, document_id: UUID, chunks: Sequence[KnowledgeChunk]
     ) -> None:
         """Replace all of a document's chunks with ``chunks`` — deletes
-        the document's existing chunks, then inserts the new set."""
+        the document's existing chunks, then inserts the new set. If the
+        document no longer exists (deleted while an ingest was in flight)
+        the write-back is rejected instead of recreating orphan chunks:
+        the SQL store raises ``IntegrityError`` (FK, migration ``0136``),
+        the in-memory store raises :class:`KeyError`."""
 
     @abc.abstractmethod
     async def list_chunks(
