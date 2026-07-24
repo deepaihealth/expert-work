@@ -368,6 +368,21 @@ class SqlCurationCandidateStore(CurationCandidateStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
+    async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
+        stmt = (
+            sa_update(CurationCandidateRow)
+            .where(
+                CurationCandidateRow.tenant_id == tenant_id,
+                CurationCandidateRow.eval_dataset_id == dataset_id,
+                CurationCandidateRow.status == CandidateStatus.PROMOTED.value,
+            )
+            .values(status=CandidateStatus.PENDING.value, eval_dataset_id=None)
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
+
     async def anonymize_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         stmt = (
             sa_update(CurationCandidateRow)
