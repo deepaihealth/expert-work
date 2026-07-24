@@ -171,3 +171,34 @@ async def test_binding_digest_round_trip_and_rebind(
         assert row.binding_digest == "rebound-digest"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_delete_for_threads_scopes_by_tenant_and_thread(
+    approval_store: ApprovalStoreFixture,
+) -> None:
+    """Deletion-hygiene PR3 — the purge_session cascade deletes by (tenant, thread)."""
+    store, engine = approval_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        thread_1, thread_2 = uuid4(), uuid4()
+        run_a1, run_a2, run_b1 = uuid4(), uuid4(), uuid4()
+        await store.create(
+            _record(tenant_id=tenant_a, run_id=run_a1).model_copy(update={"thread_id": thread_1})
+        )
+        await store.create(
+            _record(tenant_id=tenant_a, run_id=run_a2).model_copy(update={"thread_id": thread_2})
+        )
+        await store.create(
+            _record(tenant_id=tenant_b, run_id=run_b1).model_copy(update={"thread_id": thread_1})
+        )
+
+        assert await store.delete_for_threads(thread_ids=[thread_1], tenant_id=tenant_a) == 1
+        assert await store.delete_for_threads(thread_ids=[], tenant_id=tenant_a) == 0
+
+        # Tenant A's thread-1 row is gone; the other thread / other tenant survive.
+        assert await store.get_by_run(run_id=run_a1, tenant_id=tenant_a) is None
+        assert await store.get_by_run(run_id=run_a2, tenant_id=tenant_a) is not None
+        assert await store.get_by_run(run_id=run_b1, tenant_id=tenant_b) is not None
+    finally:
+        await engine.dispose()

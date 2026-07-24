@@ -14,6 +14,7 @@ Implementations:
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -137,3 +138,19 @@ class ApprovalStore(abc.ABC):
         user-scoped — the ``(tenant_id, user_id)`` predicate never touches
         another tenant's or user's rows; rows with a NULL ``user_id`` (legacy /
         machine-triggered) are not this user's and are left untouched."""
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        """Hard-delete every approval row for ``tenant_id`` on any of ``thread_ids``.
+
+        Deletion-hygiene purge (PR3) — cascades approval removal when a
+        session's threads are purged, so ``purge_session`` leaves no
+        orphan ``agent_approval`` rows. Scoped by both tenant and thread
+        id so another tenant's row sharing the same thread id is
+        untouched. An empty ``thread_ids`` deletes nothing and returns
+        ``0``.
+
+        A *write* — ``agent_approval`` is ENABLE-only RLS and the app's
+        owner connection is exempt, so the explicit ``(tenant_id,
+        thread_id)`` predicate is the tenant guard here, not RLS.
+        """

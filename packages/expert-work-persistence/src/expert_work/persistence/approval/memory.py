@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -104,6 +105,19 @@ class InMemoryApprovalStore(ApprovalStore):
             run_id
             for run_id, r in self._rows.items()
             if r.tenant_id == tenant_id and r.user_id == user_id
+        ]
+        for run_id in victims:
+            del self._rows[run_id]
+        return len(victims)
+
+    async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        if not thread_ids:
+            return 0
+        wanted = set(thread_ids)
+        victims = [
+            run_id
+            for run_id, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.thread_id in wanted
         ]
         for run_id in victims:
             del self._rows[run_id]
