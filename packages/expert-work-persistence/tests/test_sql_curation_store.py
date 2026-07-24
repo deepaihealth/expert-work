@@ -269,16 +269,19 @@ async def test_candidate_list_for_review_filters(
 async def test_candidate_update_records_promotion(
     curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
 ) -> None:
-    _, candidates = curation_stores
+    datasets, candidates = curation_stores
     cid, tenant = uuid4(), uuid4()
     await candidates.upsert(_candidate(candidate_id=cid, tenant_id=tenant))
+    # eval_dataset_id must point at a real row since the 0135 RESTRICT FK.
+    dataset = _dataset(tenant_id=tenant)
+    await datasets.create(dataset)
 
     rec = await candidates.get(candidate_id=cid, tenant_id=tenant)
     assert rec is not None
     promoted = rec.model_copy(
         update={
             "status": CandidateStatus.PROMOTED,
-            "eval_dataset_id": uuid4(),
+            "eval_dataset_id": dataset.id,
             "reviewed_at": _BASE,
         }
     )
@@ -295,8 +298,11 @@ async def test_candidate_update_records_promotion(
 async def test_revert_promoted_for_dataset_reverts_only_matching_rows(
     curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
 ) -> None:
-    _, candidates = curation_stores
+    datasets, candidates = curation_stores
     tenant, d1, d2 = uuid4(), uuid4(), uuid4()
+    # eval_dataset_id must point at real rows since the 0135 RESTRICT FK.
+    await datasets.create(_dataset(dataset_id=d1, tenant_id=tenant))
+    await datasets.create(_dataset(dataset_id=d2, tenant_id=tenant))
 
     def _promote(rec: CurationCandidateRecord, dataset_id: UUID) -> CurationCandidateRecord:
         return rec.model_copy(

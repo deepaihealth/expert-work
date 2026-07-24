@@ -10,9 +10,14 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from expert_work.persistence.curation.base import CurationCandidateStore, EvalDatasetStore
+from expert_work.persistence.curation.base import (
+    CurationCandidateStore,
+    EvalDatasetInUseError,
+    EvalDatasetStore,
+)
 from expert_work.persistence.models import CurationCandidateRow, EvalDatasetRow
 from expert_work.protocol import (
     CandidateStatus,
@@ -150,13 +155,21 @@ class SqlEvalDatasetStore(EvalDatasetStore):
 
     async def delete(self, *, dataset_id: UUID, tenant_id: UUID) -> bool:
         async with self._sf() as session:
-            result = await session.execute(
-                sa_delete(EvalDatasetRow).where(
-                    EvalDatasetRow.id == dataset_id,
-                    EvalDatasetRow.tenant_id == tenant_id,
+            # The curation_candidate.eval_dataset_id FK (migration 0135) is
+            # ON DELETE RESTRICT and non-deferrable — Postgres checks it while
+            # the DELETE statement itself executes, not later at commit — so
+            # the guard has to wrap ``execute`` too, not just ``commit``.
+            try:
+                result = await session.execute(
+                    sa_delete(EvalDatasetRow).where(
+                        EvalDatasetRow.id == dataset_id,
+                        EvalDatasetRow.tenant_id == tenant_id,
+                    )
                 )
-            )
-            await session.commit()
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise EvalDatasetInUseError(dataset_id=dataset_id) from exc
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def count_by_tenant(self, *, tenant_id: UUID) -> int:
