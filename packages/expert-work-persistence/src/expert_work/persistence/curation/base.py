@@ -32,6 +32,21 @@ from expert_work.protocol import (
 )
 
 
+class EvalDatasetInUseError(Exception):
+    """The eval case is referenced by a ``curation_candidate.eval_dataset_id``.
+
+    The FK is ``ON DELETE RESTRICT`` (migration 0135), so the database refuses
+    to delete a dataset row that a curation candidate still points at — a
+    backstop for write paths that bypass the app-level revert-then-delete
+    (deletion-hygiene PR3 Task 7). Surfaced as a 409 by the control-plane
+    DELETE handler.
+    """
+
+    def __init__(self, *, dataset_id: UUID) -> None:
+        super().__init__(f"eval_dataset in use: id={dataset_id}")
+        self.dataset_id = dataset_id
+
+
 class EvalDatasetStore(abc.ABC):
     """Registry of curated eval cases — the ``eval_dataset`` table."""
 
@@ -64,7 +79,13 @@ class EvalDatasetStore(abc.ABC):
 
     @abc.abstractmethod
     async def delete(self, *, dataset_id: UUID, tenant_id: UUID) -> bool:
-        """Delete a case row; return ``True`` iff it existed."""
+        """Delete a case row; return ``True`` iff it existed.
+
+        The SQL implementation raises :class:`EvalDatasetInUseError` when a
+        ``curation_candidate`` still references the row (0135 RESTRICT FK);
+        the in-memory store does not simulate the FK (parity with the
+        mcp_connector_catalog stores — integration tests cover the SQL side).
+        """
 
     @abc.abstractmethod
     async def count_by_tenant(self, *, tenant_id: UUID) -> int:
