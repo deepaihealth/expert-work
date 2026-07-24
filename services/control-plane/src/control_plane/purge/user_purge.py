@@ -221,7 +221,10 @@ async def _purge_threads(
             summary.runs_deleted += await deps.runtime.run_manager.delete_by_thread(
                 thread_id, tenant_id=tenant_id
             )
-        except Exception:  # run_event RESTRICT may block; anonymize catches survivors
+        except Exception:
+            # Best-effort — delete_by_thread empties the runs' run_event
+            # children itself (deletion-hygiene PR3), so RESTRICT no longer
+            # blocks it; anonymize only backstops a store failure here.
             logger.warning("purge_user.runs_failed", exc_info=True)
         try:
             if await deps.threads.delete(thread_id, tenant_id=tenant_id):
