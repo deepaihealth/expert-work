@@ -509,6 +509,7 @@ def build_triggers_router() -> APIRouter:
         trigger_id: UUID,
         request: Request,
         triggers: Annotated[TriggerStore, Depends(_get_trigger_store)],
+        trigger_runs: Annotated[TriggerRunStore, Depends(_get_trigger_run_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
@@ -528,6 +529,11 @@ def build_triggers_router() -> APIRouter:
                 )
         else:
             await resolve_target_user_id(request, users, requested=record.user_id)
+        # PR3 孤儿行级联 — 无 FK cascade,先删子行再删父行(崩溃安全:中途
+        # 崩溃父行仍在,重删即可收敛;反序会留永久孤儿)。
+        runs_removed = await trigger_runs.delete_for_triggers(
+            trigger_ids=[trigger_id], tenant_id=tenant_id
+        )
         deleted = await triggers.delete(trigger_id=trigger_id, tenant_id=tenant_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="trigger not found")
@@ -539,6 +545,7 @@ def build_triggers_router() -> APIRouter:
             resource_type="trigger",
             resource_id=str(trigger_id),
             trace_id=current_trace_id_hex(),
+            details={"runs_removed": runs_removed},
         )
         return JSONResponse(content={"deleted": True})
 
