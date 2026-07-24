@@ -270,6 +270,7 @@ async def test_store_delete_maps_restrict_to_in_use_error(
             dataset_id=dataset.id, tenant_id=tenant_id
         )
         assert reverted == 1
-        assert await datasets.delete(dataset_id=dataset.id, tenant_id=tenant_id) is True
+        deleted = await datasets.delete(dataset_id=dataset.id, tenant_id=tenant_id)
+        assert deleted is True
     finally:
         await engine.dispose()
