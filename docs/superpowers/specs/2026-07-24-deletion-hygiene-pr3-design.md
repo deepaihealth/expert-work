@@ -26,8 +26,10 @@
    (promote/dismiss 均要求 PENDING,409),且模型校验 **PROMOTED 必须带
    eval_dataset_id**(protocol `eval_dataset.py:110-119`)——dataset 删后
    candidate 永久卡死:指针悬空、无回退路径、无法只清指针。store 无按 dataset
-   批量回退方法。另:promote 端点**不校验目标 dataset 存在**,可 promote 进
-   已删 dataset 直接制造新悬空。
+   批量回退方法。**勘误(写 plan 时复核)**:promote 端点是"从 candidate 铸
+   一行新 eval_dataset"(每行一个样本,candidate 与铸出的行 1:1),不存在
+   "promote 进已有 dataset",故无"promote 进已删 dataset"的新悬空入口——
+   初版 §C 的 promote 校验项基于侦察误判,已删除。
 5. **knowledge 删除 vs 在途向量化竞态**:`knowledge/sql.py:585-610` 删文档 =
    DELETE chunk + DELETE document,无守卫;`knowledge_chunk.document_id` 裸列
    无 FK(migration 0021)。后台 `KnowledgeIngestionRunner._run` 在
@@ -54,13 +56,15 @@ async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
     """Remove all events for the given runs. Returns rows removed."""
 ```
 
-2. run 删除编排(`RunManager.delete_by_thread` 或 store 单事务,plan 定):
-   **先排空子行再删父行** —— list 该 thread 的 run ids →
-   `run_events.delete_for_runs` → 既有 `delete_by_thread` 删 agent_run。
-   顺序崩溃安全:中途失败只留"无事件的 run",重跑幂等补删,不产生新孤儿。
-   `purge_user._purge_threads` 走同一编排自动受益(匿名兜底保留,但正常
-   路径 run 真删;`test_purge_store_methods.py` 中 "run_event RESTRICT —
-   never deleted" 的断言随之更新)。
+2. run 删除编排(plan 定稿):**`SqlRunStore.delete_by_thread` 单事务内
+   先子查询排空 run_event 再删 agent_run**(原子:要么全删要么全留;
+   `run_event` 无 tenant_id 列,RLS 走父 FK,子查询按父行过滤)。
+   `InMemoryRunStore` 构造新增可选 `event_store` 注入(照既有
+   `thread_meta_store` 注入先例),删除时调 `delete_for_runs` 保双实现
+   语义平价。`purge_session` 与 `purge_user._purge_threads` 均经
+   `run_manager.delete_by_thread`,零改动自动受益(匿名兜底保留;
+   `test_purge_store_methods.py` 中 "run_event RESTRICT — never deleted"
+   的断言随之更新)。
 3. `ApprovalStore` 新增(照 feedback `delete_for_threads` 套路):
 
 ```python
@@ -100,9 +104,7 @@ async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID
 2. `curation.py` delete_eval_dataset:**先回退再删 dataset**(先删 dataset 后
    崩会重现悬空;先回退后崩 = dataset 还在、candidate 回池,可重 promote,
    重删幂等)。审计 details 加 `candidates_reverted` 计数。
-3. promote 端点补校验:目标 dataset 不存在 → **404 DATASET_NOT_FOUND**
-   (堵住"promote 进已删 dataset"的新悬空入口;不校验则本批清理会被再次弄脏)。
-4. **迁移 0135**:
+3. **迁移 0135**:
    a. 存量悬空 PROMOTED(指向不存在 dataset)回退 PENDING + 清指针;
    b. 清其余悬空指针(非 PROMOTED 行的 `eval_dataset_id` 指向不存在 dataset
       → NULL,状态不动);
@@ -110,7 +112,7 @@ async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID
       **ondelete=RESTRICT**(DB 兜底防未来绕过 app 层直删 dataset;不能用
       SET NULL——会制造"PROMOTED 带 NULL 指针"的非法态,读出即 pydantic 炸)。
    downgrade:drop FK;数据修正不可逆(与 0132 同姿态)。
-5. app 删除顺序(先回退清指针再删 dataset)保证 RESTRICT 正常路径不触发;
+4. app 删除顺序(先回退清指针再删 dataset)保证 RESTRICT 正常路径不触发;
    dataset store `delete` 对 IntegrityError 的包装照 PR2 T8 教训——try 必须
    覆盖 `execute`(RESTRICT 在 execute 炸,不在 commit)。
 
@@ -134,8 +136,8 @@ async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID
 ### E. 审计与可观测
 
 - 本批所有删除动作审计 details 带级联计数:§A `runs_removed /
-  run_events_removed / approvals_removed`、§B `runs_removed` /
-  `deliveries_removed`、§C `candidates_reverted`。
+  approvals_removed`(run_event 随 run 在同一事务原子消失,不单列计数)、
+  §B `runs_removed` / `deliveries_removed`、§C `candidates_reverted`。
 - 失败分支审计可见(PR2 教训):purge_session run 删除失败带
   `runs_delete_failed`。
 - 日志不放请求派生值(PR2 CodeQL 教训:extra 也被 log-injection 追踪);
@@ -162,7 +164,6 @@ async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID
 - knowledge 竞态模拟:删除文档后直接调 `replace_chunks` → SQL 侧 FK 异常走
   优雅终止路径、无孤儿 chunk;in-memory 同语义。`set_document_status` 0 命中
   返回 False。
-- promote 到不存在 dataset → 404。
 - 变异自验:破坏 §C 回退谓词(status 条件改永真)→ "非 PROMOTED 行不动"
   测试红;破坏 §A 排空顺序(先删父)→ RESTRICT 集成测试红。
 
