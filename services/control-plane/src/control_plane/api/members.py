@@ -460,20 +460,31 @@ def build_members_router() -> APIRouter:
         #    also needs the user row's string subject (mcp_oauth key), read
         #    from the registry. A missing row (anomalous) skips the data step
         #    rather than erroring — ``data_purged: false`` flags it.
+        #    Best-effort like every step after the lifecycle move: the registry
+        #    read and the dep assembly sit outside ``purge_user``'s per-step
+        #    net, and raising here would 500 *after* the Keycloak account is
+        #    already gone — a destructive prefix with no audit row. Flag it and
+        #    fall through to the audit + response instead; the endpoint is
+        #    idempotent, so the operator re-runs to finish the data step.
         data_purged = False
+        data_purge_failed = False
         summary: PurgeSummary | None = None
         if member.subject_id is not None:
-            user = await users.get(member.subject_id, tenant_id=principal.tenant_id)
-            if user is not None:
-                summary = await purge_user(
-                    tenant_id=principal.tenant_id,
-                    user_id=member.subject_id,
-                    subject_id=user.subject_id,
-                    deps=_build_purge_deps(request),
-                    actor_id=principal.subject_id,
-                    trace_id=current_trace_id_hex(),
-                )
-                data_purged = True
+            try:
+                user = await users.get(member.subject_id, tenant_id=principal.tenant_id)
+                if user is not None:
+                    summary = await purge_user(
+                        tenant_id=principal.tenant_id,
+                        user_id=member.subject_id,
+                        subject_id=user.subject_id,
+                        deps=_build_purge_deps(request),
+                        actor_id=principal.subject_id,
+                        trace_id=current_trace_id_hex(),
+                    )
+                    data_purged = True
+            except Exception:
+                data_purge_failed = True
+                logger.warning("member_purge.data_purge_failed", exc_info=True)
 
         await emit(
             audit,
@@ -491,6 +502,12 @@ def build_members_router() -> APIRouter:
                 "role_bindings_removed": removed,
                 "role_bindings_cleanup_failed": cleanup_failed,
                 "data_purged": data_purged,
+                "data_purge_failed": data_purge_failed,
+                # Tri-state accountability: ``None`` = no data step ran,
+                # ``True`` = ran and every store succeeded, ``False`` = ran but
+                # some store failed (``data_purged`` alone can't tell those
+                # last two apart, and the summary itself isn't stored).
+                "purge_ok": summary.ok if summary is not None else None,
             },
         )
         return {
@@ -503,6 +520,7 @@ def build_members_router() -> APIRouter:
                 "role_bindings_removed": removed,
                 "role_bindings_cleanup_failed": cleanup_failed,
                 "data_purged": data_purged,
+                "data_purge_failed": data_purge_failed,
                 "purge": summary.as_dict() if summary is not None else None,
             },
             "error": None,
