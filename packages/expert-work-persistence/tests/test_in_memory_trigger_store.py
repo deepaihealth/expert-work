@@ -538,3 +538,49 @@ async def test_claim_reconcile_cross_tenant_miss() -> None:
         row.model_copy(update={"tenant_id": uuid4(), "status": TriggerRunStatus.SUCCEEDED})
     )
     assert won is False
+
+
+# --- PR4 §B — disable_for_agent (agent soft-delete cascade) ----------------
+
+
+@pytest.mark.asyncio
+async def test_disable_for_agent_scopes_by_name_version_tenant() -> None:
+    store = InMemoryTriggerStore()
+    ten_a, ten_b = uuid4(), uuid4()
+    # 同租户:target@v1 enabled x2、target@v2 enabled x1、target@v1 已 disabled x1
+    r1 = _record(tenant_id=ten_a, agent_name="target", name="t1").model_copy(
+        update={"agent_version": "v1"}
+    )
+    r2 = _record(tenant_id=ten_a, agent_name="target", name="t2").model_copy(
+        update={"agent_version": "v1"}
+    )
+    r_v2 = _record(tenant_id=ten_a, agent_name="target", name="t3").model_copy(
+        update={"agent_version": "v2"}
+    )
+    r_off = _record(tenant_id=ten_a, agent_name="target", name="t4", enabled=False).model_copy(
+        update={"agent_version": "v1"}
+    )
+    # 他租户:target@v1 enabled x1
+    r_b = _record(tenant_id=ten_b, agent_name="target", name="t1").model_copy(
+        update={"agent_version": "v1"}
+    )
+    for rec in (r1, r2, r_v2, r_off, r_b):
+        await store.create(rec)
+
+    n = await store.disable_for_agent(agent_name="target", agent_version="v1", tenant_id=ten_a)
+    assert n == 2  # 已 disabled 的不计数
+
+    async def _enabled(rec: TriggerRecord) -> bool:
+        got = await store.get(trigger_id=rec.id, tenant_id=rec.tenant_id)
+        assert got is not None
+        return got.enabled
+
+    assert await _enabled(r1) is False
+    assert await _enabled(r2) is False
+    assert await _enabled(r_v2) is True  # 同 name 他 version 不动(变异哨兵)
+    assert await _enabled(r_b) is True  # 他租户不动
+    assert await _enabled(r_off) is False  # 此前 disabled 的仍 disabled
+
+    # 幂等重跑:全部已 disabled → 0
+    again = await store.disable_for_agent(agent_name="target", agent_version="v1", tenant_id=ten_a)
+    assert again == 0
