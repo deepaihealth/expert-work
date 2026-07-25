@@ -204,6 +204,16 @@ AssertionError: expected "streamRunEvents" to be called 1 times, but got 2 times
 10. **PlaygroundTab 从 2634 行降到 1377 行**(brief 预估 ~1650)。多降的 ~270 行是因为 hook 连
     扁平 `history` state + `resetDraft` / `handleResume` 里的那段编排一起吸走了(见偏离 1)。
 
+11. **依赖数组两处变动**(任务级审查者补记,原报告漏列):`PlaygroundTab.tsx:225`
+    `}, [resetHistory]);` 与 `:273` `[loadHistory],`,两处原为 `[]`。二者在 hook 内均为
+    `useCallback(…, [])`,identity 跨渲染稳定,故 `resetDraft` / `handleResume` 的 identity
+    仍稳定,`useEffect(…, [r.name, r.version, resetDraft])` 的重绑时机未变。已验证惰性。
+
+12. **effect 注册顺序变化**(同上,审查者补记):拆 IntersectionObserver 的 `useEffect` 随 hook
+    调用点从组件第 4 个 effect 提前为第 1 个,unmount 时 `observerRef.disconnect()` 现在跑在
+    `abortRef.current?.abort()` 之前。两者操作互不相交的状态(`historyAbortRef` 在新旧两版的
+    unmount 路径上都从不被 abort),已验证惰性。
+
 ---
 
 ## 5. 新增文件
