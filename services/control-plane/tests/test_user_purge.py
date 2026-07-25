@@ -12,7 +12,7 @@ The endpoint test asserts the admin/viewer authz split.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -45,7 +45,7 @@ from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.persistence.token_usage_store import InMemoryTokenUsageStore, TokenUsageRecord
 from expert_work.persistence.workspace.dlq import InMemoryVolumeBackupDLQ
-from expert_work.protocol import AuditAction, AuditQuery, MemoryItem
+from expert_work.protocol import ApprovalRecord, AuditAction, AuditQuery, MemoryItem
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
@@ -103,6 +103,24 @@ def _run(*, tenant: UUID, user: UUID, thread: UUID) -> RunInfo:
         updated_at=_NOW,
         finished_at=_NOW,
         trace_id=None,
+    )
+
+
+def _approval(*, tenant: UUID, thread: UUID) -> ApprovalRecord:
+    """A NULL-``user_id`` approval — the shape every real row has (the only
+    writer, orchestrator sse.py's pause flow, stamps ``user_id=None``)."""
+    return ApprovalRecord(
+        id=uuid4(),
+        tenant_id=tenant,
+        user_id=None,
+        run_id=uuid4(),
+        thread_id=thread,
+        request_id="approval:purge-seed",
+        node="tools",
+        reason_kind="policy_gate",
+        action_summary="approval-gated tool 'send_email'",
+        requested_at=_NOW,
+        timeout_at=_NOW + timedelta(hours=24),
     )
 
 
@@ -481,6 +499,105 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
     assert summary.deleted["image_upload"] == len(image_ids)
     assert "image_upload" not in summary.failures
     assert await image_uploads.list_for_user(tenant_id=t1, user_id=a.id) == []
+
+
+@pytest.mark.asyncio
+async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
+    """Approvals are wiped by *thread*, not user — regression sentinel.
+
+    Every real ``agent_approval`` row has ``user_id=None`` (the only writer,
+    orchestrator sse.py's pause flow, hardcodes it), so the per-user
+    ``delete_all_for_user`` backstop matches nothing today — the thread-scope
+    pass in ``_purge_threads`` must be the one that removes the rows.
+    A NULL-``user_id`` approval on ANOTHER user's thread must survive
+    (thread-predicate sentinel: the delete is thread-scoped, not tenant-wide).
+    """
+    t1 = uuid4()
+    threads = InMemoryThreadMetaStore()
+    memory = InMemoryMemoryStore()
+    memory_dlq = InMemoryMemoryWritebackDLQ()
+    artifacts = InMemoryArtifactStore()
+    mcp_oauth = InMemoryMcpOAuthConnectionStore()
+    agent_instances = InMemoryAgentInstanceStore()
+    approvals = InMemoryApprovalStore()
+    triggers = InMemoryTriggerStore()
+    trigger_runs = InMemoryTriggerRunStore()
+    webhook_endpoints = InMemoryWebhookEndpointStore()
+    webhook_deliveries = InMemoryWebhookDeliveryStore()
+    image_uploads = InMemoryImageUploadStore()
+    feedback = InMemoryFeedbackStore()
+    volume_backup_dlq = InMemoryVolumeBackupDLQ()
+    token_usage = InMemoryTokenUsageStore()
+    runs = InMemoryRunStore()
+    skills = InMemorySkillStore()
+    eval_datasets = InMemoryEvalDatasetStore()
+    curation = InMemoryCurationCandidateStore()
+    users = InMemoryTenantUserStore()
+    audit_store = InMemoryAuditLogStore()
+    supervisor = RecordingSupervisorClient()
+
+    a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
+    b = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-b")
+    t_a, t_b = uuid4(), uuid4()
+    await threads.create(
+        thread_id=t_a,
+        tenant_id=t1,
+        created_by="seed",
+        user_id=a.id,
+        agent_name="alpha",
+        agent_version="1.0.0",
+    )
+    await threads.create(
+        thread_id=t_b,
+        tenant_id=t1,
+        created_by="seed",
+        user_id=b.id,
+        agent_name="alpha",
+        agent_version="1.0.0",
+    )
+    approval_a = _approval(tenant=t1, thread=t_a)  # on A's thread → must be deleted
+    approval_b = _approval(tenant=t1, thread=t_b)  # on B's thread → must survive
+    await approvals.create(approval_a)
+    await approvals.create(approval_b)
+
+    deps = PurgeUserDeps(
+        threads=threads,
+        runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
+        memory=memory,
+        memory_dlq=memory_dlq,
+        artifacts=artifacts,
+        mcp_oauth=mcp_oauth,
+        agent_instances=agent_instances,
+        approvals=approvals,
+        triggers=triggers,
+        trigger_runs=trigger_runs,
+        webhook_endpoints=webhook_endpoints,
+        webhook_deliveries=webhook_deliveries,
+        image_uploads=image_uploads,
+        feedback=feedback,
+        object_store=None,
+        volume_backup_dlq=volume_backup_dlq,
+        token_usage=token_usage,
+        runs=runs,
+        skills=skills,
+        eval_datasets=eval_datasets,
+        curation_candidates=curation,
+        tenant_users=users,
+        audit=build_default_audit_logger(audit_store),
+        supervisor=supervisor,
+    )
+
+    summary = await purge_user(
+        tenant_id=t1, user_id=a.id, subject_id="subj-a", deps=deps, actor_id="admin"
+    )
+
+    # A's thread's NULL-user approval is gone, counted under agent_approval —
+    # and the count survives the later per-user backstop step (no overwrite).
+    assert summary.deleted["agent_approval"] == 1
+    assert "agent_approval" not in summary.failures
+    assert await approvals.get_by_run(run_id=approval_a.run_id, tenant_id=t1) is None
+    # B's thread's NULL approval is untouched (thread predicate, not tenant-wide).
+    assert await approvals.get_by_run(run_id=approval_b.run_id, tenant_id=t1) is not None
 
 
 # --------------------------------------------------------------------------- #
