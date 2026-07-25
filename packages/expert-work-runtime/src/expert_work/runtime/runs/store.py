@@ -187,6 +187,14 @@ class RunStore(abc.ABC):
         ``thread_meta.agent_version`` is nullable, so a thread with no
         recorded version never matches a version-level query — deleting one
         version must not cancel runs that were never bound to it.
+
+        A version-level query is **not** exhaustive for a second reason: the
+        external-app path (``api/agents.py:_resolve_session``) reuses an
+        existing thread by ``agent_name`` alone, so a thread stamped ``1.0.0``
+        may be executing the newest ACTIVE version's code. Deleting that newer
+        version does not cancel such a run. Delete-cascade cancellation is
+        hygiene (the run still dies on its deadline); the emergency stop is the
+        kill switch, which stays name-level precisely for this reason.
         """
 
     @abc.abstractmethod

@@ -1046,10 +1046,16 @@ def build_mcp_servers_router() -> APIRouter:
                 page = await agent_spec_store.list_by_tenant(  # type: ignore[attr-defined]
                     tenant_id=tenant_id, limit=_SPEC_PAGE_SIZE, offset=offset
                 )
-                specs.extend(page)
-                if len(page) < _SPEC_PAGE_SIZE:
+                # Terminate on an empty page, not on a short one, and advance
+                # by what the store actually returned. A server-side limit
+                # clamp (RunStore already has one) would make every page
+                # "short" — a short-page break would then stop after one page
+                # and silently reinstate the very gap this sweep closes. Costs
+                # one extra empty query per sweep; deletes are rare.
+                if not page:
                     break
-                offset += _SPEC_PAGE_SIZE
+                specs.extend(page)
+                offset += len(page)
             active_specs = [s for s in specs if s.status is not AgentSpecStatus.DELETED]
             # AgentSpecRecord.spec is an AgentSpec object — convert to dict (once
             # per spec) for the helpers below, which read raw manifest dicts.
