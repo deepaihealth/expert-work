@@ -269,16 +269,19 @@ async def test_candidate_list_for_review_filters(
 async def test_candidate_update_records_promotion(
     curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
 ) -> None:
-    _, candidates = curation_stores
+    datasets, candidates = curation_stores
     cid, tenant = uuid4(), uuid4()
     await candidates.upsert(_candidate(candidate_id=cid, tenant_id=tenant))
+    # eval_dataset_id must point at a real row since the 0135 RESTRICT FK.
+    dataset = _dataset(tenant_id=tenant)
+    await datasets.create(dataset)
 
     rec = await candidates.get(candidate_id=cid, tenant_id=tenant)
     assert rec is not None
     promoted = rec.model_copy(
         update={
             "status": CandidateStatus.PROMOTED,
-            "eval_dataset_id": uuid4(),
+            "eval_dataset_id": dataset.id,
             "reviewed_at": _BASE,
         }
     )
@@ -289,6 +292,75 @@ async def test_candidate_update_records_promotion(
     assert again is not None
     assert again.status is CandidateStatus.PROMOTED
     assert again.eval_dataset_id is not None
+
+
+@pytest.mark.asyncio
+async def test_revert_promoted_for_dataset_reverts_only_matching_rows(
+    curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
+) -> None:
+    datasets, candidates = curation_stores
+    tenant, d1, d2 = uuid4(), uuid4(), uuid4()
+    # eval_dataset_id must point at real rows since the 0135 RESTRICT FK.
+    await datasets.create(_dataset(dataset_id=d1, tenant_id=tenant))
+    await datasets.create(_dataset(dataset_id=d2, tenant_id=tenant))
+
+    def _promote(rec: CurationCandidateRecord, dataset_id: UUID) -> CurationCandidateRecord:
+        return rec.model_copy(
+            update={
+                "status": CandidateStatus.PROMOTED,
+                "eval_dataset_id": dataset_id,
+                "reviewed_at": _BASE,
+            }
+        )
+
+    hit_a, hit_b = uuid4(), uuid4()
+    await candidates.upsert(_promote(_candidate(candidate_id=hit_a, tenant_id=tenant), d1))
+    await candidates.upsert(_promote(_candidate(candidate_id=hit_b, tenant_id=tenant), d1))
+    # PROMOTED but pointing at another dataset — untouched.
+    other_ds = uuid4()
+    await candidates.upsert(_promote(_candidate(candidate_id=other_ds, tenant_id=tenant), d2))
+    # DISMISSED row pointing at D1 — mutation sentinel: must stay DISMISSED.
+    dismissed = uuid4()
+    await candidates.upsert(
+        _candidate(candidate_id=dismissed, tenant_id=tenant).model_copy(
+            update={
+                "status": CandidateStatus.DISMISSED,
+                "eval_dataset_id": d1,
+                "reviewed_at": _BASE,
+            }
+        )
+    )
+    # Same dataset, another tenant — untouched.
+    foreign_tenant, foreign = uuid4(), uuid4()
+    await candidates.upsert(
+        _promote(_candidate(candidate_id=foreign, tenant_id=foreign_tenant), d1)
+    )
+
+    reverted = await candidates.revert_promoted_for_dataset(dataset_id=d1, tenant_id=tenant)
+    assert reverted == 2
+
+    for cid in (hit_a, hit_b):
+        rec = await candidates.get(candidate_id=cid, tenant_id=tenant)
+        assert rec is not None
+        assert rec.status is CandidateStatus.PENDING
+        assert rec.eval_dataset_id is None
+        # Other columns untouched — the review history stays.
+        assert rec.reviewed_at == _BASE
+
+    untouched_other = await candidates.get(candidate_id=other_ds, tenant_id=tenant)
+    assert untouched_other is not None
+    assert untouched_other.status is CandidateStatus.PROMOTED
+    assert untouched_other.eval_dataset_id == d2
+
+    untouched_dismissed = await candidates.get(candidate_id=dismissed, tenant_id=tenant)
+    assert untouched_dismissed is not None
+    assert untouched_dismissed.status is CandidateStatus.DISMISSED
+    assert untouched_dismissed.eval_dataset_id == d1
+
+    untouched_foreign = await candidates.get(candidate_id=foreign, tenant_id=foreign_tenant)
+    assert untouched_foreign is not None
+    assert untouched_foreign.status is CandidateStatus.PROMOTED
+    assert untouched_foreign.eval_dataset_id == d1
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,14 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from expert_work.runtime.runs import DisconnectMode, InMemoryRunStore, RunInfo, RunStatus
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    InMemoryRunEventStore,
+    InMemoryRunStore,
+    RunInfo,
+    RunStatus,
+    make_event_record,
+)
 
 _BASE = datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
 
@@ -264,6 +271,26 @@ async def test_delete_by_thread_removes_only_that_thread_and_tenant() -> None:
     assert await store.get(run_id=cross, tenant_id=other) is not None
     # Deleting an empty thread is a no-op returning 0.
     assert await store.delete_by_thread(thread_id=uuid4(), tenant_id=tenant) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_by_thread_clears_child_events_via_injected_event_store() -> None:
+    """Deletion-hygiene PR3 §A — the in-memory mirror of the SQL contract:
+    purging a thread's runs also empties their ``run_event`` children."""
+    events = InMemoryRunEventStore()
+    store = InMemoryRunStore(event_store=events)
+    thread, tenant = uuid4(), uuid4()
+    doomed, bystander = uuid4(), uuid4()
+    await store.create(_info(run_id=doomed, tenant_id=tenant, thread_id=thread))
+    await store.create(_info(run_id=bystander, tenant_id=tenant))  # other thread
+    await events.append(make_event_record(run_id=doomed, seq=0, event_name="metadata", data={}))
+    await events.append(make_event_record(run_id=doomed, seq=1, event_name="updates", data={}))
+    await events.append(make_event_record(run_id=bystander, seq=0, event_name="metadata", data={}))
+
+    assert await store.delete_by_thread(thread_id=thread, tenant_id=tenant) == 1
+    assert list(await events.list(run_id=doomed)) == []
+    # The bystander run on another thread keeps its events.
+    assert len(await events.list(run_id=bystander)) == 1
 
 
 # ---------------------------------------------------------------------------

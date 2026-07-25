@@ -170,6 +170,22 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
         self._rows[record.id] = record
         return True
 
+    async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
+        reverted = 0
+        for cid, r in list(self._rows.items()):
+            if (
+                r.tenant_id == tenant_id
+                and r.eval_dataset_id == dataset_id
+                and r.status is CandidateStatus.PROMOTED
+            ):
+                # One-shot copy — a PROMOTED record without a dataset id is an
+                # illegal intermediate state (frozen model validator).
+                self._rows[cid] = r.model_copy(
+                    update={"status": CandidateStatus.PENDING, "eval_dataset_id": None}
+                )
+                reverted += 1
+        return reverted
+
     async def anonymize_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         updated = 0
         for cid, r in list(self._rows.items()):

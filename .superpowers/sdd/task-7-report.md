@@ -1,134 +1,39 @@
-# Task 7 报告 —— mcp_servers 删除清密文 + oauth disconnect 真删 + 审计标签
+# Task 7 Report: delete_eval_dataset 先回退再删 + 审计(依赖 T6)
 
-## 做了什么
+## STATUS
+DONE
 
-1. **worktree 对齐**:执行 `git merge --ff-only fix-deletion-hygiene-pr2`,从
-   `621c53f9` 快进合并到 `b630cf7a`(纯 fast-forward,无冲突),拿到 T2
-   `SecretStore.delete`(`LocalDevSecretStore.delete` / `AliyunKmsSecretStore.delete`
-   / `SqlEncryptedSecretStore.delete`)以及 `.superpowers/sdd/task-7-brief.md`。
+## Commit
+- `751de14a` `feat(control-plane): 删 eval dataset 先回退 promoted candidate(悬空修复)`(worktree 分支,基于 `006d1004` ff 同步 fix-deletion-hygiene-pr3 后提交)
 
-2. **`mcp_servers.py` DELETE 端点**(`services/control-plane/src/control_plane/api/mcp_servers.py:987`):
-   - 注入 `secret_store: Annotated[SecretStore, Depends(_get_secret_store)]`(该
-     依赖已存在,POST/PATCH/GET 均用同一 accessor)。
-   - 行删除后新增 `(c2)` 步骤:遍历 `record.token_secret_ref` /
-     `record.custom_headers_ref`,存在即 `parse_secret_ref` 取名后
-     `secret_store.delete(name)`;`try/except Exception` 包裹 + `logger.warning`,
-     不阻断主删除流程(best-effort,与 disconnect 同款取舍)。该域全平台代管
-     paste-only(`CreateMcpServerRequest.token` 是 `SecretStr`,从无 ref-mode
-     外部引用),不存在"误删外部 KMS 条目"顾虑。
+## 改动文件
+- `services/control-plane/src/control_plane/api/curation.py` — `delete_eval_dataset` 端点:
+  - 注入 `candidates: Annotated[CurationCandidateStore, Depends(_get_curation_store)]`(getter 复用同文件既有 `_get_curation_store`)。
+  - **删除前**调 `await candidates.revert_promoted_for_dataset(dataset_id=dataset_id, tenant_id=tenant_id)`,回退异常**不捕获**(上抛阻断删除;代码内注释写明理由:先删后崩重现悬空,先回退后崩安全——dataset 行还在、candidate 可再 promote)。
+  - 既有 `emit` 加 `details={"candidates_reverted": reverted}`(该 emit 原本无 details)。
+  - 回退发生在 404 存在性判定**之前**(照 brief/spec「先回退再删」字面顺序;对已悬空的重删场景是自愈行为,重删幂等——回退无匹配行计 0)。
+- `services/control-plane/tests/test_curation_api.py` — 新增一节 5 个测试 + fixture 小改:
+  - fixture:`InMemoryAuditLogStore` 实例保留进 `_Ctx.audit_store`(原先匿名传入无法断言 details);新增 `AuditQuery` / `UUID` 导入。
+  - ① `test_delete_eval_dataset_reverts_promoted_candidate`:promote 铸 dataset → 删 → candidate 回 `pending`、`eval_dataset_id is None`、可再 promote 且铸出**新** dataset id。未断言 `reviewed_at`(T6 既定保留)。
+  - ② `test_delete_eval_dataset_leaves_dismissed_candidate_alone`:dismissed candidate 在同租户另一 candidate 的 dataset 被删后状态不动。
+  - ③ `test_delete_eval_dataset_audit_counts_reverted`:审计 `eval_dataset:delete` 行 `details["candidates_reverted"] == 1`。
+  - ④ `test_delete_eval_dataset_without_candidate_counts_zero`:golden dataset(无关联 candidate)删除照常 200、计数 0。
+  - ⑤(变异哨兵,brief 之外补)`test_delete_eval_dataset_blocked_when_revert_fails`:monkeypatch revert 抛 RuntimeError → 异常穿透(ASGITransport `raise_app_exceptions` 默认 True,以 `pytest.raises` 断言)+ **dataset 行仍在**。此测试专门钉死「先回退再删 + 不捕获」全局约束——前 4 个测试杀不掉「先删后回退」变异体(revert 按 candidate 行匹配,与 dataset 行存亡无关,换序照样全绿)。
 
-3. **`mcp_oauth_api.py` disconnect 端点**(`:406-449`):
-   - `put(parse_secret_ref(ref), "")` 覆写循环改为
-     `secret_store.delete(parse_secret_ref(ref))`;保留原有 `try/except + logger.warning`
-     结构,日志键从 `disconnect_secret_overwrite_failed` 改
-     `disconnect_secret_delete_failed`(语义对齐真删)。
-   - 两处 docstring/注释同步("no delete" → 已有 delete)。
+## TDD 过程
+1. Step 1-2(红):先写 ①②③④,真跑红——① `assert 'promoted' == 'pending'`、③④ `KeyError: 'candidates_reverted'`;② 天生绿(dismissed 无指针本就不会被扫),留作回归卫兵。
+2. Step 3-4(绿):实现后全文件 17 passed。
+3. **变异自验(已做)**:把实现换序成「先删 dataset 后回退」→ 哨兵⑤红(dataset 行在异常前已被删)→ 恢复正确顺序 → 18 passed。确认 ⑤ 是唯一能杀该变异体的测试。
 
-4. **审计 `resource_type` 修正**(brief 指定的两处,`action` 枚举不动):
-   - OAuth 回调(`:375-385`):`"tenant_mcp_server"` → `"mcp_oauth_connection"`。
-   - disconnect(`:438-448`):同上。
-   - **`resource_type` 是 `Literal` 类型**(`control_plane.audit.ResourceType` +
-     protocol 侧镜像 `expert_work.protocol.audit.ResourceType`),`"mcp_oauth_connection"`
-     此前不在两个 Literal 里——brief 未提及这一步,但不加的话是类型错误(即使
-     Python 运行时 Literal 不强校验,也违反仓库
-     `[memory:audit-literal-drift]` 双侧同步约定)。已在两处 Literal 末尾各加
-     一条 `"mcp_oauth_connection"`,注释按仓库既有格式标注来源 + drift 提示。
+## 测试摘要
+`uv run --group dev pytest services/control-plane/tests/test_curation_api.py` → **18 passed**(含既有 13 个回归);`services/control-plane/tests/test_tenant_scope_endpoints.py`(另一处打 `/v1/eval-datasets` 的测试文件)→ 45 passed;`ruff check .` 全库 All checks passed;`ruff format --check` 两改动文件干净。CI-scope mypy 不含 control-plane(`.github/workflows/ci.yml:75`),本任务改动全在 control-plane,未跑。
 
-## 测试(TDD 红→绿)
-
-- `services/control-plane/tests/test_mcp_servers_api.py`:新增
-  `test_delete_removes_token_and_headers_secrets`——创建带 `auth_type=bearer` +
-  `token` + `custom_headers` 的 server,删除前确认两个密文都存在,删除后两个
-  `secret_store.get(...)` 均 `raises SecretNotFoundError`。无 ref 的删除路径
-  已被既有 `test_delete_succeeds_when_unreferenced`(`auth_type=none`,无 token/
-  headers)覆盖,未新增重复用例。
-- `services/control-plane/tests/test_mcp_oauth_api.py`:
-  - `test_disconnect_revokes_and_removes`:断言从 `revoked == ""`(覆写空串,锁
-    旧行为)改为 `pytest.raises(SecretNotFoundError)`(锁新行为——这正是修
-    bug);新增断言用 `app.state.audit_logger.query(AuditQuery(...), actor_id=...)`
-    过滤 `details["source"] == "oauth_disconnect"` 的条目,`resource_type ==
-    "mcp_oauth_connection"`。
-  - `test_full_oauth_roundtrip`:同样追加 callback 审计条目的 `resource_type`
-    断言(过滤 `source == "oauth_callback"`)。
-  - 两个新 import:`AuditQuery`(`expert_work.protocol`)、`SecretNotFoundError`
-    (`expert_work.runtime.secret_store`)。
-- **红态验证**:`git stash` 掉 4 个 src 文件(保留测试改动)单独跑新/改测试,
-  确认 `test_delete_removes_token_and_headers_secrets` 失败(`DID NOT RAISE
-  SecretNotFoundError`),`stash pop` 恢复实现后重跑转绿。
-
-## 验证
-
-```
-uv run pytest services/control-plane/tests/test_mcp_servers_api.py \
-  services/control-plane/tests/test_mcp_oauth_api.py \
-  services/control-plane/tests/test_mcp_oauth.py \
-  services/control-plane/tests/test_audit_mcp_server_types.py -q
-# 72 passed
-
-uv run pytest services/control-plane/tests/ -k "audit" -q
-# 88 passed, 1975 deselected（含 control-plane 全量 audit 相关回归，两处 Literal
-# 新增未破坏任何既有断言）
-
-uv run pytest packages/expert-work-protocol/tests/test_audit_actions.py -q
-# 2 passed
-
-uv run ruff check services/control-plane packages/expert-work-protocol
-# All checks passed!
-
-uv run ruff format --check <6 个改动文件>
-# 6 files already formatted
-
-uv run mypy packages
-# Success: no issues found in 672 source files
-# （services/control-plane 不在 CI mypy 范围内，见 .github/workflows/ci.yml:75
-#   与 [memory:ci-mypy-scans-tests] 同款结论，未额外跑）
-```
+## 事实核查(实现依据)
+- `app.state.curation_candidate_store` 在 `create_app` 里**无条件**赋值(`app.py:1948`,injected repo 或 lifespan 构建二选一),eval-dataset router 挂载处依赖必可解析,无第三处 wiring 断裂。
+- 审计 details 断言姿势照 `test_agents_api.py` / `test_admin_api.py` 先例(`audit_store.query(AuditQuery(tenant_id=...))` + `entry.details[...]`);`AuditAction.EVAL_DATASET_DELETE.value == "eval_dataset:delete"`。
+- 默认 redactor 不动 int 计数(先例:`grace_period_s`/`revision` 等 int details 均可直读断言)。
 
 ## Concerns
-
-- 无阻塞项。
-- brief 字面只列了两处 `resource_type` 字面量替换，未提及 `ResourceType`
-  Literal 定义本身需要扩容——已按仓库 `[memory:audit-literal-drift]` 约定的
-  "control-plane 侧 + protocol 侧必须同步" 规则补齐两处，属于让改动类型正确
-  的必要配套，非范围蔓延。
-- `mcp_oauth_api.py` disconnect 的密文清理与 `mcp_servers.py` 一样是
-  best-effort(`try/except Exception` + `logger.warning`），与 spec §B5/§错误处理
-  一致；未额外加 metrics/告警（brief 未要求，且该端点无先例告警可比照，不同于
-  PR1 retention job 的 `image_object_keys_failed` 场景）。
-
-## Review 修复(T7 review Critical C-1 + 变异回归)
-
-- **[C-1] 修复**:`mcp_servers.py:1040` 的
-  `logger.warning("mcp_servers.delete_secret_failed", extra={"name": name})` ——
-  `extra` 里的 `name` 撞 `logging.LogRecord` 保留属性（`makeRecord` 对
-  `key in rv.__dict__` 的 `name` 直接 `raise KeyError("Attempt to overwrite
-  'name' in LogRecord")`），真跑到这条 warning 会把 (c2) best-effort 清理失败
-  升级成整个 DELETE 请求 500——完全违背 (c2) 段落自己写的 "best-effort，不阻断
-  主删除流程" 设计意图。改为 `extra={"server_name": name}`；未把 `name` 内嵌进
-  消息字符串（`name` 是请求路径参数，字符串插值会触发 CodeQL
-  `py/log-injection`）。
-- **变异测试**:`test_mcp_servers_api.py` 新增
-  `test_delete_best_effort_secret_cleanup_does_not_abort_request` ——
-  用 `_DeleteAlwaysFailsSecretStore`（真实 secret_store 的 wrapper，`get`/`put`
-  透传，`delete` 恒抛 `RuntimeError`）替换 `app.state.secret_store`，创建带
-  token 的 server 后调用 DELETE，断言：①响应 204；②
-  `tenant_mcp_server_store.get(...)` 查行真没了；③audit_store 里
-  `AuditAction.MCP_SERVER_DELETE` 已写；④异常未外抛。钉死 (c2) 的
-  best-effort 不变式，顺带证明修复后 `logger.warning` 不再炸。
-- **红态验证**:`git stash` 掉 src 改动、单独跑新测试 → 复现
-  `KeyError: "Attempt to overwrite 'name' in LogRecord"`（栈顶在
-  `logging/__init__.py:makeRecord`），与 review 描述的故障模式完全一致；
-  `stash pop` 恢复修复后重跑转绿。
-
-### 验证
-
-```
-uv run pytest services/control-plane/tests/test_mcp_servers_api.py -q
-# 34 passed
-
-uv run ruff check services/control-plane
-# All checks passed!
-
-uv run ruff format --check services/control-plane
-# 395 files already formatted
-```
+- 无阻塞。两点提示终审:
+  1. 回退在 404 判定之前 → 对不存在 dataset 的 DELETE(404 响应)也会执行回退。正常路径回退计 0 无副作用;唯一有副作用的场景是存量悬空 PROMOTED(指向已删 dataset)被重删触发自愈回 PENDING——与 Task 8 迁移 0135 的存量清理方向一致,视为良性。若终审认为 404 必须零副作用,可把回退挪到 `datasets.get` 存在性预检之后(需多一次读)。
+  2. 测试⑤是 brief 四测之外的补充(变异自验发现前 4 测杀不掉换序变异体),行为约束直接来自计划 Global Constraints,非 scope 外新需求。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import cast
 from uuid import UUID
@@ -217,6 +218,18 @@ class SqlApprovalStore(ApprovalStore):
         stmt = delete(AgentApprovalRow).where(
             AgentApprovalRow.tenant_id == tenant_id,
             AgentApprovalRow.user_id == user_id,
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        if not thread_ids:
+            return 0
+        stmt = delete(AgentApprovalRow).where(
+            AgentApprovalRow.tenant_id == tenant_id,
+            AgentApprovalRow.thread_id.in_(list(thread_ids)),
         )
         async with self._sf() as session:
             result = await session.execute(stmt)

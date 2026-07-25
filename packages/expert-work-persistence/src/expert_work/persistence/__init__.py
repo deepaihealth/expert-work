@@ -54,6 +54,9 @@ from expert_work.persistence.billing import (
 from expert_work.persistence.curation import (
     CurationCandidateStore as CurationCandidateStore,
 )
+from expert_work.persistence.curation import (
+    EvalDatasetInUseError as EvalDatasetInUseError,
+)
 from expert_work.persistence.curation import EvalDatasetStore as EvalDatasetStore
 from expert_work.persistence.curation import (
     InMemoryCurationCandidateStore as InMemoryCurationCandidateStore,
@@ -401,6 +404,7 @@ __all__ = [
     "DrDrillRow",
     "DuplicateKnowledgeBaseError",
     "DuplicateMemberError",
+    "EvalDatasetInUseError",
     "EvalDatasetStore",
     "EvalRunStore",
     "EventLogRow",

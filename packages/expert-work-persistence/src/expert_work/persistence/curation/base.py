@@ -32,6 +32,21 @@ from expert_work.protocol import (
 )
 
 
+class EvalDatasetInUseError(Exception):
+    """The eval case is referenced by a ``curation_candidate.eval_dataset_id``.
+
+    The FK is ``ON DELETE RESTRICT`` (migration 0135), so the database refuses
+    to delete a dataset row that a curation candidate still points at — a
+    backstop for write paths that bypass the app-level revert-then-delete
+    (deletion-hygiene PR3 Task 7). Surfaced as a 409 by the control-plane
+    DELETE handler.
+    """
+
+    def __init__(self, *, dataset_id: UUID) -> None:
+        super().__init__(f"eval_dataset in use: id={dataset_id}")
+        self.dataset_id = dataset_id
+
+
 class EvalDatasetStore(abc.ABC):
     """Registry of curated eval cases — the ``eval_dataset`` table."""
 
@@ -64,7 +79,13 @@ class EvalDatasetStore(abc.ABC):
 
     @abc.abstractmethod
     async def delete(self, *, dataset_id: UUID, tenant_id: UUID) -> bool:
-        """Delete a case row; return ``True`` iff it existed."""
+        """Delete a case row; return ``True`` iff it existed.
+
+        The SQL implementation raises :class:`EvalDatasetInUseError` when a
+        ``curation_candidate`` still references the row (0135 RESTRICT FK);
+        the in-memory store does not simulate the FK (parity with the
+        mcp_connector_catalog stores — integration tests cover the SQL side).
+        """
 
     @abc.abstractmethod
     async def count_by_tenant(self, *, tenant_id: UUID) -> int:
@@ -156,6 +177,19 @@ class CurationCandidateStore(abc.ABC):
 
         Used by the curation API to record promote / dismiss verdicts.
         """
+
+    @abc.abstractmethod
+    async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
+        """Deletion hygiene PR3 — revert PROMOTED candidates pointing at a
+        deleted ``eval_dataset`` row back to PENDING.
+
+        Predicate: ``status == PROMOTED AND eval_dataset_id == dataset_id``
+        (tenant-scoped). Writes ``status=PENDING, eval_dataset_id=None`` in
+        one shot (a PROMOTED candidate without a dataset id is an illegal
+        state); every other column (``reviewed_at`` / ``evolved_at`` …) is
+        left untouched. The candidate becomes re-promotable — promoting
+        again mints a fresh ``eval_dataset`` row. Returns the count
+        reverted."""
 
     @abc.abstractmethod
     async def anonymize_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

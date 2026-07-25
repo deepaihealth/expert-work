@@ -214,6 +214,17 @@ class KnowledgeIngestionRunner:
             )
             logger.info("knowledge.ingest_ready document=%s chunks=%d", document_id, chunk_count)
         except Exception as exc:
+            gone = False
+            try:
+                gone = (
+                    await self._store.get_document(tenant_id=tenant_id, document_id=document_id)
+                ) is None
+            except Exception:  # noqa: S110  # pragma: no cover - 判定失败按未删处理
+                pass
+            if gone:
+                # 文档已被并发删除 — FK/守卫拒绝写回是正常终止,不算失败。
+                logger.debug("knowledge.ingest_document_gone document=%s", document_id)
+                return
             # A fast-path failure (parse error, etc.) is terminal — re-ingest is
             # an explicit user action. Crash recovery (process died mid-ingest)
             # is handled separately by the recovery worker.

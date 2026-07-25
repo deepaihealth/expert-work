@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, TypedDict
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -16,8 +18,14 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditQuery
-from expert_work.runtime.runs import InMemoryRunStore
+from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    InMemoryRunStore,
+    RunEventRecord,
+    RunInfo,
+    RunStatus,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -729,3 +737,172 @@ async def test_non_owner_cannot_rename_or_archive(session_client: AsyncClient) -
     assert rename.status_code == 404
     archive = await session_client.delete(f"/v1/sessions/{tid}", headers=b)
     assert archive.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# purge — hard-delete cascade (deletion-hygiene PR3)
+# ---------------------------------------------------------------------------
+
+
+def _run_info(thread_id: str) -> RunInfo:
+    now = datetime.now(UTC)
+    return RunInfo(
+        run_id=uuid4(),
+        tenant_id=_DEFAULT_TENANT,
+        thread_id=UUID(thread_id),
+        user_id=None,
+        status=RunStatus.SUCCESS,
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=False,
+        error=None,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+    )
+
+
+def _pending_approval(thread_id: str, run_id: UUID) -> ApprovalRecord:
+    now = datetime.now(UTC)
+    return ApprovalRecord(
+        id=uuid4(),
+        tenant_id=_DEFAULT_TENANT,
+        run_id=run_id,
+        thread_id=UUID(thread_id),
+        request_id="approval:purge-seed",
+        node="tools",
+        reason_kind="policy_gate",
+        action_summary="approval-gated tool 'send_email'",
+        proposed_args={"to": "ops@example.com"},
+        requested_at=now,
+        timeout_at=now + timedelta(hours=24),
+    )
+
+
+def _purge_audit_details(page: AuditPage, tid: str) -> dict[str, object]:
+    return next(
+        r.details for r in page.entries if r.resource_id == tid and r.details.get("op") == "purge"
+    )
+
+
+@pytest.mark.asyncio
+async def test_purge_cascades_runs_events_and_approvals(
+    session_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """Purge removes the run rows, their run_event children AND the thread's
+    ``agent_approval`` rows — no orphans left behind."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    info = _run_info(tid)
+    await app.state.run_store.create(info)
+    now = datetime.now(UTC)
+    await app.state.run_event_store.append(
+        RunEventRecord(
+            run_id=info.run_id,
+            seq=0,
+            event_name="run_started",
+            data={"status": "running"},
+            created_at_ms=int(now.timestamp() * 1000),
+            created_at=now,
+        )
+    )
+    await app.state.approval_store.create(_pending_approval(tid, info.run_id))
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["purged"] == tid
+    assert data["runs"] == 1
+    assert data["approvals"] == 1
+
+    # Store level — every thread-scoped row is gone.
+    assert await app.state.run_store.get(run_id=info.run_id, tenant_id=_DEFAULT_TENANT) is None
+    assert list(await app.state.run_event_store.list(run_id=info.run_id)) == []
+    assert (
+        await app.state.approval_store.get_by_run(run_id=info.run_id, tenant_id=_DEFAULT_TENANT)
+        is None
+    )
+
+    # HTTP level — the session 404s and the runs index no longer knows the thread.
+    assert (await session_client.get(f"/v1/sessions/{tid}")).status_code == 404
+    runs_page = await session_client.get(f"/v1/runs?q={tid}")
+    assert runs_page.status_code == 200
+    assert runs_page.json()["data"]["items"] == []
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    details = _purge_audit_details(page, tid)
+    assert details["meta_removed"] is True
+    assert details["runs"] == 1
+    assert details["approvals"] == 1
+
+
+@pytest.mark.asyncio
+async def test_purge_run_delete_failure_is_audit_visible(
+    session_client: AsyncClient,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed run cascade stays best-effort (200) but the failure is
+    flagged in both the response data and the audit details."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+
+    async def _boom(thread_id: object, *, tenant_id: object) -> int:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(app.state.agent_runtime.run_manager, "delete_by_thread", _boom)
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert body["data"]["runs"] == 0
+    assert body["data"]["runs_delete_failed"] is True
+
+    # Best-effort — the thread_meta row is still removed last.
+    assert (await session_client.get(f"/v1/sessions/{tid}")).status_code == 404
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    details = _purge_audit_details(page, tid)
+    assert details["runs_delete_failed"] is True
+    assert details["meta_removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_purge_approval_delete_failure_is_audit_visible(
+    session_client: AsyncClient,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed approval cascade is equally audit-visible."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+
+    async def _boom(*, thread_ids: object, tenant_id: object) -> int:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(app.state.approval_store, "delete_for_threads", _boom)
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["approvals"] == 0
+    assert data["approvals_delete_failed"] is True
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    details = _purge_audit_details(page, tid)
+    assert details["approvals_delete_failed"] is True
+    assert details["meta_removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_repeat_purge_returns_404(session_client: AsyncClient) -> None:
+    """Purge is idempotent at the HTTP surface: the first call removes the
+    thread_meta row, so the ownership gate hides the thread from a second
+    call (404 — current ``_load_owned_session`` semantics)."""
+    tid = await _create(session_client)
+    first = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert first.status_code == 200
+    assert first.json()["data"]["purged"] == tid
+
+    second = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert second.status_code == 404

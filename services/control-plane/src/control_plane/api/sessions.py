@@ -51,6 +51,7 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -122,6 +123,10 @@ def _get_agent_runtime(request: Request) -> AgentRuntime:
 
 def _get_agent_repo(request: Request) -> AgentSpecStore:
     return request.app.state.agent_spec_repo  # type: ignore[no-any-return]
+
+
+def _get_approval_store(request: Request) -> ApprovalStore:
+    return request.app.state.approval_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -819,20 +824,23 @@ def build_sessions_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         runtime: Annotated[AgentRuntime, Depends(_get_agent_runtime)],
+        approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
-        Removes ONLY thread-scoped data (checkpoint messages, run rows, the
-        thread_meta row). The user's persistent workspace + artifacts are
-        keyed by ``user_id`` and SHARED across that user's other threads, so
-        they are intentionally left untouched. Best-effort: a failed step is
-        logged, not fatal, and the thread_meta row is deleted LAST so a partial
-        failure never orphans the metadata.
+        Removes ONLY thread-scoped data (checkpoint messages, run rows +
+        their run_event children, agent_approval rows, the thread_meta row).
+        The user's persistent workspace + artifacts are keyed by ``user_id``
+        and SHARED across that user's other threads, so they are
+        intentionally left untouched. Best-effort: a failed step is logged
+        AND flagged in the audit details (``*_delete_failed``), not fatal,
+        and the thread_meta row is deleted LAST so a partial failure never
+        orphans the metadata.
         """
         await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
-        deleted: dict[str, object] = {"checkpoint": False, "runs": 0}
+        deleted: dict[str, object] = {"checkpoint": False, "runs": 0, "approvals": 0}
 
         checkpointer = runtime.durable_checkpointer
         adelete = getattr(checkpointer, "adelete_thread", None)
@@ -848,6 +856,14 @@ def build_sessions_router() -> APIRouter:
             )
         except Exception:
             logger.warning("session_purge.runs_failed", exc_info=True)
+            deleted["runs_delete_failed"] = True
+        try:
+            deleted["approvals"] = await approvals.delete_for_threads(
+                thread_ids=[thread_id], tenant_id=tenant_id
+            )
+        except Exception:
+            logger.warning("session_purge.approvals_failed", exc_info=True)
+            deleted["approvals_delete_failed"] = True
 
         removed = await threads.delete(thread_id, tenant_id=tenant_id)
         await emit(

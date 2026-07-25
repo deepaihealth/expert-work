@@ -160,7 +160,10 @@ async def test_agent_run_anonymize_keeps_row_nulls_user() -> None:
 
     assert await store.anonymize_all_for_user(tenant_id=tenant, user_id=a) == 1
     rows = await store.list_for_tenant(tenant_id=tenant, limit=100)
-    assert len(rows) == 2  # both KEPT (run_event RESTRICT — never deleted)
+    # Both rows KEPT — anonymize only nulls the user link. Row removal is
+    # ``delete_by_thread``'s job (which now also empties the ``run_event``
+    # children — deletion-hygiene PR3 §A), never this method's.
+    assert len(rows) == 2
     assert sorted((r.user_id is None) for r in rows) == [False, True]
     assert await store.anonymize_all_for_user(tenant_id=tenant, user_id=a) == 0
 

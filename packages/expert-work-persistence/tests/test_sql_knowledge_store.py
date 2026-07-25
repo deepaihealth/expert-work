@@ -537,6 +537,31 @@ async def test_set_status_ready_clears_lease(sql_store: SqlStoreFixture) -> None
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_set_document_status_reports_document_presence(sql_store: SqlStoreFixture) -> None:
+    """已删文档的状态写回返回 False —— 删除竞态下调用方可见"文档已不在"."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+        assert (
+            await store.set_document_status(
+                tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+            )
+            is True
+        )
+        assert await store.delete_document(tenant_id=tenant, document_id=doc.id) is True
+        assert (
+            await store.set_document_status(
+                tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY
+            )
+            is False
+        )
+    finally:
+        await engine.dispose()
+
+
 def _make_chunk(
     tenant_id: object,
     kb_id: object,

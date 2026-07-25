@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -18,7 +18,12 @@ from expert_work.persistence.curation import (
     InMemoryCurationCandidateStore,
     InMemoryEvalDatasetStore,
 )
-from expert_work.protocol import CurationCandidateRecord, CurationSignal, TrajectoryOutcome
+from expert_work.protocol import (
+    AuditQuery,
+    CurationCandidateRecord,
+    CurationSignal,
+    TrajectoryOutcome,
+)
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.trajectory import TrajectoryRecord, TrajectoryRecorder
 from tests.agent_fixtures import stub_agent_runtime
@@ -42,11 +47,13 @@ class _Ctx:
         candidates: InMemoryCurationCandidateStore,
         datasets: InMemoryEvalDatasetStore,
         object_store: InMemoryObjectStore,
+        audit_store: InMemoryAuditLogStore,
     ) -> None:
         self.client = client
         self.candidates = candidates
         self.datasets = datasets
         self.object_store = object_store
+        self.audit_store = audit_store
 
     async def seed_candidate(
         self,
@@ -87,9 +94,10 @@ async def ctx() -> AsyncIterator[_Ctx]:
     candidates = InMemoryCurationCandidateStore()
     datasets = InMemoryEvalDatasetStore()
     object_store = InMemoryObjectStore()
+    audit_store = InMemoryAuditLogStore()
     app = create_app(
         settings=settings,
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        audit_logger=build_default_audit_logger(audit_store),
         jwt_verifier=build_test_jwt_verifier(),
         agent_runtime=stub_agent_runtime(),
         enable_scheduler=False,
@@ -104,7 +112,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     async with AsyncClient(
         transport=transport, base_url="http://control-plane.test", headers=headers
     ) as client:
-        yield _Ctx(client, candidates, datasets, object_store)
+        yield _Ctx(client, candidates, datasets, object_store, audit_store)
 
 
 # --- eval-dataset CRUD -----------------------------------------------------
@@ -303,6 +311,112 @@ async def test_dismiss_candidate(ctx: _Ctx) -> None:
     stored = await ctx.candidates.get(candidate_id=candidate.id, tenant_id=_TENANT)
     assert stored is not None
     assert stored.status.value == "dismissed"
+
+
+# --- delete_eval_dataset → promoted-candidate revert (deletion hygiene PR3) --
+
+
+@pytest.mark.asyncio
+async def test_delete_eval_dataset_reverts_promoted_candidate(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    body = {"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"}
+    promoted = await ctx.client.post(f"/v1/curation/candidates/{candidate.id}/promote", json=body)
+    assert promoted.status_code == 201
+    dataset_id = promoted.json()["id"]
+
+    deleted = await ctx.client.delete(f"/v1/eval-datasets/{dataset_id}")
+    assert deleted.status_code == 200
+
+    stored = await ctx.candidates.get(candidate_id=candidate.id, tenant_id=_TENANT)
+    assert stored is not None
+    assert stored.status.value == "pending"
+    assert stored.eval_dataset_id is None
+
+    # Re-promotable — promoting again mints a fresh eval_dataset row.
+    again = await ctx.client.post(f"/v1/curation/candidates/{candidate.id}/promote", json=body)
+    assert again.status_code == 201
+    assert again.json()["id"] != dataset_id
+
+
+@pytest.mark.asyncio
+async def test_delete_eval_dataset_leaves_dismissed_candidate_alone(ctx: _Ctx) -> None:
+    to_promote = await ctx.seed_candidate()
+    to_dismiss = await ctx.seed_candidate()
+    dismissed = await ctx.client.post(f"/v1/curation/candidates/{to_dismiss.id}/dismiss")
+    assert dismissed.status_code == 200
+    body = {"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"}
+    promoted = await ctx.client.post(f"/v1/curation/candidates/{to_promote.id}/promote", json=body)
+    assert promoted.status_code == 201
+
+    deleted = await ctx.client.delete(f"/v1/eval-datasets/{promoted.json()['id']}")
+    assert deleted.status_code == 200
+
+    stored = await ctx.candidates.get(candidate_id=to_dismiss.id, tenant_id=_TENANT)
+    assert stored is not None
+    assert stored.status.value == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_delete_eval_dataset_audit_counts_reverted(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    body = {"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"}
+    promoted = await ctx.client.post(f"/v1/curation/candidates/{candidate.id}/promote", json=body)
+    assert promoted.status_code == 201
+
+    deleted = await ctx.client.delete(f"/v1/eval-datasets/{promoted.json()['id']}")
+    assert deleted.status_code == 200
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=_TENANT))
+    rows = [e for e in page.entries if e.action.value == "eval_dataset:delete"]
+    assert len(rows) == 1
+    assert rows[0].details["candidates_reverted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_eval_dataset_blocked_when_revert_fails(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revert runs BEFORE the delete and its failure propagates uncaught —
+    delete-then-crash would recreate the dangling pointer this fix removes."""
+    candidate = await ctx.seed_candidate()
+    body = {"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"}
+    promoted = await ctx.client.post(f"/v1/curation/candidates/{candidate.id}/promote", json=body)
+    assert promoted.status_code == 201
+    dataset_id = promoted.json()["id"]
+
+    async def _boom(*, dataset_id: UUID, tenant_id: UUID) -> int:
+        raise RuntimeError("revert failed")
+
+    monkeypatch.setattr(ctx.candidates, "revert_promoted_for_dataset", _boom)
+    with pytest.raises(RuntimeError, match="revert failed"):
+        await ctx.client.delete(f"/v1/eval-datasets/{dataset_id}")
+
+    # Revert-before-delete: the dataset row must survive a revert failure.
+    still_there = await ctx.datasets.get(dataset_id=UUID(dataset_id), tenant_id=_TENANT)
+    assert still_there is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_eval_dataset_without_candidate_counts_zero(ctx: _Ctx) -> None:
+    created = await ctx.client.post(
+        "/v1/eval-datasets",
+        json={
+            "agent_name": "reporter",
+            "name": "s",
+            "input": {},
+            "expected": {"a": 1},
+            "source": "golden",
+        },
+    )
+    assert created.status_code == 201
+
+    deleted = await ctx.client.delete(f"/v1/eval-datasets/{created.json()['id']}")
+    assert deleted.status_code == 200
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=_TENANT))
+    rows = [e for e in page.entries if e.action.value == "eval_dataset:delete"]
+    assert len(rows) == 1
+    assert rows[0].details["candidates_reverted"] == 0
 
 
 @pytest.mark.asyncio

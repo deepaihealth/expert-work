@@ -34,7 +34,11 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
-from expert_work.persistence.curation import CurationCandidateStore, EvalDatasetStore
+from expert_work.persistence.curation import (
+    CurationCandidateStore,
+    EvalDatasetInUseError,
+    EvalDatasetStore,
+)
 from expert_work.protocol import (
     AuditAction,
     CandidateStatus,
@@ -439,11 +443,32 @@ def build_eval_dataset_router() -> APIRouter:
         dataset_id: UUID,
         request: Request,
         datasets: Annotated[EvalDatasetStore, Depends(_get_eval_dataset_store)],
+        candidates: Annotated[CurationCandidateStore, Depends(_get_curation_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
-        deleted = await datasets.delete(dataset_id=dataset_id, tenant_id=tenant_id)
+        # Deletion hygiene PR3 — revert PROMOTED candidates BEFORE deleting the
+        # dataset row, and let a revert failure propagate (delete-then-crash
+        # would recreate the dangling pointer this fixes). Revert-then-crash is
+        # safe: the dataset row survives and the candidate is re-promotable.
+        reverted = await candidates.revert_promoted_for_dataset(
+            dataset_id=dataset_id, tenant_id=tenant_id
+        )
+        try:
+            deleted = await datasets.delete(dataset_id=dataset_id, tenant_id=tenant_id)
+        except EvalDatasetInUseError as exc:
+            # Normally unreachable — the endpoint reverts referencing
+            # candidates before deleting. This surfaces the 0135 RESTRICT FK
+            # (hit when a write path bypasses the app-level revert) as a
+            # semantic conflict instead of a 500.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "EVAL_DATASET_IN_USE",
+                    "message": "eval-dataset row is still referenced by curation candidates",
+                },
+            ) from exc
         if not deleted:
             raise HTTPException(status_code=404, detail="eval-dataset row not found")
         await emit(
@@ -454,6 +479,7 @@ def build_eval_dataset_router() -> APIRouter:
             resource_type="eval_dataset",
             resource_id=str(dataset_id),
             trace_id=current_trace_id_hex(),
+            details={"candidates_reverted": reverted},
         )
         return JSONResponse(content={"deleted": True})
 

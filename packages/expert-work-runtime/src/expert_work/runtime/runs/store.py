@@ -28,8 +28,9 @@ from uuid import UUID
 from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from expert_work.persistence.models import AgentRunRow, ThreadMetaRow
+from expert_work.persistence.models import AgentRunRow, RunEventRow, ThreadMetaRow
 from expert_work.persistence.thread_meta.base import ThreadMetaStore
+from expert_work.runtime.runs.event_store import RunEventStore
 from expert_work.runtime.runs.schemas import (
     DisconnectMode,
     RunInfo,
@@ -124,9 +125,12 @@ class RunStore(abc.ABC):
     async def delete_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> int:
         """Hard-delete every run row for ``thread_id`` under ``tenant_id``.
 
-        Session purge (hard delete of a whole conversation). Returns the
-        number of rows removed. Tenant-scoped — never touches another
-        tenant's runs.
+        Session purge (hard delete of a whole conversation). Also empties
+        the runs' ``run_event`` children first (``ON DELETE RESTRICT``
+        would otherwise block the parent delete — deletion-hygiene PR3
+        §A): SQL inside the same transaction, in-memory via the injected
+        event store. Returns the number of run rows removed (children not
+        counted). Tenant-scoped — never touches another tenant's runs.
         """
 
     @abc.abstractmethod
@@ -364,7 +368,12 @@ def _clamp_limit(limit: int) -> int:
 class InMemoryRunStore(RunStore):
     """In-memory ``RunStore`` for unit tests."""
 
-    def __init__(self, *, thread_meta_store: ThreadMetaStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        thread_meta_store: ThreadMetaStore | None = None,
+        event_store: RunEventStore | None = None,
+    ) -> None:
         # Keyed by run_id — the primary key.
         self._rows: dict[UUID, RunInfo] = {}
         # Stream RT-4 — runs carry no agent_name; the binding is on thread_meta.
@@ -373,6 +382,11 @@ class InMemoryRunStore(RunStore):
         # run's thread → agent. ``None`` when the caller does not wire it —
         # ``list_running_for_agent`` then returns [] (no join source).
         self._thread_meta_store = thread_meta_store
+        # Deletion-hygiene PR3 §A — the SQL store empties ``run_event``
+        # inside its delete transaction; the in-memory double mirrors that
+        # through the injected event store. ``None`` when the caller does
+        # not wire it — ``delete_by_thread`` then touches run rows only.
+        self._event_store = event_store
 
     async def create(self, info: RunInfo) -> None:
         if info.run_id in self._rows:
@@ -437,6 +451,9 @@ class InMemoryRunStore(RunStore):
             for rid, r in self._rows.items()
             if r.thread_id == thread_id and r.tenant_id == tenant_id
         ]
+        # Children first — mirrors the SQL store's in-transaction order.
+        if self._event_store is not None:
+            await self._event_store.delete_for_runs(run_ids=victims)
         for rid in victims:
             del self._rows[rid]
         return len(victims)
@@ -828,7 +845,19 @@ class SqlRunStore(RunStore):
         return [_row_to_dto(r) for r in rows]
 
     async def delete_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> int:
+        # Deletion-hygiene PR3 §A — empty the ``run_event`` children in the
+        # SAME transaction, children before parents: ``ON DELETE RESTRICT``
+        # would otherwise block the ``agent_run`` delete (the ghost-run bug).
         async with self._sf() as session:
+            run_ids = (
+                select(AgentRunRow.id)
+                .where(
+                    AgentRunRow.thread_id == thread_id,
+                    AgentRunRow.tenant_id == tenant_id,
+                )
+                .scalar_subquery()
+            )
+            await session.execute(delete(RunEventRow).where(RunEventRow.run_id.in_(run_ids)))
             result = await session.execute(
                 delete(AgentRunRow).where(
                     AgentRunRow.thread_id == thread_id,

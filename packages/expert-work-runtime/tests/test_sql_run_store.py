@@ -18,7 +18,14 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus, SqlRunStore
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    RunInfo,
+    RunStatus,
+    SqlRunEventStore,
+    SqlRunStore,
+    make_event_record,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -48,6 +55,19 @@ def run_store(postgres_container: PostgresContainer) -> Iterator[SqlRunStore]:
         DatabaseConfig(dsn=_async_dsn(postgres_container))
     )
     yield SqlRunStore(create_async_session_factory(engine))
+
+
+@pytest.fixture
+def run_event_store(postgres_container: PostgresContainer) -> Iterator[SqlRunEventStore]:
+    """``SqlRunEventStore`` on the same database as ``run_store``."""
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+
+    engine: AsyncEngine = create_async_engine_from_config(
+        DatabaseConfig(dsn=_async_dsn(postgres_container))
+    )
+    yield SqlRunEventStore(create_async_session_factory(engine))
 
 
 def _info(
@@ -195,6 +215,61 @@ async def test_delete_by_thread_scoped_to_thread_and_tenant(run_store: SqlRunSto
     assert await run_store.get(run_id=cross, tenant_id=other) is not None
     # Empty thread → no-op, rowcount 0.
     assert await run_store.delete_by_thread(thread_id=uuid4(), tenant_id=tenant) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_for_runs_removes_only_targeted_runs_sql(
+    run_store: SqlRunStore, run_event_store: SqlRunEventStore
+) -> None:
+    """Deletion-hygiene PR3 §A — SQL twin of the in-memory contract."""
+    tenant = uuid4()
+    run_a, run_b = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_a, tenant_id=tenant))
+    await run_store.create(_info(run_id=run_b, tenant_id=tenant))
+    await run_event_store.append(
+        make_event_record(run_id=run_a, seq=0, event_name="metadata", data={})
+    )
+    await run_event_store.append(
+        make_event_record(run_id=run_a, seq=1, event_name="updates", data={})
+    )
+    await run_event_store.append(
+        make_event_record(run_id=run_b, seq=0, event_name="metadata", data={})
+    )
+
+    assert await run_event_store.delete_for_runs(run_ids=[run_a]) == 2
+    assert list(await run_event_store.list(run_id=run_a)) == []
+    assert len(await run_event_store.list(run_id=run_b)) == 1
+    assert await run_event_store.delete_for_runs(run_ids=[]) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_by_thread_also_removes_child_run_events(
+    run_store: SqlRunStore, run_event_store: SqlRunEventStore
+) -> None:
+    """Deletion-hygiene PR3 §A — ghost-run root cause: ``run_event`` rows
+    (``ON DELETE RESTRICT``) must be emptied inside the same transaction,
+    otherwise the ``agent_run`` delete is blocked and the purge fails."""
+    tenant, thread = uuid4(), uuid4()
+    doomed, bystander = uuid4(), uuid4()
+    await run_store.create(_info(run_id=doomed, tenant_id=tenant, thread_id=thread))
+    await run_store.create(_info(run_id=bystander, tenant_id=tenant))  # other thread
+    await run_event_store.append(
+        make_event_record(run_id=doomed, seq=0, event_name="metadata", data={})
+    )
+    await run_event_store.append(
+        make_event_record(run_id=doomed, seq=1, event_name="updates", data={})
+    )
+    await run_event_store.append(
+        make_event_record(run_id=bystander, seq=0, event_name="metadata", data={})
+    )
+
+    removed = await run_store.delete_by_thread(thread_id=thread, tenant_id=tenant)
+    assert removed == 1
+    assert await run_store.get(run_id=doomed, tenant_id=tenant) is None
+    assert list(await run_event_store.list(run_id=doomed)) == []
+    # The bystander run on another thread keeps its row AND its events.
+    assert await run_store.get(run_id=bystander, tenant_id=tenant) is not None
+    assert len(await run_event_store.list(run_id=bystander)) == 1
 
 
 # ---------------------------------------------------------------------------

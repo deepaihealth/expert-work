@@ -327,10 +327,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
-    ) -> None:
+    ) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if document is None:
-            return
+            return False
         update: dict[str, object] = {
             "status": status,
             "error": error,
@@ -341,6 +341,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if status in (DocumentStatus.READY, DocumentStatus.FAILED):
             self._lease[document_id] = None  # terminal → release lease
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
+        return True
 
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
@@ -355,6 +356,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     async def replace_chunks(
         self, *, tenant_id: UUID, document_id: UUID, chunks: Sequence[KnowledgeChunk]
     ) -> None:
+        # Mirror the SQL side's FK (0136): writing chunks back to a deleted
+        # document must fail loudly instead of recreating orphan vectors.
+        if await self.get_document(tenant_id=tenant_id, document_id=document_id) is None:
+            raise KeyError(document_id)
         self._chunks = [
             c
             for c in self._chunks
