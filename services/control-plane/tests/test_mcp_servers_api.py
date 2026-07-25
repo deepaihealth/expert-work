@@ -1,7 +1,7 @@
 """API tests for /v1/mcp-servers — Stream V-C.
 
 Tests probe→persist→encrypt, probe-fail→422, SSRF→422, non-admin→403,
-duplicate-name→409, and delete-unreferenced→204.
+duplicate-name→409, and delete-unreferenced→200.
 
 Fixture helpers mirror the pattern from test_platform_config_api.py and
 test_members_api.py: create_app with test settings + jwt_verifier, then embed
@@ -10,6 +10,7 @@ role in the JWT claim (no role-binding seeding needed for tenant-scope roles).
 
 from __future__ import annotations
 
+import hashlib
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,7 +21,12 @@ from control_plane.mcp_probe import McpProbeError
 from control_plane.settings import Settings
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.lifecycle import Lifecycle
-from expert_work.protocol import McpConnectorCatalogUpsert, TenantConfigPatch
+from expert_work.protocol import (
+    AgentSpec,
+    AgentSpecStatus,
+    McpConnectorCatalogUpsert,
+    TenantConfigPatch,
+)
 from expert_work.runtime.secret_store import SecretNotFoundError, parse_secret_ref
 from orchestrator.tools.mcp import MCPToolDef
 from tests.auth_fixtures import (
@@ -87,6 +93,53 @@ async def _seed_viewer_headers(app: object, tenant_id: UUID) -> dict[str, str]:
     """
     token = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=("viewer",))
     return {"Authorization": f"Bearer {token}"}
+
+
+def _agent_spec(name: str, tools: list[dict[str, object]]) -> AgentSpec:
+    """Minimal valid AgentSpec with the given ``spec.tools`` entries."""
+    return AgentSpec.model_validate(
+        {
+            "apiVersion": "expert_work.io/v1",
+            "kind": "Agent",
+            "metadata": {"name": name, "version": "1.0.0", "tenant": "test-tenant"},
+            "spec": {
+                "tenant_config": {},
+                "model": {
+                    "provider": "anthropic",
+                    "name": "claude-sonnet-4-6",
+                    "api_key_ref": "secret://expert-work/dev/llm/anthropic",
+                },
+                "system_prompt": {"template": "you are a test agent"},
+                "sandbox": {
+                    "resources": {"cpu": "1.0", "memory": "1Gi"},
+                    "network": {"egress": "proxy", "allowlist": ["api.anthropic.com"]},
+                    "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+                },
+                "tools": tools,
+            },
+        }
+    )
+
+
+async def _seed_agent_spec(
+    app: object,
+    tenant_id: UUID,
+    name: str,
+    tools: list[dict[str, object]],
+    *,
+    status: AgentSpecStatus | None = None,
+) -> None:
+    """Create an agent spec row directly in the in-memory store, optionally
+    moving it to a non-ACTIVE status afterwards (create always inserts ACTIVE)."""
+    repo = app.state.agent_spec_repo  # type: ignore[attr-defined]
+    await repo.create(
+        tenant_id=tenant_id,
+        spec=_agent_spec(name, tools),
+        spec_sha256=hashlib.sha256(name.encode()).hexdigest(),
+        created_by="test",
+    )
+    if status is not None:
+        await repo.update_status(tenant_id=tenant_id, name=name, version="1.0.0", status=status)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +340,7 @@ async def test_post_invalid_name_rejected(monkeypatch: pytest.MonkeyPatch) -> No
 
 @pytest.mark.asyncio
 async def test_delete_succeeds_when_unreferenced(monkeypatch: pytest.MonkeyPatch) -> None:
-    """DELETE an existing server that is not referenced by any agent → 204."""
+    """DELETE an existing server that is not referenced by any agent → 200."""
     app, admin_headers, _ = await _make_app_with_admin()
     monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
     transport = ASGITransport(app=app)
@@ -304,10 +357,182 @@ async def test_delete_succeeds_when_unreferenced(monkeypatch: pytest.MonkeyPatch
         )
         assert create_resp.status_code == 201
         delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
-        assert delete_resp.status_code == 204
+        assert delete_resp.status_code == 200
+        body = delete_resp.json()
+        assert body["success"] is True
+        assert body["data"]["implicit_all_agents"] == 0
         # Verify it's gone from the list
         lst = await client.get("/v1/mcp-servers", headers=admin_headers)
         assert lst.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_conflicts_when_active_agent_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DELETE a server explicitly referenced by an ACTIVE agent → 409 IN_USE."""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        await _seed_agent_spec(
+            app,
+            tenant_id,
+            "consumer",
+            [{"type": "mcp", "servers": ["github"], "allow_tools": []}],
+        )
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 409
+        detail = delete_resp.json()["detail"]
+        assert detail["code"] == "MCP_SERVER_IN_USE"
+        assert "consumer" in detail["message"]
+        # Row must survive the refused delete.
+        lst = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert [row["name"] for row in lst.json()["data"]] == ["github"]
+
+
+@pytest.mark.asyncio
+async def test_delete_conflicts_when_deprecated_agent_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEPRECATED specs still count as live reference surface (only DELETED
+    is filtered out) — an explicit reference from one keeps the 409."""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        await _seed_agent_spec(
+            app,
+            tenant_id,
+            "sunsetting",
+            [{"type": "mcp", "servers": ["github"], "allow_tools": []}],
+            status=AgentSpecStatus.DEPRECATED,
+        )
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 409
+        assert delete_resp.json()["detail"]["code"] == "MCP_SERVER_IN_USE"
+
+
+@pytest.mark.asyncio
+async def test_delete_ignores_soft_deleted_agent_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug regression sentinel: a soft-deleted agent's explicit reference must
+    NOT block server deletion. Before the fix the reference check read ALL
+    specs (including DELETED tombstones), so one dead agent produced a false
+    409 that locked the server row forever."""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        await _seed_agent_spec(
+            app,
+            tenant_id,
+            "ghost",
+            [{"type": "mcp", "servers": ["github"], "allow_tools": []}],
+            status=AgentSpecStatus.DELETED,
+        )
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 200, delete_resp.text
+        lst = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert lst.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_reports_implicit_all_agents_in_response_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D3: servers empty/absent = dynamic "every available server" wildcard —
+    not a hard reference (delete proceeds), but the impact count is surfaced
+    in the delete response data AND the MCP_SERVER_DELETE audit details.
+    Soft-deleted specs and specs without mcp tools do not count."""
+    from control_plane.audit import build_default_audit_logger
+    from expert_work.persistence.audit_log import InMemoryAuditLogStore
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    lifecycle = Lifecycle()
+    lifecycle.mark_ready()
+    audit_store = InMemoryAuditLogStore()
+    app = create_app(
+        settings=_build_settings(),
+        lifecycle=lifecycle,
+        jwt_verifier=build_test_jwt_verifier(),
+        audit_logger=build_default_audit_logger(audit_store),
+    )
+    tenant_id = uuid4()
+    token = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=("admin",))
+    admin_headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    mcp_wildcard: list[dict[str, object]] = [{"type": "mcp", "servers": [], "allow_tools": []}]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        # Two live wildcard followers…
+        await _seed_agent_spec(app, tenant_id, "implicit-a", mcp_wildcard)
+        await _seed_agent_spec(app, tenant_id, "implicit-b", mcp_wildcard)
+        # …one agent without any mcp tool (counts 0)…
+        await _seed_agent_spec(
+            app, tenant_id, "no-mcp", [{"type": "builtin", "name": "web_search"}]
+        )
+        # …and one soft-deleted wildcard follower (must not count).
+        await _seed_agent_spec(
+            app, tenant_id, "implicit-ghost", mcp_wildcard, status=AgentSpecStatus.DELETED
+        )
+
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 200, delete_resp.text
+        body = delete_resp.json()
+        assert body["success"] is True
+        assert body["data"]["implicit_all_agents"] == 2
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    delete_entries = [r for r in page.entries if r.action == AuditAction.MCP_SERVER_DELETE]
+    assert len(delete_entries) == 1
+    assert delete_entries[0].details["name"] == "github"
+    assert delete_entries[0].details["implicit_all_agents"] == 2
 
 
 @pytest.mark.asyncio
@@ -351,7 +576,7 @@ async def test_post_and_delete_invalidate_tenant_mcp_cache(
         )
         assert post_resp.status_code == 201
         delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
-        assert delete_resp.status_code == 204
+        assert delete_resp.status_code == 200
 
     assert pool_spy.invalidated.count(tenant_id) == 2
     assert rt_spy.invalidated.count(tenant_id) == 2
@@ -389,7 +614,7 @@ async def test_delete_removes_token_and_headers_secrets(monkeypatch: pytest.Monk
         await app.state.secret_store.get(headers_name)  # type: ignore[attr-defined]  # does not raise
 
         delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
-        assert delete_resp.status_code == 204
+        assert delete_resp.status_code == 200
 
     with pytest.raises(SecretNotFoundError):
         await app.state.secret_store.get(token_name)  # type: ignore[attr-defined]
@@ -402,7 +627,7 @@ class _DeleteAlwaysFailsSecretStore:
 
     Used to prove the (c2) best-effort secret cleanup in the DELETE handler
     never lets a secret-store failure escape as a 500 — it must be caught,
-    logged, and the request must still complete (204 + row gone + audit
+    logged, and the request must still complete (200 + row gone + audit
     written). Regression guard for the ``extra={"name": ...}`` LogRecord
     collision that used to turn this into an unhandled ``KeyError``.
     """
@@ -424,7 +649,7 @@ class _DeleteAlwaysFailsSecretStore:
 async def test_delete_best_effort_secret_cleanup_does_not_abort_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """DELETE must still 204 + remove the row + write the audit row even when
+    """DELETE must still 200 + remove the row + write the audit row even when
     secret_store.delete raises. This also regression-guards the fixed
     logger.warning(..., extra={"server_name": name}) call: before the fix,
     ``extra={"name": name}`` collided with the reserved ``LogRecord.name``
@@ -472,7 +697,7 @@ async def test_delete_best_effort_secret_cleanup_does_not_abort_request(
 
     # (1) The request completes with the normal success status — the
     # secret-store failure never escapes as a 500.
-    assert delete_resp.status_code == 204
+    assert delete_resp.status_code == 200
 
     # (2) The row is really gone (delete happened before the best-effort
     # secret cleanup, so this is unaffected by the injected failure).
