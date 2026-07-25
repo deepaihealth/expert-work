@@ -110,6 +110,15 @@ async def _find_extends_dependents(
     ``@latest`` (``app.py`` ``_platform_template_resolver`` → ``get_latest(status=
     PUBLISHED)``, consumed by ``runtime._resolve_template_extends``)."""
     versions = await template_store.list_versions(name=name)
+    # 404 before 409 — "TEMPLATE_IN_USE" asserts the resource exists; a ghost
+    # target (typo'd version, orphaned pin) must surface as not-found, and its
+    # dangling dependents are already broken whether or not we delete (review
+    # T2 ruling).
+    if not any(r.version == version for r in versions):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "TEMPLATE_NOT_FOUND", "message": "not found"},
+        )
     target_is_last_resolvable = not any(
         r.version != version and r.status is PlatformAgentTemplateStatus.PUBLISHED for r in versions
     )

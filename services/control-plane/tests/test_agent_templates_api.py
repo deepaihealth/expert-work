@@ -267,6 +267,27 @@ async def test_delete_with_pinned_dependent_409(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_ghost_template_with_dangling_pin_is_404(ctx: _Ctx) -> None:
+    """A ghost target outranks its dangling dependents: 404, never 409.
+
+    "TEMPLATE_IN_USE" asserts the resource exists; a typo'd version (or an
+    orphaned pin left by an earlier delete) must surface as not-found — the
+    pinning tenant's build is already broken either way (review T2 ruling).
+    """
+    await ctx.client.post(_PREFIX, json=_upsert(), headers=ctx.admin_headers)
+    await ctx.seed_tenant_spec(name="fork-bot", extends="support-bot@9.9.9")
+
+    resp = await ctx.client.delete(f"{_PREFIX}/support-bot/9.9.9", headers=ctx.admin_headers)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["code"] == "TEMPLATE_NOT_FOUND"
+    # A ghost *name* (no versions at all) with a dangling @latest pin: same.
+    await ctx.seed_tenant_spec(name="latest-fork", extends="ghost-tpl@latest")
+    resp = await ctx.client.delete(f"{_PREFIX}/ghost-tpl/1.0.0", headers=ctx.admin_headers)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["code"] == "TEMPLATE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
 async def test_delete_without_dependents_204_and_audit_flag(ctx: _Ctx) -> None:
     """No inheritors → delete proceeds; audit details record the check ran."""
     await ctx.client.post(_PREFIX, json=_upsert(), headers=ctx.admin_headers)
