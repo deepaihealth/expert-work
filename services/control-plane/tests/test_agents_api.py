@@ -610,6 +610,49 @@ async def test_delete_cancels_in_flight_runs(cascade_ctx: _CascadeCtx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_cancels_only_this_versions_in_flight_runs(
+    cascade_ctx: _CascadeCtx,
+) -> None:
+    """Deletion hygiene follow-up — the cancel is version-level: deleting
+    ``code-reviewer@1.0.0`` leaves ``@2.0.0``'s live session running."""
+    v2_yaml = _VALID_YAML.replace('version: "1.0.0"', 'version: "2.0.0"')
+    reg = await cascade_ctx.client.post("/v1/agents", json={"manifest_yaml": v2_yaml})
+    assert reg.status_code == 201, reg.text
+
+    run_manager = cascade_ctx.app.state.agent_runtime.run_manager  # type: ignore[attr-defined]
+    runs: dict[str, UUID] = {}
+    for version in ("1.0.0", "2.0.0"):
+        sess = await cascade_ctx.client.post(
+            "/v1/sessions", json={"agent_name": "code-reviewer", "agent_version": version}
+        )
+        assert sess.status_code == 201, sess.text
+        thread_id = UUID(sess.json()["data"]["thread_id"])
+        run_id = uuid4()
+        await run_manager.create(
+            run_id=run_id, thread_id=thread_id, tenant_id=cascade_ctx.tenant_id
+        )
+        await run_manager.set_status(run_id, RunStatus.RUNNING)
+        runs[version] = run_id
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    v1_info = await cascade_ctx.run_store.get(run_id=runs["1.0.0"], tenant_id=cascade_ctx.tenant_id)
+    v2_info = await cascade_ctx.run_store.get(run_id=runs["2.0.0"], tenant_id=cascade_ctx.tenant_id)
+    assert v1_info is not None and v1_info.status is RunStatus.INTERRUPTED
+    assert v2_info is not None and v2_info.status is RunStatus.RUNNING  # not collateral damage
+
+    page = await cascade_ctx.audit_store.query(
+        AuditQuery(tenant_id=cascade_ctx.tenant_id, limit=1000)
+    )
+    cancels = [e for e in page.entries if e.action is AuditAction.SESSION_CANCEL]
+    assert [e.resource_id for e in cancels] == [str(runs["1.0.0"])]
+
+    details = await _manifest_delete_details(cascade_ctx)
+    assert details["runs_cancelled"] == 1
+
+
+@pytest.mark.asyncio
 async def test_delete_survives_trigger_disable_failure(
     cascade_ctx: _CascadeCtx, monkeypatch: pytest.MonkeyPatch
 ) -> None:
