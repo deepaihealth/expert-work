@@ -68,6 +68,7 @@ import { summarizeTurn } from "../../api/turn_summary";
 import { uploadDocument, uploadImage } from "../../api/uploads";
 import { MarkdownView } from "../../components/MarkdownView";
 import { SessionHistoryDrawer } from "../../components/SessionHistoryDrawer";
+import { downloadJson } from "../../components/turn/download_json";
 import { HistoryDivider } from "../../components/turn/HistoryDivider";
 import { TaskResultCard } from "../../components/turn/TaskResultCard";
 import {
@@ -1353,21 +1354,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
       </div>
     </div>
   );
-}
-
-/** Trigger a client-side download of ``data`` as a pretty-printed JSON file. */
-function downloadJson(filename: string, data: unknown): void {
-  const blob = new Blob([JSON.stringify(data, null, 2)], {
-    type: "application/json",
-  });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
 
 /** Hide dotfiles/dotdirs (``.npm``, ``.cache``, ``.mplconfig``, …) — runtime

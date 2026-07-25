@@ -9,6 +9,11 @@
 import type { ApprovalItem } from "../../api/approvals";
 import type { SseEvent } from "../../api/sessions";
 
+/** Re-exported so a consumer of ``useHistoryTurns`` can name the turn shape
+ *  without reaching back into ``pages/agent_detail/playground`` — one
+ *  components→pages edge instead of one per call site. */
+export type { HistoryTurn } from "../../pages/agent_detail/playground/history_turns";
+
 export interface Attachment {
   id: string;
   name: string;

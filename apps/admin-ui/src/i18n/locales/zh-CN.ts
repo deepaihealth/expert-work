@@ -393,6 +393,7 @@ const zhCN: TranslationKeys = {
     runs_title: "运行",
     runs_empty: "本对话暂无运行。",
     column_started: "开始时间",
+    view_run: "查看运行",
   },
   skills_tab: {
     title: "该智能体创作的技能",

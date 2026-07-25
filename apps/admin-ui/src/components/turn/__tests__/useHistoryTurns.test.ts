@@ -16,6 +16,11 @@ const getMessagesMock = vi.spyOn(sessionsSdk, "getSessionMessages");
 const listThreadRunsMock = vi.spyOn(runsSdk, "listThreadRuns");
 const streamRunEventsMock = vi.spyOn(runsSdk, "streamRunEvents");
 
+// Records every ``observe(el)`` across stub instances so the re-registration
+// guard (``runIdByEl``) can be asserted directly, not just via its replay
+// side effect.
+const observeSpy = vi.fn<(el: Element) => void>();
+
 // jsdom has no IntersectionObserver — stub one that treats every observed
 // element as immediately visible (fires its callback synchronously from
 // ``observe``), mirroring ``PlaygroundTab.test.tsx``.
@@ -25,6 +30,7 @@ class IOStub {
     this.cb = cb;
   }
   observe = (el: Element) => {
+    observeSpy(el);
     this.cb(
       [{ isIntersecting: true, target: el } as IntersectionObserverEntry],
       this as unknown as IntersectionObserver,
@@ -73,6 +79,7 @@ beforeEach(() => {
   listThreadRunsMock.mockResolvedValue([]);
   streamRunEventsMock.mockReset();
   streamRunEventsMock.mockImplementation(() => makeStream([]));
+  observeSpy.mockReset();
   vi.stubGlobal("IntersectionObserver", IOStub);
 });
 
@@ -156,6 +163,28 @@ describe("useHistoryTurns", () => {
     });
     expect(streamRunEventsMock).toHaveBeenCalledTimes(1);
     expect(result.current.loads.r1.events).toHaveLength(2);
+  });
+
+  it("observes a row element only once when its ref re-registers", async () => {
+    getMessagesMock.mockResolvedValue(oneTurnOfMessages);
+    listThreadRunsMock.mockResolvedValue(oneRun);
+
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+
+    // A row's ref prop is a fresh closure every render (curried by
+    // ``registerRow``), so React re-invokes it on every re-render of that row —
+    // not just on mount. ``runIdByEl`` is the guard that keeps the shared
+    // observer from accumulating duplicate registrations for the SAME element.
+    const row = document.createElement("div");
+    await act(async () => {
+      result.current.registerRow("r1", "th-1")(row);
+      result.current.registerRow("r1", "th-1")(row);
+    });
+
+    expect(observeSpy).toHaveBeenCalledTimes(1);
   });
 
   it("drops a stale load's result when a newer load superseded it", async () => {

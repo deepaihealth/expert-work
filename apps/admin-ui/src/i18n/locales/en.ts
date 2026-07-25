@@ -385,6 +385,7 @@ export interface TranslationKeys {
     runs_title: string;
     runs_empty: string;
     column_started: string;
+    view_run: string;
   };
   skills_tab: {
     title: string;
@@ -3268,6 +3269,7 @@ const en: TranslationKeys = {
     runs_title: "Runs",
     runs_empty: "No runs in this conversation.",
     column_started: "Started",
+    view_run: "View run",
   },
   skills_tab: {
     title: "Skills authored by this agent",
