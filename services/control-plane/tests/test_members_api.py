@@ -554,6 +554,7 @@ async def test_purge_invited_member_revokes_and_deletes_kc_account(
     assert data["role_bindings_removed"] == 1
     assert data["role_bindings_cleanup_failed"] is False
     assert data["data_purged"] is False  # subject_id NULL — never logged in
+    assert data["data_purge_failed"] is False
     assert data["purge"] is None
 
     member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
@@ -569,6 +570,10 @@ async def test_purge_invited_member_revokes_and_deletes_kc_account(
     assert rows[0].details["kc_deleted"] is True
     assert rows[0].details["role_bindings_removed"] == 1
     assert rows[0].details["data_purged"] is False
+    assert rows[0].details["data_purge_failed"] is False
+    # No data step ran at all — accountability distinguishes that from "ran
+    # and every store succeeded" (True) and "ran, some store failed" (False).
+    assert rows[0].details["purge_ok"] is None
 
 
 @pytest.mark.asyncio
@@ -594,6 +599,7 @@ async def test_purge_active_member_suspends_deletes_kc_and_purges_data(
     assert data["status"] == "suspended"
     assert data["kc_deleted"] is True
     assert data["data_purged"] is True
+    assert data["data_purge_failed"] is False
     assert data["purge"] is not None
     assert data["purge"]["user_id"] == str(user_id)
     assert data["purge"]["threads_purged"] == 1
@@ -611,6 +617,8 @@ async def test_purge_active_member_suspends_deletes_kc_and_purges_data(
     assert len(rows) == 1
     assert rows[0].details["from_status"] == "active"
     assert rows[0].details["data_purged"] is True
+    assert rows[0].details["data_purge_failed"] is False
+    assert rows[0].details["purge_ok"] is True  # ran AND every store succeeded
 
 
 @pytest.mark.asyncio
@@ -755,6 +763,94 @@ async def test_purge_transition_conflict_409_blocks_all_side_effects(
     assert still is not None
     page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
     assert [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE] == []
+
+
+@pytest.mark.asyncio
+async def test_purge_partial_cascade_records_purge_ok_false(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑧ one cascade store fails → 200, ``purge.ok`` false, audit ``purge_ok`` false.
+
+    ``data_purged`` alone can't tell "ran and fully succeeded" from "ran and
+    half-failed" — the audit row carries ``purge_ok`` so the offboarding is
+    accountable without re-deriving it from the (unstored) summary.
+    """
+    from expert_work.protocol import AuditAction, AuditQuery
+    from orchestrator.tools.sandbox import RecordingSupervisorClient
+
+    client, tenant_id, app, _kc = admin_app
+    # Supervisor wired so the ONLY failure is the injected one.
+    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    member_id = await _invite_one(client, tenant_id)
+    await _activate_with_data(app, tenant_id, member_id)
+
+    async def _memory_boom(**_kwargs: object) -> int:
+        raise RuntimeError("forced memory purge failure (test)")
+
+    monkeypatch.setattr(app.state.memory_repo, "delete_all_for_user", _memory_boom)  # type: ignore[attr-defined]
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["data_purged"] is True  # the step ran…
+    assert data["data_purge_failed"] is False  # …and did not blow up as a whole
+    assert data["purge"]["ok"] is False  # …but a store inside it failed
+    assert "memory_item" in data["purge"]["failures"]
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    rows = [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE]
+    assert len(rows) == 1
+    assert rows[0].details["data_purged"] is True
+    assert rows[0].details["purge_ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_purge_data_step_failure_is_best_effort_and_audited(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑨ data-step *resolution* blows up → 200 + flag, not a 500 with no audit row.
+
+    ``users.get`` / dep assembly sit OUTSIDE ``purge_user``'s per-step
+    best-effort net. A transient failure there used to 500 *after* the
+    Keycloak account was already deleted — the destructive prefix happened
+    with no audit trail at all.
+    """
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    client, tenant_id, app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+    _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+
+    async def _users_get_boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("forced registry read failure (test)")
+
+    monkeypatch.setattr(app.state.tenant_user_repo, "get", _users_get_boom)  # type: ignore[attr-defined]
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["data_purged"] is False
+    assert data["data_purge_failed"] is True
+    assert data["purge"] is None
+    # The steps before it still ran and are still reported truthfully.
+    assert data["status"] == "suspended"
+    assert data["kc_deleted"] is True
+    assert data["role_bindings_removed"] == 1
+    assert len(kc.users) == 0
+    still = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert still is not None  # data untouched — the operator must re-run
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    rows = [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE]
+    assert len(rows) == 1  # the audit row lands even though the data step died
+    assert rows[0].details["kc_deleted"] is True
+    assert rows[0].details["data_purged"] is False
+    assert rows[0].details["data_purge_failed"] is True
+    assert rows[0].details["purge_ok"] is None
 
 
 @pytest.mark.asyncio

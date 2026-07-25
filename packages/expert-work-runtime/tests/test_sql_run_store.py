@@ -589,3 +589,38 @@ async def test_list_running_for_agent_joins_thread_meta(run_store: SqlRunStore) 
     running = await run_store.list_running_for_agent(tenant_id=tenant, agent_name="a")
     # Only agent a's RUNNING run — not its SUCCESS run, not agent b's run.
     assert {r.run_id for r in running} == {run_a_running}
+
+
+@pytest.mark.asyncio
+async def test_list_running_for_agent_filters_by_version_when_given(
+    run_store: SqlRunStore,
+) -> None:
+    """Deletion hygiene follow-up — parity with the in-memory double:
+    ``agent_version`` narrows to that version; ``None`` stays name-level;
+    a thread with a NULL version is out of scope of a version-level cancel."""
+    from expert_work.persistence.thread_meta import SqlThreadMetaStore
+
+    threads = SqlThreadMetaStore(run_store._sf)  # same engine as the run store
+    tenant = uuid4()
+    t_v1, t_v2, t_unbound = uuid4(), uuid4(), uuid4()
+    for tid, version in ((t_v1, "1.0.0"), (t_v2, "2.0.0"), (t_unbound, None)):
+        await threads.create(
+            thread_id=tid,
+            tenant_id=tenant,
+            created_by="seed",
+            agent_name="foo",
+            agent_version=version,
+        )
+    run_v1, run_v2, run_unbound = uuid4(), uuid4(), uuid4()
+    for run_id, thread_id in ((run_v1, t_v1), (run_v2, t_v2), (run_unbound, t_unbound)):
+        await run_store.create(
+            _info(run_id=run_id, tenant_id=tenant, thread_id=thread_id, status=RunStatus.RUNNING)
+        )
+
+    both = await run_store.list_running_for_agent(tenant_id=tenant, agent_name="foo")
+    assert {r.run_id for r in both} == {run_v1, run_v2, run_unbound}  # no version = old semantics
+
+    only_v1 = await run_store.list_running_for_agent(
+        tenant_id=tenant, agent_name="foo", agent_version="1.0.0"
+    )
+    assert {r.run_id for r in only_v1} == {run_v1}  # version sentinel; NULL row excluded

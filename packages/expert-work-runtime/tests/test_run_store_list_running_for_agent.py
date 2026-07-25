@@ -42,14 +42,19 @@ def _info(
 
 
 async def _seed_thread(
-    threads: InMemoryThreadMetaStore, *, thread_id: UUID, tenant_id: UUID, agent_name: str
+    threads: InMemoryThreadMetaStore,
+    *,
+    thread_id: UUID,
+    tenant_id: UUID,
+    agent_name: str,
+    agent_version: str | None = "1.0.0",
 ) -> None:
     await threads.create(
         thread_id=thread_id,
         tenant_id=tenant_id,
         created_by="seed",
         agent_name=agent_name,
-        agent_version="1.0.0",
+        agent_version=agent_version,
     )
 
 
@@ -101,6 +106,42 @@ async def test_scoped_by_tenant() -> None:
 
     running = await store.list_running_for_agent(tenant_id=tenant_a, agent_name="shared")
     assert {r.run_id for r in running} == {run_a}
+
+
+@pytest.mark.asyncio
+async def test_list_running_for_agent_filters_by_version_when_given() -> None:
+    """Deletion hygiene follow-up — deleting ``foo@v1`` must not cancel
+    ``foo@v2``'s live runs. ``agent_version=None`` keeps the name-level
+    semantics the kill switch relies on; a thread with no recorded version
+    is out of scope of a version-level cancel."""
+    threads = InMemoryThreadMetaStore()
+    store = InMemoryRunStore(thread_meta_store=threads)
+    tenant = uuid4()
+
+    t_v1, t_v2, t_unbound = uuid4(), uuid4(), uuid4()
+    await _seed_thread(
+        threads, thread_id=t_v1, tenant_id=tenant, agent_name="foo", agent_version="1.0.0"
+    )
+    await _seed_thread(
+        threads, thread_id=t_v2, tenant_id=tenant, agent_name="foo", agent_version="2.0.0"
+    )
+    await _seed_thread(
+        threads, thread_id=t_unbound, tenant_id=tenant, agent_name="foo", agent_version=None
+    )
+
+    run_v1, run_v2, run_unbound = uuid4(), uuid4(), uuid4()
+    for run_id, thread_id in ((run_v1, t_v1), (run_v2, t_v2), (run_unbound, t_unbound)):
+        await store.create(
+            _info(run_id=run_id, tenant_id=tenant, thread_id=thread_id, status=RunStatus.RUNNING)
+        )
+
+    both = await store.list_running_for_agent(tenant_id=tenant, agent_name="foo")
+    assert {r.run_id for r in both} == {run_v1, run_v2, run_unbound}  # no version = old semantics
+
+    only_v1 = await store.list_running_for_agent(
+        tenant_id=tenant, agent_name="foo", agent_version="1.0.0"
+    )
+    assert {r.run_id for r in only_v1} == {run_v1}  # version sentinel; NULL row excluded
 
 
 @pytest.mark.asyncio

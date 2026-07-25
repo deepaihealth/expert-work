@@ -1203,14 +1203,16 @@ def build_agents_router() -> APIRouter:
 
         # Deletion hygiene PR4 — cascade, best-effort with audit-visible
         # failures. Cancel the agent's in-flight runs (same RT-ADR-17 loop as
-        # ``disable_agent``; ``RunInfo`` carries no agent_version, so the
-        # cancel is name-level — wider than this version-level delete, never
-        # narrower), then disable this version's triggers so they stop firing
+        # ``disable_agent``, but narrowed to this version via the session's
+        # ``thread_meta.agent_version`` — deleting v1 must not kill a live v2
+        # session), then disable this version's triggers so they stop firing
         # against a deleted agent.
         details: dict[str, object] = {}
         cancelled = 0
         try:
-            running = await run_store.list_running_for_agent(tenant_id=tenant_id, agent_name=name)
+            running = await run_store.list_running_for_agent(
+                tenant_id=tenant_id, agent_name=name, agent_version=version
+            )
             now = datetime.now(UTC)
             for run in running:
                 stopped = await runtime.run_manager.cancel(

@@ -169,7 +169,9 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def list_running_for_agent(self, *, tenant_id: UUID, agent_name: str) -> list[RunInfo]:
+    async def list_running_for_agent(
+        self, *, tenant_id: UUID, agent_name: str, agent_version: str | None = None
+    ) -> list[RunInfo]:
         """Return the ``RUNNING`` runs bound to ``agent_name`` under ``tenant_id``.
 
         Stream RT-4 (RT-ADR-17) — the agent-level kill switch bulk-cancels
@@ -178,6 +180,21 @@ class RunStore(abc.ABC):
         joins ``agent_run`` ↔ ``thread_meta`` on ``thread_id`` where
         ``thread_meta.agent_name = agent_name`` and ``agent_run.status =
         'running'``. Tenant-scoped — never returns another tenant's runs.
+
+        ``agent_version`` given narrows the result to that version (the
+        version-level delete cascade); ``None`` keeps the name-level
+        semantics (the kill switch, which covers all versions).
+        ``thread_meta.agent_version`` is nullable, so a thread with no
+        recorded version never matches a version-level query — deleting one
+        version must not cancel runs that were never bound to it.
+
+        A version-level query is **not** exhaustive for a second reason: the
+        external-app path (``api/agents.py:_resolve_session``) reuses an
+        existing thread by ``agent_name`` alone, so a thread stamped ``1.0.0``
+        may be executing the newest ACTIVE version's code. Deleting that newer
+        version does not cancel such a run. Delete-cascade cancellation is
+        hygiene (the run still dies on its deadline); the emergency stop is the
+        kill switch, which stays name-level precisely for this reason.
         """
 
     @abc.abstractmethod
@@ -494,7 +511,9 @@ class InMemoryRunStore(RunStore):
         clamped = _clamp_limit(limit)
         return rows[offset : offset + clamped]
 
-    async def list_running_for_agent(self, *, tenant_id: UUID, agent_name: str) -> list[RunInfo]:
+    async def list_running_for_agent(
+        self, *, tenant_id: UUID, agent_name: str, agent_version: str | None = None
+    ) -> list[RunInfo]:
         if self._thread_meta_store is None:
             return []
         running = [
@@ -505,8 +524,11 @@ class InMemoryRunStore(RunStore):
         out: list[RunInfo] = []
         for r in running:
             meta = await self._thread_meta_store.get(r.thread_id, tenant_id=tenant_id)
-            if meta is not None and meta.agent_name == agent_name:
-                out.append(r)
+            if meta is None or meta.agent_name != agent_name:
+                continue
+            if agent_version is not None and meta.agent_version != agent_version:
+                continue
+            out.append(r)
         out.sort(key=lambda r: r.created_at, reverse=True)
         return out
 
@@ -923,7 +945,9 @@ class SqlRunStore(RunStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(r) for r in rows]
 
-    async def list_running_for_agent(self, *, tenant_id: UUID, agent_name: str) -> list[RunInfo]:
+    async def list_running_for_agent(
+        self, *, tenant_id: UUID, agent_name: str, agent_version: str | None = None
+    ) -> list[RunInfo]:
         # Stream RT-4 (RT-ADR-17) — join agent_run ↔ thread_meta on thread_id;
         # the agent binding lives on thread_meta. RLS scopes agent_run to the
         # tenant; the explicit tenant_id predicate keeps the in-memory double's
@@ -938,6 +962,10 @@ class SqlRunStore(RunStore):
             )
             .order_by(AgentRunRow.created_at.desc())
         )
+        if agent_version is not None:
+            # NULL agent_version rows drop out here (SQL NULL comparison) —
+            # same as the in-memory double's ``!= agent_version`` skip.
+            stmt = stmt.where(ThreadMetaRow.agent_version == agent_version)
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(r) for r in rows]

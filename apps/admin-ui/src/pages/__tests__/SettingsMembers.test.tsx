@@ -161,6 +161,18 @@ const PURGE_PARTIAL: MemberPurgeResult = {
   purge: null,
 };
 
+// Backend PR5 follow-up: the data-purge step is best-effort — a registry
+// read / dependency assembly blowup no longer 500s, it comes back 200 with
+// ``data_purge_failed: true`` and ``purge: null`` while every other step
+// reports success. Renders as fully successful without the partial check
+// below, even though not one row of business data was cleared.
+const PURGE_DATA_STEP_FAILED: MemberPurgeResult = {
+  ...PURGE_OK,
+  data_purged: false,
+  data_purge_failed: true,
+  purge: null,
+};
+
 const crossTenantMembers: TenantMember[] = [
   { ...activeMember },
   {
@@ -294,6 +306,28 @@ describe("SettingsMembers — deactivate & purge", () => {
   it("keeps the modal open on a partial failure so retry stays actionable", async () => {
     vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
     vi.mocked(purgeMember).mockResolvedValue(PURGE_PARTIAL);
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-purge-m-1"));
+    await user.type(
+      await screen.findByTestId("purge-confirm-input"),
+      "alice@example.com",
+    );
+    await user.click(screen.getByTestId("purge-confirm-ok"));
+
+    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-1"));
+    // Partial failure stays put — modal open for a retry, no roster refresh.
+    expect(screen.getByTestId("purge-confirm-input")).toBeInTheDocument();
+    expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the modal open when the data-purge step failed to even start", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(purgeMember).mockResolvedValue(PURGE_DATA_STEP_FAILED);
     const user = userEvent.setup();
     renderPage();
 

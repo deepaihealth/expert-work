@@ -763,3 +763,37 @@ async def test_delete_trigger_without_runs_audits_zero(
 
     entry = await _delete_audit_entry(audit_store, trigger_id=trigger_id)
     assert entry.details == {"runs_removed": 0}  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_403_delete_leaves_trigger_run_rows_intact(
+    triggers_client: AsyncClient,
+) -> None:
+    """非 admin 删他人无主 trigger —— 403,且该 trigger 的 trigger_run 子行未被级联删除。
+
+    锁定 ``delete_trigger`` 的操作顺序不变式:所有权闸必须先于 PR3 引入的
+    孤儿行级联跑。若级联被误挪到权限门之前(比如为了顺手把
+    ``runs_removed`` 算出来揣在 403 响应里),被拒绝的调用方虽然拿不到
+    删除权限,却能把受害者的 trigger_run 行清空 —— 本测试锁定"403 时子行
+    原封不动"这条线。用无主(service principal 建)trigger 复用
+    ``test_null_owner_trigger_delete_requires_admin`` 的构造,让攻击者是
+    真实存在的非 admin user(不是同一 caller 打自己)。
+    """
+    sa = _client_as(triggers_client, subject="svc-1", roles=(), sub_type="service_account")
+    async with sa:
+        created = await _create_cron(sa, name="unowned-with-runs")
+    trigger_id = UUID(str(created["id"]))
+
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    await _seed_trigger_run(app, trigger_id=trigger_id)
+    await _seed_trigger_run(app, trigger_id=trigger_id)
+
+    attacker = _client_as(triggers_client, subject="user-attacker", roles=("viewer",))
+    async with attacker:
+        resp = await attacker.delete(f"/v1/triggers/{trigger_id}")
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "USER_SCOPE_FORBIDDEN"
+
+    run_store = app.state.trigger_run_store
+    surviving = await run_store.list_by_trigger(trigger_id=trigger_id, tenant_id=_DEFAULT_TENANT)
+    assert len(surviving) == 2
