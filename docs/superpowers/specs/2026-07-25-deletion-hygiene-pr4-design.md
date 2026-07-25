@@ -52,6 +52,10 @@
    对每份 spec 用 `parse_extends_ref`(agent_template_resolve.py:111)解析
    `extends` 并与 `{name}@{version}` 精确匹配。仅统计 **status != DELETED** 的
    spec(软删 agent 不算继承者——与 §C bug 修同一原则)。
+   **`name@latest` 引用者的判定**:latest 由构建方对模板 store 重解析——删掉
+   一个版本后若该名字仍有其他可解析版本(与 `get_latest` 的可见性语义对齐,
+   plan 时核),latest 引用者不受影响、**不算继承者**;仅当删除目标是该名字
+   最后一个可解析版本时才算(否则误拦)。
 2. 命中 → **409** `TEMPLATE_IN_USE`,body 携带:继承者总数 + 前 20 条
    `{tenant_id, agent: "name@version"}` 清单(cap 防 body 爆炸)。无 force。
 3. 无命中 → 照删;审计 details 加 `dependents_checked: true`(区分新老行为)。
