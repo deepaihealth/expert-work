@@ -28,6 +28,7 @@ from expert_work.persistence import (
     TenantMcpServerStore,
 )
 from expert_work.protocol import (
+    AgentSpecRecord,
     AgentSpecStatus,
     AuditAction,
     McpServerAuthType,
@@ -46,6 +47,11 @@ from expert_work.runtime.secret_store import SecretStore, parse_secret_ref
 logger = logging.getLogger("expert_work.control_plane.api.mcp_servers")
 
 _DEFAULT_TIMEOUT_S = 30.0
+
+# Page size for the delete-time agent-spec reference sweep. The sweep MUST see
+# every spec of the tenant — a single fixed page silently hid references past
+# the boundary and deleted in-use servers.
+_SPEC_PAGE_SIZE = 200
 
 
 def manifest_references_server(spec_json: Mapping[str, Any], server_name: str) -> bool:
@@ -1032,9 +1038,18 @@ def build_mcp_servers_router() -> APIRouter:
         # agent_spec_repo may be None in minimal deployments (no spec store wired).
         implicit_all = 0
         if agent_spec_store is not None:
-            specs = await agent_spec_store.list_by_tenant(  # type: ignore[attr-defined]
-                tenant_id=tenant_id, limit=1000
-            )
+            # Sweep every page: one fixed page hid references past its boundary
+            # and let the delete through on tenants with more specs than that.
+            specs: list[AgentSpecRecord] = []
+            offset = 0
+            while True:
+                page = await agent_spec_store.list_by_tenant(  # type: ignore[attr-defined]
+                    tenant_id=tenant_id, limit=_SPEC_PAGE_SIZE, offset=offset
+                )
+                specs.extend(page)
+                if len(page) < _SPEC_PAGE_SIZE:
+                    break
+                offset += _SPEC_PAGE_SIZE
             active_specs = [s for s in specs if s.status is not AgentSpecStatus.DELETED]
             # AgentSpecRecord.spec is an AgentSpec object — convert to dict (once
             # per spec) for the helpers below, which read raw manifest dicts.
