@@ -133,6 +133,7 @@ export function isMemberPurgePartial(result: MemberPurgeResult): boolean {
   return (
     result.kc_delete_failed ||
     result.role_bindings_cleanup_failed ||
+    result.data_purge_failed === true ||
     (result.purge !== null && !result.purge.ok)
   );
 }
