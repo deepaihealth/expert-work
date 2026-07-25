@@ -49,7 +49,7 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.uplift_metrics import record_manifest_provider_rejected
-from expert_work.persistence import ApprovalStore
+from expert_work.persistence import ApprovalStore, TriggerStore
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore, DuplicateAgentSpecError
@@ -272,6 +272,10 @@ def _get_agent_disable_service(request: Request) -> AgentDisableService:
 
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+def _get_trigger_store(request: Request) -> TriggerStore:
+    return request.app.state.trigger_store  # type: ignore[no-any-return]
 
 
 class _SessionError(Exception):
@@ -1171,9 +1175,14 @@ def build_agents_router() -> APIRouter:
         version: str,
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        run_store: Annotated[RunStore, Depends(_get_run_store)],
+        runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
+        triggers: Annotated[TriggerStore, Depends(_get_trigger_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id = request.state.tenant_id
+        actor_id = request.state.actor_id
+        trace_id = current_trace_id_hex()
         # Stream 8.5 — authorize against the existing instance before deleting.
         existing = await repo.get(tenant_id=tenant_id, name=name, version=version)
         if existing is None:
@@ -1191,14 +1200,60 @@ def build_agents_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="agent not found")
         # Drop the deleted build so a re-register at the same version rebuilds.
         _invalidate_agent_build_cache(request, tenant_id)
+
+        # Deletion hygiene PR4 — cascade, best-effort with audit-visible
+        # failures. Cancel the agent's in-flight runs (same RT-ADR-17 loop as
+        # ``disable_agent``; ``RunInfo`` carries no agent_version, so the
+        # cancel is name-level — wider than this version-level delete, never
+        # narrower), then disable this version's triggers so they stop firing
+        # against a deleted agent.
+        details: dict[str, object] = {}
+        cancelled = 0
+        try:
+            running = await run_store.list_running_for_agent(tenant_id=tenant_id, agent_name=name)
+            now = datetime.now(UTC)
+            for run in running:
+                stopped = await runtime.run_manager.cancel(
+                    run.run_id
+                ) or await run_store.request_cancel(
+                    run_id=run.run_id, tenant_id=tenant_id, updated_at=now
+                )
+                if stopped:
+                    cancelled += 1
+                    await emit(
+                        audit,
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        action=AuditAction.SESSION_CANCEL,
+                        resource_type="run",
+                        resource_id=str(run.run_id),
+                        trace_id=trace_id,
+                        reason="agent_deleted",
+                    )
+        except Exception:
+            logger.warning("agent_delete.runs_cancel_failed", exc_info=True)
+            details["runs_cancel_failed"] = True
+        details["runs_cancelled"] = cancelled
+
+        disabled = 0
+        try:
+            disabled = await triggers.disable_for_agent(
+                agent_name=name, agent_version=version, tenant_id=tenant_id
+            )
+        except Exception:
+            logger.warning("agent_delete.triggers_disable_failed", exc_info=True)
+            details["triggers_disable_failed"] = True
+        details["triggers_disabled"] = disabled
+
         await emit(
             audit,
             tenant_id=tenant_id,
-            actor_id=request.state.actor_id,
+            actor_id=actor_id,
             action=AuditAction.MANIFEST_DELETE,
             resource_type="manifest",
             resource_id=f"{name}/{version}",
-            trace_id=current_trace_id_hex(),
+            trace_id=trace_id,
+            details=details,
         )
         return JSONResponse(status_code=204, content=None)
 

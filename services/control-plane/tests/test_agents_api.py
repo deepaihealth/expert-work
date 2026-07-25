@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -10,8 +12,12 @@ from httpx import ASGITransport, AsyncClient
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
+from expert_work.persistence import TriggerStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditQuery
+from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
+from expert_work.protocol import AuditAction, AuditQuery, TriggerRecord
+from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
+from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -421,3 +427,227 @@ async def test_delete_invalidates_runtime_build_cache(
     assert resp.status_code == 204
     # A re-register at the same (name, version) must not reuse the deleted build.
     assert key not in app.state.agent_runtime._cache  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Deletion hygiene PR4 — delete cascade (cancel in-flight runs + disable
+# triggers + audit counts / failure booleans)
+# ---------------------------------------------------------------------------
+
+
+class _CascadeCtx:
+    """Delete-cascade test context — app + the stores the cascade touches."""
+
+    def __init__(
+        self,
+        *,
+        client: AsyncClient,
+        app: object,
+        tenant_id: UUID,
+        run_store: InMemoryRunStore,
+        audit_store: InMemoryAuditLogStore,
+    ) -> None:
+        self.client = client
+        self.app = app
+        self.tenant_id = tenant_id
+        self.run_store = run_store
+        self.audit_store = audit_store
+
+
+@pytest.fixture
+async def cascade_ctx() -> AsyncIterator[_CascadeCtx]:
+    """Like ``b5_client`` but with the run / thread stores explicitly shared
+    between the runtime's RunManager and ``app.state`` (the ``disable_agent``
+    test wiring) so the delete cascade's run-cancel loop is observable."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    threads = InMemoryThreadMetaStore()
+    run_store = InMemoryRunStore(thread_meta_store=threads)
+    run_event_store = InMemoryRunEventStore()
+    audit_store = InMemoryAuditLogStore()
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+        thread_meta_repo=threads,
+    )
+    tenant_id = uuid4()
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=tenant_id)}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+        assert resp.status_code == 201, resp.text
+        yield _CascadeCtx(
+            client=client,
+            app=app,
+            tenant_id=tenant_id,
+            run_store=run_store,
+            audit_store=audit_store,
+        )
+
+
+async def _seed_trigger(
+    store: TriggerStore,
+    *,
+    tenant_id: UUID,
+    agent_name: str,
+    agent_version: str,
+    name: str,
+) -> TriggerRecord:
+    now = datetime.now(UTC)
+    record = TriggerRecord(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        agent_name=agent_name,
+        agent_version=agent_version,
+        name=name,
+        kind="cron",
+        config={"expr": "0 9 * * *"},
+        enabled=True,
+        source="api",
+        created_at=now,
+        updated_at=now,
+    )
+    await store.create(record)
+    return record
+
+
+async def _manifest_delete_details(ctx: _CascadeCtx) -> dict[str, object]:
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=ctx.tenant_id, limit=1000))
+    entries = [e for e in page.entries if e.action is AuditAction.MANIFEST_DELETE]
+    assert len(entries) == 1
+    return dict(entries[0].details)
+
+
+@pytest.mark.asyncio
+async def test_delete_disables_only_this_versions_triggers(cascade_ctx: _CascadeCtx) -> None:
+    store: TriggerStore = cascade_ctx.app.state.trigger_store  # type: ignore[attr-defined]
+    target = await _seed_trigger(
+        store,
+        tenant_id=cascade_ctx.tenant_id,
+        agent_name="code-reviewer",
+        agent_version="1.0.0",
+        name="nightly",
+    )
+    other_agent = await _seed_trigger(
+        store,
+        tenant_id=cascade_ctx.tenant_id,
+        agent_name="other-agent",
+        agent_version="1.0.0",
+        name="nightly",
+    )
+    other_version = await _seed_trigger(
+        store,
+        tenant_id=cascade_ctx.tenant_id,
+        agent_name="code-reviewer",
+        agent_version="2.0.0",
+        name="weekly",
+    )
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    target_after = await store.get(trigger_id=target.id, tenant_id=cascade_ctx.tenant_id)
+    other_agent_after = await store.get(trigger_id=other_agent.id, tenant_id=cascade_ctx.tenant_id)
+    other_version_after = await store.get(
+        trigger_id=other_version.id, tenant_id=cascade_ctx.tenant_id
+    )
+    assert target_after is not None
+    assert target_after.enabled is False
+    assert other_agent_after is not None
+    assert other_agent_after.enabled is True
+    assert other_version_after is not None
+    assert other_version_after.enabled is True
+
+    details = await _manifest_delete_details(cascade_ctx)
+    assert details["triggers_disabled"] == 1
+    assert details["runs_cancelled"] == 0
+    assert "triggers_disable_failed" not in details
+    assert "runs_cancel_failed" not in details
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_in_flight_runs(cascade_ctx: _CascadeCtx) -> None:
+    sess = await cascade_ctx.client.post(
+        "/v1/sessions", json={"agent_name": "code-reviewer", "agent_version": "1.0.0"}
+    )
+    assert sess.status_code == 201, sess.text
+    thread_id = UUID(sess.json()["data"]["thread_id"])
+
+    run_manager = cascade_ctx.app.state.agent_runtime.run_manager  # type: ignore[attr-defined]
+    run_id = uuid4()
+    await run_manager.create(run_id=run_id, thread_id=thread_id, tenant_id=cascade_ctx.tenant_id)
+    await run_manager.set_status(run_id, RunStatus.RUNNING)
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    info = await cascade_ctx.run_store.get(run_id=run_id, tenant_id=cascade_ctx.tenant_id)
+    assert info is not None
+    assert info.status is RunStatus.INTERRUPTED
+
+    page = await cascade_ctx.audit_store.query(
+        AuditQuery(tenant_id=cascade_ctx.tenant_id, limit=1000)
+    )
+    cancels = [e for e in page.entries if e.action is AuditAction.SESSION_CANCEL]
+    assert len(cancels) == 1
+    assert cancels[0].reason == "agent_deleted"
+    assert cancels[0].resource_id == str(run_id)
+
+    details = await _manifest_delete_details(cascade_ctx)
+    assert details["runs_cancelled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_survives_trigger_disable_failure(
+    cascade_ctx: _CascadeCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort cascade — a trigger-store failure never blocks the delete,
+    but MUST be audit-visible (``triggers_disable_failed``)."""
+
+    async def _boom(**_kwargs: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        cascade_ctx.app.state.trigger_store,  # type: ignore[attr-defined]
+        "disable_for_agent",
+        _boom,
+    )
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    details = await _manifest_delete_details(cascade_ctx)
+    assert details["triggers_disable_failed"] is True
+    assert details["triggers_disabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_survives_run_cancel_failure(
+    cascade_ctx: _CascadeCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same audit-visibility guarantee for the run-cancel half
+    (``runs_cancel_failed``)."""
+
+    async def _boom(**_kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cascade_ctx.run_store, "list_running_for_agent", _boom)
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    details = await _manifest_delete_details(cascade_ctx)
+    assert details["runs_cancel_failed"] is True
+    assert details["runs_cancelled"] == 0

@@ -1473,3 +1473,68 @@ async def test_thread_runs_store_failure_degrades_to_empty(
     resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
     assert resp.status_code == 200
     assert resp.json()["data"]["runs"] == []
+
+
+# ---------------------------------------------------------------------------
+# Deletion hygiene PR4 — a session bound to a soft-DELETED agent refuses new
+# runs / approval resumes with 410 AGENT_DELETED; a never-registered agent
+# stays a plain 404.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_ghost_thread(client: AsyncClient) -> UUID:
+    """A thread bound to an agent name that was never registered."""
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    thread_id = uuid4()
+    await app.state.thread_meta_repo.create(
+        thread_id=thread_id,
+        tenant_id=_DEFAULT_TENANT,
+        created_by="test",
+        agent_name="ghost",
+        agent_version="1.0.0",
+    )
+    return thread_id
+
+
+@pytest.mark.asyncio
+async def test_run_on_deleted_agent_returns_410(runs_client: AsyncClient) -> None:
+    thread_id = await _create_session(runs_client)
+    deleted = await runs_client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert deleted.status_code == 204, deleted.text
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs", json={"input": "hi"})
+    assert resp.status_code == 410, resp.text
+    assert resp.json()["detail"]["code"] == "AGENT_DELETED"
+
+
+@pytest.mark.asyncio
+async def test_run_on_never_registered_agent_still_404(runs_client: AsyncClient) -> None:
+    thread_id = await _seed_ghost_thread(runs_client)
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs", json={"input": "hi"})
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_resume_on_deleted_agent_returns_410(runs_client: AsyncClient) -> None:
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_pending_approval(runs_client, thread_id)
+    deleted = await runs_client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert deleted.status_code == 204, deleted.text
+
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/resume",
+        json={"decision": "approve"},
+    )
+    assert resp.status_code == 410, resp.text
+    assert resp.json()["detail"]["code"] == "AGENT_DELETED"
+
+
+@pytest.mark.asyncio
+async def test_resume_on_never_registered_agent_still_404(runs_client: AsyncClient) -> None:
+    thread_id = await _seed_ghost_thread(runs_client)
+    run_id = await _seed_pending_approval(runs_client, str(thread_id))
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/resume",
+        json={"decision": "approve"},
+    )
+    assert resp.status_code == 404, resp.text

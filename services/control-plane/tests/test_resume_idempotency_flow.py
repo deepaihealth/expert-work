@@ -32,6 +32,7 @@ from expert_work.persistence import (
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.workspace import workspace_volume_name
 from expert_work.protocol import (
+    AgentSpecStatus,
     ApprovalRecord,
     ApprovalStatus,
     AuditAction,
@@ -126,9 +127,16 @@ class _FakeThreads:
 
 
 class _FakeAgentRepo:
-    async def get(self, *, tenant_id: object, name: object, version: object) -> SimpleNamespace:
-        del tenant_id, name, version
-        return SimpleNamespace(spec=SimpleNamespace())
+    async def get(
+        self,
+        *,
+        tenant_id: object,
+        name: object,
+        version: object,
+        include_deleted: bool = False,
+    ) -> SimpleNamespace:
+        del tenant_id, name, version, include_deleted
+        return SimpleNamespace(spec=SimpleNamespace(), status=AgentSpecStatus.ACTIVE)
 
 
 def _pending(run_id: object, thread_id: object) -> ApprovalRecord:
