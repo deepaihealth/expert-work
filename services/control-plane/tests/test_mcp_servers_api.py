@@ -472,6 +472,81 @@ async def test_delete_ignores_soft_deleted_agent_reference(
 
 
 @pytest.mark.asyncio
+async def test_delete_conflicts_when_reference_is_on_a_later_spec_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug regression sentinel: the reference check must walk EVERY spec page.
+
+    It used to read a single ``limit=1000`` page, so a tenant holding more
+    specs than that page hid every reference past the boundary and the in-use
+    server got deleted anyway. ``_SPEC_PAGE_SIZE`` is shrunk here so three
+    specs already straddle the boundary (keeps the test fast); the referencing
+    spec is seeded first so — the store lists newest-first — it lands on the
+    second page.
+    """
+    page_size = 2
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    monkeypatch.setattr("control_plane.api.mcp_servers._SPEC_PAGE_SIZE", page_size)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        await _seed_agent_spec(
+            app,
+            tenant_id,
+            "page-two-consumer",
+            [{"type": "mcp", "servers": ["github"], "allow_tools": []}],
+        )
+        for filler in ("filler-a", "filler-b"):
+            await _seed_agent_spec(
+                app,
+                tenant_id,
+                filler,
+                [{"type": "mcp", "servers": ["unrelated"], "allow_tools": []}],
+            )
+        repo = app.state.agent_spec_repo  # type: ignore[attr-defined]
+        # Guard the premise: at this page size the referencing spec must NOT sit
+        # on the first page — otherwise a single-page check would still find it
+        # and this sentinel would pass without paginating anything.
+        first_page = await repo.list_by_tenant(tenant_id=tenant_id, limit=page_size, offset=0)
+        first_page_names = [s.name for s in first_page]
+        assert "page-two-consumer" not in first_page_names
+
+        # Record the sweep's own paging arguments. Without this, a regression
+        # that hardcodes a large single page (the original ``limit=1000``) still
+        # swallows all three seeded specs and the 409 below stays green.
+        sweep_calls: list[tuple[object, object]] = []
+        real_list_by_tenant = repo.list_by_tenant
+
+        async def _recording_list_by_tenant(**kwargs: object) -> object:
+            sweep_calls.append((kwargs.get("limit"), kwargs.get("offset", 0)))
+            return await real_list_by_tenant(**kwargs)
+
+        monkeypatch.setattr(repo, "list_by_tenant", _recording_list_by_tenant)
+
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 409, delete_resp.text
+        detail = delete_resp.json()["detail"]
+        assert detail["code"] == "MCP_SERVER_IN_USE"
+        assert "page-two-consumer" in detail["message"]
+        assert len(sweep_calls) > 1, sweep_calls
+        assert all(limit == page_size for limit, _ in sweep_calls), sweep_calls
+        # Row must survive the refused delete.
+        lst = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert [row["name"] for row in lst.json()["data"]] == ["github"]
+
+
+@pytest.mark.asyncio
 async def test_delete_reports_implicit_all_agents_in_response_and_audit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
