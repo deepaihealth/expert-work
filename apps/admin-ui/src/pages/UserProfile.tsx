@@ -51,6 +51,7 @@ export function UserProfile() {
   // opens / refreshes. Best-effort — a 404 keeps the surrogate fallback.
   const [fetchedSubjectId, setFetchedSubjectId] = useState<string | null>(null);
   const [fetchedName, setFetchedName] = useState<string | null>(null);
+  const [fetchedEmail, setFetchedEmail] = useState<string | null>(null);
   useEffect(() => {
     if (!userId || denied) return;
     let cancelled = false;
@@ -59,6 +60,7 @@ export function UserProfile() {
         if (cancelled) return;
         setFetchedSubjectId(u.subject_id);
         if (u.display_name) setFetchedName(u.display_name);
+        setFetchedEmail(u.member_email);
       })
       .catch(() => {
         // 404 / 403 — keep the fallbacks.
@@ -104,7 +106,10 @@ export function UserProfile() {
     <div data-testid="user-profile-root">
       <PageHeader
         icon={<UserRound size={18} strokeWidth={1.5} />}
-        title={displayName ?? subjectId ?? `${userId.slice(0, 12)}…`}
+        // An employee's ``subject_id`` is an OIDC sub UUID — their email names
+        // them far better. An external end-user has no email and needs none:
+        // their ``subject_id`` is the id their app passed and already reads.
+        title={displayName ?? fetchedEmail ?? subjectId ?? `${userId.slice(0, 12)}…`}
         backTo={{ label: t("user_profile.back_label"), to: "/users" }}
         actions={
           subjectId ? (

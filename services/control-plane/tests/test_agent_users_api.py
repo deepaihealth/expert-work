@@ -247,6 +247,46 @@ async def test_get_user_returns_display_name(
 
 
 @pytest.mark.asyncio
+async def test_get_user_carries_member_identity(
+    client_and_users: tuple[AsyncClient, UUID, UUID],
+) -> None:
+    """An employee's email/role ride along so the detail page can name them.
+
+    The roster (``GET /v1/users``) already joins ``tenant_member``; without the
+    same join here an employee opened directly by URL had only an OIDC ``sub``
+    UUID to show as a title.
+    """
+    client, alice_id, _ = client_and_users
+    member_repo = client._transport.app.state.tenant_member_repo  # type: ignore[attr-defined,union-attr]
+    m = await member_repo.create(
+        tenant_id=_TENANT, email="alice@corp.com", role="operator", invited_by="admin"
+    )
+    await member_repo.transition(
+        member_id=m.id, tenant_id=_TENANT, to="active", now=_NOW, subject_id=alice_id
+    )
+    data = (await client.get(f"/v1/users/{alice_id}")).json()["data"]
+    assert data["is_member"] is True
+    assert data["member_email"] == "alice@corp.com"
+    assert data["member_role"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_get_user_external_caller_has_no_member_identity(
+    client_and_users: tuple[AsyncClient, UUID, UUID],
+) -> None:
+    """An external API end-user has no member row — the fields stay null.
+
+    Their ``subject_id`` (the id the calling app passed) is already the
+    human-recognisable name, so nothing is lost.
+    """
+    client, alice_id, _ = client_and_users
+    data = (await client.get(f"/v1/users/{alice_id}")).json()["data"]
+    assert data["is_member"] is False
+    assert data["member_email"] is None
+    assert data["member_role"] is None
+
+
+@pytest.mark.asyncio
 async def test_get_user_unknown_is_404(
     client_and_users: tuple[AsyncClient, UUID, UUID],
 ) -> None:

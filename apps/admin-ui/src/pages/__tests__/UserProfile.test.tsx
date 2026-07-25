@@ -69,6 +69,9 @@ function stubCommon() {
     subject_id: "ext-alice",
     display_name: "Alice",
     subject_type: "user",
+    is_member: false,
+    member_email: null,
+    member_role: null,
     created_at: "2026-06-01T00:00:00Z",
     last_active_at: "2026-07-01T00:00:00Z",
   });
@@ -136,6 +139,45 @@ describe("UserProfile", () => {
       expect(screen.getByTestId("user-profile-subject-id")).toHaveTextContent("ext-alice"),
     );
     expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("titles an unnamed employee by their email, not their OIDC sub", async () => {
+    // An employee's subject_id is a Keycloak sub UUID and display_name is
+    // usually unset — the title used to be an unreadable UUID even though
+    // the member row carries their email.
+    stubCommon();
+    vi.spyOn(usersSdk, "getTenantUser").mockResolvedValue({
+      user_id: USER_ID,
+      subject_id: "6344ed9a-6f6e-455a-8eb3-a03a26da1639",
+      display_name: null,
+      subject_type: "user",
+      is_member: true,
+      member_email: "alice@corp.com",
+      member_role: "admin",
+      created_at: "2026-06-01T00:00:00Z",
+      last_active_at: "2026-07-01T00:00:00Z",
+    });
+    renderPage();
+    expect(await screen.findByText("alice@corp.com")).toBeInTheDocument();
+  });
+
+  it("titles an external caller by the id their app passed in", async () => {
+    // No member row, no email — subject_id is already the recognizable name.
+    stubCommon();
+    vi.spyOn(usersSdk, "getTenantUser").mockResolvedValue({
+      user_id: USER_ID,
+      subject_id: "customer-8891",
+      display_name: null,
+      subject_type: "user",
+      is_member: false,
+      member_email: null,
+      member_role: null,
+      created_at: "2026-06-01T00:00:00Z",
+      last_active_at: "2026-07-01T00:00:00Z",
+    });
+    renderPage();
+    // subject_id also renders as the copyable identifier — assert the title.
+    expect(await screen.findByRole("heading", { name: "customer-8891" })).toBeInTheDocument();
   });
 
   it("sorts memory by importance (descending) by default", async () => {

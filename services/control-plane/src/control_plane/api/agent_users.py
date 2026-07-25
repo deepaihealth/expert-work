@@ -443,6 +443,7 @@ def build_tenant_users_router() -> APIRouter:
         user_id: UUID,
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        members: Annotated[TenantMemberStore | None, Depends(_get_member_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # A registry row belongs to one tenant — a concrete id lets a
         # system_admin drill in; the "*" scope is rejected below.
@@ -470,6 +471,16 @@ def build_tenant_users_router() -> APIRouter:
         if user is None:
             raise HTTPException(status_code=404, detail="user not found")
 
+        # Same member join the roster does — an employee's ``subject_id`` is an
+        # OIDC sub UUID, so the email is the only name the detail page can show.
+        # An external end-user has no member row and needs none: the id their
+        # app passed in *is* the recognisable name.
+        member = (
+            await members.get_by_subject_id(tenant_id=target, subject_id=user.id)
+            if members is not None
+            else None
+        )
+
         return JSONResponse(
             content={
                 "success": True,
@@ -478,6 +489,9 @@ def build_tenant_users_router() -> APIRouter:
                     "subject_id": user.subject_id,
                     "display_name": user.display_name,
                     "subject_type": user.subject_type,
+                    "is_member": member is not None,
+                    "member_email": member.email if member is not None else None,
+                    "member_role": member.role if member is not None else None,
                     "created_at": user.created_at.isoformat() if user.created_at else None,
                     "last_active_at": (
                         user.last_active_at.isoformat() if user.last_active_at else None
