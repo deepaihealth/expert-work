@@ -118,6 +118,10 @@ export interface MemberPurgeResult {
   role_bindings_removed: number;
   role_bindings_cleanup_failed: boolean;
   data_purged: boolean;
+  /** ``true`` when the data cascade could not even start (registry read /
+   *  dependency assembly blew up). The step is best-effort server-side — the
+   *  purge is idempotent, so a re-run retries it. */
+  data_purge_failed?: boolean;
   purge: PurgeSummary | null;
 }
 

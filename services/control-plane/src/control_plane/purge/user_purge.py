@@ -132,6 +132,14 @@ class PurgeSummary:
     image_blobs_failed: int = 0
     image_blobs_skipped: int = 0
 
+    @property
+    def ok(self) -> bool:
+        """``True`` when every step succeeded — the one source for "ok".
+
+        Both the wire payload (``as_dict``) and the ``MEMBER_PURGE`` audit
+        detail read it here so the two can never disagree."""
+        return not self.failures
+
     def as_dict(self) -> dict[str, object]:
         return {
             "tenant_id": str(self.tenant_id),
@@ -148,7 +156,7 @@ class PurgeSummary:
             "image_blobs_removed": self.image_blobs_removed,
             "image_blobs_failed": self.image_blobs_failed,
             "image_blobs_skipped": self.image_blobs_skipped,
-            "ok": not self.failures,
+            "ok": self.ok,
         }
 
 
