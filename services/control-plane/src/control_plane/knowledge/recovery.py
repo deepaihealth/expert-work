@@ -155,6 +155,19 @@ class KnowledgeIngestRecoveryWorker:
                 chunk_overlap_tokens=claim.chunk_overlap_tokens,
             )
         except Exception as exc:
+            gone = False
+            try:
+                gone = (
+                    await self._store.get_document(
+                        tenant_id=claim.tenant_id, document_id=claim.document_id
+                    )
+                ) is None
+            except Exception:  # noqa: S110  # pragma: no cover - 判定失败按未删处理
+                pass
+            if gone:
+                # 文档已被并发删除 — FK/守卫拒绝写回是正常终止,不算失败。
+                logger.debug("knowledge.recovery_document_gone document=%s", claim.document_id)
+                return False
             if claim.attempts >= self._max_attempts:
                 await self._store.mark_document_failed_terminal(
                     tenant_id=claim.tenant_id,
