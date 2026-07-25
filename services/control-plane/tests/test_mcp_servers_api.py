@@ -611,6 +611,46 @@ async def test_delete_reports_implicit_all_agents_in_response_and_audit(
 
 
 @pytest.mark.asyncio
+async def test_delete_counts_deprecated_wildcard_follower_in_implicit_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DEPRECATED spec with an empty-``servers`` (wildcard) mcp tool still
+    counts toward ``implicit_all_agents`` — the reference-check's active-spec
+    filter is "not DELETED" (DEPRECATED counts), and the wildcard tally reads
+    that same ``active_specs`` list. Companion to
+    ``test_delete_conflicts_when_deprecated_agent_references`` (DEPRECATED +
+    explicit reference → 409); this one is DEPRECATED + wildcard → 200 with
+    the follower counted, not silently dropped."""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    mcp_wildcard: list[dict[str, object]] = [{"type": "mcp", "servers": [], "allow_tools": []}]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        create_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "none",
+            },
+            headers=admin_headers,
+        )
+        assert create_resp.status_code == 201
+        await _seed_agent_spec(
+            app,
+            tenant_id,
+            "sunsetting-wildcard",
+            mcp_wildcard,
+            status=AgentSpecStatus.DEPRECATED,
+        )
+
+        delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
+        assert delete_resp.status_code == 200, delete_resp.text
+        assert delete_resp.json()["data"]["implicit_all_agents"] == 1
+
+
+@pytest.mark.asyncio
 async def test_post_and_delete_invalidate_tenant_mcp_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
