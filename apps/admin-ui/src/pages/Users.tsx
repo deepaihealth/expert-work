@@ -99,7 +99,10 @@ export function Users() {
       if (q === "") return true;
       return (
         u.subject_id.toLowerCase().includes(q) ||
-        (u.display_name ?? "").toLowerCase().includes(q)
+        (u.display_name ?? "").toLowerCase().includes(q) ||
+        // An employee is most likely searched for by the email the roster
+        // shows them under — their subject_id is an opaque OIDC sub.
+        (u.member_email ?? "").toLowerCase().includes(q)
       );
     });
   }, [items, query, typeFilter]);
@@ -111,16 +114,22 @@ export function Users() {
       {
         title: t("users_page.col_user"),
         key: "user",
-        render: (_: unknown, record) => (
-          <Space direction="vertical" size={0}>
-            <Text code style={{ fontSize: 12 }}>
-              {record.subject_id}
-            </Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {record.display_name ?? t("users_page.unnamed")}
-            </Text>
-          </Space>
-        ),
+        render: (_: unknown, record) => {
+          // An employee's subject_id is an OIDC sub UUID and display_name is
+          // usually unset — lead with whatever names them (matching the detail
+          // page's title chain) and keep subject_id below as the id operators
+          // copy. An external caller has neither, so their subject_id — the id
+          // their app passed — leads on its own.
+          const name = record.display_name ?? record.member_email;
+          return (
+            <Space direction="vertical" size={0}>
+              {name && <Text style={{ fontSize: 13 }}>{name}</Text>}
+              <Text code style={{ fontSize: 12 }} type={name ? "secondary" : undefined}>
+                {record.subject_id}
+              </Text>
+            </Space>
+          );
+        },
       },
       {
         title: t("users_page.col_type"),

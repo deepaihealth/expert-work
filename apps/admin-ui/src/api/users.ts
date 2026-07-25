@@ -59,6 +59,14 @@ export interface TenantUser {
   subject_id: string;
   display_name: string | null;
   subject_type: string;
+  /** ``true`` when the user maps to a tenant member (a logged-in employee)
+   *  rather than an external caller. */
+  is_member: boolean;
+  /** An employee's email — their ``subject_id`` is an OIDC sub UUID, so this
+   *  is the only human-readable name available. ``null`` for external users
+   *  (whose ``subject_id`` is already the recognizable id their app passed). */
+  member_email: string | null;
+  member_role: string | null;
   created_at: string | null;
   last_active_at: string | null;
 }

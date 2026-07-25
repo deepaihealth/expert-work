@@ -82,6 +82,7 @@ function ConversationsPane({
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const load = useCallback(
     () => listConversations({ agentName, agentVersion, userId }),
     [agentName, agentVersion, userId],
@@ -164,7 +165,12 @@ function ConversationsPane({
         loading={loading}
         pagination={{ total: data?.total ?? 0, showSizeChanger: false, pageSize: 50 }}
         onRow={(record) => ({
-          onClick: () => navigate(`/conversations/${encodeURIComponent(record.thread_id)}`),
+          // ``from`` + ``fromLabel`` let the detail page's back link return
+          // here instead of falling through to the thread's agent.
+          onClick: () =>
+            navigate(`/conversations/${encodeURIComponent(record.thread_id)}`, {
+              state: { from: `${location.pathname}${location.search}`, fromLabel: t("nav.users") },
+            }),
           style: { cursor: "pointer" },
         })}
         locale={{ emptyText: <Empty description={t("user_detail.conversations_empty")} /> }}

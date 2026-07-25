@@ -315,6 +315,68 @@ describe("ConversationDetail", () => {
     );
   });
 
+  it("back link returns to the user page a conversation was opened from", async () => {
+    // Regression: ``from`` used to be honoured only when it started with
+    // ``/conversations``, so drilling in from a user page fell through to the
+    // thread's agent — the back arrow read the agent name and left the user.
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    render(
+      <MemoryRouter
+        initialEntries={[
+          {
+            pathname: `/conversations/${THREAD_ID}`,
+            state: { from: "/users/user-42", fromLabel: "Users" },
+          },
+        ]}
+      >
+        <AuthProvider>
+          <App>
+            <Routes>
+              <Route path="/conversations/:threadId" element={<ConversationDetail />} />
+            </Routes>
+          </App>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
+    );
+    const back = screen.getByTestId("page-header-back");
+    expect(back).toHaveAttribute("href", "/users/user-42");
+    expect(back).toHaveTextContent("Users");
+  });
+
+  it("back link rejects an off-site state.from and falls back", async () => {
+    // ``from`` lands in the URL of a link the user clicks — a protocol-relative
+    // value would navigate off the app.
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    render(
+      <MemoryRouter
+        initialEntries={[
+          {
+            pathname: `/conversations/${THREAD_ID}`,
+            state: { from: "//evil.example.com/phish" },
+          },
+        ]}
+      >
+        <AuthProvider>
+          <App>
+            <Routes>
+              <Route path="/conversations/:threadId" element={<ConversationDetail />} />
+            </Routes>
+          </App>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("page-header-back")).toHaveAttribute(
+      "href",
+      "/agents/code-reviewer/1.0.0/conversations",
+    );
+  });
+
   it("back link falls back to the agent conversations tab without state.from", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
     renderPage();

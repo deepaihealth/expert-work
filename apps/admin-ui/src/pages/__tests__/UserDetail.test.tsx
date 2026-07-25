@@ -36,6 +36,9 @@ function stubAll() {
     subject_id: "ext-alice",
     display_name: "Alice",
     subject_type: "user",
+    is_member: false,
+    member_email: null,
+    member_role: null,
     created_at: "2026-06-01T00:00:00Z",
     last_active_at: "2026-07-01T00:00:00Z",
   });
