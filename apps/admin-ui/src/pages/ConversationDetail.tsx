@@ -130,7 +130,14 @@ export function ConversationDetail() {
   // tenant; everyone else keeps the flat message block (which does carry the
   // tenant on the wire). Also skips the whole rebuild until identity resolves.
   const sameTenant =
-    convo !== null && homeTenantId !== null && convo.tenant_id === homeTenantId;
+    convo !== null &&
+    homeTenantId !== null &&
+    convo.tenant_id === homeTenantId &&
+    // M-3 — ``convo`` can still be the *previous* threadId's row for one
+    // render after the params change (this effect's own dependency), so
+    // pin the check to the thread actually being viewed rather than
+    // whatever the last fetch resolved.
+    convo.thread_id === threadId;
 
   useEffect(() => {
     if (!threadId || !sameTenant) return;
@@ -254,15 +261,27 @@ export function ConversationDetail() {
     {
       // The whole row has been clickable since M2, but nothing said so. The
       // explicit link makes the drill-in discoverable (and keyboard reachable).
+      // M-6 — title stays visually blank (matches every other action-only
+      // column in this codebase, e.g. SettingsApiKeys/KnowledgeAdmin), but an
+      // empty <th> still reads as unnamed to a screen reader; ``onHeaderCell``
+      // is antd's own escape hatch for attaching attributes straight to the
+      // header cell without rendering anything visible.
       title: "",
       key: "open",
       width: 96,
+      onHeaderCell: () => ({ "aria-label": t("conversations_detail.view_run") }),
       render: (_: unknown, record) => (
         <Link
           to={`/runs/${encodeURIComponent(record.thread_id)}/${encodeURIComponent(
             record.run_id,
           )}`}
           data-testid={`conversation-run-open-${record.run_id}`}
+          // I-1 — the link sits inside a clickable <tr> (``onRow.onClick``
+          // below navigates to the same URL). Without stopping propagation,
+          // one click fires both: the Link's own navigation AND the row's
+          // ``navigate()``, pushing the same URL twice — one "back" from the
+          // run page then lands on the run page again, not here.
+          onClick={(e) => e.stopPropagation()}
         >
           {t("conversations_detail.view_run")}
         </Link>

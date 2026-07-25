@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router-dom";
 import "../../i18n";
 
 import { setStoredToken } from "../../api/client";
@@ -458,10 +458,28 @@ describe("ConversationDetail", () => {
     });
   });
 
-  it("every run row carries an explicit drill-in link to its run detail", async () => {
+  it("every run row carries an explicit drill-in link to its run detail, and clicking it navigates exactly once (I-1: one 'back' returns to the conversation page)", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
 
-    renderPage();
+    // The link sits inside a row that is *also* clickable (``onRow.onClick``
+    // navigates to the same run). A ``MemoryRouter``+``Routes`` render can't
+    // observe the push *count* — only a data router's ``router.state``/
+    // ``router.navigate(-1)`` can distinguish "navigated once" from
+    // "navigated twice to the same URL" (I-1).
+    const router = createMemoryRouter(
+      [
+        { path: "/conversations/:threadId", element: <ConversationDetail /> },
+        { path: "/runs/:threadId/:runId", element: <div data-testid="run-detail-stub" /> },
+      ],
+      { initialEntries: [`/conversations/${THREAD_ID}`] },
+    );
+    render(
+      <AuthProvider>
+        <App>
+          <RouterProvider router={router} />
+        </App>
+      </AuthProvider>,
+    );
 
     await waitFor(() =>
       expect(screen.getByTestId("conversation-runs-table")).toBeInTheDocument(),
@@ -473,6 +491,24 @@ describe("ConversationDetail", () => {
     expect(screen.getByTestId(`conversation-run-open-${RUN_2}`)).toHaveAttribute(
       "href",
       `/runs/${THREAD_ID}/${RUN_2}`,
+    );
+
+    fireEvent.click(screen.getByTestId(`conversation-run-open-${RUN_1}`));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("run-detail-stub")).toBeInTheDocument(),
+    );
+    expect(router.state.location.pathname).toBe(`/runs/${THREAD_ID}/${RUN_1}`);
+
+    router.navigate(-1);
+
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(`/conversations/${THREAD_ID}`),
+    );
+    // Going back remounts ``ConversationDetail`` (it re-fetches), so it's
+    // briefly back on the loading Skeleton before the root testid reappears.
+    await waitFor(() =>
+      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
     );
   });
 });

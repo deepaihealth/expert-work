@@ -22,11 +22,8 @@ import {
   type HistoryMessage,
   type SseEvent,
 } from "../../api/sessions";
-import {
-  buildHistoryTurns,
-  type HistoryTurn,
-} from "../../pages/agent_detail/playground/history_turns";
-import type { HistoryLoad } from "./types";
+import { buildHistoryTurns } from "../../pages/agent_detail/playground/history_turns";
+import type { HistoryLoad, HistoryTurn } from "./types";
 
 export interface UseHistoryTurns {
   /** Flat ``/messages`` text — the always-available degradation payload. */
