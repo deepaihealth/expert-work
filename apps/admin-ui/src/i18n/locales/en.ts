@@ -283,7 +283,6 @@ export interface TranslationKeys {
     col_last_active: string;
     tag_external: string;
     tag_member: string;
-    unnamed: string;
     failed_to_load: string;
     empty: string;
   };
@@ -3147,7 +3146,7 @@ const en: TranslationKeys = {
     stat_total: "Total users",
     stat_conversations: "Total conversations",
     stat_errors: "Error conversations",
-    search_placeholder: "Search user_id or name…",
+    search_placeholder: "Search user_id, name, or email…",
     type_all: "All",
     type_external: "External",
     type_member: "Member",
@@ -3161,7 +3160,6 @@ const en: TranslationKeys = {
     col_last_active: "Last active",
     tag_external: "External",
     tag_member: "Member",
-    unnamed: "Unnamed",
     failed_to_load: "Failed to load users",
     empty: "No users yet.",
   },

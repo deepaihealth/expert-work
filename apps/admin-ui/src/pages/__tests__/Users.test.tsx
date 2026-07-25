@@ -131,6 +131,42 @@ describe("Users", () => {
     expect(screen.getByText("kc-bob")).toBeInTheDocument();
   });
 
+  it("names an unnamed employee by their email and still shows the sub", async () => {
+    // The common case: an employee has no display_name and their subject_id
+    // is an opaque Keycloak sub, so the row used to read "<UUID> / Unnamed".
+    const UNNAMED_EMPLOYEE: TenantUserRosterItem = {
+      ...MEMBER,
+      user_id: "9d1c0a3e-0000-4000-8000-000000000003",
+      subject_id: "6344ed9a-6f6e-455a-8eb3-a03a26da1639",
+      display_name: null,
+      member_email: "carol@corp.com",
+    };
+    vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
+      items: [UNNAMED_EMPLOYEE],
+      total: 1,
+      cross_tenant: false,
+    });
+    renderPage();
+    expect(await screen.findByText("carol@corp.com")).toBeInTheDocument();
+    // The sub stays visible — it is the id operators copy into API calls.
+    expect(screen.getByText("6344ed9a-6f6e-455a-8eb3-a03a26da1639")).toBeInTheDocument();
+  });
+
+  it("finds an employee by email, not just by subject_id", async () => {
+    vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
+      items: [EXTERNAL, MEMBER],
+      total: 2,
+      cross_tenant: false,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("ext-alice");
+
+    await user.type(screen.getByTestId("users-search"), "bob@example.com");
+    await waitFor(() => expect(screen.queryByText("ext-alice")).not.toBeInTheDocument());
+    expect(screen.getByText("kc-bob")).toBeInTheDocument();
+  });
+
   it("drills into the profile carrying subject_id + name on router state", async () => {
     vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
       items: [EXTERNAL],
