@@ -17,7 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.auth import JWTVerifier
-from control_plane.keycloak import FakeKeycloakAdminClient
+from control_plane.keycloak import FakeKeycloakAdminClient, KeycloakUnavailableError
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
@@ -487,6 +487,274 @@ async def test_reset_password_too_short_422(
     )
     assert resp.status_code == 422
     assert kc.password_resets == []
+
+
+# --- one-shot deactivate + purge (delete-hygiene PR5 T2) ----------------------
+
+
+async def _invite_one(client: AsyncClient, tenant_id: UUID, email: str = "leaver@co.com") -> UUID:
+    inv = await client.post(
+        "/v1/members/invite",
+        json={"invitations": [{"email": email, "role": "viewer"}]},
+        headers=_admin_headers(tenant_id),
+    )
+    assert inv.status_code == 201, inv.text
+    return UUID(inv.json()["data"]["results"][0]["member_id"])
+
+
+async def _activate_with_data(app: object, tenant_id: UUID, member_id: UUID) -> tuple[UUID, UUID]:
+    """First-login link (subject_id back-fill) + one thread of user data.
+
+    Returns ``(tenant_user.id, thread_id)``.
+    """
+    from datetime import UTC, datetime
+
+    user = await app.state.tenant_user_repo.resolve(  # type: ignore[attr-defined]
+        tenant_id=tenant_id, subject_type="user", subject_id="emp-sub", display_name="Emp"
+    )
+    moved = await app.state.tenant_member_repo.transition(  # type: ignore[attr-defined]
+        member_id=member_id,
+        tenant_id=tenant_id,
+        to="active",
+        now=datetime.now(UTC),
+        subject_id=user.id,
+    )
+    assert moved
+    thread_id = uuid4()
+    await app.state.thread_meta_repo.create(  # type: ignore[attr-defined]
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        created_by="seed",
+        user_id=user.id,
+        agent_name="alpha",
+        agent_version="1.0.0",
+    )
+    return user.id, thread_id
+
+
+@pytest.mark.asyncio
+async def test_purge_invited_member_revokes_and_deletes_kc_account(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """① invited → revoked; KC account deleted; no data step (never logged in)."""
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    client, tenant_id, app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+    assert len(kc.users) == 1
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["member_id"] == str(member_id)
+    assert data["status"] == "revoked"
+    assert data["kc_deleted"] is True
+    assert data["kc_delete_failed"] is False
+    assert data["role_bindings_removed"] == 1
+    assert data["role_bindings_cleanup_failed"] is False
+    assert data["data_purged"] is False  # subject_id NULL — never logged in
+    assert data["purge"] is None
+
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.status == "revoked"
+    assert len(kc.users) == 0  # KC account deleted (D2)
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    rows = [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE]
+    assert len(rows) == 1
+    assert rows[0].resource_id == str(member_id)
+    assert rows[0].details["email"] == "leaver@co.com"
+    assert rows[0].details["from_status"] == "invited"
+    assert rows[0].details["kc_deleted"] is True
+    assert rows[0].details["role_bindings_removed"] == 1
+    assert rows[0].details["data_purged"] is False
+
+
+@pytest.mark.asyncio
+async def test_purge_active_member_suspends_deletes_kc_and_purges_data(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """② active (subject_id + data) → suspended; KC deleted; data cascade ran."""
+    from expert_work.protocol import AuditAction, AuditQuery
+    from orchestrator.tools.sandbox import RecordingSupervisorClient
+
+    client, tenant_id, app, kc = admin_app
+    # create_app has no supervisor URL in tests — wire the recording fake so
+    # the workspace step of the cascade runs (otherwise it logs a failure and
+    # ``purge.ok`` could never be asserted True).
+    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    member_id = await _invite_one(client, tenant_id)
+    user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["status"] == "suspended"
+    assert data["kc_deleted"] is True
+    assert data["data_purged"] is True
+    assert data["purge"] is not None
+    assert data["purge"]["user_id"] == str(user_id)
+    assert data["purge"]["threads_purged"] == 1
+    assert data["purge"]["deactivated"] is True
+    assert data["purge"]["ok"] is True
+
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.status == "suspended"
+    assert len(kc.users) == 0  # deleted, not merely disabled (D2)
+    gone = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert gone is None  # the data row is actually gone
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    rows = [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE]
+    assert len(rows) == 1
+    assert rows[0].details["from_status"] == "active"
+    assert rows[0].details["data_purged"] is True
+
+
+@pytest.mark.asyncio
+async def test_purge_suspended_member_backfills_without_transition(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """③ suspended backfill — status unchanged, KC deleted, data cascade ran."""
+    from datetime import UTC, datetime
+
+    client, tenant_id, app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+    _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+    moved = await app.state.tenant_member_repo.transition(  # type: ignore[attr-defined]
+        member_id=member_id, tenant_id=tenant_id, to="suspended", now=datetime.now(UTC)
+    )
+    assert moved
+    assert len(kc.users) == 1  # suspend never deleted the KC account before
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["status"] == "suspended"  # no further transition
+    assert data["kc_deleted"] is True
+    assert data["data_purged"] is True
+
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.status == "suspended"
+    assert len(kc.users) == 0
+    gone = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert gone is None
+
+
+@pytest.mark.asyncio
+async def test_purge_rerun_is_idempotent(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """④ re-running the purge is a safe no-op (200, every step no-ops)."""
+    from orchestrator.tools.sandbox import RecordingSupervisorClient
+
+    client, tenant_id, app, _kc = admin_app
+    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    member_id = await _invite_one(client, tenant_id)
+    await _activate_with_data(app, tenant_id, member_id)
+
+    first = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert first.status_code == 200, first.text
+
+    second = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert second.status_code == 200, second.text
+    data = second.json()["data"]
+    assert data["status"] == "suspended"
+    assert data["kc_delete_failed"] is False  # fake delete_user is idempotent
+    assert data["role_bindings_removed"] == 0  # already removed on the first run
+    assert data["role_bindings_cleanup_failed"] is False
+    assert data["data_purged"] is True  # re-run retries the cascade, safe no-op
+    assert data["purge"]["threads_purged"] == 0
+    assert data["purge"]["ok"] is True
+
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.status == "suspended"
+
+
+@pytest.mark.asyncio
+async def test_purge_kc_unavailable_flags_and_continues(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑤ KC down → 200 with ``kc_delete_failed``; every other step still runs."""
+    client, tenant_id, app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+    _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+
+    async def _kc_boom(**_kwargs: object) -> None:
+        raise KeycloakUnavailableError("forced-unavailable (test)")
+
+    monkeypatch.setattr(kc, "delete_user", _kc_boom)
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["kc_deleted"] is False
+    assert data["kc_delete_failed"] is True
+    assert data["status"] == "suspended"
+    assert data["role_bindings_removed"] == 1
+    assert data["data_purged"] is True
+
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.status == "suspended"
+    gone = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert gone is None
+
+
+@pytest.mark.asyncio
+async def test_purge_viewer_forbidden(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """⑥ non-admin gets 403; nothing happens."""
+    client, tenant_id, _app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_viewer_headers(tenant_id))
+    assert resp.status_code == 403
+    assert len(kc.users) == 1  # untouched
+
+
+@pytest.mark.asyncio
+async def test_purge_transition_conflict_409_blocks_all_side_effects(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑦ a lost transition race → 409 MEMBER_STATE_CONFLICT, ZERO side effects.
+
+    Continuing past a failed lifecycle move would purge a still-active
+    member's data (half-state) — the whole point of the blocking rule.
+    """
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    client, tenant_id, app, kc = admin_app
+    member_id = await _invite_one(client, tenant_id)
+    _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None and member.keycloak_user_id is not None
+    kc_uuid = UUID(member.keycloak_user_id)
+
+    async def _not_moved(**_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(app.state.tenant_member_repo, "transition", _not_moved)  # type: ignore[attr-defined]
+
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "MEMBER_STATE_CONFLICT"
+
+    # No side effects at all: KC account, role binding, data, audit all intact.
+    assert len(kc.users) == 1
+    bindings = await app.state.role_binding_repo.list_for_subject(  # type: ignore[attr-defined]
+        subject_type="user", subject_id=kc_uuid, tenant_id=tenant_id
+    )
+    assert len(bindings) == 1
+    still = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert still is not None
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    assert [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE] == []
 
 
 @pytest.mark.asyncio
