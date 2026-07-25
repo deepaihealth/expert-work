@@ -317,17 +317,30 @@ export function ConversationDetail() {
   }
 
   const tk = convo.tokens;
-  // Back link: when the global browser navigated here it passes its exact
-  // URL (filters + page) via ``location.state.from`` — going back restores
-  // that view verbatim. Otherwise fall back to the agent's conversations
-  // tab (agent-bound thread) or the agents index.
-  const stateFrom = (location.state as { from?: unknown } | null)?.from;
-  const fromBrowser =
-    typeof stateFrom === "string" && stateFrom.startsWith("/conversations")
+  // Back link: every entry point passes its exact URL (filters + page) via
+  // ``location.state.from`` plus a ``fromLabel`` — going back restores that
+  // view verbatim. Any in-app path is accepted (a single leading slash rules
+  // out protocol-relative and absolute URLs); the label falls back to the
+  // section the path belongs to, so a caller that predates ``fromLabel``
+  // still reads right. Without state at all, fall back to the agent's
+  // conversations tab (agent-bound thread) or the agents index.
+  const navState = location.state as { from?: unknown; fromLabel?: unknown } | null;
+  const stateFrom = navState?.from;
+  const fromPath =
+    typeof stateFrom === "string" && stateFrom.startsWith("/") && !stateFrom.startsWith("//")
       ? stateFrom
       : undefined;
-  const backTo = fromBrowser
-    ? { label: t("nav.conversations"), to: fromBrowser }
+  const stateLabel = navState?.fromLabel;
+  const fromLabel =
+    typeof stateLabel === "string" && stateLabel
+      ? stateLabel
+      : fromPath?.startsWith("/users")
+        ? t("nav.users")
+        : fromPath?.startsWith("/agents")
+          ? t("nav.agents")
+          : t("nav.conversations");
+  const backTo = fromPath
+    ? { label: fromLabel, to: fromPath }
     : convo.agent_name && convo.agent_version
       ? {
           label: convo.agent_name,

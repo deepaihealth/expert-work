@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Card, Empty, Input, Select, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { AlertTriangle, MessagesSquare, Search } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import type { AgentDetailResponse } from "../../api/agents";
@@ -53,6 +53,7 @@ interface ConversationsTabProps {
 export function ConversationsTab({ detail }: ConversationsTabProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
   const { name, version } = detail.record;
 
   const [data, setData] = useState<ConversationList | null>(null);
@@ -266,7 +267,12 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
           onChange: setPage,
         }}
         onRow={(record) => ({
-          onClick: () => navigate(`/conversations/${encodeURIComponent(record.thread_id)}`),
+          // ``from`` + ``fromLabel`` restore this tab (page included) instead
+          // of the detail page's generic agent fallback.
+          onClick: () =>
+            navigate(`/conversations/${encodeURIComponent(record.thread_id)}`, {
+              state: { from: `${location.pathname}${location.search}`, fromLabel: name },
+            }),
           style: { cursor: "pointer" },
         })}
         locale={{ emptyText: <Empty description={t("conversations_tab.empty")} /> }}

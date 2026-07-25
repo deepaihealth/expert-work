@@ -19,7 +19,7 @@ import {
 import type { TableColumnsType } from "antd";
 import type { Dayjs } from "dayjs";
 import { AlertTriangle } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { listAgents } from "../../api/agents";
@@ -45,6 +45,7 @@ const STATUS_COLOR: Record<string, string> = {
 export function ConversationsPane({ userId }: { userId: string }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [agentName, setAgentName] = useState<string | undefined>(undefined);
   const [since, setSince] = useState<string | undefined>(undefined);
@@ -182,7 +183,12 @@ export function ConversationsPane({ userId }: { userId: string }) {
         loading={loading}
         pagination={{ total: data?.total ?? 0, showSizeChanger: false, pageSize: 50 }}
         onRow={(record) => ({
-          onClick: () => navigate(`/conversations/${encodeURIComponent(record.thread_id)}`),
+          // ``from`` + ``fromLabel`` let the detail page's back link return
+          // here instead of falling through to the thread's agent.
+          onClick: () =>
+            navigate(`/conversations/${encodeURIComponent(record.thread_id)}`, {
+              state: { from: `${location.pathname}${location.search}`, fromLabel: t("nav.users") },
+            }),
           style: { cursor: "pointer" },
         })}
         locale={{ emptyText: <Empty description={t("user_profile.conversations_empty")} /> }}
