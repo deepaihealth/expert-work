@@ -28,6 +28,7 @@ from expert_work.persistence import (
     TenantMcpServerStore,
 )
 from expert_work.protocol import (
+    AgentSpecStatus,
     AuditAction,
     McpServerAuthType,
     McpServerProbeStatus,
@@ -65,6 +66,27 @@ def manifest_references_server(spec_json: Mapping[str, Any], server_name: str) -
             continue
         servers = tool.get("servers")
         if isinstance(servers, list) and server_name in servers:
+            return True
+    return False
+
+
+def manifest_uses_implicit_all(manifest: dict[str, object], /) -> bool:
+    """True when the manifest has an ``mcp`` tool whose ``servers`` list is
+    empty/absent — the documented "every available server" wildcard. Such an
+    agent follows the live server set dynamically, so it is NOT a hard
+    reference (delete proceeds), but the impact count is surfaced."""
+    spec = manifest.get("spec")
+    if not isinstance(spec, Mapping):
+        return False
+    tools = spec.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, Mapping) or tool.get("type") != "mcp":
+            continue
+        servers = tool.get("servers")
+        # Absent (pre-V-E manifests) and explicit [] both mean the wildcard.
+        if not isinstance(servers, list) or not servers:
             return True
     return False
 
@@ -984,7 +1006,7 @@ def build_mcp_servers_router() -> APIRouter:
         await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
         return {"success": True, "data": _public(record), "error": None}
 
-    @router.delete("/{name}", status_code=204)
+    @router.delete("/{name}", status_code=200)
     async def delete_mcp_server(
         name: Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")],
         principal: Annotated[Principal, Depends(require("mcp_server", "delete"))],
@@ -994,7 +1016,7 @@ def build_mcp_servers_router() -> APIRouter:
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
-    ) -> None:
+    ) -> dict[str, object]:
         tenant_id = principal.tenant_id
         # (a) Resolve row first so we have the UUID for the audit record and a clean 404.
         record = await store.get(tenant_id=tenant_id, name=name)
@@ -1003,18 +1025,24 @@ def build_mcp_servers_router() -> APIRouter:
                 status_code=404,
                 detail={"code": "MCP_SERVER_NOT_FOUND", "message": "not found"},
             )
-        # (b) Reference check: refuse if any active agent manifest references this server.
+        # (b) Reference check: refuse if any live (non-soft-deleted) agent manifest
+        # explicitly references this server. DELETED specs are tombstones —
+        # counting them produced a false 409 that locked deletion forever;
+        # DEPRECATED still counts as active reference surface.
         # agent_spec_repo may be None in minimal deployments (no spec store wired).
+        implicit_all = 0
         if agent_spec_store is not None:
             specs = await agent_spec_store.list_by_tenant(  # type: ignore[attr-defined]
                 tenant_id=tenant_id, limit=1000
             )
-            # AgentSpecRecord.spec is an AgentSpec object — convert to dict for the
-            # manifest_references_server helper which reads raw manifest dicts.
+            active_specs = [s for s in specs if s.status is not AgentSpecStatus.DELETED]
+            # AgentSpecRecord.spec is an AgentSpec object — convert to dict (once
+            # per spec) for the helpers below, which read raw manifest dicts.
+            dumped = [(s.name, s.spec.model_dump(mode="json")) for s in active_specs]
             referencing = [
-                s.name
-                for s in specs
-                if manifest_references_server(s.spec.model_dump(mode="json"), name)
+                spec_name
+                for spec_name, manifest in dumped
+                if manifest_references_server(manifest, name)
             ]
             if referencing:
                 raise HTTPException(
@@ -1026,6 +1054,11 @@ def build_mcp_servers_router() -> APIRouter:
                         ),
                     },
                 )
+            # D3: ``servers`` empty/absent = "every available server" wildcard.
+            # Those agents follow the live server set dynamically, so they are
+            # not a hard reference — the delete proceeds, but the impact count
+            # is surfaced in the response and the audit record.
+            implicit_all = sum(1 for _, manifest in dumped if manifest_uses_implicit_all(manifest))
         # (c) Delete the row.
         await store.delete(tenant_id=tenant_id, name=name)
         # (c2) Best-effort secret cleanup. This domain is paste-only (no ref-mode
@@ -1053,8 +1086,13 @@ def build_mcp_servers_router() -> APIRouter:
             resource_type="tenant_mcp_server",
             resource_id=str(record.id),
             trace_id=current_trace_id_hex(),
-            details={"name": name},
+            details={"name": name, "implicit_all_agents": implicit_all},
         )
         await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+        return {
+            "success": True,
+            "data": {"implicit_all_agents": implicit_all},
+            "error": None,
+        }
 
     return router

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from expert_work.persistence.trigger.base import TriggerRunStore, TriggerStore
@@ -95,6 +95,30 @@ class InMemoryTriggerStore(TriggerStore):
             return False
         self._rows[record.id] = record
         return True
+
+    async def disable_for_agent(
+        self, *, agent_name: str, agent_version: str, tenant_id: UUID
+    ) -> int:
+        """Deletion hygiene PR4 §B — agent soft-delete cascade.
+
+        Predicates: ``enabled == true AND agent_name == AND agent_version ==
+        AND tenant_id ==``; sets ``enabled=false``; returns rows changed.
+        Must stay semantically identical to ``SqlTriggerStore.disable_for_agent``.
+        """
+        victims = [
+            tid
+            for tid, r in self._rows.items()
+            if r.tenant_id == tenant_id
+            and r.agent_name == agent_name
+            and r.agent_version == agent_version
+            and r.enabled
+        ]
+        now = datetime.now(UTC)
+        for tid in victims:
+            self._rows[tid] = self._rows[tid].model_copy(
+                update={"enabled": False, "updated_at": now}
+            )
+        return len(victims)
 
     async def claim_cron_fire(
         self,

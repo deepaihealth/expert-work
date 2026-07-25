@@ -80,6 +80,7 @@ from expert_work.persistence.token_usage_store import TokenTotals, TokenUsageSto
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import (
     AgentSpec,
+    AgentSpecStatus,
     ApprovalStatus,
     AuditAction,
     AuditResult,
@@ -640,11 +641,27 @@ async def resolve_approval_decision(
         },
     )
 
+    # Deletion hygiene PR4 — same 410-over-404 split as the run-start path: a
+    # soft-DELETED agent's approval continuation is refused with a precise 410.
     spec_record = await agent_repo.get(
-        tenant_id=tenant_id, name=meta.agent_name, version=meta.agent_version
+        tenant_id=tenant_id,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        include_deleted=True,
     )
     if spec_record is None:
-        raise HTTPException(status_code=404, detail="agent not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
+        )
+    if spec_record.status is AgentSpecStatus.DELETED:
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "AGENT_DELETED",
+                "message": f"agent {meta.agent_name}@{meta.agent_version} has been deleted",
+            },
+        )
     try:
         built = await runtime.get_agent(
             tenant_id=tenant_id,
@@ -1000,13 +1017,26 @@ def build_runs_router() -> APIRouter:
             return denial
 
         # Load the agent manifest + build (cache-hit) a runnable agent.
+        # Deletion hygiene PR4 — look up including soft-deleted rows so a
+        # DELETED agent gets a precise 410 instead of a generic 404.
         record = await agent_repo.get(
-            tenant_id=tenant_id, name=meta.agent_name, version=meta.agent_version
+            tenant_id=tenant_id,
+            name=meta.agent_name,
+            version=meta.agent_version,
+            include_deleted=True,
         )
         if record is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
+            )
+        if record.status is AgentSpecStatus.DELETED:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "code": "AGENT_DELETED",
+                    "message": f"agent {meta.agent_name}@{meta.agent_version} has been deleted",
+                },
             )
         try:
             built = await runtime.get_agent(
