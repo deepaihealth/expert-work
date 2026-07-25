@@ -81,6 +81,7 @@ export function ConversationDetail() {
     loads: historyLoads,
     registerRow: registerHistoryRow,
     load: loadHistory,
+    reset: resetHistory,
   } = useHistoryTurns();
   // Per-page seed for each turn's event view (the playground persists its own
   // default under a playground-scoped key; this page just starts on timeline).
@@ -140,9 +141,17 @@ export function ConversationDetail() {
     convo.thread_id === threadId;
 
   useEffect(() => {
-    if (!threadId || !sameTenant) return;
+    if (!threadId || !sameTenant) {
+      // H-1 — the route's param can change without remounting this
+      // component (react-router keys by route id, not ``:threadId``), so a
+      // same-tenant → cross-tenant switch must explicitly clear whatever
+      // turn cards the previous thread built here; otherwise they linger
+      // over the new thread's own content indefinitely.
+      resetHistory();
+      return;
+    }
     void loadHistory(threadId);
-  }, [threadId, sameTenant, loadHistory]);
+  }, [threadId, sameTenant, loadHistory, resetHistory]);
 
   // Export a turn's full event stream as JSON — same contract as the
   // playground's toolbar button (prefer the authoritative persisted replay,

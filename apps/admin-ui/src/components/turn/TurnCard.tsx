@@ -228,8 +228,11 @@ export interface TurnCardProps {
   /** item 15 — gates the "open in Langfuse" deep link (Langfuse has no
    *  per-tenant isolation; see TraceToolbar for the same gate). */
   isSystemAdmin: boolean;
-  /** Historical-turn rendering: hides the approval gate and feedback bar
-   *  (no mutating control on a finished run). Live turns default false. */
+  /** Historical-turn rendering: hides the approval gate and feedback bar.
+   *  NOT a blanket "no writes" switch — ``onExport`` still fires (callers
+   *  must pass a real handler, not a no-op) and the manage_task 「立即触发」
+   *  button inside ToolCallCard is currently ungated. Live turns default
+   *  false. */
   readOnly?: boolean;
   /** Historical-turn lazy load state — drives the placeholder below. */
   loadState?: "pending" | "loading" | "done" | "error";

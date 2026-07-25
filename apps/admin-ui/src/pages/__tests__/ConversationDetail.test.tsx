@@ -429,6 +429,70 @@ describe("ConversationDetail", () => {
       expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
     });
 
+    it("clears a previous thread's paired turn cards when the route param switches to a cross-tenant thread without remounting (H-1; also guards M-3's per-render staleness check)", async () => {
+      // Same mounted ``<ConversationDetail>`` — react-router keys routes by
+      // route id, not by ``:threadId``, so navigating A → B re-renders the
+      // same component instance instead of remounting it. Thread A pairs
+      // 1:1 (turn cards); thread B is a different tenant, so it must fall
+      // back to the flat block — and none of A's cards may linger.
+      const THREAD_B = "55555555-5555-5555-5555-555555555555";
+      const CROSS_TENANT = "99999999-9999-9999-9999-999999999999";
+      const B_MESSAGES: sessionsSdk.HistoryMessage[] = [
+        { role: "user", content: "B-ONLY cross tenant question" },
+      ];
+      const CONVO_B: ConversationDetailModel = {
+        ...CONVO,
+        thread_id: THREAD_B,
+        tenant_id: CROSS_TENANT,
+        title: "cross-tenant thread",
+        runs: [],
+      };
+
+      vi.spyOn(convoSdk, "getConversation").mockImplementation(async (id: string) =>
+        id === THREAD_ID ? CONVO : CONVO_B,
+      );
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockImplementation(async (id: string) =>
+        id === THREAD_ID ? TWO_TURNS : B_MESSAGES,
+      );
+      const runsSpy = vi
+        .spyOn(runsSdk, "listThreadRuns")
+        .mockImplementation(async (id: string) => (id === THREAD_ID ? TWO_RUNS : []));
+      const streamSpy = vi.spyOn(runsSdk, "streamRunEvents");
+
+      const router = createMemoryRouter(
+        [{ path: "/conversations/:threadId", element: <ConversationDetail /> }],
+        { initialEntries: [`/conversations/${THREAD_ID}`] },
+      );
+      render(
+        <AuthProvider>
+          <App>
+            <RouterProvider router={router} />
+          </App>
+        </AuthProvider>,
+      );
+
+      await waitFor(() =>
+        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+      );
+      expect(screen.getByText("I was charged twice")).toBeInTheDocument();
+
+      streamSpy.mockClear();
+      runsSpy.mockClear();
+
+      router.navigate(`/conversations/${THREAD_B}`);
+
+      await waitFor(() =>
+        expect(screen.getByTestId("conversation-message-0")).toBeInTheDocument(),
+      );
+      expect(screen.getByText("B-ONLY cross tenant question")).toBeInTheDocument();
+      // A's turn cards (and its input text) must not linger.
+      expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
+      expect(screen.queryByText("I was charged twice")).not.toBeInTheDocument();
+      // Cross-tenant thread B must never hit the replay/runs endpoints.
+      expect(runsSpy).not.toHaveBeenCalled();
+      expect(streamSpy).not.toHaveBeenCalled();
+    });
+
     it("stays flat and issues no replay for a cross-tenant thread", async () => {
       // system_admin drilling into another tenant's conversation: the replay /
       // runs endpoints take no ``tenant_id``, so rebuilding could only 404 (D3).
