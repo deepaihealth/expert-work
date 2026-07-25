@@ -11,7 +11,7 @@ The endpoint test asserts the admin/viewer authz split.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -598,6 +598,116 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
     assert await approvals.get_by_run(run_id=approval_a.run_id, tenant_id=t1) is None
     # B's thread's NULL approval is untouched (thread predicate, not tenant-wide).
     assert await approvals.get_by_run(run_id=approval_b.run_id, tenant_id=t1) is not None
+
+
+class _FailingApprovalStore(InMemoryApprovalStore):
+    """``delete_for_threads`` always raises; every other op behaves normally.
+
+    Drives the ``_purge_threads`` approval-cleanup best-effort branch (its own
+    inner ``try``/``except``, distinct from the outer per-step ``_step``
+    wrapper): a failure there must be recorded and must NOT abort the rest of
+    ``_purge_threads`` — the checkpoint/run/thread-row deletion loop that
+    follows in the same function must still run.
+    """
+
+    async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        raise RuntimeError("approval store unavailable")
+
+
+@pytest.mark.asyncio
+async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort() -> None:
+    """``approvals.delete_for_threads`` raising —— failure is recorded under
+    ``agent_approval`` and the rest of ``_purge_threads`` (thread-row
+    deletion, which runs later in the SAME function) still completes.
+
+    Guards the inner try/except around the approval cleanup in
+    ``_purge_threads`` (distinct from ``purge_user``'s outer per-step
+    ``_step`` wrapper around the whole ``_purge_threads`` coroutine): if that
+    inner guard were removed, the exception would propagate out of
+    ``_purge_threads`` entirely, get caught by the OUTER ``_step`` instead
+    (recorded as ``failures["threads"]``, not ``failures["agent_approval"]``),
+    and abort the function before the per-thread deletion loop below it ever
+    runs — leaving ``threads_purged == 0``.
+    """
+    t1 = uuid4()
+    threads = InMemoryThreadMetaStore()
+    memory = InMemoryMemoryStore()
+    memory_dlq = InMemoryMemoryWritebackDLQ()
+    artifacts = InMemoryArtifactStore()
+    mcp_oauth = InMemoryMcpOAuthConnectionStore()
+    agent_instances = InMemoryAgentInstanceStore()
+    approvals = _FailingApprovalStore()
+    triggers = InMemoryTriggerStore()
+    trigger_runs = InMemoryTriggerRunStore()
+    webhook_endpoints = InMemoryWebhookEndpointStore()
+    webhook_deliveries = InMemoryWebhookDeliveryStore()
+    image_uploads = InMemoryImageUploadStore()
+    feedback = InMemoryFeedbackStore()
+    volume_backup_dlq = InMemoryVolumeBackupDLQ()
+    token_usage = InMemoryTokenUsageStore()
+    runs = InMemoryRunStore()
+    skills = InMemorySkillStore()
+    eval_datasets = InMemoryEvalDatasetStore()
+    curation = InMemoryCurationCandidateStore()
+    users = InMemoryTenantUserStore()
+    audit_store = InMemoryAuditLogStore()
+    supervisor = RecordingSupervisorClient()
+
+    a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
+    t_a = uuid4()
+    await threads.create(
+        thread_id=t_a,
+        tenant_id=t1,
+        created_by="seed",
+        user_id=a.id,
+        agent_name="alpha",
+        agent_version="1.0.0",
+    )
+    await approvals.create(_approval(tenant=t1, thread=t_a))
+
+    deps = PurgeUserDeps(
+        threads=threads,
+        runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
+        memory=memory,
+        memory_dlq=memory_dlq,
+        artifacts=artifacts,
+        mcp_oauth=mcp_oauth,
+        agent_instances=agent_instances,
+        approvals=approvals,
+        triggers=triggers,
+        trigger_runs=trigger_runs,
+        webhook_endpoints=webhook_endpoints,
+        webhook_deliveries=webhook_deliveries,
+        image_uploads=image_uploads,
+        feedback=feedback,
+        object_store=None,
+        volume_backup_dlq=volume_backup_dlq,
+        token_usage=token_usage,
+        runs=runs,
+        skills=skills,
+        eval_datasets=eval_datasets,
+        curation_candidates=curation,
+        tenant_users=users,
+        audit=build_default_audit_logger(audit_store),
+        supervisor=supervisor,
+    )
+
+    summary = await purge_user(
+        tenant_id=t1, user_id=a.id, subject_id="subj-a", deps=deps, actor_id="admin"
+    )
+
+    # Failure recorded under the specific step name, not just "threads" as a
+    # whole — proves the inner try/except (not the outer _step) caught it.
+    assert "agent_approval" in summary.failures
+    assert summary.failures["agent_approval"]
+    # The rest of _purge_threads — which runs AFTER the approval-cleanup
+    # block, in the same function — still executed: the thread row itself
+    # was purged despite the approval-cleanup exception.
+    assert summary.threads_purged == 1
+    # purge_user's outer per-step wrapper never saw an exception either — the
+    # "threads" step (the whole _purge_threads coroutine) is not itself
+    # recorded as failed.
+    assert "threads" not in summary.failures
 
 
 # --------------------------------------------------------------------------- #
