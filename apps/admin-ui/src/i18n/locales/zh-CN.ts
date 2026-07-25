@@ -297,7 +297,8 @@ const zhCN: TranslationKeys = {
   },
   user_profile: {
     back_label: "用户",
-    banner: "只读观测 —— 此页不代表以该用户身份运行；跨用户查看/修改均留审计。",
+    banner:
+      "只读页面 —— 你只是在查看该用户的数据，不会以他的身份运行任何操作；查看和修改他人数据都会记入审计日志。",
     tab_conversations: "对话",
     tab_memory: "记忆",
     tab_workspace: "工作区",

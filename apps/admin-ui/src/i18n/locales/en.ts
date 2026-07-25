@@ -3168,7 +3168,7 @@ const en: TranslationKeys = {
   user_profile: {
     back_label: "Users",
     banner:
-      "Read-only observability — this page does not run as this user; all cross-user views/edits are audited.",
+      "Read-only page — you are viewing this user's data, not acting as them; viewing or editing someone else's data is written to the audit log.",
     tab_conversations: "Conversations",
     tab_memory: "Memory",
     tab_workspace: "Workspace",
