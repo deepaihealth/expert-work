@@ -209,6 +209,17 @@ async def _purge_threads(
         logger.warning("purge_user.feedback_failed", exc_info=True)
         summary.failures["feedback"] = f"{type(exc).__name__}: {exc}"
 
+    # Approvals are keyed by thread, not user — the only writer (orchestrator
+    # sse.py pause flow) stamps user_id=None on every row, so the per-user
+    # delete below never matches. Thread-scope delete is the one that works.
+    try:
+        summary.deleted["agent_approval"] = await deps.approvals.delete_for_threads(
+            thread_ids=thread_ids, tenant_id=tenant_id
+        )
+    except Exception as exc:
+        logger.warning("purge_user.approvals_failed", exc_info=True)
+        summary.failures["agent_approval"] = f"{type(exc).__name__}: {exc}"
+
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)
     for thread_id in thread_ids:
@@ -345,9 +356,12 @@ async def purge_user(
         deps.agent_instances.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )
-    summary.deleted["agent_approval"] = await _step(
+    # Backstop for future user-stamped approval rows; the thread-scope pass in
+    # _purge_threads covers today's NULL-user_id rows (its count is
+    # deleted["agent_approval"] — a separate key here so it isn't overwritten).
+    summary.deleted["agent_approval_user_scope"] = await _step(
         summary,
-        "agent_approval",
+        "agent_approval_user_scope",
         deps.approvals.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )

@@ -137,11 +137,13 @@ export interface PurgeSummary {
   ok: boolean;
 }
 
-/** POST /v1/users/{id}:purge — irreversibly cascade-purge an external end-user's
- *  data + assets (admin-only, server-gated). Caller-home-tenant-scoped like the
- *  rest of the /users feature. The backend rejects a console member (employee)
- *  with 409 — those are purged from the members page. Best-effort + idempotent;
- *  the returned summary carries per-store counts and any step that failed. */
+/** POST /v1/users/{id}:purge — irreversibly cascade-purge a user's data +
+ *  assets (admin-only, server-gated). Caller-home-tenant-scoped like the rest
+ *  of the /users feature. Works for any user — external end-user or console
+ *  member (employee); account deletion stays a members-page concern (this
+ *  endpoint never touches Keycloak / roles / tenant_member). Best-effort +
+ *  idempotent; the returned summary carries per-store counts and any step
+ *  that failed. */
 export async function purgeUser(userId: string): Promise<PurgeSummary> {
   return postJson<PurgeSummary>(`/v1/users/${encodeURIComponent(userId)}:purge`, {});
 }

@@ -7,6 +7,10 @@
  * ``active`` row is suspended. Invitation is a batch call that returns
  * per-item results, so a partial failure (Keycloak conflict / down)
  * surfaces the failing emails without aborting the whole batch.
+ *
+ * Deletion-hygiene PR5 adds the one-shot "deactivate & purge" action:
+ * type-to-confirm (the member's email) then ``POST /{id}:purge`` —
+ * lifecycle + role bindings + Keycloak account DELETE + data cascade.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -28,13 +32,14 @@ import {
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
-import { KeyRound, RefreshCw, Send, Trash2, UserPlus, Users } from "lucide-react";
+import { KeyRound, RefreshCw, Send, Trash2, UserPlus, Users, UserX } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { PageHeader } from "../components/PageHeader";
 import {
   inviteMembers,
   listMembers,
+  purgeMember,
   resendMember,
   resetMemberPassword,
   revokeMember,
@@ -45,9 +50,10 @@ import {
   type TenantMember,
 } from "../api/members";
 import { ApiError } from "../api/client";
+import { PurgeUserModal } from "./user_profile/PurgeUserModal";
 import { SCOPE_ALL, useTenantScope } from "../tenant/TenantScopeContext";
 
-const { Text } = Typography;
+const { Paragraph, Text } = Typography;
 
 const ROLE_OPTIONS: MemberRole[] = ["admin", "operator", "viewer"];
 
@@ -95,6 +101,9 @@ export function SettingsMembers() {
   const [pwTarget, setPwTarget] = useState<TenantMember | null>(null);
   const [pw, setPw] = useState("");
   const [pwErr, setPwErr] = useState<string | null>(null);
+
+  // One-shot deactivate & purge (deletion-hygiene PR5) — type-to-confirm.
+  const [purgeTarget, setPurgeTarget] = useState<TenantMember | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -287,7 +296,7 @@ export function SettingsMembers() {
       {
         title: t("settings_members.col_actions"),
         key: "actions",
-        width: 200,
+        width: 300,
         render: (_: unknown, record: TenantMember) => {
           const removable =
             record.status === "invited" || record.status === "active";
@@ -347,6 +356,17 @@ export function SettingsMembers() {
                   </Button>
                 </Popconfirm>
               )}
+              {/* One-shot deactivate & purge — every status is purgeable
+                  (suspended / revoked rows re-enter as backfill cleanup). */}
+              <Button
+                size="small"
+                danger
+                icon={<UserX size={12} strokeWidth={1.75} />}
+                onClick={() => setPurgeTarget(record)}
+                data-testid={`members-purge-${record.id}`}
+              >
+                {t("settings_members.purge_action")}
+              </Button>
             </Space>
           );
         },
@@ -556,6 +576,49 @@ export function SettingsMembers() {
           </Text>
         )}
       </Modal>
+
+      {purgeTarget !== null && (
+        <PurgeUserModal
+          open
+          onClose={() => setPurgeTarget(null)}
+          userId={purgeTarget.id}
+          subjectId={purgeTarget.email}
+          confirmTarget={purgeTarget.email}
+          onSubmit={() => purgeMember(purgeTarget.id)}
+          onPurged={() => {
+            setPurgeTarget(null);
+            refresh();
+          }}
+          copy={{
+            title: t("settings_members.purge_confirm_title"),
+            okText: t("settings_members.purge_action"),
+            body: (
+              <>
+                <Alert
+                  type="error"
+                  showIcon
+                  message={t("settings_members.purge_confirm_body", {
+                    email: purgeTarget.email,
+                  })}
+                  style={{ marginBottom: 16 }}
+                />
+                {purgeTarget.subject_id === null && (
+                  <Paragraph
+                    type="secondary"
+                    style={{ marginBottom: 16 }}
+                    data-testid="members-purge-no-data-note"
+                  >
+                    {t("settings_members.purge_no_data_note")}
+                  </Paragraph>
+                )}
+              </>
+            ),
+            typeToConfirm: t("settings_members.purge_type_to_confirm"),
+            done: t("settings_members.purge_done"),
+            partial: t("settings_members.purge_partial"),
+          }}
+        />
+      )}
     </div>
   );
 }

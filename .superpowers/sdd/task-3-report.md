@@ -1,63 +1,94 @@
-# Task 3 报告(PR4)—— delete_agent 级联 + runs 两处 410 语义
+# PR5 Task 3 报告 — 前端成员页"停用并清除"入口(§C)
 
-## STATUS: DONE(TDD 先红后绿 + 变异自验通过)
+## STATUS: DONE(TDD 先红后绿)
 
-- 注:本文件覆盖的旧 `task-3-report.md` 是 PR3 遗留(purge_session 报告),沿既定覆盖惯例;旧版完整保留在 git 历史。
-- 起手 `git merge --ff-only fix-deletion-hygiene-pr4`(fast-forward `d2ae1fcb..9bcd2848`,带入 T1 `disable_for_agent`)。
+- 注:本文件覆盖的旧 `task-3-report.md` 是 PR4 遗留(delete_agent 级联报告),沿既定覆盖惯例;旧版完整保留在 git 历史。
+- 起手 `git merge --ff-only fix-deletion-hygiene-pr5`(fast-forward `8c264b26..e24be19a`,带入 T1/T2)。
 
-## 变更
+Commit: `84cf715c` feat(admin-ui): 成员页一键停用并清除(type-to-confirm email + partial 留驻)
 
-### 实现
+## 交付内容
 
-- `services/control-plane/src/control_plane/api/agents.py`
-  - `delete_agent` 新增 Depends:`run_store` / `runtime` / `triggers`(新增本地 getter `_get_trigger_store` 读 `app.state.trigger_store`,照 triggers.py:232 模式);import 增 `TriggerStore`。
-  - 软删成功、build cache 失效后、MANIFEST_DELETE 审计前插入级联(brief Step 3 代码逐字落地):
-    - 取消在飞 run:`run_store.list_running_for_agent` → 每条 `runtime.run_manager.cancel(...) or run_store.request_cancel(...)`(照 `disable_agent` RT-ADR-17 套路),每成功一条 SESSION_CANCEL 审计(reason=`"agent_deleted"`)。整段 try/except:失败 → `logger.warning("agent_delete.runs_cancel_failed", exc_info=True)` + `details["runs_cancel_failed"] = True`,删除不受阻。
-    - 禁用 trigger:`triggers.disable_for_agent(agent_name=name, agent_version=version, tenant_id=tenant_id)`(T1 接口,版本级)。失败同型 → `triggers_disable_failed: true`。
-  - MANIFEST_DELETE 审计 details 合入 `runs_cancelled` / `triggers_disabled` 计数 + 失败布尔(仅失败时出现)。`trace_id` 函数头取一次,SESSION_CANCEL 与 MANIFEST_DELETE 共用(照 disable_agent)。
-- `services/control-plane/src/control_plane/api/runs.py`
-  - protocol import 增 `AgentSpecStatus`。
-  - 两处 `agent_repo.get` 改 `include_deleted=True` + `status is DELETED` → 410 `{"code": "AGENT_DELETED", "message": ...}`、None → 404 照旧(brief 410 结构逐字):
-    - `trigger_run`(起 run / 会话发消息,原 :1002-1010)。
-    - `resolve_approval_decision`(审批续跑,原 :643-647;404 detail 顺带带上 name@version,同型)。
+### 1. `api/members.ts` — 新 SDK 面
 
-### 测试(先写、确认红、实现转绿)
+- `MemberPurgeResult` 接口,逐字段对齐 T2 落定的 200 信封 `data` 形状
+  (`member_id / status / kc_deleted / kc_delete_failed / role_bindings_removed /
+  role_bindings_cleanup_failed / data_purged / purge: PurgeSummary | null`)。
+- `purgeMember(memberId)` → `POST /v1/members/{id}:purge`(照文件内既有
+  `encodeURIComponent` + `postJson` 风格;URL 形状照 `users.ts` 的 `:purge` 先例)。
+- `isMemberPurgePartial(result)` — partial 判定单源:
+  `kc_delete_failed || role_bindings_cleanup_failed || (purge !== null && !purge.ok)`。
+  放在类型旁(members.ts)而非 Modal 内,注释点明无 supervisor 部署里
+  `purge.ok === false` 是已知形状,不特判。
 
-- `services/control-plane/tests/test_agents_api.py` 新增级联段:
-  - `cascade_ctx` fixture(照 test_agent_disable_api.py `_Ctx` 套路:threads/run_store 共享 + `stub_agent_runtime` + 可 introspect 的 audit store)。
-  - ① `test_delete_disables_only_this_versions_triggers`:目标 trigger 变 disabled,他 agent / 他 version 不动;details `triggers_disabled==1`、`runs_cancelled==0`、无失败布尔。
-  - ② `test_delete_cancels_in_flight_runs`:RUNNING run → INTERRUPTED;恰一条 SESSION_CANCEL(reason=`agent_deleted`、resource_id=run_id);details `runs_cancelled==1`。
-  - ③ `test_delete_survives_trigger_disable_failure`:monkeypatch `disable_for_agent` 抛 → 仍 204 + `triggers_disable_failed is True` + `triggers_disabled==0`。
-  - ③b `test_delete_survives_run_cancel_failure`:monkeypatch `list_running_for_agent` 抛 → 仍 204 + `runs_cancel_failed is True` + `runs_cancelled==0`(Global Constraint:两个 best-effort 失败布尔都有测试咬住)。
-- `services/control-plane/tests/test_runs_api.py` 新增 410 段(测试④):
-  - `test_run_on_deleted_agent_returns_410` / `test_resume_on_deleted_agent_returns_410`:删 agent 后起 run / 审批续跑 → 410,body `detail.code == "AGENT_DELETED"`(control-plane 无自定义 exception handler,FastAPI 默认 `{"detail": {...}}` 包裹)。
-  - `test_run_on_never_registered_agent_still_404` / `test_resume_on_never_registered_agent_still_404`:seed 绑到从未注册 agent 的 thread(`_seed_ghost_thread` 直插 thread_meta)→ 404 照旧。
-- 波及修复:`tests/test_resume_idempotency_flow.py` 与 `tests/test_approval_timeout_sweep.py` 的 `_FakeAgentRepo.get` 桩不接受新 `include_deleted` kwarg、返回值无 `status` 属性(9 测 TypeError 红)→ 桩补 `include_deleted: bool = False` + `status=AgentSpecStatus.ACTIVE`,与 `AgentSpecStore.get` 真契约对齐(修桩非削测试)。
+### 2. `PurgeUserModal.tsx` 泛化(向后兼容,UserProfile 零改动)
 
-## TDD 记录
+新 props **全可选**,缺省走原路径:
 
-1. RED:6 个新行为测试失败且失败原因正确(trigger 仍 enabled / 410 处仍返 404 `agent code-reviewer@1.0.0 not found`);2 个 404-保持测试在旧代码上即绿(语义未变,预期内)。
-2. GREEN:实现后 `test_agents_api.py + test_runs_api.py` 85 passed。
+- `confirmTarget?: string` — 覆盖 arming 目标:
+  `target = confirmTarget ?? subjectId; armed = target.length > 0 && confirmText.trim() === target`;
+  `<Text code>` 展示与 placeholder 同步用 `target`。
+- `onSubmit?: () => Promise<PurgeSummary | MemberPurgeResult>` — 覆盖默认
+  `purgeUser(userId)`;结果判定用 `"ok" in result` 判别联合
+  (PurgeSummary 才有顶层 `ok`;MemberPurgeResult 走 `isMemberPurgePartial`)。
+- `copy?: PurgeModalCopy` — 文案覆盖束(title / okText / body / typeToConfirm /
+  done / partial),每字段回退原 `user_profile.purge_*` 文案。
+- 一处有意的行为门:409"这是员工去成员页"的防御性提示**只在默认
+  purgeUser 路径生效**(`onSubmit === undefined` 才走)——成员页自身弹
+  "去成员页"是误导;members 流的 409(MEMBER_STATE_CONFLICT)落通用
+  `purge_failed_title` 错误弹窗。
 
-## 变异自验(brief Step 5,必做项)
+### 3. `SettingsMembers.tsx` — 入口 + Modal 装配
 
-- 变异:runs.py 两处 410 status 判定改永假(`if False and record.status is ...` / `if False and spec_record.status is ...`)。
-- 结果:`test_run_on_deleted_agent_returns_410` 与 `test_resume_on_deleted_agent_returns_410` 双双红(`assert 404 == 410`),两个 404 测试仍绿 → 测试④确实咬住 410 判定,非空转。
-- 恢复后同组 4/4 绿。
+- 危险动作列新增"停用并清除"按钮(UserX 图标,照 set-password 按钮结构,
+  `data-testid=members-purge-{id}`),**全状态可见**(suspended/revoked 行
+  可补清——后端幂等重入);列宽 200→300 容纳第四个按钮。
+- 跨租户聚合视图自然隐藏(按钮在既有 actions 列条件块内)。
+- Modal 条件挂载(`purgeTarget !== null`),传
+  `confirmTarget={member.email}`、`onSubmit={() => purgeMember(member.id)}`;
+  copy.body = settings_members 专属警示 Alert({{email}} 插值)+
+  `subject_id === null` 时的 no_data_note 段落
+  (`data-testid=members-purge-no-data-note`);成功 → 关 Modal + refresh;
+  partial → Modal 留驻(泛化后的原留驻逻辑)。
 
-## 验证
+### 4. i18n 三处同步(先查撞键:settings_members 域原无 purge_* 键)
 
-- `uv run pytest services/control-plane/tests/test_agents_api.py services/control-plane/tests/test_runs_api.py -q` → **85 passed**
-- 影响面 10 文件(agents/runs/sessions/agent_disable/agents_run_for_user/resume_idempotency_flow/approval_timeout_sweep/approvals/orphan_sweep/run_queue_worker)→ **177 passed**(修桩后;全量套件由 T5 终门统一跑)
-- `uv run ruff check .`(全库)All checks passed;`uv run ruff format --check .`(全库)通过
-- CI mypy 范围不含 control-plane(ci.yml:75),无新增扫描面
+`settings_members.purge_action / purge_confirm_title / purge_confirm_body /
+purge_type_to_confirm / purge_no_data_note / purge_done / purge_partial`,
+en 值块 + en interface 块 + zh-CN 镜像三处齐。
 
-## 设计说明 / 注意点
+### 5. 顺手更正
 
-- **RunInfo 无 agent_version 字段**(`packages/expert-work-runtime/src/expert_work/runtime/runs/schemas.py:66`;run→agent 绑定经 thread_meta join,只有 agent_name)→ 取消范围保持 **name 级**(brief 预案:宁可多取消不留残留)。同名他版本的在飞 run 也会被取消;trigger 禁用则是精确的 name+version 级。测试①同时锁住 trigger 的版本精确性。
-- 审批续跑路径的 410 在 `mark_decided` CAS **之后**抛出(approval 决定已消费)——与改动前该处 404 的时序一致,只是状态码更精确,未引入新语义。
-- 日志两条失败告警不含任何请求派生值,仅事件名 + `exc_info`;副作用调用均先赋值再断言,未进 assert。
+`api/users.ts` `purgeUser` 陈旧"员工 409"docstring 更正为现实
+(任意用户可清;账号删除是成员页职责)。
 
-## Commit
+## TDD 过程
 
-`feat(control-plane): agent 软删级联(禁 trigger+取消在飞 run)+ 已删 agent 起 run 410`
+- Step 1-2:先写 5 个测试(按钮三状态可见 / email type-to-confirm armed /
+  成功调 `purgeMember("m-1")`+刷新+关 Modal / partial 留驻不刷新 /
+  未首登 no_data_note),另在跨租户"隐藏写面"测试补 purge 按钮隐藏断言。
+  **确认红**:5/5 新测试红(按钮 testid 不存在),存量 1268 全绿。
+- Step 3:实现(上述 1-4)。
+- Step 4:**确认绿**——`pnpm -C apps/admin-ui typecheck` 0 错;目标两文件
+  SettingsMembers(9)+ UserProfile(9)= 18/18 绿(UserProfile 回归
+  含默认路径 type-to-confirm / partial 留驻 / 409 防御 / self-warning 全绿,
+  泛化未破坏);**全量套件 150 文件 / 1273 测试全绿**。
+
+## 测试要点(套路记录)
+
+- `vi.mock("../../api/members")` 工厂改用 `importOriginal` 展开真模块再覆盖
+  各 fn——Modal 经真 `isMemberPurgePartial` 判 partial,桩掉它会让
+  partial 测试空转(测不到判定逻辑)。
+- 本机 `pnpm` corepack shim 被 SIGKILL(exit 137,原因未查),
+  用 `node ~/.nvm/.../corepack/dist/pnpm.js` 直调绕过;worktree 需先
+  `pnpm install`(admin-ui 独立 lockfile,非 monorepo workspace)。
+
+## Concerns
+
+1. **（无阻塞）** actions 列四按钮在窄屏可能换行——列宽已放到 300,
+   纯 cosmetic,未做响应式折叠(YAGNI)。
+2. **（无阻塞）** revoked 成员也显示"停用并清除"(后端幂等补清语义),
+   brief 测试 ① 只点名 invited/active/suspended——已按设计文档
+   "全状态可清"实现,若产品想对 revoked 隐藏是一行条件的事。
+3. CI 的 `pnpm build`(vite build)未在本地跑(typecheck + 全量 vitest
+   已绿,build 无新增配置面);CI 会兜。
