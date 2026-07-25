@@ -216,7 +216,7 @@ class SqlTriggerStore(TriggerStore):
                 AgentTriggerRow.agent_version == agent_version,
                 AgentTriggerRow.enabled.is_(True),
             )
-            .values(enabled=False)
+            .values(enabled=False, updated_at=func.now())
         )
         async with self._sf() as session:
             result = await session.execute(stmt)

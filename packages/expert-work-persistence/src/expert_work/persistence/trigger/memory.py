@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from expert_work.persistence.trigger.base import TriggerRunStore, TriggerStore
@@ -113,8 +113,11 @@ class InMemoryTriggerStore(TriggerStore):
             and r.agent_version == agent_version
             and r.enabled
         ]
+        now = datetime.now(UTC)
         for tid in victims:
-            self._rows[tid] = self._rows[tid].model_copy(update={"enabled": False})
+            self._rows[tid] = self._rows[tid].model_copy(
+                update={"enabled": False, "updated_at": now}
+            )
         return len(victims)
 
     async def claim_cron_fire(
