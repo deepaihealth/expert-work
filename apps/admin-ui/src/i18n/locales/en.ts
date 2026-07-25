@@ -2070,6 +2070,13 @@ export interface TranslationKeys {
     failed_to_load: string;
     empty: string;
     empty_cross: string;
+    purge_action: string;
+    purge_confirm_title: string;
+    purge_confirm_body: string;
+    purge_type_to_confirm: string;
+    purge_no_data_note: string;
+    purge_done: string;
+    purge_partial: string;
   };
   settings_platform_users: {
     page_title: string;
@@ -5132,6 +5139,15 @@ const en: TranslationKeys = {
     failed_to_load: "Failed to load members",
     empty: "No members in this tenant yet.",
     empty_cross: "No members across all tenants.",
+    purge_action: "Deactivate & purge",
+    purge_confirm_title: "Deactivate and purge this member · irreversible",
+    purge_confirm_body:
+      "This deactivates {{email}}, deletes their Keycloak account, removes their role bindings, and irreversibly purges their business data. If some steps fail it is safe to run again.",
+    purge_type_to_confirm: "Type the member's email to confirm:",
+    purge_no_data_note:
+      "This member has never signed in — there is no business data to purge; the account is deactivated and deleted only.",
+    purge_done: "Member deactivated and purged.",
+    purge_partial: "Some steps failed — safe to run again to finish cleanup.",
   },
   settings_platform_users: {
     page_title: "Platform Admins",
