@@ -21,6 +21,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from control_plane.api._authz import require
+from control_plane.api._user_scope import get_user_repo
+
+# Same-app private share (deletion-hygiene PR5 design decision): the purge-deps
+# assembly stays in agent_users.py next to the user-purge endpoint; the members
+# one-shot purge below reuses it rather than duplicating the wiring.
+from control_plane.api.agent_users import _build_purge_deps
 from control_plane.api.member_ops import (
     MemberConflictError,
     MemberKeycloakUnavailableError,
@@ -29,11 +35,13 @@ from control_plane.api.member_ops import (
 )
 from control_plane.audit import emit
 from control_plane.keycloak import KeycloakAdminClient, KeycloakUnavailableError
+from control_plane.purge import PurgeSummary, purge_user
 from control_plane.settings import Settings
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.auth import RoleBindingStore
 from expert_work.persistence.tenant_member import TenantMemberStore
+from expert_work.persistence.tenant_user.base import TenantUserStore
 from expert_work.protocol import AuditAction, MemberRole, MemberStatus, Principal
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -363,5 +371,141 @@ def build_members_router() -> APIRouter:
                 "role_bindings_cleanup_failed": cleanup_failed,
             },
         )
+
+    @router.post("/{member_id}:purge")
+    async def purge_member(
+        member_id: UUID,
+        request: Request,
+        principal: Annotated[Principal, Depends(require("user", "write"))],
+        member_repo: Annotated[TenantMemberStore, Depends(_get_member_repo)],
+        role_binding_repo: Annotated[RoleBindingStore, Depends(_get_role_binding_repo)],
+        keycloak: Annotated[KeycloakAdminClient, Depends(_get_keycloak)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> dict[str, object]:
+        """One-shot deactivate + purge — deletion-hygiene PR5 (D1 + D2).
+
+        The employee-offboarding combo the members page calls: lifecycle
+        transition (invited→revoked / active→suspended), role-binding
+        cleanup, Keycloak account DELETE (unlike revoke's disable), and the
+        ``purge_user`` data cascade for members who have logged in
+        (``subject_id`` back-filled). Terminal states (suspended / revoked)
+        re-enter without a transition — the backfill-cleanup path — so
+        re-running is safe and idempotent.
+
+        The lifecycle transition is the one BLOCKING step: a lost race
+        aborts with 409 before any side effect (continuing would purge a
+        still-active member's data). Every later step is best-effort with
+        its failure surfaced in the response + audit details.
+        """
+        from datetime import UTC, datetime
+
+        member = await member_repo.get(tenant_id=principal.tenant_id, member_id=member_id)
+        if member is None:
+            raise HTTPException(status_code=404, detail={"code": "MEMBER_NOT_FOUND"})
+
+        now = datetime.now(UTC)
+        # 1) Lifecycle — same state machine as revoke; failure blocks all.
+        target_status: MemberStatus = member.status
+        if member.status == "invited":
+            target_status = "revoked"
+            moved = await member_repo.transition(
+                member_id=member.id, tenant_id=principal.tenant_id, to="revoked", now=now
+            )
+        elif member.status == "active":
+            target_status = "suspended"
+            moved = await member_repo.transition(
+                member_id=member.id, tenant_id=principal.tenant_id, to="suspended", now=now
+            )
+        else:  # suspended / revoked — already terminal; backfill cleanup only.
+            moved = True
+        if not moved:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MEMBER_STATE_CONFLICT",
+                    "message": "member state changed concurrently; re-read and retry",
+                },
+            )
+
+        # 2) Role-binding cleanup (same shape as revoke — keyed on the KC sub;
+        #    best-effort, failure flagged in the response + audit).
+        removed = 0
+        cleanup_failed = False
+        if member.keycloak_user_id is not None:
+            try:
+                removed = await role_binding_repo.delete_for_subject(
+                    subject_type="user",
+                    subject_id=UUID(member.keycloak_user_id),
+                    tenant_id=principal.tenant_id,
+                )
+            except Exception:
+                cleanup_failed = True
+                logger.warning("member_purge.role_binding_cleanup_failed", exc_info=True)
+
+        # 3) Keycloak account DELETE (D2) — best-effort; the client treats a
+        #    404 as success, so a re-run stays idempotent.
+        kc_deleted = False
+        kc_delete_failed = False
+        if member.keycloak_user_id is not None:
+            try:
+                await keycloak.delete_user(user_id=member.keycloak_user_id)
+                kc_deleted = True
+            except KeycloakUnavailableError:
+                kc_delete_failed = True
+                logger.warning("member_purge.keycloak_delete_failed", exc_info=True)
+
+        # 4) Data cascade — only for members who have logged in.
+        #    ``member.subject_id`` is the tenant_user surrogate; ``purge_user``
+        #    also needs the user row's string subject (mcp_oauth key), read
+        #    from the registry. A missing row (anomalous) skips the data step
+        #    rather than erroring — ``data_purged: false`` flags it.
+        data_purged = False
+        summary: PurgeSummary | None = None
+        if member.subject_id is not None:
+            user = await users.get(member.subject_id, tenant_id=principal.tenant_id)
+            if user is not None:
+                summary = await purge_user(
+                    tenant_id=principal.tenant_id,
+                    user_id=member.subject_id,
+                    subject_id=user.subject_id,
+                    deps=_build_purge_deps(request),
+                    actor_id=principal.subject_id,
+                    trace_id=current_trace_id_hex(),
+                )
+                data_purged = True
+
+        await emit(
+            audit,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.subject_id,
+            action=AuditAction.MEMBER_PURGE,
+            resource_type="tenant_member",
+            resource_id=str(member.id),
+            trace_id=current_trace_id_hex(),
+            details={
+                "email": member.email,
+                "from_status": member.status,
+                "kc_deleted": kc_deleted,
+                "kc_delete_failed": kc_delete_failed,
+                "role_bindings_removed": removed,
+                "role_bindings_cleanup_failed": cleanup_failed,
+                "data_purged": data_purged,
+            },
+        )
+        return {
+            "success": True,
+            "data": {
+                "member_id": str(member.id),
+                "status": target_status,
+                "kc_deleted": kc_deleted,
+                "kc_delete_failed": kc_delete_failed,
+                "role_bindings_removed": removed,
+                "role_bindings_cleanup_failed": cleanup_failed,
+                "data_purged": data_purged,
+                "purge": summary.as_dict() if summary is not None else None,
+            },
+            "error": None,
+        }
 
     return router
