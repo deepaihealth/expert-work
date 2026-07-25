@@ -10,6 +10,12 @@
  * mismatch (an approval that split one turn across 2 runs, an auto-triggered
  * or errored run) is the honest signal that order-pairing is unsafe — we
  * return ``null`` and the caller falls back to flat text.
+ *
+ * A single run can emit several assistant messages (multi-step turns), so
+ * ``fallbackAnswer`` collects every assistant message between a user turn
+ * and the next one, joined with blank lines — not just the immediate next
+ * message — so the replay-failure fallback doesn't show less than the flat
+ * view would.
  */
 import type { HistoryMessage } from "../../../api/sessions";
 import type { ThreadRunSummary } from "../../../api/runs";
@@ -30,9 +36,11 @@ export function buildHistoryTurns(
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
     if (m.role !== "user") continue;
-    const next = messages[i + 1];
-    const answer = next && next.role === "assistant" ? next.content : "";
-    pairs.push({ input: m.content, answer });
+    const answers: string[] = [];
+    for (let j = i + 1; j < messages.length && messages[j].role !== "user"; j += 1) {
+      answers.push(messages[j].content);
+    }
+    pairs.push({ input: m.content, answer: answers.join("\n\n") });
   }
   if (pairs.length !== runs.length) return null;
   return pairs.map((p, i) => ({

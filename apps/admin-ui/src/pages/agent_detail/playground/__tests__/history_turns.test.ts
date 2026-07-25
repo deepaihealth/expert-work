@@ -44,4 +44,17 @@ describe("buildHistoryTurns", () => {
   it("returns [] for an empty thread", () => {
     expect(buildHistoryTurns([], [])).toEqual([]);
   });
+
+  it("collects ALL assistant messages in a turn (a run can emit several), joined by blank lines", () => {
+    // Turn 1: 3 assistant messages before the next user turn (e.g. multi-step run).
+    // Turn 2: 1 assistant message. runs.length === 2 user turns → pairing still succeeds.
+    const turns = buildHistoryTurns(
+      [U("q1"), A("a1"), A("a2"), A("a3"), U("q2"), A("b1")],
+      [run("r1"), run("r2")],
+    );
+    expect(turns).toEqual([
+      { key: "r1", input: "q1", fallbackAnswer: "a1\n\na2\n\na3", runId: "r1", status: "success" },
+      { key: "r2", input: "q2", fallbackAnswer: "b1", runId: "r2", status: "success" },
+    ]);
+  });
 });
