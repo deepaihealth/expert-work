@@ -37,14 +37,13 @@
 - span 保留(`TRACED_SPANS` 不动):fire-and-forget 后该 span 时间上仍在 trace 里,但不再阻塞入口链——bench 里该段耗时仍可见,分解条该段不再计入首字等待,收益体现为 recall 段变短。文档注明。
 - **已知会破的测试**:`services/orchestrator/tests/test_memory_nodes.py:337-357` 在 node 返回后立刻断言 `access_count == 1` → 改为 drain 后台任务再断言(暴露 task 集合或提供 flush 测试钩子)。
 
-### Task 3:P1.2 tenant_config TTL 缓存
+### Task 3:P1.2 tenant_config 读走已有缓存(修正版)
 
-现状:`_resolve_memory_recall_mode`(`memory.py:279-296`)每次 recall 拉整行 tenant_config 只用 `memory_recall_mode` 一个字段,15ms/次;**另一个隐藏消费点** `resolver.py:116` 每次 `resolve_provider` 都打一次 `tenant_config.get`(纯 existence 校验)——是 `resolve_ms` 里唯一无 TTL 保护的 DB 读。`SqlTenantConfigStore.get` 每次新开 AsyncSession(`tenant_config/sql.py:76-85`)。
+现状核实(2026-07-27 复核,推翻侦察初判):`TenantConfigService`(`tenancy/tenant_config.py:59`)**已带 per-tenant TTL 缓存**(`tenant_config_cache_ttl_s`,默认 60s)+ `upsert` 主动失效(prime);resolver 注入的 `tenant_config_getter` 就是它(`app.py:1191`)——resolve 路径早有缓存。**唯一裸奔的是 MemoryEnv 注入**(`app.py` 建 `MemoryEnv(tenant_config_store=resolved_tenant_config_repo)` 给的是无缓存 repo),即 bench「读取召回配置」段的 15ms/recall。
 
-- 新 `CachingTenantConfigStore` 包装类(persistence tenant_config 包内),照 `aliyun_kms.py:94-131` 模式:`dict[UUID, (record, expires_at)]` + 注入 `clock=time.monotonic`,TTL 30s。
-- **包共享实例**:app.py 建 repo 处包一层,5 处消费(`app.py:736/740/752/949/2088/2177`)+ resolver 全部受益。
-- 主动失效:tenant_config 写端点(`api/tenant_config.py`)PUT 后调 `invalidate(tenant_id)`;TTL 兜底跨副本。
-- 注意:settings 里已存在 `tenant_config_cache_ttl_s`(dynamic_worker service 的 ttl 借用了它)——plan 阶段核实其现有语义,TTL 值复用该 setting 而非新增。
+- 修法:**薄适配器委托 TenantConfigService**——实现 orchestrator 期望的 store 接口(`get -> record | None`),内部调 `service.get(tenant_id=..., actor_id=None)` 并把 `TenantConfigNotConfiguredError` 转 `None`。缓存、TTL、upsert 失效全复用 service 现有实现,**零新缓存逻辑**。
+- `actor_id=None` 不触发 audit(service 只在带 actor 时 emit),热路径无审计噪音。
+- **不包共享 repo**(spec 早稿方案作废):`TenantStatusService`(kill switch)用秒级短 TTL 消费同一 repo,repo 层加长缓存会架空 kill switch 传播,是安全回归。
 
 ### Task 4:P1.3 workspace_ingest 与 memory_recall 并行
 
@@ -52,7 +51,7 @@
 
 - 改边拓扑为两条并发分支:`START → memory_recall → agent` ‖ `START → planner → workspace_ingest → agent`(planner/ingest 各自可选,分支内保序,汇合在 agent 的 superstep 屏障)。
 - bench agent 无 planner 时即 `START → {memory_recall ‖ workspace_ingest} → agent` 纯并行。
-- **前提(plan 阶段必须核实)**:planner 不消费 `recalled_memories`。若消费,并行会改变 planner 输入语义——届时降级为只并行 ingest 分支或放弃本项并说明。
+- **前提已核实**:planner 只读 `state["messages"]`(`planner.py:148` `_extract_task`),不消费 `recalled_memories`——并行不改变 planner 输入语义。
 - approval RESUME 重入路径(`builder.py:1160-1167` 在 agent_node 内直接 await ingest)不受影响,不动。
 
 ### Task 5:P3 guards 全关跳 64 字符缓冲
@@ -148,7 +147,7 @@
 
 | 风险 | 对策 |
 |---|---|
-| P1.3 planner 消费 recalled_memories(未核实) | plan 阶段第一步核实;若消费则降级为只并行 ingest 分支 |
+| P1.3 planner 消费 recalled_memories | 已核实不消费(`planner.py:148` 只读 `state["messages"]`),前提成立 |
 | bump_access 后台化后测试时序 | 暴露 drain 钩子;bench 里该段仍可见(span 保留) |
 | secret 缓存把旧 key 延长到 TTL 窗口 | 主动失效为主力,TTL 只兜漏;失效链回归测试盖住 10+2 入口 |
 | agent 缓存 LRU 驱逐活 MCP 连接 | 遗弃靠 GC,与现状 invalidate 行为一致,不恶化 |
