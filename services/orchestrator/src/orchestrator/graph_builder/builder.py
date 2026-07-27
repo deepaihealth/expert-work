@@ -1424,7 +1424,8 @@ def build_react_graph(
     #   分支 1: memory_recall(写 recalled_memories)
     #   分支 2: planner → workspace_ingest(写 plan;分支内保序 —— CM-0:
     #           人改的 PLAN.md 仍覆盖 planner 生成的 plan)
-    # 写集不相交,LangGraph 多入边节点等全部父分支完成后执行一次。
+    # 写集不相交;汇合用列表形式 add_edge([a, b], "agent") 建 AND-join
+    # 屏障(NamedBarrierValue),agent 等全部父分支完成后执行一次。
     # ``# type: ignore[arg-type]``: the bare Callable node aliases don't
     # match LangGraph's internal ``_NodeWithConfig`` overloads (same gap
     # runs.py documents).
@@ -1446,8 +1447,14 @@ def build_react_graph(
         tails.append(plan_tail)
     if not tails:
         tails.append(START)
-    for tail in tails:
-        graph.add_edge(tail, "agent")
+    if len(tails) > 1:
+        # LangGraph 语义:单串 add_edge(a, c) + add_edge(b, c) 是 OR 触发
+        # (每个父完成都触发 c 一次);列表形式才建 AND-join 屏障
+        # (NamedBarrierValue)。两分支不等长(planner→ingest 是 2 步)时
+        # OR 触发会让 agent 双跑 —— 带 tool_calls 时直接 InvalidUpdateError。
+        graph.add_edge(tails, "agent")
+    else:
+        graph.add_edge(tails[0], "agent")
 
     # Exit: the run's end routes through ``memory_writeback`` when present.
     end_target: str = END
