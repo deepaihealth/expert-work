@@ -220,18 +220,20 @@ http: httpx.AsyncClient | None = None   # 有则复用，无则退回 per-call �
 ```
 输入:  --agent <name@version> --prompt-file <f> --runs 10
 过程:  真栈发 N 轮 → 每轮从 trace facade 拉 span 树
-输出:  各段 median / p95 + 首字 median / p95，写 JSON
+输出:  各段 median / p95 + 首字 median / p95，写 YAML
 ```
 
 不是完整 benchmark 框架，就是个取数脚本。二期量 P1.1 / P1.2 / P1.3 / P3 时直接复用同一个脚本，那四项每一项都能给出「省了多少毫秒」。
 
-基线 JSON 进仓 `tools/bench/baselines/`，文件名带日期，内容带机器标识 + 环境 + commit sha（换机器数字不可比，标记让人一眼看出而不是默默误比）。
+基线 YAML 进仓 `tools/bench/baselines/`，照 `tools/eval/baselines/` 已有的形状（YAML + `meta.fingerprints`）。文件名带日期，`meta` 里带机器标识 + 环境 + commit sha（换机器数字不可比，标记让人一眼看出而不是默默误比）。
+
+`tools/` 不是包（无 `__init__.py`），所以照 `tools/eval/conftest.py` 的约定做 `sys.path` shim + 裸模块名 import，脚本按路径跑而非 `-m`。
 
 ### 6.2 验收线
 
 | 时点 | 动作 | 产出 |
 |---|---|---|
-| Task 1+2 合完 | 跑 bench 第一次 | `baselines/<date>-before.json` |
+| Task 1+2 合完 | 跑 bench 第一次 | `baselines/<date>-before.yaml` |
 | Task 4 合完 | 跑 bench 第二次 | PR 描述里 before/after 对照表 |
 | Task 5 合完 | 手动看 TraceView | 分解条数字跟 bench 对得上 |
 
@@ -251,7 +253,7 @@ http: httpx.AsyncClient | None = None   # 有则复用，无则退回 per-call �
 | 共享 client 的 event-loop 绑定 | orchestrator / control-plane 单 loop 长驻；`None` 回退路径保证测试不受影响 |
 | 共享 client 让某个 provider 的 timeout 语义漂 | per-request timeout 覆盖；task 4 逐处确认，尤其 sandbox / web_search |
 | 标签契约 drift | common 单源 + parity 测（§2.4） |
-| bench 数字跨机器误比 | 基线 JSON 内嵌机器 / 环境 / commit 标识 |
+| bench 数字跨机器误比 | 基线 YAML 的 `meta` 内嵌机器 / 环境 / commit 标识 |
 
 ---
 
