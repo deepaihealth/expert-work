@@ -1,0 +1,59 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 1.0
+    n: 10
+  向量化:
+    median: 184.5
+    p95: 312.0
+    n: 10
+  向量检索:
+    median: 25.0
+    p95: 33.0
+    n: 10
+  回写访问计数:
+    median: 27.0
+    p95: 36.0
+    n: 10
+  工作区摄取:
+    median: 126.0
+    p95: 140.0
+    n: 10
+  记忆召回:
+    median: 1185.0
+    p95: 1403.0
+    n: 10
+  记忆重排:
+    median: 207.5
+    p95: 278.0
+    n: 10
+  读取召回配置:
+    median: 0.0
+    p95: 0.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@2.0.0
+  runs: 10
+  prompt_file: /tmp/bench2/prompts/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: 'PR2 after @perf-phase2-pr2 5d180144 (secret/resolve cache + agent cache bounds
+    + invalidation chain); post-invalidation rebuild run included as round 1 (cold);
+    secret_ms per-round in trace attrs — round1 miss then hits; invalidation smoke
+    passed: PUT credential -> built_agent_cache gauge 1->0 (both scopes) -> next run
+    rebuilds OK without restart; embed median 205(PR1-after)->184.5, cold round 312ms
+    vs warm 178ms (cache-hit pattern; facade does not surface resolve_ms/secret_ms
+    attrs)'
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 647.5
+  p95: 915.0
+verify_ms:
+  median: 717.0
+  p95: 906.0
+  n: 10
+total_ms:
+  median: 4983.5
+  p95: 7336.0
