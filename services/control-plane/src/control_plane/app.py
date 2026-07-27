@@ -1101,7 +1101,18 @@ def create_app(
                 # "supervisor unreachable", masquerading as a provider
                 # fault and triggering a retry storm, when pre-refactor
                 # semantics were unbounded.
-                limits=httpx.Limits(max_keepalive_connections=64, max_connections=None),
+                # keepalive_expiry: httpx's default is 5s — far below this
+                # workload's real inter-call gaps (an agent's LLM calls are
+                # separated by tool execution: a 30s bash run is routine, and
+                # the first live probe showed bench rounds ~20-40s apart paid
+                # a fresh handshake every time). 60s matches typical vendor
+                # LB idle timeouts; a server that closes earlier is detected
+                # by httpcore's staleness check on reuse, not by the caller.
+                limits=httpx.Limits(
+                    max_keepalive_connections=64,
+                    max_connections=None,
+                    keepalive_expiry=60.0,
+                ),
             )
             # The shared client's persistent cookie jar is a NEW cross-tenant
             # state channel: a Set-Cookie a vendor returns for tenant A's
