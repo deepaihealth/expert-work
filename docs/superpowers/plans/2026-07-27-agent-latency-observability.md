@@ -18,6 +18,7 @@
 - **连接复用的兼容契约**：每个 client 类新增的 `http: httpx.AsyncClient | None = None` 默认 `None`，此时**必须**退回原本的 per-call `async with httpx.AsyncClient(...)` 路径。既有 `transport` 字段原样保留。
 - **CI 命令**（合并前本地跑同款，范围要一致）：
   - `uv run ruff check` —— **无路径参数，跑全库含 tests**
+  - `uv run ruff format --check` —— **CI 里是独立于上一条的一步**（`.github/workflows/ci.yml:40-41`）。`ruff check` 绿不代表这条绿：改动让某行的缩进变深/变浅后，原本需要换行包裹的调用可能变成一行放得下，format 会要求折叠它。**凡是给已有代码加 `with` 块（缩进整体变化）的 task 必跑这条。**
   - `uv run mypy packages services/audit-backup-worker/src services/billing-rollup-job/src services/event-log-archive-job/src services/orchestrator/src services/retention-cleanup-job/src` —— **不含 control-plane**，control-plane 的类型问题 CI 不抓，本地也要自己看
   - `uv run pytest -v -m "not integration" --timeout=120 --timeout-method=thread`
   - `uv run pytest -v -m integration`（需 `export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock`）
