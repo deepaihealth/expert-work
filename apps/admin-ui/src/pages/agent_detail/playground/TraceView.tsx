@@ -229,7 +229,7 @@ function isAuxLlm(span: Pick<TraceSpan, "kind" | "purpose">): boolean {
  *  renders — an errored LLM/tool call is red first, its kind second. An
  *  auxiliary LLM call renders in a muted LLM tint so it reads apart from the
  *  main conversation without competing with it. */
-function kindDotColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
+export function kindDotColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
   if (span.level === "error") return DANGER;
   if (span.kind === "llm") return isAuxLlm(span) ? AUX_LLM : ACCENT;
   if (span.kind === "tool") return PURPLE;
@@ -237,7 +237,7 @@ function kindDotColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "grou
   return MUTED;
 }
 
-function kindBarColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
+export function kindBarColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
   if (span.level === "error") return DANGER;
   if (span.kind === "llm")
     return `color-mix(in srgb, ${isAuxLlm(span) ? AUX_LLM : ACCENT} 62%, transparent)`;

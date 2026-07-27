@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import "../../../../i18n";
 
-import { TraceView } from "../TraceView";
+import { kindBarColor, kindDotColor, TraceView } from "../TraceView";
 import { fetchRunTraceRaw, type RunTrace, type TraceSpan } from "../../../../api/trace_facade";
 
 // Task 9's raw-view modal calls fetchRunTraceRaw — mock it so tests control
@@ -469,5 +469,34 @@ describe("TraceView", () => {
 
     expect(screen.queryByTestId("trace-raw-modal")).not.toBeInTheDocument();
     expect(mockFetchRunTraceRaw).not.toHaveBeenCalled();
+  });
+});
+
+// Task 6 — entry-chain spans (group === "entry") must render in their own
+// colour, distinct from both the llm and tool families, otherwise the
+// pre-first-token stretch of the waterfall is indistinguishable from any
+// other "span"-kind row.
+describe("kindDotColor / kindBarColor", () => {
+  const llmSpan = makeSpan({ id: "l", parentId: null, kind: "llm", label: "LLM 调用" });
+  const toolSpan = makeSpan({ id: "t", parentId: null, kind: "tool", label: "工具调用" });
+  const entrySpan = makeSpan({
+    id: "e",
+    parentId: null,
+    kind: "span",
+    label: "记忆召回",
+    group: "entry",
+  });
+  const plainSpan = makeSpan({ id: "p", parentId: null, kind: "span", label: "其它" });
+
+  it("gives an entry-group span a colour distinct from llm, tool, and plain spans", () => {
+    const entryDot = kindDotColor(entrySpan);
+    expect(entryDot).not.toBe(kindDotColor(llmSpan));
+    expect(entryDot).not.toBe(kindDotColor(toolSpan));
+    expect(entryDot).not.toBe(kindDotColor(plainSpan));
+
+    const entryBar = kindBarColor(entrySpan);
+    expect(entryBar).not.toBe(kindBarColor(llmSpan));
+    expect(entryBar).not.toBe(kindBarColor(toolSpan));
+    expect(entryBar).not.toBe(kindBarColor(plainSpan));
   });
 });
