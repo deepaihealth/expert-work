@@ -132,4 +132,4 @@ uv run ruff check
 
 **记一笔、没动代码**:`resolve_embedder()`/`resolve_reranker()` 这两个工厂函数(构造被打点的 `ResolvingEmbedder`/`ResolvingReranker`)在 `services/` 下疑似是死代码 —— 生产路径不经过它们。调度者已确认记入 backlog,本批不清理,这里只是留痕。
 
-**Commit**:[[FOLLOWUP_COMMIT_PLACEHOLDER]]
+**Commit**:`a116c7a6` —— `fix(observability): 补 DynamicResolvingEmbedder/Reranker 计时(生产实际 wire 的类)`。
