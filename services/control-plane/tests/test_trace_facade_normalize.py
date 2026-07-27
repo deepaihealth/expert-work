@@ -154,6 +154,28 @@ def test_facade_labels_stay_in_parity_with_common_purposes() -> None:
     assert set(_LLM_LABELS) == set(LLM_SPAN_PURPOSES)
 
 
+def test_span_labels_cover_every_traced_span() -> None:
+    """非 LLM span 的中文标签必须覆盖 TRACED_SPANS 的每一项 —— 漏一个就会
+    静默退回 _classify 的裸英文名 fallback,不炸 CI。"""
+    from control_plane.api.trace_facade import _SPAN_LABELS
+    from expert_work.common.observability import TRACED_SPANS
+
+    assert set(_SPAN_LABELS) == set(TRACED_SPANS)
+
+
+def test_entry_chain_spans_carry_the_entry_group() -> None:
+    """入口链 span 带 group="entry",前端据此上色并算分解条。"""
+    obs = [
+        _obs("a", "SPAN", "expert_work.memory.recall", None, 2.0, 0),
+        _obs("b", "SPAN", "expert_work.orchestrator.tool_call", None, 0.5, 1),
+    ]
+    spans = normalize_trace(_trace(obs))["spans"]
+    by_id = {s["id"]: s for s in spans}
+    assert by_id["a"]["group"] == "entry"
+    assert by_id["a"]["label"] == "记忆召回"
+    assert by_id["b"]["group"] is None
+
+
 def test_normalize_main_llm_call_purpose_is_main() -> None:
     obs = [
         _obs("sess", "SPAN", "expert_work.session.run", None, 5.0, 0),
