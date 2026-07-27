@@ -12,7 +12,7 @@
 |---|-----|------|------|----------|---------|
 | 1 | 控制平面 API 可用性 | ≥ 99.9% | 30d | `expert_work_control_plane_http_requests_total` | ✅ 指标已 emit |
 | 2 | 控制平面 API P99 延迟 | < 200ms | 30d | `expert_work_control_plane_http_request_duration_seconds` | ✅ 指标已 emit |
-| 3 | Session TTFT P95 | < 1.5s | 30d | `expert_work_session_ttft_seconds` | ✅ 指标已 emit（K10） |
+| 3 | Session 首个图节点 P95 | < 1.5s | 30d | `expert_work_session_first_node_seconds`（一期 Task 3 前名 `..._ttft_seconds`,改名说实话——测的是首个图节点完成,不是首字）| ✅ 指标已 emit（K10） |
 | 4 | Sandbox 冷启动 P95 | < 3s（M0）/ < 500ms（M1 warm pool，临时沙盒池命中路径） | 30d | `expert_work_sandbox_cold_start_seconds`；M1 验收并读池命中率 `Expert Work:sli:sandbox_pool_hit:ratio1h` + `expert_work_sandbox_pool_ready` | ✅ 指标已 emit（K10）；池指标已 emit（HX-6） |
 | 5 | Durable resume P95 | < 1.5s | 30d | `expert_work_durable_resume_seconds` | ✅ 指标已 emit（K10）|
 | 6 | Memory recall@5（zh+en） | ≥ 0.7（M1 against real embedder） | 单测 | `tools/eval/memory_recall.py` | ✅ 框架 + seed set 已 ship（K12）|

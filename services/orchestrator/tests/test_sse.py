@@ -675,12 +675,13 @@ async def test_run_agent_no_audit_logger_does_not_crash() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_agent_observes_session_ttft_histogram() -> None:
-    """First ``updates`` chunk after ``RUNNING`` writes the TTFT
-    histogram. Every run emits — there is no ``is_resume`` gate on TTFT."""
-    from orchestrator.sse import _session_ttft_seconds
+async def test_run_agent_observes_session_first_node_histogram() -> None:
+    """First ``updates`` chunk after ``RUNNING`` writes the first-node
+    histogram (renamed from ``ttft`` by 一期 Task 3). Every run emits —
+    there is no ``is_resume`` gate on it."""
+    from orchestrator.sse import _session_first_node_seconds
 
-    before = _session_ttft_seconds._sum.get()  # type: ignore[attr-defined]
+    before = _session_first_node_seconds._sum.get()  # type: ignore[attr-defined]
     bridge = InMemoryStreamBridge()
     rm = RunManager()
     record = await _new_record(rm)
@@ -692,7 +693,7 @@ async def test_run_agent_observes_session_ttft_histogram() -> None:
         graph_input={"messages": []},
         config={},
     )
-    after = _session_ttft_seconds._sum.get()  # type: ignore[attr-defined]
+    after = _session_first_node_seconds._sum.get()  # type: ignore[attr-defined]
     assert after > before
 
 
