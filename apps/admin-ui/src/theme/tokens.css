@@ -78,6 +78,14 @@
   --ew-color-danger-700: #b91c1c;
   --ew-color-danger-900: #7f1d1d;
 
+  /* Indigo — 调试台 trace 入口链标记(memory_recall / workspace_ingest /
+     context_gates)专用,跟 brand cyan(llm)、accent violet(tool)都要拉得开。 */
+  --ew-color-indigo-100: #e0e7ff;
+  --ew-color-indigo-300: #a5b4fc;
+  --ew-color-indigo-500: #6366f1;
+  --ew-color-indigo-700: #4338ca;
+  --ew-color-indigo-900: #312e81;
+
   /* Info = brand-500 同色族(避免引入第 5 个色相) */
   --ew-color-info-100: var(--ew-color-brand-100);
   --ew-color-info-300: var(--ew-color-brand-300);
@@ -230,6 +238,9 @@ html[data-theme="dark"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-400);
+  /* TraceView's entry-chain span marker (Task 6) — lighter indigo step for
+     dark backgrounds, same rationale as the block above. */
+  --ew-trace-entry:    var(--ew-color-indigo-300);
 
   --ew-action-primary-bg:       var(--ew-color-brand-500);
   --ew-action-primary-bg-hover: var(--ew-color-brand-400);
@@ -289,6 +300,9 @@ html[data-theme="light"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-600);
+  /* TraceView's entry-chain span marker (Task 6) — darker indigo step for
+     light backgrounds, same rationale as the block above. */
+  --ew-trace-entry:    var(--ew-color-indigo-700);
 
   --ew-action-primary-bg:       var(--ew-color-brand-600);
   --ew-action-primary-bg-hover: var(--ew-color-brand-700);

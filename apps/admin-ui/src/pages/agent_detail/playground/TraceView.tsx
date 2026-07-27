@@ -43,6 +43,7 @@ import {
 import { fmtDuration } from "./duration_format";
 import { buildRows, isWideBar, type TraceRowData } from "./trace_tree";
 import { cleanUntrusted } from "./untrusted_clean";
+import { EntryBreakdown } from "./EntryBreakdown";
 
 const ACCENT = "var(--ew-text-info, #4c8dff)";
 const SUCCESS = "var(--ew-text-success, #3ecf8e)";
@@ -50,6 +51,12 @@ const WARNING = "var(--ew-text-warning, #e8a33d)";
 const DANGER = "var(--ew-text-danger, #f0616d)";
 const PURPLE = "var(--ew-accent-violet, #b18cff)";
 const MUTED = "var(--ew-text-tertiary)";
+// Entry-chain spans (memory_recall / workspace_ingest / context_gates) get
+// their own indigo tint — distinct from both the llm blue and tool violet
+// families so the pre-first-token stretch reads apart from the rest of the
+// waterfall at a glance. Same var + fallback as EntryBreakdown.tsx's bar so
+// the breakdown and the waterfall agree on the colour.
+const ENTRY = "var(--ew-trace-entry, #7c8cff)";
 // Auxiliary LLM calls render in a muted LLM tint — still the LLM (blue) family
 // so the kind reads at a glance, but dimmed so a background sub-call never
 // competes with the main conversation for attention.
@@ -139,6 +146,7 @@ function TraceTree({
 
   return (
     <div>
+      <EntryBreakdown spans={spans} selectedId={selectedId} onSelect={setSelectedId} />
       <div
         style={{
           display: "grid",
@@ -221,18 +229,20 @@ function isAuxLlm(span: Pick<TraceSpan, "kind" | "purpose">): boolean {
  *  renders — an errored LLM/tool call is red first, its kind second. An
  *  auxiliary LLM call renders in a muted LLM tint so it reads apart from the
  *  main conversation without competing with it. */
-function kindDotColor(span: Pick<TraceSpan, "kind" | "level" | "purpose">): string {
+export function kindDotColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
   if (span.level === "error") return DANGER;
   if (span.kind === "llm") return isAuxLlm(span) ? AUX_LLM : ACCENT;
   if (span.kind === "tool") return PURPLE;
+  if (span.group === "entry") return ENTRY;
   return MUTED;
 }
 
-function kindBarColor(span: Pick<TraceSpan, "kind" | "level" | "purpose">): string {
+export function kindBarColor(span: Pick<TraceSpan, "kind" | "level" | "purpose" | "group">): string {
   if (span.level === "error") return DANGER;
   if (span.kind === "llm")
     return `color-mix(in srgb, ${isAuxLlm(span) ? AUX_LLM : ACCENT} 62%, transparent)`;
   if (span.kind === "tool") return PURPLE;
+  if (span.group === "entry") return `color-mix(in srgb, ${ENTRY} 62%, transparent)`;
   return `color-mix(in srgb, ${MUTED} 45%, transparent)`;
 }
 

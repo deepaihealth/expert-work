@@ -1360,6 +1360,7 @@ describe("PlaygroundTab", () => {
             level: "default",
             statusMessage: null,
             purpose: "",
+            group: null,
           },
         ],
       });
@@ -1435,6 +1436,7 @@ describe("PlaygroundTab", () => {
             level: "default",
             statusMessage: null,
             purpose: "",
+            group: null,
           },
           {
             id: "s2",
@@ -1453,6 +1455,7 @@ describe("PlaygroundTab", () => {
             level: "error",
             statusMessage: "SandboxTimeout",
             purpose: "",
+            group: null,
           },
         ],
       });
@@ -1529,6 +1532,7 @@ describe("PlaygroundTab", () => {
             level: "default",
             statusMessage: null,
             purpose: "",
+            group: null,
           },
         ],
       });

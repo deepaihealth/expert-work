@@ -44,6 +44,10 @@ export interface TraceSpan {
    *  unwrapped/main agent turn, else "memory"/"planner"/"reflect"/… — an
    *  auxiliary LLM call the console flags apart from the main conversation. */
   purpose: string;
+  /** Functional stage for colour grouping + the pre-first-token breakdown:
+   *  "entry" = entry chain (recall / ingest / context gates), null = other.
+   *  Separate from `purpose`, which is LLM-call intent only. */
+  group: "entry" | null;
 }
 
 export interface RunTrace {
