@@ -107,3 +107,29 @@ uv run pytest -v -m "not integration" --timeout=60 --timeout-method=thread \
 ## 5. Commit
 
 `d50e6e73` —— `feat(observability): 入口链 8 个 span + TRACED_SPANS 单源`(本 worktree 分支 `worktree-agent-a459185bdef7efdbb`,基线 `d81e81d2`)。
+`e104c4ed` —— `docs: perf-task-1 报告补 commit sha`。
+
+## 6. Follow-up:生产路径纠偏(DynamicResolvingEmbedder / DynamicResolvingReranker)
+
+**背景**:上面 1.6 节记录的 `ResolvingEmbedder`/`ResolvingReranker` 打点是照 brief Step 11 字面实现的,但调度者核对 `services/control-plane/src/control_plane/app.py:1307`、`:1322` 后发现 —— **生产路径 wire 的其实是 `DynamicResolvingEmbedder`/`DynamicResolvingReranker`**,`ResolvingEmbedder`/`ResolvingReranker` 的构造工厂 `resolve_embedder()`/`resolve_reranker()` 在 `services/` 下没有任何非测试调用点。也就是说打在 `ResolvingEmbedder`/`ResolvingReranker` 上的 `resolve_ms`/`secret_ms` 永远不会出现在生产的 `memory.embed`/`memory.rerank` span 上。这是 brief 指错了目标类,不是本 task 实现有误 —— 已按调度者指示补齐 Dynamic 那一对,`ResolvingEmbedder`/`ResolvingReranker` 上的打点保留不删(同一语义两处实现,约束要全处一起加,为将来切回这两个类打好底)。
+
+**改的地方**(均在 `services/control-plane/src/control_plane/runtime.py`):
+- `DynamicResolvingEmbedder.embed`:比 `ResolvingEmbedder.embed` 多一次 DB 读(`effective_embedding_config()` 拉平台配置),所以是三段计时而非两段:`config_ms`(读配置)+ `resolve_ms`(凭据解析)+ `secret_ms`(vault 读)。`cfg is None` 的早退(直接 `raise AgentFactoryError`)在 `config_ms` 计时点之后、不打任何 attribute —— 没有 embed 可言。
+- `DynamicResolvingReranker.rerank`:同款,`config_ms` + `resolve_ms` 在三条早退路径(`documents` 为空 / `cfg is None` / `CredentialsResolverError`)都跳过之后才打;`secret_ms` 只在 DashScope 分支打(LLM router 分支不直接读 secret_store),和 `ResolvingReranker.rerank` 的不对称处理保持一致。
+
+**验证**(同步跑,未后台化):
+```bash
+uv run pytest services/orchestrator/tests/test_entry_chain_spans.py -v
+# 5 passed in 0.87s —— 未受影响(这批改动只碰 control-plane)
+
+uv run pytest services/control-plane/tests/ -k "embedder or rerank or resolving" -v
+# 24 passed, 2122 deselected in 1.29s —— 和纠偏前跑的 24/24 一致,没有回归
+
+uv run ruff check
+# All checks passed!
+```
+另外自查了一遍 `uv run mypy services/control-plane/src/control_plane/runtime.py`(non-CI,自愿):还是那两处与本次改动无关的既有错误(行号因插入代码从 895/923 位移到 920/961,内容不变,`git stash` 已在 1.6 节验证过是基线本来就有的)。
+
+**记一笔、没动代码**:`resolve_embedder()`/`resolve_reranker()` 这两个工厂函数(构造被打点的 `ResolvingEmbedder`/`ResolvingReranker`)在 `services/` 下疑似是死代码 —— 生产路径不经过它们。调度者已确认记入 backlog,本批不清理,这里只是留痕。
+
+**Commit**:[[FOLLOWUP_COMMIT_PLACEHOLDER]]

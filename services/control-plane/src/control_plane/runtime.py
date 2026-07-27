@@ -906,14 +906,25 @@ class DynamicResolvingEmbedder:
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
             return []
+        # 一期 Task 1 —— 同 ResolvingEmbedder.embed,但这条路径每次调用还多一次
+        # DB 读(平台配置),所以是三段计时。挂到调用方的 ``memory.embed`` span
+        # 上。``cfg is None`` 的早退直接抛错,没有 embed 可言,不打属性。
+        t0 = time.monotonic()
         cfg = await self.config_service.effective_embedding_config()
+        t1 = time.monotonic()
         if cfg is None:
             raise AgentFactoryError(
                 "platform embedding is not configured — configure it in platform settings"
             )
         provider, model = cfg
         secret_ref = await self.resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
+        t2 = time.monotonic()
         api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+        t3 = time.monotonic()
+        span = trace.get_current_span()
+        span.set_attribute("config_ms", round((t1 - t0) * 1000))
+        span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
+        span.set_attribute("secret_ms", round((t3 - t2) * 1000))
         delegate = OpenAICompatibleEmbedder(
             client=HTTPEmbeddingClient(api_key=api_key), model=model
         )
@@ -934,7 +945,14 @@ class DynamicResolvingReranker:
     ) -> list[int]:
         if not documents:
             return []
+        # 一期 Task 1 —— 同 ResolvingReranker.rerank,但这条路径每次调用还多
+        # 一次 DB 读(平台配置)。config_ms/resolve_ms 挂到调用方的
+        # ``memory.rerank`` span 上;secret_ms 只在 DashScope 分支打(LLM 分支
+        # 走 build_llm_router)。三条早退路径(无 documents/cfg 未配置/无凭据)
+        # 都没有 rerank 可言,不打属性。
+        t0 = time.monotonic()
         cfg = await self.config_service.effective_rerank_config()
+        t1 = time.monotonic()
         if cfg is None:
             return list(range(len(documents)))[:top_k]
         provider, model = cfg
@@ -949,8 +967,13 @@ class DynamicResolvingReranker:
                 tenant_id,
             )
             return list(range(len(documents)))[:top_k]
+        t2 = time.monotonic()
+        span = trace.get_current_span()
+        span.set_attribute("config_ms", round((t1 - t0) * 1000))
+        span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         if _is_dashscope_rerank_model(provider, model):
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+            span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key), model=model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
