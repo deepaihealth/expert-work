@@ -16,6 +16,17 @@ import { fmtDuration } from "./duration_format";
  *  overflow into its neighbours. */
 const LABEL_MIN_SHARE = 0.06;
 
+// Same 62%-over-transparent blend TraceView.tsx's kindBarColor uses for the
+// waterfall's own entry-chain bars (so the breakdown and the waterfall read
+// as the same colour) — and, unlike a flat opaque fill, it composites with
+// whatever surface sits behind it instead of imposing one fixed background.
+// A solid `--ew-trace-entry` fill paired with hardcoded white text failed
+// dark-theme contrast (indigo-300 is light — 1.99:1 against white, WCAG AA
+// wants ≥3:1 for UI text). Pairing the translucent fill with
+// `--ew-text-primary` (also theme-aware) fixes it in both directions instead
+// of just swapping which theme breaks.
+const ENTRY_BG = "color-mix(in srgb, var(--ew-trace-entry, #7c8cff) 62%, transparent)";
+
 interface EntryBreakdownProps {
   spans: readonly TraceSpan[];
   selectedId: string | null;
@@ -49,8 +60,8 @@ export function EntryBreakdown({ spans, selectedId, onSelect }: EntryBreakdownPr
                 minWidth: 4,
                 border: selectedId === s.id ? "1px solid var(--ew-text-primary)" : "none",
                 borderRadius: 3,
-                background: "var(--ew-trace-entry, #7c8cff)",
-                color: "#fff",
+                background: ENTRY_BG,
+                color: "var(--ew-text-primary)",
                 fontSize: 11,
                 overflow: "hidden",
                 whiteSpace: "nowrap",

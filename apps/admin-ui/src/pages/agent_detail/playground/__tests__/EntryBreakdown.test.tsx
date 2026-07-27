@@ -52,4 +52,26 @@ describe("EntryBreakdown", () => {
     );
     expect(screen.queryByTestId("entry-breakdown")).not.toBeInTheDocument();
   });
+
+  // Regression guard for a dark-theme contrast bug: the segment used to be
+  // an opaque `--ew-trace-entry` fill with hardcoded white text (1.99:1
+  // against dark theme's light indigo — WCAG AA wants ≥3:1). The fix is a
+  // translucent fill (composites with whatever surface sits behind it,
+  // matching TraceView.tsx's own kindBarColor pattern) plus theme-aware
+  // text. EntryBreakdown.contrast.test.ts checks the resulting numbers
+  // clear 3:1 in both themes; this checks the *component* still emits that
+  // shape (not a hardcoded "#fff") — the two together close the gap either
+  // one alone leaves open (tokens.css drifting vs. the component reverting).
+  it("renders segments with a translucent entry-tinted background and theme-aware text (not a solid fill + hardcoded white)", () => {
+    const spans = [span({ id: "r", label: "记忆召回", group: "entry", latencyMs: 2000 })];
+    render(<EntryBreakdown spans={spans} selectedId={null} onSelect={vi.fn()} />);
+
+    const button = screen.getByRole("button");
+    expect(button.style.color).toBe("var(--ew-text-primary)");
+    expect(button.style.color).not.toBe("#fff");
+    expect(button.style.background).toContain("color-mix");
+    expect(button.style.background).toContain("var(--ew-trace-entry");
+    expect(button.style.background).toContain("62%");
+    expect(button.style.background).toContain("transparent");
+  });
 });
