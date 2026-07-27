@@ -106,4 +106,40 @@ uv run ruff format --check
 - **没有真栈验证**（按你的范围调整，Step 5 跳过）——上面列的 5 条假设都需要你第一次跑的时候核实。
 - **没有创建 `tools/bench/prompts/fixed.txt`**——计划文档的 File Structure 表没列这个文件，固定 prompt 内容是"跑基线"这个动作自己的输入决定，不是脚本实现的一部分，留给你按测试 agent 的实际能力挑一个合适的 prompt。
 - **`meta` 用扁平结构而非 `fingerprints` 嵌套**——见上面"两个命门的落实"第 2 条，需要你确认这个设计选择。
-- **`first_output` 是近似值**——只从 trace facade 的 span 数据反推（最早 LLM span 的 startMs），不是 Task 3 新增的 `first_output_seconds` Prometheus 直方图本身（脚本没有查 Prometheus，只查 trace facade——你在任务描述里指的参照端点也只有这一个）。如果这个近似跟真实 `first_output_seconds` 数值对不上，需要另外决定要不要让脚本改查 Prometheus。
+- **~~`first_output` 是近似值~~**——已按协调者回复改名为 `first_llm_start`，见下方追加小节。
+
+---
+
+## 追加：假设核验结果 + `first_output` → `first_llm_start` 改名
+
+协调者核验了 5 条实现假设：
+
+- **假设 2（`X-Expert-Work-Run-Id` header）—— 成立**。协调者查了 `runs.py:907/1494/1551/1565`，`:1543` 附近的注释明确写着这个 header 在流式和续跑两条路径上都要发，是维持的稳定契约，不是巧合。
+- **假设 1（会话创建 envelope）、假设 4（span 字段名）—— 接受**，判断合理。
+- **假设 3（trace 轮询 30s 超时是猜的）—— 接受**，`--trace-timeout-s` 已经做成可配置，协调者跑基线时会拿到真实值再回填默认值。
+- **`meta` 用 flat 而非 nested `fingerprints` —— 接受**，理由（`longmem_baseline.yaml` 的嵌套是因为文件要累积多个 benchmark，本脚本每次产出一份独立快照）成立。
+
+**假设 5 需要改**：问题不在"用最早 LLM span 的 startMs 做代理指标"这个近似本身（协调者确认一期要量的 TLS 握手节省发生在 LLM 调用内部，被 span latency 完整覆盖，用这个代理做优化前后对比依然有效），而在**命名撞车**——Task 3 的 Prometheus 直方图 `expert_work_first_output_seconds` 测的是"第一个 token 帧到达 / 第一个 agent updates 帧"，跟"最早 LLM span 开始"隔着一段模型 prefill 时间（几百毫秒到几秒）。同名不同义会让二期有人拿这两个数字互相对照，误判成"哪里坏了"。
+
+按协调者给的三步改法执行：
+
+1. **字段改名**：`first_output` → `first_llm_start`（YAML 输出的 top-level key、内部常量 `FIRST_OUTPUT_KEY` → `FIRST_LLM_START_KEY`、内部字符串值 `__first_output_ms__` → `__first_llm_start_ms__`、局部变量名、docstring、测试函数名/文档字符串全部同步）。用 `grep -rn "first_output" tools/bench/` 复核，剩下的两处引用（`entry_latency.py` 里）都是**主动解释"我们不叫这个名字、为什么不叫"**的说明性文字（提到 Task 3 的 `expert_work_first_output_seconds` 作对比），不是本脚本自己在用这个名字，符合协调者"别留半边"的要求。
+2. **`tools/bench/README.md` 新增一节** `first_llm_start` is NOT `first_output_seconds`：解释两个指标测的是不同时刻（trace 里没有首字 span，Task 3 的首字打点是 Prometheus-only、无对应 span）、中间隔一段 prefill、脚本内部前后对比有效但不能拿去对 Grafana 数字。
+3. **CLI help 检查**：`--help` 输出里本来就没有涉及这个词的 flag（只在 YAML 输出字段和代码文档里出现），无需改。
+
+### 验证结果（改名后）
+
+```
+uv run pytest tools/bench/test_entry_latency.py -v
+# 5 passed in 0.02s
+
+uv run ruff check
+# All checks passed!
+
+uv run ruff format --check
+# 1476 files already formatted
+```
+
+三条命令同步跑、全绿，没有后台化/轮询。
+
+改名 + README 说明 + 本追加一起提交（commit sha 见 PR/对话回复）。

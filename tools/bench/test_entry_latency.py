@@ -1,6 +1,6 @@
 """分段聚合的纯函数测试。网络/真栈部分不在单测范围。"""
 
-from entry_latency import FIRST_OUTPUT_KEY, aggregate, extract_run_metrics
+from entry_latency import FIRST_LLM_START_KEY, aggregate, extract_run_metrics
 
 
 def test_aggregate_reports_median_and_p95_per_segment() -> None:
@@ -39,10 +39,12 @@ def test_extract_run_metrics_keeps_only_entry_group_spans() -> None:
     assert "LLM 调用" not in metrics
 
 
-def test_extract_run_metrics_first_output_is_earliest_llm_span_start() -> None:
-    """``first_output`` approximates "entry chain done, generation starts" as
-    the earliest ``startMs`` among ``kind == "llm"`` spans — two LLM spans
-    (main call + an auxiliary one) must not both count; only the first."""
+def test_extract_run_metrics_first_llm_start_is_earliest_llm_span_start() -> None:
+    """``first_llm_start`` approximates "entry chain done, generation starts"
+    as the earliest ``startMs`` among ``kind == "llm"`` spans — two LLM spans
+    (main call + an auxiliary one) must not both count; only the first. Not
+    the same clock as Task 3's ``first_output_seconds`` (first token) — see
+    the ``FIRST_LLM_START_KEY`` docstring."""
     trace = {
         "status": "ok",
         "spans": [
@@ -51,15 +53,15 @@ def test_extract_run_metrics_first_output_is_earliest_llm_span_start() -> None:
         ],
     }
     metrics = extract_run_metrics(trace)
-    assert metrics[FIRST_OUTPUT_KEY] == 500.0
+    assert metrics[FIRST_LLM_START_KEY] == 500.0
 
 
-def test_extract_run_metrics_no_llm_span_omits_first_output() -> None:
+def test_extract_run_metrics_no_llm_span_omits_first_llm_start() -> None:
     """A trace with only entry-chain spans (no LLM call landed yet / not
-    ingested) must not fabricate a ``first_output`` value of 0."""
+    ingested) must not fabricate a ``first_llm_start`` value of 0."""
     trace = {
         "status": "ok",
         "spans": [{"label": "工作区摄取", "group": "entry", "latencyMs": 40, "kind": "span"}],
     }
     metrics = extract_run_metrics(trace)
-    assert FIRST_OUTPUT_KEY not in metrics
+    assert FIRST_LLM_START_KEY not in metrics

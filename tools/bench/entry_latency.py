@@ -39,10 +39,17 @@ import yaml
 
 #: Internal-only key carrying each run's "time until the first LLM call
 #: starts" through the same ``aggregate()`` pass as the real span segments —
-#: popped back out into the YAML's top-level ``first_output`` section before
-#: writing. Can never collide with a real span label (those are all
+#: popped back out into the YAML's top-level ``first_llm_start`` section
+#: before writing. Can never collide with a real span label (those are all
 #: Chinese entry-chain names from trace_facade.py's ``_SPAN_LABELS``).
-FIRST_OUTPUT_KEY = "__first_output_ms__"
+#:
+#: Deliberately NOT named ``first_output`` — Task 3 already owns that name
+#: for a different, non-overlapping measurement (the
+#: ``expert_work_first_output_seconds`` Prometheus histogram: first token
+#: frame / first ``agent`` updates chunk). This proxy measures the earliest
+#: LLM *span start*, which sits a model prefill earlier than a real first
+#: token. Same name, different clock — see ``tools/bench/README.md``.
+FIRST_LLM_START_KEY = "__first_llm_start_ms__"
 
 
 @dataclass(frozen=True)
@@ -86,11 +93,12 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
 
     * **Segments** — every span with ``group == "entry"`` (the 8 入口链 spans,
       Task 1/2), keyed by its (already Chinese) ``label``.
-    * ``FIRST_OUTPUT_KEY`` — the earliest ``startMs`` among ``kind == "llm"``
+    * ``FIRST_LLM_START_KEY`` — the earliest ``startMs`` among ``kind == "llm"``
       spans, as a proxy for "entry chain finished, generation started". This
       script only reads the trace facade (not the ``first_output_seconds``
-      Prometheus histogram Task 3 added), so it is an approximation, not the
-      real first-token timestamp — flagged for live-stack verification.
+      Prometheus histogram Task 3 added), so it is **not** that metric — it's
+      an earlier point on the clock (a model prefill separates the two). See
+      ``tools/bench/README.md`` for the full explanation.
 
     Malformed / missing fields degrade silently (span skipped) rather than
     raising — one bad span in a trace should not sink an entire run's data.
@@ -115,7 +123,7 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
                 llm_starts.append(float(start_ms))
 
     if llm_starts:
-        metrics[FIRST_OUTPUT_KEY] = min(llm_starts)
+        metrics[FIRST_LLM_START_KEY] = min(llm_starts)
     return metrics
 
 
@@ -238,7 +246,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 per_run.append({})
 
     aggregated = aggregate(per_run)
-    first_output = aggregated.pop(FIRST_OUTPUT_KEY, None)
+    first_llm_start = aggregated.pop(FIRST_LLM_START_KEY, None)
 
     meta: dict[str, Any] = {
         "commit": _git_commit(),
@@ -253,8 +261,11 @@ async def _amain(args: argparse.Namespace) -> int:
         "segments": {name: _segment_to_dict(seg) for name, seg in sorted(aggregated.items())},
         "meta": meta,
     }
-    if first_output is not None:
-        result["first_output"] = {"median": first_output.median, "p95": first_output.p95}
+    if first_llm_start is not None:
+        result["first_llm_start"] = {
+            "median": first_llm_start.median,
+            "p95": first_llm_start.p95,
+        }
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
