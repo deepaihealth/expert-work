@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID
 
+import httpx
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from opentelemetry import trace
@@ -609,6 +610,11 @@ def make_agent_builder(
     # applied when the manifest leaves ``policies.run_deadline_s`` at 0.
     # 0 = no floor (manifest-only). Bound from ``settings`` by the lifespan.
     default_run_deadline_s: int = 0,
+    # 一期 Task 5 — process-level shared HTTP client (control-plane lifespan).
+    # Forwarded into ``build_agent`` for every build this builder produces.
+    # ``None`` (tests / pre-lifespan placeholder builder) keeps every LLM
+    # provider client on its original per-call ``httpx.AsyncClient``.
+    http_client: httpx.AsyncClient | None = None,
 ) -> AgentBuilder:
     """Production :data:`AgentBuilder` bound to a SecretStore + checkpointer.
 
@@ -784,6 +790,8 @@ def make_agent_builder(
             platform_tool_budget_enabled=platform_tool_budget_enabled,
             # skill-asset-store — dual-read for externalized supporting files.
             skill_asset_store=skill_asset_store,
+            # 一期 Task 5 — process-level shared HTTP client.
+            http_client=http_client,
         )
 
     return _build
@@ -811,6 +819,9 @@ class ResolvingEmbedder:
     secret_store: SecretStore
     provider: Provider
     model: str
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to the embedding client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -830,7 +841,7 @@ class ResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         span.set_attribute("secret_ms", round((t2 - t1) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key), model=self.model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=self.model
         )
         return await delegate.embed(texts, tenant_id=tenant_id)
 
@@ -855,6 +866,9 @@ class ResolvingReranker:
     secret_store: SecretStore
     provider: Provider
     model: str
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to each client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -883,12 +897,14 @@ class ResolvingReranker:
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key), model=self.model
+                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
-        router = await build_llm_router(model_spec, secret_store=self.secret_store)
+        router = await build_llm_router(
+            model_spec, secret_store=self.secret_store, http_client=self.http
+        )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
@@ -902,6 +918,9 @@ class DynamicResolvingEmbedder:
     config_service: PlatformEmbeddingConfigService
     resolver: CredentialsResolver
     secret_store: SecretStore
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to the embedding client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -926,7 +945,7 @@ class DynamicResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         span.set_attribute("secret_ms", round((t3 - t2) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key), model=model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=model
         )
         return await delegate.embed(texts, tenant_id=tenant_id)
 
@@ -939,6 +958,9 @@ class DynamicResolvingReranker:
     config_service: PlatformEmbeddingConfigService
     resolver: CredentialsResolver
     secret_store: SecretStore
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to each client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -975,12 +997,14 @@ class DynamicResolvingReranker:
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key), model=model
+                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )
-        router = await build_llm_router(model_spec, secret_store=self.secret_store)
+        router = await build_llm_router(
+            model_spec, secret_store=self.secret_store, http_client=self.http
+        )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
@@ -1080,16 +1104,21 @@ def make_mcp_allowlist_provider(
     return _provider
 
 
-def resolve_web_search_client(*, searxng_base_url: str | None) -> TavilyClient | None:
+def resolve_web_search_client(
+    *, searxng_base_url: str | None, http: httpx.AsyncClient | None = None
+) -> TavilyClient | None:
     """Build the web-search backend for the builtin ``web_search`` tool.
 
     The builtin backend is a self-hosted SearXNG instance (free, no API
     key) — design ``web-search-searxng-builtin-and-tavily-mcp`` M2. Set
     ``searxng_base_url`` → :class:`SearXNGClient`; unset → ``None`` (an
     agent declaring ``web_search`` then fails at build, gate preserved).
-    Premium Tavily moved to the platform MCP catalog (not a builtin)."""
+    Premium Tavily moved to the platform MCP catalog (not a builtin).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client; ``None``
+    falls back to the client's own per-call default."""
     if searxng_base_url:
-        return SearXNGClient(base_url=searxng_base_url)
+        return SearXNGClient(base_url=searxng_base_url, http=http)
     return None
 
 
@@ -1250,15 +1279,24 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_supervisor_client(url: str | None) -> SupervisorClient | None:
+def build_supervisor_client(
+    url: str | None, *, http: httpx.AsyncClient | None = None
+) -> SupervisorClient | None:
     """Build the Sandbox Supervisor HTTP client from its base URL.
 
     ``None`` → the ``exec_python`` tool is unavailable; an agent that
     declares it fails at build time with a clear error.
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client; ``None``
+    falls back to the client's own per-call default. It is commonly ``None``
+    HERE — this factory runs before the app lifespan creates the shared
+    client (see ``app.py``), which instead mutates ``.http`` on the returned
+    client once the shared client exists (``HTTPSupervisorClient`` is not
+    frozen, so that in-place wiring is safe).
     """
     if url is None:
         return None
-    return HTTPSupervisorClient(base_url=url)
+    return HTTPSupervisorClient(base_url=url, http=http)
 
 
 def build_tool_env(

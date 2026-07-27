@@ -1070,6 +1070,20 @@ def create_app(
             otlp_endpoint=resolved_settings.otlp_traces_endpoint,
         )
         async with AsyncExitStack() as stack:
+            # 一期 Task 5 — one process-level httpx.AsyncClient, shared across
+            # every LLM / embed / rerank / web-search / sandbox-supervisor
+            # call so each reuses a pooled connection instead of paying a
+            # fresh TLS handshake per call. httpx pools per (scheme, host,
+            # port) internally, so a single instance is enough — no
+            # per-provider split needed. Wired into the deps below (embedder /
+            # reranker / web-search client / supervisor client / agent
+            # builder); ``stack`` closes it on shutdown, after every other
+            # cleanup callback that might still use it has run (LIFO).
+            shared_http = httpx.AsyncClient(
+                limits=httpx.Limits(max_keepalive_connections=64, max_connections=256),
+            )
+            _app.state.shared_http = shared_http
+            stack.push_async_callback(shared_http.aclose)
             # Stream MCP-OAUTH (OA-5) — env-seed the connector catalog before
             # serving: oauth2 connectors whose ${VAR} client_id placeholders
             # resolve from the environment are created idempotently.
@@ -1142,7 +1156,16 @@ def create_app(
                 _app.state.credentials_resolver = credentials_resolver
                 web_search_client = resolve_web_search_client(
                     searxng_base_url=resolved_settings.web_search_searxng_base_url,
+                    http=shared_http,
                 )
+                # 一期 Task 5 — the supervisor client is built earlier (before
+                # ``shared_http`` exists, so ``app.state.supervisor_client``
+                # is well-defined pre-lifespan too); wire the shared client in
+                # now. ``HTTPSupervisorClient`` is not frozen, so this mutates
+                # the same instance ``app.state.supervisor_client`` and
+                # ``base_tool_env`` below both reference.
+                if resolved_supervisor_client is not None:
+                    resolved_supervisor_client.http = shared_http
                 mcp_pool = await stack.enter_async_context(
                     build_mcp_pool(
                         resolved_settings.mcp_servers_config_file,
@@ -1308,6 +1331,7 @@ def create_app(
                     config_service=resolved_platform_embedding_config_service,
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
+                    http=shared_http,
                 )
                 # Stream K.K6 — memory CRUD endpoint needs the embedder
                 # for the PATCH path (re-embed on content change). GET /
@@ -1323,6 +1347,7 @@ def create_app(
                     config_service=resolved_platform_embedding_config_service,
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
+                    http=shared_http,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker
@@ -1510,6 +1535,9 @@ def create_app(
                     # scheduled tasks). Only the main builder — sub-agents/workers
                     # don't schedule tasks (intentional constraint).
                     trigger_store=resolved_trigger_store,
+                    # 一期 Task 5 — every LLM provider client this builder
+                    # constructs reuses the process-level shared connection pool.
+                    http_client=shared_http,
                 )
                 # Stream MCP-OAUTH (OA-3b) — let get_agent decide per-user builds.
                 resolved_agent_runtime.user_oauth_pool_provider = _user_mcp_oauth_pool_provider
