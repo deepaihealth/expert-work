@@ -1,6 +1,19 @@
-"""分段聚合的纯函数测试。网络/真栈部分不在单测范围。"""
+"""分段聚合的纯函数测试,外加 ``run_rounds`` 的单轮故障容错(用 ``httpx.MockTransport``
+打桩,不需要真栈)。"""
 
-from entry_latency import FIRST_LLM_START_KEY, aggregate, extract_run_metrics
+from pathlib import Path
+
+import httpx
+import yaml
+from entry_latency import (
+    FIRST_LLM_START_KEY,
+    _exit_status,
+    _prompt_fingerprint,
+    _write_result,
+    aggregate,
+    extract_run_metrics,
+    run_rounds,
+)
 
 
 def test_aggregate_reports_median_and_p95_per_segment() -> None:
@@ -65,3 +78,93 @@ def test_extract_run_metrics_no_llm_span_omits_first_llm_start() -> None:
     }
     metrics = extract_run_metrics(trace)
     assert FIRST_LLM_START_KEY not in metrics
+
+
+def _mock_run_response(run_id: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={"X-Expert-Work-Run-Id": run_id},
+        content=b"event: end\ndata: {}\n\n",
+    )
+
+
+async def test_run_rounds_survives_a_malformed_trace_response_body() -> None:
+    """Code-review Important-1: a 2xx trace response with a non-JSON body
+    (a gateway mangled it, say) makes ``resp.json()`` raise
+    ``json.JSONDecodeError`` — a ``ValueError`` subclass, NOT an
+    ``httpx.HTTPError``. Before this fix that escaped the per-round
+    try/except entirely and crashed the whole batch, discarding every
+    earlier round's already-paid-for real LLM data. Round 3 of 3 here
+    returns a mangled body; rounds 1-2's real measurements must survive it.
+    """
+    trace_gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/runs"):
+            return _mock_run_response("11111111-1111-1111-1111-111111111111")
+        if request.method == "GET" and request.url.path.endswith("/trace"):
+            trace_gets["n"] += 1
+            if trace_gets["n"] == 3:
+                return httpx.Response(200, content=b"<html>not json</html>")
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "spans": [
+                        {"label": "记忆召回", "group": "entry", "latencyMs": 100, "kind": "span"}
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        per_run, failed_runs = await run_rounds(client, "thread-1", "hello", 3, trace_timeout_s=5.0)
+
+    assert per_run == [{"记忆召回": 100.0}, {"记忆召回": 100.0}, {}]
+    assert failed_runs == 1
+
+
+def test_write_result_distinguishes_zero_success_from_zero_spans(tmp_path: Path) -> None:
+    """Code-review Important-2: ``meta`` must record ``successful_runs`` /
+    ``failed_runs`` so a reader can tell "0 real measurements because every
+    round failed" (e.g. a typo'd ``--agent`` version → all 404) apart from
+    "0 real measurements because this agent legitimately has no entry-chain
+    spans" — both would otherwise write an identical ``segments: {}``."""
+    out_path = tmp_path / "baseline.yaml"
+    per_run = [{}, {}, {}]  # all three rounds failed
+    _write_result(out_path, per_run, {"agent": "x@1", "runs": 3}, failed_runs=3)
+
+    written = yaml.safe_load(out_path.read_text(encoding="utf-8"))
+    assert written["segments"] == {}
+    assert written["meta"]["successful_runs"] == 0
+    assert written["meta"]["failed_runs"] == 3
+    assert written["meta"]["runs"] == 3  # requested count untouched
+
+
+def test_exit_status_all_failed_returns_nonzero_and_warns() -> None:
+    """Code-review Important-2: an all-failed batch must not exit 0 as if it
+    had captured real data — the coordinator's concrete scenario is a
+    typo'd ``--agent`` version silently 404ing every round."""
+    code, warning = _exit_status(successful_runs=0, total_runs=10)
+    assert code != 0
+    assert warning is not None
+    assert "10" in warning
+
+
+def test_exit_status_full_success_is_clean() -> None:
+    code, warning = _exit_status(successful_runs=10, total_runs=10)
+    assert code == 0
+    assert warning is None
+
+
+def test_prompt_fingerprint_changes_with_content() -> None:
+    """Code-review Important-3: the fingerprint (not just the file path,
+    which the caller records separately) must change when the prompt
+    content changes — a same-path-different-content edit between a
+    before/after run pair must be detectable."""
+    a = _prompt_fingerprint("总结今天的待办")
+    b = _prompt_fingerprint("总结今天的待办事项,并列出优先级")
+    assert a != b
+    assert a == _prompt_fingerprint("总结今天的待办")  # deterministic

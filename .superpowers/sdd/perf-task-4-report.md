@@ -143,3 +143,66 @@ uv run ruff format --check
 三条命令同步跑、全绿，没有后台化/轮询。
 
 改名 + README 说明 + 本追加一起提交（commit sha 见 PR/对话回复）。
+
+---
+
+## 追加：代码审查 3 Important + 2 Minor 修复
+
+Spec 判 ✅，代码质量审查提了 3 个 Important + 2 个 Minor，全部成立，已修。
+
+### Important-1：`resp.json()` 解析异常打崩整个脚本，丢光已有数据
+
+根因：`_fetch_trace()` 里 `resp.json()` 在"2xx 但 body 不是合法 JSON"时抛 `json.JSONDecodeError`（`ValueError` 子类），逃出了原来 `except (httpx.HTTPError, RuntimeError)` 的捕获范围；而聚合+落盘原来只在 for 循环跑完之后做一次——跑到第 8 轮崩溃，前 7 轮真实 LLM 调用拿到的数据一个数字都不落盘。
+
+修法（两部分都做了，不是二选一）：
+
+1. **异常捕获收窄补 `ValueError`**：把整个 for 循环体抽成新函数 `run_rounds()`（`entry_latency.py`），`except (httpx.HTTPError, RuntimeError, ValueError) as exc` 覆盖 JSON 解析失败。
+2. **增量落盘**：新增 `_write_result(out_path, per_run, meta_base, *, failed_runs)`，每轮跑完都调一次(通过 `run_rounds()` 的 `on_round_done` 回调),不再是"循环跑完才写一次"。每次调用整体重写文件(用当前累积的 `per_run` 重新聚合),所以中途崩溃时磁盘上已经是最新的部分结果,不会丢已经跑过的真实轮次。
+
+新测试 `test_run_rounds_survives_a_malformed_trace_response_body`：用 `httpx.MockTransport` 打桩,3 轮里第 3 轮的 trace GET 返回 `content=b"<html>not json</html>"`(2xx,body 不是 JSON)。断言 `per_run == [{"记忆召回": 100.0}, {"记忆召回": 100.0}, {}]`(前两轮真实数据在,第三轮退化成空字典而不是抛异常)且 `failed_runs == 1`。
+
+### Important-2：全军覆没也产出「看起来合法」的 YAML
+
+根因：`--agent` 拼错版本号→10 轮全 404→`per_run` 全 `{}`→`aggregate()` 合法地返回空字典→脚本照样 `wrote ...` + exit 0。产出的 `segments: {}` 跟"这个 agent 本来就没有入口链 span"长得一模一样，`meta.runs` 记的还是请求轮数不是成功轮数，反而像在担保"这是 10 轮真数据"。
+
+修法：
+
+1. **`meta` 加 `successful_runs` / `failed_runs`**：`_write_result()` 每次调用都从 `len(per_run) - failed_runs` 现算，不再只有一个语义模糊的 `runs`(那个字段保留表示"请求了几轮"，新增两个字段表示"实际成功/失败几轮")。
+2. **新增 `_exit_status(successful_runs, total_runs) -> (exit_code, warning)`**：`successful_runs == 0` → exit 1 + stdout 警告(协调者给的具体场景：typo 的 `--agent`);`successful_runs / total_runs < 0.5` → exit 0(部分真实数据仍然有用,呼应之前"单轮失败容错"的设计)但同样打印 stdout 警告。警告用 `print()` 默认写 stdout,不是只写 stderr(协调者原话"打印警告到 stdout(不只 stderr)")。
+
+新测试两个：`test_write_result_distinguishes_zero_success_from_zero_spans`(3 轮全失败时 `meta.successful_runs == 0`、`meta.failed_runs == 3`、`meta.runs` 仍是请求的 3 不变)+ `test_exit_status_all_failed_returns_nonzero_and_warns`(`_exit_status(0, 10)` 返回非零 code + 带"10"的警告文案)。另加一个补充测试 `test_exit_status_full_success_is_clean` 确认正常情况不误报。
+
+### Important-3：prompt 没进 meta
+
+根因：协调者审查指令里列的"机器/agent/prompt/runs 数"四轴，前三个(commit/host/agent/runs)都进了 meta，prompt 完全没记。`-before.yaml` 和 `-after.yaml` 如果指向了内容不同的 prompt 文件，两份 meta 长得一模一样，prompt 长度差异导致的延迟差会被误判成"连接池改造的效果"——这条最致命，直接破坏这个脚本存在的意义。
+
+修法：`meta` 新增两个字段——`prompt_file`(`--prompt-file` 的原始路径字符串)+ `prompt_sha256`(新增纯函数 `_prompt_fingerprint()`，`hashlib.sha256(prompt.encode()).hexdigest()[:12]`，同 `_git_commit()` 的短哈希风格)。哈希覆盖"路径相同但内容被编辑过"这种路径本身查不出来的情况。
+
+新测试 `test_prompt_fingerprint_changes_with_content`：两段不同中文 prompt 哈希不同，同一段内容哈希确定性一致。（协调者原话只点名 Important-1、-2 各补一个测试，Important-3 的测试是我主动加的——新增的纯函数照项目"新函数要有单测"的惯例补了一个，成本很低。）
+
+### Minor-4：mypy strict 类型缺口
+
+`_run_once()` 里 `run_id = resp.headers.get(...)` 之前没有显式类型标注，httpx 的 `Headers.get()` stub 返回 `Any`，`if not run_id: raise` 的收窄对 `Any` 不生效，`return run_id` 触发 mypy strict 的 "Returning Any from function declared to return str"。改成 `run_id: str | None = resp.headers.get(...)`。验证：`uv run mypy tools/bench/entry_latency.py --strict` → `Success: no issues found in 1 source file`(`tools/` 不在 CI mypy 范围内，这条是额外验证，不是三条硬性命令之一)。
+
+### Minor-5：README 补语义边界
+
+`tools/bench/README.md` 的 `first_llm_start` is NOT `first_output_seconds` 一节加了一段：`first_llm_start` 取的是所有 `kind=="llm"` span 里最早的一个，不特指主生成调用——配了 query-rewrite 之类辅助 LLM 调用的 agent(发生在 `memory.recall` 内部，必然早于主生成)，这个代理指标拿到的其实是辅助调用的启动时刻。对连接池改造的 before/after 有效性没有影响(TLS 复用对所有出站 LLM 调用生效)，但跨 agent 比较"到主生成开始"的延迟时会误导。`extract_run_metrics()` 的 docstring 同步加了这句。
+
+### 验证结果
+
+```
+uv run pytest tools/bench/test_entry_latency.py -v
+# 10 passed in 0.02s(新增 5 个:run_rounds 容错 1 个、Important-2 相关 3 个、prompt 哈希 1 个)
+
+uv run ruff check
+# All checks passed!
+
+uv run ruff format --check
+# 1476 files already formatted
+```
+
+三条命令同步跑、全绿，没有后台化/轮询。中途 `ruff format --check` 对 `test_entry_latency.py` 报了一行超长(`run_rounds(client, "thread-1", "hello", 3, trace_timeout_s=5.0)` 那行)，跑 `ruff format` 折行后复跑全绿。
+
+### 未变的部分
+
+上面追加小节确认过的 4 条假设(1/2/3/4)、扁平 `meta` 设计、Step 5 跳过范围、`first_llm_start` 改名——这次审查没有再动，原文保留在上面两节。

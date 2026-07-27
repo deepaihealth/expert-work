@@ -1,7 +1,9 @@
 """入口链延迟取数脚本 —— 一期 Task 4。
 
 跑 N 轮固定 prompt,每轮从 trace facade 拉 span 树,按 ``group == "entry"``
-的 span 加首个 llm_call 聚合出各段耗时,输出 median / p95。
+的 span 加首个 llm_call 聚合出各段耗时,输出 median / p95。基线 YAML
+每轮跑完就增量落盘一次(不是只在全部跑完后写一次)——跑 N 轮是真实 LLM
+调用,有成本,某一轮的网络故障不应该让之前几轮的数据白跑一场。
 
 不是 benchmark 框架,是个取数脚本。二期量 P1.1/P1.2/P1.3/P3 复用它。
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import platform
 import shutil
@@ -30,6 +33,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -93,12 +97,17 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
 
     * **Segments** — every span with ``group == "entry"`` (the 8 入口链 spans,
       Task 1/2), keyed by its (already Chinese) ``label``.
-    * ``FIRST_LLM_START_KEY`` — the earliest ``startMs`` among ``kind == "llm"``
-      spans, as a proxy for "entry chain finished, generation started". This
-      script only reads the trace facade (not the ``first_output_seconds``
-      Prometheus histogram Task 3 added), so it is **not** that metric — it's
-      an earlier point on the clock (a model prefill separates the two). See
-      ``tools/bench/README.md`` for the full explanation.
+    * ``FIRST_LLM_START_KEY`` — the earliest ``startMs`` among **all**
+      ``kind == "llm"`` spans, as a proxy for "entry chain finished,
+      generation started". This is the earliest LLM call of *any* purpose —
+      an agent with an auxiliary LLM call inside the entry chain itself
+      (e.g. a query-rewrite step inside ``memory.recall``) will report that
+      call's start, not the main generation call's. See
+      ``tools/bench/README.md`` for why that's fine for before/after
+      comparisons but not for cross-agent ones. This script only reads the
+      trace facade (not the ``first_output_seconds`` Prometheus histogram
+      Task 3 added), so it is **not** that metric either way — it's an
+      earlier point on the clock (a model prefill separates the two).
 
     Malformed / missing fields degrade silently (span skipped) rather than
     raising — one bad span in a trace should not sink an entire run's data.
@@ -156,6 +165,16 @@ def _host_fingerprint() -> str:
     return f"{platform.system().lower()}-{platform.machine()}"
 
 
+def _prompt_fingerprint(prompt: str) -> str:
+    """Short content hash for the baseline's ``meta`` — same shape as
+    ``_git_commit()``'s short sha. Catches "same ``--prompt-file`` path, but
+    someone edited its content between the before/after run" as well as a
+    different path entirely — both invalidate a before/after comparison,
+    and neither is visible from the path string alone.
+    """
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -192,7 +211,10 @@ async def _run_once(client: httpx.AsyncClient, thread_id: str, prompt: str) -> s
         "POST", f"/v1/sessions/{thread_id}/runs", json={"input": prompt}
     ) as resp:
         resp.raise_for_status()
-        run_id = resp.headers.get("X-Expert-Work-Run-Id")
+        # httpx.Headers.get()'s stub returns Any — the `if not run_id: raise`
+        # below narrows at runtime but not for mypy, so annotate explicitly
+        # (mypy strict: "Returning Any from function declared to return str").
+        run_id: str | None = resp.headers.get("X-Expert-Work-Run-Id")
         async for _line in resp.aiter_lines():
             pass  # drain to completion; content itself isn't needed here
     if not run_id:
@@ -205,7 +227,14 @@ async def _fetch_trace(
 ) -> dict[str, Any]:
     """GET the run's normalized trace, retrying while Langfuse ingestion is
     still async-flushing (``status: "not_ready"`` — see ``fetch_and_normalize``'s
-    docstring in ``control_plane/api/trace_facade.py``)."""
+    docstring in ``control_plane/api/trace_facade.py``).
+
+    ``resp.json()`` raises ``json.JSONDecodeError`` (a ``ValueError``
+    subclass) when a 2xx response body isn't valid JSON (e.g. a gateway
+    mangled it) — deliberately NOT caught here; the caller (``run_rounds``)
+    catches it per-round so one bad response doesn't take earlier rounds'
+    real data down with it.
+    """
     deadline = time.monotonic() + timeout_s
     while True:
         resp = await client.get(f"/v1/sessions/{thread_id}/runs/{run_id}/trace")
@@ -218,44 +247,73 @@ async def _fetch_trace(
         await asyncio.sleep(1.0)
 
 
-async def _amain(args: argparse.Namespace) -> int:
-    base_url = args.base_url or _require_env("EXPERT_WORK_API_URL")
-    token = _require_env("EXPERT_WORK_API_TOKEN")  # never logged
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
-    if not prompt:
-        raise SystemExit(f"{args.prompt_file} is empty")
-    agent_name, sep, agent_version = args.agent.partition("@")
-    if not sep:
-        raise SystemExit("--agent must be name@version")
+async def run_rounds(
+    client: httpx.AsyncClient,
+    thread_id: str,
+    prompt: str,
+    runs: int,
+    *,
+    trace_timeout_s: float,
+    on_round_done: Callable[[list[dict[str, float]], int], None] | None = None,
+) -> tuple[list[dict[str, float]], int]:
+    """Run ``runs`` rounds against an already-created session.
 
-    headers = {"Authorization": f"Bearer {token}"}
+    Returns ``(per_run_metrics, failed_runs)``. A single round's failure —
+    an HTTP error, a run response missing its run id, trace ingestion never
+    settling, **or a 2xx trace response whose body isn't valid JSON**
+    (``resp.json()`` raises ``json.JSONDecodeError``, a ``ValueError``
+    subclass — this used to escape the catch here and crash the whole batch,
+    losing every earlier round's already-collected real data; code review
+    caught it) — is recorded as an empty ``{}`` entry plus a failed-round
+    increment, not a batch-aborting exception.
+
+    ``on_round_done`` (if given) fires after every round, success or
+    failure, with the metrics collected so far and the running failure
+    count — the caller uses this to persist partial results to disk after
+    each round instead of only once at the very end, so a crash mid-batch
+    (from something this function doesn't catch) doesn't erase real,
+    already-paid-for LLM calls.
+    """
     per_run: list[dict[str, float]] = []
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=180.0) as client:
-        thread_id = await _create_session(client, agent_name, agent_version)
-        print(f"session: {thread_id}", file=sys.stderr)
-        for i in range(args.runs):
-            print(f"run {i + 1}/{args.runs} ...", file=sys.stderr)
-            try:
-                run_id = await _run_once(client, thread_id, prompt)
-                trace = await _fetch_trace(
-                    client, thread_id, run_id, timeout_s=args.trace_timeout_s
-                )
-                per_run.append(extract_run_metrics(trace))
-            except (httpx.HTTPError, RuntimeError) as exc:
-                print(f"  run {i + 1} failed, skipping: {exc}", file=sys.stderr)
-                per_run.append({})
+    failed_runs = 0
+    for i in range(runs):
+        print(f"run {i + 1}/{runs} ...", file=sys.stderr)
+        try:
+            run_id = await _run_once(client, thread_id, prompt)
+            trace = await _fetch_trace(client, thread_id, run_id, timeout_s=trace_timeout_s)
+            per_run.append(extract_run_metrics(trace))
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            print(f"  run {i + 1} failed, skipping: {exc}", file=sys.stderr)
+            per_run.append({})
+            failed_runs += 1
+        if on_round_done is not None:
+            on_round_done(per_run, failed_runs)
+    return per_run, failed_runs
 
+
+def _write_result(
+    out_path: Path,
+    per_run: list[dict[str, float]],
+    meta_base: dict[str, Any],
+    *,
+    failed_runs: int,
+) -> None:
+    """Aggregate ``per_run`` and write the baseline YAML to ``out_path``.
+
+    Called after every round (incremental persistence, see ``run_rounds``)
+    as well as once more at the end — each call fully overwrites the file
+    with the current cumulative state, so it's safe to call repeatedly.
+    ``meta_base`` carries the fields that don't change per round (commit /
+    host / agent / runs / prompt fingerprint / note); ``successful_runs``
+    and ``failed_runs`` are computed fresh every call since they're the
+    only thing that changes as rounds complete.
+    """
     aggregated = aggregate(per_run)
     first_llm_start = aggregated.pop(FIRST_LLM_START_KEY, None)
 
-    meta: dict[str, Any] = {
-        "commit": _git_commit(),
-        "host": _host_fingerprint(),
-        "agent": args.agent,
-        "runs": args.runs,
-    }
-    if args.note:
-        meta["note"] = args.note
+    meta: dict[str, Any] = dict(meta_base)
+    meta["successful_runs"] = len(per_run) - failed_runs
+    meta["failed_runs"] = failed_runs
 
     result: dict[str, Any] = {
         "segments": {name: _segment_to_dict(seg) for name, seg in sorted(aggregated.items())},
@@ -267,13 +325,83 @@ async def _amain(args: argparse.Namespace) -> int:
             "p95": first_llm_start.p95,
         }
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         yaml.safe_dump(result, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
+
+
+def _exit_status(successful_runs: int, total_runs: int) -> tuple[int, str | None]:
+    """Decide the process exit code + an optional stdout warning from the
+    final success/total tally.
+
+    All rounds failing (e.g. a typo'd ``--agent`` version — every round
+    404s, ``per_run`` is all empty dicts, ``aggregate()`` legitimately
+    returns ``{}``) must NOT look like a clean run: the file would read
+    identically to "this agent genuinely has no entry-chain spans" without
+    ``meta.successful_runs`` — so this returns a non-zero exit code and a
+    warning in that case. A low-but-nonzero success rate still exits 0
+    (partial real data is still useful — the whole point of per-round fault
+    tolerance) but is called out anyway so it isn't missed.
+    """
+    if total_runs <= 0:
+        return 0, None
+    if successful_runs == 0:
+        return 1, f"all {total_runs} runs failed — no measurements were collected"
+    if successful_runs / total_runs < 0.5:
+        return (
+            0,
+            f"only {successful_runs}/{total_runs} runs succeeded — "
+            "these numbers rest on a small sample",
+        )
+    return 0, None
+
+
+async def _amain(args: argparse.Namespace) -> int:
+    base_url = args.base_url or _require_env("EXPERT_WORK_API_URL")
+    token = _require_env("EXPERT_WORK_API_TOKEN")  # never logged
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise SystemExit(f"{args.prompt_file} is empty")
+    agent_name, sep, agent_version = args.agent.partition("@")
+    if not sep:
+        raise SystemExit("--agent must be name@version")
+
+    meta_base: dict[str, Any] = {
+        "commit": _git_commit(),
+        "host": _host_fingerprint(),
+        "agent": args.agent,
+        "runs": args.runs,
+        "prompt_file": args.prompt_file,
+        "prompt_sha256": _prompt_fingerprint(prompt),
+    }
+    if args.note:
+        meta_base["note"] = args.note
+
+    out_path = Path(args.out)
+
+    def _persist(per_run: list[dict[str, float]], failed_runs: int) -> None:
+        _write_result(out_path, per_run, meta_base, failed_runs=failed_runs)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=180.0) as client:
+        thread_id = await _create_session(client, agent_name, agent_version)
+        print(f"session: {thread_id}", file=sys.stderr)
+        _per_run, failed_runs = await run_rounds(
+            client,
+            thread_id,
+            prompt,
+            args.runs,
+            trace_timeout_s=args.trace_timeout_s,
+            on_round_done=_persist,
+        )
+
+    successful_runs = args.runs - failed_runs
     print(f"wrote {out_path}")
-    return 0
+    exit_code, warning = _exit_status(successful_runs, args.runs)
+    if warning is not None:
+        print(f"WARNING: {warning}")
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:

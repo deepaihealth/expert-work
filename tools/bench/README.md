@@ -32,6 +32,17 @@ first LLM call *starts*, not the moment its first token arrives. A model's
 prefill sits between those two clocks — anywhere from a few hundred
 milliseconds to a few seconds, depending on prompt length and model.
 
+It's also the earliest of **all** LLM calls in the trace, not specifically
+the main generation call. An agent with an auxiliary LLM call inside the
+entry chain itself (e.g. a query-rewrite step that runs inside
+`memory.recall`, necessarily before the main generation) will report that
+auxiliary call's start time, not the main call's. This doesn't affect a
+before/after comparison for this program's connection-pooling work (TLS
+reuse applies to every outbound LLM call, auxiliary or not), but it is
+misleading if you use `first_llm_start` to compare "time to main-generation
+start" *across different agents* that don't have the same auxiliary-call
+shape.
+
 Practical consequence:
 
 - **Comparing this script's own before/after runs is valid** — the one
@@ -67,13 +78,27 @@ uv run python tools/bench/entry_latency.py \
 Run as a script (`uv run python tools/bench/entry_latency.py`), not as a
 module (`-m`) — `tools/bench` isn't a package.
 
+The output YAML is written after **every** round, not just once at the end
+— a round that fails part-way through a batch (network blip, a gateway
+mangling a response body, …) doesn't discard the real LLM data already
+collected by earlier rounds. `meta` also records `successful_runs` /
+`failed_runs` (distinct from the requested `runs` count) and a
+`prompt_sha256` content hash alongside `prompt_file`, so an all-failed run
+(e.g. a typo'd `--agent` version) can't be mistaken for "0 real
+measurements because this agent has no entry-chain spans", and a
+before/after pair pointed at a since-edited prompt file is detectable
+instead of silently attributing a prompt-length difference to the
+optimization being measured.
+
 ### Tests
 
 ```bash
 uv run pytest tools/bench/test_entry_latency.py -v
 ```
 
-Covers the pure functions only (`aggregate`, `extract_run_metrics`) —
-the HTTP / live-stack path isn't unit-tested (see
-`.superpowers/sdd/perf-task-4-report.md` for why and what a coordinator
-running it for real should know).
+Covers the pure functions (`aggregate`, `extract_run_metrics`,
+`_exit_status`, `_prompt_fingerprint`, `_write_result`) plus `run_rounds`'s
+per-round fault tolerance via `httpx.MockTransport` (no live stack needed).
+The full live-stack path (session creation, driving a real agent, real
+Langfuse ingestion) isn't covered — see `.superpowers/sdd/perf-task-4-report.md`
+for what a coordinator running it for real should know.
