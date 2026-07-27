@@ -1,0 +1,35 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 1.0
+    n: 10
+  向量化:
+    median: 290.0
+    p95: 361.0
+    n: 10
+  向量检索:
+    median: 24.0
+    p95: 30.0
+    n: 10
+  记忆召回:
+    median: 328.0
+    p95: 401.0
+    n: 10
+  读取召回配置:
+    median: 15.0
+    p95: 17.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@1.0.0
+  runs: 10
+  prompt_file: /tmp/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: before connection-pool; branch perf-latency-observability @16c2abca; in-container(control-plane-blue)
+    local dev compose
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 571.5
+  p95: 650.0
