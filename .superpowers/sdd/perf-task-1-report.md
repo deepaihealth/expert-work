@@ -106,4 +106,4 @@ uv run pytest -v -m "not integration" --timeout=60 --timeout-method=thread \
 
 ## 5. Commit
 
-[[COMMIT_PLACEHOLDER]]
+`d50e6e73` —— `feat(observability): 入口链 8 个 span + TRACED_SPANS 单源`(本 worktree 分支 `worktree-agent-a459185bdef7efdbb`,基线 `d81e81d2`)。
