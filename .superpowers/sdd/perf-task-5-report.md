@@ -60,8 +60,84 @@ Task 5 的 spec 原文说"没接线的路径字段是 None，行为逐字节不�
 
 其次是 `resolved_supervisor_client.http = shared_http` 这处原地 mutate——我读代码确认了 `HTTPSupervisorClient` 不是 frozen、`app.state.supervisor_client` 和 `base_tool_env` 引用的是同一个对象、mutate 发生在 lifespan 内且早于任何请求进来，逻辑链条自认站得住,但这是本 task 唯一一处"构造在先、注入在后"的非声明式接线,如果协调者的启动路径跟我读到的 `app.py` 不一致（比如某个部署禁用了 `sandbox_supervisor_url`,`resolved_supervisor_client` 是 None,mutate 分支被跳过——这个我已经用 `if resolved_supervisor_client is not None:` 挡了，但没有真栈验证过这条分支）,值得跑一次真实的 `exec_python`/`bash` 工具调用确认没有静默退回未共享状态。
 
-## 未做的事
+## 未做的事（第一轮交付时）
 
 - 没有跑 `tools/bench/entry_latency.py` 的 after 基线——按你的分工，这一步你在真栈上做。
 - 没有跑 integration 标记的测试、没有跑 orchestrator/control-plane 之外的全量 suite——按你的范围指示跳过。
 - 没有接 `subagent_runtime.py`/judge/quality 三处独立 `build_llm_router` 调用点——见上"接线深度"末尾的说明,如果你希望这些也吃到连接复用,是同一套 `http_client=` 透传模式,改动量不大但不在这次改动里。
+
+---
+
+## 追加：Opus 审查回来后的修复（第二轮）
+
+审查结论：实现本身零遗漏零漂移（12 个调用点 per-request timeout 全对，共享分支变异验证杀得死，`resolve_ms` 打点未动，CodeQL 干净）。发现全在设计层，按①-⑤ 逐条修。
+
+### ① 共享 client 构造（`app.py`，一处改三件事）
+
+- **`timeout=None`**（原来没显式写，隐式吃 httpx 内置 `Timeout(5.0)`）。改成显式 `None` + 长注释：12 处 per-request timeout 一处都不删,兜底行为选温和的那个(router 的 first_token/idle timeout 或 run deadline 兜,不是 httpx 5s 静默铡断)。触发了 `ruff` 的 bandit 规则 `S113`(probable use of httpx call with timeout set to None),加了 `# noqa: S113` + 注释说明是故意的。
+- **`max_connections=None`**（原来是 256）。256 是改造顺带引入的全新全局并发闸——池满会让 `httpx.PoolTimeout` 被现有错误分类逻辑翻译成 `LLMNetworkError`/"supervisor unreachable"，伪装成 provider 故障触发重试风暴，而改造前语义本就是无上限。`max_keepalive_connections=64` 保留不动（握手收益所在）。
+- **空 cookie 策略**：`shared_http.cookies.jar.set_policy(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))`。共享 client 的持久 cookie jar 是这次改造新增的跨租户状态通道——手工验证过（脚本见下）：不设策略时，A 请求的 `Set-Cookie` 会被存进 jar，B 请求会带上它一起发出去。加空策略后验证「A 请求后 `dict(client.cookies)` 为空、B 请求也不带 cookie」。`import http.cookiejar` 加在文件顶部 stdlib import 块。
+
+验证脚本（跑过，见下方"验证结果"）：手工起一个 `httpx.AsyncClient` + `MockTransport` 返回 `Set-Cookie`，确认设置策略前会存、设置后不存。
+
+### ② `app.py:1204` 就地变异加 isinstance 门 + 删除 `runtime.py` 死参数
+
+- `if resolved_supervisor_client is not None:` → `if isinstance(resolved_supervisor_client, HTTPSupervisorClient):`。加了 `from orchestrator.tools import HTTPSupervisorClient` 导入。`SupervisorClient`（Protocol）没有 `http` 成员，`mypy services/control-plane/src/control_plane/app.py` 之前在这行报 `attr-defined`（CI 不扫 control-plane，本地没人看得到）；改用 isinstance 后这个错误消失（验证见下）。
+- `runtime.py` 的 `build_supervisor_client` 删掉了 `http` 参数——它构造在 `create_app` 同步体内、早于 lifespan 的 `shared_http` 存在，没有任何调用方能传非 None 值给它，是个死参数。检查过唯一调用点（`app.py:680`）和两个测试（`test_checkpointer_wiring.py:220/224/230`）都没用过这个 kwarg，删除零影响。
+
+### ③ 参数化 timeout 存在性测试（`test_http_client_reuse.py`，把命门从"人不出错"变成"机器保证"）
+
+新增 `test_every_call_site_passes_a_per_request_timeout`，用 `pytest.mark.parametrize` 遍历 **13 个真实调用点**（不是审查原话里的 12——我数了一遍实际改过 `timeout=` 的行：openai 2 + anthropic 2 + embedder 1 + rerank 1 + web_search 1 + sandbox 6 `_post`/`exec`/`read`/`list`/`write`/`delete` = 13。把这个差异写出来而不是悄悄按 12 交——多出来的那一个是 sandbox 的 `_post`，它被 `acquire`/`release`/`destroy`/`reap`/`mark_workspace_deleted` 五个方法共用，算作一个独立调用点）。
+
+每个 case：注入一个 `_Recorder` transport（记录 `request.extensions["timeout"]`，统一返回 `httpx.Response(200, json={})`——审计了每个类的响应体消费逻辑，`json={}` 对全部 13 条路径都是合法输入，不需要为每个 case 定制响应形状），跑该类的对应方法，断言：
+1. `request.extensions["timeout"]` 存在且等于该路径期望值（每个 client 用独立的 `timeout_s=12.5` 构造，跟其他默认值区分开，防止"凑巧对上默认值"的假阳性）；
+2. 流式两条（`openai.stream_chat_completions`/`anthropic.stream_messages`）额外断言 `timeout["read"] is None`；
+3. 共享 client 全程 `not is_closed`。
+
+**自检结果（按要求手工做的，不是纸面推演）**：
+- 临时删掉 `openai.py` `chat_completions` 里的 `timeout=self.timeout_s,`：`test_every_call_site_passes_a_per_request_timeout[openai.chat_completions]` **从绿变红**——`AssertionError: openai.chat_completions: timeout mismatch — got {'connect': 5.0, 'read': 5.0, 'write': 5.0, 'pool': 5.0}`（正是 httpx 内置 5s 默认，跟①的分析完全对上）。恢复后复绿。
+- 临时删掉 `sandbox.py` `exec()` 里的 `timeout=read_timeout,`：`test_every_call_site_passes_a_per_request_timeout[sandbox.exec]` **从绿变红**——同样是 5.0s 默认，跟期望的 315.0s（`_MAX_EXEC_TIMEOUT_S + _EXEC_HTTP_BUFFER_S`）差了 63 倍。恢复后复绿，`git diff` 确认两个文件跟改动前逐字节一致。
+
+### ④ 两处未接线在本轮补齐
+
+- **`runtime.py::_build_judge_caller`**：加 `http_client` 参数，转发到 `build_llm_router(judge_spec, secret_store=secret_store, http_client=http_client)`。`_make_output_judge`/`_make_action_judge` 同步加参数转发。`make_agent_builder._build` 里两处调用点（`_make_output_judge(...)`/`_make_action_judge(...)`）传 `http_client=http_client`——这是闭包局部变量，`make_agent_builder` 本身已有这个参数（第一轮加的），零新增外部依赖。
+- **`subagent_runtime.py`**：`make_child_agent_builder`/`make_worker_build_fn` 都加 `http_client: httpx.AsyncClient | None = None` 参数，转发到各自的 `build_agent(...)` 调用。`app.py` 里两处调用点（`make_child_agent_builder(...)`/`make_worker_build_fn(...)`）都在跟 `make_agent_builder(..., http_client=shared_http)` 同一个 lifespan 代码块里，补 `http_client=shared_http` 是纯透传，没有新建变量。
+- **`aux_model_adapter.py`/`quality_judge.py` 两处按你的指示不动**——低频后台 worker，你记 ledger 作为后续 follow-up。
+
+至此，除了这两处显式记为 follow-up 的低频路径，一期 Task 5 涉及的所有 `build_agent`/`build_llm_router` 调用链都已经把 `http_client` 一路传到底。
+
+### ⑤ 三个 Minor
+
+- `_http.py` 的 `client_for`：docstring 补了一段说明共享分支静默丢弃 `timeout`/`transport`；加了 `assert transport is None or shared is None`（+ `# noqa: S101`）防"注入 MockTransport 却因为 shared 也非 None 而被静默忽略,实际打到 shared 自己的 transport(生产环境里可能是真网络)"这个测试陷阱。顺手把 docstring 里写错的 `:func:`_client_for`` 改成实际符号名 `:func:`client_for``（我在第一轮就没照抄计划文档的下划线命名，这条是清理遗留的错误自引用，不是新决定）。检查过全仓库没有任何调用点同时传 `http=` 和 `transport=`，这条 assert 对现有代码零影响（跑全量测试验证过）。
+- `runtime.py` 的静态 `resolve_embedder`/`resolve_reranker` 两个工厂补了 `http: httpx.AsyncClient | None = None` 参数并转发进 `ResolvingEmbedder(..., http=http)`/`ResolvingReranker(..., http=http)`。这两个工厂目前唯一的调用方是测试（生产 wire 是 `DynamicResolvingEmbedder`/`DynamicResolvingReranker`，在 `app.py` 里直接构造），加这个参数是为了不让 `ResolvingEmbedder`/`ResolvingReranker` 的 `http` 字段在"静态"这条腿上变成无 opt 路径的死字段。
+- `app.state.shared_http`：保留（当前无读方），行内加注释 `# ops introspection hook; no reader yet`。
+
+### 验证结果（第二轮）
+
+```
+uv run pytest services/orchestrator/tests/test_http_client_reuse.py -v
+# 17 passed（原 4 个 + 新增 13 个参数化 case）
+
+uv run pytest services/control-plane/tests/ -k "runtime or embedder or rerank or subagent or judge" -v
+# 120 passed, 2028 deselected
+
+uv run ruff check
+# All checks passed!（含新增的 S113 noqa）
+
+uv run ruff format --check
+# 1478 files already formatted
+
+uv run mypy packages services/orchestrator/src
+# Success: no issues found in 763 source files
+
+uv run mypy services/control-plane/src/control_plane/app.py 2>&1 | grep -v from_url
+# (无输出 —— :1204 的 attr-defined 已消失,只剩 4 条既有的 from_url 噪音,已被过滤掉)
+```
+
+六条命令逐条同步跑、无后台化/轮询。
+
+另外顺带跑了 `services/orchestrator/tests/ -v -k "provider or llm or embedder or rerank or web_search or sandbox"`（第一轮的受影响面回归网）：**366 passed, 1506 deselected**，零回归。
+
+### 参数化测试的自检结果（明确回答）
+
+**红**。删 `openai.py:307`(`chat_completions` 的 `timeout=`)和删 `sandbox.py` `exec()` 的 `timeout=`，对应 parametrize case 各自独立变红，报错信息精确指向"退化成了 httpx 内置 5.0s 默认"。两次都验证了恢复后文件与改动前逐字节一致（`git diff` 无输出）。

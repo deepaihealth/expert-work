@@ -482,6 +482,7 @@ async def _build_judge_caller(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> LLMCaller:
     """Stream PI-3-A2 — the LLM caller backing the output/action judges.
 
@@ -490,6 +491,10 @@ async def _build_judge_caller(
     separate, injection-free call reusing the provider's platform credential).
     A resolve failure propagates so a misconfigured judge fails the build loudly
     rather than silently shipping an agent that opted into a judge it didn't get.
+
+    ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
+    client — the judge fires on every gated output/action, so this is a
+    high-frequency call, not a background one.
     """
     provider = spec.spec.model.provider
     name = spec.spec.model.name
@@ -499,7 +504,7 @@ async def _build_judge_caller(
             provider, name = cast(Provider, configured[0]), configured[1]
     secret_ref = await credentials_resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
     judge_spec = ModelSpec(provider=provider, name=name, api_key_ref=secret_ref)
-    return await build_llm_router(judge_spec, secret_store=secret_store)
+    return await build_llm_router(judge_spec, secret_store=secret_store, http_client=http_client)
 
 
 async def _make_output_judge(
@@ -509,6 +514,7 @@ async def _make_output_judge(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> OutputJudge | None:
     """Stream PI-2b-3 / PI-3-A2 — build the output judge when the manifest opts
     in (``defenses.output_judge == "block"``), over the platform judge model
@@ -521,6 +527,7 @@ async def _make_output_judge(
         credentials_resolver=credentials_resolver,
         secret_store=secret_store,
         judge_config_service=judge_config_service,
+        http_client=http_client,
     )
     return LLMOutputJudge(caller=caller)
 
@@ -532,6 +539,7 @@ async def _make_action_judge(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> ActionJudge | None:
     """Stream PI-3b-2 — build the action judge when the manifest opts in
     (``defenses.action_screen != "off"``), over the platform judge model (or
@@ -544,6 +552,7 @@ async def _make_action_judge(
         credentials_resolver=credentials_resolver,
         secret_store=secret_store,
         judge_config_service=judge_config_service,
+        http_client=http_client,
     )
     return LLMActionJudge(caller=caller)
 
@@ -740,6 +749,7 @@ def make_agent_builder(
                 credentials_resolver=credentials_resolver,
                 secret_store=secret_store,
                 judge_config_service=platform_judge_config_service,
+                http_client=http_client,
             )
             if credentials_resolver is not None and tenant_id is not None
             else None
@@ -752,6 +762,7 @@ def make_agent_builder(
                 credentials_resolver=credentials_resolver,
                 secret_store=secret_store,
                 judge_config_service=platform_judge_config_service,
+                http_client=http_client,
             )
             if credentials_resolver is not None and tenant_id is not None
             else None
@@ -1017,6 +1028,7 @@ async def resolve_embedder(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
+    http: httpx.AsyncClient | None = None,
 ) -> Embedder | None:
     """Build the per-tenant credential-resolving embedder for long-term
     memory (Stream J.3 + Mini-ADR O-9).
@@ -1026,11 +1038,17 @@ async def resolve_embedder(
     memory is globally unavailable and an agent declaring
     ``memory.long_term`` fails at build time (the build-time gate is
     preserved). Per-tenant failures (tenant mode, missing key) surface at
-    ``embed`` time instead (Mini-ADR O-11)."""
+    ``embed`` time instead (Mini-ADR O-11).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
+    to the built :class:`ResolvingEmbedder`. ``None`` (this factory's only
+    caller today is tests — the production wire is ``DynamicResolvingEmbedder``,
+    built directly in ``app.py``) keeps the field an opt-in, not a dead one.
+    """
     if provider not in supported_providers:
         return None
     return ResolvingEmbedder(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
     )
 
 
@@ -1041,14 +1059,18 @@ async def resolve_reranker(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
+    http: httpx.AsyncClient | None = None,
 ) -> Reranker | None:
     """Build the per-tenant credential-resolving reranker (Stream J.5 +
     Mini-ADR O-9). ``provider`` not in ``supported_providers`` → ``None``
-    (no rerank pass; hybrid search returns the RRF-fused order)."""
+    (no rerank pass; hybrid search returns the RRF-fused order).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
+    to the built :class:`ResolvingReranker`."""
     if provider not in supported_providers:
         return None
     return ResolvingReranker(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
     )
 
 
@@ -1279,24 +1301,23 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_supervisor_client(
-    url: str | None, *, http: httpx.AsyncClient | None = None
-) -> SupervisorClient | None:
+def build_supervisor_client(url: str | None) -> SupervisorClient | None:
     """Build the Sandbox Supervisor HTTP client from its base URL.
 
     ``None`` → the ``exec_python`` tool is unavailable; an agent that
     declares it fails at build time with a clear error.
 
-    ``http`` (一期 Task 5) is the process-level shared HTTP client; ``None``
-    falls back to the client's own per-call default. It is commonly ``None``
-    HERE — this factory runs before the app lifespan creates the shared
-    client (see ``app.py``), which instead mutates ``.http`` on the returned
-    client once the shared client exists (``HTTPSupervisorClient`` is not
-    frozen, so that in-place wiring is safe).
+    一期 Task 5 — no ``http`` param here: this factory runs in ``app.py``'s
+    synchronous ``create_app`` body, before the lifespan creates the shared
+    ``httpx.AsyncClient``, so no caller could ever pass one. The lifespan
+    instead mutates ``.http`` on the returned client in place once the
+    shared client exists (``HTTPSupervisorClient`` is not frozen, so that
+    is safe) — see the ``isinstance(..., HTTPSupervisorClient)`` guard in
+    ``app.py``.
     """
     if url is None:
         return None
-    return HTTPSupervisorClient(base_url=url, http=http)
+    return HTTPSupervisorClient(base_url=url)
 
 
 def build_tool_env(
