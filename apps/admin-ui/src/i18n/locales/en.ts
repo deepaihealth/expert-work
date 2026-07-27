@@ -3723,7 +3723,7 @@ const en: TranslationKeys = {
     verify_reads_label: "Check memories before answering",
     verify_reads_brief: "Double-checks memories first — slower but more accurate",
     verify_reads_impact:
-      "After pulling memories and before using them, the model screens them and drops anything irrelevant, stale, or contradictory, so old memories don't skew the answer.\nCosts one extra model call — measured at roughly 0.7–1s per turn, the single largest wait before the answer starts; if it errors, nothing is blocked.\nOn by default.\nExample: on",
+      "Before answering, the model screens the recalled memories and drops anything irrelevant, stale, or contradictory, so old memories don't skew the answer.\nThe cost is one extra model call: measured at roughly 0.7–1s of added wait per answer.\nIf the screening itself fails, nothing is blocked — all memories are used as-is.\nOn by default.\nExample: on",
     write_min_importance_label: "Importance filter",
     write_min_importance_brief: "Skips memories below this importance score",
     write_min_importance_impact:
