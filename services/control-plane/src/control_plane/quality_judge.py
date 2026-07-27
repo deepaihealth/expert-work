@@ -26,6 +26,7 @@ from uuid import UUID
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.credential_value_cache import CachingSecretStore, CredentialValueCache
 from expert_work.common.credentials import CredentialsResolver
 from expert_work.protocol import ModelSpec, Provider, StructuredOutputSpec
 
@@ -90,9 +91,14 @@ class QualityJudge:
         *,
         resolver: CredentialsResolver,
         secret_store: SecretStore,
+        secret_cache: CredentialValueCache | None = None,
     ) -> None:
         self._resolver = resolver
         self._secret_store = secret_store
+        # 二期 PR2 T3 — the judge has no direct ``secret_store.get``; its
+        # vault read happens inside ``build_llm_router``. ``None`` (tests /
+        # not yet wired) keeps the direct-read behaviour.
+        self._secret_cache = secret_cache
 
     async def score(
         self, *, tenant_id: UUID, prompt: str, reply: str, provider: str, model: str
@@ -118,7 +124,15 @@ class QualityJudge:
             spec = ModelSpec(
                 provider=provider_typed, name=model, api_key_ref=secret_ref, fallback=[]
             )
-            router = await build_llm_router(spec, secret_store=self._secret_store)
+            # 二期 PR2 T3 — hand the router a tenant-scoped caching store so
+            # its internal vault read (agent_factory.py:1956) becomes a
+            # cache hit.
+            store: SecretStore = self._secret_store
+            if self._secret_cache is not None:
+                store = CachingSecretStore(
+                    inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
+                )
+            router = await build_llm_router(spec, secret_store=store)
             content = f"{_RUBRIC}\n\nUSER REQUEST:\n{prompt}\n\nAGENT REPLY:\n{reply}"
             response = await router(
                 messages=[HumanMessage(content=content)], tools=[], output_schema=_QUALITY_SPEC

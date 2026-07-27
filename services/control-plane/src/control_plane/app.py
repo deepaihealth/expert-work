@@ -113,6 +113,7 @@ from control_plane.auth import (
 )
 from control_plane.aux_model_adapter import make_llm_router_aux_model
 from control_plane.catalog_seed import CatalogSeedError, load_catalog_seed, seed_catalog
+from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.curation_worker import CurationWorker
 from control_plane.encrypted_secret_store import (
     SqlEncryptedSecretStore,
@@ -1135,6 +1136,13 @@ def create_app(
             )
             _app.state.shared_http = shared_http  # ops introspection hook; no reader yet
             stack.push_async_callback(shared_http.aclose)
+            # 二期 PR2 T3 — process-level secret-value cache(LRU 256 / TTL
+            # 300s,plan 拍定值 = 类默认参数)。embed / rerank / aux / judge
+            # 的 vault 读变缓存命中;T2 的凭据写入口经
+            # ``app.state.credential_value_cache``(getattr)连动失效,闭合
+            # 换 key 生效链。跨副本陈旧度由 TTL 兜底(本仓立场)。
+            credential_value_cache = CredentialValueCache()
+            _app.state.credential_value_cache = credential_value_cache
             # Stream MCP-OAUTH (OA-5) — env-seed the connector catalog before
             # serving: oauth2 connectors whose ${VAR} client_id placeholders
             # resolve from the environment are created idempotently.
@@ -1393,6 +1401,7 @@ def create_app(
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
                     http=shared_http,
+                    secret_cache=credential_value_cache,
                 )
                 # Stream K.K6 — memory CRUD endpoint needs the embedder
                 # for the PATCH path (re-embed on content change). GET /
@@ -1409,6 +1418,7 @@ def create_app(
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
                     http=shared_http,
+                    secret_cache=credential_value_cache,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker
@@ -1718,6 +1728,7 @@ def create_app(
                     secret_store=resolved_secret_store,
                     default_provider=default_provider,
                     default_model=(resolved_settings.memory_consolidator_default_aux_model),
+                    secret_cache=credential_value_cache,
                 )
                 memory_consolidator = MemoryConsolidator(
                     memory_store=resolved_memory_store,
@@ -1789,6 +1800,7 @@ def create_app(
                         secret_store=resolved_secret_store,
                         default_provider=se_provider,
                         default_model=resolved_settings.memory_consolidator_default_aux_model,
+                        secret_cache=credential_value_cache,
                     ),
                     aux_default_model=resolved_settings.memory_consolidator_default_aux_model,
                     tenant_gate=_skill_evolution_tenant_gate,
@@ -1919,6 +1931,7 @@ def create_app(
                 judge=QualityJudge(
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
+                    secret_cache=credential_value_cache,
                 ),
                 runtime=resolved_agent_runtime,
                 usage_store=resolved_token_usage,

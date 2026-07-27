@@ -33,6 +33,7 @@ from uuid import UUID
 
 from langchain_core.messages import HumanMessage
 
+from control_plane.credential_value_cache import CachingSecretStore, CredentialValueCache
 from control_plane.memory_consolidator import (
     ConsolidatorAuxModel,
     ConsolidatorLLMReply,
@@ -74,11 +75,16 @@ class LLMRouterAuxModelAdapter:
         secret_store: SecretStore,
         default_provider: Provider,
         default_model: str,
+        secret_cache: CredentialValueCache | None = None,
     ) -> None:
         self._resolver = resolver
         self._secret_store = secret_store
         self._default_provider = default_provider
         self._default_model = default_model
+        # 二期 PR2 T3 — the adapter has no direct ``secret_store.get``; its
+        # vault read happens inside ``build_llm_router``. ``None`` (tests /
+        # not yet wired) keeps the direct-read behaviour.
+        self._secret_cache = secret_cache
 
     async def __call__(
         self,
@@ -122,7 +128,14 @@ class LLMRouterAuxModelAdapter:
             # default model is what the manifest opted into.
             fallback=[],
         )
-        router = await build_llm_router(spec, secret_store=self._secret_store)
+        # 二期 PR2 T3 — hand the router a tenant-scoped caching store so its
+        # internal vault read (agent_factory.py:1956) becomes a cache hit.
+        store: SecretStore = self._secret_store
+        if self._secret_cache is not None:
+            store = CachingSecretStore(
+                inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
+            )
+        router = await build_llm_router(spec, secret_store=store)
         message = HumanMessage(content=prompt)
         # RT-1 — ``output_schema`` threads straight through to the router's
         # validation loop; ``None`` keeps the call wire-identical to the
@@ -169,6 +182,7 @@ def make_llm_router_aux_model(
     secret_store: SecretStore,
     default_provider: Provider,
     default_model: str,
+    secret_cache: CredentialValueCache | None = None,
 ) -> ConsolidatorAuxModel:
     """Factory mirroring :func:`make_null_consolidator_aux_model` so the
     app.py wire-up can swap one for the other with no code change at
@@ -178,4 +192,5 @@ def make_llm_router_aux_model(
         secret_store=secret_store,
         default_provider=default_provider,
         default_model=default_model,
+        secret_cache=secret_cache,
     )
