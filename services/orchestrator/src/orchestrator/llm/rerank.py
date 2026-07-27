@@ -21,6 +21,8 @@ from uuid import UUID
 
 import httpx
 
+from orchestrator.llm.providers._http import client_for
+
 #: DashScope native (NOT compatible-mode) text-rerank endpoint.
 DASHSCOPE_RERANK_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
@@ -47,6 +49,12 @@ class HTTPDashScopeRerankClient:
     base_url: str = DASHSCOPE_RERANK_URL
     timeout_s: float = _DEFAULT_TIMEOUT_S
     transport: httpx.AsyncBaseTransport | None = None
+    #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
+    #: original per-call ``async with httpx.AsyncClient(...)`` behaviour
+    #: (tests / eval CLI / not-yet-wired production paths). When injected it
+    #: must NOT be closed here: it is owned by the control-plane lifespan and
+    #: outlives every individual call.
+    http: httpx.AsyncClient | None = None
 
     async def rerank(
         self, *, model: str, query: str, documents: Sequence[str], top_n: int
@@ -60,7 +68,9 @@ class HTTPDashScopeRerankClient:
             # We only need the reordered indices, not the echoed documents.
             "parameters": {"return_documents": False, "top_n": top_n},
         }
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout_s) as client:
+        async with client_for(
+            self.http, timeout=self.timeout_s, transport=self.transport
+        ) as client:
             response = await client.post(
                 self.base_url,
                 headers={
@@ -68,6 +78,7 @@ class HTTPDashScopeRerankClient:
                     "content-type": "application/json",
                 },
                 json=body,
+                timeout=self.timeout_s,  # per-request — governs even when sharing a client
             )
             if response.is_error:
                 detail = response.text[:_ERROR_BODY_LIMIT]

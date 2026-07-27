@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID
 
+import httpx
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from opentelemetry import trace
@@ -481,6 +482,7 @@ async def _build_judge_caller(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> LLMCaller:
     """Stream PI-3-A2 — the LLM caller backing the output/action judges.
 
@@ -489,6 +491,10 @@ async def _build_judge_caller(
     separate, injection-free call reusing the provider's platform credential).
     A resolve failure propagates so a misconfigured judge fails the build loudly
     rather than silently shipping an agent that opted into a judge it didn't get.
+
+    ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
+    client — the judge fires on every gated output/action, so this is a
+    high-frequency call, not a background one.
     """
     provider = spec.spec.model.provider
     name = spec.spec.model.name
@@ -498,7 +504,7 @@ async def _build_judge_caller(
             provider, name = cast(Provider, configured[0]), configured[1]
     secret_ref = await credentials_resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
     judge_spec = ModelSpec(provider=provider, name=name, api_key_ref=secret_ref)
-    return await build_llm_router(judge_spec, secret_store=secret_store)
+    return await build_llm_router(judge_spec, secret_store=secret_store, http_client=http_client)
 
 
 async def _make_output_judge(
@@ -508,6 +514,7 @@ async def _make_output_judge(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> OutputJudge | None:
     """Stream PI-2b-3 / PI-3-A2 — build the output judge when the manifest opts
     in (``defenses.output_judge == "block"``), over the platform judge model
@@ -520,6 +527,7 @@ async def _make_output_judge(
         credentials_resolver=credentials_resolver,
         secret_store=secret_store,
         judge_config_service=judge_config_service,
+        http_client=http_client,
     )
     return LLMOutputJudge(caller=caller)
 
@@ -531,6 +539,7 @@ async def _make_action_judge(
     credentials_resolver: CredentialsResolver,
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> ActionJudge | None:
     """Stream PI-3b-2 — build the action judge when the manifest opts in
     (``defenses.action_screen != "off"``), over the platform judge model (or
@@ -543,6 +552,7 @@ async def _make_action_judge(
         credentials_resolver=credentials_resolver,
         secret_store=secret_store,
         judge_config_service=judge_config_service,
+        http_client=http_client,
     )
     return LLMActionJudge(caller=caller)
 
@@ -609,6 +619,11 @@ def make_agent_builder(
     # applied when the manifest leaves ``policies.run_deadline_s`` at 0.
     # 0 = no floor (manifest-only). Bound from ``settings`` by the lifespan.
     default_run_deadline_s: int = 0,
+    # 一期 Task 5 — process-level shared HTTP client (control-plane lifespan).
+    # Forwarded into ``build_agent`` for every build this builder produces.
+    # ``None`` (tests / pre-lifespan placeholder builder) keeps every LLM
+    # provider client on its original per-call ``httpx.AsyncClient``.
+    http_client: httpx.AsyncClient | None = None,
 ) -> AgentBuilder:
     """Production :data:`AgentBuilder` bound to a SecretStore + checkpointer.
 
@@ -734,6 +749,7 @@ def make_agent_builder(
                 credentials_resolver=credentials_resolver,
                 secret_store=secret_store,
                 judge_config_service=platform_judge_config_service,
+                http_client=http_client,
             )
             if credentials_resolver is not None and tenant_id is not None
             else None
@@ -746,6 +762,7 @@ def make_agent_builder(
                 credentials_resolver=credentials_resolver,
                 secret_store=secret_store,
                 judge_config_service=platform_judge_config_service,
+                http_client=http_client,
             )
             if credentials_resolver is not None and tenant_id is not None
             else None
@@ -784,6 +801,8 @@ def make_agent_builder(
             platform_tool_budget_enabled=platform_tool_budget_enabled,
             # skill-asset-store — dual-read for externalized supporting files.
             skill_asset_store=skill_asset_store,
+            # 一期 Task 5 — process-level shared HTTP client.
+            http_client=http_client,
         )
 
     return _build
@@ -811,6 +830,9 @@ class ResolvingEmbedder:
     secret_store: SecretStore
     provider: Provider
     model: str
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to the embedding client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -830,7 +852,7 @@ class ResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         span.set_attribute("secret_ms", round((t2 - t1) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key), model=self.model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=self.model
         )
         return await delegate.embed(texts, tenant_id=tenant_id)
 
@@ -855,6 +877,9 @@ class ResolvingReranker:
     secret_store: SecretStore
     provider: Provider
     model: str
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to each client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -883,12 +908,14 @@ class ResolvingReranker:
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key), model=self.model
+                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
-        router = await build_llm_router(model_spec, secret_store=self.secret_store)
+        router = await build_llm_router(
+            model_spec, secret_store=self.secret_store, http_client=self.http
+        )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
@@ -902,6 +929,9 @@ class DynamicResolvingEmbedder:
     config_service: PlatformEmbeddingConfigService
     resolver: CredentialsResolver
     secret_store: SecretStore
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to the embedding client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -926,7 +956,7 @@ class DynamicResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         span.set_attribute("secret_ms", round((t3 - t2) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key), model=model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=model
         )
         return await delegate.embed(texts, tenant_id=tenant_id)
 
@@ -939,6 +969,9 @@ class DynamicResolvingReranker:
     config_service: PlatformEmbeddingConfigService
     resolver: CredentialsResolver
     secret_store: SecretStore
+    #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
+    #: yet wired) falls back to each client's own per-call default.
+    http: httpx.AsyncClient | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -975,12 +1008,14 @@ class DynamicResolvingReranker:
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key), model=model
+                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )
-        router = await build_llm_router(model_spec, secret_store=self.secret_store)
+        router = await build_llm_router(
+            model_spec, secret_store=self.secret_store, http_client=self.http
+        )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
@@ -993,6 +1028,7 @@ async def resolve_embedder(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
+    http: httpx.AsyncClient | None = None,
 ) -> Embedder | None:
     """Build the per-tenant credential-resolving embedder for long-term
     memory (Stream J.3 + Mini-ADR O-9).
@@ -1002,11 +1038,17 @@ async def resolve_embedder(
     memory is globally unavailable and an agent declaring
     ``memory.long_term`` fails at build time (the build-time gate is
     preserved). Per-tenant failures (tenant mode, missing key) surface at
-    ``embed`` time instead (Mini-ADR O-11)."""
+    ``embed`` time instead (Mini-ADR O-11).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
+    to the built :class:`ResolvingEmbedder`. ``None`` (this factory's only
+    caller today is tests — the production wire is ``DynamicResolvingEmbedder``,
+    built directly in ``app.py``) keeps the field an opt-in, not a dead one.
+    """
     if provider not in supported_providers:
         return None
     return ResolvingEmbedder(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
     )
 
 
@@ -1017,14 +1059,18 @@ async def resolve_reranker(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
+    http: httpx.AsyncClient | None = None,
 ) -> Reranker | None:
     """Build the per-tenant credential-resolving reranker (Stream J.5 +
     Mini-ADR O-9). ``provider`` not in ``supported_providers`` → ``None``
-    (no rerank pass; hybrid search returns the RRF-fused order)."""
+    (no rerank pass; hybrid search returns the RRF-fused order).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
+    to the built :class:`ResolvingReranker`."""
     if provider not in supported_providers:
         return None
     return ResolvingReranker(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
     )
 
 
@@ -1080,16 +1126,21 @@ def make_mcp_allowlist_provider(
     return _provider
 
 
-def resolve_web_search_client(*, searxng_base_url: str | None) -> TavilyClient | None:
+def resolve_web_search_client(
+    *, searxng_base_url: str | None, http: httpx.AsyncClient | None = None
+) -> TavilyClient | None:
     """Build the web-search backend for the builtin ``web_search`` tool.
 
     The builtin backend is a self-hosted SearXNG instance (free, no API
     key) — design ``web-search-searxng-builtin-and-tavily-mcp`` M2. Set
     ``searxng_base_url`` → :class:`SearXNGClient`; unset → ``None`` (an
     agent declaring ``web_search`` then fails at build, gate preserved).
-    Premium Tavily moved to the platform MCP catalog (not a builtin)."""
+    Premium Tavily moved to the platform MCP catalog (not a builtin).
+
+    ``http`` (一期 Task 5) is the process-level shared HTTP client; ``None``
+    falls back to the client's own per-call default."""
     if searxng_base_url:
-        return SearXNGClient(base_url=searxng_base_url)
+        return SearXNGClient(base_url=searxng_base_url, http=http)
     return None
 
 
@@ -1255,6 +1306,14 @@ def build_supervisor_client(url: str | None) -> SupervisorClient | None:
 
     ``None`` → the ``exec_python`` tool is unavailable; an agent that
     declares it fails at build time with a clear error.
+
+    一期 Task 5 — no ``http`` param here: this factory runs in ``app.py``'s
+    synchronous ``create_app`` body, before the lifespan creates the shared
+    ``httpx.AsyncClient``, so no caller could ever pass one. The lifespan
+    instead mutates ``.http`` on the returned client in place once the
+    shared client exists (``HTTPSupervisorClient`` is not frozen, so that
+    is safe) — see the ``isinstance(..., HTTPSupervisorClient)`` guard in
+    ``app.py``.
     """
     if url is None:
         return None

@@ -23,6 +23,8 @@ from uuid import UUID
 
 import httpx
 
+from orchestrator.llm.providers._http import client_for
+
 #: OpenAI-compatible embeddings path — qwen DashScope compatible-mode,
 #: DeepSeek, etc. all accept it.
 DEFAULT_EMBEDDINGS_PATH = "/v1/embeddings"
@@ -79,15 +81,22 @@ class HTTPEmbeddingClient:
     base_url: str = QWEN_EMBEDDING_BASE_URL
     embeddings_path: str = DEFAULT_EMBEDDINGS_PATH
     transport: httpx.AsyncBaseTransport | None = None
+    #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
+    #: original per-call ``async with httpx.AsyncClient(...)`` behaviour
+    #: (tests / eval CLI / not-yet-wired production paths). When injected it
+    #: must NOT be closed here: it is owned by the control-plane lifespan and
+    #: outlives every individual call.
+    http: httpx.AsyncClient | None = None
 
     async def embeddings(self, *, model: str, texts: Sequence[str]) -> Mapping[str, Any]:
-        async with httpx.AsyncClient(
-            transport=self.transport, timeout=_DEFAULT_TIMEOUT_S
+        async with client_for(
+            self.http, timeout=_DEFAULT_TIMEOUT_S, transport=self.transport
         ) as client:
             response = await client.post(
                 f"{self.base_url}{self.embeddings_path}",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json={"model": model, "input": list(texts)},
+                timeout=_DEFAULT_TIMEOUT_S,  # per-request — governs even when sharing a client
             )
             if response.is_error:
                 # httpx's default message is opaque ("Client error '400 Bad
