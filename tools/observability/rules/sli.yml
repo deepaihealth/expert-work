@@ -3,10 +3,10 @@
 # Pre-aggregates the SLIs for the SLOs defined in docs/runbooks/slo.md.
 # Loaded by Prometheus from /etc/prometheus/rules/ (G.0 mount).
 #
-# Only the two SLIs whose metric is emitted in M0 are recorded here;
-# TTFT / sandbox-cold-start / durable-resume rules land when their
-# metrics are emitted (slo.md SLO #3-#5). Error-budget burn-rate rules
-# (multi-window) live in burn_rate.yml (Stream 10.5).
+# Session first-node (formerly named TTFT — see the rename note at line 37),
+# sandbox-cold-start, and durable-resume SLIs are all recorded below
+# (slo.md SLO #3-#5). Error-budget burn-rate rules (multi-window) live in
+# burn_rate.yml (Stream 10.5).
 
 groups:
   - name: expert_work_sli
@@ -28,14 +28,30 @@ groups:
             sum by (le) (rate(expert_work_control_plane_http_request_duration_seconds_bucket[5m]))
           )
 
-      # SLO 3 — Session TTFT P95 (seconds; target < 1.5). Stream K.K10
-      # added the histogram in the orchestrator SSE worker — observed
-      # at the first agent ``updates`` chunk after ``RUNNING``.
-      - record: expert_work:sli:session_ttft:p95_5m
+      # SLO 3 — Session first-node P95 (seconds; target < 1.5). Stream K.K10
+      # added the histogram in the orchestrator SSE worker — observed at the
+      # first graph-node ``updates`` chunk after ``RUNNING`` (*any* node, not
+      # specifically the agent node — a run with memory_recall records the
+      # recall's completion here, not the first user-visible content; see
+      # 一期 Task 3's ``expert_work:sli:first_output:p95_5m`` below for the
+      # user-perceived metric). Renamed from ``session_ttft`` by 一期 Task 3
+      # to stop implying this is about tokens.
+      - record: expert_work:sli:session_first_node:p95_5m
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le) (rate(expert_work_session_ttft_seconds_bucket[5m]))
+            sum by (le) (rate(expert_work_session_first_node_seconds_bucket[5m]))
+          )
+
+      # 用户第一次看到内容的 P95。两条 source(token 流式 / 无流式 run 的
+      # agent updates 帧兜底)聚合,不按 source 分 —— 这里要的是真实用户
+      # 体验,不是某条路径的性能。
+      # 暂不配告警:阈值要等攒够生产数据再定,老的 first_node 告警继续守着。
+      - record: expert_work:sli:first_output:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_first_output_seconds_bucket[5m]))
           )
 
       # SLO 4 — Sandbox cold-start P95 (seconds; target < 3 in M0, < 0.5 in M1).

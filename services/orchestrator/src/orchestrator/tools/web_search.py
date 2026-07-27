@@ -30,6 +30,7 @@ from uuid import UUID
 
 import httpx
 
+from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -112,16 +113,25 @@ class SearXNGClient:
     base_url: str
     timeout_s: float = _DEFAULT_SEARXNG_TIMEOUT_S
     transport: httpx.AsyncBaseTransport | None = None
+    #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
+    #: original per-call ``async with httpx.AsyncClient(...)`` behaviour
+    #: (tests / eval CLI / not-yet-wired production paths). When injected it
+    #: must NOT be closed here: it is owned by the control-plane lifespan and
+    #: outlives every individual call.
+    http: httpx.AsyncClient | None = None
 
     async def search(
         self, *, query: str, max_results: int, tenant_id: UUID | None = None
     ) -> Mapping[str, Any]:
         del tenant_id  # shared instance — no per-tenant credential
-        async with httpx.AsyncClient(transport=self.transport, timeout=self.timeout_s) as client:
+        async with client_for(
+            self.http, timeout=self.timeout_s, transport=self.transport
+        ) as client:
             response = await client.get(
                 f"{self.base_url.rstrip('/')}/search",
                 params={"q": query, "format": "json"},
                 headers={"Accept": "application/json"},
+                timeout=self.timeout_s,  # per-request — governs even when sharing a client
             )
             response.raise_for_status()
             data = response.json()

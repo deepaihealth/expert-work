@@ -1389,6 +1389,9 @@ export interface TranslationKeys {
     open_in_langfuse: string;
     langfuse_unconfigured_hint: string;
   };
+  trace: {
+    breakdown_title: string;
+  };
   approval_badge: {
     aria_label: string;
     tooltip_one: string;
@@ -4367,6 +4370,9 @@ const en: TranslationKeys = {
     open_in_langfuse: "Open in Langfuse",
     langfuse_unconfigured_hint:
       "Set VITE_LANGFUSE_BASE_URL to enable the deep link.",
+  },
+  trace: {
+    breakdown_title: "Entry chain + first generation {{d}}",
   },
   approval_badge: {
     aria_label: "Pending approvals",

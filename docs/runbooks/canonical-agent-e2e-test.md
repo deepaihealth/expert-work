@@ -469,8 +469,8 @@ PROM=http://localhost:9090
 curl -sS "${PROM}/api/v1/query?query=Expert Work:sli:control_plane_availability:ratio5m" | jq .data.result[0].value[1]
 # 期望:>= 0.999
 
-# 2. TTFT P95
-curl -sS "${PROM}/api/v1/query?query=histogram_quantile(0.95,sum%20by%20(le)(rate(expert_work_session_ttft_seconds_bucket[1h])))" | jq .data.result[0].value[1]
+# 2. 首个图节点 P95(前名 TTFT)
+curl -sS "${PROM}/api/v1/query?query=histogram_quantile(0.95,sum%20by%20(le)(rate(expert_work_session_first_node_seconds_bucket[1h])))" | jq .data.result[0].value[1]
 # 期望:< 2.0
 
 # 3. End-to-end P95

@@ -113,6 +113,7 @@ def make_kimi_client(
     base_url: str = KIMI_BASE_URL,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """Moonshot AI / Kimi — OpenAI-compatible at ``api.moonshot.cn/v1``."""
     return HTTPOpenAIClient(
@@ -120,6 +121,7 @@ def make_kimi_client(
         base_url=base_url,
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
     )
 
@@ -130,6 +132,7 @@ def make_glm_client(
     base_url: str = GLM_BASE_URL,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """Zhipu AI / GLM — OpenAI-compatible at ``open.bigmodel.cn/api/paas/v4``.
 
@@ -141,6 +144,7 @@ def make_glm_client(
         base_url=base_url,
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=GLM_CHAT_COMPLETIONS_PATH,
     )
 
@@ -151,6 +155,7 @@ def make_deepseek_client(
     base_url: str = DEEPSEEK_BASE_URL,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """DeepSeek — OpenAI-compatible at ``api.deepseek.com/v1``."""
     return HTTPOpenAIClient(
@@ -158,6 +163,7 @@ def make_deepseek_client(
         base_url=base_url,
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
     )
 
@@ -168,6 +174,7 @@ def make_qwen_client(
     base_url: str = QWEN_BASE_URL,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """Alibaba Qwen via DashScope compatible-mode — OpenAI-format at
     ``dashscope.aliyuncs.com/compatible-mode/v1``.
@@ -181,6 +188,7 @@ def make_qwen_client(
         base_url=base_url,
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=DEFAULT_CHAT_COMPLETIONS_PATH,
     )
 
@@ -191,6 +199,7 @@ def make_doubao_client(
     base_url: str = DOUBAO_BASE_URL,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """ByteDance Doubao via Volcengine ARK — OpenAI-compatible at
     ``ark.cn-beijing.volces.com/api/v3``.
@@ -204,6 +213,7 @@ def make_doubao_client(
         base_url=base_url,
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=DOUBAO_CHAT_COMPLETIONS_PATH,
     )
 
@@ -215,6 +225,7 @@ def make_self_hosted_client(
     chat_completions_path: str = DEFAULT_CHAT_COMPLETIONS_PATH,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """A self-hosted OpenAI-compatible server (vLLM / Ollama / …).
 
@@ -227,6 +238,7 @@ def make_self_hosted_client(
         base_url=base_url.rstrip("/"),
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=chat_completions_path,
     )
 
@@ -239,6 +251,7 @@ def make_azure_client(
     api_version: str,
     timeout_s: float = 60.0,
     transport: httpx.AsyncBaseTransport | None = None,
+    http: httpx.AsyncClient | None = None,
 ) -> HTTPOpenAIClient:
     """Azure OpenAI Service — OpenAI wire format, deployment-style URL.
 
@@ -252,6 +265,7 @@ def make_azure_client(
         base_url=endpoint.rstrip("/"),
         timeout_s=timeout_s,
         transport=transport,
+        http=http,
         chat_completions_path=path,
         api_key_header="api-key",
         api_key_prefix="",

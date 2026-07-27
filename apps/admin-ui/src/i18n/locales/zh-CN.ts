@@ -1459,6 +1459,9 @@ const zhCN: TranslationKeys = {
     langfuse_unconfigured_hint:
       "设置 VITE_LANGFUSE_BASE_URL 即可开启外链跳转。",
   },
+  trace: {
+    breakdown_title: "入口链 + 首次生成 {{d}}",
+  },
   approval_badge: {
     aria_label: "待审批",
     tooltip_one: "{{count}} 个运行等待审批",

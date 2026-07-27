@@ -1,0 +1,37 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 3150.0
+    n: 10
+  向量化:
+    median: 202.5
+    p95: 280.0
+    n: 10
+  向量检索:
+    median: 22.0
+    p95: 328.0
+    n: 10
+  记忆召回:
+    median: 238.5
+    p95: 619.0
+    n: 10
+  读取召回配置:
+    median: 15.0
+    p95: 16.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@1.0.0
+  runs: 10
+  prompt_file: /tmp/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: after connection-pool @fb123c5f(含 keepalive_expiry=60s); in-container(control-plane-blue)
+    local dev compose; 与 before 同 agent 同 prompt 同环境; p95 不可比——本轮容器刚重启且无预热探针(before
+    轮有),p95 全被第 1 轮冷启动拉飞,对照统计量应看 median; 基线只覆盖 8 个入口链段中的 5 个——固定 prompt
+    零召回结果(rerank/bump_access 不触发)、无持久工作区(workspace_ingest 不存在)
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 476.5
+  p95: 4567.0

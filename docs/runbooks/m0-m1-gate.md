@@ -61,8 +61,8 @@ canonical_agent_manifest: <manifest_name>:<version>
 # 可用性 ratio (5xx 错误率) - 5 分钟窗口
 curl -s 'http://localhost:9090/api/v1/query?query=Expert Work:sli:control_plane_availability:ratio5m'
 
-# TTFT P95 - 1 小时窗口
-curl -s 'http://localhost:9090/api/v1/query?query=histogram_quantile(0.95, sum by (le)(rate(expert_work_session_ttft_seconds_bucket[1h])))'
+# 首个图节点 P95(一期 Task 3 前名 TTFT)- 1 小时窗口
+curl -s 'http://localhost:9090/api/v1/query?query=histogram_quantile(0.95, sum by (le)(rate(expert_work_session_first_node_seconds_bucket[1h])))'
 
 # Sandbox 冷启动 P95 - 1 小时
 curl -s 'http://localhost:9090/api/v1/query?query=histogram_quantile(0.95, sum by (le)(rate(expert_work_sandbox_cold_start_seconds_bucket[1h])))'
@@ -103,7 +103,7 @@ diff <(yq '.capabilities' tools/eval/baselines/m0_gate_baseline.yaml) \
 | SLO | Gate 阈值 | Prometheus query 核心部分 |
 |-----|----------|--------------------------|
 | 可用性 (control-plane 5xx) | < 0.1% in 30d | `Expert Work:sli:control_plane_availability:ratio5m` (>= 0.999) |
-| TTFT P95 | < 2.0s | `expert_work_session_ttft_seconds_bucket` |
+| 首个图节点 P95(前名 TTFT) | < 2.0s | `expert_work_session_first_node_seconds_bucket` |
 | End-to-end P95 (canonical agent run) | < 30s | `expert_work_session_duration_seconds{outcome="success"}_bucket` (recording rule `Expert Work:sli:session_duration:p95_5m`) |
 | SSE 流断裂率 | < 0.05% in 30d | `expert_work_llm_stream_stale_total / expert_work_llm_tokens_total` |
 | Sandbox 冷启动 P95 | < 5s | `expert_work_sandbox_cold_start_seconds_bucket` |
@@ -197,7 +197,7 @@ Gate 期间各演练一次, 写入 `gate-log/drills/`:
 |------|---------|------|
 | A. 再走一轮 30 天 | 1-2 个 SLO marginally 越线, 已识别明确单点 | 修复 + 30 天观察重新计时 |
 | B. 暂停修复 (热修补) | 多个 SLO 越限, 但根因可在 1-2 周内解决 | 暂停 Gate, 走临时修复 sprint, 后回 Gate |
-| C. 回退架构 | 系统级 SLO (TTFT/E2E) 跑不到目标 1.5 倍内, 或安全验收红 | 架构 retro, M0→M0.5 重构 |
+| C. 回退架构 | 系统级 SLO (首个图节点/E2E) 跑不到目标 1.5 倍内, 或安全验收红 | 架构 retro, M0→M0.5 重构 |
 
 ## 6. Failure modes — 常见处理
 

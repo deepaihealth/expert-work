@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if TYPE_CHECKING:
     from orchestrator.tools.skill_view import SkillResolution
 
+import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -497,6 +498,12 @@ async def build_agent(
     middleware_env: MiddlewareEnv | None = None,
     memory_env: MemoryEnv | None = None,
     subagent_depth: int = 0,
+    # 一期 Task 5 — process-level shared HTTP client (control-plane lifespan).
+    # Forwarded into every LLM provider client this build constructs so they
+    # reuse the pooled connection instead of opening one per call. ``None``
+    # (tests / eval CLI / not-yet-wired build paths) keeps every provider on
+    # its original per-call ``httpx.AsyncClient``.
+    http_client: httpx.AsyncClient | None = None,
     # Platform-default wall-clock floor (seconds) applied when the manifest
     # leaves ``policies.run_deadline_s`` at 0. ``0`` = no floor.
     default_run_deadline_s: int = 0,
@@ -571,6 +578,9 @@ async def build_agent(
     Raises :class:`AgentFactoryError` for an un-buildable manifest
     (a provider with no platform credential configured, an unsupported
     provider, an un-assemblable ``tools:`` entry, …).
+
+    ``http_client`` (一期 Task 5) is the process-level shared ``httpx``
+    client; see the parameter's own docstring above.
     """
     env = tool_env or ToolEnv()
     # Stream J.6 — Path A (native content blocks) and Path B (the ``ask_image``
@@ -616,6 +626,7 @@ async def build_agent(
         # Stream Y-2 — manifest-pinned api_key_ref is ignored for agent builds
         # (LLM spend must go through platform-metered credentials).
         ignore_api_key_ref=True,
+        http_client=http_client,
     )
     # Stream CM-9 (Mini-ADR CM-J4) — pre-build the one-step-up effort
     # caller for limit-hit escalation. Only the primary caller escalates
@@ -635,6 +646,7 @@ async def build_agent(
             provider_timeout_s=escalated_first_token,
             provider_key_resolver=provider_key_resolver,
             ignore_api_key_ref=True,
+            http_client=http_client,
         )
     # Stream J.6 Path B — build the VL router when a ``vision:`` block is
     # declared; ``ask_image`` will route through it. Stream L.L3 — the VL
@@ -666,6 +678,7 @@ async def build_agent(
             extra_fallbacks=list(vision_block.fallbacks),
             provider_key_resolver=provider_key_resolver,
             ignore_api_key_ref=True,  # Stream Y-2 (manifest-sourced VL model)
+            http_client=http_client,
         )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file
@@ -1858,6 +1871,7 @@ async def build_llm_router(
     extra_fallbacks: list[ModelSpec] | None = None,
     provider_key_resolver: ProviderKeyResolver | None = None,
     ignore_api_key_ref: bool = False,
+    http_client: httpx.AsyncClient | None = None,
 ) -> LLMRouter:
     """Build an :class:`LLMRouter` from a ``ModelSpec`` + its fallback tree.
 
@@ -1894,6 +1908,9 @@ async def build_llm_router(
     warning is logged. The default ``False`` preserves the internal-plumbing
     contract — control-plane rerank/embed/aux callers resolve the *platform*
     key themselves and pass it in via ``api_key_ref`` (no bypass).
+
+    ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
+    client to every provider built for this chain (see ``_build_provider``).
     """
     handles: list[ProviderHandle] = []
     chain: list[ModelSpec] = list(_flatten_chain(model))
@@ -1938,7 +1955,11 @@ async def build_llm_router(
         for idx, secret_ref in enumerate(secret_refs):
             api_key = await secret_store.get(parse_secret_ref(secret_ref))
             provider = _build_provider(
-                entry, api_key, image_resolver=image_resolver, timeout_s=provider_timeout_s
+                entry,
+                api_key,
+                image_resolver=image_resolver,
+                timeout_s=provider_timeout_s,
+                http_client=http_client,
             )
             rate_limited = RateLimitedProvider.with_rpm(
                 provider, rate_limit_rpm=entry.rate_limit_rpm
@@ -1961,6 +1982,7 @@ async def build_step_routers(
     image_resolver: ImageResolver | None = None,
     provider_key_resolver: ProviderKeyResolver | None = None,
     ignore_api_key_ref: bool = False,
+    http_client: httpx.AsyncClient | None = None,
 ) -> StepRouters:
     """Resolve the LLM router for each step class (Stream J.11).
 
@@ -1975,6 +1997,9 @@ async def build_step_routers(
     and ``spec.spec.idle_timeout_s`` (inter-token idle cap) are applied
     uniformly to every router (default + planning + reflection); a hung
     provider on any step class trips the same caps.
+
+    ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
+    client into every step's router.
     """
     first_token: float | None = _chat_stream_deadline_s(spec.spec.stream_deadline_s)
     idle: float | None = _chat_idle_timeout_s(spec.spec.idle_timeout_s)
@@ -1994,6 +2019,7 @@ async def build_step_routers(
         provider_timeout_s=first_token,
         provider_key_resolver=provider_key_resolver,
         ignore_api_key_ref=ignore_api_key_ref,
+        http_client=http_client,
     )
     planning = default
     reflection = default
@@ -2010,6 +2036,7 @@ async def build_step_routers(
                 provider_timeout_s=first_token,
                 provider_key_resolver=provider_key_resolver,
                 ignore_api_key_ref=ignore_api_key_ref,
+                http_client=http_client,
             )
             if rule.when == "planning":
                 planning = routed
@@ -2116,6 +2143,7 @@ def _build_provider(
     *,
     image_resolver: ImageResolver | None = None,
     timeout_s: float | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> LLMProvider:
     """Map a ``ModelSpec`` to a concrete :class:`LLMProvider` adapter.
 
@@ -2127,6 +2155,12 @@ def _build_provider(
 
     ``image_resolver`` is passed to every adapter so ``image_ref``
     content blocks resolve to bytes at call time (J.6 Path A).
+
+    ``http_client`` (一期 Task 5) is the process-level shared ``httpx``
+    client, forwarded to every provider's HTTP client so it reuses the
+    pooled connection instead of paying a TLS handshake per call.
+    ``None`` (tests / eval CLI / not-yet-wired build paths) keeps every
+    adapter on its original per-call client.
     """
     # Widen to ``str`` so the exhaustive Literal still leaves the
     # trailing "unsupported" raise reachable to mypy.
@@ -2160,7 +2194,7 @@ def _build_provider(
                 )
             temperature = None
         return AnthropicProvider(
-            client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff),
+            client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
             max_tokens=model.max_tokens,
             temperature=temperature,
@@ -2203,7 +2237,7 @@ def _build_provider(
 
     if provider == "openai":
         return OpenAIProvider(
-            client=HTTPOpenAIClient(api_key=api_key, timeout_s=timeout_eff),
+            client=HTTPOpenAIClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
             temperature=model.temperature,
             image_resolver=image_resolver,
@@ -2229,7 +2263,7 @@ def _build_provider(
         # vendors stream tool-args incrementally already — no injection.
         stream_extra_body = {"tool_stream": True} if provider == "glm" else None
         return OpenAICompatibleProvider(
-            client=make_client(api_key=api_key, timeout_s=timeout_eff),
+            client=make_client(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
             temperature=model.temperature,
             image_resolver=image_resolver,
@@ -2241,7 +2275,9 @@ def _build_provider(
         if not model.base_url:
             raise AgentFactoryError(f"self-hosted model {model.name!r} requires a base_url")
         return OpenAICompatibleProvider(
-            client=make_self_hosted_client(api_key, base_url=model.base_url, timeout_s=timeout_eff),
+            client=make_self_hosted_client(
+                api_key, base_url=model.base_url, timeout_s=timeout_eff, http=http_client
+            ),
             model=model.name,
             temperature=model.temperature,
             image_resolver=image_resolver,
@@ -2261,6 +2297,7 @@ def _build_provider(
                 deployment=model.azure_deployment,
                 api_version=model.azure_api_version,
                 timeout_s=timeout_eff,
+                http=http_client,
             ),
             model=model.name,
             temperature=model.temperature,

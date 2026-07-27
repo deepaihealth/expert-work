@@ -63,6 +63,9 @@ from expert_work.common.observability.tracing import (
     LLM_SPAN_PURPOSES as LLM_SPAN_PURPOSES,
 )
 from expert_work.common.observability.tracing import (
+    TRACED_SPANS as TRACED_SPANS,
+)
+from expert_work.common.observability.tracing import (
     ExpertWorkComponent as ExpertWorkComponent,
 )
 from expert_work.common.observability.tracing import (
@@ -78,6 +81,7 @@ from expert_work.common.observability.tracing import (
 __all__ = [
     "BANNED_LABEL_NAMES",
     "LLM_SPAN_PURPOSES",
+    "TRACED_SPANS",
     "TRACEPARENT_HEADER",
     "TRACESTATE_HEADER",
     "ExpertWorkComponent",

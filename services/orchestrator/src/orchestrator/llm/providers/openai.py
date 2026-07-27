@@ -65,6 +65,7 @@ from expert_work.runtime.middleware import (
 )
 from orchestrator.llm.coalesce import coalesce_system_messages
 from orchestrator.llm.providers._errors import classify_http_error
+from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.providers._metrics import disclosure_fallback_total
 from orchestrator.llm.providers._streaming import (
     LLMDelta,
@@ -264,6 +265,12 @@ class HTTPOpenAIClient:
     #: OpenAI uses ``api-key: <key>`` (prefix empty).
     api_key_header: str = "authorization"
     api_key_prefix: str = "Bearer "
+    #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
+    #: original per-call ``async with httpx.AsyncClient(...)`` behaviour
+    #: (tests / eval CLI / not-yet-wired production paths). When injected it
+    #: must NOT be closed here: it is owned by the control-plane lifespan and
+    #: outlives every individual call.
+    http: httpx.AsyncClient | None = None
 
     async def chat_completions(
         self,
@@ -287,8 +294,8 @@ class HTTPOpenAIClient:
         )
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout_s, transport=self.transport
+            async with client_for(
+                self.http, timeout=self.timeout_s, transport=self.transport
             ) as client:
                 response = await client.post(
                     f"{self.base_url}{self.chat_completions_path}",
@@ -297,6 +304,7 @@ class HTTPOpenAIClient:
                         "content-type": "application/json",
                     },
                     json=body,
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
                 )
         except httpx.HTTPError as exc:
             raise LLMNetworkError(f"openai: {exc}") from exc
@@ -340,7 +348,7 @@ class HTTPOpenAIClient:
         # idle_timeout_s governs inter-chunk silence (Stream L, P1).
         timeout = httpx.Timeout(self.timeout_s, read=None)
         try:
-            async with httpx.AsyncClient(timeout=timeout, transport=self.transport) as client:
+            async with client_for(self.http, timeout=timeout, transport=self.transport) as client:
                 async with client.stream(
                     "POST",
                     f"{self.base_url}{self.chat_completions_path}",
@@ -349,6 +357,7 @@ class HTTPOpenAIClient:
                         "content-type": "application/json",
                     },
                     json=body,
+                    timeout=timeout,  # per-request — the shared client's default must not win
                 ) as response:
                     if response.status_code >= 400:
                         await response.aread()

@@ -63,6 +63,7 @@ describe("getRunTrace", () => {
           level: "default",
           statusMessage: null,
           purpose: "",
+          group: null,
         },
         {
           id: "span-2",
@@ -81,6 +82,7 @@ describe("getRunTrace", () => {
           level: "default",
           statusMessage: null,
           purpose: "",
+          group: null,
         },
       ],
     };

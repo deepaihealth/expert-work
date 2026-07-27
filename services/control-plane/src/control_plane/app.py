@@ -20,6 +20,7 @@ Wiring overview (see [STREAM-B-DESIGN § 2.2](../../../docs/streams/STREAM-B-DES
 
 from __future__ import annotations
 
+import http.cookiejar
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -477,6 +478,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from orchestrator import MemoryEnv
+from orchestrator.tools import HTTPSupervisorClient
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -1070,6 +1072,65 @@ def create_app(
             otlp_endpoint=resolved_settings.otlp_traces_endpoint,
         )
         async with AsyncExitStack() as stack:
+            # 一期 Task 5 — one process-level httpx.AsyncClient, shared across
+            # every LLM / embed / rerank / web-search / sandbox-supervisor
+            # call so each reuses a pooled connection instead of paying a
+            # fresh TLS handshake per call. httpx pools per (scheme, host,
+            # port) internally, so a single instance is enough — no
+            # per-provider split needed. Wired into the deps below (embedder /
+            # reranker / web-search client / supervisor client / agent
+            # builder); ``stack`` closes it on shutdown, after every other
+            # cleanup callback that might still use it has run (LIFO).
+            shared_http = httpx.AsyncClient(
+                # No client-level default timeout: every call site passes
+                # timeout= per-request explicitly (see each provider's
+                # client_for() usage). If one call site is ever missed, the
+                # gap should be caught by the router's first_token/idle
+                # timeout or the run deadline — NOT by httpx's built-in 5s
+                # default silently killing a long-context prefill or a
+                # pip-install-grade sandbox exec (code review: deleting any
+                # one call site's timeout= left the full test suite green —
+                # there is no automated gate for "one call site missed", so
+                # the fallback behaviour must be the forgiving one).
+                timeout=None,  # noqa: S113 — deliberate; see comment above
+                # Keepalive is bounded (that's where the handshake-reuse win
+                # comes from); total connections is left unbounded — a 256
+                # cap would be a NEW global concurrency gate this refactor
+                # would introduce as a side effect. A full pool makes
+                # httpx.PoolTimeout translate into LLMNetworkError /
+                # "supervisor unreachable", masquerading as a provider
+                # fault and triggering a retry storm, when pre-refactor
+                # semantics were unbounded.
+                # keepalive_expiry: httpx's default is 5s — far below this
+                # workload's real inter-call gaps (an agent's LLM calls are
+                # separated by tool execution: a 30s bash run is routine, and
+                # the first live probe showed bench rounds ~20-40s apart paid
+                # a fresh handshake every time). 55s, not 60s: 60 lands
+                # exactly on AWS ALB's default idle timeout, so a
+                # server-side and client-side expiry at the same value would
+                # race every time — 55 keeps us strictly under it (client
+                # closing first is the convention; a server that closes
+                # earlier still gets caught by httpcore's staleness check on
+                # reuse).
+                limits=httpx.Limits(
+                    max_keepalive_connections=64,
+                    max_connections=None,
+                    keepalive_expiry=55.0,
+                ),
+            )
+            # The shared client's persistent cookie jar is a NEW cross-tenant
+            # state channel: a Set-Cookie a vendor returns for tenant A's
+            # call would otherwise be replayed on tenant B's call to the same
+            # vendor domain. Every LLM / embed / rerank / web-search /
+            # sandbox-supervisor call here is header-authenticated, so an
+            # empty cookie policy (never store) is zero-loss. A DefaultCookiePolicy
+            # subclass of httpx.Cookies would NOT work — the ``.cookies``
+            # setter always re-wraps into the base ``httpx.Cookies`` class.
+            shared_http.cookies.jar.set_policy(
+                http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
+            )
+            _app.state.shared_http = shared_http  # ops introspection hook; no reader yet
+            stack.push_async_callback(shared_http.aclose)
             # Stream MCP-OAUTH (OA-5) — env-seed the connector catalog before
             # serving: oauth2 connectors whose ${VAR} client_id placeholders
             # resolve from the environment are created idempotently.
@@ -1142,7 +1203,21 @@ def create_app(
                 _app.state.credentials_resolver = credentials_resolver
                 web_search_client = resolve_web_search_client(
                     searxng_base_url=resolved_settings.web_search_searxng_base_url,
+                    http=shared_http,
                 )
+                # 一期 Task 5 — the supervisor client is built earlier (before
+                # ``shared_http`` exists, so ``app.state.supervisor_client``
+                # is well-defined pre-lifespan too); wire the shared client in
+                # now. ``HTTPSupervisorClient`` is not frozen, so this mutates
+                # the same instance ``app.state.supervisor_client`` and
+                # ``base_tool_env`` below both reference. Guarded by
+                # isinstance (not ``SupervisorClient`` the Protocol, which has
+                # no ``http`` member) so a future wrapper implementation
+                # doesn't silently take a ``.http = ...`` assignment as a
+                # stray attribute and lose pooling without either an error or
+                # a type-checker complaint.
+                if isinstance(resolved_supervisor_client, HTTPSupervisorClient):
+                    resolved_supervisor_client.http = shared_http
                 mcp_pool = await stack.enter_async_context(
                     build_mcp_pool(
                         resolved_settings.mcp_servers_config_file,
@@ -1308,6 +1383,7 @@ def create_app(
                     config_service=resolved_platform_embedding_config_service,
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
+                    http=shared_http,
                 )
                 # Stream K.K6 — memory CRUD endpoint needs the embedder
                 # for the PATCH path (re-embed on content change). GET /
@@ -1323,6 +1399,7 @@ def create_app(
                     config_service=resolved_platform_embedding_config_service,
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
+                    http=shared_http,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker
@@ -1425,6 +1502,8 @@ def create_app(
                     # Stream MCP platform-servers (P1b) — evict ALL cached
                     # sub-agents when the process-global catalog pool changes.
                     register_invalidation_all=resolved_agent_runtime.register_invalidation_all,
+                    # 一期 Task 5 — delegated sub-agent builds reuse the shared pool too.
+                    http_client=shared_http,
                 )
                 # 1.3 Orchestrator-Worker — the spawn_worker builder (synthesizes
                 # ephemeral workers from the parent). ``None`` when the platform
@@ -1452,6 +1531,8 @@ def create_app(
                         # service (DB-wins-over-env, live); ``max_iterations=``
                         # above stays its boot-time fallback.
                         dynamic_worker_config_service=resolved_platform_dynamic_worker_config_service,
+                        # 一期 Task 5 — spawned worker builds reuse the shared pool too.
+                        http_client=shared_http,
                     )
                     if resolved_settings.enable_dynamic_workers
                     else None
@@ -1510,6 +1591,9 @@ def create_app(
                     # scheduled tasks). Only the main builder — sub-agents/workers
                     # don't schedule tasks (intentional constraint).
                     trigger_store=resolved_trigger_store,
+                    # 一期 Task 5 — every LLM provider client this builder
+                    # constructs reuses the process-level shared connection pool.
+                    http_client=shared_http,
                 )
                 # Stream MCP-OAUTH (OA-3b) — let get_agent decide per-user builds.
                 resolved_agent_runtime.user_oauth_pool_provider = _user_mcp_oauth_pool_provider

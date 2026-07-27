@@ -15,6 +15,7 @@ from dataclasses import replace
 from typing import Any
 from uuid import UUID
 
+import httpx
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
@@ -156,6 +157,10 @@ def make_child_agent_builder(
     tenant_config_service: TenantConfigService | None = None,
     register_invalidation: Callable[[Callable[[UUID], None]], None] | None = None,
     register_invalidation_all: Callable[[Callable[[], None]], None] | None = None,
+    # 一期 Task 5 — process-level shared HTTP client, forwarded into every
+    # delegated child build's ``build_agent`` call. ``None`` keeps every LLM
+    # provider client on its original per-call ``httpx.AsyncClient``.
+    http_client: httpx.AsyncClient | None = None,
 ) -> ChildAgentBuilder:
     """Build the :class:`ChildAgentBuilder` the orchestrator's ``ToolEnv`` carries.
 
@@ -243,6 +248,7 @@ def make_child_agent_builder(
             skill_resolver=skill_resolver,
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
+            http_client=http_client,
         )
         cache[key] = built
         logger.info(
@@ -303,6 +309,10 @@ def make_worker_build_fn(
     skill_activity_recorder: SkillActivityRecorder | None = None,
     tenant_config_service: TenantConfigService | None = None,
     dynamic_worker_config_service: PlatformDynamicWorkerConfigService | None = None,
+    # 一期 Task 5 — process-level shared HTTP client, forwarded into every
+    # spawned worker's ``build_agent`` call. ``None`` keeps every LLM
+    # provider client on its original per-call ``httpx.AsyncClient``.
+    http_client: httpx.AsyncClient | None = None,
 ) -> WorkerBuildFn:
     """Build the :class:`WorkerBuildFn` the orchestrator's ``ToolEnv`` carries
     for the ``spawn_worker`` tool (1.3 dynamic Orchestrator-Worker).
@@ -377,6 +387,7 @@ def make_worker_build_fn(
             skill_resolver=skill_resolver,
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
+            http_client=http_client,
         )
         logger.info("control_plane.worker.built role=%s depth=%d", role or "general", depth)
         return built

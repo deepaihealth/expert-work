@@ -25,7 +25,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
@@ -33,6 +34,7 @@ from uuid import UUID
 import httpx
 
 from expert_work.common.observability import inject_context
+from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -209,9 +211,19 @@ class HTTPSupervisorClient:
     #: exercise the wire layer (e.g. the A.8 traceparent round-trip).
     #: Production leaves it ``None`` (real network transport).
     transport: httpx.AsyncBaseTransport | None = None
+    #: 一期 Task 5 — process-level shared client. ``None`` falls back to the
+    #: original per-call ``httpx.AsyncClient(...)`` behaviour (tests / eval
+    #: CLI / not-yet-wired production paths). When injected it must NOT be
+    #: closed here: it is owned by the control-plane lifespan and outlives
+    #: every individual call.
+    http: httpx.AsyncClient | None = None
 
-    def _make_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(timeout=self.timeout_s, transport=self.transport)
+    @asynccontextmanager
+    async def _make_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        async with client_for(
+            self.http, timeout=self.timeout_s, transport=self.transport
+        ) as client:
+            yield client
 
     async def acquire(
         self,
@@ -256,9 +268,14 @@ class HTTPSupervisorClient:
             float(timeout_s) if timeout_s is not None else float(_MAX_EXEC_TIMEOUT_S)
         ) + _EXEC_HTTP_BUFFER_S
         url = f"{self.base_url}/v1/sandboxes/{sandbox_id}:exec"
-        async with httpx.AsyncClient(timeout=read_timeout, transport=self.transport) as client:
+        async with client_for(self.http, timeout=read_timeout, transport=self.transport) as client:
             try:
-                response = await client.post(url, json=payload, headers=_traced_headers())
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers=_traced_headers(),
+                    timeout=read_timeout,  # per-request — governs even when sharing a client
+                )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({url}): {exc}"
                 raise SandboxSupervisorError(msg) from exc
@@ -293,7 +310,12 @@ class HTTPSupervisorClient:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
         async with self._make_client() as client:
             try:
-                response = await client.get(url, params={"path": path}, headers=_traced_headers())
+                response = await client.get(
+                    url,
+                    params={"path": path},
+                    headers=_traced_headers(),
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
+                )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({url}): {exc}"
                 raise SandboxSupervisorError(msg) from exc
@@ -310,7 +332,11 @@ class HTTPSupervisorClient:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/files"
         async with self._make_client() as client:
             try:
-                response = await client.get(url, headers=_traced_headers())
+                response = await client.get(
+                    url,
+                    headers=_traced_headers(),
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
+                )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({url}): {exc}"
                 raise SandboxSupervisorError(msg) from exc
@@ -336,6 +362,7 @@ class HTTPSupervisorClient:
                     params={"path": path},
                     content=data,
                     headers={**_traced_headers(), "content-type": "application/octet-stream"},
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
                 )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({url}): {exc}"
@@ -351,7 +378,11 @@ class HTTPSupervisorClient:
         async with self._make_client() as client:
             try:
                 response = await client.request(
-                    "DELETE", url, params={"path": path}, headers=_traced_headers()
+                    "DELETE",
+                    url,
+                    params={"path": path},
+                    headers=_traced_headers(),
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
                 )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({url}): {exc}"
@@ -380,7 +411,10 @@ class HTTPSupervisorClient:
         async with self._make_client() as client:
             try:
                 response = await client.post(
-                    f"{self.base_url}{path}", json=json, headers=_traced_headers()
+                    f"{self.base_url}{path}",
+                    json=json,
+                    headers=_traced_headers(),
+                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
                 )
             except httpx.HTTPError as exc:
                 msg = f"sandbox supervisor unreachable ({path}): {exc}"

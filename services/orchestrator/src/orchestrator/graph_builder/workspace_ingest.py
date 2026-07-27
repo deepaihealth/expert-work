@@ -16,7 +16,11 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from expert_work.common.observability import expert_work_counter
+from expert_work.common.observability import (
+    ExpertWorkComponent,
+    expert_work_counter,
+    expert_work_span,
+)
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, Plan
 from expert_work.runtime.audit.logger import AuditLogger
@@ -90,35 +94,36 @@ def make_workspace_ingest_node(*, client: SupervisorClient) -> MemoryNode:
         tenant_id = configurable_uuid(config, "tenant_id")
         if tenant_id is None:
             return {}
-        ctx = ToolContext(
-            tenant_id=tenant_id,
-            run_id=configurable_uuid(config, "run_id"),
-            user_id=configurable_uuid(config, "user_id"),
-            cancellation_token=token,
-        )
-        reader = SandboxWorkspaceReader(client=client, ctx=ctx)
-        current = state.get("plan")
-        try:
-            candidate = await token.run_cancellable(
-                WorkspaceIngester(reader=reader).ingest_plan(current=current)
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "workspace_ingest"):
+            ctx = ToolContext(
+                tenant_id=tenant_id,
+                run_id=configurable_uuid(config, "run_id"),
+                user_id=configurable_uuid(config, "user_id"),
+                cancellation_token=token,
             )
-        except Exception:
-            logger.warning("workspace_ingest.failed", exc_info=True)
-            return {}
-        if candidate is None:
-            return {}
-        # Strict injection scan on the human-edited content before it can land
-        # in the plan the model executes against (Mini-ADR CM-A8). On a hit,
-        # discard the edit — DB stays authoritative — and keep the file for
-        # the user to review.
-        if scan_for_threats(_plan_scan_text(candidate), scope="strict"):
-            logger.warning("workspace_ingest.blocked_injection")
-            _cm_ingest_total.labels(outcome="rejected").inc()
-            return {}
-        _cm_ingest_total.labels(outcome="applied").inc()
-        await _emit_state_ingested_audit(
-            audit_logger_from_config(config), ctx, steps=len(candidate.steps)
-        )
-        return {"plan": candidate}
+            reader = SandboxWorkspaceReader(client=client, ctx=ctx)
+            current = state.get("plan")
+            try:
+                candidate = await token.run_cancellable(
+                    WorkspaceIngester(reader=reader).ingest_plan(current=current)
+                )
+            except Exception:
+                logger.warning("workspace_ingest.failed", exc_info=True)
+                return {}
+            if candidate is None:
+                return {}
+            # Strict injection scan on the human-edited content before it can land
+            # in the plan the model executes against (Mini-ADR CM-A8). On a hit,
+            # discard the edit — DB stays authoritative — and keep the file for
+            # the user to review.
+            if scan_for_threats(_plan_scan_text(candidate), scope="strict"):
+                logger.warning("workspace_ingest.blocked_injection")
+                _cm_ingest_total.labels(outcome="rejected").inc()
+                return {}
+            _cm_ingest_total.labels(outcome="applied").inc()
+            await _emit_state_ingested_audit(
+                audit_logger_from_config(config), ctx, steps=len(candidate.steps)
+            )
+            return {"plan": candidate}
 
     return workspace_ingest_node
