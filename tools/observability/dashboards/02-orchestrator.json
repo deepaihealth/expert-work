@@ -68,7 +68,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Session TTFT P95",
+      "title": "Session first-node P95",
       "datasource": {
         "type": "prometheus",
         "uid": "expert-work-prometheus"
@@ -93,7 +93,7 @@
             "type": "prometheus",
             "uid": "expert-work-prometheus"
           },
-          "expr": "expert_work:sli:session_ttft:p95_5m",
+          "expr": "expert_work:sli:session_first_node:p95_5m",
           "legendFormat": "p95"
         }
       ]

@@ -11,7 +11,7 @@
 - **命名规范**：span / metric / log 字段的统一标准
 - **强制 schema**：日志必填字段（含 redaction 中间件保证不带 PII）
 - **W3C Trace Context 传播**：跨 Control Plane → Orchestrator → Sandbox → MCP → LLM Gateway 全链路
-- **SLO/SLI 定义**：可用性、TTFT、冷启动、API 延迟
+- **SLO/SLI 定义**：可用性、首个图节点、冷启动、API 延迟
 - **错误预算策略**：耗尽 → 自动冻结新 manifest 发布 24h
 - **Dashboard 模板**：每个核心子系统一份 Grafana JSON
 - **告警分级**（P0/P1/P2）+ 路由到 PagerDuty / 飞书
@@ -68,9 +68,9 @@
 ```sql
 CREATE TABLE slo_definition (
     id            BIGSERIAL PRIMARY KEY,
-    name          TEXT NOT NULL UNIQUE,             -- 'session_ttft_p95'
+    name          TEXT NOT NULL UNIQUE,             -- 'session_first_node_p95'
     component     TEXT NOT NULL,                    -- orchestrator / sandbox / control_plane / global
-    metric        TEXT NOT NULL,                    -- 'expert_work_session_ttft_seconds'
+    metric        TEXT NOT NULL,                    -- 'expert_work_session_first_node_seconds'
     target_pct    NUMERIC(5,2) NOT NULL,            -- 99.0 表示 99% 时间满足
     threshold     NUMERIC(10,3) NOT NULL,           -- 1.5（秒）
     window_days   INT NOT NULL DEFAULT 30,
@@ -217,7 +217,7 @@ expert_work.orchestrator.session_run
 | `expert_work_sandbox_cold_start_seconds` | histogram | `()` | 启动决策到 `wait_ready` 成功的秒数 |
 | `expert_work_sandbox_pool_total` | counter | `event` | 暖池流转事件（HX-6） |
 | `expert_work_sandbox_pool_ready` | gauge | `variant` | 当前 READY 暖池容器数/镜像变体 |
-| `expert_work_session_ttft_seconds` | histogram | `()` | RUNNING 到首个 agent chunk 的秒数 |
+| `expert_work_session_first_node_seconds` | histogram | `()` | RUNNING 到首个图节点 chunk 的秒数（任意节点,非特指 agent；前名 `..._ttft_seconds`） |
 | `expert_work_session_duration_seconds` | histogram | `outcome` | RUNNING 到终态的秒数，按 run 结局 |
 | `expert_work_tool_call_total` | counter | `tool,outcome` | 工具分派计数（ok/error/blocked） |
 | `expert_work_tool_latency_seconds` | histogram | `tool` | 每次工具分派 wall-clock |
@@ -369,7 +369,7 @@ expert_work.orchestrator.session_run
 |-----|------|------|
 | 控制平面 API 可用性 | 99.9% / 30d | `1 - rate(http_5xx) / rate(http_total)` |
 | 控制平面 API P99 延迟 | < 200ms | `expert_work_control_plane_http_request_duration_seconds_bucket` |
-| Session TTFT P95 | < 1.5s | `expert_work_session_ttft_seconds` |
+| Session 首个图节点 P95（前名 TTFT） | < 1.5s | `expert_work_session_first_node_seconds` |
 | Sandbox 冷启动 P95 | < 3s (M0) / < 500ms (M1 warm pool) | `expert_work_sandbox_cold_start_seconds` |
 | Durable resume 成功率 | > 99% | `expert_work_resume_total{outcome="ok"} / total` |
 

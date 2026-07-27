@@ -94,7 +94,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Session TTFT P95 (SLI, 5m)",
+      "title": "Session first-node P95 (SLI, 5m)",
       "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
@@ -103,7 +103,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
-          "expr": "expert_work:sli:session_ttft:p95_5m",
+          "expr": "expert_work:sli:session_first_node:p95_5m",
           "legendFormat": "p95"
         }
       ]

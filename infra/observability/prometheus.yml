@@ -23,7 +23,7 @@ scrape_configs:
 
   # The control-plane exposes /metrics (A.9 — control_plane api/metrics.py).
   # The orchestrator runs in-process inside the control-plane, so its metrics
-  # (expert_work_session_ttft_seconds / _duration_seconds / expert_work_durable_resume_* /
+  # (expert_work_session_first_node_seconds / _duration_seconds / expert_work_durable_resume_* /
   # expert_work_llm_stream_stale_total) register to the same shared registry and are
   # scraped here — there is no separate orchestrator scrape target.
   - job_name: expert-work-control-plane

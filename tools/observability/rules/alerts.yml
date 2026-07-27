@@ -82,18 +82,18 @@ groups:
           description: "5m success ratio is {{ $value | humanizePercentage }} — Gate target 99.9%."
           runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
-      - alert: ExpertWorkGateTTFTOverBudget
+      - alert: ExpertWorkGateFirstNodeOverBudget
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le) (rate(expert_work_session_ttft_seconds_bucket[1h]))
+            sum by (le) (rate(expert_work_session_first_node_seconds_bucket[1h]))
           ) > 2.0
         for: 30m
         labels:
           severity: gate-watch
         annotations:
-          summary: "Session TTFT P95 above Gate budget (2.0s)"
-          description: "1h P95 TTFT is {{ $value }}s — Gate budget 2.0s."
+          summary: "First graph-node P95 above Gate budget (2.0s)"
+          description: "1h P95 time-to-first-graph-node is {{ $value }}s — Gate budget 2.0s."
           runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       - alert: ExpertWorkGateSandboxColdStartOverBudget
