@@ -110,9 +110,23 @@ logger = logging.getLogger(__name__)
 # publish synchronously beforehand isn't counted — TTFT tracks how long
 # the user waits for actual agent work to start. SLO #3 (slo.md):
 # P95 < 1.5s @ 30d.
-_session_ttft_seconds = expert_work_histogram(
-    "expert_work_session_ttft_seconds",
-    "Seconds from RUNNING to first agent update chunk.",
+# 一期 Task 3 —— 老名字叫 ttft 但测的是"第一个图节点完成",有 memory_recall
+# 的 run 测到的是召回结束,不是首字。改名说实话,真首字用下面的
+# first_output_seconds。
+_session_first_node_seconds = expert_work_histogram(
+    "expert_work_session_first_node_seconds",
+    "Seconds from RUNNING to the first graph-node update chunk.",
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
+
+#: 用户第一次看到内容的时刻。``source="token"`` 走流式首帧;``source="node"``
+#: 是无 token 流的 run(output judge 开启 / LLM cache 命中 / provider 不支持
+#: 流式)的兜底,取第一个 **agent** 节点的 updates 帧。两条路径互斥、先到先得。
+#: 不做兜底的话最慢的那批(judge-on)完全不进直方图,是幸存者偏差。
+_first_output_seconds = expert_work_histogram(
+    "expert_work_first_output_seconds",
+    "Seconds from RUNNING to the first content the user can see.",
+    ("source",),
     buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
 )
 
@@ -376,9 +390,17 @@ async def run_agent(
         )
         event_seq += 1
 
+    # 一期 Task 3 —— ``source`` 路径的赢家标记。token / node 两条路径互斥、
+    # 先到先得;声明在 ``_publish_token`` 定义之前,闭包用 ``nonlocal`` 改写。
+    first_output_recorded = False
+
     async def _publish_token(frame: Any) -> None:
+        nonlocal first_output_recorded
         # Live-only: token frames are provisional; do NOT mirror to the event
         # store (the authoritative ``updates`` frame is what replays).
+        if not first_output_recorded:
+            first_output_recorded = True
+            _first_output_seconds.labels(source="token").observe(time.monotonic() - ttft_started)
         await bridge.publish(run_id, "token", frame)
 
     # B2 worker 可观测性 — worker 事件 sink。child run(spawn_worker /
@@ -469,11 +491,21 @@ async def run_agent(
                             break
                         if not first_chunk_seen:
                             ttft = time.monotonic() - ttft_started
-                            _session_ttft_seconds.observe(ttft)
+                            _session_first_node_seconds.observe(ttft)
                             if getattr(record, "is_resume", False):
                                 _durable_resume_seconds.observe(ttft)
                             first_chunk_seen = True
                         jsonable_chunk = _to_jsonable(chunk)
+                        # 一期 Task 3 —— agent 节点的 updates 帧是无 token 流
+                        # 时用户第一次看到内容的时刻。必须挑 agent 那帧:
+                        # first_chunk_seen 认的是任意第一个节点,有 recall 的
+                        # run 那是召回完成,比真实首字早好几秒。
+                        if not first_output_recorded and isinstance(jsonable_chunk, dict):
+                            if "agent" in jsonable_chunk:
+                                first_output_recorded = True
+                                _first_output_seconds.labels(source="node").observe(
+                                    time.monotonic() - ttft_started
+                                )
                         now = time.monotonic()
                         duration_ms = round((now - last_frame_ts) * 1000)
                         last_frame_ts = now
