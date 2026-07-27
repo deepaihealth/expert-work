@@ -4,9 +4,11 @@
 
 DONE
 
-## commit
+## commit(按时间顺序，4 轮)
 
-`7c6ca67b` — `feat(admin-ui): TraceView 首字分解条 + 入口链 span 配色分组`(13 files changed, 179 insertions, 2 deletions)
+1. `7c6ca67b` — `feat(admin-ui): TraceView 首字分解条 + 入口链 span 配色分组`(13 files changed, 179 insertions, 2 deletions) —— 初版实施 / 报告：`501237ef`
+2. `43902cf4` — `fix(admin-ui): trace-entry 色令牌双主题化 + 配色/点击选中测试补全` —— 一轮复核后修复色令牌未双主题化 + 补配色分支/点击选中测试 / 报告：`97eb2434`
+3. `08a6941c` — `fix(admin-ui): dark 主题分解条文字对比度(半透明底+主题感知文字色)` —— 二轮复核后修复 dark 主题分解条文字对比度 1.99:1 的问题 / 本报告更新的提交见 git log（本文件本身的提交）
 
 ## 做了什么
 
@@ -35,7 +37,7 @@ Step 7 说 ENTRY 要"过双主题（照文件里既有色值常量的定义方�
 
 ## 因新增必填字段引发的连带修复（范围外但被迫改）
 
-`TraceSpan.group` 是必填字段（非 optional），加了之后 tsc 报了 7 个既有测试文件的 fixture 缺字段 / 类型不兼容：
+`TraceSpan.group` 是必填字段（非 optional），加了之后 tsc 报了 6 个既有测试文件的 fixture 缺字段 / 类型不兼容：
 
 - `api/__tests__/trace_facade.test.ts`（2 处字面量 span，补 `group: null`）
 - `pages/__tests__/PlaygroundTab.test.tsx`（4 处字面量 span，补 `group: null`）
@@ -90,4 +92,72 @@ dark 主题 `--ew-trace-entry: var(--ew-color-indigo-300)`（`#a5b4fc`），ligh
 
 ### 顺带确认
 
-Coordinator 指出的"7 个既有测试文件补 `group` fixture 是类型变更的必然后果、`TraceSpan.group` 设成 required 而非 optional 是对的"——认同，`_span_as_dict`（control-plane facade）无条件带这个字段,没有"可能不返回"的分支,required 能让以后哪个 mock/fixture 漏传时被 tsc 当场抓住,而不是运行时才发现 `undefined` 被当成合法值传下去。
+Coordinator 指出的"既有测试文件补 `group` fixture 是类型变更的必然后果、`TraceSpan.group` 设成 required 而非 optional 是对的"——认同，`_span_as_dict`（control-plane facade）无条件带这个字段,没有"可能不返回"的分支,required 能让以后哪个 mock/fixture 漏传时被 tsc 当场抓住,而不是运行时才发现 `undefined` 被当成合法值传下去。（口径更正：上面写的"7 个既有测试文件"数错了,实际改动的是 6 个——`trace_facade.test.ts`/`PlaygroundTab.test.tsx`/`trace_banner.test.ts`/`trace_purpose.test.ts`/`TraceView.test.tsx`/`trace_tree.test.ts`,纯文档口径错误,diff 本身没有多余改动。）
+
+---
+
+## 追加二轮：dark 主题分解条文字对比度 Important 修复（commit `08a6941c`）
+
+Coordinator 用 WCAG 相对亮度公式手算 + 仓库内已装的 `axe-core@4.11.4`（`@axe-core/playwright` 的传递依赖，和 CI 用的 `@axe-core/playwright` 同引擎）在 jsdom 里跑 `color-contrast` 复核，指出 `EntryBreakdown.tsx` 的分段按钮固定 `color: "#fff"` + 不透明 `background: var(--ew-trace-entry, ...)`，dark 主题下 `--ew-trace-entry` 取 `indigo-300`（`#a5b4fc`，一个亮色），白字对它只有 **1.99:1**，远低于 AA 对 UI 文字的 3:1。只要 dark 主题打开一个有 memory 的 run，任何占比 ≥6%（`LABEL_MIN_SHARE`）的段都会踩中——也就是「召回 2.0s / 规划 1.6s / 首调 0.6s」这种最典型的分布必然触发。
+
+### 根因 & 修法
+
+新文件没沿用同一个文件夹里 `TraceView.tsx:308-319`（`GanttBar`）早就用过的模式——瀑布图的 kind 色块本来就是**半透明背景**（`color-mix(in srgb, <色> 62%, transparent)`）+ **主题感知文字色**（`var(--ew-text-primary)`），而不是不透明底 + 写死文字色。`EntryBreakdown.tsx` 是这次新加的文件，没抄这个先例，直接用了 Step 6 计划代码字面量给的 `background: "var(--ew-trace-entry, #7c8cff)"` + `color: "#fff"`。
+
+`EntryBreakdown.tsx` 改动（唯一的生产代码改动）：
+```diff
+-                background: "var(--ew-trace-entry, #7c8cff)",
+-                color: "#fff",
++                background: ENTRY_BG,   // color-mix(in srgb, var(--ew-trace-entry, #7c8cff) 62%, transparent)
++                color: "var(--ew-text-primary)",
+```
+`62%` 这个比例不是新拍的——跟 `TraceView.tsx` 的 `kindBarColor` 给 `group === "entry"` 分支返回的 `color-mix(in srgb, ${ENTRY} 62%, transparent)`（上一轮 commit 加的）完全一致，保证分解条和瀑布图里的 entry 色块视觉上是同一个颜色。没有选"白字改黑字"这种单主题修法——那样会让 light 主题（深底）反过来坏掉；两个主题都要靠背景变半透明后跟页面基底混合，文字色再跟着主题走。
+
+### 两个主题的实测对比度数字
+
+背景合成假设：分解条按钮所在的 `TraceTree` 根 `<div>`（`EntryBreakdown` 的父级）不显式设置 `background`（只有 axis 表头行显式用了 `--ew-surface-raised`），沿这条无背景链条一路网上找到的是页面主内容面（`--ew-surface-base`）——这也是同一个文件里另外两处"静置"面板（`:561`、`:1014`）用的同一个变量，是这个文件对"默认背景"最一致的既有假设。62% 半透明的 `--ew-trace-entry` 与它做 sRGB 通道线性混合（`color-mix(in srgb, ...)` 本身就是直接按比例混通道，不走 gamma），再用 WCAG 相对亮度公式对 `--ew-text-primary` 求对比度：
+
+| 主题 | `--ew-trace-entry` | 合成后背景（62% 混 `--ew-surface-base`） | `--ew-text-primary` | 对比度 |
+|---|---|---|---|---|
+| dark | indigo-300 `#a5b4fc` | `#6f79a9` | neutral-100 `#f4f5f7` | **3.863 : 1** |
+| light | indigo-700 `#4338ca` | `#8a84de` | neutral-900 `#161921` | **5.385 : 1** |
+
+两边都清了 coordinator 定的 3:1 门槛。用仓库里 `axe-core@4.11.4` 的 `commons.color.{Color,getContrast,flattenColors}`（同一引擎，直接喂合成后的 RGBA，不经过 jsdom 的 DOM/CSS 解析——原因见下）独立复核过，数字一致；旧代码（不透明底 + 白字）用同一脚本算出 dark 1.99、light 7.90，跟 coordinator 报的数字完全对上，交叉验证了我解出的 `indigo-300`/`indigo-700` 十六进制值和 surface-base 假设是对的。
+
+**诚实的口径**：3.863:1 是 WCAG 1.4.11（非文本/UI 组件对比度）的 3:1 门槛，coordinator 两次明确把 3:1 定为验收线，达标；但严格套用 1.4.3（正文文字对比度，11px 常规字重需要 4.5:1）dark 主题这条差一点没到（`axe-core` 的 `hasValidContrastRatio(bg, fg, 11pt-ish, false)` 判定 `isValid: false, expectedContrastRatio: 4.5`）。light 主题 5.385:1 两条都过。如果要把 dark 也顶到 4.5:1，需要动 `62%` 这个混合比例或者换一档更深的 indigo——但 `62%` 是刻意跟 `kindBarColor` 的 entry 分支保持一致（不然分解条和瀑布图颜色对不上），没有在这轮改；先按 coordinator 明确给的 3:1 验收线交付，这个 4.5:1 缺口在下面的顾虑里标出来供取舍。
+
+### 为什么不直接跑 axe-core 的 DOM `color-contrast` 规则
+
+`vitest.config.ts` 设了 `css: false`（vitest 显式关闭 CSS 处理），`tokens.css` 从不会被解析进 jsdom；即便解析了,jsdom 的 CSS 引擎也不认识 `color-mix()`（探测过：`element.style.background` 会原样存住这个函数调用的字符串，但不会计算出实际像素色）。真要在 jsdom 里跑 axe-core 完整的 DOM `color-contrast` 规则，必须先把合成后的具体像素色注入进去——等于要先做我下面这条"合成计算"，DOM 规则本身反而是多余的一层。所以复核选择直接调 `axe-core` 暴露的底层 `commons.color` 算法（`getContrast`/`flattenColors`），而不是走全量 `axe.run()`。
+
+### 两个 axe 测试文件的处置
+
+`find` 遍历过整个仓库（`/Users/mac/src/github/jone_qian/expert-work`，含所有 worktree），没有找到 `axe_button_name.test.tsx` 或 `zz_axe_button_name.test.tsx` 这两个文件——它们不在我的 worktree 里，大概率是 coordinator 那边审查用的独立沙箱产物，跟我这次改动无关，**没有需要清理的东西**。
+
+我自己为验证这次改动新建了一个探测用的临时文件 `zzprobe.test.tsx`（确认 jsdom 会原样保留 `var()`/`color-mix()` 字符串），验证完已删除，未提交。
+
+按 coordinator"对比度回归值得长期守"的意见，新增了一个**永久、命名规范**的回归测试，两个方向都补了（缺一个都堵不住"过一阵子被静默改坏"）：
+
+1. **`EntryBreakdown.contrast.test.ts`**（新文件，纯计算，不渲染）—— 直接读 `theme/tokens.css` 源文件（不是抄一份写死的十六进制快照），解出两个主题下 `--ew-trace-entry`/`--ew-surface-base`/`--ew-text-primary` 实际引用的原色阶值，按 62% 混合后跑 WCAG 对比度公式，断言两个主题都 ≥3:1。用真实 tokens.css 文本而非硬编码副本的理由：硬编码副本会跟 tokens.css 本身脱钩，将来改了色阶这个测试还是绿的（正是这次事故的成因之一）。变异验证：把 `--ew-trace-entry` 临时改成 `indigo-100`（更亮）,dark 侧断言从 3.863 掉到 2.607,测试真的红了;改回后复跑绿。
+2. **`EntryBreakdown.test.tsx` 新增一条 `it`**（渲染实测）—— 断言真实渲染出的按钮 `style.color === "var(--ew-text-primary)"`（且不是 `"#fff"`）、`style.background` 里含 `color-mix`/`62%`/`transparent`/`var(--ew-trace-entry`。这条堵的是"tokens.css 没变但组件代码被人手滑改回旧样式"这个（1）测不到的洞。变异验证：把 `EntryBreakdown.tsx` 临时改回旧的 `background: "var(--ew-trace-entry, #7c8cff)"` + `color: "#fff"`，这条新测试真的红了（`AssertionError: expected 'rgb(255, 255, 255)' to be 'var(--ew-text-primary)'`）；改回后复跑绿。
+
+两条一起覆盖"token 漂移"和"组件代码手滑"两类退化路径，缺一类都会留一个静默通道。
+
+### Minor 项处置
+
+- **色相间距**：实测 dark 主题 ENTRY(indigo-300) hue≈229.7° / PURPLE(accent-400) hue≈270.0°,gap≈40.3°；light 主题 ENTRY(indigo-700) hue≈244.5° / PURPLE(accent-600) hue≈271.5°,gap≈27.0°(跟 coordinator 估的 ~26° 基本对上)。light 侧饱和度(indigo-700 57.9% vs accent-600 81.3%)和明度(50.6% vs 55.9%)都有明显差异,按 coordinator "拉不开就算了" 的口径,这轮没有为了拉开 hue gap 去换色阶(indigo-700 是 Tailwind 默认色板值,换一档就脱离了这批新增色阶"照 Tailwind 惯例走"的一致性,划不来换一个更窄的 minor 项)。
+- **"7 个既有测试文件"文档口径**：已在报告正文改成"6 个"，并列出准确文件名。
+
+### 校验命令（同步跑）
+
+1. `vitest run`（全量）—— **155 test files / 1306 tests 全绿**（比上一版多 1 个文件 3 个测试：新增的 `EntryBreakdown.contrast.test.ts` 2 条 + `EntryBreakdown.test.tsx` 追加的 1 条），无回归
+2. `tsc -b --noEmit` —— 干净，0 错误
+
+### commit
+
+`08a6941c` — `fix(admin-ui): dark 主题分解条文字对比度(半透明底+主题感知文字色)`(3 files changed, 142 insertions, 2 deletions)，父提交 `97eb2434`。
+
+### 顾虑（这一轮）
+
+1. **dark 主题 3.863:1 清 3:1 但没到 4.5:1**——上面"诚实的口径"那段已展开：coordinator 明确定的验收线是 3:1（两次强调），本轮按这条线交付；如果目标其实是完整的 WCAG 1.4.3 正文对比度（4.5:1），dark 侧还差一截，需要再动 `62%` 混合比例或换更深一档的 indigo，而这会牵动跟 `kindBarColor` entry 分支共享的同一个比例常量，我没有在这轮擅自改。
+2. **`--ew-surface-base` 是我的假设，不是从代码强制读出的**——`EntryBreakdown` 的父级容器链一路到 `TraceView` 挂载点都没有显式设置 `background`（唯一确定的锚点是它不是 `--ew-surface-raised`，因为那个只用在 axis 表头行），所以合成对比度用的"背景基底"是我按同文件里另外两处"静置面板"背景的既有用法类推出来的，不是从 DOM 树强制解析出来的。如果实际挂载上下文有其它显式背景（比如某层 Modal/Drawer 用了 `--ew-surface-overlay`），真实对比度会和这里算的不完全一样——但两个主题都留了 1.3~1.8 的余量（3.863 vs 3.0、5.385 vs 3.0），不同"静置"档位背景之间的差异不太可能吃掉这个余量。
