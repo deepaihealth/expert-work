@@ -22,8 +22,24 @@ export function buildBreakdown(spans: readonly TraceSpan[]): BreakdownSegment[] 
   const entryIds = new Set(entry.map((s) => s.id));
   const topLevel = entry.filter((s) => s.parentId === null || !entryIds.has(s.parentId));
 
+  // A span nested inside an entry-chain span (e.g. rewrite_reads' query-rewrite
+  // LLM call, emitted inside 记忆召回) has its latency already counted in that
+  // entry segment. Picking it as firstLlm would double-count it and — since it
+  // starts before the entry span even finishes — place it last despite being
+  // the earliest LLM call. Walk the parent chain to the root, not just the
+  // immediate parent, since nesting can be more than one level deep.
+  const byId = new Map(spans.map((s) => [s.id, s]));
+  const isNestedInEntry = (s: TraceSpan): boolean => {
+    let parentId = s.parentId;
+    while (parentId !== null) {
+      if (entryIds.has(parentId)) return true;
+      parentId = byId.get(parentId)?.parentId ?? null;
+    }
+    return false;
+  };
+
   const firstLlm = spans
-    .filter((s) => s.kind === "llm")
+    .filter((s) => s.kind === "llm" && !isNestedInEntry(s))
     .sort((a, b) => a.startMs - b.startMs)[0];
 
   const segments = topLevel
