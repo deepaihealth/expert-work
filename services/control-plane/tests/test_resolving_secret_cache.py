@@ -11,7 +11,8 @@ vault);aux_model_adapter / quality_judge 没有直读 ``secret_store.get``
   ``invalidate_all`` 后重新拉;cache=None(未接线)行为与现状一致;
 * rerank DashScope 分支同断言;LLM-rerank 分支不经 cache(``build_llm_router``
   路径照旧直读,cache 保持空);
-* :class:`CachingSecretStore` 命中 / version 直通 / 写直通;
+* :class:`CachingSecretStore` 命中 / version 直通 / 写透传后驱逐 /
+  repr 不泄漏 inner;vault 抛错不污染缓存(两条读路径);
 * aux adapter / quality judge 两次调用只打一次 vault;
 * 与 T2 的失效链闭环:平台 PUT → cache 清空 → 下次 ``_cached_secret`` miss
   重新打 vault。
@@ -74,6 +75,22 @@ class _CountingSecretStore:
 
     async def delete(self, name: str) -> None:
         self.deletes.append(name)
+
+
+class _RaisingSecretStore:
+    """vault 永远抛错的 fake——验证异常不污染缓存。"""
+
+    async def get(self, name: str, *, version: str | None = None) -> str:
+        raise RuntimeError("vault down")
+
+    async def put(self, name: str, value: str) -> None:
+        raise RuntimeError("vault down")
+
+    async def list_versions(self, name: str) -> list[str]:
+        raise RuntimeError("vault down")
+
+    async def delete(self, name: str) -> None:
+        raise RuntimeError("vault down")
 
 
 class _Clock:
@@ -338,6 +355,49 @@ async def test_caching_secret_store_writes_pass_through() -> None:
     assert await store.list_versions("n") == ["v1"]
 
 
+@pytest.mark.asyncio
+async def test_caching_secret_store_put_and_delete_evict_cached_value() -> None:
+    """写后驱逐:put/delete 透传后清本 tenant 缓存,读不到写前旧值。"""
+    inner = _CountingSecretStore()
+    cache = _cache(_Clock())
+    store = CachingSecretStore(inner=inner, cache=cache, tenant_id=uuid4())  # type: ignore[arg-type]
+    assert await store.get("platform/qwen") == "sk-vault"
+    inner.value = "sk-rotated"
+    await store.put("platform/qwen", "sk-rotated")
+    assert await store.get("platform/qwen") == "sk-rotated"  # 驱逐 → miss → 重读
+    assert len(inner.gets) == 2
+    await store.delete("platform/qwen")
+    assert len(cache) == 0
+
+
+def test_caching_secret_store_repr_does_not_leak_inner() -> None:
+    """dataclass 合成 repr 会递归吐 inner 的明文——repr=False 掐掉。"""
+
+    class _LeakyReprStore(_CountingSecretStore):
+        def __repr__(self) -> str:
+            return "LeakyStore({'platform/qwen': 'sk-vault'})"
+
+    store = CachingSecretStore(inner=_LeakyReprStore(), cache=_cache(_Clock()), tenant_id=uuid4())  # type: ignore[arg-type]
+    assert "sk-vault" not in repr(store)
+
+
+@pytest.mark.asyncio
+async def test_caching_secret_store_error_does_not_pollute_cache() -> None:
+    cache = _cache(_Clock())
+    store = CachingSecretStore(inner=_RaisingSecretStore(), cache=cache, tenant_id=uuid4())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="vault down"):
+        await store.get("platform/qwen")
+    assert len(cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_cached_secret_error_does_not_pollute_cache() -> None:
+    cache = _cache(_Clock())
+    with pytest.raises(RuntimeError, match="vault down"):
+        await _cached_secret(cache, _RaisingSecretStore(), uuid4(), _REF)  # type: ignore[arg-type]
+    assert len(cache) == 0
+
+
 # ─── aux adapter / quality judge(vault 读在 build_llm_router 内部)────
 
 
@@ -357,7 +417,7 @@ def _patch_store_reading_router(monkeypatch: pytest.MonkeyPatch, response: AIMes
         await secret_store.get(parse_secret_ref(spec.api_key_ref))
         return _fake_router
 
-    monkeypatch.setattr("orchestrator.build_llm_router", _fake_build, raising=False)
+    monkeypatch.setattr("orchestrator.build_llm_router", _fake_build, raising=True)
 
 
 @pytest.mark.asyncio

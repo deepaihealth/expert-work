@@ -965,6 +965,8 @@ class ResolvingReranker:
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
+        # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
+        # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec, secret_store=self.secret_store, http_client=self.http
         )
@@ -1073,6 +1075,8 @@ class DynamicResolvingReranker:
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )
+        # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
+        # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec, secret_store=self.secret_store, http_client=self.http
         )

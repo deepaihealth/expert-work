@@ -79,7 +79,10 @@ class CredentialValueCache:
         return len(self._entries)
 
 
-@dataclass(frozen=True)
+# repr=False: the synthesized dataclass repr would recurse into ``inner``
+# (e.g. a dev secret store whose repr shows its plaintext mapping) — a log
+# line or traceback rendering this object must never leak secret values.
+@dataclass(frozen=True, repr=False)
 class CachingSecretStore:
     """Tenant-scoped :class:`SecretStore` adapter over a
     :class:`CredentialValueCache` — PR2 T3.
@@ -89,8 +92,12 @@ class CachingSecretStore:
     (agent_factory.py:1956). Handing the router this wrapper — built per
     call with the caller's ``tenant_id`` — turns that read into a cache
     hit without touching the orchestrator factory. Only latest-version
-    reads are cached (a pinned ``version`` bypasses); writes / deletes
-    pass through untouched.
+    reads are cached: the cache key carries no ``version`` dimension, so
+    caching a pinned read would cross versions both ways (a pinned read
+    could serve a cached latest value, a latest read a cached pinned
+    one) — a pinned ``version`` therefore bypasses the cache entirely.
+    Writes / deletes pass through, then evict this tenant's cached
+    entries so a follow-up read never serves the pre-write value.
 
     Cache keys use the bare secret *name* ``build_llm_router`` passes
     (post-``parse_secret_ref``); the Resolving classes key on the full
@@ -114,9 +121,14 @@ class CachingSecretStore:
 
     async def put(self, name: str, value: str) -> None:
         await self.inner.put(name, value)
+        # Evict after the write so a read through this wrapper can't serve
+        # the pre-write value for up to a TTL. Tenant-wide (the cache has no
+        # per-key invalidate) — writes are rare, the sweep is cheap.
+        self.cache.invalidate_tenant(self.tenant_id)
 
     async def list_versions(self, name: str) -> list[str]:
         return await self.inner.list_versions(name)
 
     async def delete(self, name: str) -> None:
         await self.inner.delete(name)
+        self.cache.invalidate_tenant(self.tenant_id)
