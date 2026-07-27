@@ -614,22 +614,23 @@ def build_react_graph(
         # reasoning intact. Running it before the window means the coarser gates
         # re-estimate against a smaller prompt and fire less often. Prompt-view
         # only — the checkpointed history is never rewritten (CM-C4).
-        if tool_result_pruner is not None:
-            messages = tool_result_pruner.apply(messages).messages
-        # Stream CM-2 — working-memory sliding window: cheap LLM-free first
-        # gate. Trims the raw history to first turn + most-recent N turns
-        # when over threshold (on HumanMessage boundaries, so tool-call
-        # pairs stay intact), BEFORE plan/memory/advisory injection (those
-        # are this turn's guidance and must always reach the LLM) and the
-        # compressor preflight (the second, LLM-backed gate). Trims only
-        # this prompt view — the checkpointed history is never rewritten.
-        if working_window is not None:
-            trim = working_window.apply(messages)
-            messages = trim.messages
-            _cm_working_window_total.labels(
-                outcome="trimmed" if trim.dropped_turns else "noop"
-            ).inc()
-            _cm_working_window_dropped_turns.set(trim.dropped_turns)
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "context_gates"):
+            if tool_result_pruner is not None:
+                messages = tool_result_pruner.apply(messages).messages
+            # Stream CM-2 — working-memory sliding window: cheap LLM-free first
+            # gate. Trims the raw history to first turn + most-recent N turns
+            # when over threshold (on HumanMessage boundaries, so tool-call
+            # pairs stay intact), BEFORE plan/memory/advisory injection (those
+            # are this turn's guidance and must always reach the LLM) and the
+            # compressor preflight (the second, LLM-backed gate). Trims only
+            # this prompt view — the checkpointed history is never rewritten.
+            if working_window is not None:
+                trim = working_window.apply(messages)
+                messages = trim.messages
+                _cm_working_window_total.labels(
+                    outcome="trimmed" if trim.dropped_turns else "noop"
+                ).inc()
+                _cm_working_window_dropped_turns.set(trim.dropped_turns)
         # Stream J.1 — render the plan into the system context so every
         # ReAct step executes against it. No-op for plain ReAct graphs.
         plan = state.get("plan")

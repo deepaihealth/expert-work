@@ -548,104 +548,117 @@ def make_memory_recall_node(
         task = _last_human_text(list(state["messages"]))
         if not task:
             return {}
-        mode = await _resolve_memory_recall_mode(
-            tenant_id=tenant_id, tenant_config_store=tenant_config_store
-        )
-        recall_limit = max(top_k, _MEMORY_RECALL_WIDE_LIMIT)
-        try:
-            # Stream P5a (Task 7) — rewrite into a retrieval query before
-            # embedding, stripping instructions / trimming long messages so
-            # they don't pollute the vector. Best-effort inside
-            # ``_rewrite_query`` itself; disabled (or no ``rewriter`` wired)
-            # keeps ``search_text is task`` — behaviour unchanged.
-            search_text = task
-            if rewrite_query and rewriter is not None:
-                search_text = await _rewrite_query(llm_caller=rewriter, task=task, token=token)
-            vectors = await token.run_cancellable(
-                embedder.embed([search_text], tenant_id=tenant_id)
-            )
-            memories = await memory_store.retrieve(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                query_embedding=vectors[0],
-                query_text=search_text if mode == "hybrid" else None,
-                # Stream Agent-Templates (M1-5c) — scope episodic recall to this
-                # agent; shared facts (agent_name NULL) are always included.
-                agent_name=agent_name,
-                limit=recall_limit,
-            )
-            # Stream P5a (Task 8) — abstention threshold gate, placed right
-            # after retrieve() and before rerank/MMR/verify so an irrelevant
-            # recall skips their cost entirely. ``_reconcile_cosine`` already
-            # returns a similarity in [-1, 1] (not a distance) — higher is
-            # more relevant. Gated on ``abstain_threshold > 0.0`` so the
-            # default (0.0) never abstains.
-            if memories and abstain_threshold > 0.0:
-                top_sim = max(
-                    (_reconcile_cosine(vectors[0], m.embedding) for m in memories),
-                    default=0.0,
+        # 一期 Task 1 —— 整段召回是入口链上最大的一块,父 span 让瀑布图
+        # 能先看到总量再下钻。放在两处 no-op 早退之后:没有 tenant/user
+        # 或没有 task 的 run 根本没做召回,发一个 0ms 的空 span 只是噪音。
+        with expert_work_span(ExpertWorkComponent.MEMORY, "recall"):
+            with expert_work_span(ExpertWorkComponent.MEMORY, "resolve_mode"):
+                mode = await _resolve_memory_recall_mode(
+                    tenant_id=tenant_id, tenant_config_store=tenant_config_store
                 )
-                if top_sim < abstain_threshold:
-                    record_memory_abstain()
-                    # An abstained recall injects nothing — it is a retrieval
-                    # miss for observability. The normal record_memory_retrieval
-                    # call below is skipped by this early return, so bump it here
-                    # or the abstain branch silently drops off the retrieval
-                    # hit/miss dashboards.
-                    record_memory_retrieval(mode=mode, result="miss")
-                    logger.info("memory.abstain top_sim=%.3f < %.3f", top_sim, abstain_threshold)
-                    return {}
-            if reranker is not None and memories:
-                # Full reorder (top_k = pool size) — the MMR stage below
-                # makes the final cut, so diversity can still swap in
-                # candidates the relevance cut would have dropped.
-                memories = await _rerank_memories(
-                    reranker=reranker,
-                    query=task,
-                    candidates=memories,
-                    top_k=len(memories),
-                    tenant_id=tenant_id,
-                    token=token,
-                )
-            if memories:
-                memories = _mmr_memories(
-                    query_embedding=vectors[0],
-                    candidates=memories,
-                    top_k=top_k,
-                )
-            # Stream Memory-Enhance (M-3) — read-time verification on the final
-            # set (raw content, pre-redaction). Fail-open inside its own helper,
-            # so a verifier error keeps all candidates rather than emptying
-            # recall. Runs after MMR so it only judges the items that would
-            # actually be injected (one batched call over the final top_k).
-            if verify_reads and verifier is not None and memories:
-                memories = await _verify_memories(
-                    llm_caller=verifier,
-                    query=task,
-                    candidates=memories,
-                    token=token,
-                )
-        except RunCancelledError:
-            raise
-        except Exception:
-            logger.warning("memory.recall_failed — continuing without memories", exc_info=True)
-            record_memory_retrieval(mode=mode, result="miss")
-            return {}
-        record_memory_retrieval(mode=mode, result="hit" if memories else "miss")
-        if memories:
+            recall_limit = max(top_k, _MEMORY_RECALL_WIDE_LIMIT)
             try:
-                await memory_store.bump_access(
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    ids=[m.id for m in memories],
-                )
+                # Stream P5a (Task 7) — rewrite into a retrieval query before
+                # embedding, stripping instructions / trimming long messages so
+                # they don't pollute the vector. Best-effort inside
+                # ``_rewrite_query`` itself; disabled (or no ``rewriter`` wired)
+                # keeps ``search_text is task`` — behaviour unchanged.
+                search_text = task
+                if rewrite_query and rewriter is not None:
+                    search_text = await _rewrite_query(llm_caller=rewriter, task=task, token=token)
+                with expert_work_span(ExpertWorkComponent.MEMORY, "embed"):
+                    vectors = await token.run_cancellable(
+                        embedder.embed([search_text], tenant_id=tenant_id)
+                    )
+                with expert_work_span(ExpertWorkComponent.MEMORY, "retrieve"):
+                    memories = await memory_store.retrieve(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        query_embedding=vectors[0],
+                        query_text=search_text if mode == "hybrid" else None,
+                        # Stream Agent-Templates (M1-5c) — scope episodic recall to this
+                        # agent; shared facts (agent_name NULL) are always included.
+                        agent_name=agent_name,
+                        limit=recall_limit,
+                    )
+                # Stream P5a (Task 8) — abstention threshold gate, placed right
+                # after retrieve() and before rerank/MMR/verify so an irrelevant
+                # recall skips their cost entirely. ``_reconcile_cosine`` already
+                # returns a similarity in [-1, 1] (not a distance) — higher is
+                # more relevant. Gated on ``abstain_threshold > 0.0`` so the
+                # default (0.0) never abstains.
+                if memories and abstain_threshold > 0.0:
+                    top_sim = max(
+                        (_reconcile_cosine(vectors[0], m.embedding) for m in memories),
+                        default=0.0,
+                    )
+                    if top_sim < abstain_threshold:
+                        record_memory_abstain()
+                        # An abstained recall injects nothing — it is a retrieval
+                        # miss for observability. The normal record_memory_retrieval
+                        # call below is skipped by this early return, so bump it here
+                        # or the abstain branch silently drops off the retrieval
+                        # hit/miss dashboards.
+                        record_memory_retrieval(mode=mode, result="miss")
+                        logger.info(
+                            "memory.abstain top_sim=%.3f < %.3f", top_sim, abstain_threshold
+                        )
+                        return {}
+                if reranker is not None and memories:
+                    # Full reorder (top_k = pool size) — the MMR stage below
+                    # makes the final cut, so diversity can still swap in
+                    # candidates the relevance cut would have dropped.
+                    with expert_work_span(ExpertWorkComponent.MEMORY, "rerank"):
+                        memories = await _rerank_memories(
+                            reranker=reranker,
+                            query=task,
+                            candidates=memories,
+                            top_k=len(memories),
+                            tenant_id=tenant_id,
+                            token=token,
+                        )
+                if memories:
+                    memories = _mmr_memories(
+                        query_embedding=vectors[0],
+                        candidates=memories,
+                        top_k=top_k,
+                    )
+                # Stream Memory-Enhance (M-3) — read-time verification on the final
+                # set (raw content, pre-redaction). Fail-open inside its own helper,
+                # so a verifier error keeps all candidates rather than emptying
+                # recall. Runs after MMR so it only judges the items that would
+                # actually be injected (one batched call over the final top_k).
+                if verify_reads and verifier is not None and memories:
+                    memories = await _verify_memories(
+                        llm_caller=verifier,
+                        query=task,
+                        candidates=memories,
+                        token=token,
+                    )
             except RunCancelledError:
                 raise
             except Exception:
-                logger.warning("memory.bump_access_failed", exc_info=True)
-        redacted = [_redact_memory(m) for m in memories]
-        logger.info("memory.recall count=%d mode=%s", len(redacted), mode)
-        return {"recalled_memories": redacted}
+                logger.warning(
+                    "memory.recall_failed — continuing without memories", exc_info=True
+                )
+                record_memory_retrieval(mode=mode, result="miss")
+                return {}
+            record_memory_retrieval(mode=mode, result="hit" if memories else "miss")
+            if memories:
+                with expert_work_span(ExpertWorkComponent.MEMORY, "bump_access"):
+                    try:
+                        await memory_store.bump_access(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            ids=[m.id for m in memories],
+                        )
+                    except RunCancelledError:
+                        raise
+                    except Exception:
+                        logger.warning("memory.bump_access_failed", exc_info=True)
+            redacted = [_redact_memory(m) for m in memories]
+            logger.info("memory.recall count=%d mode=%s", len(redacted), mode)
+            return {"recalled_memories": redacted}
 
     return memory_recall_node
 

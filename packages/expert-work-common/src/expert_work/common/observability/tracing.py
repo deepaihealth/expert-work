@@ -96,6 +96,33 @@ LLM_SPAN_PURPOSES: dict[str, str] = {
 }
 
 
+#: SINGLE SOURCE OF TRUTH for the non-LLM traced spans the trace facade
+#: labels. Sibling of :data:`LLM_SPAN_PURPOSES`, deliberately separate: that
+#: one's values are *LLM call purposes*, and these spans wrap DB / HTTP /
+#: pure-CPU work, not LLM calls. The control-plane facade keeps a Chinese
+#: label per name (``_SPAN_LABELS``) and its tests assert parity against this
+#: set — without the single source, renaming a span here would silently make
+#: the console fall back to the raw English name (``_classify``'s default
+#: branch) with nothing failing CI.
+#:
+#: ``_llm_span_name``'s name carries "llm" only as historical baggage — it is
+#: simply ``f"expert_work.{component}.{action}"`` — so reusing it here keeps
+#: both contracts' name construction identical without adding a second
+#: single-purpose alias.
+TRACED_SPANS: frozenset[str] = frozenset(
+    {
+        _llm_span_name(ExpertWorkComponent.MEMORY, "recall"),
+        _llm_span_name(ExpertWorkComponent.MEMORY, "resolve_mode"),
+        _llm_span_name(ExpertWorkComponent.MEMORY, "embed"),
+        _llm_span_name(ExpertWorkComponent.MEMORY, "retrieve"),
+        _llm_span_name(ExpertWorkComponent.MEMORY, "rerank"),
+        _llm_span_name(ExpertWorkComponent.MEMORY, "bump_access"),
+        _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "workspace_ingest"),
+        _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "context_gates"),
+    }
+)
+
+
 _TRACER_NAME: Final[str] = "expert-work"
 
 # Mutable process-wide state populated by ``init_tracing``. The

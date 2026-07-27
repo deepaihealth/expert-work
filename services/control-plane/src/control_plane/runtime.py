@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -23,6 +24,7 @@ from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from opentelemetry import trace
 
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
@@ -813,10 +815,20 @@ class ResolvingEmbedder:
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
             return []
+        # 一期 Task 1 —— 每次 embed 都重解一次凭据(DB 读 + vault 读)。这两段
+        # 挂到调用方的 ``memory.embed`` span 上而不是各开一个子 span:它们是
+        # 同一次调用的内部构成,单列会让瀑布图多两行毫秒级噪音。二期若做
+        # 凭据缓存,这两个数字就是收益的度量。
+        t0 = time.monotonic()
         secret_ref = await self.resolver.resolve_provider(
             tenant_id=tenant_id, provider=self.provider
         )
+        t1 = time.monotonic()
         api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+        t2 = time.monotonic()
+        span = trace.get_current_span()
+        span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
+        span.set_attribute("secret_ms", round((t2 - t1) * 1000))
         delegate = OpenAICompatibleEmbedder(
             client=HTTPEmbeddingClient(api_key=api_key), model=self.model
         )
@@ -849,6 +861,10 @@ class ResolvingReranker:
     ) -> list[int]:
         if not documents:
             return []
+        # 一期 Task 1 —— 同 ResolvingEmbedder.embed:凭据解析计时挂到调用方的
+        # ``memory.rerank`` span 上。secret_store.get 只在 DashScope 分支里
+        # 调用(LLM 分支走 build_llm_router),所以两条子路径各自打点。
+        t0 = time.monotonic()
         try:
             secret_ref = await self.resolver.resolve_provider(
                 tenant_id=tenant_id, provider=self.provider
@@ -860,8 +876,12 @@ class ResolvingReranker:
                 tenant_id,
             )
             return list(range(len(documents)))[:top_k]
+        t1 = time.monotonic()
+        span = trace.get_current_span()
+        span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         if _is_dashscope_rerank_model(self.provider, self.model):
             api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+            span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key), model=self.model
             ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
