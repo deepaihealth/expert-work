@@ -70,7 +70,8 @@ from both of the above:
 - **The breakdown bar's total** — a *duration*, not a point: the
   top-level entry-chain segments plus the **complete latency** of the
   first LLM span (start to finish, i.e. including its own generation
-  time), not just its start.
+  time), not just its start. 入口链并行化(P1.3)后该 total 为段之和,
+  大于真实墙钟,对照请以本脚本输出的顶层 `total_ms` 为准。
 
 All three are legitimate, they just answer different questions, so
 they won't line up numerically even on the same run — the breakdown
@@ -173,8 +174,10 @@ verify_reads 开着时,trace facade 给「记忆校验」输出的是一个
 `startMs`,而 verify 本身就是一次 LLM 调用、且发生在主生成之前 —— 所以
 verify 开着时 `first_llm_start` 量的是 **verify 调用的开始时间**,不再
 近似"主生成开始"。verify on/off 两组对照不要直接比 `first_llm_start`;
-对照口径用端到端总时长(各 `segments` 段 + `verify_ms` 之和,或
-admin-ui breakdown bar 的 total)。
+对照口径看顶层 **`total_ms`**(整 run 墙钟,来自 trace 根节点的
+`trace.latencyMs`)+ `verify_ms` 自身。Σ segments **不可**作端到端:
+segments 里父 span(记忆召回)与子 span(向量化/检索/读配置)并列,
+直接求和双计;且入口链并行化(P1.3)后段之和 > 真实墙钟。
 
 The output YAML is written after **every** round, not just once at the end
 — a round that fails part-way through a batch (network blip, a gateway

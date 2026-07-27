@@ -156,6 +156,11 @@ class TenantConfigService:
         """Drop the cached entry. Useful for tests + admin-driven flushes."""
         self._cache.pop(tenant_id, None)
 
+    @property
+    def store(self) -> TenantConfigStore:
+        """底层 store 的只读访问 —— 给适配器委托绕缓存的直写方法用。"""
+        return self._store
+
 
 class ServiceBackedTenantConfigStore(TenantConfigStore):
     """二期 P1.2 —— 给 orchestrator 的 MemoryEnv 用的 store 适配器。
@@ -200,14 +205,14 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
     ) -> TenantConfigRecord:
         # 新租户首行:service 缓存里不可能有该 tenant 的条目(get miss
         # 不缓存、已有行时 create 直接抛),无需失效。
-        return await self._service._store.create(
+        return await self._service.store.create(
             tenant_id=tenant_id, display_name=display_name, plan=plan, actor_id=actor_id
         )
 
     async def set_status(
         self, *, tenant_id: UUID, status: str, actor_id: str
     ) -> TenantConfigRecord:
-        record = await self._service._store.set_status(
+        record = await self._service.store.set_status(
             tenant_id=tenant_id, status=status, actor_id=actor_id
         )
         # 直写底层 store 绕过了 service 缓存 —— 立刻失效,避免 TTL 窗口内
@@ -216,4 +221,4 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
         return record
 
     async def list_all(self, *, limit: int = 50, offset: int = 0) -> list[TenantConfigRecord]:
-        return await self._service._store.list_all(limit=limit, offset=offset)
+        return await self._service.store.list_all(limit=limit, offset=offset)

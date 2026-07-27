@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.runtime.checkpointer import make_checkpointer
-from orchestrator import GraphRunner, ToolRegistry, build_react_graph
+from orchestrator import GraphRunner, ToolContext, ToolRegistry, ToolResult, build_react_graph
 from orchestrator.tools.registry import ToolSpec
 
 
@@ -141,3 +141,142 @@ async def test_three_node_entry_chain_joins_before_single_agent_run() -> None:
     assert result is not None
     ai_messages = [m for m in result["messages"] if isinstance(m, AIMessage)]
     assert len(ai_messages) == 1  # 无重复 AIMessage
+
+
+@pytest.mark.asyncio
+async def test_barrier_resets_across_turns_on_same_thread() -> None:
+    """终审 M-3 回归钉①:AND-join 屏障(NamedBarrierValue)跨轮复位。
+
+    同 thread 连跑 3 轮完整 ainvoke,每轮入口链两分支都要重新汇合、agent
+    恰跑 3 次。屏障若跨轮不复位,第 2 轮起 agent 要么等不齐父分支挂死
+    (wait_for 超时兜底),要么带着上轮残留状态双触发。回归钉,非新行为。
+    """
+    order: list[str] = []
+
+    async def fake_recall(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        del state, config
+        order.append("recall")
+        return {"recalled_memories": []}
+
+    async def fake_planner(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        del state, config
+        order.append("planner")
+        return {}
+
+    async def fake_ingest(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        del state, config
+        order.append("ingest")
+        return {}
+
+    llm = _CountingLLM(order=order)
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=ToolRegistry(),
+                memory_recall_node=fake_recall,  # type: ignore[arg-type]
+                planner_node=fake_planner,  # type: ignore[arg-type]
+                workspace_ingest_node=fake_ingest,  # type: ignore[arg-type]
+            )
+        )
+        thread_id = str(uuid4())
+        for turn in range(3):
+            result = await asyncio.wait_for(
+                compiled.ainvoke(
+                    {
+                        "messages": [HumanMessage(content=f"turn-{turn}")],
+                        "step_count": 0,
+                        "max_steps": 5,
+                    },
+                    config={"configurable": {"thread_id": thread_id}},
+                ),
+                timeout=10.0,
+            )
+            assert result is not None
+
+    assert llm.calls == 3, f"3 轮应各跑 agent 一次,实跑 {llm.calls} 次(order={order})"
+    assert order.count("recall") == 3  # 每轮入口链都重跑、重新汇合
+    assert order.count("ingest") == 3
+
+
+@dataclass
+class _ToolOnceLLM:
+    """首轮发一个 tool_call,次轮不发 —— 驱动 tools→agent 回边恰好一圈。"""
+
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "echo", "args": {}, "id": "tc-1", "type": "tool_call"}],
+            )
+        return AIMessage(content="done")
+
+
+@dataclass
+class _EchoTool:
+    dispatched: int = 0
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name="echo", description="echo tool")
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        self.dispatched += 1
+        return ToolResult(content="ok")
+
+
+@pytest.mark.asyncio
+async def test_barrier_coexists_with_tools_agent_loop_edge() -> None:
+    """终审 M-3 回归钉②:AND-join 屏障与 tools→agent 回边共存。
+
+    首轮 LLM 发 tool_call,tools 跑完经回边再触发 agent —— 此时入口链
+    分支不会重跑,回边必须能单独触发 agent,而不是等一个本轮不会再满足
+    的屏障挂死(wait_for 超时兜底);次轮不发 tool_call,run 正常收尾,
+    agent 恰跑 2 次。回归钉,非新行为。
+    """
+    order: list[str] = []
+
+    async def fake_recall(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        del state, config
+        order.append("recall")
+        return {"recalled_memories": []}
+
+    async def fake_ingest(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        del state, config
+        order.append("ingest")
+        return {}
+
+    llm = _ToolOnceLLM()
+    tool = _EchoTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=registry,
+                memory_recall_node=fake_recall,  # type: ignore[arg-type]
+                workspace_ingest_node=fake_ingest,  # type: ignore[arg-type]
+                planner_node=None,
+            )
+        )
+        result = await asyncio.wait_for(
+            compiled.ainvoke(
+                {"messages": [HumanMessage(content="hi")], "step_count": 0, "max_steps": 5},
+                config={"configurable": {"thread_id": str(uuid4()), "run_id": "r-1"}},
+            ),
+            timeout=10.0,
+        )
+
+    assert llm.calls == 2, f"agent 应恰跑 2 次(tool 轮 + 收尾轮),实跑 {llm.calls} 次"
+    assert tool.dispatched == 1
+    assert order.count("recall") == 1  # 回边不重跑入口链
+    assert order.count("ingest") == 1
+    assert result is not None
