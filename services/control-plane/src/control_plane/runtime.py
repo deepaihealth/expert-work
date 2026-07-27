@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -39,6 +40,7 @@ from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
 from expert_work.common.credentials import CredentialsResolver, CredentialsResolverError
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
+from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
 from expert_work.persistence import ArtifactStore, KnowledgeStore
 from expert_work.persistence.skill import SkillStore
@@ -150,7 +152,10 @@ logger = logging.getLogger(__name__)
 # Built-agent cache key. 3-tuple for the shared (no-OAuth) build; 4-tuple
 # ``(tenant, name, version, user_id)`` when the caller has connected OAuth
 # connectors (Stream MCP-OAUTH, OA-3b). ``k[0]`` is the tenant in both shapes,
-# so ``invalidate_tenant`` works uniformly.
+# so ``invalidate_tenant`` works uniformly. The cached value carries its
+# ``expires_at`` (二期 PR2 T4): the TTL only backstops invalidation write
+# paths that were never wired (e.g. a future credential entry point missing
+# the T2 fan-out) — explicit invalidation stays the primary freshness path.
 _CacheKey = tuple[UUID, str, str] | tuple[UUID, str, str, str]
 
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
@@ -214,7 +219,15 @@ class AgentRuntime:
     #: lifespan sets it (tests / pre-swap), in which case those surfaces degrade
     #: to an empty history rather than erroring.
     durable_checkpointer: BaseCheckpointSaver[Any] | None = None
-    _cache: dict[_CacheKey, BuiltAgent] = field(default_factory=dict, repr=False)
+    #: 二期 PR2 T4 — built-agent cache bounds. At most ``cache_max_size``
+    #: entries (LRU eviction past that), each valid for ``cache_ttl_s``
+    #: seconds. ``_clock`` is the injectable monotonic time source (tests).
+    cache_max_size: int = 256
+    cache_ttl_s: float = 1800.0
+    _clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _cache: OrderedDict[_CacheKey, tuple[BuiltAgent, float]] = field(
+        default_factory=OrderedDict, repr=False
+    )
     #: Extra per-tenant cache invalidators fanned out by ``invalidate_tenant``
     #: — the sub-agent builder registers its own cache here (Stream V-D, audit
     #: #1) since it caches built agents independently of ``_cache``.
@@ -284,10 +297,31 @@ class AgentRuntime:
                 key = (tenant_id, name, version, user_id)
         cached = self._cache.get(key)
         if cached is not None:
-            return cached
+            built, expires_at = cached
+            if self._clock() < expires_at:
+                self._cache.move_to_end(key)
+                return built
+            # Expired — drop and treat as a miss. Pure abandonment: the
+            # BuiltAgent may hold live MCP connections (MCPServerPool) still
+            # in use by an in-flight run, so never close() here; dropping the
+            # reference leaves cleanup to GC, matching invalidate_* behavior.
+            # No hook fan-out: hooks broadcast config changes, and natural
+            # expiry is not one (二期 PR2 T4).
+            del self._cache[key]
+            self._publish_cache_size()
         built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
-        self._cache[key] = built
+        self._cache[key] = (built, self._clock() + self.cache_ttl_s)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.cache_max_size:
+            # LRU eviction — pure abandonment, no hook fan-out (same
+            # rationale as the expiry branch above).
+            self._cache.popitem(last=False)
+        self._publish_cache_size()
         return built
+
+    def _publish_cache_size(self) -> None:
+        """Refresh the runtime-scope built-agent cache size gauge (二期 PR2 T4)."""
+        set_built_agent_cache_entries(scope="runtime", count=len(self._cache))
 
     def register_invalidation_hook(self, hook: Callable[[UUID], None]) -> None:
         """Register an extra per-tenant cache invalidator (Stream V-D, audit #1).
@@ -327,6 +361,7 @@ class AgentRuntime:
         sub-agent builder cache) are fanned out too.
         """
         self._cache.clear()
+        self._publish_cache_size()
         for hook in self._invalidate_all_hooks:
             hook()
 
@@ -340,6 +375,7 @@ class AgentRuntime:
         """
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
+        self._publish_cache_size()
         for hook in self._invalidation_hooks:
             hook(tenant_id)
 
@@ -356,6 +392,7 @@ class AgentRuntime:
             k for k in self._cache if k[0] == tenant_id and len(k) == 4 and k[3] == user_id
         ]:
             del self._cache[key]
+        self._publish_cache_size()
         for hook in self._user_invalidation_hooks:
             hook(tenant_id, user_id)
 
