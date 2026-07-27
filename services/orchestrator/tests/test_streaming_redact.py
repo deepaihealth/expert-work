@@ -12,21 +12,6 @@ from orchestrator.graph_builder.streaming_redact import (
 from orchestrator.llm.providers._streaming import LLMDelta
 
 
-def test_no_guards_passthrough_progressive() -> None:
-    r = StreamingRedactor(dlp=False, screen=False)
-    text = "A" * 100
-    out1 = r.feed(text)
-    assert out1 == "A" * (100 - HOLD_CHARS)  # holds the trailing HOLD_CHARS
-    out2 = r.flush()
-    assert out1 + out2 == text
-
-
-def test_short_input_all_at_flush() -> None:
-    r = StreamingRedactor(dlp=False, screen=False)
-    assert r.feed("hello") == ""  # < HOLD_CHARS → nothing stable to release yet
-    assert r.flush() == "hello"
-
-
 def test_dlp_redacts_card_split_across_feeds() -> None:
     r = StreamingRedactor(dlp=True, screen=False)
     a = r.feed("your card is 4111 1111 ")
@@ -353,3 +338,24 @@ async def test_token_sink_emits_tool_name_once_per_index() -> None:
         {"step": 1, "channel": "tool_args", "tool_index": 0, "name": "search_web"},
         {"step": 1, "channel": "tool_args", "tool_index": 1, "name": "read_file"},
     ]
+
+
+def test_feed_passthrough_when_both_guards_off() -> None:
+    """P3 —— dlp/screen 双关时无 64 字符 hold:feed 立即全量返回。"""
+    r = StreamingRedactor(dlp=False, screen=False)
+    assert r.feed("short") == "short"  # < HOLD_CHARS 也立即出
+    assert r.feed("A" * 100) == "A" * 100  # 无尾部扣留
+    assert r.flush() == ""  # 无 buffered 尾巴
+
+
+def test_feed_still_holds_when_screen_on() -> None:
+    """screen 单开 —— hold 行为必须不变(撤回语义依赖它)。"""
+    r = StreamingRedactor(dlp=False, screen=True)
+    out = r.feed("A" * 100)
+    assert len(out) == 100 - HOLD_CHARS
+
+
+def test_feed_still_holds_when_dlp_on() -> None:
+    r = StreamingRedactor(dlp=True, screen=False)
+    out = r.feed("A" * 100)
+    assert len(out) == 100 - HOLD_CHARS
