@@ -63,6 +63,13 @@ class TraceSpan:
     #: LLM-call intent for the console's visual marker: "" for non-LLM spans
     #: and unwrapped generations, else "main"/"memory"/"planner"/…
     purpose: str
+    #: Which functional stage this span belongs to, for the console's colour
+    #: grouping and the pre-first-token breakdown bar. "entry" = the entry
+    #: chain (recall / ingest / context gates); None = everything else.
+    #: Deliberately NOT folded into ``purpose``: that field is locked to
+    #: ``LLM_SPAN_PURPOSES`` by a parity test and means "LLM call intent",
+    #: so a non-LLM span carrying purpose="recall" would mislead.
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +94,7 @@ class _ParsedObs:
     level: str
     status_message: str | None
     purpose: str
+    group: str | None
 
 
 def normalize_trace(trace: object) -> dict[str, object]:
@@ -159,6 +167,7 @@ def normalize_trace(trace: object) -> dict[str, object]:
             level=parsed.level,
             status_message=parsed.status_message,
             purpose=purpose_override.get(parsed.id, parsed.purpose),
+            group=parsed.group,
         )
         for parsed in parsed_by_id.values()
         if parsed.id not in omitted
@@ -284,7 +293,7 @@ def _parse_observation(o: Any, *, trace_start: Any) -> _ParsedObs:
     else:
         start_ms = round((o.start_time - trace_start).total_seconds() * 1000)
     latency_ms = round((o.latency or 0) * 1000)
-    kind, label = _classify(obs_type, name)
+    kind, label, group = _classify(obs_type, name)
     detail = _tool_detail(o) if kind == "tool" else None
     return _ParsedObs(
         id=obs_id,
@@ -305,6 +314,7 @@ def _parse_observation(o: Any, *, trace_start: Any) -> _ParsedObs:
         level=_level(o),
         status_message=_clean_str(getattr(o, "status_message", None)),
         purpose="",
+        group=group,
     )
 
 
@@ -328,6 +338,22 @@ _LLM_LABELS: dict[str, str] = {
     "expert_work.orchestrator.judge_action": "行动评审",
     "expert_work.orchestrator.vision": "视觉理解",
     "expert_work.orchestrator.rerank": "文档重排",
+}
+
+
+#: Human labels for the non-LLM entry-chain spans. Sibling of
+#: :data:`_LLM_LABELS`; keys kept in parity with common's ``TRACED_SPANS`` by
+#: the facade tests, so a span renamed in the orchestrator without a label
+#: here fails CI rather than silently rendering its raw English name.
+_SPAN_LABELS: dict[str, str] = {
+    "expert_work.memory.recall": "记忆召回",
+    "expert_work.memory.resolve_mode": "读取召回配置",
+    "expert_work.memory.embed": "向量化",
+    "expert_work.memory.retrieve": "向量检索",
+    "expert_work.memory.rerank": "记忆重排",
+    "expert_work.memory.bump_access": "回写访问计数",
+    "expert_work.orchestrator.workspace_ingest": "工作区摄取",
+    "expert_work.orchestrator.context_gates": "上下文门",
 }
 
 
@@ -398,15 +424,18 @@ def _resolve_omissions(
     return omitted, latency_override, label_override, purpose_override
 
 
-def _classify(obs_type: str, name: str) -> tuple[str, str]:
-    """Map an observation's raw ``type``/``name`` to a human kind + label."""
+def _classify(obs_type: str, name: str) -> tuple[str, str, str | None]:
+    """Map an observation's raw ``type``/``name`` to (kind, label, group)."""
     if obs_type == "GENERATION":
-        return "llm", "LLM 调用"
+        return "llm", "LLM 调用", None
     if ".tool_call" in name:
-        return "tool", "工具调用"
+        return "tool", "工具调用", None
     if ".session.run" in name:
-        return "session", "会话运行"
-    return "span", _clean_label(name)
+        return "session", "会话运行", None
+    entry_label = _SPAN_LABELS.get(name)
+    if entry_label is not None:
+        return "span", entry_label, "entry"
+    return "span", _clean_label(name), None
 
 
 def _clean_label(name: str) -> str:
@@ -563,4 +592,5 @@ def _span_as_dict(span: TraceSpan) -> dict[str, object]:
         "level": span.level,
         "statusMessage": span.status_message,
         "purpose": span.purpose,
+        "group": span.group,
     }
