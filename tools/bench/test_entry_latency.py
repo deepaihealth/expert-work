@@ -7,13 +7,17 @@ import httpx
 import yaml
 from entry_latency import (
     FIRST_LLM_START_KEY,
+    VERIFY_MS_KEY,
     _exit_status,
     _prompt_fingerprint,
     _write_result,
     aggregate,
     extract_run_metrics,
     run_rounds,
+    seed_memories,
 )
+
+from expert_work.protocol import AgentSpec
 
 
 def test_aggregate_reports_median_and_p95_per_segment() -> None:
@@ -188,6 +192,81 @@ def test_exit_status_full_success_is_clean() -> None:
     code, warning = _exit_status(successful_runs=10, total_runs=10)
     assert code == 0
     assert warning is None
+
+
+async def test_seed_round_runs_one_priming_conversation() -> None:
+    """--seed-prompt-file 只跑一轮独立 session 的种子对话(让 writeback 落
+    库),校验 run 终态 success,不拉 trace、不计入 bench 数据。"""
+    seen = {"sessions": 0, "runs": 0, "trace_gets": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            seen["sessions"] += 1
+            return httpx.Response(200, json={"data": {"thread_id": f"t-{seen['sessions']}"}})
+        if request.method == "POST" and request.url.path.endswith("/runs"):
+            seen["runs"] += 1
+            return _mock_run_response("33333333-3333-3333-3333-333333333333")
+        if (
+            request.method == "GET"
+            and "/runs/" in request.url.path
+            and not request.url.path.endswith("/trace")
+        ):
+            return httpx.Response(200, json={"data": {"status": "success"}})
+        if request.url.path.endswith("/trace"):
+            seen["trace_gets"] += 1
+            return httpx.Response(200, json={"status": "ok", "spans": []})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        await seed_memories(
+            client, agent_name="bench-entry", agent_version="2.0.0", prompt="记住这些"
+        )
+
+    assert seen["sessions"] == 1
+    assert seen["runs"] == 1
+    assert seen["trace_gets"] == 0  # 种子轮永不拉 trace
+
+
+def test_extract_run_metrics_captures_verify_llm_span_by_label() -> None:
+    """verify_reads 开着时 facade 输出 label=「记忆校验」的 llm span
+    (group=None,不在 entry 组)——按 label 抓成独立指标,不混进 segments。"""
+    trace = {
+        "status": "ok",
+        "spans": [
+            {"label": "记忆召回", "group": "entry", "latencyMs": 120, "kind": "span"},
+            {"label": "记忆校验", "group": None, "latencyMs": 350, "kind": "llm", "startMs": 400},
+            {"label": "LLM 调用", "group": None, "latencyMs": 900, "kind": "llm", "startMs": 800},
+        ],
+    }
+    metrics = extract_run_metrics(trace)
+    assert metrics[VERIFY_MS_KEY] == 350.0
+    assert "记忆校验" not in metrics  # 不以 label 名混进 segments
+
+
+def test_write_result_emits_verify_section_when_present(tmp_path: Path) -> None:
+    out_path = tmp_path / "baseline.yaml"
+    per_run = [{"记忆召回": 100.0, VERIFY_MS_KEY: 300.0}, {"记忆召回": 120.0, VERIFY_MS_KEY: 340.0}]
+    _write_result(out_path, per_run, {"agent": "x@1", "runs": 2}, failed_runs=0)
+    written = yaml.safe_load(out_path.read_text(encoding="utf-8"))
+    assert written["verify_ms"]["median"] == 320.0
+    assert "__verify_ms__" not in written["segments"]
+
+
+def test_bench_entry_manifest_parses_against_protocol_schema() -> None:
+    """入仓的 bench manifest 的解析守卫 —— schema 漂移导致注册要 422 时,
+    这个测试先红,而不是等到真栈跑基线时才发现(照 test_canonical_manifest.py
+    给 canonical-agent 上的同款守卫)。顺带钉住 8 段全亮依赖的两个开关。"""
+    manifest_path = Path(__file__).parent / "manifests" / "bench-entry.yaml"
+    spec = AgentSpec.model_validate(yaml.safe_load(manifest_path.read_text(encoding="utf-8")))
+    assert spec.metadata.name == "bench-entry"
+    assert spec.metadata.version == "2.0.0"
+    assert spec.spec.memory is not None
+    assert spec.spec.memory.long_term is not None
+    assert spec.spec.memory.long_term.write_back is True
+    assert spec.spec.memory.long_term.verify_reads is True
+    assert spec.spec.sandbox.filesystem.persistent_workspace is True
 
 
 def test_prompt_fingerprint_changes_with_content() -> None:

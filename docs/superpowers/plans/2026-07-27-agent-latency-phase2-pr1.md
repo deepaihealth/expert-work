@@ -38,7 +38,7 @@
 - verify 的 span 在 trace facade 输出中是 `kind == "llm"`、`label == "记忆校验"`、`group == None`(facade `_LLM_LABELS` 定死),**不在** `group == "entry"` 里——按 label 抓,照 `FIRST_LLM_START_KEY` 的「内部键 + 写出时 pop 成顶层节」范式。
 - `tools/bench/prompts/fixed.txt` **不改**(问「新加入团队的后端工程师第一周该了解哪些系统组件和开发流程」)——seed 记忆的内容要与它语义重叠,召回才非空。
 
-- [ ] **Step 1: 写失败测试(verify 指标抓取)**
+- [x] **Step 1: 写失败测试(verify 指标抓取)**
 
 在 `tools/bench/test_entry_latency.py` 追加:
 
@@ -70,12 +70,12 @@ def test_write_result_emits_verify_section_when_present(tmp_path: Path) -> None:
 
 import 行加 `VERIFY_MS_KEY`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `uv run pytest tools/bench/test_entry_latency.py -x -q`
 Expected: FAIL — `ImportError: cannot import name 'VERIFY_MS_KEY'`
 
-- [ ] **Step 3: 实现 verify 指标**
+- [x] **Step 3: 实现 verify 指标**
 
 `tools/bench/entry_latency.py`:
 
@@ -115,12 +115,12 @@ _VERIFY_SPAN_LABEL = "记忆校验"  # trace_facade.py _LLM_LABELS 的固定中�
         result["verify_ms"] = {"median": verify_ms.median, "p95": verify_ms.p95, "n": verify_ms.n}
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tools/bench/test_entry_latency.py -x -q`
 Expected: PASS(全部,含既有)
 
-- [ ] **Step 5: 写失败测试(seed 轮)**
+- [x] **Step 5: 写失败测试(seed 轮)**
 
 追加:
 
@@ -156,12 +156,12 @@ async def test_seed_round_runs_one_priming_conversation() -> None:
 
 import 行加 `seed_memories`。
 
-- [ ] **Step 6: 跑测试确认失败**
+- [x] **Step 6: 跑测试确认失败**
 
 Run: `uv run pytest tools/bench/test_entry_latency.py::test_seed_round_runs_one_priming_conversation -x -q`
 Expected: FAIL — ImportError
 
-- [ ] **Step 7: 实现 seed**
+- [x] **Step 7: 实现 seed**
 
 `entry_latency.py` 在 `run_rounds` 前加:
 
@@ -205,12 +205,12 @@ async def seed_memories(
     )
 ```
 
-- [ ] **Step 8: 跑测试确认通过**
+- [x] **Step 8: 跑测试确认通过**
 
 Run: `uv run pytest tools/bench/test_entry_latency.py -x -q`
 Expected: PASS
 
-- [ ] **Step 9: manifest + seed prompt 入仓**
+- [x] **Step 9: manifest + seed prompt 入仓**
 
 `tools/bench/prompts/seed.txt`(内容与 fixed.txt 的问题语义重叠,召回才命中):
 
@@ -244,11 +244,11 @@ spec:
 
 （字段名以 canonical-agent + `packages/expert-work-protocol/.../agent_spec.py` 为准——`verify_reads` 在 `MemorySpec.long_term` 下、`persistent_workspace` 在 `FilesystemSpec` 下已核实;其余照 protocol 校验通过为准,manifest 注册时 422 即字段错。）
 
-- [ ] **Step 10: README 更新**
+- [x] **Step 10: README 更新**
 
 `tools/bench/README.md` 加一节「二期:8 段全亮的跑法」:注册 manifest(`POST /v1/agents`,body `{"manifest": <yaml text>}`,若 422 试 `{"manifest_yaml": ...}` ——仓内两处写法不一致,以实测为准并把结论写进 README)→ `--seed-prompt-file tools/bench/prompts/seed.txt` → 正常 bench。说明:`verify_ms` 顶层节的含义、seed 轮不计入数据、verify 开着时 `first_llm_start` 是 verify 的开始时间(对照口径用端到端总时长)。
 
-- [ ] **Step 11: 全量检查 + commit**
+- [x] **Step 11: 全量检查 + commit**
 
 ```bash
 uv run ruff check tools/bench && uv run ruff format --check tools/bench

@@ -1,0 +1,1 @@
+请记住我们团队的这些事实,后面会用到:后端主要组件是 control-plane(FastAPI,负责 API 与租户管理)、orchestrator(LangGraph,负责 Agent 运行)、PostgreSQL 17(主库)和 Keycloak(登录);开发流程是主干开发,每个改动走 PR 评审,CI 全绿才允许合并,发布用蓝绿部署。新人第一周需要先读 getting-started 文档并在本地把 docker compose 栈跑起来。
