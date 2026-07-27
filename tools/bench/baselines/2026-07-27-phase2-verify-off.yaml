@@ -1,0 +1,52 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 0.0
+    n: 10
+  向量化:
+    median: 203.0
+    p95: 272.0
+    n: 10
+  向量检索:
+    median: 27.5
+    p95: 32.0
+    n: 10
+  回写访问计数:
+    median: 29.0
+    p95: 39.0
+    n: 10
+  工作区摄取:
+    median: 131.5
+    p95: 162.0
+    n: 10
+  记忆召回:
+    median: 453.0
+    p95: 527.0
+    n: 10
+  记忆重排:
+    median: 215.5
+    p95: 247.0
+    n: 10
+  读取召回配置:
+    median: 0.0
+    p95: 0.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@2.0.1
+  runs: 10
+  prompt_file: /tmp/bench2/prompts/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: 'verify-off control @perf-phase2-pr1 a8d46bee; identical to phase2-after except
+    verify_reads=false (agent 2.0.1); same seeded memory pool (slightly larger by
+    now — write_back accretes; embed/retrieve insensitive at wide-limit 20); P1.4
+    decision data: compare total_ms + first_llm_start vs phase2-after'
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 707.0
+  p95: 860.0
+total_ms:
+  median: 4138.0
+  p95: 6453.0

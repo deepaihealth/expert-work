@@ -26,15 +26,16 @@ spec:
     isolation_level: dedicated_sandbox
 
   model:
-    provider: anthropic
-    name: claude-sonnet-4-5
-    # No api_key_ref — the agent build resolves the anthropic key from the
-    # platform-configured credential, same as canonical-agent.
+    # deepseek-chat — the provider the local dev stack has a live platform
+    # credential for (same as bench-entry@1.0.0 / the 一期 baselines), so
+    # before/after stay on one provider. No api_key_ref — resolved from the
+    # platform credential. No fallback: a mid-benchmark provider switch would
+    # silently change what the numbers measure.
+    provider: deepseek
+    name: deepseek-chat
     temperature: 0.2
-    max_tokens: 4096
-    fallback:
-      - provider: anthropic
-        name: claude-haiku-4-5-20251001
+    max_tokens: 2048
+    rate_limit_rpm: 60
 
   system_prompt:
     template: "你是团队知识助手,回答成员关于系统与流程的问题。"

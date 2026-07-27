@@ -1,0 +1,56 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 125.0
+    n: 10
+  向量化:
+    median: 205.0
+    p95: 297.0
+    n: 10
+  向量检索:
+    median: 25.0
+    p95: 437.0
+    n: 10
+  回写访问计数:
+    median: 27.0
+    p95: 40.0
+    n: 10
+  工作区摄取:
+    median: 130.0
+    p95: 142.0
+    n: 10
+  记忆召回:
+    median: 1143.5
+    p95: 1665.0
+    n: 10
+  记忆重排:
+    median: 218.5
+    p95: 260.0
+    n: 10
+  读取召回配置:
+    median: 0.0
+    p95: 1.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@2.0.0
+  runs: 10
+  prompt_file: /tmp/bench2/prompts/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: after phase2 PR1 @perf-phase2-pr1 a8d46bee (P1.1 bump fire-and-forget + P1.2
+    config cache + P1.3 parallel branches + P3 passthrough); same container/agent/prompt/seeded-memory
+    pool as before run; verify_reads=on; first round after a container restart is
+    cold — p95 skewed, compare medians
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 664.5
+  p95: 1636.0
+verify_ms:
+  median: 692.0
+  p95: 923.0
+  n: 10
+total_ms:
+  median: 5312.0
+  p95: 11210.0
