@@ -3,10 +3,10 @@
 # Pre-aggregates the SLIs for the SLOs defined in docs/runbooks/slo.md.
 # Loaded by Prometheus from /etc/prometheus/rules/ (G.0 mount).
 #
-# Only the two SLIs whose metric is emitted in M0 are recorded here;
-# TTFT / sandbox-cold-start / durable-resume rules land when their
-# metrics are emitted (slo.md SLO #3-#5). Error-budget burn-rate rules
-# (multi-window) live in burn_rate.yml (Stream 10.5).
+# Session first-node (formerly named TTFT — see the rename note at line 37),
+# sandbox-cold-start, and durable-resume SLIs are all recorded below
+# (slo.md SLO #3-#5). Error-budget burn-rate rules (multi-window) live in
+# burn_rate.yml (Stream 10.5).
 
 groups:
   - name: expert_work_sli

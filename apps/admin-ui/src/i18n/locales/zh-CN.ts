@@ -1460,7 +1460,7 @@ const zhCN: TranslationKeys = {
       "设置 VITE_LANGFUSE_BASE_URL 即可开启外链跳转。",
   },
   trace: {
-    breakdown_title: "首字 {{d}}",
+    breakdown_title: "入口链 + 首次生成 {{d}}",
   },
   approval_badge: {
     aria_label: "待审批",

@@ -235,7 +235,7 @@ http: httpx.AsyncClient | None = None   # 有则复用，无则退回 per-call �
 |---|---|---|
 | Task 1+2 合完 | 跑 bench 第一次 | `baselines/<date>-before.yaml` |
 | Task 4 合完 | 跑 bench 第二次 | PR 描述里 before/after 对照表 |
-| Task 5 合完 | 手动看 TraceView | 分解条数字跟 bench 对得上 |
+| Task 5 合完 | 手动看 TraceView | 分解条各段与 bench 各段一致;两者的"总数"是不同口径(分解条含首次生成完整时长,bench 的 first_llm_start 是首个 LLM 开始时刻),不要求相等 |
 
 ### 6.3 成功判据
 

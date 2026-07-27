@@ -38,7 +38,7 @@
 | SLO | M0 Gate 阈值 | 数据源 |
 |-----|------------|-------|
 | **可用性**（control-plane 5xx 错误率）| < 0.1% in 30d | A.9 Prometheus + G.2 告警 |
-| **TTFT P95**（首字节延迟）| < 2.0s | K10 `expert_work_session_ttft_seconds` |
+| **TTFT P95**（首字节延迟）| < 2.0s | K10 `expert_work_session_first_node_seconds`（2026-07-27 改名,语义=首个图节点完成,原名 `..._ttft_seconds` 误导） |
 | **End-to-end P95**（run 完成）| < 30s for 95% of canonical agent runs | E.14 SSE 端到端 + run_manager 状态 |
 | **SSE 流断裂率**（mid-stream 中断后未恢复）| < 0.05% in 30d | L3 `expert_work_llm_stream_stale_total` + stream_bridge 重连数据 |
 | **Sandbox 冷启动 P95** | < 5s（M0 范围）| K10 `expert_work_sandbox_cold_start_seconds` |
