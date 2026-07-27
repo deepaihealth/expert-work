@@ -29,7 +29,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Orchestrator \u2014 session / LLM / tool metrics. TTFT and durable-resume are emitted by the SSE worker; recording rules in `tools/observability/rules/sli.yml` back SLOs #3 / #5."
+        "content": "Orchestrator \u2014 session / LLM / tool metrics. Session first-node (first graph-node chunk, any node \u2014 not TTFT) and durable-resume are emitted by the SSE worker; recording rules in `tools/observability/rules/sli.yml` back SLOs #3 / #5."
       }
     },
     {

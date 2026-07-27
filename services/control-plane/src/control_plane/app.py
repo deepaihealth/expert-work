@@ -1105,13 +1105,17 @@ def create_app(
                 # workload's real inter-call gaps (an agent's LLM calls are
                 # separated by tool execution: a 30s bash run is routine, and
                 # the first live probe showed bench rounds ~20-40s apart paid
-                # a fresh handshake every time). 60s matches typical vendor
-                # LB idle timeouts; a server that closes earlier is detected
-                # by httpcore's staleness check on reuse, not by the caller.
+                # a fresh handshake every time). 55s, not 60s: 60 lands
+                # exactly on AWS ALB's default idle timeout, so a
+                # server-side and client-side expiry at the same value would
+                # race every time — 55 keeps us strictly under it (client
+                # closing first is the convention; a server that closes
+                # earlier still gets caught by httpcore's staleness check on
+                # reuse).
                 limits=httpx.Limits(
                     max_keepalive_connections=64,
                     max_connections=None,
-                    keepalive_expiry=60.0,
+                    keepalive_expiry=55.0,
                 ),
             )
             # The shared client's persistent cookie jar is a NEW cross-tenant

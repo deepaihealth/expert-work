@@ -27,7 +27,9 @@ meta:
   prompt_file: /tmp/fixed.txt
   prompt_sha256: 06b9296128f9
   note: after connection-pool @fb123c5f(含 keepalive_expiry=60s); in-container(control-plane-blue)
-    local dev compose; 与 before 同 agent 同 prompt 同环境
+    local dev compose; 与 before 同 agent 同 prompt 同环境; p95 不可比——本轮容器刚重启且无预热探针(before
+    轮有),p95 全被第 1 轮冷启动拉飞,对照统计量应看 median; 基线只覆盖 8 个入口链段中的 5 个——固定 prompt
+    零召回结果(rerank/bump_access 不触发)、无持久工作区(workspace_ingest 不存在)
   successful_runs: 10
   failed_runs: 0
 first_llm_start:

@@ -4372,7 +4372,7 @@ const en: TranslationKeys = {
       "Set VITE_LANGFUSE_BASE_URL to enable the deep link.",
   },
   trace: {
-    breakdown_title: "First output {{d}}",
+    breakdown_title: "Entry chain + first generation {{d}}",
   },
   approval_badge: {
     aria_label: "Pending approvals",

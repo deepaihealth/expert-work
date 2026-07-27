@@ -210,7 +210,7 @@ expert_work.orchestrator.session_run
 | `expert_work_llm_auth_refresh_total` | counter | `provider_key,result` | OAuth provider 401 触发的凭证刷新（L.L8） |
 | `expert_work_llm_tool_disclosure_fallback_total` | counter | `provider` | 厂商原生工具披露档被拒、回落 HX-12 档 |
 
-**`expert_work_sandbox_*` / `expert_work_session_*` / `expert_work_tool*`（10）**
+**`expert_work_sandbox_*` / `expert_work_session_*` / `expert_work_tool*`（11）**
 
 | metric | type | labels | 用途 |
 |---|---|---|---|
@@ -218,6 +218,7 @@ expert_work.orchestrator.session_run
 | `expert_work_sandbox_pool_total` | counter | `event` | 暖池流转事件（HX-6） |
 | `expert_work_sandbox_pool_ready` | gauge | `variant` | 当前 READY 暖池容器数/镜像变体 |
 | `expert_work_session_first_node_seconds` | histogram | `()` | RUNNING 到首个图节点 chunk 的秒数（任意节点,非特指 agent；前名 `..._ttft_seconds`） |
+| `expert_work_first_output_seconds` | histogram | `source` | 用户首次看到内容的秒数，按来源分（`token`=流式首帧 / `node`=无流式 run 的 agent updates 帧兜底） |
 | `expert_work_session_duration_seconds` | histogram | `outcome` | RUNNING 到终态的秒数，按 run 结局 |
 | `expert_work_tool_call_total` | counter | `tool,outcome` | 工具分派计数（ok/error/blocked） |
 | `expert_work_tool_latency_seconds` | histogram | `tool` | 每次工具分派 wall-clock |

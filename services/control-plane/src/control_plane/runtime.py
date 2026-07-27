@@ -1028,7 +1028,6 @@ async def resolve_embedder(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
-    http: httpx.AsyncClient | None = None,
 ) -> Embedder | None:
     """Build the per-tenant credential-resolving embedder for long-term
     memory (Stream J.3 + Mini-ADR O-9).
@@ -1039,16 +1038,11 @@ async def resolve_embedder(
     ``memory.long_term`` fails at build time (the build-time gate is
     preserved). Per-tenant failures (tenant mode, missing key) surface at
     ``embed`` time instead (Mini-ADR O-11).
-
-    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
-    to the built :class:`ResolvingEmbedder`. ``None`` (this factory's only
-    caller today is tests — the production wire is ``DynamicResolvingEmbedder``,
-    built directly in ``app.py``) keeps the field an opt-in, not a dead one.
     """
     if provider not in supported_providers:
         return None
     return ResolvingEmbedder(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model
     )
 
 
@@ -1059,18 +1053,14 @@ async def resolve_reranker(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
-    http: httpx.AsyncClient | None = None,
 ) -> Reranker | None:
     """Build the per-tenant credential-resolving reranker (Stream J.5 +
     Mini-ADR O-9). ``provider`` not in ``supported_providers`` → ``None``
-    (no rerank pass; hybrid search returns the RRF-fused order).
-
-    ``http`` (一期 Task 5) is the process-level shared HTTP client, forwarded
-    to the built :class:`ResolvingReranker`."""
+    (no rerank pass; hybrid search returns the RRF-fused order)."""
     if provider not in supported_providers:
         return None
     return ResolvingReranker(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model, http=http
+        resolver=resolver, secret_store=secret_store, provider=provider, model=model
     )
 
 
