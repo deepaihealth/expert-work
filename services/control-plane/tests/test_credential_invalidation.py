@@ -237,7 +237,8 @@ async def test_put_without_runtime_or_cache_still_succeeds(
     app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
     admin = await _seed_admin(app)
     del app.state.agent_runtime  # 模拟不装 runtime 的测试 app
-    assert not hasattr(app.state, "credential_value_cache")  # T3 落地前的现状
+    # T3 起 cache 挂在 lifespan 里——不跑 lifespan 的测试 app 天然没有它。
+    assert not hasattr(app.state, "credential_value_cache")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
         resp = await client.put(

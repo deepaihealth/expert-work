@@ -16,7 +16,11 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from expert_work.runtime.secret_store import SecretStore
 
 CacheKey = tuple[UUID, str]
 
@@ -73,3 +77,46 @@ class CredentialValueCache:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+@dataclass(frozen=True)
+class CachingSecretStore:
+    """Tenant-scoped :class:`SecretStore` adapter over a
+    :class:`CredentialValueCache` — PR2 T3.
+
+    aux_model_adapter / quality_judge have no direct ``secret_store.get``;
+    their vault read happens inside ``build_llm_router``
+    (agent_factory.py:1956). Handing the router this wrapper — built per
+    call with the caller's ``tenant_id`` — turns that read into a cache
+    hit without touching the orchestrator factory. Only latest-version
+    reads are cached (a pinned ``version`` bypasses); writes / deletes
+    pass through untouched.
+
+    Cache keys use the bare secret *name* ``build_llm_router`` passes
+    (post-``parse_secret_ref``); the Resolving classes key on the full
+    ``secret://`` ref. Same values, disjoint keys — both are swept by the
+    tenant/all invalidation T2 wired in.
+    """
+
+    inner: SecretStore
+    cache: CredentialValueCache
+    tenant_id: UUID
+
+    async def get(self, name: str, *, version: str | None = None) -> str:
+        if version is not None:
+            return await self.inner.get(name, version=version)
+        hit = self.cache.get(self.tenant_id, name)
+        if hit is not None:
+            return hit
+        value = await self.inner.get(name)
+        self.cache.put(self.tenant_id, name, value)
+        return value
+
+    async def put(self, name: str, value: str) -> None:
+        await self.inner.put(name, value)
+
+    async def list_versions(self, name: str) -> list[str]:
+        return await self.inner.list_versions(name)
+
+    async def delete(self, name: str) -> None:
+        await self.inner.delete(name)
