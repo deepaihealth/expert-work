@@ -81,6 +81,7 @@ class McpOAuthRefresher:
         clock: Clock = _utc_now,
         skew_s: float = _DEFAULT_SKEW_S,
         refresh_lock: OAuthRefreshLock | None = None,
+        invalidate_user: Callable[[UUID, str], None] | None = None,
     ) -> None:
         self._oauth_store = oauth_store
         self._catalog_store = catalog_store
@@ -91,6 +92,11 @@ class McpOAuthRefresher:
         # Cross-replica lock (OA-6 hardening). None = single-replica / tests:
         # the pool's in-process asyncio.Lock is the only serialisation.
         self._refresh_lock = refresh_lock
+        # 二期 PR2 T2 — a refresh overwrites the token secrets IN PLACE (same
+        # refs), so any cached per-user built agent still holds the old token
+        # baked in; after a successful refresh this evicts those builds
+        # (``AgentRuntime.invalidate_user``). None = tests / no runtime wired.
+        self._invalidate_user = invalidate_user
 
     async def ensure_fresh(
         self, record: McpOAuthConnectionRecord
@@ -188,6 +194,10 @@ class McpOAuthRefresher:
             await self._secret_store.put(
                 parse_secret_ref(record.refresh_token_ref), tokens.refresh_token
             )
+        # 二期 PR2 T2 — the token refs were just overwritten in place; evict the
+        # user's cached built agents so the next build resolves the new token.
+        if self._invalidate_user is not None:
+            self._invalidate_user(record.tenant_id, record.user_id)
         ttl = tokens.expires_in if tokens.expires_in else _REFRESH_FALLBACK_TTL_S
         now = self._clock()
         updated = await self._oauth_store.update(

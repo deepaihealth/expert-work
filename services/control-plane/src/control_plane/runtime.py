@@ -223,6 +223,13 @@ class AgentRuntime:
     #: out by ``invalidate_all`` when a process-global pool (the platform shared
     #: catalog) changes, which affects every tenant's build.
     _invalidate_all_hooks: list[Callable[[], None]] = field(default_factory=list, repr=False)
+    #: 二期 PR2 T2 — per-(tenant, user) invalidators fanned out by
+    #: ``invalidate_user`` (the sub-agent builder registers its per-user
+    #: eviction here) so an OAuth token refresh / disconnect clears BOTH the
+    #: top-level and the delegated per-user builds.
+    _user_invalidation_hooks: list[Callable[[UUID, str], None]] = field(
+        default_factory=list, repr=False
+    )
 
     async def new_worker_spawn_budget(self) -> Any:
         """A fresh per-run :class:`WorkerSpawnBudget`, or ``None`` when dynamic
@@ -301,6 +308,16 @@ class AgentRuntime:
         """
         self._invalidate_all_hooks.append(hook)
 
+    def register_user_invalidation_hook(self, hook: Callable[[UUID, str], None]) -> None:
+        """Register an extra per-(tenant, user) cache invalidator (二期 PR2 T2).
+
+        The sub-agent builder caches per-user (OAuth) child builds
+        independently of ``_cache``; registering its invalidator here keeps
+        the delegation path coherent with the top-level cache when a user's
+        OAuth tokens rotate or disconnect.
+        """
+        self._user_invalidation_hooks.append(hook)
+
     def invalidate_all(self) -> None:
         """Drop every cached built-agent, across all tenants.
 
@@ -332,12 +349,15 @@ class AgentRuntime:
         Called when the user's OAuth connections change (connect / disconnect)
         so the next run rebuilds against the refreshed per-user OAuth pool
         (Stream MCP-OAUTH, OA-3b). Only 4-tuple (per-user) keys match; the
-        shared no-OAuth builds are left intact.
+        shared no-OAuth builds are left intact. Registered user hooks (the
+        sub-agent builder cache, 二期 PR2 T2) are fanned out too.
         """
         for key in [
             k for k in self._cache if k[0] == tenant_id and len(k) == 4 and k[3] == user_id
         ]:
             del self._cache[key]
+        for hook in self._user_invalidation_hooks:
+            hook(tenant_id, user_id)
 
 
 @runtime_checkable

@@ -1292,6 +1292,11 @@ def create_app(
                         if sql_stores is not None
                         else None
                     ),
+                    # 二期 PR2 T2 — a refresh overwrites the token secrets in
+                    # place; evict that user's cached built agents (top-level +
+                    # delegated via the registered user hook) so the next build
+                    # resolves the fresh token instead of the baked-in old one.
+                    invalidate_user=resolved_agent_runtime.invalidate_user,
                 )
                 user_mcp_oauth_pool_service = UserMcpOAuthPoolService(
                     oauth_store=resolved_mcp_oauth_connection_store,
@@ -1510,6 +1515,9 @@ def create_app(
                     # Stream MCP platform-servers (P1b) — evict ALL cached
                     # sub-agents when the process-global catalog pool changes.
                     register_invalidation_all=resolved_agent_runtime.register_invalidation_all,
+                    # 二期 PR2 T2 — evict a user's cached per-user (OAuth) child
+                    # builds when invalidate_user fires (token refresh / disconnect).
+                    register_user_invalidation=resolved_agent_runtime.register_user_invalidation_hook,
                     # 一期 Task 5 — delegated sub-agent builds reuse the shared pool too.
                     http_client=shared_http,
                 )

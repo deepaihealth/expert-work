@@ -132,6 +132,25 @@ async def _resolve_write_ref(
     return payload.secret_ref
 
 
+def _invalidate_built_agents(request: Request, *, tenant_id: UUID | None = None) -> None:
+    """凭据轮换后清 built-agent 缓存 —— 轮换是同 ref 原地覆写值
+    (``_canonical_secret_name`` 对同 (provider,key_id) 恒同 slot),ref 比对
+    发现不了,已构建 agent 里烤住的旧明文 key 只能靠显式失效清掉。
+    同时清 secret 值缓存(T3 落地后 ``app.state`` 上才有,getattr 兜底)。"""
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    cache = getattr(request.app.state, "credential_value_cache", None)
+    if tenant_id is None:
+        if runtime is not None:
+            runtime.invalidate_all()
+        if cache is not None:
+            cache.invalidate_all()
+    else:
+        if runtime is not None:
+            runtime.invalidate_tenant(tenant_id)
+        if cache is not None:
+            cache.invalidate_tenant(tenant_id)
+
+
 def _require_system_admin(principal: Principal) -> None:
     if not principal.is_system_admin:
         raise HTTPException(
@@ -315,6 +334,7 @@ def build_platform_config_router() -> APIRouter:
         service: PlatformSecretsService,
         audit: AuditLogger,
         secret_store: SecretStore,
+        request: Request,
     ) -> dict[str, object]:
         _require_system_admin(principal)
         if provider not in PROVIDER_CATALOG:
@@ -339,6 +359,7 @@ def build_platform_config_router() -> APIRouter:
                 actor_id=principal.subject_id,
             )
         service.invalidate()
+        _invalidate_built_agents(request)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -362,6 +383,7 @@ def build_platform_config_router() -> APIRouter:
         service: Annotated[PlatformSecretsService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        request: Request,
     ) -> dict[str, object]:
         """Upsert the provider's ``default`` key (Stream P; Y-MK key_id='default')."""
         return await _do_upsert_provider(
@@ -373,6 +395,7 @@ def build_platform_config_router() -> APIRouter:
             service=service,
             audit=audit,
             secret_store=secret_store,
+            request=request,
         )
 
     @router.put("/providers/{provider}/keys/{key_id}")
@@ -385,6 +408,7 @@ def build_platform_config_router() -> APIRouter:
         service: Annotated[PlatformSecretsService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        request: Request,
     ) -> dict[str, object]:
         """Stream Y-MK — upsert one named key of a provider for multi-key failover."""
         return await _do_upsert_provider(
@@ -396,6 +420,7 @@ def build_platform_config_router() -> APIRouter:
             service=service,
             audit=audit,
             secret_store=secret_store,
+            request=request,
         )
 
     @router.put("/tools/{tool}")
@@ -407,6 +432,7 @@ def build_platform_config_router() -> APIRouter:
         service: Annotated[PlatformSecretsService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        request: Request,
     ) -> dict[str, object]:
         _require_system_admin(principal)
         if tool not in TOOL_CATALOG:
@@ -425,6 +451,7 @@ def build_platform_config_router() -> APIRouter:
                 actor_id=principal.subject_id,
             )
         service.invalidate()
+        _invalidate_built_agents(request)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -482,6 +509,7 @@ def build_platform_config_router() -> APIRouter:
         if not deleted:
             raise HTTPException(status_code=404, detail="platform provider credential not found")
         service.invalidate()
+        _invalidate_built_agents(request)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -540,6 +568,7 @@ def build_platform_config_router() -> APIRouter:
         if not deleted:
             raise HTTPException(status_code=404, detail="platform provider key not found")
         service.invalidate()
+        _invalidate_built_agents(request)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -593,6 +622,7 @@ def build_platform_config_router() -> APIRouter:
         if not deleted:
             raise HTTPException(status_code=404, detail="platform tool credential not found")
         service.invalidate()
+        _invalidate_built_agents(request)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -709,6 +739,7 @@ def build_platform_config_router() -> APIRouter:
                 actor_id=principal.subject_id,
             )
         service.invalidate()
+        _invalidate_built_agents(request, tenant_id=tenant_id)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -755,6 +786,7 @@ def build_platform_config_router() -> APIRouter:
                 actor_id=principal.subject_id,
             )
         service.invalidate()
+        _invalidate_built_agents(request, tenant_id=tenant_id)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -777,6 +809,7 @@ def build_platform_config_router() -> APIRouter:
         service: Annotated[PlatformSecretsService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        request: Request,
     ) -> None:
         # Deleting an override just falls the tenant back to the platform
         # view — never an outage by itself, so no in-use guard (unlike the
@@ -798,6 +831,7 @@ def build_platform_config_router() -> APIRouter:
         if not deleted:
             raise HTTPException(status_code=404, detail="tenant provider override not found")
         service.invalidate()
+        _invalidate_built_agents(request, tenant_id=tenant_id)
         await _emit_platform_audit(
             audit,
             principal=principal,
@@ -815,6 +849,7 @@ def build_platform_config_router() -> APIRouter:
         service: Annotated[PlatformSecretsService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        request: Request,
     ) -> None:
         _require_system_admin(principal)
         async with bypass_rls_session():
@@ -831,6 +866,7 @@ def build_platform_config_router() -> APIRouter:
         if not deleted:
             raise HTTPException(status_code=404, detail="tenant tool override not found")
         service.invalidate()
+        _invalidate_built_agents(request, tenant_id=tenant_id)
         await _emit_platform_audit(
             audit,
             principal=principal,
