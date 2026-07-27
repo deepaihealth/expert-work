@@ -34,6 +34,7 @@ function makeSpan(
     statusMessage: null,
     ...over,
     purpose: over.purpose ?? "",
+    group: over.group ?? null,
   };
 }
 
