@@ -34,6 +34,7 @@ from expert_work.protocol import (
     AuditAction,
     TenantConfigPatch,
     TenantConfigRecord,
+    TenantPlan,
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -154,3 +155,65 @@ class TenantConfigService:
     def invalidate(self, tenant_id: UUID) -> None:
         """Drop the cached entry. Useful for tests + admin-driven flushes."""
         self._cache.pop(tenant_id, None)
+
+
+class ServiceBackedTenantConfigStore(TenantConfigStore):
+    """二期 P1.2 —— 给 orchestrator 的 MemoryEnv 用的 store 适配器。
+
+    recall 节点每次召回读一次 tenant_config(只用 memory_recall_mode 一个
+    字段);裸 repo 是每次一条真 DB 读(基线 15ms/召回)。这个适配器把读
+    委托给 :class:`TenantConfigService`,复用它现有的 per-tenant TTL 缓存
+    与 upsert 失效/prime —— 不新建任何缓存。
+
+    为什么不直接把共享 repo 包一层缓存:TenantStatusService(kill switch)
+    用秒级 TTL 消费同一 repo,repo 层长缓存会架空急停传播。
+
+    ``get`` 把 service 的 :class:`TenantConfigNotConfiguredError` 转回
+    store 接口约定的 ``None``(recall 节点靠 None 走默认 hybrid);
+    ``actor_id=None`` 使 service 不发读审计 —— 热路径零审计噪音。
+    """
+
+    def __init__(self, *, service: TenantConfigService) -> None:
+        self._service = service
+
+    async def get(self, *, tenant_id: UUID) -> TenantConfigRecord | None:
+        try:
+            return await self._service.get(tenant_id=tenant_id, actor_id=None)
+        except TenantConfigNotConfiguredError:
+            return None
+
+    async def upsert(
+        self, *, tenant_id: UUID, patch: TenantConfigPatch, actor_id: str
+    ) -> TenantConfigRecord:
+        return await self._service.upsert(tenant_id=tenant_id, patch=patch, actor_id=actor_id)
+
+    # ── 以下三个方法 recall 路径用不到,但基类是 ABC,必须逐个委托底层
+    # store,不留 NotImplementedError。────────────────────────────────
+
+    async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        display_name: str,
+        plan: TenantPlan | None = None,
+        actor_id: str,
+    ) -> TenantConfigRecord:
+        # 新租户首行:service 缓存里不可能有该 tenant 的条目(get miss
+        # 不缓存、已有行时 create 直接抛),无需失效。
+        return await self._service._store.create(
+            tenant_id=tenant_id, display_name=display_name, plan=plan, actor_id=actor_id
+        )
+
+    async def set_status(
+        self, *, tenant_id: UUID, status: str, actor_id: str
+    ) -> TenantConfigRecord:
+        record = await self._service._store.set_status(
+            tenant_id=tenant_id, status=status, actor_id=actor_id
+        )
+        # 直写底层 store 绕过了 service 缓存 —— 立刻失效,避免 TTL 窗口内
+        # 经 service 读到旧 status。
+        self._service.invalidate(tenant_id)
+        return record
+
+    async def list_all(self, *, limit: int = 50, offset: int = 0) -> list[TenantConfigRecord]:
+        return await self._service._store.list_all(limit=limit, offset=offset)

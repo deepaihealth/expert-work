@@ -211,7 +211,11 @@ from control_plane.skill_evolution_worker import SkillEvolutionWorker
 from control_plane.skill_rollback_monitor import RollbackMonitor
 from control_plane.skill_run_usage_recorder import StoreSkillRunUsageRecorder
 from control_plane.subagent_runtime import make_child_agent_builder, make_worker_build_fn
-from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
+from control_plane.tenancy import (
+    ServiceBackedTenantConfigStore,
+    TenantConfigNotConfiguredError,
+    TenantConfigService,
+)
 from control_plane.tenant_mcp_pool import TenantMcpPoolService
 from control_plane.tenant_scope import bypass_rls_session
 from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
@@ -1463,7 +1467,11 @@ def create_app(
                     dlq=resolved_memory_dlq,  # K.K7 — failed writebacks land here
                     # Capability Uplift Sprint #6 (Mini-ADR U-5) — recall
                     # node reads tenant_config.memory_recall_mode.
-                    tenant_config_store=resolved_tenant_config_repo,
+                    # 二期 P1.2 —— 经 ServiceBackedTenantConfigStore 走
+                    # TenantConfigService 的 60s 缓存,不再每次召回打 DB。
+                    tenant_config_store=ServiceBackedTenantConfigStore(
+                        service=resolved_tenant_config_service
+                    ),
                     # Stream CM-4 — the same DynamicResolvingReranker that backs
                     # knowledge_search reorders long-term memory recall too. It
                     # reads the live rerank config per call and degrades to the
