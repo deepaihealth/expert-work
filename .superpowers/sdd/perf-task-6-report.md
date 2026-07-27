@@ -44,7 +44,50 @@ Step 7 说 ENTRY 要"过双主题（照文件里既有色值常量的定义方�
 
 这些都不在 Task 6 Files 清单里，但不改就是全新的 tsc 报错（不是既有的 stale 诊断噪音，是本次改动直接引发的真实编译错误），按"清理自己改动造成的孤儿/破坏"处理，全部补 `group: null`，没有动这些文件的其它内容。
 
-## 顾虑
+## 顾虑（初版，均已在下方追加 commit 中修掉）
 
-1. 上面提到的 `--ew-trace-entry` 未落 `tokens.css` 的决定——如果 coordinator 认为"过双主题"是字面要求要有真正随主题变化的两套色阶，需要补一次小改动。
-2. 没有为 `EntryBreakdown` 组件本身、`TraceView.tsx` 的配色分支新增单独的渲染测试（Task 6 的 Files 清单里 Test 只列了 `entry_breakdown.test.ts`）——全量 vitest 跑过，既有 `TraceView.test.tsx` 没有因为新增的顶部分解条渲染而失败（说明 DOM 结构没有破坏既有断言的选择器），但没有专门断言"入口链 span 确实渲染成 ENTRY 颜色"或"分解条点击会联动选中"这类新行为的正面用例，纯粹按计划字面执行。
+1. ~~上面提到的 `--ew-trace-entry` 未落 `tokens.css` 的决定~~ —— 已修，见下。
+2. ~~没有为配色分支 / 点击选中接线补测试~~ —— 已修，见下。
+
+---
+
+## 追加：色令牌双主题化 + 配色/点击选中测试（commit `43902cf4`）
+
+Coordinator 复核后指出这两个 concern 都是真的，且 ①有本仓库先例（`tokens.css:224-227` 那条注释描述的正是同一类"hex fallback 不随主题变"的老毛病，之前已经修过一次），授权改 `tokens.css`（它不在 Task 6 原 Files 清单，是 brief 的疏漏）。改法：
+
+### ① `--ew-trace-entry` 双主题令牌化
+
+- **原色阶区**（`tokens.css` 第 81 行前）新增一组 indigo 5 阶，跟 `success`/`warning`/`danger` 现有的 100/300/500/700/900 定义方式（含数值来源——Tailwind 默认色板）保持一致：
+  ```
+  --ew-color-indigo-100: #e0e7ff;
+  --ew-color-indigo-300: #a5b4fc;
+  --ew-color-indigo-500: #6366f1;
+  --ew-color-indigo-700: #4338ca;
+  --ew-color-indigo-900: #312e81;
+  ```
+  选 indigo 而非复用 brand/accent/success/warning/danger 任何一个既有色相：跟 TraceView.tsx 里 llm(brand cyan)、tool(accent violet)都要拉得开是 Task 6 本来的判断，成功/警示/危险三色又各有既有语义（用在别处会引起混淆），只有新开一相最干净。
+- **语义层**：dark 主题（`:root, html[data-theme="dark"]`）取 `--ew-color-indigo-300`（浅），light 主题（`html[data-theme="light"]`）取 `--ew-color-indigo-700`（深）。这个"浅一档给暗背景、深一档给亮背景"的两步跳（跳过中间的 500）是抄 `success`/`warning`/`danger` 自己的现有模式（它们的 `--ew-status-*-fg` 就是 dark 取 -300、light 取 -700），不是抄 `--ew-accent-violet` 的 400/600（那是另一个 12 阶色阶,阶数体系不同,硬套档位数字没意义,套"浅/深不对称"这条设计原则才是对的）。
+- `TraceView.tsx` 的 `ENTRY` 常量字面量没动（还是 `var(--ew-trace-entry, #7c8cff)`），因为现在 `--ew-trace-entry` 有真实定义了，fallback 十六进制只在变量意外未加载时才会生效，保留它纯粹是防御性的，跟其它几个常量（`ACCENT`/`SUCCESS` 等）的 fallback 惯例一致。
+
+### ② 配色分支 + 点击选中接线测试
+
+- `TraceView.tsx` 的 `kindDotColor`/`kindBarColor` 从模块私有函数改成 `export`（唯一的生产代码改动），供测试直接调用，不用整个渲染组件去反推颜色。
+- `TraceView.test.tsx` 追加一个新 `describe("kindDotColor / kindBarColor")` 块：构造 llm/tool/entry-group/plain 四种 span，断言 entry-group 的 dot 颜色和 bar 颜色都跟另外三种互不相同。
+- 新建 `EntryBreakdown.test.tsx`：渲染 `<EntryBreakdown>`（一个 entry span + 一个 llm span，两个按钮），分别点击两个按钮，断言 `onSelect` 收到的是被点击那个按钮自己的 span id（先点右边的按钮断言收到 `"l"`，再点左边的断言收到 `"r"`——不是"点了就总收到同一个 id"这种会被退化实现蒙混过关的弱断言）；另加一条"无 entry span 时不渲染"的空状态用例。
+
+### 校验命令（同步跑）
+
+1. `vitest run`（全量）—— **154 test files / 1303 tests 全绿**（比上一版多 1 个文件、3 个测试，新增的 `EntryBreakdown.test.tsx` 2 条 + `TraceView.test.tsx` 追加的 1 条），无回归
+2. `tsc -b --noEmit` —— 干净，0 错误
+
+### 最终色阶选择
+
+dark 主题 `--ew-trace-entry: var(--ew-color-indigo-300)`（`#a5b4fc`），light 主题 `--ew-trace-entry: var(--ew-color-indigo-700)`（`#4338ca`）。
+
+### commit
+
+`43902cf4` — `fix(admin-ui): trace-entry 色令牌双主题化 + 配色/点击选中测试补全`(4 files changed, 101 insertions, 3 deletions)，父提交 `501237ef`。
+
+### 顺带确认
+
+Coordinator 指出的"7 个既有测试文件补 `group` fixture 是类型变更的必然后果、`TraceSpan.group` 设成 required 而非 optional 是对的"——认同，`_span_as_dict`（control-plane facade）无条件带这个字段,没有"可能不返回"的分支,required 能让以后哪个 mock/fixture 漏传时被 tsc 当场抓住,而不是运行时才发现 `undefined` 被当成合法值传下去。
