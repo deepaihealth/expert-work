@@ -157,6 +157,7 @@ def make_child_agent_builder(
     tenant_config_service: TenantConfigService | None = None,
     register_invalidation: Callable[[Callable[[UUID], None]], None] | None = None,
     register_invalidation_all: Callable[[Callable[[], None]], None] | None = None,
+    register_user_invalidation: Callable[[Callable[[UUID, str], None]], None] | None = None,
     # 一期 Task 5 — process-level shared HTTP client, forwarded into every
     # delegated child build's ``build_agent`` call. ``None`` keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
@@ -278,10 +279,25 @@ def make_child_agent_builder(
         """
         cache.clear()
 
+    def _invalidate_user(tenant_id: UUID, user_id: str) -> None:
+        """Drop cached per-user (OAuth) sub-agents for ``(tenant, user)``
+        (二期 PR2 T2).
+
+        Registered with the :class:`AgentRuntime` so a user's OAuth token
+        refresh / disconnect evicts stale delegated child builds (whose
+        ``ToolEnv`` holds the old per-user OAuth pool). Only 5-tuple keys
+        match — index 4 is the OAuth subject (see ``_ChildKey``); shared
+        4-tuple builds and other users' entries are left intact.
+        """
+        for key in [k for k in cache if len(k) == 5 and k[0] == tenant_id and k[4] == user_id]:
+            del cache[key]
+
     if register_invalidation is not None:
         register_invalidation(_invalidate_tenant)
     if register_invalidation_all is not None:
         register_invalidation_all(_invalidate_all)
+    if register_user_invalidation is not None:
+        register_user_invalidation(_invalidate_user)
 
     # The sub-agent's ToolEnv carries _build itself so a child can in turn
     # delegate to a grandchild. Assigned after _build is defined; the
