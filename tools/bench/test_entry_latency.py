@@ -102,6 +102,10 @@ async def test_run_rounds_survives_a_malformed_trace_response_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith("/runs"):
             return _mock_run_response("11111111-1111-1111-1111-111111111111")
+        if request.method == "GET" and request.url.path.endswith(
+            "/runs/11111111-1111-1111-1111-111111111111"
+        ):
+            return httpx.Response(200, json={"data": {"status": "success"}})
         if request.method == "GET" and request.url.path.endswith("/trace"):
             trace_gets["n"] += 1
             if trace_gets["n"] == 3:
@@ -123,6 +127,33 @@ async def test_run_rounds_survives_a_malformed_trace_response_body() -> None:
         per_run, failed_runs = await run_rounds(client, "thread-1", "hello", 3, trace_timeout_s=5.0)
 
     assert per_run == [{"记忆召回": 100.0}, {"记忆召回": 100.0}, {}]
+    assert failed_runs == 1
+
+
+async def test_run_with_error_status_does_not_pollute_the_baseline() -> None:
+    """真栈首跑逮到的 bug:graph 崩掉的 run 照样把 SSE 流干净地放完、照样
+    留下 trace —— HTTP 层全绿。修复前这种 run 被记成 successful_runs=1,
+    半截 trace(入口链跑了、LLM 挂了)混进聚合,正是"被静默污染的中位数"。
+    现在 ``_run_once`` 问权威 run 记录的终态,非 success 一律判该轮失败。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/runs"):
+            return _mock_run_response("22222222-2222-2222-2222-222222222222")
+        if request.method == "GET" and request.url.path.endswith(
+            "/runs/22222222-2222-2222-2222-222222222222"
+        ):
+            return httpx.Response(200, json={"data": {"status": "error"}})
+        if request.method == "GET" and request.url.path.endswith("/trace"):
+            raise AssertionError("a failed run's trace must never be fetched")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        per_run, failed_runs = await run_rounds(client, "thread-1", "hi", 1, trace_timeout_s=5.0)
+
+    assert per_run == [{}]
     assert failed_runs == 1
 
 

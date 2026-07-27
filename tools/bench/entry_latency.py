@@ -219,6 +219,19 @@ async def _run_once(client: httpx.AsyncClient, thread_id: str, prompt: str) -> s
             pass  # drain to completion; content itself isn't needed here
     if not run_id:
         raise RuntimeError("run response carried no X-Expert-Work-Run-Id header")
+    # A run whose graph CRASHED still streams to a clean SSE close and still
+    # leaves a trace behind — HTTP-level success is NOT run success. Without
+    # this check a failed run's half-built trace (e.g. an entry chain that
+    # died at the LLM call) is aggregated into the baseline as if it were a
+    # real measurement — a silently poisoned median. Ask the authoritative
+    # run record instead of scanning SSE frames for error events.
+    status_resp = await client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
+    status_resp.raise_for_status()
+    payload = status_resp.json()
+    run_status = str((payload.get("data") or payload).get("status", "")).lower()
+    # RunStatus's sole terminal-success value is "success" (runs/schemas.py).
+    if run_status != "success":
+        raise RuntimeError(f"run {run_id} finished with status {run_status!r}")
     return run_id
 
 
