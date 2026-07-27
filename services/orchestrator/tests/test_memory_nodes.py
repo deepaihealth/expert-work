@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -352,6 +354,46 @@ async def test_memory_recall_node_bumps_access_count_on_hit() -> None:
     )
     assert [m.content for m in out["recalled_memories"]] == ["user prefers metric units"]
 
+    # 二期 P1.1 —— bump_access 是 fire-and-forget 后台任务,断言前先 drain。
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
+
+    [after] = await store.list_for_user(tenant_id=tenant, user_id=user)
+    assert after.access_count == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_recall_returns_before_bump_access_completes() -> None:
+    """P1.1 —— bump_access 不再阻塞 recall 返回:store 的 bump_access 挂在
+    一个未 set 的事件上,recall 必须照常返回;set 事件、drain 后计数才落。"""
+    gate = asyncio.Event()
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    await _seed(store, tenant=tenant, user=user, content="user prefers metric units")
+
+    original_bump = store.bump_access
+
+    async def slow_bump(**kwargs: Any) -> None:
+        await gate.wait()
+        await original_bump(**kwargs)
+
+    store.bump_access = slow_bump  # type: ignore[method-assign]
+
+    node = make_memory_recall_node(memory_store=store, embedder=FakeEmbedder(dim=_DIM), top_k=5)
+    out = await asyncio.wait_for(
+        node(  # type: ignore[arg-type]
+            _state("what's the distance"),
+            {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
+        ),
+        timeout=2.0,
+    )
+    assert [m.content for m in out["recalled_memories"]] == ["user prefers metric units"]
+
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+
+    gate.set()
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
     [after] = await store.list_for_user(tenant_id=tenant, user_id=user)
     assert after.access_count == 1
 

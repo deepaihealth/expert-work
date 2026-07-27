@@ -829,7 +829,7 @@ const zhCN: TranslationKeys = {
     verify_reads_label: "回答前核对记忆",
     verify_reads_brief: "回答前核对记忆,更准更慢",
     verify_reads_impact:
-      "调取记忆后、用进回答前,先让模型筛一遍,丢掉跟当前问题无关、过期或矛盾的,避免旧记忆带偏回答。\n会多花一次模型调用;万一出错则不拦截、全部放行。\n默认开启。\n示例:开启",
+      "回答前先让模型把调出来的记忆筛一遍,丢掉跟当前问题无关、过期或矛盾的,避免旧记忆带偏回答。\n代价是多一次模型调用:实测每次回答要多等约 0.7~1 秒。\n筛选本身出错时不拦截,记忆照常全部使用。\n默认开启。\n示例:开启",
     write_min_importance_label: "重要性过滤",
     write_min_importance_brief: "低于此重要度不存记忆",
     write_min_importance_impact:

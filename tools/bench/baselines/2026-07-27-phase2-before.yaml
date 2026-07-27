@@ -1,0 +1,56 @@
+segments:
+  上下文门:
+    median: 0.0
+    p95: 1.0
+    n: 10
+  向量化:
+    median: 201.5
+    p95: 298.0
+    n: 10
+  向量检索:
+    median: 22.5
+    p95: 33.0
+    n: 10
+  回写访问计数:
+    median: 17.0
+    p95: 28.0
+    n: 10
+  工作区摄取:
+    median: 125.0
+    p95: 131.0
+    n: 10
+  记忆召回:
+    median: 1145.0
+    p95: 1597.0
+    n: 10
+  记忆重排:
+    median: 217.5
+    p95: 374.0
+    n: 10
+  读取召回配置:
+    median: 15.0
+    p95: 16.0
+    n: 10
+meta:
+  commit: unknown
+  host: linux-aarch64
+  agent: bench-entry@2.0.0
+  runs: 10
+  prompt_file: /tmp/bench2/prompts/fixed.txt
+  prompt_sha256: 06b9296128f9
+  note: before phase2 @main f892b6dc; in-container(control-plane-blue) hot-reload
+    dev compose; deepseek-chat; seeded memories (seed.txt); verify_reads=on; write_back=on
+    so the memory pool grows a little across rounds (same pattern for the after run
+    — medians stay comparable)
+  successful_runs: 10
+  failed_runs: 0
+first_llm_start:
+  median: 677.5
+  p95: 828.0
+verify_ms:
+  median: 634.0
+  p95: 1043.0
+  n: 10
+total_ms:
+  median: 5740.0
+  p95: 8507.0

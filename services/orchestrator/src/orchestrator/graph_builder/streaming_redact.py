@@ -82,6 +82,10 @@ class StreamingRedactor:
         #: the collapse guard in ``_advance_frozen``): ``_frozen_out <= _emitted_out``.
         self._frozen_out = 0
         self._blocked = False
+        # 二期 P3 —— 双关时整条快路径:无 hold、无重扫、无冻结指针。
+        # hold 的存在意义是 screen 的整段撤回 + dlp 的跨 chunk 模式匹配,
+        # 两者都关时扣住尾部 64 字符纯粹是感知延迟损耗。
+        self._passthrough = not dlp and not screen
 
     def _redact(self, text: str) -> str:
         return scan_and_redact(text).redacted if self._dlp else text
@@ -117,6 +121,8 @@ class StreamingRedactor:
         self._frozen_raw = new_frozen
 
     def feed(self, text: str) -> str:
+        if self._passthrough:
+            return text
         if self._blocked:
             return ""
         self._buf += text
@@ -135,6 +141,8 @@ class StreamingRedactor:
         return out
 
     def flush(self) -> str:
+        if self._passthrough:
+            return ""
         if self._blocked:
             return ""
         tail = self._buf[self._frozen_raw :]

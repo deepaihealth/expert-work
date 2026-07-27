@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import itertools
 import json
 import logging
 import time
@@ -1421,26 +1420,41 @@ def build_react_graph(
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
 
-    # Entry chain: START → [memory_recall] → [planner] → agent — each
-    # node optional, in this fixed order. ``# type: ignore[arg-type]``:
-    # the bare Callable node aliases don't match LangGraph's internal
-    # ``_NodeWithConfig`` overloads (same gap runs.py documents).
-    entry: list[str] = [START]
+    # Entry chain(二期 P1.3)—— 两条分支从 START 并发,AND-join 汇到 agent:
+    #   分支 1: memory_recall(写 recalled_memories)
+    #   分支 2: planner → workspace_ingest(写 plan;分支内保序 —— CM-0:
+    #           人改的 PLAN.md 仍覆盖 planner 生成的 plan)
+    # 写集不相交;汇合用列表形式 add_edge([a, b], "agent") 建 AND-join
+    # 屏障(NamedBarrierValue),agent 等全部父分支完成后执行一次。
+    # ``# type: ignore[arg-type]``: the bare Callable node aliases don't
+    # match LangGraph's internal ``_NodeWithConfig`` overloads (same gap
+    # runs.py documents).
+    tails: list[str] = []
     if memory_recall_node is not None:
         graph.add_node("memory_recall", memory_recall_node)  # type: ignore[arg-type]
-        entry.append("memory_recall")
+        graph.add_edge(START, "memory_recall")
+        tails.append("memory_recall")
+    plan_tail: str | None = None
     if planner_node is not None:
         graph.add_node("planner", planner_node)  # type: ignore[arg-type]
-        entry.append("planner")
-    # Stream CM-0 — file→DB ingest, placed last in the entry chain (after the
-    # planner) so a human's PLAN.md edit overrides a (re)generated plan, and so
-    # it fires exactly once per ainvoke (run start / resume), not per turn.
+        graph.add_edge(START, "planner")
+        plan_tail = "planner"
     if workspace_ingest_node is not None:
         graph.add_node("workspace_ingest", workspace_ingest_node)  # type: ignore[arg-type]
-        entry.append("workspace_ingest")
-    for src, dst in itertools.pairwise(entry):
-        graph.add_edge(src, dst)
-    graph.add_edge(entry[-1], "agent")
+        graph.add_edge(plan_tail if plan_tail is not None else START, "workspace_ingest")
+        plan_tail = "workspace_ingest"
+    if plan_tail is not None:
+        tails.append(plan_tail)
+    if not tails:
+        tails.append(START)
+    if len(tails) > 1:
+        # LangGraph 语义:单串 add_edge(a, c) + add_edge(b, c) 是 OR 触发
+        # (每个父完成都触发 c 一次);列表形式才建 AND-join 屏障
+        # (NamedBarrierValue)。两分支不等长(planner→ingest 是 2 步)时
+        # OR 触发会让 agent 双跑 —— 带 tool_calls 时直接 InvalidUpdateError。
+        graph.add_edge(tails, "agent")
+    else:
+        graph.add_edge(tails[0], "agent")
 
     # Exit: the run's end routes through ``memory_writeback`` when present.
     end_target: str = END

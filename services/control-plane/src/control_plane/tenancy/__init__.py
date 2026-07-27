@@ -11,12 +11,14 @@ Exposes:
 
 from control_plane.tenancy.rls_context import RLSContextMiddleware
 from control_plane.tenancy.tenant_config import (
+    ServiceBackedTenantConfigStore,
     TenantConfigNotConfiguredError,
     TenantConfigService,
 )
 
 __all__ = [
     "RLSContextMiddleware",
+    "ServiceBackedTenantConfigStore",
     "TenantConfigNotConfiguredError",
     "TenantConfigService",
 ]

@@ -21,6 +21,7 @@ still propagates).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -62,6 +63,26 @@ from orchestrator.state import AgentState
 from orchestrator.tools.knowledge import Reranker
 
 logger = logging.getLogger(__name__)
+
+#: 二期 P1.1 —— fire-and-forget bump_access 任务的强引用集合(RUF006:
+#: 裸 create_task 的返回值不被引用会被 GC 提前回收)。照 sse.py 的
+#: _BACKGROUND_CLEANUP_TASKS 范式。测试用它 drain。
+_BACKGROUND_BUMP_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _bump_access_background(
+    *, memory_store: MemoryStore, tenant_id: UUID, user_id: UUID, ids: list[UUID]
+) -> None:
+    """后台执行 bump_access —— best-effort 语义与内联时代一致(失败只
+    warning),但不再阻塞 recall 返回。不特判 RunCancelledError:这条
+    UPDATE 不消费 cancellation token,run 取消后记忆确实被召回过,计数
+    照记。"""
+    with expert_work_span(ExpertWorkComponent.MEMORY, "bump_access"):
+        try:
+            await memory_store.bump_access(tenant_id=tenant_id, user_id=user_id, ids=ids)
+        except Exception:
+            logger.warning("memory.bump_access_failed", exc_info=True)
+
 
 #: A memory graph node: takes state + config, returns state updates.
 MemoryNode = Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]
@@ -643,17 +664,16 @@ def make_memory_recall_node(
                 return {}
             record_memory_retrieval(mode=mode, result="hit" if memories else "miss")
             if memories:
-                with expert_work_span(ExpertWorkComponent.MEMORY, "bump_access"):
-                    try:
-                        await memory_store.bump_access(
-                            tenant_id=tenant_id,
-                            user_id=user_id,
-                            ids=[m.id for m in memories],
-                        )
-                    except RunCancelledError:
-                        raise
-                    except Exception:
-                        logger.warning("memory.bump_access_failed", exc_info=True)
+                bump_task = asyncio.create_task(
+                    _bump_access_background(
+                        memory_store=memory_store,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        ids=[m.id for m in memories],
+                    )
+                )
+                _BACKGROUND_BUMP_TASKS.add(bump_task)
+                bump_task.add_done_callback(_BACKGROUND_BUMP_TASKS.discard)
             redacted = [_redact_memory(m) for m in memories]
             logger.info("memory.recall count=%d mode=%s", len(redacted), mode)
             return {"recalled_memories": redacted}

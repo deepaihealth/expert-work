@@ -55,6 +55,20 @@ import yaml
 #: token. Same name, different clock — see ``tools/bench/README.md``.
 FIRST_LLM_START_KEY = "__first_llm_start_ms__"
 
+#: 同范式的第二个内部键 —— verify_reads 开着时 facade 输出的「记忆校验」
+#: llm span(group=None,不在 entry 组)。写出时 pop 成顶层 ``verify_ms`` 节。
+#: 二期 P1.4:verify on/off 两组基线的对照数据源。
+VERIFY_MS_KEY = "__verify_ms__"
+
+_VERIFY_SPAN_LABEL = "记忆校验"  # trace_facade.py _LLM_LABELS 的固定中文标签
+
+#: 同范式的第三个内部键 —— trace 根节点的整 run 墙钟(facade
+#: ``normalize_trace`` 输出顶层 ``trace.latencyMs``)。写出时 pop 成顶层
+#: ``total_ms`` 节。这是 verify on/off 对照的端到端口径 —— Σ segments
+#: 不可作端到端:segments 里父 span(记忆召回)与子 span(向量化/检索/
+#: 读配置)并列,直接求和双计;且入口链并行化(P1.3)后段之和 > 真实墙钟。
+TOTAL_MS_KEY = "__total_ms__"
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -97,6 +111,13 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
 
     * **Segments** — every span with ``group == "entry"`` (the 8 入口链 spans,
       Task 1/2), keyed by its (already Chinese) ``label``.
+    * ``TOTAL_MS_KEY`` — the whole-run wall clock, from the trace root's
+      ``trace.latencyMs`` (the ``trace_latency_ms`` ``normalize_trace``
+      computes). This — not a sum over segments — is the end-to-end
+      number: segments mix parent spans (记忆召回) with their own children
+      (向量化/检索/读配置) so a sum double-counts, and after the entry
+      chain went parallel (P1.3) a sum of segments exceeds the real wall
+      clock anyway.
     * ``FIRST_LLM_START_KEY`` — the earliest ``startMs`` among **all**
       ``kind == "llm"`` spans, as a proxy for "entry chain finished,
       generation started". This is the earliest LLM call of *any* purpose —
@@ -112,11 +133,17 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
     Malformed / missing fields degrade silently (span skipped) rather than
     raising — one bad span in a trace should not sink an entire run's data.
     """
+    metrics: dict[str, float] = {}
+    trace_meta = trace.get("trace")
+    if isinstance(trace_meta, dict):
+        total_ms = trace_meta.get("latencyMs")
+        if isinstance(total_ms, int | float):
+            metrics[TOTAL_MS_KEY] = float(total_ms)
+
     spans = trace.get("spans")
     if not isinstance(spans, list):
-        return {}
+        return metrics
 
-    metrics: dict[str, float] = {}
     llm_starts: list[float] = []
     for span in spans:
         if not isinstance(span, dict):
@@ -130,6 +157,9 @@ def extract_run_metrics(trace: dict[str, Any]) -> dict[str, float]:
             start_ms = span.get("startMs")
             if isinstance(start_ms, int | float):
                 llm_starts.append(float(start_ms))
+            latency_ms = span.get("latencyMs")
+            if span.get("label") == _VERIFY_SPAN_LABEL and isinstance(latency_ms, int | float):
+                metrics[VERIFY_MS_KEY] = float(latency_ms)
 
     if llm_starts:
         metrics[FIRST_LLM_START_KEY] = min(llm_starts)
@@ -260,6 +290,21 @@ async def _fetch_trace(
         await asyncio.sleep(1.0)
 
 
+async def seed_memories(
+    client: httpx.AsyncClient, *, agent_name: str, agent_version: str, prompt: str
+) -> None:
+    """跑一轮独立 session 的种子对话,让 run 末的 memory_writeback 落库。
+
+    记忆是 (tenant, user, agent) 维度、跨 session 可召回,所以种子轮用
+    独立 session,不污染 bench session 的对话历史。run 终态 success 即
+    writeback 已完成(它是 graph 的 end 前节点)。失败直接抛 —— 种子没
+    种上,后面所有轮的召回都是空的,数据全白跑,fail-fast 是正确行为。
+    """
+    thread_id = await _create_session(client, agent_name, agent_version)
+    print(f"seed session: {thread_id}", file=sys.stderr)
+    await _run_once(client, thread_id, prompt)
+
+
 async def run_rounds(
     client: httpx.AsyncClient,
     thread_id: str,
@@ -323,6 +368,8 @@ def _write_result(
     """
     aggregated = aggregate(per_run)
     first_llm_start = aggregated.pop(FIRST_LLM_START_KEY, None)
+    verify_ms = aggregated.pop(VERIFY_MS_KEY, None)
+    total_ms = aggregated.pop(TOTAL_MS_KEY, None)
 
     meta: dict[str, Any] = dict(meta_base)
     meta["successful_runs"] = len(per_run) - failed_runs
@@ -337,6 +384,10 @@ def _write_result(
             "median": first_llm_start.median,
             "p95": first_llm_start.p95,
         }
+    if verify_ms is not None:
+        result["verify_ms"] = {"median": verify_ms.median, "p95": verify_ms.p95, "n": verify_ms.n}
+    if total_ms is not None:
+        result["total_ms"] = {"median": total_ms.median, "p95": total_ms.p95}
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
@@ -398,6 +449,13 @@ async def _amain(args: argparse.Namespace) -> int:
 
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=180.0) as client:
+        if args.seed_prompt_file:
+            seed_prompt = Path(args.seed_prompt_file).read_text(encoding="utf-8").strip()
+            if not seed_prompt:
+                raise SystemExit(f"{args.seed_prompt_file} is empty")
+            await seed_memories(
+                client, agent_name=agent_name, agent_version=agent_version, prompt=seed_prompt
+            )
         thread_id = await _create_session(client, agent_name, agent_version)
         print(f"session: {thread_id}", file=sys.stderr)
         _per_run, failed_runs = await run_rounds(
@@ -433,6 +491,11 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=30.0,
         help="max seconds to wait per run for Langfuse trace ingestion (default 30)",
+    )
+    parser.add_argument(
+        "--seed-prompt-file",
+        default=None,
+        help="optional: run one priming conversation first so recall is non-empty",
     )
     parser.add_argument("--note", default=None, help="free-text note stored under meta.note")
     args = parser.parse_args(argv)

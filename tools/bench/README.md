@@ -70,7 +70,8 @@ from both of the above:
 - **The breakdown bar's total** — a *duration*, not a point: the
   top-level entry-chain segments plus the **complete latency** of the
   first LLM span (start to finish, i.e. including its own generation
-  time), not just its start.
+  time), not just its start. 入口链并行化(P1.3)后该 total 为段之和,
+  大于真实墙钟,对照请以本脚本输出的顶层 `total_ms` 为准。
 
 All three are legitimate, they just answer different questions, so
 they won't line up numerically even on the same run — the breakdown
@@ -111,6 +112,72 @@ uv run python tools/bench/entry_latency.py \
 
 Run as a script (`uv run python tools/bench/entry_latency.py`), not as a
 module (`-m`) — `tools/bench` isn't a package.
+
+### 二期:8 段全亮的跑法(bench-entry manifest + seed 记忆轮)
+
+一期基线只亮 8 段中的 5 段:固定 prompt 打在空记忆库上零召回结果
+(rerank / bump_access / verify 都不触发),而且没开持久工作区
+(workspace_ingest 段不存在)。二期把缺的段点亮,分三步:
+
+1. **注册 bench agent** — `tools/bench/manifests/bench-entry.yaml`
+   (`memory.long_term` 全链 write_back + verify_reads,外加
+   `sandbox.filesystem.persistent_workspace`):
+
+   ```bash
+   curl -sS -X POST "$EXPERT_WORK_API_URL/v1/agents" \
+       -H "Authorization: Bearer $EXPERT_WORK_API_TOKEN" \
+       -H "Content-Type: application/json" \
+       --data "$(jq -n --rawfile m tools/bench/manifests/bench-entry.yaml \
+           '{manifest_yaml: $m}')"
+   ```
+
+   Body key 是 **`manifest_yaml`**(不是 `{"manifest": ...}` —— 那个拼法
+   只在计划文档里出现过)。定论来源:`POST /v1/agents` 的请求模型
+   `ManifestPayload`(`services/control-plane/src/control_plane/api/agents.py`)
+   只收 `{"manifest_yaml": "...", "template_vars": {...}}`,发 `{"manifest":
+   ...}` 会因缺字段 422。manifest 本身有解析守卫
+   (`test_bench_entry_manifest_parses_against_protocol_schema`):schema
+   漂移在 CI 先红,不会等到注册时才 422。
+
+2. **Seed 记忆轮** — 加 `--seed-prompt-file tools/bench/prompts/seed.txt`,
+   脚本在建 bench session **之前**先用一条独立的一次性 session 跑一轮
+   种子对话:run 终态 success 即 `memory_writeback` 已落库(它是 graph
+   的 end 前节点);记忆是 (tenant, user, agent) 维度、跨 session 可召回,
+   所以 bench 轮的召回自然非空。种子轮**不计入 bench 数据**——不拉
+   trace、不进 `per_run`、不影响 `meta.runs` / `successful_runs`。种子轮
+   失败直接抛(fail-fast):种子没种上,后面所有轮的召回全空,数据白跑。
+   `seed.txt` 的内容与 `fixed.txt` 的提问语义重叠(团队系统组件 + 开发
+   流程)——召回是语义检索,种不相关的记忆等于没种。
+
+3. **正常跑 bench**(与一期相同,换 agent 名 + 带上 seed):
+
+   ```bash
+   uv run python tools/bench/entry_latency.py \
+       --agent bench-entry@2.0.0 \
+       --prompt-file tools/bench/prompts/fixed.txt \
+       --seed-prompt-file tools/bench/prompts/seed.txt \
+       --runs 10 \
+       --out tools/bench/baselines/2026-07-27-phase2-before.yaml
+   ```
+
+#### `verify_ms` 顶层节
+
+verify_reads 开着时,trace facade 给「记忆校验」输出的是一个
+`kind == "llm"` 的 span,`group` 是 `null` **不是** `"entry"`(facade
+`_LLM_LABELS` 定死),所以它进不了 `segments` —— 脚本按 label 单独抓,
+写进顶层 `verify_ms` 节(median / p95 / n,`n` = 实际出现 verify span
+的轮数)。这是二期 P1.4(verify on/off 两组基线)的对照数据源。
+
+#### verify 开着时 `first_llm_start` 的含义变了
+
+`first_llm_start` 取的是全 trace 最早的 `kind == "llm"` span 的
+`startMs`,而 verify 本身就是一次 LLM 调用、且发生在主生成之前 —— 所以
+verify 开着时 `first_llm_start` 量的是 **verify 调用的开始时间**,不再
+近似"主生成开始"。verify on/off 两组对照不要直接比 `first_llm_start`;
+对照口径看顶层 **`total_ms`**(整 run 墙钟,来自 trace 根节点的
+`trace.latencyMs`)+ `verify_ms` 自身。Σ segments **不可**作端到端:
+segments 里父 span(记忆召回)与子 span(向量化/检索/读配置)并列,
+直接求和双计;且入口链并行化(P1.3)后段之和 > 真实墙钟。
 
 The output YAML is written after **every** round, not just once at the end
 — a round that fails part-way through a batch (network blip, a gateway
