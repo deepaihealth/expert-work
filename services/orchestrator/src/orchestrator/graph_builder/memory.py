@@ -638,9 +638,7 @@ def make_memory_recall_node(
             except RunCancelledError:
                 raise
             except Exception:
-                logger.warning(
-                    "memory.recall_failed — continuing without memories", exc_info=True
-                )
+                logger.warning("memory.recall_failed — continuing without memories", exc_info=True)
                 record_memory_retrieval(mode=mode, result="miss")
                 return {}
             record_memory_retrieval(mode=mode, result="hit" if memories else "miss")
