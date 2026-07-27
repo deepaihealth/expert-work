@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -114,6 +115,12 @@ async def test_memory_recall_emits_the_full_entry_chain(exporter: InMemorySpanEx
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
 
+    # 二期 P1.1 —— bump_access 是 fire-and-forget 后台任务,span 在任务内
+    # 打;读 finished spans 前先 drain。
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
+
     names = {s.name for s in exporter.get_finished_spans()}
     assert "expert_work.memory.recall" in names
     assert "expert_work.memory.resolve_mode" in names
@@ -137,6 +144,11 @@ async def test_recall_children_nest_under_the_recall_span(
         _state("what's the distance"),
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
+
+    # 二期 P1.1 —— 同上,drain 后台 bump_access 任务再读 spans。
+    from orchestrator.graph_builder.memory import _BACKGROUND_BUMP_TASKS
+
+    await asyncio.gather(*list(_BACKGROUND_BUMP_TASKS))
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
     parent = spans["expert_work.memory.recall"]
