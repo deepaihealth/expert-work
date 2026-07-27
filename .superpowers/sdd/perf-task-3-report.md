@@ -78,3 +78,70 @@ uv run mypy packages services/orchestrator/src
 ## 未涉及范围
 
 按要求只改了 `services/orchestrator/src/orchestrator/sse.py`、新增的 `services/orchestrator/tests/test_first_output_metric.py`,以及因改名被迫同步的 `services/orchestrator/tests/test_sse.py` 一处引用。没有碰 `graph_builder/memory.py`、`workspace_ingest.py`、`builder.py`、`control-plane/runtime.py`(并行任务的文件)。
+
+---
+
+## 追加:告警 / SLI / 面板 / docs 连带修复(commit `83ade7d2`)
+
+上一节"发现但没改的东西"列的 13 个文件里,coordinator 复核后判定其中 3 个不能留 follow-up:
+
+- `tools/observability/rules/alerts.yml:85` 的 `ExpertWorkGateTTFTOverBudget` 引用了改名后不再产出的 `expert_work_session_ttft_seconds_bucket` —— `histogram_quantile` 对空 series 返回 NaN,`NaN > 2.0` 恒为 false,告警静默失效,不报错也不触发。
+- `tools/observability/rules/sli.yml:34` 的 recording rule `expert_work:sli:session_ttft:p95_5m`(SLO 3)同样断供。
+
+已按 coordinator 给的具体方案补了一个 commit,改了 9 个文件:
+
+1. **`tools/observability/rules/alerts.yml`**:`ExpertWorkGateTTFTOverBudget` → `ExpertWorkGateFirstNodeOverBudget`,指标名同步改成 `expert_work_session_first_node_seconds_bucket`。**阈值 2.0s 不动**(测的还是同一个东西,只是名字诚实了)。summary/description 里的 "Session TTFT" → "First graph-node"。`runbook_url` 未动。
+
+2. **`tools/observability/rules/sli.yml`**:record 名 `expert_work:sli:session_ttft:p95_5m` → `expert_work:sli:session_first_node:p95_5m`,指标名同步改。原注释说"observed at the first agent `updates` chunk"是假话(实现认的是任意第一个节点,不特指 agent)——已改成准确描述,并点出这正是本 task 在修的口径 bug,顺带指向新增的 `first_output` SLI。
+
+3. **同一文件新增**:`expert_work:sli:first_output:p95_5m`(逐字用 coordinator 给的 expr/注释),只做记录不配告警——阈值等生产数据攒够再定,老的 first_node 告警继续兜底。
+
+4. **`infra/observability/prometheus.yml:26`**:注释里的指标名列举同步改。
+
+5. **docs(只改活文档,按 coordinator 名单)**:
+   - `docs/runbooks/slo.md`:SLO 表第 3 行 "Session TTFT P95" → "Session 首个图节点 P95",标注前名。
+   - `docs/runbooks/m0-m1-gate.md`:daily-check 的 curl 命令 + 阈值表 + NO-GO 选项里的 "TTFT" 三处,统一加"(前名 TTFT)"并换成新指标名。
+   - `docs/architecture/subsystems/20-observability.md`:职责列表的 "TTFT" 措辞、`slo_definition` 示例 SQL 的注释值、metric 清单表(顺带把"RUNNING 到首个 **agent** chunk"这句本身就不准确的描述改成"任意节点,非特指 agent")、SLO 表,共 4 处。
+   - `docs/runbooks/canonical-agent-e2e-test.md`:看了内容,是操作手册(Phase 6 手工冒烟步骤,里面的 curl 命令是要人真的跑的),改了里面的 curl query。
+   - `docs/streams/STREAM-*.md`、`docs/ITERATION-PLAN.md`:按 coordinator 指示**没有动**——历史设计文档,保留当时决定的记录。
+
+6. **主动追加,coordinator 未点名但确认"改是对的"**:`tools/observability/dashboards/01-overview.json`、`02-orchestrator.json` 两个 Grafana 面板的 `expr`(`expert_work:sli:session_ttft:p95_5m` → `...session_first_node:p95_5m`)和 `title`("Session TTFT P95" → "Session first-node P95")。判断依据:这两个面板直接引用的是我在 sli.yml 里改名的那条 recording rule,不改的话面板会静默变空,和 alerts.yml/sli.yml 是同一类"改名连带断供"问题,不是新的语义判断,只是把已经决定的 rename 传播到最后一个消费者。
+
+### promtool 校验
+
+`promtool` 本地不存在(`command -v promtool` exit 1,它是 Prometheus 发行包自带的二进制,本机未装,也没有走 Docker 拉镜像 —— 第一次尝试用 `docker run prom/prometheus promtool check rules` 起了后台任务等待,被判定为踩了"起后台任务+轮询"的坑,已改为同步命令)。按 coordinator 的兜底方案,只跑了 YAML 语法校验:
+
+```
+python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]; print('YAML OK:', sys.argv[1:])" tools/observability/rules/alerts.yml tools/observability/rules/sli.yml
+# YAML OK: ['tools/observability/rules/alerts.yml', 'tools/observability/rules/sli.yml']
+```
+
+两个 dashboard JSON 也单独过了 `json.load()` 语法校验(见下)。PromQL expr 的语义正确性(指标名有没有指对)没有工具能自动查,coordinator 说会自己 review expr,这里不重复背书。
+
+```
+python3 -c "
+import json
+for f in ['tools/observability/dashboards/01-overview.json', 'tools/observability/dashboards/02-orchestrator.json']:
+    with open(f) as fh: json.load(fh)
+    print(f, 'valid JSON')
+"
+# 两个文件都 valid JSON
+```
+
+### 全仓复核
+
+```
+grep -rln "session_ttft" .
+# tools/observability/rules/sli.yml         — 新注释里提"改名前叫 session_ttft"的历史说明,预期
+# docs/ITERATION-PLAN.md                    — coordinator 指示不动
+# docs/streams/STREAM-M-DESIGN.md           — 同上
+# docs/streams/STREAM-K-DESIGN.md           — 同上
+# docs/streams/STREAM-P-DESIGN.md           — 同上
+# .superpowers/sdd/perf-task-3-report.md    — 本报告自身的记录文字
+```
+
+无遗漏的功能性引用。
+
+### commit
+
+`83ade7d2` — `fix(observability): 老 ttft 指标改名的告警/SLI/面板连带修复`(9 files changed, 42 insertions, 26 deletions),父提交 `353316df`。
