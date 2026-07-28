@@ -1930,6 +1930,15 @@ export interface TranslationKeys {
     dynamic_worker_save: string;
     dynamic_worker_saved: string;
     dynamic_worker_save_failed: string;
+    delegation_heading: string;
+    delegation_help_title: string;
+    delegation_help_body: string;
+    delegation_max_concurrent_delegations_label: string;
+    delegation_env_default: string;
+    delegation_hint: string;
+    delegation_save: string;
+    delegation_saved: string;
+    delegation_save_failed: string;
     quality_heading: string;
     quality_help_title: string;
     quality_help_body: string;
@@ -4983,6 +4992,17 @@ const en: TranslationKeys = {
     dynamic_worker_save: "Save",
     dynamic_worker_saved: "Dynamic worker guardrails saved.",
     dynamic_worker_save_failed: "Failed to save dynamic worker guardrails",
+    delegation_heading: "Delegation-gate capacity",
+    delegation_help_title: "What is the delegation-gate capacity?",
+    delegation_help_body:
+      "Caps how many sub-agent delegations a run may have in flight at once. Unset falls back to the built-in default.",
+    delegation_max_concurrent_delegations_label: "Max concurrent delegations per run",
+    delegation_env_default: "env default",
+    delegation_hint:
+      "Changes take effect on the next run/build — no restart needed. When unset, the built-in default is used.",
+    delegation_save: "Save",
+    delegation_saved: "Delegation-gate capacity saved.",
+    delegation_save_failed: "Failed to save delegation-gate capacity",
     quality_heading: "Quality Monitoring",
     quality_help_title: "What is quality monitoring?",
     quality_help_body:
