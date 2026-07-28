@@ -6,6 +6,7 @@ delegation concurrency gate + its wiring through ``SubAgentTool`` /
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -20,7 +21,12 @@ from expert_work.protocol import SubAgentSpec
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.agent_factory import BuiltAgent
 from orchestrator.graph_builder.builder import _build_tool_context
-from orchestrator.tools._budget import DELEGATION_GATE_KEY, DELEGATIONS_GATED, DelegationGate
+from orchestrator.tools._budget import (
+    DELEGATION_GATE_FAIL_OPEN,
+    DELEGATION_GATE_KEY,
+    DELEGATIONS_GATED,
+    DelegationGate,
+)
 from orchestrator.tools._child_run import _child_config
 from orchestrator.tools.registry import ToolContext
 from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerAgentBuilder
@@ -193,11 +199,11 @@ async def test_provider_timeout_error_not_miscounted_as_gate_full() -> None:
         raise TimeoutError("query timed out")
 
     gate = DelegationGate(_timing_out_provider, timeout_s=1.0)
-    before = DELEGATIONS_GATED._value.get()  # type: ignore[attr-defined]
+    before = DELEGATIONS_GATED.labels(tool="subagent")._value.get()  # type: ignore[attr-defined]
 
     assert await gate.acquire() is True
 
-    after = DELEGATIONS_GATED._value.get()  # type: ignore[attr-defined]
+    after = DELEGATIONS_GATED.labels(tool="subagent")._value.get()  # type: ignore[attr-defined]
     assert after == before
 
 
@@ -254,6 +260,144 @@ async def test_provider_exception_uses_last_known_capacity() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR3 加固 — fail-open counter + healthy/failing flip logging
+# ---------------------------------------------------------------------------
+
+_BUDGET_LOGGER = "orchestrator.tools._budget"
+
+
+def _budget_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _BUDGET_LOGGER and r.levelno == logging.WARNING]
+
+
+@pytest.mark.asyncio
+async def test_read_capacity_failure_increments_counter_every_time_but_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Persistent provider failures bump ``DELEGATION_GATE_FAIL_OPEN`` on
+    EVERY failed read (still observable), but only log a warning on the
+    healthy -> failing transition — not on every failure while the
+    provider stays down (log-spam guard)."""
+
+    async def _always_raising() -> int:
+        raise RuntimeError("config store unavailable")
+
+    gate = DelegationGate(_always_raising, timeout_s=1.0)
+    before = DELEGATION_GATE_FAIL_OPEN._value.get()  # type: ignore[attr-defined]
+
+    with caplog.at_level(logging.WARNING, logger=_BUDGET_LOGGER):
+        for _ in range(3):
+            assert await gate._read_capacity() is None
+
+    after = DELEGATION_GATE_FAIL_OPEN._value.get()  # type: ignore[attr-defined]
+    assert after - before == 3
+    assert len(_budget_warnings(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_capacity_recovery_logs_info_once_and_next_failure_warns_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recovery (failing -> healthy) logs one info line; a SUBSEQUENT
+    failure after that recovery flips state again and warns once more —
+    the flip-tracking isn't a one-shot latch."""
+    should_raise = True
+
+    async def _provider() -> int:
+        if should_raise:
+            raise RuntimeError("down")
+        return 2
+
+    gate = DelegationGate(_provider, timeout_s=1.0)
+
+    with caplog.at_level(logging.WARNING, logger=_BUDGET_LOGGER):
+        assert await gate._read_capacity() is None  # healthy -> failing
+    assert len(_budget_warnings(caplog)) == 1
+    caplog.clear()
+
+    should_raise = False
+    with caplog.at_level(logging.INFO, logger=_BUDGET_LOGGER):
+        assert await gate._read_capacity() == 2  # failing -> healthy
+    recovered = [
+        r
+        for r in caplog.records
+        if r.name == _BUDGET_LOGGER and "capacity_provider_recovered" in r.message
+    ]
+    assert len(recovered) == 1
+    caplog.clear()
+
+    should_raise = True
+    with caplog.at_level(logging.WARNING, logger=_BUDGET_LOGGER):
+        assert await gate._read_capacity() == 2  # last-known capacity; healthy -> failing again
+    assert len(_budget_warnings(caplog)) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR3 加固 — acquire(timeout_s=...) run-deadline coupling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_s_smaller_than_default_bounds_the_wait() -> None:
+    """A ``timeout_s`` tighter than the gate's own default (e.g. a
+    near-expired run deadline) wins — the wait is bounded by the SMALLER
+    of the two, not the gate's generous default."""
+    gate = DelegationGate(_capacity(1), timeout_s=5.0)
+    assert await gate.acquire() is True  # occupies the only slot
+
+    started = time.monotonic()
+    result = await gate.acquire(timeout_s=0.05)
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 1.0  # bounded by the tighter 0.05s, not the gate's 5.0s default
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_s_larger_than_default_does_not_extend_the_wait() -> None:
+    """``min()`` picks the SMALLER side regardless of which operand is
+    larger — a generous caller-supplied ``timeout_s`` never overrides the
+    gate's own (smaller) default."""
+    gate = DelegationGate(_capacity(1), timeout_s=0.05)
+    assert await gate.acquire() is True  # occupies the only slot
+
+    started = time.monotonic()
+    result = await gate.acquire(timeout_s=5.0)
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 1.0  # still bounded by the gate's own 0.05s default, not 5.0s
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_s_none_uses_gate_default() -> None:
+    gate = DelegationGate(_capacity(1), timeout_s=0.05)
+    assert await gate.acquire() is True
+
+    started = time.monotonic()
+    result = await gate.acquire(timeout_s=None)
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 1.0  # bounded by the gate's own 0.05s default
+
+
+@pytest.mark.asyncio
+async def test_acquire_negative_timeout_s_returns_false_immediately() -> None:
+    """A caller passing an already-negative remaining deadline (run
+    deadline already expired before the acquire attempt) gets an
+    immediate False — no wait is attempted at all."""
+    gate = DelegationGate(_capacity(1), timeout_s=30.0)
+
+    started = time.monotonic()
+    result = await gate.acquire(timeout_s=-1.0)
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 0.05  # immediate — no wait, no gate contention needed
+
+
+# ---------------------------------------------------------------------------
 # FakeGate — records acquire()/release() calls for the tool-level tests
 # ---------------------------------------------------------------------------
 
@@ -263,9 +407,11 @@ class _FakeGate:
     admit: bool = True
     acquire_calls: int = 0
     release_calls: int = 0
+    acquire_timeout_s: list[float | None] = field(default_factory=list)
 
-    async def acquire(self) -> bool:
+    async def acquire(self, *, timeout_s: float | None = None) -> bool:
         self.acquire_calls += 1
+        self.acquire_timeout_s.append(timeout_s)
         return self.admit
 
     async def release(self) -> None:
@@ -377,6 +523,7 @@ async def test_subagent_call_gate_refusal_is_soft_fail_and_skips_child_run() -> 
     gate = _FakeGate(admit=False)
     builder = _RecordingBuilder(built=_built(_answer_graph("ok")))
     tool = SubAgentTool(subagent=_SUB, builder=builder, child_depth=1)
+    before = DELEGATIONS_GATED.labels(tool="subagent")._value.get()  # type: ignore[attr-defined]
 
     result = await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate))
 
@@ -385,6 +532,54 @@ async def test_subagent_call_gate_refusal_is_soft_fail_and_skips_child_run() -> 
     assert builder.calls == []  # child never built
     assert gate.acquire_calls == 1
     assert gate.release_calls == 0  # nothing to release — acquire never succeeded
+    after = DELEGATIONS_GATED.labels(tool="subagent")._value.get()  # type: ignore[attr-defined]
+    assert after - before == 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_call_passes_remaining_deadline_as_gate_timeout() -> None:
+    gate = _FakeGate(admit=True)
+    builder = _RecordingBuilder(built=_built(_answer_graph("ok")))
+    tool = SubAgentTool(subagent=_SUB, builder=builder, child_depth=1)
+    deadline_at = time.monotonic() + 5.0
+
+    await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=deadline_at))
+
+    assert len(gate.acquire_timeout_s) == 1
+    remaining = gate.acquire_timeout_s[0]
+    assert remaining is not None
+    assert 0 < remaining <= 5.0
+
+
+@pytest.mark.asyncio
+async def test_subagent_call_gate_timeout_s_none_when_no_run_deadline() -> None:
+    gate = _FakeGate(admit=True)
+    builder = _RecordingBuilder(built=_built(_answer_graph("ok")))
+    tool = SubAgentTool(subagent=_SUB, builder=builder, child_depth=1)
+
+    await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=None))
+
+    assert gate.acquire_timeout_s == [None]
+
+
+@pytest.mark.asyncio
+async def test_subagent_call_gate_wait_bounded_by_run_deadline_not_gate_default() -> None:
+    """A near-expired run deadline bounds the gate wait to ~0.05s, not the
+    gate's own 30s default — Mini-ADR J-40 extended to the delegation
+    gate (real ``DelegationGate``, saturated, not the ``_FakeGate``)."""
+    gate = DelegationGate(_capacity(1), timeout_s=30.0)
+    assert await gate.acquire() is True  # saturate the only slot
+
+    builder = _RecordingBuilder(built=_built(_answer_graph("ok")))
+    tool = SubAgentTool(subagent=_SUB, builder=builder, child_depth=1)
+    deadline_at = time.monotonic() + 0.05
+
+    started = time.monotonic()
+    result = await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=deadline_at))
+    elapsed = time.monotonic() - started
+
+    assert result.meta["delegation_gated"] is True
+    assert elapsed < 1.0  # bounded by the ~0.05s deadline, not the gate's 30s default
 
 
 @pytest.mark.asyncio
@@ -453,6 +648,7 @@ async def test_spawn_worker_call_gate_refusal_is_soft_fail_and_skips_child_run()
     gate = _FakeGate(admit=False)
     builder = _RecordingWorkerBuilder(built=_built(_answer_graph("ok")))
     tool = _worker_tool(builder)
+    before = DELEGATIONS_GATED.labels(tool="spawn_worker")._value.get()  # type: ignore[attr-defined]
 
     result = await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate))
 
@@ -461,6 +657,54 @@ async def test_spawn_worker_call_gate_refusal_is_soft_fail_and_skips_child_run()
     assert builder.calls == []
     assert gate.acquire_calls == 1
     assert gate.release_calls == 0
+    after = DELEGATIONS_GATED.labels(tool="spawn_worker")._value.get()  # type: ignore[attr-defined]
+    assert after - before == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_worker_call_passes_remaining_deadline_as_gate_timeout() -> None:
+    gate = _FakeGate(admit=True)
+    builder = _RecordingWorkerBuilder(built=_built(_answer_graph("ok")))
+    tool = _worker_tool(builder)
+    deadline_at = time.monotonic() + 5.0
+
+    await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=deadline_at))
+
+    assert len(gate.acquire_timeout_s) == 1
+    remaining = gate.acquire_timeout_s[0]
+    assert remaining is not None
+    assert 0 < remaining <= 5.0
+
+
+@pytest.mark.asyncio
+async def test_spawn_worker_call_gate_timeout_s_none_when_no_run_deadline() -> None:
+    gate = _FakeGate(admit=True)
+    builder = _RecordingWorkerBuilder(built=_built(_answer_graph("ok")))
+    tool = _worker_tool(builder)
+
+    await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=None))
+
+    assert gate.acquire_timeout_s == [None]
+
+
+@pytest.mark.asyncio
+async def test_spawn_worker_call_gate_wait_bounded_by_run_deadline_not_gate_default() -> None:
+    """Same run-deadline coupling as ``SubAgentTool`` — real, saturated
+    ``DelegationGate``, bounded by the ~0.05s deadline, not its 30s
+    default."""
+    gate = DelegationGate(_capacity(1), timeout_s=30.0)
+    assert await gate.acquire() is True  # saturate the only slot
+
+    builder = _RecordingWorkerBuilder(built=_built(_answer_graph("ok")))
+    tool = _worker_tool(builder)
+    deadline_at = time.monotonic() + 0.05
+
+    started = time.monotonic()
+    result = await tool.call({"task": "x"}, ctx=_ctx(delegation_gate=gate, deadline_at=deadline_at))
+    elapsed = time.monotonic() - started
+
+    assert result.meta["delegation_gated"] is True
+    assert elapsed < 1.0  # bounded by the ~0.05s deadline, not the gate's 30s default
 
 
 @pytest.mark.asyncio
