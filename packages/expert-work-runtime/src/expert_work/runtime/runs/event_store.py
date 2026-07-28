@@ -9,9 +9,11 @@ bridge's 60-second cleanup window. Two implementations behind one ABC:
 * :class:`SqlRunEventStore` — Postgres-backed, the ``run_event`` table
   (migration 0038).
 
-Producer side: ``run_agent`` calls :meth:`RunEventStore.append` after
-every ``bridge.publish`` (Stream H.3 PR 3). Failure → log + counter +
-swallow; the SSE stream is never blocked by a store hiccup.
+Producer side: ``run_agent`` enqueues a record per ``bridge.publish``
+into a bounded in-process queue; a background writer drains it in
+batches through :meth:`RunEventStore.append_batch` (二期 PR3 — moved
+off the SSE stream's hot path). Failure → log + counter + swallow; the
+SSE stream is never blocked by a store hiccup.
 
 Consumer side: ``GET /v1/sessions/{thread}/runs/{run}/events`` (Stream
 H.3 PR 4) chooses :meth:`bridge.subscribe` for live runs and
@@ -72,6 +74,28 @@ class RunEventStore(abc.ABC):
         sequence numbers. Producers (``run_agent``) MUST supply
         monotonic ``seq`` per run.
         """
+
+    async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+        """Persist ``records`` (possibly spanning several runs) in one call.
+
+        Default implementation loops :meth:`append` — correct but not
+        atomic. Backends that can commit multiple rows in a single
+        transaction (see :class:`SqlRunEventStore`) SHOULD override for a
+        true single round-trip. ``seq`` is allocated by the producer
+        (``run_agent``'s in-process counter), so unlike ``event_log``'s
+        ``put_batch`` this needs no advisory lock or in-batch seq
+        allocation.
+
+        Any record colliding on ``(run_id, seq)`` raises — the durable
+        primary key (SQL) or the in-memory dedup check in :meth:`append`.
+        On :class:`SqlRunEventStore` the failure rolls back the WHOLE
+        batch (single transaction). The caller (二期 PR3's background
+        persist writer, Mini-ADR H-7) swallows the exception, logs, and
+        bumps ``expert_work_run_event_persist_errors_total`` for every
+        record in the batch — it never blocks the live SSE stream.
+        """
+        for record in records:
+            await self.append(record)
 
     @abc.abstractmethod
     async def list(
@@ -144,6 +168,17 @@ class InMemoryRunEventStore(RunEventStore):
                 raise ValueError(msg)
         bucket.append(record)
 
+    async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+        """Append every record in ``records``, one at a time.
+
+        Reuses :meth:`append`'s per-record ``(run_id, seq)`` dedup check —
+        a colliding record raises ``ValueError`` and leaves already-appended
+        records from earlier in the batch in place (no rollback; only the
+        SQL backend's single transaction is truly atomic).
+        """
+        for record in records:
+            await self.append(record)
+
     async def list(
         self,
         *,
@@ -191,6 +226,31 @@ class SqlRunEventStore(RunEventStore):
                 )
             )
             await session.commit()
+
+    async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+        """One session + ``add_all`` + single commit — see ``event_log/db.py``'s
+        ``put_batch`` for the same pattern. No advisory lock / in-batch seq
+        allocation needed here (unlike ``put_batch``): ``seq`` already comes
+        pre-assigned from the producer. A duplicate ``(run_id, seq)`` raises
+        ``IntegrityError`` on commit and rolls back the whole batch.
+        """
+        if not records:
+            return
+        async with self._sf() as session:
+            async with session.begin():
+                session.add_all(
+                    [
+                        RunEventRow(
+                            run_id=r.run_id,
+                            seq=r.seq,
+                            event_name=r.event_name,
+                            data=r.data,
+                            created_at_ms=r.created_at_ms,
+                            created_at=r.created_at,
+                        )
+                        for r in records
+                    ]
+                )
 
     async def list(
         self,
