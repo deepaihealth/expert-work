@@ -1397,6 +1397,12 @@ def create_app(
                 resolved_agent_runtime.dynamic_worker_config_service = (
                     resolved_platform_dynamic_worker_config_service
                 )
+                # perf phase2 PR3 T3 — delegation_gate() reads THROUGH this
+                # service live (DB-wins-over-env); ``None`` would keep the
+                # gate unwired (delegations run ungated).
+                resolved_agent_runtime.delegation_config_service = (
+                    resolved_platform_delegation_config_service
+                )
                 # Stream J.12 — the curation worker reads the L7
                 # trajectory ObjectStore, so it is constructed here
                 # where the store exists (mirrors MemoryDLQWorker).

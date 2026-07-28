@@ -298,6 +298,8 @@ class OrphanSweep:
                     trajectory_enabled=built.trajectory_recording,
                     token_budget=built.token_budget,
                     worker_spawn_budget=await self._runtime.new_worker_spawn_budget(),
+                    # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
+                    delegation_gate=self._runtime.delegation_gate(),
                     tool_replay_safe=built.tool_replay_safe,
                 )
             )

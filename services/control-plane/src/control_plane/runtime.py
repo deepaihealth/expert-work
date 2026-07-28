@@ -29,6 +29,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from opentelemetry import trace
 
 from control_plane.credential_value_cache import CredentialValueCache
+from control_plane.platform_delegation_config import PlatformDelegationConfigService
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
@@ -213,6 +214,19 @@ class AgentRuntime:
     #: (tests / pre-lifespan-swap) falls back to the attrs above, which
     #: the lifespan cold-reads from settings at boot.
     dynamic_worker_config_service: PlatformDynamicWorkerConfigService | None = None
+    #: perf phase2 PR3 — the platform delegation-gate config service. When
+    #: set, :meth:`delegation_gate` builds a process-wide concurrency gate
+    #: that reads capacity live through ``effective()`` (DB-wins-over-env) on
+    #: every ``acquire()``, so a platform-settings change is hot for the NEXT
+    #: delegation, no restart. ``None`` (tests / pre-lifespan-swap) makes
+    #: :meth:`delegation_gate` return ``None`` — delegations run ungated,
+    #: same as before this gate existed.
+    delegation_config_service: PlatformDelegationConfigService | None = None
+    #: Lazily-built :class:`~orchestrator.tools._budget.DelegationGate`
+    #: singleton (see :meth:`delegation_gate`). Typed ``Any`` to keep this
+    #: module's import graph light — mirrors ``new_worker_spawn_budget``'s
+    #: lazy import of the orchestrator type.
+    _delegation_gate: Any = field(default=None, repr=False)
     #: The durable checkpointer the app lifespan binds into ``agent_builder``.
     #: Exposed here so read-only history surfaces (Playground resume — the
     #: ``/messages`` endpoint) can read a thread's checkpoint DIRECTLY instead of
@@ -273,6 +287,29 @@ class AgentRuntime:
             max_per_run=max_per_run,
             max_concurrent=max_concurrent,
         )
+
+    def delegation_gate(self) -> Any | None:
+        """Process-wide delegation concurrency gate — a lazy singleton.
+
+        Unlike :meth:`new_worker_spawn_budget` (a fresh per-run object),
+        this is built ONCE per process and reused by every run + every
+        delegation depth (subagent + spawn_worker), so it actually bounds
+        total concurrent delegations platform-wide. ``None`` when no
+        ``delegation_config_service`` is wired — the gate stays unwired and
+        delegations run ungated, matching behaviour before this gate existed.
+        """
+        if self.delegation_config_service is None:
+            return None
+        if self._delegation_gate is None:
+            from orchestrator.tools._budget import DelegationGate
+
+            service = self.delegation_config_service
+
+            async def _capacity() -> int:
+                return (await service.effective()).max_concurrent_delegations
+
+            self._delegation_gate = DelegationGate(_capacity)
+        return self._delegation_gate
 
     async def get_agent(
         self,
