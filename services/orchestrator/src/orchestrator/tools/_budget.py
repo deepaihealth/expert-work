@@ -57,6 +57,15 @@ DELEGATION_GATE_KEY: Final = "delegation_gate"
 DELEGATIONS_GATED = expert_work_counter(
     "expert_work_delegations_gated_total",
     "Delegations refused by the global concurrency gate (acquire timeout).",
+    ("tool",),
+)
+
+#: PR3 加固 — every ``_read_capacity`` fail-open (provider raised, gate falls
+#: back to last-known/unbounded rather than blocking). Unlabeled: this is a
+#: platform-wide health signal, not per-tool.
+DELEGATION_GATE_FAIL_OPEN = expert_work_counter(
+    "expert_work_delegation_gate_fail_open_total",
+    "DelegationGate capacity_provider reads that failed open (provider raised).",
 )
 
 
@@ -107,14 +116,30 @@ class DelegationGate:
         self._active = 0
         self._cond = asyncio.Condition()
         self._last_capacity: int | None = None
+        #: PR3 加固 — tracks the healthy/failing transition so
+        #: ``_read_capacity`` logs a warning only on health flips, not on
+        #: every failed read while the provider stays down.
+        self._provider_healthy: bool = True
 
     @property
     def active(self) -> int:
         return self._active
 
-    async def acquire(self) -> bool:
+    async def acquire(self, *, timeout_s: float | None = None) -> bool:
+        """Wait up to ``timeout_s`` for a slot — ``None`` uses the gate's own
+        ``timeout_s`` default; otherwise the SMALLER of the two wins (PR3
+        加固 — Mini-ADR J-40's run deadline extended to the delegation gate,
+        so a near-expired run never waits out the gate's full default).
+        A ``timeout_s`` that's already <= 0 (deadline already expired)
+        returns ``False`` immediately without attempting the wait.
+        """
+        effective_timeout = (
+            self._timeout_s if timeout_s is None else min(self._timeout_s, timeout_s)
+        )
+        if effective_timeout <= 0:
+            return False
         try:
-            async with asyncio.timeout(self._timeout_s):
+            async with asyncio.timeout(effective_timeout):
                 while True:
                     capacity = await self._read_capacity()
                     async with self._cond:
@@ -146,12 +171,24 @@ class DelegationGate:
             # ``asyncio.timeout`` itself expires while awaiting the
             # provider) is a ``BaseException``, not caught here, and
             # propagates to become that outer timeout as intended.
-            logger.warning(
-                "DelegationGate capacity_provider failed; falling back to last known capacity %r",
-                self._last_capacity,
-                exc_info=True,
-            )
+            DELEGATION_GATE_FAIL_OPEN.inc()
+            if self._provider_healthy:
+                # healthy -> failing flip: log once, then go quiet for as
+                # long as the provider stays down — the counter above still
+                # advances on every failed read, so persistent outages
+                # remain observable without spamming the log.
+                self._provider_healthy = False
+                logger.warning(
+                    "DelegationGate capacity_provider failed; falling back to last "
+                    "known capacity %r",
+                    self._last_capacity,
+                    exc_info=True,
+                )
             return self._last_capacity
+        if not self._provider_healthy:
+            # failing -> healthy flip.
+            self._provider_healthy = True
+            logger.info("delegation_gate.capacity_provider_recovered")
         self._last_capacity = capacity
         return capacity
 

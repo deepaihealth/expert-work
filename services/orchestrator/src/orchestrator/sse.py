@@ -356,15 +356,7 @@ async def run_agent(
         try:
             persist_queue.put_nowait(record_)
         except asyncio.QueueFull:
-            try:
-                persist_queue.get_nowait()  # drop-oldest
-                persist_queue.task_done()
-            except asyncio.QueueEmpty:
-                # writer 恰在 QueueFull 与 get_nowait 之间清空了队列——位子
-                # 已经腾出来,无需(也无从)丢帧,直接重投即可。
-                pass
-            _run_event_queue_dropped.labels(event_name=event_name).inc()
-            persist_queue.put_nowait(record_)
+            _put_dropping_oldest(persist_queue, record_)
 
     # mypy: event_store is RunEventStore | None here; _persist_writer wants a
     # concrete RunEventStore. No writer (and no queue consumer) when there's
@@ -777,14 +769,7 @@ async def run_agent(
         try:
             persist_queue.put_nowait(None)
         except asyncio.QueueFull:
-            try:
-                persist_queue.get_nowait()
-                persist_queue.task_done()
-            except asyncio.QueueEmpty:
-                # writer 恰在 QueueFull 与 get_nowait 之间清空了队列——位子
-                # 已腾出,sentinel 直接重投(此路径必须全同步,不能 await)。
-                pass
-            persist_queue.put_nowait(None)
+            _put_dropping_oldest(persist_queue, None)
         # Stream 9.4 — stop renewing the lease; the terminal status write
         # already moved the run out of ``running`` so it's no longer an orphan
         # candidate regardless of the now-stale lease.
@@ -826,6 +811,47 @@ _run_event_queue_dropped = expert_work_counter(
     "Frames dropped from the run_event persist queue (drop-oldest on overflow).",
     ("event_name",),
 )
+
+
+def _put_dropping_oldest(
+    queue: asyncio.Queue[RunEventRecord | None], item: RunEventRecord | None
+) -> None:
+    """Make room in a full ``queue`` for ``item`` by evicting the oldest
+    entry, then put ``item``. Call only from an ``except
+    asyncio.QueueFull`` handler. Fully synchronous (zero-await) — shared by
+    ``_enqueue_event``'s drop-oldest branch and ``run_agent``'s ``finally``
+    sentinel put, both of which must never block on a full persist queue
+    (H-7).
+
+    ``item`` is either a real ``RunEventRecord`` (``_enqueue_event``) or the
+    ``None`` shutdown sentinel (``finally``). If the entry evicted to make
+    room is itself a stray ``None`` sentinel — unreachable via the single-
+    sentinel-at-shutdown flow ``run_agent`` follows today, but defended
+    against here (and exercised directly by tests) — it isn't a real frame,
+    so it isn't charged to ``_run_event_queue_dropped``; a second (real)
+    entry is evicted in its place so the counter always reflects genuine
+    dropped data and ``item`` still lands as intended (a fresh sentinel
+    displacing a stray one stays a no-op for durability).
+    """
+    try:
+        dropped = queue.get_nowait()
+    except asyncio.QueueEmpty:
+        # The writer drained the queue in the gap between the caller's
+        # QueueFull and this get_nowait() — the slot is already free.
+        queue.put_nowait(item)
+        return
+    queue.task_done()
+    if dropped is None:
+        try:
+            dropped = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            dropped = None
+        else:
+            queue.task_done()
+    if dropped is not None:
+        _run_event_queue_dropped.labels(event_name=dropped.event_name).inc()
+    queue.put_nowait(item)
+
 
 #: Sentinel distinguishing "queue.get() timed out, no item" from a real
 #: item (including the ``None`` shutdown sentinel) in ``_persist_writer``.

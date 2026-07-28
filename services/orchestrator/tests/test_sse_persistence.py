@@ -24,11 +24,15 @@ from expert_work.runtime.runs import (
     RunManager,
     RunRecord,
     RunStatus,
+    make_event_record,
 )
 from expert_work.runtime.stream_bridge import END_SENTINEL, InMemoryStreamBridge
 from orchestrator import sse as sse_module
 from orchestrator.sse import (
     _BACKGROUND_PERSIST_WRITERS,
+    _PERSIST_FLUSH_INTERVAL_S,
+    _persist_writer,
+    _put_dropping_oldest,
     _run_event_persist_errors,
     _run_event_queue_dropped,
     run_agent,
@@ -616,3 +620,111 @@ async def test_dead_writer_drain_returns_fast() -> None:
     assert elapsed < 1.0
 
     await _await_writers()  # no-op cleanup: the writer is already done
+
+
+# ---------------------------------------------------------------------------
+# PR3 加固 — ``_put_dropping_oldest`` (shared by ``_enqueue_event``'s
+# drop-oldest branch and ``run_agent``'s ``finally`` sentinel put): M-1 fix
+# (label the truly-evicted frame, not the newly-enqueued one) + sentinel
+# eviction fallback. Unit-tested directly against a hand-built queue — no
+# ``run_agent`` / background writer race involved.
+# ---------------------------------------------------------------------------
+
+
+def _rec(*, seq: int, event_name: str) -> RunEventRecord:
+    return make_event_record(run_id=uuid4(), seq=seq, event_name=event_name, data={})
+
+
+@pytest.mark.asyncio
+async def test_put_dropping_oldest_labels_the_evicted_frame_not_the_new_one() -> None:
+    """M-1: the drop-oldest counter must be labeled with the EVICTED
+    (oldest) frame's event_name, not the newly-enqueued frame's — the old
+    code always used the new frame's name, which was silently correct
+    only when both frames happened to share a name."""
+    queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=1)
+    queue.put_nowait(_rec(seq=0, event_name="metadata"))
+    new_item = _rec(seq=1, event_name="updates")
+
+    before = _run_event_queue_dropped.labels(event_name="metadata")._value.get()
+
+    _put_dropping_oldest(queue, new_item)
+
+    after = _run_event_queue_dropped.labels(event_name="metadata")._value.get()
+    assert after - before == 1
+    assert queue.qsize() == 1
+    assert queue.get_nowait() is new_item  # the new frame survived, unevicted
+
+
+@pytest.mark.asyncio
+async def test_put_dropping_oldest_stray_sentinel_evicts_a_real_frame_instead() -> None:
+    """Defensive fallback exercised directly: if the entry evicted to make
+    room turns out to already be a stray ``None`` sentinel (unreachable
+    via the single-sentinel-at-shutdown flow ``run_agent`` follows today),
+    it must not be charged to the drop counter — a second, REAL, frame is
+    evicted (and counted) in its place, and the fresh sentinel being
+    enqueued (``run_agent``'s ``finally`` block) still ends up in the
+    queue where a background writer can pick it up and exit cleanly."""
+    queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=2)
+    queue.put_nowait(None)  # stray sentinel already occupying the head
+    real = _rec(seq=0, event_name="updates")
+    queue.put_nowait(real)
+
+    before = _run_event_queue_dropped.labels(event_name="updates")._value.get()
+
+    _put_dropping_oldest(queue, None)  # finally's fresh sentinel
+
+    after = _run_event_queue_dropped.labels(event_name="updates")._value.get()
+    assert after - before == 1  # the REAL frame is what's charged, not the stray sentinel
+    assert queue.qsize() == 1
+    assert queue.get_nowait() is None  # the fresh sentinel is what's left, at the tail
+
+    # And a background writer handed this (now sentinel-only) queue exits
+    # cleanly instead of hanging — nothing left to persist.
+    queue.put_nowait(None)  # restore the sentinel consumed by the assertion above
+    store = InMemoryRunEventStore()
+    run_id = uuid4()
+    await asyncio.wait_for(_persist_writer(store, queue, run_id=run_id), timeout=1.0)
+    assert await store.list(run_id=run_id) == []
+
+
+# ---------------------------------------------------------------------------
+# PR3 加固 — flush-on-empty pin: a lone record with nothing behind it (and
+# no sentinel) must be flushed almost immediately, not held for the full
+# _PERSIST_FLUSH_INTERVAL_S idle-poll tax.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_writer_flushes_immediately_when_queue_goes_empty() -> None:
+    """Pins the queue-empty flush optimization (``or queue.empty()`` in the
+    flush condition): a regression here would silently reintroduce a
+    _PERSIST_FLUSH_INTERVAL_S (100ms) latency tail on every run's terminal
+    frame."""
+    flushed_at: list[float] = []
+
+    class _TimingStore(InMemoryRunEventStore):
+        async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+            await super().append_batch(records)
+            flushed_at.append(time.monotonic())
+
+    run_id = uuid4()
+    queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=8)
+    queue.put_nowait(make_event_record(run_id=run_id, seq=0, event_name="updates", data={}))
+    # No sentinel — the writer must flush this lone record on its own via
+    # the queue-empty check, not because it saw a shutdown signal.
+
+    store = _TimingStore()
+    started = time.monotonic()
+    writer_task = asyncio.create_task(_persist_writer(store, queue, run_id=run_id))
+    try:
+        deadline = time.monotonic() + 1.0
+        while not flushed_at and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert flushed_at, "append_batch was never called"
+    finally:
+        writer_task.cancel()
+        await asyncio.gather(writer_task, return_exceptions=True)
+
+    elapsed = flushed_at[0] - started
+    assert elapsed < 0.05  # << _PERSIST_FLUSH_INTERVAL_S (0.1s) — no idle-poll tax
+    assert elapsed < _PERSIST_FLUSH_INTERVAL_S / 2

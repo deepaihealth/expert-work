@@ -150,15 +150,21 @@ class SubAgentTool:
         # Acquired before the child build so a saturated gate doesn't pay for
         # resolving/building a child agent it can't run yet.
         gate = ctx.delegation_gate
-        if gate is not None and not await gate.acquire():
-            DELEGATIONS_GATED.inc()
-            return ToolResult(
-                content=(
-                    "[delegation refused: platform-wide delegation concurrency is "
-                    "saturated; retry later or complete the work without delegating]"
-                ),
-                meta={"delegation_gated": True, "reason": "global_gate_timeout"},
-            )
+        if gate is not None:
+            # PR3 加固 — the gate wait is bounded by whichever is smaller:
+            # the gate's own default or the run's remaining deadline (Mini-
+            # ADR J-40), so a near-expired run never waits out the gate's
+            # full default before degrading to a soft-fail refusal.
+            remaining = ctx.deadline_at - time.monotonic() if ctx.deadline_at is not None else None
+            if not await gate.acquire(timeout_s=remaining):
+                DELEGATIONS_GATED.labels(tool="subagent").inc()
+                return ToolResult(
+                    content=(
+                        "[delegation refused: platform-wide delegation concurrency is "
+                        "saturated; retry later or complete the work without delegating]"
+                    ),
+                    meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+                )
         try:
             child = await self.builder(
                 tenant_id=ctx.tenant_id,
