@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.audit import emit as audit_emit
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
@@ -68,6 +70,17 @@ logger = logging.getLogger("expert_work.control_plane.memory_consolidator")
 # Default cadence — one sweep per 4 hours. Configurable via constructor
 # so tests drive a fast loop and operators dial it.
 _DEFAULT_INTERVAL_S: float = 14_400.0
+
+#: Advisory-lock classid for the single-flight sweep — makes concurrent
+#: replicas race for one winner per cycle instead of each spending LLM
+#: calls on the same work. Mirrors ``QualityDriftWorker._DRIFT_LOCK_CLASSID``
+#: (quality_drift_worker.py); a distinct value so the two never share a key
+#: (workspace_lock.py uses 1, mcp_oauth_refresh_lock.py uses 2, the drift
+#: worker uses 8615).
+_CONSOLIDATOR_LOCK_CLASSID = 8616
+#: The lock txn is held open for the whole sweep; keep it off any idle
+#: reaper.
+_LOCK_TXN_TIMEOUT_MS = 5 * 60 * 1000
 
 # Per-(tenant, user) safety caps. Hard-coded for Sprint #7 — Mini-ADR
 # U-34. Prevents a runaway worker from emitting thousands of LLM calls
@@ -533,6 +546,7 @@ class MemoryConsolidator:
         default_aux_model_name: str = "claude-sonnet-4-6",
         actor_id: str = "memory_consolidator",
         usage_store: TokenUsageStore | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -549,6 +563,10 @@ class MemoryConsolidator:
         self._interval_s = interval_s
         self._default_model = default_aux_model_name
         self._actor_id = actor_id
+        # Advisory-lock session factory (multi-replica single-flight, same
+        # shape as ``QualityDriftWorker``). ``None`` (in-memory / single
+        # process) skips the lock — matches quality_drift's degrade.
+        self._session_factory = session_factory
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -592,6 +610,41 @@ class MemoryConsolidator:
                 record_consolidator_run(outcome="error")
 
     async def run_once(self) -> ConsolidatorRunSummary:
+        """Run one sweep, single-flight across replicas.
+
+        Each per-user write inside the sweep is individually idempotent, so
+        two replicas racing the same sweep is safe — just wasted LLM calls
+        (the class docstring's "single replica per cluster" note). A
+        ``pg_try_advisory_xact_lock`` makes the whole sweep single-flight
+        (mirrors ``QualityDriftWorker.run_once``); a replica that misses the
+        lock returns an empty summary immediately, no sweep attempted.
+        Single-process / in-memory runs have no factory and need no lock.
+        """
+        if self._session_factory is None:
+            return await self._run_sweep()
+        async with self._session_factory() as lock_session:
+            # Long-hold guard: the lock txn stays open for the sweep; keep it
+            # off any idle-in-transaction reaper (same posture as
+            # PgWorkspaceLock / QualityDriftWorker).
+            await lock_session.execute(
+                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+            )
+            got = (
+                await lock_session.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
+                    {"cid": _CONSOLIDATOR_LOCK_CLASSID, "k": "memory_consolidator"},
+                )
+            ).scalar_one()
+            if not got:
+                await lock_session.rollback()
+                return ConsolidatorRunSummary()
+            try:
+                return await self._run_sweep()
+            finally:
+                # rollback ends the txn → releases the xact advisory lock.
+                await lock_session.rollback()
+
+    async def _run_sweep(self) -> ConsolidatorRunSummary:
         """One full sweep across all tenants. Idempotent.
 
         Returns the summary so tests can assert on transition counts.
