@@ -831,7 +831,10 @@ def _put_dropping_oldest(
     so it isn't charged to ``_run_event_queue_dropped``; a second (real)
     entry is evicted in its place so the counter always reflects genuine
     dropped data and ``item`` still lands as intended (a fresh sentinel
-    displacing a stray one stays a no-op for durability).
+    displacing a stray one stays a no-op for durability). 注意不对称:该
+    级联对真帧调用者会吞掉队头的 stray sentinel 而不补投——今天不可达
+    (``_enqueue_event`` 只在 graph await 期间跑,先于 ``finally`` 的唯一
+    sentinel),若未来出现多 sentinel 流,真帧调用方需先特判队头。
     """
     try:
         dropped = queue.get_nowait()

@@ -65,7 +65,8 @@ DELEGATIONS_GATED = expert_work_counter(
 #: platform-wide health signal, not per-tool.
 DELEGATION_GATE_FAIL_OPEN = expert_work_counter(
     "expert_work_delegation_gate_fail_open_total",
-    "DelegationGate capacity_provider reads that failed open (provider raised).",
+    "DelegationGate capacity_provider read failures (fail-open when no capacity "
+    "was ever read, else fallback to last-known capacity).",
 )
 
 

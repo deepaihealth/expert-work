@@ -646,11 +646,14 @@ async def test_put_dropping_oldest_labels_the_evicted_frame_not_the_new_one() ->
     new_item = _rec(seq=1, event_name="updates")
 
     before = _run_event_queue_dropped.labels(event_name="metadata")._value.get()
+    updates_before = _run_event_queue_dropped.labels(event_name="updates")._value.get()
 
     _put_dropping_oldest(queue, new_item)
 
     after = _run_event_queue_dropped.labels(event_name="metadata")._value.get()
+    updates_after = _run_event_queue_dropped.labels(event_name="updates")._value.get()
     assert after - before == 1
+    assert updates_after == updates_before  # 新帧一侧不计——只记被丢的那帧
     assert queue.qsize() == 1
     assert queue.get_nowait() is new_item  # the new frame survived, unevicted
 
@@ -677,6 +680,11 @@ async def test_put_dropping_oldest_stray_sentinel_evicts_a_real_frame_instead() 
     assert after - before == 1  # the REAL frame is what's charged, not the stray sentinel
     assert queue.qsize() == 1
     assert queue.get_nowait() is None  # the fresh sentinel is what's left, at the tail
+    # 配平钉:helper 内部每次 get 恰一 task_done——补上我们自己这次 get 的
+    # task_done 后 join() 必须立即归零;helper 少记会在此挂 1s 超时,多记
+    # 会在上面就抛 ValueError。
+    queue.task_done()
+    await asyncio.wait_for(queue.join(), timeout=1.0)
 
     # And a background writer handed this (now sentinel-only) queue exits
     # cleanly instead of hanging — nothing left to persist.
@@ -726,5 +734,4 @@ async def test_persist_writer_flushes_immediately_when_queue_goes_empty() -> Non
         await asyncio.gather(writer_task, return_exceptions=True)
 
     elapsed = flushed_at[0] - started
-    assert elapsed < 0.05  # << _PERSIST_FLUSH_INTERVAL_S (0.1s) — no idle-poll tax
-    assert elapsed < _PERSIST_FLUSH_INTERVAL_S / 2
+    assert elapsed < _PERSIST_FLUSH_INTERVAL_S / 2  # 无 idle-poll 尾税
