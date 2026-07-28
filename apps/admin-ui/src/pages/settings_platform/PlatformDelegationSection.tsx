@@ -3,7 +3,8 @@
  *
  * Self-contained section: GETs the platform delegation-gate capacity on
  * mount and shows one number input for the resolved (effective) cap on
- * concurrent sub-agent delegations per run. Saving writes an explicit
+ * concurrent sub-agent delegations across the whole platform (per process,
+ * shared by every run). Saving writes an explicit
  * platform override that takes effect on the next run/build — no redeploy,
  * overriding the process's built-in default. system_admin-only at the route
  * level; surfaces backend errors.

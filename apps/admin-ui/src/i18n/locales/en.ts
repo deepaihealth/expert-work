@@ -4995,8 +4995,8 @@ const en: TranslationKeys = {
     delegation_heading: "Delegation-gate capacity",
     delegation_help_title: "What is the delegation-gate capacity?",
     delegation_help_body:
-      "Caps how many sub-agent delegations a run may have in flight at once. Unset falls back to the built-in default.",
-    delegation_max_concurrent_delegations_label: "Max concurrent delegations per run",
+      "Caps how many sub-agent delegations may be in flight at once across the whole platform (per process). Unset falls back to the built-in default. Once the cap is reached, a new delegation queues for up to 30 seconds waiting for a slot; if none frees up in time, that delegation soft-fails without interrupting the run.",
+    delegation_max_concurrent_delegations_label: "Max concurrent delegations (platform-wide)",
     delegation_env_default: "env default",
     delegation_hint:
       "Changes take effect on the next run/build — no restart needed. When unset, the built-in default is used.",

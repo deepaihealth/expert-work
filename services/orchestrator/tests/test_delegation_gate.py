@@ -202,6 +202,33 @@ async def test_provider_timeout_error_not_miscounted_as_gate_full() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_slower_than_timeout_still_times_out() -> None:
+    """A provider that outlives ``timeout_s`` must not hang ``acquire``.
+
+    ``_read_capacity`` catches ``Exception``, not ``BaseException`` — this is
+    the only thing that keeps a provider-internal ``asyncio.CancelledError``
+    (raised when the OUTER ``asyncio.timeout`` in ``acquire`` expires while
+    the provider is still awaited) propagating instead of being swallowed.
+    If ``_read_capacity`` ever widened its ``except`` to ``BaseException``,
+    the cancellation would be caught and retried, and this call would hang
+    past ``timeout_s`` instead of degrading to a soft-fail ``False``.
+    """
+
+    async def _slow_provider() -> int:
+        await asyncio.sleep(0.2)
+        return 1
+
+    gate = DelegationGate(_slow_provider, timeout_s=0.05)
+
+    started = time.monotonic()
+    result = await gate.acquire()
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 0.15  # bounded by timeout_s, not the provider's 0.2s sleep
+
+
+@pytest.mark.asyncio
 async def test_provider_exception_uses_last_known_capacity() -> None:
     """After one successful read, a later provider exception falls back to
     the LAST KNOWN capacity — not an unbounded fail-open — so a config

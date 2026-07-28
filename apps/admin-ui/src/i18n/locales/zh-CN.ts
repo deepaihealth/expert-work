@@ -2043,8 +2043,8 @@ const zhCN: TranslationKeys = {
     delegation_heading: "委托并发闸容量",
     delegation_help_title: "什么是委托并发闸容量?",
     delegation_help_body:
-      "限制单次运行同时在途的子 Agent 委托数量上限。未配置时使用内置默认值。",
-    delegation_max_concurrent_delegations_label: "单 run 委托并发上限",
+      "限制全平台(本进程)同时在途的子 Agent 委托总数上限。未配置时使用内置默认值。到达上限后,新的委托会排队最长 30 秒等待空位;若超时仍无空位,该次委托会软失败,不会中断所在的运行。",
+    delegation_max_concurrent_delegations_label: "平台级委托并发上限",
     delegation_env_default: "环境默认",
     delegation_hint:
       "改后对下一次运行/构建生效,无需重启;未配置时使用内置默认值。",

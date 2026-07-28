@@ -1,8 +1,9 @@
 /**
  * Platform delegation-gate config SDK — backed by
  * /v1/platform/delegation-config (perf phase2 PR3). system_admin-only,
- * platform-level. Caps how many concurrent sub-agent delegations a run may
- * have in flight at once. ``configured`` is the explicit platform override
+ * platform-level. Caps how many concurrent sub-agent delegations may be in
+ * flight at once across the whole platform (per process, shared by every
+ * run) — not a per-run cap. ``configured`` is the explicit platform override
  * (``null`` ⇒ unset, using the built-in default); ``effective`` is the
  * resolved capacity the agent runtime reads.
  */

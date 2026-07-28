@@ -61,9 +61,10 @@ DELEGATIONS_GATED = expert_work_counter(
 
 
 # 二期 PR3(spec P4)— 进程级委托并发闸。容量每次 acquire 时经
-# capacity_provider 现读(provider 内部是 30s TTL 的配置服务),配置
-# 热生效语义 = 对下一次委托生效,不影响已在闸内的。单进程部署下
-# 真闸得住;HA 双色同活时每实例一闸(与本仓多副本 TTL 兜底同一立场)。
+# capacity_provider 现读(provider 内部是配置服务的内存 TTL 读,默认
+# 分钟级以内),配置热生效语义 = 对下一次委托生效,不影响已在闸内的。
+# 单进程部署下真闸得住;HA 双色同活时每实例一闸(与本仓多副本 TTL
+# 兜底同一立场)。
 class DelegationGate:
     """Process-wide concurrency gate for delegations (subagent + spawn_worker).
 
@@ -74,8 +75,9 @@ class DelegationGate:
     Fix round 1 (queue-head blocking): ``capacity_provider`` is invoked
     OUTSIDE ``self._cond`` — each waiting acquirer re-reads capacity, then
     briefly takes the lock only to compare + increment. The production
-    provider (``PlatformDelegationConfigService.effective``) does a real DB
-    read whenever its 30s TTL cache expires, so running it under the lock
+    provider (``PlatformDelegationConfigService.effective``) is an in-memory
+    TTL-cached read (default well under a minute) that does one real DB
+    round-trip whenever the cache expires, so running it under the lock
     would make every ``acquire`` *and every ``release``* (release also needs
     the lock) queue behind that one slow DB round-trip — a queue-head-
     blocking amplifier turning one slow query into a platform-wide stall.
