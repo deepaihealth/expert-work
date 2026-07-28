@@ -118,14 +118,18 @@ class WebhookEndpointRecord(BaseModel):
 class WebhookDeliveryStatus(StrEnum):
     """Lifecycle status of a :class:`WebhookDeliveryRecord` — one delivery.
 
-    ``PENDING`` — enqueued, not yet attempted. ``DELIVERED`` — a 2xx was
-    received. ``FAILED`` — a non-retryable outcome (4xx, Mini-ADR HX-J2).
-    ``RETRYING`` — a 5xx / timeout is queued for a backoff re-try
-    (``next_retry_at`` set). ``DEAD_LETTER`` — terminal after the retry
-    budget is spent.
+    ``PENDING`` — enqueued, not yet attempted. ``DELIVERING`` — claimed by a
+    worker replica via the CAS ``claim_ready`` (W1-PR1, multi-replica
+    readiness) and in flight; a replica that crashes mid-delivery leaves the
+    row here until the next sweep's stale-claim window reclaims it.
+    ``DELIVERED`` — a 2xx was received. ``FAILED`` — a non-retryable outcome
+    (4xx, Mini-ADR HX-J2). ``RETRYING`` — a 5xx / timeout is queued for a
+    backoff re-try (``next_retry_at`` set). ``DEAD_LETTER`` — terminal after
+    the retry budget is spent.
     """
 
     PENDING = "pending"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
     FAILED = "failed"
     RETRYING = "retrying"

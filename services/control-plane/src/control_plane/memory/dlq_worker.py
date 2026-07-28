@@ -152,7 +152,23 @@ class MemoryDLQWorker:
         retried = 0
         dead = 0
         for row in ready:
-            outcome = await self._attempt_one(row, now=now)
+            try:
+                outcome = await self._attempt_one(row, now=now)
+            except Exception as exc:
+                # take_ready already claimed this row (attempts bumped,
+                # next_retry_at pushed to the claim lease) before handing
+                # it to _attempt_one. If the DLQ-store call *inside* one of
+                # _attempt_one's own except-branches raises (mark_done /
+                # record_failure itself failing — e.g. a DB hiccup), that
+                # exception is not caught there, so neither the success nor
+                # the failure path settles the claim. Left alone the row
+                # would sit stuck until the lease elapses — the same trap
+                # the webhook delivery worker's unhandled-exception branch
+                # hit (see ``webhook_delivery_worker._release``). Release
+                # it immediately instead.
+                logger.warning("memory.dlq_worker.unhandled row_id=%s err=%s", row.id, exc)
+                await self._release(row, now=now, error=exc)
+                continue
             if outcome == "ok":
                 succeeded += 1
                 _retries_succeeded.inc()
@@ -199,7 +215,9 @@ class MemoryDLQWorker:
             )
             return "dead"
         except Exception as exc:
-            next_attempt_number = row.attempts + 1
+            # ``row.attempts`` already counts this try — take_ready's claim
+            # bumped it atomically before handing the row here (W1-PR1).
+            next_attempt_number = row.attempts
             if next_attempt_number >= self._max_attempts:
                 logger.error(
                     "memory.dlq_worker.dead_letter row_id=%s attempts=%d last_error=%s",
@@ -227,6 +245,31 @@ class MemoryDLQWorker:
             return "retry"
         await self._dlq.mark_done(row_id=row.id)
         return "ok"
+
+    async def _release(self, row: DLQRowLike, *, now: datetime, error: BaseException) -> None:
+        """Best-effort release for a row ``take_ready`` claimed but
+        ``_attempt_one`` never resolved (see the call site in
+        :meth:`run_once`). Reuses :meth:`MemoryWritebackDLQ.record_failure`
+        — its new claim-time-only attempts semantics (W1-PR1) mean this
+        call only touches ``last_error``/``next_retry_at``, so it does not
+        double-count the attempt ``take_ready`` already booked; a release
+        is not a second try, and the claim already spent one. Setting
+        ``next_retry_at=now`` makes the row immediately re-claimable
+        instead of sitting out the rest of the ``_CLAIM_LEASE_S`` window.
+
+        Failure here is logged and swallowed, not raised — the claim
+        lease itself is the backstop that reclaims the row even if this
+        call fails too.
+        """
+        try:
+            await self._dlq.record_failure(
+                row_id=row.id,
+                error=f"dlq_worker.unhandled: {type(error).__name__}: {error}",
+                when=now,
+                next_retry_at=now,
+            )
+        except Exception:
+            logger.exception("memory.dlq_worker.release_failed row_id=%s", row.id)
 
 
 def _build_memory_items(row: DLQRowLike, vectors: Sequence[Sequence[float]]) -> list[MemoryItem]:

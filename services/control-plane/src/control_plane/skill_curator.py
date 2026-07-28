@@ -37,6 +37,9 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from control_plane.audit import emit as audit_emit
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from expert_work.common.observability import current_trace_id_hex
@@ -55,6 +58,18 @@ logger = logging.getLogger("expert_work.control_plane.skill_curator")
 # Default cadence — one sweep per day. Configurable via the constructor
 # so tests can drive a fast loop and platform operators can dial it.
 _DEFAULT_INTERVAL_S: float = 86_400.0
+
+#: Advisory-lock classid for the single-flight sweep — makes concurrent
+#: replicas race for one winner per cycle instead of each doing the same
+#: (harmless but wasted) work. Mirrors
+#: ``QualityDriftWorker._DRIFT_LOCK_CLASSID`` (quality_drift_worker.py); a
+#: distinct value so the two never share a key (workspace_lock.py uses 1,
+#: mcp_oauth_refresh_lock.py uses 2, the drift worker uses 8615, the
+#: memory consolidator uses 8616).
+_CURATOR_LOCK_CLASSID = 8617
+#: The lock txn is held open for the whole sweep; keep it off any idle
+#: reaper.
+_LOCK_TXN_TIMEOUT_MS = 5 * 60 * 1000
 
 # Fallback thresholds applied when a tenant has no tenant_config row
 # yet. Match the Pydantic defaults so behavior is the same whether or
@@ -114,6 +129,7 @@ class SkillCurator:
         audit_logger: AuditLogger,
         interval_s: float = _DEFAULT_INTERVAL_S,
         actor_id: str = "skill_curator",
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -123,6 +139,10 @@ class SkillCurator:
         self._audit = audit_logger
         self._interval_s = interval_s
         self._actor_id = actor_id
+        # Advisory-lock session factory (multi-replica single-flight, same
+        # shape as ``QualityDriftWorker``). ``None`` (in-memory / single
+        # process) skips the lock — matches quality_drift's degrade.
+        self._session_factory = session_factory
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -169,6 +189,42 @@ class SkillCurator:
                 logger.exception("skill_curator.cycle_failed")
 
     async def run_once(self) -> CuratorRunSummary:
+        """Run one sweep, single-flight across replicas.
+
+        The state-machine writes inside the sweep are individually
+        idempotent, so two replicas racing the same sweep is safe — just
+        wasted work + audit noise (the class docstring's "single replica
+        per cluster" note). A ``pg_try_advisory_xact_lock`` makes the whole
+        sweep single-flight (mirrors ``QualityDriftWorker.run_once``); a
+        replica that misses the lock returns an empty summary immediately,
+        no sweep attempted. Single-process / in-memory runs have no
+        factory and need no lock.
+        """
+        if self._session_factory is None:
+            return await self._run_sweep()
+        async with self._session_factory() as lock_session:
+            # Long-hold guard: the lock txn stays open for the sweep; keep it
+            # off any idle-in-transaction reaper (same posture as
+            # PgWorkspaceLock / QualityDriftWorker).
+            await lock_session.execute(
+                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+            )
+            got = (
+                await lock_session.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
+                    {"cid": _CURATOR_LOCK_CLASSID, "k": "skill_curator"},
+                )
+            ).scalar_one()
+            if not got:
+                await lock_session.rollback()
+                return CuratorRunSummary()
+            try:
+                return await self._run_sweep()
+            finally:
+                # rollback ends the txn → releases the xact advisory lock.
+                await lock_session.rollback()
+
+    async def _run_sweep(self) -> CuratorRunSummary:
         """One full sweep across all tenants with skills. Idempotent.
 
         Callable directly from tests + an operator-facing manual-run

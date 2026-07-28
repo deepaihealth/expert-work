@@ -74,6 +74,7 @@ async def _seed(
     status: WebhookDeliveryStatus = WebhookDeliveryStatus.PENDING,
     attempt: int = 0,
     payload_format: str = "generic",
+    deliveries: InMemoryWebhookDeliveryStore | None = None,
 ) -> tuple[
     InMemoryWebhookEndpointStore,
     InMemoryWebhookDeliveryStore,
@@ -82,7 +83,7 @@ async def _seed(
     WebhookDeliveryRecord,
 ]:
     endpoints = InMemoryWebhookEndpointStore()
-    deliveries = InMemoryWebhookDeliveryStore()
+    deliveries = deliveries if deliveries is not None else InMemoryWebhookDeliveryStore()
     secrets_store = _FakeSecretStore()
     tenant = uuid4()
     endpoint_id = uuid4()
@@ -235,6 +236,156 @@ async def test_circuit_breaker_opens_after_threshold() -> None:
     # Breaker threshold 3 → at most 3 endpoints attempted before it trips;
     # the remaining are skipped, so far fewer than 7 POSTs happen.
     assert len(post.calls) <= 3
+
+
+class _CallSpyDeliveryStore(InMemoryWebhookDeliveryStore):
+    """Wraps the real in-memory store, recording which claim path the worker
+    used — the CAS ``claim_ready`` must be used, not the read-only
+    ``list_ready`` (W1-PR1, multi-replica readiness: a fleet of worker
+    replicas sharing ``list_ready`` would each pick up the same row and
+    double-POST it)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_ready_calls = 0
+        self.list_ready_calls = 0
+        self.last_claimed_statuses: list[WebhookDeliveryStatus] = []
+
+    async def claim_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        self.claim_ready_calls += 1
+        claimed = await super().claim_ready(before=before, limit=limit)
+        self.last_claimed_statuses = [d.status for d in claimed]
+        return claimed
+
+    async def list_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        self.list_ready_calls += 1
+        return await super().list_ready(before=before, limit=limit)
+
+
+class _WeirdError(BaseException):
+    """A raise type outside ``Exception``'s hierarchy — simulates a failure
+    that escapes ``_deliver_one``'s own ``except Exception`` handling around
+    the POST call (unlike a modeled transport failure, which is caught and
+    turned into a normal retry)."""
+
+
+@pytest.mark.asyncio
+async def test_breaker_skip_releases_row_to_retrying_not_stuck_delivering() -> None:
+    """Review Critical (deploy-w1-replica-fixes) — the breaker-open skip
+    branch of ``_deliver_one`` never calls ``_finish``, so under the CAS
+    claim (claim_ready writes DELIVERING before delivery is attempted) a
+    skipped row would be stranded DELIVERING until the 300s stale-claim
+    window, instead of being retried on the very next 15s sweep like
+    before the CAS change. It must be released back to RETRYING (attempt
+    untouched) so the next claim_ready can pick it up immediately."""
+    endpoints, deliveries, secrets_store, endpoint, first = await _seed()
+    post = _RecordingPost(status=503)
+    worker = _worker(
+        endpoints, deliveries, secrets_store, post, max_attempts=100, breaker_threshold=3
+    )
+    # 5 more deliveries on the same endpoint (6 total) — the first 3 trip
+    # the breaker (3 consecutive 503s), the last 3 are skipped by it.
+    rows = [first]
+    for i in range(5):
+        row = WebhookDeliveryRecord(
+            id=uuid4(),
+            tenant_id=endpoint.tenant_id,
+            endpoint_id=endpoint.id,
+            event_id=f"run:{i}",
+            event_type="run.completed",
+            payload={},
+            status=WebhookDeliveryStatus.PENDING,
+            attempt=0,
+            created_at=_NOW,
+            updated_at=_NOW,
+        )
+        await deliveries.create(row)
+        rows.append(row)
+
+    await worker.run_once()
+    assert len(post.calls) == 3  # breaker trips after 3 failed attempts
+
+    refreshed = [await deliveries.get(delivery_id=r.id, tenant_id=r.tenant_id) for r in rows]
+    assert all(r is not None for r in refreshed)
+    attempted, skipped = refreshed[:3], refreshed[3:]
+
+    # The 3 attempted rows failed normally (retry with backoff) — untouched
+    # by this fix, included here to pin down the boundary.
+    for r in attempted:
+        assert r.status is WebhookDeliveryStatus.RETRYING
+        assert r.attempt == 1
+
+    # The 3 breaker-skipped rows must be released, not stuck DELIVERING.
+    now = datetime.now(UTC)
+    for r in skipped:
+        assert r.status is WebhookDeliveryStatus.RETRYING
+        assert r.status is not WebhookDeliveryStatus.DELIVERING
+        assert r.attempt == 0  # a release is not a delivery attempt
+        assert r.next_retry_at is not None
+        assert r.next_retry_at <= now
+
+    # Second sweep: the released rows are immediately re-claimable (no 15s
+    # wait needed) — still skipped by the still-open breaker, but claimed
+    # (not orphaned), and no new POSTs happen.
+    await worker.run_once()
+    assert len(post.calls) == 3  # no growth — the skipped rows never POST
+
+    refreshed_again = [
+        await deliveries.get(delivery_id=r.id, tenant_id=r.tenant_id) for r in skipped
+    ]
+    for r in refreshed_again:
+        assert r is not None
+        assert r.status is WebhookDeliveryStatus.RETRYING
+        assert r.attempt == 0
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_releases_row_to_retrying_not_stuck_delivering() -> None:
+    """Review Critical (deploy-w1-replica-fixes) — when _deliver_one raises
+    past its own exception handling (a bug, not a modeled transport
+    failure), run_once's ``gather(..., return_exceptions=True)`` branch
+    used to leave the row's status untouched — under the CAS claim that
+    means stuck DELIVERING until the 300s stale-claim window. It must be
+    released back to RETRYING instead."""
+    endpoints, deliveries, secrets_store, _, delivery = await _seed()
+
+    async def _boom(url: str, body: bytes, headers: dict[str, str]) -> int:
+        raise _WeirdError("unexpected, not a modeled transport failure")
+
+    result = await _worker(endpoints, deliveries, secrets_store, _boom).run_once()
+    assert result == (0, 0, 0)  # not counted delivered/retry/dead this cycle
+
+    row = await deliveries.get(delivery_id=delivery.id, tenant_id=delivery.tenant_id)
+    assert row is not None
+    assert row.status is WebhookDeliveryStatus.RETRYING
+    assert row.status is not WebhookDeliveryStatus.DELIVERING
+    assert row.attempt == 0  # a release is not a delivery attempt
+    assert row.next_retry_at is not None
+    assert row.next_retry_at <= datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_run_once_claims_via_cas_not_list_ready() -> None:
+    """W1-PR1 — ``run_once`` must claim its batch (CAS) rather than merely
+    list it: the row is written ``delivering`` before delivery is attempted,
+    and the read-only ``list_ready`` is never called from the sweep."""
+    spy = _CallSpyDeliveryStore()
+    endpoints, deliveries, secrets_store, _, delivery = await _seed(deliveries=spy)
+    post = _RecordingPost(status=200)
+    result = await _worker(endpoints, deliveries, secrets_store, post).run_once()
+    assert result == (1, 0, 0)
+
+    assert spy.claim_ready_calls == 1
+    assert spy.list_ready_calls == 0
+    # The row passed through ``delivering`` on its way to the terminal state.
+    assert spy.last_claimed_statuses == [WebhookDeliveryStatus.DELIVERING]
+
+    row = await deliveries.get(delivery_id=delivery.id, tenant_id=delivery.tenant_id)
+    assert row is not None and row.status is WebhookDeliveryStatus.DELIVERED
 
 
 # --------------------------------------------------------------- enqueue

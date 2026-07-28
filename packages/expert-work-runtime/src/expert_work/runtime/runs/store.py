@@ -110,6 +110,28 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def fail_if_active(
+        self, *, run_id: UUID, tenant_id: UUID, error: str, now: datetime
+    ) -> bool:
+        """W1 PR1 task 4 — CAS-guarded terminal transition to ``ERROR``.
+
+        Updates ``status → error`` (+ ``error`` / ``finished_at`` /
+        ``updated_at``) ONLY when the row is currently ``running`` /
+        ``pending`` — the same active-status guard as :meth:`request_cancel`.
+        Returns ``True`` iff a row was transitioned.
+
+        This is :class:`~control_plane.orphan_sweep.OrphanSweep`'s
+        ``_fail_orphan`` guard: every replica's sweep loop can list the same
+        lease-expired, reclaim-capped orphan in the same cycle (a scan-then-act
+        race, structurally identical to the :meth:`reclaim` CAS). Without this
+        guard each replica's unconditional ``set_status`` would "succeed",
+        double-incrementing the failed-orphan counter and emitting a duplicate
+        audit record for one terminal transition. ``False`` means a peer
+        already won (or the run reached a terminal status on its own) — the
+        caller skips its counter/audit side effects.
+        """
+
+    @abc.abstractmethod
     async def get(self, *, run_id: UUID, tenant_id: UUID) -> RunInfo | None:
         """Return the run row, or ``None`` when unknown / cross-tenant.
 
@@ -446,6 +468,25 @@ class InMemoryRunStore(RunStore):
             status=RunStatus.INTERRUPTED,
             updated_at=updated_at,
             finished_at=updated_at,
+        )
+        return True
+
+    async def fail_if_active(
+        self, *, run_id: UUID, tenant_id: UUID, error: str, now: datetime
+    ) -> bool:
+        row = self._rows.get(run_id)
+        if (
+            row is None
+            or row.tenant_id != tenant_id
+            or row.status not in (RunStatus.RUNNING, RunStatus.PENDING)
+        ):
+            return False
+        self._rows[run_id] = replace(
+            row,
+            status=RunStatus.ERROR,
+            error=error,
+            finished_at=now,
+            updated_at=now,
         )
         return True
 
@@ -831,6 +872,30 @@ class SqlRunStore(RunStore):
                     status=RunStatus.INTERRUPTED.value,
                     updated_at=updated_at,
                     finished_at=updated_at,
+                )
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def fail_if_active(
+        self, *, run_id: UUID, tenant_id: UUID, error: str, now: datetime
+    ) -> bool:
+        # Same CAS shape as request_cancel / approval.mark_decided — the
+        # ``status IN (running, pending)`` guard is the exactly-once win
+        # condition when several replicas race the same orphan's failover.
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentRunRow)
+                .where(
+                    AgentRunRow.id == run_id,
+                    AgentRunRow.tenant_id == tenant_id,
+                    AgentRunRow.status.in_((RunStatus.RUNNING.value, RunStatus.PENDING.value)),
+                )
+                .values(
+                    status=RunStatus.ERROR.value,
+                    error=error,
+                    finished_at=now,
+                    updated_at=now,
                 )
             )
             await session.commit()

@@ -1072,6 +1072,9 @@ def create_app(
             tenant_config_service=resolved_tenant_config_service,
             audit_logger=resolved_audit,
             interval_s=float(resolved_settings.skill_curator_interval_s),
+            # Single-flight the sweep across replicas (advisory lock); None
+            # in single-process / test runs needs no lock.
+            session_factory=sql_stores.session_factory if sql_stores else None,
         )
         if enable_scheduler
         else None
@@ -1774,6 +1777,9 @@ def create_app(
                     # (usage_kind='memory_consolidation'), same as SE-A43 did
                     # for the evolution aux path.
                     usage_store=resolved_token_usage,
+                    # Single-flight the sweep across replicas (advisory lock);
+                    # None in single-process / test runs needs no lock.
+                    session_factory=sql_stores.session_factory if sql_stores else None,
                 )
                 memory_consolidator.start()
                 _app.state.memory_consolidator = memory_consolidator

@@ -37,6 +37,24 @@ def test_env_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.default_dev_tenant_id == UUID("11111111-1111-1111-1111-111111111111")
 
 
+def test_background_task_switches_default_true() -> None:
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.enable_scheduler is True
+    assert settings.enable_curation_worker is True
+    assert settings.enable_reaper is True
+
+
+def test_background_task_switches_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXPERT_WORK_ENABLE_SCHEDULER", "false")
+    monkeypatch.setenv("EXPERT_WORK_ENABLE_CURATION_WORKER", "false")
+    monkeypatch.setenv("EXPERT_WORK_ENABLE_REAPER", "false")
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.enable_scheduler is False
+    assert settings.enable_curation_worker is False
+    assert settings.enable_reaper is False
+
+
 def test_invalid_auth_mode_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXPERT_WORK_AUTH_MODE", "wat")
     with pytest.raises(ValidationError):

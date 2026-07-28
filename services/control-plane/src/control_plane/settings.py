@@ -86,6 +86,30 @@ class Settings(BaseSettings):
     # to ``False`` only after C.6 ships the Redis backend.
     single_instance: bool = True
 
+    #: Multi-replica deploy — per-replica opt-out for the "single-replica"
+    #: background tasks ``create_app`` gates behind its ``enable_scheduler``
+    #: parameter: the J.10 ``TriggerScheduler``, ``SkillCurator`` (Sprint
+    #: #4), and ``MemoryConsolidator`` (Sprint #7). The latter two now take
+    #: a ``pg_try_advisory_xact_lock`` on ``run_once`` so a second replica
+    #: racing in loses the lock instead of duplicating work; setting this
+    #: ``False`` stops *this* replica from even starting them (e.g. to pin
+    #: them to one replica in a fleet). Wired in ``main.py`` from
+    #: ``EXPERT_WORK_ENABLE_SCHEDULER``. Default ``True`` keeps today's
+    #: every-replica-runs-it behavior.
+    enable_scheduler: bool = True
+
+    #: Multi-replica deploy — per-replica opt-out for the J.12 trajectory
+    #: ``CurationWorker`` (``create_app``'s ``enable_curation_worker``
+    #: parameter). ``False`` stops this replica from running it. Wired in
+    #: ``main.py`` from ``EXPERT_WORK_ENABLE_CURATION_WORKER``.
+    enable_curation_worker: bool = True
+
+    #: Multi-replica deploy — per-replica opt-out for the quota
+    #: ``ReservationReaper`` (``create_app``'s ``enable_reaper`` parameter).
+    #: ``False`` stops this replica from running it. Wired in ``main.py``
+    #: from ``EXPERT_WORK_ENABLE_REAPER``.
+    enable_reaper: bool = True
+
     health_check_timeout_s: float = Field(default=5.0, gt=0)
 
     # Stream 16.3 — application-layer backpressure (overload guard). Sheds new

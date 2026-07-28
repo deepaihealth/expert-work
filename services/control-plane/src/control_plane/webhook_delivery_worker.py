@@ -497,7 +497,7 @@ class WebhookDeliveryWorker:
         """Drain one batch. Returns ``(delivered, retried, dead_lettered)``."""
         now = datetime.now(UTC)
         with _bypass_rls():
-            ready = await self._deliveries.list_ready(before=now, limit=self._batch_size)
+            ready = await self._deliveries.claim_ready(before=now, limit=self._batch_size)
         if not ready:
             return (0, 0, 0)
 
@@ -512,11 +512,15 @@ class WebhookDeliveryWorker:
 
         outcomes = await asyncio.gather(*(_guarded(row) for row in ready), return_exceptions=True)
         delivered = retried = dead = 0
-        for outcome in outcomes:
+        for row, outcome in zip(ready, outcomes, strict=True):
             if isinstance(outcome, BaseException):
-                # A delivery that raised past _deliver_one's own handling is
-                # left untouched (status unchanged) → retried next sweep.
+                # A delivery that raised past _deliver_one's own handling
+                # never reached a _finish() call, so the row is still
+                # DELIVERING (claimed by claim_ready above) — release it
+                # back to RETRYING now instead of leaving it stranded until
+                # the 300s stale-claim window reclaims it.
                 logger.warning("webhook_delivery.unhandled err=%s", outcome)
+                await self._release(row, now=now)
                 continue
             if outcome == "delivered":
                 delivered += 1
@@ -537,6 +541,12 @@ class WebhookDeliveryWorker:
         """Sign + POST one delivery. Returns ``delivered`` / ``retry`` / ``dead`` / ``skip``."""
         if self._breaker_open(row.endpoint_id, now=now):
             _breaker_skips.inc()
+            # This branch never calls _finish() — the row is still
+            # DELIVERING (claim_ready wrote that before this call). Release
+            # it back to RETRYING so next sweep's claim_ready can pick it up
+            # again immediately instead of waiting out the 300s stale-claim
+            # window; the breaker itself governs the skip/retry cadence.
+            await self._release(row, now=now)
             return "skip"
 
         with _bypass_rls():
@@ -662,6 +672,33 @@ class WebhookDeliveryWorker:
             return "retry"
         _dead_letters.inc()
         return "dead"
+
+    async def _release(self, row: WebhookDeliveryRecord, *, now: datetime) -> None:
+        """Release a claimed row back to ``RETRYING`` without spending an
+        attempt — for the two paths that skip past ``_finish``'s terminal
+        update (the breaker-open skip in ``_deliver_one`` and the
+        unhandled-exception branch of ``run_once``). ``next_retry_at`` is
+        set to ``now`` so the row is immediately re-claimable by the next
+        sweep, matching the pre-CAS behaviour where a skipped/errored row
+        simply kept its original state and was retried on the next 15s
+        cycle. ``attempt`` is untouched — a release is not a delivery try.
+
+        Best-effort: a failure here is logged and swallowed rather than
+        raised, because the 300s stale-claim window in ``claim_ready`` is
+        the backstop that reclaims the row even if this call itself fails.
+        """
+        try:
+            released = row.model_copy(
+                update={
+                    "status": WebhookDeliveryStatus.RETRYING,
+                    "next_retry_at": now,
+                    "updated_at": now,
+                }
+            )
+            with _bypass_rls():
+                await self._deliveries.update(released)
+        except Exception:
+            logger.exception("webhook_delivery.release_failed delivery_id=%s", row.id)
 
     # ----------------------------------------------------------- breaker
     def _breaker_open(self, endpoint_id: UUID, *, now: datetime) -> bool:

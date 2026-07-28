@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import cast
 from uuid import UUID
 
@@ -201,6 +201,12 @@ def _delivery_row_to_dto(row: WebhookDeliveryRow) -> WebhookDeliveryRecord:
     )
 
 
+#: How long a ``delivering`` row can go untouched before the next sweep
+#: treats it as an orphaned claim (crashed replica) and reclaims it. Mirrors
+#: the in-memory store's constant of the same name (W1-PR1).
+_DELIVERING_STALE_S: int = 300
+
+
 class SqlWebhookDeliveryStore(WebhookDeliveryStore):
     """Postgres-backed delivery queue — the ``webhook_delivery`` table."""
 
@@ -332,3 +338,52 @@ class SqlWebhookDeliveryStore(WebhookDeliveryStore):
                 .all()
             )
         return [_delivery_row_to_dto(r) for r in rows]
+
+    async def claim_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        # Atomic CAS — a fleet of worker replicas shares this queue without
+        # double-POSTing: ``FOR UPDATE SKIP LOCKED`` lets each replica's
+        # transaction skip rows another replica already has locked, then the
+        # UPDATE flips exactly the rows this replica won to ``delivering``
+        # and hands them back via ``RETURNING`` in one round trip.
+        stale_before = before - timedelta(seconds=_DELIVERING_STALE_S)
+        ready = or_(
+            WebhookDeliveryRow.status == WebhookDeliveryStatus.PENDING.value,
+            (WebhookDeliveryRow.status == WebhookDeliveryStatus.RETRYING.value)
+            & (WebhookDeliveryRow.next_retry_at <= before),
+            (WebhookDeliveryRow.status == WebhookDeliveryStatus.DELIVERING.value)
+            & (WebhookDeliveryRow.updated_at <= stale_before),
+        )
+        async with self._sf() as session:
+            candidate_ids = (
+                (
+                    await session.execute(
+                        select(WebhookDeliveryRow.id)
+                        .where(ready)
+                        .order_by(WebhookDeliveryRow.created_at.asc())
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not candidate_ids:
+                await session.commit()
+                return []
+            rows = (
+                (
+                    await session.execute(
+                        sa_update(WebhookDeliveryRow)
+                        .where(WebhookDeliveryRow.id.in_(candidate_ids))
+                        .values(status=WebhookDeliveryStatus.DELIVERING.value, updated_at=before)
+                        .returning(WebhookDeliveryRow)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        ordered = sorted(rows, key=lambda r: r.created_at)
+        return [_delivery_row_to_dto(r) for r in ordered]
