@@ -365,6 +365,9 @@ class AuditAction(StrEnum):
     # platform dynamic-worker limits config (B3 PR2) — system_admin-only write
     # to the platform dynamic_worker max_concurrent/max_per_run/max_iterations row.
     PLATFORM_DYNAMIC_WORKER_UPDATED = "platform_dynamic_worker_config:updated"
+    # platform delegation-gate config (perf phase2 PR3) — system_admin-only write
+    # to the platform max_concurrent_delegations row.
+    PLATFORM_DELEGATION_UPDATED = "platform_delegation_config:updated"
     # mcp_server (Stream V — tenant remote MCP server registry)
     MCP_SERVER_CREATE = "mcp_server:create"
     MCP_SERVER_UPDATE = "mcp_server:update"
