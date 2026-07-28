@@ -719,6 +719,69 @@ async def test_reclaim_cas_one_winner() -> None:
     assert row is not None and row.claimed_by == "inst-b"
 
 
+@pytest.mark.asyncio
+async def test_fail_if_active_running_cas_one_winner() -> None:
+    # W1 PR1 task 4 — two replicas racing the same orphan's terminal
+    # transition (both scanned the run while it was still RUNNING); the CAS
+    # guard lets exactly one of them win.
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.RUNNING))
+    now = _BASE + timedelta(minutes=5)
+
+    won = await store.fail_if_active(
+        run_id=run_id, tenant_id=tenant, error="orphaned run failover: max_reclaims", now=now
+    )
+    lost = await store.fail_if_active(
+        run_id=run_id, tenant_id=tenant, error="orphaned run failover: max_reclaims", now=now
+    )
+    assert won is True
+    assert lost is False
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.ERROR
+    assert row.error == "orphaned run failover: max_reclaims"
+    assert row.finished_at == now
+
+
+@pytest.mark.asyncio
+async def test_fail_if_active_error_row_returns_false() -> None:
+    # A row already in a terminal status is not re-failed (loser CAS path).
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.ERROR))
+    hit = await store.fail_if_active(
+        run_id=run_id, tenant_id=tenant, error="second attempt", now=_BASE
+    )
+    assert hit is False
+
+
+@pytest.mark.asyncio
+async def test_fail_if_active_pending_row_returns_true() -> None:
+    # PENDING is an active (non-terminal) status — same active set as
+    # request_cancel's guard.
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.PENDING))
+    hit = await store.fail_if_active(
+        run_id=run_id, tenant_id=tenant, error="orphaned run failover: auto_reclaim_off", now=_BASE
+    )
+    assert hit is True
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.status is RunStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_fail_if_active_cross_tenant_returns_false() -> None:
+    store = InMemoryRunStore()
+    run_id, tenant_a, tenant_b = uuid4(), uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_a, status=RunStatus.RUNNING))
+    hit = await store.fail_if_active(run_id=run_id, tenant_id=tenant_b, error="orphaned", now=_BASE)
+    assert hit is False
+    untouched = await store.get(run_id=run_id, tenant_id=tenant_a)
+    assert untouched is not None and untouched.status is RunStatus.RUNNING
+
+
 # --------------------------------------------------------------------------
 # Stream 9.5 — distributed run queue
 # --------------------------------------------------------------------------

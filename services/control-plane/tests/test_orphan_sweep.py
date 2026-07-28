@@ -233,6 +233,49 @@ async def test_skips_respawn_for_suspended_tenant(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_fail_orphan_second_call_skips_audit_and_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1 PR1 task 4 — two replicas racing the same orphan's terminal
+    transition (both scanned it while it was still RUNNING/expired-lease)
+    must not double-audit or double-count. The CAS guard (``fail_if_active``)
+    lets only the first ``_fail_orphan`` call win; the loser is a no-op."""
+    monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+    sweep = _sweep(store, runtime, auto_reclaim=False)
+
+    audit_calls: list[str] = []
+
+    async def _fake_emit_audit(_orphan, *, result, reason):
+        del result
+        audit_calls.append(reason)
+
+    monkeypatch.setattr(sweep, "_emit_audit", _fake_emit_audit)
+
+    counter_calls: list[dict[str, str]] = []
+    real_labels = sweep_module._failed_total.labels
+
+    def _spying_labels(**kw):
+        counter_calls.append(kw)
+        return real_labels(**kw)
+
+    monkeypatch.setattr(sweep_module._failed_total, "labels", _spying_labels)
+
+    now = datetime.now(UTC)
+    # Both replicas' scan phase observed the same still-RUNNING snapshot.
+    orphan = (await store.list_orphans(now=now, limit=10))[0]
+    await sweep._fail_orphan(orphan, now=now, reason="auto_reclaim_off")
+    await sweep._fail_orphan(orphan, now=now, reason="auto_reclaim_off")  # loses the CAS
+
+    assert audit_calls == ["auto_reclaim_off"]
+    assert counter_calls == [{"reason": "auto_reclaim_off"}]
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.status is RunStatus.ERROR
+
+
+@pytest.mark.asyncio
 async def test_no_agent_meta_marks_errored(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
     store = InMemoryRunStore()

@@ -199,14 +199,19 @@ class OrphanSweep:
 
     async def _fail_orphan(self, orphan: RunInfo, *, now: datetime, reason: str) -> None:
         with _tenant_scope(orphan.tenant_id):
-            await self._runs.set_status(
+            won = await self._runs.fail_if_active(
                 run_id=orphan.run_id,
                 tenant_id=orphan.tenant_id,
-                status=RunStatus.ERROR,
-                updated_at=now,
                 error=f"orphaned run failover: {reason}",
-                finished_at=now,
+                now=now,
             )
+        if not won:
+            # A peer replica's sweep already failed (or otherwise terminated)
+            # this orphan — the CAS guard makes this a no-op, not a re-failure.
+            logger.debug(
+                "orphan_sweep.fail_orphan_lost_cas run_id=%s reason=%s", orphan.run_id, reason
+            )
+            return
         _failed_total.labels(reason=reason).inc()
         logger.warning("orphan_sweep.failed run_id=%s reason=%s", orphan.run_id, reason)
         await self._emit_audit(orphan, result=AuditResult.ERROR, reason=reason)
