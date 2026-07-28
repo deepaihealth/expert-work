@@ -163,11 +163,11 @@ expert_work.orchestrator.session_run
 
 ### 5.2 关键 metric
 
-本节分两块：**§5.2.1 as-built（M0 已 emit）**= 全仓实测 103 个 `expert_work_*` 指标（A.9，据 `expert_work_counter`/`expert_work_histogram`/`expert_work_gauge` 定义点逐个核），**§5.2.2 M1-target**= 设计期规划但 M0 未实现的指标。**强制真值源** = `expert-work-common/observability/metrics.py` 的 validator（`expert_work_*` 前缀 + label cardinality 拦截）；新增/改名指标先过它。
+本节分两块：**§5.2.1 as-built（M0 已 emit）**= 全仓实测 107 个 `expert_work_*` 指标（A.9，据 `expert_work_counter`/`expert_work_histogram`/`expert_work_gauge` 定义点逐个核），**§5.2.2 M1-target**= 设计期规划但 M0 未实现的指标。**强制真值源** = `expert-work-common/observability/metrics.py` 的 validator（`expert_work_*` 前缀 + label cardinality 拦截）；新增/改名指标先过它。
 
 > 全部指标为模块级单例，经三个 builder 定义。`expert_work_uplift_*` 几乎全在 `expert-work-common/uplift_metrics.py`；`expert_work_control_plane_*` 散在各 worker / middleware；orchestrator 指标在 `sse.py` / `graph_builder/builder.py`。
 
-#### 5.2.1 as-built（M0 已 emit，103 项）
+#### 5.2.1 as-built（M0 已 emit，107 项）
 
 **`expert_work_control_plane_*`（26）**
 
@@ -300,20 +300,24 @@ expert_work.orchestrator.session_run
 | `expert_work_billing_rollup_unpriced_buckets_total` | counter | `()` | 写入 priced=false 的 ledger bucket |
 | `expert_work_platform_credentials_tenant_overrides` | gauge | `()` | 配置的 per-tenant 凭证 override 行数（HX-8） |
 
-**其他 / Misc（8）**
+**其他 / Misc（12）**
 
 | metric | type | labels | 用途 |
 |---|---|---|---|
 | `expert_work_orchestrator_run_retry_total` | counter | `outcome` | run 级瞬态重试，按最终结局（HX-3） |
 | `expert_work_durable_resume_seconds` | histogram | `()` | resumed run 从 RUNNING 到首 chunk 秒数 |
-| `expert_work_run_event_persist_total` | counter | `event_name` | run_agent 双写中 RunEventStore.append 成功 |
-| `expert_work_run_event_persist_errors_total` | counter | `event_name` | run_agent 双写中 RunEventStore.append 失败 |
+| `expert_work_run_event_persist_total` | counter | `event_name` | run_agent 后台批写队列（有界，drop-oldest）经 `append_batch` 落库成功的帧（二期 PR3，终态前 `_drain_persist_queue` 等 flush） |
+| `expert_work_run_event_persist_errors_total` | counter | `event_name` | 同上批写路径，`append_batch` 整批失败 |
+| `expert_work_run_event_queue_dropped_total` | counter | `event_name` | 后台批写队列已满时 drop-oldest 丢弃的帧（二期 PR3） |
+| `expert_work_delegations_gated_total` | counter | `tool` | 委托被全局并发闸拒绝（acquire 超时），按工具（二期 PR3；`tool` 标签为 follow-up 补） |
+| `expert_work_delegation_gate_fail_open_total` | counter | `()` | `DelegationGate` 容量 provider 读失败（从未读到过容量则 fail-open 不限流，否则退用最近一次成功值） |
+| `expert_work_built_agent_cache_entries` | gauge | `scope` | in-process built-agent 缓存现存条目数，按 scope（二期 PR2 T4；此前漏登记） |
 | `expert_work_trajectory_recorded_total` | counter | `outcome` | 成功写 ObjectStore 的轨迹（L.L7） |
 | `expert_work_trajectory_record_errors_total` | counter | `outcome,reason` | 轨迹写失败（吞掉以保终态路径干净） |
 | `expert_work_ew_token_estimated_total` | counter | `tenant_id,agent_name,model` | 每次 LLM 调用估算 prompt token（HX-1 drift 分子） |
 | `expert_work_checkpoint_op_seconds` | histogram | `op` | checkpointer 每次 IO 调用 wall-clock |
 
-> 计：counter ~81 / histogram 9 / gauge ~13；共 103。
+> 计：counter ~84 / histogram 9 / gauge ~14；共 107。
 
 #### 5.2.2 M1-target（设计规划，M0 未实现）
 
