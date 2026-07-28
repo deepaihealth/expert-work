@@ -19,12 +19,14 @@ plus a ``Retry-After`` header and the project-wide error envelope.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import math
 import secrets
 from collections.abc import Awaitable, Callable
 
+from pydantic import SecretStr
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -43,27 +45,32 @@ _rate_limit_decisions = expert_work_counter(
     ("dimension", "decision"),
 )
 
-# Process-local HMAC key used to derive bucket identifiers from raw header
-# values. HMAC (rather than a bare hash) keeps the bucket map free of any
-# reversible secret material: if the process is dumped, an attacker cannot
-# recover the raw header without also recovering this key, and this key
-# never leaves the process. Rotated implicitly on every restart.
-_BUCKET_HMAC_KEY = secrets.token_bytes(32)
+# HMAC key used to derive bucket identifiers from raw header values. HMAC
+# (rather than a bare hash) keeps the bucket map free of any reversible
+# secret material: if the process is dumped, an attacker cannot recover the
+# raw header without also recovering this key.
+#
+# Multi-replica note: by default each ``RateLimitMiddleware`` instance mints
+# its own random 32-byte key at construction (rotated implicitly on every
+# restart, safe only for a single replica). Passing ``hmac_salt`` derives a
+# deterministic key instead (``sha256(salt)``), so every replica configured
+# with the same salt maps a given ``X-API-Key`` to the same bucket id — see
+# ``Settings.apikey_rate_limit_hmac_salt``.
 
 
-def _derive_bucket_id(value: str) -> str:
+def _derive_bucket_id(value: str, hmac_key: bytes) -> str:
     """Return a stable, non-reversible 16-char id for a request-scoped value.
 
     Not credential storage — this is purely a bucket-index derivation, so
     HMAC-SHA-256 (fast + keyed) is the correct primitive over a slow KDF.
     """
-    return hmac.new(_BUCKET_HMAC_KEY, value.encode("utf-8"), "sha256").hexdigest()[:16]
+    return hmac.new(hmac_key, value.encode("utf-8"), "sha256").hexdigest()[:16]
 
 
-def _resolve_bucket(request: Request) -> tuple[str, str]:
+def _resolve_bucket(request: Request, hmac_key: bytes) -> tuple[str, str]:
     header_value = request.headers.get(API_KEY_HEADER)
     if header_value:
-        return "apikey", _derive_bucket_id(header_value)
+        return "apikey", _derive_bucket_id(header_value, hmac_key)
     host = request.client.host if request.client else "unknown"
     return "ip", host
 
@@ -84,10 +91,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         *,
         limiter: RateLimiter,
         enabled: bool = True,
+        hmac_salt: SecretStr | None = None,
     ) -> None:
         super().__init__(app)
         self._limiter = limiter
         self._enabled = enabled
+        self._bucket_hmac_key = (
+            hashlib.sha256(hmac_salt.get_secret_value().encode("utf-8")).digest()
+            if hmac_salt is not None
+            else secrets.token_bytes(32)
+        )
 
     async def dispatch(
         self,
@@ -97,7 +110,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not self._enabled:
             return await call_next(request)
 
-        dimension, key = _resolve_bucket(request)
+        dimension, key = _resolve_bucket(request, self._bucket_hmac_key)
         decision = await self._limiter.acquire(dimension=dimension, key=key)
         outcome = "allowed" if decision.allowed else "denied"
         _rate_limit_decisions.labels(dimension=dimension, decision=outcome).inc()

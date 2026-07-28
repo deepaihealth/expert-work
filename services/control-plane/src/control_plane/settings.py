@@ -129,6 +129,17 @@ class Settings(BaseSettings):
     rate_limit_burst: int = Field(default=60, gt=0)
     rate_limit_per_second: float = Field(default=20.0, gt=0)
 
+    #: Shared HMAC salt for deriving the apikey rate-limit bucket id
+    #: (``RateLimitMiddleware``). Multi-replica deploys MUST set this to the
+    #: same value on every replica: without it, each process mints its own
+    #: random key at startup, so the same ``X-API-Key`` header hashes to a
+    #: different bucket per replica and the limiter never accumulates
+    #: enough hits on one Redis bucket to trip behind a load balancer.
+    #: ``None`` (default) falls back to a per-process random key — safe
+    #: only for a single replica. ``SecretStr`` so it never renders in
+    #: logs / repr.
+    apikey_rate_limit_hmac_salt: SecretStr | None = None
+
     # ------------------------------------------------------------------ cancellation (B.3)
     # ADR B-2: 50 ms cadence + 50 ms scheduler drift + 100 ms handler
     # deadline_check ≈ 200 ms detection budget (verification gate #3).

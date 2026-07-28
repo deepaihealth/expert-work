@@ -2225,6 +2225,7 @@ def create_app(
         RateLimitMiddleware,
         limiter=resolved_limiter,
         enabled=resolved_settings.rate_limit_enabled,
+        hmac_salt=resolved_settings.apikey_rate_limit_hmac_salt,
     )
     app.add_middleware(
         AuditContextMiddleware,
