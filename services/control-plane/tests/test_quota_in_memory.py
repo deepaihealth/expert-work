@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -9,6 +10,7 @@ import pytest
 
 from control_plane.quota import InMemoryQuotaService
 from expert_work.persistence.quota import (
+    BudgetExceededError,
     InMemoryTenantQuotaStore,
     InMemoryTokenReservationStore,
 )
@@ -170,6 +172,52 @@ async def test_reserve_denies_when_over_monthly_budget() -> None:
     assert not result.granted
     assert result.reservation_id is None
     assert result.reason == "over_budget"
+
+
+@pytest.mark.asyncio
+async def test_store_reserve_rejects_even_when_caller_races_get_budget_then_reserve() -> None:
+    """W1-PR2 Task 3 — TOCTOU regression at the store layer.
+
+    ``asyncio``'s cooperative scheduler never preempts mid-coroutine: with
+    no real I/O between a ``get_budget()`` read and a ``reserve()`` write,
+    10 tasks fired via ``asyncio.gather`` simply run to completion one at a
+    time (no interleaving), so a naive gather-based race test would pass
+    even against the pre-fix code — it doesn't reproduce the hazard. The
+    ``asyncio.sleep(0)`` below forces the real interleave point a
+    multi-replica caller would see over the network (read budget, then
+    later write): all 10 callers read the *same* stale ``reserved_total``
+    before any of them writes. Before the fix, the store's ``reserve()``
+    had no check of its own and trusted the caller — all 10 would win,
+    landing ``reserved_total`` at 1000 (double the 500 budget). After the
+    fix, ``reserve()``'s own atomic check (inside ``self._lock``) rejects
+    5 of them regardless of what the racing caller believed, so exactly 5
+    are admitted."""
+    tenant = _tenant()
+    store = InMemoryTokenReservationStore()
+    month = datetime.now(tz=UTC).date().replace(day=1)
+    await store.set_budget_total_for_test(tenant_id=tenant, month=month, budget_total=500)
+
+    async def _racy_caller() -> bool:
+        budget = await store.get_budget(tenant_id=tenant, month=month)
+        assert budget is not None
+        would_fit = budget.used_total + budget.reserved_total + 100 <= budget.budget_total
+        await asyncio.sleep(0)  # force interleaving across the check→act window
+        if not would_fit:
+            return False
+        try:
+            await store.reserve(
+                tenant_id=tenant, agent_name="alpha", thread_id=uuid4(), estimated=100
+            )
+        except BudgetExceededError:
+            return False
+        return True
+
+    results = await asyncio.gather(*[_racy_caller() for _ in range(10)])
+    assert sum(1 for granted in results if granted) == 5
+
+    budget = await store.get_budget(tenant_id=tenant, month=month)
+    assert budget is not None
+    assert budget.reserved_total == 500  # exactly the cap — no overspend, no lost admit
 
 
 @pytest.mark.asyncio
