@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from opentelemetry import trace
 
+from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
@@ -39,6 +41,7 @@ from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
 from expert_work.common.credentials import CredentialsResolver, CredentialsResolverError
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
+from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
 from expert_work.persistence import ArtifactStore, KnowledgeStore
 from expert_work.persistence.skill import SkillStore
@@ -150,7 +153,10 @@ logger = logging.getLogger(__name__)
 # Built-agent cache key. 3-tuple for the shared (no-OAuth) build; 4-tuple
 # ``(tenant, name, version, user_id)`` when the caller has connected OAuth
 # connectors (Stream MCP-OAUTH, OA-3b). ``k[0]`` is the tenant in both shapes,
-# so ``invalidate_tenant`` works uniformly.
+# so ``invalidate_tenant`` works uniformly. The cached value carries its
+# ``expires_at`` (二期 PR2 T4): the TTL only backstops invalidation write
+# paths that were never wired (e.g. a future credential entry point missing
+# the T2 fan-out) — explicit invalidation stays the primary freshness path.
 _CacheKey = tuple[UUID, str, str] | tuple[UUID, str, str, str]
 
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
@@ -214,7 +220,15 @@ class AgentRuntime:
     #: lifespan sets it (tests / pre-swap), in which case those surfaces degrade
     #: to an empty history rather than erroring.
     durable_checkpointer: BaseCheckpointSaver[Any] | None = None
-    _cache: dict[_CacheKey, BuiltAgent] = field(default_factory=dict, repr=False)
+    #: 二期 PR2 T4 — built-agent cache bounds. At most ``cache_max_size``
+    #: entries (LRU eviction past that), each valid for ``cache_ttl_s``
+    #: seconds. ``_clock`` is the injectable monotonic time source (tests).
+    cache_max_size: int = 256
+    cache_ttl_s: float = 1800.0
+    _clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _cache: OrderedDict[_CacheKey, tuple[BuiltAgent, float]] = field(
+        default_factory=OrderedDict, repr=False
+    )
     #: Extra per-tenant cache invalidators fanned out by ``invalidate_tenant``
     #: — the sub-agent builder registers its own cache here (Stream V-D, audit
     #: #1) since it caches built agents independently of ``_cache``.
@@ -223,6 +237,13 @@ class AgentRuntime:
     #: out by ``invalidate_all`` when a process-global pool (the platform shared
     #: catalog) changes, which affects every tenant's build.
     _invalidate_all_hooks: list[Callable[[], None]] = field(default_factory=list, repr=False)
+    #: 二期 PR2 T2 — per-(tenant, user) invalidators fanned out by
+    #: ``invalidate_user`` (the sub-agent builder registers its per-user
+    #: eviction here) so an OAuth token refresh / disconnect clears BOTH the
+    #: top-level and the delegated per-user builds.
+    _user_invalidation_hooks: list[Callable[[UUID, str], None]] = field(
+        default_factory=list, repr=False
+    )
 
     async def new_worker_spawn_budget(self) -> Any:
         """A fresh per-run :class:`WorkerSpawnBudget`, or ``None`` when dynamic
@@ -277,10 +298,31 @@ class AgentRuntime:
                 key = (tenant_id, name, version, user_id)
         cached = self._cache.get(key)
         if cached is not None:
-            return cached
+            built, expires_at = cached
+            if self._clock() < expires_at:
+                self._cache.move_to_end(key)
+                return built
+            # Expired — drop and treat as a miss. Pure abandonment: the
+            # BuiltAgent may hold live MCP connections (MCPServerPool) still
+            # in use by an in-flight run, so never close() here; dropping the
+            # reference leaves cleanup to GC, matching invalidate_* behavior.
+            # No hook fan-out: hooks broadcast config changes, and natural
+            # expiry is not one (二期 PR2 T4).
+            del self._cache[key]
+            self._publish_cache_size()
         built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
-        self._cache[key] = built
+        self._cache[key] = (built, self._clock() + self.cache_ttl_s)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.cache_max_size:
+            # LRU eviction — pure abandonment, no hook fan-out (same
+            # rationale as the expiry branch above).
+            self._cache.popitem(last=False)
+        self._publish_cache_size()
         return built
+
+    def _publish_cache_size(self) -> None:
+        """Refresh the runtime-scope built-agent cache size gauge (二期 PR2 T4)."""
+        set_built_agent_cache_entries(scope="runtime", count=len(self._cache))
 
     def register_invalidation_hook(self, hook: Callable[[UUID], None]) -> None:
         """Register an extra per-tenant cache invalidator (Stream V-D, audit #1).
@@ -301,6 +343,16 @@ class AgentRuntime:
         """
         self._invalidate_all_hooks.append(hook)
 
+    def register_user_invalidation_hook(self, hook: Callable[[UUID, str], None]) -> None:
+        """Register an extra per-(tenant, user) cache invalidator (二期 PR2 T2).
+
+        The sub-agent builder caches per-user (OAuth) child builds
+        independently of ``_cache``; registering its invalidator here keeps
+        the delegation path coherent with the top-level cache when a user's
+        OAuth tokens rotate or disconnect.
+        """
+        self._user_invalidation_hooks.append(hook)
+
     def invalidate_all(self) -> None:
         """Drop every cached built-agent, across all tenants.
 
@@ -310,6 +362,7 @@ class AgentRuntime:
         sub-agent builder cache) are fanned out too.
         """
         self._cache.clear()
+        self._publish_cache_size()
         for hook in self._invalidate_all_hooks:
             hook()
 
@@ -323,6 +376,7 @@ class AgentRuntime:
         """
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
+        self._publish_cache_size()
         for hook in self._invalidation_hooks:
             hook(tenant_id)
 
@@ -332,12 +386,16 @@ class AgentRuntime:
         Called when the user's OAuth connections change (connect / disconnect)
         so the next run rebuilds against the refreshed per-user OAuth pool
         (Stream MCP-OAUTH, OA-3b). Only 4-tuple (per-user) keys match; the
-        shared no-OAuth builds are left intact.
+        shared no-OAuth builds are left intact. Registered user hooks (the
+        sub-agent builder cache, 二期 PR2 T2) are fanned out too.
         """
         for key in [
             k for k in self._cache if k[0] == tenant_id and len(k) == 4 and k[3] == user_id
         ]:
             del self._cache[key]
+        self._publish_cache_size()
+        for hook in self._user_invalidation_hooks:
+            hook(tenant_id, user_id)
 
 
 @runtime_checkable
@@ -815,11 +873,34 @@ def make_agent_builder(
 # baked in at boot. These wrappers resolve the per-tenant secret_ref via
 # :class:`CredentialsResolver` at call time (platform vs tenant mode), then
 # build the concrete client. Resolution runs once per ``embed`` batch / once
-# per rerank / once per search — frequency is low, so no caching is needed.
+# per rerank / once per search. 二期 PR2 T3 —— vault 读(``secret_store.get``)
+# 经 ``_cached_secret`` 走进程内 ``CredentialValueCache``(LRU 256 / TTL 300s,
+# T2 的凭据写入口连动失效);resolve(DB)读仍由 PlatformSecretsService 30s TTL 挡。
 # The wrappers live here (control-plane glue) so the orchestrator package
 # never imports expert-work-common.credentials; they implement the orchestrator
 # protocols structurally.
 # ---------------------------------------------------------------------------
+
+
+async def _cached_secret(
+    cache: CredentialValueCache | None,
+    secret_store: SecretStore,
+    tenant_id: UUID,
+    secret_ref: str,
+) -> str:
+    """Resolve ``secret_ref``'s value through the process-level cache.
+
+    ``cache=None``(测试 / 未接线)= 现状行为:每次直读 vault。命中时不打
+    vault——调用方既有的 ``secret_ms`` span attribute 自然趋 0,即收益读数。
+    """
+    if cache is not None:
+        hit = cache.get(tenant_id, secret_ref)
+        if hit is not None:
+            return hit
+    value = await secret_store.get(parse_secret_ref(secret_ref))
+    if cache is not None:
+        cache.put(tenant_id, secret_ref, value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -833,20 +914,23 @@ class ResolvingEmbedder:
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to the embedding client's own per-call default.
     http: httpx.AsyncClient | None = None
+    #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
+    #: yet wired) reads the vault every call (pre-T3 behaviour).
+    secret_cache: CredentialValueCache | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
             return []
         # 一期 Task 1 —— 每次 embed 都重解一次凭据(DB 读 + vault 读)。这两段
         # 挂到调用方的 ``memory.embed`` span 上而不是各开一个子 span:它们是
-        # 同一次调用的内部构成,单列会让瀑布图多两行毫秒级噪音。二期若做
-        # 凭据缓存,这两个数字就是收益的度量。
+        # 同一次调用的内部构成,单列会让瀑布图多两行毫秒级噪音。二期 PR2 T3
+        # 起 vault 读走 ``_cached_secret``——命中时 ``secret_ms`` 趋 0,即收益。
         t0 = time.monotonic()
         secret_ref = await self.resolver.resolve_provider(
             tenant_id=tenant_id, provider=self.provider
         )
         t1 = time.monotonic()
-        api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
         t2 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
@@ -880,6 +964,9 @@ class ResolvingReranker:
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to each client's own per-call default.
     http: httpx.AsyncClient | None = None
+    #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
+    #: yet wired) reads the vault every call (pre-T3 behaviour).
+    secret_cache: CredentialValueCache | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -905,7 +992,9 @@ class ResolvingReranker:
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         if _is_dashscope_rerank_model(self.provider, self.model):
-            api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+            api_key = await _cached_secret(
+                self.secret_cache, self.secret_store, tenant_id, secret_ref
+            )
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
@@ -913,6 +1002,8 @@ class ResolvingReranker:
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
+        # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
+        # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec, secret_store=self.secret_store, http_client=self.http
         )
@@ -932,6 +1023,9 @@ class DynamicResolvingEmbedder:
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to the embedding client's own per-call default.
     http: httpx.AsyncClient | None = None
+    #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
+    #: yet wired) reads the vault every call (pre-T3 behaviour).
+    secret_cache: CredentialValueCache | None = None
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -949,7 +1043,7 @@ class DynamicResolvingEmbedder:
         provider, model = cfg
         secret_ref = await self.resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
         t2 = time.monotonic()
-        api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+        api_key = await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
         t3 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
@@ -972,6 +1066,9 @@ class DynamicResolvingReranker:
     #: 一期 Task 5 — process-level shared HTTP client. ``None`` (tests / not
     #: yet wired) falls back to each client's own per-call default.
     http: httpx.AsyncClient | None = None
+    #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
+    #: yet wired) reads the vault every call (pre-T3 behaviour).
+    secret_cache: CredentialValueCache | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -1005,7 +1102,9 @@ class DynamicResolvingReranker:
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         if _is_dashscope_rerank_model(provider, model):
-            api_key = await self.secret_store.get(parse_secret_ref(secret_ref))
+            api_key = await _cached_secret(
+                self.secret_cache, self.secret_store, tenant_id, secret_ref
+            )
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
@@ -1013,6 +1112,8 @@ class DynamicResolvingReranker:
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )
+        # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
+        # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
             model_spec, secret_store=self.secret_store, http_client=self.http
         )

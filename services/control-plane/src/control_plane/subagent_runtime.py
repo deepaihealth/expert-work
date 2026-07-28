@@ -10,6 +10,8 @@ the spec store and the recursive ``build_agent`` path to produce the
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -26,6 +28,7 @@ from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
 from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.skill_activity import SkillActivityRecorder
+from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.protocol import AgentSpec, SystemPromptSpec, ToolSpecEntry
@@ -157,10 +160,16 @@ def make_child_agent_builder(
     tenant_config_service: TenantConfigService | None = None,
     register_invalidation: Callable[[Callable[[UUID], None]], None] | None = None,
     register_invalidation_all: Callable[[Callable[[], None]], None] | None = None,
+    register_user_invalidation: Callable[[Callable[[UUID, str], None]], None] | None = None,
     # 一期 Task 5 — process-level shared HTTP client, forwarded into every
     # delegated child build's ``build_agent`` call. ``None`` keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
     http_client: httpx.AsyncClient | None = None,
+    # 二期 PR2 T4 — child-cache bounds: LRU capacity + flat TTL, plus the
+    # injectable monotonic time source (tests). Mirrors AgentRuntime._cache.
+    cache_max_size: int = 256,
+    cache_ttl_s: float = 1800.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> ChildAgentBuilder:
     """Build the :class:`ChildAgentBuilder` the orchestrator's ``ToolEnv`` carries.
 
@@ -183,7 +192,14 @@ def make_child_agent_builder(
     # when that user has ≥1 connected OAuth connector (mirrors the top-level
     # AgentRuntime cache) — so the common no-OAuth child stays shared and only
     # OAuth users get a per-user child build (never cross-user pool sharing).
-    cache: dict[_ChildKey, BuiltAgent] = {}
+    # 二期 PR2 T4 — bounded LRU; the value carries its ``expires_at``. The TTL
+    # only backstops invalidation paths that were never wired; explicit
+    # invalidation (the registered hooks below) stays the primary path.
+    cache: OrderedDict[_ChildKey, tuple[BuiltAgent, float]] = OrderedDict()
+
+    def _publish_cache_size() -> None:
+        """Refresh the subagent-scope cache size gauge (二期 PR2 T4)."""
+        set_built_agent_cache_entries(scope="subagent", count=len(cache))
 
     async def _build(
         *, tenant_id: UUID, name: str, version: str, depth: int, oauth_user_id: str | None = None
@@ -201,7 +217,18 @@ def make_child_agent_builder(
         )
         cached = cache.get(key)
         if cached is not None:
-            return cached
+            cached_built, expires_at = cached
+            if clock() < expires_at:
+                cache.move_to_end(key)
+                return cached_built
+            # Expired — drop and treat as a miss. Pure abandonment: the
+            # BuiltAgent may hold live MCP connections (MCPServerPool) still
+            # in use by an in-flight run, so never close() here; dropping the
+            # reference leaves cleanup to GC, matching the invalidators'
+            # behavior. No hook semantics apply — natural expiry is not a
+            # config change (二期 PR2 T4).
+            del cache[key]
+            _publish_cache_size()
         record = await spec_store.get(tenant_id=tenant_id, name=name, version=version)
         if record is None:
             raise SubAgentNotFoundError(tenant_id=tenant_id, name=name, version=version)
@@ -250,7 +277,13 @@ def make_child_agent_builder(
             skill_activity_recorder=skill_activity_recorder,
             http_client=http_client,
         )
-        cache[key] = built
+        cache[key] = (built, clock() + cache_ttl_s)
+        cache.move_to_end(key)
+        while len(cache) > cache_max_size:
+            # LRU eviction — pure abandonment, no close (same rationale as
+            # the expiry branch above).
+            cache.popitem(last=False)
+        _publish_cache_size()
         logger.info(
             "control_plane.subagent.built name=%s version=%s depth=%d",
             name,
@@ -268,6 +301,7 @@ def make_child_agent_builder(
         """
         for key in [k for k in cache if k[0] == tenant_id]:
             del cache[key]
+        _publish_cache_size()
 
     def _invalidate_all() -> None:
         """Drop every cached sub-agent (P1b).
@@ -277,11 +311,28 @@ def make_child_agent_builder(
         across all tenants, mirroring the top-level cache.
         """
         cache.clear()
+        _publish_cache_size()
+
+    def _invalidate_user(tenant_id: UUID, user_id: str) -> None:
+        """Drop cached per-user (OAuth) sub-agents for ``(tenant, user)``
+        (二期 PR2 T2).
+
+        Registered with the :class:`AgentRuntime` so a user's OAuth token
+        refresh / disconnect evicts stale delegated child builds (whose
+        ``ToolEnv`` holds the old per-user OAuth pool). Only 5-tuple keys
+        match — index 4 is the OAuth subject (see ``_ChildKey``); shared
+        4-tuple builds and other users' entries are left intact.
+        """
+        for key in [k for k in cache if len(k) == 5 and k[0] == tenant_id and k[4] == user_id]:
+            del cache[key]
+        _publish_cache_size()
 
     if register_invalidation is not None:
         register_invalidation(_invalidate_tenant)
     if register_invalidation_all is not None:
         register_invalidation_all(_invalidate_all)
+    if register_user_invalidation is not None:
+        register_user_invalidation(_invalidate_user)
 
     # The sub-agent's ToolEnv carries _build itself so a child can in turn
     # delegate to a grandchild. Assigned after _build is defined; the

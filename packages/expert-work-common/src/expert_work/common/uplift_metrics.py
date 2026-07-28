@@ -296,6 +296,16 @@ _legacy_credentials_fallback_total = expert_work_counter(
     label_names=("role",),
 )
 
+# 二期 PR2 T4 — built-agent cache bounds observability.
+_built_agent_cache_entries = expert_work_gauge(
+    "expert_work_built_agent_cache_entries",
+    "Live entries in the in-process built-agent caches. "
+    "``scope`` ∈ runtime (AgentRuntime top-level cache) | subagent "
+    "(delegated child-builder closure cache). Refreshed after every "
+    "put / invalidation / eviction / expiry.",
+    label_names=("scope",),
+)
+
 
 def record_threat_scan(*, scope: str, result: str, variant: str = "original") -> None:
     """Bump ``expert_work_uplift_threat_scan_total``.
@@ -619,6 +629,15 @@ def record_legacy_credentials_fallback(*, role: str) -> None:
     _legacy_credentials_fallback_total.labels(role=role).inc()
 
 
+def set_built_agent_cache_entries(*, scope: str, count: int) -> None:
+    """Set ``expert_work_built_agent_cache_entries{scope}`` (二期 PR2 T4).
+
+    ``scope`` ∈ ``{"runtime", "subagent"}``; ``count`` is the cache's
+    current ``len``. Callers set the absolute size after every mutation
+    (put / invalidation / LRU eviction / TTL expiry)."""
+    _built_agent_cache_entries.labels(scope=scope).set(count)
+
+
 __all__ = [
     "record_anthropic_cache_anchor",
     "record_consolidator_llm_tokens",
@@ -650,5 +669,6 @@ __all__ = [
     "record_threat_pattern_hits",
     "record_threat_scan",
     "record_trigger_blocked",
+    "set_built_agent_cache_entries",
     "set_curator_pinned_skills",
 ]
