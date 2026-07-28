@@ -52,11 +52,17 @@ async def test_expired_token_raises_token_expired() -> None:
 
 @pytest.mark.asyncio
 async def test_bad_signature_raises_invalid_token() -> None:
-    # Tamper with the signature segment.
+    # Tamper with the signature segment. Flip a character in the middle of
+    # the segment (every bit there is signature-significant) and guarantee it
+    # differs from the original — replacing the *trailing* chars with a fixed
+    # value is flaky: the last base64url char carries only 2 effective bits,
+    # so ~1/256 signatures already end in the replacement value.
     tenant = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     token = make_test_jwt(tenant_id=tenant)
     head, body, sig = token.split(".")
-    tampered = ".".join([head, body, sig[:-2] + "AA"])
+    mid = len(sig) // 2
+    flipped = "A" if sig[mid] != "A" else "B"
+    tampered = ".".join([head, body, sig[:mid] + flipped + sig[mid + 1 :]])
     with pytest.raises(InvalidTokenError):
         await _verifier().verify(tampered)
 
