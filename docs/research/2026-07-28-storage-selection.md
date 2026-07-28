@@ -32,13 +32,14 @@
 - **备选 = OSS 直挂**:官方唯一验证路径,但写语义弱,只有 NAS 路不通才用,且用之前三场景性能实测(pandas 读写/unzip/批量小文件)。
 - **AgenticFS = 工单探路**:官方选型指导页原文"AI Agent 多租户场景,为大规模终端用户提供独立隔离 Workspace → 建议选 AgenticFS"——与我们场景逐字匹配;per-space 原生配额上限 50 万(vs NAS 500 目录),专为此场景设计。邀测阶段,**建议提工单问:杭州开服?CSI/Agent Sandbox 集成?开测资格?** 不依赖它开工,作为 NAS 500 配额上限的未来解法。
 
-### PoC 清单(实施第一步,与沙箱验证合并)
+### PoC 结论(2026-07-28 实测,W0)
 
-1. 杭州 ACS 集群创建 agent-sandbox 沙箱(坐实售后说的杭州支持)。
-2. e2b 注解挂 NAS PV(subpath 模式)→ 可行则 NAS 定案。
-3. 不可行 → OSS 静态 PV 挂载 + 三场景性能实测 → 决定 OSS 直挂 or 升级方案(本地盘工作+OSS 同步)。
-4. OSS S3 兼容 PoC:现有 storage 层 5 操作 + virtual-hosted style 打通。
-5. AgenticFS 工单并行发出。
+1. ✅ 杭州 ACS 集群创建 agent-sandbox 沙箱:成功(冷启 ~40s;池领取 0.09s;休眠→唤醒 4s/2.2s;文件系统跨休眠保留)。
+2. ✅ **e2b 注解(`csi-volume-config`)挂 NAS PV:成功——工作区定案 = 通用型 NAS 容量型**。铁证:沙箱内 mount 显示 `<挂载点>:/tenant-a/user-1` NFSv3 挂 /workspace;subPath per-(tenant,user) 隔离生效;跨 Pod 共享确认(普通 Pod 写、沙箱读)→ control-plane 直读工作区路线成立。
+3. 性能抽测(容量型):小文件写 ~13ms/个、读 ~5ms/个、顺序写 ~109MB/s——产出型负载够用;不够可在线升高级型(2ms)。OSS 直挂路线归档为备选,不再需要。
+4. ✅ OSS S3 兼容 PoC:仓库 storage 层五操作(put/get/list_prefix/presigned_url 公网直取/delete)对真 OSS 全通。**两个 W2 代码适配项**:①`factory.py` addressing_style `auto`→显式 `virtual`(auto 对自定义 endpoint 退 path-style,OSS 拒 SecondLevelDomainForbidden);②BotoConfig 加 `request_checksum_calculation="when_required"` + `response_checksum_validation="when_required"`(OSS 不支持新版 botocore 默认的 STREAMING-UNSIGNED-PAYLOAD-TRAILER 流式校验)。另:presigned URL 面向公网的场景需公网 endpoint,服务内部走内网 endpoint——双 endpoint 配置进 W2。
+5. AgenticFS 工单:用户提交中。
+6. 附加发现:沙箱镜像必须含 bash(runtime 注入钩子依赖);E2B SDK 数据面经 gateway 在 port-forward 伪装姿势下 502,W3 上 Ingress 真域名复验(API 面/envd/网络/路由表均已验证正常)。
 
 ## control-plane 工作区访问路径(方案阶段细化)
 
