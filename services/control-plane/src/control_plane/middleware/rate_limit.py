@@ -27,6 +27,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 
 from pydantic import SecretStr
+from redis.exceptions import RedisError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -43,6 +44,19 @@ _rate_limit_decisions = expert_work_counter(
     "expert_work_control_plane_rate_limit_decisions_total",
     "Gateway rate-limit decisions by dimension and outcome.",
     ("dimension", "decision"),
+)
+
+# Shared with tenant_rate_limit.py (label distinguishes the tier) — see
+# subsystems/16 § 5.2 degradation table. A Redis outage must not take the
+# HTTP frontline down with it: both rate-limit tiers fail OPEN (request
+# proceeds, un-throttled) while recording the outage here so on-call can
+# see it. Business-level admission (quota check, ``_quota_admission.py``)
+# fails CLOSED instead — that's the deliberate asymmetry this counter's
+# ``backend`` label lets us tell apart on a dashboard.
+_rate_limit_backend_errors = expert_work_counter(
+    "expert_work_rate_limit_backend_errors_total",
+    "Rate-limit Redis backend errors; request fails OPEN (allowed) by tier.",
+    ("backend",),
 )
 
 # HMAC key used to derive bucket identifiers from raw header values. HMAC
@@ -111,7 +125,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         dimension, key = _resolve_bucket(request, self._bucket_hmac_key)
-        decision = await self._limiter.acquire(dimension=dimension, key=key)
+        try:
+            decision = await self._limiter.acquire(dimension=dimension, key=key)
+        except RedisError:
+            # Fail OPEN: an unavailable rate-limit backend must not become
+            # an outage. Log (not throttled — no existing log-throttle
+            # helper in this codebase; see task-2-report.md) + count, then
+            # let the request through un-throttled.
+            _rate_limit_backend_errors.labels(backend="gateway").inc()
+            logger.warning(
+                "rate_limit.backend_unavailable",
+                extra={"dimension": dimension},
+            )
+            return await call_next(request)
         outcome = "allowed" if decision.allowed else "denied"
         _rate_limit_decisions.labels(dimension=dimension, decision=outcome).inc()
 

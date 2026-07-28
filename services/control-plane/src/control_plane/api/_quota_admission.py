@@ -19,7 +19,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
@@ -68,7 +70,14 @@ async def check_admission(
         cost=cost,
         cost_overrides=dict(cost_overrides) if cost_overrides else {},
     )
-    result: CheckResult = await quota.check(request)
+    try:
+        result: CheckResult = await quota.check(request)
+    except RedisError as exc:
+        # Fail CLOSED — the deliberate asymmetry vs. the rate-limit tiers
+        # (which fail open): a business quota decision we can't verify
+        # must not silently allow unmetered spend. Wording is the
+        # subsystems/16 § 6 promise in redis_quota.py's module docstring.
+        raise HTTPException(status_code=503, detail="quota_engine_unavailable") from exc
     if result.allowed:
         return None
 

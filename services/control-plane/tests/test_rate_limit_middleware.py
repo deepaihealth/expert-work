@@ -9,9 +9,11 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
+from redis.exceptions import RedisError
 from starlette.responses import JSONResponse
 
 from control_plane.middleware import RateLimitMiddleware
+from control_plane.middleware.rate_limit import _rate_limit_backend_errors
 from control_plane.ratelimit import InProcessTokenBucketLimiter, RateLimitDecision, RateLimiter
 
 
@@ -25,6 +27,17 @@ class _StubLimiter:
     async def acquire(self, *, dimension: str, key: str) -> RateLimitDecision:
         self.calls.append((dimension, key))
         return self.decision
+
+
+@dataclass
+class _RedisDownLimiter:
+    """Simulates a Redis-backed limiter whose backend is unreachable."""
+
+    calls: list[tuple[str, str]]
+
+    async def acquire(self, *, dimension: str, key: str) -> RateLimitDecision:
+        self.calls.append((dimension, key))
+        raise RedisError("connection refused")
 
 
 def _build_probe_app(
@@ -108,6 +121,24 @@ async def test_denied_returns_429_with_envelope() -> None:
     assert body["success"] is False
     assert body["error"]["code"] == "RATE_LIMIT_EXCEEDED"
     assert body["error"]["retry_after_s"] == 3
+
+
+@pytest.mark.asyncio
+async def test_redis_error_fails_open_and_counts_backend_error() -> None:
+    """subsystems/16 § 5.2 — a Redis outage on the gateway tier must not become
+    an HTTP outage: the request is allowed through (fail OPEN) and the
+    backend-error counter records the degradation for on-call."""
+    stub = _RedisDownLimiter(calls=[])
+    app = _build_probe_app(stub)
+    transport = ASGITransport(app=app)
+    before = _rate_limit_backend_errors.labels(backend="gateway")._value.get()  # type: ignore[attr-defined]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/probe")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert stub.calls  # the limiter was actually invoked, not skipped
+    after = _rate_limit_backend_errors.labels(backend="gateway")._value.get()  # type: ignore[attr-defined]
+    assert after == before + 1
 
 
 @pytest.mark.asyncio

@@ -12,22 +12,51 @@ pin the new admission contract.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from dataclasses import dataclass
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from redis.exceptions import RedisError
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.quota import InMemoryTenantQuotaStore
-from expert_work.protocol import AuditAction, AuditQuery, QuotaDimension, TenantQuotaPatch
+from expert_work.protocol import (
+    AuditAction,
+    AuditQuery,
+    CheckRequest,
+    CheckResult,
+    CommitRequest,
+    QuotaDimension,
+    ReserveRequest,
+    ReserveResult,
+    TenantQuotaPatch,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
 _TENANT = DEFAULT_DEV_TENANT_ID
+
+
+@dataclass
+class _RedisDownQuotaService:
+    """Quota engine whose Redis backend is unreachable — every ``check`` raises."""
+
+    async def check(self, req: CheckRequest) -> CheckResult:
+        raise RedisError("connection refused")
+
+    async def reserve_tokens(self, req: ReserveRequest) -> ReserveResult:
+        raise NotImplementedError
+
+    async def commit_tokens(self, req: CommitRequest) -> None:
+        raise NotImplementedError
+
+    async def release_tokens(self, reservation_id: UUID, *, tenant_id: UUID) -> None:
+        raise NotImplementedError
 
 
 _AGENT_YAML = """\
@@ -99,6 +128,50 @@ async def admission_client(
     ) as client:
         await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
         yield client
+
+
+# ---------------------------------------------------------------------------
+# Redis outage — fail CLOSED (subsystems/16 § 5.2, § 6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_503_when_quota_engine_redis_down(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """A quota-engine Redis outage must deny admission (fail CLOSED) — the
+    opposite of the rate-limit tiers, which fail open. We can't verify the
+    quota decision, so we must not silently allow unmetered spend."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        quota_service=_RedisDownQuotaService(),
+        enable_reaper=False,
+        agent_runtime=stub_agent_runtime(),
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT)}"}
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://control-plane.test",
+        headers=headers,
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        response = await client.post(
+            "/v1/sessions",
+            json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "quota_engine_unavailable"
 
 
 # ---------------------------------------------------------------------------
