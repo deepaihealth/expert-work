@@ -62,6 +62,7 @@ import { listTenants, type TenantSummary } from "../api/tenants";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { PlatformBillingSection } from "./settings_platform/PlatformBillingSection";
+import { PlatformDelegationSection } from "./settings_platform/PlatformDelegationSection";
 import { PlatformDynamicWorkerSection } from "./settings_platform/PlatformDynamicWorkerSection";
 import { PlatformEmbeddingSection } from "./settings_platform/PlatformEmbeddingSection";
 import { PlatformJudgeSection } from "./settings_platform/PlatformJudgeSection";
@@ -749,6 +750,12 @@ export function SettingsPlatformConfig() {
                       title={t("settings_platform.dynamic_worker_heading")}
                     >
                       <PlatformDynamicWorkerSection />
+                    </Card>
+                    <Card
+                      size="small"
+                      title={t("settings_platform.delegation_heading")}
+                    >
+                      <PlatformDelegationSection />
                     </Card>
                   </Space>
                 ),
