@@ -9,9 +9,12 @@ forming an import cycle.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Final
+
+from expert_work.common.observability import expert_work_counter
 
 
 @dataclass
@@ -44,3 +47,57 @@ class WorkerSpawnBudget:
     async def concurrency(self) -> AsyncIterator[None]:
         async with self._sem:
             yield
+
+
+DELEGATION_GATE_KEY: Final = "delegation_gate"
+
+_delegations_gated = expert_work_counter(
+    "expert_work_delegations_gated_total",
+    "Delegations refused by the global concurrency gate (acquire timeout).",
+)
+
+
+# 二期 PR3(spec P4)— 进程级委托并发闸。容量每次 acquire 时经
+# capacity_provider 现读(provider 内部是 30s TTL 的配置服务),配置
+# 热生效语义 = 对下一次委托生效,不影响已在闸内的。单进程部署下
+# 真闸得住;HA 双色同活时每实例一闸(与本仓多副本 TTL 兜底同一立场)。
+class DelegationGate:
+    """Process-wide concurrency gate for delegations (subagent + spawn_worker).
+
+    ``acquire`` waits up to ``timeout_s`` for a slot; returns False on
+    timeout (caller degrades to a soft-fail ToolResult — never raises, so a
+    depth-1 delegation holding all slots cannot deadlock its own depth-2).
+    """
+
+    def __init__(
+        self,
+        capacity_provider: Callable[[], Awaitable[int]],
+        *,
+        timeout_s: float = 30.0,
+    ) -> None:
+        self._capacity_provider = capacity_provider
+        self._timeout_s = timeout_s
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self) -> bool:
+        try:
+            async with asyncio.timeout(self._timeout_s):
+                async with self._cond:
+                    while True:
+                        capacity = max(1, int(await self._capacity_provider()))
+                        if self._active < capacity:
+                            self._active += 1
+                            return True
+                        await self._cond.wait()
+        except TimeoutError:
+            return False
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()

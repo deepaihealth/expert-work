@@ -31,6 +31,7 @@ from uuid import UUID
 
 from expert_work.protocol import SubAgentSpec, parse_agent_ref
 from expert_work.runtime.cancellation import RunCancelledError
+from orchestrator.tools._budget import _delegations_gated
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.trajectory import TrajectoryRecorder
@@ -145,27 +146,44 @@ class SubAgentTool:
         task = self._require_task(args)
         name, version = parse_agent_ref(self.subagent.agent_ref)
 
-        child = await self.builder(
-            tenant_id=ctx.tenant_id,
-            name=name,
-            version=version,
-            depth=self.child_depth,
-            oauth_user_id=ctx.oauth_user_id,
-        )
-        return await run_child_to_result(
-            child=child,
-            task=task,
-            ctx=ctx,
-            child_depth=self.child_depth,
-            label=self.subagent.name,
-            agent_ref=self.subagent.agent_ref,
-            trajectory_recorder=self.trajectory_recorder,
-            trajectory_metadata={
-                "subagent_name": self.subagent.name,
-                "subagent_ref": self.subagent.agent_ref,
-                "child_depth": self.child_depth,
-            },
-        )
+        # 二期 PR3(spec P4)— process-wide delegation concurrency gate.
+        # Acquired before the child build so a saturated gate doesn't pay for
+        # resolving/building a child agent it can't run yet.
+        gate = ctx.delegation_gate
+        if gate is not None and not await gate.acquire():
+            _delegations_gated.inc()
+            return ToolResult(
+                content=(
+                    "[delegation refused: platform-wide delegation concurrency is "
+                    "saturated; retry later or complete the work without delegating]"
+                ),
+                meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+            )
+        try:
+            child = await self.builder(
+                tenant_id=ctx.tenant_id,
+                name=name,
+                version=version,
+                depth=self.child_depth,
+                oauth_user_id=ctx.oauth_user_id,
+            )
+            return await run_child_to_result(
+                child=child,
+                task=task,
+                ctx=ctx,
+                child_depth=self.child_depth,
+                label=self.subagent.name,
+                agent_ref=self.subagent.agent_ref,
+                trajectory_recorder=self.trajectory_recorder,
+                trajectory_metadata={
+                    "subagent_name": self.subagent.name,
+                    "subagent_ref": self.subagent.agent_ref,
+                    "child_depth": self.child_depth,
+                },
+            )
+        finally:
+            if gate is not None:
+                await gate.release()
 
     def _require_task(self, args: Mapping[str, Any]) -> str:
         raw = args.get("task")

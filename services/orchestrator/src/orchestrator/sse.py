@@ -93,6 +93,7 @@ from orchestrator.run_retry import (
     retry_enabled,
     run_retry_total,
 )
+from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
@@ -254,6 +255,7 @@ async def run_agent(
     event_store: RunEventStore | None = None,
     tool_replay_safe: Callable[[str], bool] | None = None,
     worker_spawn_budget: WorkerSpawnBudget | None = None,
+    delegation_gate: DelegationGate | None = None,
     token_budget: int = 0,
 ) -> None:
     """Drive ``graph`` to completion, publishing events to ``bridge``.
@@ -307,6 +309,10 @@ async def run_agent(
             # concurrency gate), shared across every spawn_worker call. A live
             # object like the cancel token; ``None`` when the feature is off.
             "worker_spawn_budget": worker_spawn_budget,
+            # 二期 PR3(spec P4)— the process-wide delegation concurrency gate
+            # (a process-level singleton, unlike worker_spawn_budget above).
+            # ``None`` when unwired (no delegation_config_service).
+            DELEGATION_GATE_KEY: delegation_gate,
         },
     }
     # Stream M Gate — session E2E duration. Started before ``set_status``
