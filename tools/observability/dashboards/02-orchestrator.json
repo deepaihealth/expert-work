@@ -35,7 +35,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "LLM tokens / s (by direction)",
+      "title": "LLM tokens / s (by type)",
       "datasource": {
         "type": "prometheus",
         "uid": "expert-work-prometheus"
@@ -60,8 +60,8 @@
             "type": "prometheus",
             "uid": "expert-work-prometheus"
           },
-          "expr": "sum by (direction) (rate(expert_work_llm_tokens_total[5m]))",
-          "legendFormat": "{{direction}}"
+          "expr": "sum by (type) (rate(expert_work_llm_token_usage_total[5m]))",
+          "legendFormat": "{{type}}"
         }
       ]
     },
@@ -101,7 +101,7 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Tool-call duration P95 (by tool_type)",
+      "title": "Tool-call duration P95 (by tool)",
       "datasource": {
         "type": "prometheus",
         "uid": "expert-work-prometheus"
@@ -126,8 +126,8 @@
             "type": "prometheus",
             "uid": "expert-work-prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, tool_type) (rate(expert_work_tool_call_duration_seconds_bucket[5m])))",
-          "legendFormat": "{{tool_type}}"
+          "expr": "histogram_quantile(0.95, sum by (le, tool) (rate(expert_work_tool_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{tool}}"
         }
       ]
     },
@@ -194,6 +194,57 @@
           },
           "expr": "expert_work:sli:session_duration:p95_5m",
           "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Delegation gate saturation (gated / queue-dropped / fail-open, rate 5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_delegations_gated_total[5m]))",
+          "legendFormat": "gated"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_run_event_queue_dropped_total[5m]))",
+          "legendFormat": "queue_dropped"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_delegation_gate_fail_open_total[5m]))",
+          "legendFormat": "fail_open"
         }
       ]
     }

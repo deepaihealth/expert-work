@@ -137,7 +137,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
-          "expr": "sum(rate(expert_work_llm_stream_stale_total[5m])) / clamp_min(sum(rate(expert_work_llm_tokens_total[5m])), 1)",
+          "expr": "sum(rate(expert_work_llm_stream_stale_total[5m])) / clamp_min(sum(rate(expert_work_llm_token_usage_total[5m])), 1)",
           "legendFormat": "stale ratio"
         }
       ]

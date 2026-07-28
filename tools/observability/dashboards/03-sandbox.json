@@ -39,7 +39,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Sandbox pool size (by state)",
+      "title": "Sandbox pool ready (by variant)",
       "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 3 },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
@@ -48,8 +48,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
-          "expr": "sum by (state) (expert_work_sandbox_pool_size)",
-          "legendFormat": "{{state}}"
+          "expr": "sum by (variant) (expert_work_sandbox_pool_ready)",
+          "legendFormat": "{{variant}}"
         }
       ]
     },
