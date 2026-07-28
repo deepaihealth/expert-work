@@ -161,13 +161,13 @@ groups:
           runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       # 委托闸(二期 PR3)可观测性追加。基线未知,先保守观察级
-      # (severity: warning,不接 P0/P1/P2/gate-watch 分级路由)——阈值
+      # (severity: gate-watch,随组内既有条目走同一路由)——阈值
       # 与窗口待攒够生产数据后再收紧。
       - alert: ExpertWorkGateDelegationsGatedSaturated
         expr: sum(increase(expert_work_delegations_gated_total[15m])) > 0
         for: 0m
         labels:
-          severity: warning
+          severity: gate-watch
         annotations:
           summary: "委托闸出现饱和拒绝"
           description: "过去 15m 有 {{ $value }} 次委托被并发闸拒绝（acquire 超时）。"
@@ -177,7 +177,7 @@ groups:
         expr: increase(expert_work_delegation_gate_fail_open_total[15m]) > 0
         for: 0m
         labels:
-          severity: warning
+          severity: gate-watch
         annotations:
           summary: "闸容量配置读取失败，fail-open 中"
           description: "过去 15m 有 {{ $value }} 次 DelegationGate 容量 provider 读取失败，已 fail-open（不限流）。"
