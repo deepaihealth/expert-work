@@ -26,13 +26,22 @@ from __future__ import annotations
 import abc
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import MemoryWritebackDLQRow
+
+#: How long a claimed row stays invisible to other ``take_ready`` callers
+#: before the next sweep treats it as an orphaned claim (crashed worker)
+#: and reclaims it. W1-PR1 Task 2 — the DLQ has no separate "in progress"
+#: status column, so the claim lease is expressed entirely through
+#: ``next_retry_at``: claiming pushes it to ``now + _CLAIM_LEASE_S``, and
+#: whichever of ``mark_done`` / ``record_failure`` eventually settles the
+#: row overwrites it with something sooner (or deletes the row outright).
+_CLAIM_LEASE_S: int = 600
 
 
 @dataclass(frozen=True)
@@ -96,10 +105,17 @@ class MemoryWritebackDLQ(abc.ABC):
 
     @abc.abstractmethod
     async def take_ready(self, *, limit: int, now: datetime) -> list[DLQRow]:
-        """Return up to ``limit`` rows whose ``next_retry_at <= now``,
-        oldest first. The worker is responsible for either calling
-        :meth:`mark_done` on success or :meth:`record_failure` on a
-        new error."""
+        """Atomically claim up to ``limit`` rows whose ``next_retry_at <=
+        now`` — a fleet of DLQ worker replicas shares this queue without
+        double-embedding/double-writing the same row (W1-PR1). Each
+        returned row's ``attempts`` already reflects this claim (bumped by
+        one) and its ``next_retry_at`` has been pushed to ``now +
+        _CLAIM_LEASE_S``; a replica that crashes mid-retry leaves the claim
+        behind for a later sweep to reclaim once the lease elapses. The
+        worker is responsible for either calling :meth:`mark_done` on
+        success or :meth:`record_failure` on a new error — both settle
+        ``next_retry_at`` to something sooner than the lease (or delete the
+        row outright)."""
 
     @abc.abstractmethod
     async def mark_done(self, *, row_id: UUID) -> None:
@@ -114,7 +130,9 @@ class MemoryWritebackDLQ(abc.ABC):
         when: datetime,
         next_retry_at: datetime,
     ) -> None:
-        """Bump ``attempts``, store ``error``, schedule ``next_retry_at``."""
+        """Store ``error`` and schedule ``next_retry_at``. Does **not**
+        bump ``attempts`` — :meth:`take_ready` already counted this
+        attempt at claim time (W1-PR1)."""
 
     @abc.abstractmethod
     async def count(self) -> int:
@@ -171,7 +189,24 @@ class InMemoryMemoryWritebackDLQ(MemoryWritebackDLQ):
     async def take_ready(self, *, limit: int, now: datetime) -> list[DLQRow]:
         ready = [r for r in self._rows.values() if r.next_retry_at <= now]
         ready.sort(key=lambda r: r.next_retry_at)
-        return ready[:limit]
+        lease_until = now + timedelta(seconds=_CLAIM_LEASE_S)
+        claimed: list[DLQRow] = []
+        for row in ready[:limit]:
+            updated = DLQRow(
+                id=row.id,
+                tenant_id=row.tenant_id,
+                user_id=row.user_id,
+                source_thread_id=row.source_thread_id,
+                source_run_id=row.source_run_id,
+                extracted=row.extracted,
+                attempts=row.attempts + 1,
+                next_retry_at=lease_until,
+                last_error=row.last_error,
+                created_at=row.created_at,
+            )
+            self._rows[row.id] = updated
+            claimed.append(updated)
+        return claimed
 
     async def mark_done(self, *, row_id: UUID) -> None:
         self._rows.pop(row_id, None)
@@ -195,7 +230,7 @@ class InMemoryMemoryWritebackDLQ(MemoryWritebackDLQ):
             source_thread_id=existing.source_thread_id,
             source_run_id=existing.source_run_id,
             extracted=existing.extracted,
-            attempts=existing.attempts + 1,
+            attempts=existing.attempts,
             next_retry_at=next_retry_at,
             last_error=error,
             created_at=existing.created_at,
@@ -252,15 +287,51 @@ class SqlMemoryWritebackDLQ(MemoryWritebackDLQ):
         return _row_to_dlq(row)
 
     async def take_ready(self, *, limit: int, now: datetime) -> list[DLQRow]:
-        stmt = (
-            select(MemoryWritebackDLQRow)
-            .where(MemoryWritebackDLQRow.next_retry_at <= now)
-            .order_by(MemoryWritebackDLQRow.next_retry_at.asc())
-            .limit(limit)
-        )
+        # Atomic CAS — a fleet of worker replicas shares this queue without
+        # double-embedding/double-writing the same row: ``FOR UPDATE SKIP
+        # LOCKED`` lets each replica's transaction skip rows another
+        # replica already has locked, then the UPDATE flips exactly the
+        # rows this replica won (bumping ``attempts`` and pushing the claim
+        # lease) and hands them back via ``RETURNING`` in one round trip.
+        # Mirrors ``knowledge/sql.py::claim_documents_for_ingest``.
+        lease_until = now + timedelta(seconds=_CLAIM_LEASE_S)
         async with self._sf() as session:
-            rows = (await session.execute(stmt)).scalars().all()
-        return [_row_to_dlq(r) for r in rows]
+            candidate_ids = (
+                (
+                    await session.execute(
+                        select(MemoryWritebackDLQRow.id)
+                        .where(MemoryWritebackDLQRow.next_retry_at <= now)
+                        .order_by(MemoryWritebackDLQRow.next_retry_at.asc())
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not candidate_ids:
+                await session.commit()
+                return []
+            rows = (
+                (
+                    await session.execute(
+                        update(MemoryWritebackDLQRow)
+                        .where(MemoryWritebackDLQRow.id.in_(candidate_ids))
+                        .values(
+                            attempts=MemoryWritebackDLQRow.attempts + 1,
+                            next_retry_at=lease_until,
+                        )
+                        .returning(MemoryWritebackDLQRow)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        by_id = {r.id: r for r in rows}
+        # ``RETURNING`` doesn't preserve the candidate SELECT's ordering —
+        # reapply it so callers still see oldest-claimed-first.
+        return [_row_to_dlq(by_id[rid]) for rid in candidate_ids]
 
     async def mark_done(self, *, row_id: UUID) -> None:
         stmt = delete(MemoryWritebackDLQRow).where(MemoryWritebackDLQRow.id == row_id)
@@ -281,7 +352,6 @@ class SqlMemoryWritebackDLQ(MemoryWritebackDLQ):
             update(MemoryWritebackDLQRow)
             .where(MemoryWritebackDLQRow.id == row_id)
             .values(
-                attempts=MemoryWritebackDLQRow.attempts + 1,
                 last_error=error,
                 next_retry_at=next_retry_at,
             )

@@ -132,20 +132,24 @@ async def test_transient_failure_schedules_backoff_retry() -> None:
 async def test_max_attempts_marks_dead_letter() -> None:
     """A row at ``attempts == max_attempts - 1`` whose retry fails
     becomes a dead letter; future ``take_ready`` calls inside the
-    backoff window skip it."""
+    backoff window skip it.
+
+    W1-PR1 Task 2 recalibration: ``attempts`` is now counted at claim
+    time (``take_ready``), not inside ``record_failure`` — so "4 prior
+    failed attempts" means 4 prior claim+fail cycles, not 4 bare
+    ``record_failure`` calls (which no longer touch ``attempts`` at
+    all)."""
     dlq = InMemoryMemoryWritebackDLQ()
     store = InMemoryMemoryStore()
     await _seed_dlq(dlq)
-    # Bring the row to attempts=4 — next failure crosses the threshold
-    # (max_attempts default=5).
+    # Bring the row to attempts=4 via 4 claim+fail cycles — the 5th claim
+    # (inside worker.run_once below) crosses the max_attempts=5 threshold.
     row_id = next(iter(dlq._rows))
     for _ in range(4):
-        await dlq.record_failure(
-            row_id=row_id,
-            error="prior",
-            when=datetime.now(UTC),
-            next_retry_at=datetime.now(UTC),
-        )
+        now = datetime.now(UTC)
+        claimed = await dlq.take_ready(limit=10, now=now)
+        assert [r.id for r in claimed] == [row_id]
+        await dlq.record_failure(row_id=row_id, error="prior", when=now, next_retry_at=now)
 
     embedder = _ScriptedEmbedder([RuntimeError("still broken")])
     worker = MemoryDLQWorker(dlq=dlq, memory_store=store, embedder=embedder)
@@ -154,10 +158,54 @@ async def test_max_attempts_marks_dead_letter() -> None:
 
     pending = list(dlq._rows.values())
     assert len(pending) == 1, "dead letter should remain in the queue for review"
+    assert pending[0].attempts == 5  # claimed once per cycle, never doubled
     # next_retry_at parked far ahead so the cycle doesn't keep
     # re-trying it.
     far = (pending[0].next_retry_at - datetime.now(UTC)).total_seconds()
     assert far > 30 * 24 * 3600  # parked > 30 days out
+
+
+class _FlakyMarkDoneDLQ(InMemoryMemoryWritebackDLQ):
+    """``mark_done`` raises once — exercises the ``run_once`` release path
+    for a row ``_attempt_one`` claimed but never resolved (W1-PR1 Task 2
+    follow-up, same trap as the webhook delivery worker's unhandled-
+    exception branch)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mark_done_calls = 0
+
+    async def mark_done(self, *, row_id: UUID) -> None:
+        self.mark_done_calls += 1
+        raise RuntimeError("db down")
+
+
+@pytest.mark.asyncio
+async def test_unhandled_store_exception_releases_claim_immediately() -> None:
+    """If the DLQ-store call inside ``_attempt_one`` itself raises past its
+    own handling (here: ``mark_done`` failing on the happy path), the row
+    must not sit stuck until the 600s claim lease elapses. ``run_once``
+    must (a) not propagate the exception, and (b) release the row back to
+    ``next_retry_at=now`` so the very next sweep retries it.
+
+    Choice locked here (see task-2-report.md): release keeps ``attempts``
+    exactly as the claim left it — a release is not a second attempt, but
+    the claim already spent one, so it is not rolled back either."""
+    dlq = _FlakyMarkDoneDLQ()
+    store = InMemoryMemoryStore()
+    await _seed_dlq(dlq)
+    embedder = _ScriptedEmbedder([[(0.1, 0.2, 0.3)]])
+    worker = MemoryDLQWorker(dlq=dlq, memory_store=store, embedder=embedder)
+
+    succeeded, retried, dead = await worker.run_once()  # must not raise
+
+    assert (succeeded, retried, dead) == (0, 0, 0)
+    assert dlq.mark_done_calls == 1
+
+    [row] = list(dlq._rows.values())
+    assert row.attempts == 1  # the claim's bump stands; release doesn't roll it back
+    delta = (row.next_retry_at - datetime.now(UTC)).total_seconds()
+    assert delta < 5, "released row must be immediately re-claimable, not stuck at the 600s lease"
 
 
 @pytest.mark.asyncio
