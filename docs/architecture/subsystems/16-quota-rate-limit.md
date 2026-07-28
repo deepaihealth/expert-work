@@ -319,7 +319,7 @@ smooth_factor = 1.5  # 允许某天突破到 1.5× 平均
 
 | 失败模式 | 影响 | 缓解 |
 |---------|------|------|
-| Redis 不可达 | 所有限流失效 | **fail-closed for tenant 维度**（拒绝），**fail-open for IP 维度**（放行）；告警 |
+| Redis 不可达 | 所有限流失效 | 限流层（网关 per-IP/per-apikey + 业务 per-tenant/agent/user）统一 **fail-open 放行** + `expert_work_rate_limit_backend_errors_total` counter 告警；配额准入（花费控制，`_quota_admission` 及 `/v1/quota/*` 端点）**fail-closed**，返回 503 `quota_engine_unavailable`——花费风险由准入层兜底，限流层 fail-open 不产生未计量成本（2026-07-28 多副本就绪改造定，替代原 per-维度分裂策略） |
 | Lua 脚本未加载 | EVALSHA NOSCRIPT 错误 | 客户端自动 EVAL fallback + 重新缓存 sha |
 | Tenant header 伪造 | 跨租户绕过 | [15 AuthN](./15-authn-authz.md) 强校验 |
 | 配置漂移（manifest 比 tenant_quota 宽）| 实际无限制 | check 时取 min；CI lint 校验 manifest 不能宽 |

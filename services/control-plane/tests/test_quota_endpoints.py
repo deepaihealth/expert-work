@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.exceptions import RedisError
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -15,7 +17,12 @@ from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import (
     AuditAction,
     AuditQuery,
+    CheckRequest,
+    CheckResult,
+    CommitRequest,
     QuotaDimension,
+    ReserveRequest,
+    ReserveResult,
     Role,
     TenantQuotaPatch,
 )
@@ -27,6 +34,27 @@ from tests.auth_fixtures import (
 )
 
 _TENANT = DEFAULT_DEV_TENANT_ID
+
+
+@dataclass
+class _RedisDownQuotaService:
+    """Quota engine whose Redis backend is unreachable — every call raises.
+
+    Mirrors ``test_quota_admission.py``'s fixture of the same name (kept
+    local rather than imported so this file stays self-contained).
+    """
+
+    async def check(self, req: CheckRequest) -> CheckResult:
+        raise RedisError("connection refused")
+
+    async def reserve_tokens(self, req: ReserveRequest) -> ReserveResult:
+        raise RedisError("connection refused")
+
+    async def commit_tokens(self, req: CommitRequest) -> None:
+        raise RedisError("connection refused")
+
+    async def release_tokens(self, reservation_id: UUID, *, tenant_id: UUID) -> None:
+        raise RedisError("connection refused")
 
 
 @pytest.fixture
@@ -50,6 +78,31 @@ async def quota_client(audit_store: InMemoryAuditLogStore) -> AsyncIterator[Asyn
         jwt_verifier=build_test_jwt_verifier(),
         # Reaper would start a periodic asyncio task on top of the test
         # event loop; disable for endpoint-only tests.
+        enable_reaper=False,
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as c:
+        yield c
+
+
+@pytest.fixture
+async def redis_down_quota_client(
+    audit_store: InMemoryAuditLogStore,
+) -> AsyncIterator[AsyncClient]:
+    """Client wired to a quota engine whose Redis backend is down."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        quota_service=_RedisDownQuotaService(),
         enable_reaper=False,
     )
     transport = ASGITransport(app=app)
@@ -304,6 +357,43 @@ async def test_internal_release_404_when_unknown(quota_client: AsyncClient) -> N
     )
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "RESERVATION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_internal_check_returns_503_when_redis_down(
+    redis_down_quota_client: AsyncClient,
+) -> None:
+    """RedisError inside ``quota.check`` must map to 503
+    ``quota_engine_unavailable`` (subsystems/16 § 6 fail-closed contract for
+    quota admission) rather than an unhandled 500."""
+    token = _operator_token()
+    resp = await redis_down_quota_client.post(
+        "/v1/quota/check",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"tenant_id": str(_TENANT), "cost": 1},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "quota_engine_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_internal_reserve_returns_503_when_redis_down(
+    redis_down_quota_client: AsyncClient,
+) -> None:
+    """Same fail-closed contract for ``/v1/quota/reserve``."""
+    token = _operator_token()
+    resp = await redis_down_quota_client.post(
+        "/v1/quota/reserve",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "tenant_id": str(_TENANT),
+            "agent": "alpha",
+            "thread_id": str(uuid4()),
+            "estimated_tokens": 100,
+        },
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "quota_engine_unavailable"
 
 
 @pytest.mark.asyncio

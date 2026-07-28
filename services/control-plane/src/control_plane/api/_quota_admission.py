@@ -17,6 +17,8 @@ Why a separate module and not inline:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -35,7 +37,26 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
-__all__ = ["check_admission"]
+__all__ = ["check_admission", "quota_engine_unavailable_as_503"]
+
+
+@asynccontextmanager
+async def quota_engine_unavailable_as_503() -> AsyncIterator[None]:
+    """Translate a ``RedisError`` raised inside the block into the
+    subsystems/16 § 6 promise: the quota engine being unreachable maps to
+    HTTP 503 ``quota_engine_unavailable`` (fail CLOSED — the opposite of the
+    rate-limit tiers, which fail open; see ``redis_quota.py``'s module
+    docstring for the wording this ``detail`` must stay byte-identical to).
+
+    Shared by :func:`check_admission` (the in-process admission wire used by
+    ``sessions:create`` / ``runs:create`` / uploads) and the ``/v1/quota/*``
+    internal HTTP endpoints (``api/quota.py``) so both surfaces honour the
+    same contract from one place.
+    """
+    try:
+        yield
+    except RedisError as exc:
+        raise HTTPException(status_code=503, detail="quota_engine_unavailable") from exc
 
 
 async def check_admission(
@@ -70,14 +91,9 @@ async def check_admission(
         cost=cost,
         cost_overrides=dict(cost_overrides) if cost_overrides else {},
     )
-    try:
-        result: CheckResult = await quota.check(request)
-    except RedisError as exc:
-        # Fail CLOSED — the deliberate asymmetry vs. the rate-limit tiers
-        # (which fail open): a business quota decision we can't verify
-        # must not silently allow unmetered spend. Wording is the
-        # subsystems/16 § 6 promise in redis_quota.py's module docstring.
-        raise HTTPException(status_code=503, detail="quota_engine_unavailable") from exc
+    result: CheckResult
+    async with quota_engine_unavailable_as_503():
+        result = await quota.check(request)
     if result.allowed:
         return None
 
