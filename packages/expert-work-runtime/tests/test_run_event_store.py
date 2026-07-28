@@ -158,6 +158,48 @@ async def test_delete_for_runs_removes_only_targeted_runs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_append_batch_round_trips_in_order() -> None:
+    """One ``append_batch`` call with N records → ``list`` returns all of
+    them, in seq order (二期 PR3 background persist writer)."""
+    store = InMemoryRunEventStore()
+    run_id = uuid4()
+    records = [
+        make_event_record(run_id=run_id, seq=i, event_name="updates", data={"i": i})
+        for i in range(5)
+    ]
+
+    await store.append_batch(records)
+
+    listed = await store.list(run_id=run_id)
+    assert [r.seq for r in listed] == [0, 1, 2, 3, 4]
+    assert [r.data for r in listed] == [{"i": i} for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_append_batch_duplicate_seq_raises() -> None:
+    """A record colliding with an already-persisted ``(run_id, seq)`` raises,
+    mirroring the SQL primary key."""
+    store = InMemoryRunEventStore()
+    run_id = uuid4()
+    await store.append(make_event_record(run_id=run_id, seq=0, event_name="metadata", data={}))
+
+    with pytest.raises(ValueError, match="duplicate seq"):
+        await store.append_batch(
+            [make_event_record(run_id=run_id, seq=0, event_name="updates", data={"dup": True})]
+        )
+
+
+@pytest.mark.asyncio
+async def test_append_batch_empty_is_noop() -> None:
+    store = InMemoryRunEventStore()
+    run_id = uuid4()
+
+    await store.append_batch([])
+
+    assert await store.list(run_id=run_id) == []
+
+
+@pytest.mark.asyncio
 async def test_next_seq_pages_beyond_list_limit() -> None:
     """The default paging implementation finds the true max even when the run
     has more frames than ``MAX_LIST_LIMIT`` (single ``list`` call can't)."""
