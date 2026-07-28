@@ -140,3 +140,9 @@ groups:
           sum(rate(expert_work_sandbox_pool_total{event="hit"}[1h]))
           /
           sum(rate(expert_work_sandbox_pool_total{event=~"hit|miss"}[1h]))
+
+      # Delegation gate saturation (二期 PR3 spec P4): rate of delegations
+      # refused by the process-wide concurrency gate (acquire timeout).
+      # Feeds the gate-watch alerts in alerts.yml.
+      - record: expert_work:sli:delegations_gated:rate_5m
+        expr: rate(expert_work_delegations_gated_total[5m])
