@@ -20,7 +20,7 @@ from expert_work.protocol import SubAgentSpec
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.agent_factory import BuiltAgent
 from orchestrator.graph_builder.builder import _build_tool_context
-from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
+from orchestrator.tools._budget import DELEGATION_GATE_KEY, DELEGATIONS_GATED, DelegationGate
 from orchestrator.tools._child_run import _child_config
 from orchestrator.tools.registry import ToolContext
 from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerAgentBuilder
@@ -130,6 +130,100 @@ async def test_release_below_zero_clamps_to_zero() -> None:
     gate = DelegationGate(_capacity(2), timeout_s=1.0)
     await gate.release()  # no prior acquire
     assert gate.active == 0
+
+
+# ---------------------------------------------------------------------------
+# DelegationGate — Fix round 1: capacity_provider read OUTSIDE the lock,
+# fail-open on provider exceptions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_not_blocked_by_slow_provider() -> None:
+    """``release`` must never wait on a slow ``capacity_provider``.
+
+    The production provider (``PlatformDelegationConfigService.effective``)
+    does a real DB read on its 30s TTL expiry. If that read happened under
+    the gate's lock, one slow query would queue-head-block every waiting
+    ``acquire`` AND every ``release`` — turning a single slow DB round-trip
+    into a platform-wide delegation stall.
+    """
+
+    async def _slow_provider() -> int:
+        await asyncio.sleep(0.2)
+        return 1
+
+    gate = DelegationGate(_slow_provider, timeout_s=5.0)
+    assert await gate.acquire() is True  # occupies the only slot
+
+    waiter = asyncio.ensure_future(gate.acquire())
+    await asyncio.sleep(0.05)  # let the waiter start its (slow) capacity read
+    assert not waiter.done()
+
+    started = time.monotonic()
+    await gate.release()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.1  # must return promptly, not stuck behind the provider
+
+    result = await asyncio.wait_for(waiter, timeout=1.0)
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_fails_open() -> None:
+    async def _raising_provider() -> int:
+        raise RuntimeError("config store unavailable")
+
+    gate = DelegationGate(_raising_provider, timeout_s=1.0)
+    assert await gate.acquire() is True
+    assert gate.active == 1
+
+    await gate.release()
+    assert gate.active == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_error_not_miscounted_as_gate_full() -> None:
+    """A provider-internal ``TimeoutError`` (e.g. an asyncpg query timeout)
+    must fail OPEN (``acquire`` -> ``True``), not be mistaken for the gate
+    itself timing out (``acquire`` -> ``False``, which the tool call sites
+    count via ``DELEGATIONS_GATED``)."""
+
+    async def _timing_out_provider() -> int:
+        raise TimeoutError("query timed out")
+
+    gate = DelegationGate(_timing_out_provider, timeout_s=1.0)
+    before = DELEGATIONS_GATED._value.get()  # type: ignore[attr-defined]
+
+    assert await gate.acquire() is True
+
+    after = DELEGATIONS_GATED._value.get()  # type: ignore[attr-defined]
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_uses_last_known_capacity() -> None:
+    """After one successful read, a later provider exception falls back to
+    the LAST KNOWN capacity — not an unbounded fail-open — so a config
+    store that starts erroring after reading fine doesn't suddenly uncap
+    the gate."""
+    should_raise = False
+
+    async def _provider() -> int:
+        if should_raise:
+            raise RuntimeError("config store unavailable")
+        return 1
+
+    gate = DelegationGate(_provider, timeout_s=0.05)
+    assert await gate.acquire() is True  # capacity=1 cached, slot taken
+
+    should_raise = True
+    started = time.monotonic()
+    result = await gate.acquire()  # must use cached capacity=1: wait, then time out
+    elapsed = time.monotonic() - started
+
+    assert result is False  # NOT fail-open — the cached capacity was honored
+    assert elapsed < 1.0  # bounded by timeout_s, not real 30s
 
 
 # ---------------------------------------------------------------------------

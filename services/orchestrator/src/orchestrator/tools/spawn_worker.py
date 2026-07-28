@@ -36,7 +36,7 @@ from uuid import UUID
 
 from expert_work.common.observability import expert_work_counter
 from expert_work.runtime.cancellation import RunCancelledError
-from orchestrator.tools._budget import WorkerSpawnBudget, _delegations_gated
+from orchestrator.tools._budget import DELEGATIONS_GATED, WorkerSpawnBudget
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.trajectory import TrajectoryRecorder
@@ -185,12 +185,18 @@ class SpawnWorkerTool:
                 meta={"spawn_worker_blocked": True, "reason": "per_run_budget"},
             )
 
+        # Minor — if the gate below refuses this delegation, the per-run
+        # spawn budget slot reserved just above is intentionally NOT rolled
+        # back: WorkerSpawnBudget exposes no reverse/refund API, a gate
+        # refusal is transient (retry later), and the budget is a defense
+        # against runaway spawning — erring toward spending it down is the
+        # conservative direction here.
         # 二期 PR3(spec P4)— process-wide delegation concurrency gate, layered
         # on top of the per-run budget above. Acquired before the child build
         # so a saturated gate doesn't pay for building a worker it can't run.
         gate = ctx.delegation_gate
         if gate is not None and not await gate.acquire():
-            _delegations_gated.inc()
+            DELEGATIONS_GATED.inc()
             return ToolResult(
                 content=(
                     "[delegation refused: platform-wide delegation concurrency is "

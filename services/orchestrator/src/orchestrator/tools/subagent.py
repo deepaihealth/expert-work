@@ -31,7 +31,7 @@ from uuid import UUID
 
 from expert_work.protocol import SubAgentSpec, parse_agent_ref
 from expert_work.runtime.cancellation import RunCancelledError
-from orchestrator.tools._budget import _delegations_gated
+from orchestrator.tools._budget import DELEGATIONS_GATED
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.trajectory import TrajectoryRecorder
@@ -151,7 +151,7 @@ class SubAgentTool:
         # resolving/building a child agent it can't run yet.
         gate = ctx.delegation_gate
         if gate is not None and not await gate.acquire():
-            _delegations_gated.inc()
+            DELEGATIONS_GATED.inc()
             return ToolResult(
                 content=(
                     "[delegation refused: platform-wide delegation concurrency is "

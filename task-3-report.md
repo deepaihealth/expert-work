@@ -209,3 +209,114 @@ Modify:
 New:
 - `services/orchestrator/tests/test_delegation_gate.py`
 - `services/control-plane/tests/test_delegation_gate_wiring.py`
+
+## Fix round 1(2026-07-28)
+
+### 问题
+
+审查发现 `DelegationGate.acquire` 把 `await capacity_provider()` 包在
+`async with self._cond` 锁内(旧 `_budget.py:90-92`)。生产 provider
+(`PlatformDelegationConfigService.effective`)TTL(30s)到期时做真 DB 读——
+DB 卡顿会让持锁的那次 `acquire` 独占 `self._cond`,队头阻塞同进程内**所有**
+`acquire` **和** `release`(`release` 也要拿同一把锁),把一次慢查询放大成
+全平台委托的雪崩式软失败。
+
+### 修复(4 处,均按 brief 逐字落地)
+
+1. **容量读挪到锁外 + provider 异常 fail-open**(`_budget.py`):`acquire`
+   改写为经典 condition-loop——每轮先在锁外 `await self._read_capacity()`,
+   再进 `self._cond` 比较+自增。新增 `_read_capacity() -> int | None`:成功
+   缓存到 `self._last_capacity` 并返回;`except Exception`(含内建
+   `TimeoutError`,例如 asyncpg 查询超时)记 warning(`exc_info=True`)后
+   返回 `self._last_capacity`(从未成功过则 `None`)。`None` 语义 = fail-open
+   不设限(闸是延迟保护闸不是安全闸,与 `delegation_gate=None` 现状行为同向)。
+   `asyncio.CancelledError` 是 `BaseException` 不会被 `except Exception` 捕获,
+   外层 `asyncio.timeout` 到期时的取消信号能正常穿透到 `acquire` 的
+   `except TimeoutError: return False`,不会被 `_read_capacity` 误吞。
+   `_active += 1` 到 `return True` 之间仍无 `await`;`acquire` 返回 `False`
+   绝不占坑。
+2. **docstring 补约束**(`_budget.py` 类文档):写明 provider 在锁外执行、
+   其耗时计入 `acquire` 超时窗、异常时 fail-open 用最近一次成功值、
+   `release` 永不被 provider 阻塞。
+3. **counter 改公开名**(Minor):`_delegations_gated` → `DELEGATIONS_GATED`
+   ——`_budget.py` 定义处 + `spawn_worker.py` / `subagent.py` 两个 import
+   处 + 各自 `.inc()` 调用点。
+4. **budget 烧名额不回滚加注释**(Minor,`spawn_worker.py`):`try_reserve`
+   与过闸判断之间补一句注释,说明闸拒时已 `reserve` 的 per-run 名额有意不
+   回滚(`WorkerSpawnBudget` 无反向 API;闸拒是瞬态、budget 是防失控上限,
+   烧掉偏保守方向)。
+
+### 测试(`test_delegation_gate.py` 新增 4 个,RED→GREEN 各自验证)
+
+- `test_release_not_blocked_by_slow_provider`:provider `sleep(0.2)`;先占满
+  唯一容量,另起一个 acquirer 卡在（锁外的）慢 provider 读上,同时对占用者
+  调用 `release()`——断言 `release` 在 `<0.1s` 内完成。**RED 验证**:用
+  `git`-free 的手工回退法——临时把 `acquire()` 换回旧的「锁内读 provider」
+  实现(保留 `DELEGATIONS_GATED` 新名不动,以免测试文件 import 失败),单独
+  跑这一个测试,复现 `assert 0.150... < 0.1` 失败(旧代码下 `release` 被卡在
+  等待者持有的 provider-read 锁后面);随后原样换回新实现,同一测试转绿。
+- `test_provider_exception_fails_open`:provider 恒抛 `RuntimeError` →
+  `acquire` 立即 `True`,`active` 记账正常,`release` 后归零。
+- `test_provider_timeout_error_not_miscounted_as_gate_full`:provider 抛内建
+  `TimeoutError` → `acquire` 返回 `True`(fail-open)而非 `False`;直接读
+  `DELEGATIONS_GATED._value.get()` 前后对比,断言 counter 不增(与既有
+  `test_sse_persistence.py` 同款 `._value.get()` 读法一致)。
+- `test_provider_exception_uses_last_known_capacity`:先成功一次(容量 1)
+  占满;再切 provider 恒抛异常;第二次 `acquire`(`timeout_s=0.05`)必须
+  返回 `False` 而非立即 fail-open 的 `True`——证明用的是缓存容量 1(仍判定
+  已满,等到超时才软失败),而不是「provider 一异常就整个不设限」。
+
+其余全部既有 gate/工具测试(`test_third_acquire_waits_until_a_release_frees_a_slot`
+等)不改断言,原样跑绿——热生效语义(provider 正常时每轮现读、下一次
+`acquire` 立刻看到新容量)未变。
+
+### 验证结果
+
+```
+$ DOCKER_HOST= uv run pytest services/orchestrator/tests/test_delegation_gate.py -x -q
+24 passed in 1.24s
+
+$ DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock uv run pytest services/orchestrator -q
+1906 passed, 1 skipped in 24.56s
+  (skip 是既有的 docx 模块缺失,与本次改动无关;
+   test_runner_integration.py::test_postgres_checkpoint_persists_across_restart
+   在无 DOCKER_HOST 时的 DockerException 在基线上原样复现,与本次改动无关)
+
+$ uv run ruff check services/orchestrator
+All checks passed!
+
+$ uv run ruff format --check services/orchestrator
+227 files already formatted
+
+$ uv run mypy services/orchestrator/src
+Success: no issues found in 83 source files
+```
+
+### 自审
+
+- **锁外读+锁内比较不丢唤醒**:`wait()` 返回后仍持锁,`async with self._cond:`
+  块结束才释放,循环回到 `while True` 顶部才在锁外重读容量、重新进锁再判——
+  经典 re-check 模式,新容量不会因为提前退出锁而被错过。
+- **`_read_capacity` 的 `except Exception` 与外层 `asyncio.timeout` 不冲突**:
+  仔细核对了 `asyncio.timeout()` 的实现机制——超时到期时它 `task.cancel()`
+  当前任务,在 `await self._capacity_provider()` 挂起点抛出的是
+  `asyncio.CancelledError`(`BaseException` 子类,3.8+ 起不再继承
+  `Exception`),不会被 `_read_capacity` 的 `except Exception` 吞掉;
+  `CancelledError` 穿透到 `Timeout.__aexit__` 才被转换成 `TimeoutError`,
+  外层 `except TimeoutError: return False` 接住。真正会被 `_read_capacity`
+  捕获的是 **provider 自己**抛出的 `TimeoutError`(例如 provider 内部用
+  `asyncio.wait_for` 或 asyncpg 驱动对查询做的超时),这正是 brief 要求
+  「在这里捕获才不会被外层误判闸满」的场景——两者不会互相干扰。
+- **`test_release_not_blocked_by_slow_provider` 的 RED 复现是真实的**:不是
+  只凭推理断言应该失败,实测跑出 `0.150... < 0.1` 断言失败,数值(约等于
+  provider 的 0.2s sleep 减去测试里 0.05s 的先导 sleep)与「release 被卡在
+  等待者持锁读 provider 后面」的假设吻合。
+- **`DELEGATIONS_GATED` 改公开名后确认无遗漏引用**:`grep -rn
+  "_delegations_gated"` 全仓只剩 Prometheus 指标字符串本身
+  (`"expert_work_delegations_gated_total"`,这是 metric name 不是 Python
+  标识符,不受影响)。
+- **未做但确认过不需要做**:没有改 `runtime.py` 里 `delegation_gate()` 方法
+  或 `PlatformDelegationConfigService`——本轮 brief 明确限定改动范围在
+  `_budget.py`/`spawn_worker.py`/`subagent.py`/`test_delegation_gate.py`
+  四个文件,provider 本身的实现(DB 读、TTL 缓存)不在本轮修复范围内,
+  fail-open 是在 `DelegationGate` 侧兜底,不依赖 provider 改造。
