@@ -360,6 +360,8 @@ async def run_agent(
                 persist_queue.get_nowait()  # drop-oldest
                 persist_queue.task_done()
             except asyncio.QueueEmpty:
+                # writer 恰在 QueueFull 与 get_nowait 之间清空了队列——位子
+                # 已经腾出来,无需(也无从)丢帧,直接重投即可。
                 pass
             _run_event_queue_dropped.labels(event_name=event_name).inc()
             persist_queue.put_nowait(record_)
@@ -779,6 +781,8 @@ async def run_agent(
                 persist_queue.get_nowait()
                 persist_queue.task_done()
             except asyncio.QueueEmpty:
+                # writer 恰在 QueueFull 与 get_nowait 之间清空了队列——位子
+                # 已腾出,sentinel 直接重投(此路径必须全同步,不能 await)。
                 pass
             persist_queue.put_nowait(None)
         # Stream 9.4 — stop renewing the lease; the terminal status write
