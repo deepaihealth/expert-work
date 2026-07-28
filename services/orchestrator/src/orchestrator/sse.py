@@ -40,7 +40,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 from uuid import UUID, uuid4
 
 from langchain_core.messages import BaseMessage
@@ -71,6 +71,7 @@ from expert_work.runtime.cancellation import (
     RunCancelledError,
 )
 from expert_work.runtime.runs import (
+    RunEventRecord,
     RunEventStore,
     RunManager,
     RunRecord,
@@ -214,43 +215,6 @@ class StreamableGraph(Protocol):
 # ---------------------------------------------------------------------------
 
 
-async def _persist_event(
-    event_store: RunEventStore | None,
-    *,
-    run_id: UUID,
-    seq: int,
-    event_name: str,
-    data: Any,
-) -> None:
-    """Mirror one SSE frame to the durable :class:`RunEventStore`.
-
-    Failure → log warning + counter ``expert_work_run_event_persist_errors_total``;
-    the caller's ``bridge.publish`` is not blocked (Mini-ADR H-7 — better
-    miss a frame in replay than fail the live SSE stream).
-    """
-    if event_store is None:
-        return
-    try:
-        await event_store.append(
-            make_event_record(
-                run_id=run_id,
-                seq=seq,
-                event_name=event_name,
-                data=data,
-            )
-        )
-        _run_event_persist_total.labels(event_name=event_name).inc()
-    except Exception as exc:
-        _run_event_persist_errors.labels(event_name=event_name).inc()
-        logger.warning(
-            "run_event.persist_failed run_id=%s seq=%s event=%s err=%s",
-            run_id,
-            seq,
-            event_name,
-            exc,
-        )
-
-
 async def _heartbeat_loop(run_manager: RunManager, run_id: UUID, record: Any) -> None:
     """Stream 9.4 — renew the run's ownership lease until cancelled.
 
@@ -368,6 +332,59 @@ async def run_agent(
     if event_store is not None and getattr(record, "is_resume", False):
         event_seq = await event_store.next_seq(run_id=run_id)
 
+    # 二期 PR3 — run_event 持久化移出流路径(spec PR3 Task 2)。
+    # 主循环每帧只做「seq 同步预分配 + put_nowait」;后台 writer 攒批
+    # (≤_PERSIST_BATCH_MAX 条或 _PERSIST_FLUSH_INTERVAL_S)写 append_batch。
+    # 队满 drop-oldest(H-7 立场:调试台 replay 可容忍缺帧,live SSE 不能慢)。
+    persist_queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=_PERSIST_QUEUE_MAX)
+
+    def _enqueue_event(event_name: str, data: Any) -> None:
+        nonlocal event_seq
+        # seq 分配先于 event_store 判空——与现状 event_seq 无条件递增的
+        # 行为完全一致(即便没有 store,resume 场景的种子计数仍要对齐)。
+        seq = event_seq
+        event_seq += 1
+        if event_store is None:
+            return
+        record_ = make_event_record(run_id=run_id, seq=seq, event_name=event_name, data=data)
+        try:
+            persist_queue.put_nowait(record_)
+        except asyncio.QueueFull:
+            try:
+                persist_queue.get_nowait()  # drop-oldest
+                persist_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            _run_event_queue_dropped.labels(event_name=event_name).inc()
+            persist_queue.put_nowait(record_)
+
+    # mypy: event_store is RunEventStore | None here; _persist_writer wants a
+    # concrete RunEventStore. No writer (and no queue consumer) when there's
+    # no store to write to — _enqueue_event already no-ops in that case, so
+    # the queue simply never receives anything to drain.
+    writer_task: asyncio.Task[None] | None = None
+    if event_store is not None:
+        writer_task = asyncio.create_task(
+            _persist_writer(event_store, persist_queue, run_id=run_id)
+        )
+        _BACKGROUND_PERSIST_WRITERS.add(writer_task)
+        writer_task.add_done_callback(_BACKGROUND_PERSIST_WRITERS.discard)
+
+    async def _drain_persist_queue() -> None:
+        """Block until every enqueued frame so far has been flushed (or
+        dropped) by the background writer — capped at
+        ``_PERSIST_DRAIN_TIMEOUT_S`` so a stuck writer never hangs a
+        terminal ``set_status`` transition."""
+        if event_store is None:
+            return
+        try:
+            async with asyncio.timeout(_PERSIST_DRAIN_TIMEOUT_S):
+                await persist_queue.join()
+        except TimeoutError:
+            logger.warning(
+                "run_event.drain_timeout run_id=%s pending=%s", run_id, persist_queue.qsize()
+            )
+
     # Stream RT-2 PR-4 — COMPACTION event sink. ``agent_node`` fires this when
     # the context compressor produces a summary; publishing lives here (the
     # driver owns the bridge + event store), so the graph layer stays
@@ -376,19 +393,12 @@ async def run_agent(
     # the durable store on the same monotonic ``event_seq`` as every other
     # frame; it runs inside the node's turn, before the ``updates`` chunk that
     # turn yields, so it lands earlier in the stream. Best-effort by contract —
-    # the caller (agent_node) already swallows failures; ``_persist_event``
-    # swallows its own.
+    # the caller (agent_node) already swallows failures; ``_enqueue_event``
+    # never raises (queue put is synchronous) and the background persist
+    # writer swallows its own (H-7).
     async def _publish_compaction(payload: Any) -> None:
-        nonlocal event_seq
         await bridge.publish(run_id, EventType.COMPACTION.value, payload)
-        await _persist_event(
-            event_store,
-            run_id=run_id,
-            seq=event_seq,
-            event_name=EventType.COMPACTION.value,
-            data=payload,
-        )
-        event_seq += 1
+        _enqueue_event(EventType.COMPACTION.value, payload)
 
     # 一期 Task 3 —— ``source`` 路径的赢家标记。token / node 两条路径互斥、
     # 先到先得;声明在 ``_publish_token`` 定义之前,闭包用 ``nonlocal`` 改写。
@@ -408,23 +418,19 @@ async def run_agent(
     # 库,实时与回放同源。与 _publish_compaction 的关键差异:并发
     # worker(≤dynamic_worker_max_concurrent)会交错 await 本函数,seq
     # 必须在任何 await 之前同步分配,否则两帧读到同一 event_seq 撞
-    # (run_id, seq) 主键。best-effort 由发送端(_emit_worker_frame)兜。
+    # (run_id, seq) 主键 —— 二期 PR3 起这条铁律由 _enqueue_event 内部
+    # 保证(其 seq 读取+自增全程无 await,不管调用方在 bridge.publish
+    # 前后调它都不会撞号),本函数不再手工预分配。
     async def _publish_worker(frame: dict[str, Any]) -> None:
-        nonlocal event_seq
-        seq = event_seq
-        event_seq += 1
         await bridge.publish(run_id, "worker", frame)
-        await _persist_event(event_store, run_id=run_id, seq=seq, event_name="worker", data=frame)
+        _enqueue_event("worker", frame)
 
-    # B3 — guard marker 帧 sink(_publish_worker 同款:seq 在任何 await 前
-    # 同步分配;worker 树里的 guard 也经它)。无条件注入 —— max_steps /
-    # no_progress 的 tripped 可见化与 token 预算是否启用无关。
+    # B3 — guard marker 帧 sink(_publish_worker 同款:seq 分配交给
+    # _enqueue_event;worker 树里的 guard 也经它)。无条件注入 ——
+    # max_steps / no_progress 的 tripped 可见化与 token 预算是否启用无关。
     async def _publish_guard(frame: dict[str, Any]) -> None:
-        nonlocal event_seq
-        seq = event_seq
-        event_seq += 1
         await bridge.publish(run_id, "guard", frame)
-        await _persist_event(event_store, run_id=run_id, seq=seq, event_name="guard", data=frame)
+        _enqueue_event("guard", frame)
 
     # ``configurable`` was populated in the effective_config literal above.
     effective_config["configurable"][COMPACTION_SINK_KEY] = _publish_compaction
@@ -444,14 +450,7 @@ async def run_agent(
         )
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
         await bridge.publish(run_id, "metadata", metadata_payload)
-        await _persist_event(
-            event_store,
-            run_id=run_id,
-            seq=event_seq,
-            event_name="metadata",
-            data=metadata_payload,
-        )
-        event_seq += 1
+        _enqueue_event("metadata", metadata_payload)
 
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,
@@ -514,14 +513,7 @@ async def run_agent(
                                 if isinstance(node_val, dict):
                                     node_val["_duration_ms"] = duration_ms
                         await bridge.publish(run_id, stream_mode, jsonable_chunk)
-                        await _persist_event(
-                            event_store,
-                            run_id=run_id,
-                            seq=event_seq,
-                            event_name=stream_mode,
-                            data=jsonable_chunk,
-                        )
-                        event_seq += 1
+                        _enqueue_event(stream_mode, jsonable_chunk)
                 except Exception as exc:
                     if (
                         retry_attempts >= MAX_RUN_RETRIES
@@ -546,14 +538,7 @@ async def run_agent(
                         "backoff_s": backoff_s,
                     }
                     await bridge.publish(run_id, "retry", retry_payload)
-                    await _persist_event(
-                        event_store,
-                        run_id=run_id,
-                        seq=event_seq,
-                        event_name="retry",
-                        data=retry_payload,
-                    )
-                    event_seq += 1
+                    _enqueue_event("retry", retry_payload)
                     # Abort-aware backoff: a timeout means the backoff simply
                     # elapsed; a cancel during the wait exits immediately and
                     # takes the INTERRUPTED path below.
@@ -602,6 +587,10 @@ async def run_agent(
         # counts as recovered. An abort after a retry counts as neither.
         if retry_attempts and final in (RunStatus.SUCCESS, RunStatus.PAUSED):
             run_retry_total.labels(outcome="recovered").inc()
+        # 二期 PR3 — flush every frame queued so far before the terminal
+        # status write lands, so a client polling right after ``set_status``
+        # sees a fully-persisted replay (bounded by _PERSIST_DRAIN_TIMEOUT_S).
+        await _drain_persist_queue()
         await run_manager.set_status(run_id, final)
         if final is RunStatus.PAUSED and pending_request is not None:
             # Register the paused run in the durable ``agent_approval``
@@ -625,14 +614,7 @@ async def run_agent(
                 **pending_request.model_dump(mode="json"),
             }
             await bridge.publish(run_id, "approval", approval_payload)
-            await _persist_event(
-                event_store,
-                run_id=run_id,
-                seq=event_seq,
-                event_name="approval",
-                data=approval_payload,
-            )
-            event_seq += 1
+            _enqueue_event("approval", approval_payload)
         if final is not RunStatus.PAUSED:
             await _emit_run_end_audit(
                 audit_logger,
@@ -662,6 +644,7 @@ async def run_agent(
         # A node surfaced cooperative cancellation mid-step (E.15) — a
         # normal interrupted finish, not a failure.
         session_outcome = "interrupted"
+        await _drain_persist_queue()
         await run_manager.set_status(run_id, RunStatus.INTERRUPTED)
         logger.info("run_agent.cancelled_cooperatively run_id=%s", run_id)
         await _emit_run_end_audit(
@@ -709,14 +692,11 @@ async def run_agent(
         )
         error_payload = {"message": str(exc), "name": type(exc).__name__}
         await bridge.publish(run_id, "error", error_payload)
-        await _persist_event(
-            event_store,
-            run_id=run_id,
-            seq=event_seq,
-            event_name="error",
-            data=error_payload,
-        )
-        event_seq += 1
+        _enqueue_event("error", error_payload)
+        # set_status(ERROR) already fired above (before the error frame
+        # existed) — drain here instead flushes it (+ anything still queued)
+        # before the run's terminal path continues.
+        await _drain_persist_queue()
         await _emit_run_end_audit(
             audit_logger,
             record,
@@ -742,14 +722,9 @@ async def run_agent(
         logger.exception("run_agent.failed run_id=%s", run_id)
         error_payload = {"message": str(exc), "name": type(exc).__name__}
         await bridge.publish(run_id, "error", error_payload)
-        await _persist_event(
-            event_store,
-            run_id=run_id,
-            seq=event_seq,
-            event_name="error",
-            data=error_payload,
-        )
-        event_seq += 1
+        _enqueue_event("error", error_payload)
+        # Same rationale as the MaxSteps branch above.
+        await _drain_persist_queue()
         await _emit_run_end_audit(
             audit_logger,
             record,
@@ -768,6 +743,21 @@ async def run_agent(
         )
         _dispatch_skill_run_usage(skill_run_usage_recorder, record, outcome="failed")
     finally:
+        # 二期 PR3 — sentinel(None)tells the background persist writer to
+        # flush its tail and exit. Synchronous put — safe even on the
+        # asyncio.CancelledError teardown path above (no await). QueueFull
+        # uses the same drop-oldest scheme as ``_enqueue_event`` to
+        # guarantee room; the writer is self-collecting via
+        # ``_BACKGROUND_PERSIST_WRITERS`` so nothing here awaits it.
+        try:
+            persist_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            try:
+                persist_queue.get_nowait()
+                persist_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            persist_queue.put_nowait(None)
         # Stream 9.4 — stop renewing the lease; the terminal status write
         # already moved the run out of ``running`` so it's no longer an orphan
         # candidate regardless of the now-stale lease.
@@ -796,6 +786,96 @@ async def run_agent(
 #: Strong refs to in-flight cleanup tasks — without this the event loop
 #: may garbage-collect a bare ``create_task`` result before it runs.
 _BACKGROUND_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
+
+# 二期 PR3 — run_event 后台批写 writer。sentinel(None)= 收尾:flush 余量后退出。
+_PERSIST_QUEUE_MAX: Final = 512
+_PERSIST_BATCH_MAX: Final = 32
+_PERSIST_FLUSH_INTERVAL_S: Final = 0.1
+_PERSIST_DRAIN_TIMEOUT_S: Final = 5.0
+_BACKGROUND_PERSIST_WRITERS: set[asyncio.Task[None]] = set()
+
+_run_event_queue_dropped = expert_work_counter(
+    "expert_work_run_event_queue_dropped_total",
+    "Frames dropped from the run_event persist queue (drop-oldest on overflow).",
+    ("event_name",),
+)
+
+#: Sentinel distinguishing "queue.get() timed out, no item" from a real
+#: item (including the ``None`` shutdown sentinel) in ``_persist_writer``.
+_NO_ITEM: Final = object()
+
+
+async def _persist_writer(
+    event_store: RunEventStore,
+    queue: asyncio.Queue[RunEventRecord | None],
+    *,
+    run_id: UUID,
+) -> None:
+    """Drain ``queue`` in batches into ``event_store.append_batch``.
+
+    H-7 立场:batch 写失败 → counter + warning,继续下一批;绝不向上抛。
+    收到 sentinel(None)→ flush 剩余 → 退出。
+    """
+    batch: list[RunEventRecord] = []
+    stopping = False
+    while not stopping:
+        item: RunEventRecord | None | object
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=_PERSIST_FLUSH_INTERVAL_S)
+        except TimeoutError:
+            item = _NO_ITEM
+        if item is _NO_ITEM:
+            pass
+        elif item is None:
+            stopping = True
+            queue.task_done()
+        elif isinstance(item, RunEventRecord):
+            # task_done 延迟到 flush 之后——drain 的 queue.join() 语义必须是
+            # 「帧已落库(或已尽力)」,不是「writer 已拿走」。在 get 时就
+            # task_done 会让 join() 在批未 flush 时假完成,终态先于帧落库。
+            # (isinstance, not a bare ``else``: ``item``'s static type is
+            # ``RunEventRecord | None | object`` — ``object`` swallows the
+            # ``is`` checks above for mypy's narrowing, so this branch needs
+            # an explicit runtime check to narrow back to ``RunEventRecord``.)
+            batch.append(item)
+        if batch and (len(batch) >= _PERSIST_BATCH_MAX or item is _NO_ITEM or stopping):
+            await _flush_batch(event_store, batch, run_id=run_id)
+            for _ in batch:
+                queue.task_done()
+            batch = []
+    # sentinel 后队列可能仍有余量(CancelledError 路径 put_nowait 竞态)——清空
+    tail_count = 0
+    while True:
+        try:
+            tail = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        tail_count += 1
+        if tail is not None:
+            batch.append(tail)
+    if batch:
+        await _flush_batch(event_store, batch, run_id=run_id)
+    for _ in range(tail_count):
+        queue.task_done()
+
+
+async def _flush_batch(
+    event_store: RunEventStore, batch: list[RunEventRecord], *, run_id: UUID
+) -> None:
+    try:
+        await event_store.append_batch(batch)
+        for rec in batch:
+            _run_event_persist_total.labels(event_name=rec.event_name).inc()
+    except Exception as exc:
+        for rec in batch:
+            _run_event_persist_errors.labels(event_name=rec.event_name).inc()
+        logger.warning(
+            "run_event.batch_persist_failed run_id=%s count=%s err=%s",
+            run_id,
+            len(batch),
+            exc,
+        )
+
 
 #: Strong refs to in-flight trajectory dispatch tasks (Stream L.L7) —
 #: same garbage-collection guard as ``_BACKGROUND_CLEANUP_TASKS``.
