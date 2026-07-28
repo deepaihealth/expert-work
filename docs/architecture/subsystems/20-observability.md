@@ -310,7 +310,7 @@ expert_work.orchestrator.session_run
 | `expert_work_run_event_persist_errors_total` | counter | `event_name` | 同上批写路径，`append_batch` 整批失败 |
 | `expert_work_run_event_queue_dropped_total` | counter | `event_name` | 后台批写队列已满时 drop-oldest 丢弃的帧（二期 PR3） |
 | `expert_work_delegations_gated_total` | counter | `tool` | 委托被全局并发闸拒绝（acquire 超时），按工具（二期 PR3；`tool` 标签为 follow-up 补） |
-| `expert_work_delegation_gate_fail_open_total` | counter | `()` | `DelegationGate` 容量 provider 读失败，闸 fail-open（不限流）（follow-up） |
+| `expert_work_delegation_gate_fail_open_total` | counter | `()` | `DelegationGate` 容量 provider 读失败（从未读到过容量则 fail-open 不限流，否则退用最近一次成功值） |
 | `expert_work_built_agent_cache_entries` | gauge | `scope` | in-process built-agent 缓存现存条目数，按 scope（二期 PR2 T4；此前漏登记） |
 | `expert_work_trajectory_recorded_total` | counter | `outcome` | 成功写 ObjectStore 的轨迹（L.L7） |
 | `expert_work_trajectory_record_errors_total` | counter | `outcome,reason` | 轨迹写失败（吞掉以保终态路径干净） |
