@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from expert_work.persistence.webhook.base import WebhookDeliveryStore, WebhookEndpointStore
@@ -12,6 +12,11 @@ from expert_work.protocol import (
     WebhookDeliveryStatus,
     WebhookEndpointRecord,
 )
+
+#: How long a ``delivering`` row can go untouched before the next sweep
+#: treats it as an orphaned claim (crashed replica) and reclaims it. Mirrors
+#: the SQL store's constant of the same name (W1-PR1).
+_DELIVERING_STALE_S: int = 300
 
 
 class InMemoryWebhookEndpointStore(WebhookEndpointStore):
@@ -155,3 +160,30 @@ class InMemoryWebhookDeliveryStore(WebhookDeliveryStore):
         ]
         rows.sort(key=lambda r: r.next_retry_at or r.created_at)
         return rows[:limit]
+
+    async def claim_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        stale_before = before - timedelta(seconds=_DELIVERING_STALE_S)
+        candidates = [
+            r
+            for r in self._rows.values()
+            if (
+                r.status is WebhookDeliveryStatus.PENDING
+                or (
+                    r.status is WebhookDeliveryStatus.RETRYING
+                    and r.next_retry_at is not None
+                    and r.next_retry_at <= before
+                )
+                or (r.status is WebhookDeliveryStatus.DELIVERING and r.updated_at <= stale_before)
+            )
+        ]
+        candidates.sort(key=lambda r: r.created_at)
+        claimed: list[WebhookDeliveryRecord] = []
+        for r in candidates[:limit]:
+            updated = r.model_copy(
+                update={"status": WebhookDeliveryStatus.DELIVERING, "updated_at": before}
+            )
+            self._rows[r.id] = updated
+            claimed.append(updated)
+        return claimed

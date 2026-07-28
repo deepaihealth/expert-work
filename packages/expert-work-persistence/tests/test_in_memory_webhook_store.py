@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -282,3 +283,80 @@ async def test_delivery_list_ready_pending_now_and_due_retries() -> None:
 
     ready = await store.list_ready(before=now)
     assert {d.event_id for d in ready} == {"p1", "r-due"}
+
+
+# --- claim_ready (W1-PR1 CAS) -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_matches_list_ready_set_and_writes_delivering() -> None:
+    store = InMemoryWebhookDeliveryStore()
+    now = datetime(2026, 6, 13, 15, 0, 0, tzinfo=UTC)
+    p1 = _delivery(event_id="p1", status=WebhookDeliveryStatus.PENDING)
+    await store.create(p1)
+    await store.create(
+        _delivery(
+            event_id="r-due",
+            status=WebhookDeliveryStatus.RETRYING,
+            next_retry_at=now - timedelta(minutes=1),
+        )
+    )
+    await store.create(
+        _delivery(
+            event_id="r-future",
+            status=WebhookDeliveryStatus.RETRYING,
+            next_retry_at=now + timedelta(hours=1),
+        )
+    )
+    await store.create(_delivery(event_id="done", status=WebhookDeliveryStatus.DELIVERED))
+    await store.create(_delivery(event_id="dead", status=WebhookDeliveryStatus.DEAD_LETTER))
+
+    claimed = await store.claim_ready(before=now)
+    assert {d.event_id for d in claimed} == {"p1", "r-due"}
+    assert all(d.status is WebhookDeliveryStatus.DELIVERING for d in claimed)
+
+    # The store's own row is flipped too, not just the returned copy.
+    refetched = await store.get(delivery_id=p1.id, tenant_id=p1.tenant_id)
+    assert refetched is not None and refetched.status is WebhookDeliveryStatus.DELIVERING
+
+    # A second claim right away finds nothing left — both rows are now
+    # ``delivering`` (not ``pending``/due-``retrying``) and freshly touched.
+    assert await store.claim_ready(before=now) == []
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_reclaims_stale_delivering_not_fresh() -> None:
+    store = InMemoryWebhookDeliveryStore()
+    now = datetime(2026, 6, 13, 17, 0, 0, tzinfo=UTC)
+    stale = _delivery(
+        event_id="c-stale",
+        status=WebhookDeliveryStatus.DELIVERING,
+        created_at=now - timedelta(hours=1),
+    ).model_copy(update={"updated_at": now - timedelta(seconds=301)})
+    fresh = _delivery(
+        event_id="c-fresh",
+        status=WebhookDeliveryStatus.DELIVERING,
+        created_at=now - timedelta(hours=1),
+    ).model_copy(update={"updated_at": now - timedelta(seconds=10)})
+    await store.create(stale)
+    await store.create(fresh)
+
+    claimed = {d.event_id for d in await store.claim_ready(before=now)}
+    assert "c-stale" in claimed  # past the _DELIVERING_STALE_S = 300s window — reclaimed
+    assert "c-fresh" not in claimed  # inside the window — still owned by its claimer
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_concurrent_one_winner_per_row() -> None:
+    store = InMemoryWebhookDeliveryStore()
+    now = datetime(2026, 6, 13, 18, 0, 0, tzinfo=UTC)
+    seeded = {f"conc-{i}" for i in range(5)}
+    for event_id in seeded:
+        await store.create(_delivery(event_id=event_id, status=WebhookDeliveryStatus.PENDING))
+
+    batches = await asyncio.gather(*[store.claim_ready(before=now, limit=50) for _ in range(2)])
+    claimed_a = {d.event_id for d in batches[0]}
+    claimed_b = {d.event_id for d in batches[1]}
+
+    assert claimed_a.isdisjoint(claimed_b)
+    assert claimed_a | claimed_b == seeded

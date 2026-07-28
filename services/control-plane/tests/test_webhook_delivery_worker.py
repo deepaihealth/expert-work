@@ -74,6 +74,7 @@ async def _seed(
     status: WebhookDeliveryStatus = WebhookDeliveryStatus.PENDING,
     attempt: int = 0,
     payload_format: str = "generic",
+    deliveries: InMemoryWebhookDeliveryStore | None = None,
 ) -> tuple[
     InMemoryWebhookEndpointStore,
     InMemoryWebhookDeliveryStore,
@@ -82,7 +83,7 @@ async def _seed(
     WebhookDeliveryRecord,
 ]:
     endpoints = InMemoryWebhookEndpointStore()
-    deliveries = InMemoryWebhookDeliveryStore()
+    deliveries = deliveries if deliveries is not None else InMemoryWebhookDeliveryStore()
     secrets_store = _FakeSecretStore()
     tenant = uuid4()
     endpoint_id = uuid4()
@@ -235,6 +236,54 @@ async def test_circuit_breaker_opens_after_threshold() -> None:
     # Breaker threshold 3 → at most 3 endpoints attempted before it trips;
     # the remaining are skipped, so far fewer than 7 POSTs happen.
     assert len(post.calls) <= 3
+
+
+class _CallSpyDeliveryStore(InMemoryWebhookDeliveryStore):
+    """Wraps the real in-memory store, recording which claim path the worker
+    used — the CAS ``claim_ready`` must be used, not the read-only
+    ``list_ready`` (W1-PR1, multi-replica readiness: a fleet of worker
+    replicas sharing ``list_ready`` would each pick up the same row and
+    double-POST it)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_ready_calls = 0
+        self.list_ready_calls = 0
+        self.last_claimed_statuses: list[WebhookDeliveryStatus] = []
+
+    async def claim_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        self.claim_ready_calls += 1
+        claimed = await super().claim_ready(before=before, limit=limit)
+        self.last_claimed_statuses = [d.status for d in claimed]
+        return claimed
+
+    async def list_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        self.list_ready_calls += 1
+        return await super().list_ready(before=before, limit=limit)
+
+
+@pytest.mark.asyncio
+async def test_run_once_claims_via_cas_not_list_ready() -> None:
+    """W1-PR1 — ``run_once`` must claim its batch (CAS) rather than merely
+    list it: the row is written ``delivering`` before delivery is attempted,
+    and the read-only ``list_ready`` is never called from the sweep."""
+    spy = _CallSpyDeliveryStore()
+    endpoints, deliveries, secrets_store, _, delivery = await _seed(deliveries=spy)
+    post = _RecordingPost(status=200)
+    result = await _worker(endpoints, deliveries, secrets_store, post).run_once()
+    assert result == (1, 0, 0)
+
+    assert spy.claim_ready_calls == 1
+    assert spy.list_ready_calls == 0
+    # The row passed through ``delivering`` on its way to the terminal state.
+    assert spy.last_claimed_statuses == [WebhookDeliveryStatus.DELIVERING]
+
+    row = await deliveries.get(delivery_id=delivery.id, tenant_id=delivery.tenant_id)
+    assert row is not None and row.status is WebhookDeliveryStatus.DELIVERED
 
 
 # --------------------------------------------------------------- enqueue

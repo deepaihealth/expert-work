@@ -497,7 +497,7 @@ class WebhookDeliveryWorker:
         """Drain one batch. Returns ``(delivered, retried, dead_lettered)``."""
         now = datetime.now(UTC)
         with _bypass_rls():
-            ready = await self._deliveries.list_ready(before=now, limit=self._batch_size)
+            ready = await self._deliveries.claim_ready(before=now, limit=self._batch_size)
         if not ready:
             return (0, 0, 0)
 

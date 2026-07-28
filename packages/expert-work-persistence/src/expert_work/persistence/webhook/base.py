@@ -4,9 +4,10 @@ The durable registry of outbound webhook endpoints (``webhook_endpoint``)
 and the delivery queue / DLQ (``webhook_delivery``). The CRUD API uses the
 tenant-scoped methods; the delivery worker uses the cross-tenant scans
 (:meth:`WebhookEndpointStore.list_enabled_all_tenants` /
-:meth:`WebhookDeliveryStore.list_ready`), entering an RLS-bypass context
-(``bypass_rls_var``) around them — the single-replica worker scans every
-tenant's rows; per-delivery work re-scopes to the row's own tenant.
+:meth:`WebhookDeliveryStore.claim_ready`), entering an RLS-bypass context
+(``bypass_rls_var``) around them — a fleet of worker replicas shares the
+same cross-tenant scan, ``claim_ready``'s CAS handing each row to exactly
+one replica (W1-PR1); per-delivery work re-scopes to the row's own tenant.
 
 Implementations:
 - :mod:`expert_work.persistence.webhook.memory`
@@ -134,5 +135,25 @@ class WebhookDeliveryStore(abc.ABC):
     ) -> list[WebhookDeliveryRecord]:
         """Cross-tenant — deliverable rows (``pending`` now, or ``retrying``
         whose ``next_retry_at`` has passed). The caller (the worker) enters
-        an RLS-bypass context.
+        an RLS-bypass context. Read-only — does not claim; a multi-replica
+        worker fleet must use :meth:`claim_ready` instead.
+        """
+
+    @abc.abstractmethod
+    async def claim_ready(
+        self, *, before: datetime, limit: int = 1000
+    ) -> list[WebhookDeliveryRecord]:
+        """Atomically claim deliverable rows — the CAS the delivery worker
+        uses so a fleet of replicas never double-POSTs the same event
+        (W1-PR1, multi-replica readiness).
+
+        Matches the same set :meth:`list_ready` would return (``pending``
+        now, or ``retrying`` whose ``next_retry_at`` has passed) **plus**
+        rows stuck ``delivering`` for longer than the stale-claim window —
+        a replica that crashed mid-delivery leaves its claim behind for the
+        next sweep to reclaim. Every returned row is atomically written
+        ``delivering`` before being handed back; the caller's terminal
+        :meth:`update` (DELIVERED / RETRYING / DEAD_LETTER) overwrites it.
+        Cross-tenant — the caller (the worker) enters an RLS-bypass context,
+        matching :meth:`list_ready`.
         """

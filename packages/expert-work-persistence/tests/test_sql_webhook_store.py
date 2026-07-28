@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -256,3 +257,100 @@ async def test_delivery_exists_update_list_ready(
     assert "r-due" in ready  # retrying + next_retry_at passed
     assert "p1" not in ready  # now delivered
     assert "r-future" not in ready  # retry not yet due
+
+
+# --- claim_ready (W1-PR1 CAS) -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_writes_delivering_and_matches_list_ready_set(
+    stores: tuple[SqlWebhookEndpointStore, SqlWebhookDeliveryStore],
+) -> None:
+    _, deliveries = stores
+    now = datetime(2026, 6, 13, 16, 0, 0, tzinfo=UTC)
+    endpoint = uuid4()
+    await deliveries.create(_delivery(endpoint_id=endpoint, event_id="c-p1"))
+    await deliveries.create(
+        _delivery(
+            endpoint_id=endpoint,
+            event_id="c-r-due",
+            status=WebhookDeliveryStatus.RETRYING,
+            next_retry_at=now - timedelta(minutes=1),
+        )
+    )
+    await deliveries.create(
+        _delivery(
+            endpoint_id=endpoint,
+            event_id="c-r-future",
+            status=WebhookDeliveryStatus.RETRYING,
+            next_retry_at=now + timedelta(hours=1),
+        )
+    )
+
+    claimed = await deliveries.claim_ready(before=now)
+    claimed_by_event = {d.event_id: d for d in claimed}
+    assert "c-p1" in claimed_by_event
+    assert "c-r-due" in claimed_by_event
+    assert "c-r-future" not in claimed_by_event
+    # claim_ready hands back the row already flipped to ``delivering``.
+    assert claimed_by_event["c-p1"].status is WebhookDeliveryStatus.DELIVERING
+    assert claimed_by_event["c-r-due"].status is WebhookDeliveryStatus.DELIVERING
+
+    # A second claim right away sees nothing left for this batch (both rows
+    # are now ``delivering``, not ``pending``/due-``retrying``).
+    reclaimed = {d.event_id for d in await deliveries.claim_ready(before=now)}
+    assert "c-p1" not in reclaimed
+    assert "c-r-due" not in reclaimed
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_reclaims_stale_delivering_not_fresh(
+    stores: tuple[SqlWebhookEndpointStore, SqlWebhookDeliveryStore],
+) -> None:
+    _, deliveries = stores
+    now = datetime(2026, 6, 13, 17, 0, 0, tzinfo=UTC)
+    endpoint = uuid4()
+    # A crashed replica's claim, last touched further back than the
+    # _DELIVERING_STALE_S = 300s window — the next sweep must reclaim it.
+    stale = _delivery(
+        endpoint_id=endpoint,
+        event_id="c-stale",
+        status=WebhookDeliveryStatus.DELIVERING,
+        created_at=now - timedelta(hours=1),
+    ).model_copy(update={"updated_at": now - timedelta(seconds=301)})
+    # A live replica's claim, touched inside the window — must stay theirs.
+    fresh = _delivery(
+        endpoint_id=endpoint,
+        event_id="c-fresh",
+        status=WebhookDeliveryStatus.DELIVERING,
+        created_at=now - timedelta(hours=1),
+    ).model_copy(update={"updated_at": now - timedelta(seconds=10)})
+    await deliveries.create(stale)
+    await deliveries.create(fresh)
+
+    claimed = {d.event_id for d in await deliveries.claim_ready(before=now)}
+    assert "c-stale" in claimed  # updated_at older than the stale window — reclaimed
+    assert "c-fresh" not in claimed  # updated_at recent — still owned by its claimer
+
+
+@pytest.mark.asyncio
+async def test_claim_ready_concurrent_exactly_once_across_batch(
+    stores: tuple[SqlWebhookEndpointStore, SqlWebhookDeliveryStore],
+) -> None:
+    """True DB concurrency — the CAS + SKIP LOCKED claim hands each row to
+    exactly one concurrent claimer, no double-POST across worker replicas."""
+    _, deliveries = stores
+    now = datetime(2026, 6, 13, 18, 0, 0, tzinfo=UTC)
+    endpoint = uuid4()
+    seeded = {f"conc-{i}" for i in range(5)}
+    for event_id in seeded:
+        await deliveries.create(_delivery(endpoint_id=endpoint, event_id=event_id))
+
+    batches = await asyncio.gather(
+        *[deliveries.claim_ready(before=now, limit=50) for _ in range(2)]
+    )
+    claimed_a = {d.event_id for d in batches[0] if d.event_id in seeded}
+    claimed_b = {d.event_id for d in batches[1] if d.event_id in seeded}
+
+    assert claimed_a.isdisjoint(claimed_b)  # never claimed by both
+    assert claimed_a | claimed_b == seeded  # every row claimed exactly once, by someone

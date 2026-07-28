@@ -27,7 +27,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 from expert_work.persistence.base import Base
 
 _SOURCE_VALUES = "('manifest', 'api')"
-_DELIVERY_STATUS_VALUES = "('pending', 'delivered', 'failed', 'retrying', 'dead_letter')"
+_DELIVERY_STATUS_VALUES = (
+    "('pending', 'delivering', 'delivered', 'failed', 'retrying', 'dead_letter')"
+)
 
 
 class WebhookEndpointRow(Base):
