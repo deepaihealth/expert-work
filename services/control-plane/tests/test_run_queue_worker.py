@@ -69,6 +69,9 @@ class _FakeRuntime:
     async def new_worker_spawn_budget(self):
         return None
 
+    def delegation_gate(self):
+        return None
+
 
 def _worker(store, runtime, **kw) -> RunQueueWorker:
     return RunQueueWorker(

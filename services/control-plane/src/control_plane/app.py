@@ -64,6 +64,7 @@ from control_plane.api import (
     build_plan_router,
     build_platform_billing_config_router,
     build_platform_config_router,
+    build_platform_delegation_config_router,
     build_platform_dynamic_worker_config_router,
     build_platform_embedding_config_router,
     build_platform_judge_config_router,
@@ -161,6 +162,10 @@ from control_plane.middleware import (
     TenantRateLimitMiddleware,
 )
 from control_plane.orphan_sweep import OrphanSweep
+from control_plane.platform_delegation_config import (
+    DelegationConfig,
+    PlatformDelegationConfigService,
+)
 from control_plane.platform_dynamic_worker_config import (
     DynamicWorkerConfig,
     PlatformDynamicWorkerConfigService,
@@ -335,6 +340,11 @@ from expert_work.persistence.platform_billing_config import (
     InMemoryPlatformBillingConfigStore,
     PlatformBillingConfigStore,
     SqlPlatformBillingConfigStore,
+)
+from expert_work.persistence.platform_delegation_config import (
+    InMemoryPlatformDelegationConfigStore,
+    PlatformDelegationConfigStore,
+    SqlPlatformDelegationConfigStore,
 )
 from expert_work.persistence.platform_dynamic_worker_config import (
     InMemoryPlatformDynamicWorkerConfigStore,
@@ -882,6 +892,20 @@ def create_app(
         store=resolved_platform_tool_budget_config_store,
         ttl_seconds=float(resolved_settings.tenant_config_cache_ttl_s),
     )
+    # perf phase2 PR3 — platform delegation-gate capacity
+    # (max_concurrent_delegations); DB-row wins over the built-in constant
+    # default, mirroring the tool-budget pattern above. No settings env var —
+    # the default is a frozen constant (T3 wires runtime consumption).
+    resolved_platform_delegation_config_store: PlatformDelegationConfigStore = (
+        sql_stores.platform_delegation_config
+        if sql_stores
+        else InMemoryPlatformDelegationConfigStore()
+    )
+    resolved_platform_delegation_config_service = PlatformDelegationConfigService(
+        store=resolved_platform_delegation_config_store,
+        env_default=DelegationConfig(max_concurrent_delegations=16),
+        ttl_seconds=float(resolved_settings.tenant_config_cache_ttl_s),
+    )
     # B3 PR2 — platform dynamic-worker limits (max_concurrent/max_per_run/
     # max_iterations); DB-row wins over the env-default settings snapshot,
     # mirroring the tool-budget pattern immediately above.
@@ -1372,6 +1396,12 @@ def create_app(
                 # attrs above remain its fallback (service absent).
                 resolved_agent_runtime.dynamic_worker_config_service = (
                     resolved_platform_dynamic_worker_config_service
+                )
+                # perf phase2 PR3 T3 — delegation_gate() reads THROUGH this
+                # service live (DB-wins-over-env); ``None`` would keep the
+                # gate unwired (delegations run ungated).
+                resolved_agent_runtime.delegation_config_service = (
+                    resolved_platform_delegation_config_service
                 )
                 # Stream J.12 — the curation worker reads the L7
                 # trajectory ObjectStore, so it is constructed here
@@ -2079,6 +2109,7 @@ def create_app(
     app.state.platform_embedding_config_service = resolved_platform_embedding_config_service
     app.state.platform_judge_config_service = resolved_platform_judge_config_service
     app.state.platform_tool_budget_config_service = resolved_platform_tool_budget_config_service
+    app.state.platform_delegation_config_service = resolved_platform_delegation_config_service
     app.state.platform_dynamic_worker_config_service = (
         resolved_platform_dynamic_worker_config_service
     )
@@ -2275,6 +2306,7 @@ def create_app(
     app.include_router(build_platform_embedding_config_router())
     app.include_router(build_platform_judge_config_router())
     app.include_router(build_platform_tool_budget_config_router())
+    app.include_router(build_platform_delegation_config_router())
     app.include_router(build_platform_dynamic_worker_config_router())
     app.include_router(build_platform_billing_config_router())
     app.include_router(build_tenant_quotas_router())
@@ -2331,6 +2363,7 @@ class _SqlStores:
     platform_embedding_config: PlatformEmbeddingConfigStore  # Stream T (PR B)
     platform_judge_config: PlatformJudgeConfigStore  # Stream PI-3-A1
     platform_tool_budget_config: PlatformToolBudgetConfigStore  # Phase 3
+    platform_delegation_config: PlatformDelegationConfigStore  # perf phase2 PR3
     platform_dynamic_worker_config: PlatformDynamicWorkerConfigStore  # B3 PR2
     platform_billing_config: PlatformBillingConfigStore  # Stream 12.4
     tenant_quota: TenantQuotaStore
@@ -2555,6 +2588,7 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         platform_embedding_config=SqlPlatformEmbeddingConfigStore(session_factory),
         platform_judge_config=SqlPlatformJudgeConfigStore(session_factory),
         platform_tool_budget_config=SqlPlatformToolBudgetConfigStore(session_factory),
+        platform_delegation_config=SqlPlatformDelegationConfigStore(session_factory),
         platform_dynamic_worker_config=SqlPlatformDynamicWorkerConfigStore(session_factory),
         platform_billing_config=SqlPlatformBillingConfigStore(session_factory),
         tenant_config=SqlTenantConfigStore(session_factory),

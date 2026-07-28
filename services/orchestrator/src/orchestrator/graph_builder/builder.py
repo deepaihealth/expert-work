@@ -136,6 +136,7 @@ from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.state import AgentState
+from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
     GUARD_SINK_KEY,
     TOKEN_BUDGET_KEY,
@@ -2697,6 +2698,10 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
     # ``sse.run_agent`` and lives in config["configurable"]; ``None`` when the
     # feature is unwired. Read verbatim (mirrors cancellation_token).
     worker_spawn_budget = configurable.get("worker_spawn_budget")
+    # 二期 PR3(spec P4)— the process-wide delegation concurrency gate is
+    # injected once per run (or forwarded verbatim into a child's config by
+    # ``_child_run._child_config``); read verbatim (mirrors worker_spawn_budget).
+    delegation_gate = configurable.get(DELEGATION_GATE_KEY)
     # MCP-OAUTH (OA-3b-后续) — the caller's OAuth subject id (a string), kept
     # distinct from user_id so a child run can resolve the same per-user OAuth
     # pool. ``None`` when absent (no OAuth identity).
@@ -2719,6 +2724,7 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
         plan=plan,
         deadline_at=deadline_at,
         worker_spawn_budget=worker_spawn_budget,
+        delegation_gate=delegation_gate,
         worker_event_sink=worker_event_sink,
         token_budget=tb_raw if isinstance(tb_raw, TokenBudget) else None,
         guard_sink=guard_raw if callable(guard_raw) else None,

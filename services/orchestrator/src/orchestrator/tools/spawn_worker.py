@@ -36,7 +36,7 @@ from uuid import UUID
 
 from expert_work.common.observability import expert_work_counter
 from expert_work.runtime.cancellation import RunCancelledError
-from orchestrator.tools._budget import WorkerSpawnBudget
+from orchestrator.tools._budget import DELEGATIONS_GATED, WorkerSpawnBudget
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.trajectory import TrajectoryRecorder
@@ -185,30 +185,53 @@ class SpawnWorkerTool:
                 meta={"spawn_worker_blocked": True, "reason": "per_run_budget"},
             )
 
-        child = await self.builder(
-            tenant_id=ctx.tenant_id,
-            role=role,
-            depth=self.child_depth,
-            oauth_user_id=ctx.oauth_user_id,
-        )
-        _workers_spawned.inc()
-        async with _maybe_concurrency(budget):
-            return await run_child_to_result(
-                child=child,
-                task=task,
-                ctx=ctx,
-                child_depth=self.child_depth,
-                label=SPAWN_WORKER_TOOL_NAME,
-                agent_ref=f"dynamic:{role or 'general'}",
-                trajectory_recorder=self.trajectory_recorder,
-                trajectory_metadata={
-                    "subagent_name": SPAWN_WORKER_TOOL_NAME,
-                    "dynamic": True,
-                    "role": role,
-                    "child_depth": self.child_depth,
-                },
-                extra_meta={"dynamic": True, "role": role},
+        # Minor — if the gate below refuses this delegation, the per-run
+        # spawn budget slot reserved just above is intentionally NOT rolled
+        # back: WorkerSpawnBudget exposes no reverse/refund API, a gate
+        # refusal is transient (retry later), and the budget is a defense
+        # against runaway spawning — erring toward spending it down is the
+        # conservative direction here.
+        # 二期 PR3(spec P4)— process-wide delegation concurrency gate, layered
+        # on top of the per-run budget above. Acquired before the child build
+        # so a saturated gate doesn't pay for building a worker it can't run.
+        gate = ctx.delegation_gate
+        if gate is not None and not await gate.acquire():
+            DELEGATIONS_GATED.inc()
+            return ToolResult(
+                content=(
+                    "[delegation refused: platform-wide delegation concurrency is "
+                    "saturated; retry later or complete the work without delegating]"
+                ),
+                meta={"delegation_gated": True, "reason": "global_gate_timeout"},
             )
+        try:
+            child = await self.builder(
+                tenant_id=ctx.tenant_id,
+                role=role,
+                depth=self.child_depth,
+                oauth_user_id=ctx.oauth_user_id,
+            )
+            _workers_spawned.inc()
+            async with _maybe_concurrency(budget):
+                return await run_child_to_result(
+                    child=child,
+                    task=task,
+                    ctx=ctx,
+                    child_depth=self.child_depth,
+                    label=SPAWN_WORKER_TOOL_NAME,
+                    agent_ref=f"dynamic:{role or 'general'}",
+                    trajectory_recorder=self.trajectory_recorder,
+                    trajectory_metadata={
+                        "subagent_name": SPAWN_WORKER_TOOL_NAME,
+                        "dynamic": True,
+                        "role": role,
+                        "child_depth": self.child_depth,
+                    },
+                    extra_meta={"dynamic": True, "role": role},
+                )
+        finally:
+            if gate is not None:
+                await gate.release()
 
     def _require_task(self, args: Mapping[str, Any]) -> str:
         raw = args.get("task")

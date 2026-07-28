@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -270,6 +271,71 @@ async def test_delete_by_thread_also_removes_child_run_events(
     # The bystander run on another thread keeps its row AND its events.
     assert await run_store.get(run_id=bystander, tenant_id=tenant) is not None
     assert len(await run_event_store.list(run_id=bystander)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 二期 PR3 — SqlRunEventStore.append_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_append_batch_round_trips_in_order_sql(
+    run_store: SqlRunStore, run_event_store: SqlRunEventStore
+) -> None:
+    """One ``append_batch`` call, one session + ``add_all`` + single commit
+    (matches ``event_log/db.py``'s ``put_batch`` precedent) → ``list``
+    returns every row, ordered by ``seq``."""
+    tenant, run_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant))
+    records = [
+        make_event_record(run_id=run_id, seq=i, event_name="updates", data={"i": i})
+        for i in range(5)
+    ]
+
+    await run_event_store.append_batch(records)
+
+    listed = await run_event_store.list(run_id=run_id)
+    assert [r.seq for r in listed] == [0, 1, 2, 3, 4]
+    assert [r.data for r in listed] == [{"i": i} for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_append_batch_duplicate_seq_rolls_back_whole_batch_sql(
+    run_store: SqlRunStore, run_event_store: SqlRunEventStore
+) -> None:
+    """A batch containing a ``(run_id, seq)`` collision raises
+    ``IntegrityError`` and commits NOTHING from the batch — the single
+    transaction rolls back atomically."""
+    tenant, run_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant))
+    await run_event_store.append(
+        make_event_record(run_id=run_id, seq=0, event_name="metadata", data={})
+    )
+
+    with pytest.raises(IntegrityError):
+        await run_event_store.append_batch(
+            [
+                make_event_record(run_id=run_id, seq=1, event_name="updates", data={"i": 1}),
+                # Collides with the pre-existing seq=0 row.
+                make_event_record(run_id=run_id, seq=0, event_name="updates", data={"dup": True}),
+            ]
+        )
+
+    listed = await run_event_store.list(run_id=run_id)
+    # Only the original seq=0 row survives — the batch's seq=1 row never
+    # committed because the transaction rolled back on the seq=0 collision.
+    assert [r.seq for r in listed] == [0]
+
+
+@pytest.mark.asyncio
+async def test_append_batch_empty_is_noop_sql(
+    run_store: SqlRunStore, run_event_store: SqlRunEventStore
+) -> None:
+    run_id = uuid4()
+
+    await run_event_store.append_batch([])
+
+    assert await run_event_store.list(run_id=run_id) == []
 
 
 # ---------------------------------------------------------------------------

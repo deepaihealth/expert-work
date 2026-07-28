@@ -2040,6 +2040,17 @@ const zhCN: TranslationKeys = {
     dynamic_worker_save: "保存",
     dynamic_worker_saved: "动态 worker 护栏已保存。",
     dynamic_worker_save_failed: "保存动态 worker 护栏失败",
+    delegation_heading: "委托并发闸容量",
+    delegation_help_title: "什么是委托并发闸容量?",
+    delegation_help_body:
+      "限制全平台(本进程)同时在途的子 Agent 委托总数上限。未配置时使用内置默认值。到达上限后,新的委托会排队最长 30 秒等待空位;若超时仍无空位,该次委托会软失败,不会中断所在的运行。",
+    delegation_max_concurrent_delegations_label: "平台级委托并发上限",
+    delegation_env_default: "环境默认",
+    delegation_hint:
+      "改后对下一次运行/构建生效,无需重启;未配置时使用内置默认值。",
+    delegation_save: "保存",
+    delegation_saved: "委托并发闸容量已保存。",
+    delegation_save_failed: "保存委托并发闸容量失败",
     quality_heading: "质量监控",
     quality_help_title: "什么是质量监控？",
     quality_help_body:

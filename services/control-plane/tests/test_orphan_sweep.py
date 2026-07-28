@@ -84,6 +84,9 @@ class _FakeRuntime:
     async def new_worker_spawn_budget(self):
         return None
 
+    def delegation_gate(self):
+        return None
+
 
 async def _seed_orphan(store: InMemoryRunStore, *, expired: bool):
     run_id, tenant, thread = uuid4(), uuid4(), uuid4()

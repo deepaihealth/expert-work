@@ -23,7 +23,7 @@ from uuid import UUID
 
 from expert_work.protocol import Plan
 from expert_work.runtime.cancellation import CancellationToken
-from orchestrator.tools._budget import WorkerSpawnBudget
+from orchestrator.tools._budget import DelegationGate, WorkerSpawnBudget
 from orchestrator.tools._guards import TokenBudget
 from orchestrator.tools.ranking import build_document, rank_tools
 
@@ -218,6 +218,13 @@ class ToolContext:
     token_budget: TokenBudget | None = None
     #: B3 — guard marker 帧 sink(下传给子树,None=未接线)。
     guard_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    #: 二期 PR3(spec P4)— process-wide delegation concurrency gate (subagent
+    #: + spawn_worker), a single process-level singleton shared across every
+    #: run and every delegation depth (下传给子树,见 ``_child_run._child_config``).
+    #: Injected per-run by ``sse.run_agent`` via ``DELEGATION_GATE_KEY``;
+    #: ``None`` when unwired (tests / eval / no config service) — delegations
+    #: run ungated, same as before this gate existed.
+    delegation_gate: DelegationGate | None = None
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``
