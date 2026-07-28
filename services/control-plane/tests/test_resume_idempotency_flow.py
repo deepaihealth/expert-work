@@ -119,6 +119,9 @@ class _FakeRuntime:
     async def new_worker_spawn_budget(self) -> None:
         return None
 
+    def delegation_gate(self) -> None:
+        return None
+
 
 class _FakeThreads:
     async def get(self, _thread_id: object, *, tenant_id: object) -> SimpleNamespace:

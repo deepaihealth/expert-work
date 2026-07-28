@@ -38,6 +38,7 @@ from expert_work.runtime.cancellation import (
     RunCancelledError,
 )
 from orchestrator.errors import MaxStepsExceededError
+from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY
 from orchestrator.tools._worker_events import (
     WORKER_EVENT_SINK_KEY,
@@ -464,4 +465,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         configurable[TOKEN_BUDGET_KEY] = ctx.token_budget
     if ctx.guard_sink is not None:
         configurable[GUARD_SINK_KEY] = ctx.guard_sink
+    # 二期 PR3(spec P4)— the delegation gate is process-wide (one singleton
+    # per process, not per-run like worker_spawn_budget): forward the SAME
+    # object so a depth-2 delegation from within this child contends for the
+    # SAME slots as its parent, which is exactly the nested-acquire scenario
+    # the 30s acquire timeout exists to resolve without deadlocking.
+    if ctx.delegation_gate is not None:
+        configurable[DELEGATION_GATE_KEY] = ctx.delegation_gate
     return {"configurable": configurable}

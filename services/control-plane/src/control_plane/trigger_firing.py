@@ -294,6 +294,8 @@ async def fire_trigger(
             trajectory_enabled=built.trajectory_recording,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(),
+            # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
+            delegation_gate=runtime.delegation_gate(),
             # Stream HX-3 — replay-safety resolver for transient retry.
             tool_replay_safe=built.tool_replay_safe,
         )
