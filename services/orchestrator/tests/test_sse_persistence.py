@@ -231,6 +231,10 @@ async def test_paused_run_emits_and_persists_approval_event() -> None:
     assert approval_row.data["thread_id"] == str(record.thread_id)
     assert approval_row.data["action_summary"] == "approval-gated tool 'bash'"
     assert approval_row.data["proposed_args"] == {"command": "pip install reportlab"}
+    # 断言之后的纯清理:等 writer task 真正退出,别把它留给下一个测试的
+    # 事件循环(模块级 _BACKGROUND_PERSIST_WRITERS 是跨测试全局集合)。
+    # 放在断言后不影响本测试的 RED 性质——durability 已在上面证毕。
+    await _await_writers()
 
 
 @pytest.mark.asyncio
