@@ -472,3 +472,39 @@ async def test_reserve_denial_emits_budget_exceeded_audit(
         AuditQuery(tenant_id=_TENANT, action=AuditAction.QUOTA_BUDGET_EXCEEDED)
     )
     assert len(entries.entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_commit_returns_503_when_redis_down(
+    redis_down_quota_client: AsyncClient,
+) -> None:
+    """RedisError inside ``quota.commit_tokens`` must map to 503
+    ``quota_engine_unavailable`` (fail-closed contract)."""
+    token = _operator_token()
+    resp = await redis_down_quota_client.post(
+        "/v1/quota/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "reservation_id": str(uuid4()),
+            "tenant_id": str(_TENANT),
+            "actual_tokens": 50,
+        },
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "quota_engine_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_internal_release_returns_503_when_redis_down(
+    redis_down_quota_client: AsyncClient,
+) -> None:
+    """RedisError inside ``quota.release_tokens`` must map to 503
+    ``quota_engine_unavailable`` (fail-closed contract)."""
+    token = _operator_token()
+    reservation_id = uuid4()
+    resp = await redis_down_quota_client.post(
+        f"/v1/quota/release/{reservation_id}?tenant_id={_TENANT}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "quota_engine_unavailable"
