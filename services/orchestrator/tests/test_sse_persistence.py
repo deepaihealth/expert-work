@@ -176,10 +176,23 @@ async def test_paused_run_emits_and_persists_approval_event() -> None:
     from expert_work.persistence import InMemoryApprovalStore
     from expert_work.protocol import ApprovalRequest
 
+    class _SlowStore(InMemoryRunEventStore):
+        """Adds latency to ``append_batch`` so the assertion right after
+        ``run_agent`` returns actually exercises the drain guarantee —
+        against a bare ``InMemoryRunEventStore`` the background writer
+        keeps up via incidental scheduling in ``run_agent``'s own
+        ``finally`` block (heartbeat-cancel gather + ``publish_end``
+        awaits) even without an explicit drain, which would make this
+        test pass for the wrong reason."""
+
+        async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+            await asyncio.sleep(0.15)
+            await super().append_batch(records)
+
     bridge = InMemoryStreamBridge()
     rm = RunManager()
     record = await _new_record(rm)
-    store = InMemoryRunEventStore()
+    store = _SlowStore()
     now = datetime.now(UTC)
     request = ApprovalRequest(
         request_id="approval:deadbeef",
@@ -205,7 +218,11 @@ async def test_paused_run_emits_and_persists_approval_event() -> None:
         event_store=store,
         approval_store=InMemoryApprovalStore(),
     )
-    await _await_writers()
+    # No ``_await_writers()`` here on purpose: the PAUSED path drains the
+    # persist queue (``await _drain_persist_queue()``) right after enqueuing
+    # the approval frame, before ``run_agent`` returns — the approval row
+    # must already be durable at this point, not just eventually once the
+    # background writer gets around to it.
 
     listed = await store.list(run_id=record.run_id)
     assert [r.event_name for r in listed] == ["metadata", "updates", "approval"]
@@ -546,3 +563,52 @@ async def test_cancelled_run_does_not_await_drain() -> None:
     await _await_writers()
     listed = await store.list(run_id=record.run_id)
     assert [r.event_name for r in listed] == ["metadata", "updates"]
+
+
+@pytest.mark.asyncio
+async def test_dead_writer_drain_returns_fast() -> None:
+    """If the background persist writer dies mid-run, ``_drain_persist_queue``
+    must notice via ``writer_task.done()`` and return immediately instead of
+    waiting out the full ``_PERSIST_DRAIN_TIMEOUT_S`` (5s) — once the writer
+    is gone, nothing will ever call ``queue.task_done()`` again, so
+    ``persist_queue.join()`` could otherwise only ever resolve by timing out.
+
+    The writer dies because ``append_batch`` raises ``asyncio.CancelledError``
+    — a ``BaseException``, not an ``Exception`` — which ``_flush_batch``'s
+    ``except Exception`` does not catch; it propagates out of
+    ``_persist_writer`` and asyncio's Task machinery marks the task
+    cancelled/done."""
+
+    class _DyingStore(InMemoryRunEventStore):
+        async def append_batch(self, records: Sequence[RunEventRecord]) -> None:
+            raise asyncio.CancelledError
+
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    store = _DyingStore()
+    # A tiny real delay before the graph's first chunk (_ScriptedGraph sleeps
+    # before yielding when chunk_delay_s is set) is needed so the event loop
+    # actually gets a turn to schedule and run writer_task before run_agent
+    # reaches ``_drain_persist_queue()`` — with an all-synchronous graph +
+    # in-memory stubs nothing in this test ever suspends beforehand, so the
+    # writer wouldn't have had a chance to pick up the metadata frame, call
+    # the (instantly-raising) ``append_batch``, and die yet.
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}], chunk_delay_s=0.02)
+
+    started = time.monotonic()
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+        event_store=store,
+    )
+    elapsed = time.monotonic() - started
+    # Nowhere near the 5s drain timeout — proves the dead-writer fast path
+    # returned immediately instead of waiting out persist_queue.join().
+    assert elapsed < 1.0
+
+    await _await_writers()  # no-op cleanup: the writer is already done

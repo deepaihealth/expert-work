@@ -377,6 +377,17 @@ async def run_agent(
         terminal ``set_status`` transition."""
         if event_store is None:
             return
+        if writer_task is not None and writer_task.done():
+            # The writer is gone (crashed on an exception it didn't swallow,
+            # or was externally cancelled) — nobody will ever call
+            # queue.task_done() again, so persist_queue.join() can only ever
+            # resolve by timing out. Skip straight to the terminal path
+            # instead of paying the full _PERSIST_DRAIN_TIMEOUT_S for a wait
+            # that is guaranteed to fail.
+            logger.warning(
+                "run_event.writer_dead run_id=%s pending=%s", run_id, persist_queue.qsize()
+            )
+            return
         try:
             async with asyncio.timeout(_PERSIST_DRAIN_TIMEOUT_S):
                 await persist_queue.join()
@@ -615,6 +626,12 @@ async def run_agent(
             }
             await bridge.publish(run_id, "approval", approval_payload)
             _enqueue_event("approval", approval_payload)
+            # PAUSED is itself a terminal branch here (no further set_status
+            # call follows on this path within this function invocation) —
+            # flush now so the approval row is durable before run_agent
+            # returns, matching the drain guarantee every other terminal
+            # branch gives its own last enqueued frame.
+            await _drain_persist_queue()
         if final is not RunStatus.PAUSED:
             await _emit_run_end_audit(
                 audit_logger,
@@ -838,7 +855,27 @@ async def _persist_writer(
             # ``is`` checks above for mypy's narrowing, so this branch needs
             # an explicit runtime check to narrow back to ``RunEventRecord``.)
             batch.append(item)
-        if batch and (len(batch) >= _PERSIST_BATCH_MAX or item is _NO_ITEM or stopping):
+        else:
+            # Off-type item should never occur — the queue only ever carries
+            # RunEventRecord / None(sentinel) / the local _NO_ITEM marker.
+            # But silently doing nothing here would skip task_done() for a
+            # slot that was already queue.get()'d, and _drain_persist_queue's
+            # persist_queue.join() would then hang forever waiting for a
+            # count that can never reach zero. Fail loud, not silent-hang.
+            logger.warning("run_event.unexpected_queue_item run_id=%s item=%r", run_id, item)
+            queue.task_done()
+        # ``or queue.empty()`` — flush as soon as the backlog is drained
+        # instead of waiting out the rest of the idle timeout with a
+        # partial batch sitting unflushed. Without this, a terminal drain
+        # (_drain_persist_queue) that clears the queue mid-batch pays up to
+        # one full _PERSIST_FLUSH_INTERVAL_S (100ms) of pure idle wait before
+        # the next ``get()`` times out and triggers the flush — a tax that
+        # lands on every run's terminal path for no reason once nothing is
+        # left to batch with. Idle (nothing ever arrived) is unaffected: the
+        # 100ms wait there is genuine polling cadence, not a batching delay.
+        if batch and (
+            len(batch) >= _PERSIST_BATCH_MAX or item is _NO_ITEM or stopping or queue.empty()
+        ):
             await _flush_batch(event_store, batch, run_id=run_id)
             for _ in batch:
                 queue.task_done()
