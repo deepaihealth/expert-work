@@ -853,6 +853,74 @@ async def test_claim_queued_carries_enqueued_input() -> None:
     assert claimed.enqueued_input == {"input": "hi", "image_refs": []}
 
 
+# --- list_stale_pending (W1-PR3 Task 1 — PENDING orphan sweep) -------------
+
+
+@pytest.mark.asyncio
+async def test_list_stale_pending_returns_only_old_pending_rows() -> None:
+    store = InMemoryRunStore()
+    tenant = uuid4()
+    cutoff = _BASE + timedelta(seconds=600)
+
+    # Stale PENDING (created before cutoff) — the crash-window candidate.
+    stale = uuid4()
+    await store.create(
+        _info(run_id=stale, tenant_id=tenant, status=RunStatus.PENDING, created_at=_BASE)
+    )
+    # Fresh PENDING (created_at >= cutoff) — still inside the normal window.
+    fresh = uuid4()
+    await store.create(
+        _info(run_id=fresh, tenant_id=tenant, status=RunStatus.PENDING, created_at=cutoff)
+    )
+    # RUNNING with an old created_at — never a pending-sweep candidate,
+    # regardless of age (list_orphans owns the running lane).
+    running = uuid4()
+    await store.create(
+        _info(run_id=running, tenant_id=tenant, status=RunStatus.RUNNING, created_at=_BASE)
+    )
+    # Terminal with an old created_at — never a candidate.
+    done = uuid4()
+    await store.create(
+        _info(run_id=done, tenant_id=tenant, status=RunStatus.SUCCESS, created_at=_BASE)
+    )
+
+    found = await store.list_stale_pending(cutoff=cutoff, limit=10)
+    assert [r.run_id for r in found] == [stale]
+
+
+@pytest.mark.asyncio
+async def test_list_stale_pending_orders_oldest_first_and_respects_limit() -> None:
+    store = InMemoryRunStore()
+    tenant = uuid4()
+    oldest, middle, newest = uuid4(), uuid4(), uuid4()
+    await store.create(
+        _info(
+            run_id=newest,
+            tenant_id=tenant,
+            status=RunStatus.PENDING,
+            created_at=_BASE + timedelta(seconds=20),
+        )
+    )
+    await store.create(
+        _info(run_id=oldest, tenant_id=tenant, status=RunStatus.PENDING, created_at=_BASE)
+    )
+    await store.create(
+        _info(
+            run_id=middle,
+            tenant_id=tenant,
+            status=RunStatus.PENDING,
+            created_at=_BASE + timedelta(seconds=10),
+        )
+    )
+    cutoff = _BASE + timedelta(hours=1)
+
+    found = await store.list_stale_pending(cutoff=cutoff, limit=10)
+    assert [r.run_id for r in found] == [oldest, middle, newest]
+
+    limited = await store.list_stale_pending(cutoff=cutoff, limit=2)
+    assert [r.run_id for r in limited] == [oldest, middle]
+
+
 # --- aggregate_by_threads (conversation-list rollup) -----------------------
 
 

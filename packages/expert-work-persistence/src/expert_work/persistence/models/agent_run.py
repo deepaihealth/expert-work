@@ -87,6 +87,14 @@ class AgentRunRow(Base):
             "created_at",
             postgresql_where=text("status = 'queued'"),
         ),
+        # W1-PR3 Task 1 — the orphan sweep's PENDING-reclaim scan (a replica
+        # crashed in the create→RUNNING window, before ever stamping a
+        # lease, so ``ix_agent_run_lease_sweep`` never sees the row).
+        Index(
+            "ix_agent_run_pending_sweep",
+            "created_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
         # Runs filter-by-user — GET /v1/runs?user_id serves this + newest-first
         # order in one scan; partial (skips system / auto-triggered NULL rows).
         Index(

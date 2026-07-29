@@ -343,6 +343,23 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_stale_pending(self, *, cutoff: datetime, limit: int) -> list[RunInfo]:
+        """Cross-tenant PENDING runs stuck past the create→RUNNING window.
+
+        ``status='pending' AND created_at < cutoff``, ordered
+        ``created_at`` ascending. PENDING is normally a milliseconds-scale
+        in-process step on the synchronous SSE path (see
+        :attr:`~expert_work.runtime.runs.schemas.RunStatus.PENDING`); a row
+        still PENDING past ``cutoff`` means its owning replica crashed
+        before ever stamping a lease. :meth:`list_orphans` never nominates
+        it (that scan only looks at ``running`` + expired lease), so without
+        this scan the row is stuck forever — and it also permanently blocks
+        its thread's external plan writes (``_WRITE_BLOCKED_STATUSES`` in
+        ``control_plane.api.plan`` treats PENDING as plan-write-blocking).
+        Caller MUST wrap in ``bypass_rls_session()`` (cross-tenant sweep).
+        """
+
+    @abc.abstractmethod
     async def reclaim(
         self,
         *,
@@ -689,6 +706,15 @@ class InMemoryRunStore(RunStore):
             if r.status is RunStatus.RUNNING and r.lease_until is not None and r.lease_until < now
         ]
         rows.sort(key=lambda r: r.lease_until or r.created_at)
+        return rows[: max(1, limit)]
+
+    async def list_stale_pending(self, *, cutoff: datetime, limit: int) -> list[RunInfo]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.status is RunStatus.PENDING and r.created_at < cutoff
+        ]
+        rows.sort(key=lambda r: r.created_at)
         return rows[: max(1, limit)]
 
     async def reclaim(
@@ -1202,6 +1228,21 @@ class SqlRunStore(RunStore):
                 AgentRunRow.lease_until < now,
             )
             .order_by(AgentRunRow.lease_until.asc())
+            .limit(max(1, limit))
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(r) for r in rows]
+
+    async def list_stale_pending(self, *, cutoff: datetime, limit: int) -> list[RunInfo]:
+        # Cross-tenant: no tenant filter — caller wraps in bypass_rls_session().
+        stmt = (
+            select(AgentRunRow)
+            .where(
+                AgentRunRow.status == RunStatus.PENDING.value,
+                AgentRunRow.created_at < cutoff,
+            )
+            .order_by(AgentRunRow.created_at.asc())
             .limit(max(1, limit))
         )
         async with self._sf() as session:

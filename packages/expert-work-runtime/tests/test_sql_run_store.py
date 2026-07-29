@@ -581,6 +581,37 @@ async def test_list_orphans_finds_only_expired_running(run_store: SqlRunStore) -
 
 
 @pytest.mark.asyncio
+async def test_list_stale_pending_finds_only_old_pending(run_store: SqlRunStore) -> None:
+    """W1-PR3 Task 1 — the crash-window recovery scan's predicate, proven
+    against real Postgres (partial index ``ix_agent_run_pending_sweep``).
+    Exact ordering/limit is covered by the in-memory double
+    (``test_list_stale_pending_orders_oldest_first_and_respects_limit``);
+    this is a cross-tenant scan (no tenant filter) over a table shared with
+    every other test in this session, so assertions use membership, same
+    convention as ``test_list_orphans_finds_only_expired_running``."""
+    tenant = uuid4()
+    cutoff = _BASE + timedelta(seconds=600)
+
+    stale = uuid4()
+    await run_store.create(
+        _info(run_id=stale, tenant_id=tenant, status=RunStatus.PENDING, created_at=_BASE)
+    )
+    fresh = uuid4()
+    await run_store.create(
+        _info(run_id=fresh, tenant_id=tenant, status=RunStatus.PENDING, created_at=cutoff)
+    )
+    running = uuid4()
+    await run_store.create(
+        _info(run_id=running, tenant_id=tenant, status=RunStatus.RUNNING, created_at=_BASE)
+    )
+
+    found_ids = [r.run_id for r in await run_store.list_stale_pending(cutoff=cutoff, limit=10)]
+    assert stale in found_ids
+    assert fresh not in found_ids
+    assert running not in found_ids
+
+
+@pytest.mark.asyncio
 async def test_concurrent_claim_queued_exactly_one_winner(run_store: SqlRunStore) -> None:
     """True DB concurrency — the claim CAS row-lock serialises queue workers."""
     import asyncio
