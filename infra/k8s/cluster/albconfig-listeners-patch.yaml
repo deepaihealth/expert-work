@@ -1,0 +1,37 @@
+# Desired listeners for the SHARED test-cluster AlbConfig "alb".
+#
+# The AlbConfig was created by the ACS agent-sandbox component install
+# (sandbox-system's sandbox-manager Ingress rides the same ALB instance,
+# alb-cv3xokwot6r9bgojzx), so it is deliberately NOT part of the
+# kustomize tree — ownership is shared. Apply this as a merge patch:
+#
+#   kubectl patch albconfig alb --type merge --patch-file \
+#       infra/k8s/cluster/albconfig-listeners-patch.yaml
+#
+# A merge patch REPLACES the whole `listeners` list, so this file must
+# always carry every listener the ALB needs (sandbox-manager's port 80
+# included), not just ours.
+#
+# Why listeners and not Ingress annotations: the Aliyun ALB Ingress
+# controller has no `cert-id` / `idle-timeout` annotations (checked
+# against the ALB Ingress configuration dictionary, 2026-07-29). HTTPS
+# certificates and timeouts are listener-level AlbConfig fields.
+#
+# - CertificateId: the SSL-cert service CertIdentifier
+#   (<cert-id>-<region>) of the hosted *.deepaihealth.com wildcard cert.
+# - idleTimeout 60 / requestTimeout 180 are the product maxima without a
+#   support ticket. SSE streams (Playground token streaming) rely on
+#   heartbeat frames to keep resetting these; if smoke tests show ALB
+#   cutting long streams, raise a ticket to lift the listener caps
+#   toward 3600 (spec 2026-07-28-aliyun-deployment-design.md).
+spec:
+  listeners:
+    - port: 80
+      protocol: HTTP
+    - port: 443
+      protocol: HTTPS
+      idleTimeout: 60
+      requestTimeout: 180
+      certificates:
+        - CertificateId: 25878622-cn-hangzhou
+          IsDefault: true
