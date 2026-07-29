@@ -126,7 +126,7 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
             # Fail OPEN — see control_plane.middleware.rate_limit for the
             # rationale (shared counter, ``backend`` label tells the tiers
             # apart). Business-level quota admission fails CLOSED instead;
-            # that asymmetry is deliberate (subsystems/16 § 5.2).
+            # that asymmetry is deliberate (subsystems/16 § 6).
             _rate_limit_backend_errors.labels(backend="tenant").inc()
             logger.warning(
                 "tenant_rate_limit.backend_unavailable",

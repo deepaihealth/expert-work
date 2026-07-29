@@ -47,7 +47,7 @@ _rate_limit_decisions = expert_work_counter(
 )
 
 # Shared with tenant_rate_limit.py (label distinguishes the tier) — see
-# subsystems/16 § 5.2 degradation table. A Redis outage must not take the
+# subsystems/16 § 6 degradation table. A Redis outage must not take the
 # HTTP frontline down with it: both rate-limit tiers fail OPEN (request
 # proceeds, un-throttled) while recording the outage here so on-call can
 # see it. Business-level admission (quota check, ``_quota_admission.py``)

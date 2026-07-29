@@ -1112,6 +1112,29 @@ def create_app(
                 "is not actually enforced across the fleet."
             )
             raise RuntimeError(msg)
+        # Final-review I-2 — same rationale, different failure mode: without
+        # a shared HMAC salt, each replica mints its own random bucket-id
+        # key at construction (``RateLimitMiddleware``), so a given
+        # ``X-API-Key`` hashes to a *different* Redis bucket on every
+        # replica it happens to land on. The apikey-dimension limit is then
+        # effectively multiplied by the replica count instead of shared
+        # across the fleet — the Redis backend alone (guarded above) is not
+        # sufficient without also pinning the key derivation.
+        if (
+            not resolved_settings.single_instance
+            and resolved_settings.apikey_rate_limit_hmac_salt is None
+        ):
+            msg = (
+                "multi-replica deployment (single_instance=False) requires "
+                "EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT to be set. Without "
+                "it, every replica mints its own random HMAC key at "
+                "startup, so the same API key hashes to a different "
+                "rate-limit bucket per replica — the apikey-dimension limit "
+                "is effectively relaxed N-fold across N replicas instead of "
+                "enforced. All replicas must be configured with the same "
+                "salt value."
+            )
+            raise RuntimeError(msg)
         init_logging(
             service=resolved_settings.service_name,
             env=resolved_settings.env,

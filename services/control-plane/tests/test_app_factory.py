@@ -70,13 +70,38 @@ def test_multi_replica_without_quota_redis_url_fails_startup() -> None:
         pass
 
 
-def test_multi_replica_with_quota_redis_url_boots() -> None:
-    """Same multi-replica settings, but with the Redis URL configured —
-    startup must succeed (the guard only fires on the missing-config case)."""
+def test_multi_replica_without_hmac_salt_fails_startup() -> None:
+    """Final-review I-2 — a multi-replica deploy (``single_instance=False``)
+    with ``EXPERT_WORK_QUOTA_REDIS_URL`` set but no
+    ``EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT`` must also fail fast at
+    startup: without a shared salt, each replica mints its own random HMAC
+    key (``RateLimitMiddleware``), so the same ``X-API-Key`` hashes to a
+    different bucket per replica and the apikey-dimension limit is
+    effectively multiplied by the replica count instead of enforced.
+    """
     settings = Settings(  # type: ignore[call-arg]
         _env_file=None,
         single_instance=False,
         quota_redis_url="redis://localhost:6379/0",
+        apikey_rate_limit_hmac_salt=None,
+    )
+    app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
+    with (
+        pytest.raises(RuntimeError, match="EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT"),
+        TestClient(app),
+    ):
+        pass
+
+
+def test_multi_replica_with_quota_redis_url_boots() -> None:
+    """Same multi-replica settings, but with the Redis URL and HMAC salt
+    configured — startup must succeed (the guards only fire on the
+    missing-config cases)."""
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        single_instance=False,
+        quota_redis_url="redis://localhost:6379/0",
+        apikey_rate_limit_hmac_salt="test-hmac-salt",
     )
     app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
     with TestClient(app):
