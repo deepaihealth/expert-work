@@ -1,0 +1,85 @@
+# Keycloak IdP — production mode (`start --import-realm`, NOT start-dev)
+# against the RDS `keycloak` database (KC_DB=postgres), unlike the H2
+# dev-mode compose service. StatefulSet (not Deployment) for a stable
+# pod identity ahead of any future JGroups clustering; single replica
+# here, W2 test-env default.
+#
+# FOLLOW-UP: the branded login theme (infra/keycloak/themes/expert-work,
+# compose-mounted at /opt/keycloak/data/import/../themes/expert-work) is
+# NOT wired up here — too many files to vendor as a ConfigMap like the
+# realm json. Bake it into the image instead, or add an initContainer
+# that fetches/copies it onto an emptyDir mounted at
+# /opt/keycloak/themes/expert-work. Until then this deployment serves
+# Keycloak's stock theme.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+  labels:
+    app.kubernetes.io/name: keycloak
+spec:
+  serviceName: keycloak
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:25.0
+          args: ["start", "--import-realm"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: KC_DB_URL
+            - name: KC_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: KC_DB_USERNAME
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: KC_DB_PASSWORD
+            # No base value — overlay adds this via a patch (real
+            # per-environment hostname behind the ALB Ingress).
+            # - name: KC_HOSTNAME
+            - name: KC_PROXY_HEADERS
+              value: "xforwarded"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            # Ingress routes /auth here (ingress.yaml); Keycloak must
+            # serve under the same path prefix.
+            - name: KC_HTTP_RELATIVE_PATH
+              value: "/auth"
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: KEYCLOAK_ADMIN
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-secrets
+                  key: KEYCLOAK_ADMIN_PASSWORD
+          volumeMounts:
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import/realm-expert-work.json
+              subPath: realm-expert-work.json
+              readOnly: true
+      volumes:
+        - name: realm-import
+          configMap:
+            name: keycloak-realm

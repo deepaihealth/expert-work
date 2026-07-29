@@ -1,0 +1,116 @@
+# control-plane non-secret env — extracted from infra/docker-compose.yml
+# `x-control-plane-base` (environment: block, L21-150). Secret-bearing
+# keys (DSNs, API keys, tokens — see infra/k8s/base/secrets.example.yaml)
+# are deliberately NOT here. Values are the same neutral dev defaults
+# compose ships; per-environment overrides (real OIDC issuer, real OSS
+# endpoint, real Langfuse host, ...) belong in overlays/<env>/, not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-plane-config
+data:
+  # ---------------------------------------------------------------- identity
+  EXPERT_WORK_STORE_BACKEND: "sql"
+
+  # ------------------------------------------------------- multi-replica (W1)
+  # 0th-wave four (2026-07-29 audit item 0): this base targets a natively
+  # multi-replica deployment, not the single-process compose default.
+  EXPERT_WORK_SINGLE_INSTANCE: "false"
+  EXPERT_WORK_CHECKPOINTER_BACKEND: "postgres"
+  # Multi-replica singleton background workers. CAS-protected (W1 PR1-3),
+  # safe to run true on every replica; overlay may still pin these to a
+  # single replica (e.g. via a dedicated worker deployment) later.
+  EXPERT_WORK_ENABLE_SCHEDULER: "true"
+  EXPERT_WORK_ENABLE_CURATION_WORKER: "true"
+  EXPERT_WORK_ENABLE_REAPER: "true"
+
+  # --------------------------------------------------------------- auth/OIDC
+  # Key positions reserved; real values are an overlay decision (per-env
+  # Keycloak issuer/audience once C.1 OIDC middleware is wired for this
+  # deployment). auth_mode=dev keeps the header-trust dev path until then.
+  EXPERT_WORK_AUTH_MODE: "dev"
+  EXPERT_WORK_OIDC_ISSUER: "http://keycloak:8080/realms/expert-work"
+  EXPERT_WORK_OIDC_JWKS_URI: ""
+  EXPERT_WORK_OIDC_AUDIENCE: '["expert-work-api-internal"]'
+
+  # ------------------------------------------------------------------- misc
+  EXPERT_WORK_TOOL_OUTPUT_BUDGET: "1"
+  # sandbox-supervisor ships in W3; this URL is inert until that Service
+  # exists (web_search / exec_python builds fail closed per-run, not at
+  # control-plane startup).
+  EXPERT_WORK_SANDBOX_SUPERVISOR_URL: "http://sandbox-supervisor:8000"
+  # Observability stack (OTel Collector) ships in PR-3; the OTel SDK
+  # buffers and drops silently when the endpoint is unreachable.
+  EXPERT_WORK_OTLP_TRACES_ENDPOINT: "http://otel-collector:4318/v1/traces"
+
+  # --------------------------------------------------------------- langfuse
+  EXPERT_WORK_LANGFUSE_HOST: ""
+  EXPERT_WORK_LANGFUSE_PII_MASKING_ENABLED: "true"
+
+  # ------------------------------------------------------------ secret store
+  # local_dev backend resolves secret:// refs from a mounted dotenv file;
+  # this path is a compose-only bind mount and is inert in-cluster until
+  # an overlay either mounts an equivalent Secret here or switches
+  # secret_store_backend to sql_encrypted / aliyun_kms.
+  EXPERT_WORK_SECRET_STORE_ENV_FILE: "/run/dev-keys/dev-llm-keys.local"
+  EXPERT_WORK_SECRET_STORE_BACKEND: "local_dev"
+
+  # ------------------------------------------------------------- object store
+  # 0th-wave four: s3-compatible + virtual addressing (T1, OSS requires
+  # virtual-hosted style — path style raises SecondLevelDomainForbidden).
+  EXPERT_WORK_OBJECT_STORE_BACKEND: "s3-compatible"
+  EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE: "virtual"
+  # Neutral (compose/minio) default; overlay points this at the real OSS
+  # endpoint for the target environment.
+  EXPERT_WORK_OBJECT_STORE_ENDPOINT_URL: "http://minio:9000"
+  EXPERT_WORK_OBJECT_STORE_BUCKET: "expert-work"
+  # secret:// refs resolved via the pluggable secret_store_backend above —
+  # NOT the literal OSS access/secret key. See secrets.example.yaml for how
+  # the real key material is provisioned per backend.
+  EXPERT_WORK_OBJECT_STORE_ACCESS_KEY_REF: "secret://expert-work/dev/minio/access-key"
+  EXPERT_WORK_OBJECT_STORE_SECRET_KEY_REF: "secret://expert-work/dev/minio/secret-key"
+
+  # --------------------------------------------------------------- keycloak
+  EXPERT_WORK_KEYCLOAK_ENABLED: "false"
+
+  # ----------------------------------------------------------------- setup
+  EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL: ""
+
+  # ------------------------------------------------------------- eval worker
+  EXPERT_WORK_ENABLE_EVAL_WORKER: "false"
+  EXPERT_WORK_EVAL_WORKER_INTERVAL_S: "300"
+  EXPERT_WORK_EVAL_AGENT_PROVIDER: "anthropic"
+  EXPERT_WORK_EVAL_AGENT_MODEL: "claude-sonnet-4-6"
+
+  # ------------------------------------------------------ skill evolution
+  EXPERT_WORK_ENABLE_SKILL_EVOLUTION_WORKER: "false"
+  EXPERT_WORK_ENABLE_SKILL_ROLLBACK_MONITOR: "false"
+  EXPERT_WORK_SKILL_EVOLUTION_WORKER_INTERVAL_S: "600"
+  EXPERT_WORK_CURATION_WORKER_INTERVAL_S: "300"
+  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_PROVIDER: "anthropic"
+  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL: "claude-sonnet-4-6"
+
+  # ---------------------------------------------------------- quality monitor
+  EXPERT_WORK_ENABLE_QUALITY_MONITOR: "false"
+  EXPERT_WORK_QUALITY_MONITOR_INTERVAL_S: "300"
+  EXPERT_WORK_QUALITY_SAMPLING_RATE_PCT: "5"
+  EXPERT_WORK_QUALITY_DAILY_CAP: "500"
+  EXPERT_WORK_QUALITY_MONITOR_BATCH_SIZE: "200"
+  EXPERT_WORK_QUALITY_JUDGE_PROVIDER: "anthropic"
+  EXPERT_WORK_QUALITY_JUDGE_MODEL: "claude-haiku-4-5-20251001"
+  EXPERT_WORK_QUALITY_DRIFT_INTERVAL_S: "3600"
+  EXPERT_WORK_QUALITY_DRIFT_RECENT_WINDOW_H: "24"
+  EXPERT_WORK_QUALITY_DRIFT_BASELINE_WINDOW_H: "168"
+  EXPERT_WORK_QUALITY_DRIFT_MIN_SAMPLES: "10"
+  EXPERT_WORK_QUALITY_DRIFT_THRESHOLD: "0.15"
+  EXPERT_WORK_QUALITY_DRIFT_COOLDOWN_H: "24"
+
+  # -------------------------------------------------------------- mcp oauth
+  EXPERT_WORK_MCP_OAUTH_REDIRECT_URI: ""
+  EXPERT_WORK_MCP_OAUTH_REDIRECT_ALLOWLIST: "[]"
+  EXPERT_WORK_MCP_CATALOG_SEED_FILE: ""
+  # No EXPERT_WORK_ prefix — matches infra/docker-compose.yml verbatim.
+  MCP_OAUTH_GITHUB_CLIENT_ID: ""
+
+  # -------------------------------------------------------------- web search
+  EXPERT_WORK_WEB_SEARCH_SEARXNG_BASE_URL: "http://searxng:8080"

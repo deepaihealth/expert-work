@@ -1,0 +1,48 @@
+# Route skeleton only — host, TLS, and ALB-specific annotations (idle
+# timeout, etc.) are an overlay concern per environment.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: expert-work
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          - path: /healthz
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          # KC_HTTP_RELATIVE_PATH=/auth (keycloak/statefulset.yaml) —
+          # keep these in sync.
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-ui
+                port:
+                  number: 8080

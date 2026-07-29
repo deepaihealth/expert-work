@@ -1,0 +1,48 @@
+# Expert Work K8s base — W2-PR1 Task 3.
+#
+# Deploys the W2 slice only: control-plane (2 replicas) + admin-ui +
+# Keycloak + searxng + the migrate Job. NOT here (see
+# docs/superpowers/plans/2026-07-29-w2-pr1-k8s-foundation.md):
+#   - sandbox-supervisor / credential-proxy    -> W3
+#   - postgres / redis / pgbouncer / minio     -> replaced by Aliyun
+#     managed RDS / Redis / OSS in every overlay
+#   - nginx                                     -> replaced by this Ingress
+#   - observability stack + Langfuse            -> PR-3
+#
+# Environment-specific values (image tags, real domains, OIDC issuer,
+# ingress annotations, KC_HOSTNAME, replica counts, secrets) live in
+# overlays/<env>/ on top of this base.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: expert-work
+
+commonLabels:
+  app.kubernetes.io/part-of: expert-work
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - ingress.yaml
+  - control-plane/deployment.yaml
+  - control-plane/service.yaml
+  - control-plane/migrate-job.yaml
+  - admin-ui/deployment.yaml
+  - admin-ui/service.yaml
+  - keycloak/statefulset.yaml
+  - keycloak/service.yaml
+  - searxng/deployment.yaml
+  - searxng/service.yaml
+
+# Kustomize's default load restrictor forbids configMapGenerator `files:`
+# from escaping the kustomization root, so these are vendored copies of
+# infra/keycloak/realm-expert-work.json and infra/searxng/settings.yml
+# (verified byte-identical at commit time). Keep them in sync by hand
+# until a sync check / shared source lands — see task-3 report.
+configMapGenerator:
+  - name: keycloak-realm
+    files:
+      - realm-expert-work.json=keycloak/realm-expert-work.json
+  - name: searxng-settings
+    files:
+      - settings.yml=searxng/settings.yml

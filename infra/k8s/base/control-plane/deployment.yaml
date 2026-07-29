@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  labels:
+    app.kubernetes.io/name: control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-plane
+    spec:
+      containers:
+        - name: control-plane
+          # Overlay pins the real tag; :latest here is a build-time
+          # placeholder only (kustomize does not resolve/validate images).
+          image: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane:latest
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: control-plane-config
+            - secretRef:
+                name: control-plane-secrets
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          # Three distinct probes per api/health.py — live never touches
+          # deps (restart trigger), ready aggregates dep checks +
+          # lifecycle state, startup is true only once Lifecycle.mark_ready
+          # fires (gates live/ready until the app has actually finished
+          # boot, per subsystems/28 § 3.1).
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
