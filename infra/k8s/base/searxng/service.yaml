@@ -1,0 +1,15 @@
+# No host port / LoadBalancer / Ingress route — internal ClusterIP only
+# (see deployment.yaml SECURITY note).
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  labels:
+    app.kubernetes.io/name: searxng
+spec:
+  selector:
+    app.kubernetes.io/name: searxng
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

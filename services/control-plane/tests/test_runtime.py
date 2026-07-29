@@ -199,6 +199,30 @@ async def test_resolve_object_store_config_s3_resolves_keys() -> None:
     assert config.endpoint_url == "http://minio:9000"
     assert config.access_key == "AKID"
     assert config.secret_key == "SKEY"
+    # Default stays "path" — MinIO local dev keeps working unchanged.
+    assert config.addressing_style == "path"
+
+
+@pytest.mark.asyncio
+async def test_resolve_object_store_config_passes_addressing_style() -> None:
+    """OSS prod needs ``addressing_style="virtual"`` threaded through —
+    W0 real-bucket finding: OSS rejects path-style addressing."""
+    store = InMemorySecretStore()
+    await store.put(parse_secret_ref("secret://expert-work/prod/s3-access"), "AKID")
+    await store.put(parse_secret_ref("secret://expert-work/prod/s3-secret"), "SKEY")
+
+    config = await resolve_object_store_config(
+        backend="s3-compatible",
+        endpoint_url="https://oss-cn-hangzhou.aliyuncs.com",
+        region="cn-hangzhou",
+        bucket="expert-work-prod",
+        access_key_ref="secret://expert-work/prod/s3-access",
+        secret_key_ref="secret://expert-work/prod/s3-secret",
+        secret_store=store,
+        addressing_style="virtual",
+    )
+    assert config is not None
+    assert config.addressing_style == "virtual"
 
 
 # ---------------------------------------------------------------------------

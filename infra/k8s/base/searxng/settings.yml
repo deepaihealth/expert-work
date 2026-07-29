@@ -1,0 +1,26 @@
+# SearXNG config — free self-hosted metasearch backing the builtin
+# ``web_search`` tool (design web-search-searxng-builtin-and-tavily-mcp).
+#
+# SECURITY (§3.4): this instance is reached ONLY over the internal compose
+# network (no host port is published in docker-compose.yml). Its JSON API is
+# a free proxy to upstream engines — never expose it publicly.
+#
+# ``secret_key`` below is a DEV-ONLY signing key for SearXNG's own UI/CSRF;
+# it guards nothing sensitive in this internal setup. Override it (and review
+# the limiter) for any internet-facing deployment.
+use_default_settings: true
+
+server:
+  secret_key: "expert-work-dev-searxng-not-a-real-secret"
+  # Internal-only instance → the bot limiter would just block our own
+  # service-to-service calls. Disable it; lockdown is by network, not by rate.
+  limiter: false
+  public_instance: false
+  bind_address: "0.0.0.0:8080"
+
+search:
+  # The JSON output format is OFF by default in SearXNG — the builtin
+  # web_search client calls ``/search?format=json``, so enable it here.
+  formats:
+    - html
+    - json

@@ -1,0 +1,39 @@
+# Route skeleton only — host, TLS, and ALB-specific annotations (idle
+# timeout, etc.) are an overlay concern per environment.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: expert-work
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          # /healthz + /metrics deliberately NOT exposed here — kubelet
+          # probes hit the pod IP directly (control-plane/deployment.yaml)
+          # and Prometheus scrapes in-cluster; neither needs a public
+          # route, so keeping them off the Ingress shrinks the attack
+          # surface for no functional loss.
+          # KC_HTTP_RELATIVE_PATH=/kc (keycloak/statefulset.yaml) — keep
+          # these in sync. NOT /auth — see that file's comment for why.
+          - path: /kc
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-ui
+                port:
+                  number: 8080

@@ -1,0 +1,38 @@
+# Production ALB routing — PROD_PLACEHOLDER_* until prod is actually
+# provisioned. Mirrors overlays/test/ingress-patch.yaml structure; see
+# that file's comments for why spec.rules is a full replacement and for
+# annotation-name caveats.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: expert-work
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    alb.ingress.kubernetes.io/cert-id: "PROD_PLACEHOLDER_CERT_ID"
+    alb.ingress.kubernetes.io/idle-timeout: "3600"
+spec:
+  rules:
+    - host: PROD_PLACEHOLDER_DOMAIN
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          - path: /kc
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-ui
+                port:
+                  number: 8080

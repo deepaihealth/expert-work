@@ -1,0 +1,67 @@
+# Expert Work K8s base — W2-PR1 Task 3.
+#
+# Deploys the W2 slice only: control-plane (2 replicas) + admin-ui +
+# Keycloak + searxng + the migrate Job. NOT here (see
+# docs/superpowers/plans/2026-07-29-w2-pr1-k8s-foundation.md):
+#   - sandbox-supervisor / credential-proxy    -> W3
+#   - postgres / redis / pgbouncer / minio     -> replaced by Aliyun
+#     managed RDS / Redis / OSS in every overlay
+#   - nginx                                     -> replaced by this Ingress
+#   - observability stack + Langfuse            -> PR-3
+#
+# Environment-specific values (image tags, real domains, OIDC issuer,
+# ingress annotations, KC_HOSTNAME, replica counts, secrets) live in
+# overlays/<env>/ on top of this base.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: expert-work
+
+commonLabels:
+  app.kubernetes.io/part-of: expert-work
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - ingress.yaml
+  - control-plane/deployment.yaml
+  - control-plane/service.yaml
+  - control-plane/migrate-job.yaml
+  - admin-ui/deployment.yaml
+  - admin-ui/service.yaml
+  - keycloak/statefulset.yaml
+  - keycloak/service.yaml
+  - searxng/deployment.yaml
+  - searxng/service.yaml
+
+# Kustomize's default load restrictor forbids configMapGenerator `files:`
+# from escaping the kustomization root, so these are vendored copies of
+# infra/keycloak/realm-expert-work.json and infra/searxng/settings.yml
+# (verified byte-identical at commit time). Keep them in sync by hand
+# until a sync check / shared source lands — see task-3 report.
+configMapGenerator:
+  # !!! DEV CREDENTIALS IN THIS FILE — DO NOT SHIP AS-IS !!!
+  # realm-expert-work.json embeds plaintext dev secrets: the
+  # `expert-work-api-internal` client secret (`dev-internal-secret-rotate-me`)
+  # and dev user passwords. Any environment deployed from this base
+  # (including "test") MUST run the seed/rotate flow before going live —
+  # same one `infra/Makefile`'s `dev-seed-keycloak` target uses. A
+  # production overlay MUST NOT reuse this realm file unrotated; either
+  # rotate post-import or supply an overlay-specific realm export with
+  # real secrets.
+  #
+  # ALSO: the `expert-work-admin-ui` client's redirectUris/webOrigins in
+  # this realm file are seeded to ONLY `http://localhost:5173/*` /
+  # `http://localhost:5173` (dev). Every test/prod deploy MUST run kcadm
+  # to add `https://<real-domain>/*` to redirectUris and
+  # `https://<real-domain>` to webOrigins for that client BEFORE anyone
+  # can log in through the deployed admin-ui — this is a hard PR-2 seed-
+  # flow prerequisite (same seed pass as the credential rotation above),
+  # not optional polish. Keycloak rejects the OIDC redirect outright
+  # otherwise ("Invalid parameter: redirect_uri").
+  - name: keycloak-realm
+    files:
+      - realm-expert-work.json=keycloak/realm-expert-work.json
+  - name: searxng-settings
+    files:
+      - settings.yml=searxng/settings.yml

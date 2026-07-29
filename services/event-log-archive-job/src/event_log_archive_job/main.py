@@ -37,7 +37,7 @@ async def _amain() -> None:
         bucket=settings.s3_bucket,
         access_key=settings.s3_access_key,
         secret_key=settings.s3_secret_key,
-        use_path_style=settings.s3_use_path_style,
+        addressing_style=settings.effective_s3_addressing_style,
     )
     logger.info(
         "event_log_archive_job.start age_days=%d batch=%d backend=%s",

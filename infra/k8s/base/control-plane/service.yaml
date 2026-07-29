@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  labels:
+    app.kubernetes.io/name: control-plane
+spec:
+  selector:
+    app.kubernetes.io/name: control-plane
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

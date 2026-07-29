@@ -153,7 +153,7 @@ async def worm_store(compose_stack: DockerCompose) -> AsyncIterator[ObjectStore]
         bucket=bucket,
         access_key=user,
         secret_key=password,
-        use_path_style=True,
+        addressing_style="path",
     )
     async with make_object_store("s3-compatible", config) as s:
         await _ensure_worm_bucket(s, bucket)

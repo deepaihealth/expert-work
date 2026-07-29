@@ -50,7 +50,7 @@ auth:
 # Container registry — 阿里云 ACR prod
 container_registry:
   type: aliyun-acr
-  endpoint: TBD-acr-prod.cn-hangzhou.cr.aliyuncs.com
+  endpoint: PROD_PLACEHOLDER
   namespace: expert-work
 
 # TLS minima per subsystems/28-reliability-primitives § 5.1.

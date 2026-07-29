@@ -41,10 +41,29 @@ class AuditBackupSettings(BaseSettings):
     s3_bucket: str = "expert-work-audit-worm"
     s3_access_key: str = "expert_work"
     s3_secret_key: str = "expert_work_dev_minio"  # noqa: S105 — dev fixture default; prod via env
+    #: Deprecated — superseded by ``s3_addressing_style``. Kept for env
+    #: back-compat: existing deployments setting this bool keep getting
+    #: the pre-migration ``"path" if true else "auto"`` behavior (see
+    #: ``effective_s3_addressing_style``).
     s3_use_path_style: bool = True
+    #: S3 addressing style — set explicitly to override the legacy bool
+    #: above. ``"path"`` for MinIO local dev, ``"virtual"`` for Aliyun OSS
+    #: prod (W0 real-bucket finding: OSS rejects path-style addressing).
+    #: ``None`` (default) falls back to the legacy bool for back-compat.
+    s3_addressing_style: Literal["path", "virtual", "auto"] | None = None
 
     # ------------------------------------------------------------------ worker tuning
     batch_size: int = Field(default=100, gt=0, le=10000)
     poll_interval_s: float = Field(default=2.0, gt=0, le=60.0)
     max_retries_per_row: int = Field(default=10, gt=0)
     audit_retention_days_default: int = Field(default=90, gt=0, le=3650)
+
+    @property
+    def effective_s3_addressing_style(self) -> Literal["path", "virtual", "auto"]:
+        """Explicit ``s3_addressing_style`` wins; otherwise derived from
+        the legacy ``s3_use_path_style`` bool (``True``→``"path"``,
+        ``False``→``"auto"`` — the pre-migration ternary in
+        ``factory.py``) so existing deployments keep working unchanged."""
+        if self.s3_addressing_style is not None:
+            return self.s3_addressing_style
+        return "path" if self.s3_use_path_style else "auto"

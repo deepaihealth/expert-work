@@ -1,0 +1,51 @@
+# expert-work-test.deepaihealth.com — real ALB routing for the test env.
+#
+# spec.rules has no Kubernetes strategic-merge key (IngressRule is an
+# unkeyed list), so patching it means a full replacement, not a diff —
+# this mirrors base/ingress.yaml's paths/backends verbatim plus `host`.
+# Keep the two files in sync by hand (same caveat T3 left for
+# configMapGenerator files — see base/kustomization.yaml).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: expert-work
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # Real cert ID is a PR-2 value (cert issued for
+    # expert-work-test.deepaihealth.com). Annotation name is best-effort
+    # per Aliyun ALB ingress controller docs — confirm against the live
+    # controller version before PR-2 applies this for real.
+    alb.ingress.kubernetes.io/cert-id: "25878622-cn-hangzhou"
+    # Long-lived SSE connections (Playground token streaming) want a
+    # generous idle timeout. Per docs/superpowers/specs/2026-07-28-aliyun-
+    # deployment-design.md line 43, the actual 3600s bump may need an
+    # Aliyun support ticket at the ALB *instance* level rather than (or
+    # in addition to) this Ingress annotation — confirm both paths at
+    # PR-2 deploy time.
+    alb.ingress.kubernetes.io/idle-timeout: "3600"
+spec:
+  rules:
+    - host: expert-work-test.deepaihealth.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: control-plane
+                port:
+                  number: 8000
+          - path: /kc
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-ui
+                port:
+                  number: 8080

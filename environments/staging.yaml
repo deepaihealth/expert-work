@@ -46,7 +46,7 @@ auth:
 # Container registry — 阿里云 ACR staging
 container_registry:
   type: aliyun-acr
-  endpoint: TBD-acr-staging.cn-hangzhou.cr.aliyuncs.com
+  endpoint: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com
   namespace: expert-work
 
 # TLS minima per subsystems/28-reliability-primitives § 5.1.

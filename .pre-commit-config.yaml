@@ -12,6 +12,9 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # k8s manifests (infra/k8s/) conventionally pack multiple documents
+        # per file with `---` separators; each document is still validated.
+        args: [--allow-multiple-documents]
         # helm templates carry Go ``{{ }}`` and the HA-failover / run-queue compose
         # overlays use docker-compose's ``!override`` merge tag — both are valid for
         # their tooling but PyYAML's safe_load (check-yaml) can't parse them.

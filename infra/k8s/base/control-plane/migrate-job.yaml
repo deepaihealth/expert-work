@@ -1,0 +1,36 @@
+# One-shot schema migration — mirrors infra/docker-compose.yml `migrate`
+# (Mini-ADR I-3): same image as control-plane, entrypoint overridden to
+# run Alembic directly against Postgres (5432, NOT PgBouncer — DDL wants
+# a direct connection).
+#
+# Jobs are immutable once created: the PR-2 deploy script applies this
+# Job (deleting/recreating it first, since re-applying an unchanged spec
+# is a no-op and a changed image tag can't be patched onto an existing
+# Job) and waits for it to complete before rolling the control-plane
+# Deployment. ttlSecondsAfterFinished auto-cleans the completed Pod so a
+# stale run never blocks the next `kubectl apply`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app.kubernetes.io/name: migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
+          command: ["alembic", "-c", "/app/alembic/alembic.ini", "upgrade", "head"]
+          env:
+            - name: EXPERT_WORK_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-secrets
+                  key: EXPERT_WORK_DB_URL

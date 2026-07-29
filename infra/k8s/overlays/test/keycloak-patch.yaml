@@ -1,0 +1,16 @@
+# KC_HOSTNAME — base/keycloak/statefulset.yaml leaves this unset (real
+# per-environment hostname is an overlay concern). Container `env` merges
+# by `name`, so this only adds KC_HOSTNAME; the base-defined vars are
+# untouched.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+spec:
+  template:
+    spec:
+      containers:
+        - name: keycloak
+          env:
+            - name: KC_HOSTNAME
+              value: "https://expert-work-test.deepaihealth.com/kc"

@@ -1401,6 +1401,7 @@ def create_app(
                             access_key_ref=resolved_settings.object_store_access_key_ref,
                             secret_key_ref=resolved_settings.object_store_secret_key_ref,
                             secret_store=resolved_secret_store,
+                            addressing_style=resolved_settings.object_store_addressing_style,
                         ),
                     )
                 )
