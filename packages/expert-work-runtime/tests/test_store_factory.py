@@ -75,7 +75,10 @@ async def test_postgres_backend_retries_transient_setup_race() -> None:
 
     with _patched_from_conn_string(fake_store):
         async with make_store("postgres", dsn="postgresql://fake") as store:
-            assert store is fake_store
+            # via ``object`` — the fake is not a BaseStore subclass, and a direct
+            # identity check trips mypy's comparison-overlap.
+            yielded: object = store
+            assert yielded is fake_store
 
     assert fake_store.setup_calls == 3
 
