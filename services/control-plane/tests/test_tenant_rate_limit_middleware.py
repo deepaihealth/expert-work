@@ -2,20 +2,41 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.exceptions import RedisError
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
-from control_plane.ratelimit import InProcessTokenBucketLimiter, RateLimiter
+from control_plane.middleware.rate_limit import _rate_limit_backend_errors
+from control_plane.ratelimit import InProcessTokenBucketLimiter, RateLimitDecision, RateLimiter
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditAction, AuditQuery
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
 _TENANT = DEFAULT_DEV_TENANT_ID
+
+
+@dataclass
+class _RedisDownLimiter:
+    """Simulates a Redis-backed limiter whose backend is unreachable."""
+
+    calls: list[tuple[str, str]]
+
+    async def acquire(
+        self,
+        *,
+        dimension: str,
+        key: str,
+        capacity: int | None = None,
+        refill_per_sec: float | None = None,
+    ) -> RateLimitDecision:
+        self.calls.append((dimension, key))
+        raise RedisError("connection refused")
 
 
 @pytest.fixture
@@ -103,6 +124,24 @@ async def test_disabled_middleware_is_a_no_op(audit_store: InMemoryAuditLogStore
         for _ in range(50):
             resp = await client.get("/v1/agents", headers={"Authorization": f"Bearer {token}"})
             assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_redis_error_fails_open_and_counts_backend_error(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """subsystems/16 § 5.2 — a Redis outage on the tenant tier must not become
+    an HTTP outage: the request is allowed through (fail OPEN) and the
+    backend-error counter records the degradation for on-call."""
+    limiter = _RedisDownLimiter(calls=[])
+    before = _rate_limit_backend_errors.labels(backend="tenant")._value.get()  # type: ignore[attr-defined]
+    async with _build_client(audit_store=audit_store, tenant_limiter=limiter) as client:
+        token = make_test_jwt(tenant_id=_TENANT)
+        resp = await client.get("/v1/agents", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert limiter.calls  # the limiter was actually invoked, not skipped
+    after = _rate_limit_backend_errors.labels(backend="tenant")._value.get()  # type: ignore[attr-defined]
+    assert after == before + 1
 
 
 # ---------------------------------------------------------------------------

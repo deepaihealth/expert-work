@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import UUID, uuid4
 
 from expert_work.persistence.quota.base import (
+    BudgetExceededError,
     DuplicateQuotaError,
     ReservationNotFoundError,
     TenantQuotaStore,
@@ -147,6 +148,12 @@ class InMemoryTokenReservationStore(TokenReservationStore):
     ) -> TokenReservationRecord:
         async with self._lock:
             now = _now()
+            month = now.date().replace(day=1)
+            budget = await self._ensure_budget_locked(tenant_id, month)
+            if budget.budget_total > 0:
+                projected = budget.used_total + budget.reserved_total + estimated
+                if projected > budget.budget_total:
+                    raise BudgetExceededError(tenant_id=tenant_id, month=month)
             row = TokenReservationRecord(
                 id=uuid4(),
                 tenant_id=tenant_id,
@@ -161,8 +168,7 @@ class InMemoryTokenReservationStore(TokenReservationStore):
                 closed_at=None,
             )
             self._reservations[row.id] = row
-            budget = await self._ensure_budget_locked(tenant_id, now.date().replace(day=1))
-            self._ledger[(tenant_id, budget.month)] = budget.model_copy(
+            self._ledger[(tenant_id, month)] = budget.model_copy(
                 update={
                     "reserved_total": budget.reserved_total + estimated,
                     "updated_at": now,

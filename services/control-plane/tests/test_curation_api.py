@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -33,6 +34,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _BASE = datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
@@ -218,6 +220,73 @@ async def test_eval_dataset_quota_returns_429(ctx: _Ctx) -> None:
         assert created.status_code == 201
     over = await ctx.client.post("/v1/eval-datasets", json=body)
     assert over.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creates_do_not_overshoot_quota() -> None:
+    """W1-PR2 Task 4 — count-then-insert TOCTOU regression.
+
+    Same hazard/harness shape as the webhook-endpoints counterpart: two
+    replicas racing the same tenant can both read the same under-cap count
+    and both insert. ``count_by_tenant`` is wrapped with a post-count delay
+    to force the two concurrent requests' checks to genuinely overlap, and
+    a fake advisory-lock session factory stands in for Postgres.
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+        max_eval_dataset_rows_per_tenant=1,
+    )
+    audit_store = InMemoryAuditLogStore()
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(),
+        enable_scheduler=False,
+    )
+    app.state.session_factory = FakeAdvisoryLockSessionFactory()
+
+    datasets = app.state.eval_dataset_store
+    real_count_by_tenant = datasets.count_by_tenant
+
+    async def _slow_count_by_tenant(*, tenant_id: UUID) -> int:
+        n = await real_count_by_tenant(tenant_id=tenant_id)
+        await asyncio.sleep(0.2)  # widen the race window past the lock's retry budget
+        return n
+
+    datasets.count_by_tenant = _slow_count_by_tenant  # type: ignore[method-assign]
+
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT)}"}
+    body = {
+        "agent_name": "reporter",
+        "name": "s",
+        "input": {},
+        "expected": {"a": 1},
+        "source": "golden",
+    }
+    async with (
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_a,
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_b,
+    ):
+
+        async def _post(client: AsyncClient) -> int:
+            resp = await client.post("/v1/eval-datasets", json=body)
+            return resp.status_code
+
+        status_a, status_b = await asyncio.gather(_post(client_a), _post(client_b))
+
+    assert sorted([status_a, status_b]) == [201, 429]
+    assert await real_count_by_tenant(tenant_id=_TENANT) == 1
 
 
 # --- curation candidates ---------------------------------------------------

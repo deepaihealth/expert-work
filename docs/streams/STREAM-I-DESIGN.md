@@ -316,6 +316,7 @@ deploy.py 重写该文件后 `nginx -s reload`（reload 不断连，平滑换 up
 | TLS 证书 | 自签（`tools/dev-certs/`）| 内部 CA / 真证书 | 真证书 |
 | `store_backend` | `sql`（compose `migrate` 起 schema）| `sql` | `sql` |
 | `single_instance` | `true`（不蓝绿）| `false` + Redis（蓝绿需要，§ 6.4）| `false` + Redis |
+| `EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT` | 未设置（单副本用进程随机盐即可）| **必配**，所有副本同值（`openssl rand -hex 32` 生成）| **必配**，所有副本同值 |
 | 发布方式 | `compose up`（无蓝绿）| `deploy.py` 蓝绿 | `deploy.py` 蓝绿 + 金丝雀 |
 
 **环境隔离（P0）**：三环境的 DB / 密钥 / bucket 完全分离，命名一律带环境后缀（`expert_work_dev` / `_staging` / `_prod`）防误连；`environments/<env>.yaml` + `EXPERT_WORK_*` env var + KMS 三处配置源，prod 凭据只存 KMS、不落盘不进仓库。
@@ -328,7 +329,7 @@ deploy.py 重写该文件后 `nginx -s reload`（reload 不断连，平滑换 up
 4. 滚动发布步骤：`migrate`（expand，§ 7.3）→ `deploy.py --tag <new>`（→ § 6.3）。
 5. 回滚步骤：`rollback.py`（→ § 7.2）。
 6. **发布检查清单**：迁移是否纯 expand（§ 7.3）/ 新镜像 CI 全绿 / `environments/<env>.yaml` 已核对 / 金丝雀阶段已看 SLO 大盘（Stream G）/ 旧色保留待回滚。
-7. 环境差异与坑：dev 的 redis 占宿主 6379（已知，见 § 4.1）、staging/prod 必设 `single_instance=false`、prod 密钥只走 KMS。
+7. 环境差异与坑：dev 的 redis 占宿主 6379（已知，见 § 4.1）、staging/prod 必设 `single_instance=false`、staging/prod 必设 `EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT`（所有副本同值，`openssl rand -hex 32` 生成；未配则每副本各自随机盐，同一 api key 在 N 副本散 N 个桶，apikey 维度限流形同放宽 N 倍）、prod 密钥只走 KMS。
 
 ### 8.4 说明
 

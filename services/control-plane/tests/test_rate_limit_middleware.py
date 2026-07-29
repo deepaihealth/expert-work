@@ -8,9 +8,12 @@ from dataclasses import dataclass
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
+from redis.exceptions import RedisError
 from starlette.responses import JSONResponse
 
 from control_plane.middleware import RateLimitMiddleware
+from control_plane.middleware.rate_limit import _rate_limit_backend_errors
 from control_plane.ratelimit import InProcessTokenBucketLimiter, RateLimitDecision, RateLimiter
 
 
@@ -26,15 +29,50 @@ class _StubLimiter:
         return self.decision
 
 
-def _build_probe_app(limiter: RateLimiter, *, enabled: bool = True) -> FastAPI:
+@dataclass
+class _RedisDownLimiter:
+    """Simulates a Redis-backed limiter whose backend is unreachable."""
+
+    calls: list[tuple[str, str]]
+
+    async def acquire(self, *, dimension: str, key: str) -> RateLimitDecision:
+        self.calls.append((dimension, key))
+        raise RedisError("connection refused")
+
+
+def _build_probe_app(
+    limiter: RateLimiter,
+    *,
+    enabled: bool = True,
+    hmac_salt: SecretStr | None = None,
+) -> FastAPI:
     app = FastAPI()
-    app.add_middleware(RateLimitMiddleware, limiter=limiter, enabled=enabled)
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=limiter,
+        enabled=enabled,
+        hmac_salt=hmac_salt,
+    )
 
     @app.get("/probe")
     async def probe() -> JSONResponse:
         return JSONResponse({"ok": True})
 
     return app
+
+
+async def _fetch_apikey_bucket(
+    stub: _StubLimiter,
+    *,
+    hmac_salt: SecretStr | None = None,
+    api_key: str = "secret-token",
+) -> str:
+    """Drive one request through a fresh middleware instance, return its bucket id."""
+    app = _build_probe_app(stub, hmac_salt=hmac_salt)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.get("/probe", headers={"X-API-Key": api_key})
+    return stub.calls[-1][1]
 
 
 @pytest.mark.asyncio
@@ -86,6 +124,24 @@ async def test_denied_returns_429_with_envelope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_redis_error_fails_open_and_counts_backend_error() -> None:
+    """subsystems/16 § 5.2 — a Redis outage on the gateway tier must not become
+    an HTTP outage: the request is allowed through (fail OPEN) and the
+    backend-error counter records the degradation for on-call."""
+    stub = _RedisDownLimiter(calls=[])
+    app = _build_probe_app(stub)
+    transport = ASGITransport(app=app)
+    before = _rate_limit_backend_errors.labels(backend="gateway")._value.get()  # type: ignore[attr-defined]
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/probe")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert stub.calls  # the limiter was actually invoked, not skipped
+    after = _rate_limit_backend_errors.labels(backend="gateway")._value.get()  # type: ignore[attr-defined]
+    assert after == before + 1
+
+
+@pytest.mark.asyncio
 async def test_disabled_short_circuit_skips_limiter() -> None:
     stub = _StubLimiter(
         decision=RateLimitDecision(allowed=False, retry_after_s=10.0, remaining=0.0),
@@ -110,3 +166,55 @@ async def test_concurrent_burst_returns_some_429s() -> None:
     status_codes = [r.status_code for r in responses]
     assert status_codes.count(200) == 3
     assert status_codes.count(429) == 5
+
+
+@pytest.mark.asyncio
+async def test_shared_hmac_salt_yields_same_bucket_across_instances() -> None:
+    """Same salt on two independently constructed instances → same bucket id.
+
+    Simulates the cross-replica scenario in-process: each replica boots its
+    own ``RateLimitMiddleware``, but a shared
+    ``apikey_rate_limit_hmac_salt`` must make them agree on the bucket for a
+    given api key — otherwise the same key falls into a different bucket per
+    replica and the limiter never accumulates enough hits to trip.
+    """
+    salt = SecretStr("shared-multi-replica-salt")
+    stub_a = _StubLimiter(
+        decision=RateLimitDecision(allowed=True, retry_after_s=0.0, remaining=5.0),
+        calls=[],
+    )
+    stub_b = _StubLimiter(
+        decision=RateLimitDecision(allowed=True, retry_after_s=0.0, remaining=5.0),
+        calls=[],
+    )
+
+    bucket_a = await _fetch_apikey_bucket(stub_a, hmac_salt=salt)
+    bucket_b = await _fetch_apikey_bucket(stub_b, hmac_salt=salt)
+
+    assert bucket_a == bucket_b
+    assert len(bucket_a) == 16
+
+
+@pytest.mark.asyncio
+async def test_no_salt_falls_back_to_per_instance_random_key() -> None:
+    """No salt configured → legacy single-replica behaviour: the bucket id
+    is stable across requests within one instance, but two independently
+    constructed instances (each minting their own random key) disagree."""
+    stub = _StubLimiter(
+        decision=RateLimitDecision(allowed=True, retry_after_s=0.0, remaining=5.0),
+        calls=[],
+    )
+    app = _build_probe_app(stub)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.get("/probe", headers={"X-API-Key": "secret-token"})
+        await client.get("/probe", headers={"X-API-Key": "secret-token"})
+    bucket_first, bucket_second = stub.calls[0][1], stub.calls[1][1]
+    assert bucket_first == bucket_second  # stable within one instance
+
+    stub_other = _StubLimiter(
+        decision=RateLimitDecision(allowed=True, retry_after_s=0.0, remaining=5.0),
+        calls=[],
+    )
+    bucket_other = await _fetch_apikey_bucket(stub_other)
+    assert bucket_other != bucket_first  # independent instance → different random key

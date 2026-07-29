@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -21,6 +22,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _DEFAULT_TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -145,6 +147,82 @@ async def test_quota_exhausted(client: AsyncClient) -> None:
         json={"name": "c", "url": "https://h.example.com", "event_types": ["run.completed"]},
     )
     assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creates_do_not_overshoot_quota(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """W1-PR2 Task 4 — count-then-insert TOCTOU regression.
+
+    Two replicas serving the same tenant can both read the same under-cap
+    count and both insert, overshooting the cap. ``count_by_tenant`` is
+    wrapped with a delay *after* it computes the real count so two
+    concurrent requests' count-checks genuinely overlap (asyncio's
+    cooperative scheduler never preempts mid-coroutine — without a real
+    await point between the two racing calls, ``asyncio.gather`` would
+    just run them one at a time and never reproduce the hazard). A fake
+    advisory-lock session factory stands in for Postgres so the fix's
+    exclusion is provable without a real DB (``FakeAdvisoryLockSession``'s
+    contract is exercised for real against Postgres separately in
+    ``test_tenant_resource_lock_integration.py``).
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+        max_webhook_endpoints_per_tenant=1,
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(),
+        enable_scheduler=False,
+    )
+    app.state.session_factory = FakeAdvisoryLockSessionFactory()
+
+    store = app.state.webhook_endpoint_store
+    real_count_by_tenant = store.count_by_tenant
+
+    async def _slow_count_by_tenant(*, tenant_id: UUID) -> int:
+        n = await real_count_by_tenant(tenant_id=tenant_id)
+        await asyncio.sleep(0.2)  # widen the race window past the lock's retry budget
+        return n
+
+    store.count_by_tenant = _slow_count_by_tenant  # type: ignore[method-assign]
+
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with (
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_a,
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_b,
+    ):
+
+        async def _post(client: AsyncClient, name: str) -> int:
+            resp = await client.post(
+                "/v1/webhook-endpoints",
+                json={
+                    "name": name,
+                    "url": "https://h.example.com",
+                    "event_types": ["run.completed"],
+                },
+            )
+            return resp.status_code
+
+        status_a, status_b = await asyncio.gather(
+            _post(client_a, "race-a"), _post(client_b, "race-b")
+        )
+
+    assert sorted([status_a, status_b]) == [201, 429]
+    assert await real_count_by_tenant(tenant_id=_DEFAULT_TENANT) == 1
 
 
 @pytest.mark.asyncio

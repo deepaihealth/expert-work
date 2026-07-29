@@ -33,12 +33,14 @@ import time
 from collections.abc import Awaitable, Callable, Iterable
 from uuid import UUID
 
+from redis.exceptions import RedisError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
 from control_plane.audit import emit
+from control_plane.middleware.rate_limit import _rate_limit_backend_errors
 from control_plane.ratelimit import RateLimiter, RateLimitOverride, parse_rate_limit_override
 from expert_work.common.observability import current_trace_id_hex, expert_work_counter
 from expert_work.persistence.rls import current_tenant_id_var
@@ -113,12 +115,24 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
 
         tenant_key = str(principal.tenant_id)
         override = await self._resolve_override(principal.tenant_id)
-        decision = await self._limiter.acquire(
-            dimension="tenant",
-            key=tenant_key,
-            capacity=override.capacity if override else None,
-            refill_per_sec=override.refill_per_sec if override else None,
-        )
+        try:
+            decision = await self._limiter.acquire(
+                dimension="tenant",
+                key=tenant_key,
+                capacity=override.capacity if override else None,
+                refill_per_sec=override.refill_per_sec if override else None,
+            )
+        except RedisError:
+            # Fail OPEN — see control_plane.middleware.rate_limit for the
+            # rationale (shared counter, ``backend`` label tells the tiers
+            # apart). Business-level quota admission fails CLOSED instead;
+            # that asymmetry is deliberate (subsystems/16 § 6).
+            _rate_limit_backend_errors.labels(backend="tenant").inc()
+            logger.warning(
+                "tenant_rate_limit.backend_unavailable",
+                extra={"tenant_id": tenant_key},
+            )
+            return await call_next(request)
         outcome = "allowed" if decision.allowed else "denied"
         _decisions.labels(decision=outcome).inc()
 

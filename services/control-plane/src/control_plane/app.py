@@ -1093,6 +1093,48 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # W1-PR2 Task 5 — multi-replica configuration-consistency guard.
+        # ``_build_default_gateway_limiter`` / ``_build_default_tenant_limiter``
+        # / ``_build_mcp_probe_limiter`` (below) silently fall back to the
+        # in-process bucket whenever ``quota_redis_url`` is unset — fine for
+        # single_instance=True, but under single_instance=False that fallback
+        # means every replica enforces its OWN independent bucket instead of
+        # a shared one, i.e. no limit at all under horizontal scale-out
+        # (ratelimit/in_process.py's module docstring). Fail fast at startup
+        # rather than let that ship as a silent no-op degradation.
+        if not resolved_settings.single_instance and not resolved_settings.quota_redis_url:
+            msg = (
+                "multi-replica deployment (single_instance=False) requires "
+                "EXPERT_WORK_QUOTA_REDIS_URL to be set. Without it, every "
+                "replica's gateway / tenant / MCP-probe rate limiter falls "
+                "back to the in-process token bucket — each replica then "
+                "keeps its own independent count, so the configured limit "
+                "is not actually enforced across the fleet."
+            )
+            raise RuntimeError(msg)
+        # Final-review I-2 — same rationale, different failure mode: without
+        # a shared HMAC salt, each replica mints its own random bucket-id
+        # key at construction (``RateLimitMiddleware``), so a given
+        # ``X-API-Key`` hashes to a *different* Redis bucket on every
+        # replica it happens to land on. The apikey-dimension limit is then
+        # effectively multiplied by the replica count instead of shared
+        # across the fleet — the Redis backend alone (guarded above) is not
+        # sufficient without also pinning the key derivation.
+        if (
+            not resolved_settings.single_instance
+            and resolved_settings.apikey_rate_limit_hmac_salt is None
+        ):
+            msg = (
+                "multi-replica deployment (single_instance=False) requires "
+                "EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT to be set. Without "
+                "it, every replica mints its own random HMAC key at "
+                "startup, so the same API key hashes to a different "
+                "rate-limit bucket per replica — the apikey-dimension limit "
+                "is effectively relaxed N-fold across N replicas instead of "
+                "enforced. All replicas must be configured with the same "
+                "salt value."
+            )
+            raise RuntimeError(msg)
         init_logging(
             service=resolved_settings.service_name,
             env=resolved_settings.env,
@@ -2075,6 +2117,11 @@ def create_app(
     app.state.lifecycle = resolved_lifecycle
     # ``AsyncEngine`` in ``sql`` mode, ``None`` in ``memory`` mode (ADR B-6).
     app.state.db_engine = sql_stores.engine if sql_stores else None
+    # W1-PR2 Task 4 — per-tenant advisory-lock critical sections
+    # (``_tenant_resource_lock.py``) read this off app.state; ``None`` in
+    # ``memory`` mode degrades the lock to a no-op (single process, no
+    # cross-replica race to guard against).
+    app.state.session_factory = sql_stores.session_factory if sql_stores else None
     app.state.health_provider = health_provider
     app.state.rate_limiter = resolved_limiter
     app.state.mcp_probe_limiter = resolved_mcp_probe_limiter
@@ -2225,6 +2272,7 @@ def create_app(
         RateLimitMiddleware,
         limiter=resolved_limiter,
         enabled=resolved_settings.rate_limit_enabled,
+        hmac_salt=resolved_settings.apikey_rate_limit_hmac_salt,
     )
     app.add_middleware(
         AuditContextMiddleware,

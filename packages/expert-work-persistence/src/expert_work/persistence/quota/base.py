@@ -55,6 +55,21 @@ class ReservationNotFoundError(Exception):
         self.reservation_id = reservation_id
 
 
+class BudgetExceededError(Exception):
+    """Admitting this reservation would exceed the tenant's monthly budget.
+
+    Raised by :meth:`TokenReservationStore.reserve` — the budget check and
+    the ``reserved_total`` bump happen atomically (same lock / same
+    conditional statement), so this is TOCTOU-safe under concurrent
+    ``reserve`` calls on the same ``(tenant_id, month)`` ledger row.
+    """
+
+    def __init__(self, *, tenant_id: UUID, month: date) -> None:
+        super().__init__(f"token_budget exceeded: tenant={tenant_id} month={month}")
+        self.tenant_id = tenant_id
+        self.month = month
+
+
 class TenantQuotaStore(abc.ABC):
     """Persistence Protocol for ``tenant_quota`` rows."""
 
@@ -91,7 +106,13 @@ class TokenReservationStore(abc.ABC):
         parent_thread_id: UUID | None = None,
         model: str | None = None,
     ) -> TokenReservationRecord:
-        """Insert a row in ``RESERVED`` state and bump the ledger reserved_total."""
+        """Insert a row in ``RESERVED`` state and bump the ledger reserved_total.
+
+        Raises :class:`BudgetExceededError` if ``budget_total`` is set and
+        admitting this reservation would push ``used_total + reserved_total``
+        past it — the check is atomic with the bump (no reservation row is
+        created on rejection).
+        """
 
     @abc.abstractmethod
     async def commit(

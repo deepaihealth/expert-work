@@ -16,6 +16,7 @@ from expert_work.persistence.models import (
     TokenReservationRow,
 )
 from expert_work.persistence.quota.base import (
+    BudgetExceededError,
     ReservationNotFoundError,
     TenantQuotaStore,
     TokenReservationStore,
@@ -241,6 +242,46 @@ class SqlTokenReservationStore(TokenReservationStore):
             )
         ).scalar_one_or_none()
 
+    async def _lock_budget_row(
+        self, session: AsyncSession, *, tenant_id: UUID, month: date, now: datetime
+    ) -> TokenBudgetLedgerRow:
+        """Ensure the ``(tenant_id, month)`` ledger row exists, then
+        ``SELECT … FOR UPDATE`` it — same lock-then-branch style as
+        ``_lock_reservation``. The row lock serialises concurrent
+        ``reserve()`` calls on this ledger row, so the budget check +
+        ``reserved_total`` bump in ``reserve()`` below happen as one
+        atomic step instead of racing across a separate check-then-bump
+        round trip (the TOCTOU this method fixes).
+
+        ``ON CONFLICT DO NOTHING`` seeds a fresh unlimited-budget row
+        without itself racing the lock: concurrent seeders each no-op
+        past one another, then every caller locks the same settled row.
+        """
+        await session.execute(
+            pg_insert(TokenBudgetLedgerRow)
+            .values(
+                tenant_id=tenant_id,
+                month=month,
+                budget_total=0,
+                used_total=0,
+                reserved_total=0,
+                updated_at=now,
+            )
+            .on_conflict_do_nothing(constraint="token_budget_ledger_tenant_month_uniq")
+        )
+        return (
+            await session.execute(
+                select(TokenBudgetLedgerRow)
+                .where(
+                    and_(
+                        TokenBudgetLedgerRow.tenant_id == tenant_id,
+                        TokenBudgetLedgerRow.month == month,
+                    )
+                )
+                .with_for_update()
+            )
+        ).scalar_one()
+
     async def reserve(
         self,
         *,
@@ -253,6 +294,12 @@ class SqlTokenReservationStore(TokenReservationStore):
     ) -> TokenReservationRecord:
         async with self._sf() as session:
             now = _utc_now()
+            month = _month_of(now)
+            ledger = await self._lock_budget_row(session, tenant_id=tenant_id, month=month, now=now)
+            if ledger.budget_total > 0:
+                projected = ledger.used_total + ledger.reserved_total + estimated
+                if projected > ledger.budget_total:
+                    raise BudgetExceededError(tenant_id=tenant_id, month=month)
             row = TokenReservationRow(
                 tenant_id=tenant_id,
                 agent_name=agent_name,
@@ -266,9 +313,8 @@ class SqlTokenReservationStore(TokenReservationStore):
                 closed_at=None,
             )
             session.add(row)
-            await self._bump_reserved(
-                session, tenant_id=tenant_id, month=_month_of(now), delta=estimated, now=now
-            )
+            ledger.reserved_total = ledger.reserved_total + estimated
+            ledger.updated_at = now
             await session.commit()
             await session.refresh(row)
             return _row_to_reservation(row)

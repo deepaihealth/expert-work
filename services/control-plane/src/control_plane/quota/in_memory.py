@@ -24,12 +24,15 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Final
 from uuid import UUID
 
 from control_plane.quota.base import QuotaService
-from expert_work.persistence.quota import TenantQuotaStore, TokenReservationStore
+from expert_work.persistence.quota import (
+    BudgetExceededError,
+    TenantQuotaStore,
+    TokenReservationStore,
+)
 from expert_work.protocol import (
     CheckRequest,
     CheckResult,
@@ -136,23 +139,23 @@ class InMemoryQuotaService(QuotaService):
     # ------------------------------------------------------------------ reserve / commit
 
     async def reserve_tokens(self, req: ReserveRequest) -> ReserveResult:
-        month = datetime.now(tz=UTC).date().replace(day=1)
-        budget = await self._reservation_store.get_budget(tenant_id=req.tenant_id, month=month)
-        # ``budget_total == 0`` means "no monthly budget configured"
-        # which we treat as "unlimited" — same M0 dev default as QPS.
-        if budget is not None and budget.budget_total > 0:
-            projected = budget.used_total + budget.reserved_total + req.estimated_tokens
-            if projected > budget.budget_total:
-                return ReserveResult(granted=False, reason="over_budget")
-
-        row = await self._reservation_store.reserve(
-            tenant_id=req.tenant_id,
-            agent_name=req.agent,
-            thread_id=req.thread_id,
-            estimated=req.estimated_tokens,
-            parent_thread_id=req.parent_thread_id,
-            model=req.model,
-        )
+        # ``budget_total == 0`` means "no monthly budget configured" which
+        # we treat as "unlimited" — same M0 dev default as QPS. The check
+        # + reserved_total bump happen atomically inside ``reserve()``
+        # (same ``self._lock`` critical section) — no separate
+        # get_budget() pre-check here, which would race a concurrent
+        # reserve() between the check and the bump (TOCTOU).
+        try:
+            row = await self._reservation_store.reserve(
+                tenant_id=req.tenant_id,
+                agent_name=req.agent,
+                thread_id=req.thread_id,
+                estimated=req.estimated_tokens,
+                parent_thread_id=req.parent_thread_id,
+                model=req.model,
+            )
+        except BudgetExceededError:
+            return ReserveResult(granted=False, reason="over_budget")
         return ReserveResult(granted=True, reservation_id=row.id, reason="ok")
 
     async def commit_tokens(self, req: CommitRequest) -> None:

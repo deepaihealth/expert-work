@@ -27,7 +27,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane._tenant_resource_lock import tenant_resource_lock
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api._user_scope import (
     get_user_repo,
@@ -280,6 +282,10 @@ def _get_thread_message_store(request: Request) -> ThreadMessageStore:
     return request.app.state.thread_message_store  # type: ignore[no-any-return]
 
 
+def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession] | None:
+    return request.app.state.session_factory  # type: ignore[no-any-return]
+
+
 def build_triggers_router() -> APIRouter:
     """Stream J.10 — authenticated trigger CRUD."""
     router = APIRouter(prefix="/v1/triggers", tags=["triggers"])
@@ -292,6 +298,9 @@ def build_triggers_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         settings: Annotated[Settings, Depends(_get_settings)],
+        session_factory: Annotated[
+            async_sessionmaker[AsyncSession] | None, Depends(_get_session_factory)
+        ],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
@@ -303,19 +312,6 @@ def build_triggers_router() -> APIRouter:
             actor_id=actor_id,
             audit=audit,
         )
-
-        # Scheduler quota (Mini-ADR J-26 (2)) — cap a tenant's cron
-        # triggers so a runaway client cannot flood the scheduler.
-        if body.kind == "cron":
-            existing = await triggers.count_cron_by_tenant(tenant_id=tenant_id)
-            if existing >= settings.max_cron_triggers_per_tenant:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        "cron trigger quota exhausted "
-                        f"(max {settings.max_cron_triggers_per_tenant} per tenant)"
-                    ),
-                )
 
         user_id = await resolve_caller_user_id(request, users)
         now = datetime.now(UTC)
@@ -340,13 +336,36 @@ def build_triggers_router() -> APIRouter:
             created_at=now,
             updated_at=now,
         )
-        try:
-            await triggers.create(record)
-        except (ValueError, IntegrityError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=f"trigger {body.name!r} already exists for agent {body.agent_name!r}",
-            ) from exc
+
+        async def _insert() -> None:
+            try:
+                await triggers.create(record)
+            except (ValueError, IntegrityError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"trigger {body.name!r} already exists for agent {body.agent_name!r}",
+                ) from exc
+
+        if body.kind == "cron":
+            # Task 4 — count-then-insert is TOCTOU-vulnerable across
+            # replicas; the scheduler quota check (Mini-ADR J-26 (2), caps a
+            # tenant's cron triggers so a runaway client cannot flood the
+            # scheduler) and the insert are one per-tenant advisory-locked
+            # critical section so two replicas can't both pass the count
+            # check and both insert, overshooting the cap.
+            async with tenant_resource_lock(session_factory, tenant_id, "cron_trigger"):
+                existing = await triggers.count_cron_by_tenant(tenant_id=tenant_id)
+                if existing >= settings.max_cron_triggers_per_tenant:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=(
+                            "cron trigger quota exhausted "
+                            f"(max {settings.max_cron_triggers_per_tenant} per tenant)"
+                        ),
+                    )
+                await _insert()
+        else:
+            await _insert()
 
         await emit(
             audit,

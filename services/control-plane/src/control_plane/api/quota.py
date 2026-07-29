@@ -22,6 +22,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from control_plane.api._authz import require
+from control_plane.api._quota_admission import quota_engine_unavailable_as_503
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
 from expert_work.common.observability import current_trace_id_hex
@@ -59,7 +60,8 @@ def build_quota_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> CheckResult:
-        result = await quota.check(payload)
+        async with quota_engine_unavailable_as_503():
+            result = await quota.check(payload)
         if not result.allowed:
             # Sample rate-limit denials (audit can blow up under
             # sustained 429 storms). Subsystems/16 § 8 specifies 1%
@@ -83,7 +85,8 @@ def build_quota_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> ReserveResult:
-        result = await quota.reserve_tokens(payload)
+        async with quota_engine_unavailable_as_503():
+            result = await quota.reserve_tokens(payload)
         if not result.granted:
             await emit(
                 audit,
@@ -110,7 +113,8 @@ def build_quota_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
     ) -> None:
         try:
-            await quota.commit_tokens(payload)
+            async with quota_engine_unavailable_as_503():
+                await quota.commit_tokens(payload)
         except ReservationNotFoundError as exc:
             raise HTTPException(
                 status_code=404,
@@ -128,7 +132,8 @@ def build_quota_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
     ) -> None:
         try:
-            await quota.release_tokens(reservation_id, tenant_id=tenant_id)
+            async with quota_engine_unavailable_as_503():
+                await quota.release_tokens(reservation_id, tenant_id=tenant_id)
         except ReservationNotFoundError as exc:
             raise HTTPException(
                 status_code=404,

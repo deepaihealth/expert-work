@@ -17,6 +17,8 @@ to ``(tenant, agent_name)`` — agent-level, not per-instance.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -24,7 +26,9 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane._tenant_resource_lock import tenant_resource_lock
 from control_plane.audit import emit
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
@@ -112,19 +116,37 @@ def _get_settings(request: Request) -> Settings:
     return request.app.state.settings  # type: ignore[no-any-return]
 
 
+def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession] | None:
+    return request.app.state.session_factory  # type: ignore[no-any-return]
+
+
+@asynccontextmanager
 async def _enforce_quota(
-    datasets: EvalDatasetStore, settings: Settings, *, tenant_id: UUID
-) -> None:
-    """Cap a tenant's curated rows — checked at create + promote."""
-    count = await datasets.count_by_tenant(tenant_id=tenant_id)
-    if count >= settings.max_eval_dataset_rows_per_tenant:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "eval-dataset quota exhausted "
-                f"(max {settings.max_eval_dataset_rows_per_tenant} per tenant)"
-            ),
-        )
+    datasets: EvalDatasetStore,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    *,
+    tenant_id: UUID,
+) -> AsyncIterator[None]:
+    """Cap a tenant's curated rows — checked at create + promote.
+
+    Task 4 — count-then-insert is TOCTOU-vulnerable across replicas; the
+    count check and the caller's insert are one per-tenant advisory-locked
+    critical section (the caller does the insert inside this ``async
+    with``) so two replicas can't both pass the count check and both
+    insert, overshooting ``max_eval_dataset_rows_per_tenant``.
+    """
+    async with tenant_resource_lock(session_factory, tenant_id, "eval_dataset"):
+        count = await datasets.count_by_tenant(tenant_id=tenant_id)
+        if count >= settings.max_eval_dataset_rows_per_tenant:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "eval-dataset quota exhausted "
+                    f"(max {settings.max_eval_dataset_rows_per_tenant} per tenant)"
+                ),
+            )
+        yield
 
 
 class _PromoteBody(BaseModel):
@@ -231,6 +253,9 @@ def build_curation_router() -> APIRouter:
         datasets: Annotated[EvalDatasetStore, Depends(_get_eval_dataset_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         settings: Annotated[Settings, Depends(_get_settings)],
+        session_factory: Annotated[
+            async_sessionmaker[AsyncSession] | None, Depends(_get_session_factory)
+        ],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
@@ -239,26 +264,26 @@ def build_curation_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="curation candidate not found")
         if record.status is not CandidateStatus.PENDING:
             raise HTTPException(status_code=409, detail=f"candidate already {record.status.value}")
-        await _enforce_quota(datasets, settings, tenant_id=tenant_id)
 
         now = datetime.now(UTC)
-        try:
-            dataset = EvalDatasetRecord(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                agent_name=record.agent_name,
-                name=body.name,
-                input=body.input,
-                expected=body.expected,
-                source=body.source,
-                source_trajectory_key=record.trajectory_key,
-                source_user_id=record.user_id,
-                created_at=now,
-                updated_at=now,
-            )
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        await datasets.create(dataset)
+        async with _enforce_quota(datasets, settings, session_factory, tenant_id=tenant_id):
+            try:
+                dataset = EvalDatasetRecord(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    agent_name=record.agent_name,
+                    name=body.name,
+                    input=body.input,
+                    expected=body.expected,
+                    source=body.source,
+                    source_trajectory_key=record.trajectory_key,
+                    source_user_id=record.user_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            await datasets.create(dataset)
         await candidates.update(
             record.model_copy(
                 update={
@@ -324,27 +349,30 @@ def build_eval_dataset_router() -> APIRouter:
         datasets: Annotated[EvalDatasetStore, Depends(_get_eval_dataset_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         settings: Annotated[Settings, Depends(_get_settings)],
+        session_factory: Annotated[
+            async_sessionmaker[AsyncSession] | None, Depends(_get_session_factory)
+        ],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
-        await _enforce_quota(datasets, settings, tenant_id=tenant_id)
 
         now = datetime.now(UTC)
-        try:
-            record = EvalDatasetRecord(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                agent_name=body.agent_name,
-                name=body.name,
-                input=body.input,
-                expected=body.expected,
-                source=body.source,
-                created_at=now,
-                updated_at=now,
-            )
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        await datasets.create(record)
+        async with _enforce_quota(datasets, settings, session_factory, tenant_id=tenant_id):
+            try:
+                record = EvalDatasetRecord(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    agent_name=body.agent_name,
+                    name=body.name,
+                    input=body.input,
+                    expected=body.expected,
+                    source=body.source,
+                    created_at=now,
+                    updated_at=now,
+                )
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            await datasets.create(record)
         await emit(
             audit,
             tenant_id=tenant_id,

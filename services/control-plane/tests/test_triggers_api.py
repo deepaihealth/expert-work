@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -21,6 +22,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _DEFAULT_TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -315,6 +317,81 @@ async def test_cron_trigger_quota_returns_429(triggers_client: AsyncClient) -> N
         },
     )
     assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cron_creates_do_not_overshoot_quota(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """W1-PR2 Task 4 — count-then-insert TOCTOU regression.
+
+    Same hazard/harness shape as the curation / webhook-endpoints
+    counterparts: two replicas racing the same tenant can both read the
+    same under-cap cron-trigger count and both insert.
+    ``count_cron_by_tenant`` is wrapped with a post-count delay to force
+    the two concurrent requests' checks to genuinely overlap, and a fake
+    advisory-lock session factory stands in for Postgres.
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+        max_cron_triggers_per_tenant=1,
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(),
+        enable_scheduler=False,
+    )
+    app.state.session_factory = FakeAdvisoryLockSessionFactory()
+
+    triggers = app.state.trigger_store
+    real_count_cron_by_tenant = triggers.count_cron_by_tenant
+
+    async def _slow_count_cron_by_tenant(*, tenant_id: UUID) -> int:
+        n = await real_count_cron_by_tenant(tenant_id=tenant_id)
+        await asyncio.sleep(0.2)  # widen the race window past the lock's retry budget
+        return n
+
+    triggers.count_cron_by_tenant = _slow_count_cron_by_tenant  # type: ignore[method-assign]
+
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as setup_client:
+        await setup_client.post("/v1/agents", json={"manifest_yaml": _REPORTER_YAML})
+
+    body = {
+        "agent_name": "reporter",
+        "agent_version": "1.0.0",
+        "kind": "cron",
+        "config": {"expr": "0 9 * * *"},
+    }
+    async with (
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_a,
+        AsyncClient(
+            transport=transport, base_url="http://control-plane.test", headers=headers
+        ) as client_b,
+    ):
+
+        async def _post(client: AsyncClient, name: str) -> int:
+            resp = await client.post("/v1/triggers", json={**body, "name": name})
+            return resp.status_code
+
+        status_a, status_b = await asyncio.gather(
+            _post(client_a, "race-a"), _post(client_b, "race-b")
+        )
+
+    assert sorted([status_a, status_b]) == [201, 429]
+    assert await real_count_cron_by_tenant(tenant_id=_DEFAULT_TENANT) == 1
 
 
 # --- Capability Uplift Sprint #1 — create-time prompt injection scan ---------

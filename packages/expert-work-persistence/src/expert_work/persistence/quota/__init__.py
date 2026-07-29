@@ -1,6 +1,7 @@
 """Quota engine persistence — Stream C.5."""
 
 from expert_work.persistence.quota.base import (
+    BudgetExceededError,
     DuplicateQuotaError,
     ReservationNotFoundError,
     TenantQuotaStore,
@@ -16,6 +17,7 @@ from expert_work.persistence.quota.sql import (
 )
 
 __all__ = [
+    "BudgetExceededError",
     "DuplicateQuotaError",
     "InMemoryTenantQuotaStore",
     "InMemoryTokenReservationStore",

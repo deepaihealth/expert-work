@@ -51,7 +51,7 @@ from expert_work.persistence.rls import (
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
+from expert_work.runtime.runs import RunInfo, RunStore
 from orchestrator import AgentFactoryError, run_agent
 
 logger = logging.getLogger("expert_work.control_plane.orphan_sweep")
@@ -235,13 +235,28 @@ class OrphanSweep:
             )
             if blocked is not None:
                 now = datetime.now(UTC)
-                await self._runs.set_status(
+                # W1-PR2 Task 5 — CAS-guarded terminal transition, same
+                # rationale as ``_fail_orphan``'s ``fail_if_active`` guard:
+                # two replicas can both reclaim-and-resume the same orphan
+                # in the same sweep cycle and both observe ``blocked``. An
+                # unconditional ``set_status`` would let both "succeed",
+                # double-counting the failed-orphan counter and emitting a
+                # duplicate audit record for one terminal transition.
+                won = await self._runs.request_cancel(
                     run_id=orphan.run_id,
                     tenant_id=orphan.tenant_id,
-                    status=RunStatus.INTERRUPTED,
                     updated_at=now,
-                    finished_at=now,
                 )
+                if not won:
+                    # A peer replica's kill-switch branch (or some other
+                    # terminal transition) already won — no-op, skip the
+                    # counter/audit side effects.
+                    logger.debug(
+                        "orphan_sweep.kill_switch_lost_cas run_id=%s reason=%s",
+                        orphan.run_id,
+                        blocked,
+                    )
+                    return
                 _failed_total.labels(reason=blocked).inc()
                 logger.warning(
                     "orphan_sweep.kill_switch run_id=%s reason=%s", orphan.run_id, blocked
