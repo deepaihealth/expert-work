@@ -605,7 +605,9 @@ async def test_list_stale_pending_finds_only_old_pending(run_store: SqlRunStore)
         _info(run_id=running, tenant_id=tenant, status=RunStatus.RUNNING, created_at=_BASE)
     )
 
-    found_ids = [r.run_id for r in await run_store.list_stale_pending(cutoff=cutoff, limit=10)]
+    # limit is generous: other tests in this shared-container session also
+    # leave stale PENDING rows, and a small limit would truncate ours away.
+    found_ids = [r.run_id for r in await run_store.list_stale_pending(cutoff=cutoff, limit=1000)]
     assert stale in found_ids
     assert fresh not in found_ids
     assert running not in found_ids
