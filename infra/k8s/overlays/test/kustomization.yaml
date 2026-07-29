@@ -15,7 +15,7 @@ resources:
 # literal value never reaches a cluster.
 images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newTag: "23a3194e"
+    newTag: 23a3194e-r2
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
     newTag: 23a3194e-test
   # The cluster VPC cannot reach docker.io / quay.io (dial timeout — same
