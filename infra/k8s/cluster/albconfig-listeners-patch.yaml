@@ -1,5 +1,10 @@
 # Desired listeners for the SHARED test-cluster AlbConfig "alb".
 #
+# TEST cluster only — the CertificateId below is the test wildcard cert.
+# The prod cluster gets its own AlbConfig (own ALB instance, own cert);
+# add a prod variant of this file alongside when W4 provisions prod
+# rather than reusing this one.
+#
 # The AlbConfig was created by the ACS agent-sandbox component install
 # (sandbox-system's sandbox-manager Ingress rides the same ALB instance,
 # alb-cv3xokwot6r9bgojzx), so it is deliberately NOT part of the

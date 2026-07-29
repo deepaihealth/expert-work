@@ -11,6 +11,12 @@ metadata:
   name: expert-work
   annotations:
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # 301 every HTTP request to the 443 listener — without this the whole
+    # app (including OIDC id_token bearers) is reachable in cleartext on
+    # port 80. Real annotation per the official ALB Ingress docs;
+    # requires the AlbConfig 443 HTTPS listener (present —
+    # infra/k8s/cluster/albconfig-listeners-patch.yaml).
+    alb.ingress.kubernetes.io/ssl-redirect: "true"
     # Certificate and idle/request timeouts are NOT Ingress annotations in
     # the Aliyun ALB controller (verified against the ALB Ingress
     # configuration dictionary at PR-2 deploy time — `cert-id` /

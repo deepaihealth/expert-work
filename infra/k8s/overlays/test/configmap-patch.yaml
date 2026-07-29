@@ -1,8 +1,7 @@
 # Test-env real values layered onto base/configmap.yaml's neutral
 # defaults (strategic-merge on ConfigMap.data — only listed keys change;
-# everything else, e.g. EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE,
-# EXPERT_WORK_SECRET_STORE_BACKEND, the multi-replica switches, keeps the
-# base value).
+# everything else, e.g. EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE and
+# the multi-replica switches, keeps the base value).
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -9,10 +9,15 @@ kind: Kustomization
 resources:
   - ../../base
 
-# Placeholder — PR-2's deploy script runs `kustomize edit set image
-# .../control-plane=...:$(git rev-parse --short HEAD)` (tools/deploy/
-# build-push.sh tags images this way) right before `kubectl apply`. This
-# literal value never reaches a cluster.
+# Deployed image tags — updated by hand at release time (edit + commit,
+# then `kubectl apply -k`). Tag convention: `<main sha>` for
+# control-plane, `<main sha>-test` for the env-specific admin-ui build
+# (OIDC build args baked in — see tools/deploy/build-push.sh). An `-rN`
+# suffix means a same-source rebuild pushed under a NEW tag: the ACS
+# image cache resolves tags without consulting the registry, so
+# re-pushing an existing tag serves stale bits — every release must mint
+# a fresh tag. (Follow-up: digest pinning would remove this class of
+# problem entirely.)
 images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newTag: 23a3194e-r2
