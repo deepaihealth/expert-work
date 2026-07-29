@@ -1,0 +1,14 @@
+# KC_HOSTNAME — PROD_PLACEHOLDER_DOMAIN until prod is actually
+# provisioned. Mirrors overlays/test/keycloak-patch.yaml.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+spec:
+  template:
+    spec:
+      containers:
+        - name: keycloak
+          env:
+            - name: KC_HOSTNAME
+              value: "https://PROD_PLACEHOLDER_DOMAIN/auth"

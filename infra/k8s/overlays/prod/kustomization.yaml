@@ -1,0 +1,22 @@
+# W2-PR1 Task 4 — production overlay. Same structure as overlays/test/,
+# every environment-specific value is a PROD_PLACEHOLDER_* stand-in (spec
+# 拍板 — real values are a future PR once prod is actually provisioned).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane
+    newTag: PROD_PLACEHOLDER_TAG
+  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/admin-ui
+    newTag: PROD_PLACEHOLDER_TAG
+
+patches:
+  - path: configmap-patch.yaml
+  - path: ingress-patch.yaml
+  - path: keycloak-patch.yaml
+
+# Secrets (control-plane-secrets / keycloak-secrets) are NOT built by
+# kustomize here — see secrets.env.example.

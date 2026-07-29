@@ -1,0 +1,29 @@
+# W2-PR1 Task 4 — expert-work-test.deepaihealth.com overlay. Real
+# per-environment values on top of infra/k8s/base/ (control-plane +
+# admin-ui + Keycloak + searxng + migrate Job). See
+# docs/superpowers/plans/2026-07-29-w2-pr1-k8s-foundation.md Task 4 and
+# docs/superpowers/specs/2026-07-28-aliyun-deployment-design.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Placeholder — PR-2's deploy script runs `kustomize edit set image
+# .../control-plane=...:$(git rev-parse --short HEAD)` (tools/deploy/
+# build-push.sh tags images this way) right before `kubectl apply`. This
+# literal value never reaches a cluster.
+images:
+  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane
+    newTag: TEST_DEPLOY_TAG_PLACEHOLDER
+  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/admin-ui
+    newTag: TEST_DEPLOY_TAG_PLACEHOLDER
+
+patches:
+  - path: configmap-patch.yaml
+  - path: ingress-patch.yaml
+  - path: keycloak-patch.yaml
+
+# Secrets (control-plane-secrets / keycloak-secrets) are NOT built by
+# kustomize here — see secrets.env.example for how PR-2 provisions them
+# directly against the cluster (kubectl create secret --from-env-file).
