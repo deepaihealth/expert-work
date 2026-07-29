@@ -20,6 +20,20 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY . .
+
+# Baked into the built bundle via Vite's import.meta.env substitution
+# (src/auth/oidc.ts reads these three at runtime, from the static
+# replacement Vite performs at build time — there's no server to read a
+# real env var from once this becomes static files behind nginx). Empty
+# defaults keep the image buildable with no OIDC config at all, in which
+# case admin-ui falls back to its token-paste login path.
+ARG VITE_OIDC_ISSUER=""
+ARG VITE_OIDC_CLIENT_ID=""
+ARG VITE_OIDC_AUDIENCE=""
+ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER} \
+    VITE_OIDC_CLIENT_ID=${VITE_OIDC_CLIENT_ID} \
+    VITE_OIDC_AUDIENCE=${VITE_OIDC_AUDIENCE}
+
 RUN pnpm build
 
 # nginx-unprivileged ships pre-hardened for non-root K8s pods (listens on

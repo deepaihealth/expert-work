@@ -27,6 +27,15 @@ spec:
                 name: control-plane-config
             - secretRef:
                 name: control-plane-secrets
+          # local_dev SecretStore dotenv vault (EXPERT_WORK_SECRET_STORE_ENV_FILE
+          # in configmap.yaml) — resolves the object-store `secret://` refs.
+          # Without this mount the file simply doesn't exist and every
+          # secret:// lookup fails (see secrets.example.yaml for how to
+          # provision the Secret this reads).
+          volumeMounts:
+            - name: secret-store-files
+              mountPath: /run/secret-store
+              readOnly: true
           resources:
             requests:
               cpu: 500m
@@ -63,3 +72,11 @@ spec:
             preStop:
               exec:
                 command: ["sleep", "5"]
+      # `optional: false` (the default, spelled out here) — a missing
+      # Secret must fail pod scheduling loudly, not silently start
+      # control-plane with an empty secret-store vault.
+      volumes:
+        - name: secret-store-files
+          secret:
+            secretName: control-plane-secret-files
+            optional: false

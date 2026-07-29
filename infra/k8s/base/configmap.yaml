@@ -12,6 +12,16 @@ data:
   # ---------------------------------------------------------------- identity
   EXPERT_WORK_STORE_BACKEND: "sql"
 
+  # -------------------------------------------------------------- database
+  # DSN (EXPERT_WORK_DB_DSN, in the Secret) connects straight to RDS —
+  # there is no PgBouncer/pooler in front in-cluster (unlike
+  # infra/docker-compose.yml's :6432 hop). settings.py:53 defaults
+  # db_pgbouncer_mode to true, which disables asyncpg's prepared-statement
+  # cache and forces NullPool — both are PgBouncer transaction-mode
+  # workarounds that would just throw away connection pooling for no
+  # reason against a direct RDS connection.
+  EXPERT_WORK_DB_PGBOUNCER_MODE: "false"
+
   # ------------------------------------------------------- multi-replica (W1)
   # 0th-wave four (2026-07-29 audit item 0): this base targets a natively
   # multi-replica deployment, not the single-process compose default.
@@ -29,7 +39,9 @@ data:
   # Keycloak issuer/audience once C.1 OIDC middleware is wired for this
   # deployment). auth_mode=dev keeps the header-trust dev path until then.
   EXPERT_WORK_AUTH_MODE: "dev"
-  EXPERT_WORK_OIDC_ISSUER: "http://keycloak:8080/realms/expert-work"
+  # keycloak/statefulset.yaml serves under KC_HTTP_RELATIVE_PATH=/kc; kept
+  # in sync here even though auth_mode=dev doesn't consume this value.
+  EXPERT_WORK_OIDC_ISSUER: "http://keycloak:8080/kc/realms/expert-work"
   EXPERT_WORK_OIDC_JWKS_URI: ""
   EXPERT_WORK_OIDC_AUDIENCE: '["expert-work-api-internal"]'
 
@@ -48,11 +60,16 @@ data:
   EXPERT_WORK_LANGFUSE_PII_MASKING_ENABLED: "true"
 
   # ------------------------------------------------------------ secret store
-  # local_dev backend resolves secret:// refs from a mounted dotenv file;
-  # this path is a compose-only bind mount and is inert in-cluster until
-  # an overlay either mounts an equivalent Secret here or switches
-  # secret_store_backend to sql_encrypted / aliyun_kms.
-  EXPERT_WORK_SECRET_STORE_ENV_FILE: "/run/dev-keys/dev-llm-keys.local"
+  # local_dev backend resolves secret:// refs by reading `name=value` lines
+  # from this dotenv file (refs.py strips the `secret://` prefix; the
+  # remainder is looked up verbatim). control-plane/deployment.yaml mounts
+  # the `control-plane-secret-files` Secret read-only at this path — see
+  # secrets.example.yaml for how to provision it. That file is REQUIRED,
+  # not a compose-only convenience: a ref control-plane actually needs at
+  # boot (e.g. the object-store keys below) resolves during app startup, so
+  # a missing/empty file surfaces as SecretNotFoundError before the pod
+  # ever goes ready — not a silent no-op.
+  EXPERT_WORK_SECRET_STORE_ENV_FILE: "/run/secret-store/secret-store.env"
   EXPERT_WORK_SECRET_STORE_BACKEND: "local_dev"
 
   # ------------------------------------------------------------- object store
@@ -67,8 +84,8 @@ data:
   # secret:// refs resolved via the pluggable secret_store_backend above —
   # NOT the literal OSS access/secret key. See secrets.example.yaml for how
   # the real key material is provisioned per backend.
-  EXPERT_WORK_OBJECT_STORE_ACCESS_KEY_REF: "secret://expert-work/dev/minio/access-key"
-  EXPERT_WORK_OBJECT_STORE_SECRET_KEY_REF: "secret://expert-work/dev/minio/secret-key"
+  EXPERT_WORK_OBJECT_STORE_ACCESS_KEY_REF: "secret://expert-work/platform/oss/access-key"
+  EXPERT_WORK_OBJECT_STORE_SECRET_KEY_REF: "secret://expert-work/platform/oss/secret-key"
 
   # --------------------------------------------------------------- keycloak
   EXPERT_WORK_KEYCLOAK_ENABLED: "false"

@@ -18,7 +18,7 @@ spec:
       port: 8080
       targetPort: http
 ---
-# Normal ClusterIP Service — this is the Ingress /auth backend
+# Normal ClusterIP Service — this is the Ingress /kc backend
 # (ingress.yaml). Same pod selector as keycloak-headless above; two
 # Services, one StatefulSet.
 apiVersion: v1

@@ -16,23 +16,14 @@ spec:
                 name: control-plane
                 port:
                   number: 8000
-          - path: /healthz
-            pathType: Prefix
-            backend:
-              service:
-                name: control-plane
-                port:
-                  number: 8000
-          - path: /metrics
-            pathType: Prefix
-            backend:
-              service:
-                name: control-plane
-                port:
-                  number: 8000
-          # KC_HTTP_RELATIVE_PATH=/auth (keycloak/statefulset.yaml) —
-          # keep these in sync.
-          - path: /auth
+          # /healthz + /metrics deliberately NOT exposed here — kubelet
+          # probes hit the pod IP directly (control-plane/deployment.yaml)
+          # and Prometheus scrapes in-cluster; neither needs a public
+          # route, so keeping them off the Ingress shrinks the attack
+          # surface for no functional loss.
+          # KC_HTTP_RELATIVE_PATH=/kc (keycloak/statefulset.yaml) — keep
+          # these in sync. NOT /auth — see that file's comment for why.
+          - path: /kc
             pathType: Prefix
             backend:
               service:

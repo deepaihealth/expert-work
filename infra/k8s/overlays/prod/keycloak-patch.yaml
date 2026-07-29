@@ -11,4 +11,4 @@ spec:
         - name: keycloak
           env:
             - name: KC_HOSTNAME
-              value: "https://PROD_PLACEHOLDER_DOMAIN/auth"
+              value: "https://PROD_PLACEHOLDER_DOMAIN/kc"

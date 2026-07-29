@@ -49,6 +49,16 @@ configMapGenerator:
   # production overlay MUST NOT reuse this realm file unrotated; either
   # rotate post-import or supply an overlay-specific realm export with
   # real secrets.
+  #
+  # ALSO: the `expert-work-admin-ui` client's redirectUris/webOrigins in
+  # this realm file are seeded to ONLY `http://localhost:5173/*` /
+  # `http://localhost:5173` (dev). Every test/prod deploy MUST run kcadm
+  # to add `https://<real-domain>/*` to redirectUris and
+  # `https://<real-domain>` to webOrigins for that client BEFORE anyone
+  # can log in through the deployed admin-ui — this is a hard PR-2 seed-
+  # flow prerequisite (same seed pass as the credential rotation above),
+  # not optional polish. Keycloak rejects the OIDC redirect outright
+  # otherwise ("Invalid parameter: redirect_uri").
   - name: keycloak-realm
     files:
       - realm-expert-work.json=keycloak/realm-expert-work.json

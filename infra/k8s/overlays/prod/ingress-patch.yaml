@@ -22,21 +22,7 @@ spec:
                 name: control-plane
                 port:
                   number: 8000
-          - path: /healthz
-            pathType: Prefix
-            backend:
-              service:
-                name: control-plane
-                port:
-                  number: 8000
-          - path: /metrics
-            pathType: Prefix
-            backend:
-              service:
-                name: control-plane
-                port:
-                  number: 8000
-          - path: /auth
+          - path: /kc
             pathType: Prefix
             backend:
               service:

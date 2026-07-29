@@ -66,10 +66,13 @@ spec:
               value: "xforwarded"
             - name: KC_HTTP_ENABLED
               value: "true"
-            # Ingress routes /auth here (ingress.yaml); Keycloak must
-            # serve under the same path prefix.
+            # Ingress routes /kc here (ingress.yaml); Keycloak must serve
+            # under the same path prefix. NOT /auth — Keycloak's default
+            # relative path collides with the admin-ui SPA's own
+            # /auth/callback route (src/auth/oidc.ts's default
+            # redirectUri), so this is deliberately non-default.
             - name: KC_HTTP_RELATIVE_PATH
-              value: "/auth"
+              value: "/kc"
             - name: KEYCLOAK_ADMIN
               valueFrom:
                 secretKeyRef:
@@ -82,25 +85,28 @@ spec:
                   key: KEYCLOAK_ADMIN_PASSWORD
           # Health endpoints live on the management port (9000), not the
           # app port — KC_HEALTH_ENABLED above is what makes them exist.
+          # KC_HTTP_RELATIVE_PATH also prefixes the management port, not
+          # just the app port — verified against a live container — so
+          # these paths carry /kc too, not bare /health/*.
           # startupProbe gets a long budget (60 x 5s = 5min) because the
           # realm import on first boot is slow; live/ready only take over
           # once startup succeeds.
           startupProbe:
             httpGet:
-              path: /health/ready
+              path: /kc/health/ready
               port: management
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
-              path: /health/ready
+              path: /kc/health/ready
               port: management
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /health/live
+              path: /kc/health/live
               port: management
             periodSeconds: 10
             timeoutSeconds: 3

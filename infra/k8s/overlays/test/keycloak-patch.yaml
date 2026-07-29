@@ -13,4 +13,4 @@ spec:
         - name: keycloak
           env:
             - name: KC_HOSTNAME
-              value: "https://expert-work-test.deepaihealth.com/auth"
+              value: "https://expert-work-test.deepaihealth.com/kc"
