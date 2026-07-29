@@ -22,7 +22,11 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 if (env_url := os.environ.get("EXPERT_WORK_DB_URL")) is not None:
-    config.set_main_option("sqlalchemy.url", env_url)
+    # set_main_option values pass through configparser interpolation, so a
+    # literal ``%`` (e.g. a URL-encoded ``%40`` for ``@`` in the password)
+    # must be escaped as ``%%`` or alembic dies with "invalid interpolation
+    # syntax".
+    config.set_main_option("sqlalchemy.url", env_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
