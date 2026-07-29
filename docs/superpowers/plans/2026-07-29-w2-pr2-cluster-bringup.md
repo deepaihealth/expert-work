@@ -73,5 +73,5 @@
 - [x] F1 `/.well-known/openid-configuration` issuer 逐字节 ==
   `https://expert-work-test.deepaihealth.com/kc/realms/expert-work`
 - [x] F2 `/v1/healthz` 200;admin-ui `/` 出 SPA;`/kc` 出 Keycloak
-- [ ] F3 冒烟(需用户):OIDC 登录 → setup → 后台粘 LLM key → 建 agent 跑 run;
+- [x] F3 冒烟(需用户):OIDC 登录 → setup → 后台粘 LLM key → 建 agent 跑 run;
   SSE 长流看 ALB 是否 180s 砍(砍则工单)
