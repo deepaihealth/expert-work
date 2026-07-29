@@ -3,9 +3,11 @@
 ADR B-1 calls out that this implementation assumes **one control-plane
 replica**: every replica owns an independent bucket, so deploying two
 behind a single LB would defeat the limit. Stream C.6 replaces this with
-a Redis-backed atomic implementation; until then the
-``settings.single_instance`` guard fails startup when operators try to
-scale beyond one replica.
+a Redis-backed atomic implementation (:class:`RedisTokenBucketLimiter`);
+``create_app``'s ``lifespan`` (W1-PR2 Task 5) enforces the constraint at
+startup — ``single_instance=False`` with no ``EXPERT_WORK_QUOTA_REDIS_URL``
+raises ``RuntimeError`` instead of silently falling back to this
+in-process bucket.
 
 The bucket map is bounded only by unique ``(dimension, key)`` pairs. For
 dev / single-tenant M0 traffic this is fine; if it ever grows we'll

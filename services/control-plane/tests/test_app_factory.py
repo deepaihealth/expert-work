@@ -52,6 +52,37 @@ def test_health_and_metrics_routes_registered() -> None:
     assert "/metrics" in paths
 
 
+def test_multi_replica_without_quota_redis_url_fails_startup() -> None:
+    """W1-PR2 Task 5 — a multi-replica deploy (``single_instance=False``)
+    with no ``EXPERT_WORK_QUOTA_REDIS_URL`` must fail fast at startup
+    instead of silently falling back to the in-process rate limiter /
+    quota engine: each replica would then keep its own independent bucket,
+    which is equivalent to no limit at all under horizontal scale-out
+    (ratelimit/in_process.py's docstring). The guard lives in ``lifespan``,
+    so it only fires once the app actually starts (``TestClient`` context
+    entry), not at bare ``create_app()`` construction time.
+    """
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None, single_instance=False, quota_redis_url=None
+    )
+    app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
+    with pytest.raises(RuntimeError, match="EXPERT_WORK_QUOTA_REDIS_URL"), TestClient(app):
+        pass
+
+
+def test_multi_replica_with_quota_redis_url_boots() -> None:
+    """Same multi-replica settings, but with the Redis URL configured —
+    startup must succeed (the guard only fires on the missing-config case)."""
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        single_instance=False,
+        quota_redis_url="redis://localhost:6379/0",
+    )
+    app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
+    with TestClient(app):
+        pass
+
+
 def test_enable_scheduler_false_skips_single_replica_workers() -> None:
     """Multi-replica deploy (Task 3) — ``EXPERT_WORK_ENABLE_SCHEDULER=false``
     (surfaced here as the settings value ``main.py`` forwards to

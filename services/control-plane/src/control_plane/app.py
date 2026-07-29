@@ -1093,6 +1093,25 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # W1-PR2 Task 5 — multi-replica configuration-consistency guard.
+        # ``_build_default_gateway_limiter`` / ``_build_default_tenant_limiter``
+        # / ``_build_mcp_probe_limiter`` (below) silently fall back to the
+        # in-process bucket whenever ``quota_redis_url`` is unset — fine for
+        # single_instance=True, but under single_instance=False that fallback
+        # means every replica enforces its OWN independent bucket instead of
+        # a shared one, i.e. no limit at all under horizontal scale-out
+        # (ratelimit/in_process.py's module docstring). Fail fast at startup
+        # rather than let that ship as a silent no-op degradation.
+        if not resolved_settings.single_instance and not resolved_settings.quota_redis_url:
+            msg = (
+                "multi-replica deployment (single_instance=False) requires "
+                "EXPERT_WORK_QUOTA_REDIS_URL to be set. Without it, every "
+                "replica's gateway / tenant / MCP-probe rate limiter falls "
+                "back to the in-process token bucket — each replica then "
+                "keeps its own independent count, so the configured limit "
+                "is not actually enforced across the fleet."
+            )
+            raise RuntimeError(msg)
         init_logging(
             service=resolved_settings.service_name,
             env=resolved_settings.env,

@@ -276,6 +276,66 @@ async def test_fail_orphan_second_call_skips_audit_and_counter(
 
 
 @pytest.mark.asyncio
+async def test_kill_switch_second_call_skips_audit_and_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1-PR2 Task 5 — two replicas racing the same reclaimed run's
+    kill-switch termination (both resumed the same disabled-agent orphan in
+    the same sweep cycle) must not double-audit or double-count. The CAS
+    guard (``request_cancel``) lets only the first ``_respawn`` call's
+    kill-switch branch win; the loser is a no-op — same shape as
+    ``test_fail_orphan_second_call_skips_audit_and_counter`` above."""
+    monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+    disable_store = InMemoryAgentDisableStore()
+    await disable_store.set_disabled(
+        tenant_id=tenant, agent_name="a", disabled=True, reason=None, disabled_by="admin"
+    )
+    sweep = _sweep(store, runtime, agent_disable_service=AgentDisableService(store=disable_store))
+
+    audit_calls: list[str] = []
+
+    async def _fake_emit_audit(_orphan, *, result, reason):
+        del result
+        audit_calls.append(reason)
+
+    monkeypatch.setattr(sweep, "_emit_audit", _fake_emit_audit)
+
+    counter_calls: list[dict[str, str]] = []
+    real_labels = sweep_module._failed_total.labels
+
+    def _spying_labels(**kw):
+        counter_calls.append(kw)
+        return real_labels(**kw)
+
+    monkeypatch.setattr(sweep_module._failed_total, "labels", _spying_labels)
+
+    now = datetime.now(UTC)
+    # Both replicas' scan phase reclaimed the same orphan under this
+    # instance (mirrors run_once()'s reclaim step) so the row is RUNNING
+    # when _respawn's kill-switch branch fires for each racing call.
+    await store.reclaim(
+        run_id=run_id,
+        new_owner="sweeper",
+        lease_until=now + timedelta(seconds=30),
+        heartbeat_at=now,
+        now=now,
+    )
+    orphan = await store.get(run_id=run_id, tenant_id=tenant)
+    assert orphan is not None
+
+    await sweep._respawn(orphan)
+    await sweep._respawn(orphan)  # loses the CAS — row already INTERRUPTED
+
+    assert audit_calls == ["agent_disabled"]
+    assert counter_calls == [{"reason": "agent_disabled"}]
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
 async def test_no_agent_meta_marks_errored(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
     store = InMemoryRunStore()
