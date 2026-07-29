@@ -52,10 +52,12 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --images)
+            [[ $# -ge 2 && -n "$2" ]] || usage
             images="$2"
             shift 2
             ;;
         --tag)
+            [[ $# -ge 2 && -n "$2" ]] || usage
             tag="$2"
             shift 2
             ;;
