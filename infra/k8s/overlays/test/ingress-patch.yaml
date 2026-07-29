@@ -15,7 +15,7 @@ metadata:
     # expert-work-test.deepaihealth.com). Annotation name is best-effort
     # per Aliyun ALB ingress controller docs — confirm against the live
     # controller version before PR-2 applies this for real.
-    alb.ingress.kubernetes.io/cert-id: "TEST_PLACEHOLDER_CERT_ID"
+    alb.ingress.kubernetes.io/cert-id: "25878622-cn-hangzhou"
     # Long-lived SSE connections (Playground token streaming) want a
     # generous idle timeout. Per docs/superpowers/specs/2026-07-28-aliyun-
     # deployment-design.md line 43, the actual 3600s bump may need an
