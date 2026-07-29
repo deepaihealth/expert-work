@@ -15,9 +15,20 @@ resources:
 # literal value never reaches a cluster.
 images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newTag: TEST_DEPLOY_TAG_PLACEHOLDER
+    newTag: "23a3194e"
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newTag: TEST_DEPLOY_TAG_PLACEHOLDER
+    newTag: 23a3194e-test
+  # The cluster VPC cannot reach docker.io / quay.io (dial timeout — same
+  # constraint W0 hit with probe pods), so base's upstream keycloak and
+  # searxng images are remapped to ACR mirror copies pushed from a dev
+  # machine (docker pull upstream → tag → push; searxng's `latest` is
+  # pinned as a dated snapshot at mirror time).
+  - name: quay.io/keycloak/keycloak
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
+    newTag: "25.0"
+  - name: searxng/searxng
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
+    newTag: "2026-07-29"
 
 patches:
   - path: configmap-patch.yaml
