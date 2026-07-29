@@ -18,7 +18,7 @@ spec:
         - name: control-plane
           # Overlay pins the real tag; :latest here is a build-time
           # placeholder only (kustomize does not resolve/validate images).
-          image: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane:latest
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
           ports:
             - name: http
               containerPort: 8000

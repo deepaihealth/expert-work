@@ -18,7 +18,7 @@ spec:
         - name: admin-ui
           # Image built by W2-PR1 Task 2 (admin-ui containerization); tag
           # pinned per-overlay like control-plane.
-          image: registry.cn-hangzhou.aliyuncs.com/expert-work/admin-ui:latest
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui:latest
           ports:
             - name: http
               containerPort: 8080

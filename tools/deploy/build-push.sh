@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build (and optionally push) expert-work images to Aliyun ACR
-# (registry.cn-hangzhou.aliyuncs.com/expert-work namespace).
+# (crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work namespace).
 #
 # Two images:
 #   control-plane  services/control-plane/Dockerfile, context = repo root
@@ -37,7 +37,7 @@
 
 set -euo pipefail
 
-readonly REGISTRY="registry.cn-hangzhou.aliyuncs.com"
+readonly REGISTRY="crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com"
 readonly NAMESPACE="expert-work"
 readonly DEFAULT_IMAGES="control-plane,admin-ui"
 

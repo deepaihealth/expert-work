@@ -26,7 +26,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane:latest
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
           command: ["alembic", "-c", "/app/alembic/alembic.ini", "upgrade", "head"]
           env:
             - name: EXPERT_WORK_DB_URL

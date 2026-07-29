@@ -14,9 +14,9 @@ resources:
 # build-push.sh tags images this way) right before `kubectl apply`. This
 # literal value never reaches a cluster.
 images:
-  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/control-plane
+  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newTag: TEST_DEPLOY_TAG_PLACEHOLDER
-  - name: registry.cn-hangzhou.aliyuncs.com/expert-work/admin-ui
+  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
     newTag: TEST_DEPLOY_TAG_PLACEHOLDER
 
 patches:
