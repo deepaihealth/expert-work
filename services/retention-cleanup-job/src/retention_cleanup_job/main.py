@@ -63,6 +63,7 @@ async def _amain() -> None:
                         bucket=settings.object_store_bucket,
                         access_key=settings.object_store_access_key,
                         secret_key=settings.object_store_secret_key,
+                        addressing_style=settings.object_store_addressing_style,
                     ),
                 )
             )

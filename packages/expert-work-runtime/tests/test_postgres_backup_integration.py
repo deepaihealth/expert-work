@@ -101,7 +101,7 @@ def _minio_config(stack: DockerCompose) -> S3CompatibleConfig:
         bucket=os.environ.get("EXPERT_WORK_MINIO_BUCKET", "expert-work-dev"),
         access_key=os.environ.get("EXPERT_WORK_MINIO_ROOT_USER", "expert_work"),
         secret_key=os.environ.get("EXPERT_WORK_MINIO_ROOT_PASSWORD", "expert_work_dev_minio"),
-        use_path_style=True,
+        addressing_style="path",
     )
 
 

@@ -91,6 +91,7 @@ async def _amain(args: argparse.Namespace) -> int:
         access_key_ref=settings.object_store_access_key_ref,
         secret_key_ref=settings.object_store_secret_key_ref,
         secret_store=secret_store,
+        addressing_style=settings.object_store_addressing_style,
     )
 
     engine = create_async_engine_from_config(

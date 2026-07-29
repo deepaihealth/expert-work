@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 import httpx
@@ -1506,6 +1506,7 @@ async def resolve_object_store_config(
     access_key_ref: str | None,
     secret_key_ref: str | None,
     secret_store: SecretStore,
+    addressing_style: Literal["path", "virtual", "auto"] = "path",
 ) -> S3CompatibleConfig | None:
     """Build the S3 config for ``make_object_store`` (Stream J.6).
 
@@ -1513,6 +1514,11 @@ async def resolve_object_store_config(
     ``s3-compatible`` the endpoint URL + both ``secret://`` key
     references are required; the keys are resolved through the
     SecretStore. Missing fields fail fast with a clear error.
+
+    ``addressing_style`` defaults to ``"path"`` (MinIO local dev);
+    callers must pass ``Settings.object_store_addressing_style`` through
+    so OSS prod can request ``"virtual"`` (W0 real-bucket finding: OSS
+    rejects path-style addressing).
     """
     if backend != "s3-compatible":
         return None
@@ -1528,6 +1534,7 @@ async def resolve_object_store_config(
         bucket=bucket,
         access_key=await secret_store.get(parse_secret_ref(access_key_ref)),
         secret_key=await secret_store.get(parse_secret_ref(secret_key_ref)),
+        addressing_style=addressing_style,
     )
 
 

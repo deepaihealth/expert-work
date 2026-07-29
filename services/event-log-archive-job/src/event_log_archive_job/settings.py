@@ -36,7 +36,16 @@ class EventLogArchiveSettings(BaseSettings):
     s3_bucket: str = "expert-work-event-log-archive"
     s3_access_key: str = "expert_work"
     s3_secret_key: str = "expert_work_dev_minio"  # noqa: S105 — dev placeholder
+    #: Deprecated — superseded by ``s3_addressing_style``. Kept for env
+    #: back-compat: existing deployments setting this bool keep getting
+    #: the pre-migration ``"path" if true else "auto"`` behavior (see
+    #: ``effective_s3_addressing_style``).
     s3_use_path_style: bool = True
+    #: S3 addressing style — set explicitly to override the legacy bool
+    #: above. ``"path"`` for MinIO local dev, ``"virtual"`` for Aliyun OSS
+    #: prod (W0 real-bucket finding: OSS rejects path-style addressing).
+    #: ``None`` (default) falls back to the legacy bool for back-compat.
+    s3_addressing_style: Literal["path", "virtual", "auto"] | None = None
 
     # ------------------------------------------------------------------ tuning
     #: Rows older than this many days are archived. 180d ≈ subsystems/20's
@@ -45,3 +54,13 @@ class EventLogArchiveSettings(BaseSettings):
     #: Max ``(tenant, thread, month)`` groups processed per sweep — bounds
     #: how long one cron invocation runs.
     batch_size: int = Field(default=500, gt=0, le=100000)
+
+    @property
+    def effective_s3_addressing_style(self) -> Literal["path", "virtual", "auto"]:
+        """Explicit ``s3_addressing_style`` wins; otherwise derived from
+        the legacy ``s3_use_path_style`` bool (``True``→``"path"``,
+        ``False``→``"auto"`` — the pre-migration ternary in
+        ``factory.py``) so existing deployments keep working unchanged."""
+        if self.s3_addressing_style is not None:
+            return self.s3_addressing_style
+        return "path" if self.s3_use_path_style else "auto"

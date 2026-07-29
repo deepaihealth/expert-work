@@ -41,7 +41,7 @@ def _config(stack: DockerCompose) -> S3CompatibleConfig:
         bucket=bucket,
         access_key=user,
         secret_key=password,
-        use_path_style=True,
+        addressing_style="path",
     )
 
 

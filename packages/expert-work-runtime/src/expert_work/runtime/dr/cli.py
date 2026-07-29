@@ -93,7 +93,7 @@ async def _run(args: argparse.Namespace) -> int:
         bucket=args.storage_bucket,
         access_key=access_key,
         secret_key=secret_key,
-        use_path_style=True,
+        addressing_style="path",
     )
 
     engine = create_async_engine_from_config(DatabaseConfig(dsn=args.meta_dsn))

@@ -64,3 +64,23 @@ def test_invalid_auth_mode_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_health_check_timeout_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         Settings(health_check_timeout_s=0)
+
+
+def test_object_store_addressing_style_defaults_to_path() -> None:
+    """Default stays ``"path"`` — MinIO local dev keeps working unchanged."""
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.object_store_addressing_style == "path"
+
+
+def test_object_store_addressing_style_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE", "virtual")
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.object_store_addressing_style == "virtual"
+
+
+def test_object_store_addressing_style_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE", "wat")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]

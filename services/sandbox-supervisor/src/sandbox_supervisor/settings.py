@@ -172,4 +172,24 @@ class SandboxSupervisorSettings(BaseSettings):
     object_store_bucket: str = "expert-work-volume-backups"
     object_store_access_key: str = ""
     object_store_secret_key: str = ""
+    #: Deprecated — superseded by ``object_store_addressing_style``. Kept
+    #: for env back-compat: existing deployments setting this bool keep
+    #: getting the pre-migration ``"path" if true else "auto"`` behavior
+    #: (see ``effective_object_store_addressing_style``).
     object_store_use_path_style: bool = True
+    #: S3 addressing style — set explicitly to override the legacy bool
+    #: above. ``"path"`` for MinIO local dev, ``"virtual"`` for Aliyun OSS
+    #: prod (W0 real-bucket finding: OSS rejects path-style addressing).
+    #: ``None`` (default) falls back to the legacy bool for back-compat.
+    object_store_addressing_style: Literal["path", "virtual", "auto"] | None = None
+
+    @property
+    def effective_object_store_addressing_style(self) -> Literal["path", "virtual", "auto"]:
+        """Explicit ``object_store_addressing_style`` wins; otherwise
+        derived from the legacy ``object_store_use_path_style`` bool
+        (``True``→``"path"``, ``False``→``"auto"`` — the pre-migration
+        ternary in ``factory.py``) so existing deployments keep working
+        unchanged."""
+        if self.object_store_addressing_style is not None:
+            return self.object_store_addressing_style
+        return "path" if self.object_store_use_path_style else "auto"

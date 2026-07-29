@@ -245,7 +245,7 @@ def _build_object_store(
         bucket=settings.object_store_bucket,
         access_key=settings.object_store_access_key,
         secret_key=settings.object_store_secret_key,
-        use_path_style=settings.object_store_use_path_style,
+        addressing_style=settings.effective_object_store_addressing_style,
     )
     return make_object_store("s3-compatible", config)
 

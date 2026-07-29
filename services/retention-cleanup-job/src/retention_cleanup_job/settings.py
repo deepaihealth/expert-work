@@ -76,3 +76,8 @@ class RetentionCleanupSettings(BaseSettings):
     object_store_bucket: str = "expert-work"
     object_store_access_key: str | None = None
     object_store_secret_key: str | None = None
+    #: S3 addressing style. ``"path"`` (default) matches MinIO local dev.
+    #: 阿里云 OSS prod MUST use ``"virtual"`` — W0 real-bucket testing found
+    #: OSS rejects path-style addressing (``SecondLevelDomainForbidden``)
+    #: and does not reliably resolve ``"auto"`` to virtual-hosted style.
+    object_store_addressing_style: Literal["path", "virtual", "auto"] = "path"

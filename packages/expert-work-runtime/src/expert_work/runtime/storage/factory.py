@@ -27,8 +27,11 @@ class S3CompatibleConfig:
     """All knobs needed to point aiobotocore at an S3-compatible endpoint.
 
     For MinIO local dev: ``endpoint_url="http://localhost:9000"``,
-    ``use_path_style=True``. For Aliyun OSS prod: HTTPS endpoint,
-    ``use_path_style=False`` (OSS supports virtual-host style by default).
+    ``addressing_style="path"``. For Aliyun OSS prod: HTTPS endpoint,
+    ``addressing_style="virtual"`` — W0 real-bucket testing found OSS
+    *rejects* path-style addressing (``SecondLevelDomainForbidden``) and
+    botocore's ``"auto"`` does not reliably resolve to virtual-hosted style
+    against OSS, so OSS callers must request ``"virtual"`` explicitly.
     """
 
     endpoint_url: str
@@ -36,7 +39,7 @@ class S3CompatibleConfig:
     bucket: str
     access_key: str
     secret_key: str
-    use_path_style: bool = True
+    addressing_style: Literal["path", "virtual", "auto"] = "path"
 
 
 @contextlib.asynccontextmanager
@@ -82,8 +85,14 @@ async def _build_s3_store(
     from botocore.config import Config as BotoConfig
 
     boto_config = BotoConfig(
-        s3={"addressing_style": "path" if config.use_path_style else "auto"},
+        s3={"addressing_style": config.addressing_style},
         signature_version="s3v4",
+        # W0 real-bucket testing: OSS rejects botocore's default streaming
+        # checksum trailer on PutObject. ``when_required`` only computes /
+        # validates a checksum when the operation demands one — a no-op
+        # difference for MinIO / AWS, so this is safe unconditionally.
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
     )
 
     session = get_session()

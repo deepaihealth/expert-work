@@ -249,6 +249,11 @@ class Settings(BaseSettings):
     #: when ``object_store_backend`` is ``"s3-compatible"``.
     object_store_access_key_ref: str | None = None
     object_store_secret_key_ref: str | None = None
+    #: S3 addressing style. ``"path"`` (default) matches MinIO local dev.
+    #: 阿里云 OSS prod MUST use ``"virtual"`` — W0 real-bucket testing found
+    #: OSS rejects path-style addressing (``SecondLevelDomainForbidden``)
+    #: and does not reliably resolve ``"auto"`` to virtual-hosted style.
+    object_store_addressing_style: Literal["path", "virtual", "auto"] = "path"
 
     # ------------------------------------------------------------------ multimodal input (J.6)
     #: Per-image upload size cap (default 10 MiB) and per-run image count
