@@ -18,7 +18,7 @@ metadata:
   labels:
     app.kubernetes.io/name: keycloak
 spec:
-  serviceName: keycloak
+  serviceName: keycloak-headless
   replicas: 1
   selector:
     matchLabels:
@@ -35,9 +35,15 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: management
+              containerPort: 9000
           env:
             - name: KC_DB
               value: "postgres"
+            # Exposes /health/ready, /health/live on the management port
+            # (9000) below — required for the probes to resolve.
+            - name: KC_HEALTH_ENABLED
+              value: "true"
             - name: KC_DB_URL
               valueFrom:
                 secretKeyRef:
@@ -74,6 +80,31 @@ spec:
                 secretKeyRef:
                   name: keycloak-secrets
                   key: KEYCLOAK_ADMIN_PASSWORD
+          # Health endpoints live on the management port (9000), not the
+          # app port — KC_HEALTH_ENABLED above is what makes them exist.
+          # startupProbe gets a long budget (60 x 5s = 5min) because the
+          # realm import on first boot is slow; live/ready only take over
+          # once startup succeeds.
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - name: realm-import
               mountPath: /opt/keycloak/data/import/realm-expert-work.json

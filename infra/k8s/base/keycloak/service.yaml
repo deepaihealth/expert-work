@@ -1,7 +1,26 @@
 # Headless (clusterIP: None) — required as the StatefulSet's governing
-# serviceName for stable per-pod DNS. ALB ingress controllers route by
-# EndpointSlice/pod IP regardless of headless-ness, so this same Service
-# also works as the Ingress /auth backend.
+# serviceName for stable per-pod DNS. Not used as an Ingress backend:
+# ALB target-group registration needs real Endpoints with resolvable
+# ClusterIPs/ports, which a headless Service's DNS-only semantics don't
+# give it — see `keycloak` Service below for that.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-headless
+  labels:
+    app.kubernetes.io/name: keycloak
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Normal ClusterIP Service — this is the Ingress /auth backend
+# (ingress.yaml). Same pod selector as keycloak-headless above; two
+# Services, one StatefulSet.
 apiVersion: v1
 kind: Service
 metadata:
@@ -9,7 +28,6 @@ metadata:
   labels:
     app.kubernetes.io/name: keycloak
 spec:
-  clusterIP: None
   selector:
     app.kubernetes.io/name: keycloak
   ports:

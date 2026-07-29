@@ -26,17 +26,19 @@ spec:
             requests:
               cpu: 50m
               memory: 64Mi
-          # Generic static-file-server default; adjust the path once
-          # Task 2 defines the container's actual health surface.
+          # /healthz is the nginx health surface added by Task 2
+          # (apps/admin-ui/nginx.conf) — a plain 200, not the SPA
+          # fallback, so probes don't depend on index.html/JS bundle
+          # health.
           readinessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             periodSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             periodSeconds: 10
             failureThreshold: 3

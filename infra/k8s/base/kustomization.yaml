@@ -40,6 +40,15 @@ resources:
 # (verified byte-identical at commit time). Keep them in sync by hand
 # until a sync check / shared source lands — see task-3 report.
 configMapGenerator:
+  # !!! DEV CREDENTIALS IN THIS FILE — DO NOT SHIP AS-IS !!!
+  # realm-expert-work.json embeds plaintext dev secrets: the
+  # `expert-work-api-internal` client secret (`dev-internal-secret-rotate-me`)
+  # and dev user passwords. Any environment deployed from this base
+  # (including "test") MUST run the seed/rotate flow before going live —
+  # same one `infra/Makefile`'s `dev-seed-keycloak` target uses. A
+  # production overlay MUST NOT reuse this realm file unrotated; either
+  # rotate post-import or supply an overlay-specific realm export with
+  # real secrets.
   - name: keycloak-realm
     files:
       - realm-expert-work.json=keycloak/realm-expert-work.json
