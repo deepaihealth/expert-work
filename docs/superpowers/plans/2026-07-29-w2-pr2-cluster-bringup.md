@@ -25,7 +25,7 @@
 ## Phase A — 清单/镜像
 
 - [x] A1 假注解修正 + AlbConfig patch 文件入仓(commit 已做)
-- [ ] A2 镜像双推(main 树):
+- [x] A2 镜像双推(main 树):
   - control-plane:`tools/deploy/build-push.sh --images control-plane --tag <mainsha> --push`
   - admin-ui 环境专属:`--images admin-ui --tag <mainsha>-test --push
     --oidc-issuer https://expert-work-test.deepaihealth.com/kc/realms/expert-work
@@ -35,9 +35,9 @@
 
 ## Phase B — 数据面前置
 
-- [ ] B1 RDS 建 `keycloak` 库(经集群内 anolisos 探针 pod psql;owner=expert_work_dev,
+- [x] B1 RDS 建 `keycloak` 库(经集群内 anolisos 探针 pod psql;owner=expert_work_dev,
   测试环境不另立用户)
-- [ ] B2 secret 真值生成(全机器生成,用户零填):
+- [x] B2 secret 真值生成(全机器生成,用户零填):
   - `EXPERT_WORK_SECRET_ENCRYPTION_KEY` = `openssl rand -base64 32`
   - `EXPERT_WORK_APIKEY_RATE_LIMIT_HMAC_SALT` = `openssl rand -hex 32`
   - `EXPERT_WORK_SETUP_TOKEN` = `openssl rand -hex 32`
@@ -47,31 +47,31 @@
 
 ## Phase C — 部署
 
-- [ ] C1 `kubectl apply` namespace(base 携带)→ 建 3 个 Secret
+- [x] C1 `kubectl apply` namespace(base 携带)→ 建 3 个 Secret
   (`control-plane-secrets` / `keycloak-secrets` env 型;`control-plane-secret-files`
   --from-file dotenv 金库,配方在 overlays/test/secrets.env.example)
-- [ ] C2 `kustomize edit set image` 双 tag → `kubectl apply -k infra/k8s/overlays/test`
-- [ ] C3 migrate Job 完成(Job immutable:后续重发布 delete-then-create;ConfigMap 无 hash,
+- [x] C2 `kustomize edit set image` 双 tag → `kubectl apply -k infra/k8s/overlays/test`
+- [x] C3 migrate Job 完成(Job immutable:后续重发布 delete-then-create;ConfigMap 无 hash,
   改配置须 `kubectl rollout restart`)
-- [ ] C4 Keycloak ready(startupProbe 5min 预算,首次 realm import 慢)
+- [x] C4 Keycloak ready(startupProbe 5min 预算,首次 realm import 慢)
 
 ## Phase D — Keycloak 初始化
 
-- [ ] D1 kcadm:`expert-work-admin-ui` client 追加 redirectUris/webOrigins
+- [x] D1 kcadm:`expert-work-admin-ui` client 追加 redirectUris/webOrigins
   `https://expert-work-test.deepaihealth.com/*`;realm unmanagedAttributePolicy=ENABLED
-- [ ] D2 (与 F 后)setup wizard 走 SETUP_TOKEN 建首租户
+- [x] D2 (与 F 后)setup wizard 走 SETUP_TOKEN 建首租户
 
 ## Phase E — 入口
 
-- [ ] E1 AlbConfig merge patch(443 + 证书 + 超时)
-- [ ] E2 Ingress 分到 ALB(status.address 出现)
-- [ ] E3 **用户动作**:DNS CNAME `expert-work-test` →
+- [x] E1 AlbConfig merge patch(443 + 证书 + 超时)
+- [x] E2 Ingress 分到 ALB(status.address 出现)
+- [x] E3 **用户动作**:DNS CNAME `expert-work-test` →
   `alb-cv3xokwot6r9bgojzx.cn-hangzhou.alb.aliyuncsslb.com`
 
 ## Phase F — 验证(DNS 生效前用 `curl --resolve` 提前跑)
 
-- [ ] F1 `/.well-known/openid-configuration` issuer 逐字节 ==
+- [x] F1 `/.well-known/openid-configuration` issuer 逐字节 ==
   `https://expert-work-test.deepaihealth.com/kc/realms/expert-work`
-- [ ] F2 `/v1/healthz` 200;admin-ui `/` 出 SPA;`/kc` 出 Keycloak
+- [x] F2 `/v1/healthz` 200;admin-ui `/` 出 SPA;`/kc` 出 Keycloak
 - [ ] F3 冒烟(需用户):OIDC 登录 → setup → 后台粘 LLM key → 建 agent 跑 run;
   SSE 长流看 ALB 是否 180s 砍(砍则工单)
