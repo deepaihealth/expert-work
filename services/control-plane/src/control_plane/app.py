@@ -2075,6 +2075,11 @@ def create_app(
     app.state.lifecycle = resolved_lifecycle
     # ``AsyncEngine`` in ``sql`` mode, ``None`` in ``memory`` mode (ADR B-6).
     app.state.db_engine = sql_stores.engine if sql_stores else None
+    # W1-PR2 Task 4 — per-tenant advisory-lock critical sections
+    # (``_tenant_resource_lock.py``) read this off app.state; ``None`` in
+    # ``memory`` mode degrades the lock to a no-op (single process, no
+    # cross-replica race to guard against).
+    app.state.session_factory = sql_stores.session_factory if sql_stores else None
     app.state.health_provider = health_provider
     app.state.rate_limiter = resolved_limiter
     app.state.mcp_probe_limiter = resolved_mcp_probe_limiter

@@ -22,7 +22,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane._tenant_resource_lock import tenant_resource_lock
 from control_plane.audit import emit
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
@@ -145,6 +147,10 @@ def _get_secret_store(request: Request) -> SecretStore:
     return request.app.state.secret_store  # type: ignore[no-any-return]
 
 
+def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession] | None:
+    return request.app.state.session_factory  # type: ignore[no-any-return]
+
+
 def build_webhook_endpoints_router() -> APIRouter:
     """HX-9 — authenticated outbound webhook endpoint CRUD."""
     router = APIRouter(prefix="/v1/webhook-endpoints", tags=["webhook-endpoints"])
@@ -157,53 +163,61 @@ def build_webhook_endpoints_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         settings: Annotated[Settings, Depends(_get_settings)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
+        session_factory: Annotated[
+            async_sessionmaker[AsyncSession] | None, Depends(_get_session_factory)
+        ],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
         _validate_url(body.url)
         event_types = _validate_event_types(body.event_types)
 
-        existing = await store.count_by_tenant(tenant_id=tenant_id)
-        if existing >= settings.max_webhook_endpoints_per_tenant:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    "webhook endpoint quota exhausted "
-                    f"(max {settings.max_webhook_endpoints_per_tenant} per tenant)"
-                ),
-            )
+        # Task 4 — count-then-insert is TOCTOU-vulnerable across replicas;
+        # the whole check + insert is one per-tenant advisory-locked
+        # critical section so two replicas can't both pass the count check
+        # and both insert, overshooting the cap.
+        async with tenant_resource_lock(session_factory, tenant_id, "webhook_endpoint"):
+            existing = await store.count_by_tenant(tenant_id=tenant_id)
+            if existing >= settings.max_webhook_endpoints_per_tenant:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "webhook endpoint quota exhausted "
+                        f"(max {settings.max_webhook_endpoints_per_tenant} per tenant)"
+                    ),
+                )
 
-        # HMAC signing secret: stored in the SecretStore (encrypted at rest);
-        # the row holds only a ref. The plaintext is returned once here and
-        # never again (Mini-ADR HX-J5). The delivery worker resolves the ref
-        # to sign outbound requests.
-        endpoint_id = uuid4()
-        secret = secrets.token_urlsafe(32)
-        secret_ref = _secret_ref(endpoint_id)
-        await secret_store.put(secret_ref, secret)
-        now = datetime.now(UTC)
-        record = WebhookEndpointRecord(
-            id=endpoint_id,
-            tenant_id=tenant_id,
-            user_id=None,
-            name=body.name,
-            url=body.url,
-            event_types=event_types,
-            agent_name=body.agent_name,
-            secret_ref=secret_ref,
-            enabled=True,
-            source="api",
-            payload_format=body.payload_format,
-            created_at=now,
-            updated_at=now,
-        )
-        try:
-            await store.create(record)
-        except (ValueError, IntegrityError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=f"webhook endpoint {body.name!r} already exists for this tenant",
-            ) from exc
+            # HMAC signing secret: stored in the SecretStore (encrypted at
+            # rest); the row holds only a ref. The plaintext is returned once
+            # here and never again (Mini-ADR HX-J5). The delivery worker
+            # resolves the ref to sign outbound requests.
+            endpoint_id = uuid4()
+            secret = secrets.token_urlsafe(32)
+            secret_ref = _secret_ref(endpoint_id)
+            await secret_store.put(secret_ref, secret)
+            now = datetime.now(UTC)
+            record = WebhookEndpointRecord(
+                id=endpoint_id,
+                tenant_id=tenant_id,
+                user_id=None,
+                name=body.name,
+                url=body.url,
+                event_types=event_types,
+                agent_name=body.agent_name,
+                secret_ref=secret_ref,
+                enabled=True,
+                source="api",
+                payload_format=body.payload_format,
+                created_at=now,
+                updated_at=now,
+            )
+            try:
+                await store.create(record)
+            except (ValueError, IntegrityError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"webhook endpoint {body.name!r} already exists for this tenant",
+                ) from exc
 
         await emit(
             audit,
