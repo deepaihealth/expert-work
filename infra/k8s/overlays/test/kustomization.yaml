@@ -30,6 +30,15 @@ images:
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
     newTag: "2026-07-29"
 
+# Replaces base's vendored searxng settings with the mainland-engine-only
+# variant — the cluster VPC cannot reach the upstream default engines
+# (google/ddg/wikipedia); see searxng-settings-cn.yml's header.
+configMapGenerator:
+  - name: searxng-settings
+    behavior: replace
+    files:
+      - settings.yml=searxng-settings-cn.yml
+
 patches:
   - path: configmap-patch.yaml
   - path: ingress-patch.yaml
