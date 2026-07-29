@@ -38,6 +38,8 @@ from typing import Literal
 
 from langgraph.store.base import BaseStore
 
+from expert_work.runtime._setup_retry import setup_with_retry
+
 logger = logging.getLogger(__name__)
 
 StoreBackend = Literal["memory", "postgres"]
@@ -74,7 +76,7 @@ async def make_store(
         from langgraph.store.postgres.aio import AsyncPostgresStore
 
         async with AsyncPostgresStore.from_conn_string(dsn) as store:
-            await store.setup()
+            await setup_with_retry(store)
             logger.info("store.postgres.ready")
             yield store
         return

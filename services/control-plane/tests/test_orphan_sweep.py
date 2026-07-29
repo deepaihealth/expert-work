@@ -27,8 +27,8 @@ from expert_work.runtime.runs import InMemoryRunStore, RunInfo, RunManager, RunS
 from expert_work.runtime.runs.schemas import DisconnectMode
 
 
-def _run_info(*, run_id, tenant, thread, status=RunStatus.RUNNING) -> RunInfo:
-    now = datetime.now(UTC)
+def _run_info(*, run_id, tenant, thread, status=RunStatus.RUNNING, created_at=None) -> RunInfo:
+    now = created_at or datetime.now(UTC)
     return RunInfo(
         run_id=run_id,
         tenant_id=tenant,
@@ -333,6 +333,112 @@ async def test_kill_switch_second_call_skips_audit_and_counter(
     assert counter_calls == [{"reason": "agent_disabled"}]
     row = await store.get(run_id=run_id, tenant_id=tenant)
     assert row is not None and row.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_pending_sweep_fails_stale_pending_and_spares_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1-PR3 Task 1 — a PENDING run whose owner crashed in the
+    create→RUNNING window (before ever stamping a lease) never shows up in
+    ``list_orphans`` (that scan only looks at running + expired lease);
+    ``run_once`` must also sweep stale PENDING rows via
+    ``list_stale_pending``, reusing ``_fail_orphan``'s CAS + audit."""
+    monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    sweep = _sweep(store, runtime)
+
+    now = datetime.now(UTC)
+    stale_id, stale_tenant, stale_thread = uuid4(), uuid4(), uuid4()
+    await store.create(
+        _run_info(
+            run_id=stale_id,
+            tenant=stale_tenant,
+            thread=stale_thread,
+            status=RunStatus.PENDING,
+            created_at=now - timedelta(seconds=sweep_module._PENDING_STALE_S + 60),
+        )
+    )
+    fresh_id, fresh_tenant, fresh_thread = uuid4(), uuid4(), uuid4()
+    await store.create(
+        _run_info(
+            run_id=fresh_id,
+            tenant=fresh_tenant,
+            thread=fresh_thread,
+            status=RunStatus.PENDING,
+            created_at=now,
+        )
+    )
+
+    handled = await sweep.run_once()
+    assert handled == 1
+
+    stale_row = await store.get(run_id=stale_id, tenant_id=stale_tenant)
+    assert stale_row is not None
+    assert stale_row.status is RunStatus.ERROR
+    assert stale_row.error == "orphaned run failover: stale_pending"
+
+    fresh_row = await store.get(run_id=fresh_id, tenant_id=fresh_tenant)
+    assert fresh_row is not None
+    assert fresh_row.status is RunStatus.PENDING  # untouched — inside the normal window
+
+    # A second sweep pass sees the (now ERROR) row filtered out by the
+    # status='pending' predicate — no re-processing, no duplicate audit.
+    handled_again = await sweep.run_once()
+    assert handled_again == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_sweep_cas_loser_is_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two replicas' sweep loops racing the same stale-PENDING row (both
+    scanned it while it was still PENDING) must not double-audit or
+    double-count — same CAS shape as
+    ``test_fail_orphan_second_call_skips_audit_and_counter``, exercised via
+    the ``stale_pending`` reason."""
+    monkeypatch.setattr(sweep_module, "run_agent", lambda **kw: None)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    sweep = _sweep(store, runtime)
+
+    now = datetime.now(UTC)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await store.create(
+        _run_info(
+            run_id=run_id,
+            tenant=tenant,
+            thread=thread,
+            status=RunStatus.PENDING,
+            created_at=now - timedelta(seconds=sweep_module._PENDING_STALE_S + 60),
+        )
+    )
+
+    audit_calls: list[str] = []
+
+    async def _fake_emit_audit(_orphan, *, result, reason):
+        del result
+        audit_calls.append(reason)
+
+    monkeypatch.setattr(sweep, "_emit_audit", _fake_emit_audit)
+
+    counter_calls: list[dict[str, str]] = []
+    real_labels = sweep_module._failed_total.labels
+
+    def _spying_labels(**kw):
+        counter_calls.append(kw)
+        return real_labels(**kw)
+
+    monkeypatch.setattr(sweep_module._failed_total, "labels", _spying_labels)
+
+    # Both replicas' scan phase observed the same still-PENDING snapshot.
+    pending = (await store.list_stale_pending(cutoff=now, limit=10))[0]
+    await sweep._fail_orphan(pending, now=now, reason="stale_pending")
+    await sweep._fail_orphan(pending, now=now, reason="stale_pending")  # loses the CAS
+
+    assert audit_calls == ["stale_pending"]
+    assert counter_calls == [{"reason": "stale_pending"}]
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.status is RunStatus.ERROR
 
 
 @pytest.mark.asyncio

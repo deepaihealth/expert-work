@@ -68,6 +68,14 @@ _failed_total = expert_work_counter(
 
 _DEFAULT_MAX_RECLAIMS = 3
 
+#: W1-PR3 Task 1 — how long a run may sit PENDING before the sweep treats it
+#: as stuck. The synchronous SSE path's create→RUNNING transition is a
+#: milliseconds-scale in-process step (``RunStatus.PENDING`` docstring); a
+#: row still PENDING past this many seconds means its owning replica
+#: crashed inside that window before ever stamping a lease. 600s is far
+#: past any normal window, so this never fires on a healthy run.
+_PENDING_STALE_S = 600
+
 
 @contextmanager
 def _bypass_rls() -> Iterator[None]:
@@ -171,6 +179,28 @@ class OrphanSweep:
                     handled += 1
             except Exception:
                 logger.exception("orphan_sweep.handle_failed", extra={"run_id": str(orphan.run_id)})
+
+        # W1-PR3 Task 1 — a run whose owner crashed in the create→RUNNING
+        # window (before ever stamping a lease) never shows up in the
+        # ``list_orphans`` scan above (running + expired lease only). It's
+        # otherwise stuck PENDING forever — and blocks its thread's external
+        # plan writes forever too (``_WRITE_BLOCKED_STATUSES``). The run
+        # never started, so there is nothing to resume: fail it straight
+        # through the existing reused CAS guard, same as the conservative
+        # orphan path.
+        cutoff = now - timedelta(seconds=_PENDING_STALE_S)
+        with _bypass_rls():
+            stale_pending = await self._runs.list_stale_pending(
+                cutoff=cutoff, limit=self._batch_size
+            )
+        for pending in stale_pending:
+            try:
+                await self._fail_orphan(pending, now=now, reason="stale_pending")
+                handled += 1
+            except Exception:
+                logger.exception(
+                    "orphan_sweep.handle_failed", extra={"run_id": str(pending.run_id)}
+                )
         return handled
 
     async def _handle_orphan(self, orphan: RunInfo, *, now: datetime) -> bool:

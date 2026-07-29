@@ -36,51 +36,11 @@ from typing import Any, Literal
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from expert_work.runtime._setup_retry import setup_with_retry
+
 logger = logging.getLogger(__name__)
 
 CheckpointerBackend = Literal["memory", "postgres"]
-
-# Replicas that start at the same time (dev compose brings the blue + green
-# control-plane pair up together; a rolling deploy can briefly overlap them)
-# all call ``AsyncPostgresSaver.setup()`` at once. LangGraph's first-run setup
-# is NOT concurrency-safe — two ``CREATE TYPE`` race and the loser fails with
-# ``duplicate key value violates unique constraint "pg_type_typname_nsp_index"``
-# (or a transient ``DeadlockDetected``). setup() is idempotent *across* runs,
-# though: once the winner has created + recorded a migration, a re-run skips it.
-# So we simply retry on those concurrency errors until the loser sees the
-# winner's objects already present. Bounded; re-raises anything else / on exhaust.
-_SETUP_MAX_ATTEMPTS = 8
-_SETUP_RETRY_BASE_DELAY_S = 0.1
-
-
-async def _setup_with_retry(saver: Any) -> None:
-    """Run ``saver.setup()``, retrying transient concurrent-DDL collisions.
-
-    Two replicas calling first-run setup at once race ``CREATE TYPE`` /
-    ``CREATE TABLE``; the loser raises a uniqueness/duplicate or deadlock
-    error. setup() is idempotent across runs, so the loser just retries until
-    it observes the winner's objects. Any other error (or running out of
-    attempts) propagates.
-    """
-    import asyncio
-
-    import psycopg.errors
-
-    transient = (
-        psycopg.errors.UniqueViolation,
-        psycopg.errors.DuplicateObject,
-        psycopg.errors.DuplicateTable,
-        psycopg.errors.DeadlockDetected,
-    )
-    for attempt in range(_SETUP_MAX_ATTEMPTS):
-        try:
-            await saver.setup()
-            return
-        except transient:
-            if attempt == _SETUP_MAX_ATTEMPTS - 1:
-                raise
-            logger.info("checkpointer.postgres.setup_retry attempt=%d", attempt + 1)
-            await asyncio.sleep(_SETUP_RETRY_BASE_DELAY_S * (attempt + 1))
 
 
 @contextlib.asynccontextmanager
@@ -121,7 +81,7 @@ async def make_checkpointer(
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
         async with AsyncPostgresSaver.from_conn_string(dsn) as saver:
-            await _setup_with_retry(saver)
+            await setup_with_retry(saver)
             logger.info("checkpointer.postgres.ready")
             yield TimingCheckpointSaver(saver)
         return
