@@ -13,6 +13,16 @@ data:
   EXPERT_WORK_ENV: "staging"
   EXPERT_WORK_AUTH_MODE: "prod"
   EXPERT_WORK_KEYCLOAK_ENABLED: "true"
+  # sql_encrypted, NOT base's local_dev: local_dev's put() writes process
+  # memory, so with 2 replicas a key pasted via the admin UI lands in ONE
+  # pod and every run routed to the other 500s with SecretNotFound (found
+  # live at PR-2 smoke — the classic single-process assumption). The
+  # encrypted vault stores in Postgres (KEK = EXPERT_WORK_SECRET_
+  # ENCRYPTION_KEY), shared across replicas. Platform secrets (OSS AK/SK,
+  # keycloak admin-client secret) are seeded once via
+  # control_plane.seed_keycloak_secret + an inline put — see the PR-2
+  # runbook.
+  EXPERT_WORK_SECRET_STORE_BACKEND: "sql_encrypted"
   # In-cluster Keycloak admin/token calls — must carry the /kc relative
   # path (KC_HTTP_RELATIVE_PATH in keycloak/statefulset.yaml); the code
   # default is bare http://keycloak:8080 which 404s (HTML → JSON decode
