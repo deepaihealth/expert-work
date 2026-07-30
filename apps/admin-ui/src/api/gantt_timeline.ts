@@ -227,12 +227,17 @@ export function buildGanttRows(
     detail: r.detail,
   }));
 
-  // settle 后末步即终结步(与 #1072 final 语义对齐)— relabel the last
-  // agent-kind row, if any.
+  // settle 后末步即终结步(与 #1072 final 语义对齐:api/turn_summary.ts
+  // 只有"末条且不带 tool_calls"才是 final)— relabel the last agent-kind
+  // row only when it carries no tool calls; a settled run whose last step
+  // dispatched tools (guard/error/max_steps 中断在工具调用后) stays "agent",
+  // not a false "终结步".
   if (opts?.settled === true) {
     for (let i = rows.length - 1; i >= 0; i -= 1) {
       if (rows[i].kind === "agent") {
-        rows[i] = { ...rows[i], kind: "final" };
+        const d = rows[i].detail;
+        const noToolCalls = d.type === "item" && d.item.kind === "agent" && d.item.tools.length === 0;
+        if (noToolCalls) rows[i] = { ...rows[i], kind: "final" };
         break;
       }
     }

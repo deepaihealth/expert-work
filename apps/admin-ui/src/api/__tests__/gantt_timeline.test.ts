@@ -145,6 +145,23 @@ const fx = {
     ev("error", { message: "boom" }, 1600),
     ev("end", {}, 1700),
   ] satisfies SseEvent[],
+
+  // A settled turn whose last agent step dispatched a tool call (e.g. the
+  // run was cut off by a guard/error/max_steps interrupt right after a tool
+  // call) — the last agent row must NOT be relabeled "final" (#1072 final
+  // channel semantics: only a tool-call-free last step is terminal).
+  settledRunEndsWithTool: [
+    upd("agent", agentChannel(1, 500), 1000),
+    upd("agent", agentChannel(2, 700, [{ id: "c1", name: "tool_a" }]), 2000),
+    toolResult("c1", "tool_a", 300, 2300),
+  ] satisfies SseEvent[],
+
+  // One agent step dispatching a tool call whose RESULT frame hasn't
+  // arrived yet — the call stays "pending". A pending call is not a data
+  // anomaly (it just hasn't finished), so it must not flip `degraded`.
+  pendingTool: [
+    upd("agent", agentChannel(1, 500, [{ id: "c1", name: "tool_a" }]), 1000),
+  ] satisfies SseEvent[],
 };
 
 describe("buildGanttRows", () => {
@@ -196,5 +213,20 @@ describe("buildGanttRows", () => {
     const m = buildGanttRows(fx.withMarkers);
     expect(m.rows).toHaveLength(1); // only the one agent step — markers never become rows
     expect(m.markers.map((mk) => mk.kind)).toEqual(["retry", "error", "end"]);
+  });
+
+  it("settled 但末条 agent 步带 tool_calls → kind 仍 agent(非 final)", () => {
+    const m = buildGanttRows(fx.settledRunEndsWithTool, { settled: true });
+    const agentLike = m.rows.filter((r) => r.kind === "agent" || r.kind === "final");
+    expect(agentLike).toHaveLength(2);
+    expect(agentLike[1].kind).toBe("agent");
+  });
+
+  it("pending 工具(RESULT 未到)不计入 degraded,其行 durationMs=null", () => {
+    const m = buildGanttRows(fx.pendingTool);
+    expect(m.degraded).toBe(false);
+    const tool = m.rows.find((r) => r.kind === "tool");
+    expect(tool).toBeDefined();
+    expect(tool?.durationMs).toBeNull();
   });
 });
