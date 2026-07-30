@@ -76,6 +76,34 @@ import type { Turn } from "./types";
 
 const { Text } = Typography;
 
+/** A commentary-channel line — the de-emphasised icon + secondary-text +
+ *  240-char clamp rendering shared by the live answer block and the
+ *  historical-turn fallback branch (spec 2026-07-30, Important#1/Minor#3:
+ *  keeps the two rendering sites byte-identical instead of hand-copied). */
+function CommentarySegmentLine({
+  text,
+  label,
+}: {
+  text: string;
+  label: string;
+}) {
+  return (
+    <div
+      style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 6 }}
+      data-testid="turn-segment-commentary"
+    >
+      <MessageSquareText
+        size={12}
+        style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }}
+        aria-label={label}
+      />
+      <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
+        {text.length > 240 ? `${text.slice(0, 240)}…` : text}
+      </Text>
+    </div>
+  );
+}
+
 // A just-finished run's Langfuse trace lands as `not_ready` for a moment
 // (ingestion isn't atomic — the root closes before its child observations
 // land). Auto-poll a few times so the waterfall appears without a manual
@@ -518,28 +546,33 @@ export function TurnCard({
           {turn.input}
         </div>
         {fallbackLines && fallbackLines.length > 0 ? (
-          <div style={{ maxHeight: 420, overflowY: "auto" }}>
-            {fallbackLines.map((l, i) =>
-              l.channel === "commentary" ? (
-                <div
-                  key={i}
-                  style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 6 }}
-                  data-testid="turn-segment-commentary"
-                >
-                  <MessageSquareText
-                    size={12}
-                    style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }}
-                    aria-label={t("playground.segment_commentary")}
+          <>
+            <div style={{ maxHeight: 420, overflowY: "auto" }}>
+              {fallbackLines.map((l, i) =>
+                l.channel === "commentary" ? (
+                  <CommentarySegmentLine
+                    key={i}
+                    text={l.text}
+                    label={t("playground.segment_commentary")}
                   />
-                  <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
-                    {l.text.length > 240 ? `${l.text.slice(0, 240)}…` : l.text}
-                  </Text>
-                </div>
-              ) : (
-                <MarkdownView key={i}>{l.text}</MarkdownView>
-              ),
-            )}
-          </div>
+                ) : (
+                  <MarkdownView key={i}>{l.text}</MarkdownView>
+                ),
+              )}
+            </div>
+            {/* Important#1 — a commentary line clamps to 240 chars above with
+                no other way to read the rest; a replay that never lands
+                (fallback is permanent, not "until the timeline loads") must
+                not leave long narration permanently truncated. */}
+            <FullTextTrigger
+              onClick={() =>
+                setFullText({
+                  title: t("playground.view_full_text"),
+                  text: fallbackLines.map((l) => l.text).join("\n\n"),
+                })
+              }
+            />
+          </>
         ) : null}
         {loadState !== "error" ? (
           <div
@@ -549,6 +582,7 @@ export function TurnCard({
             <span>{t("playground.history_loading")}</span>
           </div>
         ) : null}
+        <FullTextModal state={fullText} onClose={() => setFullText(null)} />
       </div>
     );
   }
@@ -624,16 +658,11 @@ export function TurnCard({
                   turn.status === "running" ? !isLast : seg.channel === "commentary";
                 if (asCommentary) {
                   return (
-                    <div
+                    <CommentarySegmentLine
                       key={i}
-                      style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 6 }}
-                      data-testid="turn-segment-commentary"
-                    >
-                      <MessageSquareText size={12} style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }} aria-label={t("playground.segment_commentary")} />
-                      <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
-                        {seg.text.length > 240 ? `${seg.text.slice(0, 240)}…` : seg.text}
-                      </Text>
-                    </div>
+                      text={seg.text}
+                      label={t("playground.segment_commentary")}
+                    />
                   );
                 }
                 return turn.status === "running" ? (

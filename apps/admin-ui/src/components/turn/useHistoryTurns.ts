@@ -11,7 +11,7 @@
  *      and the caller renders the flat ``messages`` block.
  *   2. ``getSessionMessages`` failed → both cleared (nothing to show).
  *   3. A row's replay failed / delivered nothing → that turn's load state is
- *      ``error`` and its ``TurnCard`` keeps the flat ``fallbackAnswer``.
+ *      ``error`` and its ``TurnCard`` keeps the flat ``fallbackLines``.
  *   4. A newer ``load()`` superseded this one → the stale result is dropped.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -159,7 +159,7 @@ export function useHistoryTurns(): UseHistoryTurns {
       // lone ``[{event:"end"}]``. Only mark ``done`` when the replay actually
       // delivered renderable content AND completed; an empty replay
       // (no non-end frame) or a truncated one (no end frame) degrades to
-      // ``error`` — which keeps the placeholder showing ``fallbackAnswer``
+      // ``error`` — which keeps the placeholder showing ``fallbackLines``
       // (the /messages text we already have) instead of the full render's
       // "no text" empty state. 不丢已有内容。
       const sawEnd = collected.some((f) => f.event === "end");

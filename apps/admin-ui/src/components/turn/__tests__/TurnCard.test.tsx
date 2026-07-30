@@ -166,6 +166,27 @@ describe("TurnCard (read-only)", () => {
     expect(screen.queryByTestId("step-timeline")).not.toBeInTheDocument();
   });
 
+  // Important#1 — a fallback commentary line clamps to 240 chars with no
+  // other way to read the rest (the replay that would normally render the
+  // full segment never lands in this mode). The FullTextTrigger must open
+  // the modal with the complete, unclamped text.
+  it("fallback commentary line clamps to 240 chars but its FullTextTrigger opens the full text", () => {
+    const longText = "旁白内容".repeat(80); // 320 chars, well past the 240 clamp
+    renderCard({
+      readOnly: true,
+      loadState: "loading",
+      fallbackLines: [{ text: longText, channel: "commentary" }],
+      turn: makeTurn({ events: [] }),
+    });
+
+    const commentary = screen.getByTestId("turn-segment-commentary");
+    expect(commentary).toHaveTextContent(`${longText.slice(0, 240)}…`);
+    expect(commentary.textContent?.length ?? 0).toBeLessThan(longText.length);
+
+    fireEvent.click(screen.getByTestId("full-text-trigger"));
+    expect(screen.getByTestId("full-text-modal")).toHaveTextContent(longText);
+  });
+
   it("hides the approval gate and the feedback bar in read-only mode", () => {
     renderCard({
       readOnly: true,
