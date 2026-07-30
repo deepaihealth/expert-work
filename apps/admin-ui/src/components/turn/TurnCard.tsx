@@ -423,10 +423,40 @@ export function TurnCard({
   // the `eventView === "timeline"` branch below), not per-row.
   const renderGanttDetail = useCallback(
     (row: GanttRow) => (
-      <StepTimeline items={[row.detail.item]} onFireResult={onFireResult} />
+      <StepTimeline items={[row.detail.item]} onFireResult={onFireResult} hideLegend />
     ),
     [onFireResult],
   );
+  // C1 fix (Critical, gantt-execution-timeline review) — `StepTimeline`
+  // derives its own `settled` step-number set solely from the `items` array
+  // it's handed (see StepTimeline.tsx); the sibling `StepTimeline` call below
+  // passes `items={[]}` by design (the Gantt itself renders every settled
+  // step; this call exists only to surface the still-streaming typewriter),
+  // so THAT internal `settled` set is always empty. `useTokenStream`
+  // accumulates `liveByStep` per step and never clears a step's buffer once
+  // it settles — by design, it documents the consuming render filtering it
+  // out via `settled`. An always-empty `settled` set defeats that filter: an
+  // already-settled step's stale buffer renders forever as a duplicate
+  // "streaming" (or, once `finalized`, falsely "interrupted") card next to
+  // its own real Gantt row. Compute the settled step-number set here — from
+  // the same `timeline` parse already built above, i.e. exactly what
+  // `StepTimeline` would compute were it handed the full item list — and
+  // filter `liveByStep` before handing it down.
+  const settledSteps = useMemo(() => {
+    const s = new Set<number>();
+    for (const it of timeline) {
+      if (it.kind === "agent" && it.stepCount !== null) s.add(it.stepCount);
+    }
+    return s;
+  }, [timeline]);
+  const unsettledLiveByStep = useMemo(() => {
+    if (!liveByStep) return liveByStep;
+    const filtered = new Map<number, LiveStep>();
+    for (const [step, live] of liveByStep) {
+      if (!settledSteps.has(step)) filtered.set(step, live);
+    }
+    return filtered;
+  }, [liveByStep, settledSteps]);
   // Task 11 — RunStatusBanner status for the timeline view, derived from
   // this turn's own SSE-parsed items (NOT Langfuse level, unlike the exact
   // view's traceBanner below).
@@ -1088,14 +1118,20 @@ export function TurnCard({
                       streaming step (it has no settled row yet, so it never
                       appears in `ganttModel.rows`); without this, switching
                       to the "timeline" view during a live run showed no
-                      typewriter at all. `items={[]}` renders nothing but the
-                      still-unsettled live cards (probe-verified) — settled
-                      steps stay Gantt-only, never duplicated here. */}
+                      typewriter at all. `items={[]}` renders nothing but live
+                      cards — settled steps stay Gantt-only, never duplicated
+                      here, because `liveByStep` is pre-filtered to only the
+                      unsettled steps above (see the C1-fix `settledSteps` /
+                      `unsettledLiveByStep` memos): `StepTimeline`'s own
+                      internal `settled` set is always empty here (it's
+                      computed from `items`, which is always `[]` at this call
+                      site), so the filtering has to happen on the way in. */}
                   <StepTimeline
                     items={[]}
-                    liveByStep={liveByStep}
+                    liveByStep={unsettledLiveByStep}
                     ttftMs={ttftMs}
                     finalized={finalized}
+                    hideLegend
                   />
                 </>
               ) : eventView === "exact" ? (

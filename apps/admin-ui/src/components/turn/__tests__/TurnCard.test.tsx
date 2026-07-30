@@ -15,6 +15,7 @@ import { TurnCard } from "../TurnCard";
 import type { Turn } from "../types";
 import type { ApprovalItem } from "../../../api/approvals";
 import type { SseEvent } from "../../../api/sessions";
+import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 
 /** A replayed run: run metadata → one agent step calling ``search`` → the
  *  tool's result → the final answer → terminal frame. */
@@ -574,5 +575,88 @@ describe("TurnCard timeline view → Gantt (Task 3)", () => {
     const finalBar = screen.getByTestId("gantt-bar-item-1");
     expect(finalBar.style.left).toBe("93.75%");
     expect(finalBar.style.width).toBe("6.25%");
+  });
+});
+
+/** Critical (gantt-execution-timeline review) — the Gantt view's sibling
+ *  `StepTimeline` call (the one that surfaces the live typewriter alongside
+ *  the Gantt axis) passes `items={[]}`, so `StepTimeline`'s own internal
+ *  `settled` set (computed only from `items`) is always empty there.
+ *  `useTokenStream`'s `liveByStep` accumulates per step and never clears a
+ *  step's buffer once it settles — by design, it relies on the consumer
+ *  filtering via `settled`. Before the fix, that meant an already-settled
+ *  step's stale live buffer rendered forever, duplicating its own real Gantt
+ *  row (and, once `finalized`, painting it "interrupted" even though it
+ *  finished normally). `TurnCard` now pre-filters `liveByStep` against the
+ *  settled step numbers found in its own `parseTimeline` result before
+ *  handing it to the sibling `StepTimeline`. */
+describe("TurnCard live typewriter — settled-step filtering (Critical, gantt-execution-timeline review)", () => {
+  function liveStep(content: string): LiveStep {
+    return { content, reasoning: "", toolNames: new Map(), reasoningMs: null };
+  }
+
+  /** One agent step (`step_count: 1`) whose authoritative content has
+   *  already landed via an `updates` frame — no `end` frame (the turn is
+   *  still `running`), matching a real mid-run snapshot where step 1 has
+   *  settled but step 2 is still streaming. */
+  const settledStepOneEvents: SseEvent[] = [
+    {
+      id: "1722400000000-1",
+      event: "metadata",
+      data: { run_id: "run-live-c1" },
+      rawData: "",
+      receivedAt: "",
+    },
+    {
+      id: "1722400000500-2",
+      event: "updates",
+      data: {
+        agent: {
+          step_count: 1,
+          _duration_ms: 400,
+          messages: [{ type: "ai", content: "step one settled answer" }],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    },
+  ];
+
+  it("hides an already-settled step's stale live buffer while still rendering an unsettled step's live card", () => {
+    renderCard({
+      turn: makeTurn({ events: settledStepOneEvents, status: "running" }),
+      liveByStep: new Map([
+        [1, liveStep("STALE STEP1 LIVE TEXT")],
+        [2, liveStep("LIVE STEP2 LIVE TEXT")],
+      ]),
+      finalized: false,
+    });
+
+    // Step 1 already has an authoritative Gantt row — its residual live
+    // buffer must not render as a duplicate streaming card.
+    expect(screen.queryByText("STALE STEP1 LIVE TEXT")).not.toBeInTheDocument();
+    // Step 2 has no authoritative card yet — its live buffer still renders.
+    const cards = screen.getAllByTestId("streaming-step-card");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toHaveAttribute("data-step", "2");
+    expect(within(cards[0]).getByText("LIVE STEP2 LIVE TEXT")).toBeInTheDocument();
+  });
+
+  it("does not render a settled step's stale buffer as 'interrupted' once the run finalizes", () => {
+    renderCard({
+      turn: makeTurn({
+        events: [
+          ...settledStepOneEvents,
+          { id: "1722400001000-3", event: "end", data: {}, rawData: "", receivedAt: "" },
+        ],
+        status: "done",
+      }),
+      liveByStep: new Map([[1, liveStep("STALE STEP1 LIVE TEXT")]]),
+      finalized: true,
+    });
+
+    expect(screen.queryByTestId("streaming-step-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("interrupted-badge")).not.toBeInTheDocument();
+    expect(screen.queryByText("STALE STEP1 LIVE TEXT")).not.toBeInTheDocument();
   });
 });

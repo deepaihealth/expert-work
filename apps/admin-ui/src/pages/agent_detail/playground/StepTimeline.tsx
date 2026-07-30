@@ -44,6 +44,14 @@ export interface StepTimelineProps {
   /** Spec 1 PR4 Task 4 — see ``ToolTimelineProps.onFireResult``; threaded
    *  down to each ``manage_task`` tool card's 「立即触发」 button. */
   onFireResult?: (result: FireNowResult) => void;
+  /** Minor (gantt-execution-timeline review) — suppresses the bottom
+   *  ``Legend`` block. The legend documents this component's own dot/marker
+   *  colors, which read as a mismatched leftover wherever `StepTimeline` is
+   *  co-rendered with the Gantt (a different color system) — either as the
+   *  live-typewriter sibling next to the Gantt axis, or once per expanded
+   *  Gantt row's detail. Default false keeps every other (non-Gantt) call
+   *  site's rendering unchanged. */
+  hideLegend?: boolean;
 }
 
 /** Renders `fmtDuration(ms)` with the `tl_duration` aria-label — used for the
@@ -66,6 +74,7 @@ export function StepTimeline({
   ttftMs = null,
   finalized = false,
   onFireResult,
+  hideLegend = false,
 }: StepTimelineProps) {
   // Steps that already have an authoritative card — their live buffer is superseded.
   const settled = new Set<number>();
@@ -118,7 +127,7 @@ export function StepTimeline({
           />
         ))}
       </div>
-      <Legend />
+      {!hideLegend && <Legend />}
     </div>
   );
 }
