@@ -120,14 +120,30 @@ describe("FormView", () => {
     expect(
       document.querySelector('[data-section-id="model"]'),
     ).toBeInTheDocument();
-    // Sibling sub-sections bundled into the same "model" tab keep their OWN
-    // (non-duplicate) headings — suppressing those would remove the only
-    // label distinguishing them from one another.
+    // Sub-parts bundled into the same "model" tab keep their OWN
+    // (non-duplicate) labels — suppressing those would remove the only
+    // label distinguishing them from one another. (Fallback is a nested
+    // sub-area of af-model with a small label, not a sibling heading.)
     expect(screen.getByTestId("af-fallback")).toHaveTextContent(
-      "Fallback providers (optional)",
+      "Fallback models",
     );
     expect(screen.getByTestId("af-reflection-evaluator")).toHaveTextContent(
       "Reflection evaluator (optional)",
+    );
+  });
+
+  it("folds the fallback area into the model block with model-wording copy (no empty-state illustration)", () => {
+    renderSection("model");
+    const model = screen.getByTestId("af-model");
+    // Nested inside the main-model block, not a sibling section.
+    expect(within(model).getByTestId("af-fallback")).toBeInTheDocument();
+    // Empty chain = one-line hint + inline add button — no big Empty block.
+    expect(document.querySelector(".ant-empty")).not.toBeInTheDocument();
+    expect(screen.getByTestId("af-fallback")).toHaveTextContent(
+      "No fallback models yet.",
+    );
+    expect(screen.getByTestId("af-fallback-add")).toHaveTextContent(
+      "Add fallback model",
     );
   });
 

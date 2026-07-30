@@ -988,14 +988,13 @@ const zhCN: TranslationKeys = {
     vision_clear: "清除(不配图像理解)",
     section_vision_help:
       "主模型是纯文本时才显示这块。\n配的视觉模型专门回答图片相关问题,主模型负责统筹。\n留空 = Agent 不能看图。\n示例:qwen-vl-max",
-    section_fallback: "备用 provider(可选)",
+    section_fallback: "备用模型",
     section_fallback_help:
-      "主 provider 慢或不可用时,按顺序切到下一个 provider,而不是让整个 run 失败。\n单 provider 的 Agent 留空即可。\n建议:选不同厂商,避免一家挂了整条链跟着挂。",
-    fallback_hint:
-      "在主 provider 之后按顺序尝试。某个 provider 卡住或失败就切到下一个。",
-    fallback_empty: "无备用 —— 此 Agent 只用单一 provider。",
-    fallback_rank: "备用 {{n}}",
-    fallback_add: "添加备用 provider",
+      "主模型失败或超时时,按顺序切换到备用模型,而不是让整次运行失败。\n不配 = 只用主模型。\n建议:备用选不同厂商的模型,避免一家挂了整条链跟着挂。",
+    fallback_hint: "主模型失败或超时时,按顺序切换到备用模型。",
+    fallback_empty: "暂无备用模型。",
+    fallback_rank: "备用模型 {{n}}",
+    fallback_add: "添加备用模型",
     fallback_remove: "移除",
     field_name_help:
       "Agent 的唯一标识,外部程序按它调用。\n只能用小写字母、数字、连字符。\n示例:support-bot",

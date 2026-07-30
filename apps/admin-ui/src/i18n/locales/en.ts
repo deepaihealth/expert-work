@@ -3908,14 +3908,14 @@ const en: TranslationKeys = {
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
       "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",
-    section_fallback: "Fallback providers (optional)",
+    section_fallback: "Fallback models",
     section_fallback_help:
-      "If the primary provider is slow or unavailable, the run falls over to the next provider in order instead of failing.\nLeave empty for a single-provider agent.\nTip: pick a different vendor so one vendor's outage doesn't take down the whole chain.",
+      "If the main model fails or times out, the run switches to the fallback models in order instead of failing.\nNone configured = the agent only uses its main model.\nTip: pick fallbacks from different vendors so one vendor's outage doesn't take down the whole chain.",
     fallback_hint:
-      "Tried in order after the primary. A stalled or failing provider falls over to the next one.",
-    fallback_empty: "No fallback — this agent uses a single provider.",
-    fallback_rank: "Fallback {{n}}",
-    fallback_add: "Add fallback provider",
+      "If the main model fails or times out, the run switches to the fallback models in order.",
+    fallback_empty: "No fallback models yet.",
+    fallback_rank: "Fallback model {{n}}",
+    fallback_add: "Add fallback model",
     fallback_remove: "Remove",
     field_name_help:
       "The agent's unique id that external apps call by.\nLowercase letters, digits, and hyphens only.\nExample: support-bot",

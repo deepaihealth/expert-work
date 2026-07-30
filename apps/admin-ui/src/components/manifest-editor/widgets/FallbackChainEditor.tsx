@@ -1,17 +1,21 @@
 /**
- * FallbackChainEditor — edits the main model's E.11 provider fallback chain
+ * FallbackChainEditor — edits the main model's E.11 fallback-model chain
  * (``spec.model.fallback``). A flat, ordered list: the router tries the primary
- * first, then each fallback in turn (a slow / failing provider falls over
+ * first, then each fallback model in turn (a slow / failing model falls over
  * instead of killing the run). Each entry reuses ``ModelSelect``; an empty list
- * writes no ``fallback`` block (single-provider agent).
+ * writes no ``fallback`` block (main-model-only agent). Rendered as a
+ * lightweight sub-area of the main-model block: no empty-state illustration —
+ * an empty chain is just the inline add button plus a one-line hint.
  */
-import { Button, Empty } from "antd";
+import { Button, Typography } from "antd";
 import { Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import type { ModelCatalog } from "../../../api/model_catalog";
 import type { ModelFields } from "../form_model";
 import { ModelSelect } from "./ModelSelect";
+
+const { Text } = Typography;
 
 interface FallbackChainEditorProps {
   value: ModelFields[];
@@ -38,63 +42,63 @@ export function FallbackChainEditor({
 
   return (
     <div data-testid="af-fallback-chain">
-      {value.length === 0 ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={t("agent_form.fallback_empty")}
-          style={{ margin: "8px 0" }}
-        />
-      ) : (
-        value.map((entry, i) => (
-          // Index key is safe: ModelSelect is fully controlled (no internal
-          // state to mis-associate when an entry is removed).
+      {value.map((entry, i) => (
+        // Index key is safe: ModelSelect is fully controlled (no internal
+        // state to mis-associate when an entry is removed).
+        <div
+          key={i}
+          data-testid={`af-fallback-entry-${i}`}
+          style={{
+            border: "1px solid var(--ew-border-default)",
+            borderRadius: 6,
+            padding: 12,
+            marginBottom: 8,
+          }}
+        >
           <div
-            key={i}
-            data-testid={`af-fallback-entry-${i}`}
             style={{
-              border: "1px solid var(--ew-border-default)",
-              borderRadius: 6,
-              padding: 12,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
               marginBottom: 8,
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                marginBottom: 8,
-              }}
+            <strong>{t("agent_form.fallback_rank", { n: i + 1 })}</strong>
+            <Button
+              type="text"
+              danger
+              size="small"
+              icon={<Trash2 size={14} strokeWidth={1.75} />}
+              data-testid={`af-fallback-remove-${i}`}
+              onClick={() => removeAt(i)}
             >
-              <strong>{t("agent_form.fallback_rank", { n: i + 1 })}</strong>
-              <Button
-                type="text"
-                danger
-                size="small"
-                icon={<Trash2 size={14} strokeWidth={1.75} />}
-                data-testid={`af-fallback-remove-${i}`}
-                onClick={() => removeAt(i)}
-              >
-                {t("agent_form.fallback_remove")}
-              </Button>
-            </div>
-            <ModelSelect
-              value={entry}
-              catalog={catalog}
-              onChange={(mdl) => updateAt(i, mdl)}
-            />
+              {t("agent_form.fallback_remove")}
+            </Button>
           </div>
-        ))
-      )}
-      <Button
-        type="dashed"
-        block
-        icon={<Plus size={14} strokeWidth={1.75} />}
-        data-testid="af-fallback-add"
-        onClick={add}
-      >
-        {t("agent_form.fallback_add")}
-      </Button>
+          <ModelSelect
+            value={entry}
+            catalog={catalog}
+            onChange={(mdl) => updateAt(i, mdl)}
+          />
+        </div>
+      ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Button
+          type="link"
+          size="small"
+          style={{ padding: 0 }}
+          icon={<Plus size={14} strokeWidth={1.75} />}
+          data-testid="af-fallback-add"
+          onClick={add}
+        >
+          {t("agent_form.fallback_add")}
+        </Button>
+        {value.length === 0 && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {t("agent_form.fallback_empty")}
+          </Text>
+        )}
+      </div>
     </div>
   );
 }
