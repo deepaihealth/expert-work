@@ -150,6 +150,23 @@ async def test_reflect_node_revise_appends_feedback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reflect_node_revise_feedback_hidden_from_ui() -> None:
+    """revise 注入的 [Reflection] HumanMessage 必须标 hide_from_ui —— 否则
+    /messages 出现假 user 消息,污染第三方对话历史并破坏历史轮 order-pairing。"""
+    llm = _RecordingLLM(
+        responses=[AIMessage(content='{"verdict": "revise", "critique": "incomplete"}')]
+    )
+    node = make_reflect_node(llm, budget=2)
+
+    out = await node(  # type: ignore[arg-type]
+        _state([HumanMessage(content="task"), AIMessage(content="weak answer")]),
+        {"configurable": {}},
+    )
+    injected = out["messages"][0]
+    assert injected.additional_kwargs.get("expert_work_hide_from_ui") is True
+
+
+@pytest.mark.asyncio
 async def test_reflect_node_revise_replans_for_plan_execute() -> None:
     llm = _RecordingLLM(
         responses=[
