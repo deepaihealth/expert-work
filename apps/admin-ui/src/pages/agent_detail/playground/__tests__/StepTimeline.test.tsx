@@ -129,6 +129,36 @@ describe("StepTimeline", () => {
     expect(screen.getByLabelText("step duration")).toBeInTheDocument();
     expect(screen.getByText("3.2s")).toBeInTheDocument();
   });
+
+  // #9a — the old `tools.length === 0` gate dropped a tool-calling step's own
+  // content entirely; both the tool card AND the step output must render.
+  it("renders a tool-calling step's own content below its tool cards", () => {
+    const step: AgentStep = { ...agentStep, seq: 20, content: "本步中间结论文本" };
+    render(<StepTimeline items={[step]} />);
+    fireEvent.click(screen.getByTestId("step-head"));
+    expect(screen.getByTestId("tool-call-card")).toBeInTheDocument();
+    expect(screen.getByText("本步中间结论文本")).toBeInTheDocument();
+  });
+
+  // #9d — the reasoning area's 「查看全文」 trigger opens the full-text modal
+  // with the client-side full text (zero fetch).
+  it("opens the full-text modal from the reasoning trigger", () => {
+    render(<StepTimeline items={[agentStep]} />);
+    fireEvent.click(screen.getByTestId("step-head"));
+    fireEvent.click(screen.getAllByTestId("full-text-trigger")[0]);
+    expect(screen.getByTestId("full-text-modal")).toHaveTextContent("先查天气");
+  });
+
+  // #9d — the output area gets its own trigger too (second one on the card).
+  it("opens the full-text modal from the step-output trigger", () => {
+    const step: AgentStep = { ...agentStep, seq: 21, content: "很长的本步输出" };
+    render(<StepTimeline items={[step]} />);
+    fireEvent.click(screen.getByTestId("step-head"));
+    const triggers = screen.getAllByTestId("full-text-trigger");
+    expect(triggers).toHaveLength(2);
+    fireEvent.click(triggers[1]);
+    expect(screen.getByTestId("full-text-modal")).toHaveTextContent("很长的本步输出");
+  });
 });
 
 describe("StepTimeline live streaming (3a content + 3b reasoning/tool)", () => {

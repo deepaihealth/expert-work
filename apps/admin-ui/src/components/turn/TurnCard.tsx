@@ -64,6 +64,11 @@ import { TurnMeta } from "../../pages/agent_detail/playground/TurnMeta";
 import { PlanPanel } from "../../pages/run_detail/PlanPanel";
 import { buildLangfuseTraceUrl } from "../../config/env";
 import { FeedbackBar } from "./FeedbackBar";
+import {
+  FullTextModal,
+  FullTextTrigger,
+  type FullTextState,
+} from "./FullTextModal";
 import type { Turn } from "./types";
 
 const { Text } = Typography;
@@ -346,6 +351,9 @@ export function TurnCard({
     aggregatedAnswer ??
     (turn.status === "running" ? t("playground.turn_running") : null);
   const runId = runIdOf(turn.events);
+  // #9e/#11 — 「查看全文」 modal shared by the answer block and the turn's
+  // reasoning summary section.
+  const [fullText, setFullText] = useState<FullTextState | null>(null);
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
@@ -635,21 +643,32 @@ export function TurnCard({
                   key: "reasoning",
                   label: t("playground.reasoning_label"),
                   children: (
-                    <pre
-                      data-testid="playground-reasoning"
-                      style={{
-                        margin: 0,
-                        fontSize: 11,
-                        fontFamily: "var(--ew-font-mono)",
-                        color: "var(--ew-text-secondary)",
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-word",
-                        maxHeight: 240,
-                        overflow: "auto",
-                      }}
-                    >
-                      {summary.reasoning.join("\n\n———\n\n")}
-                    </pre>
+                    <>
+                      <pre
+                        data-testid="playground-reasoning"
+                        style={{
+                          margin: 0,
+                          fontSize: 11,
+                          fontFamily: "var(--ew-font-mono)",
+                          color: "var(--ew-text-secondary)",
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                          maxHeight: 240,
+                          overflow: "auto",
+                        }}
+                      >
+                        {summary.reasoning.join("\n\n———\n\n")}
+                      </pre>
+                      {/* #9e — same full-text modal as the step cards. */}
+                      <FullTextTrigger
+                        onClick={() =>
+                          setFullText({
+                            title: t("playground.reasoning_label"),
+                            text: summary.reasoning.join("\n\n———\n\n"),
+                          })
+                        }
+                      />
+                    </>
                   ),
                 },
               ]
@@ -891,6 +910,7 @@ export function TurnCard({
           },
         ]}
       />
+      <FullTextModal state={fullText} onClose={() => setFullText(null)} />
     </div>
   );
 }

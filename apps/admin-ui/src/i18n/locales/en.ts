@@ -1143,6 +1143,7 @@ export interface TranslationKeys {
     meta_finish: string;
     meta_model: string;
     reasoning_label: string;
+    view_full_text: string;
     events_label: string;
     export_json: string;
     export_json_tip: string;
@@ -1203,6 +1204,7 @@ export interface TranslationKeys {
     tl_finish: string;
     tl_tool_failed: string;
     tl_final_answer: string;
+    tl_step_output: string;
     tl_reasoning: string;
     tl_expand: string;
     tl_critique: string;
@@ -4134,6 +4136,7 @@ const en: TranslationKeys = {
     meta_finish: "Finish",
     meta_model: "Model",
     reasoning_label: "Reasoning",
+    view_full_text: "View full text",
     events_label: "Events",
     export_json: "Export JSON",
     export_json_tip:
@@ -4197,6 +4200,7 @@ const en: TranslationKeys = {
     tl_finish: "finish: {{reason}}",
     tl_tool_failed: "Tool failed → retry",
     tl_final_answer: "Final answer",
+    tl_step_output: "Step output",
     tl_reasoning: "Reasoning (this LLM call)",
     tl_expand: "Expand",
     tl_critique: "critique",
