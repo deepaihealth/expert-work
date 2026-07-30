@@ -40,6 +40,7 @@
 3. **发布 = 仓库内脚本** `scripts/deploy/`(bash):`release.sh <env> --tag vX.Y.Z` 与 `rollback.sh <env> <tag>`。CI 自动化(GHA→ACR 跨境慢)后置,不在本期。
 4. **观测栈 = 最小自建搬迁**:prometheus + grafana + otel-collector + alertmanager 以单副本 Deployment + 云盘 PVC 进 ACS(现有 dashboards/rules JSON 直接复用);promtail/loki 由 **SLS(ACS 默认集成)替代**,tempo 保留单副本(trace 后端)。全托管 ARMS 方案作为后续可选(迁移 dashboards 成本换取零运维)。
 5. **Langfuse = 测试环境先自建搬迁**(web/worker + 专属 PG(用 RDS 新 database)+ ClickHouse 单副本 PVC + 复用平台云 Redis 的独立 DB 号 + OSS bucket)。ClickHouse 是最重的有状态组件,若运行痛,后续再评估阿里云托管 ClickHouse 或 Langfuse Cloud。
+   **版本要求(2026-07-31 补,轨迹可视化调研定案)**:镜像选 ≥2025-11 发行版——「Agent Graphs」该版 GA(2026-07 起 Aggregated/Expanded 双模式),LangGraph 集成自动出执行图,是调试台 Gantt(#1073)之外的 graph 短线,零自研。部署后顺手:调试台 exact 视图加「图视图」深链跳该 trace 的 Langfuse graph 页(小前端项,随 PR-3 或紧随其后)。
 6. **admin-ui 入口 = ALB Ingress**(升级版实例,工单提 idle/request timeout 3600s);SandboxGateway 泛域名走同一 ALB。**域名与 ICP 备案是前置硬项**(国内公网 80/443 强制备案)——参数清单第一批问。
 
 ## 四、波次计划
