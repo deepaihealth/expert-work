@@ -6,6 +6,7 @@
  * field parsing. See docs/.../2026-07-10-batch3-wireframe.html for the render.
  */
 import type { SseEvent } from "./sessions";
+import { serverMsOf } from "./gantt_timeline";
 import { parseToolCalls, type ToolCallEntry } from "./tool_timeline";
 import { parseWorkerFrames } from "./worker_timeline";
 
@@ -13,6 +14,10 @@ export interface AgentStep {
   kind: "agent";
   seq: number;
   receivedAt: string;
+  /** SSE frame id's millisecond segment (``serverMsOf``) — ``null`` if the
+   *  frame's ``id`` is missing/malformed. Gantt data layer's absolute-time
+   *  anchor; never derive wall-clock position from ``receivedAt``. */
+  serverMs?: number | null;
   stepCount: number | null;
   node: string;
   model: string | null;
@@ -30,6 +35,7 @@ export interface AuxNodeItem {
   kind: "memory_recall" | "planner" | "reflect" | "memory_writeback" | "workspace_ingest";
   seq: number;
   receivedAt: string;
+  serverMs?: number | null;
   node: string;
   summary: string;
   detail: Record<string, unknown>;
@@ -40,6 +46,7 @@ export interface MarkerItem {
   kind: "compaction" | "retry" | "error" | "approval" | "guard" | "end";
   seq: number;
   receivedAt: string;
+  serverMs?: number | null;
   text: string;
   tone: "warn" | "bad" | "good" | "pause";
 }
@@ -84,12 +91,17 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
   for (const e of parseToolCalls(events)) byId.set(e.id, e);
   const workersByCall = parseWorkerFrames(events);
   let seq = 0;
+  // Current evt's frame-id ms — set once per loop iteration below, visible
+  // to every push() call made while processing that evt (single-threaded,
+  // no concurrent iterations).
+  let evtServerMs: number | null = null;
   const push = (it: Record<string, unknown>): void => {
-    items.push({ ...it, seq: seq++ } as TimelineItem);
+    items.push({ ...it, seq: seq++, serverMs: evtServerMs } as TimelineItem);
   };
 
   for (const evt of events) {
     const at = evt.receivedAt;
+    evtServerMs = serverMsOf(evt.id);
     if (evt.event === "compaction") {
       const d = obj(evt.data);
       push({ kind: "compaction", receivedAt: at, tone: "warn",

@@ -13,6 +13,7 @@
  * originating MCP server from the name. Builtin tools (``web_search``,
  * ``exec_python``, …) keep their bare name.
  */
+import { serverMsOf } from "./gantt_timeline";
 import type { SseEvent } from "./sessions";
 import type { WorkerTimeline } from "./worker_timeline";
 
@@ -36,6 +37,10 @@ export interface ToolCallEntry {
   execResult?: ExecResult;
   /** Tool execution time in ms, from the result's ``additional_kwargs.duration_ms`` (``null`` until the result arrives or if absent). */
   durationMs: number | null;
+  /** RESULT frame's SSE id ms segment (``serverMsOf``) — ``null`` until the
+   *  result arrives or its frame ``id`` is missing/malformed. Gantt data
+   *  layer's absolute-time anchor for this call's bar. */
+  serverMs?: number | null;
   /** B2 PR2 — 本次调用派生的 worker 子时间线(spawn_worker / subagent);无则缺省。 */
   workers?: WorkerTimeline[];
   /** 定时任务工具(``manage_task`` create)回传的 trigger id —— 供「立即触发」按钮。取自 wire ToolMessage 的 ``artifact.trigger_id``。 */
@@ -239,6 +244,7 @@ export function parseToolCalls(
             status: "pending",
             resultPreview: null,
             durationMs: null,
+            serverMs: null,
             triggerId: null,
             action: null,
           }));
@@ -269,6 +275,7 @@ export function parseToolCalls(
             status,
             resultPreview: preview,
             durationMs: null,
+            serverMs: null,
             triggerId: null,
             action: null,
           };
@@ -283,6 +290,7 @@ export function parseToolCalls(
         }
         entry.status = status;
         entry.resultPreview = preview;
+        entry.serverMs = serverMsOf(evt.id);
         const ak = m.additional_kwargs;
         const durRaw =
           ak !== null && typeof ak === "object"

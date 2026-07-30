@@ -2,6 +2,7 @@
 // WorkerTimeline 树。纯函数,防御式:异常帧丢弃不抛。
 // 帧契约见 docs/superpowers/specs/2026-07-19-worker-observability-design.md。
 
+import { serverMsOf } from "./gantt_timeline";
 import type { SseEvent } from "./sessions";
 
 export interface WorkerMessageSummary {
@@ -17,6 +18,10 @@ export interface WorkerStepSummary {
   node: string;
   stepCount: number | null;
   durationMs: number;
+  /** This ``update`` frame's SSE id ms segment (``serverMsOf``) — ``null``
+   *  if the frame's ``id`` is missing/malformed. Gantt data layer's
+   *  absolute-time anchor for this worker step's bar. */
+  serverMs?: number | null;
   messages: WorkerMessageSummary[];
 }
 
@@ -133,6 +138,7 @@ export function parseWorkerFrames(events: readonly SseEvent[]): Map<string, Work
         node: typeof f.data.node === "string" ? f.data.node : "?",
         stepCount: typeof f.data.step_count === "number" ? f.data.step_count : null,
         durationMs: typeof f.data._duration_ms === "number" ? f.data._duration_ms : 0,
+        serverMs: serverMsOf(evt.id),
         messages: summarizeMessages(f.data.messages),
       });
     } else {
