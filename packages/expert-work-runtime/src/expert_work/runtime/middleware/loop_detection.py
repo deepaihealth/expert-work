@@ -169,7 +169,14 @@ class LoopDetectionMiddleware:
         )
         latest = recent[0]
         cleaned = clone_ai_message_with_tool_calls(latest, tool_calls=[])
-        reminder = HumanMessage(content=self.reminder_text)
+        # Not a real user turn — without this the system-reminder renders as a
+        # user chat bubble, gets forwarded to third parties reading the
+        # transcript, and throws off buildHistoryTurns' user/assistant
+        # order-pairing (spec 2026-07-30, Important#2).
+        reminder = HumanMessage(
+            content=self.reminder_text,
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        )
         # Same-id ``cleaned`` → replace in-place via add_messages; the
         # reminder has a fresh auto-id → append.
         ctx.payload["messages"] = [cleaned, reminder]

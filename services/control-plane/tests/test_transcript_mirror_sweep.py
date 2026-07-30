@@ -236,3 +236,60 @@ async def test_read_turns_channel_segments_reset_at_user_boundary() -> None:
         ("assistant", "commentary"),  # 隐藏行剔除后仍非末条
         ("assistant", "final"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channel_invariant_across_include_hidden() -> None:
+    """I1 — segmenting must not be computed off the filtered list: a hidden
+    feedback row must not silently shift a segment boundary between the
+    faithful audit drill-in (``include_hidden=True``) and the UI bubble view
+    (``include_hidden=False``), or the same thread reports two different
+    "final" rows depending on which caller reads it."""
+    msgs = [
+        HumanMessage(content="任务"),
+        AIMessage(content="候选答案 v1"),  # superseded — must stay commentary either way
+        HumanMessage(
+            content="[Reflection] 不够好",
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        ),
+        AIMessage(content="答案 v2"),
+    ]
+    cp = _checkpointer_with(msgs)
+    faithful = await read_turns(cp, THREAD_ID, include_hidden=True)
+    ui = await read_turns(cp, THREAD_ID, include_hidden=False)
+
+    faithful_by_seq = {t.seq: t.channel for t in faithful if t.role == "assistant"}
+    ui_by_seq = {t.seq: t.channel for t in ui if t.role == "assistant"}
+    # Every assistant row common to both views (identified by its stable
+    # ``seq``) must report the exact same channel in both.
+    assert ui_by_seq == {seq: faithful_by_seq[seq] for seq in ui_by_seq}
+
+    # Exactly one final per segment in both views (one segment here).
+    assert [t.channel for t in ui if t.role == "assistant"] == ["commentary", "final"]
+    assert [t.channel for t in faithful if t.role == "assistant"] == [
+        "commentary",
+        "final",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_scheduled_delivery_opens_its_own_segment() -> None:
+    """I3 — a scheduler delivery (``trigger_delivery.inject_delivery``) appends
+    an ``AIMessage`` tagged ``expert_work_scheduled_delivery`` after the
+    user's real answer. It must not steal "final" from the user's own answer
+    by looking like that segment's new last row — it opens its OWN segment
+    (self-final), leaving the user's answer's final status untouched."""
+    msgs = [
+        HumanMessage(content="帮我算一下 ARR"),
+        AIMessage(content="ARR 是 120 万"),  # the user's real answer
+        AIMessage(
+            content="定时任务简报:今日新增 3 单",
+            additional_kwargs={"expert_work_scheduled_delivery": True},
+        ),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "final"),  # 用户真答案 — 不被投递行降级
+        ("assistant", "final"),  # 投递行自成一段,亦是段末条
+    ]

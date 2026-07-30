@@ -78,6 +78,9 @@ async def test_three_identical_tool_calls_trip_detection() -> None:
     assert cleaned.tool_calls == []
     assert isinstance(reminder, HumanMessage)
     assert "Loop detected" in reminder.content
+    # Spec 2026-07-30 Important#2 — not a real user turn: must not render as a
+    # chat bubble, forward to third parties, or break history order-pairing.
+    assert reminder.additional_kwargs.get("expert_work_hide_from_ui") is True
 
 
 @pytest.mark.asyncio
