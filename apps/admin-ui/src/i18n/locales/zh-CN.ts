@@ -622,6 +622,7 @@ const zhCN: TranslationKeys = {
     capability: "能力优先",
     capability_desc: "多记多想:步数翻倍、记忆更全,复杂任务更稳,费用更高",
     custom: "自定义",
+    nearest_hint: "最接近「{{name}}」,相差 {{count}} 项设置",
     confirm_title: "应用「{{name}}」?",
     confirm_body: "将调整 {{count}} 项配置;每一项之后仍可单独修改。",
   },

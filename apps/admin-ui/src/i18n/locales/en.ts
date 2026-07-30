@@ -612,6 +612,7 @@ export interface TranslationKeys {
     capability: string;
     capability_desc: string;
     custom: string;
+    nearest_hint: string;
     confirm_title: string;
     confirm_body: string;
   };
@@ -3541,6 +3542,7 @@ const en: TranslationKeys = {
     capability_desc:
       "Remembers and thinks more: double the steps, fuller memory, steadier on hard tasks — costs more.",
     custom: "Custom",
+    nearest_hint: 'Closest to "{{name}}" — {{count}} setting(s) apart',
     confirm_title: 'Apply "{{name}}"?',
     confirm_body:
       "This will change {{count}} settings; you can still adjust any of them afterward.",

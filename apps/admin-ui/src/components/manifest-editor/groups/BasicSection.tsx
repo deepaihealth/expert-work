@@ -98,14 +98,37 @@ function RunProfileCard({ formData, onChange }: BasicSectionProps) {
         ))}
       </Radio.Group>
       {current === "custom" && (
-        <Tag
-          color="blue"
-          bordered={false}
-          data-testid="run-profile-custom-tag"
-          style={{ marginTop: 8 }}
-        >
-          {t("run_profile.custom")}
-        </Tag>
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+          <Tag
+            color="blue"
+            bordered={false}
+            data-testid="run-profile-custom-tag"
+            style={{ margin: 0 }}
+          >
+            {t("run_profile.custom")}
+          </Tag>
+          {(() => {
+            // Nearest preset + how far off — answers "why is nothing
+            // selected?" after a manual tweak knocks the config off a
+            // preset (UX feedback 2026-07-30 #12: the deselection is by
+            // design, the mystery wasn't).
+            const [nearest, diff] = RUN_PROFILE_IDS.map(
+              (p) => [p, countProfileDiff(formData, p)] as const,
+            ).sort((a, b) => a[1] - b[1])[0];
+            return (
+              <Text
+                type="secondary"
+                style={{ fontSize: 12 }}
+                data-testid="run-profile-nearest"
+              >
+                {t("run_profile.nearest_hint", {
+                  name: t(`run_profile.${nearest}`),
+                  count: diff,
+                })}
+              </Text>
+            );
+          })()}
+        </div>
       )}
     </div>
   );
