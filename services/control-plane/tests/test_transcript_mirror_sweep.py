@@ -14,10 +14,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from control_plane.transcript import read_turns
 from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from expert_work.persistence import InMemoryThreadMessageStore
+
+THREAD_ID = uuid4()
 
 
 def _msg(mtype: str, content: Any) -> SimpleNamespace:
@@ -36,6 +39,14 @@ class _FakeCheckpointer:
         if messages is None:
             return None
         return SimpleNamespace(checkpoint={"channel_values": {"messages": messages}})
+
+
+def _tc(name: str) -> dict[str, Any]:
+    return {"name": name, "args": {}, "id": "call_1"}
+
+
+def _checkpointer_with(msgs: list[HumanMessage | AIMessage]) -> _FakeCheckpointer:
+    return _FakeCheckpointer({str(THREAD_ID): msgs})
 
 
 class _QueueStore(InMemoryThreadMessageStore):
@@ -182,3 +193,103 @@ async def test_run_once_short_circuits_without_checkpointer() -> None:
     sweep = _sweep(store, None)
     assert await sweep.run_once() == 0
     assert store.synced == []
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channels_commentary_and_final() -> None:
+    """段内末条且无 tool_calls = final;带 tool_calls / 非末条 = commentary。"""
+    msgs = [
+        HumanMessage(content="写两章综述"),
+        AIMessage(content="先搜第一章资料", tool_calls=[_tc("web_search")]),
+        AIMessage(content="第一章正文…现在搜第二章", tool_calls=[_tc("web_search")]),
+        AIMessage(content="第二章正文,全文完。"),
+        HumanMessage(content="再补个结论"),
+        AIMessage(content="补充搜索", tool_calls=[_tc("web_search")]),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "commentary"),
+        ("assistant", "commentary"),
+        ("assistant", "final"),
+        ("user", None),
+        # 第二段末条带 tool_calls(暂停/未完轮)→ 无 final
+        ("assistant", "commentary"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channel_segments_reset_at_user_boundary() -> None:
+    """reflect 打回形态:候选答案被追加消息取代后自动变 commentary。"""
+    msgs = [
+        HumanMessage(content="任务"),
+        AIMessage(content="候选答案 v1"),  # 无 tool_calls,但非段末条
+        HumanMessage(
+            content="[Reflection] 不够好",
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        ),
+        AIMessage(content="答案 v2"),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID, include_hidden=False)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "commentary"),  # 隐藏行剔除后仍非末条
+        ("assistant", "final"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channel_invariant_across_include_hidden() -> None:
+    """I1 — segmenting must not be computed off the filtered list: a hidden
+    feedback row must not silently shift a segment boundary between the
+    faithful audit drill-in (``include_hidden=True``) and the UI bubble view
+    (``include_hidden=False``), or the same thread reports two different
+    "final" rows depending on which caller reads it."""
+    msgs = [
+        HumanMessage(content="任务"),
+        AIMessage(content="候选答案 v1"),  # superseded — must stay commentary either way
+        HumanMessage(
+            content="[Reflection] 不够好",
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        ),
+        AIMessage(content="答案 v2"),
+    ]
+    cp = _checkpointer_with(msgs)
+    faithful = await read_turns(cp, THREAD_ID, include_hidden=True)
+    ui = await read_turns(cp, THREAD_ID, include_hidden=False)
+
+    faithful_by_seq = {t.seq: t.channel for t in faithful if t.role == "assistant"}
+    ui_by_seq = {t.seq: t.channel for t in ui if t.role == "assistant"}
+    # Every assistant row common to both views (identified by its stable
+    # ``seq``) must report the exact same channel in both.
+    assert ui_by_seq == {seq: faithful_by_seq[seq] for seq in ui_by_seq}
+
+    # Exactly one final per segment in both views (one segment here).
+    assert [t.channel for t in ui if t.role == "assistant"] == ["commentary", "final"]
+    assert [t.channel for t in faithful if t.role == "assistant"] == [
+        "commentary",
+        "final",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_scheduled_delivery_opens_its_own_segment() -> None:
+    """I3 — a scheduler delivery (``trigger_delivery.inject_delivery``) appends
+    an ``AIMessage`` tagged ``expert_work_scheduled_delivery`` after the
+    user's real answer. It must not steal "final" from the user's own answer
+    by looking like that segment's new last row — it opens its OWN segment
+    (self-final), leaving the user's answer's final status untouched."""
+    msgs = [
+        HumanMessage(content="帮我算一下 ARR"),
+        AIMessage(content="ARR 是 120 万"),  # the user's real answer
+        AIMessage(
+            content="定时任务简报:今日新增 3 单",
+            additional_kwargs={"expert_work_scheduled_delivery": True},
+        ),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "final"),  # 用户真答案 — 不被投递行降级
+        ("assistant", "final"),  # 投递行自成一段,亦是段末条
+    ]

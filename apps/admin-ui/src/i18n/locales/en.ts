@@ -1132,6 +1132,7 @@ export interface TranslationKeys {
     turn_count: string;
     turn_running: string;
     turn_no_text: string;
+    segment_commentary: string;
     turn_failed: string;
     usage_in: string;
     usage_out: string;
@@ -4127,6 +4128,7 @@ const en: TranslationKeys = {
     turn_count: "{{n}} turns",
     turn_running: "Running…",
     turn_no_text: "(no text answer)",
+    segment_commentary: "Progress note",
     turn_failed: "This turn's run failed",
     usage_in: "in",
     usage_out: "out",

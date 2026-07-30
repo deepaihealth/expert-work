@@ -158,12 +158,33 @@ describe("TurnCard (read-only)", () => {
     renderCard({
       readOnly: true,
       loadState: "loading",
-      fallbackAnswer: "stored answer",
+      fallbackLines: [{ text: "stored answer", channel: null }],
       turn: makeTurn({ events: [] }),
     });
 
     expect(screen.getByText("stored answer")).toBeInTheDocument();
     expect(screen.queryByTestId("step-timeline")).not.toBeInTheDocument();
+  });
+
+  // Important#1 — a fallback commentary line clamps to 240 chars with no
+  // other way to read the rest (the replay that would normally render the
+  // full segment never lands in this mode). The FullTextTrigger must open
+  // the modal with the complete, unclamped text.
+  it("fallback commentary line clamps to 240 chars but its FullTextTrigger opens the full text", () => {
+    const longText = "旁白内容".repeat(80); // 320 chars, well past the 240 clamp
+    renderCard({
+      readOnly: true,
+      loadState: "loading",
+      fallbackLines: [{ text: longText, channel: "commentary" }],
+      turn: makeTurn({ events: [] }),
+    });
+
+    const commentary = screen.getByTestId("turn-segment-commentary");
+    expect(commentary).toHaveTextContent(`${longText.slice(0, 240)}…`);
+    expect(commentary.textContent?.length ?? 0).toBeLessThan(longText.length);
+
+    fireEvent.click(screen.getByTestId("full-text-trigger"));
+    expect(screen.getByTestId("full-text-modal")).toHaveTextContent(longText);
   });
 
   it("hides the approval gate and the feedback bar in read-only mode", () => {
@@ -215,6 +236,94 @@ const multiTextEvents: SseEvent[] = [
   },
   { id: "4", event: "end", data: {}, rawData: "", receivedAt: "" },
 ];
+
+/** Spec 2026-07-30 (conversation output channels) — one AI-message
+ *  ``updates`` frame, matching what ``turn_summary.ts`` parses. ``toolCalls``
+ *  seeds N dummy tool_calls so the structural channel rule (only the turn's
+ *  last text message, when it carries no tool_calls, is "final" — everything
+ *  else is "commentary") can be exercised without a full timeline. */
+let aiUpdatesSeq = 0;
+function aiUpdates(text: string, opts: { toolCalls?: number } = {}): SseEvent {
+  aiUpdatesSeq += 1;
+  const toolCalls = opts.toolCalls
+    ? Array.from({ length: opts.toolCalls }, (_, i) => ({
+        id: `c${aiUpdatesSeq}-${i}`,
+        name: "search",
+        args: {},
+        type: "tool_call",
+      }))
+    : undefined;
+  return {
+    id: `u-${aiUpdatesSeq}`,
+    event: "updates",
+    data: {
+      agent: {
+        messages: [
+          {
+            type: "ai",
+            content: text,
+            ...(toolCalls ? { tool_calls: toolCalls } : {}),
+          },
+        ],
+      },
+    },
+    rawData: "",
+    receivedAt: "",
+  };
+}
+
+/** A settled (``status: "done"``) turn built from a sequence of ``aiUpdates``
+ *  frames, bracketed with ``metadata``/``end`` frames like a real replay. */
+function settledTurnWith(updates: SseEvent[]): Turn {
+  return makeTurn({
+    events: [
+      {
+        id: "meta",
+        event: "metadata",
+        data: { run_id: "run-seg" },
+        rawData: "",
+        receivedAt: "",
+      },
+      ...updates,
+      { id: "end", event: "end", data: {}, rawData: "", receivedAt: "" },
+    ],
+  });
+}
+
+describe("TurnCard answer segments (spec 2026-07-30-conversation-output-channels)", () => {
+  it("答案区按段渲染:commentary 弱化行,final 走 Markdown 正文", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: settledTurnWith([
+        aiUpdates("第一章资料已获取,现在撰写第一章正文。", { toolCalls: 1 }),
+        aiUpdates("# 第一章\n正文内容"),
+      ]),
+    });
+
+    const commentary = screen.getAllByTestId("turn-segment-commentary");
+    expect(commentary).toHaveLength(1);
+    expect(commentary[0]).toHaveTextContent("第一章资料已获取");
+    // final 段经 MarkdownView 渲染出标题元素,且不含旁白文本
+    const answer = screen.getByTestId("playground-turn-answer-scroll");
+    expect(
+      within(answer).getByRole("heading", { name: "第一章" }),
+    ).toBeInTheDocument();
+  });
+
+  it("无 final 段(末条带 tool_calls)只渲染 commentary,不显示 no_text 占位", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: settledTurnWith([aiUpdates("先搜资料", { toolCalls: 1 })]),
+    });
+
+    expect(screen.getByTestId("turn-segment-commentary")).toHaveTextContent(
+      "先搜资料",
+    );
+    expect(screen.queryByText(/turn_no_text/)).not.toBeInTheDocument();
+  });
+});
 
 describe("TurnCard answer area (#8 / #11 / C1)", () => {
   it("aggregates every assistant text into the answer, not just the last step's", () => {

@@ -220,7 +220,12 @@ def make_reflect_node(llm_caller: LLMCaller, *, budget: int, deadline_s: int = 3
             updates["messages"] = [
                 HumanMessage(
                     content=f"[Reflection] {reflection.critique}\n\n"
-                    "Address the feedback above, then continue."
+                    "Address the feedback above, then continue.",
+                    # Orchestrator-authored scaffolding (RT-ADR-9): keep it
+                    # in-prompt and in the faithful record, but out of the UI
+                    # bubble view / GET /messages — an unhidden feedback row
+                    # renders as a user message the user never sent.
+                    additional_kwargs={"expert_work_hide_from_ui": True},
                 )
             ]
             if revised_plan is not None:

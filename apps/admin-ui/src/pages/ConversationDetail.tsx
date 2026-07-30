@@ -34,7 +34,7 @@ import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/s
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
 import { downloadJson } from "../components/turn/download_json";
-import { runIdOf, TurnCard } from "../components/turn/TurnCard";
+import { CommentarySegmentLine, runIdOf, TurnCard } from "../components/turn/TurnCard";
 import type { Turn } from "../components/turn/types";
 import { useHistoryTurns } from "../components/turn/useHistoryTurns";
 import { formatCompact, formatDuration } from "../utils/runFormat";
@@ -495,7 +495,7 @@ export function ConversationDetail() {
                       isSystemAdmin={isSystemAdmin}
                       readOnly
                       loadState={load.state}
-                      fallbackAnswer={h.fallbackAnswer}
+                      fallbackLines={h.fallbackLines}
                     />
                   </div>
                 );
@@ -526,9 +526,19 @@ export function ConversationDetail() {
                       ? t("conversations_detail.role_user")
                       : t("conversations_detail.role_assistant")}
                   </Tag>
-                  <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                    {m.content}
-                  </div>
+                  {m.role === "assistant" && m.channel === "commentary" ? (
+                    // Minor#3 — same fix as PlaygroundTab's flat degradation
+                    // path: don't render a commentary row full-width as if
+                    // it were the answer body.
+                    <CommentarySegmentLine
+                      text={m.content}
+                      label={t("playground.segment_commentary")}
+                    />
+                  ) : (
+                    <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      {m.content}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

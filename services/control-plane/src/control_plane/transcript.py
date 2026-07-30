@@ -13,6 +13,11 @@ latest checkpoint carries the full history in one ``aget_tuple`` and a
 message's index (``seq``) is stable across reads — the mirror's idempotency
 key. Only human/ai turns with non-empty text survive; tool/system messages
 stay in the per-run event stream by design.
+
+Assistant turns also carry a structural output ``channel`` — "final" iff the
+turn is the last visible one in its user-delimited segment AND has no
+``tool_calls``; otherwise "commentary". See
+docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
 """
 
 from __future__ import annotations
@@ -57,20 +62,44 @@ async def read_turns(
     if tup is None:
         return []
     raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
-    out: list[MessageTurn] = []
+    # Each row records whether IT opens a new segment, decided purely from its
+    # own kwargs — never from list position. That keeps "channel" independent
+    # of ``include_hidden`` (a hidden feedback row filtered out of the UI view
+    # must not silently move a segment boundary relative to the faithful audit
+    # view, which would report a different set of "final" rows for the same
+    # thread) and lets a scheduled-delivery ``AIMessage`` (trigger_delivery.py
+    # ``inject_delivery``, tagged ``expert_work_scheduled_delivery``) open its
+    # OWN segment instead of being appended onto — and stealing "final" from —
+    # the user's real answer.
+    collected: list[tuple[int, str, str, bool, bool]] = []
     for seq, m in enumerate(raw):
         mtype = getattr(m, "type", None)
         if mtype not in ("human", "ai"):
             continue
-        if not include_hidden:
-            kwargs = getattr(m, "additional_kwargs", None) or {}
-            if kwargs.get("expert_work_hide_from_ui"):
-                continue
+        ak = getattr(m, "additional_kwargs", None) or {}
+        hidden = bool(ak.get("expert_work_hide_from_ui"))
+        if not include_hidden and hidden:
+            continue
         text = message_text(getattr(m, "content", ""))
-        if text.strip():
-            out.append(
-                MessageTurn(seq=seq, role="user" if mtype == "human" else "assistant", content=text)
-            )
+        if not text.strip():
+            continue
+        has_tool_calls = mtype == "ai" and bool(getattr(m, "tool_calls", None))
+        starts_segment = (mtype == "human" and not hidden) or (
+            mtype == "ai" and bool(ak.get("expert_work_scheduled_delivery"))
+        )
+        collected.append((seq, mtype, text, has_tool_calls, starts_segment))
+    out: list[MessageTurn] = []
+    for i, (seq, mtype, text, has_tool_calls, _starts_segment) in enumerate(collected):
+        if mtype == "human":
+            out.append(MessageTurn(seq=seq, role="user", content=text))
+            continue
+        # Channel is structural (spec): an assistant turn is "final" iff it is
+        # the last visible turn of its user-delimited segment AND carries no
+        # tool_calls; every other assistant turn is "commentary".
+        nxt = collected[i + 1] if i + 1 < len(collected) else None
+        last_in_segment = nxt is None or nxt[4]
+        channel = "final" if last_in_segment and not has_tool_calls else "commentary"
+        out.append(MessageTurn(seq=seq, role="assistant", content=text, channel=channel))
     return out
 
 
