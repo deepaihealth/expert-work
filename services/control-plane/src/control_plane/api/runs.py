@@ -1344,7 +1344,7 @@ def build_runs_router() -> APIRouter:
         except Exception:
             logger.warning("thread_messages.read_failed", exc_info=True)
             return empty
-        out = [{"role": t.role, "content": t.content} for t in turns]
+        out = [{"role": t.role, "content": t.content, "channel": t.channel} for t in turns]
         return JSONResponse({"success": True, "data": {"messages": out}})
 
     @router.get("/{thread_id}/runs", response_model=None)

@@ -32,6 +32,11 @@ class MessageTurn:
     seq: int
     role: str  # "user" | "assistant"
     content: str
+    #: Structural output channel for assistant turns — "final" (last turn of
+    #: its user-delimited segment AND no tool_calls) or "commentary"
+    #: (everything else); always None for user turns. See
+    #: docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
+    channel: str | None = None
 
 
 class ThreadMessageStore(abc.ABC):

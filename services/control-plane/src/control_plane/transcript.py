@@ -13,6 +13,11 @@ latest checkpoint carries the full history in one ``aget_tuple`` and a
 message's index (``seq``) is stable across reads — the mirror's idempotency
 key. Only human/ai turns with non-empty text survive; tool/system messages
 stay in the per-run event stream by design.
+
+Assistant turns also carry a structural output ``channel`` — "final" iff the
+turn is the last visible one in its user-delimited segment AND has no
+``tool_calls``; otherwise "commentary". See
+docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ async def read_turns(
     if tup is None:
         return []
     raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
-    out: list[MessageTurn] = []
+    collected: list[tuple[int, str, str, bool]] = []
     for seq, m in enumerate(raw):
         mtype = getattr(m, "type", None)
         if mtype not in ("human", "ai"):
@@ -67,10 +72,22 @@ async def read_turns(
             if kwargs.get("expert_work_hide_from_ui"):
                 continue
         text = message_text(getattr(m, "content", ""))
-        if text.strip():
-            out.append(
-                MessageTurn(seq=seq, role="user" if mtype == "human" else "assistant", content=text)
-            )
+        if not text.strip():
+            continue
+        has_tool_calls = mtype == "ai" and bool(getattr(m, "tool_calls", None))
+        collected.append((seq, mtype, text, has_tool_calls))
+    out: list[MessageTurn] = []
+    for i, (seq, mtype, text, has_tool_calls) in enumerate(collected):
+        if mtype == "human":
+            out.append(MessageTurn(seq=seq, role="user", content=text))
+            continue
+        # Channel is structural (spec): an assistant turn is "final" iff it is
+        # the last visible turn of its user-delimited segment AND carries no
+        # tool_calls; every other assistant turn is "commentary".
+        nxt = collected[i + 1] if i + 1 < len(collected) else None
+        last_in_segment = nxt is None or nxt[1] == "human"
+        channel = "final" if last_in_segment and not has_tool_calls else "commentary"
+        out.append(MessageTurn(seq=seq, role="assistant", content=text, channel=channel))
     return out
 
 

@@ -14,10 +14,13 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from control_plane.transcript import read_turns
 from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from expert_work.persistence import InMemoryThreadMessageStore
+
+THREAD_ID = uuid4()
 
 
 def _msg(mtype: str, content: Any) -> SimpleNamespace:
@@ -36,6 +39,14 @@ class _FakeCheckpointer:
         if messages is None:
             return None
         return SimpleNamespace(checkpoint={"channel_values": {"messages": messages}})
+
+
+def _tc(name: str) -> dict[str, Any]:
+    return {"name": name, "args": {}, "id": "call_1"}
+
+
+def _checkpointer_with(msgs: list[HumanMessage | AIMessage]) -> _FakeCheckpointer:
+    return _FakeCheckpointer({str(THREAD_ID): msgs})
 
 
 class _QueueStore(InMemoryThreadMessageStore):
@@ -182,3 +193,46 @@ async def test_run_once_short_circuits_without_checkpointer() -> None:
     sweep = _sweep(store, None)
     assert await sweep.run_once() == 0
     assert store.synced == []
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channels_commentary_and_final() -> None:
+    """段内末条且无 tool_calls = final;带 tool_calls / 非末条 = commentary。"""
+    msgs = [
+        HumanMessage(content="写两章综述"),
+        AIMessage(content="先搜第一章资料", tool_calls=[_tc("web_search")]),
+        AIMessage(content="第一章正文…现在搜第二章", tool_calls=[_tc("web_search")]),
+        AIMessage(content="第二章正文,全文完。"),
+        HumanMessage(content="再补个结论"),
+        AIMessage(content="补充搜索", tool_calls=[_tc("web_search")]),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "commentary"),
+        ("assistant", "commentary"),
+        ("assistant", "final"),
+        ("user", None),
+        # 第二段末条带 tool_calls(暂停/未完轮)→ 无 final
+        ("assistant", "commentary"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_turns_channel_segments_reset_at_user_boundary() -> None:
+    """reflect 打回形态:候选答案被追加消息取代后自动变 commentary。"""
+    msgs = [
+        HumanMessage(content="任务"),
+        AIMessage(content="候选答案 v1"),  # 无 tool_calls,但非段末条
+        HumanMessage(
+            content="[Reflection] 不够好",
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        ),
+        AIMessage(content="答案 v2"),
+    ]
+    turns = await read_turns(_checkpointer_with(msgs), THREAD_ID, include_hidden=False)
+    assert [(t.role, t.channel) for t in turns] == [
+        ("user", None),
+        ("assistant", "commentary"),  # 隐藏行剔除后仍非末条
+        ("assistant", "final"),
+    ]
