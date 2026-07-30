@@ -14,6 +14,7 @@
  * pane, so a template's ``mcpSource="catalog"`` still reaches the MCP tool
  * picker.
  */
+import { useState } from "react";
 import { Tabs } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -26,20 +27,34 @@ interface CapabilitiesSectionProps {
   /** Where the MCP tab sources servers — forwarded verbatim from
    *  ``ManifestEditor``'s own ``mcpSource`` prop. */
   mcpSource?: McpPickerSource;
+  /** #2 — controlled sub-tab, lifted to ManifestEditor so the selection
+   *  survives this pane unmounting on a group switch. Falls back to local
+   *  state when rendered standalone (tests). */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 
 export function CapabilitiesSection({
   formData,
   onChange,
   mcpSource,
+  activeSubTab,
+  onSubTabChange,
 }: CapabilitiesSectionProps) {
   const { t } = useTranslation();
+  const [fallbackSubTab, setFallbackSubTab] = useState("tools");
+  const subTab = activeSubTab ?? fallbackSubTab;
+  const handleSubTabChange = (key: string): void => {
+    setFallbackSubTab(key);
+    onSubTabChange?.(key);
+  };
 
   return (
     <div data-testid="capabilities-section" style={{ maxWidth: 760 }}>
       <Tabs
         size="small"
-        defaultActiveKey="tools"
+        activeKey={subTab}
+        onChange={handleSubTabChange}
         items={[
           {
             key: "tools",

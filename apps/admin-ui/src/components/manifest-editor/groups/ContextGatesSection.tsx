@@ -27,6 +27,7 @@
  * feature-off state (a coarse legacy cap that predates the three gates), not
  * "falls back to a numeric default".
  */
+import { useState } from "react";
 import { Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -42,6 +43,11 @@ const { Text } = Typography;
 interface ContextGatesSectionProps {
   formData: unknown;
   onChange: (data: unknown) => void;
+  /** #2 — controlled sub-tab, lifted to ManifestEditor so the selection
+   *  survives this pane unmounting on a group switch. Falls back to local
+   *  state when rendered standalone (tests). */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 
 // ① tool_result_prune — the cheapest, first-line gate: collapses old tool
@@ -204,8 +210,16 @@ const TOOL_OUTPUT_BUDGET_DEFS: readonly FieldDef[] = [
 export function ContextGatesSection({
   formData,
   onChange,
+  activeSubTab,
+  onSubTabChange,
 }: ContextGatesSectionProps) {
   const { t } = useTranslation();
+  const [fallbackSubTab, setFallbackSubTab] = useState("prune");
+  const subTab = activeSubTab ?? fallbackSubTab;
+  const handleSubTabChange = (key: string): void => {
+    setFallbackSubTab(key);
+    onSubTabChange?.(key);
+  };
   const gates = readContextGates(formData);
   const values = gates as Record<string, number | boolean | undefined>;
 
@@ -225,7 +239,8 @@ export function ContextGatesSection({
       />
       <Tabs
         size="small"
-        defaultActiveKey="prune"
+        activeKey={subTab}
+        onChange={handleSubTabChange}
         items={[
           {
             key: "prune",

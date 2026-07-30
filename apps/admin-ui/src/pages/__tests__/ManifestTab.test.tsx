@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import "../../i18n";
 
 vi.mock("@monaco-editor/react", () => {
@@ -62,10 +63,37 @@ const sampleDetail: AgentDetailResponse = {
   },
 } as AgentDetailResponse;
 
+// The server's post-save re-dump — same agent, but the spec came back
+// coerced/re-serialised (different sha + model), the way a real save's quiet
+// refetch delivers it (#2).
+const savedDetail: AgentDetailResponse = {
+  ...sampleDetail,
+  record: {
+    ...sampleDetail.record,
+    spec_sha256: "f".repeat(64),
+    spec: {
+      apiVersion: "expert_work.io/v1",
+      kind: "Agent",
+      metadata: { name: "demo-agent", version: "1.0.0" },
+      spec: { model: { provider: "anthropic", name: "claude-opus-4-5" } },
+    },
+  },
+} as AgentDetailResponse;
+
 const onSaved = vi.fn();
 // Re-installed in beforeEach: afterEach() runs vi.restoreAllMocks(), which would
 // otherwise permanently restore a module-level spy after the first test.
 let updateAgentMock: ReturnType<typeof vi.spyOn>;
+
+// ManifestTab persists the active config group in the URL (?group=), so it
+// needs a router context (#2).
+function renderTab(detail: AgentDetailResponse = sampleDetail) {
+  return render(
+    <MemoryRouter>
+      <ManifestTab detail={detail} onSaved={onSaved} />
+    </MemoryRouter>,
+  );
+}
 
 beforeEach(() => {
   onSaved.mockClear();
@@ -90,7 +118,7 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("ManifestTab", () => {
   it("renders the visual ManifestEditor form by default (no view/edit toggle)", async () => {
-    render(<ManifestTab detail={sampleDetail} onSaved={onSaved} />);
+    renderTab();
     await waitFor(() => expect(screen.getByTestId("manifest-editor-edit")).toBeInTheDocument());
     // Save + Reset are always present; there is no separate read-only mode.
     expect(screen.getByTestId("manifest-save-btn")).toBeInTheDocument();
@@ -99,7 +127,7 @@ describe("ManifestTab", () => {
   });
 
   it("exposes the raw YAML escape-hatch toggle", async () => {
-    render(<ManifestTab detail={sampleDetail} onSaved={onSaved} />);
+    renderTab();
     await screen.findByTestId("manifest-editor-edit");
     expect(screen.getByTestId("cfg-yaml-toggle")).toBeInTheDocument();
   });
@@ -107,7 +135,7 @@ describe("ManifestTab", () => {
   it("saves edits via updateAgent and stays on the editor", async () => {
     const user = userEvent.setup();
     updateAgentMock.mockResolvedValue(sampleDetail);
-    render(<ManifestTab detail={sampleDetail} onSaved={onSaved} />);
+    renderTab();
     await screen.findByTestId("manifest-editor-edit");
     // edit via the YAML toggle for a deterministic buffer
     await user.click(screen.getByTestId("cfg-yaml-toggle"));
@@ -125,7 +153,7 @@ describe("ManifestTab", () => {
   it("surfaces an error alert when updateAgent rejects", async () => {
     const user = userEvent.setup();
     updateAgentMock.mockRejectedValue(new ApiError("name mismatch", "MANIFEST_PATH_MISMATCH", 422));
-    render(<ManifestTab detail={sampleDetail} onSaved={onSaved} />);
+    renderTab();
     await screen.findByTestId("manifest-editor-edit");
     await user.click(screen.getByTestId("manifest-save-btn"));
     const alert = await screen.findByTestId("manifest-error");
@@ -135,7 +163,7 @@ describe("ManifestTab", () => {
 
   it("Reset re-seeds from the snapshot without calling updateAgent", async () => {
     const user = userEvent.setup();
-    render(<ManifestTab detail={sampleDetail} onSaved={onSaved} />);
+    renderTab();
     await screen.findByTestId("manifest-editor-edit");
     await user.click(screen.getByTestId("cfg-yaml-toggle"));
     const ta = screen.getByTestId("monaco-stub") as HTMLTextAreaElement;
@@ -145,5 +173,73 @@ describe("ManifestTab", () => {
     expect(updateAgentMock).not.toHaveBeenCalled();
     // Editor remounts and re-seeds from the server snapshot.
     await screen.findByTestId("manifest-editor-edit");
+  });
+
+  it("keeps the active group and sub-tab after a save + snapshot refresh (#2)", async () => {
+    const user = userEvent.setup();
+    updateAgentMock.mockResolvedValue(sampleDetail);
+    const { rerender } = renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+
+    // Navigate away from the default group into a non-default sub-tab.
+    await user.click(screen.getByTestId("cfg-nav-security"));
+    await screen.findByTestId("security-section");
+    await user.click(screen.getByRole("tab", { name: "Human approval" }));
+    await screen.findByTestId("security-tab-approval");
+
+    await user.click(screen.getByTestId("manifest-save-btn"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+
+    // The parent's quiet refetch lands: a re-dumped (different) server
+    // snapshot flows in through props. Before #2 this key-remounted the
+    // editor and reset the form position to basic/defenses.
+    rerender(
+      <MemoryRouter>
+        <ManifestTab detail={savedDetail} onSaved={onSaved} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("security-section")).toBeInTheDocument();
+    expect(screen.getByTestId("security-tab-approval")).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "Human approval" }),
+    ).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("adopts the refreshed server snapshot in place — editor content resyncs (#2)", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+
+    rerender(
+      <MemoryRouter>
+        <ManifestTab detail={savedDetail} onSaved={onSaved} />
+      </MemoryRouter>,
+    );
+
+    // The YAML view serialises the editor's working manifest — it must
+    // carry the refreshed snapshot, not the stale mount-time seed.
+    await user.click(screen.getByTestId("cfg-yaml-toggle"));
+    const ta = screen.getByTestId("monaco-stub") as HTMLTextAreaElement;
+    expect(ta.value).toContain("claude-opus-4-5");
+  });
+
+  it("restores the active group from the URL after a full remount (#2)", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("cfg-nav-security"));
+    await screen.findByTestId("security-section");
+
+    // Full remount of the tab (e.g. the page-level skeleton path) — the
+    // router (and its ?group= query) survives, so the editor reopens on
+    // the security group instead of falling back to basic.
+    rerender(
+      <MemoryRouter>
+        <ManifestTab key="remounted" detail={sampleDetail} onSaved={onSaved} />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("manifest-editor-edit");
+    expect(await screen.findByTestId("security-section")).toBeInTheDocument();
   });
 });
