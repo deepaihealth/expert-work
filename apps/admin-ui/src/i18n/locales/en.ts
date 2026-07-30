@@ -1147,6 +1147,7 @@ export interface TranslationKeys {
     events_label: string;
     export_json: string;
     export_json_tip: string;
+    retry: string;
     workspace_label: string;
     workspace_refresh: string;
     workspace_volume: string;
@@ -4141,6 +4142,7 @@ const en: TranslationKeys = {
     export_json: "Export JSON",
     export_json_tip:
       "Export this turn's full event stream (authoritative backend record) as JSON",
+    retry: "Retry",
     workspace_label: "Workspace",
     workspace_refresh: "Refresh workspace",
     workspace_volume: "Volume",

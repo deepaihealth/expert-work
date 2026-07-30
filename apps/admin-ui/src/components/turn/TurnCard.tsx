@@ -27,6 +27,7 @@ import {
   Check,
   Download,
   ExternalLink,
+  RotateCcw,
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -255,6 +256,11 @@ export interface TurnCardProps {
    *  or replayed) reports its result back up into the transcript's task
    *  result cards. */
   onFireResult?: (result: FireNowResult) => void;
+  /** #10 — per-turn retry. Live turns get a real re-dispatch handler; the
+   *  playground's history turns get a backfill-the-input-box handler (a past
+   *  run's enqueued inputs aren't exposed by the backend yet). Not passed on
+   *  the read-only conversation page → the button simply doesn't render. */
+  onRetry?: (turn: Turn) => void;
 }
 
 export function TurnCard({
@@ -277,6 +283,7 @@ export function TurnCard({
   ttftMs = null,
   finalized = false,
   onFireResult,
+  onRetry,
 }: TurnCardProps) {
   const { t } = useTranslation();
   const summary = summarizeTurn(turn.events);
@@ -354,6 +361,14 @@ export function TurnCard({
   // #9e/#11 — 「查看全文」 modal shared by the answer block and the turn's
   // reasoning summary section.
   const [fullText, setFullText] = useState<FullTextState | null>(null);
+  // #10 — failed-turn detection for the retry button's danger styling.
+  // ``turn.status === "error"`` only covers transport-level failures (a
+  // server-side failure emits an ``error`` frame then still settles "done"),
+  // so also read the timeline banner / raw error frames.
+  const turnFailed =
+    turn.status === "error" ||
+    timelineBanner?.status === "error" ||
+    turn.events.some((e) => e.event === "error");
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
@@ -787,6 +802,21 @@ export function TurnCard({
                   >
                     {t("playground.export_json")}
                   </Button>
+                  {/* #10 — one unified retry button (success turns can re-run
+                      too); danger tint marks a failed turn. Hidden while the
+                      turn is still running or when no handler is wired (the
+                      read-only conversation page). */}
+                  {onRetry && turn.status !== "running" && (
+                    <Button
+                      size="small"
+                      danger={turnFailed}
+                      icon={<RotateCcw size={13} strokeWidth={1.75} />}
+                      onClick={() => onRetry(turn)}
+                      data-testid="playground-turn-retry"
+                    >
+                      {t("playground.retry")}
+                    </Button>
+                  )}
                   {langfuseUrl !== null && (
                     <Button
                       size="small"

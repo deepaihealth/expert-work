@@ -357,14 +357,28 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     [patchTurn],
   );
 
-  const handleRun = useCallback(async () => {
+  // #10 — send/retry shared kernel. Assembles docNote + effectiveInput from
+  // the given raw input/attachments/jinja inputs (recomputed here, not passed
+  // pre-baked), pushes a fresh turn and streams it. Concurrency guard =
+  // ``running`` + ``abortRef``, shared by both callers. ``onDispatched`` fires
+  // once the turn is actually in the transcript — the send path uses it to
+  // consume the input box/attachments only when a run really started.
+  const startRun = useCallback(
+    async (
+      req: {
+        input: string;
+        attachments: Attachment[];
+        inputs: Record<string, string>;
+      },
+      onDispatched?: () => void,
+    ) => {
     if (running) return;
     // Lazy — create the backend thread on this first send if it doesn't exist.
     const active = thread ?? (await ensureThread());
     if (!active) return;
     setRunning(true);
-    const turnAttachments = attachments;
-    const turnInput = input;
+    const turnAttachments = req.attachments;
+    const turnInput = req.input;
     const imageRefs = turnAttachments
       .filter((a) => a.kind === "image")
       .map((a) => a.value);
@@ -376,11 +390,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         ? `${t("playground.uploaded_docs_note")}: ${docPaths.join(", ")}\n\n`
         : "";
     const effectiveInput = docNote + turnInput;
-    const inputs: Record<string, string> = {};
-    for (const v of promptVariables) {
-      const val = varValues[v.name];
-      if (val !== undefined && val !== "") inputs[v.name] = val;
-    }
+    const inputs = req.inputs;
     const body: RunRequest = { input: effectiveInput };
     if (imageRefs.length > 0) body.image_refs = imageRefs;
     if (Object.keys(inputs).length > 0) body.inputs = inputs;
@@ -396,15 +406,14 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         id: turnId,
         input: turnInput,
         attachments: turnAttachments,
+        inputs,
         events: [],
         status: "running",
         error: null,
         approval: null,
       },
     ]);
-    // Consume the input + attachments — the next turn starts fresh.
-    setInput("");
-    setAttachments([]);
+    onDispatched?.();
 
     tokenStream.reset();
     setStreamTurnId(turnId);
@@ -461,19 +470,56 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     ) {
       void detectApproval(turnId, threadId, runIdOf(frames));
     }
-  }, [
-    thread,
-    ensureThread,
-    input,
-    running,
-    attachments,
-    promptVariables,
-    varValues,
-    turns.length,
-    t,
-    detectApproval,
-    tokenStream,
-  ]);
+    },
+    [
+      thread,
+      ensureThread,
+      running,
+      turns.length,
+      t,
+      detectApproval,
+      tokenStream,
+    ],
+  );
+
+  const handleRun = useCallback(async () => {
+    const inputs: Record<string, string> = {};
+    for (const v of promptVariables) {
+      const val = varValues[v.name];
+      if (val !== undefined && val !== "") inputs[v.name] = val;
+    }
+    await startRun({ input, attachments, inputs }, () => {
+      // Consume the input + attachments — the next turn starts fresh. Only
+      // fires once the turn actually dispatched (a failed ensureThread keeps
+      // the draft intact, same as before the #10 extraction).
+      setInput("");
+      setAttachments([]);
+    });
+  }, [startRun, input, attachments, promptVariables, varValues]);
+
+  // #10 — live-turn retry: re-dispatch the turn's original input/attachments/
+  // jinja inputs as a NEW turn (attachments are stored refs — no re-upload).
+  const handleRetry = useCallback(
+    (turn: Turn) => {
+      void startRun({
+        input: turn.input,
+        attachments: turn.attachments,
+        inputs: turn.inputs ?? {},
+      });
+    },
+    [startRun],
+  );
+
+  // #10 — history-turn retry: a past run's enqueued inputs live in the
+  // checkpoint (not exposed yet), so retry backfills the input box for the
+  // user to re-send — no backend re-dispatch.
+  const handleHistoryRetry = useCallback(
+    (turn: Turn) => {
+      if (running) return;
+      setInput(turn.input);
+    },
+    [running],
+  );
 
   // #5 — decide a turn's pending approval, then stream the continuation run
   // (the decision spawns it) into the SAME turn, then re-check for a next gate.
@@ -1254,7 +1300,13 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                         input: h.input,
                         attachments: [],
                         events: load.events,
-                        status: "done",
+                        // #10 — surface the run's real terminal state instead
+                        // of a hardcoded "done"; other statuses (interrupted/
+                        // paused/…) keep the normal rendering.
+                        status:
+                          h.status === "error" || h.status === "timeout"
+                            ? "error"
+                            : "done",
                         error: null,
                         approval: null,
                       }}
@@ -1273,6 +1325,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                       loadState={load.state}
                       fallbackAnswer={h.fallbackAnswer}
                       onFireResult={handleFireResult}
+                      onRetry={handleHistoryRetry}
                     />
                   </div>
                 );
@@ -1345,6 +1398,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 turn.id === streamTurnId ? tokenStream.finalized : false
               }
               onFireResult={handleFireResult}
+              onRetry={handleRetry}
             />
           ))}
           {taskResults.map((result) => (

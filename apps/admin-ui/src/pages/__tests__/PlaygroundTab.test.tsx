@@ -714,6 +714,49 @@ describe("PlaygroundTab", () => {
     ).toBe(true);
   });
 
+  // #10 — per-turn retry: the button re-dispatches streamRun with the
+  // original turn's request as a NEW turn.
+  it("retries a turn with the same input via the per-turn retry button", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    const frames = (text: string): SseEvent[] => [
+      {
+        id: "u",
+        event: "updates",
+        data: { agent: { messages: [{ type: "ai", content: text }] } },
+        rawData: "",
+        receivedAt: "2026-05-25T00:00:02Z",
+      },
+      {
+        id: "e",
+        event: "end",
+        data: "ok",
+        rawData: "ok",
+        receivedAt: "2026-05-25T00:00:03Z",
+      },
+    ];
+    streamRunMock.mockReturnValueOnce(makeStream(frames("first answer")));
+    streamRunMock.mockReturnValueOnce(makeStream(frames("retried answer")));
+
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "q1");
+    await user.click(screen.getByTestId("playground-run"));
+    await screen.findByText("first answer");
+
+    await user.click(screen.getByTestId("playground-turn-retry"));
+    await screen.findByText("retried answer");
+
+    // Re-dispatched to the same thread with the exact same request body.
+    expect(streamRunMock).toHaveBeenCalledTimes(2);
+    expect(streamRunMock.mock.calls[1][0]).toBe(sampleThread.thread_id);
+    expect(streamRunMock.mock.calls[1][1]).toEqual(
+      streamRunMock.mock.calls[0][1],
+    );
+    // The retry appended a new turn — the original stays in the transcript.
+    expect(screen.getAllByTestId("playground-turn")).toHaveLength(2);
+  });
+
   it("shows per-turn cost + step + a run-detail link", async () => {
     const user = userEvent.setup();
     const costDetail: AgentDetailResponse = {

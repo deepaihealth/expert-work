@@ -28,6 +28,10 @@ export interface Turn {
   id: string;
   input: string;
   attachments: Attachment[];
+  /** #10 — the jinja prompt-variable values this turn was dispatched with
+   *  (``RunRequest.inputs``), kept so a retry re-sends the same variables.
+   *  Absent on turns that predate the field (history/replayed turns). */
+  inputs?: Record<string, string>;
   events: SseEvent[];
   status: "running" | "done" | "error";
   error: string | null;

@@ -466,7 +466,14 @@ export function ConversationDetail() {
                         input: h.input,
                         attachments: [],
                         events: load.events,
-                        status: "done",
+                        // #10 — surface the run's real terminal state instead
+                        // of a hardcoded "done"; other statuses (interrupted/
+                        // paused/…) keep the normal rendering. No onRetry
+                        // here — the read-only page never dispatches runs.
+                        status:
+                          h.status === "error" || h.status === "timeout"
+                            ? "error"
+                            : "done",
                         error: null,
                         approval: null,
                       }}
