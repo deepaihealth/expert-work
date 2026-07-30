@@ -126,6 +126,13 @@
   box-shadow: 0 0 8px color-mix(in srgb, var(--ew-color-success-500, #22c55e) 45%, transparent);
 }
 
+/* I1 — declared after every `--agent`/`--aux`/`--tool`/`--worker`/`--final`
+   color rule above (same specificity — a single class selector each — so
+   cascade order decides; this must stay last among them to win). */
+.ew-gantt-bar--error {
+  background: var(--ew-text-danger, #ef4444);
+}
+
 .ew-gantt-bar--running {
   opacity: 0.75;
   animation:
@@ -192,13 +199,26 @@
   pointer-events: none;
 }
 
+/* I2 — the ±4px hoverable/clickable hit zone; positioned via inline
+   `left: calc(x% - 4px)` so it's centered on the marker's true x position.
+   `.ew-gantt-marker` (the 1px visual line, unchanged in appearance) sits at
+   its horizontal center via `left: 4px`. */
+.ew-gantt-marker-hit {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  pointer-events: auto;
+}
+
 .ew-gantt-marker {
   position: absolute;
   top: 0;
   bottom: 0;
+  left: 4px;
   width: 0;
   border-left: 1px dashed currentColor;
-  pointer-events: auto;
+  pointer-events: none;
 }
 
 .ew-gantt-detail {

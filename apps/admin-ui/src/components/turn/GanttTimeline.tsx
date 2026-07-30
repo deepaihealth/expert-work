@@ -75,11 +75,21 @@ function axisStepMs(totalMs: number): number {
   return 30_000;
 }
 
+// I3② — a mis-anchored/degraded axis (see gantt_timeline.ts's
+// `firstValidAnchorMs`) could previously make `totalMs` span trillions of
+// ms, so this loop ran toward billions of iterations before ever rendering.
+// I3① fixes the anchoring bug at the source; this cap is the second,
+// independent guard — no realistic turn needs more than 200 gridlines.
+const MAX_TICKS = 200;
+
 function ticksFor(totalMs: number): number[] {
   if (totalMs <= 0) return [];
   const step = axisStepMs(totalMs);
   const out: number[] = [];
-  for (let t = step; t <= totalMs; t += step) out.push(t);
+  for (let t = step; t <= totalMs; t += step) {
+    out.push(t);
+    if (out.length >= MAX_TICKS) break;
+  }
   return out;
 }
 
@@ -131,6 +141,10 @@ export function GanttTimeline({ model, variant, running = false, renderDetail }:
                   ? "ew-gantt-bar--running"
                   : "ew-gantt-bar--interrupted"
                 : null,
+              // I1 — a failed row's bar takes the danger tint over its kind
+              // color, so a red tool/worker bar reads as "this one broke"
+              // rather than blending into the row above/below it.
+              row.hasError ? "ew-gantt-bar--error" : null,
             ]
               .filter((c): c is string => c !== null)
               .join(" ");
@@ -141,6 +155,11 @@ export function GanttTimeline({ model, variant, running = false, renderDetail }:
                 <div
                   className={`ew-gantt-row${open ? " ew-gantt-row--active" : ""}`}
                   data-testid={`gantt-row-${row.key}`}
+                  // I1 — the jump-to-error scroll target (RunStatusBanner's
+                  // onJump in TurnCard queries `[data-error="true"]` inside
+                  // `[data-testid="gantt-timeline"]`), same convention as
+                  // StepTimeline's step/marker rows.
+                  data-error={row.hasError ? "true" : undefined}
                   role="button"
                   tabIndex={0}
                   onClick={() => toggle(row.key)}
@@ -188,15 +207,33 @@ export function GanttTimeline({ model, variant, running = false, renderDetail }:
             );
           })}
           <div className="ew-gantt-markers" aria-hidden={model.markers.length === 0}>
-            {model.markers.map((marker, i) => (
-              <span
-                key={`${marker.kind}-${marker.atMs}-${i}`}
-                className={`ew-gantt-marker ew-gantt-marker--${marker.kind}`}
-                data-testid="gantt-marker"
-                title={marker.text}
-                style={{ left: `${pct(marker.atMs, safeTotal)}%`, color: MARKER_COLOR[marker.kind] }}
-              />
-            ))}
+            {model.markers.map((marker, i) => {
+              // M4 — clamp so a marker landing at/after the axis end (e.g. a
+              // terminal `end` frame at exactly `totalMs`) never pushes the
+              // hit area past 100% and forces horizontal scroll.
+              const leftPct = Math.min(pct(marker.atMs, safeTotal), 100);
+              return (
+                // I2 — the visual tick is a 1px dashed line; a bare 1px hit
+                // target is unreliable to hover/click, so the actual
+                // pointer target is `.ew-gantt-marker-hit`, a ±4px
+                // transparent zone centered on the same x position (the
+                // visual line stays exactly where it was). `title` (native,
+                // no hover delay/dismiss, no focus/keyboard support) is
+                // replaced by an antd Tooltip on the hit area.
+                <Tooltip key={`${marker.kind}-${marker.atMs}-${i}`} title={marker.text}>
+                  <span
+                    className="ew-gantt-marker-hit"
+                    data-testid="gantt-marker"
+                    style={{ left: `calc(${leftPct}% - 4px)` }}
+                  >
+                    <span
+                      className={`ew-gantt-marker ew-gantt-marker--${marker.kind}`}
+                      style={{ color: MARKER_COLOR[marker.kind] }}
+                    />
+                  </span>
+                </Tooltip>
+              );
+            })}
           </div>
         </div>
       </div>

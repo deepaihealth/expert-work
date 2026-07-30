@@ -20,14 +20,10 @@ import type { SseEvent } from "./sessions";
 import { parseTimeline, type AuxNodeItem, type MarkerItem, type TimelineItem } from "./timeline";
 import type { WorkerStepSummary, WorkerTimeline } from "./worker_timeline";
 
-/** Extract the millisecond segment from an SSE frame id (`"{server_ms}-{seq}"`
- *  — live `stream_bridge/memory.py` and replay `runs.py` both emit this
- *  shape). `null` on a missing or malformed id. */
-export function serverMsOf(id: string | null): number | null {
-  if (id === null) return null;
-  const m = /^(\d{10,})-\d+$/.exec(id);
-  return m === null ? null : Number(m[1]);
-}
+// M2 — `serverMsOf` now lives in the dependency-free `sse_id.ts` leaf
+// module; re-exported here so existing `import { serverMsOf } from
+// "./gantt_timeline"` call sites (and tests) keep working unchanged.
+export { serverMsOf } from "./sse_id";
 
 export interface GanttRow {
   key: string;
@@ -39,6 +35,12 @@ export interface GanttRow {
   startMs: number;
   /** `null` = in progress (growing bar) or duration unknown. */
   durationMs: number | null;
+  /** I1 — agent rows take `AgentStep.hasError` (a dispatched tool call
+   *  failed); tool rows take `status === "error"`; worker/aux rows have no
+   *  per-unit error signal upstream yet, so they default `false`. Drives
+   *  the Gantt row's `data-error` anchor (jump-to-error) and its bar's
+   *  danger tint. */
+  hasError: boolean;
   detail:
     | { type: "item"; item: TimelineItem } // agent/aux 行 → 整卡复用
     | { type: "parentStep"; item: TimelineItem }; // tool/worker 行 → 所属步整卡
@@ -108,6 +110,34 @@ function collectWorkerSteps(
   return out;
 }
 
+/** I3① — the absolute ms of the first row (in the same traversal order the
+ *  main loop below uses: agent → its tools → their workers, then aux/marker
+ *  items) that carries a valid frame-id ms. Seeds `buildGanttRows`' initial
+ *  `prevEnd` so a degraded row (missing/malformed id) that precedes every
+ *  valid-id row anchors near the real data instead of absolute-ms `0`
+ *  (~1970) — which previously collapsed the axis to a decades-wide span
+ *  (`totalMs` in the trillions, `ticksFor` looping toward a gridline per
+ *  30s across that whole span). `null` when no row anywhere in the turn has
+ *  a valid id — callers then keep the pre-existing behaviour (chain starts
+ *  at 0), which is harmless there since the whole axis is relative anyway. */
+function firstValidAnchorMs(items: readonly TimelineItem[]): number | null {
+  for (const item of items) {
+    if (item.kind === "agent") {
+      if (item.serverMs != null) return item.serverMs;
+      for (const tool of item.tools) {
+        const pending = tool.status === "pending" || tool.status === "pending_approval";
+        if (!pending && tool.serverMs != null) return tool.serverMs;
+        for (const { step } of collectWorkerSteps(tool.workers ?? [])) {
+          if (step.serverMs != null) return step.serverMs;
+        }
+      }
+      continue;
+    }
+    if (item.serverMs != null) return item.serverMs;
+  }
+  return null;
+}
+
 interface AbsRow {
   key: string;
   label: string;
@@ -117,6 +147,7 @@ interface AbsRow {
   absStart: number;
   absEnd: number;
   durationMs: number | null;
+  hasError: boolean;
   detail: GanttRow["detail"];
 }
 
@@ -127,7 +158,8 @@ export function buildGanttRows(
   const items = parseTimeline(events);
   const absRows: AbsRow[] = [];
   const absMarkers: GanttMarker[] = [];
-  let prevEnd = 0;
+  // I3① — see `firstValidAnchorMs` doc.
+  let prevEnd = firstValidAnchorMs(items) ?? 0;
   let degraded = false;
 
   for (const item of items) {
@@ -144,6 +176,7 @@ export function buildGanttRows(
         absStart: placed.startMs,
         absEnd: placed.endMs,
         durationMs: placed.durationMs,
+        hasError: item.hasError,
         detail: { type: "item", item },
       });
 
@@ -164,6 +197,7 @@ export function buildGanttRows(
           absStart: toolPlaced.startMs,
           absEnd: toolPlaced.endMs,
           durationMs: toolPlaced.durationMs,
+          hasError: tool.status === "error",
           detail: { type: "parentStep", item },
         });
 
@@ -183,6 +217,10 @@ export function buildGanttRows(
             absStart: stepPlaced.startMs,
             absEnd: stepPlaced.endMs,
             durationMs: stepPlaced.durationMs,
+            // I1 — no per-step error signal upstream yet (WorkerStepSummary
+            // carries no status/error field); default false rather than
+            // guess from the parent worker's terminal status.
+            hasError: false,
             detail: { type: "parentStep", item },
           });
         }
@@ -202,6 +240,9 @@ export function buildGanttRows(
         absStart: placed.startMs,
         absEnd: placed.endMs,
         durationMs: placed.durationMs,
+        // I1 — aux nodes (memory recall / planner / reflect / writeback)
+        // have no error concept, only `tone: "normal" | "warn"`.
+        hasError: false,
         detail: { type: "item", item },
       });
       continue;
@@ -224,6 +265,7 @@ export function buildGanttRows(
     depth: r.depth,
     startMs: r.absStart - t0,
     durationMs: r.durationMs,
+    hasError: r.hasError,
     detail: r.detail,
   }));
 

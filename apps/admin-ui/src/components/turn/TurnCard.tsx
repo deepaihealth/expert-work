@@ -1038,8 +1038,20 @@ export function TurnCard({
                           ? (timelineBanner.errorText ?? undefined)
                           : undefined
                       }
-                      // No `onJump` — Gantt has no per-row error DOM anchor
-                      // the way `StepTimeline`'s `[data-error="true"]` did.
+                      // I1 — restored: GanttTimeline rows now carry
+                      // `data-error` (see gantt_timeline.ts's `hasError`),
+                      // so jump-to-error has a DOM anchor again.
+                      onJump={
+                        timelineBanner.status === "error"
+                          ? () => {
+                              document
+                                .querySelector(
+                                  '[data-testid="gantt-timeline"] [data-error="true"]',
+                                )
+                                ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                            }
+                          : undefined
+                      }
                     />
                   )}
                   {gantt.degraded && (

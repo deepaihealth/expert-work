@@ -162,6 +162,16 @@ const fx = {
   pendingTool: [
     upd("agent", agentChannel(1, 500, [{ id: "c1", name: "tool_a" }]), 1000),
   ] satisfies SseEvent[],
+
+  // I3① — the first row has no id (degraded); the second has a valid one.
+  // Before the fix, the degraded row anchored at absolute-ms 0 (~1970)
+  // while the valid row anchored at real epoch-ms (`BASE_MS`+…) — a
+  // decades-wide `totalMs`. Anchoring the degraded row off the first
+  // *valid* row instead keeps everything in the same neighborhood.
+  firstDegradedThenValid: [
+    upd("agent", agentChannel(1, 1000), null),
+    upd("agent", agentChannel(2, 500), 5000),
+  ] satisfies SseEvent[],
 };
 
 describe("buildGanttRows", () => {
@@ -228,5 +238,11 @@ describe("buildGanttRows", () => {
     const tool = m.rows.find((r) => r.kind === "tool");
     expect(tool).toBeDefined();
     expect(tool?.durationMs).toBeNull();
+  });
+
+  it("I3① 首行退化(id 缺失)+ 后行有效 id → totalMs 量级正常(< 1 天),不再锚定绝对 0", () => {
+    const m = buildGanttRows(fx.firstDegradedThenValid);
+    expect(m.degraded).toBe(true);
+    expect(m.totalMs).toBeLessThan(24 * 60 * 60 * 1000);
   });
 });

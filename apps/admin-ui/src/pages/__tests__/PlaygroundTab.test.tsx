@@ -1202,7 +1202,7 @@ describe("PlaygroundTab", () => {
       expect(screen.queryByTestId("run-status-jump")).not.toBeInTheDocument();
     });
 
-    it("shows the error banner when a tool call failed", async () => {
+    it("shows the error banner when a tool call failed, and 'jump' scrolls the failing Gantt row into view", async () => {
       const user = userEvent.setup();
       createSessionMock.mockResolvedValue(sampleThread);
       streamRunMock.mockReturnValue(
@@ -1258,12 +1258,20 @@ describe("PlaygroundTab", () => {
 
       const banner = await screen.findByTestId("run-status-banner");
       expect(banner).toHaveTextContent(i18n.t("playground.tl_step", { n: 3 }));
-      // Task 3 — the timeline eventView's banner no longer wires `onJump`:
-      // `GanttTimeline` rows have no `[data-error="true"]` DOM anchor the
-      // way `StepTimeline`'s step cards did, so the "jump to error" button
-      // no longer renders here (still present + wired for the "exact" view's
-      // trace banner, which reads its own span-level `data-error`).
-      expect(screen.queryByTestId("run-status-jump")).not.toBeInTheDocument();
+
+      // I1 — restored: `GanttTimeline` rows now carry `data-error` (see
+      // gantt_timeline.ts's `hasError`), so the "jump to error" button
+      // renders again and targets the first errored row (same pattern as
+      // the "exact" view's trace-row jump test below).
+      const errorRow = screen
+        .getAllByTestId(/^gantt-row-/)
+        .find((row) => row.getAttribute("data-error") === "true");
+      expect(errorRow).toBeTruthy();
+      const scrollSpy = vi.fn();
+      if (errorRow) errorRow.scrollIntoView = scrollSpy;
+
+      await user.click(screen.getByTestId("run-status-jump"));
+      expect(scrollSpy).toHaveBeenCalledTimes(1);
     });
 
     it("shows a top-level error event's message once (not duplicated) when no failing tool step owns the label", async () => {

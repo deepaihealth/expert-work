@@ -42,6 +42,7 @@ function row(overrides: Partial<GanttRow> & Pick<GanttRow, "key" | "label">): Ga
     depth: 0,
     startMs: 0,
     durationMs: 1000,
+    hasError: false,
     detail: { type: "item", item: FAKE_ITEM },
     ...overrides,
   };
@@ -136,7 +137,7 @@ describe("GanttTimeline", () => {
     expect(screen.queryByTestId("detail-body")).not.toBeInTheDocument();
   });
 
-  it("kind=final 行携带 final 语义色 class;marker 渲染为轴上刻度并带 title", () => {
+  it("kind=final 行携带 final 语义色 class;marker 渲染为轴上刻度并带 Tooltip", async () => {
     const model = buildModel(
       [row({ key: "final-1", label: "最终输出", kind: "final", startMs: 8000, durationMs: 2000 })],
       [{ atMs: 4300, kind: "error", text: "web_search 失败:超时" }],
@@ -146,8 +147,25 @@ describe("GanttTimeline", () => {
 
     expect(screen.getByTestId("gantt-bar-final-1").className).toContain("ew-gantt-bar--final");
 
+    // I2 — a native `title` attribute has no hover delay/dismiss and no
+    // keyboard/focus support; replaced by an antd Tooltip on the ±4px hit
+    // area (same mouseEnter/waitFor pattern as the label-column tooltip
+    // test above).
     const marker = screen.getByTestId("gantt-marker");
-    expect(marker).toHaveAttribute("title", "web_search 失败:超时");
+    fireEvent.mouseEnter(marker);
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent("web_search 失败:超时"));
+  });
+
+  it("I3② 巨大 totalMs(退化锚定异常场景)不生成海量刻度,上限 200", () => {
+    const model = buildModel(
+      [row({ key: "r1", label: "步骤 1", startMs: 0, durationMs: 1000 })],
+      [],
+      10_000_000_000, // pathological — uncapped would be ~333k 30s-step ticks
+    );
+    const { container } = render(
+      <GanttTimeline model={model} variant="expanded" renderDetail={() => null} />,
+    );
+    expect(container.querySelectorAll(".ew-gantt-tick").length).toBeLessThanOrEqual(200);
   });
 
   it("durationMs=null 行渲染生长条 class(running)或中断态(!running)", () => {
