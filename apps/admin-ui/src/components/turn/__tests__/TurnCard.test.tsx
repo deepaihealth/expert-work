@@ -137,18 +137,22 @@ function renderCard(props: Partial<Parameters<typeof TurnCard>[0]> = {}) {
 }
 
 describe("TurnCard (read-only)", () => {
-  it("renders the replayed run's step timeline and tool call card", () => {
+  it("renders the replayed run's Gantt timeline and tool call card", () => {
     renderCard({ readOnly: true, loadState: "done" });
 
     expect(screen.getByTestId("playground-turn")).toBeInTheDocument();
     expect(screen.getByText("what happened?")).toBeInTheDocument();
     expect(screen.getByText("replayed answer")).toBeInTheDocument();
-    expect(screen.getByTestId("step-timeline")).toBeInTheDocument();
+    // Task 3 — the timeline eventView now renders `GanttTimeline`, not
+    // `StepTimeline` directly.
+    expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
     expect(screen.getByTestId("playground-tool-count")).toHaveTextContent("1");
 
-    // Tool cards live inside a step card's collapsed body — expand the step
-    // that made the call.
-    fireEvent.click(screen.getAllByTestId("step-head")[0]);
+    // Row detail reuses the existing step card (StepTimeline, single-item
+    // array) — expand the row for the step that made the call, then its
+    // (collapsed-by-default) step head, to reach the nested tool call card.
+    fireEvent.click(screen.getByTestId("gantt-row-item-0"));
+    fireEvent.click(screen.getByTestId("step-head"));
     const toolCards = screen.getAllByTestId("tool-call-card");
     expect(toolCards.length).toBe(1);
     expect(within(toolCards[0]).getByText("search")).toBeInTheDocument();
@@ -382,5 +386,97 @@ describe("TurnCard answer area (#8 / #11 / C1)", () => {
     // The banner already states the outcome — no "(no text answer)"
     // placeholder stacked underneath it.
     expect(screen.queryByText("(no text answer)")).not.toBeInTheDocument();
+  });
+});
+
+/** Task 3 — the "timeline" eventView branch now renders `GanttTimeline`
+ *  instead of `StepTimeline` directly; row detail expansion reuses the
+ *  existing `StepTimeline` (single-item array) for the整卡 content, and a
+ *  header button opens a 92vw Modal with the `expanded` variant of the same
+ *  model/renderDetail. See task-3-brief.md Step 1. */
+describe("TurnCard timeline view → Gantt (Task 3)", () => {
+  it("renders GanttTimeline (not StepTimeline) for the timeline view", () => {
+    renderCard({ readOnly: true, loadState: "done" });
+
+    expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
+    expect(screen.queryByTestId("step-timeline")).not.toBeInTheDocument();
+  });
+
+  it("放大按钮打开 92vw Modal,内渲 expanded variant 的 GanttTimeline", () => {
+    renderCard({ readOnly: true, loadState: "done" });
+
+    fireEvent.click(screen.getByTestId("playground-gantt-expand"));
+
+    const instances = screen.getAllByTestId("gantt-timeline");
+    const expanded = instances.find((el) => el.getAttribute("data-variant") === "expanded");
+    expect(expanded).toBeInTheDocument();
+    // The embedded copy stays mounted behind the modal (only the modal's
+    // visibility toggles), so both variants coexist while open.
+    expect(instances.some((el) => el.getAttribute("data-variant") === "embedded")).toBe(true);
+  });
+
+  it("点击 Gantt 行展开出现有 StepTimeline 整卡内容(AgentStepCard 稳定 testid)", () => {
+    renderCard({ readOnly: true, loadState: "done" });
+
+    const [firstAgentRow] = screen.getAllByTestId(/^gantt-row-item-/);
+    fireEvent.click(firstAgentRow);
+
+    expect(screen.getByTestId("step-card")).toBeInTheDocument();
+  });
+
+  it("degraded(帧 id 缺失)时显示提示文案", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({ events: replayEvents.map((e) => ({ ...e, id: null })) }),
+    });
+
+    expect(
+      screen.getByText(
+        "Timeline approximated by event order (server timestamps unavailable)",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("running 时,进行中(无 duration)的行渲染生长条 class", () => {
+    const runningEvents: SseEvent[] = [
+      {
+        id: "1722400000000-1",
+        event: "metadata",
+        data: { run_id: "run-live-1" },
+        rawData: "",
+        receivedAt: new Date().toISOString(),
+      },
+      {
+        id: "1722400000500-2",
+        event: "updates",
+        data: {
+          agent: {
+            step_count: 1,
+            _duration_ms: 400,
+            messages: [
+              {
+                type: "ai",
+                content: "",
+                tool_calls: [{ id: "c1", name: "search", args: {}, type: "tool_call" }],
+              },
+            ],
+          },
+        },
+        rawData: "",
+        receivedAt: new Date().toISOString(),
+      },
+      // No RESULT frame for `c1` — the tool call is still pending, so its
+      // Gantt row gets `durationMs: null` (the growing-bar case).
+    ];
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({ events: runningEvents, status: "running" }),
+    });
+
+    expect(screen.getByTestId("gantt-bar-tool-c1").className).toContain(
+      "ew-gantt-bar--running",
+    );
   });
 });

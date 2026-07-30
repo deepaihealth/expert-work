@@ -16,6 +16,7 @@ import {
   Alert,
   Button,
   Collapse,
+  Modal,
   Segmented,
   Space,
   Spin,
@@ -27,6 +28,7 @@ import {
   Check,
   Download,
   ExternalLink,
+  Maximize2,
   MessageSquareText,
   RotateCcw,
   X,
@@ -34,6 +36,7 @@ import {
 import { useTranslation } from "react-i18next";
 
 import type { ApprovalItem } from "../../api/approvals";
+import { buildGanttRows, serverMsOf, type GanttModel, type GanttRow } from "../../api/gantt_timeline";
 import type { RateCardRecord } from "../../api/rate_card";
 import { getRun } from "../../api/runs";
 import { getRunTrace, type RunTrace } from "../../api/trace_facade";
@@ -48,7 +51,6 @@ import type { FireNowResult } from "../../api/triggers";
 import { summarizeTurn } from "../../api/turn_summary";
 import { parseAgentState } from "../../api/agent_state";
 import { parseTimeline } from "../../api/timeline";
-import { filterTimeline, type TimelineFilter } from "../../api/timeline_filter";
 import { CompactionSummaryList } from "../CompactionCard";
 import { EventCard } from "../EventCard";
 import { MarkdownView } from "../MarkdownView";
@@ -58,7 +60,6 @@ import type { FallbackLine } from "../../pages/agent_detail/playground/history_t
 import { RunStatusBanner } from "../../pages/agent_detail/playground/RunStatusBanner";
 import { StepTimeline } from "../../pages/agent_detail/playground/StepTimeline";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
-import { TimelineFilterBar } from "../../pages/agent_detail/playground/TimelineFilterBar";
 import { timelineBannerModel } from "../../pages/agent_detail/playground/timeline_banner";
 import { traceBannerModel } from "../../pages/agent_detail/playground/trace_banner";
 import { TraceView } from "../../pages/agent_detail/playground/TraceView";
@@ -72,6 +73,7 @@ import {
   FullTextTrigger,
   type FullTextState,
 } from "./FullTextModal";
+import { GanttTimeline } from "./GanttTimeline";
 import type { Turn } from "./types";
 
 const { Text } = Typography;
@@ -129,6 +131,28 @@ export function runIdOf(events: readonly SseEvent[]): string | null {
     ) {
       const rid = (e.data as Record<string, unknown>).run_id;
       if (typeof rid === "string" && rid) return rid;
+    }
+  }
+  return null;
+}
+
+/** Task 3 — Gantt growing-bar calibration anchor: the most recent SSE frame
+ *  carrying a valid server-ms id (``serverMsOf``) plus the client wall-clock
+ *  moment it was received. ``GanttModel`` is a point-in-time snapshot with no
+ *  "now" input (Task 2's documented boundary) — the caller advances
+ *  ``model.totalMs`` itself using ``lastFrame.serverMs + (Date.now() -
+ *  lastFrame.receivedAtMs)`` (design doc: 客户端 now 与最近帧 id_ms 的偏差
+ *  校准), never raw ``Date.now()`` alone, so client/server clock skew never
+ *  leaks into the axis. ``null`` when no frame has a parseable id — the
+ *  caller then leaves the axis static (same as a settled turn). */
+function lastKnownFrame(
+  events: readonly SseEvent[],
+): { serverMs: number; receivedAtMs: number } | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const serverMs = serverMsOf(events[i].id);
+    const receivedAtMs = Date.parse(events[i].receivedAt);
+    if (serverMs !== null && Number.isFinite(receivedAtMs)) {
+      return { serverMs, receivedAtMs };
     }
   }
   return null;
@@ -337,28 +361,61 @@ export function TurnCard({
   const retries = parseRetryEvents(turn.events);
   const compactions = parseCompactionEvents(turn.events);
   const timeline = useMemo(() => parseTimeline(turn.events), [turn.events]);
-  const [tlType, setTlType] = useState<TimelineFilter>("all");
-  const [tlQuery, setTlQuery] = useState("");
-  const visibleTimeline = useMemo(
-    () => filterTimeline(timeline, tlType, tlQuery),
-    [timeline, tlType, tlQuery],
+  // Task 3 — the "timeline" eventView renders `GanttTimeline` (Gantt
+  // execution trace) instead of `StepTimeline`; built straight off
+  // `turn.events` (Task 1's `buildGanttRows` reuses `parseTimeline`/
+  // `parseToolCalls`/`parseWorkerFrames` internally, so this isn't a second
+  // parse pass). `settled` flips once the run leaves "running" so the last
+  // no-tool-calls agent row gets `kind: "final"` (#1072 final-step
+  // semantics — see gantt_timeline.ts).
+  const gantt = useMemo(
+    () => buildGanttRows(turn.events, { settled: turn.status !== "running" }),
+    [turn.events, turn.status],
   );
-  const timelineToolCount = visibleTimeline.filter(
-    (it) => it.kind === "agent" && it.tools.length > 0,
-  ).length;
-  const timelineFailCount = visibleTimeline.filter(
-    (it) => (it.kind === "agent" && it.hasError) || it.kind === "error",
-  ).length;
-  const timelineCount = t("playground.tl_count", {
-    shown: visibleTimeline.length,
-    tools: timelineToolCount,
-    fails: timelineFailCount,
-  });
+  // Growing bar: while running, tick every 1s so the axis (and any pending
+  // tool/worker row stretching to its right edge) keeps advancing between
+  // SSE frames instead of freezing at the last known event — cleared the
+  // instant the turn settles (effect cleanup + the `turn.status` dep).
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    if (turn.status !== "running") return;
+    const id = window.setInterval(() => setNowTick((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [turn.status]);
+  // `GanttModel` is a point-in-time snapshot (Task 2's documented boundary —
+  // it has no "now" input); advance its `totalMs` here using the calibrated
+  // "now" (`lastKnownFrame` above the component) so the axis actually grows
+  // between frames rather than freezing.
+  const ganttModel = useMemo((): GanttModel => {
+    if (turn.status !== "running") return gantt;
+    const last = lastKnownFrame(turn.events);
+    if (last === null) return gantt;
+    const nowServerMs = last.serverMs + (Date.now() - last.receivedAtMs);
+    const grownTotalMs = gantt.totalMs + Math.max(0, nowServerMs - last.serverMs);
+    return grownTotalMs > gantt.totalMs ? { ...gantt, totalMs: grownTotalMs } : gantt;
+  }, [gantt, turn.status, turn.events, nowTick]);
+  const [ganttExpanded, setGanttExpanded] = useState(false);
+  // Row detail — a thin adapter handing the row's underlying `TimelineItem`
+  // to the existing 整卡 (full-card) renderer. Both `detail.type` variants
+  // ("item" for agent/aux rows, "parentStep" for tool/worker rows) carry the
+  // same `TimelineItem`, so a single-element `StepTimeline` array reuses the
+  // existing card verbatim (nested tool/worker sub-timeline included) — no
+  // new detail-rendering logic.
+  const renderGanttDetail = useCallback(
+    (row: GanttRow) => (
+      <StepTimeline
+        items={[row.detail.item]}
+        liveByStep={liveByStep}
+        ttftMs={ttftMs}
+        finalized={finalized}
+        onFireResult={onFireResult}
+      />
+    ),
+    [liveByStep, ttftMs, finalized, onFireResult],
+  );
   // Task 11 — RunStatusBanner status for the timeline view, derived from
   // this turn's own SSE-parsed items (NOT Langfuse level, unlike the exact
-  // view's traceBanner below). Derives from the UNFILTERED `timeline`, not
-  // `visibleTimeline`: a type/query filter that hides the failing step must
-  // never flip run status to a false "succeeded".
+  // view's traceBanner below).
   const timelineBanner = useMemo(() => timelineBannerModel(timeline), [timeline]);
   // parseAgentState always returns a plain object (never null), so a bare
   // truthiness check on it would always pass — check its channels instead so
@@ -895,6 +952,19 @@ export function TurnCard({
                     ]}
                     data-testid="playground-event-view-toggle"
                   />
+                  {/* Task 3 — Gantt-only affordance: opens the 92vw `expanded`
+                      variant of the same model/renderDetail (FullTextModal
+                      sizing precedent). */}
+                  {eventView === "timeline" && (
+                    <Button
+                      size="small"
+                      icon={<Maximize2 size={13} strokeWidth={1.75} />}
+                      onClick={() => setGanttExpanded(true)}
+                      title={t("playground.gantt_expand")}
+                      aria-label={t("playground.gantt_expand")}
+                      data-testid="playground-gantt-expand"
+                    />
+                  )}
                   <Button
                     size="small"
                     icon={<Download size={13} strokeWidth={1.75} />}
@@ -965,32 +1035,24 @@ export function TurnCard({
                           ? (timelineBanner.errorText ?? undefined)
                           : undefined
                       }
-                      onJump={
-                        timelineBanner.status === "error"
-                          ? () => {
-                              document
-                                .querySelector(
-                                  '[data-testid="step-timeline"] [data-error="true"]',
-                                )
-                                ?.scrollIntoView({ behavior: "smooth", block: "center" });
-                            }
-                          : undefined
-                      }
+                      // No `onJump` — Gantt has no per-row error DOM anchor
+                      // the way `StepTimeline`'s `[data-error="true"]` did.
                     />
                   )}
-                  <TimelineFilterBar
-                    type={tlType}
-                    query={tlQuery}
-                    onType={setTlType}
-                    onQuery={setTlQuery}
-                    count={timelineCount}
-                  />
-                  <StepTimeline
-                    items={visibleTimeline}
-                    liveByStep={liveByStep}
-                    ttftMs={ttftMs}
-                    finalized={finalized}
-                    onFireResult={onFireResult}
+                  {gantt.degraded && (
+                    <Text
+                      type="secondary"
+                      style={{ fontSize: 12, display: "block", marginBottom: 6 }}
+                      data-testid="playground-gantt-degraded"
+                    >
+                      {t("playground.gantt_degraded")}
+                    </Text>
+                  )}
+                  <GanttTimeline
+                    model={ganttModel}
+                    variant="embedded"
+                    running={turn.status === "running"}
+                    renderDetail={renderGanttDetail}
                   />
                 </>
               ) : eventView === "exact" ? (
@@ -1065,6 +1127,25 @@ export function TurnCard({
         ]}
       />
       <FullTextModal state={fullText} onClose={() => setFullText(null)} />
+      {/* Task 3 — Gantt 放大 Modal: same model/renderDetail as the embedded
+          copy above, just the `expanded` variant (wider label column, model
+          name + duration always visible). Sizing matches FullTextModal's
+          92vw precedent, widened for the axis. */}
+      <Modal
+        open={ganttExpanded}
+        onCancel={() => setGanttExpanded(false)}
+        footer={null}
+        width="min(92vw, 1680px)"
+        destroyOnHidden
+        title={t("playground.gantt_expand")}
+      >
+        <GanttTimeline
+          model={ganttModel}
+          variant="expanded"
+          running={turn.status === "running"}
+          renderDetail={renderGanttDetail}
+        />
+      </Modal>
     </div>
   );
 }

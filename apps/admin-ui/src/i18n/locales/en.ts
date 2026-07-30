@@ -1274,6 +1274,8 @@ export interface TranslationKeys {
     lifecycle_fired: string;
     lifecycle_completed: string;
     fire_pending: string;
+    gantt_expand: string;
+    gantt_degraded: string;
   };
   session_history: {
     title: string;
@@ -4277,6 +4279,8 @@ const en: TranslationKeys = {
     lifecycle_completed: "Completed",
     fire_pending:
       "The result hasn't landed yet — the run is still going. Reopen this conversation later to see it.",
+    gantt_expand: "Expand",
+    gantt_degraded: "Timeline approximated by event order (server timestamps unavailable)",
   },
   session_history: {
     title: "Session history",

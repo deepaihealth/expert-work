@@ -72,6 +72,10 @@ describe("GanttTimeline", () => {
       <GanttTimeline model={model} variant="expanded" renderDetail={() => null} />,
     );
     expect(screen.getByTestId("gantt-dur-r1").className).not.toContain("gantt-dur-hover");
+    // Task 2 self-review follow-up — the expanded density surfaces the model
+    // name directly in the row (not just via the tooltip the embedded
+    // density falls back to).
+    expect(screen.getByText("glm-5.2")).toBeInTheDocument();
     expanded.unmount();
   });
 

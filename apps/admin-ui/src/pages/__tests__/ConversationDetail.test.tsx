@@ -428,9 +428,13 @@ describe("ConversationDetail", () => {
       );
       // The replayed content renders — not just the stored fallback text.
       expect(await screen.findByText("replayed answer")).toBeInTheDocument();
-      expect(screen.getByTestId("step-timeline")).toBeInTheDocument();
+      // Task 3 — the timeline eventView renders `GanttTimeline`, not
+      // `StepTimeline` directly; its row detail reuses the existing step
+      // card (single-item `StepTimeline`, collapsed by default).
+      expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
       expect(screen.getByTestId("playground-tool-count")).toHaveTextContent("1");
-      fireEvent.click(screen.getAllByTestId("step-head")[0]);
+      fireEvent.click(screen.getByTestId("gantt-row-item-0"));
+      fireEvent.click(screen.getByTestId("step-head"));
       const toolCards = screen.getAllByTestId("tool-call-card");
       expect(toolCards).toHaveLength(1);
       expect(within(toolCards[0]).getByText("search")).toBeInTheDocument();

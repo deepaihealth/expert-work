@@ -1337,6 +1337,8 @@ const zhCN: TranslationKeys = {
     lifecycle_fired: "已触发",
     lifecycle_completed: "已完成",
     fire_pending: "结果还没送达 —— 运行仍在进行中,稍后重新打开该对话即可看到结果。",
+    gantt_expand: "放大查看",
+    gantt_degraded: "时间轴按事件顺序近似(缺服务端时戳)",
   },
   session_history: {
     title: "会话历史",
