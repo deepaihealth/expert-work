@@ -401,17 +401,20 @@ export function TurnCard({
   // same `TimelineItem`, so a single-element `StepTimeline` array reuses the
   // existing card verbatim (nested tool/worker sub-timeline included) — no
   // new detail-rendering logic.
+  // C2 — does NOT forward `liveByStep`/`ttftMs`/`finalized`: this single-row
+  // `StepTimeline` only ever renders `row.detail.item` (a settled item), but
+  // the full `liveByStep` map covers every in-flight step, not just this
+  // row's. A single-element `StepTimeline` treats every step absent from its
+  // (one-item) `settled` set as unsettled — so passing the whole map here
+  // made every OTHER step's live buffer render as a phantom "interrupted"
+  // card under whichever row happened to be expanded. The live surface now
+  // lives once, alongside the Gantt (see the C1 sibling `StepTimeline` in
+  // the `eventView === "timeline"` branch below), not per-row.
   const renderGanttDetail = useCallback(
     (row: GanttRow) => (
-      <StepTimeline
-        items={[row.detail.item]}
-        liveByStep={liveByStep}
-        ttftMs={ttftMs}
-        finalized={finalized}
-        onFireResult={onFireResult}
-      />
+      <StepTimeline items={[row.detail.item]} onFireResult={onFireResult} />
     ),
-    [liveByStep, ttftMs, finalized, onFireResult],
+    [onFireResult],
   );
   // Task 11 — RunStatusBanner status for the timeline view, derived from
   // this turn's own SSE-parsed items (NOT Langfuse level, unlike the exact
@@ -1053,6 +1056,19 @@ export function TurnCard({
                     variant="embedded"
                     running={turn.status === "running"}
                     renderDetail={renderGanttDetail}
+                  />
+                  {/* C1 — the Gantt has no render surface for a still-
+                      streaming step (it has no settled row yet, so it never
+                      appears in `ganttModel.rows`); without this, switching
+                      to the "timeline" view during a live run showed no
+                      typewriter at all. `items={[]}` renders nothing but the
+                      still-unsettled live cards (probe-verified) — settled
+                      steps stay Gantt-only, never duplicated here. */}
+                  <StepTimeline
+                    items={[]}
+                    liveByStep={liveByStep}
+                    ttftMs={ttftMs}
+                    finalized={finalized}
                   />
                 </>
               ) : eventView === "exact" ? (
