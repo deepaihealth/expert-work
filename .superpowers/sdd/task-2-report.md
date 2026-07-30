@@ -1,56 +1,72 @@
-# Task 2 Report — POST /v1/members/{member_id}:purge(PR5 组合端点,D1+D2)
+# Task 2 Report — `GanttTimeline` 组件(行/条/轴/两档/tooltip)
 
 ## STATUS
 
-DONE — TDD 先红后绿,7 测全绿,变异自验通过,已提交。
+DONE — TDD 先红后绿,5 测全绿,已提交。
 
-## Commits
+## Commit
 
-- `9eb96081` feat(control-plane): 成员一键停用并清除端点(生命周期+KC 删账号+收权+数据清除)
+- `a7d7703c` feat(ui): GanttTimeline 组件——两档形态+标签 tooltip+并发条形
 
 ## 变更文件
 
-- `packages/expert-work-protocol/src/expert_work/protocol/audit.py` — MEMBER_SUSPEND 后加 `MEMBER_PURGE = "member:purge"`(带 PR5 注释;全库 grep 确认 member 系 action 字符串无前端/其他镜像,单源)。
-- `services/control-plane/src/control_plane/api/members.py` — revoke 端点后新增 `POST /{member_id}:purge`:
-  1. lifecycle:invited→revoked / active→suspended(转移失败 → **409 MEMBER_STATE_CONFLICT,零副作用**);suspended/revoked 补清路径不转移;
-  2. role_binding 清理(照 revoke 块,`keycloak_user_id` 键,best-effort + 失败布尔);
-  3. KC `delete_user`(D2,best-effort,`KeycloakUnavailableError` → `kc_delete_failed`;client 404=成功幂等);`keycloak_user_id is None` 跳过;
-  4. 数据级联:`member.subject_id` 非 NULL → `users.get` 取 user 行拿字符串 subject → `purge_user(...)`;user 行缺失(异常态)→ `data_purged: false` 不炸;
-  5. 审计 `MEMBER_PURGE`(details:email/from_status/kc_deleted/kc_delete_failed/role_bindings_removed/role_bindings_cleanup_failed/data_purged);
-  6. 200 信封 `data = {member_id, status, kc_deleted, kc_delete_failed, role_bindings_removed, role_bindings_cleanup_failed, data_purged, purge}`(`purge` = PurgeSummary.as_dict() 或 null)——契约照 brief,T3 消费。
-  - 复用 `agent_users._build_purge_deps`(同应用内私有共享,import 处加注释说明设计决定);日志全静态串 + `exc_info=True`。
-- `services/control-plane/tests/test_members_api.py` — 状态机矩阵 7 测(brief ①–⑦逐字)+ 两个小 helper(`_invite_one` / `_activate_with_data`)。
+- `apps/admin-ui/src/components/turn/GanttTimeline.tsx`(新)— 组件本体。
+- `apps/admin-ui/src/components/turn/GanttTimeline.css`(新)— 组件专属样式(见下方「实现备注」的必要性说明)。
+- `apps/admin-ui/src/components/turn/__tests__/GanttTimeline.test.tsx`(新)— brief Step 1 五条测试,逐字对齐。
 
-## 测试矩阵(brief Step 1 ①–⑦)
+## 接口(按 brief 定稿,未偏离)
 
-| # | 用例 | 断言要点 |
-|---|------|---------|
-| ① | invited → revoked | KC 账号删(`len(kc.users)==0`)、`data_purged=false`、`purge=null`、binding 清 1、审计 details 全布尔/计数 |
-| ② | active(subject_id+thread 数据)→ suspended | KC 删、`purge.threads_purged==1`、`purge.deactivated=true`、`purge.ok=true`、thread 行真消失、审计 `data_purged=true` |
-| ③ | suspended 补清 | 状态不变、KC 删(suspend 时只 disabled 过)、数据照清 |
-| ④ | 重跑幂等 | 200、binding=0、`purge.threads_purged==0`、`purge.ok=true`、无失败布尔 |
-| ⑤ | KC 失败注入(monkeypatch 抛 KeycloakUnavailableError) | 200、`kc_deleted=false`+`kc_delete_failed=true`、其余步照走(状态转移+binding+数据全完成) |
-| ⑥ | viewer | 403,KC 账号原封不动 |
-| ⑦ | transition 注入返 False | **409 MEMBER_STATE_CONFLICT**;KC 账号在、binding 在、thread 在、无 MEMBER_PURGE 审计行(零副作用) |
+```tsx
+export interface GanttTimelineProps {
+  model: GanttModel;
+  variant: "embedded" | "expanded";
+  running?: boolean;
+  renderDetail: (row: GanttRow) => ReactNode;
+}
+export function GanttTimeline(props: GanttTimelineProps): JSX.Element;
+```
 
-- **红**:7 测先写,实现前全 FAILED(405 Method Not Allowed —— 路由不存在,失败原因正确)。
-- **绿**:实现后 `test_members_api.py` 27 passed(20 存量 + 7 新)。
+消费 Task 1 `api/gantt_timeline.ts` 的真实导出(`GanttModel.rows/markers/totalMs/degraded`;`GanttRow.label/model/kind/depth/startMs/durationMs/detail`)——已核对该文件字段,组件不读取 `detail` 内部结构,只原样转发给调用方注入的 `renderDetail`。
 
-## 变异自验(brief Step 5,必做)
+## 实现要点
 
-- 注掉 `await keycloak.delete_user(...)` 步 → **4 测红**:①②③(`len(kc.users)==0` 断言炸)+ ⑤(失败注入永不触发,`kc_delete_failed` 恒 False)。
-- 恢复 → 全绿。KC 删除步被测试真实压住,①②的 KC 断言 load-bearing 确认。
+- **两档共用一套 class**:标签列宽度(176px/292px)、model 名显隐、时长常显/悬停显、marker 覆盖层的 `left` 偏移,全部靠根节点 `data-variant="embedded"|"expanded"` 属性 + CSS 后代选择器切换(仿原型 `body.compact` 的做法),JSX 里不做双份宽度分支,只有 model 文案本身按 `!embedded &&` 条件不渲染(嵌入态压根不产出该 DOM,不只是隐藏)。
+- **条形几何**:`left = startMs/totalMs*100%`,`width = max(durationMs/totalMs*100%, 0.35%)`;`durationMs === null` 行按「延伸到轴右边界」处理(`width = max((totalMs-startMs)/totalMs*100%, 0.35%)`),再叠加 `running` 决定的 `ew-gantt-bar--running`(生长/脉冲动画)或 `ew-gantt-bar--interrupted`(斜纹中断态)修饰类。`totalMs<=0` 时用 `safeTotal=1` 兜底避免除零。
+- **时间轴刻度**:`totalMs<10s→1s`、`<60s→10s`、否则 `30s`,三档都整除到整秒,tick 文案直接 `${ms/1000}s`。
+- **色 class → `--ew-*` 令牌**(先 grep 了 `theme/tokens.css` 全表,未新增令牌):
+  - agent → `var(--ew-text-info)`(brand 蓝,StepTimeline 的 `INFO` 同源)
+  - aux → `var(--ew-accent-violet)`(brief 要的紫,表里已有,非新增)
+  - tool → `var(--ew-text-success)`
+  - worker → `var(--ew-text-warning)`
+  - final → `var(--ew-color-success-500)` raw 色阶(比语义层 `--ew-text-success` 更饱和的"强绿",brief 明确要求 final 与 tool 视觉可区分;不是新令牌,是既有色阶里挑更浓的一档)+ `color-mix` 出的 box-shadow 光晕,避免硬编码 rgba 表达"颜色"。
+  - marker 六种 kind 复用同一张令牌(warn/danger/violet/success 四色分派),不新增。
+- **缩进**:`paddingLeft = depth*18+10`,`depth>0` 前缀 `└`(`aria-hidden` 装饰性字符)。
+- **点击展开**:单个 `openKey` state,一次一行;行同时是 `role="button" tabIndex=0` 支持 Enter/Space。
+- **Tooltip**:antd `Tooltip` 包裹标签列,`title = model ? \`${label} · ${model}\` : label`——嵌入态标签列本身不渲染 model span,全靠 tooltip 补全;放大态 model 常显 + tooltip 仍可用(不冲突)。
+
+## 5 条测试(brief Step 1,逐条落地)
+
+| # | 断言 |
+|---|------|
+| 1 | 嵌入态:mouseEnter 标签列 → `role="tooltip"` 文案含 model 名;时长 `<span>` 带 `gantt-dur-hover`;放大态同一行不带该 class |
+| 2 | 三行(1 个 agent + 2 个并发 tool,同 startMs)→ `style.left`/`style.width` 精确百分比;两并发行 `left` 相等(重叠断言) |
+| 3 | 点击行 1 渲染 `renderDetail`;点击行 2 → 行 1 详情消失、行 2 详情出现(`getAllByTestId` 长度恒 ≤1);再点行 2 → 收起 |
+| 4 | `kind="final"` 行 bar class 含 `ew-gantt-bar--final`;marker 元素带 `title` 属性且值等于 marker.text |
+| 5 | `durationMs=null` 行:`running` 时 class 含 `ew-gantt-bar--running`;`running=false` 时含 `ew-gantt-bar--interrupted` |
+
+**红**:实现前跑测试 → `Failed to resolve import "../GanttTimeline"`(组件文件不存在,失败原因正确)。
+**绿**:实现后 5/5 通过。中途一处返工——`screen.getByText("glm-5.2")` 在 antd Tooltip 把 `label · model` 渲染成单个文本节点时匹配不到(getByText 默认精确匹配整节点文本),改用 `screen.getByRole("tooltip")` + `toHaveTextContent` 断言子串,更贴合 antd 的渲染形态。
 
 ## 验证摘要
 
-- `test_members_api.py` 27 passed;`test_user_purge.py` 8 passed;三文件(含 `test_agent_users_api.py`)合计 48 passed。
-- `packages/expert-work-protocol` 404 passed(枚举加项无回归)。
-- `uv run ruff check .` 全库 All checks passed;`ruff format --check` 触及 3 文件 formatted。
-- CI 同款 mypy strict(packages + 5 services)Success: no issues found in 783 source files。
+- `npx vitest run src/components/turn/__tests__/GanttTimeline.test.tsx` → 5 passed。
+- `npx vitest run`(全量) → **158 files / 1364 tests all passed**(零回归)。
+- `npx tsc -b --noEmit` → 无输出(通过)。
+- `npx vite build` → 构建成功,新 CSS 正常打进 `dist/assets/index-*.css`(13.00 kB,较改动前增量正常);唯一警告是存量的 chunk-size/dynamic-import 提示,与本次改动无关。
 
 ## 实现备注 / concerns
 
-1. **测试 app 无 supervisor**:`create_app` 只从 `settings.sandbox_supervisor_url`(测试为 None)建 supervisor client → purge 级联的 workspace 步会记 `failures["workspace"]="no supervisor client wired"`(与存量 `test_user_purge.py` 端点测同状况,该文件因此从不断言 ok)。测 ②④ 需断言 `purge.ok=true`,故在这两测内局部 `app.state.supervisor_client = RecordingSupervisorClient()`(不动共享 fixture)。**给 T3 的提示**:无 supervisor 的部署里 `purge.ok` 会因 workspace 步为 false——partial 判定读 `purge.ok === false` 时这是预期形状(与 /users 页 PurgeUserModal 行为一致,非本端点新问题)。
-2. 幂等重跑时 `kc_deleted` 会再报 true(delete_user 404=成功语义),`data_purged` 也照 true(级联安全 no-op 重试)——布尔语义是"本次请求该步执行成功",非"本次真删了东西"。
-3. 环境插曲:worktree 首次 `uv run` 时 hatchling 并行 build 被 SIGKILL(本机内存压力),`UV_CONCURRENT_BUILDS=1 uv sync` 后正常,与代码无关。
-4. worktree 基于 `fix-deletion-hygiene-pr5`(75892f60,已 ff 合入);未触碰 T1 的 `purge/user_purge.py`,并行安全。本文件覆盖了 worktree 里残留的 PR4 旧 task-2-report(历史文档,PR4 已合并 #1051)。
+1. **本仓首个组件级 `.css` 文件**:grep 全 `apps/admin-ui/src`,此前每个组件(含 StepTimeline/ToolTimeline/FullTextModal 等)都是纯内联 `style={{...}}` + `var(--ew-*, #hex)`,零 `<style>` 标签、零 `.css` 文件先例。但 brief 明确要三样东西——① 时长标签「行 hover 才显」、② 入场 `scaleX` 动画、③ `prefers-reduced-motion` 关闭动画——这三样都要 `:hover` 伪类 / `@keyframes` / `@media`,内联 style 对象表达不了。权衡后新增同目录 `GanttTimeline.css`(Vite 原生支持,`vitest.config.ts` 的 `css:false` 让测试环境把它当空模块处理,不影响断言;真实 `vite build` 已验证能正常打包)。这是本任务唯一偏离"纯内联"既有惯例的地方,做了显式记录以便后续任务/评审知情。
+2. **`prefers-reduced-motion` 没有走独立的 `@media` 覆盖动画名**,而是让入场/脉冲动画的 `animation-duration` 直接引用 `var(--ew-duration-slow)`,复用 `tokens.css` 里已存在的「reduced-motion 把 `--ew-duration-*` 归零」规则(见该文件第 338-344 行)——归零后 `animation-duration:0ms` 等价于关闭动画,不需要再写一份 `.ew-gantt-bar{animation:none}` 的媒体查询去重复表达同一件事;`GanttTimeline.css` 里仍保留了一份显式 `@media(prefers-reduced-motion:reduce){.ew-gantt-bar{animation:none}}` 作为双保险(两条规则同时生效,互不冲突)。
+3. **`durationMs===null` 行的宽度语义是本任务自行定义的**(brief 只要求"渲染生长条 class 或中断态 class",没钉死具体宽度公式):选择「从 `startMs` 延伸到轴右边界」而不是零宽度,因为 Task 1 对这类行的原始 placement 就是零宽度(`start===end===prevEnd`),原样渲染在视觉上等于看不见。这个选择只影响 CSS/像素表现,不影响 5 条测试断言(测试只查 class 名)。Task 3 接线 `running` prop 时如果需要更精确的"当前时刻"宽度(设计稿提到的『每秒 tick 重算』),那是运行时数据层的活(GanttModel 目前没有 `t0Ms`/"now" 输入),本组件的职责边界到"给定一个 model 快照,按 `running` 布尔选样式"为止,与 brief 的 Task 2 范围一致。
+4. 未做的东西(有意,YAGNI 对齐设计文档"不做"清单):不引图表库、不做时间轴缩放/拖拽、组件本身不含图例(legend)——brief 的 props 签名和 5 条测试都没提,归为 Task 3(TurnCard 接线)或压根不需要的范围,避免抢建。
