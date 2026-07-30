@@ -745,16 +745,6 @@ const zhCN: TranslationKeys = {
     cc_max_passes_impact:
       "做摘要的模型偶尔调用失败会先跳过重试,只有连续失败 3 次才会真的判定失败。\n如果试完这些轮数还是超限,这次运行就会直接失败(提示内容超限,不会悄悄硬凑合)。\n例:设成 3,压缩一次还超限就再压一次,最多压 3 次;3 次都不够就直接失败。",
     cc_max_passes_default: "3",
-    cc_max_turns_label: "按轮数硬截断(旧机制)",
-    cc_max_turns_brief: "直接砍到只剩最近几轮对话",
-    cc_max_turns_impact:
-      "这是在「三道处理」出现之前就有的老机制,默认关闭(留空 = 不启用)。\n一旦设置了数值,每次调用都会无条件砍掉多余部分——不管内容有没有真的超限,一般用不上,优先用上面按比例触发的几道处理就够了。\n例:设成 20,不管超没超限,每次调用都只留最近 20 轮。",
-    cc_max_turns_default: "留空(关闭)",
-    cc_max_tokens_label: "按 token 数硬截断(旧机制)",
-    cc_max_tokens_brief: "跟上面类似,按 token 数量砍",
-    cc_max_tokens_impact:
-      "跟「按轮数硬截断」一样,一旦设置就会无条件生效,不管内容有没有真的超限。\n留空 = 不启用这个老机制,一般建议留空不要设。\n例:设成 50000,每次调用都会被砍到最多 5 万 token。",
-    cc_max_tokens_default: "留空(关闭)",
     cc_pressure_feedback_label: "压力反馈提示",
     cc_pressure_feedback_brief: "快到上限时提醒模型收着点",
     cc_pressure_feedback_impact:
@@ -1216,6 +1206,9 @@ const zhCN: TranslationKeys = {
     meta_model: "模型",
     reasoning_label: "思考过程",
     view_full_text: "查看全文",
+    copy_all: "复制全文",
+    copy_done: "已复制到剪贴板",
+    copy_failed: "复制失败——请手动选择文本",
     events_label: "事件",
     export_json: "导出 JSON",
     export_json_tip: "导出本轮完整事件流(后端权威记录)为 JSON",
