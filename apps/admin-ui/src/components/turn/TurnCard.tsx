@@ -27,6 +27,7 @@ import {
   Check,
   Download,
   ExternalLink,
+  MessageSquareText,
   RotateCcw,
   X,
 } from "lucide-react";
@@ -53,6 +54,7 @@ import { EventCard } from "../EventCard";
 import { MarkdownView } from "../MarkdownView";
 import { AgentStatePanels } from "../../pages/agent_detail/playground/AgentStatePanels";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
+import type { FallbackLine } from "../../pages/agent_detail/playground/history_turns";
 import { RunStatusBanner } from "../../pages/agent_detail/playground/RunStatusBanner";
 import { StepTimeline } from "../../pages/agent_detail/playground/StepTimeline";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
@@ -242,8 +244,10 @@ export interface TurnCardProps {
   readOnly?: boolean;
   /** Historical-turn lazy load state — drives the placeholder below. */
   loadState?: "pending" | "loading" | "done" | "error";
-  /** Assistant text shown before this historical turn's events replay. */
-  fallbackAnswer?: string;
+  /** Assistant text shown before this historical turn's events replay, one
+   *  entry per assistant message (spec 2026-07-30 — each keeps its
+   *  structural channel so it renders commentary/final like a live turn). */
+  fallbackLines?: FallbackLine[];
   /** 流式打字机(子项目 3a)— live token buffers by step, forwarded to
    *  ``StepTimeline``. Only the currently-streaming live turn receives these
    *  (undefined/default elsewhere — history turns never stream). */
@@ -278,7 +282,7 @@ export function TurnCard({
   isSystemAdmin,
   readOnly = false,
   loadState = "done",
-  fallbackAnswer,
+  fallbackLines,
   liveByStep,
   ttftMs = null,
   finalized = false,
@@ -346,17 +350,15 @@ export function TurnCard({
     },
     [onDownloadArtifact],
   );
-  // #8 — a multi-step turn emits one assistant text per LLM step; the answer
-  // shows them all (joined), not just the last (matches history_turns.ts's
-  // fallbackAnswer aggregation). ``finalText`` keeps its null-signal role
-  // (PlaygroundTab's paused-run/approval detection) — don't repoint it.
-  const aggregatedAnswer =
-    summary.assistantTexts.length > 0
-      ? summary.assistantTexts.join("\n\n")
-      : summary.finalText;
-  const answer =
-    aggregatedAnswer ??
-    (turn.status === "running" ? t("playground.turn_running") : null);
+  // Channelled segments (spec 2026-07-30): commentary rows render de-emphasised
+  // in sequence order; the final row is the answer body. The old join("\n\n")
+  // flattened narration INTO the answer — that's exactly the bug.
+  const segments = summary.segments;
+  const hasText = segments.length > 0;
+  // Named distinctly from the `fullText`/`setFullText` modal state below (the
+  // shared "查看全文" trigger for this block and the reasoning section) —
+  // same name would shadow that state variable.
+  const answerFullText = segments.map((s) => s.text).join("\n\n");
   const runId = runIdOf(turn.events);
   // #9e/#11 — 「查看全文」 modal shared by the answer block and the turn's
   // reasoning summary section.
@@ -378,7 +380,7 @@ export function TurnCard({
     if (turn.status === "running" && node) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [answer, turn.status]);
+  }, [segments, turn.status]);
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
@@ -515,17 +517,28 @@ export function TurnCard({
         >
           {turn.input}
         </div>
-        {fallbackAnswer ? (
-          <div
-            style={{
-              alignSelf: "flex-start",
-              maxWidth: "85%",
-              fontSize: 13,
-              whiteSpace: "pre-wrap",
-              opacity: 0.75,
-            }}
-          >
-            <MarkdownView>{fallbackAnswer}</MarkdownView>
+        {fallbackLines && fallbackLines.length > 0 ? (
+          <div style={{ maxHeight: 420, overflowY: "auto" }}>
+            {fallbackLines.map((l, i) =>
+              l.channel === "commentary" ? (
+                <div
+                  key={i}
+                  style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 6 }}
+                  data-testid="turn-segment-commentary"
+                >
+                  <MessageSquareText
+                    size={12}
+                    style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }}
+                    aria-label={t("playground.segment_commentary")}
+                  />
+                  <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
+                    {l.text.length > 240 ? `${l.text.slice(0, 240)}…` : l.text}
+                  </Text>
+                </div>
+              ) : (
+                <MarkdownView key={i}>{l.text}</MarkdownView>
+              ),
+            )}
           </div>
         ) : null}
         {loadState !== "error" ? (
@@ -591,7 +604,7 @@ export function TurnCard({
             data-testid="playground-turn-error"
           />
         )}
-        {answer !== null ? (
+        {hasText ? (
           <>
             {/* #11 — cap the answer block so a long (multi-step) answer
                 scrolls inside its own container instead of stretching the
@@ -601,28 +614,47 @@ export function TurnCard({
               style={{ maxHeight: 420, overflowY: "auto" }}
               data-testid="playground-turn-answer-scroll"
             >
-              {/* While streaming, render raw text (markdown reflow on every
-                  token is janky + partial fences render oddly); render
-                  markdown once the turn settles. */}
-              {turn.status === "running" ? (
-                <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
-                  {answer}
-                </Text>
-              ) : (
-                <MarkdownView>{answer}</MarkdownView>
-              )}
-            </div>
-            {aggregatedAnswer !== null && (
-              <FullTextTrigger
-                onClick={() =>
-                  setFullText({
-                    title: t("playground.view_full_text"),
-                    text: aggregatedAnswer,
-                  })
+              {segments.map((seg, i) => {
+                const isLast = i === segments.length - 1;
+                // While streaming, the newest segment is still a candidate
+                // answer — render it plainly; earlier segments are already
+                // superseded (a later message exists), so they are
+                // commentary regardless of their settled channel.
+                const asCommentary =
+                  turn.status === "running" ? !isLast : seg.channel === "commentary";
+                if (asCommentary) {
+                  return (
+                    <div
+                      key={i}
+                      style={{ display: "flex", gap: 6, alignItems: "flex-start", marginBottom: 6 }}
+                      data-testid="turn-segment-commentary"
+                    >
+                      <MessageSquareText size={12} style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }} aria-label={t("playground.segment_commentary")} />
+                      <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
+                        {seg.text.length > 240 ? `${seg.text.slice(0, 240)}…` : seg.text}
+                      </Text>
+                    </div>
+                  );
                 }
-              />
-            )}
+                return turn.status === "running" ? (
+                  <Text key={i} style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+                    {seg.text}
+                  </Text>
+                ) : (
+                  <MarkdownView key={i}>{seg.text}</MarkdownView>
+                );
+              })}
+            </div>
+            <FullTextTrigger
+              onClick={() =>
+                setFullText({ title: t("playground.view_full_text"), text: answerFullText })
+              }
+            />
           </>
+        ) : turn.status === "running" ? (
+          <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+            {t("playground.turn_running")}
+          </Text>
         ) : turn.status !== "error" ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("playground.turn_no_text")}

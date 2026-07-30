@@ -9,7 +9,10 @@ function run(runId: string): ThreadRunSummary {
 }
 
 const U = (content: string): HistoryMessage => ({ role: "user", content });
-const A = (content: string): HistoryMessage => ({ role: "assistant", content });
+const A = (
+  content: string,
+  channel: HistoryMessage["channel"] = null,
+): HistoryMessage => ({ role: "assistant", content, channel });
 
 describe("buildHistoryTurns", () => {
   it("pairs each (user, following assistant) with the i-th run in order", () => {
@@ -18,8 +21,39 @@ describe("buildHistoryTurns", () => {
       [run("r1"), run("r2")],
     );
     expect(turns).toEqual([
-      { key: "r1", input: "q1", fallbackAnswer: "a1", runId: "r1", status: "success" },
-      { key: "r2", input: "q2", fallbackAnswer: "a2", runId: "r2", status: "success" },
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [{ text: "a1", channel: null }],
+        runId: "r1",
+        status: "success",
+      },
+      {
+        key: "r2",
+        input: "q2",
+        fallbackLines: [{ text: "a2", channel: null }],
+        runId: "r2",
+        status: "success",
+      },
+    ]);
+  });
+
+  it("carries each assistant row's channel through into its fallback line", () => {
+    const turns = buildHistoryTurns(
+      [U("q1"), A("thinking out loud", "commentary"), A("the answer", "final")],
+      [run("r1")],
+    );
+    expect(turns).toEqual([
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [
+          { text: "thinking out loud", channel: "commentary" },
+          { text: "the answer", channel: "final" },
+        ],
+        runId: "r1",
+        status: "success",
+      },
     ]);
   });
 
@@ -35,7 +69,7 @@ describe("buildHistoryTurns", () => {
     expect(turns?.[1]).toEqual({
       key: "r2",
       input: "q2",
-      fallbackAnswer: "",
+      fallbackLines: [],
       runId: "r2",
       status: "success",
     });
@@ -45,7 +79,7 @@ describe("buildHistoryTurns", () => {
     expect(buildHistoryTurns([], [])).toEqual([]);
   });
 
-  it("collects ALL assistant messages in a turn (a run can emit several), joined by blank lines", () => {
+  it("collects ALL assistant messages in a turn (a run can emit several), each its own line", () => {
     // Turn 1: 3 assistant messages before the next user turn (e.g. multi-step run).
     // Turn 2: 1 assistant message. runs.length === 2 user turns → pairing still succeeds.
     const turns = buildHistoryTurns(
@@ -53,8 +87,24 @@ describe("buildHistoryTurns", () => {
       [run("r1"), run("r2")],
     );
     expect(turns).toEqual([
-      { key: "r1", input: "q1", fallbackAnswer: "a1\n\na2\n\na3", runId: "r1", status: "success" },
-      { key: "r2", input: "q2", fallbackAnswer: "b1", runId: "r2", status: "success" },
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [
+          { text: "a1", channel: null },
+          { text: "a2", channel: null },
+          { text: "a3", channel: null },
+        ],
+        runId: "r1",
+        status: "success",
+      },
+      {
+        key: "r2",
+        input: "q2",
+        fallbackLines: [{ text: "b1", channel: null }],
+        runId: "r2",
+        status: "success",
+      },
     ]);
   });
 });

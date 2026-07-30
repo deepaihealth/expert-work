@@ -1329,7 +1329,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                       isSystemAdmin={isSystemAdmin}
                       readOnly
                       loadState={load.state}
-                      fallbackAnswer={h.fallbackAnswer}
+                      fallbackLines={h.fallbackLines}
                       onFireResult={handleFireResult}
                       onRetry={handleHistoryRetry}
                     />

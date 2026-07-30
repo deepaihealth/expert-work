@@ -12,18 +12,27 @@
  * return ``null`` and the caller falls back to flat text.
  *
  * A single run can emit several assistant messages (multi-step turns), so
- * ``fallbackAnswer`` collects every assistant message between a user turn
- * and the next one, joined with blank lines — not just the immediate next
- * message — so the replay-failure fallback doesn't show less than the flat
- * view would.
+ * ``fallbackLines`` collects every assistant message between a user turn
+ * and the next one — not just the immediate next message — so the
+ * replay-failure fallback doesn't show less than the flat view would. Each
+ * line keeps its structural ``channel`` (spec:
+ * docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md)
+ * so ``TurnCard`` can render it commentary-style vs. as the answer body,
+ * matching the live/replayed rendering instead of flattening narration INTO
+ * the answer.
  */
 import type { HistoryMessage } from "../../../api/sessions";
 import type { ThreadRunSummary } from "../../../api/runs";
 
+export interface FallbackLine {
+  text: string;
+  channel: "commentary" | "final" | null;
+}
+
 export interface HistoryTurn {
   key: string;
   input: string;
-  fallbackAnswer: string;
+  fallbackLines: FallbackLine[];
   runId: string;
   status: string;
 }
@@ -32,21 +41,21 @@ export function buildHistoryTurns(
   messages: readonly HistoryMessage[],
   runs: readonly ThreadRunSummary[],
 ): HistoryTurn[] | null {
-  const pairs: { input: string; answer: string }[] = [];
+  const pairs: { input: string; answers: FallbackLine[] }[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
     if (m.role !== "user") continue;
-    const answers: string[] = [];
+    const answers: FallbackLine[] = [];
     for (let j = i + 1; j < messages.length && messages[j].role !== "user"; j += 1) {
-      answers.push(messages[j].content);
+      answers.push({ text: messages[j].content, channel: messages[j].channel ?? null });
     }
-    pairs.push({ input: m.content, answer: answers.join("\n\n") });
+    pairs.push({ input: m.content, answers });
   }
   if (pairs.length !== runs.length) return null;
   return pairs.map((p, i) => ({
     key: runs[i].runId,
     input: p.input,
-    fallbackAnswer: p.answer,
+    fallbackLines: p.answers,
     runId: runs[i].runId,
     status: runs[i].status,
   }));

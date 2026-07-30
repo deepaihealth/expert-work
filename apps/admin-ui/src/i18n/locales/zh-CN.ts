@@ -1195,6 +1195,7 @@ const zhCN: TranslationKeys = {
     turn_count: "共 {{n}} 轮",
     turn_running: "运行中…",
     turn_no_text: "（无文本回复）",
+    segment_commentary: "过程输出",
     turn_failed: "本轮运行失败",
     usage_in: "输入",
     usage_out: "输出",

@@ -495,7 +495,7 @@ export function ConversationDetail() {
                       isSystemAdmin={isSystemAdmin}
                       readOnly
                       loadState={load.state}
-                      fallbackAnswer={h.fallbackAnswer}
+                      fallbackLines={h.fallbackLines}
                     />
                   </div>
                 );

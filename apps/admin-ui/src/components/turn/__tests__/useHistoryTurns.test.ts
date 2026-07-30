@@ -103,7 +103,7 @@ describe("useHistoryTurns", () => {
       {
         key: "r1",
         input: "q1",
-        fallbackAnswer: "a1",
+        fallbackLines: [{ text: "a1", channel: null }],
         runId: "r1",
         status: "success",
       },

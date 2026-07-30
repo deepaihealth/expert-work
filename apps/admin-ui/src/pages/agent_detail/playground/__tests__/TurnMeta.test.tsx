@@ -9,7 +9,7 @@ import type { TurnSummary } from "../../../../api/turn_summary";
 function summary(over: Partial<TurnSummary> = {}): TurnSummary {
   return {
     finalText: "hi",
-    assistantTexts: ["hi"],
+    segments: [{ text: "hi", channel: "final" }],
     reasoning: [],
     usage: {
       inputTokens: 100,

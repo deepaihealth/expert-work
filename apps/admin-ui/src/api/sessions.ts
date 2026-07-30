@@ -114,6 +114,9 @@ export interface WorkspaceFile {
 export interface HistoryMessage {
   role: "user" | "assistant";
   content: string;
+  /** Structural output channel (backend read_turns): assistant rows carry
+   *  "commentary" | "final"; user rows are null. Absent on old payloads. */
+  channel?: "commentary" | "final" | null;
 }
 
 export async function getSessionMessages(
