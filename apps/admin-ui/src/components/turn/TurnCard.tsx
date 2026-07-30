@@ -76,11 +76,17 @@ import type { Turn } from "./types";
 
 const { Text } = Typography;
 
+/** Minor#5 — the commentary clamp length, previously a repeated magic
+ *  number (240) at each render site. */
+const COMMENTARY_CLAMP_CHARS = 240;
+
 /** A commentary-channel line — the de-emphasised icon + secondary-text +
- *  240-char clamp rendering shared by the live answer block and the
- *  historical-turn fallback branch (spec 2026-07-30, Important#1/Minor#3:
- *  keeps the two rendering sites byte-identical instead of hand-copied). */
-function CommentarySegmentLine({
+ *  clamp rendering shared by the live answer block, the historical-turn
+ *  fallback branch, and the degraded flat-message views (spec 2026-07-30,
+ *  Important#1/Minor#3/Minor#5: keeps every rendering site byte-identical
+ *  instead of hand-copied). Exported so ``PlaygroundTab``/``ConversationDetail``
+ *  can reuse it for their flat-list degradation paths (Minor#3). */
+export function CommentarySegmentLine({
   text,
   label,
 }: {
@@ -94,11 +100,14 @@ function CommentarySegmentLine({
     >
       <MessageSquareText
         size={12}
+        role="img"
         style={{ marginTop: 3, flexShrink: 0, color: "var(--ew-text-tertiary)" }}
         aria-label={label}
       />
       <Text type="secondary" style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
-        {text.length > 240 ? `${text.slice(0, 240)}…` : text}
+        {text.length > COMMENTARY_CLAMP_CHARS
+          ? `${text.slice(0, COMMENTARY_CLAMP_CHARS)}…`
+          : text}
       </Text>
     </div>
   );
@@ -318,7 +327,11 @@ export function TurnCard({
   onRetry,
 }: TurnCardProps) {
   const { t } = useTranslation();
-  const summary = summarizeTurn(turn.events);
+  // Minor#1 — memoized: an unmemoized call produces a fresh `segments` array
+  // identity every render, which the streaming auto-scroll effect below
+  // depends on ([segments, turn.status]) — that forced the view back to the
+  // bottom on every render while streaming, interrupting a user scrolling up.
+  const summary = useMemo(() => summarizeTurn(turn.events), [turn.events]);
   const toolStats = toolStatusSummary(turn.events);
   const agentState = parseAgentState(turn.events);
   const retries = parseRetryEvents(turn.events);
@@ -547,7 +560,20 @@ export function TurnCard({
         </div>
         {fallbackLines && fallbackLines.length > 0 ? (
           <>
-            <div style={{ maxHeight: 420, overflowY: "auto" }}>
+            {/* Minor#2 — restores the pre-segments wrapper styling (git show
+                b10d54b5:.../TurnCard.tsx :518-528) so an unreplayed historical
+                turn's fallback answer keeps its de-emphasised look, visually
+                distinct from a live/settled answer. */}
+            <div
+              style={{
+                alignSelf: "flex-start",
+                maxWidth: "85%",
+                fontSize: 13,
+                opacity: 0.75,
+                maxHeight: 420,
+                overflowY: "auto",
+              }}
+            >
               {fallbackLines.map((l, i) =>
                 l.channel === "commentary" ? (
                   <CommentarySegmentLine

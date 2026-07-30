@@ -246,4 +246,15 @@ describe("summarizeTurn", () => {
     expect(s.segments).toEqual([{ text: "最终答案", channel: "final" }]);
     expect(s.reasoning).toEqual(["想一想"]);
   });
+
+  it("deepseek 形态(Minor#6,只钉现状不改渲染):唯一带文本的 AI 消息随 tool_calls 到达,收尾帧 content 转空 → 无 final 段,finalText null,该文本是 commentary", () => {
+    const s = summarizeTurn([
+      updates([aiMsg("先给出正文,再决定要不要查资料", { toolCalls: 1 })]),
+      updates([aiMsg("")]), // 收尾帧 content 转空——textOf 返回 null,不产出新段
+    ]);
+    expect(s.segments).toEqual([
+      { text: "先给出正文,再决定要不要查资料", channel: "commentary" },
+    ]);
+    expect(s.finalText).toBeNull();
+  });
 });

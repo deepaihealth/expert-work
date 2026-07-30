@@ -73,6 +73,7 @@ import { HistoryDivider } from "../../components/turn/HistoryDivider";
 import { TaskResultCard } from "../../components/turn/TaskResultCard";
 import {
   approvalItemFromEvent,
+  CommentarySegmentLine,
   runIdOf,
   TurnCard,
 } from "../../components/turn/TurnCard";
@@ -1372,6 +1373,16 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                   >
                     {m.role === "user" ? (
                       m.content
+                    ) : m.channel === "commentary" ? (
+                      // Minor#3 — this degraded flat view previously rendered
+                      // every assistant row full-width regardless of channel,
+                      // mixing narration into the answer body; route
+                      // commentary rows through the same de-emphasised
+                      // rendering as the structured (TurnCard) path.
+                      <CommentarySegmentLine
+                        text={m.content}
+                        label={t("playground.segment_commentary")}
+                      />
                     ) : (
                       <MarkdownView>{m.content}</MarkdownView>
                     )}
