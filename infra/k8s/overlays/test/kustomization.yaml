@@ -22,7 +22,7 @@ images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newTag: 23a3194e-r2
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newTag: 23a3194e-test-r2
+    newTag: 2f90906d-test
   # The cluster VPC cannot reach docker.io / quay.io (dial timeout — same
   # constraint W0 hit with probe pods), so base's upstream keycloak and
   # searxng images are remapped to ACR mirror copies pushed from a dev
