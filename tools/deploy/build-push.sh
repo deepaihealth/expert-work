@@ -149,7 +149,11 @@ build_image() {
     local repo="${REGISTRY}/${NAMESPACE}/${name}"
 
     echo "==> Building ${repo}:${tag} (+ :latest)"
+    # --platform is pinned: the ACS cluster nodes are linux/amd64, and a
+    # default build on an Apple-Silicon dev machine produces arm64 images
+    # the cluster rejects with "no match for platform in manifest".
     docker build \
+        --platform linux/amd64 \
         -f "${dockerfile}" \
         -t "${repo}:${tag}" \
         -t "${repo}:latest" \

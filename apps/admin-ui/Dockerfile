@@ -11,7 +11,11 @@
 # directory as the context:
 #   docker build -f apps/admin-ui/Dockerfile -t expert-work-admin-ui apps/admin-ui
 
-FROM node:22-alpine AS build
+# --platform=$BUILDPLATFORM: the build stage's output is pure static
+# files (no native binaries reach the final image), so it always runs on
+# the build machine's native arch — cross-building for amd64 from an
+# Apple-Silicon host skips QEMU emulation for the whole pnpm/Vite step.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@10.14.0 --activate

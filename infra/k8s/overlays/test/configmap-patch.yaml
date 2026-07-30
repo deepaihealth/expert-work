@@ -1,8 +1,7 @@
 # Test-env real values layered onto base/configmap.yaml's neutral
 # defaults (strategic-merge on ConfigMap.data — only listed keys change;
-# everything else, e.g. EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE,
-# EXPERT_WORK_SECRET_STORE_BACKEND, the multi-replica switches, keeps the
-# base value).
+# everything else, e.g. EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE and
+# the multi-replica switches, keeps the base value).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,6 +12,29 @@ data:
   EXPERT_WORK_ENV: "staging"
   EXPERT_WORK_AUTH_MODE: "prod"
   EXPERT_WORK_KEYCLOAK_ENABLED: "true"
+  # sql_encrypted, NOT base's local_dev: local_dev's put() writes process
+  # memory, so with 2 replicas a key pasted via the admin UI lands in ONE
+  # pod and every run routed to the other 500s with SecretNotFound (found
+  # live at PR-2 smoke — the classic single-process assumption). The
+  # encrypted vault stores in Postgres (KEK = EXPERT_WORK_SECRET_
+  # ENCRYPTION_KEY), shared across replicas. Platform secrets (OSS AK/SK,
+  # keycloak admin-client secret) are seeded once via
+  # control_plane.seed_keycloak_secret + an inline put — see the PR-2
+  # runbook.
+  EXPERT_WORK_SECRET_STORE_BACKEND: "sql_encrypted"
+  # In-cluster Keycloak admin/token calls — must carry the /kc relative
+  # path (KC_HTTP_RELATIVE_PATH in keycloak/statefulset.yaml); the code
+  # default is bare http://keycloak:8080 which 404s (HTML → JSON decode
+  # error in the token client). Found live at PR-2 setup time.
+  EXPERT_WORK_KEYCLOAK_BASE_URL: "http://keycloak:8080/kc"
+  # BOTH audiences — the admin-ui SPA sends the id_token as its bearer
+  # (apps/admin-ui/src/auth/oidc.ts), whose aud is the CLIENT id
+  # (expert-work-admin-ui); the realm's audience mapper only decorates
+  # access tokens with expert-work-api-internal. base's single-value
+  # default rejects every SPA login with AUTH_INVALID_TOKEN (found live
+  # at PR-2 smoke; same dual-value recipe as docs/runbooks/
+  # getting-started.md).
+  EXPERT_WORK_OIDC_AUDIENCE: '["expert-work-api-internal","expert-work-admin-ui"]'
   EXPERT_WORK_OIDC_ISSUER: "https://expert-work-test.deepaihealth.com/kc/realms/expert-work"
   EXPERT_WORK_OIDC_JWKS_URI: "https://expert-work-test.deepaihealth.com/kc/realms/expert-work/protocol/openid-connect/certs"
   # EXPERT_WORK_QUOTA_REDIS_URL carries the Redis AUTH password — it

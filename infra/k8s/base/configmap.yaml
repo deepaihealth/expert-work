@@ -70,6 +70,13 @@ data:
   # a missing/empty file surfaces as SecretNotFoundError before the pod
   # ever goes ready — not a silent no-op.
   EXPERT_WORK_SECRET_STORE_ENV_FILE: "/run/secret-store/secret-store.env"
+  # WARNING: local_dev's put() writes PROCESS MEMORY — with the 2-replica
+  # deployment in this very base, a secret pasted through the admin UI
+  # lands in one pod and requests routed to the other 500 (observed live
+  # on the test cluster). Any multi-replica overlay MUST override this to
+  # sql_encrypted (and seed the platform secrets — see overlays/test/
+  # secrets.env.example). Kept as local_dev here only because the vault
+  # needs a one-time seed before sql_encrypted can boot at all.
   EXPERT_WORK_SECRET_STORE_BACKEND: "local_dev"
 
   # ------------------------------------------------------------- object store
