@@ -28,8 +28,6 @@ const COMPRESS_FIELD_IDS = [
   "policies.context_compression.tail_keep",
   "policies.context_compression.flush_before_compaction",
   "policies.context_compression.max_passes",
-  "policies.context_compression.max_turns",
-  "policies.context_compression.max_tokens",
   "policies.context_compression.pressure_feedback",
   "policies.context_compression.pressure_warn_pct",
 ];
@@ -202,19 +200,13 @@ describe("ContextGatesSection", () => {
     expect(last.spec?.policies?.context_compression?.head_keep).toBe(2);
   });
 
-  it("context_compression.max_turns has no numeric default (effectiveDefault null) — shows empty and writes an explicit value", async () => {
+  it("legacy hard-truncation knobs (max_turns / max_tokens) are NOT rendered — YAML-only (#13)", async () => {
     const user = userEvent.setup();
-    const onChange = vi.fn();
-    renderSection({}, onChange);
+    renderSection({}, vi.fn());
     await openTab(user, TAB_LABELS.compress);
 
-    const row = rowFor("policies.context_compression.max_turns") as HTMLElement;
-    const input = within(row).getByRole("spinbutton") as HTMLInputElement;
-    expect(input).toHaveValue("");
-    await user.type(input, "8");
-
-    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-    expect(last.spec?.policies?.context_compression?.max_turns).toBe(8);
+    expect(rowFor("policies.context_compression.max_turns")).toBeNull();
+    expect(rowFor("policies.context_compression.max_tokens")).toBeNull();
   });
 
   it("switching tool_output_budget.enabled off writes policies.tool_output_budget.enabled = false", async () => {

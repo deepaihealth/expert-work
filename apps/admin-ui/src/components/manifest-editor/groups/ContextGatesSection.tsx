@@ -164,22 +164,12 @@ const CONTEXT_COMPRESSION_DEFS: readonly FieldDef[] = [
     effectiveDefault: 3,
     min: 1,
   },
-  {
-    fieldId: "policies.context_compression.max_turns",
-    i18nKey: "context_gates.cc_max_turns",
-    valueKey: "ccMaxTurns",
-    kind: "number",
-    effectiveDefault: null,
-    min: 1,
-  },
-  {
-    fieldId: "policies.context_compression.max_tokens",
-    i18nKey: "context_gates.cc_max_tokens",
-    valueKey: "ccMaxTokens",
-    kind: "number",
-    effectiveDefault: null,
-    min: 1,
-  },
+  // policies.context_compression.max_turns / max_tokens (the legacy
+  // hard-truncation axes, opt-in via YAML, default None = middleware
+  // skipped) are deliberately NOT rendered here — the three-step gates
+  // above cover the scenario, and surfacing "old mechanism" knobs in the
+  // form only confused users (UX feedback 2026-07-30 #13). YAML remains
+  // the escape hatch for the rare opt-in.
   {
     fieldId: "policies.context_compression.pressure_feedback",
     i18nKey: "context_gates.cc_pressure_feedback",

@@ -722,14 +722,6 @@ export interface TranslationKeys {
     cc_max_passes_brief: string;
     cc_max_passes_impact: string;
     cc_max_passes_default: string;
-    cc_max_turns_label: string;
-    cc_max_turns_brief: string;
-    cc_max_turns_impact: string;
-    cc_max_turns_default: string;
-    cc_max_tokens_label: string;
-    cc_max_tokens_brief: string;
-    cc_max_tokens_impact: string;
-    cc_max_tokens_default: string;
     cc_pressure_feedback_label: string;
     cc_pressure_feedback_brief: string;
     cc_pressure_feedback_impact: string;
@@ -1151,6 +1143,9 @@ export interface TranslationKeys {
     meta_model: string;
     reasoning_label: string;
     view_full_text: string;
+    copy_all: string;
+    copy_done: string;
+    copy_failed: string;
     events_label: string;
     export_json: string;
     export_json_tip: string;
@@ -3667,16 +3662,6 @@ const en: TranslationKeys = {
     cc_max_passes_impact:
       "A one-off failure in the summarization model just skips that pass and retries; only 3 failures in a row actually fails the run.\nStill over the threshold after using up these retries? The run just fails outright (a context-overflow error, not a silent workaround).\nExample: set to 3 — if it's still over the threshold after one compression pass, it tries again, up to 3 total; if 3 passes still aren't enough, the run fails.",
     cc_max_passes_default: "3",
-    cc_max_turns_label: "Hard turn cap (legacy)",
-    cc_max_turns_brief: "Hard-cuts every call to the most recent N turns",
-    cc_max_turns_impact:
-      "An older mechanism from before the three-step pipeline existed, off (empty) by default.\nOnce set, every call gets cut unconditionally — whether or not content is actually over any limit; usually unnecessary, since the ratio-based steps above are almost always the better choice.\nExample: set to 20 — every call sends only the most recent 20 turns regardless of size.",
-    cc_max_turns_default: "Empty (off)",
-    cc_max_tokens_label: "Hard token cap (legacy)",
-    cc_max_tokens_brief: "Same idea, but cuts by token count instead",
-    cc_max_tokens_impact:
-      "Same as the turn cap above — once set, it applies unconditionally, whether or not content is actually over any limit.\nEmpty = this legacy mechanism is off, which is usually the better choice.\nExample: set to 50000 — every call gets cut to at most 50,000 tokens.",
-    cc_max_tokens_default: "Empty (off)",
     cc_pressure_feedback_label: "Pressure-feedback nudge",
     cc_pressure_feedback_brief: "Nudges the model to trim down near the limit",
     cc_pressure_feedback_impact:
@@ -4153,6 +4138,9 @@ const en: TranslationKeys = {
     meta_model: "Model",
     reasoning_label: "Reasoning",
     view_full_text: "View full text",
+    copy_all: "Copy all",
+    copy_done: "Copied to clipboard",
+    copy_failed: "Copy failed — select the text manually",
     events_label: "Events",
     export_json: "Export JSON",
     export_json_tip:
