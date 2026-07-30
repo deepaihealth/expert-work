@@ -1,0 +1,226 @@
+/*
+ * GanttTimeline — component-scoped styles for behaviour plain inline React
+ * style objects can't express: pseudo-class hover reveal, `@keyframes`
+ * entrance/pulse animation (+ `prefers-reduced-motion` off-switch), and the
+ * embedded/expanded density switch (scoped off the root's `data-variant`
+ * attribute — mirrors the confirmed interactive prototype's `body.compact`
+ * toggle). All colors are `--ew-*` design tokens (theme.md#tokens.css); the
+ * `rgba(0,0,0,…)` uses below are neutral overlay/texture, the same
+ * convention `--ew-shadow-*` already uses for elevation, not semantic color.
+ */
+
+.ew-gantt-scroll {
+  overflow-x: auto;
+}
+
+.ew-gantt-inner {
+  min-width: 560px;
+}
+
+.ew-gantt-axis {
+  position: relative;
+  display: flex;
+  height: 26px;
+  margin-left: 292px;
+  border-bottom: 1px solid var(--ew-border-default);
+}
+
+.ew-gantt-tick {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  padding: 5px 0 0 5px;
+  border-left: 1px solid var(--ew-border-subtle);
+  color: var(--ew-text-tertiary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ew-gantt-body {
+  position: relative;
+}
+
+.ew-gantt-row {
+  display: flex;
+  align-items: stretch;
+  cursor: pointer;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  transition: background var(--ew-duration-fast) var(--ew-ease-standard);
+}
+
+.ew-gantt-row:hover {
+  background: var(--ew-surface-hover);
+}
+
+.ew-gantt-row--active {
+  background: var(--ew-surface-active);
+}
+
+.ew-gantt-label {
+  display: flex;
+  flex: 0 0 292px;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding-right: 10px;
+  overflow: hidden;
+  color: var(--ew-text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  border-right: 1px solid var(--ew-border-subtle);
+}
+
+.ew-gantt-twig {
+  color: var(--ew-text-tertiary);
+  font-size: 10px;
+}
+
+.ew-gantt-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ew-gantt-model {
+  color: var(--ew-text-tertiary);
+  font-family: var(--ew-font-mono);
+  font-size: 11px;
+}
+
+.ew-gantt-track {
+  position: relative;
+  flex: 1;
+  height: 30px;
+}
+
+.ew-gantt-bar {
+  position: absolute;
+  top: 7px;
+  height: 16px;
+  min-width: 3px;
+  border-radius: 4px;
+  transform-origin: left center;
+  animation: ew-gantt-grow var(--ew-duration-slow) var(--ew-ease-standard) backwards;
+}
+
+@keyframes ew-gantt-grow {
+  from {
+    transform: scaleX(0);
+  }
+}
+
+.ew-gantt-bar--agent {
+  background: var(--ew-text-info, #4c8dff);
+}
+.ew-gantt-bar--aux {
+  background: var(--ew-accent-violet, #a855f7);
+}
+.ew-gantt-bar--tool {
+  background: var(--ew-text-success, #34d399);
+}
+.ew-gantt-bar--worker {
+  background: var(--ew-text-warning, #f59e0b);
+}
+.ew-gantt-bar--final {
+  background: var(--ew-color-success-500, #22c55e);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ew-color-success-500, #22c55e) 45%, transparent);
+}
+
+.ew-gantt-bar--running {
+  opacity: 0.75;
+  animation:
+    ew-gantt-grow var(--ew-duration-slow) var(--ew-ease-standard) backwards,
+    ew-gantt-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ew-gantt-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.ew-gantt-bar--interrupted {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 3px,
+    rgba(0, 0, 0, 0.18) 3px,
+    rgba(0, 0, 0, 0.18) 6px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ew-gantt-bar {
+    animation: none;
+  }
+  .ew-gantt-bar--running {
+    animation: none;
+  }
+}
+
+.ew-gantt-dur {
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ew-text-tertiary);
+  font-family: var(--ew-font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.gantt-dur-hover {
+  opacity: 0;
+  transition: opacity var(--ew-duration-fast);
+}
+
+.ew-gantt-row:hover .gantt-dur-hover {
+  opacity: 1;
+}
+
+.ew-gantt-markers {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 292px;
+  pointer-events: none;
+}
+
+.ew-gantt-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed currentColor;
+  pointer-events: auto;
+}
+
+.ew-gantt-detail {
+  padding: 10px 14px 12px 302px;
+  background: var(--ew-surface-raised);
+  border-bottom: 1px solid var(--ew-border-default);
+  font-size: 12px;
+}
+
+/* Embedded density (TurnCard right rail ≈1100px) — narrower label column,
+   model name collapsed out of the row (see GanttTimeline.tsx), duration
+   labels hidden until the row is hovered (avoids crowding a narrow axis). */
+[data-variant="embedded"] .ew-gantt-axis {
+  margin-left: 176px;
+}
+[data-variant="embedded"] .ew-gantt-label {
+  flex-basis: 176px;
+  font-size: 11.5px;
+}
+[data-variant="embedded"] .ew-gantt-markers {
+  left: 176px;
+}
+[data-variant="embedded"] .ew-gantt-detail {
+  padding-left: 186px;
+}
