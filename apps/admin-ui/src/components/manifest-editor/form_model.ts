@@ -228,7 +228,9 @@ export interface AgentManifest {
     } | null;
     // Template this agent extends (AgentSpecBody.extends). Presence drives the
     // "template may enforce stricter defenses" hint in the defenses section.
-    extends?: string;
+    // The backend's full dump writes ``extends: null`` when unset — readExtends
+    // folds that back to undefined so the hint doesn't misfire (#5).
+    extends?: string | null;
     // Stream K.K4 (Mini-ADR K-3) — per-agent LLM response cache opt-out
     // (CacheSpec). DISTINCT from ``model.cache_enabled`` (ModelFields,
     // Anthropic prompt caching) — see ``ObservabilityFields`` below. Backend
@@ -1266,7 +1268,8 @@ export const readActionScreenOnError = (m: unknown): "open" | "closed" =>
   (specOf(m).defenses?.action_screen_on_error as "open" | "closed") ?? "open";
 export const readOutputDlp = (m: unknown): "redact" | "off" =>
   (specOf(m).defenses?.output_dlp as "redact" | "off") ?? "off";
-export const readExtends = (m: unknown): string | undefined => specOf(m).extends;
+export const readExtends = (m: unknown): string | undefined =>
+  specOf(m).extends ?? undefined;
 
 export const setPromptInjection = (
   m: unknown,

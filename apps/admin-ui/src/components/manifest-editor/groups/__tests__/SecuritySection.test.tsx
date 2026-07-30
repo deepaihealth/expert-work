@@ -183,6 +183,16 @@ describe("SecuritySection", () => {
     expect(screen.getByTestId("af-defenses-extends-note")).toBeInTheDocument();
   });
 
+  it("treats the backend's dumped extends: null as not-inherited — no extends note (#5)", () => {
+    // The backend's full dump always writes ``extends: null`` for agents that
+    // never extended a template; the note must not misfire on it.
+    const nullExtends: AgentManifest = { spec: { extends: null } };
+    renderSection(nullExtends);
+    expect(
+      screen.queryByTestId("af-defenses-extends-note"),
+    ).not.toBeInTheDocument();
+  });
+
   it("approval tab: checking bash adds it to policies.approval_required_tools", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
