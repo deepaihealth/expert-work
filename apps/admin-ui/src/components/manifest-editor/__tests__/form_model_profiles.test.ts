@@ -234,6 +234,237 @@ describe("countProfileDiff", () => {
   });
 });
 
+// ---- backend full-dump echo (#12) ----
+// The control plane never stores/echoes the sparse manifest the editor
+// submits: PUT re-validates through Pydantic and persists
+// ``spec.model_dump(by_alias=True, mode="json")`` (api/agents.py
+// ``_load_manifest``), and GET re-dumps the record — so EVERY defaulted key
+// comes back explicit and every unset optional key comes back as literal
+// ``null`` (``extends: null`` / ``short_term: null`` / ``builder: null`` /
+// ``aux_model: null`` …). After a save the editor resyncs its working copy
+// from that echo (ManifestTab snapshot resync), so ``inferRunProfile`` must
+// keep recognizing an applied preset on the full-dump shape, not just on
+// the sparse apply output. Fixtures below mirror the real dump byte-for-
+// byte for the managed-field subtree (generated via
+// ``AgentSpec.model_validate`` + ``model_dump(by_alias=True, mode="json")``
+// on the current protocol package).
+interface EchoValues {
+  topK: number;
+  verifyReads: boolean;
+  rewriteReads: boolean;
+  recallMode: string;
+  abstainThreshold: number;
+  injectionTokenBudget: number;
+  correctionTokenBudget: number;
+  consolidationEnabled: boolean;
+  maxIterations: number;
+  maxNoProgress: number;
+  prThresholdPct: number;
+  prRecentKept: number;
+  wmThresholdPct: number;
+  wmMaxRecentTurns: number;
+  ccThresholdPct: number;
+  ccHeadKeep: number;
+  ccTailKeep: number;
+  dynamicWorkersOn: boolean;
+}
+
+// Returns ``unknown`` (the readers' own input type) — the fixture mirrors
+// the wire shape, not the editor's ``AgentManifest`` view of it.
+function backendEcho(v: EchoValues, memoryOn: boolean): unknown {
+  return {
+    spec: {
+      extends: null,
+      memory: memoryOn
+        ? {
+            short_term: null,
+            long_term: {
+              retrieve_top_k: v.topK,
+              write_back: true,
+              recall_mode: v.recallMode,
+              reconcile_writes: true,
+              write_min_importance: 0.3,
+              verify_reads: v.verifyReads,
+              rewrite_reads: v.rewriteReads,
+              abstain_threshold: v.abstainThreshold,
+              injection_token_budget: v.injectionTokenBudget,
+              correction_token_budget: v.correctionTokenBudget,
+            },
+          }
+        : null,
+      workflow: {
+        type: "react",
+        max_iterations: v.maxIterations,
+        early_stop: {},
+        builder: null,
+      },
+      policies: {
+        context_compression: {
+          enabled: true,
+          threshold_pct: v.ccThresholdPct,
+          head_keep: v.ccHeadKeep,
+          tail_keep: v.ccTailKeep,
+          flush_before_compaction: true,
+          max_passes: 3,
+          max_turns: null,
+          max_tokens: null,
+          pressure_feedback: true,
+          pressure_warn_pct: 0.75,
+        },
+        working_memory: {
+          enabled: true,
+          threshold_pct: v.wmThresholdPct,
+          max_recent_turns: v.wmMaxRecentTurns,
+          keep_first_turn: true,
+        },
+        tool_result_prune: {
+          enabled: true,
+          threshold_pct: v.prThresholdPct,
+          recent_tool_results_kept: v.prRecentKept,
+        },
+        tool_output_budget: { enabled: true },
+        memory_consolidation: {
+          enabled: v.consolidationEnabled,
+          aux_model: null,
+        },
+        max_no_progress: v.maxNoProgress,
+        token_budget: 0,
+        run_deadline_s: 0,
+      },
+      dynamic_workers: { enabled: v.dynamicWorkersOn },
+    },
+  };
+}
+
+// Each preset's values as the backend echoes them (all 18 explicit).
+const ECHO_VALUES: Record<"balanced" | "cost" | "capability", EchoValues> = {
+  balanced: {
+    topK: 5,
+    verifyReads: true,
+    rewriteReads: false,
+    recallMode: "per_session",
+    abstainThreshold: 0,
+    injectionTokenBudget: 2000,
+    correctionTokenBudget: 500,
+    consolidationEnabled: true,
+    maxIterations: 30,
+    maxNoProgress: 4,
+    prThresholdPct: 0.7,
+    prRecentKept: 4,
+    wmThresholdPct: 0.7,
+    wmMaxRecentTurns: 20,
+    ccThresholdPct: 0.7,
+    ccHeadKeep: 4,
+    ccTailKeep: 6,
+    dynamicWorkersOn: true,
+  },
+  cost: {
+    topK: 3,
+    verifyReads: false,
+    rewriteReads: false,
+    recallMode: "per_session",
+    abstainThreshold: 0.2,
+    injectionTokenBudget: 1000,
+    correctionTokenBudget: 300,
+    consolidationEnabled: false,
+    maxIterations: 20,
+    maxNoProgress: 3,
+    prThresholdPct: 0.6,
+    prRecentKept: 2,
+    wmThresholdPct: 0.6,
+    wmMaxRecentTurns: 10,
+    ccThresholdPct: 0.6,
+    ccHeadKeep: 2,
+    ccTailKeep: 4,
+    dynamicWorkersOn: false,
+  },
+  capability: {
+    topK: 8,
+    verifyReads: true,
+    rewriteReads: true,
+    recallMode: "per_turn",
+    abstainThreshold: 0,
+    injectionTokenBudget: 4000,
+    correctionTokenBudget: 800,
+    consolidationEnabled: true,
+    maxIterations: 60,
+    maxNoProgress: 6,
+    prThresholdPct: 0.8,
+    prRecentKept: 8,
+    wmThresholdPct: 0.8,
+    wmMaxRecentTurns: 40,
+    ccThresholdPct: 0.85,
+    ccHeadKeep: 6,
+    ccTailKeep: 10,
+    dynamicWorkersOn: true,
+  },
+};
+
+describe("backend full-dump echo (#12)", () => {
+  for (const profile of ["balanced", "cost", "capability"] as const) {
+    it(`recognizes '${profile}' on the memory-ON echo (explicit defaults + nulls)`, () => {
+      expect(inferRunProfile(backendEcho(ECHO_VALUES[profile], true))).toBe(
+        profile,
+      );
+    });
+
+    it(`recognizes '${profile}' on the memory-OFF echo (memory: null)`, () => {
+      expect(inferRunProfile(backendEcho(ECHO_VALUES[profile], false))).toBe(
+        profile,
+      );
+    });
+
+    it(`apply→save-payload round-trip on the '${profile}' echo stays '${profile}'`, () => {
+      // Editing an echoed manifest: apply another pass of the same preset
+      // (idempotent) and YAML round-trip like the PUT payload does.
+      const applied = applyRunProfile(backendEcho(ECHO_VALUES[profile], true), profile);
+      expect(inferRunProfile(applied)).toBe(profile);
+      expect(inferRunProfile(parseYaml(dumpYaml(applied)))).toBe(profile);
+    });
+  }
+
+  it("explicit null knobs (the ``extends: null`` class) fall back to backend defaults, not mismatch", () => {
+    // Apply "balanced" (deletes every managed key but max_no_progress), then
+    // simulate an echo that materializes those absent keys as explicit null —
+    // the ``??`` readers must fold null back to the backend default so the
+    // preset still reads back.
+    const applied = applyRunProfile(BASE_ON, "balanced");
+    const spec = (JSON.parse(JSON.stringify(applied)) as {
+      spec: Record<string, unknown>;
+    }).spec;
+    spec.extends = null;
+    const memory = spec.memory as { long_term: Record<string, unknown> };
+    for (const k of [
+      "retrieve_top_k",
+      "verify_reads",
+      "rewrite_reads",
+      "recall_mode",
+      "abstain_threshold",
+      "injection_token_budget",
+      "correction_token_budget",
+    ]) {
+      memory.long_term[k] = null;
+    }
+    spec.workflow = { max_iterations: null, builder: null };
+    const policies = spec.policies as Record<string, unknown>;
+    policies.memory_consolidation = null;
+    policies.context_compression = {
+      threshold_pct: null,
+      head_keep: null,
+      tail_keep: null,
+      max_turns: null,
+    };
+    policies.working_memory = { threshold_pct: null, max_recent_turns: null };
+    policies.tool_result_prune = {
+      threshold_pct: null,
+      recent_tool_results_kept: null,
+    };
+    spec.dynamic_workers = { enabled: null };
+
+    expect(inferRunProfile({ spec })).toBe("balanced");
+  });
+});
+
 // Memory-off gating (spec §③: presets tune knobs, never flip feature
 // switches). ``long_term``'s PRESENCE is the memory on/off switch, so an
 // apply on a memory-off manifest must not materialize it — and infer must
