@@ -661,6 +661,11 @@ export interface TranslationKeys {
   // ContextGatesFields' camelCase field names (pr_/wm_/cc_/budget_).
   context_gates: {
     group_intro: string;
+    // #4 — per-step one-liner shown as the first line inside each tab; the
+    // detail that used to crowd ``group_intro`` moved here.
+    tab_intro_prune: string;
+    tab_intro_window: string;
+    tab_intro_compress: string;
     panel_tool_result_prune: string;
     panel_working_memory: string;
     panel_context_compression: string;
@@ -3583,10 +3588,16 @@ const en: TranslationKeys = {
   },
   context_gates: {
     group_intro:
-      "When there's too much content to fit, it falls back on three steps in order: ① prune old tool results → ② keep only the most recent conversation → ③ have the model summarize the middle. Most of the time the first two steps are enough. Window size depends on whichever model is selected.",
-    panel_tool_result_prune: "① Tool-result prune",
-    panel_working_memory: "② Sliding window",
-    panel_context_compression: "③ Context compression",
+      "When content overflows the window, it falls back on the three steps below in order — the first two are usually enough. Window size follows the selected model.",
+    tab_intro_prune:
+      "Step 1: older tool results get squashed into a one-line reference first — the cheapest and least lossy of the three steps.",
+    tab_intro_window:
+      "Step 2: if pruning isn't enough, only the first turn plus the most recent turns are sent — the real history is never touched.",
+    tab_intro_compress:
+      "Step 3: when the first two steps still aren't enough, the model summarizes the long middle stretch into one background note — the last resort.",
+    panel_tool_result_prune: "Step 1 · Tool-result prune",
+    panel_working_memory: "Step 2 · Sliding window",
+    panel_context_compression: "Step 3 · Context compression",
     pr_enabled_label: "Enable tool-result prune",
     pr_enabled_brief: "Over the limit, squash old tool results to one line",
     pr_enabled_impact:

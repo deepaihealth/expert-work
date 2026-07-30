@@ -669,10 +669,16 @@ const zhCN: TranslationKeys = {
   },
   context_gates: {
     group_intro:
-      "内容太长装不下时,按 ①修剪旧工具结果 → ②只留最近对话 → ③模型总结中间段 的顺序兜底,大多数情况前两步就够。窗口大小以所选模型为准。",
-    panel_tool_result_prune: "①结果修剪",
-    panel_working_memory: "②滑动窗口",
-    panel_context_compression: "③上下文压缩",
+      "内容超窗时按下面三步顺序兜底,多数情况前两步就够;窗口大小以所选模型为准。",
+    tab_intro_prune:
+      "第 1 步:先把较早的工具执行结果压成一行引用——三步里最省、最不伤内容的一步。",
+    tab_intro_window:
+      "第 2 步:修剪后仍超限时,只保留首轮和最近几轮对话发给模型,真实历史不动。",
+    tab_intro_compress:
+      "第 3 步:前两步都不够时,用模型把中间一大段对话总结成一条背景摘要,作为最后兜底。",
+    panel_tool_result_prune: "第 1 步 · 结果修剪",
+    panel_working_memory: "第 2 步 · 滑动窗口",
+    panel_context_compression: "第 3 步 · 上下文压缩",
     pr_enabled_label: "启用结果修剪",
     pr_enabled_brief: "内容超限就把旧结果压成一行",
     pr_enabled_impact:
