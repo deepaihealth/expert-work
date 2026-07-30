@@ -6,7 +6,7 @@
  * field parsing. See docs/.../2026-07-10-batch3-wireframe.html for the render.
  */
 import type { SseEvent } from "./sessions";
-import { serverMsOf } from "./gantt_timeline";
+import { serverMsOf } from "./sse_id";
 import { parseToolCalls, type ToolCallEntry } from "./tool_timeline";
 import { parseWorkerFrames } from "./worker_timeline";
 

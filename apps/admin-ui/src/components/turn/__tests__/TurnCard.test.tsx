@@ -479,4 +479,100 @@ describe("TurnCard timeline view → Gantt (Task 3)", () => {
       "ew-gantt-bar--running",
     );
   });
+
+  // M1 — every other fixture in this describe block uses ids "1"~"5", which
+  // fail `serverMsOf`'s 10+-digit check and so run entirely on the degraded
+  // (sequential-placement) path — a blind spot that never exercised real
+  // start/duration → percentage geometry. This fixture uses the real
+  // `"{epoch_ms}-{seq}"` shape (see task-1-brief.md / gantt_timeline.test.ts)
+  // so the assertions below are pinned to the non-degraded arithmetic.
+  const REAL_ID_BASE_MS = 1_722_400_000_000;
+  const realIdEvents: SseEvent[] = [
+    {
+      id: `${REAL_ID_BASE_MS}-1`,
+      event: "metadata",
+      data: { run_id: "run-real-1" },
+      rawData: "",
+      receivedAt: "",
+    },
+    {
+      id: `${REAL_ID_BASE_MS + 500}-2`,
+      event: "updates",
+      data: {
+        agent: {
+          step_count: 1,
+          _duration_ms: 500,
+          messages: [
+            {
+              type: "ai",
+              content: "",
+              tool_calls: [{ id: "c1", name: "search", args: {}, type: "tool_call" }],
+            },
+          ],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    },
+    {
+      id: `${REAL_ID_BASE_MS + 1500}-3`,
+      event: "updates",
+      data: {
+        tools: {
+          messages: [
+            {
+              type: "tool",
+              tool_call_id: "c1",
+              name: "search",
+              content: "3 hits",
+              status: "success",
+              additional_kwargs: { duration_ms: 1000 },
+            },
+          ],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    },
+    {
+      id: `${REAL_ID_BASE_MS + 1600}-4`,
+      event: "updates",
+      data: {
+        agent: {
+          step_count: 2,
+          _duration_ms: 100,
+          messages: [{ type: "ai", content: "final answer" }],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    },
+    { id: `${REAL_ID_BASE_MS + 1700}-5`, event: "end", data: {}, rawData: "", receivedAt: "" },
+  ];
+
+  it("真实 epoch-ms id fixture:渲染真实(非退化)几何,不显示 degraded 提示(M1)", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({ events: realIdEvents }),
+    });
+
+    expect(screen.queryByTestId("playground-gantt-degraded")).not.toBeInTheDocument();
+
+    // t0 = step1's start (id_ms − durationMs = +0); totalMs = 1600 (step2's
+    // end). All three rows resolve to exact binary fractions of 1600, so the
+    // percentages below are exact, not rounded.
+    const stepBar = screen.getByTestId("gantt-bar-item-0");
+    expect(stepBar.style.left).toBe("0%");
+    expect(stepBar.style.width).toBe("31.25%");
+
+    const toolBar = screen.getByTestId("gantt-bar-tool-c1");
+    expect(toolBar.style.left).toBe("31.25%");
+    expect(toolBar.style.width).toBe("62.5%");
+
+    // Settled + no tool_calls on the last step → relabeled "final", same key.
+    const finalBar = screen.getByTestId("gantt-bar-item-1");
+    expect(finalBar.style.left).toBe("93.75%");
+    expect(finalBar.style.width).toBe("6.25%");
+  });
 });

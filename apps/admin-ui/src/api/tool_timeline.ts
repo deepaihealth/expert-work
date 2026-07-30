@@ -13,7 +13,7 @@
  * originating MCP server from the name. Builtin tools (``web_search``,
  * ``exec_python``, …) keep their bare name.
  */
-import { serverMsOf } from "./gantt_timeline";
+import { serverMsOf } from "./sse_id";
 import type { SseEvent } from "./sessions";
 import type { WorkerTimeline } from "./worker_timeline";
 

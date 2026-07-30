@@ -2,7 +2,7 @@
 // WorkerTimeline 树。纯函数,防御式:异常帧丢弃不抛。
 // 帧契约见 docs/superpowers/specs/2026-07-19-worker-observability-design.md。
 
-import { serverMsOf } from "./gantt_timeline";
+import { serverMsOf } from "./sse_id";
 import type { SseEvent } from "./sessions";
 
 export interface WorkerMessageSummary {

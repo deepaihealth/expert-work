@@ -372,16 +372,27 @@ export function TurnCard({
     () => buildGanttRows(turn.events, { settled: turn.status !== "running" }),
     [turn.events, turn.status],
   );
-  // Growing bar: while running, tick every 1s so the axis (and any pending
-  // tool/worker row stretching to its right edge) keeps advancing between
-  // SSE frames instead of freezing at the last known event — cleared the
-  // instant the turn settles (effect cleanup + the `turn.status` dep).
+  // M3 — hoisted above the growing-bar interval effect below: the effect's
+  // dependency array reads both values during render (not just at effect-run
+  // time), so they must already exist at that point (TDZ) — `handleViewChange`
+  // and the Collapse wiring that own these further down still work the same,
+  // just referencing state declared earlier in the function body.
+  const [eventView, setEventViewLocal] = useState(initialEventView);
+  const [eventsCollapseKeys, setEventsCollapseKeys] = useState<string[]>(["events"]);
+  // Growing bar: while running AND the timeline view's events panel is
+  // actually visible, tick every 1s so the axis (and any pending tool/worker
+  // row stretching to its right edge) keeps advancing between SSE frames
+  // instead of freezing at the last known event — cleared the instant the
+  // turn settles, the view switches away from "timeline", or the events
+  // panel collapses (effect cleanup + the dependency array below). Ticking
+  // for a view/panel nobody can see was pure wasted work (M3).
   const [nowTick, setNowTick] = useState(0);
   useEffect(() => {
     if (turn.status !== "running") return;
+    if (eventView !== "timeline" || !eventsCollapseKeys.includes("events")) return;
     const id = window.setInterval(() => setNowTick((n) => n + 1), 1000);
     return () => window.clearInterval(id);
-  }, [turn.status]);
+  }, [turn.status, eventView, eventsCollapseKeys]);
   // `GanttModel` is a point-in-time snapshot (Task 2's documented boundary —
   // it has no "now" input); advance its `totalMs` here using the calibrated
   // "now" (`lastKnownFrame` above the component) so the axis actually grows
@@ -485,8 +496,9 @@ export function TurnCard({
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
-  // a getRunTrace to every rendered turn at once).
-  const [eventView, setEventViewLocal] = useState(initialEventView);
+  // a getRunTrace to every rendered turn at once). `eventView` itself is
+  // declared earlier in this function (M3 — see the growing-bar interval
+  // effect above).
   const handleViewChange = useCallback(
     (next: "timeline" | "raw" | "exact") => {
       setEventViewLocal(next);
@@ -830,11 +842,14 @@ export function TurnCard({
         )}
       </div>
 
-      {/* Reasoning (collapsed) + events (expanded by default). */}
+      {/* Reasoning (collapsed) + events (expanded by default). Controlled
+          (M3) — the growing-bar interval effect above needs to know whether
+          the "events" panel is actually open. */}
       <Collapse
         ghost
         size="small"
-        defaultActiveKey={["events"]}
+        activeKey={eventsCollapseKeys}
+        onChange={(keys) => setEventsCollapseKeys(typeof keys === "string" ? [keys] : keys)}
         items={[
           ...(summary.reasoning.length > 0
             ? [
