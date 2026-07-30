@@ -334,8 +334,16 @@ export function TurnCard({
     },
     [onDownloadArtifact],
   );
+  // #8 — a multi-step turn emits one assistant text per LLM step; the answer
+  // shows them all (joined), not just the last (matches history_turns.ts's
+  // fallbackAnswer aggregation). ``finalText`` keeps its null-signal role
+  // (PlaygroundTab's paused-run/approval detection) — don't repoint it.
+  const aggregatedAnswer =
+    summary.assistantTexts.length > 0
+      ? summary.assistantTexts.join("\n\n")
+      : summary.finalText;
   const answer =
-    summary.finalText ??
+    aggregatedAnswer ??
     (turn.status === "running" ? t("playground.turn_running") : null);
   const runId = runIdOf(turn.events);
 
