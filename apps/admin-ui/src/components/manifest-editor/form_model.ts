@@ -228,7 +228,9 @@ export interface AgentManifest {
     } | null;
     // Template this agent extends (AgentSpecBody.extends). Presence drives the
     // "template may enforce stricter defenses" hint in the defenses section.
-    extends?: string;
+    // The backend's full dump writes ``extends: null`` when unset — readExtends
+    // folds that back to undefined so the hint doesn't misfire (#5).
+    extends?: string | null;
     // Stream K.K4 (Mini-ADR K-3) — per-agent LLM response cache opt-out
     // (CacheSpec). DISTINCT from ``model.cache_enabled`` (ModelFields,
     // Anthropic prompt caching) — see ``ObservabilityFields`` below. Backend
@@ -437,21 +439,30 @@ export const readMemoryOn = (m: unknown): boolean =>
 export const readTopK = (m: unknown): number | undefined =>
   specOf(m).memory?.long_term?.retrieve_top_k;
 // long_term knob readers — each defaults to the backend default so an
-// unset field reads as its effective value (LongTermMemorySpec).
+// unset field reads as its effective value (LongTermMemorySpec). The four
+// run-profile-managed knobs (verify/recall/rewrite/abstain) take their
+// fallback from ``PROFILE_BACKEND_DEFAULTS`` instead of an inline literal
+// (#12): ``inferRunProfile`` compares these readers' effective values
+// against ``RUN_PROFILES``, so a hand-maintained duplicate drifting from
+// the table would silently make a matching preset read as "custom".
 export const readWriteBack = (m: unknown): boolean =>
   specOf(m).memory?.long_term?.write_back ?? true;
 export const readVerifyReads = (m: unknown): boolean =>
-  specOf(m).memory?.long_term?.verify_reads ?? true;
+  specOf(m).memory?.long_term?.verify_reads ??
+  PROFILE_BACKEND_DEFAULTS.verifyReads;
 export const readWriteMinImportance = (m: unknown): number =>
   specOf(m).memory?.long_term?.write_min_importance ?? 0.3;
 export const readReconcileWrites = (m: unknown): boolean =>
   specOf(m).memory?.long_term?.reconcile_writes ?? true;
 export const readRecallMode = (m: unknown): string =>
-  specOf(m).memory?.long_term?.recall_mode ?? "per_session";
+  specOf(m).memory?.long_term?.recall_mode ??
+  PROFILE_BACKEND_DEFAULTS.recallMode;
 export const readRewriteReads = (m: unknown): boolean =>
-  specOf(m).memory?.long_term?.rewrite_reads ?? false;
+  specOf(m).memory?.long_term?.rewrite_reads ??
+  PROFILE_BACKEND_DEFAULTS.rewriteReads;
 export const readAbstainThreshold = (m: unknown): number =>
-  specOf(m).memory?.long_term?.abstain_threshold ?? 0;
+  specOf(m).memory?.long_term?.abstain_threshold ??
+  PROFILE_BACKEND_DEFAULTS.abstainThreshold;
 
 // ---- reflection evaluator (Stream J.11 routing — the `when=reflection` rule) ----
 // The "reflection evaluator model" friendly control is a curated view over the
@@ -1266,7 +1277,8 @@ export const readActionScreenOnError = (m: unknown): "open" | "closed" =>
   (specOf(m).defenses?.action_screen_on_error as "open" | "closed") ?? "open";
 export const readOutputDlp = (m: unknown): "redact" | "off" =>
   (specOf(m).defenses?.output_dlp as "redact" | "off") ?? "off";
-export const readExtends = (m: unknown): string | undefined => specOf(m).extends;
+export const readExtends = (m: unknown): string | undefined =>
+  specOf(m).extends ?? undefined;
 
 export const setPromptInjection = (
   m: unknown,

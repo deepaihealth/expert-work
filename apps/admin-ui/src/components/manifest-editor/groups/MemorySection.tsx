@@ -38,6 +38,7 @@
  * while memory is off would silently reactivate memory the instant either
  * field is touched.
  */
+import { useState } from "react";
 import { Collapse, InputNumber, Select, Switch, Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -75,6 +76,11 @@ const { Text } = Typography;
 interface MemorySectionProps {
   formData: unknown;
   onChange: (data: unknown) => void;
+  /** #2 — controlled sub-tab, lifted to ManifestEditor so the selection
+   *  survives this pane unmounting on a group switch. Falls back to local
+   *  state when rendered standalone (tests). */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 
 // ① spec.memory.long_term.{injection,correction}_token_budget — the two
@@ -112,8 +118,19 @@ const CONSOLIDATION_DEFS: readonly FieldDef[] = [
   },
 ];
 
-export function MemorySection({ formData, onChange }: MemorySectionProps) {
+export function MemorySection({
+  formData,
+  onChange,
+  activeSubTab,
+  onSubTabChange,
+}: MemorySectionProps) {
   const { t } = useTranslation();
+  const [fallbackSubTab, setFallbackSubTab] = useState("basic");
+  const subTab = activeSubTab ?? fallbackSubTab;
+  const handleSubTabChange = (key: string): void => {
+    setFallbackSubTab(key);
+    onSubTabChange?.(key);
+  };
   const memoryOn = readMemoryOn(formData);
   const budgetValues = readMemoryBudgets(formData) as Record<
     string,
@@ -146,7 +163,8 @@ export function MemorySection({ formData, onChange }: MemorySectionProps) {
     <div data-testid="memory-section" style={{ maxWidth: 760 }}>
       <Tabs
         size="small"
-        defaultActiveKey="basic"
+        activeKey={subTab}
+        onChange={handleSubTabChange}
         items={[
           {
             key: "basic",

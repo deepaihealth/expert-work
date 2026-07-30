@@ -57,6 +57,20 @@ function int(v: unknown): number {
 }
 function textOf(v: unknown): string | null {
   if (typeof v === "string") return v.trim() === "" ? null : v;
+  // #9c — block-list content (Anthropic-style array): join the text parts,
+  // same handling as api/turn_summary.ts's textOf.
+  if (Array.isArray(v)) {
+    const parts = v
+      .filter(
+        (b): b is { text: string } =>
+          b !== null &&
+          typeof b === "object" &&
+          typeof (b as { text?: unknown }).text === "string",
+      )
+      .map((b) => b.text);
+    const joined = parts.join("");
+    return joined.trim() === "" ? null : joined;
+  }
   return null;
 }
 function durationOf(ch: Record<string, unknown>): number | null {

@@ -442,7 +442,14 @@ export function ConversationDetail() {
                stream replays only once it scrolls into view. */
             <div
               data-testid="conversation-turns"
-              style={{ display: "flex", flexDirection: "column", gap: 12 }}
+              // No list-level height cap: each TurnCard's answer block caps
+              // itself (#11), and an outer 480px cap only produced nested
+              // scrollbars fighting over the wheel (I1).
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+              }}
             >
               {historyTurns.map((h, idx) => {
                 const load = historyLoads[h.runId] ?? {
@@ -457,8 +464,22 @@ export function ConversationDetail() {
                         input: h.input,
                         attachments: [],
                         events: load.events,
-                        status: "done",
-                        error: null,
+                        // #10 — surface the run's real terminal state instead
+                        // of a hardcoded "done"; other statuses (interrupted/
+                        // paused/…) keep the normal rendering. No onRetry
+                        // here — the read-only page never dispatches runs.
+                        status:
+                          h.status === "error" || h.status === "timeout"
+                            ? "error"
+                            : "done",
+                        // C1 — feed the failure banner: prefer the run list's
+                        // real error text, fall back to the raw status string
+                        // so the Alert never renders an empty frame.
+                        error:
+                          h.status === "error" || h.status === "timeout"
+                            ? (convo.runs.find((r) => r.run_id === h.runId)
+                                ?.error ?? h.status)
+                            : null,
                         approval: null,
                       }}
                       turnSeq={idx}

@@ -622,6 +622,7 @@ const zhCN: TranslationKeys = {
     capability: "能力优先",
     capability_desc: "多记多想:步数翻倍、记忆更全,复杂任务更稳,费用更高",
     custom: "自定义",
+    nearest_hint: "最接近「{{name}}」,相差 {{count}} 项设置",
     confirm_title: "应用「{{name}}」?",
     confirm_body: "将调整 {{count}} 项配置;每一项之后仍可单独修改。",
   },
@@ -669,10 +670,16 @@ const zhCN: TranslationKeys = {
   },
   context_gates: {
     group_intro:
-      "内容太长装不下时,按 ①修剪旧工具结果 → ②只留最近对话 → ③模型总结中间段 的顺序兜底,大多数情况前两步就够。窗口大小以所选模型为准。",
-    panel_tool_result_prune: "①结果修剪",
-    panel_working_memory: "②滑动窗口",
-    panel_context_compression: "③上下文压缩",
+      "内容超窗时按下面三步顺序兜底,多数情况前两步就够;窗口大小以所选模型为准。",
+    tab_intro_prune:
+      "第 1 步:先把较早的工具执行结果压成一行引用——三步里最省、最不伤内容的一步。",
+    tab_intro_window:
+      "第 2 步:修剪后仍超限时,只保留首轮和最近几轮对话发给模型,真实历史不动。",
+    tab_intro_compress:
+      "第 3 步:前两步都不够时,用模型把中间一大段对话总结成一条背景摘要,作为最后兜底。",
+    panel_tool_result_prune: "第 1 步 · 结果修剪",
+    panel_working_memory: "第 2 步 · 滑动窗口",
+    panel_context_compression: "第 3 步 · 上下文压缩",
     pr_enabled_label: "启用结果修剪",
     pr_enabled_brief: "内容超限就把旧结果压成一行",
     pr_enabled_impact:
@@ -805,10 +812,19 @@ const zhCN: TranslationKeys = {
     pw_impact:
       "每轮结束时把 PLAN.md / TODO.md / MEMORY.md 写进用户的工作区,下次运行开始时再读回来,让沙箱内外看到同一份任务进度。这个开关要真正生效,还需要部署那边把沙箱管理组件接好。\n这个开关只管「要不要做这层文件同步」,管不着文件会不会被保留下来:只要运行时带着用户身份,工作区文件本来就会一直留着——就算一段时间没人碰、被系统回收了,下次也会自动恢复;没有用户身份的系统运行,工作区从一开始就是用完即丢的临时空间——这两种情况都跟这个开关没关系。\n例:一个跑很久的调研任务中途被打断,开着这个开关,下次接着跑还能看到 PLAN.md 里记的进度;关掉的话,Agent 心里知道计划,只是不会额外写这几个文件去同步。",
     platform_note_title: "平台实际生效值",
-    platform_note_body:
-      "沙箱实际用多少资源、用什么镜像,都是由平台部署决定的,配置清单里写了也不算数。\n镜像统一用平台自带的那个(装了 Python 和办公/数据/多媒体处理常用的库);资源配置(默认 1 个 CPU、1024 MB 内存、最多 128 个进程)由部署环境决定;单条命令默认最多跑 30 秒,工具调用时可以自己指定,但不超过 300 秒。\n沙箱里的根目录永远是只读的,能写文件的地方永远只有 /workspace 和 /tmp;具体用哪种容器技术运行(gVisor 还是 runc)由部署时的环境变量决定。",
+    platform_note_intro: "以下由平台部署统一决定,配置清单里写了也不生效:",
+    pn_image: "镜像",
+    pn_image_v: "平台内置镜像(含 Python 及办公/数据/多媒体常用库)",
+    pn_resources: "资源",
+    pn_resources_v: "默认 1 CPU / 1024 MB 内存 / 最多 128 个进程",
+    pn_timeout: "命令超时",
+    pn_timeout_v: "默认 30 秒,工具调用可自定,上限 300 秒",
+    pn_paths: "可写路径",
+    pn_paths_v: "仅 /workspace 与 /tmp(根目录只读)",
+    pn_runtime: "容器运行时",
+    pn_runtime_v: "gVisor 或 runc,由部署环境变量决定",
     declarative_note:
-      "配置清单里的 runtime / image / image_build / resources / readonly_root / writable / mounts 这几个字段,还有 code 这一整块,目前都只是摆设(专业说法叫「声明性字段」):写了不会报错,但系统运行时根本不会去读它们,留着也没坏处。\n真要调整实际的资源上限,请去改平台部署那边的配置(sandbox-supervisor 的环境变量)。",
+      "清单里的 runtime / image / image_build / resources / readonly_root / writable / mounts 字段与 code 块是声明性字段:写了不报错,运行时也不会读。要调真实上限,请改平台部署配置(sandbox-supervisor 环境变量)。",
   },
   memory_group: {
     tab_basic: "基本",
@@ -876,7 +892,7 @@ const zhCN: TranslationKeys = {
     rf_enable_label: "反思自评",
     rf_enable_brief: "回答前先让模型自查打分",
     rf_enable_impact:
-      "回答定稿前,先让一个评判模型给这次回答打分、挑毛病,不达标就自动让模型重新改进一遍,直到达标或次数用完。用哪个模型评判,由下面「反思评判模型」的设置决定;没设置就用主模型自己评判自己。\n每多反思一轮,就多一次模型调用:回答质量会更好,但也更慢、更贵。\n例:客服 Agent 答完一次,评判模型发现少说了退款流程,就打回去让它补上再答一次。",
+      "回答定稿前,先让一个评判模型给这次回答打分、挑毛病,不达标就自动让模型重新改进一遍,直到达标或次数用完。用哪个模型评判,由开启后下方出现的「反思评判模型」决定;没设置就用主模型自己评判自己。\n每多反思一轮,就多一次模型调用:回答质量会更好,但也更慢、更贵。\n例:客服 Agent 答完一次,评判模型发现少说了退款流程,就打回去让它补上再答一次。",
     rf_budget_label: "反思次数上限",
     rf_budget_brief: "最多反思几次就定稿",
     rf_budget_impact:
@@ -899,10 +915,9 @@ const zhCN: TranslationKeys = {
     traj_rec_brief: "把完整运行过程存档,用于质量评测",
     traj_rec_impact:
       "开启时,每次运行结束后把完整过程(用户输入、Agent 回复、工具调用)存一份档案,平台用它做质量评测,将来也可用于改进模型。\n关闭 = 对话内容不落档案,适合处理敏感信息的 Agent。\n例:客服 Agent 涉及用户隐私数据,关掉后运行内容只留在会话记录里,不进分析档案库。",
-    triggers_note:
-      "定时任务请到『触发器』页面管理。\n配置清单里的 triggers 字段目前还没接通,写了不会生效——请通过「触发器管理」功能(/v1/triggers 接口)去创建,走这条路径才能真正跑起来。",
+    triggers_note: "定时任务请到「触发器」页面创建和管理;清单里的 triggers 字段未接通,写了不生效。",
     declarative_note:
-      "observability 下面的 trace / log_level / redact_fields 这几个字段目前都只是摆设:写了不会报错,但系统运行时不会真的去读它们——链路追踪开不开由平台统一配置决定,日志级别由各服务的部署环境决定,隐私信息(PII)脱敏由平台的防御机制统一负责,都不受这几个字段影响。",
+      "observability 下的 trace / log_level / redact_fields 是声明性字段,运行时不会读取——链路追踪、日志级别、PII 脱敏均由平台统一配置。",
   },
   model_select: {
     provider_label: "提供方",
@@ -971,8 +986,8 @@ const zhCN: TranslationKeys = {
     mcp_tools_unreachable: "工具加载失败",
     mcp_servers_loading: "加载服务器中…",
     mcp_servers_load_failed: "服务器加载失败",
-    section_reflection_evaluator: "反思评判者（可选）",
-    reflection_evaluator_hint: "只选模型,不开启反思——开关在「反思自评」面板。",
+    section_reflection_evaluator: "反思评判模型（可选）",
+    reflection_evaluator_hint: "反思时用这个模型给回答打分;不选 = 用 agent 自己的主模型评判。",
     reflection_evaluator_clear: "清除（改用 agent 自己的模型）",
     section_vision: "图像理解(VL 模型)",
     vision_hint:
@@ -980,14 +995,13 @@ const zhCN: TranslationKeys = {
     vision_clear: "清除(不配图像理解)",
     section_vision_help:
       "主模型是纯文本时才显示这块。\n配的视觉模型专门回答图片相关问题,主模型负责统筹。\n留空 = Agent 不能看图。\n示例:qwen-vl-max",
-    section_fallback: "备用 provider(可选)",
+    section_fallback: "备用模型",
     section_fallback_help:
-      "主 provider 慢或不可用时,按顺序切到下一个 provider,而不是让整个 run 失败。\n单 provider 的 Agent 留空即可。\n建议:选不同厂商,避免一家挂了整条链跟着挂。",
-    fallback_hint:
-      "在主 provider 之后按顺序尝试。某个 provider 卡住或失败就切到下一个。",
-    fallback_empty: "无备用 —— 此 Agent 只用单一 provider。",
-    fallback_rank: "备用 {{n}}",
-    fallback_add: "添加备用 provider",
+      "主模型失败或超时时,按顺序切换到备用模型,而不是让整次运行失败。\n不配 = 只用主模型。\n建议:备用选不同厂商的模型,避免一家挂了整条链跟着挂。",
+    fallback_hint: "主模型失败或超时时,按顺序切换到备用模型。",
+    fallback_empty: "暂无备用模型。",
+    fallback_rank: "备用模型 {{n}}",
+    fallback_add: "添加备用模型",
     fallback_remove: "移除",
     field_name_help:
       "Agent 的唯一标识,外部程序按它调用。\n只能用小写字母、数字、连字符。\n示例:support-bot",
@@ -998,7 +1012,7 @@ const zhCN: TranslationKeys = {
     section_prompt_help:
       "系统提示词,定义 Agent 的角色、语气和行为规则,是塑造性格的核心。\n示例:你是资深 Python 工程师,回答简洁、给可运行代码",
     section_reflection_evaluator_help:
-      "指定反思自评所用的评判模型。仅在上方「反思自评」开启后生效;未指定时反思复用主模型。",
+      "指定反思自评所用的评判模型。未指定时反思复用主模型。",
     section_defenses: "防御守卫",
     section_defenses_help:
       "配置该 agent 的安全守卫姿态:输入注入防护、输出筛查/脱敏、工具行为审查。",
@@ -1191,6 +1205,7 @@ const zhCN: TranslationKeys = {
     turn_count: "共 {{n}} 轮",
     turn_running: "运行中…",
     turn_no_text: "（无文本回复）",
+    turn_failed: "本轮运行失败",
     usage_in: "输入",
     usage_out: "输出",
     usage_total: "合计",
@@ -1200,9 +1215,11 @@ const zhCN: TranslationKeys = {
     meta_finish: "结束原因",
     meta_model: "模型",
     reasoning_label: "思考过程",
+    view_full_text: "查看全文",
     events_label: "事件",
     export_json: "导出 JSON",
     export_json_tip: "导出本轮完整事件流(后端权威记录)为 JSON",
+    retry: "重试",
     workspace_label: "工作区",
     workspace_refresh: "刷新工作区",
     workspace_volume: "卷",
@@ -1260,6 +1277,7 @@ const zhCN: TranslationKeys = {
     tl_finish: "finish: {{reason}}",
     tl_tool_failed: "工具失败 → 重试",
     tl_final_answer: "最终答复",
+    tl_step_output: "本步输出",
     tl_reasoning: "思考(本次 LLM 调用)",
     tl_expand: "展开",
     tl_critique: "critique",

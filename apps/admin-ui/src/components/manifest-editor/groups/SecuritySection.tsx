@@ -36,6 +36,7 @@
  * but in ``ObservabilitySection`` (it's a run-archiving concern, not a
  * security/governance one), not here.
  */
+import { useState } from "react";
 import { Alert, Checkbox, InputNumber, Select, Switch, Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -73,6 +74,11 @@ const { Text } = Typography;
 interface SecuritySectionProps {
   formData: unknown;
   onChange: (data: unknown) => void;
+  /** #2 — controlled sub-tab, lifted to ManifestEditor so the selection
+   *  survives this pane unmounting on a group switch. Falls back to local
+   *  state when rendered standalone (tests). */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 
 const LABEL: React.CSSProperties = { display: "block", marginBottom: 4 };
@@ -136,8 +142,16 @@ const ENFORCE_DEFS: readonly FieldDef[] = [
 export function SecuritySection({
   formData,
   onChange,
+  activeSubTab,
+  onSubTabChange,
 }: SecuritySectionProps) {
   const { t } = useTranslation();
+  const [fallbackSubTab, setFallbackSubTab] = useState("defenses");
+  const subTab = activeSubTab ?? fallbackSubTab;
+  const handleSubTabChange = (key: string): void => {
+    setFallbackSubTab(key);
+    onSubTabChange?.(key);
+  };
   const security = readSecurity(formData);
   // NETWORK_DEFS mixes a select (string) and two tags (string[]) fields;
   // ENFORCE_DEFS is select-only (string) — cast ``readSecurity``'s output to
@@ -177,7 +191,8 @@ export function SecuritySection({
     <div data-testid="security-section" style={{ maxWidth: 760 }}>
       <Tabs
         size="small"
-        defaultActiveKey="defenses"
+        activeKey={subTab}
+        onChange={handleSubTabChange}
         items={[
           {
             key: "defenses",

@@ -27,6 +27,7 @@ import {
   Check,
   Download,
   ExternalLink,
+  RotateCcw,
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -64,6 +65,11 @@ import { TurnMeta } from "../../pages/agent_detail/playground/TurnMeta";
 import { PlanPanel } from "../../pages/run_detail/PlanPanel";
 import { buildLangfuseTraceUrl } from "../../config/env";
 import { FeedbackBar } from "./FeedbackBar";
+import {
+  FullTextModal,
+  FullTextTrigger,
+  type FullTextState,
+} from "./FullTextModal";
 import type { Turn } from "./types";
 
 const { Text } = Typography;
@@ -250,6 +256,11 @@ export interface TurnCardProps {
    *  or replayed) reports its result back up into the transcript's task
    *  result cards. */
   onFireResult?: (result: FireNowResult) => void;
+  /** #10 — per-turn retry. Live turns get a real re-dispatch handler; the
+   *  playground's history turns get a backfill-the-input-box handler (a past
+   *  run's enqueued inputs aren't exposed by the backend yet). Not passed on
+   *  the read-only conversation page → the button simply doesn't render. */
+  onRetry?: (turn: Turn) => void;
 }
 
 export function TurnCard({
@@ -272,6 +283,7 @@ export function TurnCard({
   ttftMs = null,
   finalized = false,
   onFireResult,
+  onRetry,
 }: TurnCardProps) {
   const { t } = useTranslation();
   const summary = summarizeTurn(turn.events);
@@ -334,10 +346,39 @@ export function TurnCard({
     },
     [onDownloadArtifact],
   );
+  // #8 — a multi-step turn emits one assistant text per LLM step; the answer
+  // shows them all (joined), not just the last (matches history_turns.ts's
+  // fallbackAnswer aggregation). ``finalText`` keeps its null-signal role
+  // (PlaygroundTab's paused-run/approval detection) — don't repoint it.
+  const aggregatedAnswer =
+    summary.assistantTexts.length > 0
+      ? summary.assistantTexts.join("\n\n")
+      : summary.finalText;
   const answer =
-    summary.finalText ??
+    aggregatedAnswer ??
     (turn.status === "running" ? t("playground.turn_running") : null);
   const runId = runIdOf(turn.events);
+  // #9e/#11 — 「查看全文」 modal shared by the answer block and the turn's
+  // reasoning summary section.
+  const [fullText, setFullText] = useState<FullTextState | null>(null);
+  // #10 — failed-turn detection for the retry button's danger styling.
+  // ``turn.status === "error"`` only covers transport-level failures (a
+  // server-side failure emits an ``error`` frame then still settles "done"),
+  // so also read the timeline banner / raw error frames.
+  const turnFailed =
+    turn.status === "error" ||
+    timelineBanner?.status === "error" ||
+    turn.events.some((e) => e.event === "error");
+  // I2 — while streaming, keep the capped answer box pinned to the newest
+  // text (the transcript-level auto-scroll can't reach inside this inner
+  // scroll div). Once the turn settles, stop forcing so the user can scroll.
+  const answerScrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const node = answerScrollRef.current;
+    if (turn.status === "running" && node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [answer, turn.status]);
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
@@ -536,30 +577,57 @@ export function TurnCard({
 
       {/* Agent answer */}
       <div style={{ padding: "8px 12px" }} data-testid="playground-turn-answer">
-        {turn.status === "error" ? (
+        {/* C1 — a failed turn keeps whatever answer it produced; the Alert is
+            a banner ABOVE the content, never a replacement (this is the only
+            place a failed run's partial output can be read back). Empty error
+            text falls back to the generic copy in ``message``. */}
+        {turn.status === "error" && (
           <Alert
             type="error"
             showIcon
-            message={t("playground.stream_failed")}
-            description={turn.error}
+            style={{ marginBottom: 8 }}
+            message={t("playground.turn_failed")}
+            description={turn.error || undefined}
             data-testid="playground-turn-error"
           />
-        ) : answer !== null ? (
-          // While streaming, render raw text (markdown reflow on every token is
-          // janky + partial fences render oddly); render markdown once the turn
-          // settles.
-          turn.status === "running" ? (
-            <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
-              {answer}
-            </Text>
-          ) : (
-            <MarkdownView>{answer}</MarkdownView>
-          )
-        ) : (
+        )}
+        {answer !== null ? (
+          <>
+            {/* #11 — cap the answer block so a long (multi-step) answer
+                scrolls inside its own container instead of stretching the
+                page (420 mirrors TraceView's raw modal cap). */}
+            <div
+              ref={answerScrollRef}
+              style={{ maxHeight: 420, overflowY: "auto" }}
+              data-testid="playground-turn-answer-scroll"
+            >
+              {/* While streaming, render raw text (markdown reflow on every
+                  token is janky + partial fences render oddly); render
+                  markdown once the turn settles. */}
+              {turn.status === "running" ? (
+                <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+                  {answer}
+                </Text>
+              ) : (
+                <MarkdownView>{answer}</MarkdownView>
+              )}
+            </div>
+            {aggregatedAnswer !== null && (
+              <FullTextTrigger
+                onClick={() =>
+                  setFullText({
+                    title: t("playground.view_full_text"),
+                    text: aggregatedAnswer,
+                  })
+                }
+              />
+            )}
+          </>
+        ) : turn.status !== "error" ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("playground.turn_no_text")}
           </Text>
-        )}
+        ) : null}
 
         {/* A+B — inline download row for artifacts this turn registered. */}
         {turnArtifacts.length > 0 && (
@@ -627,21 +695,32 @@ export function TurnCard({
                   key: "reasoning",
                   label: t("playground.reasoning_label"),
                   children: (
-                    <pre
-                      data-testid="playground-reasoning"
-                      style={{
-                        margin: 0,
-                        fontSize: 11,
-                        fontFamily: "var(--ew-font-mono)",
-                        color: "var(--ew-text-secondary)",
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-word",
-                        maxHeight: 240,
-                        overflow: "auto",
-                      }}
-                    >
-                      {summary.reasoning.join("\n\n———\n\n")}
-                    </pre>
+                    <>
+                      <pre
+                        data-testid="playground-reasoning"
+                        style={{
+                          margin: 0,
+                          fontSize: 11,
+                          fontFamily: "var(--ew-font-mono)",
+                          color: "var(--ew-text-secondary)",
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                          maxHeight: 240,
+                          overflow: "auto",
+                        }}
+                      >
+                        {summary.reasoning.join("\n\n———\n\n")}
+                      </pre>
+                      {/* #9e — same full-text modal as the step cards. */}
+                      <FullTextTrigger
+                        onClick={() =>
+                          setFullText({
+                            title: t("playground.reasoning_label"),
+                            text: summary.reasoning.join("\n\n———\n\n"),
+                          })
+                        }
+                      />
+                    </>
                   ),
                 },
               ]
@@ -740,6 +819,21 @@ export function TurnCard({
                   >
                     {t("playground.export_json")}
                   </Button>
+                  {/* #10 — one unified retry button (success turns can re-run
+                      too); danger tint marks a failed turn. Hidden while the
+                      turn is still running or when no handler is wired (the
+                      read-only conversation page). */}
+                  {onRetry && turn.status !== "running" && (
+                    <Button
+                      size="small"
+                      danger={turnFailed}
+                      icon={<RotateCcw size={13} strokeWidth={1.75} />}
+                      onClick={() => onRetry(turn)}
+                      data-testid="playground-turn-retry"
+                    >
+                      {t("playground.retry")}
+                    </Button>
+                  )}
                   {langfuseUrl !== null && (
                     <Button
                       size="small"
@@ -883,6 +977,7 @@ export function TurnCard({
           },
         ]}
       />
+      <FullTextModal state={fullText} onClose={() => setFullText(null)} />
     </div>
   );
 }

@@ -39,8 +39,6 @@ import {
   readName,
   readPromptJinja,
   readPromptVariables,
-  readReflectionEvaluator,
-  readReflectionEvaluatorOn,
   readSystemPrompt,
   readTools,
   readVisionModel,
@@ -52,7 +50,6 @@ import {
   setMcp,
   setModel,
   setName,
-  setReflectionEvaluator,
   setSystemPrompt,
   setTool,
   setVisionModel,
@@ -229,59 +226,38 @@ export function FormView({
             catalog={catalog}
             onChange={(mdl) => onChange(setModel(formData, mdl))}
           />
-        </section>
-
-        {/* E.11 provider fallback chain — only meaningful once a primary model
-          is picked. A slow / failing provider falls over to the next instead
-          of killing the run (the failure mode this feature exists to prevent). */}
-        {!!readModel(formData).provider && !!readModel(formData).name && (
-          <section data-testid="af-fallback" style={SECTION}>
-            <Heading>
-              {t("agent_form.section_fallback")}
-              <FieldHelp
-                text={t("agent_form.section_fallback_help")}
-                testId="af-fallback"
+          {/* E.11 model fallback chain — a lightweight sub-area of the main
+            model (not a sibling section); only meaningful once a primary
+            model is picked. A slow / failing model falls over to the next
+            instead of killing the run (the failure mode this feature exists
+            to prevent). */}
+          {!!readModel(formData).provider && !!readModel(formData).name && (
+            <div data-testid="af-fallback" style={{ marginTop: 16 }}>
+              <label style={LABEL}>
+                {t("agent_form.section_fallback")}
+                <FieldHelp
+                  text={t("agent_form.section_fallback_help")}
+                  testId="af-fallback"
+                />
+              </label>
+              <Text
+                type="secondary"
+                style={{ display: "block", marginBottom: 8, fontSize: 12 }}
+              >
+                {t("agent_form.fallback_hint")}
+              </Text>
+              <FallbackChainEditor
+                value={readFallback(formData)}
+                catalog={catalog}
+                onChange={(chain) => onChange(setFallback(formData, chain))}
               />
-            </Heading>
-            <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-              {t("agent_form.fallback_hint")}
-            </Text>
-            <FallbackChainEditor
-              value={readFallback(formData)}
-              catalog={catalog}
-              onChange={(chain) => onChange(setFallback(formData, chain))}
-            />
-          </section>
-        )}
-
-        <section data-testid="af-reflection-evaluator" style={SECTION}>
-          <Heading>
-            {t("agent_form.section_reflection_evaluator")}
-            <FieldHelp
-              text={t("agent_form.section_reflection_evaluator_help")}
-              testId="af-reflection-evaluator"
-            />
-          </Heading>
-          <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-            {t("agent_form.reflection_evaluator_hint")}
-          </Text>
-          <ModelSelect
-            value={readReflectionEvaluator(formData) ?? {}}
-            catalog={catalog}
-            onChange={(mdl) => onChange(setReflectionEvaluator(formData, mdl))}
-          />
-          {readReflectionEvaluatorOn(formData) && (
-            <Button
-              type="link"
-              size="small"
-              data-testid="af-reflection-evaluator-clear"
-              style={{ paddingLeft: 0 }}
-              onClick={() => onChange(setReflectionEvaluator(formData, null))}
-            >
-              {t("agent_form.reflection_evaluator_clear")}
-            </Button>
+            </div>
           )}
         </section>
+
+        {/* The reflection-evaluator model picker lives in
+          ModelRoutingSection's reflection panel (next to the switch that
+          governs it), not here. */}
 
         {/* Stream J.6 Path B — shown whenever the main model can't see images
           itself (including before one is picked); a separate VL model handles

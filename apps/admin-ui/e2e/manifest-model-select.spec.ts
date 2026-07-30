@@ -151,13 +151,20 @@ test("pick a provider + model via the form turns vision on", async ({
   ).toBeVisible();
 });
 
-test("the reflection-evaluator section exposes its own model picker", async ({
+test("the reflection-evaluator picker rides the reflection panel (shown once reflection is on)", async ({
   page,
 }) => {
   await page.getByTestId("agents-create").click();
   await expect(page.getByTestId("manifest-form-view")).toBeVisible();
-  // The reflection-evaluator section lives under the "Model" group.
+  // The reflection panel lives under the "Model" group.
   await page.getByTestId("cfg-nav-model").click();
+  // Hidden while reflection self-assessment is off (the default).
+  await expect(page.getByTestId("af-reflection-evaluator")).toHaveCount(0);
+  // Flip the reflection switch on — the evaluator model picker appears.
+  await page
+    .locator('[data-field-id="reflection"]')
+    .getByRole("switch")
+    .click();
   const evaluator = page.getByTestId("af-reflection-evaluator");
   await expect(evaluator).toBeVisible();
   // Empty by default (reflection reuses the agent's own model) — no clear link.

@@ -844,6 +844,11 @@ describe("form_model defenses readers (default-aware)", () => {
     expect(readExtends(m)).toBeUndefined();
   });
 
+  it("folds the backend's dumped extends: null back to undefined (#5)", () => {
+    const m: AgentManifest = { spec: { extends: null } };
+    expect(readExtends(m)).toBeUndefined();
+  });
+
   it("reads explicit values", () => {
     const m: AgentManifest = {
       spec: {

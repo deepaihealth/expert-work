@@ -35,13 +35,13 @@ const COMPRESS_FIELD_IDS = [
 ];
 const BUDGET_FIELD_ID = "policies.tool_output_budget.enabled";
 
-// Mirrors the (en locale) ``context_gates.panel_*`` values — the ①②③
-// sequence order is the whole point of this section, so the labels
-// (and the tabs' left-to-right order) must carry it.
+// Mirrors the (en locale) ``context_gates.panel_*`` values — the step
+// sequence is the whole point of this section, so the labels (and the
+// tabs' left-to-right order) must carry it (#4).
 const TAB_LABELS = {
-  prune: "① Tool-result prune",
-  window: "② Sliding window",
-  compress: "③ Context compression",
+  prune: "Step 1 · Tool-result prune",
+  window: "Step 2 · Sliding window",
+  compress: "Step 3 · Context compression",
 };
 
 function renderSection(
@@ -71,8 +71,18 @@ describe("ContextGatesSection", () => {
   it("renders a one-line intro above everything else", () => {
     renderSection();
     expect(
-      screen.getByText(/prune old tool results/i),
+      screen.getByText(/three steps below in order/i),
     ).toBeVisible();
+  });
+
+  it("each tab opens with its own step-intro first line (#4)", async () => {
+    const user = userEvent.setup();
+    renderSection();
+    expect(screen.getByText(/^Step 1:/)).toBeVisible();
+    await openTab(user, TAB_LABELS.window);
+    expect(screen.getByText(/^Step 2:/)).toBeVisible();
+    await openTab(user, TAB_LABELS.compress);
+    expect(screen.getByText(/^Step 3:/)).toBeVisible();
   });
 
   it("renders the tool-output-budget master switch outside the Tabs, at the very top", () => {
@@ -83,7 +93,7 @@ describe("ContextGatesSection", () => {
     expect(row?.closest(".ant-tabs")).toBeNull();
   });
 
-  it("renders three tabs labeled ①②③ in order, prune (①) active by default", () => {
+  it("renders three step-labelled tabs in order, prune (step 1) active by default", () => {
     renderSection();
     const tabs = screen.getAllByRole("tab").map((el) => el.textContent);
     expect(tabs).toEqual([
@@ -103,7 +113,7 @@ describe("ContextGatesSection", () => {
     }
   });
 
-  it("switching to the sliding-window (②) tab shows its 4 fields", async () => {
+  it("switching to the sliding-window (step 2) tab shows its 4 fields", async () => {
     const user = userEvent.setup();
     renderSection();
     await openTab(user, TAB_LABELS.window);
@@ -112,7 +122,7 @@ describe("ContextGatesSection", () => {
     }
   });
 
-  it("switching to the context-compression (③) tab shows its 10 fields", async () => {
+  it("switching to the context-compression (step 3) tab shows its 10 fields", async () => {
     const user = userEvent.setup();
     renderSection();
     await openTab(user, TAB_LABELS.compress);

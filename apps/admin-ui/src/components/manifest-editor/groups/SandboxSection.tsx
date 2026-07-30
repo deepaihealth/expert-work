@@ -19,13 +19,18 @@
  * ``Collapse`` — content is short enough to lay out flat (mirrors
  * ``RunBudgetSection``, the other single-panel curated pane).
  */
-import { Typography } from "antd";
+import { Descriptions, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { PolicyFieldList, type FieldDef } from "./field_defs";
 import { patchSandboxFs, readSandboxFs } from "../form_model";
 
 const { Text } = Typography;
+
+// Platform-decided runtime facts, rendered as a compact definition table
+// (they used to be one three-line prose wall — UX feedback 2026-07-30 #6).
+// Label/value pairs live in i18n under sandbox_group.pn_*.
+const PLATFORM_FACTS = ["image", "resources", "timeout", "paths", "runtime"] as const;
 
 interface SandboxSectionProps {
   formData: unknown;
@@ -64,9 +69,20 @@ export function SandboxSection({ formData, onChange }: SandboxSectionProps) {
         <Text strong style={{ display: "block", marginBottom: 4 }}>
           {t("sandbox_group.platform_note_title")}
         </Text>
-        <Text type="secondary" style={{ display: "block" }}>
-          {t("sandbox_group.platform_note_body")}
+        <Text type="secondary" style={{ display: "block", marginBottom: 8 }}>
+          {t("sandbox_group.platform_note_intro")}
         </Text>
+        <Descriptions
+          size="small"
+          bordered
+          column={1}
+          style={{ maxWidth: 640 }}
+          items={PLATFORM_FACTS.map((k) => ({
+            key: k,
+            label: t(`sandbox_group.pn_${k}`),
+            children: t(`sandbox_group.pn_${k}_v`),
+          }))}
+        />
       </div>
       <Text
         type="secondary"

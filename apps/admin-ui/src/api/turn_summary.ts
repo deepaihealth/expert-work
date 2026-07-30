@@ -27,6 +27,12 @@ export interface StepUsage {
 export interface TurnSummary {
   /** Last AI message text content — the agent's answer (null if none yet). */
   finalText: string | null;
+  /** Every AI message text content, in arrival order (#8 — a multi-step turn
+   *  emits one per LLM step; the transcript answer joins them all instead of
+   *  showing only the last). ``finalText`` keeps its last-wins semantics —
+   *  callers use its ``null`` as the "no answer → look for an approval gate"
+   *  signal. */
+  assistantTexts: string[];
   /** ``reasoning_content`` blocks, in arrival order. */
   reasoning: string[];
   /** Token usage summed across the turn's AI messages (null if none reported). */
@@ -85,6 +91,7 @@ function usageFromMetadata(um: Record<string, unknown>): TurnUsage {
 /** Distill a turn's frames into answer + reasoning + usage. */
 export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
   let finalText: string | null = null;
+  const assistantTexts: string[] = [];
   const reasoning: string[] = [];
   let reported = false;
   let stepCount: number | null = null;
@@ -130,7 +137,10 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
     for (const m of messagesOf(evt.data)) {
       if (m.type !== "ai") continue;
       const text = textOf(m.content);
-      if (text !== null) finalText = text; // last AI text wins
+      if (text !== null) {
+        finalText = text; // last AI text wins
+        assistantTexts.push(text); // #8 — but every step's text is kept too
+      }
 
       const rm = m.response_metadata;
       if (rm !== null && typeof rm === "object") {
@@ -170,6 +180,7 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
 
   return {
     finalText,
+    assistantTexts,
     reasoning,
     usage: reported ? usage : null,
     stepCount,

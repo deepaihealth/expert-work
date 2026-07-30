@@ -39,6 +39,8 @@ describe("summarizeTurn", () => {
     ];
     const summary = summarizeTurn(events);
     expect(summary.finalText).toBe("final");
+    // #8 — the empty first content is skipped; only real texts aggregate.
+    expect(summary.assistantTexts).toEqual(["final"]);
     expect(summary.usage).toEqual({
       inputTokens: 150,
       outputTokens: 30,
@@ -58,6 +60,22 @@ describe("summarizeTurn", () => {
     const summary = summarizeTurn(events);
     expect(summary.reasoning).toEqual(["step 1"]);
     expect(summary.finalText).toBe("answer");
+    expect(summary.assistantTexts).toEqual(["answer"]);
+  });
+
+  it("#8 — aggregates every AI text into assistantTexts (arrival order) while finalText stays last-wins", () => {
+    const events = [
+      updates([{ type: "ai", content: "step one text" }]),
+      updates([{ type: "ai", content: "step two text" }]),
+      updates([{ type: "ai", content: "the final text" }]),
+    ];
+    const summary = summarizeTurn(events);
+    expect(summary.assistantTexts).toEqual([
+      "step one text",
+      "step two text",
+      "the final text",
+    ]);
+    expect(summary.finalText).toBe("the final text");
   });
 
   it("returns null usage when no AI message reports usage", () => {
@@ -65,6 +83,7 @@ describe("summarizeTurn", () => {
     const summary = summarizeTurn(events);
     expect(summary.usage).toBeNull();
     expect(summary.finalText).toBe("hi");
+    expect(summary.assistantTexts).toEqual(["hi"]);
   });
 
   it("takes the highest node step_count and the frame-span latency", () => {
@@ -96,6 +115,7 @@ describe("summarizeTurn", () => {
     ];
     const summary = summarizeTurn(events);
     expect(summary.finalText).toBeNull();
+    expect(summary.assistantTexts).toEqual([]);
     expect(summary.usage).toBeNull();
   });
 

@@ -202,6 +202,27 @@ export function AgentDetail() {
     }
   }, [name, version]);
 
+  /** #2 — post-save refetch WITHOUT the loading skeleton. ``refresh`` flips
+   *  ``loading`` and the whole detail body is swapped for a <Skeleton/>,
+   *  unmounting ManifestTab (and every bit of editor state with it). The
+   *  save path refetches in place instead, so the editor stays mounted. */
+  const refreshQuietly = useCallback(async () => {
+    if (!name || !version) return;
+    try {
+      const result = await getAgent(name, version);
+      setDetail(result);
+      setError(null);
+    } catch (err) {
+      const message =
+        err instanceof ApiError
+          ? `${err.code}: ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : "unknown error";
+      setError(message);
+    }
+  }, [name, version]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -295,7 +316,7 @@ export function AgentDetail() {
       />
 
       {activeTab === "overview" && <OverviewTab detail={detail} />}
-      {activeTab === "manifest" && <ManifestTab detail={detail} onSaved={refresh} />}
+      {activeTab === "manifest" && <ManifestTab detail={detail} onSaved={refreshQuietly} />}
       {activeTab === "history" && <HistoryTab detail={detail} onRolledBack={refresh} />}
       {activeTab === "playground" && <PlaygroundTab detail={detail} />}
       {activeTab === "users" && <UsersTab detail={detail} />}

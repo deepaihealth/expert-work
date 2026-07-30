@@ -15,6 +15,11 @@ import type { AgentStep, AuxNodeItem, MarkerItem, TimelineItem } from "../../../
 import type { FireNowResult } from "../../../api/triggers";
 import type { WorkerStatus, WorkerTimeline } from "../../../api/worker_timeline";
 import { ToolCallCard } from "../../../components/ToolTimeline";
+import {
+  FullTextModal,
+  FullTextTrigger,
+  type FullTextState,
+} from "../../../components/turn/FullTextModal";
 import { fmtDuration } from "./duration_format";
 import { StreamingStepCard } from "./StreamingStepCard";
 import type { LiveStep } from "./useTokenStream";
@@ -127,7 +132,8 @@ function AgentStepCard({
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(item.hasError);
-  const isFinal = item.tools.length === 0;
+  // #9d — 「查看全文」 modal, shared by this step's reasoning + output areas.
+  const [fullText, setFullText] = useState<FullTextState | null>(null);
   const toggle = (): void => setExpanded((v) => !v);
   const onHeadKeyDown = (e: KeyboardEvent): void => {
     if (e.key === "Enter" || e.key === " ") {
@@ -136,14 +142,22 @@ function AgentStepCard({
     }
   };
 
-  const caretSuffix =
+  // #9a — a tool-calling step can carry its own content too; the collapsed
+  // caret hints at both (tools count · output/final-answer label).
+  const contentLabel =
+    item.tools.length > 0
+      ? t("playground.tl_step_output")
+      : t("playground.tl_final_answer");
+  const caretSuffix = [
     item.tools.length > 0
       ? t(item.tools.length === 1 ? "playground.tool_count_one" : "playground.tool_count_other", {
           count: item.tools.length,
         })
-      : isFinal && item.content
-        ? t("playground.tl_final_answer")
-        : "";
+      : null,
+    item.content ? contentLabel : null,
+  ]
+    .filter((s): s is string => s !== null)
+    .join(" · ");
 
   return (
     <div style={{ position: "relative", marginBottom: 10 }}>
@@ -243,9 +257,32 @@ function AgentStepCard({
                 >
                   {t("playground.tl_reasoning")}
                 </div>
-                <p style={{ margin: "3px 0 0", fontSize: 12, color: "var(--ew-text-secondary)", fontStyle: "italic" }}>
+                <p
+                  style={{
+                    margin: "3px 0 0",
+                    fontSize: 12,
+                    color: "var(--ew-text-secondary)",
+                    fontStyle: "italic",
+                    // #9b — long CoT collapsed into one blob without these
+                    // (reads as truncation); StreamingStepCard already wraps.
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    // I4 — cap the expanded reasoning (same 240 as TurnCard's
+                    // turn-level reasoning); full text lives in the modal.
+                    maxHeight: 240,
+                    overflowY: "auto",
+                  }}
+                >
                   {item.reasoning}
                 </p>
+                <FullTextTrigger
+                  onClick={() =>
+                    setFullText({
+                      title: t("playground.tl_reasoning"),
+                      text: item.reasoning ?? "",
+                    })
+                  }
+                />
               </div>
             )}
             {item.tools.map((tool) => (
@@ -271,14 +308,51 @@ function AgentStepCard({
                 {tool.workers ? <WorkerSubTimeline workers={tool.workers} /> : null}
               </div>
             ))}
-            {isFinal && item.content && (
-              <div style={{ paddingTop: 8, fontSize: 13, color: "var(--ew-text-secondary)" }}>
-                {item.content}
+            {/* #9a — render the step's own content whether or not it called
+                tools (the old `tools.length === 0` gate dropped a tool-calling
+                step's text entirely). */}
+            {item.content && (
+              <div style={{ paddingTop: 8 }}>
+                {item.tools.length > 0 && (
+                  <div
+                    style={{
+                      fontSize: 10.5,
+                      letterSpacing: "0.05em",
+                      textTransform: "uppercase",
+                      color: "var(--ew-text-tertiary)",
+                    }}
+                  >
+                    {t("playground.tl_step_output")}
+                  </div>
+                )}
+                <div
+                  style={{
+                    fontSize: 13,
+                    color: "var(--ew-text-secondary)",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    // I4 — cap the expanded step output the same way as the
+                    // reasoning above; full text lives in the modal.
+                    maxHeight: 240,
+                    overflowY: "auto",
+                  }}
+                >
+                  {item.content}
+                </div>
+                <FullTextTrigger
+                  onClick={() =>
+                    setFullText({
+                      title: contentLabel,
+                      text: item.content ?? "",
+                    })
+                  }
+                />
               </div>
             )}
           </div>
         )}
       </div>
+      <FullTextModal state={fullText} onClose={() => setFullText(null)} />
     </div>
   );
 }

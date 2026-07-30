@@ -150,6 +150,33 @@ describe("ManifestEditor", () => {
     expect(screen.queryByTestId("cfg-pane-pending")).not.toBeInTheDocument();
   });
 
+  it("remembers a group's active sub-tab across group switches (#2)", async () => {
+    const user = userEvent.setup();
+    render(
+      <ManifestEditor mode="create" initialYaml={SEED} onChange={vi.fn()} />,
+    );
+    await screen.findByTestId("af-basic");
+
+    // security → open the (non-default) approval sub-tab.
+    await user.click(screen.getByTestId("cfg-nav-security"));
+    await screen.findByTestId("security-tab-defenses");
+    await user.click(
+      screen.getByRole("tab", { name: en.security_gates.tab_approval }),
+    );
+    await screen.findByTestId("security-tab-approval");
+
+    // Leave for another group (unmounts SecuritySection), then come back —
+    // the sub-tab selection is held by ManifestEditor, so it survives.
+    await user.click(screen.getByTestId("cfg-nav-memory"));
+    await screen.findByTestId("memory-tab-basic");
+    await user.click(screen.getByTestId("cfg-nav-security"));
+
+    expect(screen.getByTestId("security-tab-approval")).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: en.security_gates.tab_approval }),
+    ).toHaveAttribute("aria-selected", "true");
+  });
+
   it("the 'model' group renders ModelRoutingSection instead of a plain stacked FormView", async () => {
     const user = userEvent.setup();
     render(

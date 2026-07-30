@@ -63,6 +63,12 @@ interface CuratedPaneProps {
   /** Only consumed by ``CapabilitiesSection`` (its "mcp" sub-tab) — every
    *  other curated pane ignores it. */
   mcpSource?: McpPickerSource;
+  /** #2 — sub-tab persistence: the four tabbed panes (capabilities/context/
+   *  memory/security) report their active sub-tab up so the selection
+   *  survives the pane unmounting on a group switch; single-pane sections
+   *  ignore both. */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 const CURATED_GROUP_PANES: Record<
   string,
@@ -104,6 +110,11 @@ interface ManifestEditorProps {
   leadingTabs?: ReadonlyArray<LeadingTab>;
   /** Forwarded to the MCP section — ``catalog`` for a platform template. */
   mcpSource?: McpPickerSource;
+  /** #2 — optionally lift the active-group selection to the caller (e.g.
+   *  ManifestTab persists it in the URL so it survives remounts). Undefined
+   *  ⇒ the editor keeps its own internal selection. */
+  activeGroup?: string;
+  onActiveGroupChange?: (id: string) => void;
 }
 
 function safeSeed(initialYaml: string): unknown {
@@ -128,6 +139,8 @@ export function ManifestEditor({
   onChange,
   leadingTabs = [],
   mcpSource,
+  activeGroup,
+  onActiveGroupChange,
 }: ManifestEditorProps) {
   const { t } = useTranslation();
   const seed = useMemo(() => safeSeed(initialYaml), [initialYaml]);
@@ -135,13 +148,38 @@ export function ManifestEditor({
 
   const [schema, setSchema] = useState<JsonSchema | null>(null);
   const [schemaError, setSchemaError] = useState(false);
-  const [group, setGroup] = useState<string>(
+  const [internalGroup, setInternalGroup] = useState<string>(
     primaryLeading?.value ?? CONFIG_GROUPS[0].id,
   );
+  // #2 — caller-controlled group (when provided) wins over the internal
+  // selection; both are written on every switch so an uncontrolled caller
+  // keeps today's behaviour untouched.
+  const group = activeGroup ?? internalGroup;
+  // #2 — active sub-tab per tabbed curated pane (capabilities/context/
+  // memory/security), keyed by group id and held HERE so the selection
+  // survives the pane unmounting on a group switch.
+  const [subTabs, setSubTabs] = useState<Record<string, string>>({});
   const [manifestObject, setManifestObject] = useState<unknown>(seed);
   const [yamlText, setYamlText] = useState<string>(initialYaml);
   const [yamlActive, setYamlActive] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
+
+  function setGroup(id: string): void {
+    setInternalGroup(id);
+    onActiveGroupChange?.(id);
+  }
+
+  // #2 — controlled resync: ManifestTab no longer key-remounts this editor
+  // when the server snapshot changes; the refreshed snapshot arrives as a
+  // NEW ``initialYaml`` instead. Adopt it wholesale — callers only change
+  // ``initialYaml`` when the incoming snapshot is authoritative (the
+  // post-save refetch), so overwriting the working copy IS the resync. On
+  // mount both setters are identity no-ops (state was seeded from the same
+  // values).
+  useEffect(() => {
+    setManifestObject(seed);
+    setYamlText(initialYaml);
+  }, [seed, initialYaml]);
 
   useEffect(() => {
     let alive = true;
@@ -310,6 +348,8 @@ export function ManifestEditor({
       formData={manifestObject}
       onChange={handleFormChange}
       mcpSource={mcpSource}
+      activeSubTab={subTabs[group]}
+      onSubTabChange={(key) => setSubTabs((m) => ({ ...m, [group]: key }))}
     />
   ) : activeConfigGroup ? (
     <FormView

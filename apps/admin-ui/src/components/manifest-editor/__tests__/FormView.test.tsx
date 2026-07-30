@@ -71,9 +71,13 @@ describe("FormView", () => {
 
     renderSection("model");
     expect(screen.getByTestId("af-model")).toBeInTheDocument();
-    expect(screen.getByTestId("af-reflection-evaluator")).toBeInTheDocument();
-    // E.11 — the fallback-chain section shows once a primary model is picked.
+    // E.11 — the fallback-chain sub-area shows once a primary model is picked.
     expect(screen.getByTestId("af-fallback")).toBeInTheDocument();
+    // The reflection-evaluator picker moved to ModelRoutingSection's
+    // reflection panel (gated on the reflection switch) — not here.
+    expect(
+      screen.queryByTestId("af-reflection-evaluator"),
+    ).not.toBeInTheDocument();
 
     renderSection("prompt");
     expect(screen.getByTestId("af-prompt")).toBeInTheDocument();
@@ -120,14 +124,27 @@ describe("FormView", () => {
     expect(
       document.querySelector('[data-section-id="model"]'),
     ).toBeInTheDocument();
-    // Sibling sub-sections bundled into the same "model" tab keep their OWN
-    // (non-duplicate) headings — suppressing those would remove the only
-    // label distinguishing them from one another.
+    // Sub-parts bundled into the same "model" tab keep their OWN
+    // (non-duplicate) labels — suppressing those would remove the only
+    // label distinguishing them from one another. (Fallback is a nested
+    // sub-area of af-model with a small label, not a sibling heading.)
     expect(screen.getByTestId("af-fallback")).toHaveTextContent(
-      "Fallback providers (optional)",
+      "Fallback models",
     );
-    expect(screen.getByTestId("af-reflection-evaluator")).toHaveTextContent(
-      "Reflection evaluator (optional)",
+  });
+
+  it("folds the fallback area into the model block with model-wording copy (no empty-state illustration)", () => {
+    renderSection("model");
+    const model = screen.getByTestId("af-model");
+    // Nested inside the main-model block, not a sibling section.
+    expect(within(model).getByTestId("af-fallback")).toBeInTheDocument();
+    // Empty chain = one-line hint + inline add button — no big Empty block.
+    expect(document.querySelector(".ant-empty")).not.toBeInTheDocument();
+    expect(screen.getByTestId("af-fallback")).toHaveTextContent(
+      "No fallback models yet.",
+    );
+    expect(screen.getByTestId("af-fallback-add")).toHaveTextContent(
+      "Add fallback model",
     );
   });
 
@@ -187,38 +204,6 @@ describe("FormView", () => {
     };
     renderSection("model", visionModel);
     expect(screen.queryByTestId("af-vision")).not.toBeInTheDocument();
-  });
-
-  it("hides the evaluator clear button until an independent evaluator is set", () => {
-    renderSection("model");
-    expect(
-      screen.queryByTestId("af-reflection-evaluator-clear"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("shows the clear button and removes the routing rule when cleared", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    const withEvaluator: AgentManifest = {
-      ...SEED,
-      spec: {
-        ...SEED.spec,
-        routing: {
-          rules: [
-            {
-              when: "reflection",
-              model: { provider: "openai", name: "gpt-4o" },
-            },
-          ],
-        },
-      },
-    };
-    renderSection("model", withEvaluator, onChange);
-    const clear = screen.getByTestId("af-reflection-evaluator-clear");
-    expect(clear).toBeInTheDocument();
-    await user.click(clear);
-    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-    expect(last.spec?.routing).toBeUndefined();
   });
 
   it("typing the name emits a merged manifest preserving non-curated fields", async () => {

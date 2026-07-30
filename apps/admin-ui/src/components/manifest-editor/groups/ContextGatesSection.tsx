@@ -5,13 +5,15 @@
  * (PolicySpec.tool_result_prune → .working_memory → .context_compression)
  * plus the sibling tool-output-budget master switch.
  *
- * Structure: an intro ``Text`` explaining the three-gate order, then the
- * tool-output-budget master switch (a single-field ``PolicyFieldList``) as
- * its own row ABOVE the Tabs — it's a sibling "policies" block, not a fourth
- * gate in the sequence, so it doesn't belong inside the ①②③ tab strip. Below
- * that, an antd ``Tabs`` (``size="small"``, mirrors ``MemorySection``'s
- * sub-tab precedent) with one tab per gate — prune (①, default active) /
- * window (②) / compress (③) — each rendering its ``PolicyFieldList`` (Task
+ * Structure: a one-sentence intro ``Text`` naming the three-step order (the
+ * per-step detail moved into each tab's own first-line note, #4:
+ * ``tab_intro_prune/window/compress``), then the tool-output-budget master
+ * switch (a single-field ``PolicyFieldList``) as its own row ABOVE the Tabs
+ * — it's a sibling "policies" block, not a fourth gate in the sequence, so
+ * it doesn't belong inside the step-labelled tab strip. Below that, an antd
+ * ``Tabs`` (``size="small"``, mirrors ``MemorySection``'s sub-tab precedent)
+ * with one tab per gate — prune (step 1, default active) / window (step 2) /
+ * compress (step 3) — each rendering its ``PolicyFieldList`` (Task
  * 1's declarative one-row-per-field renderer). Unlike ``MemorySection``,
  * these tabs are NOT ``forceRender``: a hidden tab's fields simply aren't
  * mounted, matching antd Tabs' default lazy-mount behavior — there's no
@@ -27,6 +29,7 @@
  * feature-off state (a coarse legacy cap that predates the three gates), not
  * "falls back to a numeric default".
  */
+import { useState } from "react";
 import { Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -42,6 +45,11 @@ const { Text } = Typography;
 interface ContextGatesSectionProps {
   formData: unknown;
   onChange: (data: unknown) => void;
+  /** #2 — controlled sub-tab, lifted to ManifestEditor so the selection
+   *  survives this pane unmounting on a group switch. Falls back to local
+   *  state when rendered standalone (tests). */
+  activeSubTab?: string;
+  onSubTabChange?: (key: string) => void;
 }
 
 // ① tool_result_prune — the cheapest, first-line gate: collapses old tool
@@ -204,8 +212,16 @@ const TOOL_OUTPUT_BUDGET_DEFS: readonly FieldDef[] = [
 export function ContextGatesSection({
   formData,
   onChange,
+  activeSubTab,
+  onSubTabChange,
 }: ContextGatesSectionProps) {
   const { t } = useTranslation();
+  const [fallbackSubTab, setFallbackSubTab] = useState("prune");
+  const subTab = activeSubTab ?? fallbackSubTab;
+  const handleSubTabChange = (key: string): void => {
+    setFallbackSubTab(key);
+    onSubTabChange?.(key);
+  };
   const gates = readContextGates(formData);
   const values = gates as Record<string, number | boolean | undefined>;
 
@@ -225,39 +241,64 @@ export function ContextGatesSection({
       />
       <Tabs
         size="small"
-        defaultActiveKey="prune"
+        activeKey={subTab}
+        onChange={handleSubTabChange}
         items={[
           {
             key: "prune",
             label: t("context_gates.panel_tool_result_prune"),
             children: (
-              <PolicyFieldList
-                defs={TOOL_RESULT_PRUNE_DEFS}
-                values={values}
-                onPatch={handlePatch}
-              />
+              <>
+                <Text
+                  type="secondary"
+                  style={{ display: "block", marginBottom: 12 }}
+                >
+                  {t("context_gates.tab_intro_prune")}
+                </Text>
+                <PolicyFieldList
+                  defs={TOOL_RESULT_PRUNE_DEFS}
+                  values={values}
+                  onPatch={handlePatch}
+                />
+              </>
             ),
           },
           {
             key: "window",
             label: t("context_gates.panel_working_memory"),
             children: (
-              <PolicyFieldList
-                defs={WORKING_MEMORY_DEFS}
-                values={values}
-                onPatch={handlePatch}
-              />
+              <>
+                <Text
+                  type="secondary"
+                  style={{ display: "block", marginBottom: 12 }}
+                >
+                  {t("context_gates.tab_intro_window")}
+                </Text>
+                <PolicyFieldList
+                  defs={WORKING_MEMORY_DEFS}
+                  values={values}
+                  onPatch={handlePatch}
+                />
+              </>
             ),
           },
           {
             key: "compress",
             label: t("context_gates.panel_context_compression"),
             children: (
-              <PolicyFieldList
-                defs={CONTEXT_COMPRESSION_DEFS}
-                values={values}
-                onPatch={handlePatch}
-              />
+              <>
+                <Text
+                  type="secondary"
+                  style={{ display: "block", marginBottom: 12 }}
+                >
+                  {t("context_gates.tab_intro_compress")}
+                </Text>
+                <PolicyFieldList
+                  defs={CONTEXT_COMPRESSION_DEFS}
+                  values={values}
+                  onPatch={handlePatch}
+                />
+              </>
             ),
           },
         ]}

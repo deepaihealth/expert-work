@@ -476,6 +476,72 @@ describe("ConversationDetail", () => {
       expect(payload.events).toHaveLength(replayEvents.length);
     });
 
+    // C1 — a failed run's replayed transcript keeps its content; the error
+    // banner is additive and carries the run's real error text ("boom").
+    it("keeps a failed history turn's replayed answer and shows its error banner", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
+        TWO_RUNS[0],
+        { ...TWO_RUNS[1], status: "error" },
+      ]);
+      vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() =>
+        makeStream(replayEvents),
+      );
+
+      renderPage();
+
+      await waitFor(() =>
+        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+      );
+      // Both cards replayed → both keep their assistant body …
+      await waitFor(() =>
+        expect(screen.getAllByText("replayed answer")).toHaveLength(2),
+      );
+      // … and only the failed one grows a banner, fed with the run list's
+      // real error text (CONVO.runs[1].error === "boom"), not an empty frame.
+      const banners = screen.getAllByTestId("playground-turn-error");
+      expect(banners).toHaveLength(1);
+      expect(banners[0]).toHaveTextContent("This turn's run failed");
+      expect(banners[0]).toHaveTextContent("boom");
+      // I1 — the turns list itself is no longer a capped nested scroller.
+      expect(screen.getByTestId("conversation-turns").style.maxHeight).toBe("");
+    });
+
+    // #10 — run status → turn status mapping: error/timeout fail the card,
+    // interrupted (non-terminal-failure) renders as a normal turn.
+    it("maps error/timeout runs to failed turns and interrupted runs to normal ones", async () => {
+      const RUN_3 = "33333333-3333-3333-3333-333333333335";
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([
+        ...TWO_TURNS,
+        { role: "user", content: "third question" },
+        { role: "assistant", content: "third answer" },
+      ]);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
+        { runId: RUN_1, status: "timeout", isResume: false, createdAt: "2026-06-30T12:00:00Z" },
+        { runId: RUN_2, status: "interrupted", isResume: true, createdAt: "2026-06-30T12:05:00Z" },
+        { runId: RUN_3, status: "error", isResume: true, createdAt: "2026-06-30T12:10:00Z" },
+      ]);
+      vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() =>
+        makeStream(replayEvents),
+      );
+
+      renderPage();
+
+      await waitFor(() =>
+        expect(screen.getAllByTestId("playground-turn")).toHaveLength(3),
+      );
+      await waitFor(() =>
+        expect(screen.getAllByTestId("playground-turn-error")).toHaveLength(2),
+      );
+      const banners = screen.getAllByTestId("playground-turn-error");
+      // No matching error text in CONVO.runs for these → the raw status
+      // string backfills the description.
+      expect(banners[0]).toHaveTextContent("timeout");
+      expect(banners[1]).toHaveTextContent("error");
+    });
+
     it("keeps the flat message block when the message/run counts don't line up", async () => {
       vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
       vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
