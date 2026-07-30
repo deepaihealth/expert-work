@@ -1775,6 +1775,55 @@ describe("PlaygroundTab", () => {
       expect(screen.queryByTestId("playground-approval")).not.toBeInTheDocument();
     });
 
+    // #10 — a history turn's retry can't re-dispatch (a past run's enqueued
+    // inputs aren't exposed by the backend yet): it backfills the input box
+    // for the user to re-send, and must dispatch nothing itself.
+    it("backfills the input box (no re-dispatch) when a history turn's retry is clicked", async () => {
+      const user = userEvent.setup();
+      createSessionMock.mockResolvedValue(sampleThread);
+      const past: ThreadMeta = {
+        ...sampleThread,
+        thread_id: "aaaaaaaa-0000-0000-0000-000000000009",
+      };
+      listSessionsMock.mockResolvedValue([past]);
+      getMessagesMock.mockResolvedValue([
+        { role: "user", content: "q1" },
+        { role: "assistant", content: "a1" },
+      ]);
+      listThreadRunsMock.mockResolvedValue([
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+      ]);
+      streamRunEventsMock.mockReturnValue(
+        makeStream([
+          {
+            id: "u1",
+            event: "updates",
+            data: {
+              agent: { messages: [{ type: "ai", content: "replayed answer" }] },
+            },
+            rawData: "",
+            receivedAt: "t1",
+          },
+          { id: "e1", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
+        ]),
+      );
+
+      renderPg();
+      await screen.findByTestId("playground-input");
+      await user.click(screen.getByTestId("playground-history-open"));
+      await user.click(
+        await screen.findByTestId(`session-history-item-${past.thread_id}`),
+      );
+      // The retry button only appears once the row's replay settles.
+      await screen.findByText("replayed answer");
+
+      await user.click(screen.getByTestId("playground-turn-retry"));
+
+      expect(screen.getByTestId("playground-input")).toHaveValue("q1");
+      // Backfill only — no run was dispatched.
+      expect(streamRunMock).not.toHaveBeenCalled();
+    });
+
     it("falls back to the flat history block when message/run counts don't line up", async () => {
       const user = userEvent.setup();
       createSessionMock.mockResolvedValue(sampleThread);

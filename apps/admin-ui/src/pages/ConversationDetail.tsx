@@ -442,15 +442,13 @@ export function ConversationDetail() {
                stream replays only once it scrolls into view. */
             <div
               data-testid="conversation-turns"
-              // #11 — same cap as the flat degraded view below: the lazy turn
-              // cards (events expanded by default) would otherwise stretch
-              // the page without bound.
+              // No list-level height cap: each TurnCard's answer block caps
+              // itself (#11), and an outer 480px cap only produced nested
+              // scrollbars fighting over the wheel (I1).
               style={{
                 display: "flex",
                 flexDirection: "column",
                 gap: 12,
-                maxHeight: 480,
-                overflowY: "auto",
               }}
             >
               {historyTurns.map((h, idx) => {
@@ -474,7 +472,14 @@ export function ConversationDetail() {
                           h.status === "error" || h.status === "timeout"
                             ? "error"
                             : "done",
-                        error: null,
+                        // C1 — feed the failure banner: prefer the run list's
+                        // real error text, fall back to the raw status string
+                        // so the Alert never renders an empty frame.
+                        error:
+                          h.status === "error" || h.status === "timeout"
+                            ? (convo.runs.find((r) => r.run_id === h.runId)
+                                ?.error ?? h.status)
+                            : null,
                         approval: null,
                       }}
                       turnSeq={idx}

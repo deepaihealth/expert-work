@@ -188,3 +188,90 @@ describe("TurnCard (read-only)", () => {
     expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
   });
 });
+
+/** A multi-step run: two LLM steps each emitting their own assistant text —
+ *  the answer must aggregate BOTH (#8), not just the last one. */
+const multiTextEvents: SseEvent[] = [
+  {
+    id: "1",
+    event: "metadata",
+    data: { run_id: "run-hist-2" },
+    rawData: "",
+    receivedAt: "",
+  },
+  {
+    id: "2",
+    event: "updates",
+    data: { agent: { messages: [{ type: "ai", content: "step one findings" }] } },
+    rawData: "",
+    receivedAt: "",
+  },
+  {
+    id: "3",
+    event: "updates",
+    data: { agent: { messages: [{ type: "ai", content: "final summary" }] } },
+    rawData: "",
+    receivedAt: "",
+  },
+  { id: "4", event: "end", data: {}, rawData: "", receivedAt: "" },
+];
+
+describe("TurnCard answer area (#8 / #11 / C1)", () => {
+  it("aggregates every assistant text into the answer, not just the last step's", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({ events: multiTextEvents }),
+    });
+
+    const scroll = screen.getByTestId("playground-turn-answer-scroll");
+    expect(within(scroll).getByText("step one findings")).toBeInTheDocument();
+    expect(within(scroll).getByText("final summary")).toBeInTheDocument();
+  });
+
+  it("caps the answer block so a long answer scrolls inside its own container (#11)", () => {
+    renderCard({ readOnly: true, loadState: "done" });
+
+    expect(screen.getByTestId("playground-turn-answer-scroll")).toHaveStyle({
+      maxHeight: "420px",
+      overflowY: "auto",
+    });
+  });
+
+  // C1 — the failure Alert is a banner ABOVE the answer, never a replacement:
+  // a failed run's produced assistant text must stay readable.
+  it("keeps a failed turn's answer body and shows the error banner above it", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({ status: "error", error: "boom" }),
+    });
+
+    const banner = screen.getByTestId("playground-turn-error");
+    expect(banner).toHaveTextContent("This turn's run failed");
+    expect(banner).toHaveTextContent("boom");
+    expect(screen.getByText("replayed answer")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("playground-turn-answer-scroll"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a generic failure banner (never an empty frame) when the turn has no error text", () => {
+    renderCard({
+      readOnly: true,
+      loadState: "done",
+      turn: makeTurn({
+        status: "error",
+        error: null,
+        events: [{ id: "e", event: "end", data: {}, rawData: "", receivedAt: "" }],
+      }),
+    });
+
+    expect(screen.getByTestId("playground-turn-error")).toHaveTextContent(
+      "This turn's run failed",
+    );
+    // The banner already states the outcome — no "(no text answer)"
+    // placeholder stacked underneath it.
+    expect(screen.queryByText("(no text answer)")).not.toBeInTheDocument();
+  });
+});

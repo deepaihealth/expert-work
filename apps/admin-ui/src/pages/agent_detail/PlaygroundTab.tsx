@@ -1307,7 +1307,13 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                           h.status === "error" || h.status === "timeout"
                             ? "error"
                             : "done",
-                        error: null,
+                        // C1 — ``ThreadRunSummary`` carries no error text yet,
+                        // so the raw status string keeps the failure banner
+                        // from rendering an empty frame.
+                        error:
+                          h.status === "error" || h.status === "timeout"
+                            ? h.status
+                            : null,
                         approval: null,
                       }}
                       turnSeq={idx}

@@ -369,6 +369,16 @@ export function TurnCard({
     turn.status === "error" ||
     timelineBanner?.status === "error" ||
     turn.events.some((e) => e.event === "error");
+  // I2 — while streaming, keep the capped answer box pinned to the newest
+  // text (the transcript-level auto-scroll can't reach inside this inner
+  // scroll div). Once the turn settles, stop forcing so the user can scroll.
+  const answerScrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const node = answerScrollRef.current;
+    if (turn.status === "running" && node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [answer, turn.status]);
 
   // Per-turn view state, seeded from the persisted global default. Switching
   // one turn's view no longer flips every other turn (and no longer fans out
@@ -567,20 +577,27 @@ export function TurnCard({
 
       {/* Agent answer */}
       <div style={{ padding: "8px 12px" }} data-testid="playground-turn-answer">
-        {turn.status === "error" ? (
+        {/* C1 — a failed turn keeps whatever answer it produced; the Alert is
+            a banner ABOVE the content, never a replacement (this is the only
+            place a failed run's partial output can be read back). Empty error
+            text falls back to the generic copy in ``message``. */}
+        {turn.status === "error" && (
           <Alert
             type="error"
             showIcon
-            message={t("playground.stream_failed")}
-            description={turn.error}
+            style={{ marginBottom: 8 }}
+            message={t("playground.turn_failed")}
+            description={turn.error || undefined}
             data-testid="playground-turn-error"
           />
-        ) : answer !== null ? (
+        )}
+        {answer !== null ? (
           <>
             {/* #11 — cap the answer block so a long (multi-step) answer
                 scrolls inside its own container instead of stretching the
                 page (420 mirrors TraceView's raw modal cap). */}
             <div
+              ref={answerScrollRef}
               style={{ maxHeight: 420, overflowY: "auto" }}
               data-testid="playground-turn-answer-scroll"
             >
@@ -606,11 +623,11 @@ export function TurnCard({
               />
             )}
           </>
-        ) : (
+        ) : turn.status !== "error" ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("playground.turn_no_text")}
           </Text>
-        )}
+        ) : null}
 
         {/* A+B — inline download row for artifacts this turn registered. */}
         {turnArtifacts.length > 0 && (

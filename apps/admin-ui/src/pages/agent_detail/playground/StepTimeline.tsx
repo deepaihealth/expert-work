@@ -267,6 +267,10 @@ function AgentStepCard({
                     // (reads as truncation); StreamingStepCard already wraps.
                     whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
+                    // I4 — cap the expanded reasoning (same 240 as TurnCard's
+                    // turn-level reasoning); full text lives in the modal.
+                    maxHeight: 240,
+                    overflowY: "auto",
                   }}
                 >
                   {item.reasoning}
@@ -327,6 +331,10 @@ function AgentStepCard({
                     color: "var(--ew-text-secondary)",
                     whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
+                    // I4 — cap the expanded step output the same way as the
+                    // reasoning above; full text lives in the modal.
+                    maxHeight: 240,
+                    overflowY: "auto",
                   }}
                 >
                   {item.content}
