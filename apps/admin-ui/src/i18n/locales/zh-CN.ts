@@ -805,10 +805,19 @@ const zhCN: TranslationKeys = {
     pw_impact:
       "每轮结束时把 PLAN.md / TODO.md / MEMORY.md 写进用户的工作区,下次运行开始时再读回来,让沙箱内外看到同一份任务进度。这个开关要真正生效,还需要部署那边把沙箱管理组件接好。\n这个开关只管「要不要做这层文件同步」,管不着文件会不会被保留下来:只要运行时带着用户身份,工作区文件本来就会一直留着——就算一段时间没人碰、被系统回收了,下次也会自动恢复;没有用户身份的系统运行,工作区从一开始就是用完即丢的临时空间——这两种情况都跟这个开关没关系。\n例:一个跑很久的调研任务中途被打断,开着这个开关,下次接着跑还能看到 PLAN.md 里记的进度;关掉的话,Agent 心里知道计划,只是不会额外写这几个文件去同步。",
     platform_note_title: "平台实际生效值",
-    platform_note_body:
-      "沙箱实际用多少资源、用什么镜像,都是由平台部署决定的,配置清单里写了也不算数。\n镜像统一用平台自带的那个(装了 Python 和办公/数据/多媒体处理常用的库);资源配置(默认 1 个 CPU、1024 MB 内存、最多 128 个进程)由部署环境决定;单条命令默认最多跑 30 秒,工具调用时可以自己指定,但不超过 300 秒。\n沙箱里的根目录永远是只读的,能写文件的地方永远只有 /workspace 和 /tmp;具体用哪种容器技术运行(gVisor 还是 runc)由部署时的环境变量决定。",
+    platform_note_intro: "以下由平台部署统一决定,配置清单里写了也不生效:",
+    pn_image: "镜像",
+    pn_image_v: "平台内置镜像(含 Python 及办公/数据/多媒体常用库)",
+    pn_resources: "资源",
+    pn_resources_v: "默认 1 CPU / 1024 MB 内存 / 最多 128 个进程",
+    pn_timeout: "命令超时",
+    pn_timeout_v: "默认 30 秒,工具调用可自定,上限 300 秒",
+    pn_paths: "可写路径",
+    pn_paths_v: "仅 /workspace 与 /tmp(根目录只读)",
+    pn_runtime: "容器运行时",
+    pn_runtime_v: "gVisor 或 runc,由部署环境变量决定",
     declarative_note:
-      "配置清单里的 runtime / image / image_build / resources / readonly_root / writable / mounts 这几个字段,还有 code 这一整块,目前都只是摆设(专业说法叫「声明性字段」):写了不会报错,但系统运行时根本不会去读它们,留着也没坏处。\n真要调整实际的资源上限,请去改平台部署那边的配置(sandbox-supervisor 的环境变量)。",
+      "清单里的 runtime / image / image_build / resources / readonly_root / writable / mounts 字段与 code 块是声明性字段:写了不报错,运行时也不会读。要调真实上限,请改平台部署配置(sandbox-supervisor 环境变量)。",
   },
   memory_group: {
     tab_basic: "基本",
@@ -899,10 +908,9 @@ const zhCN: TranslationKeys = {
     traj_rec_brief: "把完整运行过程存档,用于质量评测",
     traj_rec_impact:
       "开启时,每次运行结束后把完整过程(用户输入、Agent 回复、工具调用)存一份档案,平台用它做质量评测,将来也可用于改进模型。\n关闭 = 对话内容不落档案,适合处理敏感信息的 Agent。\n例:客服 Agent 涉及用户隐私数据,关掉后运行内容只留在会话记录里,不进分析档案库。",
-    triggers_note:
-      "定时任务请到『触发器』页面管理。\n配置清单里的 triggers 字段目前还没接通,写了不会生效——请通过「触发器管理」功能(/v1/triggers 接口)去创建,走这条路径才能真正跑起来。",
+    triggers_note: "定时任务请到「触发器」页面创建和管理;清单里的 triggers 字段未接通,写了不生效。",
     declarative_note:
-      "observability 下面的 trace / log_level / redact_fields 这几个字段目前都只是摆设:写了不会报错,但系统运行时不会真的去读它们——链路追踪开不开由平台统一配置决定,日志级别由各服务的部署环境决定,隐私信息(PII)脱敏由平台的防御机制统一负责,都不受这几个字段影响。",
+      "observability 下的 trace / log_level / redact_fields 是声明性字段,运行时不会读取——链路追踪、日志级别、PII 脱敏均由平台统一配置。",
   },
   model_select: {
     provider_label: "提供方",

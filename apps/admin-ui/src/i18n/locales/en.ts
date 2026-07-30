@@ -784,7 +784,17 @@ export interface TranslationKeys {
     pw_brief: string;
     pw_impact: string;
     platform_note_title: string;
-    platform_note_body: string;
+    platform_note_intro: string;
+    pn_image: string;
+    pn_image_v: string;
+    pn_resources: string;
+    pn_resources_v: string;
+    pn_timeout: string;
+    pn_timeout_v: string;
+    pn_paths: string;
+    pn_paths_v: string;
+    pn_runtime: string;
+    pn_runtime_v: string;
     declarative_note: string;
   };
   // "Memory" group (MemorySection) — config-page redesign v2 Task 2 moved
@@ -3708,10 +3718,20 @@ const en: TranslationKeys = {
     pw_impact:
       "At the end of each turn, write PLAN.md / TODO.md / MEMORY.md into the user's workspace, and read them back when the next run starts — so progress is visible both inside and outside the sandbox. It also needs the deployment to have the sandbox supervisor wired up to actually take effect.\nThis switch only controls whether that file sync happens — it has nothing to do with whether files stick around. A run tied to a user identity already keeps its workspace files regardless (restored automatically next time, even after an idle cleanup); a system run with no user identity always gets a throwaway workspace — neither case depends on this switch.\nExample: a long research task gets interrupted midway — with this on, the next run can pick up right where PLAN.md left off; with this off, the agent still knows the plan, it just doesn't write these files to sync it.",
     platform_note_title: "Platform-effective values",
-    platform_note_body:
-      "How much the sandbox can actually use, and what image it runs, is decided by the platform deployment — the manifest has no say, no matter what's written here.\nThe image is always the platform's shared one (Python plus the usual office / data / media libraries); resources (default 1 CPU, 1024 MB memory, up to 128 processes) come from the deployment environment; a single command gets 30 seconds by default, a tool call can ask for more, capped at 300 seconds.\nThe sandbox's root filesystem is always read-only, and the only writable paths are always /workspace and /tmp; which container tech runs it (gVisor or runc) is set by a deployment environment variable.",
+    platform_note_intro:
+      "The following are decided by the platform deployment — the manifest has no say:",
+    pn_image: "Image",
+    pn_image_v: "Platform-shared image (Python plus common office/data/media libraries)",
+    pn_resources: "Resources",
+    pn_resources_v: "Default 1 CPU / 1024 MB memory / up to 128 processes",
+    pn_timeout: "Command timeout",
+    pn_timeout_v: "30s default, per-tool-call override capped at 300s",
+    pn_paths: "Writable paths",
+    pn_paths_v: "Only /workspace and /tmp (root filesystem is read-only)",
+    pn_runtime: "Container runtime",
+    pn_runtime_v: "gVisor or runc, set by a deployment environment variable",
     declarative_note:
-      "The manifest's runtime / image / image_build / resources / readonly_root / writable / mounts fields, and the whole code block, are currently just for show (the technical term is 'declarative'): writing them doesn't error, but the system never actually reads them at run time — harmless to leave them in the YAML.\nTo actually change the resource limits, edit the platform deployment config instead (the sandbox-supervisor environment variables).",
+      "The manifest's runtime / image / image_build / resources / readonly_root / writable / mounts fields and the code block are declarative-only: writing them doesn't error, but nothing reads them at run time. To change real limits, edit the platform deployment (sandbox-supervisor environment variables).",
   },
   memory_group: {
     tab_basic: "Basic",
@@ -3803,9 +3823,9 @@ const en: TranslationKeys = {
     traj_rec_impact:
       "When on, every run's full transcript — the user's messages, the agent's replies, and its tool calls — gets archived once the run finishes; the platform uses that archive for quality evaluation, and it may also feed future model improvements.\nOff = conversation content never gets archived, which fits agents that handle sensitive information.\nExample: a support agent that touches private customer data turns this off, so run content stays only in the session log and never enters the analysis archive.",
     triggers_note:
-      "Manage scheduled tasks from the Triggers page.\nThe manifest's triggers field is not wired up yet — cron or webhook triggers written there have no effect; create them through trigger management (the /v1/triggers API) instead, since that's the path that actually runs.",
+      "Create and manage scheduled tasks from the Triggers page; the manifest's triggers field is not wired up and has no effect.",
     declarative_note:
-      "observability's trace / log_level / redact_fields fields are currently declarative — they don't error when set, but the system never actually reads them at run time. Tracing is controlled by the platform's own configuration, the log level comes from each service's deployment environment, and PII redaction is handled entirely by the platform's defense chain — none of that depends on these fields.",
+      "observability's trace / log_level / redact_fields are declarative-only — nothing reads them at run time. Tracing, log level and PII redaction are all platform-configured.",
   },
   model_select: {
     provider_label: "Provider",
