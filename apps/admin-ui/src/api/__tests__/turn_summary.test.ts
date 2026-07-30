@@ -13,6 +13,29 @@ function updates(messages: unknown[]): SseEvent {
   };
 }
 
+interface AiMsgOpts {
+  toolCalls?: number;
+  reasoning?: string;
+}
+
+/** Build an AIMessage-dump-shaped fixture: ``{type, content, tool_calls?,
+ *  additional_kwargs?}``. ``toolCalls: n`` produces ``n`` synthetic calls
+ *  (structure only matters — channel logic just checks non-empty). */
+function aiMsg(text: string, opts: AiMsgOpts = {}): Record<string, unknown> {
+  const msg: Record<string, unknown> = { type: "ai", content: text };
+  if (opts.toolCalls) {
+    msg.tool_calls = Array.from({ length: opts.toolCalls }, (_, i) => ({
+      name: "web_search",
+      args: {},
+      id: `call_${i}`,
+    }));
+  }
+  if (opts.reasoning !== undefined) {
+    msg.additional_kwargs = { reasoning_content: opts.reasoning };
+  }
+  return msg;
+}
+
 describe("summarizeTurn", () => {
   it("sums usage across AI messages and splits cache/reasoning details", () => {
     const events = [
@@ -39,8 +62,8 @@ describe("summarizeTurn", () => {
     ];
     const summary = summarizeTurn(events);
     expect(summary.finalText).toBe("final");
-    // #8 — the empty first content is skipped; only real texts aggregate.
-    expect(summary.assistantTexts).toEqual(["final"]);
+    // The empty first content is skipped; only real texts become segments.
+    expect(summary.segments).toEqual([{ text: "final", channel: "final" }]);
     expect(summary.usage).toEqual({
       inputTokens: 150,
       outputTokens: 30,
@@ -60,20 +83,20 @@ describe("summarizeTurn", () => {
     const summary = summarizeTurn(events);
     expect(summary.reasoning).toEqual(["step 1"]);
     expect(summary.finalText).toBe("answer");
-    expect(summary.assistantTexts).toEqual(["answer"]);
+    expect(summary.segments).toEqual([{ text: "answer", channel: "final" }]);
   });
 
-  it("#8 — aggregates every AI text into assistantTexts (arrival order) while finalText stays last-wins", () => {
+  it("aggregates every AI text into segments (arrival order); only the last (no tool_calls) is final", () => {
     const events = [
       updates([{ type: "ai", content: "step one text" }]),
       updates([{ type: "ai", content: "step two text" }]),
       updates([{ type: "ai", content: "the final text" }]),
     ];
     const summary = summarizeTurn(events);
-    expect(summary.assistantTexts).toEqual([
-      "step one text",
-      "step two text",
-      "the final text",
+    expect(summary.segments).toEqual([
+      { text: "step one text", channel: "commentary" },
+      { text: "step two text", channel: "commentary" },
+      { text: "the final text", channel: "final" },
     ]);
     expect(summary.finalText).toBe("the final text");
   });
@@ -83,7 +106,7 @@ describe("summarizeTurn", () => {
     const summary = summarizeTurn(events);
     expect(summary.usage).toBeNull();
     expect(summary.finalText).toBe("hi");
-    expect(summary.assistantTexts).toEqual(["hi"]);
+    expect(summary.segments).toEqual([{ text: "hi", channel: "final" }]);
   });
 
   it("takes the highest node step_count and the frame-span latency", () => {
@@ -115,7 +138,7 @@ describe("summarizeTurn", () => {
     ];
     const summary = summarizeTurn(events);
     expect(summary.finalText).toBeNull();
-    expect(summary.assistantTexts).toEqual([]);
+    expect(summary.segments).toEqual([]);
     expect(summary.usage).toBeNull();
   });
 
@@ -193,5 +216,34 @@ describe("summarizeTurn", () => {
     expect(s.perStepUsage[1].stepCount).toBe(2);
     // summed usage still intact
     expect(s.usage?.totalTokens).toBe(165);
+  });
+
+  it("glm 形态:旁白/正文各自与 tool_calls 同帧 → 全 commentary,末条无 tool_calls = final", () => {
+    const s = summarizeTurn([
+      updates([aiMsg("好的!我将分两章完成", { toolCalls: 1 })]),
+      updates([aiMsg("第一章正文…现在撰写第二章", { toolCalls: 1 })]),
+      updates([aiMsg("第二章正文,全文完。")]),
+    ]);
+    expect(s.segments).toEqual([
+      { text: "好的!我将分两章完成", channel: "commentary" },
+      { text: "第一章正文…现在撰写第二章", channel: "commentary" },
+      { text: "第二章正文,全文完。", channel: "final" },
+    ]);
+    expect(s.finalText).toBe("第二章正文,全文完。");
+  });
+
+  it("暂停/未完轮:末条 AI 文本带 tool_calls → 无 final,finalText null", () => {
+    const s = summarizeTurn([updates([aiMsg("先搜资料", { toolCalls: 1 })])]);
+    expect(s.segments).toEqual([{ text: "先搜资料", channel: "commentary" }]);
+    expect(s.finalText).toBeNull();
+  });
+
+  it("qwen/doubao 形态:中间轮 content 全空 → 无 commentary 段,只有 final", () => {
+    const s = summarizeTurn([
+      updates([aiMsg("", { toolCalls: 1, reasoning: "想一想" })]),
+      updates([aiMsg("最终答案")]),
+    ]);
+    expect(s.segments).toEqual([{ text: "最终答案", channel: "final" }]);
+    expect(s.reasoning).toEqual(["想一想"]);
   });
 });

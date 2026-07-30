@@ -1,10 +1,13 @@
 /**
  * Per-turn summary parser — distills a turn's SSE ``updates`` frames into the
- * agent's final answer, its reasoning trace, and token usage.
+ * agent's answer segments, its reasoning trace, and token usage.
  *
  * Reads the fields the OpenAI-compat decoder now surfaces (PR #847):
  * ``AIMessage.usage_metadata`` (tokens), ``additional_kwargs.reasoning_content``
- * (thinking trace), and the last AI text content (the answer).
+ * (thinking trace), and every AI text content, split into commentary/final
+ * channels by structural rule (spec:
+ * docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md) —
+ * never by inspecting the text itself.
  */
 import type { SseEvent } from "./sessions";
 import { messagesOf } from "./tool_timeline";
@@ -24,15 +27,23 @@ export interface StepUsage {
   usage: TurnUsage;
 }
 
+export type SegmentChannel = "commentary" | "final";
+
+export interface AnswerSegment {
+  text: string;
+  channel: SegmentChannel;
+}
+
 export interface TurnSummary {
-  /** Last AI message text content — the agent's answer (null if none yet). */
+  /** The ``final``-channel segment's text (null if the turn has no final
+   *  segment yet). Callers use this ``null`` as the "no answer → look for an
+   *  approval gate" signal. */
   finalText: string | null;
-  /** Every AI message text content, in arrival order (#8 — a multi-step turn
-   *  emits one per LLM step; the transcript answer joins them all instead of
-   *  showing only the last). ``finalText`` keeps its last-wins semantics —
-   *  callers use its ``null`` as the "no answer → look for an approval gate"
-   *  signal. */
-  assistantTexts: string[];
+  /** Every AI message text content, in arrival order, tagged with a
+   *  structural channel (spec: docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md).
+   *  Only the turn's LAST assistant text message can be ``"final"``, and only
+   *  when it carries no ``tool_calls``; everything else is ``"commentary"``. */
+  segments: AnswerSegment[];
   /** ``reasoning_content`` blocks, in arrival order. */
   reasoning: string[];
   /** Token usage summed across the turn's AI messages (null if none reported). */
@@ -90,8 +101,7 @@ function usageFromMetadata(um: Record<string, unknown>): TurnUsage {
 
 /** Distill a turn's frames into answer + reasoning + usage. */
 export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
-  let finalText: string | null = null;
-  const assistantTexts: string[] = [];
+  const pending: Array<{ text: string; hasToolCalls: boolean }> = [];
   const reasoning: string[] = [];
   let reported = false;
   let stepCount: number | null = null;
@@ -138,8 +148,8 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
       if (m.type !== "ai") continue;
       const text = textOf(m.content);
       if (text !== null) {
-        finalText = text; // last AI text wins
-        assistantTexts.push(text); // #8 — but every step's text is kept too
+        const hasToolCalls = Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+        pending.push({ text, hasToolCalls });
       }
 
       const rm = m.response_metadata;
@@ -178,9 +188,20 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
     }
   }
 
+  // Channel is structural (spec 2026-07-30-conversation-output-channels):
+  // within this turn, only the LAST assistant text message can be "final",
+  // and only when it carries no tool_calls; everything else is commentary.
+  const segments: AnswerSegment[] = pending.map((p, i) => ({
+    text: p.text,
+    channel:
+      i === pending.length - 1 && !p.hasToolCalls ? "final" : "commentary",
+  }));
+  const finalSegment = segments.length > 0 ? segments[segments.length - 1] : null;
+  const finalText = finalSegment?.channel === "final" ? finalSegment.text : null;
+
   return {
     finalText,
-    assistantTexts,
+    segments,
     reasoning,
     usage: reported ? usage : null,
     stepCount,
