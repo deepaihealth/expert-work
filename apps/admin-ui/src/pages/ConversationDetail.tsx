@@ -442,7 +442,16 @@ export function ConversationDetail() {
                stream replays only once it scrolls into view. */
             <div
               data-testid="conversation-turns"
-              style={{ display: "flex", flexDirection: "column", gap: 12 }}
+              // #11 — same cap as the flat degraded view below: the lazy turn
+              // cards (events expanded by default) would otherwise stretch
+              // the page without bound.
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+                maxHeight: 480,
+                overflowY: "auto",
+              }}
             >
               {historyTurns.map((h, idx) => {
                 const load = historyLoads[h.runId] ?? {

@@ -561,16 +561,36 @@ export function TurnCard({
             data-testid="playground-turn-error"
           />
         ) : answer !== null ? (
-          // While streaming, render raw text (markdown reflow on every token is
-          // janky + partial fences render oddly); render markdown once the turn
-          // settles.
-          turn.status === "running" ? (
-            <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
-              {answer}
-            </Text>
-          ) : (
-            <MarkdownView>{answer}</MarkdownView>
-          )
+          <>
+            {/* #11 — cap the answer block so a long (multi-step) answer
+                scrolls inside its own container instead of stretching the
+                page (420 mirrors TraceView's raw modal cap). */}
+            <div
+              style={{ maxHeight: 420, overflowY: "auto" }}
+              data-testid="playground-turn-answer-scroll"
+            >
+              {/* While streaming, render raw text (markdown reflow on every
+                  token is janky + partial fences render oddly); render
+                  markdown once the turn settles. */}
+              {turn.status === "running" ? (
+                <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>
+                  {answer}
+                </Text>
+              ) : (
+                <MarkdownView>{answer}</MarkdownView>
+              )}
+            </div>
+            {aggregatedAnswer !== null && (
+              <FullTextTrigger
+                onClick={() =>
+                  setFullText({
+                    title: t("playground.view_full_text"),
+                    text: aggregatedAnswer,
+                  })
+                }
+              />
+            )}
+          </>
         ) : (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("playground.turn_no_text")}
