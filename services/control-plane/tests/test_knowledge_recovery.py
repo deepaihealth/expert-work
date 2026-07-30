@@ -191,7 +191,14 @@ async def test_recovery_document_deleted_mid_flight_logs_no_retry_warning(
         settled = await _worker(store, max_attempts=5).run_once()
     assert settled == 0
     assert store.failed_terminal == []
-    assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
+    # 只看 recovery 自己的 logger:CI 里其他测试遗留的 otel exporter 后台线程
+    # 会往 root 吐 "Transient error ... retrying" WARNING,污染全局断言(flake)。
+    assert [
+        r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and r.name.startswith("expert_work.control_plane.knowledge.recovery")
+    ] == []
 
 
 @pytest.mark.asyncio
