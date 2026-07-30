@@ -1221,12 +1221,6 @@ export interface TranslationKeys {
     tl_importance: string;
     tl_confidence: string;
     tl_goal: string;
-    tl_filter_all: string;
-    tl_filter_tool: string;
-    tl_filter_error: string;
-    tl_filter_retry: string;
-    tl_search_placeholder: string;
-    tl_count: string;
     tl_duration: string;
     tr_col_action: string;
     tr_state_not_ready_title: string;
@@ -1274,6 +1268,8 @@ export interface TranslationKeys {
     lifecycle_fired: string;
     lifecycle_completed: string;
     fire_pending: string;
+    gantt_expand: string;
+    gantt_degraded: string;
   };
   session_history: {
     title: string;
@@ -4220,12 +4216,6 @@ const en: TranslationKeys = {
     tl_importance: "importance {{v}}",
     tl_confidence: "confidence {{v}}",
     tl_goal: "Goal: {{text}}",
-    tl_filter_all: "All",
-    tl_filter_tool: "Tool",
-    tl_filter_error: "Error",
-    tl_filter_retry: "retry",
-    tl_search_placeholder: "Search tool name / error / finish_reason / node…",
-    tl_count: "{{shown}} items · {{tools}} tools · {{fails}} failed",
     tl_duration: "step duration",
     tr_col_action: "Action",
     tr_state_not_ready_title: "Processing",
@@ -4277,6 +4267,8 @@ const en: TranslationKeys = {
     lifecycle_completed: "Completed",
     fire_pending:
       "The result hasn't landed yet — the run is still going. Reopen this conversation later to see it.",
+    gantt_expand: "Expand",
+    gantt_degraded: "Timeline approximated by event order (server timestamps unavailable)",
   },
   session_history: {
     title: "Session history",

@@ -1202,7 +1202,7 @@ describe("PlaygroundTab", () => {
       expect(screen.queryByTestId("run-status-jump")).not.toBeInTheDocument();
     });
 
-    it("shows the error banner when a tool call failed, and 'jump' scrolls the errored step-card into view", async () => {
+    it("shows the error banner when a tool call failed, and 'jump' scrolls the failing Gantt row into view", async () => {
       const user = userEvent.setup();
       createSessionMock.mockResolvedValue(sampleThread);
       streamRunMock.mockReturnValue(
@@ -1259,12 +1259,16 @@ describe("PlaygroundTab", () => {
       const banner = await screen.findByTestId("run-status-banner");
       expect(banner).toHaveTextContent(i18n.t("playground.tl_step", { n: 3 }));
 
-      const errorCard = screen
-        .getAllByTestId("step-card")
-        .find((card) => card.getAttribute("data-error") === "true");
-      expect(errorCard).toBeTruthy();
+      // I1 — restored: `GanttTimeline` rows now carry `data-error` (see
+      // gantt_timeline.ts's `hasError`), so the "jump to error" button
+      // renders again and targets the first errored row (same pattern as
+      // the "exact" view's trace-row jump test below).
+      const errorRow = screen
+        .getAllByTestId(/^gantt-row-/)
+        .find((row) => row.getAttribute("data-error") === "true");
+      expect(errorRow).toBeTruthy();
       const scrollSpy = vi.fn();
-      if (errorCard) errorCard.scrollIntoView = scrollSpy;
+      if (errorRow) errorRow.scrollIntoView = scrollSpy;
 
       await user.click(screen.getByTestId("run-status-jump"));
       expect(scrollSpy).toHaveBeenCalledTimes(1);
@@ -1294,67 +1298,14 @@ describe("PlaygroundTab", () => {
       expect(occurrences).toBe(1);
     });
 
-    it("keeps the error banner even when a timeline filter hides the failing step (banner derives from unfiltered items)", async () => {
-      // A type/query filter that hides the failing step must NOT flip run
-      // status to a false "succeeded" — the banner reads the full timeline.
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          { id: "1", event: "metadata", data: { run_id: "run-tl-filter" }, rawData: "", receivedAt: "" },
-          {
-            id: "2",
-            event: "updates",
-            data: {
-              agent: {
-                step_count: 3,
-                messages: [
-                  {
-                    type: "ai",
-                    content: "",
-                    tool_calls: [{ id: "c1", name: "exec_python", args: { code: "1/0" }, type: "tool_call" }],
-                  },
-                ],
-              },
-            },
-            rawData: "",
-            receivedAt: "",
-          },
-          {
-            id: "3",
-            event: "updates",
-            data: {
-              tools: {
-                messages: [
-                  { type: "tool", tool_call_id: "c1", name: null, content: "ZeroDivisionError", status: "error" },
-                ],
-              },
-            },
-            rawData: "",
-            receivedAt: "",
-          },
-          { id: "4", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
-        ]),
-      );
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      // banner is in the error state before filtering
-      expect(await screen.findByTestId("run-status-banner")).toHaveTextContent(
-        i18n.t("playground.tl_step", { n: 3 }),
-      );
-
-      // apply a search query that matches no timeline item → visible list empties
-      await user.type(screen.getByTestId("timeline-filter-query"), "zzz-no-such-item");
-
-      // the banner MUST still show the failure (derived from the unfiltered timeline)
-      expect(screen.getByTestId("run-status-banner")).toHaveTextContent(
-        i18n.t("playground.tl_step", { n: 3 }),
-      );
-    });
+    // Task 3 dropped this test: the timeline eventView's type/query filter
+    // (`TimelineFilterBar`) went away with the `StepTimeline` → `GanttTimeline`
+    // swap (Gantt has no equivalent row filter), so there is no longer a
+    // filter that could hide the failing step out from under the banner. The
+    // banner's derivation from the unfiltered `timeline` (not a filtered
+    // view) is still pinned by "shows the error banner when a tool call
+    // failed" above — this test's premise (a filter to bypass) no longer
+    // exists.
   });
 
   // Batch 4b Task 5 — third "Exact" event-view tier (item 14) + purpose
@@ -2127,8 +2078,11 @@ describe("PlaygroundTab", () => {
         "每天早上3点搜AI新闻",
       );
       await user.click(screen.getByTestId("playground-run"));
-      // The manage_task step-card starts collapsed (no error) — expand it to
-      // reach the nested ToolCallCard's 「立即触发」 button.
+      // Task 3 — the timeline eventView renders `GanttTimeline`; open the
+      // row for this step (its detail reuses `StepTimeline`, which starts
+      // collapsed — no error — so a further click reaches the nested
+      // ToolCallCard's 「立即触发」 button).
+      await user.click(await screen.findByTestId("gantt-row-item-0"));
       await user.click(await screen.findByTestId("step-head"));
       await user.click(await screen.findByTestId("tool-fire-now"));
     }
