@@ -39,8 +39,6 @@ import {
   readName,
   readPromptJinja,
   readPromptVariables,
-  readReflectionEvaluator,
-  readReflectionEvaluatorOn,
   readSystemPrompt,
   readTools,
   readVisionModel,
@@ -52,7 +50,6 @@ import {
   setMcp,
   setModel,
   setName,
-  setReflectionEvaluator,
   setSystemPrompt,
   setTool,
   setVisionModel,
@@ -258,34 +255,9 @@ export function FormView({
           )}
         </section>
 
-        <section data-testid="af-reflection-evaluator" style={SECTION}>
-          <Heading>
-            {t("agent_form.section_reflection_evaluator")}
-            <FieldHelp
-              text={t("agent_form.section_reflection_evaluator_help")}
-              testId="af-reflection-evaluator"
-            />
-          </Heading>
-          <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-            {t("agent_form.reflection_evaluator_hint")}
-          </Text>
-          <ModelSelect
-            value={readReflectionEvaluator(formData) ?? {}}
-            catalog={catalog}
-            onChange={(mdl) => onChange(setReflectionEvaluator(formData, mdl))}
-          />
-          {readReflectionEvaluatorOn(formData) && (
-            <Button
-              type="link"
-              size="small"
-              data-testid="af-reflection-evaluator-clear"
-              style={{ paddingLeft: 0 }}
-              onClick={() => onChange(setReflectionEvaluator(formData, null))}
-            >
-              {t("agent_form.reflection_evaluator_clear")}
-            </Button>
-          )}
-        </section>
+        {/* The reflection-evaluator model picker lives in
+          ModelRoutingSection's reflection panel (next to the switch that
+          governs it), not here. */}
 
         {/* Stream J.6 Path B — shown whenever the main model can't see images
           itself (including before one is picked); a separate VL model handles

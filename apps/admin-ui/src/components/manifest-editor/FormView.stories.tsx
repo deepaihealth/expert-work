@@ -23,7 +23,6 @@ import type { AgentManifest } from "./form_model";
 import {
   setPromptJinja,
   setPromptVariables,
-  setReflectionEvaluator,
   setSystemPrompt,
   setTool,
 } from "./form_model";
@@ -199,14 +198,6 @@ const JINJA_PROMPT_MANIFEST: AgentManifest = (() => {
   return { ...m, metadata: { name: "jinja-agent" } };
 })();
 
-const EVALUATOR_ON_MANIFEST: AgentManifest = (() => {
-  const withEval = setReflectionEvaluator(BLANK_MANIFEST, {
-    provider: "openai",
-    name: "gpt-4o",
-  });
-  return { ...withEval, metadata: { name: "evaluator-agent" } };
-})();
-
 // ── Meta ──────────────────────────────────────────────────────────────────
 
 const meta: Meta<typeof FormView> = {
@@ -274,16 +265,6 @@ export const SkillsRich: Story = {
   },
 };
 
-/**
- * An independent reflection evaluator is set (openai/gpt-4o) via a
- * ``routing[when=reflection]`` rule — the curated control shows the picked
- * model plus the "clear (use the agent's own model)" affordance.
- */
-export const WithReflectionEvaluator: Story = {
-  decorators: [withMcpFixture],
-  args: {
-    formData: EVALUATOR_ON_MANIFEST,
-    onChange: () => {},
-    section: "model",
-  },
-};
+// The former ``WithReflectionEvaluator`` story is gone: the evaluator model
+// picker moved out of FormView's "model" section into ModelRoutingSection's
+// reflection panel (rendered only while reflection is on).

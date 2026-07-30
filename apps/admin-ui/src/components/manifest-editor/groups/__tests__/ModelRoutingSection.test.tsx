@@ -154,6 +154,50 @@ describe("ModelRoutingSection", () => {
     expect(rowFor("reflection.deadline_s")).not.toBeInTheDocument();
   });
 
+  // Reflection-evaluator model picker — moved into the reflection panel
+  // (UX feedback merge): rendered only while reflection is on, same guard
+  // as the tuning FieldRows.
+  it("does not render the reflection-evaluator picker while reflection is off", () => {
+    renderSection(SEED);
+    expect(
+      screen.queryByTestId("af-reflection-evaluator"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the reflection-evaluator picker once reflection is on (no clear link while unset)", () => {
+    renderSection(REFLECTION_ON_SEED);
+    expect(screen.getByTestId("af-reflection-evaluator")).toBeInTheDocument();
+    // Empty by default — reflection reuses the agent's own model, no clear link.
+    expect(
+      screen.queryByTestId("af-reflection-evaluator-clear"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the clear link and removes the routing rule when cleared", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const withEvaluator: AgentManifest = {
+      ...REFLECTION_ON_SEED,
+      spec: {
+        ...REFLECTION_ON_SEED.spec,
+        routing: {
+          rules: [
+            {
+              when: "reflection",
+              model: { provider: "openai", name: "gpt-4o" },
+            },
+          ],
+        },
+      },
+    };
+    renderSection(withEvaluator, onChange);
+    const clear = screen.getByTestId("af-reflection-evaluator-clear");
+    expect(clear).toBeInTheDocument();
+    await user.click(clear);
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.routing).toBeUndefined();
+  });
+
   it("renders the closing YAML-guidance note", () => {
     renderSection();
     expect(screen.getByTestId("model-yaml-note")).toHaveTextContent(

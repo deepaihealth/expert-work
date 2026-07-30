@@ -71,9 +71,13 @@ describe("FormView", () => {
 
     renderSection("model");
     expect(screen.getByTestId("af-model")).toBeInTheDocument();
-    expect(screen.getByTestId("af-reflection-evaluator")).toBeInTheDocument();
-    // E.11 — the fallback-chain section shows once a primary model is picked.
+    // E.11 — the fallback-chain sub-area shows once a primary model is picked.
     expect(screen.getByTestId("af-fallback")).toBeInTheDocument();
+    // The reflection-evaluator picker moved to ModelRoutingSection's
+    // reflection panel (gated on the reflection switch) — not here.
+    expect(
+      screen.queryByTestId("af-reflection-evaluator"),
+    ).not.toBeInTheDocument();
 
     renderSection("prompt");
     expect(screen.getByTestId("af-prompt")).toBeInTheDocument();
@@ -126,9 +130,6 @@ describe("FormView", () => {
     // sub-area of af-model with a small label, not a sibling heading.)
     expect(screen.getByTestId("af-fallback")).toHaveTextContent(
       "Fallback models",
-    );
-    expect(screen.getByTestId("af-reflection-evaluator")).toHaveTextContent(
-      "Reflection evaluator (optional)",
     );
   });
 
@@ -203,38 +204,6 @@ describe("FormView", () => {
     };
     renderSection("model", visionModel);
     expect(screen.queryByTestId("af-vision")).not.toBeInTheDocument();
-  });
-
-  it("hides the evaluator clear button until an independent evaluator is set", () => {
-    renderSection("model");
-    expect(
-      screen.queryByTestId("af-reflection-evaluator-clear"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("shows the clear button and removes the routing rule when cleared", async () => {
-    const user = userEvent.setup();
-    const onChange = vi.fn();
-    const withEvaluator: AgentManifest = {
-      ...SEED,
-      spec: {
-        ...SEED.spec,
-        routing: {
-          rules: [
-            {
-              when: "reflection",
-              model: { provider: "openai", name: "gpt-4o" },
-            },
-          ],
-        },
-      },
-    };
-    renderSection("model", withEvaluator, onChange);
-    const clear = screen.getByTestId("af-reflection-evaluator-clear");
-    expect(clear).toBeInTheDocument();
-    await user.click(clear);
-    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-    expect(last.spec?.routing).toBeUndefined();
   });
 
   it("typing the name emits a merged manifest preserving non-curated fields", async () => {

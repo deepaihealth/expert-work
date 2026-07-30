@@ -885,7 +885,7 @@ const zhCN: TranslationKeys = {
     rf_enable_label: "反思自评",
     rf_enable_brief: "回答前先让模型自查打分",
     rf_enable_impact:
-      "回答定稿前,先让一个评判模型给这次回答打分、挑毛病,不达标就自动让模型重新改进一遍,直到达标或次数用完。用哪个模型评判,由下面「反思评判模型」的设置决定;没设置就用主模型自己评判自己。\n每多反思一轮,就多一次模型调用:回答质量会更好,但也更慢、更贵。\n例:客服 Agent 答完一次,评判模型发现少说了退款流程,就打回去让它补上再答一次。",
+      "回答定稿前,先让一个评判模型给这次回答打分、挑毛病,不达标就自动让模型重新改进一遍,直到达标或次数用完。用哪个模型评判,由开启后下方出现的「反思评判模型」决定;没设置就用主模型自己评判自己。\n每多反思一轮,就多一次模型调用:回答质量会更好,但也更慢、更贵。\n例:客服 Agent 答完一次,评判模型发现少说了退款流程,就打回去让它补上再答一次。",
     rf_budget_label: "反思次数上限",
     rf_budget_brief: "最多反思几次就定稿",
     rf_budget_impact:
@@ -979,8 +979,8 @@ const zhCN: TranslationKeys = {
     mcp_tools_unreachable: "工具加载失败",
     mcp_servers_loading: "加载服务器中…",
     mcp_servers_load_failed: "服务器加载失败",
-    section_reflection_evaluator: "反思评判者（可选）",
-    reflection_evaluator_hint: "只选模型,不开启反思——开关在「反思自评」面板。",
+    section_reflection_evaluator: "反思评判模型（可选）",
+    reflection_evaluator_hint: "反思时用这个模型给回答打分;不选 = 用 agent 自己的主模型评判。",
     reflection_evaluator_clear: "清除（改用 agent 自己的模型）",
     section_vision: "图像理解(VL 模型)",
     vision_hint:
@@ -1005,7 +1005,7 @@ const zhCN: TranslationKeys = {
     section_prompt_help:
       "系统提示词,定义 Agent 的角色、语气和行为规则,是塑造性格的核心。\n示例:你是资深 Python 工程师,回答简洁、给可运行代码",
     section_reflection_evaluator_help:
-      "指定反思自评所用的评判模型。仅在上方「反思自评」开启后生效;未指定时反思复用主模型。",
+      "指定反思自评所用的评判模型。未指定时反思复用主模型。",
     section_defenses: "防御守卫",
     section_defenses_help:
       "配置该 agent 的安全守卫姿态:输入注入防护、输出筛查/脱敏、工具行为审查。",

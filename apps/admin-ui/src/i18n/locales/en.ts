@@ -3799,7 +3799,7 @@ const en: TranslationKeys = {
     rf_enable_label: "Reflection self-assessment",
     rf_enable_brief: "Has a judge model score the answer before it's sent",
     rf_enable_impact:
-      "Before an answer is final, a judge model scores it and flags problems, and automatically sends it back for another pass if it falls short — repeating until it passes or the retry cap runs out. Which model judges is set by the 'reflection evaluator model' setting below; if it's unset, the main model judges its own answer.\nEach extra round of reflection is one more model call: better quality, but slower and pricier.\nExample: a support agent's answer is missing the refund process — the judge catches it and sends it back for a redo before the user ever sees it.",
+      "Before an answer is final, a judge model scores it and flags problems, and automatically sends it back for another pass if it falls short — repeating until it passes or the retry cap runs out. Which model judges is set by the 'Reflection evaluator model' picker that appears below once this is on; if it's unset, the main model judges its own answer.\nEach extra round of reflection is one more model call: better quality, but slower and pricier.\nExample: a support agent's answer is missing the refund process — the judge catches it and sends it back for a redo before the user ever sees it.",
     rf_budget_label: "Reflection retry cap",
     rf_budget_brief: "The most reflection rounds before it just ships",
     rf_budget_impact:
@@ -3898,9 +3898,9 @@ const en: TranslationKeys = {
     mcp_tools_unreachable: "Could not load tools",
     mcp_servers_loading: "Loading servers…",
     mcp_servers_load_failed: "Could not load servers",
-    section_reflection_evaluator: "Reflection evaluator (optional)",
+    section_reflection_evaluator: "Reflection evaluator model (optional)",
     reflection_evaluator_hint:
-      "Only picks the model — doesn't turn reflection on. The switch lives in the \"Reflection self-assessment\" panel.",
+      "The model that scores answers during reflection; unset = the agent's own main model judges.",
     reflection_evaluator_clear: "Clear (use the agent's own model)",
     section_vision: "Image understanding (VL model)",
     vision_hint:
@@ -3926,7 +3926,7 @@ const en: TranslationKeys = {
     section_prompt_help:
       "System prompt — defines the agent's role, tone, and rules. The core of its persona.\nExample: You are a senior Python engineer; answer concisely with runnable code",
     section_reflection_evaluator_help:
-      "Specifies which model judges reflection self-assessment. Only takes effect once \"Reflection self-assessment\" above is turned on; when unset, reflection reuses the main model.",
+      "Specifies which model judges reflection self-assessment. When unset, reflection reuses the main model.",
     section_defenses: "Defenses",
     section_defenses_help:
       "Configure this agent's safety posture: input injection defense, output screening/redaction, and tool-action review.",

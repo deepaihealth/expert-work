@@ -5,7 +5,13 @@
  * the reflection-evaluator model picker, vision fallback) — this component
  * embeds that FormView FIRST, unchanged, then adds the one curated panel the
  * group didn't have a home for before: reflection self-assessment
- * (``spec.reflection`` — Stream J.11's reflect-node config). config-page
+ * (``spec.reflection`` — Stream J.11's reflect-node config). The
+ * reflection-evaluator model picker (``routing.rules[when=reflection]``,
+ * formerly its own unconditional FormView sub-section) now rides this panel
+ * right after the switch, rendered only while reflection is ON — picking a
+ * judge for a disabled reflection pass was the confusion the merge removes.
+ * Clearing it keeps its meaning: no rule = reflection reuses the agent's own
+ * model. config-page
  * redesign v2 Task 5 flattened this panel from a collapsible ``Collapse``
  * into a plain heading + always-visible switch — every sibling curated pane
  * that used to fold optional content behind a click now shows it directly
@@ -29,16 +35,24 @@
  * the ``routing.rules`` planning rule, ``vision.fallbacks``, the
  * base_url/azure_* connection fields, and the deprecated ``api_key_ref``.
  */
-import { Switch, Typography } from "antd";
+import { useEffect, useState } from "react";
+import { Button, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import type { ModelCatalog } from "../../../api/model_catalog";
+import { FieldHelp } from "../../FieldHelp";
 import { FieldRow } from "../FieldRow";
 import { FormView } from "../FormView";
+import { loadModelCatalog } from "../catalog";
+import { ModelSelect } from "../widgets/ModelSelect";
 import { PolicyFieldList, type FieldDef } from "./field_defs";
 import {
   patchReflectionTuning,
+  readReflectionEvaluator,
+  readReflectionEvaluatorOn,
   readReflectionOn,
   readReflectionTuning,
+  setReflectionEvaluator,
   setReflectionOn,
   type ReflectionTuningFields,
 } from "../form_model";
@@ -77,6 +91,25 @@ export function ModelRoutingSection({
   onChange,
 }: ModelRoutingSectionProps) {
   const { t } = useTranslation();
+  // The evaluator ModelSelect needs its own catalog — the embedded FormView
+  // loads one internally but doesn't share it (same load/mock path though).
+  const [catalog, setCatalog] = useState<ModelCatalog | undefined>(undefined);
+
+  useEffect(() => {
+    let alive = true;
+    loadModelCatalog().then(
+      (c) => {
+        if (alive) setCatalog(c);
+      },
+      () => {
+        /* catalog optional — ModelSelect degrades to a disabled/loading select */
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const reflectionOn = readReflectionOn(formData);
   const tuningValues = readReflectionTuning(formData) as Record<
     string,
@@ -113,11 +146,51 @@ export function ModelRoutingSection({
         />
       </FieldRow>
       {reflectionOn && (
-        <PolicyFieldList
-          defs={TUNING_DEFS}
-          values={tuningValues}
-          onPatch={handleTuningPatch}
-        />
+        <>
+          {/* Reflection-evaluator model (routing.rules[when=reflection]) —
+            only meaningful while reflection is on, same guard as the tuning
+            rows below. Unset = reflection reuses the agent's own model. */}
+          <div data-testid="af-reflection-evaluator" style={{ marginBottom: 12 }}>
+            <label style={{ display: "block", marginBottom: 4 }}>
+              {t("agent_form.section_reflection_evaluator")}
+              <FieldHelp
+                text={t("agent_form.section_reflection_evaluator_help")}
+                testId="af-reflection-evaluator"
+              />
+            </label>
+            <Text
+              type="secondary"
+              style={{ display: "block", marginBottom: 8, fontSize: 12 }}
+            >
+              {t("agent_form.reflection_evaluator_hint")}
+            </Text>
+            <ModelSelect
+              value={readReflectionEvaluator(formData) ?? {}}
+              catalog={catalog}
+              onChange={(mdl) =>
+                onChange(setReflectionEvaluator(formData, mdl))
+              }
+            />
+            {readReflectionEvaluatorOn(formData) && (
+              <Button
+                type="link"
+                size="small"
+                data-testid="af-reflection-evaluator-clear"
+                style={{ paddingLeft: 0 }}
+                onClick={() =>
+                  onChange(setReflectionEvaluator(formData, null))
+                }
+              >
+                {t("agent_form.reflection_evaluator_clear")}
+              </Button>
+            )}
+          </div>
+          <PolicyFieldList
+            defs={TUNING_DEFS}
+            values={tuningValues}
+            onPatch={handleTuningPatch}
+          />
+        </>
       )}
       <Text
         type="secondary"
