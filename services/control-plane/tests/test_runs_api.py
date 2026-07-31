@@ -1621,9 +1621,12 @@ async def test_get_run_trace_system_admin_target_tenant_200(runs_client: AsyncCl
         params={"tenant_id": str(_DEFAULT_TENANT)},
         headers=headers,
     )
-    # 命中目标租户的 run 行(OTel 未接 → 无 trace_id → no_trace,而非 404)。
+    # 命中目标租户的 run 行(而非跨租户 404)。具体 status 取决于整个套件的
+    # OTel 状态:单跑时无 tracer → run 无 trace_id → "no_trace";全量套件里
+    # 其他用例装过全局 tracer → run 带 trace_id,但本 app 无 Langfuse client
+    # → "unavailable"。两者都证明已越过租户 gate 读到了目标租户的 run 行。
     assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "no_trace"
+    assert resp.json()["status"] in {"no_trace", "unavailable"}
 
 
 @pytest.mark.asyncio
