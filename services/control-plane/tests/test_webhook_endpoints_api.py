@@ -14,7 +14,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery, WebhookDeliveryRecord
+from expert_work.protocol import AuditAction, AuditQuery, Role, WebhookDeliveryRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -386,3 +386,63 @@ async def test_delete_endpoint_without_deliveries_audits_zero(
 
     entry = await _delete_audit_entry(audit_store, endpoint_id=endpoint_id)
     assert entry.details == {"deliveries_removed": 0}  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# W3 — webhook 详情读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套:system_admin 带目标租户 tenant_id → 200;普通租户用户带他租户
+# tenant_id → 403 TENANT_NOT_ALLOWED;tenant_id=* → 400
+# SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_get_endpoint_system_admin_target_tenant_200(client: AsyncClient) -> None:
+    created = await _create(client)
+    headers = await _grant_system_admin(client)
+    resp = await client.get(
+        f"/v1/webhook-endpoints/{created['id']}",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == created["id"]
+
+
+@pytest.mark.asyncio
+async def test_get_endpoint_foreign_tenant_user_403(client: AsyncClient) -> None:
+    created = await _create(client)
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    resp = await client.get(
+        f"/v1/webhook-endpoints/{created['id']}",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=foreign,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_get_endpoint_tenant_id_star_400(client: AsyncClient) -> None:
+    created = await _create(client)
+    resp = await client.get(f"/v1/webhook-endpoints/{created['id']}", params={"tenant_id": "*"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
