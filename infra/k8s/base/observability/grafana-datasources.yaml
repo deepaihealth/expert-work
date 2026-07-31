@@ -1,0 +1,22 @@
+# Grafana datasource provisioning — W2-PR3 in-cluster copy.
+#
+# Adapted from infra/observability/grafana/provisioning/datasources/
+# datasources.yaml (vendored — keep in sync by hand). The Loki datasource
+# is dropped in-cluster: logs go to Aliyun SLS instead of a self-hosted
+# loki/promtail pair (spec 2026-07-28-aliyun-deployment-design.md §3.4).
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: expert-work-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Tempo
+    type: tempo
+    uid: expert-work-tempo
+    access: proxy
+    url: http://tempo:3200

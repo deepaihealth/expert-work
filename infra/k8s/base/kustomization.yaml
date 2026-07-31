@@ -33,6 +33,30 @@ resources:
   - keycloak/service.yaml
   - searxng/deployment.yaml
   - searxng/service.yaml
+  # W2-PR3 — observability stack (single-replica + cloud-disk PVCs;
+  # loki/promtail intentionally absent: logs go to Aliyun SLS).
+  - observability/otel-collector-deployment.yaml
+  - observability/otel-collector-service.yaml
+  - observability/prometheus-deployment.yaml
+  - observability/prometheus-service.yaml
+  - observability/prometheus-pvc.yaml
+  - observability/tempo-deployment.yaml
+  - observability/tempo-service.yaml
+  - observability/tempo-pvc.yaml
+  - observability/grafana-deployment.yaml
+  - observability/grafana-service.yaml
+  - observability/grafana-pvc.yaml
+  - observability/alertmanager-deployment.yaml
+  - observability/alertmanager-service.yaml
+  # W2-PR3 — Langfuse (web/worker + in-cluster ClickHouse; PG/Redis/OSS
+  # are external managed services, see langfuse/ headers).
+  - langfuse/clickhouse-statefulset.yaml
+  - langfuse/clickhouse-service.yaml
+  - langfuse/config.yaml
+  - langfuse/ingress.yaml
+  - langfuse/web-deployment.yaml
+  - langfuse/web-service.yaml
+  - langfuse/worker-deployment.yaml
 
 # Kustomize's default load restrictor forbids configMapGenerator `files:`
 # from escaping the kustomization root, so these are vendored copies of
@@ -65,3 +89,36 @@ configMapGenerator:
   - name: searxng-settings
     files:
       - settings.yml=searxng/settings.yml
+  # W2-PR3 — observability configs (vendored copies under observability/,
+  # source infra/observability/ + tools/observability/ — keep in sync by
+  # hand, same caveat as the two entries above).
+  - name: otel-collector-config
+    files:
+      - observability/otel-collector-config.yaml
+  - name: prometheus-config
+    files:
+      - observability/prometheus.yml
+  - name: prometheus-rules
+    files:
+      - observability/rules/alerts.yml
+      - observability/rules/burn_rate.yml
+      - observability/rules/burn_rate_test.yml
+      - observability/rules/sli.yml
+      - observability/rules/uplift.yml
+  - name: tempo-config
+    files:
+      - observability/tempo.yaml
+  - name: alertmanager-config
+    files:
+      - observability/alertmanager.yml
+  - name: grafana-datasources
+    files:
+      - observability/grafana-datasources.yaml
+  - name: grafana-dashboard-provider
+    files:
+      - observability/grafana-dashboard-provider.yaml
+  - name: grafana-dashboards
+    files:
+      - observability/dashboards/01-overview.json
+      - observability/dashboards/02-orchestrator.json
+      - observability/dashboards/03-sandbox.json

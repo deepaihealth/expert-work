@@ -1,0 +1,40 @@
+# Prometheus scrape + rule config — W2-PR3 in-cluster copy.
+#
+# Adapted from infra/observability/prometheus.yml (vendored — keep in sync
+# by hand, same caveat as the other base/ config copies):
+#   - targets are in-cluster Service names;
+#   - the sandbox-supervisor job is commented out until W3 deploys it;
+#   - rules mount from the prometheus-rules ConfigMap
+#     (tools/observability/rules/ vendored copies).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # The control-plane exposes /metrics (A.9). The orchestrator runs
+  # in-process inside it, so its metrics share the same registry —
+  # no separate orchestrator target.
+  - job_name: expert-work-control-plane
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["control-plane:8000"]
+
+  # W3: uncomment when the sandbox-supervisor (or its Agent Sandbox
+  # replacement) is deployed in-cluster.
+  # - job_name: expert-work-sandbox-supervisor
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["sandbox-supervisor:8000"]

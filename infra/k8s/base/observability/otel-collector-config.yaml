@@ -1,0 +1,31 @@
+# OpenTelemetry Collector config — W2-PR3 in-cluster copy.
+#
+# Vendored from infra/observability/otel-collector-config.yaml (kustomize's
+# load restrictor forbids configMapGenerator files outside the base root —
+# same caveat as the keycloak realm / searxng settings copies, keep in sync
+# by hand). `tempo:4317` resolves to the in-cluster Service below just like
+# the compose service name.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]

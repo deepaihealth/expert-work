@@ -1,0 +1,14 @@
+# Trace blocks + WAL — cloud disk, cluster-default StorageClass.
+# 168h retention (tempo.yaml compactor) keeps 20Gi comfortable at
+# test-env trace volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tempo-data
+  labels:
+    app.kubernetes.io/name: tempo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi

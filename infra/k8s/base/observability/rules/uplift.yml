@@ -1,0 +1,532 @@
+# Capability Uplift Sprint #1 + #2 + #3 + #5 + #6 + #8 — threat scanner
+# + memory poisoning + skill packaging + MCP client HTTP/SSE transport
+# + hybrid retrieval + Anthropic cache anchor recording rules and alerts.
+#
+# See docs/streams/STREAM-UPLIFT-DESIGN.md § 2.6 + § 3.7 + § 4.7 + § 6.7.
+#
+# Sprint #1 SecOps signals:
+#   * expert_work:uplift:threat_block_rate:5m — total blocked-rate; sustained
+#     spikes mean either a pattern-set update needs tuning or someone is
+#     actively probing the API.
+#   * expert_work:uplift:trigger_fire_warn_rate:1h — fire-time WARN rate. In a
+#     steady state this should be ~0; non-zero means either a recent
+#     pattern-set update is matching historically-accepted triggers OR a
+#     DB drift / internal-actor mutation slipped past the create-time
+#     strict scan. Either way, SecOps needs eyes on it.
+#
+# Sprint #2 SecOps signals:
+#   * expert_work:uplift:memory_drift_rate:1h — sustained > 0 is a P0 attack
+#     signal (DB drift means someone bypassed the API + create-time
+#     strict scan, e.g. SQL injection or an internal actor).
+#   * expert_work:uplift:memory_redact_rate:1h — recall-time matches; usually
+#     means a pattern-set update is catching historical poisoned memories.
+#   * expert_work:uplift:memory_block_rate:5m{source=…} — write-time blocks
+#     partitioned by source (api / writeback / dlq).
+#
+# Sprint #3 SecOps signals (Mini-ADRs U-21 / U-22 / U-23 / U-24):
+#   * expert_work:uplift:skill_view_rate:5m{result} — skill_view tool calls
+#     by outcome; baseline traffic + early indicator for skill misuse.
+#   * expert_work:uplift:skill_zip_reject_rate:1h{reason} — ZIP boundary
+#     reject by allowlisted reason (Oracle defense: no user paths).
+#   * expert_work:uplift:skill_blocked_rate:5m{phase} — strict-scan blocks
+#     partitioned by phase (zip_import vs skill_view).
+#   * expert_work:uplift:skill_drift_rate:1h — P0 — DB drift on skill rows
+#     means the row was mutated past the write-time strict scan.
+#   * expert_work:uplift:skill_redacted_rate:1h — context-scope read-time
+#     matches; usually a pattern-set update catching historical content.
+#   * expert_work:uplift:threat_scan_variant_rate:1h{variant} — U-22 telemetry
+#     for which obfuscation pre-processing variant fires patterns
+#     (original / nfkc / collapsed / base64).
+#   * expert_work:uplift:skill_high_risk_event_rate:1h{event} — U-24 publish
+#     gate (activation_blocked / activated).
+#
+# Sprint #5 MCP-client operability signals:
+#   * expert_work:uplift:mcp_call_failure_rate:5m{transport,server} — short
+#     window for paging; spike points at a degraded remote MCP server.
+#   * expert_work:uplift:mcp_circuit_open_total{server} — instantaneous count
+#     of servers whose breaker tripped in the last 30 minutes (Mini-ADR
+#     U-13); non-zero means at least one MCP server is offline cap.
+
+groups:
+  - name: expert_work_uplift_threat_scan
+    interval: 30s
+    rules:
+      - record: expert_work:uplift:threat_block_rate:5m
+        expr: |
+          sum(rate(expert_work_uplift_threat_scan_total{result="blocked"}[5m]))
+
+      - record: expert_work:uplift:threat_warn_rate:5m
+        expr: |
+          sum(rate(expert_work_uplift_threat_scan_total{result="warned"}[5m]))
+
+      - record: expert_work:uplift:trigger_fire_warn_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_triggers_blocked_total{phase="fire"}[1h]))
+          +
+          sum(rate(expert_work_uplift_threat_scan_total{scope="context",result="warned"}[1h]))
+
+  - name: expert_work_uplift_memory
+    interval: 30s
+    rules:
+      # Capability Uplift Sprint #2 — memory poisoning / drift signals.
+      - record: expert_work:uplift:memory_drift_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_memory_drift_total[1h]))
+
+      - record: expert_work:uplift:memory_redact_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_memory_recalls_redacted_total[1h]))
+
+      - record: expert_work:uplift:memory_block_rate:5m
+        expr: |
+          sum(rate(expert_work_uplift_memory_writes_blocked_total[5m])) by (source)
+
+      # Capability Uplift Sprint #6 — hybrid retrieval adoption +
+      # hit-rate-by-mode (tracks whether tenants opt out of hybrid).
+      - record: expert_work:uplift:memory_hybrid_adoption_ratio:1h
+        expr: |
+          sum(rate(expert_work_uplift_memory_retrieval_total{mode="hybrid"}[1h]))
+          /
+          clamp_min(sum(rate(expert_work_uplift_memory_retrieval_total[1h])), 1)
+
+      - record: expert_work:uplift:memory_retrieval_hit_ratio:1h
+        expr: |
+          sum by (mode) (rate(expert_work_uplift_memory_retrieval_total{result="hit"}[1h]))
+          /
+          clamp_min(sum by (mode) (rate(expert_work_uplift_memory_retrieval_total[1h])), 1)
+
+      # Capability Uplift Sprint #8 — memory frozen snapshot adoption +
+      # Anthropic cache anchor application.
+      - record: expert_work:uplift:memory_per_session_adoption_ratio:1h
+        expr: |
+          sum(rate(expert_work_uplift_memory_recall_inject_mode_total{mode="per_session"}[1h]))
+          /
+          clamp_min(sum(rate(expert_work_uplift_memory_recall_inject_mode_total[1h])), 1)
+
+      - record: expert_work:uplift:anthropic_cache_anchor_rate:5m
+        expr: |
+          sum(rate(expert_work_uplift_anthropic_cache_anchors_total[5m]))
+
+  - name: expert_work_uplift_skill
+    interval: 30s
+    rules:
+      # Capability Uplift Sprint #3 (Mini-ADRs U-21 / U-22 / U-24) — skill
+      # packaging + supporting files + content threat scan + drift +
+      # high-risk publish gate.
+      - record: expert_work:uplift:skill_view_rate:5m
+        expr: |
+          sum by (result) (rate(expert_work_uplift_skill_view_total[5m]))
+
+      - record: expert_work:uplift:skill_zip_reject_rate:1h
+        expr: |
+          sum by (reason) (rate(expert_work_uplift_skill_zip_reject_total[1h]))
+
+      - record: expert_work:uplift:skill_blocked_rate:5m
+        expr: |
+          sum by (phase) (rate(expert_work_uplift_skill_blocked_total[5m]))
+
+      - record: expert_work:uplift:skill_drift_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_skill_drift_total[1h]))
+
+      - record: expert_work:uplift:skill_redacted_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_skill_redacted_total[1h]))
+
+      - record: expert_work:uplift:threat_scan_variant_rate:1h
+        expr: |
+          sum by (variant) (rate(expert_work_uplift_threat_scan_total[1h]))
+
+      - record: expert_work:uplift:skill_high_risk_event_rate:1h
+        expr: |
+          sum by (event) (rate(expert_work_uplift_skill_high_risk_event_total[1h]))
+
+  - name: expert_work_uplift_skill_curator
+    interval: 60s
+    rules:
+      # Capability Uplift Sprint #4 — Curator state machine.
+      #   * curator_active_to_stale_rate:1d — daily count of skills
+      #     auto-stale'd; normal background is a slow trickle (a few
+      #     per tenant per week).
+      #   * curator_stale_to_archived_rate:1d — same for archive.
+      #   * curator_stale_to_active_rate:1d — auto-revives (Mini-ADR
+      #     U-29); spikes mean a previously-stale skill came back into
+      #     use, usually fine.
+      #   * skill_view_archived_blocked_rate:1h — cold path; > 0 means
+      #     an agent's manifest references an archived skill that
+      #     should be unarchived or replaced.
+      - record: expert_work:uplift:curator_active_to_stale_rate:1d
+        expr: |
+          sum(increase(expert_work_uplift_curator_transition_total{from_state="active",to_state="stale"}[1d]))
+
+      - record: expert_work:uplift:curator_stale_to_archived_rate:1d
+        expr: |
+          sum(increase(expert_work_uplift_curator_transition_total{from_state="stale",to_state="archived"}[1d]))
+
+      - record: expert_work:uplift:curator_stale_to_active_rate:1d
+        expr: |
+          sum(increase(expert_work_uplift_curator_transition_total{from_state="stale",to_state="active"}[1d]))
+
+      - record: expert_work:uplift:skill_view_archived_blocked_rate:1h
+        expr: |
+          sum(rate(expert_work_uplift_skill_view_archived_blocked_total[1h]))
+
+  - name: expert_work_uplift_memory_consolidator
+    interval: 60s
+    rules:
+      # Capability Uplift Sprint #7 — MemoryConsolidator state-machine.
+      #   * memory_consolidated_rate:1d — daily count of successful
+      #     consolidations; expected 0–N per tenant per day; sustained
+      #     0 across all tenants triggers ExpertWorkUpliftConsolidatorIdle.
+      #   * memory_cluster_rejection_rate:1d{reason} — labeled split so
+      #     SecOps can see whether anti-mislearn is firing for env
+      #     failures, credentials, etc.
+      #   * memory_purged_rate:1d{category} — same shape for the
+      #     lone-item noise-purge sub-pass.
+      #   * memory_review_durable_ratio:1d — % of lone-item reviews
+      #     that pass; healthy memory_writeback is typically 0.7–0.9.
+      #   * consolidator_aux_tokens_input:1d — Sprint #7 LLM spend
+      #     telemetry split from main-model accounting.
+      - record: expert_work:uplift:memory_consolidated_rate:1d
+        expr: |
+          sum(increase(expert_work_uplift_memory_consolidated_total[1d]))
+
+      - record: expert_work:uplift:memory_cluster_rejection_rate:1d
+        expr: |
+          sum by (reason) (increase(expert_work_uplift_memory_cluster_rejected_total[1d]))
+
+      - record: expert_work:uplift:memory_purged_rate:1d
+        expr: |
+          sum by (category) (increase(expert_work_uplift_memory_purged_total[1d]))
+
+      - record: expert_work:uplift:memory_review_durable_ratio:1d
+        expr: |
+          sum(increase(expert_work_uplift_memory_reviewed_durable_total[1d]))
+          /
+          clamp_min(
+            sum(increase(expert_work_uplift_memory_reviewed_durable_total[1d]))
+            + sum(increase(expert_work_uplift_memory_purged_total[1d])),
+            1
+          )
+
+      - record: expert_work:uplift:consolidator_aux_tokens_input:1d
+        expr: |
+          sum(increase(expert_work_uplift_consolidator_llm_tokens_total{kind="input"}[1d]))
+
+  - name: expert_work_uplift_credentials
+    interval: 60s
+    rules:
+      # Stream O — Mini-ADR O-8. Credentials management surface.
+      #   * credentials_resolve_failure_rate:5m{role,key,mode} — fail-fast
+      #     401 rate per (provider/tool, mode). Spikes mean a platform
+      #     cred is misconfigured.
+      #   * legacy_credentials_fallback_rate:1d{role} — Stream O
+      #     transition-period signal; should drop to zero after PR 2.
+      # Stream Y-1 removed the tenant credentials_mode adoption ratio rule
+      # (LLM credentials are platform-exclusive; the backing gauge is gone).
+      - record: expert_work:uplift:credentials_resolve_failure_rate:5m
+        expr: |
+          sum by (role, key, mode) (
+            rate(expert_work_uplift_credentials_resolve_total{result!="ok"}[5m])
+          )
+
+      - record: expert_work:uplift:legacy_credentials_fallback_rate:1d
+        expr: |
+          sum by (role) (rate(expert_work_uplift_legacy_credentials_fallback_total[1d]))
+
+  - name: expert_work_uplift_mcp_client
+    interval: 30s
+    rules:
+      # Capability Uplift Sprint #5 — MCP client HTTP/SSE transport.
+      #   * mcp_call_failure_rate:5m — per-(transport, server) failure
+      #     ratio; spikes mean a remote MCP server is degraded.
+      #   * mcp_call_failure_rate:1h — slower trend for capacity reviews.
+      #   * mcp_circuit_open_total — instantaneous count of servers
+      #     currently in the open state (Mini-ADR U-13); >0 means at
+      #     least one MCP server is hard-disabled for the 30-min
+      #     cool-down.
+      - record: expert_work:uplift:mcp_call_failure_rate:5m
+        expr: |
+          sum by (transport, server) (
+            rate(expert_work_uplift_mcp_call_total{result!="ok"}[5m])
+          )
+          /
+          clamp_min(
+            sum by (transport, server) (
+              rate(expert_work_uplift_mcp_call_total[5m])
+            ),
+            1
+          )
+
+      - record: expert_work:uplift:mcp_call_failure_rate:1h
+        expr: |
+          sum by (transport, server) (
+            rate(expert_work_uplift_mcp_call_total{result!="ok"}[1h])
+          )
+          /
+          clamp_min(
+            sum by (transport, server) (
+              rate(expert_work_uplift_mcp_call_total[1h])
+            ),
+            1
+          )
+
+      - record: expert_work:uplift:mcp_circuit_open_total
+        expr: |
+          sum by (server) (
+            increase(expert_work_uplift_mcp_circuit_state_total{state="open"}[30m])
+          )
+
+  - name: expert_work_uplift_alerts
+    rules:
+      # P1 — sustained block-rate spike. Catches a noisy pattern-set
+      # update OR an attacker probing prompts in a tight loop.
+      - alert: ExpertWorkUpliftThreatBlockRateSpike
+        expr: expert_work:uplift:threat_block_rate:5m > 0.5
+        for: 15m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Threat scanner block rate spike"
+          description: "Block rate is {{ $value }} blocks/sec sustained 15m — check audit log + pattern-set tuning."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+
+      # P1 — any fire-time WARN is suspicious in a steady state (creates
+      # are already strict-scanned). Treat as latent drift signal.
+      - alert: ExpertWorkUpliftFireTimeWarn
+        expr: expert_work:uplift:trigger_fire_warn_rate:1h > 0
+        for: 15m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Trigger fire-time prompt scan warned"
+          description: "Fire-time warn rate is {{ $value }} / hr — possible DB drift or new pattern matching historical triggers."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+
+      # Capability Uplift Sprint #2 (Mini-ADR U-4) — drift on memory
+      # rows means the DB row has been mutated past the strict-scan
+      # gate. Almost certainly an attack (SQL injection / internal
+      # actor); legitimate writes always update content_hash atomically.
+      - alert: ExpertWorkUpliftMemoryDriftDetected
+        expr: expert_work:uplift:memory_drift_rate:1h > 0
+        for: 15m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Memory content drift detected"
+          description: "Memory drift rate is {{ $value }} / hr — DB rows mutated past the strict-scan gate. See runbook § 8 for SQL-injection / internal-actor triage."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+
+      # P1 — sustained recall-time redactions usually indicate either
+      # (a) a recent pattern-set update is catching memories that landed
+      # before the new pattern shipped, or (b) writeback / DLQ leaked
+      # poisoned content past the write-time strict scan (would be a
+      # bug — investigate).
+      - alert: ExpertWorkUpliftMemoryRedactSpike
+        expr: expert_work:uplift:memory_redact_rate:1h > 1
+        for: 30m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Memory recall redaction rate elevated"
+          description: "Recall redact rate is {{ $value }} / hr sustained 30m — either a noisy pattern update or a write-time scan miss."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+
+      # Capability Uplift Sprint #5 (Mini-ADR U-13) — an MCP server
+      # that the circuit breaker has opened in the last 30 minutes
+      # means every agent that depends on its tools is degraded.
+      # Treat as P2: failure is contained (other tools still work)
+      # but operator should know the server is down and either fix
+      # the remote endpoint or pull the entry from
+      # mcp_servers_config_file.
+      - alert: ExpertWorkUpliftMCPServerUnhealthy
+        expr: expert_work:uplift:mcp_circuit_open_total > 0
+        for: 10m
+        labels:
+          severity: P2
+        annotations:
+          summary: "MCP server circuit open ≥ 10m"
+          description: "Server {{ $labels.server }} is unreachable; agents lose access to its tools. See runbook § 5 to triage."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
+
+      # P2 — sustained MCP call failure rate spike. Differs from
+      # ExpertWorkUpliftMCPServerUnhealthy in that the breaker may not yet
+      # have tripped (failures distributed across many servers / brief
+      # bursts that don't hit threshold).
+      - alert: ExpertWorkUpliftMCPCallFailureRateSpike
+        expr: expert_work:uplift:mcp_call_failure_rate:5m > 0.5
+        for: 15m
+        labels:
+          severity: P2
+        annotations:
+          summary: "MCP call failure rate spike on {{ $labels.server }}"
+          description: "{{ $labels.transport }} server {{ $labels.server }} failure rate is {{ $value }} sustained 15m. See runbook § 2."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
+
+      # Capability Uplift Sprint #3 (Mini-ADR U-21) — drift on skill_version
+      # rows is the same P0 attack signature as memory drift: the stored
+      # content_hash no longer matches sha256(prompt_fragment + supporting
+      # files), so the row was mutated past the write-time strict scan.
+      # Almost certainly SQL injection / internal actor / restored-from-
+      # backup-without-rehash. See runbook § 8.
+      - alert: ExpertWorkUpliftSkillDriftDetected
+        expr: expert_work:uplift:skill_drift_rate:1h > 0
+        for: 15m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Skill content drift detected"
+          description: "Skill drift rate is {{ $value }} / hr — DB row mutated past write-time strict scan, almost certainly SQL injection or internal actor. See runbook § 8."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-8"
+
+      # Capability Uplift Sprint #3 (Mini-ADR U-21) — sustained ZIP
+      # import strict-scan blocks point at either (a) a noisy pattern
+      # update catching legitimate skill content, or (b) an actor
+      # probing the ZIP endpoint with poisoned content. > 6 blocks/hr
+      # sustained 30 min is the trigger; runbook § 7 walks triage.
+      - alert: ExpertWorkUpliftSkillBlockedSpike
+        expr: sum(rate(expert_work_uplift_skill_blocked_total{phase="zip_import"}[15m])) > 0.1
+        for: 30m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Skill ZIP threat-scan blocks elevated"
+          description: "ZIP import strict scan blocked {{ $value }} / sec sustained 30m (~6/hr) — pattern tuning or attack probing. See runbook § 7."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-7"
+
+      # Capability Uplift Sprint #3 (Mini-ADR U-21) — ZIP reject rate
+      # is a softer signal than blocked-scan: rejects happen before
+      # content scan (path traversal, size cap, symlink, etc) so a
+      # spike here usually means a user is iterating on packaging or
+      # an attacker is probing the boundary validator. Excludes
+      # legacy_format because that's expected drift from M0 → M0+.
+      - alert: ExpertWorkUpliftSkillZipRejectSpike
+        expr: sum(rate(expert_work_uplift_skill_zip_reject_total{reason!="legacy_format"}[15m])) > 0.1
+        for: 30m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Skill ZIP reject rate elevated"
+          description: "User upload ZIPs being rejected {{ $value }} / sec sustained 30m (~6/hr) — check audit log for attack pattern or doc gap."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md"
+
+      # Capability Uplift Sprint #3 (Mini-ADR U-24) — surge in non-admin
+      # activation attempts on high-risk skills. M0 reality: this is
+      # ~0 because all writes today are admin-driven; signal will grow
+      # once M1-K J.7b-1 ships agent self-authored skills. > 30/hr
+      # sustained 30m is the trigger; investigate skill author + intent.
+      - alert: ExpertWorkUpliftSkillHighRiskActivationSurge
+        expr: sum(rate(expert_work_uplift_skill_high_risk_event_total{event="activation_blocked"}[1h])) > 0.5
+        for: 30m
+        labels:
+          severity: P2
+        annotations:
+          summary: "High-risk skill activation attempts elevated"
+          description: "Non-admin actors trying to activate high-risk skills {{ $value }} / sec sustained 30m (~30/hr) — investigate skill author + intent. See runbook § 11."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-11"
+
+      # Sprint #4 (Mini-ADR U-31) — Curator alerts.
+      # P2 — > 50 active→stale transitions in one day is unusually high
+      # and probably means activity tracking broke (or a tenant
+      # mis-configured an aggressive stale_days). Background should be
+      # a slow trickle.
+      - alert: ExpertWorkUpliftCuratorStaleSurge
+        expr: expert_work:uplift:curator_active_to_stale_rate:1d > 50
+        for: 1d
+        labels:
+          severity: P2
+        annotations:
+          summary: "Curator marked > 50 skills stale in last day"
+          description: "{{ $value }} active→stale transitions in 24h — verify activity tracking is firing and tenant_config.skill_stale_days isn't mis-set. See runbook § 3."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-curator.md#section-3"
+
+      # P2 — any non-trivial rate of agents trying to read archived
+      # skills means an active manifest references a skill the Curator
+      # archived. Operator should unarchive or update the manifest.
+      - alert: ExpertWorkUpliftSkillArchivedAccessAttempts
+        expr: expert_work:uplift:skill_view_archived_blocked_rate:1h > 0.1
+        for: 30m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Agents trying to read archived skills > 6/hr"
+          description: "{{ $value }} archived-skill read attempts/sec sustained 30m — an agent's manifest probably references an auto-archived skill. See runbook § 4."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-curator.md#section-4"
+
+      # Capability Uplift Sprint #7 (Mini-ADR U-41) — MemoryConsolidator.
+      # P2 — 0 consolidations across all tenants for 3 days means either
+      # threshold misconfig, embedding pipeline broken, or LLM rejecting
+      # everything. Healthy state is a slow trickle every day.
+      - alert: ExpertWorkUpliftConsolidatorIdle
+        expr: expert_work:uplift:memory_consolidated_rate:1d == 0
+        for: 3d
+        labels:
+          severity: P2
+        annotations:
+          summary: "MemoryConsolidator produced 0 consolidations in 3 days"
+          description: "Zero consolidations sustained 3d — verify aux_model is wired (Sprint #7 ships a no-op default), tenant_config thresholds aren't disabling, embedding pipeline is healthy. See runbook § 4."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-4"
+
+      # P2 — > 100 noise-purges in one day is well above the expected
+      # trickle and points at either upstream memory_writeback emitting
+      # too much noise (good catch) or anti-mislearn over-rejecting
+      # (regression). The labeled rate lets the runbook split which.
+      - alert: ExpertWorkUpliftConsolidatorPurgeSurge
+        expr: sum(expert_work:uplift:memory_purged_rate:1d) > 100
+        for: 1d
+        labels:
+          severity: P2
+        annotations:
+          summary: "MemoryConsolidator purged > 100 items in last day"
+          description: "{{ $value }} purges in 24h — investigate whether memory_writeback is leaking noise or anti-mislearn prompt regressed. See runbook § 5."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-5"
+
+      # P3 — anti-mislearn rejection rate > 50% of all cluster decisions
+      # is a soft warning that either (a) writeback is generating too
+      # much noise (root cause is upstream) or (b) anti-mislearn prompt
+      # is over-strict (Sprint #7 PR may need a re-tune).
+      - alert: ExpertWorkUpliftConsolidatorRejectionDominant
+        expr: |
+          sum(rate(expert_work_uplift_memory_cluster_rejected_total{reason!="false_cluster"}[1d]))
+          /
+          clamp_min(
+            sum(rate(expert_work_uplift_memory_consolidated_total[1d]))
+            + sum(rate(expert_work_uplift_memory_cluster_rejected_total{reason!="false_cluster"}[1d])),
+            1
+          ) > 0.5
+        for: 1d
+        labels:
+          severity: P3
+        annotations:
+          summary: "MemoryConsolidator anti-mislearn rejection > 50% of decisions"
+          description: "Rejection ratio is {{ $value }} sustained 1d — either upstream writeback is leaking noise (good catch) or anti-mislearn prompt regressed. See runbook § 6."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-6"
+
+      # Stream O — Credentials.
+      # P1 — sustained 401 fail-fast rate. Either tenant mode + missing
+      # cred (user misconfig — they need to add credentials or switch
+      # back to platform mode) or platform-side outage (platform cred
+      # was revoked). Runbook walks the {{ $labels.mode }} split.
+      - alert: ExpertWorkUpliftCredentialsResolveFailureSpike
+        expr: expert_work:uplift:credentials_resolve_failure_rate:5m > 0.1
+        for: 10m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Credentials resolve failures sustained on {{ $labels.role }}/{{ $labels.key }}"
+          description: "{{ $value }} missing-cred lookups/sec sustained 10m for {{ $labels.role }}={{ $labels.key }} in mode={{ $labels.mode }}. See runbook § 3."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/credentials.md#section-3"
+
+      # P3 — Stream O transition-period signal. After PR 2 wires the
+      # remaining callers (embedder / reranker / web_search) the legacy
+      # fallback should reach zero. If still non-zero 30d after PR 2
+      # merge, the migration regressed somewhere.
+      - alert: ExpertWorkUpliftLegacyCredentialsFallbackPresent
+        expr: expert_work:uplift:legacy_credentials_fallback_rate:1d > 0
+        for: 1d
+        labels:
+          severity: P3
+        annotations:
+          summary: "Stream O legacy credential fallback still triggering for {{ $labels.role }}"
+          description: "Migrate {{ $labels.role }} caller to CredentialsResolver and remove legacy settings env. See runbook § 4."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/credentials.md#section-4"

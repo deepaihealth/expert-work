@@ -1,0 +1,41 @@
+# Langfuse non-secret env shared by web + worker (compose
+# `&langfuse-backend-env` equivalent — infra/docker-compose.yml L813+).
+# Secret-bearing keys (DATABASE_URL, SALT, ENCRYPTION_KEY, Redis DSN,
+# S3 AK/SK, NEXTAUTH_SECRET, INIT keys) live in the `langfuse-secrets`
+# Secret — see infra/k8s/base/secrets.example.yaml.
+#
+# Env-specific values (NEXTAUTH_URL, S3 endpoint/bucket/region) are ""
+# here and patched per environment in overlays/<env>/configmap-patch.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langfuse-config
+data:
+  # ------------------------------------------------------------ clickhouse
+  CLICKHOUSE_MIGRATION_URL: "clickhouse://langfuse-clickhouse:9000"
+  CLICKHOUSE_URL: "http://langfuse-clickhouse:8123"
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+
+  # ------------------------------------------------------------------- s3
+  # Blob storage rides the platform bucket under a dedicated prefix
+  # (decision 2026-07-31 — no separate Langfuse bucket). OSS wants
+  # virtual-hosted style, hence FORCE_PATH_STYLE=false (the compose/MinIO
+  # dev stack overrides this to true).
+  LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "langfuse/"
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ""
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ""
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: ""
+
+  # ------------------------------------------------------------------ web
+  NEXTAUTH_URL: ""
+
+  # Turnkey init: fixed org/project ids so the control plane's keys
+  # (EXPERT_WORK_LANGFUSE_PUBLIC_KEY/SECRET_KEY) bind without UI clicks.
+  # The key VALUES are secrets (langfuse-secrets INIT_* entries).
+  LANGFUSE_INIT_ORG_ID: "expert_work"
+  LANGFUSE_INIT_PROJECT_ID: "expert_work"
+  LANGFUSE_INIT_USER_NAME: "expert_work"
+
+  TELEMETRY_ENABLED: "false"

@@ -1,0 +1,22 @@
+# Langfuse UI route — separate Ingress object from the main `expert-work`
+# one because Langfuse lives on its own subdomain and IngressRule lists
+# only support full-replacement patching (see overlays/test/
+# ingress-patch.yaml header). Host + annotations are overlay concerns;
+# the wildcard *.deepaihealth.com cert on the shared AlbConfig 443
+# listener already covers any subdomain — no AlbConfig change needed.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: langfuse
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: langfuse-web
+                port:
+                  number: 3000

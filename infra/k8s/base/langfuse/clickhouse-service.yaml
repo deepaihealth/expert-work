@@ -1,0 +1,18 @@
+# In-cluster only — langfuse web/worker reach :8123 (HTTP) and :9000
+# (native, migrations).
+apiVersion: v1
+kind: Service
+metadata:
+  name: langfuse-clickhouse
+  labels:
+    app.kubernetes.io/name: langfuse-clickhouse
+spec:
+  selector:
+    app.kubernetes.io/name: langfuse-clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native

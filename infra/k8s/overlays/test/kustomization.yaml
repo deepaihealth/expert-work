@@ -34,6 +34,24 @@ images:
   - name: searxng/searxng
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
     newTag: "2026-07-29"
+  # W2-PR3 — observability + Langfuse mirrors (same docker.io-unreachable
+  # constraint; pushed by tools/deploy/mirror script from a dev machine).
+  - name: otel/opentelemetry-collector
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
+  - name: prom/prometheus
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
+  - name: grafana/tempo
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
+  - name: grafana/grafana
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
+  - name: prom/alertmanager
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
+  - name: clickhouse/clickhouse-server
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
+  - name: langfuse/langfuse
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
+  - name: langfuse/langfuse-worker
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
 
 # Replaces base's vendored searxng settings with the mainland-engine-only
 # variant — the cluster VPC cannot reach the upstream default engines
@@ -48,6 +66,8 @@ patches:
   - path: configmap-patch.yaml
   - path: ingress-patch.yaml
   - path: keycloak-patch.yaml
+  - path: langfuse-configmap-patch.yaml
+  - path: langfuse-ingress-patch.yaml
 
 # Secrets (control-plane-secrets / keycloak-secrets) are NOT built by
 # kustomize here — see secrets.env.example for how PR-2 provisions them

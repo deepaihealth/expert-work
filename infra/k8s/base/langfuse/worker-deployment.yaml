@@ -1,0 +1,41 @@
+# Langfuse worker — async ingest processing (Redis queue → ClickHouse).
+# Same env set as web (compose `&langfuse-backend-env`); version pinned
+# in lockstep with web-deployment.yaml — bump both together.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-worker
+  labels:
+    app.kubernetes.io/name: langfuse-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: langfuse-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: langfuse-worker
+    spec:
+      containers:
+        - name: langfuse-worker
+          image: langfuse/langfuse-worker:3.122.0
+          ports:
+            - name: health
+              containerPort: 3030
+          envFrom:
+            - configMapRef:
+                name: langfuse-config
+            - secretRef:
+                name: langfuse-secrets
+          readinessProbe:
+            tcpSocket:
+              port: health
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 8

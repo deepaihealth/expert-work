@@ -1,0 +1,56 @@
+# W2-PR3 vendored in-cluster copy (source: infra/observability/ — keep in sync by hand,
+# same caveat as the keycloak realm / searxng settings copies in this base).
+# Alertmanager config — Stream G.2.
+#
+# P0/P1/P2 severity routing (subsystems/20 § 5.7). Alerts carry a
+# `severity` label set by tools/observability/rules/alerts.yml.
+#
+#   P0 → PagerDuty + 飞书 oncall   (5 min SLA)
+#   P1 → PagerDuty                 (30 min SLA)
+#   P2 → 飞书 alert group          (24 h SLA)
+#
+# The receiver webhook URLs are PLACEHOLDERS — Alertmanager does not
+# expand env vars in its config, so the real PagerDuty / 飞书 endpoints
+# are wired at deploy time (M1-H; Mini-ADR G-1 keeps M0 receivers as
+# placeholders). ``amtool check-config`` validates this file as-is.
+
+route:
+  receiver: default
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="P0"']
+      receiver: p0
+      group_wait: 0s
+      repeat_interval: 1h
+    - matchers: ['severity="P1"']
+      receiver: p1
+      repeat_interval: 2h
+    - matchers: ['severity="P2"']
+      receiver: p2
+
+receivers:
+  # Catch-all for alerts with no severity label.
+  - name: default
+
+  # P0 — paged + 飞书 oncall.
+  - name: p0
+    webhook_configs:
+      - url: http://placeholder.invalid/pagerduty
+        send_resolved: true
+      - url: http://placeholder.invalid/feishu
+        send_resolved: true
+
+  # P1 — paged.
+  - name: p1
+    webhook_configs:
+      - url: http://placeholder.invalid/pagerduty
+        send_resolved: true
+
+  # P2 — 飞书 alert group.
+  - name: p2
+    webhook_configs:
+      - url: http://placeholder.invalid/feishu
+        send_resolved: true

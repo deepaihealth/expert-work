@@ -1,0 +1,74 @@
+{
+  "uid": "expert-work-sandbox",
+  "title": "Expert Work — Sandbox",
+  "tags": ["expert_work", "g.7"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Sandbox-supervisor — cold start, pool, acquire latency. Stream K.K10 wired the cold-start histogram + recording rule (SLI for SLO #4)."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Cold-start latency P95",
+      "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 3 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+          "expr": "expert_work:sli:sandbox_cold_start:p95_5m",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Sandbox pool ready (by variant)",
+      "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 3 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+          "expr": "sum by (variant) (expert_work_sandbox_pool_ready)",
+          "legendFormat": "{{variant}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Acquire latency P95 (by result)",
+      "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 11 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "expert-work-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, result) (rate(expert_work_sandbox_acquire_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    }
+  ]
+}

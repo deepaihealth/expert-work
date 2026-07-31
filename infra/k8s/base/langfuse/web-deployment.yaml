@@ -1,0 +1,49 @@
+# Langfuse web — trace UI + ingest API + DB migrations on boot.
+# Version floor is a spec hard requirement: ≥2025-11 for Agent Graphs GA
+# (spec §3.5 version note, 2026-07-31); pinned to 3.122.0 at authoring
+# time. Bump web and worker TOGETHER — they share the schema.
+#
+# No init-ordering guarantees vs ClickHouse/worker: the pod crashloops
+# until its stores answer, which is the normal k8s convergence path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-web
+  labels:
+    app.kubernetes.io/name: langfuse-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: langfuse-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: langfuse-web
+    spec:
+      containers:
+        - name: langfuse-web
+          image: langfuse/langfuse:3.122.0
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: langfuse-config
+            - secretRef:
+                name: langfuse-secrets
+          readinessProbe:
+            httpGet:
+              path: /api/public/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/public/health
+              port: http
+            # Generous: boot runs Prisma + ClickHouse migrations before
+            # the server listens.
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 8

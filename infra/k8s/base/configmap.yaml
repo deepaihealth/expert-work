@@ -56,8 +56,17 @@ data:
   EXPERT_WORK_OTLP_TRACES_ENDPOINT: "http://otel-collector:4318/v1/traces"
 
   # --------------------------------------------------------------- langfuse
-  EXPERT_WORK_LANGFUSE_HOST: ""
+  # W2-PR3: points at the in-cluster langfuse-web Service. Keys live in
+  # control-plane-secrets (EXPERT_WORK_LANGFUSE_PUBLIC_KEY/SECRET_KEY).
+  EXPERT_WORK_LANGFUSE_HOST: "http://langfuse-web:3000"
   EXPERT_WORK_LANGFUSE_PII_MASKING_ENABLED: "true"
+
+  # ----------------------------------------------------------- otel tracing
+  # W2-PR3: OTLP HTTP export to the in-cluster collector. After the
+  # tracing.py opt-in change (same PR), leaving this UNSET means "no
+  # exporter installed" — so this base value is what turns tracing on
+  # in-cluster.
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://otel-collector:4318/v1/traces"
 
   # ------------------------------------------------------------ secret store
   # local_dev backend resolves secret:// refs by reading `name=value` lines
