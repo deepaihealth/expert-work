@@ -16,7 +16,13 @@
  * ``fetch`` + ``ReadableStream``. ``abortSignal`` plumbs the consumer's
  * cancel back to the network layer.
  */
-import { apiClient, getStoredToken, type ApiEnvelope } from "./client";
+import {
+  apiClient,
+  getStoredToken,
+  withTenantScope,
+  type ApiEnvelope,
+  type TenantScope,
+} from "./client";
 import { unwrap } from "./client";
 
 export interface ThreadMeta {
@@ -146,6 +152,9 @@ export async function listSessions(
     agentName?: string;
     status?: string;
     includeArchived?: boolean;
+    /** Stream N — the endpoint is scope-aware ("*" aggregates every
+     *  tenant), so the raw scope passes through unmapped. */
+    tenantScope?: TenantScope;
   } = {},
 ): Promise<ThreadMeta[]> {
   const query: Record<string, string | number | boolean> = {
@@ -158,7 +167,7 @@ export async function listSessions(
   if (params.includeArchived) query.include_archived = true;
   const response = await apiClient.get<ApiEnvelope<{ items: ThreadMeta[] }>>(
     "/v1/sessions",
-    { params: query },
+    { params: withTenantScope(query, params.tenantScope) },
   );
   return unwrap(response.data).items;
 }

@@ -32,6 +32,7 @@ import {
   renameSession,
   type ThreadMeta,
 } from "../api/sessions";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 
 const PAGE_SIZE = 50;
 
@@ -86,6 +87,9 @@ export function SessionHistoryDrawer({
 }: SessionHistoryDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Stream N — the sessions list is scope-aware ("*" aggregates every
+  // tenant), so the raw scope rides along for a switched-in system_admin.
+  const { apiTenantScope } = useTenantScope();
 
   const [sessions, setSessions] = useState<ThreadMeta[]>([]);
   const [loading, setLoading] = useState(false);
@@ -119,6 +123,7 @@ export function SessionHistoryDrawer({
           status: statusFilter || undefined,
           limit: PAGE_SIZE,
           offset,
+          tenantScope: apiTenantScope,
         });
         offsetRef.current = offset + page.length;
         setHasMore(page.length === PAGE_SIZE);
@@ -129,7 +134,7 @@ export function SessionHistoryDrawer({
         setLoading(false);
       }
     },
-    [agentName, debouncedQuery, statusFilter],
+    [agentName, debouncedQuery, statusFilter, apiTenantScope],
   );
 
   // Reload from the top whenever the drawer opens, the search / status filter

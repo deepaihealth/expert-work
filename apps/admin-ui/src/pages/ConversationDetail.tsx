@@ -66,7 +66,6 @@ export function ConversationDetail() {
   // platform-ops only — same gate as the playground.
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
-  const homeTenantId = identity?.homeTenantId ?? null;
   // A system_admin drilling in from the cross-tenant browser carries the
   // thread's tenant here — without it the scope-aware detail endpoint
   // resolves to the caller's home tenant and 404s the foreign thread. The
@@ -132,33 +131,27 @@ export function ConversationDetail() {
     void refresh();
   }, [refresh]);
 
-  // D3 — the replay/runs endpoints take no ``tenant_id`` parameter, so a
-  // system_admin drilling into a foreign tenant's thread could only ever
-  // collect 404s. Rebuild the rich transcript for a thread in the caller's own
-  // tenant; everyone else keeps the flat message block (which does carry the
-  // tenant on the wire). Also skips the whole rebuild until identity resolves.
-  const sameTenant =
-    convo !== null &&
-    homeTenantId !== null &&
-    convo.tenant_id === homeTenantId &&
-    // M-3 — ``convo`` can still be the *previous* threadId's row for one
-    // render after the params change (this effect's own dependency), so
-    // pin the check to the thread actually being viewed rather than
-    // whatever the last fetch resolved.
-    convo.thread_id === threadId;
+  // D3 (lifted, W2) — the replay/runs endpoints are scope-aware now, so the
+  // rich transcript rebuilds for any tenant's thread; the thread's own
+  // ``tenant_id`` rides along (authoritative even from the "*" aggregate).
+  // M-3 — ``convo`` can still be the *previous* threadId's row for one
+  // render after the params change (this effect's own dependency), so pin
+  // the rebuild to the thread actually being viewed rather than whatever
+  // the last fetch resolved.
+  const viewedConvo = convo !== null && convo.thread_id === threadId ? convo : null;
 
   useEffect(() => {
-    if (!threadId || !sameTenant) {
+    if (!threadId || viewedConvo === null) {
       // H-1 — the route's param can change without remounting this
       // component (react-router keys by route id, not ``:threadId``), so a
-      // same-tenant → cross-tenant switch must explicitly clear whatever
-      // turn cards the previous thread built here; otherwise they linger
-      // over the new thread's own content indefinitely.
+      // thread switch must explicitly clear whatever turn cards the
+      // previous thread built here; otherwise they linger over the new
+      // thread's own content indefinitely.
       resetHistory();
       return;
     }
-    void loadHistory(threadId);
-  }, [threadId, sameTenant, loadHistory, resetHistory]);
+    void loadHistory(threadId, viewedConvo.tenant_id);
+  }, [threadId, viewedConvo, loadHistory, resetHistory]);
 
   // Export a turn's full event stream as JSON — same contract as the
   // playground's toolbar button (prefer the authoritative persisted replay,
