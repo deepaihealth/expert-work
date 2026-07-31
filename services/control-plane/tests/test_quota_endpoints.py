@@ -508,3 +508,107 @@ async def test_internal_release_returns_503_when_redis_down(
     )
     assert resp.status_code == 503
     assert resp.json()["detail"] == "quota_engine_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# release — ?tenant_id= scope gate
+# ---------------------------------------------------------------------------
+
+_SYSTEM_TENANT = UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+
+@pytest.fixture
+async def mtls_quota_client(audit_store: InMemoryAuditLogStore) -> AsyncIterator[AsyncClient]:
+    """Client with the mTLS branch enabled (service principals via XFCC)."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+        mtls_enabled=True,
+        mtls_allowed_service_subjects=["orchestrator"],
+        mtls_system_tenant_id=_SYSTEM_TENANT,
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_release_cross_tenant_target_forbidden_for_user(quota_client: AsyncClient) -> None:
+    """A tenant-A user naming tenant B via ``?tenant_id=`` must get 403
+    ``TENANT_NOT_ALLOWED`` — not silently operate on the other tenant's
+    reservations (previously the query param was trusted unchecked)."""
+    other_tenant = uuid4()
+    resp = await quota_client.post(
+        f"/v1/quota/release/{uuid4()}?tenant_id={other_tenant}",
+        headers={"Authorization": f"Bearer {_operator_token()}"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_release_cross_tenant_target_passes_gate_for_system_admin(
+    quota_sysadmin: tuple[AsyncClient, UUID],
+) -> None:
+    """system_admin (``allowed_tenants == "*"``) may target any tenant — the
+    scope gate passes and the unknown reservation surfaces as 404."""
+    client, sys_admin_id = quota_sysadmin
+    resp = await client.post(
+        f"/v1/quota/release/{uuid4()}?tenant_id={uuid4()}",
+        headers={
+            "Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))}"
+        },
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "RESERVATION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_release_cross_tenant_target_passes_gate_for_mtls_service(
+    mtls_quota_client: AsyncClient,
+) -> None:
+    """mTLS service principals keep the documented semantics: they sit on the
+    system tenant and release on behalf of any tenant via ``?tenant_id=``."""
+    resp = await mtls_quota_client.post(
+        f"/v1/quota/release/{uuid4()}?tenant_id={uuid4()}",
+        headers={"X-Forwarded-Client-Cert": 'Subject="CN=orchestrator,O=expert_work";Hash=abc'},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "RESERVATION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_release_without_query_param_uses_principal_tenant(
+    quota_client: AsyncClient,
+) -> None:
+    """Regression: no ``?tenant_id=`` still falls back to the caller's home
+    tenant — a real reservation reserved under it releases with 204."""
+    token = _operator_token()
+    reserve = await quota_client.post(
+        "/v1/quota/reserve",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "tenant_id": str(_TENANT),
+            "agent": "alpha",
+            "thread_id": str(uuid4()),
+            "estimated_tokens": 100,
+        },
+    )
+    assert reserve.status_code == 200
+    reservation_id = reserve.json()["reservation_id"]
+
+    release = await quota_client.post(
+        f"/v1/quota/release/{reservation_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert release.status_code == 204
