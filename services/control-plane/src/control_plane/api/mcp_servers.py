@@ -19,13 +19,11 @@ from control_plane.audit import emit
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenancy.tenant_config import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
-    CrossTenant,
-    SingleTenant,
     applied_scope,
     bypass_rls_session,
     cross_tenant_query_enabled,
     ensure_single_tenant_scope,
-    ensure_tenant_scope,
+    ensure_tenant_scope_home_fallback,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.url_validation import RemoteURLError, validate_remote_url
@@ -336,34 +334,6 @@ async def _resolve_plan(tenant_config_service: object, tenant_id: UUID) -> Tenan
     except TenantConfigNotConfiguredError:
         return TenantPlan.FREE
     return cfg.plan  # type: ignore[no-any-return]
-
-
-async def _resolve_list_scope(
-    request: Request,
-    principal: Principal,
-    tenant_id: UUID | Literal["*"] | None,
-    audit: AuditLogger,
-    *,
-    endpoint: str,
-) -> SingleTenant:
-    """W3 read scope for the two mcp-server lists.
-
-    ``TenantMcpServerStore`` has no cross-tenant aggregate reader and the "*"
-    aggregate is a spec non-goal here — a resolved :class:`CrossTenant` falls
-    back to the caller's home tenant (the pre-scope-threading behavior,
-    mirroring the front-end ``concreteTenantScope`` collapse).
-    """
-    scope = await ensure_tenant_scope(
-        principal,
-        tenant_id,
-        audit,
-        trace_id=current_trace_id_hex(),
-        endpoint=endpoint,
-        cross_tenant_enabled=cross_tenant_query_enabled(request),
-    )
-    if isinstance(scope, CrossTenant):
-        return SingleTenant(tenant_id=principal.tenant_id)
-    return scope
 
 
 async def _tenant_allowlist(tenant_config_service: object, tenant_id: UUID) -> list[str]:
@@ -745,8 +715,15 @@ def build_mcp_servers_router() -> APIRouter:
         # tenant's MCP servers from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        scope = await _resolve_list_scope(
-            request, principal, tenant_id, audit, endpoint="GET /v1/mcp-servers"
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/mcp-servers",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         async with applied_scope(scope):
             rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
@@ -798,8 +775,14 @@ def build_mcp_servers_router() -> APIRouter:
         # W3 read scope — same treatment as the base list.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        scope = await _resolve_list_scope(
-            request, principal, tenant_id, audit, endpoint="GET /v1/mcp-servers/available"
+        # W3 — same "*" home collapse as the base list.
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/mcp-servers/available",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         target_tenant = scope.tenant_id
         available: list[dict[str, object]] = []

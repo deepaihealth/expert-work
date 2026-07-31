@@ -27,12 +27,10 @@ from pydantic import BaseModel, Field
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.tenant_scope import (
-    CrossTenant,
-    SingleTenant,
     applied_scope,
     cross_tenant_query_enabled,
     ensure_single_tenant_scope,
-    ensure_tenant_scope,
+    ensure_tenant_scope_home_fallback,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
@@ -243,7 +241,9 @@ def build_knowledge_router() -> APIRouter:
         # tenant's knowledge bases from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        scope = await ensure_tenant_scope(
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
             request.state.principal,
             tenant_id,
             audit,
@@ -251,12 +251,6 @@ def build_knowledge_router() -> APIRouter:
             endpoint="GET /v1/knowledge/bases",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
-        if isinstance(scope, CrossTenant):
-            # ``KnowledgeStore`` has no cross-tenant aggregate reader and the
-            # "*" aggregate is a spec non-goal here — fall back to the caller's
-            # home tenant (the pre-scope-threading behavior, mirroring the
-            # front-end ``concreteTenantScope`` collapse).
-            scope = SingleTenant(tenant_id=request.state.principal.tenant_id)
         async with applied_scope(scope):
             bases = await store.list_bases(tenant_id=scope.tenant_id)
             stats = await store.base_stats_many(tenant_id=scope.tenant_id)

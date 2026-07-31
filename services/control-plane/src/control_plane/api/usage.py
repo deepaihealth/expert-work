@@ -28,11 +28,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from control_plane.api._authz import require
 from control_plane.tenant_scope import (
-    CrossTenant,
-    SingleTenant,
     applied_scope,
     cross_tenant_query_enabled,
-    ensure_tenant_scope,
+    ensure_tenant_scope_home_fallback,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import TenantBillingLedgerStore
@@ -77,34 +75,6 @@ def _get_token_usage_store(request: Request) -> TokenUsageStore:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
-
-
-async def _resolve_usage_scope(
-    request: Request,
-    principal: Principal,
-    tenant_id: UUID | Literal["*"] | None,
-    audit: AuditLogger,
-    *,
-    endpoint: str,
-) -> SingleTenant:
-    """W3 read scope for the two usage reads.
-
-    Neither store has a cross-tenant aggregate reader and the "*" aggregate is
-    a spec non-goal here — a resolved :class:`CrossTenant` falls back to the
-    caller's home tenant (the pre-scope-threading behavior, mirroring the
-    front-end ``concreteTenantScope`` collapse).
-    """
-    scope = await ensure_tenant_scope(
-        principal,
-        tenant_id,
-        audit,
-        trace_id=current_trace_id_hex(),
-        endpoint=endpoint,
-        cross_tenant_enabled=cross_tenant_query_enabled(request),
-    )
-    if isinstance(scope, CrossTenant):
-        return SingleTenant(tenant_id=principal.tenant_id)
-    return scope
 
 
 def _parse_month(month: str | None) -> date:
@@ -166,8 +136,15 @@ def build_usage_router() -> APIRouter:
                 status_code=422,
                 detail={"code": "INVALID_GROUP_BY", "message": f"group_by ∈ {_GroupBy}"},
             )
-        scope = await _resolve_usage_scope(
-            request, principal, tenant_id, audit, endpoint="GET /v1/usage/cost"
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/usage/cost",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         target = _parse_month(month)
         async with applied_scope(scope):
@@ -232,8 +209,14 @@ def build_usage_router() -> APIRouter:
         # W3 read scope — same treatment as ``/cost``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        scope = await _resolve_usage_scope(
-            request, principal, tenant_id, audit, endpoint="GET /v1/usage/tokens"
+        # W3 — same "*" home collapse as ``/cost``.
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/usage/tokens",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         target = _parse_month(month)
         start, end = _month_window(target)

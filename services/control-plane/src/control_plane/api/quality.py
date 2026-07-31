@@ -24,11 +24,9 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.tenant_scope import (
-    CrossTenant,
-    SingleTenant,
     applied_scope,
     cross_tenant_query_enabled,
-    ensure_tenant_scope,
+    ensure_tenant_scope_home_fallback,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import QualityDriftAlertStore, QualityScoreStore
@@ -76,33 +74,6 @@ def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
-async def _resolve_list_scope(
-    request: Request,
-    tenant_id: UUID | Literal["*"] | None,
-    audit: AuditLogger,
-    *,
-    endpoint: str,
-) -> SingleTenant:
-    """W3 read scope for the two quality lists.
-
-    Neither store has a cross-tenant aggregate reader and the "*" aggregate is
-    a spec non-goal here — a resolved :class:`CrossTenant` falls back to the
-    caller's home tenant (the pre-scope-threading behavior, mirroring the
-    front-end ``concreteTenantScope`` collapse).
-    """
-    scope = await ensure_tenant_scope(
-        request.state.principal,
-        tenant_id,
-        audit,
-        trace_id=current_trace_id_hex(),
-        endpoint=endpoint,
-        cross_tenant_enabled=cross_tenant_query_enabled(request),
-    )
-    if isinstance(scope, CrossTenant):
-        return SingleTenant(tenant_id=request.state.principal.tenant_id)
-    return scope
-
-
 def build_quality_router() -> APIRouter:
     """Read the per-agent quality series + drift alerts (scope-aware reads)."""
     router = APIRouter(prefix="/v1/quality", tags=["quality"])
@@ -119,8 +90,15 @@ def build_quality_router() -> APIRouter:
         # tenant's quality series from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        scope = await _resolve_list_scope(
-            request, tenant_id, audit, endpoint="GET /v1/quality/scores"
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/quality/scores",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         since = datetime.now(tz=UTC) - timedelta(hours=window_h)
         async with applied_scope(scope):
@@ -140,8 +118,14 @@ def build_quality_router() -> APIRouter:
         # W3 read scope — same treatment as ``/scores``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        scope = await _resolve_list_scope(
-            request, tenant_id, audit, endpoint="GET /v1/quality/drift-alerts"
+        # W3 — same "*" home collapse as ``/scores``.
+        scope = await ensure_tenant_scope_home_fallback(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/quality/drift-alerts",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         since = datetime.now(tz=UTC) - timedelta(hours=window_h)
         async with applied_scope(scope):
