@@ -25,7 +25,7 @@ from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.billing.ledger import InMemoryTenantBillingLedgerStore
 from expert_work.persistence.token_usage_store import InMemoryTokenUsageStore, TokenUsageRecord
-from expert_work.protocol import TenantBillingLedgerRecord
+from expert_work.protocol import Role, TenantBillingLedgerRecord
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -285,3 +285,82 @@ async def test_tokens_by_kind_split_and_filter(ctx: _Ctx) -> None:
     ).json()["data"]
     assert filtered["total"]["input_tokens"] == 40
     assert {g["key"] for g in filtered["by_kind"]} == {"skill_evolution"}
+
+
+# ---------------------------------------------------------------------------
+# W3 — usage 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套(列表性读,无 "*" 详情拒绝项):system_admin 带目标租户 tenant_id
+# → 200 命中目标租户数据;普通租户用户带他租户 tenant_id → 403
+# TENANT_NOT_ALLOWED;"*" 无聚合读法 → 回落归属租户。照 W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from the tenant under test."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_usage_system_admin_target_tenant_200(ctx: _Ctx) -> None:
+    await ctx.ledger.upsert(
+        _ledger_row(tenant_id=ctx.tenant_id, agent="a1", model="m1", billed=300)
+    )
+    await ctx.usage.insert(
+        TokenUsageRecord(
+            tenant_id=ctx.tenant_id,
+            agent_name="a1",
+            agent_version="1",
+            model="m1",
+            provider="anthropic",
+            input_tokens=10,
+            output_tokens=1,
+        )
+    )
+    headers = await _grant_system_admin(ctx.client)
+    params = {"tenant_id": str(ctx.tenant_id)}
+
+    cost = await ctx.client.get("/v1/usage/cost", params=params, headers=headers)
+    assert cost.status_code == 200, cost.text
+    assert cost.json()["data"]["total_billed_cost_micros"] == 300
+
+    tokens = await ctx.client.get("/v1/usage/tokens", params=params, headers=headers)
+    assert tokens.status_code == 200, tokens.text
+    assert tokens.json()["data"]["total"]["input_tokens"] == 10
+
+
+@pytest.mark.asyncio
+async def test_usage_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
+    """``tenant_id=*``:usage 无聚合读法(spec 非目标)→ 回落 system_admin
+    归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    await ctx.ledger.upsert(
+        _ledger_row(tenant_id=ctx.tenant_id, agent="a1", model="m1", billed=300)
+    )
+    headers = await _grant_system_admin(ctx.client)
+    resp = await ctx.client.get("/v1/usage/cost", params={"tenant_id": "*"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["total_billed_cost_micros"] == 0
+
+
+@pytest.mark.asyncio
+async def test_usage_foreign_tenant_user_403(ctx: _Ctx) -> None:
+    foreign_jwt = make_test_jwt(tenant_id=uuid4(), subject=str(uuid4()), roles=("admin",))
+    foreign = {"Authorization": f"Bearer {foreign_jwt}"}
+    for name, path in [("cost", "/v1/usage/cost"), ("tokens", "/v1/usage/tokens")]:
+        resp = await ctx.client.get(
+            path, params={"tenant_id": str(ctx.tenant_id)}, headers=foreign
+        )
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
