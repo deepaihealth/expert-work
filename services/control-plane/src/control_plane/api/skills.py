@@ -54,6 +54,7 @@ from control_plane.tenant_scope import (
     applied_scope,
     bypass_rls_session,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -211,6 +212,10 @@ def _get_audit(request: Request) -> AuditLogger:
 def _skill_dict(skill: Skill) -> dict[str, Any]:
     return {
         "id": str(skill.id),
+        # W3 cross-tenant drilldown — the "*" aggregate list row needs its
+        # owning tenant so the UI can deep-link with a concrete tenant_id
+        # (list/detail share this serializer). NULL for platform skills.
+        "tenant_id": str(skill.tenant_id) if skill.tenant_id is not None else None,
         "name": skill.name,
         "status": skill.status.value,
         "latest_version": skill.latest_version,
@@ -427,6 +432,9 @@ def build_skills_router() -> APIRouter:
         file_path: str,
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — admin-UI file read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Admin UI single-file content fetch (Mini-ADR U-20).
 
@@ -442,7 +450,14 @@ def build_skills_router() -> APIRouter:
         they can audit / triage threat-scanner findings. The drift hash
         is enforced at ``skill_view`` (agent path), not here (admin path).
         """
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/skills/{skill_id}/versions/{version}/supporting-files/{file_path}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
 
         # U-18 path validation — same allowlist enforcement as the
         # mutation surfaces, so a probe of an invalid path returns 400
@@ -452,9 +467,10 @@ def build_skills_router() -> APIRouter:
         except SkillPackageLayoutError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        row = await store.get_version_by_number(
-            skill_id=skill_id, tenant_id=tenant_id, version=version
-        )
+        async with applied_scope(scope):
+            row = await store.get_version_by_number(
+                skill_id=skill_id, tenant_id=scope.tenant_id, version=version
+            )
         if row is None:
             raise HTTPException(status_code=404, detail="skill version not found")
         entry = row.supporting_files.get(file_path)
@@ -1140,9 +1156,21 @@ def build_skills_router() -> APIRouter:
         skill_id: UUID,
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's skill; "*" is meaningless (one owning tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/skills/{skill_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
         return JSONResponse(status_code=200, content=_skill_dict(skill))
@@ -1152,12 +1180,23 @@ def build_skills_router() -> APIRouter:
         skill_id: UUID,
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
-        if skill is None:
-            raise HTTPException(status_code=404, detail="skill not found")
-        versions = await store.list_versions(skill_id=skill_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/skills/{skill_id}/versions",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
+            if skill is None:
+                raise HTTPException(status_code=404, detail="skill not found")
+            versions = await store.list_versions(skill_id=skill_id, tenant_id=scope.tenant_id)
         return JSONResponse(
             status_code=200, content={"items": [_version_dict(v) for v in versions]}
         )
@@ -1168,11 +1207,22 @@ def build_skills_router() -> APIRouter:
         version_number: int,
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        version = await store.get_version_by_number(
-            skill_id=skill_id, tenant_id=tenant_id, version=version_number
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/skills/{skill_id}/versions/{version_number}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        async with applied_scope(scope):
+            version = await store.get_version_by_number(
+                skill_id=skill_id, tenant_id=scope.tenant_id, version=version_number
+            )
         if version is None:
             raise HTTPException(status_code=404, detail="skill version not found")
         return JSONResponse(status_code=200, content=_version_dict(version))
@@ -1316,14 +1366,25 @@ def build_skills_router() -> APIRouter:
         version_number: int,
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — download is a read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> Response:
-        tenant_id: UUID = request.state.tenant_id
-        version = await store.get_version_by_number(
-            skill_id=skill_id, tenant_id=tenant_id, version=version_number
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/skills/{skill_id}/versions/{version_number}/export",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
-        if version is None:
-            raise HTTPException(status_code=404, detail="skill version not found")
-        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        async with applied_scope(scope):
+            version = await store.get_version_by_number(
+                skill_id=skill_id, tenant_id=scope.tenant_id, version=version_number
+            )
+            if version is None:
+                raise HTTPException(status_code=404, detail="skill version not found")
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
         blob = build_skill_zip(
