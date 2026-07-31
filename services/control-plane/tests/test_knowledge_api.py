@@ -696,3 +696,11 @@ async def test_knowledge_test_retrieval_tenant_id_star_400(setup: Setup) -> None
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_missing_base_404_wins_over_503(setup: Setup) -> None:
+    """M-2 锁定:库不存在 → 404,即使 retriever 未配置(原错误优先级)。"""
+    client, _ = setup
+    resp = await client.post("/v1/knowledge/bases/ghost/test", json={"query": "x"})
+    assert resp.status_code == 404, resp.text

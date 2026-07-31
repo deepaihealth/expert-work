@@ -577,13 +577,15 @@ def build_knowledge_router() -> APIRouter:
             endpoint="POST /v1/knowledge/bases/{name}/test",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
-        if retriever is None:
-            raise HTTPException(
-                status_code=503,
-                detail="knowledge retrieval unavailable: no embedding model configured",
-            )
         async with applied_scope(scope):
             base = await _require_base(store, scope.tenant_id, name)
+            # AFTER the base lookup — a missing base stays 404 even when the
+            # retriever is unconfigured (pre-W3 error priority).
+            if retriever is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="knowledge retrieval unavailable: no embedding model configured",
+                )
             results = await retriever.search(
                 tenant_id=scope.tenant_id,
                 base_names=[base.name],
