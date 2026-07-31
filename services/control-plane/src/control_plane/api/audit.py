@@ -36,6 +36,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import (
@@ -200,13 +201,26 @@ def build_audit_router() -> APIRouter:
         audit_id: int,
         request: Request,
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's audit row from the tenant switcher; "*" is
+        # meaningless (a row belongs to one tenant — the list endpoint
+        # owns the aggregate).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        entry = await audit.get_by_id(
-            audit_id,
-            tenant_id=tenant_id,
-            actor_id=request.state.actor_id,
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/audit/{audit_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        async with applied_scope(scope):
+            entry = await audit.get_by_id(
+                audit_id,
+                tenant_id=scope.tenant_id,
+                actor_id=request.state.actor_id,
+            )
         if entry is None:
             raise HTTPException(status_code=404, detail="audit entry not found")
         return JSONResponse(content=_audit_entry_dict(entry))

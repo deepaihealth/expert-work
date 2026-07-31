@@ -40,6 +40,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -159,20 +160,33 @@ def build_artifacts_router() -> APIRouter:
         # (the user-detail Artifacts tab). Non-admins targeting someone
         # else get a 403 from the shared gate.
         user_id: Annotated[UUID | None, Query()] = None,
+        # W2 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's artifact from the tenant switcher; "*" is
+        # meaningless (an artifact belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> Response:
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/artifacts/download",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         # 404 (not 403) so a cross-user / nonexistent name stays opaque.
         if target_user_id is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
-        version = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=target_user_id, name=name
-        )
-        if version is None:
-            raise HTTPException(status_code=404, detail="artifact not found")
-        # Re-fetch the parent row to know the ``kind`` for MIME inference.
-        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=target_user_id)
+        async with applied_scope(scope):
+            version = await store.get_latest_version(
+                tenant_id=target_tenant, user_id=target_user_id, name=name
+            )
+            if version is None:
+                raise HTTPException(status_code=404, detail="artifact not found")
+            # Re-fetch the parent row to know the ``kind`` for MIME inference.
+            artifacts = await store.list_for_user(tenant_id=target_tenant, user_id=target_user_id)
         artifact = next((a for a in artifacts if a.name == name), None)
         if artifact is None:
             # Defensive — would mean a version exists but its parent does
@@ -181,11 +195,13 @@ def build_artifacts_router() -> APIRouter:
         # Mini-ADR J-25 (J.9-step2) — quota admission. ``cost=1`` deducts
         # from QPS + ``ARTIFACT_DOWNLOAD_COUNT_30D`` (only the
         # dimensions a tenant has rows for run; others are no-ops).
+        # Quota stays charged to the CALLER's tenant (home) — a system_admin
+        # drill-in must not consume the target tenant's download budget.
         actor_id: str = getattr(request.state, "actor_id", "anonymous")
         denial = await check_admission(
             quota=quota,
             audit=audit,
-            tenant_id=tenant_id,
+            tenant_id=request.state.tenant_id,
             actor_id=actor_id,
             agent=None,
             resource_kind="artifact_download",
@@ -200,7 +216,7 @@ def build_artifacts_router() -> APIRouter:
             )
         try:
             data = await supervisor.read_workspace_file(
-                tenant_id=tenant_id,
+                tenant_id=target_tenant,
                 user_id=target_user_id,
                 path=version.path_in_workspace,
             )
@@ -212,11 +228,12 @@ def build_artifacts_router() -> APIRouter:
 
         # Backfill the digest on first read — unknown at save_artifact time.
         if version.size_bytes is None:
-            await store.set_version_digest(
-                version_id=version.id,
-                size_bytes=len(data),
-                sha256=hashlib.sha256(data).hexdigest(),
-            )
+            async with applied_scope(scope):
+                await store.set_version_digest(
+                    version_id=version.id,
+                    size_bytes=len(data),
+                    sha256=hashlib.sha256(data).hexdigest(),
+                )
         # Mini-ADR J-25 (J.9-step3, STREAM-J-DESIGN § 10.5) — MIME +
         # XSS-safe disposition. Active content (HTML / SVG / etc.) is
         # always sent ``attachment`` regardless of how the kind / path
@@ -331,8 +348,11 @@ def build_artifacts_router() -> APIRouter:
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         # H.8-F1 — tenant-admin governance target (see download).
         user_id: Annotated[UUID | None, Query()] = None,
+        # W2 read scope — see ``download_artifact``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Mini-ADR J-25 — version history for one artifact.
 
@@ -341,12 +361,22 @@ def build_artifacts_router() -> APIRouter:
         ``size_bytes`` / ``sha256`` may still be NULL when the version
         has never been downloaded (lazy backfill).
         """
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/artifacts/{name}/versions",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         if target_user_id is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
-        versions = await store.list_versions(tenant_id=tenant_id, user_id=target_user_id, name=name)
+        async with applied_scope(scope):
+            versions = await store.list_versions(
+                tenant_id=scope.tenant_id, user_id=target_user_id, name=name
+            )
         if versions is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         items: list[dict[str, Any]] = [

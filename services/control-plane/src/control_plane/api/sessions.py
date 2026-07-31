@@ -47,6 +47,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -366,9 +367,22 @@ def build_sessions_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's session from the tenant switcher; "*" is
+        # meaningless (a thread belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         # Stream J.14 — a user-owned thread is private to its owner.
@@ -380,7 +394,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         await emit(
             audit,
-            tenant_id=tenant_id,
+            tenant_id=request.state.tenant_id,
             actor_id=request.state.actor_id,
             action=AuditAction.SESSION_READ,
             resource_type="session",
@@ -397,6 +411,9 @@ def build_sessions_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         workspaces: Annotated[UserWorkspaceStore, Depends(_get_workspace_store)],
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_session``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Playground-Uplift D4 — the thread user's persistent workspace + artifacts.
 
@@ -405,8 +422,17 @@ def build_sessions_router() -> APIRouter:
         on the thread's ``user_id`` (its owning user), gated by the same
         thread-ownership check as GET.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/workspace",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -417,8 +443,9 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None:
             # Machine/unowned thread — no per-user workspace.
             return JSONResponse({"success": True, "data": {"workspace": None, "artifacts": []}})
-        workspace = await workspaces.get(tenant_id=tenant_id, user_id=meta.user_id)
-        arts = await artifacts.list_for_user(tenant_id=tenant_id, user_id=meta.user_id)
+        async with applied_scope(scope):
+            workspace = await workspaces.get(tenant_id=target_tenant, user_id=meta.user_id)
+            arts = await artifacts.list_for_user(tenant_id=target_tenant, user_id=meta.user_id)
         return JSONResponse(
             {
                 "success": True,
@@ -436,6 +463,9 @@ def build_sessions_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_session``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Workspace browse — the files in the thread user's persistent volume.
 
@@ -444,8 +474,17 @@ def build_sessions_router() -> APIRouter:
         owning user). A machine/unowned thread, an absent supervisor, or an
         empty volume all return ``[]``.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/workspace/files",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -457,7 +496,7 @@ def build_sessions_router() -> APIRouter:
             return JSONResponse({"success": True, "data": {"files": []}})
         try:
             entries = await supervisor.list_workspace_files(
-                tenant_id=tenant_id, user_id=meta.user_id
+                tenant_id=target_tenant, user_id=meta.user_id
             )
         except SandboxSupervisorError:
             logger.warning("session_workspace.list_failed", exc_info=True)
@@ -473,6 +512,9 @@ def build_sessions_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
         path: Annotated[str, Query()],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_session``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> Response:
         """Download one file from the thread user's persistent workspace volume.
 
@@ -481,8 +523,17 @@ def build_sessions_router() -> APIRouter:
         here and again at the supervisor boundary. 404 hides cross-user /
         missing-file / no-supervisor behind one opaque response.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/workspace/file",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -497,7 +548,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="file not found")
         try:
             data = await supervisor.read_workspace_file(
-                tenant_id=tenant_id, user_id=meta.user_id, path=safe_path
+                tenant_id=target_tenant, user_id=meta.user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:
             logger.warning("session_workspace.read_failed", exc_info=True)
@@ -559,6 +610,9 @@ def build_sessions_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_session``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> Response:
         """Download the thread user's artifact by logical name (latest version).
 
@@ -567,8 +621,17 @@ def build_sessions_router() -> APIRouter:
         path + proxies the bytes via the supervisor. 404 hides cross-user /
         missing / no-supervisor.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/workspace/artifacts/{name}/download",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -578,14 +641,15 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         if meta.user_id is None or supervisor is None:
             raise HTTPException(status_code=404, detail="artifact not found")
-        version = await artifacts.get_latest_version(
-            tenant_id=tenant_id, user_id=meta.user_id, name=name
-        )
+        async with applied_scope(scope):
+            version = await artifacts.get_latest_version(
+                tenant_id=target_tenant, user_id=meta.user_id, name=name
+            )
         if version is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         try:
             data = await supervisor.read_workspace_file(
-                tenant_id=tenant_id, user_id=meta.user_id, path=version.path_in_workspace
+                tenant_id=target_tenant, user_id=meta.user_id, path=version.path_in_workspace
             )
         except SandboxSupervisorError as exc:
             logger.warning("session_artifact.content_unavailable", exc_info=True)

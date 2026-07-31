@@ -227,3 +227,47 @@ async def test_system_admin_cross_tenant_aggregates(ctx: _Ctx) -> None:
     assert body["applied_scope"] == "cross_tenant"
     # ≥ 2 seeded rows visible across tenants.
     assert len(body["items"]) >= 2
+
+
+# ---------------------------------------------------------------------------
+# W2 — audit 详情读端点接跨租户 scope(系统管理员租户切换器)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_audit_entry_system_admin_target_tenant_200(ctx: _Ctx) -> None:
+    stored = await ctx.store.append(_make_entry(tenant_id=_TENANT_OTHER))
+    assert stored.id is not None
+    sys_admin_id = uuid4()
+    await ctx.app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=_TENANT, subject=str(sys_admin_id))
+    resp = await ctx.client.get(
+        f"/v1/audit/{stored.id}",
+        params={"tenant_id": str(_TENANT_OTHER)},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == stored.id
+    assert body["tenant_id"] == str(_TENANT_OTHER)
+
+
+@pytest.mark.asyncio
+async def test_get_audit_entry_foreign_tenant_403(ctx: _Ctx) -> None:
+    resp = await ctx.client.get("/v1/audit/1", params={"tenant_id": str(_TENANT_OTHER)})
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_get_audit_entry_tenant_id_star_400(ctx: _Ctx) -> None:
+    resp = await ctx.client.get("/v1/audit/1", params={"tenant_id": "*"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
