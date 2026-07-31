@@ -197,10 +197,14 @@ export function approvalItemFromEvent(data: unknown): ApprovalItem | null {
 export function ApprovalGate({
   approval,
   busy,
+  disabled = false,
   onDecide,
 }: {
   approval: ApprovalItem;
   busy: boolean;
+  /** Track C W2 — 切入态只读:审批决策是写操作,置灰两个按钮
+   *  (照 ``FeedbackBar.disabled`` 的现有传法)。 */
+  disabled?: boolean;
   onDecide: (decision: "approve" | "reject") => void;
 }) {
   const { t } = useTranslation();
@@ -252,6 +256,7 @@ export function ApprovalGate({
           size="small"
           icon={<Check size={13} strokeWidth={1.75} />}
           loading={busy}
+          disabled={disabled}
           onClick={() => onDecide("approve")}
           data-testid="playground-approval-approve"
         >
@@ -262,6 +267,7 @@ export function ApprovalGate({
           size="small"
           icon={<X size={13} strokeWidth={1.75} />}
           loading={busy}
+          disabled={disabled}
           onClick={() => onDecide("reject")}
           data-testid="playground-approval-reject"
         >
@@ -858,13 +864,23 @@ export function TurnCard({
           </div>
         )}
 
-        {/* #5 — approval gate (run paused on an approval-required tool). */}
+        {/* #5 — approval gate (run paused on an approval-required tool).
+            Track C W2 fix — 切入态只读:审批决策是写操作,按钮真禁用 + Tooltip
+            (PlaygroundTab.handleDecide 的 early-return 仅作兜底)。 */}
         {!readOnly && turn.approval && threadId && (
-          <ApprovalGate
-            approval={turn.approval}
-            busy={deciding}
-            onDecide={(decision) => onDecide(turn.id, turn.approval!, decision)}
-          />
+          <Tooltip
+            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+          >
+            {/* div 承接 Tooltip 注入的鼠标事件(函数组件 child 不转发会静默失效) */}
+            <div>
+              <ApprovalGate
+                approval={turn.approval}
+                busy={deciding}
+                disabled={isTenantSwitched}
+                onDecide={(decision) => onDecide(turn.id, turn.approval!, decision)}
+              />
+            </div>
+          </Tooltip>
         )}
 
         <TurnMeta

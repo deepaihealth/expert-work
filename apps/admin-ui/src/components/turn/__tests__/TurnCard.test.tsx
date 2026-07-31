@@ -236,6 +236,25 @@ describe("TurnCard (read-only)", () => {
     expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
   });
 
+  // Track C W2 fix-review Important#1 — 切入态审批门按钮真禁用(此前只有
+  // PlaygroundTab.handleDecide 顶部的静默 early-return,按钮仍可点)。
+  // 场景实时可达:home 态发起 run 挂审批门 → 顶栏切换器切入他租户。
+  it("切入态审批门批准/拒绝按钮置灰", () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderCard({ turn: makeTurn({ approval: pendingApproval }) });
+
+    expect(screen.getByTestId("playground-approval-approve")).toBeDisabled();
+    expect(screen.getByTestId("playground-approval-reject")).toBeDisabled();
+  });
+
+  // 两态对照,防上面的 disabled 断言变 vacuous。
+  it("归属态审批门批准/拒绝按钮可点", () => {
+    renderCard({ turn: makeTurn({ approval: pendingApproval }) });
+
+    expect(screen.getByTestId("playground-approval-approve")).not.toBeDisabled();
+    expect(screen.getByTestId("playground-approval-reject")).not.toBeDisabled();
+  });
+
   // Track C W2 — 切入态只读:反馈按钮置灰,但事件时间线照常可见
   // (不复用 readOnly 表达切入态)。
   it("切入态置灰反馈按钮,历史轮事件仍可见", () => {
