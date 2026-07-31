@@ -55,6 +55,9 @@ push=0
 oidc_issuer="${VITE_OIDC_ISSUER:-}"
 oidc_client_id="${VITE_OIDC_CLIENT_ID:-}"
 oidc_audience="${VITE_OIDC_AUDIENCE:-}"
+# W2-PR3 — Langfuse UI origin for the debug console deep link; baked at
+# build time like the OIDC trio (env-specific image when set).
+langfuse_base_url="${VITE_LANGFUSE_BASE_URL:-}"
 
 usage() {
     cat >&2 <<EOF
@@ -71,9 +74,11 @@ Options:
   --oidc-issuer <url>   admin-ui build arg VITE_OIDC_ISSUER (default: \$VITE_OIDC_ISSUER, else unset)
   --oidc-client-id <id> admin-ui build arg VITE_OIDC_CLIENT_ID (default: \$VITE_OIDC_CLIENT_ID, else unset)
   --oidc-audience <aud> admin-ui build arg VITE_OIDC_AUDIENCE (default: \$VITE_OIDC_AUDIENCE, else unset)
+  --langfuse-base-url <url> admin-ui build arg VITE_LANGFUSE_BASE_URL (default: \$VITE_LANGFUSE_BASE_URL, else unset)
 
-Any --oidc-* value set makes the built admin-ui image environment-specific
-— see the admin-ui OIDC paragraph in this file's header comment.
+Any --oidc-* / --langfuse-* value set makes the built admin-ui image
+environment-specific — see the admin-ui OIDC paragraph in this file's
+header comment.
 EOF
     exit 2
 }
@@ -103,6 +108,11 @@ while [[ $# -gt 0 ]]; do
         --oidc-audience)
             [[ $# -ge 2 && -n "$2" ]] || usage
             oidc_audience="$2"
+            shift 2
+            ;;
+        --langfuse-base-url)
+            [[ $# -ge 2 && -n "$2" ]] || usage
+            langfuse_base_url="$2"
             shift 2
             ;;
         --push)
@@ -183,6 +193,7 @@ for image in "${selected[@]}"; do
             [[ -n "${oidc_issuer}" ]] && admin_ui_build_args+=(--build-arg "VITE_OIDC_ISSUER=${oidc_issuer}")
             [[ -n "${oidc_client_id}" ]] && admin_ui_build_args+=(--build-arg "VITE_OIDC_CLIENT_ID=${oidc_client_id}")
             [[ -n "${oidc_audience}" ]] && admin_ui_build_args+=(--build-arg "VITE_OIDC_AUDIENCE=${oidc_audience}")
+            [[ -n "${langfuse_base_url}" ]] && admin_ui_build_args+=(--build-arg "VITE_LANGFUSE_BASE_URL=${langfuse_base_url}")
             if [[ ${#admin_ui_build_args[@]} -gt 0 ]]; then
                 build_image "admin-ui" "${REPO_ROOT}/apps/admin-ui/Dockerfile" "${REPO_ROOT}/apps/admin-ui" \
                     "${admin_ui_build_args[@]}"

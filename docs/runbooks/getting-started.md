@@ -142,6 +142,10 @@ VITE_OIDC_CLIENT_ID=expert-work-admin-ui
 # 该页「打开」按钮跳 ${base}/admin/(realm expert-work → Users → Credentials
 # 设成员/首位管理员密码)。不设则该页显示"未配置"提示。
 VITE_KEYCLOAK_BASE_URL=http://localhost:8080
+# 可选:调试台轮次卡「在 Langfuse 打开」深链的 Langfuse UI origin
+#(本地 observability profile 起的 langfuse-web 是 3001)。不设则链接隐藏。
+# 部署版镜像走 tools/deploy/build-push.sh --langfuse-base-url 构建期烘入。
+VITE_LANGFUSE_BASE_URL=http://localhost:3001
 ```
 
 > 没有 ①,起栈会因 6379 端口冲突起不来(或你本机 redis 没占 6379 就不用)。
