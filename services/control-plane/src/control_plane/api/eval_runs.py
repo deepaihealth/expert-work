@@ -3,8 +3,9 @@
 Operator / CI surface over the ``eval_run`` + ``eval_case_result`` tables:
 enqueue a suite (``POST``) for the resident :class:`EvalWorker` to drain,
 then read the run's status + summary + per-case results. Authenticated +
-tenant-scoped — a run is owned by the caller's tenant; reads never cross
-tenants (RLS + the explicit ``tenant_id`` filter both enforce this).
+tenant-scoped by default; a system_admin may target another tenant on the
+READ endpoints via ``?tenant_id=`` (W3 read scope, see
+``control_plane.tenant_scope``). Writes stay bound to the caller's tenant.
 """
 
 from __future__ import annotations

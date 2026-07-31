@@ -1,6 +1,6 @@
 """Tenant usage / cost API — Stream Z (Mini-ADR Z-1).
 
-Two tenant-facing, RLS-self-isolated read endpoints (``billing:read``):
+Two tenant-facing read endpoints (``billing:read``):
 
 * ``GET /v1/usage/cost``   — billed cost + token sums from the Y4
   ``tenant_billing_ledger`` (rollup-derived; lags the hourly rollup).
@@ -10,9 +10,10 @@ Two tenant-facing, RLS-self-isolated read endpoints (``billing:read``):
 **Hard constraint (Stream Y/Z locked decision):** the tenant surface exposes
 ONLY ``billed_cost_micros``. ``base_cost``/``markup`` live on the ledger row but
 are NEVER projected here — they are physically absent from these response
-shapes, visible only via the system_admin chargeback API (Z-2). Tenant scoping
-rides on the RLS ContextVar (``RLSContextMiddleware`` projects
-``principal.tenant_id``), so a plain ``list_for_tenant`` is self-isolating.
+shapes, visible only via the system_admin chargeback API (Z-2). Reads are
+tenant-scoped by default; a system_admin may target another tenant via
+``?tenant_id=`` (W3 read scope, see ``control_plane.tenant_scope``), applied
+to both the RLS ContextVar and the store's explicit ``tenant_id`` filter.
 """
 
 from __future__ import annotations

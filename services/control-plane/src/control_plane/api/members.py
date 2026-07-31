@@ -6,9 +6,11 @@ and revokes / suspends a member. Each invite provisions a Keycloak account
 binding, using the same DB-first + idempotent-compensation discipline as the
 first-admin flow (Mini-ADR R-4).
 
-Scope: these endpoints are tenant-scoped — an admin manages **their own**
-tenant via request-time RLS (``principal.tenant_id``); there is no cross-tenant
-member management here (that is the platform-admin / first-admin path).
+Scope: the WRITE endpoints are tenant-scoped — an admin manages **their own**
+tenant via request-time RLS (``principal.tenant_id``). The roster READ
+(``GET /v1/members``) is scope-aware (W3, see ``control_plane.tenant_scope``):
+a system_admin may list another tenant's roster via ``?tenant_id=<uuid>`` or
+aggregate all tenants via ``?tenant_id=*``.
 """
 
 from __future__ import annotations

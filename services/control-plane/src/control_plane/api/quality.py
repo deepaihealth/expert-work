@@ -1,6 +1,6 @@
 """``/v1/quality`` — Stream RT-5 (RT-ADR-26) production-quality dashboard reads.
 
-Home-tenant, read-only surface over the ``quality_score`` time-series and the
+Read-only surface over the ``quality_score`` time-series and the
 ``quality_drift_alert`` history the RT-5 workers fill:
 
 - ``GET /v1/quality/scores`` — the per-agent score series (trend chart) and the
@@ -8,8 +8,8 @@ Home-tenant, read-only surface over the ``quality_score`` time-series and the
   so the UI can link to ``run_detail``).
 - ``GET /v1/quality/drift-alerts`` — the raised drift alerts.
 
-Reads never cross tenants: the caller's tenant (RLS GUC set by the request
-middleware) plus the store's explicit ``tenant_id`` filter both enforce it.
+Tenant-scoped by default; a system_admin may target another tenant via
+``?tenant_id=`` (W3 read scope, see ``control_plane.tenant_scope``).
 Returns the **raw** payload (no ``{success, data, error}`` envelope), matching
 ``api/eval_runs.py`` and the other operator read surfaces.
 """
@@ -104,7 +104,7 @@ async def _resolve_list_scope(
 
 
 def build_quality_router() -> APIRouter:
-    """Read the per-agent quality series + drift alerts (home-tenant)."""
+    """Read the per-agent quality series + drift alerts (scope-aware reads)."""
     router = APIRouter(prefix="/v1/quality", tags=["quality"])
 
     @router.get("/scores", response_model=None)

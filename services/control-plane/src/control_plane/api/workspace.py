@@ -159,7 +159,9 @@ def build_workspace_router() -> APIRouter:
         """Browse the files in the target user's persistent volume.
 
         Read-only inventory for the inspector. A machine principal, an absent
-        supervisor, or an empty volume all return ``[]``.
+        supervisor, or an empty volume all return ``[]``. No store call is made
+        here — file isolation is delegated to the supervisor, which resolves
+        the volume strictly by ``(tenant_id, user_id)``.
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -199,7 +201,9 @@ def build_workspace_router() -> APIRouter:
         MIME-aware + XSS-safe (active content always ``attachment`` +
         ``nosniff``). ``path`` is validated here and again at the supervisor
         boundary. 404 hides cross-user / missing-file / no-supervisor behind one
-        opaque response.
+        opaque response. No store call is made here — file isolation is
+        delegated to the supervisor, which resolves the volume strictly by
+        ``(tenant_id, user_id)``.
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
