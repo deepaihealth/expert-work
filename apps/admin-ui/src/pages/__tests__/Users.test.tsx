@@ -21,9 +21,10 @@ vi.mock("../../auth/AuthContext", () => ({
     identity: { isSystemAdmin: false, roles: ["admin"], serverResolved: true },
   }),
 }));
+let mockScope: string | undefined;
 vi.mock("../../tenant/TenantScopeContext", () => ({
   SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: undefined, apiTenantScope: undefined }),
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
 const EXTERNAL: TenantUserRosterItem = {
@@ -78,9 +79,23 @@ function renderPage() {
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  mockScope = undefined;
+  vi.restoreAllMocks();
+});
 
 describe("Users", () => {
+  it("threads the tenant scope through listUsers (跨租户钻取 B类补传)", async () => {
+    mockScope = "*";
+    const spy = vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
+      items: [EXTERNAL],
+      total: 1,
+      cross_tenant: true,
+    });
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: "*" }));
+  });
+
   it("renders roster rows keyed on subject_id, type tags, and summary stats", async () => {
     vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
       items: [EXTERNAL, MEMBER],

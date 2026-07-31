@@ -35,9 +35,10 @@ vi.mock("../../auth/AuthContext", () => ({
     },
   }),
 }));
+let mockScope: string | undefined;
 vi.mock("../../tenant/TenantScopeContext", () => ({
   SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: undefined, apiTenantScope: undefined }),
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -127,7 +128,10 @@ function renderPage(navState?: { isMember?: boolean }) {
 beforeEach(() => {
   mockIdentitySubject = "someone-else";
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  mockScope = undefined;
+  vi.restoreAllMocks();
+});
 
 describe("UserProfile", () => {
   it("resolves and shows subject_id in the header on a direct URL open", async () => {
@@ -138,7 +142,16 @@ describe("UserProfile", () => {
     await waitFor(() =>
       expect(screen.getByTestId("user-profile-subject-id")).toHaveTextContent("ext-alice"),
     );
-    expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID);
+    expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, undefined);
+  });
+
+  it("threads the tenant scope through getTenantUser (跨租户钻取 B类补传)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    stubCommon();
+    renderPage();
+    await waitFor(() =>
+      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, mockScope),
+    );
   });
 
   it("titles an unnamed employee by their email, not their OIDC sub", async () => {

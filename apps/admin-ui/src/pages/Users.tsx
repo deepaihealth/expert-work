@@ -31,6 +31,7 @@ import { ApiError } from "../api/client";
 import { listUsers, type TenantUserRoster, type TenantUserRosterItem } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -42,6 +43,7 @@ export function Users() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { identity } = useAuth();
+  const { apiTenantScope } = useTenantScope();
 
   const isAdmin =
     (identity?.isSystemAdmin ?? false) || (identity?.roles.includes("admin") ?? false);
@@ -55,21 +57,20 @@ export function Users() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
 
-  // The whole /users feature is caller-home-tenant-scoped: per-user workspace
-  // and usage endpoints take no tenant_id, so cross-tenant user drill-in can't
-  // be made consistent yet. Keeping the roster home-scoped too avoids a
-  // scope-switched system_admin seeing a tenant's roster but home-tenant detail.
+  // Scope-aware roster: a scope-switched system_admin sees the selected
+  // tenant's roster (or the "*" aggregate) instead of silently reading
+  // their home tenant (跨租户钻取 2026-07-31).
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setData(await listUsers());
+      setData(await listUsers({ tenantScope: apiTenantScope }));
     } catch (err) {
       setError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     if (denied) {
