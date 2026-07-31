@@ -175,10 +175,14 @@ build_image() {
         "${context}"
 
     if [[ "${push}" -eq 1 ]]; then
+        # --platform on push too: with the containerd image store a tag
+        # can hold BOTH arch variants, and a bare push picks the HOST
+        # arch (arm64 on Apple Silicon) — the cluster then dies with
+        # "exec format error" (live lesson, W2-PR3 mirror sweep).
         echo "==> Pushing ${repo}:${tag}"
-        docker push "${repo}:${tag}"
+        docker push --platform linux/amd64 "${repo}:${tag}"
         echo "==> Pushing ${repo}:latest"
-        docker push "${repo}:latest"
+        docker push --platform linux/amd64 "${repo}:latest"
     fi
 }
 
