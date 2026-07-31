@@ -14,6 +14,12 @@ vi.mock("../../auth/AuthContext", () => ({
   useAuth: () => useAuthMock(),
 }));
 
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", () => ({
+  SCOPE_ALL: "*",
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 import { SkillEvolutionKillSwitch } from "../SkillEvolutionKillSwitch";
 
 const getMock = vi.spyOn(sdk, "getKillSwitch");
@@ -36,10 +42,18 @@ beforeEach(() => {
   useAuthMock.mockReturnValue({ identity: { isSystemAdmin: false, roles: ["admin"] } });
 });
 afterEach(() => {
+  mockScope = undefined;
   vi.clearAllMocks();
 });
 
 describe("SkillEvolutionKillSwitch", () => {
+  it("threads the tenant scope through getKillSwitch (跨租户钻取)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(mockScope));
+  });
+
   it("shows the active status + tenant toggle for a tenant admin (no global)", async () => {
     getMock.mockResolvedValue(state());
     renderControl();

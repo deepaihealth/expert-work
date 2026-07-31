@@ -11,6 +11,12 @@ import type { SkillLineage } from "../../../api/skill-evolution";
 import type { SkillRecord, SkillVersion } from "../../../api/skills";
 import { LineagePanel } from "../LineagePanel";
 
+let mockScope: string | undefined;
+vi.mock("../../../tenant/TenantScopeContext", () => ({
+  SCOPE_ALL: "*",
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 const getMock = vi.spyOn(sdk, "getLineage");
 
 function skill(overrides: Partial<SkillRecord> = {}): SkillRecord {
@@ -63,10 +69,22 @@ beforeEach(() => {
   getMock.mockReset();
 });
 afterEach(() => {
+  mockScope = undefined;
   vi.clearAllMocks();
 });
 
 describe("LineagePanel", () => {
+  it("threads the tenant scope through getLineage (跨租户钻取)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    getMock.mockResolvedValue({
+      skill: skill(),
+      forked_from_source: null,
+      versions: [version()],
+    } satisfies SkillLineage);
+    renderPanel();
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("sk-1", mockScope));
+  });
+
   it("renders the version timeline with origin tags", async () => {
     getMock.mockResolvedValue({
       skill: skill(),

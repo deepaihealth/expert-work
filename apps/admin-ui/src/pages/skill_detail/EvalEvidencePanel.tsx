@@ -16,6 +16,7 @@ import {
   type EvalVerdict,
   type SkillEvalResult,
 } from "../../api/skill-evolution";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -39,6 +40,7 @@ interface EvalEvidencePanelProps {
 
 export function EvalEvidencePanel({ skillId }: EvalEvidencePanelProps) {
   const { t } = useTranslation();
+  const { apiTenantScope } = useTenantScope();
   const [results, setResults] = useState<SkillEvalResult[] | null>(null);
 
   const verdictLabel = (v: EvalVerdict): string =>
@@ -50,11 +52,11 @@ export function EvalEvidencePanel({ skillId }: EvalEvidencePanelProps) {
 
   const load = useCallback(async () => {
     try {
-      setResults(await listEvalResults(skillId));
+      setResults(await listEvalResults(skillId, apiTenantScope));
     } catch {
       setResults([]);
     }
-  }, [skillId]);
+  }, [skillId, apiTenantScope]);
 
   useEffect(() => {
     void load();

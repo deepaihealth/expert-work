@@ -28,6 +28,7 @@ import {
   getPlatformEmbeddingConfig,
   getPlatformEmbeddingStatus,
 } from "../platform_embedding_config";
+import { getKillSwitch, getLineage, listEvalResults } from "../skill-evolution";
 
 interface Capture {
   url: string;
@@ -296,5 +297,31 @@ describe("api_keys mutations", () => {
     await rotateApiKey("k1", { grace_period_s: 600 });
     expect(calls[0].url).toBe("/v1/api_keys/k1/rotate");
     expect(calls[0].method).toBe("post");
+  });
+});
+
+describe("skill-evolution reads — tenant scope threading (跨租户钻取)", () => {
+  // Raw payloads (no envelope) — the module reads ``response.data`` verbatim.
+  it("threads tenant_id through listEvalResults", async () => {
+    const calls = captureAdapter({ items: [] });
+    await listEvalResults("sk-1", "t-1");
+    expect(calls[0].url).toBe("/v1/skill-evolution/skills/sk-1/eval-results");
+    expect(calls[0].params?.tenant_id).toBe("t-1");
+  });
+
+  it("threads tenant_id through getLineage", async () => {
+    const calls = captureAdapter({ skill: null, forked_from_source: null, versions: [] });
+    await getLineage("sk-1", "t-1");
+    expect(calls[0].url).toBe("/v1/skill-evolution/skills/sk-1/lineage");
+    expect(calls[0].params?.tenant_id).toBe("t-1");
+  });
+
+  it("threads tenant_id through getKillSwitch and omits it when unscoped", async () => {
+    const calls = captureAdapter({ global: null, tenant: null, effective_halted: false });
+    await getKillSwitch("t-1");
+    expect(calls[0].url).toBe("/v1/skill-evolution/kill-switch");
+    expect(calls[0].params?.tenant_id).toBe("t-1");
+    await getKillSwitch();
+    expect(calls[1].params?.tenant_id).toBeUndefined();
   });
 });

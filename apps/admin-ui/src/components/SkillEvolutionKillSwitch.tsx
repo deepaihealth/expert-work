@@ -20,6 +20,7 @@ import {
 } from "../api/skill-evolution";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -28,17 +29,18 @@ export function SkillEvolutionKillSwitch() {
   const { message, modal } = App.useApp();
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
+  const { apiTenantScope } = useTenantScope();
 
   const [state, setState] = useState<KillSwitchState | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      setState(await getKillSwitch());
+      setState(await getKillSwitch(apiTenantScope));
     } catch {
       setState(null);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     void load();
