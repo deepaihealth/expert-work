@@ -362,3 +362,23 @@ async def test_usage_foreign_tenant_user_403(ctx: _Ctx) -> None:
         resp = await ctx.client.get(path, params={"tenant_id": str(ctx.tenant_id)}, headers=foreign)
         assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
         assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_usage_tokens_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
+    """``tenant_id=*`` 回落断言补齐 /tokens(与 /cost 同 helper,M-3)。"""
+    await ctx.usage.insert(
+        TokenUsageRecord(
+            tenant_id=ctx.tenant_id,
+            agent_name="a1",
+            agent_version="1",
+            model="m1",
+            provider="anthropic",
+            input_tokens=10,
+            output_tokens=1,
+        )
+    )
+    headers = await _grant_system_admin(ctx.client)
+    resp = await ctx.client.get("/v1/usage/tokens", params={"tenant_id": "*"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["total"]["input_tokens"] == 0
