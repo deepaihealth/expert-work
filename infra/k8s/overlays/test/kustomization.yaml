@@ -7,7 +7,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base
+- ../../base
 
 # Deployed image tags — updated by hand at release time (edit + commit,
 # then `kubectl apply -k`). Tag convention: `<main sha>` for
@@ -18,22 +18,11 @@ resources:
 # re-pushing an existing tag serves stale bits — every release must mint
 # a fresh tag. (Follow-up: digest pinning would remove this class of
 # problem entirely.)
-images:
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newTag: c304294a
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newTag: 3520c2d7-test
   # The cluster VPC cannot reach docker.io / quay.io (dial timeout — same
   # constraint W0 hit with probe pods), so base's upstream keycloak and
   # searxng images are remapped to ACR mirror copies pushed from a dev
   # machine (docker pull upstream → tag → push; searxng's `latest` is
   # pinned as a dated snapshot at mirror time).
-  - name: quay.io/keycloak/keycloak
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
-    newTag: "25.0"
-  - name: searxng/searxng
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
-    newTag: "2026-07-29"
   # W2-PR3 — observability + Langfuse mirrors (same docker.io-unreachable
   # constraint; pushed by tools/deploy/mirror script from a dev machine).
   # clickhouse + otel-collector carry an -r1 suffix: their original tags
@@ -41,41 +30,50 @@ images:
   # the host arch — exec format error on cluster) and MAY be cached
   # tag-level by ACS; a fresh tag guarantees the amd64 bits (same rule
   # as the `-rN` release convention above).
-  - name: otel/opentelemetry-collector
-    newTag: 0.119.0-r1
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
-  - name: prom/prometheus
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
-  - name: grafana/tempo
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
-  - name: grafana/grafana
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
-  - name: prom/alertmanager
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
-  - name: clickhouse/clickhouse-server
-    newTag: 24.12-alpine-r1
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
-  - name: langfuse/langfuse
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
-  - name: langfuse/langfuse-worker
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
+images:
+- name: clickhouse/clickhouse-server
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
+  newTag: 24.12-alpine-r1
+- name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
+  newTag: beb07512-test
+- name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+  newTag: beb07512
+- name: grafana/grafana
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
+- name: grafana/tempo
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
+- name: langfuse/langfuse
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
+- name: langfuse/langfuse-worker
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
+- name: otel/opentelemetry-collector
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
+  newTag: 0.119.0-r1
+- name: prom/alertmanager
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
+- name: prom/prometheus
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
+- name: quay.io/keycloak/keycloak
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
+  newTag: "25.0"
+- name: searxng/searxng
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
+  newTag: "2026-07-29"
 
 # Replaces base's vendored searxng settings with the mainland-engine-only
 # variant — the cluster VPC cannot reach the upstream default engines
 # (google/ddg/wikipedia); see searxng-settings-cn.yml's header.
 configMapGenerator:
-  - name: searxng-settings
-    behavior: replace
-    files:
-      - settings.yml=searxng-settings-cn.yml
+- behavior: replace
+  files:
+  - settings.yml=searxng-settings-cn.yml
+  name: searxng-settings
 
 patches:
-  - path: configmap-patch.yaml
-  - path: ingress-patch.yaml
-  - path: keycloak-patch.yaml
-  - path: langfuse-configmap-patch.yaml
-  - path: langfuse-ingress-patch.yaml
-
-# Secrets (control-plane-secrets / keycloak-secrets) are NOT built by
-# kustomize here — see secrets.env.example for how PR-2 provisions them
-# directly against the cluster (kubectl create secret --from-env-file).
+- path: configmap-patch.yaml
+- path: ingress-patch.yaml
+- path: keycloak-patch.yaml
+- path: langfuse-configmap-patch.yaml
+- path: langfuse-ingress-patch.yaml
