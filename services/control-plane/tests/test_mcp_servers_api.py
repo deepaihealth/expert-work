@@ -1562,3 +1562,54 @@ async def test_mcp_tools_tenant_id_star_400(monkeypatch: pytest.MonkeyPatch) -> 
         )
         assert resp.status_code == 400, resp.text
         assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_home_probe_still_stamps_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I-1 锁定(其一):归属租户探测照常落健康戳(行为不回退)。"""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_fail)
+        resp = await client.get("/v1/mcp-servers/linear/tools", headers=admin_headers)
+        assert resp.status_code == 502, resp.text
+        row = await app.state.tenant_mcp_server_store.get(  # type: ignore[attr-defined]
+            tenant_id=tenant_id, name="linear"
+        )
+        assert row is not None
+        assert row.last_probe_status == "error"
+        assert row.last_probe_error == "MCP_SERVER_PROBE_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_cross_tenant_probe_does_not_stamp_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-1 锁定(其二):切入态 system_admin 探测他租户 server,探测结果照常
+    返回(502),但**不**改写该租户真行的健康状态(一期只开读)。"""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        store = app.state.tenant_mcp_server_store  # type: ignore[attr-defined]
+        before = await store.get(tenant_id=tenant_id, name="linear")
+        assert before is not None
+
+        headers = await _grant_system_admin_on(app)
+        monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_fail)
+        resp = await client.get(
+            "/v1/mcp-servers/linear/tools",
+            params={"tenant_id": str(tenant_id)},
+            headers=headers,
+        )
+        assert resp.status_code == 502, resp.text
+
+        after = await store.get(tenant_id=tenant_id, name="linear")
+        assert after is not None
+        # 行未被改写:健康三元组与探测前逐字段一致(尤其不是 error)。
+        assert after.last_probe_status == before.last_probe_status
+        assert after.last_probe_error == before.last_probe_error
+        assert after.last_probe_at == before.last_probe_at

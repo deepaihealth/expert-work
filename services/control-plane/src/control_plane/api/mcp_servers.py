@@ -881,6 +881,11 @@ def build_mcp_servers_router() -> APIRouter:
         # Rate limit stays keyed on the CALLER's tenant (caller-identity).
         await _enforce_probe_rate_limit(probe_limiter, principal.tenant_id)
         target_tenant = scope.tenant_id
+        # W3 一期只开读 — a switched-in system_admin's probe must not mutate the
+        # target tenant's own health row (their UI would flip on a platform-side
+        # network/credential hiccup). Health stamps persist only for home-tenant
+        # probes; the probe RESULT is still returned either way.
+        is_home_probe = scope.tenant_id == principal.tenant_id
 
         # The picker lists BOTH tenant-private servers and platform servers the
         # tenant enabled (``/available`` → ``mcp_allowlist``), so tool-probe must
@@ -935,9 +940,9 @@ def build_mcp_servers_router() -> APIRouter:
             )
         except McpProbeError as exc:
             # On-demand probe doubles as the live-health signal — persist the
-            # failure (#2). Only tenant rows carry per-server health. The
-            # health stamp belongs to the PROBED row's tenant (scope target).
-            if is_tenant:
+            # failure (#2). Only tenant rows carry per-server health, and only
+            # for HOME-tenant probes (see ``is_home_probe`` above).
+            if is_tenant and is_home_probe:
                 async with applied_scope(scope):
                     await _record_health(
                         store, tenant_id=target_tenant, name=name, status="error", error=exc.code
@@ -945,7 +950,7 @@ def build_mcp_servers_router() -> APIRouter:
             raise HTTPException(
                 status_code=502, detail={"code": exc.code, "message": exc.message}
             ) from exc
-        if is_tenant:
+        if is_tenant and is_home_probe:
             async with applied_scope(scope):
                 await _record_health(store, tenant_id=target_tenant, name=name, status="ok")
         return {
