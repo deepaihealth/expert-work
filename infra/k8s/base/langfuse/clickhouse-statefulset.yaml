@@ -79,6 +79,12 @@ spec:
     - metadata:
         name: data
       spec:
+        # Explicit — the test cluster has NO default StorageClass (found
+        # live: unset SC ⇒ PVC Pending forever, "unbound immediate
+        # PersistentVolumeClaims"). alltype is the topology-aware
+        # WaitForFirstConsumer class that auto-picks an available disk
+        # category per zone. Same pin as the three observability PVCs.
+        storageClassName: alicloud-disk-topology-alltype
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:

@@ -1,5 +1,5 @@
 # Grafana state (users, prefs, non-provisioned dashboards) — cloud disk,
-# cluster-default StorageClass, Aliyun 20Gi minimum.
+# SC pinned explicitly (no default SC in cluster), Aliyun 20Gi minimum.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -7,6 +7,7 @@ metadata:
   labels:
     app.kubernetes.io/name: grafana
 spec:
+  storageClassName: alicloud-disk-topology-alltype
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:

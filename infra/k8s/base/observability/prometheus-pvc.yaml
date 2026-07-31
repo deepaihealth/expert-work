@@ -1,5 +1,5 @@
-# Metrics history — cloud disk, cluster-default (topology-aware)
-# StorageClass. 20Gi is the Aliyun disk minimum; expand online if the
+# Metrics history — cloud disk. SC pinned explicitly —
+# the test cluster has NO default StorageClass (unset ⇒ Pending forever). 20Gi is the Aliyun disk minimum; expand online if the
 # 15s-interval TSDB outgrows it.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -8,6 +8,7 @@ metadata:
   labels:
     app.kubernetes.io/name: prometheus
 spec:
+  storageClassName: alicloud-disk-topology-alltype
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:

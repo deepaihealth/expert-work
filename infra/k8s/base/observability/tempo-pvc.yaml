@@ -1,4 +1,4 @@
-# Trace blocks + WAL — cloud disk, cluster-default StorageClass.
+# Trace blocks + WAL — cloud disk, SC pinned explicitly (no default SC in cluster).
 # 168h retention (tempo.yaml compactor) keeps 20Gi comfortable at
 # test-env trace volume.
 apiVersion: v1
@@ -8,6 +8,7 @@ metadata:
   labels:
     app.kubernetes.io/name: tempo
 spec:
+  storageClassName: alicloud-disk-topology-alltype
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
