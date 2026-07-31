@@ -8,7 +8,7 @@ create a thread, and the workspace stays reachable after every session is gone.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -18,7 +18,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery
+from expert_work.protocol import AuditAction, AuditQuery, Role
 from orchestrator.tools import RecordingSupervisorClient, WorkspaceFileEntry
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -389,3 +389,87 @@ async def test_self_workspace_view_does_not_emit_view_audit() -> None:
         assert resp.status_code == 200
     page = await audit_store.query(AuditQuery(tenant_id=_TENANT))
     assert not any(r.action is AuditAction.USER_DATA_VIEW for r in page.entries)
+
+
+# ---------------------------------------------------------------------------
+# W3 — workspace 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id(+user_id)→ 200
+# 命中目标租户用户数据;普通租户用户带他租户 tenant_id → 403
+# TENANT_NOT_ALLOWED;tenant_id=* → 400 SCOPE_ALL_NOT_SUPPORTED。照 W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_system_admin_target_tenant_200(
+    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+) -> None:
+    client, _, user_id = setup
+    headers = await _grant_system_admin(client)
+    params = {"tenant_id": str(_TENANT), "user_id": str(user_id)}
+
+    meta = await client.get("/v1/workspace", params=params, headers=headers)
+    assert meta.status_code == 200, meta.text
+    assert [a["name"] for a in meta.json()["data"]["artifacts"]] == ["report.md"]
+
+    files = await client.get("/v1/workspace/files", params=params, headers=headers)
+    assert files.status_code == 200, files.text
+    assert files.json()["data"]["files"] == [{"path": "out.txt", "size": 11}]
+
+    download = await client.get(
+        "/v1/workspace/file", params={**params, "path": "out.txt"}, headers=headers
+    )
+    assert download.status_code == 200, download.text
+    assert download.content == _CONTENT
+
+
+@pytest.mark.asyncio
+async def test_workspace_foreign_tenant_user_403(
+    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+) -> None:
+    client, _, user_id = setup
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    for name, path, extra in [
+        ("get_workspace", "/v1/workspace", {}),
+        ("list_files", "/v1/workspace/files", {}),
+        ("download", "/v1/workspace/file", {"path": "out.txt"}),
+    ]:
+        resp = await client.get(
+            path,
+            params={"tenant_id": str(_TENANT), "user_id": str(user_id), **extra},
+            headers=foreign,
+        )
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_workspace_tenant_id_star_400(
+    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+) -> None:
+    client, _, _ = setup
+    for name, path, extra in [
+        ("get_workspace", "/v1/workspace", {}),
+        ("list_files", "/v1/workspace/files", {}),
+        ("download", "/v1/workspace/file", {"path": "out.txt"}),
+    ]:
+        resp = await client.get(path, params={"tenant_id": "*", **extra})
+        assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
