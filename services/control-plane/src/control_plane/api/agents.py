@@ -45,6 +45,7 @@ from control_plane.tenant_scope import (
     applied_scope,
     bypass_rls_session,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -954,19 +955,33 @@ def build_agents_router() -> APIRouter:
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
         disable_repo: Annotated[AgentDisableStore, Depends(_get_agent_disable_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's agent from the tenant switcher; "*" is meaningless
+        # (an agent row belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id = request.state.tenant_id
-        record = await repo.get(tenant_id=tenant_id, name=name, version=version)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/agents/{name}/{version}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
         if record is None:
             raise HTTPException(status_code=404, detail="agent not found")
         # Stream 8.5 — instance-level RBAC + ABAC (conditioned bindings may
         # restrict a member to specific agents by id / label / ownership).
+        # Deliberately OUTSIDE applied_scope: it reads the CALLER's bindings.
         await ensure_resource_access(
             request, resource="manifest", action="read", attrs=_record_attrs(record)
         )
         await emit(
             audit,
-            tenant_id=tenant_id,
+            tenant_id=target_tenant,
             actor_id=request.state.actor_id,
             action=AuditAction.MANIFEST_READ,
             resource_type="manifest",
@@ -978,7 +993,8 @@ def build_agents_router() -> APIRouter:
         # flag is per ``name`` (all versions); read it straight from the store
         # (not the hot-path TTL cache) so the UI always sees the latest write.
         data = AgentDetail(record=record).model_dump(mode="json")
-        disable_row = await disable_repo.get(tenant_id=tenant_id, agent_name=name)
+        async with applied_scope(scope):
+            disable_row = await disable_repo.get(tenant_id=target_tenant, agent_name=name)
         if disable_row is not None and disable_row.disabled:
             data["disabled"] = True
             data["disable"] = disable_row.model_dump(mode="json")
@@ -1060,21 +1076,33 @@ def build_agents_router() -> APIRouter:
         version: str,
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         limit: int = 50,
         offset: int = 0,
+        # W2 read scope — see ``get_agent``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Stream HX-5 — revision history, newest first (summaries only)."""
-        tenant_id = request.state.tenant_id
-        # 404 for an unknown manifest, [] for a known one with a short
-        # history window — the UI distinguishes the two.
-        record = await repo.get(tenant_id=tenant_id, name=name, version=version)
-        if record is None:
-            raise HTTPException(status_code=404, detail="agent not found")
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/agents/{name}/{version}/revisions",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
-        revisions = await repo.list_revisions(
-            tenant_id=tenant_id, name=name, version=version, limit=limit, offset=offset
-        )
+        async with applied_scope(scope):
+            # 404 for an unknown manifest, [] for a known one with a short
+            # history window — the UI distinguishes the two.
+            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
+            if record is None:
+                raise HTTPException(status_code=404, detail="agent not found")
+            revisions = await repo.list_revisions(
+                tenant_id=target_tenant, name=name, version=version, limit=limit, offset=offset
+            )
         items = [
             RevisionSummary(
                 revision=r.revision,
@@ -1095,12 +1123,23 @@ def build_agents_router() -> APIRouter:
         revision: int,
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_agent``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Stream HX-5 — one full revision snapshot (the diff view's input)."""
-        tenant_id = request.state.tenant_id
-        snapshot = await repo.get_revision(
-            tenant_id=tenant_id, name=name, version=version, revision=revision
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/agents/{name}/{version}/revisions/{revision}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        async with applied_scope(scope):
+            snapshot = await repo.get_revision(
+                tenant_id=scope.tenant_id, name=name, version=version, revision=revision
+            )
         if snapshot is None:
             raise HTTPException(status_code=404, detail="revision not found")
         return JSONResponse(

@@ -18,7 +18,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery
+from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery, Role
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
@@ -906,3 +906,186 @@ async def test_repeat_purge_returns_404(session_client: AsyncClient) -> None:
 
     second = await session_client.post(f"/v1/sessions/{tid}:purge")
     assert second.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# W2 — session 详情读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
+# 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tenant_id=* → 400
+# SCOPE_ALL_NOT_SUPPORTED。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+#: (name, path-suffix under /v1/sessions/{thread_id}, extra query params)
+_SESSION_SCOPE_ENDPOINTS: list[tuple[str, str, dict[str, str]]] = [
+    ("get_session", "", {}),
+    ("workspace", "/workspace", {}),
+    ("workspace_files", "/workspace/files", {}),
+    ("workspace_file", "/workspace/file", {"path": "report.pdf"}),
+    ("artifact_download", "/workspace/artifacts/report.pdf/download", {}),
+]
+
+
+async def _create_owned_session(client: AsyncClient) -> str:
+    create = await client.post(
+        "/v1/sessions",
+        json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
+    )
+    assert create.status_code == 201, create.text
+    return str(create.json()["data"]["thread_id"])
+
+
+@pytest.mark.asyncio
+async def test_get_session_system_admin_target_tenant_200(session_client: AsyncClient) -> None:
+    thread_id = await _create_owned_session(session_client)
+    headers = await _grant_system_admin(session_client)
+    resp = await session_client.get(
+        f"/v1/sessions/{thread_id}",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["thread_id"] == thread_id
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_system_admin_target_tenant_200(
+    session_client: AsyncClient,
+) -> None:
+    thread_id = await _create_owned_session(session_client)
+    headers = await _grant_system_admin(session_client)
+    resp = await session_client.get(
+        f"/v1/sessions/{thread_id}/workspace",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["workspace"] is None  # no VM ever started — truthful null
+    assert data["artifacts"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_files_system_admin_target_tenant_200(
+    session_client: AsyncClient,
+) -> None:
+    thread_id = await _create_owned_session(session_client)
+    headers = await _grant_system_admin(session_client)
+    resp = await session_client.get(
+        f"/v1/sessions/{thread_id}/workspace/files",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["files"] == []  # no supervisor wired → degrade
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_file_and_artifact_download_system_admin_200(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """The two byte-download endpoints, end to end with a recording
+    supervisor: a system_admin homed elsewhere reads the target tenant
+    thread's workspace file and artifact via ``?tenant_id=``."""
+    from orchestrator.tools import RecordingSupervisorClient, WorkspaceFileEntry
+
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        app.state.supervisor_client = RecordingSupervisorClient(
+            workspace_files=[WorkspaceFileEntry(path="report.pdf", size=2048)],
+            workspace_file=b"%PDF-1.4 hello",
+        )
+        thread_id = await _create_owned_session(client)
+        # The thread owner's artifact row, so the by-name download resolves.
+        meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+        assert meta is not None and meta.user_id is not None
+        await app.state.artifact_store.save_version(
+            tenant_id=_DEFAULT_TENANT,
+            user_id=meta.user_id,
+            name="report.pdf",
+            kind="document",
+            path_in_workspace="report.pdf",
+            created_in_thread=thread_id,
+        )
+
+        sys_headers = await _grant_system_admin(client)
+        file_resp = await client.get(
+            f"/v1/sessions/{thread_id}/workspace/file",
+            params={"path": "report.pdf", "tenant_id": str(_DEFAULT_TENANT)},
+            headers=sys_headers,
+        )
+        assert file_resp.status_code == 200, file_resp.text
+        assert file_resp.content == b"%PDF-1.4 hello"
+
+        artifact_resp = await client.get(
+            f"/v1/sessions/{thread_id}/workspace/artifacts/report.pdf/download",
+            params={"tenant_id": str(_DEFAULT_TENANT)},
+            headers=sys_headers,
+        )
+        assert artifact_resp.status_code == 200, artifact_resp.text
+        assert artifact_resp.content == b"%PDF-1.4 hello"
+
+
+@pytest.mark.parametrize("name,suffix,extra", _SESSION_SCOPE_ENDPOINTS)
+@pytest.mark.asyncio
+async def test_session_detail_foreign_tenant_user_403(
+    session_client: AsyncClient, name: str, suffix: str, extra: dict[str, str]
+) -> None:
+    thread_id = await _create_owned_session(session_client)
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    resp = await session_client.get(
+        f"/v1/sessions/{thread_id}{suffix}",
+        params={"tenant_id": str(_DEFAULT_TENANT), **extra},
+        headers=foreign,
+    )
+    assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.parametrize("name,suffix,extra", _SESSION_SCOPE_ENDPOINTS)
+@pytest.mark.asyncio
+async def test_session_detail_tenant_id_star_400(
+    session_client: AsyncClient, name: str, suffix: str, extra: dict[str, str]
+) -> None:
+    thread_id = await _create_owned_session(session_client)
+    resp = await session_client.get(
+        f"/v1/sessions/{thread_id}{suffix}",
+        params={"tenant_id": "*", **extra},
+    )
+    assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
