@@ -873,7 +873,8 @@ describe("PlaygroundTab", () => {
     const hist = await screen.findByTestId("playground-history");
     expect(hist).toHaveTextContent("earlier question");
     expect(hist).toHaveTextContent("earlier answer");
-    expect(getMessagesMock).toHaveBeenCalledWith(past.thread_id);
+    // Home state — the ambient scope resolves to no tenant override.
+    expect(getMessagesMock).toHaveBeenCalledWith(past.thread_id, undefined);
   });
 
   it("shows the workspace inspector with the volume + artifacts", async () => {

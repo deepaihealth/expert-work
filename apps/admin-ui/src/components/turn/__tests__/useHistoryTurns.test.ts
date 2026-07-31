@@ -138,6 +138,43 @@ describe("useHistoryTurns", () => {
     expect(result.current.messages).toEqual(oneTurnOfMessages);
   });
 
+  it("threads the caller-supplied tenant through the fetch and each replay", async () => {
+    getMessagesMock.mockResolvedValue(oneTurnOfMessages);
+    listThreadRunsMock.mockResolvedValue(oneRun);
+    streamRunEventsMock.mockImplementation(() =>
+      makeStream([
+        {
+          id: "1",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "replayed" }] } },
+          rawData: "",
+          receivedAt: "",
+        },
+        { id: "2", event: "end", data: {}, rawData: "", receivedAt: "" },
+      ]),
+    );
+
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1", "tenant-x");
+    });
+
+    expect(getMessagesMock).toHaveBeenCalledWith("th-1", "tenant-x");
+    expect(listThreadRunsMock).toHaveBeenCalledWith("th-1", "tenant-x");
+
+    // The replay a row triggers later reads under the same pinned tenant.
+    const row = document.createElement("div");
+    await act(async () => {
+      result.current.registerRow("r1", "th-1")(row);
+    });
+    await waitFor(() => expect(result.current.loads.r1.state).toBe("done"));
+    expect(streamRunEventsMock).toHaveBeenCalledWith(
+      "th-1",
+      "r1",
+      expect.objectContaining({ tenantScope: "tenant-x" }),
+    );
+  });
+
   it("replays a runId only once even when two rows register it", async () => {
     getMessagesMock.mockResolvedValue(oneTurnOfMessages);
     listThreadRunsMock.mockResolvedValue(oneRun);

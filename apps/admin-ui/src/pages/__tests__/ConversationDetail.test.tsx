@@ -598,8 +598,9 @@ describe("ConversationDetail", () => {
       // Same mounted ``<ConversationDetail>`` — react-router keys routes by
       // route id, not by ``:threadId``, so navigating A → B re-renders the
       // same component instance instead of remounting it. Thread A pairs
-      // 1:1 (turn cards); thread B is a different tenant, so it must fall
-      // back to the flat block — and none of A's cards may linger.
+      // 1:1 (turn cards); thread B (a different tenant — rebuilt under its
+      // own tenant since D3 lifted) has no runs, so it falls back to the
+      // flat block — and none of A's cards may linger.
       const THREAD_B = "55555555-5555-5555-5555-555555555555";
       const CROSS_TENANT = "99999999-9999-9999-9999-999999999999";
       const B_MESSAGES: sessionsSdk.HistoryMessage[] = [
@@ -653,14 +654,17 @@ describe("ConversationDetail", () => {
       // A's turn cards (and its input text) must not linger.
       expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
       expect(screen.queryByText("I was charged twice")).not.toBeInTheDocument();
-      // Cross-tenant thread B must never hit the replay/runs endpoints.
-      expect(runsSpy).not.toHaveBeenCalled();
+      // Thread B's rebuild ran under B's own tenant (D3 lifted); with no
+      // runs it degraded to the flat block, so nothing replayed.
+      expect(runsSpy).toHaveBeenCalledWith(THREAD_B, CROSS_TENANT);
       expect(streamSpy).not.toHaveBeenCalled();
     });
 
-    it("stays flat and issues no replay for a cross-tenant thread", async () => {
+    it("rebuilds turn cards for a cross-tenant thread under the thread's own tenant (D3 lifted)", async () => {
       // system_admin drilling into another tenant's conversation: the replay /
-      // runs endpoints take no ``tenant_id``, so rebuilding could only 404 (D3).
+      // runs endpoints are scope-aware now, so the rich transcript rebuilds
+      // with the thread's own ``tenant_id`` riding along — on the runs list
+      // AND on each lazy replay.
       setStoredToken(
         jwt({
           sub: "u",
@@ -670,7 +674,6 @@ describe("ConversationDetail", () => {
       );
       vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
       vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
-      // Would pair 1:1 if it were ever asked — the guard is what keeps it flat.
       const runsSpy = vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
       const streamSpy = vi
         .spyOn(runsSdk, "streamRunEvents")
@@ -679,11 +682,15 @@ describe("ConversationDetail", () => {
       renderPage();
 
       await waitFor(() =>
-        expect(screen.getByTestId("conversation-message-0")).toBeInTheDocument(),
+        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
       );
-      expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
-      expect(runsSpy).not.toHaveBeenCalled();
-      expect(streamSpy).not.toHaveBeenCalled();
+      expect(runsSpy).toHaveBeenCalledWith(THREAD_ID, TENANT_ID);
+      await waitFor(() => expect(streamSpy).toHaveBeenCalled());
+      expect(streamSpy).toHaveBeenCalledWith(
+        THREAD_ID,
+        expect.any(String),
+        expect.objectContaining({ tenantScope: TENANT_ID }),
+      );
     });
   });
 

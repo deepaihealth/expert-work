@@ -37,8 +37,10 @@ export interface UseHistoryTurns {
   /** Curried ``ref`` callback for a history row — registers it with the shared
    *  IntersectionObserver so scrolling it into view replays its run. */
   registerRow: (runId: string, threadId: string) => (el: HTMLElement | null) => void;
-  /** Fetch + pair a thread's history. Never rejects (degrades internally). */
-  load: (threadId: string) => Promise<void>;
+  /** Fetch + pair a thread's history. Never rejects (degrades internally).
+   *  ``tenantId`` is the thread's own tenant (authoritative — correct even
+   *  from the "*" aggregate); omitted, the ambient tenant scope applies. */
+  load: (threadId: string, tenantId?: string) => Promise<void>;
   /** Clear the rebuilt history and tear down the observer (new draft / agent
    *  switch). Deliberately does NOT abort the in-flight fetch — same as the
    *  original ``resetDraft``. */
@@ -88,15 +90,22 @@ export function useHistoryTurns(): UseHistoryTurns {
     startedHistoryRunsRef.current.clear();
   }, []);
 
+  // The tenant the current rebuild reads under — pinned at ``load`` time so
+  // the fetch and every lazy replay it spawns hit the same tenant even if
+  // the ambient scope switches mid-rebuild.
+  const tenantIdRef = useRef<string | undefined>(undefined);
+
   // 历史重建:并行拉文本轮 + runs,按序配对成懒重建描述符;
   // 计数守卫失败或任一失败 → 落回扁平文本(setHistory 保留原行为)。
-  const load = useCallback(async (threadId: string) => {
+  const load = useCallback(async (threadId: string, tenantId?: string) => {
     setHistory([]);
     setHistoryTurns(null);
     setHistoryLoads({});
     historyAbortRef.current?.abort();
     const ac = new AbortController();
     historyAbortRef.current = ac;
+    const effectiveTenant = tenantId ?? concreteTenantScope(apiTenantScope);
+    tenantIdRef.current = effectiveTenant;
     // Tear down the previous thread's observer/registry — its callback
     // closure is bound to that thread id (see ``registerRow``), and
     // any in-flight replay's runId must not block this thread's own runs
@@ -107,8 +116,8 @@ export function useHistoryTurns(): UseHistoryTurns {
     runIdByEl.current.clear();
     startedHistoryRunsRef.current.clear();
     await Promise.all([
-      getSessionMessages(threadId),
-      listThreadRuns(threadId).catch(() => null),
+      getSessionMessages(threadId, effectiveTenant),
+      listThreadRuns(threadId, effectiveTenant).catch(() => null),
     ])
       .then(([messages, runs]) => {
         // A newer resume replaced ``historyAbortRef.current`` before this
@@ -135,7 +144,7 @@ export function useHistoryTurns(): UseHistoryTurns {
         setHistory([]);
         setHistoryTurns(null);
       });
-  }, []);
+  }, [apiTenantScope]);
 
   // 历史懒重建 — replay one historical run's persisted event stream so its
   // TurnCard can render the full debug panels (rather than just the flat
@@ -154,7 +163,9 @@ export function useHistoryTurns(): UseHistoryTurns {
       const collected: SseEvent[] = [];
       for await (const frame of streamRunEvents(threadId, runId, {
         signal: historyAbortRef.current?.signal,
-        tenantScope: concreteTenantScope(apiTenantScope),
+        // Pinned by ``load`` — a replay must read the same tenant its
+        // rebuild was fetched under, not whatever the scope switched to.
+        tenantScope: tenantIdRef.current,
       })) {
         collected.push(frame);
         if (frame.event === "end") break;
@@ -179,7 +190,7 @@ export function useHistoryTurns(): UseHistoryTurns {
     } catch {
       setHistoryLoads((prev) => ({ ...prev, [runId]: { state: "error", events: [] } }));
     }
-  }, [apiTenantScope]);
+  }, []);
 
   // Each history row's ref registers itself with a shared IntersectionObserver
   // (created lazily on first row); a row scrolling into view triggers its

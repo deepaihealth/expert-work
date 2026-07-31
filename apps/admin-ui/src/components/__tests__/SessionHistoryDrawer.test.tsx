@@ -12,6 +12,20 @@ import { SessionHistoryDrawer } from "../SessionHistoryDrawer";
 import * as sessionsSdk from "../../api/sessions";
 import type { ThreadMeta } from "../../api/sessions";
 
+// Stream N — the drawer reads the ambient tenant scope; these tests don't
+// mount a TenantScopeProvider, so mock it (mutable for passthrough asserts).
+const { tenantScopeRef } = vi.hoisted(() => ({
+  tenantScopeRef: { current: undefined as string | undefined },
+}));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: tenantScopeRef.current ?? "home",
+    setScope: () => {},
+    apiTenantScope: tenantScopeRef.current,
+  }),
+}));
+
 const listMock = vi.spyOn(sessionsSdk, "listSessions");
 const renameMock = vi.spyOn(sessionsSdk, "renameSession");
 const archiveMock = vi.spyOn(sessionsSdk, "archiveSession");
@@ -65,6 +79,7 @@ function renderDrawer(
 }
 
 beforeEach(() => {
+  tenantScopeRef.current = undefined;
   listMock.mockReset();
   listMock.mockResolvedValue([A, B]);
   renameMock.mockReset().mockResolvedValue(A);
@@ -84,6 +99,18 @@ describe("SessionHistoryDrawer", () => {
     // Scoped to the agent, server-side.
     expect(listMock).toHaveBeenCalledWith(
       expect.objectContaining({ agentName: "demo-agent" }),
+    );
+  });
+
+  it("passes the ambient tenant scope through to the sessions list", async () => {
+    tenantScopeRef.current = "99999999-9999-9999-9999-999999999999";
+    renderDrawer();
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tenantScope: "99999999-9999-9999-9999-999999999999",
+        }),
+      ),
     );
   });
 
