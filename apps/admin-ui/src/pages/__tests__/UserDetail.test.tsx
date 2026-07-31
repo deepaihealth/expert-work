@@ -191,6 +191,20 @@ describe("UserDetail", () => {
     await waitFor(() =>
       expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, mockScope),
     );
+    // W3 I-2 — the sibling panes ride the same concrete scope (the page
+    // must not mix home-tenant conversations/memories with scoped usage).
+    await waitFor(() =>
+      expect(convoSdk.listConversations).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+      ),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "Memory" }));
+    await waitFor(() =>
+      expect(memorySdk.listMemories).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+      ),
+    );
   });
 
   it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {

@@ -17,6 +17,8 @@ import type { ComponentType } from "react";
 import type { Meta, StoryObj } from "@storybook/react";
 
 import { FormView } from "./FormView";
+import { AuthProvider } from "../../auth/AuthContext";
+import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { apiClient, setStoredToken } from "../../api/client";
 import "../../i18n";
 import type { AgentManifest } from "./form_model";
@@ -158,7 +160,16 @@ function withMcpFixture(Story: ComponentType) {
       request: {},
     });
   };
-  return <Story />;
+  // Cross-tenant W3 — the skills/mcp/knowledge pickers consume
+  // useTenantScope (throws without a provider). Routing comes from the
+  // global preview decorator, so no MemoryRouter here.
+  return (
+    <AuthProvider>
+      <TenantScopeProvider>
+        <Story />
+      </TenantScopeProvider>
+    </AuthProvider>
+  );
 }
 
 // ── Seed manifest helpers ─────────────────────────────────────────────────
