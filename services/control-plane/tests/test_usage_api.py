@@ -359,8 +359,6 @@ async def test_usage_foreign_tenant_user_403(ctx: _Ctx) -> None:
     foreign_jwt = make_test_jwt(tenant_id=uuid4(), subject=str(uuid4()), roles=("admin",))
     foreign = {"Authorization": f"Bearer {foreign_jwt}"}
     for name, path in [("cost", "/v1/usage/cost"), ("tokens", "/v1/usage/tokens")]:
-        resp = await ctx.client.get(
-            path, params={"tenant_id": str(ctx.tenant_id)}, headers=foreign
-        )
+        resp = await ctx.client.get(path, params={"tenant_id": str(ctx.tenant_id)}, headers=foreign)
         assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
         assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name

@@ -656,9 +656,7 @@ _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [
 
 @pytest.mark.parametrize("name,path", _KNOWLEDGE_SCOPE_GETS)
 @pytest.mark.asyncio
-async def test_knowledge_scope_foreign_tenant_user_403(
-    setup: Setup, name: str, path: str
-) -> None:
+async def test_knowledge_scope_foreign_tenant_user_403(setup: Setup, name: str, path: str) -> None:
     client, _ = setup
     foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
     resp = await client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)

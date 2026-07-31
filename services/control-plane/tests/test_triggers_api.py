@@ -931,8 +931,6 @@ async def test_get_trigger_foreign_tenant_user_403(triggers_client: AsyncClient)
 @pytest.mark.asyncio
 async def test_get_trigger_tenant_id_star_400(triggers_client: AsyncClient) -> None:
     created = await _create_cron(triggers_client)
-    resp = await triggers_client.get(
-        f"/v1/triggers/{created['id']}", params={"tenant_id": "*"}
-    )
+    resp = await triggers_client.get(f"/v1/triggers/{created['id']}", params={"tenant_id": "*"})
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"

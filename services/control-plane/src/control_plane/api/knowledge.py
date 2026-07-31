@@ -543,9 +543,7 @@ def build_knowledge_router() -> APIRouter:
         safe_limit = max(1, min(limit, 200))
         async with applied_scope(scope):
             base = await _require_base(store, scope.tenant_id, name)
-            document = await store.get_document(
-                tenant_id=scope.tenant_id, document_id=document_id
-            )
+            document = await store.get_document(tenant_id=scope.tenant_id, document_id=document_id)
             if document is None or document.kb_id != base.id:
                 raise HTTPException(status_code=404, detail="document not found")
             chunks, total = await store.list_chunks(
