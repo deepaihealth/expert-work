@@ -11,13 +11,22 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.tenant_scope import (
+    CrossTenant,
+    SingleTenant,
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+    ensure_tenant_scope,
+)
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.eval import EvalRunStore
 from expert_work.protocol import (
     EvalCaseResultRecord,
@@ -25,6 +34,7 @@ from expert_work.protocol import (
     EvalRunStatus,
     EvalTriggeredBy,
 )
+from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.eval_runs")
 
@@ -62,6 +72,10 @@ def _get_eval_run_store(request: Request) -> EvalRunStore:
     return request.app.state.eval_run_store  # type: ignore[no-any-return]
 
 
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
 class _EnqueueBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -76,17 +90,32 @@ def build_eval_runs_router() -> APIRouter:
     async def list_runs(
         request: Request,
         store: Annotated[EvalRunStore, Depends(_get_eval_run_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         status: Annotated[EvalRunStatus | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=500)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
+        # W3 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's eval runs from the tenant switcher.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        # Home-tenant scope only — the caller's tenant (RLS GUC already set by
-        # the request middleware). A cross-tenant aggregate over this FORCE-RLS
-        # table needs the ``audit_reader`` role and is a follow-up.
-        tenant_id: UUID = request.state.tenant_id
-        items, total = await store.list_for_tenant(
-            tenant_id=tenant_id, status=status, limit=limit, offset=offset
+        scope = await ensure_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/eval-runs",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        if isinstance(scope, CrossTenant):
+            # ``EvalRunStore`` has no cross-tenant aggregate reader and the
+            # "*" aggregate is a spec non-goal here — fall back to the caller's
+            # home tenant (the pre-scope-threading behavior, mirroring the
+            # front-end ``concreteTenantScope`` collapse).
+            scope = SingleTenant(tenant_id=request.state.principal.tenant_id)
+        async with applied_scope(scope):
+            items, total = await store.list_for_tenant(
+                tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
+            )
         return JSONResponse(
             content={"items": [_run_dict(r) for r in items], "total": total},
         )
@@ -119,9 +148,20 @@ def build_eval_runs_router() -> APIRouter:
         run_id: UUID,
         request: Request,
         store: Annotated[EvalRunStore, Depends(_get_eval_run_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — "*" is meaningless (a run belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        record = await store.get_run(run_id=run_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/eval-runs/{run_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            record = await store.get_run(run_id=run_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="eval run not found")
         return JSONResponse(content=_run_dict(record))
@@ -131,12 +171,23 @@ def build_eval_runs_router() -> APIRouter:
         run_id: UUID,
         request: Request,
         store: Annotated[EvalRunStore, Depends(_get_eval_run_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        run = await store.get_run(run_id=run_id, tenant_id=tenant_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="eval run not found")
-        cases = await store.list_case_results(run_id=run_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/eval-runs/{run_id}/cases",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            run = await store.get_run(run_id=run_id, tenant_id=scope.tenant_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="eval run not found")
+            cases = await store.list_case_results(run_id=run_id, tenant_id=scope.tenant_id)
         return JSONResponse(content={"cases": [_case_dict(c) for c in cases]})
 
     return router

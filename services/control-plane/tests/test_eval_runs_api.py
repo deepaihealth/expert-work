@@ -22,6 +22,7 @@ from expert_work.protocol import (
     EvalRunRecord,
     EvalRunStatus,
     EvalTriggeredBy,
+    Role,
 )
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -177,3 +178,88 @@ async def test_list_cases(ctx: _Ctx) -> None:
     assert cases[0]["capability"] == "J.1_plan_execute"
     assert cases[0]["passed"] is True
     assert cases[0]["scores"] == {"pass_rate": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# W3 — eval-runs 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
+# 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;详情端点 tenant_id=* →
+# 400 SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_eval_runs_system_admin_target_tenant_200(ctx: _Ctx) -> None:
+    created = await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
+    run_id = created.json()["id"]
+    headers = await _grant_system_admin(ctx.client)
+    params = {"tenant_id": str(_TENANT)}
+
+    listed = await ctx.client.get("/v1/eval-runs", params=params, headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert [r["id"] for r in listed.json()["items"]] == [run_id]
+
+    got = await ctx.client.get(f"/v1/eval-runs/{run_id}", params=params, headers=headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["id"] == run_id
+
+    cases = await ctx.client.get(f"/v1/eval-runs/{run_id}/cases", params=params, headers=headers)
+    assert cases.status_code == 200, cases.text
+    assert cases.json()["cases"] == []
+
+
+@pytest.mark.asyncio
+async def test_eval_runs_list_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
+    """``tenant_id=*``:EvalRunStore 无聚合读法(spec 非目标)→ 回落
+    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
+    headers = await _grant_system_admin(ctx.client)
+    resp = await ctx.client.get("/v1/eval-runs", params={"tenant_id": "*"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_eval_runs_foreign_tenant_user_403(ctx: _Ctx) -> None:
+    created = await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
+    run_id = created.json()["id"]
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    for name, path in [
+        ("list_runs", "/v1/eval-runs"),
+        ("get_run", f"/v1/eval-runs/{run_id}"),
+        ("list_cases", f"/v1/eval-runs/{run_id}/cases"),
+    ]:
+        resp = await ctx.client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_eval_runs_detail_tenant_id_star_400(ctx: _Ctx) -> None:
+    created = await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
+    run_id = created.json()["id"]
+    for name, path in [
+        ("get_run", f"/v1/eval-runs/{run_id}"),
+        ("list_cases", f"/v1/eval-runs/{run_id}/cases"),
+    ]:
+        resp = await ctx.client.get(path, params={"tenant_id": "*"})
+        assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
