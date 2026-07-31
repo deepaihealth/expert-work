@@ -8,17 +8,25 @@
  * ``userId`` governance target (the M2 user-detail Workspace tab). The
  * playground inspector uses the self form (``userId`` omitted).
  */
-import { apiClient, getStoredToken, unwrap, type ApiEnvelope } from "./client";
+import {
+  apiClient,
+  getStoredToken,
+  unwrap,
+  withTenantScope,
+  type ApiEnvelope,
+  type TenantScope,
+} from "./client";
 import type { SessionWorkspace, WorkspaceFile } from "./sessions";
 
 /** GET /v1/workspace — the target user's persistent workspace + artifacts.
  *  ``workspace`` is null when no VM has ever started for that user. */
 export async function getUserWorkspace(
   userId?: string,
+  tenantScope?: TenantScope,
 ): Promise<SessionWorkspace> {
   const response = await apiClient.get<ApiEnvelope<SessionWorkspace>>(
     "/v1/workspace",
-    { params: { user_id: userId } },
+    { params: withTenantScope({ user_id: userId }, tenantScope) },
   );
   return unwrap(response.data);
 }
@@ -26,10 +34,11 @@ export async function getUserWorkspace(
 /** GET /v1/workspace/files — browse the files in the target user's volume. */
 export async function getUserWorkspaceFiles(
   userId?: string,
+  tenantScope?: TenantScope,
 ): Promise<WorkspaceFile[]> {
   const response = await apiClient.get<ApiEnvelope<{ files: WorkspaceFile[] }>>(
     "/v1/workspace/files",
-    { params: { user_id: userId } },
+    { params: withTenantScope({ user_id: userId }, tenantScope) },
   );
   return unwrap(response.data).files;
 }
@@ -39,10 +48,12 @@ export async function getUserWorkspaceFiles(
 export async function downloadUserWorkspaceFile(
   path: string,
   userId?: string,
+  tenantScope?: TenantScope,
 ): Promise<void> {
   const token = getStoredToken();
   const params = new URLSearchParams({ path });
   if (userId) params.set("user_id", userId);
+  if (tenantScope !== undefined) params.set("tenant_id", tenantScope);
   const url = `/v1/workspace/file?${params.toString()}`;
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;

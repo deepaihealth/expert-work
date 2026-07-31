@@ -1,8 +1,9 @@
 /**
  * Tenant usage SDK — Stream Z3, backed by the Z1/Z2 billing APIs.
  *
- * Two tenant-scoped endpoints (``billing:read``; the server derives the
- * tenant from the caller, so no ``tenant_id`` is threaded):
+ * Two tenant-scoped endpoints (``billing:read``; cross-tenant W3 adds an
+ * optional ``tenantScope`` → ``?tenant_id=`` for switched-in system_admin
+ * reads — ``undefined`` falls through to the caller's home tenant):
  *
  *   - ``GET /v1/usage/cost``   — billed cost rollup (lags the hourly rollup,
  *     hence ``as_of``). The tenant view exposes **only** billed cost; the
@@ -14,7 +15,7 @@
  * Both return the standard ``{success, data, error}`` envelope; ``getJson``
  * unwraps it.
  */
-import { getJson } from "./client";
+import { getJson, withTenantScope, type TenantScope } from "./client";
 
 export type UsageGroupBy = "agent" | "model" | "none";
 
@@ -63,6 +64,7 @@ export interface UsageTokens {
 }
 
 export interface GetUsageCostParams {
+  tenantScope?: TenantScope;
   /** ``YYYY-MM``; defaults server-side to the current month when omitted. */
   month?: string;
   groupBy?: UsageGroupBy;
@@ -73,10 +75,13 @@ export async function getUsageCost(params: GetUsageCostParams = {}): Promise<Usa
   const query: Record<string, string> = {};
   if (params.month) query.month = params.month;
   if (params.groupBy) query.group_by = params.groupBy;
-  return getJson<UsageCost>("/v1/usage/cost", { params: query });
+  return getJson<UsageCost>("/v1/usage/cost", {
+    params: withTenantScope(query, params.tenantScope),
+  });
 }
 
 export interface GetUsageTokensParams {
+  tenantScope?: TenantScope;
   /** ``YYYY-MM``; defaults server-side to the current month when omitted. */
   month?: string;
   /** Narrow to one end-user (M2 user-detail usage tab). */
@@ -88,5 +93,7 @@ export async function getUsageTokens(params: GetUsageTokensParams = {}): Promise
   const query: Record<string, string> = {};
   if (params.month) query.month = params.month;
   if (params.userId) query.user_id = params.userId;
-  return getJson<UsageTokens>("/v1/usage/tokens", { params: query });
+  return getJson<UsageTokens>("/v1/usage/tokens", {
+    params: withTenantScope(query, params.tenantScope),
+  });
 }

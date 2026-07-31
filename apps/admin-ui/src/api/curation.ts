@@ -85,9 +85,11 @@ export async function listCandidates(
 
 export async function getCandidate(
   candidateId: string,
+  tenantScope?: TenantScope,
 ): Promise<CurationCandidateDetail> {
   const response = await apiClient.get<CurationCandidateDetail>(
     `/v1/curation/candidates/${encodeURIComponent(candidateId)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -177,9 +179,13 @@ export async function createEvalDataset(
   return response.data;
 }
 
-export async function getEvalDataset(datasetId: string): Promise<EvalDataset> {
+export async function getEvalDataset(
+  datasetId: string,
+  tenantScope?: TenantScope,
+): Promise<EvalDataset> {
   const response = await apiClient.get<EvalDataset>(
     `/v1/eval-datasets/${encodeURIComponent(datasetId)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }

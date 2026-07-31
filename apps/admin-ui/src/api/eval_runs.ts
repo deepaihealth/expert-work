@@ -7,11 +7,11 @@
  * So these calls go through ``apiClient`` directly and read
  * ``response.data``, NOT through ``getJson`` (which unwraps an envelope).
  *
- * Scope: home-tenant only. A cross-tenant aggregate over the FORCE-RLS
- * ``eval_run`` table needs the ``audit_reader`` role server-side and is a
- * backend follow-up, so this SDK threads no ``tenant_id``.
+ * Scope (cross-tenant W3): the read endpoints accept an optional
+ * ``tenantScope`` (``?tenant_id=``) so a switched-in system_admin reads the
+ * target tenant's runs; ``undefined`` falls through to the home tenant.
  */
-import { apiClient } from "./client";
+import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 export type EvalRunStatus = "queued" | "running" | "passed" | "failed" | "error";
 
@@ -50,32 +50,41 @@ export interface EvalRunCases {
 }
 
 export interface ListEvalRunsParams {
+  tenantScope?: TenantScope;
   status?: EvalRunStatus;
   limit?: number;
   offset?: number;
 }
 
-/** GET /v1/eval-runs — home-tenant page of runs (newest first). */
+/** GET /v1/eval-runs — a page of runs (newest first). */
 export async function listEvalRuns(params: ListEvalRunsParams = {}): Promise<EvalRunList> {
-  const { status, limit, offset } = params;
+  const { tenantScope, status, limit, offset } = params;
   const response = await apiClient.get<EvalRunList>("/v1/eval-runs", {
-    params: { status, limit, offset },
+    params: withTenantScope({ status, limit, offset }, tenantScope),
   });
   return response.data;
 }
 
 /** GET /v1/eval-runs/{id} — one run's status + summary. */
-export async function getEvalRun(runId: string): Promise<EvalRunRecord> {
+export async function getEvalRun(
+  runId: string,
+  tenantScope?: TenantScope,
+): Promise<EvalRunRecord> {
   const response = await apiClient.get<EvalRunRecord>(
     `/v1/eval-runs/${encodeURIComponent(runId)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
 
 /** GET /v1/eval-runs/{id}/cases — per-case results for a run. */
-export async function getEvalRunCases(runId: string): Promise<EvalRunCases> {
+export async function getEvalRunCases(
+  runId: string,
+  tenantScope?: TenantScope,
+): Promise<EvalRunCases> {
   const response = await apiClient.get<EvalRunCases>(
     `/v1/eval-runs/${encodeURIComponent(runId)}/cases`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }

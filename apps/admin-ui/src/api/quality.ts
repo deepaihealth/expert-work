@@ -6,10 +6,11 @@
  * ``api/eval_runs.py``). So these calls go through ``apiClient`` directly and
  * read ``response.data``, NOT through an envelope unwrap.
  *
- * Scope: home-tenant only — the server derives the tenant from the request
- * (RLS), so this SDK threads no ``tenant_id``.
+ * Scope (cross-tenant W3): both lists accept an optional ``tenantScope``
+ * (``?tenant_id=``) so a switched-in system_admin reads the target tenant's
+ * quality data; ``undefined`` falls through to the home tenant.
  */
-import { apiClient } from "./client";
+import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 /** One LLM-judge verdict for a sampled production run. ``overall`` /
  *  ``dimensions`` are a subjective 1-5 rubric score, not ground truth. */
@@ -49,12 +50,14 @@ export interface QualityDriftAlertList {
 }
 
 export interface ListQualityScoresParams {
+  tenantScope?: TenantScope;
   agentName?: string;
   windowH?: number;
   limit?: number;
 }
 
 export interface ListQualityDriftAlertsParams {
+  tenantScope?: TenantScope;
   agentName?: string;
   windowH?: number;
   limit?: number;
@@ -64,9 +67,12 @@ export interface ListQualityDriftAlertsParams {
 export async function listQualityScores(
   params: ListQualityScoresParams = {},
 ): Promise<QualityScoreList> {
-  const { agentName, windowH, limit } = params;
+  const { tenantScope, agentName, windowH, limit } = params;
   const response = await apiClient.get<QualityScoreList>("/v1/quality/scores", {
-    params: { agent_name: agentName, window_h: windowH, limit },
+    params: withTenantScope(
+      { agent_name: agentName, window_h: windowH, limit },
+      tenantScope,
+    ),
   });
   return response.data;
 }
@@ -75,11 +81,14 @@ export async function listQualityScores(
 export async function listQualityDriftAlerts(
   params: ListQualityDriftAlertsParams = {},
 ): Promise<QualityDriftAlertList> {
-  const { agentName, windowH, limit } = params;
+  const { tenantScope, agentName, windowH, limit } = params;
   const response = await apiClient.get<QualityDriftAlertList>(
     "/v1/quality/drift-alerts",
     {
-      params: { agent_name: agentName, window_h: windowH, limit },
+      params: withTenantScope(
+        { agent_name: agentName, window_h: windowH, limit },
+        tenantScope,
+      ),
     },
   );
   return response.data;

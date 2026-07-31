@@ -20,6 +20,7 @@
  * ``decodeBase64Utf8``) are pure and identical for both, so callers keep
  * importing them from ``./skills`` directly.
  */
+import type { TenantScope } from "./client";
 import {
   getSkill,
   listSkillVersions,
@@ -49,14 +50,18 @@ import {
 } from "./platform-skills";
 
 export interface SkillApi {
-  getSkill(id: string): Promise<SkillRecord>;
-  listVersions(id: string): Promise<SkillVersionList>;
+  /** Read calls take an optional ``scope`` (cross-tenant W3 — switched-in
+   *  system_admin drill-in). The platform impl ignores it (platform skills
+   *  are tenant-less); writes stay scope-less (read-only drill-in). */
+  getSkill(id: string, scope?: TenantScope): Promise<SkillRecord>;
+  listVersions(id: string, scope?: TenantScope): Promise<SkillVersionList>;
   patchStatus(id: string, body: PatchSkillStatusBody): Promise<SkillRecord>;
-  exportVersion(id: string, version: number): Promise<Blob>;
+  exportVersion(id: string, version: number, scope?: TenantScope): Promise<Blob>;
   getSupportingFile(
     id: string,
     version: number,
     filePath: string,
+    scope?: TenantScope,
   ): Promise<SupportingFileBody>;
   putSupportingFile(
     id: string,

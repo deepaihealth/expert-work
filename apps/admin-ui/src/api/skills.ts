@@ -24,6 +24,11 @@ export type EvolutionOrigin = "in_session" | "distilled";
 
 export interface SkillRecord {
   id: string;
+  /** Cross-tenant W3 — owning tenant, present on list + detail responses
+   *  from a W3 backend. Powers the "*" aggregate row-jump (SkillsList →
+   *  SkillDetail with ``?tenant_id=``). Optional: absent on older backends
+   *  and on platform rows. */
+  tenant_id?: string;
   name: string;
   status: SkillStatus;
   latest_version: number | null;
@@ -171,9 +176,13 @@ export async function listSkills(
   return response.data;
 }
 
-export async function getSkill(skillId: string): Promise<SkillRecord> {
+export async function getSkill(
+  skillId: string,
+  tenantScope?: TenantScope,
+): Promise<SkillRecord> {
   const response = await apiClient.get<SkillRecord>(
     `/v1/skills/${encodeURIComponent(skillId)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -245,9 +254,13 @@ export interface SkillVersionList {
   items: SkillVersion[];
 }
 
-export async function listSkillVersions(skillId: string): Promise<SkillVersionList> {
+export async function listSkillVersions(
+  skillId: string,
+  tenantScope?: TenantScope,
+): Promise<SkillVersionList> {
   const response = await apiClient.get<SkillVersionList>(
     `/v1/skills/${encodeURIComponent(skillId)}/versions`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -255,9 +268,11 @@ export async function listSkillVersions(skillId: string): Promise<SkillVersionLi
 export async function getSkillVersion(
   skillId: string,
   versionNumber: number,
+  tenantScope?: TenantScope,
 ): Promise<SkillVersion> {
   const response = await apiClient.get<SkillVersion>(
     `/v1/skills/${encodeURIComponent(skillId)}/versions/${versionNumber}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -288,10 +303,11 @@ export async function importSkillZip(file: File | Blob): Promise<ImportSkillZipR
 export async function exportSkillVersion(
   skillId: string,
   versionNumber: number,
+  tenantScope?: TenantScope,
 ): Promise<Blob> {
   const response = await apiClient.get<Blob>(
     `/v1/skills/${encodeURIComponent(skillId)}/versions/${versionNumber}/export`,
-    { responseType: "blob" },
+    { responseType: "blob", params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -315,9 +331,11 @@ export async function getSupportingFile(
   skillId: string,
   versionNumber: number,
   filePath: string,
+  tenantScope?: TenantScope,
 ): Promise<SupportingFileBody> {
   const response = await apiClient.get<SupportingFileBody>(
     `/v1/skills/${encodeURIComponent(skillId)}/versions/${versionNumber}/supporting-files/${encodeFilePath(filePath)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
