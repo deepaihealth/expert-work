@@ -1,0 +1,27 @@
+# langfuse-test.deepaihealth.com — Langfuse UI on the shared ALB. Same
+# full-replacement caveat as ingress-patch.yaml (IngressRule is an
+# unkeyed list). The wildcard *.deepaihealth.com cert on the AlbConfig
+# 443 listener covers this subdomain via SNI — no AlbConfig change; the
+# only external prerequisite is the DNS CNAME (added 2026-07-31):
+#   langfuse-test → alb-cv3xokwot6r9bgojzx.cn-hangzhou.alb.aliyuncsslb.com
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: langfuse
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # Same rationale as ingress-patch.yaml: 301 cleartext to 443 — the
+    # Langfuse session cookie must never ride HTTP.
+    alb.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  rules:
+    - host: langfuse-test.deepaihealth.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: langfuse-web
+                port:
+                  number: 3000

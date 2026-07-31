@@ -1,0 +1,184 @@
+# Expert Work Prometheus alert rules — Stream G.2.
+#
+# M0 alerts on the metrics actually emitted today (control-plane only).
+# Each carries a `severity` label (P0/P1/P2) that Alertmanager routes on
+# (infra/observability/alertmanager.yml) and a runbook_url annotation.
+#
+# Pending — metric not emitted in M0, alert lands with the metric:
+#   * Postgres connection-pool exhaustion (expert_work_pg_connection_pool_in_use)
+#   * sandbox egress metadata-probe (expert_work_network_egress_meta_attempt_total)
+
+groups:
+  - name: expert_work_alerts
+    rules:
+      # P0 — the control-plane is unreachable to Prometheus.
+      - alert: ExpertWorkControlPlaneDown
+        expr: up{job="expert-work-control-plane"} == 0
+        for: 2m
+        labels:
+          severity: P0
+        annotations:
+          summary: "Control-plane is down"
+          description: "Prometheus has failed to scrape expert-work-control-plane for 2m."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+
+      # P1 — availability SLI (G.1 recording rule) below 95% over 5m.
+      - alert: ExpertWorkControlPlaneHigh5xxRate
+        expr: expert_work:sli:control_plane_availability:ratio5m < 0.95
+        for: 5m
+        labels:
+          severity: P1
+        annotations:
+          summary: "Control-plane 5xx rate elevated"
+          description: "5m success ratio is {{ $value | humanizePercentage }} (SLO target 99.9%)."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+
+      # P2 — P99 latency SLI (G.1 recording rule) far above the 200ms SLO.
+      - alert: ExpertWorkControlPlaneHighLatency
+        expr: expert_work:sli:control_plane_http_latency:p99_5m > 0.5
+        for: 10m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Control-plane P99 latency degraded"
+          description: "P99 request latency is {{ $value }}s (SLO target < 0.2s)."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+
+      # P2 — the quota reaper background loop is erroring.
+      - alert: ExpertWorkQuotaReaperErrors
+        expr: increase(expert_work_control_plane_quota_reaper_cycle_errors_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Quota reaper cycle errors"
+          description: "The quota reaper logged {{ $value }} cycle error(s) in the last 15m."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+
+  # Stream M — M0→M1 Gate-watch group.
+  #
+  # These alerts fire when 30-day Gate Exit Criteria thresholds
+  # (STREAM-M-DESIGN.md § 2.1) are at risk. Severity = ``gate-watch`` so
+  # Alertmanager routes them to the Gate operator without paging on-call
+  # with a production-severity escalation. The existing P0/P1/P2 alerts
+  # above keep production-protection semantics independent from Gate
+  # judgement.
+  #
+  # The ``for:`` windows are intentionally long (30m) so transient spikes
+  # don't trip a Gate-watch — only sustained breaches matter for the
+  # 30-day decision. The Gate runbook (docs/runbooks/m0-m1-gate.md § 1.4)
+  # describes the daily SLO-check workflow that consumes these alerts.
+  - name: expert_work_gate_watch
+    rules:
+      # Tighter than ExpertWorkControlPlaneHigh5xxRate (0.95): Gate target is
+      # 99.9% success ratio (= < 0.1% 5xx) in 30d.
+      - alert: ExpertWorkGateAvailabilityTight
+        expr: expert_work:sli:control_plane_availability:ratio5m < 0.999
+        for: 30m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "Control-plane success ratio below Gate target"
+          description: "5m success ratio is {{ $value | humanizePercentage }} — Gate target 99.9%."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      - alert: ExpertWorkGateFirstNodeOverBudget
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_session_first_node_seconds_bucket[1h]))
+          ) > 2.0
+        for: 30m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "First graph-node P95 above Gate budget (2.0s)"
+          description: "1h P95 time-to-first-graph-node is {{ $value }}s — Gate budget 2.0s."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      - alert: ExpertWorkGateSandboxColdStartOverBudget
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_sandbox_cold_start_seconds_bucket[1h]))
+          ) > 5.0
+        for: 30m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "Sandbox cold-start P95 above Gate budget (5.0s)"
+          description: "1h P95 cold-start is {{ $value }}s — Gate budget 5.0s."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      - alert: ExpertWorkGateDurableResumeOverBudget
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_durable_resume_seconds_bucket[1h]))
+          ) > 1.0
+        for: 30m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "Durable resume P95 above Gate budget (1.0s)"
+          description: "1h P95 durable resume is {{ $value }}s — Gate budget 1.0s."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      # End-to-end P95 for successful runs — Gate target < 30s. Filtered
+      # to outcome="success" so user-facing latency isn't biased by
+      # error / max_steps / cancelled tails.
+      - alert: ExpertWorkGateEndToEndOverBudget
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_session_duration_seconds_bucket{outcome="success"}[1h]))
+          ) > 30
+        for: 30m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "End-to-end session P95 above Gate budget (30s)"
+          description: "1h P95 successful session duration is {{ $value }}s — Gate budget 30s."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      # Stream-stale spike — Gate target is < 0.05% in 30d. The denominator
+      # uses expert_work_llm_token_usage_total as a proxy for active LLM
+      # streaming traffic; switch to the canonical SSE-events counter once
+      # it lands.
+      - alert: ExpertWorkGateSSEStreamStaleSpike
+        expr: |
+          (
+            sum(rate(expert_work_llm_stream_stale_total[1h]))
+            /
+            clamp_min(sum(rate(expert_work_llm_token_usage_total[1h])), 1)
+          ) > 0.0005
+        for: 1h
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "LLM stream stale rate above Gate target (0.05%)"
+          description: "1h stream-stale ratio is {{ $value | humanizePercentage }} — Gate target 0.05%."
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      # 委托闸(二期 PR3)可观测性追加。基线未知,先保守观察级
+      # (severity: gate-watch,随组内既有条目走同一路由)——阈值
+      # 与窗口待攒够生产数据后再收紧。
+      - alert: ExpertWorkGateDelegationsGatedSaturated
+        expr: sum(increase(expert_work_delegations_gated_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "委托闸出现饱和拒绝"
+          description: "过去 15m 有 {{ $value }} 次委托被并发闸拒绝（acquire 超时）。"
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+
+      - alert: ExpertWorkGateDelegationFailOpen
+        expr: increase(expert_work_delegation_gate_fail_open_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: gate-watch
+        annotations:
+          summary: "闸容量配置读取失败，fail-open 中"
+          description: "过去 15m 有 {{ $value }} 次 DelegationGate 容量 provider 读取失败，已 fail-open（不限流）。"
+          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"

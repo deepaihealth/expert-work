@@ -1,0 +1,13 @@
+# Grafana state (users, prefs, non-provisioned dashboards) — cloud disk,
+# cluster-default StorageClass, Aliyun 20Gi minimum.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  labels:
+    app.kubernetes.io/name: grafana
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi

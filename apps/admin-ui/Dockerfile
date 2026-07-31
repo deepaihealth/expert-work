@@ -34,9 +34,14 @@ COPY . .
 ARG VITE_OIDC_ISSUER=""
 ARG VITE_OIDC_CLIENT_ID=""
 ARG VITE_OIDC_AUDIENCE=""
+# W2-PR3 — Langfuse UI origin for the debug console's per-turn deep link
+# (config/env.ts readLangfuseBaseUrl → buildLangfuseTraceUrl). Empty =
+# the link stays hidden, same fallback shape as the OIDC trio.
+ARG VITE_LANGFUSE_BASE_URL=""
 ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER} \
     VITE_OIDC_CLIENT_ID=${VITE_OIDC_CLIENT_ID} \
-    VITE_OIDC_AUDIENCE=${VITE_OIDC_AUDIENCE}
+    VITE_OIDC_AUDIENCE=${VITE_OIDC_AUDIENCE} \
+    VITE_LANGFUSE_BASE_URL=${VITE_LANGFUSE_BASE_URL}
 
 RUN pnpm build
 

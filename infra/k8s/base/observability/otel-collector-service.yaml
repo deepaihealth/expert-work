@@ -1,0 +1,19 @@
+# In-cluster OTLP endpoint. App pods export to
+# http://otel-collector:4318/v1/traces
+# (EXPERT_WORK base configmap: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  labels:
+    app.kubernetes.io/name: otel-collector
+spec:
+  selector:
+    app.kubernetes.io/name: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

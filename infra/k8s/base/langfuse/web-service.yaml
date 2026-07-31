@@ -1,0 +1,17 @@
+# Backend for the langfuse Ingress (public UI) AND the in-cluster
+# ingest target — the control plane's EXPERT_WORK_LANGFUSE_HOST points
+# here (http://langfuse-web:3000) so trace ingest never leaves the
+# cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: langfuse-web
+  labels:
+    app.kubernetes.io/name: langfuse-web
+spec:
+  selector:
+    app.kubernetes.io/name: langfuse-web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

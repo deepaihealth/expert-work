@@ -1,0 +1,13 @@
+# Test-env real values for base/langfuse/config.yaml's neutral blanks
+# (strategic-merge on ConfigMap.data). Bucket/endpoint/region mirror
+# configmap-patch.yaml's object-store values — Langfuse rides the same
+# platform bucket under the `langfuse/` prefix (decision 2026-07-31).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langfuse-config
+data:
+  NEXTAUTH_URL: "https://langfuse-test.deepaihealth.com"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "expert-work-test"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "https://s3.oss-cn-hangzhou-internal.aliyuncs.com"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "cn-hangzhou"

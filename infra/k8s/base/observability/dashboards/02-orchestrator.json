@@ -1,0 +1,252 @@
+{
+  "uid": "expert-work-orchestrator",
+  "title": "Expert Work \u2014 Orchestrator",
+  "tags": [
+    "expert_work",
+    "g.7"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Orchestrator \u2014 session / LLM / tool metrics. Session first-node (first graph-node chunk, any node \u2014 not TTFT) and durable-resume are emitted by the SSE worker; recording rules in `tools/observability/rules/sli.yml` back SLOs #3 / #5."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "LLM tokens / s (by type)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 3
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum by (type) (rate(expert_work_llm_token_usage_total[5m]))",
+          "legendFormat": "{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Session first-node P95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 3
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "expert_work:sli:session_first_node:p95_5m",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Tool-call duration P95 (by tool)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, tool) (rate(expert_work_tool_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{tool}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Durable resume P95 (SLI, 5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "expert_work:sli:durable_resume:p95_5m",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Session end-to-end P95 (SLI, 5m, outcome=success)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "expert_work:sli:session_duration:p95_5m",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Delegation gate saturation (gated / queue-dropped / fail-open, rate 5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_delegations_gated_total[5m]))",
+          "legendFormat": "gated"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_run_event_queue_dropped_total[5m]))",
+          "legendFormat": "queue_dropped"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum(rate(expert_work_delegation_gate_fail_open_total[5m]))",
+          "legendFormat": "fail_open"
+        }
+      ]
+    }
+  ]
+}

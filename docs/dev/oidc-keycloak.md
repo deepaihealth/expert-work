@@ -78,6 +78,11 @@ VITE_OIDC_SCOPES=openid profile email
 # browser-reachable Keycloak origin; the page's Open button targets
 # ${VITE_KEYCLOAK_BASE_URL}/admin/. Unset → the page shows a "configure" hint.
 VITE_KEYCLOAK_BASE_URL=http://localhost:8080
+# Optional — Langfuse UI origin for the debug console's per-turn deep link
+# (compose observability profile serves langfuse-web on 3001). Unset →
+# the link stays hidden. Deployed images bake it at build time via
+# tools/deploy/build-push.sh --langfuse-base-url.
+VITE_LANGFUSE_BASE_URL=http://localhost:3001
 ```
 
 Then:

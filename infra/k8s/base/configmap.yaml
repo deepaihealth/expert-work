@@ -51,12 +51,19 @@ data:
   # exists (web_search / exec_python builds fail closed per-run, not at
   # control-plane startup).
   EXPERT_WORK_SANDBOX_SUPERVISOR_URL: "http://sandbox-supervisor:8000"
-  # Observability stack (OTel Collector) ships in PR-3; the OTel SDK
-  # buffers and drops silently when the endpoint is unreachable.
+  # W2-PR3: the in-cluster OTel Collector this key waited for is now
+  # deployed (observability/). Settings.otlp_traces_endpoint, passed
+  # explicitly to init_tracing by app.py — BEATS the generic
+  # $OTEL_EXPORTER_OTLP_TRACES_ENDPOINT fallback. After tracing.py's
+  # opt-in change (same PR), deleting this line means "no exporter
+  # installed, zero export retries" — this value is the in-cluster
+  # tracing switch.
   EXPERT_WORK_OTLP_TRACES_ENDPOINT: "http://otel-collector:4318/v1/traces"
 
   # --------------------------------------------------------------- langfuse
-  EXPERT_WORK_LANGFUSE_HOST: ""
+  # W2-PR3: points at the in-cluster langfuse-web Service. Keys live in
+  # control-plane-secrets (EXPERT_WORK_LANGFUSE_PUBLIC_KEY/SECRET_KEY).
+  EXPERT_WORK_LANGFUSE_HOST: "http://langfuse-web:3000"
   EXPERT_WORK_LANGFUSE_PII_MASKING_ENABLED: "true"
 
   # ------------------------------------------------------------ secret store

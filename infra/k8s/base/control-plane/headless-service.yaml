@@ -1,0 +1,23 @@
+# Headless twin of the control-plane Service — W2-PR3, for Prometheus
+# ONLY. The ClusterIP Service load-balances, so a static scrape against
+# it flip-flops between the 2 replicas and every counter series jumps
+# hosts (rate() sees phantom resets — terminal-review I1). A headless
+# Service's DNS A records resolve to the individual pod IPs, so the
+# dns_sd_configs job in observability/prometheus.yml scrapes each
+# replica as its own target. Zero RBAC needed (the kubernetes_sd
+# alternative wants a ServiceAccount + ClusterRole this base doesn't
+# have yet).
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane-headless
+  labels:
+    app.kubernetes.io/name: control-plane
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: control-plane
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

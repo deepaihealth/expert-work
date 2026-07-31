@@ -42,8 +42,10 @@ data:
   EXPERT_WORK_OBJECT_STORE_ENDPOINT_URL: "https://s3.oss-cn-hangzhou-internal.aliyuncs.com"
   EXPERT_WORK_OBJECT_STORE_BUCKET: "expert-work-test"
   EXPERT_WORK_OBJECT_STORE_REGION: "cn-hangzhou"
-  # Langfuse (EXPERT_WORK_LANGFUSE_HOST/…) stays at base's blank
-  # default — disabled until PR-3 wires the observability stack.
+  # Langfuse: base's in-cluster default (http://langfuse-web:3000) is
+  # already right for this env — keys land in control-plane-secrets
+  # (W2-PR3). Langfuse's own env is patched in
+  # langfuse-configmap-patch.yaml.
   # sandbox-supervisor doesn't exist yet (ships W3); blank overrides
   # base's compose-only default so control-plane doesn't try to dial a
   # Service that isn't deployed.

@@ -1,0 +1,17 @@
+# W2-PR3 vendored in-cluster copy (source: infra/observability/ — keep in sync by hand,
+# same caveat as the keycloak realm / searxng settings copies in this base).
+# Grafana dashboard provider — Stream G.0.
+#
+# Loads dashboard JSON from /var/lib/grafana/dashboards (mounted from
+# tools/observability/dashboards/). Empty until G.7 adds the first three.
+
+apiVersion: 1
+
+providers:
+  - name: expert_work
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

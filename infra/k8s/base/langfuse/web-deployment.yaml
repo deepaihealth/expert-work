@@ -1,0 +1,65 @@
+# Langfuse web — trace UI + ingest API + DB migrations on boot.
+# Version floor is a spec hard requirement: ≥2025-11 for Agent Graphs GA
+# (spec §3.5 version note, 2026-07-31); pinned to 3.122.0 at authoring
+# time. Bump web and worker TOGETHER — they share the schema.
+#
+# No init-ordering guarantees vs ClickHouse/worker: the pod crashloops
+# until its stores answer, which is the normal k8s convergence path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-web
+  labels:
+    app.kubernetes.io/name: langfuse-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: langfuse-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: langfuse-web
+    spec:
+      containers:
+        - name: langfuse-web
+          image: langfuse/langfuse:3.122.0
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: langfuse-config
+            - secretRef:
+                name: langfuse-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          # Boot runs Prisma + ClickHouse migrations before the server
+          # listens — startupProbe owns that window (up to 10 min) so
+          # liveness never kills a mid-migration pod into a restart loop.
+          startupProbe:
+            httpGet:
+              path: /api/public/ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          # readiness on /health (checks PG+ClickHouse): DB trouble only
+          # sheds traffic. liveness on /ready (no DB dependency): an RDS
+          # blip must NOT trigger kubelet restarts (terminal-review I3,
+          # same split as the official langfuse-k8s chart).
+          readinessProbe:
+            httpGet:
+              path: /api/public/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/public/ready
+              port: http
+            periodSeconds: 15
+            failureThreshold: 8

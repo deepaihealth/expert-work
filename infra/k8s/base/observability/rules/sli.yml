@@ -1,0 +1,149 @@
+# Expert Work SLI recording rules — Stream G.1.
+#
+# Pre-aggregates the SLIs for the SLOs defined in docs/runbooks/slo.md.
+# Loaded by Prometheus from /etc/prometheus/rules/ (G.0 mount).
+#
+# Session first-node (formerly named TTFT — see the rename note at line 37),
+# sandbox-cold-start, and durable-resume SLIs are all recorded below
+# (slo.md SLO #3-#5). Error-budget burn-rate rules (multi-window) live in
+# burn_rate.yml (Stream 10.5).
+
+groups:
+  - name: expert_work_sli
+    interval: 30s
+    rules:
+      # SLO 1 — control-plane API availability: 5m non-5xx success ratio.
+      # 0/0 (no traffic) records as NaN — acceptable for M0.
+      - record: expert_work:sli:control_plane_availability:ratio5m
+        expr: |
+          sum(rate(expert_work_control_plane_http_requests_total{status_code!~"5.."}[5m]))
+          /
+          sum(rate(expert_work_control_plane_http_requests_total[5m]))
+
+      # SLO 2 — control-plane API P99 latency (seconds; target < 0.2).
+      - record: expert_work:sli:control_plane_http_latency:p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(expert_work_control_plane_http_request_duration_seconds_bucket[5m]))
+          )
+
+      # SLO 3 — Session first-node P95 (seconds; target < 1.5). Stream K.K10
+      # added the histogram in the orchestrator SSE worker — observed at the
+      # first graph-node ``updates`` chunk after ``RUNNING`` (*any* node, not
+      # specifically the agent node — a run with memory_recall records the
+      # recall's completion here, not the first user-visible content; see
+      # 一期 Task 3's ``expert_work:sli:first_output:p95_5m`` below for the
+      # user-perceived metric). Renamed from ``session_ttft`` by 一期 Task 3
+      # to stop implying this is about tokens.
+      - record: expert_work:sli:session_first_node:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_session_first_node_seconds_bucket[5m]))
+          )
+
+      # 用户第一次看到内容的 P95。两条 source(token 流式 / 无流式 run 的
+      # agent updates 帧兜底)聚合,不按 source 分 —— 这里要的是真实用户
+      # 体验,不是某条路径的性能。
+      # 暂不配告警:阈值要等攒够生产数据再定,老的 first_node 告警继续守着。
+      - record: expert_work:sli:first_output:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_first_output_seconds_bucket[5m]))
+          )
+
+      # SLO 4 — Sandbox cold-start P95 (seconds; target < 3 in M0, < 0.5 in M1).
+      # Stream K.K10 added the histogram in sandbox-supervisor.acquire,
+      # observed only on the cold-launch path (warm-session reuse skips it).
+      - record: expert_work:sli:sandbox_cold_start:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_sandbox_cold_start_seconds_bucket[5m]))
+          )
+
+      # SLO 5 — Durable resume P95 (seconds). Stream K.K10 added the
+      # histogram, observed at the first chunk of a run that resumed an
+      # existing checkpointed thread (control-plane sets
+      # ``RunRecord.is_resume`` from prior-runs lookup).
+      - record: expert_work:sli:durable_resume:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_durable_resume_seconds_bucket[5m]))
+          )
+
+      # SLO 7 — Session end-to-end P95 for successful runs (seconds;
+      # Stream M Gate target < 30). Filtered to outcome="success" so
+      # error / max_steps / cancelled tails do not bias the user-facing
+      # latency view (the labelled histogram in orchestrator.sse).
+      - record: expert_work:sli:session_duration:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(expert_work_session_duration_seconds_bucket{outcome="success"}[5m]))
+          )
+
+      # --- Stream HX-4 — query-layer rules over already-emitted metrics ---
+
+      # Run success ratio (Mini-ADR HX-D1): the outcome-labelled duration
+      # histogram's _count is the per-terminal run counter — no separate
+      # counter exists by design. interrupted/cancelled excluded from the
+      # denominator: a user abort is not a platform failure.
+      - record: expert_work:sli:run_success:ratio1h
+        expr: |
+          sum(rate(expert_work_session_duration_seconds_count{outcome="success"}[1h]))
+          /
+          sum(rate(expert_work_session_duration_seconds_count{outcome=~"success|error|max_steps"}[1h]))
+
+      # Run transient-retry recovery ratio (Stream HX-3): of runs that
+      # took the in-worker retry, how many recovered. NaN when no retries
+      # fired in the window — acceptable (no-data beats a fake 100%).
+      - record: expert_work:sli:run_retry_recovery:ratio1h
+        expr: |
+          sum(rate(expert_work_orchestrator_run_retry_total{outcome="recovered"}[1h]))
+          /
+          sum(rate(expert_work_orchestrator_run_retry_total[1h]))
+
+      # Token-estimate drift ratio (Stream HX-1): tiktoken estimate vs
+      # provider-reported prompt tokens. Healthy ~1.0; chars//4 fallback
+      # shows ~0.3-0.4 on CJK-heavy traffic.
+      - record: expert_work:sli:token_estimate_drift:ratio1h
+        expr: |
+          sum(rate(expert_work_ew_token_estimated_total[1h]))
+          /
+          sum(rate(expert_work_llm_token_usage_total{type=~"input|cache_creation|cache_read"}[1h]))
+
+      # Checkpoint IO P95 (Stream HX-4): per-step persistence latency by
+      # operation (aput / aput_writes / aget_tuple).
+      - record: expert_work:sli:checkpoint_op:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, op) (rate(expert_work_checkpoint_op_seconds_bucket[5m]))
+          )
+
+      # Pending approvals (Stream HX-4): instant gauge, re-recorded for
+      # uniform expert_work:sli:* dashboards; alert on sustained growth.
+      - record: expert_work:sli:approvals_pending:current
+        expr: expert_work_control_plane_approvals_pending
+
+      # Sandbox warm-pool hit ratio (Stream HX-6, SLO #13): of ephemeral
+      # acquires that consulted the pool, how many claimed a READY
+      # container. NaN when the pool saw no traffic in the window.
+      # SLO #4's M1 acceptance reads this together with
+      # expert_work_sandbox_pool_ready and the cold-start P95.
+      - record: expert_work:sli:sandbox_pool_hit:ratio1h
+        expr: |
+          sum(rate(expert_work_sandbox_pool_total{event="hit"}[1h]))
+          /
+          sum(rate(expert_work_sandbox_pool_total{event=~"hit|miss"}[1h]))
+
+      # Delegation gate saturation (二期 PR3 spec P4): rate of delegations
+      # refused by the process-wide concurrency gate (acquire timeout).
+      # 目前无消费者(alerts.yml 的两条告警直接查 raw counter);留给
+      # 后续 SLO 面板用。sum 聚掉 tool 标签,单序列口径与本文件同侪一致。
+      - record: expert_work:sli:delegations_gated:rate_5m
+        expr: sum(rate(expert_work_delegations_gated_total[5m]))

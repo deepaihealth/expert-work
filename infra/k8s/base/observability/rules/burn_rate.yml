@@ -1,0 +1,123 @@
+# Expert Work SLO error-budget burn-rate rules — Stream 10.5 (closes slo.md "M1-E").
+#
+# The Google SRE multi-window, multi-burn-rate pattern (SRE Workbook ch. 5)
+# on top of the G.1 SLI recording rules (sli.yml). For each SLO we record the
+# error-budget burn rate over several windows, then alert only when a *fast*
+# (short-window) burn confirms a *sustained* (long-window) burn — that pairing
+# is what keeps a burn-rate alert both prompt and resistant to single-spike
+# false positives.
+#
+# burn_rate(W) = error_ratio(W) / error_budget
+#   error_budget = 1 - SLO_target  (availability 99.9% → 0.001 → ~43 min / 30d)
+# A burn rate of 1.0 spends the 30-day budget in exactly 30 days; 14.4 spends
+# it in ~50 hours (i.e. the 1h budget slice in ~5 min) → page.
+#
+# Recorded as ``expert_work_slo_burn_rate{slo,window}`` (docs/subsystems/20 § 5.4 /
+# § 5.6 ``07-slo`` dashboard). Thresholds per docs/runbooks/slo.md § burn-rate:
+# 1h > 14.4 → P0, 6h > 6 → P1, 24h > 3 → P2.
+
+groups:
+  # --- recording: availability error-budget burn rate, by window ----------
+  # SLO 1 (slo.md): control-plane API availability ≥ 99.9% / 30d.
+  # error_ratio = 5xx / total; burn_rate = error_ratio / 0.001.
+  - name: expert_work_slo_burn_rate_availability
+    interval: 30s
+    rules:
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "5m" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[5m]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[5m]))
+          ) / 0.001
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "30m" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[30m]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[30m]))
+          ) / 0.001
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "1h" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[1h]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[1h]))
+          ) / 0.001
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "2h" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[2h]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[2h]))
+          ) / 0.001
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "6h" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[6h]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[6h]))
+          ) / 0.001
+      - record: expert_work_slo_burn_rate
+        labels: { slo: "control_plane_availability", window: "24h" }
+        expr: |
+          (
+            sum(rate(expert_work_control_plane_http_requests_total{status_code=~"5.."}[24h]))
+            /
+            sum(rate(expert_work_control_plane_http_requests_total[24h]))
+          ) / 0.001
+
+  # --- alerts: multi-window burn (long AND short both over threshold) -----
+  - name: expert_work_slo_burn_rate_alerts
+    rules:
+      # P0 — fast burn: 1h budget spent in ~5 min, confirmed by the 5m window.
+      - alert: ExpertWorkSLOAvailabilityFastBurn
+        expr: |
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="1h"} > 14.4
+          and ignoring(window)
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="5m"} > 14.4
+        for: 2m
+        labels:
+          severity: P0
+          slo: control_plane_availability
+        annotations:
+          summary: "Control-plane availability error budget burning fast (P0)"
+          description: >-
+            1h burn rate {{ $value | printf "%.1f" }}× (and 5m window confirms);
+            the 30d error budget for 99.9% availability empties in <2 days at
+            this rate. Page on-call.
+
+      # P1 — medium burn: 6h window confirmed by 30m.
+      - alert: ExpertWorkSLOAvailabilityMediumBurn
+        expr: |
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="6h"} > 6
+          and ignoring(window)
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="30m"} > 6
+        for: 15m
+        labels:
+          severity: P1
+          slo: control_plane_availability
+        annotations:
+          summary: "Control-plane availability error budget burning (P1)"
+          description: >-
+            6h burn rate {{ $value | printf "%.1f" }}× (and 30m window confirms).
+
+      # P2 — slow burn: 24h window confirmed by 2h.
+      - alert: ExpertWorkSLOAvailabilitySlowBurn
+        expr: |
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="24h"} > 3
+          and ignoring(window)
+          expert_work_slo_burn_rate{slo="control_plane_availability",window="2h"} > 3
+        for: 1h
+        labels:
+          severity: P2
+          slo: control_plane_availability
+        annotations:
+          summary: "Control-plane availability error budget burning slowly (P2)"
+          description: >-
+            24h burn rate {{ $value | printf "%.1f" }}× (and 2h window confirms).
