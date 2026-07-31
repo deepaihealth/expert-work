@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -14,6 +14,7 @@ from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import Role
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
@@ -554,3 +555,146 @@ async def test_reingest_missing_document_404(full_setup: FullSetup) -> None:
         "/v1/knowledge/bases/kb/documents/00000000-0000-0000-0000-000000000000/reingest"
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# W3 — knowledge 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
+# 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;详情端点 tenant_id=* →
+# 400 SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _seed_kb_with_document(client: AsyncClient, runner: KnowledgeIngestionRunner) -> str:
+    """Create base ``kb`` with one ready document in ``_TENANT``; return doc id."""
+    await client.post("/v1/knowledge/bases", json={"name": "kb"})
+    await client.post(
+        "/v1/knowledge/bases/kb/documents",
+        files={"file": ("h.md", b"# H\n\nThe deductible is 500.", "text/markdown")},
+    )
+    await runner.drain()
+    documents = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
+    return str(documents[0]["id"])
+
+
+@pytest.mark.asyncio
+async def test_knowledge_scope_system_admin_target_tenant_200(full_setup: FullSetup) -> None:
+    client, runner, _ = full_setup
+    doc_id = await _seed_kb_with_document(client, runner)
+    headers = await _grant_system_admin(client)
+    params = {"tenant_id": str(_TENANT)}
+
+    listed = await client.get("/v1/knowledge/bases", params=params, headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert [b["name"] for b in listed.json()["bases"]] == ["kb"]
+
+    single = await client.get("/v1/knowledge/bases/kb", params=params, headers=headers)
+    assert single.status_code == 200, single.text
+    assert single.json()["name"] == "kb"
+
+    docs = await client.get("/v1/knowledge/bases/kb/documents", params=params, headers=headers)
+    assert docs.status_code == 200, docs.text
+    assert [d["id"] for d in docs.json()["documents"]] == [doc_id]
+
+    chunks = await client.get(
+        f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks", params=params, headers=headers
+    )
+    assert chunks.status_code == 200, chunks.text
+    assert chunks.json()["total"] >= 1
+
+    hit = await client.post(
+        "/v1/knowledge/bases/kb/test",
+        params=params,
+        headers=headers,
+        json={"query": "deductible"},
+    )
+    assert hit.status_code == 200, hit.text
+    assert hit.json()["count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_list_bases_star_falls_back_to_home_tenant(full_setup: FullSetup) -> None:
+    """``tenant_id=*``:KnowledgeStore 无聚合读法(spec 非目标)→ 回落
+    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    client, runner, _ = full_setup
+    await _seed_kb_with_document(client, runner)
+    headers = await _grant_system_admin(client)
+    resp = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    # The sys-admin's home tenant is a fresh uuid4 — no bases there.
+    assert resp.json()["bases"] == []
+
+
+_KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [
+    ("list_bases", "/v1/knowledge/bases"),
+    ("get_base", "/v1/knowledge/bases/kb"),
+    ("list_documents", "/v1/knowledge/bases/kb/documents"),
+    (
+        "list_chunks",
+        "/v1/knowledge/bases/kb/documents/00000000-0000-0000-0000-000000000001/chunks",
+    ),
+]
+
+
+@pytest.mark.parametrize("name,path", _KNOWLEDGE_SCOPE_GETS)
+@pytest.mark.asyncio
+async def test_knowledge_scope_foreign_tenant_user_403(
+    setup: Setup, name: str, path: str
+) -> None:
+    client, _ = setup
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    resp = await client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)
+    assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_knowledge_test_retrieval_foreign_tenant_user_403(setup: Setup) -> None:
+    client, _ = setup
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    resp = await client.post(
+        "/v1/knowledge/bases/kb/test",
+        params={"tenant_id": str(_TENANT)},
+        headers=foreign,
+        json={"query": "x"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+_KNOWLEDGE_DETAIL_GETS = [p for p in _KNOWLEDGE_SCOPE_GETS if p[0] != "list_bases"]
+
+
+@pytest.mark.parametrize("name,path", _KNOWLEDGE_DETAIL_GETS)
+@pytest.mark.asyncio
+async def test_knowledge_detail_tenant_id_star_400(setup: Setup, name: str, path: str) -> None:
+    resp = await setup[0].get(path, params={"tenant_id": "*"})
+    assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+@pytest.mark.asyncio
+async def test_knowledge_test_retrieval_tenant_id_star_400(setup: Setup) -> None:
+    resp = await setup[0].post(
+        "/v1/knowledge/bases/kb/test", params={"tenant_id": "*"}, json={"query": "x"}
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
