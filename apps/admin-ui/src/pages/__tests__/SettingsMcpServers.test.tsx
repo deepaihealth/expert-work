@@ -9,6 +9,19 @@ import { SettingsMcpServers } from "../SettingsMcpServers";
 import * as serversSdk from "../../api/mcp-servers";
 import type { McpServer } from "../../api/mcp-servers";
 
+// Cross-tenant W3 — the page reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (switchable per test;
+// undefined = home state).
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
+}));
+
 const listMock = vi.spyOn(serversSdk, "listMcpServers");
 const availMock = vi.spyOn(serversSdk, "listAvailableMcpServers");
 const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");
@@ -22,6 +35,7 @@ beforeEach(async () => {
   listMock.mockReset();
   availMock.mockReset();
   toolsMock.mockReset();
+  mockScope = undefined;
 });
 
 const custom: McpServer = {
@@ -154,5 +168,16 @@ describe("SettingsMcpServers unified list", () => {
     );
     fireEvent.click(screen.getByTestId("ms-test-my-custom"));
     await waitFor(() => expect(toolsMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("threads the ambient tenant scope into both list reads (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    listMock.mockResolvedValue([custom]);
+    availMock.mockResolvedValue([]);
+
+    renderPage();
+
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith(mockScope));
+    expect(availMock).toHaveBeenCalledWith(mockScope);
   });
 });

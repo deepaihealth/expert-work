@@ -39,6 +39,7 @@ import {
 } from "../api/mcp-servers";
 import { disablePlatformServer } from "../api/mcp-catalog";
 import { ApiError } from "../api/client";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { CreateMcpServerDrawer } from "../components/CreateMcpServerDrawer";
 import { AddMcpServerDrawer } from "../components/mcp_catalog/AddMcpServerDrawer";
 import { PageHeader } from "../components/PageHeader";
@@ -60,6 +61,9 @@ export function SettingsMcpServers() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const navigate = useNavigate();
+  // Cross-tenant W3 — lists ride the ambient scope; the per-server tools
+  // probe is a detail read (concrete UUID only, "*" 400s).
+  const { apiTenantScope } = useTenantScope();
 
   const [rows, setRows] = useState<UnifiedRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -84,8 +88,8 @@ export function SettingsMcpServers() {
     // (``/available``) is supplementary — degrade to no platform rows if it
     // fails rather than blanking the whole page on a partial outage.
     Promise.all([
-      listMcpServers(),
-      listAvailableMcpServers().catch(() => [] as AvailableMcpServer[]),
+      listMcpServers(apiTenantScope),
+      listAvailableMcpServers(apiTenantScope).catch(() => [] as AvailableMcpServer[]),
     ]).then(
       ([servers, available]) => {
         setRows(buildUnifiedRows(servers, available));
@@ -96,7 +100,7 @@ export function SettingsMcpServers() {
         setLoading(false);
       },
     );
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     reload();
@@ -116,7 +120,7 @@ export function SettingsMcpServers() {
       if (!opts?.force && current?.kind === "connected") return;
       setProbes((prev) => ({ ...prev, [key]: { kind: "testing" } }));
       try {
-        const tools = await listMcpServerTools(name);
+        const tools = await listMcpServerTools(name, concreteTenantScope(apiTenantScope));
         setProbes((prev) => ({
           ...prev,
           [key]: { kind: "connected", count: tools.length, tools },
@@ -125,7 +129,7 @@ export function SettingsMcpServers() {
         setProbes((prev) => ({ ...prev, [key]: { kind: "unreachable" } }));
       }
     },
-    [],
+    [apiTenantScope],
   );
 
   const handleToggle = useCallback(

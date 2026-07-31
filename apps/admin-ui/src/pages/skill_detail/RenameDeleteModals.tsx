@@ -12,6 +12,7 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../../api/client";
 import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -38,6 +39,8 @@ export function RenameModal({
 }: RenameModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — the pre-rename read is scope-aware (writes are not).
+  const { apiTenantScope } = useTenantScope();
   const [form] = Form.useForm<{ newPath: string }>();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +67,12 @@ export function RenameModal({
 
     setSubmitting(true);
     try {
-      const original = await api.getSupportingFile(skillId, versionNumber, oldPath);
+      const original = await api.getSupportingFile(
+        skillId,
+        versionNumber,
+        oldPath,
+        concreteTenantScope(apiTenantScope),
+      );
       const newVersion = await api.renameSupportingFile(
         skillId,
         versionNumber,
@@ -96,6 +104,7 @@ export function RenameModal({
     skillId,
     t,
     versionNumber,
+    apiTenantScope,
   ]);
 
   return (

@@ -935,7 +935,8 @@ describe("PlaygroundTab", () => {
       await screen.findByTestId("playground-workspace-file-download"),
     );
     await waitFor(() =>
-      expect(downloadFileMock).toHaveBeenCalledWith("report.pdf"),
+      // W3 — trailing (userId, tenantScope) both undefined in the home state.
+      expect(downloadFileMock).toHaveBeenCalledWith("report.pdf", undefined, undefined),
     );
   });
 
@@ -963,8 +964,9 @@ describe("PlaygroundTab", () => {
     const panel = await screen.findByTestId("playground-workspace");
     expect(panel).toHaveTextContent("expert-work-ws-t-u");
     expect(panel).toHaveTextContent("out.txt");
-    // ...and the load was keyed on the caller, not a thread id.
-    expect(getWorkspaceMock).toHaveBeenCalledWith();
+    // ...and the load was keyed on the caller, not a thread id. W3 —
+    // trailing (userId, tenantScope) both undefined in the home state.
+    expect(getWorkspaceMock).toHaveBeenCalledWith(undefined, undefined);
   });
 
   it("surfaces an approval gate, approves, and streams the continuation", async () => {

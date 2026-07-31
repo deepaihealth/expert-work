@@ -45,6 +45,7 @@ import {
   type SupportingFileBody,
 } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { SKILL_MD_PATH } from "./FileTree";
 
 const { Text } = Typography;
@@ -117,6 +118,8 @@ export function FileEditor({
 }: FileEditorProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — supporting-file read: concrete UUID only ("*" 400s).
+  const { apiTenantScope } = useTenantScope();
 
   const [loaded, setLoaded] = useState<LoadedFile | null>(null);
   const [loading, setLoading] = useState(false);
@@ -150,7 +153,12 @@ export function FileEditor({
     let cancelled = false;
     void (async () => {
       try {
-        const body = await api.getSupportingFile(skillId, version.version, selectedPath);
+        const body = await api.getSupportingFile(
+          skillId,
+          version.version,
+          selectedPath,
+          concreteTenantScope(apiTenantScope),
+        );
         if (cancelled) return;
         const text = decodeBase64Utf8(body.content);
         setLoaded({ path: selectedPath, body, text });
@@ -173,7 +181,7 @@ export function FileEditor({
     return () => {
       cancelled = true;
     };
-  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange]);
+  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange, apiTenantScope]);
 
   const isSkillMd = selectedPath === SKILL_MD_PATH;
   const isBinary = loaded !== null && loaded.text === null;

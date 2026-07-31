@@ -37,6 +37,7 @@ import {
   listPlatformCatalog,
   listCatalogTools,
 } from "../../../api/mcp-catalog";
+import { concreteTenantScope, useTenantScope } from "../../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -70,6 +71,9 @@ export function McpToolPicker({
   source = "available",
 }: McpToolPickerProps) {
   const { t } = useTranslation();
+  // Cross-tenant W3 — tenant-server list rides the ambient scope; the
+  // per-server tools probe is a detail read (concrete UUID only).
+  const { apiTenantScope } = useTenantScope();
 
   const [rows, setRows] = useState<ServerRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -97,7 +101,7 @@ export function McpToolPicker({
                 toolKey: e.id,
               })),
           )
-        : listAvailableMcpServers().then((data) =>
+        : listAvailableMcpServers(apiTenantScope).then((data) =>
             data.map((s) => ({
               name: s.name,
               label: s.name,
@@ -124,7 +128,7 @@ export function McpToolPicker({
     return () => {
       alive = false;
     };
-  }, [source, t]);
+  }, [source, t, apiTenantScope]);
 
   // ── Per-server tool fetch ────────────────────────────────────────────────
   const fetchTools = useCallback(
@@ -141,7 +145,7 @@ export function McpToolPicker({
                     .map((x) => ({ name: x.name, description: x.description }))
                 : Promise.reject(new Error(res.error ?? "unreachable")),
             )
-          : listMcpServerTools(row.toolKey);
+          : listMcpServerTools(row.toolKey, concreteTenantScope(apiTenantScope));
       req.then(
         (tools) =>
           setToolStates((prev) => ({
@@ -152,7 +156,7 @@ export function McpToolPicker({
           setToolStates((prev) => ({ ...prev, [row.name]: { kind: "error" } })),
       );
     },
-    [toolStates, source],
+    [toolStates, source, apiTenantScope],
   );
 
   // Pre-load tools for already-selected servers (from the manifest) so their

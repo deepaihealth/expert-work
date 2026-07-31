@@ -19,6 +19,19 @@ import * as evalSdk from "../../api/eval_runs";
 import { EvalRunsList } from "../EvalRunsList";
 import type { EvalRunRecord } from "../../api/eval_runs";
 
+// Cross-tenant W3 — override the hook only (the real TenantScopeProvider in
+// renderPage keeps working via the importOriginal spread); switchable per
+// test, undefined = home state.
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
+}));
+
 function run(overrides: Partial<EvalRunRecord> = {}): EvalRunRecord {
   return {
     id: crypto.randomUUID(),
@@ -47,7 +60,10 @@ function renderPage() {
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  mockScope = undefined;
+});
 
 describe("EvalRunsList", () => {
   it("renders runs from the SDK", async () => {
@@ -83,5 +99,20 @@ describe("EvalRunsList", () => {
     vi.spyOn(evalSdk, "listEvalRuns").mockRejectedValue(new Error("boom"));
     renderPage();
     await waitFor(() => expect(screen.getByTestId("eval-error")).toBeInTheDocument());
+  });
+
+  it("threads the ambient tenant scope into listEvalRuns (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    const listMock = vi
+      .spyOn(evalSdk, "listEvalRuns")
+      .mockResolvedValue({ items: [], total: 0 });
+
+    renderPage();
+
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith(
+        expect.objectContaining({ tenantScope: mockScope }),
+      ),
+    );
   });
 });

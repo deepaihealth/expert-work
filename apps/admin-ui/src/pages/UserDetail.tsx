@@ -236,7 +236,12 @@ function MemoryPane({ userId }: { userId: string }) {
 
 function UsagePane({ userId }: { userId: string }) {
   const { t } = useTranslation();
-  const load = useCallback(() => getUsageTokens({ userId }), [userId]);
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
+  const load = useCallback(
+    () => getUsageTokens({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
+    [userId, apiTenantScope],
+  );
   const { data, loading, error } = useLoad(load);
 
   if (loading) return <Skeleton active paragraph={{ rows: 3 }} />;

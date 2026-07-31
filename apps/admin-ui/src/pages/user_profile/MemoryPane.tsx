@@ -32,6 +32,7 @@ import {
   type MemoryKind,
   type MemoryList,
 } from "../../api/memory";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { errMessage } from "./useLoad";
 
 const { Text } = Typography;
@@ -42,6 +43,8 @@ export function MemoryPane({ userId }: { userId: string }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const navigate = useNavigate();
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
 
   const [data, setData] = useState<MemoryList | null>(null);
   const [loading, setLoading] = useState(true);
@@ -58,13 +61,19 @@ export function MemoryPane({ userId }: { userId: string }) {
     setLoading(true);
     setError(null);
     try {
-      setData(await listMemories({ userId, as_of: asOf ?? undefined }));
+      setData(
+        await listMemories({
+          userId,
+          as_of: asOf ?? undefined,
+          tenantScope: concreteTenantScope(apiTenantScope),
+        }),
+      );
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [userId, asOf]);
+  }, [userId, asOf, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

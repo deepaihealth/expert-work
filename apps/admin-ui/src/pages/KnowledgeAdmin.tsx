@@ -35,7 +35,7 @@ function errMessage(err: unknown): string {
 export function KnowledgeAdmin() {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  const { scope } = useTenantScope();
+  const { scope, apiTenantScope } = useTenantScope();
   const navigate = useNavigate();
 
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
@@ -47,13 +47,13 @@ export function KnowledgeAdmin() {
     setLoading(true);
     setError(null);
     try {
-      setBases(await listBases());
+      setBases(await listBases(apiTenantScope));
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     void refresh();

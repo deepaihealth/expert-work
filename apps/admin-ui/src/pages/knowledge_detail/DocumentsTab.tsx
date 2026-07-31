@@ -23,6 +23,7 @@ import {
   type KnowledgeDocument,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
 
 const { Text } = Typography;
@@ -47,6 +48,8 @@ function errMessage(err: unknown): string {
 export function DocumentsTab({ baseName }: { baseName: string }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — subordinate detail read: concrete UUID only ("*" 400s).
+  const { apiTenantScope } = useTenantScope();
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(false);
@@ -58,14 +61,14 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
     async ({ quiet = false }: { quiet?: boolean } = {}) => {
       if (!quiet) setLoading(true);
       try {
-        setDocuments(await listDocuments(baseName));
+        setDocuments(await listDocuments(baseName, concreteTenantScope(apiTenantScope)));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
         if (!quiet) setLoading(false);
       }
     },
-    [baseName, message],
+    [baseName, message, apiTenantScope],
   );
 
   useEffect(() => {

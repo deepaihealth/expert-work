@@ -31,6 +31,7 @@ import {
   type RetrievalTestResult,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text, Paragraph } = Typography;
 
@@ -51,6 +52,8 @@ const RECALL_COLOR: Record<string, string> = {
 export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — read-only probe on the switched-in tenant's base.
+  const { apiTenantScope } = useTenantScope();
 
   const config = base.retrieval_config;
   const [query, setQuery] = useState("");
@@ -66,13 +69,17 @@ export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
     if (!query.trim()) return;
     setRunning(true);
     try {
-      const response = await testRetrieval(base.name, {
-        query: query.trim(),
-        top_k: topK,
-        method,
-        score_threshold: threshold,
-        rerank,
-      });
+      const response = await testRetrieval(
+        base.name,
+        {
+          query: query.trim(),
+          top_k: topK,
+          method,
+          score_threshold: threshold,
+          rerank,
+        },
+        concreteTenantScope(apiTenantScope),
+      );
       setResults(response.results);
     } catch (err) {
       const detail =
@@ -83,7 +90,7 @@ export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
     } finally {
       setRunning(false);
     }
-  }, [base.name, query, topK, method, threshold, rerank, t, message]);
+  }, [base.name, query, topK, method, threshold, rerank, t, message, apiTenantScope]);
 
   return (
     <div data-testid="knowledge-test-tab">

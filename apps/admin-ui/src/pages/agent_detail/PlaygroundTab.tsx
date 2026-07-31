@@ -655,8 +655,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     setWorkspaceLoading(true);
     try {
       const [ws, fs] = await Promise.all([
-        getUserWorkspace(),
-        getUserWorkspaceFiles().catch(() => [] as WorkspaceFile[]),
+        getUserWorkspace(undefined, concreteTenantScope(apiTenantScope)),
+        getUserWorkspaceFiles(undefined, concreteTenantScope(apiTenantScope)).catch(
+          () => [] as WorkspaceFile[],
+        ),
       ]);
       setWorkspace(ws);
       setWorkspaceFiles(fs);
@@ -666,19 +668,19 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     } finally {
       setWorkspaceLoading(false);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   const handleDownloadFile = useCallback(async (path: string) => {
     setDownloadingPath(path);
     try {
-      await downloadUserWorkspaceFile(path);
+      await downloadUserWorkspaceFile(path, undefined, concreteTenantScope(apiTenantScope));
     } catch {
       // Swallow — the file may have been removed between list + click; the
       // refresh button re-syncs. A toast here would need the App message API.
     } finally {
       setDownloadingPath(null);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   const handleDownloadArtifact = useCallback(
     async (name: string) => {

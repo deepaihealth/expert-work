@@ -27,6 +27,7 @@ import {
   listConversations,
   type ConversationListItem,
 } from "../../api/conversations";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { formatCompact } from "../../utils/runFormat";
 import { useLoad } from "./useLoad";
 
@@ -46,13 +47,13 @@ export function ConversationsPane({ userId }: { userId: string }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
 
   const [agentName, setAgentName] = useState<string | undefined>(undefined);
   const [since, setSince] = useState<string | undefined>(undefined);
   const [agentNames, setAgentNames] = useState<string[]>([]);
 
-  // The user-detail drill-down is caller-home-tenant-scoped (see Users.tsx) —
-  // no tenant scope threaded, so every pane queries the same tenant.
   // Populate the agent filter once (distinct names across versions).
   useEffect(() => {
     let cancelled = false;
@@ -70,8 +71,15 @@ export function ConversationsPane({ userId }: { userId: string }) {
   }, []);
 
   const load = useCallback(
-    () => listConversations({ userId, agentName, since }),
-    [userId, agentName, since],
+    // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+    () =>
+      listConversations({
+        userId,
+        agentName,
+        since,
+        tenantScope: concreteTenantScope(apiTenantScope),
+      }),
+    [userId, agentName, since, apiTenantScope],
   );
   const { data, loading, error } = useLoad(load);
 

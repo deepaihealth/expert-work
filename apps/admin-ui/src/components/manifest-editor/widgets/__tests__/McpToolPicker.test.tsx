@@ -7,6 +7,17 @@ import { McpToolPicker } from "../McpToolPicker";
 import * as serversSdk from "../../../../api/mcp-servers";
 import * as catalogSdk from "../../../../api/mcp-catalog";
 
+// Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (home state: no scope).
+vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 const availableMock = vi.spyOn(serversSdk, "listAvailableMcpServers");
 const catalogMock = vi.spyOn(catalogSdk, "listPlatformCatalog");
 const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");

@@ -39,7 +39,7 @@ import {
   type CurationSignal,
 } from "../../api/curation";
 import { ApiError } from "../../api/client";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -106,14 +106,15 @@ export function CandidatesPanel() {
     setDetailLoading(true);
     setSelected(null);
     try {
-      const detail = await getCandidate(record.id);
+      // Detail read takes a concrete UUID only ("*" 400s).
+      const detail = await getCandidate(record.id, concreteTenantScope(apiTenantScope));
       setSelected(detail);
     } catch (err) {
       message.error(err instanceof Error ? err.message : "failed to load");
     } finally {
       setDetailLoading(false);
     }
-  }, [message]);
+  }, [message, apiTenantScope]);
 
   const onDismiss = useCallback(async (id: string) => {
     try {

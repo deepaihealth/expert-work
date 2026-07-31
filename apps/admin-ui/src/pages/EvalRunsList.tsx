@@ -29,6 +29,7 @@ import {
 import { ApiError } from "../api/client";
 import type { RunStatus } from "../api/runs";
 import { useStatusPolling } from "../hooks/useStatusPolling";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 
 const { Text } = Typography;
@@ -65,6 +66,8 @@ export function EvalRunsList() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const navigate = useNavigate();
+  // Cross-tenant W3 — the list is scope-aware ("*" aggregates every tenant).
+  const { apiTenantScope } = useTenantScope();
   const [data, setData] = useState<EvalRunList | null>(null);
   const [loading, setLoading] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
@@ -86,14 +89,14 @@ export function EvalRunsList() {
         setError(null);
       }
       try {
-        setData(await listEvalRuns({ status: statusFilter }));
+        setData(await listEvalRuns({ status: statusFilter, tenantScope: apiTenantScope }));
       } catch (err) {
         setError(toMessage(err));
       } finally {
         if (!silent) setLoading(false);
       }
     },
-    [statusFilter],
+    [statusFilter, apiTenantScope],
   );
 
   useEffect(() => {

@@ -15,6 +15,19 @@ import { SettingsQuality } from "../SettingsQuality";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
 
+// Cross-tenant W3 — the page reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (switchable per test;
+// undefined = home state).
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
+}));
+
 const TENANT = "00000000-0000-0000-0000-00000000acme";
 
 function makeJwt(payload: Record<string, unknown>): string {
@@ -113,6 +126,7 @@ function renderPage() {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  mockScope = undefined;
 });
 
 describe("SettingsQuality page", () => {
@@ -186,5 +200,32 @@ describe("SettingsQuality page", () => {
     await waitFor(() =>
       expect(screen.getByTestId("quality-error")).toBeInTheDocument(),
     );
+  });
+
+  it("threads the switched tenant scope onto both quality reads (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    const seen: Record<string, Record<string, unknown> | undefined> = {};
+    apiClient.defaults.adapter = (config) => {
+      const url = config.url ?? "";
+      let data: unknown = {};
+      if (url.endsWith("/quality/scores")) {
+        seen.scores = config.params as Record<string, unknown>;
+        data = { items: [] };
+      } else if (url.endsWith("/quality/drift-alerts")) {
+        seen.alerts = config.params as Record<string, unknown>;
+        data = { items: [] };
+      }
+      return Promise.resolve({
+        data,
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+    renderPage();
+    await waitFor(() => expect(seen.scores?.tenant_id).toBe(mockScope));
+    expect(seen.alerts?.tenant_id).toBe(mockScope);
   });
 });

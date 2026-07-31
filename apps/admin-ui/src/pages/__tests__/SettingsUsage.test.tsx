@@ -16,6 +16,19 @@ import { SettingsUsage } from "../SettingsUsage";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
 
+// Cross-tenant W3 — the page reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (switchable per test;
+// undefined = home state).
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
+}));
+
 const TENANT = "00000000-0000-0000-0000-00000000acme";
 
 function makeJwt(payload: Record<string, unknown>): string {
@@ -131,6 +144,7 @@ function renderUsage() {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  mockScope = undefined;
 });
 
 describe("SettingsUsage page", () => {
@@ -218,5 +232,34 @@ describe("usage kind split (SE-A43)", () => {
     expect(within(kindTable).getByText(/技能自进化|Skill evolution/)).toBeInTheDocument();
     expect(within(kindTable).getByText("300")).toBeInTheDocument();
     expect(within(kindTable).getByText(/对话|Conversation/)).toBeInTheDocument();
+  });
+});
+
+describe("cross-tenant W3 scope passthrough", () => {
+  it("threads the switched tenant scope onto both usage reads", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    const seen: Record<string, Record<string, unknown> | undefined> = {};
+    apiClient.defaults.adapter = (config) => {
+      const url = config.url ?? "";
+      let data: unknown = {};
+      if (url.endsWith("/usage/cost")) {
+        seen.cost = config.params as Record<string, unknown>;
+        data = { success: true, data: COST, error: null };
+      } else if (url.endsWith("/usage/tokens")) {
+        seen.tokens = config.params as Record<string, unknown>;
+        data = { success: true, data: TOKENS, error: null };
+      }
+      return Promise.resolve({
+        data,
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+    renderUsage();
+    await waitFor(() => expect(seen.cost?.tenant_id).toBe(mockScope));
+    expect(seen.tokens?.tenant_id).toBe(mockScope);
   });
 });

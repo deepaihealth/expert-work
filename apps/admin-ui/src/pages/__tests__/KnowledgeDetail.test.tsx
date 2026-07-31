@@ -15,6 +15,17 @@ import "../../i18n";
 import * as knowledgeSdk from "../../api/knowledge";
 import { KnowledgeDetail } from "../KnowledgeDetail";
 
+// Cross-tenant W3 — the page reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (home state: no scope).
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 const BASE: knowledgeSdk.KnowledgeBase = {
   id: "11111111-1111-1111-1111-111111111111",
   name: "support-docs",
@@ -134,6 +145,8 @@ describe("KnowledgeDetail", () => {
     expect(testSpy).toHaveBeenCalledWith(
       "support-docs",
       expect.objectContaining({ query: "deductible" }),
+      // W3 — trailing tenantScope is undefined in the home state.
+      undefined,
     );
     expect(screen.getByText("faq.pdf#0")).toBeInTheDocument();
     expect(screen.getByText("The deductible is 500.")).toBeInTheDocument();
