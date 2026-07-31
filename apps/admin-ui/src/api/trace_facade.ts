@@ -4,7 +4,7 @@
  * Consumes ``GET /v1/sessions/{thread_id}/runs/{run_id}/trace`` (raw payload,
  * no envelope — matching the pattern in :func:`getRun`).
  */
-import { apiClient } from "./client";
+import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 export type TraceStatus = "ok" | "not_ready" | "unavailable" | "no_trace";
 
@@ -70,9 +70,11 @@ export interface RunTrace {
 export async function getRunTrace(
   threadId: string,
   runId: string,
+  tenantScope?: TenantScope,
 ): Promise<RunTrace> {
   const response = await apiClient.get<RunTrace>(
     `/v1/sessions/${threadId}/runs/${runId}/trace`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -87,9 +89,14 @@ export async function fetchRunTraceRaw(
   runId: string,
   spanId: string,
   field: "input" | "output",
+  tenantScope?: TenantScope,
 ): Promise<string> {
+  // Hand-built query string — append tenant_id manually (Track C W2);
+  // ``undefined`` omits it so existing callers see an identical URL.
+  const tenantQs =
+    tenantScope !== undefined ? `&tenant_id=${encodeURIComponent(tenantScope)}` : "";
   const response = await apiClient.get<{ spanId: string; field: string; content: string }>(
-    `/v1/sessions/${threadId}/runs/${runId}/trace/raw?span=${encodeURIComponent(spanId)}&field=${field}`,
+    `/v1/sessions/${threadId}/runs/${runId}/trace/raw?span=${encodeURIComponent(spanId)}&field=${field}${tenantQs}`,
   );
   return response.data.content;
 }

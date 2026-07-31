@@ -9,7 +9,12 @@ import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { apiClient } from "../client";
 import { fetchRunTraceRaw, getRunTrace, type RunTrace } from "../trace_facade";
 
-vi.mock("../client");
+// Keep the real ``withTenantScope`` (getRunTrace threads it into ``params``);
+// only the axios instance is mocked.
+vi.mock("../client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../client")>()),
+  apiClient: { get: vi.fn() },
+}));
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -32,7 +37,9 @@ describe("getRunTrace", () => {
 
     const result = await getRunTrace("thread-123", "run-456");
 
-    expect(apiClient.get).toHaveBeenCalledWith("/v1/sessions/thread-123/runs/run-456/trace");
+    expect(apiClient.get).toHaveBeenCalledWith("/v1/sessions/thread-123/runs/run-456/trace", {
+      params: {},
+    });
     expect(result).toEqual(mockTrace);
   });
 

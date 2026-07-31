@@ -6,7 +6,7 @@
  * ``GET /v1/sessions/{thread_id}/runs/{run_id}`` is one of the few
  * endpoints that returns the raw payload (no envelope) — see :func:`getRun`.
  */
-import { apiClient, unwrap, type ApiEnvelope } from "./client";
+import { apiClient, unwrap, withTenantScope, type ApiEnvelope, type TenantScope } from "./client";
 
 export type RunStatus =
   // Server-side ``RunStatus`` enum (expert_work.runtime.runs.RunStatus).
@@ -80,13 +80,18 @@ export interface RunDetail {
 
 /** Raw (no envelope) fetch — runs.py historically returns the run
  *  status directly. Keeping this endpoint un-enveloped to match
- *  Mini-ADR J-41; ADR refresh PR would normalise. */
+ *  Mini-ADR J-41; ADR refresh PR would normalise.
+ *
+ *  ``tenantScope`` (Track C W2) carries the concrete tenant id when a
+ *  system_admin has switched into a foreign tenant; ``undefined`` = home. */
 export async function getRun(
   threadId: string,
   runId: string,
+  tenantScope?: TenantScope,
 ): Promise<RunDetail> {
   const response = await apiClient.get<RunDetail>(
     `/v1/sessions/${threadId}/runs/${runId}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -123,7 +128,10 @@ export async function resumeRun(
  *  know which mode it got.
  *
  *  ``sinceSeq`` is Last-Event-ID semantics: ``undefined`` returns the
- *  stream from the beginning; ``N`` returns events with ``seq > N``. */
+ *  stream from the beginning; ``N`` returns events with ``seq > N``.
+ *
+ *  ``tenantScope`` (Track C W2) — hand-built URL, so ``tenant_id`` is
+ *  appended manually (cf. ``listThreadRuns``); ``undefined`` omits it. */
 export async function* streamRunEvents(
   threadId: string,
   runId: string,
@@ -131,11 +139,13 @@ export async function* streamRunEvents(
     sinceSeq?: number;
     signal?: AbortSignal;
     baseUrl?: string;
+    tenantScope?: TenantScope;
   } = {},
 ): AsyncGenerator<import("./sessions").SseEvent, void, void> {
-  const { sinceSeq, signal, baseUrl = "" } = options;
+  const { sinceSeq, signal, baseUrl = "", tenantScope } = options;
   const params = new URLSearchParams();
   if (sinceSeq !== undefined) params.set("since_seq", String(sinceSeq));
+  if (tenantScope !== undefined) params.set("tenant_id", tenantScope);
   const qs = params.toString();
   const url =
     `${baseUrl}/v1/sessions/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/events` +

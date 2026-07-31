@@ -80,9 +80,13 @@ export function filenameFromDisposition(header: string | undefined, fallback: st
  *  ``window.open`` would arrive unauthenticated) and hand it to the
  *  browser via an object URL. Returns the saved filename. ``userId``
  *  is the tenant-admin governance target (H.8-F1). */
-export async function downloadArtifact(name: string, userId?: string): Promise<string> {
+export async function downloadArtifact(
+  name: string,
+  userId?: string,
+  tenantScope?: TenantScope,
+): Promise<string> {
   const response = await apiClient.get<Blob>("/v1/artifacts/download", {
-    params: { name, user_id: userId },
+    params: withTenantScope({ name, user_id: userId }, tenantScope),
     responseType: "blob",
   });
   const disposition = (response.headers as Record<string, string | undefined>)[
@@ -130,10 +134,11 @@ export async function patchArtifactKind(
 export async function listArtifactVersions(
   name: string,
   userId?: string,
+  tenantScope?: TenantScope,
 ): Promise<ArtifactVersionList> {
   const response = await apiClient.get<ArtifactVersionList>(
     `/v1/artifacts/${encodeURIComponent(name)}/versions`,
-    { params: { user_id: userId } },
+    { params: withTenantScope({ user_id: userId }, tenantScope) },
   );
   return response.data;
 }
