@@ -22,7 +22,7 @@ images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newTag: c304294a
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newTag: 045ca088-test
+    newTag: 3520c2d7-test
   # The cluster VPC cannot reach docker.io / quay.io (dial timeout — same
   # constraint W0 hit with probe pods), so base's upstream keycloak and
   # searxng images are remapped to ACR mirror copies pushed from a dev
@@ -36,7 +36,13 @@ images:
     newTag: "2026-07-29"
   # W2-PR3 — observability + Langfuse mirrors (same docker.io-unreachable
   # constraint; pushed by tools/deploy/mirror script from a dev machine).
+  # clickhouse + otel-collector carry an -r1 suffix: their original tags
+  # were first pushed as arm64 by mistake (containerd store push picks
+  # the host arch — exec format error on cluster) and MAY be cached
+  # tag-level by ACS; a fresh tag guarantees the amd64 bits (same rule
+  # as the `-rN` release convention above).
   - name: otel/opentelemetry-collector
+    newTag: 0.119.0-r1
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
   - name: prom/prometheus
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
@@ -47,6 +53,7 @@ images:
   - name: prom/alertmanager
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
   - name: clickhouse/clickhouse-server
+    newTag: 24.12-alpine-r1
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
   - name: langfuse/langfuse
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
