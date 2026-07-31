@@ -47,6 +47,7 @@ import {
   type SkillVisibility,
 } from "../api/skills";
 import { ApiError } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
@@ -86,6 +87,9 @@ export function SkillsList() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — home tenant for the aggregate row-jump: a foreign
+  // row carries its owning tenant into the detail URL (see onRow below).
+  const { identity } = useAuth();
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -418,7 +422,18 @@ export function SkillsList() {
           record.source === "platform"
             ? {}
             : {
-                onClick: () => navigate(`/skills/${encodeURIComponent(record.id)}`),
+                onClick: () => {
+                  // Cross-tenant W3 — in the "*" aggregate a foreign-tenant
+                  // row would 404 (getSkill falls back to the home tenant),
+                  // so carry the row's owning tenant into the detail URL.
+                  // Field absent = pre-W3 backend → keep the old behavior.
+                  const query =
+                    record.tenant_id !== undefined &&
+                    record.tenant_id !== identity?.homeTenantId
+                      ? `?tenant_id=${encodeURIComponent(record.tenant_id)}`
+                      : "";
+                  navigate(`/skills/${encodeURIComponent(record.id)}${query}`);
+                },
                 style: { cursor: "pointer" },
               }
         }

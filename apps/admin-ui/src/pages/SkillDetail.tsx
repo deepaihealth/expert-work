@@ -43,7 +43,7 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
@@ -113,9 +113,14 @@ export function SkillDetail({
   const { skillId } = useParams<{ skillId: string }>();
   const { identity } = useAuth();
   // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 400s).
-  // The platform facade ignores the scope (platform skills are tenant-less).
+  // Priority: the ``?tenant_id=`` query param (set by the SkillsList "*"
+  // aggregate row-jump — the ambient scope is "*" there, which collapses
+  // to undefined) wins over the ambient switched-in scope. The platform
+  // facade ignores the scope (platform skills are tenant-less).
   const { apiTenantScope } = useTenantScope();
-  const readScope = concreteTenantScope(apiTenantScope);
+  const [searchParams] = useSearchParams();
+  const readScope =
+    searchParams.get("tenant_id") ?? concreteTenantScope(apiTenantScope);
   const isPlatform = variant === "platform";
   const statusOptions = isPlatform ? PLATFORM_STATUS_OPTIONS : STATUS_OPTIONS;
   const backLink = backTo ?? { label: t("nav.skills"), to: "/skills" };
