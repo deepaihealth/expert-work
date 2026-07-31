@@ -120,7 +120,7 @@ if tenant_id == "*":
     })
 scope = await ensure_tenant_scope(
     principal, tenant_id, audit,
-    trace_id=current_trace_id_hex(), endpoint=<route>, 
+    trace_id=current_trace_id_hex(), endpoint=<route>,
     cross_tenant_enabled=cross_tenant_query_enabled(request),
 )
 async with applied_scope(scope):
