@@ -19,6 +19,17 @@ import { ConversationsTab } from "../agent_detail/ConversationsTab";
 import { SkillsTab } from "../agent_detail/SkillsTab";
 import { TriggersTab } from "../agent_detail/TriggersTab";
 
+// Stream N — the tabs read the ambient tenant scope; these tests don't
+// mount a TenantScopeProvider, so mock it (home state: no scope override).
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 const detail: AgentDetailResponse = {
   record: {
     id: "11111111-1111-1111-1111-111111111111",
