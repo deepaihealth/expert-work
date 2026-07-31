@@ -58,6 +58,7 @@ import {
 } from "../api/agents";
 import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateAgentModal } from "../components/CreateAgentModal";
 import { DeleteAgentModal } from "../components/DeleteAgentModal";
 import { PageHeader } from "../components/PageHeader";
@@ -107,6 +108,9 @@ function AgentRowActions({
 }) {
   const { t } = useTranslation();
   const { message, modal } = App.useApp();
+  // Track C W2 — 切入态只读:删除/禁用/启用是写操作,而且按 name 打到
+  // 归属租户(不带 tenant_id)——切入态下会误伤自家同名 Agent,必须置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [disabled, setDisabled] = useState<boolean | null>(null);
 
   const loadDisabledState = useCallback(() => {
@@ -189,19 +193,44 @@ function AgentRowActions({
             ? {
                 key: "enable",
                 icon: <CircleCheck size={14} strokeWidth={1.5} />,
-                label: t("agents_page.action_enable"),
+                disabled: isTenantSwitched,
+                label: (
+                  <Tooltip
+                    title={
+                      isTenantSwitched ? t("common.tenant_switched_readonly") : undefined
+                    }
+                  >
+                    {t("agents_page.action_enable")}
+                  </Tooltip>
+                ),
               }
             : {
                 key: "disable",
                 icon: <Ban size={14} strokeWidth={1.5} />,
-                label: t("agents_page.action_disable"),
+                disabled: isTenantSwitched,
+                label: (
+                  <Tooltip
+                    title={
+                      isTenantSwitched ? t("common.tenant_switched_readonly") : undefined
+                    }
+                  >
+                    {t("agents_page.action_disable")}
+                  </Tooltip>
+                ),
               },
           { type: "divider" as const },
           {
             key: "delete",
             danger: true,
             icon: <Trash2 size={14} strokeWidth={1.5} />,
-            label: t("agents_page.action_delete"),
+            disabled: isTenantSwitched,
+            label: (
+              <Tooltip
+                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+              >
+                {t("agents_page.action_delete")}
+              </Tooltip>
+            ),
           },
         ],
         onClick: ({ key }) => {

@@ -34,6 +34,15 @@ vi.mock("@monaco-editor/react", () => {
   return { default: Editor };
 });
 
+// Track C W2 — 切入态 hook;这些测试不挂 Provider,mock 成 home 态;
+// ``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 import { ApiError } from "../../api/client";
 import * as agentsSdk from "../../api/agents";
 import * as schemaSdk from "../../api/manifest_schema";
@@ -97,6 +106,8 @@ function renderTab(detail: AgentDetailResponse = sampleDetail) {
 
 beforeEach(() => {
   onSaved.mockClear();
+  // vitest 4 的 restore 不复位 vi.fn 的 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
   updateAgentMock = vi.spyOn(agentsSdk, "updateAgent");
   __resetSchemaCacheForTest();
   __resetCatalogCacheForTest();
@@ -124,6 +135,16 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("manifest-save-btn")).toBeInTheDocument();
     expect(screen.getByTestId("manifest-reset-btn")).toBeInTheDocument();
     expect(screen.queryByTestId("manifest-edit-btn")).not.toBeInTheDocument();
+  });
+
+  // Track C W2 — 切入态只读:保存是写操作,置灰;Reset 只回本地缓冲,不置灰。
+  // 归属态可用由本文件其余 save 测试覆盖(两态断言)。
+  it("切入态置灰保存按钮", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderTab();
+    await waitFor(() => expect(screen.getByTestId("manifest-editor-edit")).toBeInTheDocument());
+    expect(screen.getByTestId("manifest-save-btn")).toBeDisabled();
+    expect(screen.getByTestId("manifest-reset-btn")).not.toBeDisabled();
   });
 
   it("exposes the raw YAML escape-hatch toggle", async () => {

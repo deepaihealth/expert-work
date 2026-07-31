@@ -15,8 +15,18 @@ const { Text } = Typography;
 /** SE-16 (SE-A46) — the per-turn 👍/👎 bar. 👍 submits immediately; 👎 opens
  *  a comment popover (the user's own words are the highest-value failure
  *  label for the distiller). One submission per turn; errors surface inline
- *  (fire-and-forget signal — never blocks the conversation). */
-export function FeedbackBar({ threadId, turnSeq }: { threadId: string; turnSeq: number }) {
+ *  (fire-and-forget signal — never blocks the conversation).
+ *
+ *  ``disabled`` (Track C W2) — 切入态只读:反馈是写操作,置灰两个按钮。 */
+export function FeedbackBar({
+  threadId,
+  turnSeq,
+  disabled = false,
+}: {
+  threadId: string;
+  turnSeq: number;
+  disabled?: boolean;
+}) {
   const { t } = useTranslation();
   const [submitted, setSubmitted] = useState<"up" | "down" | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,7 +65,7 @@ export function FeedbackBar({ threadId, turnSeq }: { threadId: string; turnSeq: 
       <Button
         type="text"
         size="small"
-        disabled={busy || submitted !== null}
+        disabled={disabled || busy || submitted !== null}
         onClick={() => void submit("up")}
         aria-label={t("playground.feedback_up")}
         data-testid="playground-feedback-up"
@@ -70,7 +80,7 @@ export function FeedbackBar({ threadId, turnSeq }: { threadId: string; turnSeq: 
       <Popover
         open={commentOpen}
         onOpenChange={(open) => {
-          if (submitted === null && !busy) setCommentOpen(open);
+          if (!disabled && submitted === null && !busy) setCommentOpen(open);
         }}
         trigger="click"
         content={
@@ -101,7 +111,7 @@ export function FeedbackBar({ threadId, turnSeq }: { threadId: string; turnSeq: 
         <Button
           type="text"
           size="small"
-          disabled={busy || submitted !== null}
+          disabled={disabled || busy || submitted !== null}
           aria-label={t("playground.feedback_down")}
           data-testid="playground-feedback-down"
           icon={

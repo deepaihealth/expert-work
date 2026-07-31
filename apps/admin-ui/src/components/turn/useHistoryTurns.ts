@@ -23,6 +23,7 @@ import {
   type SseEvent,
 } from "../../api/sessions";
 import { buildHistoryTurns } from "../../pages/agent_detail/playground/history_turns";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import type { HistoryLoad, HistoryTurn } from "./types";
 
 export interface UseHistoryTurns {
@@ -45,6 +46,9 @@ export interface UseHistoryTurns {
 }
 
 export function useHistoryTurns(): UseHistoryTurns {
+  // Track C W2 — 切入态读透传:replay 的事件流要带 ?tenant_id=
+  // (组件内直取,不穿 prop)。
+  const { apiTenantScope } = useTenantScope();
   // #6 — prior conversation loaded when resuming an existing thread.
   const [history, setHistory] = useState<HistoryMessage[]>([]);
   // 历史懒重建 — count-paired historical turns (null = not built / count
@@ -150,6 +154,7 @@ export function useHistoryTurns(): UseHistoryTurns {
       const collected: SseEvent[] = [];
       for await (const frame of streamRunEvents(threadId, runId, {
         signal: historyAbortRef.current?.signal,
+        tenantScope: concreteTenantScope(apiTenantScope),
       })) {
         collected.push(frame);
         if (frame.event === "end") break;
@@ -174,7 +179,7 @@ export function useHistoryTurns(): UseHistoryTurns {
     } catch {
       setHistoryLoads((prev) => ({ ...prev, [runId]: { state: "error", events: [] } }));
     }
-  }, []);
+  }, [apiTenantScope]);
 
   // Each history row's ref registers itself with a shared IntersectionObserver
   // (created lazily on first row); a row scrolling into view triggers its

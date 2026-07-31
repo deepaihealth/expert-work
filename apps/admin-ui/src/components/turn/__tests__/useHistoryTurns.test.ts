@@ -12,6 +12,17 @@ import * as sessionsSdk from "../../../api/sessions";
 import type { HistoryMessage, SseEvent } from "../../../api/sessions";
 import { useHistoryTurns } from "../useHistoryTurns";
 
+// Track C W2 — hook 内直取 tenant scope;renderHook 不挂 Provider,mock 成
+// home 态(apiTenantScope undefined)。
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 const getMessagesMock = vi.spyOn(sessionsSdk, "getSessionMessages");
 const listThreadRunsMock = vi.spyOn(runsSdk, "listThreadRuns");
 const streamRunEventsMock = vi.spyOn(runsSdk, "streamRunEvents");

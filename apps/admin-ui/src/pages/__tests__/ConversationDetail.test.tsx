@@ -24,12 +24,18 @@ import type { ConversationDetail as ConversationDetailModel } from "../../api/co
 
 // Mutable tenant scope for the page's ``useTenantScope()`` — the default
 // (undefined) keeps every pre-existing test on the caller's home tenant.
+// ``scope`` falls back to "home" so ``useIsTenantSwitched`` never reads an
+// undefined scope as a switched-in state.
 let mockScope: string | undefined;
 // Spread the real module so the page keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
 vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
 }));
 
 const THREAD_ID = "44444444-4444-4444-4444-444444444444";

@@ -24,6 +24,15 @@ import * as triggersSdk from "../../api/triggers";
 import * as uploadsSdk from "../../api/uploads";
 import { PlaygroundTab } from "../agent_detail/PlaygroundTab";
 import { AuthProvider } from "../../auth/AuthContext";
+import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
+
+// Track C W2 — 切入态只读:mock 掉判定 hook,两态断言直接翻转返回值。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
 import type { AgentDetailResponse } from "../../api/agents";
 import type { ApprovalItem } from "../../api/approvals";
 import type { SseEvent, ThreadMeta } from "../../api/sessions";
@@ -144,6 +153,9 @@ beforeEach(() => {
   listThreadRunsMock.mockReset();
   listThreadRunsMock.mockResolvedValue([]);
   fireTriggerNowMock.mockReset();
+  // Track C W2 — 默认 home 态;切入态测试自行翻 true(clearAllMocks 不清
+  // mockReturnValue,这里显式归位防串台)。
+  isTenantSwitchedMock.mockReturnValue(false);
   vi.stubGlobal("IntersectionObserver", IOStub);
 });
 
@@ -196,7 +208,9 @@ function renderPg(
   return render(
     <MemoryRouter>
       <AuthProvider>
-        <PlaygroundTab detail={detail} />
+        <TenantScopeProvider>
+          <PlaygroundTab detail={detail} />
+        </TenantScopeProvider>
       </AuthProvider>
     </MemoryRouter>,
   );
@@ -351,7 +365,7 @@ describe("PlaygroundTab", () => {
     const btn = await screen.findByTestId("playground-turn-artifact-download");
     expect(btn).toHaveTextContent("report.pdf");
     await user.click(btn);
-    expect(downloadArtifactMock).toHaveBeenCalledWith("report.pdf");
+    expect(downloadArtifactMock).toHaveBeenCalledWith("report.pdf", undefined, undefined);
   });
 
   it("exports the turn's authoritative event stream as JSON", async () => {
@@ -1377,6 +1391,7 @@ describe("PlaygroundTab", () => {
         expect(getRunTraceMock).toHaveBeenCalledWith(
           sampleThread.thread_id,
           "run-exact-1",
+          undefined,
         ),
       );
       await screen.findByTestId("trace-view");
@@ -1663,7 +1678,7 @@ describe("PlaygroundTab", () => {
         "href",
         "https://langfuse.example.com/trace/tr-xyz",
       );
-      expect(getRunMock).toHaveBeenCalledWith(sampleThread.thread_id, "run-link");
+      expect(getRunMock).toHaveBeenCalledWith(sampleThread.thread_id, "run-link", undefined);
     });
   });
 
@@ -2247,5 +2262,114 @@ describe("PlaygroundTab", () => {
         within(card).getByTestId("playground-task-result-view-run"),
       ).toBeInTheDocument();
     });
+  });
+});
+
+// Track C W2 — 切入态只读:一期只开读,写操作全置灰(两态断言)。
+describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
+  it("切入态:发送/运行与新建会话按钮置灰", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderPg();
+    const run = await screen.findByTestId("playground-run");
+    expect(run).toBeDisabled();
+    expect(screen.getByTestId("playground-new-session")).toBeDisabled();
+  });
+
+  it("归属态:新建会话可用,输入后发送可用", async () => {
+    const user = userEvent.setup();
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("playground-new-session")).not.toBeDisabled();
+    await user.type(screen.getByTestId("playground-input"), "hi");
+    expect(screen.getByTestId("playground-run")).not.toBeDisabled();
+  });
+
+  // fix-review Minor#2 — 重试按钮切入态用「不渲染」实现(onRetry={undefined}),
+  // 两渲染点(live 轮 + resume 历史轮)各补两态断言。切入态在 home 态跑出
+  // transcript 后翻 mock + rerender 模拟(顶栏切换器实时可达该状态)。
+  const pgTree = (
+    <MemoryRouter>
+      <AuthProvider>
+        <TenantScopeProvider>
+          <PlaygroundTab detail={sampleDetail} />
+        </TenantScopeProvider>
+      </AuthProvider>
+    </MemoryRouter>
+  );
+
+  it("live 轮:归属态渲染重试按钮,切入态不渲染", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        {
+          id: "u",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "an answer" }] } },
+          rawData: "",
+          receivedAt: "",
+        },
+        { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
+      ]),
+    );
+
+    const view = renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "q1");
+    await user.click(screen.getByTestId("playground-run"));
+    await screen.findByText("an answer");
+    expect(screen.getByTestId("playground-turn-retry")).toBeInTheDocument();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    view.rerender(pgTree);
+    expect(
+      screen.queryByTestId("playground-turn-retry"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("resume 历史轮:归属态渲染重试按钮,切入态不渲染", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    const past: ThreadMeta = {
+      ...sampleThread,
+      thread_id: "aaaaaaaa-0000-0000-0000-00000000000a",
+    };
+    listSessionsMock.mockResolvedValue([past]);
+    getMessagesMock.mockResolvedValue([
+      { role: "user", content: "q1" },
+      { role: "assistant", content: "a1" },
+    ]);
+    listThreadRunsMock.mockResolvedValue([
+      { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+    ]);
+    streamRunEventsMock.mockReturnValue(
+      makeStream([
+        {
+          id: "u1",
+          event: "updates",
+          data: {
+            agent: { messages: [{ type: "ai", content: "replayed answer" }] },
+          },
+          rawData: "",
+          receivedAt: "t1",
+        },
+        { id: "e1", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
+      ]),
+    );
+
+    const view = renderPg();
+    await screen.findByTestId("playground-input");
+    await user.click(screen.getByTestId("playground-history-open"));
+    await user.click(
+      await screen.findByTestId(`session-history-item-${past.thread_id}`),
+    );
+    await screen.findByText("replayed answer");
+    expect(screen.getByTestId("playground-turn-retry")).toBeInTheDocument();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    view.rerender(pgTree);
+    expect(
+      screen.queryByTestId("playground-turn-retry"),
+    ).not.toBeInTheDocument();
   });
 });

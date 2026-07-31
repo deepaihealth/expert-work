@@ -19,7 +19,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Alert, Button, Card, Space, Typography } from "antd";
+import { Alert, Button, Card, Space, Tooltip, Typography } from "antd";
 import { dump as yamlDump } from "js-yaml";
 import { RotateCcw, Save } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -28,6 +28,7 @@ import { ApiError } from "../../api/client";
 import { updateAgent, type AgentDetailResponse } from "../../api/agents";
 import { ManifestEditor } from "../../components/manifest-editor";
 import { CONFIG_GROUPS } from "../../components/manifest-editor/groups";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -41,6 +42,8 @@ interface ManifestTabProps {
 export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
   const { t } = useTranslation();
   const r = detail.record;
+  // Track C W2 — 切入态只读:保存是写操作,切入目标租户后置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   /** Server snapshot serialised as YAML — the editor's seed. */
   const snapshotYaml = useMemo(() => yamlDump(r.spec, { lineWidth: 120 }), [r.spec]);
@@ -131,16 +134,19 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
           >
             {t("manifest_tab.reset")}
           </Button>
-          <Button
-            size="small"
-            type="primary"
-            icon={<Save size={14} strokeWidth={1.75} />}
-            onClick={handleSave}
-            loading={saving}
-            data-testid="manifest-save-btn"
-          >
-            {t("manifest_tab.save")}
-          </Button>
+          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <Button
+              size="small"
+              type="primary"
+              icon={<Save size={14} strokeWidth={1.75} />}
+              onClick={handleSave}
+              loading={saving}
+              disabled={isTenantSwitched}
+              data-testid="manifest-save-btn"
+            >
+              {t("manifest_tab.save")}
+            </Button>
+          </Tooltip>
         </Space>
       </div>
 

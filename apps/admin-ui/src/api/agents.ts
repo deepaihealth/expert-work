@@ -75,12 +75,17 @@ export interface AgentDisableResult {
   cancelled_runs?: number;
 }
 
+/** ``tenantScope`` carries the concrete tenant id when a system_admin has
+ *  switched into a foreign tenant (Track C W2 — read-only drill-in); it rides
+ *  as ``?tenant_id=`` like :func:`listAgents`. ``undefined`` = home tenant. */
 export async function getAgent(
   name: string,
   version: string,
+  tenantScope?: TenantScope,
 ): Promise<AgentDetailResponse> {
   return getJson<AgentDetailResponse>(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
 }
 
@@ -189,9 +194,11 @@ export interface RollbackResult {
 export async function listRevisions(
   name: string,
   version: string,
+  tenantScope?: TenantScope,
 ): Promise<RevisionList> {
   return getJson<RevisionList>(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/revisions`,
+    { params: withTenantScope({}, tenantScope) },
   );
 }
 
@@ -199,9 +206,11 @@ export async function getRevision(
   name: string,
   version: string,
   revision: number,
+  tenantScope?: TenantScope,
 ): Promise<RevisionDetail> {
   return getJson<RevisionDetail>(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/revisions/${revision}`,
+    { params: withTenantScope({}, tenantScope) },
   );
 }
 

@@ -21,6 +21,7 @@ import {
   Popconfirm,
   Space,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -87,6 +88,8 @@ import {
   readPromptVariables,
 } from "../../components/manifest-editor/form_model";
 import { useAuth } from "../../auth/AuthContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -122,6 +125,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // TraceToolbar for the same gate.
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
+  // Track C W2 — 切入态读透传:artifact 下载带 ?tenant_id=(组件内直取);
+  // 一期只开读:切入态所有写操作(发送/新建会话/重试/审批/反馈)置灰。
+  const { apiTenantScope } = useTenantScope();
+  const isTenantSwitched = useIsTenantSwitched();
 
   // Dynamic-Prompt — the agent's declared run-time variables (jinja agents only).
   const manifestLike = { spec: r.spec };
@@ -530,6 +537,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
       approval: ApprovalItem,
       decision: "approve" | "reject",
     ) => {
+      // Track C W2 — 切入态只读:审批决策是写操作。切入态下发不出新 run,
+      // 这里只是残留 gate 的防御性拦截(在 PlaygroundTab 层拦,不动 TurnCard)。
+      if (isTenantSwitched) return;
       if (!thread) return;
       const threadId = thread.thread_id;
       setRunning(true);
@@ -594,7 +604,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         void detectApproval(turnId, threadId, continuationRunId);
       }
     },
-    [thread, patchTurn, detectApproval, tokenStream],
+    [thread, patchTurn, detectApproval, tokenStream, isTenantSwitched],
   );
 
   // Export a turn's full event stream as JSON for offline analysis. Prefer the
@@ -670,16 +680,19 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     }
   }, []);
 
-  const handleDownloadArtifact = useCallback(async (name: string) => {
-    setBusyWorkspaceKey(`artifact:${name}`);
-    try {
-      await downloadArtifact(name);
-    } catch {
-      // Swallow — same rationale as the file download.
-    } finally {
-      setBusyWorkspaceKey(null);
-    }
-  }, []);
+  const handleDownloadArtifact = useCallback(
+    async (name: string) => {
+      setBusyWorkspaceKey(`artifact:${name}`);
+      try {
+        await downloadArtifact(name, undefined, concreteTenantScope(apiTenantScope));
+      } catch {
+        // Swallow — same rationale as the file download.
+      } finally {
+        setBusyWorkspaceKey(null);
+      }
+    },
+    [apiTenantScope],
+  );
 
   const handleDeleteFile = useCallback(
     async (path: string) => {
@@ -779,16 +792,20 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             >
               {t("playground.history_button")}
             </Button>
-            <Button
-              size="small"
-              icon={<RotateCcw size={12} strokeWidth={1.75} />}
-              onClick={resetDraft}
-              loading={creatingThread}
-              disabled={running}
-              data-testid="playground-new-session"
+            <Tooltip
+              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
             >
-              {t("playground.new_session")}
-            </Button>
+              <Button
+                size="small"
+                icon={<RotateCcw size={12} strokeWidth={1.75} />}
+                onClick={resetDraft}
+                loading={creatingThread}
+                disabled={running || isTenantSwitched}
+                data-testid="playground-new-session"
+              >
+                {t("playground.new_session")}
+              </Button>
+            </Tooltip>
           </Space>
         </div>
         {resumed && (
@@ -934,22 +951,26 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         )}
 
         <Space size={8}>
-          <Button
-            type="primary"
-            icon={
-              running ? (
-                <Play size={14} strokeWidth={1.75} />
-              ) : (
-                <Send size={14} strokeWidth={1.75} />
-              )
-            }
-            onClick={handleRun}
-            loading={running}
-            disabled={!running && input.trim().length === 0}
-            data-testid="playground-run"
+          <Tooltip
+            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
           >
-            {running ? t("playground.running") : t("playground.run")}
-          </Button>
+            <Button
+              type="primary"
+              icon={
+                running ? (
+                  <Play size={14} strokeWidth={1.75} />
+                ) : (
+                  <Send size={14} strokeWidth={1.75} />
+                )
+              }
+              onClick={handleRun}
+              loading={running}
+              disabled={(!running && input.trim().length === 0) || isTenantSwitched}
+              data-testid="playground-run"
+            >
+              {running ? t("playground.running") : t("playground.run")}
+            </Button>
+          </Tooltip>
           <Button
             icon={<ImagePlus size={14} strokeWidth={1.75} />}
             onClick={() => fileInputRef.current?.click()}
@@ -1332,7 +1353,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                       loadState={load.state}
                       fallbackLines={h.fallbackLines}
                       onFireResult={handleFireResult}
-                      onRetry={handleHistoryRetry}
+                      // Track C W2 — 切入态只读:重试(回填输入框)在
+                      // PlaygroundTab 层拦,不传 handler 按钮就不渲染。
+                      onRetry={isTenantSwitched ? undefined : handleHistoryRetry}
                     />
                   </div>
                 );
@@ -1415,7 +1438,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 turn.id === streamTurnId ? tokenStream.finalized : false
               }
               onFireResult={handleFireResult}
-              onRetry={handleRetry}
+              // Track C W2 — 切入态只读:重试是写操作,同上在本层拦。
+              onRetry={isTenantSwitched ? undefined : handleRetry}
             />
           ))}
           {taskResults.map((result) => (
