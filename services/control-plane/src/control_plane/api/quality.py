@@ -17,14 +17,23 @@ Returns the **raw** payload (no ``{success, data, error}`` envelope), matching
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
+from control_plane.tenant_scope import (
+    CrossTenant,
+    SingleTenant,
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_tenant_scope,
+)
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import QualityDriftAlertStore, QualityScoreStore
 from expert_work.protocol import QualityDriftAlertRecord, QualityScoreRecord
+from expert_work.runtime.audit.logger import AuditLogger
 
 
 def _score_dict(record: QualityScoreRecord) -> dict[str, Any]:
@@ -63,6 +72,37 @@ def _get_alert_store(request: Request) -> QualityDriftAlertStore:
     return request.app.state.quality_drift_alert_store  # type: ignore[no-any-return]
 
 
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+async def _resolve_list_scope(
+    request: Request,
+    tenant_id: UUID | Literal["*"] | None,
+    audit: AuditLogger,
+    *,
+    endpoint: str,
+) -> SingleTenant:
+    """W3 read scope for the two quality lists.
+
+    Neither store has a cross-tenant aggregate reader and the "*" aggregate is
+    a spec non-goal here — a resolved :class:`CrossTenant` falls back to the
+    caller's home tenant (the pre-scope-threading behavior, mirroring the
+    front-end ``concreteTenantScope`` collapse).
+    """
+    scope = await ensure_tenant_scope(
+        request.state.principal,
+        tenant_id,
+        audit,
+        trace_id=current_trace_id_hex(),
+        endpoint=endpoint,
+        cross_tenant_enabled=cross_tenant_query_enabled(request),
+    )
+    if isinstance(scope, CrossTenant):
+        return SingleTenant(tenant_id=request.state.principal.tenant_id)
+    return scope
+
+
 def build_quality_router() -> APIRouter:
     """Read the per-agent quality series + drift alerts (home-tenant)."""
     router = APIRouter(prefix="/v1/quality", tags=["quality"])
@@ -71,30 +111,43 @@ def build_quality_router() -> APIRouter:
     async def list_scores(
         request: Request,
         store: Annotated[QualityScoreStore, Depends(_get_score_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_name: Annotated[str | None, Query(max_length=200)] = None,
         window_h: Annotated[int, Query(ge=1, le=8760)] = 168,
         limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+        # W3 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's quality series from the tenant switcher.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        since = datetime.now(tz=UTC) - timedelta(hours=window_h)
-        rows = await store.list_scores(
-            tenant_id=tenant_id, agent_name=agent_name, since=since, limit=limit
+        scope = await _resolve_list_scope(
+            request, tenant_id, audit, endpoint="GET /v1/quality/scores"
         )
+        since = datetime.now(tz=UTC) - timedelta(hours=window_h)
+        async with applied_scope(scope):
+            rows = await store.list_scores(
+                tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
+            )
         return JSONResponse(content={"items": [_score_dict(r) for r in rows]})
 
     @router.get("/drift-alerts", response_model=None)
     async def list_drift_alerts(
         request: Request,
         store: Annotated[QualityDriftAlertStore, Depends(_get_alert_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_name: Annotated[str | None, Query(max_length=200)] = None,
         window_h: Annotated[int, Query(ge=1, le=8760)] = 720,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        # W3 read scope — same treatment as ``/scores``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        since = datetime.now(tz=UTC) - timedelta(hours=window_h)
-        rows = await store.list_alerts(
-            tenant_id=tenant_id, agent_name=agent_name, since=since, limit=limit
+        scope = await _resolve_list_scope(
+            request, tenant_id, audit, endpoint="GET /v1/quality/drift-alerts"
         )
+        since = datetime.now(tz=UTC) - timedelta(hours=window_h)
+        async with applied_scope(scope):
+            rows = await store.list_alerts(
+                tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
+            )
         return JSONResponse(content={"items": [_alert_dict(r) for r in rows]})
 
     return router
