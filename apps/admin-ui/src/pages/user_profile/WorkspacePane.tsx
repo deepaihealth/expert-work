@@ -64,7 +64,7 @@ export function WorkspacePane({ userId }: { userId: string }) {
     const [ws, fs, art] = await Promise.allSettled([
       getUserWorkspace(userId, concreteTenantScope(apiTenantScope)),
       getUserWorkspaceFiles(userId, concreteTenantScope(apiTenantScope)),
-      listArtifacts({ userId }),
+      listArtifacts({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
     ]);
     if (ws.status === "fulfilled") setWorkspace(ws.value);
     if (fs.status === "fulfilled") setFiles(fs.value);
@@ -82,14 +82,14 @@ export function WorkspacePane({ userId }: { userId: string }) {
     async (name: string) => {
       setBusyKey(`artifact:${name}`);
       try {
-        await downloadArtifact(name, userId);
+        await downloadArtifact(name, userId, concreteTenantScope(apiTenantScope));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
         setBusyKey(null);
       }
     },
-    [userId, message],
+    [userId, message, apiTenantScope],
   );
 
   const handleDeleteArtifact = useCallback(

@@ -54,10 +54,12 @@ export function ConversationsPane({ userId }: { userId: string }) {
   const [since, setSince] = useState<string | undefined>(undefined);
   const [agentNames, setAgentNames] = useState<string[]>([]);
 
-  // Populate the agent filter once (distinct names across versions).
+  // Populate the agent filter (distinct names across versions); the list
+  // endpoint rides the bare ambient scope so a switched-in admin sees the
+  // target tenant's agent names.
   useEffect(() => {
     let cancelled = false;
-    listAgents({ limit: 100 })
+    listAgents({ limit: 100, tenantScope: apiTenantScope })
       .then((res) => {
         if (cancelled) return;
         setAgentNames([...new Set(res.items.map((a) => a.name))].sort());
@@ -68,7 +70,7 @@ export function ConversationsPane({ userId }: { userId: string }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [apiTenantScope]);
 
   const load = useCallback(
     // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.

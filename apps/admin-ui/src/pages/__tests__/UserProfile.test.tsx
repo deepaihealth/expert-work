@@ -15,8 +15,10 @@ import "../../i18n";
 
 import * as usersSdk from "../../api/users";
 import * as agentsSdk from "../../api/agents";
+import * as artifactsSdk from "../../api/artifacts";
 import * as convoSdk from "../../api/conversations";
 import * as memorySdk from "../../api/memory";
+import * as workspaceSdk from "../../api/workspace";
 import { ApiError } from "../../api/client";
 import { UserProfile } from "../UserProfile";
 import type { MemoryItem } from "../../api/memory";
@@ -162,6 +164,39 @@ describe("UserProfile", () => {
     renderPage();
     await waitFor(() =>
       expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, undefined),
+    );
+  });
+
+  it("threads the switched scope through the conversations + workspace panes (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    stubCommon();
+    vi.spyOn(workspaceSdk, "getUserWorkspace").mockResolvedValue({
+      workspace: null,
+      artifacts: [],
+    });
+    vi.spyOn(workspaceSdk, "getUserWorkspaceFiles").mockResolvedValue([]);
+    const artifactsSpy = vi
+      .spyOn(artifactsSdk, "listArtifacts")
+      .mockResolvedValue({ items: [], cross_tenant: false });
+    const user = userEvent.setup();
+    renderPage();
+
+    // Conversations is the default tab — the agent-filter list rides the
+    // bare scope; the conversations list takes the concrete UUID.
+    await waitFor(() =>
+      expect(agentsSdk.listAgents).toHaveBeenCalledWith(
+        expect.objectContaining({ limit: 100, tenantScope: mockScope }),
+      ),
+    );
+    expect(convoSdk.listConversations).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+    );
+
+    await user.click(screen.getByRole("tab", { name: "Workspace" }));
+    await waitFor(() =>
+      expect(artifactsSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+      ),
     );
   });
 
