@@ -21,6 +21,7 @@ import {
   Space,
   Spin,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -67,6 +68,8 @@ import { labelPurpose } from "../../pages/agent_detail/playground/trace_purpose"
 import { TurnMeta } from "../../pages/agent_detail/playground/TurnMeta";
 import { PlanPanel } from "../../pages/run_detail/PlanPanel";
 import { buildLangfuseTraceUrl } from "../../config/env";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { FeedbackBar } from "./FeedbackBar";
 import {
   FullTextModal,
@@ -351,6 +354,12 @@ export function TurnCard({
   onRetry,
 }: TurnCardProps) {
   const { t } = useTranslation();
+  // Track C W2 — 切入态读透传:系统管理员切入目标租户后,本卡的
+  // getRun/getRunTrace 懒加载要带 ?tenant_id=(组件内直取,不穿 prop)。
+  // 注意不复用 readOnly 表达切入态(语义不同——切入态历史轮仍要能看事件),
+  // 只禁写控件(反馈条)。
+  const { apiTenantScope } = useTenantScope();
+  const isTenantSwitched = useIsTenantSwitched();
   // Minor#1 — memoized: an unmemoized call produces a fresh `segments` array
   // identity every render, which the streaming auto-scroll effect below
   // depends on ([segments, turn.status]) — that forced the view back to the
@@ -548,7 +557,7 @@ export function TurnCard({
   useEffect(() => {
     if (eventView !== "exact" || !threadId || !runId || trace !== null) return;
     let cancelled = false;
-    void getRunTrace(threadId, runId)
+    void getRunTrace(threadId, runId, apiTenantScope)
       .then((data) => {
         if (!cancelled) setTrace(data);
       })
@@ -558,7 +567,7 @@ export function TurnCard({
     return () => {
       cancelled = true;
     };
-  }, [eventView, threadId, runId, trace]);
+  }, [eventView, threadId, runId, trace, apiTenantScope]);
   // Fresh retry budget whenever the turn or the view changes.
   useEffect(() => {
     traceRetriesRef.current = 0;
@@ -610,7 +619,7 @@ export function TurnCard({
   useEffect(() => {
     if (!isSystemAdmin || !threadId || !runId) return;
     let cancelled = false;
-    void getRun(threadId, runId)
+    void getRun(threadId, runId, apiTenantScope)
       .then((detail) => {
         if (!cancelled) setTraceId(detail.trace_id ?? null);
       })
@@ -620,7 +629,7 @@ export function TurnCard({
     return () => {
       cancelled = true;
     };
-  }, [isSystemAdmin, threadId, runId]);
+  }, [isSystemAdmin, threadId, runId, apiTenantScope]);
   const langfuseUrl = isSystemAdmin ? buildLangfuseTraceUrl(traceId) : null;
 
   // #4 cost — non-cached input + cache_read + output, each at its per-mtok rate
@@ -866,9 +875,18 @@ export function TurnCard({
         />
 
         {/* SE-16 (SE-A46) — per-turn 👍/👎 quality signal feeding the
-            skill-evolution curation pipeline. Settled turns only. */}
+            skill-evolution curation pipeline. Settled turns only. Track C W2:
+            切入态只读——反馈是写操作,置灰 + Tooltip。 */}
         {!readOnly && turn.status === "done" && threadId && (
-          <FeedbackBar threadId={threadId} turnSeq={turnSeq} />
+          <Tooltip
+            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+          >
+            <FeedbackBar
+              threadId={threadId}
+              turnSeq={turnSeq}
+              disabled={isTenantSwitched}
+            />
+          </Tooltip>
         )}
       </div>
 

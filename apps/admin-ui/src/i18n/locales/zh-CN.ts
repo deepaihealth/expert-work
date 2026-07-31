@@ -27,6 +27,7 @@ const zhCN: TranslationKeys = {
     field_help: "字段说明",
     copy: "复制",
     copied: "已复制",
+    tenant_switched_readonly: "已切入租户,只读视角——写操作请切回归属租户",
   },
   theme: {
     switch_to_light: "切到 Light",

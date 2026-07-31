@@ -205,13 +205,13 @@ export function ConversationDetail() {
   const handleDownloadArtifact = useCallback(
     async (name: string) => {
       try {
-        await downloadArtifact(name, conversationUserId ?? undefined);
+        await downloadArtifact(name, conversationUserId ?? undefined, concreteTenantScope(apiTenantScope));
       } catch {
         // Swallow — same rationale as the playground: the artifact may have
         // been deleted, and a toast here would need the App message API.
       }
     },
-    [conversationUserId],
+    [conversationUserId, apiTenantScope],
   );
 
   const columns: TableColumnsType<ConversationRun> = [

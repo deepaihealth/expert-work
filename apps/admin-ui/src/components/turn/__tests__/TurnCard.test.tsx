@@ -5,7 +5,7 @@
  * renders the full step/tool timeline, and ``readOnly`` suppresses every
  * mutating affordance (approval gate + feedback bar).
  */
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -16,6 +16,28 @@ import type { Turn } from "../types";
 import type { ApprovalItem } from "../../../api/approvals";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
+
+// Track C W2 — TurnCard 组件内直取 tenant scope;这些测试不挂 Provider,
+// mock 成 home 态(apiTenantScope undefined / 非切入态)。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+vi.mock("../../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
+// vitest 4 的 restore/clear 不复位 mockReturnValue — 显式归位防串台。
+beforeEach(() => {
+  isTenantSwitchedMock.mockReturnValue(false);
+});
 
 /** A replayed run: run metadata → one agent step calling ``search`` → the
  *  tool's result → the final answer → terminal frame. */
@@ -212,6 +234,17 @@ describe("TurnCard (read-only)", () => {
 
     expect(screen.getByTestId("playground-approval")).toBeInTheDocument();
     expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+  });
+
+  // Track C W2 — 切入态只读:反馈按钮置灰,但事件时间线照常可见
+  // (不复用 readOnly 表达切入态)。
+  it("切入态置灰反馈按钮,历史轮事件仍可见", () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderCard({});
+
+    expect(screen.getByTestId("playground-feedback-up")).toBeDisabled();
+    expect(screen.getByTestId("playground-feedback-down")).toBeDisabled();
+    expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
   });
 });
 

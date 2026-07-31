@@ -23,6 +23,7 @@ import { useTranslation } from "react-i18next";
 import { streamRunEvents } from "../../api/runs";
 import type { SseEvent } from "../../api/sessions";
 import { parseCompactionEvents } from "../../api/tool_timeline";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 import { CompactionSummaryList } from "../../components/CompactionCard";
 import { EventCard } from "../../components/EventCard";
 import { ToolTimeline } from "../../components/ToolTimeline";
@@ -38,6 +39,8 @@ interface EventStreamPanelProps {
 
 export function EventStreamPanel({ threadId, runId }: EventStreamPanelProps) {
   const { t } = useTranslation();
+  // Track C W2 — 切入态读透传:SSE URL 带 tenant_id(组件内直取)。
+  const { apiTenantScope } = useTenantScope();
   const [expanded, setExpanded] = useState<boolean>(() => {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(LOCAL_STORAGE_KEY) === "1";
@@ -80,7 +83,10 @@ export function EventStreamPanel({ threadId, runId }: EventStreamPanelProps) {
     abortRef.current = ac;
     (async () => {
       try {
-        for await (const frame of streamRunEvents(threadId, runId, { signal: ac.signal })) {
+        for await (const frame of streamRunEvents(threadId, runId, {
+          signal: ac.signal,
+          tenantScope: apiTenantScope,
+        })) {
           setEvents((prev) => [...prev, frame]);
           if (frame.event === "end") break;
         }
@@ -98,7 +104,7 @@ export function EventStreamPanel({ threadId, runId }: EventStreamPanelProps) {
     return () => {
       ac.abort();
     };
-  }, [expanded, threadId, runId]);
+  }, [expanded, threadId, runId, apiTenantScope]);
 
   return (
     <Card

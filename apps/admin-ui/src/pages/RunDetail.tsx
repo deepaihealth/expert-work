@@ -28,6 +28,7 @@ import {
   type RunStatus,
 } from "../api/runs";
 import { useStatusPolling } from "../hooks/useStatusPolling";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 import { ApprovalCard } from "./run_detail/ApprovalCard";
 import { EventStreamPanel } from "./run_detail/EventStreamPanel";
 import { PlanPanel } from "./run_detail/PlanPanel";
@@ -55,6 +56,8 @@ const STATUS_COLOR: Record<RunStatus, string> = {
 export function RunDetail() {
   const { t } = useTranslation();
   const { threadId, runId } = useParams<{ threadId: string; runId: string }>();
+  // Track C W2 — 切入态读透传:getRun 带 ?tenant_id=(组件内直取)。
+  const { apiTenantScope } = useTenantScope();
 
   const [run, setRun] = useState<RunDetailModel | null>(null);
   const [loading, setLoading] = useState(true);
@@ -69,7 +72,7 @@ export function RunDetail() {
   const refreshSilent = useCallback(async () => {
     if (!threadId || !runId) return;
     try {
-      setRun(await getRun(threadId, runId));
+      setRun(await getRun(threadId, runId, apiTenantScope));
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -79,14 +82,14 @@ export function RunDetail() {
             : "unknown error";
       setError(msg);
     }
-  }, [threadId, runId]);
+  }, [threadId, runId, apiTenantScope]);
 
   const refresh = useCallback(async () => {
     if (!threadId || !runId) return;
     setLoading(true);
     setError(null);
     try {
-      setRun(await getRun(threadId, runId));
+      setRun(await getRun(threadId, runId, apiTenantScope));
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -98,7 +101,7 @@ export function RunDetail() {
     } finally {
       setLoading(false);
     }
-  }, [threadId, runId]);
+  }, [threadId, runId, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

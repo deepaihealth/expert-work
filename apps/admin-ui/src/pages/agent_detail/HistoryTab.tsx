@@ -14,7 +14,7 @@
  * operator sees in the editor.
  */
 import { useCallback, useEffect, useMemo, useState, type Key } from "react";
-import { Alert, Button, Card, Popconfirm, Space, Table, Tag, Typography } from "antd";
+import { Alert, Button, Card, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { DiffEditor } from "@monaco-editor/react";
 import { dump as yamlDump } from "js-yaml";
 import { History, Undo2 } from "lucide-react";
@@ -28,6 +28,8 @@ import {
   type AgentDetailResponse,
   type RevisionSummary,
 } from "../../api/agents";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -41,6 +43,10 @@ interface HistoryTabProps {
 export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
   const { t } = useTranslation();
   const { name, version } = detail.record;
+  // Track C W2 — 切入态读透传:revision 读接口带 ?tenant_id=(组件内直取);
+  // 回滚是写操作,切入态置灰。
+  const { apiTenantScope } = useTenantScope();
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [items, setItems] = useState<RevisionSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -56,14 +62,14 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
     setLoading(true);
     setError(null);
     try {
-      const result = await listRevisions(name, version);
+      const result = await listRevisions(name, version, apiTenantScope);
       setItems(result.items);
     } catch (err) {
       setError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
     } finally {
       setLoading(false);
     }
-  }, [name, version]);
+  }, [name, version, apiTenantScope]);
 
   useEffect(() => {
     void refresh();
@@ -76,8 +82,8 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
       setError(null);
       try {
         const [older, newer] = await Promise.all([
-          getRevision(name, version, a),
-          getRevision(name, version, b),
+          getRevision(name, version, a, apiTenantScope),
+          getRevision(name, version, b, apiTenantScope),
         ]);
         setDiff({
           older: yamlDump(older.record.spec, { lineWidth: 120 }),
@@ -90,7 +96,7 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
         setDiffLoading(false);
       }
     },
-    [name, version, t],
+    [name, version, t, apiTenantScope],
   );
 
   const handleSelect = useCallback(
@@ -177,20 +183,26 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
               description={t("history_tab.rollback_confirm_body")}
               onConfirm={() => void handleRollback(row.revision)}
               okText={t("history_tab.rollback")}
+              disabled={isTenantSwitched}
             >
-              <Button
-                size="small"
-                icon={<Undo2 size={13} strokeWidth={1.5} />}
-                loading={rollingBack === row.revision}
-                data-testid={`history-rollback-${row.revision}`}
+              <Tooltip
+                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
               >
-                {t("history_tab.rollback")}
-              </Button>
+                <Button
+                  size="small"
+                  icon={<Undo2 size={13} strokeWidth={1.5} />}
+                  loading={rollingBack === row.revision}
+                  disabled={isTenantSwitched}
+                  data-testid={`history-rollback-${row.revision}`}
+                >
+                  {t("history_tab.rollback")}
+                </Button>
+              </Tooltip>
             </Popconfirm>
           ),
       },
     ],
-    [t, currentSha, rollingBack, handleRollback],
+    [t, currentSha, rollingBack, handleRollback, isTenantSwitched],
   );
 
   return (

@@ -17,6 +17,17 @@ import { fetchRunTraceRaw, type RunTrace, type TraceSpan } from "../../../../api
 vi.mock("../../../../api/trace_facade", () => ({ fetchRunTraceRaw: vi.fn() }));
 const mockFetchRunTraceRaw = vi.mocked(fetchRunTraceRaw);
 
+// Track C W2 — TraceDetail 组件内直取 tenant scope;这些测试不挂 Provider,
+// mock 成 home 态(apiTenantScope undefined)。
+vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 function makeSpan(
   over: Partial<TraceSpan> & Pick<TraceSpan, "id" | "parentId" | "kind" | "label">,
 ): TraceSpan {
@@ -450,7 +461,7 @@ describe("TraceView", () => {
     // layer must NOT run cleanUntrusted — that's its whole purpose).
     expect(modal.textContent).toContain("RAW FULL CONTENT");
     expect(modal.textContent).toContain("«UNTRUSTED nonce=x»");
-    expect(mockFetchRunTraceRaw).toHaveBeenCalledWith("t1", "r1", "sr5", "input");
+    expect(mockFetchRunTraceRaw).toHaveBeenCalledWith("t1", "r1", "sr5", "input", undefined);
   });
 
   it("查看原文 shows an error message in the modal when the raw fetch fails, without crashing", async () => {

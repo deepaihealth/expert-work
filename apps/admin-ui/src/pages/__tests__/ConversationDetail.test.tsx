@@ -37,6 +37,17 @@ const TENANT_ID = "22222222-2222-2222-2222-222222222222";
 const RUN_1 = "33333333-3333-3333-3333-333333333333";
 const RUN_2 = "33333333-3333-3333-3333-333333333334";
 
+// Track C W2 — 页面/TurnCard/useHistoryTurns 组件内直取 tenant scope;这些
+// 测试不挂 TenantScopeProvider,mock 成 home 态(apiTenantScope undefined)。
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 function jwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
   const body = btoa(JSON.stringify(payload));

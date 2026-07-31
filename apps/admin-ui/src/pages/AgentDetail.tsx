@@ -38,6 +38,8 @@ import { useTranslation } from "react-i18next";
 import { disableAgent, enableAgent, getAgent, type AgentDetailResponse } from "../api/agents";
 import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
+import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { ConversationsTab } from "./agent_detail/ConversationsTab";
 import { UsersTab } from "./agent_detail/UsersTab";
 import { HistoryTab } from "./agent_detail/HistoryTab";
@@ -78,6 +80,8 @@ function AgentKillSwitch({
 }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Track C W2 — 切入态只读:启用/禁用是写操作,切入目标租户后置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -119,15 +123,19 @@ function AgentKillSwitch({
         onConfirm={runEnable}
         okText={t("agent_detail.enable")}
         cancelText={t("common.cancel")}
+        disabled={isTenantSwitched}
       >
-        <Button
-          size="small"
-          loading={busy}
-          icon={<CircleCheck size={14} strokeWidth={1.75} />}
-          data-testid="agent-enable-btn"
-        >
-          {t("agent_detail.enable")}
-        </Button>
+        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <Button
+            size="small"
+            loading={busy}
+            disabled={isTenantSwitched}
+            icon={<CircleCheck size={14} strokeWidth={1.75} />}
+            data-testid="agent-enable-btn"
+          >
+            {t("agent_detail.enable")}
+          </Button>
+        </Tooltip>
       </Popconfirm>
     );
   }
@@ -155,16 +163,20 @@ function AgentKillSwitch({
       okButtonProps={{ danger: true }}
       okText={t("agent_detail.disable")}
       cancelText={t("common.cancel")}
+      disabled={isTenantSwitched}
     >
-      <Button
-        size="small"
-        danger
-        loading={busy}
-        icon={<Ban size={14} strokeWidth={1.75} />}
-        data-testid="agent-disable-btn"
-      >
-        {t("agent_detail.disable")}
-      </Button>
+      <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <Button
+          size="small"
+          danger
+          loading={busy}
+          disabled={isTenantSwitched}
+          icon={<Ban size={14} strokeWidth={1.75} />}
+          data-testid="agent-disable-btn"
+        >
+          {t("agent_detail.disable")}
+        </Button>
+      </Tooltip>
     </Popconfirm>
   );
 }
@@ -177,6 +189,8 @@ export function AgentDetail() {
     tab?: string;
   }>();
   const nav = useNavigate();
+  // Track C W2 — 切入态读透传:getAgent 带 ?tenant_id=(组件内直取)。
+  const { apiTenantScope } = useTenantScope();
 
   const [detail, setDetail] = useState<AgentDetailResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -187,7 +201,7 @@ export function AgentDetail() {
     setLoading(true);
     setError(null);
     try {
-      const result = await getAgent(name, version);
+      const result = await getAgent(name, version, apiTenantScope);
       setDetail(result);
     } catch (err) {
       const message =
@@ -200,7 +214,7 @@ export function AgentDetail() {
     } finally {
       setLoading(false);
     }
-  }, [name, version]);
+  }, [name, version, apiTenantScope]);
 
   /** #2 — post-save refetch WITHOUT the loading skeleton. ``refresh`` flips
    *  ``loading`` and the whole detail body is swapped for a <Skeleton/>,
@@ -209,7 +223,7 @@ export function AgentDetail() {
   const refreshQuietly = useCallback(async () => {
     if (!name || !version) return;
     try {
-      const result = await getAgent(name, version);
+      const result = await getAgent(name, version, apiTenantScope);
       setDetail(result);
       setError(null);
     } catch (err) {
@@ -221,7 +235,7 @@ export function AgentDetail() {
             : "unknown error";
       setError(message);
     }
-  }, [name, version]);
+  }, [name, version, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

@@ -4,7 +4,7 @@
  * The revisions SDK is stubbed; Monaco's DiffEditor is mocked to a pair
  * of textareas (the real component cannot mount in jsdom).
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
@@ -22,6 +22,23 @@ vi.mock("@monaco-editor/react", () => ({
 import * as agentsSdk from "../../api/agents";
 import { HistoryTab } from "../agent_detail/HistoryTab";
 import type { AgentDetailResponse } from "../../api/agents";
+
+// Track C W2 — 组件内直取 tenant scope + 切入态 hook;这些测试不挂
+// Provider,mock 成 home 态;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
 
 const SHA_V1 = "a".repeat(64);
 const SHA_V2 = "b".repeat(64);
@@ -59,6 +76,11 @@ function snapshot(revision: number, sha: string, prompt: string) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+// vitest 4 的 restore 不复位 vi.fn 的 mockReturnValue — 显式归位防串台。
+beforeEach(() => {
+  isTenantSwitchedMock.mockReturnValue(false);
+});
 
 describe("HistoryTab", () => {
   it("renders the revision table, marks current, hides rollback on it", async () => {
@@ -119,6 +141,16 @@ describe("HistoryTab", () => {
     await waitFor(() => expect(rollbackMock).toHaveBeenCalledWith("demo-agent", "1.0.0", 1));
     await waitFor(() => expect(onRolledBack).toHaveBeenCalled());
     expect(listMock).toHaveBeenCalledTimes(2); // initial + post-rollback refresh
+  });
+
+  // Track C W2 — 切入态只读:回滚是写操作,置灰(归属态可用由上一条覆盖)。
+  it("切入态置灰回滚按钮", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: summaries });
+
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} />);
+
+    expect(await screen.findByTestId("history-rollback-1")).toBeDisabled();
   });
 
   it("surfaces SDK errors in an alert", async () => {

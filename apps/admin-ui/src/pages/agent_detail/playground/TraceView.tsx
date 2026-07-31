@@ -44,6 +44,7 @@ import { fmtDuration } from "./duration_format";
 import { buildRows, isWideBar, type TraceRowData } from "./trace_tree";
 import { cleanUntrusted } from "./untrusted_clean";
 import { EntryBreakdown } from "./EntryBreakdown";
+import { useTenantScope } from "../../../tenant/TenantScopeContext";
 
 const ACCENT = "var(--ew-text-info, #4c8dff)";
 const SUCCESS = "var(--ew-text-success, #3ecf8e)";
@@ -783,6 +784,8 @@ function TraceDetail({
   runId?: string;
 }) {
   const { t } = useTranslation();
+  // Track C W2 — 切入态读透传:原文懒加载带 tenant_id(组件内直取)。
+  const { apiTenantScope } = useTenantScope();
   const tokenParts: string[] = [];
   if (span.inputTokens !== null) tokenParts.push(`in ${span.inputTokens}`);
   if (span.outputTokens !== null) tokenParts.push(`out ${span.outputTokens}`);
@@ -799,7 +802,7 @@ function TraceDetail({
     if (threadId === undefined || runId === undefined) return;
     setRawView({ status: "loading", content: "" });
     try {
-      const content = await fetchRunTraceRaw(threadId, runId, span.id, field);
+      const content = await fetchRunTraceRaw(threadId, runId, span.id, field, apiTenantScope);
       setRawView({ status: "ok", content });
     } catch {
       setRawView({ status: "error", content: "" });

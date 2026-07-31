@@ -25,6 +25,7 @@ export interface TranslationKeys {
     field_help: string;
     copy: string;
     copied: string;
+    tenant_switched_readonly: string;
   };
   theme: {
     switch_to_light: string;
@@ -2905,6 +2906,8 @@ const en: TranslationKeys = {
     field_help: "Field help",
     copy: "Copy",
     copied: "Copied",
+    tenant_switched_readonly:
+      "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
   },
   theme: {
     switch_to_light: "Switch to Light",
