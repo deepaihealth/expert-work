@@ -25,6 +25,7 @@ import { listMemories, type MemoryItem, type MemoryKind } from "../api/memory";
 import { getUsageTokens } from "../api/usage";
 import { getTenantUser } from "../api/users";
 import { PageHeader } from "../components/PageHeader";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ArtifactsPane } from "./user_detail/ArtifactsPane";
 import { formatCompact } from "../utils/runFormat";
 
@@ -294,11 +295,12 @@ export function UserDetail() {
   // the id fallback.
   const location = useLocation();
   const stateName = (location.state as { displayName?: string } | null)?.displayName;
+  const { apiTenantScope } = useTenantScope();
   const [fetchedName, setFetchedName] = useState<string | null>(null);
   useEffect(() => {
     if (!userId) return;
     let cancelled = false;
-    getTenantUser(userId)
+    getTenantUser(userId, concreteTenantScope(apiTenantScope))
       .then((u) => {
         if (!cancelled && u.display_name) setFetchedName(u.display_name);
       })
@@ -308,7 +310,7 @@ export function UserDetail() {
     return () => {
       cancelled = true;
     };
-  }, [userId]);
+  }, [userId, apiTenantScope]);
   const displayName = stateName ?? fetchedName ?? undefined;
 
   if (!name || !version || !userId) {

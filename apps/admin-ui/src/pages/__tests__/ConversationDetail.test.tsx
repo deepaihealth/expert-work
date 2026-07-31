@@ -22,6 +22,16 @@ import { AuthProvider } from "../../auth/AuthContext";
 import { ConversationDetail } from "../ConversationDetail";
 import type { ConversationDetail as ConversationDetailModel } from "../../api/conversations";
 
+// Mutable tenant scope for the page's ``useTenantScope()`` — the default
+// (undefined) keeps every pre-existing test on the caller's home tenant.
+let mockScope: string | undefined;
+// Spread the real module so the page keeps the real ``concreteTenantScope``
+// ("*" → undefined) instead of a test-local copy that could drift.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 const THREAD_ID = "44444444-4444-4444-4444-444444444444";
 const TENANT_ID = "22222222-2222-2222-2222-222222222222";
 const RUN_1 = "33333333-3333-3333-3333-333333333333";
@@ -211,11 +221,28 @@ afterEach(() => {
   URL.createObjectURL = realCreateObjectURL;
   URL.revokeObjectURL = realRevokeObjectURL;
   setStoredToken(null);
+  mockScope = undefined;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe("ConversationDetail", () => {
+  it("threads the tenant scope through getConversation (跨租户钻取 B类补传)", async () => {
+    mockScope = TENANT_ID;
+    const spy = vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(THREAD_ID, TENANT_ID));
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
+    mockScope = "*";
+    const spy = vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(THREAD_ID, undefined));
+  });
+
   it("renders the conversation summary + its run list", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
 

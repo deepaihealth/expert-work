@@ -18,6 +18,14 @@ import * as usageSdk from "../../api/usage";
 import * as usersSdk from "../../api/users";
 import { UserDetail } from "../UserDetail";
 
+let mockScope: string | undefined;
+// Spread the real module so the page keeps the real ``concreteTenantScope``
+// ("*" → undefined) instead of a test-local copy that could drift.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
 
 function renderPage() {
@@ -107,7 +115,10 @@ function stubAll() {
   });
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  mockScope = undefined;
+  vi.restoreAllMocks();
+});
 
 describe("UserDetail", () => {
   it("renders the conversations tab with the agent+user filter applied", async () => {
@@ -170,6 +181,24 @@ describe("UserDetail", () => {
     // GET /v1/users/{id} supplies the human name for the title.
     renderPage();
     expect(await screen.findByText("Alice")).toBeInTheDocument();
-    expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID);
+    expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, undefined);
+  });
+
+  it("threads the tenant scope through getTenantUser (跨租户钻取 B类补传)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    stubAll();
+    renderPage();
+    await waitFor(() =>
+      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, mockScope),
+    );
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
+    mockScope = "*";
+    stubAll();
+    renderPage();
+    await waitFor(() =>
+      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, undefined),
+    );
   });
 });

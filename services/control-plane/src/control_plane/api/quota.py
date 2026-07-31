@@ -195,12 +195,28 @@ def _tenant_id_from_query_or_principal(
     the system tenant — query param is then required.
     """
     raw = request.query_params.get("tenant_id")
-    if raw:
-        try:
-            return UUID(raw)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "INVALID_TENANT_ID", "message": "tenant_id is not a UUID"},
-            ) from exc
-    return principal.tenant_id
+    if not raw:
+        return principal.tenant_id
+    try:
+        target = UUID(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_TENANT_ID", "message": "tenant_id is not a UUID"},
+        ) from exc
+    # mTLS service principals (orchestrator-tier infra) keep the documented
+    # semantics: they sit on the system tenant and releasing any tenant's
+    # reservation is their job.
+    if principal.auth_method == "mtls":
+        return target
+    # User / service-account principals: the target must be within their
+    # authorized tenants (system_admin's allowed_tenants == "*" always passes).
+    if principal.allowed_tenants != "*" and target not in principal.allowed_tenants:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TENANT_NOT_ALLOWED",
+                "message": "the caller is not authorized for this tenant",
+            },
+        )
+    return target

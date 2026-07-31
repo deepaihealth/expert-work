@@ -20,6 +20,7 @@ import {
 } from "../api/skill-evolution";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -28,17 +29,21 @@ export function SkillEvolutionKillSwitch() {
   const { message, modal } = App.useApp();
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
+  const { apiTenantScope } = useTenantScope();
 
   const [state, setState] = useState<KillSwitchState | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      setState(await getKillSwitch());
+      // "*" maps to undefined: the endpoint types tenant_id as ``UUID | None``
+      // and 422s a literal "*", which would hide the whole control (state
+      // stays null) in the system_admin aggregate view.
+      setState(await getKillSwitch(concreteTenantScope(apiTenantScope)));
     } catch {
       setState(null);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     void load();

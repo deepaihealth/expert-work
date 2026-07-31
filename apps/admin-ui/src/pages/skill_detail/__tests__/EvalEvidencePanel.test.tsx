@@ -10,6 +10,12 @@ import * as sdk from "../../../api/skill-evolution";
 import type { SkillEvalResult } from "../../../api/skill-evolution";
 import { EvalEvidencePanel } from "../EvalEvidencePanel";
 
+let mockScope: string | undefined;
+vi.mock("../../../tenant/TenantScopeContext", () => ({
+  SCOPE_ALL: "*",
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 const listMock = vi.spyOn(sdk, "listEvalResults");
 
 function evalResult(overrides: Partial<SkillEvalResult> = {}): SkillEvalResult {
@@ -43,10 +49,18 @@ beforeEach(() => {
   listMock.mockReset();
 });
 afterEach(() => {
+  mockScope = undefined;
   vi.clearAllMocks();
 });
 
 describe("EvalEvidencePanel", () => {
+  it("threads the tenant scope through listEvalResults (跨租户钻取)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    listMock.mockResolvedValue([]);
+    renderPanel();
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith("sk-1", mockScope));
+  });
+
   it("renders a paired-bar row per eval result", async () => {
     listMock.mockResolvedValue([evalResult()]);
     renderPanel();

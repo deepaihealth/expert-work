@@ -14,6 +14,14 @@ vi.mock("../../auth/AuthContext", () => ({
   useAuth: () => useAuthMock(),
 }));
 
+let mockScope: string | undefined;
+// Spread the real module so the component keeps the real
+// ``concreteTenantScope`` ("*" → undefined) instead of a test-local copy.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+}));
+
 import { SkillEvolutionKillSwitch } from "../SkillEvolutionKillSwitch";
 
 const getMock = vi.spyOn(sdk, "getKillSwitch");
@@ -36,10 +44,26 @@ beforeEach(() => {
   useAuthMock.mockReturnValue({ identity: { isSystemAdmin: false, roles: ["admin"] } });
 });
 afterEach(() => {
+  mockScope = undefined;
   vi.clearAllMocks();
 });
 
 describe("SkillEvolutionKillSwitch", () => {
+  it("threads the tenant scope through getKillSwitch (跨租户钻取)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(mockScope));
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id so the control stays visible', async () => {
+    mockScope = "*";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(undefined));
+    expect(await screen.findByTestId("skill-kill-switch")).toBeInTheDocument();
+  });
+
   it("shows the active status + tenant toggle for a tenant admin (no global)", async () => {
     getMock.mockResolvedValue(state());
     renderControl();

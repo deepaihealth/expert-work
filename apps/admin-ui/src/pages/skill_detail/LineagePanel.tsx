@@ -14,6 +14,7 @@ import { useTranslation } from "react-i18next";
 
 import { getLineage, type SkillLineage } from "../../api/skill-evolution";
 import type { EvolutionOrigin } from "../../api/skills";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -29,6 +30,7 @@ interface LineagePanelProps {
 
 export function LineagePanel({ skillId }: LineagePanelProps) {
   const { t } = useTranslation();
+  const { apiTenantScope } = useTenantScope();
   const [lineage, setLineage] = useState<SkillLineage | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -41,11 +43,11 @@ export function LineagePanel({ skillId }: LineagePanelProps) {
 
   const load = useCallback(async () => {
     try {
-      setLineage(await getLineage(skillId));
+      setLineage(await getLineage(skillId, apiTenantScope));
     } catch {
       setFailed(true);
     }
-  }, [skillId]);
+  }, [skillId, apiTenantScope]);
 
   useEffect(() => {
     void load();

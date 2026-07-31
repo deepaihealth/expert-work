@@ -112,9 +112,13 @@ export interface SkillEvalResult {
   created_at: string;
 }
 
-export async function listEvalResults(skillId: string): Promise<SkillEvalResult[]> {
+export async function listEvalResults(
+  skillId: string,
+  tenantScope?: TenantScope,
+): Promise<SkillEvalResult[]> {
   const response = await apiClient.get<{ items: SkillEvalResult[] }>(
     `/v1/skill-evolution/skills/${encodeURIComponent(skillId)}/eval-results`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data.items ?? [];
 }
@@ -127,9 +131,13 @@ export interface SkillLineage {
   versions: SkillVersion[];
 }
 
-export async function getLineage(skillId: string): Promise<SkillLineage> {
+export async function getLineage(
+  skillId: string,
+  tenantScope?: TenantScope,
+): Promise<SkillLineage> {
   const response = await apiClient.get<SkillLineage>(
     `/v1/skill-evolution/skills/${encodeURIComponent(skillId)}/lineage`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -157,8 +165,10 @@ export interface KillSwitchState {
   effective_halted: boolean;
 }
 
-export async function getKillSwitch(): Promise<KillSwitchState> {
-  const response = await apiClient.get<KillSwitchState>("/v1/skill-evolution/kill-switch");
+export async function getKillSwitch(tenantScope?: TenantScope): Promise<KillSwitchState> {
+  const response = await apiClient.get<KillSwitchState>("/v1/skill-evolution/kill-switch", {
+    params: withTenantScope({}, tenantScope),
+  });
   return response.data;
 }
 

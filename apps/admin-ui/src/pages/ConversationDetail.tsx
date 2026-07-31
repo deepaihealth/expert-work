@@ -37,6 +37,7 @@ import { downloadJson } from "../components/turn/download_json";
 import { CommentarySegmentLine, runIdOf, TurnCard } from "../components/turn/TurnCard";
 import type { Turn } from "../components/turn/types";
 import { useHistoryTurns } from "../components/turn/useHistoryTurns";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { formatCompact, formatDuration } from "../utils/runFormat";
 
 const { Text } = Typography;
@@ -66,6 +67,12 @@ export function ConversationDetail() {
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
   const homeTenantId = identity?.homeTenantId ?? null;
+  // A system_admin drilling in from the cross-tenant browser carries the
+  // thread's tenant here — without it the scope-aware detail endpoint
+  // resolves to the caller's home tenant and 404s the foreign thread. The
+  // "*" aggregate maps to undefined (the endpoint types tenant_id as
+  // ``UUID | None`` and 422s a literal "*").
+  const { apiTenantScope } = useTenantScope();
 
   const [convo, setConvo] = useState<ConversationDetailModel | null>(null);
   const [loading, setLoading] = useState(true);
@@ -96,7 +103,7 @@ export function ConversationDetail() {
     setError(null);
     let loaded: ConversationDetailModel | null = null;
     try {
-      loaded = await getConversation(threadId);
+      loaded = await getConversation(threadId, concreteTenantScope(apiTenantScope));
       setConvo(loaded);
     } catch (err) {
       setError(
@@ -119,7 +126,7 @@ export function ConversationDetail() {
     } catch {
       setMessages(null);
     }
-  }, [threadId]);
+  }, [threadId, apiTenantScope]);
 
   useEffect(() => {
     void refresh();
