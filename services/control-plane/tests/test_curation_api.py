@@ -23,6 +23,7 @@ from expert_work.protocol import (
     AuditQuery,
     CurationCandidateRecord,
     CurationSignal,
+    Role,
     TrajectoryOutcome,
 )
 from expert_work.runtime.storage import InMemoryObjectStore
@@ -496,3 +497,89 @@ async def test_unauthenticated_request_is_401(ctx: _Ctx) -> None:
     ) as bare:
         resp = await bare.get("/v1/curation/candidates")
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# W3 — curation 详情读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套:system_admin 带目标租户 tenant_id → 200;普通租户用户带他租户
+# tenant_id → 403 TENANT_NOT_ALLOWED;tenant_id=* → 400
+# SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _seed_dataset(ctx: _Ctx) -> str:
+    created = await ctx.client.post(
+        "/v1/eval-datasets",
+        json={
+            "agent_name": "reporter",
+            "name": "scope-set",
+            "input": {"prompt": "hi"},
+            "expected": {"answer": "ok"},
+            "source": "golden",
+        },
+    )
+    assert created.status_code == 201, created.text
+    return str(created.json()["id"])
+
+
+@pytest.mark.asyncio
+async def test_curation_detail_system_admin_target_tenant_200(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    dataset_id = await _seed_dataset(ctx)
+    headers = await _grant_system_admin(ctx.client)
+    params = {"tenant_id": str(_TENANT)}
+
+    cand = await ctx.client.get(
+        f"/v1/curation/candidates/{candidate.id}", params=params, headers=headers
+    )
+    assert cand.status_code == 200, cand.text
+    assert cand.json()["id"] == str(candidate.id)
+
+    ds = await ctx.client.get(f"/v1/eval-datasets/{dataset_id}", params=params, headers=headers)
+    assert ds.status_code == 200, ds.text
+    assert ds.json()["id"] == dataset_id
+
+
+@pytest.mark.asyncio
+async def test_curation_detail_foreign_tenant_user_403(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    dataset_id = await _seed_dataset(ctx)
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    for name, path in [
+        ("get_candidate", f"/v1/curation/candidates/{candidate.id}"),
+        ("get_eval_dataset", f"/v1/eval-datasets/{dataset_id}"),
+    ]:
+        resp = await ctx.client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_curation_detail_tenant_id_star_400(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    dataset_id = await _seed_dataset(ctx)
+    for name, path in [
+        ("get_candidate", f"/v1/curation/candidates/{candidate.id}"),
+        ("get_eval_dataset", f"/v1/eval-datasets/{dataset_id}"),
+    ]:
+        resp = await ctx.client.get(path, params={"tenant_id": "*"})
+        assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
