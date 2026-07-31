@@ -58,9 +58,9 @@ from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
     CrossTenant,
-    SingleTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from control_plane.tenant_status import TenantStatusService
@@ -1100,6 +1100,11 @@ def build_runs_router() -> APIRouter:
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
         runs: Annotated[RunStore, Depends(_get_run_store)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's run from the tenant switcher; "*" is meaningless
+        # (a run belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Stream J.8 — a run's status + any pending approval.
 
@@ -1109,8 +1114,17 @@ def build_runs_router() -> APIRouter:
         pending verdict. 404 hides cross-tenant / cross-user existence,
         identical to ``trigger_run``.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/runs/{run_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)  # type: ignore[attr-defined]
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -1119,58 +1133,61 @@ def build_runs_router() -> APIRouter:
         ):
             raise HTTPException(status_code=404, detail="session not found")
 
-        approval = await approvals.get_by_run(run_id=run_id, tenant_id=tenant_id)
-        pending: dict[str, Any] | None = None
-        if approval is not None and approval.status is ApprovalStatus.PENDING:
-            # RT-6 Tier B — compute the workspace-drift signal live so the review
-            # card can warn the human *before* they decide (the resume-time audit
-            # is too late for the pending view). Best-effort inside the helper.
-            drift = await _workspace_drift(
-                getattr(request.app.state, "user_workspace_store", None),
-                tenant_id=tenant_id,
-                user_id=approval.user_id,
-                reason_kind=approval.reason_kind,
-                requested_at=approval.requested_at,
-            )
-            pending = {
-                "request_id": approval.request_id,
-                "node": approval.node,
-                "reason_kind": approval.reason_kind,
-                "action_summary": approval.action_summary,
-                "proposed_args": approval.proposed_args,
-                "requested_at": approval.requested_at.isoformat(),
-                "timeout_at": approval.timeout_at.isoformat(),
-                # RT-6 Tier A — the approved args fingerprint receipt (empty for a
-                # legacy / unbound or action-screen approval).
-                "binding_digest": approval.binding_digest,
-                # RT-6 Tier B — workspace mutated since the request (audit-only).
-                "workspace_drift": drift,
-            }
-        # Status resolution (Mini-ADR J-41): the in-memory RunManager is
-        # authoritative while the run is live, but its record is dropped
-        # 5 minutes after the run ends — and on a control-plane restart.
-        # The durable ``agent_run`` row is the fallback, so a finished
-        # run stays queryable past the TTL instead of 404-ing.
-        run_status = runtime_run_status(request, run_id)
-        # Mini-ADR H-9.5 — surface the persisted trace_id when the agent_run
-        # row exists. The in-memory record carries it for live runs; the
-        # durable row carries it past the TTL.
-        persisted = await runs.get(run_id=run_id, tenant_id=tenant_id)
-        trace_id: str | None = persisted.trace_id if persisted is not None else None
-        if run_status is None:
-            if persisted is not None:
-                run_status = persisted.status.value
-        if run_status is None and approval is None:
-            raise HTTPException(status_code=404, detail="run not found")
-        status = run_status or (approval.status.value if approval is not None else "unknown")
-        # Run summary — token usage joined by trace_id (expert_work's own token_usage,
-        # no Langfuse round-trip). Scoped to the caller's tenant so RLS applies
-        # (token_usage isolation rides on the tenant GUC, set by applied_scope).
-        tokens: dict[str, Any] | None = None
-        if trace_id is not None:
-            async with applied_scope(SingleTenant(tenant_id=tenant_id)):
+        async with applied_scope(scope):
+            approval = await approvals.get_by_run(run_id=run_id, tenant_id=target_tenant)
+            pending: dict[str, Any] | None = None
+            if approval is not None and approval.status is ApprovalStatus.PENDING:
+                # RT-6 Tier B — compute the workspace-drift signal live so the
+                # review card can warn the human *before* they decide (the
+                # resume-time audit is too late for the pending view).
+                # Best-effort inside the helper.
+                drift = await _workspace_drift(
+                    getattr(request.app.state, "user_workspace_store", None),
+                    tenant_id=target_tenant,
+                    user_id=approval.user_id,
+                    reason_kind=approval.reason_kind,
+                    requested_at=approval.requested_at,
+                )
+                pending = {
+                    "request_id": approval.request_id,
+                    "node": approval.node,
+                    "reason_kind": approval.reason_kind,
+                    "action_summary": approval.action_summary,
+                    "proposed_args": approval.proposed_args,
+                    "requested_at": approval.requested_at.isoformat(),
+                    "timeout_at": approval.timeout_at.isoformat(),
+                    # RT-6 Tier A — the approved args fingerprint receipt (empty
+                    # for a legacy / unbound or action-screen approval).
+                    "binding_digest": approval.binding_digest,
+                    # RT-6 Tier B — workspace mutated since the request
+                    # (audit-only).
+                    "workspace_drift": drift,
+                }
+            # Status resolution (Mini-ADR J-41): the in-memory RunManager is
+            # authoritative while the run is live, but its record is dropped
+            # 5 minutes after the run ends — and on a control-plane restart.
+            # The durable ``agent_run`` row is the fallback, so a finished
+            # run stays queryable past the TTL instead of 404-ing.
+            run_status = runtime_run_status(request, run_id)
+            # Mini-ADR H-9.5 — surface the persisted trace_id when the agent_run
+            # row exists. The in-memory record carries it for live runs; the
+            # durable row carries it past the TTL.
+            persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
+            trace_id: str | None = persisted.trace_id if persisted is not None else None
+            if run_status is None:
+                if persisted is not None:
+                    run_status = persisted.status.value
+            if run_status is None and approval is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            status = run_status or (approval.status.value if approval is not None else "unknown")
+            # Run summary — token usage joined by trace_id (expert_work's own
+            # token_usage, no Langfuse round-trip). Scoped to the resolved
+            # target tenant so RLS applies (token_usage isolation rides on the
+            # tenant GUC, set by applied_scope).
+            tokens: dict[str, Any] | None = None
+            if trace_id is not None:
                 totals = await token_usage.totals_by_trace_ids([trace_id])
-            tokens = _tokens_to_dict(totals.get(trace_id))
+                tokens = _tokens_to_dict(totals.get(trace_id))
         return JSONResponse(
             content={
                 "run_id": str(run_id),
@@ -1198,6 +1215,9 @@ def build_runs_router() -> APIRouter:
         threads: Annotated[object, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         runs: Annotated[RunStore, Depends(_get_run_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_run``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Batch 4b Task 2 — the run's Langfuse trace, normalized for the
         debug console's "precise" view.
@@ -1205,10 +1225,19 @@ def build_runs_router() -> APIRouter:
         Ownership-gated identically to ``get_run`` (404 hides cross-tenant
         / cross-user existence); unlike ``get_run`` this does NOT require
         system_admin — it only ever returns the caller's own run's trace,
-        never a cross-tenant one.
+        never a cross-tenant one (a system_admin crosses via ``?tenant_id=``).
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/runs/{run_id}/trace",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)  # type: ignore[attr-defined]
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -1217,7 +1246,8 @@ def build_runs_router() -> APIRouter:
         ):
             raise HTTPException(status_code=404, detail="session not found")
 
-        persisted = await runs.get(run_id=run_id, tenant_id=tenant_id)
+        async with applied_scope(scope):
+            persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
         trace_id = persisted.trace_id if persisted is not None else None
         if trace_id is None:
             return JSONResponse(content={"status": "no_trace"})
@@ -1235,6 +1265,9 @@ def build_runs_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         span: Annotated[str, Query()],
         field: Annotated[str, Query()],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W2 read scope — see ``get_run``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Task 4 —— 单 span input/output 的未截断全文("查看原文").
 
@@ -1244,8 +1277,17 @@ def build_runs_router() -> APIRouter:
         Langfuse outage all degrade to ``None``, which this route turns
         into a 404 rather than ever 500ing.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/runs/{run_id}/trace/raw",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)  # type: ignore[attr-defined]
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -1254,7 +1296,8 @@ def build_runs_router() -> APIRouter:
         ):
             raise HTTPException(status_code=404, detail="session not found")
 
-        persisted = await runs.get(run_id=run_id, tenant_id=tenant_id)
+        async with applied_scope(scope):
+            persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
         trace_id = persisted.trace_id if persisted is not None else None
         if trace_id is None:
             raise HTTPException(status_code=404, detail="trace not found")
@@ -1417,7 +1460,11 @@ def build_runs_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         runs: Annotated[RunStore, Depends(_get_run_store)],
         event_store: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         since_seq: Annotated[int | None, Query(ge=0)] = None,
+        # W2 read scope — resolved BEFORE the stream is built, so 403/400 are
+        # plain HTTP errors (never SSE frames); see ``get_run``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> StreamingResponse:
         """Stream H.3 PR 4 (Mini-ADR H-7) — SSE event stream for one run.
 
@@ -1438,8 +1485,17 @@ def build_runs_router() -> APIRouter:
         404 hides cross-tenant / cross-user existence, identical to
         ``get_run``.
         """
-        tenant_id: UUID = request.state.tenant_id
-        meta = await threads.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/sessions/{thread_id}/runs/{run_id}/events",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)  # type: ignore[attr-defined]
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
         caller_user_id = await resolve_caller_user_id(request, users)
@@ -1448,7 +1504,8 @@ def build_runs_router() -> APIRouter:
         ):
             raise HTTPException(status_code=404, detail="session not found")
 
-        persisted = await runs.get(run_id=run_id, tenant_id=tenant_id)
+        async with applied_scope(scope):
+            persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
         if persisted is None:
             raise HTTPException(status_code=404, detail="run not found")
 
@@ -1463,7 +1520,13 @@ def build_runs_router() -> APIRouter:
                 # cleanly instead of waiting forever.
                 yield format_sse("end", None)
                 return
-            rows = await event_store.list(run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT)
+            # The generator body runs after the handler returned — re-apply
+            # the resolved scope so this DB read stays bound to the target
+            # tenant (not the request middleware's home-tenant GUC).
+            async with applied_scope(scope):
+                rows = await event_store.list(
+                    run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT
+                )
             for row in rows:
                 yield format_sse(
                     row.event_name,

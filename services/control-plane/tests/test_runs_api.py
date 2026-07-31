@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Annotated, TypedDict
+from types import SimpleNamespace
+from typing import Annotated, Any, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
@@ -33,7 +34,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditQuery
+from expert_work.protocol import AuditQuery, Role
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -1538,3 +1539,153 @@ async def test_resume_on_never_registered_agent_still_404(runs_client: AsyncClie
         json={"decision": "approve"},
     )
     assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# W2 — run 详情读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
+# 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tenant_id=* → 400
+# SCOPE_ALL_NOT_SUPPORTED(详情端点只认单租户)。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _foreign_tenant_headers() -> dict[str, str]:
+    """A plain tenant user homed in a random other tenant."""
+    return {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+
+
+#: (name, path-suffix under /v1/sessions/{thread}/runs/{run}, extra query params)
+_RUN_SCOPE_ENDPOINTS: list[tuple[str, str, dict[str, str]]] = [
+    ("get_run", "", {}),
+    ("trace", "/trace", {}),
+    ("trace_raw", "/trace/raw", {"span": "s1", "field": "input"}),
+    ("events", "/events", {}),
+]
+
+
+class _StubTraceApi:
+    def __init__(self, trace: Any) -> None:
+        self._trace = trace
+
+    def get(self, trace_id: str) -> Any:
+        return self._trace
+
+
+class _StubLangfuseClient:
+    """Minimal read client: one trace holding one span with a raw input."""
+
+    def __init__(self) -> None:
+        span = SimpleNamespace(id="s1", input="raw span input", output=None)
+        self.api = SimpleNamespace(trace=_StubTraceApi(SimpleNamespace(observations=[span])))
+
+
+@pytest.mark.asyncio
+async def test_get_run_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    headers = await _grant_system_admin(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["run_id"] == run_id
+    assert body["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_get_run_trace_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    headers = await _grant_system_admin(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/trace",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    # 命中目标租户的 run 行(OTel 未接 → 无 trace_id → no_trace,而非 404)。
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "no_trace"
+
+
+@pytest.mark.asyncio
+async def test_get_run_trace_raw_system_admin_target_tenant_200(
+    runs_client: AsyncClient,
+) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.run_store.set_trace_id(
+        run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT, trace_id="cafef00d" * 4
+    )
+    app.state.langfuse_read_client = _StubLangfuseClient()
+    headers = await _grant_system_admin(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/trace/raw",
+        params={"tenant_id": str(_DEFAULT_TENANT), "span": "s1", "field": "input"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"] == "raw span input"
+
+
+@pytest.mark.asyncio
+async def test_run_events_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    headers = await _grant_system_admin(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/events",
+        params={"tenant_id": str(_DEFAULT_TENANT)},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-expert-work-stream-mode"] == "replay"
+    events = _parse_sse(resp.text)
+    assert events, "expected replayed SSE frames"
+    assert events[0][0] == "metadata"
+
+
+@pytest.mark.parametrize("name,suffix,extra", _RUN_SCOPE_ENDPOINTS)
+@pytest.mark.asyncio
+async def test_run_detail_foreign_tenant_user_403(
+    runs_client: AsyncClient, name: str, suffix: str, extra: dict[str, str]
+) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}{suffix}",
+        params={"tenant_id": str(_DEFAULT_TENANT), **extra},
+        headers=_foreign_tenant_headers(),
+    )
+    assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.parametrize("name,suffix,extra", _RUN_SCOPE_ENDPOINTS)
+@pytest.mark.asyncio
+async def test_run_detail_tenant_id_star_400(
+    runs_client: AsyncClient, name: str, suffix: str, extra: dict[str, str]
+) -> None:
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}{suffix}",
+        params={"tenant_id": "*", **extra},
+    )
+    assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name

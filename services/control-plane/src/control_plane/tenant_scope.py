@@ -256,6 +256,47 @@ async def ensure_tenant_scope(
     return SingleTenant(tenant_id=target)
 
 
+async def ensure_single_tenant_scope(
+    principal: Principal,
+    requested_tenant_id: UUID | Literal["*"] | None,
+    audit: AuditLogger,
+    *,
+    trace_id: str | None = None,
+    endpoint: str | None = None,
+    cross_tenant_enabled: bool = True,
+) -> SingleTenant:
+    """:func:`ensure_tenant_scope` for **detail** endpoints — W2 read scope.
+
+    A detail endpoint reads one row that lives in exactly one tenant, so the
+    cross-tenant aggregate (``tenant_id=*``) is meaningless there: rejected
+    with 400 ``SCOPE_ALL_NOT_SUPPORTED`` *before* resolution (no spurious
+    ``SYSTEM_CROSS_TENANT_QUERY`` audit row for a request that can never
+    succeed). Everything else — home fallback, 403 ``TENANT_NOT_ALLOWED``,
+    the system_admin switch audit, the HX-8 deployment switch — delegates to
+    :func:`ensure_tenant_scope` unchanged. Returning :class:`SingleTenant`
+    (never the union) lets callers use ``scope.tenant_id`` directly.
+    """
+    detail = {
+        "code": "SCOPE_ALL_NOT_SUPPORTED",
+        "message": "detail endpoints require a concrete tenant_id",
+    }
+    if requested_tenant_id == "*":
+        raise HTTPException(status_code=400, detail=detail)
+    scope = await ensure_tenant_scope(
+        principal,
+        requested_tenant_id,
+        audit,
+        trace_id=trace_id,
+        endpoint=endpoint,
+        cross_tenant_enabled=cross_tenant_enabled,
+    )
+    if isinstance(scope, CrossTenant):
+        # Unreachable — "*" is the only CrossTenant trigger and was rejected
+        # above; kept as a defensive narrow (mypy + future resolver changes).
+        raise HTTPException(status_code=400, detail=detail)
+    return scope
+
+
 # ---------------------------------------------------------------------------
 # bypass_rls_session — CrossTenant SQL wrapper
 # ---------------------------------------------------------------------------
@@ -328,5 +369,6 @@ __all__ = [
     "TenantScopeResolution",
     "applied_scope",
     "bypass_rls_session",
+    "ensure_single_tenant_scope",
     "ensure_tenant_scope",
 ]
