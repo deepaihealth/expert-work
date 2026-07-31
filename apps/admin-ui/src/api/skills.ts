@@ -28,7 +28,7 @@ export interface SkillRecord {
    *  from a W3 backend. Powers the "*" aggregate row-jump (SkillsList →
    *  SkillDetail with ``?tenant_id=``). Optional: absent on older backends
    *  and on platform rows. */
-  tenant_id?: string;
+  tenant_id?: string | null;
   name: string;
   status: SkillStatus;
   latest_version: number | null;

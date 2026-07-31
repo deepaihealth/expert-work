@@ -426,9 +426,10 @@ export function SkillsList() {
                   // Cross-tenant W3 — in the "*" aggregate a foreign-tenant
                   // row would 404 (getSkill falls back to the home tenant),
                   // so carry the row's owning tenant into the detail URL.
-                  // Field absent = pre-W3 backend → keep the old behavior.
+                  // Absent = pre-W3 backend; null = platform skill (NULL
+                  // tenant) — both keep the old behavior.
                   const query =
-                    record.tenant_id !== undefined &&
+                    record.tenant_id != null &&
                     record.tenant_id !== identity?.homeTenantId
                       ? `?tenant_id=${encodeURIComponent(record.tenant_id)}`
                       : "";
