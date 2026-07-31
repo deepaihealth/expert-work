@@ -27,10 +27,20 @@ scrape_configs:
   # The control-plane exposes /metrics (A.9). The orchestrator runs
   # in-process inside it, so its metrics share the same registry —
   # no separate orchestrator target.
+  #
+  # dns_sd against the HEADLESS twin Service (control-plane/
+  # headless-service.yaml), NOT the ClusterIP one: control-plane runs 2
+  # replicas, and scraping through the load-balanced Service flip-flops
+  # counters between pods — rate() sees phantom resets and every SLI in
+  # rules/ goes wrong (terminal-review I1). A-record lookups return each
+  # pod IP as its own target; refreshed every 30s.
   - job_name: expert-work-control-plane
     metrics_path: /metrics
-    static_configs:
-      - targets: ["control-plane:8000"]
+    dns_sd_configs:
+      - names: ["control-plane-headless.expert-work.svc.cluster.local"]
+        type: A
+        port: 8000
+        refresh_interval: 30s
 
   # W3: uncomment when the sandbox-supervisor (or its Agent Sandbox
   # replacement) is deployed in-cluster.

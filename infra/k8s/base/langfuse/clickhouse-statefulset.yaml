@@ -46,6 +46,23 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/clickhouse
+          # Heaviest pod in this base — pin real requests so it never
+          # runs BestEffort (first evicted under node pressure), cap
+          # memory so a runaway merge can't take the node down.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 4Gi
+          # First boot initializes the data volume; give it its own
+          # window instead of inflating liveness thresholds.
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /ping

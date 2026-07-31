@@ -6,6 +6,10 @@
 #
 # Env-specific values (NEXTAUTH_URL, S3 endpoint/bucket/region) are ""
 # here and patched per environment in overlays/<env>/configmap-patch.yaml.
+#
+# Plain resource, NOT a configMapGenerator entry — no hash suffix, so
+# edits here do NOT auto-roll web/worker: follow up any change with
+# `kubectl -n expert-work rollout restart deploy/langfuse-web deploy/langfuse-worker`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,6 +34,11 @@ data:
 
   # ------------------------------------------------------------------ web
   NEXTAUTH_URL: ""
+  # Public-ALB posture (unlike compose's localhost:3001 bind): signup is
+  # zero-value here — LANGFUSE_INIT_* provisions the only account — and
+  # an open registration form on a subdomain wired to real RDS/OSS is
+  # pure attack surface (terminal-review I2).
+  AUTH_DISABLE_SIGNUP: "true"
 
   # Turnkey init: fixed org/project ids so the control plane's keys
   # (EXPERT_WORK_LANGFUSE_PUBLIC_KEY/SECRET_KEY) bind without UI clicks.

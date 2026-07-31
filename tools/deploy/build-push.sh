@@ -13,7 +13,9 @@
 # convention for the sandbox image (.github/workflows/sandbox-image.yml).
 #
 # admin-ui OIDC build args (--oidc-issuer / --oidc-client-id /
-# --oidc-audience, or the matching VITE_OIDC_* env vars): apps/admin-ui/
+# --oidc-audience, or the matching VITE_OIDC_* env vars — plus
+# --langfuse-base-url / VITE_LANGFUSE_BASE_URL for the debug-console
+# Langfuse deep link, same bake-at-build mechanics): apps/admin-ui/
 # Dockerfile bakes these into the static bundle via Vite's build-time
 # import.meta.env substitution — there's no server-side env read once
 # this becomes nginx-served static files. That means an admin-ui image
@@ -25,7 +27,8 @@
 #
 # Usage:
 #   tools/deploy/build-push.sh [--images control-plane,admin-ui] [--tag <tag>] [--push|--no-push] \
-#       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>]
+#       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \
+#       [--langfuse-base-url <url>]
 #
 # Examples:
 #   tools/deploy/build-push.sh --no-push                  # build only, both images
@@ -62,7 +65,8 @@ langfuse_base_url="${VITE_LANGFUSE_BASE_URL:-}"
 usage() {
     cat >&2 <<EOF
 Usage: $0 [--images control-plane,admin-ui] [--tag <tag>] [--push|--no-push] \\
-    [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>]
+    [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \\
+    [--langfuse-base-url <url>]
 
 Builds (and optionally pushes) expert-work images to Aliyun ACR.
 

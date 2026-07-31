@@ -26,6 +26,7 @@ resources:
   - ingress.yaml
   - control-plane/deployment.yaml
   - control-plane/service.yaml
+  - control-plane/headless-service.yaml
   - control-plane/migrate-job.yaml
   - admin-ui/deployment.yaml
   - admin-ui/service.yaml
@@ -98,11 +99,15 @@ configMapGenerator:
   - name: prometheus-config
     files:
       - observability/prometheus.yml
+  # NOTE: tools/observability/rules/burn_rate_test.yml is deliberately NOT
+  # vendored/listed — it is a promtool UNIT-TEST file (`rule_files:`/`tests:`
+  # top-level keys), and Prometheus' strict rulefmt parser exits 1 on it,
+  # crash-looping the pod (terminal-review C1). The compose stack has the
+  # same latent bug (whole-directory mount + *.yml glob) — follow-up.
   - name: prometheus-rules
     files:
       - observability/rules/alerts.yml
       - observability/rules/burn_rate.yml
-      - observability/rules/burn_rate_test.yml
       - observability/rules/sli.yml
       - observability/rules/uplift.yml
   - name: tempo-config

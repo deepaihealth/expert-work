@@ -67,12 +67,16 @@
 
 ### Task 5: 部署 runbook + 冒烟(PR 合并后运维执行,不进 PR 代码)
 
-1. mirror 完成确认(9 镜像在 ACR)
-2. RDS 建库:`CREATE DATABASE langfuse` + 专用 user(psql 经跳板/pod)
-3. secrets.env 金库补真值 → `kubectl apply -k overlays/test`
-4. 冒烟:langfuse-test 域名开页登录 → 跑一条 run → trace 到达 Langfuse(Agent Graphs 出图)→ prometheus targets up → grafana port-forward 看板有数
-5. **记忆召回 5.7s 拆解**:抓真 trace 看 recall 子 span(resolve_mode/embed/retrieve/rerank)哪个是大头,结论回填 progress
-6. admin-ui 重建(带 VITE_LANGFUSE_BASE_URL)发测试环境 + newTag PR
+1. mirror 完成确认:**overlay 引用的 8 个**(otel-collector/prometheus/tempo/grafana/alertmanager/clickhouse-server/langfuse/langfuse-worker,tag 必须与 base 完全一致——overlay 只重映射 newName 不改 tag)+ node:22-alpine(W2 扫尾欠账,不进 overlay)
+2. **云 Redis 前提校验**(终审 I5):`CONFIG GET maxmemory-policy` 必须是 `noeviction`(实例级;Langfuse 队列在 DB 1,驱逐=trace 静默丢)
+3. RDS 建库:`CREATE DATABASE langfuse` + 专用 user(psql 经跳板/pod)
+4. secrets.env 金库补真值 → `kubectl apply -k overlays/test`
+5. 冒烟:langfuse-test 域名开页登录(注册应被禁,AUTH_DISABLE_SIGNUP)→ 跑一条 run → trace 到达 Langfuse(Agent Graphs 出图)→ prometheus targets up(应看到 control-plane **两个** pod 目标)→ grafana port-forward 看板有数;对着 3.122.0 实测 `/api/public/ready` 存在(liveness/startup 用它)
+6. **告警链路现状记录**(终审 M5):alertmanager receivers 仍是 placeholder webhook——P0/P1/P2 会路由但投递到空气;真 PagerDuty/飞书 endpoint 是后续项,勿误当有 oncall 覆盖
+7. **记忆召回 5.7s 拆解**:抓真 trace 看 recall 子 span(resolve_mode/embed/retrieve/rerank)哪个是大头,结论回填 progress
+8. admin-ui 重建(带 VITE_LANGFUSE_BASE_URL=https://langfuse-test.deepaihealth.com)发测试环境 + newTag PR
+
+**Follow-up(不阻本 PR)**:compose 侧同款 C1 坑(整目录挂载 + `*.yml` glob 命中 burn_rate_test.yml,`--profile observability` 的 prometheus 一直起不来)——修法=单测文件挪 `tools/observability/rules/tests/` 子目录 + 改 promtool 文档路径(docs/runbooks/slo.md、20-observability.md);clickhouse headless Service(终审 M2,replicas>1 才需要);keycloak/searxng resources 既有欠账。
 
 ---
 

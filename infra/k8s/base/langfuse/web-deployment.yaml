@@ -32,6 +32,25 @@ spec:
                 name: langfuse-config
             - secretRef:
                 name: langfuse-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          # Boot runs Prisma + ClickHouse migrations before the server
+          # listens — startupProbe owns that window (up to 10 min) so
+          # liveness never kills a mid-migration pod into a restart loop.
+          startupProbe:
+            httpGet:
+              path: /api/public/ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          # readiness on /health (checks PG+ClickHouse): DB trouble only
+          # sheds traffic. liveness on /ready (no DB dependency): an RDS
+          # blip must NOT trigger kubelet restarts (terminal-review I3,
+          # same split as the official langfuse-k8s chart).
           readinessProbe:
             httpGet:
               path: /api/public/health
@@ -40,10 +59,7 @@ spec:
             failureThreshold: 6
           livenessProbe:
             httpGet:
-              path: /api/public/health
+              path: /api/public/ready
               port: http
-            # Generous: boot runs Prisma + ClickHouse migrations before
-            # the server listens.
-            initialDelaySeconds: 60
             periodSeconds: 15
             failureThreshold: 8

@@ -26,6 +26,12 @@ spec:
               containerPort: 4317
             - name: otlp-http
               containerPort: 4318
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
           volumeMounts:
             - name: config
               mountPath: /etc/otel

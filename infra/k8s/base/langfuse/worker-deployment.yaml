@@ -28,6 +28,12 @@ spec:
                 name: langfuse-config
             - secretRef:
                 name: langfuse-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
           readinessProbe:
             tcpSocket:
               port: health
