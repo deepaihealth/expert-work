@@ -7,12 +7,14 @@ each test.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from uuid import UUID
 
 import pytest
 from opentelemetry import trace
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -158,3 +160,94 @@ def test_expert_work_span_without_links_has_none(exporter: InMemorySpanExporter)
 
     [span] = list(exporter.get_finished_spans())
     assert not span.links
+
+
+# ---------------------------------------------------------------------------
+# OTLP exporter opt-in — ``init_tracing`` must not build an exporter when no
+# endpoint is configured (a localhost default left BatchSpanProcessor's
+# background thread retrying forever in collector-less environments, spamming
+# "Transient error ... retrying" WARNINGs on the root logger).
+#
+# ``trace.set_tracer_provider`` is a process-wide one-shot, so these tests
+# never touch the session-scoped global provider: they route ``init_tracing``'s
+# re-init path onto a throwaway ``TracerProvider`` and spy on the public
+# ``add_span_processor`` API instead of poking at private processor lists.
+# ---------------------------------------------------------------------------
+
+
+def _fresh_provider(monkeypatch: pytest.MonkeyPatch) -> TracerProvider:
+    provider = TracerProvider()
+
+    def _get_provider() -> TracerProvider:
+        return provider
+
+    monkeypatch.setattr(trace, "get_tracer_provider", _get_provider)
+    return provider
+
+
+def _spy_added_processors(
+    provider: TracerProvider, monkeypatch: pytest.MonkeyPatch
+) -> list[SpanProcessor]:
+    added: list[SpanProcessor] = []
+    real_add = provider.add_span_processor
+
+    def _record(span_processor: SpanProcessor) -> None:
+        added.append(span_processor)
+        real_add(span_processor)
+
+    monkeypatch.setattr(provider, "add_span_processor", _record)
+    return added
+
+
+def test_init_tracing_without_endpoint_installs_no_exporter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No ``otlp_endpoint`` param + no env var → no processor at all, and an
+    INFO breadcrumb explains why no traces will show up."""
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    provider = _fresh_provider(monkeypatch)
+    added = _spy_added_processors(provider, monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="expert_work.observability.tracing"):
+        result = init_tracing(service_name="test-service", env="test")
+
+    assert result is provider
+    assert added == []
+    own_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "expert_work.observability.tracing"
+    ]
+    assert any("tracing.export_not_configured" in message for message in own_messages)
+
+
+def test_init_tracing_with_explicit_endpoint_installs_batch_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    provider = _fresh_provider(monkeypatch)
+    added = _spy_added_processors(provider, monkeypatch)
+
+    init_tracing(
+        service_name="test-service",
+        env="test",
+        otlp_endpoint="http://127.0.0.1:9/v1/traces",
+    )
+
+    assert len(added) == 1
+    assert isinstance(added[0], BatchSpanProcessor)
+    provider.shutdown()
+
+
+def test_init_tracing_with_env_endpoint_installs_batch_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:9/v1/traces")
+    provider = _fresh_provider(monkeypatch)
+    added = _spy_added_processors(provider, monkeypatch)
+
+    init_tracing(service_name="test-service", env="test")
+
+    assert len(added) == 1
+    assert isinstance(added[0], BatchSpanProcessor)
+    provider.shutdown()

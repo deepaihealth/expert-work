@@ -5,8 +5,9 @@ Design: subsystems/20-observability § 4.1 + § 5.1.
 Two public surfaces:
 
 - :func:`init_tracing` — process-wide setup. Wires the SDK to an OTLP
-  exporter (default ``http://localhost:4318/v1/traces`` for the local
-  OTel Collector); idempotent across re-invocations.
+  exporter when an endpoint is configured (``otlp_endpoint`` param or
+  ``$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``); no endpoint → no exporter.
+  Idempotent across re-invocations.
 - :func:`expert_work_span` — context manager that creates a span with the
   ``expert_work.{component}.{action}`` naming contract + auto-injected
   ``tenant`` / ``service`` / ``env`` attributes.
@@ -154,12 +155,14 @@ def init_tracing(
     :param service_name: Logical service (``control_plane`` /
         ``orchestrator``).
     :param env: ``dev`` / ``staging`` / ``prod``.
-    :param otlp_endpoint: Override the OTLP HTTP endpoint. Default is
-        ``$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` or
-        ``http://localhost:4318/v1/traces``.
+    :param otlp_endpoint: OTLP HTTP endpoint to export spans to. Falls
+        back to ``$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``. When neither is
+        set (and no ``span_processor`` is injected), **no exporter is
+        installed** — spans are still created, just not exported.
     :param span_processor: Inject a custom processor (tests pass an
         ``InMemorySpanExporter`` here). When ``None``, a
-        :class:`BatchSpanProcessor` + OTLP HTTP exporter is built.
+        :class:`BatchSpanProcessor` + OTLP HTTP exporter is built if an
+        endpoint is configured.
     :returns: The active provider (so callers can ``provider.shutdown()``
         on teardown).
     """
@@ -168,23 +171,34 @@ def init_tracing(
     _env = env
 
     if span_processor is None:
-        # Lazy import — the OTLP exporter pulls in protobuf + requests,
-        # which tests using in-memory exporters don't need.
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-            OTLPSpanExporter,
-        )
+        endpoint = otlp_endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        if endpoint:
+            # Lazy import — the OTLP exporter pulls in protobuf + requests,
+            # which tests using in-memory exporters don't need.
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
 
-        endpoint = (
-            otlp_endpoint
-            or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-            or "http://localhost:4318/v1/traces"
-        )
-        span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+            span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+        else:
+            # No collector configured → install no exporter. The old
+            # ``http://localhost:4318/v1/traces`` fallback left
+            # BatchSpanProcessor's background thread retrying forever in
+            # collector-less environments (CI, bare runs), spamming
+            # "Transient error ... retrying" WARNINGs on the root logger.
+            logger.info(
+                "tracing.export_not_configured service=%s env=%s "
+                "(set otlp_endpoint or $OTEL_EXPORTER_OTLP_TRACES_ENDPOINT "
+                "to export spans)",
+                service_name,
+                env,
+            )
 
     existing = trace.get_tracer_provider()
     if isinstance(existing, TracerProvider):
-        # Re-init path: attach the new processor to the live provider.
-        existing.add_span_processor(span_processor)
+        # Re-init path: attach the new processor (if any) to the live provider.
+        if span_processor is not None:
+            existing.add_span_processor(span_processor)
         logger.info("tracing.reinit service=%s env=%s", service_name, env)
         return existing
 
@@ -197,7 +211,8 @@ def init_tracing(
         }
     )
     provider = TracerProvider(resource=resource)
-    provider.add_span_processor(span_processor)
+    if span_processor is not None:
+        provider.add_span_processor(span_processor)
     trace.set_tracer_provider(provider)
     logger.info("tracing.initialized service=%s env=%s", service_name, env)
     return provider
