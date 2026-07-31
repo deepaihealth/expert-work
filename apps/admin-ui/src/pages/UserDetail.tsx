@@ -25,7 +25,7 @@ import { listMemories, type MemoryItem, type MemoryKind } from "../api/memory";
 import { getUsageTokens } from "../api/usage";
 import { getTenantUser } from "../api/users";
 import { PageHeader } from "../components/PageHeader";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ArtifactsPane } from "./user_detail/ArtifactsPane";
 import { formatCompact } from "../utils/runFormat";
 
@@ -300,7 +300,7 @@ export function UserDetail() {
   useEffect(() => {
     if (!userId) return;
     let cancelled = false;
-    getTenantUser(userId, apiTenantScope)
+    getTenantUser(userId, concreteTenantScope(apiTenantScope))
       .then((u) => {
         if (!cancelled && u.display_name) setFetchedName(u.display_name);
       })

@@ -15,8 +15,10 @@ vi.mock("../../auth/AuthContext", () => ({
 }));
 
 let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
+// Spread the real module so the component keeps the real
+// ``concreteTenantScope`` ("*" → undefined) instead of a test-local copy.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
@@ -52,6 +54,14 @@ describe("SkillEvolutionKillSwitch", () => {
     getMock.mockResolvedValue(state());
     renderControl();
     await waitFor(() => expect(getMock).toHaveBeenCalledWith(mockScope));
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id so the control stays visible', async () => {
+    mockScope = "*";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(undefined));
+    expect(await screen.findByTestId("skill-kill-switch")).toBeInTheDocument();
   });
 
   it("shows the active status + tenant toggle for a tenant admin (no global)", async () => {

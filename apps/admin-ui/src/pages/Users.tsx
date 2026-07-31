@@ -31,7 +31,7 @@ import { ApiError } from "../api/client";
 import { listUsers, type TenantUserRoster, type TenantUserRosterItem } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -57,14 +57,19 @@ export function Users() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
 
-  // Scope-aware roster: a scope-switched system_admin sees the selected
-  // tenant's roster (or the "*" aggregate) instead of silently reading
-  // their home tenant (跨租户钻取 2026-07-31).
+  // Scope-aware roster: a UUID-scope-switched system_admin sees the selected
+  // tenant's roster instead of silently reading their home tenant (跨租户钻取
+  // 2026-07-31). The "*" aggregate maps to undefined — the backend types
+  // tenant_id as ``UUID | None`` and 422s a literal "*" — so the aggregate
+  // view falls back to the caller's home tenant. Caveat: under a UUID switch
+  // the UserProfile/UserDetail sub-panels (Conversations/Memory/Usage/
+  // Workspace panes) are not scope-wired yet and still read the home
+  // tenant — W3 计划内.
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setData(await listUsers({ tenantScope: apiTenantScope }));
+      setData(await listUsers({ tenantScope: concreteTenantScope(apiTenantScope) }));
     } catch (err) {
       setError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
     } finally {

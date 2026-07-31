@@ -25,8 +25,10 @@ import type { ConversationDetail as ConversationDetailModel } from "../../api/co
 // Mutable tenant scope for the page's ``useTenantScope()`` — the default
 // (undefined) keeps every pre-existing test on the caller's home tenant.
 let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
+// Spread the real module so the page keeps the real ``concreteTenantScope``
+// ("*" → undefined) instead of a test-local copy that could drift.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
@@ -231,6 +233,14 @@ describe("ConversationDetail", () => {
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
     renderPage();
     await waitFor(() => expect(spy).toHaveBeenCalledWith(THREAD_ID, TENANT_ID));
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
+    mockScope = "*";
+    const spy = vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(THREAD_ID, undefined));
   });
 
   it("renders the conversation summary + its run list", async () => {

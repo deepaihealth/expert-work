@@ -19,7 +19,7 @@ import { useTranslation } from "react-i18next";
 import { getTenantUser } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ConversationsPane } from "./user_profile/ConversationsPane";
 import { MemoryPane } from "./user_profile/MemoryPane";
 import { PurgeUserModal } from "./user_profile/PurgeUserModal";
@@ -57,7 +57,7 @@ export function UserProfile() {
   useEffect(() => {
     if (!userId || denied) return;
     let cancelled = false;
-    getTenantUser(userId, apiTenantScope)
+    getTenantUser(userId, concreteTenantScope(apiTenantScope))
       .then((u) => {
         if (cancelled) return;
         setFetchedSubjectId(u.subject_id);

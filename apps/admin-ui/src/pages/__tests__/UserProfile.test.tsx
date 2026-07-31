@@ -36,8 +36,10 @@ vi.mock("../../auth/AuthContext", () => ({
   }),
 }));
 let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
+// Spread the real module so the page keeps the real ``concreteTenantScope``
+// ("*" → undefined) instead of a test-local copy that could drift.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
@@ -151,6 +153,15 @@ describe("UserProfile", () => {
     renderPage();
     await waitFor(() =>
       expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, mockScope),
+    );
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
+    mockScope = "*";
+    stubCommon();
+    renderPage();
+    await waitFor(() =>
+      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, undefined),
     );
   });
 

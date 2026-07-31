@@ -27,6 +27,14 @@ export const SCOPE_ALL = "*" as const;
  *  any UUID ⇒ specific tenant switch. */
 export type TenantScopeValue = typeof SCOPE_HOME | typeof SCOPE_ALL | string;
 
+/** Collapse the ``"*"`` aggregate to ``undefined`` for endpoints whose
+ *  ``tenant_id`` is typed ``UUID | None`` server-side — they 422 a literal
+ *  ``"*"``. A concrete UUID switch passes through; the aggregate falls back
+ *  to the caller's home tenant (the pre-scope-threading behavior). */
+export function concreteTenantScope(scope: undefined | string): string | undefined {
+  return scope === SCOPE_ALL ? undefined : scope;
+}
+
 interface TenantScopeContextValue {
   scope: TenantScopeValue;
   setScope: (next: TenantScopeValue) => void;

@@ -22,8 +22,10 @@ vi.mock("../../auth/AuthContext", () => ({
   }),
 }));
 let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
+// Spread the real module so the page keeps the real ``concreteTenantScope``
+// ("*" → undefined) instead of a test-local copy that could drift.
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
@@ -85,15 +87,26 @@ afterEach(() => {
 });
 
 describe("Users", () => {
-  it("threads the tenant scope through listUsers (跨租户钻取 B类补传)", async () => {
+  it("threads a concrete tenant scope through listUsers (跨租户钻取 B类补传)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    const spy = vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
+      items: [EXTERNAL],
+      total: 1,
+      cross_tenant: false,
+    });
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: mockScope }));
+  });
+
+  it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
     mockScope = "*";
     const spy = vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
       items: [EXTERNAL],
       total: 1,
-      cross_tenant: true,
+      cross_tenant: false,
     });
     renderPage();
-    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: "*" }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: undefined }));
   });
 
   it("renders roster rows keyed on subject_id, type tags, and summary stats", async () => {
