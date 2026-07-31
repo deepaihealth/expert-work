@@ -88,7 +88,7 @@ import {
   readPromptVariables,
 } from "../../components/manifest-editor/form_model";
 import { useAuth } from "../../auth/AuthContext";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
@@ -684,7 +684,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     async (name: string) => {
       setBusyWorkspaceKey(`artifact:${name}`);
       try {
-        await downloadArtifact(name, undefined, apiTenantScope);
+        await downloadArtifact(name, undefined, concreteTenantScope(apiTenantScope));
       } catch {
         // Swallow — same rationale as the file download.
       } finally {

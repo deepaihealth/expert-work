@@ -68,7 +68,7 @@ import { labelPurpose } from "../../pages/agent_detail/playground/trace_purpose"
 import { TurnMeta } from "../../pages/agent_detail/playground/TurnMeta";
 import { PlanPanel } from "../../pages/run_detail/PlanPanel";
 import { buildLangfuseTraceUrl } from "../../config/env";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { FeedbackBar } from "./FeedbackBar";
 import {
@@ -563,7 +563,7 @@ export function TurnCard({
   useEffect(() => {
     if (eventView !== "exact" || !threadId || !runId || trace !== null) return;
     let cancelled = false;
-    void getRunTrace(threadId, runId, apiTenantScope)
+    void getRunTrace(threadId, runId, concreteTenantScope(apiTenantScope))
       .then((data) => {
         if (!cancelled) setTrace(data);
       })
@@ -625,7 +625,7 @@ export function TurnCard({
   useEffect(() => {
     if (!isSystemAdmin || !threadId || !runId) return;
     let cancelled = false;
-    void getRun(threadId, runId, apiTenantScope)
+    void getRun(threadId, runId, concreteTenantScope(apiTenantScope))
       .then((detail) => {
         if (!cancelled) setTraceId(detail.trace_id ?? null);
       })

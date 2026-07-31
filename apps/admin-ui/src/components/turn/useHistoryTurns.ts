@@ -23,7 +23,7 @@ import {
   type SseEvent,
 } from "../../api/sessions";
 import { buildHistoryTurns } from "../../pages/agent_detail/playground/history_turns";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import type { HistoryLoad, HistoryTurn } from "./types";
 
 export interface UseHistoryTurns {
@@ -154,7 +154,7 @@ export function useHistoryTurns(): UseHistoryTurns {
       const collected: SseEvent[] = [];
       for await (const frame of streamRunEvents(threadId, runId, {
         signal: historyAbortRef.current?.signal,
-        tenantScope: apiTenantScope,
+        tenantScope: concreteTenantScope(apiTenantScope),
       })) {
         collected.push(frame);
         if (frame.event === "end") break;

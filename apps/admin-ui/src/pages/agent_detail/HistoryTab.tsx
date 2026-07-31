@@ -28,7 +28,7 @@ import {
   type AgentDetailResponse,
   type RevisionSummary,
 } from "../../api/agents";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
@@ -62,7 +62,7 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
     setLoading(true);
     setError(null);
     try {
-      const result = await listRevisions(name, version, apiTenantScope);
+      const result = await listRevisions(name, version, concreteTenantScope(apiTenantScope));
       setItems(result.items);
     } catch (err) {
       setError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
@@ -82,8 +82,8 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
       setError(null);
       try {
         const [older, newer] = await Promise.all([
-          getRevision(name, version, a, apiTenantScope),
-          getRevision(name, version, b, apiTenantScope),
+          getRevision(name, version, a, concreteTenantScope(apiTenantScope)),
+          getRevision(name, version, b, concreteTenantScope(apiTenantScope)),
         ]);
         setDiff({
           older: yamlDump(older.record.spec, { lineWidth: 120 }),

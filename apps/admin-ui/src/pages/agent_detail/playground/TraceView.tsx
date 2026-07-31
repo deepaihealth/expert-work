@@ -44,7 +44,7 @@ import { fmtDuration } from "./duration_format";
 import { buildRows, isWideBar, type TraceRowData } from "./trace_tree";
 import { cleanUntrusted } from "./untrusted_clean";
 import { EntryBreakdown } from "./EntryBreakdown";
-import { useTenantScope } from "../../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../../tenant/TenantScopeContext";
 
 const ACCENT = "var(--ew-text-info, #4c8dff)";
 const SUCCESS = "var(--ew-text-success, #3ecf8e)";
@@ -802,7 +802,7 @@ function TraceDetail({
     if (threadId === undefined || runId === undefined) return;
     setRawView({ status: "loading", content: "" });
     try {
-      const content = await fetchRunTraceRaw(threadId, runId, span.id, field, apiTenantScope);
+      const content = await fetchRunTraceRaw(threadId, runId, span.id, field, concreteTenantScope(apiTenantScope));
       setRawView({ status: "ok", content });
     } catch {
       setRawView({ status: "error", content: "" });

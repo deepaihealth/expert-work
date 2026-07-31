@@ -23,7 +23,7 @@ import { useTranslation } from "react-i18next";
 import { streamRunEvents } from "../../api/runs";
 import type { SseEvent } from "../../api/sessions";
 import { parseCompactionEvents } from "../../api/tool_timeline";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { CompactionSummaryList } from "../../components/CompactionCard";
 import { EventCard } from "../../components/EventCard";
 import { ToolTimeline } from "../../components/ToolTimeline";
@@ -85,7 +85,7 @@ export function EventStreamPanel({ threadId, runId }: EventStreamPanelProps) {
       try {
         for await (const frame of streamRunEvents(threadId, runId, {
           signal: ac.signal,
-          tenantScope: apiTenantScope,
+          tenantScope: concreteTenantScope(apiTenantScope),
         })) {
           setEvents((prev) => [...prev, frame]);
           if (frame.event === "end") break;

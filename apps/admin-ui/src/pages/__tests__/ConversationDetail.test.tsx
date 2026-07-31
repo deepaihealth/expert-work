@@ -24,29 +24,24 @@ import type { ConversationDetail as ConversationDetailModel } from "../../api/co
 
 // Mutable tenant scope for the page's ``useTenantScope()`` — the default
 // (undefined) keeps every pre-existing test on the caller's home tenant.
+// ``scope`` falls back to "home" so ``useIsTenantSwitched`` never reads an
+// undefined scope as a switched-in state.
 let mockScope: string | undefined;
 // Spread the real module so the page keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
 vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
 }));
 
 const THREAD_ID = "44444444-4444-4444-4444-444444444444";
 const TENANT_ID = "22222222-2222-2222-2222-222222222222";
 const RUN_1 = "33333333-3333-3333-3333-333333333333";
 const RUN_2 = "33333333-3333-3333-3333-333333333334";
-
-// Track C W2 — 页面/TurnCard/useHistoryTurns 组件内直取 tenant scope;这些
-// 测试不挂 TenantScopeProvider,mock 成 home 态(apiTenantScope undefined)。
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
 
 function jwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));

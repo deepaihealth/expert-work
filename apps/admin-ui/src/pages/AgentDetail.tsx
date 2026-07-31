@@ -38,7 +38,7 @@ import { useTranslation } from "react-i18next";
 import { disableAgent, enableAgent, getAgent, type AgentDetailResponse } from "../api/agents";
 import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { ConversationsTab } from "./agent_detail/ConversationsTab";
 import { UsersTab } from "./agent_detail/UsersTab";
@@ -201,7 +201,7 @@ export function AgentDetail() {
     setLoading(true);
     setError(null);
     try {
-      const result = await getAgent(name, version, apiTenantScope);
+      const result = await getAgent(name, version, concreteTenantScope(apiTenantScope));
       setDetail(result);
     } catch (err) {
       const message =
@@ -223,7 +223,7 @@ export function AgentDetail() {
   const refreshQuietly = useCallback(async () => {
     if (!name || !version) return;
     try {
-      const result = await getAgent(name, version, apiTenantScope);
+      const result = await getAgent(name, version, concreteTenantScope(apiTenantScope));
       setDetail(result);
       setError(null);
     } catch (err) {

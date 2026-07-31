@@ -28,7 +28,7 @@ import {
   type RunStatus,
 } from "../api/runs";
 import { useStatusPolling } from "../hooks/useStatusPolling";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ApprovalCard } from "./run_detail/ApprovalCard";
 import { EventStreamPanel } from "./run_detail/EventStreamPanel";
 import { PlanPanel } from "./run_detail/PlanPanel";
@@ -72,7 +72,7 @@ export function RunDetail() {
   const refreshSilent = useCallback(async () => {
     if (!threadId || !runId) return;
     try {
-      setRun(await getRun(threadId, runId, apiTenantScope));
+      setRun(await getRun(threadId, runId, concreteTenantScope(apiTenantScope)));
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -89,7 +89,7 @@ export function RunDetail() {
     setLoading(true);
     setError(null);
     try {
-      setRun(await getRun(threadId, runId, apiTenantScope));
+      setRun(await getRun(threadId, runId, concreteTenantScope(apiTenantScope)));
     } catch (err) {
       const msg =
         err instanceof ApiError
