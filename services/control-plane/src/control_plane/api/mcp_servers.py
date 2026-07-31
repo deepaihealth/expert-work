@@ -8,17 +8,25 @@ import math
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from control_plane.api._authz import require
 from control_plane.audit import emit
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenancy.tenant_config import TenantConfigNotConfiguredError
-from control_plane.tenant_scope import bypass_rls_session
+from control_plane.tenant_scope import (
+    CrossTenant,
+    SingleTenant,
+    applied_scope,
+    bypass_rls_session,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+    ensure_tenant_scope,
+)
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.url_validation import RemoteURLError, validate_remote_url
 from expert_work.persistence import (
@@ -328,6 +336,34 @@ async def _resolve_plan(tenant_config_service: object, tenant_id: UUID) -> Tenan
     except TenantConfigNotConfiguredError:
         return TenantPlan.FREE
     return cfg.plan  # type: ignore[no-any-return]
+
+
+async def _resolve_list_scope(
+    request: Request,
+    principal: Principal,
+    tenant_id: UUID | Literal["*"] | None,
+    audit: AuditLogger,
+    *,
+    endpoint: str,
+) -> SingleTenant:
+    """W3 read scope for the two mcp-server lists.
+
+    ``TenantMcpServerStore`` has no cross-tenant aggregate reader and the "*"
+    aggregate is a spec non-goal here — a resolved :class:`CrossTenant` falls
+    back to the caller's home tenant (the pre-scope-threading behavior,
+    mirroring the front-end ``concreteTenantScope`` collapse).
+    """
+    scope = await ensure_tenant_scope(
+        principal,
+        tenant_id,
+        audit,
+        trace_id=current_trace_id_hex(),
+        endpoint=endpoint,
+        cross_tenant_enabled=cross_tenant_query_enabled(request),
+    )
+    if isinstance(scope, CrossTenant):
+        return SingleTenant(tenant_id=principal.tenant_id)
+    return scope
 
 
 async def _tenant_allowlist(tenant_config_service: object, tenant_id: UUID) -> list[str]:
@@ -701,10 +737,19 @@ def build_mcp_servers_router() -> APIRouter:
 
     @router.get("")
     async def list_mcp_servers(
+        request: Request,
         principal: Annotated[Principal, Depends(require("mcp_server", "read"))],
         store: Annotated[TenantMcpServerStore, Depends(_get_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's MCP servers from the tenant switcher.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        rows = await store.list_for_tenant(tenant_id=principal.tenant_id)
+        scope = await _resolve_list_scope(
+            request, principal, tenant_id, audit, endpoint="GET /v1/mcp-servers"
+        )
+        async with applied_scope(scope):
+            rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
         return {"success": True, "data": [_public(r) for r in rows], "error": None}
 
     @router.post("/test")
@@ -744,21 +789,29 @@ def build_mcp_servers_router() -> APIRouter:
 
     @router.get("/available")
     async def list_available_mcp_servers(
+        request: Request,
         principal: Annotated[Principal, Depends(require("mcp_server", "read"))],
         store: Annotated[TenantMcpServerStore, Depends(_get_store)],
         catalog_store: Annotated[McpConnectorCatalogStore, Depends(_get_catalog_store)],
         tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — same treatment as the base list.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        tenant_id = principal.tenant_id
+        scope = await _resolve_list_scope(
+            request, principal, tenant_id, audit, endpoint="GET /v1/mcp-servers/available"
+        )
+        target_tenant = scope.tenant_id
         available: list[dict[str, object]] = []
         allowlist: list[str] = []
-        if tenant_config_service is not None:
-            try:
-                cfg = await tenant_config_service.get(tenant_id=tenant_id)  # type: ignore[attr-defined]
-                allowlist = list(cfg.mcp_allowlist)
-            except Exception:
-                logger.info("mcp_servers.available.no_tenant_config")
-        tenant_rows = await store.list_for_tenant(tenant_id=tenant_id)
+        async with applied_scope(scope):
+            if tenant_config_service is not None:
+                try:
+                    cfg = await tenant_config_service.get(tenant_id=target_tenant)  # type: ignore[attr-defined]
+                    allowlist = list(cfg.mcp_allowlist)
+                except Exception:
+                    logger.info("mcp_servers.available.no_tenant_config")
+            tenant_rows = await store.list_for_tenant(tenant_id=target_tenant)
 
         # Fetch the platform catalog once if either the allowlist (platform rows,
         # enriched below) or any catalog-bound tenant row needs it. Catalog is
@@ -805,21 +858,36 @@ def build_mcp_servers_router() -> APIRouter:
     @router.get("/{name}/tools")
     async def list_mcp_server_tools(
         name: Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")],
+        request: Request,
         principal: Annotated[Principal, Depends(require("mcp_server", "read"))],
         store: Annotated[TenantMcpServerStore, Depends(_get_store)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         probe_limiter: Annotated[object, Depends(_get_mcp_probe_limiter)],
         catalog_store: Annotated[McpConnectorCatalogStore, Depends(_get_catalog_store)],
         tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin probe a foreign
+        # tenant's server tools; "*" is meaningless (one owning tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/mcp-servers/{name}/tools",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        # Rate limit stays keyed on the CALLER's tenant (caller-identity).
         await _enforce_probe_rate_limit(probe_limiter, principal.tenant_id)
-        tenant_id = principal.tenant_id
+        target_tenant = scope.tenant_id
 
         # The picker lists BOTH tenant-private servers and platform servers the
         # tenant enabled (``/available`` → ``mcp_allowlist``), so tool-probe must
         # resolve both. Tenant rows first; otherwise fall back to a platform
         # catalog server the tenant has enabled.
-        record = await store.get(tenant_id=tenant_id, name=name)
+        async with applied_scope(scope):
+            record = await store.get(tenant_id=target_tenant, name=name)
         if record is not None:
             transport, url, timeout_s = record.transport, record.url, record.timeout_s
             raw: str | None = None
@@ -827,7 +895,8 @@ def build_mcp_servers_router() -> APIRouter:
                 raw = await secret_store.get(parse_secret_ref(record.token_secret_ref))
             is_tenant = True
         else:
-            allowlist = await _tenant_allowlist(tenant_config_service, tenant_id)
+            async with applied_scope(scope):
+                allowlist = await _tenant_allowlist(tenant_config_service, target_tenant)
             entry = None
             if name in allowlist:
                 # Catalog rows are platform-global (NULL tenant) → bypass RLS (W-8).
@@ -866,16 +935,19 @@ def build_mcp_servers_router() -> APIRouter:
             )
         except McpProbeError as exc:
             # On-demand probe doubles as the live-health signal — persist the
-            # failure (#2). Only tenant rows carry per-server health.
+            # failure (#2). Only tenant rows carry per-server health. The
+            # health stamp belongs to the PROBED row's tenant (scope target).
             if is_tenant:
-                await _record_health(
-                    store, tenant_id=tenant_id, name=name, status="error", error=exc.code
-                )
+                async with applied_scope(scope):
+                    await _record_health(
+                        store, tenant_id=target_tenant, name=name, status="error", error=exc.code
+                    )
             raise HTTPException(
                 status_code=502, detail={"code": exc.code, "message": exc.message}
             ) from exc
         if is_tenant:
-            await _record_health(store, tenant_id=tenant_id, name=name, status="ok")
+            async with applied_scope(scope):
+                await _record_health(store, tenant_id=target_tenant, name=name, status="ok")
         return {
             "success": True,
             "data": [{"name": t.name, "description": t.description or ""} for t in tools],

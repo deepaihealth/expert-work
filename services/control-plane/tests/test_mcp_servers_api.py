@@ -1443,3 +1443,122 @@ async def test_available_platform_row_degrades_when_catalog_missing(
     assert r.status_code == 200, r.text
     rows = {item["name"]: item for item in r.json()["data"]}
     assert rows["ghost-server"] == {"name": "ghost-server", "source": "platform"}
+
+
+# ---------------------------------------------------------------------------
+# W3 — mcp-servers 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套:system_admin 带目标租户 tenant_id → 200 命中目标租户数据;普通
+# 租户用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tools 详情
+# tenant_id=* → 400 SCOPE_ALL_NOT_SUPPORTED;列表 "*" 无聚合读法 → 回落
+# 归属租户。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin_on(app: object) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from the tenant under test."""
+    from expert_work.protocol import Role
+
+    sys_admin_id = uuid4()
+    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _seed_server(client: AsyncClient, admin_headers: dict[str, str]) -> None:
+    resp = await client.post(
+        "/v1/mcp-servers",
+        json={
+            "name": "linear",
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "auth_type": "none",
+            "timeout_s": 30.0,
+        },
+        headers=admin_headers,
+    )
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_scope_system_admin_target_tenant_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        headers = await _grant_system_admin_on(app)
+        params = {"tenant_id": str(tenant_id)}
+
+        listed = await client.get("/v1/mcp-servers", params=params, headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert [r["name"] for r in listed.json()["data"]] == ["linear"]
+
+        available = await client.get("/v1/mcp-servers/available", params=params, headers=headers)
+        assert available.status_code == 200, available.text
+        assert [r["name"] for r in available.json()["data"]] == ["linear"]
+
+        tools = await client.get("/v1/mcp-servers/linear/tools", params=params, headers=headers)
+        assert tools.status_code == 200, tools.text
+        assert [t["name"] for t in tools.json()["data"]] == ["create_issue"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_lists_star_fall_back_to_home_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tenant_id=*``:TenantMcpServerStore 无聚合读法(spec 非目标)→ 回落
+    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    app, admin_headers, _tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        headers = await _grant_system_admin_on(app)
+        for path in ("/v1/mcp-servers", "/v1/mcp-servers/available"):
+            resp = await client.get(path, params={"tenant_id": "*"}, headers=headers)
+            assert resp.status_code == 200, f"{path}: {resp.status_code} {resp.text}"
+            assert resp.json()["data"] == [], path
+
+
+@pytest.mark.asyncio
+async def test_mcp_scope_foreign_tenant_user_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        foreign_token = make_test_jwt(tenant_id=uuid4(), subject=str(uuid4()), roles=("admin",))
+        foreign = {"Authorization": f"Bearer {foreign_token}"}
+        for name, path in [
+            ("list", "/v1/mcp-servers"),
+            ("available", "/v1/mcp-servers/available"),
+            ("tools", "/v1/mcp-servers/linear/tools"),
+        ]:
+            resp = await client.get(path, params={"tenant_id": str(tenant_id)}, headers=foreign)
+            assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+            assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_tenant_id_star_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    app, admin_headers, _tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        resp = await client.get(
+            "/v1/mcp-servers/linear/tools", params={"tenant_id": "*"}, headers=admin_headers
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
