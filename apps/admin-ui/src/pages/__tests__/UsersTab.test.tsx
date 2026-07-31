@@ -16,6 +16,20 @@ import { UsersTab } from "../agent_detail/UsersTab";
 import type { AgentDetailResponse } from "../../api/agents";
 import type { AgentUserItem } from "../../api/users";
 
+// Stream N — the tab reads the ambient tenant scope; these tests don't
+// mount a TenantScopeProvider, so mock it (mutable for passthrough asserts).
+const { tenantScopeRef } = vi.hoisted(() => ({
+  tenantScopeRef: { current: undefined as string | undefined },
+}));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: tenantScopeRef.current ?? "home",
+    setScope: () => {},
+    apiTenantScope: tenantScopeRef.current,
+  }),
+}));
+
 const DETAIL = {
   record: { name: "support-bot", version: "1.0.0" },
 } as unknown as AgentDetailResponse;
@@ -70,9 +84,25 @@ function renderTab() {
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  tenantScopeRef.current = undefined;
+  vi.restoreAllMocks();
+});
 
 describe("UsersTab", () => {
+  it("passes the ambient tenant scope through to the users rollup", async () => {
+    tenantScopeRef.current = "99999999-9999-9999-9999-999999999999";
+    const listSpy = vi
+      .spyOn(usersSdk, "listAgentUsers")
+      .mockResolvedValue({ items: [ALICE], total: 1, cross_tenant: false });
+    renderTab();
+    await waitFor(() =>
+      expect(listSpy).toHaveBeenCalledWith("support-bot", "1.0.0", {
+        tenantScope: "99999999-9999-9999-9999-999999999999",
+      }),
+    );
+  });
+
   it("renders the rollup rows with name fallback, error signal + tokens", async () => {
     vi.spyOn(usersSdk, "listAgentUsers").mockResolvedValue({
       items: [ALICE, BOB],

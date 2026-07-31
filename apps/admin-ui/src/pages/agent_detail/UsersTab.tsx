@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import type { AgentDetailResponse } from "../../api/agents";
 import { ApiError } from "../../api/client";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 import { listAgentUsers, type AgentUserItem, type AgentUserList } from "../../api/users";
 import { formatCompact } from "../../utils/runFormat";
 
@@ -35,17 +36,21 @@ export function UsersTab({ detail }: UsersTabProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Stream N — the lists are scope-aware ("*" aggregates every tenant),
+  // so the ambient scope rides along for a switched-in system_admin.
+  const { apiTenantScope } = useTenantScope();
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setData(await listAgentUsers(name, version));
+      setData(await listAgentUsers(name, version, { tenantScope: apiTenantScope }));
     } catch (err) {
       setError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
     } finally {
       setLoading(false);
     }
-  }, [name, version]);
+  }, [name, version, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

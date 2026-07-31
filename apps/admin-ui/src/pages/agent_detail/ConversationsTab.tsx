@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import type { AgentDetailResponse } from "../../api/agents";
 import { ApiError } from "../../api/client";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 import {
   listConversations,
   type ConversationList,
@@ -71,6 +72,10 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
     return () => clearTimeout(handle);
   }, [search]);
 
+  // Stream N — the lists are scope-aware ("*" aggregates every tenant),
+  // so the ambient scope rides along for a switched-in system_admin.
+  const { apiTenantScope } = useTenantScope();
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -82,6 +87,7 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
         q,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
+        tenantScope: apiTenantScope,
       });
       setData(result);
     } catch (err) {
@@ -89,7 +95,7 @@ export function ConversationsTab({ detail }: ConversationsTabProps) {
     } finally {
       setLoading(false);
     }
-  }, [name, version, statusFilter, q, page]);
+  }, [name, version, statusFilter, q, page, apiTenantScope]);
 
   useEffect(() => {
     void refresh();
