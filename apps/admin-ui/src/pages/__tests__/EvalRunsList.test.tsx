@@ -22,14 +22,21 @@ import type { EvalRunRecord } from "../../api/eval_runs";
 // Cross-tenant W3 — override the hook only (the real TenantScopeProvider in
 // renderPage keeps working via the importOriginal spread); switchable per
 // test, undefined = home state.
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 function run(overrides: Partial<EvalRunRecord> = {}): EvalRunRecord {
@@ -62,7 +69,9 @@ function renderPage() {
 
 afterEach(() => {
   vi.restoreAllMocks();
-  mockScope = undefined;
+  scopeRef.current = undefined;
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 describe("EvalRunsList", () => {
@@ -95,6 +104,20 @@ describe("EvalRunsList", () => {
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
   });
 
+  it("home 态入队可用;切入态置灰(两态)", async () => {
+    vi.spyOn(evalSdk, "listEvalRuns").mockResolvedValue({ items: [], total: 0 });
+
+    const first = renderPage();
+    await waitFor(() => expect(screen.getByTestId("eval-table")).toBeInTheDocument());
+    expect(screen.getByTestId("eval-enqueue")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("eval-table")).toBeInTheDocument());
+    expect(screen.getByTestId("eval-enqueue")).toBeDisabled();
+  });
+
   it("surfaces SDK errors in an alert", async () => {
     vi.spyOn(evalSdk, "listEvalRuns").mockRejectedValue(new Error("boom"));
     renderPage();
@@ -102,7 +125,7 @@ describe("EvalRunsList", () => {
   });
 
   it("threads the ambient tenant scope into listEvalRuns (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const listMock = vi
       .spyOn(evalSdk, "listEvalRuns")
       .mockResolvedValue({ items: [], total: 0 });
@@ -111,7 +134,7 @@ describe("EvalRunsList", () => {
 
     await waitFor(() =>
       expect(listMock).toHaveBeenCalledWith(
-        expect.objectContaining({ tenantScope: mockScope }),
+        expect.objectContaining({ tenantScope: scopeRef.current }),
       ),
     );
   });

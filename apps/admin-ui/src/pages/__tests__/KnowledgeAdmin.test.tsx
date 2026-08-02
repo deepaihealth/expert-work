@@ -15,9 +15,23 @@ import "../../i18n";
 import * as knowledgeSdk from "../../api/knowledge";
 import { KnowledgeAdmin } from "../KnowledgeAdmin";
 
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+// Cross-tenant W3 (F3) — 共享 tenant scope mock 工厂;scopeRef.current
+// 切换切入/聚合视角,undefined = home 态。
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 const BASES: knowledgeSdk.KnowledgeBase[] = [
@@ -52,7 +66,9 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -97,16 +113,16 @@ describe("KnowledgeAdmin (list)", () => {
   });
 
   it("threads the ambient tenant scope into listBases (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const listSpy = vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(mockScope));
+    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(scopeRef.current));
   });
 
   it("shows the empty state on the home scope", async () => {
-    mockScope = undefined;
+    scopeRef.current = undefined;
     vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
     renderPage();
@@ -114,6 +130,27 @@ describe("KnowledgeAdmin (list)", () => {
     await waitFor(() =>
       expect(screen.getByText("No knowledge bases yet.")).toBeInTheDocument(),
     );
+  });
+
+  it("home 态创建/删库按钮可用(两态其一)", async () => {
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeEnabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeEnabled();
+  });
+
+  it("切入态置灰创建/删库按钮(两态其二)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeDisabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeDisabled();
   });
 
   it("isSupportedDocument matches the backend whitelist", () => {

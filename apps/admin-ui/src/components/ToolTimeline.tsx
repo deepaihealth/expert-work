@@ -17,6 +17,8 @@ import type { SseEvent } from "../api/sessions";
 import { parseToolCalls, type ToolCallEntry, type ToolCallStatus } from "../api/tool_timeline";
 import { fireTriggerNow, type FireNowResult } from "../api/triggers";
 import { cleanUntrusted } from "../pages/agent_detail/playground/untrusted_clean";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "./ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -230,6 +232,9 @@ function FireNowButton({
 }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:立即触发是写操作(以该 trigger 的 user 跑
+  // run),置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [firing, setFiring] = useState(false);
   const [delivery, setDelivery] = useState<string | null>(null);
 
@@ -264,14 +269,17 @@ function FireNowButton({
 
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      <Button
-        size="small"
-        loading={firing}
-        onClick={() => void handleFire()}
-        data-testid="tool-fire-now"
-      >
-        {firing ? t("tool_timeline.firing") : t("tool_timeline.fire_now")}
-      </Button>
+      <ReadonlyTooltip on={isTenantSwitched}>
+        <Button
+          size="small"
+          loading={firing}
+          disabled={isTenantSwitched}
+          onClick={() => void handleFire()}
+          data-testid="tool-fire-now"
+        >
+          {firing ? t("tool_timeline.firing") : t("tool_timeline.fire_now")}
+        </Button>
+      </ReadonlyTooltip>
       {statusText !== null && (
         <Tag
           bordered={false}

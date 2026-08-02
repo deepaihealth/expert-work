@@ -56,6 +56,7 @@ import {
 import { type SkillApi, tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { AddFileModal } from "./skill_detail/AddFileModal";
 import { FileEditor } from "./skill_detail/FileEditor";
 import { EvalEvidencePanel } from "./skill_detail/EvalEvidencePanel";
@@ -67,6 +68,7 @@ import {
   DeleteConfirmModal,
   RenameModal,
 } from "./skill_detail/RenameDeleteModals";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -121,6 +123,8 @@ export function SkillDetail({
   const [searchParams] = useSearchParams();
   const readScope =
     searchParams.get("tenant_id") ?? concreteTenantScope(apiTenantScope);
+  // Cross-tenant W3 — 切入态只读:改分类/改状态/置顶是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const isPlatform = variant === "platform";
   const statusOptions = isPlatform ? PLATFORM_STATUS_OPTIONS : STATUS_OPTIONS;
   const backLink = backTo ?? { label: t("nav.skills"), to: "/skills" };
@@ -393,6 +397,7 @@ export function SkillDetail({
                 backend role check, avoids the 403 round-trip).
                 Pinned state shows the filled icon + brand color so
                 the visual gate is obvious. */}
+            <ReadonlyTooltip on={isTenantSwitched}>
             <Tooltip
               title={
                 skill.pinned
@@ -417,39 +422,44 @@ export function SkillDetail({
                 }
                 onClick={onTogglePin}
                 disabled={
-                  statusSubmitting || (!skill.pinned && isLatestHighRisk && !isAdmin)
+                  statusSubmitting ||
+                  isTenantSwitched ||
+                  (!skill.pinned && isLatestHighRisk && !isAdmin)
                 }
                 data-testid="skill-pin-button"
               >
                 {skill.pinned ? t("skills.unpin") : t("skills.pin")}
               </Button>
             </Tooltip>
-            <Select<SkillStatus>
-              value={skill.status}
-              onChange={(v) => onChangeStatus(v)}
-              style={{ width: 160 }}
-              loading={statusSubmitting}
-              disabled={statusSubmitting}
-              aria-label={t("skills.change_status")}
-              data-testid="skill-status-select"
-              options={statusOptions.map((s) => {
-                const isActiveBlocked = s === "active" && isLatestHighRisk && !isAdmin;
-                const label = t(`skills.status_${s}`);
-                return {
-                  value: s,
-                  label: isActiveBlocked ? (
-                    <Tooltip title={t("skills.detail_admin_required_tooltip")}>
-                      <span style={{ color: "var(--ew-text-tertiary)" }}>
-                        {label} 🔒
-                      </span>
-                    </Tooltip>
-                  ) : (
-                    label
-                  ),
-                  disabled: isActiveBlocked,
-                };
-              })}
-            />
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Select<SkillStatus>
+                value={skill.status}
+                onChange={(v) => onChangeStatus(v)}
+                style={{ width: 160 }}
+                loading={statusSubmitting}
+                disabled={statusSubmitting || isTenantSwitched}
+                aria-label={t("skills.change_status")}
+                data-testid="skill-status-select"
+                options={statusOptions.map((s) => {
+                  const isActiveBlocked = s === "active" && isLatestHighRisk && !isAdmin;
+                  const label = t(`skills.status_${s}`);
+                  return {
+                    value: s,
+                    label: isActiveBlocked ? (
+                      <Tooltip title={t("skills.detail_admin_required_tooltip")}>
+                        <span style={{ color: "var(--ew-text-tertiary)" }}>
+                          {label} 🔒
+                        </span>
+                      </Tooltip>
+                    ) : (
+                      label
+                    ),
+                    disabled: isActiveBlocked,
+                  };
+                })}
+              />
+            </ReadonlyTooltip>
           </Space>
         }
       />

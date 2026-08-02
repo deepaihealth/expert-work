@@ -46,7 +46,9 @@ import {
 } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SKILL_MD_PATH } from "./FileTree";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -120,6 +122,8 @@ export function FileEditor({
   const { message } = App.useApp();
   // Cross-tenant W3 — supporting-file read: concrete UUID only ("*" 400s).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:编辑/重命名/删除/保存是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [loaded, setLoaded] = useState<LoadedFile | null>(null);
   const [loading, setLoading] = useState(false);
@@ -420,44 +424,56 @@ export function FileEditor({
         {/* SKILL.md is editable (Phase D-2) but has no rename/delete — it's
             a required member of every skill. Saving edits the prompt body. */}
         {isSkillMd && mode === "view" && (
-          <Button
-            size="small"
-            type="primary"
-            icon={<Edit3 size={13} strokeWidth={1.75} />}
-            onClick={handleEdit}
-            data-testid="skill-editor-edit-btn"
-          >
-            {t("skills.file_action_edit")}
-          </Button>
-        )}
-        {!isSkillMd && mode === "view" && !isBinary && (
-          <>
-            <Button
-              size="small"
-              danger
-              icon={<Trash2 size={13} strokeWidth={1.75} />}
-              onClick={() => onRequestDelete(selectedPath)}
-              data-testid="skill-editor-delete-btn"
-            >
-              {t("skills.file_action_delete")}
-            </Button>
-            <Button
-              size="small"
-              icon={<PencilLine size={13} strokeWidth={1.75} />}
-              onClick={() => onRequestRename(selectedPath)}
-              data-testid="skill-editor-rename-btn"
-            >
-              {t("skills.file_action_rename")}
-            </Button>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               size="small"
               type="primary"
               icon={<Edit3 size={13} strokeWidth={1.75} />}
               onClick={handleEdit}
+              disabled={isTenantSwitched}
               data-testid="skill-editor-edit-btn"
             >
               {t("skills.file_action_edit")}
             </Button>
+          </ReadonlyTooltip>
+        )}
+        {!isSkillMd && mode === "view" && !isBinary && (
+          <>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                danger
+                icon={<Trash2 size={13} strokeWidth={1.75} />}
+                onClick={() => onRequestDelete(selectedPath)}
+                disabled={isTenantSwitched}
+                data-testid="skill-editor-delete-btn"
+              >
+                {t("skills.file_action_delete")}
+              </Button>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                icon={<PencilLine size={13} strokeWidth={1.75} />}
+                onClick={() => onRequestRename(selectedPath)}
+                disabled={isTenantSwitched}
+                data-testid="skill-editor-rename-btn"
+              >
+                {t("skills.file_action_rename")}
+              </Button>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                type="primary"
+                icon={<Edit3 size={13} strokeWidth={1.75} />}
+                onClick={handleEdit}
+                disabled={isTenantSwitched}
+                data-testid="skill-editor-edit-btn"
+              >
+                {t("skills.file_action_edit")}
+              </Button>
+            </ReadonlyTooltip>
           </>
         )}
         {mode === "edit" && (
@@ -471,17 +487,19 @@ export function FileEditor({
             >
               {t("skills.file_action_cancel")}
             </Button>
-            <Button
-              size="small"
-              type="primary"
-              icon={<Save size={13} strokeWidth={1.75} />}
-              onClick={handleSave}
-              loading={saving}
-              disabled={!dirty}
-              data-testid="skill-editor-save-btn"
-            >
-              {t("skills.file_action_save")}
-            </Button>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                type="primary"
+                icon={<Save size={13} strokeWidth={1.75} />}
+                onClick={handleSave}
+                loading={saving}
+                disabled={!dirty || isTenantSwitched}
+                data-testid="skill-editor-save-btn"
+              >
+                {t("skills.file_action_save")}
+              </Button>
+            </ReadonlyTooltip>
           </>
         )}
       </div>

@@ -14,6 +14,16 @@ import "../../../i18n";
 import * as sdk from "../../../api/skill-evolution";
 import type { PromoteRequest } from "../../../api/skill-evolution";
 import type { SkillRecord } from "../../../api/skills";
+
+// Cross-tenant W3(review M-1)— 切入态置灰;组件不挂 Provider,mock 判定
+// hook,``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 import { GovernancePanel } from "../GovernancePanel";
 
 const listMock = vi.spyOn(sdk, "listPromoteRequests");
@@ -68,6 +78,8 @@ beforeEach(() => {
   listMock.mockReset();
   requestMock.mockReset();
   approveMock.mockReset();
+  // vitest 4 的 clear 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
   if (typeof window !== "undefined") window.localStorage.clear();
 });
 
@@ -105,6 +117,25 @@ describe("GovernancePanel", () => {
     expect(screen.getByTestId("skill-approve-button")).toBeInTheDocument();
     expect(screen.getByTestId("skill-reject-button")).toBeInTheDocument();
     expect(screen.queryByTestId("skill-propose-button")).not.toBeInTheDocument();
+  });
+
+  // Cross-tenant W3(review M-1)— promote 链路不带 scope,切入态置灰
+  // (上方用例覆盖 home 态可点)。
+  it("切入态置灰提议/批准/驳回(两态)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
+    const first = renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn() });
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-propose-button")).toBeDisabled(),
+    );
+    first.unmount();
+
+    listMock.mockResolvedValue({ items: [pending()], next_cursor: null, cross_tenant: false });
+    renderPanel({ skill: skill(), isAdmin: true, onChanged: vi.fn() });
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-approve-button")).toBeDisabled(),
+    );
+    expect(screen.getByTestId("skill-reject-button")).toBeDisabled();
   });
 
   it("hides approve/reject for a non-admin even when pending", async () => {

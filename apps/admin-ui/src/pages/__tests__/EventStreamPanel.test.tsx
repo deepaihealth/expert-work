@@ -16,14 +16,14 @@ import type { SseEvent } from "../../api/sessions";
 
 // Track C W2 — 组件内直取 tenant scope;这些测试不挂 Provider,mock 成
 // home 态(apiTenantScope undefined)。
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const streamMock = vi.spyOn(runsSdk, "streamRunEvents");
 

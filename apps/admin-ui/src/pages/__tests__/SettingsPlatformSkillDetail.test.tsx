@@ -23,14 +23,14 @@ import { apiClient, setStoredToken } from "../../api/client";
 
 // Cross-tenant W3 — SkillDetail reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (home state: no scope).
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const TENANT = "00000000-0000-0000-0000-00000000acme";
 

@@ -12,14 +12,21 @@ import type { McpServer } from "../../api/mcp-servers";
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (switchable per test;
 // undefined = home state).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 const listMock = vi.spyOn(serversSdk, "listMcpServers");
@@ -35,7 +42,9 @@ beforeEach(async () => {
   listMock.mockReset();
   availMock.mockReset();
   toolsMock.mockReset();
-  mockScope = undefined;
+  scopeRef.current = undefined;
+  // vitest 4 的 reset 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 const custom: McpServer = {
@@ -71,6 +80,25 @@ describe("SettingsMcpServers unified list", () => {
     expect(screen.getByText("my-custom")).toBeInTheDocument();
     expect(screen.getAllByText("平台").length).toBeGreaterThan(0);
     expect(screen.getAllByText("自定义").length).toBeGreaterThan(0);
+  });
+
+  it("home 态新建/启停/删除可用;切入态置灰(两态)", async () => {
+    listMock.mockResolvedValue([custom]);
+    availMock.mockResolvedValue([]);
+    const first = renderPage();
+    expect(await screen.findByText("my-custom")).toBeInTheDocument();
+    expect(screen.getByTestId("ms-add")).toBeEnabled();
+    expect(screen.getByTestId("ms-toggle-my-custom")).toBeEnabled();
+    expect(screen.getByTestId("ms-delete-my-custom")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderPage();
+    expect(await screen.findByText("my-custom")).toBeInTheDocument();
+    expect(screen.getByTestId("ms-add")).toBeDisabled();
+    expect(screen.getByTestId("ms-toggle-my-custom")).toBeDisabled();
+    expect(screen.getByTestId("ms-edit-my-custom")).toBeDisabled();
+    expect(screen.getByTestId("ms-delete-my-custom")).toBeDisabled();
   });
 
   it("oauth2 platform row shows the authorize link and hides Test", async () => {
@@ -171,13 +199,13 @@ describe("SettingsMcpServers unified list", () => {
   });
 
   it("threads the ambient tenant scope into both list reads (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     listMock.mockResolvedValue([custom]);
     availMock.mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(listMock).toHaveBeenCalledWith(mockScope));
-    expect(availMock).toHaveBeenCalledWith(mockScope);
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith(scopeRef.current));
+    expect(availMock).toHaveBeenCalledWith(scopeRef.current);
   });
 });

@@ -5,7 +5,7 @@
  * banner/reindex), the documents tab (localized status + re-ingest), the
  * retrieval-test tab (run → scored results), and the settings tab (PATCH).
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
@@ -17,13 +17,21 @@ import { KnowledgeDetail } from "../KnowledgeDetail";
 
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (home state: no scope).
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 const BASE: knowledgeSdk.KnowledgeBase = {
@@ -68,6 +76,11 @@ function renderDetail(initial = "/knowledge/support-docs") {
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+// vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+beforeEach(() => {
+  isTenantSwitchedMock.mockReturnValue(false);
+});
 
 describe("KnowledgeDetail", () => {
   it("loads the base, shows stats + localized doc status", async () => {
@@ -163,5 +176,32 @@ describe("KnowledgeDetail", () => {
     await userEvent.click(within(tab).getByTestId("kb-settings-save"));
 
     await waitFor(() => expect(updateSpy).toHaveBeenCalledWith("support-docs", expect.any(Object)));
+  });
+
+  it("切入态置灰重建索引/文档删除(两态:home 态由上方用例覆盖)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    expect(screen.getByTestId("knowledge-reindex-btn")).toBeDisabled();
+    expect(
+      screen.getByTestId("doc-delete-22222222-2222-2222-2222-222222222222"),
+    ).toBeDisabled();
+  });
+
+  it("切入态置灰设置保存(两态:home 态由上方用例覆盖)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail("/knowledge/support-docs/settings");
+    await waitFor(() => expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument());
+
+    const tab = screen.getByTestId("knowledge-settings-tab");
+    expect(within(tab).getByTestId("kb-settings-save")).toBeDisabled();
+    expect(within(tab).getByTestId("kb-settings-reindex")).toBeDisabled();
   });
 });

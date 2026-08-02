@@ -30,6 +30,8 @@ import { ApiError } from "../api/client";
 import type { RunStatus } from "../api/runs";
 import { useStatusPolling } from "../hooks/useStatusPolling";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { PageHeader } from "../components/PageHeader";
 
 const { Text } = Typography;
@@ -68,6 +70,8 @@ export function EvalRunsList() {
   const navigate = useNavigate();
   // Cross-tenant W3 — the list is scope-aware ("*" aggregates every tenant).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:入队是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [data, setData] = useState<EvalRunList | null>(null);
   const [loading, setLoading] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
@@ -209,27 +213,30 @@ export function EvalRunsList() {
               data-testid="eval-suite-select"
               options={SUITE_OPTIONS.map((s) => ({ value: s, label: s }))}
             />
-            <button
-              type="button"
-              onClick={() => void onEnqueue()}
-              disabled={enqueuing}
-              data-testid="eval-enqueue"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 12px",
-                border: "1px solid var(--ew-color-brand-500)",
-                borderRadius: 6,
-                background: "var(--ew-color-brand-500)",
-                color: "#fff",
-                fontSize: 13,
-                cursor: enqueuing ? "wait" : "pointer",
-              }}
-            >
-              <FlaskConical size={14} strokeWidth={1.5} />
-              {t("eval_runs_page.enqueue")}
-            </button>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <button
+                type="button"
+                onClick={() => void onEnqueue()}
+                disabled={enqueuing || isTenantSwitched}
+                data-testid="eval-enqueue"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "4px 12px",
+                  border: "1px solid var(--ew-color-brand-500)",
+                  borderRadius: 6,
+                  background: "var(--ew-color-brand-500)",
+                  color: "#fff",
+                  fontSize: 13,
+                  cursor: enqueuing ? "wait" : isTenantSwitched ? "not-allowed" : "pointer",
+                  opacity: isTenantSwitched ? 0.5 : 1,
+                }}
+              >
+                <FlaskConical size={14} strokeWidth={1.5} />
+                {t("eval_runs_page.enqueue")}
+              </button>
+            </ReadonlyTooltip>
             <button
               type="button"
               onClick={() => void load(false)}

@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
@@ -22,14 +23,14 @@ import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenSt
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
   isTenantSwitchedMock: vi.fn(() => false),
 }));
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 vi.mock("../../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));
@@ -264,6 +265,24 @@ describe("TurnCard (read-only)", () => {
     expect(screen.getByTestId("playground-feedback-up")).toBeDisabled();
     expect(screen.getByTestId("playground-feedback-down")).toBeDisabled();
     expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
+  });
+
+  // Cross-tenant W3 fix — 函数组件 child(FeedbackBar)不转发鼠标事件,
+  // ReadonlyTooltip 的 wrapper 承接 hover(child 容器 pointer-events:none),
+  // hover wrapper 必须真出 Tooltip。
+  it("切入态 hover 反馈条 wrapper 真出 Tooltip 提示", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    const user = userEvent.setup();
+    renderCard({});
+
+    expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+    await user.hover(screen.getByTestId("readonly-tooltip"));
+
+    expect(
+      await screen.findByText(
+        "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
+      ),
+    ).toBeInTheDocument();
   });
 });
 

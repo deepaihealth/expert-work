@@ -21,13 +21,16 @@ vi.mock("../../auth/AuthContext", () => ({
     identity: { isSystemAdmin: false, roles: ["admin"], serverResolved: true },
   }),
 }));
-let mockScope: string | undefined;
 // Spread the real module so the page keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const EXTERNAL: TenantUserRosterItem = {
   user_id: "aaaaaaaa-0000-0000-0000-000000000001",
@@ -82,24 +85,24 @@ function renderPage() {
 }
 
 afterEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.restoreAllMocks();
 });
 
 describe("Users", () => {
   it("threads a concrete tenant scope through listUsers (跨租户钻取 B类补传)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const spy = vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
       items: [EXTERNAL],
       total: 1,
       cross_tenant: false,
     });
     renderPage();
-    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: mockScope }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ tenantScope: scopeRef.current }));
   });
 
   it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
-    mockScope = "*";
+    scopeRef.current = "*";
     const spy = vi.spyOn(usersSdk, "listUsers").mockResolvedValue({
       items: [EXTERNAL],
       total: 1,

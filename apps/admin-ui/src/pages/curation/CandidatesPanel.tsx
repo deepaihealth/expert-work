@@ -40,6 +40,8 @@ import {
 } from "../../api/curation";
 import { ApiError } from "../../api/client";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -62,6 +64,8 @@ export function CandidatesPanel() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:驳回/提升是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [data, setData] = useState<CurationCandidateList | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -266,12 +270,26 @@ export function CandidatesPanel() {
         extra={
           selected?.status === "pending" && (
             <Space>
-              <Button danger onClick={() => onDismiss(selected.id)} data-testid="curation-dismiss-btn">
-                {t("curation.dismiss")}
-              </Button>
-              <Button type="primary" onClick={() => setPromoteOpen(true)} data-testid="curation-promote-btn">
-                {t("curation.promote")}
-              </Button>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  danger
+                  disabled={isTenantSwitched}
+                  onClick={() => onDismiss(selected.id)}
+                  data-testid="curation-dismiss-btn"
+                >
+                  {t("curation.dismiss")}
+                </Button>
+              </ReadonlyTooltip>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  type="primary"
+                  disabled={isTenantSwitched}
+                  onClick={() => setPromoteOpen(true)}
+                  data-testid="curation-promote-btn"
+                >
+                  {t("curation.promote")}
+                </Button>
+              </ReadonlyTooltip>
             </Space>
           )
         }

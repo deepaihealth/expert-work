@@ -25,14 +25,19 @@ import { MemoryPane } from "./MemoryPane";
 // Cross-tenant W3 — the pane reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (switchable per test;
 // undefined = home state).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态判定 hook 会触 useAuth(这里不挂 AuthProvider),
+// mock 成 home 态(两态断言在 UserProfile.test.tsx 的 Memory tab 用例)。
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: () => false,
 }));
 
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -73,12 +78,12 @@ function renderPane() {
 
 afterEach(() => {
   vi.restoreAllMocks();
-  mockScope = undefined;
+  scopeRef.current = undefined;
 });
 
 describe("MemoryPane — cross-tenant W3 scope passthrough", () => {
   it("threads the switched tenant scope into listMemories", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const listSpy = vi.spyOn(memorySdk, "listMemories").mockResolvedValue({
       items: [],
       total: 0,
@@ -88,7 +93,7 @@ describe("MemoryPane — cross-tenant W3 scope passthrough", () => {
 
     await waitFor(() =>
       expect(listSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+        expect.objectContaining({ userId: USER_ID, tenantScope: scopeRef.current }),
       ),
     );
   });

@@ -24,6 +24,13 @@ import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
 import type { TenantCatalogEntry } from "../../api/mcp-catalog";
 
+// Cross-tenant W3 — CatalogBrowser 的切入态判定 hook 会触 useTenantScope/
+// useAuth(这里部分渲染不挂 Provider),mock 成 home 态(两态断言在
+// AddMcpServerDrawer.test.tsx)。
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: () => false,
+}));
+
 const TENANT = "00000000-0000-0000-0000-00000000acme";
 
 function makeJwt(payload: Record<string, unknown>): string {

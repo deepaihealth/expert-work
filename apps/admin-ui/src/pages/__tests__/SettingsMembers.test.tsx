@@ -47,10 +47,21 @@ vi.mock("../../api/members", async (importOriginal) => {
 });
 
 // TenantScope context — switchable per test (mirrors ArtifactsList).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 function makeJwt(payload: Record<string, unknown>): string {
@@ -75,7 +86,7 @@ const activeMember: TenantMember = {
 };
 
 function renderPage(): void {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   setStoredToken(makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin"] }));
   render(
     <MemoryRouter>
@@ -90,7 +101,7 @@ function renderPage(): void {
 
 /** Render in the cross-tenant aggregate (read-only) view (scope "*"). */
 function renderCrossTenant(): void {
-  mockScope = "*";
+  scopeRef.current = "*";
   setStoredToken(
     makeJwt({ sub: "u1", tenant_id: "t1", roles: ["system_admin"] }),
   );
@@ -188,6 +199,34 @@ afterEach(() => {
   setStoredToken(null);
   window.sessionStorage.clear();
   vi.clearAllMocks();
+  // vitest 4 的 clear 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
+});
+
+describe("SettingsMembers — 切入态置灰 (W3)", () => {
+  it("home 态邀请/清除可用(两态其一)", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-invite-btn")).toBeEnabled();
+    expect(screen.getByTestId("members-purge-m-1")).toBeEnabled();
+  });
+
+  it("切入态置灰邀请/清除(两态其二)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-invite-btn")).toBeDisabled();
+    expect(screen.getByTestId("members-purge-m-1")).toBeDisabled();
+    expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
+  });
 });
 
 describe("SettingsMembers — set password", () => {

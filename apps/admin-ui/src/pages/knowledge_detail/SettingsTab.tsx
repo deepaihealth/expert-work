@@ -28,6 +28,8 @@ import {
   type RetrievalMethod,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -58,6 +60,8 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const [form] = Form.useForm<SettingsFormValues>();
+  // Cross-tenant W3 — 切入态只读:保存/重建索引是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
 
@@ -197,9 +201,17 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           >
             <Switch aria-label={t("knowledge_page.field_rerank")} />
           </Form.Item>
-          <Button type="primary" htmlType="submit" loading={saving} data-testid="kb-settings-save">
-            {t("common.save")}
-          </Button>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              type="primary"
+              htmlType="submit"
+              loading={saving}
+              disabled={isTenantSwitched}
+              data-testid="kb-settings-save"
+            >
+              {t("common.save")}
+            </Button>
+          </ReadonlyTooltip>
           <Text type="secondary" style={{ display: "block", marginTop: 8, fontSize: 12 }}>
             {t("knowledge_page.settings_rename_note")}
           </Text>
@@ -214,14 +226,16 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           {base.needs_reindex && (
             <Alert type="warning" showIcon message={t("knowledge_page.needs_reindex_banner")} />
           )}
-          <Button
-            loading={reindexing}
-            disabled={base.reindexing}
-            onClick={() => void handleReindex()}
-            data-testid="kb-settings-reindex"
-          >
-            {t("knowledge_page.reindex_button")}
-          </Button>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              loading={reindexing}
+              disabled={base.reindexing || isTenantSwitched}
+              onClick={() => void handleReindex()}
+              data-testid="kb-settings-reindex"
+            >
+              {t("knowledge_page.reindex_button")}
+            </Button>
+          </ReadonlyTooltip>
         </Space>
       </Card>
     </div>

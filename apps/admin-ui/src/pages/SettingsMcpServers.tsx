@@ -40,10 +40,12 @@ import {
 import { disablePlatformServer } from "../api/mcp-catalog";
 import { ApiError } from "../api/client";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateMcpServerDrawer } from "../components/CreateMcpServerDrawer";
 import { AddMcpServerDrawer } from "../components/mcp_catalog/AddMcpServerDrawer";
 import { PageHeader } from "../components/PageHeader";
 import { buildUnifiedRows, type UnifiedRow } from "./mcpServerRows";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 type ProbeState =
   | { kind: "idle" }
@@ -64,6 +66,8 @@ export function SettingsMcpServers() {
   // Cross-tenant W3 — lists ride the ambient scope; the per-server tools
   // probe is a detail read (concrete UUID only, "*" 400s).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:启停/删除/停用/编辑/新建是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [rows, setRows] = useState<UnifiedRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -331,14 +335,21 @@ export function SettingsMcpServers() {
                   {t("mcp_servers.test")}
                 </Button>
               )}
-              <Popconfirm
-                title={t("mcp_servers.remove_confirm", { name: row.displayName })}
-                onConfirm={() => void handleRemovePlatform(row.catalogId)}
-              >
-                <Button size="small" data-testid={`ms-remove-${row.name}`}>
-                  {t("mcp_servers.remove")}
-                </Button>
-              </Popconfirm>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Popconfirm
+                  title={t("mcp_servers.remove_confirm", { name: row.displayName })}
+                  onConfirm={() => void handleRemovePlatform(row.catalogId)}
+                  disabled={isTenantSwitched}
+                >
+                  <Button
+                    size="small"
+                    disabled={isTenantSwitched}
+                    data-testid={`ms-remove-${row.name}`}
+                  >
+                    {t("mcp_servers.remove")}
+                  </Button>
+                </Popconfirm>
+              </ReadonlyTooltip>
             </Space>
           );
         }
@@ -353,24 +364,42 @@ export function SettingsMcpServers() {
             >
               {t("mcp_servers.test")}
             </Button>
-            <Button size="small" data-testid={`ms-edit-${s.name}`} onClick={() => openEdit(s)}>
-              {t("mcp_servers.edit")}
-            </Button>
-            <Button
-              size="small"
-              data-testid={`ms-toggle-${s.name}`}
-              onClick={() => void handleToggle(s)}
-            >
-              {s.enabled ? t("mcp_servers.act_stop") : t("mcp_servers.act_run")}
-            </Button>
-            <Popconfirm
-              title={t("mcp_servers.delete_confirm", { name: s.name })}
-              onConfirm={() => void handleDelete(s.name)}
-            >
-              <Button size="small" danger data-testid={`ms-delete-${s.name}`}>
-                {t("mcp_servers.delete")}
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                disabled={isTenantSwitched}
+                data-testid={`ms-edit-${s.name}`}
+                onClick={() => openEdit(s)}
+              >
+                {t("mcp_servers.edit")}
               </Button>
-            </Popconfirm>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                disabled={isTenantSwitched}
+                data-testid={`ms-toggle-${s.name}`}
+                onClick={() => void handleToggle(s)}
+              >
+                {s.enabled ? t("mcp_servers.act_stop") : t("mcp_servers.act_run")}
+              </Button>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("mcp_servers.delete_confirm", { name: s.name })}
+                onConfirm={() => void handleDelete(s.name)}
+                disabled={isTenantSwitched}
+              >
+                <Button
+                  size="small"
+                  danger
+                  disabled={isTenantSwitched}
+                  data-testid={`ms-delete-${s.name}`}
+                >
+                  {t("mcp_servers.delete")}
+                </Button>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         );
       },
@@ -437,9 +466,11 @@ export function SettingsMcpServers() {
       >
         {t("mcp_servers.empty_hint")}
       </div>
-      <Button type="primary" onClick={openCreate}>
-        {t("mcp_servers.add")}
-      </Button>
+      <ReadonlyTooltip on={isTenantSwitched}>
+        <Button type="primary" disabled={isTenantSwitched} onClick={openCreate}>
+          {t("mcp_servers.add")}
+        </Button>
+      </ReadonlyTooltip>
     </div>
   );
 
@@ -450,9 +481,16 @@ export function SettingsMcpServers() {
         title={t("mcp_servers.page_title")}
         subtitle={t("mcp_servers.subtitle")}
         actions={
-          <Button type="primary" data-testid="ms-add" onClick={openCreate}>
-            {t("mcp_servers.add")}
-          </Button>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              type="primary"
+              disabled={isTenantSwitched}
+              data-testid="ms-add"
+              onClick={openCreate}
+            >
+              {t("mcp_servers.add")}
+            </Button>
+          </ReadonlyTooltip>
         }
       />
 

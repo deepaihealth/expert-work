@@ -13,6 +13,8 @@ import { ApiError } from "../../api/client";
 import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -41,6 +43,8 @@ export function RenameModal({
   const { message } = App.useApp();
   // Cross-tenant W3 — the pre-rename read is scope-aware (writes are not).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:重命名是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [form] = Form.useForm<{ newPath: string }>();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,15 +121,18 @@ export function RenameModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Button
-          key="submit"
-          type="primary"
-          onClick={handleSubmit}
-          loading={submitting}
-          data-testid="skill-rename-submit"
-        >
-          {t("skills.file_rename_submit")}
-        </Button>,
+        <ReadonlyTooltip
+          key="submit" on={isTenantSwitched}>
+          <Button
+            type="primary"
+            onClick={handleSubmit}
+            loading={submitting}
+            disabled={isTenantSwitched}
+            data-testid="skill-rename-submit"
+          >
+            {t("skills.file_rename_submit")}
+          </Button>
+        </ReadonlyTooltip>,
       ]}
     >
       {error !== null && (
@@ -178,6 +185,8 @@ export function DeleteConfirmModal({
 }: DeleteConfirmModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:删除是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [typed, setTyped] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -232,17 +241,19 @@ export function DeleteConfirmModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Button
-          key="submit"
-          danger
-          type="primary"
-          onClick={handleSubmit}
-          loading={submitting}
-          disabled={!canDelete}
-          data-testid="skill-delete-submit"
-        >
-          {t("skills.file_action_delete")}
-        </Button>,
+        <ReadonlyTooltip
+          key="submit" on={isTenantSwitched}>
+          <Button
+            danger
+            type="primary"
+            onClick={handleSubmit}
+            loading={submitting}
+            disabled={!canDelete || isTenantSwitched}
+            data-testid="skill-delete-submit"
+          >
+            {t("skills.file_action_delete")}
+          </Button>
+        </ReadonlyTooltip>,
       ]}
     >
       {error !== null && (

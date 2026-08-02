@@ -57,7 +57,7 @@ import {
   type AgentList,
 } from "../api/agents";
 import { ApiError } from "../api/client";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateAgentModal } from "../components/CreateAgentModal";
 import { DeleteAgentModal } from "../components/DeleteAgentModal";
@@ -111,14 +111,17 @@ function AgentRowActions({
   // Track C W2 — 切入态只读:删除/禁用/启用是写操作,而且按 name 打到
   // 归属租户(不带 tenant_id)——切入态下会误伤自家同名 Agent,必须置灰。
   const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W3 (cosmetic) — 详情读带 concrete scope,切入态下禁用徽标
+  // 反映目标租户同名 Agent 的真实状态,而非归属租户的。
+  const { apiTenantScope } = useTenantScope();
   const [disabled, setDisabled] = useState<boolean | null>(null);
 
   const loadDisabledState = useCallback(() => {
-    getAgent(record.name, record.version).then(
+    getAgent(record.name, record.version, concreteTenantScope(apiTenantScope)).then(
       (detail) => setDisabled(detail.disabled ?? false),
       () => setDisabled(false),
     );
-  }, [record.name, record.version]);
+  }, [record.name, record.version, apiTenantScope]);
 
   const runEnable = useCallback(async () => {
     try {

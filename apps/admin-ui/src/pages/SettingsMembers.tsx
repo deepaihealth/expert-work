@@ -52,6 +52,8 @@ import {
 import { ApiError } from "../api/client";
 import { PurgeUserModal } from "./user_profile/PurgeUserModal";
 import { SCOPE_ALL, useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Paragraph, Text } = Typography;
 
@@ -88,6 +90,8 @@ export function SettingsMembers() {
   // actions (invite / resend / reset-password / remove) stay on the
   // single-tenant context where the tenant_id is unambiguous.
   const crossTenant = scope === SCOPE_ALL;
+  // Cross-tenant W3 — 切入态只读:邀请/重发/吊销/重置密码/清除是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [data, setData] = useState<MemberList | null>(null);
   const [loading, setLoading] = useState(false);
@@ -308,74 +312,87 @@ export function SettingsMembers() {
           return (
             <Space size={6}>
               {record.status === "invited" && (
-                <Button
-                  size="small"
-                  icon={<Send size={12} strokeWidth={1.75} />}
-                  onClick={() => onResend(record.id)}
-                  data-testid={`members-resend-${record.id}`}
-                >
-                  {t("settings_members.resend")}
-                </Button>
-              )}
-              {settable && (
-                <Button
-                  size="small"
-                  icon={<KeyRound size={12} strokeWidth={1.75} />}
-                  onClick={() => {
-                    setPwTarget(record);
-                    setPw("");
-                    setPwErr(null);
-                  }}
-                  data-testid={`members-set-password-${record.id}`}
-                >
-                  {t("settings_members.set_password")}
-                </Button>
-              )}
-              {removable && (
-                <Popconfirm
-                  title={
-                    record.status === "invited"
-                      ? t("settings_members.revoke_confirm_title")
-                      : t("settings_members.suspend_confirm_title")
-                  }
-                  description={
-                    record.status === "invited"
-                      ? t("settings_members.revoke_confirm_body")
-                      : t("settings_members.suspend_confirm_body")
-                  }
-                  okType="danger"
-                  okText={t("common.delete")}
-                  cancelText={t("common.cancel")}
-                  onConfirm={() => onRemove(record.id)}
-                >
+                <ReadonlyTooltip on={isTenantSwitched}>
                   <Button
                     size="small"
-                    danger
-                    icon={<Trash2 size={12} strokeWidth={1.75} />}
-                    data-testid={`members-remove-${record.id}`}
+                    disabled={isTenantSwitched}
+                    icon={<Send size={12} strokeWidth={1.75} />}
+                    onClick={() => onResend(record.id)}
+                    data-testid={`members-resend-${record.id}`}
                   >
-                    {t("settings_members.remove")}
+                    {t("settings_members.resend")}
                   </Button>
-                </Popconfirm>
+                </ReadonlyTooltip>
+              )}
+              {settable && (
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    size="small"
+                    disabled={isTenantSwitched}
+                    icon={<KeyRound size={12} strokeWidth={1.75} />}
+                    onClick={() => {
+                      setPwTarget(record);
+                      setPw("");
+                      setPwErr(null);
+                    }}
+                    data-testid={`members-set-password-${record.id}`}
+                  >
+                    {t("settings_members.set_password")}
+                  </Button>
+                </ReadonlyTooltip>
+              )}
+              {removable && (
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Popconfirm
+                    title={
+                      record.status === "invited"
+                        ? t("settings_members.revoke_confirm_title")
+                        : t("settings_members.suspend_confirm_title")
+                    }
+                    description={
+                      record.status === "invited"
+                        ? t("settings_members.revoke_confirm_body")
+                        : t("settings_members.suspend_confirm_body")
+                    }
+                    okType="danger"
+                    okText={t("common.delete")}
+                    cancelText={t("common.cancel")}
+                    onConfirm={() => onRemove(record.id)}
+                    disabled={isTenantSwitched}
+                  >
+                    <Button
+                      size="small"
+                      danger
+                      disabled={isTenantSwitched}
+                      icon={<Trash2 size={12} strokeWidth={1.75} />}
+                      data-testid={`members-remove-${record.id}`}
+                    >
+                      {t("settings_members.remove")}
+                    </Button>
+                  </Popconfirm>
+                </ReadonlyTooltip>
               )}
               {/* One-shot deactivate & purge — every status is purgeable
                   (suspended / revoked rows re-enter as backfill cleanup). */}
-              <Button
-                size="small"
-                danger
-                icon={<UserX size={12} strokeWidth={1.75} />}
-                onClick={() => setPurgeTarget(record)}
-                data-testid={`members-purge-${record.id}`}
-              >
-                {t("settings_members.purge_action")}
-              </Button>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  size="small"
+                  danger
+                  disabled={isTenantSwitched}
+                  icon={<UserX size={12} strokeWidth={1.75} />}
+                  onClick={() => setPurgeTarget(record)}
+                  data-testid={`members-purge-${record.id}`}
+                >
+                  {t("settings_members.purge_action")}
+                </Button>
+              </ReadonlyTooltip>
             </Space>
           );
         },
       },
           ] satisfies TableColumnsType<TenantMember>)),
     ],
-    [t, onResend, onRemove, crossTenant],
+    [t, onResend, onRemove, crossTenant, isTenantSwitched],
   );
 
   return (
@@ -406,14 +423,17 @@ export function SettingsMembers() {
               {t("common.refresh")}
             </Button>
             {!crossTenant && (
-              <Button
-                type="primary"
-                icon={<UserPlus size={14} strokeWidth={1.5} />}
-                onClick={() => setInviteOpen(true)}
-                data-testid="members-invite-btn"
-              >
-                {t("settings_members.invite")}
-              </Button>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  type="primary"
+                  icon={<UserPlus size={14} strokeWidth={1.5} />}
+                  onClick={() => setInviteOpen(true)}
+                  disabled={isTenantSwitched}
+                  data-testid="members-invite-btn"
+                >
+                  {t("settings_members.invite")}
+                </Button>
+              </ReadonlyTooltip>
             )}
           </>
         }

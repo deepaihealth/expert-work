@@ -33,7 +33,9 @@ import {
   type MemoryList,
 } from "../../api/memory";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { errMessage } from "./useLoad";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -45,6 +47,8 @@ export function MemoryPane({ userId }: { userId: string }) {
   const navigate = useNavigate();
   // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:编辑/遗忘记忆是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [data, setData] = useState<MemoryList | null>(null);
   const [loading, setLoading] = useState(true);
@@ -193,37 +197,42 @@ export function MemoryPane({ userId }: { userId: string }) {
         width: 160,
         render: (_: unknown, record) => (
           <Space size={6}>
-            <Button
-              size="small"
-              icon={<Pencil size={13} strokeWidth={1.5} />}
-              onClick={() => openEdit(record)}
-              disabled={asOf !== null}
-              data-testid={`memory-edit-${record.id}`}
-            >
-              {t("user_profile.memory_edit")}
-            </Button>
-            <Popconfirm
-              title={t("user_profile.memory_forget_confirm")}
-              onConfirm={() => void handleForget(record.id)}
-              okText={t("user_profile.memory_forget")}
-              okButtonProps={{ danger: true }}
-            >
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
-                danger
-                icon={<Trash2 size={13} strokeWidth={1.5} />}
-                loading={busyId === record.id}
-                disabled={asOf !== null}
-                data-testid={`memory-forget-${record.id}`}
+                icon={<Pencil size={13} strokeWidth={1.5} />}
+                onClick={() => openEdit(record)}
+                disabled={asOf !== null || isTenantSwitched}
+                data-testid={`memory-edit-${record.id}`}
               >
-                {t("user_profile.memory_forget")}
+                {t("user_profile.memory_edit")}
               </Button>
-            </Popconfirm>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("user_profile.memory_forget_confirm")}
+                onConfirm={() => void handleForget(record.id)}
+                okText={t("user_profile.memory_forget")}
+                okButtonProps={{ danger: true }}
+                disabled={isTenantSwitched}
+              >
+                <Button
+                  size="small"
+                  danger
+                  icon={<Trash2 size={13} strokeWidth={1.5} />}
+                  loading={busyId === record.id}
+                  disabled={asOf !== null || isTenantSwitched}
+                  data-testid={`memory-forget-${record.id}`}
+                >
+                  {t("user_profile.memory_forget")}
+                </Button>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         ),
       },
     ],
-    [t, busyId, openEdit, handleForget, navigate, asOf],
+    [t, busyId, openEdit, handleForget, navigate, asOf, isTenantSwitched],
   );
 
   return (

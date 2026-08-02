@@ -10,11 +10,14 @@ import * as sdk from "../../../api/skill-evolution";
 import type { SkillEvalResult } from "../../../api/skill-evolution";
 import { EvalEvidencePanel } from "../EvalEvidencePanel";
 
-let mockScope: string | undefined;
-vi.mock("../../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const listMock = vi.spyOn(sdk, "listEvalResults");
 
@@ -49,16 +52,16 @@ beforeEach(() => {
   listMock.mockReset();
 });
 afterEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.clearAllMocks();
 });
 
 describe("EvalEvidencePanel", () => {
   it("threads the tenant scope through listEvalResults (跨租户钻取)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     listMock.mockResolvedValue([]);
     renderPanel();
-    await waitFor(() => expect(listMock).toHaveBeenCalledWith("sk-1", mockScope));
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith("sk-1", scopeRef.current));
   });
 
   it("renders a paired-bar row per eval result", async () => {

@@ -22,9 +22,11 @@ import {
   type TenantCatalogEntry,
 } from "../../api/mcp-catalog";
 import { ApiError } from "../../api/client";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { CatalogBrowser } from "./CatalogBrowser";
 import { OAuthConnectForm } from "./OAuthConnectForm";
 import { CreateMcpServerDrawer } from "../CreateMcpServerDrawer";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 export interface AddMcpServerDrawerProps {
   open: boolean;
@@ -49,6 +51,8 @@ export function AddMcpServerDrawer({
 }: AddMcpServerDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:自建 server 入口是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [step, setStep] = useState<Step>({ kind: "browse" });
   const [entries, setEntries] = useState<TenantCatalogEntry[]>([]);
@@ -144,12 +148,15 @@ export function AddMcpServerDrawer({
                 {t("mcp_catalog.advanced_hint")}
               </Typography.Text>
               <div style={{ marginTop: 8 }}>
-                <Button
-                  data-testid="amsd-custom"
-                  onClick={() => setCustomOpen(true)}
-                >
-                  {t("mcp_catalog.advanced_custom")}
-                </Button>
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    data-testid="amsd-custom"
+                    disabled={isTenantSwitched}
+                    onClick={() => setCustomOpen(true)}
+                  >
+                    {t("mcp_catalog.advanced_custom")}
+                  </Button>
+                </ReadonlyTooltip>
               </div>
             </div>
           </>

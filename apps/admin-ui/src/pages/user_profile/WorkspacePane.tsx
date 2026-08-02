@@ -24,6 +24,8 @@ import {
 } from "../../api/workspace";
 import type { SessionWorkspace, WorkspaceFile } from "../../api/sessions";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 import { errMessage } from "./useLoad";
 
 const { Text } = Typography;
@@ -50,6 +52,8 @@ export function WorkspacePane({ userId }: { userId: string }) {
   const { message } = App.useApp();
   // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:删工件/删文件是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [workspace, setWorkspace] = useState<SessionWorkspace | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -174,20 +178,24 @@ export function WorkspacePane({ userId }: { userId: string }) {
           >
             {t("user_profile.download")}
           </Button>
-          <Popconfirm
-            title={t("user_profile.delete_confirm", { name: record.name })}
-            onConfirm={() => void handleDeleteArtifact(record.name)}
-            okText={t("user_profile.delete")}
-            okButtonProps={{ danger: true }}
-          >
-            <Button
-              size="small"
-              danger
-              icon={<Trash2 size={13} strokeWidth={1.5} />}
-              loading={busyKey === `artifact:${record.name}`}
-              data-testid={`ws-artifact-delete-${record.name}`}
-            />
-          </Popconfirm>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("user_profile.delete_confirm", { name: record.name })}
+              onConfirm={() => void handleDeleteArtifact(record.name)}
+              okText={t("user_profile.delete")}
+              okButtonProps={{ danger: true }}
+              disabled={isTenantSwitched}
+            >
+              <Button
+                size="small"
+                danger
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                loading={busyKey === `artifact:${record.name}`}
+                data-testid={`ws-artifact-delete-${record.name}`}
+              />
+            </Popconfirm>
+          </ReadonlyTooltip>
         </Space>
       ),
     },
@@ -227,20 +235,24 @@ export function WorkspacePane({ userId }: { userId: string }) {
             onClick={() => void handleDownloadFile(record.path)}
             data-testid={`ws-file-download-${record.path}`}
           />
-          <Popconfirm
-            title={t("user_profile.delete_confirm", { name: record.path })}
-            onConfirm={() => void handleDeleteFile(record.path)}
-            okText={t("user_profile.delete")}
-            okButtonProps={{ danger: true }}
-          >
-            <Button
-              size="small"
-              danger
-              icon={<Trash2 size={13} strokeWidth={1.5} />}
-              loading={busyKey === `file:${record.path}`}
-              data-testid={`ws-file-delete-${record.path}`}
-            />
-          </Popconfirm>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("user_profile.delete_confirm", { name: record.path })}
+              onConfirm={() => void handleDeleteFile(record.path)}
+              okText={t("user_profile.delete")}
+              okButtonProps={{ danger: true }}
+              disabled={isTenantSwitched}
+            >
+              <Button
+                size="small"
+                danger
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                loading={busyKey === `file:${record.path}`}
+                data-testid={`ws-file-delete-${record.path}`}
+              />
+            </Popconfirm>
+          </ReadonlyTooltip>
         </Space>
       ),
     },

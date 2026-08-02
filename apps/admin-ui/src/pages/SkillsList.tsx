@@ -49,8 +49,10 @@ import {
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -87,6 +89,8 @@ export function SkillsList() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:导入 ZIP 是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   // Cross-tenant W3 — home tenant for the aggregate row-jump: a foreign
   // row carries its owning tenant into the detail URL (see onRow below).
   const { identity } = useAuth();
@@ -384,14 +388,17 @@ export function SkillsList() {
             <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
               {t("common.refresh")}
             </Button>
-            <Button
-              type="primary"
-              onClick={onImportClick}
-              icon={<Upload size={14} strokeWidth={1.75} />}
-              data-testid="skills-import-btn"
-            >
-              {t("skills.import_zip")}
-            </Button>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                type="primary"
+                onClick={onImportClick}
+                disabled={isTenantSwitched}
+                icon={<Upload size={14} strokeWidth={1.75} />}
+                data-testid="skills-import-btn"
+              >
+                {t("skills.import_zip")}
+              </Button>
+            </ReadonlyTooltip>
           </>
         }
       />
@@ -444,14 +451,17 @@ export function SkillsList() {
               description={scope === "*" ? t("skills.empty_cross") : t("skills.empty_home")}
             >
               {scope !== "*" && (
-                <Button
-                  type="primary"
-                  icon={<Upload size={14} strokeWidth={1.75} />}
-                  onClick={onImportClick}
-                  data-testid="skills-empty-import"
-                >
-                  {t("skills.import_zip")}
-                </Button>
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    type="primary"
+                    icon={<Upload size={14} strokeWidth={1.75} />}
+                    onClick={onImportClick}
+                    disabled={isTenantSwitched}
+                    data-testid="skills-empty-import"
+                  >
+                    {t("skills.import_zip")}
+                  </Button>
+                </ReadonlyTooltip>
               )}
             </Empty>
           ),

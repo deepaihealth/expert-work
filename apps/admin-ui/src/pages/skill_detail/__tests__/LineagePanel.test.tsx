@@ -11,11 +11,14 @@ import type { SkillLineage } from "../../../api/skill-evolution";
 import type { SkillRecord, SkillVersion } from "../../../api/skills";
 import { LineagePanel } from "../LineagePanel";
 
-let mockScope: string | undefined;
-vi.mock("../../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const getMock = vi.spyOn(sdk, "getLineage");
 
@@ -69,20 +72,20 @@ beforeEach(() => {
   getMock.mockReset();
 });
 afterEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.clearAllMocks();
 });
 
 describe("LineagePanel", () => {
   it("threads the tenant scope through getLineage (跨租户钻取)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     getMock.mockResolvedValue({
       skill: skill(),
       forked_from_source: null,
       versions: [version()],
     } satisfies SkillLineage);
     renderPanel();
-    await waitFor(() => expect(getMock).toHaveBeenCalledWith("sk-1", mockScope));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith("sk-1", scopeRef.current));
   });
 
   it("renders the version timeline with origin tags", async () => {

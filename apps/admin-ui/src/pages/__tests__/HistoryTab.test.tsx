@@ -32,14 +32,13 @@ const { isTenantSwitchedMock, tenantScopeRef } = vi.hoisted(() => ({
 }));
 // Spread the real module so the tab keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: tenantScopeRef.current ?? "home",
-    setScope: () => {},
-    apiTenantScope: tenantScopeRef.current,
-  }),
-}));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    tenantScopeRef,
+  );
+});
 vi.mock("../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));

@@ -15,10 +15,12 @@ import { useTranslation } from "react-i18next";
 import { getBase, reindexBase, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { DocumentsTab } from "./knowledge_detail/DocumentsTab";
 import { RetrievalTestTab } from "./knowledge_detail/RetrievalTestTab";
 import { SettingsTab } from "./knowledge_detail/SettingsTab";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -37,6 +39,8 @@ export function KnowledgeDetail() {
   const navigate = useNavigate();
   // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 422s).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:重建索引是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [base, setBase] = useState<KnowledgeBase | null>(null);
   const [loading, setLoading] = useState(true);
@@ -148,15 +152,18 @@ export function KnowledgeDetail() {
           style={{ marginBottom: 16 }}
           data-testid="knowledge-needs-reindex"
           action={
-            <Button
-              size="small"
-              type="primary"
-              loading={reindexing}
-              onClick={() => void handleReindex()}
-              data-testid="knowledge-reindex-btn"
-            >
-              {t("knowledge_page.reindex_button")}
-            </Button>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                type="primary"
+                loading={reindexing}
+                disabled={isTenantSwitched}
+                onClick={() => void handleReindex()}
+                data-testid="knowledge-reindex-btn"
+              >
+                {t("knowledge_page.reindex_button")}
+              </Button>
+            </ReadonlyTooltip>
           }
         />
       )}

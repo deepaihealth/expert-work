@@ -18,15 +18,14 @@ import { apiClient, setStoredToken } from "../../api/client";
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (switchable per test;
 // undefined = home state).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const TENANT = "00000000-0000-0000-0000-00000000acme";
 
@@ -126,7 +125,7 @@ function renderPage() {
 
 beforeEach(() => {
   vi.restoreAllMocks();
-  mockScope = undefined;
+  scopeRef.current = undefined;
 });
 
 describe("SettingsQuality page", () => {
@@ -203,7 +202,7 @@ describe("SettingsQuality page", () => {
   });
 
   it("threads the switched tenant scope onto both quality reads (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const seen: Record<string, Record<string, unknown> | undefined> = {};
     apiClient.defaults.adapter = (config) => {
       const url = config.url ?? "";
@@ -225,7 +224,7 @@ describe("SettingsQuality page", () => {
       });
     };
     renderPage();
-    await waitFor(() => expect(seen.scores?.tenant_id).toBe(mockScope));
-    expect(seen.alerts?.tenant_id).toBe(mockScope);
+    await waitFor(() => expect(seen.scores?.tenant_id).toBe(scopeRef.current));
+    expect(seen.alerts?.tenant_id).toBe(scopeRef.current);
   });
 });

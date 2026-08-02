@@ -14,13 +14,16 @@ vi.mock("../../auth/AuthContext", () => ({
   useAuth: () => useAuthMock(),
 }));
 
-let mockScope: string | undefined;
 // Spread the real module so the component keeps the real
 // ``concreteTenantScope`` ("*" → undefined) instead of a test-local copy.
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 import { SkillEvolutionKillSwitch } from "../SkillEvolutionKillSwitch";
 
@@ -44,24 +47,50 @@ beforeEach(() => {
   useAuthMock.mockReturnValue({ identity: { isSystemAdmin: false, roles: ["admin"] } });
 });
 afterEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.clearAllMocks();
 });
 
 describe("SkillEvolutionKillSwitch", () => {
   it("threads the tenant scope through getKillSwitch (跨租户钻取)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     getMock.mockResolvedValue(state());
     renderControl();
-    await waitFor(() => expect(getMock).toHaveBeenCalledWith(mockScope));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(scopeRef.current));
   });
 
   it('maps the "*" aggregate scope to no tenant_id so the control stays visible', async () => {
-    mockScope = "*";
+    scopeRef.current = "*";
     getMock.mockResolvedValue(state());
     renderControl();
     await waitFor(() => expect(getMock).toHaveBeenCalledWith(undefined));
     expect(await screen.findByTestId("skill-kill-switch")).toBeInTheDocument();
+  });
+
+  // Cross-tenant W3 (review I-1) — 熔断启停读写租户不对称(读目标租户/写归属
+  // 租户),切入态必须置灰。真 useIsTenantSwitched 逻辑:scope 为他租户 UUID
+  // 即切入态;home 态可用。
+  it("home 态熔断开关可用;切入态置灰(两态,tenant+global 档)", async () => {
+    useAuthMock.mockReturnValue({
+      identity: { isSystemAdmin: true, roles: ["admin"], homeTenantId: "t-home" },
+    });
+    getMock.mockResolvedValue(state());
+    const first = renderControl();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("skill-kill-switch-tenant")).toBeEnabled();
+    expect(screen.getByTestId("skill-kill-switch-global")).toBeEnabled();
+    first.unmount();
+
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("skill-kill-switch-tenant")).toBeDisabled();
+    expect(screen.getByTestId("skill-kill-switch-global")).toBeDisabled();
   });
 
   it("shows the active status + tenant toggle for a tenant admin (no global)", async () => {

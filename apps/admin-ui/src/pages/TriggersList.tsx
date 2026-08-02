@@ -47,7 +47,9 @@ import {
 } from "../api/triggers";
 import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -62,6 +64,8 @@ export function TriggersList() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:启停/删除/创建是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [activeTab, setActiveTab] = useState<TriggerKind>("cron");
   const [data, setData] = useState<TriggerList | null>(null);
@@ -232,11 +236,14 @@ export function TriggersList() {
       key: "enabled",
       width: 100,
       render: (v: boolean, record) => (
-        <Switch
-          checked={v}
-          onChange={(next) => onToggleEnabled(record, next)}
-          data-testid={`trigger-enabled-${record.id}`}
-        />
+        <ReadonlyTooltip on={isTenantSwitched}>
+          <Switch
+            checked={v}
+            disabled={isTenantSwitched}
+            onChange={(next) => onToggleEnabled(record, next)}
+            data-testid={`trigger-enabled-${record.id}`}
+          />
+        </ReadonlyTooltip>
       ),
     },
     {
@@ -255,21 +262,30 @@ export function TriggersList() {
       key: "actions",
       width: 100,
       render: (_, record) => (
-        <Popconfirm
-          title={t("triggers.delete_confirm_title")}
-          description={t("triggers.delete_confirm_body")}
-          okType="danger"
-          okText={t("common.delete")}
-          cancelText={t("common.cancel")}
-          onConfirm={() => onDelete(record.id)}
-        >
-          <Button size="small" danger icon={<Trash2 size={12} strokeWidth={1.75} />} data-testid={`trigger-delete-${record.id}`}>
-            {t("common.delete")}
-          </Button>
-        </Popconfirm>
+        <ReadonlyTooltip on={isTenantSwitched}>
+          <Popconfirm
+            title={t("triggers.delete_confirm_title")}
+            description={t("triggers.delete_confirm_body")}
+            okType="danger"
+            okText={t("common.delete")}
+            cancelText={t("common.cancel")}
+            onConfirm={() => onDelete(record.id)}
+            disabled={isTenantSwitched}
+          >
+            <Button
+              size="small"
+              danger
+              disabled={isTenantSwitched}
+              icon={<Trash2 size={12} strokeWidth={1.75} />}
+              data-testid={`trigger-delete-${record.id}`}
+            >
+              {t("common.delete")}
+            </Button>
+          </Popconfirm>
+        </ReadonlyTooltip>
       ),
     },
-  ], [t, activeTab, onToggleEnabled, onDelete]);
+  ], [t, activeTab, onToggleEnabled, onDelete, isTenantSwitched]);
 
   return (
     <div data-testid="triggers-root">
@@ -293,9 +309,17 @@ export function TriggersList() {
             <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
               {t("common.refresh")}
             </Button>
-            <Button type="primary" icon={<Plus size={14} strokeWidth={1.75} />} onClick={() => openCreate(activeTab)} data-testid="triggers-create-btn">
-              {t("triggers.create")}
-            </Button>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                type="primary"
+                icon={<Plus size={14} strokeWidth={1.75} />}
+                onClick={() => openCreate(activeTab)}
+                disabled={isTenantSwitched}
+                data-testid="triggers-create-btn"
+              >
+                {t("triggers.create")}
+              </Button>
+            </ReadonlyTooltip>
           </>
         }
       />

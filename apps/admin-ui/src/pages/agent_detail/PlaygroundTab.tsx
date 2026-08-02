@@ -21,7 +21,6 @@ import {
   Popconfirm,
   Space,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -90,6 +89,7 @@ import {
 import { useAuth } from "../../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -794,9 +794,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             >
               {t("playground.history_button")}
             </Button>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 icon={<RotateCcw size={12} strokeWidth={1.75} />}
@@ -807,7 +805,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               >
                 {t("playground.new_session")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </Space>
         </div>
         {resumed && (
@@ -953,9 +951,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         )}
 
         <Space size={8}>
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               type="primary"
               icon={
@@ -972,29 +968,33 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             >
               {running ? t("playground.running") : t("playground.run")}
             </Button>
-          </Tooltip>
-          <Button
-            icon={<ImagePlus size={14} strokeWidth={1.75} />}
-            onClick={() => fileInputRef.current?.click()}
-            loading={uploading}
-            disabled={running}
-            data-testid="playground-attach"
-          >
-            {uploading
-              ? t("playground.uploading")
-              : t("playground.attach_image")}
-          </Button>
-          <Button
-            icon={<FileText size={14} strokeWidth={1.75} />}
-            onClick={() => docInputRef.current?.click()}
-            loading={uploading}
-            disabled={running}
-            data-testid="playground-attach-doc"
-          >
-            {uploading
-              ? t("playground.uploading")
-              : t("playground.attach_document")}
-          </Button>
+          </ReadonlyTooltip>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              icon={<ImagePlus size={14} strokeWidth={1.75} />}
+              onClick={() => fileInputRef.current?.click()}
+              loading={uploading}
+              disabled={running || isTenantSwitched}
+              data-testid="playground-attach"
+            >
+              {uploading
+                ? t("playground.uploading")
+                : t("playground.attach_image")}
+            </Button>
+          </ReadonlyTooltip>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              icon={<FileText size={14} strokeWidth={1.75} />}
+              onClick={() => docInputRef.current?.click()}
+              loading={uploading}
+              disabled={running || isTenantSwitched}
+              data-testid="playground-attach-doc"
+            >
+              {uploading
+                ? t("playground.uploading")
+                : t("playground.attach_document")}
+            </Button>
+          </ReadonlyTooltip>
           {running && (
             <Button
               danger
@@ -1122,25 +1122,28 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                         })}
                         data-testid="playground-workspace-artifact-download"
                       />
-                      <Popconfirm
-                        title={t("playground.artifact_delete_confirm")}
-                        okText={t("playground.delete_ok")}
-                        cancelText={t("playground.delete_cancel")}
-                        okButtonProps={{ danger: true }}
-                        onConfirm={() => void handleDeleteArtifact(a.name)}
-                      >
-                        <Button
-                          size="small"
-                          type="text"
-                          danger
-                          icon={<Trash2 size={11} strokeWidth={1.75} />}
-                          disabled={busyWorkspaceKey !== null}
-                          aria-label={t("playground.artifact_delete", {
-                            name: a.name,
-                          })}
-                          data-testid="playground-workspace-artifact-delete"
-                        />
-                      </Popconfirm>
+                      <ReadonlyTooltip on={isTenantSwitched}>
+                        <Popconfirm
+                          title={t("playground.artifact_delete_confirm")}
+                          okText={t("playground.delete_ok")}
+                          cancelText={t("playground.delete_cancel")}
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => void handleDeleteArtifact(a.name)}
+                          disabled={isTenantSwitched}
+                        >
+                          <Button
+                            size="small"
+                            type="text"
+                            danger
+                            icon={<Trash2 size={11} strokeWidth={1.75} />}
+                            disabled={busyWorkspaceKey !== null || isTenantSwitched}
+                            aria-label={t("playground.artifact_delete", {
+                              name: a.name,
+                            })}
+                            data-testid="playground-workspace-artifact-delete"
+                          />
+                        </Popconfirm>
+                      </ReadonlyTooltip>
                     </div>
                   ))}
                 </div>
@@ -1206,26 +1209,29 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                           })}
                           data-testid="playground-workspace-file-download"
                         />
-                        <Popconfirm
-                          title={t("playground.file_delete_confirm")}
-                          okText={t("playground.delete_ok")}
-                          cancelText={t("playground.delete_cancel")}
-                          okButtonProps={{ danger: true }}
-                          onConfirm={() => void handleDeleteFile(f.path)}
-                        >
-                          <Button
-                            size="small"
-                            type="text"
-                            danger
-                            icon={<Trash2 size={11} strokeWidth={1.75} />}
-                            loading={busyWorkspaceKey === f.path}
-                            disabled={busyWorkspaceKey !== null}
-                            aria-label={t("playground.file_delete", {
-                              name: f.path,
-                            })}
-                            data-testid="playground-workspace-file-delete"
-                          />
-                        </Popconfirm>
+                        <ReadonlyTooltip on={isTenantSwitched}>
+                          <Popconfirm
+                            title={t("playground.file_delete_confirm")}
+                            okText={t("playground.delete_ok")}
+                            cancelText={t("playground.delete_cancel")}
+                            okButtonProps={{ danger: true }}
+                            onConfirm={() => void handleDeleteFile(f.path)}
+                            disabled={isTenantSwitched}
+                          >
+                            <Button
+                              size="small"
+                              type="text"
+                              danger
+                              icon={<Trash2 size={11} strokeWidth={1.75} />}
+                              loading={busyWorkspaceKey === f.path}
+                              disabled={busyWorkspaceKey !== null || isTenantSwitched}
+                              aria-label={t("playground.file_delete", {
+                                name: f.path,
+                              })}
+                              data-testid="playground-workspace-file-delete"
+                            />
+                          </Popconfirm>
+                        </ReadonlyTooltip>
                       </div>
                     ))}
                 </div>

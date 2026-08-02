@@ -40,14 +40,21 @@ vi.mock("@monaco-editor/react", () => {
 // Cross-tenant W3 — override the hook only (the real TenantScopeProvider in
 // renderCuration keeps working via the importOriginal spread); switchable per
 // test, undefined = home state.
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
 function makeJwt(payload: Record<string, unknown>): string {
@@ -125,7 +132,9 @@ const datasetRow = {
 
 beforeEach(() => {
   vi.restoreAllMocks();
-  mockScope = undefined;
+  scopeRef.current = undefined;
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 describe("Curation outer page", () => {
@@ -193,8 +202,33 @@ describe("CandidatesPanel", () => {
     expect(screen.getByTestId("curation-dismiss-btn")).toBeInTheDocument();
   });
 
+  it("切入态置灰驳回/提升(两态:home 态由上方用例覆盖)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [candidateRow], total: 1, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1" && m === "get",
+        respond: () => ({
+          ...candidateRow,
+          trajectory: { messages: [{ role: "user", content: "hi" }], step_count: 1 },
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
+    await user.click(screen.getByText("research"));
+    await waitFor(() =>
+      expect(screen.getByTestId("curation-dismiss-btn")).toBeDisabled(),
+    );
+    expect(screen.getByTestId("curation-promote-btn")).toBeDisabled();
+  });
+
   it("threads the switched tenant scope into the getCandidate detail read (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     let detailParams: Record<string, unknown> | undefined;
     apiClient.defaults.adapter = (config) => {
       const url = config.url ?? "";
@@ -218,7 +252,7 @@ describe("CandidatesPanel", () => {
     renderCuration();
     await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
     await user.click(screen.getByText("research"));
-    await waitFor(() => expect(detailParams?.tenant_id).toBe(mockScope));
+    await waitFor(() => expect(detailParams?.tenant_id).toBe(scopeRef.current));
   });
 
   it("opens promote modal with required name input", async () => {
@@ -263,6 +297,25 @@ describe("EvalDatasetsPanel", () => {
     ]);
     await openDatasetsTab();
     await waitFor(() => expect(screen.getByText("golden_v1")).toBeInTheDocument());
+  });
+
+  it("切入态置灰创建/编辑/删除(两态:home 态由上方用例覆盖)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter([
+      {
+        match: (u) => u.startsWith("/v1/curation/candidates"),
+        respond: () => ({ items: [], total: 0, cross_tenant: false }),
+      },
+      {
+        match: (u) => u.startsWith("/v1/eval-datasets"),
+        respond: () => ({ items: [datasetRow], total: 1, cross_tenant: false }),
+      },
+    ]);
+    await openDatasetsTab();
+    await waitFor(() => expect(screen.getByText("golden_v1")).toBeInTheDocument());
+    expect(screen.getByTestId("evald-create-btn")).toBeDisabled();
+    expect(screen.getByTestId(`eval-edit-${datasetRow.id}`)).toBeDisabled();
+    expect(screen.getByTestId(`eval-delete-${datasetRow.id}`)).toBeDisabled();
   });
 
   it("disables Save when input JSON is invalid", async () => {
