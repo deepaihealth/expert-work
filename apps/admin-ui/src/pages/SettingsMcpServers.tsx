@@ -45,6 +45,7 @@ import { CreateMcpServerDrawer } from "../components/CreateMcpServerDrawer";
 import { AddMcpServerDrawer } from "../components/mcp_catalog/AddMcpServerDrawer";
 import { PageHeader } from "../components/PageHeader";
 import { buildUnifiedRows, type UnifiedRow } from "./mcpServerRows";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 type ProbeState =
   | { kind: "idle" }
@@ -334,13 +335,11 @@ export function SettingsMcpServers() {
                   {t("mcp_servers.test")}
                 </Button>
               )}
-              <Popconfirm
-                title={t("mcp_servers.remove_confirm", { name: row.displayName })}
-                onConfirm={() => void handleRemovePlatform(row.catalogId)}
-                disabled={isTenantSwitched}
-              >
-                <Tooltip
-                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Popconfirm
+                  title={t("mcp_servers.remove_confirm", { name: row.displayName })}
+                  onConfirm={() => void handleRemovePlatform(row.catalogId)}
+                  disabled={isTenantSwitched}
                 >
                   <Button
                     size="small"
@@ -349,8 +348,8 @@ export function SettingsMcpServers() {
                   >
                     {t("mcp_servers.remove")}
                   </Button>
-                </Tooltip>
-              </Popconfirm>
+                </Popconfirm>
+              </ReadonlyTooltip>
             </Space>
           );
         }
@@ -365,9 +364,7 @@ export function SettingsMcpServers() {
             >
               {t("mcp_servers.test")}
             </Button>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 disabled={isTenantSwitched}
@@ -376,10 +373,8 @@ export function SettingsMcpServers() {
               >
                 {t("mcp_servers.edit")}
               </Button>
-            </Tooltip>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 disabled={isTenantSwitched}
@@ -388,14 +383,12 @@ export function SettingsMcpServers() {
               >
                 {s.enabled ? t("mcp_servers.act_stop") : t("mcp_servers.act_run")}
               </Button>
-            </Tooltip>
-            <Popconfirm
-              title={t("mcp_servers.delete_confirm", { name: s.name })}
-              onConfirm={() => void handleDelete(s.name)}
-              disabled={isTenantSwitched}
-            >
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("mcp_servers.delete_confirm", { name: s.name })}
+                onConfirm={() => void handleDelete(s.name)}
+                disabled={isTenantSwitched}
               >
                 <Button
                   size="small"
@@ -405,8 +398,8 @@ export function SettingsMcpServers() {
                 >
                   {t("mcp_servers.delete")}
                 </Button>
-              </Tooltip>
-            </Popconfirm>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         );
       },
@@ -473,11 +466,11 @@ export function SettingsMcpServers() {
       >
         {t("mcp_servers.empty_hint")}
       </div>
-      <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+      <ReadonlyTooltip on={isTenantSwitched}>
         <Button type="primary" disabled={isTenantSwitched} onClick={openCreate}>
           {t("mcp_servers.add")}
         </Button>
-      </Tooltip>
+      </ReadonlyTooltip>
     </div>
   );
 
@@ -488,7 +481,7 @@ export function SettingsMcpServers() {
         title={t("mcp_servers.page_title")}
         subtitle={t("mcp_servers.subtitle")}
         actions={
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               type="primary"
               disabled={isTenantSwitched}
@@ -497,7 +490,7 @@ export function SettingsMcpServers() {
             >
               {t("mcp_servers.add")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
         }
       />
 

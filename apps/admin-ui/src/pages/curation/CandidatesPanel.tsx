@@ -41,6 +41,7 @@ import {
 import { ApiError } from "../../api/client";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -269,7 +270,7 @@ export function CandidatesPanel() {
         extra={
           selected?.status === "pending" && (
             <Space>
-              <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+              <ReadonlyTooltip on={isTenantSwitched}>
                 <Button
                   danger
                   disabled={isTenantSwitched}
@@ -278,8 +279,8 @@ export function CandidatesPanel() {
                 >
                   {t("curation.dismiss")}
                 </Button>
-              </Tooltip>
-              <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+              </ReadonlyTooltip>
+              <ReadonlyTooltip on={isTenantSwitched}>
                 <Button
                   type="primary"
                   disabled={isTenantSwitched}
@@ -288,7 +289,7 @@ export function CandidatesPanel() {
                 >
                   {t("curation.promote")}
                 </Button>
-              </Tooltip>
+              </ReadonlyTooltip>
             </Space>
           )
         }

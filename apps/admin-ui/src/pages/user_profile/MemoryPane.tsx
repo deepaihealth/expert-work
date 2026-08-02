@@ -17,7 +17,6 @@ import {
   Space,
   Table,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
@@ -36,6 +35,7 @@ import {
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { errMessage } from "./useLoad";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -197,9 +197,7 @@ export function MemoryPane({ userId }: { userId: string }) {
         width: 160,
         render: (_: unknown, record) => (
           <Space size={6}>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 icon={<Pencil size={13} strokeWidth={1.5} />}
@@ -209,16 +207,14 @@ export function MemoryPane({ userId }: { userId: string }) {
               >
                 {t("user_profile.memory_edit")}
               </Button>
-            </Tooltip>
-            <Popconfirm
-              title={t("user_profile.memory_forget_confirm")}
-              onConfirm={() => void handleForget(record.id)}
-              okText={t("user_profile.memory_forget")}
-              okButtonProps={{ danger: true }}
-              disabled={isTenantSwitched}
-            >
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("user_profile.memory_forget_confirm")}
+                onConfirm={() => void handleForget(record.id)}
+                okText={t("user_profile.memory_forget")}
+                okButtonProps={{ danger: true }}
+                disabled={isTenantSwitched}
               >
                 <Button
                   size="small"
@@ -230,8 +226,8 @@ export function MemoryPane({ userId }: { userId: string }) {
                 >
                   {t("user_profile.memory_forget")}
                 </Button>
-              </Tooltip>
-            </Popconfirm>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         ),
       },

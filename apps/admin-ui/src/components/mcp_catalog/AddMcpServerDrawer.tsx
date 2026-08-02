@@ -12,7 +12,7 @@
  * with per-step controls, reset-on-close).
  */
 import { useCallback, useEffect, useState } from "react";
-import { App, Button, Divider, Drawer, Tooltip, Typography } from "antd";
+import { App, Button, Divider, Drawer, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -26,6 +26,7 @@ import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { CatalogBrowser } from "./CatalogBrowser";
 import { OAuthConnectForm } from "./OAuthConnectForm";
 import { CreateMcpServerDrawer } from "../CreateMcpServerDrawer";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 export interface AddMcpServerDrawerProps {
   open: boolean;
@@ -147,9 +148,7 @@ export function AddMcpServerDrawer({
                 {t("mcp_catalog.advanced_hint")}
               </Typography.Text>
               <div style={{ marginTop: 8 }}>
-                <Tooltip
-                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-                >
+                <ReadonlyTooltip on={isTenantSwitched}>
                   <Button
                     data-testid="amsd-custom"
                     disabled={isTenantSwitched}
@@ -157,7 +156,7 @@ export function AddMcpServerDrawer({
                   >
                     {t("mcp_catalog.advanced_custom")}
                   </Button>
-                </Tooltip>
+                </ReadonlyTooltip>
               </div>
             </div>
           </>

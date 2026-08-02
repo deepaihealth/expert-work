@@ -21,7 +21,6 @@ import {
   Space,
   Spin,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -55,6 +54,7 @@ import { parseTimeline } from "../../api/timeline";
 import { CompactionSummaryList } from "../CompactionCard";
 import { EventCard } from "../EventCard";
 import { MarkdownView } from "../MarkdownView";
+import { ReadonlyTooltip } from "../ReadonlyTooltip";
 import { AgentStatePanels } from "../../pages/agent_detail/playground/AgentStatePanels";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import type { FallbackLine } from "../../pages/agent_detail/playground/history_turns";
@@ -868,19 +868,14 @@ export function TurnCard({
             Track C W2 fix — 切入态只读:审批决策是写操作,按钮真禁用 + Tooltip
             (PlaygroundTab.handleDecide 的 early-return 仅作兜底)。 */}
         {!readOnly && turn.approval && threadId && (
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
-            {/* div 承接 Tooltip 注入的鼠标事件(函数组件 child 不转发会静默失效) */}
-            <div>
-              <ApprovalGate
-                approval={turn.approval}
-                busy={deciding}
-                disabled={isTenantSwitched}
-                onDecide={(decision) => onDecide(turn.id, turn.approval!, decision)}
-              />
-            </div>
-          </Tooltip>
+          <ReadonlyTooltip on={isTenantSwitched} block>
+            <ApprovalGate
+              approval={turn.approval}
+              busy={deciding}
+              disabled={isTenantSwitched}
+              onDecide={(decision) => onDecide(turn.id, turn.approval!, decision)}
+            />
+          </ReadonlyTooltip>
         )}
 
         <TurnMeta
@@ -894,18 +889,13 @@ export function TurnCard({
             skill-evolution curation pipeline. Settled turns only. Track C W2:
             切入态只读——反馈是写操作,置灰 + Tooltip。 */}
         {!readOnly && turn.status === "done" && threadId && (
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
-            {/* div 承接 Tooltip 注入的鼠标事件(函数组件 child 不转发会静默失效) */}
-            <div>
-              <FeedbackBar
-                threadId={threadId}
-                turnSeq={turnSeq}
-                disabled={isTenantSwitched}
-              />
-            </div>
-          </Tooltip>
+          <ReadonlyTooltip on={isTenantSwitched} block>
+            <FeedbackBar
+              threadId={threadId}
+              turnSeq={turnSeq}
+              disabled={isTenantSwitched}
+            />
+          </ReadonlyTooltip>
         )}
       </div>
 

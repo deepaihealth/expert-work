@@ -39,6 +39,7 @@ import {
 import { ApiError } from "../../api/client";
 import { useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -205,7 +206,7 @@ export function EvalDatasetsPanel() {
       width: 180,
       render: (_, record) => (
         <Space size={4}>
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               size="small"
               disabled={isTenantSwitched}
@@ -214,17 +215,17 @@ export function EvalDatasetsPanel() {
             >
               {t("common.edit") /* fallback to "Edit" via i18n */}
             </Button>
-          </Tooltip>
-          <Popconfirm
-            title={t("eval_datasets.delete_confirm_title")}
-            description={t("eval_datasets.delete_confirm_body")}
-            okType="danger"
-            okText={t("common.delete")}
-            cancelText={t("common.cancel")}
-            onConfirm={() => onDelete(record.id)}
-            disabled={isTenantSwitched}
-          >
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          </ReadonlyTooltip>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("eval_datasets.delete_confirm_title")}
+              description={t("eval_datasets.delete_confirm_body")}
+              okType="danger"
+              okText={t("common.delete")}
+              cancelText={t("common.cancel")}
+              onConfirm={() => onDelete(record.id)}
+              disabled={isTenantSwitched}
+            >
               <Button
                 size="small"
                 danger
@@ -234,8 +235,8 @@ export function EvalDatasetsPanel() {
               >
                 {t("common.delete")}
               </Button>
-            </Tooltip>
-          </Popconfirm>
+            </Popconfirm>
+          </ReadonlyTooltip>
         </Space>
       ),
     },
@@ -255,7 +256,7 @@ export function EvalDatasetsPanel() {
         <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
           {t("common.refresh")}
         </Button>
-        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <ReadonlyTooltip on={isTenantSwitched}>
           <Button
             type="primary"
             icon={<Plus size={14} strokeWidth={1.75} />}
@@ -265,7 +266,7 @@ export function EvalDatasetsPanel() {
           >
             {t("eval_datasets.create")}
           </Button>
-        </Tooltip>
+        </ReadonlyTooltip>
       </div>
 
       {error !== null && (

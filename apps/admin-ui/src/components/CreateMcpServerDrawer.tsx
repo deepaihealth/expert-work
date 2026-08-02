@@ -26,7 +26,6 @@ import {
   Space,
   Spin,
   Tabs,
-  Tooltip,
 } from "antd";
 import { Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -43,6 +42,7 @@ import {
 } from "../api/mcp-servers";
 import { ApiError } from "../api/client";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -581,7 +581,7 @@ export function CreateMcpServerDrawer({
           >
             {t("common.cancel")}
           </Button>
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               type="primary"
               loading={submitting}
@@ -593,7 +593,7 @@ export function CreateMcpServerDrawer({
                 ? t("create_mcp_server.submit_save")
                 : t("create_mcp_server.submit_add")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
         </div>
       }
     >

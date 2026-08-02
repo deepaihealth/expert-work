@@ -21,7 +21,6 @@ import {
   Input,
   Modal,
   Space,
-  Tooltip,
   Typography,
   Upload,
 } from "antd";
@@ -33,6 +32,7 @@ import { ApiError } from "../../api/client";
 import { encodeUtf8Base64, type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -155,10 +155,8 @@ export function AddFileModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Tooltip
-          key="submit"
-          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-        >
+        <ReadonlyTooltip
+          key="submit" on={isTenantSwitched}>
           <Button
             type="primary"
             onClick={handleSubmit}
@@ -168,7 +166,7 @@ export function AddFileModal({
           >
             {t("skills.file_add_submit")}
           </Button>
-        </Tooltip>,
+        </ReadonlyTooltip>,
       ]}
     >
       {error !== null && (

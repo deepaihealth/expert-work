@@ -68,6 +68,7 @@ import {
   DeleteConfirmModal,
   RenameModal,
 } from "./skill_detail/RenameDeleteModals";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -396,15 +397,14 @@ export function SkillDetail({
                 backend role check, avoids the 403 round-trip).
                 Pinned state shows the filled icon + brand color so
                 the visual gate is obvious. */}
+            <ReadonlyTooltip on={isTenantSwitched}>
             <Tooltip
               title={
-                isTenantSwitched
-                  ? t("common.tenant_switched_readonly")
-                  : skill.pinned
-                    ? t("skills.pin_tooltip_on")
-                    : isLatestHighRisk && !isAdmin
-                      ? t("skills.detail_admin_required_tooltip")
-                      : t("skills.pin_tooltip_off")
+                skill.pinned
+                  ? t("skills.pin_tooltip_on")
+                  : isLatestHighRisk && !isAdmin
+                    ? t("skills.detail_admin_required_tooltip")
+                    : t("skills.pin_tooltip_off")
               }
             >
               <Button
@@ -431,9 +431,8 @@ export function SkillDetail({
                 {skill.pinned ? t("skills.unpin") : t("skills.pin")}
               </Button>
             </Tooltip>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Select<SkillStatus>
                 value={skill.status}
                 onChange={(v) => onChangeStatus(v)}
@@ -460,7 +459,7 @@ export function SkillDetail({
                   };
                 })}
               />
-            </Tooltip>
+            </ReadonlyTooltip>
           </Space>
         }
       />

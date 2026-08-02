@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { Alert, App, Button, Empty, Skeleton, Space, Tabs, Tag, Tooltip, Typography } from "antd";
+import { Alert, App, Button, Empty, Skeleton, Space, Tabs, Tag, Typography } from "antd";
 import { BookOpen, RefreshCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -20,6 +20,7 @@ import { PageHeader } from "../components/PageHeader";
 import { DocumentsTab } from "./knowledge_detail/DocumentsTab";
 import { RetrievalTestTab } from "./knowledge_detail/RetrievalTestTab";
 import { SettingsTab } from "./knowledge_detail/SettingsTab";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -151,7 +152,7 @@ export function KnowledgeDetail() {
           style={{ marginBottom: 16 }}
           data-testid="knowledge-needs-reindex"
           action={
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 type="primary"
@@ -162,7 +163,7 @@ export function KnowledgeDetail() {
               >
                 {t("knowledge_page.reindex_button")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           }
         />
       )}

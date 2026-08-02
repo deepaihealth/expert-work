@@ -5,7 +5,7 @@
  * target. Mirrors the playground workspace inspector, simplified.
  */
 import { useCallback, useEffect, useState } from "react";
-import { Alert, App, Button, Empty, Popconfirm, Space, Table, Tooltip, Typography } from "antd";
+import { Alert, App, Button, Empty, Popconfirm, Space, Table, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { Download, HardDrive, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -25,6 +25,7 @@ import {
 import type { SessionWorkspace, WorkspaceFile } from "../../api/sessions";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 import { errMessage } from "./useLoad";
 
 const { Text } = Typography;
@@ -177,15 +178,13 @@ export function WorkspacePane({ userId }: { userId: string }) {
           >
             {t("user_profile.download")}
           </Button>
-          <Popconfirm
-            title={t("user_profile.delete_confirm", { name: record.name })}
-            onConfirm={() => void handleDeleteArtifact(record.name)}
-            okText={t("user_profile.delete")}
-            okButtonProps={{ danger: true }}
-            disabled={isTenantSwitched}
-          >
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("user_profile.delete_confirm", { name: record.name })}
+              onConfirm={() => void handleDeleteArtifact(record.name)}
+              okText={t("user_profile.delete")}
+              okButtonProps={{ danger: true }}
+              disabled={isTenantSwitched}
             >
               <Button
                 size="small"
@@ -195,8 +194,8 @@ export function WorkspacePane({ userId }: { userId: string }) {
                 loading={busyKey === `artifact:${record.name}`}
                 data-testid={`ws-artifact-delete-${record.name}`}
               />
-            </Tooltip>
-          </Popconfirm>
+            </Popconfirm>
+          </ReadonlyTooltip>
         </Space>
       ),
     },
@@ -236,15 +235,13 @@ export function WorkspacePane({ userId }: { userId: string }) {
             onClick={() => void handleDownloadFile(record.path)}
             data-testid={`ws-file-download-${record.path}`}
           />
-          <Popconfirm
-            title={t("user_profile.delete_confirm", { name: record.path })}
-            onConfirm={() => void handleDeleteFile(record.path)}
-            okText={t("user_profile.delete")}
-            okButtonProps={{ danger: true }}
-            disabled={isTenantSwitched}
-          >
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("user_profile.delete_confirm", { name: record.path })}
+              onConfirm={() => void handleDeleteFile(record.path)}
+              okText={t("user_profile.delete")}
+              okButtonProps={{ danger: true }}
+              disabled={isTenantSwitched}
             >
               <Button
                 size="small"
@@ -254,8 +251,8 @@ export function WorkspacePane({ userId }: { userId: string }) {
                 loading={busyKey === `file:${record.path}`}
                 data-testid={`ws-file-delete-${record.path}`}
               />
-            </Tooltip>
-          </Popconfirm>
+            </Popconfirm>
+          </ReadonlyTooltip>
         </Space>
       ),
     },

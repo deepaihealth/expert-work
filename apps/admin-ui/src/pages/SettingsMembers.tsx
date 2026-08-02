@@ -53,6 +53,7 @@ import { ApiError } from "../api/client";
 import { PurgeUserModal } from "./user_profile/PurgeUserModal";
 import { SCOPE_ALL, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Paragraph, Text } = Typography;
 
@@ -311,9 +312,7 @@ export function SettingsMembers() {
           return (
             <Space size={6}>
               {record.status === "invited" && (
-                <Tooltip
-                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-                >
+                <ReadonlyTooltip on={isTenantSwitched}>
                   <Button
                     size="small"
                     disabled={isTenantSwitched}
@@ -323,12 +322,10 @@ export function SettingsMembers() {
                   >
                     {t("settings_members.resend")}
                   </Button>
-                </Tooltip>
+                </ReadonlyTooltip>
               )}
               {settable && (
-                <Tooltip
-                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-                >
+                <ReadonlyTooltip on={isTenantSwitched}>
                   <Button
                     size="small"
                     disabled={isTenantSwitched}
@@ -342,28 +339,26 @@ export function SettingsMembers() {
                   >
                     {t("settings_members.set_password")}
                   </Button>
-                </Tooltip>
+                </ReadonlyTooltip>
               )}
               {removable && (
-                <Popconfirm
-                  title={
-                    record.status === "invited"
-                      ? t("settings_members.revoke_confirm_title")
-                      : t("settings_members.suspend_confirm_title")
-                  }
-                  description={
-                    record.status === "invited"
-                      ? t("settings_members.revoke_confirm_body")
-                      : t("settings_members.suspend_confirm_body")
-                  }
-                  okType="danger"
-                  okText={t("common.delete")}
-                  cancelText={t("common.cancel")}
-                  onConfirm={() => onRemove(record.id)}
-                  disabled={isTenantSwitched}
-                >
-                  <Tooltip
-                    title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Popconfirm
+                    title={
+                      record.status === "invited"
+                        ? t("settings_members.revoke_confirm_title")
+                        : t("settings_members.suspend_confirm_title")
+                    }
+                    description={
+                      record.status === "invited"
+                        ? t("settings_members.revoke_confirm_body")
+                        : t("settings_members.suspend_confirm_body")
+                    }
+                    okType="danger"
+                    okText={t("common.delete")}
+                    cancelText={t("common.cancel")}
+                    onConfirm={() => onRemove(record.id)}
+                    disabled={isTenantSwitched}
                   >
                     <Button
                       size="small"
@@ -374,14 +369,12 @@ export function SettingsMembers() {
                     >
                       {t("settings_members.remove")}
                     </Button>
-                  </Tooltip>
-                </Popconfirm>
+                  </Popconfirm>
+                </ReadonlyTooltip>
               )}
               {/* One-shot deactivate & purge — every status is purgeable
                   (suspended / revoked rows re-enter as backfill cleanup). */}
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-              >
+              <ReadonlyTooltip on={isTenantSwitched}>
                 <Button
                   size="small"
                   danger
@@ -392,7 +385,7 @@ export function SettingsMembers() {
                 >
                   {t("settings_members.purge_action")}
                 </Button>
-              </Tooltip>
+              </ReadonlyTooltip>
             </Space>
           );
         },
@@ -430,9 +423,7 @@ export function SettingsMembers() {
               {t("common.refresh")}
             </Button>
             {!crossTenant && (
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-              >
+              <ReadonlyTooltip on={isTenantSwitched}>
                 <Button
                   type="primary"
                   icon={<UserPlus size={14} strokeWidth={1.5} />}
@@ -442,7 +433,7 @@ export function SettingsMembers() {
                 >
                   {t("settings_members.invite")}
                 </Button>
-              </Tooltip>
+              </ReadonlyTooltip>
             )}
           </>
         }

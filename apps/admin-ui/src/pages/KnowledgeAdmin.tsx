@@ -10,7 +10,7 @@
  * only — this page does NOT follow the global TenantScope switch.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { BookOpen, Plus, RefreshCcw, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -22,6 +22,7 @@ import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateBaseModal } from "../components/CreateBaseModal";
 import { PageHeader } from "../components/PageHeader";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -133,15 +134,15 @@ export function KnowledgeAdmin() {
         key: "actions",
         width: 60,
         render: (_: unknown, record) => (
-          <Popconfirm
-            title={t("knowledge_page.delete_base_confirm_title", { name: record.name })}
-            description={t("knowledge_page.delete_base_confirm_body")}
-            onConfirm={() => void handleDelete(record.name)}
-            okText={t("knowledge_page.delete")}
-            okButtonProps={{ danger: true }}
-            disabled={isTenantSwitched}
-          >
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Popconfirm
+              title={t("knowledge_page.delete_base_confirm_title", { name: record.name })}
+              description={t("knowledge_page.delete_base_confirm_body")}
+              onConfirm={() => void handleDelete(record.name)}
+              okText={t("knowledge_page.delete")}
+              okButtonProps={{ danger: true }}
+              disabled={isTenantSwitched}
+            >
               <Button
                 size="small"
                 danger
@@ -152,8 +153,8 @@ export function KnowledgeAdmin() {
                 aria-label={t("knowledge_page.delete")}
                 data-testid={`kb-delete-${record.name}`}
               />
-            </Tooltip>
-          </Popconfirm>
+            </Popconfirm>
+          </ReadonlyTooltip>
         ),
       },
     ],
@@ -181,7 +182,7 @@ export function KnowledgeAdmin() {
             >
               {t("common.refresh")}
             </Button>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.5} />}
@@ -191,7 +192,7 @@ export function KnowledgeAdmin() {
               >
                 {t("knowledge_page.create_base")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </Space>
         }
       />

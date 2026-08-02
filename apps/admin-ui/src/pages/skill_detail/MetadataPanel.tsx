@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 
 import type { SkillRecord, SkillVersion } from "../../api/skills";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -95,9 +96,7 @@ export function MetadataPanel({
                 aria-label={t("platform_skills.detail_category_label")}
                 data-testid="skill-category-input"
               />
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-              >
+              <ReadonlyTooltip on={isTenantSwitched}>
                 <Button
                   type="primary"
                   loading={savingCategory}
@@ -107,7 +106,7 @@ export function MetadataPanel({
                 >
                   {t("platform_skills.detail_category_save")}
                 </Button>
-              </Tooltip>
+              </ReadonlyTooltip>
             </Space.Compact>
           ) : skill.category ? (
             skill.category

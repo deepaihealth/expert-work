@@ -17,7 +17,6 @@ import {
   Select,
   Space,
   Switch,
-  Tooltip,
   Typography,
 } from "antd";
 import { useTranslation } from "react-i18next";
@@ -30,6 +29,7 @@ import {
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -201,7 +201,7 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           >
             <Switch aria-label={t("knowledge_page.field_rerank")} />
           </Form.Item>
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               type="primary"
               htmlType="submit"
@@ -211,7 +211,7 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
             >
               {t("common.save")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
           <Text type="secondary" style={{ display: "block", marginTop: 8, fontSize: 12 }}>
             {t("knowledge_page.settings_rename_note")}
           </Text>
@@ -226,7 +226,7 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           {base.needs_reindex && (
             <Alert type="warning" showIcon message={t("knowledge_page.needs_reindex_banner")} />
           )}
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               loading={reindexing}
               disabled={base.reindexing || isTenantSwitched}
@@ -235,7 +235,7 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
             >
               {t("knowledge_page.reindex_button")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
         </Space>
       </Card>
     </div>

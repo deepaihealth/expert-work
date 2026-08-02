@@ -52,6 +52,7 @@ import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -387,7 +388,7 @@ export function SkillsList() {
             <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
               {t("common.refresh")}
             </Button>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 type="primary"
                 onClick={onImportClick}
@@ -397,7 +398,7 @@ export function SkillsList() {
               >
                 {t("skills.import_zip")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </>
         }
       />
@@ -450,9 +451,7 @@ export function SkillsList() {
               description={scope === "*" ? t("skills.empty_cross") : t("skills.empty_home")}
             >
               {scope !== "*" && (
-                <Tooltip
-                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-                >
+                <ReadonlyTooltip on={isTenantSwitched}>
                   <Button
                     type="primary"
                     icon={<Upload size={14} strokeWidth={1.75} />}
@@ -462,7 +461,7 @@ export function SkillsList() {
                   >
                     {t("skills.import_zip")}
                   </Button>
-                </Tooltip>
+                </ReadonlyTooltip>
               )}
             </Empty>
           ),

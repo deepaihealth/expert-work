@@ -23,7 +23,6 @@ import {
   Spin,
   Switch,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import { Lock } from "lucide-react";
@@ -34,6 +33,7 @@ import type {
   TenantCatalogEntry,
 } from "../../api/mcp-catalog";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text, Paragraph } = Typography;
 
@@ -189,11 +189,7 @@ export function CatalogBrowser({
                   </Button>
                 ) : (
                   <Space size={8}>
-                    <Tooltip
-                      title={
-                        isTenantSwitched ? t("common.tenant_switched_readonly") : undefined
-                      }
-                    >
+                    <ReadonlyTooltip on={isTenantSwitched}>
                       <Switch
                         size="small"
                         checked={entry.tenant_enabled}
@@ -205,7 +201,7 @@ export function CatalogBrowser({
                         })}
                         data-testid={`cb-toggle-${entry.name}`}
                       />
-                    </Tooltip>
+                    </ReadonlyTooltip>
                     <Text type="secondary" style={{ fontSize: 12 }}>
                       {entry.tenant_enabled
                         ? t("mcp_catalog.enabled")

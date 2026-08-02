@@ -49,6 +49,7 @@ import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -235,14 +236,14 @@ export function TriggersList() {
       key: "enabled",
       width: 100,
       render: (v: boolean, record) => (
-        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <ReadonlyTooltip on={isTenantSwitched}>
           <Switch
             checked={v}
             disabled={isTenantSwitched}
             onChange={(next) => onToggleEnabled(record, next)}
             data-testid={`trigger-enabled-${record.id}`}
           />
-        </Tooltip>
+        </ReadonlyTooltip>
       ),
     },
     {
@@ -261,16 +262,16 @@ export function TriggersList() {
       key: "actions",
       width: 100,
       render: (_, record) => (
-        <Popconfirm
-          title={t("triggers.delete_confirm_title")}
-          description={t("triggers.delete_confirm_body")}
-          okType="danger"
-          okText={t("common.delete")}
-          cancelText={t("common.cancel")}
-          onConfirm={() => onDelete(record.id)}
-          disabled={isTenantSwitched}
-        >
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <ReadonlyTooltip on={isTenantSwitched}>
+          <Popconfirm
+            title={t("triggers.delete_confirm_title")}
+            description={t("triggers.delete_confirm_body")}
+            okType="danger"
+            okText={t("common.delete")}
+            cancelText={t("common.cancel")}
+            onConfirm={() => onDelete(record.id)}
+            disabled={isTenantSwitched}
+          >
             <Button
               size="small"
               danger
@@ -280,8 +281,8 @@ export function TriggersList() {
             >
               {t("common.delete")}
             </Button>
-          </Tooltip>
-        </Popconfirm>
+          </Popconfirm>
+        </ReadonlyTooltip>
       ),
     },
   ], [t, activeTab, onToggleEnabled, onDelete, isTenantSwitched]);
@@ -308,7 +309,7 @@ export function TriggersList() {
             <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
               {t("common.refresh")}
             </Button>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.75} />}
@@ -318,7 +319,7 @@ export function TriggersList() {
               >
                 {t("triggers.create")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </>
         }
       />

@@ -24,7 +24,6 @@ import {
   Card,
   Space,
   Switch,
-  Tooltip,
   Typography,
 } from "antd";
 import Editor, { DiffEditor } from "@monaco-editor/react";
@@ -49,6 +48,7 @@ import { type SkillApi } from "../../api/skillApi";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SKILL_MD_PATH } from "./FileTree";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -424,7 +424,7 @@ export function FileEditor({
         {/* SKILL.md is editable (Phase D-2) but has no rename/delete — it's
             a required member of every skill. Saving edits the prompt body. */}
         {isSkillMd && mode === "view" && (
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               size="small"
               type="primary"
@@ -435,11 +435,11 @@ export function FileEditor({
             >
               {t("skills.file_action_edit")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
         )}
         {!isSkillMd && mode === "view" && !isBinary && (
           <>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 danger
@@ -450,8 +450,8 @@ export function FileEditor({
               >
                 {t("skills.file_action_delete")}
               </Button>
-            </Tooltip>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 icon={<PencilLine size={13} strokeWidth={1.75} />}
@@ -461,8 +461,8 @@ export function FileEditor({
               >
                 {t("skills.file_action_rename")}
               </Button>
-            </Tooltip>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 type="primary"
@@ -473,7 +473,7 @@ export function FileEditor({
               >
                 {t("skills.file_action_edit")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </>
         )}
         {mode === "edit" && (
@@ -487,7 +487,7 @@ export function FileEditor({
             >
               {t("skills.file_action_cancel")}
             </Button>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 type="primary"
@@ -499,7 +499,7 @@ export function FileEditor({
               >
                 {t("skills.file_action_save")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </>
         )}
       </div>

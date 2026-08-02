@@ -267,14 +267,16 @@ describe("TurnCard (read-only)", () => {
     expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
   });
 
-  // Cross-tenant W3 fix — Tooltip 包函数组件 child(FeedbackBar)不转发
-  // 鼠标事件会静默失效;套裸 div 后 hover 必须真出 Tooltip。
-  it("切入态 hover 反馈条真出 Tooltip 提示", async () => {
+  // Cross-tenant W3 fix — 函数组件 child(FeedbackBar)不转发鼠标事件,
+  // ReadonlyTooltip 的 wrapper 承接 hover(child 容器 pointer-events:none),
+  // hover wrapper 必须真出 Tooltip。
+  it("切入态 hover 反馈条 wrapper 真出 Tooltip 提示", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     const user = userEvent.setup();
     renderCard({});
 
-    await user.hover(screen.getByTestId("playground-turn-feedback"));
+    expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+    await user.hover(screen.getByTestId("readonly-tooltip"));
 
     expect(
       await screen.findByText(

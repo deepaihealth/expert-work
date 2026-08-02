@@ -23,7 +23,6 @@ import {
   Switch,
   Table,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
@@ -48,6 +47,7 @@ import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -227,14 +227,14 @@ export function WebhooksList() {
       key: "enabled",
       width: 90,
       render: (v: boolean, record) => (
-        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <ReadonlyTooltip on={isTenantSwitched}>
           <Switch
             checked={v}
             disabled={isTenantSwitched}
             onChange={(next) => onToggleEnabled(record, next)}
             data-testid={`webhook-enabled-${record.id}`}
           />
-        </Tooltip>
+        </ReadonlyTooltip>
       ),
     },
     {
@@ -242,16 +242,16 @@ export function WebhooksList() {
       key: "actions",
       width: 100,
       render: (_, record) => (
-        <Popconfirm
-          title={t("webhooks.delete_confirm_title")}
-          description={t("webhooks.delete_confirm_body")}
-          okType="danger"
-          okText={t("common.delete")}
-          cancelText={t("common.cancel")}
-          onConfirm={() => onDelete(record.id)}
-          disabled={isTenantSwitched}
-        >
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        <ReadonlyTooltip on={isTenantSwitched}>
+          <Popconfirm
+            title={t("webhooks.delete_confirm_title")}
+            description={t("webhooks.delete_confirm_body")}
+            okType="danger"
+            okText={t("common.delete")}
+            cancelText={t("common.cancel")}
+            onConfirm={() => onDelete(record.id)}
+            disabled={isTenantSwitched}
+          >
             <Button
               size="small"
               danger
@@ -261,8 +261,8 @@ export function WebhooksList() {
             >
               {t("common.delete")}
             </Button>
-          </Tooltip>
-        </Popconfirm>
+          </Popconfirm>
+        </ReadonlyTooltip>
       ),
     },
   ];
@@ -287,7 +287,7 @@ export function WebhooksList() {
             <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
               {t("common.refresh")}
             </Button>
-            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.75} />}
@@ -297,7 +297,7 @@ export function WebhooksList() {
               >
                 {t("webhooks.create")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </>
         }
       />

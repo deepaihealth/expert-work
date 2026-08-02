@@ -26,6 +26,7 @@ import { ApiError } from "../../api/client";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -218,32 +219,26 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
                 data-testid={`doc-chunks-${record.id}`}
               />
             </Tooltip>
-            <Tooltip
-              title={
-                isTenantSwitched
-                  ? t("common.tenant_switched_readonly")
-                  : t("knowledge_page.reingest")
-              }
-            >
-              <Button
-                size="small"
-                type="text"
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Tooltip title={t("knowledge_page.reingest")}>
+                <Button
+                  size="small"
+                  type="text"
+                  disabled={isTenantSwitched}
+                  icon={<RefreshCw size={14} strokeWidth={1.5} />}
+                  onClick={() => void handleReingest(record.id)}
+                  aria-label={t("knowledge_page.reingest")}
+                  data-testid={`doc-reingest-${record.id}`}
+                />
+              </Tooltip>
+            </ReadonlyTooltip>
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("knowledge_page.delete_doc_confirm_title", { name: record.filename })}
+                onConfirm={() => void handleDelete(record.id)}
+                okText={t("knowledge_page.delete")}
+                okButtonProps={{ danger: true }}
                 disabled={isTenantSwitched}
-                icon={<RefreshCw size={14} strokeWidth={1.5} />}
-                onClick={() => void handleReingest(record.id)}
-                aria-label={t("knowledge_page.reingest")}
-                data-testid={`doc-reingest-${record.id}`}
-              />
-            </Tooltip>
-            <Popconfirm
-              title={t("knowledge_page.delete_doc_confirm_title", { name: record.filename })}
-              onConfirm={() => void handleDelete(record.id)}
-              okText={t("knowledge_page.delete")}
-              okButtonProps={{ danger: true }}
-              disabled={isTenantSwitched}
-            >
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
               >
                 <Button
                   size="small"
@@ -254,8 +249,8 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
                   aria-label={t("knowledge_page.delete")}
                   data-testid={`doc-delete-${record.id}`}
                 />
-              </Tooltip>
-            </Popconfirm>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         ),
       },
@@ -265,8 +260,7 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
 
   return (
     <div data-testid="knowledge-documents-tab">
-      <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
-        {/* div 承接 Tooltip 注入的鼠标事件(函数组件 child 不转发会静默失效) */}
+      <ReadonlyTooltip on={isTenantSwitched} block>
         <div style={{ marginBottom: 16 }}>
           <Upload.Dragger
             accept={SUPPORTED_DOCUMENT_EXTENSIONS.join(",")}
@@ -280,7 +274,7 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
             <p className="ant-upload-hint">{t("knowledge_page.upload_dragger_sub")}</p>
           </Upload.Dragger>
         </div>
-      </Tooltip>
+      </ReadonlyTooltip>
 
       <Table<KnowledgeDocument>
         size="small"

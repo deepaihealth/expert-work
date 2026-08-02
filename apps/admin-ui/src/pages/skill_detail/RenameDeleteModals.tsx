@@ -6,7 +6,7 @@
  * the rest of the destructive surfaces in Admin UI.
  */
 import { useCallback, useState } from "react";
-import { Alert, App, Button, Form, Input, Modal, Tooltip, Typography } from "antd";
+import { Alert, App, Button, Form, Input, Modal, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api/client";
@@ -14,6 +14,7 @@ import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -120,10 +121,8 @@ export function RenameModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Tooltip
-          key="submit"
-          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-        >
+        <ReadonlyTooltip
+          key="submit" on={isTenantSwitched}>
           <Button
             type="primary"
             onClick={handleSubmit}
@@ -133,7 +132,7 @@ export function RenameModal({
           >
             {t("skills.file_rename_submit")}
           </Button>
-        </Tooltip>,
+        </ReadonlyTooltip>,
       ]}
     >
       {error !== null && (
@@ -242,10 +241,8 @@ export function DeleteConfirmModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Tooltip
-          key="submit"
-          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-        >
+        <ReadonlyTooltip
+          key="submit" on={isTenantSwitched}>
           <Button
             danger
             type="primary"
@@ -256,7 +253,7 @@ export function DeleteConfirmModal({
           >
             {t("skills.file_action_delete")}
           </Button>
-        </Tooltip>,
+        </ReadonlyTooltip>,
       ]}
     >
       {error !== null && (

@@ -21,7 +21,6 @@ import {
   Popconfirm,
   Space,
   Tag,
-  Tooltip,
   Typography,
 } from "antd";
 import {
@@ -90,6 +89,7 @@ import {
 import { useAuth } from "../../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -794,9 +794,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             >
               {t("playground.history_button")}
             </Button>
-            <Tooltip
-              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-            >
+            <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
                 icon={<RotateCcw size={12} strokeWidth={1.75} />}
@@ -807,7 +805,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               >
                 {t("playground.new_session")}
               </Button>
-            </Tooltip>
+            </ReadonlyTooltip>
           </Space>
         </div>
         {resumed && (
@@ -953,9 +951,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         )}
 
         <Space size={8}>
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               type="primary"
               icon={
@@ -972,10 +968,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             >
               {running ? t("playground.running") : t("playground.run")}
             </Button>
-          </Tooltip>
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
+          </ReadonlyTooltip>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               icon={<ImagePlus size={14} strokeWidth={1.75} />}
               onClick={() => fileInputRef.current?.click()}
@@ -987,10 +981,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 ? t("playground.uploading")
                 : t("playground.attach_image")}
             </Button>
-          </Tooltip>
-          <Tooltip
-            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
-          >
+          </ReadonlyTooltip>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               icon={<FileText size={14} strokeWidth={1.75} />}
               onClick={() => docInputRef.current?.click()}
@@ -1002,7 +994,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 ? t("playground.uploading")
                 : t("playground.attach_document")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
           {running && (
             <Button
               danger
@@ -1130,20 +1122,14 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                         })}
                         data-testid="playground-workspace-artifact-download"
                       />
-                      <Popconfirm
-                        title={t("playground.artifact_delete_confirm")}
-                        okText={t("playground.delete_ok")}
-                        cancelText={t("playground.delete_cancel")}
-                        okButtonProps={{ danger: true }}
-                        onConfirm={() => void handleDeleteArtifact(a.name)}
-                        disabled={isTenantSwitched}
-                      >
-                        <Tooltip
-                          title={
-                            isTenantSwitched
-                              ? t("common.tenant_switched_readonly")
-                              : undefined
-                          }
+                      <ReadonlyTooltip on={isTenantSwitched}>
+                        <Popconfirm
+                          title={t("playground.artifact_delete_confirm")}
+                          okText={t("playground.delete_ok")}
+                          cancelText={t("playground.delete_cancel")}
+                          okButtonProps={{ danger: true }}
+                          onConfirm={() => void handleDeleteArtifact(a.name)}
+                          disabled={isTenantSwitched}
                         >
                           <Button
                             size="small"
@@ -1156,8 +1142,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                             })}
                             data-testid="playground-workspace-artifact-delete"
                           />
-                        </Tooltip>
-                      </Popconfirm>
+                        </Popconfirm>
+                      </ReadonlyTooltip>
                     </div>
                   ))}
                 </div>
@@ -1223,20 +1209,14 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                           })}
                           data-testid="playground-workspace-file-download"
                         />
-                        <Popconfirm
-                          title={t("playground.file_delete_confirm")}
-                          okText={t("playground.delete_ok")}
-                          cancelText={t("playground.delete_cancel")}
-                          okButtonProps={{ danger: true }}
-                          onConfirm={() => void handleDeleteFile(f.path)}
-                          disabled={isTenantSwitched}
-                        >
-                          <Tooltip
-                            title={
-                              isTenantSwitched
-                                ? t("common.tenant_switched_readonly")
-                                : undefined
-                            }
+                        <ReadonlyTooltip on={isTenantSwitched}>
+                          <Popconfirm
+                            title={t("playground.file_delete_confirm")}
+                            okText={t("playground.delete_ok")}
+                            cancelText={t("playground.delete_cancel")}
+                            okButtonProps={{ danger: true }}
+                            onConfirm={() => void handleDeleteFile(f.path)}
+                            disabled={isTenantSwitched}
                           >
                             <Button
                               size="small"
@@ -1250,8 +1230,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                               })}
                               data-testid="playground-workspace-file-delete"
                             />
-                          </Tooltip>
-                        </Popconfirm>
+                          </Popconfirm>
+                        </ReadonlyTooltip>
                       </div>
                     ))}
                 </div>
