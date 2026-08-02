@@ -21,6 +21,8 @@ import {
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "./ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -30,6 +32,10 @@ export function SkillEvolutionKillSwitch() {
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:熔断启停是写操作。且读写租户不对称
+  // (getKillSwitch 读目标租户、engage/release 只写归属租户),切入态下
+  // 一点就是「看 A 租户的状态、改自家的开关」——必须置灰。读侧照常。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [state, setState] = useState<KillSwitchState | null>(null);
   const [busy, setBusy] = useState(false);
@@ -115,27 +121,33 @@ export function SkillEvolutionKillSwitch() {
       <Text type="secondary" style={{ fontSize: 11 }}>
         {t("skill_evolution.kill_switch_tenant_label")}
       </Text>
-      <Switch
-        size="small"
-        checked={state.tenant?.engaged ?? false}
-        loading={busy}
-        onChange={(next) => onToggle("tenant", next)}
-        aria-label={t("skill_evolution.kill_switch_tenant_aria")}
-        data-testid="skill-kill-switch-tenant"
-      />
+      <ReadonlyTooltip on={isTenantSwitched}>
+        <Switch
+          size="small"
+          checked={state.tenant?.engaged ?? false}
+          loading={busy}
+          disabled={isTenantSwitched}
+          onChange={(next) => onToggle("tenant", next)}
+          aria-label={t("skill_evolution.kill_switch_tenant_aria")}
+          data-testid="skill-kill-switch-tenant"
+        />
+      </ReadonlyTooltip>
       {isSystemAdmin && (
         <>
           <Text type="secondary" style={{ fontSize: 11 }}>
             {t("skill_evolution.kill_switch_global_label")}
           </Text>
-          <Switch
-            size="small"
-            checked={state.global?.engaged ?? false}
-            loading={busy}
-            onChange={(next) => onToggle("global", next)}
-            aria-label={t("skill_evolution.kill_switch_global_aria")}
-            data-testid="skill-kill-switch-global"
-          />
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Switch
+              size="small"
+              checked={state.global?.engaged ?? false}
+              loading={busy}
+              disabled={isTenantSwitched}
+              onChange={(next) => onToggle("global", next)}
+              aria-label={t("skill_evolution.kill_switch_global_aria")}
+              data-testid="skill-kill-switch-global"
+            />
+          </ReadonlyTooltip>
         </>
       )}
     </Space>

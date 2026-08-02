@@ -210,12 +210,20 @@ describe("SkillsList", () => {
         match: (u) => u === "/v1/skills",
         respond: () => ({ items: [skillRow], next_cursor: null, cross_tenant: false }),
       },
+      {
+        match: (u) => u.startsWith("/v1/skill-evolution/kill-switch"),
+        respond: () => ({ global: null, tenant: null, effective_halted: false }),
+      },
     ];
 
     installAdapter(routes);
     const first = renderSkillsRouter();
     await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
     expect(screen.getByTestId("skills-import-btn")).toBeEnabled();
+    // 技能进化熔断开关(review I-1)——同页写控件,home 态可用。
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeEnabled(),
+    );
     first.unmount();
 
     isTenantSwitchedMock.mockReturnValue(true);
@@ -223,6 +231,9 @@ describe("SkillsList", () => {
     renderSkillsRouter();
     await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
     expect(screen.getByTestId("skills-import-btn")).toBeDisabled();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeDisabled(),
+    );
   });
 
   it("draft at v>1 shows the pending-revision tag (SE-A47); v1 draft does not", async () => {

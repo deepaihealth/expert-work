@@ -11,6 +11,15 @@ import type { ToolCallEntry } from "../../api/tool_timeline";
 import * as triggersSdk from "../../api/triggers";
 import type { FireNowResult } from "../../api/triggers";
 
+// Cross-tenant W3 — 立即触发按钮的切入态判定 hook 会触 useAuth/useTenantScope
+// (这里不挂 Provider),mock 掉;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 function updates(node: string, messages: unknown[]): SseEvent {
   return { id: null, event: "updates", data: { [node]: { messages } }, rawData: "", receivedAt: "" };
 }
@@ -175,6 +184,8 @@ describe("ToolTimeline", () => {
 describe("ToolCallCard 立即触发 / run-now button (Spec 1 PR4 Task 4)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+    isTenantSwitchedMock.mockReturnValue(false);
   });
 
   it("shows the button for a successful manage_task create card with a triggerId", () => {
@@ -182,6 +193,22 @@ describe("ToolCallCard 立即触发 / run-now button (Spec 1 PR4 Task 4)", () =>
       baseEntry({ toolName: "manage_task", triggerId: "trig-1", action: "create" }),
     );
     expect(screen.getByTestId("tool-fire-now")).toBeInTheDocument();
+  });
+
+  // Cross-tenant W3 — 立即触发是写操作(以 trigger 的 user 跑 run),切入态置灰。
+  it("home 态立即触发可用;切入态置灰(两态)", () => {
+    const entry = baseEntry({
+      toolName: "manage_task",
+      triggerId: "trig-1",
+      action: "create",
+    });
+    const first = renderFireCard(entry);
+    expect(screen.getByTestId("tool-fire-now")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderFireCard(entry);
+    expect(screen.getByTestId("tool-fire-now")).toBeDisabled();
   });
 
   it("hides the button when there is no triggerId", () => {

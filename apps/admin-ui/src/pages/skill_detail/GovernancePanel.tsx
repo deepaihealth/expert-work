@@ -21,6 +21,8 @@ import {
   requestPromote,
   type PromoteRequest,
 } from "../../api/skill-evolution";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -40,6 +42,10 @@ function errMessage(err: unknown): string {
 export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3(review M-1)— 切入态只读:提议/批准/驳回是写操作,且
+  // promote 链路不带 scope(切入态下会拿目标租户的 skill.id 打归属租户端点),
+  // 置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [pending, setPending] = useState<PromoteRequest | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -134,14 +140,17 @@ export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelPr
         </Space>
 
         {visibility === "agent_private" && pending === null && (
-          <Button
-            icon={<Send size={13} strokeWidth={1.75} />}
-            loading={busy}
-            onClick={onPropose}
-            data-testid="skill-propose-button"
-          >
-            {t("skill_evolution.propose_to_tenant")}
-          </Button>
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              icon={<Send size={13} strokeWidth={1.75} />}
+              loading={busy}
+              disabled={isTenantSwitched}
+              onClick={onPropose}
+              data-testid="skill-propose-button"
+            >
+              {t("skill_evolution.propose_to_tenant")}
+            </Button>
+          </ReadonlyTooltip>
         )}
 
         {pending !== null && (
@@ -149,26 +158,32 @@ export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelPr
             <Tag color="gold">{t("skill_evolution.pending_tenant_promotion")}</Tag>
             {isAdmin && (
               <>
-                <Button
-                  size="small"
-                  type="primary"
-                  icon={<Check size={13} strokeWidth={2} />}
-                  loading={busy}
-                  onClick={() => void onDecide(true)}
-                  data-testid="skill-approve-button"
-                >
-                  {t("skill_evolution.approve")}
-                </Button>
-                <Button
-                  size="small"
-                  danger
-                  icon={<X size={13} strokeWidth={2} />}
-                  loading={busy}
-                  onClick={() => void onDecide(false)}
-                  data-testid="skill-reject-button"
-                >
-                  {t("skill_evolution.reject")}
-                </Button>
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    size="small"
+                    type="primary"
+                    icon={<Check size={13} strokeWidth={2} />}
+                    loading={busy}
+                    disabled={isTenantSwitched}
+                    onClick={() => void onDecide(true)}
+                    data-testid="skill-approve-button"
+                  >
+                    {t("skill_evolution.approve")}
+                  </Button>
+                </ReadonlyTooltip>
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    size="small"
+                    danger
+                    icon={<X size={13} strokeWidth={2} />}
+                    loading={busy}
+                    disabled={isTenantSwitched}
+                    onClick={() => void onDecide(false)}
+                    data-testid="skill-reject-button"
+                  >
+                    {t("skill_evolution.reject")}
+                  </Button>
+                </ReadonlyTooltip>
               </>
             )}
           </Space>

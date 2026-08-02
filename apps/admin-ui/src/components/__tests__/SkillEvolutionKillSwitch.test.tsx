@@ -67,6 +67,32 @@ describe("SkillEvolutionKillSwitch", () => {
     expect(await screen.findByTestId("skill-kill-switch")).toBeInTheDocument();
   });
 
+  // Cross-tenant W3 (review I-1) — 熔断启停读写租户不对称(读目标租户/写归属
+  // 租户),切入态必须置灰。真 useIsTenantSwitched 逻辑:scope 为他租户 UUID
+  // 即切入态;home 态可用。
+  it("home 态熔断开关可用;切入态置灰(两态,tenant+global 档)", async () => {
+    useAuthMock.mockReturnValue({
+      identity: { isSystemAdmin: true, roles: ["admin"], homeTenantId: "t-home" },
+    });
+    getMock.mockResolvedValue(state());
+    const first = renderControl();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("skill-kill-switch-tenant")).toBeEnabled();
+    expect(screen.getByTestId("skill-kill-switch-global")).toBeEnabled();
+    first.unmount();
+
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
+    getMock.mockResolvedValue(state());
+    renderControl();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-kill-switch-tenant")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("skill-kill-switch-tenant")).toBeDisabled();
+    expect(screen.getByTestId("skill-kill-switch-global")).toBeDisabled();
+  });
+
   it("shows the active status + tenant toggle for a tenant admin (no global)", async () => {
     getMock.mockResolvedValue(state());
     renderControl();
