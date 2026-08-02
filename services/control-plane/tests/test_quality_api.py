@@ -18,7 +18,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import QualityDriftAlertRecord, QualityScoreRecord
+from expert_work.protocol import QualityDriftAlertRecord, QualityScoreRecord, Role
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -178,4 +178,97 @@ async def test_list_drift_alerts_tenant_scoped(ctx: _Ctx) -> None:
         )
     )
     resp = await ctx.client.get("/v1/quality/drift-alerts")
+    assert resp.json()["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# W3 — quality 读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套(列表无 "*" 详情拒绝项):system_admin 带目标租户 tenant_id →
+# 200 命中目标租户数据;普通租户用户带他租户 tenant_id → 403
+# TENANT_NOT_ALLOWED;"*" 无聚合读法 → 回落归属租户。照 W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _seed_alert(*, at: datetime) -> QualityDriftAlertRecord:
+    return QualityDriftAlertRecord(
+        tenant_id=_TENANT,
+        agent_name="a",
+        recent_mean=3.0,
+        baseline_mean=5.0,
+        drift_pct=0.4,
+        recent_count=10,
+        baseline_count=40,
+        detected_at=at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_quality_system_admin_target_tenant_200(ctx: _Ctx) -> None:
+    now = datetime.now(tz=UTC)
+    await ctx.scores.insert(_score(agent="a", overall=4, at=now))
+    await ctx.alerts.insert(_seed_alert(at=now))
+    headers = await _grant_system_admin(ctx.client)
+    params = {"tenant_id": str(_TENANT)}
+
+    scores = await ctx.client.get("/v1/quality/scores", params=params, headers=headers)
+    assert scores.status_code == 200, scores.text
+    assert [it["agent_name"] for it in scores.json()["items"]] == ["a"]
+
+    alerts = await ctx.client.get("/v1/quality/drift-alerts", params=params, headers=headers)
+    assert alerts.status_code == 200, alerts.text
+    assert [it["agent_name"] for it in alerts.json()["items"]] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_quality_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
+    """``tenant_id=*``:quality store 无聚合读法(spec 非目标)→ 回落
+    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    now = datetime.now(tz=UTC)
+    await ctx.scores.insert(_score(agent="a", overall=4, at=now))
+    headers = await _grant_system_admin(ctx.client)
+    resp = await ctx.client.get("/v1/quality/scores", params={"tenant_id": "*"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_quality_foreign_tenant_user_403(ctx: _Ctx) -> None:
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    for name, path in [
+        ("list_scores", "/v1/quality/scores"),
+        ("list_drift_alerts", "/v1/quality/drift-alerts"),
+    ]:
+        resp = await ctx.client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_quality_drift_alerts_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
+    """``tenant_id=*`` 回落断言补齐 /drift-alerts(与 /scores 同 helper,M-3)。"""
+    now = datetime.now(tz=UTC)
+    await ctx.alerts.insert(_seed_alert(at=now))
+    headers = await _grant_system_admin(ctx.client)
+    resp = await ctx.client.get(
+        "/v1/quality/drift-alerts", params={"tenant_id": "*"}, headers=headers
+    )
+    assert resp.status_code == 200, resp.text
     assert resp.json()["items"] == []

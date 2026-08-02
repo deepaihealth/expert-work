@@ -1,6 +1,6 @@
 """Tenant usage / cost API — Stream Z (Mini-ADR Z-1).
 
-Two tenant-facing, RLS-self-isolated read endpoints (``billing:read``):
+Two tenant-facing read endpoints (``billing:read``):
 
 * ``GET /v1/usage/cost``   — billed cost + token sums from the Y4
   ``tenant_billing_ledger`` (rollup-derived; lags the hourly rollup).
@@ -10,9 +10,10 @@ Two tenant-facing, RLS-self-isolated read endpoints (``billing:read``):
 **Hard constraint (Stream Y/Z locked decision):** the tenant surface exposes
 ONLY ``billed_cost_micros``. ``base_cost``/``markup`` live on the ledger row but
 are NEVER projected here — they are physically absent from these response
-shapes, visible only via the system_admin chargeback API (Z-2). Tenant scoping
-rides on the RLS ContextVar (``RLSContextMiddleware`` projects
-``principal.tenant_id``), so a plain ``list_for_tenant`` is self-isolating.
+shapes, visible only via the system_admin chargeback API (Z-2). Reads are
+tenant-scoped by default; a system_admin may target another tenant via
+``?tenant_id=`` (W3 read scope, see ``control_plane.tenant_scope``), applied
+to both the RLS ContextVar and the store's explicit ``tenant_id`` filter.
 """
 
 from __future__ import annotations
@@ -20,15 +21,22 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from control_plane.api._authz import require
+from control_plane.tenant_scope import (
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_tenant_scope_home_fallback,
+)
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import TenantBillingLedgerStore
 from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsageStore
 from expert_work.protocol import Principal
+from expert_work.runtime.audit.logger import AuditLogger
 
 _GroupBy = ("agent", "model", "none")
 
@@ -63,6 +71,10 @@ def _get_ledger_store(request: Request) -> TenantBillingLedgerStore:
 
 def _get_token_usage_store(request: Request) -> TokenUsageStore:
     return request.app.state.token_usage_store  # type: ignore[no-any-return]
+
+
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
 def _parse_month(month: str | None) -> date:
@@ -109,19 +121,34 @@ def build_usage_router() -> APIRouter:
 
     @router.get("/cost")
     async def usage_cost(
+        request: Request,
         principal: Annotated[Principal, Depends(require("billing", "read"))],
         store: Annotated[TenantBillingLedgerStore, Depends(_get_ledger_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         month: Annotated[str | None, Query()] = None,
         group_by: Annotated[str, Query()] = "agent",
+        # W3 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's usage from the tenant switcher.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
         if group_by not in _GroupBy:
             raise HTTPException(
                 status_code=422,
                 detail={"code": "INVALID_GROUP_BY", "message": f"group_by ∈ {_GroupBy}"},
             )
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/usage/cost",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         target = _parse_month(month)
-        # RLS self-isolation via the ContextVar — only this tenant's buckets.
-        rows = await store.list_for_tenant(tenant_id=principal.tenant_id, month=target)
+        async with applied_scope(scope):
+            rows = await store.list_for_tenant(tenant_id=scope.tenant_id, month=target)
 
         # Aggregate into groups. NEVER project base/markup — billed only.
         agg: dict[str, _CostGroup] = {}
@@ -167,8 +194,10 @@ def build_usage_router() -> APIRouter:
 
     @router.get("/tokens")
     async def usage_tokens(
+        request: Request,
         principal: Annotated[Principal, Depends(require("billing", "read"))],
         store: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         month: Annotated[str | None, Query()] = None,
         # Conversation-centric IA M2 — narrow to one end-user (the
         # user-detail usage tab). Endpoint already requires billing:read
@@ -177,13 +206,25 @@ def build_usage_router() -> APIRouter:
         # SE-16 (SE-A43) — narrow to one usage kind ('conversation' |
         # 'skill_evolution'); None keeps the full month.
         kind: Annotated[str | None, Query()] = None,
+        # W3 read scope — same treatment as ``/cost``.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
+        # W3 — same "*" home collapse as ``/cost``.
+        scope = await ensure_tenant_scope_home_fallback(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/usage/tokens",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         target = _parse_month(month)
         start, end = _month_window(target)
-        # Realtime — straight from the meter, no rollup lag. RLS self-isolated.
-        rows = await store.list_for_tenant_window(
-            tenant_id=principal.tenant_id, start=start, end=end, user_id=user_id
-        )
+        # Realtime — straight from the meter, no rollup lag.
+        async with applied_scope(scope):
+            rows = await store.list_for_tenant_window(
+                tenant_id=scope.tenant_id, start=start, end=end, user_id=user_id
+            )
         if kind is not None:
             rows = [r for r in rows if r.usage_kind == kind]
 

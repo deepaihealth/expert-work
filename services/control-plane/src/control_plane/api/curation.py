@@ -35,6 +35,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -228,9 +229,21 @@ def build_curation_router() -> APIRouter:
         request: Request,
         candidates: Annotated[CurationCandidateStore, Depends(_get_curation_store)],
         object_store: Annotated[ObjectStore | None, Depends(_get_object_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's candidate; "*" is meaningless (one owning tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        record = await candidates.get(candidate_id=candidate_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/curation/candidates/{candidate_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            record = await candidates.get(candidate_id=candidate_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="curation candidate not found")
         body = _candidate_dict(record)
@@ -426,9 +439,20 @@ def build_eval_dataset_router() -> APIRouter:
         dataset_id: UUID,
         request: Request,
         datasets: Annotated[EvalDatasetStore, Depends(_get_eval_dataset_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — "*" is meaningless (a row belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        record = await datasets.get(dataset_id=dataset_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/eval-datasets/{dataset_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            record = await datasets.get(dataset_id=dataset_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="eval-dataset row not found")
         return JSONResponse(content=_eval_dataset_dict(record))

@@ -44,6 +44,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from control_plane.tenant_status import TenantStatusService
@@ -445,9 +446,21 @@ def build_triggers_router() -> APIRouter:
         request: Request,
         triggers: Annotated[TriggerStore, Depends(_get_trigger_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's trigger; "*" is meaningless (one owning tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        record = await triggers.get(trigger_id=trigger_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/triggers/{trigger_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            record = await triggers.get(trigger_id=trigger_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="trigger not found")
         # H.8-F1 所有权闸:有主触发器仅 owner / admin 可读;resolve 对越权抛 403。

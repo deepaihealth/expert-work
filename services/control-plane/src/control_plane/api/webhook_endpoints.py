@@ -31,6 +31,7 @@ from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
@@ -265,9 +266,21 @@ def build_webhook_endpoints_router() -> APIRouter:
         endpoint_id: UUID,
         request: Request,
         store: Annotated[WebhookEndpointStore, Depends(_get_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant's endpoint; "*" is meaningless (one owning tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        record = await store.get(endpoint_id=endpoint_id, tenant_id=tenant_id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/webhook-endpoints/{endpoint_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            record = await store.get(endpoint_id=endpoint_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="webhook endpoint not found")
         return JSONResponse(content=_endpoint_dict(record))

@@ -17,15 +17,22 @@ import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
+from control_plane.tenant_scope import (
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+    ensure_tenant_scope_home_fallback,
+)
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge import UNSET, DuplicateKnowledgeBaseError
 from expert_work.protocol import (
@@ -36,6 +43,7 @@ from expert_work.protocol import (
     KnowledgeDocument,
     RetrievalMethod,
 )
+from expert_work.runtime.audit.logger import AuditLogger
 
 # NOTE: ``KnowledgeRetriever`` lives in ``orchestrator`` — importing it at
 # module top level would cycle (control-plane → orchestrator). The
@@ -100,6 +108,10 @@ def _get_knowledge_retriever(request: Request) -> Any | None:
 
 def _get_embedding_config_service(request: Request) -> Any | None:
     return getattr(request.app.state, "platform_embedding_config_service", None)
+
+
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
 async def _current_embedding_model(config_service: Any | None) -> tuple[str, str] | None:
@@ -224,10 +236,24 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         config_service: Annotated[Any | None, Depends(_get_embedding_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's knowledge bases from the tenant switcher.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        bases = await store.list_bases(tenant_id=tenant_id)
-        stats = await store.base_stats_many(tenant_id=tenant_id)
+        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
+        # to the caller's home tenant (see the shared helper's docstring).
+        scope = await ensure_tenant_scope_home_fallback(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            bases = await store.list_bases(tenant_id=scope.tenant_id)
+            stats = await store.base_stats_many(tenant_id=scope.tenant_id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
             content={
@@ -248,10 +274,21 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         config_service: Annotated[Any | None, Depends(_get_embedding_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — "*" is meaningless (a base belongs to one tenant).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        base = await _require_base(store, tenant_id, name)
-        stats = await store.base_stats(tenant_id=tenant_id, kb_id=base.id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases/{name}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            stats = await store.base_stats(tenant_id=scope.tenant_id, kb_id=base.id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
             content=_base_dict(base, stats, needs_reindex=_needs_reindex(base, current))
@@ -401,10 +438,21 @@ def build_knowledge_router() -> APIRouter:
         name: str,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        base = await _require_base(store, tenant_id, name)
-        documents = await store.list_documents(tenant_id=tenant_id, kb_id=base.id)
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases/{name}/documents",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            documents = await store.list_documents(tenant_id=scope.tenant_id, kb_id=base.id)
         return JSONResponse(content={"documents": [_document_dict(doc) for doc in documents]})
 
     @router.delete("/bases/{name}/documents/{document_id}", status_code=204, response_model=None)
@@ -471,22 +519,33 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         offset: int = 0,
         limit: int = 50,
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        base = await _require_base(store, tenant_id, name)
-        document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
-        if document is None or document.kb_id != base.id:
-            raise HTTPException(status_code=404, detail="document not found")
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases/{name}/documents/{document_id}/chunks",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         safe_offset = max(0, offset)
         safe_limit = max(1, min(limit, 200))
-        chunks, total = await store.list_chunks(
-            tenant_id=tenant_id,
-            document_id=document_id,
-            offset=safe_offset,
-            limit=safe_limit,
-        )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            document = await store.get_document(tenant_id=scope.tenant_id, document_id=document_id)
+            if document is None or document.kb_id != base.id:
+                raise HTTPException(status_code=404, detail="document not found")
+            chunks, total = await store.list_chunks(
+                tenant_id=scope.tenant_id,
+                document_id=document_id,
+                offset=safe_offset,
+                limit=safe_limit,
+            )
         return JSONResponse(
             content={
                 "chunks": [
@@ -506,23 +565,36 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         retriever: Annotated[Any | None, Depends(_get_knowledge_retriever)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        # W3 read scope — read-only retrieval hit-test: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        tenant_id: UUID = request.state.tenant_id
-        base = await _require_base(store, tenant_id, name)
-        if retriever is None:
-            raise HTTPException(
-                status_code=503,
-                detail="knowledge retrieval unavailable: no embedding model configured",
-            )
-        results = await retriever.search(
-            tenant_id=tenant_id,
-            base_names=[base.name],
-            query=body.query,
-            limit=body.top_k or base.retrieval_top_k,
-            method=body.method,
-            score_threshold=body.score_threshold,
-            rerank=body.rerank,
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="POST /v1/knowledge/bases/{name}/test",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            # AFTER the base lookup — a missing base stays 404 even when the
+            # retriever is unconfigured (pre-W3 error priority).
+            if retriever is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="knowledge retrieval unavailable: no embedding model configured",
+                )
+            results = await retriever.search(
+                tenant_id=scope.tenant_id,
+                base_names=[base.name],
+                query=body.query,
+                limit=body.top_k or base.retrieval_top_k,
+                method=body.method,
+                score_threshold=body.score_threshold,
+                rerank=body.rerank,
+            )
         return JSONResponse(
             content={
                 "query": body.query,

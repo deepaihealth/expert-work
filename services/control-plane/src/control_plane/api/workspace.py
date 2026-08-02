@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -30,6 +30,11 @@ from control_plane.api._user_scope import (
     resolve_target_user_id,
 )
 from control_plane.audit import emit
+from control_plane.tenant_scope import (
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+)
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.rls import current_user_id_var
@@ -86,13 +91,26 @@ def build_workspace_router() -> APIRouter:
         # Tenant-admin governance target (the user-detail Workspace tab); a
         # non-admin asking for someone else is a 403. Omitted → the caller.
         user_id: Annotated[UUID | None, Query()] = None,
+        # W3 read scope — a concrete id lets a system_admin drill into a
+        # foreign tenant user's workspace; "*" is meaningless here.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """The target user's persistent workspace + artifacts.
 
         Read-only: ``workspaces.get`` never provisions a row, so a ``null``
         workspace truthfully means "no VM has ever started for this user".
         """
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/workspace",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        # Caller-identity resolution stays OUTSIDE applied_scope — it reads /
+        # upserts the CALLER's registry row in their home tenant.
         caller_user_id = await resolve_caller_user_id(request, users)
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         if target_user_id is None:
@@ -102,14 +120,15 @@ def build_workspace_router() -> APIRouter:
         # explicit (tenant_id, user_id), but set the RLS GUC too, mirroring
         # ``/v1/artifacts``, so a future user-level policy stays enforced.
         current_user_id_var.set(target_user_id)
-        workspace = await workspaces.get(tenant_id=tenant_id, user_id=target_user_id)
-        arts = await artifacts.list_for_user(tenant_id=tenant_id, user_id=target_user_id)
+        async with applied_scope(scope):
+            workspace = await workspaces.get(tenant_id=target_tenant, user_id=target_user_id)
+            arts = await artifacts.list_for_user(tenant_id=target_tenant, user_id=target_user_id)
         if target_user_id != caller_user_id:
             # Read auditing — an admin opened another user's workspace
             # ("who looked at whom", Phase 2 governance).
             await emit(
                 audit,
-                tenant_id=tenant_id,
+                tenant_id=target_tenant,
                 actor_id=getattr(request.state, "actor_id", "anonymous"),
                 action=AuditAction.USER_DATA_VIEW,
                 resource_type="user",
@@ -132,20 +151,33 @@ def build_workspace_router() -> APIRouter:
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[UUID | None, Query()] = None,
+        # W3 read scope — concrete tenant only (single-tenant semantics).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """Browse the files in the target user's persistent volume.
 
         Read-only inventory for the inspector. A machine principal, an absent
-        supervisor, or an empty volume all return ``[]``.
+        supervisor, or an empty volume all return ``[]``. No store call is made
+        here — file isolation is delegated to the supervisor, which resolves
+        the volume strictly by ``(tenant_id, user_id)``.
         """
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/workspace/files",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        # Caller-identity resolution stays OUTSIDE applied_scope.
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         if target_user_id is None or supervisor is None:
             return JSONResponse({"success": True, "data": {"files": []}})
         try:
             entries = await supervisor.list_workspace_files(
-                tenant_id=tenant_id, user_id=target_user_id
+                tenant_id=scope.tenant_id, user_id=target_user_id
             )
         except SandboxSupervisorError:
             logger.warning("workspace.list_failed", exc_info=True)
@@ -158,17 +190,30 @@ def build_workspace_router() -> APIRouter:
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         path: Annotated[str, Query()],
         user_id: Annotated[UUID | None, Query()] = None,
+        # W3 read scope — concrete tenant only (single-tenant semantics).
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> Response:
         """Download one file from the target user's persistent workspace volume.
 
         MIME-aware + XSS-safe (active content always ``attachment`` +
         ``nosniff``). ``path`` is validated here and again at the supervisor
         boundary. 404 hides cross-user / missing-file / no-supervisor behind one
-        opaque response.
+        opaque response. No store call is made here — file isolation is
+        delegated to the supervisor, which resolves the volume strictly by
+        ``(tenant_id, user_id)``.
         """
-        tenant_id: UUID = request.state.tenant_id
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/workspace/file",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        # Caller-identity resolution stays OUTSIDE applied_scope.
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         safe_path = _safe_workspace_relpath(path)
         if safe_path is None:
@@ -177,7 +222,7 @@ def build_workspace_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="file not found")
         try:
             data = await supervisor.read_workspace_file(
-                tenant_id=tenant_id, user_id=target_user_id, path=safe_path
+                tenant_id=scope.tenant_id, user_id=target_user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:
             logger.warning("workspace.read_failed", exc_info=True)

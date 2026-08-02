@@ -903,3 +903,65 @@ async def test_cross_tenant_list_aggregates_for_system_admin(
     items = resp.json()["data"]["items"]
     tenants_seen = {item["tenant_id"] for item in items}
     assert {str(tenant_a), str(tenant_b)} <= tenants_seen
+
+
+# ---------------------------------------------------------------------------
+# W3 — members C-2 修复:具体 tenant_id 不再被静默忽略
+#
+# system_admin 带具体他租户 UUID → 返回该租户成员;普通租户 admin 带他租户
+# UUID → 403 TENANT_NOT_ALLOWED;"*" 聚合行为不回归(上方既有两测)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_members_system_admin_concrete_foreign_tenant(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    from expert_work.protocol import Role
+
+    client, tenant_a, app, _kc = admin_app
+    tenant_b = uuid4()
+    for tenant, email in ((tenant_a, "a@t1.com"), (tenant_b, "b@t2.com")):
+        r = await client.post(
+            "/v1/members/invite",
+            json={"invitations": [{"email": email, "role": "viewer"}]},
+            headers=_admin_headers(tenant),
+        )
+        assert r.status_code == 201, r.text
+
+    sysadmin = uuid4()
+    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=sysadmin,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="test",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sysadmin), roles=("admin",))
+    resp = await client.get(
+        "/v1/members",
+        params={"tenant_id": str(tenant_b)},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["data"]["items"]
+    # C-2 修复断言:具体 UUID 生效——只见 tenant_b 的成员,不再落回归属租户。
+    assert [i["email"] for i in items] == ["b@t2.com"]
+    assert {i["tenant_id"] for i in items} == {str(tenant_b)}
+
+
+@pytest.mark.asyncio
+async def test_list_members_foreign_tenant_user_403(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """普通租户 admin 带他租户 UUID:此前被静默忽略返回自家名册,现在 403。"""
+    client, tenant_a, _app, _kc = admin_app
+    foreign_tenant = uuid4()
+    resp = await client.get(
+        "/v1/members",
+        params={"tenant_id": str(foreign_tenant)},
+        headers=_admin_headers(tenant_a),
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"

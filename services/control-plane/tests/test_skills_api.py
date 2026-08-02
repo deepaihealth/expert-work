@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import zipfile
 from collections.abc import AsyncIterator
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -23,7 +24,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery
+from expert_work.protocol import AuditAction, AuditQuery, Role
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -691,3 +692,97 @@ async def test_put_prompt_rejects_threat_and_404(setup: Setup) -> None:
         json={"prompt_fragment": "ok body"},
     )
     assert missing.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# W3 — skills 详情读端点接跨租户 scope(系统管理员租户切换器)
+#
+# 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
+# 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tenant_id=* → 400
+# SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# ---------------------------------------------------------------------------
+
+
+async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
+    sys_admin_id = uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _import_skill_with_file(client: AsyncClient) -> tuple[str, int]:
+    """Import a skill ZIP (with one supporting file) into ``_TENANT``."""
+    blob = _build_skill_md_zip(extras={"reference/notes.md": b"line 1\n"})
+    create = await client.post(
+        "/v1/skills/import", files={"file": ("foo.skill", blob, "application/zip")}
+    )
+    assert create.status_code == 201, create.text
+    return create.json()["skill"]["id"], int(create.json()["version"]["version"])
+
+
+def _skill_scope_paths(skill_id: str, version: int) -> list[tuple[str, str]]:
+    return [
+        ("get_skill", f"/v1/skills/{skill_id}"),
+        ("list_versions", f"/v1/skills/{skill_id}/versions"),
+        ("get_version", f"/v1/skills/{skill_id}/versions/{version}"),
+        ("export_version", f"/v1/skills/{skill_id}/versions/{version}/export"),
+        (
+            "get_supporting_file",
+            f"/v1/skills/{skill_id}/versions/{version}/supporting-files/reference/notes.md",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_detail_system_admin_target_tenant_200(setup: Setup) -> None:
+    client, _ = setup
+    skill_id, version = await _import_skill_with_file(client)
+    headers = await _grant_system_admin(client)
+    params = {"tenant_id": str(_TENANT)}
+    for name, path in _skill_scope_paths(skill_id, version):
+        resp = await client.get(path, params=params, headers=headers)
+        assert resp.status_code == 200, f"{name}: {resp.status_code} {resp.text}"
+    # W3 — ``_skill_dict`` carries tenant_id (聚合行跳转依赖).
+    detail = await client.get(f"/v1/skills/{skill_id}", params=params, headers=headers)
+    assert detail.json()["tenant_id"] == str(_TENANT)
+
+
+@pytest.mark.asyncio
+async def test_skill_list_items_carry_tenant_id(setup: Setup) -> None:
+    """列表/详情同源(_skill_dict)——列表行也带 tenant_id。"""
+    client, _ = setup
+    await _import_skill_with_file(client)
+    listed = await client.get("/v1/skills")
+    assert listed.status_code == 200, listed.text
+    assert [s["tenant_id"] for s in listed.json()["items"]] == [str(_TENANT)]
+
+
+@pytest.mark.asyncio
+async def test_skill_detail_foreign_tenant_user_403(setup: Setup) -> None:
+    client, _ = setup
+    skill_id, version = await _import_skill_with_file(client)
+    foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
+    for name, path in _skill_scope_paths(skill_id, version):
+        resp = await client.get(path, params={"tenant_id": str(_TENANT)}, headers=foreign)
+        assert resp.status_code == 403, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED", name
+
+
+@pytest.mark.asyncio
+async def test_skill_detail_tenant_id_star_400(setup: Setup) -> None:
+    client, _ = setup
+    skill_id, version = await _import_skill_with_file(client)
+    for name, path in _skill_scope_paths(skill_id, version):
+        resp = await client.get(path, params={"tenant_id": "*"})
+        assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
