@@ -20,6 +20,14 @@ vi.mock("../../tenant/TenantScopeContext", () => ({
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 const BASES: knowledgeSdk.KnowledgeBase[] = [
   {
     id: "11111111-1111-1111-1111-111111111111",
@@ -53,6 +61,8 @@ function renderPage() {
 
 beforeEach(() => {
   mockScope = undefined;
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -114,6 +124,27 @@ describe("KnowledgeAdmin (list)", () => {
     await waitFor(() =>
       expect(screen.getByText("No knowledge bases yet.")).toBeInTheDocument(),
     );
+  });
+
+  it("home 态创建/删库按钮可用(两态其一)", async () => {
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeEnabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeEnabled();
+  });
+
+  it("切入态置灰创建/删库按钮(两态其二)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeDisabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeDisabled();
   });
 
   it("isSupportedDocument matches the backend whitelist", () => {

@@ -45,6 +45,14 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
 
 const HIGH: MemoryItem = {
@@ -135,6 +143,8 @@ beforeEach(() => {
 afterEach(() => {
   mockScope = undefined;
   vi.restoreAllMocks();
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 describe("UserProfile", () => {
@@ -198,6 +208,31 @@ describe("UserProfile", () => {
         expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
       ),
     );
+  });
+
+  it("切入态置灰工作区删工件/删文件(两态:home 态按钮默认可用)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    stubCommon();
+    vi.spyOn(workspaceSdk, "getUserWorkspace").mockResolvedValue({
+      workspace: null,
+      artifacts: [],
+    });
+    vi.spyOn(workspaceSdk, "getUserWorkspaceFiles").mockResolvedValue([
+      { path: "notes/report.md", size: 1024 } as never,
+    ]);
+    vi.spyOn(artifactsSdk, "listArtifacts").mockResolvedValue({
+      items: [{ name: "summary.pdf", kind: "document", latest_version: 1 }],
+      cross_tenant: false,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("Alice");
+    await user.click(screen.getByRole("tab", { name: "Workspace" }));
+
+    expect(
+      await screen.findByTestId("ws-artifact-delete-summary.pdf"),
+    ).toBeDisabled();
+    expect(screen.getByTestId("ws-file-delete-notes/report.md")).toBeDisabled();
   });
 
   it("titles an unnamed employee by their email, not their OIDC sub", async () => {
@@ -274,6 +309,18 @@ describe("UserProfile", () => {
         USER_ID,
       ),
     );
+  });
+
+  it("切入态置灰记忆编辑/遗忘(两态:home 态由上下用例覆盖)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    stubCommon();
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("Alice");
+    await user.click(screen.getByRole("tab", { name: "Memory" }));
+
+    expect(await screen.findByTestId(`memory-edit-${HIGH.id}`)).toBeDisabled();
+    expect(screen.getByTestId(`memory-forget-${HIGH.id}`)).toBeDisabled();
   });
 
   it("forgets a memory, threading the userId", async () => {

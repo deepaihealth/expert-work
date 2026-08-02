@@ -32,6 +32,14 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
   }),
 }));
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 function run(overrides: Partial<EvalRunRecord> = {}): EvalRunRecord {
   return {
     id: crypto.randomUUID(),
@@ -63,6 +71,8 @@ function renderPage() {
 afterEach(() => {
   vi.restoreAllMocks();
   mockScope = undefined;
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 describe("EvalRunsList", () => {
@@ -93,6 +103,20 @@ describe("EvalRunsList", () => {
     await waitFor(() => expect(enqueueMock).toHaveBeenCalledWith("m0_baseline"));
     // initial load + post-enqueue refresh
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("home 态入队可用;切入态置灰(两态)", async () => {
+    vi.spyOn(evalSdk, "listEvalRuns").mockResolvedValue({ items: [], total: 0 });
+
+    const first = renderPage();
+    await waitFor(() => expect(screen.getByTestId("eval-table")).toBeInTheDocument());
+    expect(screen.getByTestId("eval-enqueue")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("eval-table")).toBeInTheDocument());
+    expect(screen.getByTestId("eval-enqueue")).toBeDisabled();
   });
 
   it("surfaces SDK errors in an alert", async () => {

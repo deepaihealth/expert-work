@@ -53,6 +53,14 @@ vi.mock("../../tenant/TenantScopeContext", () => ({
   useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
 }));
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 function makeJwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
   const body = btoa(JSON.stringify(payload));
@@ -188,6 +196,34 @@ afterEach(() => {
   setStoredToken(null);
   window.sessionStorage.clear();
   vi.clearAllMocks();
+  // vitest 4 的 clear 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
+});
+
+describe("SettingsMembers — 切入态置灰 (W3)", () => {
+  it("home 态邀请/清除可用(两态其一)", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-invite-btn")).toBeEnabled();
+    expect(screen.getByTestId("members-purge-m-1")).toBeEnabled();
+  });
+
+  it("切入态置灰邀请/清除(两态其二)", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-invite-btn")).toBeDisabled();
+    expect(screen.getByTestId("members-purge-m-1")).toBeDisabled();
+    expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
+  });
 });
 
 describe("SettingsMembers — set password", () => {

@@ -35,6 +35,12 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
   }),
 }));
 
+// Cross-tenant W3 — 切入态判定 hook 会触 useAuth(这里不挂 AuthProvider),
+// mock 成 home 态(两态断言在 UserProfile.test.tsx 的 Memory tab 用例)。
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: () => false,
+}));
+
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
 
 const WITH_SOURCE: MemoryItem = {

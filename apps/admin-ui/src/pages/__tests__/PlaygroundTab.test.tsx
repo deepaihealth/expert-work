@@ -2287,6 +2287,21 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
     expect(screen.getByTestId("playground-run")).not.toBeDisabled();
   });
 
+  // Cross-tenant W3 — 上传图片/文档也是写操作(会话工作区落盘),两态断言。
+  it("切入态:上传图片/文档按钮置灰;归属态可用", async () => {
+    const first = renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("playground-attach")).toBeEnabled();
+    expect(screen.getByTestId("playground-attach-doc")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("playground-attach")).toBeDisabled();
+    expect(screen.getByTestId("playground-attach-doc")).toBeDisabled();
+  });
+
   // fix-review Minor#2 — 重试按钮切入态用「不渲染」实现(onRetry={undefined}),
   // 两渲染点(live 轮 + resume 历史轮)各补两态断言。切入态在 home 态跑出
   // transcript 后翻 mock + rerender 模拟(顶栏切换器实时可达该状态)。

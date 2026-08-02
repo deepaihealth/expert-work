@@ -17,6 +17,14 @@ import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 function makeJwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
   const body = btoa(JSON.stringify(payload));
@@ -85,9 +93,40 @@ const webhookRow = {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 describe("TriggersList", () => {
+  it("home 态启停/创建可用;切入态置灰(两态)", async () => {
+    const routes: RouteHandler[] = [
+      {
+        match: (u) => u === "/v1/triggers",
+        respond: () => ({ items: [cronRow], total: 1, cross_tenant: false }),
+      },
+    ];
+
+    installAdapter(routes);
+    const first = renderTriggers();
+    await waitFor(() =>
+      expect(screen.getByTestId("trigger-enabled-t1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("trigger-enabled-t1")).toBeEnabled();
+    expect(screen.getByTestId("triggers-create-btn")).toBeEnabled();
+    expect(screen.getByTestId("trigger-delete-t1")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter(routes);
+    renderTriggers();
+    await waitFor(() =>
+      expect(screen.getByTestId("trigger-enabled-t1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("trigger-enabled-t1")).toBeDisabled();
+    expect(screen.getByTestId("triggers-create-btn")).toBeDisabled();
+    expect(screen.getByTestId("trigger-delete-t1")).toBeDisabled();
+  });
+
   it("default tab is cron and lists cron triggers only", async () => {
     installAdapter([
       {

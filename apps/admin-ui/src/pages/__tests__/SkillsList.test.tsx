@@ -19,6 +19,14 @@ import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
 
+// Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
+const { isTenantSwitchedMock } = vi.hoisted(() => ({
+  isTenantSwitchedMock: vi.fn(() => false),
+}));
+vi.mock("../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: isTenantSwitchedMock,
+}));
+
 vi.mock("@monaco-editor/react", () => {
   const Editor = ({
     value,
@@ -168,6 +176,8 @@ const meResponse = {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
+  isTenantSwitchedMock.mockReturnValue(false);
 });
 
 // ─── SkillsList — pre-PR C tests (unchanged) ─────────────────────────
@@ -191,6 +201,28 @@ describe("SkillsList", () => {
     renderSkillsRouter();
     await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
     expect(screen.getByText("web")).toBeInTheDocument();
+  });
+
+  it("home 态导入 ZIP 按钮可用;切入态置灰(两态)", async () => {
+    const routes: RouteHandler[] = [
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({ items: [skillRow], next_cursor: null, cross_tenant: false }),
+      },
+    ];
+
+    installAdapter(routes);
+    const first = renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
+    expect(screen.getByTestId("skills-import-btn")).toBeEnabled();
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter(routes);
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
+    expect(screen.getByTestId("skills-import-btn")).toBeDisabled();
   });
 
   it("draft at v>1 shows the pending-revision tag (SE-A47); v1 draft does not", async () => {
@@ -411,6 +443,28 @@ describe("SkillDetail (PR C)", () => {
       expect(screen.getByTestId("skill-md-edit-hint")).toBeInTheDocument(),
     );
     expect(screen.getByTestId("skill-editor-edit-btn")).toBeInTheDocument();
+  });
+
+  it("home 态置顶/编辑可用;切入态置灰(两态)", async () => {
+    installAdapter(detailAdapter());
+    const first = renderSkillsRouter(["/skills/sk1"]);
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-pin-button")).toBeEnabled(),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-editor-edit-btn")).toBeEnabled(),
+    );
+    first.unmount();
+
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter(detailAdapter());
+    renderSkillsRouter(["/skills/sk1"]);
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-pin-button")).toBeDisabled(),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-editor-edit-btn")).toBeDisabled(),
+    );
   });
 
   it("404 / error path renders Alert", async () => {
