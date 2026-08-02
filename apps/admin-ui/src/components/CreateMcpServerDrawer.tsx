@@ -26,6 +26,7 @@ import {
   Space,
   Spin,
   Tabs,
+  Tooltip,
 } from "antd";
 import { Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -41,6 +42,7 @@ import {
   type McpTransport,
 } from "../api/mcp-servers";
 import { ApiError } from "../api/client";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -109,6 +111,8 @@ export function CreateMcpServerDrawer({
 }: CreateMcpServerDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:新建/保存是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [form] = Form.useForm<McpServerForm>();
   const [submitting, setSubmitting] = useState(false);
@@ -577,16 +581,19 @@ export function CreateMcpServerDrawer({
           >
             {t("common.cancel")}
           </Button>
-          <Button
-            type="primary"
-            loading={submitting}
-            onClick={handleSubmit}
-            data-testid="cms-submit"
-          >
-            {isEditing
-              ? t("create_mcp_server.submit_save")
-              : t("create_mcp_server.submit_add")}
-          </Button>
+          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <Button
+              type="primary"
+              loading={submitting}
+              disabled={isTenantSwitched}
+              onClick={handleSubmit}
+              data-testid="cms-submit"
+            >
+              {isEditing
+                ? t("create_mcp_server.submit_save")
+                : t("create_mcp_server.submit_add")}
+            </Button>
+          </Tooltip>
         </div>
       }
     >

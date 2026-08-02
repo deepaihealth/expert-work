@@ -21,6 +21,7 @@ import {
   Input,
   Modal,
   Space,
+  Tooltip,
   Typography,
   Upload,
 } from "antd";
@@ -31,6 +32,7 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../../api/client";
 import { encodeUtf8Base64, type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -83,6 +85,8 @@ export function AddFileModal({
 }: AddFileModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:新增文件是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [form] = Form.useForm<FormValues>();
   const [uploaded, setUploaded] = useState<UploadFile | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -151,15 +155,20 @@ export function AddFileModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Button
+        <Tooltip
           key="submit"
-          type="primary"
-          onClick={handleSubmit}
-          loading={submitting}
-          data-testid="skill-add-file-submit"
+          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
         >
-          {t("skills.file_add_submit")}
-        </Button>,
+          <Button
+            type="primary"
+            onClick={handleSubmit}
+            loading={submitting}
+            disabled={isTenantSwitched}
+            data-testid="skill-add-file-submit"
+          >
+            {t("skills.file_add_submit")}
+          </Button>
+        </Tooltip>,
       ]}
     >
       {error !== null && (

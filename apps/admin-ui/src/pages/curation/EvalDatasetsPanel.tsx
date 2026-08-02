@@ -38,6 +38,7 @@ import {
 } from "../../api/curation";
 import { ApiError } from "../../api/client";
 import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -66,6 +67,8 @@ export function EvalDatasetsPanel() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:创建/编辑/删除是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [data, setData] = useState<EvalDatasetList | null>(null);
   const [loading, setLoading] = useState(false);
@@ -202,9 +205,16 @@ export function EvalDatasetsPanel() {
       width: 180,
       render: (_, record) => (
         <Space size={4}>
-          <Button size="small" onClick={() => openEdit(record)} data-testid={`eval-edit-${record.id}`}>
-            {t("common.edit") /* fallback to "Edit" via i18n */}
-          </Button>
+          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+            <Button
+              size="small"
+              disabled={isTenantSwitched}
+              onClick={() => openEdit(record)}
+              data-testid={`eval-edit-${record.id}`}
+            >
+              {t("common.edit") /* fallback to "Edit" via i18n */}
+            </Button>
+          </Tooltip>
           <Popconfirm
             title={t("eval_datasets.delete_confirm_title")}
             description={t("eval_datasets.delete_confirm_body")}
@@ -212,15 +222,24 @@ export function EvalDatasetsPanel() {
             okText={t("common.delete")}
             cancelText={t("common.cancel")}
             onConfirm={() => onDelete(record.id)}
+            disabled={isTenantSwitched}
           >
-            <Button size="small" danger icon={<Trash2 size={12} strokeWidth={1.75} />} data-testid={`eval-delete-${record.id}`}>
-              {t("common.delete")}
-            </Button>
+            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+              <Button
+                size="small"
+                danger
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={12} strokeWidth={1.75} />}
+                data-testid={`eval-delete-${record.id}`}
+              >
+                {t("common.delete")}
+              </Button>
+            </Tooltip>
           </Popconfirm>
         </Space>
       ),
     },
-  ], [t, openEdit, onDelete]);
+  ], [t, openEdit, onDelete, isTenantSwitched]);
 
   const isCrossTenant = data?.cross_tenant ?? false;
 
@@ -236,9 +255,17 @@ export function EvalDatasetsPanel() {
         <Button onClick={refresh} loading={loading} icon={<RefreshCw size={14} strokeWidth={1.5} />}>
           {t("common.refresh")}
         </Button>
-        <Button type="primary" icon={<Plus size={14} strokeWidth={1.75} />} onClick={() => setCreateOpen(true)} data-testid="evald-create-btn">
-          {t("eval_datasets.create")}
-        </Button>
+        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <Button
+            type="primary"
+            icon={<Plus size={14} strokeWidth={1.75} />}
+            onClick={() => setCreateOpen(true)}
+            disabled={isTenantSwitched}
+            data-testid="evald-create-btn"
+          >
+            {t("eval_datasets.create")}
+          </Button>
+        </Tooltip>
       </div>
 
       {error !== null && (

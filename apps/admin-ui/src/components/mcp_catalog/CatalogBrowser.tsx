@@ -23,6 +23,7 @@ import {
   Spin,
   Switch,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import { Lock } from "lucide-react";
@@ -32,6 +33,7 @@ import type {
   McpRequiredTier,
   TenantCatalogEntry,
 } from "../../api/mcp-catalog";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text, Paragraph } = Typography;
 
@@ -59,6 +61,8 @@ export function CatalogBrowser({
   onAuthorize,
 }: CatalogBrowserProps) {
   const { t } = useTranslation();
+  // Cross-tenant W3 — 切入态只读:目录启停是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [busy, setBusy] = useState<ReadonlySet<string>>(new Set());
 
   const handleToggle = useCallback(
@@ -185,16 +189,23 @@ export function CatalogBrowser({
                   </Button>
                 ) : (
                   <Space size={8}>
-                    <Switch
-                      size="small"
-                      checked={entry.tenant_enabled}
-                      loading={busy.has(entry.name)}
-                      onChange={(next) => void handleToggle(entry, next)}
-                      aria-label={t("mcp_catalog.enable_aria", {
-                        name: entry.display_name,
-                      })}
-                      data-testid={`cb-toggle-${entry.name}`}
-                    />
+                    <Tooltip
+                      title={
+                        isTenantSwitched ? t("common.tenant_switched_readonly") : undefined
+                      }
+                    >
+                      <Switch
+                        size="small"
+                        checked={entry.tenant_enabled}
+                        disabled={isTenantSwitched}
+                        loading={busy.has(entry.name)}
+                        onChange={(next) => void handleToggle(entry, next)}
+                        aria-label={t("mcp_catalog.enable_aria", {
+                          name: entry.display_name,
+                        })}
+                        data-testid={`cb-toggle-${entry.name}`}
+                      />
+                    </Tooltip>
                     <Text type="secondary" style={{ fontSize: 12 }}>
                       {entry.tenant_enabled
                         ? t("mcp_catalog.enabled")

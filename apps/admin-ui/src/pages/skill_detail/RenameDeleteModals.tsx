@@ -6,13 +6,14 @@
  * the rest of the destructive surfaces in Admin UI.
  */
 import { useCallback, useState } from "react";
-import { Alert, App, Button, Form, Input, Modal, Typography } from "antd";
+import { Alert, App, Button, Form, Input, Modal, Tooltip, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api/client";
 import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -41,6 +42,8 @@ export function RenameModal({
   const { message } = App.useApp();
   // Cross-tenant W3 — the pre-rename read is scope-aware (writes are not).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:重命名是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [form] = Form.useForm<{ newPath: string }>();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -117,15 +120,20 @@ export function RenameModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Button
+        <Tooltip
           key="submit"
-          type="primary"
-          onClick={handleSubmit}
-          loading={submitting}
-          data-testid="skill-rename-submit"
+          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
         >
-          {t("skills.file_rename_submit")}
-        </Button>,
+          <Button
+            type="primary"
+            onClick={handleSubmit}
+            loading={submitting}
+            disabled={isTenantSwitched}
+            data-testid="skill-rename-submit"
+          >
+            {t("skills.file_rename_submit")}
+          </Button>
+        </Tooltip>,
       ]}
     >
       {error !== null && (
@@ -178,6 +186,8 @@ export function DeleteConfirmModal({
 }: DeleteConfirmModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:删除是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const [typed, setTyped] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -232,17 +242,21 @@ export function DeleteConfirmModal({
         <Button key="cancel" onClick={handleClose} disabled={submitting}>
           {t("skills.file_action_cancel")}
         </Button>,
-        <Button
+        <Tooltip
           key="submit"
-          danger
-          type="primary"
-          onClick={handleSubmit}
-          loading={submitting}
-          disabled={!canDelete}
-          data-testid="skill-delete-submit"
+          title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
         >
-          {t("skills.file_action_delete")}
-        </Button>,
+          <Button
+            danger
+            type="primary"
+            onClick={handleSubmit}
+            loading={submitting}
+            disabled={!canDelete || isTenantSwitched}
+            data-testid="skill-delete-submit"
+          >
+            {t("skills.file_action_delete")}
+          </Button>
+        </Tooltip>,
       ]}
     >
       {error !== null && (

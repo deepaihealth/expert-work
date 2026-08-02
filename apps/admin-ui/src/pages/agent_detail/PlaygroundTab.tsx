@@ -973,28 +973,36 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               {running ? t("playground.running") : t("playground.run")}
             </Button>
           </Tooltip>
-          <Button
-            icon={<ImagePlus size={14} strokeWidth={1.75} />}
-            onClick={() => fileInputRef.current?.click()}
-            loading={uploading}
-            disabled={running}
-            data-testid="playground-attach"
+          <Tooltip
+            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
           >
-            {uploading
-              ? t("playground.uploading")
-              : t("playground.attach_image")}
-          </Button>
-          <Button
-            icon={<FileText size={14} strokeWidth={1.75} />}
-            onClick={() => docInputRef.current?.click()}
-            loading={uploading}
-            disabled={running}
-            data-testid="playground-attach-doc"
+            <Button
+              icon={<ImagePlus size={14} strokeWidth={1.75} />}
+              onClick={() => fileInputRef.current?.click()}
+              loading={uploading}
+              disabled={running || isTenantSwitched}
+              data-testid="playground-attach"
+            >
+              {uploading
+                ? t("playground.uploading")
+                : t("playground.attach_image")}
+            </Button>
+          </Tooltip>
+          <Tooltip
+            title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
           >
-            {uploading
-              ? t("playground.uploading")
-              : t("playground.attach_document")}
-          </Button>
+            <Button
+              icon={<FileText size={14} strokeWidth={1.75} />}
+              onClick={() => docInputRef.current?.click()}
+              loading={uploading}
+              disabled={running || isTenantSwitched}
+              data-testid="playground-attach-doc"
+            >
+              {uploading
+                ? t("playground.uploading")
+                : t("playground.attach_document")}
+            </Button>
+          </Tooltip>
           {running && (
             <Button
               danger
@@ -1128,18 +1136,27 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                         cancelText={t("playground.delete_cancel")}
                         okButtonProps={{ danger: true }}
                         onConfirm={() => void handleDeleteArtifact(a.name)}
+                        disabled={isTenantSwitched}
                       >
-                        <Button
-                          size="small"
-                          type="text"
-                          danger
-                          icon={<Trash2 size={11} strokeWidth={1.75} />}
-                          disabled={busyWorkspaceKey !== null}
-                          aria-label={t("playground.artifact_delete", {
-                            name: a.name,
-                          })}
-                          data-testid="playground-workspace-artifact-delete"
-                        />
+                        <Tooltip
+                          title={
+                            isTenantSwitched
+                              ? t("common.tenant_switched_readonly")
+                              : undefined
+                          }
+                        >
+                          <Button
+                            size="small"
+                            type="text"
+                            danger
+                            icon={<Trash2 size={11} strokeWidth={1.75} />}
+                            disabled={busyWorkspaceKey !== null || isTenantSwitched}
+                            aria-label={t("playground.artifact_delete", {
+                              name: a.name,
+                            })}
+                            data-testid="playground-workspace-artifact-delete"
+                          />
+                        </Tooltip>
                       </Popconfirm>
                     </div>
                   ))}
@@ -1212,19 +1229,28 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                           cancelText={t("playground.delete_cancel")}
                           okButtonProps={{ danger: true }}
                           onConfirm={() => void handleDeleteFile(f.path)}
+                          disabled={isTenantSwitched}
                         >
-                          <Button
-                            size="small"
-                            type="text"
-                            danger
-                            icon={<Trash2 size={11} strokeWidth={1.75} />}
-                            loading={busyWorkspaceKey === f.path}
-                            disabled={busyWorkspaceKey !== null}
-                            aria-label={t("playground.file_delete", {
-                              name: f.path,
-                            })}
-                            data-testid="playground-workspace-file-delete"
-                          />
+                          <Tooltip
+                            title={
+                              isTenantSwitched
+                                ? t("common.tenant_switched_readonly")
+                                : undefined
+                            }
+                          >
+                            <Button
+                              size="small"
+                              type="text"
+                              danger
+                              icon={<Trash2 size={11} strokeWidth={1.75} />}
+                              loading={busyWorkspaceKey === f.path}
+                              disabled={busyWorkspaceKey !== null || isTenantSwitched}
+                              aria-label={t("playground.file_delete", {
+                                name: f.path,
+                              })}
+                              data-testid="playground-workspace-file-delete"
+                            />
+                          </Tooltip>
                         </Popconfirm>
                       </div>
                     ))}

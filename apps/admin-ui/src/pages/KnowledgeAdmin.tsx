@@ -10,7 +10,7 @@
  * only — this page does NOT follow the global TenantScope switch.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Typography } from "antd";
+import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { BookOpen, Plus, RefreshCcw, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -19,6 +19,7 @@ import { useTranslation } from "react-i18next";
 import { deleteBase, listBases, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateBaseModal } from "../components/CreateBaseModal";
 import { PageHeader } from "../components/PageHeader";
 
@@ -38,6 +39,8 @@ export function KnowledgeAdmin() {
   // Cross-tenant W3 — the list rides the ambient scope (the old H-19
   // "does not follow the tenant switch" note is gone with the backend gap).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:删库/新建是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
   const navigate = useNavigate();
 
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
@@ -136,21 +139,25 @@ export function KnowledgeAdmin() {
             onConfirm={() => void handleDelete(record.name)}
             okText={t("knowledge_page.delete")}
             okButtonProps={{ danger: true }}
+            disabled={isTenantSwitched}
           >
-            <Button
-              size="small"
-              danger
-              type="text"
-              icon={<Trash2 size={13} strokeWidth={1.5} />}
-              onClick={(e) => e.stopPropagation()}
-              aria-label={t("knowledge_page.delete")}
-              data-testid={`kb-delete-${record.name}`}
-            />
+            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+              <Button
+                size="small"
+                danger
+                type="text"
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                onClick={(e) => e.stopPropagation()}
+                aria-label={t("knowledge_page.delete")}
+                data-testid={`kb-delete-${record.name}`}
+              />
+            </Tooltip>
           </Popconfirm>
         ),
       },
     ],
-    [t, handleDelete],
+    [t, handleDelete, isTenantSwitched],
   );
 
   return (
@@ -174,14 +181,17 @@ export function KnowledgeAdmin() {
             >
               {t("common.refresh")}
             </Button>
-            <Button
-              type="primary"
-              icon={<Plus size={14} strokeWidth={1.5} />}
-              onClick={() => setCreateOpen(true)}
-              data-testid="kb-create-open"
-            >
-              {t("knowledge_page.create_base")}
-            </Button>
+            <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+              <Button
+                type="primary"
+                icon={<Plus size={14} strokeWidth={1.5} />}
+                onClick={() => setCreateOpen(true)}
+                disabled={isTenantSwitched}
+                data-testid="kb-create-open"
+              >
+                {t("knowledge_page.create_base")}
+              </Button>
+            </Tooltip>
           </Space>
         }
       />

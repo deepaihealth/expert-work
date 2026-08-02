@@ -5,7 +5,7 @@
  * target. Mirrors the playground workspace inspector, simplified.
  */
 import { useCallback, useEffect, useState } from "react";
-import { Alert, App, Button, Empty, Popconfirm, Space, Table, Typography } from "antd";
+import { Alert, App, Button, Empty, Popconfirm, Space, Table, Tooltip, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { Download, HardDrive, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -24,6 +24,7 @@ import {
 } from "../../api/workspace";
 import type { SessionWorkspace, WorkspaceFile } from "../../api/sessions";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { errMessage } from "./useLoad";
 
 const { Text } = Typography;
@@ -50,6 +51,8 @@ export function WorkspacePane({ userId }: { userId: string }) {
   const { message } = App.useApp();
   // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W3 — 切入态只读:删工件/删文件是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [workspace, setWorkspace] = useState<SessionWorkspace | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -179,14 +182,20 @@ export function WorkspacePane({ userId }: { userId: string }) {
             onConfirm={() => void handleDeleteArtifact(record.name)}
             okText={t("user_profile.delete")}
             okButtonProps={{ danger: true }}
+            disabled={isTenantSwitched}
           >
-            <Button
-              size="small"
-              danger
-              icon={<Trash2 size={13} strokeWidth={1.5} />}
-              loading={busyKey === `artifact:${record.name}`}
-              data-testid={`ws-artifact-delete-${record.name}`}
-            />
+            <Tooltip
+              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+            >
+              <Button
+                size="small"
+                danger
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                loading={busyKey === `artifact:${record.name}`}
+                data-testid={`ws-artifact-delete-${record.name}`}
+              />
+            </Tooltip>
           </Popconfirm>
         </Space>
       ),
@@ -232,14 +241,20 @@ export function WorkspacePane({ userId }: { userId: string }) {
             onConfirm={() => void handleDeleteFile(record.path)}
             okText={t("user_profile.delete")}
             okButtonProps={{ danger: true }}
+            disabled={isTenantSwitched}
           >
-            <Button
-              size="small"
-              danger
-              icon={<Trash2 size={13} strokeWidth={1.5} />}
-              loading={busyKey === `file:${record.path}`}
-              data-testid={`ws-file-delete-${record.path}`}
-            />
+            <Tooltip
+              title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+            >
+              <Button
+                size="small"
+                danger
+                disabled={isTenantSwitched}
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                loading={busyKey === `file:${record.path}`}
+                data-testid={`ws-file-delete-${record.path}`}
+              />
+            </Tooltip>
           </Popconfirm>
         </Space>
       ),

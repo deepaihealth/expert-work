@@ -12,7 +12,7 @@
  * with per-step controls, reset-on-close).
  */
 import { useCallback, useEffect, useState } from "react";
-import { App, Button, Divider, Drawer, Typography } from "antd";
+import { App, Button, Divider, Drawer, Tooltip, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -22,6 +22,7 @@ import {
   type TenantCatalogEntry,
 } from "../../api/mcp-catalog";
 import { ApiError } from "../../api/client";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { CatalogBrowser } from "./CatalogBrowser";
 import { OAuthConnectForm } from "./OAuthConnectForm";
 import { CreateMcpServerDrawer } from "../CreateMcpServerDrawer";
@@ -49,6 +50,8 @@ export function AddMcpServerDrawer({
 }: AddMcpServerDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — 切入态只读:自建 server 入口是写操作,置灰。
+  const isTenantSwitched = useIsTenantSwitched();
 
   const [step, setStep] = useState<Step>({ kind: "browse" });
   const [entries, setEntries] = useState<TenantCatalogEntry[]>([]);
@@ -144,12 +147,17 @@ export function AddMcpServerDrawer({
                 {t("mcp_catalog.advanced_hint")}
               </Typography.Text>
               <div style={{ marginTop: 8 }}>
-                <Button
-                  data-testid="amsd-custom"
-                  onClick={() => setCustomOpen(true)}
+                <Tooltip
+                  title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
                 >
-                  {t("mcp_catalog.advanced_custom")}
-                </Button>
+                  <Button
+                    data-testid="amsd-custom"
+                    disabled={isTenantSwitched}
+                    onClick={() => setCustomOpen(true)}
+                  >
+                    {t("mcp_catalog.advanced_custom")}
+                  </Button>
+                </Tooltip>
               </div>
             </div>
           </>
