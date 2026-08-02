@@ -71,15 +71,18 @@ export function TenantScopeProvider({ children }: { children: ReactNode }) {
   });
 
   // Demote stale scope when a non-system-admin lands with a cached
-  // ``"*"`` value (eg. operator left a JWT in localStorage from a
-  // previous system-admin session on this machine).
+  // non-home value — ``"*"`` or any residual specific-tenant UUID (eg.
+  // operator left a JWT in localStorage from a previous system-admin
+  // session on this machine, or an admin got demoted mid-session). A
+  // residual UUID would otherwise flag ``useIsTenantSwitched`` forever
+  // and lock every write control greyed (Cross-tenant W3).
   //
   // Gate on ``serverResolved``: until ``/v1/me`` returns, the optimistic
   // identity reports ``isSystemAdmin=false``, which would wrongly demote a
-  // real system_admin who reloaded on the ``"*"`` scope (scope flashes /
+  // real system_admin who reloaded on a non-home scope (scope flashes /
   // is lost). Only demote once the server truth confirms a non-admin.
   useEffect(() => {
-    if (identity?.serverResolved && !identity.isSystemAdmin && scope === SCOPE_ALL) {
+    if (identity?.serverResolved && !identity.isSystemAdmin && scope !== SCOPE_HOME) {
       setScopeState(SCOPE_HOME);
       writeStored(SCOPE_HOME);
     }

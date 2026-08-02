@@ -8,6 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
@@ -264,6 +265,22 @@ describe("TurnCard (read-only)", () => {
     expect(screen.getByTestId("playground-feedback-up")).toBeDisabled();
     expect(screen.getByTestId("playground-feedback-down")).toBeDisabled();
     expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
+  });
+
+  // Cross-tenant W3 fix — Tooltip 包函数组件 child(FeedbackBar)不转发
+  // 鼠标事件会静默失效;套裸 div 后 hover 必须真出 Tooltip。
+  it("切入态 hover 反馈条真出 Tooltip 提示", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    const user = userEvent.setup();
+    renderCard({});
+
+    await user.hover(screen.getByTestId("playground-turn-feedback"));
+
+    expect(
+      await screen.findByText(
+        "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
+      ),
+    ).toBeInTheDocument();
   });
 });
 

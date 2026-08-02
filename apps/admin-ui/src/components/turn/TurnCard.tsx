@@ -897,11 +897,14 @@ export function TurnCard({
           <Tooltip
             title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
           >
-            <FeedbackBar
-              threadId={threadId}
-              turnSeq={turnSeq}
-              disabled={isTenantSwitched}
-            />
+            {/* div 承接 Tooltip 注入的鼠标事件(函数组件 child 不转发会静默失效) */}
+            <div>
+              <FeedbackBar
+                threadId={threadId}
+                turnSeq={turnSeq}
+                disabled={isTenantSwitched}
+              />
+            </div>
           </Tooltip>
         )}
       </div>
