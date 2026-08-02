@@ -421,7 +421,6 @@ export interface TranslationKeys {
   knowledge_page: {
     page_title: string;
     subtitle: string;
-    home_scope_note: string;
     failed_to_load: string;
     bases_title: string;
     bases_empty: string;
@@ -3330,8 +3329,6 @@ const en: TranslationKeys = {
   knowledge_page: {
     page_title: "Knowledge",
     subtitle: "Tenant-shared knowledge bases feeding agent retrieval.",
-    home_scope_note:
-      "Knowledge bases follow your signed-in tenant only — this page does not switch with the global tenant scope (no cross-tenant backend support).",
     failed_to_load: "Failed to load knowledge bases",
     bases_title: "Bases",
     bases_empty: "No knowledge bases yet.",

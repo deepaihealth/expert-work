@@ -4,12 +4,13 @@
  * Every endpoint is RAW (no envelope) → ``apiClient`` directly, never
  * ``getJson`` ([memory:envelope-vs-raw-contract-check]).
  *
- * Tenant semantics (Mini-ADR H-19): the backend router reads the JWT's
- * home tenant only — there is no ``tenant_id`` query support, so these
- * calls intentionally take NO TenantScope. Knowledge bases are
- * tenant-scoped shared assets (not per-user).
+ * Tenant semantics (Mini-ADR H-19, revised by cross-tenant W3): knowledge
+ * bases are tenant-scoped shared assets (not per-user). The read endpoints
+ * accept an optional ``tenantScope`` (``?tenant_id=``) so a switched-in
+ * system_admin reads the target tenant's bases; ``undefined`` falls through
+ * to the caller's home tenant as before.
  */
-import { apiClient } from "./client";
+import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 /** Document ingestion lifecycle — mirrors the backend ``DocumentStatus``. */
 export type DocumentStatus = "pending" | "processing" | "ready" | "failed";
@@ -141,14 +142,20 @@ export function isSupportedDocument(filename: string): boolean {
   return (SUPPORTED_DOCUMENT_EXTENSIONS as readonly string[]).includes(ext);
 }
 
-export async function listBases(): Promise<KnowledgeBase[]> {
-  const response = await apiClient.get<{ bases: KnowledgeBase[] }>("/v1/knowledge/bases");
+export async function listBases(tenantScope?: TenantScope): Promise<KnowledgeBase[]> {
+  const response = await apiClient.get<{ bases: KnowledgeBase[] }>("/v1/knowledge/bases", {
+    params: withTenantScope({}, tenantScope),
+  });
   return response.data.bases;
 }
 
-export async function getBase(name: string): Promise<KnowledgeBase> {
+export async function getBase(
+  name: string,
+  tenantScope?: TenantScope,
+): Promise<KnowledgeBase> {
   const response = await apiClient.get<KnowledgeBase>(
     `/v1/knowledge/bases/${encodeURIComponent(name)}`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }
@@ -207,9 +214,13 @@ export async function uploadDocument(baseName: string, file: File): Promise<Know
   return response.data;
 }
 
-export async function listDocuments(baseName: string): Promise<KnowledgeDocument[]> {
+export async function listDocuments(
+  baseName: string,
+  tenantScope?: TenantScope,
+): Promise<KnowledgeDocument[]> {
   const response = await apiClient.get<{ documents: KnowledgeDocument[] }>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data.documents;
 }
@@ -236,10 +247,16 @@ export async function listChunks(
   baseName: string,
   documentId: string,
   params?: { offset?: number; limit?: number },
+  tenantScope?: TenantScope,
 ): Promise<ChunksPage> {
   const response = await apiClient.get<ChunksPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/chunks`,
-    { params: { offset: params?.offset, limit: params?.limit } },
+    {
+      params: withTenantScope(
+        { offset: params?.offset, limit: params?.limit },
+        tenantScope,
+      ),
+    },
   );
   return response.data;
 }
@@ -249,10 +266,12 @@ export async function listChunks(
 export async function testRetrieval(
   baseName: string,
   body: RetrievalTestBody,
+  tenantScope?: TenantScope,
 ): Promise<RetrievalTestResponse> {
   const response = await apiClient.post<RetrievalTestResponse>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/test`,
     body,
+    { params: withTenantScope({}, tenantScope) },
   );
   return response.data;
 }

@@ -9,6 +9,17 @@ import { FormView, type FormSection } from "../FormView";
 import type { AgentManifest } from "../form_model";
 import { parseYaml } from "../yaml";
 
+// Cross-tenant W3 — the pickers read the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (home state: no scope).
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: "home",
+    setScope: () => {},
+    apiTenantScope: undefined,
+  }),
+}));
+
 // The MCP tab mounts McpToolPicker, which loads servers on mount.
 vi.mock("../../../api/mcp-servers", () => ({
   listAvailableMcpServers: vi.fn().mockResolvedValue([]),

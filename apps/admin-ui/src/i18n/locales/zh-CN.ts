@@ -430,8 +430,6 @@ const zhCN: TranslationKeys = {
   knowledge_page: {
     page_title: "知识库",
     subtitle: "租户共享知识库，供智能体检索使用。",
-    home_scope_note:
-      "知识库仅跟随当前登录租户——本页不随全局租户切换变化（后端暂无跨租户支持）。",
     failed_to_load: "知识库加载失败",
     bases_title: "知识库",
     bases_empty: "暂无知识库。",

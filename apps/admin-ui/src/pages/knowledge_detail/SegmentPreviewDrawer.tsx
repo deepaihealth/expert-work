@@ -10,6 +10,7 @@ import { useTranslation } from "react-i18next";
 
 import { listChunks, type KnowledgeChunk, type KnowledgeDocument } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text, Paragraph } = Typography;
 
@@ -32,6 +33,8 @@ interface SegmentPreviewDrawerProps {
 export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPreviewDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — subordinate detail read: concrete UUID only ("*" 400s).
+  const { apiTenantScope } = useTenantScope();
 
   const [chunks, setChunks] = useState<KnowledgeChunk[]>([]);
   const [total, setTotal] = useState(0);
@@ -45,10 +48,15 @@ export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPre
       if (!documentId) return;
       setLoading(true);
       try {
-        const result = await listChunks(baseName, documentId, {
-          offset: (targetPage - 1) * PAGE_SIZE,
-          limit: PAGE_SIZE,
-        });
+        const result = await listChunks(
+          baseName,
+          documentId,
+          {
+            offset: (targetPage - 1) * PAGE_SIZE,
+            limit: PAGE_SIZE,
+          },
+          concreteTenantScope(apiTenantScope),
+        );
         setChunks(result.chunks);
         setTotal(result.total);
       } catch (err) {
@@ -57,7 +65,7 @@ export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPre
         setLoading(false);
       }
     },
-    [baseName, documentId, message],
+    [baseName, documentId, message, apiTenantScope],
   );
 
   useEffect(() => {

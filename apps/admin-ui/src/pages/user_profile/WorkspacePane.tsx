@@ -23,6 +23,7 @@ import {
   getUserWorkspaceFiles,
 } from "../../api/workspace";
 import type { SessionWorkspace, WorkspaceFile } from "../../api/sessions";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { errMessage } from "./useLoad";
 
 const { Text } = Typography;
@@ -47,6 +48,8 @@ function isHiddenWorkspacePath(path: string): boolean {
 export function WorkspacePane({ userId }: { userId: string }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
 
   const [workspace, setWorkspace] = useState<SessionWorkspace | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
@@ -59,9 +62,9 @@ export function WorkspacePane({ userId }: { userId: string }) {
     setLoading(true);
     setError(null);
     const [ws, fs, art] = await Promise.allSettled([
-      getUserWorkspace(userId),
-      getUserWorkspaceFiles(userId),
-      listArtifacts({ userId }),
+      getUserWorkspace(userId, concreteTenantScope(apiTenantScope)),
+      getUserWorkspaceFiles(userId, concreteTenantScope(apiTenantScope)),
+      listArtifacts({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
     ]);
     if (ws.status === "fulfilled") setWorkspace(ws.value);
     if (fs.status === "fulfilled") setFiles(fs.value);
@@ -69,7 +72,7 @@ export function WorkspacePane({ userId }: { userId: string }) {
     const failed = [ws, fs, art].find((r) => r.status === "rejected");
     if (failed && failed.status === "rejected") setError(errMessage(failed.reason));
     setLoading(false);
-  }, [userId]);
+  }, [userId, apiTenantScope]);
 
   useEffect(() => {
     void refresh();
@@ -79,14 +82,14 @@ export function WorkspacePane({ userId }: { userId: string }) {
     async (name: string) => {
       setBusyKey(`artifact:${name}`);
       try {
-        await downloadArtifact(name, userId);
+        await downloadArtifact(name, userId, concreteTenantScope(apiTenantScope));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
         setBusyKey(null);
       }
     },
-    [userId, message],
+    [userId, message, apiTenantScope],
   );
 
   const handleDeleteArtifact = useCallback(
@@ -109,14 +112,14 @@ export function WorkspacePane({ userId }: { userId: string }) {
     async (path: string) => {
       setBusyKey(`file:${path}`);
       try {
-        await downloadUserWorkspaceFile(path, userId);
+        await downloadUserWorkspaceFile(path, userId, concreteTenantScope(apiTenantScope));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
         setBusyKey(null);
       }
     },
-    [userId, message],
+    [userId, message, apiTenantScope],
   );
 
   const handleDeleteFile = useCallback(

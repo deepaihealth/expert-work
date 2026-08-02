@@ -35,7 +35,9 @@ function errMessage(err: unknown): string {
 export function KnowledgeAdmin() {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  const { scope } = useTenantScope();
+  // Cross-tenant W3 — the list rides the ambient scope (the old H-19
+  // "does not follow the tenant switch" note is gone with the backend gap).
+  const { apiTenantScope } = useTenantScope();
   const navigate = useNavigate();
 
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
@@ -47,13 +49,13 @@ export function KnowledgeAdmin() {
     setLoading(true);
     setError(null);
     try {
-      setBases(await listBases());
+      setBases(await listBases(apiTenantScope));
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [apiTenantScope]);
 
   useEffect(() => {
     void refresh();
@@ -183,16 +185,6 @@ export function KnowledgeAdmin() {
           </Space>
         }
       />
-
-      {scope !== undefined && (
-        <Alert
-          type="info"
-          showIcon
-          message={t("knowledge_page.home_scope_note")}
-          style={{ marginBottom: 16 }}
-          data-testid="knowledge-scope-note"
-        />
-      )}
 
       {error !== null && (
         <Alert

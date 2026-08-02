@@ -39,6 +39,7 @@ import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import {
   listQualityDriftAlerts,
@@ -138,6 +139,8 @@ function Sparkline({ series }: { series: number[] }) {
 
 export function SettingsQuality() {
   const { t } = useTranslation();
+  // Cross-tenant W3 — the lists are scope-aware ("*" aggregates every tenant).
+  const { apiTenantScope } = useTenantScope();
 
   const [agentFilter, setAgentFilter] = useState("");
   // Named ``timeWindow`` (not ``window``) so it never shadows the DOM global.
@@ -155,8 +158,8 @@ export function SettingsQuality() {
       agentFilter.trim().length > 0 ? agentFilter.trim() : undefined;
     try {
       const [scoreList, alertList] = await Promise.all([
-        listQualityScores({ agentName, windowH: WINDOWS[timeWindow] }),
-        listQualityDriftAlerts({ agentName, windowH: WINDOWS[timeWindow] }),
+        listQualityScores({ agentName, windowH: WINDOWS[timeWindow], tenantScope: apiTenantScope }),
+        listQualityDriftAlerts({ agentName, windowH: WINDOWS[timeWindow], tenantScope: apiTenantScope }),
       ]);
       setScores(scoreList.items);
       setAlerts(alertList.items);
@@ -171,7 +174,7 @@ export function SettingsQuality() {
     } finally {
       setLoading(false);
     }
-  }, [agentFilter, timeWindow]);
+  }, [agentFilter, timeWindow, apiTenantScope]);
 
   useEffect(() => {
     fetchAll();

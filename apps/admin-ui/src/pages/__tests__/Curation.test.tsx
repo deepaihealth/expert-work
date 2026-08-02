@@ -37,6 +37,19 @@ vi.mock("@monaco-editor/react", () => {
   return { default: Editor };
 });
 
+// Cross-tenant W3 — override the hook only (the real TenantScopeProvider in
+// renderCuration keeps working via the importOriginal spread); switchable per
+// test, undefined = home state.
+let mockScope: string | undefined;
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({
+    scope: mockScope ?? "home",
+    setScope: () => {},
+    apiTenantScope: mockScope,
+  }),
+}));
+
 function makeJwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
   const body = btoa(JSON.stringify(payload));
@@ -112,6 +125,7 @@ const datasetRow = {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  mockScope = undefined;
 });
 
 describe("Curation outer page", () => {
@@ -177,6 +191,34 @@ describe("CandidatesPanel", () => {
     await waitFor(() => expect(screen.getByTestId("curation-trajectory-body")).toBeInTheDocument());
     expect(screen.getByTestId("curation-promote-btn")).toBeInTheDocument();
     expect(screen.getByTestId("curation-dismiss-btn")).toBeInTheDocument();
+  });
+
+  it("threads the switched tenant scope into the getCandidate detail read (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    let detailParams: Record<string, unknown> | undefined;
+    apiClient.defaults.adapter = (config) => {
+      const url = config.url ?? "";
+      let data: unknown = {};
+      if (url === "/v1/curation/candidates/c1") {
+        detailParams = config.params as Record<string, unknown>;
+        data = { ...candidateRow, trajectory: null };
+      } else if (url.startsWith("/v1/curation/candidates")) {
+        data = { items: [candidateRow], total: 1, cross_tenant: false };
+      }
+      return Promise.resolve({
+        data,
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
+    await user.click(screen.getByText("research"));
+    await waitFor(() => expect(detailParams?.tenant_id).toBe(mockScope));
   });
 
   it("opens promote modal with required name input", async () => {

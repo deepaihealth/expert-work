@@ -83,7 +83,7 @@ interface InviteForm {
 export function SettingsMembers() {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  const { scope } = useTenantScope();
+  const { scope, apiTenantScope } = useTenantScope();
   // Cross-tenant aggregate ("All tenants") is a read-only view: write
   // actions (invite / resend / reset-password / remove) stay on the
   // single-tenant context where the tenant_id is unambiguous.
@@ -111,7 +111,9 @@ export function SettingsMembers() {
     try {
       const result = await listMembers({
         status: statusFilter === "all" ? undefined : statusFilter,
-        ...(crossTenant ? { crossTenant: true } : {}),
+        // Cross-tenant W3 — bare ambient scope: "*" aggregate or a concrete
+        // switched-in tenant UUID (replaces the legacy crossTenant flag).
+        tenantScope: apiTenantScope,
       });
       setData(result);
     } catch (err) {
@@ -125,7 +127,7 @@ export function SettingsMembers() {
     } finally {
       setLoading(false);
     }
-  }, [statusFilter, crossTenant]);
+  }, [statusFilter, apiTenantScope]);
 
   useEffect(() => {
     refresh();

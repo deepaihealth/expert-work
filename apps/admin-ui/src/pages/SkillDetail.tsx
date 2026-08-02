@@ -43,7 +43,7 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
@@ -55,6 +55,7 @@ import {
 } from "../api/skills";
 import { type SkillApi, tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { AddFileModal } from "./skill_detail/AddFileModal";
 import { FileEditor } from "./skill_detail/FileEditor";
 import { EvalEvidencePanel } from "./skill_detail/EvalEvidencePanel";
@@ -111,6 +112,15 @@ export function SkillDetail({
   const { message, modal } = App.useApp();
   const { skillId } = useParams<{ skillId: string }>();
   const { identity } = useAuth();
+  // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 400s).
+  // Priority: the ``?tenant_id=`` query param (set by the SkillsList "*"
+  // aggregate row-jump — the ambient scope is "*" there, which collapses
+  // to undefined) wins over the ambient switched-in scope. The platform
+  // facade ignores the scope (platform skills are tenant-less).
+  const { apiTenantScope } = useTenantScope();
+  const [searchParams] = useSearchParams();
+  const readScope =
+    searchParams.get("tenant_id") ?? concreteTenantScope(apiTenantScope);
   const isPlatform = variant === "platform";
   const statusOptions = isPlatform ? PLATFORM_STATUS_OPTIONS : STATUS_OPTIONS;
   const backLink = backTo ?? { label: t("nav.skills"), to: "/skills" };
@@ -144,8 +154,8 @@ export function SkillDetail({
     setError(null);
     try {
       const [skillResult, versionsResult] = await Promise.all([
-        api.getSkill(skillId),
-        api.listVersions(skillId),
+        api.getSkill(skillId, readScope),
+        api.listVersions(skillId, readScope),
       ]);
       setSkill(skillResult);
       setVersions(versionsResult.items);
@@ -168,7 +178,7 @@ export function SkillDetail({
     } finally {
       setLoading(false);
     }
-  }, [skillId, api]);
+  }, [skillId, api, readScope]);
 
   useEffect(() => {
     void refresh();
@@ -274,7 +284,7 @@ export function SkillDetail({
   const onExport = useCallback(async () => {
     if (skill === null || selectedVersion === null) return;
     try {
-      const blob = await api.exportVersion(skill.id, selectedVersion.version);
+      const blob = await api.exportVersion(skill.id, selectedVersion.version, readScope);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -287,7 +297,7 @@ export function SkillDetail({
       const msg = err instanceof Error ? err.message : "export failed";
       message.error(msg);
     }
-  }, [skill, selectedVersion, message, api]);
+  }, [skill, selectedVersion, message, api, readScope]);
 
   const selectFileSafely = useCallback(
     (path: string) => {

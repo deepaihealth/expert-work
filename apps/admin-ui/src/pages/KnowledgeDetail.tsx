@@ -14,6 +14,7 @@ import { useTranslation } from "react-i18next";
 
 import { getBase, reindexBase, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import { DocumentsTab } from "./knowledge_detail/DocumentsTab";
 import { RetrievalTestTab } from "./knowledge_detail/RetrievalTestTab";
@@ -34,6 +35,8 @@ export function KnowledgeDetail() {
   const { message } = App.useApp();
   const { name, tab } = useParams<{ name: string; tab?: string }>();
   const navigate = useNavigate();
+  // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 422s).
+  const { apiTenantScope } = useTenantScope();
 
   const [base, setBase] = useState<KnowledgeBase | null>(null);
   const [loading, setLoading] = useState(true);
@@ -45,13 +48,13 @@ export function KnowledgeDetail() {
     setLoading(true);
     setError(null);
     try {
-      setBase(await getBase(name));
+      setBase(await getBase(name, concreteTenantScope(apiTenantScope)));
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [name]);
+  }, [name, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

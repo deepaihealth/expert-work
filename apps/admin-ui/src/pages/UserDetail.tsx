@@ -84,9 +84,17 @@ function ConversationsPane({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
   const load = useCallback(
-    () => listConversations({ agentName, agentVersion, userId }),
-    [agentName, agentVersion, userId],
+    () =>
+      listConversations({
+        agentName,
+        agentVersion,
+        userId,
+        tenantScope: concreteTenantScope(apiTenantScope),
+      }),
+    [agentName, agentVersion, userId, apiTenantScope],
   );
   const { data, loading, error } = useLoad(load);
 
@@ -183,7 +191,12 @@ function ConversationsPane({
 
 function MemoryPane({ userId }: { userId: string }) {
   const { t } = useTranslation();
-  const load = useCallback(() => listMemories({ userId }), [userId]);
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
+  const load = useCallback(
+    () => listMemories({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
+    [userId, apiTenantScope],
+  );
   const { data, loading, error } = useLoad(load);
 
   const columns: TableColumnsType<MemoryItem> = useMemo(
@@ -236,7 +249,12 @@ function MemoryPane({ userId }: { userId: string }) {
 
 function UsagePane({ userId }: { userId: string }) {
   const { t } = useTranslation();
-  const load = useCallback(() => getUsageTokens({ userId }), [userId]);
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
+  const load = useCallback(
+    () => getUsageTokens({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
+    [userId, apiTenantScope],
+  );
   const { data, loading, error } = useLoad(load);
 
   if (loading) return <Skeleton active paragraph={{ rows: 3 }} />;

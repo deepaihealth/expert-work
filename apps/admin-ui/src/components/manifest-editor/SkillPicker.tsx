@@ -30,6 +30,7 @@ import {
 import { useTranslation } from "react-i18next";
 
 import { listSkills, type SkillRecord } from "../../api/skills";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 import { FieldHelp } from "../FieldHelp";
 import {
   readAutoAttachEvolvedSkills,
@@ -76,6 +77,8 @@ interface SkillPickerProps {
 
 export function SkillPicker({ formData, onChange }: SkillPickerProps) {
   const { t } = useTranslation();
+  // Cross-tenant W3 — list the switched-in tenant's skills for the picker.
+  const { apiTenantScope } = useTenantScope();
   const [skills, setSkillRecords] = useState<SkillRecord[]>([]);
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string | undefined>(
@@ -87,7 +90,7 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
 
   useEffect(() => {
     let alive = true;
-    listSkills().then(
+    listSkills({ tenantScope: apiTenantScope }).then(
       (s) => {
         if (!alive) return;
         setSkillRecords([...(s?.items ?? []), ...(s?.platform_items ?? [])]);
@@ -97,7 +100,7 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [apiTenantScope]);
 
   const selected = readSkills(formData);
 

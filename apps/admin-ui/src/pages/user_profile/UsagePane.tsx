@@ -7,12 +7,18 @@ import { Alert, Card, Skeleton } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { getUsageTokens } from "../../api/usage";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { formatCompact } from "../../utils/runFormat";
 import { useLoad } from "./useLoad";
 
 export function UsagePane({ userId }: { userId: string }) {
   const { t } = useTranslation();
-  const load = useCallback(() => getUsageTokens({ userId }), [userId]);
+  // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
+  const { apiTenantScope } = useTenantScope();
+  const load = useCallback(
+    () => getUsageTokens({ userId, tenantScope: concreteTenantScope(apiTenantScope) }),
+    [userId, apiTenantScope],
+  );
   const { data, loading, error } = useLoad(load);
 
   if (loading) return <Skeleton active paragraph={{ rows: 3 }} />;

@@ -13,6 +13,7 @@ import { App } from "antd";
 import { SettingsQuality } from "./SettingsQuality";
 import type { QualityDriftAlert, QualityScore } from "../api/quality";
 import { AuthProvider } from "../auth/AuthContext";
+import { TenantScopeProvider } from "../tenant/TenantScopeContext";
 import { apiClient, setStoredToken } from "../api/client";
 import "../i18n";
 
@@ -122,9 +123,13 @@ function withFixture(scores: QualityScore[], alerts: QualityDriftAlert[]) {
     return (
       <MemoryRouter>
         <AuthProvider>
-          <App>
-            <Story />
-          </App>
+          {/* Cross-tenant W3 — the page consumes useTenantScope (throws
+              without a provider); same stack as EvalRunsList.stories. */}
+          <TenantScopeProvider>
+            <App>
+              <Story />
+            </App>
+          </TenantScopeProvider>
         </AuthProvider>
       </MemoryRouter>
     );

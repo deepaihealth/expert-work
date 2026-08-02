@@ -320,6 +320,64 @@ describe("SkillsList", () => {
     // Empty-state surfaces an Import CTA.
     expect(screen.getByTestId("skills-empty-import")).toBeInTheDocument();
   });
+
+  // ─── Cross-tenant W3 — aggregate row-jump carries the owning tenant ───
+
+  function rowJumpAdapter(rowTenantId: string) {
+    const paramsByUrl: Record<string, Record<string, unknown> | undefined> = {};
+    apiClient.defaults.adapter = (config) => {
+      const url = config.url ?? "";
+      let data: unknown = {};
+      if (url === "/v1/me") {
+        data = meResponse;
+      } else if (url === "/v1/skills") {
+        data = {
+          items: [{ ...skillRow, tenant_id: rowTenantId }],
+          next_cursor: null,
+          cross_tenant: true,
+        };
+      } else if (url === "/v1/skills/sk1") {
+        paramsByUrl.detail = config.params as Record<string, unknown>;
+        data = { ...skillRow, tenant_id: rowTenantId };
+      } else if (url === "/v1/skills/sk1/versions") {
+        paramsByUrl.versions = config.params as Record<string, unknown>;
+        data = { items: [versionRow] };
+      }
+      return Promise.resolve({
+        data,
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+    return paramsByUrl;
+  }
+
+  it("row-jump carries a foreign tenant_id into the detail reads (W3)", async () => {
+    // JWT home tenant is t1; the row belongs to t2 → the click appends
+    // ?tenant_id=t2 and SkillDetail threads it into both reads.
+    const paramsByUrl = rowJumpAdapter("t2");
+    const user = userEvent.setup();
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
+    await user.click(screen.getByText("web_search"));
+    await waitFor(() => expect(screen.getByTestId("skill-detail-root")).toBeInTheDocument());
+    expect(paramsByUrl.detail?.tenant_id).toBe("t2");
+    expect(paramsByUrl.versions?.tenant_id).toBe("t2");
+  });
+
+  it("row-jump keeps the plain URL for a home-tenant row (W3)", async () => {
+    const paramsByUrl = rowJumpAdapter("t1");
+    const user = userEvent.setup();
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
+    await user.click(screen.getByText("web_search"));
+    await waitFor(() => expect(screen.getByTestId("skill-detail-root")).toBeInTheDocument());
+    expect(paramsByUrl.detail?.tenant_id).toBeUndefined();
+    expect(paramsByUrl.versions?.tenant_id).toBeUndefined();
+  });
 });
 
 // ─── SkillDetail — base + PR C dual-pane / badges / gates ────────────

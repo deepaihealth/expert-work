@@ -6,7 +6,7 @@
  * call returning per-item results so a partial failure (Keycloak
  * conflict / unavailable) surfaces without aborting the whole batch.
  */
-import { apiClient, getJson, postJson } from "./client";
+import { apiClient, getJson, postJson, withTenantScope, type TenantScope } from "./client";
 import type { PurgeSummary } from "./users";
 
 export type MemberRole = "admin" | "operator" | "viewer";
@@ -60,22 +60,23 @@ export interface ListMembersParams {
   status?: MemberStatus;
   limit?: number;
   offset?: number;
+  /** Cross-tenant W3 — ``"*"`` for the aggregate, a UUID for a specific
+   *  tenant (system_admin only server-side). Takes precedence over the
+   *  legacy ``crossTenant`` flag. */
+  tenantScope?: TenantScope;
   /** ``true`` requests the cross-tenant aggregate (``tenant_id="*"``);
-   *  requires system_admin server-side (403 otherwise). Read-only. */
+   *  requires system_admin server-side (403 otherwise). Read-only.
+   *  Legacy alias for ``tenantScope: "*"``. */
   crossTenant?: boolean;
 }
 
 export async function listMembers(
   params: ListMembersParams = {},
 ): Promise<MemberList> {
-  const { status, limit, offset, crossTenant } = params;
+  const { status, limit, offset, tenantScope, crossTenant } = params;
+  const scope = tenantScope ?? (crossTenant ? "*" : undefined);
   return getJson<MemberList>("/v1/members", {
-    params: {
-      status,
-      limit,
-      offset,
-      ...(crossTenant ? { tenant_id: "*" } : {}),
-    },
+    params: withTenantScope({ status, limit, offset }, scope),
   });
 }
 

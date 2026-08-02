@@ -31,6 +31,7 @@ import { Gauge } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
+import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import {
   getUsageCost,
@@ -96,6 +97,8 @@ function errText(err: unknown): string {
 
 export function SettingsUsage() {
   const { t } = useTranslation();
+  // Cross-tenant W3 — the rollups are scope-aware ("*" aggregates every tenant).
+  const { apiTenantScope } = useTenantScope();
 
   const [month, setMonth] = useState<Dayjs>(() => dayjs());
   const [groupBy, setGroupBy] = useState<CostGroupBy>("agent");
@@ -111,8 +114,8 @@ export function SettingsUsage() {
     const monthStr = month.format(MONTH_FMT);
     try {
       const [c, tok] = await Promise.all([
-        getUsageCost({ month: monthStr, groupBy }),
-        getUsageTokens({ month: monthStr }),
+        getUsageCost({ month: monthStr, groupBy, tenantScope: apiTenantScope }),
+        getUsageTokens({ month: monthStr, tenantScope: apiTenantScope }),
       ]);
       setCost(c);
       setTokens(tok);
@@ -121,7 +124,7 @@ export function SettingsUsage() {
     } finally {
       setLoading(false);
     }
-  }, [month, groupBy]);
+  }, [month, groupBy, apiTenantScope]);
 
   useEffect(() => {
     void refresh();

@@ -9,6 +9,7 @@ import { Select, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listBases, type KnowledgeBase } from "../../api/knowledge";
+import { useTenantScope } from "../../tenant/TenantScopeContext";
 import { FieldHelp } from "../FieldHelp";
 import { readKnowledgeRefs, setKnowledgeRefs } from "./form_model";
 
@@ -28,17 +29,19 @@ interface KnowledgePickerProps {
 export function KnowledgePicker({ formData, onChange }: KnowledgePickerProps) {
   const { t } = useTranslation();
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
+  // Cross-tenant W3 — list the switched-in tenant's bases for the picker.
+  const { apiTenantScope } = useTenantScope();
 
   useEffect(() => {
     let alive = true;
-    listBases().then(
+    listBases(apiTenantScope).then(
       (b) => alive && setBases(b ?? []),
       () => {},
     );
     return () => {
       alive = false;
     };
-  }, []);
+  }, [apiTenantScope]);
 
   const knowledgeRefs = readKnowledgeRefs(formData);
 

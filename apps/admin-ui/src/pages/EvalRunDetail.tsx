@@ -16,6 +16,7 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../api/client";
 import type { RunStatus } from "../api/runs";
 import { useStatusPolling } from "../hooks/useStatusPolling";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 import {
   getEvalRun,
@@ -54,6 +55,8 @@ function scoresLabel(scores: Record<string, number> | null): string {
 export function EvalRunDetail() {
   const { t } = useTranslation();
   const { runId } = useParams<{ runId: string }>();
+  // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 400s).
+  const { apiTenantScope } = useTenantScope();
 
   const [run, setRun] = useState<EvalRunRecord | null>(null);
   const [cases, setCases] = useState<EvalCaseResult[]>([]);
@@ -75,9 +78,10 @@ export function EvalRunDetail() {
         setError(null);
       }
       try {
+        const scope = concreteTenantScope(apiTenantScope);
         const [runData, casesData] = await Promise.all([
-          getEvalRun(runId),
-          getEvalRunCases(runId),
+          getEvalRun(runId, scope),
+          getEvalRunCases(runId, scope),
         ]);
         setRun(runData);
         setCases(casesData.cases);
@@ -87,7 +91,7 @@ export function EvalRunDetail() {
         if (!silent) setLoading(false);
       }
     },
-    [runId],
+    [runId, apiTenantScope],
   );
 
   useEffect(() => {

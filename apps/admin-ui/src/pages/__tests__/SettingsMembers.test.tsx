@@ -376,7 +376,7 @@ describe("SettingsMembers — cross-tenant read-only view", () => {
 
     await waitFor(() =>
       expect(listMembers).toHaveBeenCalledWith(
-        expect.objectContaining({ crossTenant: true }),
+        expect.objectContaining({ tenantScope: "*" }),
       ),
     );
   });

@@ -11,7 +11,14 @@
  * unwrapped payload is typed below.  ``getJson`` / ``postJson`` / ``patchJson``
  * all call ``unwrap()`` internally — the caller receives the data directly.
  */
-import { getJson, patchJson, postJson, apiClient } from "./client";
+import {
+  getJson,
+  patchJson,
+  postJson,
+  apiClient,
+  withTenantScope,
+  type TenantScope,
+} from "./client";
 
 export type McpTransport = "sse" | "streamable_http";
 // "oauth2" only appears on catalog entries (per-user OAuth connectors, Stream
@@ -95,8 +102,10 @@ export interface TestConnectionBody {
 }
 
 /** ``GET /v1/mcp-servers`` — list all MCP servers for the current tenant. */
-export async function listMcpServers(): Promise<McpServer[]> {
-  return getJson<McpServer[]>("/v1/mcp-servers");
+export async function listMcpServers(tenantScope?: TenantScope): Promise<McpServer[]> {
+  return getJson<McpServer[]>("/v1/mcp-servers", {
+    params: withTenantScope({}, tenantScope),
+  });
 }
 
 /** ``POST /v1/mcp-servers`` — register a new MCP server. */
@@ -137,9 +146,13 @@ export async function testMcpConnection(
  * returns the tool list.  On probe failure the backend returns 502 — callers
  * should treat that as ``unreachable``.
  */
-export async function listMcpServerTools(name: string): Promise<McpTool[]> {
+export async function listMcpServerTools(
+  name: string,
+  tenantScope?: TenantScope,
+): Promise<McpTool[]> {
   return getJson<McpTool[]>(
     `/v1/mcp-servers/${encodeURIComponent(name)}/tools`,
+    { params: withTenantScope({}, tenantScope) },
   );
 }
 
@@ -147,6 +160,10 @@ export async function listMcpServerTools(name: string): Promise<McpTool[]> {
  * ``GET /v1/mcp-servers/available`` — servers available to this tenant
  * (platform-allowlisted names + the tenant's own registered servers).
  */
-export async function listAvailableMcpServers(): Promise<AvailableMcpServer[]> {
-  return getJson<AvailableMcpServer[]>("/v1/mcp-servers/available");
+export async function listAvailableMcpServers(
+  tenantScope?: TenantScope,
+): Promise<AvailableMcpServer[]> {
+  return getJson<AvailableMcpServer[]>("/v1/mcp-servers/available", {
+    params: withTenantScope({}, tenantScope),
+  });
 }

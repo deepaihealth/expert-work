@@ -96,16 +96,16 @@ describe("KnowledgeAdmin (list)", () => {
     );
   });
 
-  it("shows the H-19 scope note when the global scope is not home", async () => {
-    mockScope = "*";
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
+  it("threads the ambient tenant scope into listBases (W3)", async () => {
+    mockScope = "22222222-2222-2222-2222-222222222222";
+    const listSpy = vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByTestId("knowledge-scope-note")).toBeInTheDocument());
+    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(mockScope));
   });
 
-  it("hides the scope note on the home scope", async () => {
+  it("shows the empty state on the home scope", async () => {
     mockScope = undefined;
     vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
@@ -114,7 +114,6 @@ describe("KnowledgeAdmin (list)", () => {
     await waitFor(() =>
       expect(screen.getByText("No knowledge bases yet.")).toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("knowledge-scope-note")).toBeNull();
   });
 
   it("isSupportedDocument matches the backend whitelist", () => {
