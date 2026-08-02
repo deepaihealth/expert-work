@@ -15,7 +15,8 @@
  */
 import { Select, Tag } from "antd";
 import { Globe2, Building2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { listTenants, type TenantSummary } from "../api/tenants";
@@ -26,6 +27,7 @@ import {
   useTenantScope,
   type TenantScopeValue,
 } from "../tenant/TenantScopeContext";
+import { defaultPathForScope } from "./navModel";
 
 interface ScopeOption {
   value: TenantScopeValue;
@@ -37,8 +39,22 @@ export function TenantSwitcher() {
   const { t } = useTranslation();
   const { identity } = useAuth();
   const { scope, setScope } = useTenantScope();
+  const navigate = useNavigate();
 
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
+
+  // Switching scope is a perspective switch — the current page's context
+  // rarely survives it (a tenant's agent detail 404s under "*"; platform
+  // governance pages don't exist in a tenant's IA). Land on the new
+  // perspective's first sidebar entry instead of staying put.
+  const handleChange = useCallback(
+    (next: TenantScopeValue) => {
+      if (next === scope) return;
+      setScope(next);
+      navigate(defaultPathForScope(next, isSystemAdmin));
+    },
+    [scope, setScope, navigate, isSystemAdmin],
+  );
 
   const [tenants, setTenants] = useState<TenantSummary[]>([]);
 
@@ -99,7 +115,7 @@ export function TenantSwitcher() {
       data-testid="tenant-switcher"
       aria-label={t("tenant.home_tenant")}
       value={scope}
-      onChange={setScope}
+      onChange={handleChange}
       style={{ minWidth: 220 }}
       size="middle"
       labelInValue={false}
