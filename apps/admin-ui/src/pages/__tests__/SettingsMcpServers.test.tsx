@@ -12,15 +12,14 @@ import type { McpServer } from "../../api/mcp-servers";
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (switchable per test;
 // undefined = home state).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -43,7 +42,7 @@ beforeEach(async () => {
   listMock.mockReset();
   availMock.mockReset();
   toolsMock.mockReset();
-  mockScope = undefined;
+  scopeRef.current = undefined;
   // vitest 4 的 reset 不复位 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
 });
@@ -200,13 +199,13 @@ describe("SettingsMcpServers unified list", () => {
   });
 
   it("threads the ambient tenant scope into both list reads (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     listMock.mockResolvedValue([custom]);
     availMock.mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(listMock).toHaveBeenCalledWith(mockScope));
-    expect(availMock).toHaveBeenCalledWith(mockScope);
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith(scopeRef.current));
+    expect(availMock).toHaveBeenCalledWith(scopeRef.current);
   });
 });

@@ -37,13 +37,16 @@ vi.mock("../../auth/AuthContext", () => ({
     },
   }),
 }));
-let mockScope: string | undefined;
 // Spread the real module so the page keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -141,7 +144,7 @@ beforeEach(() => {
   mockIdentitySubject = "someone-else";
 });
 afterEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.restoreAllMocks();
   // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
@@ -160,16 +163,16 @@ describe("UserProfile", () => {
   });
 
   it("threads the tenant scope through getTenantUser (跨租户钻取 B类补传)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     stubCommon();
     renderPage();
     await waitFor(() =>
-      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, mockScope),
+      expect(usersSdk.getTenantUser).toHaveBeenCalledWith(USER_ID, scopeRef.current),
     );
   });
 
   it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
-    mockScope = "*";
+    scopeRef.current = "*";
     stubCommon();
     renderPage();
     await waitFor(() =>
@@ -178,7 +181,7 @@ describe("UserProfile", () => {
   });
 
   it("threads the switched scope through the conversations + workspace panes (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     stubCommon();
     vi.spyOn(workspaceSdk, "getUserWorkspace").mockResolvedValue({
       workspace: null,
@@ -195,17 +198,17 @@ describe("UserProfile", () => {
     // bare scope; the conversations list takes the concrete UUID.
     await waitFor(() =>
       expect(agentsSdk.listAgents).toHaveBeenCalledWith(
-        expect.objectContaining({ limit: 100, tenantScope: mockScope }),
+        expect.objectContaining({ limit: 100, tenantScope: scopeRef.current }),
       ),
     );
     expect(convoSdk.listConversations).toHaveBeenCalledWith(
-      expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+      expect.objectContaining({ userId: USER_ID, tenantScope: scopeRef.current }),
     );
 
     await user.click(screen.getByRole("tab", { name: "Workspace" }));
     await waitFor(() =>
       expect(artifactsSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ userId: USER_ID, tenantScope: mockScope }),
+        expect.objectContaining({ userId: USER_ID, tenantScope: scopeRef.current }),
       ),
     );
   });

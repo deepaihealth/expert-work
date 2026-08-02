@@ -15,10 +15,16 @@ import "../../i18n";
 import * as knowledgeSdk from "../../api/knowledge";
 import { KnowledgeAdmin } from "../KnowledgeAdmin";
 
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+// Cross-tenant W3 (F3) — 共享 tenant scope mock 工厂;scopeRef.current
+// 切换切入/聚合视角,undefined = home 态。
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -60,7 +66,7 @@ function renderPage() {
 }
 
 beforeEach(() => {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
 });
@@ -107,16 +113,16 @@ describe("KnowledgeAdmin (list)", () => {
   });
 
   it("threads the ambient tenant scope into listBases (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     const listSpy = vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(mockScope));
+    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(scopeRef.current));
   });
 
   it("shows the empty state on the home scope", async () => {
-    mockScope = undefined;
+    scopeRef.current = undefined;
     vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
 
     renderPage();

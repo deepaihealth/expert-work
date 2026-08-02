@@ -23,14 +23,14 @@ import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenSt
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
   isTenantSwitchedMock: vi.fn(() => false),
 }));
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 vi.mock("../../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));

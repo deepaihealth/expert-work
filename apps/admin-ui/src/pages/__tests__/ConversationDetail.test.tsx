@@ -26,17 +26,16 @@ import type { ConversationDetail as ConversationDetailModel } from "../../api/co
 // (undefined) keeps every pre-existing test on the caller's home tenant.
 // ``scope`` falls back to "home" so ``useIsTenantSwitched`` never reads an
 // undefined scope as a switched-in state.
-let mockScope: string | undefined;
 // Spread the real module so the page keeps the real ``concreteTenantScope``
 // ("*" → undefined) instead of a test-local copy that could drift.
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const THREAD_ID = "44444444-4444-4444-4444-444444444444";
 const TENANT_ID = "22222222-2222-2222-2222-222222222222";
@@ -227,14 +226,14 @@ afterEach(() => {
   URL.createObjectURL = realCreateObjectURL;
   URL.revokeObjectURL = realRevokeObjectURL;
   setStoredToken(null);
-  mockScope = undefined;
+  scopeRef.current = undefined;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
 describe("ConversationDetail", () => {
   it("threads the tenant scope through getConversation (跨租户钻取 B类补传)", async () => {
-    mockScope = TENANT_ID;
+    scopeRef.current = TENANT_ID;
     const spy = vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
     renderPage();
@@ -242,7 +241,7 @@ describe("ConversationDetail", () => {
   });
 
   it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
-    mockScope = "*";
+    scopeRef.current = "*";
     const spy = vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
     renderPage();

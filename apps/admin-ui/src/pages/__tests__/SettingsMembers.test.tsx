@@ -47,11 +47,14 @@ vi.mock("../../api/members", async (importOriginal) => {
 });
 
 // TenantScope context — switchable per test (mirrors ArtifactsList).
-let mockScope: string | undefined;
-vi.mock("../../tenant/TenantScopeContext", () => ({
-  SCOPE_ALL: "*",
-  useTenantScope: () => ({ scope: mockScope, apiTenantScope: mockScope }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -83,7 +86,7 @@ const activeMember: TenantMember = {
 };
 
 function renderPage(): void {
-  mockScope = undefined;
+  scopeRef.current = undefined;
   setStoredToken(makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin"] }));
   render(
     <MemoryRouter>
@@ -98,7 +101,7 @@ function renderPage(): void {
 
 /** Render in the cross-tenant aggregate (read-only) view (scope "*"). */
 function renderCrossTenant(): void {
-  mockScope = "*";
+  scopeRef.current = "*";
   setStoredToken(
     makeJwt({ sub: "u1", tenant_id: "t1", roles: ["system_admin"] }),
   );

@@ -7,14 +7,14 @@ import type { AgentManifest } from "../form_model";
 
 // Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (home state: no scope).
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 vi.mock("../../../api/knowledge", () => ({
   listBases: vi.fn().mockResolvedValue([

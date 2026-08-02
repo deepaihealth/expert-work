@@ -10,15 +10,14 @@ import type { AgentManifest } from "../form_model";
 // Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (switchable per test;
 // undefined = home state).
-let mockScope: string | undefined;
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: mockScope ?? "home",
-    setScope: () => {},
-    apiTenantScope: mockScope,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 /** Open an antd Select (by its data-testid root) and click the option whose
  *  visible content matches — a string (exact) or regex (language-tolerant,
@@ -274,14 +273,14 @@ describe("SkillPicker", () => {
   });
 
   it("threads the ambient tenant scope into listSkills (W3)", async () => {
-    mockScope = "22222222-2222-2222-2222-222222222222";
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
     try {
       render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
       await waitFor(() =>
-        expect(listSkills).toHaveBeenCalledWith({ tenantScope: mockScope }),
+        expect(listSkills).toHaveBeenCalledWith({ tenantScope: scopeRef.current }),
       );
     } finally {
-      mockScope = undefined;
+      scopeRef.current = undefined;
     }
   });
 });

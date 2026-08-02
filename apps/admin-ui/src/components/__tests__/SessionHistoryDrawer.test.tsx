@@ -17,14 +17,13 @@ import type { ThreadMeta } from "../../api/sessions";
 const { tenantScopeRef } = vi.hoisted(() => ({
   tenantScopeRef: { current: undefined as string | undefined },
 }));
-vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: tenantScopeRef.current ?? "home",
-    setScope: () => {},
-    apiTenantScope: tenantScopeRef.current,
-  }),
-}));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    tenantScopeRef,
+  );
+});
 
 const listMock = vi.spyOn(sessionsSdk, "listSessions");
 const renameMock = vi.spyOn(sessionsSdk, "renameSession");
