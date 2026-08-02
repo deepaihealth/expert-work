@@ -19,14 +19,14 @@ const mockFetchRunTraceRaw = vi.mocked(fetchRunTraceRaw);
 
 // Track C W2 — TraceDetail 组件内直取 tenant scope;这些测试不挂 Provider,
 // mock 成 home 态(apiTenantScope undefined)。
-vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../../../tenant/TenantScopeContext")>()),
-  useTenantScope: () => ({
-    scope: "home",
-    setScope: () => {},
-    apiTenantScope: undefined,
-  }),
-}));
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 function makeSpan(
   over: Partial<TraceSpan> & Pick<TraceSpan, "id" | "parentId" | "kind" | "label">,
