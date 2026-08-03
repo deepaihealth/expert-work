@@ -117,7 +117,13 @@ def build_quality_router() -> APIRouter:
                 rows = await store.list_scores(
                     tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
                 )
-        return JSONResponse(content={"items": [_score_dict(r) for r in rows]})
+        return JSONResponse(
+            content={
+                "items": [_score_dict(r) for r in rows],
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            }
+        )
 
     @router.get("/drift-alerts", response_model=None)
     async def list_drift_alerts(
@@ -149,7 +155,13 @@ def build_quality_router() -> APIRouter:
                 rows = await store.list_alerts(
                     tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
                 )
-        return JSONResponse(content={"items": [_alert_dict(r) for r in rows]})
+        return JSONResponse(
+            content={
+                "items": [_alert_dict(r) for r in rows],
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            }
+        )
 
     return router
 

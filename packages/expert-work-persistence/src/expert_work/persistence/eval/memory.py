@@ -86,6 +86,9 @@ class InMemoryEvalRunStore(EvalRunStore):
             for r in self._runs.values()
             if r.tenant_id == tenant_id and (status is None or r.status is status)
         ]
+        # created_at DESC with id tiebreak (two stable sorts) — same ordering
+        # contract as list_all_tenants, keeps pagination stable on ties.
+        rows.sort(key=lambda r: r.id.int)
         rows.sort(key=lambda r: r.created_at, reverse=True)
         return rows[offset : offset + limit], len(rows)
 

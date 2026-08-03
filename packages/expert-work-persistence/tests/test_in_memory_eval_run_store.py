@@ -27,9 +27,10 @@ def _run(
     *,
     status: EvalRunStatus = EvalRunStatus.QUEUED,
     created_at: datetime | None = None,
+    run_id: object | None = None,
 ) -> EvalRunRecord:
     return EvalRunRecord(
-        id=uuid4(),
+        id=run_id if run_id is not None else uuid4(),  # type: ignore[arg-type]
         tenant_id=tenant_id,  # type: ignore[arg-type]
         suite="m0_baseline",
         status=status,
@@ -140,6 +141,27 @@ async def test_list_for_tenant_paginates_with_full_total() -> None:
     assert total == 5
     page2, _ = await store.list_for_tenant(tenant_id=a, limit=2, offset=4)
     assert len(page2) == 1  # tail page
+
+
+@pytest.mark.asyncio
+async def test_list_all_tenants_id_tiebreak_on_equal_created_at() -> None:
+    """W4 review C-3 — ``created_at`` ties order by ``id`` ASC (``.int``), in
+    both the aggregate and the per-tenant sibling (C-7). Rows are inserted in
+    *descending* ``id.int`` order so a dropped tiebreak degrades to dict
+    insertion order and the exact-order assertion goes red."""
+    store = InMemoryEvalRunStore()
+    tenant = uuid4()
+    ts = datetime(2026, 6, 14, 8, 0, tzinfo=UTC)
+    id_lo, id_hi = sorted((uuid4(), uuid4()), key=lambda u: u.int)
+    for run_id in (id_hi, id_lo):  # descending insertion
+        await store.create_run(_run(tenant, created_at=ts, run_id=run_id))
+
+    items, total = await store.list_all_tenants()
+    assert (total, [r.id for r in items]) == (2, [id_lo, id_hi])
+
+    # C-7 — the per-tenant sibling applies the same tiebreak.
+    sibling, _ = await store.list_for_tenant(tenant_id=tenant)
+    assert [r.id for r in sibling] == [id_lo, id_hi]
 
 
 @pytest.mark.asyncio

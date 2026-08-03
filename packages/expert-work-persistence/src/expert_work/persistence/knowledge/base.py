@@ -128,10 +128,15 @@ class KnowledgeStore(abc.ABC):
         """The tenant's knowledge bases, newest first."""
 
     @abc.abstractmethod
-    async def list_bases_all_tenants(self) -> list[KnowledgeBase]:
-        """Every tenant's knowledge bases, newest first (``id`` tiebreak) —
-        the W4 ``tenant_id=*`` aggregate. Caller MUST wrap the call in
-        ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``."""
+    async def list_bases_all_tenants(self, *, limit: int = 200) -> list[KnowledgeBase]:
+        """Every tenant's knowledge bases, newest first (``id`` tiebreak),
+        capped at ``limit`` rows — the W4 ``tenant_id=*`` aggregate
+        (``list_bases`` has no cap; the cross-tenant read is bounded so it
+        can never become an unbounded full-table page). Caller MUST wrap the
+        call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
+
+        No covering index; full scan acceptable at current scale, see W4
+        follow-ups."""
 
     @abc.abstractmethod
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
@@ -145,10 +150,16 @@ class KnowledgeStore(abc.ABC):
         tenant's bases in one query — used by ``list_bases`` to avoid N+1."""
 
     @abc.abstractmethod
-    async def base_stats_many_all_tenants(self) -> dict[UUID, tuple[int, int]]:
-        """:meth:`base_stats_many` across every tenant — ``kb_id`` is globally
-        unique, so one dict serves the W4 aggregate list. Same bypass posture
-        as :meth:`list_bases_all_tenants`."""
+    async def base_stats_many_all_tenants(
+        self, *, kb_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[int, int]]:
+        """:meth:`base_stats_many` across every tenant, bounded to ``kb_ids``
+        (the page :meth:`list_bases_all_tenants` returned) — ``kb_id`` is
+        globally unique, so one dict serves the W4 aggregate list. Same
+        bypass posture as :meth:`list_bases_all_tenants`.
+
+        No covering index; full scan acceptable at current scale, see W4
+        follow-ups."""
 
     @abc.abstractmethod
     async def stamp_embedding_model(

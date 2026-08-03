@@ -634,10 +634,14 @@ async def test_knowledge_scope_system_admin_target_tenant_200(full_setup: FullSe
 @pytest.mark.asyncio
 async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: FullSetup) -> None:
     """W4:system_admin ``tenant_id=*`` 真聚合——全租户 base,每行带
-    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。"""
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。
+    Review C-9 — 同名跨租户 pair((tenant_id, name) 唯一,name 不唯一):
+    断言按 (tenant_id, name) 键,两行都在且 tenant_id 不同。"""
     client, runner, store = full_setup
     await _seed_kb_with_document(client, runner)
     other_tenant = uuid4()
+    # Same-name pair across tenants — the schema only dedups (tenant_id, name).
+    await store.create_base(tenant_id=other_tenant, name="kb")
     await store.create_base(tenant_id=other_tenant, name="other-kb")
 
     # Non-aggregate branch: items carry tenant_id = the scoped tenant.
@@ -647,12 +651,16 @@ async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: Full
     headers = await _grant_system_admin(client)
     resp = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    by_name = {b["name"]: b for b in resp.json()["bases"]}
-    assert by_name["kb"]["tenant_id"] == str(_TENANT)
-    assert by_name["other-kb"]["tenant_id"] == str(other_tenant)
+    by_key = {(b["tenant_id"], b["name"]): b for b in resp.json()["bases"]}
+    assert len(by_key) == len(resp.json()["bases"])  # no row collapsed
+    # Both same-name rows surface with distinct tenant_ids.
+    assert (str(_TENANT), "kb") in by_key
+    assert (str(other_tenant), "kb") in by_key
+    assert (str(other_tenant), "other-kb") in by_key
     # Stats stay attributed per base across the aggregate.
-    assert by_name["kb"]["stats"]["document_count"] == 1
-    assert by_name["other-kb"]["stats"]["document_count"] == 0
+    assert by_key[(str(_TENANT), "kb")]["stats"]["document_count"] == 1
+    assert by_key[(str(other_tenant), "kb")]["stats"]["document_count"] == 0
+    assert by_key[(str(other_tenant), "other-kb")]["stats"]["document_count"] == 0
 
 
 _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [

@@ -53,6 +53,11 @@ from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.knowledge")
 
+#: W4 cap for the ``tenant_id=*`` aggregate — ``list_bases`` (single tenant)
+#: has no cap; the cross-tenant read is bounded so it can never become an
+#: unbounded full-table page.
+_ALL_TENANTS_BASES_LIMIT = 200
+
 
 class _CreateBaseBody(BaseModel):
     """Body of ``POST /v1/knowledge/bases``."""
@@ -258,8 +263,8 @@ def build_knowledge_router() -> APIRouter:
         )
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
-                bases = await store.list_bases_all_tenants()
-                stats = await store.base_stats_many_all_tenants()
+                bases = await store.list_bases_all_tenants(limit=_ALL_TENANTS_BASES_LIMIT)
+                stats = await store.base_stats_many_all_tenants(kb_ids=[b.id for b in bases])
             else:
                 bases = await store.list_bases(tenant_id=scope.tenant_id)
                 stats = await store.base_stats_many(tenant_id=scope.tenant_id)
@@ -273,7 +278,9 @@ def build_knowledge_router() -> APIRouter:
                         needs_reindex=_needs_reindex(base, current),
                     )
                     for base in bases
-                ]
+                ],
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
             }
         )
 

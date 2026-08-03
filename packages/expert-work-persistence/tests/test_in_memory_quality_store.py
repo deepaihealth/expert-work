@@ -77,6 +77,25 @@ async def test_count_since_and_list_filters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_scores_all_tenants_id_tiebreak_on_equal_observed_at() -> None:
+    """W4 review C-3 — ``observed_at`` ties order by ``id`` ASC. ``insert``
+    assigns ids in insertion order (dict order == id order), so the tie is
+    seeded white-box (precedent: ``test_in_memory_memory_consolidator.py``)
+    in *descending* id order — a dropped id sort degrades to dict insertion
+    order and the exact-order assertion goes red."""
+    store = InMemoryQualityScoreStore()
+    ts = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    tenant_a, tenant_b = uuid4(), uuid4()
+    rec_1 = _record(tenant=tenant_a, run=uuid4()).model_copy(update={"id": 1, "observed_at": ts})
+    rec_2 = _record(tenant=tenant_b, run=uuid4()).model_copy(update={"id": 2, "observed_at": ts})
+    for rec in (rec_2, rec_1):  # descending id seed
+        store._by_run[(rec.tenant_id, rec.run_id)] = rec
+
+    rows = await store.list_scores_all_tenants()
+    assert [r.id for r in rows] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_window_stats_and_agent_enumeration() -> None:
     store = InMemoryQualityScoreStore()
     t1, t2 = uuid4(), uuid4()

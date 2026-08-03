@@ -208,12 +208,15 @@ async def test_list_all_tenants_spans_tenants_ordered(
 ) -> None:
     """W4 — the aggregate reader spans tenants, ordered ``(name, tenant_id)``
     (the same name may exist in several tenants). Superuser session mirrors
-    the production posture (bypass GUC on the app's superuser connection)."""
+    the production posture (bypass GUC on the app's superuser connection).
+    Review C-3 — rows are inserted in *descending* ``tenant_id.int`` order so
+    a dropped tenant_id tiebreak degrades to insertion (heap-scan) order and
+    the exact-order assertion goes red."""
     servers, _catalog, engine = tenant_mcp_server_platform_scope
     try:
-        tid_1, tid_2 = uuid4(), uuid4()
+        tid_lo, tid_hi = sorted((uuid4(), uuid4()), key=lambda u: u.int)
         shared_name = f"agg-{uuid4().hex[:12]}"
-        for tid in (tid_1, tid_2):
+        for tid in (tid_hi, tid_lo):  # descending insertion
             await servers.create(
                 tenant_id=tid,
                 name=shared_name,
@@ -226,12 +229,12 @@ async def test_list_all_tenants_spans_tenants_ordered(
             )
 
         rows = await servers.list_all_tenants()
-        mine = [r for r in rows if r.tenant_id in {tid_1, tid_2}]
+        mine = [r for r in rows if r.tenant_id in {tid_lo, tid_hi}]
         assert [r.name for r in mine] == [shared_name, shared_name]
         # tenant_id tiebreak: Postgres uuid byte order == UUID.int order.
-        assert [r.tenant_id for r in mine] == sorted((tid_1, tid_2), key=lambda u: u.int)
+        assert [r.tenant_id for r in mine] == [tid_lo, tid_hi]
         # Per-tenant sibling stays scoped.
-        assert [r.tenant_id for r in await servers.list_for_tenant(tenant_id=tid_1)] == [tid_1]
+        assert [r.tenant_id for r in await servers.list_for_tenant(tenant_id=tid_lo)] == [tid_lo]
     finally:
         await engine.dispose()
 

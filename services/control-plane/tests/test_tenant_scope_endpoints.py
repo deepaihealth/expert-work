@@ -32,11 +32,16 @@ from expert_work.protocol import (
     CandidateStatus,
     CurationCandidateRecord,
     EvalDatasetRecord,
+    EvalRunRecord,
+    EvalRunStatus,
+    EvalTriggeredBy,
     FilesystemSpec,
     MemoryItem,
     MemorySpec,
     ModelSpec,
     NetworkSpec,
+    QualityDriftAlertRecord,
+    QualityScoreRecord,
     ResourceSpec,
     Role,
     SandboxSpec,
@@ -284,6 +289,67 @@ async def app_state() -> AsyncIterator[tuple[AsyncClient, UUID]]:
             created_in_thread="seed-thread",
         )
 
+    # ── W4 Task C1 review C-4: 5 aggregate endpoints join the matrix ──────
+    knowledge = app.state.knowledge_store
+    for tenant in (_TENANT_A, _TENANT_B):
+        await knowledge.create_base(tenant_id=tenant, name=f"kb-{tenant.hex[:6]}")
+
+    eval_runs = app.state.eval_run_store
+    for tenant in (_TENANT_A, _TENANT_B):
+        await eval_runs.create_run(
+            EvalRunRecord(
+                id=uuid4(),
+                tenant_id=tenant,
+                suite="m0_baseline",
+                status=EvalRunStatus.QUEUED,
+                triggered_by=EvalTriggeredBy.MANUAL,
+                created_at=now,
+            )
+        )
+
+    quality_scores = app.state.quality_score_store
+    for tenant in (_TENANT_A, _TENANT_B):
+        await quality_scores.insert(
+            QualityScoreRecord(
+                tenant_id=tenant,
+                agent_name=f"agent-in-{tenant.hex[:6]}",
+                agent_version="1.0.0",
+                run_id=uuid4(),
+                thread_id=uuid4(),
+                overall=4,
+                dimensions={"addressed_request": 4, "coherence": 4, "safety": 5},
+                rationale="ok",
+                judge_model="m",
+            )
+        )
+
+    drift_alerts = app.state.quality_drift_alert_store
+    for tenant in (_TENANT_A, _TENANT_B):
+        await drift_alerts.insert(
+            QualityDriftAlertRecord(
+                tenant_id=tenant,
+                agent_name=f"agent-in-{tenant.hex[:6]}",
+                recent_mean=3.0,
+                baseline_mean=4.0,
+                drift_pct=0.25,
+                recent_count=12,
+                baseline_count=80,
+            )
+        )
+
+    mcp_servers = app.state.tenant_mcp_server_store
+    for tenant in (_TENANT_A, _TENANT_B):
+        await mcp_servers.create(
+            tenant_id=tenant,
+            name=f"mcp-{tenant.hex[:6]}",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth_type="none",
+            token_secret_ref=None,
+            timeout_s=30.0,
+            created_by="seed",
+        )
+
     # Stream H placeholder: silence unused locals when adding more rows.
     _ = ThreadStatus
 
@@ -344,17 +410,27 @@ _ENDPOINTS: list[tuple[str, str, int, int]] = [
     ("memory", "/v1/memory", 0, 2),
     ("artifacts", "/v1/artifacts", 0, 2),
     ("api_keys", "/v1/api_keys", 1, 2),
+    # ── W4 Task C1 review C-4: the 5 "*" aggregate list endpoints ─────────
+    ("knowledge_bases", "/v1/knowledge/bases", 1, 2),
+    ("eval_runs", "/v1/eval-runs", 1, 2),
+    ("quality_scores", "/v1/quality/scores", 1, 2),
+    ("quality_drift_alerts", "/v1/quality/drift-alerts", 1, 2),
+    ("mcp_servers", "/v1/mcp-servers", 1, 2),
 ]
 
 
 def _items(body: dict[str, object]) -> list[dict[str, object]]:
-    """Some endpoints wrap items in ``data``, others put items at the top level."""
+    """Some endpoints wrap items in ``data``, others put items at the top level.
+    ``/v1/mcp-servers`` returns a bare list under ``data``;
+    ``/v1/knowledge/bases`` names its list ``bases``."""
     raw: object
     data = body.get("data")
     if isinstance(data, dict):
         raw = data.get("items", [])
+    elif isinstance(data, list):
+        raw = data
     else:
-        raw = body.get("items", [])
+        raw = body.get("items", body.get("bases", []))
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]

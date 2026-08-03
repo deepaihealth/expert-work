@@ -165,7 +165,7 @@ class SqlEvalRunStore(EvalRunStore):
                     await session.execute(
                         select(EvalRunRow)
                         .where(*where)
-                        .order_by(EvalRunRow.created_at.desc())
+                        .order_by(EvalRunRow.created_at.desc(), EvalRunRow.id)
                         .limit(limit)
                         .offset(offset)
                     )

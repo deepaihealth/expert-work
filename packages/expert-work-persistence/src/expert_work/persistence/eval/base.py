@@ -74,9 +74,10 @@ class EvalRunStore(abc.ABC):
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[EvalRunRecord], int]:
-        """Per-tenant page of runs (``created_at`` DESC), plus the total count
-        *before* pagination. Backs the operator list page (S2.5). The W4
-        cross-tenant aggregate is :meth:`list_all_tenants`.
+        """Per-tenant page of runs (``created_at`` DESC, ``id`` tiebreak),
+        plus the total count *before* pagination. Backs the operator list
+        page (S2.5). The W4 cross-tenant aggregate is
+        :meth:`list_all_tenants`.
         """
 
     @abc.abstractmethod

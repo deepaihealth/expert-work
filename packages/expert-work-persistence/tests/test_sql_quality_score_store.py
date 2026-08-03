@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -26,6 +26,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.models import QualityScoreRow
 from expert_work.persistence.rls import build_rls_sessionmaker, current_tenant_id_var
 from expert_work.protocol import QualityScoreRecord
 
@@ -238,6 +239,44 @@ async def test_list_scores_all_tenants_spans_tenants(
         # agent_name narrows the aggregate the same way as the sibling.
         only_b = await su_store.list_scores_all_tenants(agent_name="agg-b")
         assert {r.tenant_id for r in only_b if r.tenant_id in {tenant_a, tenant_b}} == {tenant_b}
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_scores_all_tenants_id_tiebreak_on_equal_observed_at(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 review C-3 — ``observed_at`` ties order by ``id`` ASC. The two
+    rows' ``observed_at`` are equalized via raw UPDATEs issued higher-id
+    first, so the live heap tuples end up in *descending* id order — a
+    dropped tiebreak degrades to heap-scan order and the exact-order
+    assertion goes red."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        agent = f"tie-{uuid4().hex[:8]}"
+        current_tenant_id_var.set(tenant_a)
+        first = await store.insert(_record(tenant=tenant_a, run=uuid4(), agent=agent))
+        current_tenant_id_var.set(tenant_b)
+        second = await store.insert(_record(tenant=tenant_b, run=uuid4(), agent=agent))
+        assert first.id is not None and second.id is not None and first.id < second.id
+
+        ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
+        async with su_engine.begin() as conn:
+            for row_id in (second.id, first.id):  # hi first → live tuples id-descending
+                await conn.execute(
+                    update(QualityScoreRow)
+                    .where(QualityScoreRow.id == row_id)
+                    .values(observed_at=ts)
+                )
+
+        rows = await su_store.list_scores_all_tenants(agent_name=agent)
+        assert [r.id for r in rows] == [first.id, second.id]
     finally:
         await su_engine.dispose()
         await engine.dispose()

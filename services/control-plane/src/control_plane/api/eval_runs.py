@@ -122,7 +122,12 @@ def build_eval_runs_router() -> APIRouter:
                     tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
                 )
         return JSONResponse(
-            content={"items": [_run_dict(r) for r in items], "total": total},
+            content={
+                "items": [_run_dict(r) for r in items],
+                "total": total,
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            },
         )
 
     @router.post("", response_model=None)

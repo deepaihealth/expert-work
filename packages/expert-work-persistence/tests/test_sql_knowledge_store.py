@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -22,6 +23,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError
+from expert_work.persistence.models import KnowledgeBaseRow
 from expert_work.protocol import DocumentStatus, KnowledgeChunk, RetrievalMethod
 
 pytestmark = pytest.mark.integration
@@ -292,14 +294,45 @@ async def test_list_bases_all_tenants_aggregates(sql_store: SqlStoreFixture) -> 
             tenant_id=tenant_a, document_id=doc.id, status=DocumentStatus.READY, chunk_count=3
         )
 
-        rows = await store.list_bases_all_tenants()
+        rows = await store.list_bases_all_tenants(limit=500)
         mine = [b for b in rows if b.tenant_id in {tenant_a, tenant_b}]
         # Both tenants' bases surface, newest first across tenants.
         assert [(b.tenant_id, b.name) for b in mine] == [(tenant_b, "kb-b"), (tenant_a, "kb-a")]
 
-        stats = await store.base_stats_many_all_tenants()
+        # C-5 — stats are bounded to the kb_ids of the (capped) base page.
+        stats = await store.base_stats_many_all_tenants(kb_ids=[base_a.id, base_b.id])
         assert stats[base_a.id] == (1, 3)
         assert base_b.id not in stats  # no documents yet
+        assert await store.base_stats_many_all_tenants(kb_ids=[base_b.id]) == {}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_id_tiebreak_on_equal_created_at(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """W4 review C-3 — ``created_at`` ties order by ``id`` ASC. The two rows'
+    ``created_at`` are equalized via raw UPDATEs issued higher-id first, so
+    the live heap tuples end up in *descending* id order — a dropped tiebreak
+    degrades to heap-scan order and the exact-order assertion goes red."""
+    store, engine = sql_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        base_1 = await store.create_base(tenant_id=tenant_a, name="tie-1")
+        base_2 = await store.create_base(tenant_id=tenant_b, name="tie-2")
+        lo, hi = sorted((base_1, base_2), key=lambda b: b.id.int)
+        ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
+        async with engine.begin() as conn:
+            for kb in (hi, lo):  # hi first → live tuples land id-descending
+                await conn.execute(
+                    update(KnowledgeBaseRow)
+                    .where(KnowledgeBaseRow.id == kb.id)
+                    .values(created_at=ts)
+                )
+
+        rows = await store.list_bases_all_tenants(limit=500)
+        assert [b.id for b in rows if b.tenant_id in {tenant_a, tenant_b}] == [lo.id, hi.id]
     finally:
         await engine.dispose()
 

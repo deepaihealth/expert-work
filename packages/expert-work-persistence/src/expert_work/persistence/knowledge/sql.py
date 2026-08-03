@@ -220,10 +220,12 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_to_base(row) for row in rows]
 
-    async def list_bases_all_tenants(self) -> list[KnowledgeBase]:
+    async def list_bases_all_tenants(self, *, limit: int = 200) -> list[KnowledgeBase]:
         # W4 — no tenant filter; caller must wrap in bypass_rls_session().
-        stmt = select(KnowledgeBaseRow).order_by(
-            KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id
+        stmt = (
+            select(KnowledgeBaseRow)
+            .order_by(KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id)
+            .limit(limit)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
@@ -255,13 +257,22 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(stmt)).all()
         return {row[0]: (int(row[1]), int(row[2])) for row in rows}
 
-    async def base_stats_many_all_tenants(self) -> dict[UUID, tuple[int, int]]:
+    async def base_stats_many_all_tenants(
+        self, *, kb_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[int, int]]:
         # W4 — no tenant filter; caller must wrap in bypass_rls_session().
-        stmt = select(
-            KnowledgeDocumentRow.kb_id,
-            func.count(KnowledgeDocumentRow.id),
-            func.coalesce(func.sum(KnowledgeDocumentRow.chunk_count), 0),
-        ).group_by(KnowledgeDocumentRow.kb_id)
+        # Bounded to the kb_ids of the (capped) aggregate base page.
+        if not kb_ids:
+            return {}
+        stmt = (
+            select(
+                KnowledgeDocumentRow.kb_id,
+                func.count(KnowledgeDocumentRow.id),
+                func.coalesce(func.sum(KnowledgeDocumentRow.chunk_count), 0),
+            )
+            .where(KnowledgeDocumentRow.kb_id.in_(list(kb_ids)))
+            .group_by(KnowledgeDocumentRow.kb_id)
+        )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         return {row[0]: (int(row[1]), int(row[2])) for row in rows}

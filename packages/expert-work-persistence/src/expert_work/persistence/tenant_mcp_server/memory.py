@@ -83,8 +83,10 @@ class InMemoryTenantMcpServerStore(TenantMcpServerStore):
         return sorted(rows, key=lambda r: r.name)
 
     async def list_all_tenants(self) -> list[TenantMcpServerRecord]:
-        # W4 — no tenant filter; (name, tenant_id) ordering matching the SQL
-        # implementation byte-for-byte (uuid int order == Postgres byte order).
+        # W4 — no tenant filter; (name, tenant_id) ordering mirrors the SQL
+        # implementation. uuid int order == Postgres uuid byte order; the
+        # ``name`` leg only matches when the DB collation is C/POSIX (Python
+        # sorts str by codepoint — locale/ICU collations may diverge).
         async with self._lock:
             rows = list(self._rows.values())
         return sorted(rows, key=lambda r: (r.name, r.tenant_id.int))

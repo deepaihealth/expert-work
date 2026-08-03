@@ -733,7 +733,14 @@ def build_mcp_servers_router() -> APIRouter:
                 rows = await store.list_all_tenants()
             else:
                 rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
-        return {"success": True, "data": [_public(r) for r in rows], "error": None}
+        return {
+            "success": True,
+            "data": [_public(r) for r in rows],
+            "error": None,
+            # W4 response contract — aggregate branch flagged for the UI
+            # (top-level: ``data`` is a bare list on this endpoint).
+            "cross_tenant": isinstance(scope, CrossTenant),
+        }
 
     @router.post("/test")
     async def test_mcp_connection(

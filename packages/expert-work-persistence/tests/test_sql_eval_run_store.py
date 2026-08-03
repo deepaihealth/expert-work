@@ -62,9 +62,10 @@ def _run(
     tenant: UUID,
     created_at: datetime,
     status: EvalRunStatus = EvalRunStatus.QUEUED,
+    run_id: UUID | None = None,
 ) -> EvalRunRecord:
     return EvalRunRecord(
-        id=uuid4(),
+        id=run_id if run_id is not None else uuid4(),
         tenant_id=tenant,
         suite="m0_baseline",
         status=status,
@@ -100,5 +101,31 @@ async def test_list_all_tenants_spans_tenants_newest_first(sql_store: SqlStoreFi
         # Per-tenant sibling stays scoped.
         a_items, a_total = await store.list_for_tenant(tenant_id=tenant_a)
         assert (a_total, [r.id for r in a_items]) == (1, [older.id])
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_all_tenants_id_tiebreak_on_equal_created_at(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """W4 review C-3 — ``created_at`` ties order by ``id`` ASC, in both the
+    aggregate and the per-tenant sibling (C-7). Rows are inserted in
+    *descending* ``id.int`` order so a dropped tiebreak degrades to insertion
+    (heap-scan) order and the exact-order assertion goes red."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
+        id_lo, id_hi = sorted((uuid4(), uuid4()), key=lambda u: u.int)
+        for run_id in (id_hi, id_lo):  # descending insertion
+            await store.create_run(_run(tenant=tenant, created_at=ts, run_id=run_id))
+
+        items, _ = await store.list_all_tenants(limit=500)
+        assert [r.id for r in items if r.tenant_id == tenant] == [id_lo, id_hi]
+
+        # C-7 — the per-tenant sibling applies the same tiebreak.
+        sibling, total = await store.list_for_tenant(tenant_id=tenant)
+        assert (total, [r.id for r in sibling]) == (2, [id_lo, id_hi])
     finally:
         await engine.dispose()
