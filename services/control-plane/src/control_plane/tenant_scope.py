@@ -29,6 +29,7 @@ have just resolved to :class:`CrossTenant`.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -43,6 +44,17 @@ from expert_work.protocol import AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.tenant_scope")
+
+_LOG_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _log_safe(value: object | None) -> str | None:
+    """Strip control characters (CR/LF included) from principal-derived
+    values before logging so a forged claim cannot inject extra log lines
+    (CodeQL py/log-injection)."""
+    if value is None:
+        return None
+    return _LOG_CTRL_CHARS.sub("", str(value))
 
 
 def cross_tenant_query_enabled(request: Request) -> bool:
@@ -83,7 +95,11 @@ async def _emit_blocked(
     )
     logger.info(
         "tenant_scope.cross_tenant_blocked",
-        extra={"actor_id": principal.subject_id, "endpoint": endpoint, "mode": mode},
+        extra={
+            "actor_id": _log_safe(principal.subject_id),
+            "endpoint": _log_safe(endpoint),
+            "mode": mode,
+        },
     )
 
 
@@ -130,10 +146,10 @@ async def emit_tenant_switch(
     logger.info(
         "tenant_scope.tenant_switch",
         extra={
-            "actor_id": principal.subject_id,
-            "home_tenant": str(principal.tenant_id),
-            "target_tenant": str(target),
-            "endpoint": endpoint,
+            "actor_id": _log_safe(principal.subject_id),
+            "home_tenant": _log_safe(principal.tenant_id),
+            "target_tenant": _log_safe(target),
+            "endpoint": _log_safe(endpoint),
         },
     )
 
