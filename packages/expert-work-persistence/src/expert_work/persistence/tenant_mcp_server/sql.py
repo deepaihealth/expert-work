@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import TenantMcpServerRow
 from expert_work.persistence.tenant_mcp_server.base import (
+    ALL_TENANTS_SERVERS_LIMIT,
     TenantMcpServerAlreadyExistsError,
     TenantMcpServerNotFoundError,
     TenantMcpServerStore,
@@ -122,6 +123,20 @@ class SqlTenantMcpServerStore(TenantMcpServerStore):
             select(TenantMcpServerRow)
             .where(TenantMcpServerRow.tenant_id == tenant_id)
             .order_by(TenantMcpServerRow.name)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_record(r) for r in rows]
+
+    async def list_all_tenants(
+        self, *, limit: int = ALL_TENANTS_SERVERS_LIMIT
+    ) -> list[TenantMcpServerRecord]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        # tenant_id tiebreak: (tenant_id, name) is unique, name alone is not.
+        stmt = (
+            select(TenantMcpServerRow)
+            .order_by(TenantMcpServerRow.name, TenantMcpServerRow.tenant_id)
+            .limit(limit)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()

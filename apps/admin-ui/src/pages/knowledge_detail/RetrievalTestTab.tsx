@@ -31,7 +31,6 @@ import {
   type RetrievalTestResult,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text, Paragraph } = Typography;
 
@@ -49,11 +48,17 @@ const RECALL_COLOR: Record<string, string> = {
   both: "green",
 };
 
-export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
+interface RetrievalTestTabProps {
+  base: KnowledgeBase;
+  /** Cross-tenant W4(review C-2)— 权威读口径:URL ``?tenant_id=`` 原样透
+   *  传优先;无 URL 参数时取 ambient scope("*" 折叠成 undefined),由
+   *  KnowledgeDetail 统一下传。检索测试是只读探针,无写控件。 */
+  readScope: string | undefined;
+}
+
+export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — read-only probe on the switched-in tenant's base.
-  const { apiTenantScope } = useTenantScope();
 
   const config = base.retrieval_config;
   const [query, setQuery] = useState("");
@@ -78,7 +83,7 @@ export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
           score_threshold: threshold,
           rerank,
         },
-        concreteTenantScope(apiTenantScope),
+        readScope,
       );
       setResults(response.results);
     } catch (err) {
@@ -90,7 +95,7 @@ export function RetrievalTestTab({ base }: { base: KnowledgeBase }) {
     } finally {
       setRunning(false);
     }
-  }, [base.name, query, topK, method, threshold, rerank, t, message, apiTenantScope]);
+  }, [base.name, query, topK, method, threshold, rerank, t, message, readScope]);
 
   return (
     <div data-testid="knowledge-test-tab">

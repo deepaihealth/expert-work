@@ -23,9 +23,11 @@ from uuid import UUID, uuid4
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from httpx import AsyncClient
 from jwt import PyJWK
 
 from control_plane.auth import JWTVerifier, StaticJWKSProvider
+from expert_work.protocol import Role
 
 TEST_ISSUER = "http://keycloak.test/realms/expert-work"
 TEST_AUDIENCE = "expert-work-api-internal"
@@ -129,6 +131,28 @@ def make_test_jwt(
         algorithm=algorithm,
         headers={"kid": kid},
     )
+
+
+async def grant_system_admin_on(app: object) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from the tenant under test."""
+    sys_admin_id = uuid4()
+    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """:func:`grant_system_admin_on` flavored for an ASGI-transport client."""
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    return await grant_system_admin_on(app)
 
 
 def _jwk_components(public_pem: str) -> dict[str, str]:

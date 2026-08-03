@@ -28,6 +28,7 @@ import {
 } from "../api/eval_runs";
 import { ApiError } from "../api/client";
 import type { RunStatus } from "../api/runs";
+import { useAuth } from "../auth/AuthContext";
 import { useStatusPolling } from "../hooks/useStatusPolling";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
@@ -72,6 +73,13 @@ export function EvalRunsList() {
   const { apiTenantScope } = useTenantScope();
   // Cross-tenant W3 — 切入态只读:入队是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W4 — "*" aggregate: tenant column + row-jump carries the
+  // owning tenant (home rows keep the plain URL, see onRow below).
+  const isAggregate = apiTenantScope === "*";
+  // Enqueue binds the run to the caller's OWN tenant, so the aggregate view
+  // must not offer it either — same rule as KnowledgeAdmin / SettingsMcpServers.
+  const writeDisabled = isAggregate || isTenantSwitched;
+  const { identity } = useAuth();
   const [data, setData] = useState<EvalRunList | null>(null);
   const [loading, setLoading] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
@@ -162,6 +170,28 @@ export function EvalRunsList() {
         key: "suite",
         render: (suite: string) => <Text strong>{suite}</Text>,
       },
+      // Cross-tenant W4 — raw tenant UUID is noise inside a single tenant;
+      // only the "*" aggregate needs it to tell rows apart.
+      ...(isAggregate
+        ? [
+            {
+              title: t("eval_runs_page.col_tenant"),
+              dataIndex: "tenant_id" as const,
+              key: "tenant_id",
+              width: 160,
+              render: (tenantId: string | null | undefined) =>
+                tenantId ? (
+                  <Tooltip title={tenantId}>
+                    <Text code style={{ fontSize: 12 }}>
+                      {tenantId.slice(0, 8)}…
+                    </Text>
+                  </Tooltip>
+                ) : (
+                  <Text type="secondary">—</Text>
+                ),
+            },
+          ]
+        : []),
       {
         title: t("eval_runs_page.column_summary"),
         dataIndex: "summary",
@@ -183,7 +213,7 @@ export function EvalRunsList() {
         ),
       },
     ],
-    [t],
+    [t, isAggregate],
   );
 
   return (
@@ -213,11 +243,14 @@ export function EvalRunsList() {
               data-testid="eval-suite-select"
               options={SUITE_OPTIONS.map((s) => ({ value: s, label: s }))}
             />
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <button
                 type="button"
                 onClick={() => void onEnqueue()}
-                disabled={enqueuing || isTenantSwitched}
+                disabled={enqueuing || writeDisabled}
                 data-testid="eval-enqueue"
                 style={{
                   display: "inline-flex",
@@ -229,8 +262,8 @@ export function EvalRunsList() {
                   background: "var(--ew-color-brand-500)",
                   color: "#fff",
                   fontSize: 13,
-                  cursor: enqueuing ? "wait" : isTenantSwitched ? "not-allowed" : "pointer",
-                  opacity: isTenantSwitched ? 0.5 : 1,
+                  cursor: enqueuing ? "wait" : writeDisabled ? "not-allowed" : "pointer",
+                  opacity: writeDisabled ? 0.5 : 1,
                 }}
               >
                 <FlaskConical size={14} strokeWidth={1.5} />
@@ -281,10 +314,28 @@ export function EvalRunsList() {
         loading={loading}
         pagination={{ total: data?.total ?? 0, showSizeChanger: false, pageSize: 50 }}
         onRow={(record) => ({
-          onClick: () => navigate(`/eval-runs/${encodeURIComponent(record.id)}`),
+          onClick: () => {
+            // Cross-tenant W4 — in the "*" aggregate a foreign-tenant row
+            // would 404 (getEvalRun falls back to the home tenant), so carry
+            // the row's owning tenant into the detail URL. Absent = pre-W4
+            // backend — keeps the old behavior.
+            const query =
+              record.tenant_id != null && record.tenant_id !== identity?.homeTenantId
+                ? `?tenant_id=${encodeURIComponent(record.tenant_id)}`
+                : "";
+            navigate(`/eval-runs/${encodeURIComponent(record.id)}${query}`);
+          },
           style: { cursor: "pointer" },
         })}
-        locale={{ emptyText: <Empty description={t("eval_runs_page.empty")} /> }}
+        locale={{
+          emptyText: (
+            <Empty
+              description={
+                isAggregate ? t("eval_runs_page.empty_cross") : t("eval_runs_page.empty")
+              }
+            />
+          ),
+        }}
         data-testid="eval-table"
       />
     </div>

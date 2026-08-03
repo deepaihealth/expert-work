@@ -20,10 +20,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.tenant_scope import (
+    CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
     ensure_single_tenant_scope,
-    ensure_tenant_scope_home_fallback,
+    ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.eval import EvalRunStore
@@ -45,6 +46,9 @@ _ALLOWED_SUITES = frozenset({"m0_baseline", "adversarial", "trace_eval"})
 def _run_dict(record: EvalRunRecord) -> dict[str, Any]:
     return {
         "id": str(record.id),
+        # W4 response contract — every item carries its owning tenant in both
+        # the aggregate ("*") and the single-tenant branch.
+        "tenant_id": str(record.tenant_id),
         "suite": record.suite,
         "status": record.status.value,
         "triggered_by": record.triggered_by.value,
@@ -97,9 +101,10 @@ def build_eval_runs_router() -> APIRouter:
         # tenant's eval runs from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
-        # to the caller's home tenant (see the shared helper's docstring).
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — real cross-tenant aggregate: "*" reads every tenant via the
+        # store's all-tenants reader; a concrete id keeps the W3 single-tenant
+        # read (see members.py for the pattern).
+        scope = await ensure_tenant_scope(
             request.state.principal,
             tenant_id,
             audit,
@@ -108,11 +113,21 @@ def build_eval_runs_router() -> APIRouter:
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         async with applied_scope(scope):
-            items, total = await store.list_for_tenant(
-                tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
-            )
+            if isinstance(scope, CrossTenant):
+                items, total = await store.list_all_tenants(
+                    status=status, limit=limit, offset=offset
+                )
+            else:
+                items, total = await store.list_for_tenant(
+                    tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
+                )
         return JSONResponse(
-            content={"items": [_run_dict(r) for r in items], "total": total},
+            content={
+                "items": [_run_dict(r) for r in items],
+                "total": total,
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            },
         )
 
     @router.post("", response_model=None)

@@ -33,6 +33,7 @@ from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin_on,
     make_test_jwt,
 )
 
@@ -1446,31 +1447,14 @@ async def test_available_platform_row_degrades_when_catalog_missing(
 
 
 # ---------------------------------------------------------------------------
-# W3 — mcp-servers 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — mcp-servers 读端点接跨租户 scope(系统管理员租户切换器)
 #
 # 三件套:system_admin 带目标租户 tenant_id → 200 命中目标租户数据;普通
-# 租户用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tools 详情
-# tenant_id=* → 400 SCOPE_ALL_NOT_SUPPORTED;列表 "*" 无聚合读法 → 回落
-# 归属租户。照 test_agents_api.py W2 先例。
+# 租户用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;tools 详情与
+# available 的 tenant_id=* → 400 SCOPE_ALL_NOT_SUPPORTED;基础列表
+# tenant_id=* → W4 真聚合(全租户行,每行带 tenant_id)。照
+# test_agents_api.py W2 先例。
 # ---------------------------------------------------------------------------
-
-
-async def _grant_system_admin_on(app: object) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from the tenant under test."""
-    from expert_work.protocol import Role
-
-    sys_admin_id = uuid4()
-    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
 
 
 async def _seed_server(client: AsyncClient, admin_headers: dict[str, str]) -> None:
@@ -1497,7 +1481,7 @@ async def test_mcp_scope_system_admin_target_tenant_200(
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         await _seed_server(client, admin_headers)
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         params = {"tenant_id": str(tenant_id)}
 
         listed = await client.get("/v1/mcp-servers", params=params, headers=headers)
@@ -1514,21 +1498,94 @@ async def test_mcp_scope_system_admin_target_tenant_200(
 
 
 @pytest.mark.asyncio
-async def test_mcp_lists_star_fall_back_to_home_tenant(
+async def test_mcp_list_star_aggregates_all_tenants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``tenant_id=*``:TenantMcpServerStore 无聚合读法(spec 非目标)→ 回落
-    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+    """W4:system_admin ``tenant_id=*`` 真聚合——全租户 server,每行带
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。"""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        other_tenant = uuid4()
+        await app.state.tenant_mcp_server_store.create(  # type: ignore[attr-defined]
+            tenant_id=other_tenant,
+            name="linear-b",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth_type="none",
+            token_secret_ref=None,
+            timeout_s=30.0,
+            created_by="seed",
+        )
+
+        # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+        plain = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert [r["tenant_id"] for r in plain.json()["data"]] == [str(tenant_id)]
+
+        headers = await grant_system_admin_on(app)
+        resp = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
+        assert resp.status_code == 200, resp.text
+        rows = {r["name"]: r for r in resp.json()["data"]}
+        assert rows["linear"]["tenant_id"] == str(tenant_id)
+        assert rows["linear-b"]["tenant_id"] == str(other_tenant)
+
+
+@pytest.mark.asyncio
+async def test_mcp_list_star_truncated_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W4 二轮 #4:聚合响应顶层带 ``truncated``(``data`` 是裸列表,与
+    ``cross_tenant`` 并排)——聚合页装满 cap 为 true,未装满为 false,非聚合
+    分支恒 false。cap 通过 monkeypatch 端点模块引用的 store 侧常量注入
+    (端点用同一常量取页+算 flag,单源)。"""
     app, admin_headers, _tenant_id = await _make_app_with_admin()
     monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         await _seed_server(client, admin_headers)
-        headers = await _grant_system_admin_on(app)
-        for path in ("/v1/mcp-servers", "/v1/mcp-servers/available"):
-            resp = await client.get(path, params={"tenant_id": "*"}, headers=headers)
-            assert resp.status_code == 200, f"{path}: {resp.status_code} {resp.text}"
-            assert resp.json()["data"] == [], path
+        await app.state.tenant_mcp_server_store.create(  # type: ignore[attr-defined]
+            tenant_id=uuid4(),
+            name="linear-b",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth_type="none",
+            token_secret_ref=None,
+            timeout_s=30.0,
+            created_by="seed",
+        )
+        headers = await grant_system_admin_on(app)
+
+        under = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
+        assert under.status_code == 200, under.text
+        assert under.json()["truncated"] is False  # 2 rows < default cap (200)
+
+        monkeypatch.setattr("control_plane.api.mcp_servers.ALL_TENANTS_SERVERS_LIMIT", 1)
+        capped = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
+        assert capped.status_code == 200, capped.text
+        assert len(capped.json()["data"]) == 1  # the cap actually bounds the page
+        assert capped.json()["truncated"] is True
+
+        # Non-aggregate branch has no cap — never truncated.
+        plain = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert plain.status_code == 200, plain.text
+        assert plain.json()["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_available_tenant_id_star_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W4 C3:available 语义=「本租户可用的 server」,聚合无意义 →
+    ``tenant_id=*`` 显式 400 SCOPE_ALL_NOT_SUPPORTED(原为静默回落)。"""
+    app, admin_headers, _tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        headers = await grant_system_admin_on(app)
+        resp = await client.get(
+            "/v1/mcp-servers/available", params={"tenant_id": "*"}, headers=headers
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
 
 
 @pytest.mark.asyncio
@@ -1598,7 +1655,7 @@ async def test_mcp_tools_cross_tenant_probe_does_not_stamp_health(
         before = await store.get(tenant_id=tenant_id, name="linear")
         assert before is not None
 
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_fail)
         resp = await client.get(
             "/v1/mcp-servers/linear/tools",

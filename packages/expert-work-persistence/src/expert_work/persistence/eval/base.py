@@ -74,11 +74,32 @@ class EvalRunStore(abc.ABC):
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[EvalRunRecord], int]:
-        """Per-tenant page of runs (``created_at`` DESC), plus the total count
-        *before* pagination. Backs the operator list page (S2.5). Single-tenant
-        only — a cross-tenant aggregate over this FORCE-RLS table needs the
-        ``audit_reader`` role and is intentionally not offered here.
+        """Per-tenant page of runs (``created_at`` DESC, ``id`` tiebreak),
+        plus the total count *before* pagination. Backs the operator list
+        page (S2.5). The W4 cross-tenant aggregate is
+        :meth:`list_all_tenants`.
         """
+
+    @abc.abstractmethod
+    async def list_all_tenants(
+        self,
+        *,
+        status: EvalRunStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[EvalRunRecord], int]:
+        """Cross-tenant page of runs (``created_at`` DESC, ``id`` tiebreak),
+        plus the pre-pagination total — the W4 ``tenant_id=*`` aggregate.
+        Caller MUST wrap the call in ``bypass_rls_session()`` /
+        ``applied_scope(CrossTenant)`` (same posture as
+        :meth:`list_by_status_all_tenants`).
+
+        FORCE-RLS note: this table runs ``ENABLE + FORCE ROW LEVEL SECURITY``
+        with a ``tenant_id = current_setting('app.tenant_id')`` policy that
+        denies when the GUC is unset. Skipping the GUC therefore only works
+        because the app connects with a BYPASSRLS role today. When RLS is
+        un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
+        GRANT treatment that ``token_usage`` already has (migration 0140)."""
 
     @abc.abstractmethod
     async def append_case_result(self, record: EvalCaseResultRecord) -> EvalCaseResultRecord:

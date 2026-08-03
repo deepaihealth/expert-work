@@ -13,7 +13,11 @@ are NEVER projected here — they are physically absent from these response
 shapes, visible only via the system_admin chargeback API (Z-2). Reads are
 tenant-scoped by default; a system_admin may target another tenant via
 ``?tenant_id=`` (W3 read scope, see ``control_plane.tenant_scope``), applied
-to both the RLS ContextVar and the store's explicit ``tenant_id`` filter.
+to both the RLS ContextVar and the store's explicit ``tenant_id`` filter, or
+aggregate every tenant via ``?tenant_id=*`` (W4 — real cross-tenant readers;
+grouping keys carry the tenant dimension so same-named agents/models in two
+tenants never fold into one bucket, and every grouped row exposes its
+``tenant_id``).
 """
 
 from __future__ import annotations
@@ -28,9 +32,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from control_plane.api._authz import require
 from control_plane.tenant_scope import (
+    CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
-    ensure_tenant_scope_home_fallback,
+    ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import TenantBillingLedgerStore
@@ -56,6 +61,9 @@ class _CostGroup:
     provider: str | None = None
     model: str | None = None
     agent_name: str | None = None
+    # W4 — owning tenant. Always populated: the row's tenant in the
+    # ``tenant_id=*`` aggregate, the (single) scoped tenant otherwise.
+    tenant_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         d = asdict(self)
@@ -127,8 +135,8 @@ def build_usage_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         month: Annotated[str | None, Query()] = None,
         group_by: Annotated[str, Query()] = "agent",
-        # W3 read scope — a concrete id lets a system_admin read a foreign
-        # tenant's usage from the tenant switcher.
+        # W3/W4 read scope — a concrete id lets a system_admin read a foreign
+        # tenant's usage from the tenant switcher; "*" aggregates every tenant.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
         if group_by not in _GroupBy:
@@ -136,9 +144,9 @@ def build_usage_router() -> APIRouter:
                 status_code=422,
                 detail={"code": "INVALID_GROUP_BY", "message": f"group_by ∈ {_GroupBy}"},
             )
-        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
-        # to the caller's home tenant (see the shared helper's docstring).
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — real cross-tenant aggregate: "*" reads every tenant's ledger
+        # buckets (Z-2 chargeback reader); a concrete UUID keeps W3 behavior.
+        scope = await ensure_tenant_scope(
             principal,
             tenant_id,
             audit,
@@ -148,10 +156,17 @@ def build_usage_router() -> APIRouter:
         )
         target = _parse_month(month)
         async with applied_scope(scope):
-            rows = await store.list_for_tenant(tenant_id=scope.tenant_id, month=target)
+            if isinstance(scope, CrossTenant):
+                rows = await store.list_for_month_all_tenants(month=target)
+            else:
+                rows = await store.list_for_tenant(tenant_id=scope.tenant_id, month=target)
 
         # Aggregate into groups. NEVER project base/markup — billed only.
-        agg: dict[str, _CostGroup] = {}
+        # The bucket key carries the tenant so the "*" aggregate can't fold
+        # two tenants' same-named agents/models into one row (W4); inside a
+        # single tenant every row shares one tenant_id, so behavior is
+        # unchanged (plus the additive ``tenant_id`` response field).
+        agg: dict[tuple[str, str], _CostGroup] = {}
         total_billed = 0
         as_of: datetime | None = None
         for r in rows:
@@ -164,14 +179,15 @@ def build_usage_router() -> APIRouter:
                 key = r.model
             else:  # none — keep the full bucket identity
                 key = f"{r.provider}:{r.model}:{r.agent_name}"
-            bucket = agg.get(key)
+            bucket_key = (str(r.tenant_id), key)
+            bucket = agg.get(bucket_key)
             if bucket is None:
-                bucket = _CostGroup(key=key)
+                bucket = _CostGroup(key=key, tenant_id=str(r.tenant_id))
                 if group_by == "none":
                     bucket.provider = r.provider
                     bucket.model = r.model
                     bucket.agent_name = r.agent_name
-                agg[key] = bucket
+                agg[bucket_key] = bucket
             bucket.input_tokens += r.input_tokens
             bucket.output_tokens += r.output_tokens
             bucket.cache_creation_tokens += r.cache_creation_tokens
@@ -206,11 +222,11 @@ def build_usage_router() -> APIRouter:
         # SE-16 (SE-A43) — narrow to one usage kind ('conversation' |
         # 'skill_evolution'); None keeps the full month.
         kind: Annotated[str | None, Query()] = None,
-        # W3 read scope — same treatment as ``/cost``.
+        # W3/W4 read scope — same treatment as ``/cost``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        # W3 — same "*" home collapse as ``/cost``.
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — same real "*" aggregate as ``/cost`` (all-tenants meter read).
+        scope = await ensure_tenant_scope(
             principal,
             tenant_id,
             audit,
@@ -222,21 +238,29 @@ def build_usage_router() -> APIRouter:
         start, end = _month_window(target)
         # Realtime — straight from the meter, no rollup lag.
         async with applied_scope(scope):
-            rows = await store.list_for_tenant_window(
-                tenant_id=scope.tenant_id, start=start, end=end, user_id=user_id
-            )
+            if isinstance(scope, CrossTenant):
+                rows = await store.list_window_all_tenants(start=start, end=end, user_id=user_id)
+            else:
+                rows = await store.list_for_tenant_window(
+                    tenant_id=scope.tenant_id, start=start, end=end, user_id=user_id
+                )
         if kind is not None:
             rows = [r for r in rows if r.usage_kind == kind]
 
+        # Bucket keys carry the tenant (W4) so the "*" aggregate can't fold
+        # two tenants' same-named agents/models/kinds into one row; inside a
+        # single tenant every row shares one tenant_id, so behavior is
+        # unchanged (plus the additive ``tenant_id`` response field).
         total = _token_zero()
-        by_agent: dict[str, dict[str, int]] = defaultdict(_token_zero)
-        by_model: dict[str, dict[str, int]] = defaultdict(_token_zero)
-        by_kind: dict[str, dict[str, int]] = defaultdict(_token_zero)
+        by_agent: dict[tuple[str, str], dict[str, int]] = defaultdict(_token_zero)
+        by_model: dict[tuple[str, str], dict[str, int]] = defaultdict(_token_zero)
+        by_kind: dict[tuple[str, str], dict[str, int]] = defaultdict(_token_zero)
         for r in rows:
+            tid = str(r.tenant_id)
             _token_add(total, r)
-            _token_add(by_agent[r.agent_name], r)
-            _token_add(by_model[r.model], r)
-            _token_add(by_kind[r.usage_kind], r)
+            _token_add(by_agent[(tid, r.agent_name)], r)
+            _token_add(by_model[(tid, r.model)], r)
+            _token_add(by_kind[(tid, r.usage_kind)], r)
 
         return {
             "success": True,
@@ -245,10 +269,10 @@ def build_usage_router() -> APIRouter:
                 "as_of": datetime.now(tz=UTC).isoformat(),
                 "realtime": True,
                 "total": total,
-                "by_agent": [{"key": k, **v} for k, v in by_agent.items()],
-                "by_model": [{"key": k, **v} for k, v in by_model.items()],
+                "by_agent": [{"key": k, "tenant_id": tid, **v} for (tid, k), v in by_agent.items()],
+                "by_model": [{"key": k, "tenant_id": tid, **v} for (tid, k), v in by_model.items()],
                 # SE-16 (SE-A43) — evolution spend separable from conversation.
-                "by_kind": [{"key": k, **v} for k, v in by_kind.items()],
+                "by_kind": [{"key": k, "tenant_id": tid, **v} for (tid, k), v in by_kind.items()],
             },
             "error": None,
         }

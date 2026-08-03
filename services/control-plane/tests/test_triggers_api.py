@@ -14,12 +14,13 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRunRecord
+from expert_work.protocol import AuditAction, AuditQuery, TriggerRunRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
@@ -885,27 +886,10 @@ async def test_403_delete_leaves_trigger_run_rows_intact(
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 @pytest.mark.asyncio
 async def test_get_trigger_system_admin_target_tenant_200(triggers_client: AsyncClient) -> None:
     created = await _create_cron(triggers_client)
-    headers = await _grant_system_admin(triggers_client)
+    headers = await grant_system_admin(triggers_client)
     resp = await triggers_client.get(
         f"/v1/triggers/{created['id']}",
         params={"tenant_id": str(_DEFAULT_TENANT)},

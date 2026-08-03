@@ -14,12 +14,12 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import Role
 from orchestrator.tools import RecordingSupervisorClient
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 
@@ -475,23 +475,6 @@ async def test_list_versions_unknown_returns_404(
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 #: (name, path, extra query params) — the two artifact detail read endpoints.
 _ARTIFACT_SCOPE_ENDPOINTS: list[tuple[str, str, dict[str, str]]] = [
     ("download", "/v1/artifacts/download", {"name": "report.md"}),
@@ -504,7 +487,7 @@ async def test_download_system_admin_target_tenant_200(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, user_id = setup
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
     resp = await client.get(
         "/v1/artifacts/download",
         params={"name": "report.md", "tenant_id": str(_TENANT), "user_id": str(user_id)},
@@ -519,7 +502,7 @@ async def test_versions_system_admin_target_tenant_200(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, user_id = setup
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
     resp = await client.get(
         "/v1/artifacts/report.md/versions",
         params={"tenant_id": str(_TENANT), "user_id": str(user_id)},

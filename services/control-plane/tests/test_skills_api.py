@@ -24,11 +24,12 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery, Role
+from expert_work.protocol import AuditAction, AuditQuery
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 
@@ -853,23 +854,6 @@ async def test_put_prompt_rejects_threat_and_404(setup: Setup) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 async def _import_skill_with_file(client: AsyncClient) -> tuple[str, int]:
     """Import a skill ZIP (with one supporting file) into ``_TENANT``."""
     blob = _build_skill_md_zip(extras={"reference/notes.md": b"line 1\n"})
@@ -897,7 +881,7 @@ def _skill_scope_paths(skill_id: str, version: int) -> list[tuple[str, str]]:
 async def test_skill_detail_system_admin_target_tenant_200(setup: Setup) -> None:
     client, _ = setup
     skill_id, version = await _import_skill_with_file(client)
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
     params = {"tenant_id": str(_TENANT)}
     for name, path in _skill_scope_paths(skill_id, version):
         resp = await client.get(path, params=params, headers=headers)

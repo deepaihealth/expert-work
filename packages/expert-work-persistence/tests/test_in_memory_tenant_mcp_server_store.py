@@ -82,6 +82,39 @@ async def test_list_for_tenant_sorted_and_scoped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_all_tenants_ordered_name_then_tenant_id() -> None:
+    """W4 review C-3 — the aggregate orders ``(name, tenant_id.int)``. The
+    shared-name pair is created in *descending* ``tenant_id.int`` order so a
+    dropped tenant_id tiebreak degrades to dict insertion order and the
+    exact-order assertion goes red."""
+    store = InMemoryTenantMcpServerStore()
+    tid_lo, tid_hi = sorted((uuid4(), uuid4()), key=lambda u: u.int)
+    await _make(store, tid_hi, name="beta")  # descending insertion for the tie
+    await _make(store, tid_lo, name="beta")
+    await _make(store, tid_hi, name="alpha")
+
+    rows = await store.list_all_tenants()
+    assert [(r.name, r.tenant_id) for r in rows] == [
+        ("alpha", tid_hi),
+        ("beta", tid_lo),
+        ("beta", tid_hi),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_all_tenants_respects_limit() -> None:
+    """W4 review #4 — the aggregate cap: ``limit=1`` keeps only the first row
+    of the ``(name, tenant_id)`` order."""
+    store = InMemoryTenantMcpServerStore()
+    tid = uuid4()
+    await _make(store, tid, name="beta")
+    await _make(store, tid, name="alpha")
+
+    rows = await store.list_all_tenants(limit=1)
+    assert [r.name for r in rows] == ["alpha"]
+
+
+@pytest.mark.asyncio
 async def test_update_applies_partial_fields() -> None:
     store = InMemoryTenantMcpServerStore()
     tid = uuid4()

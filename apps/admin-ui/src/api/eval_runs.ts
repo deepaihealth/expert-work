@@ -20,6 +20,9 @@ export type EvalRunStatus = "queued" | "running" | "passed" | "failed" | "error"
  *  doesn't break the client. */
 export interface EvalRunRecord {
   id: string;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate;
+   *  absent on pre-W4 backends. */
+  tenant_id?: string | null;
   suite: string;
   status: EvalRunStatus;
   triggered_by: string;

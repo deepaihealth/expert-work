@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from expert_work.persistence.tenant_mcp_server.base import (
+    ALL_TENANTS_SERVERS_LIMIT,
     TenantMcpServerAlreadyExistsError,
     TenantMcpServerNotFoundError,
     TenantMcpServerStore,
@@ -81,6 +82,17 @@ class InMemoryTenantMcpServerStore(TenantMcpServerStore):
         async with self._lock:
             rows = [r for (tid, _), r in self._rows.items() if tid == tenant_id]
         return sorted(rows, key=lambda r: r.name)
+
+    async def list_all_tenants(
+        self, *, limit: int = ALL_TENANTS_SERVERS_LIMIT
+    ) -> list[TenantMcpServerRecord]:
+        # W4 — no tenant filter; (name, tenant_id) ordering mirrors the SQL
+        # implementation. uuid int order == Postgres uuid byte order; the
+        # ``name`` leg only matches when the DB collation is C/POSIX (Python
+        # sorts str by codepoint — locale/ICU collations may diverge).
+        async with self._lock:
+            rows = list(self._rows.values())
+        return sorted(rows, key=lambda r: (r.name, r.tenant_id.int))[:limit]
 
     async def update(
         self, *, tenant_id: UUID, name: str, patch: TenantMcpServerPatch

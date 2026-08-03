@@ -41,6 +41,12 @@ class _Unset:
 #: passes it (via ``model_fields_set``) for fields the caller omitted.
 UNSET: Final = _Unset()
 
+#: Default cap for :meth:`KnowledgeStore.list_bases_all_tenants` — the single
+#: source shared by both store implementations and the
+#: ``GET /v1/knowledge/bases`` endpoint (which also derives its ``truncated``
+#: response flag from it, so the two must never drift).
+ALL_TENANTS_BASES_LIMIT: Final = 200
+
 
 @dataclass(frozen=True)
 class ClaimedIngestion:
@@ -128,6 +134,26 @@ class KnowledgeStore(abc.ABC):
         """The tenant's knowledge bases, newest first."""
 
     @abc.abstractmethod
+    async def list_bases_all_tenants(
+        self, *, limit: int = ALL_TENANTS_BASES_LIMIT
+    ) -> list[KnowledgeBase]:
+        """Every tenant's knowledge bases, newest first (``id`` tiebreak),
+        capped at ``limit`` rows — the W4 ``tenant_id=*`` aggregate
+        (``list_bases`` has no cap; the cross-tenant read is bounded so it
+        can never become an unbounded full-table page). Caller MUST wrap the
+        call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
+
+        No covering index; full scan acceptable at current scale — see
+        ``docs/superpowers/plans/2026-08-03-cross-tenant-drilldown-w4.md``.
+
+        FORCE-RLS note: this table runs ``ENABLE + FORCE ROW LEVEL SECURITY``
+        with a ``tenant_id = current_setting('app.tenant_id')`` policy that
+        denies when the GUC is unset. Skipping the GUC therefore only works
+        because the app connects with a BYPASSRLS role today. When RLS is
+        un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
+        GRANT treatment that ``token_usage`` already has (migration 0140)."""
+
+    @abc.abstractmethod
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         """``(document_count, total_chunk_count)`` for one base. Computed
         from ``knowledge_document`` (chunk counts are maintained per
@@ -137,6 +163,18 @@ class KnowledgeStore(abc.ABC):
     async def base_stats_many(self, *, tenant_id: UUID) -> dict[UUID, tuple[int, int]]:
         """``{kb_id: (document_count, total_chunk_count)}`` for all the
         tenant's bases in one query — used by ``list_bases`` to avoid N+1."""
+
+    @abc.abstractmethod
+    async def base_stats_many_all_tenants(
+        self, *, kb_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[int, int]]:
+        """:meth:`base_stats_many` across every tenant, bounded to ``kb_ids``
+        (the page :meth:`list_bases_all_tenants` returned) — ``kb_id`` is
+        globally unique, so one dict serves the W4 aggregate list. Same
+        bypass posture as :meth:`list_bases_all_tenants`.
+
+        No covering index; full scan acceptable at current scale — see
+        ``docs/superpowers/plans/2026-08-03-cross-tenant-drilldown-w4.md``."""
 
     @abc.abstractmethod
     async def stamp_embedding_model(

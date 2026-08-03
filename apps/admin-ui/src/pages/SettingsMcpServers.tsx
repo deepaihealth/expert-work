@@ -68,6 +68,12 @@ export function SettingsMcpServers() {
   const { apiTenantScope } = useTenantScope();
   // Cross-tenant W3 — 切入态只读:启停/删除/停用/编辑/新建是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W4 — "*" aggregate: tenant column on custom rows; writes
+  // are read-only here too (review C-1): they bind by name to the caller's
+  // HOME tenant, so acting on a foreign row would hit the home tenant's
+  // same-named server.
+  const isAggregate = apiTenantScope === "*";
+  const writeDisabled = isAggregate || isTenantSwitched;
 
   const [rows, setRows] = useState<UnifiedRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -91,9 +97,14 @@ export function SettingsMcpServers() {
     // The custom-server list is the primary content; the platform allowlist
     // (``/available``) is supplementary — degrade to no platform rows if it
     // fails rather than blanking the whole page on a partial outage.
+    // ``/available`` rejects the "*" aggregate with 400 (review C-2) —
+    // collapse it to the home tenant so platform rows survive the aggregate
+    // view instead of silently vanishing into the .catch below.
     Promise.all([
       listMcpServers(apiTenantScope),
-      listAvailableMcpServers(apiTenantScope).catch(() => [] as AvailableMcpServer[]),
+      listAvailableMcpServers(concreteTenantScope(apiTenantScope)).catch(
+        () => [] as AvailableMcpServer[],
+      ),
     ]).then(
       ([servers, available]) => {
         setRows(buildUnifiedRows(servers, available));
@@ -110,11 +121,22 @@ export function SettingsMcpServers() {
     reload();
   }, [reload]);
 
+  // Cross-tenant W4 — in the "*" aggregate a custom row's tools probe must
+  // hit the row's OWNING tenant (the bare name would probe the home tenant's
+  // same-named server). Platform rows and concrete/home scopes keep the
+  // ambient read.
+  const probeTenantId = useCallback(
+    (row: UnifiedRow): string | undefined =>
+      isAggregate && row.source === "tenant" ? (row.server.tenant_id ?? undefined) : undefined,
+    [isAggregate],
+  );
+
   const probe = useCallback(
     // `key` is the source-qualified `UnifiedRow.key` (probes map key, avoids
     // tenant/platform name collisions); `name` is the bare server name sent
-    // to the API.
-    async (key: string, name: string, opts?: { force?: boolean }) => {
+    // to the API. `opts.tenantId` (W4) overrides the ambient scope with the
+    // row's owning tenant in the "*" aggregate.
+    async (key: string, name: string, opts?: { force?: boolean; tenantId?: string }) => {
       const current = probesRef.current[key];
       // Always skip while a probe is in flight (prevents double-fire). A
       // cached ``connected`` result is skipped only for passive callers
@@ -124,7 +146,10 @@ export function SettingsMcpServers() {
       if (!opts?.force && current?.kind === "connected") return;
       setProbes((prev) => ({ ...prev, [key]: { kind: "testing" } }));
       try {
-        const tools = await listMcpServerTools(name, concreteTenantScope(apiTenantScope));
+        const tools = await listMcpServerTools(
+          name,
+          opts?.tenantId ?? concreteTenantScope(apiTenantScope),
+        );
         setProbes((prev) => ({
           ...prev,
           [key]: { kind: "connected", count: tools.length, tools },
@@ -290,6 +315,30 @@ export function SettingsMcpServers() {
         return <span style={{ color: "var(--ew-text-tertiary, #666)" }}>—</span>;
       },
     },
+    // Cross-tenant W4 — raw tenant UUID is noise inside a single tenant;
+    // only the "*" aggregate needs it to tell rows apart. Platform rows are
+    // the home tenant's allowlist (``/available`` collapses to home) — dash.
+    ...(isAggregate
+      ? [
+          {
+            title: t("mcp_servers.col_tenant"),
+            key: "tenant_id",
+            width: 160,
+            render: (_: unknown, row: UnifiedRow) => {
+              const tenantId = row.source === "tenant" ? row.server.tenant_id : null;
+              return tenantId ? (
+                <Tooltip title={tenantId}>
+                  <Typography.Text code style={{ fontSize: 12 }}>
+                    {tenantId.slice(0, 8)}…
+                  </Typography.Text>
+                </Tooltip>
+              ) : (
+                <Typography.Text type="secondary">—</Typography.Text>
+              );
+            },
+          } satisfies ColumnsType<UnifiedRow>[number],
+        ]
+      : []),
     {
       title: t("mcp_servers.col_actions"),
       key: "actions",
@@ -335,15 +384,18 @@ export function SettingsMcpServers() {
                   {t("mcp_servers.test")}
                 </Button>
               )}
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip
+                on={writeDisabled}
+                title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+              >
                 <Popconfirm
                   title={t("mcp_servers.remove_confirm", { name: row.displayName })}
                   onConfirm={() => void handleRemovePlatform(row.catalogId)}
-                  disabled={isTenantSwitched}
+                  disabled={writeDisabled}
                 >
                   <Button
                     size="small"
-                    disabled={isTenantSwitched}
+                    disabled={writeDisabled}
                     data-testid={`ms-remove-${row.name}`}
                   >
                     {t("mcp_servers.remove")}
@@ -360,40 +412,51 @@ export function SettingsMcpServers() {
               size="small"
               data-testid={`ms-test-${s.name}`}
               loading={probes[row.key]?.kind === "testing"}
-              onClick={() => void probe(row.key, s.name, { force: true })}
+              onClick={() =>
+                void probe(row.key, s.name, { force: true, tenantId: probeTenantId(row) })
+              }
             >
               {t("mcp_servers.test")}
             </Button>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 size="small"
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 data-testid={`ms-edit-${s.name}`}
                 onClick={() => openEdit(s)}
               >
                 {t("mcp_servers.edit")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 size="small"
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 data-testid={`ms-toggle-${s.name}`}
                 onClick={() => void handleToggle(s)}
               >
                 {s.enabled ? t("mcp_servers.act_stop") : t("mcp_servers.act_run")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Popconfirm
                 title={t("mcp_servers.delete_confirm", { name: s.name })}
                 onConfirm={() => void handleDelete(s.name)}
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
               >
                 <Button
                   size="small"
                   danger
-                  disabled={isTenantSwitched}
+                  disabled={writeDisabled}
                   data-testid={`ms-delete-${s.name}`}
                 >
                   {t("mcp_servers.delete")}
@@ -466,8 +529,11 @@ export function SettingsMcpServers() {
       >
         {t("mcp_servers.empty_hint")}
       </div>
-      <ReadonlyTooltip on={isTenantSwitched}>
-        <Button type="primary" disabled={isTenantSwitched} onClick={openCreate}>
+      <ReadonlyTooltip
+        on={writeDisabled}
+        title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+      >
+        <Button type="primary" disabled={writeDisabled} onClick={openCreate}>
           {t("mcp_servers.add")}
         </Button>
       </ReadonlyTooltip>
@@ -481,10 +547,13 @@ export function SettingsMcpServers() {
         title={t("mcp_servers.page_title")}
         subtitle={t("mcp_servers.subtitle")}
         actions={
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip
+            on={writeDisabled}
+            title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+          >
             <Button
               type="primary"
-              disabled={isTenantSwitched}
+              disabled={writeDisabled}
               data-testid="ms-add"
               onClick={openCreate}
             >
@@ -525,7 +594,9 @@ export function SettingsMcpServers() {
           rowExpandable: (row) => !(row.source === "platform" && row.authType === "oauth2"),
           onExpand: (expanded, row) => {
             if (!expanded || (row.source === "platform" && row.authType === "oauth2")) return;
-            void probe(row.key, row.source === "tenant" ? row.server.name : row.name);
+            void probe(row.key, row.source === "tenant" ? row.server.name : row.name, {
+              tenantId: probeTenantId(row),
+            });
           },
         }}
       />

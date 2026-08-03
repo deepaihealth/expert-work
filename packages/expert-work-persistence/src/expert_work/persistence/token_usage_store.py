@@ -25,10 +25,20 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models.token_usage import TokenUsageRow
+
+# Cross-tenant usage read (W4) must ``SET LOCAL ROLE`` to a BYPASSRLS role:
+# ``token_usage`` is FORCE ROW LEVEL SECURITY (migration 0036) and the
+# application's main connection role is NOT guaranteed BYPASSRLS, so merely
+# skipping the ``app.tenant_id`` GUC leaves the policy as ``tenant_id = NULL``
+# → zero rows. Assuming ``audit_reader`` (NOLOGIN BYPASSRLS, migration 0005;
+# GRANTed SELECT on this table by migration 0140) is what actually lets the
+# read cross tenants — same precedent as the ledger / tenant_member readers.
+# ``SET LOCAL`` is transaction-scoped, so it lifts on commit/rollback.
+_SET_AUDIT_READER_ROLE = text("SET LOCAL ROLE audit_reader")
 
 
 @dataclass(frozen=True)
@@ -122,6 +132,26 @@ class TokenUsageStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_window_all_tenants(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        user_id: UUID | None = None,
+    ) -> Sequence[TokenUsageRecord]:
+        """Return **every** tenant's rows with ``start <= observed_at < end`` — W4.
+
+        Cross-tenant sibling of :meth:`list_for_tenant_window` (identical
+        half-open window + optional ``user_id`` narrowing, minus the tenant
+        predicate), feeding the ``GET /v1/usage/tokens`` ``tenant_id=*``
+        aggregate. Caller MUST have resolved a ``CrossTenant`` scope
+        (system_admin only) and wrapped the call in ``applied_scope`` /
+        ``bypass_rls_session``; the SQL implementation additionally assumes
+        the ``audit_reader`` BYPASSRLS role because ``token_usage`` is
+        FORCE-RLS (see ``_SET_AUDIT_READER_ROLE``).
+        """
+
+    @abc.abstractmethod
     async def totals_by_trace_ids(self, trace_ids: Sequence[str]) -> dict[str, TokenTotals]:
         """Sum token usage grouped by ``trace_id`` for the given ids.
 
@@ -204,6 +234,22 @@ class InMemoryTokenUsageStore(TokenUsageStore):
             for r in self._rows
             if r.tenant_id == tenant_id
             and r.observed_at is not None
+            and start <= r.observed_at < end
+            and (user_id is None or r.user_id == user_id)
+        ]
+
+    async def list_window_all_tenants(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        user_id: UUID | None = None,
+    ) -> Sequence[TokenUsageRecord]:
+        # Same predicate as ``list_for_tenant_window`` minus the tenant clause.
+        return [
+            r
+            for r in self._rows
+            if r.observed_at is not None
             and start <= r.observed_at < end
             and (user_id is None or r.user_id == user_id)
         ]
@@ -363,6 +409,58 @@ class DbTokenUsageStore(TokenUsageStore):
                         # Explicit tenant predicate — RLS is bypassed under the
                         # app's superuser connection, so this is the isolation.
                         TokenUsageRow.tenant_id == tenant_id,
+                        TokenUsageRow.observed_at >= start,
+                        TokenUsageRow.observed_at < end,
+                        TokenUsageRow.id > after_id,
+                    )
+                    .order_by(TokenUsageRow.id.asc())
+                    .limit(page_size)
+                )
+                if user_id is not None:
+                    stmt = stmt.where(TokenUsageRow.user_id == user_id)
+                rows = (await session.execute(stmt)).scalars().all()
+                if not rows:
+                    break
+                out.extend(_row_to_record(r) for r in rows)
+                after_id = rows[-1].id
+                if len(rows) < page_size:
+                    break
+        return out
+
+    async def list_window_all_tenants(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        user_id: UUID | None = None,
+    ) -> Sequence[TokenUsageRecord]:
+        # Same keyset pagination as ``list_for_tenant_window``, minus the
+        # tenant predicate. ``token_usage`` is FORCE-RLS, so the first
+        # statement assumes the BYPASSRLS ``audit_reader`` role (see
+        # ``_SET_AUDIT_READER_ROLE``); ``SET LOCAL`` is transaction-scoped
+        # and the whole loop runs inside ONE session/transaction, so one
+        # SET covers every page.
+        #
+        # NOTE (Y4 operability follow-up, as on ``list_for_tenant_window``):
+        # all pages stream inside ONE session, so a very large window holds a
+        # read transaction (+ connection) open for the whole scan — and this
+        # variant scans EVERY tenant's rows, so it grows with the whole
+        # platform, not one tenant. Acceptable for the W4 usage-aggregate
+        # cadence; revisit with per-page sessions (or push the rollup into a
+        # SQL GROUP BY — recorded follow-up) if it runs behind
+        # transaction-mode pooling or the table accumulates millions of rows
+        # per month. The window predicate has no leading ``tenant_id``, so it
+        # depends on the ``observed_at``-leading ``token_usage_time_idx``
+        # (migration 0140) — the 0036 indexes all lead with ``tenant_id``.
+        page_size = 5000
+        out: list[TokenUsageRecord] = []
+        after_id = 0
+        async with self._sf() as session:
+            await session.execute(_SET_AUDIT_READER_ROLE)
+            while True:
+                stmt = (
+                    select(TokenUsageRow)
+                    .where(
                         TokenUsageRow.observed_at >= start,
                         TokenUsageRow.observed_at < end,
                         TokenUsageRow.id > after_id,

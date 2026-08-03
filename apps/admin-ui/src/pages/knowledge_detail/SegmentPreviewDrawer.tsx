@@ -10,7 +10,6 @@ import { useTranslation } from "react-i18next";
 
 import { listChunks, type KnowledgeChunk, type KnowledgeDocument } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text, Paragraph } = Typography;
 
@@ -26,15 +25,22 @@ function errMessage(err: unknown): string {
 
 interface SegmentPreviewDrawerProps {
   baseName: string;
+  /** Cross-tenant W4(review C-2)— 权威读口径:URL ``?tenant_id=`` 原样透
+   *  传优先;无 URL 参数时取 ambient scope("*" 折叠成 undefined),由
+   *  KnowledgeDetail 经 DocumentsTab 统一下传。 */
+  readScope: string | undefined;
   document: KnowledgeDocument | null;
   onClose: () => void;
 }
 
-export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPreviewDrawerProps) {
+export function SegmentPreviewDrawer({
+  baseName,
+  readScope,
+  document,
+  onClose,
+}: SegmentPreviewDrawerProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — subordinate detail read: concrete UUID only ("*" 400s).
-  const { apiTenantScope } = useTenantScope();
 
   const [chunks, setChunks] = useState<KnowledgeChunk[]>([]);
   const [total, setTotal] = useState(0);
@@ -55,7 +61,7 @@ export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPre
             offset: (targetPage - 1) * PAGE_SIZE,
             limit: PAGE_SIZE,
           },
-          concreteTenantScope(apiTenantScope),
+          readScope,
         );
         setChunks(result.chunks);
         setTotal(result.total);
@@ -65,7 +71,7 @@ export function SegmentPreviewDrawer({ baseName, document, onClose }: SegmentPre
         setLoading(false);
       }
     },
-    [baseName, documentId, message, apiTenantScope],
+    [baseName, documentId, message, readScope],
   );
 
   useEffect(() => {

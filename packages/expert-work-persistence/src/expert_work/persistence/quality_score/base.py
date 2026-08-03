@@ -47,10 +47,23 @@ class QualityScoreStore(abc.ABC):
         since: datetime | None = None,
         limit: int = 200,
     ) -> list[QualityScoreRecord]:
-        """Recent verdicts, newest ``observed_at`` first.
+        """Recent verdicts, newest ``observed_at`` first (``id`` tiebreak).
 
         Serves the drift window (RT-ADR-24) and the dashboard trend
         (RT-ADR-26). ``agent_name`` / ``since`` narrow the series.
+        """
+
+    @abc.abstractmethod
+    async def list_scores_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[QualityScoreRecord]:
+        """:meth:`list_scores` across every tenant (``observed_at`` DESC,
+        ``id`` tiebreak) — the W4 ``tenant_id=*`` aggregate. Caller MUST wrap
+        the call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
         """
 
     @abc.abstractmethod

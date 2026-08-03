@@ -18,7 +18,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery, Role
+from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
@@ -31,6 +31,7 @@ from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 
@@ -917,23 +918,6 @@ async def test_repeat_purge_returns_404(session_client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 #: (name, path-suffix under /v1/sessions/{thread_id}, extra query params)
 _SESSION_SCOPE_ENDPOINTS: list[tuple[str, str, dict[str, str]]] = [
     ("get_session", "", {}),
@@ -956,7 +940,7 @@ async def _create_owned_session(client: AsyncClient) -> str:
 @pytest.mark.asyncio
 async def test_get_session_system_admin_target_tenant_200(session_client: AsyncClient) -> None:
     thread_id = await _create_owned_session(session_client)
-    headers = await _grant_system_admin(session_client)
+    headers = await grant_system_admin(session_client)
     resp = await session_client.get(
         f"/v1/sessions/{thread_id}",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -971,7 +955,7 @@ async def test_session_workspace_system_admin_target_tenant_200(
     session_client: AsyncClient,
 ) -> None:
     thread_id = await _create_owned_session(session_client)
-    headers = await _grant_system_admin(session_client)
+    headers = await grant_system_admin(session_client)
     resp = await session_client.get(
         f"/v1/sessions/{thread_id}/workspace",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -988,7 +972,7 @@ async def test_session_workspace_files_system_admin_target_tenant_200(
     session_client: AsyncClient,
 ) -> None:
     thread_id = await _create_owned_session(session_client)
-    headers = await _grant_system_admin(session_client)
+    headers = await grant_system_admin(session_client)
     resp = await session_client.get(
         f"/v1/sessions/{thread_id}/workspace/files",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -1043,7 +1027,7 @@ async def test_session_workspace_file_and_artifact_download_system_admin_200(
             created_in_thread=thread_id,
         )
 
-        sys_headers = await _grant_system_admin(client)
+        sys_headers = await grant_system_admin(client)
         file_resp = await client.get(
             f"/v1/sessions/{thread_id}/workspace/file",
             params={"path": "report.pdf", "tenant_id": str(_DEFAULT_TENANT)},

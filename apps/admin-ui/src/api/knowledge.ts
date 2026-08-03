@@ -35,6 +35,9 @@ export interface KnowledgeBaseStats {
 export interface KnowledgeBase {
   id: string;
   name: string;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate;
+   *  absent on pre-W4 backends. */
+  tenant_id?: string | null;
   chunk_max_tokens: number;
   chunk_overlap_tokens: number;
   created_at: string | null;

@@ -14,6 +14,8 @@ import "../../i18n";
 
 import * as knowledgeSdk from "../../api/knowledge";
 import { KnowledgeAdmin } from "../KnowledgeAdmin";
+import { AuthProvider } from "../../auth/AuthContext";
+import { setStoredToken } from "../../api/client";
 
 // Cross-tenant W3 (F3) — 共享 tenant scope mock 工厂;scopeRef.current
 // 切换切入/聚合视角,undefined = home 态。
@@ -47,20 +49,30 @@ const BASES: knowledgeSdk.KnowledgeBase[] = [
   },
 ];
 
+function makeJwt(payload: Record<string, unknown>): string {
+  const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
+  const body = btoa(JSON.stringify(payload));
+  return `${header}.${body}.`;
+}
+
 function LocationProbe() {
   const loc = useLocation();
-  return <div data-testid="loc">{loc.pathname}</div>;
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
 }
 
 function renderPage() {
+  // W4 — the page reads useAuth() (home tenant for the aggregate row-jump).
+  setStoredToken(makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin"] }));
   return render(
     <MemoryRouter initialEntries={["/knowledge"]}>
-      <App>
-        <Routes>
-          <Route path="/knowledge" element={<KnowledgeAdmin />} />
-          <Route path="/knowledge/:name" element={<LocationProbe />} />
-        </Routes>
-      </App>
+      <AuthProvider>
+        <App>
+          <Routes>
+            <Route path="/knowledge" element={<KnowledgeAdmin />} />
+            <Route path="/knowledge/:name" element={<LocationProbe />} />
+          </Routes>
+        </App>
+      </AuthProvider>
     </MemoryRouter>,
   );
 }
@@ -158,5 +170,86 @@ describe("KnowledgeAdmin (list)", () => {
     expect(knowledgeSdk.isSupportedDocument("notes.markdown")).toBe(true);
     expect(knowledgeSdk.isSupportedDocument("payload.exe")).toBe(false);
     expect(knowledgeSdk.isSupportedDocument("no-extension")).toBe(false);
+  });
+});
+
+// ─── Cross-tenant W4 — "*" aggregate: tenant column + row-jump ─────────
+
+describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
+  it("shows the tenant column and carries a foreign tenant into the row-jump", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "tenant-2-xxxx" },
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    // Tenant column renders the truncated owning tenant.
+    expect(screen.getByText("tenant-2…")).toBeInTheDocument();
+
+    // JWT home tenant is t1; the row belongs to tenant-2 → the click
+    // appends ?tenant_id= so the detail read hits the owning tenant.
+    await userEvent.click(screen.getByText("support-docs"));
+    await waitFor(() =>
+      expect(screen.getByTestId("loc")).toHaveTextContent(
+        "/knowledge/support-docs?tenant_id=tenant-2-xxxx",
+      ),
+    );
+  });
+
+  it("row-jump keeps the plain URL for a home-tenant row", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "t1" },
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    await userEvent.click(screen.getByText("support-docs"));
+    await waitFor(() =>
+      expect(screen.getByTestId("loc")).toHaveTextContent("/knowledge/support-docs"),
+    );
+    expect(screen.getByTestId("loc")).not.toHaveTextContent("tenant_id");
+  });
+
+  // Review C-1 — writes bind by name to the caller's HOME tenant, so a
+  // delete/create fired from the aggregate would hit the home tenant's
+  // same-named base. Both write controls must grey out under "*".
+  it("聚合态置灰创建/删库按钮(写接口按 name 绑归属租户)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "tenant-2-xxxx" },
+    ]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeDisabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeDisabled();
+  });
+
+  // rowKey must include the owning tenant: two tenants may legally own a
+  // same-named base and both rows must render (a bare name key collides).
+  it("renders same-named bases from two tenants as two rows", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "t1" },
+      { ...BASES[0], id: "22222222-2222-2222-2222-222222222222", tenant_id: "tenant-2-xxxx" },
+    ]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getAllByText("support-docs")).toHaveLength(2));
+  });
+
+  it("home scope hides the tenant column", async () => {
+    scopeRef.current = undefined;
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "t1" },
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.queryByText("t1…")).not.toBeInTheDocument();
   });
 });

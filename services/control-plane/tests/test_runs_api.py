@@ -34,13 +34,14 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditQuery, Role
+from expert_work.protocol import AuditQuery
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 
@@ -1550,23 +1551,6 @@ async def test_resume_on_never_registered_agent_still_404(runs_client: AsyncClie
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 def _foreign_tenant_headers() -> dict[str, str]:
     """A plain tenant user homed in a random other tenant."""
     return {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
@@ -1600,7 +1584,7 @@ class _StubLangfuseClient:
 @pytest.mark.asyncio
 async def test_get_run_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
     thread_id, run_id = await _seed_completed_run(runs_client)
-    headers = await _grant_system_admin(runs_client)
+    headers = await grant_system_admin(runs_client)
     resp = await runs_client.get(
         f"/v1/sessions/{thread_id}/runs/{run_id}",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -1615,7 +1599,7 @@ async def test_get_run_system_admin_target_tenant_200(runs_client: AsyncClient) 
 @pytest.mark.asyncio
 async def test_get_run_trace_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
     thread_id, run_id = await _seed_completed_run(runs_client)
-    headers = await _grant_system_admin(runs_client)
+    headers = await grant_system_admin(runs_client)
     resp = await runs_client.get(
         f"/v1/sessions/{thread_id}/runs/{run_id}/trace",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -1639,7 +1623,7 @@ async def test_get_run_trace_raw_system_admin_target_tenant_200(
         run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT, trace_id="cafef00d" * 4
     )
     app.state.langfuse_read_client = _StubLangfuseClient()
-    headers = await _grant_system_admin(runs_client)
+    headers = await grant_system_admin(runs_client)
     resp = await runs_client.get(
         f"/v1/sessions/{thread_id}/runs/{run_id}/trace/raw",
         params={"tenant_id": str(_DEFAULT_TENANT), "span": "s1", "field": "input"},
@@ -1652,7 +1636,7 @@ async def test_get_run_trace_raw_system_admin_target_tenant_200(
 @pytest.mark.asyncio
 async def test_run_events_system_admin_target_tenant_200(runs_client: AsyncClient) -> None:
     thread_id, run_id = await _seed_completed_run(runs_client)
-    headers = await _grant_system_admin(runs_client)
+    headers = await grant_system_admin(runs_client)
     resp = await runs_client.get(
         f"/v1/sessions/{thread_id}/runs/{run_id}/events",
         params={"tenant_id": str(_DEFAULT_TENANT)},

@@ -22,19 +22,24 @@ interface ReadonlyTooltipProps {
   on: boolean;
   /** Block-level children (e.g. ``Upload.Dragger``); default inline-flex. */
   block?: boolean;
+  /** Override the tooltip copy — Cross-tenant W4(review M2):"*" 聚合态置灰
+   *  用 ``t("common.cross_tenant_readonly")``(切入具体租户的指引);缺省仍是
+   *  切入态文案 ``common.tenant_switched_readonly``。 */
+  title?: string;
   children: ReactElement;
 }
 
 export function ReadonlyTooltip({
   on,
   block = false,
+  title,
   children,
 }: ReadonlyTooltipProps): ReactElement {
   const { t } = useTranslation();
   if (!on) return children;
   const display = block ? "block" : "inline-flex";
   return (
-    <Tooltip title={t("common.tenant_switched_readonly")}>
+    <Tooltip title={title ?? t("common.tenant_switched_readonly")}>
       <span data-testid="readonly-tooltip" style={{ display, cursor: "not-allowed" }}>
         <span style={{ display, pointerEvents: "none" }}>{children}</span>
       </span>

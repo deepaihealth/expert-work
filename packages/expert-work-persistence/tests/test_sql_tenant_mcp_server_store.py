@@ -201,6 +201,79 @@ async def test_count_for_catalog_cross_tenant(
 
 
 @pytest.mark.asyncio
+async def test_list_all_tenants_spans_tenants_ordered(
+    tenant_mcp_server_platform_scope: tuple[
+        SqlTenantMcpServerStore, SqlMcpConnectorCatalogStore, AsyncEngine
+    ],
+) -> None:
+    """W4 — the aggregate reader spans tenants, ordered ``(name, tenant_id)``
+    (the same name may exist in several tenants). Superuser session mirrors
+    the production posture (bypass GUC on the app's superuser connection).
+    Review C-3 — rows are inserted in *descending* ``tenant_id.int`` order so
+    a dropped tenant_id tiebreak degrades to insertion (heap-scan) order and
+    the exact-order assertion goes red."""
+    servers, _catalog, engine = tenant_mcp_server_platform_scope
+    try:
+        tid_lo, tid_hi = sorted((uuid4(), uuid4()), key=lambda u: u.int)
+        shared_name = f"agg-{uuid4().hex[:12]}"
+        for tid in (tid_hi, tid_lo):  # descending insertion
+            await servers.create(
+                tenant_id=tid,
+                name=shared_name,
+                transport="streamable_http",
+                url="https://mcp.example.com/a",
+                auth_type="none",
+                token_secret_ref=None,
+                timeout_s=30.0,
+                created_by="a@x",
+            )
+
+        rows = await servers.list_all_tenants()
+        mine = [r for r in rows if r.tenant_id in {tid_lo, tid_hi}]
+        assert [r.name for r in mine] == [shared_name, shared_name]
+        # tenant_id tiebreak: Postgres uuid byte order == UUID.int order.
+        assert [r.tenant_id for r in mine] == [tid_lo, tid_hi]
+        # Per-tenant sibling stays scoped.
+        assert [r.tenant_id for r in await servers.list_for_tenant(tenant_id=tid_lo)] == [tid_lo]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_all_tenants_respects_limit(
+    tenant_mcp_server_platform_scope: tuple[
+        SqlTenantMcpServerStore, SqlMcpConnectorCatalogStore, AsyncEngine
+    ],
+) -> None:
+    """W4 review #4 — the ``limit`` leg is load-bearing. The two rows' names
+    are digit-prefixed so they sort ahead of every other test's rows in the
+    shared session container (digits precede letters in C and en_US alike);
+    ``limit=1`` must return exactly the first of the ``(name, tenant_id)``
+    order."""
+    servers, _catalog, engine = tenant_mcp_server_platform_scope
+    try:
+        tid = uuid4()
+        first_name = f"0-limit-a-{uuid4().hex[:12]}"
+        second_name = f"0-limit-b-{uuid4().hex[:12]}"
+        for name in (second_name, first_name):  # insert out of order
+            await servers.create(
+                tenant_id=tid,
+                name=name,
+                transport="streamable_http",
+                url="https://mcp.example.com/a",
+                auth_type="none",
+                token_secret_ref=None,
+                timeout_s=30.0,
+                created_by="a@x",
+            )
+
+        rows = await servers.list_all_tenants(limit=1)
+        assert [r.name for r in rows] == [first_name]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_count_for_catalog_empty(
     tenant_mcp_server_platform_scope: tuple[
         SqlTenantMcpServerStore, SqlMcpConnectorCatalogStore, AsyncEngine

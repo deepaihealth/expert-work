@@ -37,7 +37,9 @@ export function buildUnifiedRows(
       catalogId: a.catalog_id ?? null,
     }));
   const custom: UnifiedRow[] = servers.map((s) => ({
-    key: `tenant:${s.name}`,
+    // Cross-tenant W4 — two tenants may own a same-named server in the
+    // ``tenant_id=*`` aggregate; key by (tenant, name) so rows never collide.
+    key: `tenant:${s.tenant_id ?? "home"}:${s.name}`,
     source: "tenant" as const,
     server: s,
   }));

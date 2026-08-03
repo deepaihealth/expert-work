@@ -344,41 +344,6 @@ async def ensure_single_tenant_scope(
     return scope
 
 
-async def ensure_tenant_scope_home_fallback(
-    principal: Principal,
-    requested_tenant_id: UUID | Literal["*"] | None,
-    audit: AuditLogger,
-    *,
-    trace_id: str | None = None,
-    endpoint: str | None = None,
-    cross_tenant_enabled: bool = True,
-) -> SingleTenant:
-    """:func:`ensure_tenant_scope` for **list** endpoints whose stores have no
-    cross-tenant aggregate reader — W3 read scope.
-
-    The "*" aggregate is a spec non-goal on these surfaces (knowledge / eval /
-    quality / usage / mcp lists): once the resolver has authorized and audited
-    the request, a :class:`CrossTenant` resolution collapses to the caller's
-    home tenant — the pre-scope-threading behavior, mirroring the front-end
-    ``concreteTenantScope`` convention. Everything else (home fallback, 403
-    ``TENANT_NOT_ALLOWED`` / ``CROSS_TENANT_FORBIDDEN``, the switch audit, the
-    HX-8 deployment switch) is exactly :func:`ensure_tenant_scope`. Swap the
-    call site to :func:`ensure_tenant_scope` + a real ``*_all_tenants`` branch
-    once the store grows an aggregate reader (W4 candidate).
-    """
-    scope = await ensure_tenant_scope(
-        principal,
-        requested_tenant_id,
-        audit,
-        trace_id=trace_id,
-        endpoint=endpoint,
-        cross_tenant_enabled=cross_tenant_enabled,
-    )
-    if isinstance(scope, CrossTenant):
-        return SingleTenant(tenant_id=principal.tenant_id)
-    return scope
-
-
 # ---------------------------------------------------------------------------
 # bypass_rls_session — CrossTenant SQL wrapper
 # ---------------------------------------------------------------------------
@@ -454,5 +419,4 @@ __all__ = [
     "emit_tenant_switch",
     "ensure_single_tenant_scope",
     "ensure_tenant_scope",
-    "ensure_tenant_scope_home_fallback",
 ]

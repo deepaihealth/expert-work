@@ -15,13 +15,14 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import TriggerStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
-from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRecord
+from expert_work.protocol import AuditAction, AuditQuery, TriggerRecord
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
 
@@ -705,23 +706,6 @@ async def test_delete_survives_run_cancel_failure(
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_DEFAULT_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 #: (name, path) — the three agent detail read endpoints under scope.
 _AGENT_SCOPE_PATHS: list[tuple[str, str]] = [
     ("get_agent", "/v1/agents/code-reviewer/1.0.0"),
@@ -733,7 +717,7 @@ _AGENT_SCOPE_PATHS: list[tuple[str, str]] = [
 @pytest.mark.asyncio
 async def test_get_agent_system_admin_target_tenant_200(b5_client: AsyncClient) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    headers = await _grant_system_admin(b5_client)
+    headers = await grant_system_admin(b5_client)
     resp = await b5_client.get(
         "/v1/agents/code-reviewer/1.0.0",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -746,7 +730,7 @@ async def test_get_agent_system_admin_target_tenant_200(b5_client: AsyncClient) 
 @pytest.mark.asyncio
 async def test_agent_revisions_system_admin_target_tenant_200(b5_client: AsyncClient) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    headers = await _grant_system_admin(b5_client)
+    headers = await grant_system_admin(b5_client)
     listing = await b5_client.get(
         "/v1/agents/code-reviewer/1.0.0/revisions",
         params={"tenant_id": str(_DEFAULT_TENANT)},
@@ -762,7 +746,7 @@ async def test_agent_revision_detail_system_admin_target_tenant_200(
     b5_client: AsyncClient,
 ) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    headers = await _grant_system_admin(b5_client)
+    headers = await grant_system_admin(b5_client)
     snap = await b5_client.get(
         "/v1/agents/code-reviewer/1.0.0/revisions/1",
         params={"tenant_id": str(_DEFAULT_TENANT)},
