@@ -1,11 +1,16 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { Layout } from "antd";
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { SCOPE_ALL, useTenantScope } from "../tenant/TenantScopeContext";
-import { groupForPath, isPlatformScope } from "./navModel";
+import {
+  defaultPathForScope,
+  groupForPath,
+  isPlatformScope,
+  pathAllowedForScope,
+} from "./navModel";
 
 const { Sider, Header, Content } = Layout;
 
@@ -26,6 +31,7 @@ function useScopeRedirect(): void {
   const { scope, setScope } = useTenantScope();
   const isSystemAdmin = useAuth().identity?.isSystemAdmin ?? false;
   const location = useLocation();
+  const navigate = useNavigate();
 
   useEffect(() => {
     if (
@@ -36,6 +42,24 @@ function useScopeRedirect(): void {
       setScope(SCOPE_ALL);
     }
   }, [scope, isSystemAdmin, location.pathname, setScope]);
+
+  // Scope changed underneath the current page — the context auto-promotes a
+  // platform-homed system_admin to ``"*"`` after /v1/me (login lands on
+  // /agents with a platform sidebar otherwise), and demotes a stale non-admin
+  // scope. When the page is no longer part of the new scope's nav, land on
+  // the new scope's first menu entry, same as a switcher change. A page that
+  // IS part of it stays put (deep-link promotion above; ``"*"``-adaptive
+  // pages like the cross-tenant Members overview). Transition-gated on
+  // purpose: mounting straight onto e.g. /knowledge under ``"*"`` (aggregate
+  // view via URL/palette) must not bounce.
+  const prevScope = useRef(scope);
+  useEffect(() => {
+    if (prevScope.current === scope) return;
+    prevScope.current = scope;
+    if (!pathAllowedForScope(location.pathname, scope, isSystemAdmin)) {
+      navigate(defaultPathForScope(scope, isSystemAdmin), { replace: true });
+    }
+  }, [scope, isSystemAdmin, location.pathname, navigate]);
 }
 
 export function Shell({ children }: { children: ReactNode }) {
