@@ -16,6 +16,9 @@ import { apiClient, withTenantScope, type TenantScope } from "./client";
  *  ``dimensions`` are a subjective 1-5 rubric score, not ground truth. */
 export interface QualityScore {
   id: number;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate;
+   *  absent on pre-W4 backends. */
+  tenant_id?: string | null;
   agent_name: string;
   agent_version: string;
   /** For drill-down: link to the run / conversation in run_detail. */
@@ -31,6 +34,9 @@ export interface QualityScore {
 /** One raised drift alert (recent mean dropped below baseline). */
 export interface QualityDriftAlert {
   id: number;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate;
+   *  absent on pre-W4 backends. */
+  tenant_id?: string | null;
   agent_name: string;
   recent_mean: number;
   baseline_mean: number;

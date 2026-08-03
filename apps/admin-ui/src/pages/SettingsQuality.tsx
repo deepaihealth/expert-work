@@ -31,6 +31,7 @@ import {
   Skeleton,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
@@ -47,6 +48,7 @@ import {
   type QualityDriftAlert,
   type QualityScore,
 } from "../api/quality";
+import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
 
@@ -62,27 +64,39 @@ function scoreColor(overall: number): string {
 
 interface AgentTrend {
   agent: string;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate. */
+  tenant_id?: string | null;
   mean: number;
   count: number;
   /** Oldest → newest ``overall`` values for the sparkline. */
   series: number[];
 }
 
-/** Group the flat (newest-first) score list into a per-agent trend. */
+/** Group the flat (newest-first) score list into a per-agent trend.
+ *  W4 — the group key carries the row's tenant so the "*" aggregate never
+ *  folds two tenants' same-named agents into one trend; inside a single
+ *  tenant every row shares one tenant, so grouping is unchanged. */
 function toTrends(scores: QualityScore[]): AgentTrend[] {
   const byAgent = new Map<string, QualityScore[]>();
   for (const s of scores) {
-    const bucket = byAgent.get(s.agent_name);
+    const key = `${s.tenant_id ?? ""}:${s.agent_name}`;
+    const bucket = byAgent.get(key);
     if (bucket) bucket.push(s);
-    else byAgent.set(s.agent_name, [s]);
+    else byAgent.set(key, [s]);
   }
   const trends: AgentTrend[] = [];
-  for (const [agent, rows] of byAgent) {
+  for (const rows of byAgent.values()) {
     // rows are newest-first; the sparkline reads oldest → newest.
     const chrono = [...rows].reverse();
     const series = chrono.map((r) => r.overall);
     const mean = series.reduce((a, b) => a + b, 0) / series.length;
-    trends.push({ agent, mean, count: series.length, series });
+    trends.push({
+      agent: rows[0].agent_name,
+      tenant_id: rows[0].tenant_id,
+      mean,
+      count: series.length,
+      series,
+    });
   }
   return trends.sort((a, b) => a.mean - b.mean); // worst mean first
 }
@@ -141,6 +155,8 @@ export function SettingsQuality() {
   const { t } = useTranslation();
   // Cross-tenant W3 — the lists are scope-aware ("*" aggregates every tenant).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W4 — "*" aggregate shows the owning tenant per row.
+  const isAggregate = apiTenantScope === "*";
 
   const [agentFilter, setAgentFilter] = useState("");
   // Named ``timeWindow`` (not ``window``) so it never shadows the DOM global.
@@ -186,8 +202,33 @@ export function SettingsQuality() {
     [scores],
   );
 
+  // Cross-tenant W4 — shared tenant column, appended only in the "*"
+  // aggregate (raw tenant UUID is noise inside a single tenant).
+  function tenantColumn<T extends { tenant_id?: string | null }>(): TableColumnsType<T> {
+    if (!isAggregate) return [];
+    return [
+      {
+        title: t("quality_page.col_tenant"),
+        dataIndex: "tenant_id",
+        key: "tenant_id",
+        width: 120,
+        render: (v: string | null | undefined) =>
+          v ? (
+            <Tooltip title={v}>
+              <Text code style={{ fontSize: 12 }}>
+                {v.slice(0, 8)}…
+              </Text>
+            </Tooltip>
+          ) : (
+            <Text type="secondary">—</Text>
+          ),
+      },
+    ];
+  }
+
   const trendColumns: TableColumnsType<AgentTrend> = [
     { title: t("quality_page.col_agent"), dataIndex: "agent", key: "agent" },
+    ...tenantColumn<AgentTrend>(),
     {
       title: t("quality_page.trend_mean"),
       key: "mean",
@@ -221,6 +262,7 @@ export function SettingsQuality() {
       dataIndex: "agent_name",
       key: "agent_name",
     },
+    ...tenantColumn<QualityScore>(),
     {
       title: t("quality_page.col_dimensions"),
       key: "dimensions",
@@ -269,6 +311,7 @@ export function SettingsQuality() {
       dataIndex: "agent_name",
       key: "agent_name",
     },
+    ...tenantColumn<QualityDriftAlert>(),
     {
       title: t("quality_page.drift_col_recent"),
       dataIndex: "recent_mean",
@@ -404,7 +447,9 @@ export function SettingsQuality() {
             />
           ) : (
             <Table<AgentTrend>
-              rowKey="agent"
+              // W4 — two tenants may run a same-named agent in the "*"
+              // aggregate; key the row by (tenant, agent).
+              rowKey={(r) => tenantRowKey(r.tenant_id, r.agent)}
               columns={trendColumns}
               dataSource={trends}
               pagination={false}

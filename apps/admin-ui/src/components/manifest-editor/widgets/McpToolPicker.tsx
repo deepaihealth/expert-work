@@ -101,7 +101,9 @@ export function McpToolPicker({
                 toolKey: e.id,
               })),
           )
-        : listAvailableMcpServers(apiTenantScope).then((data) =>
+        : // ``/available`` rejects the "*" aggregate with 400 (review C-2) —
+          // collapse it to the home tenant like the tools probe below.
+          listAvailableMcpServers(concreteTenantScope(apiTenantScope)).then((data) =>
             data.map((s) => ({
               name: s.name,
               label: s.name,

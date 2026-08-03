@@ -209,3 +209,78 @@ describe("SettingsMcpServers unified list", () => {
     expect(availMock).toHaveBeenCalledWith(scopeRef.current);
   });
 });
+
+// ─── Cross-tenant W4 — "*" aggregate ────────────────────────────────────
+
+describe("SettingsMcpServers — cross-tenant W4 aggregate", () => {
+  // Review C-1 — writes bind by name to the caller's HOME tenant, so any
+  // write fired from the aggregate would hit the home tenant's same-named
+  // server. Every write control must grey out under "*".
+  it("聚合态置灰全部写控件(新建/编辑/启停/删除/移出)", async () => {
+    scopeRef.current = "*";
+    listMock.mockResolvedValue([{ ...custom, tenant_id: "tenant-2" }]);
+    availMock.mockResolvedValue([
+      { name: "amap", source: "platform", display_name: "高德地图", auth_type: "none", catalog_id: "c1" },
+    ]);
+
+    renderPage();
+
+    expect(await screen.findByText("my-custom")).toBeInTheDocument();
+    expect(screen.getByTestId("ms-add")).toBeDisabled();
+    expect(screen.getByTestId("ms-edit-my-custom")).toBeDisabled();
+    expect(screen.getByTestId("ms-toggle-my-custom")).toBeDisabled();
+    expect(screen.getByTestId("ms-delete-my-custom")).toBeDisabled();
+    expect(screen.getByTestId("ms-remove-amap")).toBeDisabled();
+  });
+
+  // Review C-2 — /available rejects "*" with 400: the aggregate list read
+  // stays "*" while /available collapses to home (no tenant scope) instead
+  // of erroring into the .catch and dropping platform rows.
+  it("聚合态 /available 收敛 home;列表读保持 '*'", async () => {
+    scopeRef.current = "*";
+    listMock.mockResolvedValue([{ ...custom, tenant_id: "tenant-2" }]);
+    availMock.mockResolvedValue([
+      { name: "amap", source: "platform", display_name: "高德地图", auth_type: "none", catalog_id: "c1" },
+    ]);
+
+    renderPage();
+
+    expect(await screen.findByText("高德地图")).toBeInTheDocument();
+    expect(listMock).toHaveBeenCalledWith("*");
+    expect(availMock).toHaveBeenCalledWith(undefined);
+  });
+
+  // Key must include the owning tenant: two tenants may legally own a
+  // same-named server and both rows must render, with the tenant column
+  // telling them apart.
+  it("同名双租户行都渲染 + 聚合态租户列", async () => {
+    scopeRef.current = "*";
+    listMock.mockResolvedValue([
+      { ...custom, tenant_id: "tenant-1-xxxx" },
+      { ...custom, id: "s2", tenant_id: "tenant-2-xxxx" },
+    ]);
+    availMock.mockResolvedValue([]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getAllByText("my-custom")).toHaveLength(2));
+    expect(screen.getByText("tenant-1…")).toBeInTheDocument();
+    expect(screen.getByText("tenant-2…")).toBeInTheDocument();
+  });
+
+  // A foreign row's Test probe must hit the OWNING tenant (the bare name
+  // would probe the home tenant's same-named server).
+  it("聚合态 Test 探测带上行的归属租户", async () => {
+    scopeRef.current = "*";
+    listMock.mockResolvedValue([{ ...custom, tenant_id: "tenant-2" }]);
+    availMock.mockResolvedValue([]);
+    toolsMock.mockResolvedValue([]);
+
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId("ms-test-my-custom"));
+    await waitFor(() =>
+      expect(toolsMock).toHaveBeenCalledWith("my-custom", "tenant-2"),
+    );
+  });
+});

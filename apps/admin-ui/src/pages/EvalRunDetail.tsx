@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Alert, Button, Card, Empty, Skeleton, Table, Tag, Typography } from "antd";
 import type { TableColumnsType } from "antd";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
@@ -55,8 +55,15 @@ function scoresLabel(scores: Record<string, number> | null): string {
 export function EvalRunDetail() {
   const { t } = useTranslation();
   const { runId } = useParams<{ runId: string }>();
-  // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 400s).
+  // Cross-tenant W3/W4 — detail reads take a concrete UUID only ("*" 400s).
+  // Priority: the ``?tenant_id=`` query param (set by the EvalRunsList "*"
+  // aggregate row-jump — the ambient scope is "*" there, which collapses to
+  // undefined) wins over the ambient switched-in scope.
   const { apiTenantScope } = useTenantScope();
+  const [searchParams] = useSearchParams();
+  // ``||``(非 ``??``):``?tenant_id=`` 空串落回 ambient 分支,不拼空参 422。
+  const readScope =
+    searchParams.get("tenant_id") || concreteTenantScope(apiTenantScope);
 
   const [run, setRun] = useState<EvalRunRecord | null>(null);
   const [cases, setCases] = useState<EvalCaseResult[]>([]);
@@ -78,10 +85,9 @@ export function EvalRunDetail() {
         setError(null);
       }
       try {
-        const scope = concreteTenantScope(apiTenantScope);
         const [runData, casesData] = await Promise.all([
-          getEvalRun(runId, scope),
-          getEvalRunCases(runId, scope),
+          getEvalRun(runId, readScope),
+          getEvalRunCases(runId, readScope),
         ]);
         setRun(runData);
         setCases(casesData.cases);
@@ -91,7 +97,7 @@ export function EvalRunDetail() {
         if (!silent) setLoading(false);
       }
     },
-    [runId, apiTenantScope],
+    [runId, readScope],
   );
 
   useEffect(() => {

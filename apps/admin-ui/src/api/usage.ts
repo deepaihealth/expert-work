@@ -31,6 +31,9 @@ export interface TokenCounts {
  *  ``agent_name`` are only populated when ``group_by=none``. */
 export interface UsageCostGroup extends TokenCounts {
   key: string;
+  /** Cross-tenant W4 — owning tenant (per-tenant buckets in the
+   *  ``tenant_id=*`` aggregate); absent on pre-W4 backends. */
+  tenant_id?: string | null;
   billed_cost_micros: number;
   unpriced: boolean;
   provider?: string;
@@ -49,6 +52,9 @@ export interface UsageCost {
 /** A keyed token tally from ``/v1/usage/tokens``. */
 export interface TokenGroup extends TokenCounts {
   key: string;
+  /** Cross-tenant W4 — owning tenant (per-tenant buckets in the
+   *  ``tenant_id=*`` aggregate); absent on pre-W4 backends. */
+  tenant_id?: string | null;
 }
 
 export interface UsageTokens {

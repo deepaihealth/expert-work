@@ -206,6 +206,43 @@ async def test_window_isolates_tenants(store: InMemoryTokenUsageStore) -> None:
     assert rows[0].tenant_id == tenant_a
 
 
+@pytest.mark.asyncio
+async def test_window_all_tenants_crosses_tenants(store: InMemoryTokenUsageStore) -> None:
+    """W4 — the all-tenants sibling returns every tenant, same half-open window."""
+    tenant_a = uuid4()
+    tenant_b = uuid4()
+    start = datetime(2026, 6, 1, tzinfo=UTC)
+    end = datetime(2026, 7, 1, tzinfo=UTC)
+    await _insert_at(store, tenant_id=tenant_a, observed_at=start)
+    await _insert_at(store, tenant_id=tenant_b, observed_at=start)
+    # observed_at == end → excluded (window semantics identical to per-tenant).
+    await _insert_at(store, tenant_id=tenant_b, observed_at=end)
+    rows = list(await store.list_window_all_tenants(start=start, end=end))
+    assert {r.tenant_id for r in rows} == {tenant_a, tenant_b}
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_window_all_tenants_filters_by_user(store: InMemoryTokenUsageStore) -> None:
+    tenant = uuid4()
+    alice, bob = uuid4(), uuid4()
+    for uid, inp in [(alice, 10), (bob, 99)]:
+        await store.insert(
+            TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="bot",
+                agent_version="1.0.0",
+                model="m1",
+                user_id=uid,
+                input_tokens=inp,
+            )
+        )
+    start = datetime.now(UTC) - timedelta(minutes=1)
+    end = datetime.now(UTC) + timedelta(minutes=1)
+    rows = list(await store.list_window_all_tenants(start=start, end=end, user_id=alice))
+    assert [r.input_tokens for r in rows] == [10]
+
+
 # ---------------------------------------------------------------------------
 # totals_by_trace_ids — Runs enrichment (per-run token summary, joined by
 # trace_id since token_usage has no run_id column)

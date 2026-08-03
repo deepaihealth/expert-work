@@ -28,7 +28,6 @@ import {
   type RetrievalMethod,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -54,14 +53,15 @@ function errMessage(err: unknown): string {
 interface SettingsTabProps {
   base: KnowledgeBase;
   onSaved: () => Promise<void> | void;
+  /** Cross-tenant W4(review C-2)— 只读态(切入态 ∪ "*" 聚合深链外租户
+   *  读),由 KnowledgeDetail 统一判定下传;保存/重建索引一律置灰。 */
+  readonly: boolean;
 }
 
-export function SettingsTab({ base, onSaved }: SettingsTabProps) {
+export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const [form] = Form.useForm<SettingsFormValues>();
-  // Cross-tenant W3 — 切入态只读:保存/重建索引是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
 
@@ -201,12 +201,12 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           >
             <Switch aria-label={t("knowledge_page.field_rerank")} />
           </Form.Item>
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip on={readonly}>
             <Button
               type="primary"
               htmlType="submit"
               loading={saving}
-              disabled={isTenantSwitched}
+              disabled={readonly}
               data-testid="kb-settings-save"
             >
               {t("common.save")}
@@ -226,10 +226,10 @@ export function SettingsTab({ base, onSaved }: SettingsTabProps) {
           {base.needs_reindex && (
             <Alert type="warning" showIcon message={t("knowledge_page.needs_reindex_banner")} />
           )}
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip on={readonly}>
             <Button
               loading={reindexing}
-              disabled={base.reindexing || isTenantSwitched}
+              disabled={base.reindexing || readonly}
               onClick={() => void handleReindex()}
               data-testid="kb-settings-reindex"
             >

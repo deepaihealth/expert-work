@@ -26,6 +26,7 @@ beforeEach(() => {
   availableMock.mockReset();
   catalogMock.mockReset();
   toolsMock.mockReset();
+  scopeRef.current = undefined;
 });
 
 const noop = () => {};
@@ -42,6 +43,23 @@ describe("McpToolPicker", () => {
     ).toBeInTheDocument();
     expect(screen.getByTestId("af-mcp-server-my-custom")).toBeInTheDocument();
     expect(catalogMock).not.toHaveBeenCalled();
+  });
+
+  // Cross-tenant W4 (review C-2) — /available rejects "*" with 400; the
+  // picker must collapse the aggregate to home (no tenant scope on the
+  // request) and render normally instead of an error banner.
+  it("'*' aggregate collapses to home — servers render, no error banner", async () => {
+    scopeRef.current = "*";
+    availableMock.mockResolvedValue([
+      { name: "amap-maps", source: "platform" },
+    ]);
+    render(<McpToolPicker servers={[]} allowTools={[]} onChange={noop} />);
+    expect(
+      await screen.findByTestId("af-mcp-server-amap-maps"),
+    ).toBeInTheDocument();
+    // The scope arg collapses to undefined → no ?tenant_id on the wire.
+    expect(availableMock).toHaveBeenCalledWith(undefined);
+    expect(screen.queryByText(/加载失败|failed/i)).not.toBeInTheDocument();
   });
 
   it("catalog source lists published connectors (enabled only) by display name", async () => {

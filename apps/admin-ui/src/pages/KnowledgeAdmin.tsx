@@ -10,7 +10,7 @@
  * only — this page does NOT follow the global TenantScope switch.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Typography } from "antd";
+import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { BookOpen, Plus, RefreshCcw, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -18,11 +18,13 @@ import { useTranslation } from "react-i18next";
 
 import { deleteBase, listBases, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateBaseModal } from "../components/CreateBaseModal";
 import { PageHeader } from "../components/PageHeader";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
+import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
 
@@ -42,6 +44,14 @@ export function KnowledgeAdmin() {
   const { apiTenantScope } = useTenantScope();
   // Cross-tenant W3 — 切入态只读:删库/新建是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W4 — "*" aggregate: tenant column + row-jump carries the
+  // owning tenant (home rows keep the plain URL, see onRow below).
+  const isAggregate = apiTenantScope === "*";
+  // Cross-tenant W4 (review C-1) — the aggregate is read-only too: writes
+  // (delete/create) bind by name to the caller's HOME tenant, so acting on a
+  // foreign row would hit the home tenant's same-named base.
+  const writeDisabled = isAggregate || isTenantSwitched;
+  const { identity } = useAuth();
   const navigate = useNavigate();
 
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
@@ -129,25 +139,50 @@ export function KnowledgeAdmin() {
           <Text className="mono">{record.stats?.chunk_count ?? 0}</Text>
         ),
       },
+      // Cross-tenant W4 — raw tenant UUID is noise inside a single tenant;
+      // only the "*" aggregate needs it to tell rows apart.
+      ...(isAggregate
+        ? [
+            {
+              title: t("knowledge_page.col_tenant"),
+              dataIndex: "tenant_id" as const,
+              key: "tenant_id",
+              width: 160,
+              render: (tenantId: string | null | undefined) =>
+                tenantId ? (
+                  <Tooltip title={tenantId}>
+                    <Text code style={{ fontSize: 12 }}>
+                      {tenantId.slice(0, 8)}…
+                    </Text>
+                  </Tooltip>
+                ) : (
+                  <Text type="secondary">—</Text>
+                ),
+            },
+          ]
+        : []),
       {
         title: "",
         key: "actions",
         width: 60,
         render: (_: unknown, record) => (
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip
+            on={writeDisabled}
+            title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+          >
             <Popconfirm
               title={t("knowledge_page.delete_base_confirm_title", { name: record.name })}
               description={t("knowledge_page.delete_base_confirm_body")}
               onConfirm={() => void handleDelete(record.name)}
               okText={t("knowledge_page.delete")}
               okButtonProps={{ danger: true }}
-              disabled={isTenantSwitched}
+              disabled={writeDisabled}
             >
               <Button
                 size="small"
                 danger
                 type="text"
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 icon={<Trash2 size={13} strokeWidth={1.5} />}
                 onClick={(e) => e.stopPropagation()}
                 aria-label={t("knowledge_page.delete")}
@@ -158,7 +193,7 @@ export function KnowledgeAdmin() {
         ),
       },
     ],
-    [t, handleDelete, isTenantSwitched],
+    [t, handleDelete, writeDisabled, isAggregate],
   );
 
   return (
@@ -182,12 +217,15 @@ export function KnowledgeAdmin() {
             >
               {t("common.refresh")}
             </Button>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.5} />}
                 onClick={() => setCreateOpen(true)}
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 data-testid="kb-create-open"
               >
                 {t("knowledge_page.create_base")}
@@ -210,15 +248,35 @@ export function KnowledgeAdmin() {
 
       <Table<KnowledgeBase>
         columns={columns}
+        // Two tenants may own a same-named base in the "*" aggregate — key
+        // the row by (tenant, name) so they never collide.
+        rowKey={(r) => tenantRowKey(r.tenant_id, r.name)}
         dataSource={bases}
-        rowKey="name"
         loading={loading}
         pagination={false}
         onRow={(record) => ({
-          onClick: () => navigate(`/knowledge/${encodeURIComponent(record.name)}`),
+          onClick: () => {
+            // Cross-tenant W4 — in the "*" aggregate a foreign-tenant row
+            // would 404 (getBase falls back to the home tenant), so carry
+            // the row's owning tenant into the detail URL. Absent = pre-W4
+            // backend — keeps the old behavior.
+            const query =
+              record.tenant_id != null && record.tenant_id !== identity?.homeTenantId
+                ? `?tenant_id=${encodeURIComponent(record.tenant_id)}`
+                : "";
+            navigate(`/knowledge/${encodeURIComponent(record.name)}${query}`);
+          },
           style: { cursor: "pointer" },
         })}
-        locale={{ emptyText: <Empty description={t("knowledge_page.bases_empty")} /> }}
+        locale={{
+          emptyText: (
+            <Empty
+              description={
+                isAggregate ? t("knowledge_page.empty_cross") : t("knowledge_page.bases_empty")
+              }
+            />
+          ),
+        }}
         data-testid="kb-table"
       />
 
