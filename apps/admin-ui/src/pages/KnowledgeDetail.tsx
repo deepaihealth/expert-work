@@ -14,6 +14,7 @@ import { useTranslation } from "react-i18next";
 
 import { getBase, reindexBase, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
@@ -42,11 +43,19 @@ export function KnowledgeDetail() {
   // aggregate row-jump — the ambient scope is "*" there, which collapses to
   // undefined) wins over the ambient switched-in scope.
   const { apiTenantScope } = useTenantScope();
+  const { identity } = useAuth();
   const [searchParams] = useSearchParams();
+  // ``||``(非 ``??``):``?tenant_id=`` 空串落回 ambient 分支,不拼空参 422。
   const tenantParam = searchParams.get("tenant_id");
-  const readScope = tenantParam ?? concreteTenantScope(apiTenantScope);
+  const readScope = tenantParam || concreteTenantScope(apiTenantScope);
   // Cross-tenant W3 — 切入态只读:重建索引是写操作,置灰。
+  // Cross-tenant W4(review C-2)— "*" 聚合深链(``?tenant_id=B``)不算切入
+  // 态,但读的是外租户;写链路(reindex/update/upload/delete)按 name 绑定
+  // 归属租户,点了会误伤 home 同名库,所以外租户读同样只读。
+  // readonly = 切入态 ∪ 外租户深链读,统一下传子 tab。
   const isTenantSwitched = useIsTenantSwitched();
+  const isForeignRead = readScope != null && readScope !== identity?.homeTenantId;
+  const readonly = isTenantSwitched || isForeignRead;
 
   const [base, setBase] = useState<KnowledgeBase | null>(null);
   const [loading, setLoading] = useState(true);
@@ -158,12 +167,12 @@ export function KnowledgeDetail() {
           style={{ marginBottom: 16 }}
           data-testid="knowledge-needs-reindex"
           action={
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Button
                 size="small"
                 type="primary"
                 loading={reindexing}
-                disabled={isTenantSwitched}
+                disabled={readonly}
                 onClick={() => void handleReindex()}
                 data-testid="knowledge-reindex-btn"
               >
@@ -181,7 +190,7 @@ export function KnowledgeDetail() {
         onChange={(k) =>
           navigate(
             `/knowledge/${encodeURIComponent(name)}/${k}${
-              tenantParam !== null ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
+              tenantParam ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
             }`,
           )
         }
@@ -192,9 +201,13 @@ export function KnowledgeDetail() {
         ]}
       />
 
-      {activeTab === "documents" && <DocumentsTab baseName={name} />}
-      {activeTab === "test" && <RetrievalTestTab base={base} />}
-      {activeTab === "settings" && <SettingsTab base={base} onSaved={refresh} />}
+      {activeTab === "documents" && (
+        <DocumentsTab baseName={name} readScope={readScope} readonly={readonly} />
+      )}
+      {activeTab === "test" && <RetrievalTestTab base={base} readScope={readScope} />}
+      {activeTab === "settings" && (
+        <SettingsTab base={base} onSaved={refresh} readonly={readonly} />
+      )}
     </div>
   );
 }

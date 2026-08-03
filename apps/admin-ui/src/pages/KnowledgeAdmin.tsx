@@ -24,6 +24,7 @@ import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { CreateBaseModal } from "../components/CreateBaseModal";
 import { PageHeader } from "../components/PageHeader";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
+import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
 
@@ -165,7 +166,10 @@ export function KnowledgeAdmin() {
         key: "actions",
         width: 60,
         render: (_: unknown, record) => (
-          <ReadonlyTooltip on={writeDisabled}>
+          <ReadonlyTooltip
+            on={writeDisabled}
+            title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+          >
             <Popconfirm
               title={t("knowledge_page.delete_base_confirm_title", { name: record.name })}
               description={t("knowledge_page.delete_base_confirm_body")}
@@ -213,7 +217,10 @@ export function KnowledgeAdmin() {
             >
               {t("common.refresh")}
             </Button>
-            <ReadonlyTooltip on={writeDisabled}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.5} />}
@@ -243,7 +250,7 @@ export function KnowledgeAdmin() {
         columns={columns}
         // Two tenants may own a same-named base in the "*" aggregate — key
         // the row by (tenant, name) so they never collide.
-        rowKey={(r) => `${r.tenant_id ?? "home"}:${r.name}`}
+        rowKey={(r) => tenantRowKey(r.tenant_id, r.name)}
         dataSource={bases}
         loading={loading}
         pagination={false}

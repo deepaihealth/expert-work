@@ -440,6 +440,18 @@ class DbTokenUsageStore(TokenUsageStore):
         # ``_SET_AUDIT_READER_ROLE``); ``SET LOCAL`` is transaction-scoped
         # and the whole loop runs inside ONE session/transaction, so one
         # SET covers every page.
+        #
+        # NOTE (Y4 operability follow-up, as on ``list_for_tenant_window``):
+        # all pages stream inside ONE session, so a very large window holds a
+        # read transaction (+ connection) open for the whole scan — and this
+        # variant scans EVERY tenant's rows, so it grows with the whole
+        # platform, not one tenant. Acceptable for the W4 usage-aggregate
+        # cadence; revisit with per-page sessions (or push the rollup into a
+        # SQL GROUP BY — recorded follow-up) if it runs behind
+        # transaction-mode pooling or the table accumulates millions of rows
+        # per month. The window predicate has no leading ``tenant_id``, so it
+        # depends on the ``observed_at``-leading ``token_usage_time_idx``
+        # (migration 0140) — the 0036 indexes all lead with ``tenant_id``.
         page_size = 5000
         out: list[TokenUsageRecord] = []
         after_id = 0

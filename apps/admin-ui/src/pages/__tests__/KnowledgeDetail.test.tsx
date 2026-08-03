@@ -26,6 +26,40 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
   );
 });
 
+const { HOME_TENANT, FOREIGN_TENANT } = vi.hoisted(() => ({
+  // 归属租户(mock identity 的 homeTenantId)。
+  HOME_TENANT: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  // 外租户(聚合行跳转的深链目标)。
+  FOREIGN_TENANT: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+}));
+
+// Identity mock — homeTenantId=HOME_TENANT(W4 readonly 判定要比对
+// homeTenantId;真 AuthProvider 要拉 /v1/me,直接 mock useAuth 更确定)。
+vi.mock("../../auth/AuthContext", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../auth/AuthContext")>();
+  return {
+    ...original,
+    useAuth: () => ({
+      status: "authenticated" as const,
+      identity: {
+        kind: "jwt" as const,
+        subject: "u1",
+        subjectType: "user" as const,
+        homeTenantId: HOME_TENANT,
+        roles: ["system_admin"],
+        isSystemAdmin: true,
+        homeIsPlatform: false,
+        displayName: "u1",
+        serverResolved: true,
+      },
+      token: "test-token",
+      login: () => {},
+      logout: () => {},
+      refreshIdentity: async () => {},
+    }),
+  };
+});
+
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
   isTenantSwitchedMock: vi.fn(() => false),
@@ -216,6 +250,98 @@ describe("KnowledgeDetail", () => {
     renderDetail("/knowledge/support-docs?tenant_id=tenant-2-xxxx");
     await waitFor(() =>
       expect(getBaseSpy).toHaveBeenCalledWith("support-docs", "tenant-2-xxxx"),
+    );
+  });
+});
+
+// ─── Cross-tenant W4(review C-2)— 子 tab readScope 接线 + readonly 跟随读目标 ───
+
+describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
+  it("deep-link ?tenant_id= threads into the documents read (readScope prop)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
+
+    // 把 DocumentsTab 的 readScope prop 换回 ambient("*" 折叠 undefined)
+    // 这里必须红。
+    await waitFor(() =>
+      expect(listSpy).toHaveBeenCalledWith("support-docs", FOREIGN_TENANT),
+    );
+  });
+
+  it('"*" 聚合 + 外租户深链 → 写控件置灰(readonly 跟随读目标)', async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    // 页面级 reindex + DocumentsTab 的删除各断一处(写接口按 name 绑归属
+    // 租户,点了会误伤 home 同名库)。
+    expect(screen.getByTestId("knowledge-reindex-btn")).toBeDisabled();
+    expect(
+      screen.getByTestId("doc-delete-22222222-2222-2222-2222-222222222222"),
+    ).toBeDisabled();
+  });
+
+  it('"*" 聚合无深链(读归属租户)→ 保持可写(防"一律置灰"退化)', async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    expect(screen.getByTestId("knowledge-reindex-btn")).toBeEnabled();
+    expect(
+      screen.getByTestId("doc-delete-22222222-2222-2222-2222-222222222222"),
+    ).toBeEnabled();
+  });
+
+  it("settings 外租户深链置灰保存/重建索引(readonly prop 下传)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail(`/knowledge/support-docs/settings?tenant_id=${FOREIGN_TENANT}`);
+    await waitFor(() =>
+      expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument(),
+    );
+
+    const tab = screen.getByTestId("knowledge-settings-tab");
+    expect(within(tab).getByTestId("kb-settings-save")).toBeDisabled();
+    expect(within(tab).getByTestId("kb-settings-reindex")).toBeDisabled();
+  });
+
+  it("换 tab 保留 ?tenant_id=:documents→test 后检索测试仍读外租户(MUT-11)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const testSpy = vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
+      query: "q",
+      count: 0,
+      results: [],
+    });
+
+    renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
+    await waitFor(() => expect(screen.getByTestId("knowledge-detail-root")).toBeInTheDocument());
+
+    // Tabs onChange 丢掉 ``?tenant_id=`` 保留(MUT-11)→ readScope 落回
+    // ambient("*" 折叠 undefined)→ 这里读到 undefined → 红。
+    await userEvent.click(screen.getByRole("tab", { name: "Retrieval test" }));
+    await waitFor(() => expect(screen.getByTestId("knowledge-test-tab")).toBeInTheDocument());
+    await userEvent.type(screen.getByTestId("kb-test-query"), "q");
+    await userEvent.click(screen.getByTestId("kb-test-run"));
+
+    await waitFor(() =>
+      expect(testSpy).toHaveBeenCalledWith(
+        "support-docs",
+        expect.objectContaining({ query: "q" }),
+        FOREIGN_TENANT,
+      ),
     );
   });
 });

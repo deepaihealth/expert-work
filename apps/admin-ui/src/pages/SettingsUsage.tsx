@@ -46,6 +46,7 @@ import {
 } from "../api/usage";
 import { formatMicros } from "../utils/money";
 import { cacheHitRate, formatHitRate } from "../utils/cache";
+import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
 
@@ -283,7 +284,8 @@ export function SettingsUsage() {
       <PageHeader
         icon={<Gauge size={18} strokeWidth={1.5} />}
         title={t("usage.page_title")}
-        subtitle={t("usage.subtitle")}
+        // W4(review M4)— 聚合态口径换成平台全租户(照 empty_cross 模式)。
+        subtitle={t(isAggregate ? "usage.subtitle_cross" : "usage.subtitle")}
         actions={
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <DatePicker
@@ -347,7 +349,7 @@ export function SettingsUsage() {
             columns={costColumns}
             dataSource={cost?.groups ?? []}
             // W4 — per-tenant buckets repeat ``key`` in the "*" aggregate.
-            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
+            rowKey={(r) => tenantRowKey(r.tenant_id, r.key)}
             loading={loading}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
@@ -410,7 +412,7 @@ export function SettingsUsage() {
             dataSource={
               groupBy === "agent" ? (tokens?.by_agent ?? []) : (tokens?.by_model ?? [])
             }
-            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
+            rowKey={(r) => tenantRowKey(r.tenant_id, r.key)}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
             style={{ marginBottom: 24 }}
@@ -426,7 +428,7 @@ export function SettingsUsage() {
           <Table<TokenGroup>
             columns={kindColumns}
             dataSource={tokens?.by_kind ?? []}
-            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
+            rowKey={(r) => tenantRowKey(r.tenant_id, r.key)}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
             data-testid="usage-token-kind-table"

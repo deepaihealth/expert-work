@@ -26,6 +26,7 @@ export interface TranslationKeys {
     copy: string;
     copied: string;
     tenant_switched_readonly: string;
+    cross_tenant_readonly: string;
   };
   theme: {
     switch_to_light: string;
@@ -2765,6 +2766,7 @@ export interface TranslationKeys {
   usage: {
     page_title: string;
     subtitle: string;
+    subtitle_cross: string;
     group_by_agent: string;
     group_by_model: string;
     col_tenant: string;
@@ -2914,6 +2916,8 @@ const en: TranslationKeys = {
     copied: "Copied",
     tenant_switched_readonly:
       "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
+    cross_tenant_readonly:
+      "The all-tenants view is read-only — switch into a specific tenant to make changes",
   },
   theme: {
     switch_to_light: "Switch to Light",
@@ -5932,6 +5936,8 @@ const en: TranslationKeys = {
   usage: {
     page_title: "Usage",
     subtitle: "Billed cost and token usage for your tenant this month.",
+    subtitle_cross:
+      "Billed cost and token usage across every tenant on the platform this month (bucketed per tenant).",
     group_by_agent: "By Agent",
     group_by_model: "By Model",
     col_tenant: "Tenant",

@@ -23,8 +23,6 @@ import {
   type KnowledgeDocument,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
@@ -47,13 +45,20 @@ function errMessage(err: unknown): string {
       : "unknown error";
 }
 
-export function DocumentsTab({ baseName }: { baseName: string }) {
+interface DocumentsTabProps {
+  baseName: string;
+  /** Cross-tenant W4(review C-2)— 权威读口径:URL ``?tenant_id=`` 原样透
+   *  传优先;无 URL 参数时取 ambient scope("*" 折叠成 undefined),由
+   *  KnowledgeDetail 统一下传。 */
+  readScope: string | undefined;
+  /** Cross-tenant W4(review C-2)— 只读态(切入态 ∪ "*" 聚合深链外租户
+   *  读),由 KnowledgeDetail 统一判定下传;上传/重入库/删除一律置灰。 */
+  readonly: boolean;
+}
+
+export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — subordinate detail read: concrete UUID only ("*" 400s).
-  const { apiTenantScope } = useTenantScope();
-  // Cross-tenant W3 — 切入态只读:上传/重入库/删除是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(false);
@@ -65,14 +70,14 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
     async ({ quiet = false }: { quiet?: boolean } = {}) => {
       if (!quiet) setLoading(true);
       try {
-        setDocuments(await listDocuments(baseName, concreteTenantScope(apiTenantScope)));
+        setDocuments(await listDocuments(baseName, readScope));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
         if (!quiet) setLoading(false);
       }
     },
-    [baseName, message, apiTenantScope],
+    [baseName, message, readScope],
   );
 
   useEffect(() => {
@@ -219,12 +224,12 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
                 data-testid={`doc-chunks-${record.id}`}
               />
             </Tooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Tooltip title={t("knowledge_page.reingest")}>
                 <Button
                   size="small"
                   type="text"
-                  disabled={isTenantSwitched}
+                  disabled={readonly}
                   icon={<RefreshCw size={14} strokeWidth={1.5} />}
                   onClick={() => void handleReingest(record.id)}
                   aria-label={t("knowledge_page.reingest")}
@@ -232,19 +237,19 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
                 />
               </Tooltip>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Popconfirm
                 title={t("knowledge_page.delete_doc_confirm_title", { name: record.filename })}
                 onConfirm={() => void handleDelete(record.id)}
                 okText={t("knowledge_page.delete")}
                 okButtonProps={{ danger: true }}
-                disabled={isTenantSwitched}
+                disabled={readonly}
               >
                 <Button
                   size="small"
                   danger
                   type="text"
-                  disabled={isTenantSwitched}
+                  disabled={readonly}
                   icon={<Trash2 size={13} strokeWidth={1.5} />}
                   aria-label={t("knowledge_page.delete")}
                   data-testid={`doc-delete-${record.id}`}
@@ -255,19 +260,19 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
         ),
       },
     ],
-    [t, handleReingest, handleDelete, isTenantSwitched],
+    [t, handleReingest, handleDelete, readonly],
   );
 
   return (
     <div data-testid="knowledge-documents-tab">
-      <ReadonlyTooltip on={isTenantSwitched} block>
+      <ReadonlyTooltip on={readonly} block>
         <div style={{ marginBottom: 16 }}>
           <Upload.Dragger
             accept={SUPPORTED_DOCUMENT_EXTENSIONS.join(",")}
             showUploadList={false}
             multiple
             beforeUpload={(file) => handleUpload(file)}
-            disabled={uploading || isTenantSwitched}
+            disabled={uploading || readonly}
             data-testid="doc-upload-dragger"
           >
             <p className="ant-upload-text">{t("knowledge_page.upload_dragger_hint")}</p>
@@ -289,6 +294,7 @@ export function DocumentsTab({ baseName }: { baseName: string }) {
 
       <SegmentPreviewDrawer
         baseName={baseName}
+        readScope={readScope}
         document={previewDoc}
         onClose={() => setPreviewDoc(null)}
       />

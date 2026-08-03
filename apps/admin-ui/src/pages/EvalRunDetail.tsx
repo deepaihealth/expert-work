@@ -61,8 +61,9 @@ export function EvalRunDetail() {
   // undefined) wins over the ambient switched-in scope.
   const { apiTenantScope } = useTenantScope();
   const [searchParams] = useSearchParams();
+  // ``||``(非 ``??``):``?tenant_id=`` 空串落回 ambient 分支,不拼空参 422。
   const readScope =
-    searchParams.get("tenant_id") ?? concreteTenantScope(apiTenantScope);
+    searchParams.get("tenant_id") || concreteTenantScope(apiTenantScope);
 
   const [run, setRun] = useState<EvalRunRecord | null>(null);
   const [cases, setCases] = useState<EvalCaseResult[]>([]);

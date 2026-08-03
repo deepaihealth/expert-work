@@ -5,7 +5,7 @@
  * MemoryRouter so ``useParams`` resolves ``:runId``. Terminal status keeps
  * the live-poll timer off.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
@@ -16,6 +16,18 @@ import "../../i18n";
 import * as evalSdk from "../../api/eval_runs";
 import { EvalRunDetail } from "../EvalRunDetail";
 import type { EvalCaseResult, EvalRunRecord } from "../../api/eval_runs";
+
+// Cross-tenant W3/W4 — 共享 tenant scope mock 工厂;undefined = home 态,
+// UUID = 切入态。W4 优先级用例必须把 ambient 设成「另一个」租户,否则
+// ``??`` 两个方向不可分(review IMPORTANT-4)。
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
 
 const RUN_ID = "11111111-1111-1111-1111-111111111111";
 
@@ -65,6 +77,10 @@ function renderPage(initial = `/eval-runs/${RUN_ID}`) {
   );
 }
 
+beforeEach(() => {
+  scopeRef.current = undefined;
+});
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("EvalRunDetail", () => {
@@ -89,7 +105,10 @@ describe("EvalRunDetail", () => {
     await waitFor(() => expect(screen.getByTestId("eval-detail-error")).toBeInTheDocument());
   });
 
-  it("URL ?tenant_id= wins for both reads (W4 aggregate row-jump)", async () => {
+  it("URL ?tenant_id= wins over the ambient scope for both reads (W4 aggregate row-jump)", async () => {
+    // Ambient scope is a DIFFERENT switched-in tenant — the URL param must
+    // still win. 交换优先级(ambient 优先)→ 这里读到 3333… → 红。
+    scopeRef.current = "33333333-3333-3333-3333-333333333333";
     const runSpy = vi.spyOn(evalSdk, "getEvalRun").mockResolvedValue(RUN);
     const casesSpy = vi.spyOn(evalSdk, "getEvalRunCases").mockResolvedValue({ cases: [] });
 

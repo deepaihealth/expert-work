@@ -28,6 +28,7 @@ const zhCN: TranslationKeys = {
     copy: "复制",
     copied: "已复制",
     tenant_switched_readonly: "已切入租户,只读视角——写操作请切回归属租户",
+    cross_tenant_readonly: "全部租户视图为只读——写操作请切入具体租户",
   },
   theme: {
     switch_to_light: "切到 Light",
@@ -2925,6 +2926,7 @@ const zhCN: TranslationKeys = {
   usage: {
     page_title: "用量",
     subtitle: "本月你所在租户的计费成本与 token 用量。",
+    subtitle_cross: "本月平台全部租户的计费成本与 token 用量(按租户分桶)。",
     group_by_agent: "按智能体",
     group_by_model: "按模型",
     col_tenant: "租户",

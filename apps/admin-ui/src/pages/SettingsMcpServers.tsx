@@ -384,7 +384,10 @@ export function SettingsMcpServers() {
                   {t("mcp_servers.test")}
                 </Button>
               )}
-              <ReadonlyTooltip on={writeDisabled}>
+              <ReadonlyTooltip
+                on={writeDisabled}
+                title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+              >
                 <Popconfirm
                   title={t("mcp_servers.remove_confirm", { name: row.displayName })}
                   onConfirm={() => void handleRemovePlatform(row.catalogId)}
@@ -415,7 +418,10 @@ export function SettingsMcpServers() {
             >
               {t("mcp_servers.test")}
             </Button>
-            <ReadonlyTooltip on={writeDisabled}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 size="small"
                 disabled={writeDisabled}
@@ -425,7 +431,10 @@ export function SettingsMcpServers() {
                 {t("mcp_servers.edit")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={writeDisabled}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Button
                 size="small"
                 disabled={writeDisabled}
@@ -435,7 +444,10 @@ export function SettingsMcpServers() {
                 {s.enabled ? t("mcp_servers.act_stop") : t("mcp_servers.act_run")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={writeDisabled}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <Popconfirm
                 title={t("mcp_servers.delete_confirm", { name: s.name })}
                 onConfirm={() => void handleDelete(s.name)}
@@ -517,7 +529,10 @@ export function SettingsMcpServers() {
       >
         {t("mcp_servers.empty_hint")}
       </div>
-      <ReadonlyTooltip on={writeDisabled}>
+      <ReadonlyTooltip
+        on={writeDisabled}
+        title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+      >
         <Button type="primary" disabled={writeDisabled} onClick={openCreate}>
           {t("mcp_servers.add")}
         </Button>
@@ -532,7 +547,10 @@ export function SettingsMcpServers() {
         title={t("mcp_servers.page_title")}
         subtitle={t("mcp_servers.subtitle")}
         actions={
-          <ReadonlyTooltip on={writeDisabled}>
+          <ReadonlyTooltip
+            on={writeDisabled}
+            title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+          >
             <Button
               type="primary"
               disabled={writeDisabled}

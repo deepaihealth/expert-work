@@ -17,6 +17,12 @@ Membership (``GRANT audit_reader TO <app_role>``) is provisioned per
 deployment, as for the existing audit/ledger readers — not encoded here,
 because the application LOGIN role name is environment-specific.
 
+The cross-tenant scan also gets a plain ``observed_at``-leading index
+(review IMPORTANT-2): both existing 0036 indexes lead with ``tenant_id``,
+so the tenant-less window predicate of ``list_window_all_tenants``
+(``observed_at >= start AND observed_at < end``) would otherwise fall
+back to a sequential scan over the whole append-only table.
+
 Revision ID: 0140_token_usage_audit_grant
 Revises: 0139_agent_run_pending_sweep
 """
@@ -36,11 +42,14 @@ __all__ = ["branch_labels", "depends_on", "down_revision", "downgrade", "revisio
 
 _TABLE = "token_usage"
 _READER_ROLE = "audit_reader"
+_TIME_INDEX = "token_usage_time_idx"
 
 
 def upgrade() -> None:
     op.execute(f"GRANT SELECT ON TABLE {_TABLE} TO {_READER_ROLE};")
+    op.create_index(_TIME_INDEX, _TABLE, ["observed_at"])
 
 
 def downgrade() -> None:
+    op.drop_index(_TIME_INDEX, table_name=_TABLE)
     op.execute(f"REVOKE SELECT ON TABLE {_TABLE} FROM {_READER_ROLE};")  # noqa: S608

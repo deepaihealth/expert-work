@@ -48,6 +48,7 @@ import {
   type QualityDriftAlert,
   type QualityScore,
 } from "../api/quality";
+import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
 
@@ -448,7 +449,7 @@ export function SettingsQuality() {
             <Table<AgentTrend>
               // W4 — two tenants may run a same-named agent in the "*"
               // aggregate; key the row by (tenant, agent).
-              rowKey={(r) => `${r.tenant_id ?? ""}:${r.agent}`}
+              rowKey={(r) => tenantRowKey(r.tenant_id, r.agent)}
               columns={trendColumns}
               dataSource={trends}
               pagination={false}
