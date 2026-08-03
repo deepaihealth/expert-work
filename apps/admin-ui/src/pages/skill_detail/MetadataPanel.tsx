@@ -12,7 +12,6 @@ import { ShieldAlert, Sparkles, Zap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import type { SkillRecord, SkillVersion } from "../../api/skills";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -24,6 +23,9 @@ interface MetadataPanelProps {
    *  library only — the tenant SDK has no category patch). */
   categoryOptions?: string[];
   onSaveCategory?: (category: string) => Promise<void>;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;改分类是写操作,置灰。 */
+  readonly: boolean;
 }
 
 export function MetadataPanel({
@@ -31,10 +33,9 @@ export function MetadataPanel({
   version,
   categoryOptions,
   onSaveCategory,
+  readonly,
 }: MetadataPanelProps) {
   const { t } = useTranslation();
-  // Cross-tenant W3 — 切入态只读:改分类是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
   const editableCategory = onSaveCategory !== undefined;
   const [categoryDraft, setCategoryDraft] = useState(skill.category ?? "");
   const [savingCategory, setSavingCategory] = useState(false);
@@ -96,11 +97,11 @@ export function MetadataPanel({
                 aria-label={t("platform_skills.detail_category_label")}
                 data-testid="skill-category-input"
               />
-              <ReadonlyTooltip on={isTenantSwitched}>
+              <ReadonlyTooltip on={readonly}>
                 <Button
                   type="primary"
                   loading={savingCategory}
-                  disabled={!categoryDirty || savingCategory || isTenantSwitched}
+                  disabled={!categoryDirty || savingCategory || readonly}
                   onClick={() => void saveCategory()}
                   data-testid="skill-category-save"
                 >

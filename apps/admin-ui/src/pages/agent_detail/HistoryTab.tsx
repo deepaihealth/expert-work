@@ -14,7 +14,7 @@
  * operator sees in the editor.
  */
 import { useCallback, useEffect, useMemo, useState, type Key } from "react";
-import { Alert, Button, Card, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { Alert, Button, Card, Popconfirm, Space, Table, Tag, Typography } from "antd";
 import { DiffEditor } from "@monaco-editor/react";
 import { dump as yamlDump } from "js-yaml";
 import { History, Undo2 } from "lucide-react";
@@ -28,6 +28,7 @@ import {
   type AgentDetailResponse,
   type RevisionSummary,
 } from "../../api/agents";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
@@ -178,15 +179,13 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
         width: 130,
         render: (_: unknown, row: RevisionSummary) =>
           row.spec_sha256 === currentSha ? null : (
-            <Popconfirm
-              title={t("history_tab.rollback_confirm_title", { revision: row.revision })}
-              description={t("history_tab.rollback_confirm_body")}
-              onConfirm={() => void handleRollback(row.revision)}
-              okText={t("history_tab.rollback")}
-              disabled={isTenantSwitched}
-            >
-              <Tooltip
-                title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("history_tab.rollback_confirm_title", { revision: row.revision })}
+                description={t("history_tab.rollback_confirm_body")}
+                onConfirm={() => void handleRollback(row.revision)}
+                okText={t("history_tab.rollback")}
+                disabled={isTenantSwitched}
               >
                 <Button
                   size="small"
@@ -197,8 +196,8 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
                 >
                   {t("history_tab.rollback")}
                 </Button>
-              </Tooltip>
-            </Popconfirm>
+              </Popconfirm>
+            </ReadonlyTooltip>
           ),
       },
     ],

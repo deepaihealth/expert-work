@@ -86,11 +86,20 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.skill import (
     SkillPackageLayoutError,
+    SkillSupportingFile,
     compute_content_hash,
     is_high_risk_skill_version,
     supporting_files_to_jsonable,
 )
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.skill_assets import (
+    ObjectStore as SkillAssetObjectStore,
+)
+from expert_work.runtime.skill_assets import (
+    SkillAssetError,
+    fetch_supporting_file,
+    fetch_supporting_files,
+)
 
 logger = logging.getLogger("expert_work.control_plane.skills")
 
@@ -207,6 +216,20 @@ def _get_skill_subscription_store(request: Request) -> TenantSkillSubscriptionSt
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _get_object_store(request: Request) -> SkillAssetObjectStore | None:
+    """The DURABLE object store for skill assets, or ``None``.
+
+    Local copy of ``platform_skills._get_object_store`` (importing it here
+    would be circular — ``platform_skills`` imports from this module).
+
+    The lifespan sets ``app.state.skill_asset_store`` only when the object
+    store backend is s3-compatible — the in-memory backend loses objects on
+    restart, so externalizing skill bytes to it would corrupt skills. With
+    ``None`` imports stay inline (tighter caps) and reads degrade cleanly.
+    """
+    return getattr(request.app.state, "skill_asset_store", None)
 
 
 def _skill_dict(skill: Skill) -> dict[str, Any]:
@@ -476,10 +499,21 @@ def build_skills_router() -> APIRouter:
         entry = row.supporting_files.get(file_path)
         if entry is None:
             raise HTTPException(status_code=404, detail="supporting file not found")
+        # Dual-read (skill-asset-store): inline rows return their stored
+        # base64 verbatim; external rows fetch + digest-verify the object.
+        content_b64 = entry.content
+        if entry.is_external:
+            try:
+                raw = await fetch_supporting_file(entry, object_store=_get_object_store(request))
+            except SkillAssetError as exc:
+                raise HTTPException(
+                    status_code=502, detail="supporting file asset unavailable"
+                ) from exc
+            content_b64 = base64.b64encode(raw).decode("ascii")
         return JSONResponse(
             status_code=200,
             content={
-                "content": entry.content,
+                "content": content_b64,
                 "size": entry.size,
                 "mime": entry.mime,
             },
@@ -1387,6 +1421,27 @@ def build_skills_router() -> APIRouter:
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
+        # Dual-read (skill-asset-store): inflate external entries back to the
+        # inline shape so the exported ZIP carries real bytes — a round-trip
+        # (export → import) stays lossless either way.
+        supporting_files = version.supporting_files
+        if any(sf.is_external for sf in supporting_files.values()):
+            try:
+                raw_map = await fetch_supporting_files(
+                    supporting_files, object_store=_get_object_store(request)
+                )
+            except SkillAssetError as exc:
+                raise HTTPException(
+                    status_code=502, detail="supporting file assets unavailable"
+                ) from exc
+            supporting_files = {
+                path: SkillSupportingFile(
+                    content=base64.b64encode(raw_map[path]).decode("ascii"),
+                    size=sf.size,
+                    mime=sf.mime,
+                )
+                for path, sf in supporting_files.items()
+            }
         blob = build_skill_zip(
             name=skill.name,
             description=version.description,
@@ -1394,10 +1449,12 @@ def build_skills_router() -> APIRouter:
             required_models=version.required_models,
             prompt_fragment=version.prompt_fragment,
             tool_names=version.tool_names,
+            supporting_files=supporting_files,
             # Round-trip the disclosure mode so an export→re-import keeps the
             # skill lazy/eager as authored (now that lazy is the default, an
             # omitted ``lazy`` would silently re-import a lazy skill as eager).
             lazy=version.lazy_load,
+            version=version.version,
         )
         return Response(
             content=blob,

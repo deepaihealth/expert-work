@@ -17,14 +17,11 @@ import { getBase, listBases, listChunks, listDocuments, testRetrieval } from "..
 import {
   exportSkillVersion,
   getSkill,
-  getSkillVersion,
   getSupportingFile,
   listSkillVersions,
 } from "../skills";
-import { getTrigger } from "../triggers";
-import { getWebhookEndpoint } from "../webhooks";
 import { getEvalRun, getEvalRunCases, listEvalRuns } from "../eval_runs";
-import { getCandidate, getEvalDataset } from "../curation";
+import { getCandidate } from "../curation";
 import { listQualityDriftAlerts, listQualityScores } from "../quality";
 import { getUsageCost, getUsageTokens } from "../usage";
 import {
@@ -253,13 +250,6 @@ describe("skills SDK — tenantScope passthrough", () => {
     expect(calls[0].params?.tenant_id).toBe(TENANT);
   });
 
-  it("getSkillVersion threads tenant_id", async () => {
-    const calls = captureAdapter({ id: "v1" });
-    await getSkillVersion("s1", 3, TENANT);
-    expect(calls[0].url).toBe("/v1/skills/s1/versions/3");
-    expect(calls[0].params?.tenant_id).toBe(TENANT);
-  });
-
   it("exportSkillVersion threads tenant_id", async () => {
     const calls = captureAdapter(new Blob(["zip"]));
     await exportSkillVersion("s1", 3, TENANT);
@@ -271,22 +261,6 @@ describe("skills SDK — tenantScope passthrough", () => {
     const calls = captureAdapter({ content: "", size: 0, mime: "text/plain" });
     await getSupportingFile("s1", 3, "scripts/run.py", TENANT);
     expect(calls[0].url).toBe("/v1/skills/s1/versions/3/supporting-files/scripts/run.py");
-    expect(calls[0].params?.tenant_id).toBe(TENANT);
-  });
-});
-
-describe("triggers / webhooks SDK — tenantScope passthrough", () => {
-  it("getTrigger threads tenant_id", async () => {
-    const calls = captureAdapter({ id: "t1" });
-    await getTrigger("t1", TENANT);
-    expect(calls[0].url).toBe("/v1/triggers/t1");
-    expect(calls[0].params?.tenant_id).toBe(TENANT);
-  });
-
-  it("getWebhookEndpoint threads tenant_id", async () => {
-    const calls = captureAdapter({ id: "w1" });
-    await getWebhookEndpoint("w1", TENANT);
-    expect(calls[0].url).toBe("/v1/webhook-endpoints/w1");
     expect(calls[0].params?.tenant_id).toBe(TENANT);
   });
 });
@@ -321,13 +295,6 @@ describe("curation SDK — tenantScope passthrough", () => {
     const calls = captureAdapter({ id: "c1" });
     await getCandidate("c1", TENANT);
     expect(calls[0].url).toBe("/v1/curation/candidates/c1");
-    expect(calls[0].params?.tenant_id).toBe(TENANT);
-  });
-
-  it("getEvalDataset threads tenant_id", async () => {
-    const calls = captureAdapter({ id: "d1" });
-    await getEvalDataset("d1", TENANT);
-    expect(calls[0].url).toBe("/v1/eval-datasets/d1");
     expect(calls[0].params?.tenant_id).toBe(TENANT);
   });
 });

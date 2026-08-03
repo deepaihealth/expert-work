@@ -78,17 +78,6 @@ export async function listWebhookEndpoints(
   return response.data;
 }
 
-export async function getWebhookEndpoint(
-  endpointId: string,
-  tenantScope?: TenantScope,
-): Promise<WebhookEndpoint> {
-  const response = await apiClient.get<WebhookEndpoint>(
-    `/v1/webhook-endpoints/${encodeURIComponent(endpointId)}`,
-    { params: withTenantScope({}, tenantScope) },
-  );
-  return response.data;
-}
-
 export interface CreateWebhookEndpointBody {
   name: string;
   url: string;

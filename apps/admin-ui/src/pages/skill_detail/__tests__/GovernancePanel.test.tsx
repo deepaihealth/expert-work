@@ -15,15 +15,6 @@ import * as sdk from "../../../api/skill-evolution";
 import type { PromoteRequest } from "../../../api/skill-evolution";
 import type { SkillRecord } from "../../../api/skills";
 
-// Cross-tenant W3(review M-1)— 切入态置灰;组件不挂 Provider,mock 判定
-// hook,``isTenantSwitchedMock`` 可翻转做两态断言。
-const { isTenantSwitchedMock } = vi.hoisted(() => ({
-  isTenantSwitchedMock: vi.fn(() => false),
-}));
-vi.mock("../../../tenant/useIsTenantSwitched", () => ({
-  useIsTenantSwitched: isTenantSwitchedMock,
-}));
-
 import { GovernancePanel } from "../GovernancePanel";
 
 const listMock = vi.spyOn(sdk, "listPromoteRequests");
@@ -66,10 +57,17 @@ function pending(): PromoteRequest {
   };
 }
 
-function renderPanel(props: Parameters<typeof GovernancePanel>[0]) {
+type PanelProps = Parameters<typeof GovernancePanel>[0];
+
+// Cross-tenant W4(D2)— readScope/readonly 由 SkillDetail 下传;默认 home 态
+// (readScope undefined、readonly false),跨租户/只读用例自行覆盖。
+function renderPanel(
+  props: Omit<PanelProps, "readScope" | "readonly"> &
+    Partial<Pick<PanelProps, "readScope" | "readonly">>,
+) {
   return render(
     <App>
-      <GovernancePanel {...props} />
+      <GovernancePanel readScope={undefined} readonly={false} {...props} />
     </App>,
   );
 }
@@ -78,8 +76,6 @@ beforeEach(() => {
   listMock.mockReset();
   requestMock.mockReset();
   approveMock.mockReset();
-  // vitest 4 的 clear 不复位 mockReturnValue — 显式归位防串台。
-  isTenantSwitchedMock.mockReturnValue(false);
   if (typeof window !== "undefined") window.localStorage.clear();
 });
 
@@ -88,6 +84,17 @@ afterEach(() => {
 });
 
 describe("GovernancePanel", () => {
+  // Cross-tenant W4(D2)— pending 列表读把 readScope 透传给 SDK。
+  it("threads readScope through listPromoteRequests (跨租户钻取)", async () => {
+    const scope = "22222222-2222-2222-2222-222222222222";
+    listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
+    renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn(), readScope: scope });
+
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith({ status: "pending", tenantScope: scope }),
+    );
+  });
+
   it("shows the propose button for an agent_private skill with no pending request", async () => {
     listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
     renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn() });
@@ -119,19 +126,23 @@ describe("GovernancePanel", () => {
     expect(screen.queryByTestId("skill-propose-button")).not.toBeInTheDocument();
   });
 
-  // Cross-tenant W3(review M-1)— promote 链路不带 scope,切入态置灰
-  // (上方用例覆盖 home 态可点)。
-  it("切入态置灰提议/批准/驳回(两态)", async () => {
-    isTenantSwitchedMock.mockReturnValue(true);
+  // Cross-tenant W4(D2)— promote 链路不带 scope,readonly(切入态/"*" 聚合
+  // 深链外租户读)由 SkillDetail 下传置灰(上方用例覆盖 home 态可点)。
+  it("readonly 态置灰提议/批准/驳回(两态)", async () => {
     listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
-    const first = renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn() });
+    const first = renderPanel({
+      skill: skill(),
+      isAdmin: false,
+      onChanged: vi.fn(),
+      readonly: true,
+    });
     await waitFor(() =>
       expect(screen.getByTestId("skill-propose-button")).toBeDisabled(),
     );
     first.unmount();
 
     listMock.mockResolvedValue({ items: [pending()], next_cursor: null, cross_tenant: false });
-    renderPanel({ skill: skill(), isAdmin: true, onChanged: vi.fn() });
+    renderPanel({ skill: skill(), isAdmin: true, onChanged: vi.fn(), readonly: true });
     await waitFor(() =>
       expect(screen.getByTestId("skill-approve-button")).toBeDisabled(),
     );
