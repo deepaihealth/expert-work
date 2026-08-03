@@ -19,7 +19,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Alert, Button, Card, Space, Tooltip, Typography } from "antd";
+import { Alert, Button, Card, Space, Typography } from "antd";
 import { dump as yamlDump } from "js-yaml";
 import { RotateCcw, Save } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -28,6 +28,7 @@ import { ApiError } from "../../api/client";
 import { updateAgent, type AgentDetailResponse } from "../../api/agents";
 import { ManifestEditor } from "../../components/manifest-editor";
 import { CONFIG_GROUPS } from "../../components/manifest-editor/groups";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
@@ -134,7 +135,7 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
           >
             {t("manifest_tab.reset")}
           </Button>
-          <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+          <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               size="small"
               type="primary"
@@ -146,7 +147,7 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
             >
               {t("manifest_tab.save")}
             </Button>
-          </Tooltip>
+          </ReadonlyTooltip>
         </Space>
       </div>
 

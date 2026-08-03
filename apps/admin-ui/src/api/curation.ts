@@ -179,17 +179,6 @@ export async function createEvalDataset(
   return response.data;
 }
 
-export async function getEvalDataset(
-  datasetId: string,
-  tenantScope?: TenantScope,
-): Promise<EvalDataset> {
-  const response = await apiClient.get<EvalDataset>(
-    `/v1/eval-datasets/${encodeURIComponent(datasetId)}`,
-    { params: withTenantScope({}, tenantScope) },
-  );
-  return response.data;
-}
-
 export interface PatchEvalDatasetBody {
   name?: string;
   input?: Record<string, unknown>;

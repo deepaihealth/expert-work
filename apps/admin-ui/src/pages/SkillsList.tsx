@@ -28,6 +28,7 @@ import {
 import type { TableColumnsType } from "antd";
 import {
   Boxes,
+  Download,
   FileCode2,
   Globe2,
   Lock,
@@ -47,8 +48,9 @@ import {
   type SkillVisibility,
 } from "../api/skills";
 import { ApiError } from "../api/client";
+import { tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
-import { useTenantScope } from "../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
@@ -184,6 +186,38 @@ export function SkillsList() {
       }
     },
     [message, refresh, t],
+  );
+
+  // W4 D1 — row-level export of the latest version (read op: stays live in
+  // the switched-in state). Scope mirrors the onRow row-jump: a foreign-tenant
+  // row in the "*" aggregate carries its owning tenant; otherwise the ambient
+  // scope collapses to a concrete UUID (or undefined for home).
+  const onExportRow = useCallback(
+    async (record: SkillRecord) => {
+      if (record.latest_version === null) return;
+      const tenantScope =
+        record.tenant_id != null && record.tenant_id !== identity?.homeTenantId
+          ? record.tenant_id
+          : concreteTenantScope(apiTenantScope);
+      try {
+        const blob = await tenantSkillApi.exportVersion(
+          record.id,
+          record.latest_version,
+          tenantScope,
+        );
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${record.name}-v${record.latest_version}.skill`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : "export failed");
+      }
+    },
+    [apiTenantScope, identity, message],
   );
 
   const isCrossTenant = data?.cross_tenant ?? false;
@@ -333,7 +367,29 @@ export function SkillsList() {
         <Text type="secondary" style={{ fontSize: 12 }}>{new Date(iso).toLocaleString()}</Text>
       ),
     },
-  ], [t]);
+    {
+      title: t("skills.col_actions"),
+      key: "actions",
+      width: 120,
+      // Platform rows are read-only in the tenant scope — the tenant
+      // ``/v1/skills/{id}/…/export`` route would 404, so no export there.
+      render: (_: unknown, record) =>
+        record.source === "platform" ? null : (
+          <Button
+            size="small"
+            icon={<Download size={13} strokeWidth={1.75} />}
+            disabled={record.latest_version === null}
+            onClick={(e) => {
+              e.stopPropagation();
+              void onExportRow(record);
+            }}
+            data-testid={`skill-row-export-${record.id}`}
+          >
+            {t("skills.export_zip")}
+          </Button>
+        ),
+    },
+  ], [t, onExportRow]);
 
   return (
     <div data-testid="skills-root">

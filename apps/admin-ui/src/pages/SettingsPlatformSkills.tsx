@@ -40,6 +40,7 @@ import { PageHeader } from "../components/PageHeader";
 import { FieldHelp } from "../components/FieldHelp";
 import {
   bulkUpdatePlatformSkills,
+  exportPlatformSkillVersion,
   importPlatformSkill,
   importPlatformSkillFromGithub,
   importPlatformSkillsFromGithubBatch,
@@ -382,6 +383,29 @@ export function SettingsPlatformSkills() {
     [errText, message, refresh],
   );
 
+  // W4 D1 — row-level export of the latest version as a ``.skill`` ZIP
+  // (mirrors the SkillsList inline export; blob-anchor download pattern
+  // from the detail page's onExport).
+  const onExportRow = useCallback(
+    async (row: PlatformSkill) => {
+      if (row.latest_version === null) return;
+      try {
+        const blob = await exportPlatformSkillVersion(row.id, row.latest_version);
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = `${row.name}-v${row.latest_version}.skill`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        message.error(errText(err));
+      }
+    },
+    [errText, message],
+  );
+
   // Bulk actions over the table's row selection — lock/unlock + archive/activate
   // via the server-side ``POST /v1/platform/skills/batch`` endpoint (one atomic
   // UPDATE, returns the affected count). Two scopes:
@@ -516,7 +540,7 @@ export function SettingsPlatformSkills() {
       {
         title: t("platform_skills.col_actions"),
         key: "actions",
-        width: 200,
+        width: 260,
         render: (_v, row) => (
           <div style={{ display: "flex", gap: 6 }}>
             <Button size="small" onClick={() => openManage(row)} data-testid={`ps-manage-${row.id}`}>
@@ -529,11 +553,19 @@ export function SettingsPlatformSkills() {
             >
               {row.pinned ? t("platform_skills.unpin") : t("platform_skills.pin")}
             </Button>
+            <Button
+              size="small"
+              disabled={row.latest_version === null}
+              onClick={() => void onExportRow(row)}
+              data-testid={`ps-export-${row.id}`}
+            >
+              {t("skills.export_zip")}
+            </Button>
           </div>
         ),
       },
     ],
-    [t, openManage, onPinToggle],
+    [t, openManage, onPinToggle, onExportRow],
   );
 
   const emptyText = (

@@ -342,6 +342,63 @@ describe("SkillsList", () => {
     expect(screen.queryByTestId("skill-locked-pk1")).not.toBeInTheDocument();
   });
 
+  it("行内导出按钮下载最新版且不触发行跳转;切入态不置灰(W4 D1)", async () => {
+    let exportCalls = 0;
+    const routes: RouteHandler[] = [
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({
+          items: [skillRow],
+          platform_items: [
+            { ...skillRow, id: "pk1", name: "platform_search", source: "platform" as const },
+          ],
+          next_cursor: null,
+          cross_tenant: false,
+        }),
+      },
+      {
+        match: (u, m) => u === "/v1/skills/sk1/versions/3/export" && m === "get",
+        respond: () => {
+          exportCalls += 1;
+          return new Blob(["zip"]);
+        },
+      },
+    ];
+    installAdapter(routes);
+    (URL as unknown as { createObjectURL: () => string }).createObjectURL = vi.fn(
+      () => "blob:mock",
+    );
+    (URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL = vi.fn();
+    const downloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download);
+    });
+
+    const user = userEvent.setup();
+    const first = renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("web_search")).toBeInTheDocument());
+    // Platform rows are read-only in the tenant scope — no export button.
+    expect(screen.queryByTestId("skill-row-export-pk1")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("skill-row-export-sk1"));
+    await waitFor(() => expect(exportCalls).toBe(1));
+    expect(downloads).toEqual(["web_search-v3.skill"]);
+    // stopPropagation — the row's navigate must not fire.
+    expect(screen.queryByTestId("skill-detail-root")).not.toBeInTheDocument();
+    first.unmount();
+
+    // 切入态:导出是读操作,按钮不置灰。
+    isTenantSwitchedMock.mockReturnValue(true);
+    installAdapter(routes);
+    renderSkillsRouter();
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-row-export-sk1")).toBeEnabled(),
+    );
+  });
+
   it("creation is import-only — no hand-build drawer; empty state offers Import", async () => {
     // Phase D: the empty-shell "New skill" drawer is removed (it was a dead
     // end). Import .skill is the primary + empty-state CTA.

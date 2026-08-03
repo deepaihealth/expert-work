@@ -265,18 +265,6 @@ export async function listSkillVersions(
   return response.data;
 }
 
-export async function getSkillVersion(
-  skillId: string,
-  versionNumber: number,
-  tenantScope?: TenantScope,
-): Promise<SkillVersion> {
-  const response = await apiClient.get<SkillVersion>(
-    `/v1/skills/${encodeURIComponent(skillId)}/versions/${versionNumber}`,
-    { params: withTenantScope({}, tenantScope) },
-  );
-  return response.data;
-}
-
 export interface ImportSkillZipResponse {
   skill: SkillRecord;
   version: SkillVersion;
