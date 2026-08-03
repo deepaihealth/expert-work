@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from expert_work.persistence.knowledge.base import (
+    ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
     DuplicateKnowledgeBaseError,
@@ -134,6 +135,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         bases = [b for b in self._bases if b.tenant_id == tenant_id]
         return sorted(bases, key=_created_key, reverse=True)
 
+    async def list_bases_all_tenants(
+        self, *, limit: int = ALL_TENANTS_BASES_LIMIT
+    ) -> list[KnowledgeBase]:
+        # W4 — no tenant filter; created_at DESC with id tiebreak (two stable
+        # sorts) matching the SQL implementation byte-for-byte.
+        bases = sorted(self._bases, key=lambda b: b.id.int)
+        return sorted(bases, key=_created_key, reverse=True)[:limit]
+
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         docs = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
         return len(docs), sum(d.chunk_count for d in docs)
@@ -142,6 +151,20 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         stats: dict[UUID, tuple[int, int]] = {}
         for doc in self._documents:
             if doc.tenant_id != tenant_id:
+                continue
+            count, chunks = stats.get(doc.kb_id, (0, 0))
+            stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)
+        return stats
+
+    async def base_stats_many_all_tenants(
+        self, *, kb_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[int, int]]:
+        # W4 — no tenant filter; kb_id is globally unique. Bounded to the
+        # kb_ids of the (capped) aggregate base page.
+        wanted = set(kb_ids)
+        stats: dict[UUID, tuple[int, int]] = {}
+        for doc in self._documents:
+            if doc.kb_id not in wanted:
                 continue
             count, chunks = stats.get(doc.kb_id, (0, 0))
             stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)

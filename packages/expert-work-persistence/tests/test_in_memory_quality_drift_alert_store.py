@@ -68,3 +68,27 @@ async def test_list_alerts_newest_first_and_filtered() -> None:
     assert rows[0].detected_at == base + timedelta(hours=1)  # newest first
     # Other tenant's alert is not visible in this in-memory scope filter.
     assert all(r.tenant_id == tenant for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_list_alerts_all_tenants_id_tiebreak_on_equal_detected_at() -> None:
+    """W4 review C-3 — ``detected_at`` ties order by ``id`` ASC. ``insert``
+    assigns ids in insertion order (list order == id order), so the tie is
+    seeded white-box (precedent: ``test_in_memory_memory_consolidator.py``)
+    in *descending* id order — a dropped id sort degrades to list order and
+    the exact-order assertion goes red. Review #5 — a same-tenant pair rides
+    along so the per-tenant sibling (``list_alerts``) proves the identical
+    tiebreak contract."""
+    store = InMemoryQualityDriftAlertStore()
+    ts = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    tenant_a, tenant_b = uuid4(), uuid4()
+    rec_1 = _alert(tenant=tenant_a, at=ts).model_copy(update={"id": 1})
+    rec_2 = _alert(tenant=tenant_a, at=ts).model_copy(update={"id": 2})
+    rec_3 = _alert(tenant=tenant_b, at=ts).model_copy(update={"id": 3})
+    store._alerts.extend([rec_3, rec_2, rec_1])  # descending id seed
+
+    rows = await store.list_alerts_all_tenants()
+    assert [r.id for r in rows] == [1, 2, 3]
+    # Review #5 — the per-tenant sibling shares the id tiebreak contract.
+    sibling = await store.list_alerts(tenant_id=tenant_a)
+    assert [r.id for r in sibling] == [1, 2]

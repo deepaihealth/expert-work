@@ -356,15 +356,18 @@ async def ensure_tenant_scope_home_fallback(
     """:func:`ensure_tenant_scope` for **list** endpoints whose stores have no
     cross-tenant aggregate reader — W3 read scope.
 
-    The "*" aggregate is a spec non-goal on these surfaces (knowledge / eval /
-    quality / usage / mcp lists): once the resolver has authorized and audited
-    the request, a :class:`CrossTenant` resolution collapses to the caller's
-    home tenant — the pre-scope-threading behavior, mirroring the front-end
+    Once the resolver has authorized and audited the request, a
+    :class:`CrossTenant` resolution collapses to the caller's home tenant —
+    the pre-scope-threading behavior, mirroring the front-end
     ``concreteTenantScope`` convention. Everything else (home fallback, 403
     ``TENANT_NOT_ALLOWED`` / ``CROSS_TENANT_FORBIDDEN``, the switch audit, the
-    HX-8 deployment switch) is exactly :func:`ensure_tenant_scope`. Swap the
-    call site to :func:`ensure_tenant_scope` + a real ``*_all_tenants`` branch
-    once the store grows an aggregate reader (W4 candidate).
+    HX-8 deployment switch) is exactly :func:`ensure_tenant_scope`.
+
+    W4 note: the knowledge / eval / quality / mcp lists moved off this helper
+    to :func:`ensure_tenant_scope` + real ``*_all_tenants`` store branches, and
+    ``GET /v1/mcp-servers/available`` to :func:`ensure_single_tenant_scope`.
+    The only remaining callers are the two ``/v1/usage`` reads (their W4
+    migration is a separate task); retire this helper once they move.
     """
     scope = await ensure_tenant_scope(
         principal,

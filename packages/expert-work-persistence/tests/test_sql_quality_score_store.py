@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -26,6 +26,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.models import QualityScoreRow
 from expert_work.persistence.rls import build_rls_sessionmaker, current_tenant_id_var
 from expert_work.protocol import QualityScoreRecord
 
@@ -210,6 +211,116 @@ async def test_window_stats_tenant_scoped_avg(
         assert empty_count == 0
         assert empty_mean is None
     finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_scores_all_tenants_spans_tenants(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 — the aggregate reader spans tenants. Runs on the container's
+    superuser connection (production posture: the app's superuser connection
+    with the RLS GUC skipped via ``bypass_rls_session``); the app-role RLS
+    store above proves per-tenant reads stay scoped."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        current_tenant_id_var.set(tenant_a)
+        await store.insert(_record(tenant=tenant_a, run=uuid4(), agent="agg-a"))
+        current_tenant_id_var.set(tenant_b)
+        await store.insert(_record(tenant=tenant_b, run=uuid4(), agent="agg-b"))
+
+        rows = await su_store.list_scores_all_tenants()
+        mine = {(r.tenant_id, r.agent_name) for r in rows if r.tenant_id in {tenant_a, tenant_b}}
+        assert mine == {(tenant_a, "agg-a"), (tenant_b, "agg-b")}
+        # agent_name narrows the aggregate the same way as the sibling.
+        only_b = await su_store.list_scores_all_tenants(agent_name="agg-b")
+        assert {r.tenant_id for r in only_b if r.tenant_id in {tenant_a, tenant_b}} == {tenant_b}
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_scores_all_tenants_id_tiebreak_on_equal_observed_at(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 review C-3 — ``observed_at`` ties order by ``id`` ASC. The two
+    rows' ``observed_at`` are equalized via raw UPDATEs issued higher-id
+    first, so the live heap tuples end up in *descending* id order — a
+    dropped tiebreak degrades to heap-scan order and the exact-order
+    assertion goes red."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        agent = f"tie-{uuid4().hex[:8]}"
+        current_tenant_id_var.set(tenant_a)
+        first = await store.insert(_record(tenant=tenant_a, run=uuid4(), agent=agent))
+        current_tenant_id_var.set(tenant_b)
+        second = await store.insert(_record(tenant=tenant_b, run=uuid4(), agent=agent))
+        assert first.id is not None and second.id is not None and first.id < second.id
+
+        ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
+        async with su_engine.begin() as conn:
+            for row_id in (second.id, first.id):  # hi first → live tuples id-descending
+                await conn.execute(
+                    update(QualityScoreRow)
+                    .where(QualityScoreRow.id == row_id)
+                    .values(observed_at=ts)
+                )
+
+        rows = await su_store.list_scores_all_tenants(agent_name=agent)
+        assert [r.id for r in rows] == [first.id, second.id]
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_scores_id_tiebreak_on_equal_observed_at(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 review #5 — the per-tenant sibling (``list_scores``) shares the
+    ``id`` tiebreak contract. Its query is served off the
+    ``(tenant_id, agent_name, observed_at)`` index scanned backward, whose
+    duplicate-key order is heap-TID *descending* — so the UPDATEs equalizing
+    ``observed_at`` are issued lowest-id first (ascending TIDs track ids):
+    without the tiebreak the backward scan yields ids descending and the
+    ascending assertion goes red."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant = uuid4()
+        agent = f"tie-sib-{uuid4().hex[:8]}"
+        current_tenant_id_var.set(tenant)
+        mine = [
+            await store.insert(_record(tenant=tenant, run=uuid4(), agent=agent)) for _ in range(6)
+        ]
+        ids = [r.id for r in mine]
+        assert all(i is not None for i in ids)
+        assert ids == sorted(ids, key=lambda i: i or 0)  # serial ids follow insertion order
+
+        ts = datetime(2035, 2, 1, 12, 0, tzinfo=UTC)
+        async with su_engine.begin() as conn:
+            for row_id in ids:  # lowest id first → new index TIDs ascend with id
+                await conn.execute(
+                    update(QualityScoreRow)
+                    .where(QualityScoreRow.id == row_id)
+                    .values(observed_at=ts)
+                )
+
+        rows = await su_store.list_scores(tenant_id=tenant, agent_name=agent)
+        assert [r.id for r in rows] == ids
+    finally:
+        await su_engine.dispose()
         await engine.dispose()
 
 

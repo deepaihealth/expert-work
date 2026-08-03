@@ -558,11 +558,12 @@ async def test_reingest_missing_document_404(full_setup: FullSetup) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W3 — knowledge 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — knowledge 读端点接跨租户 scope(系统管理员租户切换器)
 #
 # 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
 # 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;详情端点 tenant_id=* →
-# 400 SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# 400 SCOPE_ALL_NOT_SUPPORTED。列表 tenant_id=* → W4 真聚合(全租户行,
+# 每行带 tenant_id)。照 test_agents_api.py W2 先例。
 # ---------------------------------------------------------------------------
 
 
@@ -631,16 +632,63 @@ async def test_knowledge_scope_system_admin_target_tenant_200(full_setup: FullSe
 
 
 @pytest.mark.asyncio
-async def test_knowledge_list_bases_star_falls_back_to_home_tenant(full_setup: FullSetup) -> None:
-    """``tenant_id=*``:KnowledgeStore 无聚合读法(spec 非目标)→ 回落
-    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
-    client, runner, _ = full_setup
+async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: FullSetup) -> None:
+    """W4:system_admin ``tenant_id=*`` 真聚合——全租户 base,每行带
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。
+    Review C-9 — 同名跨租户 pair((tenant_id, name) 唯一,name 不唯一):
+    断言按 (tenant_id, name) 键,两行都在且 tenant_id 不同。"""
+    client, runner, store = full_setup
     await _seed_kb_with_document(client, runner)
+    other_tenant = uuid4()
+    # Same-name pair across tenants — the schema only dedups (tenant_id, name).
+    await store.create_base(tenant_id=other_tenant, name="kb")
+    await store.create_base(tenant_id=other_tenant, name="other-kb")
+
+    # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+    plain = await client.get("/v1/knowledge/bases")
+    assert [b["tenant_id"] for b in plain.json()["bases"]] == [str(_TENANT)]
+
     headers = await _grant_system_admin(client)
     resp = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    # The sys-admin's home tenant is a fresh uuid4 — no bases there.
-    assert resp.json()["bases"] == []
+    by_key = {(b["tenant_id"], b["name"]): b for b in resp.json()["bases"]}
+    assert len(by_key) == len(resp.json()["bases"])  # no row collapsed
+    # Both same-name rows surface with distinct tenant_ids.
+    assert (str(_TENANT), "kb") in by_key
+    assert (str(other_tenant), "kb") in by_key
+    assert (str(other_tenant), "other-kb") in by_key
+    # Stats stay attributed per base across the aggregate.
+    assert by_key[(str(_TENANT), "kb")]["stats"]["document_count"] == 1
+    assert by_key[(str(other_tenant), "kb")]["stats"]["document_count"] == 0
+    assert by_key[(str(other_tenant), "other-kb")]["stats"]["document_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_knowledge_list_bases_star_truncated_flag(
+    full_setup: FullSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W4 二轮 #3:聚合响应带顶层 ``truncated``——聚合页装满 cap 为 true,
+    未装满为 false,非聚合分支恒 false。cap 通过 monkeypatch 端点模块引用的
+    store 侧常量注入(端点用同一常量取页+算 flag,单源)。"""
+    client, _runner, store = full_setup
+    for i in range(3):
+        await store.create_base(tenant_id=uuid4(), name=f"kb-{i}")
+    headers = await _grant_system_admin(client)
+
+    under = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    assert under.status_code == 200, under.text
+    assert under.json()["truncated"] is False  # 3 rows < default cap (200)
+
+    monkeypatch.setattr("control_plane.api.knowledge.ALL_TENANTS_BASES_LIMIT", 2)
+    capped = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    assert capped.status_code == 200, capped.text
+    assert len(capped.json()["bases"]) == 2  # the cap actually bounds the page
+    assert capped.json()["truncated"] is True
+
+    # Non-aggregate branch has no cap — never truncated.
+    plain = await client.get("/v1/knowledge/bases")
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["truncated"] is False
 
 
 _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [

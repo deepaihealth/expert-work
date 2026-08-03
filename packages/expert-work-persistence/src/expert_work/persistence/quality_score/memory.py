@@ -61,6 +61,29 @@ class InMemoryQualityScoreStore(QualityScoreStore):
                 and (agent_name is None or rec.agent_name == agent_name)
                 and (since is None or (rec.observed_at is not None and rec.observed_at >= since))
             ]
+        # id tiebreak (two stable sorts) — same ordering contract as the
+        # all-tenants sibling, matching the SQL implementation byte-for-byte.
+        rows.sort(key=lambda r: r.id or 0)
+        rows.sort(key=lambda r: r.observed_at or datetime.min.replace(tzinfo=UTC), reverse=True)
+        return rows[:limit]
+
+    async def list_scores_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[QualityScoreRecord]:
+        # W4 — no tenant filter; observed_at DESC with id tiebreak (two stable
+        # sorts) matching the SQL implementation byte-for-byte.
+        async with self._lock:
+            rows = [
+                rec
+                for rec in self._by_run.values()
+                if (agent_name is None or rec.agent_name == agent_name)
+                and (since is None or (rec.observed_at is not None and rec.observed_at >= since))
+            ]
+        rows.sort(key=lambda r: r.id or 0)
         rows.sort(key=lambda r: r.observed_at or datetime.min.replace(tzinfo=UTC), reverse=True)
         return rows[:limit]
 

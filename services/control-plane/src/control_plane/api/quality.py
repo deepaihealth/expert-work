@@ -24,9 +24,10 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.tenant_scope import (
+    CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
-    ensure_tenant_scope_home_fallback,
+    ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import QualityDriftAlertStore, QualityScoreStore
@@ -37,6 +38,9 @@ from expert_work.runtime.audit.logger import AuditLogger
 def _score_dict(record: QualityScoreRecord) -> dict[str, Any]:
     return {
         "id": record.id,
+        # W4 response contract — every item carries its owning tenant in both
+        # the aggregate ("*") and the single-tenant branch.
+        "tenant_id": str(record.tenant_id),
         "agent_name": record.agent_name,
         "agent_version": record.agent_version,
         "run_id": str(record.run_id),
@@ -52,6 +56,8 @@ def _score_dict(record: QualityScoreRecord) -> dict[str, Any]:
 def _alert_dict(record: QualityDriftAlertRecord) -> dict[str, Any]:
     return {
         "id": record.id,
+        # W4 response contract — same tenant attribution as ``_score_dict``.
+        "tenant_id": str(record.tenant_id),
         "agent_name": record.agent_name,
         "recent_mean": record.recent_mean,
         "baseline_mean": record.baseline_mean,
@@ -90,9 +96,10 @@ def build_quality_router() -> APIRouter:
         # tenant's quality series from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
-        # to the caller's home tenant (see the shared helper's docstring).
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — real cross-tenant aggregate: "*" reads every tenant via the
+        # store's all-tenants reader; a concrete id keeps the W3 single-tenant
+        # read (see members.py for the pattern).
+        scope = await ensure_tenant_scope(
             request.state.principal,
             tenant_id,
             audit,
@@ -102,10 +109,21 @@ def build_quality_router() -> APIRouter:
         )
         since = datetime.now(tz=UTC) - timedelta(hours=window_h)
         async with applied_scope(scope):
-            rows = await store.list_scores(
-                tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
-            )
-        return JSONResponse(content={"items": [_score_dict(r) for r in rows]})
+            if isinstance(scope, CrossTenant):
+                rows = await store.list_scores_all_tenants(
+                    agent_name=agent_name, since=since, limit=limit
+                )
+            else:
+                rows = await store.list_scores(
+                    tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
+                )
+        return JSONResponse(
+            content={
+                "items": [_score_dict(r) for r in rows],
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            }
+        )
 
     @router.get("/drift-alerts", response_model=None)
     async def list_drift_alerts(
@@ -118,8 +136,8 @@ def build_quality_router() -> APIRouter:
         # W3 read scope — same treatment as ``/scores``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        # W3 — same "*" home collapse as ``/scores``.
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — same "*" aggregate treatment as ``/scores``.
+        scope = await ensure_tenant_scope(
             request.state.principal,
             tenant_id,
             audit,
@@ -129,10 +147,21 @@ def build_quality_router() -> APIRouter:
         )
         since = datetime.now(tz=UTC) - timedelta(hours=window_h)
         async with applied_scope(scope):
-            rows = await store.list_alerts(
-                tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
-            )
-        return JSONResponse(content={"items": [_alert_dict(r) for r in rows]})
+            if isinstance(scope, CrossTenant):
+                rows = await store.list_alerts_all_tenants(
+                    agent_name=agent_name, since=since, limit=limit
+                )
+            else:
+                rows = await store.list_alerts(
+                    tenant_id=scope.tenant_id, agent_name=agent_name, since=since, limit=limit
+                )
+        return JSONResponse(
+            content={
+                "items": [_alert_dict(r) for r in rows],
+                # W4 response contract — aggregate branch flagged for the UI.
+                "cross_tenant": isinstance(scope, CrossTenant),
+            }
+        )
 
     return router
 

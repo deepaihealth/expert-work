@@ -181,11 +181,12 @@ async def test_list_cases(ctx: _Ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W3 — eval-runs 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — eval-runs 读端点接跨租户 scope(系统管理员租户切换器)
 #
 # 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
 # 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;详情端点 tenant_id=* →
-# 400 SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# 400 SCOPE_ALL_NOT_SUPPORTED。列表 tenant_id=* → W4 真聚合(全租户行,
+# 每行带 tenant_id)。照 test_agents_api.py W2 先例。
 # ---------------------------------------------------------------------------
 
 
@@ -227,14 +228,33 @@ async def test_eval_runs_system_admin_target_tenant_200(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_eval_runs_list_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
-    """``tenant_id=*``:EvalRunStore 无聚合读法(spec 非目标)→ 回落
-    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
-    await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
+async def test_eval_runs_list_star_aggregates_all_tenants(ctx: _Ctx) -> None:
+    """W4:system_admin ``tenant_id=*`` 真聚合——全租户行,每行带
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。"""
+    home = (await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})).json()["id"]
+    other_tenant = uuid4()
+    foreign = EvalRunRecord(
+        id=uuid4(),
+        tenant_id=other_tenant,
+        suite="m0_baseline",
+        status=EvalRunStatus.QUEUED,
+        triggered_by=EvalTriggeredBy.MANUAL,
+        created_at=datetime.now(UTC),
+    )
+    await ctx.store.create_run(foreign)
+
+    # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+    plain = await ctx.client.get("/v1/eval-runs")
+    assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
+
     headers = await _grant_system_admin(ctx.client)
     resp = await ctx.client.get("/v1/eval-runs", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["items"] == []
+    body = resp.json()
+    assert body["total"] == 2
+    by_id = {it["id"]: it for it in body["items"]}
+    assert by_id[home]["tenant_id"] == str(_TENANT)
+    assert by_id[str(foreign.id)]["tenant_id"] == str(other_tenant)
 
 
 @pytest.mark.asyncio

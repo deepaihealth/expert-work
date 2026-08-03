@@ -100,7 +100,26 @@ class SqlQualityScoreStore(QualityScoreStore):
             stmt = stmt.where(QualityScoreRow.agent_name == agent_name)
         if since is not None:
             stmt = stmt.where(QualityScoreRow.observed_at >= since)
-        stmt = stmt.order_by(QualityScoreRow.observed_at.desc()).limit(limit)
+        # id tiebreak — same ordering contract as the all-tenants sibling.
+        stmt = stmt.order_by(QualityScoreRow.observed_at.desc(), QualityScoreRow.id).limit(limit)
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_record(row) for row in rows]
+
+    async def list_scores_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[QualityScoreRecord]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        stmt = select(QualityScoreRow)
+        if agent_name is not None:
+            stmt = stmt.where(QualityScoreRow.agent_name == agent_name)
+        if since is not None:
+            stmt = stmt.where(QualityScoreRow.observed_at >= since)
+        stmt = stmt.order_by(QualityScoreRow.observed_at.desc(), QualityScoreRow.id).limit(limit)
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(row) for row in rows]

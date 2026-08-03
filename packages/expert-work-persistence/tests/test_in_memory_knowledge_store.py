@@ -139,6 +139,48 @@ async def test_update_missing_base_returns_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_bases_all_tenants_id_tiebreak_and_cap() -> None:
+    """W4 review C-3/C-5 — ``created_at`` ties order by ``id`` ASC (``.int``)
+    and the aggregate is capped at ``limit``. ``create_base`` always stamps
+    ``now()``, so ties are seeded white-box (precedent:
+    ``test_in_memory_memory_consolidator.py``) in *descending* id order — a
+    dropped tiebreak degrades to seed order and the assertion goes red."""
+    store = InMemoryKnowledgeStore()
+    tenant_a, tenant_b = uuid4(), uuid4()
+    base_1 = await store.create_base(tenant_id=tenant_a, name="tie-1")
+    base_2 = await store.create_base(tenant_id=tenant_b, name="tie-2")
+    ts = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    lo, hi = sorted(
+        (b.model_copy(update={"created_at": ts}) for b in (base_1, base_2)),
+        key=lambda b: b.id.int,
+    )
+    store._bases[:] = [hi, lo]  # descending id seed
+
+    assert [b.id for b in await store.list_bases_all_tenants()] == [lo.id, hi.id]
+    # C-5 — the aggregate is bounded.
+    assert [b.id for b in await store.list_bases_all_tenants(limit=1)] == [lo.id]
+
+
+@pytest.mark.asyncio
+async def test_base_stats_many_all_tenants_bounded_to_kb_ids() -> None:
+    """W4 review C-5 — the aggregate stats reader only aggregates the
+    ``kb_ids`` the (capped) base page returned."""
+    store = InMemoryKnowledgeStore()
+    tenant_a, tenant_b = uuid4(), uuid4()
+    base_a = await store.create_base(tenant_id=tenant_a, name="kb-a")
+    base_b = await store.create_base(tenant_id=tenant_b, name="kb-b")
+    for base, tenant in ((base_a, tenant_a), (base_b, tenant_b)):
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=2
+        )
+
+    stats = await store.base_stats_many_all_tenants(kb_ids=[base_a.id])
+    assert stats == {base_a.id: (1, 2)}  # base_b excluded — outside the page
+    assert await store.base_stats_many_all_tenants(kb_ids=[]) == {}
+
+
+@pytest.mark.asyncio
 async def test_base_stats_counts_documents_and_chunks() -> None:
     store = InMemoryKnowledgeStore()
     tenant = uuid4()

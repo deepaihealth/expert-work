@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -22,6 +23,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError
+from expert_work.persistence.models import KnowledgeBaseRow
 from expert_work.protocol import DocumentStatus, KnowledgeChunk, RetrievalMethod
 
 pytestmark = pytest.mark.integration
@@ -273,6 +275,101 @@ async def test_base_stats_aggregate(sql_store: SqlStoreFixture) -> None:
         many = await store.base_stats_many(tenant_id=tenant)
         assert many[base.id] == (2, 7)
         assert empty.id not in many
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_aggregates(sql_store: SqlStoreFixture) -> None:
+    """W4 — the all-tenants readers span tenants (newest first, per-base
+    stats keyed by globally-unique kb_id). Session container is shared, so
+    assertions filter to this test's tenants."""
+    store, engine = sql_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        base_a = await store.create_base(tenant_id=tenant_a, name="kb-a")
+        base_b = await store.create_base(tenant_id=tenant_b, name="kb-b")
+        doc = await store.upsert_document(tenant_id=tenant_a, kb_id=base_a.id, filename="a.pdf")
+        await store.set_document_status(
+            tenant_id=tenant_a, document_id=doc.id, status=DocumentStatus.READY, chunk_count=3
+        )
+
+        rows = await store.list_bases_all_tenants(limit=500)
+        mine = [b for b in rows if b.tenant_id in {tenant_a, tenant_b}]
+        # Both tenants' bases surface, newest first across tenants.
+        assert [(b.tenant_id, b.name) for b in mine] == [(tenant_b, "kb-b"), (tenant_a, "kb-a")]
+
+        # C-5 — stats are bounded to the kb_ids of the (capped) base page.
+        stats = await store.base_stats_many_all_tenants(kb_ids=[base_a.id, base_b.id])
+        assert stats[base_a.id] == (1, 3)
+        assert base_b.id not in stats  # no documents yet
+        assert await store.base_stats_many_all_tenants(kb_ids=[base_b.id]) == {}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_id_tiebreak_on_equal_created_at(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """W4 review C-3 (2nd round) — ``created_at`` ties order by ``id`` ASC.
+
+    The query has no WHERE, so under the session-scoped container EVERY row in
+    the table joins the sort — with a 2-row tie a dropped tiebreak could still
+    come out ascending by accident (file-scope false green). Eight tied rows
+    are seeded instead, their ``created_at`` equalized via raw UPDATEs issued
+    highest-id first so the live heap tuples land in *descending* id order: a
+    dropped tiebreak cannot happen to emit the full 8-element ascending id
+    sequence, whatever else is in the table."""
+    store, engine = sql_store
+    try:
+        tenants = [uuid4() for _ in range(8)]
+        bases = [
+            await store.create_base(tenant_id=tenant, name=f"tie-{i}")
+            for i, tenant in enumerate(tenants)
+        ]
+        ordered = sorted(bases, key=lambda b: b.id.int)
+        ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
+        async with engine.begin() as conn:
+            for kb in reversed(ordered):  # highest id first → heap id-descending
+                await conn.execute(
+                    update(KnowledgeBaseRow)
+                    .where(KnowledgeBaseRow.id == kb.id)
+                    .values(created_at=ts)
+                )
+
+        rows = await store.list_bases_all_tenants(limit=500)
+        my_tenants = set(tenants)
+        # Postgres uuid byte order == UUID.int order.
+        assert [b.id for b in rows if b.tenant_id in my_tenants] == [b.id for b in ordered]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_respects_limit(sql_store: SqlStoreFixture) -> None:
+    """W4 review #2 — the ``limit`` leg is load-bearing. Two rows are pushed
+    to the global top of the ``created_at DESC`` order (far-future stamps beat
+    every other row in the shared session container), then ``limit=1`` must
+    return exactly the newer one."""
+    store, engine = sql_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        older = await store.create_base(tenant_id=tenant_a, name="limit-older")
+        newer = await store.create_base(tenant_id=tenant_b, name="limit-newer")
+        async with engine.begin() as conn:
+            for kb, ts in (
+                (older, datetime(2036, 1, 1, tzinfo=UTC)),
+                (newer, datetime(2036, 1, 2, tzinfo=UTC)),
+            ):
+                await conn.execute(
+                    update(KnowledgeBaseRow)
+                    .where(KnowledgeBaseRow.id == kb.id)
+                    .values(created_at=ts)
+                )
+
+        rows = await store.list_bases_all_tenants(limit=1)
+        assert [b.id for b in rows] == [newer.id]
     finally:
         await engine.dispose()
 

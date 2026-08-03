@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from expert_work.persistence.knowledge.base import (
+    ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
     DuplicateKnowledgeBaseError,
@@ -220,6 +221,19 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_to_base(row) for row in rows]
 
+    async def list_bases_all_tenants(
+        self, *, limit: int = ALL_TENANTS_BASES_LIMIT
+    ) -> list[KnowledgeBase]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        stmt = (
+            select(KnowledgeBaseRow)
+            .order_by(KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id)
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_to_base(row) for row in rows]
+
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         stmt = select(
             func.count(KnowledgeDocumentRow.id),
@@ -240,6 +254,26 @@ class SqlKnowledgeStore(KnowledgeStore):
                 func.coalesce(func.sum(KnowledgeDocumentRow.chunk_count), 0),
             )
             .where(KnowledgeDocumentRow.tenant_id == tenant_id)
+            .group_by(KnowledgeDocumentRow.kb_id)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+    async def base_stats_many_all_tenants(
+        self, *, kb_ids: Sequence[UUID]
+    ) -> dict[UUID, tuple[int, int]]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        # Bounded to the kb_ids of the (capped) aggregate base page.
+        if not kb_ids:
+            return {}
+        stmt = (
+            select(
+                KnowledgeDocumentRow.kb_id,
+                func.count(KnowledgeDocumentRow.id),
+                func.coalesce(func.sum(KnowledgeDocumentRow.chunk_count), 0),
+            )
+            .where(KnowledgeDocumentRow.kb_id.in_(list(kb_ids)))
             .group_by(KnowledgeDocumentRow.kb_id)
         )
         async with self._sf() as session:
