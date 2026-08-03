@@ -51,10 +51,13 @@ _LOG_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 def _log_safe(value: object | None) -> str | None:
     """Strip control characters (CR/LF included) from principal-derived
     values before logging so a forged claim cannot inject extra log lines
-    (CodeQL py/log-injection)."""
+    (CodeQL py/log-injection). The explicit ``.replace`` chain is the
+    newline barrier CodeQL's taint model recognises; the regex sweeps the
+    remaining control characters."""
     if value is None:
         return None
-    return _LOG_CTRL_CHARS.sub("", str(value))
+    text = str(value).replace("\r", "").replace("\n", "")
+    return _LOG_CTRL_CHARS.sub("", text)
 
 
 def cross_tenant_query_enabled(request: Request) -> bool:
