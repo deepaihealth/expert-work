@@ -176,6 +176,41 @@ describe("SettingsPlatformSkills page", () => {
     expect(screen.getByTestId("ps-pin-toggle-psk-1")).toBeInTheDocument();
   });
 
+  it("row export button downloads the latest version as .skill (W4 D1)", async () => {
+    let exportCalls = 0;
+    installAdapter([
+      {
+        match: (u, m) =>
+          u.endsWith("/platform/skills/psk-1/versions/2/export") && m === "get",
+        respond: () => {
+          exportCalls += 1;
+          return new Blob(["zip"]);
+        },
+      },
+      {
+        match: (u, m) => u.endsWith("/platform/skills") && m === "get",
+        respond: () => raw({ items: [SKILL], total: 1 }),
+      },
+    ]);
+    (URL as unknown as { createObjectURL: () => string }).createObjectURL = vi.fn(
+      () => "blob:mock",
+    );
+    (URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL =
+      vi.fn();
+    const downloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download);
+    });
+
+    renderPage(["system_admin"]);
+    await waitFor(() => expect(screen.getByTestId("ps-export-psk-1")).toBeInTheDocument());
+    await userEvent.click(screen.getByTestId("ps-export-psk-1"));
+    await waitFor(() => expect(exportCalls).toBe(1));
+    expect(downloads).toEqual(["web_search-v2.skill"]);
+  });
+
   it("batch-locks the selected skills via the server-side batch endpoint", async () => {
     const batched: Array<Record<string, unknown>> = [];
     installAdapter([

@@ -66,17 +66,6 @@ export async function listTriggers(
   return response.data;
 }
 
-export async function getTrigger(
-  triggerId: string,
-  tenantScope?: TenantScope,
-): Promise<TriggerRecord> {
-  const response = await apiClient.get<TriggerRecord>(
-    `/v1/triggers/${encodeURIComponent(triggerId)}`,
-    { params: withTenantScope({}, tenantScope) },
-  );
-  return response.data;
-}
-
 export interface CreateTriggerBody {
   agent_name: string;
   agent_version: string;

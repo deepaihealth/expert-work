@@ -38,6 +38,7 @@ import { useTranslation } from "react-i18next";
 import { disableAgent, enableAgent, getAgent, type AgentDetailResponse } from "../api/agents";
 import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
+import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { ConversationsTab } from "./agent_detail/ConversationsTab";
@@ -118,14 +119,14 @@ function AgentKillSwitch({
 
   if (disabled) {
     return (
-      <Popconfirm
-        title={t("agent_detail.enable_confirm")}
-        onConfirm={runEnable}
-        okText={t("agent_detail.enable")}
-        cancelText={t("common.cancel")}
-        disabled={isTenantSwitched}
-      >
-        <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+      <ReadonlyTooltip on={isTenantSwitched}>
+        <Popconfirm
+          title={t("agent_detail.enable_confirm")}
+          onConfirm={runEnable}
+          okText={t("agent_detail.enable")}
+          cancelText={t("common.cancel")}
+          disabled={isTenantSwitched}
+        >
           <Button
             size="small"
             loading={busy}
@@ -135,37 +136,37 @@ function AgentKillSwitch({
           >
             {t("agent_detail.enable")}
           </Button>
-        </Tooltip>
-      </Popconfirm>
+        </Popconfirm>
+      </ReadonlyTooltip>
     );
   }
 
   return (
-    <Popconfirm
-      icon={null}
-      title={t("agent_detail.disable_confirm_title")}
-      description={
-        <div style={{ maxWidth: 280 }}>
-          <div style={{ marginBottom: 8, color: "var(--ew-text-tertiary)", fontSize: 12 }}>
-            {t("agent_detail.disable_confirm_body")}
+    <ReadonlyTooltip on={isTenantSwitched}>
+      <Popconfirm
+        icon={null}
+        title={t("agent_detail.disable_confirm_title")}
+        description={
+          <div style={{ maxWidth: 280 }}>
+            <div style={{ marginBottom: 8, color: "var(--ew-text-tertiary)", fontSize: 12 }}>
+              {t("agent_detail.disable_confirm_body")}
+            </div>
+            <Input.TextArea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder={t("agent_detail.disable_reason_placeholder")}
+              aria-label={t("agent_detail.disable_reason_placeholder")}
+              maxLength={500}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+            />
           </div>
-          <Input.TextArea
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            placeholder={t("agent_detail.disable_reason_placeholder")}
-            aria-label={t("agent_detail.disable_reason_placeholder")}
-            maxLength={500}
-            autoSize={{ minRows: 2, maxRows: 4 }}
-          />
-        </div>
-      }
-      onConfirm={runDisable}
-      okButtonProps={{ danger: true }}
-      okText={t("agent_detail.disable")}
-      cancelText={t("common.cancel")}
-      disabled={isTenantSwitched}
-    >
-      <Tooltip title={isTenantSwitched ? t("common.tenant_switched_readonly") : undefined}>
+        }
+        onConfirm={runDisable}
+        okButtonProps={{ danger: true }}
+        okText={t("agent_detail.disable")}
+        cancelText={t("common.cancel")}
+        disabled={isTenantSwitched}
+      >
         <Button
           size="small"
           danger
@@ -176,8 +177,8 @@ function AgentKillSwitch({
         >
           {t("agent_detail.disable")}
         </Button>
-      </Tooltip>
-    </Popconfirm>
+      </Popconfirm>
+    </ReadonlyTooltip>
   );
 }
 
