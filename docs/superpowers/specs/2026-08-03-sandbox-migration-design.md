@@ -235,7 +235,7 @@ CREATE UNIQUE INDEX ix_sandbox_instance_warm_unique
 | 3 | NAS 原生目录配额 `SetDirQuota` 可行性与数量上限 | 波 3(并行查证) | 停在软配额 + 扫描 job |
 | 4 | 沙箱规格档位(1c/1024MB 会被"规整"到未公开档位) | 波 1 | 按平台实际档位调整,更新 `spec.sandbox` 文档 |
 | 5 | E2B SDK 版本锁 | 全程 | 钉 `e2b==2.24.0` + `e2b-code-interpreter==2.7.0`(<2.25.0),官方配方 |
-| 6 | SandboxGateway 常驻成本(默认 4c8g × 3 副本 ≈ 12c24g ≈ 1900 元/月) | 波 1 铺设时 | 一人规模按 1–2 副本小规格起,压到可接受量级后再按实际负载调 |
+| 6 | Agent Sandbox 控制面常驻成本 | 波 1 压测时 | **测试集群实际已按小规格装**(`sandbox-system` 下 `sandbox-gateway` 与 `sandbox-manager` 各 1 副本、各 2c4Gi request=limit,共 4c8Gi,非官方默认的 4c8g×3),量级约 350 元/月按量。风险不在成本而在**吞吐边界未测**:并发创建沙箱时 gateway 是否成瓶颈,波 1 压测看住,不够再往上加 |
 
 ## 九、测试策略
 
