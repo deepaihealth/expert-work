@@ -74,7 +74,7 @@ export const Forked: Story = {
       forked_from_source: { ...SKILL, id: "src-1", name: "origin-skill" },
       versions: [VERSION],
     });
-    return <LineagePanel skillId="sk-1" />;
+    return <LineagePanel skillId="sk-1" readScope={undefined} />;
   },
 };
 
@@ -85,6 +85,6 @@ export const NoFork: Story = {
       forked_from_source: null,
       versions: [{ ...VERSION, evolution_origin: null, distilled_from_trajectory_key: null }],
     });
-    return <LineagePanel skillId="sk-1" />;
+    return <LineagePanel skillId="sk-1" readScope={undefined} />;
   },
 };

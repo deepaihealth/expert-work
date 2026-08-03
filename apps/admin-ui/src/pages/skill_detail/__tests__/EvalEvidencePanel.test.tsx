@@ -10,15 +10,6 @@ import * as sdk from "../../../api/skill-evolution";
 import type { SkillEvalResult } from "../../../api/skill-evolution";
 import { EvalEvidencePanel } from "../EvalEvidencePanel";
 
-const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
-  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
-  return mockTenantScopeModule(
-    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
-    scopeRef,
-  );
-});
-
 const listMock = vi.spyOn(sdk, "listEvalResults");
 
 function evalResult(overrides: Partial<SkillEvalResult> = {}): SkillEvalResult {
@@ -40,10 +31,12 @@ function evalResult(overrides: Partial<SkillEvalResult> = {}): SkillEvalResult {
   };
 }
 
-function renderPanel() {
+// Cross-tenant W4(D2)— readScope 由 SkillDetail 下传(不再自读 ambient
+// scope);默认 home 态(undefined)。
+function renderPanel(readScope?: string) {
   return render(
     <App>
-      <EvalEvidencePanel skillId="sk-1" />
+      <EvalEvidencePanel skillId="sk-1" readScope={readScope} />
     </App>,
   );
 }
@@ -52,16 +45,15 @@ beforeEach(() => {
   listMock.mockReset();
 });
 afterEach(() => {
-  scopeRef.current = undefined;
   vi.clearAllMocks();
 });
 
 describe("EvalEvidencePanel", () => {
-  it("threads the tenant scope through listEvalResults (跨租户钻取)", async () => {
-    scopeRef.current = "22222222-2222-2222-2222-222222222222";
+  it("threads readScope through listEvalResults (跨租户钻取)", async () => {
+    const scope = "22222222-2222-2222-2222-222222222222";
     listMock.mockResolvedValue([]);
-    renderPanel();
-    await waitFor(() => expect(listMock).toHaveBeenCalledWith("sk-1", scopeRef.current));
+    renderPanel(scope);
+    await waitFor(() => expect(listMock).toHaveBeenCalledWith("sk-1", scope));
   });
 
   it("renders a paired-bar row per eval result", async () => {

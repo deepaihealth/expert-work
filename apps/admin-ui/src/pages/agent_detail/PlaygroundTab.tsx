@@ -203,7 +203,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const docInputRef = useRef<HTMLInputElement>(null);
 
   // #4 cost — fetch the agent model's rate once (per-(provider,model), no tier).
+  // Cross-tenant W4(D2)— rate_card 是 system_admin-only:租户用户不发请求
+  // (否则每次进调试台吃一发静默 403),成本区随现有"无数据"态自然隐藏。
   useEffect(() => {
+    if (!isSystemAdmin) return;
     const model = readModel({ spec: r.spec });
     if (!model.provider || !model.name) return;
     let cancelled = false;
@@ -217,7 +220,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [r.spec]);
+  }, [r.spec, isSystemAdmin]);
 
   // Reset to a fresh draft — no backend session is created here. The thread is
   // created lazily on the first real action (see ``ensureThread``), so opening

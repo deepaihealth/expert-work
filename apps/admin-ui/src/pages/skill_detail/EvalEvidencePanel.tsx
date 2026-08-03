@@ -16,7 +16,6 @@ import {
   type EvalVerdict,
   type SkillEvalResult,
 } from "../../api/skill-evolution";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -36,11 +35,14 @@ function clamp01(v: number): number {
 
 interface EvalEvidencePanelProps {
   skillId: string;
+  /** Cross-tenant W4(D2)— 权威读口径:URL ``?tenant_id=`` 原样透传优先;
+   *  无 URL 参数时取 ambient scope("*" 折叠成 undefined),由 SkillDetail
+   *  统一下传。 */
+  readScope: string | undefined;
 }
 
-export function EvalEvidencePanel({ skillId }: EvalEvidencePanelProps) {
+export function EvalEvidencePanel({ skillId, readScope }: EvalEvidencePanelProps) {
   const { t } = useTranslation();
-  const { apiTenantScope } = useTenantScope();
   const [results, setResults] = useState<SkillEvalResult[] | null>(null);
 
   const verdictLabel = (v: EvalVerdict): string =>
@@ -52,11 +54,11 @@ export function EvalEvidencePanel({ skillId }: EvalEvidencePanelProps) {
 
   const load = useCallback(async () => {
     try {
-      setResults(await listEvalResults(skillId, apiTenantScope));
+      setResults(await listEvalResults(skillId, readScope));
     } catch {
       setResults([]);
     }
-  }, [skillId, apiTenantScope]);
+  }, [skillId, readScope]);
 
   useEffect(() => {
     void load();

@@ -21,7 +21,6 @@ import {
   requestPromote,
   type PromoteRequest,
 } from "../../api/skill-evolution";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -31,6 +30,13 @@ interface GovernancePanelProps {
   isAdmin: boolean;
   /** Refetch the parent skill (visibility flips on approve). */
   onChanged: () => void | Promise<void>;
+  /** Cross-tenant W4(D2)— 权威读口径:URL ``?tenant_id=`` 原样透传优先;
+   *  无 URL 参数时取 ambient scope("*" 折叠成 undefined),由 SkillDetail
+   *  统一下传。 */
+  readScope: string | undefined;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;写控件一律置灰。 */
+  readonly: boolean;
 }
 
 function errMessage(err: unknown): string {
@@ -39,25 +45,31 @@ function errMessage(err: unknown): string {
   return "failed";
 }
 
-export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelProps) {
+export function GovernancePanel({
+  skill,
+  isAdmin,
+  onChanged,
+  readScope,
+  readonly,
+}: GovernancePanelProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3(review M-1)— 切入态只读:提议/批准/驳回是写操作,且
-  // promote 链路不带 scope(切入态下会拿目标租户的 skill.id 打归属租户端点),
-  // 置灰。
-  const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W4(D2)— pending 列表读带 readScope 透传(切入态/聚合跳转
+  // 下读对租户)。提议/批准/驳回是写操作,promote 写链路仍不带 scope(会拿
+  // 目标租户的 skill.id 打归属租户端点)→ 切入态与 "*" 聚合深链(外租户读)
+  // 一律由页面下传的 readonly 置灰。
   const [pending, setPending] = useState<PromoteRequest | null>(null);
   const [busy, setBusy] = useState(false);
 
   const loadPending = useCallback(async () => {
     try {
-      const list = await listPromoteRequests({ status: "pending" });
+      const list = await listPromoteRequests({ status: "pending", tenantScope: readScope });
       setPending(list.items.find((r) => r.skill_id === skill.id) ?? null);
     } catch {
       // Best-effort: the panel still renders its static facts without the queue.
       setPending(null);
     }
-  }, [skill.id]);
+  }, [skill.id, readScope]);
 
   useEffect(() => {
     void loadPending();
@@ -140,11 +152,11 @@ export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelPr
         </Space>
 
         {visibility === "agent_private" && pending === null && (
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip on={readonly}>
             <Button
               icon={<Send size={13} strokeWidth={1.75} />}
               loading={busy}
-              disabled={isTenantSwitched}
+              disabled={readonly}
               onClick={onPropose}
               data-testid="skill-propose-button"
             >
@@ -158,26 +170,26 @@ export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelPr
             <Tag color="gold">{t("skill_evolution.pending_tenant_promotion")}</Tag>
             {isAdmin && (
               <>
-                <ReadonlyTooltip on={isTenantSwitched}>
+                <ReadonlyTooltip on={readonly}>
                   <Button
                     size="small"
                     type="primary"
                     icon={<Check size={13} strokeWidth={2} />}
                     loading={busy}
-                    disabled={isTenantSwitched}
+                    disabled={readonly}
                     onClick={() => void onDecide(true)}
                     data-testid="skill-approve-button"
                   >
                     {t("skill_evolution.approve")}
                   </Button>
                 </ReadonlyTooltip>
-                <ReadonlyTooltip on={isTenantSwitched}>
+                <ReadonlyTooltip on={readonly}>
                   <Button
                     size="small"
                     danger
                     icon={<X size={13} strokeWidth={2} />}
                     loading={busy}
-                    disabled={isTenantSwitched}
+                    disabled={readonly}
                     onClick={() => void onDecide(false)}
                     data-testid="skill-reject-button"
                   >
