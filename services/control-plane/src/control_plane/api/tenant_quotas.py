@@ -15,9 +15,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from control_plane.api._authz import require
 from control_plane.audit import emit
+from control_plane.tenant_scope import (
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+)
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.quota import TenantQuotaStore
-from expert_work.protocol import ALL_TENANTS, AuditAction, Principal, TenantQuotaPatch
+from expert_work.protocol import AuditAction, Principal, TenantQuotaPatch
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.api.tenant_quotas")
@@ -37,15 +42,27 @@ def build_tenant_quotas_router() -> APIRouter:
     @router.get("/{tenant_id}/quotas")
     async def list_tenant_quotas(
         tenant_id: UUID,
+        request: Request,
         principal: Annotated[Principal, Depends(require("quota", "read"))],
         repo: Annotated[TenantQuotaStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        _ensure_tenant_match(principal, tenant_id)
-        rows = await repo.list_by_tenant(tenant_id=tenant_id)
+        # W4 (PR-2) — path-param target through the central resolver: plain
+        # tenant admins keep their 403 on foreign tenants (TENANT_NOT_ALLOWED),
+        # system_admin cross-tenant hits emit SYSTEM_TENANT_SWITCH.
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/tenants/{tenant_id}/quotas",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            rows = await repo.list_by_tenant(tenant_id=scope.tenant_id)
         await emit(
             audit,
-            tenant_id=tenant_id,
+            tenant_id=scope.tenant_id,
             actor_id=principal.subject_id,
             action=AuditAction.QUOTA_CONFIG_READ,
             resource_type="quota",
@@ -63,19 +80,28 @@ def build_tenant_quotas_router() -> APIRouter:
     async def upsert_tenant_quota(
         tenant_id: UUID,
         payload: TenantQuotaPatch,
+        request: Request,
         principal: Annotated[Principal, Depends(require("quota", "write"))],
         repo: Annotated[TenantQuotaStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        _ensure_tenant_match(principal, tenant_id)
-        row = await repo.upsert(
-            tenant_id=tenant_id,
-            patch=payload,
-            updated_by=principal.subject_id,
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="POST /v1/tenants/{tenant_id}/quotas",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        async with applied_scope(scope):
+            row = await repo.upsert(
+                tenant_id=scope.tenant_id,
+                patch=payload,
+                updated_by=principal.subject_id,
+            )
         await emit(
             audit,
-            tenant_id=tenant_id,
+            tenant_id=scope.tenant_id,
             actor_id=principal.subject_id,
             action=AuditAction.QUOTA_CONFIG_WRITE,
             resource_type="quota",
@@ -94,12 +120,22 @@ def build_tenant_quotas_router() -> APIRouter:
     async def delete_tenant_quota(
         tenant_id: UUID,
         quota_id: UUID,
+        request: Request,
         principal: Annotated[Principal, Depends(require("quota", "delete"))],
         repo: Annotated[TenantQuotaStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
-        _ensure_tenant_match(principal, tenant_id)
-        if not await repo.delete(quota_id=quota_id, tenant_id=tenant_id):
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="DELETE /v1/tenants/{tenant_id}/quotas/{quota_id}",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            deleted = await repo.delete(quota_id=quota_id, tenant_id=scope.tenant_id)
+        if not deleted:
             raise HTTPException(
                 status_code=404,
                 detail={
@@ -109,7 +145,7 @@ def build_tenant_quotas_router() -> APIRouter:
             )
         await emit(
             audit,
-            tenant_id=tenant_id,
+            tenant_id=scope.tenant_id,
             actor_id=principal.subject_id,
             action=AuditAction.QUOTA_CONFIG_DELETE,
             resource_type="quota",
@@ -118,31 +154,3 @@ def build_tenant_quotas_router() -> APIRouter:
         )
 
     return router
-
-
-def _ensure_tenant_match(principal: Principal, tenant_id: UUID) -> None:
-    """Block admins from one tenant editing another tenant's quotas.
-
-    JWT principals always carry their own tenant; mTLS service
-    principals carry the system tenant and may be allowed to operate
-    on any (via ``allowed_tenants``) — but for admin endpoints we want
-    the principal's tenant to match the path. Subsystems/15 § 5
-    documents this exact rule for cross-tenant guard.
-    """
-    if principal.tenant_id == tenant_id:
-        return
-    # A principal authorized for every tenant carries the ``ALL_TENANTS`` ("*")
-    # sentinel — system_admin (Stream N) and certain mTLS service principals.
-    # Guard it before the ``in`` test: ``UUID in "*"`` raises TypeError, not a
-    # membership check (mirrors control_plane.tenant_scope's ``!= "*"`` guard).
-    if principal.allowed_tenants == ALL_TENANTS:
-        return
-    if tenant_id in principal.allowed_tenants:
-        return
-    raise HTTPException(
-        status_code=403,
-        detail={
-            "code": "TENANT_MISMATCH",
-            "message": "principal cannot edit quotas for this tenant",
-        },
-    )

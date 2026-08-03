@@ -242,6 +242,8 @@ async def test_viewer_can_read(tc_client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_cross_tenant_edit_rejected(tc_client: AsyncClient) -> None:
+    # W4 (PR-2) — the guard moved to ``ensure_single_tenant_scope``; the 403
+    # code is now the resolver's TENANT_NOT_ALLOWED (was TENANT_MISMATCH).
     other_tenant = uuid4()
     resp = await tc_client.put(
         f"/v1/tenants/{other_tenant}/config",
@@ -249,7 +251,20 @@ async def test_cross_tenant_edit_rejected(tc_client: AsyncClient) -> None:
         json={"display_name": "ACME"},
     )
     assert resp.status_code == 403
-    assert resp.json()["detail"]["code"] == "TENANT_MISMATCH"
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_read_rejected(tc_client: AsyncClient) -> None:
+    """W4 (PR-2) — foreign-tenant reads 403 through the central resolver too."""
+    other_tenant = uuid4()
+    for path in (
+        f"/v1/tenants/{other_tenant}/config",
+        f"/v1/tenants/{other_tenant}/config/credentials",
+    ):
+        resp = await tc_client.get(path, headers={"Authorization": f"Bearer {_admin_token()}"})
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
 
 
 @pytest.mark.asyncio
@@ -270,6 +285,37 @@ async def test_system_admin_reads_other_tenant_config(
     )
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "TENANT_CONFIG_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_system_admin_cross_tenant_config_emits_switch_audit(
+    tc_sysadmin: tuple[AsyncClient, UUID], audit_store: InMemoryAuditLogStore
+) -> None:
+    """W4 (PR-2) — all three tenant_config handlers: a system_admin hitting a
+    foreign tenant succeeds and emits SYSTEM_TENANT_SWITCH with mode/intent."""
+    client, sys_admin_id = tc_sysadmin
+    other_tenant = uuid4()
+    headers = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))}"
+    }
+
+    put = await client.put(
+        f"/v1/tenants/{other_tenant}/config", headers=headers, json={"display_name": "ACME"}
+    )
+    assert put.status_code == 200
+    got = await client.get(f"/v1/tenants/{other_tenant}/config", headers=headers)
+    assert got.status_code == 200
+    creds = await client.get(f"/v1/tenants/{other_tenant}/config/credentials", headers=headers)
+    assert creds.status_code == 200
+
+    page = await audit_store.query(
+        AuditQuery(tenant_id=other_tenant, action=AuditAction.SYSTEM_TENANT_SWITCH)
+    )
+    details = {e.details["endpoint"]: e.details for e in page.entries}
+    assert details["PUT /v1/tenants/{tenant_id}/config"]["intent"] == "write"
+    assert details["GET /v1/tenants/{tenant_id}/config"]["intent"] == "read"
+    assert details["GET /v1/tenants/{tenant_id}/config/credentials"]["intent"] == "read"
+    assert all(d["mode"] == "switch" for d in details.values())
 
 
 # ---------------------------------------------------------------------------

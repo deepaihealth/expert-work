@@ -282,6 +282,8 @@ async def test_viewer_can_read_but_not_write(quota_client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_admin_cannot_edit_other_tenants(quota_client: AsyncClient) -> None:
+    # W4 (PR-2) — the guard moved to ``ensure_single_tenant_scope``; the 403
+    # code is now the resolver's TENANT_NOT_ALLOWED (was TENANT_MISMATCH).
     other_tenant = uuid4()
     payload = TenantQuotaPatch(
         dimension=QuotaDimension.QPS,
@@ -295,7 +297,67 @@ async def test_admin_cannot_edit_other_tenants(quota_client: AsyncClient) -> Non
         json=payload.model_dump(mode="json"),
     )
     assert resp.status_code == 403
-    assert resp.json()["detail"]["code"] == "TENANT_MISMATCH"
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_read_or_delete_other_tenants(quota_client: AsyncClient) -> None:
+    """W4 (PR-2) — GET/DELETE also 403 foreign tenants through the resolver."""
+    other_tenant = uuid4()
+    read = await quota_client.get(
+        f"/v1/tenants/{other_tenant}/quotas",
+        headers={"Authorization": f"Bearer {_admin_token()}"},
+    )
+    assert read.status_code == 403
+    assert read.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+    delete = await quota_client.delete(
+        f"/v1/tenants/{other_tenant}/quotas/{uuid4()}",
+        headers={"Authorization": f"Bearer {_admin_token()}"},
+    )
+    assert delete.status_code == 403
+    assert delete.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_system_admin_cross_tenant_quotas_emit_switch_audit(
+    quota_sysadmin: tuple[AsyncClient, UUID], audit_store: InMemoryAuditLogStore
+) -> None:
+    """W4 (PR-2) — all three tenant_quotas handlers: a system_admin hitting a
+    foreign tenant succeeds and emits SYSTEM_TENANT_SWITCH with mode/intent."""
+    client, sys_admin_id = quota_sysadmin
+    other_tenant = uuid4()
+    headers = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))}"
+    }
+    payload = TenantQuotaPatch(
+        dimension=QuotaDimension.QPS,
+        scope={},
+        limit_value=10,
+        burst=20,
+    )
+    create = await client.post(
+        f"/v1/tenants/{other_tenant}/quotas",
+        headers=headers,
+        json=payload.model_dump(mode="json"),
+    )
+    assert create.status_code == 201
+    quota_id = create.json()["data"]["id"]
+
+    listed = await client.get(f"/v1/tenants/{other_tenant}/quotas", headers=headers)
+    assert listed.status_code == 200
+
+    delete = await client.delete(f"/v1/tenants/{other_tenant}/quotas/{quota_id}", headers=headers)
+    assert delete.status_code == 204
+
+    page = await audit_store.query(
+        AuditQuery(tenant_id=other_tenant, action=AuditAction.SYSTEM_TENANT_SWITCH)
+    )
+    details = {e.details["endpoint"]: e.details for e in page.entries}
+    assert details["POST /v1/tenants/{tenant_id}/quotas"]["intent"] == "write"
+    assert details["GET /v1/tenants/{tenant_id}/quotas"]["intent"] == "read"
+    assert details["DELETE /v1/tenants/{tenant_id}/quotas/{quota_id}"]["intent"] == "write"
+    assert all(d["mode"] == "switch" for d in details.values())
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +647,134 @@ async def test_release_cross_tenant_target_passes_gate_for_mtls_service(
     )
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "RESERVATION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_commit_cross_tenant_target_forbidden_for_user(quota_client: AsyncClient) -> None:
+    """W4 (PR-2) — ``payload.tenant_id`` was trusted unchecked on commit; a
+    tenant-A user naming tenant B must get 403 ``TENANT_NOT_ALLOWED``."""
+    other_tenant = uuid4()
+    resp = await quota_client.post(
+        "/v1/quota/commit",
+        headers={"Authorization": f"Bearer {_operator_token()}"},
+        json={
+            "reservation_id": str(uuid4()),
+            "tenant_id": str(other_tenant),
+            "actual_tokens": 10,
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_commit_cross_tenant_passes_gate_for_mtls_service(
+    mtls_quota_client: AsyncClient,
+) -> None:
+    """mTLS service principals (sandbox supervisor et al.) keep unconditional
+    pass on commit — the unknown reservation surfaces as 404, not 403."""
+    resp = await mtls_quota_client.post(
+        "/v1/quota/commit",
+        headers={"X-Forwarded-Client-Cert": 'Subject="CN=orchestrator,O=expert_work";Hash=abc'},
+        json={
+            "reservation_id": str(uuid4()),
+            "tenant_id": str(uuid4()),
+            "actual_tokens": 10,
+        },
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["code"] == "RESERVATION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_commit_release_cross_tenant_by_system_admin_emit_switch_audit(
+    quota_sysadmin: tuple[AsyncClient, UUID], audit_store: InMemoryAuditLogStore
+) -> None:
+    """W4 (PR-2) — a system_admin naming a foreign tenant on commit/release
+    passes the gate (unknown reservation → 404) and emits SYSTEM_TENANT_SWITCH
+    at authorization time, mirroring the resolver's semantics."""
+    client, sys_admin_id = quota_sysadmin
+    other_tenant = uuid4()
+    headers = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))}"
+    }
+
+    commit = await client.post(
+        "/v1/quota/commit",
+        headers=headers,
+        json={
+            "reservation_id": str(uuid4()),
+            "tenant_id": str(other_tenant),
+            "actual_tokens": 5,
+        },
+    )
+    assert commit.status_code == 404
+
+    release = await client.post(
+        f"/v1/quota/release/{uuid4()}?tenant_id={other_tenant}",
+        headers=headers,
+    )
+    assert release.status_code == 404
+
+    page = await audit_store.query(
+        AuditQuery(tenant_id=other_tenant, action=AuditAction.SYSTEM_TENANT_SWITCH)
+    )
+    details = {e.details["endpoint"]: e.details for e in page.entries}
+    assert details["POST /v1/quota/commit"]["intent"] == "write"
+    assert details["POST /v1/quota/release/{reservation_id}"]["intent"] == "write"
+    assert all(d["mode"] == "switch" for d in details.values())
+
+
+@pytest.mark.asyncio
+async def test_commit_and_release_emit_domain_audit(
+    quota_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """W4 (PR-2) — successful commit/release each leave a domain audit row
+    (QUOTA_COMMIT / QUOTA_RELEASE); check/reserve stay success-silent."""
+    token = _operator_token()
+
+    async def _reserve() -> str:
+        resp = await quota_client.post(
+            "/v1/quota/reserve",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "tenant_id": str(_TENANT),
+                "agent": "alpha",
+                "thread_id": str(uuid4()),
+                "estimated_tokens": 100,
+            },
+        )
+        assert resp.status_code == 200
+        rid: str = resp.json()["reservation_id"]
+        return rid
+
+    commit_id = await _reserve()
+    commit = await quota_client.post(
+        "/v1/quota/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"reservation_id": commit_id, "tenant_id": str(_TENANT), "actual_tokens": 87},
+    )
+    assert commit.status_code == 204
+
+    release_id = await _reserve()
+    release = await quota_client.post(
+        f"/v1/quota/release/{release_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert release.status_code == 204
+
+    commits = await audit_store.query(
+        AuditQuery(tenant_id=_TENANT, action=AuditAction.QUOTA_COMMIT)
+    )
+    assert len(commits.entries) == 1
+    assert commits.entries[0].resource_id == commit_id
+    assert commits.entries[0].details.get("actual_tokens") == 87
+
+    releases = await audit_store.query(
+        AuditQuery(tenant_id=_TENANT, action=AuditAction.QUOTA_RELEASE)
+    )
+    assert len(releases.entries) == 1
+    assert releases.entries[0].resource_id == release_id
 
 
 @pytest.mark.asyncio
