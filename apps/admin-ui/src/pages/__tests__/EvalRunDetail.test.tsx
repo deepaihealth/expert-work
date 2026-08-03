@@ -51,9 +51,9 @@ const CASES: EvalCaseResult[] = [
   },
 ];
 
-function renderPage() {
+function renderPage(initial = `/eval-runs/${RUN_ID}`) {
   return render(
-    <MemoryRouter initialEntries={[`/eval-runs/${RUN_ID}`]}>
+    <MemoryRouter initialEntries={[initial]}>
       <AuthProvider>
         <TenantScopeProvider>
           <Routes>
@@ -87,5 +87,17 @@ describe("EvalRunDetail", () => {
     vi.spyOn(evalSdk, "getEvalRunCases").mockResolvedValue({ cases: [] });
     renderPage();
     await waitFor(() => expect(screen.getByTestId("eval-detail-error")).toBeInTheDocument());
+  });
+
+  it("URL ?tenant_id= wins for both reads (W4 aggregate row-jump)", async () => {
+    const runSpy = vi.spyOn(evalSdk, "getEvalRun").mockResolvedValue(RUN);
+    const casesSpy = vi.spyOn(evalSdk, "getEvalRunCases").mockResolvedValue({ cases: [] });
+
+    renderPage(`/eval-runs/${RUN_ID}?tenant_id=tenant-2-xxxx`);
+
+    await waitFor(() =>
+      expect(runSpy).toHaveBeenCalledWith(RUN_ID, "tenant-2-xxxx"),
+    );
+    expect(casesSpy).toHaveBeenCalledWith(RUN_ID, "tenant-2-xxxx");
   });
 });

@@ -23,6 +23,7 @@ import {
   Statistic,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
@@ -85,6 +86,32 @@ function cacheColumns<T extends TokenCounts>(
   ];
 }
 
+/** Cross-tenant W4 — the owning-tenant column shared by the cost / token /
+ *  kind tables; callers append it only in the "*" aggregate (the backend
+ *  buckets per tenant there and each row carries its ``tenant_id``). */
+function tenantColumn<T extends { tenant_id?: string | null }>(
+  t: (key: string) => string,
+): TableColumnsType<T> {
+  return [
+    {
+      title: t("usage.col_tenant"),
+      dataIndex: "tenant_id",
+      key: "tenant_id",
+      width: 120,
+      render: (v: string | null | undefined) =>
+        v ? (
+          <Tooltip title={v}>
+            <Text code style={{ fontSize: 12 }}>
+              {v.slice(0, 8)}…
+            </Text>
+          </Tooltip>
+        ) : (
+          <Text type="secondary">—</Text>
+        ),
+    },
+  ];
+}
+
 type CostGroupBy = Extract<UsageGroupBy, "agent" | "model">;
 
 function errText(err: unknown): string {
@@ -99,6 +126,9 @@ export function SettingsUsage() {
   const { t } = useTranslation();
   // Cross-tenant W3 — the rollups are scope-aware ("*" aggregates every tenant).
   const { apiTenantScope } = useTenantScope();
+  // Cross-tenant W4 — "*" aggregate: the backend buckets per tenant and each
+  // row carries its owning tenant; surface it as a column.
+  const isAggregate = apiTenantScope === "*";
 
   const [month, setMonth] = useState<Dayjs>(() => dayjs());
   const [groupBy, setGroupBy] = useState<CostGroupBy>("agent");
@@ -147,6 +177,7 @@ export function SettingsUsage() {
           </span>
         ),
       },
+      ...(isAggregate ? tenantColumn<UsageCostGroup>(t) : []),
       {
         title: t("usage.col_input_tokens"),
         dataIndex: "input_tokens",
@@ -175,12 +206,13 @@ export function SettingsUsage() {
         ),
       },
     ],
-    [t],
+    [t, isAggregate],
   );
 
   const tokenColumns: TableColumnsType<TokenGroup> = useMemo(
     () => [
       { title: t("usage.col_key"), dataIndex: "key", key: "key" },
+      ...(isAggregate ? tenantColumn<TokenGroup>(t) : []),
       {
         title: t("usage.col_input_tokens"),
         dataIndex: "input_tokens",
@@ -199,7 +231,7 @@ export function SettingsUsage() {
       },
       ...cacheColumns<TokenGroup>(t),
     ],
-    [t],
+    [t, isAggregate],
   );
 
   const kindColumns: TableColumnsType<TokenGroup> = useMemo(
@@ -224,6 +256,7 @@ export function SettingsUsage() {
           </Tag>
         ),
       },
+      ...(isAggregate ? tenantColumn<TokenGroup>(t) : []),
       {
         title: t("usage.col_input_tokens"),
         dataIndex: "input_tokens",
@@ -242,7 +275,7 @@ export function SettingsUsage() {
       },
       ...cacheColumns<TokenGroup>(t),
     ],
-    [t],
+    [t, isAggregate],
   );
 
   return (
@@ -313,7 +346,8 @@ export function SettingsUsage() {
           <Table<UsageCostGroup>
             columns={costColumns}
             dataSource={cost?.groups ?? []}
-            rowKey={(r) => r.key}
+            // W4 — per-tenant buckets repeat ``key`` in the "*" aggregate.
+            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
             loading={loading}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
@@ -376,7 +410,7 @@ export function SettingsUsage() {
             dataSource={
               groupBy === "agent" ? (tokens?.by_agent ?? []) : (tokens?.by_model ?? [])
             }
-            rowKey={(r) => r.key}
+            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
             style={{ marginBottom: 24 }}
@@ -392,7 +426,7 @@ export function SettingsUsage() {
           <Table<TokenGroup>
             columns={kindColumns}
             dataSource={tokens?.by_kind ?? []}
-            rowKey={(r) => r.key}
+            rowKey={(r) => `${r.tenant_id ?? ""}:${r.key}`}
             pagination={false}
             locale={{ emptyText: t("usage.empty") }}
             data-testid="usage-token-kind-table"

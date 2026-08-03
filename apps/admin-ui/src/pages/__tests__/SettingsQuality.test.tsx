@@ -227,4 +227,43 @@ describe("SettingsQuality page", () => {
     await waitFor(() => expect(seen.scores?.tenant_id).toBe(scopeRef.current));
     expect(seen.alerts?.tenant_id).toBe(scopeRef.current);
   });
+
+  // ─── Cross-tenant W4 — "*" aggregate: tenant column + per-tenant split ──
+
+  it("aggregate splits same-named agents per tenant and shows the tenant column (W4)", async () => {
+    scopeRef.current = "*";
+    installAdapter(
+      [
+        { ...SCORES[0], tenant_id: "tenant-2-xxxx" },
+        { ...SCORES[1], tenant_id: "tenant-3-yyyy" },
+      ],
+      [{ ...ALERTS[0], tenant_id: "tenant-2-xxxx" }],
+    );
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("quality-trend-table")).toBeInTheDocument(),
+    );
+    // Same-named agent in two tenants → two trend rows, not one folded mean.
+    const trendTable = screen.getByTestId("quality-trend-table");
+    expect(within(trendTable).getAllByText("support-bot")).toHaveLength(2);
+    // Tenant column renders the truncated owning tenant on every table.
+    expect(within(trendTable).getByText("tenant-2…")).toBeInTheDocument();
+    expect(within(trendTable).getByText("tenant-3…")).toBeInTheDocument();
+    const driftTable = screen.getByTestId("quality-drift-table");
+    expect(within(driftTable).getByText("tenant-2…")).toBeInTheDocument();
+    const lowTable = screen.getByTestId("quality-low-table");
+    expect(within(lowTable).getByText("tenant-2…")).toBeInTheDocument();
+  });
+
+  it("home scope keeps a single trend row per agent and no tenant column (W4)", async () => {
+    installAdapter(SCORES, ALERTS);
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("quality-trend-table")).toBeInTheDocument(),
+    );
+    // Both scores share one agent + tenant → one trend row (pre-W4 shape).
+    const trendTable = screen.getByTestId("quality-trend-table");
+    expect(within(trendTable).getAllByText("support-bot")).toHaveLength(1);
+    expect(screen.queryByText(/^tenant-/)).not.toBeInTheDocument();
+  });
 });

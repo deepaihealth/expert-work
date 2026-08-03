@@ -85,6 +85,7 @@ export interface TranslationKeys {
     section_trend: string;
     section_low_scores: string;
     col_agent: string;
+    col_tenant: string;
     col_overall: string;
     col_dimensions: string;
     col_rationale: string;
@@ -424,6 +425,8 @@ export interface TranslationKeys {
     failed_to_load: string;
     bases_title: string;
     bases_empty: string;
+    empty_cross: string;
+    col_tenant: string;
     create_base: string;
     create_duplicate: string;
     field_name: string;
@@ -2724,6 +2727,8 @@ export interface TranslationKeys {
     subtitle: string;
     failed_to_load: string;
     empty: string;
+    empty_cross: string;
+    col_tenant: string;
     column_run_id: string;
     column_status: string;
     column_suite: string;
@@ -2761,6 +2766,7 @@ export interface TranslationKeys {
     subtitle: string;
     group_by_agent: string;
     group_by_model: string;
+    col_tenant: string;
     total_billed: string;
     as_of_note: string;
     col_key: string;
@@ -2967,6 +2973,7 @@ const en: TranslationKeys = {
     section_trend: "Per-agent trend",
     section_low_scores: "Lowest-scoring runs",
     col_agent: "Agent",
+    col_tenant: "Tenant",
     col_overall: "Score",
     col_dimensions: "Dimensions",
     col_rationale: "Rationale",
@@ -3332,6 +3339,8 @@ const en: TranslationKeys = {
     failed_to_load: "Failed to load knowledge bases",
     bases_title: "Bases",
     bases_empty: "No knowledge bases yet.",
+    empty_cross: "No tenant has any knowledge bases yet.",
+    col_tenant: "Tenant",
     create_base: "New base",
     create_duplicate: "A knowledge base with this name already exists.",
     field_name: "Name",
@@ -5884,6 +5893,8 @@ const en: TranslationKeys = {
     subtitle: "Trigger and monitor capability evaluation runs.",
     failed_to_load: "Failed to load eval runs",
     empty: "No eval runs yet. Enqueue the baseline suite to start.",
+    empty_cross: "No tenant has any eval runs yet.",
+    col_tenant: "Tenant",
     column_run_id: "Run ID",
     column_status: "Status",
     column_suite: "Suite",
@@ -5921,6 +5932,7 @@ const en: TranslationKeys = {
     subtitle: "Billed cost and token usage for your tenant this month.",
     group_by_agent: "By Agent",
     group_by_model: "By Model",
+    col_tenant: "Tenant",
     total_billed: "Total billed",
     as_of_note: "Cost as of {{time}}; updates hourly.",
     col_key: "Name",

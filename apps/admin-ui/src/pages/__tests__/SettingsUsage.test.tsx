@@ -262,3 +262,70 @@ describe("cross-tenant W3 scope passthrough", () => {
     expect(seen.tokens?.tenant_id).toBe(scopeRef.current);
   });
 });
+
+describe("cross-tenant W4 aggregate", () => {
+  it("shows per-tenant buckets with the tenant column in the '*' scope", async () => {
+    scopeRef.current = "*";
+    // Same agent name in two tenants — the backend keeps them as two
+    // buckets (tenant-keyed) and each row carries its owning tenant.
+    const crossCost = {
+      ...COST,
+      groups: [
+        { ...COST.groups[0], tenant_id: "tenant-2-xxxx" },
+        { ...COST.groups[0], unpriced: false, tenant_id: "tenant-3-yyyy" },
+      ],
+    };
+    const crossTokens = {
+      ...TOKENS,
+      by_agent: [
+        { ...TOKENS.by_agent[0], tenant_id: "tenant-2-xxxx" },
+        { ...TOKENS.by_agent[0], tenant_id: "tenant-3-yyyy" },
+      ],
+      by_kind: TOKENS.by_kind.map((g) => ({ ...g, tenant_id: "tenant-2-xxxx" })),
+    };
+    apiClient.defaults.adapter = (config) => {
+      const url = config.url ?? "";
+      let data: unknown = {};
+      if (url.endsWith("/usage/cost")) {
+        data = { success: true, data: crossCost, error: null };
+      } else if (url.endsWith("/usage/tokens")) {
+        data = { success: true, data: crossTokens, error: null };
+      }
+      return Promise.resolve({
+        data,
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+
+    renderUsage();
+    await waitFor(() => expect(screen.getByTestId("usage-cost-table")).toBeInTheDocument());
+    const costTable = screen.getByTestId("usage-cost-table");
+    const headers = within(costTable)
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(headers.some((h) => /租户|Tenant/.test(h ?? ""))).toBe(true);
+    // Two same-named rows survive, one per tenant, each with its truncated id.
+    expect(within(costTable).getAllByText("support-bot")).toHaveLength(2);
+    expect(within(costTable).getByText("tenant-2…")).toBeInTheDocument();
+    expect(within(costTable).getByText("tenant-3…")).toBeInTheDocument();
+    // Token table shows the tenant column too.
+    const tokenTable = screen.getByTestId("usage-token-table");
+    expect(within(tokenTable).getByText("tenant-2…")).toBeInTheDocument();
+    expect(within(tokenTable).getByText("tenant-3…")).toBeInTheDocument();
+  });
+
+  it("home scope keeps the tenant column hidden", async () => {
+    installAdapter({});
+    renderUsage();
+    await waitFor(() => expect(screen.getByTestId("usage-cost-table")).toBeInTheDocument());
+    const costTable = screen.getByTestId("usage-cost-table");
+    const headers = within(costTable)
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(headers.some((h) => /租户|Tenant/.test(h ?? ""))).toBe(false);
+  });
+});

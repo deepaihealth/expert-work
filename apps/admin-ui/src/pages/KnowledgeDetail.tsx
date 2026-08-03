@@ -7,7 +7,7 @@
  * Settings.
  */
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Alert, App, Button, Empty, Skeleton, Space, Tabs, Tag, Typography } from "antd";
 import { BookOpen, RefreshCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -37,8 +37,14 @@ export function KnowledgeDetail() {
   const { message } = App.useApp();
   const { name, tab } = useParams<{ name: string; tab?: string }>();
   const navigate = useNavigate();
-  // Cross-tenant W3 — detail reads take a concrete UUID only ("*" 422s).
+  // Cross-tenant W3/W4 — detail reads take a concrete UUID only ("*" 422s).
+  // Priority: the ``?tenant_id=`` query param (set by the KnowledgeAdmin "*"
+  // aggregate row-jump — the ambient scope is "*" there, which collapses to
+  // undefined) wins over the ambient switched-in scope.
   const { apiTenantScope } = useTenantScope();
+  const [searchParams] = useSearchParams();
+  const tenantParam = searchParams.get("tenant_id");
+  const readScope = tenantParam ?? concreteTenantScope(apiTenantScope);
   // Cross-tenant W3 — 切入态只读:重建索引是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
 
@@ -52,13 +58,13 @@ export function KnowledgeDetail() {
     setLoading(true);
     setError(null);
     try {
-      setBase(await getBase(name, concreteTenantScope(apiTenantScope)));
+      setBase(await getBase(name, readScope));
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [name, apiTenantScope]);
+  }, [name, readScope]);
 
   useEffect(() => {
     void refresh();
@@ -170,7 +176,15 @@ export function KnowledgeDetail() {
 
       <Tabs
         activeKey={activeTab}
-        onChange={(k) => navigate(`/knowledge/${encodeURIComponent(name)}/${k}`)}
+        // W4 — keep the aggregate row-jump's ``?tenant_id=`` across tab
+        // switches, else the read silently falls back to the home tenant.
+        onChange={(k) =>
+          navigate(
+            `/knowledge/${encodeURIComponent(name)}/${k}${
+              tenantParam !== null ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
+            }`,
+          )
+        }
         items={[
           { key: "documents", label: t("knowledge_page.tab_documents") },
           { key: "test", label: t("knowledge_page.tab_test") },

@@ -80,6 +80,7 @@ afterEach(() => vi.restoreAllMocks());
 // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
 beforeEach(() => {
   isTenantSwitchedMock.mockReturnValue(false);
+  scopeRef.current = undefined;
 });
 
 describe("KnowledgeDetail", () => {
@@ -203,5 +204,18 @@ describe("KnowledgeDetail", () => {
     const tab = screen.getByTestId("knowledge-settings-tab");
     expect(within(tab).getByTestId("kb-settings-save")).toBeDisabled();
     expect(within(tab).getByTestId("kb-settings-reindex")).toBeDisabled();
+  });
+
+  it("URL ?tenant_id= wins over the ambient scope for the base read (W4)", async () => {
+    // Ambient scope is a switched-in tenant; the aggregate row-jump's URL
+    // param must still win (it names the row's owning tenant).
+    scopeRef.current = "33333333-3333-3333-3333-333333333333";
+    const getBaseSpy = vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail("/knowledge/support-docs?tenant_id=tenant-2-xxxx");
+    await waitFor(() =>
+      expect(getBaseSpy).toHaveBeenCalledWith("support-docs", "tenant-2-xxxx"),
+    );
   });
 });
