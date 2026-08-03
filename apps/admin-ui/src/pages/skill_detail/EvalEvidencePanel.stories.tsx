@@ -53,13 +53,13 @@ export const WithEvidence: Story = {
         created_at: "2026-06-08T00:00:00Z",
       },
     ]);
-    return <EvalEvidencePanel skillId="sk-1" />;
+    return <EvalEvidencePanel skillId="sk-1" readScope={undefined} />;
   },
 };
 
 export const Empty: Story = {
   render: () => {
     stub([]);
-    return <EvalEvidencePanel skillId="sk-1" />;
+    return <EvalEvidencePanel skillId="sk-1" readScope={undefined} />;
   },
 };

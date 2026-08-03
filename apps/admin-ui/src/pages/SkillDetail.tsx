@@ -121,10 +121,16 @@ export function SkillDetail({
   // facade ignores the scope (platform skills are tenant-less).
   const { apiTenantScope } = useTenantScope();
   const [searchParams] = useSearchParams();
+  // ``||``(非 ``??``):``?tenant_id=`` 空串落回 ambient 分支,不拼空参 422。
   const readScope =
-    searchParams.get("tenant_id") ?? concreteTenantScope(apiTenantScope);
+    searchParams.get("tenant_id") || concreteTenantScope(apiTenantScope);
   // Cross-tenant W3 — 切入态只读:改分类/改状态/置顶是写操作,置灰。
+  // Cross-tenant W4(D2 fix)— "*" 聚合深链(``?tenant_id=B``)不算切入态,
+  // 但读的是外租户;写链路不带 scope,会打回归属租户(404/写错对象),所以
+  // 外租户读同样只读。readonly = 切入态 ∪ 外租户深链读,统一下传子组件。
   const isTenantSwitched = useIsTenantSwitched();
+  const isForeignRead = readScope != null && readScope !== identity?.homeTenantId;
+  const readonly = isTenantSwitched || isForeignRead;
   const isPlatform = variant === "platform";
   const statusOptions = isPlatform ? PLATFORM_STATUS_OPTIONS : STATUS_OPTIONS;
   const backLink = backTo ?? { label: t("nav.skills"), to: "/skills" };
@@ -397,7 +403,7 @@ export function SkillDetail({
                 backend role check, avoids the 403 round-trip).
                 Pinned state shows the filled icon + brand color so
                 the visual gate is obvious. */}
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
             <Tooltip
               title={
                 skill.pinned
@@ -423,7 +429,7 @@ export function SkillDetail({
                 onClick={onTogglePin}
                 disabled={
                   statusSubmitting ||
-                  isTenantSwitched ||
+                  readonly ||
                   (!skill.pinned && isLatestHighRisk && !isAdmin)
                 }
                 data-testid="skill-pin-button"
@@ -432,13 +438,13 @@ export function SkillDetail({
               </Button>
             </Tooltip>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Select<SkillStatus>
                 value={skill.status}
                 onChange={(v) => onChangeStatus(v)}
                 style={{ width: 160 }}
                 loading={statusSubmitting}
-                disabled={statusSubmitting || isTenantSwitched}
+                disabled={statusSubmitting || readonly}
                 aria-label={t("skills.change_status")}
                 data-testid="skill-status-select"
                 options={statusOptions.map((s) => {
@@ -470,6 +476,7 @@ export function SkillDetail({
           version={selectedVersion}
           categoryOptions={api.patchCategory ? categoryOptions : undefined}
           onSaveCategory={api.patchCategory ? onSaveCategory : undefined}
+          readonly={readonly}
         />
       )}
 
@@ -478,9 +485,15 @@ export function SkillDetail({
           (skill-authoring-ia Phase C). */}
       {!isPlatform && (
         <>
-          <GovernancePanel skill={skill} isAdmin={isAdmin} onChanged={refresh} />
-          <EvalEvidencePanel skillId={skill.id} />
-          <LineagePanel skillId={skill.id} />
+          <GovernancePanel
+            skill={skill}
+            isAdmin={isAdmin}
+            onChanged={refresh}
+            readScope={readScope}
+            readonly={readonly}
+          />
+          <EvalEvidencePanel skillId={skill.id} readScope={readScope} />
+          <LineagePanel skillId={skill.id} readScope={readScope} />
         </>
       )}
 
@@ -614,6 +627,8 @@ export function SkillDetail({
             api={api}
             skillId={skill.id}
             version={selectedVersion}
+            readScope={readScope}
+            readonly={readonly}
             selectedPath={selectedPath}
             onDirtyChange={setEditorDirty}
             onSaved={(v) => void adoptNewVersion(v)}
@@ -630,6 +645,7 @@ export function SkillDetail({
             open={addOpen}
             skillId={skill.id}
             versionNumber={selectedVersion.version}
+            readonly={readonly}
             onClose={() => setAddOpen(false)}
             onAdded={(v, p) => void adoptNewVersion(v, p)}
           />
@@ -640,6 +656,8 @@ export function SkillDetail({
               skillId={skill.id}
               versionNumber={selectedVersion.version}
               oldPath={renamePath}
+              readScope={readScope}
+              readonly={readonly}
               onClose={() => setRenamePath(null)}
               onRenamed={(v, p) => void adoptNewVersion(v, p)}
             />
@@ -651,6 +669,7 @@ export function SkillDetail({
               skillId={skill.id}
               versionNumber={selectedVersion.version}
               path={deletePath}
+              readonly={readonly}
               onClose={() => setDeletePath(null)}
               onDeleted={(v) => {
                 setSelectedPath(SKILL_MD_PATH);

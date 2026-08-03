@@ -45,8 +45,6 @@ import {
   type SupportingFileBody,
 } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SKILL_MD_PATH } from "./FileTree";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
@@ -56,6 +54,13 @@ interface FileEditorProps {
   api: SkillApi;
   skillId: string;
   version: SkillVersion;
+  /** Cross-tenant W4(D2)— 权威读口径:URL ``?tenant_id=`` 原样透传优先;
+   *  无 URL 参数时取 ambient scope("*" 折叠成 undefined),由 SkillDetail
+   *  统一下传。 */
+  readScope: string | undefined;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;编辑/重命名/删除/保存是写操作,置灰。 */
+  readonly: boolean;
   /** Path of the file currently selected in the tree, or ``null`` when
    *  nothing is selected (initial state). */
   selectedPath: string | null;
@@ -112,6 +117,8 @@ export function FileEditor({
   api,
   skillId,
   version,
+  readScope,
+  readonly,
   selectedPath,
   onDirtyChange,
   onSaved,
@@ -120,10 +127,6 @@ export function FileEditor({
 }: FileEditorProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — supporting-file read: concrete UUID only ("*" 400s).
-  const { apiTenantScope } = useTenantScope();
-  // Cross-tenant W3 — 切入态只读:编辑/重命名/删除/保存是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
 
   const [loaded, setLoaded] = useState<LoadedFile | null>(null);
   const [loading, setLoading] = useState(false);
@@ -161,7 +164,7 @@ export function FileEditor({
           skillId,
           version.version,
           selectedPath,
-          concreteTenantScope(apiTenantScope),
+          readScope,
         );
         if (cancelled) return;
         const text = decodeBase64Utf8(body.content);
@@ -185,7 +188,7 @@ export function FileEditor({
     return () => {
       cancelled = true;
     };
-  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange, apiTenantScope]);
+  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange, readScope]);
 
   const isSkillMd = selectedPath === SKILL_MD_PATH;
   const isBinary = loaded !== null && loaded.text === null;
@@ -424,13 +427,13 @@ export function FileEditor({
         {/* SKILL.md is editable (Phase D-2) but has no rename/delete — it's
             a required member of every skill. Saving edits the prompt body. */}
         {isSkillMd && mode === "view" && (
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip on={readonly}>
             <Button
               size="small"
               type="primary"
               icon={<Edit3 size={13} strokeWidth={1.75} />}
               onClick={handleEdit}
-              disabled={isTenantSwitched}
+              disabled={readonly}
               data-testid="skill-editor-edit-btn"
             >
               {t("skills.file_action_edit")}
@@ -439,36 +442,36 @@ export function FileEditor({
         )}
         {!isSkillMd && mode === "view" && !isBinary && (
           <>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Button
                 size="small"
                 danger
                 icon={<Trash2 size={13} strokeWidth={1.75} />}
                 onClick={() => onRequestDelete(selectedPath)}
-                disabled={isTenantSwitched}
+                disabled={readonly}
                 data-testid="skill-editor-delete-btn"
               >
                 {t("skills.file_action_delete")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Button
                 size="small"
                 icon={<PencilLine size={13} strokeWidth={1.75} />}
                 onClick={() => onRequestRename(selectedPath)}
-                disabled={isTenantSwitched}
+                disabled={readonly}
                 data-testid="skill-editor-rename-btn"
               >
                 {t("skills.file_action_rename")}
               </Button>
             </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Button
                 size="small"
                 type="primary"
                 icon={<Edit3 size={13} strokeWidth={1.75} />}
                 onClick={handleEdit}
-                disabled={isTenantSwitched}
+                disabled={readonly}
                 data-testid="skill-editor-edit-btn"
               >
                 {t("skills.file_action_edit")}
@@ -487,14 +490,14 @@ export function FileEditor({
             >
               {t("skills.file_action_cancel")}
             </Button>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={readonly}>
               <Button
                 size="small"
                 type="primary"
                 icon={<Save size={13} strokeWidth={1.75} />}
                 onClick={handleSave}
                 loading={saving}
-                disabled={!dirty || isTenantSwitched}
+                disabled={!dirty || readonly}
                 data-testid="skill-editor-save-btn"
               >
                 {t("skills.file_action_save")}

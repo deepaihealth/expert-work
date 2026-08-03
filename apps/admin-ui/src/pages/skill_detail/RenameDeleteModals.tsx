@@ -12,8 +12,6 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../../api/client";
 import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -26,6 +24,13 @@ interface RenameModalProps {
   skillId: string;
   versionNumber: number;
   oldPath: string;
+  /** Cross-tenant W4(D2)— 权威读口径:URL ``?tenant_id=`` 原样透传优先;
+   *  无 URL 参数时取 ambient scope("*" 折叠成 undefined),由 SkillDetail
+   *  统一下传。 */
+  readScope: string | undefined;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;重命名是写操作,置灰。 */
+  readonly: boolean;
   onClose: () => void;
   onRenamed: (newVersion: SkillVersion, newPath: string) => void;
 }
@@ -36,15 +41,15 @@ export function RenameModal({
   skillId,
   versionNumber,
   oldPath,
+  readScope,
+  readonly,
   onClose,
   onRenamed,
 }: RenameModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — the pre-rename read is scope-aware (writes are not).
-  const { apiTenantScope } = useTenantScope();
-  // Cross-tenant W3 — 切入态只读:重命名是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
+  // Cross-tenant W4(D2)— the pre-rename read takes the page's readScope
+  // (writes are not scope-aware).
   const [form] = Form.useForm<{ newPath: string }>();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,7 +80,7 @@ export function RenameModal({
         skillId,
         versionNumber,
         oldPath,
-        concreteTenantScope(apiTenantScope),
+        readScope,
       );
       const newVersion = await api.renameSupportingFile(
         skillId,
@@ -108,7 +113,7 @@ export function RenameModal({
     skillId,
     t,
     versionNumber,
-    apiTenantScope,
+    readScope,
   ]);
 
   return (
@@ -122,12 +127,12 @@ export function RenameModal({
           {t("skills.file_action_cancel")}
         </Button>,
         <ReadonlyTooltip
-          key="submit" on={isTenantSwitched}>
+          key="submit" on={readonly}>
           <Button
             type="primary"
             onClick={handleSubmit}
             loading={submitting}
-            disabled={isTenantSwitched}
+            disabled={readonly}
             data-testid="skill-rename-submit"
           >
             {t("skills.file_rename_submit")}
@@ -170,6 +175,9 @@ interface DeleteConfirmModalProps {
   skillId: string;
   versionNumber: number;
   path: string;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;删除是写操作,置灰。 */
+  readonly: boolean;
   onClose: () => void;
   onDeleted: (newVersion: SkillVersion) => void;
 }
@@ -180,13 +188,12 @@ export function DeleteConfirmModal({
   skillId,
   versionNumber,
   path,
+  readonly,
   onClose,
   onDeleted,
 }: DeleteConfirmModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — 切入态只读:删除是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
   const [typed, setTyped] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -242,13 +249,13 @@ export function DeleteConfirmModal({
           {t("skills.file_action_cancel")}
         </Button>,
         <ReadonlyTooltip
-          key="submit" on={isTenantSwitched}>
+          key="submit" on={readonly}>
           <Button
             danger
             type="primary"
             onClick={handleSubmit}
             loading={submitting}
-            disabled={!canDelete || isTenantSwitched}
+            disabled={!canDelete || readonly}
             data-testid="skill-delete-submit"
           >
             {t("skills.file_action_delete")}
