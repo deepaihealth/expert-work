@@ -771,6 +771,20 @@ describe("PlaygroundTab", () => {
     expect(screen.getAllByTestId("playground-turn")).toHaveLength(2);
   });
 
+  // Cross-tenant W4(D2)— rate_card 是 system_admin-only:非 admin 挂载
+  // 调试台不再发 listRateCards(否则每次都吃一发静默 403)。
+  it("does not fetch rate cards for a non-admin user", async () => {
+    const costDetail: AgentDetailResponse = {
+      record: {
+        ...sampleDetail.record,
+        spec: { model: { provider: "anthropic", name: "claude-x" } },
+      },
+    };
+    renderPg(costDetail);
+    await screen.findByTestId("playground-input");
+    expect(listRateCardsMock).not.toHaveBeenCalled();
+  });
+
   it("shows per-turn cost + step + a run-detail link", async () => {
     const user = userEvent.setup();
     const costDetail: AgentDetailResponse = {
@@ -832,7 +846,8 @@ describe("PlaygroundTab", () => {
         },
       ]),
     );
-    renderPg(costDetail);
+    // W4(D2)— rate_card 拉取只对 system_admin 发起,成本区仅 admin 可见。
+    renderPg(costDetail, { admin: true });
     await screen.findByTestId("playground-input");
     await user.type(screen.getByTestId("playground-input"), "q");
     await user.click(screen.getByTestId("playground-run"));

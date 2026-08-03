@@ -66,10 +66,14 @@ function pending(): PromoteRequest {
   };
 }
 
-function renderPanel(props: Parameters<typeof GovernancePanel>[0]) {
+type PanelProps = Parameters<typeof GovernancePanel>[0];
+
+// Cross-tenant W4(D2)— readScope 由 SkillDetail 下传;默认 home 态
+// (undefined),跨租户用例自行传具体 UUID。
+function renderPanel(props: Omit<PanelProps, "readScope"> & Partial<Pick<PanelProps, "readScope">>) {
   return render(
     <App>
-      <GovernancePanel {...props} />
+      <GovernancePanel readScope={undefined} {...props} />
     </App>,
   );
 }
@@ -88,6 +92,17 @@ afterEach(() => {
 });
 
 describe("GovernancePanel", () => {
+  // Cross-tenant W4(D2)— pending 列表读把 readScope 透传给 SDK。
+  it("threads readScope through listPromoteRequests (跨租户钻取)", async () => {
+    const scope = "22222222-2222-2222-2222-222222222222";
+    listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
+    renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn(), readScope: scope });
+
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith({ status: "pending", tenantScope: scope }),
+    );
+  });
+
   it("shows the propose button for an agent_private skill with no pending request", async () => {
     listMock.mockResolvedValue({ items: [], next_cursor: null, cross_tenant: false });
     renderPanel({ skill: skill(), isAdmin: false, onChanged: vi.fn() });

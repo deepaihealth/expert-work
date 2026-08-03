@@ -478,9 +478,14 @@ export function SkillDetail({
           (skill-authoring-ia Phase C). */}
       {!isPlatform && (
         <>
-          <GovernancePanel skill={skill} isAdmin={isAdmin} onChanged={refresh} />
-          <EvalEvidencePanel skillId={skill.id} />
-          <LineagePanel skillId={skill.id} />
+          <GovernancePanel
+            skill={skill}
+            isAdmin={isAdmin}
+            onChanged={refresh}
+            readScope={readScope}
+          />
+          <EvalEvidencePanel skillId={skill.id} readScope={readScope} />
+          <LineagePanel skillId={skill.id} readScope={readScope} />
         </>
       )}
 
@@ -614,6 +619,7 @@ export function SkillDetail({
             api={api}
             skillId={skill.id}
             version={selectedVersion}
+            readScope={readScope}
             selectedPath={selectedPath}
             onDirtyChange={setEditorDirty}
             onSaved={(v) => void adoptNewVersion(v)}
@@ -640,6 +646,7 @@ export function SkillDetail({
               skillId={skill.id}
               versionNumber={selectedVersion.version}
               oldPath={renamePath}
+              readScope={readScope}
               onClose={() => setRenamePath(null)}
               onRenamed={(v, p) => void adoptNewVersion(v, p)}
             />

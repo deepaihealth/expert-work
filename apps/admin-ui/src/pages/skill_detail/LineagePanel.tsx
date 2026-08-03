@@ -14,7 +14,6 @@ import { useTranslation } from "react-i18next";
 
 import { getLineage, type SkillLineage } from "../../api/skill-evolution";
 import type { EvolutionOrigin } from "../../api/skills";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
 
 const { Text } = Typography;
 
@@ -26,11 +25,13 @@ const ORIGIN_COLOR: Record<string, string> = {
 
 interface LineagePanelProps {
   skillId: string;
+  /** Cross-tenant W4(D2)— 权威读口径(URL ``?tenant_id=`` 优先,"*" 折叠
+   *  成 undefined),由 SkillDetail 统一下传。 */
+  readScope: string | undefined;
 }
 
-export function LineagePanel({ skillId }: LineagePanelProps) {
+export function LineagePanel({ skillId, readScope }: LineagePanelProps) {
   const { t } = useTranslation();
-  const { apiTenantScope } = useTenantScope();
   const [lineage, setLineage] = useState<SkillLineage | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -43,11 +44,11 @@ export function LineagePanel({ skillId }: LineagePanelProps) {
 
   const load = useCallback(async () => {
     try {
-      setLineage(await getLineage(skillId, apiTenantScope));
+      setLineage(await getLineage(skillId, readScope));
     } catch {
       setFailed(true);
     }
-  }, [skillId, apiTenantScope]);
+  }, [skillId, readScope]);
 
   useEffect(() => {
     void load();

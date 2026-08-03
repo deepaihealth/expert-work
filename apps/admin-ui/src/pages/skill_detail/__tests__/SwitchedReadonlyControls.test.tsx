@@ -19,15 +19,8 @@ vi.mock("../../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));
 
-// RenameModal/FileEditor 读 ambient scope(不挂 Provider)——共享工厂 mock。
-const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
-vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
-  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
-  return mockTenantScopeModule(
-    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
-    scopeRef,
-  );
-});
+// Cross-tenant W4(D2)— RenameModal/FileEditor 不再自读 ambient scope,
+// 改收 SkillDetail 下传的 readScope prop(这里传 undefined = home 态)。
 
 // FileEditor 的 monaco → textarea 桩(照 SkillsList.test.tsx)。
 vi.mock("@monaco-editor/react", () => {
@@ -101,7 +94,6 @@ const api: SkillApi = {
 beforeEach(() => {
   // vitest 4 的 restore 不复位 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
-  scopeRef.current = undefined;
 });
 
 describe("MetadataPanel 改分类(两态)", () => {
@@ -166,6 +158,7 @@ describe("RenameDeleteModals 重命名/删除(两态)", () => {
       skillId: "sk1",
       versionNumber: 1,
       oldPath: "notes.md",
+      readScope: undefined,
       onClose: vi.fn(),
       onRenamed: vi.fn(),
     };
@@ -233,6 +226,7 @@ describe("FileEditor 保存(两态)", () => {
           api={api}
           skillId="sk1"
           version={version}
+          readScope={undefined}
           selectedPath={SKILL_MD_PATH}
           onDirtyChange={onDirtyChange}
           onSaved={onSaved}

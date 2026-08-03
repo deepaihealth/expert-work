@@ -45,7 +45,6 @@ import {
   type SupportingFileBody,
 } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { SKILL_MD_PATH } from "./FileTree";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
@@ -56,6 +55,9 @@ interface FileEditorProps {
   api: SkillApi;
   skillId: string;
   version: SkillVersion;
+  /** Cross-tenant W4(D2)— 权威读口径(URL ``?tenant_id=`` 优先,"*" 折叠
+   *  成 undefined),由 SkillDetail 统一下传。 */
+  readScope: string | undefined;
   /** Path of the file currently selected in the tree, or ``null`` when
    *  nothing is selected (initial state). */
   selectedPath: string | null;
@@ -112,6 +114,7 @@ export function FileEditor({
   api,
   skillId,
   version,
+  readScope,
   selectedPath,
   onDirtyChange,
   onSaved,
@@ -120,8 +123,6 @@ export function FileEditor({
 }: FileEditorProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — supporting-file read: concrete UUID only ("*" 400s).
-  const { apiTenantScope } = useTenantScope();
   // Cross-tenant W3 — 切入态只读:编辑/重命名/删除/保存是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
 
@@ -161,7 +162,7 @@ export function FileEditor({
           skillId,
           version.version,
           selectedPath,
-          concreteTenantScope(apiTenantScope),
+          readScope,
         );
         if (cancelled) return;
         const text = decodeBase64Utf8(body.content);
@@ -185,7 +186,7 @@ export function FileEditor({
     return () => {
       cancelled = true;
     };
-  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange, apiTenantScope]);
+  }, [api, skillId, selectedPath, version.version, version.prompt_fragment, onDirtyChange, readScope]);
 
   const isSkillMd = selectedPath === SKILL_MD_PATH;
   const isBinary = loaded !== null && loaded.text === null;

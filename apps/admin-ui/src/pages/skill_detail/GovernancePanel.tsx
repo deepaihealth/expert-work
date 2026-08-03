@@ -31,6 +31,9 @@ interface GovernancePanelProps {
   isAdmin: boolean;
   /** Refetch the parent skill (visibility flips on approve). */
   onChanged: () => void | Promise<void>;
+  /** Cross-tenant W4(D2)— 权威读口径(URL ``?tenant_id=`` 优先,"*" 折叠
+   *  成 undefined),由 SkillDetail 统一下传。 */
+  readScope: string | undefined;
 }
 
 function errMessage(err: unknown): string {
@@ -39,25 +42,25 @@ function errMessage(err: unknown): string {
   return "failed";
 }
 
-export function GovernancePanel({ skill, isAdmin, onChanged }: GovernancePanelProps) {
+export function GovernancePanel({ skill, isAdmin, onChanged, readScope }: GovernancePanelProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3(review M-1)— 切入态只读:提议/批准/驳回是写操作,且
-  // promote 链路不带 scope(切入态下会拿目标租户的 skill.id 打归属租户端点),
-  // 置灰。
+  // Cross-tenant W4(D2)— pending 列表读带 readScope 透传(切入态/聚合跳转
+  // 下读对租户)。提议/批准/驳回是写操作,promote 写链路仍不带 scope(切入态
+  // 下会拿目标租户的 skill.id 打归属租户端点),置灰。
   const isTenantSwitched = useIsTenantSwitched();
   const [pending, setPending] = useState<PromoteRequest | null>(null);
   const [busy, setBusy] = useState(false);
 
   const loadPending = useCallback(async () => {
     try {
-      const list = await listPromoteRequests({ status: "pending" });
+      const list = await listPromoteRequests({ status: "pending", tenantScope: readScope });
       setPending(list.items.find((r) => r.skill_id === skill.id) ?? null);
     } catch {
       // Best-effort: the panel still renders its static facts without the queue.
       setPending(null);
     }
-  }, [skill.id]);
+  }, [skill.id, readScope]);
 
   useEffect(() => {
     void loadPending();

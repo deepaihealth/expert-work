@@ -12,7 +12,6 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../../api/client";
 import { type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
@@ -26,6 +25,9 @@ interface RenameModalProps {
   skillId: string;
   versionNumber: number;
   oldPath: string;
+  /** Cross-tenant W4(D2)— 权威读口径(URL ``?tenant_id=`` 优先,"*" 折叠
+   *  成 undefined),由 SkillDetail 统一下传。 */
+  readScope: string | undefined;
   onClose: () => void;
   onRenamed: (newVersion: SkillVersion, newPath: string) => void;
 }
@@ -36,14 +38,14 @@ export function RenameModal({
   skillId,
   versionNumber,
   oldPath,
+  readScope,
   onClose,
   onRenamed,
 }: RenameModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — the pre-rename read is scope-aware (writes are not).
-  const { apiTenantScope } = useTenantScope();
-  // Cross-tenant W3 — 切入态只读:重命名是写操作,置灰。
+  // Cross-tenant W4(D2)— the pre-rename read takes the page's readScope
+  // (writes are not scope-aware). W3 — 切入态只读:重命名是写操作,置灰。
   const isTenantSwitched = useIsTenantSwitched();
   const [form] = Form.useForm<{ newPath: string }>();
   const [submitting, setSubmitting] = useState(false);
@@ -75,7 +77,7 @@ export function RenameModal({
         skillId,
         versionNumber,
         oldPath,
-        concreteTenantScope(apiTenantScope),
+        readScope,
       );
       const newVersion = await api.renameSupportingFile(
         skillId,
@@ -108,7 +110,7 @@ export function RenameModal({
     skillId,
     t,
     versionNumber,
-    apiTenantScope,
+    readScope,
   ]);
 
   return (
