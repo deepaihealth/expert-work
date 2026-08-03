@@ -16,8 +16,13 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
-from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
-from tests.conftest import grant_system_admin
+from tests.auth_fixtures import (
+    TEST_AUDIENCE,
+    TEST_ISSUER,
+    build_test_jwt_verifier,
+    grant_system_admin,
+    make_test_jwt,
+)
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 

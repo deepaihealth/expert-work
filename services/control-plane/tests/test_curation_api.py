@@ -32,9 +32,9 @@ from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
-from tests.conftest import grant_system_admin
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _TENANT = DEFAULT_DEV_TENANT_ID
