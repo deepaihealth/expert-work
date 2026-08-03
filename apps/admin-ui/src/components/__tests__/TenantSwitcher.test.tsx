@@ -15,6 +15,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation } from "react-router-dom";
 
 import { AuthProvider, _identityFromTokenForTests } from "../../auth/AuthContext";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
@@ -42,14 +43,23 @@ function makeJwt(payload: Record<string, unknown>): string {
   return `${header}.${body}.`;
 }
 
-function renderWith(token: string) {
+/** Exposes the router path so the scope-switch landing rule is assertable. */
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-probe">{location.pathname}</div>;
+}
+
+function renderWith(token: string, initialPath = "/knowledge") {
   setStoredToken(token);
   return render(
-    <AuthProvider>
-      <TenantScopeProvider>
-        <TenantSwitcher />
-      </TenantScopeProvider>
-    </AuthProvider>,
+    <MemoryRouter initialEntries={[initialPath]}>
+      <AuthProvider>
+        <TenantScopeProvider>
+          <TenantSwitcher />
+          <LocationProbe />
+        </TenantScopeProvider>
+      </AuthProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -192,6 +202,54 @@ describe("TenantSwitcher — Stream N integration", () => {
     );
     await user.click(item);
     expect(window.sessionStorage.getItem("expert_work.admin.tenantScope")).toBe(tenantId);
+  });
+
+  it("switching into a tenant lands on the tenant IA's first entry (/agents)", async () => {
+    const tenantId = "11111111-1111-1111-1111-111111111111";
+    (listTenants as Mock).mockResolvedValue([
+      {
+        tenant_id: tenantId,
+        display_name: "乐毅大公司",
+        plan: "free",
+        created_at: "2026-06-02T00:00:00Z",
+      },
+    ]);
+    const token = makeJwt({
+      sub: "00000000-0000-0000-0000-0000000000aa",
+      sub_type: "user",
+      tenant_id: "00000000-0000-0000-0000-0000000000a1",
+      roles: ["system_admin"],
+    });
+    const user = userEvent.setup();
+    // Start on a platform page — a tenant perspective has no such route.
+    renderWith(token, "/settings/tenants");
+    const select = await screen.findByTestId("tenant-switcher");
+    await user.click(within(select).getByRole("combobox"));
+    await screen.findByTestId(`tenant-switcher-option-${tenantId}`);
+    const item = await screen.findByText(
+      (_content, el) =>
+        el?.classList.contains("ant-select-item-option-content") === true &&
+        el.textContent?.includes("乐毅大公司") === true,
+    );
+    await user.click(item);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/agents");
+  });
+
+  it('switching back to "*" lands on the platform IA\'s first entry (/settings/tenants)', async () => {
+    const token = makeJwt({
+      sub: "00000000-0000-0000-0000-0000000000aa",
+      sub_type: "user",
+      tenant_id: "00000000-0000-0000-0000-0000000000a1",
+      roles: ["system_admin"],
+    });
+    const user = userEvent.setup();
+    // Start deep inside a tenant page — meaningless under "*".
+    renderWith(token, "/agents/some-agent/1.0.0");
+    const select = await screen.findByTestId("tenant-switcher");
+    await user.click(within(select).getByRole("combobox"));
+    const item = await screen.findByTestId("tenant-switcher-option-*");
+    await user.click(item);
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/settings/tenants");
   });
 });
 

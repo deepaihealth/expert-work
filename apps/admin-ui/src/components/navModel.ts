@@ -280,6 +280,22 @@ export function visibleGroups(
   return ["workspace", "tenant-settings"];
 }
 
+/**
+ * Landing route after a scope switch — the first sidebar entry of the
+ * NEW scope's first visible group. Admin and tenant IAs differ too much
+ * to preserve page context across a perspective switch (product call,
+ * 2026-08-02): "*" lands on tenant governance, a concrete tenant lands
+ * on its agents.
+ */
+export function defaultPathForScope(
+  scope: TenantScopeValue,
+  isSystemAdmin: boolean,
+): string {
+  const group = visibleGroups(scope, isSystemAdmin)[0];
+  const first = ALL_NAV_ENTRIES.find((e) => e.group === group);
+  return first?.path ?? "/agents";
+}
+
 /** Which group a route path belongs to (longest-prefix wins so eg.
  *  ``/settings/platform-users`` doesn't match ``/settings/platform``
  *  before the more specific entry). */

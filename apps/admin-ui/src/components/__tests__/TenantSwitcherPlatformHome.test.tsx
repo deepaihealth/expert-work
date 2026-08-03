@@ -13,6 +13,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 
 import { TenantSwitcher } from "../TenantSwitcher";
 
@@ -49,7 +50,11 @@ describe("TenantSwitcher — platform-homed admin", () => {
       homeTenantId: "11111111-1111-1111-1111-111111111111",
     };
     mockScope = "*";
-    render(<TenantSwitcher />);
+    render(
+      <MemoryRouter>
+        <TenantSwitcher />
+      </MemoryRouter>,
+    );
     await openDropdown();
     expect(screen.queryByTestId("tenant-switcher-option-home")).toBeNull();
     // Antd may mirror the selected label, so assert presence, not count.
@@ -63,7 +68,11 @@ describe("TenantSwitcher — platform-homed admin", () => {
       homeTenantId: "22222222-2222-2222-2222-222222222222",
     };
     mockScope = "home";
-    render(<TenantSwitcher />);
+    render(
+      <MemoryRouter>
+        <TenantSwitcher />
+      </MemoryRouter>,
+    );
     await openDropdown();
     expect(screen.getAllByTestId("tenant-switcher-option-home").length).toBeGreaterThan(0);
     expect(screen.getAllByTestId("tenant-switcher-option-*").length).toBeGreaterThan(0);
