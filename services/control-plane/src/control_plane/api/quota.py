@@ -25,6 +25,7 @@ from control_plane.api._authz import require
 from control_plane.api._quota_admission import quota_engine_unavailable_as_503
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
+from control_plane.tenant_scope import emit_tenant_switch
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.quota import ReservationNotFoundError
 from expert_work.protocol import (
@@ -109,9 +110,22 @@ def build_quota_router() -> APIRouter:
     @router.post("/commit", status_code=204)
     async def commit_quota(
         payload: CommitRequest,
-        _principal: Annotated[Principal, Depends(require("quota", "check"))],
+        principal: Annotated[Principal, Depends(require("quota", "check"))],
         quota: Annotated[QuotaService, Depends(_get_quota)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
+        # W4 (PR-2) — ``payload.tenant_id`` was trusted unchecked. Same gate
+        # as release: mTLS service principals pass unconditionally, everyone
+        # else must be authorized for the target tenant.
+        _ensure_tenant_target_allowed(principal, payload.tenant_id)
+        if principal.is_system_admin and payload.tenant_id != principal.tenant_id:
+            await emit_tenant_switch(
+                audit,
+                principal,
+                payload.tenant_id,
+                trace_id=current_trace_id_hex(),
+                endpoint="POST /v1/quota/commit",
+            )
         try:
             async with quota_engine_unavailable_as_503():
                 await quota.commit_tokens(payload)
@@ -123,14 +137,33 @@ def build_quota_router() -> APIRouter:
                     "message": "reservation does not exist for this tenant",
                 },
             ) from exc
+        await emit(
+            audit,
+            tenant_id=payload.tenant_id,
+            actor_id=principal.subject_id,
+            action=AuditAction.QUOTA_COMMIT,
+            resource_type="quota",
+            resource_id=str(payload.reservation_id),
+            trace_id=current_trace_id_hex(),
+            details={"actual_tokens": payload.actual_tokens},
+        )
 
     @router.post("/release/{reservation_id}", status_code=204)
     async def release_quota(
         reservation_id: UUID,
         tenant_id: Annotated[UUID, Depends(_tenant_id_from_query_or_principal)],
-        _principal: Annotated[Principal, Depends(require("quota", "check"))],
+        principal: Annotated[Principal, Depends(require("quota", "check"))],
         quota: Annotated[QuotaService, Depends(_get_quota)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
+        if principal.is_system_admin and tenant_id != principal.tenant_id:
+            await emit_tenant_switch(
+                audit,
+                principal,
+                tenant_id,
+                trace_id=current_trace_id_hex(),
+                endpoint="POST /v1/quota/release/{reservation_id}",
+            )
         try:
             async with quota_engine_unavailable_as_503():
                 await quota.release_tokens(reservation_id, tenant_id=tenant_id)
@@ -142,6 +175,15 @@ def build_quota_router() -> APIRouter:
                     "message": "reservation does not exist for this tenant",
                 },
             ) from exc
+        await emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=principal.subject_id,
+            action=AuditAction.QUOTA_RELEASE,
+            resource_type="quota",
+            resource_id=str(reservation_id),
+            trace_id=current_trace_id_hex(),
+        )
 
     return router
 
@@ -183,6 +225,27 @@ async def _maybe_emit_denial(
     )
 
 
+def _ensure_tenant_target_allowed(principal: Principal, target: UUID) -> None:
+    """Cross-tenant gate for a caller-supplied target tenant (body or query).
+
+    mTLS service principals (orchestrator-tier infra, sandbox supervisor) keep
+    the documented semantics: they sit on the system tenant and operating on
+    any tenant's reservations is their job. User / service-account principals:
+    the target must be within their authorized tenants (system_admin's
+    ``allowed_tenants == "*"`` always passes).
+    """
+    if principal.auth_method == "mtls":
+        return
+    if principal.allowed_tenants != "*" and target not in principal.allowed_tenants:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TENANT_NOT_ALLOWED",
+                "message": "the caller is not authorized for this tenant",
+            },
+        )
+
+
 def _tenant_id_from_query_or_principal(
     request: Request,
     principal: Annotated[Principal, Depends(require("quota", "check"))],
@@ -204,19 +267,5 @@ def _tenant_id_from_query_or_principal(
             status_code=400,
             detail={"code": "INVALID_TENANT_ID", "message": "tenant_id is not a UUID"},
         ) from exc
-    # mTLS service principals (orchestrator-tier infra) keep the documented
-    # semantics: they sit on the system tenant and releasing any tenant's
-    # reservation is their job.
-    if principal.auth_method == "mtls":
-        return target
-    # User / service-account principals: the target must be within their
-    # authorized tenants (system_admin's allowed_tenants == "*" always passes).
-    if principal.allowed_tenants != "*" and target not in principal.allowed_tenants:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "TENANT_NOT_ALLOWED",
-                "message": "the caller is not authorized for this tenant",
-            },
-        )
+    _ensure_tenant_target_allowed(principal, target)
     return target

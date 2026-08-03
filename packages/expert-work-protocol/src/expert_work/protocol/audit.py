@@ -61,6 +61,10 @@ class AuditAction(StrEnum):
     QUOTA_CONFIG_WRITE = "quota:config_write"
     QUOTA_CONFIG_DELETE = "quota:config_delete"
     QUOTA_RESERVATION_EXPIRED = "quota:reservation_expired"
+    # W4 (PR-2) — runtime commit/release ops on the token-reservation ledger
+    # (``POST /v1/quota/commit`` / ``POST /v1/quota/release/{id}``).
+    QUOTA_COMMIT = "quota:commit"
+    QUOTA_RELEASE = "quota:release"
     # tenant_config (C.7)
     TENANT_CONFIG_READ = "tenant_config:read"
     TENANT_CONFIG_WRITE = "tenant_config:write"

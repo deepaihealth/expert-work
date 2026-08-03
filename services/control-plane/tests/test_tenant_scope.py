@@ -155,6 +155,40 @@ async def test_other_tenant_for_system_admin_returns_single_tenant_and_emits_swi
     assert rows[0].resource_type == "system"
     assert rows[0].tenant_id == target  # attribution under target tenant
     assert rows[0].details["home_tenant"] == str(home)
+    assert rows[0].details["mode"] == "switch"
+    assert rows[0].details["endpoint"] == "GET /v1/skills"
+    assert rows[0].details["intent"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_switch_audit_write_endpoint_derives_write_intent() -> None:
+    store = InMemoryAuditLogStore()
+    audit = _audit_for(store)
+    principal = _system_admin()
+    result = await ensure_tenant_scope(
+        principal, uuid4(), audit, endpoint="PUT /v1/tenants/{tenant_id}/config"
+    )
+    assert isinstance(result, SingleTenant)
+
+    rows = list(store._rows.values())
+    assert len(rows) == 1
+    assert rows[0].details["mode"] == "switch"
+    assert rows[0].details["intent"] == "write"
+
+
+@pytest.mark.asyncio
+async def test_switch_audit_without_endpoint_omits_intent() -> None:
+    store = InMemoryAuditLogStore()
+    audit = _audit_for(store)
+    principal = _system_admin()
+    result = await ensure_tenant_scope(principal, uuid4(), audit)
+    assert isinstance(result, SingleTenant)
+
+    rows = list(store._rows.values())
+    assert len(rows) == 1
+    assert rows[0].details["mode"] == "switch"
+    assert "intent" not in rows[0].details
+    assert "endpoint" not in rows[0].details
 
 
 @pytest.mark.asyncio

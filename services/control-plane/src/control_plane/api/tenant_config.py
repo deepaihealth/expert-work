@@ -23,21 +23,31 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from control_plane.api._authz import require
 from control_plane.ratelimit import parse_rate_limit_override
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
+from control_plane.tenant_scope import (
+    applied_scope,
+    cross_tenant_query_enabled,
+    ensure_single_tenant_scope,
+)
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import (
-    ALL_TENANTS,
     AgentSpecRecord,
     Principal,
     Provider,
     TenantConfigPatch,
     Tool,
 )
+from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.api.tenant_config")
 
 
 def _get_service(request: Request) -> TenantConfigService:
     return request.app.state.tenant_config_service  # type: ignore[no-any-return]
+
+
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
 def _get_agent_spec_store(request: Request) -> AgentSpecStore | None:
@@ -155,12 +165,25 @@ def build_tenant_config_router() -> APIRouter:
     @router.get("/{tenant_id}/config")
     async def get_tenant_config(
         tenant_id: UUID,
+        request: Request,
         principal: Annotated[Principal, Depends(require("tenant_config", "read"))],
         svc: Annotated[TenantConfigService, Depends(_get_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        _ensure_tenant_match(principal, tenant_id)
+        # W4 (PR-2) — path-param target through the central resolver: plain
+        # tenant admins keep their 403 on foreign tenants (TENANT_NOT_ALLOWED),
+        # system_admin cross-tenant hits emit SYSTEM_TENANT_SWITCH.
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/tenants/{tenant_id}/config",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         try:
-            record = await svc.get(tenant_id=tenant_id, actor_id=principal.subject_id)
+            async with applied_scope(scope):
+                record = await svc.get(tenant_id=scope.tenant_id, actor_id=principal.subject_id)
         except TenantConfigNotConfiguredError as exc:
             raise HTTPException(
                 status_code=404,
@@ -177,9 +200,17 @@ def build_tenant_config_router() -> APIRouter:
         payload: TenantConfigPatch,
         principal: Annotated[Principal, Depends(require("tenant_config", "write"))],
         svc: Annotated[TenantConfigService, Depends(_get_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         request: Request,
     ) -> dict[str, object]:
-        _ensure_tenant_match(principal, tenant_id)
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="PUT /v1/tenants/{tenant_id}/config",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         # Stream C.6 — validate the rate_limit_override shape at write time so a
         # bad config (typo / wrong unit) is rejected here, never silently
         # ignored by the limiter at runtime.
@@ -198,9 +229,10 @@ def build_tenant_config_router() -> APIRouter:
         # is a ``Literal["platform"]``, so Pydantic rejects any other value in the
         # request body with 422 before reaching this handler; no switch gate needed.
         try:
-            record = await svc.upsert(
-                tenant_id=tenant_id, patch=payload, actor_id=principal.subject_id
-            )
+            async with applied_scope(scope):
+                record = await svc.upsert(
+                    tenant_id=scope.tenant_id, patch=payload, actor_id=principal.subject_id
+                )
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,
@@ -216,6 +248,7 @@ def build_tenant_config_router() -> APIRouter:
         tenant_id: UUID,
         principal: Annotated[Principal, Depends(require("tenant_config", "read"))],
         svc: Annotated[TenantConfigService, Depends(_get_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
         request: Request,
     ) -> dict[str, object]:
         """Stream O Mini-ADR O-13 — composite view that drives the Admin UI
@@ -223,25 +256,35 @@ def build_tenant_config_router() -> APIRouter:
         flag, the tenant secret_ref, the used-by-agents count, plus the current
         mode. No secret VALUES are returned — only refs (kms:// URIs) and
         booleans."""
-        _ensure_tenant_match(principal, tenant_id)
+        scope = await ensure_single_tenant_scope(
+            principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/tenants/{tenant_id}/config/credentials",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
         supported_provs, plat_provs, supported_tools, plat_tools = await _credentials_catalog(
             request
         )
-        try:
-            record = await svc.get(tenant_id=tenant_id, actor_id=principal.subject_id)
-            mode: str = record.credentials_mode
-            tenant_provs = record.model_credentials_ref
-            tenant_tools = record.tool_credentials
-        except TenantConfigNotConfiguredError:
-            mode, tenant_provs, tenant_tools = "platform", {}, {}
-        embedding_provider = _embedding_provider(request)
-        prov_counts: dict[Provider, int] = {}
-        tool_counts: dict[Tool, int] = {}
-        agent_store = _get_agent_spec_store(request)
-        if agent_store is not None:
-            specs = await agent_store.list_by_tenant(tenant_id=tenant_id, status=None, limit=1000)
-            prov_counts = _provider_usage_counts(specs, embedding_provider=embedding_provider)
-            tool_counts = _tool_usage_counts(specs)
+        async with applied_scope(scope):
+            try:
+                record = await svc.get(tenant_id=scope.tenant_id, actor_id=principal.subject_id)
+                mode: str = record.credentials_mode
+                tenant_provs = record.model_credentials_ref
+                tenant_tools = record.tool_credentials
+            except TenantConfigNotConfiguredError:
+                mode, tenant_provs, tenant_tools = "platform", {}, {}
+            embedding_provider = _embedding_provider(request)
+            prov_counts: dict[Provider, int] = {}
+            tool_counts: dict[Tool, int] = {}
+            agent_store = _get_agent_spec_store(request)
+            if agent_store is not None:
+                specs = await agent_store.list_by_tenant(
+                    tenant_id=scope.tenant_id, status=None, limit=1000
+                )
+                prov_counts = _provider_usage_counts(specs, embedding_provider=embedding_provider)
+                tool_counts = _tool_usage_counts(specs)
         providers = [
             {
                 "provider": provider,
@@ -264,24 +307,3 @@ def build_tenant_config_router() -> APIRouter:
         return {"success": True, "data": data, "error": None}
 
     return router
-
-
-def _ensure_tenant_match(principal: Principal, tenant_id: UUID) -> None:
-    """Block cross-tenant edits (same rule as ``/v1/tenants/{t}/quotas``)."""
-    if principal.tenant_id == tenant_id:
-        return
-    # A principal authorized for every tenant carries the ``ALL_TENANTS`` ("*")
-    # sentinel — system_admin (Stream N) and certain mTLS service principals.
-    # Guard it before the ``in`` test: ``UUID in "*"`` raises TypeError, not a
-    # membership check (mirrors control_plane.tenant_scope's ``!= "*"`` guard).
-    if principal.allowed_tenants == ALL_TENANTS:
-        return
-    if tenant_id in principal.allowed_tenants:
-        return
-    raise HTTPException(
-        status_code=403,
-        detail={
-            "code": "TENANT_MISMATCH",
-            "message": "principal cannot edit config for this tenant",
-        },
-    )

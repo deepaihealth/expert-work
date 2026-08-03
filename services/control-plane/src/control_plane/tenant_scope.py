@@ -29,6 +29,7 @@ have just resolved to :class:`CrossTenant`.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -43,6 +44,20 @@ from expert_work.protocol import AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.tenant_scope")
+
+_LOG_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _log_safe(value: object | None) -> str | None:
+    """Strip control characters (CR/LF included) from principal-derived
+    values before logging so a forged claim cannot inject extra log lines
+    (CodeQL py/log-injection). The explicit ``.replace`` chain is the
+    newline barrier CodeQL's taint model recognises; the regex sweeps the
+    remaining control characters."""
+    if value is None:
+        return None
+    text = str(value).replace("\r", "").replace("\n", "")
+    return _LOG_CTRL_CHARS.sub("", text)
 
 
 def cross_tenant_query_enabled(request: Request) -> bool:
@@ -83,7 +98,62 @@ async def _emit_blocked(
     )
     logger.info(
         "tenant_scope.cross_tenant_blocked",
-        extra={"actor_id": principal.subject_id, "endpoint": endpoint, "mode": mode},
+        extra={
+            "actor_id": _log_safe(principal.subject_id),
+            "endpoint": _log_safe(endpoint),
+            "mode": mode,
+        },
+    )
+
+
+def _intent_from_endpoint(endpoint: str) -> Literal["read", "write"]:
+    """Derive the access intent from a ``"METHOD /v1/path"`` endpoint string."""
+    method = endpoint.split(" ", 1)[0].upper()
+    return "read" if method in ("GET", "HEAD") else "write"
+
+
+async def emit_tenant_switch(
+    audit: AuditLogger,
+    principal: Principal,
+    target: UUID,
+    *,
+    trace_id: str | None = None,
+    endpoint: str | None = None,
+) -> None:
+    """Emit the ``SYSTEM_TENANT_SWITCH`` audit row — the single write point.
+
+    ``details`` carries ``mode="switch"`` (aligned with :func:`_emit_blocked`'s
+    ``{mode: "aggregate"|"switch"}`` vocabulary), the actor's ``home_tenant``,
+    and — when the ``"METHOD /v1/path"`` endpoint string is known — the
+    ``endpoint`` plus the derived ``intent`` (GET/HEAD → ``"read"``, anything
+    else → ``"write"``). Callers outside the resolver (e.g. ``/v1/quota``
+    commit/release) reuse this instead of hand-assembling the emit.
+    """
+    details: dict[str, object] = {
+        "mode": "switch",
+        "home_tenant": str(principal.tenant_id),
+    }
+    if endpoint:
+        details["endpoint"] = endpoint
+        details["intent"] = _intent_from_endpoint(endpoint)
+    await emit(
+        audit,
+        tenant_id=target,  # action recorded under the target tenant
+        actor_id=principal.subject_id,
+        action=AuditAction.SYSTEM_TENANT_SWITCH,
+        resource_type="system",
+        resource_id=endpoint,
+        trace_id=trace_id,
+        details=details,
+    )
+    logger.info(
+        "tenant_scope.tenant_switch",
+        extra={
+            "actor_id": _log_safe(principal.subject_id),
+            "home_tenant": _log_safe(principal.tenant_id),
+            "target_tenant": _log_safe(target),
+            "endpoint": _log_safe(endpoint),
+        },
     )
 
 
@@ -228,30 +298,7 @@ async def ensure_tenant_scope(
     # whose target always equals their home tenant (already enforced
     # above; the inequality is impossible for them without a 403).
     if target != principal.tenant_id and principal.is_system_admin:
-        await emit(
-            audit,
-            tenant_id=target,  # action recorded under the target tenant
-            actor_id=principal.subject_id,
-            action=AuditAction.SYSTEM_TENANT_SWITCH,
-            resource_type="system",
-            resource_id=endpoint,
-            trace_id=trace_id,
-            details={
-                "endpoint": endpoint,
-                "home_tenant": str(principal.tenant_id),
-            }
-            if endpoint
-            else {"home_tenant": str(principal.tenant_id)},
-        )
-        logger.info(
-            "tenant_scope.tenant_switch",
-            extra={
-                "actor_id": principal.subject_id,
-                "home_tenant": str(principal.tenant_id),
-                "target_tenant": str(target),
-                "endpoint": endpoint,
-            },
-        )
+        await emit_tenant_switch(audit, principal, target, trace_id=trace_id, endpoint=endpoint)
 
     return SingleTenant(tenant_id=target)
 
@@ -404,6 +451,7 @@ __all__ = [
     "TenantScopeResolution",
     "applied_scope",
     "bypass_rls_session",
+    "emit_tenant_switch",
     "ensure_single_tenant_scope",
     "ensure_tenant_scope",
     "ensure_tenant_scope_home_fallback",
