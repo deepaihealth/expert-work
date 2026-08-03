@@ -35,6 +35,7 @@ from control_plane.platform_embedding_config import PlatformEmbeddingConfigServi
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
+from control_plane.settings import Settings
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.tenant_scope import bypass_rls_session
@@ -1431,11 +1432,11 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_sandbox_runtime(url: str | None) -> SandboxRuntime | None:
-    """Build the Sandbox Supervisor HTTP client from its base URL.
+def build_sandbox_runtime(settings: Settings) -> SandboxRuntime | None:
+    """按 ``sandbox_backend`` 选沙箱运行时实现。
 
-    ``None`` → the ``exec_python`` tool is unavailable; an agent that
-    declares it fails at build time with a clear error.
+    ``None`` → ``exec_python`` 等沙箱工具不可用;声明了沙箱工具的 agent
+    在构建期失败并给出明确错误(既有降级路径,波 1 不改)。
 
     一期 Task 5 — no ``http`` param here: this factory runs in ``app.py``'s
     synchronous ``create_app`` body, before the lifespan creates the shared
@@ -1445,9 +1446,14 @@ def build_sandbox_runtime(url: str | None) -> SandboxRuntime | None:
     is safe) — see the ``isinstance(..., HTTPSupervisorRuntime)`` guard in
     ``app.py``.
     """
-    if url is None:
-        return None
-    return HTTPSupervisorRuntime(base_url=url)
+    backend = settings.sandbox_backend
+    if backend is None:
+        backend = "supervisor" if settings.sandbox_supervisor_url else None
+    if backend == "agent_sandbox":
+        raise NotImplementedError("sandbox_backend='agent_sandbox' 尚未接线(波 1 Task 7)")
+    if backend == "supervisor" and settings.sandbox_supervisor_url:
+        return HTTPSupervisorRuntime(base_url=settings.sandbox_supervisor_url)
+    return None
 
 
 def build_workspace_store(url: str | None) -> WorkspaceStore | None:

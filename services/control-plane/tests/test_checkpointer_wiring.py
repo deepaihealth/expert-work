@@ -217,17 +217,21 @@ def test_build_tool_env_carries_web_search_client() -> None:
 
 
 def test_build_sandbox_runtime_none_url_yields_none() -> None:
-    assert build_sandbox_runtime(None) is None
+    assert build_sandbox_runtime(Settings(sandbox_supervisor_url=None)) is None
 
 
 def test_build_sandbox_runtime_builds_http_client() -> None:
-    client = build_sandbox_runtime("http://sandbox-supervisor:8000")
+    client = build_sandbox_runtime(
+        Settings(sandbox_supervisor_url="http://sandbox-supervisor:8000")
+    )
     assert isinstance(client, HTTPSupervisorRuntime)
     assert client.base_url == "http://sandbox-supervisor:8000"
 
 
 def test_build_tool_env_carries_sandbox_runtime() -> None:
-    client = build_sandbox_runtime("http://sandbox-supervisor:8000")
+    client = build_sandbox_runtime(
+        Settings(sandbox_supervisor_url="http://sandbox-supervisor:8000")
+    )
     env = build_tool_env(_FakeTenantConfigService(allowlist=[]), sandbox_runtime=client)
     assert env.sandbox_runtime is client
 

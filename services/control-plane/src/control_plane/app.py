@@ -693,7 +693,7 @@ def create_app(
         if sql_stores
         else InMemorySandboxEgressAuditStore()
     )
-    resolved_sandbox_runtime = build_sandbox_runtime(resolved_settings.sandbox_supervisor_url)
+    resolved_sandbox_runtime = build_sandbox_runtime(resolved_settings)
     # 波 1 Task 4 — workspace-file ops now live on a separate client, built
     # from the same supervisor URL (still the only thing that can reach the
     # docker-volume workspace today; wave 2's NAS mount replaces this).

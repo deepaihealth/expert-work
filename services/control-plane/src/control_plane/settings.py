@@ -201,6 +201,18 @@ class Settings(BaseSettings):
     #: clear error.
     sandbox_supervisor_url: str | None = None
 
+    #: 波 1 —— 沙箱后端选择。``"supervisor"`` 走本地 docker supervisor
+    #: (``sandbox_supervisor_url``);``"agent_sandbox"`` 走 ACS Agent
+    #: Sandbox(E2B SDK)。``None`` 时按老行为推断:设了
+    #: ``sandbox_supervisor_url`` 即视作 ``"supervisor"``,否则沙箱能力关闭。
+    sandbox_backend: Literal["supervisor", "agent_sandbox"] | None = None
+    #: Agent Sandbox 接入 —— gateway 域名(E2B SDK 的 ``domain``)。
+    sandbox_e2b_domain: str | None = None
+    #: Agent Sandbox 接入 —— API key。
+    sandbox_e2b_api_key: str | None = None
+    #: Agent Sandbox 接入 —— SandboxSet 模板名(池领取的来源)。
+    sandbox_e2b_template: str | None = None
+
     #: ``secret://`` reference to the embedding API key — backs long-term
     #: memory (Stream J.3). ``None`` → no embedder; an agent that declares
     #: ``memory.long_term`` fails at build time with a clear error.
