@@ -14,10 +14,10 @@ from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import Role
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
+from tests.conftest import grant_system_admin
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -567,23 +567,6 @@ async def test_reingest_missing_document_404(full_setup: FullSetup) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 async def _seed_kb_with_document(client: AsyncClient, runner: KnowledgeIngestionRunner) -> str:
     """Create base ``kb`` with one ready document in ``_TENANT``; return doc id."""
     await client.post("/v1/knowledge/bases", json={"name": "kb"})
@@ -600,7 +583,7 @@ async def _seed_kb_with_document(client: AsyncClient, runner: KnowledgeIngestion
 async def test_knowledge_scope_system_admin_target_tenant_200(full_setup: FullSetup) -> None:
     client, runner, _ = full_setup
     doc_id = await _seed_kb_with_document(client, runner)
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
     params = {"tenant_id": str(_TENANT)}
 
     listed = await client.get("/v1/knowledge/bases", params=params, headers=headers)
@@ -648,7 +631,7 @@ async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: Full
     plain = await client.get("/v1/knowledge/bases")
     assert [b["tenant_id"] for b in plain.json()["bases"]] == [str(_TENANT)]
 
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
     resp = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
     by_key = {(b["tenant_id"], b["name"]): b for b in resp.json()["bases"]}
@@ -673,7 +656,7 @@ async def test_knowledge_list_bases_star_truncated_flag(
     client, _runner, store = full_setup
     for i in range(3):
         await store.create_base(tenant_id=uuid4(), name=f"kb-{i}")
-    headers = await _grant_system_admin(client)
+    headers = await grant_system_admin(client)
 
     under = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
     assert under.status_code == 200, under.text

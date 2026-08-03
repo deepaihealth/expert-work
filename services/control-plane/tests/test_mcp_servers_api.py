@@ -35,6 +35,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.conftest import grant_system_admin_on
 
 # ---------------------------------------------------------------------------
 # Fake probe callables — injected via monkeypatch
@@ -1456,24 +1457,6 @@ async def test_available_platform_row_degrades_when_catalog_missing(
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin_on(app: object) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from the tenant under test."""
-    from expert_work.protocol import Role
-
-    sys_admin_id = uuid4()
-    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 async def _seed_server(client: AsyncClient, admin_headers: dict[str, str]) -> None:
     resp = await client.post(
         "/v1/mcp-servers",
@@ -1498,7 +1481,7 @@ async def test_mcp_scope_system_admin_target_tenant_200(
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         await _seed_server(client, admin_headers)
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         params = {"tenant_id": str(tenant_id)}
 
         listed = await client.get("/v1/mcp-servers", params=params, headers=headers)
@@ -1541,7 +1524,7 @@ async def test_mcp_list_star_aggregates_all_tenants(
         plain = await client.get("/v1/mcp-servers", headers=admin_headers)
         assert [r["tenant_id"] for r in plain.json()["data"]] == [str(tenant_id)]
 
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         resp = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
         assert resp.status_code == 200, resp.text
         rows = {r["name"]: r for r in resp.json()["data"]}
@@ -1570,7 +1553,7 @@ async def test_mcp_list_star_truncated_flag(monkeypatch: pytest.MonkeyPatch) -> 
             timeout_s=30.0,
             created_by="seed",
         )
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
 
         under = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
         assert under.status_code == 200, under.text
@@ -1597,7 +1580,7 @@ async def test_mcp_available_tenant_id_star_400(monkeypatch: pytest.MonkeyPatch)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         await _seed_server(client, admin_headers)
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         resp = await client.get(
             "/v1/mcp-servers/available", params={"tenant_id": "*"}, headers=headers
         )
@@ -1672,7 +1655,7 @@ async def test_mcp_tools_cross_tenant_probe_does_not_stamp_health(
         before = await store.get(tenant_id=tenant_id, name="linear")
         assert before is not None
 
-        headers = await _grant_system_admin_on(app)
+        headers = await grant_system_admin_on(app)
         monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_fail)
         resp = await client.get(
             "/v1/mcp-servers/linear/tools",

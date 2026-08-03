@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -12,6 +12,7 @@ from control_plane.app import create_app
 from control_plane.auth import JWTVerifier
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.common.lifecycle import Lifecycle
+from expert_work.protocol import Role
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -109,3 +110,25 @@ async def client(
 
 def known_dev_tenant() -> UUID:
     return DEFAULT_DEV_TENANT_ID
+
+
+async def grant_system_admin_on(app: object) -> dict[str, str]:
+    """Seed a platform-scope binding; return headers for a system_admin whose
+    HOME tenant differs from the tenant under test."""
+    sys_admin_id = uuid4()
+    await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def grant_system_admin(client: AsyncClient) -> dict[str, str]:
+    """:func:`grant_system_admin_on` flavored for an ASGI-transport client."""
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    return await grant_system_admin_on(app)

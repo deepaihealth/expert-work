@@ -18,7 +18,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import QualityDriftAlertRecord, QualityScoreRecord, Role
+from expert_work.protocol import QualityDriftAlertRecord, QualityScoreRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -26,6 +26,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.conftest import grant_system_admin
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -191,23 +192,6 @@ async def test_list_drift_alerts_tenant_scoped(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 def _seed_alert(
     *, at: datetime, tenant: object = _TENANT, agent: str = "a"
 ) -> QualityDriftAlertRecord:
@@ -228,7 +212,7 @@ async def test_quality_system_admin_target_tenant_200(ctx: _Ctx) -> None:
     now = datetime.now(tz=UTC)
     await ctx.scores.insert(_score(agent="a", overall=4, at=now))
     await ctx.alerts.insert(_seed_alert(at=now))
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     params = {"tenant_id": str(_TENANT)}
 
     scores = await ctx.client.get("/v1/quality/scores", params=params, headers=headers)
@@ -253,7 +237,7 @@ async def test_quality_scores_star_aggregates_all_tenants(ctx: _Ctx) -> None:
     plain = await ctx.client.get("/v1/quality/scores")
     assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
 
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     resp = await ctx.client.get("/v1/quality/scores", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
     by_agent = {it["agent_name"]: it for it in resp.json()["items"]}
@@ -285,7 +269,7 @@ async def test_quality_drift_alerts_star_aggregates_all_tenants(ctx: _Ctx) -> No
     plain = await ctx.client.get("/v1/quality/drift-alerts")
     assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
 
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     resp = await ctx.client.get(
         "/v1/quality/drift-alerts", params={"tenant_id": "*"}, headers=headers
     )

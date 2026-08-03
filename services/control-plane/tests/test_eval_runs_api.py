@@ -22,7 +22,6 @@ from expert_work.protocol import (
     EvalRunRecord,
     EvalRunStatus,
     EvalTriggeredBy,
-    Role,
 )
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -31,6 +30,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.conftest import grant_system_admin
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -190,28 +190,11 @@ async def test_list_cases(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 @pytest.mark.asyncio
 async def test_eval_runs_system_admin_target_tenant_200(ctx: _Ctx) -> None:
     created = await ctx.client.post("/v1/eval-runs", json={"suite": "m0_baseline"})
     run_id = created.json()["id"]
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     params = {"tenant_id": str(_TENANT)}
 
     listed = await ctx.client.get("/v1/eval-runs", params=params, headers=headers)
@@ -247,7 +230,7 @@ async def test_eval_runs_list_star_aggregates_all_tenants(ctx: _Ctx) -> None:
     plain = await ctx.client.get("/v1/eval-runs")
     assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
 
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     resp = await ctx.client.get("/v1/eval-runs", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
     body = resp.json()

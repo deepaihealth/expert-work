@@ -23,7 +23,6 @@ from expert_work.protocol import (
     AuditQuery,
     CurationCandidateRecord,
     CurationSignal,
-    Role,
     TrajectoryOutcome,
 )
 from expert_work.runtime.storage import InMemoryObjectStore
@@ -35,6 +34,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.conftest import grant_system_admin
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _TENANT = DEFAULT_DEV_TENANT_ID
@@ -508,23 +508,6 @@ async def test_unauthenticated_request_is_401(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
-    """Seed a platform-scope binding; return headers for a system_admin whose
-    HOME tenant differs from ``_TENANT`` (the tenant under test)."""
-    sys_admin_id = uuid4()
-    app = client._transport.app  # type: ignore[attr-defined,union-attr]
-    await app.state.role_binding_repo.create(
-        subject_type="user",
-        subject_id=sys_admin_id,
-        tenant_id=None,
-        role=Role.SYSTEM_ADMIN,
-        platform_scope=True,
-        granted_by="seed",
-    )
-    token = make_test_jwt(tenant_id=uuid4(), subject=str(sys_admin_id))
-    return {"Authorization": f"Bearer {token}"}
-
-
 async def _seed_dataset(ctx: _Ctx) -> str:
     created = await ctx.client.post(
         "/v1/eval-datasets",
@@ -544,7 +527,7 @@ async def _seed_dataset(ctx: _Ctx) -> str:
 async def test_curation_detail_system_admin_target_tenant_200(ctx: _Ctx) -> None:
     candidate = await ctx.seed_candidate()
     dataset_id = await _seed_dataset(ctx)
-    headers = await _grant_system_admin(ctx.client)
+    headers = await grant_system_admin(ctx.client)
     params = {"tenant_id": str(_TENANT)}
 
     cand = await ctx.client.get(
