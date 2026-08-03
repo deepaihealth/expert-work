@@ -37,7 +37,7 @@ from orchestrator.tools.file_ops import (
 )
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
-    SupervisorClient,
+    SandboxRuntime,
     run_in_sandbox,
 )
 
@@ -179,7 +179,7 @@ class ReadDocumentTool:
     """Parse a PDF / Word / Excel / PowerPoint / text file to plain text
     (exposed as ``read_document``)."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     output_char_cap: int = _DOC_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()

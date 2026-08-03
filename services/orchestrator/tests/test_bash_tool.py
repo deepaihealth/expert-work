@@ -1,6 +1,6 @@
 """Unit tests for the ``bash`` tool — Stream TE-5.
 
-The Sandbox Supervisor is faked via :class:`RecordingSupervisorClient`,
+The Sandbox Supervisor is faked via :class:`RecordingSandboxRuntime`,
 so these run in the plain ``pytest`` job (no Docker). bash rides the
 ``exec`` channel as a ``subprocess`` wrapper, so the assertions focus on
 the wrapper that gets executed, the irreversible classification, and the
@@ -18,7 +18,7 @@ from expert_work.protocol import BuiltinToolSpec
 from orchestrator.errors import AgentFactoryError
 from orchestrator.tools import (
     BashTool,
-    RecordingSupervisorClient,
+    RecordingSandboxRuntime,
     SandboxOutcome,
     ToolBlockedError,
     ToolContext,
@@ -35,7 +35,7 @@ def _ctx(*, user_id: UUID | None = None) -> ToolContext:
 
 
 def test_bash_spec_advertises_command_and_is_irreversible() -> None:
-    spec = BashTool(client=RecordingSupervisorClient()).spec
+    spec = BashTool(client=RecordingSandboxRuntime()).spec
     assert spec.name == "bash"
     assert "command" in spec.parameters["properties"]
     assert spec.parameters["required"] == ["command"]
@@ -50,7 +50,7 @@ def test_bash_spec_advertises_command_and_is_irreversible() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_runs_command_via_subprocess_wrapper() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="hello\n", stderr="", exit_code=0, timed_out=False)
     )
     tool = BashTool(client=client)
@@ -77,7 +77,7 @@ async def test_bash_wrapper_is_valid_python_even_for_nasty_command() -> None:
     # compilable wrapper — repr() makes it a safe Python string literal,
     # so there is no Python-level injection.
     nasty = "echo \"a'b\"; printf 'x\\n'\n# trailing"
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     await BashTool(client=client).call({"command": nasty}, ctx=_ctx())
     executed_code = client.execs[0][1]
     # Must compile (would raise SyntaxError if the embedding were unsafe).
@@ -86,7 +86,7 @@ async def test_bash_wrapper_is_valid_python_even_for_nasty_command() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_propagates_nonzero_exit_code() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="", stderr="boom\n", exit_code=2, timed_out=False)
     )
     result = await BashTool(client=client).call({"command": "false"}, ctx=_ctx())
@@ -100,14 +100,14 @@ async def test_bash_propagates_nonzero_exit_code() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_requires_tenant_binding() -> None:
-    tool = BashTool(client=RecordingSupervisorClient())
+    tool = BashTool(client=RecordingSandboxRuntime())
     with pytest.raises(ToolBlockedError, match="tenant binding"):
         await tool.call({"command": "ls"}, ctx=ToolContext(tenant_id=None))
 
 
 @pytest.mark.asyncio
 async def test_bash_requires_non_empty_command() -> None:
-    tool = BashTool(client=RecordingSupervisorClient())
+    tool = BashTool(client=RecordingSandboxRuntime())
     with pytest.raises(ValueError, match="non-empty 'command'"):
         await tool.call({"command": "   "}, ctx=_ctx())
 
@@ -117,7 +117,7 @@ async def test_bash_requires_non_empty_command() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_destroys_sandbox_on_cancellation() -> None:
-    client = RecordingSupervisorClient(exec_error=asyncio.CancelledError())
+    client = RecordingSandboxRuntime(exec_error=asyncio.CancelledError())
     tool = BashTool(client=client)
     with pytest.raises(asyncio.CancelledError):
         await tool.call({"command": "sleep 99"}, ctx=_ctx())
@@ -130,7 +130,7 @@ async def test_bash_destroys_sandbox_on_cancellation() -> None:
 async def test_bash_user_run_passes_user_id_automatically() -> None:
     # Durability is automatic: a user-scoped run mounts the user's workspace
     # volume, no manifest flag needed.
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     user_id = uuid4()
     tool = BashTool(client=client)
     await tool.call({"command": "ls"}, ctx=_ctx(user_id=user_id))
@@ -139,7 +139,7 @@ async def test_bash_user_run_passes_user_id_automatically() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_without_user_falls_back_to_tmpfs() -> None:
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     tool = BashTool(client=client)
     await tool.call({"command": "ls"}, ctx=_ctx())
     assert client.acquired[0][2] is None
@@ -150,7 +150,7 @@ async def test_bash_without_user_falls_back_to_tmpfs() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_builtin_assembled_when_supervisor_present() -> None:
-    env = ToolEnv(supervisor_client=RecordingSupervisorClient())
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime())
     registry = await build_tool_registry([BuiltinToolSpec(name="bash")], tool_env=env)
     spec = registry.get_required("bash").spec
     assert spec.name == "bash"
@@ -159,5 +159,5 @@ async def test_bash_builtin_assembled_when_supervisor_present() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_builtin_missing_supervisor_raises() -> None:
-    with pytest.raises(AgentFactoryError, match="no Sandbox Supervisor"):
+    with pytest.raises(AgentFactoryError, match="no sandbox runtime"):
         await build_tool_registry([BuiltinToolSpec(name="bash")], tool_env=ToolEnv())

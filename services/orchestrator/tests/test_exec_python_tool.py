@@ -1,6 +1,6 @@
 """Unit tests for the ``exec_python`` tool — Stream F.4b (test matrix #46).
 
-The Sandbox Supervisor is faked via :class:`RecordingSupervisorClient`,
+The Sandbox Supervisor is faked via :class:`RecordingSandboxRuntime`,
 so these run in the plain ``pytest`` job — no Docker, no supervisor.
 The old sandbox-exec call denylist was removed (audit over blocking — the
 gVisor sandbox is the real boundary); submitted code is now recorded into the
@@ -20,7 +20,7 @@ from orchestrator.errors import AgentFactoryError
 from orchestrator.tools import (
     DEFAULT_OUTPUT_CHAR_CAP,
     ExecPythonTool,
-    RecordingSupervisorClient,
+    RecordingSandboxRuntime,
     SandboxOutcome,
     ToolBlockedError,
     ToolContext,
@@ -40,7 +40,7 @@ def _ctx(*, user_id: UUID | None = None) -> ToolContext:
 
 @pytest.mark.asyncio
 async def test_exec_python_runs_code_and_returns_output() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="42\n", stderr="", exit_code=0, timed_out=False)
     )
     tool = ExecPythonTool(client=client)
@@ -63,7 +63,7 @@ async def test_exec_python_runs_code_and_returns_output() -> None:
 async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
     # skill-runtime §5.1 — the build-bound skill seed set reaches acquire so the
     # supervisor materializes /workspace/skills/<name>/ before the code runs.
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="", stderr="", exit_code=0, timed_out=False)
     )
     seed = (("skills/pptx/SKILL.md", b"---\nname: pptx\n---\n"),)
@@ -77,7 +77,7 @@ async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
 @pytest.mark.asyncio
 async def test_exec_python_truncates_oversized_output() -> None:
     # The supervisor returns 50k chars; the tool caps each stream at 20k.
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="x" * 50_000, stderr="", exit_code=0, timed_out=False)
     )
     tool = ExecPythonTool(client=client)
@@ -97,7 +97,7 @@ async def test_exec_python_truncates_oversized_output() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_python_reports_timeout() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)
     )
     tool = ExecPythonTool(client=client)
@@ -113,21 +113,21 @@ async def test_exec_python_reports_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_python_requires_tenant_binding() -> None:
-    tool = ExecPythonTool(client=RecordingSupervisorClient())
+    tool = ExecPythonTool(client=RecordingSandboxRuntime())
     with pytest.raises(ToolBlockedError, match="tenant binding"):
         await tool.call({"code": "print(1)"}, ctx=ToolContext(tenant_id=None))
 
 
 @pytest.mark.asyncio
 async def test_exec_python_requires_code() -> None:
-    tool = ExecPythonTool(client=RecordingSupervisorClient())
+    tool = ExecPythonTool(client=RecordingSandboxRuntime())
     with pytest.raises(ValueError, match="non-empty 'code'"):
         await tool.call({"code": "   "}, ctx=_ctx())
 
 
 @pytest.mark.asyncio
 async def test_exec_python_releases_sandbox_even_on_exec_error() -> None:
-    client = RecordingSupervisorClient(exec_error=RuntimeError("runner died"))
+    client = RecordingSandboxRuntime(exec_error=RuntimeError("runner died"))
     tool = ExecPythonTool(client=client)
 
     with pytest.raises(RuntimeError, match="runner died"):
@@ -139,7 +139,7 @@ async def test_exec_python_releases_sandbox_even_on_exec_error() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_python_passes_timeout_through() -> None:
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     tool = ExecPythonTool(client=client)
 
     await tool.call({"code": "print(1)", "timeout_s": 15}, ctx=_ctx())
@@ -148,7 +148,7 @@ async def test_exec_python_passes_timeout_through() -> None:
 
 
 def test_exec_python_spec_advertises_code_param() -> None:
-    spec = ExecPythonTool(client=RecordingSupervisorClient()).spec
+    spec = ExecPythonTool(client=RecordingSandboxRuntime()).spec
     assert spec.name == "exec_python"
     assert "code" in spec.parameters["required"]
 
@@ -162,7 +162,7 @@ def test_exec_python_spec_advertises_code_param() -> None:
 async def test_exec_python_user_run_passes_user_id_without_flag() -> None:
     # Durability is automatic: a user-scoped run acquires against the user's
     # persistent workspace volume even though no manifest flag is set.
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     tool = ExecPythonTool(client=client)  # no persistent_workspace knob anymore
     user_id = uuid4()
 
@@ -174,7 +174,7 @@ async def test_exec_python_user_run_passes_user_id_without_flag() -> None:
 @pytest.mark.asyncio
 async def test_exec_python_without_user_falls_back_to_tmpfs() -> None:
     # No user binding → no volume mount (ephemeral tmpfs).
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     tool = ExecPythonTool(client=client)
 
     await tool.call({"code": "print(1)"}, ctx=_ctx())
@@ -191,7 +191,7 @@ async def test_exec_python_without_user_falls_back_to_tmpfs() -> None:
 async def test_exec_python_destroys_sandbox_on_cancellation() -> None:
     """A cancelled run force-destroys the sandbox, never a graceful release."""
     # E.15 cancels the dispatch task → CancelledError on the exec ``await``.
-    client = RecordingSupervisorClient(exec_error=asyncio.CancelledError())
+    client = RecordingSandboxRuntime(exec_error=asyncio.CancelledError())
     tool = ExecPythonTool(client=client)
 
     with pytest.raises(asyncio.CancelledError):
@@ -206,7 +206,7 @@ async def test_exec_python_destroys_sandbox_on_cancellation() -> None:
 @pytest.mark.asyncio
 async def test_exec_python_cancellation_destroy_failure_is_swallowed() -> None:
     """A failed destroy must not mask the cancellation (TTL reaper backstops)."""
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         exec_error=asyncio.CancelledError(),
         destroy_error=RuntimeError("supervisor unreachable"),
     )
@@ -224,14 +224,14 @@ async def test_exec_python_cancellation_destroy_failure_is_swallowed() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_python_builtin_assembled_when_supervisor_present() -> None:
-    env = ToolEnv(supervisor_client=RecordingSupervisorClient())
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime())
     registry = await build_tool_registry([BuiltinToolSpec(name="exec_python")], tool_env=env)
     assert registry.get("exec_python") is not None
 
 
 @pytest.mark.asyncio
 async def test_exec_python_builtin_missing_supervisor_raises() -> None:
-    with pytest.raises(AgentFactoryError, match="Sandbox Supervisor"):
+    with pytest.raises(AgentFactoryError, match="sandbox runtime"):
         await build_tool_registry([BuiltinToolSpec(name="exec_python")], tool_env=ToolEnv())
 
 
@@ -239,13 +239,13 @@ async def test_exec_python_builtin_missing_supervisor_raises() -> None:
 async def test_exec_python_builtin_durability_is_automatic() -> None:
     # No manifest flag is threaded; the assembled tool relies on ctx.user_id at
     # call time for durability. Acquire carries the run's user.
-    env = ToolEnv(supervisor_client=RecordingSupervisorClient())
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime())
     registry = await build_tool_registry([BuiltinToolSpec(name="exec_python")], tool_env=env)
     tool = registry.get("exec_python")
     assert isinstance(tool, ExecPythonTool)
 
     user_id = uuid4()
     await tool.call({"code": "print(1)"}, ctx=_ctx(user_id=user_id))
-    client = env.supervisor_client
-    assert isinstance(client, RecordingSupervisorClient)
+    client = env.sandbox_runtime
+    assert isinstance(client, RecordingSandboxRuntime)
     assert client.acquired[0][2] == user_id

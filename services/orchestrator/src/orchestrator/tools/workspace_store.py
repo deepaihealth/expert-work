@@ -1,7 +1,7 @@
 """``WorkspaceStore`` — user persistent-workspace file operations.
 
 Split out of :mod:`orchestrator.tools.sandbox` (sandbox migration wave 1,
-Task 4). ``SupervisorClient`` used to carry two unrelated jobs: sandbox
+Task 4). ``SandboxRuntime`` used to carry two unrelated jobs: sandbox
 *lifecycle* (acquire / exec / release / destroy / reap) and per-user
 *workspace file* access (read / list / write / delete / mark-deleted). The
 five workspace methods never touch a live sandbox — they proxy straight to
@@ -12,7 +12,7 @@ the sandbox machinery.
 
 This module is the first cut of that split: same HTTP wire behaviour, moved
 under its own :class:`WorkspaceStore` Protocol. URL / request body / header /
-error handling are carried over unchanged from ``HTTPSupervisorClient``; the
+error handling are carried over unchanged from ``HTTPSupervisorRuntime``; the
 only change is the method names losing their redundant ``workspace_``
 prefix (``read_workspace_file`` → :meth:`WorkspaceStore.read_file`, etc.) —
 now that they live on a type called ``WorkspaceStore``, repeating the word
@@ -85,7 +85,7 @@ class SupervisorWorkspaceStore:
     """Production :class:`WorkspaceStore` — calls the supervisor's HTTP API.
 
     A non-2xx response raises :class:`SandboxSupervisorError`. Field shape
-    mirrors :class:`orchestrator.tools.sandbox.HTTPSupervisorClient`.
+    mirrors :class:`orchestrator.tools.sandbox.HTTPSupervisorRuntime`.
     """
 
     base_url: str

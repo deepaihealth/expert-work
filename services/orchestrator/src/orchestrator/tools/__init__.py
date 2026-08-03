@@ -154,19 +154,19 @@ from orchestrator.tools.sandbox import (
     ExecPythonTool as ExecPythonTool,
 )
 from orchestrator.tools.sandbox import (
-    HTTPSupervisorClient as HTTPSupervisorClient,
+    HTTPSupervisorRuntime as HTTPSupervisorRuntime,
 )
 from orchestrator.tools.sandbox import (
-    RecordingSupervisorClient as RecordingSupervisorClient,
+    RecordingSandboxRuntime as RecordingSandboxRuntime,
 )
 from orchestrator.tools.sandbox import (
     SandboxOutcome as SandboxOutcome,
 )
 from orchestrator.tools.sandbox import (
-    SandboxSupervisorError as SandboxSupervisorError,
+    SandboxRuntime as SandboxRuntime,
 )
 from orchestrator.tools.sandbox import (
-    SupervisorClient as SupervisorClient,
+    SandboxSupervisorError as SandboxSupervisorError,
 )
 from orchestrator.tools.subagent import (
     MAX_SUBAGENT_DEPTH as MAX_SUBAGENT_DEPTH,
@@ -230,7 +230,7 @@ __all__ = [
     "ExecPythonTool",
     "FileOpError",
     "FindToolsTool",
-    "HTTPSupervisorClient",
+    "HTTPSupervisorRuntime",
     "HTTPTool",
     "KnowledgeRetriever",
     "KnowledgeSearchTool",
@@ -248,19 +248,19 @@ __all__ = [
     "ReadDocumentTool",
     "ReadFileTool",
     "RecordingMCPClient",
-    "RecordingSupervisorClient",
+    "RecordingSandboxRuntime",
     "RecordingTavilyClient",
     "RecordingWorkspaceLock",
     "RecordingWorkspaceStore",
     "Reranker",
     "RetrievedChunk",
     "SandboxOutcome",
+    "SandboxRuntime",
     "SandboxSupervisorError",
     "SaveArtifactTool",
     "SearXNGClient",
     "StdioMCPClient",
     "SubAgentTool",
-    "SupervisorClient",
     "SupervisorWorkspaceStore",
     "TavilyClient",
     "Tool",

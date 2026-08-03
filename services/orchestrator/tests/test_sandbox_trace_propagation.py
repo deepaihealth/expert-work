@@ -1,4 +1,4 @@
-"""A.8 — ``HTTPSupervisorClient`` injects W3C trace context on the wire.
+"""A.8 — ``HTTPSupervisorRuntime`` injects W3C trace context on the wire.
 
 The inject half of the cross-service propagation contract (subsystems/20
 § 5.8). The matching extract half lives in the sandbox-supervisor suite
@@ -23,7 +23,7 @@ from expert_work.common.observability import (
     expert_work_span,
     init_tracing,
 )
-from orchestrator.tools.sandbox import HTTPSupervisorClient
+from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
 pytestmark = pytest.mark.asyncio
@@ -42,12 +42,12 @@ def tracing_setup() -> Iterator[None]:
         provider.shutdown()
 
 
-def _capturing_client(seen: dict[str, httpx.Headers]) -> HTTPSupervisorClient:
+def _capturing_client(seen: dict[str, httpx.Headers]) -> HTTPSupervisorRuntime:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["headers"] = request.headers
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    return HTTPSupervisorClient(
+    return HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
 
@@ -145,7 +145,7 @@ async def test_exec_aligns_timeout_and_passes_it(tracing_setup: None) -> None:
             200, json={"stdout": "ok", "stderr": "", "exit_code": 0, "timed_out": False}
         )
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "tool_call"):
@@ -212,7 +212,7 @@ async def test_acquire_serializes_seed_files_base64() -> None:
         body.update(json.loads(request.content))
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     await client.acquire(
@@ -235,7 +235,7 @@ async def test_acquire_omits_seed_files_when_empty() -> None:
         body.update(json.loads(request.content))
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     await client.acquire(tenant_id=uuid4(), thread_id="t")

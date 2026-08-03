@@ -33,7 +33,7 @@ from orchestrator.llm.rerank import HTTPDashScopeRerankClient
 from orchestrator.tools.sandbox import (
     _EXEC_HTTP_BUFFER_S,
     _MAX_EXEC_TIMEOUT_S,
-    HTTPSupervisorClient,
+    HTTPSupervisorRuntime,
 )
 from orchestrator.tools.web_search import SearXNGClient
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
@@ -167,7 +167,7 @@ async def _web_search(shared: httpx.AsyncClient) -> None:
 
 
 async def _sandbox_exec(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    client = HTTPSupervisorRuntime(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
     await client.exec(sandbox_id=uuid4(), code="1+1", timeout_s=None)
 
 
@@ -195,7 +195,7 @@ async def _sandbox_post(shared: httpx.AsyncClient) -> None:
     # release() is the simplest caller of the shared _post() helper
     # (expect_body=False — no response-shape assumptions needed); the same
     # timeout= line also covers acquire/destroy/reap.
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    client = HTTPSupervisorRuntime(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
     await client.release(sandbox_id=uuid4())
 
 

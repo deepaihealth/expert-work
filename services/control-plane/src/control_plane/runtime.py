@@ -103,7 +103,7 @@ from orchestrator.multimodal import (
 from orchestrator.tools import (
     AllowlistProvider,
     DenylistProvider,
-    HTTPSupervisorClient,
+    HTTPSupervisorRuntime,
     KnowledgeRetriever,
     LLMReranker,
     MCPClient,
@@ -111,11 +111,11 @@ from orchestrator.tools import (
     MCPServerPool,
     NullWorkspaceLock,
     Reranker,
+    SandboxRuntime,
     SearXNGClient,
     SseMCPClient,
     StdioMCPClient,
     StreamableHttpMCPClient,
-    SupervisorClient,
     SupervisorWorkspaceStore,
     TavilyClient,
     WorkspaceLock,
@@ -1431,7 +1431,7 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_supervisor_client(url: str | None) -> SupervisorClient | None:
+def build_sandbox_runtime(url: str | None) -> SandboxRuntime | None:
     """Build the Sandbox Supervisor HTTP client from its base URL.
 
     ``None`` → the ``exec_python`` tool is unavailable; an agent that
@@ -1441,23 +1441,23 @@ def build_supervisor_client(url: str | None) -> SupervisorClient | None:
     synchronous ``create_app`` body, before the lifespan creates the shared
     ``httpx.AsyncClient``, so no caller could ever pass one. The lifespan
     instead mutates ``.http`` on the returned client in place once the
-    shared client exists (``HTTPSupervisorClient`` is not frozen, so that
-    is safe) — see the ``isinstance(..., HTTPSupervisorClient)`` guard in
+    shared client exists (``HTTPSupervisorRuntime`` is not frozen, so that
+    is safe) — see the ``isinstance(..., HTTPSupervisorRuntime)`` guard in
     ``app.py``.
     """
     if url is None:
         return None
-    return HTTPSupervisorClient(base_url=url)
+    return HTTPSupervisorRuntime(base_url=url)
 
 
 def build_workspace_store(url: str | None) -> WorkspaceStore | None:
     """Build the workspace-file client from the supervisor's base URL.
 
-    波 1 Task 4 — 工作区文件操作从 ``SupervisorClient`` 拆出。本地/CI 下
+    波 1 Task 4 — 工作区文件操作从 ``SandboxRuntime`` 拆出。本地/CI 下
     工作区是 docker 卷,只有 supervisor 碰得到,所以这个实现仍走 HTTP;
     波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
 
-    ``None`` → 工作区文件端点不可用,与 ``build_supervisor_client`` 同语义。
+    ``None`` → 工作区文件端点不可用,与 ``build_sandbox_runtime`` 同语义。
     """
     if url is None:
         return None
@@ -1468,7 +1468,7 @@ def build_tool_env(
     tenant_config_service: TenantConfigService,
     *,
     web_search_client: TavilyClient | None = None,
-    supervisor_client: SupervisorClient | None = None,
+    sandbox_runtime: SandboxRuntime | None = None,
     mcp_pool: MCPServerPool | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
@@ -1478,8 +1478,8 @@ def build_tool_env(
     """Assemble the M0 :class:`ToolEnv`.
 
     Wires the HTTP tool's per-tenant allowlist, and — when supplied —
-    the ``web_search`` Tavily client, the ``exec_python`` Sandbox
-    Supervisor client, the ``mcp`` server pool, the J.9 artifact store
+    the ``web_search`` Tavily client, the ``exec_python`` sandbox
+    runtime, the ``mcp`` server pool, the J.9 artifact store
     backing ``save_artifact`` / ``list_artifacts``, the J.5 knowledge
     retriever backing ``knowledge_search``, and the J.6 image resolver
     backing multimodal input.
@@ -1488,7 +1488,7 @@ def build_tool_env(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
         denylist_provider=_tenant_denylist_provider(tenant_config_service),
         web_search_client=web_search_client,
-        supervisor_client=supervisor_client,
+        sandbox_runtime=sandbox_runtime,
         mcp_pool=mcp_pool,
         artifact_store=artifact_store,
         knowledge_retriever=knowledge_retriever,

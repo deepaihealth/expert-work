@@ -131,7 +131,7 @@ from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
 from orchestrator.tools.registry import ToolContext, ToolRegistry
-from orchestrator.tools.sandbox import EgressContext, SupervisorClient, bind_egress
+from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_egress
 from orchestrator.tools.skill_authoring import (
     SKILL_AUTHORING_BUILTINS,
     build_skill_authoring_tools,
@@ -179,11 +179,11 @@ _PROVIDER_HTTP_TIMEOUT_DEFAULT_S = 60.0
 
 
 def _make_workspace_writer_factory(
-    client: SupervisorClient,
+    client: SandboxRuntime,
 ) -> Callable[[ToolContext], WorkspaceFileWriter]:
     """Stream CM-0 — a per-turn :class:`WorkspaceFileWriter` factory bound to
     a run's ToolContext. The graph rebuilds the writer each turn (ctx is
-    per-invocation); the supervisor client is run-stable."""
+    per-invocation); the sandbox runtime is run-stable."""
 
     def factory(ctx: ToolContext) -> WorkspaceFileWriter:
         return SandboxWorkspaceWriter(client=client, ctx=ctx)
@@ -724,15 +724,15 @@ async def build_agent(
                 logger.warning("skill_seed.audit_emit_failed", exc_info=True)
 
     # sandbox-egress §3.3 — bind the agent's egress policy + identity onto the
-    # supervisor client so EVERY sandbox acquire (exec_python/bash/file_ops/
+    # sandbox runtime so EVERY sandbox acquire (exec_python/bash/file_ops/
     # workspace-ingest) carries it, without threading through each tool. The
-    # supervisor mints a per-sandbox token + injects HTTPS_PROXY when the policy
-    # is not "none" (default "proxy" — egress on, audited).
-    if env.supervisor_client is not None:
+    # sandbox runtime mints a per-sandbox token + injects HTTPS_PROXY when the
+    # policy is not "none" (default "proxy" — egress on, audited).
+    if env.sandbox_runtime is not None:
         env = replace(
             env,
-            supervisor_client=bind_egress(
-                env.supervisor_client,
+            sandbox_runtime=bind_egress(
+                env.sandbox_runtime,
                 EgressContext(
                     policy=spec.spec.sandbox.network.egress,
                     agent_name=spec.metadata.name,
@@ -992,16 +992,16 @@ async def build_agent(
 
     # Stream CM-0 — turn-end DB→/workspace state projection. Scoped to the
     # per-user persistent-workspace form (the projection target) with a wired
-    # supervisor client. A plain react agent with no plan / memory projects
+    # sandbox runtime. A plain react agent with no plan / memory projects
     # nothing (the projector no-ops), so this is effectively active only for
     # plan_execute / long-term-memory agents.
     workspace_writer_factory: Callable[[ToolContext], WorkspaceFileWriter] | None = None
     workspace_ingest_node = None
-    if spec.spec.sandbox.filesystem.persistent_workspace and env.supervisor_client is not None:
-        workspace_writer_factory = _make_workspace_writer_factory(env.supervisor_client)
+    if spec.spec.sandbox.filesystem.persistent_workspace and env.sandbox_runtime is not None:
+        workspace_writer_factory = _make_workspace_writer_factory(env.sandbox_runtime)
         # Stream CM-0 PR2b — the file→DB counterpart: ingest a human-edited
         # PLAN.md at run start. Same gate as the projection writer.
-        workspace_ingest_node = make_workspace_ingest_node(client=env.supervisor_client)
+        workspace_ingest_node = make_workspace_ingest_node(client=env.sandbox_runtime)
     # Stream PI-1b — one unguessable nonce per build (stable across the
     # session so the spotlighted memory block stays prompt-cache friendly;
     # the untrusted content's author never sees it, so it can't forge the

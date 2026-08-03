@@ -181,7 +181,7 @@ async def test_list_files_without_supervisor_returns_empty() -> None:
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
         jwt_verifier=build_test_jwt_verifier(),
     )
-    # No sandbox_supervisor_url → app.state.supervisor_client is None.
+    # No sandbox_supervisor_url → app.state.sandbox_runtime is None.
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport, base_url="http://cp.test", headers=_headers()

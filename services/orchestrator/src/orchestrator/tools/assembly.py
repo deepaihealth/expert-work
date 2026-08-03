@@ -52,7 +52,7 @@ from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
 from orchestrator.tools.registry import ToolRegistry
-from orchestrator.tools.sandbox import ExecPythonTool, SupervisorClient
+from orchestrator.tools.sandbox import ExecPythonTool, SandboxRuntime
 from orchestrator.tools.skill_authoring import SKILL_AUTHORING_BUILTINS
 from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
@@ -146,8 +146,8 @@ class ToolEnv:
     #: only after enabling it (name in ``mcp_allowlist``), so an empty allowlist
     #: = none (Stream MCP P2). ``None`` → no shared catalog servers configured.
     platform_mcp_pool: MCPServerPool | None = None
-    #: Sandbox Supervisor client backing the ``exec_python`` builtin (F.4).
-    supervisor_client: SupervisorClient | None = None
+    #: Sandbox runtime backing the ``exec_python`` builtin (F.4).
+    sandbox_runtime: SandboxRuntime | None = None
     #: Artifact registry backing the ``save_artifact`` / ``list_artifacts``
     #: builtins (Stream J.9).
     artifact_store: ArtifactStore | None = None
@@ -518,7 +518,7 @@ def _register_base_capabilities(
     Each builtin registers only when (a) it is not already present (an
     explicit manifest declaration wins and is not double-registered) and
     (b) its :class:`ToolEnv` dependency is wired. Production always wires
-    ``supervisor_client`` + ``artifact_store`` (see control-plane app.py),
+    ``sandbox_runtime`` + ``artifact_store`` (see control-plane app.py),
     so every real agent gets the full set; a deployment lacking them is a
     platform-level choice (no sandbox at all), not a per-agent off switch —
     the implicit set is silently skipped rather than raising, preserving the
@@ -532,7 +532,7 @@ def _register_base_capabilities(
         if name in ("save_artifact", "list_artifacts"):
             if env.artifact_store is None:
                 continue
-        elif env.supervisor_client is None:
+        elif env.sandbox_runtime is None:
             continue
         _register_builtin(registry, BuiltinToolSpec(name=name), env, skill_seed_files)
 
@@ -552,14 +552,14 @@ def _register_exec_python(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
 ) -> None:
-    if env.supervisor_client is None:
+    if env.sandbox_runtime is None:
         raise AgentFactoryError(
-            "builtin 'exec_python' declared but no Sandbox Supervisor client "
-            "is configured (ToolEnv.supervisor_client)"
+            "builtin 'exec_python' declared but no sandbox runtime "
+            "is configured (ToolEnv.sandbox_runtime)"
         )
     registry.register(
         ExecPythonTool(
-            client=env.supervisor_client,
+            client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
         )
     )
@@ -570,15 +570,14 @@ def _register_bash(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
 ) -> None:
-    # Stream TE-5 — bash rides the same Sandbox Supervisor as exec_python.
-    if env.supervisor_client is None:
+    # Stream TE-5 — bash rides the same sandbox runtime as exec_python.
+    if env.sandbox_runtime is None:
         raise AgentFactoryError(
-            "builtin 'bash' declared but no Sandbox Supervisor client "
-            "is configured (ToolEnv.supervisor_client)"
+            "builtin 'bash' declared but no sandbox runtime is configured (ToolEnv.sandbox_runtime)"
         )
     registry.register(
         BashTool(
-            client=env.supervisor_client,
+            client=env.sandbox_runtime,
             workspace_lock=env.workspace_lock,
             skill_seed_files=skill_seed_files,
         )
@@ -591,24 +590,24 @@ def _register_file_op(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
 ) -> None:
-    # Stream TE-7 — read_file / write_file / list_dir ride the same Sandbox
-    # Supervisor exec channel as bash / exec_python (TE-ADR-2 exec-warm locus).
-    if env.supervisor_client is None:
+    # Stream TE-7 — read_file / write_file / list_dir ride the same sandbox
+    # runtime exec channel as bash / exec_python (TE-ADR-2 exec-warm locus).
+    if env.sandbox_runtime is None:
         raise AgentFactoryError(
-            f"builtin {name!r} declared but no Sandbox Supervisor client "
-            "is configured (ToolEnv.supervisor_client)"
+            f"builtin {name!r} declared but no sandbox runtime "
+            "is configured (ToolEnv.sandbox_runtime)"
         )
     if name == "read_file":
         registry.register(
             ReadFileTool(
-                client=env.supervisor_client,
+                client=env.sandbox_runtime,
                 skill_seed_files=skill_seed_files,
             )
         )
     elif name == "write_file":
         registry.register(
             WriteFileTool(
-                client=env.supervisor_client,
+                client=env.sandbox_runtime,
                 workspace_lock=env.workspace_lock,
                 skill_seed_files=skill_seed_files,
             )
@@ -616,7 +615,7 @@ def _register_file_op(
     elif name == "edit_file":
         registry.register(
             EditFileTool(
-                client=env.supervisor_client,
+                client=env.sandbox_runtime,
                 workspace_lock=env.workspace_lock,
                 skill_seed_files=skill_seed_files,
             )
@@ -624,7 +623,7 @@ def _register_file_op(
     else:  # list_dir
         registry.register(
             ListDirTool(
-                client=env.supervisor_client,
+                client=env.sandbox_runtime,
                 skill_seed_files=skill_seed_files,
             )
         )
@@ -635,16 +634,16 @@ def _register_read_document(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
 ) -> None:
-    # read_document rides the same warm Sandbox Supervisor exec channel as the
+    # read_document rides the same warm sandbox runtime exec channel as the
     # TE-7 file primitives — the parse runs inside the per-user sandbox.
-    if env.supervisor_client is None:
+    if env.sandbox_runtime is None:
         raise AgentFactoryError(
-            "builtin 'read_document' declared but no Sandbox Supervisor client "
-            "is configured (ToolEnv.supervisor_client)"
+            "builtin 'read_document' declared but no sandbox runtime "
+            "is configured (ToolEnv.sandbox_runtime)"
         )
     registry.register(
         ReadDocumentTool(
-            client=env.supervisor_client,
+            client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
         )
     )

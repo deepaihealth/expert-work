@@ -1,4 +1,4 @@
-"""WorkspaceStore 两实现 —— 拆分自 SupervisorClient(波 1 Task 4)。"""
+"""WorkspaceStore 两实现 —— 拆分自 SandboxRuntime(波 1 Task 4)。"""
 
 from __future__ import annotations
 

@@ -34,7 +34,7 @@ from orchestrator.context import render_plan_md
 from orchestrator.graph_builder import make_workspace_ingest_node
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools.registry import ToolSpec
-from orchestrator.tools.sandbox import RecordingSupervisorClient, SandboxOutcome
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 _DIM = 32
 
@@ -194,7 +194,7 @@ async def test_workspace_ingest_emits_named_span(exporter: InMemorySpanExporter)
     # A genuine edit (goal line changed) so the ingester actually applies it —
     # the span should fire either way, but this also exercises the real path.
     edited = render_plan_md(plan).replace("ship the feature", "ship the feature now")
-    client = RecordingSupervisorClient(outcome=_read_envelope(edited))
+    client = RecordingSandboxRuntime(outcome=_read_envelope(edited))
     node = make_workspace_ingest_node(client=client)
 
     await node(  # type: ignore[arg-type]

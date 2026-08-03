@@ -34,7 +34,7 @@ from orchestrator.graph_builder.memory import MemoryNode
 from orchestrator.state import AgentState
 from orchestrator.tools.file_ops import SandboxWorkspaceReader
 from orchestrator.tools.registry import ToolContext
-from orchestrator.tools.sandbox import SupervisorClient
+from orchestrator.tools.sandbox import SandboxRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ async def _emit_state_ingested_audit(
         logger.exception("workspace_ingest.audit_failed")
 
 
-def make_workspace_ingest_node(*, client: SupervisorClient) -> MemoryNode:
+def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
     """Build the entry-chain ingest node. Reads ``PLAN.md`` via the warm
     sandbox, parses it, and returns ``{"plan": ...}`` only on a genuine,
     injection-clean edit; otherwise ``{}`` (DB authoritative).

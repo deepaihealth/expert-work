@@ -1,5 +1,5 @@
 """Phase 3a — the ``POST /v1/workspaces/{tenant}/{user}:delete`` route +
-``HTTPSupervisorClient.mark_workspace_deleted`` wire round-trip.
+``HTTPSupervisorRuntime.mark_workspace_deleted`` wire round-trip.
 
 The route proxies the control-plane cascade purge to the supervisor (only the
 supervisor can mutate a per-user docker volume). This exercises the full wire
@@ -14,7 +14,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from orchestrator.tools.sandbox import HTTPSupervisorClient
+from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from sandbox_supervisor.app import _register_routes
 
 
@@ -52,7 +52,7 @@ async def test_http_client_mark_workspace_deleted_round_trip() -> None:
     supervisor = _FakeSupervisor()
     app = _app(supervisor)
     tenant_id, user_id = uuid4(), uuid4()
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.ASGITransport(app=app)
     )
     await client.mark_workspace_deleted(tenant_id=tenant_id, user_id=user_id)

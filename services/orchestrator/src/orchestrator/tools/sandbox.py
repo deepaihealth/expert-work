@@ -4,8 +4,8 @@ Runs LLM-generated Python in a gVisor sandbox via the Sandbox Supervisor
 (F.1): ``acquire`` a sandbox, ``exec`` the code, ``release`` it. The
 supervisor mediates the held-pipe runner protocol (F.4a); this tool
 speaks only the supervisor's HTTP API behind a small
-:class:`SupervisorClient` Protocol — tests inject
-:class:`RecordingSupervisorClient`.
+:class:`SandboxRuntime` Protocol — tests inject
+:class:`RecordingSandboxRuntime`.
 
 Output is truncated to :data:`DEFAULT_OUTPUT_CHAR_CAP` for the LLM
 (Mini-ADR F-9 / E-10) — the runner already capped it at ~1 MiB for
@@ -108,15 +108,15 @@ def _traced_headers() -> dict[str, str]:
 class SandboxSupervisorError(RuntimeError):
     """A Sandbox Supervisor HTTP call failed.
 
-    Raised by :class:`HTTPSupervisorClient`; :class:`ExecPythonTool`
+    Raised by :class:`HTTPSupervisorRuntime`; :class:`ExecPythonTool`
     lets it propagate so the ReAct ``tools`` node wraps it into a
     ``ToolMessage(status="error")`` (Mini-ADR E-12).
     """
 
 
 @runtime_checkable
-class SupervisorClient(Protocol):
-    """The Sandbox Supervisor operations the tool needs."""
+class SandboxRuntime(Protocol):
+    """The sandbox runtime operations the tool needs."""
 
     async def acquire(
         self,
@@ -158,8 +158,8 @@ class SupervisorClient(Protocol):
 
 
 @dataclass
-class HTTPSupervisorClient:
-    """Production :class:`SupervisorClient` — calls the supervisor's HTTP API.
+class HTTPSupervisorRuntime:
+    """Production :class:`SandboxRuntime` — calls the supervisor's HTTP API.
 
     A non-2xx response raises :class:`SandboxSupervisorError`.
     """
@@ -296,8 +296,8 @@ class HTTPSupervisorClient:
 
 
 @dataclass
-class RecordingSupervisorClient:
-    """In-memory :class:`SupervisorClient` for dev / tests.
+class RecordingSandboxRuntime:
+    """In-memory :class:`SandboxRuntime` for dev / tests.
 
     Records the acquire / exec / release / destroy calls and returns the
     pre-set :attr:`outcome`. Set ``exec_error`` to drive the error path
@@ -359,7 +359,7 @@ class RecordingSupervisorClient:
 
 @dataclass
 class _EgressBindingClient:
-    """Wraps a :class:`SupervisorClient`, injecting a fixed :class:`EgressContext`
+    """Wraps a :class:`SandboxRuntime`, injecting a fixed :class:`EgressContext`
     into every ``acquire`` (sandbox-egress §3.3).
 
     Bound once per agent build (``agent_factory``) around the shared supervisor
@@ -368,7 +368,7 @@ class _EgressBindingClient:
     unchanged.
     """
 
-    inner: SupervisorClient
+    inner: SandboxRuntime
     egress: EgressContext
 
     async def acquire(
@@ -402,7 +402,7 @@ class _EgressBindingClient:
         return await self.inner.reap(force=force)
 
 
-def bind_egress(client: SupervisorClient, egress: EgressContext | None) -> SupervisorClient:
+def bind_egress(client: SandboxRuntime, egress: EgressContext | None) -> SandboxRuntime:
     """Wrap ``client`` so every acquire carries ``egress`` (no-op if ``None``)."""
     if egress is None:
         return client
@@ -410,7 +410,7 @@ def bind_egress(client: SupervisorClient, egress: EgressContext | None) -> Super
 
 
 async def run_in_sandbox(
-    client: SupervisorClient,
+    client: SandboxRuntime,
     *,
     code: str,
     timeout_s: int | None,
@@ -507,7 +507,7 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
     )
 
 
-async def _release_quietly(client: SupervisorClient, sandbox_id: UUID, *, tool_label: str) -> None:
+async def _release_quietly(client: SandboxRuntime, sandbox_id: UUID, *, tool_label: str) -> None:
     # A release failure must never mask the exec result / error.
     try:
         await client.release(sandbox_id=sandbox_id)
@@ -516,7 +516,7 @@ async def _release_quietly(client: SupervisorClient, sandbox_id: UUID, *, tool_l
 
 
 async def _destroy_quietly(
-    client: SupervisorClient, sandbox_id: UUID, *, reason: str, tool_label: str
+    client: SandboxRuntime, sandbox_id: UUID, *, reason: str, tool_label: str
 ) -> None:
     # A destroy failure must not mask the cancellation — the supervisor's
     # TTL reaper is the backstop for a leaked container.
@@ -530,7 +530,7 @@ async def _destroy_quietly(
 class ExecPythonTool:
     """Sandbox Python execution exposed to the LLM as ``exec_python``."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — the agent's activated skill files, materialized
     #: under ``/workspace/skills/<name>/`` on each acquire. Set at build.

@@ -1,7 +1,7 @@
 """Stream CM-0 PR2b-ii — ingest node wired into the ReAct graph.
 
 Drives ``build_react_graph`` with a ``workspace_ingest_node`` built over a
-``RecordingSupervisorClient`` (no live sandbox) whose read envelope is the
+``RecordingSandboxRuntime`` (no live sandbox) whose read envelope is the
 edited ``PLAN.md``. Asserts the run-start ingest applies a human edit to
 ``AgentState.plan``, no-ops on an unchanged file, and rejects an injection.
 """
@@ -21,7 +21,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import AgentState, GraphRunner, ToolRegistry, ToolSpec, build_react_graph
 from orchestrator.context import render_plan_md
 from orchestrator.graph_builder import make_workspace_ingest_node
-from orchestrator.tools.sandbox import RecordingSupervisorClient, SandboxOutcome
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 
 @dataclass
@@ -62,7 +62,7 @@ def _read_envelope(content: str) -> SandboxOutcome:
 
 async def _run_with_plan_md(*, plan_md: str, db_plan: Plan) -> AgentState:
     """One run whose ingest node reads ``plan_md`` from the (faked) workspace."""
-    client = RecordingSupervisorClient(outcome=_read_envelope(plan_md))
+    client = RecordingSandboxRuntime(outcome=_read_envelope(plan_md))
     node = make_workspace_ingest_node(client=client)
     llm = _ScriptedLLM(responses=[AIMessage(content="done")])
     async with make_checkpointer("memory") as cp:

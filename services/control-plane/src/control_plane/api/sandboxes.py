@@ -18,11 +18,11 @@ from control_plane.audit import emit
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.protocol import AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools.sandbox import SupervisorClient
+from orchestrator.tools.sandbox import SandboxRuntime
 
 
-def _get_supervisor_client(request: Request) -> SupervisorClient | None:
-    return getattr(request.app.state, "supervisor_client", None)
+def _get_sandbox_runtime(request: Request) -> SandboxRuntime | None:
+    return getattr(request.app.state, "sandbox_runtime", None)
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -47,7 +47,7 @@ def build_sandboxes_router() -> APIRouter:
                     "message": "only a system admin may reap sandboxes",
                 },
             )
-        client = _get_supervisor_client(request)
+        client = _get_sandbox_runtime(request)
         if client is None:
             raise HTTPException(
                 status_code=503,
