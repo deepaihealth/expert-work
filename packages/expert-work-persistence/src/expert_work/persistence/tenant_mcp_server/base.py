@@ -68,6 +68,12 @@ class TenantMcpServerStore(abc.ABC):
         """Return all rows for the tenant, ordered by ``name``."""
 
     @abc.abstractmethod
+    async def list_all_tenants(self) -> list[TenantMcpServerRecord]:
+        """Every tenant's rows, ordered by ``(name, tenant_id)`` — the W4
+        ``tenant_id=*`` aggregate. Caller MUST wrap the call in
+        ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``."""
+
+    @abc.abstractmethod
     async def update(
         self, *, tenant_id: UUID, name: str, patch: TenantMcpServerPatch
     ) -> TenantMcpServerRecord:

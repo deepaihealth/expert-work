@@ -140,6 +140,36 @@ async def test_insert_and_latest_and_list(
 
 
 @pytest.mark.asyncio
+async def test_list_alerts_all_tenants_spans_tenants(
+    alert_store: tuple[SqlQualityDriftAlertStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 — the aggregate reader spans tenants. Runs on the container's
+    superuser connection (production posture: the app's superuser connection
+    with the RLS GUC skipped via ``bypass_rls_session``); the app-role RLS
+    store below proves per-tenant reads stay scoped."""
+    store, engine = alert_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityDriftAlertStore(create_async_session_factory(su_engine))
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        current_tenant_id_var.set(tenant_a)
+        await store.insert(_alert(tenant=tenant_a, agent="agg-a"))
+        current_tenant_id_var.set(tenant_b)
+        await store.insert(_alert(tenant=tenant_b, agent="agg-b"))
+
+        rows = await su_store.list_alerts_all_tenants()
+        mine = {(r.tenant_id, r.agent_name) for r in rows if r.tenant_id in {tenant_a, tenant_b}}
+        assert mine == {(tenant_a, "agg-a"), (tenant_b, "agg-b")}
+        # agent_name narrows the aggregate the same way as the sibling.
+        only_b = await su_store.list_alerts_all_tenants(agent_name="agg-b")
+        assert {r.tenant_id for r in only_b if r.tenant_id in {tenant_a, tenant_b}} == {tenant_b}
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_rls_blocks_cross_tenant_read(
     alert_store: tuple[SqlQualityDriftAlertStore, AsyncEngine],
 ) -> None:

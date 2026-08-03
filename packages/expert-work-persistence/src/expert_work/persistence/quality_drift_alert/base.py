@@ -34,3 +34,16 @@ class QualityDriftAlertStore(abc.ABC):
         limit: int = 100,
     ) -> list[QualityDriftAlertRecord]:
         """Recent alerts, newest ``detected_at`` first (dashboard, RT-ADR-26)."""
+
+    @abc.abstractmethod
+    async def list_alerts_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[QualityDriftAlertRecord]:
+        """:meth:`list_alerts` across every tenant (``detected_at`` DESC,
+        ``id`` tiebreak) — the W4 ``tenant_id=*`` aggregate. Caller MUST wrap
+        the call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
+        """

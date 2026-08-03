@@ -54,6 +54,19 @@ class QualityScoreStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_scores_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[QualityScoreRecord]:
+        """:meth:`list_scores` across every tenant (``observed_at`` DESC,
+        ``id`` tiebreak) — the W4 ``tenant_id=*`` aggregate. Caller MUST wrap
+        the call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
+        """
+
+    @abc.abstractmethod
     async def list_agents_with_scores_since(self, *, since: datetime) -> list[tuple[UUID, str]]:
         """Distinct ``(tenant_id, agent_name)`` with a verdict at/after ``since``.
 

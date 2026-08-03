@@ -19,11 +19,12 @@ from control_plane.audit import emit
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenancy.tenant_config import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
+    CrossTenant,
     applied_scope,
     bypass_rls_session,
     cross_tenant_query_enabled,
     ensure_single_tenant_scope,
-    ensure_tenant_scope_home_fallback,
+    ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.url_validation import RemoteURLError, validate_remote_url
@@ -715,9 +716,11 @@ def build_mcp_servers_router() -> APIRouter:
         # tenant's MCP servers from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
-        # to the caller's home tenant (see the shared helper's docstring).
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — real cross-tenant aggregate: "*" reads every tenant via the
+        # store's all-tenants reader; a concrete id keeps the W3 single-tenant
+        # read (see members.py for the pattern). ``_public`` serializes the
+        # record's ``tenant_id`` in both branches (W4 response contract).
+        scope = await ensure_tenant_scope(
             principal,
             tenant_id,
             audit,
@@ -726,7 +729,10 @@ def build_mcp_servers_router() -> APIRouter:
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         async with applied_scope(scope):
-            rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
+            if isinstance(scope, CrossTenant):
+                rows = await store.list_all_tenants()
+            else:
+                rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
         return {"success": True, "data": [_public(r) for r in rows], "error": None}
 
     @router.post("/test")
@@ -775,8 +781,11 @@ def build_mcp_servers_router() -> APIRouter:
         # W3 read scope — same treatment as the base list.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> dict[str, object]:
-        # W3 — same "*" home collapse as the base list.
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 (C3) — "本租户可用的 server" is inherently single-tenant (the
+        # allowlist lives on one tenant's config row), so the "*" aggregate is
+        # meaningless here: explicit 400 SCOPE_ALL_NOT_SUPPORTED instead of the
+        # former silent home collapse.
+        scope = await ensure_single_tenant_scope(
             principal,
             tenant_id,
             audit,

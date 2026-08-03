@@ -182,11 +182,12 @@ async def test_list_drift_alerts_tenant_scoped(ctx: _Ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W3 — quality 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — quality 读端点接跨租户 scope(系统管理员租户切换器)
 #
 # 三件套(列表无 "*" 详情拒绝项):system_admin 带目标租户 tenant_id →
 # 200 命中目标租户数据;普通租户用户带他租户 tenant_id → 403
-# TENANT_NOT_ALLOWED;"*" 无聚合读法 → 回落归属租户。照 W2 先例。
+# TENANT_NOT_ALLOWED;tenant_id=* → W4 真聚合(全租户行,每行带
+# tenant_id)。照 W2 先例。
 # ---------------------------------------------------------------------------
 
 
@@ -207,10 +208,12 @@ async def _grant_system_admin(client: AsyncClient) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _seed_alert(*, at: datetime) -> QualityDriftAlertRecord:
+def _seed_alert(
+    *, at: datetime, tenant: object = _TENANT, agent: str = "a"
+) -> QualityDriftAlertRecord:
     return QualityDriftAlertRecord(
-        tenant_id=_TENANT,
-        agent_name="a",
+        tenant_id=tenant,  # type: ignore[arg-type]
+        agent_name=agent,
         recent_mean=3.0,
         baseline_mean=5.0,
         drift_pct=0.4,
@@ -238,15 +241,24 @@ async def test_quality_system_admin_target_tenant_200(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
-    """``tenant_id=*``:quality store 无聚合读法(spec 非目标)→ 回落
-    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+async def test_quality_scores_star_aggregates_all_tenants(ctx: _Ctx) -> None:
+    """W4:system_admin ``tenant_id=*`` 真聚合——全租户行,每行带
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。"""
     now = datetime.now(tz=UTC)
+    other_tenant = uuid4()
     await ctx.scores.insert(_score(agent="a", overall=4, at=now))
+    await ctx.scores.insert(_score(agent="b", overall=3, at=now, tenant=other_tenant))
+
+    # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+    plain = await ctx.client.get("/v1/quality/scores")
+    assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
+
     headers = await _grant_system_admin(ctx.client)
     resp = await ctx.client.get("/v1/quality/scores", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["items"] == []
+    by_agent = {it["agent_name"]: it for it in resp.json()["items"]}
+    assert by_agent["a"]["tenant_id"] == str(_TENANT)
+    assert by_agent["b"]["tenant_id"] == str(other_tenant)
 
 
 @pytest.mark.asyncio
@@ -262,13 +274,22 @@ async def test_quality_foreign_tenant_user_403(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_quality_drift_alerts_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
-    """``tenant_id=*`` 回落断言补齐 /drift-alerts(与 /scores 同 helper,M-3)。"""
+async def test_quality_drift_alerts_star_aggregates_all_tenants(ctx: _Ctx) -> None:
+    """W4 聚合断言补齐 /drift-alerts(与 /scores 同 helper)。"""
     now = datetime.now(tz=UTC)
+    other_tenant = uuid4()
     await ctx.alerts.insert(_seed_alert(at=now))
+    await ctx.alerts.insert(_seed_alert(at=now, tenant=other_tenant, agent="b"))
+
+    # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+    plain = await ctx.client.get("/v1/quality/drift-alerts")
+    assert [it["tenant_id"] for it in plain.json()["items"]] == [str(_TENANT)]
+
     headers = await _grant_system_admin(ctx.client)
     resp = await ctx.client.get(
         "/v1/quality/drift-alerts", params={"tenant_id": "*"}, headers=headers
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["items"] == []
+    by_agent = {it["agent_name"]: it for it in resp.json()["items"]}
+    assert by_agent["a"]["tenant_id"] == str(_TENANT)
+    assert by_agent["b"]["tenant_id"] == str(other_tenant)

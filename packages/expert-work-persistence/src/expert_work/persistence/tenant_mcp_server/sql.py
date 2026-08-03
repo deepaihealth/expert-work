@@ -127,6 +127,16 @@ class SqlTenantMcpServerStore(TenantMcpServerStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
 
+    async def list_all_tenants(self) -> list[TenantMcpServerRecord]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        # tenant_id tiebreak: (tenant_id, name) is unique, name alone is not.
+        stmt = select(TenantMcpServerRow).order_by(
+            TenantMcpServerRow.name, TenantMcpServerRow.tenant_id
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_record(r) for r in rows]
+
     async def update(
         self, *, tenant_id: UUID, name: str, patch: TenantMcpServerPatch
     ) -> TenantMcpServerRecord:

@@ -175,6 +175,34 @@ class SqlEvalRunStore(EvalRunStore):
             )
             return [_run_to_dto(r) for r in rows], int(total)
 
+    async def list_all_tenants(
+        self,
+        *,
+        status: EvalRunStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[EvalRunRecord], int]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        stmt = select(EvalRunRow)
+        count_stmt = select(func.count()).select_from(EvalRunRow)
+        if status is not None:
+            stmt = stmt.where(EvalRunRow.status == status.value)
+            count_stmt = count_stmt.where(EvalRunRow.status == status.value)
+        async with self._sf() as session:
+            total = (await session.execute(count_stmt)).scalar_one()
+            rows = (
+                (
+                    await session.execute(
+                        stmt.order_by(EvalRunRow.created_at.desc(), EvalRunRow.id)
+                        .limit(limit)
+                        .offset(offset)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [_run_to_dto(r) for r in rows], int(total)
+
     async def append_case_result(self, record: EvalCaseResultRecord) -> EvalCaseResultRecord:
         async with self._sf() as session:
             row = EvalCaseResultRow(

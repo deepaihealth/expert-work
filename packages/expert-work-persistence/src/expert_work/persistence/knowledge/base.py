@@ -128,6 +128,12 @@ class KnowledgeStore(abc.ABC):
         """The tenant's knowledge bases, newest first."""
 
     @abc.abstractmethod
+    async def list_bases_all_tenants(self) -> list[KnowledgeBase]:
+        """Every tenant's knowledge bases, newest first (``id`` tiebreak) —
+        the W4 ``tenant_id=*`` aggregate. Caller MUST wrap the call in
+        ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``."""
+
+    @abc.abstractmethod
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         """``(document_count, total_chunk_count)`` for one base. Computed
         from ``knowledge_document`` (chunk counts are maintained per
@@ -137,6 +143,12 @@ class KnowledgeStore(abc.ABC):
     async def base_stats_many(self, *, tenant_id: UUID) -> dict[UUID, tuple[int, int]]:
         """``{kb_id: (document_count, total_chunk_count)}`` for all the
         tenant's bases in one query — used by ``list_bases`` to avoid N+1."""
+
+    @abc.abstractmethod
+    async def base_stats_many_all_tenants(self) -> dict[UUID, tuple[int, int]]:
+        """:meth:`base_stats_many` across every tenant — ``kb_id`` is globally
+        unique, so one dict serves the W4 aggregate list. Same bypass posture
+        as :meth:`list_bases_all_tenants`."""
 
     @abc.abstractmethod
     async def stamp_embedding_model(

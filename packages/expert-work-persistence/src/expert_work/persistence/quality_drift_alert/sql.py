@@ -74,3 +74,23 @@ class SqlQualityDriftAlertStore(QualityDriftAlertStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(row) for row in rows]
+
+    async def list_alerts_all_tenants(
+        self,
+        *,
+        agent_name: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[QualityDriftAlertRecord]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        stmt = select(QualityDriftAlertRow)
+        if agent_name is not None:
+            stmt = stmt.where(QualityDriftAlertRow.agent_name == agent_name)
+        if since is not None:
+            stmt = stmt.where(QualityDriftAlertRow.detected_at >= since)
+        stmt = stmt.order_by(
+            QualityDriftAlertRow.detected_at.desc(), QualityDriftAlertRow.id
+        ).limit(limit)
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_record(row) for row in rows]

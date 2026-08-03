@@ -558,11 +558,12 @@ async def test_reingest_missing_document_404(full_setup: FullSetup) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W3 — knowledge 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — knowledge 读端点接跨租户 scope(系统管理员租户切换器)
 #
 # 三件套 per endpoint:system_admin 带目标租户 tenant_id → 200;普通租户
 # 用户带他租户 tenant_id → 403 TENANT_NOT_ALLOWED;详情端点 tenant_id=* →
-# 400 SCOPE_ALL_NOT_SUPPORTED。照 test_agents_api.py W2 先例。
+# 400 SCOPE_ALL_NOT_SUPPORTED。列表 tenant_id=* → W4 真聚合(全租户行,
+# 每行带 tenant_id)。照 test_agents_api.py W2 先例。
 # ---------------------------------------------------------------------------
 
 
@@ -631,16 +632,27 @@ async def test_knowledge_scope_system_admin_target_tenant_200(full_setup: FullSe
 
 
 @pytest.mark.asyncio
-async def test_knowledge_list_bases_star_falls_back_to_home_tenant(full_setup: FullSetup) -> None:
-    """``tenant_id=*``:KnowledgeStore 无聚合读法(spec 非目标)→ 回落
-    system_admin 归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
-    client, runner, _ = full_setup
+async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: FullSetup) -> None:
+    """W4:system_admin ``tenant_id=*`` 真聚合——全租户 base,每行带
+    ``tenant_id``;非聚合分支的行同样带 ``tenant_id``(值=该租户)。"""
+    client, runner, store = full_setup
     await _seed_kb_with_document(client, runner)
+    other_tenant = uuid4()
+    await store.create_base(tenant_id=other_tenant, name="other-kb")
+
+    # Non-aggregate branch: items carry tenant_id = the scoped tenant.
+    plain = await client.get("/v1/knowledge/bases")
+    assert [b["tenant_id"] for b in plain.json()["bases"]] == [str(_TENANT)]
+
     headers = await _grant_system_admin(client)
     resp = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    # The sys-admin's home tenant is a fresh uuid4 — no bases there.
-    assert resp.json()["bases"] == []
+    by_name = {b["name"]: b for b in resp.json()["bases"]}
+    assert by_name["kb"]["tenant_id"] == str(_TENANT)
+    assert by_name["other-kb"]["tenant_id"] == str(other_tenant)
+    # Stats stay attributed per base across the aggregate.
+    assert by_name["kb"]["stats"]["document_count"] == 1
+    assert by_name["other-kb"]["stats"]["document_count"] == 0
 
 
 _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [

@@ -278,6 +278,33 @@ async def test_base_stats_aggregate(sql_store: SqlStoreFixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_bases_all_tenants_aggregates(sql_store: SqlStoreFixture) -> None:
+    """W4 — the all-tenants readers span tenants (newest first, per-base
+    stats keyed by globally-unique kb_id). Session container is shared, so
+    assertions filter to this test's tenants."""
+    store, engine = sql_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        base_a = await store.create_base(tenant_id=tenant_a, name="kb-a")
+        base_b = await store.create_base(tenant_id=tenant_b, name="kb-b")
+        doc = await store.upsert_document(tenant_id=tenant_a, kb_id=base_a.id, filename="a.pdf")
+        await store.set_document_status(
+            tenant_id=tenant_a, document_id=doc.id, status=DocumentStatus.READY, chunk_count=3
+        )
+
+        rows = await store.list_bases_all_tenants()
+        mine = [b for b in rows if b.tenant_id in {tenant_a, tenant_b}]
+        # Both tenants' bases surface, newest first across tenants.
+        assert [(b.tenant_id, b.name) for b in mine] == [(tenant_b, "kb-b"), (tenant_a, "kb-a")]
+
+        stats = await store.base_stats_many_all_tenants()
+        assert stats[base_a.id] == (1, 3)
+        assert base_b.id not in stats  # no documents yet
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_search_scored_surfaces_similarity(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

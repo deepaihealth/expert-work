@@ -214,6 +214,36 @@ async def test_window_stats_tenant_scoped_avg(
 
 
 @pytest.mark.asyncio
+async def test_list_scores_all_tenants_spans_tenants(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 — the aggregate reader spans tenants. Runs on the container's
+    superuser connection (production posture: the app's superuser connection
+    with the RLS GUC skipped via ``bypass_rls_session``); the app-role RLS
+    store above proves per-tenant reads stay scoped."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        current_tenant_id_var.set(tenant_a)
+        await store.insert(_record(tenant=tenant_a, run=uuid4(), agent="agg-a"))
+        current_tenant_id_var.set(tenant_b)
+        await store.insert(_record(tenant=tenant_b, run=uuid4(), agent="agg-b"))
+
+        rows = await su_store.list_scores_all_tenants()
+        mine = {(r.tenant_id, r.agent_name) for r in rows if r.tenant_id in {tenant_a, tenant_b}}
+        assert mine == {(tenant_a, "agg-a"), (tenant_b, "agg-b")}
+        # agent_name narrows the aggregate the same way as the sibling.
+        only_b = await su_store.list_scores_all_tenants(agent_name="agg-b")
+        assert {r.tenant_id for r in only_b if r.tenant_id in {tenant_a, tenant_b}} == {tenant_b}
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_rls_blocks_cross_tenant_read(
     quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
 ) -> None:

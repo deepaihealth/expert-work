@@ -134,6 +134,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         bases = [b for b in self._bases if b.tenant_id == tenant_id]
         return sorted(bases, key=_created_key, reverse=True)
 
+    async def list_bases_all_tenants(self) -> list[KnowledgeBase]:
+        # W4 — no tenant filter; created_at DESC with id tiebreak (two stable
+        # sorts) matching the SQL implementation byte-for-byte.
+        bases = sorted(self._bases, key=lambda b: b.id.int)
+        return sorted(bases, key=_created_key, reverse=True)
+
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         docs = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
         return len(docs), sum(d.chunk_count for d in docs)
@@ -143,6 +149,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         for doc in self._documents:
             if doc.tenant_id != tenant_id:
                 continue
+            count, chunks = stats.get(doc.kb_id, (0, 0))
+            stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)
+        return stats
+
+    async def base_stats_many_all_tenants(self) -> dict[UUID, tuple[int, int]]:
+        # W4 — no tenant filter; kb_id is globally unique.
+        stats: dict[UUID, tuple[int, int]] = {}
+        for doc in self._documents:
             count, chunks = stats.get(doc.kb_id, (0, 0))
             stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)
         return stats

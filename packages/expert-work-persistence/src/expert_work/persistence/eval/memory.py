@@ -89,6 +89,20 @@ class InMemoryEvalRunStore(EvalRunStore):
         rows.sort(key=lambda r: r.created_at, reverse=True)
         return rows[offset : offset + limit], len(rows)
 
+    async def list_all_tenants(
+        self,
+        *,
+        status: EvalRunStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[EvalRunRecord], int]:
+        # W4 — no tenant filter; created_at DESC with id tiebreak (two stable
+        # sorts) matching the SQL implementation byte-for-byte.
+        rows = [r for r in self._runs.values() if status is None or r.status is status]
+        rows.sort(key=lambda r: r.id.int)
+        rows.sort(key=lambda r: r.created_at, reverse=True)
+        return rows[offset : offset + limit], len(rows)
+
     async def append_case_result(self, record: EvalCaseResultRecord) -> EvalCaseResultRecord:
         stored = record.model_copy(update={"id": next(self._ids)})
         self._results.append(stored)

@@ -27,10 +27,11 @@ from pydantic import BaseModel, Field
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.tenant_scope import (
+    CrossTenant,
     applied_scope,
     cross_tenant_query_enabled,
     ensure_single_tenant_scope,
-    ensure_tenant_scope_home_fallback,
+    ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
@@ -143,6 +144,9 @@ def _base_dict(
     document_count, chunk_count = stats
     return {
         "id": str(base.id),
+        # W4 response contract — every item carries its owning tenant in both
+        # the aggregate ("*") and the single-tenant branch.
+        "tenant_id": str(base.tenant_id),
         "name": base.name,
         "description": base.description,
         "created_by": base.created_by,
@@ -241,9 +245,10 @@ def build_knowledge_router() -> APIRouter:
         # tenant's knowledge bases from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
-        # W3 — no cross-tenant aggregate reader on this store; "*" collapses
-        # to the caller's home tenant (see the shared helper's docstring).
-        scope = await ensure_tenant_scope_home_fallback(
+        # W4 — real cross-tenant aggregate: "*" reads every tenant via the
+        # store's all-tenants readers; a concrete id keeps the W3 single-tenant
+        # read (see members.py for the pattern).
+        scope = await ensure_tenant_scope(
             request.state.principal,
             tenant_id,
             audit,
@@ -252,8 +257,12 @@ def build_knowledge_router() -> APIRouter:
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         async with applied_scope(scope):
-            bases = await store.list_bases(tenant_id=scope.tenant_id)
-            stats = await store.base_stats_many(tenant_id=scope.tenant_id)
+            if isinstance(scope, CrossTenant):
+                bases = await store.list_bases_all_tenants()
+                stats = await store.base_stats_many_all_tenants()
+            else:
+                bases = await store.list_bases(tenant_id=scope.tenant_id)
+                stats = await store.base_stats_many(tenant_id=scope.tenant_id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
             content={
