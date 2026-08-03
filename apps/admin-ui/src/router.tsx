@@ -1,4 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
+import { useAuth } from "./auth/AuthContext";
+import { useTenantScope } from "./tenant/TenantScopeContext";
+import { defaultPathForScope } from "./components/navModel";
 import { AgentsList } from "./pages/AgentsList";
 import { ApprovalsList } from "./pages/ApprovalsList";
 import { AgentDetail } from "./pages/AgentDetail";
@@ -48,10 +51,20 @@ import { TriggersList } from "./pages/TriggersList";
 import { WebhooksList } from "./pages/WebhooksList";
 import { ComingSoon } from "./pages/ComingSoon";
 
+/** Scope-aware landing for ``/`` — a system_admin at the platform level
+ *  (``"*"``, incl. the sessionStorage-restored scope on re-login) lands on
+ *  the platform group's first menu entry, everyone else on /agents. Keeps
+ *  the root redirect consistent with the switcher/promotion landing rule. */
+function HomeRedirect() {
+  const { scope } = useTenantScope();
+  const isSystemAdmin = useAuth().identity?.isSystemAdmin ?? false;
+  return <Navigate to={defaultPathForScope(scope, isSystemAdmin)} replace />;
+}
+
 export function AppRouter() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate to="/agents" replace />} />
+      <Route path="/" element={<HomeRedirect />} />
       <Route path="/agents" element={<AgentsList />} />
       <Route path="/agents/:name/:version" element={<AgentDetail />} />
       {/* User detail before the generic :tab route — three segments

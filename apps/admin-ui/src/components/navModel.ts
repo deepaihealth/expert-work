@@ -296,6 +296,24 @@ export function defaultPathForScope(
   return first?.path ?? "/agents";
 }
 
+/** Whether ``path`` belongs to a nav group visible under ``(scope,
+ *  isSystemAdmin)``. A path can live in several groups (``/settings/members``
+ *  is both a tenant-settings entry and the platform "all tenants" overview) —
+ *  it is allowed if ANY of them is visible. Paths outside the nav model
+ *  (login, OAuth callbacks…) are always allowed. */
+export function pathAllowedForScope(
+  path: string,
+  scope: TenantScopeValue,
+  isSystemAdmin: boolean,
+): boolean {
+  const groups = visibleGroups(scope, isSystemAdmin);
+  const matches = ALL_NAV_ENTRIES.filter(
+    (e) => path === e.path || path.startsWith(`${e.path}/`),
+  );
+  if (matches.length === 0) return true;
+  return matches.some((e) => groups.includes(e.group));
+}
+
 /** Which group a route path belongs to (longest-prefix wins so eg.
  *  ``/settings/platform-users`` doesn't match ``/settings/platform``
  *  before the more specific entry). */
