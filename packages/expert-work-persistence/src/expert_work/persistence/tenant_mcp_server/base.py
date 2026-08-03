@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import abc
 from datetime import datetime
+from typing import Final
 from uuid import UUID
 
 from expert_work.protocol import (
@@ -13,6 +14,12 @@ from expert_work.protocol import (
     TenantMcpServerPatch,
     TenantMcpServerRecord,
 )
+
+#: Default cap for :meth:`TenantMcpServerStore.list_all_tenants` — the single
+#: source shared by both store implementations and the ``GET /v1/mcp-servers``
+#: endpoint (which also derives its ``truncated`` response flag from it, so
+#: the two must never drift).
+ALL_TENANTS_SERVERS_LIMIT: Final = 200
 
 
 class TenantMcpServerNotFoundError(Exception):
@@ -68,9 +75,13 @@ class TenantMcpServerStore(abc.ABC):
         """Return all rows for the tenant, ordered by ``name``."""
 
     @abc.abstractmethod
-    async def list_all_tenants(self) -> list[TenantMcpServerRecord]:
-        """Every tenant's rows, ordered by ``(name, tenant_id)`` — the W4
-        ``tenant_id=*`` aggregate. Caller MUST wrap the call in
+    async def list_all_tenants(
+        self, *, limit: int = ALL_TENANTS_SERVERS_LIMIT
+    ) -> list[TenantMcpServerRecord]:
+        """Every tenant's rows, ordered by ``(name, tenant_id)``, capped at
+        ``limit`` rows — the W4 ``tenant_id=*`` aggregate (``list_for_tenant``
+        has no cap; the cross-tenant read is bounded so it can never become an
+        unbounded full-table page). Caller MUST wrap the call in
         ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``."""
 
     @abc.abstractmethod

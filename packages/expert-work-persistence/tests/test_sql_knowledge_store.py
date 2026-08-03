@@ -312,19 +312,26 @@ async def test_list_bases_all_tenants_aggregates(sql_store: SqlStoreFixture) -> 
 async def test_list_bases_all_tenants_id_tiebreak_on_equal_created_at(
     sql_store: SqlStoreFixture,
 ) -> None:
-    """W4 review C-3 — ``created_at`` ties order by ``id`` ASC. The two rows'
-    ``created_at`` are equalized via raw UPDATEs issued higher-id first, so
-    the live heap tuples end up in *descending* id order — a dropped tiebreak
-    degrades to heap-scan order and the exact-order assertion goes red."""
+    """W4 review C-3 (2nd round) — ``created_at`` ties order by ``id`` ASC.
+
+    The query has no WHERE, so under the session-scoped container EVERY row in
+    the table joins the sort — with a 2-row tie a dropped tiebreak could still
+    come out ascending by accident (file-scope false green). Eight tied rows
+    are seeded instead, their ``created_at`` equalized via raw UPDATEs issued
+    highest-id first so the live heap tuples land in *descending* id order: a
+    dropped tiebreak cannot happen to emit the full 8-element ascending id
+    sequence, whatever else is in the table."""
     store, engine = sql_store
     try:
-        tenant_a, tenant_b = uuid4(), uuid4()
-        base_1 = await store.create_base(tenant_id=tenant_a, name="tie-1")
-        base_2 = await store.create_base(tenant_id=tenant_b, name="tie-2")
-        lo, hi = sorted((base_1, base_2), key=lambda b: b.id.int)
+        tenants = [uuid4() for _ in range(8)]
+        bases = [
+            await store.create_base(tenant_id=tenant, name=f"tie-{i}")
+            for i, tenant in enumerate(tenants)
+        ]
+        ordered = sorted(bases, key=lambda b: b.id.int)
         ts = datetime(2035, 1, 1, 12, 0, tzinfo=UTC)
         async with engine.begin() as conn:
-            for kb in (hi, lo):  # hi first → live tuples land id-descending
+            for kb in reversed(ordered):  # highest id first → heap id-descending
                 await conn.execute(
                     update(KnowledgeBaseRow)
                     .where(KnowledgeBaseRow.id == kb.id)
@@ -332,7 +339,37 @@ async def test_list_bases_all_tenants_id_tiebreak_on_equal_created_at(
                 )
 
         rows = await store.list_bases_all_tenants(limit=500)
-        assert [b.id for b in rows if b.tenant_id in {tenant_a, tenant_b}] == [lo.id, hi.id]
+        my_tenants = set(tenants)
+        # Postgres uuid byte order == UUID.int order.
+        assert [b.id for b in rows if b.tenant_id in my_tenants] == [b.id for b in ordered]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_respects_limit(sql_store: SqlStoreFixture) -> None:
+    """W4 review #2 — the ``limit`` leg is load-bearing. Two rows are pushed
+    to the global top of the ``created_at DESC`` order (far-future stamps beat
+    every other row in the shared session container), then ``limit=1`` must
+    return exactly the newer one."""
+    store, engine = sql_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        older = await store.create_base(tenant_id=tenant_a, name="limit-older")
+        newer = await store.create_base(tenant_id=tenant_b, name="limit-newer")
+        async with engine.begin() as conn:
+            for kb, ts in (
+                (older, datetime(2036, 1, 1, tzinfo=UTC)),
+                (newer, datetime(2036, 1, 2, tzinfo=UTC)),
+            ):
+                await conn.execute(
+                    update(KnowledgeBaseRow)
+                    .where(KnowledgeBaseRow.id == kb.id)
+                    .values(created_at=ts)
+                )
+
+        rows = await store.list_bases_all_tenants(limit=1)
+        assert [b.id for b in rows] == [newer.id]
     finally:
         await engine.dispose()
 

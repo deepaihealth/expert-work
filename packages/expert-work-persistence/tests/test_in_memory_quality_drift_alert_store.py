@@ -76,13 +76,19 @@ async def test_list_alerts_all_tenants_id_tiebreak_on_equal_detected_at() -> Non
     assigns ids in insertion order (list order == id order), so the tie is
     seeded white-box (precedent: ``test_in_memory_memory_consolidator.py``)
     in *descending* id order — a dropped id sort degrades to list order and
-    the exact-order assertion goes red."""
+    the exact-order assertion goes red. Review #5 — a same-tenant pair rides
+    along so the per-tenant sibling (``list_alerts``) proves the identical
+    tiebreak contract."""
     store = InMemoryQualityDriftAlertStore()
     ts = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
     tenant_a, tenant_b = uuid4(), uuid4()
     rec_1 = _alert(tenant=tenant_a, at=ts).model_copy(update={"id": 1})
-    rec_2 = _alert(tenant=tenant_b, at=ts).model_copy(update={"id": 2})
-    store._alerts.extend([rec_2, rec_1])  # descending id seed
+    rec_2 = _alert(tenant=tenant_a, at=ts).model_copy(update={"id": 2})
+    rec_3 = _alert(tenant=tenant_b, at=ts).model_copy(update={"id": 3})
+    store._alerts.extend([rec_3, rec_2, rec_1])  # descending id seed
 
     rows = await store.list_alerts_all_tenants()
-    assert [r.id for r in rows] == [1, 2]
+    assert [r.id for r in rows] == [1, 2, 3]
+    # Review #5 — the per-tenant sibling shares the id tiebreak contract.
+    sibling = await store.list_alerts(tenant_id=tenant_a)
+    assert [r.id for r in sibling] == [1, 2]

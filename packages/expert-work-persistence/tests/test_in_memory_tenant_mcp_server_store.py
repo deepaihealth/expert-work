@@ -102,6 +102,19 @@ async def test_list_all_tenants_ordered_name_then_tenant_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_all_tenants_respects_limit() -> None:
+    """W4 review #4 — the aggregate cap: ``limit=1`` keeps only the first row
+    of the ``(name, tenant_id)`` order."""
+    store = InMemoryTenantMcpServerStore()
+    tid = uuid4()
+    await _make(store, tid, name="beta")
+    await _make(store, tid, name="alpha")
+
+    rows = await store.list_all_tenants(limit=1)
+    assert [r.name for r in rows] == ["alpha"]
+
+
+@pytest.mark.asyncio
 async def test_update_applies_partial_fields() -> None:
     store = InMemoryTenantMcpServerStore()
     tid = uuid4()

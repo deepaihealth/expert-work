@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from expert_work.persistence.knowledge.base import (
+    ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
     DuplicateKnowledgeBaseError,
@@ -220,7 +221,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_to_base(row) for row in rows]
 
-    async def list_bases_all_tenants(self, *, limit: int = 200) -> list[KnowledgeBase]:
+    async def list_bases_all_tenants(
+        self, *, limit: int = ALL_TENANTS_BASES_LIMIT
+    ) -> list[KnowledgeBase]:
         # W4 — no tenant filter; caller must wrap in bypass_rls_session().
         stmt = (
             select(KnowledgeBaseRow)

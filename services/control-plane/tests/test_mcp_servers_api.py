@@ -1550,6 +1550,45 @@ async def test_mcp_list_star_aggregates_all_tenants(
 
 
 @pytest.mark.asyncio
+async def test_mcp_list_star_truncated_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W4 二轮 #4:聚合响应顶层带 ``truncated``(``data`` 是裸列表,与
+    ``cross_tenant`` 并排)——聚合页装满 cap 为 true,未装满为 false,非聚合
+    分支恒 false。cap 通过 monkeypatch 端点模块引用的 store 侧常量注入
+    (端点用同一常量取页+算 flag,单源)。"""
+    app, admin_headers, _tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        await _seed_server(client, admin_headers)
+        await app.state.tenant_mcp_server_store.create(  # type: ignore[attr-defined]
+            tenant_id=uuid4(),
+            name="linear-b",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth_type="none",
+            token_secret_ref=None,
+            timeout_s=30.0,
+            created_by="seed",
+        )
+        headers = await _grant_system_admin_on(app)
+
+        under = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
+        assert under.status_code == 200, under.text
+        assert under.json()["truncated"] is False  # 2 rows < default cap (200)
+
+        monkeypatch.setattr("control_plane.api.mcp_servers.ALL_TENANTS_SERVERS_LIMIT", 1)
+        capped = await client.get("/v1/mcp-servers", params={"tenant_id": "*"}, headers=headers)
+        assert capped.status_code == 200, capped.text
+        assert len(capped.json()["data"]) == 1  # the cap actually bounds the page
+        assert capped.json()["truncated"] is True
+
+        # Non-aggregate branch has no cap — never truncated.
+        plain = await client.get("/v1/mcp-servers", headers=admin_headers)
+        assert plain.status_code == 200, plain.text
+        assert plain.json()["truncated"] is False
+
+
+@pytest.mark.asyncio
 async def test_mcp_available_tenant_id_star_400(monkeypatch: pytest.MonkeyPatch) -> None:
     """W4 C3:available 语义=「本租户可用的 server」,聚合无意义 →
     ``tenant_id=*`` 显式 400 SCOPE_ALL_NOT_SUPPORTED(原为静默回落)。"""

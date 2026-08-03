@@ -47,7 +47,7 @@ class QualityScoreStore(abc.ABC):
         since: datetime | None = None,
         limit: int = 200,
     ) -> list[QualityScoreRecord]:
-        """Recent verdicts, newest ``observed_at`` first.
+        """Recent verdicts, newest ``observed_at`` first (``id`` tiebreak).
 
         Serves the drift window (RT-ADR-24) and the dashboard trend
         (RT-ADR-26). ``agent_name`` / ``since`` narrow the series.

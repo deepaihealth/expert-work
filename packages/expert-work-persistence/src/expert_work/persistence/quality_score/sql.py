@@ -100,7 +100,8 @@ class SqlQualityScoreStore(QualityScoreStore):
             stmt = stmt.where(QualityScoreRow.agent_name == agent_name)
         if since is not None:
             stmt = stmt.where(QualityScoreRow.observed_at >= since)
-        stmt = stmt.order_by(QualityScoreRow.observed_at.desc()).limit(limit)
+        # id tiebreak — same ordering contract as the all-tenants sibling.
+        stmt = stmt.order_by(QualityScoreRow.observed_at.desc(), QualityScoreRow.id).limit(limit)
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(row) for row in rows]

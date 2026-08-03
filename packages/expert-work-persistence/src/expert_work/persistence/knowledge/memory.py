@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from expert_work.persistence.knowledge.base import (
+    ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
     DuplicateKnowledgeBaseError,
@@ -134,7 +135,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         bases = [b for b in self._bases if b.tenant_id == tenant_id]
         return sorted(bases, key=_created_key, reverse=True)
 
-    async def list_bases_all_tenants(self, *, limit: int = 200) -> list[KnowledgeBase]:
+    async def list_bases_all_tenants(
+        self, *, limit: int = ALL_TENANTS_BASES_LIMIT
+    ) -> list[KnowledgeBase]:
         # W4 — no tenant filter; created_at DESC with id tiebreak (two stable
         # sorts) matching the SQL implementation byte-for-byte.
         bases = sorted(self._bases, key=lambda b: b.id.int)

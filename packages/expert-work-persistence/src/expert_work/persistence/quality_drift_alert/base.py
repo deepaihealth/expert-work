@@ -33,7 +33,8 @@ class QualityDriftAlertStore(abc.ABC):
         since: datetime | None = None,
         limit: int = 100,
     ) -> list[QualityDriftAlertRecord]:
-        """Recent alerts, newest ``detected_at`` first (dashboard, RT-ADR-26)."""
+        """Recent alerts, newest ``detected_at`` first (``id`` tiebreak) —
+        dashboard, RT-ADR-26."""
 
     @abc.abstractmethod
     async def list_alerts_all_tenants(

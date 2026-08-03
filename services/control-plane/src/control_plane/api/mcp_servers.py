@@ -34,6 +34,7 @@ from expert_work.persistence import (
     TenantMcpServerNotFoundError,
     TenantMcpServerStore,
 )
+from expert_work.persistence.tenant_mcp_server import ALL_TENANTS_SERVERS_LIMIT
 from expert_work.protocol import (
     AgentSpecRecord,
     AgentSpecStatus,
@@ -730,7 +731,9 @@ def build_mcp_servers_router() -> APIRouter:
         )
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
-                rows = await store.list_all_tenants()
+                # W4 review #4 — bounded aggregate: the cap is the store-side
+                # constant (single source with the ``truncated`` flag below).
+                rows = await store.list_all_tenants(limit=ALL_TENANTS_SERVERS_LIMIT)
             else:
                 rows = await store.list_for_tenant(tenant_id=scope.tenant_id)
         return {
@@ -740,6 +743,9 @@ def build_mcp_servers_router() -> APIRouter:
             # W4 response contract — aggregate branch flagged for the UI
             # (top-level: ``data`` is a bare list on this endpoint).
             "cross_tenant": isinstance(scope, CrossTenant),
+            # W4 review #4 — a full aggregate page signals the cap was hit
+            # (the single-tenant branch has no cap, so it is never truncated).
+            "truncated": isinstance(scope, CrossTenant) and len(rows) == ALL_TENANTS_SERVERS_LIMIT,
         }
 
     @router.post("/test")

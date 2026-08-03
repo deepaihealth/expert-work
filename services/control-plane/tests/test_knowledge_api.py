@@ -663,6 +663,34 @@ async def test_knowledge_list_bases_star_aggregates_all_tenants(full_setup: Full
     assert by_key[(str(other_tenant), "other-kb")]["stats"]["document_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_knowledge_list_bases_star_truncated_flag(
+    full_setup: FullSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W4 二轮 #3:聚合响应带顶层 ``truncated``——聚合页装满 cap 为 true,
+    未装满为 false,非聚合分支恒 false。cap 通过 monkeypatch 端点模块引用的
+    store 侧常量注入(端点用同一常量取页+算 flag,单源)。"""
+    client, _runner, store = full_setup
+    for i in range(3):
+        await store.create_base(tenant_id=uuid4(), name=f"kb-{i}")
+    headers = await _grant_system_admin(client)
+
+    under = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    assert under.status_code == 200, under.text
+    assert under.json()["truncated"] is False  # 3 rows < default cap (200)
+
+    monkeypatch.setattr("control_plane.api.knowledge.ALL_TENANTS_BASES_LIMIT", 2)
+    capped = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    assert capped.status_code == 200, capped.text
+    assert len(capped.json()["bases"]) == 2  # the cap actually bounds the page
+    assert capped.json()["truncated"] is True
+
+    # Non-aggregate branch has no cap — never truncated.
+    plain = await client.get("/v1/knowledge/bases")
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["truncated"] is False
+
+
 _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [
     ("list_bases", "/v1/knowledge/bases"),
     ("get_base", "/v1/knowledge/bases/kb"),

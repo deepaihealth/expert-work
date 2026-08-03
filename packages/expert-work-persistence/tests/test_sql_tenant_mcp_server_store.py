@@ -240,6 +240,40 @@ async def test_list_all_tenants_spans_tenants_ordered(
 
 
 @pytest.mark.asyncio
+async def test_list_all_tenants_respects_limit(
+    tenant_mcp_server_platform_scope: tuple[
+        SqlTenantMcpServerStore, SqlMcpConnectorCatalogStore, AsyncEngine
+    ],
+) -> None:
+    """W4 review #4 — the ``limit`` leg is load-bearing. The two rows' names
+    are digit-prefixed so they sort ahead of every other test's rows in the
+    shared session container (digits precede letters in C and en_US alike);
+    ``limit=1`` must return exactly the first of the ``(name, tenant_id)``
+    order."""
+    servers, _catalog, engine = tenant_mcp_server_platform_scope
+    try:
+        tid = uuid4()
+        first_name = f"0-limit-a-{uuid4().hex[:12]}"
+        second_name = f"0-limit-b-{uuid4().hex[:12]}"
+        for name in (second_name, first_name):  # insert out of order
+            await servers.create(
+                tenant_id=tid,
+                name=name,
+                transport="streamable_http",
+                url="https://mcp.example.com/a",
+                auth_type="none",
+                token_secret_ref=None,
+                timeout_s=30.0,
+                created_by="a@x",
+            )
+
+        rows = await servers.list_all_tenants(limit=1)
+        assert [r.name for r in rows] == [first_name]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_count_for_catalog_empty(
     tenant_mcp_server_platform_scope: tuple[
         SqlTenantMcpServerStore, SqlMcpConnectorCatalogStore, AsyncEngine

@@ -35,7 +35,11 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
-from expert_work.persistence.knowledge import UNSET, DuplicateKnowledgeBaseError
+from expert_work.persistence.knowledge import (
+    ALL_TENANTS_BASES_LIMIT,
+    UNSET,
+    DuplicateKnowledgeBaseError,
+)
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -53,10 +57,9 @@ from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.knowledge")
 
-#: W4 cap for the ``tenant_id=*`` aggregate — ``list_bases`` (single tenant)
-#: has no cap; the cross-tenant read is bounded so it can never become an
-#: unbounded full-table page.
-_ALL_TENANTS_BASES_LIMIT = 200
+# W4 cap for the ``tenant_id=*`` aggregate: ``ALL_TENANTS_BASES_LIMIT`` is the
+# store-side constant (single source — the store default and the ``truncated``
+# flag below must never drift).
 
 
 class _CreateBaseBody(BaseModel):
@@ -263,7 +266,7 @@ def build_knowledge_router() -> APIRouter:
         )
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
-                bases = await store.list_bases_all_tenants(limit=_ALL_TENANTS_BASES_LIMIT)
+                bases = await store.list_bases_all_tenants(limit=ALL_TENANTS_BASES_LIMIT)
                 stats = await store.base_stats_many_all_tenants(kb_ids=[b.id for b in bases])
             else:
                 bases = await store.list_bases(tenant_id=scope.tenant_id)
@@ -281,6 +284,11 @@ def build_knowledge_router() -> APIRouter:
                 ],
                 # W4 response contract — aggregate branch flagged for the UI.
                 "cross_tenant": isinstance(scope, CrossTenant),
+                # W4 review #3 — a full aggregate page signals the cap was hit
+                # (the single-tenant branch has no cap, so it is never
+                # truncated).
+                "truncated": isinstance(scope, CrossTenant)
+                and len(bases) == ALL_TENANTS_BASES_LIMIT,
             }
         )
 

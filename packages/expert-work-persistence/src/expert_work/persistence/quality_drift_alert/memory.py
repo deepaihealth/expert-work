@@ -57,6 +57,9 @@ class InMemoryQualityDriftAlertStore(QualityDriftAlertStore):
                 and (agent_name is None or rec.agent_name == agent_name)
                 and (since is None or (rec.detected_at is not None and rec.detected_at >= since))
             ]
+        # id tiebreak (two stable sorts) — same ordering contract as the
+        # all-tenants sibling, matching the SQL implementation byte-for-byte.
+        rows.sort(key=lambda r: r.id or 0)
         rows.sort(key=lambda r: r.detected_at or datetime.min.replace(tzinfo=UTC), reverse=True)
         return rows[:limit]
 

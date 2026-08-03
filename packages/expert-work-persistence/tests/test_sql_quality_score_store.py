@@ -283,6 +283,48 @@ async def test_list_scores_all_tenants_id_tiebreak_on_equal_observed_at(
 
 
 @pytest.mark.asyncio
+async def test_list_scores_id_tiebreak_on_equal_observed_at(
+    quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """W4 review #5 — the per-tenant sibling (``list_scores``) shares the
+    ``id`` tiebreak contract. Its query is served off the
+    ``(tenant_id, agent_name, observed_at)`` index scanned backward, whose
+    duplicate-key order is heap-TID *descending* — so the UPDATEs equalizing
+    ``observed_at`` are issued lowest-id first (ascending TIDs track ids):
+    without the tiebreak the backward scan yields ids descending and the
+    ascending assertion goes red."""
+    store, engine = quality_store
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlQualityScoreStore(create_async_session_factory(su_engine))
+    try:
+        tenant = uuid4()
+        agent = f"tie-sib-{uuid4().hex[:8]}"
+        current_tenant_id_var.set(tenant)
+        mine = [
+            await store.insert(_record(tenant=tenant, run=uuid4(), agent=agent)) for _ in range(6)
+        ]
+        ids = [r.id for r in mine]
+        assert all(i is not None for i in ids)
+        assert ids == sorted(ids, key=lambda i: i or 0)  # serial ids follow insertion order
+
+        ts = datetime(2035, 2, 1, 12, 0, tzinfo=UTC)
+        async with su_engine.begin() as conn:
+            for row_id in ids:  # lowest id first → new index TIDs ascend with id
+                await conn.execute(
+                    update(QualityScoreRow)
+                    .where(QualityScoreRow.id == row_id)
+                    .values(observed_at=ts)
+                )
+
+        rows = await su_store.list_scores(tenant_id=tenant, agent_name=agent)
+        assert [r.id for r in rows] == ids
+    finally:
+        await su_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_rls_blocks_cross_tenant_read(
     quality_store: tuple[SqlQualityScoreStore, AsyncEngine],
 ) -> None:

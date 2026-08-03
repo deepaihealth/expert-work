@@ -70,7 +70,10 @@ class SqlQualityDriftAlertStore(QualityDriftAlertStore):
             stmt = stmt.where(QualityDriftAlertRow.agent_name == agent_name)
         if since is not None:
             stmt = stmt.where(QualityDriftAlertRow.detected_at >= since)
-        stmt = stmt.order_by(QualityDriftAlertRow.detected_at.desc()).limit(limit)
+        # id tiebreak — same ordering contract as the all-tenants sibling.
+        stmt = stmt.order_by(
+            QualityDriftAlertRow.detected_at.desc(), QualityDriftAlertRow.id
+        ).limit(limit)
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(row) for row in rows]
