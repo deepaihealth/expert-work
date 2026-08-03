@@ -54,7 +54,7 @@ type Story = StoryObj<typeof GovernancePanel>;
 export const AgentPrivateNoPending: Story = {
   render: () => {
     stubPromoteRequests([]);
-    return <GovernancePanel skill={BASE} isAdmin={false} onChanged={() => {}} readScope={undefined} />;
+    return <GovernancePanel skill={BASE} isAdmin={false} onChanged={() => {}} readScope={undefined} readonly={false} />;
   },
 };
 
@@ -76,7 +76,7 @@ export const PendingForAdmin: Story = {
         created_at: "2026-06-08T00:00:00Z",
       },
     ]);
-    return <GovernancePanel skill={BASE} isAdmin onChanged={() => {}} readScope={undefined} />;
+    return <GovernancePanel skill={BASE} isAdmin onChanged={() => {}} readScope={undefined} readonly={false} />;
   },
 };
 
@@ -89,6 +89,7 @@ export const TenantVisible: Story = {
         isAdmin
         onChanged={() => {}}
         readScope={undefined}
+        readonly={false}
       />
     );
   },

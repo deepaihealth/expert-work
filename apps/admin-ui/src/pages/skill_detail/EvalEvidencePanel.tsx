@@ -35,8 +35,9 @@ function clamp01(v: number): number {
 
 interface EvalEvidencePanelProps {
   skillId: string;
-  /** Cross-tenant W4(D2)— 权威读口径(URL ``?tenant_id=`` 优先,"*" 折叠
-   *  成 undefined),由 SkillDetail 统一下传。 */
+  /** Cross-tenant W4(D2)— 权威读口径:URL ``?tenant_id=`` 原样透传优先;
+   *  无 URL 参数时取 ambient scope("*" 折叠成 undefined),由 SkillDetail
+   *  统一下传。 */
   readScope: string | undefined;
 }
 

@@ -31,7 +31,6 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../../api/client";
 import { encodeUtf8Base64, type SkillVersion } from "../../api/skills";
 import { type SkillApi } from "../../api/skillApi";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -41,6 +40,9 @@ interface AddFileModalProps {
   open: boolean;
   skillId: string;
   versionNumber: number;
+  /** Cross-tenant W4(D2)— 只读态(切入态 ∪ "*" 聚合深链外租户读),由
+   *  SkillDetail 统一判定下传;新增文件是写操作,置灰。 */
+  readonly: boolean;
   onClose: () => void;
   /** Called after the PUT returns the new SkillVersion. The parent
    *  should ``setSelectedVersion`` to the returned version and ``setSelectedPath``
@@ -80,13 +82,12 @@ export function AddFileModal({
   open,
   skillId,
   versionNumber,
+  readonly,
   onClose,
   onAdded,
 }: AddFileModalProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
-  // Cross-tenant W3 — 切入态只读:新增文件是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
   const [form] = Form.useForm<FormValues>();
   const [uploaded, setUploaded] = useState<UploadFile | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -156,12 +157,12 @@ export function AddFileModal({
           {t("skills.file_action_cancel")}
         </Button>,
         <ReadonlyTooltip
-          key="submit" on={isTenantSwitched}>
+          key="submit" on={readonly}>
           <Button
             type="primary"
             onClick={handleSubmit}
             loading={submitting}
-            disabled={isTenantSwitched}
+            disabled={readonly}
             data-testid="skill-add-file-submit"
           >
             {t("skills.file_add_submit")}
