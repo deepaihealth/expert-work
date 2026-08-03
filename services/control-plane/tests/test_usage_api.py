@@ -288,11 +288,11 @@ async def test_tokens_by_kind_split_and_filter(ctx: _Ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
-# W3 — usage 读端点接跨租户 scope(系统管理员租户切换器)
+# W3/W4 — usage 读端点接跨租户 scope(系统管理员租户切换器 + "*" 真聚合)
 #
-# 三件套(列表性读,无 "*" 详情拒绝项):system_admin 带目标租户 tenant_id
-# → 200 命中目标租户数据;普通租户用户带他租户 tenant_id → 403
-# TENANT_NOT_ALLOWED;"*" 无聚合读法 → 回落归属租户。照 W2 先例。
+# system_admin 带目标租户 tenant_id → 200 命中目标租户数据;普通租户用户带
+# 他租户 tenant_id → 403 TENANT_NOT_ALLOWED;"*"(W4)→ 真聚合所有租户,
+# 分组 key 带 tenant 维度(同名 agent/model 不撞桶),行带 tenant_id。
 # ---------------------------------------------------------------------------
 
 
@@ -342,16 +342,63 @@ async def test_usage_system_admin_target_tenant_200(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
-    """``tenant_id=*``:usage 无聚合读法(spec 非目标)→ 回落 system_admin
-    归属租户(照前端 concreteTenantScope 口径),不 500/400。"""
+async def test_usage_cost_star_aggregates_all_tenants(ctx: _Ctx) -> None:
+    """W4 ``tenant_id=*``:/cost 真聚合所有租户;同名 agent 在两个租户里
+    各成一桶(tenant 维度进分组 key,不撞名),行带 ``tenant_id``。"""
+    other = uuid4()
     await ctx.ledger.upsert(
         _ledger_row(tenant_id=ctx.tenant_id, agent="a1", model="m1", billed=300)
     )
+    await ctx.ledger.upsert(_ledger_row(tenant_id=other, agent="a1", model="m1", billed=700))
     headers = await _grant_system_admin(ctx.client)
+
     resp = await ctx.client.get("/v1/usage/cost", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"]["total_billed_cost_micros"] == 0
+    data = resp.json()["data"]
+    assert data["total_billed_cost_micros"] == 1000
+    # 同名 agent → 两桶(每租户一桶),而非折叠成一桶 1000。
+    assert len(data["groups"]) == 2
+    by_tenant = {g["tenant_id"]: g for g in data["groups"]}
+    assert set(by_tenant) == {str(ctx.tenant_id), str(other)}
+    assert by_tenant[str(ctx.tenant_id)]["billed_cost_micros"] == 300
+    assert by_tenant[str(other)]["billed_cost_micros"] == 700
+    assert all(g["key"] == "a1" for g in data["groups"])
+    # 聚合面同样受 no-leak 约束。
+    for g in data["groups"]:
+        assert _FORBIDDEN_KEYS.isdisjoint(g.keys()), g
+
+
+@pytest.mark.asyncio
+async def test_usage_star_forbidden_for_tenant_user(ctx: _Ctx) -> None:
+    """``tenant_id=*`` 仅 system_admin(W4 真聚合后照旧 403)。"""
+    for path in ("/v1/usage/cost", "/v1/usage/tokens"):
+        resp = await ctx.client.get(path, params={"tenant_id": "*"}, headers=ctx.headers)
+        assert resp.status_code == 403, f"{path}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "CROSS_TENANT_FORBIDDEN", path
+
+
+@pytest.mark.asyncio
+async def test_usage_single_tenant_rows_carry_tenant_id(ctx: _Ctx) -> None:
+    """非聚合分支:行的 ``tenant_id`` 填当前租户(additive,不破坏旧字段)。"""
+    await ctx.ledger.upsert(
+        _ledger_row(tenant_id=ctx.tenant_id, agent="a1", model="m1", billed=300)
+    )
+    await ctx.usage.insert(
+        TokenUsageRecord(
+            tenant_id=ctx.tenant_id,
+            agent_name="a1",
+            agent_version="1",
+            model="m1",
+            provider="anthropic",
+            input_tokens=10,
+            output_tokens=1,
+        )
+    )
+    cost = (await ctx.client.get("/v1/usage/cost", headers=ctx.headers)).json()["data"]
+    assert [g["tenant_id"] for g in cost["groups"]] == [str(ctx.tenant_id)]
+    tokens = (await ctx.client.get("/v1/usage/tokens", headers=ctx.headers)).json()["data"]
+    for split in ("by_agent", "by_model", "by_kind"):
+        assert [g["tenant_id"] for g in tokens[split]] == [str(ctx.tenant_id)], split
 
 
 @pytest.mark.asyncio
@@ -365,20 +412,31 @@ async def test_usage_foreign_tenant_user_403(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_usage_tokens_star_falls_back_to_home_tenant(ctx: _Ctx) -> None:
-    """``tenant_id=*`` 回落断言补齐 /tokens(与 /cost 同 helper,M-3)。"""
-    await ctx.usage.insert(
-        TokenUsageRecord(
-            tenant_id=ctx.tenant_id,
-            agent_name="a1",
-            agent_version="1",
-            model="m1",
-            provider="anthropic",
-            input_tokens=10,
-            output_tokens=1,
+async def test_usage_tokens_star_aggregates_all_tenants(ctx: _Ctx) -> None:
+    """W4 ``tenant_id=*``:/tokens 真聚合;同名 agent/model 两租户各一桶
+    (tenant 维度分桶不撞名),total 是全租户合计。"""
+    other = uuid4()
+    for tenant, inp in ((ctx.tenant_id, 10), (other, 40)):
+        await ctx.usage.insert(
+            TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="a1",
+                agent_version="1",
+                model="m1",
+                provider="anthropic",
+                input_tokens=inp,
+                output_tokens=1,
+            )
         )
-    )
     headers = await _grant_system_admin(ctx.client)
     resp = await ctx.client.get("/v1/usage/tokens", params={"tenant_id": "*"}, headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"]["total"]["input_tokens"] == 0
+    data = resp.json()["data"]
+    assert data["total"]["input_tokens"] == 50
+    for split in ("by_agent", "by_model"):
+        rows = data[split]
+        assert len(rows) == 2, split  # 同名 key → 每租户一桶,不折叠
+        by_tenant = {g["tenant_id"]: g for g in rows}
+        assert set(by_tenant) == {str(ctx.tenant_id), str(other)}, split
+        assert by_tenant[str(ctx.tenant_id)]["input_tokens"] == 10, split
+        assert by_tenant[str(other)]["input_tokens"] == 40, split
