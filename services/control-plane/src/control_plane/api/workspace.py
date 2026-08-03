@@ -42,7 +42,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, SupervisorClient
+from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
 
@@ -55,8 +55,14 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
 
 
-def _get_supervisor_client(request: Request) -> SupervisorClient | None:
-    return request.app.state.supervisor_client  # type: ignore[no-any-return]
+def _get_workspace_file_store(request: Request) -> WorkspaceStore | None:
+    """波 1 Task 4 —— 工作区**文件**操作的客户端。
+
+    与上面的 ``_get_workspace_store`` 区分开:那个返回
+    ``UserWorkspaceStore``(工作区元数据表,配额/软删状态),这个返回
+    ``WorkspaceStore``(文件读写)。两者名字撞车过一次,别再合并。
+    """
+    return request.app.state.workspace_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -150,7 +156,7 @@ def build_workspace_router() -> APIRouter:
     async def list_workspace_files(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[UUID | None, Query()] = None,
         # W3 read scope — concrete tenant only (single-tenant semantics).
@@ -173,10 +179,10 @@ def build_workspace_router() -> APIRouter:
         )
         # Caller-identity resolution stays OUTSIDE applied_scope.
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
-        if target_user_id is None or supervisor is None:
+        if target_user_id is None or workspace_store is None:
             return JSONResponse({"success": True, "data": {"files": []}})
         try:
-            entries = await supervisor.list_workspace_files(
+            entries = await workspace_store.list_files(
                 tenant_id=scope.tenant_id, user_id=target_user_id
             )
         except SandboxSupervisorError:
@@ -189,7 +195,7 @@ def build_workspace_router() -> APIRouter:
     async def download_workspace_file(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         path: Annotated[str, Query()],
         user_id: Annotated[UUID | None, Query()] = None,
@@ -218,10 +224,10 @@ def build_workspace_router() -> APIRouter:
         safe_path = _safe_workspace_relpath(path)
         if safe_path is None:
             raise HTTPException(status_code=400, detail="invalid workspace path")
-        if target_user_id is None or supervisor is None:
+        if target_user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
-            data = await supervisor.read_workspace_file(
+            data = await workspace_store.read_file(
                 tenant_id=scope.tenant_id, user_id=target_user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:
@@ -241,7 +247,7 @@ def build_workspace_router() -> APIRouter:
     async def delete_workspace_file(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         path: Annotated[str, Query()],
         user_id: Annotated[UUID | None, Query()] = None,
@@ -259,10 +265,10 @@ def build_workspace_router() -> APIRouter:
         safe_path = _safe_workspace_relpath(path)
         if safe_path is None:
             raise HTTPException(status_code=400, detail="invalid workspace path")
-        if target_user_id is None or supervisor is None:
+        if target_user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
-            await supervisor.delete_workspace_file(
+            await workspace_store.delete_file(
                 tenant_id=tenant_id, user_id=target_user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:

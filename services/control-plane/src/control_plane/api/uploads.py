@@ -43,7 +43,7 @@ from expert_work.protocol import AuditAction, AuditResult, QuotaDimension
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
-from orchestrator.tools import SandboxSupervisorError, SupervisorClient
+from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
 
 #: File extension per accepted image content type. The reverse direction
 #: (ext → media_type) lives in the orchestrator's image resolver.
@@ -121,7 +121,7 @@ async def _handle_document_upload(
     caller_user_id: UUID | None,
     thread_id: UUID,
     settings: Settings,
-    supervisor: SupervisorClient | None,
+    workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
 ) -> JSONResponse:
     """Land an uploaded document in the caller's persistent workspace.
@@ -140,7 +140,7 @@ async def _handle_document_upload(
     if caller_user_id is None:
         # A document needs a per-user workspace to land in.
         raise HTTPException(status_code=400, detail="document upload requires a user workspace")
-    if supervisor is None:
+    if workspace_store is None:
         raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
 
     max_bytes = settings.document_max_bytes
@@ -155,7 +155,7 @@ async def _handle_document_upload(
 
     workspace_path = _safe_workspace_name(filename, ext)
     try:
-        await supervisor.write_workspace_file(
+        await workspace_store.write_file(
             tenant_id=tenant_id,
             user_id=caller_user_id,
             path=workspace_path,
@@ -215,8 +215,8 @@ def _get_image_upload_store(request: Request) -> ImageUploadStore:
     return request.app.state.image_upload_store  # type: ignore[no-any-return]
 
 
-def _get_supervisor_client(request: Request) -> SupervisorClient | None:
-    return getattr(request.app.state, "supervisor_client", None)
+def _get_workspace_store(request: Request) -> WorkspaceStore | None:
+    return getattr(request.app.state, "workspace_store", None)
 
 
 def build_uploads_router() -> APIRouter:
@@ -242,7 +242,7 @@ def build_uploads_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
 
@@ -276,7 +276,7 @@ def build_uploads_router() -> APIRouter:
                 caller_user_id=caller_user_id,
                 thread_id=thread_id,
                 settings=settings,
-                supervisor=supervisor,
+                workspace_store=workspace_store,
                 audit=audit,
             )
 

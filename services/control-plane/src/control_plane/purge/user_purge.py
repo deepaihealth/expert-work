@@ -58,7 +58,7 @@ from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
 from expert_work.runtime.storage import ObjectStore
-from orchestrator.tools import SupervisorClient
+from orchestrator.tools import WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.purge.user")
 
@@ -105,7 +105,7 @@ class PurgeUserDeps:
     audit: AuditLogger
     #: ``None`` in deployments without a wired supervisor — the workspace step
     #: is then skipped + flagged (mirrors ``sessions.py`` supervisor optionality).
-    supervisor: SupervisorClient | None
+    workspace_store: WorkspaceStore | None
 
 
 @dataclass
@@ -433,11 +433,11 @@ async def purge_user(
 
     # 4) Workspace — supervisor soft-deletes the volume (reaper archives) +
     # drops the user's sandbox_instance rows. Skipped when no supervisor wired.
-    if deps.supervisor is not None:
+    if deps.workspace_store is not None:
         await _step(
             summary,
             "workspace",
-            deps.supervisor.mark_workspace_deleted(tenant_id=tenant_id, user_id=user_id),
+            deps.workspace_store.mark_deleted(tenant_id=tenant_id, user_id=user_id),
             default=None,
         )
         summary.workspace_marked_deleted = "workspace" not in summary.failures

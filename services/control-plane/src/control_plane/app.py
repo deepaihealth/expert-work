@@ -200,6 +200,7 @@ from control_plane.runtime import (
     build_middleware_env,
     build_supervisor_client,
     build_tool_env,
+    build_workspace_store,
     make_agent_builder,
     make_agent_runtime,
     make_image_resolver,
@@ -493,7 +494,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from orchestrator import MemoryEnv
-from orchestrator.tools import HTTPSupervisorClient
+from orchestrator.tools import HTTPSupervisorClient, SupervisorWorkspaceStore
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -693,6 +694,10 @@ def create_app(
         else InMemorySandboxEgressAuditStore()
     )
     resolved_supervisor_client = build_supervisor_client(resolved_settings.sandbox_supervisor_url)
+    # 波 1 Task 4 — workspace-file ops now live on a separate client, built
+    # from the same supervisor URL (still the only thing that can reach the
+    # docker-volume workspace today; wave 2's NAS mount replaces this).
+    resolved_workspace_store = build_workspace_store(resolved_settings.sandbox_supervisor_url)
     resolved_feedback = feedback_repo or (
         sql_stores.feedback if sql_stores else InMemoryFeedbackStore()
     )
@@ -1299,6 +1304,10 @@ def create_app(
                 # a type-checker complaint.
                 if isinstance(resolved_supervisor_client, HTTPSupervisorClient):
                     resolved_supervisor_client.http = shared_http
+                # Same pre-lifespan-build / in-place-mutate dance for the
+                # split-out workspace-file client (波 1 Task 4).
+                if isinstance(resolved_workspace_store, SupervisorWorkspaceStore):
+                    resolved_workspace_store.http = shared_http
                 mcp_pool = await stack.enter_async_context(
                     build_mcp_pool(
                         resolved_settings.mcp_servers_config_file,
@@ -2187,6 +2196,7 @@ def create_app(
     # the pre-lifespan default so ``getattr`` lookups are well-defined.
     app.state.knowledge_recovery_worker = None
     app.state.supervisor_client = resolved_supervisor_client
+    app.state.workspace_store = resolved_workspace_store
     app.state.audit_logger = resolved_audit
     app.state.manifest_loader = resolved_loader
     app.state.jwt_verifier = resolved_verifier

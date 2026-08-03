@@ -286,7 +286,7 @@ async def test_workspace_files_and_download_with_supervisor(
     audit_store: InMemoryAuditLogStore,
 ) -> None:
     # Inject a recording supervisor so the browse + download paths run end to end.
-    from orchestrator.tools import RecordingSupervisorClient, WorkspaceFileEntry
+    from orchestrator.tools import RecordingWorkspaceStore, WorkspaceFileEntry
 
     settings = Settings(
         env="dev",
@@ -308,7 +308,7 @@ async def test_workspace_files_and_download_with_supervisor(
     ) as client:
         await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
         # Override the lifespan-set (None) client with a recording one.
-        app.state.supervisor_client = RecordingSupervisorClient(
+        app.state.workspace_store = RecordingWorkspaceStore(
             workspace_files=[WorkspaceFileEntry(path="report.pdf", size=2048)],
             workspace_file=b"%PDF-1.4 hello",
         )
@@ -337,15 +337,15 @@ async def test_workspace_files_and_download_with_supervisor(
         )
         assert deleted.status_code == 200
         assert deleted.json()["data"]["deleted"] == "report.pdf"
-        sup = app.state.supervisor_client
-        assert [d[2] for d in sup.workspace_deletes] == ["report.pdf"]
+        store = app.state.workspace_store
+        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
 
         # A traversal path is rejected before reaching the supervisor.
         bad = await client.request(
             "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "../etc/passwd"}
         )
         assert bad.status_code == 400
-        assert [d[2] for d in sup.workspace_deletes] == ["report.pdf"]
+        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -989,7 +989,7 @@ async def test_session_workspace_file_and_artifact_download_system_admin_200(
     """The two byte-download endpoints, end to end with a recording
     supervisor: a system_admin homed elsewhere reads the target tenant
     thread's workspace file and artifact via ``?tenant_id=``."""
-    from orchestrator.tools import RecordingSupervisorClient, WorkspaceFileEntry
+    from orchestrator.tools import RecordingWorkspaceStore, WorkspaceFileEntry
 
     settings = Settings(
         env="dev",
@@ -1010,7 +1010,7 @@ async def test_session_workspace_file_and_artifact_download_system_admin_200(
         transport=transport, base_url="http://control-plane.test", headers=headers
     ) as client:
         await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
-        app.state.supervisor_client = RecordingSupervisorClient(
+        app.state.workspace_store = RecordingWorkspaceStore(
             workspace_files=[WorkspaceFileEntry(path="report.pdf", size=2048)],
             workspace_file=b"%PDF-1.4 hello",
         )

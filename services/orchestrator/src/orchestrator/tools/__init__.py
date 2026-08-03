@@ -168,9 +168,6 @@ from orchestrator.tools.sandbox import (
 from orchestrator.tools.sandbox import (
     SupervisorClient as SupervisorClient,
 )
-from orchestrator.tools.sandbox import (
-    WorkspaceFileEntry as WorkspaceFileEntry,
-)
 from orchestrator.tools.subagent import (
     MAX_SUBAGENT_DEPTH as MAX_SUBAGENT_DEPTH,
 )
@@ -200,6 +197,18 @@ from orchestrator.tools.web_search import (
 )
 from orchestrator.tools.web_search import (
     WebSearchTool as WebSearchTool,
+)
+from orchestrator.tools.workspace_store import (
+    RecordingWorkspaceStore as RecordingWorkspaceStore,
+)
+from orchestrator.tools.workspace_store import (
+    SupervisorWorkspaceStore as SupervisorWorkspaceStore,
+)
+from orchestrator.tools.workspace_store import (
+    WorkspaceFileEntry as WorkspaceFileEntry,
+)
+from orchestrator.tools.workspace_store import (
+    WorkspaceStore as WorkspaceStore,
 )
 
 __all__ = [
@@ -242,6 +251,7 @@ __all__ = [
     "RecordingSupervisorClient",
     "RecordingTavilyClient",
     "RecordingWorkspaceLock",
+    "RecordingWorkspaceStore",
     "Reranker",
     "RetrievedChunk",
     "SandboxOutcome",
@@ -251,6 +261,7 @@ __all__ = [
     "StdioMCPClient",
     "SubAgentTool",
     "SupervisorClient",
+    "SupervisorWorkspaceStore",
     "TavilyClient",
     "Tool",
     "ToolBlockedError",
@@ -263,6 +274,7 @@ __all__ = [
     "WebSearchTool",
     "WorkspaceFileEntry",
     "WorkspaceLock",
+    "WorkspaceStore",
     "WriteFileTool",
     "build_tool_registry",
     "register_mcp_tools",

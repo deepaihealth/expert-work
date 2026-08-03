@@ -583,13 +583,13 @@ async def test_purge_active_member_suspends_deletes_kc_and_purges_data(
 ) -> None:
     """② active (subject_id + data) → suspended; KC deleted; data cascade ran."""
     from expert_work.protocol import AuditAction, AuditQuery
-    from orchestrator.tools.sandbox import RecordingSupervisorClient
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
     client, tenant_id, app, kc = admin_app
     # create_app has no supervisor URL in tests — wire the recording fake so
     # the workspace step of the cascade runs (otherwise it logs a failure and
     # ``purge.ok`` could never be asserted True).
-    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    app.state.workspace_store = RecordingWorkspaceStore()  # type: ignore[attr-defined]
     member_id = await _invite_one(client, tenant_id)
     user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
 
@@ -656,10 +656,10 @@ async def test_purge_rerun_is_idempotent(
     admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
 ) -> None:
     """④ re-running the purge is a safe no-op (200, every step no-ops)."""
-    from orchestrator.tools.sandbox import RecordingSupervisorClient
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
     client, tenant_id, app, _kc = admin_app
-    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    app.state.workspace_store = RecordingWorkspaceStore()  # type: ignore[attr-defined]
     member_id = await _invite_one(client, tenant_id)
     await _activate_with_data(app, tenant_id, member_id)
 
@@ -778,11 +778,11 @@ async def test_purge_partial_cascade_records_purge_ok_false(
     accountable without re-deriving it from the (unstored) summary.
     """
     from expert_work.protocol import AuditAction, AuditQuery
-    from orchestrator.tools.sandbox import RecordingSupervisorClient
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
     client, tenant_id, app, _kc = admin_app
     # Supervisor wired so the ONLY failure is the injected one.
-    app.state.supervisor_client = RecordingSupervisorClient()  # type: ignore[attr-defined]
+    app.state.workspace_store = RecordingWorkspaceStore()  # type: ignore[attr-defined]
     member_id = await _invite_one(client, tenant_id)
     await _activate_with_data(app, tenant_id, member_id)
 

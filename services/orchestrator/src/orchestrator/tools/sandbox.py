@@ -91,14 +91,6 @@ class EgressContext:
     denylist: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class WorkspaceFileEntry:
-    """One file in a user's persistent workspace volume (browse listing)."""
-
-    path: str
-    size: int
-
-
 def _traced_headers() -> dict[str, str]:
     """Outbound headers carrying the active W3C trace context (A.8).
 
@@ -155,39 +147,6 @@ class SupervisorClient(Protocol):
 
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         """Forced sandbox teardown (SIGKILL); ``reason`` is audited."""
-
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        """Read a file from a user's persistent workspace volume (J.9 artifact download)."""
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        """List the files in a user's persistent workspace volume (browse)."""
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        """Write ``data`` to ``path`` in a user's persistent workspace volume.
-
-        Backs the document-upload path: a user uploads a file, the
-        control-plane proxies here, and the bytes land in the durable
-        workspace so a later run's ``read_document`` can read them. Only
-        the supervisor can write a per-user docker volume."""
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        """Delete one file from a user's persistent workspace volume.
-
-        Backs the playground workspace cleanup. Only the supervisor can
-        mutate a per-user docker volume; the control-plane proxies here."""
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        """Soft-delete a user's whole persistent workspace (Phase 3a purge_user).
-
-        The supervisor destroys any warm session, drops the user's
-        sandbox_instance rows, and marks the volume deleted (Mini-ADR J-36 —
-        the reaper archives it, then the 90-day sweep hard-deletes). Idempotent.
-        Only the supervisor can mutate a per-user docker volume; the
-        control-plane proxies here as part of the cascade purge."""
 
     async def reap(self, *, force: bool) -> int:
         """Run the idle-session sweep now; return how many were reaped.
@@ -306,101 +265,6 @@ class HTTPSupervisorClient:
         body = await self._post("/v1/sandboxes:reap", json={"force": force})
         return int(body.get("reaped_count", 0))
 
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.get(
-                    url,
-                    params={"path": path},
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace read failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-        return response.content
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/files"
-        async with self._make_client() as client:
-            try:
-                response = await client.get(
-                    url,
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace list failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-        body = response.json()
-        return [
-            WorkspaceFileEntry(path=str(f["path"]), size=int(f["size"]))
-            for f in body.get("files", [])
-        ]
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.put(
-                    url,
-                    params={"path": path},
-                    content=data,
-                    headers={**_traced_headers(), "content-type": "application/octet-stream"},
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace write failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.request(
-                    "DELETE",
-                    url,
-                    params={"path": path},
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                "sandbox supervisor workspace delete failed: "
-                f"{response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        await self._post(
-            f"/v1/workspaces/{tenant_id}/{user_id}:delete",
-            json=None,
-            expect_body=False,
-        )
-
     async def _post(
         self,
         path: str,
@@ -446,10 +310,6 @@ class RecordingSupervisorClient:
     )
     exec_error: BaseException | None = None
     destroy_error: Exception | None = None
-    workspace_file: bytes = b""
-    workspace_file_error: Exception | None = None
-    workspace_files: list[WorkspaceFileEntry] = field(default_factory=list)
-    workspace_list_error: Exception | None = None
     acquired: list[tuple[UUID, str, UUID | None, tuple[tuple[str, bytes], ...]]] = field(
         default_factory=list
     )
@@ -459,14 +319,6 @@ class RecordingSupervisorClient:
     execs: list[tuple[UUID, str]] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
-    workspace_reads: list[tuple[UUID, UUID, str]] = field(default_factory=list)
-    workspace_writes: list[tuple[UUID, UUID, str, bytes]] = field(default_factory=list)
-    workspace_write_error: Exception | None = None
-    workspace_deletes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
-    workspace_delete_error: Exception | None = None
-    #: Phase 3a — the ``(tenant_id, user_id)`` of each mark_workspace_deleted call.
-    workspace_deletions: list[tuple[UUID, UUID]] = field(default_factory=list)
-    workspace_deletion_error: Exception | None = None
     reaped: list[bool] = field(default_factory=list)
     reap_count: int = 0
     _next_id: int = 0
@@ -499,37 +351,6 @@ class RecordingSupervisorClient:
         if self.destroy_error is not None:
             raise self.destroy_error
         self.destroyed.append((sandbox_id, reason))
-
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        self.workspace_reads.append((tenant_id, user_id, path))
-        if self.workspace_file_error is not None:
-            raise self.workspace_file_error
-        return self.workspace_file
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        self.workspace_reads.append((tenant_id, user_id, ""))
-        if self.workspace_list_error is not None:
-            raise self.workspace_list_error
-        return self.workspace_files
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        if self.workspace_write_error is not None:
-            raise self.workspace_write_error
-        self.workspace_writes.append((tenant_id, user_id, path, data))
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        if self.workspace_delete_error is not None:
-            raise self.workspace_delete_error
-        self.workspace_deletes.append((tenant_id, user_id, path))
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        if self.workspace_deletion_error is not None:
-            raise self.workspace_deletion_error
-        self.workspace_deletions.append((tenant_id, user_id))
 
     async def reap(self, *, force: bool) -> int:
         self.reaped.append(force)
@@ -576,27 +397,6 @@ class _EgressBindingClient:
 
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         await self.inner.destroy(sandbox_id=sandbox_id, reason=reason)
-
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        return await self.inner.read_workspace_file(tenant_id=tenant_id, user_id=user_id, path=path)
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        return await self.inner.list_workspace_files(tenant_id=tenant_id, user_id=user_id)
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        await self.inner.write_workspace_file(
-            tenant_id=tenant_id, user_id=user_id, path=path, data=data
-        )
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        await self.inner.delete_workspace_file(tenant_id=tenant_id, user_id=user_id, path=path)
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        await self.inner.mark_workspace_deleted(tenant_id=tenant_id, user_id=user_id)
 
     async def reap(self, *, force: bool) -> int:
         return await self.inner.reap(force=force)

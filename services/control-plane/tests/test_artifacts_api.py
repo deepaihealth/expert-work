@@ -14,7 +14,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from orchestrator.tools import RecordingSupervisorClient
+from orchestrator.tools import RecordingWorkspaceStore
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -69,7 +69,7 @@ async def setup() -> AsyncIterator[tuple[AsyncClient, InMemoryArtifactStore, UUI
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
         jwt_verifier=build_test_jwt_verifier(),
     )
-    app.state.supervisor_client = RecordingSupervisorClient(workspace_file=_CONTENT)
+    app.state.workspace_store = RecordingWorkspaceStore(workspace_file=_CONTENT)
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport, base_url="http://cp.test", headers=_headers()

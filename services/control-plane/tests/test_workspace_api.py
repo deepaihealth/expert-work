@@ -19,7 +19,7 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditAction, AuditQuery
-from orchestrator.tools import RecordingSupervisorClient, WorkspaceFileEntry
+from orchestrator.tools import RecordingWorkspaceStore, WorkspaceFileEntry
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -65,7 +65,7 @@ async def _seed() -> tuple[InMemoryTenantUserStore, InMemoryArtifactStore, UUID]
 
 
 @pytest.fixture
-async def setup() -> AsyncIterator[tuple[AsyncClient, RecordingSupervisorClient, UUID]]:
+async def setup() -> AsyncIterator[tuple[AsyncClient, RecordingWorkspaceStore, UUID]]:
     users, artifacts, user_id = await _seed()
     app = create_app(
         settings=_settings(),
@@ -74,16 +74,16 @@ async def setup() -> AsyncIterator[tuple[AsyncClient, RecordingSupervisorClient,
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
         jwt_verifier=build_test_jwt_verifier(),
     )
-    supervisor = RecordingSupervisorClient(
+    store = RecordingWorkspaceStore(
         workspace_file=_CONTENT,
         workspace_files=[WorkspaceFileEntry(path="out.txt", size=11)],
     )
-    app.state.supervisor_client = supervisor
+    app.state.workspace_store = store
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport, base_url="http://cp.test", headers=_headers()
     ) as client:
-        yield client, supervisor, user_id
+        yield client, store, user_id
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ async def setup() -> AsyncIterator[tuple[AsyncClient, RecordingSupervisorClient,
 
 @pytest.mark.asyncio
 async def test_get_workspace_null_when_no_vm_ever_started(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     """``workspaces.get`` never provisions — a null workspace is truthful."""
     client, _, _ = setup
@@ -107,7 +107,7 @@ async def test_get_workspace_null_when_no_vm_ever_started(
 
 @pytest.mark.asyncio
 async def test_get_workspace_returns_meta_when_seeded(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     # A VM having started for this user is modelled by a resolved row.
@@ -120,7 +120,7 @@ async def test_get_workspace_returns_meta_when_seeded(
 
 @pytest.mark.asyncio
 async def test_get_workspace_reachable_with_no_thread(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     """The whole point: no thread exists, yet the workspace is reachable."""
     client, _, _ = setup
@@ -136,7 +136,7 @@ async def test_get_workspace_reachable_with_no_thread(
 
 @pytest.mark.asyncio
 async def test_list_files_self(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     resp = await client.get("/v1/workspace/files")
@@ -148,7 +148,7 @@ async def test_list_files_self(
 
 @pytest.mark.asyncio
 async def test_admin_lists_another_users_files_via_user_id(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     resp = await client.get(f"/v1/workspace/files?user_id={user_id}", headers=_headers("user-b"))
@@ -159,7 +159,7 @@ async def test_admin_lists_another_users_files_via_user_id(
 
 @pytest.mark.asyncio
 async def test_non_admin_files_for_someone_else_is_403(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     viewer_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("viewer",))
@@ -198,7 +198,7 @@ async def test_list_files_without_supervisor_returns_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_download_file_self(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     resp = await client.get("/v1/workspace/file", params={"path": "out.txt"})
@@ -212,7 +212,7 @@ async def test_download_file_self(
 
 @pytest.mark.asyncio
 async def test_admin_downloads_another_users_file_via_user_id(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     resp = await client.get(
@@ -226,7 +226,7 @@ async def test_admin_downloads_another_users_file_via_user_id(
 
 @pytest.mark.asyncio
 async def test_non_admin_download_someone_else_is_403(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     viewer_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("viewer",))
@@ -241,7 +241,7 @@ async def test_non_admin_download_someone_else_is_403(
 
 @pytest.mark.asyncio
 async def test_download_html_file_is_forced_attachment(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     """Active content (HTML) must never inline-render — stored-XSS red line."""
     client, _, _ = setup
@@ -254,7 +254,7 @@ async def test_download_html_file_is_forced_attachment(
 
 @pytest.mark.asyncio
 async def test_download_traversal_path_is_400(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, _ = setup
     resp = await client.get("/v1/workspace/file", params={"path": "../etc/passwd"})
@@ -286,7 +286,7 @@ async def test_download_without_supervisor_is_404() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_file_self_records_on_supervisor(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     resp = await client.delete("/v1/workspace/file", params={"path": "out.txt"})
@@ -297,7 +297,7 @@ async def test_delete_file_self_records_on_supervisor(
 
 @pytest.mark.asyncio
 async def test_admin_deletes_another_users_file_via_user_id(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     resp = await client.delete(
@@ -311,7 +311,7 @@ async def test_admin_deletes_another_users_file_via_user_id(
 
 @pytest.mark.asyncio
 async def test_non_admin_delete_someone_else_is_403(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, supervisor, user_id = setup
     viewer_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("viewer",))
@@ -328,7 +328,7 @@ async def test_non_admin_delete_someone_else_is_403(
 
 @pytest.mark.asyncio
 async def test_delete_traversal_path_is_400(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, _ = setup
     resp = await client.delete("/v1/workspace/file", params={"path": "/abs/path"})
@@ -351,7 +351,7 @@ async def _app_with_audit() -> tuple[AsyncClient, InMemoryAuditLogStore, UUID]:
         audit_logger=build_default_audit_logger(audit_store),
         jwt_verifier=build_test_jwt_verifier(),
     )
-    app.state.supervisor_client = RecordingSupervisorClient(workspace_file=_CONTENT)
+    app.state.workspace_store = RecordingWorkspaceStore(workspace_file=_CONTENT)
     transport = ASGITransport(app=app)
     client = AsyncClient(transport=transport, base_url="http://cp.test", headers=_headers())
     return client, audit_store, user_id
@@ -403,7 +403,7 @@ async def test_self_workspace_view_does_not_emit_view_audit() -> None:
 
 @pytest.mark.asyncio
 async def test_workspace_system_admin_target_tenant_200(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     headers = await grant_system_admin(client)
@@ -426,7 +426,7 @@ async def test_workspace_system_admin_target_tenant_200(
 
 @pytest.mark.asyncio
 async def test_workspace_foreign_tenant_user_403(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, user_id = setup
     foreign = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
@@ -446,7 +446,7 @@ async def test_workspace_foreign_tenant_user_403(
 
 @pytest.mark.asyncio
 async def test_workspace_tenant_id_star_400(
-    setup: tuple[AsyncClient, RecordingSupervisorClient, UUID],
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
     client, _, _ = setup
     for name, path, extra in [

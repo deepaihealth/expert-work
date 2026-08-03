@@ -116,8 +116,10 @@ from orchestrator.tools import (
     StdioMCPClient,
     StreamableHttpMCPClient,
     SupervisorClient,
+    SupervisorWorkspaceStore,
     TavilyClient,
     WorkspaceLock,
+    WorkspaceStore,
 )
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 
@@ -1446,6 +1448,20 @@ def build_supervisor_client(url: str | None) -> SupervisorClient | None:
     if url is None:
         return None
     return HTTPSupervisorClient(base_url=url)
+
+
+def build_workspace_store(url: str | None) -> WorkspaceStore | None:
+    """Build the workspace-file client from the supervisor's base URL.
+
+    波 1 Task 4 — 工作区文件操作从 ``SupervisorClient`` 拆出。本地/CI 下
+    工作区是 docker 卷,只有 supervisor 碰得到,所以这个实现仍走 HTTP;
+    波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
+
+    ``None`` → 工作区文件端点不可用,与 ``build_supervisor_client`` 同语义。
+    """
+    if url is None:
+        return None
+    return SupervisorWorkspaceStore(base_url=url)
 
 
 def build_tool_env(
