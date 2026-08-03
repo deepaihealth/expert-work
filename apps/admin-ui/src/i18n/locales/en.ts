@@ -1619,6 +1619,7 @@ export interface TranslationKeys {
     col_auth: string;
     col_status: string;
     col_tools: string;
+    col_tenant: string;
     col_actions: string;
     status_enabled: string;
     status_disabled: string;
@@ -4648,6 +4649,7 @@ const en: TranslationKeys = {
     col_auth: "Auth",
     col_status: "Status",
     col_tools: "Tools",
+    col_tenant: "Tenant",
     col_actions: "Actions",
     status_enabled: "Running",
     status_disabled: "Disabled",

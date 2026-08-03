@@ -1696,6 +1696,7 @@ const zhCN: TranslationKeys = {
     col_auth: "认证",
     col_status: "状态",
     col_tools: "工具",
+    col_tenant: "租户",
     col_actions: "操作",
     status_enabled: "运行中",
     status_disabled: "已停用",

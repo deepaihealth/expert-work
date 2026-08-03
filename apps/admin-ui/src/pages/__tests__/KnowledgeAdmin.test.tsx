@@ -212,6 +212,36 @@ describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
     expect(screen.getByTestId("loc")).not.toHaveTextContent("tenant_id");
   });
 
+  // Review C-1 — writes bind by name to the caller's HOME tenant, so a
+  // delete/create fired from the aggregate would hit the home tenant's
+  // same-named base. Both write controls must grey out under "*".
+  it("聚合态置灰创建/删库按钮(写接口按 name 绑归属租户)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "tenant-2-xxxx" },
+    ]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
+    expect(screen.getByTestId("kb-create-open")).toBeDisabled();
+    expect(screen.getByTestId("kb-delete-support-docs")).toBeDisabled();
+  });
+
+  // rowKey must include the owning tenant: two tenants may legally own a
+  // same-named base and both rows must render (a bare name key collides).
+  it("renders same-named bases from two tenants as two rows", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+      { ...BASES[0], tenant_id: "t1" },
+      { ...BASES[0], id: "22222222-2222-2222-2222-222222222222", tenant_id: "tenant-2-xxxx" },
+    ]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getAllByText("support-docs")).toHaveLength(2));
+  });
+
   it("home scope hides the tenant column", async () => {
     scopeRef.current = undefined;
     vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([

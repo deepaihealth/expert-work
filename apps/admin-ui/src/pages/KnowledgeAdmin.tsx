@@ -46,6 +46,10 @@ export function KnowledgeAdmin() {
   // Cross-tenant W4 — "*" aggregate: tenant column + row-jump carries the
   // owning tenant (home rows keep the plain URL, see onRow below).
   const isAggregate = apiTenantScope === "*";
+  // Cross-tenant W4 (review C-1) — the aggregate is read-only too: writes
+  // (delete/create) bind by name to the caller's HOME tenant, so acting on a
+  // foreign row would hit the home tenant's same-named base.
+  const writeDisabled = isAggregate || isTenantSwitched;
   const { identity } = useAuth();
   const navigate = useNavigate();
 
@@ -161,20 +165,20 @@ export function KnowledgeAdmin() {
         key: "actions",
         width: 60,
         render: (_: unknown, record) => (
-          <ReadonlyTooltip on={isTenantSwitched}>
+          <ReadonlyTooltip on={writeDisabled}>
             <Popconfirm
               title={t("knowledge_page.delete_base_confirm_title", { name: record.name })}
               description={t("knowledge_page.delete_base_confirm_body")}
               onConfirm={() => void handleDelete(record.name)}
               okText={t("knowledge_page.delete")}
               okButtonProps={{ danger: true }}
-              disabled={isTenantSwitched}
+              disabled={writeDisabled}
             >
               <Button
                 size="small"
                 danger
                 type="text"
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 icon={<Trash2 size={13} strokeWidth={1.5} />}
                 onClick={(e) => e.stopPropagation()}
                 aria-label={t("knowledge_page.delete")}
@@ -185,7 +189,7 @@ export function KnowledgeAdmin() {
         ),
       },
     ],
-    [t, handleDelete, isTenantSwitched, isAggregate],
+    [t, handleDelete, writeDisabled, isAggregate],
   );
 
   return (
@@ -209,12 +213,12 @@ export function KnowledgeAdmin() {
             >
               {t("common.refresh")}
             </Button>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip on={writeDisabled}>
               <Button
                 type="primary"
                 icon={<Plus size={14} strokeWidth={1.5} />}
                 onClick={() => setCreateOpen(true)}
-                disabled={isTenantSwitched}
+                disabled={writeDisabled}
                 data-testid="kb-create-open"
               >
                 {t("knowledge_page.create_base")}

@@ -38,8 +38,24 @@ describe("buildUnifiedRows", () => {
     expect(c.source).toBe("tenant");
     if (c.source === "tenant") {
       expect(c.server.name).toBe("my-custom");
-      expect(c.key).toBe("tenant:my-custom");
+      expect(c.key).toBe("tenant:home:my-custom");
     }
+  });
+
+  // Cross-tenant W4 — the "*" aggregate may carry a same-named server from
+  // two tenants; the key must include the owning tenant so rows don't collide.
+  it("keys same-named custom rows from two tenants distinctly", () => {
+    const rows = buildUnifiedRows(
+      [
+        { ...custom, tenant_id: "t1" },
+        { ...custom, id: "s2", tenant_id: "t2" },
+      ],
+      [],
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows[0].key).toBe("tenant:t1:my-custom");
+    expect(rows[1].key).toBe("tenant:t2:my-custom");
+    expect(new Set(rows.map((r) => r.key)).size).toBe(2);
   });
 
   it("degrades a platform row missing enrichment (stale allowlist)", () => {

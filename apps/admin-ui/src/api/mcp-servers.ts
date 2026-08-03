@@ -39,6 +39,9 @@ export interface McpServer {
   custom_header_names?: string[] | null;
   /** SSE read-timeout override in seconds; null = SDK default. */
   sse_read_timeout_s?: number | null;
+  /** Cross-tenant W4 — owning tenant in the ``tenant_id=*`` aggregate;
+   *  absent on single-tenant reads / pre-W4 backends. */
+  tenant_id?: string | null;
 }
 
 export interface CreateMcpServerBody {
