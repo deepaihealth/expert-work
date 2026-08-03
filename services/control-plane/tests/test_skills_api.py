@@ -15,7 +15,7 @@ from __future__ import annotations
 import io
 import zipfile
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -522,6 +522,156 @@ async def test_get_supporting_file_400_for_invalid_path(setup: Setup) -> None:
         f"/v1/skills/{skill_id}/versions/{version_n}/supporting-files/reference/secret.env"
     )
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Cross-tenant W4 Task B — lossless export + external supporting files
+# ---------------------------------------------------------------------------
+
+
+class _FakeAssetStore:
+    """Minimal in-memory skill-asset object store (runtime protocol shape)."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    async def put(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
+        self.objects[key] = data
+
+    async def get(self, key: str) -> bytes:
+        return self.objects[key]
+
+
+async def _seed_external_version(
+    client: AsyncClient,
+    *,
+    raw: bytes,
+    path: str = "reference/notes.md",
+    store_bytes: bool = True,
+) -> str:
+    """Create a skill whose v1 carries one EXTERNAL supporting-file entry.
+
+    The tenant import path never externalizes in tests (no durable store is
+    wired at create_app time), so the external shape is seeded directly
+    through the store — the same manifest shape the asset-tier import
+    persists. ``store_bytes=False`` seeds the manifest but leaves the object
+    store empty (the "asset lost" case). Returns the skill id.
+    """
+    import hashlib
+
+    app = client._transport.app  # type: ignore[attr-defined]
+    fake_store = _FakeAssetStore()
+    app.state.skill_asset_store = fake_store
+    digest = hashlib.sha256(raw).hexdigest()
+    key = f"skill-assets/sha256/{digest}"
+    if store_bytes:
+        fake_store.objects[key] = raw
+    skill_resp = await client.post("/v1/skills", json={"name": "ext-skill"})
+    skill_id: str = skill_resp.json()["id"]
+    await app.state.skill_store.add_version(
+        version_id=uuid4(),
+        skill_id=UUID(skill_id),
+        tenant_id=_TENANT,
+        prompt_fragment="be helpful",
+        supporting_files={
+            path: {
+                "content": "",
+                "size": len(raw),
+                "mime": "text/markdown",
+                "storage_key": key,
+                "sha256": digest,
+            }
+        },
+    )
+    return skill_id
+
+
+@pytest.mark.asyncio
+async def test_zip_export_round_trips_supporting_files_and_version(setup: Setup) -> None:
+    """W4 Task B regression: the tenant export used to drop ``supporting_files``
+    and pin the SKILL.md frontmatter version to 1 — an export→import round
+    trip silently lost every bundled file."""
+    import base64
+
+    from control_plane.api._skill_zip import parse_skill_zip
+    from expert_work.protocol.skill_package import parse_skill_md
+
+    client, _ = setup
+    raw = b"# Error codes\n\nE100: ...\n"
+    v1 = _build_skill_md_zip(body="be helpful v1")
+    v2 = _build_skill_md_zip(body="be helpful v2", extras={"reference/error_codes.md": raw})
+    r1 = await client.post(
+        "/v1/skills/import", files={"file": ("foo.skill", v1, "application/zip")}
+    )
+    assert r1.status_code == 201
+    skill_id = r1.json()["skill"]["id"]
+    r2 = await client.post(
+        "/v1/skills/import", files={"file": ("foo.skill", v2, "application/zip")}
+    )
+    assert r2.json()["version"]["version"] == 2
+
+    export = await client.get(f"/v1/skills/{skill_id}/versions/2/export")
+    assert export.status_code == 200
+    payload = parse_skill_zip(export.content)
+    assert base64.b64decode(payload.supporting_files["reference/error_codes.md"].content) == raw
+    # The frontmatter version follows the stored version (was hardcoded 1).
+    with zipfile.ZipFile(io.BytesIO(export.content)) as archive:
+        skill_md = archive.read("SKILL.md").decode()
+    assert parse_skill_md(skill_md).expert_work_version == 2
+
+
+@pytest.mark.asyncio
+async def test_zip_export_inflates_external_supporting_files(setup: Setup) -> None:
+    """External (object-store) entries are fetched back to real bytes in the
+    exported ZIP — same dual-read as the platform export."""
+    import base64
+
+    from control_plane.api._skill_zip import parse_skill_zip
+
+    client, _ = setup
+    raw = b"# external notes\n"
+    skill_id = await _seed_external_version(client, raw=raw)
+
+    export = await client.get(f"/v1/skills/{skill_id}/versions/1/export")
+    assert export.status_code == 200, export.text
+    payload = parse_skill_zip(export.content)
+    assert base64.b64decode(payload.supporting_files["reference/notes.md"].content) == raw
+
+
+@pytest.mark.asyncio
+async def test_zip_export_external_asset_missing_returns_502(setup: Setup) -> None:
+    client, _ = setup
+    skill_id = await _seed_external_version(client, raw=b"gone", store_bytes=False)
+    export = await client.get(f"/v1/skills/{skill_id}/versions/1/export")
+    assert export.status_code == 502
+    assert export.json()["detail"] == "supporting file assets unavailable"
+
+
+@pytest.mark.asyncio
+async def test_get_supporting_file_external_returns_fetched_bytes(setup: Setup) -> None:
+    """GET .../supporting-files/{path} dual-reads external entries (used to
+    echo the stored ``content`` — an empty string for external rows)."""
+    import base64
+
+    client, _ = setup
+    raw = b"# external notes\n"
+    skill_id = await _seed_external_version(client, raw=raw)
+
+    resp = await client.get(f"/v1/skills/{skill_id}/versions/1/supporting-files/reference/notes.md")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert base64.b64decode(body["content"]) == raw
+    assert body["size"] == len(raw)
+    assert body["mime"] == "text/markdown"
+
+
+@pytest.mark.asyncio
+async def test_get_supporting_file_external_asset_missing_returns_502(setup: Setup) -> None:
+    client, _ = setup
+    skill_id = await _seed_external_version(client, raw=b"gone", store_bytes=False)
+    resp = await client.get(f"/v1/skills/{skill_id}/versions/1/supporting-files/reference/notes.md")
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "supporting file asset unavailable"
 
 
 # ---------------------------------------------------------------------------
