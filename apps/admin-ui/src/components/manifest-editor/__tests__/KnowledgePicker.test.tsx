@@ -43,6 +43,22 @@ describe("KnowledgePicker", () => {
     await waitFor(() => expect(listBases).toHaveBeenCalled());
   });
 
+  it("collapses the '*' aggregate to the caller's tenant", async () => {
+    // W4: /v1/knowledge/bases aggregates every tenant under "*", but a ref
+    // binds by name inside the agent's OWN tenant — offering foreign bases
+    // would let the author pick one the runtime can never resolve.
+    const { listBases } = await import("../../../api/knowledge");
+    (listBases as ReturnType<typeof vi.fn>).mockClear();
+    scopeRef.current = "*";
+    try {
+      render(<KnowledgePicker formData={SEED} onChange={vi.fn()} />);
+      await waitFor(() => expect(listBases).toHaveBeenCalled());
+      expect(listBases).toHaveBeenCalledWith(undefined);
+    } finally {
+      scopeRef.current = undefined;
+    }
+  });
+
   it("reflects the selected refs (supports multiple bases)", async () => {
     const seeded: AgentManifest = {
       ...SEED,

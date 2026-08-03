@@ -9,7 +9,7 @@ import { Select, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listBases, type KnowledgeBase } from "../../api/knowledge";
-import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { FieldHelp } from "../FieldHelp";
 import { readKnowledgeRefs, setKnowledgeRefs } from "./form_model";
 
@@ -31,17 +31,22 @@ export function KnowledgePicker({ formData, onChange }: KnowledgePickerProps) {
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
   // Cross-tenant W3 — list the switched-in tenant's bases for the picker.
   const { apiTenantScope } = useTenantScope();
+  // W4: the list endpoint aggregates every tenant under ``"*"``, but a ref
+  // binds a base BY NAME inside the agent's own tenant — offering foreign
+  // bases would let the author pick one the runtime can never resolve.
+  // Collapse the aggregate to the caller's tenant (same as McpToolPicker).
+  const pickerScope = concreteTenantScope(apiTenantScope);
 
   useEffect(() => {
     let alive = true;
-    listBases(apiTenantScope).then(
+    listBases(pickerScope).then(
       (b) => alive && setBases(b ?? []),
       () => {},
     );
     return () => {
       alive = false;
     };
-  }, [apiTenantScope]);
+  }, [pickerScope]);
 
   const knowledgeRefs = readKnowledgeRefs(formData);
 

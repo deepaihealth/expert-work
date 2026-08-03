@@ -193,6 +193,15 @@ describe("EvalRunsList", () => {
     );
   });
 
+  it("aggregate greys out enqueue (the run would land in the caller's own tenant)", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(evalSdk, "listEvalRuns").mockResolvedValue({ items: [], total: 0 });
+
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("eval-table")).toBeInTheDocument());
+    expect(screen.getByTestId("eval-enqueue")).toBeDisabled();
+  });
+
   it("home scope hides the tenant column (W4)", async () => {
     const row = run({ tenant_id: "t1" });
     vi.spyOn(evalSdk, "listEvalRuns").mockResolvedValue({ items: [row], total: 1 });

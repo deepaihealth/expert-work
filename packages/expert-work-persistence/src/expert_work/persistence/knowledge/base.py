@@ -144,7 +144,14 @@ class KnowledgeStore(abc.ABC):
         call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
 
         No covering index; full scan acceptable at current scale — see
-        ``docs/superpowers/plans/2026-08-03-cross-tenant-drilldown-w4.md``."""
+        ``docs/superpowers/plans/2026-08-03-cross-tenant-drilldown-w4.md``.
+
+        FORCE-RLS note: this table runs ``ENABLE + FORCE ROW LEVEL SECURITY``
+        with a ``tenant_id = current_setting('app.tenant_id')`` policy that
+        denies when the GUC is unset. Skipping the GUC therefore only works
+        because the app connects with a BYPASSRLS role today. When RLS is
+        un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
+        GRANT treatment that ``token_usage`` already has (migration 0140)."""
 
     @abc.abstractmethod
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:

@@ -92,7 +92,14 @@ class EvalRunStore(abc.ABC):
         plus the pre-pagination total — the W4 ``tenant_id=*`` aggregate.
         Caller MUST wrap the call in ``bypass_rls_session()`` /
         ``applied_scope(CrossTenant)`` (same posture as
-        :meth:`list_by_status_all_tenants`)."""
+        :meth:`list_by_status_all_tenants`).
+
+        FORCE-RLS note: this table runs ``ENABLE + FORCE ROW LEVEL SECURITY``
+        with a ``tenant_id = current_setting('app.tenant_id')`` policy that
+        denies when the GUC is unset. Skipping the GUC therefore only works
+        because the app connects with a BYPASSRLS role today. When RLS is
+        un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
+        GRANT treatment that ``token_usage`` already has (migration 0140)."""
 
     @abc.abstractmethod
     async def append_case_result(self, record: EvalCaseResultRecord) -> EvalCaseResultRecord:

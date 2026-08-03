@@ -82,7 +82,14 @@ class TenantMcpServerStore(abc.ABC):
         ``limit`` rows — the W4 ``tenant_id=*`` aggregate (``list_for_tenant``
         has no cap; the cross-tenant read is bounded so it can never become an
         unbounded full-table page). Caller MUST wrap the call in
-        ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``."""
+        ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
+
+        FORCE-RLS note: this table runs ``ENABLE + FORCE ROW LEVEL SECURITY``
+        with a ``tenant_id = current_setting('app.tenant_id')`` policy that
+        denies when the GUC is unset. Skipping the GUC therefore only works
+        because the app connects with a BYPASSRLS role today. When RLS is
+        un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
+        GRANT treatment that ``token_usage`` already has (migration 0140)."""
 
     @abc.abstractmethod
     async def update(

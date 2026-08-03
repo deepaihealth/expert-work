@@ -6,8 +6,10 @@
  * settings live. (Earlier this was a single master-detail screen; the detail
  * surface outgrew it — see ``KnowledgeDetail``.)
  *
- * Tenant semantics (Mini-ADR H-19): the backend reads the JWT's home tenant
- * only — this page does NOT follow the global TenantScope switch.
+ * Tenant semantics: the list follows the global TenantScope switch (W3) and
+ * aggregates every tenant under ``"*"`` (W4). Writes still bind by name to the
+ * caller's own tenant, so they are greyed out in both the switched-in and the
+ * aggregate view — see ``writeDisabled`` below.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";

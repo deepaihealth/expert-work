@@ -76,6 +76,9 @@ export function EvalRunsList() {
   // Cross-tenant W4 — "*" aggregate: tenant column + row-jump carries the
   // owning tenant (home rows keep the plain URL, see onRow below).
   const isAggregate = apiTenantScope === "*";
+  // Enqueue binds the run to the caller's OWN tenant, so the aggregate view
+  // must not offer it either — same rule as KnowledgeAdmin / SettingsMcpServers.
+  const writeDisabled = isAggregate || isTenantSwitched;
   const { identity } = useAuth();
   const [data, setData] = useState<EvalRunList | null>(null);
   const [loading, setLoading] = useState(false);
@@ -240,11 +243,14 @@ export function EvalRunsList() {
               data-testid="eval-suite-select"
               options={SUITE_OPTIONS.map((s) => ({ value: s, label: s }))}
             />
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <ReadonlyTooltip
+              on={writeDisabled}
+              title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+            >
               <button
                 type="button"
                 onClick={() => void onEnqueue()}
-                disabled={enqueuing || isTenantSwitched}
+                disabled={enqueuing || writeDisabled}
                 data-testid="eval-enqueue"
                 style={{
                   display: "inline-flex",
@@ -256,8 +262,8 @@ export function EvalRunsList() {
                   background: "var(--ew-color-brand-500)",
                   color: "#fff",
                   fontSize: 13,
-                  cursor: enqueuing ? "wait" : isTenantSwitched ? "not-allowed" : "pointer",
-                  opacity: isTenantSwitched ? 0.5 : 1,
+                  cursor: enqueuing ? "wait" : writeDisabled ? "not-allowed" : "pointer",
+                  opacity: writeDisabled ? 0.5 : 1,
                 }}
               >
                 <FlaskConical size={14} strokeWidth={1.5} />
