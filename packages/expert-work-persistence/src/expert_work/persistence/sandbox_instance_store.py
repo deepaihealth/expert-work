@@ -430,12 +430,34 @@ class SqlSandboxInstanceStore:
         ``last_used_at`` or the idle sweep degrades to "time since
         acquire"). One ``UPDATE ... RETURNING`` round trip, not a separate
         read followed by a separate write — same row, same statement.
+
+        The ``state``/``destroyed_at`` predicates mirror
+        :meth:`set_container_id`'s, for the same reason and one this round
+        made reachable. ``InMemorySandboxInstanceStore``'s ``_rows`` only
+        holds live rows, so it has always returned ``None`` for a destroyed
+        row; the unguarded SQL ``UPDATE`` instead returned the container id
+        AND stamped ``last_used_at`` onto a terminal row. The two stores
+        disagreeing here is the same failure class as Important-2.
+
+        It stopped being theoretical when the periodic reaper landed
+        (``control_plane.sandbox_reap_worker``): a tool call whose session
+        goes idle past ``_IDLE_TTL_S`` now really does get its row swept to
+        DESTROYED mid-run, and without these predicates that run's next
+        ``exec`` would keep executing code inside a sandbox the system has
+        already torn down — silently, and while writing "last used" onto a
+        terminal row. Returning ``None`` routes it into ``_attach``'s
+        ``SandboxSupervisorError`` instead, which is a legible failure the
+        tools node already handles.
         """
         async with self._sf() as session:
             container_id = (
                 await session.execute(
                     sa_update(SandboxInstanceRow)
-                    .where(SandboxInstanceRow.id == sandbox_id)
+                    .where(
+                        SandboxInstanceRow.id == sandbox_id,
+                        SandboxInstanceRow.state == _STATE_IN_USE,
+                        SandboxInstanceRow.destroyed_at.is_(None),
+                    )
                     .values(last_used_at=_utc_now())
                     .returning(SandboxInstanceRow.container_id)
                 )
@@ -637,7 +659,13 @@ class InMemorySandboxInstanceStore:
         return row is not None and row.user_id is not None
 
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
-        """Mirrors :meth:`SqlSandboxInstanceStore.touch_and_get_container_id`."""
+        """Mirrors :meth:`SqlSandboxInstanceStore.touch_and_get_container_id`.
+
+        ``_rows`` only ever holds live rows (``mark_destroyed`` pops them),
+        so the ``.get()`` here already covers that method's
+        ``state``/``destroyed_at`` predicates — this side needed no change;
+        SQL was the one that had to catch up.
+        """
         row = self._rows.get(sandbox_id)
         if row is None:
             return None

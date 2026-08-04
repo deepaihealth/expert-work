@@ -732,6 +732,58 @@ async def test_set_container_id_rejects_an_already_destroyed_row(
 
 
 @pytest.mark.asyncio
+async def test_touch_and_get_container_id_ignores_a_destroyed_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """周期清扫把行标 DESTROYED 之后,该 run 的下一次 exec 不能还能跑。
+
+    这条序列在周期清扫(``control_plane.sandbox_reap_worker``)落地之前不可
+    达 —— 在那之前只有管理员手工 reap 才可能把一行标成终态。现在一次长工具
+    调用的会话空闲超过 ``_IDLE_TTL_S`` 就会被真的扫掉,而 SQL 侧原本那条无
+    谓词的 ``UPDATE ... RETURNING`` 会照样把 container_id 交回去:代码继续
+    在一个系统认为已经拆掉的沙箱里跑,还顺手把 ``last_used_at``(一个专给
+    空闲判定用的字段)盖到终态行上。内存实现从来不会 —— ``_rows`` 里根本
+    没有已销毁的行。
+
+    返回 ``None`` 会被 ``_attach`` 翻成 SandboxSupervisorError,是 tools
+    节点本来就会处理的可读失败。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
+    assert await store.touch_and_get_container_id(sandbox_id=sandbox_id) == "sbx-live"
+
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            before = (
+                await conn.execute(
+                    select(SandboxInstanceRow.last_used_at).where(
+                        SandboxInstanceRow.id == sandbox_id
+                    )
+                )
+            ).scalar_one()
+
+        await store.mark_destroyed(sandbox_id=sandbox_id, reason="idle")
+
+        assert await store.touch_and_get_container_id(sandbox_id=sandbox_id) is None
+
+        async with engine.begin() as conn:
+            after = (
+                await conn.execute(
+                    select(SandboxInstanceRow.last_used_at).where(
+                        SandboxInstanceRow.id == sandbox_id
+                    )
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+    assert after == before, "终态行的 last_used_at 不能再被推进"
+
+
+@pytest.mark.asyncio
 async def test_set_container_id_still_backfills_a_live_row(
     store: SqlSandboxInstanceStore,
 ) -> None:
