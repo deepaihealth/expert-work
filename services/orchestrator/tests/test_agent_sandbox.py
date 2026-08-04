@@ -893,3 +893,28 @@ async def test_exec_touches_last_used_at() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
     assert sid in store.touched
+
+
+def test_repr_does_not_leak_credential_fields() -> None:
+    """独立审查 I-2:``field(repr=False)`` 标在 ``api_key``/
+    ``egress_token_secret`` 上(agent_sandbox.py 那两行紧邻的注释写的
+    "Task 10 实测:普通 dataclass 的 __repr__ 会把凭据吐进 pytest
+    traceback")此前只用一个手工脚本验证过,没有进仓库的回归测试。两个
+    marker 都要断言到,不能只测 api_key——不然下一个人加新的凭据字段时,
+    这条测试不会替他把关。
+    """
+    client = AgentSandboxClient(
+        domain="gw.example.com",
+        api_key="MARKER-API-KEY-DO-NOT-LEAK",
+        template="expert-work-sandbox",
+        store=FakeInstanceStore(),
+        sdk=FakeSdk(),
+        egress_token_secret="MARKER-EGRESS-SECRET-DO-NOT-LEAK",
+        egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
+        egress_proxy_port=8081,
+    )
+
+    rendered = repr(client)
+
+    assert "MARKER-API-KEY-DO-NOT-LEAK" not in rendered
+    assert "MARKER-EGRESS-SECRET-DO-NOT-LEAK" not in rendered
