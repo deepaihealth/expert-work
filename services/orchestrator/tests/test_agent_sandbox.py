@@ -179,6 +179,11 @@ class FakeInstanceStore:
     #: 被调用时的 sandbox_id,验证 exec() 真的在推进 last_used_at,而
     #: get_container_id(destroy 等只读路径)不会。
     touched: list[UUID] = field(default_factory=list)
+    #: Task 10 测试缝 —— 记录每次 mark_destroyed 被调用的 (sandbox_id,
+    #: reason),即使那个 sandbox_id 从未在 rows 里出现过。用来证明
+    #: test_ephemeral_create_failure_clears_the_row 的清理代码路径真的执行
+    #: 了,而不是"store 本来就是空的"这种巧合通过。
+    mark_destroyed_calls: list[tuple[UUID, str]] = field(default_factory=list)
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -197,10 +202,20 @@ class FakeInstanceStore:
         msg = f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
         raise RuntimeError(msg)
 
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+        """Task 10 契约测试实测发现的缺口(完整理由见生产代码
+        ``SandboxInstanceStore.create_ephemeral`` 的 docstring)—— 给不带
+        ``user_id`` 的 acquire 建一行,不进 ``warm`` 字典(不参与 CAS)。"""
+        self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": None}
+
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         self.rows[sandbox_id]["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
+        # 记录每次调用(哪怕行早就不在了)—— 让
+        # test_ephemeral_create_failure_clears_the_row 能证明清理代码真的
+        # 跑了,而不是碰巧"store 本来就是空的"这种巧合通过。
+        self.mark_destroyed_calls.append((sandbox_id, reason))
         row = self.rows.pop(sandbox_id, None)
         if row is not None:
             key = (row["tenant_id"], row["user_id"])
@@ -260,6 +275,78 @@ async def test_acquire_creates_and_records_container_id() -> None:
 
     assert len(sdk.created) == 1
     assert store.rows[sandbox_id]["container_id"] == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_acquire_without_user_id_records_a_findable_row() -> None:
+    """Task 10 契约测试实测揪出的真实 bug,先于本任务从未被任何测试覆盖过
+    (全文件所有 acquire 调用此前无一例外都传了 user_id):``acquire`` 不带
+    ``user_id`` 时从未经过 ``claim_warm``,而 ``acquire`` 结尾无条件调用
+    ``set_container_id`` 去 UPDATE 一个此前从未 INSERT 过的行——生产 SQL
+    实现是静默 0 行生效,``FakeInstanceStore``/内存实现是直接 ``KeyError``。
+    真连 E2B 测试集群跑契约测试时当场炸穿:``exec()`` 报
+    ``SandboxSupervisorError: sandbox ... has no recorded container id``。
+
+    这条测试验证修复后的行为:``store.rows`` 里必须能找到这一行,且
+    ``container_id`` 必须已经回填——不只是"acquire 不抛异常"这种弱断言。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id = uuid4()
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1")
+
+    assert sandbox_id in store.rows, "临时沙箱必须有一行记录,否则后续 exec/destroy/reap 都找不到它"
+    assert store.rows[sandbox_id]["container_id"] == "sbx-1"
+    assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_exec_after_ephemeral_acquire_actually_works() -> None:
+    """``test_acquire_without_user_id_records_a_findable_row`` 的直接
+    payoff——这正是真连测试集群时实际炸穿的那一步(``_attach`` 读不到
+    container_id)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sdk.sandbox.commands.result_stdout = "CONTRACT_OK\n"
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    outcome = await client.exec(sandbox_id=sandbox_id, code="print('CONTRACT_OK')", timeout_s=30)
+
+    assert "CONTRACT_OK" in outcome.stdout
+
+
+@pytest.mark.asyncio
+async def test_destroy_after_ephemeral_acquire_actually_works() -> None:
+    """同上,针对 ``destroy`` —— 没有这一行的话 ``_attach`` 会因为
+    "no recorded container id" 直接抛错(destroy 的 broad except 会吞掉它、
+    误判成"沙箱已经不在",行为上不算崩溃,但连 kill 都没有真的发生)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    await client.destroy(sandbox_id=sandbox_id, reason="ops")
+
+    assert sdk.sandbox.killed is True, "destroy 必须真的 kill 到沙箱,不是被 no-container-id 吞掉"
+    assert sandbox_id not in store.rows
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_create_failure_clears_the_row() -> None:
+    """临时沙箱没有热会话坑可 ``drop_warm``(它压根不参与 0141 CAS),但
+    ``acquire`` 已经在 ``sdk.create()`` 之前插入了一行 ``container_id`` 仍是
+    NULL 的 ``IN_USE`` 行——create 失败后必须清掉,不能让它一直卡到
+    ``list_stuck_creating`` 的 TTL 兜底才被 ``reap(force=True)`` 捡走。"""
+    sdk, store = FakeSdk(create_fails=True), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    with pytest.raises(SandboxSupervisorError):
+        await client.acquire(tenant_id=uuid4(), thread_id="t1")
+
+    assert store.rows == {}, "create 失败后临时沙箱的行必须被清掉,不能卡在 container_id=NULL"
+    # 只看 rows 为空不够——store 从一开始就是空的,这个断言碰巧也会通过
+    # (不能证明清理代码真的跑了)。必须证明 mark_destroyed 真的被调用过。
+    assert [reason for _, reason in store.mark_destroyed_calls] == ["create_failed"]
 
 
 @pytest.mark.asyncio

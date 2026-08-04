@@ -201,6 +201,88 @@ async def test_get_container_id_unknown_sandbox_returns_none(
 
 
 # ---------------------------------------------------------------------------
+# 波 1 Task 10 —— create_ephemeral(不带 user_id 的临时沙箱)。
+#
+# Task 10 契约测试真连 E2B 测试集群跑通契约测试时实测揪出的 bug:
+# acquire(user_id=None) 从未经过 claim_warm,过去没有任何方法给这类行做初始
+# INSERT——acquire 结尾无条件的 set_container_id 是对一个从未插入的行做
+# UPDATE,SQL 是静默 0 行生效。全仓所有既有测试(FakeInstanceStore 与两个
+# 生产 store)的 acquire 调用此前无一例外都传了 user_id,这条路径完全没有
+# 测试覆盖过,直到契约测试第一次用真实 store 跑通"acquire 不带 user_id 再
+# exec"这条链路才当场炸穿。完整理由见
+# orchestrator.tools.agent_sandbox.SandboxInstanceStore.create_ephemeral 的
+# docstring。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_ephemeral_row_is_then_updatable(store: SqlSandboxInstanceStore) -> None:
+    """核心回归测试:``create_ephemeral`` 必须真的 INSERT 一行,不只是"不
+    报错"——用 ``set_container_id`` 后能否读回来证明行真的存在。如果没有
+    INSERT,``set_container_id`` 是静默 0 行 UPDATE,``get_container_id``
+    永远读到 ``None``,跟"这行压根不存在"没法区分——这正是生产 bug 的症状
+    本身,断言必须验证"能读到写入的值",不能只验证"不抛异常"。
+    """
+    tenant_id, sandbox_id = uuid4(), uuid4()
+
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-ephemeral")
+
+    assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-ephemeral"
+
+
+@pytest.mark.asyncio
+async def test_create_ephemeral_rows_do_not_conflict_across_calls(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """迁移 0141 的部分唯一索引条件显式排除 ``user_id IS NULL`` 的行——同一
+    个 tenant 建多个临时沙箱不该像热会话那样撞 CAS 冲突。"""
+    tenant_id = uuid4()
+    first_id, second_id = uuid4(), uuid4()
+
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=first_id)
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=second_id)
+    await store.set_container_id(sandbox_id=first_id, container_id="sbx-a")
+    await store.set_container_id(sandbox_id=second_id, container_id="sbx-b")
+
+    assert await store.get_container_id(sandbox_id=first_id) == "sbx-a"
+    assert await store.get_container_id(sandbox_id=second_id) == "sbx-b"
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_row_is_visible_to_list_active_once_ready(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """独立于 exec/destroy 之外的另一个后果:修复前临时沙箱永远不会出现在
+    ``list_active()`` 里,``reap(force=True)`` 找不到它们——资源永久泄漏
+    (沙箱在 E2B 那边继续跑,``sandbox_instance`` 里却没有任何记录)。"""
+    tenant_id, sandbox_id = uuid4(), uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-reapable")
+
+    force_ids = {sid for sid, _ in await store.list_active(only_idle=False)}
+    assert sandbox_id in force_ids
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_row_still_creating_is_excluded_from_list_active(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """镜像 ``test_list_active_excludes_still_creating_and_destroyed_rows``
+    对热会话行的覆盖:临时沙箱 ``container_id`` 仍是 NULL(还在冷启窗口)
+    时,两种 ``only_idle`` 模式都不该把它算进"活跃"——语义与热会话行完全
+    一致,``list_active`` 的 WHERE 子句本就不区分 ``user_id`` 是否为空。"""
+    tenant_id, sandbox_id = uuid4(), uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    # 不调用 set_container_id —— 模拟"还在创建中"。
+
+    force_ids = {sid for sid, _ in await store.list_active(only_idle=False)}
+    idle_ids = {sid for sid, _ in await store.list_active(only_idle=True)}
+    assert sandbox_id not in force_ids
+    assert sandbox_id not in idle_ids
+
+
+# ---------------------------------------------------------------------------
 # 波 1 Task 9 —— list_active(only_idle), AgentSandboxClient.reap 用。
 # ---------------------------------------------------------------------------
 

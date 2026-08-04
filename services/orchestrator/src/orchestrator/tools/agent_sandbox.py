@@ -111,10 +111,11 @@ acquire** 时才报错,而不是进程启动时。权衡过后选择了这个方
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -242,6 +243,15 @@ class SandboxInstanceStore(Protocol):
           :meth:`set_container_id` 时对着一个从未插入的行操作。
         """
 
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+        """Task 10 实测发现的缺口(task-10-report.md):不带 ``user_id`` 的
+        临时沙箱从不经过 :meth:`claim_warm`,过去没有方法给它做初始
+        INSERT——``acquire`` 结尾的 :meth:`set_container_id` 因此是对从未
+        插入的行做 UPDATE(此前零测试覆盖)。必须在 ``_create()`` 之前调用,
+        理由同 :meth:`claim_warm`;migration 0141 排除 ``user_id IS NULL``,
+        不需要 CAS,单纯 ``ON CONFLICT DO NOTHING``。
+        """
+
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         """回填 E2B sandbox id。只应在调用方本次自己创建/重建了沙箱时调用
         ——connect 到一个早已就绪的热会话时,该行的 container_id 已经是对的,
@@ -323,10 +333,11 @@ class AgentSandboxClient:
     """:class:`~orchestrator.tools.sandbox.SandboxRuntime` 的 Agent Sandbox 实现。"""
 
     domain: str
-    api_key: str
+    #: Task 10 实测:普通 dataclass 的 __repr__ 会把凭据吐进 pytest traceback。
+    api_key: str = field(repr=False)
     template: str
     store: SandboxInstanceStore
-    egress_token_secret: str
+    egress_token_secret: str = field(repr=False)
     egress_proxy_host: str
     egress_proxy_port: int
     #: 测试缝 —— 注入 SDK 替身。``None`` 时用真实 ``e2b.AsyncSandbox``。
@@ -498,6 +509,8 @@ class AgentSandboxClient:
                 # SandboxInstanceStore.claim_warm 的 docstring)。
                 sandbox_id = winner_id
         else:
+            if user_id is None:  # 临时沙箱不经过 claim_warm,得先插一行——见 create_ephemeral。
+                await self._create_ephemeral_row(tenant_id=tenant_id, sandbox_id=sandbox_id)
             sbx = await self._create_and_track(
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, egress=egress
             )
@@ -522,6 +535,13 @@ class AgentSandboxClient:
             )
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox warm-session claim failed: {exc}") from exc
+
+    async def _create_ephemeral_row(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+        """``store.create_ephemeral`` 套上 § 6.5 的统一错误契约(同 :meth:`_claim_warm`)。"""
+        try:
+            await self.store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+        except Exception as exc:
+            raise SandboxSupervisorError(f"sandbox row creation failed: {exc}") from exc
 
     async def _create_and_track(
         self,
@@ -554,7 +574,7 @@ class AgentSandboxClient:
         的原始异常 —— 内层的 except 块正常结束(没有再 raise)后,外层
         bare ``raise`` 重新抛出的是外层 except 语句本来在处理的那个异常,
         不是内层被捕获又丢弃的那个(标准 Python 异常处理语义,已用最小
-        复现脚本独立验证过,见报告)。
+        复现脚本独立验证过,见报告)。Task 10 追加:临时沙箱同理,见 ``else`` 分支。
         """
         try:
             return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
@@ -571,6 +591,10 @@ class AgentSandboxClient:
                         user_id,
                         exc_info=True,
                     )
+            else:
+                # 尽力而为:清不掉也不阻塞,list_stuck_creating 的 TTL 兜底稍后会捡走。
+                with contextlib.suppress(Exception):
+                    await self.store.mark_destroyed(sandbox_id=sandbox_id, reason="create_failed")
             raise
 
     async def _create(

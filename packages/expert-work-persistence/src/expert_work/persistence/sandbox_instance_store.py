@@ -217,6 +217,39 @@ class SqlSandboxInstanceStore:
         )
         raise RuntimeError(msg)
 
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+        """Task 10 契约测试实测发现的缺口——完整理由见
+        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.create_ephemeral``
+        的 docstring。``user_id=None`` 显式排除在迁移 0141 的部分唯一索引
+        (``WHERE ... AND user_id IS NOT NULL``)之外,所以这里不需要
+        :meth:`claim_warm` 那套"conflict → 重新 SELECT 判断"的 CAS 逻辑,
+        单纯 ``INSERT ... ON CONFLICT DO NOTHING``(``ON CONFLICT`` 只是防
+        ``sandbox_id`` PK 碰撞这种概率可忽略的边界,同 :meth:`claim_warm`
+        自己的理由)。
+        """
+        async with self._sf() as session:
+            await session.execute(
+                pg_insert(SandboxInstanceRow)
+                .values(
+                    id=sandbox_id,
+                    tenant_id=tenant_id,
+                    user_id=None,
+                    workspace_id=None,
+                    image_ref=_UNUSED_TEXT,
+                    node=_UNUSED_TEXT,
+                    container_id=None,
+                    state=_STATE_IN_USE,
+                    thread_id=_UNUSED_TEXT,
+                    cpu_quota=0,
+                    memory_mb=0,
+                    pids_limit=0,
+                    timeout_s=0,
+                    acquired_at=_utc_now(),
+                )
+                .on_conflict_do_nothing()
+            )
+            await session.commit()
+
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         async with self._sf() as session:
             await session.execute(
@@ -355,7 +388,10 @@ class SqlSandboxInstanceStore:
 @dataclass
 class _MemRow:
     tenant_id: UUID
-    user_id: UUID
+    #: ``None`` for an ephemeral (no-``user_id``) sandbox row — see
+    #: :meth:`InMemorySandboxInstanceStore.create_ephemeral`. Never ``None``
+    #: for a row created via :meth:`InMemorySandboxInstanceStore.claim_warm`.
+    user_id: UUID | None
     container_id: str | None = None
     #: Mirrors ``SandboxInstanceRow.acquired_at`` — set at ``claim_warm``
     #: time so :meth:`InMemorySandboxInstanceStore.list_active` has the
@@ -406,13 +442,22 @@ class InMemorySandboxInstanceStore:
         )
         raise RuntimeError(msg)
 
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+        """Mirrors :meth:`SqlSandboxInstanceStore.create_ephemeral` — a plain
+        insert, no ``_warm`` bookkeeping (ephemeral rows never participate in
+        the warm-session CAS)."""
+        self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=None)
+
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         self._rows[sandbox_id].container_id = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
         del reason
         row = self._rows.pop(sandbox_id, None)
-        if row is not None:
+        # An ephemeral row (user_id is None, see create_ephemeral) never has
+        # a _warm entry to begin with — skip the lookup entirely rather than
+        # building a key _warm's tuple[UUID, UUID] type could never hold.
+        if row is not None and row.user_id is not None:
             key = (row.tenant_id, row.user_id)
             if self._warm.get(key) == sandbox_id:
                 del self._warm[key]
