@@ -15,7 +15,7 @@ dependencies = [
     # SecretStore — the proxy resolves secret refs through it (Mini-ADR F-7).
     "expert-work-runtime",
     # M0 = aiohttp reverse proxy, server + outbound client (Mini-ADR F-6).
-    "aiohttp>=3.10,<4",
+    "aiohttp>=3.14.3,<4",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",
     "sqlalchemy[asyncio]>=2.0.30,<3",
