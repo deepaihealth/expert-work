@@ -82,7 +82,9 @@ class SqlSandboxInstanceStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sf = session_factory
 
-    async def claim_warm(self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID) -> str | None:
+    async def claim_warm(
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str] | None:
         """spec § 6.2 CAS: ``INSERT ... ON CONFLICT DO NOTHING RETURNING``.
 
         The bare (no explicit conflict target) ``ON CONFLICT DO NOTHING``
@@ -114,6 +116,14 @@ class SqlSandboxInstanceStore:
         A future wave could instead poll/wait here; deliberately not built
         now (no test demands it, and it would add a timeout knob + retry
         policy this task's scope does not ask for).
+
+        Review fix — returns ``(winner sandbox_id, container_id)`` on a
+        losing claim, not just the container_id: the caller's own freshly
+        minted ``sandbox_id`` was never inserted anywhere on this path, so
+        it needs the WINNER's real row id to hand back to ITS caller
+        (otherwise a later ``destroy()`` on that never-persisted id would
+        silently no-op — see ``AgentSandboxClient.acquire``). Both values
+        come from the same ``SELECT`` already, no extra round trip.
         """
         for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
             now = _utc_now()
@@ -130,7 +140,7 @@ class SqlSandboxInstanceStore:
                             node=_UNUSED_TEXT,
                             container_id=None,
                             state=_STATE_IN_USE,
-                            thread_id="",
+                            thread_id=_UNUSED_TEXT,
                             cpu_quota=0,
                             memory_mb=0,
                             pids_limit=0,
@@ -164,9 +174,9 @@ class SqlSandboxInstanceStore:
                 # and this read (its owner dropped/destroyed it) — the slot
                 # may be free now, retry the claim.
                 continue
-            _won_id, existing_container_id = found
+            winner_id, existing_container_id = found
             if existing_container_id:
-                return str(existing_container_id)
+                return (winner_id, str(existing_container_id))
             msg = (
                 f"a sandbox is already being created for tenant={tenant_id} "
                 f"user={user_id} — retry shortly"
@@ -252,7 +262,9 @@ class InMemorySandboxInstanceStore:
         #: (tenant_id, user_id) -> sandbox_id of the live IN_USE row, if any.
         self._warm: dict[tuple[UUID, UUID], UUID] = {}
 
-    async def claim_warm(self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID) -> str | None:
+    async def claim_warm(
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str] | None:
         key = (tenant_id, user_id)
         existing_id = self._warm.get(key)
         if existing_id is None:
@@ -261,7 +273,10 @@ class InMemorySandboxInstanceStore:
             return None
         container_id = self._rows[existing_id].container_id
         if container_id:
-            return container_id
+            # Return the WINNER's real row id, not the caller's own
+            # sandbox_id (never inserted on this path) — see
+            # SqlSandboxInstanceStore.claim_warm's docstring for why.
+            return (existing_id, container_id)
         msg = (
             f"a sandbox is already being created for tenant={tenant_id} "
             f"user={user_id} — retry shortly"

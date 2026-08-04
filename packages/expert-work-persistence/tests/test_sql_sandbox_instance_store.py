@@ -76,7 +76,10 @@ async def test_claim_warm_second_caller_sees_ready_container(
     second_id = uuid4()
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
 
-    assert result == "sbx-ready"
+    # Review fix (Important-3): the loser gets back the WINNER's real row
+    # id (first_id), not its own second_id — acquire() needs a persisted id
+    # to hand its caller, and second_id was never inserted anywhere.
+    assert result == (first_id, "sbx-ready")
     # The loser's own row was never inserted (its INSERT conflicted).
     assert await store.get_container_id(sandbox_id=second_id) is None
 
@@ -149,7 +152,7 @@ async def test_concurrent_claim_warm_after_ready_all_see_same_winner(
         )
     )
 
-    assert results == ["sbx-warm"] * 5
+    assert results == [(winner_id, "sbx-warm")] * 5
 
 
 @pytest.mark.asyncio

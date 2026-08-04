@@ -59,6 +59,11 @@ patch 挪进 :meth:`AgentSandboxClient._sdk` 唯一的真实 SDK 惰性导入点
    窗口(asyncio 单线程协作式调度,同步函数体一次片内跑完);guard 只是
    避免重复 import + 重复 patch 的浪费,不是为了防真并发。
 
+``_ensure_e2b_patched`` 除了打补丁,还负责把 ``self.domain``/``self.api_key``
+写进裸环境变量 ``E2B_DOMAIN``/``E2B_API_KEY``——``kruise_agents.patch_e2b()``
+自己的第一行就无条件读 ``os.environ['E2B_DOMAIN']``(没有就 ``KeyError``),
+这不是 kwarg 能绕开的,详细证据与理由见该函数自己的 docstring。
+
 代价说明白:这不是"进程启动时就能发现 kruise_agents 没装"的 fail-fast 设计
 ——配置了 ``sandbox_backend="agent_sandbox"`` 但依赖缺失,会在**第一次真正
 acquire** 时才报错,而不是进程启动时。权衡过后选择了这个方向,因为反过来
@@ -85,12 +90,29 @@ acquire** 时才报错,而不是进程启动时。权衡过后选择了这个方
   的"已被占"分支不建行)——对 SQL 实现是静默 0-row UPDATE,对手写假件
   (``FakeInstanceStore``)是直接 ``KeyError``,``test_concurrent_acquire_has_one_winner``
   会崩。改成只在"这次调用自己建了/重建了沙箱"时才回填。
+
+## 独立审查一轮后追加修复的两处(task-7-report.md "审查修复"一节)
+
+* ``patch_e2b()`` 需要 ``os.environ['E2B_DOMAIN']``——见 ``_ensure_e2b_patched``
+  docstring,不重复。
+* ``claim_warm`` 原来只返回 container_id 字符串:CAS 输家 connect 成功后,
+  ``acquire`` 仍然返回自己在函数开头新铸的 ``uuid4()``——那个 id 从未插进
+  任何行,后续 ``destroy(sandbox_id=<那个 id>)`` 会静默 no-op(``get_container_id``
+  查不到、``mark_destroyed`` 的 ``WHERE id=...`` 影响 0 行、都不报错)。改成
+  ``claim_warm`` 输家分支返回 ``(赢家的真实 sandbox_id, container_id)`` 二元组,
+  ``acquire`` 复用成功时把返回值改写成赢家的真实 id——查 SQL store 时这两个
+  值本来就在同一次 SELECT 里,不需要多打一次库。同时 ``_create`` 失败(SDK
+  冷启炸掉)不再让 CAS 行永久卡死:``claim_warm``/重新占坑已经提交的
+  ``state='IN_USE', container_id=NULL`` 行,如果紧接着的 ``create()`` 失败,
+  改成先 ``drop_warm`` 释放槽位再把异常抛出去——否则那个 ``(tenant, user)``
+  会被迁移 0141 的部分唯一索引永久卡住,不会有任何东西再去把它解开。
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -116,7 +138,7 @@ SANDBOX_EXEC_USER = "agent"
 _e2b_patched = False
 
 
-def _ensure_e2b_patched() -> None:
+def _ensure_e2b_patched(*, domain: str, api_key: str) -> None:
     """在首次真正需要 ``e2b`` SDK 时,惰性、幂等地打私有协议补丁。
 
     必须先跑这个再 ``import e2b``——``kruise_agents.patch_e2b`` 改写的是
@@ -124,12 +146,27 @@ def _ensure_e2b_patched() -> None:
     修正。``https=False`` 是必须显式传的(签名默认 ``True``):ALB 只监听
     HTTP 80,默认值会打到 ALB 的 503(探针报告 § 一)。
 
+    **审查发现(task-7-report.md 修复记录)**:``kruise_agents.patch_e2b()``
+    第一行就是 ``os.environ["E2B_API_URL"] = f"...{os.environ['E2B_DOMAIN']}..."``
+    ——无条件读裸环境变量 ``E2B_DOMAIN``(直接 ``[]`` 取值,没有 ``.get()``
+    兜底),没设就 ``KeyError``。仓内没有任何地方设过这个裸变量(我们自己的
+    配置走 ``EXPERT_WORK_`` 前缀的 ``Settings.sandbox_e2b_domain``,是完全
+    不同的名字/通道)——所以第一次真正调用 ``patch_e2b()`` 必炸。这里用
+    ``setdefault`` 在调用前把 domain/api_key 写进裸环境变量:``setdefault``
+    而非直接赋值,是为了让运维如果真的自己设了同名环境变量时那个值优先,
+    这里只是提供一个不炸的兜底,不是要覆盖别人的显式配置。``E2B_API_KEY``
+    同理防御性地写一份——``patch_e2b()`` 本体不读它,但 ``validate_key=True``
+    (这里的默认值,没有传 ``False``)时 e2b SDK 自己的 key 校验逻辑不排除
+    某些内部路径会退回读这个环境变量而不是每次都吃调用方传的显式 kwarg。
+
     调用点收敛到 :meth:`AgentSandboxClient._sdk` 一处 —— 完整理由见模块
     docstring;不要在别处直接 ``import e2b``。
     """
     global _e2b_patched
     if _e2b_patched:
         return
+    os.environ.setdefault("E2B_DOMAIN", domain)
+    os.environ.setdefault("E2B_API_KEY", api_key)
     from kruise_agents.patch_e2b import patch_e2b
 
     patch_e2b(https=False)
@@ -143,14 +180,23 @@ class SandboxInstanceStore(Protocol):
     回填 ``last_used_at``)留给那两个任务补充 —— 今天不预先猜测形状。
     """
 
-    async def claim_warm(self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID) -> str | None:
+    async def claim_warm(
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str] | None:
         """占 ``(tenant, user)`` 的热会话坑(spec § 6.2 CAS)。
 
         ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` 的封装:
 
         * 占到 → 返回 ``None``,调用方负责建沙箱并回填 :meth:`set_container_id`。
-        * 没占到、赢家已就绪(``container_id`` 非空)→ 返回赢家的 container_id,
-          调用方 connect 上去。
+        * 没占到、赢家已就绪(``container_id`` 非空)→ 返回
+          ``(赢家那一行的 sandbox_id, container_id)`` 二元组 —— **不是**只
+          返回 container_id。调用方(``acquire``)本次调用开头自己铸的
+          ``uuid4()`` 从未插入任何行;如果 ``acquire`` 复用热会话成功后仍
+          返回那个自铸 id,后续任何 ``destroy(sandbox_id=<那个 id>)`` 都会
+          静默 no-op(``get_container_id`` 查不到、``mark_destroyed`` 的
+          ``WHERE id=...`` 影响 0 行,两处都不报错)——沙箱杀不掉,热会话槽
+          位也放不出来。返回赢家的真实行 id 让 ``acquire`` 能直接复用它,
+          不需要再多打一次库去查。
         * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)→ 允许实现
           raise(SQL 实现如此)。E2B 冷启实测 35-40s(见探针报告),这不是
           罕见边界窗口,调用方必须能收到一个明确错误,而不是悄悄再建一个
@@ -194,7 +240,7 @@ class AgentSandboxClient:
     def _sdk(self) -> Any:
         if self.sdk is not None:
             return self.sdk
-        _ensure_e2b_patched()
+        _ensure_e2b_patched(domain=self.domain, api_key=self.api_key)
         from e2b import AsyncSandbox
 
         return AsyncSandbox
@@ -256,7 +302,7 @@ class AgentSandboxClient:
     ) -> UUID:
         del thread_id  # 波 1:热会话行不记 thread_id(见 SQL store 的说明)。
         sandbox_id = uuid4()
-        existing: str | None = None
+        existing: tuple[UUID, str] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
@@ -264,8 +310,9 @@ class AgentSandboxClient:
 
         just_created = False
         if existing is not None:
+            winner_id, winner_container_id = existing
             try:
-                sbx = await self._connect(existing)
+                sbx = await self._connect(winner_container_id)
             except Exception:
                 # spec § 6.3 —— 唤醒失败(库存不足/欠费/保留期已过被平台删)
                 # 必须能重建,不能把 run 打死。
@@ -280,10 +327,20 @@ class AgentSandboxClient:
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                     )
-                sbx = await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
+                sbx = await self._create_and_track(
+                    tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, egress=egress
+                )
                 just_created = True
+            else:
+                # 复用成功 —— 返回赢家那一行**真实存在**的 sandbox_id,不是
+                # 本次调用开头自铸、从未插入任何行的 uuid4()(审查 Important-3:
+                # 否则后续 destroy(sandbox_id=<自铸 id>) 会静默 no-op,见
+                # SandboxInstanceStore.claim_warm 的 docstring)。
+                sandbox_id = winner_id
         else:
-            sbx = await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
+            sbx = await self._create_and_track(
+                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, egress=egress
+            )
             just_created = True
 
         for relpath, data in seed_files:
@@ -295,7 +352,9 @@ class AgentSandboxClient:
             await self.store.set_container_id(sandbox_id=sandbox_id, container_id=sbx.sandbox_id)
         return sandbox_id
 
-    async def _claim_warm(self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID) -> str | None:
+    async def _claim_warm(
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str] | None:
         """``store.claim_warm`` 套上 § 6.5 的统一错误契约。"""
         try:
             return await self.store.claim_warm(
@@ -303,6 +362,34 @@ class AgentSandboxClient:
             )
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox warm-session claim failed: {exc}") from exc
+
+    async def _create_and_track(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID | None,
+        sandbox_id: UUID,
+        egress: EgressContext | None,
+    ) -> Any:
+        """``_create`` 加上失败时的 CAS 槽位清理(审查 Critical-2)。
+
+        到这一步,``claim_warm``/重新占坑已经**持久化提交**了一行
+        (``state='IN_USE'``, ``container_id`` 仍是 NULL)—— 这行本身就是
+        CAS 的凭据。如果紧接着的 ``sdk.create()`` 失败(网络抖动/配额/
+        SandboxSet 暂时不可用……),没有这层清理的话,那行会永久停在
+        ``IN_USE`` + NULL:migration 0141 的部分唯一索引挡住这个
+        ``(tenant, user)`` 之后所有新的 ``claim_warm`` INSERT,而
+        ``claim_warm`` 自己看到"行存在但 container_id 是 NULL"时的约定行为
+        是 raise "already being created"(见 Protocol docstring)—— 没有任何
+        东西会再去把这行解开,该用户的热会话彻底卡死,只能手工改库。
+        ``drop_warm`` 把槽位放出来,让下一次 acquire 能重新正常竞争。
+        """
+        try:
+            return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
+        except Exception:
+            if user_id is not None:
+                await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+            raise
 
     async def _create(
         self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None
