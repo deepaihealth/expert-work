@@ -122,8 +122,15 @@ class FakeCommands:
 @dataclass
 class FakeFiles:
     written: list[tuple[str, bytes | str, str | None]] = field(default_factory=list)
+    #: 全分支终审 Important-6 测试缝 —— 非 None 时 ``write`` 直接抛它。覆盖
+    #: "create() 已经返回、沙箱已经在跑,但 set_container_id 还没落库"这段
+    #: 窗口里的失败。默认放一个真的 e2b 异常类型,顺带验证它被归一成
+    #: SandboxSupervisorError(§ 6.5 统一错误契约)。
+    write_error: BaseException | None = None
 
     async def write(self, path: str, data: bytes | str, *, user: str | None = None) -> None:
+        if self.write_error is not None:
+            raise self.write_error
         self.written.append((path, data, user))
 
 
@@ -183,6 +190,9 @@ class FakeInstanceStore:
     rows: dict[UUID, dict] = field(default_factory=dict)
     #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。
     drop_warm_fails: bool = False
+    #: 全分支终审 Important-6 —— 覆盖 "沙箱建好了,但回填 container_id 这一
+    #: 步失败" 这条路径(那之后没有任何东西找得到这个还活着的沙箱)。
+    set_container_id_fails: bool = False
     #: 全分支终审 Important-1 —— 覆盖 "release 的 store 读本身也失败" 这条
     #: 路径(按保温处置,不把已经跑完的工具调用变成错误)。
     is_warm_session_fails: bool = False
@@ -232,6 +242,8 @@ class FakeInstanceStore:
         self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": None}
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
+        if self.set_container_id_fails:
+            raise RuntimeError("set_container_id unavailable (db blip)")
         self.rows[sandbox_id]["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
@@ -901,6 +913,95 @@ def test_image_env_matches_dockerfile() -> None:
         f"镜像 WORKDIR={workdir} 与 WORKSPACE_ROOT={WORKSPACE_ROOT} 不一致 —— "
         "exec 传给 commands.run 的 cwd 就是后者。"
     )
+
+
+# ---------------------------------------------------------------------------
+# 全分支终审 Important-6 —— create() 返回之后、set_container_id 落库之前的
+# 那段窗口。失败在这里的话,沙箱已经在平台上跑着,而 destroy / reap /
+# list_stuck_creating 三条回收路径全都找不到它(前两个按 container_id 找,
+# 最后一个面对的正是没有 container id 的行、刻意不 connect/kill)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_seed_failure_after_create_kills_the_sandbox_and_frees_the_slot() -> None:
+    """种子文件写失败 → 沙箱被 kill、CAS 槽位让出、错误归一成 SandboxSupervisorError。
+
+    ``write_error`` 用真的 e2b 异常类型:没有这层归一的话,按 § 6.5 契约写
+    ``except SandboxSupervisorError`` 的调用方接不住它。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.files.write_error = TimeoutException("envd unreachable")
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    with pytest.raises(SandboxSupervisorError):
+        await client.acquire(
+            tenant_id=tenant_id,
+            thread_id="t",
+            user_id=user_id,
+            seed_files=(("skill.md", b"x"),),
+        )
+
+    assert sdk.sandbox.killed is True, "沙箱已经在跑却没人记得它 —— 必须当场 kill"
+    assert store.warm == {}, "CAS 槽位必须让出来,否则这个 (tenant, user) 卡死"
+
+    # 槽位真的可用了:下一次 acquire 能正常走完(不是只把 dict 清空了事)。
+    sdk.sandbox.files.write_error = None
+    assert await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+
+@pytest.mark.asyncio
+async def test_container_id_backfill_failure_kills_the_sandbox() -> None:
+    """回填那一步失败同样漏沙箱 —— 而且这条路径连种子文件都不需要。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    store.set_container_id_fails = True
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    with pytest.raises(SandboxSupervisorError):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert sdk.sandbox.killed is True
+    assert store.warm == {}
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_post_create_failure_clears_the_row() -> None:
+    """临时沙箱(无 user_id)没有 CAS 槽位,但有一行 create_ephemeral 插的行
+    ——同样要 kill + 清行,否则 list_active 会一直把它当活跃会话。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.files.write_error = RuntimeError("write failed")
+    client = make_client(sdk, store)
+
+    with pytest.raises(SandboxSupervisorError):
+        await client.acquire(tenant_id=uuid4(), thread_id="t", seed_files=(("skill.md", b"x"),))
+
+    assert sdk.sandbox.killed is True
+    assert [reason for _, reason in store.mark_destroyed_calls] == ["post_create_failed"]
+    assert store.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_seed_failure_on_warm_reuse_does_not_kill_the_reused_sandbox() -> None:
+    """复用别人早就建好的热会话时,种子文件写失败不该把那个沙箱连锅端了
+    ——它不是这次调用建的,那一行也已经健康登记过。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+    await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    sdk.sandbox.files.write_error = RuntimeError("write failed")
+    with pytest.raises(SandboxSupervisorError):
+        await client.acquire(
+            tenant_id=tenant_id,
+            thread_id="t2",
+            user_id=user_id,
+            seed_files=(("skill.md", b"x"),),
+        )
+
+    assert sdk.sandbox.killed is False, "复用的热会话不是本次建的,不能拆"
+    assert store.warm[(tenant_id, user_id)] is not None, "热会话槽位应原样保留"
 
 
 # ---------------------------------------------------------------------------

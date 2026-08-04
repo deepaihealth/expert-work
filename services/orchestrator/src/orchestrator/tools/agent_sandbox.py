@@ -380,14 +380,62 @@ class AgentSandboxClient:
             )
             just_created = True
 
-        for relpath, data in seed_files:
-            await sbx.files.write(f"{WORKSPACE_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER)
-
-        if just_created:
-            # 连到既有热会话时该行的 container_id 已经是对的(existing 正是
-            # 从那里读出来的)—— 只有本次自己建/重建了沙箱才需要回填。
-            await self.store.set_container_id(sandbox_id=sandbox_id, container_id=sbx.sandbox_id)
+        # 全分支终审 Important-6:这一段以前是裸的。``create()`` 一旦返回,
+        # 沙箱就已经在平台上跑起来了,但它的 id 要到下面 set_container_id
+        # 才落库 —— 这中间任何一处抛异常(种子文件写失败 / 回填时 DB 抖),
+        # 留下的是一个活着的 microVM,而 destroy / reap / list_stuck_creating
+        # 全都找不到它(前两个按 container_id 找,最后一个刻意不 connect/kill
+        # ——它面对的正是没有 container id 的行)。唯一会收走它的是平台超时,
+        # 这正是 _SANDBOX_TIMEOUT_S 那条兜底真正承重的地方。
+        #
+        # 顺带补上 § 6.5 的统一错误契约:``files.write`` 原样抛的是 e2b 自己
+        # 的异常类型,写 ``except SandboxSupervisorError`` 的调用方接不住
+        # (LLM 那条路径因为 tools 节点 catch 宽 Exception 而无感,但契约就是
+        # 契约)。
+        try:
+            for relpath, data in seed_files:
+                await sbx.files.write(f"{WORKSPACE_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER)
+            if just_created:
+                # 连到既有热会话时该行的 container_id 已经是对的(existing 正是
+                # 从那里读出来的)—— 只有本次自己建/重建了沙箱才需要回填。
+                await self.store.set_container_id(
+                    sandbox_id=sandbox_id, container_id=sbx.sandbox_id
+                )
+        except Exception as exc:
+            if just_created:
+                # 只有"这次自己建的"才拆:复用既有热会话时 sbx 是别人的沙箱、
+                # 那一行也已经健康登记过,种子文件写失败不该把它连锅端了。
+                await self._discard_new_sandbox(
+                    sbx, tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                )
+            raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
         return sandbox_id
+
+    async def _discard_new_sandbox(
+        self, sbx: Any, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
+    ) -> None:
+        """拆掉一个本次调用刚建起来、但还没能被任何一行记住的沙箱。
+
+        先 kill 再让槽位:kill 是尽力而为(沙箱可能本来就没起来 / 平台侧已
+        经不在),失败也要继续走 :meth:`_unwind_slot`,否则就把"漏一个
+        microVM"换成了"卡死一个 (tenant, user) 的热会话槽",两害相权更糟。
+        两者都不抛,调用方那句 ``raise`` 抛的始终是原始故障。
+        """
+        try:
+            await sbx.kill()
+        except Exception:
+            logger.warning(
+                "failed to kill a sandbox that was created but never recorded "
+                "(sandbox_id=%s) — it will be reclaimed by the platform timeout",
+                sandbox_id,
+                exc_info=True,
+            )
+        await self._unwind_slot(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            reason="post_create_failed",
+        )
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -439,27 +487,55 @@ class AgentSandboxClient:
         bare ``raise`` 重新抛出的是外层 except 语句本来在处理的那个异常,
         不是内层被捕获又丢弃的那个(标准 Python 异常处理语义,已用最小
         复现脚本独立验证过,见报告)。Task 10 追加:临时沙箱同理,见 ``else`` 分支。
+
+        全分支终审 Important-6:上面那套清理本身抽成 :meth:`_unwind_slot`,
+        因为 ``create()`` 已经**成功返回**之后的那段(种子文件 +
+        ``set_container_id`` 回填)也要走同一套清理,见 :meth:`acquire`。
         """
         try:
             return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
         except Exception:
-            if user_id is not None:
-                try:
-                    await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
-                except Exception:
-                    logger.error(
-                        "drop_warm failed while unwinding a create() failure — "
-                        "tenant=%s user=%s stays wedged behind the 0141 warm-slot "
-                        "index; needs manual cleanup",
-                        tenant_id,
-                        user_id,
-                        exc_info=True,
-                    )
-            else:
-                # 尽力而为:清不掉也不阻塞,list_stuck_creating 的 TTL 兜底稍后会捡走。
-                with contextlib.suppress(Exception):
-                    await self.store.mark_destroyed(sandbox_id=sandbox_id, reason="create_failed")
+            await self._unwind_slot(
+                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, reason="create_failed"
+            )
             raise
+
+    async def _unwind_slot(
+        self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID, reason: str
+    ) -> None:
+        """让出这次 acquire 已经占下的 CAS 槽位 / 清掉它已经插下的行。
+
+        本身**永不抛出** —— 两个调用方都是在处理另一个异常的路上顺手清理,
+        清理失败不该把原始错误换掉(那会让按 ``SandboxSupervisorError`` 写的
+        except 链接不住,而且槽位照样没清干净,只是把病根往下埋一层)。
+        热会话分支单独 catch + ``logger.error`` 标明需要人工介入;临时沙箱
+        分支尽力而为,清不掉也不阻塞。
+
+        与 C-1(``claim_warm`` 接管过期孤儿行)的关系,两条路径不会互踩:
+        这里是**同进程内的快路径**,成功了行就没了,C-1 那边无行可接管;
+        这里失败(DB 抖动)时行仍停在 ``IN_USE``+NULL,正好落进 C-1 的
+        ``_STUCK_CREATE_TTL_S`` 兜底,5 分钟后由下一次 ``claim_warm`` 接管。
+        两者都是"把槽位放出来",谁先做完另一个就自然没事可做,不存在
+        double-drop —— ``drop_warm`` 删的是 ``(tenant, user)`` 那一行,
+        C-1 是在一次新的 ``claim_warm`` 里对同一行改写终态。
+        """
+        if user_id is not None:
+            try:
+                await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+            except Exception:
+                logger.error(
+                    "drop_warm failed while unwinding a failed acquire (%s) — "
+                    "tenant=%s user=%s stays wedged behind the 0141 warm-slot "
+                    "index until the claim_warm stuck-create TTL takes it over",
+                    reason,
+                    tenant_id,
+                    user_id,
+                    exc_info=True,
+                )
+        else:
+            # 尽力而为:清不掉也不阻塞,list_stuck_creating 的 TTL 兜底稍后会捡走。
+            with contextlib.suppress(Exception):
+                await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
 
     async def _create(
         self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None
