@@ -2089,6 +2089,25 @@ reconnect    end_at 再推后 → connect(timeout=) 真的续钟
 顺带实证了 `PIP_USER=1` 确有必要:`/usr/local/lib/python3.12/site-packages` 对
 uid 10000 的 `agent` **不可写**(实际写入拿 `PermissionError`),global 装必失败。
 
+### 终审 fix 两轮之后的全量真栈回归(镜像 `003203ad`)
+
+两轮修复共 16 个 commit,发测试环境后把四项验收连同 I-1/I-2/I-4 一起重跑:
+
+```
+验收 0  直连 exec        SandboxOutcome(stdout='5050\n', exit_code=0, timed_out=False)
+I-2     沙箱环境          cwd=/workspace  HOME=/workspace  PIP_USER=1
+                          LANG=zh_CN.UTF-8  MPLCONFIGDIR=/workspace/.mplconfig
+I-4     平台存活钟        1201s(期望 1200)
+I-1     release 两分支    无 user_id → DESTROYED + destroy_reason='release'
+                          warm 会话  → 仍 IN_USE / destroyed_at=None
+验收 2  出网 + 审计       https 200;审计 verdict='allowed' bytes_up=1820 bytes_down=36218
+验收 3  热会话复用        同一 sandbox_id,第二次 0.04s
+验收 4  reap              reaped=1,全表 destroyed_at IS NULL 归零
+```
+
+`release` 的两个分支是这轮新加的(I-1),真栈上确认与 docker supervisor 的语义
+一致 —— 临时沙箱销毁、热会话保温。
+
 ### 发现六:`pip install` 装得上,但装完 import 不到(既有缺陷,非本波引入)
 
 顺着上一条往下测,发现镜像 `PIP_USER=1` 的设计意图从来没真正成立过:
