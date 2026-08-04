@@ -204,7 +204,7 @@ class SqlSandboxInstanceStore:
         acceptance), no handler in that process ever runs. Every subsequent
         ``claim_warm`` for that ``(tenant, user)`` then hits the raise
         forever, and the review traced every path that could clear it:
-        ``acquire``'s ``drop_warm`` branch is unreachable (this method
+        ``acquire``'s warm-reconnect cleanup is unreachable (this method
         raises instead of returning the tuple that branch needs),
         ``_create_and_track``'s unwind is same-process only, and
         :meth:`list_stuck_creating` is only reachable from
@@ -384,10 +384,37 @@ class SqlSandboxInstanceStore:
             raise RuntimeError(_missing_row_message(sandbox_id))
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
+        """First writer wins — a terminal row is never re-stamped.
+
+        The ``state``/``destroyed_at`` predicates make a repeat call a
+        no-op, matching :class:`InMemorySandboxInstanceStore` (whose
+        ``_rows.pop`` has always made the second call inert). Without them
+        SQL overwrote ``destroy_reason`` and pushed ``destroyed_at``
+        forward on an already-terminal row.
+
+        Re-review of the Important-1 fix flagged this: keying every unwind
+        by ``sandbox_id`` put repeat calls squarely on the takeover path.
+        Caller B takes over A's stale slot and marks A's row with
+        ``_REASON_STUCK_CREATE_TAKEOVER``; A then fails and its own cleanup
+        stamps the SAME row with ``post_create_failed``, erasing exactly the
+        forensic signal that constant's docstring exists to preserve — an
+        operator could no longer tell which path destroyed the row. Nothing
+        keys off ``destroy_reason`` behaviourally, so this is a
+        diagnosability fix, not a correctness one.
+
+        The in-memory store needs no change; its second call was already a
+        no-op. This is SQL catching up, the same direction as
+        :meth:`set_container_id` and
+        :meth:`touch_and_get_container_id`.
+        """
         async with self._sf() as session:
             await session.execute(
                 sa_update(SandboxInstanceRow)
-                .where(SandboxInstanceRow.id == sandbox_id)
+                .where(
+                    SandboxInstanceRow.id == sandbox_id,
+                    SandboxInstanceRow.state == _STATE_IN_USE,
+                    SandboxInstanceRow.destroyed_at.is_(None),
+                )
                 .values(state=_STATE_DESTROYED, destroyed_at=_utc_now(), destroy_reason=reason)
             )
             await session.commit()

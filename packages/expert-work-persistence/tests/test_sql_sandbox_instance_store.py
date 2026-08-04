@@ -732,6 +732,56 @@ async def test_set_container_id_rejects_an_already_destroyed_row(
 
 
 @pytest.mark.asyncio
+async def test_mark_destroyed_does_not_restamp_a_terminal_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """第一个写终态的赢,后来者不许覆写 destroy_reason / destroyed_at。
+
+    Important-1 的修法把每个清理点都改成按 sandbox_id 让位,重复调用因此正好
+    落在接管路径上:调用方 B 接管 A 的过期槽位、把 A 那行标成
+    ``stuck_create_takeover``,随后 A 自己失败,它的清理再把**同一行**盖成
+    ``post_create_failed`` —— 抹掉的正是 _REASON_STUCK_CREATE_TAKEOVER 的
+    docstring 存在的理由(运维得能看出是哪条路径拆的)。
+
+    内存实现一直是对的(``_rows.pop`` 让第二次调用天然空转),这里是 SQL 补齐,
+    方向同 set_container_id / touch_and_get_container_id。没有任何东西按
+    destroy_reason 做行为判断,所以这是可诊断性修复不是正确性修复。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason=_REASON_STUCK_CREATE_TAKEOVER)
+
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            first = (
+                await conn.execute(
+                    select(
+                        SandboxInstanceRow.destroy_reason, SandboxInstanceRow.destroyed_at
+                    ).where(SandboxInstanceRow.id == sandbox_id)
+                )
+            ).one()
+
+        await store.mark_destroyed(sandbox_id=sandbox_id, reason="post_create_failed")
+
+        async with engine.begin() as conn:
+            second = (
+                await conn.execute(
+                    select(
+                        SandboxInstanceRow.destroy_reason, SandboxInstanceRow.destroyed_at
+                    ).where(SandboxInstanceRow.id == sandbox_id)
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+
+    assert first.destroy_reason == _REASON_STUCK_CREATE_TAKEOVER
+    assert second == first, "终态行不能被第二个清理点重新盖章"
+
+
+@pytest.mark.asyncio
 async def test_touch_and_get_container_id_ignores_a_destroyed_row(
     store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
 ) -> None:

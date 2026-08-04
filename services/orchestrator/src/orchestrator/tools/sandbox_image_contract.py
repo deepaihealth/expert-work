@@ -7,7 +7,7 @@
 了什么"的常量与理由,一行可执行代码、一处对 ``AgentSandboxClient`` 内部状态的
 引用都没有。**不改任何一个值**,连 docstring 都逐字照搬。
 
-住在一起的理由不只是行数:这五个常量的共同点是它们的事实源都**不在**编排
+住在一起的理由不只是行数:这几个常量的共同点是它们的事实源都**不在**编排
 进程里(``infra/sandbox-image/Dockerfile`` 的 ``ENV``/``WORKDIR``、
 ``infra/sandbox-image/runner.py`` 的三个 clamp/截断常量、镜像里的
 ``USER agent``),运行时读不到,只能是第二份副本 + 一道漂移闸。对应的闸:
@@ -15,7 +15,7 @@
 ``test_exec_contract_constants_match_the_sandbox_image``(比 ``runner.py``
 与 supervisor 的 HTTP 边界)。
 
-``agent_sandbox`` 仍然 ``import`` 并使用全部五个,老的
+``agent_sandbox`` 仍然 ``import`` 并使用它们全部,老的
 ``from orchestrator.tools.agent_sandbox import WORKSPACE_ROOT`` 之类照常可用。
 """
 
@@ -64,10 +64,19 @@ SANDBOX_IMAGE_ENV = {
     "PIP_USER": "1",
 }
 
-#: 契约常量 —— 与 infra/sandbox-image/runner.py:28-37 逐字对齐(``exec``,
-#: Task 8)。runner.py 是本地 docker 沙箱里的 PID 1,这三个值是它的
-#: ``DEFAULT_TIMEOUT_S`` / ``MAX_TIMEOUT_S`` / ``MAX_OUTPUT_CHARS``;云沙箱
-#: 与本地 supervisor 对同一次 exec 请求要给出等价的 clamp/truncate 行为。
+#: 契约常量 —— 云沙箱与本地 supervisor 对同一次 exec 请求要给出等价的
+#: clamp/truncate 行为。三个值各自钉的对家不同,别一概而论:
+#:
+#: * ``DEFAULT_TIMEOUT_S`` —— 三方对齐(supervisor 的
+#:   ``SandboxSupervisorSettings.default_timeout_s`` + ``runner.py:28-37``)
+#: * ``MAX_TIMEOUT_S`` —— 钉 supervisor 的 **HTTP 边界**
+#:   ``schemas.ExecRequest.timeout_s`` 的 ``le``,不是 ``runner.py`` 的同名
+#:   常量:超范围的 ``timeout_s`` 在 schema 就被 422 掉,``runner.py`` 那个
+#:   clamp 在 HTTP 路径上根本走不到(全分支终审复审发现)。runner.py 侧的值
+#:   因此**没有闸钉着**——它今天是死代码,哪天 supervisor 改成直调就得补闸
+#: * ``MAX_OUTPUT_CHARS`` —— 钉 ``runner.py:28-37``(截断真发生在那里)
+#:
+#: 对应的闸都在 ``test_exec_contract_constants_match_the_sandbox_image``。
 DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
 MAX_OUTPUT_CHARS = 1_000_000

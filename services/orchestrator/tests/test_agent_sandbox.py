@@ -65,6 +65,7 @@ from e2b import CommandExitException, TimeoutException
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     InMemorySandboxInstanceStore,
+    _missing_row_message,
 )
 from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
@@ -274,7 +275,7 @@ class FakeInstanceStore:
             # 再审 Important-2 —— 契约是"行不在/已销毁必须 raise"。此前这里
             # 是 self.rows[sandbox_id][...] 的裸 KeyError:行为碰巧对,但看不
             # 出是契约还是漏了个 .get()。显式化,与两个生产 store 对齐。
-            raise RuntimeError(f"sandbox row {sandbox_id} is gone")
+            raise RuntimeError(_missing_row_message(sandbox_id))
         row["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:

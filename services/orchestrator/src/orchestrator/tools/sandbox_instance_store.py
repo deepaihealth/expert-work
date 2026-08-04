@@ -118,10 +118,21 @@ class SandboxInstanceStore(Protocol):
         方),而按坐标定位的删除删的是"此刻占着槽位的那一行",不是"我插的
         那一行"——调用方 A 被接管之后再走清理,删掉的就是接管者 B 那行健康
         的活行(B 的 microVM 随即从 :meth:`list_active` 消失,周期 reap 再也
-        看不见它)。按 ``sandbox_id`` 定位天然没有这个问题:每个清理点都恰好
-        知道自己那一行的 id,而 0141 的部分唯一索引键在 ``state`` /
-        ``destroyed_at`` / ``user_id`` 上,本方法两个都写,腾槽位的效果与按
-        坐标删完全一样。
+        看不见它)。按 ``sandbox_id`` 定位严格更好:清理点至少指名道姓说出它要
+        拆哪一行,而 0141 的部分唯一索引键在 ``state`` / ``destroyed_at`` /
+        ``user_id`` 上,本方法两个都写,腾槽位的效果与按坐标删完全一样。
+
+        **但"按 id 就一定是自己那行"并不成立**,别照这句话推论:
+        ``acquire`` 的热会话重连失败分支拆的是 ``winner_id`` —— 那行是别人
+        插的,而且 ``claim_warm`` 会把同一个赢家元组发给每一个输家,所以 A
+        的 ``connect`` 只是暂时抽风时,它照样会拆掉正在被 B 使用的那一行。
+        这个洞在改成按 id 之前就在(按坐标定位只会更糟),本轮没修;
+        :meth:`touch_and_get_container_id` 的谓词收紧之后,B 的下一次
+        ``exec`` 至少会响亮地报错而不是继续在一个已销毁的行上跑。
+
+        实现必须"先到先得":终态行不再被第二个清理点重新盖章。见
+        ``SqlSandboxInstanceStore.mark_destroyed`` 的 docstring —— 按 id
+        让位把重复调用正好放在了接管路径上。
         """
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
