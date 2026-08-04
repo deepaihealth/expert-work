@@ -217,6 +217,9 @@ class FakeInstanceStore:
     #: test_ephemeral_create_failure_clears_the_row 的清理代码路径真的执行
     #: 了,而不是"store 本来就是空的"这种巧合通过。
     mark_destroyed_calls: list[tuple[UUID, str]] = field(default_factory=list)
+    #: 全分支终审测试缝 —— 这些 sandbox_id 上的 mark_destroyed 直接抛,用来
+    #: 验证 reap 的一趟清扫不会被一行掐断。
+    mark_destroyed_fails_for: set[UUID] = field(default_factory=set)
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -247,6 +250,8 @@ class FakeInstanceStore:
         self.rows[sandbox_id]["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
+        if sandbox_id in self.mark_destroyed_fails_for:
+            raise RuntimeError(f"mark_destroyed unavailable for {sandbox_id}")
         # 记录每次调用(哪怕行早就不在了)—— 让
         # test_ephemeral_create_failure_clears_the_row 能证明清理代码真的
         # 跑了,而不是碰巧"store 本来就是空的"这种巧合通过。
@@ -1081,6 +1086,41 @@ async def test_reap_force_kills_every_active_sandbox_of_ours() -> None:
     assert reaped == 2
     assert store.rows == {}
     assert store.warm == {}, "热会话坑必须放出来,否则 (tenant, user) 再也 acquire 不到"
+
+
+@pytest.mark.asyncio
+async def test_reap_survives_a_row_that_fails_to_clear() -> None:
+    """一行清不掉不能掐断整趟清扫 —— reap 现在是云后端唯一的回收机制,
+    也是"卡死行"的人工恢复入口,一行拖垮一轮的代价比以前高。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    ids = []
+    for i in range(3):
+        sdk.sandbox = FakeSandbox(sandbox_id=f"sbx-{i}")
+        ids.append(await client.acquire(tenant_id=uuid4(), thread_id=f"t{i}", user_id=uuid4()))
+    store.mark_destroyed_fails_for = {ids[0]}
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 2, "坏行不计数,但其余两行仍然被回收"
+    assert set(store.rows) == {ids[0]}, "只剩那一行没清掉,下一轮再收"
+
+
+@pytest.mark.asyncio
+async def test_reap_survives_a_stuck_creating_row_that_fails_to_clear() -> None:
+    """孤儿行(``list_stuck_creating``)那个循环同理 —— 两个循环都要逐行包。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    bad, good = uuid4(), uuid4()
+    for sandbox_id in (bad, good):
+        store.rows[sandbox_id] = {"tenant_id": uuid4(), "user_id": uuid4()}
+    store.stuck_creating_sandbox_ids = {bad, good}
+    store.mark_destroyed_fails_for = {bad}
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 1
+    assert set(store.rows) == {bad}
 
 
 @pytest.mark.asyncio

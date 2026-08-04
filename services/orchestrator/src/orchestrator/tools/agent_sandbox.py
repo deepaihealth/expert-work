@@ -100,29 +100,25 @@ SANDBOX_EXEC_USER = "agent"
 #: 一份显式送进云沙箱。
 #:
 #: **为什么需要**:envd 派生的进程**不继承镜像的 ``ENV``/``WORKDIR``**。
-#: 2026-08-04 集群探针实测(不是推断):``cwd=/home/agent``(镜像是
-#: ``WORKDIR /workspace``)、``HOME=/home/agent``(镜像是 ``/workspace``)、
-#: ``PIP_USER``/``LANG``/``MPLCONFIGDIR`` 一律 ``None``。本地 supervisor 那边
-#: ``runner.py`` 是容器 PID 1、``subprocess.run`` 直接继承容器环境,这些白
-#: 拿——所以这是云后端独有的缺口,不是两边都有的老问题。缺了它们:
-#: ``pip install`` 在只读 rootfs 上装 ``/usr/local`` 必失败(``PIP_USER=1``
-#: 正是为此而设)、matplotlib 没有可写配置目录、``LANG`` 空则中文输出有编码
-#: 风险、``HOME`` 指向 ``/home/agent`` 让用户级安装/缓存落在工作区外。
+#: 2026-08-04 集群探针实测(不是推断):``cwd`` 与 ``HOME`` 都是
+#: ``/home/agent``(镜像是 ``/workspace``),``PIP_USER``/``LANG``/
+#: ``MPLCONFIGDIR`` 一律 ``None``。缺了它们:只读 rootfs 上 ``pip install``
+#: 必失败(``PIP_USER=1`` 正是为此而设)、matplotlib 没有可写配置目录、中文
+#: 输出有编码风险、用户级安装落在工作区外。本地 supervisor 白拿这一切
+#: (``runner.py`` 是容器 PID 1、``subprocess.run`` 直接继承容器环境),所以
+#: 这是云后端独有的缺口。
 #:
-#: **单一事实源为什么落在这里**:Dockerfile 的 ``ENV`` 是给 docker/containerd
-#: 的构建期声明,编排进程这一侧在运行时读不到它(镜像不在本进程,也不该为
-#: 取几个常量去拉镜像元数据),所以"共享一个变量"物理上做不到,只能是两份
-#: 副本 + 一道对齐闸。这份 dict 是唯一真的会被送进云沙箱的副本,放在唯一
-#: 使用它的模块里;
-#: ``services/orchestrator/tests/test_agent_sandbox.py::test_image_env_matches_dockerfile``
-#: 直接解析 Dockerfile 的 ``ENV``/``WORKDIR`` 指令逐条比对,任一边单方面改动
-#: 都会红——与 ``test_idle_ttl_matches_supervisor_default`` 防 TTL 漂移是同一
-#: 手法,也是本仓对"同一语义分散两处"的既定处置。
+#: **单一事实源为什么落在这里**:Dockerfile 的 ``ENV`` 是构建期声明,编排
+#: 进程运行时读不到(镜像不在本进程,也不该为几个常量去拉镜像元数据)——
+#: "共享一个变量"物理上做不到,只能是两份副本 + 一道对齐闸。这份是唯一真会
+#: 被送进云沙箱的副本,放在唯一使用它的模块里;
+#: ``test_image_env_matches_dockerfile`` 解析 Dockerfile 的 ``ENV``/
+#: ``WORKDIR`` 双向比对,任一边单方面改动都会红(手法同
+#: ``test_idle_ttl_matches_supervisor_default``)。
 #:
-#: 只在 ``create(envs=...)`` 传一次:``connect`` 没有 ``envs`` 形参(e2b
-#: 2.24.0 ``sandbox_async/main.py``),热会话重连不会重发。这里全是与沙箱
-#: 实例无关的常量,建时定死即可——与同样走 ``envs`` 的 egress 变量不同,
-#: 那些带 per-sandbox token(见 :meth:`_egress_env`)。
+#: 只在 ``create(envs=...)`` 送一次:``connect`` 没有 ``envs`` 形参(e2b
+#: 2.24.0),热会话重连不重发 —— 这 7 项全是与实例无关的常量,建时定死即可
+#: (与带 per-sandbox token 的 egress 变量不同,见 :meth:`_egress_env`)。
 SANDBOX_IMAGE_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
@@ -143,27 +139,25 @@ MAX_OUTPUT_CHARS = 1_000_000
 
 #: 传给 ``create()`` / ``connect()`` 的沙箱存活上限(秒)。
 #:
-#: **必须显式传**。e2b 2.24.0(``e2b/sandbox_async/main.py:171-198``)的
-#: ``timeout`` 默认 **300 秒**,且 ``lifecycle.on_timeout`` 默认是 ``"kill"``
-#: 而不是 ``"pause"``。2026-08-04 集群实测印证:``get_info()`` 回
-#: ``started_at=10:49:10 / end_at=10:54:10``(正好 300s)、``lifecycle=None``。
-#: 也就是说不传的话每个沙箱 5 分钟就被平台杀掉——热会话表面上还在,下次
-#: acquire 的 connect 失败、``drop_warm`` 重建,能自愈(波 1 验收的热复用
-#: 那一项恰好在 5 分钟窗口内跑完,所以没暴露),代价是白付一次 35-40s 冷启
-#: 外加用户工作区里的文件没了。
+#: **必须显式传**:e2b 2.24.0(``e2b/sandbox_async/main.py:171-198``)的
+#: ``timeout`` 默认 **300 秒**,``lifecycle.on_timeout`` 默认 ``"kill"`` 而非
+#: ``"pause"``;2026-08-04 集群实测印证(``get_info()`` 回
+#: ``started_at=10:49:10 / end_at=10:54:10``,正好 300s;``lifecycle=None``)。
+#: 不传的话沙箱 5 分钟就被平台杀掉——下次 acquire 的 connect 失败 →
+#: ``drop_warm`` → 重建,能自愈(波 1 验收的热复用那一项恰好在 5 分钟窗口内
+#: 跑完,所以没暴露),代价是白付一次 35-40s 冷启 + 工作区里的文件没了。
 #:
-#: **为什么是 20 分钟**:要的是"我们自己的 reap 空闲扫是主角、平台超时只是
-#: 兜底",两者不能互抢。下界由 ``_IDLE_TTL_S``(15 分钟,热会话空闲回收线)
-#: 定死——比它短则平台先动手,一个还没到我们空闲线的活跃热会话会被平台
-#: 掐掉;上界是"编排进程整体失联时兜底还要及时",设成几小时等于让兜底名存
-#: 实亡。5 分钟余量约等于 ``SandboxReapWorker._INTERVAL_S``(240s)一整轮再
-#: 加富余,保证正常情况下永远是 reap 先到。
+#: **为什么是 20 分钟**:要"我们自己的 reap 空闲扫是主角、平台超时只是兜底",
+#: 两者不能互抢。下界由 ``_IDLE_TTL_S``(15 分钟)定死——比它短则平台先动
+#: 手,掐掉还没到我们空闲线的活跃热会话;上界是"编排进程整体失联时兜底还要
+#: 及时",几小时等于让兜底名存实亡。5 分钟余量 ≈ ``SandboxReapWorker`` 一个
+#: 完整扫描周期(240s)再加富余。
 #: ``test_platform_timeout_outlives_idle_ttl`` 钉住这个不等式。
 #:
 #: **刻意不设** ``lifecycle``:``{"on_timeout": "pause"}`` 是 E2B 的语义,
 #: 阿里云 ACS 这侧是否真的实现了 pause/resume **未经验证**(探针只跑过
-#: create/connect/kill)。一个没验证过的休眠配置正是本轮要修掉的那条失真
-#: docstring 的由来,不重蹈。要开 pause 先上集群实测。
+#: create/connect/kill)。没验证过的休眠配置正是本轮那条失真 docstring 的
+#: 由来,不重蹈 —— 要开 pause 先上集群实测。
 _SANDBOX_TIMEOUT_S = 20 * 60
 
 #: ``destroy_reason`` written when :meth:`AgentSandboxClient.release` tears
@@ -380,18 +374,13 @@ class AgentSandboxClient:
             )
             just_created = True
 
-        # 全分支终审 Important-6:这一段以前是裸的。``create()`` 一旦返回,
-        # 沙箱就已经在平台上跑起来了,但它的 id 要到下面 set_container_id
-        # 才落库 —— 这中间任何一处抛异常(种子文件写失败 / 回填时 DB 抖),
-        # 留下的是一个活着的 microVM,而 destroy / reap / list_stuck_creating
-        # 全都找不到它(前两个按 container_id 找,最后一个刻意不 connect/kill
-        # ——它面对的正是没有 container id 的行)。唯一会收走它的是平台超时,
-        # 这正是 _SANDBOX_TIMEOUT_S 那条兜底真正承重的地方。
-        #
-        # 顺带补上 § 6.5 的统一错误契约:``files.write`` 原样抛的是 e2b 自己
-        # 的异常类型,写 ``except SandboxSupervisorError`` 的调用方接不住
-        # (LLM 那条路径因为 tools 节点 catch 宽 Exception 而无感,但契约就是
-        # 契约)。
+        # 全分支终审 Important-6:这一段以前是裸的。create() 一返回沙箱就已经
+        # 在平台上跑着,而它的 id 要到下面 set_container_id 才落库——中间任何
+        # 一处抛异常都留下一个活着的 microVM,且 destroy / reap /
+        # list_stuck_creating 全都找不到它(前两个按 container_id 找,最后一个
+        # 面对的正是没有 container id 的行、刻意不 connect/kill)。唯一收得走
+        # 它的是平台超时,这正是 _SANDBOX_TIMEOUT_S 真正承重的地方。顺带补上
+        # § 6.5 的统一错误契约:files.write 原样抛的是 e2b 自己的异常类型。
         try:
             for relpath, data in seed_files:
                 await sbx.files.write(f"{WORKSPACE_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER)
@@ -508,16 +497,11 @@ class AgentSandboxClient:
         本身**永不抛出** —— 两个调用方都是在处理另一个异常的路上顺手清理,
         清理失败不该把原始错误换掉(那会让按 ``SandboxSupervisorError`` 写的
         except 链接不住,而且槽位照样没清干净,只是把病根往下埋一层)。
-        热会话分支单独 catch + ``logger.error`` 标明需要人工介入;临时沙箱
-        分支尽力而为,清不掉也不阻塞。
 
-        与 C-1(``claim_warm`` 接管过期孤儿行)的关系,两条路径不会互踩:
-        这里是**同进程内的快路径**,成功了行就没了,C-1 那边无行可接管;
-        这里失败(DB 抖动)时行仍停在 ``IN_USE``+NULL,正好落进 C-1 的
-        ``_STUCK_CREATE_TTL_S`` 兜底,5 分钟后由下一次 ``claim_warm`` 接管。
-        两者都是"把槽位放出来",谁先做完另一个就自然没事可做,不存在
-        double-drop —— ``drop_warm`` 删的是 ``(tenant, user)`` 那一行,
-        C-1 是在一次新的 ``claim_warm`` 里对同一行改写终态。
+        与 C-1(``claim_warm`` 接管过期孤儿行)不会互踩:这里是同进程内的快
+        路径,成功了行就没了、C-1 无行可接管;这里失败(DB 抖)时行仍停在
+        ``IN_USE``+NULL,正好落进 C-1 的 ``_STUCK_CREATE_TTL_S`` 兜底。两者都
+        是"把槽位放出来",谁先做完另一个自然没事可做,不存在 double-drop。
         """
         if user_id is not None:
             try:
@@ -776,8 +760,7 @@ class AgentSandboxClient:
                 # 否则热会话坑永远占着,该 (tenant, user) 再也 acquire 不到
                 # ——与 destroy() 的 broad except 同理,见上面 docstring。
                 logger.info("reap: sandbox %s already gone", container_id)
-            await self.store.mark_destroyed(sandbox_id=sandbox_id, reason="reap")
-            reaped += 1
+            reaped += await self._clear_reaped_row(sandbox_id, reason="reap")
         if force:
             for sandbox_id in await self.store.list_stuck_creating():
                 # 没有对应的 E2B 容器——connect/kill 无从谈起,直接清行。
@@ -788,8 +771,27 @@ class AgentSandboxClient:
                     "with no container to kill",
                     sandbox_id,
                 )
-                await self.store.mark_destroyed(
-                    sandbox_id=sandbox_id, reason="reap_orphaned_create"
-                )
-                reaped += 1
+                reaped += await self._clear_reaped_row(sandbox_id, reason="reap_orphaned_create")
         return reaped
+
+    async def _clear_reaped_row(self, sandbox_id: UUID, *, reason: str) -> int:
+        """清一行并计数;这一行失败只记日志回 ``0``,让清扫继续往下走。
+
+        全分支终审:两个循环原本都把 ``mark_destroyed`` 摆在 per-row ``try``
+        之外,一行出问题(被并发清了 / DB 抖 / 约束冲突)整趟清扫就地中止,
+        这一轮后面该回收的全漏。本地 supervisor 的 reaper 正是为此逐行包
+        (``sandbox_supervisor/reaper.py``),这里照抄那个形状;而且 ``reap``
+        现在是云后端唯一的回收机制、也是 C-1 卡死行的人工恢复入口。
+        """
+        try:
+            await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        except Exception:
+            logger.warning(
+                "reap: failed to clear row %s (%s) — sweep continues with the "
+                "remaining rows; this one is left for the next sweep",
+                sandbox_id,
+                reason,
+                exc_info=True,
+            )
+            return 0
+        return 1
