@@ -89,6 +89,19 @@ grep -n "bash\|FROM\|apt-get\|apk" infra/sandbox-image/Dockerfile
 
 打开阿里云 Agent Sandbox 自定义镜像文档,对照检查(bash 之外还有什么强制项,例如 agent-runtime/envd 的注入方式、必须存在的目录、entrypoint 约束)。**把核对出的每一条追加写进本任务的 Step 3**,不要只记在脑子里 —— 后面三波都要照这份清单。
 
+**核对结果(2026-08-03)** —— 环境内无可用浏览器/WebFetch 工具,核对经 WebSearch 摘要交叉验证(同一措辞在 3 次独立查询、中英文页面中一致复现),置信度高但非逐字读取源文档;完整过程见 `.superpowers/sdd/2026-08-03-sandbox-migration-w1/task-1-report.md`:
+
+| # | 要求 | 强制性 | 本镜像现状 | 动作 |
+|---|---|---|---|---|
+| 1 | bash 必须存在,可执行文件位于 `/bin/bash`(来源:help.aliyun.com/zh/cs/user-guide/create-an-agent-sandbox) | 硬性,文档原文 | 已满足 —— Debian `Essential:yes` 包,`python:3.12-slim` 自带;amd64/arm64 双架构实测 `dpkg -l` 命中 `bash 5.2.37-2+b9` | Dockerfile 加 build-time assertion(校验,非安装) |
+| 2 | 基础指令 cp/mv/mkdir"等"(非穷举列表) | 硬性,文档原文 | 已满足 —— `coreutils 9.7-3`,同为 Debian Essential 包 | 同一条 assertion 一并校验 |
+| 3 | 自定义镜像下 E2B `run_code()` 方法不可用,只剩 `commands.run`(envd shell-exec 通道)可用(来源:同上 + connect-to-agent-sandbox-using-the-e2b-sdk) | 限制/后果,非镜像改动项 | 不影响 —— spec § 6.1 本就规划走 `commands.run`,未依赖 `run_code` | 记录给 Task 8:不能假设 `run_code` 可用 |
+| 4 | agent-runtime/envd 经 Kubernetes native sidecar 注入(`SandboxSet.spec.runtimes: [agent-runtime]`,sidecar 镜像 `registry-*.ack.aliyuncs.com/acs/agent-runtime:<ver>`,经共享卷挂到 `$ENVD_DIR`,`__IGNORE_RESOURCE__=true` 免占资源配额) | 平台侧机制,非镜像要求 | 不需要 Dockerfile 改动 —— 由 SandboxSet CR 声明 | Task 2 在 CR 里配 `spec.runtimes` |
+| 5 | 若要用 ACS 官方 `run_code`/code-interpreter 镜像,须直接用或以 ACS 版本化镜像为基础,不保证兼容 E2B 官方 latest 镜像 | 不适用 | 我们全程走自定义全量镜像 + `commands.run`,不碰这条路径 | 无动作 |
+| 6 | 镜像缓存是独立 CRD(`apiVersion: eci.alibabacloud.com/v1, kind: ImageCache`,复用 ECI 同款 CRD),官方文档称目前邀测阶段、白名单/工单开通 | 待确认账号状态 | 见 Step 7 实测结论 | 见 Step 7 |
+| 7 | 自定义镜像 root / 非 root 用户要求 | **未找到明确要求** | 本镜像已是 `USER agent`(uid 10000,非 root)—— 未发现与此冲突的官方说明 | 无动作;若后续 Task 2/3 探针发现 envd 注入对非 root 有特殊要求,回来补 |
+| 8 | 支持的 CPU 架构(是否仅 amd64) | **未找到明确要求**(未查到架构矩阵文档) | 全局约束已强制 `--platform linux/amd64`,与已知事实(Apple Silicon 本机 push 会走样)独立自洽,不依赖这条未证实信息 | 无动作 |
+
 - [ ] **Step 3: 按核对结果改 Dockerfile**
 
 至少确保 bash 存在。示例(基础镜像为 Debian 系时):
