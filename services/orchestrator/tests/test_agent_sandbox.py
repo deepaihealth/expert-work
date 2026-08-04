@@ -36,6 +36,16 @@ Task 9(``reap``)对 task-9-brief.md 草稿的一处偏离,记在这里:草稿的
 ``only_idle=not force`` 这条真实存在的逻辑;真实的 TTL/时间戳判定语义是
 ``SqlSandboxInstanceStore.list_active`` 的职责,由
 ``test_sql_sandbox_instance_store.py`` 的容器集成测覆盖,这里不重复建模。
+
+Task 9 独立审查 Important-1/2 追加(task-9-report.md 有完整记录):
+``FakeInstanceStore`` 加 ``stuck_creating_sandbox_ids: set[UUID]`` 测试缝
+(``list_stuck_creating()`` 只返回这里列出、且仍在 ``rows`` 里、
+``container_id`` 仍未回填的 id)——验证 ``reap(force=True)`` 会清掉编排
+进程死于 ``claim_warm``/``set_container_id`` 两次写之间的孤儿、
+``force=False`` 不会;同理不建模真实的 ``acquired_at`` 阈值,那是容器集成
+测的职责。再加 ``touched: list[UUID]``,记录每次
+``touch_and_get_container_id`` 被调用的 sandbox_id——验证 ``exec()`` 真的
+在推进 ``last_used_at``。
 """
 
 from __future__ import annotations
@@ -159,6 +169,16 @@ class FakeInstanceStore:
     #: ``force`` 正确翻译成 ``only_idle=not force`` 并如实按 list_active()
     #: 的返回值行动,见类 docstring "Task 9 对 brief 草稿的偏离"一节。
     idle_sandbox_ids: set[UUID] = field(default_factory=set)
+    #: 独立审查 Important-1 测试缝 —— ``list_stuck_creating()`` 只返回这里
+    #: 列出、且仍在 ``rows`` 里、``container_id`` 仍未回填的 sandbox_id。
+    #: 不建模真实的 acquired_at 时间戳阈值(那是两个生产 store 的职责,由
+    #: 容器集成测覆盖);这里只验证 AgentSandboxClient.reap(force=True) 真
+    #: 的会调用它、force=False 不会,以及清理时不尝试 connect/kill。
+    stuck_creating_sandbox_ids: set[UUID] = field(default_factory=set)
+    #: 独立审查 Important-2 测试缝 —— 记录每次 touch_and_get_container_id
+    #: 被调用时的 sandbox_id,验证 exec() 真的在推进 last_used_at,而
+    #: get_container_id(destroy 等只读路径)不会。
+    touched: list[UUID] = field(default_factory=list)
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -195,6 +215,10 @@ class FakeInstanceStore:
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         return self.rows.get(sandbox_id, {}).get("container_id")
 
+    async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
+        self.touched.append(sandbox_id)
+        return self.rows.get(sandbox_id, {}).get("container_id")
+
     async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
         active = [
             (sandbox_id, row["container_id"])
@@ -204,6 +228,13 @@ class FakeInstanceStore:
         if not only_idle:
             return active
         return [(sid, cid) for sid, cid in active if sid in self.idle_sandbox_ids]
+
+    async def list_stuck_creating(self) -> list[UUID]:
+        return [
+            sandbox_id
+            for sandbox_id in self.stuck_creating_sandbox_ids
+            if sandbox_id in self.rows and self.rows[sandbox_id].get("container_id") is None
+        ]
 
 
 def make_client(sdk: FakeSdk, store: FakeInstanceStore) -> AgentSandboxClient:
@@ -707,3 +738,71 @@ async def test_reap_cleans_row_even_when_sandbox_already_gone() -> None:
     assert reaped == 1, "即使连不上,也要算作已清理"
     assert sandbox_id not in store.rows, "行必须被清掉,热会话槽位必须放出来"
     assert (tenant_id, user_id) not in store.warm, "热会话坑必须放出来,否则再也 acquire 不到"
+
+
+# ---------------------------------------------------------------------------
+# 独立审查 Important-1/2(task-9-report.md 有完整记录)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reap_force_clears_orphaned_stuck_creating_row() -> None:
+    """Important-1:编排进程在 ``claim_warm`` 提交行之后、
+    ``set_container_id`` 回填之前死掉(pod OOM-kill / 驱逐 / 滚动更新,按
+    本系统的多副本生产设计这些都是预期会发生的事件)留下的孤儿——
+    ``container_id`` 永远是 NULL,``list_active()`` 两种模式都不会返回它
+    (正常"还在合法冷启窗口内"的行也长这样,不能靠 list_active 处理)。
+    ``force=True`` 必须能通过 ``list_stuck_creating()`` 把它清掉,并且不
+    尝试 connect/kill——压根没有容器可连。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    # 直接对 store 占坑、不让它走到 set_container_id —— 精确模拟"死在两次
+    # 写之间",不依赖 acquire() 的完整流程凑巧卡在那。
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    store.stuck_creating_sandbox_ids.add(sandbox_id)
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 1
+    assert sandbox_id not in store.rows, "孤儿行必须被清掉,热会话槽位必须放出来"
+    assert (tenant_id, user_id) not in store.warm
+    assert sdk.connected == [], "没有容器可连,不该尝试 connect"
+
+
+@pytest.mark.asyncio
+async def test_reap_without_force_ignores_stuck_creating_rows() -> None:
+    """Important-1 的范围限定:孤儿创建行的清理只在 ``force=True`` 时发生
+    ——``force=False`` 的常规空闲清扫不该碰"看起来还在创建"的行,那会跟
+    一个正在合法冷启窗口内的 ``acquire()`` 抢同一行。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    store.stuck_creating_sandbox_ids.add(sandbox_id)
+
+    reaped = await client.reap(force=False)
+
+    assert reaped == 0
+    assert sandbox_id in store.rows, "force=False 不该碰还在创建中的行"
+
+
+@pytest.mark.asyncio
+async def test_exec_touches_last_used_at() -> None:
+    """Important-2:``exec()`` 必须推进 ``last_used_at``,否则
+    ``force=False`` 的空闲 TTL 清扫实际是按 acquire 时间清扫,一个持续被
+    ``exec`` 的热会话会被误判成空闲、被误杀。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    assert sid in store.touched

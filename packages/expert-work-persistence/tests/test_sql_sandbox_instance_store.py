@@ -29,7 +29,11 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.models import SandboxInstanceRow
-from expert_work.persistence.sandbox_instance_store import _IDLE_TTL_S, SqlSandboxInstanceStore
+from expert_work.persistence.sandbox_instance_store import (
+    _IDLE_TTL_S,
+    _STUCK_CREATE_TTL_S,
+    SqlSandboxInstanceStore,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -321,3 +325,153 @@ async def test_list_active_only_idle_uses_last_used_at_falling_back_to_acquired_
     assert sandbox_ids["stale"] in idle_ids
     assert sandbox_ids["fresh_no_use"] not in idle_ids
     assert sandbox_ids["stale_acquire_but_used"] not in idle_ids
+
+
+# ---------------------------------------------------------------------------
+# 独立审查 Important-1/2(task-9-report.md 有完整记录)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_touch_and_get_container_id_returns_container_id(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    assert won is None
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-touch")
+
+    result = await store.touch_and_get_container_id(sandbox_id=sandbox_id)
+
+    assert result == "sbx-touch"
+
+
+@pytest.mark.asyncio
+async def test_touch_and_get_container_id_unknown_sandbox_returns_none(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    assert await store.touch_and_get_container_id(sandbox_id=uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_touch_and_get_container_id_makes_row_no_longer_idle(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """Important-2 的直接payoff:``exec()`` 用这个方法一次往返内完成"读
+    container_id" + "推进 last_used_at",不再需要分两次 round trip——这里
+    验证的是它对 ``list_active(only_idle=True)`` 的实际效果,不只是"字段被
+    写了"这种字面断言:一行 ``acquired_at`` 很久以前、本该被判定空闲的行,
+    touch 之后必须不再被判定为空闲(否则一个持续被 exec 的热会话仍然会被
+    误杀,Important-2 就白修了)。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    assert won is None
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-touch-idle")
+
+    long_ago = datetime.now(UTC) - timedelta(seconds=_IDLE_TTL_S * 2)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(SandboxInstanceRow)
+                .where(SandboxInstanceRow.id == sandbox_id)
+                .values(acquired_at=long_ago)
+            )
+    finally:
+        await engine.dispose()
+
+    idle_before = {sid for sid, _ in await store.list_active(only_idle=True)}
+    assert sandbox_id in idle_before, "acquired_at 很久以前、没有 last_used_at —— 该被判空闲"
+
+    container_id = await store.touch_and_get_container_id(sandbox_id=sandbox_id)
+    assert container_id == "sbx-touch-idle"
+
+    idle_after = {sid for sid, _ in await store.list_active(only_idle=True)}
+    assert sandbox_id not in idle_after, "touch 之后 last_used_at 是刚刚 —— 不该再被判空闲"
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_creating_ignores_fresh_still_creating_row(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """Important-1:刚 ``claim_warm``、``container_id`` 还没回填的行,正常
+    还在合法的 35-40s E2B 冷启窗口内,不该被判定成"孤儿"——只有远超这个
+    窗口(``_STUCK_CREATE_TTL_S``,数分钟量级)的行才算。"""
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    assert won is None
+    # 不调用 set_container_id —— 模拟正常、还在冷启窗口内的创建过程。
+
+    stuck_ids = set(await store.list_stuck_creating())
+    assert sandbox_id not in stuck_ids
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_creating_returns_old_null_container_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """Important-1 的核心场景:编排进程在 ``claim_warm`` 提交行之后、
+    ``set_container_id`` 回填之前死掉(pod OOM-kill / 驱逐 / 滚动更新)——
+    这行永远不会再有 ``container_id``,也永远不会出现在
+    ``list_active()`` 的任何一种模式里(见其测试)。只能靠 ``acquired_at``
+    远超合法冷启窗口来识别,直接造一行"死在两步之间"的状态验证。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    assert won is None
+    # 不调用 set_container_id —— 模拟"死在两次写之间"。
+
+    long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(SandboxInstanceRow)
+                .where(SandboxInstanceRow.id == sandbox_id)
+                .values(acquired_at=long_ago)
+            )
+    finally:
+        await engine.dispose()
+
+    stuck_ids = set(await store.list_stuck_creating())
+    assert sandbox_id in stuck_ids
+
+    # force=True 的 reap 清理这类孤儿的做法(见 AgentSandboxClient.reap):
+    # 没有容器可连,直接 mark_destroyed —— 验证清完之后槽位真的放出来了。
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason="reap_orphaned_create")
+    second_id = uuid4()
+    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
+    assert result is None, "清掉孤儿行之后,这个 (tenant, user) 必须能重新正常 claim"
+
+
+@pytest.mark.asyncio
+async def test_list_stuck_creating_excludes_ready_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """已经回填了 ``container_id``(ready)的行,不管 ``acquired_at`` 多老
+    都不算"孤儿创建中"。``acquired_at`` 也 backdate 到远超阈值——如果只留
+    "刚 claim_warm、还新鲜"这一个理由,这条测试测不出"container_id IS
+    NULL"这个过滤条件是不是真的存在(该行本来就会因为"太新"被排除,与
+    container_id 是否为空无关;首次实现时用变异验证过这个坑:单独去掉
+    container_id 过滤条件,不 backdate 的版本三条全绿,咬不住)。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    assert won is None
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-ready-not-stuck")
+
+    long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(SandboxInstanceRow)
+                .where(SandboxInstanceRow.id == sandbox_id)
+                .values(acquired_at=long_ago)
+            )
+    finally:
+        await engine.dispose()
+
+    stuck_ids = set(await store.list_stuck_creating())
+    assert sandbox_id not in stuck_ids

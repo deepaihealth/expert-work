@@ -210,12 +210,12 @@ class SandboxInstanceStore(Protocol):
     :meth:`get_container_id`/``_attach`` 就够。``reap``(Task 9)加了
     :meth:`list_active`。
 
-    已知缺口(Task 9 范围之外,留给以后):没有任何方法回填
-    ``last_used_at``——``AgentSandboxClient.exec`` 从未调用过这样的方法,
-    所以 :meth:`list_active` 的空闲判定目前总是退回 ``acquired_at``("多久
-    以前 acquire 的",不是"多久没被真正用过的")。一个被频繁 ``exec`` 的热
-    会话,只要 acquire 的时间够早,一样会被 ``force=False`` 的空闲 TTL 扫
-    掉——这不是本任务要修的问题,见 task-9-report.md 的取舍记录。
+    独立审查(Important-1/2,task-9-report.md 有完整记录)追加两个方法:
+    :meth:`touch_and_get_container_id`(``exec`` 用,读 container_id 的同时
+    推进 ``last_used_at``,空闲判定不再退化成"多久以前 acquire 的")、
+    :meth:`list_stuck_creating`(``reap(force=True)`` 用,清掉编排进程死于
+    ``claim_warm``/``set_container_id`` 两次写之间留下的孤儿——
+    :meth:`list_active` 两种模式都故意不返回这类行,见其 docstring)。
     """
 
     async def claim_warm(
@@ -257,6 +257,15 @@ class SandboxInstanceStore(Protocol):
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""
 
+    async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
+        """独立审查 Important-2:跟 :meth:`get_container_id` 一样的读语义
+        (行不存在或未回填返 ``None``),但同一次往返里把该行的
+        ``last_used_at`` 一并推进到当前时间——:meth:`AgentSandboxClient.exec`
+        用,替代"先读 container_id 再单独一次 UPDATE last_used_at"两次
+        往返(``exec`` 已经在热路径上,不该多打一次库)。``destroy`` 之类
+        只需要读的调用方仍然用 :meth:`get_container_id`。
+        """
+
     async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
         """列出活跃(``state='IN_USE'``、未销毁、``container_id`` 已回填)的
         热会话行,返回 ``(sandbox_id, container_id)``——``reap`` 用。
@@ -264,8 +273,8 @@ class SandboxInstanceStore(Protocol):
         ``only_idle=True``(常规清扫,``force=False``)只返回超过空闲 TTL
         的行——判定口径与本地 docker-supervisor 自己的 reaper 相同(见
         ``sandbox_supervisor/store.py`` 的 ``_session_idle``):以
-        ``last_used_at`` 为准,缺失(还没 exec 过,或压根没有任何代码路径
-        回填过它——见本 Protocol 类 docstring 的"已知缺口")退回
+        ``last_used_at`` 为准(``exec`` 每次成功 attach 都会推进,见
+        :meth:`touch_and_get_container_id`),缺失(还没 exec 过)退回
         ``acquired_at``;两者都缺失的行不返回。``only_idle=False``
         (``force`` 路径)返回全部活跃行,不看时间戳——运维强制拆除与
         M0→M1 Gate E2E 依赖这个确定性语义。
@@ -273,9 +282,39 @@ class SandboxInstanceStore(Protocol):
         还在创建中(``container_id`` 仍是 NULL)的行两种模式都不返回:E2B
         冷启 35-40s 的窗口里可能有另一路 ``acquire()`` 正在往这行写
         ``container_id``,此时 ``reap`` 抢着连一个还没写完的行既连不上、
-        也没什么可 kill 的;那类行的清理由 ``_create_and_track`` 自己的
-        失败分支(``drop_warm``)负责,不是 ``list_active``/``reap`` 的
-        职责。
+        也没什么可 kill 的;那类行**正常**的清理由 ``_create_and_track``
+        自己的失败分支(``drop_warm``)负责,不是 ``list_active``/``reap``
+        常规路径的职责。
+
+        独立审查 Important-1 追加:上一句的"正常"两个字是关键——
+        ``_create_and_track`` 的 ``except`` 只在 ``_create()`` **在同一个
+        协程里同步抛异常**时才跑得到。如果编排进程是在 ``claim_warm``
+        提交行之后、``set_container_id`` 完成之前**被杀掉**的(pod
+        OOM-kill / 驱逐 / 滚动更新——按本系统的多副本生产设计,这些都是
+        预期会发生的事件,不是理论边界),没有任何异常处理器会运行,那行
+        永久停在 ``IN_USE`` + ``container_id=NULL``,``list_active`` 两种
+        模式都会永远跳过它——这正是 Task 7 修过的"孤儿 CAS 行卡死
+        ``(tenant, user)``"同一类故障,只是走了 Task 7 覆盖不到的"进程死于
+        两次写之间"路径。全仓没有任何周期性清道夫会碰这类行(只有
+        ``user_purge.py`` 的显式删用户路径会捎带清掉)。这类真正的孤儿由
+        :meth:`list_stuck_creating` 负责,只在 ``force=True`` 时由 ``reap``
+        调用——见该方法的 docstring。
+        """
+
+    async def list_stuck_creating(self) -> list[UUID]:
+        """独立审查 Important-1:列出卡在"创建中"、且已经远超合法冷启窗口
+        的 ``IN_USE`` 行——编排进程在 ``claim_warm`` 提交行之后、
+        ``set_container_id`` 回填之前死掉(pod OOM-kill / 驱逐 / 滚动更新)
+        留下的孤儿,不是正常还在 35-40s 冷启窗口内、随时可能被
+        ``set_container_id`` 补完的行。判定阈值是
+        :data:`~expert_work.persistence.sandbox_instance_store._STUCK_CREATE_TTL_S`
+        (数分钟量级,留足余量不会跟合法冷启窗口混淆)。
+
+        只应该在 ``force=True`` 的 ``reap`` 里调用——常规的 ``only_idle=True``
+        空闲清扫不该碰"看起来还在创建"的行,那会跟一个正在合法冷启中的
+        ``acquire()`` 抢同一行。返回值只有 ``sandbox_id``,没有
+        ``container_id``(这类行压根没有对应的 E2B 容器)——调用方不该对
+        返回的 id 尝试 ``connect``/``kill``,直接 ``mark_destroyed`` 即可。
         """
 
 
@@ -338,7 +377,7 @@ class AgentSandboxClient:
         的"唤醒失败则重建" vs ``destroy`` 的"已经不在也无妨,继续清行")。"""
         return await self._sdk().connect(container_id, domain=self.domain, api_key=self.api_key)
 
-    async def _attach(self, sandbox_id: UUID) -> Any:
+    async def _attach(self, sandbox_id: UUID, *, touch_last_used: bool = False) -> Any:
         """从 store 读 ``container_id`` 再 ``connect`` —— ``destroy``/``exec``
         共用的"拿到一个可操作 sandbox 句柄"步骤(Task 8 从 ``destroy`` 原有的
         内联逻辑里抽出,brief Step 3 点名要求"一并抽出来")。
@@ -351,8 +390,19 @@ class AgentSandboxClient:
         清行")——``SandboxSupervisorError`` 本身就是 ``Exception`` 子类,原样
         被那层接住,行为与重构前(``container_id is None`` 时整段跳过
         connect)等价。
+
+        独立审查 Important-2 追加:``touch_last_used=True``(仅 :meth:`exec`
+        传)把"读 container_id"换成
+        :meth:`SandboxInstanceStore.touch_and_get_container_id`——同一次
+        往返里把该行的 ``last_used_at`` 一并推进到当前时间,而不是"先读
+        container_id 再单独一次 UPDATE"两次往返。``destroy`` 保持默认
+        ``False``(纯读)——销毁前推进"最后使用时间"这个专给空闲判定用的
+        字段没有意义,行马上就要被 ``mark_destroyed`` 了。
         """
-        container_id = await self.store.get_container_id(sandbox_id=sandbox_id)
+        if touch_last_used:
+            container_id = await self.store.touch_and_get_container_id(sandbox_id=sandbox_id)
+        else:
+            container_id = await self.store.get_container_id(sandbox_id=sandbox_id)
         if container_id is None:
             raise SandboxSupervisorError(f"sandbox {sandbox_id} has no recorded container id")
         try:
@@ -623,11 +673,20 @@ class AgentSandboxClient:
         不经过 shell 的 argv 列表形式,没有以上问题。这是"一个已知偏差"
         (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
         ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
+
+        独立审查 Important-2:``_attach(sandbox_id, touch_last_used=True)``
+        在拿句柄的同一次往返里把这一行的 ``last_used_at`` 推进到当前
+        时间——``reap`` 的空闲 TTL 清扫(``force=False``)按这一列判断
+        "多久没被真正用过",不推进的话空闲判定实际退化成"多久以前
+        acquire 的",一个持续被 ``exec`` 的热会话会被误杀。见
+        :meth:`_attach` 与
+        :meth:`SandboxInstanceStore.touch_and_get_container_id` 的
+        docstring。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         effective = max(1, min(effective, MAX_TIMEOUT_S))
 
-        sbx = await self._attach(sandbox_id)
+        sbx = await self._attach(sandbox_id, touch_last_used=True)
         timeout_exc, exit_exc = self._sdk_exceptions()
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
@@ -664,8 +723,9 @@ class AgentSandboxClient:
         活跃沙箱,不看空闲时间——运维强制拆除与 M0→M1 Gate E2E 都依赖这个
         确定性语义;``force=False`` 走 :meth:`SandboxInstanceStore.list_active`
         的空闲 TTL 过滤,口径与本地 supervisor 自己的 reaper 相同(该
-        Protocol 方法的 docstring 有完整说明,包括 ``last_used_at`` 目前
-        从未被回填这条已知缺口)。
+        Protocol 方法的 docstring 有完整说明;:meth:`exec` 的
+        ``touch_last_used=True`` 保证 ``last_used_at`` 会被推进,空闲判定
+        不会退化成"多久以前 acquire 的"——独立审查 Important-2)。
 
         沙箱在平台侧已经不存在时(保留期过 / 被平台回收 / 手工删了)——
         ``connect``/``kill`` 会失败,但仍要清掉那一行,否则热会话槽位永远
@@ -674,6 +734,17 @@ class AgentSandboxClient:
         故障、同一个修法:``mark_destroyed`` 必须在 ``except`` 之外,对
         ``list_active`` 交回来的每一行都无条件跑一次,不能因为
         ``connect``/``kill`` 失败就跳过。
+
+        独立审查 Important-1:``force=True`` 时额外调用
+        :meth:`SandboxInstanceStore.list_stuck_creating`,清掉编排进程死于
+        "``claim_warm`` 提交行"和"``set_container_id`` 回填"两步之间留下的
+        孤儿(pod OOM-kill / 驱逐 / 滚动更新)——``list_active`` 两种模式都
+        故意排除这类行(见其 docstring),不这样做的话"``force=True`` 拆掉
+        每一个活跃会话"这句 brief 原文承诺的确定性语义就不成立。这类行没有
+        对应的 E2B 容器,不尝试 ``connect``/``kill``,直接
+        ``mark_destroyed``。``force=False`` 不碰这类行——常规空闲清扫不该
+        跟一个正在合法冷启窗口内的 ``acquire()`` 抢同一行,见
+        :meth:`list_stuck_creating` 的 docstring。
         """
         rows = await self.store.list_active(only_idle=not force)
         reaped = 0
@@ -688,4 +759,18 @@ class AgentSandboxClient:
                 logger.info("reap: sandbox %s already gone", container_id)
             await self.store.mark_destroyed(sandbox_id=sandbox_id, reason="reap")
             reaped += 1
+        if force:
+            for sandbox_id in await self.store.list_stuck_creating():
+                # 没有对应的 E2B 容器——connect/kill 无从谈起,直接清行。
+                # 见上面 docstring "独立审查 Important-1"。
+                logger.info(
+                    "reap: sandbox %s stuck mid-create (orphaned by a process "
+                    "death between claim_warm and set_container_id), clearing "
+                    "with no container to kill",
+                    sandbox_id,
+                )
+                await self.store.mark_destroyed(
+                    sandbox_id=sandbox_id, reason="reap_orphaned_create"
+                )
+                reaped += 1
         return reaped

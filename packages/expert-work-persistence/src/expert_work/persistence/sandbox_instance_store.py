@@ -79,6 +79,22 @@ _CLAIM_WARM_MAX_ATTEMPTS = 3
 #: ``orchestrator``" / "does not import ``sandbox_supervisor.domain``").
 _IDLE_TTL_S = 15 * 60
 
+#: Independent-review Important-1 (task-9-report.md § addendum) — how old
+#: an ``acquired_at`` must be before a ``container_id IS NULL`` row is
+#: treated as an orphan of a process that died between ``claim_warm``'s
+#: commit and ``set_container_id`` (pod OOM-kill / eviction / rolling
+#: update — expected events under this system's multi-replica production
+#: design, not theoretical edges), rather than a row still inside its
+#: legitimate E2B cold-start window (measured 35-40s, 2026-08-04 probe
+#: report). 5 minutes is ~8x that measured window — comfortably wide
+#: enough to never race a genuine in-flight ``acquire()``, while not
+#: leaving a real orphan wedged for long. Only
+#: :meth:`SqlSandboxInstanceStore.list_stuck_creating` /
+#: :meth:`InMemorySandboxInstanceStore.list_stuck_creating` consult this —
+#: the regular idle sweep (``list_active(only_idle=True)``) must never
+#: touch a "looks like it's still creating" row.
+_STUCK_CREATE_TTL_S = 5 * 60
+
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
@@ -252,6 +268,52 @@ class SqlSandboxInstanceStore:
             ).scalar_one_or_none()
         return str(container_id) if container_id is not None else None
 
+    async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
+        """Independent-review Important-2 —
+        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.touch_and_get_container_id``'s
+        full contract docstring covers the "why" (``exec`` must advance
+        ``last_used_at`` or the idle sweep degrades to "time since
+        acquire"). One ``UPDATE ... RETURNING`` round trip, not a separate
+        read followed by a separate write — same row, same statement.
+        """
+        async with self._sf() as session:
+            container_id = (
+                await session.execute(
+                    sa_update(SandboxInstanceRow)
+                    .where(SandboxInstanceRow.id == sandbox_id)
+                    .values(last_used_at=_utc_now())
+                    .returning(SandboxInstanceRow.container_id)
+                )
+            ).scalar_one_or_none()
+            await session.commit()
+        return str(container_id) if container_id is not None else None
+
+    async def list_stuck_creating(self) -> list[UUID]:
+        """Independent-review Important-1 — orphans of a process that died
+        between ``claim_warm``'s commit and ``set_container_id``'s
+        backfill (pod OOM-kill / eviction / rolling update). See
+        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.list_stuck_creating``
+        for the full contract (only a ``force=True`` reap may call this;
+        the regular idle sweep must not).
+
+        ``acquired_at`` is always set by :meth:`claim_warm` at INSERT time,
+        so ``is_not(None)`` is belt-and-braces, not a real-world branch —
+        kept for the same defensive reason as :meth:`list_active`'s
+        ``container_id is None`` re-check.
+        """
+        cutoff = _utc_now() - timedelta(seconds=_STUCK_CREATE_TTL_S)
+        async with self._sf() as session:
+            result = await session.execute(
+                select(SandboxInstanceRow.id).where(
+                    SandboxInstanceRow.state == _STATE_IN_USE,
+                    SandboxInstanceRow.destroyed_at.is_(None),
+                    SandboxInstanceRow.container_id.is_(None),
+                    SandboxInstanceRow.acquired_at.is_not(None),
+                    SandboxInstanceRow.acquired_at < cutoff,
+                )
+            )
+            return [row_id for (row_id,) in result.all()]
+
     async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
         """``AgentSandboxClient.reap`` (波 1 Task 9) 用 —— 见
         ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.list_active``
@@ -364,6 +426,23 @@ class InMemorySandboxInstanceStore:
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         row = self._rows.get(sandbox_id)
         return row.container_id if row is not None else None
+
+    async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
+        """Mirrors :meth:`SqlSandboxInstanceStore.touch_and_get_container_id`."""
+        row = self._rows.get(sandbox_id)
+        if row is None:
+            return None
+        row.last_used_at = _utc_now()
+        return row.container_id
+
+    async def list_stuck_creating(self) -> list[UUID]:
+        """Mirrors :meth:`SqlSandboxInstanceStore.list_stuck_creating`."""
+        cutoff = _utc_now() - timedelta(seconds=_STUCK_CREATE_TTL_S)
+        return [
+            sandbox_id
+            for sandbox_id, row in self._rows.items()
+            if row.container_id is None and row.acquired_at < cutoff
+        ]
 
     async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
         """Mirrors :meth:`SqlSandboxInstanceStore.list_active` — same
