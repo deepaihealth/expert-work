@@ -1,0 +1,107 @@
+name: Sandbox contract (agent_sandbox)
+
+# 波 1 Task 10 — SandboxRuntime 契约测试的 agent_sandbox 档:一套用例真连
+# ACS Agent Sandbox 测试集群(design spec § 九核心质量手段)。supervisor 档
+# 需要本地 docker compose 起 sandbox-supervisor + credential-proxy,不适合
+# 在共享 runner 上跑;这个 workflow 只跑 agent_sandbox 档,凭据从 GitHub
+# Secrets 取。supervisor 档本身的容器行为由 sandbox-gvisor.yml 覆盖。
+#
+# 路径过滤:两个实现任一改动、契约测试文件自己改动、或 sandbox_instance
+# 表的 schema/迁移改动,都要跑这一档 —— 否则漂移只会在生产暴露(design
+# spec § 九)。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/orchestrator/src/orchestrator/tools/**"
+      - "services/orchestrator/tests/test_sandbox_runtime_contract.py"
+      - "services/orchestrator/tests/test_agent_sandbox.py"
+      - "infra/sandbox-image/**"
+      - "packages/expert-work-persistence/src/expert_work/persistence/sandbox_instance_store.py"
+      - "packages/expert-work-persistence/migrations/versions/0141_sandbox_warm_unique.py"
+      - ".github/workflows/sandbox-contract.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/orchestrator/src/orchestrator/tools/**"
+      - "services/orchestrator/tests/test_sandbox_runtime_contract.py"
+      - "services/orchestrator/tests/test_agent_sandbox.py"
+      - "infra/sandbox-image/**"
+      - "packages/expert-work-persistence/src/expert_work/persistence/sandbox_instance_store.py"
+      - "packages/expert-work-persistence/migrations/versions/0141_sandbox_warm_unique.py"
+      - ".github/workflows/sandbox-contract.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.9.26"
+  # 非敏感 —— 仓内已有同类明文先例(sandbox-gvisor.yml 的 RUNSC_RELEASE
+  # 等)。E2B_API_KEY 才是敏感值,走 secrets。
+  EXPERT_WORK_SANDBOX_E2B_DOMAIN: "expert-work-sbx-test.deepaihealth.com"
+  EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
+
+jobs:
+  agent-sandbox-contract:
+    name: Contract suite against the real E2B test cluster
+    runs-on: ubuntu-latest
+    # 冷启单条 30-40s(2026-08-04 探针实测)——7 条 × 冷启上限 + setup 步骤,
+    # 留够余量。共享 runner 打公网 E2B 集群本身就比本地 docker compose 多一
+    # 层不确定性(网络抖动/集群负载),continue-on-error 同 ci.yml 的
+    # test-integration job / sandbox-gvisor.yml 的既有先例——不拿它挡 PR。
+    timeout-minutes: 15
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: expert_work
+          POSTGRES_PASSWORD: expert_work_dev
+          POSTGRES_DB: expert_work_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Sync workspace
+        run: uv sync --frozen
+
+      - name: Migrate the contract-test database to head
+        # sandbox_instance 是 AgentSandboxClient 热会话 CAS 的凭据(migration
+        # 0141)——契约测试需要一个真表,不是内存假件。alembic env.py 读
+        # EXPERT_WORK_DB_URL(同步 DSN);测试本身读 EXPERT_WORK_DB_DSN(异步
+        # DSN,下一步设置)——两个不同名字是既有约定(见
+        # packages/expert-work-persistence/migrations/env.py 顶部注释),不是
+        # 笔误。
+        env:
+          EXPERT_WORK_DB_URL: postgresql+psycopg://expert_work:expert_work_dev@localhost:5432/expert_work_dev
+        run: uv run alembic -c packages/expert-work-persistence/alembic.ini upgrade head
+
+      - name: Run agent_sandbox contract tests
+        env:
+          EXPERT_WORK_SANDBOX_E2B_API_KEY: ${{ secrets.EXPERT_WORK_SANDBOX_E2B_API_KEY }}
+          EXPERT_WORK_DB_DSN: postgresql+asyncpg://expert_work:expert_work_dev@localhost:5432/expert_work_dev
+        run: >-
+          uv run pytest -v -m integration -k agent_sandbox
+          services/orchestrator/tests/test_sandbox_runtime_contract.py
