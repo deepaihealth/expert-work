@@ -61,6 +61,7 @@ import pytest
 from e2b import CommandExitException, TimeoutException
 
 from orchestrator.tools.agent_sandbox import (
+    _SANDBOX_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
@@ -144,6 +145,9 @@ class FakeSdk:
 
     created: list[dict] = field(default_factory=list)
     connected: list[str] = field(default_factory=list)
+    #: 全分支终审 Important-4 —— connect 也要显式传 timeout(SDK 语义"只延长
+    #: 不缩短"),记下 kwargs 才能断言它真的被传了。
+    connect_kwargs: list[dict] = field(default_factory=list)
     sandbox: FakeSandbox = field(default_factory=FakeSandbox)
     connect_fails: bool = False
     #: 审查 Critical-2 —— 覆盖 "CAS 行已提交但 create() 本身失败" 这条路径。
@@ -157,6 +161,7 @@ class FakeSdk:
 
     async def connect(self, sandbox_id: str, **kwargs):
         self.connected.append(sandbox_id)
+        self.connect_kwargs.append(kwargs)
         if self.connect_fails:
             raise RuntimeError("sandbox gone")
         return self.sandbox
@@ -421,7 +426,7 @@ async def test_destroy_after_reuse_actually_works() -> None:
 
 @pytest.mark.asyncio
 async def test_connect_failure_rebuilds() -> None:
-    """唤醒失败(库存不足/欠费/保留期过被删)→ 丢弃旧行 → 重建。
+    """重连失败(库存不足/欠费/超时被平台 kill)→ 丢弃旧行 → 重建。
 
     工作区权威在外部存储,重建无损 —— spec § 6.3。
     """
@@ -899,6 +904,61 @@ def test_image_env_matches_dockerfile() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 全分支终审 Important-4 —— 不传 timeout 的话 e2b 默认 300s + on_timeout=kill
+# (集群实测 end_at - started_at 正好 300s、lifecycle=None),沙箱 5 分钟就没。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_passes_an_explicit_timeout() -> None:
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    assert sdk.created[-1]["timeout"] == _SANDBOX_TIMEOUT_S, (
+        "不显式传 timeout 则吃 e2b 的 300s 默认值 —— 沙箱 5 分钟就被平台 kill"
+    )
+
+
+@pytest.mark.asyncio
+async def test_warm_reconnect_extends_the_platform_timeout() -> None:
+    """平台的存活钟从**建**沙箱起算,``connect`` 只延长不缩短 —— 复用时不
+    重新传 timeout 的话,一个被反复使用的热会话仍然在"原始创建 + 20 分钟"
+    被杀,"热"的部分越用越短。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert sdk.connected, "第二次 acquire 应该复用热会话(走 connect)"
+    assert sdk.connect_kwargs[-1]["timeout"] == _SANDBOX_TIMEOUT_S
+
+
+def test_platform_timeout_outlives_idle_ttl() -> None:
+    """设计不变式:我们自己的空闲 reap 是主角,平台超时只是兜底。
+
+    ``_SANDBOX_TIMEOUT_S`` 一旦被调到 ``_IDLE_TTL_S`` 以下,两者就从"主备"
+    变成"互抢"——平台会先掐掉一个还没到我们空闲线的活跃热会话,表现是随机
+    的 connect 失败 + 白付 35-40s 冷启,而不是任何一条报错。这条断言和
+    ``test_idle_ttl_matches_supervisor_default`` 一样刻意不打 integration
+    marker:它只比较两个 Python 常量。
+    """
+    from expert_work.persistence.sandbox_instance_store import _IDLE_TTL_S
+
+    assert _SANDBOX_TIMEOUT_S > _IDLE_TTL_S, (
+        f"平台超时 {_SANDBOX_TIMEOUT_S}s 必须大于热会话空闲 TTL {_IDLE_TTL_S}s,"
+        " 否则平台会抢在 reap 之前掐掉还没空闲够的热会话。"
+    )
+    assert _SANDBOX_TIMEOUT_S - _IDLE_TTL_S >= 240, (
+        "余量至少要覆盖 SandboxReapWorker 的一个完整扫描周期(240s),"
+        " 否则 reap 可能刚好错过一轮、让平台先动手。"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task 9 —— AgentSandboxClient.reap:以 sandbox_instance 表为准,不问 SDK
 # 账号级的 list()(见类 docstring "Task 9 对 brief 草稿的偏离"一节)。
 # ---------------------------------------------------------------------------
@@ -951,7 +1011,7 @@ async def test_reap_without_force_only_reaps_rows_the_store_marks_idle() -> None
 
 @pytest.mark.asyncio
 async def test_reap_cleans_row_even_when_sandbox_already_gone() -> None:
-    """沙箱在平台侧已经不存在(保留期过 / 被平台回收 / 手工删了)时,
+    """沙箱在平台侧已经不存在(超时被平台 kill / 被平台回收 / 手工删了)时,
     ``connect`` 会失败 —— 但行必须仍然被清掉,否则热会话槽位永远占着,该
     ``(tenant, user)`` 被迁移 0141 的部分唯一索引挡住、再也 acquire 不到,
     与 Task 7 修过的"CAS 行卡死"是同一类故障。这条不变式很容易在重构中

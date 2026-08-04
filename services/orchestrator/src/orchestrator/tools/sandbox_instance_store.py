@@ -91,7 +91,7 @@ class SandboxInstanceStore(Protocol):
         """标记销毁并让出热会话坑。"""
 
     async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        """丢弃一个失效的热会话行(唤醒失败后重建前调)。"""
+        """丢弃一个失效的热会话行(重连失败后重建前调)。"""
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""

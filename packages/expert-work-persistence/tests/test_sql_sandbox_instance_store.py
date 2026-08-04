@@ -619,7 +619,7 @@ async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
 ) -> None:
     """接管走的是终态写(腾出 0141 部分唯一索引的槽位),并且写的是一个
     **专属** ``destroy_reason``——运维读这一列时要能分清槽位是被谁清的:
-    ``drop_warm``(唤醒失败)/ ``reap_orphaned_create``(强制清扫)/ 这里
+    ``drop_warm``(重连失败)/ ``reap_orphaned_create``(强制清扫)/ 这里
     的 ``stuck_create_takeover``(后来的 acquire 自己发现并接管,三者里唯一
     不需要人工动作也不依赖 reaper 周期的一条)。
     """

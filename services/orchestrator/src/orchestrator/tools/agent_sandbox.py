@@ -15,9 +15,11 @@ docstring、零可执行代码,是最独立的一刀)。
 表,E2B sandbox id 存在既有的 ``container_id`` 列(同一语义:外部运行时给
 的实例标识)。并发 acquire 靠迁移 0141 的部分唯一索引定单赢家。
 
-唤醒失败(spec § 6.3):``connect`` 会因库存不足/欠费/保留期已过被平台删
-而失败 —— 丢弃该行、重新 ``create``。工作区权威在外部存储(波 2 起
-NAS;波 1 本就还没挂持久工作区),重建无损。
+重连失败(spec § 6.3):``connect`` 会因库存不足/欠费/沙箱已被平台超时
+kill(见 :data:`_SANDBOX_TIMEOUT_S`——``on_timeout`` 的平台默认行为是 kill,
+本实现也**没有**配置任何休眠/暂停语义)而失败 —— 丢弃该行、重新
+``create``。工作区权威在外部存储(波 2 起 NAS;波 1 本就还没挂持久工作区),
+重建无损。
 
 ## 私有协议 + ``patch_e2b`` 导入顺序
 
@@ -139,6 +141,31 @@ DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
 MAX_OUTPUT_CHARS = 1_000_000
 
+#: 传给 ``create()`` / ``connect()`` 的沙箱存活上限(秒)。
+#:
+#: **必须显式传**。e2b 2.24.0(``e2b/sandbox_async/main.py:171-198``)的
+#: ``timeout`` 默认 **300 秒**,且 ``lifecycle.on_timeout`` 默认是 ``"kill"``
+#: 而不是 ``"pause"``。2026-08-04 集群实测印证:``get_info()`` 回
+#: ``started_at=10:49:10 / end_at=10:54:10``(正好 300s)、``lifecycle=None``。
+#: 也就是说不传的话每个沙箱 5 分钟就被平台杀掉——热会话表面上还在,下次
+#: acquire 的 connect 失败、``drop_warm`` 重建,能自愈(波 1 验收的热复用
+#: 那一项恰好在 5 分钟窗口内跑完,所以没暴露),代价是白付一次 35-40s 冷启
+#: 外加用户工作区里的文件没了。
+#:
+#: **为什么是 20 分钟**:要的是"我们自己的 reap 空闲扫是主角、平台超时只是
+#: 兜底",两者不能互抢。下界由 ``_IDLE_TTL_S``(15 分钟,热会话空闲回收线)
+#: 定死——比它短则平台先动手,一个还没到我们空闲线的活跃热会话会被平台
+#: 掐掉;上界是"编排进程整体失联时兜底还要及时",设成几小时等于让兜底名存
+#: 实亡。5 分钟余量约等于 ``SandboxReapWorker._INTERVAL_S``(240s)一整轮再
+#: 加富余,保证正常情况下永远是 reap 先到。
+#: ``test_platform_timeout_outlives_idle_ttl`` 钉住这个不等式。
+#:
+#: **刻意不设** ``lifecycle``:``{"on_timeout": "pause"}`` 是 E2B 的语义,
+#: 阿里云 ACS 这侧是否真的实现了 pause/resume **未经验证**(探针只跑过
+#: create/connect/kill)。一个没验证过的休眠配置正是本轮要修掉的那条失真
+#: docstring 的由来,不重蹈。要开 pause 先上集群实测。
+_SANDBOX_TIMEOUT_S = 20 * 60
+
 #: ``destroy_reason`` written when :meth:`AgentSandboxClient.release` tears
 #: down a non-warm (no ``user_id``) sandbox. Same literal as the docker
 #: supervisor's ``DESTROY_REASON_RELEASE``
@@ -206,8 +233,24 @@ class AgentSandboxClient:
 
     async def _connect(self, container_id: str) -> Any:
         """裸 connect —— 不做错误处理,调用方各自决定失败策略(``acquire``
-        的"唤醒失败则重建" vs ``destroy`` 的"已经不在也无妨,继续清行")。"""
-        return await self._sdk().connect(container_id, domain=self.domain, api_key=self.api_key)
+        的"重连失败则重建" vs ``destroy`` 的"已经不在也无妨,继续清行")。
+
+        显式传 ``timeout=_SANDBOX_TIMEOUT_S``:平台的存活钟是从**建**沙箱那
+        一刻起算的,不传的话一个被反复复用的热会话仍然在原始创建时间 + 20
+        分钟被杀,"热"的部分越用越短。SDK 的语义是"只延长、不缩短"
+        (``connect(timeout=)`` 的 docstring + ``_cls_connect``),所以每次
+        重连把兜底推到"此刻 + 20 分钟",与我们自己按 ``last_used_at`` 判空闲
+        的 reap 口径对齐——两把钟都跟着"最后一次用"走。
+
+        ``destroy``/``reap`` 也走这里(它们 connect 完就 kill),给一个马上
+        要死的沙箱续期无意义但也无害,不值得为此拆成两个方法。
+        """
+        return await self._sdk().connect(
+            container_id,
+            domain=self.domain,
+            api_key=self.api_key,
+            timeout=_SANDBOX_TIMEOUT_S,
+        )
 
     async def _attach(self, sandbox_id: UUID, *, touch_last_used: bool = False) -> Any:
         """从 store 读 ``container_id`` 再 ``connect`` —— ``destroy``/``exec``
@@ -306,8 +349,8 @@ class AgentSandboxClient:
             try:
                 sbx = await self._connect(winner_container_id)
             except Exception:
-                # spec § 6.3 —— 唤醒失败(库存不足/欠费/保留期已过被平台删)
-                # 必须能重建,不能把 run 打死。
+                # spec § 6.3 —— 重连失败(库存不足/欠费/超过
+                # _SANDBOX_TIMEOUT_S 被平台 kill)必须能重建,不能把 run 打死。
                 logger.warning("warm sandbox connect failed, rebuilding", exc_info=True)
                 if user_id is not None:
                     await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
@@ -435,6 +478,7 @@ class AgentSandboxClient:
                     **SANDBOX_IMAGE_ENV,
                     **self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
                 },
+                timeout=_SANDBOX_TIMEOUT_S,
                 domain=self.domain,
                 api_key=self.api_key,
             )
@@ -492,7 +536,7 @@ class AgentSandboxClient:
             sbx = await self._attach(sandbox_id)
             await sbx.kill()
         except Exception:
-            # 沙箱已不在(container_id 从未回填 / 保留期过 / 被平台回收)——
+            # 沙箱已不在(container_id 从未回填 / 超时被平台 kill / 被平台回收)——
             # 仍要往下清行,否则热会话坑永远占着,该 (tenant, user) 再也
             # acquire 不到。_attach 把"没有 container_id"和"connect 失败"
             # 都统一包成 SandboxSupervisorError,这里的 broad except 一样接
@@ -626,7 +670,7 @@ class AgentSandboxClient:
         ``touch_last_used=True`` 保证 ``last_used_at`` 会被推进,空闲判定
         不会退化成"多久以前 acquire 的"——独立审查 Important-2)。
 
-        沙箱在平台侧已经不存在时(保留期过 / 被平台回收 / 手工删了)——
+        沙箱在平台侧已经不存在时(超时被平台 kill / 被平台回收 / 手工删了)——
         ``connect``/``kill`` 会失败,但仍要清掉那一行,否则热会话槽位永远
         占着,该 ``(tenant, user)`` 被迁移 0141 的部分唯一索引挡住、再也
         acquire 不到——与 :meth:`destroy` 的 broad ``except`` 是同一类
@@ -652,7 +696,7 @@ class AgentSandboxClient:
                 sbx = await self._connect(container_id)
                 await sbx.kill()
             except Exception:
-                # 沙箱已不在(保留期过 / 被平台回收 / 手工删了)也要清行,
+                # 沙箱已不在(超时被平台 kill / 被平台回收 / 手工删了)也要清行,
                 # 否则热会话坑永远占着,该 (tenant, user) 再也 acquire 不到
                 # ——与 destroy() 的 broad except 同理,见上面 docstring。
                 logger.info("reap: sandbox %s already gone", container_id)
