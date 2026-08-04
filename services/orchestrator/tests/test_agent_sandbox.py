@@ -899,9 +899,11 @@ def test_repr_does_not_leak_credential_fields() -> None:
     """独立审查 I-2:``field(repr=False)`` 标在 ``api_key``/
     ``egress_token_secret`` 上(agent_sandbox.py 那两行紧邻的注释写的
     "Task 10 实测:普通 dataclass 的 __repr__ 会把凭据吐进 pytest
-    traceback")此前只用一个手工脚本验证过,没有进仓库的回归测试。两个
-    marker 都要断言到,不能只测 api_key——不然下一个人加新的凭据字段时,
-    这条测试不会替他把关。
+    traceback")此前只用一个手工脚本验证过,没有进仓库的回归测试。
+
+    这条测试是**字段枚举式**的:它守的是现有这两个字段不回退,守不住
+    新加的第三个凭据字段——那个字段漏标 ``repr=False`` 时本测试照样绿。
+    加新凭据字段的人必须自己在这里补一行断言。
     """
     client = AgentSandboxClient(
         domain="gw.example.com",
