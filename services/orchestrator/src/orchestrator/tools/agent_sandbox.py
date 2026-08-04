@@ -133,6 +133,14 @@ WORKSPACE_ROOT = "/workspace"
 #: 做成常量而非散落字面量 —— Task 8 的 ``exec`` 也要用同一个值。
 SANDBOX_EXEC_USER = "agent"
 
+#: 契约常量 —— 与 infra/sandbox-image/runner.py:28-37 逐字对齐(``exec``,
+#: Task 8)。runner.py 是本地 docker 沙箱里的 PID 1,这三个值是它的
+#: ``DEFAULT_TIMEOUT_S`` / ``MAX_TIMEOUT_S`` / ``MAX_OUTPUT_CHARS``;云沙箱
+#: 与本地 supervisor 对同一次 exec 请求要给出等价的 clamp/truncate 行为。
+DEFAULT_TIMEOUT_S = 30
+MAX_TIMEOUT_S = 300
+MAX_OUTPUT_CHARS = 1_000_000
+
 #: 进程级 guard —— ``_ensure_e2b_patched`` 幂等的关键,见模块 docstring
 #: "私有协议 + patch_e2b 导入顺序"一节。
 _e2b_patched = False
@@ -271,6 +279,28 @@ class AgentSandboxClient:
         """裸 connect —— 不做错误处理,调用方各自决定失败策略(``acquire``
         的"唤醒失败则重建" vs ``destroy`` 的"已经不在也无妨,继续清行")。"""
         return await self._sdk().connect(container_id, domain=self.domain, api_key=self.api_key)
+
+    async def _attach(self, sandbox_id: UUID) -> Any:
+        """从 store 读 ``container_id`` 再 ``connect`` —— ``destroy``/``exec``
+        共用的"拿到一个可操作 sandbox 句柄"步骤(Task 8 从 ``destroy`` 原有的
+        内联逻辑里抽出,brief Step 3 点名要求"一并抽出来")。
+
+        统一抛 :class:`SandboxSupervisorError`(行不存在/``container_id``
+        从未回填,或 connect 本身失败)—— 与 :meth:`_connect` 的"裸、不处理
+        错误"不同,这里的调用方(``exec``)没有"静默继续"这个选项,直接让
+        错误按 § 6.5 的统一契约冒泡给 ReAct ``tools`` 节点。``destroy`` 仍然
+        保留自己外层的 broad ``except Exception``("沙箱已经不在也无妨,继续
+        清行")——``SandboxSupervisorError`` 本身就是 ``Exception`` 子类,原样
+        被那层接住,行为与重构前(``container_id is None`` 时整段跳过
+        connect)等价。
+        """
+        container_id = await self.store.get_container_id(sandbox_id=sandbox_id)
+        if container_id is None:
+            raise SandboxSupervisorError(f"sandbox {sandbox_id} has no recorded container id")
+        try:
+            return await self._connect(container_id)
+        except Exception as exc:
+            raise SandboxSupervisorError(f"sandbox attach failed: {exc}") from exc
 
     def _egress_env(
         self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None
@@ -461,25 +491,116 @@ class AgentSandboxClient:
 
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         """强制拆除 —— 真 kill 沙箱并让出热会话坑。"""
-        container_id = await self.store.get_container_id(sandbox_id=sandbox_id)
-        if container_id is not None:
-            try:
-                sbx = await self._connect(container_id)
-                await sbx.kill()
-            except Exception:
-                # 沙箱已不在(保留期过/被平台回收)—— 仍要往下清行,否则热
-                # 会话坑永远占着,该 (tenant, user) 再也 acquire 不到。
-                logger.info("destroy: sandbox %s already gone", sandbox_id)
+        try:
+            sbx = await self._attach(sandbox_id)
+            await sbx.kill()
+        except Exception:
+            # 沙箱已不在(container_id 从未回填 / 保留期过 / 被平台回收)——
+            # 仍要往下清行,否则热会话坑永远占着,该 (tenant, user) 再也
+            # acquire 不到。_attach 把"没有 container_id"和"connect 失败"
+            # 都统一包成 SandboxSupervisorError,这里的 broad except 一样接
+            # 得住,行为与重构前(container_id is None 时整段跳过 connect)
+            # 等价。
+            logger.info("destroy: sandbox %s already gone", sandbox_id)
         await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
 
     async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
-        """波 1 Task 8(§ 6.1 四契约点)。留在这里只是为了让
-        :class:`AgentSandboxClient` 结构性满足 :class:`SandboxRuntime`
-        (它有 5 个方法;波 1 Task 7 只做 acquire/release/destroy)——不是
-        "先写坏实现",是"先别写",调用即明确失败而非静默返回垃圾结果。
+        """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
+        ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
+        PID 1,以下行号均指该文件。四个契约点,与它逐字对齐:
+
+        1. timeout clamp ``[1, MAX_TIMEOUT_S]``,缺省 ``DEFAULT_TIMEOUT_S``
+           (runner.py:45-51,同一个 ``max(1, min(x, MAX))`` 公式)。
+        2. 输出截到 ``MAX_OUTPUT_CHARS``(runner.py:37/138-144)——这里用
+           简单头部截断 ``[:MAX_OUTPUT_CHARS]``,不复刻 runner.py ``_cap``
+           头尾各半 + 中间插省略标记那套人类可读展示格式:契约表只写了
+           "输出上限 1_000_000 chars"这一个长度约束,不是字节级展示格式;
+           E2B 侧的输出根本不经过 runner.py(没有本地那层子进程 JSON 协议
+           转发),不存在"跟 runner.py 字节对字节相同"这个目标,只需要满足
+           同一个长度上限。
+        3. 超时 → ``exit_code=-1, timed_out=True``(runner.py:60-66)。
+        4. 响应固定 4 键 —— 由 :class:`SandboxOutcome` 的字段集合结构性
+           保证,下面每条返回路径都填满这 4 个字段。
+
+        另有一条 runner.py 没有、AgentSandboxClient 特有的分支:E2B 的
+        ``commands.run()`` 在子进程以非零退出码结束时抛
+        ``e2b.exceptions.CommandExitException``,不像 runner.py 包的
+        ``subprocess.run(..., check=False)`` 那样把 ``exit_code`` 原样放进
+        返回值、从不因为非零退出码抛异常。不单独接住这个类型的话,LLM 代码
+        里最常见的失败场景(未处理异常、断言失败、``sys.exit(1)``……)会全部
+        落进下面兜底的 ``except Exception``,被误判成"沙箱基础设施故障"
+        (``SandboxSupervisorError``,让整个 run 挂掉),而不是 runner.py
+        契约要求的"正常返回一个非零 exit_code"。``CommandExitException``
+        是个多继承 dataclass(同时继承 ``SandboxException`` 和
+        ``CommandResult``),自带 ``stdout``/``stderr``/``exit_code`` 三个
+        字段,直接用来构造 :class:`SandboxOutcome`,不需要重新跑一次命令。
+
+        实测确认(2026-08-04,读 e2b==2.24.0 源码而非公开文档):
+        ``commands.run(timeout=...)`` 超时抛的不是内置 ``TimeoutError``,是
+        ``e2b.exceptions.TimeoutException``——envd RPC 层把 gRPC
+        ``Code.deadline_exceeded``(超出这里传的 ``timeout=``)、
+        ``Code.unavailable``(沙箱自身空闲超时被平台回收)、``Code.canceled``
+        (超出 ``request_timeout``)统一映射到这一个类
+        (``e2b/envd/rpc.py::_DEFAULT_RPC_ERROR_MAP``),不需要也没办法按根因
+        细分,catch 这一个类型就覆盖了全部。
+
+        code 先用 :meth:`_attach` 拿到的句柄 ``files.write`` 到沙箱内一个
+        临时脚本文件,再 ``python -I <path>`` 执行,不拼进命令行——E2B
+        ``commands.run(cmd: str, ...)`` 内部固定走 ``/bin/bash -l -c cmd``
+        (envd 的 ``ProcessConfig``,见 e2b SDK
+        ``sandbox_async/commands/command.py`` 的 ``_start``),把任意 LLM
+        生成的 ``code`` 直接嵌进这个 shell 字符串会被引号/特殊字符注入;
+        runner.py 那边不存在这个风险,是因为它用
+        ``subprocess.run([sys.executable, "-I", "-c", code], ...)`` 这种
+        不经过 shell 的 argv 列表形式,没有以上问题。这是"一个已知偏差"
+        (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
+        ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
         """
-        del sandbox_id, code, timeout_s
-        raise NotImplementedError("AgentSandboxClient.exec 尚未接线(波 1 Task 8)")
+        effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        effective = max(1, min(effective, MAX_TIMEOUT_S))
+
+        sbx = await self._attach(sandbox_id)
+        # 惰性 import,不放模块顶层——呼应 _sdk() 的"先 patch 后 import"顾虑
+        # (模块 docstring "私有协议 + patch_e2b 导入顺序"一节)。这里安全:
+        # e2b.exceptions 是纯异常类定义,不在 patch_e2b() 改写的 SandboxBase
+        # / ConnectionConfig / 裸环境变量那个补丁面上,导入顺序不影响其
+        # 正确性;上面 self._attach() 已经先走过 self._connect() →
+        # self._sdk(),生产模式下 _ensure_e2b_patched() 这时必然已经跑过
+        # (幂等 guard),这行拿到的是 sys.modules 里缓存的同一份 e2b,不会
+        # 重新触发任何副作用。单测走 FakeSdk 分支时 self._sdk() 从不真正
+        # import e2b(短路返回假件),但这行仍然会真的从 e2b(仓库钉死的硬
+        # 依赖 e2b==2.24.0,不是 kruise_agents 那个可选私有协议扩展包)导入
+        # 这两个类,供下面的 except 子句使用——测试 raise 的就是它们本身,
+        # 不需要额外假件类型。``CommandExitException`` 实际定义在
+        # ``e2b.sandbox.commands.command_handle``,``e2b.exceptions`` 里没有
+        # 这个名字(实测确认,不是公开文档);两者都从顶层 ``e2b`` 包(SDK
+        # 自己文档化的公开导入面,``from e2b import Sandbox`` 那种写法)导入
+        # 更稳,不依赖内部子模块路径。
+        from e2b import CommandExitException, TimeoutException
+
+        script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
+        try:
+            await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
+            result = await sbx.commands.run(
+                f"python -I {script}", user=SANDBOX_EXEC_USER, timeout=effective
+            )
+        except TimeoutException:
+            return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)
+        except CommandExitException as exc:
+            return SandboxOutcome(
+                stdout=exc.stdout[:MAX_OUTPUT_CHARS],
+                stderr=exc.stderr[:MAX_OUTPUT_CHARS],
+                exit_code=exc.exit_code,
+                timed_out=False,
+            )
+        except Exception as exc:
+            raise SandboxSupervisorError(f"sandbox exec failed: {exc}") from exc
+        return SandboxOutcome(
+            stdout=result.stdout[:MAX_OUTPUT_CHARS],
+            stderr=result.stderr[:MAX_OUTPUT_CHARS],
+            exit_code=result.exit_code,
+            timed_out=False,
+        )
 
     async def reap(self, *, force: bool) -> int:
         """波 1 Task 9。理由同 :meth:`exec` 的 docstring。"""

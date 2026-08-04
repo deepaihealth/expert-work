@@ -30,20 +30,42 @@ from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
 import pytest
+from e2b import CommandExitException, TimeoutException
 
-from orchestrator.tools.agent_sandbox import SANDBOX_EXEC_USER, AgentSandboxClient
+from orchestrator.tools.agent_sandbox import (
+    DEFAULT_TIMEOUT_S,
+    MAX_OUTPUT_CHARS,
+    MAX_TIMEOUT_S,
+    SANDBOX_EXEC_USER,
+    AgentSandboxClient,
+)
 from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
 
 
 @dataclass
 class FakeCommands:
-    calls: list[tuple[str, int | None]] = field(default_factory=list)
+    """Task 8 加 ``user`` 关键字参数并计入 ``calls``(3 元组
+    ``(cmd, timeout, user)``)—— 同 ``FakeFiles.write`` 的理由(见类
+    docstring 顶部):探针报告实测 ``commands.run`` 必须传 ``user="agent"``
+    才不炸 ``AuthenticationException``,断言就该验证它真的被传了,不是只让
+    假件"能吞下"这个参数。
+
+    ``run_error`` 是 Task 8 加的第二个测试缝:非 ``None`` 时 ``run`` 直接
+    ``raise`` 它而不是返回假结果——覆盖"超时"/"非零退出码"两条 E2B 特有的
+    异常路径(``TimeoutException`` / ``CommandExitException``),不需要靠
+    "整个方法换掉"这种更粗糙的猴子补丁。
+    """
+
+    calls: list[tuple[str, int | None, str | None]] = field(default_factory=list)
     result_stdout: str = ""
     result_stderr: str = ""
     result_exit: int = 0
+    run_error: BaseException | None = None
 
-    async def run(self, cmd: str, timeout: int | None = None):
-        self.calls.append((cmd, timeout))
+    async def run(self, cmd: str, timeout: int | None = None, *, user: str | None = None):
+        self.calls.append((cmd, timeout, user))
+        if self.run_error is not None:
+            raise self.run_error
         return type(
             "R",
             (),
@@ -438,3 +460,145 @@ async def test_ensure_e2b_patched_warns_on_domain_mismatch(monkeypatch, caplog) 
     assert "gw.example.com" in caplog.text
     # setdefault 语义不变 —— 预设值仍然生效,不被这次调用覆盖。
     assert os.environ["E2B_DOMAIN"] == "stale.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Task 8 —— AgentSandboxClient.exec,四个契约点(spec § 6.1,源头
+# infra/sandbox-image/runner.py:28-72)+ 一条 E2B 特有分支(非零退出码不
+# 是异常)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_clamps_timeout_high() -> None:
+    """契约 1:timeout clamp 到 [1, 300](runner.py:51)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=9999)
+
+    _, timeout, user = sdk.sandbox.commands.calls[-1]
+    assert timeout == MAX_TIMEOUT_S == 300
+    assert user == SANDBOX_EXEC_USER, (
+        "commands.run 必须传 user=,否则真实 E2B 炸 AuthenticationException"
+    )
+
+
+@pytest.mark.asyncio
+async def test_exec_clamps_timeout_low_and_defaults() -> None:
+    """契约 1 的另外两支:0(及以下)clamp 到 1,``None`` 落到缺省 30
+    (runner.py:45-51,同一个 ``max(1, min(x, MAX))`` 公式)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=0)
+    assert sdk.sandbox.commands.calls[-1][1] == 1
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=None)
+    assert sdk.sandbox.commands.calls[-1][1] == DEFAULT_TIMEOUT_S == 30
+
+
+@pytest.mark.asyncio
+async def test_exec_truncates_output_at_one_million_chars() -> None:
+    """契约 2:输出上限 1_000_000 chars(runner.py:37)。
+
+    简单头部截断 ``[:MAX_OUTPUT_CHARS]``,不是 runner.py ``_cap`` 头尾各半
+    + 省略标记那套人类可读格式(见 ``exec`` 实现注释里的理由)——这里只
+    验证长度这一个契约点,不验证展示格式。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.commands.result_stdout = "x" * (MAX_OUTPUT_CHARS + 500)
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    outcome = await client.exec(sandbox_id=sid, code="print('x'*2_000_000)", timeout_s=5)
+
+    assert len(outcome.stdout) == MAX_OUTPUT_CHARS
+
+
+@pytest.mark.asyncio
+async def test_exec_timeout_maps_to_minus_one_and_flag() -> None:
+    """契约 3:超时 → exit_code=-1, timed_out=True(runner.py:60-66)。
+
+    真实异常类型实测(2026-08-04,读 e2b==2.24.0 源码,非公开文档猜测):
+    ``commands.run(timeout=...)`` 超时抛的是 ``e2b.exceptions.TimeoutException``,
+    不是内置 ``TimeoutError``——见 ``AgentSandboxClient.exec`` 实现里的
+    详细注释。这里直接 raise 真实类型,drive 的是与生产代码完全相同的
+    except 子句,不是一个凑巧同名的假件类型(否则测试"能过"但咬不住真正
+    的类型不匹配这类回归)。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    sdk.sandbox.commands.run_error = TimeoutException("deadline")
+    outcome = await client.exec(sandbox_id=sid, code="import time;time.sleep(99)", timeout_s=1)
+
+    assert outcome.exit_code == -1
+    assert outcome.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_exec_nonzero_exit_returns_outcome_not_error() -> None:
+    """AgentSandboxClient 特有分支,runner.py 没有(实测发现,不在 brief
+    点名的四个契约点里,但同样是"跟本地沙箱行为对齐"的一部分——见
+    ``exec`` 实现注释)。
+
+    E2B 的 ``commands.run()`` 在子进程以非零退出码结束时抛
+    ``CommandExitException``;runner.py 包的 ``subprocess.run(check=False)``
+    从不因为非零退出码抛异常,只把 ``exit_code`` 原样放进响应。LLM 代码里
+    "未处理异常 / 断言失败 / ``sys.exit(1)``"是最常见的失败场景,如果不
+    单独接住这个类型,会被兜底的 ``except Exception`` 误判成"沙箱基础设施
+    故障"(``SandboxSupervisorError``,整个 run 挂掉),而不是 runner.py
+    契约要求的"正常返回一个非零 exit_code"——这条测试钉住"必须是后者"。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    sdk.sandbox.commands.run_error = CommandExitException(
+        stdout="partial output\n",
+        stderr="Traceback (most recent call last):\nValueError: boom\n",
+        exit_code=1,
+        error="exit status 1",
+    )
+
+    outcome = await client.exec(sandbox_id=sid, code="raise ValueError('boom')", timeout_s=5)
+
+    assert outcome.exit_code == 1
+    assert outcome.timed_out is False
+    assert outcome.stdout == "partial output\n"
+    assert "ValueError: boom" in outcome.stderr
+
+
+@pytest.mark.asyncio
+async def test_exec_writes_code_to_file_not_shell_arg() -> None:
+    """已知偏差(spec § 6.1):code 不能拼进命令行(引号注入)。
+
+    E2B ``commands.run(cmd: str, ...)`` 内部固定走 ``/bin/bash -l -c cmd``
+    (不像 runner.py 的 ``subprocess.run([..., "-c", code])`` 那样是不经过
+    shell 的 argv 列表),把任意 code 直接嵌进这个 shell 字符串会被引号/
+    特殊字符注入。做法是先 ``files.write`` 到临时文件再 ``python -I <file>``
+    执行。副作用是 ``-c`` 模式下 ``__file__`` 不存在、文件模式下存在 ——
+    这条差异由此测试钉住(测试本身只钉"不拼命令行"这一半;``__file__``
+    语义差异是文档记录,不是这条测试能直接断言的运行时行为)。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    nasty = "print('it\\'s \"quoted\"; rm -rf /')"
+    await client.exec(sandbox_id=sid, code=nasty, timeout_s=5)
+
+    path, _, write_user = sdk.sandbox.files.written[-1]
+    assert path.endswith(".py"), "code 必须先落文件"
+    assert write_user == SANDBOX_EXEC_USER, (
+        "files.write 必须传 user=,否则真实 E2B 炸 AuthenticationException"
+    )
+
+    cmd, _, run_user = sdk.sandbox.commands.calls[-1]
+    assert nasty not in cmd, "code 绝不能出现在命令行里"
+    assert "python -I " in cmd
+    assert run_user == SANDBOX_EXEC_USER
