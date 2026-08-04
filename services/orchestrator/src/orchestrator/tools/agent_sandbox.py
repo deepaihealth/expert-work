@@ -138,6 +138,43 @@ WORKSPACE_ROOT = "/workspace"
 #: 做成常量而非散落字面量 —— Task 8 的 ``exec`` 也要用同一个值。
 SANDBOX_EXEC_USER = "agent"
 
+#: 沙箱镜像 ``infra/sandbox-image/Dockerfile`` 声明的那套 ``ENV``,在这里重述
+#: 一份显式送进云沙箱。
+#:
+#: **为什么需要**:envd 派生的进程**不继承镜像的 ``ENV``/``WORKDIR``**。
+#: 2026-08-04 集群探针实测(不是推断):``cwd=/home/agent``(镜像是
+#: ``WORKDIR /workspace``)、``HOME=/home/agent``(镜像是 ``/workspace``)、
+#: ``PIP_USER``/``LANG``/``MPLCONFIGDIR`` 一律 ``None``。本地 supervisor 那边
+#: ``runner.py`` 是容器 PID 1、``subprocess.run`` 直接继承容器环境,这些白
+#: 拿——所以这是云后端独有的缺口,不是两边都有的老问题。缺了它们:
+#: ``pip install`` 在只读 rootfs 上装 ``/usr/local`` 必失败(``PIP_USER=1``
+#: 正是为此而设)、matplotlib 没有可写配置目录、``LANG`` 空则中文输出有编码
+#: 风险、``HOME`` 指向 ``/home/agent`` 让用户级安装/缓存落在工作区外。
+#:
+#: **单一事实源为什么落在这里**:Dockerfile 的 ``ENV`` 是给 docker/containerd
+#: 的构建期声明,编排进程这一侧在运行时读不到它(镜像不在本进程,也不该为
+#: 取几个常量去拉镜像元数据),所以"共享一个变量"物理上做不到,只能是两份
+#: 副本 + 一道对齐闸。这份 dict 是唯一真的会被送进云沙箱的副本,放在唯一
+#: 使用它的模块里;
+#: ``services/orchestrator/tests/test_agent_sandbox.py::test_image_env_matches_dockerfile``
+#: 直接解析 Dockerfile 的 ``ENV``/``WORKDIR`` 指令逐条比对,任一边单方面改动
+#: 都会红——与 ``test_idle_ttl_matches_supervisor_default`` 防 TTL 漂移是同一
+#: 手法,也是本仓对"同一语义分散两处"的既定处置。
+#:
+#: 只在 ``create(envs=...)`` 传一次:``connect`` 没有 ``envs`` 形参(e2b
+#: 2.24.0 ``sandbox_async/main.py``),热会话重连不会重发。这里全是与沙箱
+#: 实例无关的常量,建时定死即可——与同样走 ``envs`` 的 egress 变量不同,
+#: 那些带 per-sandbox token(见 :meth:`_egress_env`)。
+SANDBOX_IMAGE_ENV = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "HOME": WORKSPACE_ROOT,
+    "MPLCONFIGDIR": f"{WORKSPACE_ROOT}/.mplconfig",
+    "LANG": "zh_CN.UTF-8",
+    "LC_ALL": "zh_CN.UTF-8",
+    "PIP_USER": "1",
+}
+
 #: 契约常量 —— 与 infra/sandbox-image/runner.py:28-37 逐字对齐(``exec``,
 #: Task 8)。runner.py 是本地 docker 沙箱里的 PID 1,这三个值是它的
 #: ``DEFAULT_TIMEOUT_S`` / ``MAX_TIMEOUT_S`` / ``MAX_OUTPUT_CHARS``;云沙箱
@@ -489,10 +526,20 @@ class AgentSandboxClient:
     async def _create(
         self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None
     ) -> Any:
+        """建一个新沙箱。
+
+        ``envs`` 一次送两组:镜像自己声明、但 envd 派生进程拿不到的那套
+        (:data:`SANDBOX_IMAGE_ENV`,全分支终审 Important-2),加上本次
+        acquire 的 egress 变量。egress 放后面覆盖——今天两组键零重叠,
+        顺序只是把"哪一组是特化"这件事写死,免得以后加键时靠运气。
+        """
         try:
             return await self._sdk().create(
                 template=self.template,
-                envs=self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
+                envs={
+                    **SANDBOX_IMAGE_ENV,
+                    **self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
+                },
                 domain=self.domain,
                 api_key=self.api_key,
             )
@@ -621,6 +668,13 @@ class AgentSandboxClient:
         (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
         ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
 
+        全分支终审 Important-2:``commands.run`` 显式传 ``cwd=WORKSPACE_ROOT``。
+        envd 派生的进程不继承镜像的 ``WORKDIR``,不传则落在 ``/home/agent``
+        (2026-08-04 集群实测)—— ``bash`` 工具的 LLM 可见描述写着"Runs in
+        /workspace",而 LLM 代码里的 ``open('out.csv','w')`` 这类相对路径写
+        出的文件会落到 ``file_ops``(只认绝对 ``/workspace/...``)看不见的地
+        方。配套的镜像环境变量见 :data:`SANDBOX_IMAGE_ENV`。
+
         独立审查 Important-2:``_attach(sandbox_id, touch_last_used=True)``
         在拿句柄的同一次往返里把这一行的 ``last_used_at`` 推进到当前
         时间——``reap`` 的空闲 TTL 清扫(``force=False``)按这一列判断
@@ -640,7 +694,10 @@ class AgentSandboxClient:
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
-                f"python -I {script}", user=SANDBOX_EXEC_USER, timeout=effective
+                f"python -I {script}",
+                user=SANDBOX_EXEC_USER,
+                timeout=effective,
+                cwd=WORKSPACE_ROOT,
             )
         except timeout_exc:
             return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)

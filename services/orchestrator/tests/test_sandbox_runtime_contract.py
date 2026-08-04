@@ -24,7 +24,7 @@ design spec 明确把这份文件定为波 1 防两套实现漂移的**唯一手
   Postgres(``EXPERT_WORK_DB_DSN``,``postgresql+asyncpg://`` scheme)——
   ``sandbox_instance`` 表是 CAS 的凭据,不能用内存假件替代真集成。
 
-marker 策略:7 条契约测试各自单独打 ``@pytest.mark.integration``(真连
+marker 策略:每条契约测试各自单独打 ``@pytest.mark.integration``(真连
 基础设施,任一环境变量未设就 skip),但文件末尾的 TTL 漂移断言
 (``test_idle_ttl_matches_supervisor_default``)刻意**不**打这个 marker
 ——它只是比较两个包各自定义的 Python 常量,不连任何真实环境,理应在每一次
@@ -159,6 +159,79 @@ async def test_stderr_captured(runtime: SandboxRuntime) -> None:
             timeout_s=30,
         )
         assert "to-err" in outcome.stderr
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_cwd_is_workspace(runtime: SandboxRuntime) -> None:
+    """全分支终审 Important-2 —— 这条以前不存在,正是云后端 cwd 错了几个月
+    没人发现的原因:其它每一条用例都用绝对 ``/workspace/...`` 路径,对 cwd
+    完全不敏感。
+
+    supervisor 档靠镜像的 ``WORKDIR /workspace``(``runner.py`` 是容器
+    PID 1,``subprocess.run`` 继承它);agent_sandbox 档靠
+    ``commands.run(cwd=...)`` —— envd 派生的进程不继承镜像 ``WORKDIR``,
+    实测落在 ``/home/agent``。两条路子不同,观测结果必须相同。
+    """
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c8")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid, code="import os; print(os.getcwd())", timeout_s=30
+        )
+        assert outcome.stdout.strip() == "/workspace"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -> None:
+    """cwd 契约的用户可见后果:LLM 代码里的 ``open('out.csv','w')`` 必须落在
+    ``/workspace``,否则 ``file_ops``(只构造绝对 ``/workspace/...`` 路径)
+    根本看不见 agent 刚写出来的文件。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9")
+    try:
+        await runtime.exec(
+            sandbox_id=sid, code="open('relative.txt','w').write('REL_OK')", timeout_s=30
+        )
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="print(open('/workspace/relative.txt').read())",
+            timeout_s=30,
+        )
+        assert "REL_OK" in outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
+    """镜像 ``ENV`` 在两个后端都要到达沙箱进程。
+
+    supervisor 档白拿(容器环境被 ``runner.py`` 的 ``subprocess.run`` 继承);
+    agent_sandbox 档必须由 ``create(envs=...)`` 显式送(实测 envd 派生进程
+    这几项全是 ``None``)。挑的三项各自对应一条真实故障:``PIP_USER`` 空 →
+    只读 rootfs 上 ``pip install`` 必失败;``HOME`` 不是 ``/workspace`` →
+    用户级安装落在工作区外;``MPLCONFIGDIR`` 空 → matplotlib 没有可写配置目录。
+    """
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c10")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "for k in ('HOME', 'PIP_USER', 'MPLCONFIGDIR', 'LANG'):\n"
+                "    print(k, '=', os.environ.get(k))\n"
+            ),
+            timeout_s=30,
+        )
+        assert "HOME = /workspace" in outcome.stdout
+        assert "PIP_USER = 1" in outcome.stdout
+        assert "MPLCONFIGDIR = /workspace/.mplconfig" in outcome.stdout
+        assert "LANG = zh_CN.UTF-8" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 

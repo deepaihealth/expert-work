@@ -52,7 +52,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -63,6 +65,8 @@ from orchestrator.tools.agent_sandbox import (
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
     SANDBOX_EXEC_USER,
+    SANDBOX_IMAGE_ENV,
+    WORKSPACE_ROOT,
     AgentSandboxClient,
 )
 from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
@@ -70,11 +74,15 @@ from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
 
 @dataclass
 class FakeCommands:
-    """Task 8 加 ``user`` 关键字参数并计入 ``calls``(3 元组
-    ``(cmd, timeout, user)``)—— 同 ``FakeFiles.write`` 的理由(见类
+    """Task 8 加 ``user`` 关键字参数并计入 ``calls`` —— 同 ``FakeFiles.write`` 的理由(见类
     docstring 顶部):探针报告实测 ``commands.run`` 必须传 ``user="agent"``
     才不炸 ``AuthenticationException``,断言就该验证它真的被传了,不是只让
     假件"能吞下"这个参数。
+
+    全分支终审 Important-2 起 ``calls`` 是 4 元组
+    ``(cmd, timeout, user, cwd)`` —— ``cwd`` 与 ``user`` 同理:envd 派生的
+    进程不继承镜像的 ``WORKDIR``,不显式传就落在 ``/home/agent``,断言要能
+    看见它真的被传了。
 
     ``run_error`` 是 Task 8 加的第二个测试缝:非 ``None`` 时 ``run`` 直接
     ``raise`` 它而不是返回假结果——覆盖"超时"/"非零退出码"两条 E2B 特有的
@@ -82,14 +90,21 @@ class FakeCommands:
     "整个方法换掉"这种更粗糙的猴子补丁。
     """
 
-    calls: list[tuple[str, int | None, str | None]] = field(default_factory=list)
+    calls: list[tuple[str, int | None, str | None, str | None]] = field(default_factory=list)
     result_stdout: str = ""
     result_stderr: str = ""
     result_exit: int = 0
     run_error: BaseException | None = None
 
-    async def run(self, cmd: str, timeout: int | None = None, *, user: str | None = None):
-        self.calls.append((cmd, timeout, user))
+    async def run(
+        self,
+        cmd: str,
+        timeout: int | None = None,
+        *,
+        user: str | None = None,
+        cwd: str | None = None,
+    ):
+        self.calls.append((cmd, timeout, user, cwd))
         if self.run_error is not None:
             raise self.run_error
         return type(
@@ -521,13 +536,18 @@ async def test_destroy_kills_and_marks_row() -> None:
 
 @pytest.mark.asyncio
 async def test_egress_env_empty_when_no_policy() -> None:
-    """egress=None(exec_python 等未绑定 EgressContext 时)不铸 token。"""
+    """egress=None(exec_python 等未绑定 EgressContext 时)不铸 token。
+
+    全分支终审 Important-2 起 ``envs`` 不再是空 dict —— 镜像那套 ENV 恒定
+    随 ``create`` 送(见 :data:`SANDBOX_IMAGE_ENV`),所以这里断言的是"一个
+    代理相关的键都没有",而不是"整个 envs 是空的"。
+    """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
     await client.acquire(tenant_id=uuid4(), thread_id="t1", user_id=uuid4())
 
-    assert sdk.created[0]["envs"] == {}
+    assert sdk.created[0]["envs"] == SANDBOX_IMAGE_ENV
 
 
 @pytest.mark.asyncio
@@ -644,7 +664,7 @@ async def test_exec_clamps_timeout_high() -> None:
 
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=9999)
 
-    _, timeout, user = sdk.sandbox.commands.calls[-1]
+    _, timeout, user, _cwd = sdk.sandbox.commands.calls[-1]
     assert timeout == MAX_TIMEOUT_S == 300
     assert user == SANDBOX_EXEC_USER, (
         "commands.run 必须传 user=,否则真实 E2B 炸 AuthenticationException"
@@ -764,10 +784,118 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
         "files.write 必须传 user=,否则真实 E2B 炸 AuthenticationException"
     )
 
-    cmd, _, run_user = sdk.sandbox.commands.calls[-1]
+    cmd, _, run_user, _cwd = sdk.sandbox.commands.calls[-1]
     assert nasty not in cmd, "code 绝不能出现在命令行里"
     assert "python -I " in cmd
     assert run_user == SANDBOX_EXEC_USER
+
+
+# ---------------------------------------------------------------------------
+# 全分支终审 Important-2 —— 沙箱进程既不继承镜像的 WORKDIR 也不继承它的 ENV
+# (2026-08-04 集群探针实测)。cwd 靠 commands.run(cwd=),环境变量靠
+# create(envs=)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_runs_in_workspace_cwd() -> None:
+    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:``bash`` 工具对 LLM
+    宣称的 "Runs in /workspace" 是假的,LLM 写的相对路径文件会落到
+    ``file_ops``(只认绝对 ``/workspace/...``)看不见的地方。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    _, _, _, cwd = sdk.sandbox.commands.calls[-1]
+    assert cwd == WORKSPACE_ROOT == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_create_passes_the_image_environment() -> None:
+    """镜像声明的 ENV 必须显式随 ``create(envs=)`` 送进去,且不能踩掉
+    egress 那组(两组同走 ``envs`` 这一个通道)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    await client.acquire(
+        tenant_id=uuid4(),
+        thread_id="t",
+        user_id=uuid4(),
+        egress=EgressContext(policy="allowlist", agent_name="a", agent_version=1),
+    )
+
+    envs = sdk.created[-1]["envs"]
+    for key, value in SANDBOX_IMAGE_ENV.items():
+        assert envs[key] == value, f"镜像环境变量 {key} 没送进沙箱"
+    assert envs["HOME"] == "/workspace", "HOME 不是 /workspace 则 PIP_USER 装到工作区外"
+    assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
+    # egress 那组仍在 —— 合并没有把它挤掉。
+    assert "HTTPS_PROXY" in envs
+
+
+def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
+    """从 Dockerfile 文本里抽出最终的 ``ENV`` 集合与最后一条 ``WORKDIR``。
+
+    处理反斜杠续行,以及续行块内部的注释行(``ENV`` 那段真的有一段
+    ``# Read-only rootfs at runtime: ...`` 夹在中间)。
+    """
+    statements: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if pending and line.startswith("#"):
+            continue
+        if not pending and (not line or line.startswith("#")):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1].strip() + " "
+            continue
+        statements.append((pending + line).strip())
+        pending = ""
+
+    env: dict[str, str] = {}
+    workdir: str | None = None
+    for statement in statements:
+        if statement.startswith("ENV "):
+            for token in shlex.split(statement[len("ENV ") :]):
+                key, _, value = token.partition("=")
+                env[key] = value
+        elif statement.startswith("WORKDIR "):
+            workdir = statement[len("WORKDIR ") :].strip()
+    return env, workdir
+
+
+def test_image_env_matches_dockerfile() -> None:
+    """镜像与客户端两份副本的漂移闸(手法同
+    ``test_idle_ttl_matches_supervisor_default``)。
+
+    Dockerfile 的 ``ENV`` 是构建期声明,编排进程运行时读不到,所以
+    :data:`SANDBOX_IMAGE_ENV` 只能是第二份副本。**双向**比对:少了一条 →
+    云沙箱里那个变量是空的;多了一条 → 送进去一个镜像早就不再声明的值。
+    ``WORKDIR`` 同理钉住 :data:`WORKSPACE_ROOT`。
+
+    刻意不打 ``@pytest.mark.integration``、也刻意不 ``skip``:漂移闸在跳过
+    时就等于不存在(见 sandbox-contract 工作流那次"结构性报绿"的教训),
+    而这个文件在仓库 checkout 里必然存在——真找不到说明目录结构变了,
+    那正该红。
+    """
+    dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
+    assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"
+
+    env, workdir = _parse_dockerfile_env_and_workdir(dockerfile.read_text(encoding="utf-8"))
+
+    assert env == SANDBOX_IMAGE_ENV, (
+        "沙箱镜像的 ENV 与 AgentSandboxClient 送进云沙箱的 SANDBOX_IMAGE_ENV 已经不一致"
+        f"(Dockerfile={env} / 客户端={SANDBOX_IMAGE_ENV})——envd 派生的进程不继承镜像"
+        " ENV,只吃 create(envs=) 里的这份,两边必须逐条对齐。"
+    )
+    assert workdir == WORKSPACE_ROOT, (
+        f"镜像 WORKDIR={workdir} 与 WORKSPACE_ROOT={WORKSPACE_ROOT} 不一致 —— "
+        "exec 传给 commands.run 的 cwd 就是后者。"
+    )
 
 
 # ---------------------------------------------------------------------------
