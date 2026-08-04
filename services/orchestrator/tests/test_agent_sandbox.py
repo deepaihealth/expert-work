@@ -163,6 +163,9 @@ class FakeInstanceStore:
     rows: dict[UUID, dict] = field(default_factory=dict)
     #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。
     drop_warm_fails: bool = False
+    #: 全分支终审 Important-1 —— 覆盖 "release 的 store 读本身也失败" 这条
+    #: 路径(按保温处置,不把已经跑完的工具调用变成错误)。
+    is_warm_session_fails: bool = False
     #: Task 9 测试缝 —— ``list_active(only_idle=True)`` 只返回这里列出的
     #: sandbox_id。不建模真实的 last_used_at/acquired_at 时间戳(那是两个
     #: 生产 store 的职责);这里只用来验证 AgentSandboxClient.reap() 把
@@ -229,6 +232,19 @@ class FakeInstanceStore:
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         return self.rows.get(sandbox_id, {}).get("container_id")
+
+    async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
+        """全分支终审 Important-1 —— ``release`` 的分流判据。``rows`` 只存
+        活行(``mark_destroyed`` 直接 pop),所以"行在 + user_id 非空"就是
+        两个生产 store 那三条谓词的等价物,见生产 Protocol 的 docstring。
+
+        ``is_warm_session_fails`` 是配套的测试缝:覆盖"store 读不到时
+        release 按保温处置"这条不该把已经跑完的工具调用变成错误的路径。
+        """
+        if self.is_warm_session_fails:
+            raise RuntimeError("is_warm_session unavailable (db blip)")
+        row = self.rows.get(sandbox_id)
+        return row is not None and row.get("user_id") is not None
 
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         self.touched.append(sandbox_id)
@@ -920,3 +936,63 @@ def test_repr_does_not_leak_credential_fields() -> None:
 
     assert "MARKER-API-KEY-DO-NOT-LEAK" not in rendered
     assert "MARKER-EGRESS-SECRET-DO-NOT-LEAK" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# 全分支终审 Important-1 —— release() 对无 user_id 的沙箱必须真销毁。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_a_user_scoped_warm_session_alive() -> None:
+    """带 ``user_id`` 的热会话:``release`` 保温,不 kill、不清行——留给该
+    用户的下一次 run,由空闲 TTL 清扫回收。与本地 supervisor 的 ``release``
+    同语义(``supervisor.py:345-364``)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert sdk.sandbox.killed is False
+    assert sandbox_id in store.rows, "热会话行必须留着,container_id 是下次 connect 的凭据"
+    assert store.mark_destroyed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_release_destroys_an_ephemeral_sandbox() -> None:
+    """全分支终审 Important-1 的核心:``release`` 此前对两种情况都无条件
+    ``return None``。``run_in_sandbox``(``sandbox.py:444-462``)是每次工具
+    调用 acquire+release 一次,``ctx.user_id`` 又是 ``UUID | None`` —— 云
+    后端下每一次无 user 的工具调用都漏一个活的 microVM,外加一行永远停在
+    ``IN_USE``/``destroyed_at IS NULL`` 的 ``sandbox_instance``。本地
+    supervisor 没有这个洞正是因为它这条分支走的是 ``destroy``。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert sdk.sandbox.killed is True, "临时沙箱必须真 kill,否则 microVM 一直活着"
+    assert store.mark_destroyed_calls == [(sandbox_id, "release")], (
+        "行必须被标记销毁,且 reason 与本地 supervisor 的 DESTROY_REASON_RELEASE 一致"
+    )
+    assert sandbox_id not in store.rows
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_warm_when_the_store_lookup_fails() -> None:
+    """``release`` 是清理路径不是取数路径:store 抖一下(连接池耗尽/网络
+    分区)不该把一次本来已经跑完的工具调用变成错误,也不该在判据不明时
+    去 kill 一个可能正被用户使用的热会话。两种误判取代价小的那个。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    store.is_warm_session_fails = True
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert sdk.sandbox.killed is False
+    assert store.mark_destroyed_calls == []

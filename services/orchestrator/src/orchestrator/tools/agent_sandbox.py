@@ -146,6 +146,15 @@ DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
 MAX_OUTPUT_CHARS = 1_000_000
 
+#: ``destroy_reason`` written when :meth:`AgentSandboxClient.release` tears
+#: down a non-warm (no ``user_id``) sandbox. Same literal as the docker
+#: supervisor's ``DESTROY_REASON_RELEASE``
+#: (``sandbox_supervisor/domain.py:33``) so ``sandbox_instance`` rows read
+#: the same regardless of which backend wrote them — mirrored rather than
+#: imported, for the same wrong-direction-dependency reason the persistence
+#: package mirrors that service's idle TTL instead of importing its settings.
+_RELEASE_DESTROY_REASON = "release"
+
 #: 进程级 guard —— ``_ensure_e2b_patched`` 幂等的关键,见模块 docstring
 #: "私有协议 + patch_e2b 导入顺序"一节。
 _e2b_patched = False
@@ -491,15 +500,49 @@ class AgentSandboxClient:
             raise SandboxSupervisorError(f"sandbox create failed: {exc}") from exc
 
     async def release(self, *, sandbox_id: UUID) -> None:
-        """常规拆除 —— 让平台按休眠保留期回收,不主动 kill。
+        """常规拆除 —— 用户级热会话保温,临时沙箱真销毁。
 
-        与 supervisor 实现的差异:那边 ``release`` 是 ``docker rm``;这里
-        沙箱进入平台的休眠流程(内存态保留,下次 acquire 唤醒 1-10s)。
-        热会话行保留(``state`` 仍是 ``IN_USE``),``container_id`` 就是
-        下次 connect 的凭据 —— 不碰 store,是刻意的空实现。
+        与本地 supervisor 的 ``release`` 逐条对齐
+        (``sandbox_supervisor/supervisor.py:345-364``):带 ``user_id`` 的
+        热会话**保活**(留给该用户的下一次 run,由空闲 TTL 清扫回收),
+        没有 ``user_id`` 的沙箱**销毁**。
+
+        全分支终审 Important-1:这里原本对两种情况都无条件 ``return
+        None``。而 ``run_in_sandbox``(``sandbox.py:444-462``)是每次工具
+        调用 acquire 一次、release 一次,``ctx.user_id`` 又是
+        ``UUID | None`` —— 云后端下每一次无 user 的工具调用都会漏一个活的
+        microVM,外加一行永远停在 ``IN_USE``/``destroyed_at IS NULL`` 的
+        ``sandbox_instance``,没有任何东西会去销毁它。本地 supervisor 没有
+        这个问题正是因为它这条分支走的是 ``destroy``。
+
+        保温分支仍然不碰 store:热会话行保持 ``IN_USE``,``container_id``
+        就是下次 connect 的凭据。
         """
-        del sandbox_id
+        if await self._is_warm_session(sandbox_id):
+            return None
+        await self.destroy(sandbox_id=sandbox_id, reason=_RELEASE_DESTROY_REASON)
         return None
+
+    async def _is_warm_session(self, sandbox_id: UUID) -> bool:
+        """``store.is_warm_session`` 读不到时,按"保温"处置。
+
+        ``release`` 是清理路径,不是取数路径:store 抖一下(连接池耗尽 /
+        网络分区)不该把一次本来已经跑完的工具调用变成错误。两种误判里
+        选代价小的那个——误当热会话最多是多留一个沙箱到空闲 TTL 到期被
+        ``reap`` 收走(``reap`` 现在有周期任务在跑,见控制面 lifespan);
+        误当临时沙箱则是把一个用户正在用的热会话直接 kill 掉。
+        """
+        try:
+            return await self.store.is_warm_session(sandbox_id=sandbox_id)
+        except Exception:
+            logger.warning(
+                "release: is_warm_session lookup failed for sandbox %s — "
+                "keeping it warm (the idle reap sweep will reclaim it if it "
+                "was in fact ephemeral)",
+                sandbox_id,
+                exc_info=True,
+            )
+            return True
 
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         """强制拆除 —— 真 kill 沙箱并让出热会话坑。"""

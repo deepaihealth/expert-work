@@ -367,6 +367,26 @@ class SqlSandboxInstanceStore:
             ).scalar_one_or_none()
         return str(container_id) if container_id is not None else None
 
+    async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
+        """Whole-branch review Important-1 — see
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.is_warm_session``
+        for the contract. The three predicates below are the SQL spelling of
+        the docker supervisor's own ``release`` condition (``record is not
+        None and record.user_id is not None and record.state is IN_USE``).
+        """
+        async with self._sf() as session:
+            found = (
+                await session.execute(
+                    select(SandboxInstanceRow.id).where(
+                        SandboxInstanceRow.id == sandbox_id,
+                        SandboxInstanceRow.user_id.is_not(None),
+                        SandboxInstanceRow.state == _STATE_IN_USE,
+                        SandboxInstanceRow.destroyed_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+        return found is not None
+
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """Independent-review Important-2 —
         ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.touch_and_get_container_id``'s
@@ -558,6 +578,17 @@ class InMemorySandboxInstanceStore:
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         row = self._rows.get(sandbox_id)
         return row.container_id if row is not None else None
+
+    async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
+        """Mirrors :meth:`SqlSandboxInstanceStore.is_warm_session`.
+
+        ``_rows`` only ever holds live rows (``mark_destroyed`` /
+        ``drop_warm`` pop them), so "row present" already carries the SQL
+        store's ``state='IN_USE' AND destroyed_at IS NULL`` half — the only
+        thing left to check is ``user_id``.
+        """
+        row = self._rows.get(sandbox_id)
+        return row is not None and row.user_id is not None
 
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """Mirrors :meth:`SqlSandboxInstanceStore.touch_and_get_container_id`."""

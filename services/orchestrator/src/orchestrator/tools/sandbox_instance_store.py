@@ -96,6 +96,21 @@ class SandboxInstanceStore(Protocol):
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""
 
+    async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
+        """这一行是不是一个**该保温的**用户级热会话?
+
+        全分支终审 Important-1:``AgentSandboxClient.release`` 要按这个判定
+        分流,与本地 supervisor 的 ``release`` 逐条对齐——它的条件是
+        ``record is not None and record.user_id is not None and record.state
+        is IN_USE``(``supervisor.py:356-364``),三条全中才保温,否则
+        ``destroy``。这里返回的就是那三条的合取:行存在、``user_id`` 非空、
+        ``state='IN_USE'`` 且未销毁。
+
+        ``get_container_id`` 顶不了这个班:它对"行不存在"和"行在但
+        ``container_id`` 没回填"都返回 ``None``,更关键的是它压根不看
+        ``user_id``——而"有没有 user_id"正是保温与销毁的分界线。
+        """
+
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """独立审查 Important-2:跟 :meth:`get_container_id` 一样的读语义
         (行不存在或未回填返 ``None``),但同一次往返里把该行的

@@ -209,6 +209,7 @@ from control_plane.runtime import (
     resolve_object_store_config,
     resolve_web_search_client,
 )
+from control_plane.sandbox_reap_worker import SandboxReapWorker
 from control_plane.scheduler import TriggerScheduler
 from control_plane.settings import Settings
 from control_plane.skill_activity import ThrottledActivityRecorder
@@ -495,7 +496,11 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from orchestrator import MemoryEnv
-from orchestrator.tools import HTTPSupervisorRuntime, SupervisorWorkspaceStore
+from orchestrator.tools import (
+    AgentSandboxClient,
+    HTTPSupervisorRuntime,
+    SupervisorWorkspaceStore,
+)
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -1246,6 +1251,7 @@ def create_app(
             quality_monitor: QualityMonitorWorker | None = None
             quality_drift: QualityDriftWorker | None = None
             approval_gauge_worker: ApprovalGaugeWorker | None = None
+            sandbox_reap_worker: SandboxReapWorker | None = None
             if agent_runtime is None:
                 if resolved_settings.checkpointer_backend == "postgres":
                     if not resolved_settings.checkpointer_dsn:
@@ -2057,6 +2063,16 @@ def create_app(
             approval_gauge_worker = ApprovalGaugeWorker(approval_store=resolved_approval_store)
             approval_gauge_worker.start()
             _app.state.approval_gauge_worker = approval_gauge_worker
+            # 波 1 全分支终审 Important-1 — the idle-sandbox sweep. Only for
+            # the cloud backend: ``sandbox_backend="supervisor"`` already has
+            # its own in-process reaper inside the supervisor service, and
+            # that backend is frozen this wave. isinstance rather than a
+            # settings read, same reasoning as the ``HTTPSupervisorRuntime``
+            # guard above — the wiring should follow what was actually built.
+            if isinstance(resolved_sandbox_runtime, AgentSandboxClient):
+                sandbox_reap_worker = SandboxReapWorker(runtime=resolved_sandbox_runtime)
+                sandbox_reap_worker.start()
+                _app.state.sandbox_reap_worker = sandbox_reap_worker
             resolved_lifecycle.mark_ready()
             logger.info(
                 "control_plane.lifespan.ready",
@@ -2101,6 +2117,8 @@ def create_app(
                     await quality_drift.stop()
                 if approval_gauge_worker is not None:
                     await approval_gauge_worker.stop()
+                if sandbox_reap_worker is not None:
+                    await sandbox_reap_worker.stop()
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.
