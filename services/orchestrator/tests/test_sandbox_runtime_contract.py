@@ -425,6 +425,36 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
     )
 
 
+def test_egress_token_ttl_matches_supervisor_default() -> None:
+    """再审 Important-3 追加的第三道漂移闸(手法同下面那条)。
+
+    出网 token 只在 ``create(envs=...)`` 送一次——``connect`` 没有 ``envs``
+    形参(e2b 2.24.0,已核对源码),所以热会话重连**不会**换发新 token。I-4
+    之前这不成问题:不传 ``timeout`` 的沙箱 300 秒就被平台 kill,每次复用都是
+    重建 + 新 token。I-4 给 ``connect`` 也传了 ``timeout``,热会话可以无限期
+    活着,于是"token 必须活得比沙箱久"从一句废话变成一条真约束——活不过就是
+    出网一律 407 且没有自愈路径。
+
+    钉到 supervisor 的同名默认值上,而不是钉一个孤立的数字:两个后端服务同一
+    个 credential-proxy、共享同一个密钥、铸同一种 token,同一个 agent 在两边
+    理应拿到同样的待遇。这也顺带说明为什么 24h 不是新的暴露面——supervisor
+    今天就在按这个值铸。
+
+    刻意不打 ``integration`` marker:只比较两个 Python 常量。
+    """
+    from orchestrator.tools.agent_sandbox import AgentSandboxClient
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    supervisor_default = SandboxSupervisorSettings.model_fields["egress_token_ttl_s"].default
+    client_default = AgentSandboxClient.__dataclass_fields__["egress_token_ttl_s"].default
+    assert client_default == supervisor_default, (
+        f"AgentSandboxClient 铸的出网 token 活 {client_default}s,docker supervisor 铸的活"
+        f" {supervisor_default}s —— 同一个 agent 在两个后端拿到不同待遇。"
+        " 调低这个值之前先确认热会话的最长存活期仍然短于它(connect 不重发 token,"
+        " 活过期就是出网一律 407 且没有自愈路径)。"
+    )
+
+
 def test_idle_ttl_matches_supervisor_default() -> None:
     """独立审查追加的漂移检测(task-9-report.md § 11.4 Minor-2)。
 

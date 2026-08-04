@@ -74,6 +74,19 @@ C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的
 管者。两处全改成按 ``sandbox_id``,``SandboxInstanceStore.drop_warm`` 随
 之删除(零调用方,留着就是留一个默认不安全的写法)。完整推理见
 :meth:`AgentSandboxClient._unwind_slot`。
+
+## 再审 Important-3:出网 token 只能靠"活得比沙箱久",重发这条路走不通
+
+取值与安全论证在 :attr:`AgentSandboxClient.egress_token_ttl_s`;**被否决的三
+条**记在这里免得下一个人重走(完整推理见本轮报告):``connect(envs=...)``
+——e2b 2.24.0 没这个形参(核对过 ``ApiParams``);``commands.run(envs=...)``
+——SDK 层确实支持,但 ``SandboxRuntime.exec`` 签名里没有 egress
+(``EgressContext`` 只绑在 ``acquire`` 上),要拿到它得改 Protocol,而
+``HTTPSupervisorRuntime`` 本波次**冻结**、沙箱环境是 ``docker run`` 时烤死的,
+跟不了;让沙箱重读 token ——要改两个后端**共用**的镜像里的 sitecustomize,是
+波 2 规模的改动。真正的自愈解法是给热会话总年龄设上限、到点强制重建(需要
+``claim_warm`` 把 ``acquired_at`` 也透出来),已记 follow-up。残留风险:连续
+24 小时每 15 分钟至少被用一次的热会话仍会撞 407,需要真集群观察。
 """
 
 from __future__ import annotations
@@ -156,7 +169,27 @@ class AgentSandboxClient:
     #: ``e2b`` 没有 py.typed 标记(见 pyproject.toml 的 mypy override 说明),
     #: 手写测试假件也不共享一个正式 Protocol —— 两边都用 ``Any``,不是疏漏。
     sdk: Any | None = None
-    egress_token_ttl_s: int = 3600
+    #: 出网 token 的存活期。**必须长于沙箱可能活着的时间**:token 只在
+    #: ``create(envs=...)`` 送一次,之后再没机会换(见 :meth:`_egress_env`)。
+    #:
+    #: 再审 Important-3:原值 1 小时,在 I-4 之前够用——不传 ``timeout`` 的沙箱
+    #: 300 秒就被平台 kill,每次复用都是重建 + 新 token。I-4 给 ``connect`` 也
+    #: 传了 ``timeout``,热会话从此可以无限期活下去,于是持续使用的会话会活过
+    #: 自己的 token:出网一律 407,且**没有任何自愈路径**(沙箱还活着、reap 不
+    #: 收它、connect 不重发环境变量)。这是那次改动引入的用户可见回归。
+    #:
+    #: 取值 = supervisor 的 ``SandboxSupervisorSettings.egress_token_ttl_s``
+    #: 默认值,``test_egress_token_ttl_matches_supervisor_default`` 钉住。
+    #: **为什么安全**:① 不是新暴露面——同一密钥、同一 proxy、同一 token 格式,
+    #: supervisor 今天就按 24h 铸,两个后端本就该给同一个 agent 同样待遇;
+    #: ② token 绑死 ``(tenant, agent, version, sandbox_id, allowlist,
+    #: denylist)``,proxy 只按这份签名过的策略放行,泄露不构成越权——沙箱里的
+    #: 代码本来就能做这些事(见 ``expert_work.common.egress_token`` docstring);
+    #: ③ proxy 是 ClusterIP,集群外够不着
+    #: (``infra/k8s/base/credential-proxy/service.yaml``)。
+    #:
+    #: 为什么不改成"重发 token":见模块 docstring 末尾一节。
+    egress_token_ttl_s: int = 24 * 60 * 60
 
     def _sdk(self) -> Any:
         if self.sdk is not None:
