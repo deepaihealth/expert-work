@@ -161,10 +161,32 @@ def _ensure_e2b_patched(*, domain: str, api_key: str) -> None:
 
     调用点收敛到 :meth:`AgentSandboxClient._sdk` 一处 —— 完整理由见模块
     docstring;不要在别处直接 ``import e2b``。
+
+    二审发现(task-7-report.md "二审修复"一节):``setdefault`` 保持"运维
+    显式设置优先"这条语义没错,但如果预设值真的跟 ``self.domain`` 不一致,
+    后果比"连不上"更难查——``patch_e2b()`` 用(此刻的)``E2B_DOMAIN`` **一次
+    性**算好 ``E2B_API_URL`` 并写死,之后不会再读;而 ``_create``/``_connect``
+    每次调用仍然把**正确的** ``self.domain`` 当 kwarg 传给 SDK。两个值一旦
+    不一致,报出来的是认证/网络层面让人摸不着头脑的错,不是"域名连不上"
+    这种一眼能看懂的信号。这里把这种静默的同/异歧义变成可见的一条
+    warning 日志,``setdefault`` 的行为本身不变(运维的显式值仍然生效)。
     """
     global _e2b_patched
     if _e2b_patched:
         return
+    existing_domain = os.environ.get("E2B_DOMAIN")
+    if existing_domain is not None and existing_domain != domain:
+        logger.warning(
+            "E2B_DOMAIN is already set to %r (different from this "
+            "AgentSandboxClient's configured domain %r) — patch_e2b() bakes "
+            "the pre-existing env value into E2B_API_URL once and never "
+            "re-reads it, while create()/connect() keep passing %r explicitly "
+            "per call; a mismatch here surfaces as a confusing auth/network "
+            "error, not a clear connection failure",
+            existing_domain,
+            domain,
+            domain,
+        )
     os.environ.setdefault("E2B_DOMAIN", domain)
     os.environ.setdefault("E2B_API_KEY", api_key)
     from kruise_agents.patch_e2b import patch_e2b
@@ -383,12 +405,34 @@ class AgentSandboxClient:
         是 raise "already being created"(见 Protocol docstring)—— 没有任何
         东西会再去把这行解开,该用户的热会话彻底卡死,只能手工改库。
         ``drop_warm`` 把槽位放出来,让下一次 acquire 能重新正常竞争。
+
+        二审发现(task-7-report.md "二审修复"一节):``drop_warm`` 自己也
+        可能失败(DB 抖动/连接池耗尽/网络分区)。如果不特殊处理,外层
+        ``raise`` 会被 ``drop_warm`` 的新异常盖过 —— 调用方按
+        ``SandboxSupervisorError`` 设计的 except 链接不住原始错误(类型变
+        了),而且槽位依然没清理成功,与本方法开头描述的卡死症状原样重演,
+        只是往下多埋一层。用嵌套 try/except 把 ``drop_warm`` 的失败单独
+        捕获+记日志(标明需要人工介入),但外层永远重新抛出 ``_create()``
+        的原始异常 —— 内层的 except 块正常结束(没有再 raise)后,外层
+        bare ``raise`` 重新抛出的是外层 except 语句本来在处理的那个异常,
+        不是内层被捕获又丢弃的那个(标准 Python 异常处理语义,已用最小
+        复现脚本独立验证过,见报告)。
         """
         try:
             return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
         except Exception:
             if user_id is not None:
-                await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+                try:
+                    await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+                except Exception:
+                    logger.error(
+                        "drop_warm failed while unwinding a create() failure — "
+                        "tenant=%s user=%s stays wedged behind the 0141 warm-slot "
+                        "index; needs manual cleanup",
+                        tenant_id,
+                        user_id,
+                        exc_info=True,
+                    )
             raise
 
     async def _create(

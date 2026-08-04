@@ -18,11 +18,13 @@ SDK 用假件替身:真实 SDK 调用在契约测试(Task 10)与端到端(Task 1
 * ``FakeInstanceStore`` 加 ``get_container_id``——brief Step 6 原文就说明
   "FakeInstanceStore 跟着加",不是遗漏;``claim_warm`` 的返回类型 + "赢家
   还在创建中则 raise" 改成与两个生产 store(SQL/内存)同语义(审查
-  Important-3/4,详见类 docstring)。
+  Important-3/4,详见类 docstring);再加 ``drop_warm_fails`` 开关(二审
+  Critical)—— 覆盖"CAS 回滚本身也失败"这条路径。
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
@@ -111,6 +113,8 @@ class FakeInstanceStore:
 
     warm: dict[tuple[UUID, UUID], UUID] = field(default_factory=dict)
     rows: dict[UUID, dict] = field(default_factory=dict)
+    #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。
+    drop_warm_fails: bool = False
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -140,6 +144,8 @@ class FakeInstanceStore:
                 del self.warm[key]
 
     async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        if self.drop_warm_fails:
+            raise RuntimeError("drop_warm unavailable (db blip)")
         self.warm.pop((tenant_id, user_id), None)
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
@@ -252,6 +258,29 @@ async def test_create_failure_releases_warm_slot() -> None:
     sdk.create_fails = False
     sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
     assert store.rows[sandbox_id]["container_id"] == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_create_failure_rollback_does_not_mask_original_error() -> None:
+    """二审 Critical:``_create_and_track`` 的清理步骤(``drop_warm``)自己
+    也可能失败(DB 抖动/连接池耗尽/网络分区)。撤销清理前,``except
+    Exception: ... await self.store.drop_warm(...); raise`` 里如果
+    ``drop_warm`` 抛出,第 392 行的 ``raise`` 永远执行不到 —— 冒出去的是
+    ``drop_warm`` 的异常,不是原始的 ``_create()`` 失败:①调用方按
+    ``SandboxSupervisorError`` 设计的 except 链接不住(类型变了)②热会话
+    行照样卡死(回滚没做成),Critical-2 描述的症状在自己的失败路径上原样
+    重演,只是往下多埋一层。
+
+    这里验证修复后的行为:``drop_warm`` 失败被吞掉(只记日志),但外层
+    重新抛出的仍然是 ``_create()`` 触发的那个 ``SandboxSupervisorError``。
+    """
+    sdk = FakeSdk(create_fails=True)
+    store = FakeInstanceStore(drop_warm_fails=True)
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    with pytest.raises(SandboxSupervisorError, match="sandbox create failed"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
 
 
 @pytest.mark.asyncio
@@ -378,3 +407,34 @@ async def test_ensure_e2b_patched_sets_domain_env_before_patching(monkeypatch) -
     assert seen["E2B_DOMAIN"] == "gw.example.com"
     assert seen["E2B_API_KEY"] == "k"
     assert seen["https"] is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_e2b_patched_warns_on_domain_mismatch(monkeypatch, caplog) -> None:
+    """二审建议(已采纳)——``setdefault`` 保持"运维显式设置优先"这条语义
+    不变,但如果预设的 ``E2B_DOMAIN`` 真的跟这次 ``AgentSandboxClient`` 的
+    ``domain`` 不一致,``patch_e2b()`` 会把(旧的)预设值一次性烤进
+    ``E2B_API_URL``、之后不再重读,而 ``create``/``connect`` 每次仍然把
+    正确的 ``domain`` 当 kwarg 传给 SDK —— 两边不一致时报出来的是让人摸不
+    着头脑的认证/网络错,不是"连不上"那种一眼能看懂的信号。这里验证不
+    一致时至少有一条 warning 日志把这个歧义摆到明面上,且 ``setdefault``
+    行为本身不变(预设值仍然生效,不被覆盖)。
+
+    ``caplog.at_level(..., logger="orchestrator.tools.agent_sandbox")`` 把
+    断言收紧到自家 logger——仓内已有先例(#1077)证明不这样做容易被其它
+    模块的噪音日志(如 otel exporter)搞出 flaky。
+    """
+    import orchestrator.tools.agent_sandbox as mod
+
+    monkeypatch.setenv("E2B_DOMAIN", "stale.example.com")
+    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.setattr(mod, "_e2b_patched", False)
+    monkeypatch.setattr("kruise_agents.patch_e2b.patch_e2b", lambda **_: None)
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator.tools.agent_sandbox"):
+        mod._ensure_e2b_patched(domain="gw.example.com", api_key="k")
+
+    assert "stale.example.com" in caplog.text
+    assert "gw.example.com" in caplog.text
+    # setdefault 语义不变 —— 预设值仍然生效,不被这次调用覆盖。
+    assert os.environ["E2B_DOMAIN"] == "stale.example.com"
