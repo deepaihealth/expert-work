@@ -590,11 +590,11 @@ async def test_ensure_e2b_patched_sets_domain_env_before_patching(monkeypatch) -
     用 ``monkeypatch`` 把真正的 ``kruise_agents.patch_e2b`` 换成一个只记录
     调用瞬间 ``os.environ`` 状态的替身——既不用真的跑私有协议 monkeypatch
     (避免污染同一 pytest 进程里的其它测试,这正是本模块整体设计要严格
-    避免的那类全局副作用,见 agent_sandbox.py 模块 docstring),又能验证
+    避免的那类全局副作用,见 e2b_patch.py 模块 docstring),又能验证
     "env 先设、patch 后调"这个顺序关系。``monkeypatch`` 的自动回滚保证
     ``_e2b_patched`` 在测试结束后仍是 ``False``,不影响其它测试。
     """
-    import orchestrator.tools.agent_sandbox as mod
+    import orchestrator.tools.e2b_patch as mod
 
     monkeypatch.delenv("E2B_DOMAIN", raising=False)
     monkeypatch.delenv("E2B_API_KEY", raising=False)
@@ -628,18 +628,18 @@ async def test_ensure_e2b_patched_warns_on_domain_mismatch(monkeypatch, caplog) 
     一致时至少有一条 warning 日志把这个歧义摆到明面上,且 ``setdefault``
     行为本身不变(预设值仍然生效,不被覆盖)。
 
-    ``caplog.at_level(..., logger="orchestrator.tools.agent_sandbox")`` 把
+    ``caplog.at_level(..., logger="orchestrator.tools.e2b_patch")`` 把
     断言收紧到自家 logger——仓内已有先例(#1077)证明不这样做容易被其它
     模块的噪音日志(如 otel exporter)搞出 flaky。
     """
-    import orchestrator.tools.agent_sandbox as mod
+    import orchestrator.tools.e2b_patch as mod
 
     monkeypatch.setenv("E2B_DOMAIN", "stale.example.com")
     monkeypatch.delenv("E2B_API_KEY", raising=False)
     monkeypatch.setattr(mod, "_e2b_patched", False)
     monkeypatch.setattr("kruise_agents.patch_e2b.patch_e2b", lambda **_: None)
 
-    with caplog.at_level(logging.WARNING, logger="orchestrator.tools.agent_sandbox"):
+    with caplog.at_level(logging.WARNING, logger="orchestrator.tools.e2b_patch"):
         mod._ensure_e2b_patched(domain="gw.example.com", api_key="k")
 
     assert "stale.example.com" in caplog.text
