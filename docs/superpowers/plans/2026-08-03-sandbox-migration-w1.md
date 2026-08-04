@@ -1928,7 +1928,7 @@ configmap-patch 加三项(`EXPERT_WORK_SANDBOX_BACKEND=agent_sandbox` /
 | # | 验收项 | 结果 |
 |---|---|---|
 | 0 | 配置→工厂→SDK→集群 直连 | ✅ `acquire` 0.3s(池领取)/ `exec` 出 `5050` / `destroy` ok |
-| 1 | 真 agent 跑 `exec_python` | ⏳ 待人工(见下) |
+| 1 | 真 agent 跑 `exec_python` | ✅ 工具真被调、标「成功」、答出 5050、run 正常结束(glm-5.2,2 步,22.6s);⚠️ 调试台结果区显示不出 stdout / 退出码,见「发现五」 |
 | 2 | 出网经 credential-proxy 且审计落表 | ✅ HTTPS `verdict='allowed'` bytes_up=1820 bytes_down=36247;⚠️ 明文 HTTP 407,见「发现三」 |
 | 3 | 热会话复用 | ✅ 第二次 `acquire` 0.05s(第一次 0.47s),返回同一 `sandbox_id`,`container_id` 相同,`last_used_at` 被写 |
 | 4 | reap 拆干净 | ✅ `reaped_count=2`,全表 `destroyed_at IS NULL` 归零(含一条崩溃遗留的孤儿行) |
@@ -1941,9 +1941,9 @@ configmap-patch 加三项(`EXPERT_WORK_SANDBOX_BACKEND=agent_sandbox` /
 正是验收 2 脚本中途崩溃留下的 `container_id IS NULL` 行 —— Task 9 I-1 修的
 `list_stuck_creating` 正是为这类行存在的,真栈上验到了。
 
-### 验收 1 为什么没做完
+### 验收 1 的执行方式
 
-需要在调试台建 agent 发消息。走 HTTP API 自动化要 token,而 Keycloak 的
+由人在调试台完成,不是自动化的。走 HTTP API 自动化要 token,而 Keycloak 的
 `expert-work-admin-ui` client 未开 direct access grants:
 
 ```
@@ -1952,14 +1952,13 @@ configmap-patch 加三项(`EXPERT_WORK_SANDBOX_BACKEND=agent_sandbox` /
 ```
 
 开它是账户设置变更,且真 agent 还需要租户已配 LLM 凭据(凭据只由人从 admin UI
-粘进加密金库)。两项都超出本任务能自行决定的范围,故留人工:
+粘进加密金库)。两项都超出本任务能自行决定的范围。
 
-> 调试台 → 建一个声明了 `exec_python` 的 agent → 发「用 Python 算 1 到 100 的和并打印」
-> → 期望工具卡出现 `exec_python`、输出含 `5050`、run 正常结束。
-
-验收 0/2/3/4 已经覆盖了 runtime 层到集群的全部路径;验收 1 独有的增量是
-**build_fn 注入 → `_EgressBindingClient` 包装 → tools 节点捕获
-`SandboxSupervisorError`** 这段 agent 构建期接线。
+实测结果:agent 发「用 Python 算 1 到 100 的和并打印」,LLM 选择调
+`exec_python`,入参 `total = sum(range(1, 101))`,工具卡标「成功」,最终答案
+5050,run 正常结束。这一项独有的增量 —— **build_fn 注入 →
+`_EgressBindingClient` 包装 → tools 节点捕获 `SandboxSupervisorError`** 这段
+agent 构建期接线 —— 由此覆盖。
 
 ### 发现一:control-plane 镜像构建断在 `kruise-agents`(已修 `e9ab7ca7`)
 
@@ -2020,6 +2019,44 @@ http://www.baidu.com  -> HTTPError 407              # 不通
 `sandbox_backend="agent_sandbox"` 但三项 E2B 配置任一为空时 `return None`,
 表现为"声明了 `exec_python` 的 agent 构建期失败",而不是"沙箱配置不完整"。
 配错一个字母时的排查体验很差。波 2 值得改成显式抛错。
+
+### 发现五:调试台显示不出沙箱工具的 stdout 与退出码(既有缺陷,非本波引入)
+
+验收 1 的工具卡标「成功」、答案也对,但展开「结果」只有一个红色的
+`退出码: ?`,stdout 一行不显示。
+
+根因是两个既有机制相撞:
+
+1. `builder.py:2830` 对每个工具结果做 spotlight(PI-1b 间接注入防御),
+   其中 `datamark()`(`expert-work-common/spotlight.py:57`)把**每一段空白
+   替换成 `▁ `** —— 换行首当其冲。
+2. 前端 `parseExecResult`(`apps/admin-ui/src/api/tool_timeline.ts:76`)是
+   **从渲染后的文本里正则抠**结构:`/\nexit_code:\s*(-?\d+)\s*$/` 找退出码,
+   `indexOf("stdout:\n")` 找 stdout 段。
+
+datamark 之后一个 `\n` 都不剩,两个都必然失配:
+
+```
+后端 ToolResult.content   'stdout:\n1 到 100 的和是: 5050\n\n\nexit_code: 0'   ← 正则匹配得到 0
+前端拿到的 preview        'stdout:▁ 1▁ 到▁ 100▁ 的和是:▁ 5050▁ exit_code:▁ 0'  ← 正则 None,find 返回 -1
+```
+
+`stripFence` 只剥 `«UNTRUSTED nonce=…»` 标记,不还原 datamark(datamark 本就
+不可逆 —— `\n\n\n` 和 ` ` 都变成同一个 `▁ `)。
+
+**不是迁移引入的**:`datamark` / `format_sandbox_outcome` / `parseExecResult`
+三处本波都没碰,supervisor 后端走同一条渲染+spotlight 路径,现象必然一样。
+这个环境此前从没真跑过 `exec_python`(sandbox-supervisor 从未上过集群),
+所以这是它第一次被看见。
+
+修法(前端为主,follow-up 单独做):
+
+- **退出码**:改从 `ToolMessage.artifact` 读 —— 那正是 `ToolResult.meta`
+  (`builder.py:2834` 注释写明),里面 `exit_code` / `timed_out` / `truncated`
+  都是结构化的,前端也已经在读 `m.artifact` 拿 `trigger_id`。从被防御机制
+  改写过的文本里正则抠结构,本来就是脆的。
+- **stdout / stderr**:artifact 里目前没有,要显示得让后端把两段也放进
+  `meta`。这一步跨前后端,值得和上一条一起做成一个 follow-up。
 
 ### 给波 2 的注意事项
 
