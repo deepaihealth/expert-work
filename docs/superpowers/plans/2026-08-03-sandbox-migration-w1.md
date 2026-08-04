@@ -2058,6 +2058,71 @@ datamark 之后一个 `\n` 都不剩,两个都必然失配:
 - **stdout / stderr**:artifact 里目前没有,要显示得让后端把两段也放进
   `meta`。这一步跨前后端,值得和上一条一起做成一个 follow-up。
 
+### 全分支终审后的修复与真栈复验(2026-08-04)
+
+十一个任务各自过了审,之后一轮全分支终审把整条分支当一个改动看,逮到
+**1 Critical + 6 Important** —— 全是落在任务边界之间、单任务审查结构上看不见的东西。
+修复共 10 个 commit(`b89cb348..4f852e90`),全仓 6799 passed。
+
+| # | 问题 | 真栈复验 |
+|---|---|---|
+| C-1 | 进程死在 `claim_warm` 与 `set_container_id` 之间 → 那个 `(tenant,user)` **永久卡死**,无任何自动路径能清。**验收时已真实发生过一次** | 单测 + 真 PG 集成测 |
+| I-1 | `release()` 对无 `user_id` 沙箱是空转(supervisor 会销毁),且**全仓没有任何东西周期性 `reap`**(supervisor 有后台 reaper,云实现没有)→ 微 VM 与 DB 行双双无界泄漏 | 新 `SandboxReapWorker` |
+| I-2 | envd 派生的进程**不继承镜像的 `ENV`/`WORKDIR`** | ✅ 见下 |
+| I-4 | `create()` 不传 `timeout` → 平台默认 300s + `on_timeout="kill"`,而 `release()` 的 docstring 在讲不存在的休眠 | ✅ 见下 |
+| I-6 | `create()` 之后、`set_container_id` 之前失败 → 漏一个活 microVM,`destroy`/`reap`/`list_stuck_creating` 全都永远找不到它 | 变异双向验过 |
+
+I-2 / I-4 实现者够不着集群,发 `4f852e90` 后补的真栈复验:
+
+```
+cwd        = /workspace                        (修前 /home/agent)
+HOME       = /workspace                        (修前 /home/agent)
+PIP_USER   = 1                                 (修前 None)
+LANG       = zh_CN.UTF-8                       (修前 None)
+MPLCONFIG  = /workspace/.mplconfig             (修前 None)
+相对路径写入 → /workspace/probe-relative.txt    (修前 /home/agent/…)
+matplotlib   ok,配置目录 /workspace/.mplconfig
+存活窗口     1203s(期望 1200 = _SANDBOX_TIMEOUT_S,修前 300)
+reconnect    end_at 再推后 → connect(timeout=) 真的续钟
+```
+
+顺带实证了 `PIP_USER=1` 确有必要:`/usr/local/lib/python3.12/site-packages` 对
+uid 10000 的 `agent` **不可写**(实际写入拿 `PermissionError`),global 装必失败。
+
+### 发现六:`pip install` 装得上,但装完 import 不到(既有缺陷,非本波引入)
+
+顺着上一条往下测,发现镜像 `PIP_USER=1` 的设计意图从来没真正成立过:
+
+```
+pip exit = 0    Successfully installed tinynetrc-1.3.1
+落点            /workspace/.local/lib/python3.12/site-packages/tinynetrc.py
+执行进程        sys.flags.no_user_site = 1   isolated = 1
+user site 在 sys.path?  False
+sys.path        ['…/python312.zip', '…/python3.12', '…/lib-dynload', '…/site-packages']
+裸 python -c import → OK /workspace/.local/…/tinynetrc.py
+```
+
+`runner.py:54` 是 `[sys.executable, "-I", "-c", code]`,`AgentSandboxClient` 是
+`python -I <path>` —— **`-I` 等于 `-E -s`,而 `-s` 的作用就是把 user site 踢出
+`sys.path`**。于是 `PIP_USER=1` 把包装进 `$HOME/.local`,执行代码的解释器又恰好
+看不见那里。
+
+`infra/sandbox-image/Dockerfile:153` 的注释写着"user-site is on sys.path
+automatically, so a bare `pip install X` just works for the agent" —— 与
+`sitecustomize.py` 自己的 docstring(明写 `-I` 忽略 user site dir)直接矛盾,
+两句不可能同时为真。
+
+**两个后端同病**,非本波引入:同一个 `-I`、同一个镜像。影响是产品级的 ——
+agent 装完包用不了,而且 `pip` 返回 0、没有任何错误提示。
+
+修法二选一,都在本波之外:执行时把 user site 显式加回 `sys.path`(例如
+`PYTHONPATH` + 去掉 `-E`,或在 `sitecustomize` 里 `site.addsitedir`),或者干脆
+放弃 `PIP_USER`、给沙箱一个可写的 venv。选哪条要连 `-I` 的隔离意图一起想清楚。
+
+附带一提:`SANDBOX_IMAGE_ENV` 里的 `PYTHONDONTWRITEBYTECODE` / `PYTHONUNBUFFERED`
+对 `python -I` 同样无效(`-E` 忽略所有 `PYTHON*`)。传着无害 —— 沙箱里其它由
+agent 自己起的 python 进程会继承 —— 但别以为它们对 `exec_python` 生效。
+
 ### 给波 2 的注意事项
 
 1. **SandboxSet 仍在 `default` namespace**,control-plane 在 `expert-work`。
