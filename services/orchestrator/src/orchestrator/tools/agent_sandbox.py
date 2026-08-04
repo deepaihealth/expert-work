@@ -275,6 +275,35 @@ class AgentSandboxClient:
 
         return AsyncSandbox
 
+    def _sdk_exceptions(self) -> tuple[Any, Any]:
+        """``(TimeoutException, CommandExitException)`` —— ``exec`` 的
+        ``except`` 子句要用的两个真实 ``e2b`` 异常类。是 :meth:`_sdk` 的
+        兄弟方法,不是又一个独立的 import 入口:``_sdk`` 收敛成唯一入口的
+        全部理由,就是让正确性不依赖调用顺序——如果这里改成"反正 ``exec``
+        总是先 ``_attach`` → ``_sdk``,到这行时补丁必然已经打过",这个推理
+        今天是对的,但恰恰是单一入口这个设计本来要消灭的那种"靠调用顺序
+        成立"的论证;下一个人抄这个写法加第三个符号时未必会重新验证。
+
+        生产/测试分支与 :meth:`_sdk` 完全对应:``self.sdk is None``(真实
+        SDK)先 ``_ensure_e2b_patched`` 再 import;``self.sdk`` 非 ``None``
+        (单测注入 :class:`FakeSdk`)整段跳过 ``_ensure_e2b_patched``,保持
+        模块 docstring"私有协议 + patch_e2b 导入顺序"第 3 点的不变式——
+        整套单测套件从未真正触发全局 ``kruise_agents`` 补丁。
+
+        返回 ``tuple[Any, Any]`` 而不是
+        ``tuple[type[Exception], type[Exception]]`` 是刻意的:``e2b`` 没有
+        ``py.typed`` 标记,这两个类在 mypy 下本来就是 ``Any``(见上面
+        ``sdk`` 字段的 docstring);标成更窄的 ``type[Exception]`` 会让
+        :meth:`exec` 里 ``except exit_exc as exc:`` 绑定到的异常对象被 mypy
+        收窄回裸 ``Exception``,丢失 ``CommandExitException`` 专有的
+        ``stdout``/``stderr``/``exit_code`` 属性访问。
+        """
+        if self.sdk is None:
+            _ensure_e2b_patched(domain=self.domain, api_key=self.api_key)
+        from e2b import CommandExitException, TimeoutException
+
+        return TimeoutException, CommandExitException
+
     async def _connect(self, container_id: str) -> Any:
         """裸 connect —— 不做错误处理,调用方各自决定失败策略(``acquire``
         的"唤醒失败则重建" vs ``destroy`` 的"已经不在也无妨,继续清行")。"""
@@ -560,23 +589,7 @@ class AgentSandboxClient:
         effective = max(1, min(effective, MAX_TIMEOUT_S))
 
         sbx = await self._attach(sandbox_id)
-        # 惰性 import,不放模块顶层——呼应 _sdk() 的"先 patch 后 import"顾虑
-        # (模块 docstring "私有协议 + patch_e2b 导入顺序"一节)。这里安全:
-        # e2b.exceptions 是纯异常类定义,不在 patch_e2b() 改写的 SandboxBase
-        # / ConnectionConfig / 裸环境变量那个补丁面上,导入顺序不影响其
-        # 正确性;上面 self._attach() 已经先走过 self._connect() →
-        # self._sdk(),生产模式下 _ensure_e2b_patched() 这时必然已经跑过
-        # (幂等 guard),这行拿到的是 sys.modules 里缓存的同一份 e2b,不会
-        # 重新触发任何副作用。单测走 FakeSdk 分支时 self._sdk() 从不真正
-        # import e2b(短路返回假件),但这行仍然会真的从 e2b(仓库钉死的硬
-        # 依赖 e2b==2.24.0,不是 kruise_agents 那个可选私有协议扩展包)导入
-        # 这两个类,供下面的 except 子句使用——测试 raise 的就是它们本身,
-        # 不需要额外假件类型。``CommandExitException`` 实际定义在
-        # ``e2b.sandbox.commands.command_handle``,``e2b.exceptions`` 里没有
-        # 这个名字(实测确认,不是公开文档);两者都从顶层 ``e2b`` 包(SDK
-        # 自己文档化的公开导入面,``from e2b import Sandbox`` 那种写法)导入
-        # 更稳,不依赖内部子模块路径。
-        from e2b import CommandExitException, TimeoutException
+        timeout_exc, exit_exc = self._sdk_exceptions()
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         try:
@@ -584,9 +597,9 @@ class AgentSandboxClient:
             result = await sbx.commands.run(
                 f"python -I {script}", user=SANDBOX_EXEC_USER, timeout=effective
             )
-        except TimeoutException:
+        except timeout_exc:
             return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)
-        except CommandExitException as exc:
+        except exit_exc as exc:
             return SandboxOutcome(
                 stdout=exc.stdout[:MAX_OUTPUT_CHARS],
                 stderr=exc.stderr[:MAX_OUTPUT_CHARS],
