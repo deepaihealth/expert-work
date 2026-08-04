@@ -111,6 +111,20 @@ def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _missing_row_message(sandbox_id: UUID) -> str:
+    """The single wording both stores raise when ``set_container_id`` finds no
+    live row (re-review Important-2).
+
+    Shared for the same reason :func:`_stuck_create_cutoff` is: the two
+    implementations must be identical in *meaning*, and a caller that
+    string-matches one store's error (tests do) must match the other's.
+    """
+    return (
+        f"sandbox row {sandbox_id} is gone (destroyed, or never inserted) — "
+        "cannot record its container id"
+    )
+
+
 def _stuck_create_cutoff(now: datetime) -> datetime:
     """``acquired_at`` older than this ⇒ an orphaned mid-create row.
 
@@ -317,13 +331,57 @@ class SqlSandboxInstanceStore:
             await session.commit()
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
+        """Backfill the E2B sandbox id — raises if the row is gone.
+
+        Re-review Important-2. This used to be an unguarded ``UPDATE ...
+        WHERE id``, i.e. a silent no-op when the row was absent or already
+        DESTROYED, while ``InMemorySandboxInstanceStore`` raised ``KeyError``
+        on the same input. Two stores whose predicates are not identical in
+        meaning is a failure mode this codebase has been bitten by before,
+        and C-1's takeover plus ``acquire``'s rebuild path both made "row
+        absent or destroyed" *reachable*, so the two backends started taking
+        opposite branches on identical production input.
+
+        Both now reject. Rationale for reject over tolerate: this write is
+        not idempotent bookkeeping, it is the second half of a two-phase
+        claim — the row IS the CAS credential. If it silently no-ops, the
+        caller's ``acquire`` returns a ``sandbox_id`` that exists nowhere
+        while its microVM is already running on the platform, invisible to
+        ``destroy`` (``get_container_id`` → ``None``), to ``reap``
+        (``list_active`` keys off the row) and to ``list_stuck_creating``
+        — leaked until the 20-minute platform timeout, with the run's next
+        ``exec`` failing on a baffling "has no recorded container id".
+        Raising instead lets ``AgentSandboxClient``'s post-create guard do
+        what it was built for: kill the sandbox nobody remembers, unwind the
+        slot, and surface one retryable error. Reject is also what the rest
+        of the system already assumed — the in-memory store, the
+        orchestrator's ``FakeInstanceStore``, and ``acquire``'s own comment
+        on the rebuild path all say "this raises"; the SQL store was the
+        only dissenter.
+
+        The ``state``/``destroyed_at`` predicates are what make "already
+        DESTROYED" reject too: without them the UPDATE would happily write
+        ``container_id`` onto a terminal row and resurrect it for
+        :meth:`get_container_id`.
+        """
         async with self._sf() as session:
-            await session.execute(
+            result = await session.execute(
                 sa_update(SandboxInstanceRow)
-                .where(SandboxInstanceRow.id == sandbox_id)
+                .where(
+                    SandboxInstanceRow.id == sandbox_id,
+                    SandboxInstanceRow.state == _STATE_IN_USE,
+                    SandboxInstanceRow.destroyed_at.is_(None),
+                )
                 .values(container_id=container_id)
             )
             await session.commit()
+        # ``CursorResult`` exposes ``rowcount``; the generic ``Result`` type
+        # does not — same ``getattr`` spelling as the runtime package's stores
+        # (``runs/store.py``, ``event_log/db.py``). Default 0 is the safe
+        # direction here: an implementation that stopped reporting rowcount
+        # would make this raise, not silently go back to no-op.
+        if int(getattr(result, "rowcount", 0) or 0) == 0:
+            raise RuntimeError(_missing_row_message(sandbox_id))
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
         async with self._sf() as session:
@@ -534,7 +592,23 @@ class InMemorySandboxInstanceStore:
         self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=None)
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
-        self._rows[sandbox_id].container_id = container_id
+        """Mirrors :meth:`SqlSandboxInstanceStore.set_container_id` — raises
+        when the row is gone (re-review Important-2; that method's docstring
+        carries the full reasoning for reject-over-tolerate).
+
+        This already raised, but as a bare ``KeyError`` from ``self._rows[...]``
+        — a different exception type, a different message, and (crucially) an
+        *incidental* one: a reader could not tell it was contractual rather
+        than a missed ``.get()``. Now it is explicit and shares
+        :func:`_missing_row_message` with the SQL store, so both stores are
+        identical in meaning AND in wording. ``_rows`` only ever holds live
+        rows (``mark_destroyed`` pops them), so "absent" here already covers
+        the SQL store's ``state``/``destroyed_at`` predicates.
+        """
+        row = self._rows.get(sandbox_id)
+        if row is None:
+            raise RuntimeError(_missing_row_message(sandbox_id))
+        row.container_id = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
         del reason

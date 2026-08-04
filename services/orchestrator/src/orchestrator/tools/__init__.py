@@ -7,9 +7,6 @@ Concrete tool adapters land in their own modules (``web_search`` E.7,
 """
 
 from orchestrator.tools.agent_sandbox import (
-    SANDBOX_EXEC_USER as SANDBOX_EXEC_USER,
-)
-from orchestrator.tools.agent_sandbox import (
     AgentSandboxClient as AgentSandboxClient,
 )
 from orchestrator.tools.artifact import (
@@ -173,6 +170,9 @@ from orchestrator.tools.sandbox import (
 )
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
+)
+from orchestrator.tools.sandbox_image_contract import (
+    SANDBOX_EXEC_USER as SANDBOX_EXEC_USER,
 )
 from orchestrator.tools.sandbox_instance_store import (
     SandboxInstanceStore as SandboxInstanceStore,

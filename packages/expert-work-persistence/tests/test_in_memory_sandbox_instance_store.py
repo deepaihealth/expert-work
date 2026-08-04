@@ -23,6 +23,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _REASON_STUCK_CREATE_TAKEOVER,
     _STUCK_CREATE_TTL_S,
     InMemorySandboxInstanceStore,
+    _missing_row_message,
 )
 
 
@@ -98,3 +99,60 @@ async def test_stuck_create_takeover_reason_is_shared_by_both_stores() -> None:
     没有各写各的字面量"。
     """
     assert _REASON_STUCK_CREATE_TAKEOVER == "stuck_create_takeover"
+
+
+# ---------------------------------------------------------------------------
+# 再审 Important-2 —— set_container_id 的"行不在则 raise"契约,内存侧。
+# 与 test_sql_sandbox_instance_store.py 里同名的三条一一对应:那三条在真
+# Postgres 上验 state/destroyed_at 两个谓词,这三条验内存实现给出**逐字同义**
+# 的结果。两边共用 _missing_row_message,连措辞都不许各写各的。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_rejects_a_row_that_never_existed() -> None:
+    store = InMemorySandboxInstanceStore()
+
+    with pytest.raises(RuntimeError, match="is gone"):
+        await store.set_container_id(sandbox_id=uuid4(), container_id="sbx-nowhere")
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_rejects_an_already_destroyed_row() -> None:
+    """内存实现的 ``mark_destroyed`` 直接把行丢了,所以"已销毁"与"从未存在"
+    在这里物理上是同一个状态——而 SQL 侧它们是两个不同的物理状态(行还在,
+    只是 state/destroyed_at 变了)。两边可观测行为必须一样,这正是要分开写
+    两条而不是合并成一条的原因。"""
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason=_REASON_STUCK_CREATE_TAKEOVER)
+
+    with pytest.raises(RuntimeError, match="is gone"):
+        await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-too-late")
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_still_backfills_a_live_row() -> None:
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
+
+    assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-live"
+
+
+@pytest.mark.asyncio
+async def test_both_stores_share_one_missing_row_wording() -> None:
+    """措辞也共享(``_missing_row_message``)——上面六条都 ``match="is gone"``,
+    两边各写各的字面量的话,这个断言会红,而不是"两条测试各自绿、生产上两个
+    后端给出不同错误"。"""
+    sandbox_id = uuid4()
+    message = _missing_row_message(sandbox_id)
+    assert str(sandbox_id) in message
+    assert "is gone" in message

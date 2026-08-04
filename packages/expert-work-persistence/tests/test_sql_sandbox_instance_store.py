@@ -668,3 +668,79 @@ async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
     assert state == "DESTROYED"
     assert destroyed_at is not None
     assert destroy_reason == _REASON_STUCK_CREATE_TAKEOVER
+
+
+# ---------------------------------------------------------------------------
+# 再审 Important-2 —— set_container_id 对"行不在/已销毁"的处置。
+#
+# 这是两个 store 语义分歧最要命的一处:SQL 侧原来是裸 UPDATE ... WHERE id,
+# 0 行照样提交、照样返回 None(成功),而内存实现是 KeyError。C-1 的接管与
+# acquire 的重建路径都让这个输入变成**可达**的,两个后端于是在同一个生产输入
+# 上走了相反的分支。现在两边都 raise —— 下面三条钉 SQL 侧,内存侧的同名三条
+# 在 test_in_memory_sandbox_instance_store.py。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_rejects_a_row_that_never_existed(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """从未 INSERT 过的 id:此前是 0 行 UPDATE + 静默成功。
+
+    静默的代价不是"少写一行":调用方 ``acquire`` 会带着一个哪儿都不存在的
+    ``sandbox_id`` 正常返回,而它的 microVM 已经在平台上跑着 —— destroy /
+    reap / list_stuck_creating 三条回收路径全都按行找,谁也看不见它。
+    """
+    with pytest.raises(RuntimeError, match="is gone"):
+        await store.set_container_id(sandbox_id=uuid4(), container_id="sbx-nowhere")
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_rejects_an_already_destroyed_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """已销毁的行同样 raise —— 这正是 C-1 接管之后调用方 A 的处境。
+
+    SQL 与内存在这里的**物理**状态本就不同(SQL 的 mark_destroyed 是 UPDATE,
+    行还在表里;内存实现直接把行丢了),所以光靠"按 id 找得到吗"对不齐,
+    WHERE 必须显式带上 state/destroyed_at 两个谓词。顺带断言那行没被写脏:
+    没有这两个谓词的话 UPDATE 会把 container_id 写到一个终态行上,把它对
+    ``get_container_id`` 复活。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason=_REASON_STUCK_CREATE_TAKEOVER)
+
+    with pytest.raises(RuntimeError, match="is gone"):
+        await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-too-late")
+
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            container_id = (
+                await conn.execute(
+                    select(SandboxInstanceRow.container_id).where(
+                        SandboxInstanceRow.id == sandbox_id
+                    )
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+    assert container_id is None, "终态行不能被回填复活"
+
+
+@pytest.mark.asyncio
+async def test_set_container_id_still_backfills_a_live_row(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """收紧后的 WHERE 不能误伤正常路径 —— 这是唯一真正跑在热路径上的那条。"""
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+    )
+
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
+
+    assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-live"

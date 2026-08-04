@@ -269,7 +269,13 @@ class FakeInstanceStore:
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         if self.set_container_id_fails:
             raise RuntimeError("set_container_id unavailable (db blip)")
-        self.rows[sandbox_id]["container_id"] = container_id
+        row = self.rows.get(sandbox_id)
+        if row is None:
+            # 再审 Important-2 —— 契约是"行不在/已销毁必须 raise"。此前这里
+            # 是 self.rows[sandbox_id][...] 的裸 KeyError:行为碰巧对,但看不
+            # 出是契约还是漏了个 .get()。显式化,与两个生产 store 对齐。
+            raise RuntimeError(f"sandbox row {sandbox_id} is gone")
+        row["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
         if self.mark_destroyed_fails or sandbox_id in self.mark_destroyed_fails_for:
@@ -1082,6 +1088,54 @@ async def test_unwind_after_a_takeover_leaves_the_new_owners_row_alone() -> None
     assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) == (
         b_id,
         "sbx-B",
+    )
+
+
+@pytest.mark.asyncio
+async def test_caller_a_fails_loudly_after_its_row_was_taken_over() -> None:
+    """再审 Important-2 的客户端侧后果——被接管的调用方 A 自己会怎样。
+
+    与 ``test_unwind_after_a_takeover_leaves_the_new_owners_row_alone`` 同一个
+    交错,但 A 这次**不**在种子文件上失败:它一路走到回填。它的行早就被 B 接
+    管掉了,所以 ``set_container_id`` 按契约抛错(再审 Important-2:两个生产
+    store 现在都 raise,而不是 SQL 静默 no-op、内存 KeyError 各走各的)。
+
+    修复前的 SQL 语义下这里是最坏的结果:回填静默成功 → ``acquire`` 正常返回
+    → 一个 ``(tenant, user)`` 上两个活 microVM,A 那个的行是终态,
+    ``list_active`` 看不见 ⇒ 周期 reap 永远收不走它,只有 ``release()``
+    (进程活到那一步的话)或 20 分钟平台超时能收。
+
+    修复后:抛错被 Important-6 的守卫接住 —— kill 掉 A 自己那个没人记得的沙
+    箱、unwind(对早已销毁的 A 行是 no-op,按 N-1 不碰 B)、冒泡成可重试的
+    ``SandboxSupervisorError``。B 全程无感。
+    """
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sdk_b = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-B"))
+    client_b = make_client(sdk_b, store)
+    b_id: UUID | None = None
+
+    async def _b_takes_over_while_a_is_still_creating() -> None:
+        nonlocal b_id
+        _backdate_pending_rows(store)
+        b_id = await client_b.acquire(tenant_id=tenant_id, thread_id="B", user_id=user_id)
+
+    sdk_a = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-A"))
+    sdk_a.on_create = _b_takes_over_while_a_is_still_creating
+    client_a = make_client(sdk_a, store)
+
+    with pytest.raises(SandboxSupervisorError, match="post-create setup failed"):
+        await client_a.acquire(tenant_id=tenant_id, thread_id="A", user_id=user_id)
+
+    assert b_id is not None, "前置没成立:B 的接管压根没跑到"
+    assert sdk_a.sandbox.killed is True, (
+        "A 的行已经不归它了,回填必须抛错、沙箱必须当场 kill —— 否则这是一个"
+        "谁也回收不了的 microVM(reap 按行找,而那一行是终态)"
+    )
+    assert sdk_b.sandbox.killed is False
+    assert await store.list_active(only_idle=False) == [(b_id, "sbx-B")], (
+        "整个 (tenant, user) 上只该剩 B 一个活跃沙箱"
     )
 
 

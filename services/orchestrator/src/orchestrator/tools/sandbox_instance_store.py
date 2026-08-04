@@ -84,8 +84,29 @@ class SandboxInstanceStore(Protocol):
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         """回填 E2B sandbox id。只应在调用方本次自己创建/重建了沙箱时调用
         ——connect 到一个早已就绪的热会话时,该行的 container_id 已经是对的,
-        重复回填对 SQL 实现是浪费,对某些手写假件实现甚至可能因为该
-        ``sandbox_id`` 从未被插入而出错。"""
+        重复回填是浪费。
+
+        再审 Important-2 —— 这一条从"允许实现各行其是"收紧成硬契约:
+        **那一行不存在、或已经是终态(销毁)时,实现必须 raise,不许静默
+        no-op**。此前 SQL 实现是裸 ``UPDATE ... WHERE id``(0 行照样提交、
+        照样返回),内存实现是 ``KeyError`` —— 同一个输入两个后端走相反分支,
+        而 C-1 的接管与 ``acquire`` 重建路径都让"行不在/已销毁"变成**可达**
+        输入,不是理论边界。
+
+        为什么选 raise 而不是选"两边都静默":这次写不是幂等记账,它是两段式
+        占坑的后半段——那一行本身就是 CAS 的凭据。静默的话 ``acquire`` 会返
+        回一个哪儿都不存在的 ``sandbox_id``,而它的 microVM 已经在平台上跑
+        着:``destroy`` 找不到它(``get_container_id`` 返 ``None``)、
+        ``reap`` 找不到它(``list_active`` 按行找)、``list_stuck_creating``
+        也找不到它,只能等 20 分钟平台超时,期间这个 run 的下一次 ``exec``
+        报一句莫名其妙的 "has no recorded container id"。raise 则让
+        ``AgentSandboxClient`` 那层 Important-6 守卫做它本来该做的事:kill
+        掉没人记得的沙箱、让出槽位、冒泡一个可重试的错误。
+
+        调用方必须处理这个异常。今天唯一的生产调用点是 ``acquire`` 的
+        post-create 块,它本来就在 ``try`` 里(Important-6),归一成
+        ``SandboxSupervisorError``。
+        """
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
         """标记销毁并让出热会话坑。
