@@ -210,7 +210,7 @@ async def test_get_container_id_unknown_sandbox_returns_none(
 # 生产 store)的 acquire 调用此前无一例外都传了 user_id,这条路径完全没有
 # 测试覆盖过,直到契约测试第一次用真实 store 跑通"acquire 不带 user_id 再
 # exec"这条链路才当场炸穿。完整理由见
-# orchestrator.tools.agent_sandbox.SandboxInstanceStore.create_ephemeral 的
+# orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.create_ephemeral 的
 # docstring。
 # ---------------------------------------------------------------------------
 

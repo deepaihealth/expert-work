@@ -12,9 +12,6 @@ from orchestrator.tools.agent_sandbox import (
 from orchestrator.tools.agent_sandbox import (
     AgentSandboxClient as AgentSandboxClient,
 )
-from orchestrator.tools.agent_sandbox import (
-    SandboxInstanceStore as SandboxInstanceStore,
-)
 from orchestrator.tools.artifact import (
     ListArtifactsTool as ListArtifactsTool,
 )
@@ -176,6 +173,9 @@ from orchestrator.tools.sandbox import (
 )
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
+)
+from orchestrator.tools.sandbox_instance_store import (
+    SandboxInstanceStore as SandboxInstanceStore,
 )
 from orchestrator.tools.subagent import (
     MAX_SUBAGENT_DEPTH as MAX_SUBAGENT_DEPTH,

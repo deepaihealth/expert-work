@@ -6,7 +6,7 @@ manages — the migration-0141 brief and
 ``docs/superpowers/specs/2026-08-03-sandbox-migration-design.md`` § 6.2 are
 explicit that ``AgentSandboxClient`` reuses the existing ``container_id``
 column rather than adding one. This module only implements the narrow
-operations :class:`orchestrator.tools.agent_sandbox.SandboxInstanceStore`
+operations :class:`orchestrator.tools.sandbox_instance_store.SandboxInstanceStore`
 (a :class:`typing.Protocol` — structural typing, no inheritance needed)
 declares; it does not import from ``orchestrator`` (persistence must not
 depend upward on a consuming service) and does not import
@@ -103,7 +103,7 @@ def _utc_now() -> datetime:
 class SqlSandboxInstanceStore:
     """SQL-backed store for :class:`AgentSandboxClient`'s warm-session CAS.
 
-    Structurally implements ``orchestrator.tools.agent_sandbox.SandboxInstanceStore``
+    Structurally implements ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore``
     (a ``Protocol`` — no formal inheritance; see module docstring for why no
     local ABC is declared here).
     """
@@ -219,7 +219,7 @@ class SqlSandboxInstanceStore:
 
     async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
         """Task 10 契约测试实测发现的缺口——完整理由见
-        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.create_ephemeral``
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.create_ephemeral``
         的 docstring。``user_id=None`` 显式排除在迁移 0141 的部分唯一索引
         (``WHERE ... AND user_id IS NOT NULL``)之外,所以这里不需要
         :meth:`claim_warm` 那套"conflict → 重新 SELECT 判断"的 CAS 逻辑,
@@ -303,7 +303,7 @@ class SqlSandboxInstanceStore:
 
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """Independent-review Important-2 —
-        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.touch_and_get_container_id``'s
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.touch_and_get_container_id``'s
         full contract docstring covers the "why" (``exec`` must advance
         ``last_used_at`` or the idle sweep degrades to "time since
         acquire"). One ``UPDATE ... RETURNING`` round trip, not a separate
@@ -325,7 +325,7 @@ class SqlSandboxInstanceStore:
         """Independent-review Important-1 — orphans of a process that died
         between ``claim_warm``'s commit and ``set_container_id``'s
         backfill (pod OOM-kill / eviction / rolling update). See
-        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.list_stuck_creating``
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.list_stuck_creating``
         for the full contract (only a ``force=True`` reap may call this;
         the regular idle sweep must not).
 
@@ -349,7 +349,7 @@ class SqlSandboxInstanceStore:
 
     async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
         """``AgentSandboxClient.reap`` (波 1 Task 9) 用 —— 见
-        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.list_active``
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.list_active``
         的完整契约 docstring(``only_idle`` 语义、idle 判定口径、为什么
         ``container_id`` 仍是 NULL 的行不返回)。
 
