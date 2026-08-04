@@ -6,6 +6,15 @@ Concrete tool adapters land in their own modules (``web_search`` E.7,
 :class:`ToolRegistry` at orchestrator startup.
 """
 
+from orchestrator.tools.agent_sandbox import (
+    SANDBOX_EXEC_USER as SANDBOX_EXEC_USER,
+)
+from orchestrator.tools.agent_sandbox import (
+    AgentSandboxClient as AgentSandboxClient,
+)
+from orchestrator.tools.agent_sandbox import (
+    SandboxInstanceStore as SandboxInstanceStore,
+)
 from orchestrator.tools.artifact import (
     ListArtifactsTool as ListArtifactsTool,
 )
@@ -221,6 +230,8 @@ __all__ = [
     "DEFAULT_OUTPUT_CHAR_CAP",
     "KNOWN_BUILTINS",
     "MAX_SUBAGENT_DEPTH",
+    "SANDBOX_EXEC_USER",
+    "AgentSandboxClient",
     "AllowlistProvider",
     "AskImageTool",
     "BashTool",
@@ -254,6 +265,7 @@ __all__ = [
     "RecordingWorkspaceStore",
     "Reranker",
     "RetrievedChunk",
+    "SandboxInstanceStore",
     "SandboxOutcome",
     "SandboxRuntime",
     "SandboxSupervisorError",

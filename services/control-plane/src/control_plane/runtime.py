@@ -46,6 +46,7 @@ from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
 from expert_work.persistence import ArtifactStore, KnowledgeStore
+from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.persistence.trigger import TriggerStore
@@ -102,6 +103,7 @@ from orchestrator.multimodal import (
     ObjectStoreImageResolver,
 )
 from orchestrator.tools import (
+    AgentSandboxClient,
     AllowlistProvider,
     DenylistProvider,
     HTTPSupervisorRuntime,
@@ -112,6 +114,7 @@ from orchestrator.tools import (
     MCPServerPool,
     NullWorkspaceLock,
     Reranker,
+    SandboxInstanceStore,
     SandboxRuntime,
     SearXNGClient,
     SseMCPClient,
@@ -1432,7 +1435,9 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_sandbox_runtime(settings: Settings) -> SandboxRuntime | None:
+def build_sandbox_runtime(
+    settings: Settings, *, sandbox_instance_store: SandboxInstanceStore | None = None
+) -> SandboxRuntime | None:
     """按 ``sandbox_backend`` 选沙箱运行时实现。
 
     ``None`` → ``exec_python`` 等沙箱工具不可用;声明了沙箱工具的 agent
@@ -1445,12 +1450,39 @@ def build_sandbox_runtime(settings: Settings) -> SandboxRuntime | None:
     shared client exists (``HTTPSupervisorRuntime`` is not frozen, so that
     is safe) — see the ``isinstance(..., HTTPSupervisorRuntime)`` guard in
     ``app.py``.
+
+    波 1 Task 7 — ``sandbox_instance_store`` backs the ``agent_sandbox``
+    branch's warm-session CAS (``sandbox_instance`` table). It is a
+    parameter rather than something this function builds itself because a
+    real store needs the shared SQL session factory (``app.py``'s
+    ``_SqlStores``, assembled in the SAME synchronous scope this factory
+    runs in) — this stays a pure function of ``settings`` PLUS an injected
+    collaborator, matching how ``SqlSandboxEgressAuditStore`` is built ad
+    hoc at its call site rather than from a settings-only factory.
+    ``None`` (the caller has no SQL stores — ``persistence_backend="memory"``,
+    or a unit test) falls back to :class:`InMemorySandboxInstanceStore` so
+    ``sandbox_backend="agent_sandbox"`` still constructs a usable client
+    rather than silently downgrading to ``None``.
     """
     backend = settings.sandbox_backend
     if backend is None:
         backend = "supervisor" if settings.sandbox_supervisor_url else None
     if backend == "agent_sandbox":
-        raise NotImplementedError("sandbox_backend='agent_sandbox' 尚未接线(波 1 Task 7)")
+        if not (
+            settings.sandbox_e2b_domain
+            and settings.sandbox_e2b_api_key
+            and settings.sandbox_e2b_template
+        ):
+            return None
+        return AgentSandboxClient(
+            domain=settings.sandbox_e2b_domain,
+            api_key=settings.sandbox_e2b_api_key,
+            template=settings.sandbox_e2b_template,
+            store=sandbox_instance_store or InMemorySandboxInstanceStore(),
+            egress_token_secret=settings.sandbox_egress_token_secret,
+            egress_proxy_host=settings.sandbox_egress_proxy_host,
+            egress_proxy_port=settings.sandbox_egress_proxy_port,
+        )
     if backend == "supervisor" and settings.sandbox_supervisor_url:
         return HTTPSupervisorRuntime(base_url=settings.sandbox_supervisor_url)
     return None

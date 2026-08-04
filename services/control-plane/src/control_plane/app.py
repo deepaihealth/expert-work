@@ -406,6 +406,7 @@ from expert_work.persistence.sandbox_egress_audit import (
     SandboxEgressAuditStore,
     SqlSandboxEgressAuditStore,
 )
+from expert_work.persistence.sandbox_instance_store import SqlSandboxInstanceStore
 from expert_work.persistence.skill import (
     InMemorySkillStore,
     SkillStore,
@@ -693,7 +694,17 @@ def create_app(
         if sql_stores
         else InMemorySandboxEgressAuditStore()
     )
-    resolved_sandbox_runtime = build_sandbox_runtime(resolved_settings)
+    # 波 1 Task 7 — the agent_sandbox branch needs a warm-session CAS store;
+    # only a real SQL session factory can back it durably (sandbox_instance
+    # is shared with the docker-supervisor backend). ``None`` sql_stores
+    # (persistence_backend="memory") falls back to the factory's own
+    # InMemorySandboxInstanceStore default.
+    resolved_sandbox_runtime = build_sandbox_runtime(
+        resolved_settings,
+        sandbox_instance_store=(
+            SqlSandboxInstanceStore(sql_stores.session_factory) if sql_stores else None
+        ),
+    )
     # 波 1 Task 4 — workspace-file ops now live on a separate client, built
     # from the same supervisor URL (still the only thing that can reach the
     # docker-volume workspace today; wave 2's NAS mount replaces this).
