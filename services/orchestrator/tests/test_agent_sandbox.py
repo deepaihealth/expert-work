@@ -20,6 +20,22 @@ SDK 用假件替身:真实 SDK 调用在契约测试(Task 10)与端到端(Task 1
   还在创建中则 raise" 改成与两个生产 store(SQL/内存)同语义(审查
   Important-3/4,详见类 docstring);再加 ``drop_warm_fails`` 开关(二审
   Critical)—— 覆盖"CAS 回滚本身也失败"这条路径。
+
+Task 9(``reap``)对 task-9-brief.md 草稿的一处偏离,记在这里:草稿的
+``test_reap_ignores_sandboxes_not_ours`` 让 ``FakeSdk`` 加 ``list()`` +
+``foreign: list[str]`` 字段,模拟"E2B 账号下还有别的沙箱"。但顶层任务说明
+定的最终设计是"以 ``sandbox_instance`` 表为准,完全不问 SDK 的
+``list()``"——``reap()`` 的实现从头到尾没有一处调用 ``sdk.list()``,那条
+草稿测试无论 ``foreign`` 是否存在断言都成立,是摆设,不是真的在验证"忽略
+账号里的其它沙箱"这件事。这里改成 ``FakeSdk`` 压根不提供 ``list()``
+方法(真退回到"按 SDK 列表拆"的实现会在任何 reap 测试里立刻
+``AttributeError``,而不是被一个看似相关实则测不到东西的测试静默放过)、
+``FakeInstanceStore`` 加 ``idle_sandbox_ids: set[UUID]`` 测试缝
+(``list_active(only_idle=True)`` 只返回这里列出的 id)——覆盖
+``AgentSandboxClient.reap`` 把 ``force`` 正确翻给 ``list_active`` 的
+``only_idle=not force`` 这条真实存在的逻辑;真实的 TTL/时间戳判定语义是
+``SqlSandboxInstanceStore.list_active`` 的职责,由
+``test_sql_sandbox_instance_store.py`` 的容器集成测覆盖,这里不重复建模。
 """
 
 from __future__ import annotations
@@ -137,6 +153,12 @@ class FakeInstanceStore:
     rows: dict[UUID, dict] = field(default_factory=dict)
     #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。
     drop_warm_fails: bool = False
+    #: Task 9 测试缝 —— ``list_active(only_idle=True)`` 只返回这里列出的
+    #: sandbox_id。不建模真实的 last_used_at/acquired_at 时间戳(那是两个
+    #: 生产 store 的职责);这里只用来验证 AgentSandboxClient.reap() 把
+    #: ``force`` 正确翻译成 ``only_idle=not force`` 并如实按 list_active()
+    #: 的返回值行动,见类 docstring "Task 9 对 brief 草稿的偏离"一节。
+    idle_sandbox_ids: set[UUID] = field(default_factory=set)
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -172,6 +194,16 @@ class FakeInstanceStore:
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         return self.rows.get(sandbox_id, {}).get("container_id")
+
+    async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
+        active = [
+            (sandbox_id, row["container_id"])
+            for sandbox_id, row in self.rows.items()
+            if row.get("container_id") is not None
+        ]
+        if not only_idle:
+            return active
+        return [(sid, cid) for sid, cid in active if sid in self.idle_sandbox_ids]
 
 
 def make_client(sdk: FakeSdk, store: FakeInstanceStore) -> AgentSandboxClient:
@@ -602,3 +634,76 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
     assert nasty not in cmd, "code 绝不能出现在命令行里"
     assert "python -I " in cmd
     assert run_user == SANDBOX_EXEC_USER
+
+
+# ---------------------------------------------------------------------------
+# Task 9 —— AgentSandboxClient.reap:以 sandbox_instance 表为准,不问 SDK
+# 账号级的 list()(见类 docstring "Task 9 对 brief 草稿的偏离"一节)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reap_force_kills_every_active_sandbox_of_ours() -> None:
+    """force=True 拆掉表里记着的每个活跃沙箱,返回拆除数,并放出热会话坑。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    t1, t2 = uuid4(), uuid4()
+    u1, u2 = uuid4(), uuid4()
+    await client.acquire(tenant_id=t1, thread_id="a", user_id=u1)
+    sdk.sandbox = FakeSandbox(sandbox_id="sbx-2")
+    await client.acquire(tenant_id=t2, thread_id="b", user_id=u2)
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 2
+    assert store.rows == {}
+    assert store.warm == {}, "热会话坑必须放出来,否则 (tenant, user) 再也 acquire 不到"
+
+
+@pytest.mark.asyncio
+async def test_reap_without_force_only_reaps_rows_the_store_marks_idle() -> None:
+    """``force=False``(默认路径)必须把 ``only_idle=True`` 传给
+    ``store.list_active`` —— 只拆 store 判定为空闲的行,活跃的留着不动。
+
+    这里不建模真实的 last_used_at/acquired_at TTL 计算(那是
+    ``SqlSandboxInstanceStore.list_active`` 的职责,由
+    ``test_sql_sandbox_instance_store.py`` 的容器集成测覆盖);只验证
+    ``AgentSandboxClient.reap`` 把 ``force`` 正确翻译成
+    ``only_idle=not force`` 并如实按 ``list_active`` 的返回值行动 —— 用
+    ``FakeInstanceStore.idle_sandbox_ids`` 直接指定哪个 sandbox_id 是"空闲
+    的",不掺时间戳。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    busy_id = await client.acquire(tenant_id=uuid4(), thread_id="a", user_id=uuid4())
+    sdk.sandbox = FakeSandbox(sandbox_id="sbx-2")
+    idle_id = await client.acquire(tenant_id=uuid4(), thread_id="b", user_id=uuid4())
+    store.idle_sandbox_ids.add(idle_id)
+
+    reaped = await client.reap(force=False)
+
+    assert reaped == 1
+    assert idle_id not in store.rows, "标记为空闲的行必须被拆"
+    assert busy_id in store.rows, "没被标记为空闲的活跃行不该被碰"
+
+
+@pytest.mark.asyncio
+async def test_reap_cleans_row_even_when_sandbox_already_gone() -> None:
+    """沙箱在平台侧已经不存在(保留期过 / 被平台回收 / 手工删了)时,
+    ``connect`` 会失败 —— 但行必须仍然被清掉,否则热会话槽位永远占着,该
+    ``(tenant, user)`` 被迁移 0141 的部分唯一索引挡住、再也 acquire 不到,
+    与 Task 7 修过的"CAS 行卡死"是同一类故障。这条不变式很容易在重构中
+    丢失(比如把 ``mark_destroyed`` 挪进 ``try`` 块,一旦 ``connect`` 抛异常
+    就跳过它),单独验证。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="a", user_id=user_id)
+    sdk.connect_fails = True
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 1, "即使连不上,也要算作已清理"
+    assert sandbox_id not in store.rows, "行必须被清掉,热会话槽位必须放出来"
+    assert (tenant_id, user_id) not in store.warm, "热会话坑必须放出来,否则再也 acquire 不到"

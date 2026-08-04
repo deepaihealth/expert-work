@@ -35,8 +35,8 @@ wart worth revisiting at wave 4's "dead-field disposition" pass (design spec
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select
@@ -65,6 +65,19 @@ _UNUSED_TEXT = "agent-sandbox"
 #: our failed INSERT and the follow-up SELECT (its owner released the slot
 #: concurrently) — not a wait-for-readiness poll (see :meth:`claim_warm`).
 _CLAIM_WARM_MAX_ATTEMPTS = 3
+
+#: Idle TTL for a warm Agent-Sandbox session before a non-force
+#: :meth:`SqlSandboxInstanceStore.list_active`/``AgentSandboxClient.reap``
+#: sweep reclaims it (波 1 Task 9). Same value AND "``last_used_at``,
+#: falling back to ``acquired_at``" semantics as the docker-supervisor's
+#: own idle reaper default (``session_idle_ttl_s`` in
+#: ``services/sandbox-supervisor/src/sandbox_supervisor/settings.py``,
+#: consumed by ``_session_idle`` in that service's own ``store.py``) — the
+#: value is mirrored here rather than imported because this package must
+#: not depend upward on that service's settings (same wrong-direction-
+#: dependency rule as the module docstring's "does not import from
+#: ``orchestrator``" / "does not import ``sandbox_supervisor.domain``").
+_IDLE_TTL_S = 15 * 60
 
 
 def _utc_now() -> datetime:
@@ -239,12 +252,60 @@ class SqlSandboxInstanceStore:
             ).scalar_one_or_none()
         return str(container_id) if container_id is not None else None
 
+    async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
+        """``AgentSandboxClient.reap`` (波 1 Task 9) 用 —— 见
+        ``orchestrator.tools.agent_sandbox.SandboxInstanceStore.list_active``
+        的完整契约 docstring(``only_idle`` 语义、idle 判定口径、为什么
+        ``container_id`` 仍是 NULL 的行不返回)。
+
+        M0 沙箱规模小(同 ``DbSandboxStore.list_idle_sessions`` 的理由,见
+        ``sandbox_supervisor/store.py``):取回 ``IN_USE``/未销毁/
+        ``container_id`` 已回填的行,``only_idle`` 的 idle 判定在 Python
+        侧过滤,不写 per-row SQL 区间表达式。
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(
+                    SandboxInstanceRow.id,
+                    SandboxInstanceRow.container_id,
+                    SandboxInstanceRow.last_used_at,
+                    SandboxInstanceRow.acquired_at,
+                ).where(
+                    SandboxInstanceRow.state == _STATE_IN_USE,
+                    SandboxInstanceRow.destroyed_at.is_(None),
+                    SandboxInstanceRow.container_id.is_not(None),
+                )
+            )
+            rows = result.all()
+        now = _utc_now()
+        active: list[tuple[UUID, str]] = []
+        for row_id, container_id, last_used_at, acquired_at in rows:
+            if container_id is None:
+                continue  # belt-and-braces — the WHERE clause already excludes this
+            if only_idle:
+                anchor = last_used_at or acquired_at
+                if anchor is None or anchor + timedelta(seconds=_IDLE_TTL_S) >= now:
+                    continue
+            active.append((row_id, str(container_id)))
+        return active
+
 
 @dataclass
 class _MemRow:
     tenant_id: UUID
     user_id: UUID
     container_id: str | None = None
+    #: Mirrors ``SandboxInstanceRow.acquired_at`` — set at ``claim_warm``
+    #: time so :meth:`InMemorySandboxInstanceStore.list_active` has the
+    #: same idleness anchor as :meth:`SqlSandboxInstanceStore.list_active`.
+    acquired_at: datetime = field(default_factory=_utc_now)
+    #: Mirrors ``SandboxInstanceRow.last_used_at``. Nothing currently calls
+    #: a "touch" method on either store (see the ``SandboxInstanceStore``
+    #: Protocol docstring's "known gap" note), so this stays ``None`` in
+    #: practice — same as production today. Kept as a real field (not
+    #: hardcoded away) so both stores would fall out of sync the instant
+    #: one of them starts actually writing it and the other doesn't.
+    last_used_at: datetime | None = None
 
 
 class InMemorySandboxInstanceStore:
@@ -303,3 +364,21 @@ class InMemorySandboxInstanceStore:
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         row = self._rows.get(sandbox_id)
         return row.container_id if row is not None else None
+
+    async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
+        """Mirrors :meth:`SqlSandboxInstanceStore.list_active` — same
+        "``container_id`` populated" filter and (``only_idle=True``) the
+        same "``last_used_at``, falling back to ``acquired_at``" idleness
+        rule, using ``_MemRow``'s mirrored timestamp fields.
+        """
+        now = _utc_now()
+        active: list[tuple[UUID, str]] = []
+        for sandbox_id, row in self._rows.items():
+            if row.container_id is None:
+                continue
+            if only_idle:
+                anchor = row.last_used_at or row.acquired_at
+                if anchor is None or anchor + timedelta(seconds=_IDLE_TTL_S) >= now:
+                    continue
+            active.append((sandbox_id, row.container_id))
+        return active

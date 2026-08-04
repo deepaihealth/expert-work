@@ -206,8 +206,16 @@ def _ensure_e2b_patched(*, domain: str, api_key: str) -> None:
 class SandboxInstanceStore(Protocol):
     """``sandbox_instance`` 表上 ``AgentSandboxClient`` 需要的操作。
 
-    ``exec``(Task 8)/``reap``(Task 9)要用的方法(如按 idle 扫活跃会话、
-    回填 ``last_used_at``)留给那两个任务补充 —— 今天不预先猜测形状。
+    ``exec``(Task 8)最终没再加新方法——四契约点靠既有的
+    :meth:`get_container_id`/``_attach`` 就够。``reap``(Task 9)加了
+    :meth:`list_active`。
+
+    已知缺口(Task 9 范围之外,留给以后):没有任何方法回填
+    ``last_used_at``——``AgentSandboxClient.exec`` 从未调用过这样的方法,
+    所以 :meth:`list_active` 的空闲判定目前总是退回 ``acquired_at``("多久
+    以前 acquire 的",不是"多久没被真正用过的")。一个被频繁 ``exec`` 的热
+    会话,只要 acquire 的时间够早,一样会被 ``force=False`` 的空闲 TTL 扫
+    掉——这不是本任务要修的问题,见 task-9-report.md 的取舍记录。
     """
 
     async def claim_warm(
@@ -248,6 +256,27 @@ class SandboxInstanceStore(Protocol):
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""
+
+    async def list_active(self, *, only_idle: bool) -> list[tuple[UUID, str]]:
+        """列出活跃(``state='IN_USE'``、未销毁、``container_id`` 已回填)的
+        热会话行,返回 ``(sandbox_id, container_id)``——``reap`` 用。
+
+        ``only_idle=True``(常规清扫,``force=False``)只返回超过空闲 TTL
+        的行——判定口径与本地 docker-supervisor 自己的 reaper 相同(见
+        ``sandbox_supervisor/store.py`` 的 ``_session_idle``):以
+        ``last_used_at`` 为准,缺失(还没 exec 过,或压根没有任何代码路径
+        回填过它——见本 Protocol 类 docstring 的"已知缺口")退回
+        ``acquired_at``;两者都缺失的行不返回。``only_idle=False``
+        (``force`` 路径)返回全部活跃行,不看时间戳——运维强制拆除与
+        M0→M1 Gate E2E 依赖这个确定性语义。
+
+        还在创建中(``container_id`` 仍是 NULL)的行两种模式都不返回:E2B
+        冷启 35-40s 的窗口里可能有另一路 ``acquire()`` 正在往这行写
+        ``container_id``,此时 ``reap`` 抢着连一个还没写完的行既连不上、
+        也没什么可 kill 的;那类行的清理由 ``_create_and_track`` 自己的
+        失败分支(``drop_warm``)负责,不是 ``list_active``/``reap`` 的
+        职责。
+        """
 
 
 @dataclass
@@ -547,7 +576,17 @@ class AgentSandboxClient:
            E2B 侧的输出根本不经过 runner.py(没有本地那层子进程 JSON 协议
            转发),不存在"跟 runner.py 字节对字节相同"这个目标,只需要满足
            同一个长度上限。
-        3. 超时 → ``exit_code=-1, timed_out=True``(runner.py:60-66)。
+        3. 超时 → ``exit_code=-1, timed_out=True``(runner.py:60-66)——已知
+           偏差第三条(前两条见上/下文):这里 ``stdout``/``stderr`` 固定回
+           空串,runner.py 是自己包了一层 ``subprocess.run``,子进程被杀前
+           已经写出的部分输出仍读得到。E2B 这边追到 SDK 源码(而非公开
+           文档)确认这条不可弥合:``AsyncCommandHandle.wait``
+           (``e2b/sandbox_async/commands/command_handle.py``)超时时直接
+           ``raise self._iteration_exception``,不像同一方法里非零退出码
+           那支 ``raise CommandExitException(stdout=self._stdout,
+           stderr=self._stderr, ...)`` 那样顺手把累积输出带上——超时异常
+           对象本身根本不携带任何已产生的输出,没有可以在 ``except`` 里
+           读出来的部分结果,只能记文档。
         4. 响应固定 4 键 —— 由 :class:`SandboxOutcome` 的字段集合结构性
            保证,下面每条返回路径都填满这 4 个字段。
 
@@ -616,6 +655,37 @@ class AgentSandboxClient:
         )
 
     async def reap(self, *, force: bool) -> int:
-        """波 1 Task 9。理由同 :meth:`exec` 的 docstring。"""
-        del force
-        raise NotImplementedError("AgentSandboxClient.reap 尚未接线(波 1 Task 9)")
+        """扫掉空闲(或 ``force`` 时全部)的热会话,返回拆除数。
+
+        以 ``sandbox_instance`` 表(:meth:`SandboxInstanceStore.list_active`)
+        为准,不问 E2B SDK 账号级的 ``list()``——同一个 E2B 账号下可能有
+        别的来源建的沙箱(别的环境 / 别人手工建的 / 以后别的服务),按 SDK
+        列表拆会误伤不属于我们的沙箱。``force=True`` 拆掉表里记着的每一个
+        活跃沙箱,不看空闲时间——运维强制拆除与 M0→M1 Gate E2E 都依赖这个
+        确定性语义;``force=False`` 走 :meth:`SandboxInstanceStore.list_active`
+        的空闲 TTL 过滤,口径与本地 supervisor 自己的 reaper 相同(该
+        Protocol 方法的 docstring 有完整说明,包括 ``last_used_at`` 目前
+        从未被回填这条已知缺口)。
+
+        沙箱在平台侧已经不存在时(保留期过 / 被平台回收 / 手工删了)——
+        ``connect``/``kill`` 会失败,但仍要清掉那一行,否则热会话槽位永远
+        占着,该 ``(tenant, user)`` 被迁移 0141 的部分唯一索引挡住、再也
+        acquire 不到——与 :meth:`destroy` 的 broad ``except`` 是同一类
+        故障、同一个修法:``mark_destroyed`` 必须在 ``except`` 之外,对
+        ``list_active`` 交回来的每一行都无条件跑一次,不能因为
+        ``connect``/``kill`` 失败就跳过。
+        """
+        rows = await self.store.list_active(only_idle=not force)
+        reaped = 0
+        for sandbox_id, container_id in rows:
+            try:
+                sbx = await self._connect(container_id)
+                await sbx.kill()
+            except Exception:
+                # 沙箱已不在(保留期过 / 被平台回收 / 手工删了)也要清行,
+                # 否则热会话坑永远占着,该 (tenant, user) 再也 acquire 不到
+                # ——与 destroy() 的 broad except 同理,见上面 docstring。
+                logger.info("reap: sandbox %s already gone", container_id)
+            await self.store.mark_destroyed(sandbox_id=sandbox_id, reason="reap")
+            reaped += 1
+        return reaped
