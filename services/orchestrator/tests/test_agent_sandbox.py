@@ -53,13 +53,19 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from e2b import CommandExitException, TimeoutException
 
+from expert_work.persistence.sandbox_instance_store import (
+    _STUCK_CREATE_TTL_S,
+    InMemorySandboxInstanceStore,
+)
 from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
@@ -71,6 +77,7 @@ from orchestrator.tools.agent_sandbox import (
     AgentSandboxClient,
 )
 from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
+from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
 
 @dataclass
@@ -159,16 +166,28 @@ class FakeSdk:
     connect_fails: bool = False
     #: 审查 Critical-2 —— 覆盖 "CAS 行已提交但 create() 本身失败" 这条路径。
     create_fails: bool = False
+    #: 再审 Important-1 测试缝 —— ``create()`` / ``connect()`` **返回之前**跑
+    #: 一段别的协程。这是唯一能精确构造出"A 还卡在这一步里,B 已经在同一个
+    #: ``(tenant, user)`` 上往前走了"这类交错的地方,而清理误伤别人的行只在
+    #: 这类交错下才看得见:C-1 的接管窗口正是"行已提交、container_id 还没回
+    #: 填",在真实代码里就是 ``create()`` 的执行期间;重连失败那条分支的窗口
+    #: 则是 ``connect()`` 的执行期间。
+    on_create: Callable[[], Awaitable[None]] | None = None
+    on_connect: Callable[[], Awaitable[None]] | None = None
 
     async def create(self, **kwargs):
         self.created.append(kwargs)
         if self.create_fails:
             raise RuntimeError("sandbox create failed")
+        if self.on_create is not None:
+            await self.on_create()
         return self.sandbox
 
     async def connect(self, sandbox_id: str, **kwargs):
         self.connected.append(sandbox_id)
         self.connect_kwargs.append(kwargs)
+        if self.on_connect is not None:
+            await self.on_connect()
         if self.connect_fails:
             raise RuntimeError("sandbox gone")
         return self.sandbox
@@ -188,8 +207,11 @@ class FakeInstanceStore:
 
     warm: dict[tuple[UUID, UUID], UUID] = field(default_factory=dict)
     rows: dict[UUID, dict] = field(default_factory=dict)
-    #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。
-    drop_warm_fails: bool = False
+    #: 二审 Critical —— 覆盖 "回滚本身也失败" 这条路径。再审 Important-1 之
+    #: 前这个开关叫 ``drop_warm_fails``:回滚走的那个方法已经删了(按
+    #: ``(tenant, user)`` 坐标定位会误伤 C-1 的接管者),现在统一走
+    #: ``mark_destroyed``,开关跟着改名,覆盖的路径不变。
+    mark_destroyed_fails: bool = False
     #: 全分支终审 Important-6 —— 覆盖 "沙箱建好了,但回填 container_id 这一
     #: 步失败" 这条路径(那之后没有任何东西找得到这个还活着的沙箱)。
     set_container_id_fails: bool = False
@@ -250,7 +272,7 @@ class FakeInstanceStore:
         self.rows[sandbox_id]["container_id"] = container_id
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
-        if sandbox_id in self.mark_destroyed_fails_for:
+        if self.mark_destroyed_fails or sandbox_id in self.mark_destroyed_fails_for:
             raise RuntimeError(f"mark_destroyed unavailable for {sandbox_id}")
         # 记录每次调用(哪怕行早就不在了)—— 让
         # test_ephemeral_create_failure_clears_the_row 能证明清理代码真的
@@ -261,11 +283,6 @@ class FakeInstanceStore:
             key = (row["tenant_id"], row["user_id"])
             if self.warm.get(key) == sandbox_id:
                 del self.warm[key]
-
-    async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        if self.drop_warm_fails:
-            raise RuntimeError("drop_warm unavailable (db blip)")
-        self.warm.pop((tenant_id, user_id), None)
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         return self.rows.get(sandbox_id, {}).get("container_id")
@@ -305,7 +322,7 @@ class FakeInstanceStore:
         ]
 
 
-def make_client(sdk: FakeSdk, store: FakeInstanceStore) -> AgentSandboxClient:
+def make_client(sdk: FakeSdk, store: SandboxInstanceStore) -> AgentSandboxClient:
     return AgentSandboxClient(
         domain="gw.example.com",
         api_key="k",
@@ -386,7 +403,7 @@ async def test_destroy_after_ephemeral_acquire_actually_works() -> None:
 
 @pytest.mark.asyncio
 async def test_ephemeral_create_failure_clears_the_row() -> None:
-    """临时沙箱没有热会话坑可 ``drop_warm``(它压根不参与 0141 CAS),但
+    """临时沙箱没有热会话坑(它压根不参与 0141 CAS),但
     ``acquire`` 已经在 ``sdk.create()`` 之前插入了一行 ``container_id`` 仍是
     NULL 的 ``IN_USE`` 行——create 失败后必须清掉,不能让它一直卡到
     ``list_stuck_creating`` 的 TTL 兜底才被 ``reap(force=True)`` 捡走。"""
@@ -464,7 +481,7 @@ async def test_connect_failure_rebuilds() -> None:
 async def test_create_failure_releases_warm_slot() -> None:
     """审查 Critical-2:``claim_warm`` 已经持久化提交了
     ``state=IN_USE``/``container_id=NULL`` 的一行,如果紧接着的
-    ``sdk.create()`` 失败,必须 ``drop_warm`` 把槽位放出来 —— 否则该
+    ``sdk.create()`` 失败,必须把那一行清掉、槽位放出来 —— 否则该
     ``(tenant, user)`` 被迁移 0141 的部分唯一索引永久卡住:``claim_warm``
     看到"行存在但 container_id 是 NULL"会永远 raise "already being
     created",没有任何东西能再解开它(手工改库之外)。
@@ -487,20 +504,19 @@ async def test_create_failure_releases_warm_slot() -> None:
 
 @pytest.mark.asyncio
 async def test_create_failure_rollback_does_not_mask_original_error() -> None:
-    """二审 Critical:``_create_and_track`` 的清理步骤(``drop_warm``)自己
-    也可能失败(DB 抖动/连接池耗尽/网络分区)。撤销清理前,``except
-    Exception: ... await self.store.drop_warm(...); raise`` 里如果
-    ``drop_warm`` 抛出,第 392 行的 ``raise`` 永远执行不到 —— 冒出去的是
-    ``drop_warm`` 的异常,不是原始的 ``_create()`` 失败:①调用方按
-    ``SandboxSupervisorError`` 设计的 except 链接不住(类型变了)②热会话
-    行照样卡死(回滚没做成),Critical-2 描述的症状在自己的失败路径上原样
-    重演,只是往下多埋一层。
+    """二审 Critical:``_create_and_track`` 的清理步骤(``_unwind_slot`` →
+    ``mark_destroyed``)自己也可能失败(DB 抖动/连接池耗尽/网络分区)。撤销
+    清理前,``except Exception: ... await self._unwind_slot(...); raise`` 里
+    如果清理抛出,那句 ``raise`` 永远执行不到 —— 冒出去的是清理的异常,不是
+    原始的 ``_create()`` 失败:①调用方按 ``SandboxSupervisorError`` 设计的
+    except 链接不住(类型变了)②热会话行照样卡死(回滚没做成),Critical-2
+    描述的症状在自己的失败路径上原样重演,只是往下多埋一层。
 
-    这里验证修复后的行为:``drop_warm`` 失败被吞掉(只记日志),但外层
-    重新抛出的仍然是 ``_create()`` 触发的那个 ``SandboxSupervisorError``。
+    这里验证修复后的行为:清理失败被吞掉(只记日志),但外层重新抛出的仍然
+    是 ``_create()`` 触发的那个 ``SandboxSupervisorError``。
     """
     sdk = FakeSdk(create_fails=True)
-    store = FakeInstanceStore(drop_warm_fails=True)
+    store = FakeInstanceStore(mark_destroyed_fails=True)
     client = make_client(sdk, store)
     tenant_id, user_id = uuid4(), uuid4()
 
@@ -985,6 +1001,140 @@ async def test_ephemeral_post_create_failure_clears_the_row() -> None:
     assert sdk.sandbox.killed is True
     assert [reason for _, reason in store.mark_destroyed_calls] == ["post_create_failed"]
     assert store.rows == {}
+
+
+# ---------------------------------------------------------------------------
+# 再审 Important-1 —— C-1 的接管让"槽位当前的主人不是我"成为可达状态,而所有
+# 按 (tenant, user) 坐标定位的清理都会误伤接管者。
+#
+# 这两条用**真的** InMemorySandboxInstanceStore(不是本文件的 FakeInstanceStore):
+# 要验的正是"C-1 的接管发生之后清理动了谁的行",而接管那条谓词只活在两个生产
+# store 里,手写假件复刻一份就等于拿测试替身给自己作证。
+# ---------------------------------------------------------------------------
+
+
+def _backdate_pending_rows(store: InMemorySandboxInstanceStore) -> None:
+    """把所有还没回填 ``container_id`` 的行拨老到超过 ``_STUCK_CREATE_TTL_S``。
+
+    等价于"持有这些行的那个 pod 卡了 5 分钟以上"——C-1 接管的前置条件。公开
+    API 造不出"很久以前",与两个 store 自己的同款测试用 backdate 是一个手法。
+    """
+    long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    for row in store._rows.values():
+        if row.container_id is None:
+            row.acquired_at = long_ago
+
+
+@pytest.mark.asyncio
+async def test_unwind_after_a_takeover_leaves_the_new_owners_row_alone() -> None:
+    """A 被 B 合法接管之后再失败,清理**不能**动 B 那行。
+
+    交错(C-1 之前不可能出现,之后是预期状态):
+
+    1. A ``claim_warm`` 拿到槽位,行是 ``IN_USE`` + ``container_id=NULL``;
+    2. A 卡在 ``create()`` 里超过 ``_STUCK_CREATE_TTL_S``(pod 被冻/慢盘/
+       网络分区,5 分钟不是理论值,C-1 就是为真实发生过的这件事修的);
+    3. B 的 ``acquire`` 走 C-1 的接管:清掉 A 的过期行、自己 INSERT、建沙箱、
+       回填 container_id —— B 现在是**合法**的槽位主人,沙箱活着;
+    4. A 的 ``create()`` 终于返回,但紧接着的种子文件写失败 → 走 Important-6
+       那层守卫(kill 自己的沙箱 + ``_unwind_slot``)。
+
+    修复前 ``_unwind_slot`` 调 ``drop_warm(tenant_id, user_id)`` —— 按坐标删
+    "此刻占着槽位的那一行",也就是 **B 的**。后果不是"多清了一行"那么轻:B
+    的 microVM 还在平台上跑着,但它的行没了 ⇒ ``list_active`` 看不见它 ⇒ 周期
+    reaper 永远收不走,只剩 ``release()`` 或 20 分钟平台超时兜底。
+    """
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sdk_b = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-B"))
+    client_b = make_client(sdk_b, store)
+    b_id: UUID | None = None
+
+    async def _b_takes_over_while_a_is_still_creating() -> None:
+        nonlocal b_id
+        _backdate_pending_rows(store)
+        b_id = await client_b.acquire(tenant_id=tenant_id, thread_id="B", user_id=user_id)
+
+    sdk_a = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-A"))
+    sdk_a.on_create = _b_takes_over_while_a_is_still_creating
+    sdk_a.sandbox.files.write_error = TimeoutException("envd unreachable")
+    client_a = make_client(sdk_a, store)
+
+    with pytest.raises(SandboxSupervisorError):
+        await client_a.acquire(
+            tenant_id=tenant_id,
+            thread_id="A",
+            user_id=user_id,
+            seed_files=(("skill.md", b"x"),),
+        )
+
+    assert b_id is not None, "前置没成立:B 的接管压根没跑到"
+    assert sdk_a.sandbox.killed is True, "A 自己那个没人记得的沙箱仍然必须被 kill"
+    assert sdk_b.sandbox.killed is False, "B 的沙箱不是 A 建的,一根汗毛都不能碰"
+    # 核心断言:B 那行还在,并且仍然是 reap 看得见的活跃行。
+    assert await store.get_container_id(sandbox_id=b_id) == "sbx-B"
+    assert await store.is_warm_session(sandbox_id=b_id) is True
+    assert await store.list_active(only_idle=False) == [(b_id, "sbx-B")], (
+        "B 的行必须仍然出现在 list_active 里 —— 否则周期 reaper 永远收不走它那个还活着的 microVM"
+    )
+    # 槽位仍归 B:下一次 acquire 应当复用 B,而不是发现槽位空了又建一个。
+    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) == (
+        b_id,
+        "sbx-B",
+    )
+
+
+@pytest.mark.asyncio
+async def test_warm_reconnect_failure_only_clears_the_row_it_could_not_reach() -> None:
+    """同一个根因的第二处:``acquire`` 的"重连失败则重建"分支。
+
+    它拿着 ``claim_warm`` 刚返回的赢家 ``sandbox_id``,所以照样该按 id 清那一
+    行,而不是按 ``(tenant, user)`` 清"此刻占着槽位的那一行"。**不争用**时两
+    种写法效果一样(``test_connect_failure_rebuilds`` 覆盖那一半),所以这里
+    必须构造争用,否则这条测试对着按坐标清的旧写法照样绿:
+
+    1. A、B 拿到同一个赢家行(平台已经把那个沙箱超时 kill 了,两边都连不上);
+    2. B 先跑完整条重建链:清掉连不上的旧行 → 重新占坑 → 建 ``sbx-B`` → 回填。
+       B 现在是槽位的合法主人,沙箱活着;
+    3. A 这才从失败的 ``connect`` 里出来,开始它自己的清理。
+
+    按坐标清 = 清掉 **B 那行**,A 随后重新占坑成功、也建出自己的沙箱 —— 结果
+    是一个 ``(tenant, user)`` 上两个活 microVM,B 那个还没人记得。按 id 清则
+    是对早已销毁的旧行 no-op,A 重新占坑输给 B,后续回填按契约抛错、刚建的
+    沙箱被 Important-6 的守卫 kill 掉,错误冒泡成可重试的 ``SandboxSupervisorError``。
+    """
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sdk_seed = FakeSdk()
+    stale_id = await make_client(sdk_seed, store).acquire(
+        tenant_id=tenant_id, thread_id="seed", user_id=user_id
+    )
+
+    sdk_b = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-B"), connect_fails=True)
+    client_b = make_client(sdk_b, store)
+    b_id: UUID | None = None
+
+    async def _b_finishes_its_own_rebuild_first() -> None:
+        nonlocal b_id
+        if b_id is None:  # 只在 A 第一次 connect 时插队,别递归
+            b_id = await client_b.acquire(tenant_id=tenant_id, thread_id="B", user_id=user_id)
+
+    sdk_a = FakeSdk(sandbox=FakeSandbox(sandbox_id="sbx-A"), connect_fails=True)
+    sdk_a.on_connect = _b_finishes_its_own_rebuild_first
+    client_a = make_client(sdk_a, store)
+
+    with pytest.raises(SandboxSupervisorError):
+        await client_a.acquire(tenant_id=tenant_id, thread_id="A", user_id=user_id)
+
+    assert b_id is not None and b_id != stale_id, "前置没成立:B 的重建没跑到"
+    assert sdk_b.sandbox.killed is False, "B 的沙箱不是 A 建的,一根汗毛都不能碰"
+    assert sdk_a.sandbox.killed is True, "A 自己那个没人记得的沙箱必须被 kill"
+    assert await store.get_container_id(sandbox_id=stale_id) is None, "连不上的旧行必须清掉"
+    assert await store.list_active(only_idle=False) == [(b_id, "sbx-B")], (
+        "槽位与唯一的活跃行都该归 B —— A 不能既清掉 B 的行又留下第二个活 microVM"
+    )
 
 
 @pytest.mark.asyncio

@@ -65,7 +65,7 @@ class SandboxInstanceStore(Protocol):
           让那个 ``(tenant, user)`` **永久**失去沙箱能力——``claim_warm``
           提交的行只会被后来的 ``set_container_id`` 回填,进程死在两次写之
           间就没有任何处理器还会跑,而仓内没有任何自动路径能解开它
-          (``acquire`` 的 ``drop_warm`` 分支拿不到返回值走不到、
+          (``acquire`` 的"重连失败则重建"分支拿不到返回值走不到、
           ``_create_and_track`` 的 unwind 只在同进程有效、
           :meth:`list_stuck_creating` 只有 ``reap(force=True)`` 会调)。
           5 分钟阈值约为实测冷启 35-40s 的 8 倍,不会跟一次合法的在途
@@ -88,10 +88,20 @@ class SandboxInstanceStore(Protocol):
         ``sandbox_id`` 从未被插入而出错。"""
 
     async def mark_destroyed(self, *, sandbox_id: UUID, reason: str) -> None:
-        """标记销毁并让出热会话坑。"""
+        """标记销毁并让出热会话坑。
 
-    async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        """丢弃一个失效的热会话行(重连失败后重建前调)。"""
+        再审 Important-1:这是**唯一**的"让出 0141 槽位"操作。曾经还有一个
+        按 ``(tenant, user)`` 定位的 ``drop_warm``,已经删掉——C-1 的接管让
+        "槽位当前的主人不是我"成为一个**可达**状态(接管之前不可能:
+        ``claim_warm`` 对所有后来者都 raise,槽位主人恒等于插入它的那个调用
+        方),而按坐标定位的删除删的是"此刻占着槽位的那一行",不是"我插的
+        那一行"——调用方 A 被接管之后再走清理,删掉的就是接管者 B 那行健康
+        的活行(B 的 microVM 随即从 :meth:`list_active` 消失,周期 reap 再也
+        看不见它)。按 ``sandbox_id`` 定位天然没有这个问题:每个清理点都恰好
+        知道自己那一行的 id,而 0141 的部分唯一索引键在 ``state`` /
+        ``destroyed_at`` / ``user_id`` 上,本方法两个都写,腾槽位的效果与按
+        坐标删完全一样。
+        """
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""
@@ -137,8 +147,8 @@ class SandboxInstanceStore(Protocol):
         冷启 35-40s 的窗口里可能有另一路 ``acquire()`` 正在往这行写
         ``container_id``,此时 ``reap`` 抢着连一个还没写完的行既连不上、
         也没什么可 kill 的;那类行**正常**的清理由 ``_create_and_track``
-        自己的失败分支(``drop_warm``)负责,不是 ``list_active``/``reap``
-        常规路径的职责。
+        自己的失败分支(``_unwind_slot`` → :meth:`mark_destroyed`)负责,
+        不是 ``list_active``/``reap`` 常规路径的职责。
 
         独立审查 Important-1 追加:上一句的"正常"两个字是关键——
         ``_create_and_track`` 的 ``except`` 只在 ``_create()`` **在同一个

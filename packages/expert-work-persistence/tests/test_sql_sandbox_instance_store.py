@@ -164,16 +164,26 @@ async def test_concurrent_claim_warm_after_ready_all_see_same_winner(
 
 
 @pytest.mark.asyncio
-async def test_drop_warm_frees_slot_for_new_claim(store: SqlSandboxInstanceStore) -> None:
+async def test_mark_destroyed_frees_the_slot_of_a_row_that_never_got_a_container(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """再审 Important-1 —— 这条接替了删掉的 ``test_drop_warm_frees_slot_for_new_claim``。
+
+    ``drop_warm``(按 ``(tenant, user)`` 坐标删)已经删除:C-1 的接管让"槽位
+    当前的主人不是我"成为可达状态,按坐标删会误伤接管者。所有清理点改走
+    ``mark_destroyed(sandbox_id=...)``,所以要证的不变式变成"按 id 的终态写
+    对一个 ``container_id`` 还是 NULL 的行**同样**腾得出 0141 槽位"——真
+    Postgres 才验得了这一点(0141 是部分唯一索引,内存实现不存在这个约束)。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
     assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
 
-    await store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+    await store.mark_destroyed(sandbox_id=first_id, reason="warm_reconnect_failed")
 
     second_id = uuid4()
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
-    assert result is None, "dropping the dead claim must free the 0141 partial-index slot"
+    assert result is None, "clearing the dead row by id must free the 0141 partial-index slot"
 
 
 @pytest.mark.asyncio
@@ -619,7 +629,7 @@ async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
 ) -> None:
     """接管走的是终态写(腾出 0141 部分唯一索引的槽位),并且写的是一个
     **专属** ``destroy_reason``——运维读这一列时要能分清槽位是被谁清的:
-    ``drop_warm``(重连失败)/ ``reap_orphaned_create``(强制清扫)/ 这里
+    ``warm_reconnect_failed``(重连失败)/ ``reap_orphaned_create``(强制清扫)/ 这里
     的 ``stuck_create_takeover``(后来的 acquire 自己发现并接管,三者里唯一
     不需要人工动作也不依赖 reaper 周期的一条)。
     """

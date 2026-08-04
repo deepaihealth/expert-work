@@ -65,14 +65,20 @@ E2B 原生协议要求泛域名而我们的证书只覆盖一层子域名,所以
   值本来就在同一次 SELECT 里,不需要多打一次库。同时 ``_create`` 失败(SDK
   冷启炸掉)不再让 CAS 行永久卡死:``claim_warm``/重新占坑已经提交的
   ``state='IN_USE', container_id=NULL`` 行,如果紧接着的 ``create()`` 失败,
-  改成先 ``drop_warm`` 释放槽位再把异常抛出去——否则那个 ``(tenant, user)``
+  改成先清掉那一行释放槽位再把异常抛出去——否则那个 ``(tenant, user)``
   会被迁移 0141 的部分唯一索引永久卡住,不会有任何东西再去把它解开。
+
+## 再审 Important-1:让槽位一律按 ``sandbox_id``,不按 ``(tenant, user)``
+
+C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的清理会误伤接
+管者。两处全改成按 ``sandbox_id``,``SandboxInstanceStore.drop_warm`` 随
+之删除(零调用方,留着就是留一个默认不安全的写法)。完整推理见
+:meth:`AgentSandboxClient._unwind_slot`。
 """
 
 from __future__ import annotations
 
 import base64
-import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -102,7 +108,7 @@ logger = logging.getLogger(__name__)
 #: ``"pause"``;2026-08-04 集群实测印证(``get_info()`` 回
 #: ``started_at=10:49:10 / end_at=10:54:10``,正好 300s;``lifecycle=None``)。
 #: 不传的话沙箱 5 分钟就被平台杀掉——下次 acquire 的 connect 失败 →
-#: ``drop_warm`` → 重建,能自愈(波 1 验收的热复用那一项恰好在 5 分钟窗口内
+#: 清行 → 重建,能自愈(波 1 验收的热复用那一项恰好在 5 分钟窗口内
 #: 跑完,所以没暴露),代价是白付一次 35-40s 冷启 + 工作区里的文件没了。
 #:
 #: **为什么是 20 分钟**:要"我们自己的 reap 空闲扫是主角、平台超时只是兜底",
@@ -126,6 +132,12 @@ _SANDBOX_TIMEOUT_S = 20 * 60
 #: imported, for the same wrong-direction-dependency reason the persistence
 #: package mirrors that service's idle TTL instead of importing its settings.
 _RELEASE_DESTROY_REASON = "release"
+
+#: ``destroy_reason`` written when :meth:`AgentSandboxClient.acquire` cannot
+#: reconnect to a warm session and tears its row down before rebuilding
+#: (spec § 6.3). Same literal the removed ``drop_warm`` wrote, so existing
+#: ``sandbox_instance.destroy_reason`` histories stay comparable.
+_WARM_RECONNECT_DESTROY_REASON = "warm_reconnect_failed"
 
 
 @dataclass
@@ -305,17 +317,24 @@ class AgentSandboxClient:
                 # _SANDBOX_TIMEOUT_S 被平台 kill)必须能重建,不能把 run 打死。
                 logger.warning("warm sandbox connect failed, rebuilding", exc_info=True)
                 if user_id is not None:
-                    await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
+                    # 再审 Important-1(与 _unwind_slot 同一个根因):清的是
+                    # 连不上的**那一行**(winner_id,claim_warm 刚返回给我们
+                    # 的),不是"此刻占着 (tenant, user) 槽位的那一行"——C-1
+                    # 的接管让这两者不再恒等,按坐标删会误伤接管者。
+                    await self.store.mark_destroyed(
+                        sandbox_id=winner_id, reason=_WARM_RECONNECT_DESTROY_REASON
+                    )
                     # 重新占坑,让本次 acquire 的 sandbox_id 拥有一行 ——
                     # 否则下面的 set_container_id 无行可回填。槽位刚被让出,
-                    # 正常情况下这次必赢;真撞上第三方竞争者也只是这次
-                    # acquire 的返回值不完全精确热复用,不影响正确性上限
-                    # (与 brief 原始草稿同等严谨程度,未过度设计)。
+                    # 正常情况下这次必赢;真撞上第三方竞争者(重新占坑输了)
+                    # 时这里拿不到行,下面的 set_container_id 会按契约抛错、
+                    # 由 Important-6 那层守卫 kill 掉刚建的沙箱并冒泡成一个
+                    # 可重试的错误 —— 不会再悄悄多留一个 microVM。
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                     )
                 sbx = await self._create_and_track(
-                    tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, egress=egress
+                    tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
                 )
                 just_created = True
             else:
@@ -328,7 +347,7 @@ class AgentSandboxClient:
             if user_id is None:  # 临时沙箱不经过 claim_warm,得先插一行——见 create_ephemeral。
                 await self._create_ephemeral_row(tenant_id=tenant_id, sandbox_id=sandbox_id)
             sbx = await self._create_and_track(
-                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, egress=egress
+                tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
             )
             just_created = True
 
@@ -352,15 +371,11 @@ class AgentSandboxClient:
             if just_created:
                 # 只有"这次自己建的"才拆:复用既有热会话时 sbx 是别人的沙箱、
                 # 那一行也已经健康登记过,种子文件写失败不该把它连锅端了。
-                await self._discard_new_sandbox(
-                    sbx, tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
-                )
+                await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
         return sandbox_id
 
-    async def _discard_new_sandbox(
-        self, sbx: Any, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
-    ) -> None:
+    async def _discard_new_sandbox(self, sbx: Any, *, sandbox_id: UUID) -> None:
         """拆掉一个本次调用刚建起来、但还没能被任何一行记住的沙箱。
 
         先 kill 再让槽位:kill 是尽力而为(沙箱可能本来就没起来 / 平台侧已
@@ -377,12 +392,7 @@ class AgentSandboxClient:
                 sandbox_id,
                 exc_info=True,
             )
-        await self._unwind_slot(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            sandbox_id=sandbox_id,
-            reason="post_create_failed",
-        )
+        await self._unwind_slot(sandbox_id=sandbox_id, reason="post_create_failed")
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -406,7 +416,6 @@ class AgentSandboxClient:
         self,
         *,
         tenant_id: UUID,
-        user_id: UUID | None,
         sandbox_id: UUID,
         egress: EgressContext | None,
     ) -> Any:
@@ -420,15 +429,15 @@ class AgentSandboxClient:
         ``(tenant, user)`` 之后所有新的 ``claim_warm`` INSERT,而
         ``claim_warm`` 自己看到"行存在但 container_id 是 NULL"时的约定行为
         是 raise "already being created"(见 Protocol docstring)—— 没有任何
-        东西会再去把这行解开,该用户的热会话彻底卡死,只能手工改库。
-        ``drop_warm`` 把槽位放出来,让下一次 acquire 能重新正常竞争。
+        东西会再去把这行解开,该用户的热会话彻底卡死,只能手工改库。清掉这
+        一行把槽位放出来,让下一次 acquire 能重新正常竞争。
 
-        二审发现(task-7-report.md "二审修复"一节):``drop_warm`` 自己也
+        二审发现(task-7-report.md "二审修复"一节):那次清理自己也
         可能失败(DB 抖动/连接池耗尽/网络分区)。如果不特殊处理,外层
-        ``raise`` 会被 ``drop_warm`` 的新异常盖过 —— 调用方按
+        ``raise`` 会被清理抛出的新异常盖过 —— 调用方按
         ``SandboxSupervisorError`` 设计的 except 链接不住原始错误(类型变
         了),而且槽位依然没清理成功,与本方法开头描述的卡死症状原样重演,
-        只是往下多埋一层。用嵌套 try/except 把 ``drop_warm`` 的失败单独
+        只是往下多埋一层。用嵌套 try/except 把清理的失败单独
         捕获+记日志(标明需要人工介入),但外层永远重新抛出 ``_create()``
         的原始异常 —— 内层的 except 块正常结束(没有再 raise)后,外层
         bare ``raise`` 重新抛出的是外层 except 语句本来在处理的那个异常,
@@ -442,42 +451,46 @@ class AgentSandboxClient:
         try:
             return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
         except Exception:
-            await self._unwind_slot(
-                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, reason="create_failed"
-            )
+            await self._unwind_slot(sandbox_id=sandbox_id, reason="create_failed")
             raise
 
-    async def _unwind_slot(
-        self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID, reason: str
-    ) -> None:
-        """让出这次 acquire 已经占下的 CAS 槽位 / 清掉它已经插下的行。
+    async def _unwind_slot(self, *, sandbox_id: UUID, reason: str) -> None:
+        """清掉这次 acquire 自己插下的那一行(顺带让出它占着的 CAS 槽位)。
 
         本身**永不抛出** —— 两个调用方都是在处理另一个异常的路上顺手清理,
         清理失败不该把原始错误换掉(那会让按 ``SandboxSupervisorError`` 写的
         except 链接不住,而且槽位照样没清干净,只是把病根往下埋一层)。
 
-        与 C-1(``claim_warm`` 接管过期孤儿行)不会互踩:这里是同进程内的快
-        路径,成功了行就没了、C-1 无行可接管;这里失败(DB 抖)时行仍停在
-        ``IN_USE``+NULL,正好落进 C-1 的 ``_STUCK_CREATE_TTL_S`` 兜底。两者都
-        是"把槽位放出来",谁先做完另一个自然没事可做,不存在 double-drop。
+        再审 Important-1 —— 热会话分支原来调 ``drop_warm(tenant_id,
+        user_id)``:按坐标定位,清的是**此刻占着槽位的那一行**,不一定是本
+        次调用插的那一行。C-1 之前两者恒等所以安全(``claim_warm`` 对所有后
+        来者都 raise,槽位主人只能是插入它的调用方);C-1 之后不再恒等——A 卡
+        在 ``create()`` 里超过 ``_STUCK_CREATE_TTL_S``(5 分钟)时 B 会**合
+        法地**接管槽位,A 随后失败走到这里就把 B 那行健康的活行标成销毁,B
+        的 microVM 从此不在 ``list_active`` 里、周期 reap 永远看不见它,只剩
+        ``release()`` 或 20 分钟平台超时能收。
+
+        改按 ``sandbox_id``(两个调用方都恰好只拥有这一行):腾 0141 槽位的
+        效果完全一样——索引键在 ``state='IN_USE' AND destroyed_at IS NULL
+        AND user_id IS NOT NULL`` 上,``mark_destroyed`` 两个都写;别人的行
+        一根汗毛都不碰。热会话与临时沙箱因此收敛成同一条语句。
+
+        与 C-1 不会互踩:这里是同进程快路径,成功了行就没了、C-1 无行可接
+        管;这里失败(DB 抖)时行仍停在 ``IN_USE``+NULL,正好落进 C-1 的
+        ``_STUCK_CREATE_TTL_S`` 兜底。
         """
-        if user_id is not None:
-            try:
-                await self.store.drop_warm(tenant_id=tenant_id, user_id=user_id)
-            except Exception:
-                logger.error(
-                    "drop_warm failed while unwinding a failed acquire (%s) — "
-                    "tenant=%s user=%s stays wedged behind the 0141 warm-slot "
-                    "index until the claim_warm stuck-create TTL takes it over",
-                    reason,
-                    tenant_id,
-                    user_id,
-                    exc_info=True,
-                )
-        else:
-            # 尽力而为:清不掉也不阻塞,list_stuck_creating 的 TTL 兜底稍后会捡走。
-            with contextlib.suppress(Exception):
-                await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        try:
+            await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        except Exception:
+            logger.error(
+                "failed to clear sandbox row %s while unwinding a failed "
+                "acquire (%s) — the row stays IN_USE with a NULL container_id "
+                "until claim_warm's stuck-create TTL takes it over (or a "
+                "force reap clears it)",
+                sandbox_id,
+                reason,
+                exc_info=True,
+            )
 
     async def _create(
         self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None

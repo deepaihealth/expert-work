@@ -98,12 +98,12 @@ _STUCK_CREATE_TTL_S = 5 * 60
 
 #: ``destroy_reason`` written when ``claim_warm`` takes over a stale
 #: mid-create row (whole-branch review Critical-1). Deliberately distinct
-#: from ``drop_warm``'s ``"warm_reconnect_failed"`` and from ``reap``'s
-#: ``"reap_orphaned_create"``: all three clear the same wedged shape, but an
-#: operator reading ``destroy_reason`` should be able to tell WHICH path did
-#: it — this one means "a later acquire found the orphan and took the slot",
-#: which is the only one of the three that happens with no operator action
-#: and no reaper cycle.
+#: from ``AgentSandboxClient``'s ``"warm_reconnect_failed"`` and from
+#: ``reap``'s ``"reap_orphaned_create"``: all three clear the same wedged
+#: shape, but an operator reading ``destroy_reason`` should be able to tell
+#: WHICH path did it — this one means "a later acquire found the orphan and
+#: took the slot", which is the only one of the three that happens with no
+#: operator action and no reaper cycle.
 _REASON_STUCK_CREATE_TAKEOVER = "stuck_create_takeover"
 
 
@@ -334,28 +334,6 @@ class SqlSandboxInstanceStore:
             )
             await session.commit()
 
-    async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        # Same terminal write as mark_destroyed (frees the 0141 partial
-        # index slot) but keyed by (tenant, user) instead of sandbox_id —
-        # acquire() doesn't have the dead row's internal id at this point,
-        # only the warm-session coordinate it failed to connect to.
-        async with self._sf() as session:
-            await session.execute(
-                sa_update(SandboxInstanceRow)
-                .where(
-                    SandboxInstanceRow.tenant_id == tenant_id,
-                    SandboxInstanceRow.user_id == user_id,
-                    SandboxInstanceRow.state == _STATE_IN_USE,
-                    SandboxInstanceRow.destroyed_at.is_(None),
-                )
-                .values(
-                    state=_STATE_DESTROYED,
-                    destroyed_at=_utc_now(),
-                    destroy_reason="warm_reconnect_failed",
-                )
-            )
-            await session.commit()
-
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         async with self._sf() as session:
             container_id = (
@@ -569,12 +547,6 @@ class InMemorySandboxInstanceStore:
             if self._warm.get(key) == sandbox_id:
                 del self._warm[key]
 
-    async def drop_warm(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        key = (tenant_id, user_id)
-        sandbox_id = self._warm.pop(key, None)
-        if sandbox_id is not None:
-            self._rows.pop(sandbox_id, None)
-
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
         row = self._rows.get(sandbox_id)
         return row.container_id if row is not None else None
@@ -582,10 +554,10 @@ class InMemorySandboxInstanceStore:
     async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
         """Mirrors :meth:`SqlSandboxInstanceStore.is_warm_session`.
 
-        ``_rows`` only ever holds live rows (``mark_destroyed`` /
-        ``drop_warm`` pop them), so "row present" already carries the SQL
-        store's ``state='IN_USE' AND destroyed_at IS NULL`` half — the only
-        thing left to check is ``user_id``.
+        ``_rows`` only ever holds live rows (``mark_destroyed`` pops them),
+        so "row present" already carries the SQL store's ``state='IN_USE'
+        AND destroyed_at IS NULL`` half — the only thing left to check is
+        ``user_id``.
         """
         row = self._rows.get(sandbox_id)
         return row is not None and row.user_id is not None
