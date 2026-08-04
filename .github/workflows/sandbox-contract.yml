@@ -51,13 +51,32 @@ env:
 jobs:
   agent-sandbox-contract:
     name: Contract suite against the real E2B test cluster
+    # 独立审查 I-1:fork PR 在 GitHub 平台层面就拿不到 repo secrets——
+    # `pull_request` 触发的 run 只要 head 仓库不是本仓库,`secrets.*` 一律
+    # 解析成空字符串,这与本文件怎么写无关。下面新加的凭据检查步骤是硬
+    # 失败,如果不把这类 run 整个跳过,每一个外部贡献者的 fork PR 都会因为
+    # 一件他们无论如何都补不上的事变红。push(只有本仓库自己的 main 分支
+    # 收到推送才会触发)和 workflow_dispatch(需要本仓库协作者权限才能手动
+    # 触发)两种场景不受影响,永远有 secrets,照常跑并接受硬失败检查——这个
+    # 仓库是 public 的,fork PR 是真实会发生的场景,不是纸面假设。
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     # 冷启单条 30-40s(2026-08-04 探针实测)——7 条 × 冷启上限 + setup 步骤,
-    # 留够余量。共享 runner 打公网 E2B 集群本身就比本地 docker compose 多一
-    # 层不确定性(网络抖动/集群负载),continue-on-error 同 ci.yml 的
-    # test-integration job / sandbox-gvisor.yml 的既有先例——不拿它挡 PR。
+    # 留够余量。
+    #
+    # 故意不学 ci.yml 的 test-integration job / sandbox-gvisor.yml 的 gvisor
+    # job 加 continue-on-error: true(独立审查 I-1)。那两个 job 覆盖的是大
+    # 而全的通用测试面,一条无关测试的网络抖动就把整条不相关的改动挡在门外
+    # ——不值得。这个 job 反过来:design spec § 九点名它是防两套
+    # SandboxRuntime 实现漂移的**唯一手段**,path-filtered 到只在沙箱相关
+    # 代码改动时触发,全部 7 条断言对齐同一份契约。continue-on-error 不管摆
+    # 在 job 级还是单个 pytest step 级,job 的最终 conclusion 在 GitHub 那边
+    # 都会是 success,哪怕这 7 条里真的抓到一次两套实现不一致——而这恰恰是
+    # 它唯一的职责。真连一个云端测试集群确实比本地 docker compose 多一层
+    # 网络不确定性,但这里选择让这份不确定性如实体现在 job 的红绿上,而不是
+    # 用 continue-on-error 统一吞掉;真出现网络抖动导致的假红,人工重跑这个
+    # job 即可。
     timeout-minutes: 15
-    continue-on-error: true
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -74,6 +93,30 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v7
+
+      - name: Require the E2B credential secret
+        # 独立审查 I-1:契约测试的 fixture(_agent_sandbox_runtime,
+        # test_sandbox_runtime_contract.py)在凭据缺失时是 pytest.skip 掉
+        # 全部 7 条契约测试,不是 fail——pytest 对全部跳过的 run 仍然
+        # exit 0,pyproject.toml 的 addopts 没有任何东西把"全跳过"变成
+        # 失败。缺这一步之前,secret 没配等同于 job 报绿但什么都没真的
+        # 验证过。
+        #
+        # secret 走 env: 传给 shell,不用 `${{ }}` 直接拼进 run: 的脚本
+        # 文本——那样会把明文凭据字面写进构造出来的命令行里。这不是风格
+        # 偏好:这个任务已经真的把一把 E2B key 吐进过一次会话记录(细节见
+        # task-10-report.md § 5.3),key 已轮换,不再开第二条口子。
+        #
+        # 上面 job 级的 if: 已经把 fork PR 整个跳过,走到这一步还缺凭据,
+        # 只可能是 push / workflow_dispatch / 同仓库 PR 三种"本该有
+        # secret"的场景配错了 secret——必须让 job 变红,不能悄悄放行。
+        env:
+          EXPERT_WORK_SANDBOX_E2B_API_KEY: ${{ secrets.EXPERT_WORK_SANDBOX_E2B_API_KEY }}
+        run: |
+          if [ -z "${EXPERT_WORK_SANDBOX_E2B_API_KEY}" ]; then
+            echo "::error::EXPERT_WORK_SANDBOX_E2B_API_KEY secret 未设置或为空。" >&2
+            exit 1
+          fi
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
