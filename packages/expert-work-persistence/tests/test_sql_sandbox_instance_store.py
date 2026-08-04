@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import update
+from sqlalchemy import select, update
 from testcontainers.postgres import PostgresContainer
 
 from expert_work.persistence import (
@@ -31,6 +31,7 @@ from expert_work.persistence import (
 from expert_work.persistence.models import SandboxInstanceRow
 from expert_work.persistence.sandbox_instance_store import (
     _IDLE_TTL_S,
+    _REASON_STUCK_CREATE_TAKEOVER,
     _STUCK_CREATE_TTL_S,
     SqlSandboxInstanceStore,
 )
@@ -557,3 +558,103 @@ async def test_list_stuck_creating_excludes_ready_row(
 
     stuck_ids = set(await store.list_stuck_creating())
     assert sandbox_id not in stuck_ids
+
+
+# ---------------------------------------------------------------------------
+# 全分支终审 Critical-1 —— claim_warm 接管过期的"卡在创建中"行。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_warm_takes_over_a_stale_mid_create_row(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """Critical-1 的核心场景:编排进程死在 ``claim_warm`` 提交行与
+    ``set_container_id`` 回填之间(pod OOM-kill / 驱逐 / 滚动更新),那行
+    永远停在 ``IN_USE`` + ``container_id=NULL``。
+
+    修复前:该 ``(tenant, user)`` 之后**每一次** ``claim_warm`` 都撞
+    "already being created" 的 raise,而仓内没有任何自动路径会解开它
+    (波 1 验收期间真的发生过一次,靠人工 force-reap 才恢复)。
+    修复后:超过 ``_STUCK_CREATE_TTL_S`` 的这类行被接管——清掉、重试
+    INSERT,本次调用正常拿到槽位(返回 ``None`` = 我是新赢家)。
+
+    ``test_claim_warm_second_caller_raises_when_winner_not_ready`` 是这条的
+    反向:同样的 NULL-container 行,但**还新鲜**(在合法冷启窗口内)时仍
+    然 raise,不会被接管。两条一起钉住"接管必须带时限"这个不变式。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    orphan_id = uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=orphan_id) is None
+    )
+    # 不调用 set_container_id —— 模拟"死在两次写之间";再 backdate
+    # acquired_at 到远超阈值,公开 API 造不出"很久以前"这个前置状态。
+    long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(SandboxInstanceRow)
+                .where(SandboxInstanceRow.id == orphan_id)
+                .values(acquired_at=long_ago)
+            )
+    finally:
+        await engine.dispose()
+
+    newcomer_id = uuid4()
+    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=newcomer_id)
+
+    assert result is None, "过期的孤儿行必须被接管,这次调用应当成为新赢家"
+    # 新行真的插进去了(不是"raise 没发生"这种弱断言):它现在是这个
+    # (tenant, user) 唯一的活跃行,且 container_id 待回填。
+    assert await store.get_container_id(sandbox_id=newcomer_id) is None
+    await store.set_container_id(sandbox_id=newcomer_id, container_id="sbx-after-takeover")
+    assert await store.get_container_id(sandbox_id=newcomer_id) == "sbx-after-takeover"
+
+
+@pytest.mark.asyncio
+async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
+    """接管走的是终态写(腾出 0141 部分唯一索引的槽位),并且写的是一个
+    **专属** ``destroy_reason``——运维读这一列时要能分清槽位是被谁清的:
+    ``drop_warm``(唤醒失败)/ ``reap_orphaned_create``(强制清扫)/ 这里
+    的 ``stuck_create_takeover``(后来的 acquire 自己发现并接管,三者里唯一
+    不需要人工动作也不依赖 reaper 周期的一条)。
+    """
+    tenant_id, user_id, orphan_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=orphan_id) is None
+    )
+    long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(SandboxInstanceRow)
+                .where(SandboxInstanceRow.id == orphan_id)
+                .values(acquired_at=long_ago)
+            )
+
+        assert (
+            await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) is None
+        )
+
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(
+                        SandboxInstanceRow.state,
+                        SandboxInstanceRow.destroyed_at,
+                        SandboxInstanceRow.destroy_reason,
+                    ).where(SandboxInstanceRow.id == orphan_id)
+                )
+            ).one()
+    finally:
+        await engine.dispose()
+
+    state, destroyed_at, destroy_reason = row
+    assert state == "DESTROYED"
+    assert destroyed_at is not None
+    assert destroy_reason == _REASON_STUCK_CREATE_TAKEOVER

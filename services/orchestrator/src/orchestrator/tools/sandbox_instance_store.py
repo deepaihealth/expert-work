@@ -51,11 +51,25 @@ class SandboxInstanceStore(Protocol):
           ``WHERE id=...`` 影响 0 行,两处都不报错)——沙箱杀不掉,热会话槽
           位也放不出来。返回赢家的真实行 id 让 ``acquire`` 能直接复用它,
           不需要再多打一次库。
-        * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)→ 允许实现
-          raise(SQL 实现如此)。E2B 冷启实测 35-40s(见探针报告),这不是
-          罕见边界窗口,调用方必须能收到一个明确错误,而不是悄悄再建一个
-          沙箱(破坏"同时只有一个热沙箱"的不变式)或者在后续
-          :meth:`set_container_id` 时对着一个从未插入的行操作。
+        * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)且这行**还没
+          超过** ``_STUCK_CREATE_TTL_S`` → 允许实现 raise(两个生产实现都
+          如此)。E2B 冷启实测 35-40s(见探针报告),这不是罕见边界窗口,
+          调用方必须能收到一个明确错误,而不是悄悄再建一个沙箱(破坏"同时
+          只有一个热沙箱"的不变式)或者在后续 :meth:`set_container_id` 时
+          对着一个从未插入的行操作。
+        * 没占到、``container_id`` 仍是 NULL、但这行**已经超过**
+          ``_STUCK_CREATE_TTL_S`` → 实现必须**接管**它(清掉那行、重试这次
+          claim),不能 raise。全分支终审 Critical-1:上一条那个 raise 如果
+          不设时限,一次时机不巧的进程死亡(pod OOM-kill / 驱逐 / 滚动更新
+          ——多副本部署上的日常事件,波 1 验收期间已经真实发生过一次)就会
+          让那个 ``(tenant, user)`` **永久**失去沙箱能力——``claim_warm``
+          提交的行只会被后来的 ``set_container_id`` 回填,进程死在两次写之
+          间就没有任何处理器还会跑,而仓内没有任何自动路径能解开它
+          (``acquire`` 的 ``drop_warm`` 分支拿不到返回值走不到、
+          ``_create_and_track`` 的 unwind 只在同进程有效、
+          :meth:`list_stuck_creating` 只有 ``reap(force=True)`` 会调)。
+          5 分钟阈值约为实测冷启 35-40s 的 8 倍,不会跟一次合法的在途
+          ``acquire`` 抢行。行的年龄无从判断时(时间戳缺失)不接管。
         """
 
     async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:

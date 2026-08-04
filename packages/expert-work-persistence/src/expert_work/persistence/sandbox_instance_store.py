@@ -88,16 +88,42 @@ _IDLE_TTL_S = 15 * 60
 #: legitimate E2B cold-start window (measured 35-40s, 2026-08-04 probe
 #: report). 5 minutes is ~8x that measured window — comfortably wide
 #: enough to never race a genuine in-flight ``acquire()``, while not
-#: leaving a real orphan wedged for long. Only
-#: :meth:`SqlSandboxInstanceStore.list_stuck_creating` /
-#: :meth:`InMemorySandboxInstanceStore.list_stuck_creating` consult this —
-#: the regular idle sweep (``list_active(only_idle=True)``) must never
-#: touch a "looks like it's still creating" row.
+#: leaving a real orphan wedged for long. Consulted by
+#: ``list_stuck_creating`` and by ``claim_warm``'s stale-row takeover
+#: (whole-branch review Critical-1) on BOTH stores — always through
+#: :func:`_stuck_create_cutoff`, never inlined. The regular idle sweep
+#: (``list_active(only_idle=True)``) must never touch a "looks like it's
+#: still creating" row.
 _STUCK_CREATE_TTL_S = 5 * 60
+
+#: ``destroy_reason`` written when ``claim_warm`` takes over a stale
+#: mid-create row (whole-branch review Critical-1). Deliberately distinct
+#: from ``drop_warm``'s ``"warm_reconnect_failed"`` and from ``reap``'s
+#: ``"reap_orphaned_create"``: all three clear the same wedged shape, but an
+#: operator reading ``destroy_reason`` should be able to tell WHICH path did
+#: it — this one means "a later acquire found the orphan and took the slot",
+#: which is the only one of the three that happens with no operator action
+#: and no reaper cycle.
+_REASON_STUCK_CREATE_TAKEOVER = "stuck_create_takeover"
 
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _stuck_create_cutoff(now: datetime) -> datetime:
+    """``acquired_at`` older than this ⇒ an orphaned mid-create row.
+
+    A single source for the predicate so the SQL store, the in-memory
+    store, ``claim_warm``'s takeover and ``list_stuck_creating`` cannot
+    drift: all four express "is this row stuck" as
+    ``acquired_at < _stuck_create_cutoff(now)`` verbatim. This codebase has
+    been bitten before by the same rule being spelled out independently in
+    two stores and then only one of them being updated — the two stores'
+    predicates must stay identical in meaning, so they share the arithmetic
+    rather than each re-deriving it from :data:`_STUCK_CREATE_TTL_S`.
+    """
+    return now - timedelta(seconds=_STUCK_CREATE_TTL_S)
 
 
 class SqlSandboxInstanceStore:
@@ -153,6 +179,32 @@ class SqlSandboxInstanceStore:
         (otherwise a later ``destroy()`` on that never-persisted id would
         silently no-op — see ``AgentSandboxClient.acquire``). Both values
         come from the same ``SELECT`` already, no extra round trip.
+
+        Whole-branch review Critical-1 — the "still creating, raise" branch
+        above needs a time bound, or a single badly-timed process death
+        disables a user's sandbox **permanently**. The row this method
+        commits (``IN_USE`` + ``container_id=NULL``) is only backfilled by a
+        later ``set_container_id``; if the orchestrator pod is killed in
+        between (OOM-kill / eviction / rolling update — routine on a
+        multi-replica deployment, and it already happened once during wave-1
+        acceptance), no handler in that process ever runs. Every subsequent
+        ``claim_warm`` for that ``(tenant, user)`` then hits the raise
+        forever, and the review traced every path that could clear it:
+        ``acquire``'s ``drop_warm`` branch is unreachable (this method
+        raises instead of returning the tuple that branch needs),
+        ``_create_and_track``'s unwind is same-process only, and
+        :meth:`list_stuck_creating` is only reachable from
+        ``reap(force=True)`` which nothing calls on a timer.
+
+        So: ``acquired_at`` comes back in the SAME ``SELECT`` (same row, no
+        extra round trip), and a NULL-``container_id`` row older than
+        :data:`_STUCK_CREATE_TTL_S` is taken over — cleared, then the
+        existing retry loop re-runs the INSERT and this caller normally
+        wins the freed slot. There is no race against a legitimate in-flight
+        ``acquire``: the 5-minute threshold is ~8x the measured 35-40s cold
+        start. A row with a NULL ``acquired_at`` is never taken over (its
+        age is unknowable) — same defensive stance as
+        :meth:`list_stuck_creating`'s ``is_not(None)``.
         """
         for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
             now = _utc_now()
@@ -187,9 +239,15 @@ class SqlSandboxInstanceStore:
                 # alone) — otherwise "no row found" (id absent) and "row
                 # found but container_id is still NULL" would both collapse
                 # to the same `None`, and we need to tell those two apart.
+                # ``acquired_at`` rides along for the Critical-1 stale
+                # takeover below — same row, same round trip.
                 found = (
                     await session.execute(
-                        select(SandboxInstanceRow.id, SandboxInstanceRow.container_id).where(
+                        select(
+                            SandboxInstanceRow.id,
+                            SandboxInstanceRow.container_id,
+                            SandboxInstanceRow.acquired_at,
+                        ).where(
                             SandboxInstanceRow.tenant_id == tenant_id,
                             SandboxInstanceRow.user_id == user_id,
                             SandboxInstanceRow.state == _STATE_IN_USE,
@@ -203,9 +261,17 @@ class SqlSandboxInstanceStore:
                 # and this read (its owner dropped/destroyed it) — the slot
                 # may be free now, retry the claim.
                 continue
-            winner_id, existing_container_id = found
+            winner_id, existing_container_id, winner_acquired_at = found
             if existing_container_id:
                 return (winner_id, str(existing_container_id))
+            if winner_acquired_at is not None and winner_acquired_at < _stuck_create_cutoff(now):
+                # Critical-1: an orphan of a process death between this
+                # method's commit and set_container_id. Clear it and let the
+                # loop re-INSERT — see this method's docstring.
+                await self.mark_destroyed(
+                    sandbox_id=winner_id, reason=_REASON_STUCK_CREATE_TAKEOVER
+                )
+                continue
             msg = (
                 f"a sandbox is already being created for tenant={tenant_id} "
                 f"user={user_id} — retry shortly"
@@ -333,8 +399,12 @@ class SqlSandboxInstanceStore:
         so ``is_not(None)`` is belt-and-braces, not a real-world branch —
         kept for the same defensive reason as :meth:`list_active`'s
         ``container_id is None`` re-check.
+
+        Shares :func:`_stuck_create_cutoff` with :meth:`claim_warm`'s
+        takeover and with the in-memory store — "how old counts as stuck"
+        must be one rule, not four copies of the same arithmetic.
         """
-        cutoff = _utc_now() - timedelta(seconds=_STUCK_CREATE_TTL_S)
+        cutoff = _stuck_create_cutoff(_utc_now())
         async with self._sf() as session:
             result = await session.execute(
                 select(SandboxInstanceRow.id).where(
@@ -425,20 +495,37 @@ class InMemorySandboxInstanceStore:
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
     ) -> tuple[UUID, str] | None:
         key = (tenant_id, user_id)
-        existing_id = self._warm.get(key)
-        if existing_id is None:
-            self._warm[key] = sandbox_id
-            self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=user_id)
-            return None
-        container_id = self._rows[existing_id].container_id
-        if container_id:
-            # Return the WINNER's real row id, not the caller's own
-            # sandbox_id (never inserted on this path) — see
-            # SqlSandboxInstanceStore.claim_warm's docstring for why.
-            return (existing_id, container_id)
+        for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
+            existing_id = self._warm.get(key)
+            if existing_id is None:
+                self._warm[key] = sandbox_id
+                self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=user_id)
+                return None
+            existing = self._rows[existing_id]
+            if existing.container_id:
+                # Return the WINNER's real row id, not the caller's own
+                # sandbox_id (never inserted on this path) — see
+                # SqlSandboxInstanceStore.claim_warm's docstring for why.
+                return (existing_id, existing.container_id)
+            if existing.acquired_at < _stuck_create_cutoff(_utc_now()):
+                # Whole-branch review Critical-1 — mirror of the SQL store's
+                # stale-mid-create takeover, same predicate (shared
+                # _stuck_create_cutoff) and same terminal write. The two
+                # stores' claim_warm predicates must stay identical in
+                # meaning; see SqlSandboxInstanceStore.claim_warm's
+                # docstring for the full reasoning.
+                await self.mark_destroyed(
+                    sandbox_id=existing_id, reason=_REASON_STUCK_CREATE_TAKEOVER
+                )
+                continue
+            msg = (
+                f"a sandbox is already being created for tenant={tenant_id} "
+                f"user={user_id} — retry shortly"
+            )
+            raise RuntimeError(msg)
         msg = (
-            f"a sandbox is already being created for tenant={tenant_id} "
-            f"user={user_id} — retry shortly"
+            f"could not claim a warm sandbox slot for tenant={tenant_id} "
+            f"user={user_id} after {_CLAIM_WARM_MAX_ATTEMPTS} attempts"
         )
         raise RuntimeError(msg)
 
@@ -481,8 +568,9 @@ class InMemorySandboxInstanceStore:
         return row.container_id
 
     async def list_stuck_creating(self) -> list[UUID]:
-        """Mirrors :meth:`SqlSandboxInstanceStore.list_stuck_creating`."""
-        cutoff = _utc_now() - timedelta(seconds=_STUCK_CREATE_TTL_S)
+        """Mirrors :meth:`SqlSandboxInstanceStore.list_stuck_creating` —
+        same shared :func:`_stuck_create_cutoff` predicate."""
+        cutoff = _stuck_create_cutoff(_utc_now())
         return [
             sandbox_id
             for sandbox_id, row in self._rows.items()
