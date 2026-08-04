@@ -3,7 +3,16 @@
 # Deploys the W2 slice only: control-plane (2 replicas) + admin-ui +
 # Keycloak + searxng + the migrate Job. NOT here (see
 # docs/superpowers/plans/2026-07-29-w2-pr1-k8s-foundation.md):
-#   - sandbox-supervisor / credential-proxy    -> W3
+#   - sandbox-supervisor                       -> retired on this cluster;
+#     the sandbox migration replaces it with ACS Agent Sandbox (the local
+#     docker supervisor stays for local dev / CI only). See
+#     docs/superpowers/specs/2026-08-03-sandbox-migration-design.md.
+#   - credential-proxy                         -> landed (sandbox migration
+#     W1 Task 2); it survives the migration unchanged because a sandbox
+#     reaches it as a plain HTTPS_PROXY client.
+#   - the SandboxSet CR                        -> deliberately NOT here;
+#     it lives in infra/k8s/sandbox/ and is applied by hand while the
+#     namespace question is unsettled (see that file's header).
 #   - postgres / redis / pgbouncer / minio     -> replaced by Aliyun
 #     managed RDS / Redis / OSS in every overlay
 #   - nginx                                     -> replaced by this Ingress
@@ -34,6 +43,11 @@ resources:
   - keycloak/service.yaml
   - searxng/deployment.yaml
   - searxng/service.yaml
+  # Sandbox migration W1 — the audited egress path for sandboxes
+  # (HTTPS_PROXY CONNECT tunnel + per-tenant secret injection).
+  - credential-proxy/configmap.yaml
+  - credential-proxy/deployment.yaml
+  - credential-proxy/service.yaml
   # W2-PR3 — observability stack (single-replica + cloud-disk PVCs;
   # loki/promtail intentionally absent: logs go to Aliyun SLS).
   - observability/otel-collector-deployment.yaml

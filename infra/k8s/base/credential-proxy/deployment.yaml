@@ -1,0 +1,101 @@
+# credential-proxy — Stream F.5 secret injection + sandbox-egress §3.1
+# transparent proxy. Sandbox migration W1 Task 2: this service was listed as
+# "-> W3" in base/kustomization.yaml since the K8s foundation landed; this is
+# that W3.
+#
+# Why it survives the sandbox migration unchanged (spec § 三.4): it is
+# orthogonal to the sandbox runtime. A sandbox reaches it as a plain
+# `HTTPS_PROXY=http://<token>:@<host>:8081` CONNECT-proxy client, so swapping
+# the sandbox implementation from local docker to ACS Agent Sandbox does not
+# touch it. The platform's own credential injection cannot replace it either:
+# ours resolves per-tenant secrets the tenant configured at runtime, theirs is
+# declarative CR config; and the audit rows must land in our
+# `sandbox_egress_audit` table.
+#
+# Two ports, both needed:
+#   8080  the aiohttp `/forward` API — outbound secret injection (F.5)
+#   8081  the raw-asyncio CONNECT proxy sandboxes point HTTPS_PROXY at
+#
+# The egress token secret MUST match what the sandbox side uses to mint
+# tokens (`mint_egress_token` in expert-work-common): the sandbox client
+# mints, this proxy verifies. Both read it from the same Secret key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credential-proxy
+  labels:
+    app.kubernetes.io/name: credential-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: credential-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: credential-proxy
+    spec:
+      containers:
+        - name: credential-proxy
+          # Overlay pins the real tag; :latest here is a build-time
+          # placeholder only (kustomize does not resolve/validate images).
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy:latest
+          ports:
+            - name: forward
+              containerPort: 8080
+            - name: egress
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: credential-proxy-config
+            - secretRef:
+                name: credential-proxy-secrets
+          # Same local_dev SecretStore dotenv vault the control-plane mounts
+          # (see control-plane/deployment.yaml) — this is what resolves the
+          # `secret://` refs a manifest's egress allowlist points at.
+          volumeMounts:
+            - name: secret-store-files
+              mountPath: /run/secret-store
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # `/admin/health` is the only health surface this service exposes
+          # (app.py:144). It has no separate startup/live/ready split like
+          # the control-plane does, so all probes hit the same path with
+          # different timings.
+          startupProbe:
+            httpGet:
+              path: /admin/health
+              port: forward
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /admin/health
+              port: forward
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /admin/health
+              port: forward
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: secret-store-files
+          secret:
+            # Same Secret the control-plane mounts (control-plane/
+            # deployment.yaml) — one vault, two readers. `optional: true`
+            # unlike there: the control-plane cannot boot without it, but
+            # this proxy only needs it to resolve `secret://` refs in an
+            # egress allowlist, and the plain CONNECT tunnel works without
+            # any of that.
+            secretName: control-plane-secret-files
+            optional: true

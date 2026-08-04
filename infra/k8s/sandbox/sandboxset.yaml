@@ -1,0 +1,109 @@
+# Agent Sandbox pool for expert-work — sandbox migration W1 Task 2.
+#
+# WHY THIS IS NOT UNDER base/ AND NOT IN A KUSTOMIZATION
+# -----------------------------------------------------
+# base/kustomization.yaml pins `namespace: expert-work` on everything it
+# renders. The W0 PoC that proved sandbox creation works on this cluster
+# created its SandboxSet in `default`, and nothing yet tells us whether the
+# sandbox-gateway (which lives in `sandbox-system`) discovers pools across
+# namespaces. W1 Task 3 is a GO/NO-GO gate on "can E2B reach a sandbox at
+# all" — running it against an unproven namespace would let a namespace
+# problem masquerade as a data-plane failure and blow up the gate verdict
+# for the wrong reason. So this deliberately matches the PoC's proven shape
+# and is applied by hand:
+#
+#     kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
+#
+# Once the gate is green, moving this into base/ under `expert-work` is a
+# small follow-up with a known-good baseline to compare against.
+#
+# SHAPE
+# -----
+# Copied from the PoC's `SandboxSet/base` (the only shape verified to work
+# here), with three deliberate changes: our own image, replicas 1 instead of
+# 0, and 1c/2Gi instead of 0.5c/1Gi.
+#
+#   compute-class: agent-sandbox   selects the microVM sandbox compute type;
+#                                  without this label you get an ordinary pod
+#   runtimes: agent-runtime        injects envd as a native sidecar — this is
+#                                  how `commands.run` reaches into the sandbox.
+#                                  It is NOT baked into our image (W1 Task 1
+#                                  checked: the platform injects it via a
+#                                  shared volume at $ENVD_DIR)
+#   runtimes: csi                  CSI volume support — unused this wave
+#                                  (workspace is the sandbox's own disk until
+#                                  wave 2 mounts NAS), kept because the PoC
+#                                  proved this exact combination works
+#   persistentContents: filesystem the filesystem survives pause/resume, which
+#                                  is what makes warm sessions worth having
+#
+# The container command REPLACES our image's ENTRYPOINT (`python
+# /opt/runner.py`). That is intentional and is the core runtime difference of
+# this migration: the local docker supervisor drives runner.py's line-JSON
+# protocol over a held pipe, while here the container just stays alive and
+# envd executes commands beside it (spec § 6.1). runner.py stays in the image
+# — the local supervisor backend still uses it — it simply is not PID 1 here.
+# `bash` being the command is also why the image MUST ship bash.
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: expert-work-sandbox
+  namespace: default
+spec:
+  # Pool size. Claiming from a warm pool was 0.09s in the PoC vs ~40s cold —
+  # 1 is enough for one operator; raise it when concurrent runs justify it.
+  replicas: 1
+  persistentContents:
+    - filesystem
+  runtimes:
+    - name: agent-runtime
+    - name: csi
+  updateStrategy:
+    maxUnavailable: 20%
+  template:
+    metadata:
+      labels:
+        alibabacloud.com/compute-class: agent-sandbox
+    spec:
+      automountServiceAccountToken: false
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      # The PoC pulled public images (anolisos/busybox) so it never needed
+      # this. Our sandbox image is in the private ACR, and the `acr-pull`
+      # credential lives in the `expert-work` namespace — a Secret cannot be
+      # referenced across namespaces, so it was copied into `default`:
+      #
+      #   kubectl -n expert-work get secret acr-pull \
+      #     -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > /tmp/acr-cfg.json
+      #   kubectl -n default create secret docker-registry acr-pull \
+      #     --from-file=.dockerconfigjson=/tmp/acr-cfg.json
+      #
+      # Without it the pod reaches ImagePullBackOff with
+      # "insufficient_scope: authorization failed" — and the pool silently
+      # sits at availableReplicas 0 rather than surfacing an error. Folding
+      # this file into base/ under `expert-work` (see header) also removes
+      # the copy.
+      imagePullSecrets:
+        - name: acr-pull
+      containers:
+        - name: main
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:654a2b29
+          imagePullPolicy: IfNotPresent
+          # See the ENTRYPOINT note in this file's header.
+          command:
+            - bash
+            - -c
+            - sleep 2147483647
+          # The docker supervisor's per-sandbox ceiling is 1 CPU / 1024MB
+          # (supervisor env). Memory is doubled here because this image is
+          # 2.46GB and LibreOffice/Node need headroom the old tmpfs-backed
+          # sandbox did not. The platform rounds requests to its own
+          # undocumented size tiers — W1 Task 3's probe reports what we
+          # actually get.
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi

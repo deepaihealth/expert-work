@@ -1,0 +1,32 @@
+# Non-secret credential-proxy settings. Secrets (DB DSN, egress token
+# secret) come from the `credential-proxy-secrets` Secret the overlay
+# provides — see overlays/test/secrets.env.example.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credential-proxy-config
+data:
+  EXPERT_WORK_CRED_PROXY_LOG_LEVEL: "INFO"
+
+  # sandbox-egress §3.1 — the CONNECT proxy port sandboxes point
+  # HTTPS_PROXY at. Must match the port the Service and the sandbox-side
+  # proxy URL use.
+  EXPERT_WORK_CRED_PROXY_EGRESS_PORT: "8081"
+
+  # Same local_dev dotenv vault the control-plane uses (see
+  # base/configmap.yaml's EXPERT_WORK_SECRET_STORE_BACKEND note). This is
+  # what resolves the `secret://` refs a manifest's egress allowlist
+  # points at. Single replica here, so local_dev's "secret lands in one
+  # pod only" hazard does not apply — but if this Deployment ever scales
+  # past 1, it inherits that problem and must move to sql_encrypted.
+  EXPERT_WORK_CRED_PROXY_SECRET_STORE_BACKEND: "local_dev"
+  EXPERT_WORK_CRED_PROXY_SECRET_STORE_ENV_FILE: "/run/secret-store/secret-store.env"
+
+  # NOTE for W1 Task 7 (AgentSandboxClient): the egress token is minted on
+  # the SANDBOX side and verified here, so the minting side needs the SAME
+  # secret value. Today the local docker supervisor mints it from
+  # EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET; on this cluster the minter
+  # will be AgentSandboxClient running inside the control-plane process,
+  # so the control-plane's own config/secret must carry the same value.
+  # A mismatch does not fail loudly at boot — it surfaces as every sandbox
+  # egress request getting 407 from this proxy.
