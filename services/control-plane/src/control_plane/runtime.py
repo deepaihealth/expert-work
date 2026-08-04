@@ -1440,6 +1440,21 @@ def build_sandbox_runtime(
 ) -> SandboxRuntime | None:
     """按 ``sandbox_backend`` 选沙箱运行时实现。
 
+    ``settings.sandbox_backend`` 为 ``None`` 时按老配置推断:设了
+    ``sandbox_supervisor_url`` 就当 ``"supervisor"``,否则没有后端(不破坏
+    只设过 URL 的现网部署)。两个分支:
+
+    * ``"supervisor"`` → :class:`HTTPSupervisorRuntime`(本地 docker
+      sandbox-supervisor,开发/CI)。没配 URL 则 ``None``。
+    * ``"agent_sandbox"`` → :class:`AgentSandboxClient`(ACS Agent Sandbox /
+      E2B SDK,云上多节点)。三项 E2B 配置缺任何一项 **raise**,不返回
+      ``None`` —— 全分支终审"合并前"清单第 3 条:静默降级的表现是"声明了
+      ``exec_python`` 的 agent 在构建期失败",域名少打一个字母要靠一路回溯
+      到这里才查得出来,而这是个纯配置错误,该在进程起来的时候就点名说是
+      哪个 key。与 supervisor 分支的"没 URL 就 ``None``"不对称是有意的:那
+      条是本来就存在的合法降级(压根没部署 supervisor),而显式把后端设成
+      ``agent_sandbox`` 却漏配凭据,只可能是配错了。
+
     ``None`` → ``exec_python`` 等沙箱工具不可用;声明了沙箱工具的 agent
     在构建期失败并给出明确错误(既有降级路径,波 1 不改)。
 
@@ -1468,12 +1483,21 @@ def build_sandbox_runtime(
     if backend is None:
         backend = "supervisor" if settings.sandbox_supervisor_url else None
     if backend == "agent_sandbox":
-        if not (
-            settings.sandbox_e2b_domain
-            and settings.sandbox_e2b_api_key
-            and settings.sandbox_e2b_template
-        ):
-            return None
+        missing = [
+            name
+            for name, value in (
+                ("EXPERT_WORK_SANDBOX_E2B_DOMAIN", settings.sandbox_e2b_domain),
+                ("EXPERT_WORK_SANDBOX_E2B_API_KEY", settings.sandbox_e2b_api_key),
+                ("EXPERT_WORK_SANDBOX_E2B_TEMPLATE", settings.sandbox_e2b_template),
+            )
+            if not value
+        ]
+        if missing:
+            msg = (
+                "sandbox_backend='agent_sandbox' requires " + " + ".join(missing) + " — "
+                f"{'they are' if len(missing) > 1 else 'it is'} unset or empty"
+            )
+            raise RuntimeError(msg)
         return AgentSandboxClient(
             domain=settings.sandbox_e2b_domain,
             api_key=settings.sandbox_e2b_api_key,
@@ -1496,8 +1520,17 @@ def build_workspace_store(url: str | None) -> WorkspaceStore | None:
     波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
 
     ``None`` → 工作区文件端点不可用,与 ``build_sandbox_runtime`` 同语义。
+
+    全分支终审"合并前"清单第 4 条:判据是 ``not url`` 而不是 ``url is
+    None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是真值判断,而
+    ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个 overlay 关掉
+    supervisor 的写法,见 ``infra/k8s/overlays/*/configmap-patch.yaml``)在
+    ``is None`` 下会造出一个 ``base_url=""`` 的活 store —— 它不是"不可用",
+    而是每次请求都拿一个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那
+    步报成**失败**而不是跳过,工作区端点回一个传输错误而不是它们的空结果
+    分支。
     """
-    if url is None:
+    if not url:
         return None
     return SupervisorWorkspaceStore(base_url=url)
 
