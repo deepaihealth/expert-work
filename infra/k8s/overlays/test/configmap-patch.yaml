@@ -46,8 +46,34 @@ data:
   # already right for this env — keys land in control-plane-secrets
   # (W2-PR3). Langfuse's own env is patched in
   # langfuse-configmap-patch.yaml.
-  # sandbox-supervisor doesn't exist yet (ships W3); blank overrides
-  # base's compose-only default so control-plane doesn't try to dial a
-  # Service that isn't deployed.
+  # There is no sandbox-supervisor Deployment on this cluster and there
+  # never will be — the sandbox migration replaced it here with ACS Agent
+  # Sandbox. Blank overrides base's compose-only default so nothing dials
+  # a Service that isn't deployed. It stays blank rather than being
+  # deleted because settings.py's backend inference reads it: with
+  # EXPERT_WORK_SANDBOX_BACKEND set explicitly below, inference is bypassed
+  # anyway, but a non-empty value here would be a live foot-gun the day
+  # someone flips the backend back to "supervisor" to debug.
   EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""
+  # Sandbox migration W1 — sandboxes run as ACS Agent Sandbox microVMs
+  # reached through the E2B SDK, not local docker containers.
+  EXPERT_WORK_SANDBOX_BACKEND: "agent_sandbox"
+  # The ack-sandbox-manager gateway's domain, WITHOUT the `*.` prefix and
+  # without a scheme. Reached over plain HTTP: the ALB only listens on 80,
+  # which is why AgentSandboxClient calls patch_e2b(https=False). The
+  # matching API key is EXPERT_WORK_SANDBOX_E2B_API_KEY in
+  # control-plane-secrets.
+  EXPERT_WORK_SANDBOX_E2B_DOMAIN: "expert-work-sbx-test.deepaihealth.com"
+  # The SandboxSet to claim warm sandboxes from
+  # (infra/k8s/sandbox/sandboxset.yaml). Note that CR lives in the
+  # `default` namespace, not `expert-work` — see that file's header for
+  # why; sandbox ids consequently come back as
+  # `default--expert-work-sandbox-<suffix>`.
+  EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
+  # EXPERT_WORK_SANDBOX_EGRESS_PROXY_HOST/_PORT keep their settings.py
+  # defaults (credential-proxy.expert-work.svc.cluster.local:8081), which
+  # are already right here: sandboxes run in `default` while the proxy
+  # Service is in `expert-work`, so the FQDN — not the short name — is
+  # what resolves. The HMAC key the sandbox side mints egress tokens with
+  # is EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET in control-plane-secrets.
   EXPERT_WORK_WEB_SEARCH_SEARXNG_BASE_URL: "http://searxng:8080"

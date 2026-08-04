@@ -1906,3 +1906,128 @@ git commit -m "chore(deploy): 测试环境 sandbox_backend=agent_sandbox——�
 **2. 占位符扫描**:无 TBD/TODO。三处"以实测为准"是有意的 —— E2B SDK 的真实签名、超时异常类型、平台镜像要求清单,都在 Task 1 Step 2 / Task 3 Step 1 有明确的获取动作和记录去处,不是把决定甩给实施者。
 
 **3. 类型一致性**:`SandboxRuntime`(Task 5 产出)在 Task 6/7/10 用法一致;`WorkspaceStore` 五方法名(`read_file`/`list_files`/`write_file`/`delete_file`/`mark_deleted`)在 Task 4 定义后无他处引用旧名;`SandboxInstanceStore` 的四个方法(`claim_warm`/`set_container_id`/`mark_destroyed`/`drop_warm`)在 Task 7 定义,Task 9 追加 `list_active`,`FakeInstanceStore` 同步;`DEFAULT_TIMEOUT_S`/`MAX_TIMEOUT_S`/`MAX_OUTPUT_CHARS` 在 Task 8 Step 3 定义、Step 1 的测试从模块 import,一致。
+
+---
+
+## 波 1 验收记录(2026-08-04)
+
+发布:`e9ab7ca7` → 测试环境(`infra/k8s/overlays/test`,control-plane 2 副本)。
+migrate Job 跑到 `0140_token_usage_audit_grant -> 0141_sandbox_warm_unique`。
+`tools/deploy/smoke.sh test` 9/9 PASS。
+
+### 前置:配置与 Secret 接线
+
+configmap-patch 加三项(`EXPERT_WORK_SANDBOX_BACKEND=agent_sandbox` /
+`_E2B_DOMAIN` / `_E2B_TEMPLATE`),control-plane-secrets 加两项
+(`EXPERT_WORK_SANDBOX_E2B_API_KEY` / `EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET`)。
+后者与 credential-proxy 侧的 `EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET`
+**已比对确认字节一致** —— 不一致时两边都不会在启动时报错,只会表现为每次出网 407。
+
+### 验收结果
+
+| # | 验收项 | 结果 |
+|---|---|---|
+| 0 | 配置→工厂→SDK→集群 直连 | ✅ `acquire` 0.3s(池领取)/ `exec` 出 `5050` / `destroy` ok |
+| 1 | 真 agent 跑 `exec_python` | ⏳ 待人工(见下) |
+| 2 | 出网经 credential-proxy 且审计落表 | ✅ HTTPS `verdict='allowed'` bytes_up=1820 bytes_down=36247;⚠️ 明文 HTTP 407,见「发现三」 |
+| 3 | 热会话复用 | ✅ 第二次 `acquire` 0.05s(第一次 0.47s),返回同一 `sandbox_id`,`container_id` 相同,`last_used_at` 被写 |
+| 4 | reap 拆干净 | ✅ `reaped_count=2`,全表 `destroyed_at IS NULL` 归零(含一条崩溃遗留的孤儿行) |
+
+验收 0 是本计划没有的一步,插在验收 1 之前:它绕开 LLM 决策,只验
+**配置→工厂→E2B SDK→集群** 这条链。链先通再谈端到端,失败时定位范围小一个数量级。
+
+验收 3 顺带在真栈上证实了 Task 9 的 I-2 修复(`last_used_at` 此前从未被写,
+空闲清扫实际按 `acquired_at` 扫,会杀活跃会话)。验收 4 清掉的孤儿行里有一条
+正是验收 2 脚本中途崩溃留下的 `container_id IS NULL` 行 —— Task 9 I-1 修的
+`list_stuck_creating` 正是为这类行存在的,真栈上验到了。
+
+### 验收 1 为什么没做完
+
+需要在调试台建 agent 发消息。走 HTTP API 自动化要 token,而 Keycloak 的
+`expert-work-admin-ui` client 未开 direct access grants:
+
+```
+400 {"error":"unauthorized_client",
+     "error_description":"Client not allowed for direct access grants"}
+```
+
+开它是账户设置变更,且真 agent 还需要租户已配 LLM 凭据(凭据只由人从 admin UI
+粘进加密金库)。两项都超出本任务能自行决定的范围,故留人工:
+
+> 调试台 → 建一个声明了 `exec_python` 的 agent → 发「用 Python 算 1 到 100 的和并打印」
+> → 期望工具卡出现 `exec_python`、输出含 `5050`、run 正常结束。
+
+验收 0/2/3/4 已经覆盖了 runtime 层到集群的全部路径;验收 1 独有的增量是
+**build_fn 注入 → `_EgressBindingClient` 包装 → tools 节点捕获
+`SandboxSupervisorError`** 这段 agent 构建期接线。
+
+### 发现一:control-plane 镜像构建断在 `kruise-agents`(已修 `e9ab7ca7`)
+
+```
+Failed to download and build `kruise-agents @ git+https://github.com/...`
+Git executable not found. Ensure that Git is installed and available.
+```
+
+Task 7 把 `kruise-agents` 加进依赖时锁的是 GitHub rev(该包无 PyPI 发布),
+`uv sync` 拉 git 依赖要 shell 出去调 git 二进制,而 uv 的
+`python3.12-bookworm-slim` 基础镜像不带 git。**只在 Docker 里复现** —— 开发机
+永远有 git,所以一路活到第一次真构镜像。修法见该 commit。
+
+连带的持续风险:这条依赖让**镜像构建期强依赖 GitHub 可达**。构建机在国内网络
+且无代理时会断。波 4 上线前应考虑 vendor 进仓或推一份到内部 registry。
+
+### 发现二:本计划 Task 11 Step 3 的审计 SQL 列名全错
+
+计划里写的 `created_at, host, port, bytes_out, bytes_in` 在
+`sandbox_egress_audit` 上一个都不存在。真列名(见
+`packages/expert-work-persistence/src/expert_work/persistence/models/credential_proxy.py:82`):
+
+```sql
+SELECT occurred_at, target_host, target_port, verdict, bytes_up, bytes_down, error_msg
+FROM sandbox_egress_audit ORDER BY occurred_at DESC LIMIT 5;
+```
+
+计划里那几个名字是照语义猜的,没对过模型 —— 照抄会以为"审计没落表"而去查一个
+根本不存在的故障。
+
+### 发现三:明文 HTTP 走 egress proxy 恒 407(既有缺陷,非本波引入)
+
+沙箱内实测:
+
+```
+https://www.baidu.com -> 200                        # 通
+http://www.baidu.com  -> HTTPError 407              # 不通
+```
+
+根因在 stdlib:`urllib.request.ProxyHandler.proxy_open` 只在
+`if user and password:` 时才加 `Proxy-Authorization`,而我们的 proxy URL 是
+`http://<token>:@host:8081` —— 密码为空串,falsy,头永远不加。HTTPS 走
+`CONNECT`,由沙箱镜像的 `sitecustomize.py` patch `set_tunnel` 补上了头,所以反而通。
+
+**不是迁移引入的**:`supervisor.py:811` 的 `proxy_url` 与
+`agent_sandbox.py:449` 逐字相同,同一个镜像、同一套 env,两个后端行为必然一致。
+影响面也有限 —— `requests`/`httpx`/`urllib3` 都会自己发头,只有 stdlib urllib
+打明文 HTTP 这一个组合中招。
+
+本波不修(Global Constraints 写明 supervisor 冻结,且修它要动镜像里的
+`sitecustomize`,影响两个后端)。修法有两条:给 `sitecustomize` 再 patch 一层
+明文 HTTP 路径,或把 proxy URL 的空密码换成占位符让 stdlib 的
+`user and password` 成立。**后者一行,且对两个后端同时生效,是推荐做法。**
+
+### 发现四:工厂在配置缺项时静默降级
+
+`build_sandbox_runtime`(`runtime.py:1470-1476`)在
+`sandbox_backend="agent_sandbox"` 但三项 E2B 配置任一为空时 `return None`,
+表现为"声明了 `exec_python` 的 agent 构建期失败",而不是"沙箱配置不完整"。
+配错一个字母时的排查体验很差。波 2 值得改成显式抛错。
+
+### 给波 2 的注意事项
+
+1. **SandboxSet 仍在 `default` namespace**,control-plane 在 `expert-work`。
+   沙箱 id 形如 `default--expert-work-sandbox-<suffix>`。跨 ns 访问
+   credential-proxy 靠 FQDN(短名解不出),配置默认值已经是 FQDN,别改成短名。
+2. **`acr-pull` Secret 在两个 ns 各有一份**(Secret 不能跨 ns 引用)。把
+   SandboxSet 挪进 `expert-work` 时这份复制品可以删。
+3. 镜像缓存(`ImageCache` CRD)这个集群仍没有 —— 冷启 35~40s 全花在拉 2.46GB
+   镜像上,池领取则是 0.05s。`replicas` 保持 ≥1 是当前唯一的规避手段。
+4. 工作区仍是 E2B 临时盘,跨 run 不保留 —— 波 2 挂 NAS 才补齐。
