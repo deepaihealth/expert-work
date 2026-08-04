@@ -25,15 +25,17 @@ design spec 明确把这份文件定为波 1 防两套实现漂移的**唯一手
   ``sandbox_instance`` 表是 CAS 的凭据,不能用内存假件替代真集成。
 
 marker 策略:每条契约测试各自单独打 ``@pytest.mark.integration``(真连
-基础设施,任一环境变量未设就 skip),但文件末尾的 TTL 漂移断言
-(``test_idle_ttl_matches_supervisor_default``)刻意**不**打这个 marker
-——它只是比较两个包各自定义的 Python 常量,不连任何真实环境,理应在每一次
+基础设施,任一环境变量未设就 skip),但文件末尾的两条漂移断言
+(``test_exec_contract_constants_match_the_sandbox_image`` /
+``test_idle_ttl_matches_supervisor_default``)刻意**不**打这个 marker
+——它们只是比较各处定义的字面量,不连任何真实环境,理应在每一次
 ``pytest -q -m "not integration"`` 全仓扫描里就跑到,而不是只在偶尔真连
-测试集群的场次才被验证到(那正是它想防止的"没有任何东西会发现漂移")。
+测试集群的场次才被验证到(那正是它们想防止的"没有任何东西会发现漂移")。
 
-已知的一条**不可弥合**差异,写清楚是为了不让后来者当 bug 顺手"修"掉:
-超时路径的输出。``runner.py``(docker supervisor 里的 PID 1)包了一层
-``subprocess.run``,子进程被 SIGKILL 之前已经写出的部分 stdout/stderr 仍
+已知的**不可弥合**差异,写清楚是为了不让后来者当 bug 顺手"修"掉。
+
+**其一:超时路径的输出。** ``runner.py``(docker supervisor 里的 PID 1)包了
+一层 ``subprocess.run``,子进程被 SIGKILL 之前已经写出的部分 stdout/stderr 仍
 读得到,``_cap()`` 后原样放进响应。E2B 这边追到 SDK 源码(而非公开文档,
 见 task-8-report.md § 1)确认 ``AsyncCommandHandle.wait()``
 (``e2b/sandbox_async/commands/command_handle.py:127-137,172-183``)超时时
@@ -41,15 +43,40 @@ marker 策略:每条契约测试各自单独打 ``@pytest.mark.integration``(真
 输出——这一层压根没有把它们塞进去的代码路径,不是文档没写全。
 ``test_exec_timeout_contract`` 因此只断言 ``exit_code``/``timed_out``,不
 断言 stdout/stderr 内容。
+
+**其二:超出 ``[1, 300]`` 的 ``timeout_s`` 的处置。** 契约点 1 是"clamp 到
+``[1, MAX_TIMEOUT_S]``",两个后端对**范围内**的值行为一致,对**范围外**的
+值则不一致,而且这条差异端到端弥合不了:``AgentSandboxClient.exec`` 在进程
+内 clamp(``max(1, min(x, 300))``,与 ``runner.py:51`` 同一公式);
+supervisor 那侧请求还没到 ``runner.py`` 就先被 HTTP schema 拦下了——
+``sandbox_supervisor/schemas.py:68,90`` 是 ``Field(default=None, gt=0,
+le=300)``,``timeout_s=0`` / ``timeout_s=9999`` 拿到的是 422,经
+``HTTPSupervisorRuntime.exec`` 变成 ``SandboxSupervisorError``。也就是说
+``runner.py`` 那个 clamp 对 HTTP 入口而言是够不着的代码。要弥合就得改 HTTP
+schema,而 supervisor 后端这一波是冻结的。因此**没有**范围外取值的端到端
+用例;clamp 的三个常量本身改由
+``test_exec_contract_constants_match_the_sandbox_image`` 逐个钉住(它比对
+``runner.py`` 里的字面量,不需要任何真实环境),范围内的默认值行为由
+``test_exec_default_timeout_is_the_shared_default`` 端到端覆盖。
+
+**其三:输出截断的字节格式。** 契约表只约束长度上限(1_000_000 chars),不
+约束展示格式。``runner.py`` 的 ``_cap()`` 保留头尾各半、中间插一行
+``[... N chars truncated ...]`` 标记,所以它的返回值实际比上限**长**几十个
+字符;``AgentSandboxClient`` 走的是简单头部截断 ``[:MAX_OUTPUT_CHARS]``
+(理由见其 ``exec`` docstring 契约点 2)。``test_exec_output_is_capped``
+因此断言的是"被截到了上限附近",不是某个精确长度。
 """
 
 from __future__ import annotations
 
+import ast
 import os
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from orchestrator.tools.agent_sandbox import MAX_OUTPUT_CHARS
 from orchestrator.tools.sandbox import SandboxRuntime
 
 
@@ -144,6 +171,52 @@ async def test_exec_timeout_contract(runtime: SandboxRuntime) -> None:
         )
         assert outcome.timed_out is True
         assert outcome.exit_code == -1
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_default_timeout_is_the_shared_default(runtime: SandboxRuntime) -> None:
+    """契约点 1 的另一半:``timeout_s=None`` 走同一个 30 秒缺省值。
+
+    supervisor 那侧是"HTTP 请求体不带 timeout_s → 服务端用
+    ``SandboxSupervisorSettings.default_timeout_s``";agent_sandbox 那侧是
+    ``AgentSandboxClient.DEFAULT_TIMEOUT_S``。两条完全不同的路子,观测结果
+    必须相同 —— 睡 45 秒的代码在两个后端上都该在 30 秒被掐掉。三个常量本身
+    的对齐见 ``test_exec_contract_constants_match_the_sandbox_image``。
+    """
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c11")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid, code="import time; time.sleep(45)", timeout_s=None
+        )
+        assert outcome.timed_out is True
+        assert outcome.exit_code == -1
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_output_is_capped(runtime: SandboxRuntime) -> None:
+    """契约点 2:输出上限 1_000_000 chars,两个后端都不能把 5MB 原样吐回来。
+
+    断言"截到了上限附近"而不是精确长度 —— 两边的截断格式不同(见模块
+    docstring 差异其三):``runner.py`` 头尾各半 + 中间插标记,所以会比上限
+    略长几十个字符;``AgentSandboxClient`` 是简单头部截断,正好等于上限。
+    """
+    produced = 5_000_000
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c12")
+    try:
+        outcome = await runtime.exec(sandbox_id=sid, code=f"print('x' * {produced})", timeout_s=60)
+        assert len(outcome.stdout) < produced, "5MB 原样返回 = 上限根本没生效"
+        assert len(outcome.stdout) <= MAX_OUTPUT_CHARS + 200, (
+            f"截断后仍有 {len(outcome.stdout)} chars,超出 1_000_000 上限 + 截断标记的余量"
+        )
+        assert len(outcome.stdout) > MAX_OUTPUT_CHARS // 2, (
+            "截得过狠 —— 上限是 1_000_000,不该只剩零头"
+        )
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -290,6 +363,66 @@ async def test_python_variables_do_not_survive_across_exec(runtime: SandboxRunti
         assert "False" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+def _runner_py_constants() -> dict[str, int]:
+    """``infra/sandbox-image/runner.py`` 里的模块级 int 常量。
+
+    用 ``ast`` 解析而不是 import:那是镜像代码(沙箱容器里的 PID 1),既不在
+    ``sys.path`` 上,也没有理由为读三个字面量把它执行进测试进程。
+    """
+    runner = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "runner.py"
+    assert runner.is_file(), f"沙箱镜像 runner.py 不在预期位置:{runner}"
+    values: dict[str, int] = {}
+    for node in ast.parse(runner.read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, int) or isinstance(node.value.value, bool):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                values[target.id] = node.value.value
+    return values
+
+
+def test_exec_contract_constants_match_the_sandbox_image() -> None:
+    """``exec`` 契约点 1/2 的三个常量在三处必须一致。
+
+    端到端测不到的那部分由这里补上:clamp 的上/下界没有便宜的运行时观测口
+    ——范围外取值在两个后端的处置本就不同(见模块 docstring 差异其二),而
+    "300 秒真的会在第 300 秒被掐"这种用例要跑 5 分钟。所以改成钉常量:
+    ``AgentSandboxClient`` 的三个值 ↔ ``runner.py``(supervisor 那侧真正执行
+    clamp/截断的地方)的同名值,``DEFAULT_TIMEOUT_S`` 再多钉一道
+    ``SandboxSupervisorSettings.default_timeout_s``——``timeout_s=None`` 时
+    supervisor 用的是**设置项**而不是 runner.py 的那个默认值,两者今天相等
+    但来源不同,任一处改了都会让两个后端的缺省超时悄悄分叉。
+
+    与 ``test_idle_ttl_matches_supervisor_default`` 同理,刻意不打
+    ``integration`` marker:只比较字面量,不连任何真实环境。
+    """
+    from orchestrator.tools.agent_sandbox import (
+        DEFAULT_TIMEOUT_S,
+        MAX_OUTPUT_CHARS,
+        MAX_TIMEOUT_S,
+    )
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    runner = _runner_py_constants()
+    assert (DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S, MAX_OUTPUT_CHARS) == (
+        runner["DEFAULT_TIMEOUT_S"],
+        runner["MAX_TIMEOUT_S"],
+        runner["MAX_OUTPUT_CHARS"],
+    ), (
+        "AgentSandboxClient.exec 的 clamp/截断常量与 infra/sandbox-image/runner.py"
+        f" 已经不一致(客户端={DEFAULT_TIMEOUT_S}/{MAX_TIMEOUT_S}/{MAX_OUTPUT_CHARS},"
+        f" runner.py={runner['DEFAULT_TIMEOUT_S']}/{runner['MAX_TIMEOUT_S']}"
+        f"/{runner['MAX_OUTPUT_CHARS']})—— 同一次 exec 请求在两个后端会拿到不同待遇。"
+    )
+    supervisor_default = SandboxSupervisorSettings.model_fields["default_timeout_s"].default
+    assert DEFAULT_TIMEOUT_S == supervisor_default, (
+        f"timeout_s=None 时 agent_sandbox 用 {DEFAULT_TIMEOUT_S}s,"
+        f" supervisor 用 settings.default_timeout_s={supervisor_default}s —— 已经分叉。"
+    )
 
 
 def test_idle_ttl_matches_supervisor_default() -> None:
