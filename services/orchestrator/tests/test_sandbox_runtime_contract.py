@@ -55,9 +55,15 @@ le=300)``,``timeout_s=0`` / ``timeout_s=9999`` 拿到的是 422,经
 ``runner.py`` 那个 clamp 对 HTTP 入口而言是够不着的代码。要弥合就得改 HTTP
 schema,而 supervisor 后端这一波是冻结的。因此**没有**范围外取值的端到端
 用例;clamp 的三个常量本身改由
-``test_exec_contract_constants_match_the_sandbox_image`` 逐个钉住(它比对
-``runner.py`` 里的字面量,不需要任何真实环境),范围内的默认值行为由
+``test_exec_contract_constants_match_the_sandbox_image`` 逐个钉住(不需要任何
+真实环境),范围内的默认值行为由
 ``test_exec_default_timeout_is_the_shared_default`` 端到端覆盖。
+
+再审 Minor:上一句里"逐个钉住"钉的是**决定行为的那一处**,不是一律钉
+``runner.py``。上界这条尤其要紧——既然本节自己已经论证 ``runner.py`` 的
+clamp 在 HTTP 路径上够不着,拿它当闸就是拿一段死代码当闸:真正生效的是
+``schemas.ExecRequest.timeout_s`` 的 ``le``,而那个数此前没有任何东西钉。
+把它从 300 改成 600,两个后端的实际上界当场分叉,而这道闸照样绿。
 
 **其三:输出截断的字节格式。** 契约表只约束长度上限(1_000_000 chars),不
 约束展示格式。``runner.py`` 的 ``_cap()`` 保留头尾各半、中间插一行
@@ -385,17 +391,44 @@ def _runner_py_constants() -> dict[str, int]:
     return values
 
 
+def _supervisor_max_timeout_s() -> int:
+    """supervisor 侧**真正决定** ``timeout_s`` 上界的那个数。
+
+    不是 ``runner.py`` 的 ``MAX_TIMEOUT_S``:HTTP 入口的 pydantic schema
+    (``ExecRequest.timeout_s`` 的 ``Field(gt=0, le=300)``)先把超界请求拦成
+    422,runner.py 那个 clamp 在 HTTP 路径上够不着(模块 docstring 差异其二
+    已经把这条写清楚了)。从 ``model_fields`` 的 ``annotated_types.Le`` 里读,
+    不重述字面量——重述就等于又造一份会漂的副本。
+    """
+    from annotated_types import Le
+
+    from sandbox_supervisor.schemas import ExecRequest
+
+    bounds = [m.le for m in ExecRequest.model_fields["timeout_s"].metadata if isinstance(m, Le)]
+    assert len(bounds) == 1, f"ExecRequest.timeout_s 的上界约束不再是唯一一条 Le:{bounds}"
+    return int(bounds[0])
+
+
 def test_exec_contract_constants_match_the_sandbox_image() -> None:
-    """``exec`` 契约点 1/2 的三个常量在三处必须一致。
+    """``exec`` 契约点 1/2 的三个常量必须与 supervisor 侧**真正生效**的那份一致。
 
     端到端测不到的那部分由这里补上:clamp 的上/下界没有便宜的运行时观测口
     ——范围外取值在两个后端的处置本就不同(见模块 docstring 差异其二),而
-    "300 秒真的会在第 300 秒被掐"这种用例要跑 5 分钟。所以改成钉常量:
-    ``AgentSandboxClient`` 的三个值 ↔ ``runner.py``(supervisor 那侧真正执行
-    clamp/截断的地方)的同名值,``DEFAULT_TIMEOUT_S`` 再多钉一道
-    ``SandboxSupervisorSettings.default_timeout_s``——``timeout_s=None`` 时
-    supervisor 用的是**设置项**而不是 runner.py 的那个默认值,两者今天相等
-    但来源不同,任一处改了都会让两个后端的缺省超时悄悄分叉。
+    "300 秒真的会在第 300 秒被掐"这种用例要跑 5 分钟。所以钉常量。
+
+    再审 Minor —— 每个值各自钉到**决定行为的那一处**,而不是一律钉
+    ``runner.py``:
+
+    * ``MAX_TIMEOUT_S`` → ``schemas.ExecRequest.timeout_s`` 的 ``le``。
+      这条以前钉的是 ``runner.py`` 的同名常量,而按上一轮自己的发现,
+      runner.py 那个 clamp 在 HTTP 路径上**根本够不着**(schema 先返 422)。
+      于是有人把 ``le`` 从 300 改成 600 时,两个后端的实际上界立刻分叉,而这
+      道闸照样绿——闸是摆设。现在钉 ``le``,改它必红。
+    * ``MAX_OUTPUT_CHARS`` → 仍钉 ``runner.py``:截断确实是 runner.py 干的,
+      结果经 HTTP 原样回传,那才是决定行为的地方。
+    * ``DEFAULT_TIMEOUT_S`` → 仍钉 ``SandboxSupervisorSettings.default_timeout_s``
+      (``timeout_s=None`` 时 supervisor 用的是设置项),并额外与 runner.py
+      的同名默认值比一道——这个值两处都可能生效。
 
     与 ``test_idle_ttl_matches_supervisor_default`` 同理,刻意不打
     ``integration`` marker:只比较字面量,不连任何真实环境。
@@ -408,20 +441,23 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
     from sandbox_supervisor.settings import SandboxSupervisorSettings
 
     runner = _runner_py_constants()
-    assert (DEFAULT_TIMEOUT_S, MAX_TIMEOUT_S, MAX_OUTPUT_CHARS) == (
-        runner["DEFAULT_TIMEOUT_S"],
-        runner["MAX_TIMEOUT_S"],
-        runner["MAX_OUTPUT_CHARS"],
-    ), (
-        "AgentSandboxClient.exec 的 clamp/截断常量与 infra/sandbox-image/runner.py"
-        f" 已经不一致(客户端={DEFAULT_TIMEOUT_S}/{MAX_TIMEOUT_S}/{MAX_OUTPUT_CHARS},"
-        f" runner.py={runner['DEFAULT_TIMEOUT_S']}/{runner['MAX_TIMEOUT_S']}"
-        f"/{runner['MAX_OUTPUT_CHARS']})—— 同一次 exec 请求在两个后端会拿到不同待遇。"
+    supervisor_max = _supervisor_max_timeout_s()
+    assert MAX_TIMEOUT_S == supervisor_max, (
+        f"AgentSandboxClient.exec 把 timeout_s clamp 到 {MAX_TIMEOUT_S}s,而 supervisor 的"
+        f" HTTP 入口(schemas.ExecRequest.timeout_s 的 le)只接受到 {supervisor_max}s"
+        " —— 同一次 exec 请求在两个后端会拿到不同待遇。注意这里刻意不比 runner.py 的"
+        " MAX_TIMEOUT_S:那个 clamp 在 HTTP 路径上够不着(schema 先返 422),钉它等于钉"
+        " 一段死代码。"
+    )
+    assert MAX_OUTPUT_CHARS == runner["MAX_OUTPUT_CHARS"], (
+        f"AgentSandboxClient 的输出上限 {MAX_OUTPUT_CHARS} 与 infra/sandbox-image/runner.py"
+        f" 真正执行截断的 MAX_OUTPUT_CHARS={runner['MAX_OUTPUT_CHARS']} 已经不一致。"
     )
     supervisor_default = SandboxSupervisorSettings.model_fields["default_timeout_s"].default
-    assert DEFAULT_TIMEOUT_S == supervisor_default, (
+    assert DEFAULT_TIMEOUT_S == supervisor_default == runner["DEFAULT_TIMEOUT_S"], (
         f"timeout_s=None 时 agent_sandbox 用 {DEFAULT_TIMEOUT_S}s,"
-        f" supervisor 用 settings.default_timeout_s={supervisor_default}s —— 已经分叉。"
+        f" supervisor 用 settings.default_timeout_s={supervisor_default}s,"
+        f" runner.py 自己的默认值是 {runner['DEFAULT_TIMEOUT_S']}s —— 三者必须一致。"
     )
 
 
