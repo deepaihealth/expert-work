@@ -41,6 +41,7 @@ egress network, and starts a stub proxy on it; the whole module
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import os
 import subprocess
@@ -58,7 +59,7 @@ from expert_work.runtime.sandbox import SandboxRuntimeProvider
 from sandbox_supervisor.docker_client import CliDockerClient
 from sandbox_supervisor.domain import SandboxRecord, SandboxState, SupervisorError
 from sandbox_supervisor.pool import PoolReplenisher, SandboxPool
-from sandbox_supervisor.schemas import AcquireRequest
+from sandbox_supervisor.schemas import AcquireRequest, SeedFile
 from sandbox_supervisor.settings import SandboxSupervisorSettings
 from sandbox_supervisor.supervisor import SandboxSupervisor, _container_name
 
@@ -287,6 +288,39 @@ async def test_gate_45_exec_python_runs_code(expert_work: _Harness) -> None:
     assert result.exit_code == 0
     assert result.timed_out is False
     assert "42" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# skill-runtime §5.1 — seed_files materialized into /workspace at acquire
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_seed_files_land_in_workspace(expert_work: _Harness) -> None:
+    """Task 10(契约测试)真连 docker 跑通契约测试时实测揪出的 bug,这个模块
+    此前对 ``seed_files`` 零覆盖:``CliDockerClient.seed_workspace`` 用
+    ``docker cp - <container>:/workspace`` 把种子文件写进沙箱,但 docker
+    daemon 对任何 ``--read-only`` 容器的 ``docker cp`` **无条件**拒绝
+    ("container rootfs is marked read-only"),哪怕目标目录(``/workspace``)
+    是独立的可写 tmpfs 挂载——已用最小复现验证过 100% 必现,不是环境抖动。
+    ``supervisor._seed_workspace`` 把这类失败降级成"log + continue",所以
+    ``acquire`` 从不报错,种子文件只是静默从未落地。修法是改用 ``docker
+    exec <container> tar -xf - -C /workspace``(容器内部落地,不走 daemon
+    那条会检查 rootfs 只读标记的复制路径),见
+    ``CliDockerClient.seed_workspace`` 的完整 docstring。
+    """
+    content = b"SEED_CONTENT"
+    seed_files = [SeedFile(path="seeded.txt", content_b64=base64.b64encode(content).decode())]
+    acquired = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="t-seed", seed_files=seed_files)
+    )
+    result = await expert_work.supervisor.exec(
+        acquired.sandbox_id, code="print(open('/workspace/seeded.txt').read())"
+    )
+    await expert_work.supervisor.release(acquired.sandbox_id)
+
+    assert result.exit_code == 0
+    assert "SEED_CONTENT" in result.stdout
 
 
 # ---------------------------------------------------------------------------

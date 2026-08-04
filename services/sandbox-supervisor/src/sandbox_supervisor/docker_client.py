@@ -23,12 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 def _build_seed_tar(files: list[tuple[str, bytes]]) -> bytes:
-    """Pack ``(relpath, bytes)`` pairs into an uncompressed tar for ``docker cp``.
+    """Pack ``(relpath, bytes)`` pairs into an uncompressed tar for extraction
+    inside the sandbox container (see :meth:`CliDockerClient.seed_workspace`).
 
-    Members are mode 0o755 (world-readable + executable) so the non-root sandbox
-    ``agent`` user can read/run them even though ``docker cp`` extracts as root.
-    Paths are relative (e.g. ``skills/pptx/SKILL.md``); ``docker cp -
-    <c>:/workspace`` extracts them under ``/workspace`` creating parent dirs.
+    Members are mode 0o755 (world-readable + executable) — belt-and-braces now
+    that extraction runs as the container's own ``agent`` user (see
+    ``seed_workspace``'s docstring for why it is no longer a root-vs-agent
+    ownership workaround). Paths are relative (e.g. ``skills/pptx/SKILL.md``);
+    extracting with ``-C /workspace`` lands them there, creating parent dirs.
     """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -118,8 +120,10 @@ class DockerClient(Protocol):
         run as authored).
 
         Ephemeral ``/workspace`` is a per-container tmpfs that a side container
-        cannot mount, so this writes INTO the live container via ``docker cp -``
-        (tar on stdin). Covers all acquire paths (cold/pooled/reused) uniformly.
+        cannot mount, so this writes INTO the live container (``docker exec`` +
+        an in-container ``tar`` extraction — see
+        :meth:`CliDockerClient.seed_workspace` for why ``docker cp`` cannot be
+        used here). Covers all acquire paths (cold/pooled/reused) uniformly.
         No-op for an empty list. Raises :class:`DockerError` on failure.
         """
 
@@ -545,15 +549,46 @@ class CliDockerClient:
             raise DockerError(msg)
 
     async def seed_workspace(self, container_name: str, *, files: list[tuple[str, bytes]]) -> None:
-        """Stream a tar of ``files`` into ``{container}:/workspace`` via ``docker cp -``."""
+        """Stream a tar of ``files`` into ``{container}:/workspace``.
+
+        Uses ``docker exec <container> tar -xf - -C /workspace`` (stdin pipe),
+        **not** ``docker cp - <container>:/workspace``. The daemon's copy-into-
+        container path (``docker cp``) unconditionally rejects the operation
+        with "container rootfs is marked read-only" for any container started
+        with ``--read-only``(``runtime_provider.py``'s hardening — Mini-ADR
+        F-5) — it checks the container's ``HostConfig.ReadonlyRootfs`` flag
+        globally, without noticing that the actual destination (``/workspace``)
+        is a separate, writable tmpfs/volume mount, not the read-only rootfs.
+        Verified reproducible against this repo's sandbox image: ``docker cp``
+        fails 100% of the time on a ``--read-only`` container even when the
+        target directory is a writable mount; ``docker exec`` + an in-container
+        ``tar`` extraction does not go through that daemon-side check at all
+        (a new process inside the container's own mount namespace, which
+        already sees ``/workspace`` as writable) and lands the files correctly.
+        This was silently broken for every acquire with non-empty
+        ``seed_files`` — the failure degrades gracefully (caller logs +
+        continues, skill-runtime §5.1), so no run ever hard-failed; skill
+        files simply never materialized.
+
+        A side benefit: extraction now runs as the container's own default
+        user (``agent`` — no code path overrides ``--user`` on ``docker run``,
+        see ``runtime_provider.py``), so seeded files land ``agent``-owned
+        instead of root-owned. :func:`_build_seed_tar`'s 0o755 mode is no
+        longer load-bearing for that but is kept as belt-and-braces.
+        """
         if not files:
             return
         tar_bytes = _build_seed_tar(files)
         proc = await asyncio.create_subprocess_exec(
             "docker",
-            "cp",
+            "exec",
+            "-i",
+            container_name,
+            "tar",
+            "-xf",
             "-",
-            f"{container_name}:/workspace",
+            "-C",
+            "/workspace",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
