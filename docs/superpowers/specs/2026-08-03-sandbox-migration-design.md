@@ -129,7 +129,17 @@ def build_sandbox_runtime(settings: Settings) -> SandboxRuntime | None:
 
 - **基建**:建 NAS 文件系统 + PV;control-plane Pod 挂载;沙箱挂载注解带 subPath
 - **代码**:`NasWorkspaceStore`(含路径穿越防护 + 针对性测试,§ 七);§ 4.4 的 8 个调用点改指
-- **验收**:上传文档 → agent `read_document` 读到 → agent 写出文件 → 前端下载,全链路真跑
+- **技能文件搬出工作区**(2026-08-04 追加,拍板保留 per `(tenant, user)` 沙箱语义后的必然结果):
+  激活的技能现在 seed 到 `/workspace/skills/<name>/`,而热会话是 per `(tenant, user)` 不含
+  agent —— 同一用户先后用两个 agent,两套技能文件会叠在同一个目录里,且后一次 acquire 不清理
+  前一次。今天没炸是因为 agent 靠系统提示词知道自己有哪些技能、不扫目录,但这是隐式约定不是保证。
+  正解是**技能根本不该放在工作区**:它是 agent 的能力定义,不是用户的数据。写到沙箱本地的
+  非持久路径后,沙箱重建即清空、天然不叠加,用户浏览工作区也只看到自己的东西,而且**不占 NAS
+  配额**(技能每次 acquire 重 seed,存进按 GiB 计费的持久存储纯浪费)。
+  现在做不了是因为 docker 沙箱是 read-only rootfs、`/workspace` 是唯一可写处;microVM 没这个约束。
+  放波 2 而不是波 1,是因为波 1 若单改云实现会让两个后端行为分叉,直接打架 Task 10 的契约测试。
+- **验收**:上传文档 → agent `read_document` 读到 → agent 写出文件 → 前端下载,全链路真跑;
+  技能文件不再出现在用户工作区里
 
 ### 波 3 — 会话生命周期与治理
 
