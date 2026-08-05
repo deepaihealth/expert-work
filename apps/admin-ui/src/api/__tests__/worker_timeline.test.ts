@@ -101,6 +101,28 @@ describe("parseWorkerFrames", () => {
     expect(map.size).toBe(0);
   });
 
+  it("lifts the exec artifact summary off a worker tool message", () => {
+    const map = parseWorkerFrames([
+      wf("update", { wseq: 1 }, {
+        node: "tools",
+        _duration_ms: 5,
+        messages: [{
+          type: "tool",
+          name: "exec_python",
+          tool_result_excerpt: "stdout:▁ 1▁ exit_code:▁ 0",
+          exec: { exit_code: 0, timed_out: false, stdout_excerpt: "1\n", stderr_excerpt: "" },
+        }],
+      }),
+    ]);
+    const [w] = map.get("call-1") ?? [];
+    expect(w.steps[0].messages[0].exec).toEqual({
+      exitCode: 0,
+      timedOut: false,
+      stdoutExcerpt: "1\n",
+      stderrExcerpt: "",
+    });
+  });
+
   it("multiple workers on one tool call keep arrival order", () => {
     const map = parseWorkerFrames([
       wf("start", { worker_id: "a", wseq: 0 }, { task_excerpt: "1", role: null, max_steps: 1 }),

@@ -142,11 +142,29 @@ def _summarize_message(msg: BaseMessage) -> dict[str, Any]:
             summary["tool_calls"] = calls
         return summary
     if isinstance(msg, ToolMessage):
-        return {
+        summary = {
             "type": "tool",
             "name": msg.name or "",
             "tool_result_excerpt": _excerpt(_text(msg.content), WORKER_RESULT_EXCERPT),
         }
+        # PR-D — sandbox exec results carry structured streams in ``artifact``
+        # (format_sandbox_outcome.meta); the content excerpt is datamarked and
+        # unparseable. Excerpt them to the same summary budget as the content.
+        artifact = getattr(msg, "artifact", None)
+        if isinstance(artifact, dict):
+            exit_code = artifact.get("exit_code")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                summary["exec"] = {
+                    "exit_code": exit_code,
+                    "timed_out": bool(artifact.get("timed_out", False)),
+                    "stdout_excerpt": _excerpt(
+                        str(artifact.get("stdout", "")), WORKER_RESULT_EXCERPT
+                    ),
+                    "stderr_excerpt": _excerpt(
+                        str(artifact.get("stderr", "")), WORKER_RESULT_EXCERPT
+                    ),
+                }
+        return summary
     return {
         "type": msg.type,
         "content_excerpt": _excerpt(_text(msg.content), WORKER_CONTENT_EXCERPT),

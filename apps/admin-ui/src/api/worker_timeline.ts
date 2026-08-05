@@ -5,12 +5,21 @@
 import { serverMsOf } from "./sse_id";
 import type { SseEvent } from "./sessions";
 
+/** PR-D — excerpted structured exec fields riding a worker's tool summary. */
+export interface WorkerExecSummary {
+  exitCode: number;
+  timedOut: boolean;
+  stdoutExcerpt: string;
+  stderrExcerpt: string;
+}
+
 export interface WorkerMessageSummary {
   type: string;
   contentExcerpt?: string;
   toolCalls?: { name: string; argsExcerpt: string }[];
   name?: string;
   toolResultExcerpt?: string;
+  exec?: WorkerExecSummary;
 }
 
 export interface WorkerStepSummary {
@@ -115,6 +124,18 @@ function summarizeMessages(raw: unknown): WorkerMessageSummary[] {
           argsExcerpt: typeof cc.args_excerpt === "string" ? cc.args_excerpt : "",
         }];
       });
+    }
+    const ex = r.exec;
+    if (typeof ex === "object" && ex !== null) {
+      const e = ex as Record<string, unknown>;
+      if (typeof e.exit_code === "number") {
+        msg.exec = {
+          exitCode: e.exit_code,
+          timedOut: e.timed_out === true,
+          stdoutExcerpt: typeof e.stdout_excerpt === "string" ? e.stdout_excerpt : "",
+          stderrExcerpt: typeof e.stderr_excerpt === "string" ? e.stderr_excerpt : "",
+        };
+      }
     }
     out.push(msg);
   }
