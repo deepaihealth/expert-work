@@ -595,7 +595,15 @@ class AgentSandboxClient:
             return True
 
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
-        """强制拆除 —— 真 kill 沙箱并让出热会话坑。"""
+        """强制拆除 —— 真 kill 沙箱并让出热会话坑。
+
+        「kill 失败但 ``mark_destroyed`` 已成功」留下的活沙箱,唯一兜底是
+        平台 ``_SANDBOX_TIMEOUT_S``(20 分钟)超时:行终结后
+        ``get_container_id``/``touch_and_get_container_id`` 都只读活行
+        (两 store 同义),没有任何路径会再 connect 它续期。不做「二次
+        destroy 重杀」—— 代码里没有会二次 destroy 同一 id 的调用方,为
+        不可达路径保留 SQL↔memory 谓词分歧不值得(PR-A #5a)。
+        """
         try:
             sbx = await self._attach(sandbox_id)
             await sbx.kill()

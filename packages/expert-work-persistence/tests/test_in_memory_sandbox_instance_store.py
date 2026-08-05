@@ -156,3 +156,16 @@ async def test_both_stores_share_one_missing_row_wording() -> None:
     message = _missing_row_message(sandbox_id)
     assert str(sandbox_id) in message
     assert "is gone" in message
+
+
+@pytest.mark.asyncio
+async def test_create_ephemeral_does_not_overwrite_existing_row() -> None:
+    """#5b:id 碰撞时先写者赢(对齐 SQL 的 ON CONFLICT DO NOTHING)。"""
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+
+    await store.create_ephemeral(tenant_id=uuid4(), sandbox_id=sandbox_id)
+
+    # warm 行原样健在:user_id 仍在、_warm 指针没悬空
+    assert await store.is_warm_session(sandbox_id=sandbox_id) is True

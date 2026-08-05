@@ -264,6 +264,12 @@ class SqlSandboxInstanceStore:
                 # to the same `None`, and we need to tell those two apart.
                 # ``acquired_at`` rides along for the Critical-1 stale
                 # takeover below — same row, same round trip.
+                #
+                # ``image_ref`` 谓词与迁移 0142 的索引 WHERE 同义 —— 表是两
+                # 后端共用的,docker supervisor 的 warm 行不是本 CAS 的参与
+                # 者;0142 之前的 DB 上这条过滤让"撞上 docker 行"表现为大声
+                # 的 could-not-claim raise,而不是把 docker container id 当
+                # E2B sandbox id 交出去。
                 found = (
                     await session.execute(
                         select(
@@ -275,6 +281,7 @@ class SqlSandboxInstanceStore:
                             SandboxInstanceRow.user_id == user_id,
                             SandboxInstanceRow.state == _STATE_IN_USE,
                             SandboxInstanceRow.destroyed_at.is_(None),
+                            SandboxInstanceRow.image_ref == AGENT_SANDBOX_IMAGE_REF,
                         )
                     )
                 ).one_or_none()
@@ -429,11 +436,24 @@ class SqlSandboxInstanceStore:
             await session.commit()
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
+        """只读活行 —— 与 in-memory store(``mark_destroyed`` 即 pop)同义。
+
+        原先无谓词:已销毁行照样返回 container_id,同族第四条 SQL↔memory
+        分歧(前三条:``set_container_id`` / ``touch_and_get_container_id`` /
+        ``mark_destroyed``,每一条都是 SQL 向 memory 对齐收场)。曾以
+        「destroy 二次调用可重杀 kill 失败的沙箱」为由保留 —— 复盘推翻:
+        代码里没有任何路径会对同一 sandbox_id 二次 destroy,而行终结后
+        没人再 connect 续期,平台 ``_SANDBOX_TIMEOUT_S``(20 分钟)超时是
+        确定性兜底。刻意不加 ``image_ref`` 谓词:按 id 定位,id 恒来自
+        本后端 acquire 的返回值(Global Constraints)。
+        """
         async with self._sf() as session:
             container_id = (
                 await session.execute(
                     select(SandboxInstanceRow.container_id).where(
-                        SandboxInstanceRow.id == sandbox_id
+                        SandboxInstanceRow.id == sandbox_id,
+                        SandboxInstanceRow.state == _STATE_IN_USE,
+                        SandboxInstanceRow.destroyed_at.is_(None),
                     )
                 )
             ).scalar_one_or_none()
@@ -517,6 +537,10 @@ class SqlSandboxInstanceStore:
         Shares :func:`_stuck_create_cutoff` with :meth:`claim_warm`'s
         takeover and with the in-memory store — "how old counts as stuck"
         must be one rule, not four copies of the same arithmetic.
+
+        ``image_ref`` 谓词是 belt-and-braces —— docker 的 mid-create 行
+        ``state='CREATING'`` 本就不命中上面的 ``state == _STATE_IN_USE``,
+        谓词纯粹为三个集合查询口径一致而加。
         """
         cutoff = _stuck_create_cutoff(_utc_now())
         async with self._sf() as session:
@@ -527,6 +551,7 @@ class SqlSandboxInstanceStore:
                     SandboxInstanceRow.container_id.is_(None),
                     SandboxInstanceRow.acquired_at.is_not(None),
                     SandboxInstanceRow.acquired_at < cutoff,
+                    SandboxInstanceRow.image_ref == AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             return [row_id for (row_id,) in result.all()]
@@ -541,6 +566,9 @@ class SqlSandboxInstanceStore:
         ``sandbox_supervisor/store.py``):取回 ``IN_USE``/未销毁/
         ``container_id`` 已回填的行,``only_idle`` 的 idle 判定在 Python
         侧过滤,不写 per-row SQL 区间表达式。
+
+        ``image_ref`` 谓词保证 reap 只清本后端的行 —— 否则周期 reap 会把
+        docker 后端名下每一行标销毁。
         """
         async with self._sf() as session:
             result = await session.execute(
@@ -553,6 +581,7 @@ class SqlSandboxInstanceStore:
                     SandboxInstanceRow.state == _STATE_IN_USE,
                     SandboxInstanceRow.destroyed_at.is_(None),
                     SandboxInstanceRow.container_id.is_not(None),
+                    SandboxInstanceRow.image_ref == AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             rows = result.all()
@@ -598,6 +627,14 @@ class InMemorySandboxInstanceStore:
     (those hand-roll a local ``FakeInstanceStore`` per repo convention) —
     this backs ``control_plane.runtime.build_sandbox_runtime`` when no SQL
     session factory is wired (``persistence_backend="memory"``).
+
+    PR-A #5 —— image_ref 维度(SQL 侧三个集合查询上的
+    ``AGENT_SANDBOX_IMAGE_REF`` 谓词,见 :meth:`SqlSandboxInstanceStore.list_active` /
+    :meth:`SqlSandboxInstanceStore.list_stuck_creating` /
+    :meth:`SqlSandboxInstanceStore.claim_warm`)对本实现**空洞地成立**:本
+    store 只被 agent 后端进程写入,不存在 docker-supervisor 行共存于同一
+    ``_rows``——``_rows`` 里的每一行定义上都是本后端的行。不为此加一个永远
+    是同一个值的假字段。
     """
 
     def __init__(self) -> None:
@@ -646,7 +683,12 @@ class InMemorySandboxInstanceStore:
     async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
         """Mirrors :meth:`SqlSandboxInstanceStore.create_ephemeral` — a plain
         insert, no ``_warm`` bookkeeping (ephemeral rows never participate in
-        the warm-session CAS)."""
+        the warm-session CAS). First writer wins, same as the SQL side's
+        ``ON CONFLICT DO NOTHING``: 无条件 ``self._rows[...] = ...`` 会在
+        id 碰撞时把一行活着的 warm 行整个换成 ``user_id=None`` 的临时行,
+        ``_warm`` 指针悬空(指向一行不再是 warm 的行)。"""
+        if sandbox_id in self._rows:
+            return
         self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=None)
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
