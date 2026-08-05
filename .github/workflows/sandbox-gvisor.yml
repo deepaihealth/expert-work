@@ -57,7 +57,7 @@ jobs:
     # PRs on it yet (mirrors the main integration job). Tighten once stable.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Install runsc (gVisor)
         run: |

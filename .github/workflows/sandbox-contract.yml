@@ -92,7 +92,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Require the E2B credential secret
         # 独立审查 I-1:契约测试的 fixture(_agent_sandbox_runtime,
