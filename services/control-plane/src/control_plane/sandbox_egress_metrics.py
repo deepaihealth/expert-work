@@ -20,12 +20,16 @@ re-alert on every old fault after every restart. Counter semantics
 (``increase()``) are blind to the lost window regardless; alerting cares
 about "still happening", not the precise historical total.
 
-Window edges: this cycle reads ``occurred_at >= cursor`` and then sets
-``cursor = scan_start_time``. A row whose ``occurred_at`` predates the new
-cursor but that commits *after* the scan started ("late arrival") is
-skipped by the next cycle. The proxy's audit write is a synchronous commit
-on the same clock, so the race window is milliseconds — not worth the
-complexity of tracking a safety margin.
+Window edges: this cycle reads ``cursor <= occurred_at < scan_start_time``
+and then sets ``cursor = scan_start_time``. The upper bound guards against
+double-counting: without it, a row written between the ``now`` snapshot and
+the ``SELECT`` running would be counted this cycle *and* counted again next
+cycle (its ``occurred_at`` is still ``>= `` the new cursor). A row whose
+``occurred_at`` predates the new cursor but that commits *after* the scan
+started ("late arrival") is skipped by the next cycle regardless — the
+proxy's audit write is a synchronous commit on the same clock, so that race
+window is milliseconds — not worth the complexity of tracking a safety
+margin.
 """
 
 from __future__ import annotations
@@ -103,7 +107,7 @@ class SandboxEgressMetricsWorker:
         """One scan cycle; ``False`` (and a counter) on a failed read."""
         now = _utc_now()
         try:
-            counts = await self.audit_store.count_by_verdict_since(since=self._cursor)
+            counts = await self.audit_store.count_by_verdict_since(since=self._cursor, until=now)
         except Exception:
             logger.exception("sandbox_egress_metrics.cycle_failed")
             _CYCLE_ERRORS.inc()

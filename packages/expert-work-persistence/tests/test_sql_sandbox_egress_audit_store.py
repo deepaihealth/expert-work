@@ -78,6 +78,7 @@ async def test_count_by_verdict_since_aggregates_and_excludes_allowed(
     try:
         now = datetime.now(UTC)
         since = now - timedelta(minutes=5)
+        until = now + timedelta(minutes=1)
         # Two blocked_auth + one blocked_ssrf inside the window, one allowed
         # inside the window (excluded), one blocked_ssrf before the window
         # (excluded by the cursor).
@@ -87,23 +88,43 @@ async def test_count_by_verdict_since_aggregates_and_excludes_allowed(
         await _insert(engine, verdict="allowed", occurred_at=now)
         await _insert(engine, verdict="blocked_ssrf", occurred_at=since - timedelta(minutes=1))
 
-        counts = await store.count_by_verdict_since(since=since)
+        counts = await store.count_by_verdict_since(since=since, until=until)
         assert counts == {"blocked_auth": 2, "blocked_ssrf": 1}
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_count_by_verdict_since_window_boundary_is_inclusive(
+async def test_count_by_verdict_since_lower_bound_is_inclusive(
     sql_store: SqlStoreFixture,
 ) -> None:
     store, engine = sql_store
     try:
         since = datetime.now(UTC)
+        until = since + timedelta(minutes=5)
         await _insert(engine, verdict="blocked_auth", occurred_at=since)  # exactly at cursor
 
-        counts = await store.count_by_verdict_since(since=since)
+        counts = await store.count_by_verdict_since(since=since, until=until)
         assert counts == {"blocked_auth": 1}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_count_by_verdict_since_upper_bound_is_exclusive(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """Fix round 1 — double-count guard: a row landing exactly on ``until``
+    (the next cycle's ``since``) must be counted by neither cycle twice, so
+    this cycle must NOT count it."""
+    store, engine = sql_store
+    try:
+        since = datetime.now(UTC)
+        until = since + timedelta(minutes=5)
+        await _insert(engine, verdict="blocked_auth", occurred_at=until)  # exactly at scan-start
+
+        counts = await store.count_by_verdict_since(since=since, until=until)
+        assert counts == {}
     finally:
         await engine.dispose()
 
@@ -114,7 +135,8 @@ async def test_count_by_verdict_since_empty_window_returns_empty_dict(
 ) -> None:
     store, engine = sql_store
     try:
-        counts = await store.count_by_verdict_since(since=datetime.now(UTC))
+        now = datetime.now(UTC)
+        counts = await store.count_by_verdict_since(since=now, until=now + timedelta(minutes=1))
         assert counts == {}
     finally:
         await engine.dispose()
