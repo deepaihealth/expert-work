@@ -1334,6 +1334,7 @@ export interface TranslationKeys {
     exit_code: string;
     stdout_label: string;
     stderr_label: string;
+    timed_out: string;
     fire_now: string;
     firing: string;
     fire_delivered: string;
@@ -4343,6 +4344,7 @@ const en: TranslationKeys = {
     exit_code: "Exit code",
     stdout_label: "stdout",
     stderr_label: "stderr",
+    timed_out: "timed out",
     fire_now: "Run now",
     firing: "Running…",
     fire_delivered: "Result delivered",

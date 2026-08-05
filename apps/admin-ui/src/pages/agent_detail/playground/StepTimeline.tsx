@@ -443,7 +443,7 @@ function WorkerNode({ worker }: { worker: WorkerTimeline }) {
                   {m.contentExcerpt ?? ""}
                   {m.toolCalls?.map((c) => `⚙ ${c.name}(${c.argsExcerpt})`).join(" ") ?? ""}
                   {m.exec
-                    ? `→ exit ${m.exec.exitCode}${m.exec.stdoutExcerpt ? ` · ${m.exec.stdoutExcerpt}` : ""}${m.exec.stderrExcerpt ? ` ⚠ ${m.exec.stderrExcerpt}` : ""}`
+                    ? `→ exit ${m.exec.exitCode}${m.exec.timedOut ? " · timeout" : ""}${m.exec.stdoutExcerpt ? ` · ${m.exec.stdoutExcerpt}` : ""}${m.exec.stderrExcerpt ? ` ⚠ ${m.exec.stderrExcerpt}` : ""}`
                     : m.toolResultExcerpt
                       ? `→ ${m.toolResultExcerpt}`
                       : ""}

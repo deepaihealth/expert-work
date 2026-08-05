@@ -157,6 +157,32 @@ describe("ToolTimeline", () => {
     expect(screen.getByTestId("tool-exit-code").textContent).toContain("0");
   });
 
+  it("shows a timed-out tag next to the exit code when execResult.timedOut is true", () => {
+    render(
+      <ToolCallCard
+        entry={baseEntry({
+          toolName: "exec_python",
+          execResult: { stdout: "", stderr: "", exitCode: -1, timedOut: true },
+        })}
+      />,
+    );
+    openResultPanel();
+    expect(screen.getByTestId("tool-timed-out")).toBeInTheDocument();
+  });
+
+  it("does not show the timed-out tag when execResult.timedOut is unset", () => {
+    render(
+      <ToolCallCard
+        entry={baseEntry({
+          toolName: "exec_python",
+          execResult: { stdout: "1", stderr: "", exitCode: 0 },
+        })}
+      />,
+    );
+    openResultPanel();
+    expect(screen.queryByTestId("tool-timed-out")).not.toBeInTheDocument();
+  });
+
   it("does not show the badge for a clean result, and leaves args untouched", () => {
     render(
       <ToolCallCard

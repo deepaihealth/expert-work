@@ -1396,6 +1396,7 @@ const zhCN: TranslationKeys = {
     exit_code: "退出码",
     stdout_label: "stdout",
     stderr_label: "stderr",
+    timed_out: "超时",
     fire_now: "立即触发",
     firing: "触发中…",
     fire_delivered: "结果已落回对话",

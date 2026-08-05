@@ -64,6 +64,9 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  /** Set only when true (final-review fix wave) — keeps existing ``toEqual``
+   *  assertions that omit this key valid. */
+  timedOut?: boolean;
 }
 
 /** Builtin tools whose result follows ``format_sandbox_outcome``'s rendering. */
@@ -89,7 +92,12 @@ export function parseExecResult(preview: string): ExecResult {
     const next = rest.search(/\n\n(?:stdout:\n|stderr:\n|\[execution timed out)/);
     return (next === -1 ? rest : rest.slice(0, next)).trim();
   };
-  return { stdout: section("stdout"), stderr: section("stderr"), exitCode };
+  const result: ExecResult = { stdout: section("stdout"), stderr: section("stderr"), exitCode };
+  // Final-review fix wave — the timeout hint was previously visible
+  // (mangled) in the raw preview but rode nowhere in the structured result;
+  // set only when present so the field stays absent otherwise.
+  if (body.includes("[execution timed out")) result.timedOut = true;
+  return result;
 }
 
 interface ParsedName {
@@ -316,12 +324,19 @@ export function parseToolCalls(
           if (typeof act === "string" && act !== "") entry.action = act;
           // PR-D — sandbox exec tools stash their raw (pre-datamark) streams
           // here; the rendered content's newlines don't survive spotlight.
+          // Final-review fix wave — builder.py has piped meta → artifact
+          // since 2026-06-29, and pre-PR-D meta carried exit_code/timed_out/
+          // truncated WITHOUT stdout/stderr. Require a stream key too, or
+          // every historical run's artifact reads as truthy-but-empty and
+          // permanently shadows the raw-preview fallback below.
           const exit = rec.exit_code;
-          if (typeof exit === "number" && Number.isFinite(exit)) {
+          const hasStreams = typeof rec.stdout === "string" || typeof rec.stderr === "string";
+          if (typeof exit === "number" && Number.isFinite(exit) && hasStreams) {
             entry.execArtifact = {
               stdout: typeof rec.stdout === "string" ? rec.stdout : "",
               stderr: typeof rec.stderr === "string" ? rec.stderr : "",
               exitCode: exit,
+              ...(rec.timed_out === true ? { timedOut: true } : {}),
             };
           }
         }

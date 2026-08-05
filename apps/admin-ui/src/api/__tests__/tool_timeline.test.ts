@@ -383,6 +383,20 @@ describe("parseExecResult", () => {
   it("returns null exitCode when the marker is absent", () => {
     expect(parseExecResult("stdout:\nx").exitCode).toBeNull();
   });
+
+  it("sets timedOut when the body carries the [execution timed out marker", () => {
+    // format_sandbox_outcome._render appends this line before exit_code when
+    // outcome.timed_out (sandbox.py:488-495) — the finding-2 fix-wave path.
+    const preview =
+      "(no output)\n\n[execution timed out — if the command legitimately needs longer " +
+      "(e.g. installing a package), re-run it with a larger timeout_s (max 300)]\n\nexit_code: -1";
+    expect(parseExecResult(preview)).toEqual({
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      timedOut: true,
+    });
+  });
 });
 
 describe("parseToolCalls exec attribution", () => {
@@ -443,6 +457,42 @@ describe("parseToolCalls exec attribution", () => {
     ];
     const [entry] = parseToolCalls(events);
     expect(entry.execResult).toEqual({ stdout: "1", stderr: "", exitCode: 0 });
+  });
+
+  it("ignores a historical artifact carrying exit_code but no streams (pre-PR-D meta shape)", () => {
+    // builder.py has piped meta → artifact since 2026-06-29; historical meta
+    // (before this branch added stdout/stderr) carried only exit_code /
+    // timed_out / truncated. Building a truthy-but-streamless execArtifact
+    // from that shape would shadow the raw-preview fallback for every
+    // historical run.
+    const events = [
+      updates("agent", [aiCall2("c1", "exec_python", { code: "print(1)" })]),
+      updates("tools", [
+        toolResultWithArtifact("c1", "stdout:▁ 1▁ exit_code:▁ 0", {
+          exit_code: 0,
+          timed_out: false,
+          truncated: false,
+        }),
+      ]),
+    ];
+    const [entry] = parseToolCalls(events);
+    expect(entry.execResult).toBeUndefined();
+    expect(entry.resultPreview).toBe("stdout:▁ 1▁ exit_code:▁ 0");
+  });
+
+  it("sets timedOut on execResult when the artifact's timed_out is true", () => {
+    const events = [
+      updates("agent", [aiCall2("c1", "bash", { command: "sleep 999" })]),
+      updates("tools", [
+        toolResultWithArtifact(
+          "c1",
+          "«UNTRUSTED nonce=x»\n[execution timed out]▁ exit_code:▁ -1\n«/UNTRUSTED nonce=x»",
+          { exit_code: -1, timed_out: true, truncated: false, stdout: "", stderr: "" },
+        ),
+      ]),
+    ];
+    const [entry] = parseToolCalls(events);
+    expect(entry.execResult).toEqual({ stdout: "", stderr: "", exitCode: -1, timedOut: true });
   });
 });
 
