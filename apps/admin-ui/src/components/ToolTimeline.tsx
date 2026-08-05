@@ -105,7 +105,10 @@ export function ToolCallCard({
       stdoutClean.hadUntrusted ||
       stderrClean.hadUntrusted ||
       stdout.includes("▁") ||
-      stderr.includes("▁");
+      stderr.includes("▁") ||
+      // PR-D — artifact-sourced streams are raw (never datamarked); the
+      // spotlight evidence now lives only in the mangled resultPreview.
+      (entry.resultPreview?.includes("▁") ?? false);
     items.push({
       key: "result",
       label: (

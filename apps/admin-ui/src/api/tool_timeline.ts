@@ -35,6 +35,10 @@ export interface ToolCallEntry {
   resultPreview: string | null;
   /** Structured sandbox result (exec_python / bash only) parsed from ``resultPreview``. */
   execResult?: ExecResult;
+  /** Structured exec fields lifted from the result's ``artifact``
+   *  (``format_sandbox_outcome.meta`` — PR-D). Set only when the wire frame
+   *  carried them; wins over text parsing in the attribution pass. */
+  execArtifact?: ExecResult;
   /** Tool execution time in ms, from the result's ``additional_kwargs.duration_ms`` (``null`` until the result arrives or if absent). */
   durationMs: number | null;
   /** RESULT frame's SSE id ms segment (``serverMsOf``) — ``null`` until the
@@ -310,6 +314,16 @@ export function parseToolCalls(
           if (typeof tid === "string" && tid !== "") entry.triggerId = tid;
           const act = rec.action;
           if (typeof act === "string" && act !== "") entry.action = act;
+          // PR-D — sandbox exec tools stash their raw (pre-datamark) streams
+          // here; the rendered content's newlines don't survive spotlight.
+          const exit = rec.exit_code;
+          if (typeof exit === "number" && Number.isFinite(exit)) {
+            entry.execArtifact = {
+              stdout: typeof rec.stdout === "string" ? rec.stdout : "",
+              stderr: typeof rec.stderr === "string" ? rec.stderr : "",
+              exitCode: exit,
+            };
+          }
         }
       }
     }
@@ -317,8 +331,17 @@ export function parseToolCalls(
 
   const entries = order.map((id) => byId.get(id) as ToolCallEntry);
   for (const entry of entries) {
-    if (!entry.isMcp && SANDBOX_TOOLS.has(entry.toolName) && entry.resultPreview) {
-      entry.execResult = parseExecResult(entry.resultPreview);
+    if (entry.isMcp || !SANDBOX_TOOLS.has(entry.toolName)) continue;
+    if (entry.execArtifact) {
+      entry.execResult = entry.execArtifact;
+      continue;
+    }
+    if (!entry.resultPreview) continue;
+    const parsed = parseExecResult(entry.resultPreview);
+    // A fully-empty parse means the preview was datamark-mangled (legacy
+    // frames) — leave execResult unset so the raw-preview fallback renders.
+    if (parsed.exitCode !== null || parsed.stdout !== "" || parsed.stderr !== "") {
+      entry.execResult = parsed;
     }
   }
   if (awaitingApproval) {

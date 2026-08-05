@@ -141,6 +141,22 @@ describe("ToolTimeline", () => {
     expect(stdout.textContent).not.toContain("UNTRUSTED");
   });
 
+  it("keeps the untrusted badge when exec fields come from the artifact", () => {
+    // Artifact-sourced stdout is raw (no ▁ glyph) — the badge must fall back
+    // to sniffing the datamarked resultPreview.
+    renderFireCard(
+      baseEntry({
+        rawName: "exec_python",
+        toolName: "exec_python",
+        resultPreview: "stdout:▁ 1▁ exit_code:▁ 0",
+        execResult: { stdout: "1\n", stderr: "", exitCode: 0 },
+      }),
+    );
+    expect(screen.getByTestId("tool-untrusted")).toBeInTheDocument();
+    openResultPanel();
+    expect(screen.getByTestId("tool-exit-code").textContent).toContain("0");
+  });
+
   it("does not show the badge for a clean result, and leaves args untouched", () => {
     render(
       <ToolCallCard

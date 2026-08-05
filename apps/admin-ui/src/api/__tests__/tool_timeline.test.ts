@@ -403,6 +403,47 @@ describe("parseToolCalls exec attribution", () => {
     const [entry] = parseToolCalls(events);
     expect(entry.execResult).toBeUndefined();
   });
+
+  it("prefers the artifact's structured exec fields over text parsing", () => {
+    // Wire shape after PR-D: format_sandbox_outcome.meta carries the raw
+    // (pre-datamark) streams; the content string arrives datamark-mangled.
+    const events = [
+      updates("agent", [aiCall2("c1", "exec_python", { code: "print(1)" })]),
+      updates("tools", [
+        toolResultWithArtifact("c1", "«UNTRUSTED nonce=x»\nstdout:▁ 1▁ exit_code:▁ 0\n«/UNTRUSTED nonce=x»", {
+          exit_code: 0,
+          timed_out: false,
+          truncated: false,
+          stdout: "1\n",
+          stderr: "",
+        }),
+      ]),
+    ];
+    const [entry] = parseToolCalls(events);
+    expect(entry.execResult).toEqual({ stdout: "1\n", stderr: "", exitCode: 0 });
+  });
+
+  it("leaves execResult unset on a datamark-mangled preview with no artifact", () => {
+    // Legacy runs (pre-PR-D frames) have no exec artifact and a mangled
+    // preview — the raw-preview fallback branch must stay reachable, so no
+    // truthy-but-empty ExecResult may be attached.
+    const events = [
+      updates("agent", [aiCall2("c1", "exec_python", { code: "print(1)" })]),
+      updates("tools", [toolResult("c1", "stdout:▁ 1▁ exit_code:▁ 0")]),
+    ];
+    const [entry] = parseToolCalls(events);
+    expect(entry.execResult).toBeUndefined();
+    expect(entry.resultPreview).toBe("stdout:▁ 1▁ exit_code:▁ 0");
+  });
+
+  it("still parses a clean legacy preview without an artifact", () => {
+    const events = [
+      updates("agent", [aiCall2("c1", "bash", { command: "echo 1" })]),
+      updates("tools", [toolResult("c1", "stdout:\n1\n\nexit_code: 0")]),
+    ];
+    const [entry] = parseToolCalls(events);
+    expect(entry.execResult).toEqual({ stdout: "1", stderr: "", exitCode: 0 });
+  });
 });
 
 describe("toolStatusSummary", () => {
