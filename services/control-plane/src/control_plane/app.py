@@ -198,8 +198,9 @@ from control_plane.runtime import (
     _build_mcp_client,
     build_mcp_pool,
     build_middleware_env,
-    build_supervisor_client,
+    build_sandbox_runtime,
     build_tool_env,
+    build_workspace_store,
     make_agent_builder,
     make_agent_runtime,
     make_image_resolver,
@@ -208,6 +209,7 @@ from control_plane.runtime import (
     resolve_object_store_config,
     resolve_web_search_client,
 )
+from control_plane.sandbox_reap_worker import SandboxReapWorker
 from control_plane.scheduler import TriggerScheduler
 from control_plane.settings import Settings
 from control_plane.skill_activity import ThrottledActivityRecorder
@@ -405,6 +407,7 @@ from expert_work.persistence.sandbox_egress_audit import (
     SandboxEgressAuditStore,
     SqlSandboxEgressAuditStore,
 )
+from expert_work.persistence.sandbox_instance_store import SqlSandboxInstanceStore
 from expert_work.persistence.skill import (
     InMemorySkillStore,
     SkillStore,
@@ -493,7 +496,11 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from orchestrator import MemoryEnv
-from orchestrator.tools import HTTPSupervisorClient
+from orchestrator.tools import (
+    AgentSandboxClient,
+    HTTPSupervisorRuntime,
+    SupervisorWorkspaceStore,
+)
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -613,7 +620,7 @@ def create_app(
         sql_stores.memory_dlq if sql_stores else InMemoryMemoryWritebackDLQ()
     )
     # Stream J.9 — artifact registry backing save_artifact / list_artifacts
-    # and the artifact API. The supervisor client backs artifact content
+    # and the artifact API. The sandbox runtime backs artifact content
     # download (only the supervisor can read a per-user volume); it is
     # shared with the agent tool env.
     resolved_artifact_store: ArtifactStore = artifact_repo or (
@@ -692,7 +699,21 @@ def create_app(
         if sql_stores
         else InMemorySandboxEgressAuditStore()
     )
-    resolved_supervisor_client = build_supervisor_client(resolved_settings.sandbox_supervisor_url)
+    # 波 1 Task 7 — the agent_sandbox branch needs a warm-session CAS store;
+    # only a real SQL session factory can back it durably (sandbox_instance
+    # is shared with the docker-supervisor backend). ``None`` sql_stores
+    # (persistence_backend="memory") falls back to the factory's own
+    # InMemorySandboxInstanceStore default.
+    resolved_sandbox_runtime = build_sandbox_runtime(
+        resolved_settings,
+        sandbox_instance_store=(
+            SqlSandboxInstanceStore(sql_stores.session_factory) if sql_stores else None
+        ),
+    )
+    # 波 1 Task 4 — workspace-file ops now live on a separate client, built
+    # from the same supervisor URL (still the only thing that can reach the
+    # docker-volume workspace today; wave 2's NAS mount replaces this).
+    resolved_workspace_store = build_workspace_store(resolved_settings.sandbox_supervisor_url)
     resolved_feedback = feedback_repo or (
         sql_stores.feedback if sql_stores else InMemoryFeedbackStore()
     )
@@ -1152,7 +1173,7 @@ def create_app(
             # fresh TLS handshake per call. httpx pools per (scheme, host,
             # port) internally, so a single instance is enough — no
             # per-provider split needed. Wired into the deps below (embedder /
-            # reranker / web-search client / supervisor client / agent
+            # reranker / web-search client / sandbox runtime / agent
             # builder); ``stack`` closes it on shutdown, after every other
             # cleanup callback that might still use it has run (LIFO).
             shared_http = httpx.AsyncClient(
@@ -1230,6 +1251,7 @@ def create_app(
             quality_monitor: QualityMonitorWorker | None = None
             quality_drift: QualityDriftWorker | None = None
             approval_gauge_worker: ApprovalGaugeWorker | None = None
+            sandbox_reap_worker: SandboxReapWorker | None = None
             if agent_runtime is None:
                 if resolved_settings.checkpointer_backend == "postgres":
                     if not resolved_settings.checkpointer_dsn:
@@ -1286,19 +1308,23 @@ def create_app(
                     searxng_base_url=resolved_settings.web_search_searxng_base_url,
                     http=shared_http,
                 )
-                # 一期 Task 5 — the supervisor client is built earlier (before
-                # ``shared_http`` exists, so ``app.state.supervisor_client``
+                # 一期 Task 5 — the sandbox runtime is built earlier (before
+                # ``shared_http`` exists, so ``app.state.sandbox_runtime``
                 # is well-defined pre-lifespan too); wire the shared client in
-                # now. ``HTTPSupervisorClient`` is not frozen, so this mutates
-                # the same instance ``app.state.supervisor_client`` and
+                # now. ``HTTPSupervisorRuntime`` is not frozen, so this mutates
+                # the same instance ``app.state.sandbox_runtime`` and
                 # ``base_tool_env`` below both reference. Guarded by
-                # isinstance (not ``SupervisorClient`` the Protocol, which has
+                # isinstance (not ``SandboxRuntime`` the Protocol, which has
                 # no ``http`` member) so a future wrapper implementation
                 # doesn't silently take a ``.http = ...`` assignment as a
                 # stray attribute and lose pooling without either an error or
                 # a type-checker complaint.
-                if isinstance(resolved_supervisor_client, HTTPSupervisorClient):
-                    resolved_supervisor_client.http = shared_http
+                if isinstance(resolved_sandbox_runtime, HTTPSupervisorRuntime):
+                    resolved_sandbox_runtime.http = shared_http
+                # Same pre-lifespan-build / in-place-mutate dance for the
+                # split-out workspace-file client (波 1 Task 4).
+                if isinstance(resolved_workspace_store, SupervisorWorkspaceStore):
+                    resolved_workspace_store.http = shared_http
                 mcp_pool = await stack.enter_async_context(
                     build_mcp_pool(
                         resolved_settings.mcp_servers_config_file,
@@ -1505,7 +1531,7 @@ def create_app(
                 base_tool_env = build_tool_env(
                     resolved_tenant_config_service,
                     web_search_client=web_search_client,
-                    supervisor_client=resolved_supervisor_client,
+                    sandbox_runtime=resolved_sandbox_runtime,
                     mcp_pool=mcp_pool,
                     artifact_store=resolved_artifact_store,
                     knowledge_retriever=knowledge_retriever,
@@ -2037,6 +2063,16 @@ def create_app(
             approval_gauge_worker = ApprovalGaugeWorker(approval_store=resolved_approval_store)
             approval_gauge_worker.start()
             _app.state.approval_gauge_worker = approval_gauge_worker
+            # 波 1 全分支终审 Important-1 — the idle-sandbox sweep. Only for
+            # the cloud backend: ``sandbox_backend="supervisor"`` already has
+            # its own in-process reaper inside the supervisor service, and
+            # that backend is frozen this wave. isinstance rather than a
+            # settings read, same reasoning as the ``HTTPSupervisorRuntime``
+            # guard above — the wiring should follow what was actually built.
+            if isinstance(resolved_sandbox_runtime, AgentSandboxClient):
+                sandbox_reap_worker = SandboxReapWorker(runtime=resolved_sandbox_runtime)
+                sandbox_reap_worker.start()
+                _app.state.sandbox_reap_worker = sandbox_reap_worker
             resolved_lifecycle.mark_ready()
             logger.info(
                 "control_plane.lifespan.ready",
@@ -2081,6 +2117,8 @@ def create_app(
                     await quality_drift.stop()
                 if approval_gauge_worker is not None:
                     await approval_gauge_worker.stop()
+                if sandbox_reap_worker is not None:
+                    await sandbox_reap_worker.stop()
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.
@@ -2186,7 +2224,8 @@ def create_app(
     # The ingestion recovery worker is built + started in the lifespan; this is
     # the pre-lifespan default so ``getattr`` lookups are well-defined.
     app.state.knowledge_recovery_worker = None
-    app.state.supervisor_client = resolved_supervisor_client
+    app.state.sandbox_runtime = resolved_sandbox_runtime
+    app.state.workspace_store = resolved_workspace_store
     app.state.audit_logger = resolved_audit
     app.state.manifest_loader = resolved_loader
     app.state.jwt_verifier = resolved_verifier

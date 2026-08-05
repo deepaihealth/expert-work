@@ -23,7 +23,7 @@ from orchestrator.context import (
 )
 from orchestrator.tools.file_ops import FileOpError, SandboxWorkspaceWriter
 from orchestrator.tools.registry import ToolContext
-from orchestrator.tools.sandbox import RecordingSupervisorClient, SandboxOutcome
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -205,7 +205,7 @@ def _ok_envelope(path: str) -> SandboxOutcome:
 
 
 async def test_sandbox_writer_writes_through_warm_sandbox() -> None:
-    client = RecordingSupervisorClient(outcome=_ok_envelope("PLAN.md"))
+    client = RecordingSandboxRuntime(outcome=_ok_envelope("PLAN.md"))
     writer = SandboxWorkspaceWriter(client=client, ctx=_ctx())
     await writer.write(rel="PLAN.md", content="abc")
     assert len(client.execs) == 1
@@ -216,7 +216,7 @@ async def test_sandbox_writer_writes_through_warm_sandbox() -> None:
 
 
 async def test_sandbox_writer_raises_on_sandbox_failure() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(
             stdout=json.dumps({"ok": False, "error": "io_error", "detail": "disk full"}),
             stderr="",

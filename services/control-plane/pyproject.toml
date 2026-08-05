@@ -30,7 +30,9 @@ dependencies = [
     # ``>=2.13.0`` 跳过 PYSEC-2026-175/177/178/179（pip-audit 已要求）。
     "pyjwt[crypto]>=2.13.0,<3",
     # ``>=48.0.1`` 跳过 CVE-2026-26007 / 34073 / 39892 + GHSA-537c-gmf6-5ccf（pip-audit 已要求）。
-    "cryptography>=48.0.1,<49",
+    # ``>=50.0.0`` 跳过 PYSEC-2026-3552（修复版 50.0.0）与 PYSEC-2026-3553 /
+    # 3554（修复版 49.0.0）——上界因此从 <49 抬到 <51，两个主版本一起跨。
+    "cryptography>=50.0.0,<51",
     "httpx>=0.27,<1",
     # Stream C.3 — Argon2id hashing for API key secrets (OWASP-recommended).
     "argon2-cffi>=23.1,<26",

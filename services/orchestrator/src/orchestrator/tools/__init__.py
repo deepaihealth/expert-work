@@ -6,6 +6,9 @@ Concrete tool adapters land in their own modules (``web_search`` E.7,
 :class:`ToolRegistry` at orchestrator startup.
 """
 
+from orchestrator.tools.agent_sandbox import (
+    AgentSandboxClient as AgentSandboxClient,
+)
 from orchestrator.tools.artifact import (
     ListArtifactsTool as ListArtifactsTool,
 )
@@ -154,22 +157,25 @@ from orchestrator.tools.sandbox import (
     ExecPythonTool as ExecPythonTool,
 )
 from orchestrator.tools.sandbox import (
-    HTTPSupervisorClient as HTTPSupervisorClient,
+    HTTPSupervisorRuntime as HTTPSupervisorRuntime,
 )
 from orchestrator.tools.sandbox import (
-    RecordingSupervisorClient as RecordingSupervisorClient,
+    RecordingSandboxRuntime as RecordingSandboxRuntime,
 )
 from orchestrator.tools.sandbox import (
     SandboxOutcome as SandboxOutcome,
 )
 from orchestrator.tools.sandbox import (
+    SandboxRuntime as SandboxRuntime,
+)
+from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
 )
-from orchestrator.tools.sandbox import (
-    SupervisorClient as SupervisorClient,
+from orchestrator.tools.sandbox_image_contract import (
+    SANDBOX_EXEC_USER as SANDBOX_EXEC_USER,
 )
-from orchestrator.tools.sandbox import (
-    WorkspaceFileEntry as WorkspaceFileEntry,
+from orchestrator.tools.sandbox_instance_store import (
+    SandboxInstanceStore as SandboxInstanceStore,
 )
 from orchestrator.tools.subagent import (
     MAX_SUBAGENT_DEPTH as MAX_SUBAGENT_DEPTH,
@@ -201,6 +207,18 @@ from orchestrator.tools.web_search import (
 from orchestrator.tools.web_search import (
     WebSearchTool as WebSearchTool,
 )
+from orchestrator.tools.workspace_store import (
+    RecordingWorkspaceStore as RecordingWorkspaceStore,
+)
+from orchestrator.tools.workspace_store import (
+    SupervisorWorkspaceStore as SupervisorWorkspaceStore,
+)
+from orchestrator.tools.workspace_store import (
+    WorkspaceFileEntry as WorkspaceFileEntry,
+)
+from orchestrator.tools.workspace_store import (
+    WorkspaceStore as WorkspaceStore,
+)
 
 __all__ = [
     "DEFAULT_BODY_CHAR_CAP",
@@ -212,6 +230,8 @@ __all__ = [
     "DEFAULT_OUTPUT_CHAR_CAP",
     "KNOWN_BUILTINS",
     "MAX_SUBAGENT_DEPTH",
+    "SANDBOX_EXEC_USER",
+    "AgentSandboxClient",
     "AllowlistProvider",
     "AskImageTool",
     "BashTool",
@@ -221,7 +241,7 @@ __all__ = [
     "ExecPythonTool",
     "FileOpError",
     "FindToolsTool",
-    "HTTPSupervisorClient",
+    "HTTPSupervisorRuntime",
     "HTTPTool",
     "KnowledgeRetriever",
     "KnowledgeSearchTool",
@@ -239,18 +259,21 @@ __all__ = [
     "ReadDocumentTool",
     "ReadFileTool",
     "RecordingMCPClient",
-    "RecordingSupervisorClient",
+    "RecordingSandboxRuntime",
     "RecordingTavilyClient",
     "RecordingWorkspaceLock",
+    "RecordingWorkspaceStore",
     "Reranker",
     "RetrievedChunk",
+    "SandboxInstanceStore",
     "SandboxOutcome",
+    "SandboxRuntime",
     "SandboxSupervisorError",
     "SaveArtifactTool",
     "SearXNGClient",
     "StdioMCPClient",
     "SubAgentTool",
-    "SupervisorClient",
+    "SupervisorWorkspaceStore",
     "TavilyClient",
     "Tool",
     "ToolBlockedError",
@@ -263,6 +286,7 @@ __all__ = [
     "WebSearchTool",
     "WorkspaceFileEntry",
     "WorkspaceLock",
+    "WorkspaceStore",
     "WriteFileTool",
     "build_tool_registry",
     "register_mcp_tools",

@@ -1,4 +1,4 @@
-"""A.8 — ``HTTPSupervisorClient`` injects W3C trace context on the wire.
+"""A.8 — ``HTTPSupervisorRuntime`` injects W3C trace context on the wire.
 
 The inject half of the cross-service propagation contract (subsystems/20
 § 5.8). The matching extract half lives in the sandbox-supervisor suite
@@ -23,7 +23,8 @@ from expert_work.common.observability import (
     expert_work_span,
     init_tracing,
 )
-from orchestrator.tools.sandbox import HTTPSupervisorClient
+from orchestrator.tools.sandbox import HTTPSupervisorRuntime
+from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -41,12 +42,12 @@ def tracing_setup() -> Iterator[None]:
         provider.shutdown()
 
 
-def _capturing_client(seen: dict[str, httpx.Headers]) -> HTTPSupervisorClient:
+def _capturing_client(seen: dict[str, httpx.Headers]) -> HTTPSupervisorRuntime:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["headers"] = request.headers
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    return HTTPSupervisorClient(
+    return HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
 
@@ -73,12 +74,12 @@ async def test_workspace_get_injects_traceparent(tracing_setup: None) -> None:
         seen["headers"] = request.headers
         return httpx.Response(200, content=b"file-bytes")
 
-    client = HTTPSupervisorClient(
+    store = SupervisorWorkspaceStore(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "tool_call"):
         active_trace_id = current_trace_id_hex()
-        await client.read_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path="a.txt")
+        await store.read_file(tenant_id=uuid4(), user_id=uuid4(), path="a.txt")
 
     assert active_trace_id is not None
     assert seen["headers"].get(TRACEPARENT_HEADER, "").split("-")[1] == active_trace_id
@@ -94,12 +95,12 @@ async def test_workspace_put_sends_bytes_and_path(tracing_setup: None) -> None:
         seen["headers"] = request.headers
         return httpx.Response(204)
 
-    client = HTTPSupervisorClient(
+    store = SupervisorWorkspaceStore(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "tool_call"):
         active_trace_id = current_trace_id_hex()
-        await client.write_workspace_file(
+        await store.write_file(
             tenant_id=uuid4(), user_id=uuid4(), path="uploads/x.pdf", data=b"PDF"
         )
 
@@ -118,11 +119,11 @@ async def test_workspace_put_raises_on_error_response(tracing_setup: None) -> No
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="boom")
 
-    client = HTTPSupervisorClient(
+    store = SupervisorWorkspaceStore(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with pytest.raises(SandboxSupervisorError):
-        await client.write_workspace_file(
+        await store.write_file(
             tenant_id=uuid4(), user_id=uuid4(), path="uploads/x.pdf", data=b"PDF"
         )
 
@@ -144,7 +145,7 @@ async def test_exec_aligns_timeout_and_passes_it(tracing_setup: None) -> None:
             200, json={"stdout": "ok", "stderr": "", "exit_code": 0, "timed_out": False}
         )
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "tool_call"):
@@ -162,7 +163,7 @@ async def test_exec_aligns_timeout_and_passes_it(tracing_setup: None) -> None:
 
 
 async def test_workspace_list_parses_files_and_traces(tracing_setup: None) -> None:
-    from orchestrator.tools.sandbox import WorkspaceFileEntry
+    from orchestrator.tools.workspace_store import WorkspaceFileEntry
 
     seen: dict[str, object] = {}
 
@@ -172,12 +173,12 @@ async def test_workspace_list_parses_files_and_traces(tracing_setup: None) -> No
         seen["headers"] = request.headers
         return httpx.Response(200, json={"files": [{"path": "report.pdf", "size": 2048}]})
 
-    client = HTTPSupervisorClient(
+    store = SupervisorWorkspaceStore(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "tool_call"):
         active_trace_id = current_trace_id_hex()
-        entries = await client.list_workspace_files(tenant_id=uuid4(), user_id=uuid4())
+        entries = await store.list_files(tenant_id=uuid4(), user_id=uuid4())
 
     assert entries == [WorkspaceFileEntry(path="report.pdf", size=2048)]
     assert seen["method"] == "GET"
@@ -211,7 +212,7 @@ async def test_acquire_serializes_seed_files_base64() -> None:
         body.update(json.loads(request.content))
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     await client.acquire(
@@ -234,7 +235,7 @@ async def test_acquire_omits_seed_files_when_empty() -> None:
         body.update(json.loads(request.content))
         return httpx.Response(200, json={"sandbox_id": str(uuid4())})
 
-    client = HTTPSupervisorClient(
+    client = HTTPSupervisorRuntime(
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     await client.acquire(tenant_id=uuid4(), thread_id="t")

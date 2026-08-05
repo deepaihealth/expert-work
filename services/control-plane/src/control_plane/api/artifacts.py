@@ -49,7 +49,7 @@ from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import ArtifactKind, AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, SupervisorClient
+from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.artifacts")
 
@@ -74,8 +74,8 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
 
 
-def _get_supervisor_client(request: Request) -> SupervisorClient | None:
-    return request.app.state.supervisor_client  # type: ignore[no-any-return]
+def _get_workspace_store(request: Request) -> WorkspaceStore | None:
+    return request.app.state.workspace_store  # type: ignore[no-any-return]
 
 
 def _get_quota(request: Request) -> QuotaService:
@@ -153,7 +153,7 @@ def build_artifacts_router() -> APIRouter:
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # H.8-F1 — tenant-admin governance: act on one member's artifact
@@ -209,13 +209,13 @@ def build_artifacts_router() -> APIRouter:
         )
         if denial is not None:
             return denial
-        if supervisor is None:
+        if workspace_store is None:
             raise HTTPException(
                 status_code=503,
                 detail="artifact download unavailable: no sandbox supervisor configured",
             )
         try:
-            data = await supervisor.read_workspace_file(
+            data = await workspace_store.read_file(
                 tenant_id=target_tenant,
                 user_id=target_user_id,
                 path=version.path_in_workspace,

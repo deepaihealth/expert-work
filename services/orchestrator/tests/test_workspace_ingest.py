@@ -23,7 +23,7 @@ from orchestrator.context import (
 )
 from orchestrator.tools.file_ops import FileOpError, SandboxWorkspaceReader
 from orchestrator.tools.registry import ToolContext
-from orchestrator.tools.sandbox import RecordingSupervisorClient, SandboxOutcome
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 
 @dataclass
@@ -154,14 +154,14 @@ def _read_envelope(content: str) -> SandboxOutcome:
 
 
 async def test_sandbox_reader_returns_content() -> None:
-    client = RecordingSupervisorClient(outcome=_read_envelope("# Plan\n"))
+    client = RecordingSandboxRuntime(outcome=_read_envelope("# Plan\n"))
     reader = SandboxWorkspaceReader(client=client, ctx=_reader_ctx())
     assert await reader.read("PLAN.md") == "# Plan\n"
     assert client.execs and "PLAN.md" in client.execs[0][1]
 
 
 async def test_sandbox_reader_returns_none_when_absent() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(
             stdout=json.dumps({"ok": False, "error": "not_found"}),
             stderr="",
@@ -174,7 +174,7 @@ async def test_sandbox_reader_returns_none_when_absent() -> None:
 
 
 async def test_sandbox_reader_raises_on_io_error() -> None:
-    client = RecordingSupervisorClient(
+    client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(
             stdout=json.dumps({"ok": False, "error": "io_error", "detail": "x"}),
             stderr="",

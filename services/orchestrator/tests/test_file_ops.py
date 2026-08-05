@@ -8,7 +8,7 @@ Two layers are tested:
    write, hashing, UTF-8 handling, and — critically — ``realpath``
    confinement against ``..`` and symlink escape.
 2. **Tool orchestration** — ``ReadFileTool`` / ``WriteFileTool`` /
-   ``ListDirTool`` parse the JSON envelope from a ``RecordingSupervisorClient``
+   ``ListDirTool`` parse the JSON envelope from a ``RecordingSandboxRuntime``
    into a ``ToolResult``, map errors to the right exception, and validate
    the orchestrator-side path / arg checks + ToolSpec metadata.
 """
@@ -42,7 +42,7 @@ from orchestrator.tools.file_ops import (
     build_read_wrapper,
     build_write_wrapper,
 )
-from orchestrator.tools.sandbox import RecordingSupervisorClient
+from orchestrator.tools.sandbox import RecordingSandboxRuntime
 
 # --------------------------------------------------------------------------
 # Layer 1 — in-sandbox snippet logic (run locally with ws = tmp_path)
@@ -408,8 +408,8 @@ def _ctx(*, tenant_id: UUID | None = None) -> ToolContext:
 
 def _client(
     stdout: str = "", *, exit_code: int = 0, timed_out: bool = False
-) -> RecordingSupervisorClient:
-    client = RecordingSupervisorClient()
+) -> RecordingSandboxRuntime:
+    client = RecordingSandboxRuntime()
     client.outcome = SandboxOutcome(
         stdout=stdout, stderr="", exit_code=exit_code, timed_out=timed_out
     )

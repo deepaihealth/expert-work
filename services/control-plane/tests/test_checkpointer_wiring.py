@@ -23,7 +23,7 @@ from control_plane.runtime import (
     _load_mcp_server_configs,
     build_mcp_pool,
     build_middleware_env,
-    build_supervisor_client,
+    build_sandbox_runtime,
     build_tool_env,
     make_agent_builder,
     make_agent_runtime,
@@ -37,7 +37,7 @@ from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.llm import FakeEmbedder
 from orchestrator.multimodal import ObjectStoreImageResolver
 from orchestrator.tools import (
-    HTTPSupervisorClient,
+    HTTPSupervisorRuntime,
     KnowledgeRetriever,
     MCPClient,
     MCPServerConfig,
@@ -141,9 +141,9 @@ def test_build_tool_env_wires_allowlist_provider_only() -> None:
     assert env.allowlist_provider is not None
     # The denylist provider is wired alongside the allowlist (E.8 denylist model).
     assert env.denylist_provider is not None
-    # web_search (Tavily), the supervisor client, and the mcp pool are opt-in.
+    # web_search (Tavily), the sandbox runtime, and the mcp pool are opt-in.
     assert env.web_search_client is None
-    assert env.supervisor_client is None
+    assert env.sandbox_runtime is None
     assert env.mcp_pool is None
 
 
@@ -212,24 +212,28 @@ def test_build_tool_env_carries_web_search_client() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sandbox Supervisor client wiring (Stream F.11)
+# Sandbox runtime wiring (Stream F.11)
 # ---------------------------------------------------------------------------
 
 
-def test_build_supervisor_client_none_url_yields_none() -> None:
-    assert build_supervisor_client(None) is None
+def test_build_sandbox_runtime_none_url_yields_none() -> None:
+    assert build_sandbox_runtime(Settings(sandbox_supervisor_url=None)) is None
 
 
-def test_build_supervisor_client_builds_http_client() -> None:
-    client = build_supervisor_client("http://sandbox-supervisor:8000")
-    assert isinstance(client, HTTPSupervisorClient)
+def test_build_sandbox_runtime_builds_http_client() -> None:
+    client = build_sandbox_runtime(
+        Settings(sandbox_supervisor_url="http://sandbox-supervisor:8000")
+    )
+    assert isinstance(client, HTTPSupervisorRuntime)
     assert client.base_url == "http://sandbox-supervisor:8000"
 
 
-def test_build_tool_env_carries_supervisor_client() -> None:
-    client = build_supervisor_client("http://sandbox-supervisor:8000")
-    env = build_tool_env(_FakeTenantConfigService(allowlist=[]), supervisor_client=client)
-    assert env.supervisor_client is client
+def test_build_tool_env_carries_sandbox_runtime() -> None:
+    client = build_sandbox_runtime(
+        Settings(sandbox_supervisor_url="http://sandbox-supervisor:8000")
+    )
+    env = build_tool_env(_FakeTenantConfigService(allowlist=[]), sandbox_runtime=client)
+    assert env.sandbox_runtime is client
 
 
 def test_build_tool_env_carries_knowledge_retriever() -> None:

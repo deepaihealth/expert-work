@@ -3,7 +3,7 @@
 Mirrors the control-plane ``ObservabilityMiddleware`` (subsystems/20 § 5.8):
 extract the incoming ``traceparent`` so spans opened here continue the
 caller's trace instead of starting a detached root. The orchestrator's
-:class:`HTTPSupervisorClient` injects that header on every internal hop;
+:class:`HTTPSupervisorRuntime` injects that header on every internal hop;
 this middleware is the matching extraction side.
 
 Deliberately leaner than control-plane's: no per-request Prometheus

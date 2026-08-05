@@ -286,7 +286,7 @@ def build_agent_users_router() -> APIRouter:
 def _build_purge_deps(request: Request) -> PurgeUserDeps:
     """Assemble the ``purge_user`` deps from ``request.app.state`` (Phase 3a).
 
-    The supervisor client, the supervisor-owned volume-backup DLQ, and the
+    The workspace store, the supervisor-owned volume-backup DLQ, and the
     object store are optional (a deployment may not wire them); every other
     store is a hard dependency of the cascade purge."""
     state = request.app.state
@@ -314,7 +314,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         curation_candidates=state.curation_candidate_store,
         tenant_users=state.tenant_user_repo,
         audit=state.audit_logger,
-        supervisor=getattr(state, "supervisor_client", None),
+        workspace_store=getattr(state, "workspace_store", None),
     )
 
 

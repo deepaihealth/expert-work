@@ -55,7 +55,7 @@ from orchestrator.tools.registry import (
 from orchestrator.tools.sandbox import (
     DEFAULT_OUTPUT_CHAR_CAP,
     SandboxOutcome,
-    SupervisorClient,
+    SandboxRuntime,
     run_in_sandbox,
 )
 
@@ -466,7 +466,7 @@ def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
 class ReadFileTool:
     """Read a UTF-8 text file from the agent's workspace (exposed as ``read_file``)."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
@@ -524,7 +524,7 @@ class ReadFileTool:
 class WriteFileTool:
     """Atomically write a UTF-8 text file in the workspace (exposed as ``write_file``)."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
     #: Stream TE-8 — cross-replica per-workspace write lock held around the
@@ -600,7 +600,7 @@ class WriteFileTool:
 class ListDirTool:
     """List a workspace directory (exposed as ``list_dir``)."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
@@ -663,7 +663,7 @@ class EditFileTool:
     compare-and-swap — rejected as ``stale`` if the file changed since it was
     read. Exact match only here; fuzzy/anchored fallbacks land in TE-9b."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
     #: Stream TE-8 — write lock held around the edit exec.
@@ -768,7 +768,7 @@ class SandboxWorkspaceWriter:
     Structurally satisfies ``orchestrator.context.WorkspaceFileWriter``.
     """
 
-    client: SupervisorClient
+    client: SandboxRuntime
     ctx: ToolContext
     #: skill-runtime §5.1 — unused by the projection helpers (they write/read
     #: agent state, not skills); kept so the shared seed plumbing is uniform.
@@ -805,7 +805,7 @@ class SandboxWorkspaceReader:
     edit"; other failures raise (the ingester swallows them best-effort).
     Structurally satisfies ``orchestrator.context.WorkspaceFileReader``."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     ctx: ToolContext
     #: skill-runtime §5.1 — unused by the projection helpers (they write/read
     #: agent state, not skills); kept so the shared seed plumbing is uniform.

@@ -40,7 +40,7 @@ from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
     DEFAULT_OUTPUT_CHAR_CAP,
-    SupervisorClient,
+    SandboxRuntime,
     coerce_timeout,
     format_sandbox_outcome,
     run_in_sandbox,
@@ -74,7 +74,7 @@ def _build_wrapper(command: str) -> str:
 class BashTool:
     """Sandboxed shell execution exposed to the LLM as ``bash``."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
     #: Stream TE-8 — cross-replica per-workspace write lock. bash can write
     #: anything, so it takes the same exclusive workspace lock as write_file.

@@ -5,7 +5,7 @@ Two layers, mirroring test_file_ops:
      Text formats are stdlib; binary formats ``importorskip`` their parser
      (present in the sandbox image + the CI shared venv).
   2. The ``ReadDocumentTool`` envelope → :class:`ToolResult` mapping, driven
-     by a :class:`RecordingSupervisorClient` returning a canned envelope.
+     by a :class:`RecordingSandboxRuntime` returning a canned envelope.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from orchestrator.tools.read_document import (
     build_read_document_wrapper,
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
-from orchestrator.tools.sandbox import RecordingSupervisorClient, SandboxOutcome
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 # ---------------------------------------------------------------------------
 # Layer 1 — in-sandbox parse snippet (run locally with ws = tmp_path)
@@ -143,8 +143,8 @@ def _ctx() -> ToolContext:
     return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4())
 
 
-def _client(stdout: str = "", *, exit_code: int = 0) -> RecordingSupervisorClient:
-    client = RecordingSupervisorClient()
+def _client(stdout: str = "", *, exit_code: int = 0) -> RecordingSandboxRuntime:
+    client = RecordingSandboxRuntime()
     client.outcome = SandboxOutcome(stdout=stdout, stderr="", exit_code=exit_code, timed_out=False)
     return client
 

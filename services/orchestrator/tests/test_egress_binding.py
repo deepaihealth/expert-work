@@ -1,4 +1,4 @@
-"""Tests for the egress-binding supervisor client (sandbox-egress §3.3).
+"""Tests for the egress-binding sandbox runtime (sandbox-egress §3.3).
 
 ``_EgressBindingClient`` injects a fixed ``EgressContext`` into every acquire so
 sandbox tools carry the agent's egress policy + identity without per-tool
@@ -13,7 +13,7 @@ import pytest
 
 from orchestrator.tools.sandbox import (
     EgressContext,
-    RecordingSupervisorClient,
+    RecordingSandboxRuntime,
     bind_egress,
 )
 
@@ -22,7 +22,7 @@ _EGRESS = EgressContext(policy="proxy", agent_name="agent", agent_version="1.0.0
 
 @pytest.mark.asyncio
 async def test_bind_egress_injects_context_into_acquire() -> None:
-    inner = RecordingSupervisorClient()
+    inner = RecordingSandboxRuntime()
     client = bind_egress(inner, _EGRESS)
 
     await client.acquire(tenant_id=uuid4(), thread_id="t-1")
@@ -34,7 +34,7 @@ async def test_bind_egress_injects_context_into_acquire() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_egress_overrides_caller_supplied_egress() -> None:
-    inner = RecordingSupervisorClient()
+    inner = RecordingSandboxRuntime()
     client = bind_egress(inner, _EGRESS)
     other = EgressContext(policy="none", agent_name="x", agent_version="9")
 
@@ -46,13 +46,13 @@ async def test_bind_egress_overrides_caller_supplied_egress() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_egress_none_returns_client_unchanged() -> None:
-    inner = RecordingSupervisorClient()
+    inner = RecordingSandboxRuntime()
     assert bind_egress(inner, None) is inner
 
 
 @pytest.mark.asyncio
 async def test_binding_client_delegates_other_calls() -> None:
-    inner = RecordingSupervisorClient()
+    inner = RecordingSandboxRuntime()
     client = bind_egress(inner, _EGRESS)
 
     sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t-1")

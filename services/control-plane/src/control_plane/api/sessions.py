@@ -66,7 +66,7 @@ from expert_work.protocol import (
     ThreadStatus,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, SupervisorClient
+from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
 
@@ -150,8 +150,10 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
 
 
-def _get_supervisor_client(request: Request) -> SupervisorClient | None:
-    return request.app.state.supervisor_client  # type: ignore[no-any-return]
+def _get_workspace_file_client(request: Request) -> WorkspaceStore | None:
+    # Named distinctly from ``_get_workspace_store`` above (that one serves
+    # the ``UserWorkspaceStore`` volume-metadata row, not file bytes).
+    return request.app.state.workspace_store  # type: ignore[no-any-return]
 
 
 async def _backfill_titles(
@@ -462,7 +464,7 @@ def build_sessions_router() -> APIRouter:
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
@@ -492,10 +494,10 @@ def build_sessions_router() -> APIRouter:
             meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
         ):
             raise HTTPException(status_code=404, detail="session not found")
-        if meta.user_id is None or supervisor is None:
+        if meta.user_id is None or workspace_store is None:
             return JSONResponse({"success": True, "data": {"files": []}})
         try:
-            entries = await supervisor.list_workspace_files(
+            entries = await workspace_store.list_files(
                 tenant_id=target_tenant, user_id=meta.user_id
             )
         except SandboxSupervisorError:
@@ -510,7 +512,7 @@ def build_sessions_router() -> APIRouter:
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         path: Annotated[str, Query()],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
@@ -544,10 +546,10 @@ def build_sessions_router() -> APIRouter:
         safe_path = _safe_workspace_relpath(path)
         if safe_path is None:
             raise HTTPException(status_code=400, detail="invalid workspace path")
-        if meta.user_id is None or supervisor is None:
+        if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
-            data = await supervisor.read_workspace_file(
+            data = await workspace_store.read_file(
                 tenant_id=target_tenant, user_id=meta.user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:
@@ -569,7 +571,7 @@ def build_sessions_router() -> APIRouter:
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         path: Annotated[str, Query()],
     ) -> JSONResponse:
         """Delete one file from the thread user's persistent workspace volume.
@@ -590,10 +592,10 @@ def build_sessions_router() -> APIRouter:
         safe_path = _safe_workspace_relpath(path)
         if safe_path is None:
             raise HTTPException(status_code=400, detail="invalid workspace path")
-        if meta.user_id is None or supervisor is None:
+        if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
-            await supervisor.delete_workspace_file(
+            await workspace_store.delete_file(
                 tenant_id=tenant_id, user_id=meta.user_id, path=safe_path
             )
         except SandboxSupervisorError as exc:
@@ -609,7 +611,7 @@ def build_sessions_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
-        supervisor: Annotated[SupervisorClient | None, Depends(_get_supervisor_client)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
@@ -639,7 +641,7 @@ def build_sessions_router() -> APIRouter:
             meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
         ):
             raise HTTPException(status_code=404, detail="session not found")
-        if meta.user_id is None or supervisor is None:
+        if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         async with applied_scope(scope):
             version = await artifacts.get_latest_version(
@@ -648,7 +650,7 @@ def build_sessions_router() -> APIRouter:
         if version is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         try:
-            data = await supervisor.read_workspace_file(
+            data = await workspace_store.read_file(
                 tenant_id=target_tenant, user_id=meta.user_id, path=version.path_in_workspace
             )
         except SandboxSupervisorError as exc:

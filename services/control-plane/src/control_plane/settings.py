@@ -201,6 +201,31 @@ class Settings(BaseSettings):
     #: clear error.
     sandbox_supervisor_url: str | None = None
 
+    #: 波 1 —— 沙箱后端选择。``"supervisor"`` 走本地 docker supervisor
+    #: (``sandbox_supervisor_url``);``"agent_sandbox"`` 走 ACS Agent
+    #: Sandbox(E2B SDK)。``None`` 时按老行为推断:设了
+    #: ``sandbox_supervisor_url`` 即视作 ``"supervisor"``,否则沙箱能力关闭。
+    sandbox_backend: Literal["supervisor", "agent_sandbox"] | None = None
+    #: Agent Sandbox 接入 —— gateway 域名(E2B SDK 的 ``domain``)。
+    sandbox_e2b_domain: str | None = None
+    #: Agent Sandbox 接入 —— API key。
+    sandbox_e2b_api_key: str | None = None
+    #: Agent Sandbox 接入 —— SandboxSet 模板名(池领取的来源)。
+    sandbox_e2b_template: str | None = None
+    #: Agent Sandbox 接入 —— 沙箱出网走的 credential-proxy 主机 + 端口
+    #: (sandbox-egress §3.3)。默认值与 sandbox-supervisor 自己的
+    #: ``egress_proxy_host``/``egress_proxy_port`` 同形态,但集群内可达性
+    #: 由 K8s Service 名解出,不是同一个进程内配置。
+    sandbox_egress_proxy_host: str = "credential-proxy.expert-work.svc.cluster.local"
+    sandbox_egress_proxy_port: int = 8081
+    #: HMAC secret,铸沙箱的出网 token(``mint_egress_token``)。必须与
+    #: credential-proxy 侧的 ``EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET``
+    #: 一致 —— 两边各自配置,这里独立起一个配置项而不是复用
+    #: sandbox-supervisor 的同名 env(control-plane 与 sandbox-supervisor
+    #: 是两个不同的部署单元,没有共享 env 的机制)。Dev 默认值与
+    #: credential-proxy / sandbox-supervisor 的 dev 默认一致,便于本地联调。
+    sandbox_egress_token_secret: str = "dev-egress-token-secret-rotate-me"  # noqa: S105
+
     #: ``secret://`` reference to the embedding API key — backs long-term
     #: memory (Stream J.3). ``None`` → no embedder; an agent that declares
     #: ``memory.long_term`` fails at build time with a clear error.

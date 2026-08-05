@@ -19,6 +19,22 @@
 # daemon launches the sandbox), passed to `docker run` via `--security-opt
 # seccomp=`. Prod pre-places it + sets EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH; dev
 # leaves it unset (host default).
+#
+# Sandbox migration W1 Task 1 (2026-08-03) — ACS Agent Sandbox custom-image
+# requirements, checked against help.aliyun.com/zh/cs/user-guide/
+# create-an-agent-sandbox + .../connect-to-agent-sandbox-using-the-e2b-sdk
+# (full sourced checklist: .superpowers/sdd/2026-08-03-sandbox-migration-w1/
+# task-1-report.md). Two HARD requirements, both already satisfied by this
+# Debian-slim base and asserted (not installed — see the RUN check below):
+#   * bash present with the executable at /bin/bash.
+#   * basic coreutils present (cp/mv/mkdir, doc says "等" — non-exhaustive).
+# Informational (no Dockerfile action, noted so this doesn't look like an
+# oversight): agent-runtime/envd is injected as a Kubernetes native sidecar
+# via the SandboxSet CR (`spec.runtimes`), a pod-level concern owned by
+# Task 2 — this image does not bake in envd. A custom image also loses
+# E2B's `run_code()` convenience method (only `commands.run` / envd
+# shell-exec remains) — matches this migration's planned exec channel
+# (spec § 6.1), so no impact; flagged for Task 8.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -27,6 +43,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # F.3 mounts on /workspace, so matplotlib & friends can write.
     HOME=/workspace \
     MPLCONFIGDIR=/workspace/.mplconfig
+
+# Agent Sandbox hard requirement (see header note above): bash at /bin/bash
+# + basic coreutils. Both are Debian `Essential: yes` packages already
+# present in this base layer, so this is a build-time assertion, not an
+# install — it exists to fail the build loudly if a future base-image swap
+# ever drops them, rather than failing later at ACS deploy time.
+RUN test -x /bin/bash \
+    && command -v cp >/dev/null \
+    && command -v mv >/dev/null \
+    && command -v mkdir >/dev/null \
+    && echo "agent-sandbox image requirement OK: bash + cp/mv/mkdir present"
 
 # System deps:
 #   * CJK fonts + fontconfig (matplotlib/Pillow Chinese rendering) + zh_CN.UTF-8
@@ -43,8 +70,36 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #     Python wheel alone can't rasterise HTML+CSS → PDF). Pairs with the baked
 #     noto-cjk fonts so generated PDF reports render Chinese.
 # No compiler toolchain — every Python dep still installs from a wheel.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+#
+# Mirror + retries (W1 Task 1, 2026-08-03): this layer fetches ~700 packages
+# / ~350MB. From this network, `deb.debian.org` returns 502s partway through
+# and throughput collapses — three independent build attempts all died around
+# the ~17min mark with 20-48 unfetchable packages, and apt's default
+# `Acquire::Retries=0` makes any single one of those fatal for the whole
+# layer. Same network path that made a 52MB Docker Hub pull take hours (see
+# the admin-ui image escape hatch in docs/). Fix is the mirror, not smaller
+# batches: mainland Debian mirrors serve this at a usable rate. `Retries=5`
+# stays as cheap insurance on top.
+#
+# The sed handles both source formats: Debian 12+ base images ship deb822
+# (`/etc/apt/sources.list.d/debian.sources`), older ones a flat
+# `/etc/apt/sources.list`. Neither file existing would mean the base image
+# changed shape — the `-f` guards keep that from silently leaving the
+# official mirror in place.
+#
+# Kept as ONE `RUN`: `rm -rf /var/lib/apt/lists/*` only shrinks the image if
+# it runs in the same layer that populated it. Splitting the install into
+# several `RUN`s strands those lists in the lower layers, where a later
+# delete cannot reclaim them.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
+    else \
+        echo "no apt sources file found — base image layout changed" >&2; exit 1; \
+    fi \
+    && apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y -o Acquire::Retries=5 --no-install-recommends \
         fonts-noto-cjk \
         fontconfig \
         locales \

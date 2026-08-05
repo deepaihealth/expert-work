@@ -182,6 +182,15 @@ ignore_missing_imports = true
 # disallow_untyped_calls under --strict.
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# 波 1 —— ACS Agent Sandbox. Neither ships a py.typed marker (kruise-agents
+# is an unpublished GitHub-only package — see orchestrator/pyproject.toml's
+# supply-chain-risk comment). AgentSandboxClient (orchestrator/tools/agent_sandbox.py)
+# keeps its own SDK handle typed as ``object`` rather than leaning on these
+# stubs, so this override only silences the "no library stubs" import note.
+module = ["e2b.*", "kruise_agents.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/*/tests", "services/*/tests", "tools/*"]
 asyncio_mode = "auto"

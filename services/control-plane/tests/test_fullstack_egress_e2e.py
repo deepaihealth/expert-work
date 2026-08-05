@@ -31,7 +31,7 @@ from typing import Any
 import asyncpg
 import pytest
 
-from orchestrator.tools import ExecPythonTool, HTTPSupervisorClient, ToolContext
+from orchestrator.tools import ExecPythonTool, HTTPSupervisorRuntime, ToolContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e]
 
@@ -194,7 +194,7 @@ async def test_gate_60_fullstack_egress_injects_and_audits() -> None:
     tenant_id = uuid.uuid4()
     await _seed_allowlist(tenant_id)
 
-    tool = ExecPythonTool(client=HTTPSupervisorClient(base_url=_SUPERVISOR_URL))
+    tool = ExecPythonTool(client=HTTPSupervisorRuntime(base_url=_SUPERVISOR_URL))
     result = await tool.call(
         {"code": _SANDBOX_CODE.replace("__TENANT_ID__", str(tenant_id)), "timeout_s": 30},
         ctx=ToolContext(tenant_id=tenant_id),

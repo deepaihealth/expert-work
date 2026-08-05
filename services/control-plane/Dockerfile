@@ -19,6 +19,24 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 WORKDIR /app
 
+# `kruise-agents` (the Agent Sandbox E2B patch — sandbox migration W1) is
+# a git dependency: uv.lock pins a GitHub rev rather than a PyPI version,
+# because the package has no PyPI release. `uv sync` shells out to the
+# git binary to fetch it, and this base image ships without one, so
+# without this the build dies at `uv sync` with "Git executable not
+# found". It reproduces only in Docker — a dev machine always has git,
+# which is why it survived until the first image build.
+#
+# Builder stage only: by the time stage 2 copies /app/.venv the wheel is
+# already built, so the runtime image needs neither git nor network.
+#
+# Aliyun mirror for the same reason infra/sandbox-image/Dockerfile uses
+# one: deb.debian.org 502s partway through from this network.
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y -o Acquire::Retries=5 --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml uv.lock ./
 COPY packages/ packages/
 COPY services/ services/

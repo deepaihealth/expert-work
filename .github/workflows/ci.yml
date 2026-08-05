@@ -150,7 +150,33 @@ jobs:
         run: uv sync --frozen
 
       - name: Export non-workspace deps
-        run: uv export --frozen --no-emit-workspace --no-hashes --format=requirements.txt > requirements-audit.txt
+        # pip-audit's --no-deps mode requires every line to pin a PyPI
+        # version. A VCS dependency cannot, and it does not skip them — it
+        # fails the whole run:
+        #
+        #   ERROR:pip_audit._cli:kruise-agents: URL requirements cannot be
+        #   pinned to a specific package version
+        #
+        # Sandbox migration W1 introduced the first such dependency
+        # (`kruise-agents`, the Agent Sandbox E2B patch — no PyPI release,
+        # so uv.lock pins a GitHub rev).
+        #
+        # Splitting them out rather than filtering silently: a package that
+        # leaves this file is a package nothing audits, which is a real
+        # blind spot and belongs in the log, not in a grep nobody reads.
+        # The same dependency also makes the control-plane image build
+        # require GitHub reachability (services/control-plane/Dockerfile) —
+        # both are arguments for vendoring it or mirroring it to an
+        # internal index before production.
+        run: |
+          uv export --frozen --no-emit-workspace --no-hashes --format=requirements.txt \
+            > requirements-full.txt
+          grep -E '@ git\+' requirements-full.txt > requirements-vcs.txt || true
+          if [ -s requirements-vcs.txt ]; then
+            echo "::warning::VCS dependencies are OUTSIDE pip-audit's scope (no PyPI version to pin):"
+            cat requirements-vcs.txt
+          fi
+          grep -vE '@ git\+' requirements-full.txt > requirements-audit.txt
 
       - name: pip-audit
         # PYSEC-2025-183 — published 2026-05-20 against pyjwt 2.12.1 (the

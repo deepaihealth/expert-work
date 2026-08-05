@@ -33,9 +33,10 @@ from orchestrator.llm.rerank import HTTPDashScopeRerankClient
 from orchestrator.tools.sandbox import (
     _EXEC_HTTP_BUFFER_S,
     _MAX_EXEC_TIMEOUT_S,
-    HTTPSupervisorClient,
+    HTTPSupervisorRuntime,
 )
 from orchestrator.tools.web_search import SearXNGClient
+from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
 
 def _stub_transport() -> httpx.MockTransport:
@@ -104,12 +105,12 @@ async def test_streaming_path_keeps_the_no_read_timeout() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 命门,机器化版本 —— 六个 client 类的每一个 HTTP 调用点都必须显式传
+# 命门,机器化版本 —— 七个 client 类的每一个 HTTP 调用点都必须显式传
 # per-request timeout(共享 client 没有 client 级默认,见 app.py 的
 # ``timeout=None`` — 漏一处就是该路径静默退到 httpx 内置 5s 默认)。上面
 # 四个测试只覆盖 HTTPOpenAIClient;这里遍历全部 13 个真实调用点(openai
-# 2 + anthropic 2 + embedder 1 + rerank 1 + web_search 1 + sandbox 6),
-# 把"人读代码保证没漏"变成"删一处这里就红"。
+# 2 + anthropic 2 + embedder 1 + rerank 1 + web_search 1 + sandbox 2 +
+# workspace_store 4),把"人读代码保证没漏"变成"删一处这里就红"。
 #
 # 自检(手工做过一次,见 PR 报告):临时删掉 sandbox.py 的
 # ``exec()`` 或 openai.py 的 ``chat_completions`` 里的 ``timeout=`` 参数,
@@ -166,35 +167,35 @@ async def _web_search(shared: httpx.AsyncClient) -> None:
 
 
 async def _sandbox_exec(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    client = HTTPSupervisorRuntime(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
     await client.exec(sandbox_id=uuid4(), code="1+1", timeout_s=None)
 
 
 async def _sandbox_read_workspace_file(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
-    await client.read_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path="p")
+    store = SupervisorWorkspaceStore(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    await store.read_file(tenant_id=uuid4(), user_id=uuid4(), path="p")
 
 
 async def _sandbox_list_workspace_files(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
-    await client.list_workspace_files(tenant_id=uuid4(), user_id=uuid4())
+    store = SupervisorWorkspaceStore(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    await store.list_files(tenant_id=uuid4(), user_id=uuid4())
 
 
 async def _sandbox_write_workspace_file(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
-    await client.write_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path="p", data=b"x")
+    store = SupervisorWorkspaceStore(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    await store.write_file(tenant_id=uuid4(), user_id=uuid4(), path="p", data=b"x")
 
 
 async def _sandbox_delete_workspace_file(shared: httpx.AsyncClient) -> None:
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
-    await client.delete_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path="p")
+    store = SupervisorWorkspaceStore(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    await store.delete_file(tenant_id=uuid4(), user_id=uuid4(), path="p")
 
 
 async def _sandbox_post(shared: httpx.AsyncClient) -> None:
     # release() is the simplest caller of the shared _post() helper
     # (expect_body=False — no response-shape assumptions needed); the same
-    # timeout= line also covers acquire/destroy/reap/mark_workspace_deleted.
-    client = HTTPSupervisorClient(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
+    # timeout= line also covers acquire/destroy/reap.
+    client = HTTPSupervisorRuntime(base_url="http://test", http=shared, timeout_s=_TIMEOUT_S)
     await client.release(sandbox_id=uuid4())
 
 
@@ -225,10 +226,10 @@ _CASES = [
     _Case("rerank.rerank", _rerank, _TIMEOUT_S),
     _Case("web_search.search", _web_search, _TIMEOUT_S),
     _Case("sandbox.exec", _sandbox_exec, float(_MAX_EXEC_TIMEOUT_S) + _EXEC_HTTP_BUFFER_S),
-    _Case("sandbox.read_workspace_file", _sandbox_read_workspace_file, _TIMEOUT_S),
-    _Case("sandbox.list_workspace_files", _sandbox_list_workspace_files, _TIMEOUT_S),
-    _Case("sandbox.write_workspace_file", _sandbox_write_workspace_file, _TIMEOUT_S),
-    _Case("sandbox.delete_workspace_file", _sandbox_delete_workspace_file, _TIMEOUT_S),
+    _Case("workspace_store.read_file", _sandbox_read_workspace_file, _TIMEOUT_S),
+    _Case("workspace_store.list_files", _sandbox_list_workspace_files, _TIMEOUT_S),
+    _Case("workspace_store.write_file", _sandbox_write_workspace_file, _TIMEOUT_S),
+    _Case("workspace_store.delete_file", _sandbox_delete_workspace_file, _TIMEOUT_S),
     _Case("sandbox._post(release)", _sandbox_post, _TIMEOUT_S),
 ]
 

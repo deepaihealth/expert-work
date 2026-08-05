@@ -35,6 +35,7 @@ from control_plane.platform_embedding_config import PlatformEmbeddingConfigServi
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
+from control_plane.settings import Settings
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.tenant_scope import bypass_rls_session
@@ -45,6 +46,7 @@ from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
 from expert_work.persistence import ArtifactStore, KnowledgeStore
+from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.persistence.trigger import TriggerStore
@@ -101,9 +103,10 @@ from orchestrator.multimodal import (
     ObjectStoreImageResolver,
 )
 from orchestrator.tools import (
+    AgentSandboxClient,
     AllowlistProvider,
     DenylistProvider,
-    HTTPSupervisorClient,
+    HTTPSupervisorRuntime,
     KnowledgeRetriever,
     LLMReranker,
     MCPClient,
@@ -111,13 +114,16 @@ from orchestrator.tools import (
     MCPServerPool,
     NullWorkspaceLock,
     Reranker,
+    SandboxInstanceStore,
+    SandboxRuntime,
     SearXNGClient,
     SseMCPClient,
     StdioMCPClient,
     StreamableHttpMCPClient,
-    SupervisorClient,
+    SupervisorWorkspaceStore,
     TavilyClient,
     WorkspaceLock,
+    WorkspaceStore,
 )
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 
@@ -1429,30 +1435,111 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
-def build_supervisor_client(url: str | None) -> SupervisorClient | None:
-    """Build the Sandbox Supervisor HTTP client from its base URL.
+def build_sandbox_runtime(
+    settings: Settings, *, sandbox_instance_store: SandboxInstanceStore | None = None
+) -> SandboxRuntime | None:
+    """按 ``sandbox_backend`` 选沙箱运行时实现。
 
-    ``None`` → the ``exec_python`` tool is unavailable; an agent that
-    declares it fails at build time with a clear error.
+    ``settings.sandbox_backend`` 为 ``None`` 时按老配置推断:设了
+    ``sandbox_supervisor_url`` 就当 ``"supervisor"``,否则没有后端(不破坏
+    只设过 URL 的现网部署)。两个分支:
+
+    * ``"supervisor"`` → :class:`HTTPSupervisorRuntime`(本地 docker
+      sandbox-supervisor,开发/CI)。没配 URL 则 ``None``。
+    * ``"agent_sandbox"`` → :class:`AgentSandboxClient`(ACS Agent Sandbox /
+      E2B SDK,云上多节点)。三项 E2B 配置缺任何一项 **raise**,不返回
+      ``None`` —— 全分支终审"合并前"清单第 3 条:静默降级的表现是"声明了
+      ``exec_python`` 的 agent 在构建期失败",域名少打一个字母要靠一路回溯
+      到这里才查得出来,而这是个纯配置错误,该在进程起来的时候就点名说是
+      哪个 key。与 supervisor 分支的"没 URL 就 ``None``"不对称是有意的:那
+      条是本来就存在的合法降级(压根没部署 supervisor),而显式把后端设成
+      ``agent_sandbox`` 却漏配凭据,只可能是配错了。
+
+    ``None`` → ``exec_python`` 等沙箱工具不可用;声明了沙箱工具的 agent
+    在构建期失败并给出明确错误(既有降级路径,波 1 不改)。
 
     一期 Task 5 — no ``http`` param here: this factory runs in ``app.py``'s
     synchronous ``create_app`` body, before the lifespan creates the shared
     ``httpx.AsyncClient``, so no caller could ever pass one. The lifespan
     instead mutates ``.http`` on the returned client in place once the
-    shared client exists (``HTTPSupervisorClient`` is not frozen, so that
-    is safe) — see the ``isinstance(..., HTTPSupervisorClient)`` guard in
+    shared client exists (``HTTPSupervisorRuntime`` is not frozen, so that
+    is safe) — see the ``isinstance(..., HTTPSupervisorRuntime)`` guard in
     ``app.py``.
+
+    波 1 Task 7 — ``sandbox_instance_store`` backs the ``agent_sandbox``
+    branch's warm-session CAS (``sandbox_instance`` table). It is a
+    parameter rather than something this function builds itself because a
+    real store needs the shared SQL session factory (``app.py``'s
+    ``_SqlStores``, assembled in the SAME synchronous scope this factory
+    runs in) — this stays a pure function of ``settings`` PLUS an injected
+    collaborator, matching how ``SqlSandboxEgressAuditStore`` is built ad
+    hoc at its call site rather than from a settings-only factory.
+    ``None`` (the caller has no SQL stores — ``persistence_backend="memory"``,
+    or a unit test) falls back to :class:`InMemorySandboxInstanceStore` so
+    ``sandbox_backend="agent_sandbox"`` still constructs a usable client
+    rather than silently downgrading to ``None``.
     """
-    if url is None:
+    backend = settings.sandbox_backend
+    if backend is None:
+        backend = "supervisor" if settings.sandbox_supervisor_url else None
+    if backend == "agent_sandbox":
+        missing = [
+            name
+            for name, value in (
+                ("EXPERT_WORK_SANDBOX_E2B_DOMAIN", settings.sandbox_e2b_domain),
+                ("EXPERT_WORK_SANDBOX_E2B_API_KEY", settings.sandbox_e2b_api_key),
+                ("EXPERT_WORK_SANDBOX_E2B_TEMPLATE", settings.sandbox_e2b_template),
+            )
+            if not value
+        ]
+        if missing:
+            msg = (
+                "sandbox_backend='agent_sandbox' requires " + " + ".join(missing) + " — "
+                f"{'they are' if len(missing) > 1 else 'it is'} unset or empty"
+            )
+            raise RuntimeError(msg)
+        return AgentSandboxClient(
+            domain=settings.sandbox_e2b_domain,
+            api_key=settings.sandbox_e2b_api_key,
+            template=settings.sandbox_e2b_template,
+            store=sandbox_instance_store or InMemorySandboxInstanceStore(),
+            egress_token_secret=settings.sandbox_egress_token_secret,
+            egress_proxy_host=settings.sandbox_egress_proxy_host,
+            egress_proxy_port=settings.sandbox_egress_proxy_port,
+        )
+    if backend == "supervisor" and settings.sandbox_supervisor_url:
+        return HTTPSupervisorRuntime(base_url=settings.sandbox_supervisor_url)
+    return None
+
+
+def build_workspace_store(url: str | None) -> WorkspaceStore | None:
+    """Build the workspace-file client from the supervisor's base URL.
+
+    波 1 Task 4 — 工作区文件操作从 ``SandboxRuntime`` 拆出。本地/CI 下
+    工作区是 docker 卷,只有 supervisor 碰得到,所以这个实现仍走 HTTP;
+    波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
+
+    ``None`` → 工作区文件端点不可用,与 ``build_sandbox_runtime`` 同语义。
+
+    全分支终审"合并前"清单第 4 条:判据是 ``not url`` 而不是 ``url is
+    None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是真值判断,而
+    ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个 overlay 关掉
+    supervisor 的写法,见 ``infra/k8s/overlays/*/configmap-patch.yaml``)在
+    ``is None`` 下会造出一个 ``base_url=""`` 的活 store —— 它不是"不可用",
+    而是每次请求都拿一个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那
+    步报成**失败**而不是跳过,工作区端点回一个传输错误而不是它们的空结果
+    分支。
+    """
+    if not url:
         return None
-    return HTTPSupervisorClient(base_url=url)
+    return SupervisorWorkspaceStore(base_url=url)
 
 
 def build_tool_env(
     tenant_config_service: TenantConfigService,
     *,
     web_search_client: TavilyClient | None = None,
-    supervisor_client: SupervisorClient | None = None,
+    sandbox_runtime: SandboxRuntime | None = None,
     mcp_pool: MCPServerPool | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
@@ -1462,8 +1549,8 @@ def build_tool_env(
     """Assemble the M0 :class:`ToolEnv`.
 
     Wires the HTTP tool's per-tenant allowlist, and — when supplied —
-    the ``web_search`` Tavily client, the ``exec_python`` Sandbox
-    Supervisor client, the ``mcp`` server pool, the J.9 artifact store
+    the ``web_search`` Tavily client, the ``exec_python`` sandbox
+    runtime, the ``mcp`` server pool, the J.9 artifact store
     backing ``save_artifact`` / ``list_artifacts``, the J.5 knowledge
     retriever backing ``knowledge_search``, and the J.6 image resolver
     backing multimodal input.
@@ -1472,7 +1559,7 @@ def build_tool_env(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
         denylist_provider=_tenant_denylist_provider(tenant_config_service),
         web_search_client=web_search_client,
-        supervisor_client=supervisor_client,
+        sandbox_runtime=sandbox_runtime,
         mcp_pool=mcp_pool,
         artifact_store=artifact_store,
         knowledge_retriever=knowledge_retriever,

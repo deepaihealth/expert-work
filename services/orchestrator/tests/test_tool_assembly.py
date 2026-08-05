@@ -38,7 +38,7 @@ from orchestrator.tools import (
     ReadDocumentTool,
     ReadFileTool,
     RecordingMCPClient,
-    RecordingSupervisorClient,
+    RecordingSandboxRuntime,
     RecordingTavilyClient,
     RecordingWorkspaceLock,
     SaveArtifactTool,
@@ -708,14 +708,14 @@ async def test_platform_reserves_name_even_when_all_its_tools_filtered() -> None
 async def test_file_op_builtin_assembles(name: str, cls: type) -> None:
     registry = await build_tool_registry(
         [BuiltinToolSpec(name=name)],
-        tool_env=ToolEnv(supervisor_client=RecordingSupervisorClient()),
+        tool_env=ToolEnv(sandbox_runtime=RecordingSandboxRuntime()),
     )
     assert isinstance(registry.get(name), cls)
 
 
 async def test_file_op_write_tools_receive_workspace_lock() -> None:
     lock = RecordingWorkspaceLock()
-    env = ToolEnv(supervisor_client=RecordingSupervisorClient(), workspace_lock=lock)
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime(), workspace_lock=lock)
     registry = await build_tool_registry(
         [BuiltinToolSpec(name="write_file"), BuiltinToolSpec(name="edit_file")],
         tool_env=env,
@@ -762,7 +762,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     # An empty ``tools:`` list still yields a capable agent: exec_python /
     # bash / file ops (supervisor) + artifacts (artifact store).
     env = ToolEnv(
-        supervisor_client=RecordingSupervisorClient(),
+        sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
     )
     registry = await build_tool_registry([], tool_env=env)
@@ -803,7 +803,7 @@ async def test_base_capabilities_gated_per_dependency() -> None:
 async def test_explicit_base_tool_not_double_registered() -> None:
     # A manifest that still lists a base tool explicitly must not register it
     # twice — the implicit pass dedups against what the manifest loop added.
-    env = ToolEnv(supervisor_client=RecordingSupervisorClient())
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime())
     registry = await build_tool_registry([BuiltinToolSpec(name="exec_python")], tool_env=env)
     occurrences = [s for s in registry.all_specs() if s.name == "exec_python"]
     assert len(occurrences) == 1
@@ -814,7 +814,7 @@ async def test_base_capabilities_coexist_with_opt_in_tools() -> None:
     # Declaring an opt-in tool (web_search) does not suppress the base set.
     env = ToolEnv(
         web_search_client=RecordingTavilyClient(),
-        supervisor_client=RecordingSupervisorClient(),
+        sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
     )
     registry = await build_tool_registry([BuiltinToolSpec(name="web_search")], tool_env=env)

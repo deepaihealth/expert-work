@@ -22,7 +22,7 @@ from orchestrator.tools import (
     ListDirTool,
     NullWorkspaceLock,
     ReadFileTool,
-    RecordingSupervisorClient,
+    RecordingSandboxRuntime,
     RecordingWorkspaceLock,
     SandboxOutcome,
     ToolContext,
@@ -38,7 +38,7 @@ def _ctx() -> ToolContext:
 
 @dataclass
 class _LockProbeClient:
-    """Minimal SupervisorClient that records the lock depth seen at exec time."""
+    """Minimal SandboxRuntime that records the lock depth seen at exec time."""
 
     lock: RecordingWorkspaceLock
     envelope: str
@@ -124,7 +124,7 @@ async def test_write_file_releases_lock_on_cancel() -> None:
     # A cancellation mid-exec must unwind through the lock context manager so
     # the lock is released (and, for the PG impl, its transaction rolled back).
     lock = RecordingWorkspaceLock()
-    client = RecordingSupervisorClient()
+    client = RecordingSandboxRuntime()
     client.exec_error = asyncio.CancelledError()
     tool = WriteFileTool(client=client, workspace_lock=lock)
     with pytest.raises(asyncio.CancelledError):

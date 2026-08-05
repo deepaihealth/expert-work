@@ -54,7 +54,7 @@ from expert_work.runtime.runs import (
     RunStatus,
 )
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
-from orchestrator.tools.sandbox import RecordingSupervisorClient
+from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -149,7 +149,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     curation = InMemoryCurationCandidateStore()
     users = InMemoryTenantUserStore()
     audit_store = InMemoryAuditLogStore()
-    supervisor = RecordingSupervisorClient()
+    workspace_store = RecordingWorkspaceStore()
 
     a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
     b = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-b")
@@ -244,7 +244,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         curation_candidates=curation,
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
-        supervisor=supervisor,
+        workspace_store=workspace_store,
     )
 
     summary = await purge_user(
@@ -286,7 +286,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     assert all_runs[0].user_id is None
 
     # --- Workspace mark sent; tenant_user deactivated; USER_PURGE audited. ---
-    assert (t1, a.id) in supervisor.workspace_deletions
+    assert (t1, a.id) in workspace_store.workspace_deletions
     assert summary.workspace_marked_deleted is True
     assert summary.deactivated is True
     assert {u.id for u in await users.list_by_tenant(t1, subject_type="user")} == {b.id}
@@ -343,7 +343,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
     curation = InMemoryCurationCandidateStore()
     users = InMemoryTenantUserStore()
     audit_store = InMemoryAuditLogStore()
-    supervisor = RecordingSupervisorClient()
+    workspace_store = RecordingWorkspaceStore()
 
     a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
     image_id = uuid4()
@@ -382,7 +382,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
         curation_candidates=curation,
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
-        supervisor=supervisor,
+        workspace_store=workspace_store,
     )
 
     summary = await purge_user(
@@ -443,7 +443,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
     curation = InMemoryCurationCandidateStore()
     users = InMemoryTenantUserStore()
     audit_store = InMemoryAuditLogStore()
-    supervisor = RecordingSupervisorClient()
+    workspace_store = RecordingWorkspaceStore()
 
     a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
     image_ids = [uuid4(), uuid4()]
@@ -486,7 +486,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
         curation_candidates=curation,
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
-        supervisor=supervisor,
+        workspace_store=workspace_store,
     )
 
     summary = await purge_user(
@@ -534,7 +534,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
     curation = InMemoryCurationCandidateStore()
     users = InMemoryTenantUserStore()
     audit_store = InMemoryAuditLogStore()
-    supervisor = RecordingSupervisorClient()
+    workspace_store = RecordingWorkspaceStore()
 
     a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
     b = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-b")
@@ -584,7 +584,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
         curation_candidates=curation,
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
-        supervisor=supervisor,
+        workspace_store=workspace_store,
     )
 
     summary = await purge_user(
@@ -651,7 +651,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     curation = InMemoryCurationCandidateStore()
     users = InMemoryTenantUserStore()
     audit_store = InMemoryAuditLogStore()
-    supervisor = RecordingSupervisorClient()
+    workspace_store = RecordingWorkspaceStore()
 
     a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
     t_a = uuid4()
@@ -689,7 +689,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         curation_candidates=curation,
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
-        supervisor=supervisor,
+        workspace_store=workspace_store,
     )
 
     summary = await purge_user(

@@ -4,8 +4,8 @@ Runs LLM-generated Python in a gVisor sandbox via the Sandbox Supervisor
 (F.1): ``acquire`` a sandbox, ``exec`` the code, ``release`` it. The
 supervisor mediates the held-pipe runner protocol (F.4a); this tool
 speaks only the supervisor's HTTP API behind a small
-:class:`SupervisorClient` Protocol — tests inject
-:class:`RecordingSupervisorClient`.
+:class:`SandboxRuntime` Protocol — tests inject
+:class:`RecordingSandboxRuntime`.
 
 Output is truncated to :data:`DEFAULT_OUTPUT_CHAR_CAP` for the LLM
 (Mini-ADR F-9 / E-10) — the runner already capped it at ~1 MiB for
@@ -91,14 +91,6 @@ class EgressContext:
     denylist: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True)
-class WorkspaceFileEntry:
-    """One file in a user's persistent workspace volume (browse listing)."""
-
-    path: str
-    size: int
-
-
 def _traced_headers() -> dict[str, str]:
     """Outbound headers carrying the active W3C trace context (A.8).
 
@@ -116,15 +108,15 @@ def _traced_headers() -> dict[str, str]:
 class SandboxSupervisorError(RuntimeError):
     """A Sandbox Supervisor HTTP call failed.
 
-    Raised by :class:`HTTPSupervisorClient`; :class:`ExecPythonTool`
+    Raised by :class:`HTTPSupervisorRuntime`; :class:`ExecPythonTool`
     lets it propagate so the ReAct ``tools`` node wraps it into a
     ``ToolMessage(status="error")`` (Mini-ADR E-12).
     """
 
 
 @runtime_checkable
-class SupervisorClient(Protocol):
-    """The Sandbox Supervisor operations the tool needs."""
+class SandboxRuntime(Protocol):
+    """The sandbox runtime operations the tool needs."""
 
     async def acquire(
         self,
@@ -156,39 +148,6 @@ class SupervisorClient(Protocol):
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         """Forced sandbox teardown (SIGKILL); ``reason`` is audited."""
 
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        """Read a file from a user's persistent workspace volume (J.9 artifact download)."""
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        """List the files in a user's persistent workspace volume (browse)."""
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        """Write ``data`` to ``path`` in a user's persistent workspace volume.
-
-        Backs the document-upload path: a user uploads a file, the
-        control-plane proxies here, and the bytes land in the durable
-        workspace so a later run's ``read_document`` can read them. Only
-        the supervisor can write a per-user docker volume."""
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        """Delete one file from a user's persistent workspace volume.
-
-        Backs the playground workspace cleanup. Only the supervisor can
-        mutate a per-user docker volume; the control-plane proxies here."""
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        """Soft-delete a user's whole persistent workspace (Phase 3a purge_user).
-
-        The supervisor destroys any warm session, drops the user's
-        sandbox_instance rows, and marks the volume deleted (Mini-ADR J-36 —
-        the reaper archives it, then the 90-day sweep hard-deletes). Idempotent.
-        Only the supervisor can mutate a per-user docker volume; the
-        control-plane proxies here as part of the cascade purge."""
-
     async def reap(self, *, force: bool) -> int:
         """Run the idle-session sweep now; return how many were reaped.
 
@@ -199,8 +158,8 @@ class SupervisorClient(Protocol):
 
 
 @dataclass
-class HTTPSupervisorClient:
-    """Production :class:`SupervisorClient` — calls the supervisor's HTTP API.
+class HTTPSupervisorRuntime:
+    """Production :class:`SandboxRuntime` — calls the supervisor's HTTP API.
 
     A non-2xx response raises :class:`SandboxSupervisorError`.
     """
@@ -306,101 +265,6 @@ class HTTPSupervisorClient:
         body = await self._post("/v1/sandboxes:reap", json={"force": force})
         return int(body.get("reaped_count", 0))
 
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.get(
-                    url,
-                    params={"path": path},
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace read failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-        return response.content
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/files"
-        async with self._make_client() as client:
-            try:
-                response = await client.get(
-                    url,
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace list failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-        body = response.json()
-        return [
-            WorkspaceFileEntry(path=str(f["path"]), size=int(f["size"]))
-            for f in body.get("files", [])
-        ]
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.put(
-                    url,
-                    params={"path": path},
-                    content=data,
-                    headers={**_traced_headers(), "content-type": "application/octet-stream"},
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                f"sandbox supervisor workspace write failed: {response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
-        async with self._make_client() as client:
-            try:
-                response = await client.request(
-                    "DELETE",
-                    url,
-                    params={"path": path},
-                    headers=_traced_headers(),
-                    timeout=self.timeout_s,  # per-request — governs even when sharing a client
-                )
-            except httpx.HTTPError as exc:
-                msg = f"sandbox supervisor unreachable ({url}): {exc}"
-                raise SandboxSupervisorError(msg) from exc
-        if response.is_error:
-            msg = (
-                "sandbox supervisor workspace delete failed: "
-                f"{response.status_code} {response.text}"
-            )
-            raise SandboxSupervisorError(msg)
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        await self._post(
-            f"/v1/workspaces/{tenant_id}/{user_id}:delete",
-            json=None,
-            expect_body=False,
-        )
-
     async def _post(
         self,
         path: str,
@@ -432,8 +296,8 @@ class HTTPSupervisorClient:
 
 
 @dataclass
-class RecordingSupervisorClient:
-    """In-memory :class:`SupervisorClient` for dev / tests.
+class RecordingSandboxRuntime:
+    """In-memory :class:`SandboxRuntime` for dev / tests.
 
     Records the acquire / exec / release / destroy calls and returns the
     pre-set :attr:`outcome`. Set ``exec_error`` to drive the error path
@@ -446,10 +310,6 @@ class RecordingSupervisorClient:
     )
     exec_error: BaseException | None = None
     destroy_error: Exception | None = None
-    workspace_file: bytes = b""
-    workspace_file_error: Exception | None = None
-    workspace_files: list[WorkspaceFileEntry] = field(default_factory=list)
-    workspace_list_error: Exception | None = None
     acquired: list[tuple[UUID, str, UUID | None, tuple[tuple[str, bytes], ...]]] = field(
         default_factory=list
     )
@@ -459,14 +319,6 @@ class RecordingSupervisorClient:
     execs: list[tuple[UUID, str]] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
-    workspace_reads: list[tuple[UUID, UUID, str]] = field(default_factory=list)
-    workspace_writes: list[tuple[UUID, UUID, str, bytes]] = field(default_factory=list)
-    workspace_write_error: Exception | None = None
-    workspace_deletes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
-    workspace_delete_error: Exception | None = None
-    #: Phase 3a — the ``(tenant_id, user_id)`` of each mark_workspace_deleted call.
-    workspace_deletions: list[tuple[UUID, UUID]] = field(default_factory=list)
-    workspace_deletion_error: Exception | None = None
     reaped: list[bool] = field(default_factory=list)
     reap_count: int = 0
     _next_id: int = 0
@@ -500,37 +352,6 @@ class RecordingSupervisorClient:
             raise self.destroy_error
         self.destroyed.append((sandbox_id, reason))
 
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        self.workspace_reads.append((tenant_id, user_id, path))
-        if self.workspace_file_error is not None:
-            raise self.workspace_file_error
-        return self.workspace_file
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        self.workspace_reads.append((tenant_id, user_id, ""))
-        if self.workspace_list_error is not None:
-            raise self.workspace_list_error
-        return self.workspace_files
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        if self.workspace_write_error is not None:
-            raise self.workspace_write_error
-        self.workspace_writes.append((tenant_id, user_id, path, data))
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        if self.workspace_delete_error is not None:
-            raise self.workspace_delete_error
-        self.workspace_deletes.append((tenant_id, user_id, path))
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        if self.workspace_deletion_error is not None:
-            raise self.workspace_deletion_error
-        self.workspace_deletions.append((tenant_id, user_id))
-
     async def reap(self, *, force: bool) -> int:
         self.reaped.append(force)
         return self.reap_count
@@ -538,7 +359,7 @@ class RecordingSupervisorClient:
 
 @dataclass
 class _EgressBindingClient:
-    """Wraps a :class:`SupervisorClient`, injecting a fixed :class:`EgressContext`
+    """Wraps a :class:`SandboxRuntime`, injecting a fixed :class:`EgressContext`
     into every ``acquire`` (sandbox-egress §3.3).
 
     Bound once per agent build (``agent_factory``) around the shared supervisor
@@ -547,7 +368,7 @@ class _EgressBindingClient:
     unchanged.
     """
 
-    inner: SupervisorClient
+    inner: SandboxRuntime
     egress: EgressContext
 
     async def acquire(
@@ -577,32 +398,11 @@ class _EgressBindingClient:
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         await self.inner.destroy(sandbox_id=sandbox_id, reason=reason)
 
-    async def read_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        return await self.inner.read_workspace_file(tenant_id=tenant_id, user_id=user_id, path=path)
-
-    async def list_workspace_files(
-        self, *, tenant_id: UUID, user_id: UUID
-    ) -> list[WorkspaceFileEntry]:
-        return await self.inner.list_workspace_files(tenant_id=tenant_id, user_id=user_id)
-
-    async def write_workspace_file(
-        self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes
-    ) -> None:
-        await self.inner.write_workspace_file(
-            tenant_id=tenant_id, user_id=user_id, path=path, data=data
-        )
-
-    async def delete_workspace_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
-        await self.inner.delete_workspace_file(tenant_id=tenant_id, user_id=user_id, path=path)
-
-    async def mark_workspace_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        await self.inner.mark_workspace_deleted(tenant_id=tenant_id, user_id=user_id)
-
     async def reap(self, *, force: bool) -> int:
         return await self.inner.reap(force=force)
 
 
-def bind_egress(client: SupervisorClient, egress: EgressContext | None) -> SupervisorClient:
+def bind_egress(client: SandboxRuntime, egress: EgressContext | None) -> SandboxRuntime:
     """Wrap ``client`` so every acquire carries ``egress`` (no-op if ``None``)."""
     if egress is None:
         return client
@@ -610,7 +410,7 @@ def bind_egress(client: SupervisorClient, egress: EgressContext | None) -> Super
 
 
 async def run_in_sandbox(
-    client: SupervisorClient,
+    client: SandboxRuntime,
     *,
     code: str,
     timeout_s: int | None,
@@ -707,7 +507,7 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
     )
 
 
-async def _release_quietly(client: SupervisorClient, sandbox_id: UUID, *, tool_label: str) -> None:
+async def _release_quietly(client: SandboxRuntime, sandbox_id: UUID, *, tool_label: str) -> None:
     # A release failure must never mask the exec result / error.
     try:
         await client.release(sandbox_id=sandbox_id)
@@ -716,7 +516,7 @@ async def _release_quietly(client: SupervisorClient, sandbox_id: UUID, *, tool_l
 
 
 async def _destroy_quietly(
-    client: SupervisorClient, sandbox_id: UUID, *, reason: str, tool_label: str
+    client: SandboxRuntime, sandbox_id: UUID, *, reason: str, tool_label: str
 ) -> None:
     # A destroy failure must not mask the cancellation — the supervisor's
     # TTL reaper is the backstop for a leaked container.
@@ -730,7 +530,7 @@ async def _destroy_quietly(
 class ExecPythonTool:
     """Sandbox Python execution exposed to the LLM as ``exec_python``."""
 
-    client: SupervisorClient
+    client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — the agent's activated skill files, materialized
     #: under ``/workspace/skills/<name>/`` on each acquire. Set at build.
