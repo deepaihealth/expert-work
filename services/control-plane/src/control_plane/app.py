@@ -209,6 +209,7 @@ from control_plane.runtime import (
     resolve_object_store_config,
     resolve_web_search_client,
 )
+from control_plane.sandbox_egress_metrics import SandboxEgressMetricsWorker
 from control_plane.sandbox_reap_worker import SandboxReapWorker
 from control_plane.scheduler import TriggerScheduler
 from control_plane.settings import Settings
@@ -1252,6 +1253,7 @@ def create_app(
             quality_drift: QualityDriftWorker | None = None
             approval_gauge_worker: ApprovalGaugeWorker | None = None
             sandbox_reap_worker: SandboxReapWorker | None = None
+            sandbox_egress_metrics_worker: SandboxEgressMetricsWorker | None = None
             if agent_runtime is None:
                 if resolved_settings.checkpointer_backend == "postgres":
                     if not resolved_settings.checkpointer_dsn:
@@ -2073,6 +2075,16 @@ def create_app(
                 sandbox_reap_worker = SandboxReapWorker(runtime=resolved_sandbox_runtime)
                 sandbox_reap_worker.start()
                 _app.state.sandbox_reap_worker = sandbox_reap_worker
+            # sandbox-egress-age-quota Task 3 — 407/blocked egress
+            # observability. Always-on like ApprovalGaugeWorker (no settings
+            # knob); only when a real SQL-backed audit store exists to scan
+            # (``sql_stores`` is ``None`` in memory-backend mode).
+            if sql_stores is not None:
+                sandbox_egress_metrics_worker = SandboxEgressMetricsWorker(
+                    audit_store=resolved_egress_audit_store
+                )
+                sandbox_egress_metrics_worker.start()
+                _app.state.sandbox_egress_metrics_worker = sandbox_egress_metrics_worker
             resolved_lifecycle.mark_ready()
             logger.info(
                 "control_plane.lifespan.ready",
@@ -2119,6 +2131,8 @@ def create_app(
                     await approval_gauge_worker.stop()
                 if sandbox_reap_worker is not None:
                     await sandbox_reap_worker.stop()
+                if sandbox_egress_metrics_worker is not None:
+                    await sandbox_egress_metrics_worker.stop()
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.
