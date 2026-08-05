@@ -1702,3 +1702,62 @@ async def test_acquire_respects_tenant_quota_row_over_default() -> None:
         await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
     with pytest.raises(SandboxSupervisorError, match="quota"):
         await client.acquire(tenant_id=other_tenant_id, thread_id="t2")
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_over_age_warm_session_at_quota_limit() -> None:
+    """租户**已经在配额上限**(``count_active_for_tenant`` == limit,含即将
+    被重建的这一行本身)时,年龄封顶的 1 换 1 重建路径必须照常成功 ——
+    ``_enforce_quota`` 只挂在 :meth:`AgentSandboxClient.acquire` 的全新建行
+    分支(``existing is None``)上,这是刻意的设计决定(见其 docstring):
+    重建不改变总活跃行数,查了反而会把已到上限租户的存量热会话变成不可
+    重建的死会话。
+
+    这条测试钉住这个决定本身:如果未来有人把 ``_enforce_quota`` 挪到分支
+    分裂点之上、统一套在所有路径上,租户在上限时的这次重建就会被拒
+    ——这里必须变红。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes - 1):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+    store.rows[old_id]["acquired_at"] = datetime.now(UTC) - timedelta(
+        seconds=client._max_warm_age_s() + 60
+    )
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "超龄必须重建,不能复用旧 sandbox_id"
+    assert len(sdk.created) == 2, "配额已满不该拦住 1 换 1 重建(第二次 sdk.create 必须发生)"
+    assert (old_id, _WARM_AGE_DESTROY_REASON) in store.mark_destroyed_calls
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert quota_unwinds == [], "重建路径不查配额,不该有任何 quota_exceeded 的 unwind"
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_reconnect_failed_warm_session_at_quota_limit() -> None:
+    """同上一条,换成重连失败(spec § 6.3)那条 1 换 1 重建路径:租户已在配额
+    上限时,``connect`` 炸掉之后的强制重建也必须照常成功 —— 同一份
+    ``_enforce_quota`` docstring 说的是"年龄封顶/重连失败的 1 换 1 重建路径
+    都不查",两条路径都要各自钉住,免得只保住一条、另一条被后续重构悄悄
+    套上配额闸而没有任何测试发现。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes - 1):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+    sdk.connect_fails = True
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "连不上必须重建,不能返回旧 sandbox_id"
+    assert len(sdk.created) == 2, "配额已满不该拦住 1 换 1 重建(第二次 sdk.create 必须发生)"
+    assert (old_id, "warm_reconnect_failed") in store.mark_destroyed_calls
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert quota_unwinds == [], "重建路径不查配额,不该有任何 quota_exceeded 的 unwind"

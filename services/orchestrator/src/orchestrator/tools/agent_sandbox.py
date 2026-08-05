@@ -513,9 +513,15 @@ class AgentSandboxClient:
         supervisor 先查后插,两个并发 acquire 可各自读到 limit-1 双双过闸
         小幅超限;这里本次调用的行**已经**落库(它就是 CAS 凭证),count
         必然包含自己 —— 条件用严格 ``>``,超限则 :meth:`_unwind_slot` 拆掉
-        自己的行再抛。并发下每个竞争者都数得到对方已插的行,最终落库的
-        活跃行数不会超过 limit —— 比 supervisor 的竞态语义更紧,顺带免了
-        「拒绝路径漏行」的清理债。
+        自己的行再抛。并发**新建**竞争者之间数得到对方已插的行,彼此不会
+        超限 —— 比 supervisor 的竞态语义更紧,顺带免了「拒绝路径漏行」的
+        清理债。**但这不是"落库活跃行数任何时刻都 ≤ limit"的全局保证**:
+        下面的年龄封顶/重连失败重建路径刻意不经过这道闸(见下一段),它们
+        的 destroy 与重占坑之间存在窗口,一个并发的**新建**请求可以在那个
+        窗口里数到"重建者旧行已删、新行未插"之间的活跃数、把腾出来的名额
+        吃掉 —— 极端交错下总活跃行数可以短暂到 ``limit + 进行中的重建数``。
+        自限(重建数有限,不会像真正的配额洞一样无界增长)且自愈(重建
+        完成后下一次新建请求照常被这道闸拦住,不需要人工介入)。
 
         只挂在 :meth:`acquire` 的**全新建行**路径(``existing is None``
         分支)上:热会话复用与年龄封顶/重连失败的 1 换 1 重建路径都不查
@@ -526,6 +532,13 @@ class AgentSandboxClient:
         既不能吞掉(fail-open 让配额闸形同虚设),也不能保留这行不拆
         (行已经插入,槽位会一直卡着);拆 + 抛是唯一在两难之间都不留后遗症
         的选择。
+
+        与 supervisor 的第二处不对称:supervisor 拒绝时额外写一条
+        ``AuditAction.SANDBOX_QUOTA_DENIED`` 审计行(``supervisor.py:713-727``);
+        这里刻意不写 —— ``AgentSandboxClient`` 没有接审计存储的依赖,补一个
+        纯为了这一处调用不值得。拆行时留下的
+        ``destroy_reason="quota_exceeded"`` 就是可查询的痕迹,已知的能力
+        缺口,不是遗漏。
         """
         try:
             limit = await self.store.sandbox_limit_for_tenant(tenant_id=tenant_id)

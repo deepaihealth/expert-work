@@ -65,6 +65,12 @@ control-plane 是 M0 的 API 入口 + in-process orchestrator 宿主（STREAM-E 
   是 AgentSandboxClient 云后端），逼所有 agent 下次 acquire 都拿新 token；
   收尾要确认 `agent_sandbox.py` 的年龄封顶检查确实在对应后端路径上生效，
   不然过一个 age-cap 周期又会复发。
+- **租户沙箱配额耗尽**，且怀疑是孤儿 mid-create 行占坑：`sandbox_instance`
+  表里 `state=IN_USE` 且 `container_id` 为 NULL（`count_active_for_tenant`
+  把「建行中」也计入配额分子）、`acquired_at` 早于「现在 − 5 分钟」的行——
+  orchestrator 进程死在 `claim_warm`/`set_container_id` 两次写之间留下的
+  孤儿，永远占着配额名额且没有沙箱在跑；`POST /v1/sandboxes/reap?force=true`
+  （system_admin）清掉这些孤儿行释放配额。
 
 ## 回滚
 

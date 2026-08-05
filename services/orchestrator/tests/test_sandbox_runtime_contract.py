@@ -537,3 +537,47 @@ def test_default_max_sandboxes_matches_supervisor_default() -> None:
         AgentSandboxClient.__dataclass_fields__["default_max_sandboxes"].default
         == SandboxSupervisorSettings.model_fields["default_max_sandboxes"].default
     )
+
+
+def test_max_warm_age_leaves_room_under_the_egress_token_ttl() -> None:
+    """#1b 的自愈闸只有在这条不等式成立时才真的自愈 —— 手法同
+    ``test_platform_timeout_outlives_idle_ttl``(``test_agent_sandbox.py``):
+    比较两个由同一处代码派生的数字,不连任何真实环境。
+
+    ``AgentSandboxClient._max_warm_age_s()``(``egress_token_ttl_s // 2``)是
+    "热会话必须死在 token 之前"这条约束唯一的强制手段 —— token 只在
+    ``create(envs=...)`` 送一次、``connect`` 不重发(见 ``agent_sandbox.py``
+    模块 docstring 再审 Important-3),活过 token 的会话出网一律 407 且没有
+    任何自愈路径。这条闸如果不严格小于 TTL,#1b 想堵的洞会原样复活 —— 例如
+    把除法系数从 ``// 2`` 改成 ``* 2``,年龄封顶就会晚于 token 过期才触发,
+    热会话在被强制重建之前已经先撞上 407。
+
+    第二条断言额外留出一次最长工具调用(``MAX_TIMEOUT_S``,exec 的 clamp
+    上界)的余量:cap 命中的判定发生在 ``acquire`` 入口,cap 命中之后、
+    重建完成之前,进行中的那次调用仍可能用旧沙箱跑到 ``MAX_TIMEOUT_S``——
+    光是"cap < ttl"不够,cap 还必须比 ttl 早到足够让这次收尾调用也来得及
+    在 token 过期前结束。
+    """
+    from orchestrator.tools.agent_sandbox import AgentSandboxClient
+    from orchestrator.tools.sandbox_image_contract import MAX_TIMEOUT_S
+
+    client = AgentSandboxClient(
+        domain="gw.example.com",
+        api_key="k",
+        template="expert-work-sandbox",
+        store=object(),  # type: ignore[arg-type]  # 方法不碰 store,见上方 docstring。
+        egress_token_secret="s3cret",
+        egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
+        egress_proxy_port=8081,
+    )
+
+    assert client._max_warm_age_s() < client.egress_token_ttl_s, (
+        f"年龄封顶 {client._max_warm_age_s()}s 必须严格小于出网 token TTL"
+        f" {client.egress_token_ttl_s}s,否则热会话会先撞 407 才轮到强制重建"
+        " —— #1b 想堵的洞原样复活。"
+    )
+    assert client._max_warm_age_s() + MAX_TIMEOUT_S < client.egress_token_ttl_s, (
+        f"年龄封顶 {client._max_warm_age_s()}s 加一次最长工具调用"
+        f"({MAX_TIMEOUT_S}s)必须仍然小于 token TTL {client.egress_token_ttl_s}s,"
+        "否则 cap 命中之后、重建完成之前那次收尾调用可能跑到 token 过期。"
+    )
