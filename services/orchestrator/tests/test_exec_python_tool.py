@@ -96,6 +96,40 @@ async def test_exec_python_truncates_oversized_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exec_python_meta_carries_streams() -> None:
+    # PR-D — the debug console reads stdout/stderr from the structured
+    # ``meta`` (→ ToolMessage.artifact) because the rendered ``content``
+    # is spotlight-datamarked (newlines destroyed) on the wire.
+    client = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(stdout="42\n", stderr="boom\n", exit_code=3, timed_out=False)
+    )
+    tool = ExecPythonTool(client=client)
+
+    result = await tool.call({"code": "print(6 * 7)"}, ctx=_ctx())
+
+    assert result.meta["stdout"] == "42\n"
+    assert result.meta["stderr"] == "boom\n"
+    assert result.meta["exit_code"] == 3
+
+
+@pytest.mark.asyncio
+async def test_exec_python_meta_streams_are_capped() -> None:
+    # meta rides the SSE / audit / trace path — it carries the same
+    # head-truncated streams the rendered content shows, never the raw 1MB.
+    client = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(stdout="x" * 50_000, stderr="", exit_code=0, timed_out=False)
+    )
+    tool = ExecPythonTool(client=client)
+
+    result = await tool.call({"code": "print('x' * 50000)"}, ctx=_ctx())
+
+    assert result.meta["truncated"] is True
+    assert result.meta["stdout"].endswith("...[truncated]")
+    assert len(result.meta["stdout"]) == DEFAULT_OUTPUT_CHAR_CAP + len("...[truncated]")
+    assert result.meta["stderr"] == ""
+
+
+@pytest.mark.asyncio
 async def test_exec_python_reports_timeout() -> None:
     client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)
