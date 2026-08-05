@@ -54,7 +54,8 @@ class SandboxStore(Protocol):
 
         Excludes agent-sandbox-backend rows: ``sandbox_instance`` is shared
         by both backends, and this returns only the docker-backend rows
-        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``).
+        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``). Same
+        in-memory-fake vacuity note as :meth:`count_active_for_tenant`.
         """
 
     async def sandbox_limit_for_tenant(self, tenant_id: UUID) -> int | None:
