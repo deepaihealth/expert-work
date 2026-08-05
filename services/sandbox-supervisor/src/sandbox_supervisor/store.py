@@ -17,6 +17,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import SandboxInstanceRow, TenantQuotaRow
+from expert_work.persistence.sandbox_instance_store import AGENT_SANDBOX_IMAGE_REF
 from expert_work.protocol.quota import QuotaDimension
 from sandbox_supervisor.domain import SandboxRecord, SandboxState
 
@@ -37,10 +38,25 @@ class SandboxStore(Protocol):
         """Return one sandbox by id, or ``None``."""
 
     async def count_active_for_tenant(self, tenant_id: UUID) -> int:
-        """Count the tenant's non-terminal sandboxes (``CREATING`` + ``IN_USE``)."""
+        """Count the tenant's non-terminal sandboxes (``CREATING`` + ``IN_USE``).
+
+        Excludes agent-sandbox-backend rows: ``sandbox_instance`` is shared
+        by both backends, and this counts only the docker-backend rows
+        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``). The in-memory
+        fakes used in tests are only ever written by the supervisor itself,
+        so every row they hold is already docker-shaped — the ``image_ref``
+        dimension is vacuously satisfied there and those fakes add no such
+        filter.
+        """
 
     async def list_idle_sessions(self, *, now: datetime, idle_ttl_s: int) -> list[SandboxRecord]:
-        """Return ``IN_USE`` sandboxes idle past ``last_used_at + idle_ttl_s``."""
+        """Return ``IN_USE`` sandboxes idle past ``last_used_at + idle_ttl_s``.
+
+        Excludes agent-sandbox-backend rows: ``sandbox_instance`` is shared
+        by both backends, and this returns only the docker-backend rows
+        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``). Same
+        in-memory-fake vacuity note as :meth:`count_active_for_tenant`.
+        """
 
     async def sandbox_limit_for_tenant(self, tenant_id: UUID) -> int | None:
         """Return the tenant's ``sandboxes`` quota, or ``None`` if unset."""
@@ -62,6 +78,17 @@ class SandboxStore(Protocol):
         AFTER any live warm session was force-destroyed, so no orphaned
         container is left behind. Tenant- AND user-scoped; NULL-``user_id``
         ephemeral rows are not this user's and are left untouched.
+
+        Unlike ``count_active_for_tenant`` / ``list_idle_sessions``, this
+        deliberately does NOT exclude agent-backend rows — purge semantics
+        mean deleting everything for this user; an E2B row deleted here
+        loses its lease and is reclaimed by the platform's own ≤20-minute
+        timeout once nothing renews it (PR-A ruling). In a cloud deployment
+        (no supervisor process running), this purge path itself never
+        executes — ``user_purge`` only reaches it when a
+        ``sandbox_supervisor``-backed workspace store is wired in — so
+        actually cleaning up agent-backend rows on purge is wave-2
+        follow-up.
         """
 
 
@@ -99,11 +126,14 @@ class DbSandboxStore:
             return _to_record(row) if row is not None else None
 
     async def count_active_for_tenant(self, tenant_id: UUID) -> int:
+        # 表与 AgentSandboxClient 共用(PR-A):E2B 行不占 docker 配额 ——
+        # 云后端的配额语义由云侧自己管(波 2)。
         async with self._sf() as session:
             result = await session.execute(
                 select(SandboxInstanceRow.id).where(
                     SandboxInstanceRow.tenant_id == tenant_id,
                     SandboxInstanceRow.state.in_([s.value for s in _ACTIVE_STATES]),
+                    SandboxInstanceRow.image_ref != AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             return len(result.fetchall())
@@ -113,10 +143,14 @@ class DbSandboxStore:
         # idle_ttl_s`` (Stream J.15). M0 sandbox counts are small, so
         # fetching IN_USE rows and filtering in Python is simpler than a
         # SQL per-row interval expression.
+        #
+        # E2B 行交给云侧自己的周期 reap(control_plane.sandbox_reap_worker),
+        # docker reaper 对它们既 stop 不动也不该记账(PR-A)。
         async with self._sf() as session:
             result = await session.execute(
                 select(SandboxInstanceRow).where(
-                    SandboxInstanceRow.state == SandboxState.IN_USE.value
+                    SandboxInstanceRow.state == SandboxState.IN_USE.value,
+                    SandboxInstanceRow.image_ref != AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             rows = result.scalars().all()

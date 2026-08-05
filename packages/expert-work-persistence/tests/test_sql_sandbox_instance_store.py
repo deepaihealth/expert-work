@@ -21,6 +21,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from testcontainers.postgres import PostgresContainer
 
 from expert_work.persistence import (
@@ -33,6 +34,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _IDLE_TTL_S,
     _REASON_STUCK_CREATE_TAKEOVER,
     _STUCK_CREATE_TTL_S,
+    AGENT_SANDBOX_IMAGE_REF,
     SqlSandboxInstanceStore,
 )
 
@@ -187,7 +189,9 @@ async def test_mark_destroyed_frees_the_slot_of_a_row_that_never_got_a_container
 
 
 @pytest.mark.asyncio
-async def test_mark_destroyed_frees_slot_for_new_claim(store: SqlSandboxInstanceStore) -> None:
+async def test_mark_destroyed_frees_slot_for_new_claim(
+    store: SqlSandboxInstanceStore, postgres_container: PostgresContainer
+) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
     assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
@@ -195,10 +199,23 @@ async def test_mark_destroyed_frees_slot_for_new_claim(store: SqlSandboxInstance
 
     await store.mark_destroyed(sandbox_id=first_id, reason="ops")
 
-    assert await store.get_container_id(sandbox_id=first_id) == "sbx-1", (
-        "mark_destroyed keeps the historical container_id — only state/"
-        "destroyed_at/destroy_reason transition"
-    )
+    # #5a: get_container_id 现在只读活行(与 in-memory store 对齐),已销毁行
+    # 经公开 API 读回 None —— 见 test_get_container_id_returns_none_for_destroyed_row。
+    # "mark_destroyed 只转 state/destroyed_at/destroy_reason,不清空物理列"
+    # 这件事换成直连 DB 验证,两件事分开断言。
+    assert await store.get_container_id(sandbox_id=first_id) is None
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        async with engine.begin() as conn:
+            container_id = (
+                await conn.execute(
+                    select(SandboxInstanceRow.container_id).where(SandboxInstanceRow.id == first_id)
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+    assert container_id == "sbx-1", "mark_destroyed keeps the historical container_id in the row"
+
     second_id = uuid4()
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
     assert result is None, "destroying the old session must free the slot for a fresh claim"
@@ -846,3 +863,156 @@ async def test_set_container_id_still_backfills_a_live_row(
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
 
     assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-live"
+
+
+# ---------------------------------------------------------------------------
+# 迁移 0142 —— 0141 部分唯一索引按后端限定(image_ref = 'agent-sandbox')。
+# ---------------------------------------------------------------------------
+
+
+async def _insert_docker_row(
+    store: SqlSandboxInstanceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID | None,
+    state: str = "IN_USE",
+    container_id: str | None = "docker-cafe",
+    acquired_at: datetime | None = None,
+) -> UUID:
+    """直插一行 docker-supervisor 形状的行(真实 image_ref/node,非标记值)。"""
+    row_id = uuid4()
+    async with store._sf() as session:
+        session.add(
+            SandboxInstanceRow(
+                id=row_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                workspace_id=None,
+                image_ref="registry.example.com/expert-work/sandbox:py312",
+                node="dev-host-1",
+                container_id=container_id,
+                state=state,
+                thread_id="thread-1",
+                cpu_quota=1,
+                memory_mb=1024,
+                pids_limit=128,
+                timeout_s=300,
+                acquired_at=acquired_at or datetime.now(tz=UTC),
+            )
+        )
+        await session.commit()
+    return row_id
+
+
+@pytest.mark.asyncio
+async def test_docker_warm_row_does_not_block_agent_claim(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """0142:docker 后端同 (tenant, user) 的 IN_USE 行不再顶死 agent claim。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)
+
+    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+
+    assert result is None  # agent 侧照常赢得自己的槽位
+    async with store._sf() as session:
+        count = len(
+            (
+                await session.execute(
+                    select(SandboxInstanceRow.id).where(
+                        SandboxInstanceRow.tenant_id == tenant_id,
+                        SandboxInstanceRow.state == "IN_USE",
+                    )
+                )
+            ).all()
+        )
+    assert count == 2  # 两后端各一行,合法共存
+
+
+@pytest.mark.asyncio
+async def test_agent_rows_still_unique_per_tenant_user(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """0142 没放松 agent 行自己的唯一性:直插第二行 agent IN_USE 必炸。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+
+    with pytest.raises(IntegrityError):
+        async with store._sf() as session:
+            session.add(
+                SandboxInstanceRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    workspace_id=None,
+                    image_ref=AGENT_SANDBOX_IMAGE_REF,
+                    node=AGENT_SANDBOX_IMAGE_REF,
+                    container_id=None,
+                    state="IN_USE",
+                    thread_id=AGENT_SANDBOX_IMAGE_REF,
+                    cpu_quota=0,
+                    memory_mb=0,
+                    pids_limit=0,
+                    timeout_s=0,
+                    acquired_at=datetime.now(tz=UTC),
+                )
+            )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_collection_queries_exclude_docker_rows(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """list_active / list_stuck_creating / claim_warm 输家 SELECT 只看本后端的行。
+
+    不修的后果(本 PR 的背景一节):周期 reap 会把 docker 后端名下每一行
+    标销毁;claim_warm 会把 docker container id 当 E2B sandbox id 交出去。
+
+    断言只看这两个自建 docker 行的 id 在不在结果里,不对整个返回列表做相等
+    比较 —— ``postgres_container`` 是本文件全体测试共用的 session 级容器
+    (见本文件其它同类断言,比如 ``test_list_active_excludes_still_creating_and_destroyed_rows``
+    的说明),``list_active``/``list_stuck_creating`` 是不按 tenant 限定的全表
+    扫,断言"结果为空列表"在这个文件的执行顺序下会被之前测试遗留的活跃行
+    误伤。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    # 一行活跃 docker 行 + 一行 stuck-creating 形状(container 未回填、超龄)的 docker 行
+    active_docker_id = await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)
+    stale = datetime.now(tz=UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S + 60)
+    stuck_docker_id = await _insert_docker_row(
+        store, tenant_id=tenant_id, user_id=None, container_id=None, acquired_at=stale
+    )
+
+    active_ids = {sid for sid, _ in await store.list_active(only_idle=False)}
+    stuck_ids = set(await store.list_stuck_creating())
+    assert active_docker_id not in active_ids
+    assert stuck_docker_id not in stuck_ids
+
+    # claim_warm 输家 SELECT:agent 行才是槽位主人 —— docker 行在场时第二个
+    # agent claim 拿到的必须是 agent 赢家的 (id, container),不是 docker 的。
+    agent_winner = uuid4()
+    assert (
+        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=agent_winner)
+    ) is None
+    await store.set_container_id(sandbox_id=agent_winner, container_id="e2b-123")
+    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    assert result == (agent_winner, "e2b-123")
+
+
+@pytest.mark.asyncio
+async def test_get_container_id_returns_none_for_destroyed_row(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """#5a:SQL 向 in-memory 对齐 —— get_container_id 只读活行。
+
+    终审时曾以「重杀兜底」为由保留旧行为;复盘推翻:兜底要求对同一
+    sandbox_id 二次调 destroy,代码里无此路径,而行终结后无人续期、
+    平台 20 分钟超时是确定性兜底(_SANDBOX_TIMEOUT_S 的既有职责)。
+    """
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-dead")
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
+
+    assert await store.get_container_id(sandbox_id=sandbox_id) is None
