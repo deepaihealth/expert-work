@@ -85,8 +85,11 @@ C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的
 ``HTTPSupervisorRuntime`` 本波次**冻结**、沙箱环境是 ``docker run`` 时烤死的,
 跟不了;让沙箱重读 token ——要改两个后端**共用**的镜像里的 sitecustomize,是
 波 2 规模的改动。真正的自愈解法是给热会话总年龄设上限、到点强制重建(需要
-``claim_warm`` 把 ``acquired_at`` 也透出来),已记 follow-up。残留风险:连续
-24 小时每 15 分钟至少被用一次的热会话仍会撞 407,需要真集群观察。
+``claim_warm`` 把 ``acquired_at`` 也透出来)——**已落地(PR-B #1b)**:
+:meth:`AgentSandboxClient.acquire` 复用分支按 :meth:`AgentSandboxClient._max_warm_age_s`
+(``egress_token_ttl_s // 2``)封顶,超龄强制重建。原「连续 24 小时每 15 分钟
+被用一次的热会话撞 407」的残留风险随之关闭;407 的可观测兜底另见
+``control_plane`` 的 egress 审计指标(PR-B #1a)。
 """
 
 from __future__ import annotations
@@ -374,6 +377,9 @@ class AgentSandboxClient:
                 # 出网全 407 且无自愈路径。走与 connect 失败同构的重建:
                 # destroy 真 kill + 清行,重占坑,往下落进重建分支。
                 # None-acquired_at 不封顶:年龄不可知,同 C-1 拒绝接管的姿态。
+                # destroy 与重占坑之间输给第三方竞争者时的安全性,与下面
+                # connect-失败分支同一套推理(重占坑返回值同样弃用,输了则
+                # set_container_id 按契约抛错、Important-6 守卫拆新沙箱)。
                 logger.info(
                     "warm sandbox %s past age cap (%ss), rebuilding for a fresh egress token",
                     winner_id,
