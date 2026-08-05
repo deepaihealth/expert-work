@@ -75,7 +75,13 @@ logger = logging.getLogger(__name__)
 
 #: 进程级 guard —— ``_ensure_e2b_patched`` 幂等的关键,见模块 docstring
 #: "私有协议 + patch_e2b 导入顺序"一节。
-_e2b_patched = False
+#:
+#: CodeQL 的 ``py/unused-global-variable`` 在这里误报"从未被使用":这个名字
+#: 的每一次读写都在 ``_ensure_e2b_patched`` 内部、``global`` 声明之后
+#: (:func:`_ensure_e2b_patched` 首行就是 ``global _e2b_patched``),模块作用
+#: 域里除了这行初始化确实没有第二次出现。测试 ``monkeypatch.setattr(mod,
+#: "_e2b_patched", False)`` 也证明它是活的模块属性。
+_e2b_patched = False  # codeql[py/unused-global-variable]
 
 
 def _ensure_e2b_patched(*, domain: str, api_key: str) -> None:

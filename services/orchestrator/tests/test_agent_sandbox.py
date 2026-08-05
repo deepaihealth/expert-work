@@ -676,21 +676,31 @@ async def test_ensure_e2b_patched_warns_on_domain_mismatch(monkeypatch, caplog) 
     ``caplog.at_level(..., logger="orchestrator.tools.e2b_patch")`` 把
     断言收紧到自家 logger——仓内已有先例(#1077)证明不这样做容易被其它
     模块的噪音日志(如 otel exporter)搞出 flaky。
+
+    断言走 ``record.args`` 而不是 ``in caplog.text``,两个原因:
+    ``caplog.text`` 是所有日志拼成的一整块,``"x" in`` 它只能证明这串字符
+    在某处出现过,证不了它出现在**这条**日志的**这个**占位符上;而且
+    CodeQL 的 ``py/incomplete-url-substring-sanitization`` 会把
+    ``"<域名字面量>" in <字符串>`` 一律判成 URL 校验绕过(生产代码里那确实
+    是典型漏洞形态),在测试断言上是误报,但它会卡住合并。按位置断言把
+    两件事一起解决 —— 顺带钉住了参数顺序:第 2、3 个占位符都是新 domain,
+    错配时 ``in`` 版本照样绿。
     """
     import orchestrator.tools.e2b_patch as mod
 
-    monkeypatch.setenv("E2B_DOMAIN", "stale.example.com")
+    stale, fresh = "stale.example.com", "gw.example.com"
+    monkeypatch.setenv("E2B_DOMAIN", stale)
     monkeypatch.delenv("E2B_API_KEY", raising=False)
     monkeypatch.setattr(mod, "_e2b_patched", False)
     monkeypatch.setattr("kruise_agents.patch_e2b.patch_e2b", lambda **_: None)
 
     with caplog.at_level(logging.WARNING, logger="orchestrator.tools.e2b_patch"):
-        mod._ensure_e2b_patched(domain="gw.example.com", api_key="k")
+        mod._ensure_e2b_patched(domain=fresh, api_key="k")
 
-    assert "stale.example.com" in caplog.text
-    assert "gw.example.com" in caplog.text
+    [warned] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warned.args == (stale, fresh, fresh)
     # setdefault 语义不变 —— 预设值仍然生效,不被这次调用覆盖。
-    assert os.environ["E2B_DOMAIN"] == "stale.example.com"
+    assert os.environ["E2B_DOMAIN"] == stale
 
 
 # ---------------------------------------------------------------------------
