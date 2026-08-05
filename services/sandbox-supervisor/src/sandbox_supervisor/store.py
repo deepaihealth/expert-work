@@ -17,6 +17,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import SandboxInstanceRow, TenantQuotaRow
+from expert_work.persistence.sandbox_instance_store import AGENT_SANDBOX_IMAGE_REF
 from expert_work.protocol.quota import QuotaDimension
 from sandbox_supervisor.domain import SandboxRecord, SandboxState
 
@@ -62,6 +63,12 @@ class SandboxStore(Protocol):
         AFTER any live warm session was force-destroyed, so no orphaned
         container is left behind. Tenant- AND user-scoped; NULL-``user_id``
         ephemeral rows are not this user's and are left untouched.
+
+        Unlike ``count_active_for_tenant`` / ``list_idle_sessions``, this
+        deliberately does NOT exclude agent-backend rows — purge semantics
+        mean deleting everything for this user; an E2B row deleted here
+        loses its lease and is reclaimed by the platform's own ≤20-minute
+        timeout once nothing renews it (PR-A ruling).
         """
 
 
@@ -99,11 +106,14 @@ class DbSandboxStore:
             return _to_record(row) if row is not None else None
 
     async def count_active_for_tenant(self, tenant_id: UUID) -> int:
+        # 表与 AgentSandboxClient 共用(PR-A):E2B 行不占 docker 配额 ——
+        # 云后端的配额语义由云侧自己管(波 2)。
         async with self._sf() as session:
             result = await session.execute(
                 select(SandboxInstanceRow.id).where(
                     SandboxInstanceRow.tenant_id == tenant_id,
                     SandboxInstanceRow.state.in_([s.value for s in _ACTIVE_STATES]),
+                    SandboxInstanceRow.image_ref != AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             return len(result.fetchall())
@@ -113,10 +123,14 @@ class DbSandboxStore:
         # idle_ttl_s`` (Stream J.15). M0 sandbox counts are small, so
         # fetching IN_USE rows and filtering in Python is simpler than a
         # SQL per-row interval expression.
+        #
+        # E2B 行交给云侧自己的周期 reap(control_plane.sandbox_reap_worker),
+        # docker reaper 对它们既 stop 不动也不该记账(PR-A)。
         async with self._sf() as session:
             result = await session.execute(
                 select(SandboxInstanceRow).where(
-                    SandboxInstanceRow.state == SandboxState.IN_USE.value
+                    SandboxInstanceRow.state == SandboxState.IN_USE.value,
+                    SandboxInstanceRow.image_ref != AGENT_SANDBOX_IMAGE_REF,
                 )
             )
             rows = result.scalars().all()
