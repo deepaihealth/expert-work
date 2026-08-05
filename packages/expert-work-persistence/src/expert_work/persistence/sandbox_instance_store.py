@@ -44,7 +44,8 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from expert_work.persistence.models import SandboxInstanceRow
+from expert_work.persistence.models import SandboxInstanceRow, TenantQuotaRow
+from expert_work.protocol.quota import QuotaDimension
 
 #: ``sandbox_instance.state`` values (STREAM-F-DESIGN § 2.2 / migration
 #: 0012). The Agent Sandbox warm-CAS path only ever writes ``IN_USE``
@@ -162,7 +163,7 @@ class SqlSandboxInstanceStore:
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """spec § 6.2 CAS: ``INSERT ... ON CONFLICT DO NOTHING RETURNING``.
 
         The bare (no explicit conflict target) ``ON CONFLICT DO NOTHING``
@@ -202,6 +203,13 @@ class SqlSandboxInstanceStore:
         (otherwise a later ``destroy()`` on that never-persisted id would
         silently no-op — see ``AgentSandboxClient.acquire``). Both values
         come from the same ``SELECT`` already, no extra round trip.
+
+        #1b — the tuple's third element is the winner row's ``acquired_at``,
+        consumed by ``AgentSandboxClient.acquire`` to cap a warm session's
+        total age at half its egress token's TTL. The ``SELECT`` below
+        already fetches ``acquired_at`` for the Critical-1 stale-create
+        check (next paragraph), so this rides along for free — no extra
+        round trip.
 
         Whole-branch review Critical-1 — the "still creating, raise" branch
         above needs a time bound, or a single badly-timed process death
@@ -293,7 +301,7 @@ class SqlSandboxInstanceStore:
                 continue
             winner_id, existing_container_id, winner_acquired_at = found
             if existing_container_id:
-                return (winner_id, str(existing_container_id))
+                return (winner_id, str(existing_container_id), winner_acquired_at)
             if winner_acquired_at is not None and winner_acquired_at < _stuck_create_cutoff(now):
                 # Critical-1: an orphan of a process death between this
                 # method's commit and set_container_id. Clear it and let the
@@ -597,6 +605,39 @@ class SqlSandboxInstanceStore:
             active.append((row_id, str(container_id)))
         return active
 
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """本后端(agent-sandbox)该租户的活跃行数 —— 配额闸的分子(#8)。
+
+        与 docker supervisor 的 ``DbSandboxStore.count_active_for_tenant``
+        互补:那边 ``image_ref != AGENT_SANDBOX_IMAGE_REF``(PR-A),这边
+        ``==`` —— 两后端各数各的。「建行中」(``container_id IS NULL``)
+        **计入**:不计的话 N 个并发 acquire 全在 create 完成前过闸,配额
+        形同虚设。已销毁行不计(state/destroyed_at 谓词)。
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(SandboxInstanceRow.id).where(
+                    SandboxInstanceRow.tenant_id == tenant_id,
+                    SandboxInstanceRow.state == _STATE_IN_USE,
+                    SandboxInstanceRow.destroyed_at.is_(None),
+                    SandboxInstanceRow.image_ref == AGENT_SANDBOX_IMAGE_REF,
+                )
+            )
+            return len(result.fetchall())
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        """租户 ``sandboxes`` 维度配额 —— 与 supervisor 的同名方法同款
+        SELECT(``tenant_quota`` 表由 admin API 写入,两后端读同一行:
+        租户的沙箱预算是平台级的,不分后端)。"""
+        async with self._sf() as session:
+            result = await session.execute(
+                select(TenantQuotaRow.limit_value).where(
+                    TenantQuotaRow.tenant_id == tenant_id,
+                    TenantQuotaRow.dimension == QuotaDimension.SANDBOXES.value,
+                )
+            )
+            return result.scalar_one_or_none()
+
 
 @dataclass
 class _MemRow:
@@ -641,10 +682,19 @@ class InMemorySandboxInstanceStore:
         self._rows: dict[UUID, _MemRow] = {}
         #: (tenant_id, user_id) -> sandbox_id of the live IN_USE row, if any.
         self._warm: dict[tuple[UUID, UUID], UUID] = {}
+        #: #8 —— per-tenant ``sandboxes`` quota override. Production
+        #: in-memory has no admin-API write path that populates this (it
+        #: backs the no-DB dev fallback, not a real quota-admin surface), so
+        #: it stays empty in practice and :meth:`sandbox_limit_for_tenant`
+        #: always returns ``None`` there — same observable result as the SQL
+        #: store's "no row for this tenant" case. Tests set entries directly
+        #: (setter semantics, no dedicated method — same pattern as poking
+        #: ``_rows``/``_warm`` elsewhere in this class's test suite).
+        self._quota_limits: dict[UUID, int] = {}
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         key = (tenant_id, user_id)
         for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
             existing_id = self._warm.get(key)
@@ -657,7 +707,8 @@ class InMemorySandboxInstanceStore:
                 # Return the WINNER's real row id, not the caller's own
                 # sandbox_id (never inserted on this path) — see
                 # SqlSandboxInstanceStore.claim_warm's docstring for why.
-                return (existing_id, existing.container_id)
+                # #1b: acquired_at rides along too, same reason.
+                return (existing_id, existing.container_id, existing.acquired_at)
             if existing.acquired_at < _stuck_create_cutoff(_utc_now()):
                 # Whole-branch review Critical-1 — mirror of the SQL store's
                 # stale-mid-create takeover, same predicate (shared
@@ -777,3 +828,19 @@ class InMemorySandboxInstanceStore:
                     continue
             active.append((sandbox_id, row.container_id))
         return active
+
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """Mirrors :meth:`SqlSandboxInstanceStore.count_active_for_tenant`.
+
+        ``_rows`` only ever holds live rows of THIS backend (see class
+        docstring's PR-A #5 note) — the SQL side's ``state``/``destroyed_at``/
+        ``image_ref`` predicates are vacuously satisfied here, nothing left
+        to filter but ``tenant_id``.
+        """
+        return sum(1 for row in self._rows.values() if row.tenant_id == tenant_id)
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        """Mirrors :meth:`SqlSandboxInstanceStore.sandbox_limit_for_tenant` —
+        see :attr:`_quota_limits`'s docstring for why this is empty in
+        production."""
+        return self._quota_limits.get(tenant_id)

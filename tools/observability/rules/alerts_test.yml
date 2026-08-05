@@ -1,0 +1,44 @@
+# promtool unit tests for alerts.yml — sandbox-egress-age-quota Task 3 fix round 1.
+# Run: promtool test rules tools/observability/rules/alerts_test.yml
+#
+# Covers ExpertWorkSandboxEgressAuthBlocked: the 407/blocked_auth sandbox-egress
+# alert fed by the control-plane's SandboxEgressMetricsWorker scan of
+# sandbox_egress_audit.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # A steady stream of blocked_auth verdicts → increase() over the last 15m
+  # is > 0 → the alert fires immediately (for: 0m).
+  - interval: 1m
+    name: sandbox egress blocked_auth alert fires on 407 rejections
+    input_series:
+      - series: 'expert_work_control_plane_sandbox_egress_blocked_total{verdict="blocked_auth"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ExpertWorkSandboxEgressAuthBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: P2
+              verdict: blocked_auth
+            exp_annotations:
+              summary: "Sandbox egress rejected with 407 (blocked_auth)"
+              description: "15 sandbox egress attempt(s) were rejected by the credential proxy with 407 in the last 15m — most likely an egress token that outlived its sandbox (or a warm session past its token TTL before the age cap kicked in)."
+              runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+
+  # Only non-auth verdicts (blocked_ssrf) present — the blocked_auth series
+  # doesn't exist, so increase() is the empty vector (not 0) — no alert,
+  # same "absence, not zero" semantics as burn_rate_test.yml.
+  - interval: 1m
+    name: non-auth verdicts raise no alert
+    input_series:
+      - series: 'expert_work_control_plane_sandbox_egress_blocked_total{verdict="blocked_ssrf"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ExpertWorkSandboxEgressAuthBlocked
+        exp_alerts: []

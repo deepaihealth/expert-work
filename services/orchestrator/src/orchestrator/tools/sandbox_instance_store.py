@@ -15,6 +15,7 @@ docstring,搬走之后 ``agent_sandbox.py`` 少掉的都是与客户端实现逻
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -36,21 +37,26 @@ class SandboxInstanceStore(Protocol):
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """占 ``(tenant, user)`` 的热会话坑(spec § 6.2 CAS)。
 
         ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` 的封装:
 
         * 占到 → 返回 ``None``,调用方负责建沙箱并回填 :meth:`set_container_id`。
         * 没占到、赢家已就绪(``container_id`` 非空)→ 返回
-          ``(赢家那一行的 sandbox_id, container_id)`` 二元组 —— **不是**只
-          返回 container_id。调用方(``acquire``)本次调用开头自己铸的
-          ``uuid4()`` 从未插入任何行;如果 ``acquire`` 复用热会话成功后仍
-          返回那个自铸 id,后续任何 ``destroy(sandbox_id=<那个 id>)`` 都会
-          静默 no-op(``get_container_id`` 查不到、``mark_destroyed`` 的
-          ``WHERE id=...`` 影响 0 行,两处都不报错)——沙箱杀不掉,热会话槽
-          位也放不出来。返回赢家的真实行 id 让 ``acquire`` 能直接复用它,
-          不需要再多打一次库。
+          ``(赢家那一行的 sandbox_id, container_id, acquired_at)`` 三元组
+          —— **不是**只返回 container_id。调用方(``acquire``)本次调用开头
+          自己铸的 ``uuid4()`` 从未插入任何行;如果 ``acquire`` 复用热会话
+          成功后仍返回那个自铸 id,后续任何 ``destroy(sandbox_id=<那个
+          id>)`` 都会静默 no-op(``get_container_id`` 查不到、
+          ``mark_destroyed`` 的 ``WHERE id=...`` 影响 0 行,两处都不报错)
+          ——沙箱杀不掉,热会话槽位也放不出来。返回赢家的真实行 id 让
+          ``acquire`` 能直接复用它,不需要再多打一次库。第三元
+          ``acquired_at`` 是赢家那一行的 ``acquired_at``(可能为
+          ``None``)——供 ``AgentSandboxClient.acquire`` 做热会话年龄封顶
+          (#1b:超过 ``egress_token_ttl_s // 2`` 强制重建,``None`` 时年龄
+          不可知、不封顶),两个实现都是同一次 SELECT 顺带取出,零额外
+          往返。
         * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)且这行**还没
           超过** ``_STUCK_CREATE_TTL_S`` → 允许实现 raise(两个生产实现都
           如此)。E2B 冷启实测 35-40s(见探针报告),这不是罕见边界窗口,
@@ -215,4 +221,28 @@ class SandboxInstanceStore(Protocol):
         ``acquire()`` 抢同一行。返回值只有 ``sandbox_id``,没有
         ``container_id``(这类行压根没有对应的 E2B 容器)——调用方不该对
         返回的 id 尝试 ``connect``/``kill``,直接 ``mark_destroyed`` 即可。
+        """
+
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """#8 云后端租户配额闸的分子 —— 本后端该租户的活跃行数。
+
+        ``AgentSandboxClient._enforce_quota`` 用:与 docker supervisor 的
+        ``SandboxStore.count_active_for_tenant`` 互补(那边排除
+        ``AGENT_SANDBOX_IMAGE_REF``,这边只数它),两后端各按自己的行计数、
+        不互相干扰。
+
+        「建行中」(``container_id`` 仍是 ``NULL`` 的行)**必须计入**——不计
+        的话,任意多个并发 ``acquire`` 都能在各自的 ``create()`` 完成、
+        ``set_container_id`` 回填之前互相看不见对方,配额检查形同虚设。
+        已销毁的行不计。
+        """
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        """#8 云后端租户配额闸的分母 —— ``tenant_quota`` 表 ``sandboxes``
+        维度的 ``limit_value``,未设行时返回 ``None``(调用方落回
+        ``AgentSandboxClient.default_max_sandboxes``)。
+
+        与 docker supervisor 的 ``SandboxStore.sandbox_limit_for_tenant``
+        读同一张表、同一个维度 —— 租户的沙箱预算是平台级的,admin API 写一
+        行,两个后端都认。
         """

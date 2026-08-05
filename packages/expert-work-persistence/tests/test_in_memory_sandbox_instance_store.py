@@ -81,13 +81,14 @@ async def test_claim_warm_takeover_is_not_triggered_by_a_ready_row() -> None:
         await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id) is None
     )
     await store.set_container_id(sandbox_id=winner_id, container_id="sbx-warm")
-    store._rows[winner_id].acquired_at = datetime.now(UTC) - timedelta(
-        seconds=_STUCK_CREATE_TTL_S * 2
-    )
+    backdated = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    store._rows[winner_id].acquired_at = backdated
 
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
 
-    assert result == (winner_id, "sbx-warm")
+    # #1b: the third element is the winner row's acquired_at, consumed by
+    # AgentSandboxClient.acquire's warm-session age cap.
+    assert result == (winner_id, "sbx-warm", backdated)
 
 
 @pytest.mark.asyncio
@@ -156,6 +157,34 @@ async def test_both_stores_share_one_missing_row_wording() -> None:
     message = _missing_row_message(sandbox_id)
     assert str(sandbox_id) in message
     assert "is gone" in message
+
+
+# ---------------------------------------------------------------------------
+# #8 —— 配额闸的两个只读方法。``_rows`` 只存活行+只存本后端行,SQL 侧的
+# image_ref/state/destroyed_at 三谓词在这里空洞地成立(见类 docstring)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_active_for_tenant_counts_live_rows_for_that_tenant() -> None:
+    store = InMemorySandboxInstanceStore()
+    tenant_id, other_tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    destroyed_id = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=destroyed_id)
+    await store.mark_destroyed(sandbox_id=destroyed_id, reason="test")
+    await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
+
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_sandbox_limit_for_tenant_defaults_to_none() -> None:
+    """生产 in-memory 无 admin 写入路径 —— 未预置时恒 ``None``,调用方落回
+    ``default_max_sandboxes``。"""
+    store = InMemorySandboxInstanceStore()
+
+    assert await store.sandbox_limit_for_tenant(tenant_id=uuid4()) is None
 
 
 @pytest.mark.asyncio

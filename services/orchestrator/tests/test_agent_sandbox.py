@@ -69,6 +69,7 @@ from expert_work.persistence.sandbox_instance_store import (
 )
 from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
+    _WARM_AGE_DESTROY_REASON,
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
@@ -243,21 +244,31 @@ class FakeInstanceStore:
     #: 全分支终审测试缝 —— 这些 sandbox_id 上的 mark_destroyed 直接抛,用来
     #: 验证 reap 的一趟清扫不会被一行掐断。
     mark_destroyed_fails_for: set[UUID] = field(default_factory=set)
+    #: #8 测试缝 —— ``sandbox_limit_for_tenant`` 的预置返回值。``None``
+    #: (默认)时调用方落回 ``AgentSandboxClient.default_max_sandboxes``,与两
+    #: 个生产 store"未设行返 None"同义。
+    quota_limit: int | None = None
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """占坑成功返 None;已被别人占且赢家已就绪返
-        ``(赢家 sandbox_id, container_id)``;赢家还在创建中则 raise。"""
+        ``(赢家 sandbox_id, container_id, acquired_at)``;赢家还在创建中则
+        raise。``acquired_at`` 供 #1b 的年龄封顶测试直接改写
+        ``self.rows[winner_id]["acquired_at"]`` 摆前置状态。"""
         key = (tenant_id, user_id)
         winner_id = self.warm.get(key)
         if winner_id is None:
             self.warm[key] = sandbox_id
-            self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": user_id}
+            self.rows[sandbox_id] = {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "acquired_at": datetime.now(UTC),
+            }
             return None
         container_id = self.rows[winner_id].get("container_id")
         if container_id:
-            return (winner_id, container_id)
+            return (winner_id, container_id, self.rows[winner_id].get("acquired_at"))
         msg = f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
         raise RuntimeError(msg)
 
@@ -327,6 +338,18 @@ class FakeInstanceStore:
             for sandbox_id in self.stuck_creating_sandbox_ids
             if sandbox_id in self.rows and self.rows[sandbox_id].get("container_id") is None
         ]
+
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """#8 —— 与两个生产 store 同义:数 ``rows`` 里这个 tenant 的活行(``rows``
+        只存活行,同生产 in-memory store)。不是一个独立预置字段:测试要"预置
+        N 个已存在的活跃沙箱",直接调 ``create_ephemeral``/``claim_warm`` 建
+        真行即可,与 :meth:`AgentSandboxClient._enforce_quota` 的
+        insert-then-check 语义(本次调用自己插的行也数进去)天然对齐。"""
+        return sum(1 for row in self.rows.values() if row["tenant_id"] == tenant_id)
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        del tenant_id
+        return self.quota_limit
 
 
 def make_client(sdk: FakeSdk, store: SandboxInstanceStore) -> AgentSandboxClient:
@@ -1096,10 +1119,11 @@ async def test_unwind_after_a_takeover_leaves_the_new_owners_row_alone() -> None
         "B 的行必须仍然出现在 list_active 里 —— 否则周期 reaper 永远收不走它那个还活着的 microVM"
     )
     # 槽位仍归 B:下一次 acquire 应当复用 B,而不是发现槽位空了又建一个。
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) == (
-        b_id,
-        "sbx-B",
-    )
+    claim_result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    assert claim_result is not None
+    b_winner_id, b_container_id, b_acquired_at = claim_result
+    assert (b_winner_id, b_container_id) == (b_id, "sbx-B")
+    assert b_acquired_at is not None
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1301,72 @@ def test_platform_timeout_outlives_idle_ttl() -> None:
         "余量至少要覆盖 SandboxReapWorker 的一个完整扫描周期(240s),"
         " 否则 reap 可能刚好错过一轮、让平台先动手。"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1b —— 热会话年龄封顶:token 只在 create(envs=...) 送一次、无法重发(见模块
+# docstring 再审 Important-3),持续被复用的热会话会活过自己的出网 token,
+# 之后每次出网都是 407 且没有任何自愈路径。acquire 的复用分支在 connect 之前
+# 先检查赢家那行的 acquired_at,超过 egress_token_ttl_s // 2 就强制重建。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_warm_session_past_age_cap() -> None:
+    """超过 egress_token_ttl_s//2 的热会话在下次 acquire 被强制重建。
+
+    token 只在 create(envs=...) 送一次(重发三条路 2026-08-04 已否决,
+    见 agent_sandbox.py 模块 docstring),活过 24h 的会话出网全 407 且
+    永不自愈 —— 年龄封顶是唯一自愈路径。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["acquired_at"] = datetime.now(UTC) - timedelta(
+        seconds=client._max_warm_age_s() + 60
+    )
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "超龄必须重建,不能复用旧 sandbox_id"
+    assert (old_id, _WARM_AGE_DESTROY_REASON) in store.mark_destroyed_calls
+    assert len(sdk.created) == 2, "必须真的重建(第二次 sdk.create),不是复用"
+    assert store.rows[new_id]["container_id"] == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_acquire_reuses_warm_session_under_age_cap() -> None:
+    """acquired_at 在封顶内(1 小时前,远小于默认 12h 上限)→ 走 connect 复用,
+    sdk.create 不被调用,返回旧 winner_id —— 守住"封顶不误伤"。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[first_id]["acquired_at"] = datetime.now(UTC) - timedelta(hours=1)
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert len(sdk.created) == 1, "年龄封顶内不该重建"
+    assert second_id == first_id
+
+
+@pytest.mark.asyncio
+async def test_acquire_never_age_caps_null_acquired_at() -> None:
+    """第三元为 None → 年龄不可知,不封顶,照常复用(同 C-1 拒绝接管的姿态)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[first_id]["acquired_at"] = None
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert len(sdk.created) == 1, "acquired_at 缺失时年龄不可知,不该被封顶重建"
+    assert second_id == first_id
 
 
 # ---------------------------------------------------------------------------
@@ -1540,3 +1630,134 @@ async def test_release_keeps_warm_when_the_store_lookup_fails() -> None:
 
     assert sdk.sandbox.killed is False
     assert store.mark_destroyed_calls == []
+
+
+# ---------------------------------------------------------------------------
+# #8 —— 云后端租户沙箱配额。对称 supervisor 的 ``_enforce_quota``
+# (``sandbox_supervisor/supervisor.py:713-727``),一处刻意更强:
+# insert-then-check——本次调用自己的行已经落库,count 必然含自己,条件严格
+# ``>``,超限则 ``_unwind_slot`` 拆自己的行再抛。只挂在**全新建行**路径上
+# (``acquire`` 的 ``existing is None`` 分支);热会话复用与年龄封顶/重连失败
+# 的 1 换 1 重建路径不查——见 ``AgentSandboxClient._enforce_quota`` 的
+# docstring。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_when_tenant_quota_exhausted() -> None:
+    """预置 ``default_max_sandboxes`` 个已存在的活跃沙箱、limit 未设(回落
+    默认)→ 新建路径必炸,``sdk.create`` 从未被调用,本次调用自己插的那一行
+    被 unwind(``mark_destroyed`` reason ``"quota_exceeded"``),不留死行。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id = uuid4()
+    for _ in range(client.default_max_sandboxes):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+
+    with pytest.raises(SandboxSupervisorError, match="quota"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t1")
+
+    assert len(sdk.created) == 0, "配额闸必须在 sdk.create() 之前拦截"
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert len(quota_unwinds) == 1
+    unwound_id, _ = quota_unwinds[0]
+    assert unwound_id not in store.rows, "本次调用自己插的行必须被拆掉,不留死行"
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+
+
+@pytest.mark.asyncio
+async def test_acquire_warm_reuse_skips_quota_check() -> None:
+    """已有可复用热会话 + count 已到(甚至超过)上限 → 复用照常成功——supervisor
+    同款语义:复用不新建、不检查。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes + 5):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert second_id == first_id
+    assert len(sdk.created) == 1, "复用分支不该走 sdk.create()"
+
+
+@pytest.mark.asyncio
+async def test_acquire_respects_tenant_quota_row_over_default() -> None:
+    """租户自己的 ``sandboxes`` 配额行覆盖默认值:limit=2,已有 1 个活跃 →
+    新建成功(本次插入后 count=2,不严格大于 limit);已有 2 个活跃 → 拒绝
+    (本次插入后 count=3 > limit=2)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    store.quota_limit = 2
+
+    tenant_id = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1")
+    assert sandbox_id in store.rows
+
+    other_tenant_id = uuid4()
+    for _ in range(2):
+        await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
+    with pytest.raises(SandboxSupervisorError, match="quota"):
+        await client.acquire(tenant_id=other_tenant_id, thread_id="t2")
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_over_age_warm_session_at_quota_limit() -> None:
+    """租户**已经在配额上限**(``count_active_for_tenant`` == limit,含即将
+    被重建的这一行本身)时,年龄封顶的 1 换 1 重建路径必须照常成功 ——
+    ``_enforce_quota`` 只挂在 :meth:`AgentSandboxClient.acquire` 的全新建行
+    分支(``existing is None``)上,这是刻意的设计决定(见其 docstring):
+    重建不改变总活跃行数,查了反而会把已到上限租户的存量热会话变成不可
+    重建的死会话。
+
+    这条测试钉住这个决定本身:如果未来有人把 ``_enforce_quota`` 挪到分支
+    分裂点之上、统一套在所有路径上,租户在上限时的这次重建就会被拒
+    ——这里必须变红。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes - 1):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+    store.rows[old_id]["acquired_at"] = datetime.now(UTC) - timedelta(
+        seconds=client._max_warm_age_s() + 60
+    )
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "超龄必须重建,不能复用旧 sandbox_id"
+    assert len(sdk.created) == 2, "配额已满不该拦住 1 换 1 重建(第二次 sdk.create 必须发生)"
+    assert (old_id, _WARM_AGE_DESTROY_REASON) in store.mark_destroyed_calls
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert quota_unwinds == [], "重建路径不查配额,不该有任何 quota_exceeded 的 unwind"
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_reconnect_failed_warm_session_at_quota_limit() -> None:
+    """同上一条,换成重连失败(spec § 6.3)那条 1 换 1 重建路径:租户已在配额
+    上限时,``connect`` 炸掉之后的强制重建也必须照常成功 —— 同一份
+    ``_enforce_quota`` docstring 说的是"年龄封顶/重连失败的 1 换 1 重建路径
+    都不查",两条路径都要各自钉住,免得只保住一条、另一条被后续重构悄悄
+    套上配额闸而没有任何测试发现。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes - 1):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+    sdk.connect_fails = True
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "连不上必须重建,不能返回旧 sandbox_id"
+    assert len(sdk.created) == 2, "配额已满不该拦住 1 换 1 重建(第二次 sdk.create 必须发生)"
+    assert (old_id, "warm_reconnect_failed") in store.mark_destroyed_calls
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert quota_unwinds == [], "重建路径不查配额,不该有任何 quota_exceeded 的 unwind"

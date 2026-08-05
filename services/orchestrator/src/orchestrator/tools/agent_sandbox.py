@@ -85,8 +85,11 @@ C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的
 ``HTTPSupervisorRuntime`` 本波次**冻结**、沙箱环境是 ``docker run`` 时烤死的,
 跟不了;让沙箱重读 token ——要改两个后端**共用**的镜像里的 sitecustomize,是
 波 2 规模的改动。真正的自愈解法是给热会话总年龄设上限、到点强制重建(需要
-``claim_warm`` 把 ``acquired_at`` 也透出来),已记 follow-up。残留风险:连续
-24 小时每 15 分钟至少被用一次的热会话仍会撞 407,需要真集群观察。
+``claim_warm`` 把 ``acquired_at`` 也透出来)——**已落地(PR-B #1b)**:
+:meth:`AgentSandboxClient.acquire` 复用分支按 :meth:`AgentSandboxClient._max_warm_age_s`
+(``egress_token_ttl_s // 2``)封顶,超龄强制重建。原「连续 24 小时每 15 分钟
+被用一次的热会话撞 407」的残留风险随之关闭;407 的可观测兜底另见
+``control_plane`` 的 egress 审计指标(PR-B #1a)。
 """
 
 from __future__ import annotations
@@ -95,6 +98,7 @@ import base64
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -112,6 +116,10 @@ from orchestrator.tools.sandbox_image_contract import (
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(tz=UTC)
 
 
 #: 传给 ``create()`` / ``connect()`` 的沙箱存活上限(秒)。
@@ -152,6 +160,12 @@ _RELEASE_DESTROY_REASON = "release"
 #: ``sandbox_instance.destroy_reason`` histories stay comparable.
 _WARM_RECONNECT_DESTROY_REASON = "warm_reconnect_failed"
 
+#: ``destroy_reason`` written when :meth:`AgentSandboxClient.acquire` retires
+#: a warm session that outlived half its egress token's TTL (#1b). Distinct
+#: from ``_WARM_RECONNECT_DESTROY_REASON`` so an operator reading
+#: ``destroy_reason`` can tell "token 快到期,主动换血" from "connect 失败"。
+_WARM_AGE_DESTROY_REASON = "warm_age_expired"
+
 
 @dataclass
 class AgentSandboxClient:
@@ -190,6 +204,22 @@ class AgentSandboxClient:
     #:
     #: 为什么不改成"重发 token":见模块 docstring 末尾一节。
     egress_token_ttl_s: int = 24 * 60 * 60
+    #: 租户级沙箱数上限的缺省值 —— ``tenant_quota`` 表 SANDBOXES 维度未设
+    #: 行时回落。与 supervisor 的 ``default_max_sandboxes``(settings.py:112,
+    #: default=50)drift-lock 钉死(``test_default_max_sandboxes_matches_supervisor_default``)。
+    default_max_sandboxes: int = 50
+
+    def _max_warm_age_s(self) -> int:
+        """热会话总年龄上限 —— 派生自 ``egress_token_ttl_s``,不设第二个常量。
+
+        取一半:token 只在 ``create(envs=...)`` 送一次、无法重发(模块
+        docstring 末节,三条重发路线全被否决),所以会话必须死在 token
+        之前;一半留足「cap + 单次工具调用最长(≤300s exec)≪ TTL」的
+        余量,默认值下 = 12h。到点重建的代价实测(2026-08-05):池命中
+        ~2-3s,池空最坏 ~33s,每持续使用的会话 12h 一次。顺带把「热会话
+        沿用创建时烤死的旧 egress 政策」的 staleness 也封顶在同一值。
+        """
+        return self.egress_token_ttl_s // 2
 
     def _sdk(self) -> Any:
         if self.sdk is not None:
@@ -334,7 +364,7 @@ class AgentSandboxClient:
     ) -> UUID:
         del thread_id  # 波 1:热会话行不记 thread_id(见 SQL store 的说明)。
         sandbox_id = uuid4()
-        existing: tuple[UUID, str] | None = None
+        existing: tuple[UUID, str, datetime | None] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
@@ -342,27 +372,25 @@ class AgentSandboxClient:
 
         just_created = False
         if existing is not None:
-            winner_id, winner_container_id = existing
-            try:
-                sbx = await self._connect(winner_container_id)
-            except Exception:
-                # spec § 6.3 —— 重连失败(库存不足/欠费/超过
-                # _SANDBOX_TIMEOUT_S 被平台 kill)必须能重建,不能把 run 打死。
-                logger.warning("warm sandbox connect failed, rebuilding", exc_info=True)
+            winner_id, winner_container_id, winner_acquired_at = existing
+            if (
+                winner_acquired_at is not None
+                and (_utc_now() - winner_acquired_at).total_seconds() > self._max_warm_age_s()
+            ):
+                # #1b:会话活过 token TTL 的一半 —— 再复用下去 token 到期后
+                # 出网全 407 且无自愈路径。走与 connect 失败同构的重建:
+                # destroy 真 kill + 清行,重占坑,往下落进重建分支。
+                # None-acquired_at 不封顶:年龄不可知,同 C-1 拒绝接管的姿态。
+                # destroy 与重占坑之间输给第三方竞争者时的安全性,与下面
+                # connect-失败分支同一套推理(重占坑返回值同样弃用,输了则
+                # set_container_id 按契约抛错、Important-6 守卫拆新沙箱)。
+                logger.info(
+                    "warm sandbox %s past age cap (%ss), rebuilding for a fresh egress token",
+                    winner_id,
+                    self._max_warm_age_s(),
+                )
+                await self.destroy(sandbox_id=winner_id, reason=_WARM_AGE_DESTROY_REASON)
                 if user_id is not None:
-                    # 再审 Important-1(与 _unwind_slot 同一个根因):清的是
-                    # 连不上的**那一行**(winner_id,claim_warm 刚返回给我们
-                    # 的),不是"此刻占着 (tenant, user) 槽位的那一行"——C-1
-                    # 的接管让这两者不再恒等,按坐标删会误伤接管者。
-                    await self.store.mark_destroyed(
-                        sandbox_id=winner_id, reason=_WARM_RECONNECT_DESTROY_REASON
-                    )
-                    # 重新占坑,让本次 acquire 的 sandbox_id 拥有一行 ——
-                    # 否则下面的 set_container_id 无行可回填。槽位刚被让出,
-                    # 正常情况下这次必赢;真撞上第三方竞争者(重新占坑输了)
-                    # 时这里拿不到行,下面的 set_container_id 会按契约抛错、
-                    # 由 Important-6 那层守卫 kill 掉刚建的沙箱并冒泡成一个
-                    # 可重试的错误 —— 不会再悄悄多留一个 microVM。
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                     )
@@ -371,14 +399,47 @@ class AgentSandboxClient:
                 )
                 just_created = True
             else:
-                # 复用成功 —— 返回赢家那一行**真实存在**的 sandbox_id,不是
-                # 本次调用开头自铸、从未插入任何行的 uuid4()(审查 Important-3:
-                # 否则后续 destroy(sandbox_id=<自铸 id>) 会静默 no-op,见
-                # SandboxInstanceStore.claim_warm 的 docstring)。
-                sandbox_id = winner_id
+                try:
+                    sbx = await self._connect(winner_container_id)
+                except Exception:
+                    # spec § 6.3 —— 重连失败(库存不足/欠费/超过
+                    # _SANDBOX_TIMEOUT_S 被平台 kill)必须能重建,不能把 run 打死。
+                    logger.warning("warm sandbox connect failed, rebuilding", exc_info=True)
+                    if user_id is not None:
+                        # 再审 Important-1(与 _unwind_slot 同一个根因):清的是
+                        # 连不上的**那一行**(winner_id,claim_warm 刚返回给我们
+                        # 的),不是"此刻占着 (tenant, user) 槽位的那一行"——C-1
+                        # 的接管让这两者不再恒等,按坐标删会误伤接管者。
+                        await self.store.mark_destroyed(
+                            sandbox_id=winner_id, reason=_WARM_RECONNECT_DESTROY_REASON
+                        )
+                        # 重新占坑,让本次 acquire 的 sandbox_id 拥有一行 ——
+                        # 否则下面的 set_container_id 无行可回填。槽位刚被让出,
+                        # 正常情况下这次必赢;真撞上第三方竞争者(重新占坑输了)
+                        # 时这里拿不到行,下面的 set_container_id 会按契约抛错、
+                        # 由 Important-6 那层守卫 kill 掉刚建的沙箱并冒泡成一个
+                        # 可重试的错误 —— 不会再悄悄多留一个 microVM。
+                        await self._claim_warm(
+                            tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                        )
+                    sbx = await self._create_and_track(
+                        tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
+                    )
+                    just_created = True
+                else:
+                    # 复用成功 —— 返回赢家那一行**真实存在**的 sandbox_id,不是
+                    # 本次调用开头自铸、从未插入任何行的 uuid4()(审查 Important-3:
+                    # 否则后续 destroy(sandbox_id=<自铸 id>) 会静默 no-op,见
+                    # SandboxInstanceStore.claim_warm 的 docstring)。
+                    sandbox_id = winner_id
         else:
             if user_id is None:  # 临时沙箱不经过 claim_warm,得先插一行——见 create_ephemeral。
                 await self._create_ephemeral_row(tenant_id=tenant_id, sandbox_id=sandbox_id)
+            # 此刻本次调用自己的行已落库(warm 分支由 claim_warm 插,临时分支由
+            # 上一行插)—— 配额检查放在这之后、create() 之前(#8):提前查做不
+            # 到,复用路径与新建路径在 claim_warm 返回前无法区分,提前查会把
+            # "已到上限租户复用既有会话"也拒掉。
+            await self._enforce_quota(tenant_id, own_sandbox_id=sandbox_id)
             sbx = await self._create_and_track(
                 tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
             )
@@ -429,7 +490,7 @@ class AgentSandboxClient:
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """``store.claim_warm`` 套上 § 6.5 的统一错误契约。"""
         try:
             return await self.store.claim_warm(
@@ -444,6 +505,54 @@ class AgentSandboxClient:
             await self.store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox row creation failed: {exc}") from exc
+
+    async def _enforce_quota(self, tenant_id: UUID, *, own_sandbox_id: UUID) -> None:
+        """对称 supervisor 的 ``_enforce_quota``(supervisor.py:713-727),
+        一处刻意更强:insert-then-check 而非 check-then-insert。
+
+        supervisor 先查后插,两个并发 acquire 可各自读到 limit-1 双双过闸
+        小幅超限;这里本次调用的行**已经**落库(它就是 CAS 凭证),count
+        必然包含自己 —— 条件用严格 ``>``,超限则 :meth:`_unwind_slot` 拆掉
+        自己的行再抛。并发**新建**竞争者之间数得到对方已插的行,彼此不会
+        超限 —— 比 supervisor 的竞态语义更紧,顺带免了「拒绝路径漏行」的
+        清理债。**但这不是"落库活跃行数任何时刻都 ≤ limit"的全局保证**:
+        下面的年龄封顶/重连失败重建路径刻意不经过这道闸(见下一段),它们
+        的 destroy 与重占坑之间存在窗口,一个并发的**新建**请求可以在那个
+        窗口里数到"重建者旧行已删、新行未插"之间的活跃数、把腾出来的名额
+        吃掉 —— 极端交错下总活跃行数可以短暂到 ``limit + 进行中的重建数``。
+        自限(重建数有限,不会像真正的配额洞一样无界增长)且自愈(重建
+        完成后下一次新建请求照常被这道闸拦住,不需要人工介入)。
+
+        只挂在 :meth:`acquire` 的**全新建行**路径(``existing is None``
+        分支)上:热会话复用与年龄封顶/重连失败的 1 换 1 重建路径都不查
+        ——总活跃行数不变,查了反而会把已到上限租户的存量会话变成不可重建
+        的死会话。
+
+        store 查询本身失败(DB 抖动)时,拆自己的行再抛 ——
+        既不能吞掉(fail-open 让配额闸形同虚设),也不能保留这行不拆
+        (行已经插入,槽位会一直卡着);拆 + 抛是唯一在两难之间都不留后遗症
+        的选择。
+
+        与 supervisor 的第二处不对称:supervisor 拒绝时额外写一条
+        ``AuditAction.SANDBOX_QUOTA_DENIED`` 审计行(``supervisor.py:713-727``);
+        这里刻意不写 —— ``AgentSandboxClient`` 没有接审计存储的依赖,补一个
+        纯为了这一处调用不值得。拆行时留下的
+        ``destroy_reason="quota_exceeded"`` 就是可查询的痕迹,已知的能力
+        缺口,不是遗漏。
+        """
+        try:
+            limit = await self.store.sandbox_limit_for_tenant(tenant_id=tenant_id)
+            active = await self.store.count_active_for_tenant(tenant_id=tenant_id)
+        except Exception as exc:
+            await self._unwind_slot(sandbox_id=own_sandbox_id, reason="quota_lookup_failed")
+            raise SandboxSupervisorError(f"sandbox quota lookup failed: {exc}") from exc
+        if limit is None:
+            limit = self.default_max_sandboxes
+        if active > limit:
+            await self._unwind_slot(sandbox_id=own_sandbox_id, reason="quota_exceeded")
+            raise SandboxSupervisorError(
+                f"sandbox quota exceeded for tenant {tenant_id}: {active - 1}/{limit} active"
+            )
 
     async def _create_and_track(
         self,

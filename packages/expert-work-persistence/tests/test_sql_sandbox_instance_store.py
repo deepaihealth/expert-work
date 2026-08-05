@@ -29,7 +29,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.models import SandboxInstanceRow
+from expert_work.persistence.models import SandboxInstanceRow, TenantQuotaRow
 from expert_work.persistence.sandbox_instance_store import (
     _IDLE_TTL_S,
     _REASON_STUCK_CREATE_TAKEOVER,
@@ -37,6 +37,7 @@ from expert_work.persistence.sandbox_instance_store import (
     AGENT_SANDBOX_IMAGE_REF,
     SqlSandboxInstanceStore,
 )
+from expert_work.protocol.quota import QuotaDimension
 
 pytestmark = pytest.mark.integration
 
@@ -89,7 +90,12 @@ async def test_claim_warm_second_caller_sees_ready_container(
     # Review fix (Important-3): the loser gets back the WINNER's real row
     # id (first_id), not its own second_id — acquire() needs a persisted id
     # to hand its caller, and second_id was never inserted anywhere.
-    assert result == (first_id, "sbx-ready")
+    assert result is not None
+    winner_id, container_id, winner_acquired_at = result
+    assert (winner_id, container_id) == (first_id, "sbx-ready")
+    # #1b: the third element is the winner row's acquired_at, consumed by
+    # AgentSandboxClient.acquire's warm-session age cap.
+    assert winner_acquired_at is not None
     # The loser's own row was never inserted (its INSERT conflicted).
     assert await store.get_container_id(sandbox_id=second_id) is None
 
@@ -162,7 +168,12 @@ async def test_concurrent_claim_warm_after_ready_all_see_same_winner(
         )
     )
 
-    assert results == [(winner_id, "sbx-warm")] * 5
+    assert len(results) == 5
+    for result in results:
+        assert result is not None
+        winner_seen, container_id, winner_acquired_at = result
+        assert (winner_seen, container_id) == (winner_id, "sbx-warm")
+        assert winner_acquired_at is not None
 
 
 @pytest.mark.asyncio
@@ -997,7 +1008,10 @@ async def test_collection_queries_exclude_docker_rows(
     ) is None
     await store.set_container_id(sandbox_id=agent_winner, container_id="e2b-123")
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
-    assert result == (agent_winner, "e2b-123")
+    assert result is not None
+    winner_id, container_id, winner_acquired_at = result
+    assert (winner_id, container_id) == (agent_winner, "e2b-123")
+    assert winner_acquired_at is not None
 
 
 @pytest.mark.asyncio
@@ -1016,3 +1030,45 @@ async def test_get_container_id_returns_none_for_destroyed_row(
     await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
 
     assert await store.get_container_id(sandbox_id=sandbox_id) is None
+
+
+@pytest.mark.asyncio
+async def test_count_active_for_tenant_counts_only_agent_backend_live_rows(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """#8 配额闸的分子 —— 三重过滤:本后端(``image_ref``)、活行
+    (``state``/``destroyed_at``),「建行中」计入(``container_id`` 未回填也算)。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)  # docker 行不算
+    a = uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=a)  # 建行中:算
+    b = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=b)  # 临时:算
+    c = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=c)
+    await store.mark_destroyed(sandbox_id=c, reason="test")  # 已销毁:不算
+
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_sandbox_limit_for_tenant_reads_quota_row(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """未设行时回落 ``None``(调用方落回 default);设了行就读回同一个值。"""
+    tenant_id = uuid4()
+    assert await store.sandbox_limit_for_tenant(tenant_id=tenant_id) is None
+
+    async with store._sf() as session:
+        session.add(
+            TenantQuotaRow(
+                tenant_id=tenant_id,
+                dimension=QuotaDimension.SANDBOXES.value,
+                limit_value=3,
+                updated_by="test",
+            )
+        )
+        await session.commit()
+
+    assert await store.sandbox_limit_for_tenant(tenant_id=tenant_id) == 3

@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import SandboxEgressAuditRow
@@ -111,6 +111,15 @@ class SandboxEgressAuditStore(abc.ABC):
         """Paginated query, newest-first. ``tenant_id='*'`` spans all tenants —
         the caller must have verified system_admin before that path."""
 
+    @abc.abstractmethod
+    async def count_by_verdict_since(self, *, since: datetime, until: datetime) -> dict[str, int]:
+        """``since <= occurred_at < until`` rows aggregated by verdict — 407
+        可观测 worker(``control_plane.sandbox_egress_metrics``)的增量游标扫描用。
+        排除 ``allowed``(量大且不是告警对象;worker 只喂 blocked/error 类)。
+        ``until`` 上界防双计:worker 每轮拿 ``until`` 作下一轮的 ``since``,一行
+        只能落在恰好一个 ``[since, until)`` 区间里。
+        """
+
 
 class SqlSandboxEgressAuditStore(SandboxEgressAuditStore):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -133,6 +142,20 @@ class SqlSandboxEgressAuditStore(SandboxEgressAuditStore):
             rows = list((await session.execute(stmt)).scalars().all())
         return _paginate(rows, q.limit)
 
+    async def count_by_verdict_since(self, *, since: datetime, until: datetime) -> dict[str, int]:
+        # ``count`` clashes with tuple.count() on the SQLAlchemy Row — label
+        # the aggregate ``n`` instead of relying on the default name.
+        stmt = (
+            select(SandboxEgressAuditRow.verdict, func.count().label("n"))
+            .where(SandboxEgressAuditRow.occurred_at >= since)
+            .where(SandboxEgressAuditRow.occurred_at < until)
+            .where(SandboxEgressAuditRow.verdict != "allowed")
+            .group_by(SandboxEgressAuditRow.verdict)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        return {row.verdict: row.n for row in rows}
+
 
 class InMemorySandboxEgressAuditStore(SandboxEgressAuditStore):
     """Test double — an in-memory list of records (newest-first by id)."""
@@ -154,6 +177,13 @@ class InMemorySandboxEgressAuditStore(SandboxEgressAuditStore):
             cutoff = decode_cursor(q.cursor)
             rows = [r for r in rows if r.id < cutoff]
         return _paginate(rows[: q.limit + 1], q.limit)
+
+    async def count_by_verdict_since(self, *, since: datetime, until: datetime) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for r in self.records:
+            if since <= r.occurred_at < until and r.verdict != "allowed":
+                counts[r.verdict] = counts.get(r.verdict, 0) + 1
+        return counts
 
 
 def _paginate(

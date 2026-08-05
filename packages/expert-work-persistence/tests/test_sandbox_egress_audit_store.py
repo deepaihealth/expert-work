@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -118,3 +119,23 @@ async def test_query_empty_store() -> None:
     page = await store.query(EgressAuditQuery(tenant_id=uuid4()))
     assert page.entries == []
     assert page.next_cursor is None
+
+
+async def test_count_by_verdict_since_excludes_allowed_and_out_of_window_rows() -> None:
+    # 407 可观测 worker's incremental scan — Task 3 Step 1 + fix round 1
+    # (double-count guard: the ``until`` upper bound is exclusive).
+    store = InMemorySandboxEgressAuditStore()
+    since = datetime.now(UTC) - timedelta(minutes=5)
+    until = since + timedelta(minutes=5)
+    store.records = [
+        replace(_rec(1, verdict="blocked_auth"), occurred_at=since),  # lower bound: inclusive
+        replace(_rec(2, verdict="blocked_auth"), occurred_at=since + timedelta(minutes=2)),
+        replace(_rec(3, verdict="allowed"), occurred_at=since + timedelta(minutes=2)),
+        # before the window:
+        replace(_rec(4, verdict="blocked_ssrf"), occurred_at=since - timedelta(minutes=1)),
+        # upper bound: exclusive, not counted (fix round 1 double-count guard):
+        replace(_rec(5, verdict="blocked_ssrf"), occurred_at=until),
+    ]
+
+    counts = await store.count_by_verdict_since(since=since, until=until)
+    assert counts == {"blocked_auth": 2}
