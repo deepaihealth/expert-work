@@ -21,6 +21,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from testcontainers.postgres import PostgresContainer
 
 from expert_work.persistence import (
@@ -33,6 +34,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _IDLE_TTL_S,
     _REASON_STUCK_CREATE_TAKEOVER,
     _STUCK_CREATE_TTL_S,
+    AGENT_SANDBOX_IMAGE_REF,
     SqlSandboxInstanceStore,
 )
 
@@ -846,3 +848,98 @@ async def test_set_container_id_still_backfills_a_live_row(
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
 
     assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-live"
+
+
+# ---------------------------------------------------------------------------
+# 迁移 0142 —— 0141 部分唯一索引按后端限定(image_ref = 'agent-sandbox')。
+# ---------------------------------------------------------------------------
+
+
+async def _insert_docker_row(
+    store: SqlSandboxInstanceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID | None,
+    state: str = "IN_USE",
+    container_id: str | None = "docker-cafe",
+    acquired_at: datetime | None = None,
+) -> UUID:
+    """直插一行 docker-supervisor 形状的行(真实 image_ref/node,非标记值)。"""
+    row_id = uuid4()
+    async with store._sf() as session:
+        session.add(
+            SandboxInstanceRow(
+                id=row_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                workspace_id=None,
+                image_ref="registry.example.com/expert-work/sandbox:py312",
+                node="dev-host-1",
+                container_id=container_id,
+                state=state,
+                thread_id="thread-1",
+                cpu_quota=1,
+                memory_mb=1024,
+                pids_limit=128,
+                timeout_s=300,
+                acquired_at=acquired_at or datetime.now(tz=UTC),
+            )
+        )
+        await session.commit()
+    return row_id
+
+
+@pytest.mark.asyncio
+async def test_docker_warm_row_does_not_block_agent_claim(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """0142:docker 后端同 (tenant, user) 的 IN_USE 行不再顶死 agent claim。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)
+
+    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+
+    assert result is None  # agent 侧照常赢得自己的槽位
+    async with store._sf() as session:
+        count = len(
+            (
+                await session.execute(
+                    select(SandboxInstanceRow.id).where(
+                        SandboxInstanceRow.tenant_id == tenant_id,
+                        SandboxInstanceRow.state == "IN_USE",
+                    )
+                )
+            ).all()
+        )
+    assert count == 2  # 两后端各一行,合法共存
+
+
+@pytest.mark.asyncio
+async def test_agent_rows_still_unique_per_tenant_user(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """0142 没放松 agent 行自己的唯一性:直插第二行 agent IN_USE 必炸。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+
+    with pytest.raises(IntegrityError):
+        async with store._sf() as session:
+            session.add(
+                SandboxInstanceRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    workspace_id=None,
+                    image_ref=AGENT_SANDBOX_IMAGE_REF,
+                    node=AGENT_SANDBOX_IMAGE_REF,
+                    container_id=None,
+                    state="IN_USE",
+                    thread_id=AGENT_SANDBOX_IMAGE_REF,
+                    cpu_quota=0,
+                    memory_mb=0,
+                    pids_limit=0,
+                    timeout_s=0,
+                    acquired_at=datetime.now(tz=UTC),
+                )
+            )
+            await session.commit()

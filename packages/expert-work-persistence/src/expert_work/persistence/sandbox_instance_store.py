@@ -57,9 +57,18 @@ from expert_work.persistence.models import SandboxInstanceRow
 _STATE_IN_USE = "IN_USE"
 _STATE_DESTROYED = "DESTROYED"
 
+#: 本后端(AgentSandboxClient)写进 ``image_ref`` 的标记值 —— 同时是
+#: ``sandbox_instance`` 表**按后端限定行**的判据:docker supervisor 写的是
+#: 真实镜像引用,永远不会等于这个值。三处消费:迁移 0142 的部分唯一索引
+#: WHERE(字面量,alembic 不 import 应用代码)、本模块的集合查询谓词、
+#: docker supervisor 侧 ``DbSandboxStore`` 的排除谓词(import 本常量)。
+AGENT_SANDBOX_IMAGE_REF = "agent-sandbox"
+
 #: Inert marker for the docker-supervisor-only NOT NULL text columns this
-#: backend has no real value for (see module docstring).
-_UNUSED_TEXT = "agent-sandbox"
+#: backend has no real value for (see module docstring). Alias of
+#: :data:`AGENT_SANDBOX_IMAGE_REF` — the marker doubles as the backend
+#: discriminator, one value on purpose.
+_UNUSED_TEXT = AGENT_SANDBOX_IMAGE_REF
 
 #: Bounded retry for the rare case where a conflicting row vanishes between
 #: our failed INSERT and the follow-up SELECT (its owner released the slot
