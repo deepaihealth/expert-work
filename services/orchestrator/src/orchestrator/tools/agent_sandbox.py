@@ -204,6 +204,10 @@ class AgentSandboxClient:
     #:
     #: 为什么不改成"重发 token":见模块 docstring 末尾一节。
     egress_token_ttl_s: int = 24 * 60 * 60
+    #: 租户级沙箱数上限的缺省值 —— ``tenant_quota`` 表 SANDBOXES 维度未设
+    #: 行时回落。与 supervisor 的 ``default_max_sandboxes``(settings.py:112,
+    #: default=50)drift-lock 钉死(``test_default_max_sandboxes_matches_supervisor_default``)。
+    default_max_sandboxes: int = 50
 
     def _max_warm_age_s(self) -> int:
         """热会话总年龄上限 —— 派生自 ``egress_token_ttl_s``,不设第二个常量。
@@ -431,6 +435,11 @@ class AgentSandboxClient:
         else:
             if user_id is None:  # 临时沙箱不经过 claim_warm,得先插一行——见 create_ephemeral。
                 await self._create_ephemeral_row(tenant_id=tenant_id, sandbox_id=sandbox_id)
+            # 此刻本次调用自己的行已落库(warm 分支由 claim_warm 插,临时分支由
+            # 上一行插)—— 配额检查放在这之后、create() 之前(#8):提前查做不
+            # 到,复用路径与新建路径在 claim_warm 返回前无法区分,提前查会把
+            # "已到上限租户复用既有会话"也拒掉。
+            await self._enforce_quota(tenant_id, own_sandbox_id=sandbox_id)
             sbx = await self._create_and_track(
                 tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
             )
@@ -496,6 +505,41 @@ class AgentSandboxClient:
             await self.store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox row creation failed: {exc}") from exc
+
+    async def _enforce_quota(self, tenant_id: UUID, *, own_sandbox_id: UUID) -> None:
+        """对称 supervisor 的 ``_enforce_quota``(supervisor.py:713-727),
+        一处刻意更强:insert-then-check 而非 check-then-insert。
+
+        supervisor 先查后插,两个并发 acquire 可各自读到 limit-1 双双过闸
+        小幅超限;这里本次调用的行**已经**落库(它就是 CAS 凭证),count
+        必然包含自己 —— 条件用严格 ``>``,超限则 :meth:`_unwind_slot` 拆掉
+        自己的行再抛。并发下每个竞争者都数得到对方已插的行,最终落库的
+        活跃行数不会超过 limit —— 比 supervisor 的竞态语义更紧,顺带免了
+        「拒绝路径漏行」的清理债。
+
+        只挂在 :meth:`acquire` 的**全新建行**路径(``existing is None``
+        分支)上:热会话复用与年龄封顶/重连失败的 1 换 1 重建路径都不查
+        ——总活跃行数不变,查了反而会把已到上限租户的存量会话变成不可重建
+        的死会话。
+
+        store 查询本身失败(DB 抖动)时,拆自己的行再抛 ——
+        既不能吞掉(fail-open 让配额闸形同虚设),也不能保留这行不拆
+        (行已经插入,槽位会一直卡着);拆 + 抛是唯一在两难之间都不留后遗症
+        的选择。
+        """
+        try:
+            limit = await self.store.sandbox_limit_for_tenant(tenant_id=tenant_id)
+            active = await self.store.count_active_for_tenant(tenant_id=tenant_id)
+        except Exception as exc:
+            await self._unwind_slot(sandbox_id=own_sandbox_id, reason="quota_lookup_failed")
+            raise SandboxSupervisorError(f"sandbox quota lookup failed: {exc}") from exc
+        if limit is None:
+            limit = self.default_max_sandboxes
+        if active > limit:
+            await self._unwind_slot(sandbox_id=own_sandbox_id, reason="quota_exceeded")
+            raise SandboxSupervisorError(
+                f"sandbox quota exceeded for tenant {tenant_id}: {active - 1}/{limit} active"
+            )
 
     async def _create_and_track(
         self,

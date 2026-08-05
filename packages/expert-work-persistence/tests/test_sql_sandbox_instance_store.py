@@ -29,7 +29,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.models import SandboxInstanceRow
+from expert_work.persistence.models import SandboxInstanceRow, TenantQuotaRow
 from expert_work.persistence.sandbox_instance_store import (
     _IDLE_TTL_S,
     _REASON_STUCK_CREATE_TAKEOVER,
@@ -37,6 +37,7 @@ from expert_work.persistence.sandbox_instance_store import (
     AGENT_SANDBOX_IMAGE_REF,
     SqlSandboxInstanceStore,
 )
+from expert_work.protocol.quota import QuotaDimension
 
 pytestmark = pytest.mark.integration
 
@@ -1029,3 +1030,45 @@ async def test_get_container_id_returns_none_for_destroyed_row(
     await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
 
     assert await store.get_container_id(sandbox_id=sandbox_id) is None
+
+
+@pytest.mark.asyncio
+async def test_count_active_for_tenant_counts_only_agent_backend_live_rows(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """#8 配额闸的分子 —— 三重过滤:本后端(``image_ref``)、活行
+    (``state``/``destroyed_at``),「建行中」计入(``container_id`` 未回填也算)。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)  # docker 行不算
+    a = uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=a)  # 建行中:算
+    b = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=b)  # 临时:算
+    c = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=c)
+    await store.mark_destroyed(sandbox_id=c, reason="test")  # 已销毁:不算
+
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_sandbox_limit_for_tenant_reads_quota_row(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """未设行时回落 ``None``(调用方落回 default);设了行就读回同一个值。"""
+    tenant_id = uuid4()
+    assert await store.sandbox_limit_for_tenant(tenant_id=tenant_id) is None
+
+    async with store._sf() as session:
+        session.add(
+            TenantQuotaRow(
+                tenant_id=tenant_id,
+                dimension=QuotaDimension.SANDBOXES.value,
+                limit_value=3,
+                updated_by="test",
+            )
+        )
+        await session.commit()
+
+    assert await store.sandbox_limit_for_tenant(tenant_id=tenant_id) == 3

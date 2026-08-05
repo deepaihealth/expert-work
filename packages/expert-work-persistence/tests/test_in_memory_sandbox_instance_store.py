@@ -159,6 +159,34 @@ async def test_both_stores_share_one_missing_row_wording() -> None:
     assert "is gone" in message
 
 
+# ---------------------------------------------------------------------------
+# #8 —— 配额闸的两个只读方法。``_rows`` 只存活行+只存本后端行,SQL 侧的
+# image_ref/state/destroyed_at 三谓词在这里空洞地成立(见类 docstring)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_active_for_tenant_counts_live_rows_for_that_tenant() -> None:
+    store = InMemorySandboxInstanceStore()
+    tenant_id, other_tenant_id, user_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    destroyed_id = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=destroyed_id)
+    await store.mark_destroyed(sandbox_id=destroyed_id, reason="test")
+    await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
+
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_sandbox_limit_for_tenant_defaults_to_none() -> None:
+    """生产 in-memory 无 admin 写入路径 —— 未预置时恒 ``None``,调用方落回
+    ``default_max_sandboxes``。"""
+    store = InMemorySandboxInstanceStore()
+
+    assert await store.sandbox_limit_for_tenant(tenant_id=uuid4()) is None
+
+
 @pytest.mark.asyncio
 async def test_create_ephemeral_does_not_overwrite_existing_row() -> None:
     """#5b:id 碰撞时先写者赢(对齐 SQL 的 ON CONFLICT DO NOTHING)。"""

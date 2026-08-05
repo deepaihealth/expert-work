@@ -244,6 +244,10 @@ class FakeInstanceStore:
     #: 全分支终审测试缝 —— 这些 sandbox_id 上的 mark_destroyed 直接抛,用来
     #: 验证 reap 的一趟清扫不会被一行掐断。
     mark_destroyed_fails_for: set[UUID] = field(default_factory=set)
+    #: #8 测试缝 —— ``sandbox_limit_for_tenant`` 的预置返回值。``None``
+    #: (默认)时调用方落回 ``AgentSandboxClient.default_max_sandboxes``,与两
+    #: 个生产 store"未设行返 None"同义。
+    quota_limit: int | None = None
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -334,6 +338,18 @@ class FakeInstanceStore:
             for sandbox_id in self.stuck_creating_sandbox_ids
             if sandbox_id in self.rows and self.rows[sandbox_id].get("container_id") is None
         ]
+
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """#8 —— 与两个生产 store 同义:数 ``rows`` 里这个 tenant 的活行(``rows``
+        只存活行,同生产 in-memory store)。不是一个独立预置字段:测试要"预置
+        N 个已存在的活跃沙箱",直接调 ``create_ephemeral``/``claim_warm`` 建
+        真行即可,与 :meth:`AgentSandboxClient._enforce_quota` 的
+        insert-then-check 语义(本次调用自己插的行也数进去)天然对齐。"""
+        return sum(1 for row in self.rows.values() if row["tenant_id"] == tenant_id)
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        del tenant_id
+        return self.quota_limit
 
 
 def make_client(sdk: FakeSdk, store: SandboxInstanceStore) -> AgentSandboxClient:
@@ -1614,3 +1630,75 @@ async def test_release_keeps_warm_when_the_store_lookup_fails() -> None:
 
     assert sdk.sandbox.killed is False
     assert store.mark_destroyed_calls == []
+
+
+# ---------------------------------------------------------------------------
+# #8 —— 云后端租户沙箱配额。对称 supervisor 的 ``_enforce_quota``
+# (``sandbox_supervisor/supervisor.py:713-727``),一处刻意更强:
+# insert-then-check——本次调用自己的行已经落库,count 必然含自己,条件严格
+# ``>``,超限则 ``_unwind_slot`` 拆自己的行再抛。只挂在**全新建行**路径上
+# (``acquire`` 的 ``existing is None`` 分支);热会话复用与年龄封顶/重连失败
+# 的 1 换 1 重建路径不查——见 ``AgentSandboxClient._enforce_quota`` 的
+# docstring。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_when_tenant_quota_exhausted() -> None:
+    """预置 ``default_max_sandboxes`` 个已存在的活跃沙箱、limit 未设(回落
+    默认)→ 新建路径必炸,``sdk.create`` 从未被调用,本次调用自己插的那一行
+    被 unwind(``mark_destroyed`` reason ``"quota_exceeded"``),不留死行。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id = uuid4()
+    for _ in range(client.default_max_sandboxes):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+
+    with pytest.raises(SandboxSupervisorError, match="quota"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t1")
+
+    assert len(sdk.created) == 0, "配额闸必须在 sdk.create() 之前拦截"
+    quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
+    assert len(quota_unwinds) == 1
+    unwound_id, _ = quota_unwinds[0]
+    assert unwound_id not in store.rows, "本次调用自己插的行必须被拆掉,不留死行"
+    assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
+
+
+@pytest.mark.asyncio
+async def test_acquire_warm_reuse_skips_quota_check() -> None:
+    """已有可复用热会话 + count 已到(甚至超过)上限 → 复用照常成功——supervisor
+    同款语义:复用不新建、不检查。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    for _ in range(client.default_max_sandboxes + 5):
+        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert second_id == first_id
+    assert len(sdk.created) == 1, "复用分支不该走 sdk.create()"
+
+
+@pytest.mark.asyncio
+async def test_acquire_respects_tenant_quota_row_over_default() -> None:
+    """租户自己的 ``sandboxes`` 配额行覆盖默认值:limit=2,已有 1 个活跃 →
+    新建成功(本次插入后 count=2,不严格大于 limit);已有 2 个活跃 → 拒绝
+    (本次插入后 count=3 > limit=2)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    store.quota_limit = 2
+
+    tenant_id = uuid4()
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1")
+    assert sandbox_id in store.rows
+
+    other_tenant_id = uuid4()
+    for _ in range(2):
+        await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
+    with pytest.raises(SandboxSupervisorError, match="quota"):
+        await client.acquire(tenant_id=other_tenant_id, thread_id="t2")

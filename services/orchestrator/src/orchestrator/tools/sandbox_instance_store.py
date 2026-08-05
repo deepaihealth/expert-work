@@ -222,3 +222,27 @@ class SandboxInstanceStore(Protocol):
         ``container_id``(这类行压根没有对应的 E2B 容器)——调用方不该对
         返回的 id 尝试 ``connect``/``kill``,直接 ``mark_destroyed`` 即可。
         """
+
+    async def count_active_for_tenant(self, *, tenant_id: UUID) -> int:
+        """#8 云后端租户配额闸的分子 —— 本后端该租户的活跃行数。
+
+        ``AgentSandboxClient._enforce_quota`` 用:与 docker supervisor 的
+        ``SandboxStore.count_active_for_tenant`` 互补(那边排除
+        ``AGENT_SANDBOX_IMAGE_REF``,这边只数它),两后端各按自己的行计数、
+        不互相干扰。
+
+        「建行中」(``container_id`` 仍是 ``NULL`` 的行)**必须计入**——不计
+        的话,任意多个并发 ``acquire`` 都能在各自的 ``create()`` 完成、
+        ``set_container_id`` 回填之前互相看不见对方,配额检查形同虚设。
+        已销毁的行不计。
+        """
+
+    async def sandbox_limit_for_tenant(self, *, tenant_id: UUID) -> int | None:
+        """#8 云后端租户配额闸的分母 —— ``tenant_quota`` 表 ``sandboxes``
+        维度的 ``limit_value``,未设行时返回 ``None``(调用方落回
+        ``AgentSandboxClient.default_max_sandboxes``)。
+
+        与 docker supervisor 的 ``SandboxStore.sandbox_limit_for_tenant``
+        读同一张表、同一个维度 —— 租户的沙箱预算是平台级的,admin API 写一
+        行,两个后端都认。
+        """

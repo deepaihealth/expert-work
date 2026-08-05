@@ -516,3 +516,24 @@ def test_idle_ttl_matches_supervisor_default() -> None:
         " 已经不一致 —— force=False 的空闲清扫在两个后端上会有不同的判定口径。"
         " 改了任一边的值,记得同步改另一边(或者把这条断言更新成有意为之的新值)。"
     )
+
+
+def test_default_max_sandboxes_matches_supervisor_default() -> None:
+    """#8 云后端租户配额的漂移闸 —— 手法同
+    ``test_egress_token_ttl_matches_supervisor_default``。
+
+    ``AgentSandboxClient._enforce_quota`` 在 ``tenant_quota`` 表未设
+    ``sandboxes`` 行时落回 ``default_max_sandboxes``;docker supervisor 的
+    ``_enforce_quota``(``supervisor.py:713-727``)落回同名 settings 字段。
+    两个后端共用同一张 ``tenant_quota`` 表(平台级配额,不分后端),未设行
+    时的缺省上限也理应一致,否则同一个租户在两个后端拿到不同的默认额度。
+
+    刻意不打 ``integration`` marker:只比较两个 Python 常量。
+    """
+    from orchestrator.tools.agent_sandbox import AgentSandboxClient
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    assert (
+        AgentSandboxClient.__dataclass_fields__["default_max_sandboxes"].default
+        == SandboxSupervisorSettings.model_fields["default_max_sandboxes"].default
+    )
