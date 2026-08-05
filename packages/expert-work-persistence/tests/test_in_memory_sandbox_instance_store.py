@@ -81,13 +81,14 @@ async def test_claim_warm_takeover_is_not_triggered_by_a_ready_row() -> None:
         await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id) is None
     )
     await store.set_container_id(sandbox_id=winner_id, container_id="sbx-warm")
-    store._rows[winner_id].acquired_at = datetime.now(UTC) - timedelta(
-        seconds=_STUCK_CREATE_TTL_S * 2
-    )
+    backdated = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
+    store._rows[winner_id].acquired_at = backdated
 
     result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
 
-    assert result == (winner_id, "sbx-warm")
+    # #1b: the third element is the winner row's acquired_at, consumed by
+    # AgentSandboxClient.acquire's warm-session age cap.
+    assert result == (winner_id, "sbx-warm", backdated)
 
 
 @pytest.mark.asyncio

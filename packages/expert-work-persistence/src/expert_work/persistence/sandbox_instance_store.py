@@ -162,7 +162,7 @@ class SqlSandboxInstanceStore:
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """spec § 6.2 CAS: ``INSERT ... ON CONFLICT DO NOTHING RETURNING``.
 
         The bare (no explicit conflict target) ``ON CONFLICT DO NOTHING``
@@ -202,6 +202,13 @@ class SqlSandboxInstanceStore:
         (otherwise a later ``destroy()`` on that never-persisted id would
         silently no-op — see ``AgentSandboxClient.acquire``). Both values
         come from the same ``SELECT`` already, no extra round trip.
+
+        #1b — the tuple's third element is the winner row's ``acquired_at``,
+        consumed by ``AgentSandboxClient.acquire`` to cap a warm session's
+        total age at half its egress token's TTL. The ``SELECT`` below
+        already fetches ``acquired_at`` for the Critical-1 stale-create
+        check (next paragraph), so this rides along for free — no extra
+        round trip.
 
         Whole-branch review Critical-1 — the "still creating, raise" branch
         above needs a time bound, or a single badly-timed process death
@@ -293,7 +300,7 @@ class SqlSandboxInstanceStore:
                 continue
             winner_id, existing_container_id, winner_acquired_at = found
             if existing_container_id:
-                return (winner_id, str(existing_container_id))
+                return (winner_id, str(existing_container_id), winner_acquired_at)
             if winner_acquired_at is not None and winner_acquired_at < _stuck_create_cutoff(now):
                 # Critical-1: an orphan of a process death between this
                 # method's commit and set_container_id. Clear it and let the
@@ -644,7 +651,7 @@ class InMemorySandboxInstanceStore:
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         key = (tenant_id, user_id)
         for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
             existing_id = self._warm.get(key)
@@ -657,7 +664,8 @@ class InMemorySandboxInstanceStore:
                 # Return the WINNER's real row id, not the caller's own
                 # sandbox_id (never inserted on this path) — see
                 # SqlSandboxInstanceStore.claim_warm's docstring for why.
-                return (existing_id, existing.container_id)
+                # #1b: acquired_at rides along too, same reason.
+                return (existing_id, existing.container_id, existing.acquired_at)
             if existing.acquired_at < _stuck_create_cutoff(_utc_now()):
                 # Whole-branch review Critical-1 — mirror of the SQL store's
                 # stale-mid-create takeover, same predicate (shared

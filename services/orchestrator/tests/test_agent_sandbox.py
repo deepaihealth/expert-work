@@ -69,6 +69,7 @@ from expert_work.persistence.sandbox_instance_store import (
 )
 from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
+    _WARM_AGE_DESTROY_REASON,
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
@@ -246,18 +247,24 @@ class FakeInstanceStore:
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str] | None:
+    ) -> tuple[UUID, str, datetime | None] | None:
         """占坑成功返 None;已被别人占且赢家已就绪返
-        ``(赢家 sandbox_id, container_id)``;赢家还在创建中则 raise。"""
+        ``(赢家 sandbox_id, container_id, acquired_at)``;赢家还在创建中则
+        raise。``acquired_at`` 供 #1b 的年龄封顶测试直接改写
+        ``self.rows[winner_id]["acquired_at"]`` 摆前置状态。"""
         key = (tenant_id, user_id)
         winner_id = self.warm.get(key)
         if winner_id is None:
             self.warm[key] = sandbox_id
-            self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": user_id}
+            self.rows[sandbox_id] = {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "acquired_at": datetime.now(UTC),
+            }
             return None
         container_id = self.rows[winner_id].get("container_id")
         if container_id:
-            return (winner_id, container_id)
+            return (winner_id, container_id, self.rows[winner_id].get("acquired_at"))
         msg = f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
         raise RuntimeError(msg)
 
@@ -1096,10 +1103,11 @@ async def test_unwind_after_a_takeover_leaves_the_new_owners_row_alone() -> None
         "B 的行必须仍然出现在 list_active 里 —— 否则周期 reaper 永远收不走它那个还活着的 microVM"
     )
     # 槽位仍归 B:下一次 acquire 应当复用 B,而不是发现槽位空了又建一个。
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) == (
-        b_id,
-        "sbx-B",
-    )
+    claim_result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    assert claim_result is not None
+    b_winner_id, b_container_id, b_acquired_at = claim_result
+    assert (b_winner_id, b_container_id) == (b_id, "sbx-B")
+    assert b_acquired_at is not None
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1285,72 @@ def test_platform_timeout_outlives_idle_ttl() -> None:
         "余量至少要覆盖 SandboxReapWorker 的一个完整扫描周期(240s),"
         " 否则 reap 可能刚好错过一轮、让平台先动手。"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1b —— 热会话年龄封顶:token 只在 create(envs=...) 送一次、无法重发(见模块
+# docstring 再审 Important-3),持续被复用的热会话会活过自己的出网 token,
+# 之后每次出网都是 407 且没有任何自愈路径。acquire 的复用分支在 connect 之前
+# 先检查赢家那行的 acquired_at,超过 egress_token_ttl_s // 2 就强制重建。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_warm_session_past_age_cap() -> None:
+    """超过 egress_token_ttl_s//2 的热会话在下次 acquire 被强制重建。
+
+    token 只在 create(envs=...) 送一次(重发三条路 2026-08-04 已否决,
+    见 agent_sandbox.py 模块 docstring),活过 24h 的会话出网全 407 且
+    永不自愈 —— 年龄封顶是唯一自愈路径。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["acquired_at"] = datetime.now(UTC) - timedelta(
+        seconds=client._max_warm_age_s() + 60
+    )
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "超龄必须重建,不能复用旧 sandbox_id"
+    assert (old_id, _WARM_AGE_DESTROY_REASON) in store.mark_destroyed_calls
+    assert len(sdk.created) == 2, "必须真的重建(第二次 sdk.create),不是复用"
+    assert store.rows[new_id]["container_id"] == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_acquire_reuses_warm_session_under_age_cap() -> None:
+    """acquired_at 在封顶内(1 小时前,远小于默认 12h 上限)→ 走 connect 复用,
+    sdk.create 不被调用,返回旧 winner_id —— 守住"封顶不误伤"。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[first_id]["acquired_at"] = datetime.now(UTC) - timedelta(hours=1)
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert len(sdk.created) == 1, "年龄封顶内不该重建"
+    assert second_id == first_id
+
+
+@pytest.mark.asyncio
+async def test_acquire_never_age_caps_null_acquired_at() -> None:
+    """第三元为 None → 年龄不可知,不封顶,照常复用(同 C-1 拒绝接管的姿态)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[first_id]["acquired_at"] = None
+
+    second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert len(sdk.created) == 1, "acquired_at 缺失时年龄不可知,不该被封顶重建"
+    assert second_id == first_id
 
 
 # ---------------------------------------------------------------------------
