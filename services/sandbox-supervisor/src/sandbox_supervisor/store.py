@@ -38,10 +38,24 @@ class SandboxStore(Protocol):
         """Return one sandbox by id, or ``None``."""
 
     async def count_active_for_tenant(self, tenant_id: UUID) -> int:
-        """Count the tenant's non-terminal sandboxes (``CREATING`` + ``IN_USE``)."""
+        """Count the tenant's non-terminal sandboxes (``CREATING`` + ``IN_USE``).
+
+        Excludes agent-sandbox-backend rows: ``sandbox_instance`` is shared
+        by both backends, and this counts only the docker-backend rows
+        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``). The in-memory
+        fakes used in tests are only ever written by the supervisor itself,
+        so every row they hold is already docker-shaped — the ``image_ref``
+        dimension is vacuously satisfied there and those fakes add no such
+        filter.
+        """
 
     async def list_idle_sessions(self, *, now: datetime, idle_ttl_s: int) -> list[SandboxRecord]:
-        """Return ``IN_USE`` sandboxes idle past ``last_used_at + idle_ttl_s``."""
+        """Return ``IN_USE`` sandboxes idle past ``last_used_at + idle_ttl_s``.
+
+        Excludes agent-sandbox-backend rows: ``sandbox_instance`` is shared
+        by both backends, and this returns only the docker-backend rows
+        (predicate: ``image_ref != AGENT_SANDBOX_IMAGE_REF``).
+        """
 
     async def sandbox_limit_for_tenant(self, tenant_id: UUID) -> int | None:
         """Return the tenant's ``sandboxes`` quota, or ``None`` if unset."""
@@ -68,7 +82,12 @@ class SandboxStore(Protocol):
         deliberately does NOT exclude agent-backend rows — purge semantics
         mean deleting everything for this user; an E2B row deleted here
         loses its lease and is reclaimed by the platform's own ≤20-minute
-        timeout once nothing renews it (PR-A ruling).
+        timeout once nothing renews it (PR-A ruling). In a cloud deployment
+        (no supervisor process running), this purge path itself never
+        executes — ``user_purge`` only reaches it when a
+        ``sandbox_supervisor``-backed workspace store is wired in — so
+        actually cleaning up agent-backend rows on purge is wave-2
+        follow-up.
         """
 
 

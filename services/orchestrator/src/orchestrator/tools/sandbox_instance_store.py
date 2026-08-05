@@ -136,7 +136,11 @@ class SandboxInstanceStore(Protocol):
         """
 
     async def get_container_id(self, *, sandbox_id: UUID) -> str | None:
-        """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。"""
+        """读某行的 E2B sandbox id;行不存在或未回填返 ``None``。行已销毁
+        (``state != IN_USE`` 或 ``destroyed_at`` 非 ``NULL``)同样返
+        ``None``——只读活行,两个实现同义(SQL 加谓词,in-memory 靠
+        ``mark_destroyed`` pop 行)。
+        """
 
     async def is_warm_session(self, *, sandbox_id: UUID) -> bool:
         """这一行是不是一个**该保温的**用户级热会话?
@@ -155,7 +159,7 @@ class SandboxInstanceStore(Protocol):
 
     async def touch_and_get_container_id(self, *, sandbox_id: UUID) -> str | None:
         """独立审查 Important-2:跟 :meth:`get_container_id` 一样的读语义
-        (行不存在或未回填返 ``None``),但同一次往返里把该行的
+        (行不存在、未回填或已销毁返 ``None``),但同一次往返里把该行的
         ``last_used_at`` 一并推进到当前时间——:meth:`AgentSandboxClient.exec`
         用,替代"先读 container_id 再单独一次 UPDATE last_used_at"两次
         往返(``exec`` 已经在热路径上,不该多打一次库)。``destroy`` 之类
