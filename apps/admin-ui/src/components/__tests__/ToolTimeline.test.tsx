@@ -141,6 +141,48 @@ describe("ToolTimeline", () => {
     expect(stdout.textContent).not.toContain("UNTRUSTED");
   });
 
+  it("keeps the untrusted badge when exec fields come from the artifact", () => {
+    // Artifact-sourced stdout is raw (no ▁ glyph) — the badge must fall back
+    // to sniffing the datamarked resultPreview.
+    renderFireCard(
+      baseEntry({
+        rawName: "exec_python",
+        toolName: "exec_python",
+        resultPreview: "stdout:▁ 1▁ exit_code:▁ 0",
+        execResult: { stdout: "1\n", stderr: "", exitCode: 0 },
+      }),
+    );
+    expect(screen.getByTestId("tool-untrusted")).toBeInTheDocument();
+    openResultPanel();
+    expect(screen.getByTestId("tool-exit-code").textContent).toContain("0");
+  });
+
+  it("shows a timed-out tag next to the exit code when execResult.timedOut is true", () => {
+    render(
+      <ToolCallCard
+        entry={baseEntry({
+          toolName: "exec_python",
+          execResult: { stdout: "", stderr: "", exitCode: -1, timedOut: true },
+        })}
+      />,
+    );
+    openResultPanel();
+    expect(screen.getByTestId("tool-timed-out")).toBeInTheDocument();
+  });
+
+  it("does not show the timed-out tag when execResult.timedOut is unset", () => {
+    render(
+      <ToolCallCard
+        entry={baseEntry({
+          toolName: "exec_python",
+          execResult: { stdout: "1", stderr: "", exitCode: 0 },
+        })}
+      />,
+    );
+    openResultPanel();
+    expect(screen.queryByTestId("tool-timed-out")).not.toBeInTheDocument();
+  });
+
   it("does not show the badge for a clean result, and leaves args untouched", () => {
     render(
       <ToolCallCard

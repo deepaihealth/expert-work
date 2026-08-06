@@ -442,7 +442,11 @@ function WorkerNode({ worker }: { worker: WorkerTimeline }) {
                 <div key={i} style={{ paddingLeft: 12, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                   {m.contentExcerpt ?? ""}
                   {m.toolCalls?.map((c) => `⚙ ${c.name}(${c.argsExcerpt})`).join(" ") ?? ""}
-                  {m.toolResultExcerpt ? `→ ${m.toolResultExcerpt}` : ""}
+                  {m.exec
+                    ? `→ exit ${m.exec.exitCode}${m.exec.timedOut ? " · timeout" : ""}${m.exec.stdoutExcerpt ? ` · ${m.exec.stdoutExcerpt}` : ""}${m.exec.stderrExcerpt ? ` ⚠ ${m.exec.stderrExcerpt}` : ""}`
+                    : m.toolResultExcerpt
+                      ? `→ ${m.toolResultExcerpt}`
+                      : ""}
                 </div>
               ))}
             </div>

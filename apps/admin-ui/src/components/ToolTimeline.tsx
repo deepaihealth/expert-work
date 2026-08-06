@@ -93,7 +93,7 @@ export function ToolCallCard({
     });
   }
   if (entry.execResult) {
-    const { stdout, stderr, exitCode } = entry.execResult;
+    const { stdout, stderr, exitCode, timedOut } = entry.execResult;
     const stdoutClean = cleanUntrusted(stdout);
     const stderrClean = cleanUntrusted(stderr);
     // tool_timeline.ts already strips the «UNTRUSTED nonce=…» fence while
@@ -105,7 +105,10 @@ export function ToolCallCard({
       stdoutClean.hadUntrusted ||
       stderrClean.hadUntrusted ||
       stdout.includes("▁") ||
-      stderr.includes("▁");
+      stderr.includes("▁") ||
+      // PR-D — artifact-sourced streams are raw (never datamarked); the
+      // spotlight evidence now lives only in the mangled resultPreview.
+      (entry.resultPreview?.includes("▁") ?? false);
     items.push({
       key: "result",
       label: (
@@ -128,6 +131,11 @@ export function ToolCallCard({
             >
               {t("tool_timeline.exit_code")}: {exitCode ?? "?"}
             </Tag>
+            {timedOut && (
+              <Tag color="warning" bordered={false} data-testid="tool-timed-out">
+                {t("tool_timeline.timed_out")}
+              </Tag>
+            )}
           </div>
           {stdoutClean.text && (
             <ExecStream label={t("tool_timeline.stdout_label")} text={stdoutClean.text} />

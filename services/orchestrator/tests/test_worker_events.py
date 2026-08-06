@@ -99,6 +99,93 @@ def test_update_frame_no_step_count_key_when_absent() -> None:
     assert frame["data"]["messages"] == []
 
 
+def test_update_frame_carries_exec_artifact_summary() -> None:
+    # PR-D — a worker's exec_python/bash result keeps its structured fields
+    # (excerpted to the frame's summary budget); the content excerpt alone is
+    # datamark-mangled and unparseable.
+    msg = ToolMessage(
+        content="stdout:▁ 1▁ exit_code:▁ 0",
+        tool_call_id="tc-1",
+        name="exec_python",
+        artifact={
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "stdout": "1\n" * 600,
+            "stderr": "",
+        },
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    exec_summary = tool["exec"]
+    assert exec_summary["exit_code"] == 0
+    assert exec_summary["timed_out"] is False
+    assert exec_summary["stdout_excerpt"].startswith("1\n")
+    assert len(exec_summary["stdout_excerpt"]) == WORKER_RESULT_EXCERPT + 1  # +1 = "…"
+    assert exec_summary["stderr_excerpt"] == ""
+
+
+def test_update_frame_excerpts_a_long_stderr_artifact() -> None:
+    # Final-review fix wave — mutation coverage. The pre-existing
+    # exec-artifact test's stderr is empty, so a mutant that drops the
+    # ``_excerpt(...)`` wrapper around ``stderr_excerpt`` (leaving the raw
+    # ``artifact["stderr"]`` un-truncated) survives; a >500-char stderr kills
+    # it.
+    msg = ToolMessage(
+        content="stdout:▁ exit_code:▁ 1",
+        tool_call_id="tc-3",
+        name="bash",
+        artifact={
+            "exit_code": 1,
+            "timed_out": False,
+            "truncated": False,
+            "stdout": "",
+            "stderr": "e" * 600,
+        },
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    assert len(tool["exec"]["stderr_excerpt"]) == WORKER_RESULT_EXCERPT + 1
+
+
+def test_update_frame_ignores_bool_exit_code() -> None:
+    # Final-review fix wave — mutation coverage. ``bool`` is a subclass of
+    # ``int`` in Python, so ``isinstance(True, int)`` is True; the artifact
+    # reader must explicitly exclude bools via
+    # ``not isinstance(exit_code, bool)``, or a bogus artifact shape with
+    # ``exit_code: True`` would grow an ``exec`` key.
+    msg = ToolMessage(
+        content="ok",
+        tool_call_id="tc-4",
+        name="exec_python",
+        artifact={"exit_code": True, "timed_out": False, "stdout": "", "stderr": ""},
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    assert "exec" not in tool
+
+
+def test_update_frame_ignores_non_exec_artifact() -> None:
+    # manage_task-style artifacts (no exit_code) must not grow an exec key.
+    msg = ToolMessage(
+        content="ok",
+        tool_call_id="tc-2",
+        name="manage_task",
+        artifact={"trigger_id": "t1", "action": "create"},
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    assert "exec" not in tool
+
+
 def test_end_frame_summary() -> None:
     frame = build_worker_end_frame(
         _IDENT,

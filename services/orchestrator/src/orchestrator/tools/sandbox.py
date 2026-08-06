@@ -466,8 +466,9 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
     """Render a :class:`SandboxOutcome` into the ``ToolResult`` the LLM sees.
 
     Head-truncates stdout / stderr to ``output_char_cap`` (Mini-ADR F-9)
-    and surfaces ``exit_code`` / ``timed_out`` in both the text and the
-    structured ``meta``. Shared by ``exec_python`` and ``bash``.
+    and surfaces ``exit_code`` / ``timed_out`` — plus the truncated ``stdout`` / ``stderr``
+    themselves — in the structured ``meta`` (the debug console's data path; the rendered
+    text is datamarked on the wire). Shared by ``exec_python`` and ``bash``.
 
     When either stream was cut, ``full_content`` carries the complete
     rendering so the tools node can externalize it to the workspace
@@ -502,6 +503,12 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
             "exit_code": outcome.exit_code,
             "timed_out": outcome.timed_out,
             "truncated": truncated,
+            # PR-D — the debug console renders stdout/stderr from here
+            # (→ ToolMessage.artifact): the ``content`` string is spotlight-
+            # datamarked on the wire, so its newlines don't survive. These are
+            # the same head-truncated streams ``content`` renders, pre-mark.
+            "stdout": stdout,
+            "stderr": stderr,
         },
         full_content=_render(outcome.stdout, outcome.stderr) if truncated else None,
     )

@@ -59,4 +59,27 @@ describe("WorkerSubTimeline", () => {
     // "without summary":父有 summary 行,running 子 worker 没有 → 恰好 1 个
     expect(screen.getAllByTestId("worker-summary")).toHaveLength(1);
   });
+
+  it("appends a timeout marker to a worker's exec line (PR-D final-review fix wave)", async () => {
+    const timedOutWorker = worker({
+      steps: [
+        {
+          wseq: 1,
+          node: "tools",
+          stepCount: 1,
+          durationMs: 5,
+          messages: [
+            {
+              type: "tool",
+              name: "bash",
+              exec: { exitCode: -1, timedOut: true, stdoutExcerpt: "", stderrExcerpt: "" },
+            },
+          ],
+        },
+      ],
+    });
+    render(<WorkerSubTimeline workers={[timedOutWorker]} />);
+    await userEvent.click(screen.getByTestId("worker-subtimeline-header"));
+    expect(screen.getByTestId("worker-step").textContent).toContain("exit -1 · timeout");
+  });
 });

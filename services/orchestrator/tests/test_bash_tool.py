@@ -72,6 +72,21 @@ async def test_bash_runs_command_via_subprocess_wrapper() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bash_meta_carries_streams() -> None:
+    # bash shares format_sandbox_outcome with exec_python — same structured
+    # meta contract (PR-D).
+    client = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(stdout="hello\n", stderr="warn\n", exit_code=0, timed_out=False)
+    )
+    tool = BashTool(client=client)
+
+    result = await tool.call({"command": "echo hello"}, ctx=_ctx())
+
+    assert result.meta["stdout"] == "hello\n"
+    assert result.meta["stderr"] == "warn\n"
+
+
+@pytest.mark.asyncio
 async def test_bash_wrapper_is_valid_python_even_for_nasty_command() -> None:
     # A command with quotes, newlines and backslashes must still produce a
     # compilable wrapper — repr() makes it a safe Python string literal,
