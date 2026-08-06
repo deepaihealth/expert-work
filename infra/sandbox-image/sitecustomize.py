@@ -71,8 +71,16 @@ if _AUTH:
         # stdlib's own header spelling; never override a client's own value.
         # For https:// URLs do_open later migrates this header into the
         # CONNECT tunnel headers — harmless overlap with the set_tunnel
-        # patch above (both are setdefault-shaped).
-        if not req.has_header("Proxy-authorization"):
+        # patch above (both are setdefault-shaped). Mirror stdlib's own
+        # NO_PROXY bypass guard too: proxy_open's own body checks
+        # `proxy_bypass(req.host)` BEFORE deciding to proxy at all and, when
+        # bypassed, returns a direct connection instead — stamping the token
+        # header first (as an earlier version of this patch did) would leak
+        # it onto that direct connection to a NO_PROXY host (e.g. the
+        # credential-proxy itself, or localhost).
+        if not (req.host and urllib.request.proxy_bypass(req.host)) and not req.has_header(
+            "Proxy-authorization"
+        ):
             req.add_header("Proxy-authorization", _PROXY_AUTH_HEADER)
         return _orig_proxy_open(self, req, proxy, type)
 

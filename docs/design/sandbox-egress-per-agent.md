@@ -189,8 +189,10 @@ Fix, transparent to skill code (capability must not weaken):
    proxied requests (both use setdefault-style injection to avoid overwriting
    existing headers). Python auto-imports `sitecustomize` from the **global**
    site-packages at interpreter startup — and crucially this still fires under
-   the runner's `python -I -c` (isolated mode is `-E -s`, *not* `-S`, so `site`
-   still runs; `-E` ignores only `PYTHON*` env, so the auth env is still read).
+   both sandbox runners' `python -E -P` (PR-C; formerly `-I`, whose implied
+   `-s` also broke `pip install --user`): `-E` only suppresses `PYTHON*`
+   config env, so the auth env is still read, and neither flag is `-S`/`-s`,
+   so `site` still imports this module from the global site-packages.
    `requests`/`httpx`/`urllib3` already work and are unaffected (the patch only
    fills a header they already set).
 
