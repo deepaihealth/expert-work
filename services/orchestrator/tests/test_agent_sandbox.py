@@ -59,6 +59,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpcore
 import pytest
 from e2b import CommandExitException, TimeoutException
 
@@ -67,6 +68,7 @@ from expert_work.persistence.sandbox_instance_store import (
     InMemorySandboxInstanceStore,
     _missing_row_message,
 )
+from orchestrator.tools import agent_sandbox as agent_sandbox_module
 from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
     _WARM_AGE_DESTROY_REASON,
@@ -802,6 +804,72 @@ async def test_exec_timeout_maps_to_minus_one_and_flag() -> None:
 
     assert outcome.exit_code == -1
     assert outcome.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_exec_timeout_also_covers_the_blank_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """契约 3 的另一半:超时**不总是**以 ``TimeoutException`` 的形态到达。
+
+    2026-08-06 在真栈契约测试上两次实测到这条路径:
+    ``test_exec_default_timeout_is_the_shared_default``(``time.sleep(45)``
+    配 30 秒时限)红在 ``exec`` 的兜底分支上,报错正文是空的——
+    ``SandboxSupervisorError: sandbox exec failed: ``。日志里 e2b 的映射表
+    露了底:envd 掐断长命令时 gRPC 流中断走 anyio(``BrokenResourceError``
+    / ``EndOfStream``)→ httpx 的 ``map_exceptions`` → ``httpcore.ReadError``
+    / ``ReadTimeout``,而这一族异常的 ``str()`` 恰好是空字符串。
+
+    这不是"测试偶尔红":同一条路径在生产上会把一次本该返回
+    ``timed_out=True`` 的正常超时升级成 ``SandboxSupervisorError``,让整个
+    run 挂掉——LLM 写个长任务跑满时限就会踩到。
+
+    用真实的 ``httpcore.ReadError`` 而不是自造一个空消息异常:现场那个类
+    就是它,凑一个同形状的假件会让"SDK 换版本后异常族变了"这类回归照样
+    绿。``_monotonic`` 接缝摆出"跑满了时限"的状态,见它的 docstring。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    ticks = iter([100.0, 100.0 + 30.0])
+    monkeypatch.setattr(agent_sandbox_module, "_monotonic", lambda: next(ticks))
+    sdk.sandbox.commands.run_error = httpcore.ReadError()
+
+    outcome = await client.exec(sandbox_id=sid, code="import time;time.sleep(45)", timeout_s=30)
+
+    assert outcome.timed_out is True
+    assert outcome.exit_code == -1
+
+
+@pytest.mark.asyncio
+async def test_exec_early_connection_failure_stays_an_error_and_names_the_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一个异常,**没跑满时限**就断 → 仍然是基础设施故障,不是超时。
+
+    归因判据是时长而不是异常类型,所以必须有这条反向用例:否则把
+    ``_TIMEOUT_ATTRIBUTION_RATIO`` 改成 0(即"任何异常都算超时")也照样
+    绿,那等于把一切故障静默伪装成超时。
+
+    顺带钉住错误消息带类型名:走到这一支的异常有一整族 ``str()`` 为空,
+    只插值 ``{exc}`` 会得到 ``sandbox exec failed: ``,恰恰在最需要诊断
+    的时候什么都不说。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    ticks = iter([100.0, 100.5])  # 30 秒时限里只过了半秒
+    monkeypatch.setattr(agent_sandbox_module, "_monotonic", lambda: next(ticks))
+    sdk.sandbox.commands.run_error = httpcore.ReadError()
+
+    with pytest.raises(SandboxSupervisorError) as excinfo:
+        await client.exec(sandbox_id=sid, code="print(1)", timeout_s=30)
+
+    message = str(excinfo.value)
+    assert "ReadError" in message
+    assert "0.5s" in message
 
 
 @pytest.mark.asyncio
