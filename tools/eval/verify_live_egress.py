@@ -292,6 +292,15 @@ except Exception as e:
     print("EGRESS_RESULT", {"ok": False, "err": type(e).__name__ + ": " + str(e)[:200]})
 """
 
+#: Plain-HTTP — PR-C #4: stdlib by default doesn't send Proxy-Authorization
+#: for plain-HTTP proxied requests (only for CONNECT tunnels). Before the fix,
+#: this always got 407. After sitecustomize patches ProxyHandler.proxy_open too.
+_PLAIN_HTTP_CODE = _ALLOWED_CODE.replace(
+    "aHR0cHM6Ly8xLjEuMS4xL2Nkbi1jZ2kvdHJhY2U=",
+    "aHR0cDovLzEuMS4xLjEvY2RuLWNnaS90cmFjZQ==",
+)
+
+
 _SSRF_HOST = "169.254.169.254"
 # base64 for the same reason as the allowed probe — keep the model from rewriting
 # the literal. ``aHR0cHM6Ly8xNjkuMjU0LjE2OS4yNTQv`` == "https://169.254.169.254/".
@@ -352,6 +361,35 @@ async def phase_allowed(client: httpx.AsyncClient, *, name: str, version: str) -
     return True
 
 
+async def phase_plain_http(client: httpx.AsyncClient, *, name: str, version: str) -> bool:
+    print(f"\n[phase 3] plain-HTTP egress — sandbox → http://{_ALLOWED_HOST} via the audited proxy")
+    tr = await _gated_exec(
+        client,
+        name=name,
+        version=version,
+        prompt=_exec_prompt(_PLAIN_HTTP_CODE),
+        label="plain-http",
+    )
+    if tr is None:
+        return False
+    if not _tool_text_has(tr, "EGRESS_RESULT", "'ok': True"):
+        print(
+            "  FAIL — the plain-HTTP request did not succeed from the sandbox "
+            "(PR-C 前的已知形态:stdlib 不发 Proxy-Authorization → 407)."
+        )
+        return False
+    print("  request succeeded; checking the audit trail…")
+    row = await _find_audit_row(client, host=_ALLOWED_HOST, verdict="allowed")
+    if row is None:
+        print("  FAIL — no sandbox_egress_audit row (verdict=allowed) for the host.")
+        return False
+    print(
+        f"  PASS — egress reached {_ALLOWED_HOST}; audit row id={row.get('id')} "
+        f"bytes_down={row.get('bytes_down')} agent={row.get('agent_name')}."
+    )
+    return True
+
+
 async def phase_ssrf(client: httpx.AsyncClient, *, name: str, version: str) -> bool:
     print(f"\n[phase 2] SSRF blocked — sandbox → https://{_SSRF_HOST} (metadata IP) refused")
     tr = await _gated_exec(
@@ -392,6 +430,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
         ok = await phase_allowed(client, name=name, version=version)
         if not args.allowed_only:
+            ok = await phase_plain_http(client, name=name, version=version) and ok
             ok = await phase_ssrf(client, name=name, version=version) and ok
 
     print(f"\nRESULT: {'PASS — egress + audit verified live.' if ok else 'FAIL — see above.'}")
