@@ -1,6 +1,6 @@
 """Sandbox-image smoke payload — runs INSIDE the sandbox via the runner.
 
-Sent as the ``code`` of one runner request (``python -I -c``) by
+Sent as the ``code`` of one runner request (``python -E -P -c``) by
 ``smoke_test.py``. Asserts the single full image (sandbox-image-consolidation)
 ships a working toolchain: Python 3.12 + every office/data/media library +
 the system binaries skills shell out to (soffice/poppler/ffmpeg) + Node.js, with
@@ -107,6 +107,12 @@ with Image.open("/workspace/chart.png") as img:
 
 # import is enough to prove these wheels + deps load (no separate exercise).
 _ = (pypdf.__name__, pdfplumber.__name__, imageio.__name__, defusedxml.__name__)
+
+# PR-C — the runner must exec children with -E -P (user site ON, safe path ON).
+if sys.flags.no_user_site or sys.flags.isolated:
+    raise RuntimeError(f"user site disabled in exec child (flags={sys.flags})")
+if not sys.flags.safe_path:
+    raise RuntimeError("safe_path (-P) missing — script dir / cwd would shadow stdlib")
 
 # The system binaries skills shell out to. Having the Python lib is not enough;
 # assert the binary is present AND does real work.

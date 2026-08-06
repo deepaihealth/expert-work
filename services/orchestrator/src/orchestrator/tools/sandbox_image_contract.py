@@ -69,14 +69,23 @@ SANDBOX_IMAGE_ENV = {
 #:
 #: * ``DEFAULT_TIMEOUT_S`` —— 三方对齐(supervisor 的
 #:   ``SandboxSupervisorSettings.default_timeout_s`` + ``runner.py:28-37``)
-#: * ``MAX_TIMEOUT_S`` —— 钉 supervisor 的 **HTTP 边界**
-#:   ``schemas.ExecRequest.timeout_s`` 的 ``le``,不是 ``runner.py`` 的同名
-#:   常量:超范围的 ``timeout_s`` 在 schema 就被 422 掉,``runner.py`` 那个
-#:   clamp 在 HTTP 路径上根本走不到(全分支终审复审发现)。runner.py 侧的值
-#:   因此**没有闸钉着**——它今天是死代码,哪天 supervisor 改成直调就得补闸
+#: * ``MAX_TIMEOUT_S`` —— 主钉 supervisor 的 **HTTP 边界**
+#:   ``schemas.ExecRequest.timeout_s`` 的 ``le``:超范围的 ``timeout_s`` 在
+#:   schema 就被 422 掉,``runner.py`` 那个 clamp 在 HTTP 路径上根本走不到
+#:   (全分支终审复审发现)。runner.py 侧的同名常量此前没闸钉着,PR-C #9 起
+#:   也一并钉住(防哪天 supervisor 改成直调时静默分叉)
 #: * ``MAX_OUTPUT_CHARS`` —— 钉 ``runner.py:28-37``(截断真发生在那里)
 #:
 #: 对应的闸都在 ``test_exec_contract_constants_match_the_sandbox_image``。
 DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
 MAX_OUTPUT_CHARS = 1_000_000
+
+#: 解释器旗标 —— 两后端 exec 子进程共用(PR-C)。刻意是 ``-E -P`` 而非
+#: ``-I``:``-I`` 隐含 ``-s``,把 user site 踢出 ``sys.path``,静默弄坏镜像
+#: ``PIP_USER=1`` 的按需安装流(装得上、import 不到)。``-E`` 保住 PYTHON*
+#: 环境配置隔离(副作用:镜像声明的 PYTHONUNBUFFERED / PYTHONDONTWRITEBYTECODE
+#: 对子进程失效 —— 一直如此,记档不修);``-P`` 保住"脚本目录 / cwd 不进
+#: sys.path"(防 /tmp、/workspace 落的文件遮蔽 stdlib)。对家是 ``runner.py``
+#: 的 subprocess argv,闸在 test_exec_contract_constants_match_the_sandbox_image。
+SANDBOX_PYTHON_FLAGS: tuple[str, ...] = ("-E", "-P")

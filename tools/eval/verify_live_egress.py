@@ -10,7 +10,19 @@ proxy (PRs #745/#746/#747/#748). Against a running dev stack it:
   request succeeds AND a ``sandbox_egress_audit`` row with ``verdict=allowed``
   for that host shows up via ``GET /v1/sandbox-egress-audit``.
 
-* **Phase 2 — SSRF blocked + audited (negative control).** Same agent tries
+* **Phase 2 — plain-HTTP egress + audited.** Same agent, same host, but over
+  plain ``http://`` instead of ``https://`` (PR-C #4). stdlib's
+  ``ProxyHandler.proxy_open`` only sends ``Proxy-Authorization`` when the
+  proxy URL carries both a user *and* a non-empty password — ours is
+  ``http://<token>:@host`` (empty password) — so before the sitecustomize fix
+  this phase always got a ``407`` from the proxy, and a naive probe that
+  treats any ``HTTPError`` as "reached" would report success anyway. This
+  phase's probe code treats a ``407``/``403`` from the proxy itself as
+  failure, not as "reached". Asserts the request succeeds AND an
+  ``allowed`` audit row for that host **and port 80** shows up (the port
+  pin keeps this from matching Phase 1's port-443 row for the same host).
+
+* **Phase 3 — SSRF blocked + audited (negative control).** Same agent tries
   ``https://169.254.169.254/`` (the cloud metadata IP). Asserts the request
   FAILS (the proxy refuses it) AND a ``verdict=blocked_ssrf`` row is recorded.
 
@@ -229,10 +241,21 @@ async def _gated_exec(
 
 
 async def _find_audit_row(
-    client: httpx.AsyncClient, *, host: str, verdict: str, attempts: int = 12
+    client: httpx.AsyncClient,
+    *,
+    host: str,
+    verdict: str,
+    port: int | None = None,
+    attempts: int = 12,
 ) -> dict[str, Any] | None:
     """Poll GET /v1/sandbox-egress-audit for a row matching host + verdict.
-    The proxy writes the row best-effort after the connection, so we poll."""
+    The proxy writes the row best-effort after the connection, so we poll.
+
+    ``port``, when given, filters the returned items client-side (the API has
+    no port query param) so a phase probing the same host on a distinct port
+    can't accidentally match a stale row left by another phase's request to
+    that host — e.g. the plain-HTTP phase (port 80) picking up the earlier
+    HTTPS phase's port-443 ``allowed`` row for the same ``_ALLOWED_HOST``."""
     for _ in range(attempts):
         resp = await client.get(
             "/v1/sandbox-egress-audit",
@@ -240,6 +263,8 @@ async def _find_audit_row(
         )
         if resp.status_code == 200:
             items = resp.json().get("items", [])
+            if port is not None:
+                items = [row for row in items if row.get("target_port") == port]
             if items:
                 return items[0]
         await asyncio.sleep(1)
@@ -291,6 +316,45 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     print("EGRESS_RESULT", {"ok": False, "err": type(e).__name__ + ": " + str(e)[:200]})
 """
+
+#: Plain-HTTP — PR-C #4: stdlib by default doesn't send Proxy-Authorization
+#: for plain-HTTP proxied requests (only for CONNECT tunnels). Before the fix,
+#: this always got 407. Unlike ``_ALLOWED_CODE``, an ``HTTPError`` here must
+#: NOT be treated as "reached" when it's the proxy's own rejection (407 —
+#: missing/bad Proxy-Authorization — or 403 from the allowlist/SSRF gate):
+#: those mean the request never got past the proxy, which is exactly the
+#: pre-fix failure mode this phase exists to catch. So this is a dedicated
+#: code block (not a ``.replace()`` of ``_ALLOWED_CODE``) with its own
+#: HTTPError branch. ``aHR0cDovLzEuMS4xLjEvY2RuLWNnaS90cmFjZQ==`` ==
+#: "http://1.1.1.1/cdn-cgi/trace".
+_PLAIN_HTTP_CODE = """\
+import base64, urllib.request, urllib.error
+url = base64.b64decode("aHR0cDovLzEuMS4xLjEvY2RuLWNnaS90cmFjZQ==").decode()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+opener = urllib.request.build_opener(_NoRedirect)
+try:
+    req = urllib.request.Request(url, headers={"User-Agent": "expert-work-egress-verify"})
+    with opener.open(req, timeout=25) as r:
+        body = r.read(200)
+        print("EGRESS_RESULT", {"ok": True, "status": r.status, "bytes": len(body)})
+except urllib.error.HTTPError as e:
+    # A 407 (missing/bad Proxy-Authorization) or 403 (allowlist/SSRF gate)
+    # means the proxy itself refused the request — NOT a reached-target
+    # non-2xx. Only some other HTTPError (e.g. a genuine 3xx we declined to
+    # follow) counts as "reached".
+    ok = e.code not in (407, 403)
+    note = "non-2xx but reached" if ok else "proxy rejected the request"
+    print("EGRESS_RESULT", {"ok": ok, "status": e.code, "note": note})
+except Exception as e:
+    print("EGRESS_RESULT", {"ok": False, "err": type(e).__name__ + ": " + str(e)[:200]})
+"""
+
 
 _SSRF_HOST = "169.254.169.254"
 # base64 for the same reason as the allowed probe — keep the model from rewriting
@@ -352,8 +416,39 @@ async def phase_allowed(client: httpx.AsyncClient, *, name: str, version: str) -
     return True
 
 
+async def phase_plain_http(client: httpx.AsyncClient, *, name: str, version: str) -> bool:
+    print(f"\n[phase 2] plain-HTTP egress — sandbox → http://{_ALLOWED_HOST} via the audited proxy")
+    tr = await _gated_exec(
+        client,
+        name=name,
+        version=version,
+        prompt=_exec_prompt(_PLAIN_HTTP_CODE),
+        label="plain-http",
+    )
+    if tr is None:
+        return False
+    if not _tool_text_has(tr, "EGRESS_RESULT", "'ok': True"):
+        print(
+            "  FAIL — the plain-HTTP request did not succeed from the sandbox "
+            "(PR-C 前的已知形态:stdlib 不发 Proxy-Authorization → 407)."
+        )
+        for tool, text in tr.tool_msgs:
+            print(f"    [{tool}] {text[:240].replace(chr(10), ' ')}")
+        return False
+    print("  request succeeded; checking the audit trail…")
+    row = await _find_audit_row(client, host=_ALLOWED_HOST, verdict="allowed", port=80)
+    if row is None:
+        print("  FAIL — no sandbox_egress_audit row (verdict=allowed) for the host.")
+        return False
+    print(
+        f"  PASS — egress reached {_ALLOWED_HOST}; audit row id={row.get('id')} "
+        f"bytes_down={row.get('bytes_down')} agent={row.get('agent_name')}."
+    )
+    return True
+
+
 async def phase_ssrf(client: httpx.AsyncClient, *, name: str, version: str) -> bool:
-    print(f"\n[phase 2] SSRF blocked — sandbox → https://{_SSRF_HOST} (metadata IP) refused")
+    print(f"\n[phase 3] SSRF blocked — sandbox → https://{_SSRF_HOST} (metadata IP) refused")
     tr = await _gated_exec(
         client, name=name, version=version, prompt=_exec_prompt(_SSRF_CODE), label="ssrf"
     )
@@ -392,6 +487,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
         ok = await phase_allowed(client, name=name, version=version)
         if not args.allowed_only:
+            ok = await phase_plain_http(client, name=name, version=version) and ok
             ok = await phase_ssrf(client, name=name, version=version) and ok
 
     print(f"\nRESULT: {'PASS — egress + audit verified live.' if ok else 'FAIL — see above.'}")

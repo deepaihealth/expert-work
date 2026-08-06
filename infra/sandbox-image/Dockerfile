@@ -150,6 +150,11 @@ RUN python /tmp/mpl_cjk_rc.py && rm /tmp/mpl_cjk_rc.py
 # (HOME=/workspace, a writable tmpfs at runtime) and the user-site is on
 # sys.path automatically, so a bare `pip install X` just works for the agent.
 # Set AFTER the build-time requirements install above so those stay global.
+# Because $HOME/.local lives under the agent's durable workspace, user-site
+# installs persist across execs (and can shadow the image's baked package
+# versions if an agent installs a different version of something already
+# provided) — deliberate PIP_USER semantics, not a bug; a workspace reset is
+# the recovery path if that's ever undesired.
 ENV PIP_USER=1
 
 # Non-root user, uid 10000 (subsystem 14 § 5.6). `-m` creates the home dir; we
@@ -167,7 +172,7 @@ COPY runner.py /opt/runner.py
 
 # Egress urllib shim (sandbox-egress §3.5): placed in the GLOBAL site-packages
 # so Python auto-imports it at startup — including under the runner's
-# `python -I -c` (isolated mode still runs `site`). No-op unless the supervisor
+# `python -E -P -c` (still runs `site`). No-op unless the supervisor
 # injects EXPERT_WORK_EGRESS_PROXY_AUTH (egress on). Makes stdlib urllib send the
 # proxy token on CONNECT like requests/httpx already do.
 COPY sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py

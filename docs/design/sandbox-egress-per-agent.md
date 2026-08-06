@@ -184,12 +184,17 @@ Fix, transparent to skill code (capability must not weaken):
    `HTTPS_PROXY`.
 2. A `sitecustomize.py` baked into the sandbox images monkeypatches
    `http.client.HTTPConnection.set_tunnel` to add `Proxy-Authorization: Basic
-   <EXPERT_WORK_EGRESS_PROXY_AUTH>` to every `CONNECT` when that env is present. Python
-   auto-imports `sitecustomize` from the **global** site-packages at interpreter
-   startup — and crucially this still fires under the runner's `python -I -c`
-   (isolated mode is `-E -s`, *not* `-S`, so `site` still runs; `-E` ignores only
-   `PYTHON*` env, so the auth env is still read). `requests`/`httpx`/`urllib3`
-   already work and are unaffected (the patch only fills a header they already set).
+   <EXPERT_WORK_EGRESS_PROXY_AUTH>` to every `CONNECT` when that env is present.
+   It also patches `urllib.request.ProxyHandler.proxy_open` for plain-HTTP
+   proxied requests (both use setdefault-style injection to avoid overwriting
+   existing headers). Python auto-imports `sitecustomize` from the **global**
+   site-packages at interpreter startup — and crucially this still fires under
+   both sandbox runners' `python -E -P` (PR-C; formerly `-I`, whose implied
+   `-s` also broke `pip install --user`): `-E` only suppresses `PYTHON*`
+   config env, so the auth env is still read, and neither flag is `-S`/`-s`,
+   so `site` still imports this module from the global site-packages.
+   `requests`/`httpx`/`urllib3` already work and are unaffected (the patch only
+   fills a header they already set).
 
 No skill change, no proxy change (the proxy already validates the standard
 `Proxy-Authorization`); the shim only makes urllib behave like every other
