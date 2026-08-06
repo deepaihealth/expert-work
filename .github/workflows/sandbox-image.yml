@@ -17,7 +17,7 @@ name: Sandbox Image
 # Registry wiring mirrors the office image (repo Settings → Secrets/variables):
 #   vars.ALIYUN_ACR_REGISTRY / vars.ALIYUN_ACR_NAMESPACE
 #   secrets.ALIYUN_ACR_USERNAME / secrets.ALIYUN_ACR_PASSWORD
-# Then: EXPERT_WORK_SANDBOX_SANDBOX_IMAGE=<registry>/<namespace>/expert-work-sandbox:latest
+# Then: EXPERT_WORK_SANDBOX_SANDBOX_IMAGE=<registry>/<namespace>/sandbox:latest
 
 on:
   push:
@@ -58,7 +58,7 @@ jobs:
       # Actions are SHA-pinned (a mutable tag could be re-pointed at malicious
       # code in this credential-holding workflow); the trailing comment tracks
       # the human-readable version.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # QEMU lets the amd64 runner cross-build the linux/arm64 image for the
       # multi-arch push (Apple-silicon dev machines pull arm64). Only the push
@@ -130,6 +130,15 @@ jobs:
           username: ${{ secrets.ALIYUN_ACR_USERNAME }}
           password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
 
+      # 部署侧一律用 8 位短 sha(infra/k8s/sandbox/sandboxset.yaml 的 image、
+      # tools/deploy/release.sh 的 --tag、`chore(deploy): ... newTag <sha8>`
+      # 记录 PR),所以除完整 sha 外再打一个短的。三个 tag 指向同一份
+      # manifest,ACR 上不额外占存储。
+      - name: Short sha
+        id: sha
+        if: github.event_name != 'pull_request' && vars.ALIYUN_ACR_REGISTRY != ''
+        run: echo "short=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
       - name: Build + push to ACR (multi-arch)
         if: github.event_name != 'pull_request' && vars.ALIYUN_ACR_REGISTRY != ''
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -141,8 +150,12 @@ jobs:
           # has no arch-specific pins — apt/pip resolve per-arch — so one build
           # yields a manifest list covering both.
           platforms: linux/amd64,linux/arm64
+          # 仓库名是 `sandbox`,不是 `expert-work-sandbox`——命名空间里已经有
+          # `expert-work` 了。集群那份(sandboxset.yaml)一直拉的就是
+          # `<registry>/expert-work/sandbox:<sha8>`。
           tags: |
-            ${{ vars.ALIYUN_ACR_REGISTRY }}/${{ vars.ALIYUN_ACR_NAMESPACE }}/expert-work-sandbox:${{ github.sha }}
-            ${{ vars.ALIYUN_ACR_REGISTRY }}/${{ vars.ALIYUN_ACR_NAMESPACE }}/expert-work-sandbox:latest
+            ${{ vars.ALIYUN_ACR_REGISTRY }}/${{ vars.ALIYUN_ACR_NAMESPACE }}/sandbox:${{ github.sha }}
+            ${{ vars.ALIYUN_ACR_REGISTRY }}/${{ vars.ALIYUN_ACR_NAMESPACE }}/sandbox:${{ steps.sha.outputs.short }}
+            ${{ vars.ALIYUN_ACR_REGISTRY }}/${{ vars.ALIYUN_ACR_NAMESPACE }}/sandbox:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
