@@ -17,7 +17,7 @@ name: Sandbox Image
 # Registry wiring mirrors the office image (repo Settings → Secrets/variables):
 #   vars.ALIYUN_ACR_REGISTRY / vars.ALIYUN_ACR_NAMESPACE
 #   secrets.ALIYUN_ACR_USERNAME / secrets.ALIYUN_ACR_PASSWORD
-# Then: EXPERT_WORK_SANDBOX_SANDBOX_IMAGE=<registry>/<namespace>/expert-work-sandbox:latest
+# Then: EXPERT_WORK_SANDBOX_SANDBOX_IMAGE=<registry>/<namespace>/sandbox:latest
 
 on:
   push:

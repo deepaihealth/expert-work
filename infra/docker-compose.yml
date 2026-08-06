@@ -552,7 +552,7 @@ services:
       # The single sandbox image (sandbox-image-consolidation): python +
       # office/data/media libs + soffice/poppler/ffmpeg/node + CJK. Set
       # EXPERT_WORK_SANDBOX_IMAGE in infra/.env to the pushed registry path, e.g.
-      # <acr-host>/<namespace>/expert-work-sandbox:latest. The host docker daemon
+      # <acr-host>/<namespace>/sandbox:latest. The host docker daemon
       # (sandboxes launch via the mounted socket) must be able to pull it —
       # `docker login` to the registry or pre-pull the image.
       EXPERT_WORK_SANDBOX_SANDBOX_IMAGE: ${EXPERT_WORK_SANDBOX_IMAGE:-expert-work-sandbox:dev}
