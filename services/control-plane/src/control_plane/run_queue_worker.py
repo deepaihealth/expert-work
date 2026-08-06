@@ -49,6 +49,13 @@ from orchestrator import AgentFactoryError, run_agent
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
+#: ``stop()`` 等待当前这一轮 sweep 收尾的上限,超时就取消。刻意不写成别处
+#: 那种 ``interval + 5``:上界该由关机预算定,不是从轮询间隔派生 —— 同批
+#: 几个 worker 的 interval 是分钟级,那个式子给出的「上界」比 K8s 默认 30s
+#: 优雅期还长,等于没有上界。统一 5 秒:一轮正常 sweep 足够收尾,收不了尾
+#: 就取消 —— 这些 sweep 都是周期性、幂等的,下次启动会重来。
+_STOP_TIMEOUT_S = 5.0
+
 _dequeued_total = expert_work_counter(
     "expert_work_run_queue_dequeued_total",
     "Queued runs the run-queue worker claimed + started executing.",
@@ -131,8 +138,12 @@ class RunQueueWorker:
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
-            await self._task
-            self._task = None
+            try:
+                await asyncio.wait_for(self._task, timeout=_STOP_TIMEOUT_S)
+            except (TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+            finally:
+                self._task = None
 
     async def _loop(self) -> None:
         while not self._stop.is_set():

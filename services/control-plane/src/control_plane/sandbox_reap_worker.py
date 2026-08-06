@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 #: ``_INTERVAL_S``: nothing in ops needs to tune the lag on a 15-minute TTL.
 _INTERVAL_S = 240.0
 
+#: ``stop()`` 等待当前这一轮 sweep 收尾的上限,超时就取消。刻意**不是**
+#: 别处那种 ``interval + 5``:本 worker 的 interval 是分钟级,那个式子给出的
+#: 「上界」比 K8s 默认 30s 优雅期还长,等于没有上界。5 秒足够一轮正常 sweep
+#: 收尾;收不了尾就取消 —— 这些 sweep 都是周期性、幂等的,下次启动会重来。
+_STOP_TIMEOUT_S = 5.0
+
 
 @dataclass
 class SandboxReapWorker:
@@ -82,8 +88,12 @@ class SandboxReapWorker:
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
-            await self._task
-            self._task = None
+            try:
+                await asyncio.wait_for(self._task, timeout=_STOP_TIMEOUT_S)
+            except (TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+            finally:
+                self._task = None
 
     async def _loop(self) -> None:
         # Unlike ``ApprovalGaugeWorker`` there is no sweep at startup: a
