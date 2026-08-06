@@ -16,7 +16,7 @@ pdfplumber==0.11.4     # PDF text + table extraction
 # Dockerfile). This closes the gap that made md→PDF tasks thrash on the missing
 # installer.
 markdown==3.8.1          # Markdown → HTML
-weasyprint==68.0       # HTML+CSS → PDF (report generation)
+weasyprint==69.0       # HTML+CSS → PDF (report generation)
 # Pin pydyf: weasyprint 62.3 declares ``pydyf>=0.10.0`` with no upper bound, but
 # pydyf 0.12.x reworked the Stream API (``super().transform`` AttributeError at
 # write_pdf time). 0.11.0 is the newest pydyf compatible with this weasyprint.
