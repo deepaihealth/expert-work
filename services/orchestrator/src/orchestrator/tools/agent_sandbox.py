@@ -111,6 +111,7 @@ from orchestrator.tools.sandbox_image_contract import (
     MAX_TIMEOUT_S,
     SANDBOX_EXEC_USER,
     SANDBOX_IMAGE_ENV,
+    SANDBOX_PYTHON_FLAGS,
     WORKSPACE_ROOT,
 )
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
@@ -777,13 +778,14 @@ class AgentSandboxClient:
         细分,catch 这一个类型就覆盖了全部。
 
         code 先用 :meth:`_attach` 拿到的句柄 ``files.write`` 到沙箱内一个
-        临时脚本文件,再 ``python -I <path>`` 执行,不拼进命令行——E2B
+        临时脚本文件,再 ``python -E -P <path>``(:data:`SANDBOX_PYTHON_FLAGS`)
+        执行,不拼进命令行——E2B
         ``commands.run(cmd: str, ...)`` 内部固定走 ``/bin/bash -l -c cmd``
         (envd 的 ``ProcessConfig``,见 e2b SDK
         ``sandbox_async/commands/command.py`` 的 ``_start``),把任意 LLM
         生成的 ``code`` 直接嵌进这个 shell 字符串会被引号/特殊字符注入;
         runner.py 那边不存在这个风险,是因为它用
-        ``subprocess.run([sys.executable, "-I", "-c", code], ...)`` 这种
+        ``subprocess.run([sys.executable, "-E", "-P", "-c", code], ...)`` 这种
         不经过 shell 的 argv 列表形式,没有以上问题。这是"一个已知偏差"
         (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
         ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
@@ -814,7 +816,7 @@ class AgentSandboxClient:
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
-                f"python -I {script}",
+                f"python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,

@@ -80,3 +80,12 @@ SANDBOX_IMAGE_ENV = {
 DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
 MAX_OUTPUT_CHARS = 1_000_000
+
+#: 解释器旗标 —— 两后端 exec 子进程共用(PR-C)。刻意是 ``-E -P`` 而非
+#: ``-I``:``-I`` 隐含 ``-s``,把 user site 踢出 ``sys.path``,静默弄坏镜像
+#: ``PIP_USER=1`` 的按需安装流(装得上、import 不到)。``-E`` 保住 PYTHON*
+#: 环境配置隔离(副作用:镜像声明的 PYTHONUNBUFFERED / PYTHONDONTWRITEBYTECODE
+#: 对子进程失效 —— 一直如此,记档不修);``-P`` 保住"脚本目录 / cwd 不进
+#: sys.path"(防 /tmp、/workspace 落的文件遮蔽 stdlib)。对家是 ``runner.py``
+#: 的 subprocess argv,闸在 test_exec_contract_constants_match_the_sandbox_image。
+SANDBOX_PYTHON_FLAGS: tuple[str, ...] = ("-E", "-P")

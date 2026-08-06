@@ -844,7 +844,7 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
     E2B ``commands.run(cmd: str, ...)`` 内部固定走 ``/bin/bash -l -c cmd``
     (不像 runner.py 的 ``subprocess.run([..., "-c", code])`` 那样是不经过
     shell 的 argv 列表),把任意 code 直接嵌进这个 shell 字符串会被引号/
-    特殊字符注入。做法是先 ``files.write`` 到临时文件再 ``python -I <file>``
+    特殊字符注入。做法是先 ``files.write`` 到临时文件再 ``python -E -P <file>``
     执行。副作用是 ``-c`` 模式下 ``__file__`` 不存在、文件模式下存在 ——
     这条差异由此测试钉住(测试本身只钉"不拼命令行"这一半;``__file__``
     语义差异是文档记录,不是这条测试能直接断言的运行时行为)。
@@ -864,7 +864,7 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
 
     cmd, _, run_user, _cwd = sdk.sandbox.commands.calls[-1]
     assert nasty not in cmd, "code 绝不能出现在命令行里"
-    assert "python -I " in cmd
+    assert "python -E -P " in cmd
     assert run_user == SANDBOX_EXEC_USER
 
 

@@ -359,7 +359,7 @@ async def test_workspace_files_survive_across_exec(runtime: SandboxRuntime) -> N
 @pytest.mark.asyncio
 async def test_python_variables_do_not_survive_across_exec(runtime: SandboxRuntime) -> None:
     """反过来:变量不保持——两个实现的每次 ``exec`` 都是一个全新的
-    ``python -I`` 子进程(``runner.py``)/ ``commands.run`` 调用(E2B),不是
+    ``python -E -P`` 子进程(``runner.py``)/ ``commands.run`` 调用(E2B),不是
     同一个长驻解释器里的连续求值。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c7")
@@ -367,6 +367,95 @@ async def test_python_variables_do_not_survive_across_exec(runtime: SandboxRunti
         await runtime.exec(sandbox_id=sid, code="X = 42", timeout_s=30)
         outcome = await runtime.exec(sandbox_id=sid, code="print('X' in dir())", timeout_s=30)
         assert "False" in outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_user_site_survives_to_the_next_exec(runtime: SandboxRuntime) -> None:
+    """PR-C #2 —— user site 必须在 exec 子进程的 ``sys.path`` 上。
+
+    第一步把模块文件落进 ``site.getusersitepackages()``(镜像 HOME=/workspace,
+    可写),第二步全新子进程 import 它 —— 等价于「pip install --user 之后
+    下一次 exec import 得到」,但不依赖网络。旧旗标 ``-I``(含 ``-s``)下
+    第二步必失败。
+    """
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c13")
+    try:
+        seeded = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import pathlib, site\n"
+                "d = pathlib.Path(site.getusersitepackages())\n"
+                "d.mkdir(parents=True, exist_ok=True)\n"
+                "(d / 'ew_contract_usersite.py').write_text(\"MARK = 'usersite-ok'\")\n"
+                "print('seeded', d)\n"
+            ),
+            timeout_s=30,
+        )
+        assert seeded.exit_code == 0, seeded.stderr
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import ew_contract_usersite; print(ew_contract_usersite.MARK)",
+            timeout_s=30,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "usersite-ok" in outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_sys_path_excludes_cwd_and_script_dir(runtime: SandboxRuntime) -> None:
+    """PR-C #2 —— ``-P``:cwd(supervisor 的 ``-c`` 模式)与脚本目录
+    (云后端的 /tmp 脚本模式)都不得进 ``sys.path``,否则 LLM 落在
+    /workspace 或 /tmp 的文件会遮蔽 stdlib。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c14")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid, code="import sys; print(repr(sys.path))", timeout_s=30
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        paths = ast.literal_eval(outcome.stdout.strip())
+        assert "" not in paths, paths
+        assert "/tmp" not in paths, paths  # noqa: S108 — membership check on sys.path, not a filesystem write target
+        assert "/workspace" not in paths, paths
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> None:
+    """PR-C #2 的端到端本尊:``pip install --user`` 之后,下一次 exec 的
+    全新子进程要 import 得到。选 sortedcontainers(纯 py、无依赖、镜像
+    requirements 未收);第一步先断言它当前 import 不到,防镜像哪天把它
+    收编后本用例退化成空转。走真网络,超时给足。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c15")
+    try:
+        installed = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import importlib.util, subprocess, sys\n"
+                "assert importlib.util.find_spec('sortedcontainers') is None, "
+                "'already baked into the image — pick another probe package'\n"
+                "r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--user',\n"
+                "                    '--quiet', '--no-input', 'sortedcontainers==2.4.0'])\n"
+                "print('pip-rc', r.returncode)\n"
+            ),
+            timeout_s=240,
+        )
+        assert installed.exit_code == 0, installed.stderr
+        assert "pip-rc 0" in installed.stdout, installed.stdout
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import sortedcontainers; print('import-ok', sortedcontainers.__version__)",
+            timeout_s=30,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "import-ok 2.4.0" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -389,6 +478,25 @@ def _runner_py_constants() -> dict[str, int]:
             if isinstance(target, ast.Name):
                 values[target.id] = node.value.value
     return values
+
+
+def _runner_py_exec_flags() -> list[str]:
+    """ast 抠 runner.py subprocess argv 里 sys.executable 与 "-c" 之间的旗标。"""
+    runner = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "runner.py"
+    tree = ast.parse(runner.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List) or not node.elts:
+            continue
+        head = node.elts[0]
+        if isinstance(head, ast.Attribute) and head.attr == "executable":
+            flags = []
+            for elt in node.elts[1:]:
+                if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                    break
+                if elt.value == "-c":
+                    return flags
+                flags.append(elt.value)
+    raise AssertionError("runner.py 的 subprocess argv([sys.executable, ..., '-c', code])没找到")
 
 
 def _supervisor_max_timeout_s() -> int:
@@ -437,6 +545,7 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
         DEFAULT_TIMEOUT_S,
         MAX_OUTPUT_CHARS,
         MAX_TIMEOUT_S,
+        SANDBOX_PYTHON_FLAGS,
     )
     from sandbox_supervisor.settings import SandboxSupervisorSettings
 
@@ -458,6 +567,14 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
         f"timeout_s=None 时 agent_sandbox 用 {DEFAULT_TIMEOUT_S}s,"
         f" supervisor 用 settings.default_timeout_s={supervisor_default}s,"
         f" runner.py 自己的默认值是 {runner['DEFAULT_TIMEOUT_S']}s —— 三者必须一致。"
+    )
+    # PR-C #9 — runner 的 MAX_TIMEOUT_S 此前没有闸钉着,改一边就静默分叉。
+    assert MAX_TIMEOUT_S == runner["MAX_TIMEOUT_S"], (
+        f"MAX_TIMEOUT_S 漂移:contract={MAX_TIMEOUT_S} runner.py={runner['MAX_TIMEOUT_S']}"
+    )
+    # PR-C #2 — 解释器旗标单源:runner argv 必须与 SANDBOX_PYTHON_FLAGS 一致。
+    assert _runner_py_exec_flags() == list(SANDBOX_PYTHON_FLAGS), (
+        f"exec 旗标漂移:runner.py={_runner_py_exec_flags()} contract={list(SANDBOX_PYTHON_FLAGS)}"
     )
 
 
