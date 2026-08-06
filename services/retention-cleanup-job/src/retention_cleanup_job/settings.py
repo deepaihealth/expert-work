@@ -66,6 +66,13 @@ class RetentionCleanupSettings(BaseSettings):
     workspace_archive_retention_days: int = Field(default=90, ge=1, le=3650)
     tenant_user_hard_delete_grace_days: int = Field(default=90, ge=1, le=3650)
 
+    # --------------------------------------------------- 沙箱出网审计 (波 1 PR-E)
+    # ``sandbox_egress_audit`` 每次沙箱出网写一行(``allowed`` 占绝大多数),
+    # 此前没有任何清理路径。与上面几个窗口同样是 M0 全局旋钮、无 per-tenant
+    # 覆盖。这张表是运维/安全遥测,不是 audit_log 那种合规 WORM 表,所以没有
+    # ``backup_acked`` 之类的前置闸。
+    sandbox_egress_audit_retention_days: int = Field(default=90, ge=1, le=3650)
+
     # Object-store backend that owns the uploaded image bytes. ``memory``
     # (default) skips the image pass — useful for unit-tested local cron
     # ticks and for envs that haven't deployed J.6 yet. ``s3-compatible``

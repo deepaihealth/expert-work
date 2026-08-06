@@ -37,6 +37,7 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.workspace_archives_failed == 0
     assert report.workspaces_pending_archive == 0
     assert report.tenant_users_hard_deleted == 0
+    assert report.sandbox_egress_audit_deleted == 0
     assert report.duration_seconds == 0.0
     assert report.audit_deleted_by_tenant == {}
 

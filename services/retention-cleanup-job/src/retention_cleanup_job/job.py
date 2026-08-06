@@ -77,6 +77,8 @@ class CleanupReport:
     workspace_archives_failed: int = 0
     workspaces_pending_archive: int = 0
     tenant_users_hard_deleted: int = 0
+    # 波 1 PR-E —— 沙箱出网审计的保留期清理。
+    sandbox_egress_audit_deleted: int = 0
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)
@@ -103,6 +105,7 @@ class RetentionCleanupJob:
         workspace_archive_retention_days: int = 90,
         tenant_user_store: TenantUserStore | None = None,
         tenant_user_hard_delete_grace_days: int = 90,
+        sandbox_egress_audit_retention_days: int = 90,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be positive"
@@ -125,6 +128,9 @@ class RetentionCleanupJob:
         if tenant_user_hard_delete_grace_days < 1:
             msg = "tenant_user_hard_delete_grace_days must be >= 1"
             raise ValueError(msg)
+        if sandbox_egress_audit_retention_days < 1:
+            msg = "sandbox_egress_audit_retention_days must be >= 1"
+            raise ValueError(msg)
         self._sf = db_session_factory
         self._batch_size = batch_size
         self._image_upload_store = image_upload_store
@@ -140,6 +146,7 @@ class RetentionCleanupJob:
         self._workspace_retention_days = workspace_archive_retention_days
         self._tenant_user_store = tenant_user_store
         self._tenant_user_grace_days = tenant_user_hard_delete_grace_days
+        self._sandbox_egress_audit_retention_days = sandbox_egress_audit_retention_days
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -161,6 +168,7 @@ class RetentionCleanupJob:
         audit_deleted, audit_by_tenant = await self._delete_audit_log()
         audit_skipped = await self._count_unacked_past_retention()
         event_deleted = await self._delete_event_log()
+        sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
         jwt_deleted = await self._delete_expired_jwt_blacklist()
         image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
         artifact_soft, artifact_hard = await self._sweep_artifacts()
@@ -192,6 +200,7 @@ class RetentionCleanupJob:
             workspace_archives_failed=workspace_archives_failed,
             workspaces_pending_archive=workspaces_pending_archive,
             tenant_users_hard_deleted=tenant_users_hard_deleted,
+            sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
             duration_seconds=time.monotonic() - started,
         )
 
@@ -490,6 +499,49 @@ class RetentionCleanupJob:
                 total += len(result.fetchall())
                 await session.commit()
         return total
+
+    async def _delete_sandbox_egress_audit(self) -> int:
+        """删掉过了保留期的沙箱出网审计行。
+
+        ``ctid`` 子查询给 DELETE 限批(Postgres 不支持 ``DELETE ... LIMIT``),
+        与本文件其他几个 pass 同款。全局窗口、无 per-tenant 覆盖 —— 同
+        ``image_retention_days`` 的理由。表级 GRANT 见迁移 0143:这个 pass 以
+        ``retention_cleanup_worker`` 角色执行,少了那条授权就是 permission denied。
+
+        Uses ``make_interval(days => :days)`` rather than
+        ``(:days || ' days')::interval`` — the latter made Postgres infer
+        the bind parameter's type as ``text`` (from the ``||`` operator),
+        and asyncpg then refused to bind the Python ``int`` into a
+        text-typed parameter (``DataError: invalid input for query
+        argument $1: 90 (expected str, got int)``). ``make_interval``
+        takes an integer directly, sidestepping the type-inference gap;
+        it's also what ``_delete_event_log`` already uses for the same
+        reason.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                text(
+                    """
+                    DELETE FROM sandbox_egress_audit
+                    WHERE ctid IN (
+                        SELECT a.ctid
+                        FROM sandbox_egress_audit a
+                        WHERE a.occurred_at < now() - make_interval(days => :days)
+                        LIMIT :batch
+                    )
+                    """
+                ),
+                {
+                    "days": self._sandbox_egress_audit_retention_days,
+                    "batch": self._batch_size,
+                },
+            )
+            await session.commit()
+        # ``Result.rowcount`` is only typed on ``CursorResult``; the base
+        # ``Result`` mypy sees from ``session.execute(text(...))`` exposes
+        # it at runtime but not at the type level (same as
+        # ``expert_work.persistence.workspace.sql`` / ``skill.sql``).
+        return result.rowcount or 0  # type: ignore[attr-defined]
 
     async def _read_event_retentions(self) -> list[tuple[str, int]]:
         """Return ``(tenant_id, event_log_retention_days)`` for every tenant."""

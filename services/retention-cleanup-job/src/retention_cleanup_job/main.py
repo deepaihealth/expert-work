@@ -104,6 +104,7 @@ async def _amain() -> None:
             workspace_archive_retention_days=settings.workspace_archive_retention_days,
             tenant_user_store=tenant_user_store,
             tenant_user_hard_delete_grace_days=settings.tenant_user_hard_delete_grace_days,
+            sandbox_egress_audit_retention_days=settings.sandbox_egress_audit_retention_days,
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
@@ -113,7 +114,8 @@ async def _amain() -> None:
             "artifact_soft=%d artifact_hard=%d approvals_timed_out=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspace_archives_removed=%d workspace_archives_failed=%d "
-            "workspaces_pending_archive=%d tenant_users_hard_deleted=%d duration=%.2fs",
+            "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
+            "sandbox_egress_audit=%d duration=%.2fs",
             report.audit_deleted,
             report.audit_skipped_unacked,
             report.event_deleted,
@@ -130,6 +132,7 @@ async def _amain() -> None:
             report.workspace_archives_failed,
             report.workspaces_pending_archive,
             report.tenant_users_hard_deleted,
+            report.sandbox_egress_audit_deleted,
             report.duration_seconds,
         )
         if report.audit_skipped_unacked > 0:
