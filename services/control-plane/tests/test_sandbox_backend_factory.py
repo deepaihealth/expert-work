@@ -37,6 +37,11 @@ def test_agent_sandbox_backend_builds_client() -> None:
         sandbox_e2b_domain="expert-work-sbx-test.deepaihealth.com",
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="expert-work-sandbox",
+        # 全分支终审 I-2 —— 故意偏离 AgentSandboxClient.egress_token_ttl_s 的
+        # dataclass 默认值(24h)。两边默认值恰好相同,漏传(或整行被删掉)会
+        # 让 runtime 静默落回那个 dataclass 默认值,如果这里不特意选一个不同
+        # 的数,下面的断言在两种情况下都会通过,测不出接线丢了。
+        sandbox_egress_token_ttl_s=7200,
     )
     runtime = build_sandbox_runtime(s)
     assert isinstance(runtime, AgentSandboxClient)
@@ -45,11 +50,13 @@ def test_agent_sandbox_backend_builds_client() -> None:
     assert runtime.template == "expert-work-sandbox"
     # 没注入 store → 工厂自己兜一个可用的 in-memory 实现,不留 None 陷阱。
     assert isinstance(runtime.store, InMemorySandboxInstanceStore)
-    # egress 三项走 Settings 的默认值(与 credential-proxy / sandbox-supervisor
-    # 的 dev 默认一致,见 settings.py 里的说明)。
+    # egress 四项走 Settings 的值(host/port/secret 三项是 Settings 的默认值,
+    # 与 credential-proxy / sandbox-supervisor 的 dev 默认一致,见 settings.py
+    # 里的说明;ttl 上面特意设成非默认值,见构造 s 时的注释)。
     assert runtime.egress_proxy_host == s.sandbox_egress_proxy_host
     assert runtime.egress_proxy_port == s.sandbox_egress_proxy_port
     assert runtime.egress_token_secret == s.sandbox_egress_token_secret
+    assert runtime.egress_token_ttl_s == s.sandbox_egress_token_ttl_s
 
 
 def test_agent_sandbox_backend_injects_given_store() -> None:

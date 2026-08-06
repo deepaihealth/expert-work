@@ -201,6 +201,8 @@ python tools/deploy/rollback.py --to-tag v1.2.2  # 兜底路径
 
 命令:`docker compose run --rm migrate` 或容器内 `alembic upgrade head`。alembic revision id ≤ 32 字符(超长仅真 Postgres 报错)。
 
+**例外 —— 加索引迁移(0141/0142/0143)未用 `CONCURRENTLY`**:alembic 迁移跑在一个事务里,而 `CREATE INDEX CONCURRENTLY` 不允许在事务块内执行,所以这几条迁移都是普通(带锁的)`CREATE INDEX`,建索引期间会短暂持有写锁。多数受影响的表写少读多,窗口无感;`0143`(`sandbox_egress_audit_scan_idx`,建在 `sandbox_egress_audit` 表上)例外——这张表的写在沙箱出网请求路径上是 inline await 的(`credential-proxy` 的 `EgressProxy._record`,`services/credential-proxy/src/credential_proxy/egress_proxy.py`),建索引期间会短暂卡住沙箱出网请求。**升级到 `0143`(或更新版本)时挑低峰执行**,或提前评估当时的出网请求量。
+
 ## 11. 部署后验证
 
 - [ ] `curl -sf http://<host>:8000/healthz/ready` 返回 `status: ready`(所有依赖探针绿)。
