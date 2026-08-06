@@ -229,3 +229,31 @@ async def test_no_agent_meta_marks_errored(monkeypatch: pytest.MonkeyPatch) -> N
     row = await store.get(run_id=run_id, tenant_id=tenant)
     assert row is not None
     assert row.status is RunStatus.ERROR  # claimed then errored (unrecoverable)
+
+
+@pytest.mark.asyncio
+async def test_stop_is_bounded_when_a_sweep_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """卡死的 sweep 不能把关机拖到 SIGKILL —— stop() 等一小会儿就取消它。
+
+    lifespan 顺序 await 每个 worker 的 stop();这里少了上界,一个卡在
+    claim+启动 run 的 sweep 就能把整个进程的关机挂到 K8s 优雅期耗尽。
+    """
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    worker = _worker(store, runtime, interval_s=0.01)
+    entered = asyncio.Event()
+
+    async def _never_returns() -> int:
+        entered.set()
+        await asyncio.sleep(3600)
+        return 0
+
+    monkeypatch.setattr(worker, "run_once", _never_returns)
+    monkeypatch.setattr(worker_module, "_STOP_TIMEOUT_S", 0.05, raising=False)
+
+    worker.start()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    # 修复前:stop() 永远等下去,这里超时失败。
+    await asyncio.wait_for(worker.stop(), timeout=2)
+    assert worker._task is None

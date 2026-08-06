@@ -18,6 +18,7 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from expert_work.protocol import PROVIDER_CATALOG, Provider, Tool
+from orchestrator.tools.sandbox_image_contract import MAX_TIMEOUT_S
 
 #: Default tenant UUID assigned to header-less dev requests. ``00...00`` is
 #: deliberately the nil UUID so it sticks out in audit_log dumps.
@@ -225,6 +226,31 @@ class Settings(BaseSettings):
     #: 是两个不同的部署单元,没有共享 env 的机制)。Dev 默认值与
     #: credential-proxy / sandbox-supervisor 的 dev 默认一致,便于本地联调。
     sandbox_egress_token_secret: str = "dev-egress-token-secret-rotate-me"  # noqa: S105
+
+    #: 铸沙箱出网 token 的有效期。与 sandbox-supervisor 的
+    #: ``egress_token_ttl_s`` 解析到**同一个**环境变量
+    #: ``EXPERT_WORK_SANDBOX_EGRESS_TOKEN_TTL_S``(两侧前缀不同、字段名不同,
+    #: 拼出来是同一个名字,同 ``sandbox_egress_token_secret`` 的套路)——
+    #: ``test_shared_egress_settings_resolve_to_the_same_env_var`` 钉住这条。
+    #:
+    #: 补这个旋钮之前,云侧(``AgentSandboxClient``)只能吃 dataclass 默认值:
+    #: 运维在 supervisor 上调短 TTL,两个后端铸出的 token 有效期就差着倍数,
+    #: 而当时只比默认值的漂移闸完全看不见。上界与 supervisor 侧同款
+    #: (``le=7*24*60*60``);下界**不**同款——supervisor 没有
+    #: ``_max_warm_age_s()`` 这道热会话自愈闸,``gt=0`` 对它是安全的,但云后端
+    #: 的 ``AgentSandboxClient._max_warm_age_s()``(``egress_token_ttl_s // 2``)
+    #: 要求 ``_max_warm_age_s() + MAX_TIMEOUT_S < egress_token_ttl_s``
+    #: (``test_max_warm_age_leaves_room_under_the_egress_token_ttl``)才不至于
+    #: 让热会话先撞出网 407 才轮到强制重建——反解出 ``ttl > 2 * MAX_TIMEOUT_S``。
+    #: 下界钉这个不变式的边界而不是随手挑一个数,``MAX_TIMEOUT_S`` 优先从
+    #: orchestrator 那侧 import(而不是复述成新的字面量,又造一份会漂的副本)
+    #: ——control-plane 已经依赖 orchestrator 作为库(``runtime.py`` 就 import
+    #: 了 ``AgentSandboxClient``),这里不是新增的依赖方向。
+    #: ``test_max_warm_age_leaves_room_at_the_ttl_floor`` 钉住"下界本身"仍然
+    #: 满足这条不变式,而不只是钉默认值。
+    sandbox_egress_token_ttl_s: int = Field(
+        default=24 * 60 * 60, gt=2 * MAX_TIMEOUT_S, le=7 * 24 * 60 * 60
+    )
 
     #: ``secret://`` reference to the embedding API key — backs long-term
     #: memory (Stream J.3). ``None`` → no embedder; an agent that declares

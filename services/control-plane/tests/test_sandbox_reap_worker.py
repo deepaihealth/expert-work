@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from control_plane import sandbox_reap_worker as mod
 from control_plane.sandbox_reap_worker import SandboxReapWorker
 
 
@@ -121,3 +122,29 @@ def test_default_interval_is_lazier_than_the_supervisor_reaper() -> None:
         f"清扫间隔 {_INTERVAL_S}s 应当明显小于空闲 TTL {_IDLE_TTL_S}s"
         "(否则一个已空闲的沙箱要多等一整个周期才被回收),但也不该密到秒级。"
     )
+
+
+@pytest.mark.asyncio
+async def test_stop_is_bounded_when_a_sweep_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """卡死的 sweep 不能把关机拖到 SIGKILL —— stop() 等一小会儿就取消它。
+
+    lifespan 顺序 await 每个 worker 的 stop();这里少了上界,一个连不上
+    E2B 的 sweep 就能把整个进程的关机挂到 K8s 优雅期耗尽。
+    """
+    worker = SandboxReapWorker(runtime=FakeRuntime(), interval_s=0.01)  # type: ignore[arg-type]
+    entered = asyncio.Event()
+
+    async def _never_returns() -> int:
+        entered.set()
+        await asyncio.sleep(3600)
+        return 0
+
+    monkeypatch.setattr(worker, "sweep_once", _never_returns)
+    monkeypatch.setattr(mod, "_STOP_TIMEOUT_S", 0.05, raising=False)
+
+    worker.start()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    # 修复前:stop() 永远等下去,这里超时失败。
+    await asyncio.wait_for(worker.stop(), timeout=2)
+    assert worker._task is None

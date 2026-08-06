@@ -56,6 +56,20 @@ from orchestrator import AgentFactoryError, run_agent
 
 logger = logging.getLogger("expert_work.control_plane.orphan_sweep")
 
+#: ``stop()`` 等待当前这一轮 sweep 收尾的上限,超时就取消。刻意不写成别处
+#: 那种 ``interval + 5``:上界该由关机预算定,不是从轮询间隔派生 —— 同批
+#: 几个 worker 的 interval 是分钟级,那个式子给出的「上界」比 K8s 默认 30s
+#: 优雅期还长,等于没有上界。统一 5 秒:一轮正常 sweep 足够收尾,收不了尾
+#: 就取消 —— 与 reap/approval/egress 三个 sweep 不同,这里的 ``_task`` 只是
+#: 轮询循环:``_respawn`` 把实际的 agent run 铸成独立的 ``asyncio.create_task``
+#: 就返回,不 await 它,所以 5 秒超时最多打断的是"reclaim 到 spawn 之间"那个
+#: 窗口,而不是正在跑的 agent run 本身。这个模块自己就是"真正兜底"的那一层
+#: (模块 docstring 开头);它自己的 ``stop()`` 超时不能靠"下次启动重来"
+#: 兜底——这里被强制 cancel 打断,行为上与整个进程被 SIGKILL 时留下的
+#: abandoned-claim 状态等价(下一次 sweep 循环 —— 自己这个实例或另一个副本
+#: 的 —— 靠租约过期后重新发现并从 checkpoint 接管),只是回收时机更早。
+_STOP_TIMEOUT_S = 5.0
+
 _reclaimed_total = expert_work_counter(
     "expert_work_run_orphan_reclaimed_total",
     "Orphaned runs the failover sweep reclaimed + resumed from checkpoint.",
@@ -151,8 +165,12 @@ class OrphanSweep:
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:
-            await self._task
-            self._task = None
+            try:
+                await asyncio.wait_for(self._task, timeout=_STOP_TIMEOUT_S)
+            except (TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+            finally:
+                self._task = None
 
     async def _loop(self) -> None:
         while not self._stop.is_set():

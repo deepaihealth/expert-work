@@ -68,7 +68,10 @@ def test_no_warning_when_bypass_set(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         _rls_after_begin(MagicMock(), MagicMock(), connection)
 
-    assert caplog.records == []
+    # 只看本模块自己的 logger:caplog 抓的是所有冒泡上来的记录,全局零
+    # WARNING 断言会被无关噪音污染(#1077:CI 里其他测试遗留的 otel
+    # exporter 后台线程往 root 吐 retry WARNING,卡红过一个 deploy-only PR)。
+    assert [r.message for r in caplog.records if r.name == _LOGGER_NAME] == []
     connection.execute.assert_not_called()
 
 
@@ -81,5 +84,5 @@ def test_no_warning_when_tenant_set(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         _rls_after_begin(MagicMock(), MagicMock(), connection)
 
-    assert caplog.records == []
+    assert [r.message for r in caplog.records if r.name == _LOGGER_NAME] == []
     connection.execute.assert_called_once()

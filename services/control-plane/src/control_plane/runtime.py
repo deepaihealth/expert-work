@@ -1504,6 +1504,7 @@ def build_sandbox_runtime(
             template=settings.sandbox_e2b_template,
             store=sandbox_instance_store or InMemorySandboxInstanceStore(),
             egress_token_secret=settings.sandbox_egress_token_secret,
+            egress_token_ttl_s=settings.sandbox_egress_token_ttl_s,
             egress_proxy_host=settings.sandbox_egress_proxy_host,
             egress_proxy_port=settings.sandbox_egress_proxy_port,
         )

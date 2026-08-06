@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
+from control_plane import approval_metrics as mod
 from control_plane.approval_metrics import ApprovalGaugeWorker, _approvals_pending
 from expert_work.persistence import InMemoryApprovalStore
 from expert_work.protocol import ApprovalRecord, ApprovalStatus
@@ -90,3 +92,34 @@ async def test_start_refreshes_immediately_and_stop_joins() -> None:
     finally:
         await worker.stop()
     assert not worker.is_running
+
+
+@pytest.mark.asyncio
+async def test_stop_is_bounded_when_a_sweep_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """卡死的 sweep 不能把关机拖到 SIGKILL —— stop() 等一小会儿就取消它。
+
+    lifespan 顺序 await 每个 worker 的 stop();这里少了上界,一个连不上
+    数据库的 refresh 就能把整个进程的关机挂到 K8s 优雅期耗尽。
+    """
+
+    class _ExplodingStore(InMemoryApprovalStore):
+        async def count_pending(self) -> int:
+            raise RuntimeError("db away")
+
+    worker = ApprovalGaugeWorker(approval_store=_ExplodingStore(), interval_s=0.01)
+    entered = asyncio.Event()
+
+    async def _never_returns() -> bool:
+        entered.set()
+        await asyncio.sleep(3600)
+        return False
+
+    monkeypatch.setattr(worker, "refresh_once", _never_returns)
+    monkeypatch.setattr(mod, "_STOP_TIMEOUT_S", 0.05, raising=False)
+
+    worker.start()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    # 修复前:stop() 永远等下去,这里超时失败。
+    await asyncio.wait_for(worker.stop(), timeout=2)
+    assert worker._task is None

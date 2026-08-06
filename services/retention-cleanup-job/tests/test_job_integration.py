@@ -432,6 +432,77 @@ async def test_jwt_blacklist_expired_rows_deleted(
 
 
 @pytest.mark.asyncio
+async def test_sandbox_egress_audit_retention_deletes_old_rows(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """过了保留期的出网审计行被清掉,期内的留着。
+
+    这张表每次沙箱出网都写一行(``allowed`` 占绝大多数),PR-E 之前没有任何
+    清理路径 —— 只增不减。没有 per-tenant 覆盖,窗口是 job 级参数。
+
+    ``postgres_container`` 是 session 级共享,CI 的 integration job 一个进程
+    收集全部用例(``uv run pytest -m integration``,不带路径限定),
+    ``packages/expert-work-persistence/tests/test_sql_sandbox_egress_audit_store.py``
+    那几条用例往同一张表插行且从不清理 —— 同 Task 4 那条
+    ``test_retention_role_can_delete_from_the_audit_table`` docstring 记的教训
+    (该文件 192-194 行)。所以这里不能断言表(或清扫计数)的绝对行数:
+    ``remaining`` 用本用例自造的 ``tenant`` 限定;清扫是否恰好删了本用例插的
+    那一行,用同一个「早于 90 天窗口」的全局谓词在 ``run_once`` 前后各数一遍、
+    断言差值 —— 清扫 SQL 本身没有 tenant 谓词,没法像 ``remaining`` 那样直接
+    按 tenant 过滤。
+    """
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant = uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                insert = text(
+                    "INSERT INTO sandbox_egress_audit "
+                    "(tenant_id, agent_name, agent_version, sandbox_id, target_host, "
+                    " target_port, verdict, bytes_up, bytes_down, duration_ms, occurred_at) "
+                    "VALUES (:t, 'alpha', '1.0.0', 'sbx-1', 'api.openai.com', 443, "
+                    " 'allowed', 1, 2, 3, now() - (:age || ' days')::interval)"
+                )
+                conn.execute(insert, {"t": str(tenant), "age": 100})  # 过期
+                conn.execute(insert, {"t": str(tenant), "age": 1})  # 期内
+        finally:
+            admin.dispose()
+
+        # 与 job.py::_delete_sandbox_egress_audit 同款谓词 —— 全局、无 tenant 过滤。
+        window_query = text(
+            "SELECT count(*) FROM sandbox_egress_audit "
+            "WHERE occurred_at < now() - make_interval(days => :days)"
+        )
+        async with worker_engine.begin() as conn:
+            before = (await conn.execute(window_query, {"days": 90})).scalar_one()
+
+        sf = create_async_session_factory(worker_engine)
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            batch_size=10000,
+            sandbox_egress_audit_retention_days=90,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            after = (await conn.execute(window_query, {"days": 90})).scalar_one()
+        assert before - after == 1
+        assert report.sandbox_egress_audit_deleted == before - after
+
+        async with worker_engine.begin() as conn:
+            remaining = (
+                await conn.execute(
+                    text("SELECT count(*) FROM sandbox_egress_audit WHERE tenant_id = :t"),
+                    {"t": str(tenant)},
+                )
+            ).scalar_one()
+        assert remaining == 1
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_run_once_idempotent_on_empty_state(
     db_fixture: tuple[AsyncEngine, AsyncEngine, str],
 ) -> None:

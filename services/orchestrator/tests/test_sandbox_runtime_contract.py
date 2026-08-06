@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -607,6 +608,120 @@ def test_egress_token_ttl_matches_supervisor_default() -> None:
         " 活过期就是出网一律 407 且没有自愈路径)。"
     )
 
+    # 全分支终审 I-1:``build_sandbox_runtime``(control_plane/runtime.py)现在
+    # 总是显式传 ``settings.sandbox_egress_token_ttl_s`` 给 ``AgentSandboxClient``
+    # 的构造函数——上面 ``client_default`` 那条比较的 dataclass 默认值再也到不了
+    # 生产,只在没有 Settings 注入的裸构造(比如这份契约测试自己)里才会用到。
+    # 权威值变成了 control-plane 的 ``Settings.sandbox_egress_token_ttl_s``,这里
+    # 补第三道钉子,否则调低这个字段的默认值不会被任何测试发现。
+    from control_plane.settings import Settings
+
+    cp_default = Settings.model_fields["sandbox_egress_token_ttl_s"].default
+    assert cp_default == supervisor_default, (
+        f"control-plane 的 Settings.sandbox_egress_token_ttl_s 默认值({cp_default}s)"
+        f" 与 docker supervisor 的 egress_token_ttl_s 默认值({supervisor_default}s)"
+        " 不一致 —— runtime.py 现在总是显式传 settings.sandbox_egress_token_ttl_s"
+        " 给 AgentSandboxClient,这个字段才是云后端实际铸出的 TTL,AgentSandboxClient"
+        " 自己的 dataclass 默认值已经到不了生产。"
+    )
+
+
+#: 仓库根 —— 本文件在 services/orchestrator/tests/ 下,上溯三级。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: 两侧共享的出网配置项。左=control-plane ``Settings`` 字段名,
+#: 右=sandbox-supervisor ``SandboxSupervisorSettings`` 字段名。
+_SHARED_EGRESS_FIELDS = [
+    ("sandbox_egress_token_secret", "egress_token_secret"),
+    ("sandbox_egress_token_ttl_s", "egress_token_ttl_s"),
+]
+
+
+def test_shared_egress_settings_resolve_to_the_same_env_var() -> None:
+    """两侧的同名配置必须解析到**同一个**环境变量名。
+
+    这是「比真实配置」的结构性保证:名字一样,部署里改一次两个后端一起改;
+    名字一旦分叉(比如有人给 control-plane 那侧改了字段名),运维设一个变量
+    只会生效一边,而比默认值的闸完全看不见这种劈叉。
+    """
+    from control_plane.settings import Settings
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    cp_prefix = Settings.model_config["env_prefix"]
+    sup_prefix = SandboxSupervisorSettings.model_config["env_prefix"]
+
+    for cp_field, sup_field in _SHARED_EGRESS_FIELDS:
+        assert cp_field in Settings.model_fields, f"control-plane 少了 {cp_field}"
+        assert sup_field in SandboxSupervisorSettings.model_fields, f"supervisor 少了 {sup_field}"
+        cp_env = f"{cp_prefix}{cp_field}".upper()
+        sup_env = f"{sup_prefix}{sup_field}".upper()
+        assert cp_env == sup_env, (
+            f"control-plane 的 {cp_field} 读 {cp_env},supervisor 的 {sup_field} 读"
+            f" {sup_env} —— 两个名字不一样,部署里设一个只会生效一边。"
+        )
+
+
+def test_compose_never_sets_a_shared_egress_var_for_only_one_service() -> None:
+    """docker-compose 里这些变量要么两边都设、要么都不设,且取值表达式相同。
+
+    compose 是唯一两个服务同时在跑的地方(k8s 上没有 sandbox-supervisor
+    部署)。control-plane 走 ``x-control-plane-base`` 锚点,supervisor 有自己的
+    environment 块 —— 只给一边设,就是两个后端铸出不同待遇的 token,而且
+    「默认值一致」的闸看不见。
+    """
+    compose = (_REPO_ROOT / "infra" / "docker-compose.yml").read_text(encoding="utf-8")
+    # 锚点块:从 `x-control-plane-base:` 到下一个顶格键;supervisor 块:从
+    # `  sandbox-supervisor:` 到下一个同级服务键。
+    cp_block = re.search(r"^x-control-plane-base:.*?(?=^\S)", compose, re.S | re.M)
+    sup_block = re.search(r"^  sandbox-supervisor:.*?(?=^  \S)", compose, re.S | re.M)
+    assert cp_block is not None, "compose 里找不到 x-control-plane-base 锚点"
+    assert sup_block is not None, "compose 里找不到 sandbox-supervisor 服务块"
+
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    prefix = SandboxSupervisorSettings.model_config["env_prefix"]
+    for _cp_field, sup_field in _SHARED_EGRESS_FIELDS:
+        var = f"{prefix}{sup_field}".upper()
+        cp_line = re.search(rf"^\s*{var}:\s*(\S.*)$", cp_block.group(0), re.M)
+        sup_line = re.search(rf"^\s*{var}:\s*(\S.*)$", sup_block.group(0), re.M)
+        assert (cp_line is None) == (sup_line is None), (
+            f"{var} 只在一边设了(control-plane={cp_line is not None},"
+            f" supervisor={sup_line is not None})—— 两个后端会拿到不同的值。"
+        )
+        if cp_line is not None and sup_line is not None:
+            assert cp_line.group(1).strip() == sup_line.group(1).strip(), (
+                f"{var} 两边取值表达式不同:control-plane={cp_line.group(1).strip()!r}"
+                f" vs supervisor={sup_line.group(1).strip()!r}"
+            )
+
+    # 全分支终审 M-4 —— 上面的循环只比 control-plane 锚点与 supervisor 块,
+    # 从没看过真正的验证方:credential-proxy。它的 egress secret 键名不同
+    # (``EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET``,不在 _SHARED_EGRESS_FIELDS
+    # 那组"两侧同名"字段里),只改 credential-proxy 那一行,铸方(control-plane
+    # / supervisor)与验方(proxy)就分家了——proxy 会拒掉云侧/supervisor 铸的
+    # 每一个 token(见 x-control-plane-base 里那条注释),而这条测试此前对此
+    # 完全失明。
+    cred_proxy_block = re.search(r"^  credential-proxy:.*?(?=^  \S)", compose, re.S | re.M)
+    assert cred_proxy_block is not None, "compose 里找不到 credential-proxy 服务块"
+
+    sup_secret_var = f"{prefix}egress_token_secret".upper()
+    sup_secret_line = re.search(rf"^\s*{sup_secret_var}:\s*(\S.*)$", sup_block.group(0), re.M)
+    assert sup_secret_line is not None, f"{sup_secret_var} 在 supervisor 块里找不到了"
+    cred_proxy_secret_line = re.search(
+        r"^\s*EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET:\s*(\S.*)$",
+        cred_proxy_block.group(0),
+        re.M,
+    )
+    assert cred_proxy_secret_line is not None, (
+        "compose 里 credential-proxy 块找不到 EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET"
+    )
+    assert cred_proxy_secret_line.group(1).strip() == sup_secret_line.group(1).strip(), (
+        "credential-proxy 的 EXPERT_WORK_CRED_PROXY_EGRESS_TOKEN_SECRET="
+        f"{cred_proxy_secret_line.group(1).strip()!r} 与铸 token 那一方(supervisor/"
+        f"control-plane)的 {sup_secret_var}={sup_secret_line.group(1).strip()!r} 不一致"
+        " —— proxy 会拒掉铸出来的每一个 token。"
+    )
+
 
 def test_idle_ttl_matches_supervisor_default() -> None:
     """独立审查追加的漂移检测(task-9-report.md § 11.4 Minor-2)。
@@ -697,4 +812,47 @@ def test_max_warm_age_leaves_room_under_the_egress_token_ttl() -> None:
         f"年龄封顶 {client._max_warm_age_s()}s 加一次最长工具调用"
         f"({MAX_TIMEOUT_S}s)必须仍然小于 token TTL {client.egress_token_ttl_s}s,"
         "否则 cap 命中之后、重建完成之前那次收尾调用可能跑到 token 过期。"
+    )
+
+
+def test_max_warm_age_leaves_room_at_the_ttl_floor() -> None:
+    """全分支终审 I-3 —— 上一条测试只钉了**默认值**(24h)下不变式成立,没钉
+    ``settings.py`` 的 ``sandbox_egress_token_ttl_s`` **下界本身**选得够不够高。
+    运维可以把这个字段配到任意大于下界的值;下界选低了(比如本 PR 之前的
+    ``gt=0``),照样能配出一个让上一条测试永远测不到、但在生产上让 #1b 的
+    自愈闸失效的 TTL —— 症状是出网全量 407 且没有自愈路径
+    (``docs/runbooks/control-plane.md`` 记的那个最难查的形态)。
+
+    从 ``Settings.model_fields`` 读**实际配置的** ``Gt`` 下界,而不是重述字面量
+    ——手法同 ``_supervisor_max_timeout_s``(本文件上方):重述就是又造一份会
+    漂的副本,将来谁把下界调松都测不出来。这里故意反着来:直接拿"字段允许
+    的最小值"喂给 ``AgentSandboxClient``,如果下界选得不够高,这条不变式会在
+    这个最小值上先破——不用等到运维真的配了一个危险值。
+    """
+    from annotated_types import Gt
+
+    from control_plane.settings import Settings
+    from orchestrator.tools.agent_sandbox import AgentSandboxClient
+    from orchestrator.tools.sandbox_image_contract import MAX_TIMEOUT_S
+
+    field_info = Settings.model_fields["sandbox_egress_token_ttl_s"]
+    bounds = [m.gt for m in field_info.metadata if isinstance(m, Gt)]
+    assert len(bounds) == 1, f"sandbox_egress_token_ttl_s 的下界约束不再是唯一一条 Gt:{bounds}"
+    minimum_ttl = int(bounds[0]) + 1
+
+    client = AgentSandboxClient(
+        domain="gw.example.com",
+        api_key="k",
+        template="expert-work-sandbox",
+        store=object(),  # type: ignore[arg-type]  # 方法不碰 store,见上方 docstring。
+        egress_token_secret="s3cret",
+        egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
+        egress_proxy_port=8081,
+        egress_token_ttl_s=minimum_ttl,
+    )
+
+    assert client._max_warm_age_s() + MAX_TIMEOUT_S < client.egress_token_ttl_s, (
+        f"字段允许的最小 TTL({minimum_ttl}s)下,年龄封顶 {client._max_warm_age_s()}s"
+        f" 加一次最长工具调用({MAX_TIMEOUT_S}s)已经不小于 TTL 本身 —— 下界选低了,"
+        " 运维配得出一个让 #1b 自愈闸失效的值,且默认值那道闸完全看不见。"
     )
