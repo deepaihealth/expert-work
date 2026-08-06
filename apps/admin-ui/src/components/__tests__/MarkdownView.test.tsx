@@ -25,10 +25,25 @@ describe("MarkdownView", () => {
     expect(link.getAttribute("rel")).toContain("noreferrer");
   });
 
-  it("does not execute raw HTML from untrusted output", () => {
+  it("escapes raw HTML from untrusted output instead of rendering it", () => {
     const { container } = render(
-      <MarkdownView>{"hi <script>alert(1)</script> there"}</MarkdownView>,
+      <MarkdownView>
+        {'hi <b>BOLD</b> <img src=x onerror="alert(1)"> <script>alert(1)</script>'}
+      </MarkdownView>,
     );
-    expect(container.querySelector("script")).toBeNull();
+    const scope = container.querySelector(".ew-markdown");
+
+    // 断言 ``disableParsingRawHTML`` 的**真实效果**:整段 raw HTML 被转义成
+    // 文本,一个元素都不生成。
+    //
+    // 早先这里只断言 ``querySelector("script")`` 为 null。那条在
+    // markdown-to-jsx 9.x 下恒真、杀不死变异:把选项改成 ``false`` 让它真的
+    // 解析 raw HTML,9.x 也只会把 ``script``/``iframe`` 降级成 ``<span>``、
+    // 把 ``img`` 的 ``onerror`` 剥掉,于是"没有 script 元素"这件事与选项开
+    // 关无关。2026-08-06 升级到 9.10.1 时用变异验证发现的——测试仍绿但已经
+    // 不再守护任何东西。下面三条断言在选项改成 ``false`` 时会红。
+    expect(scope?.querySelectorAll("*")).toHaveLength(0);
+    expect(scope?.textContent).toContain("<b>BOLD</b>");
+    expect(scope?.textContent).toContain("onerror");
   });
 });
