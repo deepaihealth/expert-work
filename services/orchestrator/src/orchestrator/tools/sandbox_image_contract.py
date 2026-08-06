@@ -69,11 +69,11 @@ SANDBOX_IMAGE_ENV = {
 #:
 #: * ``DEFAULT_TIMEOUT_S`` —— 三方对齐(supervisor 的
 #:   ``SandboxSupervisorSettings.default_timeout_s`` + ``runner.py:28-37``)
-#: * ``MAX_TIMEOUT_S`` —— 钉 supervisor 的 **HTTP 边界**
-#:   ``schemas.ExecRequest.timeout_s`` 的 ``le``,不是 ``runner.py`` 的同名
-#:   常量:超范围的 ``timeout_s`` 在 schema 就被 422 掉,``runner.py`` 那个
-#:   clamp 在 HTTP 路径上根本走不到(全分支终审复审发现)。runner.py 侧的值
-#:   因此**没有闸钉着**——它今天是死代码,哪天 supervisor 改成直调就得补闸
+#: * ``MAX_TIMEOUT_S`` —— 主钉 supervisor 的 **HTTP 边界**
+#:   ``schemas.ExecRequest.timeout_s`` 的 ``le``:超范围的 ``timeout_s`` 在
+#:   schema 就被 422 掉,``runner.py`` 那个 clamp 在 HTTP 路径上根本走不到
+#:   (全分支终审复审发现)。runner.py 侧的同名常量此前没闸钉着,PR-C #9 起
+#:   也一并钉住(防哪天 supervisor 改成直调时静默分叉)
 #: * ``MAX_OUTPUT_CHARS`` —— 钉 ``runner.py:28-37``(截断真发生在那里)
 #:
 #: 对应的闸都在 ``test_exec_contract_constants_match_the_sandbox_image``。

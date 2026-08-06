@@ -555,8 +555,8 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
         f"AgentSandboxClient.exec 把 timeout_s clamp 到 {MAX_TIMEOUT_S}s,而 supervisor 的"
         f" HTTP 入口(schemas.ExecRequest.timeout_s 的 le)只接受到 {supervisor_max}s"
         " —— 同一次 exec 请求在两个后端会拿到不同待遇。注意这里刻意不比 runner.py 的"
-        " MAX_TIMEOUT_S:那个 clamp 在 HTTP 路径上够不着(schema 先返 422),钉它等于钉"
-        " 一段死代码。"
+        " MAX_TIMEOUT_S:那个 clamp 在 HTTP 路径上够不着(schema 先返 422);runner 侧"
+        " 的值由下面的 PR-C #9 断言单独钉住。"
     )
     assert MAX_OUTPUT_CHARS == runner["MAX_OUTPUT_CHARS"], (
         f"AgentSandboxClient 的输出上限 {MAX_OUTPUT_CHARS} 与 infra/sandbox-image/runner.py"
