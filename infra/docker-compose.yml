@@ -37,6 +37,12 @@ x-control-plane-base: &control-plane-base
     EXPERT_WORK_TOOL_OUTPUT_BUDGET: ${EXPERT_WORK_TOOL_OUTPUT_BUDGET:-1}
     EXPERT_WORK_QUOTA_REDIS_URL: redis://redis:6379/0
     EXPERT_WORK_SANDBOX_SUPERVISOR_URL: http://sandbox-supervisor:8000
+    # 出网 token 的 HMAC secret。sandbox-supervisor 与 credential-proxy 都从
+    # 同一个 ${EXPERT_WORK_EGRESS_TOKEN_SECRET} 取值;control-plane 在
+    # agent_sandbox 后端下自己铸 token,过去这里没设、靠两边 dev 默认值恰好
+    # 相同而「巧合地一致」——真设了 .env 里那个变量就会只生效一半,proxy 会
+    # 拒掉云侧铸的每一个 token。test_compose_never_sets_a_shared_egress_var_for_only_one_service 钉住。
+    EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET: ${EXPERT_WORK_EGRESS_TOKEN_SECRET:-dev-egress-token-secret-rotate-me}
     # Trace export (A.8) — reached only when the observability profile
     # is also up; the SDK buffers + drops gracefully when it is not.
     EXPERT_WORK_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces

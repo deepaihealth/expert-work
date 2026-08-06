@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -606,6 +607,75 @@ def test_egress_token_ttl_matches_supervisor_default() -> None:
         " 调低这个值之前先确认热会话的最长存活期仍然短于它(connect 不重发 token,"
         " 活过期就是出网一律 407 且没有自愈路径)。"
     )
+
+
+#: 仓库根 —— 本文件在 services/orchestrator/tests/ 下,上溯三级。
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: 两侧共享的出网配置项。左=control-plane ``Settings`` 字段名,
+#: 右=sandbox-supervisor ``SandboxSupervisorSettings`` 字段名。
+_SHARED_EGRESS_FIELDS = [
+    ("sandbox_egress_token_secret", "egress_token_secret"),
+    ("sandbox_egress_token_ttl_s", "egress_token_ttl_s"),
+]
+
+
+def test_shared_egress_settings_resolve_to_the_same_env_var() -> None:
+    """两侧的同名配置必须解析到**同一个**环境变量名。
+
+    这是「比真实配置」的结构性保证:名字一样,部署里改一次两个后端一起改;
+    名字一旦分叉(比如有人给 control-plane 那侧改了字段名),运维设一个变量
+    只会生效一边,而比默认值的闸完全看不见这种劈叉。
+    """
+    from control_plane.settings import Settings
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    cp_prefix = Settings.model_config["env_prefix"]
+    sup_prefix = SandboxSupervisorSettings.model_config["env_prefix"]
+
+    for cp_field, sup_field in _SHARED_EGRESS_FIELDS:
+        assert cp_field in Settings.model_fields, f"control-plane 少了 {cp_field}"
+        assert sup_field in SandboxSupervisorSettings.model_fields, f"supervisor 少了 {sup_field}"
+        cp_env = f"{cp_prefix}{cp_field}".upper()
+        sup_env = f"{sup_prefix}{sup_field}".upper()
+        assert cp_env == sup_env, (
+            f"control-plane 的 {cp_field} 读 {cp_env},supervisor 的 {sup_field} 读"
+            f" {sup_env} —— 两个名字不一样,部署里设一个只会生效一边。"
+        )
+
+
+def test_compose_never_sets_a_shared_egress_var_for_only_one_service() -> None:
+    """docker-compose 里这些变量要么两边都设、要么都不设,且取值表达式相同。
+
+    compose 是唯一两个服务同时在跑的地方(k8s 上没有 sandbox-supervisor
+    部署)。control-plane 走 ``x-control-plane-base`` 锚点,supervisor 有自己的
+    environment 块 —— 只给一边设,就是两个后端铸出不同待遇的 token,而且
+    「默认值一致」的闸看不见。
+    """
+    compose = (_REPO_ROOT / "infra" / "docker-compose.yml").read_text(encoding="utf-8")
+    # 锚点块:从 `x-control-plane-base:` 到下一个顶格键;supervisor 块:从
+    # `  sandbox-supervisor:` 到下一个同级服务键。
+    cp_block = re.search(r"^x-control-plane-base:.*?(?=^\S)", compose, re.S | re.M)
+    sup_block = re.search(r"^  sandbox-supervisor:.*?(?=^  \S)", compose, re.S | re.M)
+    assert cp_block is not None, "compose 里找不到 x-control-plane-base 锚点"
+    assert sup_block is not None, "compose 里找不到 sandbox-supervisor 服务块"
+
+    from sandbox_supervisor.settings import SandboxSupervisorSettings
+
+    prefix = SandboxSupervisorSettings.model_config["env_prefix"]
+    for _cp_field, sup_field in _SHARED_EGRESS_FIELDS:
+        var = f"{prefix}{sup_field}".upper()
+        cp_line = re.search(rf"^\s*{var}:\s*(\S.*)$", cp_block.group(0), re.M)
+        sup_line = re.search(rf"^\s*{var}:\s*(\S.*)$", sup_block.group(0), re.M)
+        assert (cp_line is None) == (sup_line is None), (
+            f"{var} 只在一边设了(control-plane={cp_line is not None},"
+            f" supervisor={sup_line is not None})—— 两个后端会拿到不同的值。"
+        )
+        if cp_line is not None and sup_line is not None:
+            assert cp_line.group(1).strip() == sup_line.group(1).strip(), (
+                f"{var} 两边取值表达式不同:control-plane={cp_line.group(1).strip()!r}"
+                f" vs supervisor={sup_line.group(1).strip()!r}"
+            )
 
 
 def test_idle_ttl_matches_supervisor_default() -> None:

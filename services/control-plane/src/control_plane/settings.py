@@ -226,6 +226,17 @@ class Settings(BaseSettings):
     #: credential-proxy / sandbox-supervisor 的 dev 默认一致,便于本地联调。
     sandbox_egress_token_secret: str = "dev-egress-token-secret-rotate-me"  # noqa: S105
 
+    #: 铸沙箱出网 token 的有效期。与 sandbox-supervisor 的
+    #: ``egress_token_ttl_s`` 解析到**同一个**环境变量
+    #: ``EXPERT_WORK_SANDBOX_EGRESS_TOKEN_TTL_S``(两侧前缀不同、字段名不同,
+    #: 拼出来是同一个名字,同 ``sandbox_egress_token_secret`` 的套路)——
+    #: ``test_shared_egress_settings_resolve_to_the_same_env_var`` 钉住这条。
+    #:
+    #: 补这个旋钮之前,云侧(``AgentSandboxClient``)只能吃 dataclass 默认值:
+    #: 运维在 supervisor 上调短 TTL,两个后端铸出的 token 有效期就差着倍数,
+    #: 而当时只比默认值的漂移闸完全看不见。上下界与 supervisor 侧同款。
+    sandbox_egress_token_ttl_s: int = Field(default=24 * 60 * 60, gt=0, le=7 * 24 * 60 * 60)
+
     #: ``secret://`` reference to the embedding API key — backs long-term
     #: memory (Stream J.3). ``None`` → no embedder; an agent that declares
     #: ``memory.long_term`` fails at build time with a clear error.
