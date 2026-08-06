@@ -21,7 +21,7 @@ weasyprint==68.0       # HTML+CSS → PDF (report generation)
 # pydyf 0.12.x reworked the Stream API (``super().transform`` AttributeError at
 # write_pdf time). 0.11.0 is the newest pydyf compatible with this weasyprint.
 pydyf==0.11.0          # weasyprint PDF backend (API-pinned, see above)
-Pillow==12.2.0         # image read/write/convert
+Pillow==12.3.0         # image read/write/convert
 matplotlib==3.9.2      # charts (CJK rendering via fonts-noto-cjk)
 # route ① §5.4 — Python bridges to the new apt binaries (soffice/poppler/ffmpeg).
 pdf2image==1.17.0      # PDF→image; wraps the poppler-utils binaries
