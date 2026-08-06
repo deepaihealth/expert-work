@@ -15,3 +15,36 @@ updates:
       python-deps:
         patterns:
           - "*"
+
+  # apps/admin-ui(pnpm-lock.yaml 归 npm 生态)与 infra/sandbox-image 此前都
+  # 不在本文件里,意味着只有 Dependabot **security updates** 会碰它们——那条
+  # 路径不读本文件,只在已经攒出 CVE 之后才被动开 PR,且对传递依赖(补丁在
+  # 传递链上而非直接依赖里)常常连 PR 都开不出来。2026-08-06 清点时 admin-ui
+  # 攒了 4 条 high(axios / postcss / fast-uri / brace-expansion)、
+  # sandbox-image 攒了 2 个包 4 条 high(Pillow / pypdf),全部是这样漂出来的。
+  # 补上常规版本更新,让包在变成安全事件之前就跟着走。
+  - package-ecosystem: "npm"
+    directory: "/apps/admin-ui"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # 只把 minor/patch 打成一组。major 刻意留在组外单独开 PR:react-router
+      # 6→7 这类要单独评估的改动一旦混进来,会连坐让整组 patch 都合不了。
+      admin-ui-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # 沙箱镜像的 Python 依赖。注意合并这类 PR 只改仓库:镜像要重建推 ACR、
+  # SandboxSet 换 tag,测试/生产集群才吃到新版本。
+  - package-ecosystem: "pip"
+    directory: "/infra/sandbox-image"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      sandbox-image-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

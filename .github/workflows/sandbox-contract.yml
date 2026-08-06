@@ -59,7 +59,20 @@ jobs:
     # 收到推送才会触发)和 workflow_dispatch(需要本仓库协作者权限才能手动
     # 触发)两种场景不受影响,永远有 secrets,照常跑并接受硬失败检查——这个
     # 仓库是 public 的,fork PR 是真实会发生的场景,不是纸面假设。
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    #
+    # dependabot 是同一个盲区的第二种形态,上面那条 head-repo 判据单独漏掉
+    # 了它:dependabot 在**本仓库内**建分支,head repo 就是本仓库,判据放行
+    # ——但 GitHub 给 dependabot 触发的 run 注入的是另一套 Dependabot
+    # secrets,普通 Actions secrets 同样解析成空字符串。#1103(pypdf bump,
+    # 命中 `infra/sandbox-image/**` 路径过滤)实测就是这么红的,日志里写着
+    # `Secret source: Dependabot` 而凭据检查步骤拿到空串。不把 E2B key 补进
+    # Dependabot secrets 是刻意的:那等于把真栈凭据暴露给一个内容受上游包
+    # registry 影响的上下文,而依赖 bump 本来也碰不到两套 SandboxRuntime
+    # 实现之间的漂移——这个 job 唯一要防的就是那个。
+    if: >-
+      github.event_name != 'pull_request'
+      || (github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
     # 冷启单条 30-40s(2026-08-04 探针实测)——7 条 × 冷启上限 + setup 步骤,
     # 留够余量。
