@@ -51,7 +51,11 @@ def run_once(code: str, timeout_s: int) -> Response:
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
-            [sys.executable, "-I", "-c", code],
+            # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
+            # site out of sys.path and silently breaks `pip install --user`
+            # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
+            # isolation; -P keeps the script dir / cwd off sys.path.
+            [sys.executable, "-E", "-P", "-c", code],
             capture_output=True,
             text=True,
             timeout=timeout_s,

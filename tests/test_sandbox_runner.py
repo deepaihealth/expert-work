@@ -76,6 +76,21 @@ def test_run_once_caps_oversized_output() -> None:
     assert "truncated" in stdout
 
 
+def test_run_once_child_flags_enable_user_site_and_safe_path() -> None:
+    # PR-C — the child must run `-E -P`, NOT `-I`: `-I` implies `-s`, which
+    # kicks the user site out of sys.path and silently breaks the image's
+    # PIP_USER=1 on-demand install flow (installs succeed, imports fail).
+    result = runner.run_once(
+        "import sys; print(sys.flags.no_user_site, sys.flags.safe_path, "
+        "sys.flags.ignore_environment, sys.flags.isolated)",
+        10,
+    )
+    assert result["exit_code"] == 0
+    # no_user_site=0 (user site ON), safe_path=True (-P; this flag is a bool,
+    # unlike the others), ignore_environment=1 (-E), isolated=0 (not -I).
+    assert result["stdout"].strip() == "0 True 1 0"
+
+
 # ---------- handle_request ----------
 
 

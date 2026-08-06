@@ -167,7 +167,7 @@ COPY runner.py /opt/runner.py
 
 # Egress urllib shim (sandbox-egress §3.5): placed in the GLOBAL site-packages
 # so Python auto-imports it at startup — including under the runner's
-# `python -I -c` (isolated mode still runs `site`). No-op unless the supervisor
+# `python -E -P -c` (still runs `site`). No-op unless the supervisor
 # injects EXPERT_WORK_EGRESS_PROXY_AUTH (egress on). Makes stdlib urllib send the
 # proxy token on CONNECT like requests/httpx already do.
 COPY sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py

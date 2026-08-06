@@ -68,3 +68,45 @@ def test_shim_preserves_client_supplied_auth(monkeypatch: pytest.MonkeyPatch) ->
         assert conn._tunnel_headers["Proxy-Authorization"] == "Basic CLIENTOWN"
     finally:
         http.client.HTTPConnection.set_tunnel = orig  # type: ignore[method-assign]
+
+
+def test_shim_adds_proxy_auth_to_plain_http_proxy_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PR-C — plain-HTTP requests never reach set_tunnel; stdlib's own
+    # proxy_open only sends the header when the proxy URL carries BOTH a
+    # user and a password (`if user and password`), and ours is
+    # `http://<token>:@host` (empty password) → 407 without this patch.
+    import urllib.request
+
+    orig = urllib.request.ProxyHandler.proxy_open
+    calls: list[object] = []
+
+    def _stub(self, req, proxy, type):
+        calls.append(req)
+        return None
+
+    urllib.request.ProxyHandler.proxy_open = _stub
+    try:
+        _load_shim(monkeypatch, "QUJDOg==")
+        req = urllib.request.Request("http://example.com/path")
+        handler = urllib.request.ProxyHandler({"http": "http://proxy:8081"})
+        handler.proxy_open(req, "http://proxy:8081", "http")
+        assert calls, "patched proxy_open must delegate to the original"
+        assert req.get_header("Proxy-authorization", "").startswith("Basic ")
+    finally:
+        urllib.request.ProxyHandler.proxy_open = orig
+
+
+def test_shim_preserves_client_auth_on_plain_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.request
+
+    orig = urllib.request.ProxyHandler.proxy_open
+    urllib.request.ProxyHandler.proxy_open = lambda self, req, proxy, type: None
+    try:
+        _load_shim(monkeypatch, "QUJDOg==")
+        req = urllib.request.Request("http://example.com/path")
+        req.add_header("Proxy-authorization", "Basic client-own")
+        handler = urllib.request.ProxyHandler({"http": "http://proxy:8081"})
+        handler.proxy_open(req, "http://proxy:8081", "http")
+        assert req.get_header("Proxy-authorization") == "Basic client-own"
+    finally:
+        urllib.request.ProxyHandler.proxy_open = orig

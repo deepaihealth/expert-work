@@ -1,5 +1,6 @@
 """Sandbox-image site hook — make stdlib ``urllib`` authenticate to the
-transparent egress proxy on HTTPS ``CONNECT`` (sandbox-egress §3.5).
+transparent egress proxy on both HTTPS ``CONNECT`` and plain-HTTP proxying
+(sandbox-egress §3.5).
 
 Why this exists
 ---------------
@@ -19,15 +20,21 @@ patch ``http.client.HTTPConnection.set_tunnel`` to add ``Proxy-Authorization``
 to every ``CONNECT`` that does not already set it. urllib routes proxied HTTPS
 through ``set_tunnel``, so this transparently fixes it. Clients that already send
 the header keep theirs (``setdefault``), so ``requests``/``httpx`` are untouched.
+A second patch on ``urllib.request.ProxyHandler.proxy_open`` does the same for
+plain-``http://`` requests, which never reach ``set_tunnel`` — stdlib only
+sends the header itself when the proxy URL has both a user and a non-empty
+password.
 
 Loading
 -------
 Python auto-imports ``sitecustomize`` from the global site-packages at startup.
-The sandbox runner runs submitted code via ``python -I -c`` (isolated mode):
-``-I`` is ``-E -s`` — it ignores ``PYTHON*`` env and the *user* site dir, but it
-is **not** ``-S``, so the ``site`` module still initializes and still imports this
-module from the global site-packages. ``-E`` only suppresses ``PYTHON*`` config
-env, so ``EXPERT_WORK_EGRESS_PROXY_AUTH`` is still readable.
+Both sandbox runners execute submitted code via ``python -E -P`` (the docker
+runner's ``-c`` child and the cloud backend's script file — PR-C; formerly
+``-I``, whose implied ``-s`` also broke ``pip install --user``): ``-E`` only
+suppresses ``PYTHON*`` config env, so ``EXPERT_WORK_EGRESS_PROXY_AUTH`` is
+still readable, and neither flag is ``-S``/``-s``, so the ``site`` module
+still imports this module from the global site-packages and the *user* site
+stays on ``sys.path``.
 """
 
 from __future__ import annotations
@@ -50,3 +57,23 @@ if _AUTH:
         return _orig_set_tunnel(self, host, port=port, headers=merged, **kwargs)
 
     http.client.HTTPConnection.set_tunnel = _set_tunnel  # type: ignore[method-assign]
+
+    import urllib.request
+
+    _orig_proxy_open = urllib.request.ProxyHandler.proxy_open
+
+    def _proxy_open(self, req, proxy, type):  # type: ignore[no-untyped-def]
+        # Plain-HTTP requests through the proxy never reach set_tunnel, and
+        # stdlib's own proxy_open only sends Proxy-Authorization when the
+        # proxy URL carries BOTH a user and a password (`if user and
+        # password:`) — ours is `http://<token>:@host` (empty password), so
+        # stdlib drops the credential and the proxy answers 407. Mirror
+        # stdlib's own header spelling; never override a client's own value.
+        # For https:// URLs do_open later migrates this header into the
+        # CONNECT tunnel headers — harmless overlap with the set_tunnel
+        # patch above (both are setdefault-shaped).
+        if not req.has_header("Proxy-authorization"):
+            req.add_header("Proxy-authorization", _PROXY_AUTH_HEADER)
+        return _orig_proxy_open(self, req, proxy, type)
+
+    urllib.request.ProxyHandler.proxy_open = _proxy_open
