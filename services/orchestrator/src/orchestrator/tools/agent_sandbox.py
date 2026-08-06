@@ -167,6 +167,27 @@ _WARM_RECONNECT_DESTROY_REASON = "warm_reconnect_failed"
 #: ``destroy_reason`` can tell "token 快到期,主动换血" from "connect 失败"。
 _WARM_AGE_DESTROY_REASON = "warm_age_expired"
 
+#: :meth:`AgentSandboxClient.exec` 兜底分支判"这是超时"的时长门槛,按
+#: ``effective`` 的比例算。envd 掐断一条跑满时限的命令时,SDK 抛的**不总是**
+#: ``TimeoutException``:gRPC 流被中断会经 anyio(``BrokenResourceError`` /
+#: ``EndOfStream``)→ httpx 的 ``map_exceptions`` 变成 ``httpcore.ReadError``
+#: / ``ReadTimeout`` 冒泡上来,而那些异常的 ``str()`` 恰好是空字符串。按
+#: **异常类型**判超时因此会漏,漏了就把一次正常超时升级成
+#: ``SandboxSupervisorError``,让整个 run 挂掉。改按"跑满了我们自己设的时
+#: 限"判,这个判据不依赖 SDK 或 httpx 的异常形态,换版本也不会失效。
+#: 0.9 而不是 1.0:``effective`` 是传给 envd 的值,envd 掐断总是稍早于我们
+#: 这侧测到的墙钟差,留一成余量。
+_TIMEOUT_ATTRIBUTION_RATIO = 0.9
+
+
+def _monotonic() -> float:
+    """墙钟接缝 —— 只为让单测能精确摆出"这条命令跑满了时限"这个状态。
+
+    不让测试直接 monkeypatch ``time.monotonic``:那是全局的,asyncio 自己的
+    事件循环调度也走它,替换掉会连测试框架一起影响。
+    """
+    return time.monotonic()
+
 
 @dataclass
 class AgentSandboxClient:
@@ -813,6 +834,7 @@ class AgentSandboxClient:
         timeout_exc, exit_exc = self._sdk_exceptions()
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
+        started = _monotonic()
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
@@ -831,7 +853,28 @@ class AgentSandboxClient:
                 timed_out=False,
             )
         except Exception as exc:
-            raise SandboxSupervisorError(f"sandbox exec failed: {exc}") from exc
+            # 上面那支 ``except timeout_exc`` 接不住全部超时:envd 掐断一条跑
+            # 满时限的命令时,gRPC 流中断会经 anyio → httpx ``map_exceptions``
+            # 变成 ``httpcore.ReadError`` / ``ReadTimeout`` 冒泡上来,而不是
+            # ``e2b.exceptions.TimeoutException``。2026-08-06 在真栈契约测试
+            # 上两次实测到:``test_exec_default_timeout_is_the_shared_default``
+            # (``time.sleep(45)`` + 30 秒时限)红在这一支,报错正文是空的
+            # ——``httpcore.ReadError`` 的 ``str()`` 就是空字符串。
+            #
+            # 生产后果不是"测试偶尔红":一次本该返回 ``timed_out=True`` 的
+            # 正常超时会变成 ``SandboxSupervisorError``,把整个 run 挂掉。
+            # 所以这里按**跑满了我们自己设的时限**归因,而不是按异常类型
+            # ——见 :data:`_TIMEOUT_ATTRIBUTION_RATIO`。
+            elapsed = _monotonic() - started
+            if elapsed >= effective * _TIMEOUT_ATTRIBUTION_RATIO:
+                return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)
+            # 没跑满时限就断,是真的基础设施故障。带上类型名:走到这里的异常
+            # 有一整族 ``str()`` 为空,只插值 ``{exc}`` 会得到
+            # ``sandbox exec failed: ``,恰恰在最需要诊断的时候什么都不说。
+            raise SandboxSupervisorError(
+                f"sandbox exec failed after {elapsed:.1f}s "
+                f"(timeout={effective}s): {type(exc).__name__}: {exc}"
+            ) from exc
         return SandboxOutcome(
             stdout=result.stdout[:MAX_OUTPUT_CHARS],
             stderr=result.stderr[:MAX_OUTPUT_CHARS],
