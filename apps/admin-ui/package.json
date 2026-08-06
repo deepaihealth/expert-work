@@ -28,7 +28,7 @@
     "dayjs": "^1.11.20",
     "i18next": "^23.16.8",
     "i18next-browser-languagedetector": "^8.0.2",
-    "js-yaml": "^4.2.0",
+    "js-yaml": "^4.3.1",
     "lucide-react": "^0.469.0",
     "markdown-to-jsx": "7.7.17",
     "oidc-client-ts": "^3.1.0",
@@ -64,7 +64,10 @@
       "dompurify": ">=3.4.11 <4",
       "@babel/core": ">=7.29.6 <8",
       "react-router": ">=6.30.4 <7",
-      "uuid": ">=11.1.1 <12"
+      "uuid": ">=11.1.1 <12",
+      "brace-expansion": ">=2.1.2 <3",
+      "fast-uri": ">=3.1.5 <4",
+      "postcss": ">=8.5.23 <9"
     }
   },
   "packageManager": "pnpm@10.14.0+sha512.ad27a79641b49c3e481a16a805baa71817a04bbe06a38d17e60e2eaee83f6a146c6a688125f5792e48dd5ba30e7da52a5cda4c3992b9ccf333f9ce223af84748"
