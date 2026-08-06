@@ -4,7 +4,7 @@
 # resolved by pip from manylinux wheels — no compiler in the image. Keep
 # this list narrow: every library here is import-available to office agents
 # and is part of the sandbox's trusted surface.
-pandas==2.2.3          # tabular data / xlsx+csv analysis
+pandas==3.0.5          # tabular data / xlsx+csv analysis
 openpyxl==3.1.5        # .xlsx read/write
 python-docx==1.1.2     # .docx read/write
 python-pptx==1.0.2     # .pptx read/write
