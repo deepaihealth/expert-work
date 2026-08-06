@@ -55,8 +55,8 @@ importers:
         specifier: ^4.3.1
         version: 4.3.1
       lucide-react:
-        specifier: ^0.469.0
-        version: 0.469.0(react@19.2.6)
+        specifier: ^1.28.0
+        version: 1.28.0(react@19.2.6)
       markdown-to-jsx:
         specifier: 7.7.17
         version: 7.7.17(react@19.2.6)
@@ -1675,8 +1675,8 @@ packages:
   lru-cache@5.1.1:
     resolution: {integrity: sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==}
 
-  lucide-react@0.469.0:
-    resolution: {integrity: sha512-28vvUnnKQ/dBwiCQtwJw7QauYnE7yd2Cyp4tTTJpvglX4EMpbflcdBgrgToX2j71B3YvugK/NH3BGUk+E/p/Fw==}
+  lucide-react@1.28.0:
+    resolution: {integrity: sha512-fARAFJULsGuDDydjp6+6blekG/sBIM29TerzLjc9bQUKAcEfrSc4ZQKb25KRz4OMKd87cZTb5dgq0w/T6KufVg==}
     peerDependencies:
       react: ^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
@@ -4207,7 +4207,7 @@ snapshots:
     dependencies:
       yallist: 3.1.1
 
-  lucide-react@0.469.0(react@19.2.6):
+  lucide-react@1.28.0(react@19.2.6):
     dependencies:
       react: 19.2.6
 
