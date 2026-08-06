@@ -3,6 +3,9 @@
 > Stream G.3 故障预案。sandbox-supervisor（Stream F.1）管理沙盒生命周期；
 > `exec_python` 工具经它 `acquire / exec / release` 沙盒容器。
 > 它故障 = 声明 `exec_python` 的 agent 工具调用失败（但不影响纯 LLM agent）。
+>
+> 本文档只覆盖 compose/supervisor 后端（`sandbox_backend=docker`）。
+> E2B / ACS 集群后端的沙箱镜像发布见 [sandbox-image-release.md](./sandbox-image-release.md)。
 
 ## 故障现象
 
