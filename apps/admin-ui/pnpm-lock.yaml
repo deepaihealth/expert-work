@@ -58,8 +58,8 @@ importers:
         specifier: ^0.469.0
         version: 0.469.0(react@19.2.6)
       markdown-to-jsx:
-        specifier: 7.7.17
-        version: 7.7.17(react@19.2.6)
+        specifier: 9.10.1
+        version: 9.10.1(react@19.2.6)
       oidc-client-ts:
         specifier: ^3.1.0
         version: 3.5.0
@@ -1701,6 +1701,24 @@ packages:
       react: '>= 0.14.0'
     peerDependenciesMeta:
       react:
+        optional: true
+
+  markdown-to-jsx@9.10.1:
+    resolution: {integrity: sha512-/fVJ8tKefGDQP40IONtD8O39V0sP0KkJmgkkFH1RBmPWKgnS6ljcOyUZ/ahEnQ3a3GsNZynM8KTR6b1n/6gFaQ==}
+    engines: {node: '>= 18'}
+    peerDependencies:
+      react: '>= 16.0.0'
+      react-native: '*'
+      solid-js: '>=1.0.0'
+      vue: '>=3.0.0'
+    peerDependenciesMeta:
+      react:
+        optional: true
+      react-native:
+        optional: true
+      solid-js:
+        optional: true
+      vue:
         optional: true
 
   marked@14.0.0:
@@ -4224,6 +4242,10 @@ snapshots:
   map-or-similar@1.5.0: {}
 
   markdown-to-jsx@7.7.17(react@19.2.6):
+    optionalDependencies:
+      react: 19.2.6
+
+  markdown-to-jsx@9.10.1(react@19.2.6):
     optionalDependencies:
       react: 19.2.6
 
