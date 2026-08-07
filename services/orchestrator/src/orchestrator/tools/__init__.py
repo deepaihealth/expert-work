@@ -132,6 +132,9 @@ from orchestrator.tools.nas_workspace_store import (
 from orchestrator.tools.nas_workspace_store import (
     NasWorkspaceStore as NasWorkspaceStore,
 )
+from orchestrator.tools.nas_workspace_store import (
+    workspace_user_root as workspace_user_root,
+)
 from orchestrator.tools.read_document import (
     ReadDocumentTool as ReadDocumentTool,
 )
@@ -298,4 +301,5 @@ __all__ = [
     "WriteFileTool",
     "build_tool_registry",
     "register_mcp_tools",
+    "workspace_user_root",
 ]

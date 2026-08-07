@@ -109,7 +109,7 @@ from uuid import UUID, uuid4
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
-from orchestrator.tools.nas_workspace_store import DELETED_MARKER
+from orchestrator.tools.nas_workspace_store import DELETED_MARKER, workspace_user_root
 from orchestrator.tools.sandbox import (
     EgressContext,
     SandboxOutcome,
@@ -177,6 +177,14 @@ _WARM_RECONNECT_DESTROY_REASON = "warm_reconnect_failed"
 #: from ``_WARM_RECONNECT_DESTROY_REASON`` so an operator reading
 #: ``destroy_reason`` can tell "token 快到期,主动换血" from "connect 失败"。
 _WARM_AGE_DESTROY_REASON = "warm_age_expired"
+
+#: ``destroy_reason``(经 :meth:`AgentSandboxClient._unwind_slot`)写的值 ——
+#: Task 4 审查 Important-2:``claim_warm`` 成功之后、``create()`` 之前复查
+#: 到软删标记出现(见 :meth:`AgentSandboxClient._reverify_workspace_not_deleted`
+#: 的完整推理)。与其它 ``_unwind_slot`` reason 常量同一套命名习惯——独立
+#: 一个字面量,方便运维在 ``destroy_reason`` 列里按根因区分这条与
+#: ``"create_failed"``/``"post_create_failed"``。
+_WORKSPACE_DELETED_RACE_REASON = "workspace_deleted_race"
 
 #: :meth:`AgentSandboxClient.exec` 兜底分支判"这是超时"的时长门槛,按
 #: ``effective`` 的比例算。envd 掐断一条跑满时限的命令时,SDK 抛的**不总是**
@@ -300,6 +308,19 @@ class AgentSandboxClient:
     #: ``csi-volume-config`` 的 ``subPath`` 前缀(spec § 二之二集群实测:生产
     #: PV ``workspace-nas`` 的 ``path`` 已经是 ``/workspaces``,所以这里是空
     #: 串,拼出的 subPath 就是 ``{tenant}/{user}``)。见 :func:`_workspace_subpath`。
+    #:
+    #: **必须与 :attr:`workspace_pv_name` 同时配时保持空串**(Task 4 审查
+    #: Important-1)—— 这个前缀只影响沙箱侧 ``csi-volume-config`` 的
+    #: ``subPath``,而 ``NasWorkspaceStore``(control-plane 直读那棵树的
+    #: store,见 :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root`)
+    #: 完全不理解前缀,它的布局恒为 ``{root}/{tenant_id}/{user_id}``。非空
+    #: 前缀会让沙箱实际挂载到 ``{root}/{prefix}/{tenant}/{user}``,而
+    #: mkdir/chown/软删闸(:meth:`_prepare_workspace_mount`)与
+    #: ``NasWorkspaceStore`` 的文件读写全都还在算 ``{root}/{tenant}/{user}``
+    #: ——两棵树静默分叉,用户在工作区浏览页看到的文件和沙箱里 `/workspace`
+    #: 看到的文件不是同一份,且没有任何报错。``__post_init__`` 在构造期直
+    #: 接拒绝这个组合,而不是尝试把前缀透传进 ``NasWorkspaceStore``(那会
+    #: 动到 Task 3 加固过的路径解析核心)。
     workspace_subpath_prefix: str = ""
     #: control-plane Pod 本地的 NAS 挂载点(与 ``NasWorkspaceStore.root`` 同一
     #: 个值)—— ``acquire`` 用它做 mkdir + chown(spec § 二之二"附带事实":NAS
@@ -310,6 +331,32 @@ class AgentSandboxClient:
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
+
+    def __post_init__(self) -> None:
+        """构造期不变式检查(同 ``ToolResult.__post_init__`` 的既有惯例:
+        ``registry.py`` 里"构造期就报,不要放到用了才报"的模式)。
+
+        Task 4 审查 Important-1 —— ``workspace_pv_name`` 配了、
+        ``workspace_subpath_prefix`` 也非空这个组合会让沙箱与
+        ``NasWorkspaceStore`` 静默各写各的树(见 :attr:`workspace_subpath_prefix`
+        的 docstring),这类失配没有任何运行期报错,只能靠人肉发现"用户上
+        传的文件沙箱里看不到"这种症状去反查——比"配置阶段就大声拒绝"贵得
+        多。放在 ``__post_init__`` 而不是工厂 ``build_sandbox_runtime`` 里:
+        这样无论谁构造 ``AgentSandboxClient``(生产工厂、测试里直接
+        构造)都逃不掉这条检查,不依赖调用方记得走工厂。
+        """
+        if self.workspace_pv_name and self.workspace_subpath_prefix:
+            msg = (
+                "AgentSandboxClient.workspace_subpath_prefix must be empty "
+                "when workspace_pv_name is configured — NasWorkspaceStore "
+                "has no concept of a subpath prefix (its layout is always "
+                "{root}/{tenant_id}/{user_id}), so a non-empty prefix here "
+                "would mount the sandbox's /workspace at a NAS path "
+                "NasWorkspaceStore never reads or writes: a silent, "
+                "hard-to-diagnose split between what the sandbox sees and "
+                "what the workspace-browse/upload/download endpoints see."
+            )
+            raise ValueError(msg)
 
     def _max_warm_age_s(self) -> int:
         """热会话总年龄上限 —— 派生自 ``egress_token_ttl_s``,不设第二个常量。
@@ -502,6 +549,11 @@ class AgentSandboxClient:
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                     )
+                # 审查 Important-2 —— claim_warm 成功之后、create() 之前的
+                # 窄窗口复查软删标记,见 _reverify_workspace_not_deleted。
+                await self._reverify_workspace_not_deleted(
+                    tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                )
                 sbx = await self._create_and_track(
                     tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
                 )
@@ -530,6 +582,11 @@ class AgentSandboxClient:
                         await self._claim_warm(
                             tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                         )
+                    # 审查 Important-2 —— 同上,重占坑之后、create() 之前
+                    # 复查软删标记。
+                    await self._reverify_workspace_not_deleted(
+                        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                    )
                     sbx = await self._create_and_track(
                         tenant_id=tenant_id,
                         sandbox_id=sandbox_id,
@@ -551,6 +608,11 @@ class AgentSandboxClient:
             # 到,复用路径与新建路径在 claim_warm 返回前无法区分,提前查会把
             # "已到上限租户复用既有会话"也拒掉。
             await self._enforce_quota(tenant_id, own_sandbox_id=sandbox_id)
+            # 审查 Important-2 —— 首次占坑成功之后、create() 之前复查软删
+            # 标记(ephemeral 分支 user_id 为 None,内部整段跳过)。
+            await self._reverify_workspace_not_deleted(
+                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+            )
             sbx = await self._create_and_track(
                 tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
             )
@@ -642,7 +704,7 @@ class AgentSandboxClient:
             return
         if user_id is not None:
             await self._reject_if_workspace_deleted(root, tenant_id=tenant_id, user_id=user_id)
-            target = Path(root, str(tenant_id), str(user_id))
+            target = workspace_user_root(root, tenant_id, user_id)
         else:
             target = Path(root, "_scratch", str(sandbox_id))
         await self._ensure_workspace_dir(target)
@@ -655,17 +717,57 @@ class AgentSandboxClient:
         走同一个可观察契约:直接读 ``NasWorkspaceStore`` 写的
         :data:`~orchestrator.tools.nas_workspace_store.DELETED_MARKER`
         标记文件(:meth:`NasWorkspaceStore.mark_deleted` 的落点是
-        ``{root}/{tenant_id}/{user_id}/{DELETED_MARKER}``,与这里拼的路径
-        逐段相同),不经过 ``NasWorkspaceStore`` 实例——这里只需要
-        "这个文件存在吗"这一个布尔判断,不需要该 store 的读写/路径穿越防
-        护机器。
+        ``{root}/{tenant_id}/{user_id}/{DELETED_MARKER}``)——路径经
+        :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root`
+        与 ``NasWorkspaceStore`` 共享同一个函数算出(Task 4 审查 Minor:两
+        处独立拼接过路径,曾经能各拼各的、静默失配),不经过
+        ``NasWorkspaceStore`` 实例本身——这里只需要"这个文件存在吗"这一个
+        布尔判断,不需要该 store 的读写/路径穿越防护机器。
+
+        本方法既是 :meth:`_prepare_workspace_mount` 的初次软删闸,也是
+        Task 4 审查 Important-2 修复后 :meth:`_reverify_workspace_not_deleted`
+        的复查窗口复用的同一份判定——两处调用同一个函数,不重复一份逻辑。
         """
-        marker = Path(root, str(tenant_id), str(user_id), DELETED_MARKER)
+        marker = workspace_user_root(root, tenant_id, user_id) / DELETED_MARKER
         deleted = await asyncio.to_thread(marker.exists)
         if deleted:
             raise SandboxSupervisorError(
                 f"workspace deleted for user {user_id} (tenant {tenant_id})"
             )
+
+    async def _reverify_workspace_not_deleted(
+        self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
+    ) -> None:
+        """Task 4 审查 Important-2 —— ``claim_warm`` 成功之后、``create()``
+        真正把沙箱建到平台上之前,复查一次软删标记。
+
+        :meth:`_prepare_workspace_mount` 的软删闸只在 ``claim_warm`` **之
+        前**查一次。那次检查通过之后、到这次调用真正的 CAS 行落库(或重新
+        占坑)之间,存在一个真实的竞态窗口:并发的
+        ``NasWorkspaceStore.mark_deleted`` 完全可能在这个窗口里插进来——
+        它先落 marker,再调 ``instance_store.get_warm`` 找这个用户的热会
+        话;如果这次 ``acquire`` 的行此刻还没提交、或提交了但
+        ``container_id`` 还没回填,``get_warm`` 会返回 ``None``,
+        ``mark_deleted`` 什么都拆不到,marker 却已经落盘。不补这一步复查
+        的话,这次 acquire 会继续往下把一个全新的热会话建给一个"已经被声
+        明软删"的用户,且没有任何后续机制会再发现它——只能靠 idle TTL /
+        :meth:`_max_warm_age_s` 兜底(15 分钟到 12 小时的窗口)。
+
+        直接复用 :meth:`_reject_if_workspace_deleted`(不重写一份判定),
+        marker 出现时按 :meth:`_unwind_slot` 让出这次调用刚占到的 CAS 槽
+        位再把异常原样往外抛——与 ``_create_and_track``/
+        ``_discard_new_sandbox`` 失败清理走的是同一套收口。``user_id`` 为
+        None(临时沙箱)整段跳过,同 :meth:`_prepare_workspace_mount`:临时
+        沙箱没有软删概念。
+        """
+        root = self.workspace_root
+        if not root or user_id is None:
+            return
+        try:
+            await self._reject_if_workspace_deleted(root, tenant_id=tenant_id, user_id=user_id)
+        except SandboxSupervisorError:
+            await self._unwind_slot(sandbox_id=sandbox_id, reason=_WORKSPACE_DELETED_RACE_REASON)
+            raise
 
     async def _ensure_workspace_dir(self, path: Path) -> None:
         """``mkdir(parents=True, exist_ok=True)`` + ``chown(uid, gid)``,off-loop。

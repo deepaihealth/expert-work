@@ -21,7 +21,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from orchestrator.tools.nas_workspace_store import DELETED_MARKER, NasWorkspaceStore
+from orchestrator.tools.nas_workspace_store import (
+    DELETED_MARKER,
+    NasWorkspaceStore,
+    workspace_user_root,
+)
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxSupervisorError
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
 
@@ -61,6 +65,23 @@ def test_runtime_field_defaults_to_none(tmp_path: Path) -> None:
 def test_instance_store_field_defaults_to_none(tmp_path: Path) -> None:
     """同上,``get_warm`` 查询用的另一半接线。"""
     assert _store(tmp_path).instance_store is None
+
+
+def test_workspace_user_root_matches_store_internal_user_root(tmp_path: Path) -> None:
+    """Task 4 审查 Minor —— ``NasWorkspaceStore`` 与 ``AgentSandboxClient``
+    共用同一个路径函数,不再各拼各的。这里断言公开函数与该 store 私有的
+    ``_user_root`` 逐字节同一个结果(``_user_root`` 现在就是这个函数的薄
+    封装,但断言值相等而不是断言"调用了同一个函数",防止未来有人把
+    ``_user_root`` 改回独立拼接又不留痕迹)。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    assert workspace_user_root(str(tmp_path), tenant_id, user_id) == store._user_root(
+        tenant_id, user_id
+    )
+    assert workspace_user_root(str(tmp_path), tenant_id, user_id) == (
+        tmp_path / str(tenant_id) / str(user_id)
+    )
 
 
 # ---------------------------------------------------------------- 路径穿越四件套

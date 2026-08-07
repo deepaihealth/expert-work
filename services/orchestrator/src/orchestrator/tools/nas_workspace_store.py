@@ -196,6 +196,23 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
 
 
+def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """The canonical per-``(tenant, user)`` NAS path: ``{root}/{tenant_id}/{user_id}``.
+
+    Task 4 review (Minor) — this module owns the on-disk layout, so it also
+    owns the one function that spells it out. Before this existed,
+    :meth:`NasWorkspaceStore._user_root` and
+    :mod:`orchestrator.tools.agent_sandbox`'s pre-mount mkdir/chown/
+    soft-delete-gate each concatenated ``root``/``tenant_id``/``user_id``
+    independently — two spellings of the same path that could silently
+    drift apart (e.g. one gaining a subpath-prefix segment the other never
+    learns about, see that module's ``workspace_subpath_prefix`` guard).
+    Both call sites now go through this one function so that class of bug
+    is structurally impossible, not just currently absent.
+    """
+    return (Path(root) / str(tenant_id) / str(user_id)).resolve()
+
+
 @dataclass
 class NasWorkspaceStore:
     """Production :class:`WorkspaceStore` (wave 2) — reads/writes the NAS mount directly.
@@ -234,7 +251,7 @@ class NasWorkspaceStore:
     instance_store: SandboxInstanceStore | None = None
 
     def _user_root(self, tenant_id: UUID, user_id: UUID) -> Path:
-        return (Path(self.root) / str(tenant_id) / str(user_id)).resolve()
+        return workspace_user_root(self.root, tenant_id, user_id)
 
     def _open_parent_dir_fd(
         self, tenant_id: UUID, user_id: UUID, path: str, *, create: bool

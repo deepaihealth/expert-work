@@ -167,7 +167,30 @@ def test_workspace_store_falls_back_to_supervisor_without_a_usable_nas_root(
 
 def test_agent_sandbox_backend_passes_through_workspace_mount_settings() -> None:
     """波 2 Task 4 —— 三项 NAS 工作区挂载配置从 ``Settings`` 原样传到
-    ``AgentSandboxClient``,不配就是 dataclass 默认值(波 1 行为)。"""
+    ``AgentSandboxClient``,不配就是 dataclass 默认值(波 1 行为)。
+    ``sandbox_workspace_subpath_prefix`` 留空:非空前缀与 ``pv_name`` 同时配
+    会被 ``AgentSandboxClient.__post_init__`` 拒(Task 4 审查
+    Important-1,见下面单独一条测试),这里只验证三个字段各自原样传递。
+    """
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
+    )
+    runtime = build_sandbox_runtime(s)
+    assert isinstance(runtime, AgentSandboxClient)
+    assert runtime.workspace_pv_name == "workspace-nas"
+    assert runtime.workspace_subpath_prefix == ""
+    assert runtime.workspace_root == "/mnt/workspaces"
+
+
+def test_agent_sandbox_backend_rejects_conflicting_prefix_and_pv_name() -> None:
+    """波 2 Task 4 审查 Important-1 —— 经工厂拼装同样会被
+    ``AgentSandboxClient.__post_init__`` 拒,不是只有测试直接构造才拦得住。
+    """
     s = Settings(
         sandbox_backend="agent_sandbox",
         sandbox_e2b_domain="d",
@@ -175,13 +198,9 @@ def test_agent_sandbox_backend_passes_through_workspace_mount_settings() -> None
         sandbox_e2b_template="t",
         sandbox_workspace_pv_name="workspace-nas",
         sandbox_workspace_subpath_prefix="ew",
-        workspace_nas_root="/mnt/workspaces",
     )
-    runtime = build_sandbox_runtime(s)
-    assert isinstance(runtime, AgentSandboxClient)
-    assert runtime.workspace_pv_name == "workspace-nas"
-    assert runtime.workspace_subpath_prefix == "ew"
-    assert runtime.workspace_root == "/mnt/workspaces"
+    with pytest.raises(ValueError, match="workspace_subpath_prefix"):
+        build_sandbox_runtime(s)
 
 
 def test_agent_sandbox_backend_workspace_mount_settings_default_to_wave1_behaviour() -> None:

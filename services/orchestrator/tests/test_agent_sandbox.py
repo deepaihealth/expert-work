@@ -1037,20 +1037,31 @@ async def test_create_injects_csi_volume_config() -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_create_injects_csi_volume_config_with_a_prefix() -> None:
-    """非空 ``workspace_subpath_prefix`` 原样拼进 subPath 前面。"""
-    sdk, store = FakeSdk(), FakeInstanceStore()
-    client = make_client(
-        sdk, store, workspace_pv_name="workspace-nas", workspace_subpath_prefix="ew"
-    )
-    tenant_id, user_id = uuid4(), uuid4()
+def test_workspace_subpath_prefix_conflicts_with_pv_name_raises() -> None:
+    """Task 4 审查 Important-1 —— ``workspace_pv_name`` 配了、非空
+    ``workspace_subpath_prefix`` 也配了这个组合会让沙箱与 ``NasWorkspaceStore``
+    静默各写各的树(前者按前缀挂,后者压根不理解前缀),必须在构造期就大
+    声拒绝,不要等到跑起来才靠"用户上传的文件沙箱里看不到"这种症状去反查。
+    """
+    with pytest.raises(ValueError, match="workspace_subpath_prefix"):
+        make_client(
+            FakeSdk(),
+            FakeInstanceStore(),
+            workspace_pv_name="workspace-nas",
+            workspace_subpath_prefix="ew",
+        )
 
-    await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
 
-    metadata = sdk.created[-1]["metadata"]
-    volumes = json.loads(metadata["e2b.agents.kruise.io/csi-volume-config"])
-    assert volumes[0]["subPath"] == f"ew/{tenant_id}/{user_id}"
+def test_workspace_subpath_prefix_empty_string_is_fine_with_pv_name() -> None:
+    """空串(生产配置)与 ``workspace_pv_name`` 同时配不该被这条新校验挡住
+    ——``__post_init__`` 只拒非空前缀,不拒配置项本身共存。"""
+    make_client(FakeSdk(), FakeInstanceStore(), workspace_pv_name="workspace-nas")
+
+
+def test_workspace_subpath_prefix_alone_is_fine() -> None:
+    """未配 ``workspace_pv_name`` 时,``workspace_subpath_prefix`` 非空不该
+    被拒——两者的冲突只在 ``workspace_pv_name`` 也配了时才成立。"""
+    make_client(FakeSdk(), FakeInstanceStore(), workspace_subpath_prefix="ew")
 
 
 @pytest.mark.asyncio
@@ -1168,6 +1179,46 @@ async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
 
     # 拒绝发生在 claim_warm 之前 —— 没有留下任何行。
     assert store.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 4 审查 Important-2 —— 软删闸的 TOCTOU:初次闸只在 ``claim_warm``
+    之前查一次,之后不再复查。构造"闸通过后、marker 才出现"的精确时序:
+    ``claim_warm`` 真正把这次 acquire 的行提交成功之后(模拟并发
+    ``mark_deleted`` 恰好插在这个窗口),marker 才落盘——不是提前造好(那
+    会被初次闸本身挡住,测不出 TOCTOU)。
+
+    断言 acquire 必须抛错,**且这次调用占到的 CAS 槽位必须被让出**——不能
+    占着一行不放,那会让这个 ``(tenant, user)`` 之后所有 acquire 都卡死。
+    """
+    _stub_chown_noop(monkeypatch)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+    real_claim_warm = store.claim_warm
+
+    async def _claim_then_plant_marker(
+        *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str, object] | None:
+        result = await real_claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+        # 模拟并发 mark_deleted 恰好在 claim_warm 提交之后写下 marker。
+        user_root = tmp_path / str(tenant_id) / str(user_id)
+        user_root.mkdir(parents=True, exist_ok=True)
+        (user_root / DELETED_MARKER).touch()
+        return result
+
+    monkeypatch.setattr(store, "claim_warm", _claim_then_plant_marker)
+
+    with pytest.raises(SandboxSupervisorError, match="workspace deleted"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    # 槽位已让出:没有残留的行,_warm 指针也没有悬空指向一个已清行的 id。
+    assert store.rows == {}
+    assert store.warm == {}
+    assert [reason for (_sid, reason) in store.mark_destroyed_calls] == ["workspace_deleted_race"]
 
 
 @pytest.mark.asyncio
