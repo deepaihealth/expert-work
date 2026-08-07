@@ -87,7 +87,7 @@ spec:
         - name: acr-pull
       containers:
         - name: main
-          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:d1a2cdf5
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:e9349135
           imagePullPolicy: IfNotPresent
           # See the ENTRYPOINT note in this file's header.
           command:
