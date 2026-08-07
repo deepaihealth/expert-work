@@ -71,6 +71,20 @@ clamp 在 HTTP 路径上够不着,拿它当闸就是拿一段死代码当闸:真
 字符;``AgentSandboxClient`` 走的是简单头部截断 ``[:MAX_OUTPUT_CHARS]``
 (理由见其 ``exec`` docstring 契约点 2)。``test_exec_output_is_capped``
 因此断言的是"被截到了上限附近",不是某个精确长度。
+
+**其四:``/workspace`` 的物理路径。**(波 2 真栈复跑实测)supervisor 档的
+``/workspace`` 是容器里一个真目录,``os.getcwd()`` 就报 ``/workspace``;
+agent_sandbox 档的 ``/workspace`` 是**平台建的符号链接**,指向
+``/run/csi/mount-root/nas/<hash>``(hash 每次挂载现算),而 ``getcwd(2)``
+按定义返回解析后的物理路径。这条弥合不了——符号链接是平台注入 NAS 挂载的
+方式,不是我们能选的。功能上无影响:相对路径读写、``/workspace/...``
+绝对路径、跨 exec 持久化全部照常(各由自己的用例覆盖)。
+``test_exec_cwd_is_workspace`` 因此比 ``(st_dev, st_ino)`` 而不是路径字符串。
+
+**留给上层的一条**:云后端上,agent 自己跑 ``os.getcwd()``(或任何打印绝对
+路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是 ``/workspace``。
+纯观感,但 LLM 读到自己的 cwd 长这样可能会困惑;真要治得在提示词或工具输出
+层做路径回写,不在这一层。
 """
 
 from __future__ import annotations
@@ -301,13 +315,33 @@ async def test_exec_cwd_is_workspace(runtime: SandboxRuntime) -> None:
     agent_sandbox 档靠 ``commands.run(cwd=...)`` —— envd 派生的进程不继承
     镜像 ``WORKDIR``(即便镜像声明了也一样),实测落在 ``/home/agent``。
     两条路子不同,观测结果必须相同。
+
+    **比 inode 身份,不比路径字符串**(波 2 收尾真栈复跑)。这条以前断言
+    ``os.getcwd() == "/workspace"``,在波 2 之前是对的:那时 ``/workspace``
+    两个后端都是真目录。云后端现在不是了 —— 平台把 ``/workspace`` 建成指向
+    ``/run/csi/mount-root/nas/<hash>`` 的**符号链接**,而 ``getcwd(2)`` 按定义
+    返回解析后的物理路径,于是这条用例报
+    ``assert '/run/csi/mount-root/nas/...' == '/workspace'``。
+
+    那个字符串不是我们能承诺的东西(hash 由平台每次挂载现算),而这条用例
+    真正要问的是「这个进程是不是站在工作区里」。比 ``(st_dev, st_ino)`` 正好
+    回答那个问题:``os.stat`` 跟随符号链接,所以 supervisor 档(真目录)与
+    agent_sandbox 档(symlink)都成立,而且比字符串相等更强 —— 一个 cwd 恰好
+    叫 ``/workspace`` 但其实是另一棵树的实现骗不过它。顺带把 ``getcwd()``
+    一起打出来,失败时不用再猜它到底站在哪。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c8")
     try:
         outcome = await runtime.exec(
-            sandbox_id=sid, code="import os; print(os.getcwd())", timeout_s=30
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "here, ws = os.stat('.'), os.stat('/workspace')\n"
+                "print((here.st_dev, here.st_ino) == (ws.st_dev, ws.st_ino), os.getcwd())"
+            ),
+            timeout_s=30,
         )
-        assert outcome.stdout.strip() == "/workspace"
+        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
