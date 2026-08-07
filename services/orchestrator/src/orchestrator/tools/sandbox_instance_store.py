@@ -246,3 +246,17 @@ class SandboxInstanceStore(Protocol):
         读同一张表、同一个维度 —— 租户的沙箱预算是平台级的,admin API 写一
         行,两个后端都认。
         """
+
+    async def get_warm(self, *, tenant_id: UUID, user_id: UUID) -> tuple[UUID, str] | None:
+        """该 ``(tenant, user)`` 活跃热会话的 ``(sandbox_id, container_id)``;无则 ``None``。
+
+        沙箱迁移波 2 Task 4 —— ``NasWorkspaceStore.mark_deleted`` 用它找到要
+        随软删一并拆除的热会话:与 :meth:`claim_warm` 的"已被占用"分支共享
+        同一套谓词(本后端行、``state='IN_USE'``、未销毁),但**不做 CAS**
+        (不插入/不占坑,纯只读)——调用方不是在 acquire 一个沙箱,只是想
+        知道"这个用户现在有没有一个活着的热会话"。只返回
+        ``container_id`` 已回填的行:还在冷启窗口内(``container_id`` 仍
+        NULL)的行没有可 ``destroy`` 的容器,调用方(``mark_deleted``)拿到
+        ``None`` 时就什么也不做——那半秒窗口里刚巧撞上软删的极端交错,留给
+        下一次 purge 重试或平台超时自然收敛,不值得为它另开一条路径。
+        """

@@ -14,14 +14,15 @@ mock 掉文件系统就等于没测。行为契约对照 ``sandbox_supervisor.su
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from orchestrator.tools.nas_workspace_store import DELETED_MARKER, NasWorkspaceStore
-from orchestrator.tools.sandbox import SandboxSupervisorError
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxSupervisorError
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
 
 
@@ -52,8 +53,14 @@ def test_satisfies_workspace_store_protocol(tmp_path: Path) -> None:
 
 
 def test_runtime_field_defaults_to_none(tmp_path: Path) -> None:
-    """Task 4 接线用的字段;本 task 恒 ``None``(dataclass 默认值即证明)。"""
+    """Task 4 接线用的字段;调用方不传就是 Task 3 的行为(``mark_deleted``
+    跳过热会话拆除,只写软删标记)——dataclass 默认值即证明。"""
     assert _store(tmp_path).runtime is None
+
+
+def test_instance_store_field_defaults_to_none(tmp_path: Path) -> None:
+    """同上,``get_warm`` 查询用的另一半接线。"""
+    assert _store(tmp_path).instance_store is None
 
 
 # ---------------------------------------------------------------- 路径穿越四件套
@@ -389,6 +396,65 @@ async def test_mark_deleted_creates_the_user_dir_when_missing(tmp_path: Path) ->
 
     user_root = tmp_path / str(tenant_id) / str(user_id)
     assert user_root.is_dir()
+
+
+# ---------------------------------------------------------------- mark_deleted 热会话拆除(Task 4)
+
+
+@dataclass
+class _FakeInstanceStore:
+    """``SandboxInstanceStore.get_warm`` 的最小替身 —— 只测
+    ``NasWorkspaceStore.mark_deleted`` 消费它的那一个方法,预置
+    ``(tenant_id, user_id) -> (sandbox_id, container_id)``。"""
+
+    warm: dict[tuple[UUID, UUID], tuple[UUID, str]] = field(default_factory=dict)
+
+    async def get_warm(self, *, tenant_id: UUID, user_id: UUID) -> tuple[UUID, str] | None:
+        return self.warm.get((tenant_id, user_id))
+
+
+async def test_mark_deleted_destroys_warm_session(tmp_path: Path) -> None:
+    """``runtime``/``instance_store`` 都配了、且用户确实有一个热会话 ——
+    ``mark_deleted`` 必须 ``destroy`` 它(reason="workspace_deleted"),
+    而不只是留一个 marker 文件让它悬在那里活到 idle TTL。"""
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    runtime = RecordingSandboxRuntime()
+    instance_store = _FakeInstanceStore(warm={(tenant_id, user_id): (sandbox_id, "e2b-live")})
+    store = NasWorkspaceStore(root=str(tmp_path), runtime=runtime, instance_store=instance_store)
+
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    assert runtime.destroyed == [(sandbox_id, "workspace_deleted")]
+    # marker 仍然照常落盘 —— 热会话拆除是在它之上的追加动作,不是替代。
+    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
+
+
+async def test_mark_deleted_skips_teardown_when_no_warm_session(tmp_path: Path) -> None:
+    """该用户当下没有热会话(``get_warm`` 返回 ``None``)—— 不该调
+    ``destroy``,marker 仍然写。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    runtime = RecordingSandboxRuntime()
+    instance_store = _FakeInstanceStore()
+    store = NasWorkspaceStore(root=str(tmp_path), runtime=runtime, instance_store=instance_store)
+
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    assert runtime.destroyed == []
+    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
+
+
+async def test_mark_deleted_skips_teardown_without_both_wired(tmp_path: Path) -> None:
+    """``runtime``/``instance_store`` 两者只配一个(接线半成品)—— 按"两者都
+    没配"同样降级为跳过,不炸 ``AttributeError``(见 ``mark_deleted`` 的
+    docstring:这两个字段只由 ``build_workspace_store`` 一起注入,单配一个
+    是接线 bug,不该表现成一个看着像文件系统故障的异常)。"""
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    instance_store = _FakeInstanceStore(warm={(tenant_id, user_id): (sandbox_id, "e2b-live")})
+    store = NasWorkspaceStore(root=str(tmp_path), runtime=None, instance_store=instance_store)
+
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)  # 不抛
+
+    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
 
 
 # ---------------------------------------------------------------- 目录不存在

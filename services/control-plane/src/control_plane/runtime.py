@@ -1508,13 +1508,27 @@ def build_sandbox_runtime(
             egress_token_ttl_s=settings.sandbox_egress_token_ttl_s,
             egress_proxy_host=settings.sandbox_egress_proxy_host,
             egress_proxy_port=settings.sandbox_egress_proxy_port,
+            # 波 2 Task 4 —— NAS 工作区挂载三项,全部默认 None/"":不配就是
+            # 波 1 行为(见 ``AgentSandboxClient`` 三个字段各自的 docstring)。
+            # ``workspace_root`` 与 ``build_workspace_store`` 的
+            # ``NasWorkspaceStore.root`` 是同一个 Settings 字段
+            # (``workspace_nas_root``)——两者都是"control-plane Pod 本地的
+            # NAS 挂载点"这同一件事,不是两份独立配置。
+            workspace_pv_name=settings.sandbox_workspace_pv_name,
+            workspace_subpath_prefix=settings.sandbox_workspace_subpath_prefix,
+            workspace_root=settings.workspace_nas_root,
         )
     if backend == "supervisor" and settings.sandbox_supervisor_url:
         return HTTPSupervisorRuntime(base_url=settings.sandbox_supervisor_url)
     return None
 
 
-def build_workspace_store(settings: Settings) -> WorkspaceStore | None:
+def build_workspace_store(
+    settings: Settings,
+    *,
+    runtime: SandboxRuntime | None = None,
+    instance_store: SandboxInstanceStore | None = None,
+) -> WorkspaceStore | None:
     """Build the workspace-file client per ``settings``.
 
     波 1 Task 4 — 工作区文件操作从 ``SandboxRuntime`` 拆出。本地/CI 下
@@ -1527,6 +1541,17 @@ def build_workspace_store(settings: Settings) -> WorkspaceStore | None:
     ``SupervisorWorkspaceStore``。都没配 → ``None``,与
     ``build_sandbox_runtime`` 同语义(工作区文件端点不可用)。
 
+    波 2 Task 4 — ``runtime``/``instance_store`` 两个新关键字参数原样转给
+    ``NasWorkspaceStore``(见该类的 ``mark_deleted``),让软删一个用户的工作
+    区时能顺手拆掉这个用户还活着的热会话。两者都默认 ``None``(与波 1/3
+    行为一致 —— ``NasWorkspaceStore.mark_deleted`` 在两者任一为 ``None``
+    时跳过拆除,只写软删标记)。调用方(``app.py``)按"先
+    ``build_sandbox_runtime`` 再 ``build_workspace_store``"的顺序接线,把
+    前者的返回值和喂给它的同一个 ``sandbox_instance_store`` 传进来——两个
+    工厂读的是同一份 sandbox 装配状态,不是各自重新构造一份。这两个参数只
+    在 NAS 分支有意义,supervisor 分支忽略它们(那个后端的热会话拆除已经
+    在 supervisor 服务自己的软删流程里,不需要 control-plane 侧再做一次)。
+
     全分支终审"合并前"清单第 4 条:supervisor 分支的判据是 ``not url``
     而不是 ``url is None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是
     真值判断,而 ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个
@@ -1538,7 +1563,9 @@ def build_workspace_store(settings: Settings) -> WorkspaceStore | None:
     续到 NAS 分支(``workspace_nas_root`` 也用真值判断)。
     """
     if settings.workspace_nas_root:
-        return NasWorkspaceStore(root=settings.workspace_nas_root)
+        return NasWorkspaceStore(
+            root=settings.workspace_nas_root, runtime=runtime, instance_store=instance_store
+        )
     if settings.sandbox_supervisor_url:
         return SupervisorWorkspaceStore(base_url=settings.sandbox_supervisor_url)
     return None

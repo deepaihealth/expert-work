@@ -1072,3 +1072,98 @@ async def test_sandbox_limit_for_tenant_reads_quota_row(
         await session.commit()
 
     assert await store.sandbox_limit_for_tenant(tenant_id=tenant_id) == 3
+
+
+# ---------------------------------------------------------------------------
+# 沙箱迁移波 2 Task 4 —— get_warm(只读版本的 claim_warm 命中分支)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_none_when_no_warm_session(store: SqlSandboxInstanceStore) -> None:
+    assert await store.get_warm(tenant_id=uuid4(), user_id=uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_none_while_still_creating(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    """还在冷启窗口内(``container_id`` 仍 NULL)的行不是一个能
+    ``destroy`` 的容器 —— ``get_warm`` 必须把它当成"没有"处理,不能把
+    ``None`` 的 container_id 塞进返回的元组里(签名是 ``tuple[UUID, str]``,
+    不是 ``tuple[UUID, str | None]``)。"""
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_the_ready_session(store: SqlSandboxInstanceStore) -> None:
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-live")
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) == (sandbox_id, "e2b-live")
+
+
+@pytest.mark.asyncio
+async def test_get_warm_ignores_a_destroyed_row(store: SqlSandboxInstanceStore) -> None:
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-dead")
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_excludes_docker_backend_rows(store: SqlSandboxInstanceStore) -> None:
+    """迁移 0142 的后端限定谓词 —— docker-supervisor 名下的热行不是本后端
+    的 ``get_warm`` 该看见的东西(同 ``count_active_for_tenant``/``list_active``
+    的既有谓词)。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_is_scoped_to_the_given_tenant(store: SqlSandboxInstanceStore) -> None:
+    """两个不同租户各自给同一个 ``user_id`` 建了一个已就绪的热会话 ——
+    按 ``tenant_id`` 查必须只看到自己那个。变异复验:去掉 ``tenant_id``
+    谓词会让两行同时匹配 ``.one_or_none()``,本测试会因
+    ``MultipleResultsFound`` 转红。"""
+    user_id = uuid4()
+    tenant_a, tenant_b = uuid4(), uuid4()
+    sandbox_a, sandbox_b = uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_a, user_id=user_id, sandbox_id=sandbox_a)
+    await store.set_container_id(sandbox_id=sandbox_a, container_id="tenant-a-live")
+    await store.claim_warm(tenant_id=tenant_b, user_id=user_id, sandbox_id=sandbox_b)
+    await store.set_container_id(sandbox_id=sandbox_b, container_id="tenant-b-live")
+
+    assert await store.get_warm(tenant_id=tenant_a, user_id=user_id) == (
+        sandbox_a,
+        "tenant-a-live",
+    )
+    assert await store.get_warm(tenant_id=tenant_b, user_id=user_id) == (
+        sandbox_b,
+        "tenant-b-live",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_warm_is_scoped_to_the_given_user(store: SqlSandboxInstanceStore) -> None:
+    """同一租户下两个不同用户各自有一个已就绪的热会话 —— 按 ``user_id``
+    查必须只看到自己那个。变异复验:去掉 ``user_id`` 谓词会让两行同时匹配
+    ``.one_or_none()``,本测试会因 ``MultipleResultsFound`` 转红。"""
+    tenant_id = uuid4()
+    user_a, user_b = uuid4(), uuid4()
+    sandbox_a, sandbox_b = uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_a, sandbox_id=sandbox_a)
+    await store.set_container_id(sandbox_id=sandbox_a, container_id="user-a-live")
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_b, sandbox_id=sandbox_b)
+    await store.set_container_id(sandbox_id=sandbox_b, container_id="user-b-live")
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_a) == (sandbox_a, "user-a-live")
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_b) == (sandbox_b, "user-b-live")

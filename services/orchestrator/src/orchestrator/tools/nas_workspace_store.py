@@ -127,12 +127,14 @@ from orchestrator.tools.sandbox import SandboxSupervisorError
 from orchestrator.tools.workspace_store import WorkspaceFileEntry
 
 if TYPE_CHECKING:
-    # Only used for the ``runtime`` field's type — wave 2 Task 4 wires it up
-    # (mark_deleted tearing down a warm sandbox session). Deferred behind
-    # TYPE_CHECKING so this module never needs a real import path into
-    # ``orchestrator.tools.sandbox`` at runtime, keeping the two modules free
-    # to evolve independently.
+    # Only used for the ``runtime``/``instance_store`` fields' types — wave 2
+    # Task 4 wires them up (mark_deleted tearing down a warm sandbox
+    # session). Deferred behind TYPE_CHECKING so this module never needs a
+    # real import path into ``orchestrator.tools.sandbox`` /
+    # ``orchestrator.tools.sandbox_instance_store`` at runtime, keeping the
+    # modules free to evolve independently.
     from orchestrator.tools.sandbox import SandboxRuntime
+    from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
 logger = logging.getLogger(__name__)
 
@@ -209,11 +211,27 @@ class NasWorkspaceStore:
     """
 
     root: str
-    #: Wave 2 Task 4 wiring — ``mark_deleted`` will use this to tear down a
-    #: warm sandbox session before marking the workspace deleted (mirroring
-    #: the supervisor's own destroy-then-mark sequencing). This task never
-    #: reads it; it stays ``None``.
+    #: Wave 2 Task 4 — ``mark_deleted`` uses this (together with
+    #: :attr:`instance_store`) to tear down the user's warm sandbox session
+    #: after marking the workspace deleted. ``None`` (the wave 1/3 default,
+    #: e.g. ``persistence_backend="memory"`` or a unit test that never wires
+    #: a sandbox runtime) skips teardown entirely — the marker alone is
+    #: still written, so a *later* ``acquire`` is refused (spec § 五之二's
+    #: acquire-time soft-delete gate in ``AgentSandboxClient``); this field
+    #: only controls whether an *already-warm* session gets pre-emptively
+    #: killed.
     runtime: SandboxRuntime | None = None
+    #: Wave 2 Task 4 — the same ``sandbox_instance`` store
+    #: ``AgentSandboxClient`` uses for its warm-session CAS. ``mark_deleted``
+    #: reads :meth:`SandboxInstanceStore.get_warm` through it to find the
+    #: sandbox id :attr:`runtime` should ``destroy``. Wired as a *separate*
+    #: field rather than reaching through ``runtime`` because
+    #: :class:`~orchestrator.tools.sandbox.SandboxRuntime` (the Protocol
+    #: ``runtime`` is typed as) has no ``get_warm`` — that method lives on
+    #: the store, not the runtime. Both are supplied together by
+    #: ``build_workspace_store`` in production; either being ``None`` (not
+    #: just both) skips teardown — see :meth:`mark_deleted`.
+    instance_store: SandboxInstanceStore | None = None
 
     def _user_root(self, tenant_id: UUID, user_id: UUID) -> Path:
         return (Path(self.root) / str(tenant_id) / str(user_id)).resolve()
@@ -394,6 +412,44 @@ class NasWorkspaceStore:
         await asyncio.to_thread(_delete)
 
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """Soft-delete the workspace, then tear down any warm sandbox session.
+
+        Wave 2 Task 4 addition to the marker-write this method already did
+        (see module docstring "Marker semantics"): once the marker is on
+        disk, a sandbox the user is *currently* using should not keep
+        running against a workspace that just got cut loose from purge —
+        it would otherwise sit warm (spec's default idle TTL is 15 minutes)
+        with no user around to notice, and the next ``acquire`` for this
+        ``(tenant, user)`` is refused by ``AgentSandboxClient``'s own
+        soft-delete gate anyway, so leaving the *existing* session alive
+        would just be an inconsistency window, not a real capability.
+
+        Ordering is deliberate: the marker write happens first and is not
+        undone if the teardown below fails. ``mark_deleted``'s only durable
+        side effect that matters for correctness is the marker (it is what
+        blocks future ``acquire`` calls); the teardown is a best-effort
+        cleanup of a session that may not even exist. Letting a teardown
+        failure propagate — rather than swallowing it — matters for a
+        different reason: ``user_purge.py`` records this step's outcome in
+        its per-step failure summary and audits it, and a swallowed
+        exception would report success while a running microVM with a stale
+        ``EgressContext`` for a purged user's workspace stays up until the
+        20-minute platform timeout. The marker having already landed makes
+        this safe to retry — retrying only repeats the (idempotent) marker
+        write and the teardown lookup, never re-does anything destructive.
+
+        ``runtime``/``instance_store`` both being unset (wave 1/3 default —
+        no sandbox runtime wired, e.g. ``persistence_backend="memory"`` or a
+        unit test) skips teardown entirely; the marker write above still
+        ran. Requiring *both* rather than just ``runtime`` is deliberate:
+        ``get_warm`` lives on :attr:`instance_store`, not on
+        :attr:`runtime` (:class:`~orchestrator.tools.sandbox.SandboxRuntime`
+        has no such method) — one configured without the other is a
+        wiring bug this store has no way to recover from, so it degrades
+        the same way "neither configured" does rather than raising an
+        ``AttributeError`` that would look like a filesystem failure.
+        """
+
         def _mark() -> None:
             dfd, name = self._open_parent_dir_fd(tenant_id, user_id, DELETED_MARKER, create=True)
             try:
@@ -417,4 +473,19 @@ class NasWorkspaceStore:
         await asyncio.to_thread(_mark)
         logger.info(
             "nas_workspace_store.marked_deleted tenant_id=%s user_id=%s", tenant_id, user_id
+        )
+
+        if self.runtime is None or self.instance_store is None:
+            return
+        warm = await self.instance_store.get_warm(tenant_id=tenant_id, user_id=user_id)
+        if warm is None:
+            return
+        sandbox_id, _container_id = warm
+        await self.runtime.destroy(sandbox_id=sandbox_id, reason="workspace_deleted")
+        logger.info(
+            "nas_workspace_store.destroyed_warm_session_on_delete "
+            "tenant_id=%s user_id=%s sandbox_id=%s",
+            tenant_id,
+            user_id,
+            sandbox_id,
         )

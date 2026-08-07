@@ -163,3 +163,67 @@ def test_workspace_store_falls_back_to_supervisor_without_a_usable_nas_root(
     s = Settings(workspace_nas_root=root, sandbox_supervisor_url="http://sup:8080")
     store = build_workspace_store(s)
     assert isinstance(store, SupervisorWorkspaceStore)
+
+
+def test_agent_sandbox_backend_passes_through_workspace_mount_settings() -> None:
+    """波 2 Task 4 —— 三项 NAS 工作区挂载配置从 ``Settings`` 原样传到
+    ``AgentSandboxClient``,不配就是 dataclass 默认值(波 1 行为)。"""
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        sandbox_workspace_subpath_prefix="ew",
+        workspace_nas_root="/mnt/workspaces",
+    )
+    runtime = build_sandbox_runtime(s)
+    assert isinstance(runtime, AgentSandboxClient)
+    assert runtime.workspace_pv_name == "workspace-nas"
+    assert runtime.workspace_subpath_prefix == "ew"
+    assert runtime.workspace_root == "/mnt/workspaces"
+
+
+def test_agent_sandbox_backend_workspace_mount_settings_default_to_wave1_behaviour() -> None:
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+    )
+    runtime = build_sandbox_runtime(s)
+    assert isinstance(runtime, AgentSandboxClient)
+    assert runtime.workspace_pv_name is None
+    assert runtime.workspace_subpath_prefix == ""
+    assert runtime.workspace_root is None
+
+
+def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -> None:
+    """波 2 Task 4 —— app.py 的接线顺序:``build_workspace_store`` 接收
+    ``build_sandbox_runtime`` 的返回值 + 同一个 instance store,原样转给
+    ``NasWorkspaceStore``(``mark_deleted`` 靠它们拆热会话)。"""
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        workspace_nas_root="/mnt/workspaces",
+    )
+    instance_store = InMemorySandboxInstanceStore()
+    runtime = build_sandbox_runtime(s, sandbox_instance_store=instance_store)
+
+    store = build_workspace_store(s, runtime=runtime, instance_store=instance_store)
+
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.runtime is runtime
+    assert store.instance_store is instance_store
+
+
+def test_workspace_store_runtime_and_instance_store_default_to_none() -> None:
+    """调用方不传 —— 与 Task 3 的行为一致(``mark_deleted`` 只写 marker,
+    不拆热会话)。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.runtime is None
+    assert store.instance_store is None

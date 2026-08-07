@@ -198,3 +198,46 @@ async def test_create_ephemeral_does_not_overwrite_existing_row() -> None:
 
     # warm 行原样健在:user_id 仍在、_warm 指针没悬空
     assert await store.is_warm_session(sandbox_id=sandbox_id) is True
+
+
+# ---------------------------------------------------------------------------
+# 沙箱迁移波 2 Task 4 —— get_warm(只读版本的 claim_warm 命中分支)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_none_when_no_warm_session() -> None:
+    store = InMemorySandboxInstanceStore()
+    assert await store.get_warm(tenant_id=uuid4(), user_id=uuid4()) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_none_while_still_creating() -> None:
+    """镜像 SQL 侧同名测试 —— ``_warm`` 指针已经落下,但赢家自己那行还没
+    回填 ``container_id``,不是一个能 ``destroy`` 的容器。"""
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_warm_returns_the_ready_session() -> None:
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-live")
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) == (sandbox_id, "e2b-live")
+
+
+@pytest.mark.asyncio
+async def test_get_warm_ignores_a_destroyed_row() -> None:
+    store = InMemorySandboxInstanceStore()
+    tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
+    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-dead")
+    await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
+
+    assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
