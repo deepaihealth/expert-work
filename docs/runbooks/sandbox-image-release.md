@@ -43,3 +43,102 @@
 ## 回滚
 
 换回上一个 sha tag,重跑第 3 步。镜像无状态,池滚动替换即完成。
+
+## 波 2 首发步骤(NAS 工作区上线,一次性)
+
+> 沙箱迁移波 2(`docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md`)
+> 把用户工作区从沙箱本地盘搬到 NAS(`workspace-nas` PV/PVC,§ 三),技能文件搬到
+> 沙箱本地盘 `/opt/skills`(§ 四),并改造了沙箱镜像(容器 root 启动、不预建
+> `/workspace`——W2 Task 9,见本文件上方「发布步骤」)。**这是两条独立发布线的
+> 一次性协同上线**:control-plane/admin-ui 走常规 `tools/deploy/release.sh`,
+> 沙箱镜像走本文件的「发布步骤」——W2 两条都要走,且顺序敏感,漏一步或调换顺序
+> 会导致上传/`exec` 写工作区在发布后立刻失败。按下列顺序执行。
+
+### 1. 在 NAS 上建 `/workspaces` 目录(必须先于 PVC 挂载生效)
+
+`workspace-nas` PV 的 `path` 是 `/workspaces`——NAS 根上的一个子目录。CSI 驱动
+只挂载已存在的路径,不会替你新建;PV/PVC apply 早于这一步的话,`control-plane`
+挂上去的要么是空挂载点要么行为未定义(探针报告「一、根因」一节里 mountPath 相关
+的教训:平台对不存在路径的行为不可预期,别赌它会自动建)。用一个挂 W0 PoC 遗留
+`nas-test-pvc`(同一 NAS 文件系统,挂载在 NAS 根 `/`,仍在集群里,见探针报告
+§ 五)的临时 Pod 建它:
+
+```bash
+export KUBECONFIG=~/.kube/expert-work-test.yaml
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: w2-workspaces-mkdir
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: mkdir
+      image: busybox
+      command:
+        - sh
+        - -c
+        - mkdir -p /mnt/nas/workspaces && chmod 777 /mnt/nas/workspaces && ls -la /mnt/nas
+      volumeMounts:
+        - name: nas
+          mountPath: /mnt/nas
+  volumes:
+    - name: nas
+      persistentVolumeClaim:
+        claimName: nas-test-pvc
+EOF
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/w2-workspaces-mkdir -n default --timeout=60s
+kubectl logs pod/w2-workspaces-mkdir -n default
+kubectl delete pod/w2-workspaces-mkdir -n default
+```
+
+**`chmod 777` 不是可选的一步**:集群实测 NAS 新建子目录属主是 root(spec
+§ 二之二),而 `control-plane` 容器以非 root 身份运行(uid 10002,见
+`services/control-plane/Dockerfile` 的 `useradd --uid 10002 ... expert_work` /
+`USER expert_work`)。只 `mkdir` 不 `chmod` 的话,`NasWorkspaceStore` 第一次在
+`/workspaces` 下建 `{tenant_id}/{user_id}` 子树(即端到端验收第一项"前端上传
+文档")会撞 `PermissionError`——这不是新推测,是同一份"NAS 新目录属主 root、非
+root 写入被拒"事实(探针报告 § 一;`AgentSandboxClient._ensure_workspace_dir`
+docstring 同一句话)在 control-plane 这一层的必然重现,只是这次挡的是
+control-plane 而不是沙箱。**这一层的权限设置没有随任何一个 W2 Task 的代码改动
+自动发生**——之前没有任何一个 Task 报告测过"control-plane 真的能在 `/workspaces`
+下建目录"这条,发布后第一次上传文档如果报 500,先查这个。
+
+### 2. apply PV/PVC(base 已含,随常规发布带出)
+
+`workspace-nas` PV/PVC 定义在 `infra/k8s/base/control-plane/workspace-nas.yaml`
+(W2 Task 2),已进 `infra/k8s/base/kustomization.yaml`,不需要单独 `kubectl
+apply`——下一步的常规发布会带出它。要脱离常规发布单独校验 manifest 是否合法:
+
+```bash
+kustomize build infra/k8s/overlays/test | kubectl apply --dry-run=client -f -
+```
+
+### 3. `tools/deploy/release.sh` 常规发布(control-plane / admin-ui)
+
+走常规发布路径,带上 W2 新增的三个配置项(已在
+`infra/k8s/overlays/test/configmap-patch.yaml` 里,零手工步骤):
+`EXPERT_WORK_WORKSPACE_NAS_ROOT` / `EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME` /
+`EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX`。新镜像含 W2 全部代码
+(`NasWorkspaceStore`、技能 per-agent 落点、软删闸)。
+
+### 4. 沙箱镜像换 tag(W2 Task 9 改了 `infra/sandbox-image/Dockerfile`)
+
+这是本文件开头「发布步骤」一节要走的**另一条**发布线,不是第 3 步的
+control-plane 发布——W2 首发两条都要走。等本分支合并 main 后 CI 自动构建新镜像
+(约 30 分钟),按本文件「发布步骤」一节换 `infra/k8s/sandbox/sandboxset.yaml`
+的 tag。**永不复用已存在的 tag**(本文件已有的规则,W2 同样适用——W2 Task 9
+改了 Dockerfile,旧 tag 对应的镜像仍是改造前的"非 root + 预建 `/workspace`"
+版本,沙箱侧挂载会照 § 一 的旧根因原样失败)。
+
+### 5. 冒烟
+
+```bash
+kubectl exec deploy/control-plane -n expert-work -- ls /mnt/workspaces
+# 应看到第 1 步建的空目录(还没有 tenant 子树——首次真实上传/exec 之后才会出现)
+```
+
+第 4 步换完 tag、SandboxSet 回到 `UPDATEDAVAILABLEREPLICAS=1` 后,再走
+`docs/research/2026-08-07-sandbox-w2-probe-results.md`「九、端到端验收清单」
+确认真实 `acquire` 能挂上 NAS、`exec` 能写进去。
