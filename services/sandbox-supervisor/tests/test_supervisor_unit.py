@@ -123,6 +123,7 @@ class RecordingDockerClient:
         existing_images: set[str] | None = None,
         pull_error: DockerError | None = None,
         seed_error: DockerError | None = None,
+        chown_error: DockerError | None = None,
     ) -> None:
         self.launches: list[list[str]] = []
         self.removed: list[str] = []
@@ -151,6 +152,9 @@ class RecordingDockerClient:
         self._seed_error = seed_error
         #: (container_name, [(path, bytes), ...]) for each seed_workspace call.
         self.seeds: list[tuple[str, list[tuple[str, bytes]]]] = []
+        self._chown_error = chown_error
+        #: (volume, image) for each chown_volume call.
+        self.chowns: list[tuple[str, str]] = []
 
     async def launch(self, argv: list[str]) -> FakeRunnerLink:
         self.launches.append(argv)
@@ -217,6 +221,11 @@ class RecordingDockerClient:
         self.seeds.append((container_name, files))
         if self._seed_error is not None:
             raise self._seed_error
+
+    async def chown_volume(self, *, volume: str, image: str) -> None:
+        self.chowns.append((volume, image))
+        if self._chown_error is not None:
+            raise self._chown_error
 
     async def image_exists(self, image: str) -> bool:
         return image in self._existing_images
@@ -633,6 +642,64 @@ async def test_acquire_with_user_mounts_persistent_volume() -> None:
     row = h.store.rows[response.sandbox_id]
     assert row.user_id == user
     assert row.workspace_id is not None
+
+
+# ---------------------------------------------------------------------------
+# W2 Task 6 follow-up — chown the persistent volume after every cold start
+# (docker resets --workdir /workspace's ownership to root:root on *every*
+# container creation, not just the volume's first mount — see
+# CliDockerClient.chown_volume's docstring for the full repro)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_chowns_persistent_volume_after_cold_start() -> None:
+    h = _harness()
+    tenant, user = uuid4(), uuid4()
+    response = await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+
+    volume = workspace_volume_name(tenant, user)
+    assert h.docker.chowns == [(volume, SandboxSupervisorSettings().sandbox_image)]
+    row = h.store.rows[response.sandbox_id]
+    assert row.state is SandboxState.IN_USE
+
+
+@pytest.mark.asyncio
+async def test_acquire_ephemeral_does_not_chown() -> None:
+    # No user_id → the ephemeral tmpfs path; nothing to chown (mode=1777
+    # already lets the non-root agent write regardless of ownership).
+    h = _harness()
+    await h.supervisor.acquire(_acquire_request())
+    assert h.docker.chowns == []
+
+
+@pytest.mark.asyncio
+async def test_acquire_warm_session_reuse_does_not_rechown() -> None:
+    # A second acquire for the same (tenant, user) that reuses the warm
+    # session never calls docker.launch() at all, so there's no fresh
+    # --workdir reset to fix — chown must not run again (idempotent AND
+    # cheap: no extra docker round-trip on the hot warm-reuse path).
+    h = _harness()
+    tenant, user = uuid4(), uuid4()
+    await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+    await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+
+    assert len(h.docker.launches) == 1
+    assert len(h.docker.chowns) == 1
+
+
+@pytest.mark.asyncio
+async def test_acquire_chown_failure_marks_failed_and_raises() -> None:
+    # chown failing must fail the whole acquire closed (DockerError →
+    # SupervisorError, same contract as a launch/wait_ready failure) —
+    # never hand back a sandbox that silently can't write its own
+    # workspace.
+    h = _harness(docker=RecordingDockerClient(chown_error=DockerError("chown boom")))
+    with pytest.raises(SupervisorError, match="sandbox launch failed"):
+        await h.supervisor.acquire(_acquire_request(user_id=uuid4()))
+
+    states = [r.state for r in h.store.rows.values()]
+    assert states == [SandboxState.FAILED]
 
 
 @pytest.mark.asyncio

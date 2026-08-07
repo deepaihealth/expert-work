@@ -237,6 +237,22 @@ class SandboxSupervisor:
                 self._run_argv(record, workspace_volume=workspace_volume)
             )
             await link.wait_ready(self._settings.runner_ready_timeout_s)
+            if workspace_volume is not None:
+                # supervisor-freeze exception #3 (same source as the other
+                # two Task 6 exceptions — a necessary companion to this
+                # wave's image rework, not a scope-creep addition). The
+                # sandbox's own docker run always sets --workdir /workspace
+                # (F.3 SandboxRuntimeProvider) to restore cwd now that the
+                # image no longer declares one; empirically, when --workdir
+                # names a path that's also a volume mount target, docker
+                # resets that directory's ownership to root:root on *every*
+                # container creation (not just the volume's first mount —
+                # see CliDockerClient.chown_volume's docstring for the full
+                # repro). A non-root --user sandbox can then never write its
+                # own /workspace. Fixing it here (after the container is up,
+                # not before the launch) is the only place the chown sticks
+                # for *this* container's view — see the docstring for why.
+                await self._docker.chown_volume(volume=workspace_volume, image=record.image_ref)
         except (DockerError, RunnerLinkError) as exc:
             await self._store.update(record.with_state(SandboxState.FAILED))
             msg = f"sandbox launch failed: {exc}"

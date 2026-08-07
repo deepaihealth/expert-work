@@ -18,6 +18,7 @@ import tarfile
 from typing import Protocol
 
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
+from expert_work.runtime.sandbox import SANDBOX_AGENT_GID, SANDBOX_AGENT_UID
 from sandbox_supervisor.runner_link import PipeRunnerLink, RunnerLink
 
 logger = logging.getLogger(__name__)
@@ -53,16 +54,18 @@ _READ_LIMIT = 4 * 1024 * 1024
 _ORPHAN_NAME_PREFIX = "expert-work-sb-"
 
 #: Hardening flags shared by every throwaway aux container that touches a
-#: named volume (read/list/write/delete/measure/archive) — network-isolated,
-#: read-only rootfs, all capabilities dropped, no privilege escalation.
-#: These are *not* the sandbox launch (that argv comes from the F.3
-#: ``SandboxRuntimeProvider``, W2 Task 6's ``--user``/tmpfs additions live
-#: there, not here) — each of these six is a one-shot ``--rm`` container
-#: that mounts a volume at ``/ws`` and runs a single coreutils/python
-#: command, so it stays root (the image's ``docker run`` default since W2
-#: Task 9 dropped ``USER agent``) rather than the non-root sandbox identity;
-#: forcing ``--user`` here would risk it being unable to read/write a
-#: volume whose top-level ownership it doesn't control.
+#: named volume (read/list/write/delete/measure/archive/chown) —
+#: network-isolated, read-only rootfs, all capabilities dropped, no
+#: privilege escalation. These are *not* the sandbox launch (that argv
+#: comes from the F.3 ``SandboxRuntimeProvider``, W2 Task 6's
+#: ``--user``/tmpfs additions live there, not here) — each of these seven
+#: is a one-shot ``--rm`` container that mounts a volume at ``/ws`` and
+#: runs a single coreutils/python command, so it stays root (the image's
+#: ``docker run`` default since W2 Task 9 dropped ``USER agent``) rather
+#: than the non-root sandbox identity; forcing ``--user`` here would risk
+#: it being unable to read/write a volume whose top-level ownership it
+#: doesn't control (``chown_volume`` is the one exception that adds
+#: ``CAP_CHOWN`` back — see its docstring).
 _AUX_CONTAINER_HARDENING_ARGS = [
     "--network",
     "none",
@@ -108,6 +111,18 @@ class DockerClient(Protocol):
 
     async def delete_volume_file(self, *, volume: str, path: str, image: str) -> None:
         """Delete ``path`` from a named volume (workspace cleanup)."""
+
+    async def chown_volume(self, *, volume: str, image: str) -> None:
+        """Fix a named volume's top-level ownership to ``SANDBOX_AGENT_UID``/
+        ``SANDBOX_AGENT_GID`` (J.15 persistent workspace — W2 Task 6 follow-up).
+
+        Must run after every cold-start ``launch()`` of a workspace-volume-
+        backed sandbox, not just the volume's first-ever mount — see
+        :meth:`CliDockerClient.chown_volume` for why. Raises
+        :class:`DockerError` on failure (the caller fails the whole acquire
+        closed rather than hand back a sandbox that can't write its own
+        workspace).
+        """
 
     async def measure_volume_size(self, *, volume: str, image: str) -> int:
         """Return the total ``/workspace`` size in bytes for a named volume.
@@ -409,6 +424,71 @@ class CliDockerClient:
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             msg = f"workspace file delete failed for {path!r}: {detail}"
+            raise DockerError(msg)
+
+    async def chown_volume(self, *, volume: str, image: str) -> None:
+        """Fix a named volume's top-level ownership to ``agent:agent`` (uid/gid
+        ``SANDBOX_AGENT_UID``/``SANDBOX_AGENT_GID`` — J.15 persistent
+        workspace, W2 Task 6 follow-up).
+
+        **Why this exists.** The image (W2 Task 9) no longer bakes / chowns
+        a ``/workspace`` directory (the run root must stay bare for ACS's
+        NAS-mount symlink — spec § 二之二), so a docker named volume no
+        longer inherits agent ownership on first mount the way it used to.
+        Worse, empirically confirmed against this repo's sandbox image
+        (Docker 29.6.1 / containerd 2.2.5, but this is standard ``docker
+        run`` behaviour, not image-specific): whenever ``--workdir`` names a
+        path that is *also* a volume mount target, the runtime resets that
+        directory's ownership to root:root as part of container setup —
+        **on every single container creation**, not just the volume's first
+        mount, and it sticks (durable on the volume itself, not just that
+        container's view). Reproduction::
+
+            docker volume create v
+            docker run --rm --cap-add CHOWN -v v:/w --entrypoint chown IMAGE 10000:10000 /w
+            docker run --rm --user 10000:10000 --workdir /workspace -v v:/workspace IMAGE ...
+            # /workspace is root:root again inside this container, even
+            # though the volume was just chowned to 10000:10000.
+
+        Since the sandbox's own ``docker run`` always sets ``--workdir
+        /workspace`` (W2 Task 6, ``runtime_provider.py``) to restore cwd, a
+        chown *before* that ``docker run`` is undone by the very same
+        invocation. The fix instead chowns *after* the sandbox container is
+        already up (supervisor.py's acquire path) — the reset already
+        happened during that container's own setup, and chowning the same
+        volume from a separate throwaway container (this method, mounted at
+        ``/ws``, not ``/workspace`` — matching the other five volume aux
+        ops) takes effect immediately for the already-running sandbox too,
+        since it's the same underlying volume. This has to run after every
+        cold-start launch of a workspace-volume-backed sandbox, not only
+        the very first one — repeating it on an already-correctly-owned
+        volume is a cheap no-op (plain ``chown``), so this is safe to call
+        unconditionally on that path.
+
+        Needs ``CAP_CHOWN`` — the shared ``_AUX_CONTAINER_HARDENING_ARGS``
+        drop ALL capabilities, so this call adds it back explicitly (root
+        without CAP_CHOWN cannot chown a file it doesn't already own,
+        verified). Raises :class:`DockerError` on a non-zero exit.
+        """
+        argv = [
+            "docker",
+            "run",
+            "--rm",
+            *_AUX_CONTAINER_HARDENING_ARGS,
+            "--cap-add",
+            "CHOWN",
+            "--volume",
+            f"{volume}:/ws",
+            "--entrypoint",
+            "chown",
+            image,
+            f"{SANDBOX_AGENT_UID}:{SANDBOX_AGENT_GID}",
+            "/ws",
+        ]
+        _, stderr, code = await self._exec(argv)
+        if code != 0:
+            detail = stderr.strip() or "non-zero exit"
+            msg = f"volume chown failed for {volume!r}: {detail}"
             raise DockerError(msg)
 
     async def measure_volume_size(self, *, volume: str, image: str) -> int:

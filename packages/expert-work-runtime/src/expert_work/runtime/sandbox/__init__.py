@@ -12,6 +12,12 @@ from expert_work.runtime.sandbox.runtime_provider import (
     DEFAULT_RESOURCE_LIMITS as DEFAULT_RESOURCE_LIMITS,
 )
 from expert_work.runtime.sandbox.runtime_provider import (
+    SANDBOX_AGENT_GID as SANDBOX_AGENT_GID,
+)
+from expert_work.runtime.sandbox.runtime_provider import (
+    SANDBOX_AGENT_UID as SANDBOX_AGENT_UID,
+)
+from expert_work.runtime.sandbox.runtime_provider import (
     SandboxOciRuntime as SandboxOciRuntime,
 )
 from expert_work.runtime.sandbox.runtime_provider import (
@@ -27,6 +33,8 @@ from expert_work.runtime.sandbox.runtime_provider import (
 __all__ = [
     "DEFAULT_EGRESS_NETWORK",
     "DEFAULT_RESOURCE_LIMITS",
+    "SANDBOX_AGENT_GID",
+    "SANDBOX_AGENT_UID",
     "SandboxOciRuntime",
     "SandboxResourceLimits",
     "SandboxRuntimeProvider",

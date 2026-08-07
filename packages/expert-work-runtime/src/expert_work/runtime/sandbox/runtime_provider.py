@@ -215,14 +215,16 @@ class SandboxRuntimeProvider:
         # ``/workspace`` ownership (``agent:agent``); that relied on the
         # image baking a ``WORKDIR /workspace`` + chown, which W2 Task 9
         # removed (the run root must stay bare for ACS's NAS-mount
-        # symlink). Empirically reconfirmed post-Task-9 (``docker run
-        # --user 10000:10000 -v freshvol:/workspace <image> touch
-        # /workspace/x`` → ``Permission denied``): a never-before-mounted
-        # volume now lands root:root, so the non-root --user above cannot
-        # write into it until something chowns it once. No such bootstrap
-        # exists yet — flagged as a W2 Task 6 follow-up (would need a new
-        # docker_client aux op + a supervisor call site, both beyond this
-        # task's two authorized touch points), not fixed here.
+        # symlink). Worse than a first-mount-only gap: since ``--workdir``
+        # (below, in ``docker_run_argv``) always targets this same
+        # ``/workspace`` path, docker resets its ownership to root:root on
+        # *every* container creation, not just the volume's first mount —
+        # so no mount-option fix exists here at all (unlike the tmpfs
+        # branch's ``uid=``/``gid=``/``mode=``, ``--volume`` has no such
+        # option). Fixed one level up, post-launch:
+        # ``CliDockerClient.chown_volume`` + its ``supervisor.py`` call
+        # site (its docstring has the full repro + why it must run after
+        # the container starts, not before).
         return ["--volume", f"{workspace_volume}:/workspace"]
 
 
