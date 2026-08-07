@@ -62,11 +62,14 @@ async def test_exec_python_runs_code_and_returns_output() -> None:
 @pytest.mark.asyncio
 async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
     # skill-runtime §5.1 — the build-bound skill seed set reaches acquire so the
-    # supervisor materializes /workspace/skills/<name>/ before the code runs.
+    # supervisor materializes /opt/skills/<agent_key>/<name>/ before the code
+    # runs (sandbox migration wave 2). This test only checks ExecPythonTool
+    # forwards whatever relpath it was given — the agent_key prefix itself is
+    # build_skill_seed_files's job (see test_skill_seed.py).
     client = RecordingSandboxRuntime(
         outcome=SandboxOutcome(stdout="", stderr="", exit_code=0, timed_out=False)
     )
-    seed = (("skills/pptx/SKILL.md", b"---\nname: pptx\n---\n"),)
+    seed = (("agent-1/pptx/SKILL.md", b"---\nname: pptx\n---\n"),)
     tool = ExecPythonTool(client=client, skill_seed_files=seed)
 
     await tool.call({"code": "pass"}, ctx=_ctx())

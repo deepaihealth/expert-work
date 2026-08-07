@@ -318,7 +318,37 @@ async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_seed_files_land_in_workspace(runtime: SandboxRuntime) -> None:
+async def test_exec_injects_per_agent_pythonuserbase(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2(spec 决策 10)—— 同用户双 agent 共享一个
+    沙箱时,``$HOME/.local`` 默认共享,pip --user 装包会互相覆盖/并发损坏。
+    ``agent_key`` 非空时两个后端都必须把它转成同一个 ``PYTHONUSERBASE`` 值
+    (``orchestrator.tools.sandbox.agent_key_envs`` 单源)。"""
+    from expert_work.persistence import SANDBOX_AGENTS_ROOT
+
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c16")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import os; print(os.environ.get('PYTHONUSERBASE'))",
+            timeout_s=30,
+            agent_key="contract-agent",
+        )
+        assert outcome.stdout.strip() == f"{SANDBOX_AGENTS_ROOT}/contract-agent"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_seed_files_land_under_the_sandbox_skills_root(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2 (spec § 四) — seed lands under
+    ``SANDBOX_SKILLS_ROOT`` (sandbox-local), not ``/workspace`` (NAS-backed,
+    wave 2's whole point is skills no longer occupying user workspace quota).
+    ``relpath`` here is exactly what the caller passes — the ``<agent_key>/``
+    namespace prefix is the *caller's* job (``build_skill_seed_files``), not
+    this layer's."""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+
     sid = await runtime.acquire(
         tenant_id=uuid4(),
         thread_id="c5",
@@ -327,7 +357,7 @@ async def test_seed_files_land_in_workspace(runtime: SandboxRuntime) -> None:
     try:
         outcome = await runtime.exec(
             sandbox_id=sid,
-            code="print(open('/workspace/seeded.txt').read())",
+            code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())",
             timeout_s=30,
         )
         assert "SEED_CONTENT" in outcome.stdout

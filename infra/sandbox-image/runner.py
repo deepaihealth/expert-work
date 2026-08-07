@@ -5,7 +5,12 @@ The Sandbox Supervisor (Stream F.1) attaches to the container's stdio,
 writes one request object per line, and reads one response per line:
 
     → {"code": "<python source>", "timeout_s": 30}
+    → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"}}
     ← {"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}
+
+``envs`` (sandbox migration wave 2, spec 决策 10) is optional and merged onto
+the child process's environment — currently just ``PYTHONUSERBASE`` per-agent
+isolation, sent by the supervisor's own ``ExecRequest.envs`` field.
 
 The submitted code runs in a *child* ``python -c`` process rather than in
 this interpreter. A child is killable on timeout and isolates a crashing
@@ -21,6 +26,7 @@ self-contained stdlib-only file.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import TextIO
@@ -42,13 +48,20 @@ MAX_OUTPUT_CHARS = 1_000_000
 Response = dict[str, str | int | bool]
 
 
-def run_once(code: str, timeout_s: int) -> Response:
+def run_once(code: str, timeout_s: int, envs: dict[str, str] | None = None) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
 
     ``timeout_s`` is clamped to ``[1, MAX_TIMEOUT_S]``. On timeout the
     child is killed and ``timed_out`` is ``True`` with ``exit_code`` -1.
+
+    ``envs`` (sandbox migration wave 2, spec 决策 10) is merged onto this
+    runner process's own environment for the child only — the runner's own
+    process env (and every other sandbox this runner never sees) is
+    untouched. ``None``/empty → the child inherits exactly what the runner
+    itself has, unchanged (pre-feature behaviour).
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
+    child_env = {**os.environ, **envs} if envs else None
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
@@ -60,6 +73,7 @@ def run_once(code: str, timeout_s: int) -> Response:
             text=True,
             timeout=timeout_s,
             check=False,
+            env=child_env,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -85,7 +99,13 @@ def handle_request(request: dict[str, object]) -> Response:
     # JSON numbers decode to int / float; a bool is an int subclass we
     # explicitly reject. Anything else falls back to the default.
     timeout_s = raw_timeout if type(raw_timeout) is int else DEFAULT_TIMEOUT_S
-    return run_once(code, timeout_s)
+    raw_envs = request.get("envs")
+    envs = (
+        {k: v for k, v in raw_envs.items() if isinstance(k, str) and isinstance(v, str)}
+        if isinstance(raw_envs, dict)
+        else None
+    )
+    return run_once(code, timeout_s, envs)
 
 
 def handle_line(line: str) -> Response:

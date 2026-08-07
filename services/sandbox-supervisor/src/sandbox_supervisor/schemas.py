@@ -88,6 +88,12 @@ class ExecRequest(BaseModel):
     code: str
     #: Per-call execution timeout; omitted → the sandbox's own default.
     timeout_s: int | None = Field(default=None, gt=0, le=300)
+    #: sandbox migration wave 2 (spec 决策 10) — per-agent env overrides for
+    #: this one exec call (currently just ``PYTHONUSERBASE`` isolation, built
+    #: by ``orchestrator.tools.sandbox.agent_key_envs``). Empty (default) →
+    #: no override, pre-feature behaviour. Not a general escape hatch: the
+    #: orchestrator is the only caller and only ever sends this one key.
+    envs: dict[str, str] = Field(default_factory=dict)
 
 
 class ExecResponse(BaseModel):

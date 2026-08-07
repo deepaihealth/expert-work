@@ -317,7 +317,12 @@ class SandboxSupervisor:
             )
 
     async def exec(
-        self, sandbox_id: UUID, *, code: str, timeout_s: int | None = None
+        self,
+        sandbox_id: UUID,
+        *,
+        code: str,
+        timeout_s: int | None = None,
+        envs: dict[str, str] | None = None,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -328,6 +333,12 @@ class SandboxSupervisor:
         The per-sandbox lock serialises concurrent execs sharing one
         warm session (the held pipe handles one exec at a time); each
         exec stamps ``last_used_at`` so the idle reaper measures from it.
+
+        ``envs`` (sandbox migration wave 2, spec 决策 10) — per-call env
+        overrides merged onto the runner subprocess's environment (currently
+        just ``PYTHONUSERBASE`` isolation). Re-asserted on every call rather
+        than baked in at acquire time: two agents can share one already-warm
+        session, so the value must be able to change call-to-call.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -337,7 +348,7 @@ class SandboxSupervisor:
         async with lock:
             await self._touch(sandbox_id)
             try:
-                return await link.exec(code, resolved_timeout)
+                return await link.exec(code, resolved_timeout, envs=envs)
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"
                 raise SupervisorError(msg) from exc

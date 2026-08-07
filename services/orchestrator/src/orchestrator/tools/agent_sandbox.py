@@ -103,8 +103,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
+from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
-from orchestrator.tools.sandbox import EgressContext, SandboxOutcome, SandboxSupervisorError
+from orchestrator.tools.sandbox import (
+    EgressContext,
+    SandboxOutcome,
+    SandboxSupervisorError,
+    agent_key_envs,
+)
 from orchestrator.tools.sandbox_image_contract import (
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
@@ -476,7 +482,13 @@ class AgentSandboxClient:
         # § 6.5 的统一错误契约:files.write 原样抛的是 e2b 自己的异常类型。
         try:
             for relpath, data in seed_files:
-                await sbx.files.write(f"{WORKSPACE_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER)
+                # sandbox migration wave 2 (spec § 四) — skills live on sandbox-
+                # local disk under SANDBOX_SKILLS_ROOT, not the user's NAS-backed
+                # WORKSPACE_ROOT; relpath is already namespaced under
+                # <agent_key>/ by the caller (build_skill_seed_files).
+                await sbx.files.write(
+                    f"{SANDBOX_SKILLS_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER
+                )
             if just_created:
                 # 连到既有热会话时该行的 container_id 已经是对的(existing 正是
                 # 从那里读出来的)—— 只有本次自己建/重建了沙箱才需要回填。
@@ -748,7 +760,9 @@ class AgentSandboxClient:
             logger.info("destroy: sandbox %s already gone", sandbox_id)
         await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
         PID 1,以下行号均指该文件。四个契约点,与它逐字对齐:
@@ -826,6 +840,14 @@ class AgentSandboxClient:
         :meth:`_attach` 与
         :meth:`SandboxInstanceStore.touch_and_get_container_id` 的
         docstring。
+
+        sandbox migration wave 2(spec 决策 10):``agent_key`` 非空时随
+        ``commands.run(envs=...)`` 注入 ``PYTHONUSERBASE``(:func:`agent_key_envs`
+        单源计算,与本地 supervisor 后端同一份值 —— 契约测试钉住)。egress
+        token 走 ``create(envs=...)``(§ 模块 docstring "Important-3")只送一
+        次;这里不同 —— SDK 的 ``commands.run`` 本就支持逐次传 envs,同用户
+        双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
+        的 agent_key"。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         effective = max(1, min(effective, MAX_TIMEOUT_S))
@@ -835,6 +857,7 @@ class AgentSandboxClient:
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         started = _monotonic()
+        envs = agent_key_envs(agent_key)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
@@ -842,6 +865,7 @@ class AgentSandboxClient:
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,
+                envs=envs or None,
             )
         except timeout_exc:
             return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)

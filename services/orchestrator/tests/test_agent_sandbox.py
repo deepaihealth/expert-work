@@ -63,6 +63,7 @@ import httpcore
 import pytest
 from e2b import CommandExitException, TimeoutException
 
+from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     InMemorySandboxInstanceStore,
@@ -103,6 +104,11 @@ class FakeCommands:
     """
 
     calls: list[tuple[str, int | None, str | None, str | None]] = field(default_factory=list)
+    #: spec 决策 10 — the ``envs`` kwarg passed to each ``run`` call, kept out
+    #: of ``calls`` (same reason as ``egress_calls``/``exec_agent_keys`` in
+    #: ``orchestrator.tools.sandbox``): existing 4-tuple assertions on
+    #: ``calls`` stay unchanged.
+    envs_calls: list[dict[str, str] | None] = field(default_factory=list)
     result_stdout: str = ""
     result_stderr: str = ""
     result_exit: int = 0
@@ -115,8 +121,10 @@ class FakeCommands:
         *,
         user: str | None = None,
         cwd: str | None = None,
+        envs: dict[str, str] | None = None,
     ):
         self.calls.append((cmd, timeout, user, cwd))
+        self.envs_calls.append(envs)
         if self.run_error is not None:
             raise self.run_error
         return type(
@@ -578,6 +586,9 @@ async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> No
 
 @pytest.mark.asyncio
 async def test_seed_files_written_before_first_exec() -> None:
+    """sandbox migration wave 2 — seed lands under SANDBOX_SKILLS_ROOT
+    (sandbox-local), not WORKSPACE_ROOT; relpath already carries the
+    agent_key namespace prefix (the caller's job, build_skill_seed_files)."""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
@@ -585,10 +596,12 @@ async def test_seed_files_written_before_first_exec() -> None:
         tenant_id=uuid4(),
         thread_id="t1",
         user_id=uuid4(),
-        seed_files=(("skills/a.md", b"hello"),),
+        seed_files=(("agent-1/pptx/a.md", b"hello"),),
     )
 
-    assert sdk.sandbox.files.written == [("/workspace/skills/a.md", b"hello", SANDBOX_EXEC_USER)]
+    assert sdk.sandbox.files.written == [
+        (f"{SANDBOX_SKILLS_ROOT}/agent-1/pptx/a.md", b"hello", SANDBOX_EXEC_USER)
+    ]
 
 
 @pytest.mark.asyncio
@@ -982,6 +995,36 @@ async def test_create_passes_the_image_environment() -> None:
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
     # egress 那组仍在 —— 合并没有把它挤掉。
     assert "HTTPS_PROXY" in envs
+
+
+@pytest.mark.asyncio
+async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
+    """sandbox migration wave 2(spec 决策 10)—— ``agent_key`` 非空时随
+    ``commands.run(envs=)`` 注入 ``PYTHONUSERBASE``,与本地 supervisor 后端
+    同一份值(``agent_key_envs`` 单源,两后端契约见
+    ``test_sandbox_runtime_contract.py``)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent")
+
+    assert sdk.sandbox.commands.envs_calls[-1] == {
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent"
+    }
+
+
+@pytest.mark.asyncio
+async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
+    """默认(未绑定 agent_key 的调用方,如老测试直调 exec)不该往 envs 里塞
+    任何东西 —— envs=None,不是 envs={}(避免猜 SDK 对空 dict 的语义)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    assert sdk.sandbox.commands.envs_calls[-1] is None
 
 
 def _dockerfile_text() -> str:

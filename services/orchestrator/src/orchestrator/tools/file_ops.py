@@ -468,7 +468,7 @@ class ReadFileTool:
 
     client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property
@@ -525,7 +525,7 @@ class WriteFileTool:
     """Atomically write a UTF-8 text file in the workspace (exposed as ``write_file``)."""
 
     client: SandboxRuntime
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
     #: Stream TE-8 — cross-replica per-workspace write lock held around the
     #: write exec. Defaults to a no-op (single process / tests).
@@ -601,7 +601,7 @@ class ListDirTool:
     """List a workspace directory (exposed as ``list_dir``)."""
 
     client: SandboxRuntime
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property
@@ -664,7 +664,7 @@ class EditFileTool:
     read. Exact match only here; fuzzy/anchored fallbacks land in TE-9b."""
 
     client: SandboxRuntime
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
     #: Stream TE-8 — write lock held around the edit exec.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)

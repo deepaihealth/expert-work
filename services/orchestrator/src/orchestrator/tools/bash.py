@@ -79,7 +79,7 @@ class BashTool:
     #: Stream TE-8 — cross-replica per-workspace write lock. bash can write
     #: anything, so it takes the same exclusive workspace lock as write_file.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property

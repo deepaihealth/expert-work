@@ -291,6 +291,30 @@ async def test_gate_45_exec_python_runs_code(expert_work: _Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
+# sandbox migration wave 2 (spec 决策 10) — per-exec PYTHONUSERBASE isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_envs_reach_the_subprocess(expert_work: _Harness) -> None:
+    """``envs`` really lands in the runner subprocess's environment — the
+    real end-to-end path ``ExecRequest.envs`` → supervisor → runner_link →
+    ``runner.py`` → ``subprocess.run(env=...)``. Same value the orchestrator
+    computes from ``agent_key`` (``agent_key_envs``, contract-tested against
+    the cloud backend in ``test_sandbox_runtime_contract.py``)."""
+    acquired = await expert_work.supervisor.acquire(_acquire_request("t-envs"))
+    result = await expert_work.supervisor.exec(
+        acquired.sandbox_id,
+        code="import os; print(os.environ.get('PYTHONUSERBASE'))",
+        envs={"PYTHONUSERBASE": "/opt/agents/a1"},
+    )
+    await expert_work.supervisor.release(acquired.sandbox_id)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "/opt/agents/a1"
+
+
+# ---------------------------------------------------------------------------
 # skill-runtime §5.1 — seed_files materialized into /workspace at acquire
 # ---------------------------------------------------------------------------
 

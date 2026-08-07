@@ -34,6 +34,7 @@ from uuid import UUID
 import httpx
 
 from expert_work.common.observability import inject_context
+from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
@@ -91,6 +92,22 @@ class EgressContext:
     denylist: tuple[str, ...] = ()
 
 
+def agent_key_envs(agent_key: str) -> dict[str, str]:
+    """Per-agent env overrides for an ``exec`` call (spec 决策 10).
+
+    Currently just ``PYTHONUSERBASE`` isolation: two agents sharing one warm
+    sandbox otherwise share ``$HOME/.local``, so a ``pip install --user`` from
+    one can clobber or race the other's packages (spec § 五之二 concurrency
+    review). Shared by both sandbox backends (:class:`HTTPSupervisorRuntime`
+    and ``AgentSandboxClient``) so the injected env is byte-identical —
+    contract-tested in ``test_sandbox_runtime_contract.py``. Empty
+    ``agent_key`` (a caller that never bound one) → no override.
+    """
+    if not agent_key:
+        return {}
+    return {"PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/{agent_key}"}
+
+
 def _traced_headers() -> dict[str, str]:
     """Outbound headers carrying the active W3C trace context (A.8).
 
@@ -132,15 +149,27 @@ class SandboxRuntime(Protocol):
         ``user_id`` set → the sandbox mounts that user's persistent
         workspace volume (Stream J.15); ``None`` → an ephemeral tmpfs.
         ``seed_files`` (skill-runtime §5.1) are ``(relpath, bytes)`` pairs the
-        supervisor materializes under ``/workspace`` before first exec — the
-        agent's activated skill files.
+        supervisor materializes under ``SANDBOX_SKILLS_ROOT`` (sandbox-local,
+        not ``/workspace`` — sandbox migration wave 2 spec § 四) before first
+        exec — the agent's activated skill files, already namespaced under
+        ``<agent_key>/`` by the caller (``build_skill_seed_files``).
         ``egress`` (sandbox-egress §3.3) carries the agent's egress policy +
         identity; normally injected by :class:`_EgressBindingClient`, so
         callers (``run_in_sandbox``) leave it ``None``.
         """
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
-        """Run ``code`` in the sandbox; return its captured outcome."""
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
+        """Run ``code`` in the sandbox; return its captured outcome.
+
+        ``agent_key`` (spec 决策 10) injects
+        ``PYTHONUSERBASE=SANDBOX_AGENTS_ROOT/<agent_key>`` so a ``pip install
+        --user`` stays isolated per agent even when two agents share one warm
+        sandbox; see :func:`agent_key_envs`. Normally injected by
+        :class:`_AgentKeyBindingClient`, so callers (``run_in_sandbox``) leave
+        it unset (``""`` → no override).
+        """
 
     async def release(self, *, sandbox_id: UUID) -> None:
         """Routine sandbox teardown (graceful)."""
@@ -212,10 +241,19 @@ class HTTPSupervisorRuntime:
         body = await self._post("/v1/sandboxes:acquire", json=payload)
         return UUID(str(body["sandbox_id"]))
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
         payload: dict[str, Any] = {"code": code}
         if timeout_s is not None:
             payload["timeout_s"] = timeout_s
+        # spec 决策 10 — PYTHONUSERBASE per agent. Same env dict the cloud
+        # backend builds for commands.run(envs=...) (agent_key_envs is the
+        # single source both backends call), sent over the supervisor's own
+        # exec envs channel (ExecRequest.envs, sandbox_supervisor/schemas.py).
+        envs = agent_key_envs(agent_key)
+        if envs:
+            payload["envs"] = envs
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
@@ -317,6 +355,11 @@ class RecordingSandboxRuntime:
     #: out of the ``acquired`` tuple so existing tests stay unchanged).
     egress_calls: list[EgressContext | None] = field(default_factory=list)
     execs: list[tuple[UUID, str]] = field(default_factory=list)
+    #: spec 决策 10 — the ``agent_key`` passed to each exec, kept out of
+    #: ``execs`` for the same reason ``egress_calls`` is kept out of
+    #: ``acquired``: existing tests asserting that tuple's shape stay
+    #: unchanged.
+    exec_agent_keys: list[str] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -337,9 +380,12 @@ class RecordingSandboxRuntime:
         self._next_id += 1
         return UUID(int=self._next_id)
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
+        self.exec_agent_keys.append(agent_key)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -389,8 +435,15 @@ class _EgressBindingClient:
             egress=self.egress,
         )
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
-        return await self.inner.exec(sandbox_id=sandbox_id, code=code, timeout_s=timeout_s)
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
+        # This wrapper doesn't own agent_key — it's a pure passthrough here so
+        # a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
+        # still reaches the real backend (spec 决策 10; see bind_agent_key).
+        return await self.inner.exec(
+            sandbox_id=sandbox_id, code=code, timeout_s=timeout_s, agent_key=agent_key
+        )
 
     async def release(self, *, sandbox_id: UUID) -> None:
         await self.inner.release(sandbox_id=sandbox_id)
@@ -407,6 +460,67 @@ def bind_egress(client: SandboxRuntime, egress: EgressContext | None) -> Sandbox
     if egress is None:
         return client
     return _EgressBindingClient(inner=client, egress=egress)
+
+
+@dataclass
+class _AgentKeyBindingClient:
+    """Wraps a :class:`SandboxRuntime`, injecting a fixed ``agent_key`` into
+    every ``exec`` (spec 决策 10 — ``PYTHONUSERBASE`` per-agent isolation).
+
+    Bound once per agent build (``agent_factory``) around the shared sandbox
+    client — mirrors :class:`_EgressBindingClient`, but binds into ``exec``
+    rather than ``acquire``: unlike the egress token (minted once at
+    container-create time, no re-mint on reconnect — see
+    ``AgentSandboxClient`` module docstring "Important-3"), ``PYTHONUSERBASE``
+    is a plain per-call env override both backends' exec channels support, so
+    it can — and must — be re-asserted on every call rather than baked in at
+    acquire time (two agents can share one *already-acquired* warm sandbox).
+    Every other call delegates unchanged.
+    """
+
+    inner: SandboxRuntime
+    agent_key: str
+
+    async def acquire(
+        self,
+        *,
+        tenant_id: UUID,
+        thread_id: str,
+        user_id: UUID | None = None,
+        seed_files: tuple[tuple[str, bytes], ...] = (),
+        egress: EgressContext | None = None,
+    ) -> UUID:
+        return await self.inner.acquire(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            seed_files=seed_files,
+            egress=egress,
+        )
+
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
+        # The bound key wins — callers (run_in_sandbox) don't supply their own.
+        return await self.inner.exec(
+            sandbox_id=sandbox_id, code=code, timeout_s=timeout_s, agent_key=self.agent_key
+        )
+
+    async def release(self, *, sandbox_id: UUID) -> None:
+        await self.inner.release(sandbox_id=sandbox_id)
+
+    async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
+        await self.inner.destroy(sandbox_id=sandbox_id, reason=reason)
+
+    async def reap(self, *, force: bool) -> int:
+        return await self.inner.reap(force=force)
+
+
+def bind_agent_key(client: SandboxRuntime, agent_key: str) -> SandboxRuntime:
+    """Wrap ``client`` so every exec carries ``agent_key`` (no-op if empty)."""
+    if not agent_key:
+        return client
+    return _AgentKeyBindingClient(inner=client, agent_key=agent_key)
 
 
 async def run_in_sandbox(
@@ -540,7 +654,8 @@ class ExecPythonTool:
     client: SandboxRuntime
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
     #: skill-runtime §5.1 — the agent's activated skill files, materialized
-    #: under ``/workspace/skills/<name>/`` on each acquire. Set at build.
+    #: under ``/opt/skills/<agent_key>/<name>/`` on each acquire (sandbox
+    #: migration wave 2). Set at build.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property

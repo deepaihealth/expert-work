@@ -131,12 +131,16 @@ from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
 from orchestrator.tools.registry import ToolContext, ToolRegistry
-from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_egress
+from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_agent_key, bind_egress
 from orchestrator.tools.skill_authoring import (
     SKILL_AUTHORING_BUILTINS,
     build_skill_authoring_tools,
 )
-from orchestrator.tools.skill_seed import build_skill_seed_files, seed_drop_audit_entries
+from orchestrator.tools.skill_seed import (
+    build_skill_seed_files,
+    sanitize_agent_key,
+    seed_drop_audit_entries,
+)
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
@@ -704,12 +708,19 @@ async def build_agent(
         activity_recorder=skill_activity_recorder,
         evolved=evolved_skills,
     )
+    # sandbox migration wave 2 (spec § 四) — the per-agent sandbox namespace,
+    # shared by the skill-seed anchor below and PYTHONUSERBASE (spec 决策 10,
+    # bound onto the sandbox runtime further down). Manifest name is the only
+    # stable identity available at build time (the DB row's UUID doesn't
+    # exist in this scope).
+    agent_key = sanitize_agent_key(spec.metadata.name)
     # skill-runtime §5.1 — activated skills' files (SKILL.md + scripts + reference),
-    # U-21 drift/threat-filtered, materialized under /workspace/skills/<name>/ on
-    # every sandbox acquire so bundled scripts run as authored.
+    # U-21 drift/threat-filtered, materialized under /opt/skills/<agent_key>/<name>/
+    # on every sandbox acquire so bundled scripts run as authored.
     seed_result = await build_skill_seed_files(
         loaded_skills.resolved_versions,
         loaded_skills.activated_skill_names,
+        agent_key=agent_key,
         object_store=skill_asset_store,
     )
     skill_seed_files = seed_result.files
@@ -729,9 +740,16 @@ async def build_agent(
     # sandbox runtime mints a per-sandbox token + injects HTTPS_PROXY when the
     # policy is not "none" (default "proxy" — egress on, audited).
     if env.sandbox_runtime is not None:
-        env = replace(
-            env,
-            sandbox_runtime=bind_egress(
+        # spec 决策 10 — bind_agent_key wraps the egress-bound client (not the
+        # other way round) so every exec (not just acquire) also carries
+        # PYTHONUSERBASE=/opt/agents/<agent_key>, keeping pip --user installs
+        # isolated when two agents share one warm sandbox (spec § 五之二
+        # concurrency review). Composed in one expression, not two
+        # ``env = replace(...)`` reassignments — mypy can't re-narrow
+        # ``env.sandbox_runtime`` to non-None after the first reassignment
+        # rebinds ``env``, since it no longer traces back to this ``if``.
+        bound_runtime = bind_agent_key(
+            bind_egress(
                 env.sandbox_runtime,
                 EgressContext(
                     policy=spec.spec.sandbox.network.egress,
@@ -741,7 +759,9 @@ async def build_agent(
                     denylist=tuple(spec.spec.sandbox.network.denylist),
                 ),
             ),
+            agent_key,
         )
+        env = replace(env, sandbox_runtime=bound_runtime)
 
     registry = await build_tool_registry(
         spec.spec.tools,

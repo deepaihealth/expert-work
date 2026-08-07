@@ -82,14 +82,21 @@ class FakeRunnerLink:
         self._exec_error = exec_error
         self.closed = False
         self.exec_calls: list[tuple[str, int]] = []
+        #: sandbox migration wave 2 (spec 决策 10) — the ``envs`` kwarg passed
+        #: to each ``exec`` call, kept out of ``exec_calls`` so existing
+        #: 2-tuple assertions stay unchanged.
+        self.exec_envs_calls: list[dict[str, str] | None] = []
 
     async def wait_ready(self, timeout_s: float) -> None:
         if not self._ready:
             msg = "runner never reported ready"
             raise RunnerLinkError(msg)
 
-    async def exec(self, code: str, timeout_s: int) -> ExecResult:
+    async def exec(
+        self, code: str, timeout_s: int, *, envs: dict[str, str] | None = None
+    ) -> ExecResult:
         self.exec_calls.append((code, timeout_s))
+        self.exec_envs_calls.append(envs)
         if self._exec_error is not None:
             raise self._exec_error
         return self._exec_result
@@ -1161,6 +1168,31 @@ async def test_exec_defaults_timeout_to_service_default() -> None:
 
     await h.supervisor.exec(response.sandbox_id, code="print(1)")
     assert link.exec_calls == [("print(1)", 25)]
+
+
+@pytest.mark.asyncio
+async def test_exec_forwards_envs_to_the_runner_link() -> None:
+    """sandbox migration wave 2 (spec 决策 10) — ``envs`` reaches the runner
+    link on every call (not baked in at acquire time — two agents can share
+    one already-warm session, see ``SandboxSupervisor.exec`` docstring)."""
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    response = await h.supervisor.acquire(_acquire_request())
+
+    await h.supervisor.exec(
+        response.sandbox_id, code="print(1)", envs={"PYTHONUSERBASE": "/opt/agents/a1"}
+    )
+    assert link.exec_envs_calls == [{"PYTHONUSERBASE": "/opt/agents/a1"}]
+
+
+@pytest.mark.asyncio
+async def test_exec_omits_envs_when_not_given() -> None:
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    response = await h.supervisor.acquire(_acquire_request())
+
+    await h.supervisor.exec(response.sandbox_id, code="print(1)")
+    assert link.exec_envs_calls == [None]
 
 
 @pytest.mark.asyncio
