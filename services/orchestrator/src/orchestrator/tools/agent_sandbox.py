@@ -334,7 +334,9 @@ class AgentSandboxClient:
     #: 个值)—— ``acquire`` 用它做 mkdir + chmod(spec § 二之二"附带事实":NAS
     #: 新建子目录属主是父目录的属主,沙箱内命令以 uid 10000 执行,不放开
     #: 权限一律 Permission denied)与软删闸(检查
-    #: ``{root}/{tenant}/{user}/`` + :data:`DELETED_MARKER`)。这是
+    #: :func:`~orchestrator.tools.nas_workspace_store.workspace_deleted_marker`
+    #: 的落点 ``{root}/{tenant}/.deleted/{user}`` —— **不在**用户子树里,
+    #: 见该模块 docstring 与全分支终审 Critical-1)。这是
     #: control-plane 进程能直接 ``os.mkdir``/``os.chmod`` 到的本地路径,不是
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。

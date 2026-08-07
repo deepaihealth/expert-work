@@ -280,9 +280,13 @@ symlink。
 7. **egress 审计(W1 Task 11)**:断言表里落的行 `tenant_id`/`user_id` 与本次
    测试身份一致,不是只看"有没有行"。
 8. **删用户 → purge**:验证软删闸(W2 Task 4)与既有用户 purge 流程
-   (`user_purge.py`)对齐——purge 后 `NasWorkspaceStore.mark_deleted` 落
-   `DELETED_MARKER`,之后同一 `(tenant_id, user_id)` 再 `acquire` 应被软删闸
-   (`_reject_if_workspace_deleted`)拒绝,不是静默建出一个新工作区。
+   (`user_purge.py`)对齐——purge 后 `NasWorkspaceStore.mark_deleted` 在
+   `{root}/{tenant_id}/.deleted/{user_id}` 落标记(**不在**用户子树里,
+   全分支终审 Critical-1:那棵树整个经 subPath 挂进沙箱,沙箱里的 agent
+   能自己写出同名文件),之后同一 `(tenant_id, user_id)` 再 `acquire` 应被
+   软删闸(`_reject_if_workspace_deleted`)拒绝,不是静默建出一个新工作区。
+   一并验:在 `/workspace` 里手写一个 `.ew-workspace-deleted` 文件**不该**
+   让后续 `acquire` 被拒。
 
 ### 验收时一并处理的两条已知待办
 
