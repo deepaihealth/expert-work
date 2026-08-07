@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, get_args
 
+from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
+
 #: OCI runtimes the sandbox supports. ``runc`` is Docker's default
 #: (dev / macOS); ``runsc`` is gVisor (Linux prod).
 SandboxOciRuntime = Literal["runc", "runsc"]
@@ -30,6 +32,22 @@ SandboxOciRuntime = Literal["runc", "runsc"]
 #: to the credential-proxy by an iptables allowlist (Mini-ADR F-2); the
 #: network itself is created by Stream F.5.
 DEFAULT_EGRESS_NETWORK = "expert-work-sandbox-egress"
+
+#: W2 Task 9 baked the sandbox image's non-root user at ``useradd -u
+#: 10000`` (subsystem 14 § 5.6) but dropped the image-level ``USER``
+#: directive itself — the container must start as root so ACS's envd can
+#: fork/exec its NAS-mount storage helper as the container's own identity
+#: (spec § 二之二). The local docker backend has no such constraint and
+#: still uses the container as a real isolation boundary (ACS's is the
+#: microVM instead), so it restores the pre-Task-9 non-root posture itself
+#: via ``--user`` below — the same uid/gid the image's ``agent`` user has.
+SANDBOX_AGENT_UID = 10000
+SANDBOX_AGENT_GID = 10000
+
+#: Matches the image's ``useradd -u 10000 -m`` home directory (``ENV
+#: HOME=/home/agent``, W2 Task 9) — the local backend's tmpfs mount target
+#: for it, mirroring the image's own path.
+SANDBOX_AGENT_HOME = "/home/agent"
 
 
 @dataclass(frozen=True)
@@ -117,12 +135,36 @@ class SandboxRuntimeProvider:
             container_name,
             "--interactive",
             "--read-only",
+            # W2 Task 6 — the image (Task 9) starts as root with cwd
+            # undeclared (see the SANDBOX_AGENT_UID/GID comment above); the
+            # local backend restores the container-level non-root + cwd
+            # posture itself, byte-identical to the pre-Task-9 behaviour.
+            "--user",
+            f"{SANDBOX_AGENT_UID}:{SANDBOX_AGENT_GID}",
+            "--workdir",
+            "/workspace",
             *self._workspace_mount(limits, workspace_volume),
             # Scratch /tmp — always an ephemeral tmpfs. The rootfs is read-only,
             # and many tools (soffice/poppler, tempfile-heavy libs) need a
             # writable /tmp; mode=1777 so the non-root agent user can write.
             "--tmpfs",
             f"/tmp:rw,size={limits.tmp_size_mb}m,mode=1777",  # noqa: S108 — docker tmpfs mount spec, not a temp-file path
+            # Skills / pip-user-site / HOME — W2 Task 9 moved these off the
+            # image (the run root must stay bare for ACS's NAS-mount
+            # symlink, so nothing can be pre-chowned into it at build time
+            # any more), so the local backend supplies all three as
+            # sandbox-local, agent-owned tmpfs at run time, one-to-one with
+            # the image's own /opt/skills + /opt/agents + /home/agent
+            # directories. ``uid=``/``gid=`` on the tmpfs mount option sets
+            # ownership directly (no ``mode=1777`` — unlike /workspace and
+            # /tmp, only the single non-root --user above ever touches
+            # these, so a world-writable mode isn't needed).
+            "--tmpfs",
+            f"{SANDBOX_SKILLS_ROOT}:rw,size=64m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            "--tmpfs",
+            f"{SANDBOX_AGENTS_ROOT}:rw,size=512m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            "--tmpfs",
+            f"{SANDBOX_AGENT_HOME}:rw,size=64m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -168,9 +210,19 @@ class SandboxRuntimeProvider:
                 "--tmpfs",
                 f"/workspace:rw,size={limits.workspace_size_mb}m,mode=1777",
             ]
-        # Stream J.15 — a per-user docker named volume. A fresh volume
-        # inherits the image's ``/workspace`` ownership (``agent:agent``),
-        # so unlike tmpfs it needs no mode override.
+        # Stream J.15 — a per-user docker named volume. This comment
+        # previously claimed a fresh volume inherits the image's
+        # ``/workspace`` ownership (``agent:agent``); that relied on the
+        # image baking a ``WORKDIR /workspace`` + chown, which W2 Task 9
+        # removed (the run root must stay bare for ACS's NAS-mount
+        # symlink). Empirically reconfirmed post-Task-9 (``docker run
+        # --user 10000:10000 -v freshvol:/workspace <image> touch
+        # /workspace/x`` → ``Permission denied``): a never-before-mounted
+        # volume now lands root:root, so the non-root --user above cannot
+        # write into it until something chowns it once. No such bootstrap
+        # exists yet — flagged as a W2 Task 6 follow-up (would need a new
+        # docker_client aux op + a supervisor call site, both beyond this
+        # task's two authorized touch points), not fixed here.
         return ["--volume", f"{workspace_volume}:/workspace"]
 
 

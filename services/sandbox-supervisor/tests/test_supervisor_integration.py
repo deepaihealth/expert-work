@@ -54,7 +54,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from expert_work.persistence import InMemoryUserWorkspaceStore
+from expert_work.persistence import SANDBOX_SKILLS_ROOT, InMemoryUserWorkspaceStore
 from expert_work.runtime.sandbox import SandboxRuntimeProvider
 from sandbox_supervisor.docker_client import CliDockerClient
 from sandbox_supervisor.domain import SandboxRecord, SandboxState, SupervisorError
@@ -315,23 +315,29 @@ async def test_exec_envs_reach_the_subprocess(expert_work: _Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
-# skill-runtime §5.1 — seed_files materialized into /workspace at acquire
+# skill-runtime §5.1 — seed_files materialized at acquire
+# (sandbox migration wave 2 Task 6: landing root moved to SANDBOX_SKILLS_ROOT)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_seed_files_land_in_workspace(expert_work: _Harness) -> None:
+async def test_seed_files_land_under_the_sandbox_skills_root(expert_work: _Harness) -> None:
     """Task 10(契约测试)真连 docker 跑通契约测试时实测揪出的 bug,这个模块
     此前对 ``seed_files`` 零覆盖:``CliDockerClient.seed_workspace`` 用
     ``docker cp - <container>:/workspace`` 把种子文件写进沙箱,但 docker
     daemon 对任何 ``--read-only`` 容器的 ``docker cp`` **无条件**拒绝
-    ("container rootfs is marked read-only"),哪怕目标目录(``/workspace``)
-    是独立的可写 tmpfs 挂载——已用最小复现验证过 100% 必现,不是环境抖动。
+    ("container rootfs is marked read-only"),哪怕目标目录是独立的可写
+    tmpfs 挂载——已用最小复现验证过 100% 必现,不是环境抖动。
     ``supervisor._seed_workspace`` 把这类失败降级成"log + continue",所以
     ``acquire`` 从不报错,种子文件只是静默从未落地。修法是改用 ``docker
-    exec <container> tar -xf - -C /workspace``(容器内部落地,不走 daemon
+    exec <container> tar -xf - -C <root>``(容器内部落地,不走 daemon
     那条会检查 rootfs 只读标记的复制路径),见
     ``CliDockerClient.seed_workspace`` 的完整 docstring。
+
+    W2 Task 6 把落点从 ``/workspace``(NAS-backed,占用户配额)搬到
+    ``SANDBOX_SKILLS_ROOT``(``/opt/skills``,sandbox-local tmpfs)——两后端
+    同步改(cloud 侧 Task 5 已改 ``agent_sandbox.py``),契约测试同断言
+    (spec § 四)。
     """
     content = b"SEED_CONTENT"
     seed_files = [SeedFile(path="seeded.txt", content_b64=base64.b64encode(content).decode())]
@@ -339,7 +345,7 @@ async def test_seed_files_land_in_workspace(expert_work: _Harness) -> None:
         AcquireRequest(tenant_id=uuid4(), thread_id="t-seed", seed_files=seed_files)
     )
     result = await expert_work.supervisor.exec(
-        acquired.sandbox_id, code="print(open('/workspace/seeded.txt').read())"
+        acquired.sandbox_id, code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())"
     )
     await expert_work.supervisor.release(acquired.sandbox_id)
 

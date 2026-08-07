@@ -17,6 +17,7 @@ import logging
 import tarfile
 from typing import Protocol
 
+from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from sandbox_supervisor.runner_link import PipeRunnerLink, RunnerLink
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,11 @@ def _build_seed_tar(files: list[tuple[str, bytes]]) -> bytes:
     inside the sandbox container (see :meth:`CliDockerClient.seed_workspace`).
 
     Members are mode 0o755 (world-readable + executable) — belt-and-braces now
-    that extraction runs as the container's own ``agent`` user (see
+    that extraction runs as the container's own non-root ``agent`` user (see
     ``seed_workspace``'s docstring for why it is no longer a root-vs-agent
-    ownership workaround). Paths are relative (e.g. ``skills/pptx/SKILL.md``);
-    extracting with ``-C /workspace`` lands them there, creating parent dirs.
+    ownership workaround). Paths are relative (e.g. ``pptx/SKILL.md``);
+    extracting with ``-C {SANDBOX_SKILLS_ROOT}`` (``/opt/skills``, W2 Task 6)
+    lands them there, creating parent dirs.
     """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -49,6 +51,27 @@ _READ_LIMIT = 4 * 1024 * 1024
 
 #: ``docker run`` argv prefix used to find leftover sandboxes on boot.
 _ORPHAN_NAME_PREFIX = "expert-work-sb-"
+
+#: Hardening flags shared by every throwaway aux container that touches a
+#: named volume (read/list/write/delete/measure/archive) — network-isolated,
+#: read-only rootfs, all capabilities dropped, no privilege escalation.
+#: These are *not* the sandbox launch (that argv comes from the F.3
+#: ``SandboxRuntimeProvider``, W2 Task 6's ``--user``/tmpfs additions live
+#: there, not here) — each of these six is a one-shot ``--rm`` container
+#: that mounts a volume at ``/ws`` and runs a single coreutils/python
+#: command, so it stays root (the image's ``docker run`` default since W2
+#: Task 9 dropped ``USER agent``) rather than the non-root sandbox identity;
+#: forcing ``--user`` here would risk it being unable to read/write a
+#: volume whose top-level ownership it doesn't control.
+_AUX_CONTAINER_HARDENING_ARGS = [
+    "--network",
+    "none",
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+]
 
 
 class DockerError(RuntimeError):
@@ -115,13 +138,13 @@ class DockerClient(Protocol):
         """
 
     async def seed_workspace(self, container_name: str, *, files: list[tuple[str, bytes]]) -> None:
-        """Copy ``files`` into a running container's ``/workspace`` (skill-runtime
-        §5.1 — materialize an agent's activated skill files so bundled scripts
-        run as authored).
+        """Copy ``files`` into a running container's ``SANDBOX_SKILLS_ROOT``
+        (``/opt/skills``, W2 Task 6 — skill-runtime §5.1 — materialize an
+        agent's activated skill files so bundled scripts run as authored).
 
-        Ephemeral ``/workspace`` is a per-container tmpfs that a side container
-        cannot mount, so this writes INTO the live container (``docker exec`` +
-        an in-container ``tar`` extraction — see
+        The target is a per-container tmpfs that a side container cannot
+        mount, so this writes INTO the live container (``docker exec`` + an
+        in-container ``tar`` extraction — see
         :meth:`CliDockerClient.seed_workspace` for why ``docker cp`` cannot be
         used here). Covers all acquire paths (cold/pooled/reused) uniformly.
         No-op for an empty list. Raises :class:`DockerError` on failure.
@@ -219,13 +242,7 @@ class CliDockerClient:
             "docker",
             "run",
             "--rm",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws:ro",
             "--entrypoint",
@@ -285,13 +302,7 @@ class CliDockerClient:
             "docker",
             "run",
             "--rm",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws:ro",
             "--entrypoint",
@@ -342,13 +353,7 @@ class CliDockerClient:
             "run",
             "--rm",
             "-i",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws",
             "--entrypoint",
@@ -385,13 +390,7 @@ class CliDockerClient:
             "docker",
             "run",
             "--rm",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws",
             "--entrypoint",
@@ -428,13 +427,7 @@ class CliDockerClient:
             "docker",
             "run",
             "--rm",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws:ro",
             "--entrypoint",
@@ -468,13 +461,7 @@ class CliDockerClient:
             "docker",
             "run",
             "--rm",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
+            *_AUX_CONTAINER_HARDENING_ARGS,
             "--volume",
             f"{volume}:/ws:ro",
             "--entrypoint",
@@ -549,30 +536,40 @@ class CliDockerClient:
             raise DockerError(msg)
 
     async def seed_workspace(self, container_name: str, *, files: list[tuple[str, bytes]]) -> None:
-        """Stream a tar of ``files`` into ``{container}:/workspace``.
+        """Stream a tar of ``files`` into ``{container}:{SANDBOX_SKILLS_ROOT}``
+        (``/opt/skills``, W2 Task 6 — sandbox-local, per-agent-namespaced by
+        the ``<agent_key>/…`` prefix the *caller* already baked into each
+        ``relpath``; this layer just lands them).
 
-        Uses ``docker exec <container> tar -xf - -C /workspace`` (stdin pipe),
-        **not** ``docker cp - <container>:/workspace``. The daemon's copy-into-
-        container path (``docker cp``) unconditionally rejects the operation
-        with "container rootfs is marked read-only" for any container started
-        with ``--read-only``(``runtime_provider.py``'s hardening — Mini-ADR
-        F-5) — it checks the container's ``HostConfig.ReadonlyRootfs`` flag
-        globally, without noticing that the actual destination (``/workspace``)
-        is a separate, writable tmpfs/volume mount, not the read-only rootfs.
-        Verified reproducible against this repo's sandbox image: ``docker cp``
-        fails 100% of the time on a ``--read-only`` container even when the
-        target directory is a writable mount; ``docker exec`` + an in-container
-        ``tar`` extraction does not go through that daemon-side check at all
-        (a new process inside the container's own mount namespace, which
-        already sees ``/workspace`` as writable) and lands the files correctly.
-        This was silently broken for every acquire with non-empty
-        ``seed_files`` — the failure degrades gracefully (caller logs +
-        continues, skill-runtime §5.1), so no run ever hard-failed; skill
-        files simply never materialized.
+        Uses ``docker exec <container> tar -xf - -C {SANDBOX_SKILLS_ROOT}``
+        (stdin pipe), **not** ``docker cp - <container>:{SANDBOX_SKILLS_ROOT}``.
+        The daemon's copy-into-container path (``docker cp``) unconditionally
+        rejects the operation with "container rootfs is marked read-only" for
+        any container started with ``--read-only`` (``runtime_provider.py``'s
+        hardening — Mini-ADR F-5) — it checks the container's
+        ``HostConfig.ReadonlyRootfs`` flag globally, without noticing that the
+        actual destination is a separate, writable tmpfs mount, not the
+        read-only rootfs. Verified reproducible against this repo's sandbox
+        image (originally against the ephemeral ``/workspace`` tmpfs, before
+        the W2 Task 6 landing-root move — the daemon-side check is
+        target-agnostic, so the same failure mode applies here unchanged):
+        ``docker cp`` fails 100% of the time on a ``--read-only`` container
+        even when the target directory is a writable mount; ``docker exec`` +
+        an in-container ``tar`` extraction does not go through that
+        daemon-side check at all (a new process inside the container's own
+        mount namespace, which already sees the target as writable) and lands
+        the files correctly. This was silently broken for every acquire with
+        non-empty ``seed_files`` — the failure degrades gracefully (caller
+        logs + continues, skill-runtime §5.1), so no run ever hard-failed;
+        skill files simply never materialized.
 
-        A side benefit: extraction now runs as the container's own default
-        user (``agent`` — no code path overrides ``--user`` on ``docker run``,
-        see ``runtime_provider.py``), so seeded files land ``agent``-owned
+        A side benefit: extraction runs as uid 10000 (the image's ``agent``
+        user) because the sandbox's ``docker run`` now carries an explicit
+        ``--user 10000:10000`` (W2 Task 6, ``runtime_provider.py``'s
+        ``SANDBOX_AGENT_UID``/``SANDBOX_AGENT_GID`` — the image itself no
+        longer has a non-root default user to fall back on; W2 Task 9 dropped
+        ``USER agent`` so ACS's envd can fork/exec its NAS-mount helper as the
+        container's own root identity), so seeded files land ``agent``-owned
         instead of root-owned. :func:`_build_seed_tar`'s 0o755 mode is no
         longer load-bearing for that but is kept as belt-and-braces.
         """
@@ -588,7 +585,7 @@ class CliDockerClient:
             "-xf",
             "-",
             "-C",
-            "/workspace",
+            SANDBOX_SKILLS_ROOT,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

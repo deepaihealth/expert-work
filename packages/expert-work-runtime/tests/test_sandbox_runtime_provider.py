@@ -45,6 +45,59 @@ def test_argv_carries_all_hardening_flags() -> None:
     assert _flag_value(argv, "--tmpfs") == "/workspace:rw,size=64m,mode=1777"
 
 
+# ---------- W2 Task 6 — local-docker non-root/cwd posture + skill/pip/home tmpfs ----------
+
+
+def test_argv_runs_as_the_non_root_agent_user() -> None:
+    # The image (W2 Task 9) starts as root — no image-level USER — so the
+    # ACS platform can fork/exec its NAS-mount helper as the container's own
+    # identity. The local docker backend still uses the container itself as
+    # the isolation boundary (ACS's is the microVM instead), so it restores
+    # the pre-Task-9 non-root posture explicitly via --user.
+    argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
+    assert _flag_value(argv, "--user") == "10000:10000"
+
+
+def test_argv_sets_workdir_to_workspace() -> None:
+    # Mirrors the --user restoration: the image no longer declares a
+    # WORKDIR (that would pre-create /workspace and block ACS's NAS-mount
+    # symlink), so the local backend sets cwd itself.
+    argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
+    assert _flag_value(argv, "--workdir") == "/workspace"
+
+
+def test_argv_mounts_skills_agents_home_as_owned_tmpfs() -> None:
+    # W2 Task 9 moved /opt/skills, /opt/agents and HOME off the image (the
+    # run root must stay bare); the local backend supplies all three as
+    # sandbox-local, agent-owned tmpfs at run time so the non-root --user
+    # above can write into them (uid=/gid= sets ownership directly — no
+    # mode=1777 needed since only the agent uid ever touches them).
+    argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
+    tmpfs = {}
+    for i, tok in enumerate(argv):
+        if tok == "--tmpfs":
+            target, _, spec = argv[i + 1].partition(":")
+            tmpfs[target] = spec
+    assert tmpfs["/opt/skills"] == "rw,size=64m,uid=10000,gid=10000"
+    assert tmpfs["/opt/agents"] == "rw,size=512m,uid=10000,gid=10000"
+    assert tmpfs["/home/agent"] == "rw,size=64m,uid=10000,gid=10000"
+
+
+def test_argv_user_workdir_and_extra_tmpfs_present_under_persistent_workspace_too() -> None:
+    # The --user/--workdir/skills/agents/home additions are unconditional —
+    # they don't depend on whether /workspace itself is an ephemeral tmpfs
+    # or a J.15 persistent named volume.
+    argv = _runc_provider().docker_run_argv(
+        image="img", container_name="sb-1", workspace_volume="expert-work-ws-abc"
+    )
+    assert _flag_value(argv, "--user") == "10000:10000"
+    assert _flag_value(argv, "--workdir") == "/workspace"
+    tmpfs_targets = [argv[i + 1].split(":")[0] for i, t in enumerate(argv) if t == "--tmpfs"]
+    assert "/opt/skills" in tmpfs_targets
+    assert "/opt/agents" in tmpfs_targets
+    assert "/home/agent" in tmpfs_targets
+
+
 def test_argv_keeps_stdin_open_for_runner_protocol() -> None:
     argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
     assert "--interactive" in argv
@@ -101,14 +154,21 @@ def test_default_workspace_is_ephemeral_tmpfs() -> None:
 
 def test_persistent_workspace_mounts_named_volume() -> None:
     # Stream J.15 — a workspace_volume mounts a docker named volume for
-    # /workspace (no /workspace tmpfs), but the scratch /tmp tmpfs stays.
+    # /workspace (no /workspace tmpfs), but the scratch /tmp tmpfs stays —
+    # along with the W2 Task 6 skills/agents/home tmpfs, which are
+    # unconditional (independent of the /workspace backing).
     argv = _runc_provider().docker_run_argv(
         image="img", container_name="sb-1", workspace_volume="expert-work-ws-abc"
     )
     assert _flag_value(argv, "--volume") == "expert-work-ws-abc:/workspace"
-    # /workspace is a volume, not a tmpfs; the only tmpfs is the scratch /tmp.
+    # /workspace is a volume, not a tmpfs.
     tmpfs_targets = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
-    assert tmpfs_targets == ["/tmp:rw,size=256m,mode=1777"]  # noqa: S108 — mount spec literal
+    assert tmpfs_targets == [
+        "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
+        "/opt/skills:rw,size=64m,uid=10000,gid=10000",
+        "/opt/agents:rw,size=512m,uid=10000,gid=10000",
+        "/home/agent:rw,size=64m,uid=10000,gid=10000",
+    ]
 
 
 def test_argv_always_mounts_scratch_tmp() -> None:

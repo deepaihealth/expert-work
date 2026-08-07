@@ -308,9 +308,9 @@ async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
             ),
             timeout_s=30,
         )
-        assert "HOME = /workspace" in outcome.stdout
+        assert "HOME = /home/agent" in outcome.stdout
         assert "PIP_USER = 1" in outcome.stdout
-        assert "MPLCONFIGDIR = /workspace/.mplconfig" in outcome.stdout
+        assert "MPLCONFIGDIR = /home/agent/.mplconfig" in outcome.stdout
         assert "LANG = zh_CN.UTF-8" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
@@ -407,7 +407,7 @@ async def test_python_variables_do_not_survive_across_exec(runtime: SandboxRunti
 async def test_exec_user_site_survives_to_the_next_exec(runtime: SandboxRuntime) -> None:
     """PR-C #2 —— user site 必须在 exec 子进程的 ``sys.path`` 上。
 
-    第一步把模块文件落进 ``site.getusersitepackages()``(镜像 HOME=/workspace,
+    第一步把模块文件落进 ``site.getusersitepackages()``(镜像 HOME=/home/agent,
     可写),第二步全新子进程 import 它 —— 等价于「pip install --user 之后
     下一次 exec import 得到」,但不依赖网络。旧旗标 ``-I``(含 ``-s``)下
     第二步必失败。
