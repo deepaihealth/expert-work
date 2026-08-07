@@ -202,7 +202,7 @@ def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     Task 4 review (Minor) — this module owns the on-disk layout, so it also
     owns the one function that spells it out. Before this existed,
     :meth:`NasWorkspaceStore._user_root` and
-    :mod:`orchestrator.tools.agent_sandbox`'s pre-mount mkdir/chown/
+    :mod:`orchestrator.tools.agent_sandbox`'s pre-mount mkdir/chmod/
     soft-delete-gate each concatenated ``root``/``tenant_id``/``user_id``
     independently — two spellings of the same path that could silently
     drift apart (e.g. one gaining a subpath-prefix segment the other never

@@ -79,7 +79,7 @@ spec:
       command:
         - sh
         - -c
-        - mkdir -p /mnt/nas/workspaces && chmod 777 /mnt/nas/workspaces && ls -la /mnt/nas
+        - mkdir -p /mnt/nas/workspaces && chmod 1777 /mnt/nas/workspaces && ls -la /mnt/nas
       volumeMounts:
         - name: nas
           mountPath: /mnt/nas
@@ -93,17 +93,27 @@ kubectl logs pod/w2-workspaces-mkdir -n default
 kubectl delete pod/w2-workspaces-mkdir -n default
 ```
 
-**`chmod 777` 不是可选的一步**:集群实测 NAS 新建子目录属主是 root(spec
+**`chmod 1777` 不是可选的一步**:集群实测 NAS 新建子目录属主是 root(spec
 § 二之二),而 `control-plane` 容器以非 root 身份运行(uid 10002,见
 `services/control-plane/Dockerfile` 的 `useradd --uid 10002 ... expert_work` /
-`USER expert_work`)。只 `mkdir` 不 `chmod` 的话,`NasWorkspaceStore` 第一次在
+`USER expert_work`)。只 `mkdir` 不放开权限的话,`NasWorkspaceStore` 第一次在
 `/workspaces` 下建 `{tenant_id}/{user_id}` 子树(即端到端验收第一项"前端上传
 文档")会撞 `PermissionError`——这不是新推测,是同一份"NAS 新目录属主 root、非
-root 写入被拒"事实(探针报告 § 一;`AgentSandboxClient._ensure_workspace_dir`
-docstring 同一句话)在 control-plane 这一层的必然重现,只是这次挡的是
-control-plane 而不是沙箱。**这一层的权限设置没有随任何一个 W2 Task 的代码改动
-自动发生**——之前没有任何一个 Task 报告测过"control-plane 真的能在 `/workspaces`
-下建目录"这条,发布后第一次上传文档如果报 500,先查这个。
+root 写入被拒"事实(探针报告 § 一)在 control-plane 这一层的必然重现,只是这次
+挡的是 control-plane 而不是沙箱。**这一层的权限设置没有随任何一个 W2 Task 的
+代码改动自动发生**——之前没有任何一个 Task 报告测过"control-plane 真的能在
+`/workspaces` 下建目录"这条,发布后第一次上传文档如果报 500,先查这个。
+
+**为什么是 `1777` 而不是 `777`**(集群实测坐实,W2 Task 4 审查追加):非 root
+进程无权 `chown` 成另一个 uid(control-plane 与每个用户沙箱各自的 uid 都不同),
+`AgentSandboxClient._ensure_workspace_dir` 给每个用户子目录放权限时也是
+`chmod 0o777` 而不是 `chown`(同一个根因,见该方法 docstring)——world-writable
+的代价是任何有权限进这棵目录的人都能删掉别人的文件/目录,`1777` 的前导 `1` 是
+sticky bit:world-writable 目录里,一个条目只能被它的属主、这个目录的属主、或
+root 删除/改名,其他人即使有写权限也删不动。`/workspaces` 根上真的会有多个租户
+各自的子树平级摆着,只放 `777` 会让任何一个租户的沙箱理论上能删掉另一个租户的
+顶层目录(它们都在同一个 world-writable 父目录下);`1777` 把这条路堵死,又不
+需要精确控制每个子目录的属主(那本来就做不到)。
 
 ### 2. apply PV/PVC(base 已含,随常规发布带出)
 

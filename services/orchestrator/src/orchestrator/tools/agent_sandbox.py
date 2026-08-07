@@ -198,15 +198,6 @@ _WORKSPACE_DELETED_RACE_REASON = "workspace_deleted_race"
 #: 这侧测到的墙钟差,留一成余量。
 _TIMEOUT_ATTRIBUTION_RATIO = 0.9
 
-#: 沙箱镜像 ``agent`` 用户的 uid/gid(同
-#: :data:`~orchestrator.tools.sandbox_image_contract.SANDBOX_EXEC_USER` 钉的
-#: 执行身份,数值形式)。NAS 新建子目录属主是 root,沙箱内命令以这个
-#: uid 执行 —— 集群实测(spec § 二之二):acquire 前不 ``chown`` 到这个
-#: uid/gid,沙箱写自己的工作区目录一律 ``Permission denied``。做成模块常量
-#: 而不是散落在 :meth:`AgentSandboxClient._ensure_workspace_dir` 里的字面量。
-SANDBOX_UID = 10000
-SANDBOX_GID = 10000
-
 #: ``Sandbox.create(metadata={...})`` 里挂载 NAS 工作区用的 key —— ACS 官方
 #: 文档化的动态挂载配方(spec § 一.1),"申请时"挂载,每挂载点一个 dict
 #: (``pvName``/``mountPath``/``subPath``)。
@@ -297,7 +288,7 @@ class AgentSandboxClient:
     default_max_sandboxes: int = 50
     #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,全部默认 None/"":不配 = 行为
     #: 与波 1 完全一致(``_create`` 不注入任何 ``metadata``,``acquire`` 不做
-    #: mkdir/chown/软删闸)。三项一起配才有意义,但故意不做"必须同时配"的
+    #: mkdir/chmod/软删闸)。三项一起配才有意义,但故意不做"必须同时配"的
     #: 校验——``build_sandbox_runtime`` 是唯一的生产装配点,三个 Settings 字段
     #: 本就同源(见 control-plane ``runtime.py``);拆开来是为了每个字段职责
     #: 单一,不是给运维暴露一个"只配一半"的合法状态。
@@ -315,7 +306,7 @@ class AgentSandboxClient:
     #: store,见 :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root`)
     #: 完全不理解前缀,它的布局恒为 ``{root}/{tenant_id}/{user_id}``。非空
     #: 前缀会让沙箱实际挂载到 ``{root}/{prefix}/{tenant}/{user}``,而
-    #: mkdir/chown/软删闸(:meth:`_prepare_workspace_mount`)与
+    #: mkdir/chmod/软删闸(:meth:`_prepare_workspace_mount`)与
     #: ``NasWorkspaceStore`` 的文件读写全都还在算 ``{root}/{tenant}/{user}``
     #: ——两棵树静默分叉,用户在工作区浏览页看到的文件和沙箱里 `/workspace`
     #: 看到的文件不是同一份,且没有任何报错。``__post_init__`` 在构造期直
@@ -323,13 +314,19 @@ class AgentSandboxClient:
     #: 动到 Task 3 加固过的路径解析核心)。
     workspace_subpath_prefix: str = ""
     #: control-plane Pod 本地的 NAS 挂载点(与 ``NasWorkspaceStore.root`` 同一
-    #: 个值)—— ``acquire`` 用它做 mkdir + chown(spec § 二之二"附带事实":NAS
-    #: 新建子目录属主 root,沙箱内命令以 uid 10000 执行,不 chown 一律
-    #: Permission denied)与软删闸(检查
+    #: 个值)—— ``acquire`` 用它做 mkdir + chmod(spec § 二之二"附带事实":NAS
+    #: 新建子目录属主是父目录的属主,沙箱内命令以 uid 10000 执行,不放开
+    #: 权限一律 Permission denied)与软删闸(检查
     #: ``{root}/{tenant}/{user}/`` + :data:`DELETED_MARKER`)。这是
-    #: control-plane 进程能直接 ``os.mkdir``/``os.chown`` 到的本地路径,不是
+    #: control-plane 进程能直接 ``os.mkdir``/``os.chmod`` 到的本地路径,不是
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。
+    #:
+    #: **为什么 mkdir+chmod 而不是 mkdir+chown**(Critical 修复,集群实测):
+    #: control-plane 以非 root 的 uid 10002(``expert_work``)运行,POSIX
+    #: 下非 root 进程无权把文件属主 ``chown`` 成另一个 uid(实测
+    #: ``os.chown`` 到 10000 直接 ``EPERM``,``chmod`` 则正常)——见
+    #: :meth:`_ensure_workspace_dir` 的完整推理。
     workspace_root: str | None = None
 
     def __post_init__(self) -> None:
@@ -513,7 +510,7 @@ class AgentSandboxClient:
     ) -> UUID:
         del thread_id  # 波 1:热会话行不记 thread_id(见 SQL store 的说明)。
         sandbox_id = uuid4()
-        # 沙箱迁移波 2 —— 软删闸 + mkdir/chown,claim_warm 之前(spec § 二之
+        # 沙箱迁移波 2 —— 软删闸 + mkdir/chmod,claim_warm 之前(spec § 二之
         # 二)。见 :meth:`_prepare_workspace_mount`(``workspace_root`` 未配
         # 时该方法自己整段跳过,行为与波 1 完全一致)。
         await self._prepare_workspace_mount(
@@ -670,22 +667,22 @@ class AgentSandboxClient:
     async def _prepare_workspace_mount(
         self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
     ) -> None:
-        """软删闸 + mkdir/chown,``claim_warm``/``create_ephemeral`` **之前**
+        """软删闸 + mkdir/chmod,``claim_warm``/``create_ephemeral`` **之前**
         运行(spec § 二之二)。``workspace_root`` 未配(波 1 默认)整段跳过
         ——不是 belt-and-braces,是这个方法唯一的"关"开关,``acquire`` 无
         条件调它。
 
         用户沙箱(``user_id`` 非 None)—— 先查软删标记
-        (:meth:`_reject_if_workspace_deleted`),再 mkdir + chown 该用户在
+        (:meth:`_reject_if_workspace_deleted`),再 mkdir + chmod 该用户在
         NAS 上的目录。查在 mkdir 之前:已软删的工作区不该被这次 acquire
         意外复活出一个空目录(下一次 purge 扫描到的应该还是"只有 marker
         的空壳",不是被误建出的新鲜子树)。
 
         临时沙箱(``user_id`` 为 None)—— 没有软删概念(临时沙箱没有持久
-        身份可被软删),只需要 mkdir + chown 它自己的 scratch 子树
+        身份可被软删),只需要 mkdir + chmod 它自己的 scratch 子树
         (``_scratch/<sandbox_id>``)。**取舍**(brief 明确留给实现判断的
         一点):镜像不再预建 ``/workspace``(Task 9)之后,scratch 子树跟用户
-        子树一样是 NAS 上全新的目录,一样属主 root——不 chown 的话临时沙箱
+        子树一样是 NAS 上全新的目录,权限跟用户子树同一套——不放开权限的话临时沙箱
         的 ``/workspace`` 同样会撞 ``Permission denied``,这不是"要不要顺带
         修"的问题,是同一个真因(spec § 二之二)在另一个 subPath 下的必然
         重现。让两个分支共用同一个 :meth:`_ensure_workspace_dir`,而不是只
@@ -693,7 +690,7 @@ class AgentSandboxClient:
 
         无条件跑一次(不区分"这次 acquire 会不会真的 create()")——热会话
         复用(``connect``)不会重新触发挂载,目录早在第一次 ``create()``
-        时就已经建好,这里的 mkdir(``exist_ok=True``)/chown 因此在复用路径
+        时就已经建好,这里的 mkdir(``exist_ok=True``)/chmod 因此在复用路径
         上是幂等的空操作,不是在"为将要发生的事做准备",而是在"确保这件
         事已经发生过"——比在 :meth:`acquire` 里分叉出"是否会新建"的判断
         更简单,也自愈:哪怕运维手工改过目录权限,下一次 acquire 就会把它
@@ -770,20 +767,35 @@ class AgentSandboxClient:
             raise
 
     async def _ensure_workspace_dir(self, path: Path) -> None:
-        """``mkdir(parents=True, exist_ok=True)`` + ``chown(uid, gid)``,off-loop。
+        """``mkdir(parents=True, exist_ok=True)`` + ``chmod(0o777)``,off-loop。
 
-        chown 是硬要求,不是 belt-and-braces:NAS 新建子目录属主 root,沙箱
-        内命令以 :data:`SANDBOX_UID`/:data:`SANDBOX_GID` 执行,不 chown 一律
-        ``Permission denied``(集群实测,spec § 二之二)。失败(NAS 权限异常
-        / 挂载点抖动)按 :class:`SandboxSupervisorError` 抛,不静默——静默的
-        话沙箱会挂载到一个 agent 用户写不进去的目录,直到第一次
-        ``exec``/文件工具报一个远离根因的"Permission denied",比在
-        ``acquire`` 这里就说清楚差得多。
+        **为什么 chmod 而不是 chown**(Critical 修复,集群实测坐实):最初
+        实现用 ``os.chown(path, 10000, 10000)`` 把目录属主改成沙箱镜像
+        ``agent`` 用户的 uid/gid。这在生产上必然失败——control-plane 以
+        非 root 的 uid 10002(``expert_work``)运行(``kubectl exec
+        deploy/control-plane -- id`` 实测),而 POSIX 下**非 root 进程无权
+        把文件属主改成另一个 uid**(``chown(2)``:只有 ``CAP_CHOWN``/root
+        能做到)——``os.chown`` 到 10000 直接 ``EPERM``,云后端每一次
+        ``acquire`` 都会在这里炸掉,工作区功能整个不可用。同一次实测确认
+        ``chmod`` 正常(目录变 ``drwxrwxrwx``,属主仍是 ``expert_work``)。
+
+        **为什么 0o777 够、也可接受**:这个目录经 ``subPath`` 只挂进这一个
+        用户自己的沙箱——能碰到它的只有 control-plane(uid 10002,一直是
+        目录属主)与该用户的沙箱(uid 10000)两方,两边都需要读写。跨 uid
+        改属主在非 root 下做不到,退而求其次用宽 mode 让"其他用户"这一档
+        也能读写,而不是精确匹配到 10000——这个目录本就不与其它租户共享
+        (per-``(tenant, user)`` 隔离在 subPath 层面已经做了),宽 mode 不
+        新增跨用户可见性。
+
+        失败(NAS 权限异常 / 挂载点抖动)仍按 :class:`SandboxSupervisorError`
+        抛,不静默——静默的话沙箱会挂载到一个 agent 用户写不进去的目录,
+        直到第一次 ``exec``/文件工具报一个远离根因的"Permission denied",
+        比在 ``acquire`` 这里就说清楚差得多。
         """
 
         def _do() -> None:
             path.mkdir(parents=True, exist_ok=True)
-            os.chown(path, SANDBOX_UID, SANDBOX_GID)
+            os.chmod(path, 0o777)  # noqa: S103 — 见上方 docstring:宽 mode 是跨 uid 无 chown 权限下的刻意取舍,不是疏忽。
 
         try:
             await asyncio.to_thread(_do)

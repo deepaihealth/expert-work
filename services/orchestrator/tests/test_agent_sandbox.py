@@ -1096,22 +1096,12 @@ async def test_ephemeral_create_mounts_scratch_subpath() -> None:
     ]
 
 
-def _stub_chown_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Real ``os.chown`` to uid 10000 fails ``EPERM`` under the test runner's
-    own (non-root) uid — exactly the reason the brief calls for monkeypatch
-    on the chown-specific test. These mkdir-focused tests want the mkdir
-    side effect only; stub chown to a no-op so they don't also require root.
-    """
-    monkeypatch.setattr(os, "chown", lambda *args, **kwargs: None)
-
-
 @pytest.mark.asyncio
-async def test_acquire_mkdirs_user_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_acquire_mkdirs_user_workspace(tmp_path: Path) -> None:
     """``workspace_root`` 配了 —— acquire 前把该用户在 NAS 上的目录建出来
-    (spec § 二之二"附带事实":不 mkdir 就没有目录可挂/可 chown)。"""
-    _stub_chown_noop(monkeypatch)
+    (spec § 二之二"附带事实":不 mkdir 就没有目录可挂/可放开权限)。真
+    ``mkdir``/``chmod`` 都不需要 monkeypatch 了(Critical 修复后):chmod
+    自己拥有的目录不需要 root,不像 chown 到别的 uid 那样会 EPERM。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
     tenant_id, user_id = uuid4(), uuid4()
@@ -1122,13 +1112,11 @@ async def test_acquire_mkdirs_user_workspace(
 
 
 @pytest.mark.asyncio
-async def test_acquire_mkdirs_ephemeral_scratch_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
     """临时沙箱同理建 ``_scratch/<sandbox_id>``——本任务对 brief 留白问题
-    ("_scratch 是否也需要 mkdir+chown")的取舍:走同一段逻辑,同一个真因
-    (NAS 新建目录属主 root)在这个 subPath 下同样成立。"""
-    _stub_chown_noop(monkeypatch)
+    ("_scratch 是否也需要 mkdir+放开权限")的取舍:走同一段逻辑,同一个真因
+    (NAS 新建目录默认权限挡住沙箱内的 agent uid)在这个 subPath 下同样
+    成立。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
 
@@ -1138,18 +1126,21 @@ async def test_acquire_mkdirs_ephemeral_scratch_dir(
 
 
 @pytest.mark.asyncio
-async def test_acquire_chowns_user_workspace_to_sandbox_uid(
+async def test_acquire_chmods_user_workspace_world_writable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """chown 到非自身 uid 在普通用户下会 EPERM —— monkeypatch ``os.chown``
-    记录调用参数即可,断言目标 uid/gid 恰是沙箱镜像 ``agent`` 用户的
-    ``(10000, 10000)``(集群实测:不 chown 一律 Permission denied)。"""
-    calls: list[tuple[str, int, int]] = []
+    """Critical 修复(集群实测坐实)—— control-plane 以非 root 的 uid 10002
+    运行,``os.chown`` 到沙箱镜像 ``agent`` 用户的 uid(10000)必然
+    ``EPERM``(非 root 无权把文件属主改成另一个 uid),云后端每一次
+    ``acquire`` 都会在这里炸掉。改用 ``os.chmod`` 放宽权限——这里
+    monkeypatch 记录调用参数,断言目标 mode 是 ``0o777``(控制面仍是属
+    主,沙箱内的 agent uid 靠"其他用户"这一档拿到读写权限)。"""
+    calls: list[tuple[str, int]] = []
 
-    def fake_chown(path: object, uid: int, gid: int) -> None:
-        calls.append((str(path), uid, gid))
+    def fake_chmod(path: object, mode: int) -> None:
+        calls.append((str(path), mode))
 
-    monkeypatch.setattr(os, "chown", fake_chown)
+    monkeypatch.setattr(os, "chmod", fake_chmod)
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
     tenant_id, user_id = uuid4(), uuid4()
@@ -1157,9 +1148,29 @@ async def test_acquire_chowns_user_workspace_to_sandbox_uid(
     await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
 
     assert len(calls) == 1
-    chowned_path, uid, gid = calls[0]
-    assert chowned_path == str(tmp_path / str(tenant_id) / str(user_id))
-    assert (uid, gid) == (10000, 10000)
+    chmoded_path, mode = calls[0]
+    assert chmoded_path == str(tmp_path / str(tenant_id) / str(user_id))
+    assert mode == 0o777
+
+
+@pytest.mark.asyncio
+async def test_acquire_surfaces_chmod_failure_as_sandbox_supervisor_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chmod 失败(NAS 权限异常 / 挂载点抖动)同样必须大声抛
+    ``SandboxSupervisorError``,不静默——静默的话沙箱会挂载到一个 agent
+    用户写不进去的目录,直到执行期才报一个远离根因的错误。"""
+
+    def fake_chmod(path: object, mode: int) -> None:
+        del path, mode
+        raise OSError("simulated NAS permission error")
+
+    monkeypatch.setattr(os, "chmod", fake_chmod)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    with pytest.raises(SandboxSupervisorError, match="simulated NAS permission error"):
+        await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
 
 
 @pytest.mark.asyncio
@@ -1194,7 +1205,6 @@ async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
     断言 acquire 必须抛错,**且这次调用占到的 CAS 槽位必须被让出**——不能
     占着一行不放,那会让这个 ``(tenant, user)`` 之后所有 acquire 都卡死。
     """
-    _stub_chown_noop(monkeypatch)
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
     tenant_id, user_id = uuid4(), uuid4()
@@ -1223,12 +1233,11 @@ async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
 
 @pytest.mark.asyncio
 async def test_acquire_soft_delete_gate_does_not_apply_to_ephemeral_sandboxes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """临时沙箱没有持久身份可被软删——即使某个用户的目录碰巧有同名标记
     文件(不该发生,但也不该被临时沙箱的 acquire 误读到),``user_id=None``
     的路径压根不检查它,只检查/建自己的 scratch 子树。"""
-    _stub_chown_noop(monkeypatch)
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
 
