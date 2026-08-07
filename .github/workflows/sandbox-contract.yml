@@ -47,6 +47,17 @@ env:
   # 等)。E2B_API_KEY 才是敏感值,走 secrets。
   EXPERT_WORK_SANDBOX_E2B_DOMAIN: "expert-work-sbx-test.deepaihealth.com"
   EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
+  # 沙箱迁移波 2 Task 7 — e2b NAS 挂载档(test_sandbox_runtime_contract.py
+  # 的 test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes)
+  # 的 skip 闸。值是测试集群真实配的 PV 名(infra/k8s/overlays/test/
+  # configmap-patch.yaml 的同名键;infra/k8s/base/control-plane/
+  # workspace-nas.yaml 建的那个 PV),不是 task-1-report.md 探针阶段临时起
+  # 的 nas-test-pv(那个是问题一/二探针用的一次性资源,早已不是这个集群
+  # 实际提供的 PV)。这一档今天大概率仍然跑不通(见该测试的 docstring:
+  # 云上 SandboxSet 还在用旧镜像 + csi-volume-config 动态挂载的安全豁免
+  # 工单未批),env 先补上,Task 8 换镜像 tag / 工单批复之后这条测试原样
+  # 就是验收开关,不需要再回来改这个 workflow。
+  EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME: "workspace-nas"
 
 jobs:
   agent-sandbox-contract:

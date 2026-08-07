@@ -96,7 +96,13 @@ def _supervisor_runtime() -> SandboxRuntime:
     return HTTPSupervisorRuntime(base_url=url)
 
 
-def _agent_sandbox_runtime() -> SandboxRuntime:
+def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
+    """``workspace_pv_name`` —— sandbox migration wave 2 Task 7 e2b NAS 挂载档
+    (:func:`_agent_sandbox_runtime_with_workspace_mount`)专用的额外配置;
+    默认空串保持这个函数对既有调用方(``runtime`` fixture)零行为变化——
+    ``AgentSandboxClient.workspace_pv_name`` 未配时 ``_create`` 完全不带
+    ``metadata`` 键(见该字段 docstring),与波 1 逐字相同。
+    """
     api_key = os.environ.get("EXPERT_WORK_SANDBOX_E2B_API_KEY")
     if not api_key:
         pytest.skip("E2B 凭据未设 —— agent_sandbox 契约档跳过")
@@ -129,7 +135,31 @@ def _agent_sandbox_runtime() -> SandboxRuntime:
         ),
         egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
         egress_proxy_port=8081,
+        workspace_pv_name=workspace_pv_name or None,
     )
+
+
+def _agent_sandbox_runtime_with_workspace_mount() -> SandboxRuntime:
+    """:func:`_agent_sandbox_runtime` 加配 ``workspace_pv_name`` —— e2b NAS 挂载
+    档(``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``)
+    专用。E2B 凭据 / 真 Postgres 两个既有前提检查仍由
+    :func:`_agent_sandbox_runtime` 做;这里在它之前多加一层
+    ``EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME`` 的 skip 闸。
+
+    这一档即便三个环境变量全设,今天大概率仍然跑不通,原因不止"云上
+    SandboxSet 还在用旧镜像"(task-9-report.md,Task 8 换 tag 前):
+    task-1-report.md 问题一记录了更底层的一条——这个集群的 ACS Agent Sandbox
+    动态存储挂载(``csi-volume-config``)需要"特权容器 + hostPath
+    /var/run/csi"安全豁免,工单尚未批复,``create(metadata=...)`` 今天在
+    平台侧直接 500。这些都是留给 Task 8 之后处理的基础设施缺口,不是这份
+    契约测试要绕过或弱化断言去伪造绿的目标(brief 明确要求"env 设了就跑,
+    不要为了让它绿而弱化断言")——一旦工单批复 + 镜像换新,这条测试原样
+    就是验收开关。
+    """
+    pv_name = os.environ.get("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME")
+    if not pv_name:
+        pytest.skip("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME 未设 —— e2b NAS 挂载档跳过")
+    return _agent_sandbox_runtime(workspace_pv_name=pv_name)
 
 
 @pytest.fixture(params=["supervisor", "agent_sandbox"])
@@ -370,6 +400,46 @@ async def test_seed_files_land_under_the_sandbox_skills_root(runtime: SandboxRun
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_seed_files_land_under_the_agent_key_skill_namespace(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2 Task 7 —— skill_seed 落点契约。
+
+    ``build_skill_seed_files``(``orchestrator.tools.skill_seed``)产出的
+    relpath 形如 ``<agent_key>/<skill_name>/SKILL.md``(该模块的
+    ``candidates`` 列表首项)。上一条测试
+    (``test_seed_files_land_under_the_sandbox_skills_root``)已经覆盖了
+    "任意 seed_files 落在 ``SANDBOX_SKILLS_ROOT`` 之下"这个更宽的契约点;
+    这条额外精确复现生产真实用的两层命名空间形状(``<agent_key>/<skill>/``),
+    不经过 ``build_skill_seed_files`` 本身(那需要一整套
+    ``SkillVersion``/object-store 前置),直接用
+    :func:`~orchestrator.tools.skill_seed.sanitize_agent_key` 的真实输出做
+    ``agent_key``——两个后端各自 seed 后必须能在
+    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill>/SKILL.md`` 这个精确路径读
+    回同一份内容。"""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from orchestrator.tools.skill_seed import sanitize_agent_key
+
+    agent_key = sanitize_agent_key("Contract Test Agent")
+    skill_md = "---\nname: contract-skill\n---\ncontract skill body\n"
+    sid = await runtime.acquire(
+        tenant_id=uuid4(),
+        thread_id="c18",
+        seed_files=((f"{agent_key}/contract-skill/SKILL.md", skill_md.encode("utf-8")),),
+    )
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                f"print(open('{SANDBOX_SKILLS_ROOT}/{agent_key}/contract-skill/SKILL.md').read())"
+            ),
+            timeout_s=30,
+        )
+        assert outcome.stdout.strip() == skill_md.strip()
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_workspace_files_survive_across_exec(runtime: SandboxRuntime) -> None:
     """ "热"的是文件系统而非 Python 变量 —— 两个实现都该如此。"""
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c6")
@@ -492,6 +562,77 @@ async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> Non
         assert "import-ok 2.4.0" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes() -> None:
+    """sandbox migration wave 2 Task 7 —— e2b NAS 挂载档(brief Step 3)。
+
+    Not parametrized over ``runtime`` — this is an ``agent_sandbox``-only
+    property (the docker supervisor backend's workspace persistence is
+    already covered end to end by ``test_workspace_files_survive_across_exec``
+    and separately by ``test_workspace_store_contract.py``; there is no
+    supervisor-side equivalent of "mount the *same* NAS subtree into two
+    independently created sandboxes" to parametrize against).
+
+    Proves the NAS mount, not just the docker-volume-equivalent "same sandbox,
+    two execs" persistence: write from a **first** sandbox, force it to be
+    genuinely destroyed (not the routine ``release`` that keeps a warm session
+    alive — reusing the same warm sandbox for the second ``acquire`` would
+    prove nothing about the mount, since the file would just still be sitting
+    on that one sandbox's own view of ``/workspace``), then ``acquire`` a
+    **second**, independently created sandbox for the same ``(tenant, user)``
+    and read the file back purely via its own ``exec`` — never via a local
+    filesystem read of the NAS tree from this test process, since a GitHub
+    Actions runner (or any machine without the ``workspace-nas`` PVC mounted)
+    has no NFS route to it. Two distinct sandbox ids is the actual proof that
+    authority lives on the NAS, not on either sandbox's local disk. Cleans up
+    the probe file via a third ``exec`` before destroying the second sandbox
+    (this suite writes real files onto the shared test-cluster NAS volume —
+    see task-1-report.md § 7 for why leftover probe residue there is a real,
+    previously-flagged annoyance, not a hypothetical one).
+    """
+    runtime = _agent_sandbox_runtime_with_workspace_mount()
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sandbox_1 = await runtime.acquire(tenant_id=tenant_id, thread_id="mount-1", user_id=user_id)
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_1,
+            code="open('/workspace/contract-probe.txt', 'w').write('NAS_SHARED_OK')",
+            timeout_s=30,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+    finally:
+        # 真 destroy,不是 release —— release 对带 user_id 的沙箱是保温
+        # (下一次 acquire 会 connect 回同一个沙箱),那样"第二个沙箱"其实
+        # 是同一个,证明不了任何跨沙箱共享的东西。
+        await runtime.destroy(sandbox_id=sandbox_1, reason="contract-test-mount-1")
+
+    sandbox_2 = await runtime.acquire(tenant_id=tenant_id, thread_id="mount-2", user_id=user_id)
+    assert sandbox_2 != sandbox_1, (
+        "acquire 为同一个 (tenant, user) 返回了同一个 sandbox_id —— 第一个沙箱"
+        "没有被真的 destroy 掉,读到同内容不能证明跨沙箱共享(有可能只是同一"
+        "个热会话的第二次 exec)。"
+    )
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_2,
+            code="print(open('/workspace/contract-probe.txt').read())",
+            timeout_s=30,
+        )
+        assert "NAS_SHARED_OK" in outcome.stdout
+    finally:
+        # NAS 清理 —— 探针文件是这条测试写到共享测试集群 NAS 卷上的真实
+        # 残留,通过 exec 删(不经本地文件系统:同上,CI runner 没有 NFS
+        # 路由),再 destroy 第二个沙箱。
+        await runtime.exec(
+            sandbox_id=sandbox_2,
+            code="import os; os.remove('/workspace/contract-probe.txt')",
+            timeout_s=30,
+        )
+        await runtime.destroy(sandbox_id=sandbox_2, reason="contract-test-mount-2")
 
 
 def _runner_py_constants() -> dict[str, int]:
