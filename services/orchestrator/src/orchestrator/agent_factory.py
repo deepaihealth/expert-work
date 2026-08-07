@@ -52,7 +52,7 @@ from langgraph.graph.state import CompiledStateGraph
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import BoundDistilledSkill
 from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
-from expert_work.persistence import MemoryStore
+from expert_work.persistence import SANDBOX_SKILLS_ROOT, MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.persistence.tenant_config import TenantConfigStore
@@ -700,20 +700,23 @@ async def build_agent(
         evolved_skills = await _fetch_evolved_skills(
             skill_store, tenant_id=tenant_id, agent_name=spec.metadata.name
         )
+    # sandbox migration wave 2 (spec § 四) — the per-agent sandbox namespace,
+    # shared by the skill-seed anchor below, the ``dir=`` the prompt states
+    # for each skill (final review Important 1), and PYTHONUSERBASE (spec
+    # 决策 10, bound onto the sandbox runtime further down). Manifest name is
+    # the only stable identity available at build time (the DB row's UUID
+    # doesn't exist in this scope). Computed before _load_skills because that
+    # is where the prompt summaries are rendered.
+    agent_key = sanitize_agent_key(spec.metadata.name)
     loaded_skills = await _load_skills(
         spec=spec,
         skill_resolver=skill_resolver,
         tenant_id=tenant_id,
         registry=None,
+        agent_key=agent_key,
         activity_recorder=skill_activity_recorder,
         evolved=evolved_skills,
     )
-    # sandbox migration wave 2 (spec § 四) — the per-agent sandbox namespace,
-    # shared by the skill-seed anchor below and PYTHONUSERBASE (spec 决策 10,
-    # bound onto the sandbox runtime further down). Manifest name is the only
-    # stable identity available at build time (the DB row's UUID doesn't
-    # exist in this scope).
-    agent_key = sanitize_agent_key(spec.metadata.name)
     # skill-runtime §5.1 — activated skills' files (SKILL.md + scripts + reference),
     # U-21 drift/threat-filtered, materialized under /opt/skills/<agent_key>/<name>/
     # on every sandbox acquire so bundled scripts run as authored.
@@ -766,7 +769,9 @@ async def build_agent(
     registry = await build_tool_registry(
         spec.spec.tools,
         tool_env=env,
-        # skill-runtime §5.1 — seed activated skill files into /workspace.
+        # skill-runtime §5.1 — seed activated skill files into
+        # {SANDBOX_SKILLS_ROOT}/<agent_key>/ (sandbox migration wave 2 § 四;
+        # it used to be the user's /workspace).
         skill_seed_files=skill_seed_files,
         # Stream J.4 — assemble the manifest's sub-agents into SubAgentTools;
         # subagent_depth gates the structural recursion cap.
@@ -1133,6 +1138,7 @@ async def _load_skills(
     skill_resolver: SkillResolver | None,
     tenant_id: Any,
     registry: Any,
+    agent_key: str,
     activity_recorder: SkillActivityRecorder | None = None,
     evolved: Sequence[tuple[Skill, SkillVersion]] = (),
 ) -> _LoadedSkills:
@@ -1154,6 +1160,12 @@ async def _load_skills(
     Skill tools are NOT registered here (the function is pure-read);
     the caller wires them after assembling the prompt + computing the
     final tool-name → skill-name map.
+
+    ``agent_key`` (sandbox migration wave 2 final review, Important 1) —
+    the same :func:`sanitize_agent_key` value the caller uses to namespace
+    the seed files, threaded in rather than recomputed here so the path
+    stated in the prompt and the path the files actually land on cannot
+    drift. It only feeds :func:`_render_skill_summary`'s ``dir`` attribute.
 
     ``evolved`` (SE-A42) — pre-fetched auto-attach candidates (this agent's
     own ACTIVE distilled skills). Appended after the manifest loop with
@@ -1236,7 +1248,7 @@ async def _load_skills(
         # in <available-skills>. Eager (lazy_load == False) skills also
         # get a <skill> body fragment per Mini-ADR U-15 (default preserves
         # existing behavior so deployed agents do not regress).
-        summaries.append(_render_skill_summary(name=ref.name, version=version))
+        summaries.append(_render_skill_summary(name=ref.name, version=version, agent_key=agent_key))
         if not version.lazy_load:
             fragments.append(_render_skill_fragment(name=ref.name, version=version))
         activated.append(ref.name)
@@ -1277,7 +1289,9 @@ async def _load_skills(
         for tool_name in evolved_version.tool_names:
             skill_tools[tool_name] = name
         resolved[name] = evolved_version
-        summaries.append(_render_skill_summary(name=name, version=evolved_version))
+        summaries.append(
+            _render_skill_summary(name=name, version=evolved_version, agent_key=agent_key)
+        )
         activated.append(name)
         await _record_skill_activity(activity_recorder, evolved_version)
 
@@ -1391,20 +1405,37 @@ def _render_memory_block(*, name: str, version: SkillVersion) -> str:
     )
 
 
-def _render_skill_summary(*, name: str, version: SkillVersion) -> str:
+def _render_skill_summary(*, name: str, version: SkillVersion, agent_key: str) -> str:
     """Capability Uplift Sprint #3 (Mini-ADR U-15) — render the
-    ``<skill name version description files=... />`` summary that goes
-    into ``<available-skills>``.
+    ``<skill name version description files=... dir=... />`` summary that
+    goes into ``<available-skills>``.
 
     ``files`` lists ``SKILL.md`` first, then sorted supporting-file paths.
     The agent reads this to decide which skill to load via ``skill_view``.
+
+    ``dir`` (sandbox migration wave 2 final review, Important 1) is the
+    skill's **absolute directory inside the sandbox**. Before wave 2 the
+    files were seeded into the workspace at ``skills/<name>/``, so a
+    ``SKILL.md`` saying "run ``python scripts/gen.py``" worked as authored:
+    the sandbox's cwd was ``/workspace`` and the relative path resolved.
+    Wave 2 moved the seed destination to
+    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/`` — outside the workspace
+    (spec § 四), which the file tools cannot even reach (they realpath-clamp
+    to ``/workspace``) — and ``agent_key`` carries an 8-hex digest suffix
+    the agent has no way to guess. Without this attribute nothing in the
+    system prompt ever states where the files are, and skill-runtime §5.1's
+    "bundled scripts run as authored" promise silently breaks: the agent
+    bashes ``python scripts/gen.py`` and gets "No such file". Stating the
+    directory is the whole fix — one attribute the model can concatenate a
+    relative ``files`` entry onto.
     """
     file_list = ["SKILL.md", *sorted(version.supporting_files)]
     files_attr = ", ".join(file_list)
     description = (version.description or name).replace('"', "&quot;")
     return (
         f'<skill name="{name}" version="{version.version}" '
-        f'description="{description}" files="{files_attr}" />'
+        f'description="{description}" files="{files_attr}" '
+        f'dir="{SANDBOX_SKILLS_ROOT}/{agent_key}/{name}" />'
     )
 
 
@@ -1582,7 +1613,11 @@ def _assemble_system_prompt(
             "summary lists its name, version, description, and the files "
             "you can load via the skill_view(skill_name, path) tool. "
             'Use path="SKILL.md" for the main body, or any listed '
-            "relative path for a supporting file."
+            "relative path for a supporting file. The dir attribute is that "
+            "skill's absolute directory inside the sandbox: when a skill "
+            "tells you to run one of its bundled scripts, use "
+            "dir + '/' + the file path (the sandbox working directory is "
+            "/workspace, which is NOT where skill files live)."
             "\n\n<available-skills>\n  " + "\n  ".join(skill_summaries) + "\n</available-skills>"
         )
 
