@@ -10,11 +10,11 @@ mounted **whole-tree** into the control-plane Pod itself (see wave 2 Task 2's
 so the control-plane no longer needs a network hop to read or write a
 user's files. This store implements the same :class:`WorkspaceStore`
 Protocol by operating on ``self.root`` (the Pod-local mount point, e.g.
-``/mnt/workspaces``) with plain :mod:`pathlib` calls; per-tenant/per-user
-layout is ``{root}/{tenant_id}/{user_id}/...``, matching the sandbox side's
-``subPath: "<tenant_id>/<user_id>"`` projection of the same volume (wave 2
-Task 4/6) — a sandbox writing under ``/workspace`` and this store reading
-``{root}/{tenant_id}/{user_id}`` see the same files.
+``/mnt/workspaces``) with :mod:`os` ``dir_fd``-relative syscalls; per-tenant
+/per-user layout is ``{root}/{tenant_id}/{user_id}/...``, matching the
+sandbox side's ``subPath: "<tenant_id>/<user_id>"`` projection of the same
+volume (wave 2 Task 4/6) — a sandbox writing under ``/workspace`` and this
+store reading ``{root}/{tenant_id}/{user_id}`` see the same files.
 
 **Parity contract with SupervisorWorkspaceStore.** Both implementations must
 behave identically at the :class:`WorkspaceStore` Protocol boundary — same
@@ -49,30 +49,66 @@ without ever calling :meth:`mark_deleted`). Neither of those is the
 ``is_reserved_workspace_path`` prefix check's job — the marker lives at the
 workspace *root*, not under a reserved directory prefix.
 
-**TOCTOU note.** :meth:`_resolve_user_path` validates a path once, at check
-time; every method except :meth:`list_files` then performs at least one more
-filesystem call afterwards (``mkdir``, ``open``) that a concurrent writer
-could race against. The threat is concrete, not theoretical: this NAS
-volume is the same tree a sandbox mounts (subPath-scoped to its own
-``{tenant_id}/{user_id}``) and *runs untrusted code against* — a malicious
-run sharing this control-plane's view of the wider tree could plant a
-symlink in the checked-but-not-yet-used window to redirect a write or read
-outside the caller's own subtree (a cross-tenant escape, not just a
-same-user footgun). :meth:`write_file` re-resolves and re-validates the
-parent directory *after* ``mkdir`` and *before* opening the target (closing
-the window ``mkdir``'s symlink-following parent walk could otherwise open),
-and both :meth:`write_file` and :meth:`read_file` open the final path
-component with ``os.O_NOFOLLOW`` so a symlink swapped in for the exact
-target between the check and the open causes the open itself to fail rather
-than silently follow it. :meth:`delete_file` needs neither: ``unlink()``
-never dereferences a symlink at its final path component — it removes the
-link entry itself — so there is no equivalent "write/read through a
-final-segment symlink" primitive to close there. None of this is airtight
-on NFS (no cross-process advisory lock is taken), and re-validating after
-``mkdir`` doesn't undo a directory ``mkdir`` may have already created inside
-a symlinked-elsewhere target during its parents-walk — this closes the
-specific reachable exploit (a write actually landing outside the tree with
-attacker-chosen bytes), not every theoretical race.
+**TOCTOU note.** The NAS volume is the same tree a sandbox mounts (subPath-
+scoped to its own ``{tenant_id}/{user_id}``) and *runs untrusted code
+against* — a malicious run sharing this control-plane's view of the wider
+tree can plant a symlink anywhere under its own subtree to redirect a
+later operation outside it (a cross-tenant escape, not just a same-user
+footgun). An earlier version of this module validated a path once with
+``Path.resolve()`` (following symlinks) and then reopened it by
+**re-walking the same string path** for the actual ``mkdir`` / ``open`` /
+``unlink`` — even with a freshly-repeated check immediately beforehand, the
+kernel still resolves *every* intermediate component of that string from
+scratch on the follow-up syscall, so a concurrent writer racing in a
+symlink for *any* intermediate component (not just the final one) between
+the check and the operation was never actually closed off; a symlink at the
+final component only narrows the window, it does not eliminate it. That
+includes ``delete_file``: ``unlink()`` never dereferences a symlink at its
+*final* component, but it does dereference symlinks in every component
+*before* the final one while resolving the string path — so a mid-chain
+swap turns ``delete_file`` into a cross-tenant arbitrary-delete primitive
+just as surely as it turns ``write_file``/``read_file`` into a cross-tenant
+arbitrary-write/read primitive. (An earlier revision of this note claimed
+``delete_file`` was structurally immune for this reason; that reasoning
+only covered the final component and was wrong about the intermediate
+ones — corrected here.)
+
+The actual fix is to never re-walk a string path at all.
+:meth:`_open_parent_dir_fd` resolves ``path`` one component at a time using
+``dir_fd``-relative ``openat()`` (:func:`os.open` with ``dir_fd=``),
+starting from a directory fd opened for the trusted ``{root}/{tenant_id}/
+{user_id}`` prefix (``tenant_id``/``user_id`` are UUIDs from the
+authenticated caller, never attacker-controlled path text, so opening that
+prefix via a plain path string needs no extra guarding — matching how the
+sandbox's own subPath mount is scoped to exactly this same prefix). Each
+step opens with ``O_NOFOLLOW`` — a symlink at *that* component makes the
+``openat()`` itself fail (``ELOOP``) rather than being followed — and, once
+opened, a directory fd is *pinned to the inode it was opened from*: nothing
+that happens afterwards to that name in its parent (a rename, an unlink, a
+symlink swapped in under the same name) can redirect operations already
+using that fd. The final read / write / delete all happen relative to the
+last fd in the chain (``os.open(name, ..., dir_fd=parent_fd)`` /
+``os.unlink(name, dir_fd=parent_fd)``), so there is no remaining step that
+re-resolves a string path — the class of race this note describes has no
+foothold left, for any of read/write/delete, at any path depth. This is not
+airtight against every conceivable race (e.g. a mkdir-then-immediate-reopen
+retry inside :meth:`_openat_dir` when creating a missing directory is two
+syscalls, not one — but that reopen also carries ``O_NOFOLLOW``, so even
+that narrow window fails closed rather than open), but it eliminates the
+specific mechanism (re-walking a string path) that made the previous
+version's re-checks ineffective.
+
+:meth:`list_files` is a narrower case: it only reads metadata, never opens
+file content, and its :func:`os.walk` call passes ``followlinks=False`` so
+it never *descends into* a symlinked subdirectory (an intermediate-
+component escape of the kind described above can't make it enumerate files
+outside the tree). A symlink placed as a plain file entry (not a directory)
+still appears in the listing under its own in-tree relative path, but its
+reported size comes from :func:`os.lstat` (not :func:`os.stat`) — the
+symlink's own byte length, never a stat of whatever it points at — so no
+metadata about anything outside the tree is ever surfaced. Nothing here
+needs ``dir_fd`` chaining: there is no content read and no follow-through
+target to escape into.
 """
 
 from __future__ import annotations
@@ -118,6 +154,45 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 #: ``sandbox_supervisor.supervisor._MAX_WORKSPACE_LIST_ENTRIES``.
 _MAX_LIST_ENTRIES = 2000
 
+#: Mode new leaf files are created with (``write_file`` / ``mark_deleted``).
+_LEAF_FILE_MODE = 0o644
+
+
+class _WorkspacePathNotFoundError(SandboxSupervisorError):
+    """A path component genuinely doesn't exist — distinct from an escape attempt.
+
+    Internal to this module. :meth:`NasWorkspaceStore._open_parent_dir_fd`
+    raises this (rather than a bare :class:`SandboxSupervisorError`) when a
+    component is simply missing, so :meth:`NasWorkspaceStore.delete_file`
+    can catch *specifically this* to implement ``rm -f`` semantics without
+    also swallowing an escape attempt (which raises the plain
+    :class:`SandboxSupervisorError` this subclasses, and must still
+    propagate). Every other caller doesn't need to tell the two apart — this
+    is still an ordinary :class:`SandboxSupervisorError` to them.
+    """
+
+
+def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
+    """``openat(dfd, name, O_DIRECTORY | O_NOFOLLOW)``, optionally creating ``name`` first.
+
+    Never follows a symlink at ``name`` — if the concurrent-writer race the
+    module docstring describes has swapped it for one, this raises
+    ``OSError(errno=ELOOP)``. ``create=True`` makes the directory first
+    (``mkdirat``) when it doesn't exist yet, then retries the same
+    ``O_NOFOLLOW`` open — so even a symlink raced in during that narrow
+    create-then-reopen gap still fails closed.
+    """
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, dir_fd=dfd)
+        except FileExistsError:
+            pass
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+
 
 @dataclass
 class NasWorkspaceStore:
@@ -126,11 +201,11 @@ class NasWorkspaceStore:
     ``root`` is the control-plane Pod's local mount point for the shared NAS
     volume (e.g. ``/mnt/workspaces``); every method scopes its filesystem
     access under ``{root}/{tenant_id}/{user_id}`` via
-    :meth:`_resolve_user_path`, which is the sole path-traversal guard (see
-    that method's docstring). All I/O is dispatched through
-    :func:`asyncio.to_thread` — NFS-backed synchronous I/O can block for the
-    duration of a network round-trip, and doing that on the event loop would
-    stall every other in-flight run.
+    :meth:`_open_parent_dir_fd`, which is the sole path-traversal guard (see
+    that method's docstring and the module docstring's "TOCTOU note"). All
+    I/O is dispatched through :func:`asyncio.to_thread` — NFS-backed
+    synchronous I/O can block for the duration of a network round-trip, and
+    doing that on the event loop would stall every other in-flight run.
     """
 
     root: str
@@ -143,44 +218,80 @@ class NasWorkspaceStore:
     def _user_root(self, tenant_id: UUID, user_id: UUID) -> Path:
         return (Path(self.root) / str(tenant_id) / str(user_id)).resolve()
 
-    def _resolve_user_path(self, tenant_id: UUID, user_id: UUID, path: str) -> Path:
-        """Resolve ``path`` to an absolute path inside the user's workspace, or raise.
+    def _open_parent_dir_fd(
+        self, tenant_id: UUID, user_id: UUID, path: str, *, create: bool
+    ) -> tuple[int, str]:
+        """Walk to ``path``'s parent directory via a chain of ``dir_fd``-relative opens.
 
         ``path`` must be relative and free of ``..`` path segments — checked
         against the *literal* path text, so a URL-encoded traversal attempt
-        (``%2e%2e%2f``) is never decoded; it is just an odd filename. The
-        resolved candidate must additionally stay inside the user's root
-        after ``Path.resolve()`` expands any symlink in the chain — this is
-        what stops a symlink planted inside the workspace (e.g. by a prior
-        sandbox run) from being used to read/write outside it.
+        (``%2e%2e%2f``) is never decoded; it is just an odd filename. Every
+        component of ``path`` except the last is then opened one at a time
+        with :func:`_openat_dir`, each anchored on the *previous* component's
+        already-open directory fd rather than on a re-walked string path —
+        see the module docstring's "TOCTOU note" for why that distinction is
+        the entire point.
+
+        Returns ``(parent_fd, final_component_name)``; the caller owns
+        ``parent_fd`` and must close it. ``create=True`` (``write_file`` /
+        ``mark_deleted``) creates the user root and any missing intermediate
+        directory as it walks; ``create=False`` (``read_file`` /
+        ``delete_file``) never creates anything and raises
+        :class:`_WorkspacePathNotFoundError` the moment a component is missing.
         """
         cleaned = path.strip()
         if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
             raise SandboxSupervisorError(
                 f"workspace path must be relative and free of '..': {path!r}"
             )
+        parts = PurePosixPath(cleaned).parts
         user_root = self._user_root(tenant_id, user_id)
-        candidate = (user_root / cleaned).resolve()
-        if not candidate.is_relative_to(user_root):
-            raise SandboxSupervisorError(f"workspace path escapes the user root: {path!r}")
-        return candidate
+        if create:
+            # ``tenant_id``/``user_id`` are UUIDs from the authenticated
+            # caller, not attacker path text — see module docstring — so a
+            # plain path-string mkdir/open for this trusted prefix is fine;
+            # only the (untrusted) ``parts`` walked below need dir_fd
+            # chaining.
+            user_root.mkdir(parents=True, exist_ok=True)
+        try:
+            dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as exc:
+            raise _WorkspacePathNotFoundError(f"workspace path not found: {path!r}") from exc
 
-    async def read_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
-        def _read() -> bytes:
-            candidate = self._resolve_user_path(tenant_id, user_id, path)
-            # O_NOFOLLOW — see module docstring "TOCTOU note". A concurrent
-            # writer could have swapped ``candidate`` for a symlink to
-            # somewhere outside the user's root in the window between the
-            # check above and this open; O_NOFOLLOW makes that open fail
-            # (ELOOP) instead of silently reading through it.
+        for component in parts[:-1]:
             try:
-                fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+                nfd = _openat_dir(dfd, component, create=create)
             except OSError as exc:
+                os.close(dfd)
                 if exc.errno == errno.ELOOP:
                     raise SandboxSupervisorError(
                         f"workspace path escapes the user root: {path!r}"
                     ) from exc
-                raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
+                raise _WorkspacePathNotFoundError(f"workspace path not found: {path!r}") from exc
+            os.close(dfd)
+            dfd = nfd
+        return dfd, parts[-1]
+
+    async def read_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
+        def _read() -> bytes:
+            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
+            try:
+                # O_NOFOLLOW — a symlink planted for the exact leaf name
+                # makes this open fail (ELOOP) instead of silently reading
+                # through it. ``dfd`` is pinned to the parent directory's
+                # inode (see module docstring), so nothing that happened to
+                # any *earlier* path component after it was opened can
+                # redirect this call.
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise SandboxSupervisorError(
+                            f"workspace path escapes the user root: {path!r}"
+                        ) from exc
+                    raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
+            finally:
+                os.close(dfd)
             with os.fdopen(fd, "rb") as handle:
                 # Stat before reading so an over-cap file never gets fully
                 # loaded into memory — the NFS mount has no equivalent to
@@ -195,7 +306,7 @@ class NasWorkspaceStore:
                 try:
                     return handle.read()
                 except OSError as exc:
-                    # e.g. IsADirectoryError — ``candidate`` resolved to a
+                    # e.g. IsADirectoryError — ``name`` resolved to a
                     # directory, not a file.
                     raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
 
@@ -207,13 +318,20 @@ class NasWorkspaceStore:
             if not user_root.is_dir():
                 return []
             entries: list[WorkspaceFileEntry] = []
-            for dirpath, _dirnames, filenames in os.walk(user_root):
+            # followlinks=False — see module docstring: never descend into a
+            # symlinked subdirectory, so an intermediate-component escape
+            # can't make this enumerate files outside the tree.
+            for dirpath, _dirnames, filenames in os.walk(user_root, followlinks=False):
                 for name in filenames:
                     full = Path(dirpath) / name
                     rel = full.relative_to(user_root).as_posix()
                     if rel == DELETED_MARKER or is_reserved_workspace_path(rel):
                         continue
-                    entries.append(WorkspaceFileEntry(path=rel, size=full.stat().st_size))
+                    # lstat, not stat — a symlink appearing as a plain file
+                    # entry must report its own byte length, never a stat()
+                    # of whatever it points at outside the tree (see module
+                    # docstring).
+                    entries.append(WorkspaceFileEntry(path=rel, size=full.lstat().st_size))
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 
@@ -227,31 +345,30 @@ class NasWorkspaceStore:
             if len(data) > _MAX_WRITE_BYTES:
                 msg = f"upload {path!r} exceeds the {_MAX_WRITE_BYTES}-byte write cap"
                 raise SandboxSupervisorError(msg)
-            candidate = self._resolve_user_path(tenant_id, user_id, path)
-            user_root = self._user_root(tenant_id, user_id)
-            candidate.parent.mkdir(parents=True, exist_ok=True)
-            # TOCTOU re-check — see module docstring "TOCTOU note".
-            # ``mkdir(parents=True)`` silently accepts (and walks through) a
-            # pre-existing symlink at any intermediate component; a
-            # concurrent untrusted writer sharing this tree could have
-            # swapped one in between the initial ``_resolve_user_path``
-            # check above and this ``mkdir`` call. Re-resolve the parent now
-            # that it exists and re-verify it is still inside the user's
-            # root before any byte is written.
-            real_parent = candidate.parent.resolve()
-            if not real_parent.is_relative_to(user_root):
-                raise SandboxSupervisorError(f"workspace path escapes the user root: {path!r}")
-            target = real_parent / candidate.name
-            # O_NOFOLLOW — refuse to write through a symlink swapped in for
-            # the exact target between the check above and this open.
+            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=True)
             try:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            except OSError as exc:
-                if exc.errno == errno.ELOOP:
+                # O_NOFOLLOW — see read_file and module docstring. Every
+                # OSError here (not just ELOOP) is wrapped into
+                # SandboxSupervisorError — a bare OSError must never leak
+                # past this store's boundary (parity contract: "错误类型
+                # 统一").
+                try:
+                    fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                        _LEAF_FILE_MODE,
+                        dir_fd=dfd,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise SandboxSupervisorError(
+                            f"workspace path escapes the user root: {path!r}"
+                        ) from exc
                     raise SandboxSupervisorError(
-                        f"workspace path escapes the user root: {path!r}"
+                        f"workspace file write failed: {path!r}: {exc}"
                     ) from exc
-                raise
+            finally:
+                os.close(dfd)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
 
@@ -259,25 +376,43 @@ class NasWorkspaceStore:
 
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         def _delete() -> None:
-            candidate = self._resolve_user_path(tenant_id, user_id, path)
             cleaned = path.strip()
             if cleaned == DELETED_MARKER or is_reserved_workspace_path(cleaned):
                 raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
-            # No O_NOFOLLOW-equivalent needed here (see module docstring
-            # "TOCTOU note") — ``unlink()`` never dereferences a symlink at
-            # its final path component, it removes the link entry itself,
-            # so a final-segment swap can't be abused to delete something
-            # outside the tree the way write/read could be abused to
-            # write/read one.
-            candidate.unlink(missing_ok=True)  # rm -f semantics — missing is not an error
+            try:
+                dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
+            except _WorkspacePathNotFoundError:
+                return  # rm -f semantics — the parent chain doesn't exist, nothing to delete.
+            try:
+                try:
+                    os.unlink(name, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass  # rm -f semantics — the leaf itself is already gone.
+            finally:
+                os.close(dfd)
 
         await asyncio.to_thread(_delete)
 
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
         def _mark() -> None:
-            user_root = self._user_root(tenant_id, user_id)
-            user_root.mkdir(parents=True, exist_ok=True)
-            (user_root / DELETED_MARKER).touch(exist_ok=True)
+            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, DELETED_MARKER, create=True)
+            try:
+                try:
+                    fd = os.open(
+                        name,
+                        os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
+                        _LEAF_FILE_MODE,
+                        dir_fd=dfd,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ELOOP:
+                        raise SandboxSupervisorError(
+                            "workspace marker path escapes the user root"
+                        ) from exc
+                    raise SandboxSupervisorError(f"workspace marker write failed: {exc}") from exc
+            finally:
+                os.close(dfd)
+            os.close(fd)  # touch semantics — existence is all that matters, nothing to write.
 
         await asyncio.to_thread(_mark)
         logger.info(
