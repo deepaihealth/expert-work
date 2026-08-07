@@ -8,6 +8,7 @@ from control_plane.runtime import build_sandbox_runtime, build_workspace_store
 from control_plane.settings import Settings
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from orchestrator.tools.agent_sandbox import AgentSandboxClient
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
@@ -119,7 +120,8 @@ def test_legacy_url_only_still_works() -> None:
 
 
 def test_workspace_store_builds_from_a_real_url() -> None:
-    store = build_workspace_store("http://sup:8080")
+    s = Settings(sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
     assert isinstance(store, SupervisorWorkspaceStore)
     assert store.base_url == "http://sup:8080"
 
@@ -135,4 +137,29 @@ def test_workspace_store_is_none_without_a_usable_url(url: str | None) -> None:
     HTTP:``purge_user`` 把工作区那步报成失败而不是跳过,工作区端点回传输
     错误而不是空结果。
     """
-    assert build_workspace_store(url) is None
+    s = Settings(sandbox_supervisor_url=url)
+    assert build_workspace_store(s) is None
+
+
+def test_workspace_store_builds_nas_store_when_root_is_set() -> None:
+    """波 2 Task 3 —— ``workspace_nas_root`` 真值 → ``NasWorkspaceStore``。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.root == "/mnt/workspaces"
+
+
+def test_workspace_store_prefers_nas_over_supervisor_when_both_are_set() -> None:
+    """两者都配了 —— NAS 直读路径是波 2 的目标终态,优先于 supervisor 代理。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces", sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+
+
+@pytest.mark.parametrize("root", [None, ""])
+def test_workspace_store_falls_back_to_supervisor_without_a_usable_nas_root(
+    root: str | None,
+) -> None:
+    s = Settings(workspace_nas_root=root, sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
+    assert isinstance(store, SupervisorWorkspaceStore)

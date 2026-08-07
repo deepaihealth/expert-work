@@ -714,7 +714,7 @@ def create_app(
     # 波 1 Task 4 — workspace-file ops now live on a separate client, built
     # from the same supervisor URL (still the only thing that can reach the
     # docker-volume workspace today; wave 2's NAS mount replaces this).
-    resolved_workspace_store = build_workspace_store(resolved_settings.sandbox_supervisor_url)
+    resolved_workspace_store = build_workspace_store(resolved_settings)
     resolved_feedback = feedback_repo or (
         sql_stores.feedback if sql_stores else InMemoryFeedbackStore()
     )

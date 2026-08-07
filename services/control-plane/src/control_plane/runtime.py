@@ -112,6 +112,7 @@ from orchestrator.tools import (
     MCPClient,
     MCPServerConfig,
     MCPServerPool,
+    NasWorkspaceStore,
     NullWorkspaceLock,
     Reranker,
     SandboxInstanceStore,
@@ -1513,27 +1514,34 @@ def build_sandbox_runtime(
     return None
 
 
-def build_workspace_store(url: str | None) -> WorkspaceStore | None:
-    """Build the workspace-file client from the supervisor's base URL.
+def build_workspace_store(settings: Settings) -> WorkspaceStore | None:
+    """Build the workspace-file client per ``settings``.
 
     波 1 Task 4 — 工作区文件操作从 ``SandboxRuntime`` 拆出。本地/CI 下
-    工作区是 docker 卷,只有 supervisor 碰得到,所以这个实现仍走 HTTP;
-    波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
+    工作区是 docker 卷,只有 supervisor 碰得到,所以那个实现走 HTTP 代理。
 
-    ``None`` → 工作区文件端点不可用,与 ``build_sandbox_runtime`` 同语义。
+    波 2 Task 3 — ``settings.workspace_nas_root`` 真值 → ``NasWorkspaceStore``
+    直接读挂载的 NAS 文件系统(control-plane Pod 整树挂载,见该类的模块
+    docstring);优先于 supervisor 代理,因为两者若都配置了,NAS 直读路径
+    是波 2 的目标终态。否则退回 ``sandbox_supervisor_url`` 真值 →
+    ``SupervisorWorkspaceStore``。都没配 → ``None``,与
+    ``build_sandbox_runtime`` 同语义(工作区文件端点不可用)。
 
-    全分支终审"合并前"清单第 4 条:判据是 ``not url`` 而不是 ``url is
-    None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是真值判断,而
-    ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个 overlay 关掉
-    supervisor 的写法,见 ``infra/k8s/overlays/*/configmap-patch.yaml``)在
-    ``is None`` 下会造出一个 ``base_url=""`` 的活 store —— 它不是"不可用",
-    而是每次请求都拿一个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那
-    步报成**失败**而不是跳过,工作区端点回一个传输错误而不是它们的空结果
-    分支。
+    全分支终审"合并前"清单第 4 条:supervisor 分支的判据是 ``not url``
+    而不是 ``url is None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是
+    真值判断,而 ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个
+    overlay 关掉 supervisor 的写法,见
+    ``infra/k8s/overlays/*/configmap-patch.yaml``)在 ``is None`` 下会造出
+    一个 ``base_url=""`` 的活 store —— 它不是"不可用",而是每次请求都拿一
+    个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那步报成**失败**而不
+    是跳过,工作区端点回一个传输错误而不是它们的空结果分支。同一判据延
+    续到 NAS 分支(``workspace_nas_root`` 也用真值判断)。
     """
-    if not url:
-        return None
-    return SupervisorWorkspaceStore(base_url=url)
+    if settings.workspace_nas_root:
+        return NasWorkspaceStore(root=settings.workspace_nas_root)
+    if settings.sandbox_supervisor_url:
+        return SupervisorWorkspaceStore(base_url=settings.sandbox_supervisor_url)
+    return None
 
 
 def build_tool_env(

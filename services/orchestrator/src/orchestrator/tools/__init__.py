@@ -126,6 +126,12 @@ from orchestrator.tools.mcp import (
 from orchestrator.tools.mcp import (
     register_mcp_tools as register_mcp_tools,
 )
+from orchestrator.tools.nas_workspace_store import (
+    DELETED_MARKER as DELETED_MARKER,
+)
+from orchestrator.tools.nas_workspace_store import (
+    NasWorkspaceStore as NasWorkspaceStore,
+)
 from orchestrator.tools.read_document import (
     ReadDocumentTool as ReadDocumentTool,
 )
@@ -228,6 +234,7 @@ __all__ = [
     "DEFAULT_MAX_SERVERS",
     "DEFAULT_MCP_CHAR_CAP",
     "DEFAULT_OUTPUT_CHAR_CAP",
+    "DELETED_MARKER",
     "KNOWN_BUILTINS",
     "MAX_SUBAGENT_DEPTH",
     "SANDBOX_EXEC_USER",
@@ -255,6 +262,7 @@ __all__ = [
     "MCPServerPoolLimitError",
     "MCPTool",
     "MCPToolDef",
+    "NasWorkspaceStore",
     "NullWorkspaceLock",
     "ReadDocumentTool",
     "ReadFileTool",
