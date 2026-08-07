@@ -561,6 +561,11 @@ async def test_acquire_launch_failure_marks_failed_and_raises() -> None:
 
     states = [r.state for r in h.store.rows.values()]
     assert states == [SandboxState.FAILED]
+    # docker.remove() is called unconditionally in the failure path (cheap
+    # and idempotent even when launch() itself never got a container up);
+    # asserted here too for completeness alongside the two tests below.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio
@@ -572,6 +577,13 @@ async def test_acquire_runner_not_ready_marks_failed_and_raises() -> None:
 
     states = [r.state for r in h.store.rows.values()]
     assert states == [SandboxState.FAILED]
+    # code-reviewer Important-2: a container that launched but never
+    # reported ready must not be orphaned (nothing else points to it —
+    # self._links / the store's container_id are only set after this
+    # whole try block succeeds) — it has to be torn down right here, not
+    # left for the next supervisor-restart sweep_orphans() pass.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio
@@ -700,6 +712,13 @@ async def test_acquire_chown_failure_marks_failed_and_raises() -> None:
 
     states = [r.state for r in h.store.rows.values()]
     assert states == [SandboxState.FAILED]
+    # code-reviewer Important-2: chown_volume fails *after* launch() has
+    # already created a live, READY container — nothing (self._links, the
+    # store's container_id) points to it yet at that point, so it must be
+    # torn down here or it leaks until the next supervisor-restart
+    # sweep_orphans() pass.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio

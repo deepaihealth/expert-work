@@ -254,6 +254,19 @@ class SandboxSupervisor:
                 # for *this* container's view — see the docstring for why.
                 await self._docker.chown_volume(volume=workspace_volume, image=record.image_ref)
         except (DockerError, RunnerLinkError) as exc:
+            # code-reviewer Important-2: covers all three failure points in
+            # the try block above (launch() itself, wait_ready() timeout,
+            # chown_volume()) with one line — by the time any of them can
+            # raise, launch() has already run, so a container may be alive
+            # with nothing pointing to it (self._links / the store's
+            # container_id are only set *after* this try block succeeds).
+            # Left alone it's an orphan until the next sweep_orphans() pass
+            # on supervisor restart. docker.remove() is already idempotent
+            # (a missing container just logs a warning, never raises — see
+            # its docstring), so it's safe unconditionally here even for the
+            # launch()-itself-failed case where no container exists at all;
+            # it also never raises, so it can't mask ``exc`` below.
+            await self._docker.remove(_container_name(record.id))
             await self._store.update(record.with_state(SandboxState.FAILED))
             msg = f"sandbox launch failed: {exc}"
             raise SupervisorError(msg) from exc
@@ -291,14 +304,19 @@ class SandboxSupervisor:
         )
 
     async def _seed_workspace(self, container_name_: str, seed_files: list[SeedFile]) -> None:
-        """Materialize ``seed_files`` into a running container's ``/workspace``
-        (skill-runtime §5.1). Validate path + caps (trust boundary; the request
-        round-trips untrusted), base64-decode, then ``docker cp``.
+        """Materialize ``seed_files`` into a running container's
+        ``SANDBOX_SKILLS_ROOT`` (``/opt/skills``, W2 Task 6 — skill-runtime
+        §5.1). Validate path + caps (trust boundary; the request round-trips
+        untrusted), base64-decode, then ``docker exec`` + an in-container
+        ``tar`` extraction (see :meth:`CliDockerClient.seed_workspace` for
+        why, not ``docker cp`` — that daemon path unconditionally rejects a
+        ``--read-only`` container).
 
         Bad input (unsafe path / bad base64 / over cap) → :class:`InvalidSeedFilesError`
-        (HTTP 400) — deterministic, reject the acquire. A docker-cp transport
-        failure degrades gracefully (log + continue): the skill files just aren't
-        on disk this call; ``skill_view`` still serves them as text.
+        (HTTP 400) — deterministic, reject the acquire. A transport failure
+        (the ``docker exec``/``tar`` step) degrades gracefully (log +
+        continue): the skill files just aren't on disk this call;
+        ``skill_view`` still serves them as text.
         """
         if not seed_files:
             return

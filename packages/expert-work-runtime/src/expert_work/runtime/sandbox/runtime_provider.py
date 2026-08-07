@@ -155,10 +155,16 @@ class SandboxRuntimeProvider:
             # any more), so the local backend supplies all three as
             # sandbox-local, agent-owned tmpfs at run time, one-to-one with
             # the image's own /opt/skills + /opt/agents + /home/agent
-            # directories. ``uid=``/``gid=`` on the tmpfs mount option sets
-            # ownership directly (no ``mode=1777`` — unlike /workspace and
-            # /tmp, only the single non-root --user above ever touches
-            # these, so a world-writable mode isn't needed).
+            # directories. ``uid=``/``gid=`` set ownership; no explicit
+            # ``mode=`` — Linux tmpfs defaults to 1777 (world-writable +
+            # sticky) regardless (verified: ``--tmpfs /x:rw,size=10m,uid=
+            # 10000,gid=10000`` alone still lands ``10000:10000 1777``, same
+            # as if ``mode=1777`` were spelled out). Harmless here — only
+            # the single non-root --user above ever runs inside the
+            # container (--cap-drop ALL rules out escaping that identity)
+            # — but don't read the missing ``mode=`` as "therefore not
+            # world-writable"; it is, the kernel default just already
+            # matches what /workspace and /tmp spell out explicitly.
             "--tmpfs",
             f"{SANDBOX_SKILLS_ROOT}:rw,size=64m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--tmpfs",

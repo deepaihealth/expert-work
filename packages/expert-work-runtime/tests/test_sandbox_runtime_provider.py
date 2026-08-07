@@ -70,8 +70,9 @@ def test_argv_mounts_skills_agents_home_as_owned_tmpfs() -> None:
     # W2 Task 9 moved /opt/skills, /opt/agents and HOME off the image (the
     # run root must stay bare); the local backend supplies all three as
     # sandbox-local, agent-owned tmpfs at run time so the non-root --user
-    # above can write into them (uid=/gid= sets ownership directly — no
-    # mode=1777 needed since only the agent uid ever touches them).
+    # above can write into them (uid=/gid= sets ownership; no explicit
+    # mode= — tmpfs defaults to 1777 regardless, harmless since only the
+    # agent uid ever runs in the container).
     argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
     tmpfs = {}
     for i, tok in enumerate(argv):

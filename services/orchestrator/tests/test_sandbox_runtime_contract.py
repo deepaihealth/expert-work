@@ -250,10 +250,13 @@ async def test_exec_cwd_is_workspace(runtime: SandboxRuntime) -> None:
     没人发现的原因:其它每一条用例都用绝对 ``/workspace/...`` 路径,对 cwd
     完全不敏感。
 
-    supervisor 档靠镜像的 ``WORKDIR /workspace``(``runner.py`` 是容器
-    PID 1,``subprocess.run`` 继承它);agent_sandbox 档靠
-    ``commands.run(cwd=...)`` —— envd 派生的进程不继承镜像 ``WORKDIR``,
-    实测落在 ``/home/agent``。两条路子不同,观测结果必须相同。
+    supervisor 档靠 ``docker run --workdir /workspace``(W2 Task 6,
+    ``SandboxRuntimeProvider.docker_run_argv`` —— 镜像自己不再声明
+    ``WORKDIR``,W2 Task 9 为了给 ACS 的 NAS-mount symlink 让路把它删了;
+    ``runner.py`` 是容器 PID 1,``subprocess.run`` 继承这个 run-time cwd);
+    agent_sandbox 档靠 ``commands.run(cwd=...)`` —— envd 派生的进程不继承
+    镜像 ``WORKDIR``(即便镜像声明了也一样),实测落在 ``/home/agent``。
+    两条路子不同,观测结果必须相同。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c8")
     try:
