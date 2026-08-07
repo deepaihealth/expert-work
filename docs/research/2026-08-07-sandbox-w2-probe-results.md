@@ -2,7 +2,7 @@
 
 计划 `docs/superpowers/plans/2026-08-07-sandbox-migration-w2.md` Task 1 是 Task 4(云后端挂载注入)的前置探针,回答四个问题。上游设计 `docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md` § 一.1 基于阿里云现行文档判断"`csi-volume-config` 已官方文档化、探针只是验证配方,非探生死"——**这个判断在本集群上被推翻**:配方本身没错,但机制被一道我们没开通的安全闸拦住了。
 
-**结论:问题一 NO(机制当前不通,已定位根因,需工单);问题二/四已用现有数据回答;问题三因问题一未过而无法实测,按计划默认值不变。Task 4 的"云后端挂载注入"在工单批复前不能按当前设计走通,需要先把这件事捅给运维/上层。**
+**结论:问题一 NO(机制当前不通,已定位根因,需工单);问题二部分回答(前导斜杠无关已证,相对语义未证——见 § 二);问题四测得未命中基线 53s,加速数据待 Task 8;问题三因问题一未过而无法实测,按计划默认值不变。Task 4 的"云后端挂载注入"在工单批复前不能按当前设计走通,需要先把这件事捅给运维/上层。**
 
 ## 一、`csi-volume-config` 在池领取路径下是否生效——不生效,EPERM,根因已定位
 
@@ -57,7 +57,7 @@ WebSearch 查阿里云现行文档《为Agent Sandbox挂载共享存储》(`help
 
 ## 二、`subPath` 语义——两种写法在协议层完全等价,给 Task 4 的取值指令
 
-两个变体的 create() 请求虽然都因 § 一 的根因失败,但失败发生在**挂载执行阶段**,请求本身已经被 sandbox-manager 完整解析并生成了 CSI 驱动的 protobuf config(嵌在 500 错误消息的 base64 里)——这段数据足以回答语义问题,不需要挂载真正成功。
+两个变体的 create() 请求虽然都因 § 一 的根因失败,但失败发生在**挂载执行阶段**,请求本身已经被 sandbox-manager 完整解析并生成了 CSI 驱动的 protobuf config(嵌在 500 错误消息的 base64 里)——这段数据足以回答语义问题,不需要挂载真正成功。(brief Step 2 要求的跨 Pod 共享验证——用另一个挂 `nas-test-pvc` 的 Pod 读 `probe.txt` 内容比对——因为挂载从未成功、沙箱侧从未写出任何数据而**跳过**,没有东西可比对。)
 
 变体 1,`subPath="w2-probe/tenant-a/user-1"`(不带前导 `/`)解码结果:
 
@@ -77,7 +77,7 @@ path: "/w2-probe/tenant-a/user-1"   # 与变体 1 字节级相同
 
 `nas-test-pv` 本身 `spec.csi.volumeAttributes.path` 是 `/`(NAS 根),所以本探针**无法从数据上区分**"`subPath` 相对 PV 的 `path` 字段解析"还是"相对 NAS 根解析"这两种理论(PV path 是根,两种理论算出来的绝对路径必然重合)——要真正分开这两种解释,需要另一个 `path` 不是 `/` 的 PV,当前没有,也不在本任务授权范围内新建。
 
-**对 Task 4 的取值指令**:`EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX`(或等价常量)**不需要带前导 `/`**——写 `"<tenant_id>"` 拼 `"/<user_id>"` 这种不带前导斜杠的形式即可,sandbox-manager 会自动规范化,带不带这个前导斜杠在协议层零差异,不影响正确性。设计文档 § 三给的例子 `subPath: "<tenant_id>/<user_id>"`(不带前导 `/`)可以照抄,不用改。
+**对 Task 4 的取值指令**:前导斜杠无关**已证**——`EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX`(或等价常量)带不带前导 `/` 在协议层零差异,sandbox-manager 会自动规范化,设计文档 § 三给的例子 `subPath: "<tenant_id>/<user_id>"`(不带前导 `/`)可以照抄。但"`subPath` 相对 PV `path` 解析、还是相对 NAS 根解析"这一条**相对语义未证**——`nas-test-pv` 的 `path` 恰好是 `/`,两种理论在本探针数据上无法区分(上段已说明)。生产用的 `workspace-nas` PV 的 `path` 是 `/workspaces`(非根),这才是唯一能把两种理论分开的场景,**建成后必须专项验证**(见 § 七待办),不能把这里"零差异"的结论直接推广到非根 path 的场景。
 
 ## 三、新目录不存在时自动建还是失败——无法实测,保留计划默认值
 
@@ -126,6 +126,7 @@ $ kubectl get pod -l alibabacloud.com/compute-class=agent-sandbox -o json | jq .
 |---|---|---|
 | 1 | 提工单开通"特权容器 + hostPath `/var/run/csi`"安全豁免(§ 一根因),这是 Task 4 云端挂载能落地的前置条件 | 运维/上层决策 |
 | 2 | 工单批复后重跑本探针 Step 2(尤其变体 3:新目录自动建 vs 失败),当前是唯一因 § 一 被卡住没能实测的问题 | Task 4 开工前 |
-| 3 | ImageCache 补测(是否命中、耗时是否降到官方宣称的秒级)| Task 8 端到端验收 |
-| 4 | NAS 根残留的 `/probe.txt`(W0 PoC 遗留)如何处理,待决策 | Task 2 或运维 |
-| 5 | 工单进度未知时,Task 4 是否要拆成"control-plane 侧先落地(不受影响)+ 沙箱侧挂载暂缓"两步,需要拍板 | 运维/上层决策 |
+| 3 | 用非根 path 的 PV(`workspace-nas`,`path=/workspaces`)专项验证 `subPath` 相对 PV `path` 解析还是相对 NAS 根解析——`nas-test-pv` 的 `path` 是 `/`,两种理论在它上面永远无法区分,别只测变体 3 就当这题也过了 | Task 4,`workspace-nas` 建成后 |
+| 4 | ImageCache 补测(是否命中、耗时是否降到官方宣称的秒级)| Task 8 端到端验收 |
+| 5 | NAS 根残留的 `/probe.txt`(W0 PoC 遗留)如何处理,待决策 | Task 2 或运维 |
+| 6 | 工单进度未知时,Task 4 是否要拆成"control-plane 侧先落地(不受影响)+ 沙箱侧挂载暂缓"两步,需要拍板 | 运维/上层决策 |
