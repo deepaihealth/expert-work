@@ -125,22 +125,39 @@ apply`——下一步的常规发布会带出它。要脱离常规发布单独�
 kustomize build infra/k8s/overlays/test | kubectl apply --dry-run=client -f -
 ```
 
-### 3. `tools/deploy/release.sh` 常规发布(control-plane / admin-ui)
+### 3. 沙箱镜像换 tag(W2 Task 9 改了 `infra/sandbox-image/Dockerfile`)
 
-走常规发布路径,带上 W2 新增的三个配置项(已在
-`infra/k8s/overlays/test/configmap-patch.yaml` 里,零手工步骤):
-`EXPERT_WORK_WORKSPACE_NAS_ROOT` / `EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME` /
-`EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX`。新镜像含 W2 全部代码
-(`NasWorkspaceStore`、技能 per-agent 落点、软删闸)。
-
-### 4. 沙箱镜像换 tag(W2 Task 9 改了 `infra/sandbox-image/Dockerfile`)
-
-这是本文件开头「发布步骤」一节要走的**另一条**发布线,不是第 3 步的
+这是本文件开头「发布步骤」一节要走的**另一条**发布线,不是第 4 步的
 control-plane 发布——W2 首发两条都要走。等本分支合并 main 后 CI 自动构建新镜像
 (约 30 分钟),按本文件「发布步骤」一节换 `infra/k8s/sandbox/sandboxset.yaml`
 的 tag。**永不复用已存在的 tag**(本文件已有的规则,W2 同样适用——W2 Task 9
 改了 Dockerfile,旧 tag 对应的镜像仍是改造前的"非 root + 预建 `/workspace`"
 版本,沙箱侧挂载会照 § 一 的旧根因原样失败)。
+
+> **为什么镜像在前、control-plane 在后**(W2 全分支终审 I-3 改的顺序)。
+> 这两步之间必然有一段沙箱工具不可用的窗口,方向由顺序决定,**要做的是把
+> 窗口压到最短**:
+>
+> | 顺序 | 中间态 | 症状 | 窗口长度 |
+> |---|---|---|---|
+> | 先 control-plane(**旧顺序**) | 新 control-plane 注入 `csi-volume-config` + 旧镜像(`USER agent` + 预建 `/workspace`) | § 二之二 两个真因原样重现,**每一次 acquire 都失败** | 等 CI 构建 ≈ 30 分钟 + 等池就绪 |
+> | 先镜像(**现顺序**) | 新镜像(不预建 `/workspace`)+ 旧 control-plane(不注入挂载) | 沙箱里没有 `/workspace`,`exec` 的 `cwd` 踩空 | 一次 `release.sh` 的分钟级 |
+>
+> 两个中间态都是"沙箱工具不可用",没有哪个更安全;差别只在持续多久。先换
+> 镜像 tag、SandboxSet 就绪后**立刻**走第 4 步,窗口就是一次常规发布的时长。
+> **这段时间沙箱工具报错属预期**,不要据此回滚——回滚只会把窗口拉长。
+
+### 4. `tools/deploy/release.sh` 常规发布(control-plane / admin-ui)
+
+第 3 步的 SandboxSet 回到 `UPDATEDAVAILABLEREPLICAS=1` 之后**立刻**执行这一
+步(见上方窗口说明)。走常规发布路径,带上 W2 新增的三个配置项(已在
+`infra/k8s/overlays/test/configmap-patch.yaml` 里,零手工步骤):
+`EXPERT_WORK_WORKSPACE_NAS_ROOT` / `EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME` /
+`EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX`。新镜像含 W2 全部代码
+(`NasWorkspaceStore`、技能 per-agent 落点、软删闸)。
+
+前两项**漏配会在进程启动时直接 `RuntimeError` 点名**(W2 终审 I-2:Task 9
+之后"不配 = 波 1 行为"不再成立),不会静默降级成一个 exec 全废的 Pod。
 
 ### 5. 冒烟
 
@@ -149,6 +166,6 @@ kubectl exec deploy/control-plane -n expert-work -- ls /mnt/workspaces
 # 应看到第 1 步建的空目录(还没有 tenant 子树——首次真实上传/exec 之后才会出现)
 ```
 
-第 4 步换完 tag、SandboxSet 回到 `UPDATEDAVAILABLEREPLICAS=1` 后,再走
+第 4 步的 control-plane 发布完成后,再走
 `docs/research/2026-08-07-sandbox-w2-probe-results.md`「九、端到端验收清单」
 确认真实 `acquire` 能挂上 NAS、`exec` 能写进去。

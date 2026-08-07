@@ -1490,6 +1490,21 @@ def build_sandbox_runtime(
                 ("EXPERT_WORK_SANDBOX_E2B_DOMAIN", settings.sandbox_e2b_domain),
                 ("EXPERT_WORK_SANDBOX_E2B_API_KEY", settings.sandbox_e2b_api_key),
                 ("EXPERT_WORK_SANDBOX_E2B_TEMPLATE", settings.sandbox_e2b_template),
+                # 波 2 终审 Important-2 —— 这两项在波 1 是可选的("不配 = 波 1
+                # 行为"),Task 9 之后不再是:新沙箱镜像**不预建
+                # /workspace**(那条路径必须留空,平台才能在它上面建 NAS 挂载
+                # 的 symlink),而 exec 无条件传 ``cwd=/workspace``。
+                #  * 少 PV_NAME → ``_create`` 不注入 csi-volume-config → 沙箱里
+                #    根本没有 /workspace → 第一次工具调用炸在 envd 层,报一个
+                #    与根因八竿子打不着的错;
+                #  * 少 NAS_ROOT → 挂载点子目录没人提前 mkdir + chmod(NAS 新
+                #    建目录属主 root、沙箱以 uid 10000 跑,探针 § 三 明确"平台
+                #    是否自动建目录"至今未实测),软删闸与 NasWorkspaceStore
+                #    也一起哑掉(工作区浏览/上传/下载/删用户级联全失效)。
+                # 两者都是纯配置错误 + 零运行期信号,正是这段代码上方注释自己
+                # 定的"该在进程起来时点名"的场景。
+                ("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", settings.sandbox_workspace_pv_name),
+                ("EXPERT_WORK_WORKSPACE_NAS_ROOT", settings.workspace_nas_root),
             )
             if not value
         ]

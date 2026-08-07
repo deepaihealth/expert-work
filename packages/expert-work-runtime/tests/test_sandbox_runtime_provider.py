@@ -80,7 +80,7 @@ def test_argv_mounts_skills_agents_home_as_owned_tmpfs() -> None:
             target, _, spec = argv[i + 1].partition(":")
             tmpfs[target] = spec
     assert tmpfs["/opt/skills"] == "rw,size=64m,uid=10000,gid=10000"
-    assert tmpfs["/opt/agents"] == "rw,size=512m,uid=10000,gid=10000"
+    assert tmpfs["/opt/agents"] == "rw,size=256m,uid=10000,gid=10000"
     assert tmpfs["/home/agent"] == "rw,size=64m,uid=10000,gid=10000"
 
 
@@ -167,7 +167,7 @@ def test_persistent_workspace_mounts_named_volume() -> None:
     assert tmpfs_targets == [
         "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
         "/opt/skills:rw,size=64m,uid=10000,gid=10000",
-        "/opt/agents:rw,size=512m,uid=10000,gid=10000",
+        "/opt/agents:rw,size=256m,uid=10000,gid=10000",
         "/home/agent:rw,size=64m,uid=10000,gid=10000",
     ]
 

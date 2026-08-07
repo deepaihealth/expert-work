@@ -647,7 +647,7 @@ async def test_acquire_with_user_mounts_persistent_volume() -> None:
     assert tmpfs_targets == [
         "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
         "/opt/skills:rw,size=64m,uid=10000,gid=10000",
-        "/opt/agents:rw,size=512m,uid=10000,gid=10000",
+        "/opt/agents:rw,size=256m,uid=10000,gid=10000",
         "/home/agent:rw,size=64m,uid=10000,gid=10000",
     ]
 
@@ -1936,3 +1936,33 @@ async def test_egress_acquire_bypasses_pool() -> None:
     # A NEW cold launch happened and the pooled container was NOT claimed.
     assert len(h.docker.launches) == launches_after_fill + 1
     assert pool.size(settings.sandbox_image) == 1
+
+
+def test_tmpfs_total_stays_under_the_memory_cgroup() -> None:
+    """W2 终审 Minor-4 —— tmpfs 页计入 memory cgroup。所有 tmpfs 尺寸之和超过
+    ``--memory`` 的话,大的那块永远填不满:容器先被 OOM-kill(整个沙箱带信号
+    猝死),而不是在挂载点上给一个可读的 ``ENOSPC``。此前 ``/opt/agents`` 是
+    512m,五块加起来 960m,顶着这里的默认 1024m,留给真正跑代码的内存不到
+    64m;一次 ``pip install --user`` 就能把沙箱打死。
+
+    这条闸住在 supervisor 而不是 ``expert-work-runtime`` 的测试里:``memory_mb``
+    的生产取值由 :class:`SandboxSupervisorSettings` 决定,而
+    ``SandboxResourceLimits.memory_mb`` 的 dataclass 默认值在生产路径上恒被
+    ``_docker_run_argv`` 用 ``record.memory_mb`` 覆盖 —— 两个值住在两个包里,
+    只有这个服务同时依赖二者。留 25% 余量给进程本身。
+    """
+    from expert_work.runtime.sandbox import SandboxResourceLimits
+
+    limits = SandboxResourceLimits()
+    total = (
+        limits.tmp_size_mb
+        + limits.workspace_size_mb
+        + limits.skills_size_mb
+        + limits.agents_size_mb
+        + limits.home_size_mb
+    )
+    budget = SandboxSupervisorSettings().default_memory_mb
+    assert total <= budget * 0.75, (
+        f"tmpfs 总量 {total}MB 超过 memory cgroup {budget}MB 的 75% —— "
+        f"写满任一块都会 OOM-kill 而不是 ENOSPC"
+    )

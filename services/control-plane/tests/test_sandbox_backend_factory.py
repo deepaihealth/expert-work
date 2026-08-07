@@ -43,6 +43,8 @@ def test_agent_sandbox_backend_builds_client() -> None:
         # 让 runtime 静默落回那个 dataclass 默认值,如果这里不特意选一个不同
         # 的数,下面的断言在两种情况下都会通过,测不出接线丢了。
         sandbox_egress_token_ttl_s=7200,
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
     )
     runtime = build_sandbox_runtime(s)
     assert isinstance(runtime, AgentSandboxClient)
@@ -71,6 +73,8 @@ def test_agent_sandbox_backend_injects_given_store() -> None:
         sandbox_e2b_domain="d",
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
     )
     sentinel = InMemorySandboxInstanceStore()
     runtime = build_sandbox_runtime(s, sandbox_instance_store=sentinel)
@@ -197,24 +201,56 @@ def test_agent_sandbox_backend_rejects_conflicting_prefix_and_pv_name() -> None:
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="t",
         sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
         sandbox_workspace_subpath_prefix="ew",
     )
     with pytest.raises(ValueError, match="workspace_subpath_prefix"):
         build_sandbox_runtime(s)
 
 
-def test_agent_sandbox_backend_workspace_mount_settings_default_to_wave1_behaviour() -> None:
+@pytest.mark.parametrize(
+    ("missing_key", "overrides"),
+    [
+        ("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", {"workspace_nas_root": "/mnt/workspaces"}),
+        ("EXPERT_WORK_WORKSPACE_NAS_ROOT", {"sandbox_workspace_pv_name": "workspace-nas"}),
+    ],
+)
+def test_agent_sandbox_backend_without_workspace_mount_config_raises(
+    missing_key: str, overrides: dict[str, str]
+) -> None:
+    """波 2 终审 Important-2 —— 这两项曾是可选的("不配 = 波 1 行为")。
+    Task 9 把 ``/workspace`` 从镜像里删掉之后那句话不再成立:不注入
+    ``csi-volume-config`` 就没有挂载,新镜像里根本没有 ``/workspace``,而
+    ``exec`` 无条件传 ``cwd=/workspace`` —— 进程正常起、agent 正常构建、第
+    一次工具调用炸在 envd 层,报一个与根因八竿子打不着的错。纯配置错误 +
+    零信号,必须在进程起来时点名。
+    """
     s = Settings(
         sandbox_backend="agent_sandbox",
         sandbox_e2b_domain="d",
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="t",
+        **overrides,
     )
-    runtime = build_sandbox_runtime(s)
-    assert isinstance(runtime, AgentSandboxClient)
-    assert runtime.workspace_pv_name is None
-    assert runtime.workspace_subpath_prefix == ""
-    assert runtime.workspace_root is None
+
+    with pytest.raises(RuntimeError, match=missing_key):
+        build_sandbox_runtime(s)
+
+
+def test_agent_sandbox_backend_empty_workspace_mount_config_also_raises() -> None:
+    """空串与未设同等对待 —— 同 E2B 三件套那条(k8s ConfigMap 关一项的写法
+    是 ``KEY: ""``,不是删行)。"""
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="",
+    )
+
+    with pytest.raises(RuntimeError, match="EXPERT_WORK_WORKSPACE_NAS_ROOT"):
+        build_sandbox_runtime(s)
 
 
 def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -> None:
@@ -226,6 +262,7 @@ def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -
         sandbox_e2b_domain="d",
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
         workspace_nas_root="/mnt/workspaces",
     )
     instance_store = InMemorySandboxInstanceStore()

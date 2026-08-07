@@ -64,6 +64,38 @@ class SandboxResourceLimits:
     #: socket under ``/tmp`` and dies with "no valid pipe path found" otherwise
     #: (route ① office image). Ephemeral, destroyed with the container.
     tmp_size_mb: int = 256
+    #: ``PYTHONUSERBASE`` tmpfs size (W2 Task 9 moved ``/opt/agents`` off the
+    #: image; see :data:`SANDBOX_AGENTS_ROOT`). The largest of the three
+    #: run-time tmpfs because ``pip install --user`` is by far the heaviest
+    #: writer among them.
+    #:
+    #: **Sized against the memory cgroup, not against what pip might want**
+    #: (W2 final review, Minor 4). tmpfs pages are charged to the container's
+    #: memory cgroup, so a tmpfs larger than :attr:`memory_mb` can never be
+    #: filled — the container is OOM-killed first. An OOM-kill is a strictly
+    #: worse failure than the ``ENOSPC`` an appropriately-sized mount gives:
+    #: it kills the whole sandbox mid-run with a signal instead of failing
+    #: one ``pip install`` with a legible error. The invariant this value
+    #: exists to keep is "every tmpfs this provider mounts, summed, stays
+    #: comfortably below the smallest ``memory_mb`` we hand out" — pinned by
+    #: ``test_tmpfs_total_stays_under_the_memory_cgroup``. At the supervisor's
+    #: default 1024 MB the sum is 256 + 64 + 64 + 256 + 64 = 704 MB.
+    #:
+    #: Known cost, accepted: before Task 9 ``HOME`` was ``/workspace``, so a
+    #: persistent-workspace user's ``pip --user`` packages landed on a docker
+    #: volume (disk) and survived container restarts. Per-agent
+    #: ``PYTHONUSERBASE`` (spec 决策 10) plus a bare image run-root (Task 9)
+    #: make that impossible here, so they are RAM-backed and per-container
+    #: now. **Local docker backend only** — on ACS the sandbox is a microVM
+    #: and ``/opt/agents`` is an ordinary directory on its own disk, no tmpfs
+    #: and no cgroup interaction.
+    agents_size_mb: int = 256
+    #: ``/opt/skills`` tmpfs size — skill packages are text plus small
+    #: scripts (the seed path caps the whole payload at 64 MB, see the
+    #: supervisor's ``_MAX_SEED_TOTAL_BYTES``).
+    skills_size_mb: int = 64
+    #: ``$HOME`` tmpfs size — matplotlib config, assorted tool caches.
+    home_size_mb: int = 64
 
 
 #: Default caps — a module-level singleton so it can be an argument
@@ -166,11 +198,14 @@ class SandboxRuntimeProvider:
             # world-writable"; it is, the kernel default just already
             # matches what /workspace and /tmp spell out explicitly.
             "--tmpfs",
-            f"{SANDBOX_SKILLS_ROOT}:rw,size=64m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            f"{SANDBOX_SKILLS_ROOT}:rw,size={limits.skills_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--tmpfs",
-            f"{SANDBOX_AGENTS_ROOT}:rw,size=512m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            f"{SANDBOX_AGENTS_ROOT}:rw,size={limits.agents_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--tmpfs",
-            f"{SANDBOX_AGENT_HOME}:rw,size=64m,uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            f"{SANDBOX_AGENT_HOME}:rw,size={limits.home_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--cap-drop",
             "ALL",
             "--security-opt",
