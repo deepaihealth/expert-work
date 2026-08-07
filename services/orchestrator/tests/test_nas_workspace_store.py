@@ -187,6 +187,46 @@ async def test_delete_file_missing_is_a_noop(tmp_path: Path) -> None:
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="nope.txt")
 
 
+# --------------------------------------------- 跨 uid 写冲突(Critical 复审第 6 条)
+
+
+async def test_write_file_creates_intermediate_dirs_world_writable(tmp_path: Path) -> None:
+    """`_openat_dir` 新建的每一层中间目录都要 ``fchmod`` 到 ``0o777`` ——不
+    然 ``os.mkdir`` 的默认 mode 会被这个进程的 umask(常见 0o022)掩成
+    0o755,沙箱那边的 agent uid 之后想在这棵子树里删/写文件会撞
+    ``EACCES``(read/list 不受影响,是这个坑本身难被发现的原因)。这里两层
+    嵌套(`a/` 与 `a/b/`)都要落 0o777,不是只有最外层。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b/c.txt", data=b"x")
+
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert (user_root / "a").stat().st_mode & 0o777 == 0o777
+    assert (user_root / "a" / "b").stat().st_mode & 0o777 == 0o777
+
+
+async def test_write_file_does_not_reset_mode_of_a_pre_existing_intermediate_dir(
+    tmp_path: Path,
+) -> None:
+    """新建目录才 chmod——不是 belt-and-braces 地把整条路径上每一层都强行
+    改成 0o777。一个已经存在的目录(这里模拟沙箱自己用受限 mode 建的
+    `a/`)在 ``_openat_dir`` 的快路径(``O_NOFOLLOW`` 直接 open 成功)里
+    直接返回,不会被这次 write 顺手改权限——只有这次调用真正带出来的
+    新目录(`a/b`)才落 0o777。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    restricted = user_root / "a"
+    restricted.mkdir(parents=True)
+    restricted.chmod(0o700)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b/c.txt", data=b"x")
+
+    assert restricted.stat().st_mode & 0o777 == 0o700, "预先存在的目录被意外改权限了"
+    assert (restricted / "b").stat().st_mode & 0o777 == 0o777, "本次新建的目录没有放开权限"
+
+
 # ---------------------------------------------------------------- Critical 修复回归:
 # marker 不能被 delete_file 直接删掉(解除软删),也不能被 write_file 伪造。
 

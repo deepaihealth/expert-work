@@ -1166,6 +1166,20 @@ class AgentSandboxClient:
         次;这里不同 —— SDK 的 ``commands.run`` 本就支持逐次传 envs,同用户
         双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
         的 agent_key"。
+
+        ``umask 000 && `` 前缀(Task 4 审查 Critical 后续,跨 uid 写冲突):
+        ``commands.run`` 走 ``/bin/bash -l -c cmd``(见上方 docstring),所以
+        能在同一个 shell 里先设 umask 再 exec python——这个 bash 进程与它派生
+        的 python 子进程(以及 python 里 LLM 代码自己 ``os.mkdir``/``open`` 出
+        的每一个文件)全都继承它。不设的话,agent 代码在 ``/workspace`` 下自己
+        建的目录/文件用沙箱默认 umask(常见 ``0o022``)掩过,变成
+        ``0o755``/``0o644``,uid 只是这个沙箱的 agent(10000)——
+        control-plane 以另一个 uid 经 NAS 挂载读这棵树时,``read``/``list``
+        仍然通(0o755 的"其他人"档还有 r-x),但用户从工作区页面**删除**这个
+        文件、或后续任何一次写入去覆盖它,都会撞 ``EACCES``——这正是本任务
+        对本地 docker 后端(``runner.py`` 的 ``main()``,同一处 ``os.umask(0)``)
+        同款修复的云端一半,两后端必须同款,契约测试
+        (``test_sandbox_runtime_contract.py``)钉住,不是各修各的。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         effective = max(1, min(effective, MAX_TIMEOUT_S))
@@ -1179,7 +1193,7 @@ class AgentSandboxClient:
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
-                f"python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
+                f"umask 000 && python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,

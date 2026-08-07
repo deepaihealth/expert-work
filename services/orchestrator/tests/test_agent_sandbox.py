@@ -963,6 +963,26 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
     assert run_user == SANDBOX_EXEC_USER
 
 
+@pytest.mark.asyncio
+async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
+    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— ``commands.run`` 走
+    ``/bin/bash -l -c cmd``,所以命令串必须以 ``umask 000 && `` 打头,让
+    bash 先放开 umask 再 exec python:agent 代码自己 ``mkdir``/``open`` 出
+    的目录/文件才不会被默认 umask(常见 0o022)掩成 control-plane 读得进
+    但删/写不进的 0o755/0o644——与本地 supervisor 后端
+    ``runner.py.main()`` 的 ``os.umask(0)`` 同一个根因的两个后端各自的
+    落点,契约测试(``test_sandbox_runtime_contract.py``)钉住两者不会
+    分叉。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    cmd, *_ = sdk.sandbox.commands.calls[-1]
+    assert cmd.startswith("umask 000 && python "), cmd
+
+
 # ---------------------------------------------------------------------------
 # 全分支终审 Important-2 —— 沙箱进程既不继承镜像的 WORKDIR 也不继承它的 ENV
 # (2026-08-04 集群探针实测)。cwd 靠 commands.run(cwd=),环境变量靠

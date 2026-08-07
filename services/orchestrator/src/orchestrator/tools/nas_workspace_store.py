@@ -183,6 +183,30 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
     (``mkdirat``) when it doesn't exist yet, then retries the same
     ``O_NOFOLLOW`` open — so even a symlink raced in during that narrow
     create-then-reopen gap still fails closed.
+
+    Task 4 review (Critical follow-up, cross-uid write conflict) — a
+    directory this branch brings into existence is ``fchmod``'d to
+    ``0o777`` on the just-opened fd (never a dir_fd-relative
+    ``os.chmod(name, dir_fd=dfd)`` re-walk of the string ``name``, and
+    definitely not a plain path ``chmod`` — that would reintroduce exactly
+    the string-re-walk TOCTOU this whole ``dir_fd`` chain exists to close;
+    ``os.fchmod`` needs no name at all, it acts on the fd we already hold).
+    ``os.mkdir``'s own ``mode=`` argument is masked by this process's
+    umask before the directory is actually created (typically leaves
+    ``0o755``), so an intermediate directory control-plane (uid 10002)
+    creates while walking a ``write_file``/``mark_deleted`` path would
+    otherwise silently end up in a mode the sandbox's own agent user (uid
+    10000) can read/list/mkdir-through but not write into or delete files
+    from — the write/list/read paths that only need ``mkdir`` still work
+    (masking that this was ever wrong), but the sandbox's own writes into
+    that subtree, or a user later deleting a file inside it from the
+    workspace-browse UI, hit ``EACCES``. Reached this fixed mode
+    unconditionally whenever the directory didn't already exist a moment
+    ago (whether this call's own ``mkdir`` won or a concurrent same-process
+    caller's did, both are "this process just brought it into being") —
+    a directory that already existed before this call (the ``O_NOFOLLOW``
+    fast path above) is left untouched: fixing modes on file/directory
+    *is not* what this store is responsible for, only what it *creates*.
     """
     try:
         return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
@@ -193,7 +217,9 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
             os.mkdir(name, dir_fd=dfd)
         except FileExistsError:
             pass
-        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        os.fchmod(fd, 0o777)  # cross-uid dir — see docstring above for why 0o777 is deliberate.
+        return fd
 
 
 def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
@@ -287,6 +313,18 @@ class NasWorkspaceStore:
             # plain path-string mkdir/open for this trusted prefix is fine;
             # only the (untrusted) ``parts`` walked below need dir_fd
             # chaining.
+            #
+            # Deliberately NOT chmod'd here (unlike _openat_dir's
+            # intermediate directories, Task 4 review Critical follow-up):
+            # this exact directory is also mkdir+chmod(0o777)'d by
+            # AgentSandboxClient._ensure_workspace_dir on every acquire,
+            # unconditionally and before the sandbox's mount ever goes
+            # live — so by the time a sandbox could possibly read/write
+            # here, it has already been fixed to 0o777 regardless of
+            # which of the two writers (this store or that client) got
+            # here first. Duplicating the chmod here would be redundant,
+            # not wrong — left out to keep this call's mode ownership
+            # single-sourced in one place.
             user_root.mkdir(parents=True, exist_ok=True)
         try:
             dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)

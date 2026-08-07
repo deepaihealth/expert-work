@@ -321,6 +321,39 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_exec_created_files_are_not_uid_locked(runtime: SandboxRuntime) -> None:
+    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— agent 代码自己
+    ``mkdir``/``open`` 出的嵌套目录/文件必须是 world-writable(两后端都在
+    exec 路径上把 umask 设成 000:supervisor 档 ``runner.py.main()`` 的
+    ``os.umask(0)``,agent_sandbox 档 ``commands.run`` 命令串的
+    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成只有
+    沙箱自己的 uid 能删/写的 ``0o755``/``0o644``——那类被掩过的模式在
+    ``read``/``list`` 路径上完全不可见(两者仍然通),只有 control-plane
+    经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除或覆盖该文件时才会撞
+    ``EACCES``,本条用例直接断言权限位而不是依赖第二个 uid 的进程——POSIX
+    权限语义本身就与"谁去读"这个 uid 无关,``0o777``/``0o666`` 早已蕴含了
+    "任何 uid 都能写"这件事。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9b")
+    try:
+        code = (
+            "import os\n"
+            "os.makedirs('reports/nested')\n"
+            "open('reports/nested/out.txt', 'w').close()\n"
+            "print('DIR_MODE=%o' % (os.stat('reports').st_mode & 0o777))\n"
+            "print('NESTED_MODE=%o' % (os.stat('reports/nested').st_mode & 0o777))\n"
+            "print('FILE_MODE=%o' % (os.stat('reports/nested/out.txt').st_mode & 0o777))\n"
+        )
+        outcome = await runtime.exec(sandbox_id=sid, code=code, timeout_s=30)
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "DIR_MODE=777" in outcome.stdout, outcome.stdout
+        assert "NESTED_MODE=777" in outcome.stdout, outcome.stdout
+        assert "FILE_MODE=666" in outcome.stdout, outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
     """镜像 ``ENV`` 在两个后端都要到达沙箱进程。
 
