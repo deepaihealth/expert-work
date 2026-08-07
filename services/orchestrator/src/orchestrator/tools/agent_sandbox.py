@@ -642,6 +642,8 @@ class AgentSandboxClient:
         # 它的是平台超时,这正是 _SANDBOX_TIMEOUT_S 真正承重的地方。顺带补上
         # § 6.5 的统一错误契约:files.write 原样抛的是 e2b 自己的异常类型。
         try:
+            if just_created:
+                await self._chmod_workspace_mount(sbx, sandbox_id=sandbox_id)
             for relpath, data in seed_files:
                 # sandbox migration wave 2 (spec § 四) — skills live on sandbox-
                 # local disk under SANDBOX_SKILLS_ROOT, not the user's NAS-backed
@@ -663,6 +665,50 @@ class AgentSandboxClient:
                 await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
         return sandbox_id
+
+    async def _chmod_workspace_mount(self, sbx: Any, *, sandbox_id: UUID) -> None:
+        """沙箱侧兜底:把自己刚挂上的 ``/workspace`` 放开到 ``0o777``。
+
+        **为什么需要第二道**(集群实测,2026-08-07)。挂载点的 subPath 目录
+        如果在 ``create()`` 时还不存在,**平台会替你建**——建成 ``root:root
+        0755``(实测:``/workspaces/<tenant>/<user>`` 就是这个 mode,而 NAS 根
+        是我们一次性 chmod 过的 ``1777``)。沙箱里的 agent 以 uid 10000 跑,
+        于是第一次往 ``/workspace`` 写就是 ``PermissionError``。权威的修法是
+        :meth:`_prepare_workspace_mount` —— control-plane 在 ``create()``
+        **之前** 就把目录 mkdir 成 ``0o777``,平台因此只会看到一个已存在的
+        目录、不会自己建。这一句不取代它,只补它够不到的场合:
+
+        * ``workspace_root`` 没配(把 NAS 挂进 control-plane Pod 的那半边不
+          可用——例如契约测试跑在 GitHub runner 上,它对 NAS 没有 NFS 路由)
+          时,``_prepare_workspace_mount`` 整段跳过,目录就只能由平台来建;
+        * 就算配了,``_prepare_workspace_mount`` 与平台建目录之间理论上仍有
+          竞态(我们 mkdir 之前平台已经因为别的沙箱建过了)。
+
+        **刻意 best-effort**。真正跑得通的生产路径上,目录早就是 control-plane
+        建的 ``0o777``、属主 uid 10002;而这句以 root 身份跑,NAS 若开了
+        ``root_squash``,root 会被映射成 ``nobody``,对一个别人属主的目录
+        ``chmod`` 必然 ``EPERM``。那种情况下失败是**无害**的(目录本来就已经
+        是对的),把它抬成 ``create`` 失败会把一个可用的沙箱判死。反过来,在
+        这一句是唯一权限来源的场合它失败了,下一次 ``exec`` 会以
+        ``PermissionError`` 大声报出来——不会静默变成"能跑但写不进去"。
+
+        ``/workspace`` 是平台建的 **符号链接**(指向
+        ``/run/csi/mount-root/nas/<hash>``),``chmod`` 默认跟随符号链接,所以
+        改到的是挂载点真身,不是链接本身。``workspace_pv_name`` 没配时根本没有
+        挂载、``/workspace`` 也不存在,直接跳过。
+        """
+        if not self.workspace_pv_name:
+            return
+        try:
+            await sbx.commands.run(f"chmod 0777 {WORKSPACE_ROOT}", user="root")
+        except Exception:
+            logger.info(
+                "sandbox workspace chmod skipped (sandbox_id=%s) — expected when "
+                "control-plane already created the directory and the NAS export "
+                "squashes root; only load-bearing where control-plane has no NAS route",
+                sandbox_id,
+                exc_info=True,
+            )
 
     async def _discard_new_sandbox(self, sbx: Any, *, sandbox_id: UUID) -> None:
         """拆掉一个本次调用刚建起来、但还没能被任何一行记住的沙箱。

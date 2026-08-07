@@ -97,15 +97,34 @@ def _supervisor_runtime() -> SandboxRuntime:
 
 
 def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
-    """``workspace_pv_name`` —— sandbox migration wave 2 Task 7 e2b NAS 挂载档
-    (:func:`_agent_sandbox_runtime_with_workspace_mount`)专用的额外配置;
-    默认空串保持这个函数对既有调用方(``runtime`` fixture)零行为变化——
-    ``AgentSandboxClient.workspace_pv_name`` 未配时 ``_create`` 完全不带
-    ``metadata`` 键(见该字段 docstring),与波 1 逐字相同。
+    """``workspace_pv_name`` 默认从环境读,**没配就 skip**。
+
+    这个参数原本默认空串,理由是"保持对既有调用方零行为变化——未配时
+    ``_create`` 完全不带 ``metadata`` 键,与波 1 逐字相同"。Task 9 之后那句
+    话不再成立(波 2 收尾复跑真栈时坐实):镜像不再预建 ``/workspace``,不挂
+    NAS 就等于沙箱里根本没有 ``/workspace``,而 ``exec`` 无条件传
+    ``cwd=/workspace`` —— 18 条 exec 用例齐刷刷炸在
+    ``InvalidArgumentException: cwd '/workspace' does not exist``。这是典型的
+    跨任务缝隙:Task 7 写这个默认值时它是对的,Task 9 把地基抽走了。
+
+    生产装配点(``build_sandbox_runtime``)本就强制要求 ``PV_NAME``,所以
+    "不挂载的 agent_sandbox"是一个生产里不存在的配置——契约测试没有理由去
+    测它。改成读同一个环境变量、没配就 skip,与生产保持同一个形状。
+
+    ``workspace_root`` 仍然不配:那是"把 NAS 挂进 control-plane Pod"的那半边,
+    GitHub runner 对 NAS 没有 NFS 路由。缺了它 ``_prepare_workspace_mount``
+    整段跳过,挂载点目录改由平台建(``root:root 0755``,集群实测),沙箱侧
+    ``AgentSandboxClient._chmod_workspace_mount`` 那道兜底因此成为这一档唯一
+    的权限来源 —— 也正是这一档真正在验的东西之一。
     """
     api_key = os.environ.get("EXPERT_WORK_SANDBOX_E2B_API_KEY")
     if not api_key:
         pytest.skip("E2B 凭据未设 —— agent_sandbox 契约档跳过")
+    workspace_pv_name = workspace_pv_name or os.environ.get(
+        "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", ""
+    )
+    if not workspace_pv_name:
+        pytest.skip("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME 未设 —— agent_sandbox 契约档跳过")
     dsn = os.environ.get("EXPERT_WORK_DB_DSN")
     if not dsn:
         pytest.skip("EXPERT_WORK_DB_DSN 未设 —— 契约档需要真 sandbox_instance 表")
@@ -140,26 +159,21 @@ def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
 
 
 def _agent_sandbox_runtime_with_workspace_mount() -> SandboxRuntime:
-    """:func:`_agent_sandbox_runtime` 加配 ``workspace_pv_name`` —— e2b NAS 挂载
-    档(``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``)
-    专用。E2B 凭据 / 真 Postgres 两个既有前提检查仍由
-    :func:`_agent_sandbox_runtime` 做;这里在它之前多加一层
-    ``EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME`` 的 skip 闸。
+    """``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``
+    的具名入口。
 
-    这一档即便三个环境变量全设,今天大概率仍然跑不通,原因不止"云上
-    SandboxSet 还在用旧镜像"(task-9-report.md,Task 8 换 tag 前):
-    task-1-report.md 问题一记录了更底层的一条——这个集群的 ACS Agent Sandbox
-    动态存储挂载(``csi-volume-config``)需要"特权容器 + hostPath
-    /var/run/csi"安全豁免,工单尚未批复,``create(metadata=...)`` 今天在
-    平台侧直接 500。这些都是留给 Task 8 之后处理的基础设施缺口,不是这份
-    契约测试要绕过或弱化断言去伪造绿的目标(brief 明确要求"env 设了就跑,
-    不要为了让它绿而弱化断言")——一旦工单批复 + 镜像换新,这条测试原样
-    就是验收开关。
+    历史上这个函数存在是因为 :func:`_agent_sandbox_runtime` 默认**不**挂 NAS,
+    只有这一条用例需要挂;那个默认值已经随波 2 收尾去掉了(见该函数
+    docstring),两者现在配置完全相同。保留这个名字而不是让用例直接调基函数:
+    调用点读起来仍然点名"这条测的是 NAS 挂载",而不是碰巧和别的用例共用了同一
+    个 runtime 构造器。
+
+    这条用例曾经因为两层基础设施缺口跑不通——集群 SandboxSet 还是波 1 老镜像、
+    以及 ``csi-volume-config`` 的特权豁免工单未批。两者都已解决(工单已批;
+    镜像 tag 在 Task 8 的 runbook 步骤里换新),2026-08-07 真栈复跑已能挂上
+    NAS。
     """
-    pv_name = os.environ.get("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME")
-    if not pv_name:
-        pytest.skip("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME 未设 —— e2b NAS 挂载档跳过")
-    return _agent_sandbox_runtime(workspace_pv_name=pv_name)
+    return _agent_sandbox_runtime()
 
 
 @pytest.fixture(params=["supervisor", "agent_sandbox"])

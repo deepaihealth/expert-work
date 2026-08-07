@@ -1146,6 +1146,54 @@ async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_acquire_chmods_the_mount_from_inside_the_sandbox() -> None:
+    """波 2 收尾(集群实测坐实)—— 挂载点目录若由**平台**建,是 ``root:root
+    0755``,沙箱里的 agent(uid 10000)第一次写 ``/workspace`` 就
+    ``PermissionError``。权威修法是 control-plane 在 ``create()`` 之前
+    mkdir 成 0o777(``_prepare_workspace_mount``),这里钉的是够不到那半边
+    时的兜底:沙箱建好后以 **root** 跑一句 ``chmod 0777 /workspace``。
+
+    断言 ``user="root"`` 而不是 ``SANDBOX_EXEC_USER``:agent 不是属主,以
+    agent 身份 chmod 一个 root 属主的目录必然 EPERM,这一句就白跑了。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    chmods = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")]
+    assert chmods == [(f"chmod 0777 {WORKSPACE_ROOT}", None, "root", None)]
+
+
+@pytest.mark.asyncio
+async def test_acquire_skips_the_mount_chmod_when_no_pv_is_configured() -> None:
+    """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
+    ——那一句 chmod 只会在 envd 侧留一条无意义的失败,不发。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")] == []
+
+
+@pytest.mark.asyncio
+async def test_acquire_survives_a_failing_mount_chmod() -> None:
+    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的 0o777、
+    属主 uid 10002,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
+    成 nobody,对别人属主的目录 chmod 必然 EPERM。那种失败是无害的(目录本来
+    就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.commands.run_error = RuntimeError("chmod: Operation not permitted")
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert sandbox_id is not None
+    assert sdk.sandbox.killed is False
+
+
+@pytest.mark.asyncio
 async def test_acquire_chmods_user_workspace_world_writable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
