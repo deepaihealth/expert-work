@@ -3,8 +3,9 @@
 Run once during the office image build (OFFICE-ADR-3). It rewrites the rc
 shipped in matplotlib's mpl-data so that *every* agent's matplotlib code
 renders Chinese without per-call font configuration — important because the
-runtime rootfs is read-only and /workspace (the only writable mount) is
-wiped each session, so a user-level rc would not persist.
+runtime rootfs is read-only and every writable path (HOME=/home/agent,
+/workspace) is wiped/rebuilt each session, so a user-level rc would not
+persist.
 
 Debian's ``fonts-noto-cjk`` ships ``NotoSansCJK-Regular.ttc`` (a collection);
 matplotlib registers only its first face, whose family name is

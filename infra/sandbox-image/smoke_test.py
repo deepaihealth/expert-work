@@ -26,7 +26,25 @@ def main(image: str) -> int:
     code = _PAYLOAD.read_text(encoding="utf-8")
     request = json.dumps({"code": code, "timeout_s": 30}) + "\n"
     proc = subprocess.run(  # noqa: S603
-        ["docker", "run", "--rm", "-i", image],  # noqa: S607
+        [  # noqa: S607
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            # W2 Task 9: the image no longer pre-creates /workspace (the
+            # platform builds a NAS-mount symlink there in prod; the local
+            # supervisor mounts a tmpfs there in dev) — smoke_payload.py's
+            # /workspace/... paths are the real production path, so the
+            # smoke test supplies the same kind of writable mount itself
+            # rather than changing those paths to something that wouldn't
+            # exercise the real thing. uid/gid 10000 match the image's
+            # `agent` user for parity, though this container still runs as
+            # root (Task 6 hasn't wired up --user for the local backend
+            # yet), so it isn't load-bearing for write access here.
+            "--tmpfs",
+            "/workspace:rw,size=64m,uid=10000,gid=10000",
+            image,
+        ],
         input=request,
         capture_output=True,
         text=True,
