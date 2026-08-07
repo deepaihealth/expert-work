@@ -1039,7 +1039,10 @@ async def test_read_workspace_file_returns_content() -> None:
 @pytest.mark.asyncio
 async def test_read_workspace_file_rejects_unsafe_path() -> None:
     h = _harness()
-    for bad in ("/etc/passwd", "../escape"):
+    # "a\0b" —— W2 终审复审 New-1。CPython 在下系统调用前就对内嵌空字节抛裸
+    # ``ValueError``,不是这个服务错误边界接得住的类型;NAS 后端在自己的归一化
+    # 里拒,守卫不能按后端分叉(见 ``_validate_workspace_path`` docstring)。
+    for bad in ("/etc/passwd", "../escape", "a\0b"):
         with pytest.raises(WorkspaceFileNotFoundError):
             await h.supervisor.read_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path=bad)
     # A rejected path never reaches docker.
@@ -1551,6 +1554,25 @@ async def test_replenisher_tops_up_to_target() -> None:
     # Pool rows are platform-neutral until claim binds a real tenant.
     assert all(r.tenant_id == POOL_TENANT_ID for r in ready)
     assert all(r.user_id is None for r in ready)
+
+
+@pytest.mark.asyncio
+async def test_replenisher_argv_carries_the_settings_memory_cap() -> None:
+    """W2 终审复审 New-3 —— 池启动的 argv 必须带 settings 的内存上限。
+
+    不传 ``limits=`` 会退回 ``SandboxResourceLimits`` 的 dataclass 默认
+    ``memory_mb=512``,而同一个 dataclass 声明的 tmpfs 加起来 704MB——
+    ``test_tmpfs_total_stays_under_the_memory_cgroup`` 那条不变式对池容器的
+    argv 就是假的。今天不出事只是因为池里的容器在被 claim 抬到 1024 之前
+    什么都不跑;把 ``default_memory_mb`` 调到 939 以下就会静默失效。
+    """
+    pool = SandboxPool()
+    h = _harness(pool=pool)
+    await _replenisher(h, pool, pool_size=1).run_once()
+
+    argv = h.docker.launches[0]
+    expected = f"{SandboxSupervisorSettings().default_memory_mb}m"
+    assert argv[argv.index("--memory") + 1] == expected
 
 
 @pytest.mark.asyncio

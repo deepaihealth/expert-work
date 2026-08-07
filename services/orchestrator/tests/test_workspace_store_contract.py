@@ -188,6 +188,39 @@ async def test_write_file_does_not_reserve_any_filename(store: WorkspaceStore) -
 
 
 @pytest.mark.integration
+async def test_list_files_does_not_reserve_any_filename(store: WorkspaceStore) -> None:
+    """New-2 的 parity 面 —— 浏览视图也不对 ``.ew-workspace-deleted`` 特判。
+
+    上面那条覆盖写/删,这条覆盖列:NAS 侧曾单方面把这个名字从列表里滤掉,
+    supervisor 侧没有,同一个用户文件因此在两个后端一个看得见一个看不见。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted", data=b"x"
+    )
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert ".ew-workspace-deleted" in [f.path for f in files]
+
+
+@pytest.mark.integration
+async def test_read_file_rejects_a_nul_byte_in_the_path(store: WorkspaceStore) -> None:
+    """New-1 —— 带空字节的路径两侧都必须是本 store 的错误类型,不是裸
+    ``ValueError``。CPython 在真正下系统调用前就抛 ``ValueError``,而接口层只
+    接 ``SandboxSupervisorError``,漏出去就是 500 而不是 400/404。"""
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(tenant_id=uuid4(), user_id=uuid4(), path="a\0b")
+
+
+@pytest.mark.integration
+async def test_write_file_rejects_a_nul_byte_in_the_path(store: WorkspaceStore) -> None:
+    """同上,写路径。"""
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=uuid4(), user_id=uuid4(), path="a\0b", data=b"x")
+
+
+@pytest.mark.integration
 async def test_write_file_rejects_over_cap(store: WorkspaceStore) -> None:
     from orchestrator.tools.nas_workspace_store import _MAX_WRITE_BYTES
 

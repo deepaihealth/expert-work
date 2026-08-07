@@ -283,9 +283,16 @@ async def test_an_agent_written_marker_filename_does_not_soft_delete_anything(
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted")
 
 
-async def test_list_files_still_hides_a_legacy_in_tree_marker(tmp_path: Path) -> None:
-    """``_LEGACY_IN_TREE_MARKER`` 过滤保留:修复前的构建写在树里的 marker、
-    以及沙箱自己写出的同名文件,都不该在工作区浏览里冒充平台产物。"""
+async def test_list_files_does_not_hide_a_file_named_like_the_legacy_marker(
+    tmp_path: Path,
+) -> None:
+    """全分支终审复审 New-2:浏览视图对 ``.ew-workspace-deleted`` 不做特判。
+
+    marker 搬出用户树之后这个名字在树里已经没有任何含义,而
+    ``SupervisorWorkspaceStore`` 从来没有过这条过滤——留着它就等于同一个
+    用户文件在 docker 后端看得见、在 NAS 后端凭空消失。藏用户自己的文件换
+    "屏幕上不出现平台样的名字",是这笔交易里更弱的一半。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     user_root = tmp_path / str(tenant_id) / str(user_id)
@@ -295,7 +302,7 @@ async def test_list_files_still_hides_a_legacy_in_tree_marker(tmp_path: Path) ->
 
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
 
-    assert [f.path for f in files] == ["out.txt"]
+    assert [f.path for f in files] == [".ew-workspace-deleted", "out.txt"]
 
 
 # ------------------------------------------- 全分支终审 C-2 / M-1:路径归一化单一来源
@@ -431,6 +438,9 @@ async def test_write_file_dir_fd_pinning_survives_intermediate_rename_race(
             tenant_id=tenant_id, user_id=user_id, path="sub/out.txt", data=b"pwned"
         )
     except SandboxSupervisorError:
+        # 抢跑赢没赢都算通过:这个用例断言的是「不逃逸」,不是「一定被
+        # 检测到」。O_NOFOLLOW 抓到符号链接就抛,没抓到就落在子树内——
+        # 两种都对,唯一不能发生的是下面那条断言里的越界写/删。
         pass
 
     # 关键断言:不逃逸——载荷没有落到子树外的 "outside" 里。
@@ -511,6 +521,9 @@ async def test_delete_file_dir_fd_pinning_survives_intermediate_rename_race(
     try:
         await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="sub/victim.txt")
     except SandboxSupervisorError:
+        # 抢跑赢没赢都算通过:这个用例断言的是「不逃逸」,不是「一定被
+        # 检测到」。O_NOFOLLOW 抓到符号链接就抛,没抓到就落在子树内——
+        # 两种都对,唯一不能发生的是下面那条断言里的越界写/删。
         pass
 
     # 关键断言:不逃逸——子树外不相关租户的文件必须原封不动。
@@ -590,6 +603,9 @@ async def test_dir_fd_pinning_holds_at_a_deep_intermediate_component(
             tenant_id=tenant_id, user_id=user_id, path="a/b/c/out.txt", data=b"pwned"
         )
     except SandboxSupervisorError:
+        # 抢跑赢没赢都算通过:这个用例断言的是「不逃逸」,不是「一定被
+        # 检测到」。O_NOFOLLOW 抓到符号链接就抛,没抓到就落在子树内——
+        # 两种都对,唯一不能发生的是下面那条断言里的越界写/删。
         pass
 
     assert not (outside / "out.txt").exists()
@@ -638,9 +654,13 @@ async def test_mark_deleted_is_idempotent_and_writes_the_marker(tmp_path: Path) 
 
 
 async def test_mark_deleted_creates_the_marker_dir_when_missing(tmp_path: Path) -> None:
-    """``{root}/{tenant}/.deleted/`` 不存在时由 ``mark_deleted`` 自己带出来
-    (control-plane 以非 root 的 uid 10002 跑,权限模型照
-    ``_ensure_workspace_dir`` 的先例:chmod,不 chown)。"""
+    """``{root}/{tenant}/.deleted/`` 不存在时由 ``mark_deleted`` 自己带出来。
+
+    权限刻意 **不** 照 ``_ensure_workspace_dir`` 的 0o777:那些是跨 uid 共写的
+    用户工作区根,这个目录只有 control-plane 一个写者。钉 0o700 是为了让软删
+    这条权威记录靠属主保护,而不是只靠挂载范围——万一 subPath 配宽了,沙箱也
+    伪造/清不掉 marker。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
 
@@ -648,7 +668,7 @@ async def test_mark_deleted_creates_the_marker_dir_when_missing(tmp_path: Path) 
 
     marker_dir = tmp_path / str(tenant_id) / DELETED_DIR
     assert marker_dir.is_dir()
-    assert marker_dir.stat().st_mode & 0o777 == 0o777
+    assert marker_dir.stat().st_mode & 0o777 == 0o700
 
 
 # ---------------------------------------------------------------- mark_deleted 热会话拆除(Task 4)

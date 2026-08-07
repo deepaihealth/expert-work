@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from expert_work.common.observability import expert_work_counter, expert_work_gauge
-from expert_work.runtime.sandbox import SandboxRuntimeProvider
+from expert_work.runtime.sandbox import SandboxResourceLimits, SandboxRuntimeProvider
 from sandbox_supervisor.docker_client import DockerClient, DockerError
 from sandbox_supervisor.domain import SandboxRecord, SandboxState, container_name
 from sandbox_supervisor.runner_link import RunnerLink, RunnerLinkError
@@ -199,7 +199,22 @@ class PoolReplenisher:
             observe_pool_event("replenish")
 
     async def _launch_one(self, image_ref: str) -> None:
-        """Launch one READY container with the default limits + tmpfs."""
+        """Launch one READY container with the settings' default limits + tmpfs.
+
+        The ``limits=`` below is the same translation
+        :meth:`Supervisor._docker_run_argv` does for a claimed sandbox —
+        settings' ``default_*`` in, :class:`SandboxResourceLimits` out — and
+        it has to be spelled out here too (wave 2 final re-review, New 3).
+        Omitting it fell back to ``DEFAULT_RESOURCE_LIMITS``, whose
+        ``memory_mb`` is 512 while the tmpfs mounts that same dataclass
+        declares sum to 704 MB: a self-contradictory container that only
+        stayed harmless because a pooled container runs nothing until
+        ``claim`` raises its memory to the settings' default. Reading the
+        cap from the same place the ``SandboxRecord`` above reads it keeps
+        the two from drifting, and keeps the
+        "every tmpfs, summed, stays under ``memory_mb``" invariant true of
+        the argv we actually launch, not just of the argv ``claim`` builds.
+        """
         s = self._settings
         record = SandboxRecord(
             id=uuid4(),
@@ -219,6 +234,11 @@ class PoolReplenisher:
         argv = self._runtime.docker_run_argv(
             image=image_ref,
             container_name=container_name(record.id),
+            limits=SandboxResourceLimits(
+                cpus=record.cpu_quota,
+                memory_mb=record.memory_mb,
+                pids_limit=record.pids_limit,
+            ),
             workspace_volume=None,
         )
         try:

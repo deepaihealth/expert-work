@@ -61,9 +61,16 @@ reach, the blacklist is gone too: a file named ``.ew-workspace-deleted``
 inside a user's workspace is now an ordinary file with an odd name, and
 refusing to write or delete it would only be a behaviour divergence from
 ``SupervisorWorkspaceStore`` (which has no such rule) for no protection in
-return. :meth:`list_files` still filters that one name out of the browse
-view (see :data:`_LEGACY_IN_TREE_MARKER`), together with the reserved
-``skills/`` / ``uploads/`` prefixes.
+return. :meth:`list_files` does not hide it either, for the same reason
+(wave 2 final re-review, New 2): this store carried a browse-view filter on
+that one name that ``SupervisorWorkspaceStore`` never had, so the *same*
+user file was visible on the docker backend and silently invisible on the
+NAS one. Hiding a user's own file to keep a platform-looking name off the
+screen is the weaker half of that trade — the name carries no meaning any
+more — and a per-backend browse filter is exactly the kind of split this
+module's parity contract exists to forbid. Only the reserved ``skills/`` /
+``uploads/`` prefixes are filtered, and both backends filter those through
+the same :func:`is_reserved_workspace_path`.
 
 **TOCTOU note.** The NAS volume is the same tree a sandbox mounts (subPath-
 scoped to its own ``{tenant_id}/{user_id}``) and *runs untrusted code
@@ -163,15 +170,6 @@ logger = logging.getLogger(__name__)
 #: archive / hard-delete sweep reads this directory, not the user tree.
 DELETED_DIR = ".deleted"
 
-#: The pre-fix in-tree marker filename. Nothing writes it any more (the
-#: marker moved to :data:`DELETED_DIR`), but :meth:`NasWorkspaceStore.
-#: list_files` keeps hiding it: a tree written by a pre-fix build would
-#: otherwise start surfacing a platform-looking system file in the user's
-#: browse view, and — more durably — a sandbox can still create a file with
-#: this exact name inside its own ``/workspace``, which has no meaning any
-#: more but would look to a user like a platform artefact if listed.
-_LEGACY_IN_TREE_MARKER = ".ew-workspace-deleted"
-
 #: Per-file download cap — mirrors
 #: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES``.
 _MAX_READ_BYTES = 10 * 1024 * 1024
@@ -244,6 +242,11 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         try:
             os.mkdir(name, dir_fd=dfd)
         except FileExistsError:
+            # A concurrent same-process caller won the race and created it
+            # between our failed open and this mkdir. Nothing to do: the
+            # directory we wanted now exists, and the reopen below (still
+            # ``O_NOFOLLOW``) is what decides whether it is really a
+            # directory and not a symlink swapped in under the same name.
             pass
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
         os.fchmod(fd, 0o777)  # cross-uid dir — see docstring above for why 0o777 is deliberate.
@@ -281,9 +284,18 @@ def _normalize_workspace_path(path: str) -> tuple[str, tuple[str, ...]]:
     :class:`SandboxSupervisorError` — would answer 500 where the supervisor
     backend answers 404 (the "错误类型统一" half of the parity contract in
     the module docstring).
+
+    A NUL byte is rejected here for exactly the same reason (wave 2 final
+    re-review, New 1). CPython refuses to pass an embedded NUL to any
+    syscall and raises a bare :class:`ValueError` from deep inside
+    :func:`os.open` — not an :class:`OSError`, so none of the ``except
+    OSError`` wrappers downstream catch it, and ``GET /v1/workspace/file
+    ?path=a%00b`` answered 500 where the supervisor backend answers 400.
+    Same class as the empty-``parts`` case above, same fix, same place: the
+    normaliser is where "is this string a workspace path at all" is decided.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/"):
+    if not cleaned or cleaned.startswith("/") or "\0" in cleaned:
         raise SandboxSupervisorError(f"workspace path must be relative and free of '..': {path!r}")
     parts = PurePosixPath(cleaned).parts
     if not parts or ".." in parts:
@@ -494,7 +506,7 @@ class NasWorkspaceStore:
                 for name in filenames:
                     full = Path(dirpath) / name
                     rel = full.relative_to(user_root).as_posix()
-                    if rel == _LEGACY_IN_TREE_MARKER or is_reserved_workspace_path(rel):
+                    if is_reserved_workspace_path(rel):
                         continue
                     # lstat, not stat — a symlink appearing as a plain file
                     # entry must report its own byte length, never a stat()
@@ -615,16 +627,21 @@ class NasWorkspaceStore:
             marker = workspace_deleted_marker(self.root, tenant_id, user_id)
             try:
                 marker.parent.mkdir(parents=True, exist_ok=True)
-                # chmod, never chown — control-plane runs as a non-root uid
-                # and POSIX forbids a non-root process changing another
-                # uid's ownership; same reasoning (and same fixed mode) as
-                # ``AgentSandboxClient._ensure_workspace_dir`` for the user
-                # roots this directory sits beside. Nothing untrusted can
-                # reach ``{root}/{tenant}`` — no subPath ever projects it
-                # into a sandbox — so the wide mode adds no exposure; it
-                # keeps a single, uniform answer to "how does this platform
-                # create a directory on the shared NAS".
-                os.chmod(marker.parent, 0o777)  # noqa: S103 — see comment above.
+                # 0o700, deliberately *unlike* the per-user workspace roots
+                # ``AgentSandboxClient._ensure_workspace_dir`` creates. Those
+                # have to be world-writable because two different uids
+                # (control-plane 10002, the sandbox's agent 10000) both write
+                # them and a non-root process cannot chown across uids. This
+                # directory has exactly one writer — control-plane, always the
+                # same uid across replicas — and no ``subPath`` ever projects
+                # it into a sandbox, so it needs no group/other bits at all.
+                # Keeping it at 0o700 means the authoritative soft-delete
+                # record is protected by *ownership*, not only by the mount
+                # scoping: even a hypothetically mis-scoped mount handing a
+                # sandbox a wider view of the NAS could not forge or clear a
+                # marker (wave 2 final re-review — this used to be 0o777 for
+                # uniformity's sake, which bought nothing).
+                os.chmod(marker.parent, 0o700)
                 marker.touch()  # existence is all that matters, nothing to write.
             except OSError as exc:
                 raise SandboxSupervisorError(f"workspace marker write failed: {exc}") from exc

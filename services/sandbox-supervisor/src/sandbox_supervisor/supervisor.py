@@ -136,9 +136,16 @@ def _validate_workspace_path(path: str) -> str:
     ``"."``. Observably that is the same 404 the old behaviour produced one
     layer down (there is no file named ``.``), just decided here rather
     than by a failed volume read.
+
+    A NUL byte is rejected for the same "one guard, one answer" reason
+    (wave 2 final re-review, New 1). CPython refuses to pass an embedded
+    NUL to a syscall and raises a bare :class:`ValueError` — not something
+    this service's error boundary catches. The NAS backend rejects it in
+    its own normaliser; a guard that forks per backend is exactly what the
+    Critical-2 note above says must not happen again.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/"):
+    if not cleaned or cleaned.startswith("/") or "\0" in cleaned:
         msg = f"workspace path must be relative and free of '..': {path!r}"
         raise WorkspaceFileNotFoundError(msg)
     parts = PurePosixPath(cleaned).parts
