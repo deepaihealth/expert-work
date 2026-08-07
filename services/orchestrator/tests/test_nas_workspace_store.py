@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -135,6 +136,115 @@ async def test_delete_file_missing_is_a_noop(tmp_path: Path) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="nope.txt")
+
+
+# ---------------------------------------------------------------- Critical 修复回归:
+# marker 不能被 delete_file 直接删掉(解除软删),也不能被 write_file 伪造。
+
+
+async def test_delete_file_rejects_the_deleted_marker(tmp_path: Path) -> None:
+    """delete_file 直接删 marker 等于绕过 mark_deleted 之外的任何流程解除软
+    删——审查者实测复现的 Critical。拒绝之后 marker 必须原样还在。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=DELETED_MARKER)
+
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert (user_root / DELETED_MARKER).is_file()
+
+
+async def test_write_file_rejects_the_deleted_marker(tmp_path: Path) -> None:
+    """write_file 能写出这个文件名等于能伪造"该工作区已软删"的状态,不用
+    走 mark_deleted——同一 Critical 的另一半。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(
+            tenant_id=tenant_id, user_id=user_id, path=DELETED_MARKER, data=b"forged"
+        )
+
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert not (user_root / DELETED_MARKER).exists()
+
+
+# ---------------------------------------------------------------- Important 修复回归:
+# 初始路径校验(检查时刻)与实际文件操作(使用时刻)之间的 TOCTOU 窗口期,一个
+# 共享同一棵树、跑不可信代码的并发写手把中间目录/最终文件换成指向子树外的
+# 符号链接。用 monkeypatch 在真实的检查→操作两步之间精确注入这次"race",
+# 不依赖真并发(真并发不确定,这里要的是确定性复现)。
+
+
+async def test_write_file_toctou_symlink_planted_after_initial_check_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审查者复现形态:初始 `_resolve_user_path` 校验通过后(此时 "evil" 目
+    录还不存在)、`mkdir` 落盘前的窗口期,并发写手把 "evil" 换成指向子树外
+    的符号链接。修复后必须在写入任何字节之前的复验挡住——不能真的把攻击
+    载荷写到子树外。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)  # 预先建好,只剩 "evil" 这一级待建——race 只发生在这一级
+    store = _store(tmp_path)
+
+    real_mkdir = Path.mkdir
+
+    def _racing_mkdir(
+        self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self.name == "evil" and not self.exists():
+            # 模拟并发写手在我们的初始校验之后、我们的 mkdir 落盘之前把
+            # "evil" 变成一个指向子树外的符号链接。
+            self.symlink_to(outside)
+            return None
+        return real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", _racing_mkdir)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(
+            tenant_id=tenant_id, user_id=user_id, path="evil/out.txt", data=b"pwned"
+        )
+
+    # 关键断言:攻击载荷没有真的落到子树外。
+    assert not (outside / "out.txt").exists()
+    assert list(outside.iterdir()) == []
+
+
+async def test_read_file_toctou_symlink_planted_after_initial_check_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一族 race,读路径:初始校验时 "a.txt" 是一个合法的普通文件,校验
+    通过后、真正打开读取前的窗口期,并发写手把它换成指向子树外的符号链
+    接。``O_NOFOLLOW`` 必须在打开这一步挡住,不能把子树外文件的内容读出
+    来。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top secret")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    target = user_root / "a.txt"
+    target.write_text("legit")  # 初始校验时是普通文件,校验会通过
+
+    store = _store(tmp_path)
+    real_open = os.open
+
+    def _racing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        p = path if isinstance(path, Path) else Path(str(path))
+        if p.name == "a.txt" and p.is_file() and not p.is_symlink():
+            p.unlink()
+            p.symlink_to(secret)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", _racing_open)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(tenant_id=tenant_id, user_id=user_id, path="a.txt")
 
 
 # ---------------------------------------------------------------- 读写 cap

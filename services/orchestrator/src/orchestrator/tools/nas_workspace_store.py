@@ -39,12 +39,46 @@ soft-deleted" before it actually reclaims the storage. That hard-delete /
 archive step is wave 3's job, not this store's — :meth:`list_files` hides
 the marker (and the reserved ``skills/`` / ``uploads/`` prefixes) from the
 browse view, but the underlying files stay on disk until the archive chain
-runs.
+runs. Because :data:`DELETED_MARKER` is a plain filename inside the tree
+this store otherwise treats as agent-writable, :meth:`write_file` and
+:meth:`delete_file` both explicitly refuse a request whose path equals it
+— an agent (or a caller replaying an untrusted path) could otherwise
+directly delete the marker (silently undoing a soft-delete outside the
+purge flow) or fabricate it (forging "this workspace was soft-deleted"
+without ever calling :meth:`mark_deleted`). Neither of those is the
+``is_reserved_workspace_path`` prefix check's job — the marker lives at the
+workspace *root*, not under a reserved directory prefix.
+
+**TOCTOU note.** :meth:`_resolve_user_path` validates a path once, at check
+time; every method except :meth:`list_files` then performs at least one more
+filesystem call afterwards (``mkdir``, ``open``) that a concurrent writer
+could race against. The threat is concrete, not theoretical: this NAS
+volume is the same tree a sandbox mounts (subPath-scoped to its own
+``{tenant_id}/{user_id}``) and *runs untrusted code against* — a malicious
+run sharing this control-plane's view of the wider tree could plant a
+symlink in the checked-but-not-yet-used window to redirect a write or read
+outside the caller's own subtree (a cross-tenant escape, not just a
+same-user footgun). :meth:`write_file` re-resolves and re-validates the
+parent directory *after* ``mkdir`` and *before* opening the target (closing
+the window ``mkdir``'s symlink-following parent walk could otherwise open),
+and both :meth:`write_file` and :meth:`read_file` open the final path
+component with ``os.O_NOFOLLOW`` so a symlink swapped in for the exact
+target between the check and the open causes the open itself to fail rather
+than silently follow it. :meth:`delete_file` needs neither: ``unlink()``
+never dereferences a symlink at its final path component — it removes the
+link entry itself — so there is no equivalent "write/read through a
+final-segment symlink" primitive to close there. None of this is airtight
+on NFS (no cross-process advisory lock is taken), and re-validating after
+``mkdir`` doesn't undo a directory ``mkdir`` may have already created inside
+a symlinked-elsewhere target during its parents-walk — this closes the
+specific reachable exploit (a write actually landing outside the tree with
+attacker-chosen bytes), not every theoretical race.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 from dataclasses import dataclass
@@ -134,16 +168,36 @@ class NasWorkspaceStore:
     async def read_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
         def _read() -> bytes:
             candidate = self._resolve_user_path(tenant_id, user_id, path)
-            if not candidate.is_file():
-                raise SandboxSupervisorError(f"workspace file not found: {path!r}")
-            # Stat before reading so an over-cap file never gets fully loaded
-            # into memory — the NFS mount has no equivalent to the
-            # supervisor's bounded ``head -c`` subprocess trick.
-            size = candidate.stat().st_size
-            if size > _MAX_READ_BYTES:
-                msg = f"workspace file {path!r} exceeds the {_MAX_READ_BYTES}-byte download cap"
-                raise SandboxSupervisorError(msg)
-            return candidate.read_bytes()
+            # O_NOFOLLOW — see module docstring "TOCTOU note". A concurrent
+            # writer could have swapped ``candidate`` for a symlink to
+            # somewhere outside the user's root in the window between the
+            # check above and this open; O_NOFOLLOW makes that open fail
+            # (ELOOP) instead of silently reading through it.
+            try:
+                fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise SandboxSupervisorError(
+                        f"workspace path escapes the user root: {path!r}"
+                    ) from exc
+                raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
+            with os.fdopen(fd, "rb") as handle:
+                # Stat before reading so an over-cap file never gets fully
+                # loaded into memory — the NFS mount has no equivalent to
+                # the supervisor's bounded ``head -c`` subprocess trick.
+                try:
+                    size = os.fstat(handle.fileno()).st_size
+                except OSError as exc:
+                    raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
+                if size > _MAX_READ_BYTES:
+                    msg = f"workspace file {path!r} exceeds the {_MAX_READ_BYTES}-byte download cap"
+                    raise SandboxSupervisorError(msg)
+                try:
+                    return handle.read()
+                except OSError as exc:
+                    # e.g. IsADirectoryError — ``candidate`` resolved to a
+                    # directory, not a file.
+                    raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
 
         return await asyncio.to_thread(_read)
 
@@ -167,20 +221,54 @@ class NasWorkspaceStore:
 
     async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
         def _write() -> None:
+            cleaned = path.strip()
+            if cleaned == DELETED_MARKER:
+                raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be written")
             if len(data) > _MAX_WRITE_BYTES:
                 msg = f"upload {path!r} exceeds the {_MAX_WRITE_BYTES}-byte write cap"
                 raise SandboxSupervisorError(msg)
             candidate = self._resolve_user_path(tenant_id, user_id, path)
+            user_root = self._user_root(tenant_id, user_id)
             candidate.parent.mkdir(parents=True, exist_ok=True)
-            candidate.write_bytes(data)
+            # TOCTOU re-check — see module docstring "TOCTOU note".
+            # ``mkdir(parents=True)`` silently accepts (and walks through) a
+            # pre-existing symlink at any intermediate component; a
+            # concurrent untrusted writer sharing this tree could have
+            # swapped one in between the initial ``_resolve_user_path``
+            # check above and this ``mkdir`` call. Re-resolve the parent now
+            # that it exists and re-verify it is still inside the user's
+            # root before any byte is written.
+            real_parent = candidate.parent.resolve()
+            if not real_parent.is_relative_to(user_root):
+                raise SandboxSupervisorError(f"workspace path escapes the user root: {path!r}")
+            target = real_parent / candidate.name
+            # O_NOFOLLOW — refuse to write through a symlink swapped in for
+            # the exact target between the check above and this open.
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise SandboxSupervisorError(
+                        f"workspace path escapes the user root: {path!r}"
+                    ) from exc
+                raise
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
 
         await asyncio.to_thread(_write)
 
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         def _delete() -> None:
             candidate = self._resolve_user_path(tenant_id, user_id, path)
-            if is_reserved_workspace_path(path.strip()):
+            cleaned = path.strip()
+            if cleaned == DELETED_MARKER or is_reserved_workspace_path(cleaned):
                 raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
+            # No O_NOFOLLOW-equivalent needed here (see module docstring
+            # "TOCTOU note") — ``unlink()`` never dereferences a symlink at
+            # its final path component, it removes the link entry itself,
+            # so a final-segment swap can't be abused to delete something
+            # outside the tree the way write/read could be abused to
+            # write/read one.
             candidate.unlink(missing_ok=True)  # rm -f semantics — missing is not an error
 
         await asyncio.to_thread(_delete)
@@ -192,3 +280,6 @@ class NasWorkspaceStore:
             (user_root / DELETED_MARKER).touch(exist_ok=True)
 
         await asyncio.to_thread(_mark)
+        logger.info(
+            "nas_workspace_store.marked_deleted tenant_id=%s user_id=%s", tenant_id, user_id
+        )
