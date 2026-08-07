@@ -976,10 +976,18 @@ async def test_create_passes_the_image_environment() -> None:
     envs = sdk.created[-1]["envs"]
     for key, value in SANDBOX_IMAGE_ENV.items():
         assert envs[key] == value, f"镜像环境变量 {key} 没送进沙箱"
-    assert envs["HOME"] == "/workspace", "HOME 不是 /workspace 则 PIP_USER 装到工作区外"
+    # 沙箱迁移 W2 Task 9:HOME 迁出 WORKSPACE_ROOT——/workspace 现在必须空着
+    # 让平台建 NAS 挂载 symlink,HOME 改落 useradd -m 建好的 /home/agent。
+    assert envs["HOME"] == "/home/agent", "HOME 不是 /home/agent 则 PIP_USER 装到镜像预建目录之外"
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
     # egress 那组仍在 —— 合并没有把它挤掉。
     assert "HTTPS_PROXY" in envs
+
+
+def _dockerfile_text() -> str:
+    dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
+    assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"
+    return dockerfile.read_text(encoding="utf-8")
 
 
 def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
@@ -1027,21 +1035,37 @@ def test_image_env_matches_dockerfile() -> None:
     时就等于不存在(见 sandbox-contract 工作流那次"结构性报绿"的教训),
     而这个文件在仓库 checkout 里必然存在——真找不到说明目录结构变了,
     那正该红。
-    """
-    dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
-    assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"
 
-    env, workdir = _parse_dockerfile_env_and_workdir(dockerfile.read_text(encoding="utf-8"))
+    沙箱迁移 W2 Task 9:镜像不再声明 ``WORKDIR``(该指令本身会创建
+    ``WORKSPACE_ROOT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
+    期望改成"Dockerfile 里压根没有 WORKDIR",cwd 完全交给 exec 显式传
+    :data:`WORKSPACE_ROOT`(见 ``AgentSandboxClient.exec`` 的
+    ``commands.run(cwd=...)``,W1 全分支终审 Important-2 已经在传)。
+    """
+    env, workdir = _parse_dockerfile_env_and_workdir(_dockerfile_text())
 
     assert env == SANDBOX_IMAGE_ENV, (
         "沙箱镜像的 ENV 与 AgentSandboxClient 送进云沙箱的 SANDBOX_IMAGE_ENV 已经不一致"
         f"(Dockerfile={env} / 客户端={SANDBOX_IMAGE_ENV})——envd 派生的进程不继承镜像"
         " ENV,只吃 create(envs=) 里的这份,两边必须逐条对齐。"
     )
-    assert workdir == WORKSPACE_ROOT, (
-        f"镜像 WORKDIR={workdir} 与 WORKSPACE_ROOT={WORKSPACE_ROOT} 不一致 —— "
-        "exec 传给 commands.run 的 cwd 就是后者。"
+    assert workdir is None, (
+        f"镜像不该再声明 WORKDIR(现为 {workdir!r})—— 该指令自带创建目录的"
+        f" 副作用,会跟平台在 {WORKSPACE_ROOT} 建 NAS 挂载 symlink 冲突;"
+        " cwd 改由 exec 显式传 WORKSPACE_ROOT。"
     )
+
+
+def test_image_starts_as_root_and_leaves_workspace_free() -> None:
+    """平台在 mountPath 建 symlink,且 envd 要 fork/exec 存储 helper —— 见
+    spec § 二之二(``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-
+    design.md``)。"""
+    text = _dockerfile_text()
+    assert "\nUSER agent" not in text  # 容器必须 root 启动(agent 用户仍在,执行时降权)
+    assert "WORKDIR /workspace" not in text  # WORKDIR 指令本身会创建目录
+    assert "mkdir -p /workspace" not in text
+    assert "HOME=/home/agent" in text
+    assert "mkdir -p /opt/skills /opt/agents" in text
 
 
 # ---------------------------------------------------------------------------
