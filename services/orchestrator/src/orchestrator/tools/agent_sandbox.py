@@ -109,7 +109,7 @@ from uuid import UUID, uuid4
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
-from orchestrator.tools.nas_workspace_store import DELETED_MARKER, workspace_user_root
+from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
 from orchestrator.tools.sandbox import (
     EgressContext,
     SandboxOutcome,
@@ -203,6 +203,10 @@ _TIMEOUT_ATTRIBUTION_RATIO = 0.9
 #: (``pvName``/``mountPath``/``subPath``)。
 _CSI_VOLUME_CONFIG_METADATA_KEY = "e2b.agents.kruise.io/csi-volume-config"
 
+#: 临时沙箱(无 ``user_id``)的 scratch 子树在 NAS 数据根下的目录名。与租户
+#: 目录平级、不在任何用户子树内,``NasWorkspaceStore`` 从不遍历到这里。
+_SCRATCH_DIR = "_scratch"
+
 
 def _workspace_subpath(
     *, prefix: str, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
@@ -231,9 +235,21 @@ def _workspace_subpath(
     parts = (
         (prefix, str(tenant_id), str(user_id))
         if user_id is not None
-        else (prefix, "_scratch", str(sandbox_id))
+        else (prefix, _SCRATCH_DIR, str(sandbox_id))
     )
     return "/".join(p for p in parts if p)
+
+
+def _scratch_dir(root: str, sandbox_id: UUID) -> Path:
+    """临时沙箱 scratch 子树在 **control-plane 本地挂载点**下的路径。
+
+    与 :func:`_workspace_subpath` 的 ``user_id is None`` 分支是同一个目录的
+    两种表示(前者是给平台的 ``subPath``,这里是本进程能 ``mkdir``/``rmdir``
+    的本地路径),共用 :data:`_SCRATCH_DIR` 常量——同
+    :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root` 之于
+    用户子树的理由:同一个位置两处独立拼接迟早会静默失配。
+    """
+    return Path(root, _SCRATCH_DIR, str(sandbox_id))
 
 
 def _monotonic() -> float:
@@ -286,12 +302,13 @@ class AgentSandboxClient:
     #: 行时回落。与 supervisor 的 ``default_max_sandboxes``(settings.py:112,
     #: default=50)drift-lock 钉死(``test_default_max_sandboxes_matches_supervisor_default``)。
     default_max_sandboxes: int = 50
-    #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,全部默认 None/"":不配 = 行为
-    #: 与波 1 完全一致(``_create`` 不注入任何 ``metadata``,``acquire`` 不做
-    #: mkdir/chmod/软删闸)。三项一起配才有意义,但故意不做"必须同时配"的
-    #: 校验——``build_sandbox_runtime`` 是唯一的生产装配点,三个 Settings 字段
-    #: 本就同源(见 control-plane ``runtime.py``);拆开来是为了每个字段职责
-    #: 单一,不是给运维暴露一个"只配一半"的合法状态。
+    #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,dataclass 层面全部默认
+    #: None/"",让直接构造这个类的单测不必每次都摆全三项;**生产装配点
+    #: ``build_sandbox_runtime`` 会强制要求前两项**(波 2 终审 Important-2:
+    #: Task 9 之后镜像不再预建 ``/workspace``,少配 ``workspace_pv_name`` 或
+    #: ``workspace_root`` 不再等价于"波 1 行为",而是每次工具调用都炸在 envd
+    #: 层 —— 见 ``runtime.py`` 那段 ``missing`` 列表的注释)。这里不重复那道
+    #: 校验:三个 Settings 字段本就同源,拆成三个字段是为了每个职责单一。
     #:
     #: ``workspace_pv_name`` —— ``csi-volume-config`` 的 ``pvName``(spec § 三
     #: "沙箱"消费者一节)。
@@ -703,7 +720,7 @@ class AgentSandboxClient:
             await self._reject_if_workspace_deleted(root, tenant_id=tenant_id, user_id=user_id)
             target = workspace_user_root(root, tenant_id, user_id)
         else:
-            target = Path(root, "_scratch", str(sandbox_id))
+            target = _scratch_dir(root, sandbox_id)
         await self._ensure_workspace_dir(target)
 
     async def _reject_if_workspace_deleted(
@@ -711,21 +728,25 @@ class AgentSandboxClient:
     ) -> None:
         """软删闸(spec § 二之二 / 五之二)—— supervisor 对软删工作区同样在
         acquire 拒(HTTP 客户端把 4xx 包成 ``SandboxSupervisorError``),这里
-        走同一个可观察契约:直接读 ``NasWorkspaceStore`` 写的
-        :data:`~orchestrator.tools.nas_workspace_store.DELETED_MARKER`
-        标记文件(:meth:`NasWorkspaceStore.mark_deleted` 的落点是
-        ``{root}/{tenant_id}/{user_id}/{DELETED_MARKER}``)——路径经
-        :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root`
-        与 ``NasWorkspaceStore`` 共享同一个函数算出(Task 4 审查 Minor:两
-        处独立拼接过路径,曾经能各拼各的、静默失配),不经过
-        ``NasWorkspaceStore`` 实例本身——这里只需要"这个文件存在吗"这一个
-        布尔判断,不需要该 store 的读写/路径穿越防护机器。
+        走同一个可观察契约:直接读 ``NasWorkspaceStore.mark_deleted`` 写的标
+        记文件,路径经
+        :func:`~orchestrator.tools.nas_workspace_store.workspace_deleted_marker`
+        与该 store 共享同一个函数算出(Task 4 审查 Minor:两处独立拼接过路
+        径,曾经能各拼各的、静默失配),不经过 ``NasWorkspaceStore`` 实例本
+        身——这里只需要"这个文件存在吗"这一个布尔判断,不需要该 store 的读
+        写/路径穿越防护机器。
+
+        **marker 不在 ``{tenant}/{user}`` 子树里**(全分支终审 Critical-1):
+        那棵树整个经 ``subPath`` 挂进沙箱的 ``/workspace``,沙箱里的 agent
+        直接写一个同名文件就能让这道闸永久拒掉该用户——这道闸读的是
+        ``{root}/{tenant}/.deleted/{user}``,与用户目录平级,任何 subPath 都
+        挂不到,见该函数与 ``nas_workspace_store`` 模块 docstring。
 
         本方法既是 :meth:`_prepare_workspace_mount` 的初次软删闸,也是
         Task 4 审查 Important-2 修复后 :meth:`_reverify_workspace_not_deleted`
         的复查窗口复用的同一份判定——两处调用同一个函数,不重复一份逻辑。
         """
-        marker = workspace_user_root(root, tenant_id, user_id) / DELETED_MARKER
+        marker = workspace_deleted_marker(root, tenant_id, user_id)
         deleted = await asyncio.to_thread(marker.exists)
         if deleted:
             raise SandboxSupervisorError(
@@ -1032,7 +1053,40 @@ class AgentSandboxClient:
         if await self._is_warm_session(sandbox_id):
             return None
         await self.destroy(sandbox_id=sandbox_id, reason=_RELEASE_DESTROY_REASON)
+        await self._remove_scratch_dir(sandbox_id)
         return None
+
+    async def _remove_scratch_dir(self, sandbox_id: UUID) -> None:
+        """临时沙箱的 ``_scratch/<sandbox_id>`` 目录随沙箱一起收掉(全分支终审 M-3)。
+
+        为什么需要:``run_in_sandbox``(``sandbox.py``)是**每次工具调用**
+        acquire 一次、release 一次,不是每个 run 一次。没有 ``user_id`` 的 run
+        因此每调用一次工具就在 NAS 上永久留一个空目录 —— spec 决策 9 把清理推
+        给波 3 是有意的,但推的时候按"每沙箱一个"估的量,实际是"每工具调用一
+        个",差一到两个数量级。NAS 上百万级空目录的代价不是容量而是 inode 与
+        目录遍历:波 3 的归档/配额扫描 job 正是要遍历这棵树。
+
+        为什么是 ``rmdir`` 而不是递归删:此刻是唯一一个"沙箱已经死了、这个目
+        录再没有写手"的时刻,``rmdir`` 只在目录**确实是空的**时候成功;非空
+        意味着 agent 真往里写了字节,那就留着(既不该被这条清理路径悄悄删
+        掉,也没有其它机制会去读它——留下的是可诊断的痕迹,不是垃圾)。
+
+        整段 best-effort:``release`` 是清理路径,NAS 抖一下不该把一次已经跑
+        完的工具调用变成错误(同 :meth:`_is_warm_session` 的取舍)。
+        ``workspace_root`` 未配(波 1 / 本地 docker 后端)整段跳过。
+
+        为什么不改成 ``_scratch/<yyyymmdd>/<id>`` 分片:那只是把同样多的目录
+        换个地方摆,总量不变,还得改 ``_workspace_subpath``(探针钉死的
+        ``subPath`` 语义)并让两处拼接多一个必须同步的维度。
+        """
+        root = self.workspace_root
+        if not root:
+            return
+        try:
+            await asyncio.to_thread(_scratch_dir(root, sandbox_id).rmdir)
+        except OSError:
+            # 目录非空(agent 写了东西)/ 压根没建过 / NAS 抖动 —— 都不是错误。
+            logger.debug("release: scratch dir for sandbox %s not removed", sandbox_id)
 
     async def _is_warm_session(self, sandbox_id: UUID) -> bool:
         """``store.is_warm_session`` 读不到时,按"保温"处置。

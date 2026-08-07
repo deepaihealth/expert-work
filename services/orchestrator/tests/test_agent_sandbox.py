@@ -82,7 +82,7 @@ from orchestrator.tools.agent_sandbox import (
     WORKSPACE_ROOT,
     AgentSandboxClient,
 )
-from orchestrator.tools.nas_workspace_store import DELETED_MARKER
+from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
 from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
@@ -1193,15 +1193,20 @@ async def test_acquire_surfaces_chmod_failure_as_sandbox_supervisor_error(
         await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
 
 
+def _plant_marker(root: Path, tenant_id: UUID, user_id: UUID) -> None:
+    """按 ``NasWorkspaceStore.mark_deleted`` 的真实落点造软删标记。"""
+    marker = workspace_deleted_marker(str(root), tenant_id, user_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
 @pytest.mark.asyncio
 async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
-    """软删闸 —— ``{root}/{tenant}/{user}/.ew-workspace-deleted`` 存在时
-    acquire 必须拒(supervisor 对软删工作区同样在 acquire 拒,可观察契约
-    一致:统一包成 ``SandboxSupervisorError``)。"""
+    """软删闸 —— ``{root}/{tenant}/.deleted/{user}`` 存在时 acquire 必须拒
+    (supervisor 对软删工作区同样在 acquire 拒,可观察契约一致:统一包成
+    ``SandboxSupervisorError``)。"""
     tenant_id, user_id = uuid4(), uuid4()
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    user_root.mkdir(parents=True)
-    (user_root / DELETED_MARKER).touch()
+    _plant_marker(tmp_path, tenant_id, user_id)
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_root=str(tmp_path))
 
@@ -1210,6 +1215,44 @@ async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
 
     # 拒绝发生在 claim_warm 之前 —— 没有留下任何行。
     assert store.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_acquire_ignores_a_marker_file_written_inside_the_mounted_tree(
+    tmp_path: Path,
+) -> None:
+    """全分支终审 C-1(跨任务接缝)—— ``{tenant}/{user}`` 整棵树经 subPath 挂
+    进沙箱的 ``/workspace``,沙箱里的 agent(跑 LLM 生成的代码 / 处理带注入的
+    上传文档)可以直接 ``write_file(".ew-workspace-deleted")``。软删闸读的
+    marker 必须不在这棵树里,否则一次注入就能把活跃用户的工作区永久标记成待
+    回收:此后每一次 acquire(含热复用)都拒,而 ``list_files`` 又把这个文件
+    过滤掉,UI 上看不到任何异常。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    # 沙箱视角:直接写 /workspace/.ew-workspace-deleted。
+    (user_root / ".ew-workspace-deleted").write_text("")
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert sandbox_id in store.rows
+
+
+@pytest.mark.asyncio
+async def test_mark_deleted_then_acquire_is_refused_end_to_end(tmp_path: Path) -> None:
+    """写点与读点必须真的是同一个位置 —— 两边各自的单测都不会发现它们指向了
+    不同的路径(C-1 修复把 marker 搬了家,这条钉住搬完之后两侧仍然对齐)。"""
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    tenant_id, user_id = uuid4(), uuid4()
+    await NasWorkspaceStore(root=str(tmp_path)).mark_deleted(tenant_id=tenant_id, user_id=user_id)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    with pytest.raises(SandboxSupervisorError, match="workspace deleted"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
 
 
 @pytest.mark.asyncio
@@ -1235,9 +1278,7 @@ async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
     ) -> tuple[UUID, str, object] | None:
         result = await real_claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
         # 模拟并发 mark_deleted 恰好在 claim_warm 提交之后写下 marker。
-        user_root = tmp_path / str(tenant_id) / str(user_id)
-        user_root.mkdir(parents=True, exist_ok=True)
-        (user_root / DELETED_MARKER).touch()
+        _plant_marker(tmp_path, tenant_id, user_id)
         return result
 
     monkeypatch.setattr(store, "claim_warm", _claim_then_plant_marker)
@@ -2018,6 +2059,52 @@ async def test_release_destroys_an_ephemeral_sandbox() -> None:
         "行必须被标记销毁,且 reason 与本地 supervisor 的 DESTROY_REASON_RELEASE 一致"
     )
     assert sandbox_id not in store.rows
+
+
+@pytest.mark.asyncio
+async def test_release_removes_the_empty_scratch_dir(tmp_path: Path) -> None:
+    """全分支终审 M-3 —— ``run_in_sandbox`` 每次工具调用 acquire+release 一
+    次,无 user 的 run 因此每调用一次工具就在 NAS 上留一个 ``_scratch/<id>``
+    空目录。释放时顺手 ``rmdir``,把"按工具调用数无界增长"压回零。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    scratch = tmp_path / "_scratch" / str(sandbox_id)
+    assert scratch.is_dir(), "acquire 应当先建出 scratch 子树(挂载点必须存在)"
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert not scratch.exists()
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_a_non_empty_scratch_dir(tmp_path: Path) -> None:
+    """目录里真有 agent 写出的字节 —— ``rmdir`` 失败(非空),留着不动:这条
+    清理路径只负责收掉自己建出来的空壳,不负责递归删用户数据。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    scratch = tmp_path / "_scratch" / str(sandbox_id)
+    (scratch / "out.txt").write_text("agent output")
+
+    await client.release(sandbox_id=sandbox_id)  # 不抛
+
+    assert (scratch / "out.txt").is_file()
+
+
+@pytest.mark.asyncio
+async def test_release_does_not_touch_the_user_tree_of_a_warm_session(tmp_path: Path) -> None:
+    """保温分支压根不走清理 —— 断言用户子树原样在,防止把 ``_scratch``
+    清理误接到热会话上(那会删掉用户工作区目录)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert (tmp_path / str(tenant_id) / str(user_id)).is_dir()
+    assert sdk.sandbox.killed is False
 
 
 @pytest.mark.asyncio

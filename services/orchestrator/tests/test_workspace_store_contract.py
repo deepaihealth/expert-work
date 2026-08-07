@@ -110,6 +110,83 @@ async def test_delete_file_rejects_reserved_path(store: WorkspaceStore) -> None:
     assert data == b"in"
 
 
+# ------------------------------------------------ 守卫 parity(全分支终审 M-5)
+#
+# caps parity 一直有漂移闸,守卫 parity 没有 —— C-2(``./`` 前缀绕过保留前缀
+# 检查,实测能删掉别人的上传件)因此能溜过每一轮单任务审查:两个实现各自的
+# 单测都只测自己那套写法。下面每条都参数化跑在两个实现上,断言同一个输入在
+# 两侧得到同一个答案。
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["../escape.txt", "/etc/passwd", "a/../../b"])
+async def test_path_traversal_is_refused_by_both_backends(store: WorkspaceStore, path: str) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(tenant_id=tenant_id, user_id=user_id, path=path)
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path=path, data=b"x")
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=path)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("path", [".", "./", " . "])
+async def test_degenerate_dot_path_raises_the_shared_error_type(
+    store: WorkspaceStore, path: str
+) -> None:
+    """M-1 —— ``PurePosixPath(".").parts == ()``。NAS 侧曾经从 ``parts[-1]``
+    抛裸 ``IndexError`` 越过 store 边界(``/v1/workspace/file`` → 500,
+    supervisor 同输入 404)。两侧都必须是 ``SandboxSupervisorError``。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(tenant_id=tenant_id, user_id=user_id, path=path)
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=path)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["./uploads/in.txt", "uploads/./in.txt", ".//uploads/in.txt"])
+async def test_delete_file_reserved_guard_sees_through_dot_segments(
+    store: WorkspaceStore, path: str
+) -> None:
+    """C-2 的核心 —— 这些写法与 ``uploads/in.txt`` 指同一个文件,守卫必须给
+    同一个答案。终审实测:NAS 侧放行并真删掉了文件;supervisor 侧同形。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="uploads/in.txt", data=b"in")
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=path)
+
+    assert await store.read_file(tenant_id=tenant_id, user_id=user_id, path="uploads/in.txt") == (
+        b"in"
+    )
+
+
+@pytest.mark.integration
+async def test_dot_segments_address_the_same_file_on_both_backends(store: WorkspaceStore) -> None:
+    """归一化是双向的:``x/./y`` 与 ``x/y`` 必须是同一个文件,而不是两侧各
+    造一份带 ``.`` 的第二路径。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="x/./y.txt", data=b"v")
+
+    assert await store.read_file(tenant_id=tenant_id, user_id=user_id, path="x/y.txt") == b"v"
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    assert [f.path for f in files] == ["x/y.txt"]
+
+
+@pytest.mark.integration
+async def test_write_file_does_not_reserve_any_filename(store: WorkspaceStore) -> None:
+    """C-1 的 parity 面 —— 软删标记搬出用户树之后,NAS 侧不再对
+    ``.ew-workspace-deleted`` 这个名字做特判;supervisor 侧从来没有过。两侧
+    对同一个普通(名字奇怪的)文件都必须能写、能删。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted", data=b"x"
+    )
+    await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted")
+
+
 @pytest.mark.integration
 async def test_write_file_rejects_over_cap(store: WorkspaceStore) -> None:
     from orchestrator.tools.nas_workspace_store import _MAX_WRITE_BYTES

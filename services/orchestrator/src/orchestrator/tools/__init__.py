@@ -127,10 +127,13 @@ from orchestrator.tools.mcp import (
     register_mcp_tools as register_mcp_tools,
 )
 from orchestrator.tools.nas_workspace_store import (
-    DELETED_MARKER as DELETED_MARKER,
+    DELETED_DIR as DELETED_DIR,
 )
 from orchestrator.tools.nas_workspace_store import (
     NasWorkspaceStore as NasWorkspaceStore,
+)
+from orchestrator.tools.nas_workspace_store import (
+    workspace_deleted_marker as workspace_deleted_marker,
 )
 from orchestrator.tools.nas_workspace_store import (
     workspace_user_root as workspace_user_root,
@@ -237,7 +240,7 @@ __all__ = [
     "DEFAULT_MAX_SERVERS",
     "DEFAULT_MCP_CHAR_CAP",
     "DEFAULT_OUTPUT_CHAR_CAP",
-    "DELETED_MARKER",
+    "DELETED_DIR",
     "KNOWN_BUILTINS",
     "MAX_SUBAGENT_DEPTH",
     "SANDBOX_EXEC_USER",
@@ -301,5 +304,6 @@ __all__ = [
     "WriteFileTool",
     "build_tool_registry",
     "register_mcp_tools",
+    "workspace_deleted_marker",
     "workspace_user_root",
 ]

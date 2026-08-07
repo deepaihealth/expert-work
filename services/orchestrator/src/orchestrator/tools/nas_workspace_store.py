@@ -31,23 +31,39 @@ on each other; wave 2 Task 7's contract-test suite is what pins the two
 implementations together and would catch a drift.
 
 **Marker semantics.** :meth:`NasWorkspaceStore.mark_deleted` is a
-*soft*-delete: it drops an empty :data:`DELETED_MARKER` sentinel file at the
-user's workspace root and nothing else — no file is removed, no bytes are
-freed. This mirrors the supervisor's ``mark_workspace_deleted`` (Mini-ADR
-J-36): the marker is what lets a later sweep recognise "this workspace was
-soft-deleted" before it actually reclaims the storage. That hard-delete /
-archive step is wave 3's job, not this store's — :meth:`list_files` hides
-the marker (and the reserved ``skills/`` / ``uploads/`` prefixes) from the
-browse view, but the underlying files stay on disk until the archive chain
-runs. Because :data:`DELETED_MARKER` is a plain filename inside the tree
-this store otherwise treats as agent-writable, :meth:`write_file` and
-:meth:`delete_file` both explicitly refuse a request whose path equals it
-— an agent (or a caller replaying an untrusted path) could otherwise
-directly delete the marker (silently undoing a soft-delete outside the
-purge flow) or fabricate it (forging "this workspace was soft-deleted"
-without ever calling :meth:`mark_deleted`). Neither of those is the
-``is_reserved_workspace_path`` prefix check's job — the marker lives at the
-workspace *root*, not under a reserved directory prefix.
+*soft*-delete: it drops an empty sentinel file at
+:func:`workspace_deleted_marker`'s path and nothing else — no file is
+removed, no bytes are freed. This mirrors the supervisor's
+``mark_workspace_deleted`` (Mini-ADR J-36): the marker is what lets a later
+sweep recognise "this workspace was soft-deleted" before it actually
+reclaims the storage. That hard-delete / archive step is wave 3's job, not
+this store's — the underlying files stay on disk until the archive chain
+runs.
+
+**Why the marker is NOT in the user's tree** (wave 2 final review, Critical
+1). It used to be ``{root}/{tenant}/{user}/.ew-workspace-deleted`` — the
+same subtree the sandbox mounts at ``/workspace`` via ``subPath:
+"{tenant}/{user}"``. That made the *authoritative record of "this workspace
+was soft-deleted"* a file the sandbox itself can create: an agent running
+LLM-generated code (or processing an upload carrying a prompt injection)
+only had to write a file with that name into its own working directory, and
+from then on every ``acquire`` for that ``(tenant, user)`` — including warm
+reuse — was refused by ``AgentSandboxClient``'s soft-delete gate, with wave
+3's archive/hard-delete sweep treating the workspace as reclaimable. A
+filename blacklist on :meth:`write_file` / :meth:`delete_file` (which this
+module used to carry) cannot close that: the sandbox writes the NAS tree
+*directly over NFS* and never passes through this store at all. The only
+structural fix is for the marker to live somewhere no ``subPath`` ever
+projects into a sandbox, so :func:`workspace_deleted_marker` puts it at
+``{root}/{tenant}/{DELETED_DIR}/{user}`` — a sibling of the per-user
+directories, one level up from anything mounted. With the marker out of
+reach, the blacklist is gone too: a file named ``.ew-workspace-deleted``
+inside a user's workspace is now an ordinary file with an odd name, and
+refusing to write or delete it would only be a behaviour divergence from
+``SupervisorWorkspaceStore`` (which has no such rule) for no protection in
+return. :meth:`list_files` still filters that one name out of the browse
+view (see :data:`_LEGACY_IN_TREE_MARKER`), together with the reserved
+``skills/`` / ``uploads/`` prefixes.
 
 **TOCTOU note.** The NAS volume is the same tree a sandbox mounts (subPath-
 scoped to its own ``{tenant_id}/{user_id}``) and *runs untrusted code
@@ -138,11 +154,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Soft-delete sentinel (see module docstring "Marker semantics"). An empty
-#: file with this name at a user's workspace root means "this workspace was
-#: soft-deleted" — referenced by wave 2 Task 4 (writes it) and Task 7
-#: (contract tests both implementations against it).
-DELETED_MARKER = ".ew-workspace-deleted"
+#: Per-tenant soft-delete marker directory (see module docstring "Why the
+#: marker is NOT in the user's tree"). One empty file per soft-deleted user:
+#: ``{root}/{tenant_id}/{DELETED_DIR}/{user_id}``. Deliberately not a UUID
+#: and not a sandbox mount target — it sits *beside* the per-user
+#: directories, which are the only thing ``subPath`` ever projects into a
+#: sandbox, so nothing running inside a sandbox can reach it. Wave 3's
+#: archive / hard-delete sweep reads this directory, not the user tree.
+DELETED_DIR = ".deleted"
+
+#: The pre-fix in-tree marker filename. Nothing writes it any more (the
+#: marker moved to :data:`DELETED_DIR`), but :meth:`NasWorkspaceStore.
+#: list_files` keeps hiding it: a tree written by a pre-fix build would
+#: otherwise start surfacing a platform-looking system file in the user's
+#: browse view, and — more durably — a sandbox can still create a file with
+#: this exact name inside its own ``/workspace``, which has no meaning any
+#: more but would look to a user like a platform artefact if listed.
+_LEGACY_IN_TREE_MARKER = ".ew-workspace-deleted"
 
 #: Per-file download cap — mirrors
 #: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES``.
@@ -222,6 +250,62 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         return fd
 
 
+def _normalize_workspace_path(path: str) -> tuple[str, tuple[str, ...]]:
+    """The single source of truth for "what does this workspace path mean".
+
+    Returns ``(relpath, parts)`` where ``parts`` is what the ``dir_fd`` walk
+    steps through and ``relpath`` is ``"/".join(parts)`` — the canonical
+    spelling every *guard* must compare against.
+
+    Wave 2 final review (Critical 2) — before this existed, the guards in
+    :meth:`NasWorkspaceStore.write_file` / :meth:`NasWorkspaceStore.
+    delete_file` compared the **raw** input string while the actual
+    filesystem walk used ``PurePosixPath(cleaned).parts``, which silently
+    drops ``.`` segments. The two therefore answered differently for the
+    same input: ``"./uploads/a.txt"`` did not look reserved to the guard,
+    but landed on exactly ``uploads/a.txt`` on disk (measured, not
+    reasoned — the file really was deleted). Normalising in one place and
+    letting both the guard and the walk read *that* result is what makes
+    the two structurally incapable of disagreeing; re-implementing the
+    normalisation next to each guard would recreate the bug.
+
+    ``PurePosixPath`` collapses ``.`` segments and duplicate slashes but
+    never ``..``, so the ``..`` rejection below still sees every climb
+    attempt. A URL-encoded traversal (``%2e%2e%2f``) is not decoded — it is
+    just an odd filename, and stays one.
+
+    Empty ``parts`` (``"."``, ``"./"``, ``".//"``) raises rather than
+    falling through: the walk's ``parts[-1]`` would otherwise throw a bare
+    ``IndexError`` straight past this store's error boundary, and
+    ``/v1/workspace/file`` — which only catches
+    :class:`SandboxSupervisorError` — would answer 500 where the supervisor
+    backend answers 404 (the "错误类型统一" half of the parity contract in
+    the module docstring).
+    """
+    cleaned = path.strip()
+    if not cleaned or cleaned.startswith("/"):
+        raise SandboxSupervisorError(f"workspace path must be relative and free of '..': {path!r}")
+    parts = PurePosixPath(cleaned).parts
+    if not parts or ".." in parts:
+        raise SandboxSupervisorError(f"workspace path must be relative and free of '..': {path!r}")
+    return "/".join(parts), parts
+
+
+def workspace_deleted_marker(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """The soft-delete marker file for one ``(tenant, user)``.
+
+    ``{root}/{tenant_id}/{DELETED_DIR}/{user_id}`` — see the module
+    docstring's "Why the marker is NOT in the user's tree". Sibling of
+    :func:`workspace_user_root` in every sense: same reason to exist (one
+    function owns the on-disk spelling so the writer —
+    :meth:`NasWorkspaceStore.mark_deleted` — and the reader —
+    ``AgentSandboxClient``'s acquire-time soft-delete gate — can never drift
+    apart), and the same trusted inputs (both ids are UUIDs from the
+    authenticated caller, never attacker path text).
+    """
+    return (Path(root) / str(tenant_id) / DELETED_DIR / str(user_id)).resolve()
+
+
 def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     """The canonical per-``(tenant, user)`` NAS path: ``{root}/{tenant_id}/{user_id}``.
 
@@ -284,14 +368,15 @@ class NasWorkspaceStore:
     ) -> tuple[int, str]:
         """Walk to ``path``'s parent directory via a chain of ``dir_fd``-relative opens.
 
-        ``path`` must be relative and free of ``..`` path segments — checked
-        against the *literal* path text, so a URL-encoded traversal attempt
-        (``%2e%2e%2f``) is never decoded; it is just an odd filename. Every
-        component of ``path`` except the last is then opened one at a time
-        with :func:`_openat_dir`, each anchored on the *previous* component's
-        already-open directory fd rather than on a re-walked string path —
-        see the module docstring's "TOCTOU note" for why that distinction is
-        the entire point.
+        ``path`` is validated and canonicalised by
+        :func:`_normalize_workspace_path` — the *same* function the callers'
+        reserved-name guards read, so the guard and the walk can never
+        disagree about which file a request names (wave 2 final review,
+        Critical 2). Every component except the last is then opened one at a
+        time with :func:`_openat_dir`, each anchored on the *previous*
+        component's already-open directory fd rather than on a re-walked
+        string path — see the module docstring's "TOCTOU note" for why that
+        distinction is the entire point.
 
         Returns ``(parent_fd, final_component_name)``; the caller owns
         ``parent_fd`` and must close it. ``create=True`` (``write_file`` /
@@ -300,12 +385,7 @@ class NasWorkspaceStore:
         ``delete_file``) never creates anything and raises
         :class:`_WorkspacePathNotFoundError` the moment a component is missing.
         """
-        cleaned = path.strip()
-        if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
-            raise SandboxSupervisorError(
-                f"workspace path must be relative and free of '..': {path!r}"
-            )
-        parts = PurePosixPath(cleaned).parts
+        _relpath, parts = _normalize_workspace_path(path)
         user_root = self._user_root(tenant_id, user_id)
         if create:
             # ``tenant_id``/``user_id`` are UUIDs from the authenticated
@@ -325,7 +405,23 @@ class NasWorkspaceStore:
             # here first. Duplicating the chmod here would be redundant,
             # not wrong — left out to keep this call's mode ownership
             # single-sourced in one place.
-            user_root.mkdir(parents=True, exist_ok=True)
+            #
+            # Wrapped (wave 2 final review, Minor 2): the most likely way
+            # this fails in production is the NAS data root not having been
+            # chmod'd 1777 by hand (the one manual step in the wave 2
+            # release runbook) — control-plane runs as a non-root uid and
+            # gets EACCES creating the first tenant subtree. Unwrapped, that
+            # surfaces as a bare PermissionError crossing this store's error
+            # boundary and a clueless 500 on the upload endpoint; the
+            # runbook literally tells the operator "if the first upload
+            # after release 500s, check this", which is exactly the signal
+            # the error type should have carried in the first place.
+            try:
+                user_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SandboxSupervisorError(
+                    f"failed to create workspace directory {user_root}: {exc}"
+                ) from exc
         try:
             dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
         except OSError as exc:
@@ -398,7 +494,7 @@ class NasWorkspaceStore:
                 for name in filenames:
                     full = Path(dirpath) / name
                     rel = full.relative_to(user_root).as_posix()
-                    if rel == DELETED_MARKER or is_reserved_workspace_path(rel):
+                    if rel == _LEGACY_IN_TREE_MARKER or is_reserved_workspace_path(rel):
                         continue
                     # lstat, not stat — a symlink appearing as a plain file
                     # entry must report its own byte length, never a stat()
@@ -412,9 +508,6 @@ class NasWorkspaceStore:
 
     async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
         def _write() -> None:
-            cleaned = path.strip()
-            if cleaned == DELETED_MARKER:
-                raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be written")
             if len(data) > _MAX_WRITE_BYTES:
                 msg = f"upload {path!r} exceeds the {_MAX_WRITE_BYTES}-byte write cap"
                 raise SandboxSupervisorError(msg)
@@ -449,8 +542,12 @@ class NasWorkspaceStore:
 
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         def _delete() -> None:
-            cleaned = path.strip()
-            if cleaned == DELETED_MARKER or is_reserved_workspace_path(cleaned):
+            # The guard reads _normalize_workspace_path's output, not the raw
+            # string — see that function (wave 2 final review, Critical 2):
+            # "./uploads/a.txt" used to slip past this check and delete
+            # exactly the file the check exists to protect.
+            relpath, _parts = _normalize_workspace_path(path)
+            if is_reserved_workspace_path(relpath):
                 raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
             try:
                 dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
@@ -506,24 +603,31 @@ class NasWorkspaceStore:
         """
 
         def _mark() -> None:
-            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, DELETED_MARKER, create=True)
+            # No dir_fd walk here, and no user-root mkdir either: every
+            # component of this path comes from an authenticated caller's
+            # UUIDs (module docstring "Why the marker is NOT in the user's
+            # tree"), there is no attacker-controlled path text to guard,
+            # and the marker deliberately lives *outside* the subtree the
+            # dir_fd machinery is scoped to. Not creating the user root as a
+            # side effect is a small improvement over the old in-tree write:
+            # soft-deleting a user who never had a workspace no longer
+            # conjures an empty directory for wave 3's sweep to find.
+            marker = workspace_deleted_marker(self.root, tenant_id, user_id)
             try:
-                try:
-                    fd = os.open(
-                        name,
-                        os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
-                        _LEAF_FILE_MODE,
-                        dir_fd=dfd,
-                    )
-                except OSError as exc:
-                    if exc.errno == errno.ELOOP:
-                        raise SandboxSupervisorError(
-                            "workspace marker path escapes the user root"
-                        ) from exc
-                    raise SandboxSupervisorError(f"workspace marker write failed: {exc}") from exc
-            finally:
-                os.close(dfd)
-            os.close(fd)  # touch semantics — existence is all that matters, nothing to write.
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                # chmod, never chown — control-plane runs as a non-root uid
+                # and POSIX forbids a non-root process changing another
+                # uid's ownership; same reasoning (and same fixed mode) as
+                # ``AgentSandboxClient._ensure_workspace_dir`` for the user
+                # roots this directory sits beside. Nothing untrusted can
+                # reach ``{root}/{tenant}`` — no subPath ever projects it
+                # into a sandbox — so the wide mode adds no exposure; it
+                # keeps a single, uniform answer to "how does this platform
+                # create a directory on the shared NAS".
+                os.chmod(marker.parent, 0o777)  # noqa: S103 — see comment above.
+                marker.touch()  # existence is all that matters, nothing to write.
+            except OSError as exc:
+                raise SandboxSupervisorError(f"workspace marker write failed: {exc}") from exc
 
         await asyncio.to_thread(_mark)
         logger.info(

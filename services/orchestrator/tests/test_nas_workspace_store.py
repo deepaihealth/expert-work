@@ -22,8 +22,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from orchestrator.tools.nas_workspace_store import (
-    DELETED_MARKER,
+    DELETED_DIR,
     NasWorkspaceStore,
+    workspace_deleted_marker,
     workspace_user_root,
 )
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxSupervisorError
@@ -152,7 +153,7 @@ async def test_write_read_list_delete_roundtrip(tmp_path: Path) -> None:
     assert files_after == []
 
 
-async def test_list_files_hides_reserved_prefixes_and_marker(tmp_path: Path) -> None:
+async def test_list_files_hides_reserved_prefixes(tmp_path: Path) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     await store.write_file(
@@ -227,37 +228,148 @@ async def test_write_file_does_not_reset_mode_of_a_pre_existing_intermediate_dir
     assert (restricted / "b").stat().st_mode & 0o777 == 0o777, "本次新建的目录没有放开权限"
 
 
-# ---------------------------------------------------------------- Critical 修复回归:
-# marker 不能被 delete_file 直接删掉(解除软删),也不能被 write_file 伪造。
+# ------------------------------------------- 全分支终审 C-1:marker 必须在挂载子树之外
+#
+# 旧实现把 marker 落在 ``{root}/{tenant}/{user}/`` —— 正是沙箱经 subPath 挂到
+# ``/workspace`` 的那棵树。沙箱里的 agent 直接 ``write_file(".ew-workspace-
+# deleted")`` 就能落出同一个文件,而软删闸读的就是它:一次提示注入可以把活跃
+# 用户的工作区标记成待回收。文件名黑名单挡不住(沙箱根本不经过这个 store),
+# 唯一的结构性修法是把 marker 搬出任何 subPath 会挂进沙箱的位置。
 
 
-async def test_delete_file_rejects_the_deleted_marker(tmp_path: Path) -> None:
-    """delete_file 直接删 marker 等于绕过 mark_deleted 之外的任何流程解除软
-    删——审查者实测复现的 Critical。拒绝之后 marker 必须原样还在。"""
+async def test_mark_deleted_writes_the_marker_outside_the_mounted_user_tree(
+    tmp_path: Path,
+) -> None:
+    """marker 不能出现在 ``{root}/{tenant}/{user}/`` 下的任何位置 —— 那棵子树
+    整个会被 ``csi-volume-config`` 的 ``subPath`` 挂进沙箱的 ``/workspace``。"""
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
+
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
 
-    with pytest.raises(SandboxSupervisorError):
-        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=DELETED_MARKER)
-
     user_root = tmp_path / str(tenant_id) / str(user_id)
-    assert (user_root / DELETED_MARKER).is_file()
+    residents = list(user_root.rglob("*")) if user_root.exists() else []
+    assert residents == [], f"marker(或别的东西)落在了沙箱可写的子树里:{residents}"
 
 
-async def test_write_file_rejects_the_deleted_marker(tmp_path: Path) -> None:
-    """write_file 能写出这个文件名等于能伪造"该工作区已软删"的状态,不用
-    走 mark_deleted——同一 Critical 的另一半。"""
+async def test_marker_lives_beside_the_user_tree_not_inside_it(tmp_path: Path) -> None:
+    """落点是 ``{root}/{tenant}/.deleted/{user}`` —— 与用户目录平级、不被任何
+    ``subPath`` 挂进沙箱,且目录名不是合法 UUID,不会与用户目录撞名。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    assert (tmp_path / str(tenant_id) / ".deleted" / str(user_id)).is_file()
+
+
+async def test_an_agent_written_marker_filename_does_not_soft_delete_anything(
+    tmp_path: Path,
+) -> None:
+    """沙箱里能写进 ``/workspace`` 的任何文件名都不再具有软删语义 —— 这里用
+    store 自己的 write_file 走一遍(端点可达的那条路径),断言三件事:写入
+    被接受(marker 搬出树后,那份只在 NAS 侧存在、与 supervisor 后端不对称
+    的文件名黑名单随之取消)、字节真的落进用户树、且软删状态并未成立。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted", data=b"forged"
+    )
+
+    assert (tmp_path / str(tenant_id) / str(user_id) / ".ew-workspace-deleted").is_file()
+    assert not (tmp_path / str(tenant_id) / DELETED_DIR).exists()
+    # 同理,删它也不再被拒 —— 它就是个名字奇怪的普通文件。
+    await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted")
+
+
+async def test_list_files_still_hides_a_legacy_in_tree_marker(tmp_path: Path) -> None:
+    """``_LEGACY_IN_TREE_MARKER`` 过滤保留:修复前的构建写在树里的 marker、
+    以及沙箱自己写出的同名文件,都不该在工作区浏览里冒充平台产物。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    (user_root / ".ew-workspace-deleted").write_text("")
+    (user_root / "out.txt").write_text("x")
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert [f.path for f in files] == ["out.txt"]
+
+
+# ------------------------------------------- 全分支终审 C-2 / M-1:路径归一化单一来源
+#
+# 守卫比原始字符串、定位走 ``PurePosixPath(...).parts``(会归一化掉 ``./``)——
+# 两者对同一输入答案不同,``./`` 前缀因此绕过守卫。修法是让守卫与定位读同一份
+# 归一化结果。
+
+
+async def test_delete_file_rejects_a_dot_slash_prefixed_reserved_path(tmp_path: Path) -> None:
+    """``./uploads/a.txt`` 与 ``uploads/a.txt`` 指同一个文件,守卫必须给同一
+    个答案 —— 终审实测复现:前者被放行,文件真被删掉。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="uploads/a.txt", data=b"in")
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="./uploads/a.txt")
+
+    assert (tmp_path / str(tenant_id) / str(user_id) / "uploads" / "a.txt").is_file()
+
+
+@pytest.mark.parametrize("path", [".", "./", " . ", ".//"])
+async def test_dot_paths_raise_the_store_error_not_a_bare_indexerror(
+    tmp_path: Path, path: str
+) -> None:
+    """``PurePosixPath(".").parts == ()`` → 旧实现 ``parts[-1]`` 抛裸
+    ``IndexError`` 越过 store 边界,``/v1/workspace/file`` 只 catch
+    ``SandboxSupervisorError`` → 500(supervisor 同输入是 404)。违反模块
+    docstring 自己写的"错误类型统一"parity。"""
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
 
     with pytest.raises(SandboxSupervisorError):
-        await store.write_file(
-            tenant_id=tenant_id, user_id=user_id, path=DELETED_MARKER, data=b"forged"
-        )
+        await store.read_file(tenant_id=tenant_id, user_id=user_id, path=path)
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path=path, data=b"x")
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=path)
 
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    assert not (user_root / DELETED_MARKER).exists()
+
+async def test_dot_segments_resolve_to_the_same_file_as_the_plain_path(tmp_path: Path) -> None:
+    """归一化是单一来源的另一面:``x/./y`` / ``.//x`` 定位到与 ``x/y`` / ``x``
+    同一个文件,不产生名字里带 ``.`` 的第二份。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="x/./y", data=b"v")
+
+    assert await store.read_file(tenant_id=tenant_id, user_id=user_id, path="x/y") == b"v"
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    assert files == [WorkspaceFileEntry(path="x/y", size=1)]
+
+
+async def test_user_root_mkdir_failure_stays_inside_the_store_error_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M-2 —— ``_open_parent_dir_fd`` 里 ``user_root.mkdir`` 没包 try,NAS 根
+    忘了 ``chmod 1777`` 时裸 ``PermissionError`` 越过 store 边界 → 上传端点
+    500 且不带任何线索(runbook 自己写着"发布后第一次上传文档报 500 先查这
+    个")。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    real_mkdir = Path.mkdir
+
+    def _refuse(self: Path, *args: Any, **kwargs: Any) -> None:
+        if str(self).startswith(str(tmp_path / str(tenant_id))):
+            raise PermissionError(13, "Permission denied")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _refuse)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
 
 
 # ---------------------------------------------------------------- Important 修复回归(第二轮):
@@ -406,6 +518,83 @@ async def test_delete_file_dir_fd_pinning_survives_intermediate_rename_race(
     assert outside_victim.read_text() == "do not delete me"
 
 
+# --------------------- 全分支终审 M-5:两种此前只有探针验过、没进正式套件的 race 形态
+#
+# 台账 Task 3 「minor (deferred)」原文:"两种 TOCTOU 形态只有探针验证未进正式
+# 测试套件"。探针是一次性脚本,跑完就没了——形态本身进套件才拦得住回归。
+
+
+async def test_openat_dir_create_then_reopen_gap_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """形态一:``_openat_dir`` 的 create 分支是 ``mkdir`` + 重新 ``open`` 两
+    个 syscall,中间有一条真实的窗口。并发写手在这条缝里把刚建出来的目录换
+    成指向子树外的符号链接——重新 open 带着 ``O_NOFOLLOW``,必须 fail-closed
+    (``ELOOP`` → ``SandboxSupervisorError``),而不是跟过去把载荷写到外面。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    store = _store(tmp_path)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+
+    real_mkdir = os.mkdir
+    triggered = False
+
+    def _racing_mkdir(path: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal triggered
+        real_mkdir(path, *args, **kwargs)
+        if not triggered and os.fspath(path) == "sub":
+            triggered = True
+            # mkdir 已经成功、重新 open 还没发生 —— 正是那条缝。
+            (user_root / "sub").rmdir()
+            (user_root / "sub").symlink_to(outside)
+
+    monkeypatch.setattr(os, "mkdir", _racing_mkdir)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(
+            tenant_id=tenant_id, user_id=user_id, path="sub/out.txt", data=b"pwned"
+        )
+
+    assert not (outside / "out.txt").exists()
+
+
+async def test_dir_fd_pinning_holds_at_a_deep_intermediate_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """形态二:换的不是第一段中间目录,而是链条**深处**的一段(``a/b/c``
+    里的 ``c``)。逐段 openat 对每一段都同样钉死 inode,深度不该改变结论
+    ——上一轮"再 resolve 一次"的修法恰恰在这里失效过。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    deep = user_root / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    store = _store(tmp_path)
+
+    real_open = os.open
+    triggered = False
+
+    def _racing_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal triggered
+        if not triggered and os.path.basename(os.fspath(path)) == "out.txt":
+            triggered = True
+            _swap_dir_for_symlink(deep, outside)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _racing_open)
+
+    try:
+        await store.write_file(
+            tenant_id=tenant_id, user_id=user_id, path="a/b/c/out.txt", data=b"pwned"
+        )
+    except SandboxSupervisorError:
+        pass
+
+    assert not (outside / "out.txt").exists()
+
+
 # ---------------------------------------------------------------- 读写 cap
 
 
@@ -445,18 +634,21 @@ async def test_mark_deleted_is_idempotent_and_writes_the_marker(tmp_path: Path) 
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)  # 幂等,不抛
 
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    assert (user_root / DELETED_MARKER).is_file()
+    assert workspace_deleted_marker(str(tmp_path), tenant_id, user_id).is_file()
 
 
-async def test_mark_deleted_creates_the_user_dir_when_missing(tmp_path: Path) -> None:
+async def test_mark_deleted_creates_the_marker_dir_when_missing(tmp_path: Path) -> None:
+    """``{root}/{tenant}/.deleted/`` 不存在时由 ``mark_deleted`` 自己带出来
+    (control-plane 以非 root 的 uid 10002 跑,权限模型照
+    ``_ensure_workspace_dir`` 的先例:chmod,不 chown)。"""
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
 
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
 
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    assert user_root.is_dir()
+    marker_dir = tmp_path / str(tenant_id) / DELETED_DIR
+    assert marker_dir.is_dir()
+    assert marker_dir.stat().st_mode & 0o777 == 0o777
 
 
 # ---------------------------------------------------------------- mark_deleted 热会话拆除(Task 4)
@@ -487,7 +679,7 @@ async def test_mark_deleted_destroys_warm_session(tmp_path: Path) -> None:
 
     assert runtime.destroyed == [(sandbox_id, "workspace_deleted")]
     # marker 仍然照常落盘 —— 热会话拆除是在它之上的追加动作,不是替代。
-    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
+    assert workspace_deleted_marker(str(tmp_path), tenant_id, user_id).is_file()
 
 
 async def test_mark_deleted_skips_teardown_when_no_warm_session(tmp_path: Path) -> None:
@@ -501,7 +693,7 @@ async def test_mark_deleted_skips_teardown_when_no_warm_session(tmp_path: Path) 
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
 
     assert runtime.destroyed == []
-    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
+    assert workspace_deleted_marker(str(tmp_path), tenant_id, user_id).is_file()
 
 
 async def test_mark_deleted_skips_teardown_without_both_wired(tmp_path: Path) -> None:
@@ -515,7 +707,7 @@ async def test_mark_deleted_skips_teardown_without_both_wired(tmp_path: Path) ->
 
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)  # 不抛
 
-    assert (tmp_path / str(tenant_id) / str(user_id) / DELETED_MARKER).is_file()
+    assert workspace_deleted_marker(str(tmp_path), tenant_id, user_id).is_file()
 
 
 # ---------------------------------------------------------------- 目录不存在

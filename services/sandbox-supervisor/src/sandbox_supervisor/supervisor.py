@@ -114,16 +114,38 @@ _MAX_WORKSPACE_LIST_ENTRIES = 2000
 
 
 def _validate_workspace_path(path: str) -> str:
-    """Reject a non-relative or ``..``-bearing workspace path (J.9).
+    """Reject a non-relative or ``..``-bearing workspace path, and return it canonicalised (J.9).
 
     ``save_artifact`` already validates this, but the path round-trips
     through the control-plane untrusted — re-check at this boundary.
+
+    Returns ``"/".join(PurePosixPath(...).parts)`` rather than the raw
+    stripped text (sandbox migration wave 2 final review, Critical 2). The
+    caller that matters is :meth:`SandboxSupervisor.delete_workspace_file`,
+    which feeds this result to ``is_reserved_workspace_path`` — a guard
+    that compares the *first path segment*. Returning an un-normalised
+    string made ``"./uploads/a.txt"`` present a first segment of ``"."``,
+    so the reserved-prefix check passed while the write actually landed on
+    ``uploads/a.txt``: the same input was two different files depending on
+    who was looking. ``NasWorkspaceStore._normalize_workspace_path`` is the
+    other half of this fix; the two backends must answer identically at the
+    ``WorkspaceStore`` boundary (``test_workspace_store_contract.py``), and
+    a security guard is the last place a backend fork is acceptable.
+
+    Empty ``parts`` (``"."``, ``"./"``) now raises instead of returning
+    ``"."``. Observably that is the same 404 the old behaviour produced one
+    layer down (there is no file named ``.``), just decided here rather
+    than by a failed volume read.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+    if not cleaned or cleaned.startswith("/"):
         msg = f"workspace path must be relative and free of '..': {path!r}"
         raise WorkspaceFileNotFoundError(msg)
-    return cleaned
+    parts = PurePosixPath(cleaned).parts
+    if not parts or ".." in parts:
+        msg = f"workspace path must be relative and free of '..': {path!r}"
+        raise WorkspaceFileNotFoundError(msg)
+    return "/".join(parts)
 
 
 class SandboxSupervisor:
