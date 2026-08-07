@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -63,11 +64,17 @@ import httpx
 
 #: Mirrors orchestrator.tools.skill_seed.sanitize_agent_key — duplicated
 #: rather than imported (see module docstring: this script only talks HTTP).
+#: Must stay byte-identical, INCLUDING the digest suffix (sanitization alone
+#: isn't collision-free — see that function's docstring) — this script
+#: computes the same real seed path the sandbox actually used.
 _AGENT_KEY_DISALLOWED = re.compile(r"[^a-zA-Z0-9._-]")
+_AGENT_KEY_PREFIX_MAX_LEN = 96
 
 
 def _sanitize_agent_key(name: str) -> str:
-    return _AGENT_KEY_DISALLOWED.sub("-", name) or "agent"
+    sanitized = _AGENT_KEY_DISALLOWED.sub("-", name)[:_AGENT_KEY_PREFIX_MAX_LEN] or "agent"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
 
 
 def _require_env(name: str) -> str:

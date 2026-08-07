@@ -212,17 +212,62 @@ def test_seed_drop_audit_entries_map_to_actions() -> None:
     assert set(entries[1].details) == {"skill", "path", "stage"}
 
 
+def _expected_agent_key(name: str) -> str:
+    """Reference implementation mirrored from sanitize_agent_key's docstring
+    — used to assert the exact `<cleaned-prefix>-<8-hex-digest>` shape
+    without hardcoding digest literals (which would just be re-testing
+    hashlib, not the function)."""
+    import hashlib
+    import re
+
+    sanitized = re.sub(r"[^a-zA-Z0-9._-]", "-", name)[:96] or "agent"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
+
+
 def test_sanitize_agent_key() -> None:
-    # Already-clean manifest names pass through unchanged.
-    assert sanitize_agent_key("pptx-skill-test") == "pptx-skill-test"
-    assert sanitize_agent_key("my_agent.v2") == "my_agent.v2"
-    # Disallowed characters (spaces, slashes, unicode) collapse to '-'.
-    assert sanitize_agent_key("my agent") == "my-agent"
-    assert sanitize_agent_key("a/b/c") == "a-b-c"
-    assert sanitize_agent_key("客服助手") == "-" * len("客服助手")
-    # Slashes collapse to '-' too (they're disallowed, not path separators
-    # here — the whole sanitized name becomes ONE directory segment).
-    assert sanitize_agent_key("///") == "---"
-    # Only a genuinely empty name falls back — an empty string would collapse
-    # the anchor to "/<name>/SKILL.md", silently de-namespacing the seed tree.
-    assert sanitize_agent_key("") == "agent"
+    # Structure: cleaned-prefix + "-" + an 8-hex digest of the ORIGINAL name.
+    assert sanitize_agent_key("pptx-skill-test") == _expected_agent_key("pptx-skill-test")
+    assert sanitize_agent_key("my_agent.v2") == _expected_agent_key("my_agent.v2")
+    # Even an already-clean name is no longer returned unchanged — the digest
+    # suffix is unconditional (see test_sanitize_agent_key_resolves_prefix_collisions
+    # for why: "clean passthrough" is exactly what makes prefix collisions
+    # possible).
+    assert sanitize_agent_key("pptx-skill-test") != "pptx-skill-test"
+    # Disallowed characters (spaces, slashes, unicode) collapse to '-' in the
+    # prefix, same as before.
+    assert sanitize_agent_key("my agent").startswith("my-agent-")
+    assert sanitize_agent_key("a/b/c").startswith("a-b-c-")
+    assert sanitize_agent_key("客服助手").startswith("-----")
+    # Only a genuinely empty name falls back to the "agent" prefix — an empty
+    # string would otherwise collapse the anchor to "/<name>/SKILL.md",
+    # silently de-namespacing the seed tree.
+    assert sanitize_agent_key("") == _expected_agent_key("")
+    assert sanitize_agent_key("").startswith("agent-")
+
+
+def test_sanitize_agent_key_resolves_prefix_collisions() -> None:
+    """Code review (Important) — character-cleaning alone is NOT injective:
+    ``AgentMetadata.name`` has no character-set constraint beyond length
+    (``agent_spec.py``), and the DB uniqueness constraint is on the raw text
+    ``(tenant_id, name, version)``, so two distinct, equally valid agent
+    names can clean to the identical prefix. Without a digest of the
+    ORIGINAL name, they'd land in the same sandbox namespace — silently
+    defeating spec 决策 4/10's isolation guarantee (pip installs from one
+    agent clobbering the other's, skill files becoming cross-visible)."""
+    # Both clean to "a-b".
+    assert sanitize_agent_key("a/b") != sanitize_agent_key("a-b")
+    # Both clean to "team-checkout".
+    assert sanitize_agent_key("team/checkout") != sanitize_agent_key("team-checkout")
+    # Both clean to the same all-dash run (every character disallowed either
+    # way) — the equivalent-form case from the review.
+    assert sanitize_agent_key("团队/结账") != sanitize_agent_key("团队-结账")
+
+
+def test_sanitize_agent_key_is_length_bounded() -> None:
+    # AgentMetadata.name allows up to 128 chars (agent_spec.py); the combined
+    # <prefix>-<digest> key must stay well inside any filesystem's
+    # path-segment limit even at that maximum.
+    longest_legal_name = "a" * 128
+    key = sanitize_agent_key(longest_legal_name)
+    assert len(key) <= 96 + len("-") + 8

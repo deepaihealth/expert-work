@@ -26,6 +26,7 @@ into the system prompt) so a skill's relative refs resolve on disk.
 from __future__ import annotations
 
 import binascii
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -148,19 +149,43 @@ _MAX_SEED_FILES = 16384
 #: :data:`~expert_work.persistence.SANDBOX_SKILLS_ROOT` — anything outside
 #: this set collapses to ``-``.
 _AGENT_KEY_DISALLOWED = re.compile(r"[^a-zA-Z0-9._-]")
+#: Cap on the sanitized *prefix* (before the digest suffix). ``AgentMetadata.name``
+#: allows up to 128 chars (``agent_spec.py``); ``<prefix>-<8-hex>`` at this cap
+#: is at most 96 + 1 + 8 = 105 bytes — comfortably inside any filesystem's
+#: path-segment limit (e.g. ext4/NAS's 255 bytes) with room to spare.
+_AGENT_KEY_PREFIX_MAX_LEN = 96
 
 
 def sanitize_agent_key(name: str) -> str:
-    """Turn an agent's manifest name into a safe sandbox directory segment.
+    """Turn an agent's manifest name into a safe, collision-resistant sandbox
+    directory segment.
 
     Used as the per-agent namespace prefix for both the skill-seed anchor
     (below) and ``PYTHONUSERBASE`` (spec 决策 10,
     ``orchestrator.tools.sandbox.agent_key_envs``) — the same key must reach
     both so a skill's declared path and its own ``pip install --user`` target
-    agree on which agent they belong to. An all-disallowed (or empty) name
-    falls back to ``"agent"`` rather than producing an empty path segment.
+    agree on which agent they belong to.
+
+    Character-cleaning alone is NOT injective: ``AgentMetadata.name`` only
+    constrains length (``min_length=1, max_length=128``, ``agent_spec.py``),
+    not a character set, and the DB uniqueness constraint is on the raw text
+    ``(tenant_id, name, version)`` — so two distinct, equally valid agent
+    names can clean to the identical prefix (e.g. ``"a/b"`` and ``"a-b"``
+    both collapse to ``"a-b"``). A collision here would silently defeat the
+    whole point of the namespace: two agents' skill files would land in the
+    same seed subtree (cross-visible) and share the same ``PYTHONUSERBASE``
+    (pip installs clobbering each other) — exactly what spec 决策 4/10 rely
+    on per-agent namespacing to prevent. A short digest of the ORIGINAL
+    (pre-clean) name is therefore appended so the combined key stays unique
+    across distinct inputs even when their cleaned prefixes collide; hashing
+    the *cleaned* prefix instead would reproduce the same collision this
+    exists to avoid. The prefix is capped (see
+    :data:`_AGENT_KEY_PREFIX_MAX_LEN`) purely for path-length hygiene —
+    uniqueness comes entirely from the digest, not the prefix.
     """
-    return _AGENT_KEY_DISALLOWED.sub("-", name) or "agent"
+    sanitized = _AGENT_KEY_DISALLOWED.sub("-", name)[:_AGENT_KEY_PREFIX_MAX_LEN] or "agent"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
 
 
 async def build_skill_seed_files(
