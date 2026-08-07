@@ -323,15 +323,27 @@ metadata = {
 }
 ```
 
-  `_create` 签名加 `user_id: UUID | None`(acquire 传入;`create_ephemeral` 路径传 None → 不挂,与 supervisor "临时沙箱 tmpfs /workspace" 对齐)。
+  `_create` 签名加 `user_id: UUID | None`(acquire 传入)。
+
+  **临时沙箱(`user_id is None`)也必须挂**(spec 决策 9):镜像不再预建 `/workspace`(Task 9),不挂就没这个目录、cwd 与文件工具全踩空;`commands.run(user="root")` 被平台拒,沙箱内无 root 兜底。subPath 走 scratch:
+
+```python
+subpath = (
+    f"{prefix}/{tenant_id}/{user_id}" if user_id is not None
+    else f"{prefix}/_scratch/{sandbox_id}"
+)   # prefix 为空时不留前导 "/"
+```
+
+  `_scratch/` 目录随沙箱销毁留空目录在 NAS 上,清理并入波 3 扫描 job(spec 决策 9 已记);`_scratch` 不是 `WORKSPACE_RESERVED_PREFIXES` 的成员也不需要是——它在 `{root}` 下与租户目录平级,不在任何用户子树内。
 - acquire 软删闸(`claim_warm` 之前):`workspace_root` 配了且 `{root}/{tenant}/{user}/.ew-workspace-deleted` 存在 → 抛 `SandboxSupervisorError("workspace deleted for user ...")`(supervisor 对软删工作区同样在 acquire 拒,HTTP 客户端同样包成 `SandboxSupervisorError`——工具层可观察契约一致)
-- acquire 前 mkdir(探针说"不自动建"才保留):`workspace_root` 配了 → `Path(root, str(tenant), str(user)).mkdir(parents=True, exist_ok=True)`(`asyncio.to_thread`)
+- acquire 前 mkdir + **chown**:`workspace_root` 配了 → `Path(root, str(tenant), str(user)).mkdir(parents=True, exist_ok=True)` 后 `os.chown(d, 10000, 10000)`(`asyncio.to_thread`)。chown 是硬要求:NAS 新建目录属主 root,沙箱内命令以 uid 10000 的 agent 执行,不 chown 一律 `Permission denied`(集群实测)。uid/gid 取镜像里的 agent 用户,做成模块常量 `SANDBOX_UID = SANDBOX_GID = 10000`,不散落字面量。chown 失败(NAS 权限异常)按 `SandboxSupervisorError` 抛,不静默
 - `NasWorkspaceStore.mark_deleted` 补:`runtime` 非 None 时,`store.get_warm` 查热会话 → `runtime.destroy(sandbox_id=..., reason="workspace_deleted")`(destroy 已有标记行 + kill 语义);查/杀失败不吞——marker 先落盘,拆除失败抛错让 purge 记 failure(marker 已挡住后续 acquire,最终一致)
 - 接线顺序(app.py):先 `build_sandbox_runtime` 再 `build_workspace_store(settings, runtime=..., instance_store=...)`
 
 - [ ] **Step 1: 写失败测试**
   - `test_create_injects_csi_volume_config`:FakeSDK 捕 `create(metadata=...)`,断言 JSON 三键与 subPath 拼接(含 prefix 空/非空两例)
-  - `test_ephemeral_create_has_no_volume_config`(user_id=None)
+  - `test_ephemeral_create_mounts_scratch_subpath`(user_id=None → subPath 为 `_scratch/<sandbox_id>`,仍带 volume-config)
+  - `test_acquire_chowns_user_workspace_to_sandbox_uid`(tmp_path;chown 到非自身 uid 在普通用户下会 EPERM —— monkeypatch `os.chown` 记录调用参数即可,断言 `(10000, 10000)`)
   - `test_acquire_refuses_deleted_workspace`(tmp_path 造 marker → acquire 抛)
   - `test_acquire_mkdirs_user_workspace`(探针若判自动建则删本条与实现)
   - `test_get_warm_*`:InMemory + SQL(SQL 侧进现有 store 集成测试文件,`DOCKER_HOST` 真容器跑——**SQL 变异复验 file-scope**)
@@ -374,8 +386,22 @@ async def build_skill_seed_files(
 - `agent_factory` 调用点:`agent_key=sanitize_agent_key(spec.metadata.name)`;注释同步(materialized under `/opt/skills/<agent_key>/<name>/`)
 - 系统提示词:凡向 agent 陈述技能文件位置处,插值具体路径 `/opt/skills/{agent_key}/<skill>/`(grep `workspace/skills` 定位全部陈述点,一处不留)
 - **不做清理**(spec 决策 4):并发安全靠命名空间;重复 seed 幂等
+- **`PYTHONUSERBASE` per-agent**(spec 决策 10):同用户双 agent 共享沙箱 ⇒ 共享 `$HOME/.local`,pip 装包互相覆盖 + 并发损坏。`agent_key` 已在构建期算出,顺手绑到沙箱工具上,exec 时随 env 注入:
 
-- [ ] **Step 1: 写失败测试**:`test_seed_paths_are_agent_namespaced`(relpath 前缀 = sanitized key)、`test_sanitize_agent_key`(空名/中文/斜杠)、`test_agent_sandbox` 591 行断言改 `("/opt/skills/<key>/…", …)`
+```python
+# layout.py —— 与 SANDBOX_SKILLS_ROOT 同源
+SANDBOX_AGENTS_ROOT = "/opt/agents"    # PYTHONUSERBASE 的 per-agent 根
+
+# SandboxTools(tools/sandbox.py,与 skill_seed_files 同一处 dataclass 字段)
+agent_key: str = ""
+
+# exec 路径注入(两后端同款):
+envs = {"PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/{agent_key}"} if agent_key else {}
+```
+
+  云侧走 `commands.run(envs=...)`;本地 supervisor 侧 exec 请求体带同一组 env(supervisor 已有 env 注入通道 —— 实施时先读 `runner_link.py`/`schemas.py` 确认字段名,没有就按最小改动加一个,两后端注入的 env 必须逐字节相同,契约测试钉住)。目录由 pip 自建,不需要预建/chown(`/opt/agents` 在 Task 9 镜像里预建并 chown agent)
+
+- [ ] **Step 1: 写失败测试**:`test_seed_paths_are_agent_namespaced`(relpath 前缀 = sanitized key)、`test_sanitize_agent_key`(空名/中文/斜杠)、`test_agent_sandbox` 591 行断言改 `("/opt/skills/<key>/…", …)`、`test_exec_injects_per_agent_pythonuserbase`(两后端各一条,断言 env 值 = `/opt/agents/<key>`)
 - [ ] **Step 2: FAIL** → **Step 3: 实现(layout 常量 + skill_seed + agent_factory + agent_sandbox.py:479 + 文案)** → **Step 4: PASS**
 - [ ] **Step 5: 全库 grep 复核**:`rg -n "workspace/skills" --type py` 只剩历史文档;`DOCKER_HOST= uv run pytest`(orchestrator 全量)
 - [ ] **Step 6: Commit** `feat(skills): 技能 seed 搬 /opt/skills/<agent_key>/——per-agent 命名空间,退出用户工作区`
@@ -391,17 +417,26 @@ async def build_skill_seed_files(
 
 **Interfaces:**
 - Consumes: `SANDBOX_SKILLS_ROOT`(Task 5,经 `expert_work.persistence` 导入——supervisor 已依赖该包)
-- Produces: 沙箱容器多一块挂载 `--tmpfs /opt/skills:rw,size=64m,uid=10000,gid=10000`;seed tar 解到 `-C /opt/skills`
+- Produces: 沙箱容器多三块 tmpfs + 两个 run 参数;seed tar 解到 `-C /opt/skills`
+
+```
+--tmpfs /opt/skills:rw,size=64m,uid=10000,gid=10000
+--tmpfs /opt/agents:rw,size=512m,uid=10000,gid=10000     # PYTHONUSERBASE(pip --user 落点,Task 5)
+--tmpfs /home/agent:rw,size=64m,uid=10000,gid=10000      # HOME(Task 9 从 /workspace 迁出)
+--user 10000:10000                                        # 镜像去掉 USER agent 后,本地这条线继续非 root
+--workdir /workspace                                      # 镜像去掉 WORKDIR 后,本地这条线的 cwd
+```
 
 要点:
-- `docker run` 参数在 `docker_client.py` 各 run 组装处(224/290/347/390/433/473 行族,`--read-only` 邻位)统一加 tmpfs 行——抽一个共享常量列表,别六处手拼
+- 本地 docker 后端与云侧的分工:镜像(Task 9)为满足平台要求改成 root 启动 + 不预建 `/workspace`,**本地这条线靠上面两个 run 参数原样保住"非 root + cwd=/workspace"**,行为零变化。这是 Task 9 的必要配套,两者要一起验
+- `docker run` 参数在 `docker_client.py` 各 run 组装处(224/290/347/390/433/473 行族,`--read-only` 邻位)统一加——抽一个共享常量列表,别六处手拼
 - `seed_workspace` 用 `docker exec <container> tar -xf - -C /opt/skills`(现机制对 tmpfs 已被 ephemeral `/workspace` 证明,零兼容风险)
 - supervisor 的 `_validate_workspace_path`(相对、无 `..`)继续复用——relpath 现在带 `<agent_key>/` 前缀,仍是合法相对路径,校验零改
 - 冻结例外仅此两处,别顺手改任何其他行为
 
-- [ ] **Step 1: 写失败测试**(run-args 含 tmpfs;seed 后 `docker exec cat /opt/skills/<key>/a/SKILL.md` 回读——integration 档带 `DOCKER_HOST`)
+- [ ] **Step 1: 写失败测试**(run-args 含三块 tmpfs + `--user` + `--workdir`;seed 后 `docker exec cat /opt/skills/<key>/a/SKILL.md` 回读;`docker exec id` 仍是 uid 10000;`pwd` 仍是 `/workspace`——integration 档带 `DOCKER_HOST`)
 - [ ] **Step 2: FAIL** → **Step 3: 实现** → **Step 4: PASS**(supervisor 全量测试跑一遍,3483 行套件是回归网)
-- [ ] **Step 5: Commit** `feat(supervisor): /opt/skills tmpfs + 技能 seed 落点迁移(波 2 两后端同步)`
+- [ ] **Step 5: Commit** `feat(supervisor): /opt/skills 等三块 tmpfs + 非 root/cwd run 参数 + 技能 seed 落点迁移`
 
 ---
 
@@ -451,6 +486,86 @@ async def build_skill_seed_files(
 ```
 
 - [ ] **Step 4: Commit** `docs: 波 2 发布步骤 + 端到端验收清单`
+
+---
+
+### Task 9: 沙箱镜像改造 —— root 启动 + 让出 /workspace + HOME 迁出
+
+> 2026-08-07 集群实测追加(spec § 二之二)。Task 4 的真集群验证依赖本任务:镜像不改,
+> `csi-volume-config` 在我们的镜像上永远失败。与 Task 5/6 动同一批语义,合并一次 CI 构建。
+
+**Files:**
+- Modify: `infra/sandbox-image/Dockerfile`(ENV 段 ~40-45、user/workspace 段 ~161-180)
+- Modify: `services/orchestrator/src/orchestrator/tools/sandbox_image_contract.py`(`SANDBOX_IMAGE_ENV` 的 `HOME`/`MPLCONFIGDIR`)
+- Test: `services/orchestrator/tests/test_agent_sandbox.py`(既有 `test_image_env_matches_dockerfile` 双向闸 + 新断言)
+
+**Interfaces:**
+- Consumes: `SANDBOX_SKILLS_ROOT` / `SANDBOX_AGENTS_ROOT`(Task 5 的 layout 常量)
+- Produces: 新镜像 tag(CI 构建后的 `<sha8>`),Task 8 发布时换进 `infra/k8s/sandbox/sandboxset.yaml`
+
+**先读**(改 Dockerfile 前必读,否则必踩):`sandbox_image_contract.py` 的 `SANDBOX_IMAGE_ENV` 是"镜像 ENV 的第二副本",由 `test_image_env_matches_dockerfile` **双向解析 Dockerfile 的 ENV/WORKDIR** 钉住 —— 只改 Dockerfile 那道闸立刻红。两处必须同一次改:
+
+```python
+# sandbox_image_contract.py —— 随 Dockerfile 同步
+"HOME": SANDBOX_HOME,                        # 新常量 = "/home/agent",不再是 WORKSPACE_ROOT
+"MPLCONFIGDIR": f"{SANDBOX_HOME}/.mplconfig",
+```
+
+`WORKSPACE_ROOT = "/workspace"` **保留不动**(它仍是挂载点与 cwd);闸对 `WORKDIR` 的解析要跟着改成"Dockerfile 不再声明 WORKDIR,cwd 由 exec 显式传 `WORKSPACE_ROOT`"——W1 的 I-2 已经在 exec 传 cwd,这里只是把闸的期望改对。
+
+顺带一个已实测的旁证(W1 探针,`sandbox_image_contract.py:37-40` 记着):envd 派生进程默认 cwd 与 `HOME` 本来就是 `/home/agent`,W1 当时显式覆盖回 `/workspace`;本任务是把这个覆盖撤掉,方向与平台默认一致。
+
+**改动清单**(每条都对应 spec § 二之二 的实测依据):
+
+1. 删末尾 `USER agent` —— 容器 root 启动。`agent` 用户(uid 10000)与 `useradd -m` 建的 `/home/agent` **保留**,执行仍降权(云侧 `commands.run(user="agent")` 已在传;本地侧 Task 6 的 `--user 10000:10000`)
+2. 删 `RUN mkdir -p /workspace/.mplconfig && chown -R agent:agent /workspace` 与 `WORKDIR /workspace` —— **两条都会创建目录**,平台要在这个路径建 symlink,位置必须空着
+3. `ENV HOME=/workspace` → `HOME=/home/agent`;`MPLCONFIGDIR=/workspace/.mplconfig` → `/home/agent/.mplconfig`(`/home/agent` 属主已是 agent,不用额外 chown)
+4. 新增 `RUN mkdir -p /opt/skills /opt/agents && chown agent:agent /opt/skills /opt/agents` —— 技能投递与 `PYTHONUSERBASE` 都以 agent 身份写,`/opt` 是 root 的,不预建写不进去
+5. Dockerfile 头注释补一段:为什么容器 root 启动(envd 需 fork/exec 存储 helper;隔离边界是 microVM;本地侧靠 run 参数保非 root),为什么 `/workspace` 必须空缺(平台建 symlink)
+
+**顺序**:本任务的 commit 进 main 后 CI 自动构建约 30 分钟(`.github/workflows/sandbox-image.yml`,paths 含 `infra/sandbox-image/**`)。Task 8 发布时按 `docs/runbooks/sandbox-image-release.md` 换 SandboxSet tag —— **永不复用已存在的 tag**。
+
+- [ ] **Step 1: 写失败测试**(加进 `test_agent_sandbox.py`,与既有 `test_image_env_matches_dockerfile` 相邻;Dockerfile 路径变量照抄那条测试的现成写法)
+
+```python
+def test_image_starts_as_root_and_leaves_workspace_free() -> None:
+    """平台在 mountPath 建 symlink,且 envd 要 fork/exec 存储 helper —— 见 spec § 二之二。"""
+    text = _dockerfile_text()
+    assert "\nUSER agent" not in text          # 容器必须 root 启动(agent 用户仍在,执行时降权)
+    assert "WORKDIR /workspace" not in text    # WORKDIR 指令本身会创建目录
+    assert "mkdir -p /workspace" not in text
+    assert "HOME=/home/agent" in text
+    assert "mkdir -p /opt/skills /opt/agents" in text
+```
+
+- [ ] **Step 2: 跑测试确认 FAIL**
+
+Run: `DOCKER_HOST= uv run pytest services/orchestrator/tests/test_agent_sandbox.py -k "image" -v`
+Expected: 新测试 FAIL(现镜像仍是 `USER agent` + `WORKDIR /workspace`);`test_image_env_matches_dockerfile` 此刻仍绿,改完 Dockerfile 会转红 —— Step 3 同步改 `SANDBOX_IMAGE_ENV` 才恢复,这正是那道双向闸该有的表现
+
+- [ ] **Step 3: 改 Dockerfile(5 条)+ 同步 `SANDBOX_IMAGE_ENV` 与双向闸的 WORKDIR 期望**
+
+- [ ] **Step 4: 跑测试 PASS + 本地真构建冒烟**
+
+```bash
+DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock \
+  docker build -f infra/sandbox-image/Dockerfile -t expert-work-sandbox:w2 infra/sandbox-image
+# 冒烟:root 启动、/workspace 不存在、/opt/skills 属主 agent、降权后能写 HOME
+DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock docker run --rm expert-work-sandbox:w2 \
+  bash -c 'id -u; test ! -e /workspace && echo workspace-free; stat -c "%U %U" /opt/skills /opt/agents'
+DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock docker run --rm --user 10000:10000 \
+  --tmpfs /home/agent:rw,uid=10000 expert-work-sandbox:w2 \
+  bash -c 'id -u; python -c "import matplotlib" 2>&1 | tail -1; touch $HOME/x && echo home-writable'
+```
+Expected: `0` / `workspace-free` / `agent agent`;第二条 `10000` + `home-writable`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add infra/sandbox-image/ services/orchestrator/src/orchestrator/tools/sandbox_image_contract.py \
+        services/orchestrator/tests/test_agent_sandbox.py
+git commit -m "feat(sandbox-image): 容器 root 启动 + 让出 /workspace + HOME 迁 /home/agent(ACS 动态挂载前置)"
+```
 
 ---
 

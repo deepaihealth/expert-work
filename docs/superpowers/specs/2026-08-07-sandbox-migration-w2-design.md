@@ -41,6 +41,39 @@
 | 5 | 用户工作区 `/workspace` **保持 per-(tenant,user) 共享,不按 agent 隔离** | 上传件要全 agent 可见(上传流程是 user 维度);跨 agent 接力(A 产出 B 分析)是场景不是事故;工作区浏览/配额/删用户级联全是 user 维度。同名文件 last-writer-wins 与本地后端今日行为一致 |
 | 6 | 系统提示词加中间产物引导:中间文件写 `/tmp`,交付物写 `/workspace` | 降噪不改语义;`/tmp` 沙箱临时盘,重建即清、不占配额 |
 | 7 | ImageCache 并入本波(控制台建缓存 + 实测),不再是外部依赖 | § 一.2,零工单零等待 |
+| 8 | **沙箱镜像改造**:去 `USER agent`(容器 root 启动)、去预建 `/workspace` 与 `WORKDIR`、`HOME` 迁 `/home/agent`、预建 `/opt/skills` | § 二之二,集群实测锁定的两个真因 |
+| 9 | **临时沙箱也挂 NAS**(`_scratch/<sandbox_id>` 子目录),不走"临时沙箱 cwd 改 /tmp" | 镜像不再预建 `/workspace` 后,不挂载的沙箱根本没有该目录;方案 B 会让两类沙箱行为分叉,违反本 spec 的反分叉原则。空目录清理并入波 3 扫描 job |
+| 10 | **`PYTHONUSERBASE` per-agent**(exec 时注入 `/opt/agents/<agent_key>`) | 同用户双 agent 共享沙箱 ⇒ 共享 `$HOME/.local`;pip 装包互相覆盖 + 并发损坏。该变量同时决定 `pip --user` 落点与 import 路径,per-agent 即隔离,零镜像改动 |
+
+## 二之二、集群实测:挂载失败的两个真因(2026-08-07)
+
+工单白名单批复后挂载仍失败,控制器做了对照实验(同集群/同 PV/同注解,只换镜像):
+
+| 配置 | 结果 |
+|---|---|
+| 官方 `code-interpreter` 镜像 | **挂载成功**,0.3s 池领取,读写正常 |
+| 我们镜像(`USER agent`,uid 10000) | `fork/exec /mnt/envd/sandbox-runtime-storage: operation not permitted` |
+| 我们镜像 + pod `runAsUser: 0` | 错误变为 `process error: exit status 1`(helper 已能执行) |
+| 我们镜像 + root + `mountPath=/mnt/ws` | **成功**,写入读回正常 |
+| 我们镜像 + 非 root(uid 10000)+ gid 0 | 仍 EPERM —— gid 0 不够,必须 root |
+
+**真因一:容器必须以 root 启动。** envd 与容器同身份,要 fork/exec 存储 helper(helper 本身是 `rwxr-xr-x`,非文件模式问题)。官方镜像不设 `USER`,容器 root,再由 envd 用 `commands.run(user=...)` 降权执行——正是 W1 已在传 `user="agent"` 的机制。我们把容器身份也锁成非 root,顺带锁死了平台自己的活。安全上不亏:ACS 侧隔离边界是 microVM 而非容器用户;本地 docker 侧容器仍是边界,靠 `docker run --user 10000:10000` 保住非 root。
+
+**真因二:`mountPath` 在镜像里不能预先存在。** 平台是在该路径**建 symlink** 指向 `/run/csi/mount-root/nas/<hash>`,不是往目录上挂。我们镜像预建了 `/workspace`(且 `HOME`/`WORKDIR`/`MPLCONFIGDIR` 都指它)。注意 `WORKDIR` 指令**本身也会创建目录**,只删 `mkdir` 不够。
+
+附带事实:NAS 新建子目录属主 root,非 root 用户写入被拒 → acquire 前 mkdir 要连带 chown(决策见 § 五之二);pod 级 `securityContext` 会波及 sidecar(实测 csi-agent-sidecar CrashLoop),只能用容器级;`commands.run(user="root")` 被平台拒(`InvalidArgumentException`),沙箱内没有 root 兜底路径。
+
+## 二之三、沙箱内最终布局
+
+| 路径 | 存储 | 内容 | 生命周期 |
+|---|---|---|---|
+| `/workspace` | NAS(平台建的 symlink) | 用户数据:`uploads/` + agent 产出 | 永久,跨沙箱重建 |
+| `/opt/skills/<agent_key>/<skill>/` | 沙箱本地盘 | agent 技能文件 | 沙箱重建即清,不占配额 |
+| `/opt/agents/<agent_key>/` | 沙箱本地盘 | `PYTHONUSERBASE` —— pip `--user` 装的包 | 同上 |
+| `/home/agent` | 沙箱本地盘 | matplotlib 配置、各类 cache | 同上 |
+| `/tmp` | 沙箱本地盘 | exec 临时脚本、中间产物 | 同上 |
+
+用户 NAS 目录里只有用户自己的数据;技能、pip 包、缓存、中间产物全在本地盘。
 
 ## 三、挂载布局与基建
 
@@ -102,6 +135,18 @@ NAS 001qwl4r8snh205ihrs
 | `/workspace` 共享写 | 同文件 last-writer-wins | 既定语义(决策 5) |
 | 技能 seed | per-agent 子树互不相扰 | 本波修(决策 4) |
 | egress token | per-sandbox 非 per-run,共享无害 | 已对齐(W1 N-3) |
+
+## 五之二、并发反思:同一用户同时用多个 agent
+
+热会话是 per `(tenant, user)` 不含 agent ⇒ 同一用户的两个 agent **共享同一个沙箱**。逐目录核过:
+
+| 面 | 并发行为 | 处置 |
+|---|---|---|
+| 技能 seed | `acquire` 的 seed 循环在复用/新建两分支**之外**(代码核实),后来者连热会话也会投递自己的技能;per-agent 命名空间不互踩 | 无需改动 |
+| `/workspace` | 同名文件 last-writer-wins | 既定语义(决策 5) |
+| exec 临时脚本 | `/tmp/ew-exec-<uuid4>.py` 天然不撞 | 无需改动 |
+| **`$HOME/.local`(pip)** | **两 agent 共享 ⇒ 装包互相覆盖、并发装可能损坏目录** | 决策 10:`PYTHONUSERBASE` per-agent |
+| egress token | per-sandbox 非 per-run | W1 已对齐 |
 
 ## 五、NasWorkspaceStore
 
