@@ -263,3 +263,107 @@ securityContext + 新镜像一起重建,这一步是原子的。
 □ 前端删除一个 agent 写的文件 → 成功(目录 group 有 w)
 □ 软删闸仍然生效(.deleted 没被这次改动波及)
 ```
+
+---
+
+## 六、方向变更(2026-08-08):共享 gid → 统一 uid
+
+**上面第三节的 gid 共享方案作废。** 实施到第 3 个 task、Task 3 修到第三轮的时候,
+用户提了一个问题:「直接给 root 权限行不行」。答案是不行(见下),但顺着这个问题
+重新核对之后发现,我在 § 四「不做什么」里否决「不改 control-plane 镜像的 uid」时,
+**给的理由是错的**,而那条恰恰是最简单的解法。
+
+### 两种「给 root」为什么都不选
+
+**沙箱以 root 跑** —— 不解决问题,反而更糟。agent 写的文件属主变成 uid 0,
+control-plane(10002)依然不是属主;NFS 一旦开 `root_squash`,root 还会被映射成
+`nobody`,连原先能走的路都断了。
+
+**control-plane 以 root 跑** —— 技术上**可行**:波 2 的
+`_chmod_workspace_mount` 以 `user="root"` 跑 `chmod` 在真集群上成功过,
+这说明本 NAS 的 `root_squash` 是关的,root 读得动任何文件,整套权限代码都能删。
+不选的理由不是做不到,是不划算:control-plane 是直接对公网的 HTTP 服务,
+带文件上传、路径参数、下载端点——一次路径穿越或 RCE 就直接是 root。
+为省一套权限配置把最不该给 root 的进程给成 root,这笔账不划算。
+
+### 选定:两侧统一 uid 10000
+
+不给 root,把 control-plane 镜像的 uid 从 10002 改成 10000,与沙箱镜像的
+`agent` 用户一致。两个进程在文件系统看来是同一个人,跨 uid 这件事从根上不存在
+——不需要共享组、不需要 setgid、不需要任何 `chown`、不需要装配期闸、不需要
+分级日志。
+
+**§ 四否决它时给的理由(「要重建镜像、迁移容器内 `/app` 的属主」)经不起核对**:
+
+```
+services/control-plane/Dockerfile:55  RUN useradd --uid 10002 ... expert_work   ← 全仓仅此一处
+services/control-plane/Dockerfile:57  COPY --chown=expert_work:expert_work ...  ← 用户名,不是数字
+```
+
+所有 `COPY --chown` 用的都是**用户名**,改 uid 后自动跟着;容器里唯一可写的挂载
+是 `/mnt/workspaces`(`/app` 只读、`secret-store` 声明了 `readOnly: true`);
+全仓没有任何代码或 manifest 拿 `10002` 做逻辑判断,只有注释提到它。改动面是**一行**。
+
+我当时没核对就把它写进了「不做什么」,代价是三个 task 的返工。记在这里,
+不是自责,是给下一个读者一个提醒:**「不做什么」那一节里的每条理由,
+和正文里的技术判断同等承重,必须同样核对过再写。**
+
+### 新的权限模型
+
+两侧同 uid 之后,权限可以比 gid 方案**更紧**——不再需要给任何"另一方"开口子:
+
+| 对象 | 波 2 现状 | gid 方案(作废) | **统一 uid** |
+|---|---|---|---|
+| `{tenant}/{user}/` 及子目录 | `0777` | `2770` + gid 10000 | **`0700`**,属主 10000 |
+| `_atomic_write` 写的文件 | `0600` | `0640` | **`0600` 不动**——属主就是读方 |
+| control-plane 上传的文档 | `0644` | `0640` | **`0600`** |
+| `{tenant}/.deleted/` | `0700` | `0700`(刻意不共享) | `0700` 不变 |
+| control-plane Deployment | — | `supplementalGroups: [10000]` | **不需要** |
+
+`world-writable` 与 `world-readable` 一起退场,那两条被 dismiss 的 CodeQL high
+同样真消失。BUG-1 的直接症状(`_atomic_write` 落 `0600` 读不了)自动没了——
+读方就是属主。
+
+### 保留与作废
+
+**保留**(与 gid 无关的独立改进,fix loop 里挣出来的,不该跟着方案一起丢):
+
+- `WorkspacePermissionError` 与权限失败的单独归因(§ 三那一节整段仍然成立)。
+- `write_file` 的错误边界必须包住 `with os.fdopen(...)` 的 close/flush ——
+  `BufferedWriter` 让小文件的 `ENOSPC` 在 close 才爆,这与 uid 方案无关。
+- `list_files` 的 `os.walk(onerror=...)`:不加它,一棵读不动的子树被静默丢掉。
+- `user_root.is_dir()` 在 Python 3.14 上会吞掉 `OSError` → 改 `os.stat` +
+  `S_ISDIR`(`requires-python = ">=3.12"` 允许 3.14)。
+- 建 tenant 子树的 EACCES 要归到 `WorkspacePermissionError` —— 那是运行手册
+  第一步的失败,也是本次的旗舰诊断。
+
+**作废**:三个 gid/mode 常量与其 re-export、`supplementalGroups`、
+`build_workspace_store` 的装配期闸与 `_process_is_in_shared_gid`、
+`_chgrp_denied_level` 分级日志、`_atomic_write` 的 `chmod 0640`、
+所有 `chown`/`fchown` 与 setgid。
+
+**改造**:`test_workspace_shared_gid.py` 的三方漂移闸改成钉
+**「control-plane 镜像的 uid == 沙箱镜像的 uid」**——两份 Dockerfile 双向比对。
+这个闸在新方案下比旧方案更重要:两个数字一旦分叉,症状就是 BUG-1 原样复发,
+而两份 Dockerfile 分属不同目录、不同发布线,漂移是迟早的。
+
+`_chmod_workspace_mount` 保留但改语义:平台自动创建 subPath 目录时属主是
+`root:root 0755`(集群实测),那种兜底路径下 agent 仍写不进去,所以沙箱侧
+以 `user="root"` 跑的兜底改成 `chown 10000:10000`(而不是 `chmod 0777`)。
+control-plane 正常先建好目录时属主已经是 10000,平台看到已存在就不会重建,
+这条兜底几乎不触发。
+
+### 代价:取证与 uid 分配约定
+
+两条,都接受:
+
+1. **文件属主不再能区分是谁写的。** 现在 NAS 上一眼能看出 `MEMORY.md` 是 agent
+   写的、`uploads/w2doc.md` 是 control-plane 写的;统一之后这个信息没了。
+   审计仍有 `audit_log`,但文件系统层面的这一层旁证消失。
+2. **各服务 uid 分开的现有约定破一个口子**
+   (沙箱 10000 / credential-proxy 10001 / control-plane 10002 /
+   supervisor 10003 —— 明显是有意分配的)。这里让 control-plane 与沙箱重号。
+
+软删 marker **不受影响**:它在 `{tenant}/.deleted/`,而沙箱的 `subPath` 只挂到
+`{tenant}/{user}/`,根本挂不到——靠的是挂载范围的物理隔离,不是 POSIX 位。
+波 2 终审 Critical-1 的结论在新方案下同样成立。
