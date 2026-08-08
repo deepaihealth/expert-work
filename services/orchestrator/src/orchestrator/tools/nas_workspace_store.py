@@ -458,26 +458,36 @@ class NasWorkspaceStore:
                 # 复审 I-1 —— 同类型的路径泄露:之前这里裸拼 ``{user_root}``,
                 # 是服务端 NAS 挂载点的真实文件系统路径。同 list_files 的
                 # user_root 自检分支一样用 ``'.'`` 指代"用户自己的工作区根"。
+                #
+                # 复审 N-2 —— 上一轮只换掉了手拼的 ``{user_root}``,却留着
+                # ``: {exc}``:``mkdir``/``chmod`` 都是普通路径调用(不是
+                # dir_fd-relative),真实失败时 ``OSError`` 会自己带上
+                # ``filename`` 属性,``str(exc)`` 因此原样把绝对路径缝回
+                # 消息里(实测坐实:``PermissionError(13, "...", "/abs/path")``
+                # 的 ``str()`` 是 ``"... : '/abs/path'"``)——换成
+                # ``exc.strerror`` 只留错误原因,不带路径。
                 raise WorkspacePermissionError(
-                    f"failed to create workspace directory {'.'!r}: {exc}"
+                    f"failed to create workspace directory {'.'!r}: {exc.strerror}"
                 ) from exc
             except OSError as exc:
                 raise SandboxSupervisorError(
-                    f"failed to create workspace directory {'.'!r}: {exc}"
+                    f"failed to create workspace directory {'.'!r}: {exc.strerror}"
                 ) from exc
         try:
             dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
         except PermissionError as exc:
-            # 复审 C-1 —— 这句是四个方法(read/write/delete/list_files)共用
-            # 的入口:落在这里之前 create=False 的 read_file/delete_file 从
-            # 不会碰上面的 mkdir 分支,直接从这里第一次触到 user_root。反过
-            # 来说也一样漏:PermissionError 是 OSError 的子类,顺序反了(把
-            # 这条挪到下面那句宽 except 之后)这个分支永远走不到。不接住的
-            # 后果按调用方分叉:read_file/write_file 把它收成
-            # _WorkspacePathNotFoundError(SandboxSupervisorError 的子类)→
-            # 端点翻 404,用户看到"文件不存在"而它其实读不动;delete_file
-            # 更糟——它把 _WorkspacePathNotFoundError 当 rm -f 语义直接吞掉、
-            # 返回成功,用户看到"删除成功"而文件原封不动地留在盘上。
+            # 复审 C-1 —— 这句是 read_file/write_file/delete_file 三个方法共用
+            # 的入口(list_files 走独立的 os.stat/os.walk,从不调用这个方法,
+            # 上一版这里的注释把它也算进去是错的,见复审 N-1):落在这里之
+            # 前 create=False 的 read_file/delete_file 从不会碰上面的 mkdir
+            # 分支,直接从这里第一次触到 user_root。反过来说也一样漏:
+            # PermissionError 是 OSError 的子类,顺序反了(把这条挪到下面那
+            # 句宽 except 之后)这个分支永远走不到。不接住的后果按调用方分
+            # 叉:read_file/write_file 把它收成 _WorkspacePathNotFoundError
+            # (SandboxSupervisorError 的子类)→ 端点翻 404,用户看到"文件不
+            # 存在"而它其实读不动;delete_file 更糟——它把
+            # _WorkspacePathNotFoundError 当 rm -f 语义直接吞掉、返回成功,
+            # 用户看到"删除成功"而文件原封不动地留在盘上。
             raise WorkspacePermissionError(f"workspace not readable: {path!r}") from exc
         except OSError as exc:
             raise _WorkspacePathNotFoundError(f"workspace path not found: {path!r}") from exc
@@ -485,6 +495,19 @@ class NasWorkspaceStore:
         for component in parts[:-1]:
             try:
                 nfd = _openat_dir(dfd, component, create=create)
+            except PermissionError as exc:
+                # 复审 N-1 —— 同上一句(C-1)的坑,只是深了一层:那句只顶住了
+                # user_root **自己**打不开的情形,这个循环里 _openat_dir 抛出
+                # 的 PermissionError(中间路径分量存在但不可穿透——路径深度
+                # ≥ 2 时真实会撞上,比如 ``sub/a.txt`` 里的 ``sub``)之前一样
+                # 被下面那句宽 ``except OSError`` 收成 _WorkspacePathNotFoundError。
+                # 复现过:``delete_file("sub/a.txt")`` 在 ``sub/`` 不可穿透时
+                # 直接返回成功(rm -f 语义把 _WorkspacePathNotFoundError 当
+                # "本来就没有"),文件原封不动地留在盘上,而且这次连
+                # read_file 事后核实都会答"不存在"——两个诊断都指向错误的
+                # 结论。
+                os.close(dfd)
+                raise WorkspacePermissionError(f"workspace not readable: {path!r}") from exc
             except OSError as exc:
                 os.close(dfd)
                 if exc.errno == errno.ELOOP:
@@ -584,7 +607,10 @@ class NasWorkspaceStore:
                 # absolute path — same reason).
                 raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
             except OSError as exc:
-                raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
+                # 复审 N-2 —— 同上一条 except 的路径泄露:``os.stat(user_root)``
+                # 是普通路径调用,失败的 ``OSError`` 会自带绝对 ``filename``,
+                # ``str(exc)`` 原样带着它。``exc.strerror`` 只留错误原因。
+                raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
             if not is_dir:
                 return []
 
@@ -615,7 +641,9 @@ class NasWorkspaceStore:
                     raise WorkspacePermissionError(
                         f"workspace listing not readable: {rel!r}"
                     ) from exc
-                raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
+                # 复审 N-2 —— 同上,``exc`` 是 os.walk 内部 scandir 失败的
+                # OSError,``filename`` 是绝对路径,``str(exc)`` 会带着它。
+                raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
 
             entries: list[WorkspaceFileEntry] = []
             # followlinks=False — see module docstring: never descend into a
@@ -644,8 +672,12 @@ class NasWorkspaceStore:
                             f"workspace listing not readable: {rel!r}"
                         ) from exc
                     except OSError as exc:
+                        # 复审 N-2(同类,这条不在复审原话点名的两处,但
+                        # ``full.lstat()`` 是普通路径调用,同款泄露,顺手在
+                        # 这一遍改掉)—— ``full`` 是绝对路径,``exc`` 会带
+                        # ``filename``,``str(exc)`` 原样带过来。
                         raise SandboxSupervisorError(
-                            f"workspace listing failed: {rel!r}: {exc}"
+                            f"workspace listing failed: {rel!r}: {exc.strerror}"
                         ) from exc
                     entries.append(WorkspaceFileEntry(path=rel, size=size))
             entries.sort(key=lambda entry: entry.path)
@@ -797,19 +829,48 @@ class NasWorkspaceStore:
             # conjures an empty directory for wave 3's sweep to find.
             marker = workspace_deleted_marker(self.root, tenant_id, user_id)
             try:
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                # 0o700 — this directory has exactly one writer (control-plane,
-                # always the same uid across replicas) and no ``subPath`` ever
-                # projects it into a sandbox, so it needs no group/other bits
-                # at all. Keeping it at 0o700 means the authoritative
-                # soft-delete record is protected by *ownership*, not only by
-                # the mount scoping: even a hypothetically mis-scoped mount
-                # handing a sandbox a wider view of the NAS could not forge or
-                # clear a marker.
-                os.chmod(marker.parent, 0o700)
+                # 复审 N-5 —— 第三处 chmod site,之前跟另外两处(_openat_dir /
+                # 用户根创建处)政策不一致:那两处只在"这次调用真正把目录带
+                # 入存在"时才 chmod(``exist_ok=True``/``FileExistsError``
+                # 吞掉的既存目录不归这条写路径管——修存量目录是一次性迁移
+                # Job 的职责,同一句理由这里第三次成立)。这里改成同款
+                # ``created`` 判据,不再无条件 chmod 一个我们可能不是属主
+                # 的既存 ``.deleted/``(uid 迁移落地当天,这棵目录如果是老
+                # control-plane(uid 10002)建的,新进程 chmod 会 EPERM)。
+                try:
+                    marker.parent.mkdir(parents=True)
+                    created = True
+                except FileExistsError:
+                    created = False
+                if created:
+                    # 0o700 — this directory has exactly one writer (control-plane,
+                    # always the same uid across replicas) and no ``subPath`` ever
+                    # projects it into a sandbox, so it needs no group/other bits
+                    # at all. Keeping it at 0o700 means the authoritative
+                    # soft-delete record is protected by *ownership*, not only by
+                    # the mount scoping: even a hypothetically mis-scoped mount
+                    # handing a sandbox a wider view of the NAS could not forge or
+                    # clear a marker.
+                    os.chmod(marker.parent, 0o700)
                 marker.touch()  # existence is all that matters, nothing to write.
+            except PermissionError as exc:
+                # 复审 N-5 —— 这个方法之前完全没有 keep-item 1 那条窄类型归
+                # 因(read/write/delete/list_files 建 tenant 子树那半边都
+                # 有,这里漏了):跳过 chmod 并不能真的解除访问问题——如果
+                # ``.deleted/`` 属主还是旧 uid,``marker.touch()`` 本身也会
+                # 被同一个 EPERM 挡住(mode 0700 对非属主零访问,chmod 与否
+                # 都救不了它),真正能解除的只有迁移 Job 把它 chown 回来。
+                # 这条分支因此不是"容忍"——它跟其它三个方法一样,把这个预
+                # 期中的过渡态翻成窄类型 WorkspacePermissionError,而不是
+                # 一句不带归因的 SandboxSupervisorError。``exc.strerror`` 只
+                # 留错误原因,不带 marker 的绝对路径(同 N-2)。
+                raise WorkspacePermissionError(
+                    f"workspace marker write not permitted: {exc.strerror}"
+                ) from exc
             except OSError as exc:
-                raise SandboxSupervisorError(f"workspace marker write failed: {exc}") from exc
+                raise SandboxSupervisorError(
+                    f"workspace marker write failed: {exc.strerror}"
+                ) from exc
 
         await asyncio.to_thread(_mark)
         logger.info(

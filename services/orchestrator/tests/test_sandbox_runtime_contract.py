@@ -370,18 +370,29 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_exec_created_files_are_not_uid_locked(runtime: SandboxRuntime) -> None:
-    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— agent 代码自己
+async def test_exec_created_files_are_not_masked_by_the_sandbox_default_umask(
+    runtime: SandboxRuntime,
+) -> None:
+    """Task 4 审查 Critical 后续(原为跨 uid 写冲突而加)—— agent 代码自己
     ``mkdir``/``open`` 出的嵌套目录/文件必须是 world-writable(两后端都在
     exec 路径上把 umask 设成 000:supervisor 档 ``runner.py.main()`` 的
     ``os.umask(0)``,agent_sandbox 档 ``commands.run`` 命令串的
-    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成只有
-    沙箱自己的 uid 能删/写的 ``0o755``/``0o644``——那类被掩过的模式在
-    ``read``/``list`` 路径上完全不可见(两者仍然通),只有 control-plane
-    经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除或覆盖该文件时才会撞
-    ``EACCES``,本条用例直接断言权限位而不是依赖第二个 uid 的进程——POSIX
-    权限语义本身就与"谁去读"这个 uid 无关,``0o777``/``0o666`` 早已蕴含了
-    "任何 uid 都能写"这件事。"""
+    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成
+    ``0o755``/``0o644``。
+
+    **这条机制原本的理由已经不成立**(方向变更之后——共享 gid 改统一
+    uid,见 ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-
+    design.md`` § 六):以前 control-plane 与沙箱的 agent 是不同 uid,
+    ``0o755``/``0o644`` 在 ``read``/``list`` 路径上完全不可见(两者仍然
+    通),只有 control-plane 经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除
+    或覆盖该文件时才会撞 ``EACCES``。现在两侧同 uid,属主位本身就够,不再
+    需要靠这条机制兜底跨 uid 访问。测试名和这条用例本身都留着不删——
+    ``0o777``/``0o666`` 是比统一 uid 之后真正需要的 mode 更宽的**安全超
+    集**,不是错,只是不再最小;收紧它是一个需要真栈验证的后续任务(见
+    ``AgentSandboxClient.exec`` 与 ``runner.py`` 的 docstring),这条契约用
+    例本身照旧断言权限位——POSIX 权限语义本身与"谁去读"这个 uid 无关,
+    ``0o777``/``0o666`` 早已蕴含了"任何 uid 都能写"这件事,不需要真的换一
+    个 uid 的进程来验证。"""
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9b")
     try:
         code = (

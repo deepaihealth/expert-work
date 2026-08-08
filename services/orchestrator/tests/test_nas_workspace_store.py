@@ -661,32 +661,45 @@ async def test_user_root_mkdir_permission_failure_is_a_workspace_permission_erro
     场景——runbook 第一步让人查的就是这个(NAS 根没 chmod 1777、建不出第一
     个租户子树)。Task 5 靠窄类型 WorkspacePermissionError 才能把它翻成有归
     因的 500;还是泛化类型的话,这条 runbook 场景反而是唯一没拿到新错误类
-    型的权限失败。"""
+    型的权限失败。
+
+    复审 N-2 —— 假异常之前是 ``PermissionError(13, "Permission denied")``,
+    两个参数,没有 ``filename``;真实的 ``Path.mkdir``/``os.chmod`` 失败会
+    自带第三个 ``filename`` 参数,``str(exc)`` 会把它缝进去(实测坐实)。
+    只有两个参数的假异常测不出"消息里到底有没有绝对路径"这件事——不管产
+    线代码有没有做对,这条断言都会因为假异常本来就没有 filename 而"通
+    过"。换成三个参数、真的带 ``filename`` 的假异常,断言才有咬合点。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     real_mkdir = Path.mkdir
 
     def _refuse(self: Path, *args: Any, **kwargs: Any) -> None:
         if str(self).startswith(str(tmp_path / str(tenant_id))):
-            raise PermissionError(13, "Permission denied")
+            raise PermissionError(13, "Permission denied", str(self))
         real_mkdir(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "mkdir", _refuse)
 
-    with pytest.raises(WorkspacePermissionError):
+    with pytest.raises(WorkspacePermissionError) as excinfo:
         await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+    assert str(tmp_path) not in str(excinfo.value)
 
 
 # ---------------------------------- 复审 C-1:用户根**自己**(不是子目录/子树)不可穿透
 #
-# 这是四个方法(read/write/delete/list_files)在 _open_parent_dir_fd 里共用的入口
-# ——落到这里之前 create=False 的 read_file/delete_file 完全没碰过上面的 mkdir 分
-# 支,是它们第一次、也是唯一一次触到 user_root。之前这句只接 `except OSError`,把
-# PermissionError 也收成 _WorkspacePathNotFoundError:read/write 端点翻 404("文件
-# 不存在",而它其实读不动),delete_file 更糟——它把 _WorkspacePathNotFoundError 当
-# rm -f 语义直接吞掉、返回成功,用户看到"删除成功"而文件原封不动地留在盘上。真实
-# 触发场景:uid 迁移之后,一个迁移 Job 漏掉的用户根(属主还是旧 uid,新 uid 连
-# open(O_DIRECTORY) 都过不去)。
+# 这是 read_file/write_file/delete_file 三个方法在 _open_parent_dir_fd 里共用的入口
+# (list_files 走独立的 os.stat/os.walk,从不调用这个方法——上一版这里写"四个方法"
+# 是错的,list_files 那条测试补在这里纯粹是为了四个方法在这个形状上对称覆盖,不是
+# 因为它真的经过这段代码,见复审 N-4)——落到这里之前 create=False 的
+# read_file/delete_file 完全没碰过上面的 mkdir 分支,是它们第一次、也是唯一一次触
+# 到 user_root。之前这句只接 `except OSError`,把 PermissionError 也收成
+# _WorkspacePathNotFoundError:read/write 端点翻 404("文件不存在",而它其实读不
+# 动),delete_file 更糟——它把 _WorkspacePathNotFoundError 当 rm -f 语义直接吞掉、
+# 返回成功,用户看到"删除成功"而文件原封不动地留在盘上。真实触发场景:uid 迁移之
+# 后,一个迁移 Job 漏掉的用户根(属主还是旧 uid,新 uid 连 open(O_DIRECTORY) 都过
+# 不去)。
 
 
 @pytest.mark.skipif(
@@ -758,9 +771,18 @@ async def test_delete_file_reports_permission_denied_when_user_root_itself_is_un
 async def test_list_files_reports_permission_denied_when_user_root_itself_is_unreadable(
     tmp_path: Path,
 ) -> None:
-    """list_files 走的是独立的 ``os.stat(user_root)`` 分支(不经过
-    ``_open_parent_dir_fd``),补一条同形状的用例只为四个方法对称覆盖——这条在
-    C-1 之前就已经答对了,不是本次修的那条缝。"""
+    """复审 N-4,纠正上一版这里的错误说法—— list_files **不是**靠独立的
+    ``os.stat(user_root)`` 分支答对这条。``os.stat`` 只需要祖先目录的搜索
+    权限,对**目标自己**的权限位从不敏感——``user_root`` 是 ``0o000`` 时
+    ``os.stat(user_root)`` 照样成功(实测坐实),is-dir 检查那半句压根不会
+    抛。真正命中的是 ``os.walk`` 对 ``user_root`` 自己的首次 scandir——这一
+    步才需要目标目录本身的搜索权限,失败会喂给 ``onerror=_on_walk_error``,
+    与 ``test_list_files_reports_permission_denied_for_unreadable_subtree``
+    是**同一个**机制,只是这条在 walk 的第 0 层(根自己)触发,那条在第 1
+    层(``sub`` 子目录)触发。留着两条是为了跟本节其它三个方法
+    (read/write/delete)在"用户根自己不可穿透"这个形状上对称覆盖,不是因
+    为 list_files 这里真的走了一条独立代码路径。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
@@ -771,6 +793,83 @@ async def test_list_files_reports_permission_denied_when_user_root_itself_is_unr
             await store.list_files(tenant_id=tenant_id, user_id=user_id)
     finally:
         os.chmod(user_root, 0o700)
+
+
+# --------------------------------- 复审 N-1:C-1 同一个坑在深一层(中间路径分量)复现
+#
+# _open_parent_dir_fd 顶层的 os.open(user_root, ...) 只是入口;真正走多段路径
+# (parts[:-1] 非空,即 path 至少两段,如 "sub/a.txt")时,中间分量由下面
+# `for component in parts[:-1]` 这个循环里的 _openat_dir 逐段打开——上一轮只修了
+# 入口,这个循环原样留着同一个坑:PermissionError 被下面那句宽 `except OSError`
+# 收成 _WorkspacePathNotFoundError,delete_file 的 rm -f 语义把它当"本来就没有"
+# 直接吞掉、报成功,文件其实原封不动地留在盘上。list_files 不经过这个方法(见上一
+# 节),这里只覆盖 read/write/delete 三个方法。
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_read_file_reports_permission_denied_for_an_unreadable_intermediate_dir(
+    tmp_path: Path,
+) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    sub = tmp_path / str(tenant_id) / str(user_id) / "sub"
+    os.chmod(sub, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.read_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt")
+    finally:
+        os.chmod(sub, 0o700)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_write_file_reports_permission_denied_for_an_unreadable_intermediate_dir(
+    tmp_path: Path,
+) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    sub = tmp_path / str(tenant_id) / str(user_id) / "sub"
+    sub.mkdir(parents=True)
+    os.chmod(sub, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.write_file(
+                tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x"
+            )
+    finally:
+        os.chmod(sub, 0o700)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_delete_file_reports_permission_denied_for_an_unreadable_intermediate_dir(
+    tmp_path: Path,
+) -> None:
+    """旗舰复现(复审 N-1 原话)—— 这条之前会 ``RETURNED SUCCESS``(rm -f 语
+    义把 _WorkspacePathNotFoundError 当"本来就没有"直接吞掉),文件其实原
+    封不动地留在盘上;而且事后用 ``read_file`` 核实也会答"不存在"——两个
+    诊断都指向错误的结论。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    sub = tmp_path / str(tenant_id) / str(user_id) / "sub"
+    os.chmod(sub, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt")
+    finally:
+        os.chmod(sub, 0o700)
+    # 确认真的没删——同用户根那条的最后一道防线。
+    assert (sub / "a.txt").exists()
 
 
 # ---------------------------------------------------------------- Important 修复回归(第二轮):
@@ -1063,6 +1162,60 @@ async def test_mark_deleted_creates_the_marker_dir_when_missing(tmp_path: Path) 
     marker_dir = tmp_path / str(tenant_id) / DELETED_DIR
     assert marker_dir.is_dir()
     assert marker_dir.stat().st_mode & 0o777 == 0o700
+
+
+async def test_mark_deleted_skips_chmod_for_a_pre_existing_marker_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复审 N-5 —— ``.deleted/`` 已经存在(不是这次 ``mark_deleted`` 调用带
+    出来的,比如另一个用户先软删过、或者是 uid 迁移前老 control-plane 建
+    的)时,不该碰它的 mode——同 ``_openat_dir``/用户根创建处的既有政策
+    (只在真正带入存在时才 chmod),用一个"一被调用就断言失败"的假身份钉
+    死"压根不该调它"。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    marker_dir = tmp_path / str(tenant_id) / DELETED_DIR
+    marker_dir.mkdir(parents=True)  # 模拟这棵目录不是这次调用建的
+
+    def _boom_chmod(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("os.chmod must not run for a pre-existing marker dir")
+
+    monkeypatch.setattr(os, "chmod", _boom_chmod)
+    store = _store(tmp_path)
+
+    await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    assert workspace_deleted_marker(str(tmp_path), tenant_id, user_id).is_file()
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_mark_deleted_raises_workspace_permission_error_when_marker_dir_is_foreign(
+    tmp_path: Path,
+) -> None:
+    """复审 N-5 —— ``.deleted/`` 已经存在但当前进程碰不动它(uid 迁移落地
+    当天,这棵目录还是老 control-plane 的 uid 建的,新进程既不能 chmod 它
+    也不能在里面 touch 文件),之前会被一句不带归因的
+    ``SandboxSupervisorError`` 兜底——跟 read/write/delete/list_files 建
+    tenant 子树那半边一样,这个预期中的过渡态现在翻成窄类型
+    ``WorkspacePermissionError``,不再是一句含混的失败;消息也不带这棵目
+    录的绝对路径(同 N-2)。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    marker_dir = tmp_path / str(tenant_id) / DELETED_DIR
+    marker_dir.mkdir(parents=True)
+    os.chmod(marker_dir, 0o000)  # 模拟"不是我们建的,碰不动"
+    store = _store(tmp_path)
+
+    try:
+        with pytest.raises(WorkspacePermissionError) as excinfo:
+            await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
+    finally:
+        os.chmod(marker_dir, 0o700)
+
+    assert str(tmp_path) not in str(excinfo.value)
 
 
 # ---------------------------------------------------------------- mark_deleted 热会话拆除(Task 4)

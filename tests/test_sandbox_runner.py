@@ -171,17 +171,20 @@ def test_main_emits_error_response_for_bad_line() -> None:
     assert "invalid JSON" in response["stderr"]
 
 
-# ---------- umask (Task 4 review Critical follow-up — cross-uid write conflict) ----------
+# ---------- umask (originally for a cross-uid write conflict, Task 4 review) ----------
 
 
 def test_main_sets_permissive_umask_before_serving_requests() -> None:
     """``main()`` must set the process umask to 0 before it ever serves a
     request — every later ``run_once`` child inherits whatever umask is in
-    effect at fork/exec time (see ``main()``'s own docstring for the full
-    cross-uid rationale). ``os.umask`` has no "peek" call; the only
-    portable way to *read* the current value without a side effect is the
-    round-trip idiom used here (set, read back what it returns, restore) —
-    hence saving/restoring the real process umask around the assertion.
+    effect at fork/exec time (see ``main()``'s own docstring: the reason
+    this was originally added no longer holds after the uid-unification
+    direction change, but the mechanism itself is unchanged and still a
+    safe superset — kept as-is pending a live-cluster pass, not removed).
+    ``os.umask`` has no "peek" call; the only portable way to *read* the
+    current value without a side effect is the round-trip idiom used here
+    (set, read back what it returns, restore) — hence saving/restoring the
+    real process umask around the assertion.
     """
     saved = os.umask(0)
     os.umask(saved)
@@ -193,17 +196,23 @@ def test_main_sets_permissive_umask_before_serving_requests() -> None:
 
 
 def test_child_processes_inherit_the_permissive_umask(tmp_path: Path) -> None:
-    """End-to-end proof the fix actually closes the cross-uid gap, not
-    just that ``os.umask(0)`` was called: after ``main()`` runs, code
+    """End-to-end proof the umask override actually reaches child processes,
+    not just that ``os.umask(0)`` was called: after ``main()`` runs, code
     executed via ``run_once`` (a *real* ``subprocess.run`` child, exactly
     the mechanism the submitted code's own ``mkdir``/``open`` calls go
     through) must produce a nested directory and file with **unmasked**
     modes — ``0o777``/``0o666`` — not the ``0o755``/``0o644`` a default
-    umask (commonly ``0o022``) would otherwise leave. Those masked modes
-    are exactly what let this bug hide: ``read``/``list`` still work at
-    ``0o755``, so nothing breaks until a *different* uid (control-plane,
-    reading the same NAS/docker-volume mount) tries to delete or overwrite
-    a file inside a directory the agent created.
+    umask (commonly ``0o022``) would otherwise leave.
+
+    Those masked modes are what originally let the cross-uid gap this
+    mechanism was built for hide: with a *different* uid on each side
+    (control-plane vs. this sandbox's agent, pre-direction-change),
+    ``read``/``list`` still worked at ``0o755``, so nothing broke until
+    control-plane tried to delete or overwrite a file the agent created.
+    After the uid-unification direction change control-plane and this
+    sandbox's agent share one uid, so that specific gap no longer exists —
+    see ``main()``'s docstring for why the mechanism itself stays (a safe,
+    no-longer-minimal superset) rather than being narrowed in this task.
     """
     saved = os.umask(0)
     os.umask(saved)
