@@ -145,8 +145,13 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from expert_work.persistence import is_reserved_workspace_path
-from orchestrator.tools.sandbox import SandboxSupervisorError
+from expert_work.persistence import (
+    WORKSPACE_DIR_MODE,
+    WORKSPACE_FILE_MODE,
+    WORKSPACE_SHARED_GID,
+    is_reserved_workspace_path,
+)
+from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePermissionError
 from orchestrator.tools.workspace_store import WorkspaceFileEntry
 
 if TYPE_CHECKING:
@@ -182,8 +187,16 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 #: ``sandbox_supervisor.supervisor._MAX_WORKSPACE_LIST_ENTRIES``.
 _MAX_LIST_ENTRIES = 2000
 
-#: Mode new leaf files are created with (``write_file`` / ``mark_deleted``).
-_LEAF_FILE_MODE = 0o644
+#: Leaf files (``write_file`` / ``mark_deleted``) are created with
+#: ``expert_work.persistence.WORKSPACE_FILE_MODE`` directly (Task 3, 波 2
+#: BUG-1) — no local re-declaration. There used to be a module-local
+#: ``_LEAF_FILE_MODE = 0o644`` here (``rw-r--r--``, an ``other``-readable
+#: file); that value was never actually reachable by the *other* uid on
+#: purpose — it happened to work only because ``other`` was wide open, the
+#: same accident :data:`WORKSPACE_DIR_MODE` closes for directories. Sharing
+#: the one constant with the directory mode's group-gid story means a leaf
+#: file is readable by design (group bit), not by the ``other`` bit
+#: happening to be lenient.
 
 
 class _WorkspacePathNotFoundError(SandboxSupervisorError):
@@ -210,29 +223,44 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
     ``O_NOFOLLOW`` open — so even a symlink raced in during that narrow
     create-then-reopen gap still fails closed.
 
-    Task 4 review (Critical follow-up, cross-uid write conflict) — a
-    directory this branch brings into existence is ``fchmod``'d to
-    ``0o777`` on the just-opened fd (never a dir_fd-relative
-    ``os.chmod(name, dir_fd=dfd)`` re-walk of the string ``name``, and
-    definitely not a plain path ``chmod`` — that would reintroduce exactly
-    the string-re-walk TOCTOU this whole ``dir_fd`` chain exists to close;
-    ``os.fchmod`` needs no name at all, it acts on the fd we already hold).
+    Task 3 review(gid 共享,波 2 final review BUG-1 的落地)—— 一个这个分支
+    带出来的目录,在刚拿到手的 fd 上先 ``fchown``(只改 group,``fd`` 已经
+    握在手上,不重走字符串路径 —— 从不是 dir_fd-relative 的
+    ``os.chown(name, dir_fd=dfd)``,更不是纯路径 ``chown``,那会重新引入
+    整条 ``dir_fd`` 链存在的意义就是要关掉的字符串重解析 TOCTOU;
+    ``os.fchown``/``os.fchmod`` 都不需要名字,只作用在已经握着的 fd 上),
+    到共享 gid(:data:`WORKSPACE_SHARED_GID`),再 ``fchmod`` 到
+    :data:`WORKSPACE_DIR_MODE`(``0o2770``,前导 ``2`` 是 setgid)。旧版本
+    这里是纯 ``fchmod`` 到 ``0o777``:两侧 uid(control-plane 10002、沙箱
+    agent 10000)都能读写,靠的是把 ``other`` 也开了,不挑 group —— 换成
+    setgid + 共享 gid 之后 ``other`` 归零,"另一侧也能读写"这件事完全靠
+    group 位撑住,所以 gid 必须先对上,``fchmod`` 才有意义,而不是反过来。
+
+    顺序承重:``fchown`` 必须先于 ``fchmod``——非特权进程 ``chown`` 会清
+    set-user/group-id 位(Linux 对目录网开一面,但 NFS 服务端不保证照做),
+    反过来做就可能被 ``fchmod`` 悄悄抹掉自己刚设上的 setgid,集群探针实测
+    走的就是这个顺序。``fchown`` 到目标 gid 只有调用方本身就是那个组的成员
+    才会真的生效(生产靠 Deployment 的 ``supplementalGroups: [10000]``,
+    Task 1 钉的);不是成员时(典型是本机/CI 跑测试的账户)内核报
+    ``PermissionError``,这里接住只记一条日志、不向上抛——目录仍然落到正确
+    的 mode,只是 group 没能变成共享的那个;不这样处理的话,一台没有 gid
+    10000 的机器一跑测试,``write_file`` 但凡带一层子目录就整条写入链路带崩
+    (这条 fchown 不是 belt-and-braces,是这个分支唯一会碰这个目录 gid 的
+    地方)。
+
     ``os.mkdir``'s own ``mode=`` argument is masked by this process's
     umask before the directory is actually created (typically leaves
-    ``0o755``), so an intermediate directory control-plane (uid 10002)
-    creates while walking a ``write_file``/``mark_deleted`` path would
-    otherwise silently end up in a mode the sandbox's own agent user (uid
-    10000) can read/list/mkdir-through but not write into or delete files
-    from — the write/list/read paths that only need ``mkdir`` still work
-    (masking that this was ever wrong), but the sandbox's own writes into
-    that subtree, or a user later deleting a file inside it from the
-    workspace-browse UI, hit ``EACCES``. Reached this fixed mode
-    unconditionally whenever the directory didn't already exist a moment
-    ago (whether this call's own ``mkdir`` won or a concurrent same-process
-    caller's did, both are "this process just brought it into being") —
-    a directory that already existed before this call (the ``O_NOFOLLOW``
-    fast path above) is left untouched: fixing modes on file/directory
-    *is not* what this store is responsible for, only what it *creates*.
+    ``0o755``, group 缺 ``w``) — this is why every layer needs an explicit
+    ``fchmod`` rather than relying on inheritance: setgid itself and the
+    group it stamps *do* get inherited by a child directory created under
+    an already-setgid parent, but the permission bits never do. Reached
+    this fixed mode unconditionally whenever the directory didn't already
+    exist a moment ago (whether this call's own ``mkdir`` won or a
+    concurrent same-process caller's did, both are "this process just
+    brought it into being") — a directory that already existed before this
+    call (the ``O_NOFOLLOW`` fast path above) is left untouched: fixing
+    modes on file/directory *is not* what this store is responsible for,
+    only what it *creates*.
     """
     try:
         return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
@@ -249,7 +277,19 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
             # directory and not a symlink swapped in under the same name.
             pass
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
-        os.fchmod(fd, 0o777)  # cross-uid dir — see docstring above for why 0o777 is deliberate.
+        # 先 chown 后 chmod —— 顺序承重,见上方 docstring。chown 失败
+        # (PermissionError,非目标 gid 的成员)只记日志、不中断:目录还是要
+        # 落到正确的 mode,只是这一次没能把 group 也改成共享的那个。
+        try:
+            os.fchown(fd, -1, WORKSPACE_SHARED_GID)
+        except PermissionError as exc:
+            logger.warning(
+                "nas_workspace_store.intermediate_dir_chgrp_denied name=%r gid=%s: %s",
+                name,
+                WORKSPACE_SHARED_GID,
+                exc,
+            )
+        os.fchmod(fd, WORKSPACE_DIR_MODE)
         return fd
 
 
@@ -406,17 +446,19 @@ class NasWorkspaceStore:
             # only the (untrusted) ``parts`` walked below need dir_fd
             # chaining.
             #
-            # Deliberately NOT chmod'd here (unlike _openat_dir's
-            # intermediate directories, Task 4 review Critical follow-up):
-            # this exact directory is also mkdir+chmod(0o777)'d by
-            # AgentSandboxClient._ensure_workspace_dir on every acquire,
-            # unconditionally and before the sandbox's mount ever goes
-            # live — so by the time a sandbox could possibly read/write
-            # here, it has already been fixed to 0o777 regardless of
-            # which of the two writers (this store or that client) got
-            # here first. Duplicating the chmod here would be redundant,
-            # not wrong — left out to keep this call's mode ownership
-            # single-sourced in one place.
+            # Task 3(gid 共享)—— 这里现在 **也** chown+chmod 用户根自己,
+            # 不再像旧版本那样把这一层完全让给
+            # AgentSandboxClient._ensure_workspace_dir 收尾。生产复现的
+            # W2-BUG-1 就是 agent 把 MEMORY.md 直接写在用户根这一层、不是
+            # 某个子目录里 —— 子目录再怎么修都救不了它,用户根自己的
+            # mode/gid 必须对。旧注释的结论("由 acquire 时的那次
+            # mkdir+chmod(0o777) 兜底,这里重复没意义")是 0o777 时代的:
+            # 那时谁先建都行,反正最终都是同一个宽 mode。换成 setgid + 共享
+            # gid 之后,在某次 acquire 真正跑到之前,任何一次经这个 store
+            # 落地的写入(例如用户在跑过 agent 之前先上传了一份文档)都会
+            # 看到一个两边都还没修好的目录,同一个 bug 原样重演。幂等:
+            # chown/chmod 到已经是的目标值时都是无操作的重复调用,不会和
+            # ``_ensure_workspace_dir`` 打架,谁先跑到都行。
             #
             # Wrapped (wave 2 final review, Minor 2): the most likely way
             # this fails in production is the NAS data root not having been
@@ -430,6 +472,22 @@ class NasWorkspaceStore:
             # the error type should have carried in the first place.
             try:
                 user_root.mkdir(parents=True, exist_ok=True)
+                # 路径版本的 chown/chmod(不是 _openat_dir 的 fd 版本)——
+                # user_root 是按信任前缀直接开的绝对路径,不经过下面的
+                # dir_fd 链;顺序承重(先 chown 后 chmod)与"非成员就降级
+                # 只记日志"的理由同 _openat_dir 的 docstring。
+                try:
+                    os.chown(user_root, -1, WORKSPACE_SHARED_GID)
+                except PermissionError as exc:
+                    logger.warning(
+                        "nas_workspace_store.user_root_chgrp_denied "
+                        "tenant_id=%s user_id=%s gid=%s: %s",
+                        tenant_id,
+                        user_id,
+                        WORKSPACE_SHARED_GID,
+                        exc,
+                    )
+                os.chmod(user_root, WORKSPACE_DIR_MODE)
             except OSError as exc:
                 raise SandboxSupervisorError(
                     f"failed to create workspace directory {user_root}: {exc}"
@@ -465,6 +523,16 @@ class NasWorkspaceStore:
                 # redirect this call.
                 try:
                     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                except PermissionError as exc:
+                    # W2-BUG-1 —— 读不动 ≠ 不存在。合到下面那句 SandboxSupervisorError
+                    # 里的话,端点翻成 404,用户看到"文件不存在"而它明明列在
+                    # 上一屏,只能靠翻服务端日志才诊断得出来。PermissionError
+                    # 是 OSError 的子类,必须先接住(见模块级 import 处
+                    # WorkspacePermissionError 的说明) —— 顺序反了这句永远
+                    # 走不到,下面的宽 except OSError 会先吃掉它。
+                    raise WorkspacePermissionError(
+                        f"workspace file not readable: {path!r}"
+                    ) from exc
                 except OSError as exc:
                     if exc.errno == errno.ELOOP:
                         raise SandboxSupervisorError(
@@ -479,6 +547,10 @@ class NasWorkspaceStore:
                 # the supervisor's bounded ``head -c`` subprocess trick.
                 try:
                     size = os.fstat(handle.fileno()).st_size
+                except PermissionError as exc:
+                    raise WorkspacePermissionError(
+                        f"workspace file not readable: {path!r}"
+                    ) from exc
                 except OSError as exc:
                     raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
                 if size > _MAX_READ_BYTES:
@@ -486,6 +558,10 @@ class NasWorkspaceStore:
                     raise SandboxSupervisorError(msg)
                 try:
                     return handle.read()
+                except PermissionError as exc:
+                    raise WorkspacePermissionError(
+                        f"workspace file not readable: {path!r}"
+                    ) from exc
                 except OSError as exc:
                     # e.g. IsADirectoryError — ``name`` resolved to a
                     # directory, not a file.
@@ -512,7 +588,18 @@ class NasWorkspaceStore:
                     # entry must report its own byte length, never a stat()
                     # of whatever it points at outside the tree (see module
                     # docstring).
-                    entries.append(WorkspaceFileEntry(path=rel, size=full.lstat().st_size))
+                    try:
+                        size = full.lstat().st_size
+                    except PermissionError as exc:
+                        # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
+                        raise WorkspacePermissionError(
+                            f"workspace listing not readable: {rel!r}"
+                        ) from exc
+                    except OSError as exc:
+                        raise SandboxSupervisorError(
+                            f"workspace listing failed: {rel!r}: {exc}"
+                        ) from exc
+                    entries.append(WorkspaceFileEntry(path=rel, size=size))
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 
@@ -529,14 +616,24 @@ class NasWorkspaceStore:
                 # OSError here (not just ELOOP) is wrapped into
                 # SandboxSupervisorError — a bare OSError must never leak
                 # past this store's boundary (parity contract: "错误类型
-                # 统一").
+                # 统一")。``WORKSPACE_FILE_MODE`` 起作用要靠父目录的 setgid
+                # 位把 group 继承成共享 gid(``_openat_dir``/上面的用户根
+                # chown 已经做了)——这里只负责 mode,不重复 chown 一次
+                # leaf 文件。
                 try:
                     fd = os.open(
                         name,
                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                        _LEAF_FILE_MODE,
+                        WORKSPACE_FILE_MODE,
                         dir_fd=dfd,
                     )
+                except PermissionError as exc:
+                    # 写不动同样是"配置问题"而非"不存在"——见
+                    # WorkspacePermissionError 的说明,W2-BUG-1 那一类故障
+                    # 不该被下面的宽 except OSError 收成一句 "write failed"。
+                    raise WorkspacePermissionError(
+                        f"workspace file not writable: {path!r}"
+                    ) from exc
                 except OSError as exc:
                     if exc.errno == errno.ELOOP:
                         raise SandboxSupervisorError(
@@ -570,6 +667,17 @@ class NasWorkspaceStore:
                     os.unlink(name, dir_fd=dfd)
                 except FileNotFoundError:
                     pass  # rm -f semantics — the leaf itself is already gone.
+                except PermissionError as exc:
+                    # 删不动同样是"配置问题",不是"不存在"——同 read_file/
+                    # write_file,PermissionError 先接住,别被下面吞成一句
+                    # 含混的失败。
+                    raise WorkspacePermissionError(
+                        f"workspace file not deletable: {path!r}"
+                    ) from exc
+                except OSError as exc:
+                    raise SandboxSupervisorError(
+                        f"workspace file delete failed: {path!r}: {exc}"
+                    ) from exc
             finally:
                 os.close(dfd)
 

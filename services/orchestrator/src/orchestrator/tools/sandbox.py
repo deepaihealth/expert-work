@@ -131,6 +131,19 @@ class SandboxSupervisorError(RuntimeError):
     """
 
 
+class WorkspacePermissionError(SandboxSupervisorError):
+    """工作区文件存在,但本进程的 uid/gid 读写不动它。
+
+    与"不存在"必须分开:前者是**服务端配置问题**(共享 gid 没配上、存量文件
+    没迁移、目录 mode 不对),后者才是用户输入问题。合并成一个之后,用户看到
+    的是"文件不存在"而文件明明列在浏览列表里 —— W2-BUG-1 的诊断成本几乎全在
+    这上面。
+
+    仍是 :class:`SandboxSupervisorError` 的子类,既有的宽 ``except`` 一律不受
+    影响;只有想区分的调用方(工作区下载端点)才需要单独接它。
+    """
+
+
 @runtime_checkable
 class SandboxRuntime(Protocol):
     """The sandbox runtime operations the tool needs."""
