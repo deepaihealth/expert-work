@@ -178,3 +178,220 @@ kubectl exec deploy/control-plane -n expert-work -- ls /mnt/workspaces
 第 4 步的 control-plane 发布完成后,再走
 `docs/research/2026-08-07-sandbox-w2-probe-results.md`「九、端到端验收清单」
 确认真实 `acquire` 能挂上 NAS、`exec` 能写进去。
+
+## 存量迁移(control-plane uid 10002 → 10000,一次性)
+
+> 方向变更(`docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md`
+> § 六)把 control-plane 镜像的 uid 从 10002 改成 10000,与沙箱镜像的 `agent`
+> 用户同 uid;工作区目录同时从波 2 的 `0o777`/`0o644`(world-writable/
+> world-readable)收紧到 `0o700`/`0o600`(属主独占)。测试集群已经按上一节
+> 「波 2 首发步骤」跑了一段时间,NAS 上有真实的租户/用户目录、临时沙箱的
+> `_scratch` 子树、软删 marker,属主混着 10002(老 control-plane 建的)和
+> 10000(沙箱 agent 建的)。**发布这版镜像之前必须先把这些存量目录/文件的
+> 属主统一转成 10000**——不是顺手收紧权限,是下一节要讲的两个真实故障唯一
+> 的修法。首次上线、NAS 还是空的(没有任何存量目录)可以跳过整节。
+
+### 1. 为什么必须先迁移
+
+**新镜像对着未迁移的树,先坏的不是"报错"这么简单——软删闸会静默失效。**
+
+`AgentSandboxClient._ensure_workspace_dir`
+(`services/orchestrator/src/orchestrator/tools/agent_sandbox.py:848`)在每次
+`acquire` 都跑一遍 `mkdir(exist_ok=True)` + `chmod(0o700)`;`chmod` 失败(目录
+属主还是旧 uid)是**尽力而为**,会被吞掉、写一条 warning,不让 `acquire`
+失败——这条自愈是这一版代码专门为迁移窗口加的(该方法 docstring 原话:
+"目录还没被 uid 迁移 Job(Task D)接管、属主还是旧 uid 时,chmod 是尽力而
+为,失败不影响 mkdir/acquire 本身继续")。所以**已存在的用户,大多数操作
+在迁移之前也能凑合跑**——继续吃波 2 遗留的 `0777`/`0644` world 位,新
+control-plane 作为 "other" 一样能读写。
+
+真正结构性打不开的口子是两个,都不受上面那条自愈保护:
+
+1. **给已有租户新建用户,直接挡在 mkdir 这一步。**
+   `NasWorkspaceStore._open_parent_dir_fd` 首次落盘时的
+   `user_root.mkdir(parents=True)`(`nas_workspace_store.py:445`)和
+   `_ensure_workspace_dir` 里的 `path.mkdir(...)`(`agent_sandbox.py:884`,
+   **不在任何 try/except 里**,原样冒到外层 `except OSError`)都要求在
+   **租户目录**(老 control-plane 建的,`0755`,属主 10002)里新建一个条
+   目——`0755` 的 `other` 位只有 `r-x`,没有 `w`。新 control-plane(10000)
+   对这个目录是彻头彻尾的 "other",没有写权限,`mkdir` 直接
+   `PermissionError`,`acquire` 翻 `SandboxSupervisorError`、`write_file`
+   翻 `WorkspacePermissionError` → 500。任何该租户下**还没有工作区目录**的
+   用户,发布完成那一刻,第一次 acquire / 第一次上传就会撞上这个——不需要
+   等窗口拖长。`_scratch`(临时沙箱的 scratch 子树,契约测试也在用)是同
+   一类顶层目录,测试集群里现在属主是裸 `root`(实测,见任务报告),同样
+   挡住新建临时沙箱。这也是下面第 2 步的迁移命令按"每一个顶层目录"处理、
+   不按"看起来像租户 UUID 的才处理"的原因。
+
+2. **软删闸静默放行。** `{tenant}/.deleted/` 是 `0700`,属主是老
+   control-plane(10002)。新 control-plane(10000)对它是彻底的陌生人,连
+   `stat` 都过不去。`NasWorkspaceStore.mark_deleted` 与 acquire 前的软删
+   检查(`_reject_if_workspace_deleted`)都是靠 `marker.exists()` 判断"这
+   个用户是不是已经被软删",而 `pathlib.Path.exists()` 拿到
+   `PermissionError` 时**不会往外抛,直接返回 `False`**(本仓库固定的
+   Python 3.14 上实测确认,见任务报告)。也就是说:一个在迁移前就已经被
+   软删的用户,只要 `.deleted/` 还没被迁移 Job 接管,acquire 时的软删检查
+   会**静默判定"没被删"**——不是报错,是错误答案,且不会留下任何异常日志
+   可供事后排查。这个口子只有迁移 Job 把 `.deleted/` 的属主也转成 10000
+   才会关上(`.deleted/` 的 `0700` mode 本身不变,见第 2 步)。
+
+两条都不是"发布后再补救"能救的——第 1 条要迁移 Job 跑完才有写权限,第 2
+条要迁移 Job 跑完才能读到真实答案,新镜像的代码里没有、也不该有任何绕过属
+主检查的备用路径(见第 4 节「为什么不做代码自愈」)。
+
+**反过来,迁移跑得太早、离发布太远,一样会坏,而且坏得更彻底。** 当前部署
+的镜像(`origin/main` 5557f5e9,uid 10002)里 `_ensure_workspace_dir._do()`
+的 `chmod` 调用是**没有 try/except 包着的**:
+
+```python
+# origin/main(当前部署),services/orchestrator/src/orchestrator/tools/agent_sandbox.py
+def _do() -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o777)  # noqa: S103 —— 没有 try/except,EPERM 直接冒出去
+```
+
+迁移 Job 把用户目录属主从 10002 改成 10000 之后,如果老镜像还在跑一段时
+间,**每一个已存在用户**的下一次 acquire 都会在这句 `chmod` 上撞
+`EPERM`——不区分新老用户,波及面比"新镜像早于迁移"那两条加起来还大。这就
+是「迁移 Job → 发布」之间的窗口必须尽量短、最好连着做的真正原因:窗口两头
+都有真实故障在等,只是形状和波及面不同(新镜像早于迁移 = 新用户 onboarding
+挡死 + 软删闸静默失效;迁移早于新镜像 = 所有存量用户的 acquire 硬挡)。**不
+存在"提前迁移更安全"这种说法**,迁移和发布要当成一个不可拆分的动作去做。
+
+### 2. 迁移 Job
+
+一次性 root Pod,挂 `workspace-nas`(与 control-plane 同一个 PVC,namespace
+`expert-work`)。**镜像不要用 `busybox`**:docker.io 在这个集群拉取会超时
+(`ErrImagePull` / `dial tcp ... i/o timeout`,验证时实测撞到过,见任务报
+告)。改用**当前正在跑的 control-plane 镜像**——它是 ACR 镜像,保证已经能
+拉到,而且是 Debian 基础镜像,自带 GNU coreutils/findutils(`find` 支持
+`-exec ... +` 批量执行),够用,不用额外找一个新镜像。
+
+```bash
+export KUBECONFIG=~/.kube/expert-work-test.yaml
+kubectl get deploy control-plane -n expert-work \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+# 把上面打印的 tag 填进下面 YAML 的 image 字段
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: workspace-uid-migrate
+  namespace: expert-work
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+  containers:
+    - name: migrate
+      image: <上一步打印的 control-plane 镜像 tag>
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+          rm -rf /mnt/workspaces/_gidprobe /mnt/workspaces/_chgrpprobe
+          find /mnt/workspaces -mindepth 1 -maxdepth 1 -exec chown -R 10000:10000 {} +
+          find /mnt/workspaces -mindepth 2 -type d ! -path '*/.deleted*' -exec chmod 0700 {} +
+          find /mnt/workspaces -mindepth 3 -type f ! -path '*/.deleted/*' -exec chmod 0600 {} +
+          echo "--- post-migration ---"
+          ls -la /mnt/workspaces/*/ | head -40
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+      volumeMounts:
+        - name: nas
+          mountPath: /mnt/workspaces
+  volumes:
+    - name: nas
+      persistentVolumeClaim:
+        claimName: workspace-nas
+```
+
+```bash
+kubectl apply -f workspace-uid-migrate.yaml   # 或用 cat <<'EOF' | kubectl apply -f - 直接贴
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/workspace-uid-migrate -n expert-work --timeout=120s
+kubectl logs pod/workspace-uid-migrate -n expert-work
+kubectl delete pod/workspace-uid-migrate -n expert-work
+```
+
+`set -eu` 保证任何一步失败(比如某个文件被别的进程锁住)整个 Job 都会以非
+`Succeeded` 收场——`kubectl wait` 会超时而不是假装成功,不会带着"迁移了一
+半"的树静默过关。
+
+命令本身有两处**没有**照抄 brief 草稿里的原始写法,都在测试环境验证过(方
+法:在 `/mnt/workspaces` 下自建一个 `_taskD_dryrun` 前缀、用与真实数据同构
+的 mixed-ownership fixture 跑过这四条命令、核对结果、再整棵删掉,细节见任
+务报告,**没有对着真实数据跑过**):
+
+- **`chown -R 10000:10000 /mnt/workspaces` 会把根目录本身也扫进去。**
+  `/mnt/workspaces` 是 `1777` 属主 `root`(NAS CSI 建的,详见上一节第 1
+  步),这是刻意的——多个租户子树在根下平级摆着,sticky bit 防止一个租户
+  删掉另一个租户的顶层目录。`chown -R` 从根开始递归会把根自己的属主也改成
+  10000,不影响功能(mode 还是 `1777`,world-writable + sticky 位都还
+  在),但没必要、不可逆(以后只有 root 能再把它 chown 回去),而且**这不
+  是根本来的责任归属**——control-plane 从来不需要拥有这个根,只需要
+  `1777` 放行的写权限。改成 `find /mnt/workspaces -mindepth 1 -maxdepth 1
+  -exec chown -R 10000:10000 {} +`:对根下每一个条目(租户 UUID 目录、
+  `_scratch`、清理前的探针目录……不区分名字模式)分别递归 `chown`,根本身
+  不碰。测试环境验证过:这样跑完之后,伪造的"根"目录属主/mode 原样不动,
+  子树全部转成 10000。
+- **`.deleted/` 要不要碰,答案是"属主要改、mode 不要改"。** `.deleted/`
+  现在是 `0700` 属主 10002(老 control-plane 建的,唯一的写者)。迁移之
+  后新 control-plane 是 10000,如果 `.deleted/` 的属主不跟着改,上面第 1
+  节第 2 条(软删闸静默放行)原样成立——迁移这一步如果漏了它,等于没解决
+  软删闸的问题。但 `.deleted/` 的**权限位**不能跟着通用的"目录 0700/文件
+  0600"两条 `find` 走,因为里面的 marker 文件的落地 mode(`0644` 之类,
+  由 `Path.touch()` 决定)本来就不是这套设计管的对象——`NasWorkspaceStore.
+  mark_deleted` 的注释原话是"这个目录只有一个写者、没有任何 `subPath`
+  把它投影进沙箱,不需要 group/other 位,`0700` 的目录本身就是唯一的
+  保护"。所以顶层的 `chown -R`(第一条 `find`,递归覆盖 `.deleted/` 和它
+  里面的所有 marker 文件)负责属主,后面两条 `chmod` 的 `find` 用
+  `! -path '*/.deleted*'` / `! -path '*/.deleted/*'` 把 `.deleted/` 目录
+  和它下面的文件排除掉,让 `chmod` 不去动一个本来就该保持原样的 mode。
+  测试环境验证过:跑完之后 `.deleted/` 属主变成 10000、mode 仍是
+  `0700`;marker 文件属主变成 10000、mode 保持它原来的样子不动。
+
+另外两条命令是幂等/加固性质,原样照抄了 brief 草稿,测试环境同样跑过一
+遍确认行为符合预期:已经是 `0600` 的沙箱写入产物(`write_file`/
+`_atomic_write` 落的文件)不受影响;`exec_python` 里裸 `open()` 写的老文
+件(实测过的 `0666`)会被这次迁移一并收紧到 `0600`——目录已经是属主独占
+的 `0700`,收紧文件本身的 mode 是防御纵深,不是这次修复严格要求的,但符合
+新设计"leaf 文件 `0o600`"的目标状态,顺手做掉。
+
+### 3. 顺序:迁移 → 发布 → 复验,不能拆开也不能颠倒
+
+1. **迁移 Job**(本节)。
+2. `tools/deploy/release.sh` 常规发布,新镜像(uid 10000)。与波 2 首发不
+   同,这次**不需要**协调 manifest——共享 gid 方案的 `supplementalGroups`
+   已经作废(spec § 六),仓库里也确认没有残留(`grep -rn
+   supplementalGroups infra/` 零命中),只需要走常规的镜像发布路径。
+3. 复验:参照本文件「5. 冒烟」一节 + 探针报告「九、端到端验收清单」,重点
+   过一遍新用户 onboarding(全新用户在一个已有租户下第一次 acquire/上传)
+   和软删闸(软删一个用户 → 再 acquire 应该被拒),这两条正是第 1 节点名
+   的两个结构性故障,迁移前会复现、迁移后应该恢复正常。
+
+三步之间的窗口越短越好——第 1 节已经证明窗口两头都有真实故障(迁移早于发
+布 = 全体存量用户 acquire 硬挡;发布早于迁移 = 新用户 onboarding 硬挡 + 软
+删闸静默失效),没有"先做哪个更安全"这种选项,只有"两步之间隔多久"的风险
+可以控制,所以尽量连着做,不要把迁移 Job 和 `release.sh` 排进两个不同的运
+维窗口。
+
+### 4. 为什么不做代码自愈
+
+`_ensure_workspace_dir` 已经在 chmod 失败时优雅降级(见第 1 节),这是刻意
+留的一小块自愈——但它只覆盖"目录已存在、只是 mode 需要重新收紧"这一种情
+形。再往前多走一步(比如在 `mkdir` 撞上 `PermissionError` 时让代码自己想
+办法把租户目录的属主抢过来),需要 control-plane 拥有它现在没有、也不该有
+的能力(`chown` 到自己不是属主的目录需要 root/`CAP_CHOWN`——设计 § 六已经
+论证过"control-plane 以 root 跑技术上可行但不划算",跑时自愈同样是把这个
+不划算的选项换了个更隐蔽的位置塞回来)。更根本的问题是:一旦运行期代码里
+出现"目录属主不对时,悄悄接管/绕过"的分支,"存量目录属主归谁负责"就从一个
+答案(迁移 Job)变成两个答案(迁移 Job + 一段每次 acquire 都会跑的隐藏逻
+辑)——下次这类问题重现时,得同时排查两条路径,而且运行期自愈天然没有事
+后可核对的执行记录,迁移 Job 的 `kubectl logs` 有。生产还没上线,这是一次
+性成本;写进运行手册反而让"上线前必须做这一步"这件事显式可查,而不是靠一
+段读者看不见的自愈代码悄悄兜底。
