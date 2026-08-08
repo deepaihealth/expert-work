@@ -257,6 +257,10 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
             # directory and not a symlink swapped in under the same name.
             pass
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        # 已知不修(2026-08-08 方向变更终审 Minor):``fchmod`` 抛的话这个 ``fd``
+        # 会泄。要它发生得有另一个 uid 抢先建出同名目录、让我们既 open 得到又
+        # chmod 不动——统一 uid(spec § 六)之后写这棵树的只有一个 uid,这条路
+        # 不可达。哪天再引入第二个写入身份,连同这里一起补 try/finally。
         os.fchmod(fd, _DIR_MODE)
         return fd
 
@@ -453,6 +457,15 @@ class NasWorkspaceStore:
                     # 路径版本的 chmod(不是 _openat_dir 的 fd 版本)——
                     # user_root 是按信任前缀直接开的绝对路径,不经过下面的
                     # dir_fd 链。
+                    #
+                    # 只 chmod **用户根**,不 chmod 它上面那层 ``{tenant}/``
+                    # ——后者由 ``parents=True`` 顺带建出,落的是 umask 决定的
+                    # ``0o755``。已知不修(方向变更终审 Minor-5):租户目录里
+                    # 只有 UUID 命名的用户子目录和 ``.deleted/``,自身不存任何
+                    # 内容,``other`` 的 ``r-x`` 只暴露"这个租户下有哪些 user
+                    # UUID",而能读到这一层的进程本来就有整棵树的挂载。真要
+                    # 收紧,该在这里补一次 ``chmod(user_root.parent, 0o700)``
+                    # 并同步迁移脚本,不是删掉这条注释就算数。
                     os.chmod(user_root, _DIR_MODE)
             except PermissionError as exc:
                 # 复审 I-1 —— 同类型的路径泄露:之前这里裸拼 ``{user_root}``,
