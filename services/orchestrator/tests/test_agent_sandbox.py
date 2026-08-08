@@ -965,14 +965,19 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
-    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— ``commands.run`` 走
-    ``/bin/bash -l -c cmd``,所以命令串必须以 ``umask 000 && `` 打头,让
-    bash 先放开 umask 再 exec python:agent 代码自己 ``mkdir``/``open`` 出
-    的目录/文件才不会被默认 umask(常见 0o022)掩成 control-plane 读得进
-    但删/写不进的 0o755/0o644——与本地 supervisor 后端
-    ``runner.py.main()`` 的 ``os.umask(0)`` 同一个根因的两个后端各自的
-    落点,契约测试(``test_sandbox_runtime_contract.py``)钉住两者不会
-    分叉。"""
+    """``commands.run`` 走 ``/bin/bash -l -c cmd``,所以命令串必须以
+    ``umask 000 && `` 打头,让 bash 先放开 umask 再 exec python。与本地
+    supervisor 后端 ``runner.py.main()`` 的 ``os.umask(0)`` 是同一件事在
+    两个后端各自的落点,契约测试(``test_sandbox_runtime_contract.py``)
+    钉住两者不会分叉。
+
+    **这条机制的原始理由已经作废**(2026-08-08 统一 uid,见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六):它当初是为"跨 uid 写冲突"而设——默认 umask 掩出的
+    ``0o755``/``0o644`` 会让**另一个 uid** 的 control-plane 读得进却删/写
+    不进。现在两侧同 uid,属主位本身就够。断言留着不删:``umask 000`` 落出
+    的 ``0o777``/``0o666`` 是比现在真正需要的 mode 更宽的**安全超集**,不是
+    错,只是不再最小;收紧它要真栈验证,是独立的后续任务。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())

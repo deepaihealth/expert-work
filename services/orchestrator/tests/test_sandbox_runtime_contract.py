@@ -386,7 +386,7 @@ async def test_exec_created_files_are_not_masked_by_the_sandbox_default_umask(
     ``0o755``/``0o644`` 在 ``read``/``list`` 路径上完全不可见(两者仍然
     通),只有 control-plane 经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除
     或覆盖该文件时才会撞 ``EACCES``。现在两侧同 uid,属主位本身就够,不再
-    需要靠这条机制兜底跨 uid 访问。测试名和这条用例本身都留着不删——
+    需要靠这条机制兜底跨 uid 访问。这条用例本身留着不删——
     ``0o777``/``0o666`` 是比统一 uid 之后真正需要的 mode 更宽的**安全超
     集**,不是错,只是不再最小;收紧它是一个需要真栈验证的后续任务(见
     ``AgentSandboxClient.exec`` 与 ``runner.py`` 的 docstring),这条契约用

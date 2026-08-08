@@ -507,7 +507,11 @@ class NasWorkspaceStore:
                 # read_file 事后核实都会答"不存在"——两个诊断都指向错误的
                 # 结论。
                 os.close(dfd)
-                raise WorkspacePermissionError(f"workspace not readable: {path!r}") from exc
+                # 措辞刻意比 C-1 那处的 "not readable" 中性:``_openat_dir``
+                # 在 ``create=True`` 时可能是 ``mkdir`` 撞 EACCES(父目录写
+                # 不进),不一定是"读不动"。这个异常类型的全部意义就是可诊断
+                # 性,指错权限位比不指更坏。
+                raise WorkspacePermissionError(f"workspace path not accessible: {path!r}") from exc
             except OSError as exc:
                 os.close(dfd)
                 if exc.errno == errno.ELOOP:
