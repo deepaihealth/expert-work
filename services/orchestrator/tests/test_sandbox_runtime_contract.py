@@ -71,6 +71,20 @@ clamp 在 HTTP 路径上够不着,拿它当闸就是拿一段死代码当闸:真
 字符;``AgentSandboxClient`` 走的是简单头部截断 ``[:MAX_OUTPUT_CHARS]``
 (理由见其 ``exec`` docstring 契约点 2)。``test_exec_output_is_capped``
 因此断言的是"被截到了上限附近",不是某个精确长度。
+
+**其四:``/workspace`` 的物理路径。**(波 2 真栈复跑实测)supervisor 档的
+``/workspace`` 是容器里一个真目录,``os.getcwd()`` 就报 ``/workspace``;
+agent_sandbox 档的 ``/workspace`` 是**平台建的符号链接**,指向
+``/run/csi/mount-root/nas/<hash>``(hash 每次挂载现算),而 ``getcwd(2)``
+按定义返回解析后的物理路径。这条弥合不了——符号链接是平台注入 NAS 挂载的
+方式,不是我们能选的。功能上无影响:相对路径读写、``/workspace/...``
+绝对路径、跨 exec 持久化全部照常(各由自己的用例覆盖)。
+``test_exec_cwd_is_workspace`` 因此比 ``(st_dev, st_ino)`` 而不是路径字符串。
+
+**留给上层的一条**:云后端上,agent 自己跑 ``os.getcwd()``(或任何打印绝对
+路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是 ``/workspace``。
+纯观感,但 LLM 读到自己的 cwd 长这样可能会困惑;真要治得在提示词或工具输出
+层做路径回写,不在这一层。
 """
 
 from __future__ import annotations
@@ -96,10 +110,35 @@ def _supervisor_runtime() -> SandboxRuntime:
     return HTTPSupervisorRuntime(base_url=url)
 
 
-def _agent_sandbox_runtime() -> SandboxRuntime:
+def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
+    """``workspace_pv_name`` 默认从环境读,**没配就 skip**。
+
+    这个参数原本默认空串,理由是"保持对既有调用方零行为变化——未配时
+    ``_create`` 完全不带 ``metadata`` 键,与波 1 逐字相同"。Task 9 之后那句
+    话不再成立(波 2 收尾复跑真栈时坐实):镜像不再预建 ``/workspace``,不挂
+    NAS 就等于沙箱里根本没有 ``/workspace``,而 ``exec`` 无条件传
+    ``cwd=/workspace`` —— 18 条 exec 用例齐刷刷炸在
+    ``InvalidArgumentException: cwd '/workspace' does not exist``。这是典型的
+    跨任务缝隙:Task 7 写这个默认值时它是对的,Task 9 把地基抽走了。
+
+    生产装配点(``build_sandbox_runtime``)本就强制要求 ``PV_NAME``,所以
+    "不挂载的 agent_sandbox"是一个生产里不存在的配置——契约测试没有理由去
+    测它。改成读同一个环境变量、没配就 skip,与生产保持同一个形状。
+
+    ``workspace_root`` 仍然不配:那是"把 NAS 挂进 control-plane Pod"的那半边,
+    GitHub runner 对 NAS 没有 NFS 路由。缺了它 ``_prepare_workspace_mount``
+    整段跳过,挂载点目录改由平台建(``root:root 0755``,集群实测),沙箱侧
+    ``AgentSandboxClient._chmod_workspace_mount`` 那道兜底因此成为这一档唯一
+    的权限来源 —— 也正是这一档真正在验的东西之一。
+    """
     api_key = os.environ.get("EXPERT_WORK_SANDBOX_E2B_API_KEY")
     if not api_key:
         pytest.skip("E2B 凭据未设 —— agent_sandbox 契约档跳过")
+    workspace_pv_name = workspace_pv_name or os.environ.get(
+        "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", ""
+    )
+    if not workspace_pv_name:
+        pytest.skip("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME 未设 —— agent_sandbox 契约档跳过")
     dsn = os.environ.get("EXPERT_WORK_DB_DSN")
     if not dsn:
         pytest.skip("EXPERT_WORK_DB_DSN 未设 —— 契约档需要真 sandbox_instance 表")
@@ -129,7 +168,26 @@ def _agent_sandbox_runtime() -> SandboxRuntime:
         ),
         egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
         egress_proxy_port=8081,
+        workspace_pv_name=workspace_pv_name or None,
     )
+
+
+def _agent_sandbox_runtime_with_workspace_mount() -> SandboxRuntime:
+    """``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``
+    的具名入口。
+
+    历史上这个函数存在是因为 :func:`_agent_sandbox_runtime` 默认**不**挂 NAS,
+    只有这一条用例需要挂;那个默认值已经随波 2 收尾去掉了(见该函数
+    docstring),两者现在配置完全相同。保留这个名字而不是让用例直接调基函数:
+    调用点读起来仍然点名"这条测的是 NAS 挂载",而不是碰巧和别的用例共用了同一
+    个 runtime 构造器。
+
+    这条用例曾经因为两层基础设施缺口跑不通——集群 SandboxSet 还是波 1 老镜像、
+    以及 ``csi-volume-config`` 的特权豁免工单未批。两者都已解决(工单已批;
+    镜像 tag 在 Task 8 的 runbook 步骤里换新),2026-08-07 真栈复跑已能挂上
+    NAS。
+    """
+    return _agent_sandbox_runtime()
 
 
 @pytest.fixture(params=["supervisor", "agent_sandbox"])
@@ -250,17 +308,40 @@ async def test_exec_cwd_is_workspace(runtime: SandboxRuntime) -> None:
     没人发现的原因:其它每一条用例都用绝对 ``/workspace/...`` 路径,对 cwd
     完全不敏感。
 
-    supervisor 档靠镜像的 ``WORKDIR /workspace``(``runner.py`` 是容器
-    PID 1,``subprocess.run`` 继承它);agent_sandbox 档靠
-    ``commands.run(cwd=...)`` —— envd 派生的进程不继承镜像 ``WORKDIR``,
-    实测落在 ``/home/agent``。两条路子不同,观测结果必须相同。
+    supervisor 档靠 ``docker run --workdir /workspace``(W2 Task 6,
+    ``SandboxRuntimeProvider.docker_run_argv`` —— 镜像自己不再声明
+    ``WORKDIR``,W2 Task 9 为了给 ACS 的 NAS-mount symlink 让路把它删了;
+    ``runner.py`` 是容器 PID 1,``subprocess.run`` 继承这个 run-time cwd);
+    agent_sandbox 档靠 ``commands.run(cwd=...)`` —— envd 派生的进程不继承
+    镜像 ``WORKDIR``(即便镜像声明了也一样),实测落在 ``/home/agent``。
+    两条路子不同,观测结果必须相同。
+
+    **比 inode 身份,不比路径字符串**(波 2 收尾真栈复跑)。这条以前断言
+    ``os.getcwd() == "/workspace"``,在波 2 之前是对的:那时 ``/workspace``
+    两个后端都是真目录。云后端现在不是了 —— 平台把 ``/workspace`` 建成指向
+    ``/run/csi/mount-root/nas/<hash>`` 的**符号链接**,而 ``getcwd(2)`` 按定义
+    返回解析后的物理路径,于是这条用例报
+    ``assert '/run/csi/mount-root/nas/...' == '/workspace'``。
+
+    那个字符串不是我们能承诺的东西(hash 由平台每次挂载现算),而这条用例
+    真正要问的是「这个进程是不是站在工作区里」。比 ``(st_dev, st_ino)`` 正好
+    回答那个问题:``os.stat`` 跟随符号链接,所以 supervisor 档(真目录)与
+    agent_sandbox 档(symlink)都成立,而且比字符串相等更强 —— 一个 cwd 恰好
+    叫 ``/workspace`` 但其实是另一棵树的实现骗不过它。顺带把 ``getcwd()``
+    一起打出来,失败时不用再猜它到底站在哪。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c8")
     try:
         outcome = await runtime.exec(
-            sandbox_id=sid, code="import os; print(os.getcwd())", timeout_s=30
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "here, ws = os.stat('.'), os.stat('/workspace')\n"
+                "print((here.st_dev, here.st_ino) == (ws.st_dev, ws.st_ino), os.getcwd())"
+            ),
+            timeout_s=30,
         )
-        assert outcome.stdout.strip() == "/workspace"
+        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -288,6 +369,39 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_exec_created_files_are_not_uid_locked(runtime: SandboxRuntime) -> None:
+    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— agent 代码自己
+    ``mkdir``/``open`` 出的嵌套目录/文件必须是 world-writable(两后端都在
+    exec 路径上把 umask 设成 000:supervisor 档 ``runner.py.main()`` 的
+    ``os.umask(0)``,agent_sandbox 档 ``commands.run`` 命令串的
+    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成只有
+    沙箱自己的 uid 能删/写的 ``0o755``/``0o644``——那类被掩过的模式在
+    ``read``/``list`` 路径上完全不可见(两者仍然通),只有 control-plane
+    经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除或覆盖该文件时才会撞
+    ``EACCES``,本条用例直接断言权限位而不是依赖第二个 uid 的进程——POSIX
+    权限语义本身就与"谁去读"这个 uid 无关,``0o777``/``0o666`` 早已蕴含了
+    "任何 uid 都能写"这件事。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9b")
+    try:
+        code = (
+            "import os\n"
+            "os.makedirs('reports/nested')\n"
+            "open('reports/nested/out.txt', 'w').close()\n"
+            "print('DIR_MODE=%o' % (os.stat('reports').st_mode & 0o777))\n"
+            "print('NESTED_MODE=%o' % (os.stat('reports/nested').st_mode & 0o777))\n"
+            "print('FILE_MODE=%o' % (os.stat('reports/nested/out.txt').st_mode & 0o777))\n"
+        )
+        outcome = await runtime.exec(sandbox_id=sid, code=code, timeout_s=30)
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "DIR_MODE=777" in outcome.stdout, outcome.stdout
+        assert "NESTED_MODE=777" in outcome.stdout, outcome.stdout
+        assert "FILE_MODE=666" in outcome.stdout, outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
     """镜像 ``ENV`` 在两个后端都要到达沙箱进程。
 
@@ -308,9 +422,9 @@ async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
             ),
             timeout_s=30,
         )
-        assert "HOME = /workspace" in outcome.stdout
+        assert "HOME = /home/agent" in outcome.stdout
         assert "PIP_USER = 1" in outcome.stdout
-        assert "MPLCONFIGDIR = /workspace/.mplconfig" in outcome.stdout
+        assert "MPLCONFIGDIR = /home/agent/.mplconfig" in outcome.stdout
         assert "LANG = zh_CN.UTF-8" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
@@ -318,7 +432,37 @@ async def test_exec_sees_the_image_environment(runtime: SandboxRuntime) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_seed_files_land_in_workspace(runtime: SandboxRuntime) -> None:
+async def test_exec_injects_per_agent_pythonuserbase(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2(spec 决策 10)—— 同用户双 agent 共享一个
+    沙箱时,``$HOME/.local`` 默认共享,pip --user 装包会互相覆盖/并发损坏。
+    ``agent_key`` 非空时两个后端都必须把它转成同一个 ``PYTHONUSERBASE`` 值
+    (``orchestrator.tools.sandbox.agent_key_envs`` 单源)。"""
+    from expert_work.persistence import SANDBOX_AGENTS_ROOT
+
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c16")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import os; print(os.environ.get('PYTHONUSERBASE'))",
+            timeout_s=30,
+            agent_key="contract-agent",
+        )
+        assert outcome.stdout.strip() == f"{SANDBOX_AGENTS_ROOT}/contract-agent"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_seed_files_land_under_the_sandbox_skills_root(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2 (spec § 四) — seed lands under
+    ``SANDBOX_SKILLS_ROOT`` (sandbox-local), not ``/workspace`` (NAS-backed,
+    wave 2's whole point is skills no longer occupying user workspace quota).
+    ``relpath`` here is exactly what the caller passes — the ``<agent_key>/``
+    namespace prefix is the *caller's* job (``build_skill_seed_files``), not
+    this layer's."""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+
     sid = await runtime.acquire(
         tenant_id=uuid4(),
         thread_id="c5",
@@ -327,10 +471,50 @@ async def test_seed_files_land_in_workspace(runtime: SandboxRuntime) -> None:
     try:
         outcome = await runtime.exec(
             sandbox_id=sid,
-            code="print(open('/workspace/seeded.txt').read())",
+            code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())",
             timeout_s=30,
         )
         assert "SEED_CONTENT" in outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_seed_files_land_under_the_agent_key_skill_namespace(runtime: SandboxRuntime) -> None:
+    """sandbox migration wave 2 Task 7 —— skill_seed 落点契约。
+
+    ``build_skill_seed_files``(``orchestrator.tools.skill_seed``)产出的
+    relpath 形如 ``<agent_key>/<skill_name>/SKILL.md``(该模块的
+    ``candidates`` 列表首项)。上一条测试
+    (``test_seed_files_land_under_the_sandbox_skills_root``)已经覆盖了
+    "任意 seed_files 落在 ``SANDBOX_SKILLS_ROOT`` 之下"这个更宽的契约点;
+    这条额外精确复现生产真实用的两层命名空间形状(``<agent_key>/<skill>/``),
+    不经过 ``build_skill_seed_files`` 本身(那需要一整套
+    ``SkillVersion``/object-store 前置),直接用
+    :func:`~orchestrator.tools.skill_seed.sanitize_agent_key` 的真实输出做
+    ``agent_key``——两个后端各自 seed 后必须能在
+    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill>/SKILL.md`` 这个精确路径读
+    回同一份内容。"""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from orchestrator.tools.skill_seed import sanitize_agent_key
+
+    agent_key = sanitize_agent_key("Contract Test Agent")
+    skill_md = "---\nname: contract-skill\n---\ncontract skill body\n"
+    sid = await runtime.acquire(
+        tenant_id=uuid4(),
+        thread_id="c18",
+        seed_files=((f"{agent_key}/contract-skill/SKILL.md", skill_md.encode("utf-8")),),
+    )
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                f"print(open('{SANDBOX_SKILLS_ROOT}/{agent_key}/contract-skill/SKILL.md').read())"
+            ),
+            timeout_s=30,
+        )
+        assert outcome.stdout.strip() == skill_md.strip()
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -377,7 +561,7 @@ async def test_python_variables_do_not_survive_across_exec(runtime: SandboxRunti
 async def test_exec_user_site_survives_to_the_next_exec(runtime: SandboxRuntime) -> None:
     """PR-C #2 —— user site 必须在 exec 子进程的 ``sys.path`` 上。
 
-    第一步把模块文件落进 ``site.getusersitepackages()``(镜像 HOME=/workspace,
+    第一步把模块文件落进 ``site.getusersitepackages()``(镜像 HOME=/home/agent,
     可写),第二步全新子进程 import 它 —— 等价于「pip install --user 之后
     下一次 exec import 得到」,但不依赖网络。旧旗标 ``-I``(含 ``-s``)下
     第二步必失败。
@@ -459,6 +643,77 @@ async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> Non
         assert "import-ok 2.4.0" in outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes() -> None:
+    """sandbox migration wave 2 Task 7 —— e2b NAS 挂载档(brief Step 3)。
+
+    Not parametrized over ``runtime`` — this is an ``agent_sandbox``-only
+    property (the docker supervisor backend's workspace persistence is
+    already covered end to end by ``test_workspace_files_survive_across_exec``
+    and separately by ``test_workspace_store_contract.py``; there is no
+    supervisor-side equivalent of "mount the *same* NAS subtree into two
+    independently created sandboxes" to parametrize against).
+
+    Proves the NAS mount, not just the docker-volume-equivalent "same sandbox,
+    two execs" persistence: write from a **first** sandbox, force it to be
+    genuinely destroyed (not the routine ``release`` that keeps a warm session
+    alive — reusing the same warm sandbox for the second ``acquire`` would
+    prove nothing about the mount, since the file would just still be sitting
+    on that one sandbox's own view of ``/workspace``), then ``acquire`` a
+    **second**, independently created sandbox for the same ``(tenant, user)``
+    and read the file back purely via its own ``exec`` — never via a local
+    filesystem read of the NAS tree from this test process, since a GitHub
+    Actions runner (or any machine without the ``workspace-nas`` PVC mounted)
+    has no NFS route to it. Two distinct sandbox ids is the actual proof that
+    authority lives on the NAS, not on either sandbox's local disk. Cleans up
+    the probe file via a third ``exec`` before destroying the second sandbox
+    (this suite writes real files onto the shared test-cluster NAS volume —
+    see task-1-report.md § 7 for why leftover probe residue there is a real,
+    previously-flagged annoyance, not a hypothetical one).
+    """
+    runtime = _agent_sandbox_runtime_with_workspace_mount()
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sandbox_1 = await runtime.acquire(tenant_id=tenant_id, thread_id="mount-1", user_id=user_id)
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_1,
+            code="open('/workspace/contract-probe.txt', 'w').write('NAS_SHARED_OK')",
+            timeout_s=30,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+    finally:
+        # 真 destroy,不是 release —— release 对带 user_id 的沙箱是保温
+        # (下一次 acquire 会 connect 回同一个沙箱),那样"第二个沙箱"其实
+        # 是同一个,证明不了任何跨沙箱共享的东西。
+        await runtime.destroy(sandbox_id=sandbox_1, reason="contract-test-mount-1")
+
+    sandbox_2 = await runtime.acquire(tenant_id=tenant_id, thread_id="mount-2", user_id=user_id)
+    assert sandbox_2 != sandbox_1, (
+        "acquire 为同一个 (tenant, user) 返回了同一个 sandbox_id —— 第一个沙箱"
+        "没有被真的 destroy 掉,读到同内容不能证明跨沙箱共享(有可能只是同一"
+        "个热会话的第二次 exec)。"
+    )
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_2,
+            code="print(open('/workspace/contract-probe.txt').read())",
+            timeout_s=30,
+        )
+        assert "NAS_SHARED_OK" in outcome.stdout
+    finally:
+        # NAS 清理 —— 探针文件是这条测试写到共享测试集群 NAS 卷上的真实
+        # 残留,通过 exec 删(不经本地文件系统:同上,CI runner 没有 NFS
+        # 路由),再 destroy 第二个沙箱。
+        await runtime.exec(
+            sandbox_id=sandbox_2,
+            code="import os; os.remove('/workspace/contract-probe.txt')",
+            timeout_s=30,
+        )
+        await runtime.destroy(sandbox_id=sandbox_2, reason="contract-test-mount-2")
 
 
 def _runner_py_constants() -> dict[str, int]:
@@ -855,4 +1110,60 @@ def test_max_warm_age_leaves_room_at_the_ttl_floor() -> None:
         f"字段允许的最小 TTL({minimum_ttl}s)下,年龄封顶 {client._max_warm_age_s()}s"
         f" 加一次最长工具调用({MAX_TIMEOUT_S}s)已经不小于 TTL 本身 —— 下界选低了,"
         " 运维配得出一个让 #1b 自愈闸失效的值,且默认值那道闸完全看不见。"
+    )
+
+
+# --------------------------------------------------- 生产必配项 ↔ 契约档配置 漂移闸
+#
+# W2 收尾「前提清扫」补的一道。这一波真栈复跑栽的第一跤就是这条缝:Task 9 之后
+# ``EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME`` 在生产装配点变成必配,而这份契约档的
+# fixture 的默认值还停在「不配 = 波 1 行为」的旧世界 —— 18 条 exec 用例齐炸
+# ``cwd '/workspace' does not exist``。
+#
+# 为什么代码审查逮不到:肇事任务(Task 9,改镜像)的 diff 里根本没有 fixture 那
+# 一行,它一个字符都没改。审查者读的是 diff,这条缝住在「未被改动、但被本次改动
+# 作废」的代码里。真栈跑逮到了,但那是最贵最晚的一层。
+#
+# 这道闸把那份「散文前提」变成机器可检的:名字集合对不上就红,不用等任何基础设施。
+
+#: 生产装配点每一个必配环境变量在**这份契约档**里的处置。值是理由,不是装饰 ——
+#: 工厂以后多要一个变量,下面那条断言会红,而写这行值的人被迫做一次显式判断:
+#: 契约档到底该要它,还是有理由不要。
+_FIXTURE_ENV_DISPOSITION = {
+    "EXPERT_WORK_SANDBOX_E2B_DOMAIN": "required —— _agent_sandbox_runtime 直接读,缺了 KeyError",
+    "EXPERT_WORK_SANDBOX_E2B_API_KEY": "required —— 缺了 skip(整个 agent_sandbox 档没法跑)",
+    "EXPERT_WORK_SANDBOX_E2B_TEMPLATE": "required —— _agent_sandbox_runtime 直接读,缺了 KeyError",
+    "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME": (
+        "required —— 缺了 skip。镜像不再预建 /workspace(W2 Task 9),不挂 NAS "
+        "就等于沙箱里没有 cwd;生产工厂也强制它,契约档没有理由去测一个生产里"
+        "不存在的配置。"
+    ),
+    "EXPERT_WORK_WORKSPACE_NAS_ROOT": (
+        "刻意不配 —— 这是「把 NAS 挂进 control-plane Pod」的那半边,GitHub runner "
+        "对 NAS 没有 NFS 路由,配不了。缺了它 _prepare_workspace_mount 整段跳过,"
+        "挂载点目录改由平台建(root:root 0755,集群实测),沙箱侧 "
+        "AgentSandboxClient._chmod_workspace_mount 那道兜底因此成为这一档唯一的"
+        "权限来源 —— 也正是这一档真正在验的东西之一。"
+    ),
+}
+
+
+def test_contract_fixture_accounts_for_every_mandated_env() -> None:
+    """生产工厂的必配项集合 == 这份契约档显式处置过的集合。
+
+    不连任何真实环境(同 ``test_shared_egress_settings_resolve_to_the_same_env_var``
+    的手法),所以每一次 ``pytest -m "not integration"`` 全仓扫描都跑得到 —— 这
+    正是它想防的东西:别再靠一次 30 分钟的镜像构建 + 真栈跑来发现「契约档的配置
+    形状和生产对不上了」。
+    """
+    from control_plane.runtime import AGENT_SANDBOX_REQUIRED_ENV
+
+    mandated = set(AGENT_SANDBOX_REQUIRED_ENV)
+    disposed = set(_FIXTURE_ENV_DISPOSITION)
+
+    assert mandated == disposed, (
+        f"生产工厂必配 {sorted(mandated)},契约档处置了 {sorted(disposed)} —— "
+        f"未处置 {sorted(mandated - disposed)},多余 {sorted(disposed - mandated)}。"
+        " 每多一项都要在 _FIXTURE_ENV_DISPOSITION 里显式决定:契约档要它,还是"
+        " 有理由不要(把理由写下来)。"
     )

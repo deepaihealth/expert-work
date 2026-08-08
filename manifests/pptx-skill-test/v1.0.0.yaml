@@ -2,7 +2,14 @@
 #
 # Binds the platform `pptx` skill + the `bash` tool in the office sandbox so
 # tools/eval/verify_live_skill_runtime.py can prove the skill's files are
-# materialized at /workspace/skills/pptx/ on a real sandbox acquire.
+# materialized under /opt/skills/<agent_key>/pptx/ on a real sandbox acquire
+# (sandbox migration wave 2 — skills moved off /workspace onto sandbox-local
+# disk, per-agent namespaced). `agent_key` is NOT just this manifest's `name`
+# — orchestrator.tools.skill_seed.sanitize_agent_key appends a content digest
+# to rule out namespace collisions between differently-named agents, so the
+# exact directory can't be predicted from this file alone; the verify
+# script computes it (its own `_sanitize_agent_key`, kept byte-identical)
+# and tells the agent the concrete path per-run — see `phase_mount`.
 #
 # Before registering: the `pptx` platform skill must be ACTIVE (imported skills
 # start as DRAFT) — the verify script's `--setup` flips it for you.
@@ -19,7 +26,8 @@ metadata:
 spec:
   description: >-
     Live auto-mount test agent: binds the platform pptx skill + bash in the
-    office sandbox to prove /workspace/skills/pptx/ is seeded on acquire.
+    office sandbox to prove the pptx skill is seeded under
+    /opt/skills/<agent_key>/pptx/ on acquire.
 
   tenant_config:
     isolation_level: dedicated_sandbox
@@ -33,18 +41,18 @@ spec:
   system_prompt:
     template: |
       You are a test agent. When asked, use the bash tool to run the exact
-      command given and report its full output verbatim. The pptx skill's
-      bundled files are on disk under /workspace/skills/pptx/.
+      command given and report its full output verbatim. The prompt will
+      tell you the exact directory to inspect.
 
   tools:
-    # Only read-only file tools: the auto-mount probe uses list_dir to list the
-    # seeded skill dir off the sandbox filesystem. exec_python / bash are
-    # high-risk (side_effect=irreversible) — they'd be approval-gated AND require
-    # listing in policies.approval_required_tools (harness compliance), so this
-    # read-only test agent omits them. Add them back (+ approval list) for real
-    # pptx generation.
+    # bash: the auto-mount probe `ls`s the seeded skill dir directly — it
+    # lives under /opt/skills/, outside /workspace, so list_dir (which only
+    # ever resolves paths under the workspace root) can no longer reach it
+    # (sandbox migration wave 2). bash is side_effect=irreversible but only
+    # approval-gated when listed in policies.approval_required_tools (not
+    # done here), so this stays a no-approval read-only probe in practice.
     - { type: builtin, name: read_file }
-    - { type: builtin, name: list_dir }
+    - { type: builtin, name: bash }
 
   skills:
     - pptx

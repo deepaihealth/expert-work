@@ -24,11 +24,37 @@ from __future__ import annotations
 #: 沙箱内工作区挂载点 —— 与 supervisor 实现一致。
 WORKSPACE_ROOT = "/workspace"
 
-#: 沙箱镜像是 ``USER agent``(uid 10000,``nologin``)——E2B SDK 默认以用户
-#: ``user`` 执行 ``commands.run`` / ``files.write``,那个账号在我们的镜像里
-#: 不存在(``AuthenticationException: invalid username: 'user'``,2026-08-04
-#: 探针报告实测);``user="root"`` 同样不行(``InvalidArgumentException``)。
-#: 做成常量而非散落字面量 —— Task 8 的 ``exec`` 也要用同一个值。
+#: 沙箱镜像里 ``HOME``/``MPLCONFIGDIR`` 的落点(沙箱迁移波 2 Task 9,
+#: 2026-08-07)。此前 ``HOME`` 就是 :data:`WORKSPACE_ROOT`;波 2 起该路径由
+#: ACS 平台在沙箱启动时建 NAS 挂载 symlink,镜像里绝不能预先建出这个目录
+#: (``Dockerfile`` 的 ``WORKDIR``/``mkdir`` 两条都会创建目录,已删),``HOME``
+#: 因此挪到镜像里另一处早就存在、agent 用户自己拥有的路径——``useradd -m``
+#: 建的家目录。落在沙箱本地盘,不随沙箱重建持久(与 :data:`WORKSPACE_ROOT`
+#: 的 NAS 语义不同),细节见 ``infra/sandbox-image/Dockerfile`` 头注释与
+#: ``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md`` § 二之二。
+SANDBOX_HOME = "/home/agent"
+
+#: 沙箱镜像里的 ``agent`` 用户(uid 10000,``nologin``,``useradd -m`` 建的)
+#: ——E2B SDK 默认以用户 ``user`` 执行 ``commands.run`` / ``files.write``,那个
+#: 账号在我们的镜像里不存在(``AuthenticationException: invalid username:
+#: 'user'``,2026-08-04 探针报告实测)。做成常量而非散落字面量 —— Task 8 的
+#: ``exec`` 也要用同一个值。
+#:
+#: **勘误(W2 收尾真栈复跑)**:这里原本还写着"``user="root"`` 同样不行
+#: (``InvalidArgumentException``)"。那条是 2026-08-04 在**波 1 老镜像**上测
+#: 的,当时镜像声明 ``USER agent``;Task 9 让容器 root 启动之后不再成立 ——
+#: ``AgentSandboxClient._chmod_workspace_mount`` 就是以 ``user="root"`` 跑
+#: ``chmod``,2026-08-07 真栈实测**成功**(挂载共享那条契约用例正是靠它从
+#: PermissionError 转 PASSED)。留着那句话会告诉后来者"别用 root",而我们恰恰
+#: 靠 root 修好了挂载点权限那条 Critical。
+#:
+#: 这个常量本身含义不变:它钉的是**执行身份**(降权后跑用户代码的那个用户),
+#: 不是容器身份。root 可用于平台自己的一次性运维动作,不是 ``exec`` 的落点。
+#:
+#: 沙箱迁移 W2 Task 9(2026-08-07)起镜像不再声明 ``USER agent``(容器本身
+#: root 启动,理由见 ``infra/sandbox-image/Dockerfile`` 头注释)——这个常量
+#: 钉的是执行身份,不是容器身份,含义不变,仍是 ``commands.run``/
+#: ``files.write`` 唯一能用的降权用户。
 SANDBOX_EXEC_USER = "agent"
 
 #: 沙箱镜像 ``infra/sandbox-image/Dockerfile`` 声明的那套 ``ENV``,在这里重述
@@ -57,8 +83,8 @@ SANDBOX_EXEC_USER = "agent"
 SANDBOX_IMAGE_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONUNBUFFERED": "1",
-    "HOME": WORKSPACE_ROOT,
-    "MPLCONFIGDIR": f"{WORKSPACE_ROOT}/.mplconfig",
+    "HOME": SANDBOX_HOME,
+    "MPLCONFIGDIR": f"{SANDBOX_HOME}/.mplconfig",
     "LANG": "zh_CN.UTF-8",
     "LC_ALL": "zh_CN.UTF-8",
     "PIP_USER": "1",

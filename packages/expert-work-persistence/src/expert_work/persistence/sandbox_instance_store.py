@@ -638,6 +638,34 @@ class SqlSandboxInstanceStore:
             )
             return result.scalar_one_or_none()
 
+    async def get_warm(self, *, tenant_id: UUID, user_id: UUID) -> tuple[UUID, str] | None:
+        """沙箱迁移波 2 Task 4 —— 只读版本的 :meth:`claim_warm` 命中分支:
+        不 INSERT、不占坑,单纯查这个用户当前有没有一个已就绪的热会话。见
+        ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.get_warm``
+        的完整契约 docstring。
+
+        谓词与 :meth:`list_active` 同一套(本后端行 + 活行 +
+        ``container_id`` 已回填)——都是"这是一个我能真的 ``connect``/
+        ``destroy`` 的沙箱"这同一个问题的不同问法,理应用同一组 WHERE。
+        """
+        async with self._sf() as session:
+            found = (
+                await session.execute(
+                    select(SandboxInstanceRow.id, SandboxInstanceRow.container_id).where(
+                        SandboxInstanceRow.tenant_id == tenant_id,
+                        SandboxInstanceRow.user_id == user_id,
+                        SandboxInstanceRow.state == _STATE_IN_USE,
+                        SandboxInstanceRow.destroyed_at.is_(None),
+                        SandboxInstanceRow.container_id.is_not(None),
+                        SandboxInstanceRow.image_ref == AGENT_SANDBOX_IMAGE_REF,
+                    )
+                )
+            ).one_or_none()
+        if found is None:
+            return None
+        sandbox_id, container_id = found
+        return (sandbox_id, str(container_id))
+
 
 @dataclass
 class _MemRow:
@@ -844,3 +872,19 @@ class InMemorySandboxInstanceStore:
         see :attr:`_quota_limits`'s docstring for why this is empty in
         production."""
         return self._quota_limits.get(tenant_id)
+
+    async def get_warm(self, *, tenant_id: UUID, user_id: UUID) -> tuple[UUID, str] | None:
+        """Mirrors :meth:`SqlSandboxInstanceStore.get_warm` — a read-only
+        lookup through ``_warm``, no CAS. ``_warm`` only ever points at a row
+        with a container_id once :meth:`set_container_id` has run, but a row
+        can still be mid-create (container_id ``None``) if the pointer was
+        just planted by :meth:`claim_warm`'s winning branch — the explicit
+        ``None`` check mirrors the SQL side's ``container_id.is_not(None)``.
+        """
+        sandbox_id = self._warm.get((tenant_id, user_id))
+        if sandbox_id is None:
+            return None
+        row = self._rows.get(sandbox_id)
+        if row is None or row.container_id is None:
+            return None
+        return (sandbox_id, row.container_id)

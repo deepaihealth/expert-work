@@ -181,7 +181,7 @@ class ReadDocumentTool:
 
     client: SandboxRuntime
     output_char_cap: int = _DOC_OUTPUT_CHAR_CAP
-    #: skill-runtime §5.1 — activated skill files seeded under /workspace/skills/.
+    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property

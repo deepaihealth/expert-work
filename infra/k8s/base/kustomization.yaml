@@ -33,6 +33,7 @@ resources:
   - namespace.yaml
   - configmap.yaml
   - ingress.yaml
+  - control-plane/workspace-nas.yaml
   - control-plane/deployment.yaml
   - control-plane/service.yaml
   - control-plane/headless-service.yaml

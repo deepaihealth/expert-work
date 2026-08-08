@@ -165,6 +165,34 @@ async def test_build_agent_bare_skill_ref_resolves_and_wraps_prompt(
 
 
 @pytest.mark.asyncio
+async def test_available_skills_summary_states_the_sandbox_directory(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """波 2 终审 Important-1 —— 技能文件搬到
+    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/`` 之后,提示词必须陈述这个
+    绝对目录:文件工具 realpath 锁死在 ``/workspace`` 够不到它,而
+    ``agent_key`` 带 8 位摘要后缀,agent 猜不出来。``dir=`` 用与 seed 落点
+    同一个 :func:`sanitize_agent_key` 算出,这条断言即是两者的漂移闸 ——
+    改任一侧的拼法都会在这里红。"""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from orchestrator.tools.skill_seed import sanitize_agent_key
+
+    spec = _spec_with_skills(["foo"])
+    version = _make_version(name="foo", prompt_fragment="explain X to the user")
+    resolver = _make_resolver({("foo", None): _SkillLookupResult.ok(version)})
+    built = await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=resolver,
+        tenant_id=uuid4(),
+    )
+
+    expected = f"{SANDBOX_SKILLS_ROOT}/{sanitize_agent_key(spec.metadata.name)}/foo"
+    assert f'dir="{expected}"' in built.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_build_agent_pinned_skill_ref_resolves(cp: BaseCheckpointSaver[object]) -> None:
     spec = _spec_with_skills(["bar@3"])
     version = _make_version(name="bar", version=3)

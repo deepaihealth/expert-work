@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, get_args
 
+from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
+
 #: OCI runtimes the sandbox supports. ``runc`` is Docker's default
 #: (dev / macOS); ``runsc`` is gVisor (Linux prod).
 SandboxOciRuntime = Literal["runc", "runsc"]
@@ -30,6 +32,22 @@ SandboxOciRuntime = Literal["runc", "runsc"]
 #: to the credential-proxy by an iptables allowlist (Mini-ADR F-2); the
 #: network itself is created by Stream F.5.
 DEFAULT_EGRESS_NETWORK = "expert-work-sandbox-egress"
+
+#: W2 Task 9 baked the sandbox image's non-root user at ``useradd -u
+#: 10000`` (subsystem 14 § 5.6) but dropped the image-level ``USER``
+#: directive itself — the container must start as root so ACS's envd can
+#: fork/exec its NAS-mount storage helper as the container's own identity
+#: (spec § 二之二). The local docker backend has no such constraint and
+#: still uses the container as a real isolation boundary (ACS's is the
+#: microVM instead), so it restores the pre-Task-9 non-root posture itself
+#: via ``--user`` below — the same uid/gid the image's ``agent`` user has.
+SANDBOX_AGENT_UID = 10000
+SANDBOX_AGENT_GID = 10000
+
+#: Matches the image's ``useradd -u 10000 -m`` home directory (``ENV
+#: HOME=/home/agent``, W2 Task 9) — the local backend's tmpfs mount target
+#: for it, mirroring the image's own path.
+SANDBOX_AGENT_HOME = "/home/agent"
 
 
 @dataclass(frozen=True)
@@ -46,6 +64,38 @@ class SandboxResourceLimits:
     #: socket under ``/tmp`` and dies with "no valid pipe path found" otherwise
     #: (route ① office image). Ephemeral, destroyed with the container.
     tmp_size_mb: int = 256
+    #: ``PYTHONUSERBASE`` tmpfs size (W2 Task 9 moved ``/opt/agents`` off the
+    #: image; see :data:`SANDBOX_AGENTS_ROOT`). The largest of the three
+    #: run-time tmpfs because ``pip install --user`` is by far the heaviest
+    #: writer among them.
+    #:
+    #: **Sized against the memory cgroup, not against what pip might want**
+    #: (W2 final review, Minor 4). tmpfs pages are charged to the container's
+    #: memory cgroup, so a tmpfs larger than :attr:`memory_mb` can never be
+    #: filled — the container is OOM-killed first. An OOM-kill is a strictly
+    #: worse failure than the ``ENOSPC`` an appropriately-sized mount gives:
+    #: it kills the whole sandbox mid-run with a signal instead of failing
+    #: one ``pip install`` with a legible error. The invariant this value
+    #: exists to keep is "every tmpfs this provider mounts, summed, stays
+    #: comfortably below the smallest ``memory_mb`` we hand out" — pinned by
+    #: ``test_tmpfs_total_stays_under_the_memory_cgroup``. At the supervisor's
+    #: default 1024 MB the sum is 256 + 64 + 64 + 256 + 64 = 704 MB.
+    #:
+    #: Known cost, accepted: before Task 9 ``HOME`` was ``/workspace``, so a
+    #: persistent-workspace user's ``pip --user`` packages landed on a docker
+    #: volume (disk) and survived container restarts. Per-agent
+    #: ``PYTHONUSERBASE`` (spec 决策 10) plus a bare image run-root (Task 9)
+    #: make that impossible here, so they are RAM-backed and per-container
+    #: now. **Local docker backend only** — on ACS the sandbox is a microVM
+    #: and ``/opt/agents`` is an ordinary directory on its own disk, no tmpfs
+    #: and no cgroup interaction.
+    agents_size_mb: int = 256
+    #: ``/opt/skills`` tmpfs size — skill packages are text plus small
+    #: scripts (the seed path caps the whole payload at 64 MB, see the
+    #: supervisor's ``_MAX_SEED_TOTAL_BYTES``).
+    skills_size_mb: int = 64
+    #: ``$HOME`` tmpfs size — matplotlib config, assorted tool caches.
+    home_size_mb: int = 64
 
 
 #: Default caps — a module-level singleton so it can be an argument
@@ -117,12 +167,45 @@ class SandboxRuntimeProvider:
             container_name,
             "--interactive",
             "--read-only",
+            # W2 Task 6 — the image (Task 9) starts as root with cwd
+            # undeclared (see the SANDBOX_AGENT_UID/GID comment above); the
+            # local backend restores the container-level non-root + cwd
+            # posture itself, byte-identical to the pre-Task-9 behaviour.
+            "--user",
+            f"{SANDBOX_AGENT_UID}:{SANDBOX_AGENT_GID}",
+            "--workdir",
+            "/workspace",
             *self._workspace_mount(limits, workspace_volume),
             # Scratch /tmp — always an ephemeral tmpfs. The rootfs is read-only,
             # and many tools (soffice/poppler, tempfile-heavy libs) need a
             # writable /tmp; mode=1777 so the non-root agent user can write.
             "--tmpfs",
             f"/tmp:rw,size={limits.tmp_size_mb}m,mode=1777",  # noqa: S108 — docker tmpfs mount spec, not a temp-file path
+            # Skills / pip-user-site / HOME — W2 Task 9 moved these off the
+            # image (the run root must stay bare for ACS's NAS-mount
+            # symlink, so nothing can be pre-chowned into it at build time
+            # any more), so the local backend supplies all three as
+            # sandbox-local, agent-owned tmpfs at run time, one-to-one with
+            # the image's own /opt/skills + /opt/agents + /home/agent
+            # directories. ``uid=``/``gid=`` set ownership; no explicit
+            # ``mode=`` — Linux tmpfs defaults to 1777 (world-writable +
+            # sticky) regardless (verified: ``--tmpfs /x:rw,size=10m,uid=
+            # 10000,gid=10000`` alone still lands ``10000:10000 1777``, same
+            # as if ``mode=1777`` were spelled out). Harmless here — only
+            # the single non-root --user above ever runs inside the
+            # container (--cap-drop ALL rules out escaping that identity)
+            # — but don't read the missing ``mode=`` as "therefore not
+            # world-writable"; it is, the kernel default just already
+            # matches what /workspace and /tmp spell out explicitly.
+            "--tmpfs",
+            f"{SANDBOX_SKILLS_ROOT}:rw,size={limits.skills_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            "--tmpfs",
+            f"{SANDBOX_AGENTS_ROOT}:rw,size={limits.agents_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
+            "--tmpfs",
+            f"{SANDBOX_AGENT_HOME}:rw,size={limits.home_size_mb}m"
+            f",uid={SANDBOX_AGENT_UID},gid={SANDBOX_AGENT_GID}",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -168,9 +251,21 @@ class SandboxRuntimeProvider:
                 "--tmpfs",
                 f"/workspace:rw,size={limits.workspace_size_mb}m,mode=1777",
             ]
-        # Stream J.15 — a per-user docker named volume. A fresh volume
-        # inherits the image's ``/workspace`` ownership (``agent:agent``),
-        # so unlike tmpfs it needs no mode override.
+        # Stream J.15 — a per-user docker named volume. This comment
+        # previously claimed a fresh volume inherits the image's
+        # ``/workspace`` ownership (``agent:agent``); that relied on the
+        # image baking a ``WORKDIR /workspace`` + chown, which W2 Task 9
+        # removed (the run root must stay bare for ACS's NAS-mount
+        # symlink). Worse than a first-mount-only gap: since ``--workdir``
+        # (below, in ``docker_run_argv``) always targets this same
+        # ``/workspace`` path, docker resets its ownership to root:root on
+        # *every* container creation, not just the volume's first mount —
+        # so no mount-option fix exists here at all (unlike the tmpfs
+        # branch's ``uid=``/``gid=``/``mode=``, ``--volume`` has no such
+        # option). Fixed one level up, post-launch:
+        # ``CliDockerClient.chown_volume`` + its ``supervisor.py`` call
+        # site (its docstring has the full repro + why it must run after
+        # the container starts, not before).
         return ["--volume", f"{workspace_volume}:/workspace"]
 
 

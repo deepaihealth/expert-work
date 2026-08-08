@@ -73,24 +73,28 @@ def test_summary_lists_skill_md_first_then_supporting_files() -> None:
         lazy_load=False,
         supporting_paths=["scripts/diagnose.py", "reference/error_codes.md"],
     )
-    summary = _render_skill_summary(name="api-debug", version=version)
+    summary = _render_skill_summary(name="api-debug", version=version, agent_key="ag-0badf00d")
     assert 'name="api-debug"' in summary
     assert 'version="1"' in summary
     # SKILL.md must come first; then alphabetical
     assert 'files="SKILL.md, reference/error_codes.md, scripts/diagnose.py"' in summary
+    # 波 2 终审 Important-1 —— 提示词必须陈述技能文件在沙箱里的绝对目录:
+    # 搬到 /opt/skills/<agent_key>/ 之后,agent 既够不到(文件工具锁死在
+    # /workspace)、也猜不出(agent_key 带 8 位摘要后缀)。
+    assert 'dir="/opt/skills/ag-0badf00d/api-debug"' in summary
 
 
 def test_summary_escapes_quotes_in_description() -> None:
     version = _make_version(name="x", prompt="body", lazy_load=False)
     v = version.model_copy(update={"description": 'has "quote" inside'})
-    summary = _render_skill_summary(name="x", version=v)
+    summary = _render_skill_summary(name="x", version=v, agent_key="ag-0badf00d")
     assert "&quot;quote&quot;" in summary
     assert '"quote"' not in summary  # raw " would break the attribute
 
 
 def test_summary_no_supporting_files_lists_only_skill_md() -> None:
     version = _make_version(name="x", prompt="body", lazy_load=False)
-    summary = _render_skill_summary(name="x", version=version)
+    summary = _render_skill_summary(name="x", version=version, agent_key="ag-0badf00d")
     assert 'files="SKILL.md"' in summary
 
 

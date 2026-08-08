@@ -70,6 +70,16 @@ data:
   # why; sandbox ids consequently come back as
   # `default--expert-work-sandbox-<suffix>`.
   EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
+  # Sandbox migration W2 — user workspace storage (NAS). The three
+  # settings configure where control-plane and sandboxes store user
+  # work: control-plane mounts NAS at this root path; each sandbox gets
+  # a per-(tenant, user) subPath within the PVC. EXPERT_WORK_SANDBOX_
+  # WORKSPACE_SUBPATH_PREFIX ("") is relative to NAS /workspaces mount
+  # (relative semantics TBD pending CSI workgroup validation; see
+  # docs/research/2026-08-07-sandbox-w2-probe-results.md § 七).
+  EXPERT_WORK_WORKSPACE_NAS_ROOT: "/mnt/workspaces"
+  EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME: "workspace-nas"
+  EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX: ""
   # EXPERT_WORK_SANDBOX_EGRESS_PROXY_HOST/_PORT keep their settings.py
   # defaults (credential-proxy.expert-work.svc.cluster.local:8081), which
   # are already right here: sandboxes run in `default` while the proxy

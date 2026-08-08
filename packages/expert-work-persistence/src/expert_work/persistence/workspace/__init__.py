@@ -30,6 +30,12 @@ from expert_work.persistence.workspace.dlq import (
     VolumeOpKind as VolumeOpKind,
 )
 from expert_work.persistence.workspace.layout import (
+    SANDBOX_AGENTS_ROOT as SANDBOX_AGENTS_ROOT,
+)
+from expert_work.persistence.workspace.layout import (
+    SANDBOX_SKILLS_ROOT as SANDBOX_SKILLS_ROOT,
+)
+from expert_work.persistence.workspace.layout import (
     WORKSPACE_RESERVED_PREFIXES as WORKSPACE_RESERVED_PREFIXES,
 )
 from expert_work.persistence.workspace.layout import (
@@ -49,6 +55,8 @@ from expert_work.persistence.workspace.sql import (
 )
 
 __all__ = [
+    "SANDBOX_AGENTS_ROOT",
+    "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_RESERVED_PREFIXES",
     "WORKSPACE_SKILLS_DIR",
     "WORKSPACE_UPLOADS_DIR",

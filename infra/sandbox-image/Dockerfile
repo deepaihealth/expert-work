@@ -35,14 +35,50 @@
 # E2B's `run_code()` convenience method (only `commands.run` / envd
 # shell-exec remains) — matches this migration's planned exec channel
 # (spec § 6.1), so no impact; flagged for Task 8.
+#
+# Sandbox migration W2 Task 9 (2026-08-07) — a cluster A/B probe against the
+# real ACS NAS mount (csi-volume-config) pinned two hard blockers baked into
+# this image; full writeup in
+# docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md § 二之二.
+#   * The container must start as root (no image-level `USER`, see bottom of
+#     this file). envd mounts the NAS share by fork/exec-ing a storage
+#     helper *as the container's own identity*, not as a subprocess it can
+#     re-exec under another user — non-root (uid 10000, this image's
+#     previous posture) got `operation not permitted`; the same PV mounted
+#     fine once the container ran as root. This is not a security
+#     downgrade: the sandbox's actual isolation boundary on ACS is the
+#     microVM, not the container user — the official code-interpreter image
+#     ships root for the same reason. Exec still drops privileges:
+#     `commands.run(user="agent")` (W1 Task 7/8, already wired) runs agent
+#     code as uid 10000 regardless of the container's own identity. Local
+#     docker keeps a real container-level boundary, so it needs to stay
+#     non-root there — via `docker run --user 10000:10000`, added in Task 6,
+#     not yet as of this commit, so local sandboxes built from this image
+#     run as root in the interim (dev/CI only; harmless, and ACS is
+#     unaffected either way).
+#   * The run root must not pre-exist in the image. The platform mounts the
+#     NAS share by creating a *symlink* at the mountPath when the sandbox
+#     starts, not by mounting over an existing directory — a directory
+#     already sitting there (from an explicit `mkdir`, or the
+#     directory-creating side effect of declaring it as the image's working
+#     directory) blocks the symlink from ever landing. So this image no
+#     longer creates or declares a working directory at that path; HOME /
+#     MPLCONFIGDIR move to /home/agent (this image's other pre-existing
+#     writable-user path, created by `useradd -m` below) to stay out of the
+#     way too. The run root itself stays a bare mount point with nothing
+#     baked under it.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # Read-only rootfs at runtime: point per-user cache/config dirs at the tmpfs
-    # F.3 mounts on /workspace, so matplotlib & friends can write.
-    HOME=/workspace \
-    MPLCONFIGDIR=/workspace/.mplconfig
+    # HOME/MPLCONFIGDIR point at /home/agent, not the run root (W2 Task 9,
+    # see the header note above `FROM`) — the run root must stay empty for
+    # the platform's NAS-mount symlink. /home/agent is `useradd -m`-created
+    # + agent-owned below. Local docker's --read-only rootfs still needs a
+    # writable mount over it before this is actually writable there — same
+    # gap as the run root's `USER`/`--workdir`, closed by Task 6.
+    HOME=/home/agent \
+    MPLCONFIGDIR=/home/agent/.mplconfig
 
 # Agent Sandbox hard requirement (see header note above): bash at /bin/bash
 # + basic coreutils. Both are Debian `Essential: yes` packages already
@@ -146,27 +182,56 @@ RUN python /tmp/mpl_cjk_rc.py && rm /tmp/mpl_cjk_rc.py
 # restoring on-demand installs.
 #
 # PIP_USER=1 — the runtime rootfs is read-only, so a *global* install would fail
-# on /usr/local. Defaulting pip to --user lands packages in $HOME/.local
-# (HOME=/workspace, a writable tmpfs at runtime) and the user-site is on
-# sys.path automatically, so a bare `pip install X` just works for the agent.
-# Set AFTER the build-time requirements install above so those stay global.
-# Because $HOME/.local lives under the agent's durable workspace, user-site
-# installs persist across execs (and can shadow the image's baked package
-# versions if an agent installs a different version of something already
-# provided) — deliberate PIP_USER semantics, not a bug; a workspace reset is
-# the recovery path if that's ever undesired.
+# on /usr/local. Defaulting pip to --user lands packages in $HOME/.local and
+# the user-site is on sys.path automatically, so a bare `pip install X` just
+# works for the agent. Set AFTER the build-time requirements install above so
+# those stay global.
+#
+# W2 Task 9: $HOME/.local now lands under /home/agent, sandbox-local disk —
+# HOME moved off the durable NAS-backed run root (see the header note above
+# `FROM`), so installs made this way persist only within one sandbox's execs,
+# not across a sandbox rebuild (still shadowing the image's baked package
+# versions if an agent installs a different one, same as before — deliberate
+# PIP_USER semantics, not a bug). Durable, per-agent, concurrency-safe
+# installs are Task 5/6's `PYTHONUSERBASE=/opt/agents/<agent_key>` wiring
+# (spec § 二之三), injected at exec time; this bare-HOME fallback keeps
+# working either way.
 ENV PIP_USER=1
 
-# Non-root user, uid 10000 (subsystem 14 § 5.6). `-m` creates the home dir; we
-# then repoint HOME at /workspace (writable tmpfs at runtime). `nologin` shell —
-# the container is never meant to be exec'd into interactively.
-RUN useradd -u 10000 -m -s /usr/sbin/nologin agent
+# Non-root user, uid 10000 (subsystem 14 § 5.6). `-m` creates /home/agent,
+# which HOME now points straight at (see ENV above). `nologin` shell — the
+# container is never meant to be exec'd into interactively. Exec still runs
+# as this user (`commands.run(user="agent")` / local docker `--user
+# 10000:10000`) even though the container itself now starts as root — see
+# the W2 Task 9 header note.
+#
+# The explicit `chown -R` is load-bearing, confirmed by a real build+run: no
+# `USER` directive exists anywhere in this file any more (root startup), so
+# every `RUN` — including the `mpl_cjk_rc.py` step above, which imports
+# matplotlib and makes it eagerly create its config dir — executes as root.
+# That step already ran with HOME=/home/agent, so /home/agent exists
+# root-owned by the time this line runs; `useradd -m` only takes ownership
+# of a home dir it creates itself, and silently no-ops on one that already
+# exists ("warning: the home directory ... already exists"). Without this
+# chown, /home/agent stays root-owned and the agent user can't write to its
+# own HOME at all (matplotlib import fails outright, `pip install --user`
+# fails) — this mirrors why the old `/workspace` setup used `chown -R`
+# too, for the same underlying reason.
+RUN useradd -u 10000 -m -s /usr/sbin/nologin agent \
+    && chown -R agent:agent /home/agent
 
-# /workspace is the run root; a writable tmpfs is mounted over it at runtime.
-# Created + owned here so WORKDIR resolves and the matplotlib config dir is
-# writable even before (and without) the mount.
-RUN mkdir -p /workspace/.mplconfig && chown -R agent:agent /workspace
-WORKDIR /workspace
+# The run root gets nothing baked under it — W2 Task 9, see the header note
+# above `FROM`: the platform builds a NAS-mount symlink there, and a
+# pre-existing directory (from `mkdir` or a working-directory declaration,
+# both of which create the directory as a side effect) blocks that.
+#
+# /opt/skills and /opt/agents, by contrast, must exist and be agent-owned:
+# skill files and `PYTHONUSERBASE` pip installs both land there as the
+# agent user at runtime, and /opt itself is root-owned — an agent-uid write
+# under an unset subdirectory fails. (Consumed by Task 5's skill-seed
+# rework and the per-agent PYTHONUSERBASE wiring; this task only lays the
+# directories down.)
+RUN mkdir -p /opt/skills /opt/agents && chown agent:agent /opt/skills /opt/agents
 
 COPY runner.py /opt/runner.py
 
@@ -177,7 +242,11 @@ COPY runner.py /opt/runner.py
 # proxy token on CONNECT like requests/httpx already do.
 COPY sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py
 
-USER agent
+# No image-level `USER` here any more — the container starts as root. See
+# the W2 Task 9 header note above `FROM` for why (envd's NAS-mount helper
+# needs to fork/exec as the container's own identity) and why it's safe
+# (isolation boundary is the ACS microVM, not the container user). Agent
+# code execution still drops privileges at the exec layer, not here.
 
 # exec form — no shell process, no shell-injection surface.
 ENTRYPOINT ["python", "/opt/runner.py"]

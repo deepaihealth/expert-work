@@ -17,7 +17,7 @@ dependencies = [
     # langgraph-checkpoint is transitive but pinned directly so pip-audit + CI catch any regression.
     "langgraph>=1.0.10",
     "langgraph-checkpoint>=4.1.1",
-    "langgraph-checkpoint-postgres>=2.0.20",
+    "langgraph-checkpoint-postgres>=3.1.1",
     # Stream A.5 — S3-compatible object storage (MinIO / Aliyun OSS / AWS S3).
     "aiobotocore>=2.13.0",
     # Stream HX-1 — real token estimation (o200k_base) for the context

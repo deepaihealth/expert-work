@@ -9,7 +9,10 @@ Closes the "code green ≠ it actually runs" gap for skill-runtime §5.1/§5.2
 
 * **Phase 2 — auto-mount proof (§5.1).** Drive a *real* agent that has the
   imported skill bound + the ``bash`` tool, asking it to ``cat`` the seeded
-  ``SKILL.md`` out of ``/workspace/skills/<name>/``. If the file is there, the
+  ``SKILL.md`` out of ``/opt/skills/<agent_key>/<name>/`` (sandbox migration
+  wave 2 — skills moved off the NAS-backed ``/workspace`` onto sandbox-local
+  disk, so the probe now needs ``bash``, not ``list_dir``: the latter only
+  ever resolves paths under ``/workspace``). If the file is there, the
   supervisor (#736) + orchestrator (#737) seeding works end-to-end under the
   real sandbox runtime. This is the half CI can't do (no Docker/model in CI).
 
@@ -49,13 +52,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+#: Mirrors orchestrator.tools.skill_seed.sanitize_agent_key — duplicated
+#: rather than imported (see module docstring: this script only talks HTTP).
+#: Must stay byte-identical, INCLUDING the digest suffix (sanitization alone
+#: isn't collision-free — see that function's docstring) — this script
+#: computes the same real seed path the sandbox actually used.
+_AGENT_KEY_DISALLOWED = re.compile(r"[^a-zA-Z0-9._-]")
+_AGENT_KEY_PREFIX_MAX_LEN = 96
+
+
+def _sanitize_agent_key(name: str) -> str:
+    sanitized = _AGENT_KEY_DISALLOWED.sub("-", name)[:_AGENT_KEY_PREFIX_MAX_LEN] or "agent"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
 
 
 def _require_env(name: str) -> str:
@@ -249,16 +268,19 @@ async def phase_mount(client: httpx.AsyncClient, *, agent: str, skill_name: str)
     thread_id = await _create_session(client, name, version)
     print(f"  session: {thread_id}")
 
-    # Probe via list_dir on the seeded skill dir (path is RELATIVE to /workspace
-    # — no leading slash). A directory listing proves the files are on the
-    # sandbox filesystem and is unfakeable by skill_view (which reads a single
-    # file from the DB by exact path, and can't list a directory). list_dir is
-    # read-only → NOT approval-gated (bash/exec_python are, side_effect=irreversible).
-    rel_dir = f"skills/{skill_name}"
+    # sandbox migration wave 2 — skills now live on sandbox-local disk under
+    # /opt/skills/<agent_key>/, outside /workspace, so list_dir (which only
+    # ever resolves paths under the workspace root) can no longer see them.
+    # bash is the only builtin that can reach an absolute non-workspace path.
+    # agent_key = sanitize_agent_key(name) — duplicated here rather than
+    # imported (orchestrator.tools.skill_seed) to keep this script's only
+    # dependency the HTTP API, per its keyless/arms-length design (module
+    # docstring); must stay byte-identical to that function.
+    agent_key = _sanitize_agent_key(name)
+    skill_dir = f"/opt/skills/{agent_key}/{skill_name}"
     prompt = (
-        f"Use the list_dir tool to list the directory `{rel_dir}` (a path relative "
-        "to the workspace root — do NOT prefix it with a slash). Report the entries "
-        "exactly. Use ONLY list_dir; do not use skill_view or read_file."
+        f"Use the bash tool to run exactly: ls {skill_dir}\n"
+        "Report the entries exactly. Use ONLY bash; do not use skill_view or read_file."
     )
     _run_id, tr = await _run_collect(client, thread_id, prompt)
     print(f"  sse events: {tr.events}")
@@ -269,7 +291,7 @@ async def phase_mount(client: httpx.AsyncClient, *, agent: str, skill_name: str)
         return "[tool error]" not in text and "SKILL.md" in text and "scripts" in text
 
     if any(_is_listing(text) for _tool, text in tr.tool_msgs):
-        print(f"  PASS — `{rel_dir}` listed off the sandbox filesystem (auto-mount works).")
+        print(f"  PASS — `{skill_dir}` listed off the sandbox filesystem (auto-mount works).")
         return True
 
     print("  FAIL — couldn't list the seeded skill dir off the sandbox filesystem.")

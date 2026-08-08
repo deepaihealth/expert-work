@@ -342,6 +342,12 @@ from expert_work.persistence.webhook import SqlWebhookEndpointStore as SqlWebhoo
 from expert_work.persistence.webhook import WebhookDeliveryStore as WebhookDeliveryStore
 from expert_work.persistence.webhook import WebhookEndpointStore as WebhookEndpointStore
 from expert_work.persistence.workspace import (
+    SANDBOX_AGENTS_ROOT as SANDBOX_AGENTS_ROOT,
+)
+from expert_work.persistence.workspace import (
+    SANDBOX_SKILLS_ROOT as SANDBOX_SKILLS_ROOT,
+)
+from expert_work.persistence.workspace import (
     WORKSPACE_RESERVED_PREFIXES as WORKSPACE_RESERVED_PREFIXES,
 )
 from expert_work.persistence.workspace import (
@@ -384,6 +390,8 @@ from expert_work.persistence.workspace import (
 __all__ = [
     "RLS_GUC_NAME",
     "RLS_USER_GUC_NAME",
+    "SANDBOX_AGENTS_ROOT",
+    "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_RESERVED_PREFIXES",
     "WORKSPACE_SKILLS_DIR",
     "WORKSPACE_UPLOADS_DIR",

@@ -1,0 +1,34 @@
+# Sandbox migration W2 — user workspaces on NAS.
+# PV dual-consumer: control-plane mounts the entire tree via PVC;
+# sandboxes reference it by pvName + subPath (W0 PoC validated:
+# PV in Bound state can be consumed by both control-plane and sandbox csi-volume).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workspace-nas
+spec:
+  capacity:
+    storage: 500Gi          # NAS capacity is metered by actual usage;
+                            # this value is used only for scheduling.
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: nasplugin.csi.alibabacloud.com
+    volumeHandle: workspace-nas
+    volumeAttributes:
+      server: 001qwl4r8snh205ihrs-gcl98.cn-hangzhou.nas.aliyuncs.com
+      path: /workspaces
+      vers: "3"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workspace-nas
+  namespace: expert-work
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: workspace-nas
+  resources:
+    requests:
+      storage: 500Gi

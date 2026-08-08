@@ -82,14 +82,21 @@ class FakeRunnerLink:
         self._exec_error = exec_error
         self.closed = False
         self.exec_calls: list[tuple[str, int]] = []
+        #: sandbox migration wave 2 (spec 决策 10) — the ``envs`` kwarg passed
+        #: to each ``exec`` call, kept out of ``exec_calls`` so existing
+        #: 2-tuple assertions stay unchanged.
+        self.exec_envs_calls: list[dict[str, str] | None] = []
 
     async def wait_ready(self, timeout_s: float) -> None:
         if not self._ready:
             msg = "runner never reported ready"
             raise RunnerLinkError(msg)
 
-    async def exec(self, code: str, timeout_s: int) -> ExecResult:
+    async def exec(
+        self, code: str, timeout_s: int, *, envs: dict[str, str] | None = None
+    ) -> ExecResult:
         self.exec_calls.append((code, timeout_s))
+        self.exec_envs_calls.append(envs)
         if self._exec_error is not None:
             raise self._exec_error
         return self._exec_result
@@ -116,6 +123,7 @@ class RecordingDockerClient:
         existing_images: set[str] | None = None,
         pull_error: DockerError | None = None,
         seed_error: DockerError | None = None,
+        chown_error: DockerError | None = None,
     ) -> None:
         self.launches: list[list[str]] = []
         self.removed: list[str] = []
@@ -144,6 +152,9 @@ class RecordingDockerClient:
         self._seed_error = seed_error
         #: (container_name, [(path, bytes), ...]) for each seed_workspace call.
         self.seeds: list[tuple[str, list[tuple[str, bytes]]]] = []
+        self._chown_error = chown_error
+        #: (volume, image) for each chown_volume call.
+        self.chowns: list[tuple[str, str]] = []
 
     async def launch(self, argv: list[str]) -> FakeRunnerLink:
         self.launches.append(argv)
@@ -210,6 +221,11 @@ class RecordingDockerClient:
         self.seeds.append((container_name, files))
         if self._seed_error is not None:
             raise self._seed_error
+
+    async def chown_volume(self, *, volume: str, image: str) -> None:
+        self.chowns.append((volume, image))
+        if self._chown_error is not None:
+            raise self._chown_error
 
     async def image_exists(self, image: str) -> bool:
         return image in self._existing_images
@@ -545,6 +561,11 @@ async def test_acquire_launch_failure_marks_failed_and_raises() -> None:
 
     states = [r.state for r in h.store.rows.values()]
     assert states == [SandboxState.FAILED]
+    # docker.remove() is called unconditionally in the failure path (cheap
+    # and idempotent even when launch() itself never got a container up);
+    # asserted here too for completeness alongside the two tests below.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio
@@ -556,6 +577,13 @@ async def test_acquire_runner_not_ready_marks_failed_and_raises() -> None:
 
     states = [r.state for r in h.store.rows.values()]
     assert states == [SandboxState.FAILED]
+    # code-reviewer Important-2: a container that launched but never
+    # reported ready must not be orphaned (nothing else points to it —
+    # self._links / the store's container_id are only set after this
+    # whole try block succeeds) — it has to be torn down right here, not
+    # left for the next supervisor-restart sweep_orphans() pass.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio
@@ -613,13 +641,84 @@ async def test_acquire_with_user_mounts_persistent_volume() -> None:
 
     argv = h.docker.launches[0]
     assert f"{workspace_volume_name(tenant, user)}:/workspace" in argv
-    # /workspace is a named volume (not a tmpfs); the scratch /tmp tmpfs stays.
+    # /workspace is a named volume (not a tmpfs); the scratch /tmp tmpfs plus
+    # the W2 Task 6 skills/agents/home tmpfs (unconditional) stay.
     tmpfs_targets = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
-    assert tmpfs_targets == ["/tmp:rw,size=256m,mode=1777"]  # noqa: S108 — mount spec literal
+    assert tmpfs_targets == [
+        "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
+        "/opt/skills:rw,size=64m,uid=10000,gid=10000",
+        "/opt/agents:rw,size=256m,uid=10000,gid=10000",
+        "/home/agent:rw,size=64m,uid=10000,gid=10000",
+    ]
 
     row = h.store.rows[response.sandbox_id]
     assert row.user_id == user
     assert row.workspace_id is not None
+
+
+# ---------------------------------------------------------------------------
+# W2 Task 6 follow-up — chown the persistent volume after every cold start
+# (docker resets --workdir /workspace's ownership to root:root on *every*
+# container creation, not just the volume's first mount — see
+# CliDockerClient.chown_volume's docstring for the full repro)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_chowns_persistent_volume_after_cold_start() -> None:
+    h = _harness()
+    tenant, user = uuid4(), uuid4()
+    response = await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+
+    volume = workspace_volume_name(tenant, user)
+    assert h.docker.chowns == [(volume, SandboxSupervisorSettings().sandbox_image)]
+    row = h.store.rows[response.sandbox_id]
+    assert row.state is SandboxState.IN_USE
+
+
+@pytest.mark.asyncio
+async def test_acquire_ephemeral_does_not_chown() -> None:
+    # No user_id → the ephemeral tmpfs path; nothing to chown (mode=1777
+    # already lets the non-root agent write regardless of ownership).
+    h = _harness()
+    await h.supervisor.acquire(_acquire_request())
+    assert h.docker.chowns == []
+
+
+@pytest.mark.asyncio
+async def test_acquire_warm_session_reuse_does_not_rechown() -> None:
+    # A second acquire for the same (tenant, user) that reuses the warm
+    # session never calls docker.launch() at all, so there's no fresh
+    # --workdir reset to fix — chown must not run again (idempotent AND
+    # cheap: no extra docker round-trip on the hot warm-reuse path).
+    h = _harness()
+    tenant, user = uuid4(), uuid4()
+    await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+    await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
+
+    assert len(h.docker.launches) == 1
+    assert len(h.docker.chowns) == 1
+
+
+@pytest.mark.asyncio
+async def test_acquire_chown_failure_marks_failed_and_raises() -> None:
+    # chown failing must fail the whole acquire closed (DockerError →
+    # SupervisorError, same contract as a launch/wait_ready failure) —
+    # never hand back a sandbox that silently can't write its own
+    # workspace.
+    h = _harness(docker=RecordingDockerClient(chown_error=DockerError("chown boom")))
+    with pytest.raises(SupervisorError, match="sandbox launch failed"):
+        await h.supervisor.acquire(_acquire_request(user_id=uuid4()))
+
+    states = [r.state for r in h.store.rows.values()]
+    assert states == [SandboxState.FAILED]
+    # code-reviewer Important-2: chown_volume fails *after* launch() has
+    # already created a live, READY container — nothing (self._links, the
+    # store's container_id) points to it yet at that point, so it must be
+    # torn down here or it leaks until the next supervisor-restart
+    # sweep_orphans() pass.
+    sandbox_id = next(iter(h.store.rows))
+    assert h.docker.removed == [f"expert-work-sb-{sandbox_id}"]
 
 
 @pytest.mark.asyncio
@@ -940,7 +1039,10 @@ async def test_read_workspace_file_returns_content() -> None:
 @pytest.mark.asyncio
 async def test_read_workspace_file_rejects_unsafe_path() -> None:
     h = _harness()
-    for bad in ("/etc/passwd", "../escape"):
+    # "a\0b" —— W2 终审复审 New-1。CPython 在下系统调用前就对内嵌空字节抛裸
+    # ``ValueError``,不是这个服务错误边界接得住的类型;NAS 后端在自己的归一化
+    # 里拒,守卫不能按后端分叉(见 ``_validate_workspace_path`` docstring)。
+    for bad in ("/etc/passwd", "../escape", "a\0b"):
         with pytest.raises(WorkspaceFileNotFoundError):
             await h.supervisor.read_workspace_file(tenant_id=uuid4(), user_id=uuid4(), path=bad)
     # A rejected path never reaches docker.
@@ -1161,6 +1263,31 @@ async def test_exec_defaults_timeout_to_service_default() -> None:
 
     await h.supervisor.exec(response.sandbox_id, code="print(1)")
     assert link.exec_calls == [("print(1)", 25)]
+
+
+@pytest.mark.asyncio
+async def test_exec_forwards_envs_to_the_runner_link() -> None:
+    """sandbox migration wave 2 (spec 决策 10) — ``envs`` reaches the runner
+    link on every call (not baked in at acquire time — two agents can share
+    one already-warm session, see ``SandboxSupervisor.exec`` docstring)."""
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    response = await h.supervisor.acquire(_acquire_request())
+
+    await h.supervisor.exec(
+        response.sandbox_id, code="print(1)", envs={"PYTHONUSERBASE": "/opt/agents/a1"}
+    )
+    assert link.exec_envs_calls == [{"PYTHONUSERBASE": "/opt/agents/a1"}]
+
+
+@pytest.mark.asyncio
+async def test_exec_omits_envs_when_not_given() -> None:
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    response = await h.supervisor.acquire(_acquire_request())
+
+    await h.supervisor.exec(response.sandbox_id, code="print(1)")
+    assert link.exec_envs_calls == [None]
 
 
 @pytest.mark.asyncio
@@ -1427,6 +1554,25 @@ async def test_replenisher_tops_up_to_target() -> None:
     # Pool rows are platform-neutral until claim binds a real tenant.
     assert all(r.tenant_id == POOL_TENANT_ID for r in ready)
     assert all(r.user_id is None for r in ready)
+
+
+@pytest.mark.asyncio
+async def test_replenisher_argv_carries_the_settings_memory_cap() -> None:
+    """W2 终审复审 New-3 —— 池启动的 argv 必须带 settings 的内存上限。
+
+    不传 ``limits=`` 会退回 ``SandboxResourceLimits`` 的 dataclass 默认
+    ``memory_mb=512``,而同一个 dataclass 声明的 tmpfs 加起来 704MB——
+    ``test_tmpfs_total_stays_under_the_memory_cgroup`` 那条不变式对池容器的
+    argv 就是假的。今天不出事只是因为池里的容器在被 claim 抬到 1024 之前
+    什么都不跑;把 ``default_memory_mb`` 调到 939 以下就会静默失效。
+    """
+    pool = SandboxPool()
+    h = _harness(pool=pool)
+    await _replenisher(h, pool, pool_size=1).run_once()
+
+    argv = h.docker.launches[0]
+    expected = f"{SandboxSupervisorSettings().default_memory_mb}m"
+    assert argv[argv.index("--memory") + 1] == expected
 
 
 @pytest.mark.asyncio
@@ -1812,3 +1958,33 @@ async def test_egress_acquire_bypasses_pool() -> None:
     # A NEW cold launch happened and the pooled container was NOT claimed.
     assert len(h.docker.launches) == launches_after_fill + 1
     assert pool.size(settings.sandbox_image) == 1
+
+
+def test_tmpfs_total_stays_under_the_memory_cgroup() -> None:
+    """W2 终审 Minor-4 —— tmpfs 页计入 memory cgroup。所有 tmpfs 尺寸之和超过
+    ``--memory`` 的话,大的那块永远填不满:容器先被 OOM-kill(整个沙箱带信号
+    猝死),而不是在挂载点上给一个可读的 ``ENOSPC``。此前 ``/opt/agents`` 是
+    512m,五块加起来 960m,顶着这里的默认 1024m,留给真正跑代码的内存不到
+    64m;一次 ``pip install --user`` 就能把沙箱打死。
+
+    这条闸住在 supervisor 而不是 ``expert-work-runtime`` 的测试里:``memory_mb``
+    的生产取值由 :class:`SandboxSupervisorSettings` 决定,而
+    ``SandboxResourceLimits.memory_mb`` 的 dataclass 默认值在生产路径上恒被
+    ``_docker_run_argv`` 用 ``record.memory_mb`` 覆盖 —— 两个值住在两个包里,
+    只有这个服务同时依赖二者。留 25% 余量给进程本身。
+    """
+    from expert_work.runtime.sandbox import SandboxResourceLimits
+
+    limits = SandboxResourceLimits()
+    total = (
+        limits.tmp_size_mb
+        + limits.workspace_size_mb
+        + limits.skills_size_mb
+        + limits.agents_size_mb
+        + limits.home_size_mb
+    )
+    budget = SandboxSupervisorSettings().default_memory_mb
+    assert total <= budget * 0.75, (
+        f"tmpfs 总量 {total}MB 超过 memory cgroup {budget}MB 的 75% —— "
+        f"写满任一块都会 OOM-kill 而不是 ENOSPC"
+    )

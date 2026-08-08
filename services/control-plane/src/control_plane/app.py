@@ -705,16 +705,34 @@ def create_app(
     # is shared with the docker-supervisor backend). ``None`` sql_stores
     # (persistence_backend="memory") falls back to the factory's own
     # InMemorySandboxInstanceStore default.
+    #
+    # 波 2 Task 4 — kept as a named variable (not inlined into the
+    # build_sandbox_runtime call below) so build_workspace_store can be
+    # handed the SAME store instance: NasWorkspaceStore.mark_deleted reads
+    # get_warm() through it to find a soft-deleted user's warm session to
+    # tear down (see that method's docstring), and it must be looking at the
+    # same rows AgentSandboxClient itself writes.
+    resolved_sandbox_instance_store = (
+        SqlSandboxInstanceStore(sql_stores.session_factory) if sql_stores else None
+    )
     resolved_sandbox_runtime = build_sandbox_runtime(
         resolved_settings,
-        sandbox_instance_store=(
-            SqlSandboxInstanceStore(sql_stores.session_factory) if sql_stores else None
-        ),
+        sandbox_instance_store=resolved_sandbox_instance_store,
     )
     # 波 1 Task 4 — workspace-file ops now live on a separate client, built
     # from the same supervisor URL (still the only thing that can reach the
     # docker-volume workspace today; wave 2's NAS mount replaces this).
-    resolved_workspace_store = build_workspace_store(resolved_settings.sandbox_supervisor_url)
+    #
+    # 波 2 Task 4 — built AFTER resolved_sandbox_runtime and handed both it
+    # and resolved_sandbox_instance_store (brief-mandated ordering: "先
+    # build_sandbox_runtime 再 build_workspace_store(settings, runtime=...,
+    # instance_store=...)") so NasWorkspaceStore.mark_deleted can destroy a
+    # purged user's warm sandbox session.
+    resolved_workspace_store = build_workspace_store(
+        resolved_settings,
+        runtime=resolved_sandbox_runtime,
+        instance_store=resolved_sandbox_instance_store,
+    )
     resolved_feedback = feedback_repo or (
         sql_stores.feedback if sql_stores else InMemoryFeedbackStore()
     )

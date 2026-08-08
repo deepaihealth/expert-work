@@ -302,7 +302,9 @@ def _register_routes(app: FastAPI) -> None:
     async def exec_code(
         sandbox_id: UUID, body: ExecRequest, supervisor: SupervisorDep
     ) -> ExecResponse:
-        result = await supervisor.exec(sandbox_id, code=body.code, timeout_s=body.timeout_s)
+        result = await supervisor.exec(
+            sandbox_id, code=body.code, timeout_s=body.timeout_s, envs=body.envs or None
+        )
         return ExecResponse(
             stdout=result.stdout,
             stderr=result.stderr,

@@ -162,6 +162,50 @@ async def test_exec_aligns_timeout_and_passes_it(tracing_setup: None) -> None:
     assert headers.get(TRACEPARENT_HEADER, "").split("-")[1] == active_trace_id
 
 
+async def test_exec_injects_agent_key_env_when_set() -> None:
+    """sandbox migration wave 2 (spec 决策 10) — ``agent_key`` non-empty →
+    the POST body carries ``envs.PYTHONUSERBASE``, the same value the cloud
+    backend (``AgentSandboxClient``) sends via ``commands.run(envs=...)``
+    (contract-tested in ``test_sandbox_runtime_contract.py``)."""
+    import json as _json
+
+    from expert_work.persistence import SANDBOX_AGENTS_ROOT
+
+    body: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(_json.loads(request.content))
+        return httpx.Response(
+            200, json={"stdout": "", "stderr": "", "exit_code": 0, "timed_out": False}
+        )
+
+    client = HTTPSupervisorRuntime(
+        base_url="http://supervisor", transport=httpx.MockTransport(handler)
+    )
+    await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent")
+
+    assert body["envs"] == {"PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent"}
+
+
+async def test_exec_omits_envs_when_agent_key_unset() -> None:
+    import json as _json
+
+    body: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(_json.loads(request.content))
+        return httpx.Response(
+            200, json={"stdout": "", "stderr": "", "exit_code": 0, "timed_out": False}
+        )
+
+    client = HTTPSupervisorRuntime(
+        base_url="http://supervisor", transport=httpx.MockTransport(handler)
+    )
+    await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5)
+
+    assert "envs" not in body  # back-compat: no key when there's nothing to inject
+
+
 async def test_workspace_list_parses_files_and_traces(tracing_setup: None) -> None:
     from orchestrator.tools.workspace_store import WorkspaceFileEntry
 

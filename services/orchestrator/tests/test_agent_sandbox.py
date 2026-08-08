@@ -50,6 +50,7 @@ Task 9 独立审查 Important-1/2 追加(task-9-report.md 有完整记录):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -63,6 +64,7 @@ import httpcore
 import pytest
 from e2b import CommandExitException, TimeoutException
 
+from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     InMemorySandboxInstanceStore,
@@ -80,6 +82,7 @@ from orchestrator.tools.agent_sandbox import (
     WORKSPACE_ROOT,
     AgentSandboxClient,
 )
+from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
 from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
@@ -103,6 +106,11 @@ class FakeCommands:
     """
 
     calls: list[tuple[str, int | None, str | None, str | None]] = field(default_factory=list)
+    #: spec 决策 10 — the ``envs`` kwarg passed to each ``run`` call, kept out
+    #: of ``calls`` (same reason as ``egress_calls``/``exec_agent_keys`` in
+    #: ``orchestrator.tools.sandbox``): existing 4-tuple assertions on
+    #: ``calls`` stay unchanged.
+    envs_calls: list[dict[str, str] | None] = field(default_factory=list)
     result_stdout: str = ""
     result_stderr: str = ""
     result_exit: int = 0
@@ -115,8 +123,10 @@ class FakeCommands:
         *,
         user: str | None = None,
         cwd: str | None = None,
+        envs: dict[str, str] | None = None,
     ):
         self.calls.append((cmd, timeout, user, cwd))
+        self.envs_calls.append(envs)
         if self.run_error is not None:
             raise self.run_error
         return type(
@@ -354,7 +364,14 @@ class FakeInstanceStore:
         return self.quota_limit
 
 
-def make_client(sdk: FakeSdk, store: SandboxInstanceStore) -> AgentSandboxClient:
+def make_client(
+    sdk: FakeSdk,
+    store: SandboxInstanceStore,
+    *,
+    workspace_pv_name: str | None = None,
+    workspace_subpath_prefix: str = "",
+    workspace_root: str | None = None,
+) -> AgentSandboxClient:
     return AgentSandboxClient(
         domain="gw.example.com",
         api_key="k",
@@ -364,6 +381,11 @@ def make_client(sdk: FakeSdk, store: SandboxInstanceStore) -> AgentSandboxClient
         egress_token_secret="s3cret",
         egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
         egress_proxy_port=8081,
+        # 沙箱迁移波 2 Task 4 —— 三项全默认 None/"":调用方不传就是波 1 行为,
+        # 与 AgentSandboxClient 自己的字段默认值同一个理由(见类 docstring)。
+        workspace_pv_name=workspace_pv_name,
+        workspace_subpath_prefix=workspace_subpath_prefix,
+        workspace_root=workspace_root,
     )
 
 
@@ -578,6 +600,9 @@ async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> No
 
 @pytest.mark.asyncio
 async def test_seed_files_written_before_first_exec() -> None:
+    """sandbox migration wave 2 — seed lands under SANDBOX_SKILLS_ROOT
+    (sandbox-local), not WORKSPACE_ROOT; relpath already carries the
+    agent_key namespace prefix (the caller's job, build_skill_seed_files)."""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
@@ -585,10 +610,12 @@ async def test_seed_files_written_before_first_exec() -> None:
         tenant_id=uuid4(),
         thread_id="t1",
         user_id=uuid4(),
-        seed_files=(("skills/a.md", b"hello"),),
+        seed_files=(("agent-1/pptx/a.md", b"hello"),),
     )
 
-    assert sdk.sandbox.files.written == [("/workspace/skills/a.md", b"hello", SANDBOX_EXEC_USER)]
+    assert sdk.sandbox.files.written == [
+        (f"{SANDBOX_SKILLS_ROOT}/agent-1/pptx/a.md", b"hello", SANDBOX_EXEC_USER)
+    ]
 
 
 @pytest.mark.asyncio
@@ -936,6 +963,26 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
     assert run_user == SANDBOX_EXEC_USER
 
 
+@pytest.mark.asyncio
+async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
+    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— ``commands.run`` 走
+    ``/bin/bash -l -c cmd``,所以命令串必须以 ``umask 000 && `` 打头,让
+    bash 先放开 umask 再 exec python:agent 代码自己 ``mkdir``/``open`` 出
+    的目录/文件才不会被默认 umask(常见 0o022)掩成 control-plane 读得进
+    但删/写不进的 0o755/0o644——与本地 supervisor 后端
+    ``runner.py.main()`` 的 ``os.umask(0)`` 同一个根因的两个后端各自的
+    落点,契约测试(``test_sandbox_runtime_contract.py``)钉住两者不会
+    分叉。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    cmd, *_ = sdk.sandbox.commands.calls[-1]
+    assert cmd.startswith("umask 000 && python "), cmd
+
+
 # ---------------------------------------------------------------------------
 # 全分支终审 Important-2 —— 沙箱进程既不继承镜像的 WORKDIR 也不继承它的 ENV
 # (2026-08-04 集群探针实测)。cwd 靠 commands.run(cwd=),环境变量靠
@@ -976,10 +1023,372 @@ async def test_create_passes_the_image_environment() -> None:
     envs = sdk.created[-1]["envs"]
     for key, value in SANDBOX_IMAGE_ENV.items():
         assert envs[key] == value, f"镜像环境变量 {key} 没送进沙箱"
-    assert envs["HOME"] == "/workspace", "HOME 不是 /workspace 则 PIP_USER 装到工作区外"
+    # 沙箱迁移 W2 Task 9:HOME 迁出 WORKSPACE_ROOT——/workspace 现在必须空着
+    # 让平台建 NAS 挂载 symlink,HOME 改落 useradd -m 建好的 /home/agent。
+    assert envs["HOME"] == "/home/agent", "HOME 不是 /home/agent 则 PIP_USER 装到镜像预建目录之外"
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
     # egress 那组仍在 —— 合并没有把它挤掉。
     assert "HTTPS_PROXY" in envs
+
+
+# ---------------------------------------------------------------- 沙箱迁移波 2 Task 4:
+# csi-volume-config 挂载注入 + acquire 前的软删闸/mkdir+chown。
+
+
+@pytest.mark.asyncio
+async def test_create_injects_csi_volume_config() -> None:
+    """``workspace_pv_name`` 配了时,``create(metadata=)`` 必须带
+    ``e2b.agents.kruise.io/csi-volume-config``,JSON 解出的三键与 subPath
+    拼接对——``prefix=""``(生产配置)不留前导 ``"/"``。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+    tenant_id, user_id = uuid4(), uuid4()
+
+    await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    metadata = sdk.created[-1]["metadata"]
+    volumes = json.loads(metadata["e2b.agents.kruise.io/csi-volume-config"])
+    assert volumes == [
+        {
+            "pvName": "workspace-nas",
+            "mountPath": WORKSPACE_ROOT,
+            "subPath": f"{tenant_id}/{user_id}",
+        }
+    ]
+
+
+def test_workspace_subpath_prefix_conflicts_with_pv_name_raises() -> None:
+    """Task 4 审查 Important-1 —— ``workspace_pv_name`` 配了、非空
+    ``workspace_subpath_prefix`` 也配了这个组合会让沙箱与 ``NasWorkspaceStore``
+    静默各写各的树(前者按前缀挂,后者压根不理解前缀),必须在构造期就大
+    声拒绝,不要等到跑起来才靠"用户上传的文件沙箱里看不到"这种症状去反查。
+    """
+    with pytest.raises(ValueError, match="workspace_subpath_prefix"):
+        make_client(
+            FakeSdk(),
+            FakeInstanceStore(),
+            workspace_pv_name="workspace-nas",
+            workspace_subpath_prefix="ew",
+        )
+
+
+def test_workspace_subpath_prefix_empty_string_is_fine_with_pv_name() -> None:
+    """空串(生产配置)与 ``workspace_pv_name`` 同时配不该被这条新校验挡住
+    ——``__post_init__`` 只拒非空前缀,不拒配置项本身共存。"""
+    make_client(FakeSdk(), FakeInstanceStore(), workspace_pv_name="workspace-nas")
+
+
+def test_workspace_subpath_prefix_alone_is_fine() -> None:
+    """未配 ``workspace_pv_name`` 时,``workspace_subpath_prefix`` 非空不该
+    被拒——两者的冲突只在 ``workspace_pv_name`` 也配了时才成立。"""
+    make_client(FakeSdk(), FakeInstanceStore(), workspace_subpath_prefix="ew")
+
+
+@pytest.mark.asyncio
+async def test_create_without_pv_name_omits_metadata() -> None:
+    """未配 ``workspace_pv_name``(波 1 默认)—— 不出现 ``metadata`` 键,行为
+    与波 1 完全一致。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    assert "metadata" not in sdk.created[-1]
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_create_mounts_scratch_subpath() -> None:
+    """临时沙箱(``user_id=None``)也必须挂(spec 决策 9)——subPath 走
+    ``_scratch/<sandbox_id>``,``sandbox_id`` 是本次 acquire 返回的那个 id。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    metadata = sdk.created[-1]["metadata"]
+    volumes = json.loads(metadata["e2b.agents.kruise.io/csi-volume-config"])
+    assert volumes == [
+        {
+            "pvName": "workspace-nas",
+            "mountPath": WORKSPACE_ROOT,
+            "subPath": f"_scratch/{sandbox_id}",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acquire_mkdirs_user_workspace(tmp_path: Path) -> None:
+    """``workspace_root`` 配了 —— acquire 前把该用户在 NAS 上的目录建出来
+    (spec § 二之二"附带事实":不 mkdir 就没有目录可挂/可放开权限)。真
+    ``mkdir``/``chmod`` 都不需要 monkeypatch 了(Critical 修复后):chmod
+    自己拥有的目录不需要 root,不像 chown 到别的 uid 那样会 EPERM。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+
+    await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert (tmp_path / str(tenant_id) / str(user_id)).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
+    """临时沙箱同理建 ``_scratch/<sandbox_id>``——本任务对 brief 留白问题
+    ("_scratch 是否也需要 mkdir+放开权限")的取舍:走同一段逻辑,同一个真因
+    (NAS 新建目录默认权限挡住沙箱内的 agent uid)在这个 subPath 下同样
+    成立。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert (tmp_path / "_scratch" / str(sandbox_id)).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_acquire_chmods_the_mount_from_inside_the_sandbox() -> None:
+    """波 2 收尾(集群实测坐实)—— 挂载点目录若由**平台**建,是 ``root:root
+    0755``,沙箱里的 agent(uid 10000)第一次写 ``/workspace`` 就
+    ``PermissionError``。权威修法是 control-plane 在 ``create()`` 之前
+    mkdir 成 0o777(``_prepare_workspace_mount``),这里钉的是够不到那半边
+    时的兜底:沙箱建好后以 **root** 跑一句 ``chmod 0777 /workspace``。
+
+    断言 ``user="root"`` 而不是 ``SANDBOX_EXEC_USER``:agent 不是属主,以
+    agent 身份 chmod 一个 root 属主的目录必然 EPERM,这一句就白跑了。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    chmods = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")]
+    assert chmods == [(f"chmod 0777 {WORKSPACE_ROOT}", None, "root", None)]
+
+
+@pytest.mark.asyncio
+async def test_acquire_skips_the_mount_chmod_when_no_pv_is_configured() -> None:
+    """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
+    ——那一句 chmod 只会在 envd 侧留一条无意义的失败,不发。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")] == []
+
+
+@pytest.mark.asyncio
+async def test_acquire_survives_a_failing_mount_chmod() -> None:
+    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的 0o777、
+    属主 uid 10002,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
+    成 nobody,对别人属主的目录 chmod 必然 EPERM。那种失败是无害的(目录本来
+    就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.commands.run_error = RuntimeError("chmod: Operation not permitted")
+    client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert sandbox_id is not None
+    assert sdk.sandbox.killed is False
+
+
+@pytest.mark.asyncio
+async def test_acquire_chmods_user_workspace_world_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Critical 修复(集群实测坐实)—— control-plane 以非 root 的 uid 10002
+    运行,``os.chown`` 到沙箱镜像 ``agent`` 用户的 uid(10000)必然
+    ``EPERM``(非 root 无权把文件属主改成另一个 uid),云后端每一次
+    ``acquire`` 都会在这里炸掉。改用 ``os.chmod`` 放宽权限——这里
+    monkeypatch 记录调用参数,断言目标 mode 是 ``0o777``(控制面仍是属
+    主,沙箱内的 agent uid 靠"其他用户"这一档拿到读写权限)。"""
+    calls: list[tuple[str, int]] = []
+
+    def fake_chmod(path: object, mode: int) -> None:
+        calls.append((str(path), mode))
+
+    monkeypatch.setattr(os, "chmod", fake_chmod)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+
+    await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert len(calls) == 1
+    chmoded_path, mode = calls[0]
+    assert chmoded_path == str(tmp_path / str(tenant_id) / str(user_id))
+    assert mode == 0o777
+
+
+@pytest.mark.asyncio
+async def test_acquire_surfaces_chmod_failure_as_sandbox_supervisor_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """chmod 失败(NAS 权限异常 / 挂载点抖动)同样必须大声抛
+    ``SandboxSupervisorError``,不静默——静默的话沙箱会挂载到一个 agent
+    用户写不进去的目录,直到执行期才报一个远离根因的错误。"""
+
+    def fake_chmod(path: object, mode: int) -> None:
+        del path, mode
+        raise OSError("simulated NAS permission error")
+
+    monkeypatch.setattr(os, "chmod", fake_chmod)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    with pytest.raises(SandboxSupervisorError, match="simulated NAS permission error"):
+        await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+
+def _plant_marker(root: Path, tenant_id: UUID, user_id: UUID) -> None:
+    """按 ``NasWorkspaceStore.mark_deleted`` 的真实落点造软删标记。"""
+    marker = workspace_deleted_marker(str(root), tenant_id, user_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
+@pytest.mark.asyncio
+async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
+    """软删闸 —— ``{root}/{tenant}/.deleted/{user}`` 存在时 acquire 必须拒
+    (supervisor 对软删工作区同样在 acquire 拒,可观察契约一致:统一包成
+    ``SandboxSupervisorError``)。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    _plant_marker(tmp_path, tenant_id, user_id)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    with pytest.raises(SandboxSupervisorError, match="workspace deleted"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    # 拒绝发生在 claim_warm 之前 —— 没有留下任何行。
+    assert store.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_acquire_ignores_a_marker_file_written_inside_the_mounted_tree(
+    tmp_path: Path,
+) -> None:
+    """全分支终审 C-1(跨任务接缝)—— ``{tenant}/{user}`` 整棵树经 subPath 挂
+    进沙箱的 ``/workspace``,沙箱里的 agent(跑 LLM 生成的代码 / 处理带注入的
+    上传文档)可以直接 ``write_file(".ew-workspace-deleted")``。软删闸读的
+    marker 必须不在这棵树里,否则一次注入就能把活跃用户的工作区永久标记成待
+    回收:此后每一次 acquire(含热复用)都拒,而 ``list_files`` 又把这个文件
+    过滤掉,UI 上看不到任何异常。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    # 沙箱视角:直接写 /workspace/.ew-workspace-deleted。
+    (user_root / ".ew-workspace-deleted").write_text("")
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert sandbox_id in store.rows
+
+
+@pytest.mark.asyncio
+async def test_mark_deleted_then_acquire_is_refused_end_to_end(tmp_path: Path) -> None:
+    """写点与读点必须真的是同一个位置 —— 两边各自的单测都不会发现它们指向了
+    不同的路径(C-1 修复把 marker 搬了家,这条钉住搬完之后两侧仍然对齐)。"""
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    tenant_id, user_id = uuid4(), uuid4()
+    await NasWorkspaceStore(root=str(tmp_path)).mark_deleted(tenant_id=tenant_id, user_id=user_id)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    with pytest.raises(SandboxSupervisorError, match="workspace deleted"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+
+@pytest.mark.asyncio
+async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 4 审查 Important-2 —— 软删闸的 TOCTOU:初次闸只在 ``claim_warm``
+    之前查一次,之后不再复查。构造"闸通过后、marker 才出现"的精确时序:
+    ``claim_warm`` 真正把这次 acquire 的行提交成功之后(模拟并发
+    ``mark_deleted`` 恰好插在这个窗口),marker 才落盘——不是提前造好(那
+    会被初次闸本身挡住,测不出 TOCTOU)。
+
+    断言 acquire 必须抛错,**且这次调用占到的 CAS 槽位必须被让出**——不能
+    占着一行不放,那会让这个 ``(tenant, user)`` 之后所有 acquire 都卡死。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+    real_claim_warm = store.claim_warm
+
+    async def _claim_then_plant_marker(
+        *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str, object] | None:
+        result = await real_claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+        # 模拟并发 mark_deleted 恰好在 claim_warm 提交之后写下 marker。
+        _plant_marker(tmp_path, tenant_id, user_id)
+        return result
+
+    monkeypatch.setattr(store, "claim_warm", _claim_then_plant_marker)
+
+    with pytest.raises(SandboxSupervisorError, match="workspace deleted"):
+        await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    # 槽位已让出:没有残留的行,_warm 指针也没有悬空指向一个已清行的 id。
+    assert store.rows == {}
+    assert store.warm == {}
+    assert [reason for (_sid, reason) in store.mark_destroyed_calls] == ["workspace_deleted_race"]
+
+
+@pytest.mark.asyncio
+async def test_acquire_soft_delete_gate_does_not_apply_to_ephemeral_sandboxes(
+    tmp_path: Path,
+) -> None:
+    """临时沙箱没有持久身份可被软删——即使某个用户的目录碰巧有同名标记
+    文件(不该发生,但也不该被临时沙箱的 acquire 误读到),``user_id=None``
+    的路径压根不检查它,只检查/建自己的 scratch 子树。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
+
+    assert (tmp_path / "_scratch" / str(sandbox_id)).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
+    """sandbox migration wave 2(spec 决策 10)—— ``agent_key`` 非空时随
+    ``commands.run(envs=)`` 注入 ``PYTHONUSERBASE``,与本地 supervisor 后端
+    同一份值(``agent_key_envs`` 单源,两后端契约见
+    ``test_sandbox_runtime_contract.py``)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent")
+
+    assert sdk.sandbox.commands.envs_calls[-1] == {
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent"
+    }
+
+
+@pytest.mark.asyncio
+async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
+    """默认(未绑定 agent_key 的调用方,如老测试直调 exec)不该往 envs 里塞
+    任何东西 —— envs=None,不是 envs={}(避免猜 SDK 对空 dict 的语义)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+
+    assert sdk.sandbox.commands.envs_calls[-1] is None
+
+
+def _dockerfile_text() -> str:
+    dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
+    assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"
+    return dockerfile.read_text(encoding="utf-8")
 
 
 def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
@@ -1027,21 +1436,37 @@ def test_image_env_matches_dockerfile() -> None:
     时就等于不存在(见 sandbox-contract 工作流那次"结构性报绿"的教训),
     而这个文件在仓库 checkout 里必然存在——真找不到说明目录结构变了,
     那正该红。
-    """
-    dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
-    assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"
 
-    env, workdir = _parse_dockerfile_env_and_workdir(dockerfile.read_text(encoding="utf-8"))
+    沙箱迁移 W2 Task 9:镜像不再声明 ``WORKDIR``(该指令本身会创建
+    ``WORKSPACE_ROOT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
+    期望改成"Dockerfile 里压根没有 WORKDIR",cwd 完全交给 exec 显式传
+    :data:`WORKSPACE_ROOT`(见 ``AgentSandboxClient.exec`` 的
+    ``commands.run(cwd=...)``,W1 全分支终审 Important-2 已经在传)。
+    """
+    env, workdir = _parse_dockerfile_env_and_workdir(_dockerfile_text())
 
     assert env == SANDBOX_IMAGE_ENV, (
         "沙箱镜像的 ENV 与 AgentSandboxClient 送进云沙箱的 SANDBOX_IMAGE_ENV 已经不一致"
         f"(Dockerfile={env} / 客户端={SANDBOX_IMAGE_ENV})——envd 派生的进程不继承镜像"
         " ENV,只吃 create(envs=) 里的这份,两边必须逐条对齐。"
     )
-    assert workdir == WORKSPACE_ROOT, (
-        f"镜像 WORKDIR={workdir} 与 WORKSPACE_ROOT={WORKSPACE_ROOT} 不一致 —— "
-        "exec 传给 commands.run 的 cwd 就是后者。"
+    assert workdir is None, (
+        f"镜像不该再声明 WORKDIR(现为 {workdir!r})—— 该指令自带创建目录的"
+        f" 副作用,会跟平台在 {WORKSPACE_ROOT} 建 NAS 挂载 symlink 冲突;"
+        " cwd 改由 exec 显式传 WORKSPACE_ROOT。"
     )
+
+
+def test_image_starts_as_root_and_leaves_workspace_free() -> None:
+    """平台在 mountPath 建 symlink,且 envd 要 fork/exec 存储 helper —— 见
+    spec § 二之二(``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-
+    design.md``)。"""
+    text = _dockerfile_text()
+    assert "\nUSER agent" not in text  # 容器必须 root 启动(agent 用户仍在,执行时降权)
+    assert "WORKDIR /workspace" not in text  # WORKDIR 指令本身会创建目录
+    assert "mkdir -p /workspace" not in text
+    assert "HOME=/home/agent" in text
+    assert "mkdir -p /opt/skills /opt/agents" in text
 
 
 # ---------------------------------------------------------------------------
@@ -1682,6 +2107,52 @@ async def test_release_destroys_an_ephemeral_sandbox() -> None:
         "行必须被标记销毁,且 reason 与本地 supervisor 的 DESTROY_REASON_RELEASE 一致"
     )
     assert sandbox_id not in store.rows
+
+
+@pytest.mark.asyncio
+async def test_release_removes_the_empty_scratch_dir(tmp_path: Path) -> None:
+    """全分支终审 M-3 —— ``run_in_sandbox`` 每次工具调用 acquire+release 一
+    次,无 user 的 run 因此每调用一次工具就在 NAS 上留一个 ``_scratch/<id>``
+    空目录。释放时顺手 ``rmdir``,把"按工具调用数无界增长"压回零。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    scratch = tmp_path / "_scratch" / str(sandbox_id)
+    assert scratch.is_dir(), "acquire 应当先建出 scratch 子树(挂载点必须存在)"
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert not scratch.exists()
+
+
+@pytest.mark.asyncio
+async def test_release_keeps_a_non_empty_scratch_dir(tmp_path: Path) -> None:
+    """目录里真有 agent 写出的字节 —— ``rmdir`` 失败(非空),留着不动:这条
+    清理路径只负责收掉自己建出来的空壳,不负责递归删用户数据。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+    scratch = tmp_path / "_scratch" / str(sandbox_id)
+    (scratch / "out.txt").write_text("agent output")
+
+    await client.release(sandbox_id=sandbox_id)  # 不抛
+
+    assert (scratch / "out.txt").is_file()
+
+
+@pytest.mark.asyncio
+async def test_release_does_not_touch_the_user_tree_of_a_warm_session(tmp_path: Path) -> None:
+    """保温分支压根不走清理 —— 断言用户子树原样在,防止把 ``_scratch``
+    清理误接到热会话上(那会删掉用户工作区目录)。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert (tmp_path / str(tenant_id) / str(user_id)).is_dir()
+    assert sdk.sandbox.killed is False
 
 
 @pytest.mark.asyncio

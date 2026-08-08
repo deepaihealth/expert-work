@@ -8,6 +8,7 @@ from control_plane.runtime import build_sandbox_runtime, build_workspace_store
 from control_plane.settings import Settings
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from orchestrator.tools.agent_sandbox import AgentSandboxClient
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
@@ -42,6 +43,8 @@ def test_agent_sandbox_backend_builds_client() -> None:
         # 让 runtime 静默落回那个 dataclass 默认值,如果这里不特意选一个不同
         # 的数,下面的断言在两种情况下都会通过,测不出接线丢了。
         sandbox_egress_token_ttl_s=7200,
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
     )
     runtime = build_sandbox_runtime(s)
     assert isinstance(runtime, AgentSandboxClient)
@@ -70,6 +73,8 @@ def test_agent_sandbox_backend_injects_given_store() -> None:
         sandbox_e2b_domain="d",
         sandbox_e2b_api_key="k",
         sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
     )
     sentinel = InMemorySandboxInstanceStore()
     runtime = build_sandbox_runtime(s, sandbox_instance_store=sentinel)
@@ -119,7 +124,8 @@ def test_legacy_url_only_still_works() -> None:
 
 
 def test_workspace_store_builds_from_a_real_url() -> None:
-    store = build_workspace_store("http://sup:8080")
+    s = Settings(sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
     assert isinstance(store, SupervisorWorkspaceStore)
     assert store.base_url == "http://sup:8080"
 
@@ -135,4 +141,145 @@ def test_workspace_store_is_none_without_a_usable_url(url: str | None) -> None:
     HTTP:``purge_user`` 把工作区那步报成失败而不是跳过,工作区端点回传输
     错误而不是空结果。
     """
-    assert build_workspace_store(url) is None
+    s = Settings(sandbox_supervisor_url=url)
+    assert build_workspace_store(s) is None
+
+
+def test_workspace_store_builds_nas_store_when_root_is_set() -> None:
+    """波 2 Task 3 —— ``workspace_nas_root`` 真值 → ``NasWorkspaceStore``。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.root == "/mnt/workspaces"
+
+
+def test_workspace_store_prefers_nas_over_supervisor_when_both_are_set() -> None:
+    """两者都配了 —— NAS 直读路径是波 2 的目标终态,优先于 supervisor 代理。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces", sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+
+
+@pytest.mark.parametrize("root", [None, ""])
+def test_workspace_store_falls_back_to_supervisor_without_a_usable_nas_root(
+    root: str | None,
+) -> None:
+    s = Settings(workspace_nas_root=root, sandbox_supervisor_url="http://sup:8080")
+    store = build_workspace_store(s)
+    assert isinstance(store, SupervisorWorkspaceStore)
+
+
+def test_agent_sandbox_backend_passes_through_workspace_mount_settings() -> None:
+    """波 2 Task 4 —— 三项 NAS 工作区挂载配置从 ``Settings`` 原样传到
+    ``AgentSandboxClient``,不配就是 dataclass 默认值(波 1 行为)。
+    ``sandbox_workspace_subpath_prefix`` 留空:非空前缀与 ``pv_name`` 同时配
+    会被 ``AgentSandboxClient.__post_init__`` 拒(Task 4 审查
+    Important-1,见下面单独一条测试),这里只验证三个字段各自原样传递。
+    """
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
+    )
+    runtime = build_sandbox_runtime(s)
+    assert isinstance(runtime, AgentSandboxClient)
+    assert runtime.workspace_pv_name == "workspace-nas"
+    assert runtime.workspace_subpath_prefix == ""
+    assert runtime.workspace_root == "/mnt/workspaces"
+
+
+def test_agent_sandbox_backend_rejects_conflicting_prefix_and_pv_name() -> None:
+    """波 2 Task 4 审查 Important-1 —— 经工厂拼装同样会被
+    ``AgentSandboxClient.__post_init__`` 拒,不是只有测试直接构造才拦得住。
+    """
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
+        sandbox_workspace_subpath_prefix="ew",
+    )
+    with pytest.raises(ValueError, match="workspace_subpath_prefix"):
+        build_sandbox_runtime(s)
+
+
+@pytest.mark.parametrize(
+    ("missing_key", "overrides"),
+    [
+        ("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", {"workspace_nas_root": "/mnt/workspaces"}),
+        ("EXPERT_WORK_WORKSPACE_NAS_ROOT", {"sandbox_workspace_pv_name": "workspace-nas"}),
+    ],
+)
+def test_agent_sandbox_backend_without_workspace_mount_config_raises(
+    missing_key: str, overrides: dict[str, str]
+) -> None:
+    """波 2 终审 Important-2 —— 这两项曾是可选的("不配 = 波 1 行为")。
+    Task 9 把 ``/workspace`` 从镜像里删掉之后那句话不再成立:不注入
+    ``csi-volume-config`` 就没有挂载,新镜像里根本没有 ``/workspace``,而
+    ``exec`` 无条件传 ``cwd=/workspace`` —— 进程正常起、agent 正常构建、第
+    一次工具调用炸在 envd 层,报一个与根因八竿子打不着的错。纯配置错误 +
+    零信号,必须在进程起来时点名。
+    """
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        **overrides,
+    )
+
+    with pytest.raises(RuntimeError, match=missing_key):
+        build_sandbox_runtime(s)
+
+
+def test_agent_sandbox_backend_empty_workspace_mount_config_also_raises() -> None:
+    """空串与未设同等对待 —— 同 E2B 三件套那条(k8s ConfigMap 关一项的写法
+    是 ``KEY: ""``,不是删行)。"""
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="",
+    )
+
+    with pytest.raises(RuntimeError, match="EXPERT_WORK_WORKSPACE_NAS_ROOT"):
+        build_sandbox_runtime(s)
+
+
+def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -> None:
+    """波 2 Task 4 —— app.py 的接线顺序:``build_workspace_store`` 接收
+    ``build_sandbox_runtime`` 的返回值 + 同一个 instance store,原样转给
+    ``NasWorkspaceStore``(``mark_deleted`` 靠它们拆热会话)。"""
+    s = Settings(
+        sandbox_backend="agent_sandbox",
+        sandbox_e2b_domain="d",
+        sandbox_e2b_api_key="k",
+        sandbox_e2b_template="t",
+        sandbox_workspace_pv_name="workspace-nas",
+        workspace_nas_root="/mnt/workspaces",
+    )
+    instance_store = InMemorySandboxInstanceStore()
+    runtime = build_sandbox_runtime(s, sandbox_instance_store=instance_store)
+
+    store = build_workspace_store(s, runtime=runtime, instance_store=instance_store)
+
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.runtime is runtime
+    assert store.instance_store is instance_store
+
+
+def test_workspace_store_runtime_and_instance_store_default_to_none() -> None:
+    """调用方不传 —— 与 Task 3 的行为一致(``mark_deleted`` 只写 marker,
+    不拆热会话)。"""
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+    store = build_workspace_store(s)
+    assert isinstance(store, NasWorkspaceStore)
+    assert store.runtime is None
+    assert store.instance_store is None

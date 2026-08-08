@@ -114,16 +114,45 @@ _MAX_WORKSPACE_LIST_ENTRIES = 2000
 
 
 def _validate_workspace_path(path: str) -> str:
-    """Reject a non-relative or ``..``-bearing workspace path (J.9).
+    """Reject a non-relative or ``..``-bearing workspace path, and return it canonicalised (J.9).
 
     ``save_artifact`` already validates this, but the path round-trips
     through the control-plane untrusted — re-check at this boundary.
+
+    Returns ``"/".join(PurePosixPath(...).parts)`` rather than the raw
+    stripped text (sandbox migration wave 2 final review, Critical 2). The
+    caller that matters is :meth:`SandboxSupervisor.delete_workspace_file`,
+    which feeds this result to ``is_reserved_workspace_path`` — a guard
+    that compares the *first path segment*. Returning an un-normalised
+    string made ``"./uploads/a.txt"`` present a first segment of ``"."``,
+    so the reserved-prefix check passed while the write actually landed on
+    ``uploads/a.txt``: the same input was two different files depending on
+    who was looking. ``NasWorkspaceStore._normalize_workspace_path`` is the
+    other half of this fix; the two backends must answer identically at the
+    ``WorkspaceStore`` boundary (``test_workspace_store_contract.py``), and
+    a security guard is the last place a backend fork is acceptable.
+
+    Empty ``parts`` (``"."``, ``"./"``) now raises instead of returning
+    ``"."``. Observably that is the same 404 the old behaviour produced one
+    layer down (there is no file named ``.``), just decided here rather
+    than by a failed volume read.
+
+    A NUL byte is rejected for the same "one guard, one answer" reason
+    (wave 2 final re-review, New 1). CPython refuses to pass an embedded
+    NUL to a syscall and raises a bare :class:`ValueError` — not something
+    this service's error boundary catches. The NAS backend rejects it in
+    its own normaliser; a guard that forks per backend is exactly what the
+    Critical-2 note above says must not happen again.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+    if not cleaned or cleaned.startswith("/") or "\0" in cleaned:
         msg = f"workspace path must be relative and free of '..': {path!r}"
         raise WorkspaceFileNotFoundError(msg)
-    return cleaned
+    parts = PurePosixPath(cleaned).parts
+    if not parts or ".." in parts:
+        msg = f"workspace path must be relative and free of '..': {path!r}"
+        raise WorkspaceFileNotFoundError(msg)
+    return "/".join(parts)
 
 
 class SandboxSupervisor:
@@ -237,7 +266,36 @@ class SandboxSupervisor:
                 self._run_argv(record, workspace_volume=workspace_volume)
             )
             await link.wait_ready(self._settings.runner_ready_timeout_s)
+            if workspace_volume is not None:
+                # supervisor-freeze exception #3 (same source as the other
+                # two Task 6 exceptions — a necessary companion to this
+                # wave's image rework, not a scope-creep addition). The
+                # sandbox's own docker run always sets --workdir /workspace
+                # (F.3 SandboxRuntimeProvider) to restore cwd now that the
+                # image no longer declares one; empirically, when --workdir
+                # names a path that's also a volume mount target, docker
+                # resets that directory's ownership to root:root on *every*
+                # container creation (not just the volume's first mount —
+                # see CliDockerClient.chown_volume's docstring for the full
+                # repro). A non-root --user sandbox can then never write its
+                # own /workspace. Fixing it here (after the container is up,
+                # not before the launch) is the only place the chown sticks
+                # for *this* container's view — see the docstring for why.
+                await self._docker.chown_volume(volume=workspace_volume, image=record.image_ref)
         except (DockerError, RunnerLinkError) as exc:
+            # code-reviewer Important-2: covers all three failure points in
+            # the try block above (launch() itself, wait_ready() timeout,
+            # chown_volume()) with one line — by the time any of them can
+            # raise, launch() has already run, so a container may be alive
+            # with nothing pointing to it (self._links / the store's
+            # container_id are only set *after* this try block succeeds).
+            # Left alone it's an orphan until the next sweep_orphans() pass
+            # on supervisor restart. docker.remove() is already idempotent
+            # (a missing container just logs a warning, never raises — see
+            # its docstring), so it's safe unconditionally here even for the
+            # launch()-itself-failed case where no container exists at all;
+            # it also never raises, so it can't mask ``exc`` below.
+            await self._docker.remove(_container_name(record.id))
             await self._store.update(record.with_state(SandboxState.FAILED))
             msg = f"sandbox launch failed: {exc}"
             raise SupervisorError(msg) from exc
@@ -275,14 +333,19 @@ class SandboxSupervisor:
         )
 
     async def _seed_workspace(self, container_name_: str, seed_files: list[SeedFile]) -> None:
-        """Materialize ``seed_files`` into a running container's ``/workspace``
-        (skill-runtime §5.1). Validate path + caps (trust boundary; the request
-        round-trips untrusted), base64-decode, then ``docker cp``.
+        """Materialize ``seed_files`` into a running container's
+        ``SANDBOX_SKILLS_ROOT`` (``/opt/skills``, W2 Task 6 — skill-runtime
+        §5.1). Validate path + caps (trust boundary; the request round-trips
+        untrusted), base64-decode, then ``docker exec`` + an in-container
+        ``tar`` extraction (see :meth:`CliDockerClient.seed_workspace` for
+        why, not ``docker cp`` — that daemon path unconditionally rejects a
+        ``--read-only`` container).
 
         Bad input (unsafe path / bad base64 / over cap) → :class:`InvalidSeedFilesError`
-        (HTTP 400) — deterministic, reject the acquire. A docker-cp transport
-        failure degrades gracefully (log + continue): the skill files just aren't
-        on disk this call; ``skill_view`` still serves them as text.
+        (HTTP 400) — deterministic, reject the acquire. A transport failure
+        (the ``docker exec``/``tar`` step) degrades gracefully (log +
+        continue): the skill files just aren't on disk this call;
+        ``skill_view`` still serves them as text.
         """
         if not seed_files:
             return
@@ -317,7 +380,12 @@ class SandboxSupervisor:
             )
 
     async def exec(
-        self, sandbox_id: UUID, *, code: str, timeout_s: int | None = None
+        self,
+        sandbox_id: UUID,
+        *,
+        code: str,
+        timeout_s: int | None = None,
+        envs: dict[str, str] | None = None,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -328,6 +396,12 @@ class SandboxSupervisor:
         The per-sandbox lock serialises concurrent execs sharing one
         warm session (the held pipe handles one exec at a time); each
         exec stamps ``last_used_at`` so the idle reaper measures from it.
+
+        ``envs`` (sandbox migration wave 2, spec 决策 10) — per-call env
+        overrides merged onto the runner subprocess's environment (currently
+        just ``PYTHONUSERBASE`` isolation). Re-asserted on every call rather
+        than baked in at acquire time: two agents can share one already-warm
+        session, so the value must be able to change call-to-call.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -337,7 +411,7 @@ class SandboxSupervisor:
         async with lock:
             await self._touch(sandbox_id)
             try:
-                return await link.exec(code, resolved_timeout)
+                return await link.exec(code, resolved_timeout, envs=envs)
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"
                 raise SupervisorError(msg) from exc

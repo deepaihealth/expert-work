@@ -213,6 +213,13 @@ class Settings(BaseSettings):
     sandbox_e2b_api_key: str | None = None
     #: Agent Sandbox 接入 —— SandboxSet 模板名(池领取的来源)。
     sandbox_e2b_template: str | None = None
+    #: 波 2 —— NAS 工作区根(control-plane Pod 内挂载点)。设了即选
+    #: ``NasWorkspaceStore``(优先于 supervisor 代理);None → 按老路径。
+    workspace_nas_root: str | None = None
+    #: 波 2 —— 沙箱挂工作区用的 PV 名(csi-volume-config 的 pvName)。
+    sandbox_workspace_pv_name: str | None = None
+    #: 波 2 —— csi-volume-config subPath 前缀(探针定语义;"" = 相对 PV path)。
+    sandbox_workspace_subpath_prefix: str = ""
     #: Agent Sandbox 接入 —— 沙箱出网走的 credential-proxy 主机 + 端口
     #: (sandbox-egress §3.3)。默认值与 sandbox-supervisor 自己的
     #: ``egress_proxy_host``/``egress_proxy_port`` 同形态,但集群内可达性

@@ -119,7 +119,7 @@ n=5  wall= 39.3s  ok=5  err=0  max=39.2s  min=20.6s
 
 冷启 35~40 秒,几乎全花在拉 2.46GB 镜像上(池内领取是 0.0s)。官方实测 1.34GB 镜像不加速 36s、加速后 4s,量级对得上。
 
-镜像缓存是独立 CRD(`eci.alibabacloud.com/v1 ImageCache`),W1 Task 1 核对时查到官方称邀测阶段需白名单/工单 —— 这个集群也确实没有该 CRD。**建议提工单开通**;开通前把 `SandboxSet.replicas` 保持 ≥1,让常见路径走池领取而不是冷启。
+**勘误(2026-08-07,W2 Task 1 核对现行文档后改正)**:本节原表述"官方称邀测阶段需白名单/工单"已过时。ACS 镜像缓存**无需开通**,单地域默认配额 200(免费),超了才需要工单;创建走控制台「镜像缓存」页或 OpenAPI,是平台侧对象(非集群内 CRD——这个集群没有 `eci.alibabacloud.com` API 组不说明任何问题,只是因为它本来就不是集群内资源)。沙箱池扩容默认吃镜像缓存(`ops.alibabacloud.com/update-with-image-cache` 默认 `false` = 预热池扩容时使用缓存),SandboxSet 模板零改即受益。详见 `docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md` § 一.2。
 
 ## 五、E2B SDK 2.24.0 的真实签名(给 Task 7/8)
 
@@ -160,6 +160,6 @@ AsyncSandbox.create(
 | 2 | 依赖里加 `kruise-agents`(GitHub 源码装,无 PyPI 版本锁 —— 记为供应链风险) | Task 7 |
 | 3 | `patch_e2b(https=False)` 必须在 import e2b 之前,这对模块导入顺序有硬要求,得在 `AgentSandboxClient` 模块里处理干净 | Task 7 |
 | 4 | 沙箱镜像没有 `curl`,agent 用 `bash` 工具时要知道 | 文档/Task 11 |
-| 5 | 提工单开通 ImageCache;开通前 `replicas` 保持 ≥1 | 运维 |
+| 5 | ~~提工单开通 ImageCache~~ 勘误(2026-08-07):无需开通,控制台/OpenAPI 直接建;`replicas` 保持 ≥1 仍是常规建议(让常见路径走池领取而非冷启) | 运维 |
 | 6 | 生产是否换回原生协议(需泛域名证书) | 波 4 / 上线前 |
 | 7 | SandboxSet 现在在 `default` namespace,门过了可以考虑挪进 `expert-work` | 波 4 |

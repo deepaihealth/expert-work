@@ -170,7 +170,7 @@ async def test_component_types_render_distinct_prompt_blocks() -> None:
 
     spec = _make_spec(["patch", "note", "mem", "real"])
     loaded = await _load_skills(
-        spec=spec, skill_resolver=resolver, tenant_id=uuid4(), registry=None
+        spec=spec, skill_resolver=resolver, tenant_id=uuid4(), registry=None, agent_key="ag-test"
     )
 
     # Each text component routed to its own bucket; only the real skill is an
@@ -206,7 +206,7 @@ async def test_resolver_without_skill_defaults_to_plain_skill() -> None:
 
     spec = _make_spec(["legacy"])
     loaded = await _load_skills(
-        spec=spec, skill_resolver=resolver, tenant_id=uuid4(), registry=None
+        spec=spec, skill_resolver=resolver, tenant_id=uuid4(), registry=None, agent_key="ag-test"
     )
     assert loaded.activated_skill_names == ["legacy"]
     assert loaded.behavior_patches == []

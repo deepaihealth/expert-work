@@ -36,9 +36,12 @@ E2B 原生协议要求泛域名而我们的证书只覆盖一层子域名,所以
 * ``AsyncSandbox.create()`` 的 ``domain`` / ``api_key`` 走 ``**opts``,不是
   brief 草稿写的具名参数——这里按实测签名以关键字形式传,效果一样。
 * ``commands.run`` / ``files.write`` 必须传 ``user="agent"``(见
-  :data:`SANDBOX_EXEC_USER`),否则 E2B 默认用户 ``user`` 在我们的沙箱镜像
-  (``USER agent``,uid 10000)里不存在,炸
-  ``AuthenticationException: invalid username: 'user'``。
+  :data:`SANDBOX_EXEC_USER`),否则 E2B 默认用户 ``user`` 在我们的沙箱镜像里
+  不存在,炸 ``AuthenticationException: invalid username: 'user'``。
+  (这里原本写"我们的沙箱镜像(``USER agent``,uid 10000)"—— W2 Task 9 起
+  镜像不再声明 ``USER agent``,容器 root 启动;``agent`` 用户仍在、uid 仍是
+  10000,结论不变,只是引用的理由是条已删的指令。同一句在
+  :data:`SANDBOX_EXEC_USER` 那边当时改对了,这一处漏了。)
 
 ## 独立发现、brief 草稿之外的问题(task-7-report.md 有完整记录)
 
@@ -94,17 +97,28 @@ C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
+from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
-from orchestrator.tools.sandbox import EgressContext, SandboxOutcome, SandboxSupervisorError
+from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
+from orchestrator.tools.sandbox import (
+    EgressContext,
+    SandboxOutcome,
+    SandboxSupervisorError,
+    agent_key_envs,
+)
 from orchestrator.tools.sandbox_image_contract import (
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
@@ -167,6 +181,14 @@ _WARM_RECONNECT_DESTROY_REASON = "warm_reconnect_failed"
 #: ``destroy_reason`` can tell "token 快到期,主动换血" from "connect 失败"。
 _WARM_AGE_DESTROY_REASON = "warm_age_expired"
 
+#: ``destroy_reason``(经 :meth:`AgentSandboxClient._unwind_slot`)写的值 ——
+#: Task 4 审查 Important-2:``claim_warm`` 成功之后、``create()`` 之前复查
+#: 到软删标记出现(见 :meth:`AgentSandboxClient._reverify_workspace_not_deleted`
+#: 的完整推理)。与其它 ``_unwind_slot`` reason 常量同一套命名习惯——独立
+#: 一个字面量,方便运维在 ``destroy_reason`` 列里按根因区分这条与
+#: ``"create_failed"``/``"post_create_failed"``。
+_WORKSPACE_DELETED_RACE_REASON = "workspace_deleted_race"
+
 #: :meth:`AgentSandboxClient.exec` 兜底分支判"这是超时"的时长门槛,按
 #: ``effective`` 的比例算。envd 掐断一条跑满时限的命令时,SDK 抛的**不总是**
 #: ``TimeoutException``:gRPC 流被中断会经 anyio(``BrokenResourceError`` /
@@ -178,6 +200,59 @@ _WARM_AGE_DESTROY_REASON = "warm_age_expired"
 #: 0.9 而不是 1.0:``effective`` 是传给 envd 的值,envd 掐断总是稍早于我们
 #: 这侧测到的墙钟差,留一成余量。
 _TIMEOUT_ATTRIBUTION_RATIO = 0.9
+
+#: ``Sandbox.create(metadata={...})`` 里挂载 NAS 工作区用的 key —— ACS 官方
+#: 文档化的动态挂载配方(spec § 一.1),"申请时"挂载,每挂载点一个 dict
+#: (``pvName``/``mountPath``/``subPath``)。
+_CSI_VOLUME_CONFIG_METADATA_KEY = "e2b.agents.kruise.io/csi-volume-config"
+
+#: 临时沙箱(无 ``user_id``)的 scratch 子树在 NAS 数据根下的目录名。与租户
+#: 目录平级、不在任何用户子树内,``NasWorkspaceStore`` 从不遍历到这里。
+_SCRATCH_DIR = "_scratch"
+
+
+def _workspace_subpath(
+    *, prefix: str, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
+) -> str:
+    """``csi-volume-config`` 的 ``subPath`` —— 用户工作区 or 临时沙箱的 scratch 子树。
+
+    ``user_id`` 非 None(热会话沙箱)—— ``{prefix}/{tenant_id}/{user_id}``,
+    落在 NAS 上的 :data:`~orchestrator.tools.nas_workspace_store` 那棵
+    per-(tenant,user) 权威工作区树,与 ``NasWorkspaceStore`` 的
+    ``{root}/{tenant_id}/{user_id}`` 布局同一份 subPath 语义(spec § 三)。
+
+    ``user_id`` 为 None(临时沙箱,spec 决策 9)—— 镜像不再预建
+    ``/workspace``(Task 9),不挂就没有这个目录、cwd 与文件工具全踩空;
+    落 ``{prefix}/_scratch/{sandbox_id}``,每次调用用一个全新的 ``sandbox_id``
+    (``uuid4()``),天然不与任何用户或其它临时沙箱撞名。``_scratch`` 不需要
+    是 ``WORKSPACE_RESERVED_PREFIXES`` 的成员——它在 NAS 数据根下与租户目录
+    平级,不落在任何用户子树内,``NasWorkspaceStore`` 从不遍历到这里。空目
+    录的清理并入波 3 的扫描 job(spec 决策 9),不是本方法的职责。
+
+    ``"/".join(p for p in (...) if p)`` 而非 f-string 直接拼接:
+    ``prefix=""`` 时(生产配置,见 :attr:`AgentSandboxClient.workspace_subpath_prefix`
+    的 docstring)不留前导 ``"/"``——集群实测的生产 PV ``path`` 已经是
+    ``/workspaces``,subPath 前面多一段空字符串会拼出
+    ``/tenant/user``(前导斜杠),与探针钉死的"相对 PV path"语义不符。
+    """
+    parts = (
+        (prefix, str(tenant_id), str(user_id))
+        if user_id is not None
+        else (prefix, _SCRATCH_DIR, str(sandbox_id))
+    )
+    return "/".join(p for p in parts if p)
+
+
+def _scratch_dir(root: str, sandbox_id: UUID) -> Path:
+    """临时沙箱 scratch 子树在 **control-plane 本地挂载点**下的路径。
+
+    与 :func:`_workspace_subpath` 的 ``user_id is None`` 分支是同一个目录的
+    两种表示(前者是给平台的 ``subPath``,这里是本进程能 ``mkdir``/``rmdir``
+    的本地路径),共用 :data:`_SCRATCH_DIR` 常量——同
+    :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root` 之于
+    用户子树的理由:同一个位置两处独立拼接迟早会静默失配。
+    """
+    return Path(root, _SCRATCH_DIR, str(sandbox_id))
 
 
 def _monotonic() -> float:
@@ -230,6 +305,77 @@ class AgentSandboxClient:
     #: 行时回落。与 supervisor 的 ``default_max_sandboxes``(settings.py:112,
     #: default=50)drift-lock 钉死(``test_default_max_sandboxes_matches_supervisor_default``)。
     default_max_sandboxes: int = 50
+    #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,dataclass 层面全部默认
+    #: None/"",让直接构造这个类的单测不必每次都摆全三项;**生产装配点
+    #: ``build_sandbox_runtime`` 会强制要求前两项**(波 2 终审 Important-2:
+    #: Task 9 之后镜像不再预建 ``/workspace``,少配 ``workspace_pv_name`` 或
+    #: ``workspace_root`` 不再等价于"波 1 行为",而是每次工具调用都炸在 envd
+    #: 层 —— 见 ``runtime.py`` 那段 ``missing`` 列表的注释)。这里不重复那道
+    #: 校验:三个 Settings 字段本就同源,拆成三个字段是为了每个职责单一。
+    #:
+    #: ``workspace_pv_name`` —— ``csi-volume-config`` 的 ``pvName``(spec § 三
+    #: "沙箱"消费者一节)。
+    workspace_pv_name: str | None = None
+    #: ``csi-volume-config`` 的 ``subPath`` 前缀(spec § 二之二集群实测:生产
+    #: PV ``workspace-nas`` 的 ``path`` 已经是 ``/workspaces``,所以这里是空
+    #: 串,拼出的 subPath 就是 ``{tenant}/{user}``)。见 :func:`_workspace_subpath`。
+    #:
+    #: **必须与 :attr:`workspace_pv_name` 同时配时保持空串**(Task 4 审查
+    #: Important-1)—— 这个前缀只影响沙箱侧 ``csi-volume-config`` 的
+    #: ``subPath``,而 ``NasWorkspaceStore``(control-plane 直读那棵树的
+    #: store,见 :func:`~orchestrator.tools.nas_workspace_store.workspace_user_root`)
+    #: 完全不理解前缀,它的布局恒为 ``{root}/{tenant_id}/{user_id}``。非空
+    #: 前缀会让沙箱实际挂载到 ``{root}/{prefix}/{tenant}/{user}``,而
+    #: mkdir/chmod/软删闸(:meth:`_prepare_workspace_mount`)与
+    #: ``NasWorkspaceStore`` 的文件读写全都还在算 ``{root}/{tenant}/{user}``
+    #: ——两棵树静默分叉,用户在工作区浏览页看到的文件和沙箱里 `/workspace`
+    #: 看到的文件不是同一份,且没有任何报错。``__post_init__`` 在构造期直
+    #: 接拒绝这个组合,而不是尝试把前缀透传进 ``NasWorkspaceStore``(那会
+    #: 动到 Task 3 加固过的路径解析核心)。
+    workspace_subpath_prefix: str = ""
+    #: control-plane Pod 本地的 NAS 挂载点(与 ``NasWorkspaceStore.root`` 同一
+    #: 个值)—— ``acquire`` 用它做 mkdir + chmod(spec § 二之二"附带事实":NAS
+    #: 新建子目录属主是父目录的属主,沙箱内命令以 uid 10000 执行,不放开
+    #: 权限一律 Permission denied)与软删闸(检查
+    #: :func:`~orchestrator.tools.nas_workspace_store.workspace_deleted_marker`
+    #: 的落点 ``{root}/{tenant}/.deleted/{user}`` —— **不在**用户子树里,
+    #: 见该模块 docstring 与全分支终审 Critical-1)。这是
+    #: control-plane 进程能直接 ``os.mkdir``/``os.chmod`` 到的本地路径,不是
+    #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
+    #: ``/workspace``)是两个不同维度的常量,不要混淆。
+    #:
+    #: **为什么 mkdir+chmod 而不是 mkdir+chown**(Critical 修复,集群实测):
+    #: control-plane 以非 root 的 uid 10002(``expert_work``)运行,POSIX
+    #: 下非 root 进程无权把文件属主 ``chown`` 成另一个 uid(实测
+    #: ``os.chown`` 到 10000 直接 ``EPERM``,``chmod`` 则正常)——见
+    #: :meth:`_ensure_workspace_dir` 的完整推理。
+    workspace_root: str | None = None
+
+    def __post_init__(self) -> None:
+        """构造期不变式检查(同 ``ToolResult.__post_init__`` 的既有惯例:
+        ``registry.py`` 里"构造期就报,不要放到用了才报"的模式)。
+
+        Task 4 审查 Important-1 —— ``workspace_pv_name`` 配了、
+        ``workspace_subpath_prefix`` 也非空这个组合会让沙箱与
+        ``NasWorkspaceStore`` 静默各写各的树(见 :attr:`workspace_subpath_prefix`
+        的 docstring),这类失配没有任何运行期报错,只能靠人肉发现"用户上
+        传的文件沙箱里看不到"这种症状去反查——比"配置阶段就大声拒绝"贵得
+        多。放在 ``__post_init__`` 而不是工厂 ``build_sandbox_runtime`` 里:
+        这样无论谁构造 ``AgentSandboxClient``(生产工厂、测试里直接
+        构造)都逃不掉这条检查,不依赖调用方记得走工厂。
+        """
+        if self.workspace_pv_name and self.workspace_subpath_prefix:
+            msg = (
+                "AgentSandboxClient.workspace_subpath_prefix must be empty "
+                "when workspace_pv_name is configured — NasWorkspaceStore "
+                "has no concept of a subpath prefix (its layout is always "
+                "{root}/{tenant_id}/{user_id}), so a non-empty prefix here "
+                "would mount the sandbox's /workspace at a NAS path "
+                "NasWorkspaceStore never reads or writes: a silent, "
+                "hard-to-diagnose split between what the sandbox sees and "
+                "what the workspace-browse/upload/download endpoints see."
+            )
+            raise ValueError(msg)
 
     def _max_warm_age_s(self) -> int:
         """热会话总年龄上限 —— 派生自 ``egress_token_ttl_s``,不设第二个常量。
@@ -386,6 +532,12 @@ class AgentSandboxClient:
     ) -> UUID:
         del thread_id  # 波 1:热会话行不记 thread_id(见 SQL store 的说明)。
         sandbox_id = uuid4()
+        # 沙箱迁移波 2 —— 软删闸 + mkdir/chmod,claim_warm 之前(spec § 二之
+        # 二)。见 :meth:`_prepare_workspace_mount`(``workspace_root`` 未配
+        # 时该方法自己整段跳过,行为与波 1 完全一致)。
+        await self._prepare_workspace_mount(
+            tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+        )
         existing: tuple[UUID, str, datetime | None] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
@@ -416,8 +568,13 @@ class AgentSandboxClient:
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                     )
+                # 审查 Important-2 —— claim_warm 成功之后、create() 之前的
+                # 窄窗口复查软删标记,见 _reverify_workspace_not_deleted。
+                await self._reverify_workspace_not_deleted(
+                    tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                )
                 sbx = await self._create_and_track(
-                    tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
+                    tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
                 )
                 just_created = True
             else:
@@ -444,8 +601,16 @@ class AgentSandboxClient:
                         await self._claim_warm(
                             tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                         )
+                    # 审查 Important-2 —— 同上,重占坑之后、create() 之前
+                    # 复查软删标记。
+                    await self._reverify_workspace_not_deleted(
+                        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                    )
                     sbx = await self._create_and_track(
-                        tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
+                        tenant_id=tenant_id,
+                        sandbox_id=sandbox_id,
+                        user_id=user_id,
+                        egress=egress,
                     )
                     just_created = True
                 else:
@@ -462,8 +627,13 @@ class AgentSandboxClient:
             # 到,复用路径与新建路径在 claim_warm 返回前无法区分,提前查会把
             # "已到上限租户复用既有会话"也拒掉。
             await self._enforce_quota(tenant_id, own_sandbox_id=sandbox_id)
+            # 审查 Important-2 —— 首次占坑成功之后、create() 之前复查软删
+            # 标记(ephemeral 分支 user_id 为 None,内部整段跳过)。
+            await self._reverify_workspace_not_deleted(
+                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+            )
             sbx = await self._create_and_track(
-                tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress
+                tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
             )
             just_created = True
 
@@ -475,8 +645,16 @@ class AgentSandboxClient:
         # 它的是平台超时,这正是 _SANDBOX_TIMEOUT_S 真正承重的地方。顺带补上
         # § 6.5 的统一错误契约:files.write 原样抛的是 e2b 自己的异常类型。
         try:
+            if just_created:
+                await self._chmod_workspace_mount(sbx, sandbox_id=sandbox_id)
             for relpath, data in seed_files:
-                await sbx.files.write(f"{WORKSPACE_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER)
+                # sandbox migration wave 2 (spec § 四) — skills live on sandbox-
+                # local disk under SANDBOX_SKILLS_ROOT, not the user's NAS-backed
+                # WORKSPACE_ROOT; relpath is already namespaced under
+                # <agent_key>/ by the caller (build_skill_seed_files).
+                await sbx.files.write(
+                    f"{SANDBOX_SKILLS_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER
+                )
             if just_created:
                 # 连到既有热会话时该行的 container_id 已经是对的(existing 正是
                 # 从那里读出来的)—— 只有本次自己建/重建了沙箱才需要回填。
@@ -490,6 +668,50 @@ class AgentSandboxClient:
                 await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
         return sandbox_id
+
+    async def _chmod_workspace_mount(self, sbx: Any, *, sandbox_id: UUID) -> None:
+        """沙箱侧兜底:把自己刚挂上的 ``/workspace`` 放开到 ``0o777``。
+
+        **为什么需要第二道**(集群实测,2026-08-07)。挂载点的 subPath 目录
+        如果在 ``create()`` 时还不存在,**平台会替你建**——建成 ``root:root
+        0755``(实测:``/workspaces/<tenant>/<user>`` 就是这个 mode,而 NAS 根
+        是我们一次性 chmod 过的 ``1777``)。沙箱里的 agent 以 uid 10000 跑,
+        于是第一次往 ``/workspace`` 写就是 ``PermissionError``。权威的修法是
+        :meth:`_prepare_workspace_mount` —— control-plane 在 ``create()``
+        **之前** 就把目录 mkdir 成 ``0o777``,平台因此只会看到一个已存在的
+        目录、不会自己建。这一句不取代它,只补它够不到的场合:
+
+        * ``workspace_root`` 没配(把 NAS 挂进 control-plane Pod 的那半边不
+          可用——例如契约测试跑在 GitHub runner 上,它对 NAS 没有 NFS 路由)
+          时,``_prepare_workspace_mount`` 整段跳过,目录就只能由平台来建;
+        * 就算配了,``_prepare_workspace_mount`` 与平台建目录之间理论上仍有
+          竞态(我们 mkdir 之前平台已经因为别的沙箱建过了)。
+
+        **刻意 best-effort**。真正跑得通的生产路径上,目录早就是 control-plane
+        建的 ``0o777``、属主 uid 10002;而这句以 root 身份跑,NAS 若开了
+        ``root_squash``,root 会被映射成 ``nobody``,对一个别人属主的目录
+        ``chmod`` 必然 ``EPERM``。那种情况下失败是**无害**的(目录本来就已经
+        是对的),把它抬成 ``create`` 失败会把一个可用的沙箱判死。反过来,在
+        这一句是唯一权限来源的场合它失败了,下一次 ``exec`` 会以
+        ``PermissionError`` 大声报出来——不会静默变成"能跑但写不进去"。
+
+        ``/workspace`` 是平台建的 **符号链接**(指向
+        ``/run/csi/mount-root/nas/<hash>``),``chmod`` 默认跟随符号链接,所以
+        改到的是挂载点真身,不是链接本身。``workspace_pv_name`` 没配时根本没有
+        挂载、``/workspace`` 也不存在,直接跳过。
+        """
+        if not self.workspace_pv_name:
+            return
+        try:
+            await sbx.commands.run(f"chmod 0777 {WORKSPACE_ROOT}", user="root")
+        except Exception:
+            logger.info(
+                "sandbox workspace chmod skipped (sandbox_id=%s) — expected when "
+                "control-plane already created the directory and the NAS export "
+                "squashes root; only load-bearing where control-plane has no NAS route",
+                sandbox_id,
+                exc_info=True,
+            )
 
     async def _discard_new_sandbox(self, sbx: Any, *, sandbox_id: UUID) -> None:
         """拆掉一个本次调用刚建起来、但还没能被任何一行记住的沙箱。
@@ -509,6 +731,150 @@ class AgentSandboxClient:
                 exc_info=True,
             )
         await self._unwind_slot(sandbox_id=sandbox_id, reason="post_create_failed")
+
+    async def _prepare_workspace_mount(
+        self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
+    ) -> None:
+        """软删闸 + mkdir/chmod,``claim_warm``/``create_ephemeral`` **之前**
+        运行(spec § 二之二)。``workspace_root`` 未配(波 1 默认)整段跳过
+        ——不是 belt-and-braces,是这个方法唯一的"关"开关,``acquire`` 无
+        条件调它。
+
+        用户沙箱(``user_id`` 非 None)—— 先查软删标记
+        (:meth:`_reject_if_workspace_deleted`),再 mkdir + chmod 该用户在
+        NAS 上的目录。查在 mkdir 之前:已软删的工作区不该被这次 acquire
+        意外复活出一个空目录(下一次 purge 扫描到的应该还是"只有 marker
+        的空壳",不是被误建出的新鲜子树)。
+
+        临时沙箱(``user_id`` 为 None)—— 没有软删概念(临时沙箱没有持久
+        身份可被软删),只需要 mkdir + chmod 它自己的 scratch 子树
+        (``_scratch/<sandbox_id>``)。**取舍**(brief 明确留给实现判断的
+        一点):镜像不再预建 ``/workspace``(Task 9)之后,scratch 子树跟用户
+        子树一样是 NAS 上全新的目录,权限跟用户子树同一套——不放开权限的话临时沙箱
+        的 ``/workspace`` 同样会撞 ``Permission denied``,这不是"要不要顺带
+        修"的问题,是同一个真因(spec § 二之二)在另一个 subPath 下的必然
+        重现。让两个分支共用同一个 :meth:`_ensure_workspace_dir`,而不是只
+        给用户分支修,是本任务对这道取舍的结论。
+
+        无条件跑一次(不区分"这次 acquire 会不会真的 create()")——热会话
+        复用(``connect``)不会重新触发挂载,目录早在第一次 ``create()``
+        时就已经建好,这里的 mkdir(``exist_ok=True``)/chmod 因此在复用路径
+        上是幂等的空操作,不是在"为将要发生的事做准备",而是在"确保这件
+        事已经发生过"——比在 :meth:`acquire` 里分叉出"是否会新建"的判断
+        更简单,也自愈:哪怕运维手工改过目录权限,下一次 acquire 就会把它
+        修回来。
+        """
+        root = self.workspace_root
+        if not root:
+            return
+        if user_id is not None:
+            await self._reject_if_workspace_deleted(root, tenant_id=tenant_id, user_id=user_id)
+            target = workspace_user_root(root, tenant_id, user_id)
+        else:
+            target = _scratch_dir(root, sandbox_id)
+        await self._ensure_workspace_dir(target)
+
+    async def _reject_if_workspace_deleted(
+        self, root: str, *, tenant_id: UUID, user_id: UUID
+    ) -> None:
+        """软删闸(spec § 二之二 / 五之二)—— supervisor 对软删工作区同样在
+        acquire 拒(HTTP 客户端把 4xx 包成 ``SandboxSupervisorError``),这里
+        走同一个可观察契约:直接读 ``NasWorkspaceStore.mark_deleted`` 写的标
+        记文件,路径经
+        :func:`~orchestrator.tools.nas_workspace_store.workspace_deleted_marker`
+        与该 store 共享同一个函数算出(Task 4 审查 Minor:两处独立拼接过路
+        径,曾经能各拼各的、静默失配),不经过 ``NasWorkspaceStore`` 实例本
+        身——这里只需要"这个文件存在吗"这一个布尔判断,不需要该 store 的读
+        写/路径穿越防护机器。
+
+        **marker 不在 ``{tenant}/{user}`` 子树里**(全分支终审 Critical-1):
+        那棵树整个经 ``subPath`` 挂进沙箱的 ``/workspace``,沙箱里的 agent
+        直接写一个同名文件就能让这道闸永久拒掉该用户——这道闸读的是
+        ``{root}/{tenant}/.deleted/{user}``,与用户目录平级,任何 subPath 都
+        挂不到,见该函数与 ``nas_workspace_store`` 模块 docstring。
+
+        本方法既是 :meth:`_prepare_workspace_mount` 的初次软删闸,也是
+        Task 4 审查 Important-2 修复后 :meth:`_reverify_workspace_not_deleted`
+        的复查窗口复用的同一份判定——两处调用同一个函数,不重复一份逻辑。
+        """
+        marker = workspace_deleted_marker(root, tenant_id, user_id)
+        deleted = await asyncio.to_thread(marker.exists)
+        if deleted:
+            raise SandboxSupervisorError(
+                f"workspace deleted for user {user_id} (tenant {tenant_id})"
+            )
+
+    async def _reverify_workspace_not_deleted(
+        self, *, tenant_id: UUID, user_id: UUID | None, sandbox_id: UUID
+    ) -> None:
+        """Task 4 审查 Important-2 —— ``claim_warm`` 成功之后、``create()``
+        真正把沙箱建到平台上之前,复查一次软删标记。
+
+        :meth:`_prepare_workspace_mount` 的软删闸只在 ``claim_warm`` **之
+        前**查一次。那次检查通过之后、到这次调用真正的 CAS 行落库(或重新
+        占坑)之间,存在一个真实的竞态窗口:并发的
+        ``NasWorkspaceStore.mark_deleted`` 完全可能在这个窗口里插进来——
+        它先落 marker,再调 ``instance_store.get_warm`` 找这个用户的热会
+        话;如果这次 ``acquire`` 的行此刻还没提交、或提交了但
+        ``container_id`` 还没回填,``get_warm`` 会返回 ``None``,
+        ``mark_deleted`` 什么都拆不到,marker 却已经落盘。不补这一步复查
+        的话,这次 acquire 会继续往下把一个全新的热会话建给一个"已经被声
+        明软删"的用户,且没有任何后续机制会再发现它——只能靠 idle TTL /
+        :meth:`_max_warm_age_s` 兜底(15 分钟到 12 小时的窗口)。
+
+        直接复用 :meth:`_reject_if_workspace_deleted`(不重写一份判定),
+        marker 出现时按 :meth:`_unwind_slot` 让出这次调用刚占到的 CAS 槽
+        位再把异常原样往外抛——与 ``_create_and_track``/
+        ``_discard_new_sandbox`` 失败清理走的是同一套收口。``user_id`` 为
+        None(临时沙箱)整段跳过,同 :meth:`_prepare_workspace_mount`:临时
+        沙箱没有软删概念。
+        """
+        root = self.workspace_root
+        if not root or user_id is None:
+            return
+        try:
+            await self._reject_if_workspace_deleted(root, tenant_id=tenant_id, user_id=user_id)
+        except SandboxSupervisorError:
+            await self._unwind_slot(sandbox_id=sandbox_id, reason=_WORKSPACE_DELETED_RACE_REASON)
+            raise
+
+    async def _ensure_workspace_dir(self, path: Path) -> None:
+        """``mkdir(parents=True, exist_ok=True)`` + ``chmod(0o777)``,off-loop。
+
+        **为什么 chmod 而不是 chown**(Critical 修复,集群实测坐实):最初
+        实现用 ``os.chown(path, 10000, 10000)`` 把目录属主改成沙箱镜像
+        ``agent`` 用户的 uid/gid。这在生产上必然失败——control-plane 以
+        非 root 的 uid 10002(``expert_work``)运行(``kubectl exec
+        deploy/control-plane -- id`` 实测),而 POSIX 下**非 root 进程无权
+        把文件属主改成另一个 uid**(``chown(2)``:只有 ``CAP_CHOWN``/root
+        能做到)——``os.chown`` 到 10000 直接 ``EPERM``,云后端每一次
+        ``acquire`` 都会在这里炸掉,工作区功能整个不可用。同一次实测确认
+        ``chmod`` 正常(目录变 ``drwxrwxrwx``,属主仍是 ``expert_work``)。
+
+        **为什么 0o777 够、也可接受**:这个目录经 ``subPath`` 只挂进这一个
+        用户自己的沙箱——能碰到它的只有 control-plane(uid 10002,一直是
+        目录属主)与该用户的沙箱(uid 10000)两方,两边都需要读写。跨 uid
+        改属主在非 root 下做不到,退而求其次用宽 mode 让"其他用户"这一档
+        也能读写,而不是精确匹配到 10000——这个目录本就不与其它租户共享
+        (per-``(tenant, user)`` 隔离在 subPath 层面已经做了),宽 mode 不
+        新增跨用户可见性。
+
+        失败(NAS 权限异常 / 挂载点抖动)仍按 :class:`SandboxSupervisorError`
+        抛,不静默——静默的话沙箱会挂载到一个 agent 用户写不进去的目录,
+        直到第一次 ``exec``/文件工具报一个远离根因的"Permission denied",
+        比在 ``acquire`` 这里就说清楚差得多。
+        """
+
+        def _do() -> None:
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, 0o777)  # noqa: S103 — 见上方 docstring:宽 mode 是跨 uid 无 chown 权限下的刻意取舍,不是疏忽。
+
+        try:
+            await asyncio.to_thread(_do)
+        except OSError as exc:
+            raise SandboxSupervisorError(
+                f"failed to prepare workspace directory {path}: {exc}"
+            ) from exc
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
@@ -581,6 +947,7 @@ class AgentSandboxClient:
         *,
         tenant_id: UUID,
         sandbox_id: UUID,
+        user_id: UUID | None,
         egress: EgressContext | None,
     ) -> Any:
         """``_create`` 加上失败时的 CAS 槽位清理(审查 Critical-2)。
@@ -613,7 +980,9 @@ class AgentSandboxClient:
         ``set_container_id`` 回填)也要走同一套清理,见 :meth:`acquire`。
         """
         try:
-            return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress)
+            return await self._create(
+                tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
+            )
         except Exception:
             await self._unwind_slot(sandbox_id=sandbox_id, reason="create_failed")
             raise
@@ -657,7 +1026,12 @@ class AgentSandboxClient:
             )
 
     async def _create(
-        self, *, tenant_id: UUID, sandbox_id: UUID, egress: EgressContext | None
+        self,
+        *,
+        tenant_id: UUID,
+        sandbox_id: UUID,
+        user_id: UUID | None,
+        egress: EgressContext | None,
     ) -> Any:
         """建一个新沙箱。
 
@@ -665,18 +1039,46 @@ class AgentSandboxClient:
         (:data:`SANDBOX_IMAGE_ENV`,全分支终审 Important-2),加上本次
         acquire 的 egress 变量。egress 放后面覆盖——今天两组键零重叠,
         顺序只是把"哪一组是特化"这件事写死,免得以后加键时靠运气。
+
+        沙箱迁移波 2 —— :attr:`workspace_pv_name` 配了时,额外传
+        ``metadata`` 挂载该用户(或临时沙箱的 scratch 子树,``user_id is
+        None`` 时,spec 决策 9)的 NAS 工作区。``user_id`` 是新参数(brief
+        原文:"``_create`` 签名加 ``user_id: UUID | None``");未配
+        ``workspace_pv_name``(波 1 默认)完全不带 ``metadata`` 键,行为与
+        波 1 逐字相同——不是传 ``metadata=None``,真的不出现在 kwargs 里,
+        因为没有实测过真实 ``e2b`` SDK 对 ``metadata=None`` 的行为,不值得
+        为一个从不需要的分支去赌。
         """
-        try:
-            return await self._sdk().create(
-                template=self.template,
-                envs={
-                    **SANDBOX_IMAGE_ENV,
-                    **self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
-                },
-                timeout=_SANDBOX_TIMEOUT_S,
-                domain=self.domain,
-                api_key=self.api_key,
+        kwargs: dict[str, Any] = {
+            "template": self.template,
+            "envs": {
+                **SANDBOX_IMAGE_ENV,
+                **self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
+            },
+            "timeout": _SANDBOX_TIMEOUT_S,
+            "domain": self.domain,
+            "api_key": self.api_key,
+        }
+        if self.workspace_pv_name:
+            subpath = _workspace_subpath(
+                prefix=self.workspace_subpath_prefix,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                sandbox_id=sandbox_id,
             )
+            kwargs["metadata"] = {
+                _CSI_VOLUME_CONFIG_METADATA_KEY: json.dumps(
+                    [
+                        {
+                            "pvName": self.workspace_pv_name,
+                            "mountPath": WORKSPACE_ROOT,
+                            "subPath": subpath,
+                        }
+                    ]
+                )
+            }
+        try:
+            return await self._sdk().create(**kwargs)
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox create failed: {exc}") from exc
 
@@ -702,7 +1104,40 @@ class AgentSandboxClient:
         if await self._is_warm_session(sandbox_id):
             return None
         await self.destroy(sandbox_id=sandbox_id, reason=_RELEASE_DESTROY_REASON)
+        await self._remove_scratch_dir(sandbox_id)
         return None
+
+    async def _remove_scratch_dir(self, sandbox_id: UUID) -> None:
+        """临时沙箱的 ``_scratch/<sandbox_id>`` 目录随沙箱一起收掉(全分支终审 M-3)。
+
+        为什么需要:``run_in_sandbox``(``sandbox.py``)是**每次工具调用**
+        acquire 一次、release 一次,不是每个 run 一次。没有 ``user_id`` 的 run
+        因此每调用一次工具就在 NAS 上永久留一个空目录 —— spec 决策 9 把清理推
+        给波 3 是有意的,但推的时候按"每沙箱一个"估的量,实际是"每工具调用一
+        个",差一到两个数量级。NAS 上百万级空目录的代价不是容量而是 inode 与
+        目录遍历:波 3 的归档/配额扫描 job 正是要遍历这棵树。
+
+        为什么是 ``rmdir`` 而不是递归删:此刻是唯一一个"沙箱已经死了、这个目
+        录再没有写手"的时刻,``rmdir`` 只在目录**确实是空的**时候成功;非空
+        意味着 agent 真往里写了字节,那就留着(既不该被这条清理路径悄悄删
+        掉,也没有其它机制会去读它——留下的是可诊断的痕迹,不是垃圾)。
+
+        整段 best-effort:``release`` 是清理路径,NAS 抖一下不该把一次已经跑
+        完的工具调用变成错误(同 :meth:`_is_warm_session` 的取舍)。
+        ``workspace_root`` 未配(波 1 / 本地 docker 后端)整段跳过。
+
+        为什么不改成 ``_scratch/<yyyymmdd>/<id>`` 分片:那只是把同样多的目录
+        换个地方摆,总量不变,还得改 ``_workspace_subpath``(探针钉死的
+        ``subPath`` 语义)并让两处拼接多一个必须同步的维度。
+        """
+        root = self.workspace_root
+        if not root:
+            return
+        try:
+            await asyncio.to_thread(_scratch_dir(root, sandbox_id).rmdir)
+        except OSError:
+            # 目录非空(agent 写了东西)/ 压根没建过 / NAS 抖动 —— 都不是错误。
+            logger.debug("release: scratch dir for sandbox %s not removed", sandbox_id)
 
     async def _is_warm_session(self, sandbox_id: UUID) -> bool:
         """``store.is_warm_session`` 读不到时,按"保温"处置。
@@ -748,7 +1183,9 @@ class AgentSandboxClient:
             logger.info("destroy: sandbox %s already gone", sandbox_id)
         await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
         PID 1,以下行号均指该文件。四个契约点,与它逐字对齐:
@@ -826,6 +1263,28 @@ class AgentSandboxClient:
         :meth:`_attach` 与
         :meth:`SandboxInstanceStore.touch_and_get_container_id` 的
         docstring。
+
+        sandbox migration wave 2(spec 决策 10):``agent_key`` 非空时随
+        ``commands.run(envs=...)`` 注入 ``PYTHONUSERBASE``(:func:`agent_key_envs`
+        单源计算,与本地 supervisor 后端同一份值 —— 契约测试钉住)。egress
+        token 走 ``create(envs=...)``(§ 模块 docstring "Important-3")只送一
+        次;这里不同 —— SDK 的 ``commands.run`` 本就支持逐次传 envs,同用户
+        双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
+        的 agent_key"。
+
+        ``umask 000 && `` 前缀(Task 4 审查 Critical 后续,跨 uid 写冲突):
+        ``commands.run`` 走 ``/bin/bash -l -c cmd``(见上方 docstring),所以
+        能在同一个 shell 里先设 umask 再 exec python——这个 bash 进程与它派生
+        的 python 子进程(以及 python 里 LLM 代码自己 ``os.mkdir``/``open`` 出
+        的每一个文件)全都继承它。不设的话,agent 代码在 ``/workspace`` 下自己
+        建的目录/文件用沙箱默认 umask(常见 ``0o022``)掩过,变成
+        ``0o755``/``0o644``,uid 只是这个沙箱的 agent(10000)——
+        control-plane 以另一个 uid 经 NAS 挂载读这棵树时,``read``/``list``
+        仍然通(0o755 的"其他人"档还有 r-x),但用户从工作区页面**删除**这个
+        文件、或后续任何一次写入去覆盖它,都会撞 ``EACCES``——这正是本任务
+        对本地 docker 后端(``runner.py`` 的 ``main()``,同一处 ``os.umask(0)``)
+        同款修复的云端一半,两后端必须同款,契约测试
+        (``test_sandbox_runtime_contract.py``)钉住,不是各修各的。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         effective = max(1, min(effective, MAX_TIMEOUT_S))
@@ -835,13 +1294,15 @@ class AgentSandboxClient:
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         started = _monotonic()
+        envs = agent_key_envs(agent_key)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
-                f"python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
+                f"umask 000 && python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,
+                envs=envs or None,
             )
         except timeout_exc:
             return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)

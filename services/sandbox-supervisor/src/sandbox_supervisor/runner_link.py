@@ -44,8 +44,15 @@ class RunnerLink(Protocol):
     async def wait_ready(self, timeout_s: float) -> None:
         """Block until the runner emits its readiness line."""
 
-    async def exec(self, code: str, timeout_s: int) -> ExecResult:
-        """Run ``code`` in the sandbox; return its captured outcome."""
+    async def exec(
+        self, code: str, timeout_s: int, *, envs: dict[str, str] | None = None
+    ) -> ExecResult:
+        """Run ``code`` in the sandbox; return its captured outcome.
+
+        ``envs`` (sandbox migration wave 2, spec 决策 10) — per-call env
+        overrides merged onto the runner subprocess's environment; ``None``
+        (default) → no override, pre-feature behaviour.
+        """
 
     async def close(self) -> None:
         """Close the channel — the container exits on its stdin EOF."""
@@ -79,9 +86,14 @@ class PipeRunnerLink:
             msg = f"runner sent {payload!r} instead of a readiness line"
             raise RunnerLinkError(msg)
 
-    async def exec(self, code: str, timeout_s: int) -> ExecResult:
+    async def exec(
+        self, code: str, timeout_s: int, *, envs: dict[str, str] | None = None
+    ) -> ExecResult:
         async with self._lock:
-            await self._write({"code": code, "timeout_s": timeout_s})
+            request: dict[str, object] = {"code": code, "timeout_s": timeout_s}
+            if envs:
+                request["envs"] = envs
+            await self._write(request)
             # The supervisor's read deadline is the runner's own timeout
             # plus a grace window — a runner past it is itself hung.
             payload = await self._read_line(timeout_s + self._read_grace_s)

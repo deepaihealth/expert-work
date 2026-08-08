@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 from types import ModuleType
 
@@ -168,3 +169,56 @@ def test_main_emits_error_response_for_bad_line() -> None:
     response = json.loads(lines[1])
     assert response["exit_code"] == -1
     assert "invalid JSON" in response["stderr"]
+
+
+# ---------- umask (Task 4 review Critical follow-up — cross-uid write conflict) ----------
+
+
+def test_main_sets_permissive_umask_before_serving_requests() -> None:
+    """``main()`` must set the process umask to 0 before it ever serves a
+    request — every later ``run_once`` child inherits whatever umask is in
+    effect at fork/exec time (see ``main()``'s own docstring for the full
+    cross-uid rationale). ``os.umask`` has no "peek" call; the only
+    portable way to *read* the current value without a side effect is the
+    round-trip idiom used here (set, read back what it returns, restore) —
+    hence saving/restoring the real process umask around the assertion.
+    """
+    saved = os.umask(0)
+    os.umask(saved)
+    try:
+        runner.main(stdin=io.StringIO(""), stdout=io.StringIO())
+        assert os.umask(0) == 0
+    finally:
+        os.umask(saved)
+
+
+def test_child_processes_inherit_the_permissive_umask(tmp_path: Path) -> None:
+    """End-to-end proof the fix actually closes the cross-uid gap, not
+    just that ``os.umask(0)`` was called: after ``main()`` runs, code
+    executed via ``run_once`` (a *real* ``subprocess.run`` child, exactly
+    the mechanism the submitted code's own ``mkdir``/``open`` calls go
+    through) must produce a nested directory and file with **unmasked**
+    modes — ``0o777``/``0o666`` — not the ``0o755``/``0o644`` a default
+    umask (commonly ``0o022``) would otherwise leave. Those masked modes
+    are exactly what let this bug hide: ``read``/``list`` still work at
+    ``0o755``, so nothing breaks until a *different* uid (control-plane,
+    reading the same NAS/docker-volume mount) tries to delete or overwrite
+    a file inside a directory the agent created.
+    """
+    saved = os.umask(0)
+    os.umask(saved)
+    try:
+        runner.main(stdin=io.StringIO(""), stdout=io.StringIO())
+        nested = tmp_path / "reports" / "nested"
+        leaf = nested / "out.txt"
+        code = f"import os\nos.makedirs({str(nested)!r})\nopen({str(leaf)!r}, 'w').close()\n"
+
+        result = runner.run_once(code, 30)
+
+        assert result["exit_code"] == 0, result["stderr"]
+        dir_mode = (tmp_path / "reports").stat().st_mode & 0o777
+        leaf_mode = leaf.stat().st_mode & 0o777
+        assert dir_mode == 0o777, f"directory mode {oct(dir_mode)} — umask was not inherited"
+        assert leaf_mode == 0o666, f"file mode {oct(leaf_mode)} — umask was not inherited"
+    finally:
+        os.umask(saved)

@@ -36,6 +36,8 @@ spec:
             - name: secret-store-files
               mountPath: /run/secret-store
               readOnly: true
+            - name: workspace-nas
+              mountPath: /mnt/workspaces
           resources:
             requests:
               cpu: 500m
@@ -80,3 +82,6 @@ spec:
           secret:
             secretName: control-plane-secret-files
             optional: false
+        - name: workspace-nas
+          persistentVolumeClaim:
+            claimName: workspace-nas

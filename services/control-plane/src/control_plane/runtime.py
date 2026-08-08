@@ -112,6 +112,7 @@ from orchestrator.tools import (
     MCPClient,
     MCPServerConfig,
     MCPServerPool,
+    NasWorkspaceStore,
     NullWorkspaceLock,
     Reranker,
     SandboxInstanceStore,
@@ -1435,6 +1436,30 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
+#: ``sandbox_backend="agent_sandbox"`` 起进程所必需的环境变量名,按
+#: :func:`build_sandbox_runtime` 检查它们的顺序排列。
+#:
+#: **为什么是一个具名常量而不是内联元组**(W2 收尾前提清扫)。契约测试
+#: ``services/orchestrator/tests/test_sandbox_runtime_contract.py`` 的 fixture
+#: 不走这个工厂——它直接构造 :class:`AgentSandboxClient`,于是"生产要求什么"
+#: 与"契约档配了什么"是两份各自演化的清单。这一波真栈复跑正是栽在这上面:
+#: Task 9 之后 ``PV_NAME`` 变成必配,fixture 的默认值还停在"不配 = 波 1 行为"
+#: 的旧世界,18 条 exec 用例齐炸 ``cwd '/workspace' does not exist``——而
+#: 那两个任务各自自洽、per-task 审查也各自都过了,因为肇事任务的 diff 里
+#: 根本没有 fixture 那一行。
+#:
+#: 把清单抽成一处、并由 ``test_contract_fixture_accounts_for_every_mandated_env``
+#: 逐名核对,是把这条"散文前提"变成机器可检的东西:工厂以后再多要一个变量,
+#: 那道闸当场红,不必等一次真栈跑。
+AGENT_SANDBOX_REQUIRED_ENV = (
+    "EXPERT_WORK_SANDBOX_E2B_DOMAIN",
+    "EXPERT_WORK_SANDBOX_E2B_API_KEY",
+    "EXPERT_WORK_SANDBOX_E2B_TEMPLATE",
+    "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME",
+    "EXPERT_WORK_WORKSPACE_NAS_ROOT",
+)
+
+
 def build_sandbox_runtime(
     settings: Settings, *, sandbox_instance_store: SandboxInstanceStore | None = None
 ) -> SandboxRuntime | None:
@@ -1483,15 +1508,28 @@ def build_sandbox_runtime(
     if backend is None:
         backend = "supervisor" if settings.sandbox_supervisor_url else None
     if backend == "agent_sandbox":
-        missing = [
-            name
-            for name, value in (
-                ("EXPERT_WORK_SANDBOX_E2B_DOMAIN", settings.sandbox_e2b_domain),
-                ("EXPERT_WORK_SANDBOX_E2B_API_KEY", settings.sandbox_e2b_api_key),
-                ("EXPERT_WORK_SANDBOX_E2B_TEMPLATE", settings.sandbox_e2b_template),
-            )
-            if not value
-        ]
+        # 波 2 终审 Important-2 —— 后两项在波 1 是可选的("不配 = 波 1 行为"),
+        # Task 9 之后不再是:新沙箱镜像**不预建 /workspace**(那条路径必须留
+        # 空,平台才能在它上面建 NAS 挂载的 symlink),而 exec 无条件传
+        # ``cwd=/workspace``。
+        #  * 少 PV_NAME → ``_create`` 不注入 csi-volume-config → 沙箱里根本
+        #    没有 /workspace → 第一次工具调用炸在 envd 层,报一个与根因八竿子
+        #    打不着的错(W2 收尾真栈复跑实际观测到的就是这个);
+        #  * 少 NAS_ROOT → 挂载点子目录没人提前 mkdir + chmod。平台会替你建,
+        #    但建成 ``root:root 0755``(2026-08-07 集群实测,此前探针 § 三 记作
+        #    未实测),沙箱以 uid 10000 跑就写不进去;软删闸与 NasWorkspaceStore
+        #    也一起哑掉(工作区浏览/上传/下载/删用户级联全失效)。
+        # 两者都是纯配置错误 + 零运行期信号,正是这段代码上方注释自己定的
+        # "该在进程起来时点名"的场景。名字清单抽在 AGENT_SANDBOX_REQUIRED_ENV,
+        # 契约测试按它逐名核对(见该常量 docstring)。
+        _values = {
+            "EXPERT_WORK_SANDBOX_E2B_DOMAIN": settings.sandbox_e2b_domain,
+            "EXPERT_WORK_SANDBOX_E2B_API_KEY": settings.sandbox_e2b_api_key,
+            "EXPERT_WORK_SANDBOX_E2B_TEMPLATE": settings.sandbox_e2b_template,
+            "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME": settings.sandbox_workspace_pv_name,
+            "EXPERT_WORK_WORKSPACE_NAS_ROOT": settings.workspace_nas_root,
+        }
+        missing = [name for name in AGENT_SANDBOX_REQUIRED_ENV if not _values[name]]
         if missing:
             msg = (
                 "sandbox_backend='agent_sandbox' requires " + " + ".join(missing) + " — "
@@ -1507,33 +1545,67 @@ def build_sandbox_runtime(
             egress_token_ttl_s=settings.sandbox_egress_token_ttl_s,
             egress_proxy_host=settings.sandbox_egress_proxy_host,
             egress_proxy_port=settings.sandbox_egress_proxy_port,
+            # 波 2 Task 4 —— NAS 工作区挂载三项,全部默认 None/"":不配就是
+            # 波 1 行为(见 ``AgentSandboxClient`` 三个字段各自的 docstring)。
+            # ``workspace_root`` 与 ``build_workspace_store`` 的
+            # ``NasWorkspaceStore.root`` 是同一个 Settings 字段
+            # (``workspace_nas_root``)——两者都是"control-plane Pod 本地的
+            # NAS 挂载点"这同一件事,不是两份独立配置。
+            workspace_pv_name=settings.sandbox_workspace_pv_name,
+            workspace_subpath_prefix=settings.sandbox_workspace_subpath_prefix,
+            workspace_root=settings.workspace_nas_root,
         )
     if backend == "supervisor" and settings.sandbox_supervisor_url:
         return HTTPSupervisorRuntime(base_url=settings.sandbox_supervisor_url)
     return None
 
 
-def build_workspace_store(url: str | None) -> WorkspaceStore | None:
-    """Build the workspace-file client from the supervisor's base URL.
+def build_workspace_store(
+    settings: Settings,
+    *,
+    runtime: SandboxRuntime | None = None,
+    instance_store: SandboxInstanceStore | None = None,
+) -> WorkspaceStore | None:
+    """Build the workspace-file client per ``settings``.
 
     波 1 Task 4 — 工作区文件操作从 ``SandboxRuntime`` 拆出。本地/CI 下
-    工作区是 docker 卷,只有 supervisor 碰得到,所以这个实现仍走 HTTP;
-    波 2 的 ``NasWorkspaceStore`` 会直接读挂载的文件系统。
+    工作区是 docker 卷,只有 supervisor 碰得到,所以那个实现走 HTTP 代理。
 
-    ``None`` → 工作区文件端点不可用,与 ``build_sandbox_runtime`` 同语义。
+    波 2 Task 3 — ``settings.workspace_nas_root`` 真值 → ``NasWorkspaceStore``
+    直接读挂载的 NAS 文件系统(control-plane Pod 整树挂载,见该类的模块
+    docstring);优先于 supervisor 代理,因为两者若都配置了,NAS 直读路径
+    是波 2 的目标终态。否则退回 ``sandbox_supervisor_url`` 真值 →
+    ``SupervisorWorkspaceStore``。都没配 → ``None``,与
+    ``build_sandbox_runtime`` 同语义(工作区文件端点不可用)。
 
-    全分支终审"合并前"清单第 4 条:判据是 ``not url`` 而不是 ``url is
-    None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是真值判断,而
-    ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个 overlay 关掉
-    supervisor 的写法,见 ``infra/k8s/overlays/*/configmap-patch.yaml``)在
-    ``is None`` 下会造出一个 ``base_url=""`` 的活 store —— 它不是"不可用",
-    而是每次请求都拿一个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那
-    步报成**失败**而不是跳过,工作区端点回一个传输错误而不是它们的空结果
-    分支。
+    波 2 Task 4 — ``runtime``/``instance_store`` 两个新关键字参数原样转给
+    ``NasWorkspaceStore``(见该类的 ``mark_deleted``),让软删一个用户的工作
+    区时能顺手拆掉这个用户还活着的热会话。两者都默认 ``None``(与波 1/3
+    行为一致 —— ``NasWorkspaceStore.mark_deleted`` 在两者任一为 ``None``
+    时跳过拆除,只写软删标记)。调用方(``app.py``)按"先
+    ``build_sandbox_runtime`` 再 ``build_workspace_store``"的顺序接线,把
+    前者的返回值和喂给它的同一个 ``sandbox_instance_store`` 传进来——两个
+    工厂读的是同一份 sandbox 装配状态,不是各自重新构造一份。这两个参数只
+    在 NAS 分支有意义,supervisor 分支忽略它们(那个后端的热会话拆除已经
+    在 supervisor 服务自己的软删流程里,不需要 control-plane 侧再做一次)。
+
+    全分支终审"合并前"清单第 4 条:supervisor 分支的判据是 ``not url``
+    而不是 ``url is None``。兄弟工厂 ``build_sandbox_runtime`` 一直用的是
+    真值判断,而 ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""``(测试/生产两个
+    overlay 关掉 supervisor 的写法,见
+    ``infra/k8s/overlays/*/configmap-patch.yaml``)在 ``is None`` 下会造出
+    一个 ``base_url=""`` 的活 store —— 它不是"不可用",而是每次请求都拿一
+    个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那步报成**失败**而不
+    是跳过,工作区端点回一个传输错误而不是它们的空结果分支。同一判据延
+    续到 NAS 分支(``workspace_nas_root`` 也用真值判断)。
     """
-    if not url:
-        return None
-    return SupervisorWorkspaceStore(base_url=url)
+    if settings.workspace_nas_root:
+        return NasWorkspaceStore(
+            root=settings.workspace_nas_root, runtime=runtime, instance_store=instance_store
+        )
+    if settings.sandbox_supervisor_url:
+        return SupervisorWorkspaceStore(base_url=settings.sandbox_supervisor_url)
+    return None
 
 
 def build_tool_env(

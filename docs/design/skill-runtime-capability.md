@@ -131,9 +131,21 @@ weakness — it's the boundary doing its job.
 
 ### 5.1 Auto-materialize skill supporting files into the sandbox — HIGHEST ROI
 
+> **Path update (2026-08-07, sandbox migration W2):** skill supporting files no
+> longer land under `/workspace/skills/…`. Sandbox migration W2 moved them to
+> `/opt/skills/<agent_key>/<skill_name>/…` — a per-agent namespace on the
+> sandbox's local disk, separate from the now NAS-backed, per-(tenant, user)
+> `/workspace`. Rationale: skills are the agent's capability definition, not
+> user data — they shouldn't occupy NAS quota or show up in the user's
+> workspace browser. See
+> [2026-08-07-sandbox-migration-w2-design.md](../superpowers/specs/2026-08-07-sandbox-migration-w2-design.md)
+> § 四. The design narrative below (written 2026-06-21, pre-migration)
+> otherwise still describes the seeding mechanism correctly; only the mount
+> point changed.
+
 **Goal:** when a run executes `exec_python`/`bash`, the activated skills'
-supporting files are present on `/workspace/skills/<skill_name>/…` so a skill's
-`python scripts/x.py` works as authored.
+supporting files are present on `/opt/skills/<agent_key>/<skill_name>/…` so a
+skill's `python scripts/x.py` works as authored.
 
 **Design:**
 - Add a Supervisor capability to **seed files at `acquire` time** (extend
@@ -298,6 +310,6 @@ Node-script skills run?
 - Persistent-workspace seeding idempotency: key on per-skill content_hash; evict
   stale `skills/<name>/` dirs when a version changes mid-run? (Likely yes.)
 - Should SKILL.md body injection note to the model that files are now on disk at
-  `/workspace/skills/<name>/` (so it prefers running over re-reading via
+  `/opt/skills/<agent_key>/<name>/` (so it prefers running over re-reading via
   `skill_view`)? (Probably a one-line hint in the `<available-skills>` summary.)
 - Seeded-file size/count caps vs the existing package caps — reuse or separate?
