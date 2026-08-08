@@ -193,7 +193,8 @@ kubectl exec deploy/control-plane -n expert-work -- ls /mnt/workspaces
 
 ### 1. 为什么必须先迁移
 
-**新镜像对着未迁移的树,先坏的不是"报错"这么简单——软删闸会静默失效。**
+**新镜像对着未迁移的树,两条结构性口子当场就开——第 2 条还会把整个租户的
+`acquire` 一起挡死。**
 
 `AgentSandboxClient._ensure_workspace_dir`
 (`services/orchestrator/src/orchestrator/tools/agent_sandbox.py:848`)在每次
@@ -223,17 +224,30 @@ control-plane 作为 "other" 一样能读写。
    挡住新建临时沙箱。这也是下面第 2 步的迁移命令按"每一个顶层目录"处理、
    不按"看起来像租户 UUID 的才处理"的原因。
 
-2. **软删闸静默放行。** `{tenant}/.deleted/` 是 `0700`,属主是老
-   control-plane(10002)。新 control-plane(10000)对它是彻底的陌生人,连
-   `stat` 都过不去。`NasWorkspaceStore.mark_deleted` 与 acquire 前的软删
-   检查(`_reject_if_workspace_deleted`)都是靠 `marker.exists()` 判断"这
-   个用户是不是已经被软删",而 `pathlib.Path.exists()` 拿到
-   `PermissionError` 时**不会往外抛,直接返回 `False`**(本仓库固定的
-   Python 3.14 上实测确认,见任务报告)。也就是说:一个在迁移前就已经被
-   软删的用户,只要 `.deleted/` 还没被迁移 Job 接管,acquire 时的软删检查
-   会**静默判定"没被删"**——不是报错,是错误答案,且不会留下任何异常日志
-   可供事后排查。这个口子只有迁移 Job 把 `.deleted/` 的属主也转成 10000
-   才会关上(`.deleted/` 的 `0700` mode 本身不变,见第 2 步)。
+2. **软删闸读不动 `.deleted/`,于是拒掉该租户下的每一次 acquire。**
+   `{tenant}/.deleted/` 是 `0700`,属主是老 control-plane(10002)。新
+   control-plane(10000)对它是彻底的陌生人,连 `stat` 都过不去。而 acquire
+   前的软删检查(`_reject_if_workspace_deleted`)是 **fail-closed** 的:
+   读不到 marker 就拒绝,不猜。所以该租户下**每一个用户**(不只是被软删过
+   的那些)的 acquire 都会翻成
+   `SandboxSupervisorError: workspace delete-marker unreadable`。
+
+   波及面比第 1 条大得多——第 1 条只挡"该租户下还没有工作区目录的用户",
+   这一条挡的是**全部**。好在它响亮:错误信息直接点名 delete-marker 读不动,
+   而不是含混的 404 或 500。
+
+   > **这道闸原本不是 fail-closed 的**,本波顺手改的(commit
+   > `64dad897`)。原实现用 `marker.exists()`,而 `pathlib.Path.exists()`
+   > 对 `EACCES` 的处理跨版本不一致——实测 3.12.8/3.13.1 抛、**3.14.0 吞掉
+   > 返回 `False`**。在 3.14 上那就是 fail-open:已软删的用户在这个窗口里
+   > 被静默放行,拿到一个本该拒掉的沙箱,且不留任何异常日志。
+   > `requires-python = ">=3.12"` 允许 3.14,所以这不是"以后再说"的事。
+   > 改成 fail-closed 之后,同一个窗口的表现从"安静的安全漏洞"变成"响亮的
+   > 可用性中断"——**这是有意的取舍**:窗口本来就该短到不出现,真出现时宁可
+   > 全挡也不能放错人进来。
+
+   这个口子只有迁移 Job 把 `.deleted/` 的属主也转成 10000 才会关上
+   (`.deleted/` 的 `0700` mode 本身不变,见第 2 步)。
 
 两条都不是"发布后再补救"能救的——第 1 条要迁移 Job 跑完才有写权限,第 2
 条要迁移 Job 跑完才能读到真实答案,新镜像的代码里没有、也不该有任何绕过属
@@ -247,16 +261,22 @@ control-plane 作为 "other" 一样能读写。
 # origin/main(当前部署),services/orchestrator/src/orchestrator/tools/agent_sandbox.py
 def _do() -> None:
     path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o777)  # noqa: S103 —— 没有 try/except,EPERM 直接冒出去
+    os.chmod(path, 0o777)  # noqa: S103 — 见上方 docstring:宽 mode 是跨 uid 无 chown 权限下的刻意取舍,不是疏忽。
 ```
 
 迁移 Job 把用户目录属主从 10002 改成 10000 之后,如果老镜像还在跑一段时
 间,**每一个已存在用户**的下一次 acquire 都会在这句 `chmod` 上撞
 `EPERM`——不区分新老用户,波及面比"新镜像早于迁移"那两条加起来还大。这就
-是「迁移 Job → 发布」之间的窗口必须尽量短、最好连着做的真正原因:窗口两头
-都有真实故障在等,只是形状和波及面不同(新镜像早于迁移 = 新用户 onboarding
-挡死 + 软删闸静默失效;迁移早于新镜像 = 所有存量用户的 acquire 硬挡)。**不
-存在"提前迁移更安全"这种说法**,迁移和发布要当成一个不可拆分的动作去做。
+是「迁移 Job → 发布」之间的窗口必须尽量短、最好连着做的真正原因:**窗口两头
+都是全租户级的 acquire 中断**,只是撞在不同的代码行上——
+
+| 顺序错法 | 谁受影响 | 撞在哪 |
+|---|---|---|
+| 新镜像早于迁移 | 该租户**全部**用户的 acquire(第 2 条)+ 新用户的 onboarding(第 1 条) | `.deleted/` 读不动 → `delete-marker unreadable`;租户目录写不进 → `mkdir` `PermissionError` |
+| 迁移早于新镜像 | **全部**存量用户的 acquire | 老镜像 `_ensure_workspace_dir` 那句无保护的 `chmod` → `EPERM` |
+
+两边都是响亮的失败(不是错误答案),都能从日志一眼认出来,但都是中断。
+**不存在"提前迁移更安全"这种说法**,迁移和发布要当成一个不可拆分的动作去做。
 
 ### 2. 迁移 Job
 
@@ -342,8 +362,8 @@ kubectl delete pod/workspace-uid-migrate -n expert-work
 - **`.deleted/` 要不要碰,答案是"属主要改、mode 不要改"。** `.deleted/`
   现在是 `0700` 属主 10002(老 control-plane 建的,唯一的写者)。迁移之
   后新 control-plane 是 10000,如果 `.deleted/` 的属主不跟着改,上面第 1
-  节第 2 条(软删闸静默放行)原样成立——迁移这一步如果漏了它,等于没解决
-  软删闸的问题。但 `.deleted/` 的**权限位**不能跟着通用的"目录 0700/文件
+  节第 2 条(软删闸拒掉全租户 acquire)原样成立——迁移这一步如果漏了它,
+  等于没解决软删闸的问题。但 `.deleted/` 的**权限位**不能跟着通用的"目录 0700/文件
   0600"两条 `find` 走,因为里面的 marker 文件的落地 mode(`0644` 之类,
   由 `Path.touch()` 决定)本来就不是这套设计管的对象——`NasWorkspaceStore.
   mark_deleted` 的注释原话是"这个目录只有一个写者、没有任何 `subPath`
@@ -375,8 +395,8 @@ kubectl delete pod/workspace-uid-migrate -n expert-work
    的两个结构性故障,迁移前会复现、迁移后应该恢复正常。
 
 三步之间的窗口越短越好——第 1 节已经证明窗口两头都有真实故障(迁移早于发
-布 = 全体存量用户 acquire 硬挡;发布早于迁移 = 新用户 onboarding 硬挡 + 软
-删闸静默失效),没有"先做哪个更安全"这种选项,只有"两步之间隔多久"的风险
+布 = 全体存量用户 acquire 硬挡;发布早于迁移 = 全租户 acquire 被软删闸拒 +
+新用户 onboarding 硬挡),没有"先做哪个更安全"这种选项,只有"两步之间隔多久"的风险
 可以控制,所以尽量连着做,不要把迁移 Job 和 `release.sh` 排进两个不同的运
 维窗口。
 
