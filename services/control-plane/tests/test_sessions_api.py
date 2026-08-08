@@ -492,6 +492,58 @@ async def test_session_workspace_delete_still_404s_on_a_generic_supervisor_error
     assert resp.status_code == 404, resp.text
 
 
+async def _seed_artifact_for_thread(
+    client: AsyncClient, thread_id: str, *, name: str = "report.pdf"
+) -> None:
+    """Save an artifact version row so ``.../workspace/artifacts/{name}/download``
+    resolves — mirrors ``test_session_workspace_file_and_artifact_download_system_admin_200``'s
+    seeding, factored out since the two tests below need it too."""
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+    assert meta is not None and meta.user_id is not None
+    await app.state.artifact_store.save_version(
+        tenant_id=_DEFAULT_TENANT,
+        user_id=meta.user_id,
+        name=name,
+        kind="document",
+        path_in_workspace=name,
+        created_in_thread=thread_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_artifact_download_reports_server_error_on_permission_denied(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    元数据行(artifact 版本)存在,内容读不动是权限问题(服务端配置),不是
+    "这个 artifact 不存在"——``artifacts`` 的内容其实就是同一个 workspace_store
+    上的一个文件,"gone / unreadable" 合并成一个 404 正是这整个 program 要拆
+    开的那类混淆(复审第二轮找到的第四/五处站点之一)。响应体不含路径/uid/mode。
+    """
+    client, store, thread_id = session_client_with_store
+    await _seed_artifact_for_thread(client, thread_id)
+    store.workspace_file_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/artifacts/report.pdf/download")
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_artifact_download_still_404s_on_a_generic_supervisor_error(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(真的读不到内容)仍是 404,既有姿态不变。"""
+    client, store, thread_id = session_client_with_store
+    await _seed_artifact_for_thread(client, thread_id)
+    store.workspace_file_error = SandboxSupervisorError("content gone")
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/artifacts/report.pdf/download")
+    assert resp.status_code == 404, resp.text
+
+
 @pytest.mark.asyncio
 async def test_get_returns_404_for_unknown(session_client: AsyncClient) -> None:
     response = await session_client.get("/v1/sessions/00000000-0000-0000-0000-000000000099")

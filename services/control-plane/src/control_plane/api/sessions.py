@@ -672,6 +672,12 @@ def build_sessions_router() -> APIRouter:
             data = await workspace_store.read_file(
                 tenant_id=target_tenant, user_id=meta.user_id, path=version.path_in_workspace
             )
+        except WorkspacePermissionError as exc:
+            # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
+            # 不存在"——同六处 workspace 端点的坑,必须排在下面的
+            # SandboxSupervisorError 之前(它的子类,顺序反了永远走不到)。
+            logger.warning("session_artifact.permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
         except SandboxSupervisorError as exc:
             logger.warning("session_artifact.content_unavailable", exc_info=True)
             raise HTTPException(status_code=404, detail="artifact content not found") from exc
