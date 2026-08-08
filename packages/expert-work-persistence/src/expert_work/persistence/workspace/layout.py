@@ -68,3 +68,36 @@ def is_reserved_workspace_path(relpath: str) -> bool:
     a bare top-level file (no ``/``) is never reserved.
     """
     return relpath.split("/", 1)[0] in WORKSPACE_RESERVED_PREFIXES
+
+
+#: 沙箱 agent 用户的主组(``infra/sandbox-image/Dockerfile`` 的
+#: ``useradd -u 10000 ... agent``,``useradd`` 默认建同名同 id 主组)。
+#:
+#: **为什么控制面要认识它**:波 2 把工作区权威搬到 NAS 之后,同一棵目录树
+#: 被两个不同 uid 的进程读写 —— control-plane(uid 10002,``services/
+#: control-plane/Dockerfile`` 的 ``useradd --uid 10002 ... expert_work``)与
+#: 沙箱里的 agent(uid 10000)。跨 uid 改属主在非 root 下做不到(``chown``
+#: uid 恒 ``EPERM``),但**改 group 到自己所属的组是允许的**,而 Pod 的
+#: ``securityContext.supplementalGroups`` 可以把 control-plane 放进这个组
+#: —— 于是"共享一个 gid + 目录 setgid"成了两侧都能落地的唯一支点。
+#:
+#: 三份副本(本常量 / 镜像的 ``useradd`` / k8s Deployment 的
+#: ``supplementalGroups``)由 ``test_workspace_shared_gid.py`` 双向钉住。
+WORKSPACE_SHARED_GID = 10000
+
+#: 用户工作区目录的 mode —— ``rwxrws---``。
+#:
+#: ``0o2770`` 的三段:属主(control-plane 或先建它的一方)与 group
+#: (:data:`WORKSPACE_SHARED_GID`,即沙箱 agent)读写执行齐全,``other``
+#: 全零。前导 ``2`` 是 **setgid**:目录里新建的文件/子目录 group 自动继承
+#: 成 10000,写入方不需要(也没权限)自己 ``chown`` —— 这是整套方案的枢纽。
+#:
+#: **每个目录都要显式设成这个值,不能靠继承**:集群实测,``os.makedirs``
+#: 建出来的子目录是 ``0o2755``(setgid 位与 group 继承了,权限位走 umask),
+#: group 少了 ``w``,另一侧就写不进去。
+WORKSPACE_DIR_MODE = 0o2770
+
+#: 工作区里新建 leaf 文件的 mode —— ``rw-r-----``。group 可读即可满足
+#: "一侧写、另一侧读";``other`` 全零。写方向由各自的目录写权限决定,不靠
+#: 文件的 group ``w`` 位。
+WORKSPACE_FILE_MODE = 0o640

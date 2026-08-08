@@ -14,6 +14,17 @@ spec:
       labels:
         app.kubernetes.io/name: control-plane
     spec:
+      # 波 2 BUG-1 —— 工作区在 NAS 上被两个 uid 共读写:control-plane 是
+      # uid 10002,沙箱里的 agent 是 uid 10000。把 10000 挂进本 Pod 的附加组,
+      # 加上工作区目录的 setgid(见 WORKSPACE_DIR_MODE),两侧才能读到对方
+      # 写的 0640 文件。集群实测:阿里云 NAS(NFSv3 AUTH_SYS)完整支持附加组
+      # 与 setgid 目录。数字由 test_workspace_shared_gid.py 钉住。
+      #
+      # 顺序敏感:这一项与代码里的 0640 必须同一次 release 落地。先上代码后
+      # 上本项 = control-plane 既不在组里、文件又不再 world-readable,全部
+      # 下载当场失败。
+      securityContext:
+        supplementalGroups: [10000]
       containers:
         - name: control-plane
           # Overlay pins the real tag; :latest here is a build-time
