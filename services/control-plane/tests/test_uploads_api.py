@@ -297,6 +297,58 @@ async def test_upload_document_503_without_supervisor(setup: Setup) -> None:
 
 
 # ---------------------------------------------------------------------------
+# W2-BUG-1 — a permission failure on the workspace write must not leak the
+# store's exception text (path / uid / mode) into the HTTP response body.
+# ``write_file``'s own ``PermissionError`` branch raises
+# ``WorkspacePermissionError`` (a ``SandboxSupervisorError`` subclass) since
+# ``57fc1680`` — the endpoint's original ``except SandboxSupervisorError as
+# exc: ... detail=f"workspace write failed: {exc}"`` caught it too and
+# echoed the store's message straight back to the caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_document_reports_permission_denied_without_leaking_detail() -> None:
+    """store 抛 WorkspacePermissionError → 500(不是笼统的 502),响应体不含
+    路径 / uid / mode。500 而非 502 与其余六处 workspace 端点的约定一致——
+    权限失败是服务端配置问题,不该混进"上游写失败"的 502 里,这也让"narrow
+    分支排在前面"这条要求本身可被 mutation 验证(见下方 M7):两个分支状态码
+    不同,分支顺序反了会在状态码上直接可见,不必只靠日志消息去信。
+    """
+    from orchestrator.tools import WorkspacePermissionError
+
+    client, thread_id, store, _ = await _doc_client()
+    store.workspace_write_error = WorkspacePermissionError(
+        "PermissionError(13, 'Permission denied'): "
+        "'/mnt/workspaces/t-1/u-1/uploads/report.pdf' uid=10002 mode=0o600"
+    )
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("report.pdf", b"%PDF-1.4 body", "application/pdf")},
+        )
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_upload_document_still_502s_on_a_generic_supervisor_error() -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍是 502——既有行为不变。"""
+    from orchestrator.tools import SandboxSupervisorError
+
+    client, thread_id, store, _ = await _doc_client()
+    store.workspace_write_error = SandboxSupervisorError("supervisor unreachable")
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("report.pdf", b"%PDF-1.4 body", "application/pdf")},
+        )
+    assert resp.status_code == 502, resp.text
+
+
+# ---------------------------------------------------------------------------
 # Mini-ADR J-30 (J.6.补强-1) — quota admission
 # ---------------------------------------------------------------------------
 
