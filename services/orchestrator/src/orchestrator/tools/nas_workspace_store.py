@@ -30,6 +30,18 @@ re-declared here (not imported) because ``orchestrator`` and
 on each other; wave 2 Task 7's contract-test suite is what pins the two
 implementations together and would catch a drift.
 
+**Known deferred asymmetry (workspace-gid-sharing direction change).**
+``SupervisorWorkspaceStore`` never raises :class:`WorkspacePermissionError` —
+every supervisor-side failure, permission-related or not, still surfaces as
+the generic :class:`SandboxSupervisorError` a caller cannot tell apart from
+"doesn't exist". A permission failure is therefore a 500 on this (NAS) store
+but still a 404 "file not found" on the supervisor backend; the contract-test
+leg that would otherwise flag this drift is deliberately weakened for an
+unrelated, documented reason (``test_sandbox_runtime_contract.py``'s
+``test_written_file_is_readable_by_the_control_plane_identity``, supervisor
+leg). Not fixed here — recorded so the next reader doesn't take "same error
+type" above as still true of this one dimension.
+
 **Marker semantics.** :meth:`NasWorkspaceStore.mark_deleted` is a
 *soft*-delete: it drops an empty sentinel file at
 :func:`workspace_deleted_marker`'s path and nothing else — no file is
@@ -185,8 +197,8 @@ _MAX_LIST_ENTRIES = 2000
 
 #: Mode for every directory this store creates — ``rwx------``. Both readers
 #: of this tree (control-plane and the sandbox's ``agent`` process) now run
-#: as the same uid (spec § 六 "方向变更"), so the owner bits alone are
-#: enough; there is no other uid left to grant access to.
+#: as the same uid (workspace-gid-sharing design § 六 "方向变更"), so the
+#: owner bits alone are enough; there is no other uid left to grant access to.
 _DIR_MODE = 0o700
 
 #: Mode for new leaf files written through :meth:`NasWorkspaceStore.write_file`
@@ -224,7 +236,9 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
     ``O_NOFOLLOW`` open — so even a symlink raced in during that narrow
     create-then-reopen gap still fails closed.
 
-    方向变更(共享 gid → 统一 uid,spec § 六)—— 一个这个分支带出来的目录,
+    方向变更(共享 gid → 统一 uid,见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)—— 一个这个分支带出来的目录,
     在刚拿到手的 fd 上 ``fchmod`` 到 :data:`_DIR_MODE`(``0o700``,不需要
     名字,只作用在已经握着的 fd 上,不重走字符串路径)。control-plane 与
     沙箱里的 agent 现在是同一个 uid,谁创建这个目录都是它的属主,不需要再
@@ -259,7 +273,8 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
         # 已知不修(2026-08-08 方向变更终审 Minor):``fchmod`` 抛的话这个 ``fd``
         # 会泄。要它发生得有另一个 uid 抢先建出同名目录、让我们既 open 得到又
-        # chmod 不动——统一 uid(spec § 六)之后写这棵树的只有一个 uid,这条路
+        # chmod 不动——统一 uid(``docs/superpowers/specs/2026-08-08-workspace-
+        # gid-sharing-design.md`` § 六)之后写这棵树的只有一个 uid,这条路
         # 不可达。哪天再引入第二个写入身份,连同这里一起补 try/finally。
         os.fchmod(fd, _DIR_MODE)
         return fd
@@ -572,10 +587,6 @@ class NasWorkspaceStore:
                 # the supervisor's bounded ``head -c`` subprocess trick.
                 try:
                     size = os.fstat(handle.fileno()).st_size
-                except PermissionError as exc:
-                    raise WorkspacePermissionError(
-                        f"workspace file not readable: {path!r}"
-                    ) from exc
                 except OSError as exc:
                     raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
                 if size > _MAX_READ_BYTES:
@@ -583,10 +594,6 @@ class NasWorkspaceStore:
                     raise SandboxSupervisorError(msg)
                 try:
                     return handle.read()
-                except PermissionError as exc:
-                    raise WorkspacePermissionError(
-                        f"workspace file not readable: {path!r}"
-                    ) from exc
                 except OSError as exc:
                     # e.g. IsADirectoryError — ``name`` resolved to a
                     # directory, not a file.
@@ -715,7 +722,7 @@ class NasWorkspaceStore:
                 # past this store's boundary (parity contract: "错误类型
                 # 统一")。``_LEAF_FILE_MODE`` (``0o600``) is owner-only — the
                 # only reader is the uid that wrote it, which is now the same
-                # uid on both sides (spec § 六).
+                # uid on both sides (workspace-gid-sharing design § 六).
                 try:
                     fd = os.open(
                         name,
@@ -871,9 +878,11 @@ class NasWorkspaceStore:
                     os.chmod(marker.parent, 0o700)
                 marker.touch()  # existence is all that matters, nothing to write.
             except PermissionError as exc:
-                # 复审 N-5 —— 这个方法之前完全没有 keep-item 1 那条窄类型归
-                # 因(read/write/delete/list_files 建 tenant 子树那半边都
-                # 有,这里漏了):跳过 chmod 并不能真的解除访问问题——如果
+                # 复审 N-5 —— 这个方法之前完全没有
+                # ``docs/superpowers/plans/2026-08-08-workspace-gid-sharing.md``
+                # Task A Step 7 保留清单 item 1 那条窄类型归因(read/write/
+                # delete/list_files 建 tenant 子树那半边都有,这里漏了):
+                # 跳过 chmod 并不能真的解除访问问题——如果
                 # ``.deleted/`` 属主还是旧 uid,``marker.touch()`` 本身也会
                 # 被同一个 EPERM 挡住(mode 0700 对非属主零访问,chmod 与否
                 # 都救不了它),真正能解除的只有迁移 Job 把它 chown 回来。

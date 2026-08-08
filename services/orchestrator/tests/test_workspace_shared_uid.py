@@ -22,12 +22,26 @@ sandbox-image.yml,control-plane 走 release.sh),漂移是迟早的事。
 credential-proxy(10001)/supervisor(10003)已经占用的 uid 空间)却没有真的
 守住它,读起来像是"已经处理"。``test_shared_uid_does_not_collide_with_
 another_service`` 补上这半句缺的断言,不只是改文案绕过去。
+
+终审 M-3 —— 两份 Dockerfile 互相比对不是这套权限模型唯一需要盯住的地方。
+``AgentSandboxClient._chown_workspace_mount`` 的兜底 ``chown``(平台自动建
+的 subPath 目录属主是 root 时,唯一还能把它交给 agent 的路径)曾经硬编码
+``"chown 10000:10000"``,与两份 Dockerfile 之间没有任何机器可检的联系——
+两份 Dockerfile **一起**改成同一个新数字(比如都改成 10007)不会破坏本文件
+上面两条测试(它们只比较两个 Dockerfile 是否相等,10007 == 10007 照样绿),
+但那句硬编码的 chown 仍然会把目录交给不存在的旧 uid 10000,而两个进程此时
+都已经是 10007——目录实际落给了"nobody"。字面量已经收进
+:data:`orchestrator.tools.sandbox_image_contract.SANDBOX_EXEC_UID`,调用点
+改成引用它;``test_chown_workspace_mount_uid_matches_both_dockerfiles`` 把
+这个常量也拉进比对,补上第三条腿。
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from orchestrator.tools.sandbox_image_contract import SANDBOX_EXEC_UID
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SANDBOX_DOCKERFILE = _REPO_ROOT / "infra" / "sandbox-image" / "Dockerfile"
@@ -81,3 +95,19 @@ def test_shared_uid_does_not_collide_with_another_service() -> None:
     assert shared_uid not in _RESERVED_FOR_OTHER_SERVICES, (
         f"uid {shared_uid} 已经分给了别的服务(credential-proxy=10001 / sandbox-supervisor=10003)"
     )
+
+
+def test_chown_workspace_mount_uid_matches_both_dockerfiles() -> None:
+    """``AgentSandboxClient._chown_workspace_mount`` 的兜底 ``chown`` 引用的
+    ``SANDBOX_EXEC_UID`` 必须与两份 Dockerfile 的 uid 一起漂移,不能是第三个
+    独立数字。
+
+    上面两条测试只互相比对两份 Dockerfile,两边**一起**改到同一个新数字(比
+    如都改成 10007)对它们而言仍然相等、照样绿——但
+    ``_chown_workspace_mount`` 把目录 ``chown`` 给的是这个常量,不是从
+    Dockerfile 现查的值;常量不跟着动,兜底就会把 subPath 目录的属主设成一
+    个两个进程都不再是的 uid,平台自动建目录、走到这条兜底路径时目录会静默
+    落给"nobody"。这条测试拉 ``SANDBOX_EXEC_UID`` 进同一次比对,补上第三条
+    腿。"""
+    assert SANDBOX_EXEC_UID == _sandbox_agent_uid()
+    assert SANDBOX_EXEC_UID == _control_plane_uid()

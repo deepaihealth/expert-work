@@ -507,7 +507,9 @@ async def test_written_file_is_readable_by_the_control_plane_identity(
     程、同一个身份——这份文件其余每一条工作区用例(比如
     ``test_workspace_files_survive_across_exec``)延续的正是这个模式:两次
     ``runtime.exec`` 调用,同一个身份读自己刚写的东西。真实部署里写方是沙
-    箱、读方是 control-plane;同 uid 方向变更(spec § 六)让这两个身份重新
+    箱、读方是 control-plane;同 uid 方向变更(见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)让这两个身份重新
     统一,这条用例钉的就是那个前提本身:写方走 ``runtime.exec``(沙箱进
     程),读方走 ``build_workspace_store`` 在生产也会用的同一个
     ``WorkspaceStore`` 实现(``SupervisorWorkspaceStore`` /
@@ -582,7 +584,8 @@ async def test_agent_sandbox_workspace_root_is_not_world_accessible() -> None:
     波 2 期间(``NasWorkspaceStore``/共享 gid 方案下)这里是 ``0o2770``/
     ``0o777``(group-/world-writable),靠 subPath 挂载范围做隔离,POSIX 位
     本身不设防,并因此留下两条 dismissed 的 CodeQL high。同 uid 方向变更
-    (spec § 六)之后不需要给任何"另一方"开口子了——``NasWorkspaceStore.
+    (见 ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)之后不需要给任何"另一方"开口子了——``NasWorkspaceStore.
     _DIR_MODE`` 与 ``AgentSandboxClient._ensure_workspace_dir`` 都已收紧到
     ``0o700``。这条断言防的是有人为了排查方便(比如临时调宽方便手工核对
     NAS 上的文件)又把它放宽回去。
@@ -1386,6 +1389,14 @@ _FIXTURE_ENV_DISPOSITION = {
         "AgentSandboxClient._chown_workspace_mount(方向变更前叫 "
         "_chmod_workspace_mount)那道兜底因此成为这一档唯一的"
         "权限来源 —— 也正是这一档真正在验的东西之一。"
+        "**不只是少了 _chown_workspace_mount 兜底覆盖**:这个变量还是本次改动"
+        "两条旗舰契约用例的唯一开关——"
+        "test_written_file_is_readable_by_the_control_plane_identity 与 "
+        "test_agent_sandbox_workspace_root_is_not_world_accessible 都在函数体内 "
+        "os.environ.get 这个变量,未设直接 pytest.skip,不打任何 xfail/xskip 标"
+        "记留痕。`grep -rn EXPERT_WORK_WORKSPACE_NAS_ROOT .github/` 目前无命中,"
+        "即两条测试今天在任何 CI pipeline 里都不执行,只在人工连了真 NAS 的机器"
+        "上跑得到——是 real-stack-only,不是本地/CI 也覆盖、只是少一层兜底断言。"
     ),
 }
 

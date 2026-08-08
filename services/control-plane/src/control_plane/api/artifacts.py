@@ -224,9 +224,9 @@ def build_artifacts_router() -> APIRouter:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
             # 不存在"——"gone / unreadable" 不能再合并成一个 404(同六处
             # workspace 端点的坑)。必须排在下面的 SandboxSupervisorError 之前
-            # (它的子类,顺序反了永远走不到)。日志侧插值异常对象没问题(服务端
-            # 可见,不进响应体);detail 是固定文案。
-            logger.warning("artifact.permission_denied version=%s reason=%s", version.id, exc)
+            # (它的子类,顺序反了永远走不到)。``exc_info=True`` 带全 traceback
+            # (同其它八处权限归因站点的既有手法),不进响应体;detail 是固定文案。
+            logger.warning("artifact.permission_denied version=%s", version.id, exc_info=True)
             raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
         except SandboxSupervisorError as exc:
             # The metadata row exists but the file is gone / unreadable —

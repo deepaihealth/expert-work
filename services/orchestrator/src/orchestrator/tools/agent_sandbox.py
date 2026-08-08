@@ -123,6 +123,7 @@ from orchestrator.tools.sandbox_image_contract import (
     DEFAULT_TIMEOUT_S,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
+    SANDBOX_EXEC_UID,
     SANDBOX_EXEC_USER,
     SANDBOX_IMAGE_ENV,
     SANDBOX_PYTHON_FLAGS,
@@ -704,7 +705,9 @@ class AgentSandboxClient:
         if not self.workspace_pv_name:
             return
         try:
-            await sbx.commands.run(f"chown 10000:10000 {WORKSPACE_ROOT}", user="root")
+            await sbx.commands.run(
+                f"chown {SANDBOX_EXEC_UID}:{SANDBOX_EXEC_UID} {WORKSPACE_ROOT}", user="root"
+            )
         except Exception:
             logger.info(
                 "sandbox workspace chown skipped (sandbox_id=%s) — expected when "
@@ -828,8 +831,10 @@ class AgentSandboxClient:
             里 ``Path.is_dir()`` 那处是同一个 pathlib 陷阱的第二个实例。
 
             读不动本身也不是假想:``{tenant}/.deleted/`` 是 ``0o700``、属主
-            control-plane,而 uid 统一(spec § 六)之后、存量迁移 Job(Task D)
-            跑之前,它的属主还是旧 uid 10002 而本进程已经是 10000——正好读不动。
+            control-plane,而 uid 统一(方向变更,见
+            ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+            § 六)之后、存量迁移 Job(Task D)跑之前,它的属主还是旧 uid 10002
+            而本进程已经是 10000——正好读不动。
             软删闸恰恰在那个窗口里最脆弱,而那个窗口是发布流程的一部分。
 
             与本次改动的其余部分同一个主题:权限失败被吞成"东西不在"。这里的
@@ -911,8 +916,9 @@ class AgentSandboxClient:
         ——那样迁移 Job 跑完之前,受影响用户会连一次 acquire 都做不成
         (比"某些操作降级"糟得多)。目录本身当前的 mode/属主是否真的允许
         读写,由沙箱真正 ``exec``/文件工具去接触它时自然验证,失败会走
-        keep-item 1 那条窄类型 :class:`WorkspacePermissionError` 归因路径,
-        不会被这里的静默吞掉误导成别的故障。
+        ``docs/superpowers/plans/2026-08-08-workspace-gid-sharing.md`` Task A
+        Step 7 保留清单 item 1 那条窄类型 :class:`WorkspacePermissionError`
+        归因路径,不会被这里的静默吞掉误导成别的故障。
 
         ``mkdir`` 失败(NAS 权限异常 / 挂载点抖动)仍按
         :class:`SandboxSupervisorError` 抛,不静默——那是这条路径本身没法
@@ -926,7 +932,8 @@ class AgentSandboxClient:
             except PermissionError:
                 logger.warning(
                     "workspace dir chmod skipped (not owner yet — expected until the "
-                    "uid-migration Job re-chowns legacy user roots, see Task D): %s",
+                    "uid-migration Job re-chowns legacy user roots, see "
+                    "docs/runbooks/sandbox-image-release.md § 存量迁移): %s",
                     path,
                 )
 
@@ -1341,8 +1348,9 @@ class AgentSandboxClient:
         代码在 ``/workspace`` 下自己建的目录/文件用沙箱默认 umask(常见
         ``0o022``)掩过,变成 ``0o755``/``0o644``。
 
-        **方向变更之后(spec § 六:共享 gid → 统一 uid)这条前缀原本的理由
-        已经不成立**——control-plane 现在与沙箱 agent 是同一个 uid
+        **方向变更之后(共享 gid → 统一 uid,见
+        ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+        § 六)这条前缀原本的理由已经不成立**——control-plane 现在与沙箱 agent 是同一个 uid
         (10000),属主位本身就够两侧读写/删除,不再需要靠 world-writable 的
         group/other 位兜底跨 uid 访问。留着它是**安全的超集**
         (``0o777``/``0o666`` 严格宽于统一 uid 之后真正需要的

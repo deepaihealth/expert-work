@@ -58,7 +58,7 @@ WORKDIR /app
 # 时 POSIX 直接拒绝:agent 写的文件属主是 10000,本进程读不动,用户在前端列得出
 # 却下载报 404。同 uid 之后跨 uid 这件事从根上不存在,工作区目录因此还能收紧到
 # 0700(此前是 world-writable 的 0777)。两处 uid 由
-# tests/test_workspace_shared_uid.py 双向钉住。
+# services/orchestrator/tests/test_workspace_shared_uid.py 双向钉住。
 RUN useradd --uid 10000 --no-create-home --shell /usr/sbin/nologin expert_work
 
 COPY --from=builder --chown=expert_work:expert_work /app/.venv /app/.venv

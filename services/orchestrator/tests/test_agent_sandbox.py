@@ -1202,7 +1202,9 @@ async def test_acquire_survives_a_failing_mount_chown() -> None:
 async def test_acquire_chmods_user_workspace_to_0700(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """方向变更(共享 gid → 统一 uid,spec § 六)—— control-plane 与沙箱里
+    """方向变更(共享 gid → 统一 uid,见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)—— control-plane 与沙箱里
     的 agent 现在是同一个 uid,谁先建这棵目录都是它的属主,不需要再对"另一
     侧"开任何口子。这里 monkeypatch 记录调用参数,断言目标 mode 是
     ``0o700``(此前的 gid 方案里短暂是 ``0o777`` world-writable;方向变更后
@@ -1238,7 +1240,9 @@ async def test_acquire_survives_a_chmod_permission_error_on_the_user_workspace(
     跑完之前,受影响用户连一次 acquire 都做不成,比"某些操作降级"糟得多。
     现在 ``PermissionError`` 是尽力而为:``mkdir`` 已经确认目录存在,
     acquire 继续往下走,真正的读写权限问题留给沙箱 ``exec``/文件工具接触
-    到时用 keep-item 1 的窄类型 ``WorkspacePermissionError`` 自然诊断。"""
+    到时用 ``docs/superpowers/plans/2026-08-08-workspace-gid-sharing.md``
+    Task A Step 7 保留清单 item 1 的窄类型 ``WorkspacePermissionError``
+    自然诊断。"""
 
     def fake_chmod(path: object, mode: int) -> None:
         del path, mode
@@ -1313,7 +1317,9 @@ async def test_acquire_refuses_when_the_delete_marker_is_unreadable(
     ``requires-python = ">=3.12"`` 允许 3.14,所以"今天生产跑 3.12"不是理由。
 
     读不动的窗口在发布流程里真实存在:``{tenant}/.deleted/`` 是 ``0o700``
-    属主 control-plane,而 uid 统一(spec § 六)之后、存量迁移 Job(Task D)
+    属主 control-plane,而 uid 统一(见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)之后、存量迁移 Job(Task D)
     跑之前,它的属主还是旧 uid 而进程已经是新 uid。
 
     **本用例在 3.12/3.13 上也有意义**:那两个版本虽然不放行,但裸

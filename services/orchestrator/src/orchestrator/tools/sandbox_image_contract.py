@@ -58,6 +58,23 @@ SANDBOX_HOME = "/home/agent"
 #: ``files.write`` 唯一能用的降权用户。
 SANDBOX_EXEC_USER = "agent"
 
+#: :data:`SANDBOX_EXEC_USER` 对应的数字 uid —— 与 control-plane 镜像方向变更
+#: (共享 gid → 统一 uid,见
+#: ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md`` § 六)
+#: 之后共用的同一个数字。**这是两份 Dockerfile 各自 ``useradd`` 行的字面量
+#: 副本,不是从任一份 Dockerfile 解析出来的**——原因与上面 ``SANDBOX_IMAGE_ENV``
+#: 一样:构建期声明,运行时读不到。真正需要与 Dockerfile 保持一致的调用点是
+#: ``AgentSandboxClient._chown_workspace_mount`` 的兜底 ``chown``(那句以
+#: ``user="root"`` 跑,只有 root 才能真正改属主,mode 收紧到 0700 之后这是
+#: 唯一还能把一个属主是 root 的 subPath 目录交给 agent 的路径)——之前那句
+#: 直接硬编码 ``"chown 10000:10000"``,与两份 Dockerfile 的 uid 之间没有任何
+#: 机器可检的联系:``test_workspace_shared_uid.py`` 只比对两份 Dockerfile
+#: 互相是否相等,两边一起改成同一个新数字(比如 10007)时那道闸照样绿,而这
+#: 句硬编码的 chown 仍然把目录交给不存在的旧 uid 10000——沙箱进程此时已经是
+#: 10007,新目录对它而言又是别人的。把字面量收在这一个常量里、调用点改成引用
+#: 它,``test_workspace_shared_uid.py`` 才有东西可比对、可钉住这第三处。
+SANDBOX_EXEC_UID = 10000
+
 #: 沙箱镜像 ``infra/sandbox-image/Dockerfile`` 声明的那套 ``ENV``,在这里重述
 #: 一份显式送进云沙箱。
 #:

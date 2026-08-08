@@ -1308,7 +1308,9 @@ async def test_list_files_returns_empty_when_tenant_path_is_not_a_directory(
 async def test_list_files_does_not_use_path_is_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """复审 M-2 —— keep-item 5(``is_dir()`` 换成
+    """复审 M-2 ——
+    ``docs/superpowers/plans/2026-08-08-workspace-gid-sharing.md`` Task A
+    Step 7 保留清单 item 5(``is_dir()`` 换成
     ``stat.S_ISDIR(os.stat(...).st_mode)``)的分歧只在 Python 3.14 上表现
     出来(见该 fix 的实现注释;已经用真实 3.14.0 解释器验证过)。
 
