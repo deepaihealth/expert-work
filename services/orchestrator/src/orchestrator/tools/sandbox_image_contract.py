@@ -43,9 +43,10 @@ SANDBOX_HOME = "/home/agent"
 #: **勘误(W2 收尾真栈复跑)**:这里原本还写着"``user="root"`` 同样不行
 #: (``InvalidArgumentException``)"。那条是 2026-08-04 在**波 1 老镜像**上测
 #: 的,当时镜像声明 ``USER agent``;Task 9 让容器 root 启动之后不再成立 ——
-#: ``AgentSandboxClient._chmod_workspace_mount`` 就是以 ``user="root"`` 跑
-#: ``chmod``,2026-08-07 真栈实测**成功**(挂载共享那条契约用例正是靠它从
-#: PermissionError 转 PASSED)。留着那句话会告诉后来者"别用 root",而我们恰恰
+#: ``AgentSandboxClient._chown_workspace_mount``(方向变更前叫
+#: ``_chmod_workspace_mount``)就是以 ``user="root"`` 跑,2026-08-07 真栈实测
+#: **成功**(挂载共享那条契约用例正是靠它从 PermissionError 转
+#: PASSED)。留着那句话会告诉后来者"别用 root",而我们恰恰
 #: 靠 root 修好了挂载点权限那条 Critical。
 #:
 #: 这个常量本身含义不变:它钉的是**执行身份**(降权后跑用户代码的那个用户),

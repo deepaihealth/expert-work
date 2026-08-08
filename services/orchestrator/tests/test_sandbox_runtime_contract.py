@@ -128,8 +128,9 @@ def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
     ``workspace_root`` 仍然不配:那是"把 NAS 挂进 control-plane Pod"的那半边,
     GitHub runner 对 NAS 没有 NFS 路由。缺了它 ``_prepare_workspace_mount``
     整段跳过,挂载点目录改由平台建(``root:root 0755``,集群实测),沙箱侧
-    ``AgentSandboxClient._chmod_workspace_mount`` 那道兜底因此成为这一档唯一
-    的权限来源 —— 也正是这一档真正在验的东西之一。
+    ``AgentSandboxClient._chown_workspace_mount``(方向变更前叫
+    ``_chmod_workspace_mount``)那道兜底因此成为这一档唯一的权限来源 ——
+    也正是这一档真正在验的东西之一。
     """
     api_key = os.environ.get("EXPERT_WORK_SANDBOX_E2B_API_KEY")
     if not api_key:
@@ -1142,7 +1143,8 @@ _FIXTURE_ENV_DISPOSITION = {
         "刻意不配 —— 这是「把 NAS 挂进 control-plane Pod」的那半边,GitHub runner "
         "对 NAS 没有 NFS 路由,配不了。缺了它 _prepare_workspace_mount 整段跳过,"
         "挂载点目录改由平台建(root:root 0755,集群实测),沙箱侧 "
-        "AgentSandboxClient._chmod_workspace_mount 那道兜底因此成为这一档唯一的"
+        "AgentSandboxClient._chown_workspace_mount(方向变更前叫 "
+        "_chmod_workspace_mount)那道兜底因此成为这一档唯一的"
         "权限来源 —— 也正是这一档真正在验的东西之一。"
     ),
 }

@@ -45,7 +45,6 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
 
-from expert_work.persistence import WORKSPACE_FILE_MODE
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.registry import (
     ToolBlockedError,
@@ -122,7 +121,7 @@ def _require_path(args: Mapping[str, Any], *, tool: str, default: str | None = N
 # on escape (or on any path the OS rejects, e.g. embedded NUL).
 # ---------------------------------------------------------------------------
 
-_PRELUDE = f"""\
+_PRELUDE = """\
 import hashlib, json, os, tempfile
 
 _P = json.loads(_PARAMS)
@@ -146,26 +145,6 @@ def _atomic_write(full, data):
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
-        # mkstemp 恒定落地 0600 —— 这是它的安全契约,与调用方 umask 无关;而
-        # os.replace 是纯粹的 rename,不改变目标 inode 的权限位,只会把这个
-        # 0600 原样带过去。工作区目录侧写的是 control-plane、读的是沙箱里
-        # 另一个 uid 的 agent(或反过来),不在这里放开 group 可读,经这条
-        # 路径写出的**每一个**文件都会被对面 uid 拒之门外(W2-BUG-1:前端能
-        # 列出 781 字节的 MEMORY.md,下载却 404)。
-        #
-        # chmod 必须排在 os.replace **之前**:反过来的话,目标文件在两次系统
-        # 调用之间会有一个短暂但真实可观测的 0600 窗口 —— 并发读者只要撞上
-        # 这个窗口就是一次随机失败,而不是稳定复现的 bug,会更难查。
-        #
-        # 这个 mode 的 group 位是承重的:workspace 目录是 setgid(0o2770),新建
-        # 文件的 group 自动继承成共享 gid,这里只需要把 group 的 r 位打开即
-        # 可让另一侧读到;other 依旧全零。字面量来自
-        # ``expert_work.persistence.WORKSPACE_FILE_MODE``(Task 1 钉的唯一
-        # 事实源)—— 这段源码要发进沙箱执行,沙箱里的解释器 import 不到
-        # ``expert_work.persistence``,所以只能在这里(orchestrator 进程内,
-        # 拼接 snippet 源码文本的时刻)把常量值转成字面量插值进去,不能留一个
-        # sandbox 内的 import。
-        os.chmod(tmp, {oct(WORKSPACE_FILE_MODE)})
         os.replace(tmp, full)
     except BaseException:
         try:

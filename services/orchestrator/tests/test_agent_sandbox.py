@@ -1146,45 +1146,45 @@ async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_chmods_the_mount_from_inside_the_sandbox() -> None:
+async def test_acquire_chowns_the_mount_from_inside_the_sandbox() -> None:
     """波 2 收尾(集群实测坐实)—— 挂载点目录若由**平台**建,是 ``root:root
     0755``,沙箱里的 agent(uid 10000)第一次写 ``/workspace`` 就
     ``PermissionError``。权威修法是 control-plane 在 ``create()`` 之前
-    mkdir 成 0o777(``_prepare_workspace_mount``),这里钉的是够不到那半边
-    时的兜底:沙箱建好后以 **root** 跑一句 ``chmod 0777 /workspace``。
+    mkdir 好(``_prepare_workspace_mount``),这里钉的是够不到那半边时的
+    兜底:沙箱建好后以 **root** 跑一句 ``chown 10000:10000 /workspace``。
 
     断言 ``user="root"`` 而不是 ``SANDBOX_EXEC_USER``:agent 不是属主,以
-    agent 身份 chmod 一个 root 属主的目录必然 EPERM,这一句就白跑了。
+    agent 身份 chown 一个 root 属主的目录必然 EPERM,这一句就白跑了。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_pv_name="workspace-nas")
 
     await client.acquire(tenant_id=uuid4(), thread_id="t")
 
-    chmods = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")]
-    assert chmods == [(f"chmod 0777 {WORKSPACE_ROOT}", None, "root", None)]
+    chowns = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chown ")]
+    assert chowns == [(f"chown 10000:10000 {WORKSPACE_ROOT}", None, "root", None)]
 
 
 @pytest.mark.asyncio
-async def test_acquire_skips_the_mount_chmod_when_no_pv_is_configured() -> None:
+async def test_acquire_skips_the_mount_chown_when_no_pv_is_configured() -> None:
     """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
-    ——那一句 chmod 只会在 envd 侧留一条无意义的失败,不发。"""
+    ——那一句 chown 只会在 envd 侧留一条无意义的失败,不发。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
     await client.acquire(tenant_id=uuid4(), thread_id="t")
 
-    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")] == []
+    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chown ")] == []
 
 
 @pytest.mark.asyncio
-async def test_acquire_survives_a_failing_mount_chmod() -> None:
-    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的 0o777、
-    属主 uid 10002,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
-    成 nobody,对别人属主的目录 chmod 必然 EPERM。那种失败是无害的(目录本来
+async def test_acquire_survives_a_failing_mount_chown() -> None:
+    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的、属主
+    已经是 10000,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
+    成 nobody,对别人属主的目录 chown 必然 EPERM。那种失败是无害的(目录本来
     就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
-    sdk.sandbox.commands.run_error = RuntimeError("chmod: Operation not permitted")
+    sdk.sandbox.commands.run_error = RuntimeError("chown: Operation not permitted")
     client = make_client(sdk, store, workspace_pv_name="workspace-nas")
 
     sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
@@ -1194,15 +1194,14 @@ async def test_acquire_survives_a_failing_mount_chmod() -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_chmods_user_workspace_world_writable(
+async def test_acquire_chmods_user_workspace_to_0700(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Critical 修复(集群实测坐实)—— control-plane 以非 root 的 uid 10002
-    运行,``os.chown`` 到沙箱镜像 ``agent`` 用户的 uid(10000)必然
-    ``EPERM``(非 root 无权把文件属主改成另一个 uid),云后端每一次
-    ``acquire`` 都会在这里炸掉。改用 ``os.chmod`` 放宽权限——这里
-    monkeypatch 记录调用参数,断言目标 mode 是 ``0o777``(控制面仍是属
-    主,沙箱内的 agent uid 靠"其他用户"这一档拿到读写权限)。"""
+    """方向变更(共享 gid → 统一 uid,spec § 六)—— control-plane 与沙箱里
+    的 agent 现在是同一个 uid,谁先建这棵目录都是它的属主,不需要再对"另一
+    侧"开任何口子。这里 monkeypatch 记录调用参数,断言目标 mode 是
+    ``0o700``(此前的 gid 方案里短暂是 ``0o777`` world-writable;方向变更后
+    收紧到属主独占)。"""
     calls: list[tuple[str, int]] = []
 
     def fake_chmod(path: object, mode: int) -> None:
@@ -1218,7 +1217,7 @@ async def test_acquire_chmods_user_workspace_world_writable(
     assert len(calls) == 1
     chmoded_path, mode = calls[0]
     assert chmoded_path == str(tmp_path / str(tenant_id) / str(user_id))
-    assert mode == 0o777
+    assert mode == 0o700
 
 
 @pytest.mark.asyncio

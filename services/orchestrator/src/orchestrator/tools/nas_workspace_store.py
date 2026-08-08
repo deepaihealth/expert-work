@@ -140,17 +140,13 @@ import asyncio
 import errno
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from expert_work.persistence import (
-    WORKSPACE_DIR_MODE,
-    WORKSPACE_FILE_MODE,
-    WORKSPACE_SHARED_GID,
-    is_reserved_workspace_path,
-)
+from expert_work.persistence import is_reserved_workspace_path
 from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePermissionError
 from orchestrator.tools.workspace_store import WorkspaceFileEntry
 
@@ -187,35 +183,16 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 #: ``sandbox_supervisor.supervisor._MAX_WORKSPACE_LIST_ENTRIES``.
 _MAX_LIST_ENTRIES = 2000
 
+#: Mode for every directory this store creates — ``rwx------``. Both readers
+#: of this tree (control-plane and the sandbox's ``agent`` process) now run
+#: as the same uid (spec § 六 "方向变更"), so the owner bits alone are
+#: enough; there is no other uid left to grant access to.
+_DIR_MODE = 0o700
 
-def _process_is_in_shared_gid() -> bool:
-    """Whether *this* process's chown-to-:data:`WORKSPACE_SHARED_GID` would land.
-
-    Task 3 fix round 2(egid 遗漏,回应 fix round 1 自己提的 concern #3)——
-    非特权 ``chown(path, -1, gid)`` 的内核判据是 ``in_group_p()``:先查
-    **effective gid**,查不中才落到补充组列表。``getgroups(2)`` 本身不保证
-    包含 egid(实测:Docker/runc 会把主 gid 也塞进补充组列表,但那是运行时
-    的偶然行为,不是 POSIX 承诺)。只查 ``os.getgroups()`` 会在
-    ``runAsGroup: 10000``(主 gid 而非 supplementalGroups)这种配置对的部署
-    上误判——假阴性,而且是硬闸的假阴性,后果是把配置对的部署直接拒之门
-    外,比"漏判"更糟。两个来源都要查。
-    """
-    return WORKSPACE_SHARED_GID in os.getgroups() or os.getegid() == WORKSPACE_SHARED_GID
-
-
-def _chgrp_denied_level() -> int:
-    """Log level for a tolerated chown-to-shared-gid ``PermissionError``.
-
-    Task 3 fix round 1(Critical 1)—— 两种失败形态诊断成本天差地别,不能都
-    记 ``warning``。这个进程压根不在共享 gid 里(本机/CI 直接构造
-    ``NasWorkspaceStore``,跳过了 ``build_workspace_store`` 的装配期闸)是
-    **预期**状态,不该在日志里制造噪音,降到 ``DEBUG``。已经在组里却还是
-    被拒——生产环境靠 Deployment 的 ``supplementalGroups: [10000]`` 保证在
-    组里,这种情况下 ``chown`` 还失败,只可能是这个目录本来就不是我们建
-    的、属主是别人——是一次真实事故,升到 ``ERROR``。判据见
-    :func:`_process_is_in_shared_gid`。
-    """
-    return logging.ERROR if _process_is_in_shared_gid() else logging.DEBUG
+#: Mode for new leaf files (``write_file`` / ``mark_deleted``) — ``rw-------``.
+#: Same reasoning as :data:`_DIR_MODE`: the only reader is the process that
+#: wrote it (or, now, the same uid running as the other service).
+_LEAF_FILE_MODE = 0o600
 
 
 class _WorkspacePathNotFoundError(SandboxSupervisorError):
@@ -242,44 +219,23 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
     ``O_NOFOLLOW`` open — so even a symlink raced in during that narrow
     create-then-reopen gap still fails closed.
 
-    Task 3 review(gid 共享,波 2 final review BUG-1 的落地)—— 一个这个分支
-    带出来的目录,在刚拿到手的 fd 上先 ``fchown``(只改 group,``fd`` 已经
-    握在手上,不重走字符串路径 —— 从不是 dir_fd-relative 的
-    ``os.chown(name, dir_fd=dfd)``,更不是纯路径 ``chown``,那会重新引入
-    整条 ``dir_fd`` 链存在的意义就是要关掉的字符串重解析 TOCTOU;
-    ``os.fchown``/``os.fchmod`` 都不需要名字,只作用在已经握着的 fd 上),
-    到共享 gid(:data:`WORKSPACE_SHARED_GID`),再 ``fchmod`` 到
-    :data:`WORKSPACE_DIR_MODE`(``0o2770``,前导 ``2`` 是 setgid)。旧版本
-    这里是纯 ``fchmod`` 到 ``0o777``:两侧 uid(control-plane 10002、沙箱
-    agent 10000)都能读写,靠的是把 ``other`` 也开了,不挑 group —— 换成
-    setgid + 共享 gid 之后 ``other`` 归零,"另一侧也能读写"这件事完全靠
-    group 位撑住,所以 gid 必须先对上,``fchmod`` 才有意义,而不是反过来。
-
-    顺序承重:``fchown`` 必须先于 ``fchmod``——非特权进程 ``chown`` 会清
-    set-user/group-id 位(Linux 对目录网开一面,但 NFS 服务端不保证照做),
-    反过来做就可能被 ``fchmod`` 悄悄抹掉自己刚设上的 setgid,集群探针实测
-    走的就是这个顺序。``fchown`` 到目标 gid 只有调用方本身就是那个组的成员
-    才会真的生效(生产靠 Deployment 的 ``supplementalGroups: [10000]``,
-    Task 1 钉的);不是成员时(典型是本机/CI 跑测试的账户)内核报
-    ``PermissionError``,这里接住只记一条日志、不向上抛——目录仍然落到正确
-    的 mode,只是 group 没能变成共享的那个;不这样处理的话,一台没有 gid
-    10000 的机器一跑测试,``write_file`` 但凡带一层子目录就整条写入链路带崩
-    (这条 fchown 不是 belt-and-braces,是这个分支唯一会碰这个目录 gid 的
-    地方)。
+    方向变更(共享 gid → 统一 uid,spec § 六)—— 一个这个分支带出来的目录,
+    在刚拿到手的 fd 上 ``fchmod`` 到 :data:`_DIR_MODE`(``0o700``,不需要
+    名字,只作用在已经握着的 fd 上,不重走字符串路径)。control-plane 与
+    沙箱里的 agent 现在是同一个 uid,谁创建这个目录都是它的属主,不需要再
+    对"另一侧"开任何口子 —— 不需要 ``chown``,不需要 setgid,``other`` 位
+    也不需要保留。
 
     ``os.mkdir``'s own ``mode=`` argument is masked by this process's
     umask before the directory is actually created (typically leaves
-    ``0o755``, group 缺 ``w``) — this is why every layer needs an explicit
-    ``fchmod`` rather than relying on inheritance: setgid itself and the
-    group it stamps *do* get inherited by a child directory created under
-    an already-setgid parent, but the permission bits never do. Reached
-    this fixed mode unconditionally whenever the directory didn't already
-    exist a moment ago (whether this call's own ``mkdir`` won or a
-    concurrent same-process caller's did, both are "this process just
-    brought it into being") — a directory that already existed before this
-    call (the ``O_NOFOLLOW`` fast path above) is left untouched: fixing
-    modes on file/directory *is not* what this store is responsible for,
-    only what it *creates*.
+    ``0o755``) — this is why every layer needs an explicit ``fchmod``
+    rather than relying on inheritance. Reached this fixed mode
+    unconditionally whenever the directory didn't already exist a moment
+    ago (whether this call's own ``mkdir`` won or a concurrent same-process
+    caller's did, both are "this process just brought it into being") —
+    a directory that already existed before this call (the ``O_NOFOLLOW``
+    fast path above) is left untouched: fixing modes on file/directory
+    *is not* what this store is responsible for, only what it *creates*.
     """
     try:
         return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
@@ -296,25 +252,7 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
             # directory and not a symlink swapped in under the same name.
             pass
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
-        # 先 chown 后 chmod —— 顺序承重,见上方 docstring。chown 失败时
-        # **不** chmod(Task 3 fix round 2,Residual 1)——之前这里 chown 失败
-        # 只记日志,照样往下 chmod 到 WORKSPACE_DIR_MODE:那会把目录主动收紧
-        # 成"错 group + other 归零"的零访问态,恰恰是这整个任务要修的那个
-        # 症状,只是这次是这段代码自己造成的。原样不动(留在 os.mkdir 自己
-        # 那个 umask 掩过的宽松 mode)严格好于主动收紧——至少 other 位还在,
-        # 不会把仅剩的访问路径也堵死。日志级别见 :func:`_chgrp_denied_level`。
-        try:
-            os.fchown(fd, -1, WORKSPACE_SHARED_GID)
-        except PermissionError as exc:
-            logger.log(
-                _chgrp_denied_level(),
-                "nas_workspace_store.intermediate_dir_chgrp_denied name=%r gid=%s: %s",
-                name,
-                WORKSPACE_SHARED_GID,
-                exc,
-            )
-        else:
-            os.fchmod(fd, WORKSPACE_DIR_MODE)
+        os.fchmod(fd, _DIR_MODE)
         return fd
 
 
@@ -489,58 +427,32 @@ class NasWorkspaceStore:
             # only the (untrusted) ``parts`` walked below need dir_fd
             # chaining.
             #
-            # Task 3(gid 共享)—— 这里现在 **也** chown+chmod 用户根自己,
-            # 不再像旧版本那样把这一层完全让给
-            # AgentSandboxClient._ensure_workspace_dir 收尾。生产复现的
-            # W2-BUG-1 就是 agent 把 MEMORY.md 直接写在用户根这一层、不是
-            # 某个子目录里 —— 子目录再怎么修都救不了它,用户根自己的
-            # mode/gid 必须对。旧注释的结论("由 acquire 时的那次
-            # mkdir+chmod(0o777) 兜底,这里重复没意义")是 0o777 时代的:
-            # 那时谁先建都行,反正最终都是同一个宽 mode。换成 setgid + 共享
-            # gid 之后,在某次 acquire 真正跑到之前,任何一次经这个 store
-            # 落地的写入(例如用户在跑过 agent 之前先上传了一份文档)都会
-            # 看到一个两边都还没修好的目录,同一个 bug 原样重演。
+            # This also chmods the user root itself, not just intermediate
+            # subdirectories — the production repro of W2-BUG-1 was the
+            # agent writing MEMORY.md directly at the user-root level, not
+            # inside a subdirectory, so the user root's own mode has to be
+            # right too.
             #
-            # **只在这次 mkdir 真正把目录带入存在时才 chown+chmod**(Task 3
-            # fix round 1,Important 1)——``exist_ok=True`` 原来会在目录已
-            # 存在时静默不报错,而下面这段却无条件跟着跑;chmod/chown 只对
-            # *属主*放行,对一个我们不是属主的既存目录(CSI subPath 建的、
-            # 迁移脚本建的、备份恢复出来的)会 EPERM,而这整个 try 块的
-            # 唯一异常出口是把任何 OSError 都翻成 "failed to create
-            # workspace directory" —— 一条谎报,目录明明建好了(或者一直都
-            # 在),只是我们不该动它的属主/mode。修存量目录是 Task 7 一次性
-            # 迁移 Job 的职责,这条写路径不该顺手兼职。
+            # **只在这次 mkdir 真正把目录带入存在时才 chmod**——``exist_ok=
+            # True`` 原来会在目录已存在时静默不报错,而下面这段却无条件跟着
+            # 跑;``chmod`` 只对*属主*放行,对一个我们不是属主的既存目录
+            # (CSI subPath 建的、迁移脚本建的、备份恢复出来的)会 EPERM,而
+            # 这整个 try 块的唯一异常出口是把任何 OSError 都翻成 "failed to
+            # create workspace directory" —— 一条谎报,目录明明建好了(或者
+            # 一直都在),只是我们不该动它的 mode。修存量目录是一次性迁移
+            # Job 的职责,这条写路径不该顺手兼职。
             #
-            # **这不是幂等免打架的保证**(Task 3 fix round 1,Important 2,
-            # 纠正上一版这里的错误说法):``chmod``/``chown`` 对非属主一律
-            # EPERM,不看"值是不是已经对了" —— 重复调用同一个目标值不会自
-            # 动豁免。而且在 Task 4 落地之前,
-            # ``AgentSandboxClient._ensure_workspace_dir``
-            # (``agent_sandbox.py:870``)仍然在**每次** acquire 时无条件把
-            # 这同一个目录 ``chmod`` 成 ``0o777``,会把这里刚设上的 setgid
-            # 位悄悄抹掉 —— 两处确实会打架,只是 Task 4 上线后这条(只在
-            # 首次创建时跑一次)先于任何 acquire 落地,而 acquire 那边也改
-            # 成同款 setgid+共享 gid 之后就不再互相覆盖。**Task 3 因此不能
-            # 单独发布,必须与 Task 4 一起上线。**
-            #
-            # Wrapped (wave 2 final review, Minor 2): the most likely way
-            # this fails in production is the NAS data root not having been
-            # chmod'd 1777 by hand (the one manual step in the wave 2
-            # release runbook) — control-plane runs as a non-root uid and
-            # gets EACCES creating the first tenant subtree. Unwrapped, that
+            # Wrapped: the most likely way this fails in production is the
+            # NAS data root not having been chmod'd by hand (the one manual
+            # step in the wave 2 release runbook) — control-plane gets
+            # EACCES creating the first tenant subtree. Unwrapped, that
             # surfaces as a bare PermissionError crossing this store's error
             # boundary and a clueless 500 on the upload endpoint; the
             # runbook literally tells the operator "if the first upload
             # after release 500s, check this", which is exactly the signal
-            # the error type should have carried in the first place.
-            #
-            # Task 3 fix round 2(Residual 3)—— 这句话上一版没兑现:那个
-            # EACCES 之前被这里的宽 except OSError 收成普通
-            # SandboxSupervisorError,不是 WorkspacePermissionError,Task 5
-            # 靠后者才能把它翻成有归因的 500——runbook 让人第一个查的那个
-            # 场景,反而是唯一没拿到新错误类型的权限失败。这里补一条窄的
-            # except PermissionError 在前面接住(mkdir 本身的 EACCES;下面
-            # chown 失败已经在内层 try 里被吞掉、不会走到这儿)。
+            # the error type should have carried in the first place —
+            # WorkspacePermissionError (not the generic SandboxSupervisorError)
+            # is what lets Task 5's endpoint answer with a diagnosable 500.
             try:
                 try:
                     user_root.mkdir(parents=True)
@@ -548,31 +460,13 @@ class NasWorkspaceStore:
                 except FileExistsError:
                     # 已经存在——不管是别的写入方先跑到,还是这棵目录本来
                     # 就在那里(CSI/迁移/恢复带来的),都不是我们创建的,
-                    # mode/gid 不归这条路径管。
+                    # mode 不归这条路径管。
                     created = False
                 if created:
-                    # 路径版本的 chown/chmod(不是 _openat_dir 的 fd 版
-                    # 本)—— user_root 是按信任前缀直接开的绝对路径,不经
-                    # 过下面的 dir_fd 链;顺序承重(先 chown 后 chmod)与
-                    # "非成员就降级只记日志"的理由同 _openat_dir 的
-                    # docstring,日志级别见 _chgrp_denied_level。chown 失败
-                    # 时不 chmod(Residual 1,理由同 _openat_dir 那段同款
-                    # 注释)——原样留在 mkdir 自己 umask 掩过的宽松 mode,
-                    # 严格好于主动收紧成零访问态。
-                    try:
-                        os.chown(user_root, -1, WORKSPACE_SHARED_GID)
-                    except PermissionError as exc:
-                        logger.log(
-                            _chgrp_denied_level(),
-                            "nas_workspace_store.user_root_chgrp_denied "
-                            "tenant_id=%s user_id=%s gid=%s: %s",
-                            tenant_id,
-                            user_id,
-                            WORKSPACE_SHARED_GID,
-                            exc,
-                        )
-                    else:
-                        os.chmod(user_root, WORKSPACE_DIR_MODE)
+                    # 路径版本的 chmod(不是 _openat_dir 的 fd 版本)——
+                    # user_root 是按信任前缀直接开的绝对路径,不经过下面的
+                    # dir_fd 链。
+                    os.chmod(user_root, _DIR_MODE)
             except PermissionError as exc:
                 raise WorkspacePermissionError(
                     f"failed to create workspace directory {user_root}: {exc}"
@@ -661,20 +555,32 @@ class NasWorkspaceStore:
     async def list_files(self, *, tenant_id: UUID, user_id: UUID) -> list[WorkspaceFileEntry]:
         def _list() -> list[WorkspaceFileEntry]:
             user_root = self._user_root(tenant_id, user_id)
-            # Task 3 fix round 2(Residual 2)—— Python 3.13 起 Path.is_dir()
-            # 不再无条件吞掉 OSError:它只忽略 ENOENT/ENOTDIR/EBADF/ELOOP 这
-            # 一小撮"路径本来就不存在/不是目录"的错误,EACCES/EPERM 不在白
-            # 名单里,会原样重新抛出(实测坐实,见该函数在这个解释器版本下
-            # 的源码)。祖先目录(典型是 ``{tenant_id}/`` 本身)没有搜索权限
-            # 时——同 ``_raise_workspace_listing_error`` 想防的那类
-            # 故障——这一句自己就是一个未包边的 PermissionError 出口,在
-            # ``onerror=`` 接手之前就先漏了。
+            # ``Path.is_dir()``'s error-swallowing behaviour is not stable
+            # across CPython versions: 3.12/3.13 re-raise ``PermissionError``
+            # (only ``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP`` are treated as
+            # "doesn't exist"), but 3.14's default (``follow_symlinks=True``)
+            # path delegates to ``os.path.isdir()``, which swallows *every*
+            # ``OSError`` unconditionally — on 3.14 the ``except
+            # PermissionError`` below would simply never fire, silently
+            # reintroducing the exact "unreadable subtree → empty result"
+            # failure this exists to close (this repo's ``pyproject.toml``
+            # pins ``>=3.12``, which admits 3.14; measured against the real
+            # store on 3.12.8/3.13.1 vs 3.14.0 to confirm the divergence, not
+            # assumed). ``stat.S_ISDIR(os.stat(...).st_mode)`` is the
+            # version-independent equivalent — a bare ``os.stat`` call whose
+            # exception behaviour is a stable OS-level contract, not a
+            # pathlib convenience wrapper's.
             try:
-                is_dir = user_root.is_dir()
+                is_dir = stat.S_ISDIR(os.stat(user_root).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                return []
             except PermissionError as exc:
-                raise WorkspacePermissionError(
-                    f"workspace listing not readable: {user_root!r}"
-                ) from exc
+                # "." — this checks user_root itself, not an entry under it,
+                # so there is no meaningful relative path to name; and it
+                # must not be the absolute server-side mount path (sibling
+                # wraps below use the workspace-relative ``rel``, not an
+                # absolute path — same reason).
+                raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
             except OSError as exc:
                 raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
             if not is_dir:
@@ -726,15 +632,14 @@ class NasWorkspaceStore:
                 # OSError here (not just ELOOP) is wrapped into
                 # SandboxSupervisorError — a bare OSError must never leak
                 # past this store's boundary (parity contract: "错误类型
-                # 统一")。``WORKSPACE_FILE_MODE`` 起作用要靠父目录的 setgid
-                # 位把 group 继承成共享 gid(``_openat_dir``/上面的用户根
-                # chown 已经做了)——这里只负责 mode,不重复 chown 一次
-                # leaf 文件。
+                # 统一")。``_LEAF_FILE_MODE`` (``0o600``) is owner-only — the
+                # only reader is the uid that wrote it, which is now the same
+                # uid on both sides (spec § 六).
                 try:
                     fd = os.open(
                         name,
                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                        WORKSPACE_FILE_MODE,
+                        _LEAF_FILE_MODE,
                         dir_fd=dfd,
                     )
                 except PermissionError as exc:
@@ -861,20 +766,14 @@ class NasWorkspaceStore:
             marker = workspace_deleted_marker(self.root, tenant_id, user_id)
             try:
                 marker.parent.mkdir(parents=True, exist_ok=True)
-                # 0o700, deliberately *unlike* the per-user workspace roots
-                # ``AgentSandboxClient._ensure_workspace_dir`` creates. Those
-                # have to be world-writable because two different uids
-                # (control-plane 10002, the sandbox's agent 10000) both write
-                # them and a non-root process cannot chown across uids. This
-                # directory has exactly one writer — control-plane, always the
-                # same uid across replicas — and no ``subPath`` ever projects
-                # it into a sandbox, so it needs no group/other bits at all.
-                # Keeping it at 0o700 means the authoritative soft-delete
-                # record is protected by *ownership*, not only by the mount
-                # scoping: even a hypothetically mis-scoped mount handing a
-                # sandbox a wider view of the NAS could not forge or clear a
-                # marker (wave 2 final re-review — this used to be 0o777 for
-                # uniformity's sake, which bought nothing).
+                # 0o700 — this directory has exactly one writer (control-plane,
+                # always the same uid across replicas) and no ``subPath`` ever
+                # projects it into a sandbox, so it needs no group/other bits
+                # at all. Keeping it at 0o700 means the authoritative
+                # soft-delete record is protected by *ownership*, not only by
+                # the mount scoping: even a hypothetically mis-scoped mount
+                # handing a sandbox a wider view of the NAS could not forge or
+                # clear a marker.
                 os.chmod(marker.parent, 0o700)
                 marker.touch()  # existence is all that matters, nothing to write.
             except OSError as exc:
