@@ -189,9 +189,14 @@ _MAX_LIST_ENTRIES = 2000
 #: enough; there is no other uid left to grant access to.
 _DIR_MODE = 0o700
 
-#: Mode for new leaf files (``write_file`` / ``mark_deleted``) — ``rw-------``.
-#: Same reasoning as :data:`_DIR_MODE`: the only reader is the process that
-#: wrote it (or, now, the same uid running as the other service).
+#: Mode for new leaf files written through :meth:`NasWorkspaceStore.write_file`
+#: — ``rw-------``. Same reasoning as :data:`_DIR_MODE`: the only reader is
+#: the process that wrote it (or, now, the same uid running as the other
+#: service). **Not** used by :meth:`NasWorkspaceStore.mark_deleted` — the
+#: soft-delete marker is created with ``Path.touch()`` (process umask
+#: applies, typically ``0o644``), not through this constant; its
+#: reachability is protected by the *parent directory*'s ``0o700`` instead
+#: (owner-only — see that method), not by the leaf file's own mode.
 _LEAF_FILE_MODE = 0o600
 
 
@@ -338,24 +343,6 @@ def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     return (Path(root) / str(tenant_id) / str(user_id)).resolve()
 
 
-def _raise_workspace_listing_error(exc: OSError) -> None:
-    """``os.walk``'s ``onerror`` callback — Task 3 fix round 1.
-
-    ``os.walk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
-    ``EACCES``)会被**静默吞掉**——那棵子树下的文件从结果里凭空消失,不报
-    错也不留任何痕迹,而这恰恰是"列不动"最常见的形态,比单个文件
-    ``lstat`` 失败常见得多(下面 ``_list`` 里那处 ``try/except`` 只挡得住
-    后者)。``control_plane/api/workspace.py`` 的列表端点只接
-    :class:`SandboxSupervisorError`,把它翻成 ``{"success": true, "files":
-    []}`` —— 一次真实的权限故障被这层静默吞声悄悄变成"工作区是空的",正
-    是这整个任务要根治的那类失败。传给 ``os.walk`` 的 ``onerror=`` 让这类
-    错误显式地把这次调用整个炸掉,而不是悄悄漏掉一部分结果。
-    """
-    if isinstance(exc, PermissionError):
-        raise WorkspacePermissionError(f"workspace listing not readable: {exc.filename!r}") from exc
-    raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
-
-
 @dataclass
 class NasWorkspaceStore:
     """Production :class:`WorkspaceStore` (wave 2) — reads/writes the NAS mount directly.
@@ -468,15 +455,30 @@ class NasWorkspaceStore:
                     # dir_fd 链。
                     os.chmod(user_root, _DIR_MODE)
             except PermissionError as exc:
+                # 复审 I-1 —— 同类型的路径泄露:之前这里裸拼 ``{user_root}``,
+                # 是服务端 NAS 挂载点的真实文件系统路径。同 list_files 的
+                # user_root 自检分支一样用 ``'.'`` 指代"用户自己的工作区根"。
                 raise WorkspacePermissionError(
-                    f"failed to create workspace directory {user_root}: {exc}"
+                    f"failed to create workspace directory {'.'!r}: {exc}"
                 ) from exc
             except OSError as exc:
                 raise SandboxSupervisorError(
-                    f"failed to create workspace directory {user_root}: {exc}"
+                    f"failed to create workspace directory {'.'!r}: {exc}"
                 ) from exc
         try:
             dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
+        except PermissionError as exc:
+            # 复审 C-1 —— 这句是四个方法(read/write/delete/list_files)共用
+            # 的入口:落在这里之前 create=False 的 read_file/delete_file 从
+            # 不会碰上面的 mkdir 分支,直接从这里第一次触到 user_root。反过
+            # 来说也一样漏:PermissionError 是 OSError 的子类,顺序反了(把
+            # 这条挪到下面那句宽 except 之后)这个分支永远走不到。不接住的
+            # 后果按调用方分叉:read_file/write_file 把它收成
+            # _WorkspacePathNotFoundError(SandboxSupervisorError 的子类)→
+            # 端点翻 404,用户看到"文件不存在"而它其实读不动;delete_file
+            # 更糟——它把 _WorkspacePathNotFoundError 当 rm -f 语义直接吞掉、
+            # 返回成功,用户看到"删除成功"而文件原封不动地留在盘上。
+            raise WorkspacePermissionError(f"workspace not readable: {path!r}") from exc
         except OSError as exc:
             raise _WorkspacePathNotFoundError(f"workspace path not found: {path!r}") from exc
 
@@ -585,15 +587,45 @@ class NasWorkspaceStore:
                 raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
             if not is_dir:
                 return []
+
+            def _on_walk_error(exc: OSError) -> None:
+                """``os.walk``'s ``onerror`` callback — Task 3 fix round 1.
+
+                ``os.walk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
+                ``EACCES``)会被**静默吞掉**——那棵子树下的文件从结果里凭空消
+                失,不报错也不留任何痕迹,而这恰恰是"列不动"最常见的形态,比
+                单个文件 ``lstat`` 失败常见得多(下面那处 ``try/except`` 只挡
+                得住后者)。``control_plane/api/workspace.py`` 的列表端点只接
+                :class:`SandboxSupervisorError`,把它翻成 ``{"success": true,
+                "files": []}`` —— 一次真实的权限故障被这层静默吞声悄悄变成
+                "工作区是空的",正是这整个任务要根治的那类失败。传给
+                ``os.walk`` 的 ``onerror=`` 让这类错误显式地把这次调用整个炸
+                掉,而不是悄悄漏掉一部分结果。
+
+                复审 I-1 —— 定义成 ``_list`` 内部的闭包(而不是模块级函数)只
+                为了能拿到 ``user_root`` 把 ``exc.filename``(``os.walk`` 给的
+                永远是绝对路径,NAS 挂载点在服务端的真实文件系统路径)转成工
+                作区相对路径。全局约束"用户可见的错误文案不含路径":下面兄弟
+                分支(``full.lstat()`` 那处 ``except PermissionError``)已经在
+                用相对的 ``rel``,这里之前是唯一还在裸拼 ``exc.filename!r`` 的
+                地方。
+                """
+                if isinstance(exc, PermissionError):
+                    rel = os.path.relpath(exc.filename, user_root) if exc.filename else "."
+                    raise WorkspacePermissionError(
+                        f"workspace listing not readable: {rel!r}"
+                    ) from exc
+                raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
+
             entries: list[WorkspaceFileEntry] = []
             # followlinks=False — see module docstring: never descend into a
             # symlinked subdirectory, so an intermediate-component escape
             # can't make this enumerate files outside the tree. onerror=
-            # (Task 3 fix round 1) — see _raise_workspace_listing_error:
-            # without it, a subtree this process can't scan is silently
-            # dropped from the results instead of failing loudly.
+            # (Task 3 fix round 1) — see _on_walk_error: without it, a
+            # subtree this process can't scan is silently dropped from the
+            # results instead of failing loudly.
             for dirpath, _dirnames, filenames in os.walk(
-                user_root, followlinks=False, onerror=_raise_workspace_listing_error
+                user_root, followlinks=False, onerror=_on_walk_error
             ):
                 for name in filenames:
                     full = Path(dirpath) / name

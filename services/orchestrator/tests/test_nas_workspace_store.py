@@ -412,6 +412,13 @@ async def test_list_files_reports_permission_denied_for_unreadable_subtree(
     悄悄变成"工作区是空的"(``control_plane/api/workspace.py`` 把
     ``SandboxSupervisorError`` 及其子类翻成 ``{"success": true, "files":
     []}``),这正是这整个任务要根治的那类失败。
+
+    复审 I-1 —— ``onerror`` 回调之前裸拼 ``os.walk`` 给的 ``exc.filename``
+    (永远是绝对路径),而这恰恰是两个 is_dir 兄弟分支里*会真的触发*的那一
+    个(``test_list_files_raises_when_tenant_dir_is_unreadable`` 锁的是祖先
+    目录不可读,``onerror=`` 根本没轮到;这条才是 onerror 真正被调用的形
+    状)。之前只有前者被这条"不带绝对路径"的断言钉住,后者是漏网的那半
+    边。
     """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
@@ -420,12 +427,15 @@ async def test_list_files_reports_permission_denied_for_unreadable_subtree(
     sub = user_root / "sub"
     os.chmod(sub, 0o000)
     try:
-        with pytest.raises(WorkspacePermissionError):
+        with pytest.raises(WorkspacePermissionError) as excinfo:
             await store.list_files(tenant_id=tenant_id, user_id=user_id)
     finally:
         # 0o000 连 pytest 自己的 tmp_path 清理都进不去(既不能列目录也不能
         # 递归删)——测试结束前放宽回来,不留垃圾目录。
         os.chmod(sub, 0o700)
+
+    assert str(tmp_path) not in str(excinfo.value)
+    assert "'sub'" in str(excinfo.value), "工作区相对路径应该还在,不是被整个抹掉了"
 
 
 @pytest.mark.skipif(
@@ -457,6 +467,39 @@ async def test_list_files_raises_when_tenant_dir_is_unreadable(tmp_path: Path) -
     # 消息不该带绝对服务端挂载路径:同一方法里其它兄弟(lstat 失败那条)已经
     # 用工作区相对路径,这里也一样,不带这次检查目标(用户根自己)的绝对路径。
     assert str(tmp_path) not in str(excinfo.value)
+
+
+async def test_list_files_reports_permission_denied_for_a_single_unstattable_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复审 M-3 —— ``for name in filenames`` 循环里那条 ``except
+    PermissionError`` 之前没有测试覆盖过(删掉它整套 49/49 依旧全绿)。它守
+    的是一个与"目录扫不动"不同的形状:``os.walk`` 已经能列出这个文件名(说
+    明父目录本身可搜索/可读),但对**这一个条目**单独 ``lstat`` 却被拒——
+    真实世界里 ACL/NFS 侧的逐条目权限位就能造出这种情况,本机 tmpfs 权限位
+    造不出(POSIX 下 ``lstat`` 只需要祖先目录的搜索权限,不需要文件自己的
+    任何权限位,父目录既然能被 ``os.walk`` 扫到,`lstat` 正常情况下不会单
+    独被拒),所以用 monkeypatch 精确地只让目标文件的 ``lstat`` 抛
+    ``PermissionError``,其余调用走真实实现。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    target = user_root / "a.txt"
+    real_lstat = Path.lstat
+
+    def _fake_lstat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if self == target:
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", _fake_lstat)
+
+    with pytest.raises(WorkspacePermissionError) as excinfo:
+        await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert "'a.txt'" in str(excinfo.value)
 
 
 # ------------------------------------------- 全分支终审 C-1:marker 必须在挂载子树之外
@@ -632,6 +675,102 @@ async def test_user_root_mkdir_permission_failure_is_a_workspace_permission_erro
 
     with pytest.raises(WorkspacePermissionError):
         await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+
+# ---------------------------------- 复审 C-1:用户根**自己**(不是子目录/子树)不可穿透
+#
+# 这是四个方法(read/write/delete/list_files)在 _open_parent_dir_fd 里共用的入口
+# ——落到这里之前 create=False 的 read_file/delete_file 完全没碰过上面的 mkdir 分
+# 支,是它们第一次、也是唯一一次触到 user_root。之前这句只接 `except OSError`,把
+# PermissionError 也收成 _WorkspacePathNotFoundError:read/write 端点翻 404("文件
+# 不存在",而它其实读不动),delete_file 更糟——它把 _WorkspacePathNotFoundError 当
+# rm -f 语义直接吞掉、返回成功,用户看到"删除成功"而文件原封不动地留在盘上。真实
+# 触发场景:uid 迁移之后,一个迁移 Job 漏掉的用户根(属主还是旧 uid,新 uid 连
+# open(O_DIRECTORY) 都过不去)。
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_read_file_reports_permission_denied_when_user_root_itself_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    os.chmod(user_root, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.read_file(tenant_id=tenant_id, user_id=user_id, path="a.txt")
+    finally:
+        os.chmod(user_root, 0o700)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_write_file_reports_permission_denied_when_user_root_itself_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    os.chmod(user_root, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    finally:
+        os.chmod(user_root, 0o700)
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_delete_file_reports_permission_denied_when_user_root_itself_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """旗舰场景——这条之前会静默"成功"(rm -f 语义把 _WorkspacePathNotFoundError
+    当"什么都没有,不用删"),用户看到删除成功,文件其实原封不动地留在盘上。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    os.chmod(user_root, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="a.txt")
+    finally:
+        os.chmod(user_root, 0o700)
+    # 确认真的没删——把上面那句 pytest.raises 去掉、只吞异常的话,这句才是抓
+    # "静默假成功" 的最后一道防线。
+    assert (user_root / "a.txt").exists()
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_list_files_reports_permission_denied_when_user_root_itself_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """list_files 走的是独立的 ``os.stat(user_root)`` 分支(不经过
+    ``_open_parent_dir_fd``),补一条同形状的用例只为四个方法对称覆盖——这条在
+    C-1 之前就已经答对了,不是本次修的那条缝。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    os.chmod(user_root, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    finally:
+        os.chmod(user_root, 0o700)
 
 
 # ---------------------------------------------------------------- Important 修复回归(第二轮):
@@ -1011,3 +1150,41 @@ async def test_list_files_returns_empty_when_tenant_path_is_not_a_directory(
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
 
     assert files == []
+
+
+async def test_list_files_does_not_use_path_is_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复审 M-2 —— keep-item 5(``is_dir()`` 换成
+    ``stat.S_ISDIR(os.stat(...).st_mode)``)的分歧只在 Python 3.14 上表现
+    出来(见该 fix 的实现注释;已经用真实 3.14.0 解释器验证过)。
+
+    这条修复本身没有被 CI 实际跑的解释器版本(3.12/3.13)钉住:退回
+    ``user_root.is_dir()`` 之后在 3.12/3.13 上全套测试依旧绿——包括看起来
+    该抓到这个回退的 ``test_list_files_raises_when_tenant_dir_is_unreadable``
+    (monkeypatch ``os.stat`` 让它抛 ``PermissionError`` 实测坐实:
+    ``Path.is_dir()`` 内部本来就调 ``os.stat``,而 3.12/3.13 的
+    ``Path.is_dir()`` 对 ``EACCES`` 本就会重新抛出、不吞掉——那条分歧只存
+    在于 3.14,不存在于 CI 实跑的版本,靠断言异常类型/传播行为的测试在
+    3.12/3.13 上钉不住"有没有退回 is_dir()"这件事)。
+
+    真正能在**任何**解释器版本上钉住"没有退回用 ``Path.is_dir()``"的,是
+    断言调用了哪个函数,不是断言异常传播行为——这里把 ``Path.is_dir`` 换
+    成一个一被调用就断言失败的哨兵,配合真实文件系统场景跑一遍,证明
+    ``list_files`` 走的是 ``os.stat``,压根没碰 ``is_dir()``。
+    """
+
+    def _boom_is_dir(self: Path) -> bool:
+        raise AssertionError(
+            "list_files must not call Path.is_dir() — Python 3.14 silently "
+            "swallows PermissionError inside it, see the fix's docstring"
+        )
+
+    monkeypatch.setattr(Path, "is_dir", _boom_is_dir)
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert files == [WorkspaceFileEntry(path="a.txt", size=1)]

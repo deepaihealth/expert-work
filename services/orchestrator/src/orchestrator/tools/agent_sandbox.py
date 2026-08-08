@@ -762,8 +762,14 @@ class AgentSandboxClient:
         时就已经建好,这里的 mkdir(``exist_ok=True``)/chmod 因此在复用路径
         上是幂等的空操作,不是在"为将要发生的事做准备",而是在"确保这件
         事已经发生过"——比在 :meth:`acquire` 里分叉出"是否会新建"的判断
-        更简单,也自愈:哪怕运维手工改过目录权限,下一次 acquire 就会把它
-        修回来。
+        更简单。
+
+        自愈**有条件**(复审 I-2,纠正上一版这里"哪怕运维手工改过目录权
+        限,下一次 acquire 就会把它修回来"的无条件说法):见
+        :meth:`_ensure_workspace_dir` 的 docstring——只在这个目录已经是
+        control-plane 属主时,chmod 才会真的把手工改动修回来;目录还没被
+        uid 迁移 Job(Task D)接管、属主还是旧 uid 时,chmod 是尽力而为,
+        失败不影响 mkdir/acquire 本身继续。
         """
         root = self.workspace_root
         if not root:
@@ -840,24 +846,50 @@ class AgentSandboxClient:
             raise
 
     async def _ensure_workspace_dir(self, path: Path) -> None:
-        """``mkdir(parents=True, exist_ok=True)`` + ``chmod(0o700)``,off-loop。
+        """``mkdir(parents=True, exist_ok=True)`` + best-effort ``chmod(0o700)``,off-loop。
 
         control-plane 与沙箱里的 agent 现在是同一个 uid(方向变更,spec §
-        六:共享 gid → 统一 uid)——不管谁先建这棵目录,建的人就是它的属
+        六:共享 gid → 统一 uid)——不管谁先建这棵目录,建的人都是它的属
         主,两侧读写都靠属主位,不需要再对"另一侧"开任何口子。这个目录经
         ``subPath`` 只挂进这一个用户自己的沙箱,不与其它租户共享,收到
         0o700 既不影响 control-plane/agent 任一方的访问,也比此前的
         0o777(world-writable)更紧。
 
-        失败(NAS 权限异常 / 挂载点抖动)仍按 :class:`SandboxSupervisorError`
-        抛,不静默——静默的话沙箱会挂载到一个 agent 用户写不进去的目录,
-        直到第一次 ``exec``/文件工具报一个远离根因的"Permission denied",
-        比在 ``acquire`` 这里就说清楚差得多。
+        复审 I-2 —— ``chmod`` 是**尽力而为**,不是无条件必须成功:``mkdir``
+        用 ``exist_ok=True``,这个目录几乎总是已经存在(同一个用户后续每一
+        次 acquire 都会再跑一遍这个方法),``chmod`` 对一个我们不是属主的既
+        存目录一律 EPERM。uid 迁移(control-plane 镜像 10002 → 10000)落地
+        当天,存量用户根的属主还是旧 uid 10002——把这些目录改成新 uid 属主是
+        一次性迁移 Job(见 Task D)的职责,不是这条每次 acquire 都会跑的路
+        径该做的事,也做不到(同 ``NasWorkspaceStore._open_parent_dir_fd``
+        建用户根那半边的同款理由,见其注释"修存量目录是一次性迁移 Job 的
+        职责,这条写路径不该顺手兼职")。
+
+        这半句纠正的是上一版这里的自愈说法:"哪怕运维手工改过目录权限,
+        下一次 acquire 就会把它修回来"只在**这个目录已经是 control-plane
+        属主**时成立(这时 chmod 会成功,自愈确实发生);目录还没被迁移
+        Job 接管时,chmod 失败是**预期**状态,不该把整个 ``acquire`` 判死
+        ——那样迁移 Job 跑完之前,受影响用户会连一次 acquire 都做不成
+        (比"某些操作降级"糟得多)。目录本身当前的 mode/属主是否真的允许
+        读写,由沙箱真正 ``exec``/文件工具去接触它时自然验证,失败会走
+        keep-item 1 那条窄类型 :class:`WorkspacePermissionError` 归因路径,
+        不会被这里的静默吞掉误导成别的故障。
+
+        ``mkdir`` 失败(NAS 权限异常 / 挂载点抖动)仍按
+        :class:`SandboxSupervisorError` 抛,不静默——那是这条路径本身没法
+        绕过的失败,不是"属主还没轮到我们"这种可以延后处理的状态。
         """
 
         def _do() -> None:
             path.mkdir(parents=True, exist_ok=True)
-            os.chmod(path, 0o700)
+            try:
+                os.chmod(path, 0o700)
+            except PermissionError:
+                logger.warning(
+                    "workspace dir chmod skipped (not owner yet — expected until the "
+                    "uid-migration Job re-chowns legacy user roots, see Task D): %s",
+                    path,
+                )
 
         try:
             await asyncio.to_thread(_do)
@@ -1262,18 +1294,24 @@ class AgentSandboxClient:
         双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
         的 agent_key"。
 
-        ``umask 000 && `` 前缀(Task 4 审查 Critical 后续,跨 uid 写冲突):
-        ``commands.run`` 走 ``/bin/bash -l -c cmd``(见上方 docstring),所以
-        能在同一个 shell 里先设 umask 再 exec python——这个 bash 进程与它派生
-        的 python 子进程(以及 python 里 LLM 代码自己 ``os.mkdir``/``open`` 出
-        的每一个文件)全都继承它。不设的话,agent 代码在 ``/workspace`` 下自己
-        建的目录/文件用沙箱默认 umask(常见 ``0o022``)掩过,变成
-        ``0o755``/``0o644``,uid 只是这个沙箱的 agent(10000)——
-        control-plane 以另一个 uid 经 NAS 挂载读这棵树时,``read``/``list``
-        仍然通(0o755 的"其他人"档还有 r-x),但用户从工作区页面**删除**这个
-        文件、或后续任何一次写入去覆盖它,都会撞 ``EACCES``——这正是本任务
-        对本地 docker 后端(``runner.py`` 的 ``main()``,同一处 ``os.umask(0)``)
-        同款修复的云端一半,两后端必须同款,契约测试
+        ``umask 000 && `` 前缀(Task 4 审查 Critical 后续,原为跨 uid 写冲突
+        而加):``commands.run`` 走 ``/bin/bash -l -c cmd``(见上方
+        docstring),所以能在同一个 shell 里先设 umask 再 exec python——这个
+        bash 进程与它派生的 python 子进程(以及 python 里 LLM 代码自己
+        ``os.mkdir``/``open`` 出的每一个文件)全都继承它。不设的话,agent
+        代码在 ``/workspace`` 下自己建的目录/文件用沙箱默认 umask(常见
+        ``0o022``)掩过,变成 ``0o755``/``0o644``。
+
+        **方向变更之后(spec § 六:共享 gid → 统一 uid)这条前缀原本的理由
+        已经不成立**——control-plane 现在与沙箱 agent 是同一个 uid
+        (10000),属主位本身就够两侧读写/删除,不再需要靠 world-writable 的
+        group/other 位兜底跨 uid 访问。留着它是**安全的超集**
+        (``0o777``/``0o666`` 严格宽于统一 uid 之后真正需要的
+        ``0o700``/``0o600``,不新增任何可见性),不是错,只是不再最小。收
+        紧它需要一次真栈验证(exec 产出的文件在统一 uid 之后确实还能被两侧
+        正常读写删除)——本次方向变更任务没有预算做这一步,留作后续任务,
+        这里刻意不动。跟本地 docker 后端(``runner.py`` 的 ``main()``,同一处
+        ``os.umask(0)``)同款的约束不变:两后端仍必须同款,契约测试
         (``test_sandbox_runtime_contract.py``)钉住,不是各修各的。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s

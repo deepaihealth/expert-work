@@ -1221,6 +1221,37 @@ async def test_acquire_chmods_user_workspace_to_0700(
 
 
 @pytest.mark.asyncio
+async def test_acquire_survives_a_chmod_permission_error_on_the_user_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复审 I-2 —— ``chmod`` 只对**属主**放行。uid 迁移(control-plane
+    10002 → 10000)落地当天,存量用户根的属主还是旧 uid,``chmod`` 会
+    ``EPERM``;把这些目录改回新 uid 属主是一次性迁移 Job(Task D)的职责,
+    不是每次 acquire 都跑的这条路径该做的事。
+
+    这条之前会把整个 acquire 判死(``SandboxSupervisorError``)——迁移 Job
+    跑完之前,受影响用户连一次 acquire 都做不成,比"某些操作降级"糟得多。
+    现在 ``PermissionError`` 是尽力而为:``mkdir`` 已经确认目录存在,
+    acquire 继续往下走,真正的读写权限问题留给沙箱 ``exec``/文件工具接触
+    到时用 keep-item 1 的窄类型 ``WorkspacePermissionError`` 自然诊断。"""
+
+    def fake_chmod(path: object, mode: int) -> None:
+        del path, mode
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chmod", fake_chmod)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert sandbox_id is not None
+    # mkdir 本身(不是 chmod)仍然真跑了——目录确实存在,acquire 没有跳过创建。
+    assert (tmp_path / str(tenant_id) / str(user_id)).is_dir()
+
+
+@pytest.mark.asyncio
 async def test_acquire_surfaces_chmod_failure_as_sandbox_supervisor_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

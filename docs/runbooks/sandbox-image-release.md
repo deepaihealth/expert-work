@@ -94,9 +94,12 @@ kubectl delete pod/w2-workspaces-mkdir -n default
 ```
 
 **`chmod 1777` 不是可选的一步**:集群实测 NAS 新建子目录属主是 root(spec
-§ 二之二),而 `control-plane` 容器以非 root 身份运行(uid 10002,见
-`services/control-plane/Dockerfile` 的 `useradd --uid 10002 ... expert_work` /
-`USER expert_work`)。只 `mkdir` 不放开权限的话,`NasWorkspaceStore` 第一次在
+§ 二之二),而 `control-plane` 容器以非 root 身份运行(方向变更后是 uid
+10000,与沙箱镜像的 `agent` 用户同 uid,见
+`services/control-plane/Dockerfile` 的 `useradd --uid 10000 ... expert_work` /
+`USER expert_work`;方向变更详见
+`docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md` § 六)。只
+`mkdir` 不放开权限的话,`NasWorkspaceStore` 第一次在
 `/workspaces` 下建 `{tenant_id}/{user_id}` 子树(即端到端验收第一项"前端上传
 文档")会撞 `PermissionError`——这不是新推测,是同一份"NAS 新目录属主 root、非
 root 写入被拒"事实(探针报告 § 一)在 control-plane 这一层的必然重现,只是这次
@@ -104,16 +107,22 @@ root 写入被拒"事实(探针报告 § 一)在 control-plane 这一层的必�
 代码改动自动发生**——之前没有任何一个 Task 报告测过"control-plane 真的能在
 `/workspaces` 下建目录"这条,发布后第一次上传文档如果报 500,先查这个。
 
-**为什么是 `1777` 而不是 `777`**(集群实测坐实,W2 Task 4 审查追加):非 root
-进程无权 `chown` 成另一个 uid(control-plane 与每个用户沙箱各自的 uid 都不同),
-`AgentSandboxClient._ensure_workspace_dir` 给每个用户子目录放权限时也是
-`chmod 0o777` 而不是 `chown`(同一个根因,见该方法 docstring)——world-writable
-的代价是任何有权限进这棵目录的人都能删掉别人的文件/目录,`1777` 的前导 `1` 是
-sticky bit:world-writable 目录里,一个条目只能被它的属主、这个目录的属主、或
-root 删除/改名,其他人即使有写权限也删不动。`/workspaces` 根上真的会有多个租户
-各自的子树平级摆着,只放 `777` 会让任何一个租户的沙箱理论上能删掉另一个租户的
-顶层目录(它们都在同一个 world-writable 父目录下);`1777` 把这条路堵死,又不
-需要精确控制每个子目录的属主(那本来就做不到)。
+**为什么是 `1777` 而不是 `777`**(集群实测坐实,W2 Task 4 审查追加;方向变更
+——共享 gid 改统一 uid——之后理由更新,结论不变):`/workspaces` **根**的属主
+是 root,`control-plane` 是非 root 进程,无权 `chown` 一个属主是 root 的目录,
+只能靠 `chmod` 放宽权限位——这条与两侧是否同 uid 无关,统一 uid 之后依然成
+立。`1777` 的前导 `1` 是 sticky bit:world-writable 目录里,一个条目只能被它
+的属主、这个目录的属主、或 root 删除/改名,其他人即使有写权限也删不动。
+`/workspaces` 根上真的会有多个租户各自的子树平级摆着,只放 `777` 会让任何一
+个能写这棵根目录的账号理论上删掉另一个租户的顶层目录(它们都在同一个
+world-writable 父目录下);`1777` 把这条路堵死,又不需要精确控制每个子目录的
+属主(那本来就做不到)。
+
+（这条与每个**用户子目录**自己的 mode 是两件事——那一层在方向变更之后已经从
+`chmod 0o777` 收紧到属主独占的 `chmod 0o700`,见
+`AgentSandboxClient._ensure_workspace_dir`:统一 uid 之后不再需要靠
+world-writable 兜底跨 uid 访问。`/workspaces` 根本身的属主还是 root、
+`control-plane` 还是非 root 这件事没有变,所以根这一层仍然需要 `1777`。）
 
 ### 2. apply PV/PVC(base 已含,随常规发布带出)
 

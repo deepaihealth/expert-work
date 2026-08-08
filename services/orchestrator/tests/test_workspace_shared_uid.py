@@ -14,10 +14,14 @@ sandbox-image.yml,control-plane 走 release.sh),漂移是迟早的事。
 
 不把 uid 写死在断言里(照 ``test_image_env_matches_dockerfile`` 的既有手
 法)——双向从两份 Dockerfile 各自提取一次,互相比对。写死数字的话只钉得住
-"改了一边"这一种漂移;两边被同时改成同一个新数字(比如都改成 10005)照样
-不会破坏两侧的读写能力,但会撞上 credential-proxy(10001)/supervisor
-(10003)已经占用的 uid 空间——真正要守住的不变式是"两个数字相等",不是
-"两个数字都等于 10000"。
+"改了一边"这一种漂移;真正要守住的不变式是"两个数字相等",不是"两个数字
+都等于 10000"。
+
+复审 M-4 —— 上一版这里只是**提到**了另一个漂移形状(两边被同时改成同一个
+新数字,比如都改成 10005,不会破坏两侧的读写能力,但会撞上
+credential-proxy(10001)/supervisor(10003)已经占用的 uid 空间)却没有真的
+守住它,读起来像是"已经处理"。``test_shared_uid_does_not_collide_with_
+another_service`` 补上这半句缺的断言,不只是改文案绕过去。
 """
 
 from __future__ import annotations
@@ -28,6 +32,12 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SANDBOX_DOCKERFILE = _REPO_ROOT / "infra" / "sandbox-image" / "Dockerfile"
 _CP_DOCKERFILE = _REPO_ROOT / "services" / "control-plane" / "Dockerfile"
+
+#: uid 已经分给别的服务,不能被这两份 Dockerfile 共享的新 uid 撞上——
+#: credential-proxy 是 10001,sandbox-supervisor 是 10003(两者都不在本仓的
+#: Dockerfile 漂移闸覆盖范围内,这里手写字面量;沙箱 10000/control-plane
+#: 10000 是本闸真正比对的两个值,不在这个集合里)。
+_RESERVED_FOR_OTHER_SERVICES = frozenset({10001, 10003})
 
 
 def _sandbox_agent_uid() -> int:
@@ -58,3 +68,16 @@ def test_control_plane_and_sandbox_images_share_one_uid() -> None:
     等于不存在,而这两个文件在仓库 checkout 里必然存在。
     """
     assert _control_plane_uid() == _sandbox_agent_uid()
+
+
+def test_shared_uid_does_not_collide_with_another_service() -> None:
+    """两份 Dockerfile 的 uid 相等只是必要条件,不是充分条件——两边被同时
+    改成同一个新数字(比如都改成 10001)照样不会破坏 control-plane/沙箱两
+    侧互相读写的能力,但会与 credential-proxy(10001)或
+    sandbox-supervisor(10003)已经占用的 uid 撞车,产生一个本闸的姐妹用例
+    抓不到的新故障。"""
+    shared_uid = _control_plane_uid()
+    assert shared_uid == _sandbox_agent_uid()
+    assert shared_uid not in _RESERVED_FOR_OTHER_SERVICES, (
+        f"uid {shared_uid} 已经分给了别的服务(credential-proxy=10001 / sandbox-supervisor=10003)"
+    )
