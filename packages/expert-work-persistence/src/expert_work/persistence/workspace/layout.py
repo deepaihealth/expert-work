@@ -100,4 +100,10 @@ WORKSPACE_DIR_MODE = 0o2770
 #: 工作区里新建 leaf 文件的 mode —— ``rw-r-----``。group 可读即可满足
 #: "一侧写、另一侧读";``other`` 全零。写方向由各自的目录写权限决定,不靠
 #: 文件的 group ``w`` 位。
+#:
+#: ``orchestrator.tools.nas_workspace_store`` 里曾经有一个本地
+#: ``_LEAF_FILE_MODE = 0o644``(``rw-r--r--``,``other`` 可读的旧值)——Task 3
+#: 把它删了,改成直接引用这个常量。那个旧值能凑效纯粹是因为 ``other`` 位开
+#: 着兜底,不是因为 gid 设计对了;换成这个常量后 leaf 文件的可读性由 group
+#: 位(配合上面 ``WORKSPACE_DIR_MODE`` 的 setgid)负责,不再靠 ``other`` 放水。
 WORKSPACE_FILE_MODE = 0o640

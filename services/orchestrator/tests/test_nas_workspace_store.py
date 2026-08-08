@@ -13,6 +13,7 @@ mock 掉文件系统就等于没测。行为契约对照 ``sandbox_supervisor.su
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 from dataclasses import dataclass, field
@@ -259,21 +260,26 @@ async def test_created_dirs_are_setgid_and_group_shared(
 
     gid 断言需要真能 chgrp 到 10000 —— 本机跑测试的用户几乎肯定不在 gid
     10000 里,所以 gid 那半句用 monkeypatch 把 ``os.chown`` 换成 spy、断言它
-    被以 ``(-1, WORKSPACE_SHARED_GID)`` 调用,而不是去断言真实 st_gid(照
-    ``test_agent_sandbox.py`` 里 ``test_acquire_chmods_user_workspace_world_
-    writable`` 的既有手法——spy 只记录,不代跑真实 syscall,免得非特权账户在
-    这条真调用上直接 EPERM)。mode 那半句测真值。
+    被以 ``(user_root, -1, WORKSPACE_SHARED_GID)`` 调用,而不是去断言真实
+    st_gid(照 ``test_agent_sandbox.py`` 里
+    ``test_acquire_chmods_user_workspace_world_writable`` 的既有手法——spy
+    只记录,不代跑真实 syscall,免得非特权账户在这条真调用上直接 EPERM)。
+    mode 那半句测真值。
+
+    Task 3 fix round 1(Minor 1)—— spy 连 path 参数一起记(不只 uid/gid):
+    否则一个把 chown 目标从 ``user_root`` 错拼成 ``self.root`` 之类的变异
+    不会被这条测试逮到。
     """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
-    chown_calls: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "chown", lambda _path, uid, gid: chown_calls.append((uid, gid)))
+    chown_calls: list[tuple[Any, int, int]] = []
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid: chown_calls.append((path, uid, gid)))
 
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
 
     user_root = tmp_path / str(tenant_id) / str(user_id)
     assert stat.S_IMODE(user_root.stat().st_mode) == WORKSPACE_DIR_MODE
-    assert (-1, WORKSPACE_SHARED_GID) in chown_calls
+    assert (user_root, -1, WORKSPACE_SHARED_GID) in chown_calls
 
 
 async def test_write_file_lands_group_readable(tmp_path: Path) -> None:
@@ -343,17 +349,24 @@ async def test_intermediate_dir_fchown_precedes_fchmod(
 ) -> None:
     """同上,但盯 ``_openat_dir`` 的 fd 版本(``os.fchown``/``os.fchmod``)——
     新建中间子目录(不是用户根自己)时走的是这条独立的路径,顺序同样要
-    单独钉住。"""
+    单独钉住。
+
+    Task 3 fix round 1(Important 3)—— 上一版这两个 spy 只把调用**次序**
+    记成裸字符串,丢掉了全部三个参数;``_openat_dir`` 建的目录到底 chown
+    去哪个 gid,完全没有测试覆盖到(一条把 ``WORKSPACE_SHARED_GID`` 改成
+    ``99999`` 的变异能全绿通过)。这里把参数一起记下来,同一条测试既钉顺
+    序又钉值。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
-    calls: list[str] = []
+    calls: list[tuple[str, int] | tuple[str, int, int]] = []
     real_fchmod = os.fchmod
 
-    def _spy_fchown(_fd: int, _uid: int, _gid: int) -> None:
-        calls.append("fchown")
+    def _spy_fchown(_fd: int, uid: int, gid: int) -> None:
+        calls.append(("fchown", uid, gid))
 
     def _spy_fchmod(fd: int, mode: int) -> None:
-        calls.append("fchmod")
+        calls.append(("fchmod", mode))
         real_fchmod(fd, mode)
 
     monkeypatch.setattr(os, "fchown", _spy_fchown)
@@ -361,7 +374,199 @@ async def test_intermediate_dir_fchown_precedes_fchmod(
 
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b.txt", data=b"x")
 
-    assert calls == ["fchown", "fchmod"]
+    assert calls == [
+        ("fchown", -1, WORKSPACE_SHARED_GID),
+        ("fchmod", WORKSPACE_DIR_MODE),
+    ]
+
+
+async def test_write_file_skips_chown_chmod_for_a_pre_existing_user_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 3 fix round 1(Important 1)—— 用户根已经存在(CSI subPath 建
+    的、迁移脚本建的、备份恢复出来的,总之不是这次调用创建的)时,这次
+    ``write_file`` 完全不该碰它的属主/mode:``chmod``/``chown`` 只对*属主*
+    放行,对一个我们不是属主的既存目录会 EPERM,而旧版本这里无条件跑,会把
+    每一次后续上传都变成 "failed to create workspace directory"(一条谎
+    报,目录明明早就在)。
+
+    用两个"一被调用就断言失败"的假身份钉死"压根不该调它们"——不是断言
+    没抛异常(那样一个吞掉 EPERM 的实现也能蒙混过关),而是直接证明这两个
+    函数从未被触碰。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)  # 模拟这棵目录不是这次调用建的
+
+    def _boom_chown(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("os.chown must not run for a pre-existing user root")
+
+    def _boom_chmod(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("os.chmod must not run for a pre-existing user root")
+
+    monkeypatch.setattr(os, "chown", _boom_chown)
+    monkeypatch.setattr(os, "chmod", _boom_chmod)
+    store = _store(tmp_path)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+    assert (user_root / "a.txt").read_bytes() == b"x"
+
+
+async def test_write_file_wraps_a_write_failure_as_sandbox_supervisor_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 3 fix round 1(Minor 2)—— ``ENOSPC``/``EDQUOT``(NAS 配额、磁盘
+    满)是这里真实会发生的失败,``handle.write(data)`` 之前完全没包在任何
+    ``try/except`` 里——一个裸 ``OSError`` 会越过这个 store 自己在同一个方
+    法上面 30 行处反复强调的"错误类型统一"边界。用一个假的 ``os.fdopen``
+    返回值(``write`` 一调用就抛 ``OSError``)复现,不依赖真的把磁盘写满。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    class _BoomWriter:
+        def __enter__(self) -> _BoomWriter:
+            return self
+
+        def __exit__(self, *_exc_info: object) -> None:
+            return None
+
+        def write(self, _data: bytes) -> int:
+            raise OSError(28, "No space left on device")  # ENOSPC
+
+    def _fake_fdopen(fd: int, _mode: str) -> _BoomWriter:
+        os.close(fd)  # 断言路径不需要真的写,先把 fd 还回去避免泄漏。
+        return _BoomWriter()
+
+    monkeypatch.setattr(os, "fdopen", _fake_fdopen)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,父目录没有 w 位照样建得出新文件——这条测试的前提在 root 下不成立",
+)
+async def test_write_file_reports_permission_denied_distinctly(tmp_path: Path) -> None:
+    """写不动 ≠ 不存在,同 ``read_file`` 那条(见上面)。锁的是**父目录**的
+    写权限,不是某个已存在文件的权限位——新建文件需要目录的 ``w`` 位,不是
+    文件自己的,这是这条分支在生产里最可能被触发的方式(见
+    ``_open_parent_dir_fd`` 里那段关于 NAS 根没 chmod 1777 的说明)。
+
+    Task 3 fix round 1(Important 3)—— 上一版只有 ``read_file`` 的
+    ``PermissionError`` 分支有测试覆盖,``write_file`` 自己那条同款分支
+    (去掉 ``except PermissionError`` 之后整套测试照样全绿)完全没有测到。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    os.chmod(user_root, 0o500)  # r-x,没有 w —— 目录里建不出新文件
+
+    with pytest.raises(WorkspacePermissionError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,父目录没有 w 位照样 unlink 得掉里面的文件"
+    "——这条测试的前提在 root 下不成立",
+)
+async def test_delete_file_reports_permission_denied_distinctly(tmp_path: Path) -> None:
+    """删不动 ≠ 不存在。``unlink`` 需要的是父目录的 ``w`` 位,不是文件自己
+    的权限位——锁父目录(而不是文件本身)才是复现这条分支的正确姿势。
+
+    Task 3 fix round 1(Important 3)—— 同上一条,``delete_file`` 自己那条
+    ``except PermissionError`` 分支之前完全没有测试覆盖。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    os.chmod(user_root, 0o500)  # 文件建完之后再锁父目录
+
+    with pytest.raises(WorkspacePermissionError):
+        await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="a.txt")
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧扫得动子目录——这条测试的前提在 root 下不成立",
+)
+async def test_list_files_reports_permission_denied_for_unreadable_subtree(
+    tmp_path: Path,
+) -> None:
+    """``os.walk`` 默认 ``onerror=None`` 会把扫不动的子树静默吞掉(不报
+    错、不列出)——这恰恰是列表权限失败最常见的形态,比单个文件的 ``lstat``
+    失败常见得多。
+
+    Task 3 fix round 1(list_files 专项)—— 必须显式接 ``onerror`` 让它炸出
+    来;不然一次真实的权限故障会被这层静默悄悄变成"工作区是空的"
+    (``control_plane/api/workspace.py`` 把 ``SandboxSupervisorError`` 及其
+    子类翻成 ``{"success": true, "files": []}``),这正是这整个任务要根治
+    的那类失败。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    sub = user_root / "sub"
+    os.chmod(sub, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    finally:
+        # 0o000 连 pytest 自己的 tmp_path 清理都进不去(既不能列目录也不能
+        # 递归删)——测试结束前放宽回来,不留垃圾目录。
+        os.chmod(sub, 0o700)
+
+
+async def test_chgrp_denial_logs_debug_when_process_is_not_a_group_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Task 3 fix round 1(Critical 1)—— 不在 gid 10000 里是本机/CI 跑测试
+    的常态(直接构造 store,绕过了 ``build_workspace_store`` 的装配期
+    闸),chgrp 拿不到组是**预期**状态,不该在日志里制造噪音:``DEBUG``。"""
+    monkeypatch.setattr(os, "getgroups", lambda: [20])
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    caplog.set_level(logging.DEBUG, logger="orchestrator.tools.nas_workspace_store")
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b.txt", data=b"x")
+
+    denied = [r for r in caplog.records if "chgrp_denied" in r.getMessage()]
+    assert denied
+    assert all(r.levelno == logging.DEBUG for r in denied)
+
+
+async def test_chgrp_denial_logs_error_when_process_is_already_a_group_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """已经是 gid 10000 的成员却还是被拒——生产靠
+    ``supplementalGroups: [10000]`` 保证在组里,这种情况下 ``chown`` 还失
+    败只可能是这个目录本来就不是我们的、属主是别人:真事故,``ERROR``。
+
+    用一个总是抛 ``PermissionError`` 的假 ``chown``/``fchown`` 模拟"就是
+    会被拒",配合 ``getgroups`` 返回含共享 gid,断言分支判据只看
+    ``getgroups()`` 这一件事,不看失败原因本身。"""
+    monkeypatch.setattr(os, "getgroups", lambda: [WORKSPACE_SHARED_GID])
+
+    def _always_denied(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chown", _always_denied)
+    monkeypatch.setattr(os, "fchown", _always_denied)
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    caplog.set_level(logging.DEBUG, logger="orchestrator.tools.nas_workspace_store")
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b.txt", data=b"x")
+
+    denied = [r for r in caplog.records if "chgrp_denied" in r.getMessage()]
+    assert denied
+    assert all(r.levelno == logging.ERROR for r in denied)
 
 
 # ------------------------------------------- 全分支终审 C-1:marker 必须在挂载子树之外

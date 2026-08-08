@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from control_plane.runtime import build_sandbox_runtime, build_workspace_store
 from control_plane.settings import Settings
+from expert_work.persistence import WORKSPACE_SHARED_GID
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from orchestrator.tools.agent_sandbox import AgentSandboxClient
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
+
+
+@pytest.fixture
+def in_shared_gid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Task 3 fix round 1(Critical 1)—— ``build_workspace_store`` 现在要求
+    进程在 ``WORKSPACE_SHARED_GID`` 里才会构造 ``NasWorkspaceStore``(见该
+    函数 docstring)。本机/CI 跑测试的账户几乎肯定不在——这里 monkeypatch
+    ``os.getgroups()`` 让既有测试继续测"配置对时该发生什么",而不是测"gid
+    到底在不在系统层面"(后者是 ``test_workspace_store_refuses_nas_store_
+    without_shared_gid_membership`` 自己的职责)。
+    """
+    monkeypatch.setattr(os, "getgroups", lambda: [WORKSPACE_SHARED_GID])
 
 
 def test_none_when_nothing_configured() -> None:
@@ -145,7 +160,7 @@ def test_workspace_store_is_none_without_a_usable_url(url: str | None) -> None:
     assert build_workspace_store(s) is None
 
 
-def test_workspace_store_builds_nas_store_when_root_is_set() -> None:
+def test_workspace_store_builds_nas_store_when_root_is_set(in_shared_gid: None) -> None:
     """波 2 Task 3 —— ``workspace_nas_root`` 真值 → ``NasWorkspaceStore``。"""
     s = Settings(workspace_nas_root="/mnt/workspaces")
     store = build_workspace_store(s)
@@ -153,7 +168,25 @@ def test_workspace_store_builds_nas_store_when_root_is_set() -> None:
     assert store.root == "/mnt/workspaces"
 
 
-def test_workspace_store_prefers_nas_over_supervisor_when_both_are_set() -> None:
+def test_workspace_store_refuses_nas_store_without_shared_gid_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 3 fix round 1(Critical 1)—— chown 到共享 gid 只有调用方本身在
+    那个组里才会真的生效;不在的话,这个 store 建出来的每一个目录/文件都会
+    落在 ``0o2770``/``0o640`` + 错的 group 上,比修复前的 ``0o777``/``0o644``
+    更差(旧版本至少 ``other`` 位能兜底,新版本 ``other`` 归零,沙箱那侧的
+    agent 是**零访问**)。宁可在装配期就拒,不要把这个状态放行到运行期才
+    一个个 ``PermissionError`` 冒出来。"""
+    monkeypatch.setattr(os, "getgroups", lambda: [20])  # 不含 WORKSPACE_SHARED_GID
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+
+    with pytest.raises(RuntimeError, match=str(WORKSPACE_SHARED_GID)):
+        build_workspace_store(s)
+
+
+def test_workspace_store_prefers_nas_over_supervisor_when_both_are_set(
+    in_shared_gid: None,
+) -> None:
     """两者都配了 —— NAS 直读路径是波 2 的目标终态,优先于 supervisor 代理。"""
     s = Settings(workspace_nas_root="/mnt/workspaces", sandbox_supervisor_url="http://sup:8080")
     store = build_workspace_store(s)
@@ -253,7 +286,9 @@ def test_agent_sandbox_backend_empty_workspace_mount_config_also_raises() -> Non
         build_sandbox_runtime(s)
 
 
-def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -> None:
+def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store(
+    in_shared_gid: None,
+) -> None:
     """波 2 Task 4 —— app.py 的接线顺序:``build_workspace_store`` 接收
     ``build_sandbox_runtime`` 的返回值 + 同一个 instance store,原样转给
     ``NasWorkspaceStore``(``mark_deleted`` 靠它们拆热会话)。"""
@@ -275,7 +310,9 @@ def test_workspace_store_wires_runtime_and_instance_store_into_the_nas_store() -
     assert store.instance_store is instance_store
 
 
-def test_workspace_store_runtime_and_instance_store_default_to_none() -> None:
+def test_workspace_store_runtime_and_instance_store_default_to_none(
+    in_shared_gid: None,
+) -> None:
     """调用方不传 —— 与 Task 3 的行为一致(``mark_deleted`` 只写 marker,
     不拆热会话)。"""
     s = Settings(workspace_nas_root="/mnt/workspaces")

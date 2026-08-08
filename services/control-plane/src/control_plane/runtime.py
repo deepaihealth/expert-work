@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -45,7 +46,7 @@ from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
-from expert_work.persistence import ArtifactStore, KnowledgeStore
+from expert_work.persistence import WORKSPACE_SHARED_GID, ArtifactStore, KnowledgeStore
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
@@ -1598,8 +1599,34 @@ def build_workspace_store(
     个空 base_url 去真拨 HTTP:``purge_user`` 把工作区那步报成**失败**而不
     是跳过,工作区端点回一个传输错误而不是它们的空结果分支。同一判据延
     续到 NAS 分支(``workspace_nas_root`` 也用真值判断)。
+
+    波 2 Task 3 fix round 1(Critical 1)—— NAS 分支在构造 ``NasWorkspace
+    Store`` 之前先检查 ``WORKSPACE_SHARED_GID in os.getgroups()``,不是成
+    员就拒绝装配。判据精确对应 ``NasWorkspaceStore`` 会不会真的把 ``chown``
+    落到共享 gid 上:非特权进程的 ``chown(path, -1, gid)`` 只有调用方本身
+    属于 ``gid`` 才会成功(集群实测坐实),生产靠这个 Deployment 的
+    ``securityContext.supplementalGroups: [10000]`` 保证成立。如果这条闸不
+    在这里拦,后果不是"退化成旧行为"——旧的 ``0o777``/``0o644`` 至少有
+    ``other`` 位兜底,沙箱那侧的 agent uid 好歹进得去;而这个 store 建出来
+    的目录/文件是 ``0o2770``/``0o640``,``other`` 已经归零,不在共享 gid
+    里的话 group 位也落不到共享 gid 上,沙箱那侧变成**零访问**,比修复前
+    更糟。宁可在装配期就大声拒绝,不要把这个状态放行到运行期才一个个
+    ``PermissionError`` 冒出来。
     """
     if settings.workspace_nas_root:
+        if WORKSPACE_SHARED_GID not in os.getgroups():
+            msg = (
+                f"control-plane process is not a member of gid {WORKSPACE_SHARED_GID} "
+                "(WORKSPACE_SHARED_GID) — refusing to build a NasWorkspaceStore. "
+                f"Without that membership, os.chown(path, -1, {WORKSPACE_SHARED_GID}) "
+                "fails for every directory/file this process creates, so they end "
+                "up at 0o2770/0o640 owned by the wrong group — not the old "
+                "permissive 0o777/0o644, but zero access for the sandbox's agent "
+                "uid (10000). Add gid 10000 to this Pod's "
+                "securityContext.supplementalGroups (the control-plane Deployment) "
+                "before setting EXPERT_WORK_WORKSPACE_NAS_ROOT."
+            )
+            raise RuntimeError(msg)
         return NasWorkspaceStore(
             root=settings.workspace_nas_root, runtime=runtime, instance_store=instance_store
         )

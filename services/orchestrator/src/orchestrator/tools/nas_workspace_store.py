@@ -187,16 +187,21 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 #: ``sandbox_supervisor.supervisor._MAX_WORKSPACE_LIST_ENTRIES``.
 _MAX_LIST_ENTRIES = 2000
 
-#: Leaf files (``write_file`` / ``mark_deleted``) are created with
-#: ``expert_work.persistence.WORKSPACE_FILE_MODE`` directly (Task 3, 波 2
-#: BUG-1) — no local re-declaration. There used to be a module-local
-#: ``_LEAF_FILE_MODE = 0o644`` here (``rw-r--r--``, an ``other``-readable
-#: file); that value was never actually reachable by the *other* uid on
-#: purpose — it happened to work only because ``other`` was wide open, the
-#: same accident :data:`WORKSPACE_DIR_MODE` closes for directories. Sharing
-#: the one constant with the directory mode's group-gid story means a leaf
-#: file is readable by design (group bit), not by the ``other`` bit
-#: happening to be lenient.
+
+def _chgrp_denied_level() -> int:
+    """Log level for a tolerated chown-to-shared-gid ``PermissionError``.
+
+    Task 3 fix round 1(Critical 1)—— 两种失败形态诊断成本天差地别,不能都
+    记 ``warning``。这个进程压根不在 :data:`WORKSPACE_SHARED_GID` 里(本机/
+    CI 直接构造 ``NasWorkspaceStore``,跳过了 ``build_workspace_store`` 的
+    装配期闸)是**预期**状态,不该在日志里制造噪音,降到 ``DEBUG``。已经在
+    组里却还是被拒——生产环境靠 Deployment 的
+    ``supplementalGroups: [10000]`` 保证在组里,这种情况下 ``chown``
+    还失败,只可能是这个目录本来就不是我们建的、属主是别人——是一次真实
+    事故,升到 ``ERROR``。判据用 ``os.getgroups()``(进程启动时就定死的
+    补充组列表),不依赖任何一次具体调用的失败原因。
+    """
+    return logging.ERROR if WORKSPACE_SHARED_GID in os.getgroups() else logging.DEBUG
 
 
 class _WorkspacePathNotFoundError(SandboxSupervisorError):
@@ -279,11 +284,13 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
         # 先 chown 后 chmod —— 顺序承重,见上方 docstring。chown 失败
         # (PermissionError,非目标 gid 的成员)只记日志、不中断:目录还是要
-        # 落到正确的 mode,只是这一次没能把 group 也改成共享的那个。
+        # 落到正确的 mode,只是这一次没能把 group 也改成共享的那个。日志
+        # 级别见 :func:`_chgrp_denied_level`。
         try:
             os.fchown(fd, -1, WORKSPACE_SHARED_GID)
         except PermissionError as exc:
-            logger.warning(
+            logger.log(
+                _chgrp_denied_level(),
                 "nas_workspace_store.intermediate_dir_chgrp_denied name=%r gid=%s: %s",
                 name,
                 WORKSPACE_SHARED_GID,
@@ -375,6 +382,24 @@ def workspace_user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     return (Path(root) / str(tenant_id) / str(user_id)).resolve()
 
 
+def _raise_workspace_listing_error(exc: OSError) -> None:
+    """``os.walk``'s ``onerror`` callback — Task 3 fix round 1.
+
+    ``os.walk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
+    ``EACCES``)会被**静默吞掉**——那棵子树下的文件从结果里凭空消失,不报
+    错也不留任何痕迹,而这恰恰是"列不动"最常见的形态,比单个文件
+    ``lstat`` 失败常见得多(下面 ``_list`` 里那处 ``try/except`` 只挡得住
+    后者)。``control_plane/api/workspace.py`` 的列表端点只接
+    :class:`SandboxSupervisorError`,把它翻成 ``{"success": true, "files":
+    []}`` —— 一次真实的权限故障被这层静默吞声悄悄变成"工作区是空的",正
+    是这整个任务要根治的那类失败。传给 ``os.walk`` 的 ``onerror=`` 让这类
+    错误显式地把这次调用整个炸掉,而不是悄悄漏掉一部分结果。
+    """
+    if isinstance(exc, PermissionError):
+        raise WorkspacePermissionError(f"workspace listing not readable: {exc.filename!r}") from exc
+    raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
+
+
 @dataclass
 class NasWorkspaceStore:
     """Production :class:`WorkspaceStore` (wave 2) — reads/writes the NAS mount directly.
@@ -456,9 +481,29 @@ class NasWorkspaceStore:
             # 那时谁先建都行,反正最终都是同一个宽 mode。换成 setgid + 共享
             # gid 之后,在某次 acquire 真正跑到之前,任何一次经这个 store
             # 落地的写入(例如用户在跑过 agent 之前先上传了一份文档)都会
-            # 看到一个两边都还没修好的目录,同一个 bug 原样重演。幂等:
-            # chown/chmod 到已经是的目标值时都是无操作的重复调用,不会和
-            # ``_ensure_workspace_dir`` 打架,谁先跑到都行。
+            # 看到一个两边都还没修好的目录,同一个 bug 原样重演。
+            #
+            # **只在这次 mkdir 真正把目录带入存在时才 chown+chmod**(Task 3
+            # fix round 1,Important 1)——``exist_ok=True`` 原来会在目录已
+            # 存在时静默不报错,而下面这段却无条件跟着跑;chmod/chown 只对
+            # *属主*放行,对一个我们不是属主的既存目录(CSI subPath 建的、
+            # 迁移脚本建的、备份恢复出来的)会 EPERM,而这整个 try 块的
+            # 唯一异常出口是把任何 OSError 都翻成 "failed to create
+            # workspace directory" —— 一条谎报,目录明明建好了(或者一直都
+            # 在),只是我们不该动它的属主/mode。修存量目录是 Task 7 一次性
+            # 迁移 Job 的职责,这条写路径不该顺手兼职。
+            #
+            # **这不是幂等免打架的保证**(Task 3 fix round 1,Important 2,
+            # 纠正上一版这里的错误说法):``chmod``/``chown`` 对非属主一律
+            # EPERM,不看"值是不是已经对了" —— 重复调用同一个目标值不会自
+            # 动豁免。而且在 Task 4 落地之前,
+            # ``AgentSandboxClient._ensure_workspace_dir``
+            # (``agent_sandbox.py:870``)仍然在**每次** acquire 时无条件把
+            # 这同一个目录 ``chmod`` 成 ``0o777``,会把这里刚设上的 setgid
+            # 位悄悄抹掉 —— 两处确实会打架,只是 Task 4 上线后这条(只在
+            # 首次创建时跑一次)先于任何 acquire 落地,而 acquire 那边也改
+            # 成同款 setgid+共享 gid 之后就不再互相覆盖。**Task 3 因此不能
+            # 单独发布,必须与 Task 4 一起上线。**
             #
             # Wrapped (wave 2 final review, Minor 2): the most likely way
             # this fails in production is the NAS data root not having been
@@ -471,23 +516,33 @@ class NasWorkspaceStore:
             # after release 500s, check this", which is exactly the signal
             # the error type should have carried in the first place.
             try:
-                user_root.mkdir(parents=True, exist_ok=True)
-                # 路径版本的 chown/chmod(不是 _openat_dir 的 fd 版本)——
-                # user_root 是按信任前缀直接开的绝对路径,不经过下面的
-                # dir_fd 链;顺序承重(先 chown 后 chmod)与"非成员就降级
-                # 只记日志"的理由同 _openat_dir 的 docstring。
                 try:
-                    os.chown(user_root, -1, WORKSPACE_SHARED_GID)
-                except PermissionError as exc:
-                    logger.warning(
-                        "nas_workspace_store.user_root_chgrp_denied "
-                        "tenant_id=%s user_id=%s gid=%s: %s",
-                        tenant_id,
-                        user_id,
-                        WORKSPACE_SHARED_GID,
-                        exc,
-                    )
-                os.chmod(user_root, WORKSPACE_DIR_MODE)
+                    user_root.mkdir(parents=True)
+                    created = True
+                except FileExistsError:
+                    # 已经存在——不管是别的写入方先跑到,还是这棵目录本来
+                    # 就在那里(CSI/迁移/恢复带来的),都不是我们创建的,
+                    # mode/gid 不归这条路径管。
+                    created = False
+                if created:
+                    # 路径版本的 chown/chmod(不是 _openat_dir 的 fd 版
+                    # 本)—— user_root 是按信任前缀直接开的绝对路径,不经
+                    # 过下面的 dir_fd 链;顺序承重(先 chown 后 chmod)与
+                    # "非成员就降级只记日志"的理由同 _openat_dir 的
+                    # docstring,日志级别见 _chgrp_denied_level。
+                    try:
+                        os.chown(user_root, -1, WORKSPACE_SHARED_GID)
+                    except PermissionError as exc:
+                        logger.log(
+                            _chgrp_denied_level(),
+                            "nas_workspace_store.user_root_chgrp_denied "
+                            "tenant_id=%s user_id=%s gid=%s: %s",
+                            tenant_id,
+                            user_id,
+                            WORKSPACE_SHARED_GID,
+                            exc,
+                        )
+                    os.chmod(user_root, WORKSPACE_DIR_MODE)
             except OSError as exc:
                 raise SandboxSupervisorError(
                     f"failed to create workspace directory {user_root}: {exc}"
@@ -577,8 +632,13 @@ class NasWorkspaceStore:
             entries: list[WorkspaceFileEntry] = []
             # followlinks=False — see module docstring: never descend into a
             # symlinked subdirectory, so an intermediate-component escape
-            # can't make this enumerate files outside the tree.
-            for dirpath, _dirnames, filenames in os.walk(user_root, followlinks=False):
+            # can't make this enumerate files outside the tree. onerror=
+            # (Task 3 fix round 1) — see _raise_workspace_listing_error:
+            # without it, a subtree this process can't scan is silently
+            # dropped from the results instead of failing loudly.
+            for dirpath, _dirnames, filenames in os.walk(
+                user_root, followlinks=False, onerror=_raise_workspace_listing_error
+            ):
                 for name in filenames:
                     full = Path(dirpath) / name
                     rel = full.relative_to(user_root).as_posix()
@@ -645,7 +705,17 @@ class NasWorkspaceStore:
             finally:
                 os.close(dfd)
             with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
+                # Task 3 fix round 1 (Minor 2) — the open above is wrapped,
+                # but the actual write wasn't: ENOSPC/EDQUOT (NAS quota, disk
+                # full) is a real, likely failure mode here and was leaking
+                # a bare OSError straight past this store's error boundary,
+                # contradicting the "错误类型统一" comment a few lines up.
+                try:
+                    handle.write(data)
+                except OSError as exc:
+                    raise SandboxSupervisorError(
+                        f"workspace file write failed: {path!r}: {exc}"
+                    ) from exc
 
         await asyncio.to_thread(_write)
 
