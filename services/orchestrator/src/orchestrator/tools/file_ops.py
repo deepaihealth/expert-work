@@ -157,7 +157,7 @@ def _atomic_write(full, data):
         # 调用之间会有一个短暂但真实可观测的 0600 窗口 —— 并发读者只要撞上
         # 这个窗口就是一次随机失败,而不是稳定复现的 bug,会更难查。
         #
-        # 0o640 的 group 位是承重的:workspace 目录是 setgid(0o2770),新建
+        # 这个 mode 的 group 位是承重的:workspace 目录是 setgid(0o2770),新建
         # 文件的 group 自动继承成共享 gid,这里只需要把 group 的 r 位打开即
         # 可让另一侧读到;other 依旧全零。字面量来自
         # ``expert_work.persistence.WORKSPACE_FILE_MODE``(Task 1 钉的唯一

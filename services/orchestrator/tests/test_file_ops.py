@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from expert_work.persistence import WORKSPACE_FILE_MODE
 from orchestrator.tools import (
     EditFileTool,
     FileOpError,
@@ -117,7 +118,11 @@ def test_write_snippet_chmods_the_temp_file_before_rename() -> None:
     chmod_at = src.index("os.chmod(")
     replace_at = src.index("os.replace(")
     assert chmod_at < replace_at, "chmod 必须在 os.replace 之前"
-    assert "0o640" in src
+    # 锚定到真实调用点(而不是裸子串搜索 "0o640")—— 上面那段 WHY 注释的
+    # 说明文字里也会提到 mode 相关字样,一个不挂在调用点上的裸子串断言测不
+    # 出「chmod 参数被错改成别的数,注释没跟着改」这种情况,是重构无感的
+    # 假阳性覆盖。
+    assert f"os.chmod(tmp, {oct(WORKSPACE_FILE_MODE)})" in src
 
 
 def test_atomic_write_lands_group_readable(tmp_path: Path) -> None:
