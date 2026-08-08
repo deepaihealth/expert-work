@@ -199,7 +199,7 @@ async def test_delete_file_missing_is_a_noop(tmp_path: Path) -> None:
 
 
 async def test_write_file_creates_intermediate_dirs_setgid_and_group_shared(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`_openat_dir` 新建的每一层中间目录都要 ``fchmod`` 到 ``WORKSPACE_DIR_MODE``
     (``0o2770``)——不然 ``os.mkdir`` 的默认 mode 会被这个进程的 umask(常见
@@ -210,9 +210,18 @@ async def test_write_file_creates_intermediate_dirs_setgid_and_group_shared(
     Task 3 之前这条断言的是 ``0o777``(测试名也叫
     ``..._world_writable``)——那是旧设计:两侧 uid 都能读写靠的是把
     ``other`` 也开了。gid 共享上线后 ``other`` 归零,读写权限改成专靠
-    group 位撑,测试名跟着改。"""
+    group 位撑,测试名跟着改。
+
+    Task 3 fix round 2(Residual 1)—— chown 失败之后不再 chmod,所以这里要
+    让 ``os.fchown`` 假装成功(不代跑真实 syscall,理由同其它 monkeypatch
+    过 chown 的测试)才能验证"chown 成功时 mode 落到 WORKSPACE_DIR_MODE"这
+    半句;"chown 失败时 mode 不被收紧"由
+    ``test_intermediate_dir_mode_is_not_tightened_when_chgrp_fails`` 专门
+    覆盖。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
+    monkeypatch.setattr(os, "fchown", lambda *_args: None)
 
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b/c.txt", data=b"x")
 
@@ -222,16 +231,21 @@ async def test_write_file_creates_intermediate_dirs_setgid_and_group_shared(
 
 
 async def test_write_file_does_not_reset_mode_of_a_pre_existing_intermediate_dir(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """新建目录才 chmod——不是 belt-and-braces 地把整条路径上每一层都强行
     改成 ``WORKSPACE_DIR_MODE``。一个已经存在的目录(这里模拟沙箱自己用受限
     mode 建的 `a/`)在 ``_openat_dir`` 的快路径(``O_NOFOLLOW`` 直接 open
     成功)里直接返回,不会被这次 write 顺手改权限——只有这次调用真正带出来
     的新目录(`a/b`)才落 ``WORKSPACE_DIR_MODE``(Task 3 之前是 ``0o777``,
-    见上一条测试的说明)。"""
+    见上一条测试的说明)。
+
+    同上一条,让 ``os.fchown`` 假装成功——这条测的是"新建目录才 chmod"这条
+    规则本身,不是 chown 失败时的降级行为。
+    """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
+    monkeypatch.setattr(os, "fchown", lambda *_args: None)
     user_root = tmp_path / str(tenant_id) / str(user_id)
     restricted = user_root / "a"
     restricted.mkdir(parents=True)
@@ -413,14 +427,69 @@ async def test_write_file_skips_chown_chmod_for_a_pre_existing_user_root(
     assert (user_root / "a.txt").read_bytes() == b"x"
 
 
+async def test_user_root_mode_is_not_tightened_when_chgrp_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 3 fix round 2(Residual 1)—— 装配期闸(C1)挡掉的是常见情形;
+    NFS ``root_squash``/``all_squash``、ACL,或者这个目录压根不是我们的,
+    都能让闸通过之后单次 ``chown`` 还是失败。这种时候**不该**继续
+    ``chmod`` 到 ``WORKSPACE_DIR_MODE``——那会把目录主动收紧成"错 group +
+    other 归零"的零访问态,恰恰是 C1 想根治的那个症状,只是这次是这段代码
+    自己造成的。原样留着(``os.mkdir`` 自己 umask 掩过的宽松 mode)严格好
+    于主动收紧。这里强制 ``os.chown`` 总是失败,断言用户根**没有**被改成
+    ``WORKSPACE_DIR_MODE``。
+    """
+
+    def _always_denied(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chown", _always_denied)
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert stat.S_IMODE(user_root.stat().st_mode) != WORKSPACE_DIR_MODE
+
+
+async def test_intermediate_dir_mode_is_not_tightened_when_chgrp_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同上,但测 ``_openat_dir`` 的 fd 版本(中间子目录,不是用户根自
+    己)。"""
+
+    def _always_denied(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchown", _always_denied)
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b.txt", data=b"x")
+
+    a_dir = tmp_path / str(tenant_id) / str(user_id) / "a"
+    assert stat.S_IMODE(a_dir.stat().st_mode) != WORKSPACE_DIR_MODE
+
+
 async def test_write_file_wraps_a_write_failure_as_sandbox_supervisor_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Task 3 fix round 1(Minor 2)—— ``ENOSPC``/``EDQUOT``(NAS 配额、磁盘
     满)是这里真实会发生的失败,``handle.write(data)`` 之前完全没包在任何
     ``try/except`` 里——一个裸 ``OSError`` 会越过这个 store 自己在同一个方
-    法上面 30 行处反复强调的"错误类型统一"边界。用一个假的 ``os.fdopen``
-    返回值(``write`` 一调用就抛 ``OSError``)复现,不依赖真的把磁盘写满。
+    法上面 30 行处反复强调的"错误类型统一"边界。
+
+    Task 3 fix round 2(NEW-1)—— round 1 的修法只把 ``try`` 套在
+    ``handle.write`` 外面,没套住 ``with`` 块本身的隐式 close/flush。
+    ``os.fdopen`` 给的是带缓冲的 ``BufferedWriter``(默认 8 KiB),小于这个
+    缓冲区的写入(恰好就是这整个任务的旗舰复现场景——``MEMORY.md`` 那种大
+    小的文件)根本不会在 ``write()`` 这一步真正碰到底层 ``write(2)``
+    syscall,``ENOSPC``/``EDQUOT`` 只会在 close/flush 时才浮出来。这里的假
+    ``write()`` 因此改成正常返回(模拟被缓冲、暂时"成功"),真正的失败挪到
+    ``__exit__``(模拟 close 时才炸)——如果实现只把 ``try`` 套在
+    ``handle.write`` 外面(round 1 的版本),这条测试就会因为一个裸
+    ``OSError`` 越过 ``pytest.raises(SandboxSupervisorError)`` 而失败。
     """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
@@ -430,10 +499,11 @@ async def test_write_file_wraps_a_write_failure_as_sandbox_supervisor_error(
             return self
 
         def __exit__(self, *_exc_info: object) -> None:
-            return None
-
-        def write(self, _data: bytes) -> int:
+            # close()/flush() 时才炸——缓冲写入的真实失败点。
             raise OSError(28, "No space left on device")  # ENOSPC
+
+        def write(self, data: bytes) -> int:
+            return len(data)  # 落进缓冲区,暂时"成功",不代表真的到盘了。
 
     def _fake_fdopen(fd: int, _mode: str) -> _BoomWriter:
         os.close(fd)  # 断言路径不需要真的写,先把 fd 还回去避免泄漏。
@@ -523,13 +593,44 @@ async def test_list_files_reports_permission_denied_for_unreadable_subtree(
         os.chmod(sub, 0o700)
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视目录权限位,0o000 依旧穿得透——这条测试的前提在 root 下不成立",
+)
+async def test_list_files_raises_when_tenant_dir_is_unreadable(tmp_path: Path) -> None:
+    """Task 3 fix round 2(Residual 2)—— Python 3.13 起 ``Path.is_dir()``
+    不再无条件吞掉 ``OSError``:它只忽略 ``_IGNORED_ERRNOS``(ENOENT/
+    ENOTDIR/EBADF/ELOOP)这一小撮"路径本来就不存在"的错误,``EACCES``/
+    ``EPERM`` 不在白名单里,会原样重新抛出(实测坐实,读了这个解释器版本
+    下 ``pathlib`` 的源码)。``list_files`` 里 ``onerror=`` 接手之前的那一
+    句 ``user_root.is_dir()`` 因此是一个未包边的 ``PermissionError`` 出
+    口——祖先目录(这里是 ``{tenant_id}/`` 本身)没有搜索权限时就会命中,
+    ``onerror=`` 根本还没轮到。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+    tenant_dir = tmp_path / str(tenant_id)
+    os.chmod(tenant_dir, 0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    finally:
+        os.chmod(tenant_dir, 0o700)
+
+
 async def test_chgrp_denial_logs_debug_when_process_is_not_a_group_member(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Task 3 fix round 1(Critical 1)—— 不在 gid 10000 里是本机/CI 跑测试
     的常态(直接构造 store,绕过了 ``build_workspace_store`` 的装配期
-    闸),chgrp 拿不到组是**预期**状态,不该在日志里制造噪音:``DEBUG``。"""
+    闸),chgrp 拿不到组是**预期**状态,不该在日志里制造噪音:``DEBUG``。
+
+    ``getgroups``/``getegid`` 都 monkeypatch 成不含共享 gid(fix round 2 后
+    判据查两个来源,见 ``_process_is_in_shared_gid``)——不依赖本机真实 egid
+    碰巧不是 10000。"""
     monkeypatch.setattr(os, "getgroups", lambda: [20])
+    monkeypatch.setattr(os, "getegid", lambda: 20)
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     caplog.set_level(logging.DEBUG, logger="orchestrator.tools.nas_workspace_store")
@@ -552,6 +653,34 @@ async def test_chgrp_denial_logs_error_when_process_is_already_a_group_member(
     会被拒",配合 ``getgroups`` 返回含共享 gid,断言分支判据只看
     ``getgroups()`` 这一件事,不看失败原因本身。"""
     monkeypatch.setattr(os, "getgroups", lambda: [WORKSPACE_SHARED_GID])
+
+    def _always_denied(*_args: Any, **_kwargs: Any) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chown", _always_denied)
+    monkeypatch.setattr(os, "fchown", _always_denied)
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    caplog.set_level(logging.DEBUG, logger="orchestrator.tools.nas_workspace_store")
+
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a/b.txt", data=b"x")
+
+    denied = [r for r in caplog.records if "chgrp_denied" in r.getMessage()]
+    assert denied
+    assert all(r.levelno == logging.ERROR for r in denied)
+
+
+async def test_chgrp_denial_logs_error_when_process_egid_is_the_shared_gid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Task 3 fix round 2(回应 fix round 1 自己提的 concern #3)——
+    ``getgroups()`` 不保证包含 effective gid,非特权 ``chown`` 的内核判据
+    ``in_group_p()`` 先查 egid、查不中才落到补充组列表。这里让
+    ``getgroups()`` 故意返回**不含**共享 gid 的列表,只让 ``getegid()``
+    命中,断言"是成员"这一支(ERROR)仍然成立——不是被 ``getgroups()``
+    单独决定。"""
+    monkeypatch.setattr(os, "getgroups", lambda: [20])
+    monkeypatch.setattr(os, "getegid", lambda: WORKSPACE_SHARED_GID)
 
     def _always_denied(*_args: Any, **_kwargs: Any) -> None:
         raise PermissionError(1, "Operation not permitted")
@@ -717,6 +846,30 @@ async def test_user_root_mkdir_failure_stays_inside_the_store_error_boundary(
     monkeypatch.setattr(Path, "mkdir", _refuse)
 
     with pytest.raises(SandboxSupervisorError):
+        await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
+
+
+async def test_user_root_mkdir_permission_failure_is_a_workspace_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 3 fix round 2(Residual 3)—— 上一条测的是"没越过 store 边界"
+    (泛化的 SandboxSupervisorError 也算过),但这恰恰是这整个任务的旗舰诊断
+    场景——runbook 第一步让人查的就是这个(NAS 根没 chmod 1777、建不出第一
+    个租户子树)。Task 5 靠窄类型 WorkspacePermissionError 才能把它翻成有归
+    因的 500;还是泛化类型的话,这条 runbook 场景反而是唯一没拿到新错误类
+    型的权限失败。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    real_mkdir = Path.mkdir
+
+    def _refuse(self: Path, *args: Any, **kwargs: Any) -> None:
+        if str(self).startswith(str(tmp_path / str(tenant_id))):
+            raise PermissionError(13, "Permission denied")
+        real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _refuse)
+
+    with pytest.raises(WorkspacePermissionError):
         await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
 
 

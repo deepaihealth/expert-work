@@ -1601,10 +1601,10 @@ def build_workspace_store(
     续到 NAS 分支(``workspace_nas_root`` 也用真值判断)。
 
     波 2 Task 3 fix round 1(Critical 1)—— NAS 分支在构造 ``NasWorkspace
-    Store`` 之前先检查 ``WORKSPACE_SHARED_GID in os.getgroups()``,不是成
-    员就拒绝装配。判据精确对应 ``NasWorkspaceStore`` 会不会真的把 ``chown``
-    落到共享 gid 上:非特权进程的 ``chown(path, -1, gid)`` 只有调用方本身
-    属于 ``gid`` 才会成功(集群实测坐实),生产靠这个 Deployment 的
+    Store`` 之前先检查这个进程会不会被算进共享 gid,不是就拒绝装配。判据
+    对应 ``NasWorkspaceStore`` 会不会真的把 ``chown`` 落到共享 gid 上:非
+    特权进程的 ``chown(path, -1, gid)`` 只有调用方本身属于 ``gid`` 才会成
+    功(集群实测坐实),生产靠这个 Deployment 的
     ``securityContext.supplementalGroups: [10000]`` 保证成立。如果这条闸不
     在这里拦,后果不是"退化成旧行为"——旧的 ``0o777``/``0o644`` 至少有
     ``other`` 位兜底,沙箱那侧的 agent uid 好歹进得去;而这个 store 建出来
@@ -1612,9 +1612,21 @@ def build_workspace_store(
     里的话 group 位也落不到共享 gid 上,沙箱那侧变成**零访问**,比修复前
     更糟。宁可在装配期就大声拒绝,不要把这个状态放行到运行期才一个个
     ``PermissionError`` 冒出来。
+
+    波 2 Task 3 fix round 2(纠正 fix round 1 自己 concern #3 提的疑虑)——
+    判据不能只查 ``os.getgroups()``。非特权 ``chown`` 的内核判据是
+    ``in_group_p()``:先查 **effective gid**,查不中才落到补充组列表;
+    ``getgroups(2)`` 本身不保证包含 egid(Docker/runc 会顺手把主 gid 塞进
+    补充组列表,但那是运行时的偶然行为,不是 POSIX 承诺)。只查
+    ``getgroups()`` 会在 ``runAsGroup: 10000``(主 gid 而非
+    ``supplementalGroups``)这种**配置对的**部署上把它误判成没配对、在装
+    配期就拒——硬闸的假阴性,比假阳性更糟(假阳性顶多是少一层保护,假阴
+    性是拦住一个本该放行的正确部署)。因此判据是
+    ``WORKSPACE_SHARED_GID in os.getgroups() or os.getegid() ==
+    WORKSPACE_SHARED_GID``,两个来源都要查过。
     """
     if settings.workspace_nas_root:
-        if WORKSPACE_SHARED_GID not in os.getgroups():
+        if WORKSPACE_SHARED_GID not in os.getgroups() and os.getegid() != WORKSPACE_SHARED_GID:
             msg = (
                 f"control-plane process is not a member of gid {WORKSPACE_SHARED_GID} "
                 "(WORKSPACE_SHARED_GID) — refusing to build a NasWorkspaceStore. "
@@ -1623,8 +1635,9 @@ def build_workspace_store(
                 "up at 0o2770/0o640 owned by the wrong group — not the old "
                 "permissive 0o777/0o644, but zero access for the sandbox's agent "
                 "uid (10000). Add gid 10000 to this Pod's "
-                "securityContext.supplementalGroups (the control-plane Deployment) "
-                "before setting EXPERT_WORK_WORKSPACE_NAS_ROOT."
+                "securityContext.supplementalGroups (or runAsGroup) "
+                "(the control-plane Deployment) before setting "
+                "EXPERT_WORK_WORKSPACE_NAS_ROOT."
             )
             raise RuntimeError(msg)
         return NasWorkspaceStore(

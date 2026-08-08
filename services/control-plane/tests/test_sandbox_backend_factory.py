@@ -176,12 +176,35 @@ def test_workspace_store_refuses_nas_store_without_shared_gid_membership(
     落在 ``0o2770``/``0o640`` + 错的 group 上,比修复前的 ``0o777``/``0o644``
     更差(旧版本至少 ``other`` 位能兜底,新版本 ``other`` 归零,沙箱那侧的
     agent 是**零访问**)。宁可在装配期就拒,不要把这个状态放行到运行期才
-    一个个 ``PermissionError`` 冒出来。"""
+    一个个 ``PermissionError`` 冒出来。
+
+    ``getgroups``/``getegid`` 都 monkeypatch 成不含共享 gid(fix round 2
+    后判据查两个来源)——不依赖本机真实 egid 碰巧不是 10000。"""
     monkeypatch.setattr(os, "getgroups", lambda: [20])  # 不含 WORKSPACE_SHARED_GID
+    monkeypatch.setattr(os, "getegid", lambda: 20)
     s = Settings(workspace_nas_root="/mnt/workspaces")
 
     with pytest.raises(RuntimeError, match=str(WORKSPACE_SHARED_GID)):
         build_workspace_store(s)
+
+
+def test_workspace_store_builds_nas_store_when_process_egid_is_the_shared_gid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 3 fix round 2(回应 fix round 1 自己提的 concern #3)——
+    ``getgroups(2)`` 不保证包含 effective gid;非特权 ``chown`` 的内核判据
+    ``in_group_p()`` 先查 egid、查不中才落到补充组列表。一个
+    ``runAsGroup: 10000``(主 gid,不是 ``supplementalGroups``)的部署是
+    **配置对的**,但只查 ``getgroups()`` 会把它误判成没配对、在装配期就
+    拒——硬闸的假阴性。这里让 ``getgroups()`` 故意不含共享 gid,只让
+    ``getegid()`` 命中,断言闸仍然放行。"""
+    monkeypatch.setattr(os, "getgroups", lambda: [20])
+    monkeypatch.setattr(os, "getegid", lambda: WORKSPACE_SHARED_GID)
+    s = Settings(workspace_nas_root="/mnt/workspaces")
+
+    store = build_workspace_store(s)
+
+    assert isinstance(store, NasWorkspaceStore)
 
 
 def test_workspace_store_prefers_nas_over_supervisor_when_both_are_set(

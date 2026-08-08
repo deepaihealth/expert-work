@@ -188,20 +188,34 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 _MAX_LIST_ENTRIES = 2000
 
 
+def _process_is_in_shared_gid() -> bool:
+    """Whether *this* process's chown-to-:data:`WORKSPACE_SHARED_GID` would land.
+
+    Task 3 fix round 2(egid 遗漏,回应 fix round 1 自己提的 concern #3)——
+    非特权 ``chown(path, -1, gid)`` 的内核判据是 ``in_group_p()``:先查
+    **effective gid**,查不中才落到补充组列表。``getgroups(2)`` 本身不保证
+    包含 egid(实测:Docker/runc 会把主 gid 也塞进补充组列表,但那是运行时
+    的偶然行为,不是 POSIX 承诺)。只查 ``os.getgroups()`` 会在
+    ``runAsGroup: 10000``(主 gid 而非 supplementalGroups)这种配置对的部署
+    上误判——假阴性,而且是硬闸的假阴性,后果是把配置对的部署直接拒之门
+    外,比"漏判"更糟。两个来源都要查。
+    """
+    return WORKSPACE_SHARED_GID in os.getgroups() or os.getegid() == WORKSPACE_SHARED_GID
+
+
 def _chgrp_denied_level() -> int:
     """Log level for a tolerated chown-to-shared-gid ``PermissionError``.
 
     Task 3 fix round 1(Critical 1)—— 两种失败形态诊断成本天差地别,不能都
-    记 ``warning``。这个进程压根不在 :data:`WORKSPACE_SHARED_GID` 里(本机/
-    CI 直接构造 ``NasWorkspaceStore``,跳过了 ``build_workspace_store`` 的
-    装配期闸)是**预期**状态,不该在日志里制造噪音,降到 ``DEBUG``。已经在
-    组里却还是被拒——生产环境靠 Deployment 的
-    ``supplementalGroups: [10000]`` 保证在组里,这种情况下 ``chown``
-    还失败,只可能是这个目录本来就不是我们建的、属主是别人——是一次真实
-    事故,升到 ``ERROR``。判据用 ``os.getgroups()``(进程启动时就定死的
-    补充组列表),不依赖任何一次具体调用的失败原因。
+    记 ``warning``。这个进程压根不在共享 gid 里(本机/CI 直接构造
+    ``NasWorkspaceStore``,跳过了 ``build_workspace_store`` 的装配期闸)是
+    **预期**状态,不该在日志里制造噪音,降到 ``DEBUG``。已经在组里却还是
+    被拒——生产环境靠 Deployment 的 ``supplementalGroups: [10000]`` 保证在
+    组里,这种情况下 ``chown`` 还失败,只可能是这个目录本来就不是我们建
+    的、属主是别人——是一次真实事故,升到 ``ERROR``。判据见
+    :func:`_process_is_in_shared_gid`。
     """
-    return logging.ERROR if WORKSPACE_SHARED_GID in os.getgroups() else logging.DEBUG
+    return logging.ERROR if _process_is_in_shared_gid() else logging.DEBUG
 
 
 class _WorkspacePathNotFoundError(SandboxSupervisorError):
@@ -282,10 +296,13 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
             # directory and not a symlink swapped in under the same name.
             pass
         fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
-        # 先 chown 后 chmod —— 顺序承重,见上方 docstring。chown 失败
-        # (PermissionError,非目标 gid 的成员)只记日志、不中断:目录还是要
-        # 落到正确的 mode,只是这一次没能把 group 也改成共享的那个。日志
-        # 级别见 :func:`_chgrp_denied_level`。
+        # 先 chown 后 chmod —— 顺序承重,见上方 docstring。chown 失败时
+        # **不** chmod(Task 3 fix round 2,Residual 1)——之前这里 chown 失败
+        # 只记日志,照样往下 chmod 到 WORKSPACE_DIR_MODE:那会把目录主动收紧
+        # 成"错 group + other 归零"的零访问态,恰恰是这整个任务要修的那个
+        # 症状,只是这次是这段代码自己造成的。原样不动(留在 os.mkdir 自己
+        # 那个 umask 掩过的宽松 mode)严格好于主动收紧——至少 other 位还在,
+        # 不会把仅剩的访问路径也堵死。日志级别见 :func:`_chgrp_denied_level`。
         try:
             os.fchown(fd, -1, WORKSPACE_SHARED_GID)
         except PermissionError as exc:
@@ -296,7 +313,8 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
                 WORKSPACE_SHARED_GID,
                 exc,
             )
-        os.fchmod(fd, WORKSPACE_DIR_MODE)
+        else:
+            os.fchmod(fd, WORKSPACE_DIR_MODE)
         return fd
 
 
@@ -515,6 +533,14 @@ class NasWorkspaceStore:
             # runbook literally tells the operator "if the first upload
             # after release 500s, check this", which is exactly the signal
             # the error type should have carried in the first place.
+            #
+            # Task 3 fix round 2(Residual 3)—— 这句话上一版没兑现:那个
+            # EACCES 之前被这里的宽 except OSError 收成普通
+            # SandboxSupervisorError,不是 WorkspacePermissionError,Task 5
+            # 靠后者才能把它翻成有归因的 500——runbook 让人第一个查的那个
+            # 场景,反而是唯一没拿到新错误类型的权限失败。这里补一条窄的
+            # except PermissionError 在前面接住(mkdir 本身的 EACCES;下面
+            # chown 失败已经在内层 try 里被吞掉、不会走到这儿)。
             try:
                 try:
                     user_root.mkdir(parents=True)
@@ -529,7 +555,10 @@ class NasWorkspaceStore:
                     # 本)—— user_root 是按信任前缀直接开的绝对路径,不经
                     # 过下面的 dir_fd 链;顺序承重(先 chown 后 chmod)与
                     # "非成员就降级只记日志"的理由同 _openat_dir 的
-                    # docstring,日志级别见 _chgrp_denied_level。
+                    # docstring,日志级别见 _chgrp_denied_level。chown 失败
+                    # 时不 chmod(Residual 1,理由同 _openat_dir 那段同款
+                    # 注释)——原样留在 mkdir 自己 umask 掩过的宽松 mode,
+                    # 严格好于主动收紧成零访问态。
                     try:
                         os.chown(user_root, -1, WORKSPACE_SHARED_GID)
                     except PermissionError as exc:
@@ -542,7 +571,12 @@ class NasWorkspaceStore:
                             WORKSPACE_SHARED_GID,
                             exc,
                         )
-                    os.chmod(user_root, WORKSPACE_DIR_MODE)
+                    else:
+                        os.chmod(user_root, WORKSPACE_DIR_MODE)
+            except PermissionError as exc:
+                raise WorkspacePermissionError(
+                    f"failed to create workspace directory {user_root}: {exc}"
+                ) from exc
             except OSError as exc:
                 raise SandboxSupervisorError(
                     f"failed to create workspace directory {user_root}: {exc}"
@@ -627,7 +661,23 @@ class NasWorkspaceStore:
     async def list_files(self, *, tenant_id: UUID, user_id: UUID) -> list[WorkspaceFileEntry]:
         def _list() -> list[WorkspaceFileEntry]:
             user_root = self._user_root(tenant_id, user_id)
-            if not user_root.is_dir():
+            # Task 3 fix round 2(Residual 2)—— Python 3.13 起 Path.is_dir()
+            # 不再无条件吞掉 OSError:它只忽略 ENOENT/ENOTDIR/EBADF/ELOOP 这
+            # 一小撮"路径本来就不存在/不是目录"的错误,EACCES/EPERM 不在白
+            # 名单里,会原样重新抛出(实测坐实,见该函数在这个解释器版本下
+            # 的源码)。祖先目录(典型是 ``{tenant_id}/`` 本身)没有搜索权限
+            # 时——同 ``_raise_workspace_listing_error`` 想防的那类
+            # 故障——这一句自己就是一个未包边的 PermissionError 出口,在
+            # ``onerror=`` 接手之前就先漏了。
+            try:
+                is_dir = user_root.is_dir()
+            except PermissionError as exc:
+                raise WorkspacePermissionError(
+                    f"workspace listing not readable: {user_root!r}"
+                ) from exc
+            except OSError as exc:
+                raise SandboxSupervisorError(f"workspace listing failed: {exc}") from exc
+            if not is_dir:
                 return []
             entries: list[WorkspaceFileEntry] = []
             # followlinks=False — see module docstring: never descend into a
@@ -704,18 +754,24 @@ class NasWorkspaceStore:
                     ) from exc
             finally:
                 os.close(dfd)
-            with os.fdopen(fd, "wb") as handle:
-                # Task 3 fix round 1 (Minor 2) — the open above is wrapped,
-                # but the actual write wasn't: ENOSPC/EDQUOT (NAS quota, disk
-                # full) is a real, likely failure mode here and was leaking
-                # a bare OSError straight past this store's error boundary,
-                # contradicting the "错误类型统一" comment a few lines up.
-                try:
+            # Task 3 fix round 1 (Minor 2), corrected in fix round 2 (NEW-1)
+            # — the open above is wrapped, but the write wasn't, and round
+            # 1's fix only wrapped ``handle.write`` itself, not the ``with``
+            # block's implicit close. ``os.fdopen`` hands back a buffered
+            # writer (8 KiB by default); for any payload smaller than that
+            # buffer — which covers this whole task's flagship repro,
+            # MEMORY.md — the data never reaches the actual ``write(2)``
+            # syscall until the buffer flushes at ``close()``/``__exit__``,
+            # so ENOSPC/EDQUOT (NAS quota, disk full) surfaces *there*, not
+            # inside ``handle.write``. The ``with`` has to be inside the
+            # ``try`` for the boundary to actually hold.
+            try:
+                with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
-                except OSError as exc:
-                    raise SandboxSupervisorError(
-                        f"workspace file write failed: {path!r}: {exc}"
-                    ) from exc
+            except OSError as exc:
+                raise SandboxSupervisorError(
+                    f"workspace file write failed: {path!r}: {exc}"
+                ) from exc
 
         await asyncio.to_thread(_write)
 
