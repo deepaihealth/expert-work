@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -96,6 +97,40 @@ def test_write_overwrites_atomically(tmp_path: Path) -> None:
     assert (tmp_path / "f.txt").read_text() == "v2"
     # No temp file left behind by the atomic rename.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["f.txt"]
+
+
+def test_write_snippet_chmods_the_temp_file_before_rename() -> None:
+    """``_atomic_write`` 必须在 ``os.replace`` 之前 chmod。
+
+    ``tempfile.mkstemp`` 恒定 0600(它的安全契约,与 umask 无关),而
+    ``os.replace`` 保留源 inode 的权限位 —— 所以不 chmod 的话,经这条路写出
+    的**每一个**文件都是 0600,control-plane(另一个 uid)一律读不了。这正是
+    W2-BUG-1:前端列得出、下载报 404。
+
+    顺序也是承重的:chmod 必须在 replace **之前**。之后再 chmod 的话,目标
+    文件在两个系统调用之间有一个 0600 的可观测窗口,读方正好撞上就是一次
+    随机失败。这条测试断的是 snippet 源码文本(snippet 真正的执行发生在
+    沙箱里,这条单测跑不到那一步),下面 ``test_atomic_write_lands_group_
+    readable`` 补上真跑一遍的行为断言。
+    """
+    src = build_write_wrapper("a.txt", "x")
+    chmod_at = src.index("os.chmod(")
+    replace_at = src.index("os.replace(")
+    assert chmod_at < replace_at, "chmod 必须在 os.replace 之前"
+    assert "0o640" in src
+
+
+def test_atomic_write_lands_group_readable(tmp_path: Path) -> None:
+    """真跑一遍 snippet 里的 ``_atomic_write``,断言落地 mode 是 0640。
+
+    上一条测的是源码文本(能防重构把 chmod 删掉),这一条测的是真实文件系统
+    行为 —— 两条都要,文本断言挡不住"chmod 了但 mode 写错"。``build_write_
+    wrapper`` 本就接受 ``ws`` 参数(不用像 brief 草稿那样对 snippet 源码文本
+    做字符串替换),配合既有的 ``_run_snippet`` 直接在本进程内跑。
+    """
+    out = _run_snippet(build_write_wrapper("out.txt", "hello", ws=str(tmp_path)))
+    assert out["ok"] is True
+    assert stat.S_IMODE(os.stat(tmp_path / "out.txt").st_mode) == 0o640
 
 
 def test_read_cap_truncates_content_but_hashes_full(tmp_path: Path) -> None:
