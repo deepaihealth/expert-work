@@ -37,9 +37,19 @@ SANDBOX_HOME = "/home/agent"
 #: 沙箱镜像里的 ``agent`` 用户(uid 10000,``nologin``,``useradd -m`` 建的)
 #: ——E2B SDK 默认以用户 ``user`` 执行 ``commands.run`` / ``files.write``,那个
 #: 账号在我们的镜像里不存在(``AuthenticationException: invalid username:
-#: 'user'``,2026-08-04 探针报告实测);``user="root"`` 同样不行
-#: (``InvalidArgumentException``)。做成常量而非散落字面量 —— Task 8 的
+#: 'user'``,2026-08-04 探针报告实测)。做成常量而非散落字面量 —— Task 8 的
 #: ``exec`` 也要用同一个值。
+#:
+#: **勘误(W2 收尾真栈复跑)**:这里原本还写着"``user="root"`` 同样不行
+#: (``InvalidArgumentException``)"。那条是 2026-08-04 在**波 1 老镜像**上测
+#: 的,当时镜像声明 ``USER agent``;Task 9 让容器 root 启动之后不再成立 ——
+#: ``AgentSandboxClient._chmod_workspace_mount`` 就是以 ``user="root"`` 跑
+#: ``chmod``,2026-08-07 真栈实测**成功**(挂载共享那条契约用例正是靠它从
+#: PermissionError 转 PASSED)。留着那句话会告诉后来者"别用 root",而我们恰恰
+#: 靠 root 修好了挂载点权限那条 Critical。
+#:
+#: 这个常量本身含义不变:它钉的是**执行身份**(降权后跑用户代码的那个用户),
+#: 不是容器身份。root 可用于平台自己的一次性运维动作,不是 ``exec`` 的落点。
 #:
 #: 沙箱迁移 W2 Task 9(2026-08-07)起镜像不再声明 ``USER agent``(容器本身
 #: root 启动,理由见 ``infra/sandbox-image/Dockerfile`` 头注释)——这个常量

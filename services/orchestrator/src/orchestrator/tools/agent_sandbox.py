@@ -36,9 +36,12 @@ E2B 原生协议要求泛域名而我们的证书只覆盖一层子域名,所以
 * ``AsyncSandbox.create()`` 的 ``domain`` / ``api_key`` 走 ``**opts``,不是
   brief 草稿写的具名参数——这里按实测签名以关键字形式传,效果一样。
 * ``commands.run`` / ``files.write`` 必须传 ``user="agent"``(见
-  :data:`SANDBOX_EXEC_USER`),否则 E2B 默认用户 ``user`` 在我们的沙箱镜像
-  (``USER agent``,uid 10000)里不存在,炸
-  ``AuthenticationException: invalid username: 'user'``。
+  :data:`SANDBOX_EXEC_USER`),否则 E2B 默认用户 ``user`` 在我们的沙箱镜像里
+  不存在,炸 ``AuthenticationException: invalid username: 'user'``。
+  (这里原本写"我们的沙箱镜像(``USER agent``,uid 10000)"—— W2 Task 9 起
+  镜像不再声明 ``USER agent``,容器 root 启动;``agent`` 用户仍在、uid 仍是
+  10000,结论不变,只是引用的理由是条已删的指令。同一句在
+  :data:`SANDBOX_EXEC_USER` 那边当时改对了,这一处漏了。)
 
 ## 独立发现、brief 草稿之外的问题(task-7-report.md 有完整记录)
 

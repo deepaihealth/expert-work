@@ -1436,6 +1436,30 @@ async def build_mcp_pool(
         await pool.close_all()
 
 
+#: ``sandbox_backend="agent_sandbox"`` 起进程所必需的环境变量名,按
+#: :func:`build_sandbox_runtime` 检查它们的顺序排列。
+#:
+#: **为什么是一个具名常量而不是内联元组**(W2 收尾前提清扫)。契约测试
+#: ``services/orchestrator/tests/test_sandbox_runtime_contract.py`` 的 fixture
+#: 不走这个工厂——它直接构造 :class:`AgentSandboxClient`,于是"生产要求什么"
+#: 与"契约档配了什么"是两份各自演化的清单。这一波真栈复跑正是栽在这上面:
+#: Task 9 之后 ``PV_NAME`` 变成必配,fixture 的默认值还停在"不配 = 波 1 行为"
+#: 的旧世界,18 条 exec 用例齐炸 ``cwd '/workspace' does not exist``——而
+#: 那两个任务各自自洽、per-task 审查也各自都过了,因为肇事任务的 diff 里
+#: 根本没有 fixture 那一行。
+#:
+#: 把清单抽成一处、并由 ``test_contract_fixture_accounts_for_every_mandated_env``
+#: 逐名核对,是把这条"散文前提"变成机器可检的东西:工厂以后再多要一个变量,
+#: 那道闸当场红,不必等一次真栈跑。
+AGENT_SANDBOX_REQUIRED_ENV = (
+    "EXPERT_WORK_SANDBOX_E2B_DOMAIN",
+    "EXPERT_WORK_SANDBOX_E2B_API_KEY",
+    "EXPERT_WORK_SANDBOX_E2B_TEMPLATE",
+    "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME",
+    "EXPERT_WORK_WORKSPACE_NAS_ROOT",
+)
+
+
 def build_sandbox_runtime(
     settings: Settings, *, sandbox_instance_store: SandboxInstanceStore | None = None
 ) -> SandboxRuntime | None:
@@ -1484,30 +1508,28 @@ def build_sandbox_runtime(
     if backend is None:
         backend = "supervisor" if settings.sandbox_supervisor_url else None
     if backend == "agent_sandbox":
-        missing = [
-            name
-            for name, value in (
-                ("EXPERT_WORK_SANDBOX_E2B_DOMAIN", settings.sandbox_e2b_domain),
-                ("EXPERT_WORK_SANDBOX_E2B_API_KEY", settings.sandbox_e2b_api_key),
-                ("EXPERT_WORK_SANDBOX_E2B_TEMPLATE", settings.sandbox_e2b_template),
-                # 波 2 终审 Important-2 —— 这两项在波 1 是可选的("不配 = 波 1
-                # 行为"),Task 9 之后不再是:新沙箱镜像**不预建
-                # /workspace**(那条路径必须留空,平台才能在它上面建 NAS 挂载
-                # 的 symlink),而 exec 无条件传 ``cwd=/workspace``。
-                #  * 少 PV_NAME → ``_create`` 不注入 csi-volume-config → 沙箱里
-                #    根本没有 /workspace → 第一次工具调用炸在 envd 层,报一个
-                #    与根因八竿子打不着的错;
-                #  * 少 NAS_ROOT → 挂载点子目录没人提前 mkdir + chmod(NAS 新
-                #    建目录属主 root、沙箱以 uid 10000 跑,探针 § 三 明确"平台
-                #    是否自动建目录"至今未实测),软删闸与 NasWorkspaceStore
-                #    也一起哑掉(工作区浏览/上传/下载/删用户级联全失效)。
-                # 两者都是纯配置错误 + 零运行期信号,正是这段代码上方注释自己
-                # 定的"该在进程起来时点名"的场景。
-                ("EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME", settings.sandbox_workspace_pv_name),
-                ("EXPERT_WORK_WORKSPACE_NAS_ROOT", settings.workspace_nas_root),
-            )
-            if not value
-        ]
+        # 波 2 终审 Important-2 —— 后两项在波 1 是可选的("不配 = 波 1 行为"),
+        # Task 9 之后不再是:新沙箱镜像**不预建 /workspace**(那条路径必须留
+        # 空,平台才能在它上面建 NAS 挂载的 symlink),而 exec 无条件传
+        # ``cwd=/workspace``。
+        #  * 少 PV_NAME → ``_create`` 不注入 csi-volume-config → 沙箱里根本
+        #    没有 /workspace → 第一次工具调用炸在 envd 层,报一个与根因八竿子
+        #    打不着的错(W2 收尾真栈复跑实际观测到的就是这个);
+        #  * 少 NAS_ROOT → 挂载点子目录没人提前 mkdir + chmod。平台会替你建,
+        #    但建成 ``root:root 0755``(2026-08-07 集群实测,此前探针 § 三 记作
+        #    未实测),沙箱以 uid 10000 跑就写不进去;软删闸与 NasWorkspaceStore
+        #    也一起哑掉(工作区浏览/上传/下载/删用户级联全失效)。
+        # 两者都是纯配置错误 + 零运行期信号,正是这段代码上方注释自己定的
+        # "该在进程起来时点名"的场景。名字清单抽在 AGENT_SANDBOX_REQUIRED_ENV,
+        # 契约测试按它逐名核对(见该常量 docstring)。
+        _values = {
+            "EXPERT_WORK_SANDBOX_E2B_DOMAIN": settings.sandbox_e2b_domain,
+            "EXPERT_WORK_SANDBOX_E2B_API_KEY": settings.sandbox_e2b_api_key,
+            "EXPERT_WORK_SANDBOX_E2B_TEMPLATE": settings.sandbox_e2b_template,
+            "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME": settings.sandbox_workspace_pv_name,
+            "EXPERT_WORK_WORKSPACE_NAS_ROOT": settings.workspace_nas_root,
+        }
+        missing = [name for name in AGENT_SANDBOX_REQUIRED_ENV if not _values[name]]
         if missing:
             msg = (
                 "sandbox_backend='agent_sandbox' requires " + " + ".join(missing) + " — "

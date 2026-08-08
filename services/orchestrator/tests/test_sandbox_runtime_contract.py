@@ -1111,3 +1111,59 @@ def test_max_warm_age_leaves_room_at_the_ttl_floor() -> None:
         f" 加一次最长工具调用({MAX_TIMEOUT_S}s)已经不小于 TTL 本身 —— 下界选低了,"
         " 运维配得出一个让 #1b 自愈闸失效的值,且默认值那道闸完全看不见。"
     )
+
+
+# --------------------------------------------------- 生产必配项 ↔ 契约档配置 漂移闸
+#
+# W2 收尾「前提清扫」补的一道。这一波真栈复跑栽的第一跤就是这条缝:Task 9 之后
+# ``EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME`` 在生产装配点变成必配,而这份契约档的
+# fixture 的默认值还停在「不配 = 波 1 行为」的旧世界 —— 18 条 exec 用例齐炸
+# ``cwd '/workspace' does not exist``。
+#
+# 为什么代码审查逮不到:肇事任务(Task 9,改镜像)的 diff 里根本没有 fixture 那
+# 一行,它一个字符都没改。审查者读的是 diff,这条缝住在「未被改动、但被本次改动
+# 作废」的代码里。真栈跑逮到了,但那是最贵最晚的一层。
+#
+# 这道闸把那份「散文前提」变成机器可检的:名字集合对不上就红,不用等任何基础设施。
+
+#: 生产装配点每一个必配环境变量在**这份契约档**里的处置。值是理由,不是装饰 ——
+#: 工厂以后多要一个变量,下面那条断言会红,而写这行值的人被迫做一次显式判断:
+#: 契约档到底该要它,还是有理由不要。
+_FIXTURE_ENV_DISPOSITION = {
+    "EXPERT_WORK_SANDBOX_E2B_DOMAIN": "required —— _agent_sandbox_runtime 直接读,缺了 KeyError",
+    "EXPERT_WORK_SANDBOX_E2B_API_KEY": "required —— 缺了 skip(整个 agent_sandbox 档没法跑)",
+    "EXPERT_WORK_SANDBOX_E2B_TEMPLATE": "required —— _agent_sandbox_runtime 直接读,缺了 KeyError",
+    "EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME": (
+        "required —— 缺了 skip。镜像不再预建 /workspace(W2 Task 9),不挂 NAS "
+        "就等于沙箱里没有 cwd;生产工厂也强制它,契约档没有理由去测一个生产里"
+        "不存在的配置。"
+    ),
+    "EXPERT_WORK_WORKSPACE_NAS_ROOT": (
+        "刻意不配 —— 这是「把 NAS 挂进 control-plane Pod」的那半边,GitHub runner "
+        "对 NAS 没有 NFS 路由,配不了。缺了它 _prepare_workspace_mount 整段跳过,"
+        "挂载点目录改由平台建(root:root 0755,集群实测),沙箱侧 "
+        "AgentSandboxClient._chmod_workspace_mount 那道兜底因此成为这一档唯一的"
+        "权限来源 —— 也正是这一档真正在验的东西之一。"
+    ),
+}
+
+
+def test_contract_fixture_accounts_for_every_mandated_env() -> None:
+    """生产工厂的必配项集合 == 这份契约档显式处置过的集合。
+
+    不连任何真实环境(同 ``test_shared_egress_settings_resolve_to_the_same_env_var``
+    的手法),所以每一次 ``pytest -m "not integration"`` 全仓扫描都跑得到 —— 这
+    正是它想防的东西:别再靠一次 30 分钟的镜像构建 + 真栈跑来发现「契约档的配置
+    形状和生产对不上了」。
+    """
+    from control_plane.runtime import AGENT_SANDBOX_REQUIRED_ENV
+
+    mandated = set(AGENT_SANDBOX_REQUIRED_ENV)
+    disposed = set(_FIXTURE_ENV_DISPOSITION)
+
+    assert mandated == disposed, (
+        f"生产工厂必配 {sorted(mandated)},契约档处置了 {sorted(disposed)} —— "
+        f"未处置 {sorted(mandated - disposed)},多余 {sorted(disposed - mandated)}。"
+        " 每多一项都要在 _FIXTURE_ENV_DISPOSITION 里显式决定:契约档要它,还是"
+        " 有理由不要(把理由写下来)。"
+    )
