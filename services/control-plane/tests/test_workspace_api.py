@@ -19,7 +19,12 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditAction, AuditQuery
-from orchestrator.tools import RecordingWorkspaceStore, WorkspaceFileEntry
+from orchestrator.tools import (
+    RecordingWorkspaceStore,
+    SandboxSupervisorError,
+    WorkspaceFileEntry,
+    WorkspacePermissionError,
+)
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -31,6 +36,12 @@ from tests.auth_fixtures import (
 _TENANT = DEFAULT_DEV_TENANT_ID
 _SUBJECT = "user-a"
 _CONTENT = b"report body"
+# A store-side ``WorkspacePermissionError`` message shaped like the real one
+# (path / uid / mode) — used to prove the HTTP layer never echoes it back.
+_LEAKY_DETAIL = (
+    "PermissionError(13, 'Permission denied'): "
+    "'/mnt/workspaces/t-1/u-1/report.pdf' uid=10002 mode=0o600"
+)
 
 
 def _settings() -> Settings:
@@ -191,6 +202,43 @@ async def test_list_files_without_supervisor_returns_empty() -> None:
     assert resp.json()["data"]["files"] == []
 
 
+@pytest.mark.asyncio
+async def test_list_files_reports_permission_denied_as_server_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 200 空列表。
+
+    权限读不动是**服务端配置问题**(共享 uid 没配上 / 存量目录属主没迁移 /
+    目录 mode 不对),不是"这个用户没有文件"。这里如果和普通
+    SandboxSupervisorError 一样吞成 ``{"files": []}``,用户会看到"工作区是
+    空的"——比 404 还坏,连"出错了"都看不到,诊断成本全压在服务端日志上
+    (W2-BUG-1)。响应体不含路径 / uid / mode。
+    """
+    client, supervisor, _ = setup
+    supervisor.workspace_list_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get("/v1/workspace/files")
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_files_still_empty_on_a_generic_supervisor_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍降级成空列表,不是 500。
+
+    防止把"supervisor 一时联系不上就先给个空列表,别吓着用户"这条既有姿态
+    一并改坏——只有权限失败这一种从"吞成空"里拆出来。
+    """
+    client, supervisor, _ = setup
+    supervisor.workspace_list_error = SandboxSupervisorError("supervisor unreachable")
+    resp = await client.get("/v1/workspace/files")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["files"] == []
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/workspace/file — download
 # ---------------------------------------------------------------------------
@@ -279,6 +327,40 @@ async def test_download_without_supervisor_is_404() -> None:
     assert resp.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_download_file_reports_permission_denied_as_server_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    404 的语义是"不存在 / 你不该知道它存在";权限读不动是服务端配置问题,
+    塞进 404 会让用户看到"文件不存在",而它明明列在上一屏(W2-BUG-1)。响应体
+    不含路径 / uid / mode。
+    """
+    client, supervisor, _ = setup
+    supervisor.workspace_file_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get("/v1/workspace/file", params={"path": "out.txt"})
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_download_file_still_404s_on_a_generic_supervisor_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限,比如真的没这个文件)仍是 404。
+
+    防止把"隐藏跨用户存在性"这条既有安全姿态一并改坏——只有权限失败这一种
+    从 404 里拆出来。
+    """
+    client, supervisor, _ = setup
+    supervisor.workspace_file_error = SandboxSupervisorError("not found")
+    resp = await client.get("/v1/workspace/file", params={"path": "out.txt"})
+    assert resp.status_code == 404, resp.text
+
+
 # ---------------------------------------------------------------------------
 # DELETE /v1/workspace/file
 # ---------------------------------------------------------------------------
@@ -333,6 +415,35 @@ async def test_delete_traversal_path_is_400(
     client, _, _ = setup
     resp = await client.delete("/v1/workspace/file", params={"path": "/abs/path"})
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_delete_file_reports_permission_denied_as_server_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    同下载:权限失败是服务端配置问题,不应该被 404 的"不存在/你不该知道它
+    存在"语义盖过去。响应体不含路径 / uid / mode。
+    """
+    client, supervisor, _ = setup
+    supervisor.workspace_delete_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.delete("/v1/workspace/file", params={"path": "out.txt"})
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_delete_file_still_404s_on_a_generic_supervisor_error(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍是 404,既有姿态不变。"""
+    client, supervisor, _ = setup
+    supervisor.workspace_delete_error = SandboxSupervisorError("not found")
+    resp = await client.delete("/v1/workspace/file", params={"path": "out.txt"})
+    assert resp.status_code == 404, resp.text
 
 
 # ---------------------------------------------------------------------------
