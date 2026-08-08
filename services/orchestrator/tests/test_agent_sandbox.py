@@ -1300,6 +1300,46 @@ async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
     assert store.rows == {}
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 绕过 DAC,0o000 目录照样读得动")
+@pytest.mark.asyncio
+async def test_acquire_refuses_when_the_delete_marker_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """软删闸必须 **fail closed** —— 读不动 ``.deleted/`` 时拒绝,不是放行。
+
+    原实现用 ``Path.exists()``,它对 ``EACCES`` 的处理跨版本不一致(实测
+    3.12.8/3.13.1 抛、**3.14.0 吞掉返回 ``False``**)。3.14 那条是真的
+    fail-open:读不动等于判定"没被软删",已 purge 的用户被静默放行拿到沙箱。
+    ``requires-python = ">=3.12"`` 允许 3.14,所以"今天生产跑 3.12"不是理由。
+
+    读不动的窗口在发布流程里真实存在:``{tenant}/.deleted/`` 是 ``0o700``
+    属主 control-plane,而 uid 统一(spec § 六)之后、存量迁移 Job(Task D)
+    跑之前,它的属主还是旧 uid 而进程已经是新 uid。
+
+    **本用例在 3.12/3.13 上也有意义**:那两个版本虽然不放行,但裸
+    ``PermissionError`` 穿过整个 ``acquire`` 冒上去,归因不明——断言匹配的是
+    ``delete-marker unreadable`` 而不是仅仅"抛了个异常",两种坏行为都能挡。
+
+    与本次改动其余部分同一个主题:权限失败被吞成"东西不在"。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    _plant_marker(tmp_path, tenant_id, user_id)
+    marker = workspace_deleted_marker(str(tmp_path), tenant_id, user_id)
+    marker.parent.chmod(0o000)  # 目录不可穿透 —— stat marker 撞 EACCES
+    try:
+        sdk, store = FakeSdk(), FakeInstanceStore()
+        client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+        # 关键:不是 "workspace deleted"(那说明它读到了 marker),而是明确的
+        # "读不动"——两者都拒,但归因不同,且都不能是放行。
+        with pytest.raises(SandboxSupervisorError, match="delete-marker unreadable"):
+            await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+        assert store.rows == {}
+    finally:
+        marker.parent.chmod(0o700)  # 放回去,否则 pytest 清不掉 tmp_path
+
+
 @pytest.mark.asyncio
 async def test_acquire_ignores_a_marker_file_written_inside_the_mounted_tree(
     tmp_path: Path,

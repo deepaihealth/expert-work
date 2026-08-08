@@ -805,8 +805,47 @@ class AgentSandboxClient:
         的复查窗口复用的同一份判定——两处调用同一个函数,不重复一份逻辑。
         """
         marker = workspace_deleted_marker(root, tenant_id, user_id)
-        deleted = await asyncio.to_thread(marker.exists)
-        if deleted:
+
+        def _marker_present() -> bool:
+            """``os.stat`` 而不是 ``Path.exists()`` —— 这道闸必须 fail closed。
+
+            ``Path.exists()`` 对 ``EACCES`` 的处理**跨版本不一致**(四个解释器
+            实测):
+
+            ==========  ==========================================
+            3.12 / 3.13  抛 ``PermissionError``
+            **3.14**     **吞掉,返回 ``False``**
+            ==========  ==========================================
+
+            两种都不能要。3.14 那条是真的 fail-open:这道闸的语义是"确认没被
+            软删才放行",返回 ``False`` 等于把"我看不见"当成"它不存在",
+            已 purge 的用户被静默放行拿到本该拒掉的沙箱,而且不留任何说明是
+            权限问题的日志。3.12/3.13 那条不放行,但裸 ``PermissionError``
+            穿过整个 ``acquire`` 冒上去,归因不明。
+
+            ``pyproject.toml`` 的 ``requires-python = ">=3.12"`` 允许 3.14,
+            所以"今天生产跑 3.12"不构成理由——这与 ``NasWorkspaceStore``
+            里 ``Path.is_dir()`` 那处是同一个 pathlib 陷阱的第二个实例。
+
+            读不动本身也不是假想:``{tenant}/.deleted/`` 是 ``0o700``、属主
+            control-plane,而 uid 统一(spec § 六)之后、存量迁移 Job(Task D)
+            跑之前,它的属主还是旧 uid 10002 而本进程已经是 10000——正好读不动。
+            软删闸恰恰在那个窗口里最脆弱,而那个窗口是发布流程的一部分。
+
+            与本次改动的其余部分同一个主题:权限失败被吞成"东西不在"。这里的
+            "东西"是"这个用户被删过"这一事实。
+            """
+            try:
+                os.stat(marker)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise SandboxSupervisorError(
+                    f"workspace delete-marker unreadable for user {user_id} (tenant {tenant_id})"
+                ) from exc
+            return True
+
+        if await asyncio.to_thread(_marker_present):
             raise SandboxSupervisorError(
                 f"workspace deleted for user {user_id} (tenant {tenant_id})"
             )
