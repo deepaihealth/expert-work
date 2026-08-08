@@ -117,7 +117,7 @@ def _agent_sandbox_runtime(
     """``workspace_pv_name`` 默认从环境读,**没配就 skip**。
 
     ``workspace_root``(Task C 新增关键字,默认空串)—— 不从环境读、不影响
-    其余调用点的既有行为,只有 :func:`test_user_workspace_root_is_not_world_accessible`
+    其余调用点的既有行为,只有 :func:`test_agent_sandbox_workspace_root_is_not_world_accessible`
     显式传值。原因见下面那段"``workspace_root`` 仍然不配"——那段话描述的是
     这份契约档 *其余* 十八条用例的现状,不是这个参数本身的能力上限;那条新
     用例恰恰要验的是 ``workspace_root`` 配上之后 ``_prepare_workspace_mount``
@@ -238,7 +238,7 @@ def _agent_sandbox_workspace_store() -> WorkspaceStore:
     自己那份(沙箱侧预挂载 mkdir 用的 ``workspace_root`` 字段,GitHub runner
     对 NAS 没有 NFS 路由,配不了)。这里是完全独立的第二个消费者:
     control-plane 自己读工作区文件的客户端,只有这条用例和
-    :func:`test_user_workspace_root_is_not_world_accessible` 需要真机 NAS
+    :func:`test_agent_sandbox_workspace_root_is_not_world_accessible` 需要真机 NAS
     路由时才配,不改变其余十八条既有用例的行为。
     """
     root = os.environ.get("EXPERT_WORK_WORKSPACE_NAS_ROOT")
@@ -568,8 +568,16 @@ async def test_written_file_is_readable_by_the_control_plane_identity(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_user_workspace_root_is_not_world_accessible() -> None:
+async def test_agent_sandbox_workspace_root_is_not_world_accessible() -> None:
     """用户工作区根目录 mode 是 ``0o700``——other 档全零。
+
+    **名字里的 ``agent_sandbox`` 前缀是承重的,不是命名风格**:唯一带真
+    E2B 凭据的 CI job(``.github/workflows/sandbox-contract.yml``)用
+    ``-k agent_sandbox`` 选测试。本用例不走 parametrize(见下),名字里没有
+    这个子串就会被**静默 deselect**——比 skip 更坏,报告里连一行都不留。
+    改名前它在任何自动化路径上都跑不到:CI 选不中,而本机又没有 NAS 路由。
+    参照同文件已有的
+    ``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``。
 
     波 2 期间(``NasWorkspaceStore``/共享 gid 方案下)这里是 ``0o2770``/
     ``0o777``(group-/world-writable),靠 subPath 挂载范围做隔离,POSIX 位
