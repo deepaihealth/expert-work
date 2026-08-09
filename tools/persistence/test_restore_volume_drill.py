@@ -9,11 +9,13 @@ pulled bytes match.
 
 from __future__ import annotations
 
+import subprocess
 from uuid import UUID, uuid4
 
 import pytest
 from tools.persistence.restore_volume import (
     _format_new_volume_name,
+    _hydrate_volume_with_docker,
     _select_latest_archive_key,
     restore_latest_archive_to_volume,
     restore_volume_from_object,
@@ -132,3 +134,104 @@ async def test_restore_latest_archive_raises_when_no_artifact() -> None:
             backup_prefix="volume-backups",
             image="expert-work-sandbox:dev",
         )
+
+
+# --- 真 docker 档:hydrate 的能力集 -------------------------------------
+
+
+def _docker_available() -> bool:
+    try:
+        subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["docker", "info"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+@pytest.mark.integration
+def test_hydrate_preserves_non_root_ownership_and_modes() -> None:
+    """``_hydrate_volume_with_docker`` 必须把归档里 uid 10000 的属主与 mode 原样还原。
+
+    **为什么这条要用真 docker,不能靠断言 argv**:上面那批 drill 用例走的是
+    ``writer`` 回调路径,``_hydrate_volume_with_docker`` 一次都没被执行过——
+    所以「``--cap-drop ALL`` 之下 GNU tar 根本 chown 不了」这个缺陷在全绿的
+    套件下活了很久。断言 argv 里有没有某个 flag 只能锁住"我写的还是我写的",
+    锁不住"这组 flag 到底够不够 tar 用";这两者的差值正是这条缺陷本身。
+
+    **归档由真 GNU tar 造,不用 ``tarfile`` 手搓**,而且是生产那一条命令
+    (``docker_client.py:582`` 的 ``cd /ws && tar -czf - .``)。这一步是踩出
+    来的:手搓版第一版只放 ``sub/`` + ``sub/g.txt``,拿掉 ``--cap-add
+    FOWNER`` 照样绿——等于给缺陷发合格证;补上顶层条目之后又变成**连
+    baseline 都红**(``./sub/g.txt: Cannot open: Permission denied``),因为
+    ``tarfile`` 写出的目录条目与 GNU tar 的不同构,解包侧的延迟定权限逻辑
+    走了另一条路。两次都是"归档形状不对"而不是"被测代码不对"。让生产的
+    打包命令自己造归档,这类不同构就没有存在的余地。
+
+    树的四个条目各自承重:根 ``.``(属主 10000)与 ``sub``(``0700``)逼 tar
+    延迟定目录权限——否则 root 进不去自己刚交出去的目录,这是
+    ``DAC_OVERRIDE`` 用不上的原因;``f.txt``(``0644``)逼它在 chown 之后再
+    chmod 一个自己已经不是属主的文件,这是 ``FOWNER`` 用得上的原因;
+    ``sub/g.txt``(``0600``)确认嵌套层的属主与 mode 也原样落地。
+    """
+    if not _docker_available():
+        pytest.skip("docker 不可用")
+
+    payload = b"restored-bytes"
+    image = "debian:bookworm-slim"  # 与沙箱镜像同族(GNU tar,非 busybox tar)
+    built = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [  # noqa: S607
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            "mkdir -p /src/sub"
+            " && echo top-level > /src/f.txt"
+            f" && printf %s {payload.decode()} > /src/sub/g.txt"
+            " && chown -R 10000:10000 /src"
+            " && chmod 755 /src && chmod 644 /src/f.txt"
+            " && chmod 700 /src/sub && chmod 600 /src/sub/g.txt"
+            " && cd /src && tar -czf - .",  # 与 docker_client.py:582 逐字同形
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    volume = f"expert-work-restore-drill-{uuid4().hex[:12]}"
+    try:
+        _hydrate_volume_with_docker(new_volume_name=volume, blob=built.stdout, image=image)
+        probe = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [  # noqa: S607
+                "docker",
+                "run",
+                "--rm",
+                "--volume",
+                f"{volume}:/ws",
+                "--entrypoint",
+                "sh",
+                image,
+                "-c",
+                "stat -c '%a %u:%g %n' /ws /ws/f.txt /ws/sub /ws/sub/g.txt; cat /ws/sub/g.txt",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["docker", "volume", "rm", "-f", volume],  # noqa: S607
+            check=False,
+            capture_output=True,
+        )
+
+    assert "755 10000:10000 /ws\n" in probe.stdout, probe.stdout
+    assert "644 10000:10000 /ws/f.txt" in probe.stdout, probe.stdout
+    assert "700 10000:10000 /ws/sub" in probe.stdout, probe.stdout
+    assert "600 10000:10000 /ws/sub/g.txt" in probe.stdout, probe.stdout
+    assert payload.decode() in probe.stdout, probe.stdout

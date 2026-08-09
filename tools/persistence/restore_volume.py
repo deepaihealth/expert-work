@@ -134,7 +134,33 @@ def _hydrate_volume_with_docker(*, new_volume_name: str, blob: bytes, image: str
     Runs (1) ``docker volume create`` then (2) a throwaway ``docker
     run --rm`` that mounts the volume at ``/ws`` and pipes the tar.gz
     in on stdin via ``tar -xzf - -C /ws``. Hardened the same way as
-    the archive job: no network, read-only rootfs, all caps dropped.
+    the archive job: no network, read-only rootfs, every capability
+    dropped except the two GNU tar needs to restore ownership.
+
+    **Why ``CHOWN`` + ``FOWNER`` are added back.** Workspace archives
+    carry entries owned by the sandbox ``agent`` user (uid 10000), and
+    the extracting process here is the image's root. GNU tar running as
+    root defaults to ``--same-owner``, so it ``chown``s every entry —
+    which needs ``CAP_CHOWN`` — and then ``chmod``s entries it no longer
+    owns, which needs ``CAP_FOWNER``. With a bare ``--cap-drop ALL`` the
+    extraction dies partway with ``Cannot change ownership to uid
+    10000`` and exits 2, i.e. **restore never worked for any archive of
+    non-root content**. Measured on real GNU tar (Debian bookworm), an
+    archive holding a ``0700`` dir and a ``0600`` file:
+
+    * ``--cap-drop ALL``                     → exit 2, "Cannot change ownership"
+    * ``+ --cap-add CHOWN``                  → exit 2, "Cannot change mode"
+    * ``+ --cap-add CHOWN --cap-add FOWNER`` → exit 0, owner/modes exact
+
+    ``DAC_OVERRIDE`` is deliberately NOT added: GNU tar delays applying
+    directory permissions until it is done writing their children, so
+    root never has to descend into a ``0700`` dir it does not own. The
+    third row above is that claim's evidence — the archive it restores
+    contains exactly such a directory.
+
+    Dropping ``--same-owner`` instead is not an option: the restored
+    volume is mounted back into a sandbox running as uid 10000, so
+    root-owned files would be unusable.
     """
     # Operator-driven runbook tool; docker is expected on PATH.
     create_argv = ["docker", "volume", "create", new_volume_name]
@@ -149,6 +175,10 @@ def _hydrate_volume_with_docker(*, new_volume_name: str, blob: bytes, image: str
         "--read-only",
         "--cap-drop",
         "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "FOWNER",
         "--security-opt",
         "no-new-privileges",
         "--volume",
