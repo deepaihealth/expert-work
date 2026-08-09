@@ -138,11 +138,15 @@ async def test_restore_latest_archive_raises_when_no_artifact() -> None:
 
 # --- 真 docker 档:hydrate 的能力集 -------------------------------------
 
+#: 每个 docker 调用的上限。CI 的 integration job 没有 `--timeout`(unit job 有),
+#: 拉镜像卡住会一路挂到 job 的 25 分钟上限才被杀,现场只剩一句超时。
+_DOCKER_TIMEOUT_S = 180
+
 
 def _docker_available() -> bool:
     try:
-        subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["docker", "info"],  # noqa: S607
+        subprocess.run(
+            ["docker", "info"],
             check=True,
             capture_output=True,
             timeout=30,
@@ -150,6 +154,28 @@ def _docker_available() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return True
+
+
+def _stat_volume(*, volume: str, image: str, script: str) -> subprocess.CompletedProcess[str]:
+    """在卷上跑一段 stat 脚本,回读还原结果。"""
+    return subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--volume",
+            f"{volume}:/ws",
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            script,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_DOCKER_TIMEOUT_S,
+    )
 
 
 @pytest.mark.integration
@@ -171,19 +197,41 @@ def test_hydrate_preserves_non_root_ownership_and_modes() -> None:
     走了另一条路。两次都是"归档形状不对"而不是"被测代码不对"。让生产的
     打包命令自己造归档,这类不同构就没有存在的余地。
 
-    树的四个条目各自承重:根 ``.``(属主 10000)与 ``sub``(``0700``)逼 tar
-    延迟定目录权限——否则 root 进不去自己刚交出去的目录,这是
-    ``DAC_OVERRIDE`` 用不上的原因;``f.txt``(``0644``)逼它在 chown 之后再
-    chmod 一个自己已经不是属主的文件,这是 ``FOWNER`` 用得上的原因;
-    ``sub/g.txt``(``0600``)确认嵌套层的属主与 mode 也原样落地。
+    树里每个条目都在压一条具体的能力,不是凑数据:
+
+    * 根 ``.``(属主 10000)与嵌套 ``sub``(``0700``)—— 逼 tar 延迟定目录
+      权限。新卷上 root 全程是自己刚建那些目录的属主,这是 ``DAC_OVERRIDE``
+      在**首次**恢复里用不上的原因。
+    * ``f.txt``(``0644``)—— 逼它在 chown 之后再 chmod 一个自己已经不是属主
+      的文件:``FOWNER`` 的第一个理由。
+    * ``h.txt``(指向 ``f.txt`` 的硬链接)—— 逼它跨已经易主的 inode 建链接,
+      撞 ``fs.protected_hardlinks``:``FOWNER`` 的第二个理由,少了它报的是
+      ``Cannot hard link``,与 chmod 那条不同源。
+    * ``s.txt``(符号链接)—— symlink 的属主要靠 ``lchown``,与普通文件不同
+      的系统调用路径。
+    * ``sub/g.txt``(``0600``)—— 嵌套层的属主与 mode 也要原样落地。
+
+    **第二遍恢复(同一个卷再跑一次)单独断言。** ``_format_new_volume_name``
+    的默认 suffix 是 ``"manual"``,卷名是确定的;``docker volume create`` 对
+    已存在的名字 exit 0 不拦;而运行手册对"解包失败"给的处置就是重跑。三件
+    事叠起来,"半份内容 + 重跑"是真实事故里的主路径,而不是理论分支。这一遍
+    走的是 ``DAC_OVERRIDE``:目录此时已是 ``10000:10000 0700``,root 落进
+    other 权限类。少了它这一遍报 ``Cannot open: Permission denied``——**与
+    capability 缺陷同形**,正好会让刚打完补丁的 operator 误判成"补丁没生效"。
+
+    保真度缺口(知道且接受):镜像用 ``debian:bookworm-slim``,它没有 uid
+    10000 的 passwd 条目,所以造出的归档 ``uname``/``gname`` 为空、解包走纯
+    数字路径;生产归档在真沙箱镜像里造,tar 里记的是 ``agent/agent``,解包
+    默认先按名字解析再回落数字。同的是 tar 实现(GNU,非 busybox),不同的
+    是属主名解析路径。真镜像在 CI 上拉不到,没法消掉这个差。
     """
     if not _docker_available():
         pytest.skip("docker 不可用")
 
     payload = b"restored-bytes"
-    image = "debian:bookworm-slim"  # 与沙箱镜像同族(GNU tar,非 busybox tar)
-    built = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [  # noqa: S607
+    image = "debian:bookworm-slim"  # 见 docstring 末段:同的是 GNU tar,不是属主名解析
+    built = subprocess.run(
+        [
             "docker",
             "run",
             "--rm",
@@ -194,6 +242,8 @@ def test_hydrate_preserves_non_root_ownership_and_modes() -> None:
             "mkdir -p /src/sub"
             " && echo top-level > /src/f.txt"
             f" && printf %s {payload.decode()} > /src/sub/g.txt"
+            " && ln /src/f.txt /src/h.txt"
+            " && ln -s f.txt /src/s.txt"
             " && chown -R 10000:10000 /src"
             " && chmod 755 /src && chmod 644 /src/f.txt"
             " && chmod 700 /src/sub && chmod 600 /src/sub/g.txt"
@@ -201,37 +251,35 @@ def test_hydrate_preserves_non_root_ownership_and_modes() -> None:
         ],
         check=True,
         capture_output=True,
+        timeout=_DOCKER_TIMEOUT_S,
     )
 
+    stat_cmd = (
+        "stat -c '%a %u:%g %n' /ws /ws/f.txt /ws/sub /ws/sub/g.txt;"
+        " stat -c 'LINKS=%h' /ws/f.txt;"
+        " stat -Lc 'SYMLINK_OK=%n' /ws/s.txt;"
+        " cat /ws/sub/g.txt"
+    )
     volume = f"expert-work-restore-drill-{uuid4().hex[:12]}"
     try:
         _hydrate_volume_with_docker(new_volume_name=volume, blob=built.stdout, image=image)
-        probe = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            [  # noqa: S607
-                "docker",
-                "run",
-                "--rm",
-                "--volume",
-                f"{volume}:/ws",
-                "--entrypoint",
-                "sh",
-                image,
-                "-c",
-                "stat -c '%a %u:%g %n' /ws /ws/f.txt /ws/sub /ws/sub/g.txt; cat /ws/sub/g.txt",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        probe = _stat_volume(volume=volume, image=image, script=stat_cmd)
+        # 第二遍:同一个卷、同一份归档,模拟 operator 照手册重跑。
+        _hydrate_volume_with_docker(new_volume_name=volume, blob=built.stdout, image=image)
+        rerun = _stat_volume(volume=volume, image=image, script=stat_cmd)
     finally:
-        subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["docker", "volume", "rm", "-f", volume],  # noqa: S607
+        subprocess.run(
+            ["docker", "volume", "rm", "-f", volume],
             check=False,
             capture_output=True,
+            timeout=_DOCKER_TIMEOUT_S,
         )
 
-    assert "755 10000:10000 /ws\n" in probe.stdout, probe.stdout
-    assert "644 10000:10000 /ws/f.txt" in probe.stdout, probe.stdout
-    assert "700 10000:10000 /ws/sub" in probe.stdout, probe.stdout
-    assert "600 10000:10000 /ws/sub/g.txt" in probe.stdout, probe.stdout
-    assert payload.decode() in probe.stdout, probe.stdout
+    for label, out in (("首次", probe.stdout), ("重跑", rerun.stdout)):
+        assert "755 10000:10000 /ws\n" in out, f"{label}: {out}"
+        assert "644 10000:10000 /ws/f.txt" in out, f"{label}: {out}"
+        assert "700 10000:10000 /ws/sub" in out, f"{label}: {out}"
+        assert "600 10000:10000 /ws/sub/g.txt" in out, f"{label}: {out}"
+        assert "LINKS=2" in out, f"{label}: 硬链接没还原成同一个 inode — {out}"
+        assert "SYMLINK_OK=/ws/s.txt" in out, f"{label}: 符号链接没还原 — {out}"
+        assert payload.decode() in out, f"{label}: {out}"

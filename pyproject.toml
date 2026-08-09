@@ -123,6 +123,13 @@ ignore = []
 # pre-commit ruff flags every subprocess.run — ignore both rules by config so
 # inline noqa doesn't drift between the two versions.
 "infra/sandbox-image/smoke_payload.py" = ["S603", "S607"]
+# Volume-restore drill — same two-ruff-versions problem as smoke_payload.py
+# above, and it bites harder here: the pinned ruff narrows S603 to tainted
+# input, so `["docker", "info"]` needs no noqa and `ruff check --fix` DELETES
+# one written for it (RUF100), while the older pre-commit ruff then fails on
+# the very line the fix just stripped. Config-level ignore is the only stable
+# answer; inline noqa oscillates between the two.
+"tools/persistence/test_restore_volume_drill.py" = ["S603", "S607"]
 
 [tool.ruff.format]
 quote-style = "double"

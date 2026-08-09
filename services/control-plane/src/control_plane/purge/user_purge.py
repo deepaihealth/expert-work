@@ -177,6 +177,11 @@ async def _step[T](summary: PurgeSummary, name: str, coro: Awaitable[T], *, defa
     goes to the log above, which is not a response body. The same rule applies
     to the two hand-rolled ``except`` blocks in :func:`_purge_threads` — they
     record failures in the same dict and are just as visible.
+
+    One value in ``failures`` is deliberately **not** an exception type name:
+    ``failures["workspace"] = "no supervisor client wired"``, set on a
+    configuration branch where nothing was raised. It leaks nothing, but do
+    not write a consumer that parses these values as type names.
     """
     try:
         return await coro

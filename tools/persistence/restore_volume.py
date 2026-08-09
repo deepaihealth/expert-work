@@ -133,35 +133,61 @@ def _hydrate_volume_with_docker(*, new_volume_name: str, blob: bytes, image: str
 
     Runs (1) ``docker volume create`` then (2) a throwaway ``docker
     run --rm`` that mounts the volume at ``/ws`` and pipes the tar.gz
-    in on stdin via ``tar -xzf - -C /ws``. Hardened the same way as
-    the archive job: no network, read-only rootfs, every capability
-    dropped except the two GNU tar needs to restore ownership.
+    in on stdin via ``tar -xzf - -C /ws``.
 
-    **Why ``CHOWN`` + ``FOWNER`` are added back.** Workspace archives
+    **Hardening is the archive job's own constant, not a copy of it.**
+    ``_AUX_CONTAINER_HARDENING_ARGS`` (``sandbox_supervisor.docker_client``)
+    is what ``archive_volume`` uses to pack these very tarballs; this
+    function imports it and appends the two capabilities that unpacking
+    needs on top of packing. It used to be a hand-copied duplicate, and
+    the copy went stale the moment #1136 added ``DAC_OVERRIDE`` to the
+    original — copy drift is the same mechanism that produced the bug
+    this docstring documents, so the duplicate is gone.
+
+    **Why ``CHOWN`` + ``FOWNER`` are needed on top.** Workspace archives
     carry entries owned by the sandbox ``agent`` user (uid 10000), and
     the extracting process here is the image's root. GNU tar running as
     root defaults to ``--same-owner``, so it ``chown``s every entry —
-    which needs ``CAP_CHOWN`` — and then ``chmod``s entries it no longer
-    owns, which needs ``CAP_FOWNER``. With a bare ``--cap-drop ALL`` the
-    extraction dies partway with ``Cannot change ownership to uid
-    10000`` and exits 2, i.e. **restore never worked for any archive of
-    non-root content**. Measured on real GNU tar (Debian bookworm), an
-    archive holding a ``0700`` dir and a ``0600`` file:
+    which needs ``CAP_CHOWN`` — then ``chmod``s entries it no longer
+    owns and re-creates hard links across them, both of which need
+    ``CAP_FOWNER`` (the link half via ``fs.protected_hardlinks``).
+    Measured on the real sandbox image (GNU tar 1.35), an archive with
+    nested ``0700`` dirs, ``0600``/``0644`` files, a hard link and a
+    symlink:
 
-    * ``--cap-drop ALL``                     → exit 2, "Cannot change ownership"
-    * ``+ --cap-add CHOWN``                  → exit 2, "Cannot change mode"
-    * ``+ --cap-add CHOWN --cap-add FOWNER`` → exit 0, owner/modes exact
+    * ``--cap-drop ALL``    → exit 2, every entry "Cannot change ownership"
+    * ``+ CHOWN``           → exit 2, "Cannot change mode" + "Cannot hard link"
+    * ``+ CHOWN + FOWNER``  → exit 0, owner/modes exact
 
-    ``DAC_OVERRIDE`` is deliberately NOT added: GNU tar delays applying
-    directory permissions until it is done writing their children, so
-    root never has to descend into a ``0700`` dir it does not own. The
-    third row above is that claim's evidence — the archive it restores
-    contains exactly such a directory.
+    Note what the first row does **not** mean: the tree lands complete
+    with correct modes, only every entry stays ``root:root``, and then
+    tar exits 2. An operator chasing this reads the ``stat`` owner
+    column, not a list of missing files.
+
+    ``DAC_OVERRIDE`` (inherited from the shared constant) is what makes
+    the tool **re-runnable**. On a fresh volume it is unnecessary — GNU
+    tar delays applying directory ownership until it has written the
+    children, so root stays the owner of dirs it just created. On a
+    *second* pass over a half-restored volume those dirs are already
+    ``10000:10000 0700``, root's fsuid lands in the "other" class, and
+    tar's "temporarily OR in ``S_IRWXU``" workaround does not help
+    because ``S_IRWXU`` is the *owner* triad. Without it pass 2 fails
+    with ``Cannot open: Permission denied`` — **the same symptom as the
+    capability bug above**, which is exactly the wrong thing to hand an
+    operator who has just applied the capability fix. Re-running after a
+    partial failure is the documented recovery step
+    (``docs/runbooks/volume-restore.md``), so it has to work.
 
     Dropping ``--same-owner`` instead is not an option: the restored
     volume is mounted back into a sandbox running as uid 10000, so
     root-owned files would be unusable.
     """
+    # Imported lazily for the same reason ``_main`` does it: this module is
+    # a thin operator CLI and importing a service package at module scope
+    # would drag its settings/deps into every consumer (including the test
+    # module, which only wants this one function).
+    from sandbox_supervisor.docker_client import _AUX_CONTAINER_HARDENING_ARGS
+
     # Operator-driven runbook tool; docker is expected on PATH.
     create_argv = ["docker", "volume", "create", new_volume_name]
     subprocess.run(create_argv, check=True)  # noqa: S603
@@ -170,17 +196,13 @@ def _hydrate_volume_with_docker(*, new_volume_name: str, blob: bytes, image: str
         "run",
         "--rm",
         "-i",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
+        *_AUX_CONTAINER_HARDENING_ARGS,
+        # On top of packing: see the docstring. Order is irrelevant —
+        # docker resolves --cap-drop/--cap-add as sets.
         "--cap-add",
         "CHOWN",
         "--cap-add",
         "FOWNER",
-        "--security-opt",
-        "no-new-privileges",
         "--volume",
         f"{new_volume_name}:/ws",
         "--entrypoint",

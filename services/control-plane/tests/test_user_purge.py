@@ -619,6 +619,21 @@ class _FailingApprovalStore(InMemoryApprovalStore):
         raise RuntimeError(self.SECRET_IN_MESSAGE)
 
 
+class _FailingFeedbackStore(InMemoryFeedbackStore):
+    """``delete_for_threads`` always raises; drives the feedback best-effort branch.
+
+    Third of the three sites that write ``summary.failures`` (``_step`` plus
+    the two hand-rolled ``except`` blocks in ``_purge_threads``). Each needs
+    its own guard: they are separate literals, so one regressing does not make
+    the others' assertions fail.
+    """
+
+    SECRET_IN_MESSAGE = "open /mnt/workspaces/1a2b/feedback.db failed: uid=10000 mode=0600"
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        raise RuntimeError(self.SECRET_IN_MESSAGE)
+
+
 @pytest.mark.asyncio
 async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort() -> None:
     """``approvals.delete_for_threads`` raising —— failure is recorded under
@@ -633,6 +648,13 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     (recorded as ``failures["threads"]``, not ``failures["agent_approval"]``),
     and abort the function before the per-thread deletion loop below it ever
     runs — leaving ``threads_purged == 0``.
+
+    Both hand-rolled ``except`` blocks in ``_purge_threads`` (feedback and
+    approvals) are driven here rather than in two near-identical tests — the
+    deps fixture below is ~25 stores long and the two branches are
+    independent literals, so one regressing does not mask the other's
+    assertion. ``_step``, the third writer of ``summary.failures``, is guarded
+    at the real response boundary instead (``test_members_api.py``).
     """
     t1 = uuid4()
     threads = InMemoryThreadMetaStore()
@@ -647,7 +669,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
-    feedback = InMemoryFeedbackStore()
+    feedback = _FailingFeedbackStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
     token_usage = InMemoryTokenUsageStore()
     runs = InMemoryRunStore()
@@ -710,7 +732,10 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     # with its password). Equality, not a substring check: "does not contain
     # the secret" would still pass if the value grew some *other* leaked field.
     assert summary.failures["agent_approval"] == "RuntimeError"
-    assert _FailingApprovalStore.SECRET_IN_MESSAGE not in str(summary.as_dict())
+    assert summary.failures["feedback"] == "RuntimeError"
+    rendered = str(summary.as_dict())
+    assert _FailingApprovalStore.SECRET_IN_MESSAGE not in rendered
+    assert _FailingFeedbackStore.SECRET_IN_MESSAGE not in rendered
     # The rest of _purge_threads — which runs AFTER the approval-cleanup
     # block, in the same function — still executed: the thread row itself
     # was purged despite the approval-cleanup exception.
