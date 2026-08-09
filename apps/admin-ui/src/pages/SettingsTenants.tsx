@@ -7,7 +7,7 @@
  * (persisted by :func:`TenantScopeProvider`) and jumps to its per-tenant
  * config page, where config / quotas / credentials are edited.
  */
-import { useCallback, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useState } from "react";
 import { Alert, App, Button, Popconfirm, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Building } from "lucide-react";
@@ -80,10 +80,22 @@ export function SettingsTenants() {
     [message, t, reload],
   );
 
+  // The scope change and the navigation must land in ONE commit. Shell's
+  // ``useScopeRedirect`` fires on the scope edge and tests the *current*
+  // ``location.pathname`` against the new scope; if the scope commits while
+  // the path is still ``/settings/tenants`` (a platform-level page, not part
+  // of a single tenant's nav) it bounces to that scope's default page and
+  // clobbers the navigation below. react-router v7 wraps ``navigate`` in
+  // ``startTransition`` by default (v6's ``v7_startTransition`` future flag),
+  // so the urgent ``setScope`` would otherwise commit first, on its own.
+  // Putting both in the same transition makes the effect see the consistent
+  // pair. Same shape in ``TenantSwitcher.handleChange``.
   const manage = useCallback(
     (id: string) => {
-      setScope(id);
-      navigate("/settings/tenant-config");
+      startTransition(() => {
+        setScope(id);
+        navigate("/settings/tenant-config");
+      });
     },
     [setScope, navigate],
   );
