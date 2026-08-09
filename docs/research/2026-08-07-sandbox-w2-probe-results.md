@@ -298,3 +298,67 @@ symlink。
   新镜像(约 30 分钟)后才存在;用旧 tag 跑,沙箱侧挂载会照 § 一 的旧根因原样
   失败(`fork/exec ... operation not permitted`),不代表 W2 本身有问题,换新
   tag 步骤见运行手册「波 2 首发步骤」第 4 步。
+
+---
+
+## 十一、2026-08-09 W2-BUG-1 修复上线 + 真栈复验
+
+§ 十 的验收逮到的那条 Important(agent 用标准文件工具写的文件,用户列得出、
+下载 404)已修复上线。修法与理由见
+`docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md`(**§ 六**
+是最终方案:两侧统一 uid;§ 三的共享 gid 方案是被推翻的中间产物)。
+PR #1134,main `2c0b8f04`。
+
+### 发布链(顺序敏感,已执行)
+
+1. **NAS 存量迁移 Job** —— `chown -R 10000:10000` 每个顶层条目(根本身不碰,
+   保住 `1777` + sticky),用户目录 `0700`、leaf 文件 `0600`,`.deleted/` 只
+   改属主不改 mode。顺带清掉 W2 期间两次探针留下的 `_gidprobe` / `_chgrpprobe`。
+2. **`release.sh test --tag 2c0b8f04`** —— control-plane + admin-ui。
+3. **复验** —— `SMOKE PASS 9/9`。
+
+**这两步之间是全租户中断窗口**,实测印证:迁移跑完、新镜像还没上时,
+control-plane(彼时 uid 10002)对已经 chown 成 10000 的 `0700` 用户目录
+`find` 直接 exit 1。运行手册「存量迁移」一节把这条写成了可预期的后果而不是
+一句"按顺序执行"。
+
+**过程中的一个真实教训**:第一次 `release.sh` 挂在
+`no space left on device` —— Docker Desktop 的虚拟盘被 **87 GB 构建缓存**
+占满(宿主机本身还有 306 GB 空闲)。`docker builder prune -f` 回收 13.61 GB
+后即通过。**这一下正好卡在中断窗口中间**,让测试环境多坏了几分钟。
+发布前先看一眼 `docker system df`,比在窗口里救火便宜得多。
+
+### 逐项结果
+
+| # | 项 | 结果 |
+|---|---|---|
+| 1 | **`write_file` 写的 `0600` 文件 → 前端下载** | ✅ 200,28 字节逐字节一致(`bug1.txt`)。**这就是 BUG-1 的直接复现用例**——同一形态的文件昨天必然 404 |
+| 2 | 存量 `MEMORY.md` → 下载 | ✅ 200,内容完整。验的是迁移 Job(它是 § 十 里报 404 的那个文件本体) |
+| 3 | 反方向:agent `read_document` 读 control-plane 写的 `0600` 文档 | ✅ 魔术串原样读出 |
+| 4 | 前端删除 agent 写的文件 | ✅ 200,**且 NAS 上确认真的没了**——不是"报成功实际没删"(终审 N-1 修的正是那条) |
+| 5 | 软删闸 | ✅ marker 在 → 明确拒绝;删掉 marker → 恢复正常 |
+| 6 | control-plane 身份 | ✅ 两个副本都是 `uid=10000(expert_work)` |
+| 7 | NAS 全树 | ✅ 属主 10000;用户目录 `0700`、文件 `0600`;根仍 `1777 root:root` |
+| 8 | smoke | ✅ 9/9 |
+
+`world-writable` 从此退出 control-plane 侧的工作区树,两条此前被
+dismiss 的 CodeQL high 真消失。
+
+### 三条未尽事项(诚实记账)
+
+1. **那两条新契约用例本身仍未执行过。** 它们要一个能**同时**触达 NAS 与 E2B
+   的环境,CI runner 无 NFS 路由、本机无 E2B 凭据,都不满足,于是一直
+   `pytest.skip`(改名之前更糟:被 `-k agent_sandbox` 静默 deselect,报告里
+   连一行都不留)。**它们断言的两个事实这次都用别的方式实测了**——"写的文件
+   本进程读得回来"就是上表第 1 项,"工作区根非 world-accessible"就是第 7 项
+   ——但测试函数没跑过,不能算它们已经在守门。
+2. **沙箱镜像的 `umask 000` 仍在**,agent 自己 `mkdir`/`open` 出来的东西照旧
+   落 `0o666`/`0o777`。所以"world-writable 退场"**只对 control-plane 那一半
+   成立**。今天没有利用路径(subPath 限定 + 同 uid exec),是姿态不是洞。
+   收紧它要改沙箱镜像 + 等 CI 构建 + 换 SandboxSet tag,是独立一波——
+   原先以为能在验收窗口里捎带做掉,低估了。
+3. **临时沙箱的 `_scratch/<uuid>` 落地是 `0755`,不是设计里的 `0700`**(迁移
+   之后新建的也一样)。功能无碍(属主 10000,沙箱自己读写没问题,且 subPath
+   限定),但比设计宽一档。初判是「只 chmod 这次调用真正创建的目录」那条修复
+   (终审 I-1)与平台 subPath 预建撞在一起的后果:目录被平台先建出来,
+   `mkdir` 抛 `FileExistsError` → `created=False` → 跳过 chmod。待查证。
