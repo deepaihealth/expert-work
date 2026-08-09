@@ -18,7 +18,11 @@ import tarfile
 from typing import Protocol
 
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
-from expert_work.runtime.sandbox import SANDBOX_AGENT_GID, SANDBOX_AGENT_UID
+from expert_work.runtime.sandbox import (
+    AUX_CONTAINER_HARDENING_ARGS,
+    SANDBOX_AGENT_GID,
+    SANDBOX_AGENT_UID,
+)
 from sandbox_supervisor.runner_link import PipeRunnerLink, RunnerLink
 
 logger = logging.getLogger(__name__)
@@ -53,57 +57,13 @@ _READ_LIMIT = 4 * 1024 * 1024
 #: ``docker run`` argv prefix used to find leftover sandboxes on boot.
 _ORPHAN_NAME_PREFIX = "expert-work-sb-"
 
-#: Hardening flags shared by every throwaway aux container that touches a
-#: named volume (read/list/write/delete/measure/archive/chown) —
-#: network-isolated, read-only rootfs, capabilities dropped down to the one
-#: this whole class of container needs back, no privilege escalation.
-#: These are *not* the sandbox launch (that argv comes from the F.3
-#: ``SandboxRuntimeProvider``, W2 Task 6's ``--user``/tmpfs additions live
-#: there, not here) — each of these seven is a one-shot ``--rm`` container
-#: that mounts a volume at ``/ws`` and runs a single coreutils/python
-#: command, so it stays root (the image's ``docker run`` default since W2
-#: Task 9 dropped ``USER agent``) rather than the non-root sandbox
-#: identity; forcing ``--user`` here would risk it being unable to
-#: read/write a volume whose top-level ownership it doesn't control.
-#:
-#: ``--cap-add DAC_OVERRIDE`` restores root's normal ability to bypass the
-#: file-permission check — without it, root is bound by ordinary DAC rules
-#: same as any other uid, and ``--cap-drop ALL`` above already stripped
-#: that capability. This was invisible as long as the sandbox forced
-#: ``umask 000``/``os.umask(0)`` (``AgentSandboxClient.exec`` /
-#: ``runner.py``'s ``main()``): every file an agent wrote landed
-#: ``0o666``/``0o777``, so none of these six ops (the seventh,
-#: ``chown_volume``, is unrelated — see below) ever hit a DAC check they
-#: could fail. Now that umask is ``0o077`` (workspace-gid-sharing design
-#: § 六 — matches ``NasWorkspaceStore._DIR_MODE``/``_LEAF_FILE_MODE``,
-#: ``0o700``/``0o600``, owner-only, uid 10000 both sides), an agent's own
-#: files are owner-only and unreadable/unwritable to a capability-stripped
-#: root — this constant re-adds exactly the one capability that lets these
-#: aux containers keep doing their job against that tighter mode. Same
-#: pattern ``chown_volume`` already used one capability earlier: it needs
-#: ``CAP_CHOWN`` (which ``DAC_OVERRIDE`` does *not* imply — changing
-#: ownership is a separate check) and adds it back explicitly on top of
-#: this list (see its docstring); this is that same "list the docker
-#: default, then earn back only what's needed" shape, applied to the other
-#: six ops.
-#:
-#: Acceptable here specifically because every consumer of this constant is
-#: one-shot (``--rm``), ``--network none``, its own rootfs is
-#: ``--read-only`` (only the mounted volume is writable), and it runs
-#: exactly one coreutils/python command with no user-supplied code —
-#: ``CAP_DAC_OVERRIDE`` only ever gets to act on the single volume that one
-#: invocation mounted, for the lifetime of that one command.
-_AUX_CONTAINER_HARDENING_ARGS = [
-    "--network",
-    "none",
-    "--read-only",
-    "--cap-drop",
-    "ALL",
-    "--cap-add",
-    "DAC_OVERRIDE",
-    "--security-opt",
-    "no-new-privileges",
-]
+#: Re-exported under the module's historical private name so the seven aux
+#: volume ops below keep reading naturally. The constant itself — and the
+#: full argument for why ``DAC_OVERRIDE`` is acceptable, plus the list of
+#: consumers that argument covers — lives in ``expert_work.runtime.sandbox``
+#: (it is shared with ``tools/persistence/restore_volume.py``, which used to
+#: carry a hand-copied duplicate that went stale).
+_AUX_CONTAINER_HARDENING_ARGS = AUX_CONTAINER_HARDENING_ARGS
 
 
 class DockerError(RuntimeError):

@@ -786,8 +786,12 @@ async def test_purge_partial_cascade_records_purge_ok_false(
     member_id = await _invite_one(client, tenant_id)
     await _activate_with_data(app, tenant_id, member_id)
 
+    # Message shaped like the realistic leak: a driver connect error carrying
+    # the DSN, password included. Asserted absent from the response below.
+    secret_in_message = "connect failed: postgresql://purge:s3cr3t@rds-internal:5432/ew"
+
     async def _memory_boom(**_kwargs: object) -> int:
-        raise RuntimeError("forced memory purge failure (test)")
+        raise RuntimeError(secret_in_message)
 
     monkeypatch.setattr(app.state.memory_repo, "delete_all_for_user", _memory_boom)  # type: ignore[attr-defined]
 
@@ -798,6 +802,13 @@ async def test_purge_partial_cascade_records_purge_ok_false(
     assert data["data_purge_failed"] is False  # …and did not blow up as a whole
     assert data["purge"]["ok"] is False  # …but a store inside it failed
     assert "memory_item" in data["purge"]["failures"]
+    # Exception TYPE only, never str(exc) — and asserted HERE because this is
+    # the real leak boundary: a live HTTP response body, via purge_user's
+    # shared `_step` wrapper (the path ~20 steps go through). The unit test in
+    # test_user_purge.py only covers the two hand-rolled `except` blocks, so
+    # without this line a regression in `_step` itself stays green.
+    assert data["purge"]["failures"]["memory_item"] == "RuntimeError"
+    assert secret_in_message not in resp.text
 
     page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
     rows = [r for r in page.entries if r.action is AuditAction.MEMBER_PURGE]

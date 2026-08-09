@@ -610,8 +610,28 @@ class _FailingApprovalStore(InMemoryApprovalStore):
     follows in the same function must still run.
     """
 
+    #: Shaped like a real driver error — the realistic leak is a connect
+    #: failure whose message carries the DSN, password included. Asserted
+    #: absent from the response-visible summary below.
+    SECRET_IN_MESSAGE = "connect failed: postgresql://purge:s3cr3t@rds-internal:5432/ew"
+
     async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
-        raise RuntimeError("approval store unavailable")
+        raise RuntimeError(self.SECRET_IN_MESSAGE)
+
+
+class _FailingFeedbackStore(InMemoryFeedbackStore):
+    """``delete_for_threads`` always raises; drives the feedback best-effort branch.
+
+    Third of the three sites that write ``summary.failures`` (``_step`` plus
+    the two hand-rolled ``except`` blocks in ``_purge_threads``). Each needs
+    its own guard: they are separate literals, so one regressing does not make
+    the others' assertions fail.
+    """
+
+    SECRET_IN_MESSAGE = "open /mnt/workspaces/1a2b/feedback.db failed: uid=10000 mode=0600"
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        raise RuntimeError(self.SECRET_IN_MESSAGE)
 
 
 @pytest.mark.asyncio
@@ -628,6 +648,21 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     (recorded as ``failures["threads"]``, not ``failures["agent_approval"]``),
     and abort the function before the per-thread deletion loop below it ever
     runs — leaving ``threads_purged == 0``.
+
+    Both hand-rolled ``except`` blocks in ``_purge_threads`` (feedback and
+    approvals) are driven here rather than in two near-identical tests — the
+    deps fixture below is ~25 stores long. ``_step``, the third writer of
+    ``summary.failures``, is guarded at the real response boundary instead
+    (``test_members_api.py``).
+
+    **The two branches are not symmetric, so assertion order matters.**
+    Feedback cleanup runs first; if *its* guard is removed the exception
+    escapes ``_purge_threads`` entirely, the outer ``_step`` catches it as
+    ``failures["threads"]``, and the approvals block never executes — so a
+    feedback regression surfaces as the *approvals* assertion failing, with a
+    misleading message. Feedback is therefore asserted first, before anything
+    approvals-specific. (The reverse does not happen: removing the approvals
+    guard leaves feedback untouched.)
     """
     t1 = uuid4()
     threads = InMemoryThreadMetaStore()
@@ -642,7 +677,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
-    feedback = InMemoryFeedbackStore()
+    feedback = _FailingFeedbackStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
     token_usage = InMemoryTokenUsageStore()
     runs = InMemoryRunStore()
@@ -696,10 +731,22 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         tenant_id=t1, user_id=a.id, subject_id="subj-a", deps=deps, actor_id="admin"
     )
 
+    # Feedback first — see the docstring: its guard failing would also break
+    # every approvals assertion below, and the message would point at the
+    # wrong branch.
+    assert summary.failures["feedback"] == "RuntimeError"
     # Failure recorded under the specific step name, not just "threads" as a
     # whole — proves the inner try/except (not the outer _step) caught it.
     assert "agent_approval" in summary.failures
-    assert summary.failures["agent_approval"]
+    # Exception TYPE only — the message never reaches the response body. The
+    # summary is serialized straight into the purge response, and an exception
+    # message is arbitrary text from whichever layer raised it (here: a DSN
+    # with its password). Equality, not a substring check: "does not contain
+    # the secret" would still pass if the value grew some *other* leaked field.
+    assert summary.failures["agent_approval"] == "RuntimeError"
+    rendered = str(summary.as_dict())
+    assert _FailingApprovalStore.SECRET_IN_MESSAGE not in rendered
+    assert _FailingFeedbackStore.SECRET_IN_MESSAGE not in rendered
     # The rest of _purge_threads — which runs AFTER the approval-cleanup
     # block, in the same function — still executed: the thread row itself
     # was purged despite the approval-cleanup exception.
