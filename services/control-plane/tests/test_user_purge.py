@@ -610,8 +610,13 @@ class _FailingApprovalStore(InMemoryApprovalStore):
     follows in the same function must still run.
     """
 
+    #: Shaped like a real driver error — the realistic leak is a connect
+    #: failure whose message carries the DSN, password included. Asserted
+    #: absent from the response-visible summary below.
+    SECRET_IN_MESSAGE = "connect failed: postgresql://purge:s3cr3t@rds-internal:5432/ew"
+
     async def delete_for_threads(self, *, thread_ids: Sequence[UUID], tenant_id: UUID) -> int:
-        raise RuntimeError("approval store unavailable")
+        raise RuntimeError(self.SECRET_IN_MESSAGE)
 
 
 @pytest.mark.asyncio
@@ -699,7 +704,13 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     # Failure recorded under the specific step name, not just "threads" as a
     # whole — proves the inner try/except (not the outer _step) caught it.
     assert "agent_approval" in summary.failures
-    assert summary.failures["agent_approval"]
+    # Exception TYPE only — the message never reaches the response body. The
+    # summary is serialized straight into the purge response, and an exception
+    # message is arbitrary text from whichever layer raised it (here: a DSN
+    # with its password). Equality, not a substring check: "does not contain
+    # the secret" would still pass if the value grew some *other* leaked field.
+    assert summary.failures["agent_approval"] == "RuntimeError"
+    assert _FailingApprovalStore.SECRET_IN_MESSAGE not in str(summary.as_dict())
     # The rest of _purge_threads — which runs AFTER the approval-cleanup
     # block, in the same function — still executed: the thread row itself
     # was purged despite the approval-cleanup exception.

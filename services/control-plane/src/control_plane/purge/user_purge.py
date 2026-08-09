@@ -167,12 +167,22 @@ async def _step[T](summary: PurgeSummary, name: str, coro: Awaitable[T], *, defa
     worse than a re-run). The failure is logged (no request-derived value in the
     message — CodeQL py/log-injection) and surfaced in the summary; the caller
     can re-run to retry.
+
+    **The summary records the exception TYPE only, never ``str(exc)``.** The
+    summary is returned to the caller in the purge response body, and an
+    exception's message is arbitrary text from whatever layer raised it — a
+    driver's connect error carries the DSN (password included), a filesystem
+    error carries the absolute path, uid and mode. Step name + type is all the
+    operator needs to decide what to re-run; the full detail (with traceback)
+    goes to the log above, which is not a response body. The same rule applies
+    to the two hand-rolled ``except`` blocks in :func:`_purge_threads` — they
+    record failures in the same dict and are just as visible.
     """
     try:
         return await coro
     except Exception as exc:  # best-effort: never abort the purge
         logger.warning("purge_user.step_failed step=%s", name, exc_info=True)
-        summary.failures[name] = f"{type(exc).__name__}: {exc}"
+        summary.failures[name] = type(exc).__name__
         return default
 
 
@@ -215,7 +225,8 @@ async def _purge_threads(
         )
     except Exception as exc:  # best-effort, same failure-recording shape as _step
         logger.warning("purge_user.feedback_failed", exc_info=True)
-        summary.failures["feedback"] = f"{type(exc).__name__}: {exc}"
+        # Type only, never str(exc) — see _step's docstring.
+        summary.failures["feedback"] = type(exc).__name__
 
     # Approvals are keyed by thread, not user — the only writer (orchestrator
     # sse.py pause flow) stamps user_id=None on every row, so the per-user
@@ -226,7 +237,8 @@ async def _purge_threads(
         )
     except Exception as exc:
         logger.warning("purge_user.approvals_failed", exc_info=True)
-        summary.failures["agent_approval"] = f"{type(exc).__name__}: {exc}"
+        # Type only, never str(exc) — see _step's docstring.
+        summary.failures["agent_approval"] = type(exc).__name__
 
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)
