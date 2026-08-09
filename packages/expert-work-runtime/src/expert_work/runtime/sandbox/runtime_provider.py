@@ -49,6 +49,65 @@ SANDBOX_AGENT_GID = 10000
 #: for it, mirroring the image's own path.
 SANDBOX_AGENT_HOME = "/home/agent"
 
+#: Hardening flags shared by every throwaway aux container that touches a
+#: workspace volume — network-isolated, read-only rootfs, capabilities
+#: dropped down to the one this whole class of container needs back, no
+#: privilege escalation.
+#:
+#: **Consumers** (keep this list current — the acceptability argument at the
+#: bottom is a statement about the whole set, and the next person tightening
+#: it will reason from this list):
+#:
+#: * ``sandbox_supervisor.docker_client`` — seven one-shot volume ops
+#:   (read/list/write/delete/measure/archive/chown). ``chown_volume`` adds
+#:   ``CAP_CHOWN`` on top; see its docstring.
+#: * ``tools.persistence.restore_volume._hydrate_volume_with_docker`` — the
+#:   operator restore path. Adds ``CAP_CHOWN`` + ``CAP_FOWNER`` on top, and
+#:   unlike the others it feeds the container **archive bytes pulled from
+#:   ObjectStore** on stdin rather than a fixed coreutils argument.
+#:
+#: This is *not* the sandbox launch (that argv comes from
+#: :class:`SandboxRuntimeProvider`; W2 Task 6's ``--user``/tmpfs additions
+#: live there). Each consumer is a one-shot ``--rm`` container that mounts a
+#: volume at ``/ws`` and runs a single command, so it stays root (the image's
+#: ``docker run`` default since W2 Task 9 dropped ``USER agent``) rather than
+#: the non-root sandbox identity; forcing ``--user`` here would risk it being
+#: unable to read/write a volume whose top-level ownership it doesn't control.
+#:
+#: ``--cap-add DAC_OVERRIDE`` restores root's normal ability to bypass the
+#: file-permission check — without it root is bound by ordinary DAC rules
+#: like any other uid, because ``--cap-drop ALL`` above already stripped it.
+#: This was invisible as long as the sandbox forced ``umask 000`` /
+#: ``os.umask(0)``: every file an agent wrote landed ``0o666``/``0o777``, so
+#: no op ever hit a DAC check it could fail. Now that umask is ``0o077``
+#: (workspace-gid-sharing design § 六 — matches
+#: ``NasWorkspaceStore._DIR_MODE``/``_LEAF_FILE_MODE``, ``0o700``/``0o600``,
+#: owner-only, uid 10000 both sides), an agent's own files are unreadable to
+#: a capability-stripped root.
+#:
+#: Acceptable because every consumer is one-shot (``--rm``),
+#: ``--network none``, and its own rootfs is ``--read-only`` (only the
+#: mounted volume is writable): ``CAP_DAC_OVERRIDE`` only ever acts on the
+#: single volume that one invocation mounted, for the lifetime of that one
+#: command. Note this argument rests on the *mount set*, not on the command
+#: being fixed — the restore consumer's input is attacker-influenceable in
+#: principle (archive bytes), and is still bounded by the same one volume.
+#:
+#: Lives here rather than in ``docker_client`` because it had already been
+#: hand-copied into the restore tool once, and the copy went stale the moment
+#: ``DAC_OVERRIDE`` was added to the original.
+AUX_CONTAINER_HARDENING_ARGS = (
+    "--network",
+    "none",
+    "--read-only",
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "DAC_OVERRIDE",
+    "--security-opt",
+    "no-new-privileges",
+)
+
 
 @dataclass(frozen=True)
 class SandboxResourceLimits:

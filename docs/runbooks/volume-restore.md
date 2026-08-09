@@ -6,7 +6,7 @@
 > pipelines (`services/sandbox-supervisor/src/sandbox_supervisor/lifecycle.py`)
 > drop the source artifacts into ObjectStore for this script to pull.
 >
-> Drill: see `packages/expert-work-persistence/tests/test_volume_restore_drill.py`
+> Drill: see `tools/persistence/test_restore_volume_drill.py`
 > for the testcontainers integration test that exercises the same
 > library calls end-to-end.
 
@@ -139,10 +139,15 @@ incident, log it in the DR drill tracker (`backup_record` row +
 |-------|-------------|------------|
 | `no archive or backup found ...` | The artifact never landed (DLQ failure) | Check `volume_backup_dlq` table; manual replay if needed |
 | `subprocess.CalledProcessError ... tar -xzf`, with `Cannot change ownership to uid 10000` | The extract container is missing `CAP_CHOWN`/`CAP_FOWNER` — a regression in `_hydrate_volume_with_docker`'s capability set | Not an archive problem. The tree lands complete with correct modes but owned by `root:root`; check the `stat` owner column, not for missing files. See that function's docstring and `test_hydrate_preserves_non_root_ownership_and_modes` |
-| `subprocess.CalledProcessError ... tar -xzf`, other errors | Source archive corrupted | Try the prior day's J-29 backup |
+| `subprocess.CalledProcessError ... tar -xzf`, other errors | Source archive corrupted | Try the prior day's J-29 backup — **with a different `--suffix`**. Extraction is a union: whatever the failed run already wrote stays, so re-targeting the same volume with a *different* archive silently merges the two |
 | `ObjectStoreError` on pull | Credentials / endpoint mismatch | Re-check `EXPERT_WORK_SANDBOX_OBJECT_STORE_*` env |
 
-**Re-running is safe.** The volume name is deterministic (`<volume>_restored_<suffix>`, suffix defaults to `manual`) and `docker volume create` exits 0 on an existing name, so a second run extracts over whatever the first run left behind. That path is covered by the drill test's second pass — it is the reason the extract container keeps `DAC_OVERRIDE` (on a half-restored volume the directories are already `10000:10000 0700`, and root is no longer their owner). Pass `--suffix` if you want a side-by-side volume instead of overwriting.
+**Re-running the SAME archive is safe. Re-running a different one into the same volume merges them.**
+
+The volume name is deterministic (`<volume>_restored_<suffix>`, suffix defaults to `manual`) and `docker volume create` exits 0 on an existing name, so a second run extracts on top of whatever the first left behind. `tar -xzf` overwrites the entries it carries and **leaves everything else untouched** — it is a union, not a replacement.
+
+- Same archive, after a partial failure → safe, and covered by the drill test's second pass. This is why the extract container keeps `DAC_OVERRIDE`: on a half-restored volume the directories are already `10000:10000 0700` and root is no longer their owner.
+- Different archive (e.g. falling back to the prior day per the table above) → **pass a distinct `--suffix`**. Otherwise the result is both archives merged, and Step 3's checks won't catch it: they look for the files the user reported missing and compare total size, neither of which flags *extra* files carried over from the failed attempt. Promoting that volume in Step 4 makes the merge permanent.
 
 > A row previously listed here claimed `docker volume create` raises on a name collision. It does not — it exits 0. Removed rather than reworded: nothing raises there.
 

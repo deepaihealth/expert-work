@@ -651,10 +651,18 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
 
     Both hand-rolled ``except`` blocks in ``_purge_threads`` (feedback and
     approvals) are driven here rather than in two near-identical tests — the
-    deps fixture below is ~25 stores long and the two branches are
-    independent literals, so one regressing does not mask the other's
-    assertion. ``_step``, the third writer of ``summary.failures``, is guarded
-    at the real response boundary instead (``test_members_api.py``).
+    deps fixture below is ~25 stores long. ``_step``, the third writer of
+    ``summary.failures``, is guarded at the real response boundary instead
+    (``test_members_api.py``).
+
+    **The two branches are not symmetric, so assertion order matters.**
+    Feedback cleanup runs first; if *its* guard is removed the exception
+    escapes ``_purge_threads`` entirely, the outer ``_step`` catches it as
+    ``failures["threads"]``, and the approvals block never executes — so a
+    feedback regression surfaces as the *approvals* assertion failing, with a
+    misleading message. Feedback is therefore asserted first, before anything
+    approvals-specific. (The reverse does not happen: removing the approvals
+    guard leaves feedback untouched.)
     """
     t1 = uuid4()
     threads = InMemoryThreadMetaStore()
@@ -723,6 +731,10 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         tenant_id=t1, user_id=a.id, subject_id="subj-a", deps=deps, actor_id="admin"
     )
 
+    # Feedback first — see the docstring: its guard failing would also break
+    # every approvals assertion below, and the message would point at the
+    # wrong branch.
+    assert summary.failures["feedback"] == "RuntimeError"
     # Failure recorded under the specific step name, not just "threads" as a
     # whole — proves the inner try/except (not the outer _step) caught it.
     assert "agent_approval" in summary.failures
@@ -732,7 +744,6 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     # with its password). Equality, not a substring check: "does not contain
     # the secret" would still pass if the value grew some *other* leaked field.
     assert summary.failures["agent_approval"] == "RuntimeError"
-    assert summary.failures["feedback"] == "RuntimeError"
     rendered = str(summary.as_dict())
     assert _FailingApprovalStore.SECRET_IN_MESSAGE not in rendered
     assert _FailingFeedbackStore.SECRET_IN_MESSAGE not in rendered

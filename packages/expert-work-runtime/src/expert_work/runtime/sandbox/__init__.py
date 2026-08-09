@@ -6,6 +6,9 @@ single config knob via :func:`make_sandbox_runtime_provider`.
 """
 
 from expert_work.runtime.sandbox.runtime_provider import (
+    AUX_CONTAINER_HARDENING_ARGS as AUX_CONTAINER_HARDENING_ARGS,
+)
+from expert_work.runtime.sandbox.runtime_provider import (
     DEFAULT_EGRESS_NETWORK as DEFAULT_EGRESS_NETWORK,
 )
 from expert_work.runtime.sandbox.runtime_provider import (
@@ -31,6 +34,7 @@ from expert_work.runtime.sandbox.runtime_provider import (
 )
 
 __all__ = [
+    "AUX_CONTAINER_HARDENING_ARGS",
     "DEFAULT_EGRESS_NETWORK",
     "DEFAULT_RESOURCE_LIMITS",
     "SANDBOX_AGENT_GID",
