@@ -8,7 +8,7 @@ pandas==3.0.5          # tabular data / xlsx+csv analysis
 openpyxl==3.1.5        # .xlsx read/write
 python-docx==1.2.0     # .docx read/write
 python-pptx==1.0.2     # .pptx read/write
-pypdf==6.14.2           # PDF read / merge / split
+pypdf==6.15.0           # PDF read / merge / split
 pdfplumber==0.11.10    # PDF text + table extraction
 # PDF *generation* (the read libs above can't author a PDF). markdown→HTML→PDF
 # is the de-facto report path; weasyprint renders HTML+CSS → PDF and picks up
