@@ -15,7 +15,7 @@
  */
 import { Select, Tag } from "antd";
 import { Globe2, Building2 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
@@ -50,8 +50,15 @@ export function TenantSwitcher() {
   const handleChange = useCallback(
     (next: TenantScopeValue) => {
       if (next === scope) return;
-      setScope(next);
-      navigate(defaultPathForScope(next, isSystemAdmin));
+      // One commit for the pair — see the comment in
+      // ``SettingsTenants.manage``. Here the navigation target happens to
+      // equal what ``useScopeRedirect`` would bounce to, so a split commit
+      // merely double-navigates instead of landing somewhere wrong; that is
+      // luck, not design, and it is why no test caught the same shape here.
+      startTransition(() => {
+        setScope(next);
+        navigate(defaultPathForScope(next, isSystemAdmin));
+      });
     },
     [scope, setScope, navigate, isSystemAdmin],
   );

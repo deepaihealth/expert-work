@@ -35,7 +35,7 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-i18next": "^15.4.0",
-    "react-router-dom": "^6.28.1"
+    "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
@@ -63,7 +63,7 @@
       "form-data": ">=4.0.6 <5",
       "dompurify": ">=3.4.11 <4",
       "@babel/core": ">=7.29.6 <8",
-      "react-router": ">=6.30.4 <7",
+      "react-router": ">=7.18.2 <8",
       "uuid": ">=11.1.1 <12",
       "brace-expansion": ">=2.1.2 <3",
       "fast-uri": ">=3.1.5 <4",
