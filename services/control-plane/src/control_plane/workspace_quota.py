@@ -19,6 +19,21 @@
 径用 :meth:`note_written` 做增量记账,:meth:`refresh_soon` 是防抖过的
 fire-and-forget 触发入口。``user_workspace.size_limit_bytes`` 列不读——那
 是 supervisor(波 1/2 冻结路径)专用的字段,本闸完全绕开它。
+
+## capacity 与 lifecycle 分离(评审裁决)
+
+:meth:`~expert_work.persistence.workspace.base.UserWorkspaceStore.resolve`
+的契约明确写着"soft-deleted 行仍会被返回——软删的强制执行是调用方的事,
+调用方必须自己检查 ``deleted_at``"。本 service 故意**不**对所有四个方法一
+律加这层检查,而是按 capacity(闸)/lifecycle(生命周期)分开裁决:
+
+* :meth:`check` / :meth:`check_upload` —— **不**做软删闸。这两个是纯容量
+  判断;lifecycle 语义已经分别由 acquire 路径自己的 soft-delete marker 闸
+  (``AgentSandboxClient``)和上传路径自己的闸各自拥有,配额闸重复判一次
+  只会制造两个真相源。
+* :meth:`refresh` / :meth:`note_written` —— **会**检查:命中
+  ``ws.deleted_at is not None`` 时直接 return,不碰这一行。这两个是写路
+  径(重算 / 记账),待归档的行不该再被这两条路径写。
 """
 
 from __future__ import annotations
@@ -89,16 +104,26 @@ class WorkspaceQuotaService:
             raise WorkspaceQuotaExceededError("user workspace is over its storage quota")
 
     async def note_written(self, *, tenant_id: UUID, user_id: UUID, delta_bytes: int) -> None:
-        """写入成功后的增量记账 —— resolve(建行) + ``add_size``。"""
+        """写入成功后的增量记账 —— resolve(建行) + ``add_size``。
+
+        软删(``deleted_at is not None``)行直接 return,不记账——见模块
+        docstring"capacity 与 lifecycle 分离"一节。
+        """
         ws = await self._user_workspaces.resolve(tenant_id=tenant_id, user_id=user_id)
+        if ws.deleted_at is not None:
+            return
         await self._user_workspaces.add_size(workspace_id=ws.id, delta_bytes=delta_bytes)
 
     async def refresh(self, *, tenant_id: UUID, user_id: UUID) -> None:
         """对该用户的 NAS 目录做一次 ``du`` 重算,写回 ``update_size``。
 
         无防抖 —— janitor 扫描 / 测试直调走这里;高频路径走
-        :meth:`refresh_soon`。
+        :meth:`refresh_soon`。软删(``deleted_at is not None``)行直接
+        return,不重算——见模块 docstring"capacity 与 lifecycle 分离"一节。
         """
+        ws = await self._user_workspaces.resolve(tenant_id=tenant_id, user_id=user_id)
+        if ws.deleted_at is not None:
+            return
         root = workspace_user_root(self._workspace_root, tenant_id, user_id)
 
         def _du() -> int:
@@ -118,13 +143,18 @@ class WorkspaceQuotaService:
                             else:
                                 total += st.st_size
                 except FileNotFoundError:
-                    return 0 if d == root else total
+                    # 根目录本身不存在(用户还没写过任何东西)—— 0。非 root
+                    # 子目录在遍历中途消失(NAS 并发写删的常态)—— 跳过它,
+                    # 继续扫栈上其余兄弟目录;绝不能提前 return,否则会静默
+                    # 丢掉还没扫的目录,少算配额(评审 Important-1)。
+                    if d == root:
+                        return 0
+                    continue
                 except OSError:
                     continue
             return total
 
         size = await asyncio.to_thread(_du)
-        ws = await self._user_workspaces.resolve(tenant_id=tenant_id, user_id=user_id)
         await self._user_workspaces.update_size(workspace_id=ws.id, size_bytes=size)
 
     def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
