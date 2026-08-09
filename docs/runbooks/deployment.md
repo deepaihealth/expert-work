@@ -210,6 +210,78 @@ python tools/deploy/rollback.py --to-tag v1.2.2  # 兜底路径
 - [ ] 第一个 `system_admin` 能登录(§7)。
 - [ ] Grafana SLO 大盘([slo.md](./slo.md))有数据;Langfuse 有 trace。
 - [ ] 起一个 canonical agent 跑通最小对话(Gate 验收见 [canonical-agent-e2e-test.md](./canonical-agent-e2e-test.md))。
+- [ ] **改动触及工作区权限 / NAS / 沙箱 exec 时**:在集群内跑一次 agent_sandbox 契约档(下一节),CI 那两条跳过的用例只有这里跑得到。
+
+### 11.1 集群内补跑 agent_sandbox 契约档(CI 跑不全的那两条)
+
+CI 的「Contract suite against the real E2B test cluster」跑在 GitHub runner 上,**没有到 NAS 的 NFS 路由**,所以 `EXPERT_WORK_WORKSPACE_NAS_ROOT` 不配,两条用例恒 `SKIPPED`:
+
+| 用例 | 它钉的是什么 |
+|---|---|
+| `test_written_file_is_readable_by_the_control_plane_identity` | W2-BUG-1 的回归测试——沙箱写的 `0o600` 文件,control-plane 用生产同一个 `WorkspaceStore` 读得回来 |
+| `test_agent_sandbox_workspace_root_is_not_world_accessible` | control-plane 侧 `_ensure_workspace_dir` 的 mkdir+chmod 在 NAS 上真落成 `0o700` |
+
+这两条恰好是 BUG-1 逃过 19/19 全绿的那个洞的补丁(原套件写读同进程同身份),**skip 着等于那个 bug 能原样回来**。集群内补跑一次:
+
+```bash
+export KUBECONFIG=~/.kube/expert-work-test.yaml
+TAG=$(kubectl -n expert-work get deploy control-plane \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')
+
+# 1. 一次性 pod:与 control-plane 同镜像同 uid(10000)、同 envFrom、同 NAS 挂载。
+#    envFrom 取集群里现成的 config+secret,E2B 凭据/DSN 因此不经过命令行也不落盘。
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: contract-run, namespace: expert-work}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: run
+      image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:${TAG}
+      command: ["sleep", "7200"]
+      envFrom:
+        - configMapRef: {name: control-plane-config}
+        - secretRef: {name: control-plane-secrets}
+      volumeMounts:
+        - {name: workspace-nas, mountPath: /mnt/workspaces}
+  volumes:
+    - name: workspace-nas
+      persistentVolumeClaim: {claimName: workspace-nas}
+EOF
+kubectl -n expert-work wait --for=condition=Ready pod/contract-run --timeout=180s
+
+# 2. pytest 离线装。镜像是 `uv sync --no-dev` 构建的,不带 pytest;
+#    集群 VPC 到 PyPI 的连通性不做假设(docker.io 就是不通的),所以从本机
+#    带纯 Python wheel 进去解包挂 PYTHONPATH,不装、不联网。
+mkdir -p /tmp/w && python3 -m pip download -d /tmp/w --only-binary=:all: \
+  --python-version 3.12 --platform any --no-deps \
+  pytest pytest-asyncio pluggy iniconfig packaging
+
+# 3. 测试文件放回原有目录深度——文件里 `Path(__file__).resolve().parents[3]`
+#    要解析成仓库根,放平了那几条读源码的漂移用例会指向错地方。
+kubectl -n expert-work exec contract-run -- mkdir -p /tmp/repo/services/orchestrator/tests /tmp/pylibs
+kubectl -n expert-work cp services/orchestrator/tests/test_sandbox_runtime_contract.py \
+  contract-run:/tmp/repo/services/orchestrator/tests/test_sandbox_runtime_contract.py
+kubectl -n expert-work cp /tmp/w contract-run:/tmp/wheels
+kubectl -n expert-work exec contract-run -- \
+  sh -c 'for f in /tmp/wheels/w/*.whl; do python -m zipfile -e "$f" /tmp/pylibs; done'
+
+# 4. 跑。`-o asyncio_mode=auto` 是手给的——pod 里没有仓库的 pyproject.toml,
+#    pytest 读不到 [tool.pytest.ini_options]。`-k agent_sandbox` 与 CI 同筛,
+#    supervisor 档在集群里没有后端可连。
+kubectl -n expert-work exec contract-run -- sh -c \
+  'cd /tmp/repo && PYTHONPATH=/tmp/pylibs python -m pytest \
+     services/orchestrator/tests/test_sandbox_runtime_contract.py \
+     -k agent_sandbox -v -o asyncio_mode=auto -p no:cacheprovider \
+     --import-mode=importlib -W ignore::pytest.PytestUnknownMarkWarning'
+
+kubectl -n expert-work delete pod contract-run --wait=false
+```
+
+**期望:`21 passed, 28 deselected`,零 skip。** CI 上是 `19 passed, 2 skipped` —— 差的就是上表两条。任何一条变回 SKIPPED,说明 `EXPERT_WORK_WORKSPACE_NAS_ROOT` 没生效(它来自 `control-plane-config`,pod 少了 `envFrom` 就会静默跳过而不是报错)。
+
+首次执行 2026-08-09(control-plane `d640a8b7`),21/21,耗时 3 分 13 秒。
 
 ## 12. 可观测性栈
 

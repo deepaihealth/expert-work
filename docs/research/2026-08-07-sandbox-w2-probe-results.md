@@ -346,6 +346,10 @@ dismiss 的 CodeQL high 真消失。
 
 ### 三条未尽事项(诚实记账)
 
+> **三条全部已结案,处置见 § 十二**(1 → 集群内跑通 21/21;2 → PR #1136 已上线;
+> 3 → 不是缺陷,是契约测试的产物;这一条我先后判错两次,§ 十二 里两次都记了)。
+> 下面保留写下时的原文,不改。
+
 1. **那两条新契约用例本身仍未执行过。** 它们要一个能**同时**触达 NAS 与 E2B
    的环境,CI runner 无 NFS 路由、本机无 E2B 凭据,都不满足,于是一直
    `pytest.skip`(改名之前更糟:被 `-k agent_sandbox` 静默 deselect,报告里
@@ -362,3 +366,86 @@ dismiss 的 CodeQL high 真消失。
    限定),但比设计宽一档。初判是「只 chmod 这次调用真正创建的目录」那条修复
    (终审 I-1)与平台 subPath 预建撞在一起的后果:目录被平台先建出来,
    `mkdir` 抛 `FileExistsError` → `created=False` → 跳过 chmod。待查证。
+
+## 十二、2026-08-09 扫尾:umask 收紧上线 + 那两条契约用例第一次真跑
+
+§ 十一 末尾记的三条未尽事项,到这里全部落定。
+
+### 第 2 条(沙箱 `umask 000`)—— 已修上线
+
+PR #1136(main `d640a8b7`),两处改动**必须捆在一起**:exec 路径 umask
+`000` → `077`,同时给 supervisor 的 root 辅助容器加回 `--cap-add
+DAC_OVERRIDE`。单独收紧 umask 会让本地后端读不动 `0o600`,把 BUG-1 在
+supervisor 那一档咬得更狠。
+
+发布:`release.sh test --images control-plane`(只有 control-plane 需要换
+——`runner.py` 那半边对 E2B 后端是惰性的,envd 不 fork/exec 它,**不需要
+换 SandboxSet tag**)。`SMOKE PASS 9/9`。
+
+发布前按 § 十一 的教训先看了 `docker system df`:构建缓存 3.4 GB、盘剩
+65 GB,没有重演上次那场窗口内救火。
+
+### 第 1 条(两条契约用例从未执行)—— 已执行,21/21
+
+在集群内起一次性 pod 跑,配方原样写进
+[`docs/runbooks/deployment.md` § 11.1](../runbooks/deployment.md)。要点:与
+control-plane 同镜像同 uid(10000)、同 `envFrom`(E2B 凭据/DSN 因此不经过
+命令行也不落盘)、同 NAS 挂载;pytest 从本机带纯 Python wheel 进去解包挂
+`PYTHONPATH`(镜像是 `uv sync --no-dev` 构建的不带 pytest,而集群 VPC 到
+PyPI 的连通性不做假设——docker.io 就是不通的)。
+
+```
+21 passed, 28 deselected in 193.16s
+```
+
+CI 同一档是 `19 passed, 2 skipped` —— 差的正是这两条:
+
+- `test_written_file_is_readable_by_the_control_plane_identity[agent_sandbox]` **PASSED**
+- `test_agent_sandbox_workspace_root_is_not_world_accessible` **PASSED**
+
+**这不只是补跑一次。** 这两条是 BUG-1 逃过 19/19 全绿那个洞的补丁(原套件写
+和读永远同进程同身份),它们 skip 着,等于那个 bug 能原样悄悄回来。现在它们
+在真 NAS + 真 E2B 上验过,且有一条可重复的命令。
+
+不足要说清楚:**这仍是手动闸,不是 CI 闸**。要让它自动化,得有一个能触达 NAS
+的 runner(集群内自建 runner 或把契约档做成 K8s Job),投入远超当下收益,没做。
+runbook 里因此把它挂在「改动触及工作区权限 / NAS / 沙箱 exec 时」这个条件上,
+而不是每次发布都跑。
+
+### 第 3 条(`_scratch` 0755)—— 不是缺陷,是契约测试的产物
+
+这一条我判错过两次,两次的错法相反,都记下来。
+
+**第一次**(§ 十一 原文):记成「比设计宽一档,初判是 I-1 那条修复与平台 subPath
+预建撞在一起」,挂"待查证"。
+
+**第二次**(2026-08-08 当场):我改口说第一次是错的,理由是"那 11 个目录全部创建
+于发布中断窗口 01:41–01:42,是旧 pod 造的残骸"。**这一次错得更彻底**——我把
+"时间上有条边界"当成了"边界两侧成因不同",而那条边界另有出处:**存量迁移 Job
+把当时已存在的每个目录都 chmod 成了 `0700`**。所以窗口之前的一律 700,不是因为
+它们是好目录,是因为它们被统一刷过。边界是迁移刷出来的,不是 pod 换代刷出来的。
+
+**真机制**(这次有全量时间轴 + 属主佐证):分野不是"什么时候建的",是**"谁建的"**。
+
+| 建的人 | 前提 | 落地 |
+|---|---|---|
+| control-plane `_ensure_workspace_dir` | `EXPERT_WORK_WORKSPACE_NAS_ROOT` 已配 | `0700`,属主 `expert_work` |
+| 平台 CSI subPath 自动创建 | `workspace_root` **没配** → 整段 `_ensure_workspace_dir` 跳过 | `0755`,租户层常见 `root:root` |
+
+契约测试的 19 条走 `_agent_sandbox_runtime()`,**不传 `workspace_root`**,所以走
+第二行;只有两条 NAS 用例显式传了,走第一行。同一次运行、同一分钟的两个目录因此
+一个 755 一个 700(05:00 的 `75170c9c/…` 是 755,`4adc4188/…` 是 700),这在
+`test_agent_sandbox_workspace_root_is_not_world_accessible` 自己的 docstring 里
+早就写着:「少了它,目录改由平台建(`root:root 0755`)」。
+
+生产上 control-plane 的 `control-plane-config` 恒带
+`EXPERT_WORK_WORKSPACE_NAS_ROOT=/mnt/workspaces`,永远走第一行——05:00 那个
+`0700` 就是**当前线上代码**在真 NAS 上的产物,直接证据。
+
+**结论:`_scratch` 下的 755 是契约测试留的产物,不是生产状态,也不是缺陷。**
+留在测试集群上无害(属主 10000、subPath 限定),没清。
+
+**教训**:「按时间轴查」这一步我做对了,**"读出因果"这一步做错了**——时间轴上
+有边界不等于边界解释了成因,先要问"有没有别的东西也正好在这个时刻扫过所有数据"。
+这次真正把它定死的是**属主**这个第二维度(`root:root` vs `expert_work`),单看
+mode 和时间戳,两个互相矛盾的故事都能讲得通。
