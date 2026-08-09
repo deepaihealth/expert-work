@@ -130,39 +130,41 @@ def main(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> None:
     The leading ``{"ready": true}`` line lets the supervisor confirm the
     runner booted (the acquire-time health check) before sending code.
 
-    Task 4 review Critical follow-up (originally added for a cross-uid write
-    conflict, sandbox migration wave 2): sets this process's umask to ``0``
-    before serving any request. A process's umask is inherited by every
-    child it fork/execs, so this one call covers every ``run_once`` →
-    ``subprocess.run`` child for the runner's whole lifetime — the submitted
-    code's own ``mkdir``/``open`` calls (Python ``os.mkdir`` or a
-    shelled-out ``mkdir -p``) would otherwise land at the *default* umask
-    (commonly ``0o022``), producing e.g. ``0o755`` directories / ``0o644``
-    files.
+    Sets this process's umask to ``0o077`` before serving any request. A
+    process's umask is inherited by every child it fork/execs, so this one
+    call covers every ``run_once`` → ``subprocess.run`` child for the
+    runner's whole lifetime — without it, the submitted code's own
+    ``mkdir``/``open`` calls (Python ``os.mkdir`` or a shelled-out
+    ``mkdir -p``) would land at the sandbox's *default* umask (commonly
+    ``0o022``), producing ``0o755`` directories / ``0o644`` files —
+    group/other-readable, wider than this workspace's owner-only target.
+    ``0o077`` clears every group/other bit, matching
+    ``NasWorkspaceStore._DIR_MODE`` / ``_LEAF_FILE_MODE`` (``0o700`` /
+    ``0o600`` — see ``orchestrator/tools/nas_workspace_store.py``), the
+    workspace's own settled target mode now that control-plane and this
+    sandbox's agent run as the same uid (workspace-gid-sharing design § 六).
 
-    **The reason this was originally added no longer holds after the
-    direction change to a unified uid** (workspace-gid-sharing design § 六:
-    shared gid → same uid on both sides). It used to matter because
-    control-plane read/wrote/deleted through the NAS-mounted workspace as a
-    *different* uid than this sandbox's agent — a mode masked down to
-    ``0o755``/``0o644`` by the default umask still let control-plane
-    ``read``/``list`` (the "other" bits still grant ``r-x``) but not delete
-    or overwrite, a gap that stayed invisible until a user tried exactly
-    that. Now that control-plane and this sandbox's agent share one uid,
-    owner bits alone are enough on both sides — this ``umask 0`` is a
-    **safe superset** (strictly wider than the ``0o700``/``0o600`` the
-    owner-only NAS-side directories/files now use, see
-    ``AgentSandboxClient._ensure_workspace_dir`` and ``_openat_dir``/
-    ``NasWorkspaceStore.write_file`` in ``orchestrator/tools/
-    agent_sandbox.py`` / ``nas_workspace_store.py``), not wrong, just no
-    longer minimal. Tightening it needs a live-cluster verification pass
-    this task didn't budget for — left as a follow-up, not touched here.
-    Still must agree with this repo's ``AgentSandboxClient.exec`` and its
-    same ``umask 000 &&`` prefix on the cloud (E2B) backend — both backends
-    must stay in lockstep or one of them silently reopens this exact hole
-    (contract-tested for parity in ``test_sandbox_runtime_contract.py``).
+    History, so nobody reintroduces ``umask 0``: this used to be
+    ``os.umask(0)`` (fully permissive, ``0o777``/``0o666``), added to paper
+    over a *cross-uid* write conflict from before the uid-unification
+    direction change — control-plane and this sandbox's agent were
+    different uids, and a mode masked to ``0o755``/``0o644`` by the default
+    umask still let control-plane ``read``/``list`` but not delete or
+    overwrite an agent-written file. That premise is gone: same uid means
+    owner bits alone are enough on both sides, so there is no longer a
+    reason to leave files group/other-writable at all — hence ``0o077``,
+    not merely "less than 0". This must still agree with this repo's
+    ``AgentSandboxClient.exec`` and its ``umask 077 &&`` prefix on the cloud
+    (E2B) backend — both backends stay in lockstep or one of them silently
+    reopens this exact hole (contract-tested for parity in
+    ``test_sandbox_runtime_contract.py``). It also depends on
+    ``sandbox_supervisor.docker_client._AUX_CONTAINER_HARDENING_ARGS``
+    carrying ``--cap-add DAC_OVERRIDE``: tightening this umask makes
+    exec-created files ``0o700``/``0o600``, and the supervisor's root
+    aux containers (``--cap-drop ALL``) cannot read/write/delete an
+    owner-only file without that capability — see that constant's comment.
     """
-    os.umask(0)
+    os.umask(0o077)
     stdout.write(json.dumps({"ready": True}) + "\n")
     stdout.flush()
     for raw in stdin:

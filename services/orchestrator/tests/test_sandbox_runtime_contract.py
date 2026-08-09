@@ -267,12 +267,15 @@ def runtime_and_control_plane_store(
     control-plane 实际读取工作区文件所用的同一个 ``WorkspaceStore`` 实现
     (``build_workspace_store`` 的产物),不是又一次 ``runtime.exec``。
 
-    返回的后端名(``request.param``)让调用方能按后端选写入方式——见
-    ``test_written_file_is_readable_by_the_control_plane_identity`` 的
-    docstring:两个后端"读方是谁"这件事本身就不同构(supervisor 走一个丢弃
-    了 ``CAP_DAC_OVERRIDE`` 的 root 辅助容器,agent_sandbox 走这个测试进程
-    自己的 ``os.open``),没有一种写入 mode 能同时对两者都是"读方身份敏感"
-    的,只能按后端分别选一种能证明点什么的写法。
+    返回的后端名(``request.param``)历史上让调用方按后端选不同的写入方
+    式——见 ``test_written_file_is_readable_by_the_control_plane_identity``
+    的 docstring:supervisor 那档的读方曾经是一个丢弃了 ``CAP_DAC_OVERRIDE``
+    的 root 辅助容器,读不动 ``mkstemp`` 恒定落地的 ``0o600``,逼那条用例
+    在 supervisor 档退让成裸 ``open()``。加回 ``--cap-add DAC_OVERRIDE``
+    (本次改动,见 ``docker_client.py`` ``_AUX_CONTAINER_HARDENING_ARGS`` 的
+    注释)之后两个后端的读方都不再对写入 mode 敏感,那条用例已经统一成
+    两档共用同一份 ``mkstemp`` 写法——后端名留在返回值里只为了失败时的调
+    试信息(``assert`` 消息/日志能报出是哪一档炸的),不再驱动任何分支。
     """
     if request.param == "supervisor":
         return request.param, _supervisor_runtime(), _supervisor_workspace_store()
@@ -454,26 +457,40 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
 async def test_exec_created_files_are_not_masked_by_the_sandbox_default_umask(
     runtime: SandboxRuntime,
 ) -> None:
-    """Task 4 审查 Critical 后续(原为跨 uid 写冲突而加)—— agent 代码自己
-    ``mkdir``/``open`` 出的嵌套目录/文件必须是 world-writable(两后端都在
-    exec 路径上把 umask 设成 000:supervisor 档 ``runner.py.main()`` 的
-    ``os.umask(0)``,agent_sandbox 档 ``commands.run`` 命令串的
-    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成
-    ``0o755``/``0o644``。
+    """agent 代码自己 ``mkdir``/``open`` 出的嵌套目录/文件必须是
+    **属主专用**(``0o700``/``0o600``)——两后端都在 exec 路径上把 umask 设
+    成 ``077``(supervisor 档 ``runner.py.main()`` 的 ``os.umask(0o077)``,
+    agent_sandbox 档 ``commands.run`` 命令串的 ``umask 077 &&`` 前缀),不能
+    被沙箱默认 umask(常见 ``0o022``)掩成更宽的 ``0o755``/``0o644``,也不
+    能停在这条机制历史上用过的更宽值 ``0o777``/``0o666``。**这条测试名字
+    没变**——它防的一直是"沙箱默认 umask 掩宽了 mode",不是"umask 是不是
+    000";这条契约本身没变,变的只是目标 mode。
 
-    **这条机制原本的理由已经不成立**(方向变更之后——共享 gid 改统一
-    uid,见 ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-
-    design.md`` § 六):以前 control-plane 与沙箱的 agent 是不同 uid,
-    ``0o755``/``0o644`` 在 ``read``/``list`` 路径上完全不可见(两者仍然
-    通),只有 control-plane 经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除
-    或覆盖该文件时才会撞 ``EACCES``。现在两侧同 uid,属主位本身就够,不再
-    需要靠这条机制兜底跨 uid 访问。这条用例本身留着不删——
-    ``0o777``/``0o666`` 是比统一 uid 之后真正需要的 mode 更宽的**安全超
-    集**,不是错,只是不再最小;收紧它是一个需要真栈验证的后续任务(见
-    ``AgentSandboxClient.exec`` 与 ``runner.py`` 的 docstring),这条契约用
-    例本身照旧断言权限位——POSIX 权限语义本身与"谁去读"这个 uid 无关,
-    ``0o777``/``0o666`` 早已蕴含了"任何 uid 都能写"这件事,不需要真的换一
-    个 uid 的进程来验证。"""
+    这是本仓库两后端共用的**唯一**一条把 exec 产出文件的实际权限位钉死成具
+    体数字的契约用例(``runtime`` fixture 对 supervisor/agent_sandbox 各跑
+    一遍,断言逐字相同)——两后端各自的这个数字只要有一个漂移,这条用例就
+    会在那一档报错,不会像"只比两者是否相等"那样让两者一起錯还绿。
+
+    **为什么是 ``0o700``/``0o600`` 而不是别的更紧或更松的值**:与
+    ``NasWorkspaceStore._DIR_MODE``/``_LEAF_FILE_MODE``
+    (``nas_workspace_store.py``)同一个数字——这是这棵工作区自己的目标状
+    态,不是这条 exec 路径单独选的。统一 uid 之后(见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)control-plane 与沙箱的 agent 是同一个 uid,属主位本身就够两侧读
+    写/删除,不再需要给 group/other 开任何口子——这条用例钉的正是"确实收
+    紧到头了",不是"确实还留了一圈安全冗余"。
+
+    **历史**(这条用例曾经断言的东西,免得以后有人翻出旧版本当参照抄
+    回去):方向变更之前,exec 路径的 umask 是 ``000``(``0o777``/``0o666``,
+    Task 4 审查 Critical 后续为"跨 uid 写冲突"而加——那时 control-plane 与
+    沙箱的 agent 是不同 uid,``0o755``/``0o644`` 在 ``read``/``list`` 路径
+    上完全不可见,只有 control-plane 尝试删除或覆盖该文件时才会撞
+    ``EACCES``)。收紧到 ``077`` 只在配合
+    ``sandbox_supervisor.docker_client._AUX_CONTAINER_HARDENING_ARGS`` 加
+    ``--cap-add DAC_OVERRIDE`` 时才不引入新故障——下面
+    ``test_written_file_is_readable_by_the_control_plane_identity`` 端到端
+    覆盖这一半(supervisor 的 root 辅助容器读一份 exec 产出的 ``0o600``
+    文件)。"""
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9b")
     try:
         code = (
@@ -486,9 +503,9 @@ async def test_exec_created_files_are_not_masked_by_the_sandbox_default_umask(
         )
         outcome = await runtime.exec(sandbox_id=sid, code=code, timeout_s=30)
         assert outcome.exit_code == 0, outcome.stderr
-        assert "DIR_MODE=777" in outcome.stdout, outcome.stdout
-        assert "NESTED_MODE=777" in outcome.stdout, outcome.stdout
-        assert "FILE_MODE=666" in outcome.stdout, outcome.stdout
+        assert "DIR_MODE=700" in outcome.stdout, outcome.stdout
+        assert "NESTED_MODE=700" in outcome.stdout, outcome.stdout
+        assert "FILE_MODE=600" in outcome.stdout, outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -515,48 +532,42 @@ async def test_written_file_is_readable_by_the_control_plane_identity(
     ``WorkspaceStore`` 实现(``SupervisorWorkspaceStore`` /
     ``NasWorkspaceStore``),不是又一次 ``runtime.exec``。
 
-    **两个后端的写法故意不同,理由不是偷懒**。最初的写法是两个后端共用
+    **两个后端曾经故意用不同写法,本次改动之后不再需要分叉**。写法是
     ``tempfile.mkstemp`` + ``os.replace``(mkstemp 恒定落地 ``0o600``,与调
     用方 umask 无关,是生产 ``file_ops.py`` 结构化 ``write_file`` 工具现在
     真正落地的 mode——Task A 删掉了那处显式变宽的 ``chmod``)——这样"读方
-    是不是与写方同一个身份"才是唯一的决定因素,是最严格的写法。但**实测**
-    (mutation 的一种:换一种输入,看断言会不会因为错误的原因倒下)这个写
-    法在 supervisor 档上必现 404("Permission denied"):supervisor 的
-    ``read_volume_file`` 用一个 ``--cap-drop ALL`` 的辅助容器读卷
-    (``docker_client.py`` ``_AUX_CONTAINER_HARDENING_ARGS``,注释自己写着
-    "stays root... forcing --user here would risk it being unable to
-    read/write a volume whose top-level ownership it doesn't control")——
+    是不是与写方同一个身份"才是唯一的决定因素,是这条用例能做到的最严格
+    写法。
+
+    这个写法**曾经**在 supervisor 档上必现 404("Permission denied"):
+    supervisor 的 ``read_volume_file`` 用一个 ``--cap-drop ALL`` 的辅助容
+    器读卷(``docker_client.py`` 的 ``_AUX_CONTAINER_HARDENING_ARGS``)——
     丢 ``ALL`` capability 也丢了 ``CAP_DAC_OVERRIDE``,这个容器虽然是 uid 0
     但**不能**绕过普通 DAC 权限检查,遇到 ``0o600``(属主 10000、其它人全
-    零)的文件与遇到任何非属主 uid 一样是 EACCES。这与本次方向变更的 uid
-    统一无关——supervisor 走的是这条完全独立、Global Constraints 明确"不
-    动"的 docker 卷模型,它"读方是谁"这件事从来就不是"控制面进程自己的
-    uid",而是这个丢了 capability 的根身份;这条契约测试的边界是"同一套
-    用例两个实现",不是"顺手把 supervisor 的这个下载兼容性缺口也堵上"——
-    那个发现已经写进本次任务的报告,留给独立的后续任务判断是否要修
-    ``file_ops.py`` 或 supervisor 的读路径。这里退一步用裸 ``open()``
-    (两个后端都已经在用的既有写法,umask=0 落地 ``0o666``——见
-    ``test_exec_created_files_are_not_masked_by_the_sandbox_default_umask``)
-    换 supervisor 档能通过、且理由与"两个身份重新统一"无关的读方式;
-    agent_sandbox 档保留 ``mkstemp``,因为它是这条用例唯一还能真正压中"读方
-    身份是否与写方一致"这件事的那一档(见下方 assert 之前的实现说明)。
+    零)的文件与遇到任何非属主 uid 一样是 EACCES。旧版这条用例因此在
+    supervisor 档退让成裸 ``open()``(旧 umask=000 落地 ``0o666``,靠"任何
+    人都能读"绕开这个缺口,而不是真的证明了读方身份没问题)。
+
+    **这条缺口正是本次改动要堵上的那一半**(umask 收紧到 ``077`` 的配套动
+    作——见 ``AgentSandboxClient.exec``/``runner.py`` 的 docstring):
+    ``_AUX_CONTAINER_HARDENING_ARGS`` 加了 ``--cap-add DAC_OVERRIDE`` 之
+    后,supervisor 的 root 辅助容器能绕过 DAC 检查,``0o600`` 不再挡它——
+    退让写法不再需要,两个后端现在共用同一份 ``mkstemp`` 写法。这条用例因
+    此第一次在**两个**后端上都真正压中"读方身份是否与写方一致"这件事,而
+    不是只在 agent_sandbox 档压中;它同时是本次改动最直接的端到端证据:
+    exec 产出一份真实的 ``0o600`` 文件,supervisor 的下载路径把它读回来。
     """
-    backend, runtime, store = runtime_and_control_plane_store
+    _backend, runtime, store = runtime_and_control_plane_store
     tenant_id, user_id = uuid4(), uuid4()
     sid = await runtime.acquire(tenant_id=tenant_id, thread_id="c19", user_id=user_id)
     try:
-        if backend == "supervisor":
-            write_code = (
-                "open('/workspace/control_plane_probe.txt', 'w').write('CONTROL_PLANE_CAN_READ_ME')"
-            )
-        else:
-            write_code = (
-                "import os, tempfile\n"
-                "fd, tmp = tempfile.mkstemp(dir='/workspace')\n"
-                "os.write(fd, b'CONTROL_PLANE_CAN_READ_ME')\n"
-                "os.close(fd)\n"
-                "os.replace(tmp, '/workspace/control_plane_probe.txt')\n"
-            )
+        write_code = (
+            "import os, tempfile\n"
+            "fd, tmp = tempfile.mkstemp(dir='/workspace')\n"
+            "os.write(fd, b'CONTROL_PLANE_CAN_READ_ME')\n"
+            "os.close(fd)\n"
+            "os.replace(tmp, '/workspace/control_plane_probe.txt')\n"
+        )
         outcome = await runtime.exec(sandbox_id=sid, code=write_code, timeout_s=30)
         assert outcome.exit_code == 0, outcome.stderr
 

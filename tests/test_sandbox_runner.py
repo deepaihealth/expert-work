@@ -171,16 +171,19 @@ def test_main_emits_error_response_for_bad_line() -> None:
     assert "invalid JSON" in response["stderr"]
 
 
-# ---------- umask (originally for a cross-uid write conflict, Task 4 review) ----------
+# ---------- umask (owner-only, workspace-gid-sharing design § 六) ----------
 
 
-def test_main_sets_permissive_umask_before_serving_requests() -> None:
-    """``main()`` must set the process umask to 0 before it ever serves a
-    request — every later ``run_once`` child inherits whatever umask is in
-    effect at fork/exec time (see ``main()``'s own docstring: the reason
-    this was originally added no longer holds after the uid-unification
-    direction change, but the mechanism itself is unchanged and still a
-    safe superset — kept as-is pending a live-cluster pass, not removed).
+def test_main_sets_owner_only_umask_before_serving_requests() -> None:
+    """``main()`` must set the process umask to ``0o077`` before it ever
+    serves a request — every later ``run_once`` child inherits whatever
+    umask is in effect at fork/exec time. ``0o077`` clears every
+    group/other bit, matching ``NasWorkspaceStore._DIR_MODE``/
+    ``_LEAF_FILE_MODE`` (``0o700``/``0o600``) — the owner-only mode this
+    workspace targets now that control-plane and this sandbox's agent run
+    as the same uid (see ``main()``'s own docstring for the full history:
+    this used to be ``os.umask(0)``, added for a cross-uid write conflict
+    that no longer exists after the uid-unification direction change).
     ``os.umask`` has no "peek" call; the only portable way to *read* the
     current value without a side effect is the round-trip idiom used here
     (set, read back what it returns, restore) — hence saving/restoring the
@@ -190,29 +193,32 @@ def test_main_sets_permissive_umask_before_serving_requests() -> None:
     os.umask(saved)
     try:
         runner.main(stdin=io.StringIO(""), stdout=io.StringIO())
-        assert os.umask(0) == 0
+        assert os.umask(0) == 0o077
     finally:
         os.umask(saved)
 
 
-def test_child_processes_inherit_the_permissive_umask(tmp_path: Path) -> None:
+def test_child_processes_inherit_the_owner_only_umask(tmp_path: Path) -> None:
     """End-to-end proof the umask override actually reaches child processes,
-    not just that ``os.umask(0)`` was called: after ``main()`` runs, code
-    executed via ``run_once`` (a *real* ``subprocess.run`` child, exactly
-    the mechanism the submitted code's own ``mkdir``/``open`` calls go
-    through) must produce a nested directory and file with **unmasked**
-    modes — ``0o777``/``0o666`` — not the ``0o755``/``0o644`` a default
-    umask (commonly ``0o022``) would otherwise leave.
+    not just that ``os.umask(0o077)`` was called: after ``main()`` runs,
+    code executed via ``run_once`` (a *real* ``subprocess.run`` child,
+    exactly the mechanism the submitted code's own ``mkdir``/``open`` calls
+    go through) must produce a nested directory and file with the
+    owner-only modes ``0o700``/``0o600`` — not the ``0o755``/``0o644`` the
+    sandbox's default umask (commonly ``0o022``) would otherwise leave,
+    and not the fully-permissive ``0o777``/``0o666`` this mechanism used to
+    force back when it was still ``os.umask(0)`` (see ``main()``'s
+    docstring for that history — a cross-uid write conflict that no longer
+    exists after the uid-unification direction change, workspace-gid-
+    sharing design § 六).
 
-    Those masked modes are what originally let the cross-uid gap this
-    mechanism was built for hide: with a *different* uid on each side
-    (control-plane vs. this sandbox's agent, pre-direction-change),
-    ``read``/``list`` still worked at ``0o755``, so nothing broke until
-    control-plane tried to delete or overwrite a file the agent created.
-    After the uid-unification direction change control-plane and this
-    sandbox's agent share one uid, so that specific gap no longer exists —
-    see ``main()``'s docstring for why the mechanism itself stays (a safe,
-    no-longer-minimal superset) rather than being narrowed in this task.
+    This tightening only holds end-to-end together with
+    ``sandbox_supervisor.docker_client._AUX_CONTAINER_HARDENING_ARGS``
+    carrying ``--cap-add DAC_OVERRIDE`` — without it, the supervisor's
+    root-but-capability-stripped aux containers can no longer read/write/
+    delete these now-owner-only files. That half is exercised in
+    ``services/sandbox-supervisor``'s own tests, not here — this module has
+    no visibility into the supervisor's docker invocations.
     """
     saved = os.umask(0)
     os.umask(saved)
@@ -227,7 +233,7 @@ def test_child_processes_inherit_the_permissive_umask(tmp_path: Path) -> None:
         assert result["exit_code"] == 0, result["stderr"]
         dir_mode = (tmp_path / "reports").stat().st_mode & 0o777
         leaf_mode = leaf.stat().st_mode & 0o777
-        assert dir_mode == 0o777, f"directory mode {oct(dir_mode)} — umask was not inherited"
-        assert leaf_mode == 0o666, f"file mode {oct(leaf_mode)} — umask was not inherited"
+        assert dir_mode == 0o700, f"directory mode {oct(dir_mode)} — umask was not inherited"
+        assert leaf_mode == 0o600, f"file mode {oct(leaf_mode)} — umask was not inherited"
     finally:
         os.umask(saved)

@@ -1988,3 +1988,45 @@ def test_tmpfs_total_stays_under_the_memory_cgroup() -> None:
         f"tmpfs 总量 {total}MB 超过 memory cgroup {budget}MB 的 75% —— "
         f"写满任一块都会 OOM-kill 而不是 ENOSPC"
     )
+
+
+def test_aux_containers_keep_dac_override_and_stay_otherwise_hardened() -> None:
+    """辅助容器必须保留 ``CAP_DAC_OVERRIDE``,其余加固项一个不少。
+
+    **为什么值得一条纯列表断言**:去掉这个 capability 会让本地后端读不了
+    ``0o600`` 的文件——统一 uid(2026-08-08)之后 agent 写的东西正是这个 mode
+    ——而症状是"文件列得出、下载 404",与 W2-BUG-1 一模一样,极难归因。真正
+    能抓到它的是 ``test_supervisor_integration.py::
+    test_read_workspace_file_reads_persisted_content``,但那条要真 Docker,
+    只在 ``sandbox-gvisor`` 工作流里跑,而那个 job 是 ``continue-on-error:
+    true`` —— 会报不会拦。这条不需要 Docker,进 PR 的必过套件。
+
+    ``--cap-drop ALL`` 与 ``--cap-add DAC_OVERRIDE`` 并存不矛盾:Docker 先
+    drop 后 add(实测与顺序无关,两种写法都得到 ``CapEff=0x2``),所以最终
+    能力集恰好是这一个。断言两者同时在场,就是断言"最小权限 + 恰好这一项
+    例外"这个意图本身。
+
+    同时钉住其余四项加固不被顺手删掉——它们才是让这个 capability 可接受的
+    前提:一次性 ``--rm`` 容器、无网络、只读 rootfs、禁提权。
+    """
+    from sandbox_supervisor.docker_client import _AUX_CONTAINER_HARDENING_ARGS
+
+    args = _AUX_CONTAINER_HARDENING_ARGS
+    joined = " ".join(args)
+
+    assert "--cap-add" in args and "DAC_OVERRIDE" in args, (
+        f"辅助容器丢了 CAP_DAC_OVERRIDE —— 本地后端将读不了 agent 写的 "
+        f"0o600 文件,症状与 W2-BUG-1 同形(列得出、下载 404)。实际: {joined}"
+    )
+    assert args[args.index("--cap-add") + 1] == "DAC_OVERRIDE", (
+        f"--cap-add 后面跟的不是 DAC_OVERRIDE: {joined}"
+    )
+    for flag, value in (
+        ("--cap-drop", "ALL"),
+        ("--network", "none"),
+        ("--security-opt", "no-new-privileges"),
+    ):
+        assert flag in args and args[args.index(flag) + 1] == value, (
+            f"辅助容器少了 {flag} {value} —— 那是 DAC_OVERRIDE 可接受的前提: {joined}"
+        )
+    assert "--read-only" in args, f"辅助容器 rootfs 不再只读: {joined}"
