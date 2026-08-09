@@ -686,3 +686,36 @@ async def test_artifact_storage_bytes_sticky_no_refill() -> None:
     )
     assert not second.allowed
     assert second.blocked_dimension is QuotaDimension.ARTIFACT_STORAGE_BYTES
+
+
+# ---------------------------------------------------------------------------
+# 沙箱迁移波 3 (spec § 3.1) — WORKSPACE_BYTES_PER_USER (storage-type cap,
+# bucket ladder must stay inert)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_bytes_per_user_row_is_inert_in_bucket_engine() -> None:
+    """WORKSPACE_BYTES_PER_USER 是存储型上限(spec § 3.1),bucket ladder 不认识它。
+
+    limit_value=0 是哨兵:一个真正接进 ladder 的存储型维度(照 IMAGE_STORAGE_BYTES
+    的样子,capacity=limit_value、refill=0)在 capacity=0 时对任何 cost>=1 的
+    check 都必拒(0 < cost 恒真)。如果有人往 ladder 里加了这个维度的分支,
+    这一行会立刻把 admission 打成拒绝,测试变红。(limit_value=1 曾试过但不够
+    强——bucket 满载时 capacity==cost 恰好放行,哨兵咬不住;见变异自证记录。)
+    """
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.WORKSPACE_BYTES_PER_USER,
+            scope={},
+            limit_value=0,
+        ),
+    )
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    result = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
+    assert result.allowed

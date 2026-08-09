@@ -75,6 +75,15 @@ class QuotaDimension(StrEnum):
     # the underlying storage cap, and this dimension is reserved for
     # future per-artifact charging.
     ARTIFACT_STORAGE_BYTES = "artifact_storage_bytes"
+    # 沙箱迁移波 3 (spec § 3.1) — 每用户工作区字节黏性上限。存储型配置值:
+    # 由 workspace 配额闸直接读 limit_value,**不接** bucket ladder
+    # (redis_quota.py / in_memory.py 对它必须保持惰性;有回归测试钉住)。
+    WORKSPACE_BYTES_PER_USER = "workspace_bytes_per_user"
+
+
+#: 沙箱迁移波 3 (spec § 3.1) — 租户没配 WORKSPACE_BYTES_PER_USER 时的
+#: 平台默认每用户工作区上限。唯一定义点;闸与前端提示都以此为准。
+DEFAULT_WORKSPACE_BYTES_PER_USER: int = 10 * 1024**3
 
 
 class QuotaPurpose(StrEnum):
