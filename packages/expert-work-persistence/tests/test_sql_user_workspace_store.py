@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -102,6 +103,57 @@ async def test_resolve_distinguishes_tenant_and_user(sql_store: SqlStoreFixture)
 
         assert len({w1.id, w2.id, w3.id}) == 3
         assert len({w1.volume_name, w2.volume_name, w3.volume_name}) == 3
+    finally:
+        await engine.dispose()
+
+
+# --- add_size (沙箱迁移波 3 § 3.2 记账第 1 层) -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_size_accumulates(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        workspace = await store.resolve(tenant_id=tenant_id, user_id=user_id)
+
+        await store.add_size(workspace_id=workspace.id, delta_bytes=100)
+        await store.add_size(workspace_id=workspace.id, delta_bytes=50)
+
+        got = await store.get(tenant_id=tenant_id, user_id=user_id)
+        assert got is not None and got.size_bytes == 150
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_size_floors_at_zero(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        workspace = await store.resolve(tenant_id=tenant_id, user_id=user_id)
+
+        await store.add_size(workspace_id=workspace.id, delta_bytes=-999)
+
+        got = await store.get(tenant_id=tenant_id, user_id=user_id)
+        assert got is not None and got.size_bytes == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_size_concurrent_increments_are_atomic(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        workspace = await store.resolve(tenant_id=tenant_id, user_id=user_id)
+
+        await asyncio.gather(
+            *[store.add_size(workspace_id=workspace.id, delta_bytes=10) for _ in range(20)]
+        )
+
+        got = await store.get(tenant_id=tenant_id, user_id=user_id)
+        assert got is not None and got.size_bytes == 200
     finally:
         await engine.dispose()
 

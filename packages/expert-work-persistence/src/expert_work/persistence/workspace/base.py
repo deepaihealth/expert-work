@@ -78,6 +78,15 @@ class UserWorkspaceStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def add_size(self, *, workspace_id: UUID, delta_bytes: int) -> None:
+        """Atomically add ``delta_bytes`` to ``size_bytes``, flooring at 0.
+
+        沙箱迁移波 3 (spec § 3.2 记账第 1 层) — 上传成功后增量入账用。
+        与 :meth:`update_size`(绝对值覆写,扫描/重算用)互补。负数下限 0
+        是防御性语义,两实现必须一致(SQL ``GREATEST``,memory ``max``)。
+        """
+
+    @abc.abstractmethod
     async def soft_delete(self, *, workspace_id: UUID, now: datetime) -> None:
         """Mark a workspace soft-deleted (Mini-ADR J-36 lifecycle 第 2 档).
 

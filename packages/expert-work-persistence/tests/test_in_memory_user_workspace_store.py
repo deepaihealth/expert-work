@@ -111,6 +111,31 @@ async def test_update_size_raises_when_workspace_missing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_size_accumulates() -> None:
+    store = InMemoryUserWorkspaceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+    workspace = await store.resolve(tenant_id=tenant_id, user_id=user_id)
+
+    await store.add_size(workspace_id=workspace.id, delta_bytes=100)
+    await store.add_size(workspace_id=workspace.id, delta_bytes=50)
+
+    got = await store.get(tenant_id=tenant_id, user_id=user_id)
+    assert got is not None and got.size_bytes == 150
+
+
+@pytest.mark.asyncio
+async def test_add_size_floors_at_zero() -> None:
+    store = InMemoryUserWorkspaceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+    workspace = await store.resolve(tenant_id=tenant_id, user_id=user_id)
+
+    await store.add_size(workspace_id=workspace.id, delta_bytes=-999)
+
+    got = await store.get(tenant_id=tenant_id, user_id=user_id)
+    assert got is not None and got.size_bytes == 0
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_sets_deleted_at_and_is_idempotent() -> None:
     store = InMemoryUserWorkspaceStore()
     workspace = await store.resolve(tenant_id=uuid4(), user_id=uuid4())
