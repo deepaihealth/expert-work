@@ -136,6 +136,15 @@ async def test_add_size_floors_at_zero() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_size_is_silent_noop_when_workspace_missing() -> None:
+    # Unlike update_size, a missing workspace_id must NOT raise —
+    # add_size is an optimistic accounting path; update_size's periodic
+    # recompute is the source-of-truth backstop.
+    store = InMemoryUserWorkspaceStore()
+    await store.add_size(workspace_id=uuid4(), delta_bytes=10)
+
+
+@pytest.mark.asyncio
 async def test_soft_delete_sets_deleted_at_and_is_idempotent() -> None:
     store = InMemoryUserWorkspaceStore()
     workspace = await store.resolve(tenant_id=uuid4(), user_id=uuid4())

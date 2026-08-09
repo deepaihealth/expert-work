@@ -158,6 +158,18 @@ async def test_add_size_concurrent_increments_are_atomic(sql_store: SqlStoreFixt
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_add_size_is_silent_noop_when_workspace_missing(sql_store: SqlStoreFixture) -> None:
+    # Unlike update_size, a missing workspace_id must NOT raise —
+    # add_size is an optimistic accounting path; update_size's periodic
+    # recompute is the source-of-truth backstop.
+    store, engine = sql_store
+    try:
+        await store.add_size(workspace_id=uuid4(), delta_bytes=10)
+    finally:
+        await engine.dispose()
+
+
 # --- Phase 3b 地基 (list_archived_expired + hard_delete) -------------------
 
 
