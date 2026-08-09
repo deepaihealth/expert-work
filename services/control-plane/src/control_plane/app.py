@@ -233,6 +233,7 @@ from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolService
 from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
 from control_plane.workspace_lock import PgWorkspaceLock
+from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.health import DefaultHealthProvider
 from expert_work.common.lifecycle import Lifecycle
@@ -780,6 +781,21 @@ def create_app(
     resolved_tenant_quotas = tenant_quota_repo or (
         sql_stores.tenant_quota if sql_stores else InMemoryTenantQuotaStore()
     )
+    # 沙箱迁移波 3 —— 工作区配额闸。tenant_quota store 建得比 sandbox
+    # runtime 晚,所以走 post-assign(同 :1346 resolved_workspace_store.http
+    # 的先例)。仅 agent_sandbox 后端 + 配了 NAS 根才有闸;其余部署
+    # quota_gate 保持 None,零行为变化。
+    resolved_workspace_quota: WorkspaceQuotaService | None = None
+    if (
+        isinstance(resolved_sandbox_runtime, AgentSandboxClient)
+        and resolved_settings.workspace_nas_root
+    ):
+        resolved_workspace_quota = WorkspaceQuotaService(
+            user_workspaces=resolved_user_workspace_store,
+            tenant_quotas=resolved_tenant_quotas,
+            workspace_root=resolved_settings.workspace_nas_root,
+        )
+        resolved_sandbox_runtime.quota_gate = resolved_workspace_quota
     resolved_reservations = token_reservation_repo or (
         sql_stores.token_reservation if sql_stores else InMemoryTokenReservationStore()
     )
@@ -2205,6 +2221,9 @@ def create_app(
     app.state.token_usage_store = resolved_token_usage
     app.state.artifact_store = resolved_artifact_store
     app.state.user_workspace_store = resolved_user_workspace_store
+    # 沙箱迁移波 3 —— None 也照设(与其余部署零行为变化对称;仅 agent_sandbox
+    # 后端 + 配了 NAS 根才是非 None,见上面 resolved_workspace_quota 赋值)。
+    app.state.workspace_quota_service = resolved_workspace_quota
     app.state.approval_store = resolved_approval_store
     app.state.run_store = resolved_run_store
     app.state.run_event_store = resolved_run_event_store
