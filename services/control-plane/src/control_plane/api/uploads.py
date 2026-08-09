@@ -45,6 +45,7 @@ from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+from orchestrator.tools.sandbox import WorkspaceQuotaExceededError
 
 logger = logging.getLogger("expert_work.control_plane.uploads")
 
@@ -156,6 +157,22 @@ async def _handle_document_upload(
         raise HTTPException(status_code=400, detail="uploaded file is empty")
     _reject_zip_bomb(raw, ext)
 
+    quota_service = getattr(request.app.state, "workspace_quota_service", None)
+    if quota_service is not None:
+        try:
+            # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
+            # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
+            await quota_service.check_upload(
+                tenant_id=tenant_id, user_id=caller_user_id, incoming_bytes=len(raw)
+            )
+        except WorkspaceQuotaExceededError as exc:
+            # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
+            # quota 语义一致。给用户留了自救路:删文件永远放行。
+            raise HTTPException(
+                status_code=429,
+                detail="workspace is full — delete files to free space",
+            ) from exc
+
     workspace_path = _safe_workspace_name(filename, ext)
     try:
         await workspace_store.write_file(
@@ -199,6 +216,12 @@ async def _handle_document_upload(
             "sha256": sha256_hex,
         },
     )
+    if quota_service is not None:
+        # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。同名覆盖上传会
+        # 重复计数 —— 已知偏差,janitor 全量扫兜正,不做减法补偿。
+        await quota_service.note_written(
+            tenant_id=tenant_id, user_id=caller_user_id, delta_bytes=len(raw)
+        )
     return JSONResponse(
         status_code=201,
         content={"path": workspace_path, "kind": "document"},
