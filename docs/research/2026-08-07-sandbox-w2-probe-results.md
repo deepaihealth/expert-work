@@ -301,6 +301,122 @@ symlink。
 
 ---
 
+## 十、2026-08-08 端到端验收实测结果——八项全过 + 一个真 bug
+
+§ 九 的清单在测试环境真栈上跑完了。发布链三线已对齐 `5557f5e9`(control-plane +
+admin-ui + `SandboxSet` 沙箱镜像),`SMOKE PASS 9/9`。
+
+**驱动方式**:本机 shell 被沙箱拦外网、浏览器扩展未连接,所以整条链是
+`kubectl exec` 进 `control-plane` Pod、以 `http://127.0.0.1:8000` 打自己的
+HTTP 入口驱动的——认证栈、路由、依赖注入全程真走,只绕开了 ALB(ALB 由
+`tools/deploy/smoke.sh` 覆盖)。token 是租户 admin 的 OIDC access token,
+从 admin-ui 的 `sessionStorage`(键 `expert_work.admin.oidc.user:<issuer>:<client>`)
+取出后落到 600 权限文件再送进 Pod,不经过任何命令行参数。
+
+**测试身份**:租户 `dd068302-5364-4174-8c5c-11d46aa7caa0` /
+`tenant_user` surrogate `c287e0d3-46fa-4afd-b928-d7087b0bb74e` /
+agent `test-agent`(glm-5.2,工具挂全)。**NAS 上的用户目录名是
+`tenant_user.id`(surrogate),不是 `subject_id`** ——
+`{root}/{tenant_id}/{tenant_user.id}/`,这一条此前没有任何文档白纸黑字写过。
+
+### 逐项结果
+
+| # | 清单项 | 结果 | 证据 |
+|---|--------|------|------|
+| 1 | 前端上传文档 → NAS `uploads/` | ✅ | `.../c287e0d3.../uploads/w2doc.md`,156 字节逐字节一致;**没有报 500**,即「波 2 首发步骤第 1 步 `chmod 1777`」确实生效 |
+| 2 | agent `read_document` 读到内容 | ✅ | agent 回出魔术串 `W2-NAS-ACCEPT-20260808-7f3a9c`——**NFS 共享(control-plane 写 → 沙箱读)首次真栈交叉验证** |
+| 3 | `exec_python` 写 `/workspace/out.txt` → 浏览可见 + 下载一致 | ✅ | NAS 上出现 `out.txt`(属主 uid 10000,28 字节),`GET .../workspace/files` 列出,下载逐字节一致 |
+| 4 | 浏览隐藏 `skills/`/`uploads/`;NAS 用户目录下无技能文件 | ✅ | 列表只有 `MEMORY.md` + `out.txt`;`find` 全程未见任何 `skills/` |
+| 5 | `kubectl delete sbx` → 再跑 → `out.txt` 仍在 | ✅ | 删掉 `expert-work-sandbox-fcdg8`(DB `sandbox_instance` `5a18d622`,`IN_USE`,不走 `release()`)→ 新沙箱 `wjwd7` → `out.txt` 内容一字不差回读。**工作区权威在 NAS 这条主张,由此坐实** |
+| 6 | 沙箱内 `/opt/skills/<agent_key>/<skill>/SKILL.md` | ✅ | 见下方「第 6 项的前提」 |
+| 7 | (W1 Task 11)出网经 credential-proxy + 审计落行 | ✅ | `sandbox_egress_audit` 第 14 行:`tenant_id=dd068302…` / `agent_name=test-agent` / `www.aliyun.com:443` / `verdict=allowed` / `bytes_up=1753` `bytes_down=262452`。沙箱内 `HTTPS_PROXY` 指向 `credential-proxy.expert-work.svc.cluster.local:8081` |
+| 8 | 删用户 → purge → marker → acquire 被拒 | ✅ | `POST /v1/users/{id}:purge` → `workspace_marked_deleted=true` / `deactivated=true` / `failures={}`;NAS 上 `{tenant}/.deleted/{user_id}`(目录 `drwx------`,**不在**用户子树里)。再跑 agent → `SandboxSupervisorError: workspace deleted for user … (tenant …)`,`exec_python` 与 `bash` 双双被拒 |
+| 8′ | 手写 `.ew-workspace-deleted` **不该**让 acquire 被拒 | ✅ | agent 在 `/workspace` 里写出该文件后,后续 run 照常成功。**全分支终审 Critical-1(marker 搬出沙箱可写树)在真栈上闭环** |
+
+顺带坐实的两条改动:`.deleted` 目录是 `0700`(CodeQL #450 从 `0o777` 收紧到
+`0o700` 的那一处),`.ew-workspace-deleted` 现在**出现在浏览列表里**(N-2:
+不再把用户自己的同名文件当保留路径隐藏)。
+
+### 第 6 项的前提:清单默认「租户已订阅技能且 agent 声明了它」,而测试租户两者都没有
+
+第一次跑 `/opt/skills` 是**空目录**(存在、属主 `agent:agent`)。这不是 bug:
+`tenant_skill_subscription` 0 行,`test-agent` 的 `spec.skills` 是 `[]`——
+seed 集合由 `agent_factory` 的 `loaded_skills.activated_skill_names` 决定,
+两个前提都不满足时空目录才是正确行为。补齐前提后才谈得上验这一项:
+
+1. `POST /v1/skills/{platform_skill_id}/subscribe` 订阅平台技能 `xlsx`;
+2. 发 `test-agent` 1.0.1,manifest 加 `skills: ["xlsx"]`(`spec.skills` 是
+   `list[str]`,不是对象列表);
+3. 新建 session 钉 1.0.1 再跑。
+
+结果:
+
+```
+/opt/skills/test-agent-9bcb1d02/xlsx/SKILL.md
+/opt/skills/test-agent-9bcb1d02/xlsx/LICENSE.txt
+/opt/skills/test-agent-9bcb1d02/xlsx/scripts/recalc.py
+/opt/skills/test-agent-9bcb1d02/xlsx/scripts/office
+```
+
+**清单 § 九 第 6 项对 `<agent_key>` 的描述是错的**:它写「manifest 名清洗后的值
+(`[^a-zA-Z0-9._-]` → `-`)」,实际 `sanitize_agent_key`
+(`orchestrator/tools/skill_seed.py:159`)在清洗后还追加了 `-<原始名 sha256 前 8 位>`
+——清洗不是单射(`"a/b"` 与 `"a-b"` 会撞),digest 才是唯一性来源。真实落点是
+`/opt/skills/<清洗名>-<digest8>/`。照原文去 `cat` 会 `No such file`。
+
+### 发现 1(Important,尚未修):沙箱写的 0600 文件,control-plane 读不了 → 下载 404
+
+`MEMORY.md` 在浏览列表里(781 字节),下载却 404:
+
+```
+PermissionError: [Errno 13] Permission denied: 'MEMORY.md'
+  nas_workspace_store.py:467  os.open(name, O_RDONLY | O_NOFOLLOW, dir_fd=dfd)
+→ SandboxSupervisorError("workspace file not found") → HTTP 404
+```
+
+NAS 上 `MEMORY.md` 是 `-rw-------` 属主 uid 10000(沙箱 agent),control-plane
+是 uid 10002——**两侧 uid 不共享,POSIX 位直接挡住**。同目录的 `out.txt` 是
+`-rw-rw-rw-` 所以读得到:差别只在写它的那条代码路径用了什么 umask,
+也就是说**能不能下载自己的文件,取决于是哪个工具写的**。
+
+为什么波 2 之前不存在:工作区在沙箱本地卷时,control-plane 经 supervisor 的
+HTTP 边界读文件,读操作发生在容器内、同 uid。权威搬到 NAS 并改成 control-plane
+直接 POSIX 读之后,跨 uid 这一层才第一次成为读路径上的真实约束。
+`_chmod_workspace_mount` / `_ensure_workspace_dir` 都只放**目录**权限,管不到
+后续新建的文件。
+
+两个独立的问题,别混:
+
+- **权限本身**:需要让两个 uid 都能读写同一棵树。原先记在波 3 backlog 的
+  「gid 共享加固」(control-plane 镜像把 `expert_work` 加进 gid 10000,
+  目录 `0o770`/文件 `0o640` + setgid 位)正是这条的解法——它不是加固,
+  是已经在咬人的缺陷。需要真栈验证 NFS AUTH_SYS 是否认附加组。
+- **错误归因**:`PermissionError` 被 `except` 成
+  `SandboxSupervisorError("workspace file not found")`,端点再翻成 404
+  「file not found」。用户看到的是「文件不存在」,而文件明明列在上一屏。
+  权限失败与不存在应当分开归因(至少日志之外要能区分)。
+
+### 发现 2(Minor,清单文字):`sandbox_egress_audit` 没有 `user_id` 列
+
+§ 九 第 7 项要求「断言表里落的行 `tenant_id`/`user_id` 与本次测试身份一致」,
+但该表的列是 `tenant_id / agent_name / agent_version / sandbox_id /
+target_host / target_port / verdict / bytes_up / bytes_down / duration_ms /
+error_msg / occurred_at`——没有 `user_id`。已按 `tenant_id` + `agent_name` +
+`sandbox_id` 三项核对通过。要么补列,要么改清单措辞,别让下一个人以为漏验了。
+
+### 发现 3(观察,非 bug):purge 之后仍能建会话,直到跑 run 才被拒
+
+purge 只软停用 `tenant_user` 行(3a 不硬删),`POST /v1/sessions` 照常 201,
+返回的还是同一个 `user_id`;直到 run 走到 `acquire` 才撞软删闸。产品上表现为
+「能建对话,一执行就报错」。这与 `purge_user` 的 docstring 一致(purge 是
+数据级操作,不撤销访问),记在这里只是免得下次有人把它当回归。
+
+### 仍未做的一项
+
+**ImageCache 补测**(§ 四)。需要先在阿里云控制台建镜像缓存,属于控制台侧操作,
+本次验收未做。流程照 § 四原样:删池内沙箱 → 计时 → 查
+`image.alibabacloud.com/matched-image-caches` 注解,结果补进 § 四。
+
 ## 十一、2026-08-09 W2-BUG-1 修复上线 + 真栈复验
 
 § 十 的验收逮到的那条 Important(agent 用标准文件工具写的文件,用户列得出、
