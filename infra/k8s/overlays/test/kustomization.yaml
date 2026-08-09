@@ -30,7 +30,6 @@ resources:
   # the host arch — exec format error on cluster) and MAY be cached
   # tag-level by ACS; a fresh tag guarantees the amd64 bits (same rule
   # as the `-rN` release convention above).
-# Sandbox migration W1 Task 2 — first deploy of this service to a cluster.
 images:
 - name: clickhouse/clickhouse-server
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
@@ -41,6 +40,7 @@ images:
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
   newTag: 2c0b8f04
+# Sandbox migration W1 Task 2 — first deploy of this service to a cluster.
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
   newTag: 94f1a371
