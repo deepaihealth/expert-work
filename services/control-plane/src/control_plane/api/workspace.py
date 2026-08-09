@@ -42,7 +42,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
 
@@ -185,6 +185,14 @@ def build_workspace_router() -> APIRouter:
             entries = await workspace_store.list_files(
                 tenant_id=scope.tenant_id, user_id=target_user_id
             )
+        except WorkspacePermissionError as exc:
+            # 权限失败(共享 uid 没配上/存量目录属主没迁移/mode 不对)是服务端配置
+            # 问题,不是"这个用户没有文件"。这里如果和下面的 SandboxSupervisorError
+            # 一样吞成空列表,用户会看到"工作区是空的"——比 404 更坏,连"出错了"
+            # 都看不到,诊断成本全压在服务端日志上。detail 只给固定文案,路径/uid/
+            # mode 只进下面这条结构化日志。
+            logger.warning("workspace.list_permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="workspace listing unavailable") from exc
         except SandboxSupervisorError:
             logger.warning("workspace.list_failed", exc_info=True)
             return JSONResponse({"success": True, "data": {"files": []}})
@@ -230,6 +238,13 @@ def build_workspace_router() -> APIRouter:
             data = await workspace_store.read_file(
                 tenant_id=scope.tenant_id, user_id=target_user_id, path=safe_path
             )
+        except WorkspacePermissionError as exc:
+            # 权限失败是服务端配置问题,不是"这个文件不存在"——404 的语义是
+            # "不存在 / 你不该知道它存在";塞进 404 会让用户看到一份列在上一屏
+            # 却"文件不存在"的报错。必须排在下面的 SandboxSupervisorError 之
+            # 前——它是那个类的子类,顺序反了这一分支永远走不到。
+            logger.warning("workspace.read_permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="workspace file unavailable") from exc
         except SandboxSupervisorError as exc:
             logger.warning("workspace.read_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc
@@ -271,6 +286,11 @@ def build_workspace_router() -> APIRouter:
             await workspace_store.delete_file(
                 tenant_id=tenant_id, user_id=target_user_id, path=safe_path
             )
+        except WorkspacePermissionError as exc:
+            # 同上——权限失败不是"这个文件不存在",必须排在 SandboxSupervisorError
+            # 之前(它的子类,顺序反了永远走不到)。
+            logger.warning("workspace.delete_permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="workspace file unavailable") from exc
         except SandboxSupervisorError as exc:
             logger.warning("workspace.delete_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc

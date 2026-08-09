@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import re
 import zipfile
 from typing import Annotated, Final
@@ -43,7 +44,9 @@ from expert_work.protocol import AuditAction, AuditResult, QuotaDimension
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
-from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+
+logger = logging.getLogger("expert_work.control_plane.uploads")
 
 #: File extension per accepted image content type. The reverse direction
 #: (ext → media_type) lives in the orchestrator's image resolver.
@@ -161,8 +164,21 @@ async def _handle_document_upload(
             path=workspace_path,
             data=raw,
         )
+    except WorkspacePermissionError as exc:
+        # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
+        # 对),不是笼统的"上游写失败"——必须排在下面的 SandboxSupervisorError
+        # 之前(它的子类,顺序反了这一分支永远走不到,同六处 workspace 端点的
+        # 坑)。500(而非下面的 502)与那六处的约定一致:服务端配置问题不该被
+        # 当成"上游 502"。detail 是固定文案,不插值异常对象:store 的消息里带
+        # 工作区相对路径,Task A 已经把它从绝对路径/uid/mode 里 scrub 掉了,但
+        # 这里原样 f"...: {exc}" 会把 store 消息原封不动地 echo 回响应体,等于
+        # 白 scrub。
+        logger.warning("upload.write_permission_denied", exc_info=True)
+        raise HTTPException(status_code=500, detail="workspace write failed") from exc
     except SandboxSupervisorError as exc:
-        raise HTTPException(status_code=502, detail=f"workspace write failed: {exc}") from exc
+        # 同上——固定文案,不插值异常对象;诊断细节只进下面这条结构化日志。
+        logger.warning("upload.write_failed", exc_info=True)
+        raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
     actor_id: str = getattr(request.state, "actor_id", "anonymous")
     sha256_hex = hashlib.sha256(raw).hexdigest()

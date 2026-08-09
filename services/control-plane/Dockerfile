@@ -52,7 +52,14 @@ WORKDIR /app
 
 # Non-root service account — parity with the sandbox / credential-proxy
 # image hardening.
-RUN useradd --uid 10002 --no-create-home --shell /usr/sbin/nologin expert_work
+#
+# 沙箱迁移波 2 BUG-1 —— 与沙箱镜像的 `agent` 用户同 uid(infra/sandbox-image/
+# Dockerfile 的 `useradd -u 10000`)。两个进程读写同一棵 NAS 工作区树,uid 不同
+# 时 POSIX 直接拒绝:agent 写的文件属主是 10000,本进程读不动,用户在前端列得出
+# 却下载报 404。同 uid 之后跨 uid 这件事从根上不存在,工作区目录因此还能收紧到
+# 0700(此前是 world-writable 的 0777)。两处 uid 由
+# services/orchestrator/tests/test_workspace_shared_uid.py 双向钉住。
+RUN useradd --uid 10000 --no-create-home --shell /usr/sbin/nologin expert_work
 
 COPY --from=builder --chown=expert_work:expert_work /app/.venv /app/.venv
 

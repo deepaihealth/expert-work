@@ -965,14 +965,19 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
-    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— ``commands.run`` 走
-    ``/bin/bash -l -c cmd``,所以命令串必须以 ``umask 000 && `` 打头,让
-    bash 先放开 umask 再 exec python:agent 代码自己 ``mkdir``/``open`` 出
-    的目录/文件才不会被默认 umask(常见 0o022)掩成 control-plane 读得进
-    但删/写不进的 0o755/0o644——与本地 supervisor 后端
-    ``runner.py.main()`` 的 ``os.umask(0)`` 同一个根因的两个后端各自的
-    落点,契约测试(``test_sandbox_runtime_contract.py``)钉住两者不会
-    分叉。"""
+    """``commands.run`` 走 ``/bin/bash -l -c cmd``,所以命令串必须以
+    ``umask 000 && `` 打头,让 bash 先放开 umask 再 exec python。与本地
+    supervisor 后端 ``runner.py.main()`` 的 ``os.umask(0)`` 是同一件事在
+    两个后端各自的落点,契约测试(``test_sandbox_runtime_contract.py``)
+    钉住两者不会分叉。
+
+    **这条机制的原始理由已经作废**(2026-08-08 统一 uid,见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六):它当初是为"跨 uid 写冲突"而设——默认 umask 掩出的
+    ``0o755``/``0o644`` 会让**另一个 uid** 的 control-plane 读得进却删/写
+    不进。现在两侧同 uid,属主位本身就够。断言留着不删:``umask 000`` 落出
+    的 ``0o777``/``0o666`` 是比现在真正需要的 mode 更宽的**安全超集**,不是
+    错,只是不再最小;收紧它要真栈验证,是独立的后续任务。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
@@ -1146,45 +1151,45 @@ async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_chmods_the_mount_from_inside_the_sandbox() -> None:
+async def test_acquire_chowns_the_mount_from_inside_the_sandbox() -> None:
     """波 2 收尾(集群实测坐实)—— 挂载点目录若由**平台**建,是 ``root:root
     0755``,沙箱里的 agent(uid 10000)第一次写 ``/workspace`` 就
     ``PermissionError``。权威修法是 control-plane 在 ``create()`` 之前
-    mkdir 成 0o777(``_prepare_workspace_mount``),这里钉的是够不到那半边
-    时的兜底:沙箱建好后以 **root** 跑一句 ``chmod 0777 /workspace``。
+    mkdir 好(``_prepare_workspace_mount``),这里钉的是够不到那半边时的
+    兜底:沙箱建好后以 **root** 跑一句 ``chown 10000:10000 /workspace``。
 
     断言 ``user="root"`` 而不是 ``SANDBOX_EXEC_USER``:agent 不是属主,以
-    agent 身份 chmod 一个 root 属主的目录必然 EPERM,这一句就白跑了。
+    agent 身份 chown 一个 root 属主的目录必然 EPERM,这一句就白跑了。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store, workspace_pv_name="workspace-nas")
 
     await client.acquire(tenant_id=uuid4(), thread_id="t")
 
-    chmods = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")]
-    assert chmods == [(f"chmod 0777 {WORKSPACE_ROOT}", None, "root", None)]
+    chowns = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chown ")]
+    assert chowns == [(f"chown 10000:10000 {WORKSPACE_ROOT}", None, "root", None)]
 
 
 @pytest.mark.asyncio
-async def test_acquire_skips_the_mount_chmod_when_no_pv_is_configured() -> None:
+async def test_acquire_skips_the_mount_chown_when_no_pv_is_configured() -> None:
     """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
-    ——那一句 chmod 只会在 envd 侧留一条无意义的失败,不发。"""
+    ——那一句 chown 只会在 envd 侧留一条无意义的失败,不发。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
     await client.acquire(tenant_id=uuid4(), thread_id="t")
 
-    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chmod ")] == []
+    assert [c for c in sdk.sandbox.commands.calls if c[0].startswith("chown ")] == []
 
 
 @pytest.mark.asyncio
-async def test_acquire_survives_a_failing_mount_chmod() -> None:
-    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的 0o777、
-    属主 uid 10002,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
-    成 nobody,对别人属主的目录 chmod 必然 EPERM。那种失败是无害的(目录本来
+async def test_acquire_survives_a_failing_mount_chown() -> None:
+    """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的、属主
+    已经是 10000,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
+    成 nobody,对别人属主的目录 chown 必然 EPERM。那种失败是无害的(目录本来
     就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
-    sdk.sandbox.commands.run_error = RuntimeError("chmod: Operation not permitted")
+    sdk.sandbox.commands.run_error = RuntimeError("chown: Operation not permitted")
     client = make_client(sdk, store, workspace_pv_name="workspace-nas")
 
     sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
@@ -1194,15 +1199,16 @@ async def test_acquire_survives_a_failing_mount_chmod() -> None:
 
 
 @pytest.mark.asyncio
-async def test_acquire_chmods_user_workspace_world_writable(
+async def test_acquire_chmods_user_workspace_to_0700(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Critical 修复(集群实测坐实)—— control-plane 以非 root 的 uid 10002
-    运行,``os.chown`` 到沙箱镜像 ``agent`` 用户的 uid(10000)必然
-    ``EPERM``(非 root 无权把文件属主改成另一个 uid),云后端每一次
-    ``acquire`` 都会在这里炸掉。改用 ``os.chmod`` 放宽权限——这里
-    monkeypatch 记录调用参数,断言目标 mode 是 ``0o777``(控制面仍是属
-    主,沙箱内的 agent uid 靠"其他用户"这一档拿到读写权限)。"""
+    """方向变更(共享 gid → 统一 uid,见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)—— control-plane 与沙箱里
+    的 agent 现在是同一个 uid,谁先建这棵目录都是它的属主,不需要再对"另一
+    侧"开任何口子。这里 monkeypatch 记录调用参数,断言目标 mode 是
+    ``0o700``(此前的 gid 方案里短暂是 ``0o777`` world-writable;方向变更后
+    收紧到属主独占)。"""
     calls: list[tuple[str, int]] = []
 
     def fake_chmod(path: object, mode: int) -> None:
@@ -1218,7 +1224,40 @@ async def test_acquire_chmods_user_workspace_world_writable(
     assert len(calls) == 1
     chmoded_path, mode = calls[0]
     assert chmoded_path == str(tmp_path / str(tenant_id) / str(user_id))
-    assert mode == 0o777
+    assert mode == 0o700
+
+
+@pytest.mark.asyncio
+async def test_acquire_survives_a_chmod_permission_error_on_the_user_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """复审 I-2 —— ``chmod`` 只对**属主**放行。uid 迁移(control-plane
+    10002 → 10000)落地当天,存量用户根的属主还是旧 uid,``chmod`` 会
+    ``EPERM``;把这些目录改回新 uid 属主是一次性迁移 Job(Task D)的职责,
+    不是每次 acquire 都跑的这条路径该做的事。
+
+    这条之前会把整个 acquire 判死(``SandboxSupervisorError``)——迁移 Job
+    跑完之前,受影响用户连一次 acquire 都做不成,比"某些操作降级"糟得多。
+    现在 ``PermissionError`` 是尽力而为:``mkdir`` 已经确认目录存在,
+    acquire 继续往下走,真正的读写权限问题留给沙箱 ``exec``/文件工具接触
+    到时用 ``docs/superpowers/plans/2026-08-08-workspace-gid-sharing.md``
+    Task A Step 7 保留清单 item 1 的窄类型 ``WorkspacePermissionError``
+    自然诊断。"""
+
+    def fake_chmod(path: object, mode: int) -> None:
+        del path, mode
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chmod", fake_chmod)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_root=str(tmp_path))
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+    assert sandbox_id is not None
+    # mkdir 本身(不是 chmod)仍然真跑了——目录确实存在,acquire 没有跳过创建。
+    assert (tmp_path / str(tenant_id) / str(user_id)).is_dir()
 
 
 @pytest.mark.asyncio
@@ -1263,6 +1302,48 @@ async def test_acquire_refuses_deleted_workspace(tmp_path: Path) -> None:
 
     # 拒绝发生在 claim_warm 之前 —— 没有留下任何行。
     assert store.rows == {}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 绕过 DAC,0o000 目录照样读得动")
+@pytest.mark.asyncio
+async def test_acquire_refuses_when_the_delete_marker_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """软删闸必须 **fail closed** —— 读不动 ``.deleted/`` 时拒绝,不是放行。
+
+    原实现用 ``Path.exists()``,它对 ``EACCES`` 的处理跨版本不一致(实测
+    3.12.8/3.13.1 抛、**3.14.0 吞掉返回 ``False``**)。3.14 那条是真的
+    fail-open:读不动等于判定"没被软删",已 purge 的用户被静默放行拿到沙箱。
+    ``requires-python = ">=3.12"`` 允许 3.14,所以"今天生产跑 3.12"不是理由。
+
+    读不动的窗口在发布流程里真实存在:``{tenant}/.deleted/`` 是 ``0o700``
+    属主 control-plane,而 uid 统一(见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)之后、存量迁移 Job(Task D)
+    跑之前,它的属主还是旧 uid 而进程已经是新 uid。
+
+    **本用例在 3.12/3.13 上也有意义**:那两个版本虽然不放行,但裸
+    ``PermissionError`` 穿过整个 ``acquire`` 冒上去,归因不明——断言匹配的是
+    ``delete-marker unreadable`` 而不是仅仅"抛了个异常",两种坏行为都能挡。
+
+    与本次改动其余部分同一个主题:权限失败被吞成"东西不在"。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    _plant_marker(tmp_path, tenant_id, user_id)
+    marker = workspace_deleted_marker(str(tmp_path), tenant_id, user_id)
+    marker.parent.chmod(0o000)  # 目录不可穿透 —— stat marker 撞 EACCES
+    try:
+        sdk, store = FakeSdk(), FakeInstanceStore()
+        client = make_client(sdk, store, workspace_root=str(tmp_path))
+
+        # 关键:不是 "workspace deleted"(那说明它读到了 marker),而是明确的
+        # "读不动"——两者都拒,但归因不同,且都不能是放行。
+        with pytest.raises(SandboxSupervisorError, match="delete-marker unreadable"):
+            await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=user_id)
+
+        assert store.rows == {}
+    finally:
+        marker.parent.chmod(0o700)  # 放回去,否则 pytest 清不掉 tmp_path
 
 
 @pytest.mark.asyncio

@@ -183,6 +183,9 @@ from orchestrator.tools.sandbox import (
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
 )
+from orchestrator.tools.sandbox import (
+    WorkspacePermissionError as WorkspacePermissionError,
+)
 from orchestrator.tools.sandbox_image_contract import (
     SANDBOX_EXEC_USER as SANDBOX_EXEC_USER,
 )
@@ -300,6 +303,7 @@ __all__ = [
     "WebSearchTool",
     "WorkspaceFileEntry",
     "WorkspaceLock",
+    "WorkspacePermissionError",
     "WorkspaceStore",
     "WriteFileTool",
     "build_tool_registry",

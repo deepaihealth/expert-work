@@ -49,7 +49,7 @@ from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import ArtifactKind, AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.artifacts")
 
@@ -220,6 +220,14 @@ def build_artifacts_router() -> APIRouter:
                 user_id=target_user_id,
                 path=version.path_in_workspace,
             )
+        except WorkspacePermissionError as exc:
+            # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
+            # 不存在"——"gone / unreadable" 不能再合并成一个 404(同六处
+            # workspace 端点的坑)。必须排在下面的 SandboxSupervisorError 之前
+            # (它的子类,顺序反了永远走不到)。``exc_info=True`` 带全 traceback
+            # (同其它八处权限归因站点的既有手法),不进响应体;detail 是固定文案。
+            logger.warning("artifact.permission_denied version=%s", version.id, exc_info=True)
+            raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
         except SandboxSupervisorError as exc:
             # The metadata row exists but the file is gone / unreadable —
             # log the supervisor detail, keep the client response opaque.

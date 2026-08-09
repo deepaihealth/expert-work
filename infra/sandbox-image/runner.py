@@ -130,29 +130,37 @@ def main(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> None:
     The leading ``{"ready": true}`` line lets the supervisor confirm the
     runner booted (the acquire-time health check) before sending code.
 
-    Task 4 review Critical follow-up (cross-uid write conflict, sandbox
-    migration wave 2): sets this process's umask to ``0`` before serving
-    any request. A process's umask is inherited by every child it
-    fork/execs, so this one call covers every ``run_once`` → ``subprocess.run``
-    child for the runner's whole lifetime — the submitted code's own
-    ``mkdir``/``open`` calls (Python ``os.mkdir`` or a shelled-out
-    ``mkdir -p``) would otherwise land at the *default* umask (commonly
-    ``0o022``), producing e.g. ``0o755`` directories / ``0o644`` files
-    owned by this sandbox's agent uid — modes that block the *other* uid
-    that also needs to touch them: control-plane, reading/writing/deleting
-    through the NAS-mounted workspace as a different uid (wave 2's
-    ``NasWorkspaceStore``; the local-docker workspace mount has the same
-    shape). ``read``/``list``/``mkdir``-through still work either way
-    (0o755 still grants "other" ``r-x``), which is exactly why this gap
-    doesn't show up until a user tries to delete or overwrite a file the
-    agent created inside its own nested directory — see
-    ``AgentSandboxClient._ensure_workspace_dir`` and ``_openat_dir`` in
-    ``orchestrator/tools/nas_workspace_store.py`` for the symmetric fixes
-    on the two things control-plane itself creates, and this repo's
-    ``AgentSandboxClient.exec`` for the same ``umask 000 &&`` prefix on
-    the cloud (E2B) backend — both backends must agree here or one of them
-    silently reopens this exact hole (contract-tested for parity in
-    ``test_sandbox_runtime_contract.py``).
+    Task 4 review Critical follow-up (originally added for a cross-uid write
+    conflict, sandbox migration wave 2): sets this process's umask to ``0``
+    before serving any request. A process's umask is inherited by every
+    child it fork/execs, so this one call covers every ``run_once`` →
+    ``subprocess.run`` child for the runner's whole lifetime — the submitted
+    code's own ``mkdir``/``open`` calls (Python ``os.mkdir`` or a
+    shelled-out ``mkdir -p``) would otherwise land at the *default* umask
+    (commonly ``0o022``), producing e.g. ``0o755`` directories / ``0o644``
+    files.
+
+    **The reason this was originally added no longer holds after the
+    direction change to a unified uid** (workspace-gid-sharing design § 六:
+    shared gid → same uid on both sides). It used to matter because
+    control-plane read/wrote/deleted through the NAS-mounted workspace as a
+    *different* uid than this sandbox's agent — a mode masked down to
+    ``0o755``/``0o644`` by the default umask still let control-plane
+    ``read``/``list`` (the "other" bits still grant ``r-x``) but not delete
+    or overwrite, a gap that stayed invisible until a user tried exactly
+    that. Now that control-plane and this sandbox's agent share one uid,
+    owner bits alone are enough on both sides — this ``umask 0`` is a
+    **safe superset** (strictly wider than the ``0o700``/``0o600`` the
+    owner-only NAS-side directories/files now use, see
+    ``AgentSandboxClient._ensure_workspace_dir`` and ``_openat_dir``/
+    ``NasWorkspaceStore.write_file`` in ``orchestrator/tools/
+    agent_sandbox.py`` / ``nas_workspace_store.py``), not wrong, just no
+    longer minimal. Tightening it needs a live-cluster verification pass
+    this task didn't budget for — left as a follow-up, not touched here.
+    Still must agree with this repo's ``AgentSandboxClient.exec`` and its
+    same ``umask 000 &&`` prefix on the cloud (E2B) backend — both backends
+    must stay in lockstep or one of them silently reopens this exact hole
+    (contract-tested for parity in ``test_sandbox_runtime_contract.py``).
     """
     os.umask(0)
     stdout.write(json.dumps({"ready": True}) + "\n")

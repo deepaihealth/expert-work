@@ -99,6 +99,7 @@ import pytest
 
 from orchestrator.tools.agent_sandbox import MAX_OUTPUT_CHARS
 from orchestrator.tools.sandbox import SandboxRuntime
+from orchestrator.tools.workspace_store import WorkspaceStore
 
 
 def _supervisor_runtime() -> SandboxRuntime:
@@ -110,8 +111,17 @@ def _supervisor_runtime() -> SandboxRuntime:
     return HTTPSupervisorRuntime(base_url=url)
 
 
-def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
+def _agent_sandbox_runtime(
+    *, workspace_pv_name: str = "", workspace_root: str = ""
+) -> SandboxRuntime:
     """``workspace_pv_name`` 默认从环境读,**没配就 skip**。
+
+    ``workspace_root``(Task C 新增关键字,默认空串)—— 不从环境读、不影响
+    其余调用点的既有行为,只有 :func:`test_agent_sandbox_workspace_root_is_not_world_accessible`
+    显式传值。原因见下面那段"``workspace_root`` 仍然不配"——那段话描述的是
+    这份契约档 *其余* 十八条用例的现状,不是这个参数本身的能力上限;那条新
+    用例恰恰要验的是 ``workspace_root`` 配上之后 ``_prepare_workspace_mount``
+    真的落了 ``0o700``,所以它需要一个不影响别人、只给自己开的口子。
 
     这个参数原本默认空串,理由是"保持对既有调用方零行为变化——未配时
     ``_create`` 完全不带 ``metadata`` 键,与波 1 逐字相同"。Task 9 之后那句
@@ -128,8 +138,9 @@ def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
     ``workspace_root`` 仍然不配:那是"把 NAS 挂进 control-plane Pod"的那半边,
     GitHub runner 对 NAS 没有 NFS 路由。缺了它 ``_prepare_workspace_mount``
     整段跳过,挂载点目录改由平台建(``root:root 0755``,集群实测),沙箱侧
-    ``AgentSandboxClient._chmod_workspace_mount`` 那道兜底因此成为这一档唯一
-    的权限来源 —— 也正是这一档真正在验的东西之一。
+    ``AgentSandboxClient._chown_workspace_mount``(方向变更前叫
+    ``_chmod_workspace_mount``)那道兜底因此成为这一档唯一的权限来源 ——
+    也正是这一档真正在验的东西之一。
     """
     api_key = os.environ.get("EXPERT_WORK_SANDBOX_E2B_API_KEY")
     if not api_key:
@@ -169,6 +180,7 @@ def _agent_sandbox_runtime(*, workspace_pv_name: str = "") -> SandboxRuntime:
         egress_proxy_host="credential-proxy.expert-work.svc.cluster.local",
         egress_proxy_port=8081,
         workspace_pv_name=workspace_pv_name or None,
+        workspace_root=workspace_root or None,
     )
 
 
@@ -195,6 +207,76 @@ def runtime(request: pytest.FixtureRequest) -> SandboxRuntime:
     return {"supervisor": _supervisor_runtime, "agent_sandbox": _agent_sandbox_runtime}[
         request.param
     ]()
+
+
+def _supervisor_workspace_store() -> WorkspaceStore:
+    """control-plane 读 supervisor 后端工作区文件的真实客户端。
+
+    与生产 ``build_workspace_store`` 在 ``sandbox_supervisor_url`` 真值分支
+    返回的是同一个类,读的是与 :func:`_supervisor_runtime` 完全相同的
+    ``EXPERT_WORK_SANDBOX_SUPERVISOR_URL``——两者代理到同一个 supervisor 实
+    例,天然指向同一个用户的同一棵工作区卷(卷名由 ``(tenant_id, user_id)``
+    算出,两条客户端各自独立拼,不经过共享状态)。
+    """
+    url = os.environ.get("EXPERT_WORK_SANDBOX_SUPERVISOR_URL")
+    if not url:
+        pytest.skip("EXPERT_WORK_SANDBOX_SUPERVISOR_URL 未设 —— supervisor 契约档跳过")
+    from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
+
+    return SupervisorWorkspaceStore(base_url=url)
+
+
+def _agent_sandbox_workspace_store() -> WorkspaceStore:
+    """control-plane 读 agent_sandbox 后端工作区文件的真实客户端。
+
+    ``NasWorkspaceStore`` 直读挂载的 NAS 树——生产 ``build_workspace_store``
+    在 ``workspace_nas_root`` 真值分支返回的正是这个类。
+
+    ``EXPERT_WORK_WORKSPACE_NAS_ROOT`` 是这份契约档里第一次真正被消费的地
+    方::func:`_agent_sandbox_runtime` 的 docstring 与 ``_FIXTURE_ENV_
+    DISPOSITION`` 都点名它"刻意不配"——但那句话说的是 ``AgentSandboxClient``
+    自己那份(沙箱侧预挂载 mkdir 用的 ``workspace_root`` 字段,GitHub runner
+    对 NAS 没有 NFS 路由,配不了)。这里是完全独立的第二个消费者:
+    control-plane 自己读工作区文件的客户端,只有这条用例和
+    :func:`test_agent_sandbox_workspace_root_is_not_world_accessible` 需要真机 NAS
+    路由时才配,不改变其余十八条既有用例的行为。
+    """
+    root = os.environ.get("EXPERT_WORK_WORKSPACE_NAS_ROOT")
+    if not root:
+        pytest.skip(
+            "EXPERT_WORK_WORKSPACE_NAS_ROOT 未设 —— 这条用例需要本进程也能直接"
+            "触达 NAS 树(模拟 control-plane 直读),契约档默认不配这一项"
+            "(GitHub runner 无 NFS 路由),只在真栈复跑时给。"
+        )
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    return NasWorkspaceStore(root=root)
+
+
+@pytest.fixture(params=["supervisor", "agent_sandbox"])
+def runtime_and_control_plane_store(
+    request: pytest.FixtureRequest,
+) -> tuple[str, SandboxRuntime, WorkspaceStore]:
+    """(后端名, 写方 SandboxRuntime, 读方 WorkspaceStore) 三元组——同一个后端,
+    同一棵工作区树,两个不同身份。
+
+    既有的 ``runtime`` fixture 只给 ``SandboxRuntime`` 一个,这份文件其余每
+    一条用例的写、读都靠它(两次 ``runtime.exec`` 调用)。W2-BUG-1 之所以能
+    在 19/19 全绿的套件下活下来,根子正是这个模式:写和读永远是同一个进
+    程、同一个身份。这条 fixture 是 Task C 存在的理由——第二个身份是
+    control-plane 实际读取工作区文件所用的同一个 ``WorkspaceStore`` 实现
+    (``build_workspace_store`` 的产物),不是又一次 ``runtime.exec``。
+
+    返回的后端名(``request.param``)让调用方能按后端选写入方式——见
+    ``test_written_file_is_readable_by_the_control_plane_identity`` 的
+    docstring:两个后端"读方是谁"这件事本身就不同构(supervisor 走一个丢弃
+    了 ``CAP_DAC_OVERRIDE`` 的 root 辅助容器,agent_sandbox 走这个测试进程
+    自己的 ``os.open``),没有一种写入 mode 能同时对两者都是"读方身份敏感"
+    的,只能按后端分别选一种能证明点什么的写法。
+    """
+    if request.param == "supervisor":
+        return request.param, _supervisor_runtime(), _supervisor_workspace_store()
+    return request.param, _agent_sandbox_runtime(), _agent_sandbox_workspace_store()
 
 
 @pytest.mark.integration
@@ -369,18 +451,29 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_exec_created_files_are_not_uid_locked(runtime: SandboxRuntime) -> None:
-    """Task 4 审查 Critical 后续(跨 uid 写冲突)—— agent 代码自己
+async def test_exec_created_files_are_not_masked_by_the_sandbox_default_umask(
+    runtime: SandboxRuntime,
+) -> None:
+    """Task 4 审查 Critical 后续(原为跨 uid 写冲突而加)—— agent 代码自己
     ``mkdir``/``open`` 出的嵌套目录/文件必须是 world-writable(两后端都在
     exec 路径上把 umask 设成 000:supervisor 档 ``runner.py.main()`` 的
     ``os.umask(0)``,agent_sandbox 档 ``commands.run`` 命令串的
-    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成只有
-    沙箱自己的 uid 能删/写的 ``0o755``/``0o644``——那类被掩过的模式在
-    ``read``/``list`` 路径上完全不可见(两者仍然通),只有 control-plane
-    经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除或覆盖该文件时才会撞
-    ``EACCES``,本条用例直接断言权限位而不是依赖第二个 uid 的进程——POSIX
-    权限语义本身就与"谁去读"这个 uid 无关,``0o777``/``0o666`` 早已蕴含了
-    "任何 uid 都能写"这件事。"""
+    ``umask 000 &&`` 前缀),不能被沙箱默认 umask(常见 ``0o022``)掩成
+    ``0o755``/``0o644``。
+
+    **这条机制原本的理由已经不成立**(方向变更之后——共享 gid 改统一
+    uid,见 ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-
+    design.md`` § 六):以前 control-plane 与沙箱的 agent 是不同 uid,
+    ``0o755``/``0o644`` 在 ``read``/``list`` 路径上完全不可见(两者仍然
+    通),只有 control-plane 经宿主机卷/NAS 挂载以**另一个 uid** 尝试删除
+    或覆盖该文件时才会撞 ``EACCES``。现在两侧同 uid,属主位本身就够,不再
+    需要靠这条机制兜底跨 uid 访问。这条用例本身留着不删——
+    ``0o777``/``0o666`` 是比统一 uid 之后真正需要的 mode 更宽的**安全超
+    集**,不是错,只是不再最小;收紧它是一个需要真栈验证的后续任务(见
+    ``AgentSandboxClient.exec`` 与 ``runner.py`` 的 docstring),这条契约用
+    例本身照旧断言权限位——POSIX 权限语义本身与"谁去读"这个 uid 无关,
+    ``0o777``/``0o666`` 早已蕴含了"任何 uid 都能写"这件事,不需要真的换一
+    个 uid 的进程来验证。"""
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c9b")
     try:
         code = (
@@ -396,6 +489,157 @@ async def test_exec_created_files_are_not_uid_locked(runtime: SandboxRuntime) ->
         assert "DIR_MODE=777" in outcome.stdout, outcome.stdout
         assert "NESTED_MODE=777" in outcome.stdout, outcome.stdout
         assert "FILE_MODE=666" in outcome.stdout, outcome.stdout
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_written_file_is_readable_by_the_control_plane_identity(
+    runtime_and_control_plane_store: tuple[str, SandboxRuntime, WorkspaceStore],
+) -> None:
+    """一套用例两实现:沙箱(agent)写的文件,control-plane 实际读取工作区
+    文件所用的同一个 ``WorkspaceStore`` 读得回来。
+
+    **为什么这条要进契约套件**:W2-BUG-1(agent 写的 ``MEMORY.md``
+    control-plane 读不动,前端列得出、下载 404)在 19/19 全绿的套件下活了
+    下来,根子是原套件只验"写进去读得出",而套件里写和读永远是同一个进
+    程、同一个身份——这份文件其余每一条工作区用例(比如
+    ``test_workspace_files_survive_across_exec``)延续的正是这个模式:两次
+    ``runtime.exec`` 调用,同一个身份读自己刚写的东西。真实部署里写方是沙
+    箱、读方是 control-plane;同 uid 方向变更(见
+    ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)让这两个身份重新
+    统一,这条用例钉的就是那个前提本身:写方走 ``runtime.exec``(沙箱进
+    程),读方走 ``build_workspace_store`` 在生产也会用的同一个
+    ``WorkspaceStore`` 实现(``SupervisorWorkspaceStore`` /
+    ``NasWorkspaceStore``),不是又一次 ``runtime.exec``。
+
+    **两个后端的写法故意不同,理由不是偷懒**。最初的写法是两个后端共用
+    ``tempfile.mkstemp`` + ``os.replace``(mkstemp 恒定落地 ``0o600``,与调
+    用方 umask 无关,是生产 ``file_ops.py`` 结构化 ``write_file`` 工具现在
+    真正落地的 mode——Task A 删掉了那处显式变宽的 ``chmod``)——这样"读方
+    是不是与写方同一个身份"才是唯一的决定因素,是最严格的写法。但**实测**
+    (mutation 的一种:换一种输入,看断言会不会因为错误的原因倒下)这个写
+    法在 supervisor 档上必现 404("Permission denied"):supervisor 的
+    ``read_volume_file`` 用一个 ``--cap-drop ALL`` 的辅助容器读卷
+    (``docker_client.py`` ``_AUX_CONTAINER_HARDENING_ARGS``,注释自己写着
+    "stays root... forcing --user here would risk it being unable to
+    read/write a volume whose top-level ownership it doesn't control")——
+    丢 ``ALL`` capability 也丢了 ``CAP_DAC_OVERRIDE``,这个容器虽然是 uid 0
+    但**不能**绕过普通 DAC 权限检查,遇到 ``0o600``(属主 10000、其它人全
+    零)的文件与遇到任何非属主 uid 一样是 EACCES。这与本次方向变更的 uid
+    统一无关——supervisor 走的是这条完全独立、Global Constraints 明确"不
+    动"的 docker 卷模型,它"读方是谁"这件事从来就不是"控制面进程自己的
+    uid",而是这个丢了 capability 的根身份;这条契约测试的边界是"同一套
+    用例两个实现",不是"顺手把 supervisor 的这个下载兼容性缺口也堵上"——
+    那个发现已经写进本次任务的报告,留给独立的后续任务判断是否要修
+    ``file_ops.py`` 或 supervisor 的读路径。这里退一步用裸 ``open()``
+    (两个后端都已经在用的既有写法,umask=0 落地 ``0o666``——见
+    ``test_exec_created_files_are_not_masked_by_the_sandbox_default_umask``)
+    换 supervisor 档能通过、且理由与"两个身份重新统一"无关的读方式;
+    agent_sandbox 档保留 ``mkstemp``,因为它是这条用例唯一还能真正压中"读方
+    身份是否与写方一致"这件事的那一档(见下方 assert 之前的实现说明)。
+    """
+    backend, runtime, store = runtime_and_control_plane_store
+    tenant_id, user_id = uuid4(), uuid4()
+    sid = await runtime.acquire(tenant_id=tenant_id, thread_id="c19", user_id=user_id)
+    try:
+        if backend == "supervisor":
+            write_code = (
+                "open('/workspace/control_plane_probe.txt', 'w').write('CONTROL_PLANE_CAN_READ_ME')"
+            )
+        else:
+            write_code = (
+                "import os, tempfile\n"
+                "fd, tmp = tempfile.mkstemp(dir='/workspace')\n"
+                "os.write(fd, b'CONTROL_PLANE_CAN_READ_ME')\n"
+                "os.close(fd)\n"
+                "os.replace(tmp, '/workspace/control_plane_probe.txt')\n"
+            )
+        outcome = await runtime.exec(sandbox_id=sid, code=write_code, timeout_s=30)
+        assert outcome.exit_code == 0, outcome.stderr
+
+        data = await store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path="control_plane_probe.txt"
+        )
+        assert data == b"CONTROL_PLANE_CAN_READ_ME"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_agent_sandbox_workspace_root_is_not_world_accessible() -> None:
+    """用户工作区根目录 mode 是 ``0o700``——other 档全零。
+
+    **名字里的 ``agent_sandbox`` 前缀是承重的,不是命名风格**:唯一带真
+    E2B 凭据的 CI job(``.github/workflows/sandbox-contract.yml``)用
+    ``-k agent_sandbox`` 选测试。本用例不走 parametrize(见下),名字里没有
+    这个子串就会被**静默 deselect**——比 skip 更坏,报告里连一行都不留。
+    改名前它在任何自动化路径上都跑不到:CI 选不中,而本机又没有 NAS 路由。
+    参照同文件已有的
+    ``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``。
+
+    波 2 期间(``NasWorkspaceStore``/共享 gid 方案下)这里是 ``0o2770``/
+    ``0o777``(group-/world-writable),靠 subPath 挂载范围做隔离,POSIX 位
+    本身不设防,并因此留下两条 dismissed 的 CodeQL high。同 uid 方向变更
+    (见 ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
+    § 六)之后不需要给任何"另一方"开口子了——``NasWorkspaceStore.
+    _DIR_MODE`` 与 ``AgentSandboxClient._ensure_workspace_dir`` 都已收紧到
+    ``0o700``。这条断言防的是有人为了排查方便(比如临时调宽方便手工核对
+    NAS 上的文件)又把它放宽回去。
+
+    **只在 agent_sandbox 后端跑,不参数化 ``runtime``**(同
+    ``test_agent_sandbox_nas_mount_shares_workspace_across_two_sandboxes``
+    的既有先例——那条也不参数化,理由类似)。``0o700`` 是 wave 2 NAS 直读
+    设计独有的常量;supervisor 后端走的是完全不同、这次方向变更明确"不
+    动"的 docker 卷模型(brief Global Constraints:"仅改 control-plane 的
+    uid...不动...sandbox-supervisor")——**实测** supervisor 档 ``/workspace``
+    是 ``0o755``(docker 具名卷挂载点的默认 mode,``chown_volume`` 只改属主
+    不改 mode,是这个后端一直以来的行为,与本次 uid 统一无关)。把同一条
+    ``== 0o700`` 断言套到 supervisor 档上会是一条恒假的契约,不是"两个后端
+    一套用例"该有的样子。
+
+    **为什么需要 ``workspace_root``**(这份契约档其余用例都不配的一项)。
+    ``_ensure_workspace_dir`` 只在 ``AgentSandboxClient.workspace_root`` 非
+    空时才跑(``_prepare_workspace_mount`` "workspace_root 未配... 整段跳
+    过")——这份契约档默认不配它(GitHub runner 对 NAS 没有 NFS 路由,见
+    ``_agent_sandbox_runtime`` 与 ``_FIXTURE_ENV_DISPOSITION`` 的既有注
+    释),这条用例专门为自己多要一项(读同一个
+    ``EXPERT_WORK_WORKSPACE_NAS_ROOT``,通过 Task C 新增的 ``workspace_root=``
+    关键字传给 ``_agent_sandbox_runtime``),不改变其余十八条用例的既有行
+    为。少了它,目录改由平台建(``root:root 0755``),沙箱侧
+    ``AgentSandboxClient._chown_workspace_mount`` 那道兜底只 chown 属主、不
+    chmod mode(见其 docstring"为什么 chown 而不是 chmod")——这条断言会在
+    错误的原因下失败(不是"mode 放宽了",是"这条腿本来就没把 control-plane
+    侧 mkdir 接上"),意义不一样。
+
+    **mode 从沙箱内部 ``os.stat`` 读,不从这个测试进程自己读**——
+    ``_ensure_workspace_dir`` 的 mkdir/chmod 跑在这个测试进程自己的 uid 下
+    (不一定是 10000),但 ``stat(2)`` 只需要祖先目录的搜索权限、不需要目标
+    本身的任何权限位,所以沙箱(真的是 uid 10000)总能 ``stat`` 到这个目
+    录、如实报出它的 mode——这条断言因此不依赖"跑这条测试的进程本身是不
+    是 uid 10000"这件事,只依赖 NAS 路由是否可达。
+    """
+    nas_root = os.environ.get("EXPERT_WORK_WORKSPACE_NAS_ROOT")
+    if not nas_root:
+        pytest.skip(
+            "EXPERT_WORK_WORKSPACE_NAS_ROOT 未设 —— 这条用例需要本进程也能直接"
+            "触达 NAS 树上验 control-plane 侧 mkdir+chmod 的落地结果,契约档默"
+            "认不配这一项(GitHub runner 无 NFS 路由),只在真栈复跑时给。"
+        )
+    runtime = _agent_sandbox_runtime(workspace_root=nas_root)
+    tenant_id, user_id = uuid4(), uuid4()
+    sid = await runtime.acquire(tenant_id=tenant_id, thread_id="c20", user_id=user_id)
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import os; print('MODE=%o' % (os.stat('/workspace').st_mode & 0o777))",
+            timeout_s=30,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "MODE=700" in outcome.stdout, outcome.stdout
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -1142,8 +1386,17 @@ _FIXTURE_ENV_DISPOSITION = {
         "刻意不配 —— 这是「把 NAS 挂进 control-plane Pod」的那半边,GitHub runner "
         "对 NAS 没有 NFS 路由,配不了。缺了它 _prepare_workspace_mount 整段跳过,"
         "挂载点目录改由平台建(root:root 0755,集群实测),沙箱侧 "
-        "AgentSandboxClient._chmod_workspace_mount 那道兜底因此成为这一档唯一的"
+        "AgentSandboxClient._chown_workspace_mount(方向变更前叫 "
+        "_chmod_workspace_mount)那道兜底因此成为这一档唯一的"
         "权限来源 —— 也正是这一档真正在验的东西之一。"
+        "**不只是少了 _chown_workspace_mount 兜底覆盖**:这个变量还是本次改动"
+        "两条旗舰契约用例的唯一开关——"
+        "test_written_file_is_readable_by_the_control_plane_identity 与 "
+        "test_agent_sandbox_workspace_root_is_not_world_accessible 都在函数体内 "
+        "os.environ.get 这个变量,未设直接 pytest.skip,不打任何 xfail/xskip 标"
+        "记留痕。`grep -rn EXPERT_WORK_WORKSPACE_NAS_ROOT .github/` 目前无命中,"
+        "即两条测试今天在任何 CI pipeline 里都不执行,只在人工连了真 NAS 的机器"
+        "上跑得到——是 real-stack-only,不是本地/CI 也覆盖、只是少一层兜底断言。"
     ),
 }
 

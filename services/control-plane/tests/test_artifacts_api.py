@@ -14,7 +14,11 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from orchestrator.tools import RecordingWorkspaceStore
+from orchestrator.tools import (
+    RecordingWorkspaceStore,
+    SandboxSupervisorError,
+    WorkspacePermissionError,
+)
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -208,6 +212,42 @@ async def test_download_unknown_artifact_returns_404(
     client, _, _ = setup
     resp = await client.get("/v1/artifacts/download", params={"name": "missing.md"})
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_download_reports_permission_denied_as_server_error(
+    setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    元数据行(artifact 版本)存在,内容读不动是权限问题(服务端配置),不是
+    "这个 artifact 不存在"——这里原来的注释自己就写着"the file is gone /
+    unreadable"两种情况合并成一个 404,正是这一整个 program 要拆开的那类混淆
+    (复审第二轮指出的第四/五处站点之一)。响应体不含路径 / uid / mode。
+    """
+    client, _, _ = setup
+    store = client._transport.app.state.workspace_store  # type: ignore[attr-defined,union-attr]
+    store.workspace_file_error = WorkspacePermissionError(
+        "PermissionError(13, 'Permission denied'): "
+        "'/mnt/workspaces/t-1/u-1/report.md' uid=10002 mode=0o600"
+    )
+    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_download_still_404s_on_a_generic_supervisor_error(
+    setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(真的读不到内容)仍是 404,既有姿态不变。"""
+    client, _, _ = setup
+    store = client._transport.app.state.workspace_store  # type: ignore[attr-defined,union-attr]
+    store.workspace_file_error = SandboxSupervisorError("content gone")
+    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    assert resp.status_code == 404, resp.text
 
 
 @pytest.mark.asyncio

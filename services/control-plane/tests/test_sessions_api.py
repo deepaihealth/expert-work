@@ -26,6 +26,12 @@ from expert_work.runtime.runs import (
     RunInfo,
     RunStatus,
 )
+from orchestrator.tools import (
+    RecordingWorkspaceStore,
+    SandboxSupervisorError,
+    WorkspaceFileEntry,
+    WorkspacePermissionError,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -286,8 +292,6 @@ async def test_workspace_files_and_download_with_supervisor(
     audit_store: InMemoryAuditLogStore,
 ) -> None:
     # Inject a recording supervisor so the browse + download paths run end to end.
-    from orchestrator.tools import RecordingWorkspaceStore, WorkspaceFileEntry
-
     settings = Settings(
         env="dev",
         auth_mode="dev",
@@ -346,6 +350,198 @@ async def test_workspace_files_and_download_with_supervisor(
         )
         assert bad.status_code == 400
         assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
+
+
+# ---------------------------------------------------------------------------
+# W2-BUG-1 — thread-scoped workspace endpoints: permission failures must not
+# be laundered into 404 / an empty list. Mirrors ``test_workspace_api.py``'s
+# coverage of the user-scoped ``/v1/workspace*`` router one-for-one.
+# ---------------------------------------------------------------------------
+
+# A store-side ``WorkspacePermissionError`` message shaped like the real one
+# (path / uid / mode) — used to prove the HTTP layer never echoes it back.
+_LEAKY_DETAIL = (
+    "PermissionError(13, 'Permission denied'): "
+    "'/mnt/workspaces/t-1/u-1/report.pdf' uid=10002 mode=0o600"
+)
+
+
+@pytest.fixture
+async def session_client_with_store(
+    audit_store: InMemoryAuditLogStore,
+) -> AsyncIterator[tuple[AsyncClient, RecordingWorkspaceStore, str]]:
+    """A live thread + an injected supervisor, for the workspace-file tests below."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        store = RecordingWorkspaceStore()
+        app.state.workspace_store = store
+        create = await client.post(
+            "/v1/sessions",
+            json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
+        )
+        thread_id = create.json()["data"]["thread_id"]
+        yield client, store, thread_id
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_list_reports_permission_denied_as_server_error(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 200 空列表(见 workspace.py 同款)。"""
+    client, store, thread_id = session_client_with_store
+    store.workspace_list_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/files")
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_list_still_empty_on_a_generic_supervisor_error(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍降级成空列表,不是 500。"""
+    client, store, thread_id = session_client_with_store
+    store.workspace_list_error = SandboxSupervisorError("supervisor unreachable")
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/files")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["files"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_download_reports_server_error_on_permission_denied(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    404 的语义是"不存在 / 你不该知道它存在";权限读不动是**服务端配置问题**,
+    塞进 404 会让用户看到"文件不存在"而它明明列在上一屏 —— W2-BUG-1 的诊断
+    成本几乎全在这里。响应体不含路径 / uid / mode。
+    """
+    client, store, thread_id = session_client_with_store
+    store.workspace_file_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get(
+        f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}
+    )
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_download_still_404s_on_a_missing_file(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """对照组:普通 SandboxSupervisorError 仍是 404。
+
+    防止把"隐藏跨用户存在性"这条既有安全姿态一并改坏。
+    """
+    client, store, thread_id = session_client_with_store
+    store.workspace_file_error = SandboxSupervisorError("not found")
+    resp = await client.get(
+        f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_delete_reports_server_error_on_permission_denied(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """同下载:权限失败是服务端配置问题,不应该被 404 盖过去。响应体不含路径/uid/mode。"""
+    client, store, thread_id = session_client_with_store
+    store.workspace_delete_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.request(
+        "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}
+    )
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_workspace_delete_still_404s_on_a_generic_supervisor_error(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍是 404,既有姿态不变。"""
+    client, store, thread_id = session_client_with_store
+    store.workspace_delete_error = SandboxSupervisorError("not found")
+    resp = await client.request(
+        "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def _seed_artifact_for_thread(
+    client: AsyncClient, thread_id: str, *, name: str = "report.pdf"
+) -> None:
+    """Save an artifact version row so ``.../workspace/artifacts/{name}/download``
+    resolves — mirrors ``test_session_workspace_file_and_artifact_download_system_admin_200``'s
+    seeding, factored out since the two tests below need it too."""
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+    assert meta is not None and meta.user_id is not None
+    await app.state.artifact_store.save_version(
+        tenant_id=_DEFAULT_TENANT,
+        user_id=meta.user_id,
+        name=name,
+        kind="document",
+        path_in_workspace=name,
+        created_in_thread=thread_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_artifact_download_reports_server_error_on_permission_denied(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """store 抛 WorkspacePermissionError → 500,不是 404。
+
+    元数据行(artifact 版本)存在,内容读不动是权限问题(服务端配置),不是
+    "这个 artifact 不存在"——``artifacts`` 的内容其实就是同一个 workspace_store
+    上的一个文件,"gone / unreadable" 合并成一个 404 正是这整个 program 要拆
+    开的那类混淆(复审第二轮找到的第四/五处站点之一)。响应体不含路径/uid/mode。
+    """
+    client, store, thread_id = session_client_with_store
+    await _seed_artifact_for_thread(client, thread_id)
+    store.workspace_file_error = WorkspacePermissionError(_LEAKY_DETAIL)
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/artifacts/report.pdf/download")
+    assert resp.status_code == 500, resp.text
+    assert "/mnt/workspaces" not in resp.text
+    assert "10002" not in resp.text
+    assert "0o600" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_session_artifact_download_still_404s_on_a_generic_supervisor_error(
+    session_client_with_store: tuple[AsyncClient, RecordingWorkspaceStore, str],
+) -> None:
+    """对照组:普通 SandboxSupervisorError(真的读不到内容)仍是 404,既有姿态不变。"""
+    client, store, thread_id = session_client_with_store
+    await _seed_artifact_for_thread(client, thread_id)
+    store.workspace_file_error = SandboxSupervisorError("content gone")
+    resp = await client.get(f"/v1/sessions/{thread_id}/workspace/artifacts/report.pdf/download")
+    assert resp.status_code == 404, resp.text
 
 
 @pytest.mark.asyncio
