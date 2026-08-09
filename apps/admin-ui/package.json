@@ -17,7 +17,7 @@
     "build-storybook": "storybook build --disable-telemetry"
   },
   "dependencies": {
-    "@ant-design/cssinjs": "^1.21.1",
+    "@ant-design/cssinjs": "^2.1.2",
     "@monaco-editor/react": "^4.7.0",
     "@rjsf/antd": "^5.24.13",
     "@rjsf/core": "^5.24.13",
