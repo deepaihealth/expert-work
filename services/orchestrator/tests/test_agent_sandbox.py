@@ -2515,3 +2515,57 @@ async def test_quota_error_maps_to_tool_blocked() -> None:
             tool_label="exec_python",
             fallback_thread_id="exec-python",
         )
+
+
+@pytest.mark.asyncio
+async def test_reap_forgets_session_identity_for_a_reaped_warm_session() -> None:
+    """评审 Important-1:``reap``/:meth:`~AgentSandboxClient._clear_reaped_row`
+    是空闲热会话的**主**清理路径,直接调 ``store.mark_destroyed``,绕开了
+    ``destroy()``——不忘身份缓存的话,``_session_identity`` 会无界增长
+    (每个正常走完生命周期的热会话都漏一条)。acquire → release(保温,行
+    还在)→ reap(force,拆掉这一行)→ 断言身份缓存里这一行已经不在了。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    gate = FakeQuotaGate(over=False)
+    client = make_client(sdk, store, quota_gate=gate)
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    await client.release(sandbox_id=sandbox_id)  # 保温,行还在
+    assert sandbox_id in client._session_identity
+
+    reaped = await client.reap(force=True)
+
+    assert reaped == 1
+    assert sandbox_id not in client._session_identity, (
+        "reap 直接调 mark_destroyed,绕开了 destroy()——必须自己忘身份"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_survives_a_failing_refresh_soon() -> None:
+    """评审 Important-2:``gate.refresh_soon`` 原来是裸调用——同步抛异常会
+    在 ``_is_warm_session``/``destroy`` 之前打断 ``release``,复现全分支
+    终审 Important-1 那个洞(非保温沙箱漏一台活 microVM + 一行永久
+    IN_USE)。包 try/except 之后,即使 refresh_soon 抛,非保温 release 仍
+    必须走到 destroy。
+
+    临时沙箱(无 ``user_id``)天然走非保温路径,但那样 ``identity[1]`` 是
+    ``None``,refresh_soon 根本不会被调用——手动摆一条挂着 ``user_id`` 的
+    身份记录,逼出"refresh_soon 被调用且抛出"这个分支,同时保持非保温。"""
+
+    class _RaisingRefreshGate(FakeQuotaGate):
+        def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
+            super().refresh_soon(tenant_id=tenant_id, user_id=user_id)
+            raise RuntimeError("refresh_soon boom")
+
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    gate = _RaisingRefreshGate(over=False)
+    client = make_client(sdk, store, quota_gate=gate)
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1")
+    client._session_identity[sandbox_id] = (tenant_id, user_id)
+
+    await client.release(sandbox_id=sandbox_id)  # 不抛
+
+    assert gate.refresh_calls == [(tenant_id, user_id)]
+    assert sdk.sandbox.killed is True, "refresh_soon 抛异常不该阻止真正的销毁"
+    assert store.mark_destroyed_calls == [(sandbox_id, "release")]
