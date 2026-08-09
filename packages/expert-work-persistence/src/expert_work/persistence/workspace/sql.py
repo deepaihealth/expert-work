@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -103,6 +103,15 @@ class SqlUserWorkspaceStore(UserWorkspaceStore):
             # mypy stubs for SQLAlchemy's async API don't expose it yet.
             if result.rowcount == 0:  # type: ignore[attr-defined]
                 raise WorkspaceNotFoundError(workspace_id)
+            await session.commit()
+
+    async def add_size(self, *, workspace_id: UUID, delta_bytes: int) -> None:
+        async with self._sf() as session:
+            await session.execute(
+                update(UserWorkspaceRow)
+                .where(UserWorkspaceRow.id == workspace_id)
+                .values(size_bytes=func.greatest(UserWorkspaceRow.size_bytes + delta_bytes, 0))
+            )
             await session.commit()
 
     async def soft_delete(self, *, workspace_id: UUID, now: datetime) -> None:
