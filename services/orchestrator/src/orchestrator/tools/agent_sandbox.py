@@ -106,7 +106,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
@@ -130,6 +130,21 @@ from orchestrator.tools.sandbox_image_contract import (
     WORKSPACE_ROOT,
 )
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
+
+
+class WorkspaceQuotaGate(Protocol):
+    """沙箱迁移波 3 —— 用户工作区配额闸(spec § 3.3)。``AgentSandboxClient``
+    的可选依赖:``quota_gate=None``(默认)时 :meth:`AgentSandboxClient.acquire`
+    /:meth:`~AgentSandboxClient.release` 整段跳过,行为与波 2 完全一致。
+    control-plane 在 Task 4 实现具体的 gate,本模块只定调用契约。
+    """
+
+    async def check(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """超限抛 WorkspaceQuotaExceededError;未超返回 None。"""
+
+    def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """fire-and-forget 触发该用户目录重算(实现侧自带 60s 防抖)。同步方法,内部自行调度。"""
+
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +360,17 @@ class AgentSandboxClient:
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
+    #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
+    #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
+    #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走
+    #: 构造参数 —— tenant_quota store 的构建晚于本 client。
+    quota_gate: WorkspaceQuotaGate | None = None
+    #: acquire 时记下 sandbox_id → (tenant_id, user_id),release/destroy 时
+    #: 反查身份触发配额重算。进程内(acquire/release 同进程成对);重启丢失
+    #: 无害 —— janitor 全量扫兜底(spec § 3.2 第 3 层)。
+    _session_identity: dict[UUID, tuple[UUID, UUID | None]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         """构造期不变式检查(同 ``ToolResult.__post_init__`` 的既有惯例:
@@ -533,6 +559,10 @@ class AgentSandboxClient:
         await self._prepare_workspace_mount(
             tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
         )
+        if user_id is not None and self.quota_gate is not None:
+            # 闸 A(spec § 3.3):已超才拦(>=)。放在 claim_warm 之前——
+            # 拦下时不留任何 store 行。
+            await self.quota_gate.check(tenant_id=tenant_id, user_id=user_id)
         existing: tuple[UUID, str, datetime | None] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
@@ -662,6 +692,11 @@ class AgentSandboxClient:
                 # 那一行也已经健康登记过,种子文件写失败不该把它连锅端了。
                 await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
+        # 沙箱迁移波 3 —— 记身份供 release/destroy 反查触发配额重算。放在
+        # 最终返回值确定之后:热复用分支上面已经把 sandbox_id 改写成赢家的
+        # 真实 id(见该分支注释),这里记的必须是那个 id,不是本次调用开头
+        # 自铸、从未插入任何行的 uuid4()。
+        self._session_identity[sandbox_id] = (tenant_id, user_id)
         return sandbox_id
 
     async def _chown_workspace_mount(self, sbx: Any, *, sandbox_id: UUID) -> None:
@@ -1168,7 +1203,17 @@ class AgentSandboxClient:
 
         保温分支仍然不碰 store:热会话行保持 ``IN_USE``,``container_id``
         就是下次 connect 的凭据。
+
+        沙箱迁移波 3:配额重算的触发点在最前面,保温早退**之前**——热会话
+        路径本就不碰 store,如果把这句放在早退之后就永远轮不到它执行,而
+        恰恰是热会话(反复 acquire/release 同一个用户工作区)最需要按工具
+        调用频率驱动重算(spec § 3.2 记账第 2 层)。
         """
+        identity = self._session_identity.get(sandbox_id)
+        if identity is not None and identity[1] is not None and self.quota_gate is not None:
+            # spec § 3.2 记账第 2 层:每次工具调用 release 都触发,防抖在
+            # gate 实现侧(60s)。fire-and-forget:同步调度,不 await。
+            self.quota_gate.refresh_soon(tenant_id=identity[0], user_id=identity[1])
         if await self._is_warm_session(sandbox_id):
             return None
         await self.destroy(sandbox_id=sandbox_id, reason=_RELEASE_DESTROY_REASON)
@@ -1250,6 +1295,10 @@ class AgentSandboxClient:
             # 等价。
             logger.info("destroy: sandbox %s already gone", sandbox_id)
         await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        # 沙箱迁移波 3 —— 这一行的身份不再需要:非保温 release 走的正是这个
+        # 方法,直接在这里 pop 就同时覆盖了它与其它直接调用 destroy 的路径
+        # (年龄封顶重建 / 重连失败重建 / exec_python 取消后的强制拆除)。
+        self._session_identity.pop(sandbox_id, None)
 
     async def exec(
         self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""

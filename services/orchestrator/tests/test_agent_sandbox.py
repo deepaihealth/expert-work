@@ -83,7 +83,13 @@ from orchestrator.tools.agent_sandbox import (
     AgentSandboxClient,
 )
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
-from orchestrator.tools.sandbox import EgressContext, SandboxSupervisorError
+from orchestrator.tools.registry import ToolBlockedError, ToolContext
+from orchestrator.tools.sandbox import (
+    EgressContext,
+    SandboxSupervisorError,
+    WorkspaceQuotaExceededError,
+    run_in_sandbox,
+)
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
 
 
@@ -371,6 +377,7 @@ def make_client(
     workspace_pv_name: str | None = None,
     workspace_subpath_prefix: str = "",
     workspace_root: str | None = None,
+    quota_gate: agent_sandbox_module.WorkspaceQuotaGate | None = None,
 ) -> AgentSandboxClient:
     return AgentSandboxClient(
         domain="gw.example.com",
@@ -386,6 +393,9 @@ def make_client(
         workspace_pv_name=workspace_pv_name,
         workspace_subpath_prefix=workspace_subpath_prefix,
         workspace_root=workspace_root,
+        # 沙箱迁移波 3 —— 默认 None,与 AgentSandboxClient 自己的字段默认值
+        # 同一个理由:不传就是无闸(波 2 行为)。
+        quota_gate=quota_gate,
     )
 
 
@@ -2391,3 +2401,117 @@ async def test_acquire_rebuilds_reconnect_failed_warm_session_at_quota_limit() -
     assert (old_id, "warm_reconnect_failed") in store.mark_destroyed_calls
     quota_unwinds = [c for c in store.mark_destroyed_calls if c[1] == "quota_exceeded"]
     assert quota_unwinds == [], "重建路径不查配额,不该有任何 quota_exceeded 的 unwind"
+
+
+# ---------------------------------------------------------------------------
+# 沙箱迁移波 3 PR-1 Task 3 —— 闸 A(用户工作区配额,spec § 3.3):acquire 在
+# ``_prepare_workspace_mount`` 之后、``claim_warm`` 之前查 gate,超限拦下时
+# 不留任何 store 行;``release`` 触发防抖重算(spec § 3.2 记账第 2 层),热
+# 会话早退分支也必须已经触发。``quota_gate`` 是可选依赖,``None``(默认)
+# 时行为与波 2 完全一致——gate 是新 Protocol,control-plane 具体实现在
+# Task 4,这里只用手写假件覆盖 AgentSandboxClient 这一侧的契约。
+# ---------------------------------------------------------------------------
+
+
+class FakeQuotaGate:
+    def __init__(self, *, over: bool) -> None:
+        self.over = over
+        self.check_calls: list[tuple[UUID, UUID]] = []
+        self.refresh_calls: list[tuple[UUID, UUID]] = []
+
+    async def check(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        self.check_calls.append((tenant_id, user_id))
+        if self.over:
+            raise WorkspaceQuotaExceededError("user workspace is over quota")
+
+    def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        self.refresh_calls.append((tenant_id, user_id))
+
+
+@pytest.mark.asyncio
+async def test_acquire_over_quota_raises_and_creates_nothing() -> None:
+    """gate over=True → acquire 抛 WorkspaceQuotaExceededError,且 store 里
+    没有新增 IN_USE 行——闸在 claim_warm 之前(spec § 3.3),拦下时不得留
+    任何 store 行。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    gate = FakeQuotaGate(over=True)
+    client = make_client(sdk, store, quota_gate=gate)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    with pytest.raises(WorkspaceQuotaExceededError):
+        await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    assert gate.check_calls == [(tenant_id, user_id)]
+    assert store.rows == {}, "闸在 claim_warm 之前——拦下时不得留任何 store 行"
+    assert len(sdk.created) == 0
+
+
+@pytest.mark.asyncio
+async def test_acquire_without_gate_unchanged() -> None:
+    """quota_gate=None(默认)→ 现有 acquire happy path 行为完全不变——复制
+    ``test_acquire_creates_and_records_container_id``,显式传 quota_gate=None
+    断言缺省仍走通。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, quota_gate=None)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    assert len(sdk.created) == 1
+    assert store.rows[sandbox_id]["container_id"] == "sbx-1"
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_acquire_skips_gate() -> None:
+    """``user_id=None`` + gate over=True → 不抛(临时沙箱不查配额),
+    ``gate.check_calls == []``。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    gate = FakeQuotaGate(over=True)
+    client = make_client(sdk, store, quota_gate=gate)
+
+    sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t1")
+
+    assert sandbox_id in store.rows
+    assert gate.check_calls == []
+
+
+@pytest.mark.asyncio
+async def test_release_fires_refresh_for_user_session_including_warm() -> None:
+    """带 ``user_id`` acquire → release → ``gate.refresh_calls`` 含
+    ``(tenant, user)``;热会话分支(release 早退保温)也必须已经触发
+    refresh——断言就摆在早退路径上:release 之后沙箱仍保温未被 kill,同时
+    refresh 已经调用过。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    gate = FakeQuotaGate(over=False)
+    client = make_client(sdk, store, quota_gate=gate)
+    tenant_id, user_id = uuid4(), uuid4()
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+
+    await client.release(sandbox_id=sandbox_id)
+
+    assert gate.refresh_calls == [(tenant_id, user_id)]
+    assert sdk.sandbox.killed is False, "热会话早退路径——refresh 必须在早退之前已经触发"
+    assert sandbox_id in store.rows
+
+
+@pytest.mark.asyncio
+async def test_quota_error_maps_to_tool_blocked() -> None:
+    """工具层:``sandbox.py`` 的 acquire 包装把 ``WorkspaceQuotaExceededError``
+    转成 ``ToolBlockedError``(信息含 "workspace is full"),而不是裸异常
+    穿透——LLM 拿到的是可转述的行动指引(spec § 3.3),不是基础设施故障。"""
+
+    class _OverQuotaClient:
+        async def acquire(self, **kwargs: object) -> UUID:
+            raise WorkspaceQuotaExceededError("user workspace is over quota")
+
+    ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4())
+
+    with pytest.raises(ToolBlockedError, match="workspace is full"):
+        await run_in_sandbox(
+            _OverQuotaClient(),
+            code="1 + 1",
+            timeout_s=None,
+            ctx=ctx,
+            tool_label="exec_python",
+            fallback_thread_id="exec-python",
+        )
