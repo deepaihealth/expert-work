@@ -668,6 +668,36 @@ describe("PlaygroundTab", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a workspace-full alert (not the raw ApiError string) when document upload hits 429", async () => {
+    // Locale-sensitive assertion — pin zh-CN explicitly and restore
+    // afterward so it doesn't leak into later tests in this file (the
+    // i18n singleton persists its resolved language across `it` blocks).
+    const priorLang = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      const user = userEvent.setup();
+      createSessionMock.mockResolvedValue(sampleThread);
+      uploadDocumentMock.mockRejectedValue(
+        new ApiError("workspace is full — delete files to free space", "HTTP_429", 429),
+      );
+      renderPg();
+      await screen.findByTestId("playground-input");
+
+      const file = new File(["%PDF-1.4"], "report.pdf", {
+        type: "application/pdf",
+      });
+      await user.upload(screen.getByTestId("playground-doc-input"), file);
+
+      const alert = await screen.findByTestId("playground-upload-error");
+      expect(alert).toHaveTextContent("工作区已满");
+      expect(
+        screen.queryByTestId("playground-attachment"),
+      ).not.toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage(priorLang);
+    }
+  });
+
   it("accumulates turns across runs and parses per-turn token usage", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);

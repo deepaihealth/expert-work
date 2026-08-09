@@ -1193,6 +1193,7 @@ const zhCN: TranslationKeys = {
     attachments_label: "附件",
     remove_attachment: "移除附件",
     upload_failed: "图片上传失败",
+    workspace_full: "工作区已满,请清理文件后重试",
     uploading: "上传中…",
     transcript_label: "对话",
     turn_count: "共 {{n}} 轮",

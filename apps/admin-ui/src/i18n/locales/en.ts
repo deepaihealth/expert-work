@@ -1131,6 +1131,7 @@ export interface TranslationKeys {
     attachments_label: string;
     remove_attachment: string;
     upload_failed: string;
+    workspace_full: string;
     uploading: string;
     transcript_label: string;
     turn_count: string;
@@ -4134,6 +4135,7 @@ const en: TranslationKeys = {
     attachments_label: "Attachments",
     remove_attachment: "Remove attachment",
     upload_failed: "Image upload failed",
+    workspace_full: "Workspace is full — delete some files and retry",
     uploading: "Uploading…",
     transcript_label: "Conversation",
     turn_count: "{{n}} turns",

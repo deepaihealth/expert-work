@@ -18,7 +18,8 @@ export type QuotaDimension =
   | "monthly_token_budget"
   | "image_upload_count_30d"
   | "image_storage_bytes"
-  | "artifact_download_count_30d";
+  | "artifact_download_count_30d"
+  | "workspace_bytes_per_user";
 
 export interface TenantQuotaRecord {
   id: string;
