@@ -144,6 +144,15 @@ class WorkspacePermissionError(SandboxSupervisorError):
     """
 
 
+class WorkspaceQuotaExceededError(SandboxSupervisorError):
+    """用户工作区已到配额上限(沙箱迁移波 3 spec § 3.3 闸 A/B)。
+
+    control-plane 上传路径映射 429;run 内工具路径由 sandbox.py 的
+    acquire 包装转成 ToolBlockedError。与 sandbox_supervisor.domain 里的
+    同名异常无关,互不 import(那侧是冻结的 supervisor 服务内部错误)。
+    """
+
+
 @runtime_checkable
 class SandboxRuntime(Protocol):
     """The sandbox runtime operations the tool needs."""
@@ -568,12 +577,21 @@ async def run_in_sandbox(
     # Durability is automatic for user-scoped runs: pass through the run's
     # user so the supervisor mounts that user's persistent workspace volume;
     # no ``user_id`` (e.g. a system run) → an ephemeral tmpfs.
-    sandbox_id = await client.acquire(
-        tenant_id=ctx.tenant_id,
-        thread_id=thread_id,
-        user_id=ctx.user_id,
-        seed_files=seed_files,
-    )
+    try:
+        sandbox_id = await client.acquire(
+            tenant_id=ctx.tenant_id,
+            thread_id=thread_id,
+            user_id=ctx.user_id,
+            seed_files=seed_files,
+        )
+    except WorkspaceQuotaExceededError as exc:
+        # 波 3 闸 A:配额满是用户可自救的状态,不是基础设施错误 —— 转
+        # ToolBlockedError,LLM 拿到可转述的行动指引(spec § 3.3)。
+        msg = (
+            "user workspace is full (storage quota exceeded) — "
+            "ask the user to delete files from their workspace, then retry"
+        )
+        raise ToolBlockedError(msg) from exc
     cancelled = False
     try:
         return await client.exec(sandbox_id=sandbox_id, code=code, timeout_s=timeout_s)
