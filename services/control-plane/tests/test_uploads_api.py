@@ -712,6 +712,17 @@ class _RecordingWorkspaceQuotaService:
         self.written.append((tenant_id, user_id, delta_bytes))
 
 
+class _NoteWrittenRaisingWorkspaceQuotaService:
+    """Fake ``WorkspaceQuotaService`` — admits the check, ``note_written`` blows up."""
+
+    async def check_upload(self, *, tenant_id: UUID, user_id: UUID, incoming_bytes: int) -> None:
+        pass
+
+    async def note_written(self, *, tenant_id: UUID, user_id: UUID, delta_bytes: int) -> None:
+        msg = "quota store unavailable"
+        raise RuntimeError(msg)
+
+
 @pytest.mark.asyncio
 async def test_document_upload_429_when_over_quota() -> None:
     """``check_upload`` denies → 429 with the fixed detail text, and the
@@ -730,9 +741,11 @@ async def test_document_upload_429_when_over_quota() -> None:
 
 @pytest.mark.asyncio
 async def test_document_upload_accounts_size_on_success() -> None:
-    """On a successful write, ``note_written`` is called with
-    ``delta_bytes == len(raw)`` — the raw upload size, not any post-write
-    transform."""
+    """On a successful write, both ``check_upload`` and ``note_written``
+    are called with the real caller identity + ``== len(raw)`` — a
+    regression guard against the gate silently degrading into always
+    passing ``incoming_bytes=0`` (which would defeat it without any test
+    going red)."""
     client, thread_id, _store, app = await _doc_client()
     quota = _RecordingWorkspaceQuotaService()
     app.state.workspace_quota_service = quota  # type: ignore[attr-defined]
@@ -743,9 +756,38 @@ async def test_document_upload_accounts_size_on_success() -> None:
             files={"file": ("report.pdf", raw, "application/pdf")},
         )
     assert resp.status_code == 201
+    user = await app.state.tenant_user_repo.resolve(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, subject_type="user", subject_id="user-a"
+    )
+    assert quota.checked == [(_TENANT, user.id, len(raw))]
     assert len(quota.written) == 1
-    _tenant_id, _user_id, delta_bytes = quota.written[0]
+    tenant_id, user_id, delta_bytes = quota.written[0]
+    assert tenant_id == _TENANT
+    assert user_id == user.id
     assert delta_bytes == len(raw)
+
+
+@pytest.mark.asyncio
+async def test_document_upload_201_when_accounting_fails() -> None:
+    """``note_written`` raising must not fail the request — the write
+    already succeeded and the audit row is already SUCCESS by the time
+    accounting runs. Accounting is best-effort (janitor sweep corrects
+    drift, same trade-off as the service-side ``refresh``): a transient
+    quota-store error must not turn a completed upload into a
+    client-visible 500 — the client can't tell "upload failed" from
+    "upload succeeded, accounting hiccuped", and a retry on a false 500
+    would write a duplicate file."""
+    client, thread_id, store, app = await _doc_client()
+    app.state.workspace_quota_service = (  # type: ignore[attr-defined]
+        _NoteWrittenRaisingWorkspaceQuotaService()
+    )
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("report.pdf", b"%PDF-1.4 body", "application/pdf")},
+        )
+    assert resp.status_code == 201
+    assert len(store.workspace_writes) == 1
 
 
 @pytest.mark.asyncio

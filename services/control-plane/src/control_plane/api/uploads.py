@@ -168,6 +168,7 @@ async def _handle_document_upload(
         except WorkspaceQuotaExceededError as exc:
             # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
             # quota 语义一致。给用户留了自救路:删文件永远放行。
+            logger.warning("upload.workspace_quota_exceeded")
             raise HTTPException(
                 status_code=429,
                 detail="workspace is full — delete files to free space",
@@ -218,10 +219,16 @@ async def _handle_document_upload(
     )
     if quota_service is not None:
         # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。同名覆盖上传会
-        # 重复计数 —— 已知偏差,janitor 全量扫兜正,不做减法补偿。
-        await quota_service.note_written(
-            tenant_id=tenant_id, user_id=caller_user_id, delta_bytes=len(raw)
-        )
+        # 重复计数 —— 已知偏差,janitor 全量扫兜正,不做减法补偿。写已成功、
+        # audit 已记 SUCCESS,记账是 best-effort(与 service 侧 refresh 的取舍
+        # 一致):失败不该把整个请求打成 500——客户端分不清"上传失败"还是
+        # "记账打嗝",重试还会造重复文件。
+        try:
+            await quota_service.note_written(
+                tenant_id=tenant_id, user_id=caller_user_id, delta_bytes=len(raw)
+            )
+        except Exception:
+            logger.warning("upload.quota_accounting_failed", exc_info=True)
     return JSONResponse(
         status_code=201,
         content={"path": workspace_path, "kind": "document"},
