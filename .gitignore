@@ -38,3 +38,6 @@ tools/eval/datasets/.longmem_cache/
 
 # CM-N5 端到端断点续跑中间结果（数字进 baselines/，过程文件不进库）
 eval-out/
+
+# git worktrees for parallel SDD waves (never part of the tree itself)
+.worktrees/
