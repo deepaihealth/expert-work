@@ -1340,26 +1340,34 @@ class AgentSandboxClient:
         双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
         的 agent_key"。
 
-        ``umask 000 && `` 前缀(Task 4 审查 Critical 后续,原为跨 uid 写冲突
-        而加):``commands.run`` 走 ``/bin/bash -l -c cmd``(见上方
-        docstring),所以能在同一个 shell 里先设 umask 再 exec python——这个
-        bash 进程与它派生的 python 子进程(以及 python 里 LLM 代码自己
-        ``os.mkdir``/``open`` 出的每一个文件)全都继承它。不设的话,agent
-        代码在 ``/workspace`` 下自己建的目录/文件用沙箱默认 umask(常见
-        ``0o022``)掩过,变成 ``0o755``/``0o644``。
-
-        **方向变更之后(共享 gid → 统一 uid,见
+        ``umask 077 && `` 前缀:``commands.run`` 走 ``/bin/bash -l -c cmd``
+        (见上方 docstring),所以能在同一个 shell 里先设 umask 再 exec
+        python——这个 bash 进程与它派生的 python 子进程(以及 python 里
+        LLM 代码自己 ``os.mkdir``/``open`` 出的每一个文件)全都继承它。不
+        设的话,agent 代码在 ``/workspace`` 下自己建的目录/文件用沙箱默认
+        umask(常见 ``0o022``)掩过,变成 ``0o755``/``0o644``——比这个工作
+        区的属主专用目标更宽。``077`` 把 group/other 位清零,落地
+        ``0o700``/``0o600``,与 ``NasWorkspaceStore._DIR_MODE``/
+        ``_LEAF_FILE_MODE``(``nas_workspace_store.py``)同一个数字——这正
+        是同 uid 之后(见
         ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
-        § 六)这条前缀原本的理由已经不成立**——control-plane 现在与沙箱 agent 是同一个 uid
-        (10000),属主位本身就够两侧读写/删除,不再需要靠 world-writable 的
-        group/other 位兜底跨 uid 访问。留着它是**安全的超集**
-        (``0o777``/``0o666`` 严格宽于统一 uid 之后真正需要的
-        ``0o700``/``0o600``,不新增任何可见性),不是错,只是不再最小。收
-        紧它需要一次真栈验证(exec 产出的文件在统一 uid 之后确实还能被两侧
-        正常读写删除)——本次方向变更任务没有预算做这一步,留作后续任务,
-        这里刻意不动。跟本地 docker 后端(``runner.py`` 的 ``main()``,同一处
-        ``os.umask(0)``)同款的约束不变:两后端仍必须同款,契约测试
-        (``test_sandbox_runtime_contract.py``)钉住,不是各修各的。
+        § 六)这棵工作区自己定的目标状态,不是随手选的更严格值。
+
+        历史,免得以后又加回 ``000``:这条前缀原本是 ``umask 000``(完全放
+        开,``0o777``/``0o666``),Task 4 审查 Critical 后续为"跨 uid 写冲
+        突"而加——那时 control-plane 与沙箱 agent 是不同 uid,默认 umask 掩
+        出的 ``0o755``/``0o644`` 会让 control-plane 读得进却删/写不进。方向
+        变更之后两侧同一个 uid(10000),属主位本身就够,不再需要靠
+        world-writable 的 group/other 位兜底任何跨 uid 访问——所以直接收紧
+        到 ``077``,而不是继续留一个"曾经需要、现在不需要但也无害"的更宽
+        值。跟本地 docker 后端(``runner.py`` 的 ``main()``,同一处
+        ``os.umask(0o077)``)同款的约束不变:两后端仍必须同款,契约测试
+        (``test_sandbox_runtime_contract.py``)钉住,不是各修各的。这个值
+        还牵连 ``sandbox_supervisor.docker_client._AUX_CONTAINER_HARDENING_ARGS``
+        ——收紧到 ``077`` 之后 exec 产出的文件变成 ``0o700``/``0o600``,
+        supervisor 那些 ``--cap-drop ALL`` 的 root 辅助容器如果没有
+        ``--cap-add DAC_OVERRIDE`` 就读/写/删不动这些文件了(见该常量的注
+        释);这两处是同一次改动的两半,不能只改一半。
         """
         effective = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         effective = max(1, min(effective, MAX_TIMEOUT_S))
@@ -1373,7 +1381,7 @@ class AgentSandboxClient:
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             result = await sbx.commands.run(
-                f"umask 000 && python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
+                f"umask 077 && python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,

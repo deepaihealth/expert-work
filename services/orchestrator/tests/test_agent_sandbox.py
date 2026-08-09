@@ -964,20 +964,30 @@ async def test_exec_writes_code_to_file_not_shell_arg() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
+async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
     """``commands.run`` 走 ``/bin/bash -l -c cmd``,所以命令串必须以
-    ``umask 000 && `` 打头,让 bash 先放开 umask 再 exec python。与本地
-    supervisor 后端 ``runner.py.main()`` 的 ``os.umask(0)`` 是同一件事在
-    两个后端各自的落点,契约测试(``test_sandbox_runtime_contract.py``)
+    ``umask 077 && `` 打头,让 bash 先收紧 umask 再 exec python。与本地
+    supervisor 后端 ``runner.py.main()`` 的 ``os.umask(0o077)`` 是同一件事
+    在两个后端各自的落点,契约测试(``test_sandbox_runtime_contract.py``)
     钉住两者不会分叉。
 
-    **这条机制的原始理由已经作废**(2026-08-08 统一 uid,见
+    ``077`` 清空 group/other 位,exec 产出的目录/文件因此落
+    ``0o700``/``0o600``——与 ``NasWorkspaceStore._DIR_MODE``/
+    ``_LEAF_FILE_MODE``(``nas_workspace_store.py``)同一个数字,是这个工
+    作区(统一 uid 之后,见
     ``docs/superpowers/specs/2026-08-08-workspace-gid-sharing-design.md``
-    § 六):它当初是为"跨 uid 写冲突"而设——默认 umask 掩出的
-    ``0o755``/``0o644`` 会让**另一个 uid** 的 control-plane 读得进却删/写
-    不进。现在两侧同 uid,属主位本身就够。断言留着不删:``umask 000`` 落出
-    的 ``0o777``/``0o666`` 是比现在真正需要的 mode 更宽的**安全超集**,不是
-    错,只是不再最小;收紧它要真栈验证,是独立的后续任务。"""
+    § 六)自己定的属主专用目标状态,不是随手选的更严格值。
+
+    历史,免得以后又加回 ``000``:这条前缀原本是 ``umask 000``
+    (``0o777``/``0o666``,Task 4 审查 Critical 后续为"跨 uid 写冲突"而
+    加——control-plane 与沙箱 agent 是不同 uid 时,默认 umask 掩出的
+    ``0o755``/``0o644`` 会让 control-plane 读得进却删/写不进)。方向变更之
+    后两侧同一个 uid(10000),属主位本身就够,不再需要靠 world-writable 的
+    group/other 位兜底任何跨 uid 访问——所以直接收紧到 ``077``。这个值还
+    牵连 ``sandbox_supervisor.docker_client._AUX_CONTAINER_HARDENING_ARGS``
+    ——没有它新加的 ``--cap-add DAC_OVERRIDE``,supervisor 那些
+    ``--cap-drop ALL`` 的 root 辅助容器会读/写/删不动这些变窄之后的文件;
+    两处是同一次改动的两半。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
@@ -985,7 +995,7 @@ async def test_exec_sets_permissive_umask_before_running_the_script() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
     cmd, *_ = sdk.sandbox.commands.calls[-1]
-    assert cmd.startswith("umask 000 && python "), cmd
+    assert cmd.startswith("umask 077 && python "), cmd
 
 
 # ---------------------------------------------------------------------------
