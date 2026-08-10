@@ -30,6 +30,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -68,6 +69,34 @@ _SCRATCH_MAX_AGE_S = 24 * 3600.0
 
 #: 与 orchestrator ``agent_sandbox._SCRATCH_DIR`` 同值(私名不跨包 import)。
 _SCRATCH_DIR = "_scratch"
+
+
+def _list_uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
+    """列出 path 下目录名可解析为 UUID 的子目录——布局约定
+    (workspace_user_root)之外的东西(_scratch/.deleted/lost+found/垃圾)
+    天然被 UUID 解析挡掉。单目录扫描失败(NFS ESTALE、权限问题等 OSError)
+    不炸整轮——log + 返回已收集到的部分,让调用方(``_sweep_sizes``)继续
+    处理其余兄弟目录(照 Global Constraint「单目录/单用户失败 log + 继
+    续」,呼应 ``workspace_quota._du`` 同样的容错口径)。"""
+    out: list[tuple[UUID, Path]] = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    out.append((UUID(entry.name), Path(entry.path)))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning("workspace_janitor.scan_failed path=%s", path)
+        return out
+    return sorted(out, key=lambda t: str(t[0]))
 
 
 @dataclass
@@ -194,7 +223,21 @@ class WorkspaceJanitorWorker:
         """Task 4."""
 
     async def _sweep_sizes(self, stats: JanitorRunStats) -> None:
-        """Task 5."""
+        """文件系统为发现源:按 tenant/user 两层 UUID 目录全量扫,逐用户调
+        :meth:`WorkspaceQuotaService.refresh`(建行 + 软删早退 + du +
+        ``update_size``)。行不存在也扫——``refresh`` 自己会建行。单用户失败
+        log + 继续,不拖累其余用户(NAS 并发写删场景常态)。
+        """
+        root = Path(self._workspace_root)
+        for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
+            for user_id, _user_dir in await asyncio.to_thread(_list_uuid_dirs, tenant_dir):
+                try:
+                    await self._quota_service.refresh(tenant_id=tenant_id, user_id=user_id)
+                    stats.refreshed += 1
+                except Exception:
+                    logger.exception(
+                        "workspace_janitor.refresh_failed tenant=%s user=%s", tenant_id, user_id
+                    )
 
     async def _sweep_scratch(self, stats: JanitorRunStats) -> None:
         scratch_root = Path(self._workspace_root) / _SCRATCH_DIR

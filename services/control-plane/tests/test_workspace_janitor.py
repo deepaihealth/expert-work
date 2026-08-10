@@ -12,7 +12,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
@@ -131,3 +131,95 @@ async def test_stop_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     worker.start()
     await asyncio.sleep(0.05)  # 让循环进入 run_once
     await asyncio.wait_for(worker.stop(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_full_scan_discovers_from_filesystem_and_writes_sizes(tmp_path: Path) -> None:
+    """行不存在也扫(FS 为发现源,refresh 建行);字节数 = du 真值。"""
+    tenant, user_a, user_b = uuid4(), uuid4(), uuid4()
+    (tmp_path / str(tenant) / str(user_a)).mkdir(parents=True)
+    (tmp_path / str(tenant) / str(user_a) / "f1").write_bytes(b"x" * 100)
+    (tmp_path / str(tenant) / str(user_b) / "sub").mkdir(parents=True)
+    (tmp_path / str(tenant) / str(user_b) / "sub" / "f2").write_bytes(b"y" * 250)
+
+    worker, workspaces, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.refreshed == 2
+    row_a = await workspaces.get(tenant_id=tenant, user_id=user_a)
+    row_b = await workspaces.get(tenant_id=tenant, user_id=user_b)
+    assert row_a is not None and row_a.size_bytes == 100
+    assert row_b is not None and row_b.size_bytes == 250
+
+
+@pytest.mark.asyncio
+async def test_full_scan_skips_junk_and_special_dirs(tmp_path: Path) -> None:
+    """非 UUID 目录、.deleted、_scratch 都不进扫描;坏目录不炸整轮。"""
+    tenant = uuid4()
+    user = uuid4()
+    (tmp_path / str(tenant) / str(user)).mkdir(parents=True)
+    (tmp_path / str(tenant) / ".deleted").mkdir()
+    (tmp_path / str(tenant) / "not-a-uuid").mkdir()
+    (tmp_path / "_scratch" / str(uuid4())).mkdir(parents=True)
+    (tmp_path / "lost+found").mkdir()
+
+    worker, workspaces, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.refreshed == 1
+    assert await workspaces.get(tenant_id=tenant, user_id=user) is not None
+
+
+@pytest.mark.asyncio
+async def test_full_scan_one_user_failure_does_not_stop_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant, user_a, user_b = uuid4(), uuid4(), uuid4()
+    (tmp_path / str(tenant) / str(user_a)).mkdir(parents=True)
+    (tmp_path / str(tenant) / str(user_b)).mkdir(parents=True)
+
+    worker, _workspaces, _ = _build(tmp_path)
+    real_refresh = worker._quota_service.refresh
+    calls: list[UUID] = []
+
+    async def _flaky(*, tenant_id, user_id):  # 第一个用户炸,其余照常
+        calls.append(user_id)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        await real_refresh(tenant_id=tenant_id, user_id=user_id)
+
+    monkeypatch.setattr(worker._quota_service, "refresh", _flaky)
+    stats = await worker.run_once()
+    assert stats.refreshed == 1
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_full_scan_tenant_listing_failure_does_not_stop_other_tenants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个租户目录扫描失败(NFS ESTALE/权限等 OSError)不该炸掉整轮——
+    其余租户照常被扫,异常不逃逸出 ``run_once``。
+
+    ``_list_uuid_dirs(root)`` 按 UUID 字符串排序遍历租户,``bad_tenant``
+    故意钉成全零 UUID(排序必然排在随机 ``good_tenant`` 前面)——否则若
+    ``good_tenant`` 恰好先被处理完,即使少了本次要测的 ``except OSError``
+    兜底,``_run_cycle`` 那层粗粒度的按阶段 catch 也会让本断言巧合通过,
+    测不出真正要防的回归(单个坏租户拖累排在它*之后*的所有租户)。
+    """
+    bad_tenant, good_tenant, good_user = UUID(int=0), uuid4(), uuid4()
+    bad_tenant_dir = tmp_path / str(bad_tenant)
+    bad_tenant_dir.mkdir(parents=True)
+    (tmp_path / str(good_tenant) / str(good_user)).mkdir(parents=True)
+
+    real_scandir = os.scandir
+
+    def _flaky_scandir(path):
+        if Path(path) == bad_tenant_dir:
+            raise PermissionError("denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _flaky_scandir)
+
+    worker, workspaces, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.refreshed == 1
+    assert await workspaces.get(tenant_id=good_tenant, user_id=good_user) is not None
