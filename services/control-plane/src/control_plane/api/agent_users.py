@@ -522,11 +522,11 @@ def build_tenant_users_router() -> APIRouter:
         analytics / asset rows (token_usage / agent_run / skill / eval /
         curation — the row is KEPT, the user link nulled), soft-delete the
         workspace volume (mark deleted; archive and release are completed
-        asynchronously by janitor at 30-minute granularity; purge returns when
-        the mark lands only), and soft-deactivate the ``tenant_user`` row.
-        Best-effort per step + idempotent — the returned summary carries
-        per-store counts and any step that failed; re-running is a safe no-op
-        that retries the failures.
+        asynchronously by janitor at 30-minute granularity; purge only
+        guarantees the mark has landed by the time it returns), and
+        soft-deactivate the ``tenant_user`` row. Best-effort per step +
+        idempotent — the returned summary carries per-store counts and any step
+        that failed; re-running is a safe no-op that retries the failures.
 
         Data-only, for *any* user in the tenant — an external end-user, an
         employee (console member), or the caller purging themself: purging

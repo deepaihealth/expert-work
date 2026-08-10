@@ -19,10 +19,10 @@
 ## 配额调整
 
 - **管理界面**:设置 → 租户配额 → 维度选 `workspace_bytes_per_user`,limit_value 单位字节。
-- **API**:`PUT /v1/tenants/{tenant_id}/quotas`(照租户配额既有 CRUD;curl 示例):
+- **API**:`POST /v1/tenants/{tenant_id}/quotas`(upsert;curl 示例):
 
   ```bash
-  curl -X PUT \
+  curl -X POST \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
     -d '{
