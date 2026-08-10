@@ -274,6 +274,7 @@ class AuditAction(StrEnum):
     API_KEY_CREATE = "api_key:create"
     API_KEY_REVOKE = "api_key:revoke"
     API_KEY_ROTATE = "api_key:rotate"  # Stream K.K1
+    API_KEY_REVEAL = "api_key:reveal"
     # memory (Stream K.K6)
     MEMORY_UPDATE = "memory:update"
     MEMORY_FORGET = "memory:forget"

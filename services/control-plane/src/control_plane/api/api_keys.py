@@ -31,6 +31,7 @@ from expert_work.persistence.auth import (
 )
 from expert_work.protocol import ApiKey, ApiKeyCreated, ApiKeyScope, AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.secret_store import SecretNotFoundError, SecretStore
 
 logger = logging.getLogger("expert_work.control_plane.api.api_keys")
 
@@ -76,6 +77,23 @@ def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
+def _vault_name(tenant_id: UUID, api_key_id: UUID) -> str:
+    return f"expert-work/tenant/{tenant_id}/api-key/{api_key_id}"
+
+
+def _get_secret_store(request: Request) -> SecretStore:
+    return request.app.state.secret_store  # type: ignore[no-any-return]
+
+
+async def _find_api_key(keys: ApiKeyStore, *, tenant_id: UUID, api_key_id: UUID) -> ApiKey | None:
+    """Fetch one row by id — ``ApiKeyStore`` has no single-id ``get``
+    (only list methods), so this scans the tenant's key list."""
+    for row in await keys.list_by_tenant(tenant_id=tenant_id):
+        if row.id == api_key_id:
+            return row
+    return None
+
+
 def build_api_keys_router() -> APIRouter:
     router = APIRouter(tags=["api_keys"])
 
@@ -89,6 +107,7 @@ def build_api_keys_router() -> APIRouter:
         principal: Annotated[Principal, Depends(require("api_key", "write"))],
         keys: Annotated[ApiKeyStore, Depends(_get_keys)],
         accounts: Annotated[ServiceAccountStore, Depends(_get_accounts)],
+        secrets: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         sa = await accounts.get(
@@ -127,6 +146,10 @@ def build_api_keys_router() -> APIRouter:
                         detail={"code": "INTERNAL_ERROR", "message": "regenerate API key"},
                     ) from None
                 generated = mint_api_key(tenant_id=principal.tenant_id)
+        try:
+            await secrets.put(_vault_name(principal.tenant_id, key.id), generated.plaintext)
+        except Exception:
+            logger.warning("api_key.vault_put_failed api_key_id=%s", key.id)
         await emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -203,11 +226,16 @@ def build_api_keys_router() -> APIRouter:
         api_key_id: UUID,
         principal: Annotated[Principal, Depends(require("api_key", "delete"))],
         keys: Annotated[ApiKeyStore, Depends(_get_keys)],
+        secrets: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
         ok = await keys.revoke(tenant_id=principal.tenant_id, api_key_id=api_key_id)
         if not ok:
             raise HTTPException(status_code=404, detail="api_key not found")
+        try:
+            await secrets.delete(_vault_name(principal.tenant_id, api_key_id))
+        except Exception:
+            logger.warning("api_key.vault_delete_failed api_key_id=%s", api_key_id)
         await emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -224,6 +252,7 @@ def build_api_keys_router() -> APIRouter:
         payload: RotateApiKeyRequest,
         principal: Annotated[Principal, Depends(require("api_key", "write"))],
         keys: Annotated[ApiKeyStore, Depends(_get_keys)],
+        secrets: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         """Stream K.K1 — double-active key rotation.
@@ -276,6 +305,18 @@ def build_api_keys_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="api_key not found")
 
         old_key, new_key = result
+        # rotate() always mints a fresh id for the new row (the old row is
+        # kept in place, stamped with rotated_at, for the grace window) —
+        # so the vault write follows the id, and the old id's plaintext is
+        # no longer viewable once rotated.
+        try:
+            await secrets.put(_vault_name(principal.tenant_id, new_key.id), generated.plaintext)
+        except Exception:
+            logger.warning("api_key.vault_put_failed api_key_id=%s", new_key.id)
+        try:
+            await secrets.delete(_vault_name(principal.tenant_id, old_key.id))
+        except Exception:
+            logger.warning("api_key.vault_delete_failed api_key_id=%s", old_key.id)
         await emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -298,5 +339,43 @@ def build_api_keys_router() -> APIRouter:
             },
             "error": None,
         }
+
+    @router.post("/v1/api_keys/{api_key_id}/reveal")
+    async def reveal_api_key(
+        api_key_id: UUID,
+        principal: Annotated[Principal, Depends(require("api_key", "write"))],
+        keys: Annotated[ApiKeyStore, Depends(_get_keys)],
+        secrets: Annotated[SecretStore, Depends(_get_secret_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> dict[str, object]:
+        """Re-display the plaintext bearer for a previously created key.
+
+        Only keys minted (or rotated) after vault storage landed have a
+        plaintext to show — older rows 404 with
+        ``API_KEY_PLAINTEXT_UNAVAILABLE`` (rotate to get a viewable one).
+        """
+        record = await _find_api_key(keys, tenant_id=principal.tenant_id, api_key_id=api_key_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail={"code": "API_KEY_NOT_FOUND"})
+        try:
+            plaintext = await secrets.get(_vault_name(principal.tenant_id, api_key_id))
+        except SecretNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "API_KEY_PLAINTEXT_UNAVAILABLE",
+                    "message": "key predates reveal support; rotate to get a viewable one",
+                },
+            ) from exc
+        await emit(
+            audit,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.subject_id,
+            action=AuditAction.API_KEY_REVEAL,
+            resource_type="api_key",
+            resource_id=str(api_key_id),
+            trace_id=current_trace_id_hex(),
+        )
+        return {"success": True, "data": {"plaintext": plaintext}, "error": None}
 
     return router

@@ -14,13 +14,16 @@ from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api.api_keys import _vault_name
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditAction, AuditQuery
+from expert_work.runtime.secret_store import SecretNotFoundError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -70,6 +73,32 @@ async def admin_client(
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
         yield client
+
+
+@pytest.fixture
+async def admin_client_and_app(
+    audit_store: InMemoryAuditLogStore,
+) -> AsyncIterator[tuple[AsyncClient, FastAPI]]:
+    """Same wiring as ``admin_client``, but also yields ``app`` so a test
+    can reach ``app.state`` directly — e.g. to seed an ``api_key`` row
+    that bypasses the create endpoint (and so never lands in the vault),
+    or to inspect ``app.state.secret_store`` after an endpoint call."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        yield client, app
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +431,136 @@ async def test_api_key_rotation_refuses_revoked_key(admin_client: AsyncClient) -
         headers=_admin_headers(),
     )
     assert rotated.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /v1/api_keys/{id}/reveal — plaintext re-display via the encrypted vault
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_then_reveal_roundtrip(admin_client: AsyncClient) -> None:
+    """The plaintext handed back at creation is exactly what reveal returns."""
+    minted = await _mint_key(admin_client)
+    key_id = minted["api_key"]["id"]
+    plaintext = minted["plaintext"]
+
+    revealed = await admin_client.post(f"/v1/api_keys/{key_id}/reveal", headers=_admin_headers())
+    assert revealed.status_code == 200
+    body = revealed.json()
+    assert body["success"] is True
+    assert body["error"] is None
+    assert body["data"]["plaintext"] == plaintext
+
+
+@pytest.mark.asyncio
+async def test_reveal_is_audited(
+    admin_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """Reveal writes an ``api_key:reveal`` audit row, and no audit row's
+    serialized JSON ever contains the plaintext (details stay clean)."""
+    minted = await _mint_key(admin_client)
+    key_id = minted["api_key"]["id"]
+    plaintext = minted["plaintext"]
+
+    revealed = await admin_client.post(f"/v1/api_keys/{key_id}/reveal", headers=_admin_headers())
+    assert revealed.status_code == 200
+
+    page = await audit_store.query(AuditQuery(tenant_id=_TENANT))
+    reveal_rows = [r for r in page.entries if r.action is AuditAction.API_KEY_REVEAL]
+    assert len(reveal_rows) == 1
+    assert reveal_rows[0].resource_id == key_id
+
+    for row in page.entries:
+        assert plaintext not in row.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_reveal_predates_vault_404(
+    admin_client_and_app: tuple[AsyncClient, FastAPI],
+) -> None:
+    """A key row created directly in the store — bypassing the create
+    endpoint, so nothing was ever ``put`` into the vault — reveals as
+    404 ``API_KEY_PLAINTEXT_UNAVAILABLE`` (the pre-existing-key path)."""
+    client, app = admin_client_and_app
+    sa = (
+        await client.post(
+            "/v1/service_accounts",
+            json={"name": "predates-vault", "description": ""},
+            headers=_admin_headers(),
+        )
+    ).json()["data"]
+
+    row = await app.state.api_key_repo.create(
+        tenant_id=_TENANT,
+        service_account_id=UUID(sa["id"]),
+        prefix=f"hk_{uuid4().hex[:8]}",
+        secret_hash="x" * 64,
+        scopes=[],
+        expires_at=None,
+        created_by="seed",
+    )
+
+    revealed = await client.post(f"/v1/api_keys/{row.id}/reveal", headers=_admin_headers())
+    assert revealed.status_code == 404
+    assert revealed.json()["detail"]["code"] == "API_KEY_PLAINTEXT_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_revoke_clears_vault(
+    admin_client_and_app: tuple[AsyncClient, FastAPI],
+) -> None:
+    """``DELETE /v1/api_keys/{id}`` also purges the vault entry — ``get()``
+    on that name raises ``SecretNotFoundError`` afterward."""
+    client, app = admin_client_and_app
+    minted = await _mint_key(client)
+    key_id = minted["api_key"]["id"]
+
+    revoke = await client.delete(f"/v1/api_keys/{key_id}", headers=_admin_headers())
+    assert revoke.status_code == 204
+
+    vault_name = _vault_name(_TENANT, UUID(key_id))
+    with pytest.raises(SecretNotFoundError):
+        await app.state.secret_store.get(vault_name)
+
+
+@pytest.mark.asyncio
+async def test_rotate_stores_new_plaintext(admin_client: AsyncClient) -> None:
+    """After rotate, revealing the *new* key id returns the rotated
+    plaintext — not the plaintext from the original create call."""
+    minted = await _mint_key(admin_client)
+    old_plaintext = minted["plaintext"]
+
+    rotate = await admin_client.post(
+        f"/v1/api_keys/{minted['api_key']['id']}/rotate",
+        json={"grace_period_s": 300},
+        headers=_admin_headers(),
+    )
+    assert rotate.status_code == 201
+    new_body = rotate.json()["data"]["new_api_key"]
+    new_key_id = new_body["api_key"]["id"]
+    new_plaintext = new_body["plaintext"]
+    assert new_plaintext != old_plaintext
+
+    revealed = await admin_client.post(
+        f"/v1/api_keys/{new_key_id}/reveal", headers=_admin_headers()
+    )
+    assert revealed.status_code == 200
+    assert revealed.json()["data"]["plaintext"] == new_plaintext
+
+
+@pytest.mark.asyncio
+async def test_list_response_has_no_plaintext(admin_client: AsyncClient) -> None:
+    """The plaintext must never leak through ``GET /v1/api_keys`` — neither
+    the actual secret string nor a stray ``plaintext`` field on any row."""
+    minted = await _mint_key(admin_client)
+    plaintext = minted["plaintext"]
+
+    listing = await admin_client.get("/v1/api_keys", headers=_admin_headers())
+    assert listing.status_code == 200
+    assert plaintext not in listing.text
+    for item in listing.json()["data"]["items"]:
+        assert "plaintext" not in item
 
 
 # ---------------------------------------------------------------------------
