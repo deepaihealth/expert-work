@@ -216,6 +216,9 @@ class Settings(BaseSettings):
     #: 波 2 —— NAS 工作区根(control-plane Pod 内挂载点)。设了即选
     #: ``NasWorkspaceStore``(优先于 supervisor 代理);None → 按老路径。
     workspace_nas_root: str | None = None
+    #: 沙箱迁移波 3 (spec § 五) —— WorkspaceJanitorWorker 扫描周期。
+    #: 30 分钟:归档消费 + 配额全量扫兜底 + _scratch 清理共用一轮。
+    workspace_janitor_interval_s: int = Field(default=1800, gt=0)
     #: 波 2 —— 沙箱挂工作区用的 PV 名(csi-volume-config 的 pvName)。
     sandbox_workspace_pv_name: str | None = None
     #: 波 2 —— csi-volume-config subPath 前缀(探针定语义;"" = 相对 PV path)。
