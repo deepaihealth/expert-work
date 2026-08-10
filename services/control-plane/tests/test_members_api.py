@@ -8,6 +8,7 @@ revoke/suspend branches.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
 
@@ -39,6 +40,50 @@ async def admin_app(
     kc = FakeKeycloakAdminClient()
     app = create_app(
         settings=settings,
+        lifecycle=lifecycle,
+        jwt_verifier=jwt_verifier,
+        keycloak_admin_client=kc,
+        audit_logger=build_default_audit_logger(audit_store),
+    )
+    tenant_id = uuid4()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        yield client, tenant_id, app, kc
+
+
+@pytest.fixture
+async def app_password_mode(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+    audit_store: InMemoryAuditLogStore,
+) -> AsyncIterator[tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient]]:
+    """Same wiring as ``admin_app`` but with ``member_provisioning_mode="password"``."""
+    kc = FakeKeycloakAdminClient()
+    app = create_app(
+        settings=settings.model_copy(update={"member_provisioning_mode": "password"}),
+        lifecycle=lifecycle,
+        jwt_verifier=jwt_verifier,
+        keycloak_admin_client=kc,
+        audit_logger=build_default_audit_logger(audit_store),
+    )
+    tenant_id = uuid4()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        yield client, tenant_id, app, kc
+
+
+@pytest.fixture
+async def app_email_mode(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+    audit_store: InMemoryAuditLogStore,
+) -> AsyncIterator[tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient]]:
+    """Same wiring as ``admin_app`` but with ``member_provisioning_mode="email"`` explicit."""
+    kc = FakeKeycloakAdminClient()
+    app = create_app(
+        settings=settings.model_copy(update={"member_provisioning_mode": "email"}),
         lifecycle=lifecycle,
         jwt_verifier=jwt_verifier,
         keycloak_admin_client=kc,
@@ -976,3 +1021,112 @@ async def test_list_members_foreign_tenant_user_403(
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"]["code"] == "TENANT_NOT_ALLOWED"
+
+
+# ---------------------------------------------------------------------------
+# member-password-provisioning Task 2 — invite/resend password branch.
+#
+# ``member_provisioning_mode == "password"`` swaps the Keycloak set-password
+# email for a server-generated temporary password (Task 1's
+# ``generate_initial_password``), written via ``reset_password(temporary=True)``
+# and returned once in the response. Global constraint: the password never
+# lands in the audit log.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invite_password_mode_sets_temp_password_and_skips_email(
+    app_password_mode: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    client, tenant_id, _app, kc = app_password_mode
+    resp = await client.post(
+        "/v1/members/invite",
+        json={"invitations": [{"email": "pw-mode@example.com", "role": "viewer"}]},
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["data"]["results"][0]
+    pw = item["initial_password"]
+    assert re.fullmatch(r"[a-z]+-[a-z]+-[a-z]+-\d{4}", pw)
+    assert kc.password_resets[-1][2] is True  # temporary
+    assert kc.password_resets[-1][1] == pw  # 响应里的就是写进 KC 的
+    assert len(kc.users) == 1
+    stored = next(iter(kc.users.values()))
+    assert stored.emails_sent == 0  # 不发邮件
+    assert stored.email_verified is True  # email_verified
+
+
+@pytest.mark.asyncio
+async def test_invite_email_mode_unchanged(
+    app_email_mode: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    client, tenant_id, _app, kc = app_email_mode
+    resp = await client.post(
+        "/v1/members/invite",
+        json={"invitations": [{"email": "em-mode@example.com", "role": "viewer"}]},
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 201, resp.text
+    item = resp.json()["data"]["results"][0]
+    assert item["initial_password"] is None
+    assert kc.password_resets == []
+    assert len(kc.users) == 1
+    stored = next(iter(kc.users.values()))
+    assert stored.emails_sent == 1
+    assert stored.email_verified is False
+
+
+@pytest.mark.asyncio
+async def test_resend_password_mode_regenerates(
+    app_password_mode: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    # 先邀请拿到 member_id 与第一枚密码,再 resend,断言:新密码 != 旧密码、
+    # 又一次 reset_password(temporary=True)、仍然零邮件。
+    client, tenant_id, _app, kc = app_password_mode
+    inv = await client.post(
+        "/v1/members/invite",
+        json={"invitations": [{"email": "resend-pw@example.com", "role": "viewer"}]},
+        headers=_admin_headers(tenant_id),
+    )
+    assert inv.status_code == 201, inv.text
+    item = inv.json()["data"]["results"][0]
+    member_id = item["member_id"]
+    first_pw = item["initial_password"]
+    assert first_pw is not None
+
+    resend_resp = await client.post(
+        f"/v1/members/{member_id}/resend", headers=_admin_headers(tenant_id)
+    )
+    assert resend_resp.status_code == 200, resend_resp.text
+    second_pw = resend_resp.json()["data"]["initial_password"]
+    assert second_pw is not None
+    assert second_pw != first_pw
+
+    assert len(kc.password_resets) == 2
+    assert kc.password_resets[-1][2] is True  # temporary again
+    assert kc.password_resets[-1][1] == second_pw
+    stored = next(iter(kc.users.values()))
+    assert stored.emails_sent == 0  # still zero emails
+
+
+@pytest.mark.asyncio
+async def test_password_never_in_audit(
+    app_password_mode: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    # invite 后扫全部已 emit 的 audit 事件序列化 JSON,断言初始密码子串不出现。
+    from expert_work.protocol import AuditQuery
+
+    client, tenant_id, _app, _kc = app_password_mode
+    resp = await client.post(
+        "/v1/members/invite",
+        json={"invitations": [{"email": "audit-pw@example.com", "role": "viewer"}]},
+        headers=_admin_headers(tenant_id),
+    )
+    assert resp.status_code == 201, resp.text
+    pw = resp.json()["data"]["results"][0]["initial_password"]
+    assert pw is not None
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    serialized = "\n".join(entry.model_dump_json() for entry in page.entries)
+    assert pw not in serialized
