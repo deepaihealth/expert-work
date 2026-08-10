@@ -22,15 +22,11 @@ import {
   App,
   Button,
   Checkbox,
-  Col,
   DatePicker,
   Empty,
   Form,
-  Layout,
-  Menu,
   Modal,
   Popconfirm,
-  Row,
   Select,
   Space,
   Table,
@@ -42,6 +38,7 @@ import type { TableColumnsType } from "antd";
 import {
   AlertTriangle,
   Copy,
+  Eye,
   Key,
   RotateCcw,
   ShieldAlert,
@@ -57,6 +54,7 @@ import {
   createApiKey,
   listApiKeys,
   listServiceAccounts,
+  revealApiKey,
   revokeApiKey,
   rotateApiKey,
   type ApiKeyCreated,
@@ -66,15 +64,7 @@ import {
 } from "../api/api_keys";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 
-const { Sider } = Layout;
 const { Text } = Typography;
-
-const SETTINGS_MENU = [
-  { key: "api-keys", label: "API Keys" },
-  { key: "service-accounts", label: "Service Accounts" },
-  { key: "role-bindings", label: "Role Bindings" },
-  { key: "audit", label: "Audit" },
-];
 
 type RowStatus = "active" | "grace" | "revoked" | "expired";
 
@@ -100,6 +90,9 @@ export function SettingsApiKeys() {
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [showOnce, setShowOnce] = useState<ApiKeyCreated | null>(null);
+  // Plaintext lives only in component state — cleared the instant the
+  // modal closes, never persisted or logged.
+  const [viewingKey, setViewingKey] = useState<string | null>(null);
   const [form] = Form.useForm<{
     serviceAccountId: string;
     scopes: ApiKeyScope[];
@@ -182,6 +175,21 @@ export function SettingsApiKeys() {
     }
   };
 
+  const handleView = async (apiKeyId: string) => {
+    try {
+      const { plaintext } = await revealApiKey(apiKeyId);
+      setViewingKey(plaintext);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "API_KEY_PLAINTEXT_UNAVAILABLE") {
+        message.info(t("api_keys.view_unavailable"));
+      } else if (err instanceof ApiError) {
+        message.error(err.message);
+      } else if (err instanceof Error) {
+        message.error(err.message);
+      }
+    }
+  };
+
   const handleRevoke = async (apiKeyId: string) => {
     try {
       await revokeApiKey(apiKeyId);
@@ -239,7 +247,7 @@ export function SettingsApiKeys() {
         const cls = classifyKey(r);
         return (
           <Tag color={statusTagColor[cls]} bordered={false}>
-            {cls}
+            {t(`api_keys.status_${cls}`)}
           </Tag>
         );
       },
@@ -275,6 +283,17 @@ export function SettingsApiKeys() {
         if (cls === "revoked") return null;
         return (
           <Space size={4}>
+            {cls === "active" && (
+              <Tooltip title={t("api_keys.view")}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<Eye size={14} strokeWidth={1.5} />}
+                  onClick={() => void handleView(r.id)}
+                  data-testid={`api-key-view-${r.id}`}
+                />
+              </Tooltip>
+            )}
             <Tooltip title={t("api_keys.rotate")}>
               <Button
                 type="text"
@@ -323,58 +342,42 @@ export function SettingsApiKeys() {
         }
       />
 
-      <Row gutter={24}>
-        <Col flex="200px">
-          <Layout style={{ background: "transparent" }}>
-            <Sider width={200} style={{ background: "transparent" }}>
-              <Menu
-                mode="inline"
-                selectedKeys={["api-keys"]}
-                items={SETTINGS_MENU}
-                style={{ background: "transparent", border: "none" }}
-              />
-            </Sider>
-          </Layout>
-        </Col>
-        <Col flex="auto">
-          {error !== null && (
-            <Alert
-              type="error"
-              showIcon
-              message={t("api_keys.failed_to_load")}
-              description={error}
-              style={{ marginBottom: 16 }}
-              data-testid="api-keys-error"
-            />
-          )}
+      {error !== null && (
+        <Alert
+          type="error"
+          showIcon
+          message={t("api_keys.failed_to_load")}
+          description={error}
+          style={{ marginBottom: 16 }}
+          data-testid="api-keys-error"
+        />
+      )}
 
-          {inRotation > 0 && (
-            <Alert
-              showIcon
-              icon={<AlertTriangle size={16} strokeWidth={1.5} />}
-              type="warning"
-              message={<strong>{t("api_keys.rotation_banner", { count: inRotation })}</strong>}
-              description={t("api_keys.rotation_help")}
-              style={{ marginBottom: 16 }}
-            />
-          )}
+      {inRotation > 0 && (
+        <Alert
+          showIcon
+          icon={<AlertTriangle size={16} strokeWidth={1.5} />}
+          type="warning"
+          message={<strong>{t("api_keys.rotation_banner", { count: inRotation })}</strong>}
+          description={t("api_keys.rotation_help")}
+          style={{ marginBottom: 16 }}
+        />
+      )}
 
-          <Table<ApiKeyRecord>
-            className="ew-table"
-            rowKey="id"
-            columns={columns}
-            dataSource={keys}
-            loading={loading}
-            pagination={false}
-            locale={{
-              emptyText: (
-                <Empty description={t("api_keys.empty")} />
-              ),
-            }}
-            data-testid="api-keys-table"
-          />
-        </Col>
-      </Row>
+      <Table<ApiKeyRecord>
+        className="ew-table"
+        rowKey="id"
+        columns={columns}
+        dataSource={keys}
+        loading={loading}
+        pagination={false}
+        locale={{
+          emptyText: (
+            <Empty description={t("api_keys.empty")} />
+          ),
+        }}
+        data-testid="api-keys-table"
+      />
 
       <Modal
         title={t("api_keys.create")}
@@ -406,27 +409,34 @@ export function SettingsApiKeys() {
             label={t("api_keys.scopes_label")}
             rules={[{ required: true, message: t("api_keys.scopes_required") }]}
           >
-            <Checkbox.Group>
-              <Row>
-                {API_KEY_SCOPES.map((s) => (
-                  <Col key={s} span={12} style={{ marginBottom: 6 }}>
-                    <Checkbox value={s}>
-                      <Text code style={{ fontSize: 12 }}>
-                        {s}
+            <Checkbox.Group style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+              {API_KEY_SCOPES.map((s) => (
+                <Checkbox key={s} value={s} style={{ alignItems: "flex-start" }}>
+                  <div>
+                    <Text code style={{ fontSize: 12 }}>
+                      {s}
+                    </Text>
+                    {s === "admin" && (
+                      <Tag color="error" bordered={false} style={{ marginLeft: 6, fontSize: 10 }}>
+                        <ShieldAlert size={10} strokeWidth={1.5} style={{ verticalAlign: "middle", marginRight: 2 }} />
+                        {t("api_keys.dangerous")}
+                      </Tag>
+                    )}
+                    <div>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {t(`api_keys.scope_help_${s}`)}
                       </Text>
-                      {s === "admin" && (
-                        <Tag color="error" bordered={false} style={{ marginLeft: 6, fontSize: 10 }}>
-                          <ShieldAlert size={10} strokeWidth={1.5} style={{ verticalAlign: "middle", marginRight: 2 }} />
-                          {t("api_keys.dangerous")}
-                        </Tag>
-                      )}
-                    </Checkbox>
-                  </Col>
-                ))}
-              </Row>
+                    </div>
+                  </div>
+                </Checkbox>
+              ))}
             </Checkbox.Group>
           </Form.Item>
-          <Form.Item name="expiresAt" label={t("api_keys.expires_label")}>
+          <Form.Item
+            name="expiresAt"
+            label={t("api_keys.expires_label")}
+            extra={t("api_keys.expires_extra")}
+          >
             <DatePicker style={{ width: "100%" }} />
           </Form.Item>
         </Form>
@@ -486,6 +496,22 @@ export function SettingsApiKeys() {
               <Text code>{showOnce.api_key.prefix}</Text>
             </p>
           </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={viewingKey !== null}
+        onCancel={() => setViewingKey(null)}
+        onOk={() => setViewingKey(null)}
+        okText={t("api_keys.view_close")}
+        cancelButtonProps={{ style: { display: "none" } }}
+        title={t("api_keys.view_title")}
+        data-testid="api-key-view-modal"
+      >
+        {viewingKey !== null && (
+          <Text code copyable style={{ wordBreak: "break-all" }}>
+            {viewingKey}
+          </Text>
         )}
       </Modal>
     </div>

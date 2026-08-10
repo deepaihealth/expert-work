@@ -2606,6 +2606,10 @@ export interface TranslationKeys {
     col_scopes: string;
     col_service_account: string;
     col_status: string;
+    status_active: string;
+    status_grace: string;
+    status_revoked: string;
+    status_expired: string;
     col_last_used: string;
     col_expires: string;
     rotate: string;
@@ -2617,13 +2621,21 @@ export interface TranslationKeys {
     service_account_required: string;
     scopes_label: string;
     scopes_required: string;
+    scope_help_read: string;
+    scope_help_write: string;
+    scope_help_admin: string;
     expires_label: string;
+    expires_extra: string;
     dangerous: string;
     show_once_title: string;
     show_once_ack: string;
     show_once_help_prefix: string;
     show_once_help_emphasis: string;
     show_once_prefix_note: string;
+    view: string;
+    view_title: string;
+    view_close: string;
+    view_unavailable: string;
     copy: string;
     copied: string;
   };
@@ -5785,6 +5797,10 @@ const en: TranslationKeys = {
     col_scopes: "Scopes",
     col_service_account: "Service Account",
     col_status: "Status",
+    status_active: "Active",
+    status_grace: "Grace window",
+    status_revoked: "Revoked",
+    status_expired: "Expired",
     col_last_used: "Last used",
     col_expires: "Expires",
     rotate: "Rotate",
@@ -5797,13 +5813,25 @@ const en: TranslationKeys = {
     service_account_required: "Pick a service account",
     scopes_label: "Scopes",
     scopes_required: "Pick at least one scope",
+    scope_help_read:
+      "Read-only: query sessions, run results, the Agent list, and other GET endpoints",
+    scope_help_write:
+      "Business write: invoke Agent runs, create/continue sessions, upload files (excludes read-only queries)",
+    scope_help_admin:
+      "Admin: manage service accounts and keys, change authorizations — do not share with third parties",
     expires_label: "Expires at",
+    expires_extra: "Leave blank for no expiry; keys shared outside your org should have an expiry set.",
     dangerous: "dangerous",
     show_once_title: "API Key created",
     show_once_ack: "I saved the key, close",
     show_once_help_prefix: "Copy this key immediately and store it securely — ",
-    show_once_help_emphasis: "you will not be able to view the full key again",
-    show_once_prefix_note: "Only the prefix is retained on the list:",
+    show_once_help_emphasis:
+      "you can always click “View” in the list later to retrieve the full key again",
+    show_once_prefix_note: "The list column shows the prefix — click View there to get the full key: ",
+    view: "View",
+    view_title: "API Key plaintext",
+    view_close: "Close",
+    view_unavailable: "This key predates plaintext reveal support; rotate it to get a viewable key.",
     copy: "Copy",
     copied: "Copied to clipboard",
   },
