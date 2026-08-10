@@ -6,11 +6,13 @@ import asyncio
 import io
 import tarfile
 import threading
+import time
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+import control_plane.workspace_archive as wa
 from control_plane.workspace_archive import (
     empty_tar_gz_bytes,
     stream_directory_tar_gz,
@@ -73,6 +75,41 @@ async def test_early_consumer_exit_does_not_leak_thread(tmp_path: Path) -> None:
     gen = stream_directory_tar_gz(src, chunk_size=64)
     await gen.__anext__()  # 只取一块
     await gen.aclose()  # 早退 → 打包线程必须退出
+    for _ in range(100):
+        if threading.active_count() <= before:
+            break
+        await asyncio.sleep(0.05)
+    assert threading.active_count() <= before
+
+
+@pytest.mark.timeout(15)
+@pytest.mark.asyncio
+async def test_cancel_while_parked_on_empty_queue_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """消费方在拿到第一块之前就被取消(worker 卡在空队列的 get 里)——清理必须在
+    有界时间内完成,不得悬挂,也不得留下永久驻留的线程。回归:executor 消费侧
+    早退清理复用同一个单线程池提交 thread.join,若 get 端不肯让出 worker,
+    join 永远排不上号 → 消费方自己的取消清理也跟着死锁。"""
+    src = tmp_path / "src"
+    src.mkdir()
+
+    def stalling_produce(directory: Path, writer: wa._QueueWriter) -> None:
+        # 生产者故意迟迟不写第一块,保证消费方的 get 撞上空队列;
+        # 一旦消费方早退置位 abort,立刻退出(不傻等满 10s)。
+        for _ in range(200):  # 至多 10s,正常路径下 abort 会在毫秒级提前触发
+            if writer._abort.is_set():
+                return
+            time.sleep(0.05)
+        writer.emit_raw(wa._DONE)
+
+    monkeypatch.setattr(wa, "_produce", stalling_produce)
+
+    before = threading.active_count()
+    gen = wa.stream_directory_tar_gz(src, chunk_size=64)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(gen.__anext__(), timeout=0.2)
+
     for _ in range(100):
         if threading.active_count() <= before:
             break

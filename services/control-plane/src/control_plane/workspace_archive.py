@@ -20,6 +20,8 @@ from uuid import UUID
 
 _QUEUE_DEPTH = 4
 _DONE = object()
+_ABORTED = object()  # 消费方轮询 get 时撞见 abort——早于任何 item 到达
+_POLL_INTERVAL = 0.1
 
 
 def workspace_archive_key(tenant_id: UUID, user_id: UUID, workspace_id: UUID) -> str:
@@ -92,6 +94,24 @@ def _produce(directory: Path, writer: _QueueWriter) -> None:
             return
 
 
+def _poll_get(q: queue.Queue[object], abort: threading.Event) -> object:
+    """有超时地等下一条 item;abort 置位后 <=_POLL_INTERVAL 就交回控制权。
+
+    consume 侧和 ``_QueueWriter._emit`` 用同一套轮询手法,原因也相同:这个
+    调用是提交给专用单线程 executor 的一个任务,如果直接裸 ``q.get()``(无
+    超时)且队列一直空,worker 会被永久占住——消费方取消/早退时,``finally``
+    要把 ``thread.join`` 也提交到同一个 worker 收尾,若 worker 被卡死在这
+    里,join 永远排不上号,清理本身就死锁了。
+    """
+    while True:
+        if abort.is_set():
+            return _ABORTED
+        try:
+            return q.get(timeout=_POLL_INTERVAL)
+        except queue.Empty:
+            continue
+
+
 async def stream_directory_tar_gz(
     directory: Path, *, chunk_size: int = 1024 * 1024
 ) -> AsyncIterator[bytes]:
@@ -113,8 +133,8 @@ async def stream_directory_tar_gz(
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="workspace-archive-io") as pool:
         try:
             while True:
-                item = await loop.run_in_executor(pool, q.get)
-                if item is _DONE:
+                item = await loop.run_in_executor(pool, _poll_get, q, abort)
+                if item is _DONE or item is _ABORTED:
                     return
                 if isinstance(item, BaseException):
                     raise item
