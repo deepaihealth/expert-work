@@ -563,6 +563,38 @@ async def test_list_response_has_no_plaintext(admin_client: AsyncClient) -> None
         assert "plaintext" not in item
 
 
+@pytest.mark.asyncio
+async def test_reveal_rejects_other_tenant_key(admin_client: AsyncClient) -> None:
+    """Tenant A must not reveal tenant B's key — the tenant filter has to
+    reject before the vault is ever touched, so this is 404
+    ``API_KEY_NOT_FOUND`` (not ``API_KEY_PLAINTEXT_UNAVAILABLE``, which
+    would imply the key was found but had no vault entry)."""
+    other_tenant = uuid4()
+    other_headers = {
+        "Authorization": "Bearer "
+        + make_test_jwt(tenant_id=other_tenant, subject="tenant-b-admin", roles=("admin",))
+    }
+
+    sa = (
+        await admin_client.post(
+            "/v1/service_accounts",
+            json={"name": "tenant-b-sa", "description": ""},
+            headers=other_headers,
+        )
+    ).json()["data"]
+    create_key = await admin_client.post(
+        f"/v1/service_accounts/{sa['id']}/api_keys",
+        json={"scopes": ["admin"]},
+        headers=other_headers,
+    )
+    assert create_key.status_code == 201
+    key_id = create_key.json()["data"]["api_key"]["id"]
+
+    revealed = await admin_client.post(f"/v1/api_keys/{key_id}/reveal", headers=_admin_headers())
+    assert revealed.status_code == 404
+    assert revealed.json()["detail"]["code"] == "API_KEY_NOT_FOUND"
+
+
 # ---------------------------------------------------------------------------
 # /v1/role_bindings
 # ---------------------------------------------------------------------------
