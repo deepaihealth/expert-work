@@ -170,3 +170,8 @@ cd infra && docker compose --profile full up -d
   密码只在那一次创建/重发响应与 admin-ui 的一次性面板里出现——不落库、
   不进审计、不进日志,关掉面板后唯一找回方式是「重发」(重新生成)或
   成员页「重置密码」。测试集群当前为 `password`(2026-08-10 起)。
+
+`email` 模式时代创建的账号,在切到 `password` 模式后走「重发」能拿到临时密码,
+但其 Keycloak `emailVerified` 仍为 `False`——当前 realm 未开强制邮箱验证,所以
+不拦登录;若将来开 realm 级 `verifyEmail`,这批账号会因无 SMTP 被锁死,切模式前
+需批量补 `verified` 标记。

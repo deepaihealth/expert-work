@@ -4657,7 +4657,7 @@ const en: TranslationKeys = {
     field_first_admin_email: "First admin email (optional)",
     field_first_admin_display_name: "First admin display name (optional)",
     first_admin_hint:
-      "Provisions the company's first admin and sends a set-password email. In dev (no SMTP) set the password in the Keycloak admin console instead.",
+      "Also provisions the company's first admin account. How it's activated (email or an initial password) is determined by platform configuration.",
     first_admin_email_invalid: "Enter a valid email address",
     first_admin_provisioned: "First admin invited:",
     credentials_close: "I've saved it, close",
