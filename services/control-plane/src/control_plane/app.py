@@ -232,6 +232,7 @@ from control_plane.tenant_status import TenantStatusService
 from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolService
 from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
+from control_plane.workspace_janitor import WorkspaceJanitorWorker
 from control_plane.workspace_lock import PgWorkspaceLock
 from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.common.credentials import CredentialsResolver
@@ -1288,6 +1289,7 @@ def create_app(
             approval_gauge_worker: ApprovalGaugeWorker | None = None
             sandbox_reap_worker: SandboxReapWorker | None = None
             sandbox_egress_metrics_worker: SandboxEgressMetricsWorker | None = None
+            workspace_janitor_worker: WorkspaceJanitorWorker | None = None
             if agent_runtime is None:
                 if resolved_settings.checkpointer_backend == "postgres":
                     if not resolved_settings.checkpointer_dsn:
@@ -1468,6 +1470,20 @@ def create_app(
                     )
                 )
                 _app.state.object_store = object_store
+                # 沙箱迁移波 3 (spec § 五):janitor 只在云工作区路径
+                # (quota gate 已组装)时上岗——条件跟随实际组装物,
+                # 照 SandboxReapWorker 的 isinstance 先例,不另开开关。
+                if resolved_workspace_quota is not None and resolved_settings.workspace_nas_root:
+                    workspace_janitor_worker = WorkspaceJanitorWorker(
+                        user_workspaces=resolved_user_workspace_store,
+                        quota_service=resolved_workspace_quota,
+                        object_store=object_store,
+                        workspace_root=resolved_settings.workspace_nas_root,
+                        session_factory=sql_stores.session_factory if sql_stores else None,
+                        interval_s=float(resolved_settings.workspace_janitor_interval_s),
+                    )
+                    workspace_janitor_worker.start()
+                    _app.state.workspace_janitor_worker = workspace_janitor_worker
                 # skill-asset-store — only a DURABLE backend may hold skill
                 # supporting-file bytes (memory loses them on restart).
                 skill_asset_store = (
@@ -2167,6 +2183,8 @@ def create_app(
                     await sandbox_reap_worker.stop()
                 if sandbox_egress_metrics_worker is not None:
                     await sandbox_egress_metrics_worker.stop()
+                if workspace_janitor_worker is not None:
+                    await workspace_janitor_worker.stop()
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.
