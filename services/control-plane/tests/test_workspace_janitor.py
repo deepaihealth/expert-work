@@ -447,7 +447,7 @@ async def test_archive_marker_scan_failure_does_not_stop_other_tenants(
         # removal — only compare when ``path`` is actually path-like, else
         # the good tenant's own successful archive would trip a spurious
         # ``TypeError`` from ``Path(path)`` on an int fd.
-        if isinstance(path, (str, os.PathLike)) and Path(path) == bad_marker_dir:
+        if isinstance(path, str | os.PathLike) and Path(path) == bad_marker_dir:
             raise PermissionError("denied")
         return real_scandir(path)
 

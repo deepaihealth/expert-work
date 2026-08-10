@@ -39,7 +39,7 @@
 1. **找 key**:
 
    ```sql
-   SELECT id, archived_object_key FROM user_workspace 
+   SELECT id, archived_object_key FROM user_workspace
    WHERE tenant_id='…' AND user_id='…';
    ```
 
