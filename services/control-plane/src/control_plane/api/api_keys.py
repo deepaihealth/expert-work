@@ -235,7 +235,9 @@ def build_api_keys_router() -> APIRouter:
         try:
             await secrets.delete(_vault_name(principal.tenant_id, api_key_id))
         except Exception:
-            logger.warning("api_key.vault_delete_failed api_key_id=%s", api_key_id)
+            # 不带 api_key_id:它是用户可控的路径参数(CodeQL log-injection 面),
+            # 且紧随其后的 API_KEY_REVOKE 审计行已带 resource_id,同请求可关联。
+            logger.warning("api_key.vault_delete_failed tenant_id=%s", principal.tenant_id)
         await emit(
             audit,
             tenant_id=principal.tenant_id,
