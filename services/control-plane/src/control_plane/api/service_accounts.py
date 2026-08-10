@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._authz import require
+from control_plane.api.api_keys import _vault_name
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -19,11 +20,13 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.auth import (
+    ApiKeyStore,
     DuplicateServiceAccountError,
     ServiceAccountStore,
 )
 from expert_work.protocol import AuditAction, Principal, ServiceAccount
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.secret_store import SecretStore
 
 logger = logging.getLogger("expert_work.control_plane.api.service_accounts")
 
@@ -43,6 +46,14 @@ class ServiceAccountListResponse(BaseModel):
 
 def _get_repo(request: Request) -> ServiceAccountStore:
     return request.app.state.service_account_repo  # type: ignore[no-any-return]
+
+
+def _get_keys(request: Request) -> ApiKeyStore:
+    return request.app.state.api_key_repo  # type: ignore[no-any-return]
+
+
+def _get_secret_store(request: Request) -> SecretStore:
+    return request.app.state.secret_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -122,8 +133,21 @@ def build_service_accounts_router() -> APIRouter:
         service_account_id: UUID,
         principal: Annotated[Principal, Depends(require("service_account", "delete"))],
         repo: Annotated[ServiceAccountStore, Depends(_get_repo)],
+        keys: Annotated[ApiKeyStore, Depends(_get_keys)],
+        secrets: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
+        # ``api_key`` rows FK-cascade on SA delete (ondelete="CASCADE"), but
+        # the vault has no such cascade — purge each key's vault entry
+        # first (best-effort) or the plaintext orphans forever.
+        for key in await keys.list_by_service_account(
+            tenant_id=principal.tenant_id, service_account_id=service_account_id
+        ):
+            try:
+                await secrets.delete(_vault_name(principal.tenant_id, key.id))
+            except Exception:
+                logger.warning("service_account.delete.vault_delete_failed api_key_id=%s", key.id)
+
         removed = await repo.delete(
             tenant_id=principal.tenant_id, service_account_id=service_account_id
         )

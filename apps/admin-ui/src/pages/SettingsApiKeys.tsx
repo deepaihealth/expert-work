@@ -283,7 +283,7 @@ export function SettingsApiKeys() {
         if (cls === "revoked") return null;
         return (
           <Space size={4}>
-            {cls !== "expired" && (
+            {cls === "active" && (
               <Tooltip title={t("api_keys.view")}>
                 <Button
                   type="text"

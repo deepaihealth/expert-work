@@ -168,6 +168,27 @@ async def test_admin_can_delete_service_account(admin_client: AsyncClient) -> No
     assert deleted.status_code == 204
 
 
+@pytest.mark.asyncio
+async def test_delete_service_account_purges_vault_orphans(
+    admin_client_and_app: tuple[AsyncClient, FastAPI],
+) -> None:
+    """``api_key`` rows FK-cascade (``ondelete=CASCADE``) when the parent
+    ``service_account`` is deleted, but the vault has no such cascade —
+    the endpoint must purge each key's vault entry itself or the
+    plaintext orphans forever with the DB row gone."""
+    client, app = admin_client_and_app
+    minted = await _mint_key(client)
+    sa_id = minted["api_key"]["service_account_id"]
+    key_id = minted["api_key"]["id"]
+
+    deleted = await client.delete(f"/v1/service_accounts/{sa_id}", headers=_admin_headers())
+    assert deleted.status_code == 204
+
+    vault_name = _vault_name(_TENANT, UUID(key_id))
+    with pytest.raises(SecretNotFoundError):
+        await app.state.secret_store.get(vault_name)
+
+
 # ---------------------------------------------------------------------------
 # /v1/service_accounts/{id}/api_keys
 # ---------------------------------------------------------------------------

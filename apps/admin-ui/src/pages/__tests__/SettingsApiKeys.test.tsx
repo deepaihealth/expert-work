@@ -206,4 +206,20 @@ describe("SettingsApiKeys", () => {
     expect(screen.queryByTestId("api-key-view-key-revoked")).toBeNull();
     expect(screen.queryByTestId("api-key-view-key-expired")).toBeNull();
   });
+
+  it("hides the view button for grace-window rows (backend vault entry is already gone)", async () => {
+    const grace = {
+      ...activeKey,
+      id: "key-grace",
+      rotated_at: new Date().toISOString(),
+      grace_period_s: 300,
+    };
+    installAdapter([keyListHandler([activeKey, grace]), saListHandler()]);
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("api-key-view-key-1")).toBeInTheDocument());
+    expect(screen.queryByTestId("api-key-view-key-grace")).toBeNull();
+    // rotate/revoke stay visible for grace rows — only view is gated.
+    expect(screen.getByTestId("api-key-rotate-key-grace")).toBeInTheDocument();
+    expect(screen.getByTestId("api-key-revoke-key-grace")).toBeInTheDocument();
+  });
 });
