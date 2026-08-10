@@ -18,8 +18,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-import control_plane.workspace_quota as workspace_quota_module
-from control_plane.workspace_quota import WorkspaceQuotaService
+import control_plane.workspace_quota as workspace_quota
 from expert_work.persistence.quota import InMemoryTenantQuotaStore
 from expert_work.persistence.quota.base import TenantQuotaStore
 from expert_work.persistence.workspace import InMemoryUserWorkspaceStore
@@ -40,8 +39,8 @@ def _make_service(
     user_workspaces: UserWorkspaceStore | None = None,
     tenant_quotas: TenantQuotaStore | None = None,
     debounce_s: float = 60.0,
-) -> WorkspaceQuotaService:
-    return WorkspaceQuotaService(
+) -> workspace_quota.WorkspaceQuotaService:
+    return workspace_quota.WorkspaceQuotaService(
         user_workspaces=user_workspaces or InMemoryUserWorkspaceStore(),
         tenant_quotas=tenant_quotas or InMemoryTenantQuotaStore(),
         workspace_root=tmp_path_str,
@@ -234,7 +233,7 @@ async def test_refresh_skips_vanished_subdir_but_keeps_scanning_siblings(
             raise FileNotFoundError(key)
         return nullcontext(entries)
 
-    monkeypatch.setattr(workspace_quota_module.os, "scandir", fake_scandir)
+    monkeypatch.setattr(workspace_quota.os, "scandir", fake_scandir)
 
     user_workspaces = InMemoryUserWorkspaceStore()
     service = _make_service(workspace_root, user_workspaces=user_workspaces)

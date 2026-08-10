@@ -162,6 +162,7 @@ from expert_work.protocol.provider_catalog import (
 from expert_work.protocol.quality_drift_alert import QualityDriftAlertRecord
 from expert_work.protocol.quality_score import QualityScoreRecord
 from expert_work.protocol.quota import (
+    DEFAULT_WORKSPACE_BYTES_PER_USER,
     CheckRequest,
     CheckResult,
     CommitRequest,
@@ -270,6 +271,7 @@ __all__ = [
     "DEFAULT_CHUNK_OVERLAP_TOKENS",
     "DEFAULT_RETRIEVAL_TOP_K",
     "DEFAULT_SKILL_LAZY_LOAD",
+    "DEFAULT_WORKSPACE_BYTES_PER_USER",
     "FIELD_TIERS",
     "MAX_RESULT_EXCERPT_CHARS",
     "MODEL_CATALOG",

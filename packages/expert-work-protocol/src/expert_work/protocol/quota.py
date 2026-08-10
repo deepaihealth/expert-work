@@ -25,6 +25,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "DEFAULT_WORKSPACE_BYTES_PER_USER",
     "CheckRequest",
     "CheckResult",
     "CommitRequest",
