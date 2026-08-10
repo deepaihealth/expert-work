@@ -2784,7 +2784,7 @@ const zhCN: TranslationKeys = {
     show_once_ack: "我已保存,关闭",
     show_once_help_prefix: "请立即复制密钥并安全保存 — ",
     show_once_help_emphasis: "之后可在列表中点击『查看』再次获取完整密钥",
-    show_once_prefix_note: "列表中仅保留前缀:",
+    show_once_prefix_note: "表格列展示的是前缀,完整密钥在列表点『查看』获取:",
     view: "查看",
     view_title: "API 密钥明文",
     view_close: "关闭",

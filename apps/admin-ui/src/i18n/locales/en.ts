@@ -5819,7 +5819,7 @@ const en: TranslationKeys = {
     show_once_help_prefix: "Copy this key immediately and store it securely — ",
     show_once_help_emphasis:
       "you can always click “View” in the list later to retrieve the full key again",
-    show_once_prefix_note: "Only the prefix is retained on the list:",
+    show_once_prefix_note: "The list column shows the prefix — click View there to get the full key: ",
     view: "View",
     view_title: "API Key plaintext",
     view_close: "Close",
