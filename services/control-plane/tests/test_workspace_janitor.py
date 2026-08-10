@@ -411,3 +411,50 @@ async def test_archive_upload_failure_isolates_and_retries_next_round(tmp_path: 
 
     stats2 = await worker.run_once()
     assert stats2.archived == 1  # A 补上
+
+
+@pytest.mark.asyncio
+async def test_archive_marker_scan_failure_does_not_stop_other_tenants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个租户的 ``.deleted`` 目录扫描失败(NFS ESTALE/权限等 OSError)不
+    该炸掉整轮归档——其余租户照常被归档,异常不逃逸出 ``run_once``。
+
+    照 ``test_full_scan_tenant_listing_failure_does_not_stop_other_tenants``
+    的同款配方:``bad_tenant`` 钉成全零 UUID,排序必然排在随机
+    ``good_tenant`` 前面(``_list_uuid_dirs`` 按 UUID 字符串排序遍历租
+    户)——否则若 ``good_tenant`` 恰好先被处理完,即使少了本次要测的
+    ``except OSError`` 兜底,``_run_cycle`` 那层粗粒度的按阶段 catch 也会
+    让本断言巧合通过,测不出真正要防的回归(单个坏租户的 marker 扫描失
+    败拖累排在它*之后*的所有租户)。
+    """
+    from orchestrator.tools.nas_workspace_store import DELETED_DIR
+
+    bad_tenant, bad_user = UUID(int=0), uuid4()
+    good_tenant, good_user = uuid4(), uuid4()
+    for tenant, user in ((bad_tenant, bad_user), (good_tenant, good_user)):
+        d = tmp_path / str(tenant) / str(user)
+        d.mkdir(parents=True)
+        (d / "f").write_bytes(b"z")
+        _mark_deleted(tmp_path, tenant, user)
+
+    bad_marker_dir = tmp_path / str(bad_tenant) / DELETED_DIR
+    real_scandir = os.scandir
+
+    def _flaky_scandir(path: Any) -> Any:
+        # ``shutil.rmtree`` internally re-enters ``os.scandir`` with a raw
+        # fd (the safe-fd variant) for the *good* tenant's directory
+        # removal — only compare when ``path`` is actually path-like, else
+        # the good tenant's own successful archive would trip a spurious
+        # ``TypeError`` from ``Path(path)`` on an int fd.
+        if isinstance(path, (str, os.PathLike)) and Path(path) == bad_marker_dir:
+            raise PermissionError("denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _flaky_scandir)
+
+    worker, workspaces, _ = _build_counting(tmp_path)
+    stats = await worker.run_once()
+    assert stats.archived == 1
+    row_good = await workspaces.get(tenant_id=good_tenant, user_id=good_user)
+    assert row_good is not None and row_good.archived_object_key is not None

@@ -245,6 +245,9 @@ class WorkspaceJanitorWorker:
                             continue
             except FileNotFoundError:
                 return []
+            except OSError:
+                logger.warning("workspace_janitor.marker_scan_failed path=%s", tenant_dir)
+                return out
             return sorted(out, key=str)
 
         for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
