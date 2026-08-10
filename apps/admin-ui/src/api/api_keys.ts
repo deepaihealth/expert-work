@@ -81,6 +81,10 @@ export async function createApiKey(
   );
 }
 
+export async function revealApiKey(apiKeyId: string): Promise<{ plaintext: string }> {
+  return postJson<{ plaintext: string }>(`/v1/api_keys/${apiKeyId}/reveal`, {});
+}
+
 export async function revokeApiKey(apiKeyId: string): Promise<void> {
   // DELETE returns 204; the response body is empty, so we don't go
   // through ``unwrap``.
