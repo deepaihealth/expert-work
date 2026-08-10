@@ -74,12 +74,18 @@ _SCRATCH_DIR = "_scratch"
 def _list_uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
     """列出 path 下目录名可解析为 UUID 的子目录——布局约定
     (workspace_user_root)之外的东西(_scratch/.deleted/lost+found/垃圾)
-    天然被 UUID 解析挡掉。"""
+    天然被 UUID 解析挡掉。单目录扫描失败(NFS ESTALE、权限问题等 OSError)
+    不炸整轮——log + 返回已收集到的部分,让调用方(``_sweep_sizes``)继续
+    处理其余兄弟目录(照 Global Constraint「单目录/单用户失败 log + 继
+    续」,呼应 ``workspace_quota._du`` 同样的容错口径)。"""
     out: list[tuple[UUID, Path]] = []
     try:
         with os.scandir(path) as it:
             for entry in it:
-                if not entry.is_dir(follow_symlinks=False):
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
                     continue
                 try:
                     out.append((UUID(entry.name), Path(entry.path)))
@@ -87,6 +93,9 @@ def _list_uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
                     continue
     except FileNotFoundError:
         return []
+    except OSError:
+        logger.warning("workspace_janitor.scan_failed path=%s", path)
+        return out
     return sorted(out, key=lambda t: str(t[0]))
 
 

@@ -190,3 +190,36 @@ async def test_full_scan_one_user_failure_does_not_stop_others(
     stats = await worker.run_once()
     assert stats.refreshed == 1
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_full_scan_tenant_listing_failure_does_not_stop_other_tenants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个租户目录扫描失败(NFS ESTALE/权限等 OSError)不该炸掉整轮——
+    其余租户照常被扫,异常不逃逸出 ``run_once``。
+
+    ``_list_uuid_dirs(root)`` 按 UUID 字符串排序遍历租户,``bad_tenant``
+    故意钉成全零 UUID(排序必然排在随机 ``good_tenant`` 前面)——否则若
+    ``good_tenant`` 恰好先被处理完,即使少了本次要测的 ``except OSError``
+    兜底,``_run_cycle`` 那层粗粒度的按阶段 catch 也会让本断言巧合通过,
+    测不出真正要防的回归(单个坏租户拖累排在它*之后*的所有租户)。
+    """
+    bad_tenant, good_tenant, good_user = UUID(int=0), uuid4(), uuid4()
+    bad_tenant_dir = tmp_path / str(bad_tenant)
+    bad_tenant_dir.mkdir(parents=True)
+    (tmp_path / str(good_tenant) / str(good_user)).mkdir(parents=True)
+
+    real_scandir = os.scandir
+
+    def _flaky_scandir(path):
+        if Path(path) == bad_tenant_dir:
+            raise PermissionError("denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _flaky_scandir)
+
+    worker, workspaces, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.refreshed == 1
+    assert await workspaces.get(tenant_id=good_tenant, user_id=good_user) is not None
