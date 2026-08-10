@@ -316,6 +316,7 @@ export interface TranslationKeys {
     workspace_scope_note: string;
     workspace_volume: string;
     workspace_size: string;
+    workspace_usage: string;
     workspace_none: string;
     workspace_files: string;
     workspace_files_empty: string;
@@ -3232,6 +3233,7 @@ const en: TranslationKeys = {
       "Workspace files and artifacts are the user's persistent assets, shared across agents.",
     workspace_volume: "Volume",
     workspace_size: "Size",
+    workspace_usage: "Used {{used}} / limit {{limit}} (approx., rescanned every 30 min)",
     workspace_none: "No workspace for this user yet.",
     workspace_files: "Files",
     workspace_files_empty: "No files.",
