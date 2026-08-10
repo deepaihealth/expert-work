@@ -73,3 +73,13 @@
 **装配 follow-up ✅ 已实现待合**(2026-07-21):LongTermMemorySpec 加 `rewrite_reads`(默认 **OFF**,取 plan de-risk 而非 spec 的 ON——加 per-recall LLM 调用、未验证,per-agent 可开)+ `abstain_threshold`(默认 0.0)两字段 + agent_factory 传 `rewrite_query`/`rewriter`/`abstain_threshold` 三参 + 前端 form_model/FormView/i18n en+zh-CN(仿 verify_reads 全套)+ 观测补齐(abstain 早退补 `record_memory_retrieval` miss、query 改写加 `record_memory_rewrite{rewritten|unchanged|degraded}`)。至此 P5a 全能力接入 agent 配置面。
 
 **P5b 待做**(P5a 合并后单独 plan):run 溯源(`source_run_id`)+ 完整 bi-temporal(valid_at/expired_at/invalid_at/supersedes 版本链 + reconcile 改 append-only + 时间旅行 as_of 检索)+ per-fact 预测复核 + 对话内 correction→invalidate。
+
+## 小项 — NAS SetDirQuota 点杀
+
+**问题**:单个惯犯用户在 janitor 30 分钟窗口内绕过增量记账狂写,应用层闸受限于计量粒度,NAS OpenAPI 可作运维补救。
+
+**目标**:对超限恒犯用户手工 SetDirQuota(目录级硬配额),兜底应用层闸的时间盲区。
+
+**为什么不全量接线**:调研结论 docs/research/2026-08-10-nas-setdirquota-feasibility.md ——
+500 配额上限 × 多租户 SaaS 规模 = 不能全覆盖;应用层闸已闭环且体验更好(含自救路);
+OpenAPI 状态独立,易漂移。保留点杀用法作运维手段,不做产品面。
