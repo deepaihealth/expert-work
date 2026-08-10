@@ -106,7 +106,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
@@ -130,6 +130,21 @@ from orchestrator.tools.sandbox_image_contract import (
     WORKSPACE_ROOT,
 )
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
+
+
+class WorkspaceQuotaGate(Protocol):
+    """沙箱迁移波 3 —— 用户工作区配额闸(spec § 3.3)。``AgentSandboxClient``
+    的可选依赖:``quota_gate=None``(默认)时 :meth:`AgentSandboxClient.acquire`
+    /:meth:`~AgentSandboxClient.release` 整段跳过,行为与波 2 完全一致。
+    control-plane 在 Task 4 实现具体的 gate,本模块只定调用契约。
+    """
+
+    async def check(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """超限抛 WorkspaceQuotaExceededError;未超返回 None。"""
+
+    def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """fire-and-forget 触发该用户目录重算(实现侧自带 60s 防抖)。同步方法,内部自行调度。"""
+
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +360,17 @@ class AgentSandboxClient:
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
+    #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
+    #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
+    #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走
+    #: 构造参数 —— tenant_quota store 的构建晚于本 client。
+    quota_gate: WorkspaceQuotaGate | None = None
+    #: acquire 时记下 sandbox_id → (tenant_id, user_id),release/destroy 时
+    #: 反查身份触发配额重算。进程内(acquire/release 同进程成对);重启丢失
+    #: 无害 —— janitor 全量扫兜底(spec § 3.2 第 3 层)。
+    _session_identity: dict[UUID, tuple[UUID, UUID | None]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         """构造期不变式检查(同 ``ToolResult.__post_init__`` 的既有惯例:
@@ -533,6 +559,10 @@ class AgentSandboxClient:
         await self._prepare_workspace_mount(
             tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
         )
+        if user_id is not None and self.quota_gate is not None:
+            # 闸 A(spec § 3.3):已超才拦(>=)。放在 claim_warm 之前——
+            # 拦下时不留任何 store 行。
+            await self.quota_gate.check(tenant_id=tenant_id, user_id=user_id)
         existing: tuple[UUID, str, datetime | None] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
@@ -587,6 +617,10 @@ class AgentSandboxClient:
                         await self.store.mark_destroyed(
                             sandbox_id=winner_id, reason=_WARM_RECONNECT_DESTROY_REASON
                         )
+                        # 评审 Important-1:这行绕开了 destroy(),自己也要
+                        # 忘掉 winner_id 的身份缓存,见
+                        # :meth:`_forget_session_identity` docstring。
+                        self._forget_session_identity(winner_id)
                         # 重新占坑,让本次 acquire 的 sandbox_id 拥有一行 ——
                         # 否则下面的 set_container_id 无行可回填。槽位刚被让出,
                         # 正常情况下这次必赢;真撞上第三方竞争者(重新占坑输了)
@@ -662,6 +696,13 @@ class AgentSandboxClient:
                 # 那一行也已经健康登记过,种子文件写失败不该把它连锅端了。
                 await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
+        if self.quota_gate is not None:
+            # 沙箱迁移波 3 —— 记身份供 release/destroy 反查触发配额重算。放
+            # 在最终返回值确定之后:热复用分支上面已经把 sandbox_id 改写成
+            # 赢家的真实 id(见该分支注释),这里记的必须是那个 id,不是本
+            # 次调用开头自铸、从未插入任何行的 uuid4()。评审 Minor:没配
+            # gate 的部署(本地 compose)完全不记账,少一份无谓状态。
+            self._session_identity[sandbox_id] = (tenant_id, user_id)
         return sandbox_id
 
     async def _chown_workspace_mount(self, sbx: Any, *, sandbox_id: UUID) -> None:
@@ -1168,7 +1209,32 @@ class AgentSandboxClient:
 
         保温分支仍然不碰 store:热会话行保持 ``IN_USE``,``container_id``
         就是下次 connect 的凭据。
+
+        沙箱迁移波 3:配额重算的触发点在最前面,保温早退**之前**——热会话
+        路径本就不碰 store,如果把这句放在早退之后就永远轮不到它执行,而
+        恰恰是热会话(反复 acquire/release 同一个用户工作区)最需要按工具
+        调用频率驱动重算(spec § 3.2 记账第 2 层)。
         """
+        identity = self._session_identity.get(sandbox_id)
+        if identity is not None and identity[1] is not None and self.quota_gate is not None:
+            # spec § 3.2 记账第 2 层:每次工具调用 release 都触发,防抖在
+            # gate 实现侧(60s)。fire-and-forget:同步调度,不 await —— 但
+            # Protocol 的 "fire-and-forget" 只承诺调用方不必等结果,不承诺
+            # 它不抛。评审 Important-2:这里原来是裸调用,gate 实现里的一个
+            # bug 就会在 _is_warm_session/destroy 之前打断这个方法,直接
+            # 复现全分支终审 Important-1 那个洞(非保温沙箱漏一台活
+            # microVM + 一行永久 IN_USE)。best-effort,同
+            # :meth:`_remove_scratch_dir` 的取舍。
+            try:
+                self.quota_gate.refresh_soon(tenant_id=identity[0], user_id=identity[1])
+            except Exception:
+                logger.warning(
+                    "release: quota_gate.refresh_soon failed for sandbox %s — "
+                    "continuing release; the janitor full-scan sweep is the "
+                    "fallback recompute path (spec § 3.2 第 3 层)",
+                    sandbox_id,
+                    exc_info=True,
+                )
         if await self._is_warm_session(sandbox_id):
             return None
         await self.destroy(sandbox_id=sandbox_id, reason=_RELEASE_DESTROY_REASON)
@@ -1228,6 +1294,21 @@ class AgentSandboxClient:
             )
             return True
 
+    def _forget_session_identity(self, sandbox_id: UUID) -> None:
+        """沙箱迁移波 3 —— 忘掉一行的 ``(tenant, user)`` 身份缓存。
+
+        评审 Important-1:不能只在 :meth:`destroy` 里 pop——``acquire`` 的
+        重连失败重建分支与 :meth:`_clear_reaped_row`(``reap`` 的主清理
+        路径)都直接调 ``self.store.mark_destroyed(...)``,绕开了
+        :meth:`destroy`,原本各自漏了这一步,``_session_identity`` 因此无
+        界增长(每个正常走完生命周期的热会话都漏一条)。这三处是目前全部
+        让一行变成 ``destroyed`` 的入口,统一走这个小 helper 保证不再漏。
+
+        ``reap`` 清的可能是别的进程创建的 sandbox_id,本进程的字典里未必
+        有对应条目——``.pop(id, None)`` 容忍缺席。
+        """
+        self._session_identity.pop(sandbox_id, None)
+
     async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
         """强制拆除 —— 真 kill 沙箱并让出热会话坑。
 
@@ -1250,6 +1331,10 @@ class AgentSandboxClient:
             # 等价。
             logger.info("destroy: sandbox %s already gone", sandbox_id)
         await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        # 沙箱迁移波 3 —— 这一行的身份不再需要:非保温 release 走的正是这个
+        # 方法(年龄封顶重建 / exec_python 取消后的强制拆除同理)。见
+        # :meth:`_forget_session_identity` docstring——它不是唯一的调用点。
+        self._forget_session_identity(sandbox_id)
 
     async def exec(
         self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
@@ -1492,6 +1577,12 @@ class AgentSandboxClient:
         这一轮后面该回收的全漏。本地 supervisor 的 reaper 正是为此逐行包
         (``sandbox_supervisor/reaper.py``),这里照抄那个形状;而且 ``reap``
         现在是云后端唯一的回收机制、也是 C-1 卡死行的人工恢复入口。
+
+        评审 Important-1:这是空闲热会话的**主**清理路径,直接调
+        ``self.store.mark_destroyed(...)``,绕开了 :meth:`destroy`——不忘
+        身份缓存的话,每个正常走完生命周期的热会话都会在
+        ``_session_identity`` 里漏一条。只在 ``mark_destroyed`` 真成功时才
+        忘(见下面 ``except`` 分支提前 ``return 0``,行并未真的 destroyed)。
         """
         try:
             await self.store.mark_destroyed(sandbox_id=sandbox_id, reason=reason)
@@ -1504,4 +1595,5 @@ class AgentSandboxClient:
                 exc_info=True,
             )
             return 0
+        self._forget_session_identity(sandbox_id)
         return 1

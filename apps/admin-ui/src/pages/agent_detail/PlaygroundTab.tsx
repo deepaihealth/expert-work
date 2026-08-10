@@ -320,11 +320,13 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
           ]);
         } catch (err) {
           const message =
-            err instanceof ApiError
-              ? `${err.code}: ${err.message}`
-              : err instanceof Error
-                ? err.message
-                : "upload failed";
+            err instanceof ApiError && err.status === 429 && kind === "document"
+              ? t("playground.workspace_full")
+              : err instanceof ApiError
+                ? `${err.code}: ${err.message}`
+                : err instanceof Error
+                  ? err.message
+                  : "upload failed";
           setUploadError(message);
         } finally {
           setUploading(false);

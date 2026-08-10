@@ -55,6 +55,15 @@ class InMemoryUserWorkspaceStore(UserWorkspaceStore):
             raise WorkspaceNotFoundError(workspace_id)
         self._rows[key] = self._rows[key].model_copy(update={"size_bytes": size_bytes})
 
+    async def add_size(self, *, workspace_id: UUID, delta_bytes: int) -> None:
+        key = self._find_by_id(workspace_id)
+        if key is None:
+            return
+        row = self._rows[key]
+        self._rows[key] = row.model_copy(
+            update={"size_bytes": max(row.size_bytes + delta_bytes, 0)}
+        )
+
     async def soft_delete(self, *, workspace_id: UUID, now: datetime) -> None:
         key = self._find_by_id(workspace_id)
         if key is None:

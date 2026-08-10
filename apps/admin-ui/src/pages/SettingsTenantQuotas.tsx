@@ -50,7 +50,20 @@ const DIMENSION_OPTIONS: QuotaDimension[] = [
   "image_upload_count_30d",
   "image_storage_bytes",
   "artifact_download_count_30d",
+  "workspace_bytes_per_user",
 ];
+
+// 字节维度:limit_value 列附带人类可读换算,建行表单下方提示同一换算。
+const BYTES_DIMENSIONS: ReadonlySet<QuotaDimension> = new Set([
+  "image_storage_bytes",
+  "workspace_bytes_per_user",
+]);
+
+function formatBytesHint(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) return "";
+  const gib = v / 1024 ** 3;
+  return gib >= 1 ? `${gib % 1 === 0 ? gib : gib.toFixed(1)} GiB` : `${(v / 1024 ** 2).toFixed(0)} MiB`;
+}
 
 interface CreateForm {
   dimension: QuotaDimension;
@@ -158,7 +171,14 @@ export function SettingsTenantQuotas() {
       dataIndex: "limit_value",
       key: "limit_value",
       width: 160,
-      render: (v: number) => <Text strong>{v.toLocaleString()}</Text>,
+      render: (v: number, record: TenantQuotaRecord) =>
+        BYTES_DIMENSIONS.has(record.dimension) ? (
+          <Text strong>
+            {v.toLocaleString()} ({formatBytesHint(v)})
+          </Text>
+        ) : (
+          <Text strong>{v.toLocaleString()}</Text>
+        ),
     },
     {
       title: t("settings_ops.col_burst"),
