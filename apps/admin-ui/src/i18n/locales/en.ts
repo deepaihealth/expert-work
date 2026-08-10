@@ -2606,6 +2606,10 @@ export interface TranslationKeys {
     col_scopes: string;
     col_service_account: string;
     col_status: string;
+    status_active: string;
+    status_grace: string;
+    status_revoked: string;
+    status_expired: string;
     col_last_used: string;
     col_expires: string;
     rotate: string;
@@ -5793,6 +5797,10 @@ const en: TranslationKeys = {
     col_scopes: "Scopes",
     col_service_account: "Service Account",
     col_status: "Status",
+    status_active: "Active",
+    status_grace: "Grace window",
+    status_revoked: "Revoked",
+    status_expired: "Expired",
     col_last_used: "Last used",
     col_expires: "Expires",
     rotate: "Rotate",

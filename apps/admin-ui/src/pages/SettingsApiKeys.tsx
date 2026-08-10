@@ -247,7 +247,7 @@ export function SettingsApiKeys() {
         const cls = classifyKey(r);
         return (
           <Tag color={statusTagColor[cls]} bordered={false}>
-            {cls}
+            {t(`api_keys.status_${cls}`)}
           </Tag>
         );
       },
