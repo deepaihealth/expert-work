@@ -157,3 +157,21 @@ cd infra && docker compose --profile full up -d
 - 脚本只在 `EXPERT_WORK_DB_DSN` 指向可写 DB 时能跑 —— 受网络 + DB 凭证(ops 掌握)天然门控,无 HTTP 暴露。
 - 它只写 **一行** binding,不删、不提权既有行。
 - 这是**唯一**绕过"is_system_admin 才能授 is_system_admin"的代码路径,且需 infra 级访问。生产:从受控 ops 主机/跳板跑一次,用后收紧 DB 凭证;之后授权全走审计化 API。
+
+---
+
+## 成员开通模式(member_provisioning_mode)
+
+`EXPERT_WORK_MEMBER_PROVISIONING_MODE`:
+
+- `email`(默认):Keycloak set-password 邮件,依赖 realm SMTP 配置。
+- `password`:无 SMTP 依赖。建租户(带首管)/邀请成员时服务端生成
+  `word-word-word-NNNN` 初始密码写入 Keycloak(temporary,首登强制改密),
+  密码只在那一次创建/重发响应与 admin-ui 的一次性面板里出现——不落库、
+  不进审计、不进日志,关掉面板后唯一找回方式是「重发」(重新生成)或
+  成员页「重置密码」。测试集群当前为 `password`(2026-08-10 起)。
+
+`email` 模式时代创建的账号,在切到 `password` 模式后走「重发」能拿到临时密码,
+但其 Keycloak `emailVerified` 仍为 `False`——当前 realm 未开强制邮箱验证,所以
+不拦登录;若将来开 realm 级 `verifyEmail`,这批账号会因无 SMTP 被锁死,切模式前
+需批量补 `verified` 标记。

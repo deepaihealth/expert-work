@@ -36,6 +36,7 @@ import { KeyRound, RefreshCw, Send, Trash2, UserPlus, Users, UserX } from "lucid
 import { useTranslation } from "react-i18next";
 
 import { PageHeader } from "../components/PageHeader";
+import { OneTimeCredentialPanel } from "../components/OneTimeCredentialPanel";
 import {
   inviteMembers,
   listMembers,
@@ -44,6 +45,7 @@ import {
   resetMemberPassword,
   revokeMember,
   type InvitationItem,
+  type InviteResultItem,
   type MemberList,
   type MemberRole,
   type MemberStatus,
@@ -82,6 +84,15 @@ interface InviteForm {
   display_name?: string;
 }
 
+/** Generated-password-mode success item — narrows away the ``string | null
+ *  | undefined`` union so callers get a plain ``string`` password. Email
+ *  mode (or a failed item) never satisfies this. */
+function hasInitialPassword(
+  item: InviteResultItem,
+): item is InviteResultItem & { initial_password: string } {
+  return item.error_code === null && Boolean(item.initial_password);
+}
+
 export function SettingsMembers() {
   const { t } = useTranslation();
   const { message } = App.useApp();
@@ -101,6 +112,26 @@ export function SettingsMembers() {
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteSubmitting, setInviteSubmitting] = useState(false);
   const [inviteForm] = Form.useForm<InviteForm>();
+  // Generated-password mode: successful invite items that carry a one-time
+  // password. Non-null switches the drawer body/footer to the result view
+  // instead of closing — the password must stay visible until the admin
+  // explicitly closes. Reset whenever the drawer closes (any path), so a
+  // stale password never lingers past its one render.
+  const [inviteCredentials, setInviteCredentials] = useState<
+    Array<InviteResultItem & { initial_password: string }> | null
+  >(null);
+  // Same one-shot semantics for the resend action — a table-row action has
+  // no drawer of its own, so a dedicated modal carries the result instead.
+  const [resendCredential, setResendCredential] = useState<{
+    email: string;
+    password: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!inviteOpen) {
+      setInviteCredentials(null);
+    }
+  }, [inviteOpen]);
 
   const [pwTarget, setPwTarget] = useState<TenantMember | null>(null);
   const [pw, setPw] = useState("");
@@ -150,16 +181,25 @@ export function SettingsMembers() {
     try {
       const result = await inviteMembers([invitation]);
       const failed = result.results.filter((r) => r.error_code !== null);
+      const withPassword = result.results.filter(hasInitialPassword);
       if (failed.length > 0) {
         const detail = failed
           .map((r) => `${r.email} (${r.error_code})`)
           .join(", ");
         message.warning(t("settings_members.invite_partial_fail", { detail }));
-      } else {
-        message.success(t("settings_members.invite_success"));
       }
-      setInviteOpen(false);
-      inviteForm.resetFields();
+      if (withPassword.length > 0) {
+        // Response-driven: a generated password switches the drawer to the
+        // result view. It stays open until the admin explicitly closes it —
+        // unlike the plain-success path below, which auto-closes.
+        setInviteCredentials(withPassword);
+      } else {
+        if (failed.length === 0) {
+          message.success(t("settings_members.invite_success"));
+        }
+        setInviteOpen(false);
+        inviteForm.resetFields();
+      }
       refresh();
     } catch (err) {
       message.error(err instanceof Error ? err.message : "failed");
@@ -169,10 +209,16 @@ export function SettingsMembers() {
   }, [inviteForm, message, refresh, t]);
 
   const onResend = useCallback(
-    async (id: string) => {
+    async (id: string, email: string) => {
       try {
-        await resendMember(id);
-        message.success(t("settings_members.resent"));
+        const result = await resendMember(id);
+        if (result.initial_password) {
+          // Response-driven, same as invite: a generated password opens the
+          // one-time credential modal instead of the plain "resent" toast.
+          setResendCredential({ email, password: result.initial_password });
+        } else {
+          message.success(t("settings_members.resent"));
+        }
         refresh();
       } catch (err) {
         message.error(err instanceof Error ? err.message : "failed");
@@ -317,7 +363,7 @@ export function SettingsMembers() {
                     size="small"
                     disabled={isTenantSwitched}
                     icon={<Send size={12} strokeWidth={1.75} />}
-                    onClick={() => onResend(record.id)}
+                    onClick={() => onResend(record.id, record.email)}
                     data-testid={`members-resend-${record.id}`}
                   >
                     {t("settings_members.resend")}
@@ -487,65 +533,127 @@ export function SettingsMembers() {
         width={520}
         data-testid="members-invite-drawer"
         extra={
-          <Space>
-            <Button onClick={() => setInviteOpen(false)}>
-              {t("common.cancel")}
-            </Button>
+          inviteCredentials !== null ? (
             <Button
               type="primary"
-              loading={inviteSubmitting}
-              onClick={onInvite}
-              data-testid="members-invite-submit"
+              onClick={() => {
+                setInviteOpen(false);
+                inviteForm.resetFields();
+              }}
+              data-testid="members-invite-credentials-close"
             >
-              {t("settings_members.invite_submit")}
+              {t("settings_members.credentials_close")}
             </Button>
-          </Space>
+          ) : (
+            <Space>
+              <Button onClick={() => setInviteOpen(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                type="primary"
+                loading={inviteSubmitting}
+                onClick={onInvite}
+                data-testid="members-invite-submit"
+              >
+                {t("settings_members.invite_submit")}
+              </Button>
+            </Space>
+          )
         }
       >
-        <Form
-          form={inviteForm}
-          layout="vertical"
-          initialValues={{ role: "viewer" }}
-        >
-          <Form.Item
-            name="email"
-            label={t("settings_members.field_email")}
-            rules={[
-              {
-                required: true,
-                message: t("settings_members.email_required"),
-              },
-              { type: "email", message: t("settings_members.email_invalid") },
-            ]}
+        {inviteCredentials !== null ? (
+          <Space
+            direction="vertical"
+            size="large"
+            style={{ width: "100%" }}
+            data-testid="members-invite-credentials"
           >
-            <Input
-              data-testid="members-invite-email"
-              placeholder="user@example.com"
-              autoComplete="off"
-            />
-          </Form.Item>
-          <Form.Item
-            name="role"
-            label={t("settings_members.field_role")}
-            rules={[{ required: true, message: t("settings_members.role_required") }]}
+            {inviteCredentials.map((item) => (
+              <div
+                key={item.email}
+                data-testid={`members-invite-credential-${item.email}`}
+              >
+                <Text strong style={{ display: "block", marginBottom: 8 }}>
+                  {item.email}
+                </Text>
+                <OneTimeCredentialPanel
+                  account={item.email}
+                  password={item.initial_password}
+                  loginUrl={window.location.origin}
+                />
+              </div>
+            ))}
+          </Space>
+        ) : (
+          <Form
+            form={inviteForm}
+            layout="vertical"
+            initialValues={{ role: "viewer" }}
           >
-            <Select<MemberRole>
-              data-testid="members-invite-role"
-              options={ROLE_OPTIONS.map((r) => ({ value: r, label: r }))}
-            />
-          </Form.Item>
-          <Form.Item
-            name="display_name"
-            label={t("settings_members.field_display_name")}
-          >
-            <Input
-              data-testid="members-invite-display-name"
-              placeholder={t("settings_members.field_display_name_placeholder")}
-              autoComplete="off"
-            />
-          </Form.Item>
-        </Form>
+            <Form.Item
+              name="email"
+              label={t("settings_members.field_email")}
+              rules={[
+                {
+                  required: true,
+                  message: t("settings_members.email_required"),
+                },
+                { type: "email", message: t("settings_members.email_invalid") },
+              ]}
+            >
+              <Input
+                data-testid="members-invite-email"
+                placeholder="user@example.com"
+                autoComplete="off"
+              />
+            </Form.Item>
+            <Form.Item
+              name="role"
+              label={t("settings_members.field_role")}
+              rules={[{ required: true, message: t("settings_members.role_required") }]}
+            >
+              <Select<MemberRole>
+                data-testid="members-invite-role"
+                options={ROLE_OPTIONS.map((r) => ({ value: r, label: r }))}
+              />
+            </Form.Item>
+            <Form.Item
+              name="display_name"
+              label={t("settings_members.field_display_name")}
+            >
+              <Input
+                data-testid="members-invite-display-name"
+                placeholder={t("settings_members.field_display_name_placeholder")}
+                autoComplete="off"
+              />
+            </Form.Item>
+          </Form>
+        )}
       </Drawer>
+
+      <Modal
+        open={resendCredential !== null}
+        title={t("settings_members.resend_credentials_title")}
+        onCancel={() => setResendCredential(null)}
+        data-testid="members-resend-credentials-modal"
+        footer={
+          <Button
+            type="primary"
+            onClick={() => setResendCredential(null)}
+            data-testid="members-resend-credentials-close"
+          >
+            {t("settings_members.credentials_close")}
+          </Button>
+        }
+      >
+        {resendCredential !== null && (
+          <OneTimeCredentialPanel
+            account={resendCredential.email}
+            password={resendCredential.password}
+            loginUrl={window.location.origin}
+          />
+        )}
+      </Modal>
 
       <Modal
         open={pwTarget !== null}

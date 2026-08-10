@@ -262,6 +262,7 @@ def build_tenants_router() -> APIRouter:
                         keycloak=keycloak,
                         audit=audit,
                         email_action_lifespan_s=settings.keycloak_email_action_lifespan_s,
+                        provisioning_mode=settings.member_provisioning_mode,
                     )
                 except FirstAdminConflictError as exc:
                     # Tenant is created; the email collides in Keycloak. The admin
@@ -287,6 +288,7 @@ def build_tenants_router() -> APIRouter:
                     "email": result.email,
                     "status": result.status,
                     "keycloak_user_id": result.keycloak_user_id,
+                    "initial_password": result.initial_password,
                 }
         # ``data`` stays the tenant record (backwards compatible with Stream P
         # callers that read ``data.tenant_id`` / ``data.display_name``); the

@@ -20,6 +20,7 @@ from control_plane.keycloak import (
     KeycloakUnavailableError,
     KeycloakUserExistsError,
 )
+from control_plane.member_password import generate_initial_password
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.auth import DuplicateRoleBindingError, RoleBindingStore
 from expert_work.persistence.tenant_member import DuplicateMemberError, TenantMemberStore
@@ -48,6 +49,7 @@ class MemberOpResult:
     member_id: UUID
     status: str
     keycloak_user_id: str | None
+    initial_password: str | None = None  # password 模式一次性回传;绝不落库/审计/日志
 
 
 async def _emit(
@@ -86,8 +88,10 @@ async def _provision_keycloak(
     keycloak: KeycloakAdminClient,
     audit: AuditLogger,
     email_action_lifespan_s: int,
+    provisioning_mode: str,
 ) -> MemberOpResult:
-    """Provision the Keycloak account + binding + email for an ``invited`` member.
+    """Provision the Keycloak account + binding + password/email setup for an
+    ``invited`` member.
 
     Idempotent: skips the account create if ``keycloak_user_id`` is already
     back-filled (resend after a partial failure), and tolerates a duplicate
@@ -97,7 +101,10 @@ async def _provision_keycloak(
     if kc_user_id is None:
         try:
             kc_user = await keycloak.create_user(
-                email=email, tenant_id=tenant_id, display_name=display_name
+                email=email,
+                tenant_id=tenant_id,
+                display_name=display_name,
+                email_verified=(provisioning_mode == "password"),
             )
         except KeycloakUserExistsError as exc:
             await _emit(
@@ -146,13 +153,31 @@ async def _provision_keycloak(
         # Idempotent: a prior partial attempt already wrote this binding.
         logger.debug("member.binding_already_exists member_id=%s", member.id)
 
-    # Set-password email — failure does not roll back; resend can retry.
-    try:
-        await keycloak.send_setup_email(user_id=kc_user_id, lifespan_s=email_action_lifespan_s)
-    except KeycloakUnavailableError:
-        logger.warning("member.setup_email_failed member_id=%s (resend can retry)", member.id)
+    initial_password: str | None = None
+    if provisioning_mode == "password":
+        # password 模式:临时密码替代 set-password 邮件;temporary=True 首登强制改密。
+        # 失败语义与邮件分支一致——不回滚,resend 重驱(届时重新生成)。
+        candidate = generate_initial_password()
+        try:
+            await keycloak.reset_password(user_id=kc_user_id, password=candidate, temporary=True)
+            initial_password = candidate
+        except KeycloakUnavailableError:
+            logger.warning(
+                "member.initial_password_failed member_id=%s (resend can retry)", member.id
+            )
+    else:
+        # Set-password email — failure does not roll back; resend can retry.
+        try:
+            await keycloak.send_setup_email(user_id=kc_user_id, lifespan_s=email_action_lifespan_s)
+        except KeycloakUnavailableError:
+            logger.warning("member.setup_email_failed member_id=%s (resend can retry)", member.id)
 
-    return MemberOpResult(member_id=member.id, status="invited", keycloak_user_id=kc_user_id)
+    return MemberOpResult(
+        member_id=member.id,
+        status="invited",
+        keycloak_user_id=kc_user_id,
+        initial_password=initial_password,
+    )
 
 
 async def invite_member(
@@ -167,6 +192,7 @@ async def invite_member(
     keycloak: KeycloakAdminClient,
     audit: AuditLogger,
     email_action_lifespan_s: int,
+    provisioning_mode: str,
 ) -> MemberOpResult:
     """Invite a new member: write the roster row (invited) then provision Keycloak."""
     try:
@@ -193,6 +219,7 @@ async def invite_member(
         keycloak=keycloak,
         audit=audit,
         email_action_lifespan_s=email_action_lifespan_s,
+        provisioning_mode=provisioning_mode,
     )
     await _emit(
         audit,
@@ -214,6 +241,7 @@ async def resend_member(
     keycloak: KeycloakAdminClient,
     audit: AuditLogger,
     email_action_lifespan_s: int,
+    provisioning_mode: str,
 ) -> MemberOpResult:
     """Re-drive an ``invited`` member's Keycloak provisioning (idempotent compensation)."""
     result = await _provision_keycloak(
@@ -228,6 +256,7 @@ async def resend_member(
         keycloak=keycloak,
         audit=audit,
         email_action_lifespan_s=email_action_lifespan_s,
+        provisioning_mode=provisioning_mode,
     )
     await _emit(
         audit,

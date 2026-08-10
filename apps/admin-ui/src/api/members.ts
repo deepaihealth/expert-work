@@ -44,6 +44,11 @@ export interface InviteResultItem {
   member_id: string | null;
   status: string | null;
   error_code: string | null;
+  /** Generated-password-mode only — present (string) on a successful item
+   *  when the tenant provisions members with a server-generated password;
+   *  ``null`` in email mode; absent entirely on a failed item (non-null
+   *  ``error_code``). Never re-fetchable after this response. */
+  initial_password?: string | null;
 }
 
 export interface InviteResult {
@@ -54,6 +59,10 @@ export interface ResendResult {
   member_id: string;
   status: string;
   keycloak_user_id: string | null;
+  /** Same one-shot semantics as ``InviteResultItem.initial_password`` — set
+   *  when the resend re-provisions a generated password, ``null`` in email
+   *  mode. */
+  initial_password: string | null;
 }
 
 export interface ListMembersParams {

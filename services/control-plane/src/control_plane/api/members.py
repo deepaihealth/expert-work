@@ -135,6 +135,7 @@ def build_members_router() -> APIRouter:
                     keycloak=keycloak,
                     audit=audit,
                     email_action_lifespan_s=settings.keycloak_email_action_lifespan_s,
+                    provisioning_mode=settings.member_provisioning_mode,
                 )
                 results.append(
                     {
@@ -142,6 +143,7 @@ def build_members_router() -> APIRouter:
                         "member_id": str(summary.member_id),
                         "status": summary.status,
                         "error_code": None,
+                        "initial_password": summary.initial_password,
                     }
                 )
             except MemberConflictError:
@@ -234,6 +236,7 @@ def build_members_router() -> APIRouter:
                 keycloak=keycloak,
                 audit=audit,
                 email_action_lifespan_s=settings.keycloak_email_action_lifespan_s,
+                provisioning_mode=settings.member_provisioning_mode,
             )
         except MemberConflictError as exc:
             raise HTTPException(
@@ -254,6 +257,7 @@ def build_members_router() -> APIRouter:
                 "member_id": str(summary.member_id),
                 "status": summary.status,
                 "keycloak_user_id": summary.keycloak_user_id,
+                "initial_password": summary.initial_password,
             },
             "error": None,
         }

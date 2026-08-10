@@ -23,7 +23,14 @@ from tests.auth_fixtures import make_test_jwt
 
 
 class _UnavailableKeycloak(FakeKeycloakAdminClient):
-    async def create_user(self, *, email: str, tenant_id: UUID, display_name: str | None):
+    async def create_user(
+        self,
+        *,
+        email: str,
+        tenant_id: UUID,
+        display_name: str | None,
+        email_verified: bool = False,
+    ):
         raise KeycloakUnavailableError("down")
 
 

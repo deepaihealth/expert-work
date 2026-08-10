@@ -1612,6 +1612,16 @@ export interface TranslationKeys {
     first_admin_hint: string;
     first_admin_email_invalid: string;
     first_admin_provisioned: string;
+    credentials_close: string;
+  };
+  credential_panel: {
+    title: string;
+    once_warning: string;
+    login_url: string;
+    account: string;
+    password: string;
+    copy_all: string;
+    copied: string;
   };
   mcp_servers: {
     page_title: string;
@@ -2098,6 +2108,8 @@ export interface TranslationKeys {
     invite_success: string;
     invite_partial_fail: string;
     resent: string;
+    resend_credentials_title: string;
+    credentials_close: string;
     removed: string;
     failed_to_load: string;
     empty: string;
@@ -4645,9 +4657,19 @@ const en: TranslationKeys = {
     field_first_admin_email: "First admin email (optional)",
     field_first_admin_display_name: "First admin display name (optional)",
     first_admin_hint:
-      "Provisions the company's first admin and sends a set-password email. In dev (no SMTP) set the password in the Keycloak admin console instead.",
+      "Also provisions the company's first admin account. How it's activated (email or an initial password) is determined by platform configuration.",
     first_admin_email_invalid: "Enter a valid email address",
     first_admin_provisioned: "First admin invited:",
+    credentials_close: "I've saved it, close",
+  },
+  credential_panel: {
+    title: "One-time credentials",
+    once_warning: "This password is only shown once. Copy it now — it cannot be retrieved again.",
+    login_url: "Login URL",
+    account: "Account",
+    password: "Initial password",
+    copy_all: "Copy all",
+    copied: "Copied to clipboard",
   },
   mcp_servers: {
     page_title: "MCP Servers",
@@ -5205,6 +5227,8 @@ const en: TranslationKeys = {
     invite_success: "Invitation sent.",
     invite_partial_fail: "Some invitations failed: {{detail}}",
     resent: "Invitation resent.",
+    resend_credentials_title: "Password reset",
+    credentials_close: "I've saved it, close",
     removed: "Member removed.",
     failed_to_load: "Failed to load members",
     empty: "No members in this tenant yet.",

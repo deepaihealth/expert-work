@@ -391,6 +391,11 @@ class Settings(BaseSettings):
     #: link sent on member invite. Default 24h.
     keycloak_email_action_lifespan_s: int = Field(default=86400, gt=0)
 
+    #: 成员/首管开通模式:``email`` = 现状(Keycloak set-password 邮件,依赖
+    #: SMTP);``password`` = 服务端生成初始密码写进 Keycloak(temporary,
+    #: 首登强制改密),密码只在创建/重发响应里回传一次。平台级,不分租户。
+    member_provisioning_mode: Literal["email", "password"] = "email"
+
     #: Stream ACCT — email of the first platform ``system_admin`` to auto-grant
     #: on first login. When set, the user whose verified JWT email matches gets
     #: a platform-scope ``system_admin`` binding the first time they log in,

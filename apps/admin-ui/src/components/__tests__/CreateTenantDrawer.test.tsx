@@ -21,7 +21,8 @@ interface PostCall {
 
 let postCalls: PostCall[];
 
-function installAdapter(): void {
+/** ``data`` payload merged into the create-tenant success response, per test. */
+function installAdapter(dataOverride: Record<string, unknown> = {}): void {
   postCalls = [];
   apiClient.defaults.adapter = (config) => {
     const url = config.url ?? "";
@@ -33,7 +34,10 @@ function installAdapter(): void {
       return Promise.resolve({
         data: {
           success: true,
-          data: { tenant_id: "11111111-1111-1111-1111-111111111111" },
+          data: {
+            tenant_id: "11111111-1111-1111-1111-111111111111",
+            ...dataOverride,
+          },
           error: null,
         },
         status: 201,
@@ -118,5 +122,55 @@ describe("CreateTenantDrawer tenant_id validation", () => {
     expect(onCreated).toHaveBeenCalledWith(
       expect.objectContaining({ tenant_id: "11111111-1111-1111-1111-111111111111" }),
     );
+  });
+});
+
+describe("CreateTenantDrawer one-time credential result", () => {
+  it("switches to the credential panel when initial_password is non-empty", async () => {
+    installAdapter({
+      first_admin: {
+        member_id: "m1",
+        email: "admin@acme.example",
+        status: "active",
+        keycloak_user_id: "kc-1",
+        initial_password: "wolf-mint-echo-1234",
+      },
+    });
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await user.type(screen.getByTestId("ct-display-name"), "乐毅大公司");
+    await user.type(screen.getByTestId("ct-first-admin-email"), "admin@acme.example");
+    await user.click(screen.getByTestId("ct-submit"));
+
+    expect(await screen.findByTestId("one-time-credential-panel")).toBeInTheDocument();
+    expect(screen.getByText("wolf-mint-echo-1234")).toBeInTheDocument();
+    // The result view replaces the form — it must not still be on screen.
+    expect(screen.queryByTestId("ct-form")).not.toBeInTheDocument();
+    expect(screen.getByTestId("ct-close-saved")).toBeInTheDocument();
+  });
+
+  it("keeps the existing success behavior when initial_password is null", async () => {
+    installAdapter({
+      first_admin: {
+        member_id: "m1",
+        email: "admin@acme.example",
+        status: "pending_email",
+        keycloak_user_id: "kc-1",
+        initial_password: null,
+      },
+    });
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await user.type(screen.getByTestId("ct-display-name"), "乐毅大公司");
+    await user.type(screen.getByTestId("ct-first-admin-email"), "admin@acme.example");
+    await user.click(screen.getByTestId("ct-submit"));
+
+    await screen.findByTestId("ct-created");
+    expect(screen.queryByTestId("one-time-credential-panel")).not.toBeInTheDocument();
+    // Existing behavior unchanged: form stays visible, no dedicated close button.
+    expect(screen.getByTestId("ct-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("ct-close-saved")).not.toBeInTheDocument();
   });
 });
