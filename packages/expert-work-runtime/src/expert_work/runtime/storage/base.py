@@ -119,7 +119,6 @@ class ObjectStore(Protocol):
         - 覆盖语义与 ``put`` 一致;不支持 object-lock 参数(归档不需要 WORM)。
         - 失败时不得留下部分可见对象(S3 走 multipart,abort 兜尾)。
         """
-        ...
 
     async def get(self, key: str) -> bytes:
         """Read the full object at ``key``.

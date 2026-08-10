@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 
-import control_plane.workspace_archive as wa
+from control_plane import workspace_archive as wa
 from control_plane.workspace_archive import (
     empty_tar_gz_bytes,
     stream_directory_tar_gz,

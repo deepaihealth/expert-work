@@ -121,7 +121,7 @@ async def test_lock_loser_skips_cycle(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_stop_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import control_plane.workspace_janitor as mod
+    from control_plane import workspace_janitor as mod
 
     worker, _, _ = _build(tmp_path)
 

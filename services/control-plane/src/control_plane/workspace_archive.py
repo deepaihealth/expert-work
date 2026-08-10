@@ -87,7 +87,9 @@ def _produce(directory: Path, writer: _QueueWriter) -> None:
         writer.emit_raw(_DONE)
     except _ConsumerGoneError:
         return
-    except BaseException as exc:
+    except Exception as exc:
+        # 异常必须送进队列——消费方靠收到 item 才退出轮询。工作线程不会被注入
+        # KeyboardInterrupt/CancelledError,Exception 已覆盖全部真实失败面。
         try:
             writer.emit_raw(exc)
         except _ConsumerGoneError:
