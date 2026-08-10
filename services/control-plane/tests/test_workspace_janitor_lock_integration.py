@@ -117,9 +117,7 @@ async def test_workspace_janitor_run_once_single_flights_across_sessions(
         return worker
 
     worker_a, worker_b = _make(), _make()
-    results: list[JanitorRunStats] = await asyncio.gather(
-        worker_a.run_once(), worker_b.run_once()
-    )
+    results: list[JanitorRunStats] = await asyncio.gather(worker_a.run_once(), worker_b.run_once())
 
     ran = [r for r in results if not r.skipped]
     skipped = [r for r in results if r.skipped]

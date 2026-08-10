@@ -103,8 +103,11 @@ class S3CompatibleObjectStore:
                 upload_id = created["UploadId"]
             number = len(parts) + 1
             resp = await self._client.upload_part(
-                Bucket=self._bucket, Key=key, PartNumber=number,
-                UploadId=upload_id, Body=payload,
+                Bucket=self._bucket,
+                Key=key,
+                PartNumber=number,
+                UploadId=upload_id,
+                Body=payload,
             )
             parts.append({"ETag": resp["ETag"], "PartNumber": number})
 
@@ -117,7 +120,9 @@ class S3CompatibleObjectStore:
             if upload_id is None:
                 # 整流不足一片(含空流)——单次 put 更省一轮 multipart 往返。
                 put_kwargs: dict[str, Any] = {
-                    "Bucket": self._bucket, "Key": key, "Body": bytes(buf),
+                    "Bucket": self._bucket,
+                    "Key": key,
+                    "Body": bytes(buf),
                 }
                 if content_type is not None:
                     put_kwargs["ContentType"] = content_type
@@ -126,7 +131,9 @@ class S3CompatibleObjectStore:
             if buf:
                 await _flush_part(bytes(buf))
             await self._client.complete_multipart_upload(
-                Bucket=self._bucket, Key=key, UploadId=upload_id,
+                Bucket=self._bucket,
+                Key=key,
+                UploadId=upload_id,
                 MultipartUpload={"Parts": parts},
             )
         except self._client.exceptions.ClientError as exc:

@@ -1473,7 +1473,14 @@ def create_app(
                 # 沙箱迁移波 3 (spec § 五):janitor 只在云工作区路径
                 # (quota gate 已组装)时上岗——条件跟随实际组装物,
                 # 照 SandboxReapWorker 的 isinstance 先例,不另开开关。
-                if resolved_workspace_quota is not None and resolved_settings.workspace_nas_root:
+                # 另需 object_store_backend == "s3-compatible":janitor 归档
+                # 删的是真数据(purge 后 rm -rf NAS 目录),内存 object store
+                # 重启即丢——90 天恢复承诺会悄悄落空,内存后端不算数。
+                if (
+                    resolved_workspace_quota is not None
+                    and resolved_settings.workspace_nas_root
+                    and resolved_settings.object_store_backend == "s3-compatible"
+                ):
                     workspace_janitor_worker = WorkspaceJanitorWorker(
                         user_workspaces=resolved_user_workspace_store,
                         quota_service=resolved_workspace_quota,
@@ -1484,6 +1491,8 @@ def create_app(
                     )
                     workspace_janitor_worker.start()
                     _app.state.workspace_janitor_worker = workspace_janitor_worker
+                elif resolved_workspace_quota is not None and resolved_settings.workspace_nas_root:
+                    logger.info("control_plane.workspace_janitor.not_started_memory_object_store")
                 # skill-asset-store — only a DURABLE backend may hold skill
                 # supporting-file bytes (memory loses them on restart).
                 skill_asset_store = (

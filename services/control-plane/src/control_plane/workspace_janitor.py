@@ -7,12 +7,14 @@ phases: archiving soft-deleted user workspaces to the object store
 (``_sweep_scratch``). One cycle every ``interval_s`` (default 1800s = 30
 minutes, spec § 五).
 
-This task (Task 3) lands the worker skeleton, the advisory-lock single-flight
-wrapper, and the ``_scratch`` phase only — ``_sweep_archives`` /
-``_sweep_sizes`` are ``pass`` stubs, filled by Task 4 / Task 5. Structure
-mirrors :class:`~control_plane.sandbox_reap_worker.SandboxReapWorker`
-(start/stop/loop) and :class:`~control_plane.skill_curator.SkillCurator`
-(advisory-lock wrapper around the cycle body).
+All three phases are implemented: ``_sweep_archives`` uploads soft-deleted
+users' workspaces then ``rm -rf``s the NAS directory (marking the row
+archived), ``_sweep_sizes`` walks every tenant/user directory and refreshes
+its size accounting, and ``_sweep_scratch`` reaps stale ``_scratch``
+sandbox-tmp directories. Structure mirrors
+:class:`~control_plane.sandbox_reap_worker.SandboxReapWorker` (start/stop/
+loop) and :class:`~control_plane.skill_curator.SkillCurator` (advisory-lock
+wrapper around the cycle body).
 
 No DLQ: a stale ``_scratch`` dir or a failed phase is retried on the next
 cycle for free (both are idempotent — reaping an already-gone dir, or an
@@ -66,10 +68,18 @@ _STOP_TIMEOUT_S = 5.0
 #: 8618, and this worker uses 8619 — two-arg ``(int4, int4)`` classid space.
 _JANITOR_LOCK_CLASSID = 8619
 
-#: drift 用 5 分钟;janitor 的归档上传是 GiB 级长活,5 分钟会把持锁会话
-#: 半路杀掉(idle_in_transaction 判定的是锁会话,不是干活协程)。
-#: 60 分钟 = interval x 2,孤锁仍有界。
-_LOCK_TXN_TIMEOUT_MS = 60 * 60 * 1000
+#: 这个超时守的不是「正常一轮该多久」,而是「一个挂死/泄漏的锁会话最多
+#: 赖多久」——连接掉线本就会立即放锁,超时只在会话活着但卡住时兜底。真
+#: 正的约束是:它必须是**任何**合理一轮 cycle 时长的上界,包括部署当天
+#: 第一轮——PR-1→PR-2 之间攒的整批归档 backlog + 首次全树 du 一次性追
+#: 平,时长和稳态后的 30 分钟一轮不是一个量级。60 分钟撑不住那一轮:命中
+#: 后 PG 杀掉赢家的锁会话,锁释放,另一副本起并发 cycle(重复 multipart
+#: 上传;tar 打包与 rmtree 赛跑,可能用半成品档案覆盖掉刚打完的完整档
+#: 案),赢家侧 ``finally: rollback()`` 再报一个误导性的 ``cycle_failed``。
+#: 改成 12 小时,把部署当天的 backlog 轮也罩住。曾考虑「每步 ping 一下续
+#: 命」代替长超时,否决:单个用户的多 GiB 上传本身就可能撑爆任何按步长
+#: 定的 ping 节奏假设,续命点找不到一个处处安全的粒度。
+_LOCK_TXN_TIMEOUT_MS = 12 * 60 * 60 * 1000
 
 #: spec § 五:临时沙箱寿命 ≤20min,72 倍余量。判据只看目录 mtime,不查 DB。
 _SCRATCH_MAX_AGE_S = 24 * 3600.0
@@ -227,7 +237,7 @@ class WorkspaceJanitorWorker:
                 logger.exception("workspace_janitor.phase_failed phase=%s", phase.__name__)
 
     async def _sweep_archives(self, stats: JanitorRunStats) -> None:
-        """Task 5. 软删标记文件为发现源(``.deleted/{user}``,``user_purge`` 只
+        """软删标记文件为发现源(``.deleted/{user}``,``user_purge`` 只
         落标记不碰 DB 行)——按 tenant 目录下 ``DELETED_DIR`` 里能解析成
         UUID 的条目逐用户归档。单用户失败 log + 继续,不拖累其余用户;标
         记文件本身永不删除(墓碑,见 :meth:`_archive_one`)。

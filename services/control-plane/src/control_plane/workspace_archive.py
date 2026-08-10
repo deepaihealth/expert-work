@@ -116,21 +116,23 @@ async def stream_directory_tar_gz(
     directory: Path, *, chunk_size: int = 1024 * 1024
 ) -> AsyncIterator[bytes]:
     """把目录打成 tar.gz 字节流。目录不存在 → 首块就抛 FileNotFoundError。"""
-    if not directory.is_dir():
-        raise FileNotFoundError(directory)
-    q: queue.Queue[object] = queue.Queue(maxsize=_QUEUE_DEPTH)
-    abort = threading.Event()
-    writer = _QueueWriter(q, abort, chunk_size)
-    thread = threading.Thread(
-        target=_produce, args=(directory, writer), name="workspace-archive-tar", daemon=True
-    )
-    thread.start()
     loop = asyncio.get_running_loop()
     # 专用单线程 executor,而非 loop 共享的默认 executor(``asyncio.to_thread``
     # 走的就是那个):默认 executor 的 worker 线程没有空闲超时,用过一次就
     # 常驻进程,会被 threading.active_count() 计成"消费方早退后的泄漏线程"。
-    # 这里显式拥有 + 显式 shutdown,保证生成器退出时不留下任何线程。
+    # 这里显式拥有 + 显式 shutdown,保证生成器退出时不留下任何线程——目录
+    # 存在性检查本身也是一次可能阻塞的 NFS stat,同样得走这个专用池,不能
+    # 用 ``asyncio.to_thread``(会污染共享默认 executor,见上)。
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="workspace-archive-io") as pool:
+        if not await loop.run_in_executor(pool, directory.is_dir):
+            raise FileNotFoundError(directory)
+        q: queue.Queue[object] = queue.Queue(maxsize=_QUEUE_DEPTH)
+        abort = threading.Event()
+        writer = _QueueWriter(q, abort, chunk_size)
+        thread = threading.Thread(
+            target=_produce, args=(directory, writer), name="workspace-archive-tar", daemon=True
+        )
+        thread.start()
         try:
             while True:
                 item = await loop.run_in_executor(pool, _poll_get, q, abort)
