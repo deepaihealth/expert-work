@@ -40,7 +40,7 @@ from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.workspace import UserWorkspaceStore
-from expert_work.protocol import AuditAction
+from expert_work.protocol import DEFAULT_WORKSPACE_BYTES_PER_USER, AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
@@ -115,13 +115,27 @@ def build_workspace_router() -> APIRouter:
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         target_tenant = scope.tenant_id
+        # Task 7 — the effective per-user byte limit (PR-1 WorkspaceQuotaService),
+        # never the frozen ``user_workspace.size_limit_bytes`` column (that one
+        # is the supervisor's, not this gate's — see workspace_quota.py:20-21).
+        quota_service = getattr(request.app.state, "workspace_quota_service", None)
+        if quota_service is not None:
+            limit_bytes = await quota_service.effective_limit(tenant_id=target_tenant)
+        else:
+            # 本地 compose / 测试形态没有组装 quota gate —— 上限即平台默认。
+            limit_bytes = DEFAULT_WORKSPACE_BYTES_PER_USER
         # Caller-identity resolution stays OUTSIDE applied_scope — it reads /
         # upserts the CALLER's registry row in their home tenant.
         caller_user_id = await resolve_caller_user_id(request, users)
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
         if target_user_id is None:
             # Machine principal — owns no per-user workspace.
-            return JSONResponse({"success": True, "data": {"workspace": None, "artifacts": []}})
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {"workspace": None, "artifacts": [], "limit_bytes": limit_bytes},
+                }
+            )
         # Defence-in-depth for the artifact read — the store already filters by
         # explicit (tenant_id, user_id), but set the RLS GUC too, mirroring
         # ``/v1/artifacts``, so a future user-level policy stays enforced.
@@ -148,6 +162,7 @@ def build_workspace_router() -> APIRouter:
                 "data": {
                     "workspace": workspace.model_dump(mode="json") if workspace else None,
                     "artifacts": [a.model_dump(mode="json") for a in arts],
+                    "limit_bytes": limit_bytes,
                 },
             }
         )

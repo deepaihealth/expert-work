@@ -6,8 +6,7 @@ in-memory implementation can stand in for unit tests and a different
 S3-compatible backend (MinIO / Aliyun OSS / AWS S3 / Tencent COS) can be
 swapped via the factory without code changes.
 
-**Multipart upload deferred** to M0 follow-up (per ADR § 3). M0 first cut
-handles small objects only; ``put`` takes ``bytes`` rather than a stream.
+Multipart streaming lands via ``put_stream`` (波 3).
 
 Stream D.1b extends ``put`` with optional S3 Object Lock parameters
 (``retain_until`` + ``lock_mode``) used by the D.1c audit WORM backup
@@ -16,7 +15,7 @@ worker. See STREAM-D-DESIGN § 2.3 + Mini-ADR D-2.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from typing import Literal, Protocol
 
@@ -102,6 +101,23 @@ class ObjectStore(Protocol):
         * The target bucket must already have Object Lock enabled when
           locks are used; bucket-level setup belongs to IaC, not the
           runtime API.
+        """
+
+    async def put_stream(
+        self,
+        key: str,
+        chunks: AsyncIterator[bytes],
+        *,
+        content_type: str | None = None,
+    ) -> None:
+        """Store an object from an async byte stream (multipart on S3).
+
+        波 3 (spec § 4.2):杀掉 ``put(bytes)`` 的整体驻留内存上限。契约:
+
+        - 实现负责攒片——调用方的 chunk 尺寸任意(含空流,产出空对象)。
+        - 常驻内存 ≤ 单分片(S3 实现默认 64 MiB)。
+        - 覆盖语义与 ``put`` 一致;不支持 object-lock 参数(归档不需要 WORM)。
+        - 失败时不得留下部分可见对象(S3 走 multipart,abort 兜尾)。
         """
 
     async def get(self, key: str) -> bytes:

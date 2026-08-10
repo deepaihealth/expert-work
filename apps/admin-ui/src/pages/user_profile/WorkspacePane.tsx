@@ -259,6 +259,9 @@ export function WorkspacePane({ userId }: { userId: string }) {
   ];
 
   const meta = workspace?.workspace ?? null;
+  // Task 7 — effective per-user byte cap; ``undefined`` on an old backend
+  // that hasn't shipped it yet falls back to the pre-existing size-only line.
+  const limitBytes = workspace?.limit_bytes ?? null;
 
   return (
     <div data-testid="user-workspace-pane">
@@ -286,8 +289,21 @@ export function WorkspacePane({ userId }: { userId: string }) {
         <HardDrive size={14} strokeWidth={1.5} />
         {meta ? (
           <Text style={{ fontSize: 13 }} className="mono">
-            {t("user_profile.workspace_volume")}: {meta.volume_name} ·{" "}
-            {t("user_profile.workspace_size")}: {formatBytes(meta.size_bytes)}
+            {limitBytes != null ? (
+              <>
+                {t("user_profile.workspace_volume")}: {meta.volume_name} ·{" "}
+                {t("user_profile.workspace_usage", {
+                  used: formatBytes(meta.size_bytes),
+                  limit: formatBytes(limitBytes),
+                })}
+              </>
+            ) : (
+              // 旧后端容错:保留原「大小」行(limit_bytes 尚未发布)。
+              <>
+                {t("user_profile.workspace_volume")}: {meta.volume_name} ·{" "}
+                {t("user_profile.workspace_size")}: {formatBytes(meta.size_bytes)}
+              </>
+            )}
           </Text>
         ) : (
           <Text type="secondary" style={{ fontSize: 13 }} data-testid="user-workspace-none">

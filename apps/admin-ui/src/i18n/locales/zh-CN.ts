@@ -325,6 +325,7 @@ const zhCN: TranslationKeys = {
     workspace_scope_note: "工作区文件与产物是该用户跨智能体的持久资产。",
     workspace_volume: "存储卷",
     workspace_size: "大小",
+    workspace_usage: "已用 {{used}} / 上限 {{limit}}(约,30 分钟粒度)",
     workspace_none: "该用户暂无工作区。",
     workspace_files: "文件",
     workspace_files_empty: "暂无文件。",

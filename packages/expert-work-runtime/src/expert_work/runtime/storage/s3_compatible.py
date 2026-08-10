@@ -9,7 +9,7 @@ at construction time; no application code changes for migrations.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from typing import Any, Literal
 
@@ -22,6 +22,10 @@ from expert_work.runtime.storage.base import (
 
 logger = logging.getLogger(__name__)
 
+#: S3 multipart 分片大小(spec § 4.2:常驻内存 ≤ 单分片;S3 硬下限 5 MiB,
+#: 10k 片上限 → 64 MiB x 10k = 640 GiB 单对象天花板,远超工作区配额量级)。
+_MULTIPART_PART_SIZE = 64 * 1024 * 1024
+
 
 class S3CompatibleObjectStore:
     """Operate on one S3-style bucket via an injected aiobotocore client.
@@ -33,9 +37,12 @@ class S3CompatibleObjectStore:
     S3 API and are stable across botocore releases.
     """
 
-    def __init__(self, client: Any, bucket: str) -> None:
+    def __init__(
+        self, client: Any, bucket: str, *, multipart_part_size: int = _MULTIPART_PART_SIZE
+    ) -> None:
         self._client = client
         self._bucket = bucket
+        self._multipart_part_size = multipart_part_size
 
     async def put(
         self,
@@ -73,6 +80,80 @@ class S3CompatibleObjectStore:
             # sites don't have to know about botocore exception shapes.
             msg = f"put_object failed for key={key!r}: {exc}"
             raise ObjectStoreError(msg) from exc
+
+    async def put_stream(
+        self,
+        key: str,
+        chunks: AsyncIterator[bytes],
+        *,
+        content_type: str | None = None,
+    ) -> None:
+        part_size = self._multipart_part_size
+        buf = bytearray()
+        upload_id: str | None = None
+        parts: list[dict[str, Any]] = []
+
+        async def _flush_part(payload: bytes) -> None:
+            nonlocal upload_id
+            if upload_id is None:
+                create_kwargs: dict[str, Any] = {"Bucket": self._bucket, "Key": key}
+                if content_type is not None:
+                    create_kwargs["ContentType"] = content_type
+                created = await self._client.create_multipart_upload(**create_kwargs)
+                upload_id = created["UploadId"]
+            number = len(parts) + 1
+            resp = await self._client.upload_part(
+                Bucket=self._bucket,
+                Key=key,
+                PartNumber=number,
+                UploadId=upload_id,
+                Body=payload,
+            )
+            parts.append({"ETag": resp["ETag"], "PartNumber": number})
+
+        try:
+            async for chunk in chunks:
+                buf.extend(chunk)
+                while len(buf) >= part_size:
+                    await _flush_part(bytes(buf[:part_size]))
+                    del buf[:part_size]
+            if upload_id is None:
+                # 整流不足一片(含空流)——单次 put 更省一轮 multipart 往返。
+                put_kwargs: dict[str, Any] = {
+                    "Bucket": self._bucket,
+                    "Key": key,
+                    "Body": bytes(buf),
+                }
+                if content_type is not None:
+                    put_kwargs["ContentType"] = content_type
+                await self._client.put_object(**put_kwargs)
+                return
+            if buf:
+                await _flush_part(bytes(buf))
+            await self._client.complete_multipart_upload(
+                Bucket=self._bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        except self._client.exceptions.ClientError as exc:
+            await self._abort_quietly(key, upload_id)
+            msg = f"put_stream failed for key {key!r}"
+            raise ObjectStoreError(msg) from exc
+        except BaseException:
+            # 生产侧(tar 线程)异常原样上抛,但 multipart 残骸要清。
+            await self._abort_quietly(key, upload_id)
+            raise
+
+    async def _abort_quietly(self, key: str, upload_id: str | None) -> None:
+        if upload_id is None:
+            return
+        try:
+            await self._client.abort_multipart_upload(
+                Bucket=self._bucket, Key=key, UploadId=upload_id
+            )
+        except Exception:  # abort 尽力而为,别掩埋原始异常
+            logger.warning("put_stream.abort_failed key=%s", key)
 
     async def get(self, key: str) -> bytes:
         try:
