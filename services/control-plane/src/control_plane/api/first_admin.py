@@ -34,6 +34,7 @@ from control_plane.keycloak import (
     KeycloakUnavailableError,
     KeycloakUserExistsError,
 )
+from control_plane.member_password import generate_initial_password
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.auth import RoleBindingStore
 from expert_work.persistence.tenant_member import DuplicateMemberError, TenantMemberStore
@@ -72,6 +73,7 @@ class FirstAdminResult:
     email: str
     status: str
     keycloak_user_id: str | None
+    initial_password: str | None = None  # password 模式一次性回传;绝不落库/审计/日志
 
 
 async def provision_first_admin(
@@ -85,6 +87,7 @@ async def provision_first_admin(
     keycloak: KeycloakAdminClient,
     audit: AuditLogger,
     email_action_lifespan_s: int,
+    provisioning_mode: str,
 ) -> FirstAdminResult:
     """Provision the first tenant admin. Call inside ``bypass_rls_session()``.
 
@@ -109,7 +112,10 @@ async def provision_first_admin(
     # Step 2 — provision the Keycloak account (external, retryable).
     try:
         kc_user = await keycloak.create_user(
-            email=email, tenant_id=tenant_id, display_name=display_name
+            email=email,
+            tenant_id=tenant_id,
+            display_name=display_name,
+            email_verified=(provisioning_mode == "password"),
         )
     except KeycloakUserExistsError as exc:
         await _emit(
@@ -146,12 +152,28 @@ async def provision_first_admin(
         platform_scope=False,
     )
 
-    # Step 4 — set-password email. Failure here does NOT roll back (account +
-    # binding already exist); resend can re-send. Log and continue.
-    try:
-        await keycloak.send_setup_email(user_id=kc_user.id, lifespan_s=email_action_lifespan_s)
-    except KeycloakUnavailableError:
-        logger.warning("first_admin.setup_email_failed member_id=%s (resend can retry)", member.id)
+    # Step 4 — password/email handoff. Failure here does NOT roll back (account
+    # + binding already exist); resend can retry. Log and continue.
+    initial_password: str | None = None
+    if provisioning_mode == "password":
+        # password 模式:临时密码替代 set-password 邮件;temporary=True 首登强制改密。
+        # 失败语义与邮件分支一致——不回滚,resend 是唯一补偿入口(见模块 docstring)。
+        candidate = generate_initial_password()
+        try:
+            await keycloak.reset_password(user_id=kc_user.id, password=candidate, temporary=True)
+            initial_password = candidate
+        except KeycloakUnavailableError:
+            logger.warning(
+                "first_admin.initial_password_failed member_id=%s (resend can retry)", member.id
+            )
+    else:
+        # Set-password email — failure does not roll back; resend can retry.
+        try:
+            await keycloak.send_setup_email(user_id=kc_user.id, lifespan_s=email_action_lifespan_s)
+        except KeycloakUnavailableError:
+            logger.warning(
+                "first_admin.setup_email_failed member_id=%s (resend can retry)", member.id
+            )
 
     await _emit(
         audit,
@@ -170,7 +192,11 @@ async def provision_first_admin(
         {"email": email, "role": "admin", "keycloak_user_id": kc_user.id},
     )
     return FirstAdminResult(
-        member_id=member.id, email=email, status="invited", keycloak_user_id=kc_user.id
+        member_id=member.id,
+        email=email,
+        status="invited",
+        keycloak_user_id=kc_user.id,
+        initial_password=initial_password,
     )
 
 
