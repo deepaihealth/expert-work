@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -63,6 +63,19 @@ class InMemoryObjectStore:
                 )
                 raise ObjectLockedError(msg)
             self._objects[key] = record
+
+    async def put_stream(
+        self,
+        key: str,
+        chunks: AsyncIterator[bytes],
+        *,
+        content_type: str | None = None,
+    ) -> None:
+        buf = bytearray()
+        async for chunk in chunks:
+            buf.extend(chunk)
+        # 委托 put:锁检查 / 覆盖语义天然同契约。
+        await self.put(key, bytes(buf), content_type=content_type)
 
     async def get(self, key: str) -> bytes:
         record = self._objects.get(key)
