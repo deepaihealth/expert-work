@@ -1612,6 +1612,16 @@ export interface TranslationKeys {
     first_admin_hint: string;
     first_admin_email_invalid: string;
     first_admin_provisioned: string;
+    credentials_close: string;
+  };
+  credential_panel: {
+    title: string;
+    once_warning: string;
+    login_url: string;
+    account: string;
+    password: string;
+    copy_all: string;
+    copied: string;
   };
   mcp_servers: {
     page_title: string;
@@ -4648,6 +4658,16 @@ const en: TranslationKeys = {
       "Provisions the company's first admin and sends a set-password email. In dev (no SMTP) set the password in the Keycloak admin console instead.",
     first_admin_email_invalid: "Enter a valid email address",
     first_admin_provisioned: "First admin invited:",
+    credentials_close: "I've saved it, close",
+  },
+  credential_panel: {
+    title: "One-time credentials",
+    once_warning: "This password is only shown once. Copy it now — it cannot be retrieved again.",
+    login_url: "Login URL",
+    account: "Account",
+    password: "Initial password",
+    copy_all: "Copy all",
+    copied: "Copied to clipboard",
   },
   mcp_servers: {
     page_title: "MCP Servers",

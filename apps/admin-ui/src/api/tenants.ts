@@ -33,6 +33,13 @@ export interface FirstAdminSummary {
   email: string;
   status: string;
   keycloak_user_id: string | null;
+  /**
+   * The generated password, in the clear — but only on *this* response.
+   * The backend never returns it again after this call. ``null`` when the
+   * account was provisioned via the email/set-password flow instead of a
+   * generated password.
+   */
+  initial_password?: string | null;
 }
 
 /** ``POST /v1/tenants`` data payload: the tenant record + optional first admin. */

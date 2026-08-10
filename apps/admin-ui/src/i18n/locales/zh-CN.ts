@@ -1689,6 +1689,16 @@ const zhCN: TranslationKeys = {
       "同时为公司创建首位管理员并发送设密码邮件。dev 环境无 SMTP 时,请到 Keycloak 控制台手动设密码。",
     first_admin_email_invalid: "请输入有效的邮箱地址",
     first_admin_provisioned: "首位管理员已邀请:",
+    credentials_close: "我已保存,关闭",
+  },
+  credential_panel: {
+    title: "一次性凭据",
+    once_warning: "该密码仅显示这一次,请立即复制保存——之后无法再次找回。",
+    login_url: "登录地址",
+    account: "账号",
+    password: "初始密码",
+    copy_all: "复制全部",
+    copied: "已复制到剪贴板",
   },
   mcp_servers: {
     page_title: "MCP 服务器",

@@ -23,6 +23,7 @@ import {
 } from "../api/tenants";
 import type { TenantPlan } from "../api/tenant_config";
 import { ApiError } from "../api/client";
+import { OneTimeCredentialPanel } from "./OneTimeCredentialPanel";
 
 const { Text } = Typography;
 
@@ -55,10 +56,17 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
   const [submitting, setSubmitting] = useState(false);
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [firstAdmin, setFirstAdmin] = useState<FirstAdminSummary | null>(null);
+  /** Set only when the first admin got a generated password — switches the
+   *  drawer to the one-time credential result view instead of closing. */
+  const [credentialResult, setCredentialResult] = useState<{
+    account: string;
+    password: string;
+  } | null>(null);
 
   const reset = useCallback(() => {
     setCreatedId(null);
     setFirstAdmin(null);
+    setCredentialResult(null);
     form.resetFields();
   }, [form]);
 
@@ -101,8 +109,17 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
       setCreatedId(record.tenant_id);
       setFirstAdmin(record.first_admin ?? null);
       onCreated(record);
-      message.success(t("settings_create_tenant.created"));
-      form.resetFields();
+      const admin = record.first_admin;
+      const initialPassword = admin?.initial_password;
+      if (admin && initialPassword) {
+        // Generated-password path: switch to the one-time credential result
+        // view instead of the usual toast + form reset — the password must
+        // stay visible (and copyable) until the admin explicitly closes.
+        setCredentialResult({ account: admin.email, password: initialPassword });
+      } else {
+        message.success(t("settings_create_tenant.created"));
+        form.resetFields();
+      }
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -124,95 +141,139 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
       width={520}
       destroyOnHidden
       footer={
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <Button onClick={handleCancel} disabled={submitting} data-testid="ct-cancel">
-            {t("common.cancel")}
-          </Button>
-          <Button
-            type="primary"
-            loading={submitting}
-            onClick={onCreate}
-            data-testid="ct-submit"
-          >
-            {t("settings_create_tenant.create_btn")}
-          </Button>
-        </div>
+        credentialResult !== null ? (
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <Button type="primary" onClick={handleCancel} data-testid="ct-close-saved">
+              {t("settings_create_tenant.credentials_close")}
+            </Button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Button onClick={handleCancel} disabled={submitting} data-testid="ct-cancel">
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="primary"
+              loading={submitting}
+              onClick={onCreate}
+              data-testid="ct-submit"
+            >
+              {t("settings_create_tenant.create_btn")}
+            </Button>
+          </div>
+        )
       }
       data-testid="create-tenant-drawer"
     >
-      {createdId !== null && (
-        <Alert
-          type="success"
-          showIcon
-          style={{ marginBottom: 16 }}
-          message={t("settings_create_tenant.created")}
-          description={
-            <span>
-              {t("settings_create_tenant.created_detail")}{" "}
-              <Text code copyable data-testid="ct-created-id">
-                {createdId}
-              </Text>
-              {firstAdmin !== null && (
-                <div style={{ marginTop: 8 }} data-testid="ct-first-admin">
-                  {t("settings_create_tenant.first_admin_provisioned")}{" "}
-                  <Text code>{firstAdmin.email}</Text> ({firstAdmin.status})
-                </div>
-              )}
-            </span>
-          }
-          data-testid="ct-created"
-        />
+      {credentialResult !== null ? (
+        <div data-testid="ct-credential-result">
+          {createdId !== null && (
+            <Alert
+              type="success"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={t("settings_create_tenant.created")}
+              description={
+                <span>
+                  {t("settings_create_tenant.created_detail")}{" "}
+                  <Text code copyable data-testid="ct-created-id">
+                    {createdId}
+                  </Text>
+                </span>
+              }
+              data-testid="ct-created"
+            />
+          )}
+          <OneTimeCredentialPanel
+            account={credentialResult.account}
+            password={credentialResult.password}
+            loginUrl={window.location.origin}
+          />
+        </div>
+      ) : (
+        <>
+          {createdId !== null && (
+            <Alert
+              type="success"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={t("settings_create_tenant.created")}
+              description={
+                <span>
+                  {t("settings_create_tenant.created_detail")}{" "}
+                  <Text code copyable data-testid="ct-created-id">
+                    {createdId}
+                  </Text>
+                  {firstAdmin !== null && (
+                    <div style={{ marginTop: 8 }} data-testid="ct-first-admin">
+                      {t("settings_create_tenant.first_admin_provisioned")}{" "}
+                      <Text code>{firstAdmin.email}</Text> ({firstAdmin.status})
+                    </div>
+                  )}
+                </span>
+              }
+              data-testid="ct-created"
+            />
+          )}
+          <Form form={form} layout="vertical" initialValues={{ plan: "free" }} data-testid="ct-form">
+            <Form.Item
+              name="display_name"
+              label={t("settings_create_tenant.field_display_name")}
+              rules={[
+                { required: true, message: t("settings_create_tenant.display_name_required") },
+              ]}
+            >
+              <Input data-testid="ct-display-name" maxLength={128} />
+            </Form.Item>
+            <Form.Item name="plan" label={t("settings_create_tenant.field_plan")}>
+              <Select<TenantPlan>
+                data-testid="ct-plan"
+                options={PLAN_OPTIONS.map((p) => ({ value: p, label: p }))}
+              />
+            </Form.Item>
+            <Form.Item
+              name="tenant_id"
+              label={t("settings_create_tenant.field_tenant_id")}
+              extra={t("settings_create_tenant.tenant_id_hint")}
+              rules={[
+                {
+                  validator: (_rule, value) => {
+                    const v = (value ?? "").trim();
+                    if (v === "" || UUID_RE.test(v)) return Promise.resolve();
+                    return Promise.reject(
+                      new Error(t("settings_create_tenant.tenant_id_invalid")),
+                    );
+                  },
+                },
+              ]}
+            >
+              <Input
+                data-testid="ct-tenant-id"
+                placeholder={t("settings_create_tenant.tenant_id_placeholder")}
+              />
+            </Form.Item>
+            <Form.Item
+              name="first_admin_email"
+              label={t("settings_create_tenant.field_first_admin_email")}
+              extra={t("settings_create_tenant.first_admin_hint")}
+              rules={[
+                {
+                  type: "email",
+                  message: t("settings_create_tenant.first_admin_email_invalid"),
+                },
+              ]}
+            >
+              <Input data-testid="ct-first-admin-email" maxLength={320} />
+            </Form.Item>
+            <Form.Item
+              name="first_admin_display_name"
+              label={t("settings_create_tenant.field_first_admin_display_name")}
+            >
+              <Input data-testid="ct-first-admin-name" maxLength={128} />
+            </Form.Item>
+          </Form>
+        </>
       )}
-      <Form form={form} layout="vertical" initialValues={{ plan: "free" }} data-testid="ct-form">
-        <Form.Item
-          name="display_name"
-          label={t("settings_create_tenant.field_display_name")}
-          rules={[{ required: true, message: t("settings_create_tenant.display_name_required") }]}
-        >
-          <Input data-testid="ct-display-name" maxLength={128} />
-        </Form.Item>
-        <Form.Item name="plan" label={t("settings_create_tenant.field_plan")}>
-          <Select<TenantPlan>
-            data-testid="ct-plan"
-            options={PLAN_OPTIONS.map((p) => ({ value: p, label: p }))}
-          />
-        </Form.Item>
-        <Form.Item
-          name="tenant_id"
-          label={t("settings_create_tenant.field_tenant_id")}
-          extra={t("settings_create_tenant.tenant_id_hint")}
-          rules={[
-            {
-              validator: (_rule, value) => {
-                const v = (value ?? "").trim();
-                if (v === "" || UUID_RE.test(v)) return Promise.resolve();
-                return Promise.reject(
-                  new Error(t("settings_create_tenant.tenant_id_invalid")),
-                );
-              },
-            },
-          ]}
-        >
-          <Input
-            data-testid="ct-tenant-id"
-            placeholder={t("settings_create_tenant.tenant_id_placeholder")}
-          />
-        </Form.Item>
-        <Form.Item
-          name="first_admin_email"
-          label={t("settings_create_tenant.field_first_admin_email")}
-          extra={t("settings_create_tenant.first_admin_hint")}
-          rules={[{ type: "email", message: t("settings_create_tenant.first_admin_email_invalid") }]}
-        >
-          <Input data-testid="ct-first-admin-email" maxLength={320} />
-        </Form.Item>
-        <Form.Item
-          name="first_admin_display_name"
-          label={t("settings_create_tenant.field_first_admin_display_name")}
-        >
-          <Input data-testid="ct-first-admin-name" maxLength={128} />
-        </Form.Item>
-      </Form>
     </Drawer>
   );
 }
