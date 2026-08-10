@@ -10,7 +10,8 @@ billing / analytics:
   artifacts (+ versions), MCP OAuth connections, agent-instance bindings,
   approvals, triggers (+ their runs), webhook endpoints (+ their deliveries),
   image uploads, volume-backup DLQ, and — via the supervisor — the workspace
-  volume (soft-deleted → reaper archives) + ``sandbox_instance`` rows.
+  volume (soft-deleted → janitor archives asynchronously at 30-min granularity)
+  + ``sandbox_instance`` rows.
 * **ANONYMIZE** (KEEP the row, null the user link) — ``token_usage`` and
   ``agent_run`` (billing / analytics), ``skill`` actor columns (tenant IP),
   ``eval_dataset.source_user_id`` and ``curation_candidate.user_id``.
