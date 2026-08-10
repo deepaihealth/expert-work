@@ -29,15 +29,22 @@ import os
 import shutil
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.workspace_archive import (
+    empty_tar_gz_bytes,
+    stream_directory_tar_gz,
+    workspace_archive_key,
+)
 from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.runtime.storage import ObjectStore
+from orchestrator.tools.nas_workspace_store import DELETED_DIR, workspace_user_root
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +227,70 @@ class WorkspaceJanitorWorker:
                 logger.exception("workspace_janitor.phase_failed phase=%s", phase.__name__)
 
     async def _sweep_archives(self, stats: JanitorRunStats) -> None:
-        """Task 4."""
+        """Task 5. 软删标记文件为发现源(``.deleted/{user}``,``user_purge`` 只
+        落标记不碰 DB 行)——按 tenant 目录下 ``DELETED_DIR`` 里能解析成
+        UUID 的条目逐用户归档。单用户失败 log + 继续,不拖累其余用户;标
+        记文件本身永不删除(墓碑,见 :meth:`_archive_one`)。
+        """
+        root = Path(self._workspace_root)
+
+        def _markers(tenant_dir: Path) -> list[UUID]:
+            out: list[UUID] = []
+            try:
+                with os.scandir(tenant_dir / DELETED_DIR) as it:
+                    for entry in it:
+                        try:
+                            out.append(UUID(entry.name))
+                        except ValueError:
+                            continue
+            except FileNotFoundError:
+                return []
+            return sorted(out, key=str)
+
+        for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
+            for user_id in await asyncio.to_thread(_markers, tenant_dir):
+                try:
+                    await self._archive_one(tenant_id, user_id, stats)
+                except Exception:
+                    logger.exception(
+                        "workspace_janitor.archive_failed tenant=%s user=%s", tenant_id, user_id
+                    )
+
+    async def _archive_one(self, tenant_id: UUID, user_id: UUID, stats: JanitorRunStats) -> None:
+        """spec § 4.1 + 硬要求①。单一路径:目录在就(重)归档;矩阵是推论。
+
+        崩溃安全顺序:先传后删,mark 最后。已 mark 行的目录复活
+        (上传路径不查软删标记,W2 既有设计)→ 覆盖上传同 key 再删,
+        不重 mark——覆盖语义 runbook 有言在先。
+        """
+        ws = await self._user_workspaces.resolve(tenant_id=tenant_id, user_id=user_id)
+        if ws.deleted_at is None:
+            await self._user_workspaces.soft_delete(workspace_id=ws.id, now=datetime.now(UTC))
+        key = workspace_archive_key(tenant_id, user_id, ws.id)
+        user_dir = workspace_user_root(self._workspace_root, tenant_id, user_id)
+
+        if await asyncio.to_thread(user_dir.is_dir):
+            await self._object_store.put_stream(
+                key, stream_directory_tar_gz(user_dir), content_type="application/gzip"
+            )
+            await asyncio.to_thread(shutil.rmtree, user_dir)
+            if ws.archived_object_key is None:
+                await self._user_workspaces.mark_archived(
+                    workspace_id=ws.id, archived_object_key=key
+                )
+                stats.archived += 1
+            else:
+                stats.reharvested += 1
+                logger.info("workspace_janitor.reharvested tenant=%s user=%s", tenant_id, user_id)
+            return
+
+        if ws.archived_object_key is not None:
+            return  # 稳态墓碑:标记留着挡 acquire,行已收口
+        if key not in await self._object_store.list_prefix(key):
+            # 生前无目录(或上传前崩且目录本来就空缺)→ 统一产出空档案
+            await self._object_store.put(key, empty_tar_gz_bytes(), content_type="application/gzip")
+        await self._user_workspaces.mark_archived(workspace_id=ws.id, archived_object_key=key)
+        stats.archived += 1
 
     async def _sweep_sizes(self, stats: JanitorRunStats) -> None:
         """文件系统为发现源:按 tenant/user 两层 UUID 目录全量扫,逐用户调
