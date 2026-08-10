@@ -2108,6 +2108,8 @@ export interface TranslationKeys {
     invite_success: string;
     invite_partial_fail: string;
     resent: string;
+    resend_credentials_title: string;
+    credentials_close: string;
     removed: string;
     failed_to_load: string;
     empty: string;
@@ -5225,6 +5227,8 @@ const en: TranslationKeys = {
     invite_success: "Invitation sent.",
     invite_partial_fail: "Some invitations failed: {{detail}}",
     resent: "Invitation resent.",
+    resend_credentials_title: "Password reset",
+    credentials_close: "I've saved it, close",
     removed: "Member removed.",
     failed_to_load: "Failed to load members",
     empty: "No members in this tenant yet.",

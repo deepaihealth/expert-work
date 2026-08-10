@@ -14,7 +14,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
 
@@ -22,8 +22,10 @@ import { SettingsMembers } from "../SettingsMembers";
 import { AuthProvider } from "../../auth/AuthContext";
 import { setStoredToken } from "../../api/client";
 import {
+  inviteMembers,
   listMembers,
   purgeMember,
+  resendMember,
   resetMemberPassword,
   type MemberPurgeResult,
   type TenantMember,
@@ -402,6 +404,150 @@ describe("SettingsMembers — deactivate & purge", () => {
     expect(
       await screen.findByTestId("members-purge-no-data-note"),
     ).toBeInTheDocument();
+  });
+});
+
+describe("SettingsMembers — one-time initial password display", () => {
+  it("shows one credential panel per email when invite results include a generated password", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(inviteMembers).mockResolvedValue({
+      results: [
+        {
+          email: "new1@example.com",
+          member_id: "m-10",
+          status: "invited",
+          error_code: null,
+          initial_password: "pw-one-1234",
+        },
+        {
+          email: "new2@example.com",
+          member_id: "m-11",
+          status: "invited",
+          error_code: null,
+          initial_password: "pw-two-5678",
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-invite-btn")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-invite-btn"));
+    await user.type(
+      await screen.findByTestId("members-invite-email"),
+      "new1@example.com",
+    );
+    await user.click(screen.getByTestId("members-invite-submit"));
+
+    await waitFor(() => expect(inviteMembers).toHaveBeenCalled());
+
+    const block1 = await screen.findByTestId(
+      "members-invite-credential-new1@example.com",
+    );
+    const block2 = screen.getByTestId(
+      "members-invite-credential-new2@example.com",
+    );
+    expect(within(block1).getByText("pw-one-1234")).toBeInTheDocument();
+    expect(within(block2).getByText("pw-two-5678")).toBeInTheDocument();
+    // Passwords must stay visible/copyable — the drawer switches to the
+    // result view (form replaced) instead of auto-closing like the
+    // no-password path, and offers a single explicit close action.
+    expect(screen.queryByTestId("members-invite-email")).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId("members-invite-credentials-close"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the plain success toast and no panel when the invite result has no password", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(inviteMembers).mockResolvedValue({
+      results: [
+        {
+          email: "new3@example.com",
+          member_id: "m-12",
+          status: "invited",
+          error_code: null,
+          initial_password: null,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-invite-btn")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-invite-btn"));
+    await user.type(
+      await screen.findByTestId("members-invite-email"),
+      "new3@example.com",
+    );
+    await user.click(screen.getByTestId("members-invite-submit"));
+
+    await waitFor(() => expect(inviteMembers).toHaveBeenCalled());
+    // Unchanged legacy path: no credential result view, no close-saved button.
+    expect(
+      screen.queryByTestId("one-time-credential-panel"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("members-invite-credentials-close"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("resend with a generated password opens the reset-password credential modal", async () => {
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [invitedNoLogin],
+      total: 1,
+    });
+    vi.mocked(resendMember).mockResolvedValue({
+      member_id: "m-2",
+      status: "invited",
+      keycloak_user_id: "kc-2",
+      initial_password: "fresh-pw-9999",
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-resend-m-2")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-resend-m-2"));
+
+    await waitFor(() => expect(resendMember).toHaveBeenCalledWith("m-2"));
+    const modal = await screen.findByTestId("members-resend-credentials-modal");
+    // Locale-agnostic: the test env's active language can resolve to either
+    // (i18n's ``fallbackLng`` is zh-CN, but jsdom's default locale is en-US).
+    expect(
+      within(modal).getByText(/重置密码|password reset/i),
+    ).toBeInTheDocument();
+    expect(within(modal).getByText("fresh-pw-9999")).toBeInTheDocument();
+  });
+
+  it("resend with no password keeps the plain resend toast, no modal", async () => {
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [invitedNoLogin],
+      total: 1,
+    });
+    vi.mocked(resendMember).mockResolvedValue({
+      member_id: "m-2",
+      status: "invited",
+      keycloak_user_id: "kc-2",
+      initial_password: null,
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-resend-m-2")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-resend-m-2"));
+
+    await waitFor(() => expect(resendMember).toHaveBeenCalledWith("m-2"));
+    expect(
+      screen.queryByTestId("members-resend-credentials-modal"),
+    ).not.toBeInTheDocument();
   });
 });
 

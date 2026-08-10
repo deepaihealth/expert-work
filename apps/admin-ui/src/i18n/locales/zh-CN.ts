@@ -2228,6 +2228,8 @@ const zhCN: TranslationKeys = {
     invite_success: "邀请已发送。",
     invite_partial_fail: "部分邀请失败:{{detail}}",
     resent: "邀请已重发。",
+    resend_credentials_title: "重置密码成功",
+    credentials_close: "我已保存,关闭",
     removed: "成员已移除。",
     failed_to_load: "加载成员失败",
     empty: "当前租户还没有成员。",
