@@ -26,6 +26,7 @@ from expert_work.runtime.storage import (
     S3CompatibleConfig,
     make_object_store,
 )
+from expert_work.runtime.storage.s3_compatible import S3CompatibleObjectStore
 
 pytestmark = pytest.mark.integration
 
@@ -110,3 +111,33 @@ async def test_presigned_url_format(store: ObjectStore) -> None:
 async def test_delete_missing_is_idempotent(store: ObjectStore) -> None:
     # Must not raise; ObjectStore contract.
     await store.delete("definitely-missing-key")
+
+
+@pytest.mark.asyncio
+async def test_put_stream_small_round_trip(store: ObjectStore) -> None:
+    async def _chunks() -> AsyncIterator[bytes]:
+        yield b"stream-"
+        yield b"payload"
+
+    await store.put_stream("stream/small.bin", _chunks())
+    assert await store.get("stream/small.bin") == b"stream-payload"
+
+
+@pytest.mark.asyncio
+async def test_put_stream_multipart_round_trip(store: ObjectStore) -> None:
+    """> 2 片真 multipart:5 MiB 分片 x 11 MiB 载荷 → 2 full + 1 tail。"""
+    client = getattr(store, "_client", None)
+    bucket = getattr(store, "_bucket", None)
+    assert client is not None
+    assert bucket is not None
+    small_parts = S3CompatibleObjectStore(
+        client=client, bucket=bucket, multipart_part_size=5 * 1024 * 1024
+    )
+    payload = os.urandom(11 * 1024 * 1024)
+
+    async def _chunks() -> AsyncIterator[bytes]:
+        for i in range(0, len(payload), 1024 * 1024):
+            yield payload[i : i + 1024 * 1024]
+
+    await small_parts.put_stream("stream/big.bin", _chunks(), content_type="application/gzip")
+    assert await store.get("stream/big.bin") == payload
