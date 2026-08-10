@@ -213,6 +213,41 @@ describe("UserProfile", () => {
     );
   });
 
+  it("workspace tab shows used/limit once the effective quota is on the response (Task 7)", async () => {
+    stubCommon();
+    vi.spyOn(workspaceSdk, "getUserWorkspace").mockResolvedValue({
+      workspace: {
+        id: "ws-1",
+        tenant_id: "t",
+        user_id: USER_ID,
+        volume_name: "vol-alice",
+        size_bytes: 5 * 1024 ** 3,
+        size_limit_bytes: 5 * 1024 ** 3, // frozen supervisor column — must NOT be read for this line
+        created_at: "2026-06-01T00:00:00Z",
+        last_accessed_at: "2026-07-01T00:00:00Z",
+        deleted_at: null,
+        archived_object_key: null,
+      },
+      artifacts: [],
+      limit_bytes: 10 * 1024 ** 3,
+    });
+    vi.spyOn(workspaceSdk, "getUserWorkspaceFiles").mockResolvedValue([]);
+    vi.spyOn(artifactsSdk, "listArtifacts").mockResolvedValue({
+      items: [],
+      cross_tenant: false,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("Alice");
+
+    await user.click(screen.getByRole("tab", { name: "Workspace" }));
+
+    const meta = await screen.findByTestId("user-workspace-meta");
+    await waitFor(() => expect(meta).toHaveTextContent(/Used/));
+    expect(meta).toHaveTextContent("5.0 GB");
+    expect(meta).toHaveTextContent("10.0 GB");
+  });
+
   it("切入态置灰工作区删工件/删文件(两态:home 态按钮默认可用)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     stubCommon();

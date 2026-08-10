@@ -16,9 +16,20 @@ from httpx import ASGITransport, AsyncClient
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
-from expert_work.persistence import InMemoryArtifactStore, InMemoryTenantUserStore
+from control_plane.workspace_quota import WorkspaceQuotaService
+from expert_work.persistence import (
+    InMemoryArtifactStore,
+    InMemoryTenantQuotaStore,
+    InMemoryTenantUserStore,
+)
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery
+from expert_work.protocol import (
+    DEFAULT_WORKSPACE_BYTES_PER_USER,
+    AuditAction,
+    AuditQuery,
+    QuotaDimension,
+    TenantQuotaPatch,
+)
 from orchestrator.tools import (
     RecordingWorkspaceStore,
     SandboxSupervisorError,
@@ -568,3 +579,45 @@ async def test_workspace_tenant_id_star_400(
         resp = await client.get(path, params={"tenant_id": "*", **extra})
         assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
         assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+# ---------------------------------------------------------------------------
+# Task 7 — GET /v1/workspace carries the effective per-user byte limit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_workspace_carries_default_limit_without_quota_service(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """quota service 未组装(本地/测试形态)→ 回落共享默认 10GiB。"""
+    client, _, _ = setup
+    resp = await client.get("/v1/workspace")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["limit_bytes"] == DEFAULT_WORKSPACE_BYTES_PER_USER
+
+
+@pytest.mark.asyncio
+async def test_get_workspace_limit_follows_tenant_quota(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+    tmp_path,
+) -> None:
+    """租户配了 WORKSPACE_BYTES_PER_USER → limit_bytes 即时反映(effective_limit,
+    非 user_workspace.size_limit_bytes 列)。"""
+    client, _, _ = setup
+    app = client._transport.app  # type: ignore[attr-defined]
+    quotas = InMemoryTenantQuotaStore()
+    app.state.workspace_quota_service = WorkspaceQuotaService(
+        user_workspaces=app.state.user_workspace_store,
+        tenant_quotas=quotas,
+        workspace_root=str(tmp_path),
+    )
+    await quotas.upsert(
+        tenant_id=_TENANT,
+        patch=TenantQuotaPatch(
+            dimension=QuotaDimension.WORKSPACE_BYTES_PER_USER, limit_value=123_456_789
+        ),
+        updated_by="test",
+    )
+    resp = await client.get("/v1/workspace")
+    assert resp.json()["data"]["limit_bytes"] == 123_456_789

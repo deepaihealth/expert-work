@@ -106,6 +106,8 @@ export interface WorkspaceArtifact {
 export interface SessionWorkspace {
   workspace: WorkspaceMeta | null;
   artifacts: WorkspaceArtifact[];
+  /** Effective per-user byte cap (Task 7). Optional — old backends omit it. */
+  limit_bytes?: number;
 }
 
 /** One file in a user's persistent workspace volume (browse). */
