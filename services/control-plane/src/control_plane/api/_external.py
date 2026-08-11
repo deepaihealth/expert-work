@@ -18,6 +18,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ThreadMeta
 from expert_work.runtime.runs import RunInfo, RunStore
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 
 #: Namespace prefix for end-user identities minted from a third-party app's own
 #: ``user_id`` string. An employee's ``subject_id`` is a bare Keycloak ``sub``
@@ -30,9 +31,35 @@ from expert_work.runtime.runs import RunInfo, RunStore
 EXTERNAL_SUBJECT_PREFIX = "ext:"
 
 
+def normalize_external_user_id(user_id: str) -> str:
+    """Strip an app-supplied ``user_id`` before it becomes a ``subject_id``.
+
+    Without this, ``"cust-77"`` and ``"cust-77 "`` (trailing space) mint two
+    distinct ``tenant_user`` rows. ``external_subject_id`` — the single
+    choke point both the mint (write, ``agents.py:_resolve_session``) and
+    lookup (read, ``external_sessions.py``) paths pass through — calls this
+    first, so there is exactly one normalization rule instead of two
+    definitions that can drift apart (External-API-v1 P1 review, Important:
+    the write-path implementer refused a read-only-side fix for this exact
+    reason — normalizing only reads would make a space-suffixed ``user_id``
+    findable under one identity but written under another, worse than doing
+    nothing).
+    """
+    return user_id.strip()
+
+
 def external_subject_id(user_id: str) -> str:
-    """Namespace an app-supplied ``user_id`` for ``tenant_user.subject_id``."""
-    return f"{EXTERNAL_SUBJECT_PREFIX}{user_id}"
+    """Namespace an app-supplied ``user_id`` for ``tenant_user.subject_id``.
+
+    Raises ``ValueError`` when ``user_id`` normalizes to empty (e.g. it is
+    all whitespace) — callers must turn that into a 4xx with a
+    machine-readable code rather than minting a namespaced identity for
+    blank input.
+    """
+    normalized = normalize_external_user_id(user_id)
+    if not normalized:
+        raise ValueError("user_id must not be blank")
+    return f"{EXTERNAL_SUBJECT_PREFIX}{normalized}"
 
 
 class ExternalScopeError(Exception):
@@ -57,6 +84,17 @@ def external_error(exc: ExternalScopeError) -> JSONResponse:
     )
 
 
+def _external_subject_id_or_422(user_id: str) -> str:
+    """``external_subject_id``, translating its ``ValueError`` into the
+    shared :class:`ExternalScopeError` envelope every external endpoint
+    already knows how to render, so a blank ``user_id`` surfaces as a 422
+    with a machine-readable code instead of a 500."""
+    try:
+        return external_subject_id(user_id)
+    except ValueError as exc:
+        raise ExternalScopeError("INVALID_USER_ID", str(exc), 422) from exc
+
+
 async def resolve_external_user_id(
     *, tenant_id: UUID, user_id: str, users: TenantUserStore
 ) -> UUID:
@@ -64,9 +102,42 @@ async def resolve_external_user_id(
     row = await users.resolve(
         tenant_id=tenant_id,
         subject_type="user",
-        subject_id=external_subject_id(user_id),
+        subject_id=_external_subject_id_or_422(user_id),
     )
     return row.id
+
+
+async def lookup_external_user_id(
+    *, tenant_id: UUID, user_id: str, users: TenantUserStore
+) -> UUID | None:
+    """Look up (never mint) an app-supplied ``user_id``'s ``tenant_user.id``.
+
+    Unlike :func:`resolve_external_user_id`, an unrecognized ``user_id``
+    returns ``None`` instead of creating a row. ``GET
+    /v1/agents/{code}/sessions?user_id=<anything>`` used to call the mint-on-
+    use resolver, so any string a third party enumerated wrote a
+    ``tenant_user`` row — cheap to spam and the ghost rows surface on the
+    user-dimension ops page (External-API-v1 P1 review, T3, Important). A
+    still-blank ``user_id`` (see :func:`normalize_external_user_id`) is a
+    client error, not "unknown user", so it still raises
+    :class:`ExternalScopeError` rather than returning ``None``.
+
+    ``TenantUserStore`` has no indexed point lookup by ``subject_id``; this
+    reuses the same tenant-scoped, capped ``list_by_tenant`` scan the
+    user-dimension ops page already relies on (``agent_users.py``). A tenant
+    with more than ``MAX_LIST_LIMIT`` active users could in theory have a
+    match past the cap go unseen — the same bound that page already accepts;
+    a real point-lookup index is persistence-layer scope, outside this
+    task's file allowlist.
+    """
+    subject_id = _external_subject_id_or_422(user_id)
+    rows = await users.list_by_tenant(
+        tenant_id, subject_type="user", limit=MAX_LIST_LIMIT, offset=0
+    )
+    for row in rows:
+        if row.subject_id == subject_id:
+            return row.id
+    return None
 
 
 async def load_owned_session(
@@ -77,9 +148,34 @@ async def load_owned_session(
     session_id: UUID,
     threads: ThreadMetaStore,
     users: TenantUserStore,
+    mint: bool = True,
 ) -> ThreadMeta:
-    """Return the session, or raise 404 unless it belongs to ``(user, agent)``."""
-    end_user_id = await resolve_external_user_id(tenant_id=tenant_id, user_id=user_id, users=users)
+    """Return the session, or raise 404 unless it belongs to ``(user, agent)``.
+
+    ``mint`` (default ``True``) picks which of the two end-user resolution
+    semantics applies, and both are load-bearing — do not collapse this to
+    one behavior:
+
+    - ``mint=True`` — the default, used by every endpoint that can create or
+      mutate state (session bind, run submit, upload, approval decision,
+      run cancel). A third party never pre-registers its end-users, so the
+      *first* call under a fresh ``user_id`` must mint the ``tenant_user``
+      row (mint-on-use is intentional product behavior here).
+    - ``mint=False`` — used only by the read-only message-history endpoint.
+      A GET must never write; an unrecognized ``user_id`` here means "no
+      such session", not "create a user and then report 404 anyway".
+    """
+    if mint:
+        end_user_id = await resolve_external_user_id(
+            tenant_id=tenant_id, user_id=user_id, users=users
+        )
+    else:
+        looked_up = await lookup_external_user_id(tenant_id=tenant_id, user_id=user_id, users=users)
+        if looked_up is None:
+            raise ExternalScopeError(
+                "SESSION_NOT_FOUND", "session not found for this user / agent", 404
+            )
+        end_user_id = looked_up
     meta = await threads.get(session_id, tenant_id=tenant_id)
     if meta is None or meta.user_id != end_user_id or meta.agent_name != agent_code:
         raise ExternalScopeError(

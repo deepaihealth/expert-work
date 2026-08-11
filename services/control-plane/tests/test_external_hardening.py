@@ -1,0 +1,222 @@
+"""Integration-level hardening for the shared external (third-party) API
+resolution layer — External-API-v1 P1 Task 7b.
+
+Four defects, each found during a per-endpoint review but only fixable in
+the *shared* layer every ``/v1/agents/{agent_code}/...`` endpoint goes
+through (``api/_external.py`` + ``api/agents.py:_resolve_session`` +
+``app.py``'s validation-error handling):
+
+1. A read endpoint (``GET .../sessions``) must never mint a ``tenant_user``
+   row for an unrecognized ``user_id`` — only a write endpoint may.
+2. ``user_id`` normalization (stripping whitespace) must apply identically
+   on the mint (write) and lookup (read) paths, or a space-suffixed id
+   silently becomes two different people.
+3. A 422 from FastAPI's own request validation must still carry the
+   external envelope (``{"success", "data", "error"}``), not the framework
+   default ``{"detail": [...]}}``.
+
+Fixture mirrors ``test_external_sessions.py``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from copy import deepcopy
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from control_plane.api._external import external_subject_id
+from control_plane.app import create_app
+from control_plane.audit import build_default_audit_logger
+from control_plane.settings import Settings
+from expert_work.common.lifecycle import Lifecycle
+from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import AgentSpec, Role
+from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
+from tests.agent_fixtures import stub_agent_runtime
+from tests.auth_fixtures import (
+    TEST_AUDIENCE,
+    TEST_ISSUER,
+    build_test_jwt_verifier,
+    make_test_jwt,
+)
+
+_SPEC: dict[str, Any] = {
+    "apiVersion": "expert_work.io/v1",
+    "kind": "Agent",
+    "metadata": {"name": "support-bot", "version": "1.0.0", "tenant": "acme"},
+    "spec": {
+        "tenant_config": {},
+        "model": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
+        "system_prompt": {"template": "you are support"},
+        "sandbox": {
+            "resources": {"cpu": "1.0", "memory": "1Gi"},
+            "network": {"egress": "proxy", "allowlist": ["api.anthropic.com"]},
+            "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+        },
+    },
+}
+
+
+def _spec() -> AgentSpec:
+    return AgentSpec.model_validate(deepcopy(_SPEC))
+
+
+def _build_settings() -> Settings:
+    return Settings(
+        service_name="control_plane_test",
+        env="dev",
+        auth_mode="dev",
+        db_dsn="postgresql+asyncpg://test@localhost/test",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+
+
+class _Ctx:
+    def __init__(self, client: AsyncClient, app: Any, tenant_id: UUID, headers: dict[str, str]):
+        self.client = client
+        self.app = app
+        self.tenant_id = tenant_id
+        self.headers = headers
+
+    async def seed_agent(self) -> None:
+        await self.app.state.agent_spec_repo.create(
+            tenant_id=self.tenant_id, spec=_spec(), spec_sha256="a" * 64, created_by="seed"
+        )
+
+    async def has_subject(self, subject_id: str) -> bool:
+        """Whether a ``tenant_user`` row with this ``subject_id`` exists —
+        the ground truth for "did we mint a ghost user"."""
+        rows = await self.app.state.tenant_user_repo.list_by_tenant(
+            self.tenant_id, subject_type="user", limit=MAX_LIST_LIMIT
+        )
+        return any(row.subject_id == subject_id for row in rows)
+
+
+@pytest.fixture
+async def ctx() -> AsyncIterator[_Ctx]:
+    lifecycle = Lifecycle()
+    lifecycle.mark_ready()
+    run_store = InMemoryRunStore()
+    run_event_store = InMemoryRunEventStore()
+    app = create_app(
+        settings=_build_settings(),
+        lifecycle=lifecycle,
+        jwt_verifier=build_test_jwt_verifier(),
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+    )
+    tenant_id = uuid4()
+    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    headers = {"Authorization": f"Bearer {jwt}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        yield _Ctx(client, app, tenant_id, headers)
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_never_mints_a_ghost_user(ctx: _Ctx) -> None:
+    """Step 1 — the core assertion: a GET with an unrecognized ``user_id``
+    returns 200 + an empty list, AND leaves no ``tenant_user`` row behind.
+    Before the fix this endpoint called the mint-on-use resolver, so any
+    string a third party enumerated would upsert a row."""
+    await ctx.seed_agent()
+    subject_id = external_subject_id("never-seen-before")
+    assert not await ctx.has_subject(subject_id)
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "never-seen-before"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["sessions"] == []
+
+    assert not await ctx.has_subject(subject_id)
+
+
+@pytest.mark.asyncio
+async def test_run_submit_still_mints_the_end_user(ctx: _Ctx) -> None:
+    """Step 1's counterpart: the write path (``POST .../runs``) is
+    mint-on-use BY DESIGN — a third party never pre-registers its
+    end-users. Proves the read-path fix didn't take the mint away from the
+    path that needs it."""
+    await ctx.seed_agent()
+    subject_id = external_subject_id("fresh-cust")
+    assert not await ctx.has_subject(subject_id)
+
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "fresh-cust", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 202, resp.text
+
+    assert await ctx.has_subject(subject_id)
+
+
+@pytest.mark.asyncio
+async def test_user_id_normalizes_identically_on_write_and_read(ctx: _Ctx) -> None:
+    """Step 2: a session written under ``"cust-77"`` must be findable via
+    ``"cust-77 "`` (trailing space) — both paths normalize through the same
+    ``external_subject_id``, so they can never drift into two identities."""
+    await ctx.seed_agent()
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77 "},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    sessions = resp.json()["data"]["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == created.json()["thread_id"]
+
+
+@pytest.mark.asyncio
+async def test_blank_after_normalization_is_a_client_error(ctx: _Ctx) -> None:
+    """Step 2's guard: ``user_id="   "`` passes ``min_length=1`` (3 raw
+    characters) but normalizes to empty — must be rejected with a
+    machine-readable code, not silently treated as an unknown user."""
+    await ctx.seed_agent()
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "   "},
+        headers=ctx.headers,
+    )
+    assert 400 <= resp.status_code < 500, resp.text
+    body = resp.json()
+    assert body["error"]["code"]
+
+
+@pytest.mark.asyncio
+async def test_missing_user_id_422_uses_the_external_envelope(ctx: _Ctx) -> None:
+    """Step 3: FastAPI's own ``RequestValidationError`` (missing required
+    query param) must still come back as ``{"success", "data", "error"}}``
+    — the shape every other external response uses — not the framework
+    default ``{"detail": [...]}}``, which has no ``error.code`` for an SDK
+    to key off of."""
+    await ctx.seed_agent()
+    resp = await ctx.client.get("/v1/agents/support-bot/sessions", headers=ctx.headers)
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert "detail" not in body
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_REQUEST"
+    assert body["error"]["message"]

@@ -24,7 +24,7 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_session,
-    resolve_external_user_id,
+    lookup_external_user_id,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.runtime import AgentRuntime
@@ -112,11 +112,29 @@ def build_external_sessions_router() -> APIRouter:
 
         ``user_id`` is required — never defaulted — so an app that omits it
         gets a 422, not the tenant's entire session list.
+
+        A ``user_id`` this tenant has never seen returns an empty list, not
+        404: this is a read, so it must never mint a ``tenant_user`` row
+        (``lookup_external_user_id`` — External-API-v1 P1 review, T3,
+        Important), and "no sessions yet" / "no such user" are the same
+        fact to a third party either way — an empty list leaks no more than
+        a 404 would.
         """
         tenant_id = request.state.tenant_id
-        end_user_id = await resolve_external_user_id(
-            tenant_id=tenant_id, user_id=user_id, users=users
-        )
+        try:
+            end_user_id = await lookup_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+        if end_user_id is None:
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {"sessions": [], "limit": limit, "offset": offset},
+                    "error": None,
+                }
+            )
         rows = await threads.list_by_tenant(
             tenant_id,
             user_id=end_user_id,
@@ -162,7 +180,12 @@ def build_external_sessions_router() -> APIRouter:
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> JSONResponse:
-        """A session's message history — 404s unless it belongs to ``(user, agent)``."""
+        """A session's message history — 404s unless it belongs to ``(user, agent)``.
+
+        ``mint=False``: a read must never mint a ``tenant_user`` row for a
+        ``user_id`` this tenant has never seen — an unrecognized user simply
+        cannot own the session, so it 404s the same as any other mismatch.
+        """
         tenant_id = request.state.tenant_id
         try:
             await load_owned_session(
@@ -172,6 +195,7 @@ def build_external_sessions_router() -> APIRouter:
                 session_id=session_id,
                 threads=threads,
                 users=users,
+                mint=False,
             )
         except ExternalScopeError as exc:
             return external_error(exc)

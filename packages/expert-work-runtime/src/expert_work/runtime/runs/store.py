@@ -122,8 +122,7 @@ class RunStore(abc.ABC):
 
         Updates ``status → error`` (+ ``error`` / ``finished_at`` /
         ``updated_at``) ONLY when the row is currently ``running`` /
-        ``pending`` — the same active-status guard as :meth:`request_cancel`.
-        Returns ``True`` iff a row was transitioned.
+        ``pending``. Returns ``True`` iff a row was transitioned.
 
         This is :class:`~control_plane.orphan_sweep.OrphanSweep`'s
         ``_fail_orphan`` guard: every replica's sweep loop can list the same

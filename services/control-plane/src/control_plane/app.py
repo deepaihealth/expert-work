@@ -31,7 +31,10 @@ from pathlib import Path
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -2514,6 +2517,30 @@ def create_app(
     app.include_router(build_eval_runs_router())
     app.include_router(build_quality_router())
     app.include_router(build_platform_quality_config_router())
+
+    # External-API-v1 P1 review (Important, T3): FastAPI's default 422 body
+    # for a bad query/body param is ``{"detail": [...]}`` — the one response
+    # shape that breaks the third-party envelope contract
+    # (``{"success", "data", "error"}``), and parameter validation is the
+    # error class a third-party integrator hits the most. Scoped to
+    # ``/v1/agents/`` only: the console's own frontend already parses
+    # FastAPI's default shape, so every other route keeps it unchanged.
+    @app.exception_handler(RequestValidationError)
+    async def _external_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        if not request.url.path.startswith("/v1/agents/"):
+            return await request_validation_exception_handler(request, exc)
+        errors = exc.errors()
+        message = errors[0]["msg"] if errors else "invalid request"
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "data": None,
+                "error": {"code": "INVALID_REQUEST", "message": message},
+            },
+        )
 
     return app
 

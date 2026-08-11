@@ -328,11 +328,19 @@ async def _resolve_session(
     # never collide with an employee's bare Keycloak sub — see
     # `_external.EXTERNAL_SUBJECT_PREFIX` for the full rationale. (Any valid
     # tenant key may act for any of its users — network-layer hardening is a
-    # later addition; every call is audited with on_behalf_of.)
+    # later addition; every call is audited with on_behalf_of.) `external_subject_id`
+    # also normalizes (strips) `user_id` — the same normalization the read
+    # path applies, so a space-suffixed id mints/finds the same identity on
+    # both paths (External-API-v1 P1 review, Important) — and raises
+    # ``ValueError`` when normalization empties it out.
+    try:
+        subject_id = external_subject_id(user_id)
+    except ValueError as exc:
+        raise _SessionError("INVALID_USER_ID", str(exc), 422) from exc
     end_user = await users.resolve(
         tenant_id=tenant_id,
         subject_type="user",
-        subject_id=external_subject_id(user_id),
+        subject_id=subject_id,
     )
 
     if session_id is not None:
