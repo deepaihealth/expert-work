@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane._tenant_resource_lock import tenant_resource_lock
 from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._authz import console_only
 from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
@@ -291,7 +292,7 @@ def build_triggers_router() -> APIRouter:
     """Stream J.10 — authenticated trigger CRUD."""
     router = APIRouter(prefix="/v1/triggers", tags=["triggers"])
 
-    @router.post("", response_model=None)
+    @router.post("", response_model=None, dependencies=[Depends(console_only())])
     async def create_trigger(
         body: _CreateTriggerBody,
         request: Request,
@@ -380,7 +381,7 @@ def build_triggers_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_trigger_dict(record, secret=secret))
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_triggers(
         request: Request,
         triggers: Annotated[TriggerStore, Depends(_get_trigger_store)],
@@ -440,7 +441,7 @@ def build_triggers_router() -> APIRouter:
             }
         )
 
-    @router.get("/{trigger_id}", response_model=None)
+    @router.get("/{trigger_id}", response_model=None, dependencies=[Depends(console_only())])
     async def get_trigger(
         trigger_id: UUID,
         request: Request,
@@ -480,7 +481,7 @@ def build_triggers_router() -> APIRouter:
             await resolve_target_user_id(request, users, requested=record.user_id)
         return JSONResponse(content=_trigger_dict(record))
 
-    @router.patch("/{trigger_id}", response_model=None)
+    @router.patch("/{trigger_id}", response_model=None, dependencies=[Depends(console_only())])
     async def patch_trigger(
         trigger_id: UUID,
         body: _PatchTriggerBody,
@@ -536,7 +537,7 @@ def build_triggers_router() -> APIRouter:
         )
         return JSONResponse(content=_trigger_dict(updated))
 
-    @router.delete("/{trigger_id}", response_model=None)
+    @router.delete("/{trigger_id}", response_model=None, dependencies=[Depends(console_only())])
     async def delete_trigger(
         trigger_id: UUID,
         request: Request,
@@ -581,7 +582,7 @@ def build_triggers_router() -> APIRouter:
         )
         return JSONResponse(content={"deleted": True})
 
-    @router.post("/{trigger_id}:fire", response_model=None)
+    @router.post("/{trigger_id}:fire", response_model=None, dependencies=[Depends(console_only())])
     async def fire_trigger_now(
         trigger_id: UUID,
         request: Request,

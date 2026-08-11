@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
+from control_plane.api._authz import console_only
 from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
@@ -87,7 +88,7 @@ def _safe_workspace_relpath(path: str) -> str | None:
 def build_workspace_router() -> APIRouter:
     router = APIRouter(prefix="/v1/workspace", tags=["workspace"])
 
-    @router.get("")
+    @router.get("", dependencies=[Depends(console_only())])
     async def get_workspace(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -167,7 +168,7 @@ def build_workspace_router() -> APIRouter:
             }
         )
 
-    @router.get("/files")
+    @router.get("/files", dependencies=[Depends(console_only())])
     async def list_workspace_files(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -214,7 +215,7 @@ def build_workspace_router() -> APIRouter:
         files = [{"path": e.path, "size": e.size} for e in entries]
         return JSONResponse({"success": True, "data": {"files": files}})
 
-    @router.get("/file", response_model=None)
+    @router.get("/file", response_model=None, dependencies=[Depends(console_only())])
     async def download_workspace_file(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -273,7 +274,7 @@ def build_workspace_router() -> APIRouter:
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
-    @router.delete("/file", response_model=None)
+    @router.delete("/file", response_model=None, dependencies=[Depends(console_only())])
     async def delete_workspace_file(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],

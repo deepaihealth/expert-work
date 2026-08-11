@@ -30,6 +30,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from control_plane.api._authz import console_only
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -146,7 +147,7 @@ def build_conversations_router() -> APIRouter:
     """Mount ``GET /v1/conversations`` (list) + ``/{thread_id}`` (detail)."""
     router = APIRouter(prefix="/v1/conversations", tags=["conversations"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_conversations(
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
@@ -326,7 +327,7 @@ def build_conversations_router() -> APIRouter:
             headers=headers,
         )
 
-    @router.get("/{thread_id}", response_model=None)
+    @router.get("/{thread_id}", response_model=None, dependencies=[Depends(console_only())])
     async def get_conversation(
         thread_id: UUID,
         request: Request,

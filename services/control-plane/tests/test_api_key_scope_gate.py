@@ -170,6 +170,16 @@ async def test_zero_scope_key_403_on_every_endpoint(
     response = await client.request(method, path, headers=_key_headers(()), **kwargs)  # type: ignore[arg-type]
     assert response.status_code == 403, response.text
     assert response.json()["detail"]["code"] == "FORBIDDEN"
+    # Fix round 2 (review Important I4) — pin the message, not just the code.
+    # Both require_key_scope and console_only 403 with code="FORBIDDEN", so a
+    # bare code check can't tell whether require_key_scope actually ran (it
+    # is listed first in every route's dependencies=[...] and so denies a
+    # zero-scope key before console_only ever gets a turn) or whether it had
+    # been silently deleted/bypassed and console_only alone is carrying the
+    # whole plane. This message is unique to require_key_scope's denial —
+    # console_only's is a different string (see test_console_lockdown.py) —
+    # so this line is a tripwire on require_key_scope specifically.
+    assert response.json()["detail"]["message"] == "API key scopes do not cover this operation"
 
 
 @pytest.mark.asyncio

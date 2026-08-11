@@ -30,7 +30,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit
 from control_plane.purge import PurgeUserDeps, purge_user
@@ -329,7 +329,7 @@ def build_tenant_users_router() -> APIRouter:
     """
     router = APIRouter(prefix="/v1/users", tags=["users"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_users(
         request: Request,
         principal: Annotated[Principal, Depends(require("user", "read"))],
@@ -438,7 +438,7 @@ def build_tenant_users_router() -> APIRouter:
             headers=headers,
         )
 
-    @router.get("/{user_id}", response_model=None)
+    @router.get("/{user_id}", response_model=None, dependencies=[Depends(console_only())])
     async def get_tenant_user(
         user_id: UUID,
         request: Request,
@@ -501,7 +501,7 @@ def build_tenant_users_router() -> APIRouter:
             }
         )
 
-    @router.post("/{user_id}:purge", response_model=None)
+    @router.post("/{user_id}:purge", response_model=None, dependencies=[Depends(console_only())])
     async def purge_tenant_user(
         user_id: UUID,
         request: Request,

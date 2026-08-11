@@ -50,7 +50,30 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: Path prefixes that make up the console plane (Step 4's programmatic
 #: lockdown audit walks every route under these). Kept in sync with the
 #: brief's rationale: /v1/sessions, /v1/approvals, /v1/runs, /v1/uploads.
-_CONSOLE_PREFIXES: tuple[str, ...] = ("/v1/sessions", "/v1/approvals", "/v1/runs", "/v1/uploads")
+#: Fix round 2 (review Critical C1 / Important I1-I3) widened this: the
+#: original prefix list left /v1/conversations (the read-only twin of
+#: /v1/sessions + /v1/runs, zero scope needed a 200), /v1/users (roster +
+#: :purge), /v1/artifacts + /v1/workspace (the second, thread-independent
+#: entry point onto the same per-user data /v1/sessions/{id}/workspace/*
+#: already locked), and /v1/triggers (list/get/patch/delete/:fire, plus
+#: create — locked as a whole prefix rather than leaving one verb open,
+#: since the self-audit below has no notion of "half a prefix") wide open
+#: to any API key. /v1/memory is deliberately NOT here — it already has its
+#: own machine-principal gate (memory.py::_require_caller_user). /v1/webhooks
+#: is deliberately NOT here either — it's the inbound webhook receiver,
+#: exempt from AuthMiddleware entirely (authenticated by a per-trigger
+#: secret, not a JWT/API key), so it was never part of this plane.
+_CONSOLE_PREFIXES: tuple[str, ...] = (
+    "/v1/sessions",
+    "/v1/approvals",
+    "/v1/runs",
+    "/v1/uploads",
+    "/v1/conversations",
+    "/v1/users",
+    "/v1/artifacts",
+    "/v1/workspace",
+    "/v1/triggers",
+)
 
 #: The qualname ``console_only()``'s inner dependency carries — stable across
 #: every call to ``console_only()`` (a fresh closure each time) since it comes
@@ -157,6 +180,14 @@ async def ctx() -> AsyncIterator[_Ctx]:
 async def test_api_key_is_denied_on_the_console_plane(ctx: _Ctx, method: str, path: str) -> None:
     resp = await ctx.client.request(method, path, headers=ctx.key_headers)
     assert resp.status_code == 403, resp.text
+    # Fix round 2 (review M4) — pin console_only()'s exact message text. It's
+    # the only pointer a third party gets toward the external plane; a typo
+    # in it would ship silently since nothing else asserts on it. ctx.key_headers
+    # carries the widest (admin) scope, so require_key_scope (which runs first
+    # in the dependency list) always passes and this 403 can only be console_only's.
+    assert resp.json()["detail"]["message"] == (
+        "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+    ), resp.text
 
 
 @pytest.mark.asyncio
@@ -199,6 +230,7 @@ def test_every_console_route_carries_the_lockdown_dependency() -> None:
         enable_curation_worker=False,
     )
     checked: list[str] = []
+    checked_paths: list[str] = []
     missing: list[str] = []
     for route in app.routes:
         if not isinstance(route, APIRoute):
@@ -206,8 +238,18 @@ def test_every_console_route_carries_the_lockdown_dependency() -> None:
         if not route.path.startswith(_CONSOLE_PREFIXES):
             continue
         checked.append(f"{sorted(route.methods or ())} {route.path}")
+        checked_paths.append(route.path)
         dep_qualnames = {dep.call.__qualname__ for dep in route.dependant.dependencies}
         if _CONSOLE_ONLY_DEP_QUALNAME not in dep_qualnames:
             missing.append(f"{sorted(route.methods or ())} {route.path}")
     assert checked, "no console-plane routes discovered — prefix list is stale"
+    # Fix round 2 (review M1) — ``assert checked`` only catches every prefix
+    # going stale at once. A single prefix going stale (a router's mount
+    # point renamed, say) would silently drop that whole surface from the
+    # audit while ``checked`` stays non-empty from the others. Pin each
+    # prefix individually.
+    for prefix in _CONSOLE_PREFIXES:
+        assert any(p.startswith(prefix) for p in checked_paths), (
+            f"no routes discovered under {prefix!r} — prefix is stale"
+        )
     assert not missing, f"routes missing console_only(): {missing}"

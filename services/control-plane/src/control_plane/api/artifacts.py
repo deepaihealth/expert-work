@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
+from control_plane.api._authz import console_only
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit as audit_emit
@@ -89,7 +90,7 @@ def _get_audit(request: Request) -> AuditLogger:
 def build_artifacts_router() -> APIRouter:
     router = APIRouter(prefix="/v1/artifacts", tags=["artifacts"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_artifacts(
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
@@ -147,7 +148,7 @@ def build_artifacts_router() -> APIRouter:
             }
         )
 
-    @router.get("/download", response_model=None)
+    @router.get("/download", response_model=None, dependencies=[Depends(console_only())])
     async def download_artifact(
         name: str,
         request: Request,
@@ -256,7 +257,7 @@ def build_artifacts_router() -> APIRouter:
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
-    @router.delete("/{name:path}", response_model=None)
+    @router.delete("/{name:path}", response_model=None, dependencies=[Depends(console_only())])
     async def delete_artifact(
         name: str,
         request: Request,
@@ -297,7 +298,7 @@ def build_artifacts_router() -> APIRouter:
         )
         return JSONResponse(status_code=200, content={"deleted": name})
 
-    @router.patch("/{name:path}", response_model=None)
+    @router.patch("/{name:path}", response_model=None, dependencies=[Depends(console_only())])
     async def patch_artifact(
         name: str,
         body: _ArtifactPatchBody,
@@ -350,7 +351,9 @@ def build_artifacts_router() -> APIRouter:
             },
         )
 
-    @router.get("/{name:path}/versions", response_model=None)
+    @router.get(
+        "/{name:path}/versions", response_model=None, dependencies=[Depends(console_only())]
+    )
     async def list_versions(
         name: str,
         request: Request,
