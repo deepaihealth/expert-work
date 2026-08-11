@@ -89,4 +89,20 @@ describe("Sidebar — scope-driven groups", () => {
     expect(screen.queryByText("Platform")).toBeNull();
     expect(screen.queryByText("Tenants")).toBeNull();
   });
+
+  it("the Handbook entry is always visible — tenant scope, non-admin", () => {
+    mockScope = "home";
+    mockIsSystemAdmin = false;
+    renderSidebar();
+
+    expect(screen.getByText("Handbook")).toBeInTheDocument();
+  });
+
+  it("the Handbook entry is always visible — platform scope, system_admin", () => {
+    mockScope = "*";
+    mockIsSystemAdmin = true;
+    renderSidebar();
+
+    expect(screen.getByText("Handbook")).toBeInTheDocument();
+  });
 });

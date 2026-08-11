@@ -18,7 +18,7 @@
  */
 import { SCOPE_ALL, type TenantScopeValue } from "../tenant/TenantScopeContext";
 
-export type NavGroup = "workspace" | "tenant-settings" | "platform";
+export type NavGroup = "workspace" | "tenant-settings" | "platform" | "global";
 
 export interface NavEntry {
   /** Menu item key (stable; used for selection + routing). */
@@ -252,10 +252,23 @@ export const PLATFORM_ITEMS: readonly NavEntry[] = [
   },
 ];
 
+/** D. Global — visible regardless of tenant/platform scope or role (the
+ *  in-app handbook: usage docs for everyone, ops docs for system_admin —
+ *  gated inside the page itself, not by nav scope). */
+export const GLOBAL_ITEMS: readonly NavEntry[] = [
+  {
+    key: "handbook",
+    labelKey: "nav.handbook",
+    path: "/handbook",
+    group: "global",
+  },
+];
+
 export const ALL_NAV_ENTRIES: readonly NavEntry[] = [
   ...WORKSPACE_ITEMS,
   ...TENANT_SETTINGS_ITEMS,
   ...PLATFORM_ITEMS,
+  ...GLOBAL_ITEMS,
 ];
 
 /** ``true`` when the caller is operating at the platform level. */
@@ -269,15 +282,20 @@ export function isPlatformScope(scope: TenantScopeValue): boolean {
  *   - platform scope → platform group (with a ``isSystemAdmin`` belt-and
  *     -braces guard; the switcher only offers ``"*"`` to admins anyway).
  *   - any concrete tenant → workspace + tenant-settings.
+ *   - ``global`` (the handbook) is appended in every case — it isn't
+ *     scope-specific, so it never determines ``[0]`` (the default-landing
+ *     pick below stays unaffected).
  */
 export function visibleGroups(
   scope: TenantScopeValue,
   isSystemAdmin: boolean,
 ): NavGroup[] {
-  if (isPlatformScope(scope)) {
-    return isSystemAdmin ? ["platform"] : [];
-  }
-  return ["workspace", "tenant-settings"];
+  const scoped: NavGroup[] = isPlatformScope(scope)
+    ? isSystemAdmin
+      ? ["platform"]
+      : []
+    : ["workspace", "tenant-settings"];
+  return [...scoped, "global"];
 }
 
 /**
