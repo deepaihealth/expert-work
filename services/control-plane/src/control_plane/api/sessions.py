@@ -32,6 +32,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
+from control_plane.api._authz import require_key_scope
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._session_title import first_message_title
 from control_plane.api._user_scope import (
@@ -259,7 +260,7 @@ def _conflict(message: str) -> JSONResponse:
 def build_sessions_router() -> APIRouter:
     router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
-    @router.post("", status_code=201)
+    @router.post("", status_code=201, dependencies=[Depends(require_key_scope("write"))])
     async def create_session(
         payload: CreateSessionPayload,
         request: Request,
@@ -362,7 +363,7 @@ def build_sessions_router() -> APIRouter:
             content={"success": True, "data": meta.model_dump(mode="json")},
         )
 
-    @router.get("/{thread_id}")
+    @router.get("/{thread_id}", dependencies=[Depends(require_key_scope("read"))])
     async def get_session(
         thread_id: UUID,
         request: Request,
@@ -405,7 +406,7 @@ def build_sessions_router() -> APIRouter:
         )
         return JSONResponse({"success": True, "data": meta.model_dump(mode="json")})
 
-    @router.get("/{thread_id}/workspace")
+    @router.get("/{thread_id}/workspace", dependencies=[Depends(require_key_scope("read"))])
     async def get_session_workspace(
         thread_id: UUID,
         request: Request,
@@ -458,7 +459,7 @@ def build_sessions_router() -> APIRouter:
             }
         )
 
-    @router.get("/{thread_id}/workspace/files")
+    @router.get("/{thread_id}/workspace/files", dependencies=[Depends(require_key_scope("read"))])
     async def list_session_workspace_files(
         thread_id: UUID,
         request: Request,
@@ -513,7 +514,11 @@ def build_sessions_router() -> APIRouter:
         files = [{"path": e.path, "size": e.size} for e in entries]
         return JSONResponse({"success": True, "data": {"files": files}})
 
-    @router.get("/{thread_id}/workspace/file", response_model=None)
+    @router.get(
+        "/{thread_id}/workspace/file",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def download_session_workspace_file(
         thread_id: UUID,
         request: Request,
@@ -579,7 +584,11 @@ def build_sessions_router() -> APIRouter:
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
-    @router.delete("/{thread_id}/workspace/file", response_model=None)
+    @router.delete(
+        "/{thread_id}/workspace/file",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write"))],
+    )
     async def delete_session_workspace_file(
         thread_id: UUID,
         request: Request,
@@ -622,7 +631,11 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="file not found") from exc
         return JSONResponse({"success": True, "data": {"deleted": safe_path}})
 
-    @router.get("/{thread_id}/workspace/artifacts/{name:path}/download", response_model=None)
+    @router.get(
+        "/{thread_id}/workspace/artifacts/{name:path}/download",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def download_session_artifact(
         thread_id: UUID,
         name: str,
@@ -692,7 +705,11 @@ def build_sessions_router() -> APIRouter:
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
-    @router.delete("/{thread_id}/workspace/artifacts/{name:path}", response_model=None)
+    @router.delete(
+        "/{thread_id}/workspace/artifacts/{name:path}",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write"))],
+    )
     async def delete_session_artifact(
         thread_id: UUID,
         name: str,
@@ -739,7 +756,7 @@ def build_sessions_router() -> APIRouter:
         )
         return JSONResponse({"success": True, "data": {"deleted": name}})
 
-    @router.get("")
+    @router.get("", dependencies=[Depends(require_key_scope("read"))])
     async def list_sessions(
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
@@ -847,7 +864,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         return meta
 
-    @router.patch("/{thread_id}")
+    @router.patch("/{thread_id}", dependencies=[Depends(require_key_scope("write"))])
     async def rename_session(
         thread_id: UUID,
         payload: RenamePayload,
@@ -880,7 +897,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         return JSONResponse({"success": True, "data": fresh.model_dump(mode="json")})
 
-    @router.delete("/{thread_id}")
+    @router.delete("/{thread_id}", dependencies=[Depends(require_key_scope("delete"))])
     async def archive_session(
         thread_id: UUID,
         request: Request,
@@ -908,7 +925,7 @@ def build_sessions_router() -> APIRouter:
         )
         return JSONResponse({"success": True, "data": {"archived": str(thread_id)}})
 
-    @router.post("/{thread_id}:purge")
+    @router.post("/{thread_id}:purge", dependencies=[Depends(require_key_scope("delete"))])
     async def purge_session(
         thread_id: UUID,
         request: Request,
@@ -1030,7 +1047,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         return JSONResponse({"success": True, "data": fresh.model_dump(mode="json")})
 
-    @router.post("/{thread_id}:pause")
+    @router.post("/{thread_id}:pause", dependencies=[Depends(require_key_scope("write"))])
     async def pause_session(
         thread_id: UUID,
         payload: TransitionPayload,
@@ -1051,7 +1068,7 @@ def build_sessions_router() -> APIRouter:
             reason=payload.reason,
         )
 
-    @router.post("/{thread_id}:resume")
+    @router.post("/{thread_id}:resume", dependencies=[Depends(require_key_scope("write"))])
     async def resume_session(
         thread_id: UUID,
         payload: TransitionPayload,
@@ -1072,7 +1089,7 @@ def build_sessions_router() -> APIRouter:
             reason=payload.reason,
         )
 
-    @router.post("/{thread_id}:cancel")
+    @router.post("/{thread_id}:cancel", dependencies=[Depends(require_key_scope("write"))])
     async def cancel_session(
         thread_id: UUID,
         payload: TransitionPayload,

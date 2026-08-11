@@ -37,6 +37,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._authz import require_key_scope
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
@@ -928,7 +929,9 @@ async def spawn_run(
 def build_runs_router() -> APIRouter:
     router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
-    @router.post("/{thread_id}/runs", response_model=None)
+    @router.post(
+        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("write"))]
+    )
     async def trigger_run(
         thread_id: UUID,
         payload: RunRequest,
@@ -1090,7 +1093,11 @@ def build_runs_router() -> APIRouter:
             trace_id=trace_id,
         )
 
-    @router.get("/{thread_id}/runs/{run_id}", response_model=None)
+    @router.get(
+        "/{thread_id}/runs/{run_id}",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def get_run(
         thread_id: UUID,
         run_id: UUID,
@@ -1207,7 +1214,11 @@ def build_runs_router() -> APIRouter:
             }
         )
 
-    @router.get("/{thread_id}/runs/{run_id}/trace", response_model=None)
+    @router.get(
+        "/{thread_id}/runs/{run_id}/trace",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def get_run_trace(
         thread_id: UUID,
         run_id: UUID,
@@ -1255,7 +1266,11 @@ def build_runs_router() -> APIRouter:
         client = getattr(request.app.state, "langfuse_read_client", None)
         return JSONResponse(content=fetch_and_normalize(client, trace_id))
 
-    @router.get("/{thread_id}/runs/{run_id}/trace/raw", response_model=None)
+    @router.get(
+        "/{thread_id}/runs/{run_id}/trace/raw",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def get_run_trace_raw(
         thread_id: UUID,
         run_id: UUID,
@@ -1308,7 +1323,11 @@ def build_runs_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="span not found")
         return JSONResponse(content={"spanId": span, "field": field, "content": content})
 
-    @router.get("/{thread_id}/messages", response_model=None)
+    @router.get(
+        "/{thread_id}/messages",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def get_thread_messages(
         thread_id: UUID,
         request: Request,
@@ -1390,7 +1409,9 @@ def build_runs_router() -> APIRouter:
         out = [{"role": t.role, "content": t.content, "channel": t.channel} for t in turns]
         return JSONResponse({"success": True, "data": {"messages": out}})
 
-    @router.get("/{thread_id}/runs", response_model=None)
+    @router.get(
+        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("read"))]
+    )
     async def list_thread_runs(
         thread_id: UUID,
         request: Request,
@@ -1451,7 +1472,11 @@ def build_runs_router() -> APIRouter:
             return JSONResponse({"success": True, "data": {"runs": []}})
         return JSONResponse({"success": True, "data": {"runs": out}})
 
-    @router.get("/{thread_id}/runs/{run_id}/events", response_model=None)
+    @router.get(
+        "/{thread_id}/runs/{run_id}/events",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read"))],
+    )
     async def stream_run_events(
         thread_id: UUID,
         run_id: UUID,
@@ -1563,7 +1588,11 @@ def build_runs_router() -> APIRouter:
             },
         )
 
-    @router.post("/{thread_id}/runs/{run_id}/resume", response_model=None)
+    @router.post(
+        "/{thread_id}/runs/{run_id}/resume",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write"))],
+    )
     async def resume_run(
         thread_id: UUID,
         run_id: UUID,
@@ -1733,7 +1762,7 @@ def build_runs_list_router() -> APIRouter:
     """
     router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(require_key_scope("read"))])
     async def list_runs(
         request: Request,
         runs: Annotated[RunStore, Depends(_get_run_store)],

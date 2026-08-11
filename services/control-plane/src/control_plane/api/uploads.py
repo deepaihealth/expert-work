@@ -26,6 +26,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
+from control_plane.api._authz import require_key_scope
 from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import (
@@ -276,7 +277,12 @@ def build_uploads_router() -> APIRouter:
     """
     router = APIRouter()
 
-    @router.post("/v1/sessions/{thread_id}/uploads", response_model=None, tags=["sessions"])
+    @router.post(
+        "/v1/sessions/{thread_id}/uploads",
+        response_model=None,
+        tags=["sessions"],
+        dependencies=[Depends(require_key_scope("write"))],
+    )
     async def upload_image(
         thread_id: UUID,
         request: Request,
@@ -441,7 +447,12 @@ def build_uploads_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content={"image_ref": image_ref.to_uri()})
 
-    @router.delete("/v1/uploads/{image_id}", response_model=None, tags=["uploads"])
+    @router.delete(
+        "/v1/uploads/{image_id}",
+        response_model=None,
+        tags=["uploads"],
+        dependencies=[Depends(require_key_scope("write"))],
+    )
     async def delete_image(
         image_id: UUID,
         request: Request,
