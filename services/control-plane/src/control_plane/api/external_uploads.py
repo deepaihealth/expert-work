@@ -171,8 +171,9 @@ def build_external_uploads_router() -> APIRouter:
 
         ``session_id`` omitted → mints a new session (same resolution +
         kill-switch gate ``POST /{agent_code}/runs`` uses) and returns it so
-        the caller's next run reuses it. ``session_id`` supplied → the usual
-        external-plane ownership check (404 hides cross-user existence).
+        the caller's next run reuses it. ``session_id`` supplied → the same
+        kill-switch gate, then the usual external-plane ownership check (404
+        hides cross-user existence).
         """
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
@@ -194,6 +195,19 @@ def build_external_uploads_router() -> APIRouter:
             except _SessionError as exc:
                 return external_error(ExternalScopeError(exc.code, exc.message, exc.status_code))
         else:
+            # Kill-switch first, exactly as ``_resolve_session`` does it on the
+            # other branch. ``load_owned_session`` is a pure ownership check
+            # with no kill-switch of its own, so without this the gate depended
+            # on whether the caller passed ``session_id`` — and a disabled agent
+            # kept accepting 201s, writing into the end user's persistent
+            # workspace and burning image quota. Worse, the design spec's own
+            # recommendation (§四-6: reuse ``session_id`` for follow-up uploads)
+            # pointed at the ungated branch. ``POST .../runs`` 403s either way;
+            # this is the parity fix (P1 final review, I1).
+            if await disable_service.is_disabled(tenant_id, agent_code):
+                return external_error(
+                    ExternalScopeError("AGENT_DISABLED", f"agent {agent_code!r} is disabled", 403)
+                )
             try:
                 meta = await load_owned_session(
                     tenant_id=tenant_id,
@@ -244,6 +258,7 @@ def build_external_uploads_router() -> APIRouter:
                             "mime": content_type,
                             "size": doc_result.size_bytes,
                         },
+                        "error": None,
                     },
                 )
 
@@ -289,6 +304,7 @@ def build_external_uploads_router() -> APIRouter:
                         "mime": content_type,
                         "size": len(raw),
                     },
+                    "error": None,
                 },
             )
         except HTTPException as exc:

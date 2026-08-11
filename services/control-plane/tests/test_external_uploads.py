@@ -305,3 +305,108 @@ async def test_upload_rejects_an_unsupported_type(ctx: _Ctx) -> None:
     # unrelated extension-lookup fallback that happens to also 400 for
     # this same input (see this file's mutation self-proof notes).
     assert "unsupported content type" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# P1 final review, Important I1 — the kill-switch gate must not depend on
+# whether the caller supplies ``session_id``
+# ---------------------------------------------------------------------------
+
+
+async def _disable_agent(ctx: _Ctx) -> None:
+    """Flip the kill-switch straight through the store + service.
+
+    Going through ``POST /v1/agents/{name}/disable`` would need an employee
+    JWT; this fixture's caller is deliberately a machine principal, and the
+    gate under test reads the service, not the endpoint.
+    """
+    await ctx.app.state.agent_disable_repo.set_disabled(
+        tenant_id=ctx.tenant_id,
+        agent_name="support-bot",
+        disabled=True,
+        reason="incident-42",
+        disabled_by="ops",
+    )
+    ctx.app.state.agent_disable_service.invalidate(ctx.tenant_id, "support-bot")
+
+
+@pytest.mark.asyncio
+async def test_upload_with_session_id_is_gated_by_the_kill_switch(ctx: _Ctx) -> None:
+    """The asymmetry this closes: omitting ``session_id`` routed through
+    ``_resolve_session`` (which checks the kill-switch) while supplying one
+    routed through ``load_owned_session`` (pure ownership, no kill-switch), so
+    a disabled agent still accepted 201s and kept writing into the end user's
+    persistent workspace + quota. Design spec §四-6 recommends supplying
+    ``session_id`` for follow-up uploads — i.e. the recommended path was the
+    ungated one.
+    """
+    await ctx.seed_agent()
+    first = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert first.status_code == 201, first.text
+    session_id = first.json()["data"]["session_id"]
+
+    await _disable_agent(ctx)
+
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77", "session_id": session_id},
+        files={"file": ("b.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "AGENT_DISABLED"
+
+
+@pytest.mark.asyncio
+async def test_upload_without_session_id_stays_gated_by_the_kill_switch(ctx: _Ctx) -> None:
+    """The control arm — the branch that was already gated must stay gated,
+    with the same code, so the fix is "both branches agree", not "the gate
+    moved"."""
+    await ctx.seed_agent()
+    await _disable_agent(ctx)
+
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "AGENT_DISABLED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "content_type", "payload", "expected_type"),
+    [
+        ("a.png", "image/png", _PNG_BYTES, "image"),
+        ("notes.txt", "text/plain", b"hello", "document"),
+    ],
+)
+async def test_upload_201_carries_the_full_envelope(
+    ctx: _Ctx, filename: str, content_type: str, payload: bytes, expected_type: str
+) -> None:
+    """P1 final review, I2 — the 201 body was ``{success, data}``: no ``error``
+    key at all, while cancel / list / messages / decide all return
+    ``{success, data, error}``. A third-party SDK with one envelope parser
+    ``KeyError``s on the difference. Both content branches build their own
+    response dict, so both are pinned.
+    """
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": (filename, payload, content_type)},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert set(body) == {"success", "data", "error"}, body
+    assert body["success"] is True
+    assert body["error"] is None
+    assert body["data"]["type"] == expected_type
