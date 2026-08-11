@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api._authz import ensure_resource_access, require
+from control_plane.api._external import external_subject_id
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
@@ -322,11 +323,17 @@ async def _resolve_session(
         )
     record = active[0]
 
-    # Mint-on-use the end-user. The app owns its user_id namespace; subject type
-    # "user" + the app's id is unique per tenant. (Any valid tenant key may act
-    # for any of its users — network-layer hardening is a later addition; every
-    # call is audited with on_behalf_of.)
-    end_user = await users.resolve(tenant_id=tenant_id, subject_type="user", subject_id=user_id)
+    # Mint-on-use the end-user. The app owns its user_id namespace; the id is
+    # namespaced with the `ext:` prefix before it becomes subject_id so it can
+    # never collide with an employee's bare Keycloak sub — see
+    # `_external.EXTERNAL_SUBJECT_PREFIX` for the full rationale. (Any valid
+    # tenant key may act for any of its users — network-layer hardening is a
+    # later addition; every call is audited with on_behalf_of.)
+    end_user = await users.resolve(
+        tenant_id=tenant_id,
+        subject_type="user",
+        subject_id=external_subject_id(user_id),
+    )
 
     if session_id is not None:
         meta = await threads.get(session_id, tenant_id=tenant_id)

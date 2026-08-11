@@ -50,6 +50,11 @@ from control_plane.api import (
     build_curation_router,
     build_eval_dataset_router,
     build_eval_runs_router,
+    build_external_approvals_router,
+    build_external_events_router,
+    build_external_runs_router,
+    build_external_sessions_router,
+    build_external_uploads_router,
     build_feedback_router,
     build_health_router,
     build_knowledge_router,
@@ -2493,6 +2498,13 @@ def create_app(
     app.include_router(build_eval_runs_router())
     app.include_router(build_quality_router())
     app.include_router(build_platform_quality_config_router())
+
+    # 第三方对接 API v1(P1)—— 对外契约,与控制台平面分开。
+    app.include_router(build_external_runs_router())
+    app.include_router(build_external_events_router())
+    app.include_router(build_external_sessions_router())
+    app.include_router(build_external_uploads_router())
+    app.include_router(build_external_approvals_router())
 
     return app
 
