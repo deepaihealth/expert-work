@@ -49,23 +49,36 @@ def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
 
 
+#: A run in any of these statuses counts as "in flight" for the ``running``
+#: field. ``QUEUED`` belongs here alongside ``PENDING``/``RUNNING``: a
+#: ``mode=queue`` run (``runs.py:830-850``) is created with this exact status
+#: and stays in it until some replica's ``RunQueueWorker`` claims it — the
+#: third party's most common submit path is queue mode, so omitting it would
+#: report ``running: false`` for a run the system has already accepted and
+#: will execute, and would contradict the cancel endpoint (``store.py:485``),
+#: which already treats ``QUEUED`` as live/cancellable.
+_ACTIVE_RUN_STATUSES = (RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING)
+
+
 async def _inflight_thread_ids(
     runs: RunStore, *, tenant_id: UUID, thread_ids: Collection[UUID]
 ) -> set[UUID]:
-    """Which of ``thread_ids`` have a PENDING/RUNNING run, batched (not one
-    query — or worse, one ``RunManager`` lock acquisition — per session row).
+    """Which of ``thread_ids`` have an active (``_ACTIVE_RUN_STATUSES``) run,
+    batched (not one query — or worse, one ``RunManager`` lock acquisition —
+    per session row).
 
     Reads the durable :class:`RunStore`, not :class:`RunManager.has_inflight`
     (a per-process in-memory registry, per its own docstring) — this service
     runs multi-replica, so a run executing on another instance must still
     show ``running: true`` here. ``RunStore.list_for_tenant`` takes at most
-    one ``status`` per call, so this issues the two active statuses as two
-    tenant-scoped, thread-id-filtered queries rather than one per row.
+    one ``status`` per call, so this issues one tenant-scoped,
+    thread-id-filtered query per active status (fixed count, independent of
+    how many sessions are on the page) rather than one per row.
     """
     if not thread_ids:
         return set()
     ids: set[UUID] = set()
-    for status in (RunStatus.PENDING, RunStatus.RUNNING):
+    for status in _ACTIVE_RUN_STATUSES:
         active = await runs.list_for_tenant(
             tenant_id=tenant_id,
             status=status,

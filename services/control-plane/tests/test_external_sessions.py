@@ -172,10 +172,45 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     ``RunManager.has_inflight``, a per-process in-memory registry (its own
     docstring says so) that a multi-replica deployment can't rely on: a run
     executing on another instance would falsely read ``running: false``.
-    Flip a run's *durable* row directly (as if some other replica — or a
-    ``RunQueueWorker`` — owns it) and confirm the listing reflects it, with a
-    terminal run alongside to prove it isn't just always-True."""
+
+    Covers all three active statuses independently — ``PENDING``,
+    ``QUEUED``, ``RUNNING`` — each on its own session, plus a terminal one,
+    so dropping any single status out of ``_ACTIVE_RUN_STATUSES`` fails
+    exactly that session's assertion (review fix round 2 — the first version
+    of this test only ever drove runs through ``RUNNING``/``SUCCESS``,
+    leaving ``PENDING`` with zero mutation coverage).
+
+    ``QUEUED`` is reached the way a third party actually gets there:
+    ``mode="queue"`` (``runs.py:830-850``) creates the run already in that
+    status — never claimed here, never hand-set. ``PENDING`` and ``RUNNING``
+    are dispatched directly on the durable row (as if some other replica, or
+    a ``RunQueueWorker``, owns the run) since nothing in this stub harness
+    naturally parks a run in either for long enough to observe.
+    """
     await ctx.seed_agent()
+
+    pending_run = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert pending_run.status_code == 202, pending_run.text
+    await ctx.run_store.set_status(
+        run_id=UUID(pending_run.json()["run_id"]),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.PENDING,
+        updated_at=datetime.now(UTC),
+    )
+
+    # Left exactly as ``mode="queue"`` creates it — status QUEUED, untouched.
+    queued_run = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert queued_run.status_code == 202, queued_run.text
+    assert queued_run.json()["status"] == "queued"
+
     running_run = await ctx.client.post(
         "/v1/agents/support-bot/runs",
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
@@ -210,6 +245,8 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert resp.status_code == 200, resp.text
     by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
+    assert by_id[pending_run.json()["thread_id"]]["running"] is True
+    assert by_id[queued_run.json()["thread_id"]]["running"] is True
     assert by_id[running_run.json()["thread_id"]]["running"] is True
     assert by_id[done_run.json()["thread_id"]]["running"] is False
 
