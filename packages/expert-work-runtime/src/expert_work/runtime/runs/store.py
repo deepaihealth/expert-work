@@ -95,18 +95,23 @@ class RunStore(abc.ABC):
     @abc.abstractmethod
     async def request_cancel(self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime) -> bool:
         """Stream RT-4 (RT-ADR-17) — cross-replica cancel: guarded transition of a
-        still-executing run to INTERRUPTED.
+        still-executing OR still-queued run to INTERRUPTED.
 
         Updates ``status → interrupted`` ONLY when the row is currently
-        ``running`` / ``pending`` (so a run that just finished ``SUCCESS`` is
-        never clobbered). Returns ``True`` iff a row was interrupted.
+        ``running`` / ``pending`` / ``queued`` (so a run that just finished
+        ``SUCCESS`` is never clobbered). Returns ``True`` iff a row was
+        interrupted.
 
         This is how a kill-switch stops a run owned by *another* instance: the
         owning worker's next lease heartbeat CAS (``status='running' AND
         claimed_by=<owner>``) then fails, which makes ``_renew_lease`` set that
         worker's ``abort_event`` — the run stops within one heartbeat interval.
         A local run is stopped immediately via :meth:`RunManager.cancel`; this
-        is the fallback for the runs that manager does not own.
+        is the fallback for the runs that manager does not own. Including
+        ``queued`` here (External-API-v1 P1 review fix — Critical C1) is what
+        makes a still-unclaimed run actually stoppable: once this CAS wins,
+        :meth:`claim_queued`'s own ``status = QUEUED`` guard can never match
+        it, so no worker ever picks it up — no race with a concurrent claim.
         """
 
     @abc.abstractmethod
@@ -477,7 +482,7 @@ class InMemoryRunStore(RunStore):
         if (
             row is None
             or row.tenant_id != tenant_id
-            or row.status not in (RunStatus.RUNNING, RunStatus.PENDING)
+            or row.status not in (RunStatus.RUNNING, RunStatus.PENDING, RunStatus.QUEUED)
         ):
             return False
         self._rows[run_id] = replace(
@@ -892,7 +897,13 @@ class SqlRunStore(RunStore):
                 .where(
                     AgentRunRow.id == run_id,
                     AgentRunRow.tenant_id == tenant_id,
-                    AgentRunRow.status.in_((RunStatus.RUNNING.value, RunStatus.PENDING.value)),
+                    AgentRunRow.status.in_(
+                        (
+                            RunStatus.RUNNING.value,
+                            RunStatus.PENDING.value,
+                            RunStatus.QUEUED.value,
+                        )
+                    ),
                 )
                 .values(
                     status=RunStatus.INTERRUPTED.value,

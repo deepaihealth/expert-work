@@ -3,35 +3,41 @@
 Covers: local abort (a run this replica's ``RunManager`` owns stops
 immediately + flips to INTERRUPTED), cross-replica fallback (a run only the
 durable store knows about — this replica's ``RunManager`` has no record — is
-stopped via the CAS ``request_cancel``), ownership scoping (another user /
-another agent both 404 as ``RUN_NOT_FOUND``, never leaking existence), and
-idempotency (cancelling twice is a 200 with ``stopped: false`` the second
-time, not an error).
+stopped via the CAS ``request_cancel``), a still-queued run (never claimed by
+any worker — the review-fix Critical C1 case, see below), ownership scoping
+(another user / another agent both 404 as ``RUN_NOT_FOUND``, never leaking
+existence), and idempotency (cancelling twice, or cancelling an already
+finished run, is a 200 with ``stopped: false`` rather than erroring or lying).
 
 Local vs. peer-owned runs are seeded directly against ``RunManager`` /
-``RunStore`` rather than through ``POST /{agent_code}/runs``: that endpoint's
-``mode="queue"`` only ever writes a ``QUEUED`` durable row (see
-``RunManager.enqueue`` — "there is no in-memory record and no asyncio.Task");
+``RunStore`` rather than through ``POST /{agent_code}/runs``: ``mode="stream"``
+would need the real endpoint, but ``run_agent`` runs as a bare
+``asyncio.create_task`` with no artificial delay, so a real HTTP round trip
+races it to completion before the test's own ``cancel`` call lands — flaky.
+Direct seeding sidesteps that while still exercising the endpoint's real
+ownership-check + two-level-cancel code paths.
+
+Review fix (Critical C1): ``mode="queue"`` alone used to be a dead end for
+this suite too — ``RunManager.enqueue`` writes only a durable ``QUEUED`` row
+("there is no in-memory record and no asyncio.Task" — its own docstring), and
 nothing in this test process ever claims it (the distributed
 ``RunQueueWorker`` only starts from ``create_app``'s lifespan, which
-``ASGITransport`` never triggers here), so a queue-mode run would stay
-``QUEUED`` forever — a status neither ``RunManager.cancel`` nor
-``RunStore.request_cancel`` transitions (both guard on RUNNING/PENDING only,
-matching every other cancel call site in this codebase: ``agents.py``'s
-agent-delete cascade and ``tenants.py``'s suspend bulk-cancel). ``mode="stream"``
-would dodge that, but ``run_agent`` runs as a bare ``asyncio.create_task`` with
-no artificial delay, so a real HTTP round trip races it to completion —
-flaky. Direct seeding sidesteps both problems while still exercising the
-endpoint's real ownership-check + two-level-cancel code paths. The 404 and
-idempotency tests don't need a stoppable run at all (ownership fails before
-either cancel primitive runs, and cancelling twice must not error either
-way), so they use the real ``mode="queue"`` HTTP path.
+``ASGITransport`` never triggers here). Before the fix, neither
+``RunManager.cancel`` nor ``RunStore.request_cancel`` transitioned a
+``QUEUED`` row (both guarded on RUNNING/PENDING only), so a real third-party
+caller cancelling a run still sitting in the queue got back ``200
+{"stopped": false}`` — indistinguishable from "there was nothing to stop" —
+and the run went on to execute anyway. Fixed at the ``RunStore.request_cancel``
+CAS (now matches QUEUED too, in both the in-memory and SQL backends) rather
+than in this endpoint, so ``test_cancel_stops_a_still_queued_run`` below
+exercises the real HTTP ``mode="queue"`` path end-to-end.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -174,6 +180,7 @@ async def test_cancel_stops_a_run_this_replica_owns(ctx: _Ctx) -> None:
     assert body["success"] is True
     assert body["data"]["run_id"] == str(run_id)
     assert body["data"]["stopped"] is True
+    assert body["error"] is None
 
     run = await ctx.run_store.get(run_id=run_id, tenant_id=ctx.tenant_id)
     assert run is not None
@@ -219,6 +226,50 @@ async def test_cancel_falls_back_to_request_cancel_for_a_peer_owned_run(ctx: _Ct
 
 
 @pytest.mark.asyncio
+async def test_cancel_stops_a_still_queued_run(ctx: _Ctx) -> None:
+    """Critical C1 review fix — a run started via the real ``mode="queue"``
+    HTTP path and never claimed by any worker must be genuinely stoppable,
+    not silently ignored while it goes on to execute.
+
+    The ``claim_queued`` assertion is the one that actually proves the run
+    can never run: a ``stopped: true`` response alone doesn't rule out a
+    worker still winning the CAS race a moment later.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    run_id = started.json()["run_id"]
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:cancel",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["data"]["stopped"] is True
+
+    run = await ctx.run_store.get(run_id=UUID(run_id), tenant_id=ctx.tenant_id)
+    assert run is not None
+    assert run.status is RunStatus.INTERRUPTED
+
+    # The load-bearing assertion: a worker racing to claim this run after the
+    # cancel must find nothing — the run can never execute.
+    now = datetime.now(UTC)
+    claimed = await ctx.run_store.claim_queued(
+        run_id=UUID(run_id),
+        new_owner="late-worker",
+        lease_until=now + timedelta(seconds=30),
+        heartbeat_at=now,
+    )
+    assert claimed is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_404s_for_another_user(ctx: _Ctx) -> None:
     await ctx.seed_agent()
     started = await ctx.client.post(
@@ -257,19 +308,32 @@ async def test_cancel_404s_for_another_agent(ctx: _Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_cancel_is_idempotent(ctx: _Ctx) -> None:
+    """Cancelling a run that is genuinely stopped by the first call must be a
+    true no-op on the second: ``RunManager.cancel`` returns ``True`` iff its
+    in-memory record exists — regardless of status, and that record lingers
+    ~5 minutes past completion — so without the endpoint's own status guard,
+    a second cancel of an already-INTERRUPTED run would also lie and report
+    ``stopped: true`` again. Uses a locally-owned run (not ``mode="queue"``)
+    so the *first* call genuinely stops something — otherwise this test
+    would never actually exercise "cancel something real, then cancel it
+    again", and would pass identically even if every cancel were a no-op.
+    """
     await ctx.seed_agent()
-    started = await ctx.client.post(
-        "/v1/agents/support-bot/runs",
-        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
-        headers=ctx.headers,
+    thread_id = await ctx.bind_session("cust-77")
+    end_user_id = await ctx.end_user_id("cust-77")
+    run_id = uuid4()
+    await ctx.app.state.agent_runtime.run_manager.create(
+        run_id=run_id, thread_id=thread_id, tenant_id=ctx.tenant_id, user_id=end_user_id
     )
-    run_id = started.json()["run_id"]
+
     first = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
         json={"user_id": "cust-77"},
         headers=ctx.headers,
     )
-    assert first.status_code == 200
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["stopped"] is True
+
     second = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
         json={"user_id": "cust-77"},
@@ -278,3 +342,42 @@ async def test_cancel_is_idempotent(ctx: _Ctx) -> None:
     # A second cancel must not error — it reports that nothing was still running.
     assert second.status_code == 200, second.text
     assert second.json()["data"]["stopped"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_a_noop_for_an_already_finished_run(ctx: _Ctx) -> None:
+    """A run that already reached SUCCESS (not via cancel — e.g. it simply
+    finished) must report ``stopped: false``, not ``true``.
+
+    ``RunManager.cancel`` returns ``True`` iff a record exists in its
+    registry, independent of status, so a finished run within the ~5-minute
+    TTL sweep window would otherwise be reported as freshly stopped —
+    exactly the false positive Important-I1 flagged.
+    """
+    await ctx.seed_agent()
+    thread_id = await ctx.bind_session("cust-77")
+    end_user_id = await ctx.end_user_id("cust-77")
+    run_id = uuid4()
+    await ctx.app.state.agent_runtime.run_manager.create(
+        run_id=run_id, thread_id=thread_id, tenant_id=ctx.tenant_id, user_id=end_user_id
+    )
+    now = datetime.now(UTC)
+    await ctx.run_store.set_status(
+        run_id=run_id,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+    )
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:cancel",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["stopped"] is False
+
+    run = await ctx.run_store.get(run_id=run_id, tenant_id=ctx.tenant_id)
+    assert run is not None
+    assert run.status is RunStatus.SUCCESS

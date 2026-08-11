@@ -641,6 +641,43 @@ async def test_concurrent_claim_queued_exactly_one_winner(run_store: SqlRunStore
 
 
 @pytest.mark.asyncio
+async def test_request_cancel_interrupts_a_queued_run(run_store: SqlRunStore) -> None:
+    """External-API-v1 P1 review fix (Critical C1) — a run still sitting in the
+    distributed queue, never claimed by any worker, must be cancellable too:
+    ``request_cancel``'s CAS now matches ``queued`` in addition to
+    ``running``/``pending``. Once interrupted, ``claim_queued``'s own
+    ``status = queued`` guard can never match it again — the run is
+    permanently unclaimable, not just marked cancelled while still racing a
+    worker for execution.
+    """
+    from dataclasses import replace
+
+    run_id, tenant_id = uuid4(), uuid4()
+    info = _info(run_id=run_id, tenant_id=tenant_id, status=RunStatus.QUEUED)
+    await run_store.create(replace(info, enqueued_input={"input": "hi", "image_refs": []}))
+
+    hit = await run_store.request_cancel(
+        run_id=run_id, tenant_id=tenant_id, updated_at=_BASE + timedelta(seconds=9)
+    )
+    assert hit is True
+    fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None
+    assert fetched.status is RunStatus.INTERRUPTED
+    assert fetched.finished_at == _BASE + timedelta(seconds=9)
+
+    # A worker racing to claim the same run after the cancel must lose — the
+    # CAS's own ``status = queued`` predicate no longer matches.
+    now = datetime.now(UTC)
+    claimed = await run_store.claim_queued(
+        run_id=run_id,
+        new_owner="worker-late",
+        lease_until=now + timedelta(seconds=30),
+        heartbeat_at=now,
+    )
+    assert claimed is None
+
+
+@pytest.mark.asyncio
 async def test_list_queued_round_trips_enqueued_input(run_store: SqlRunStore) -> None:
     from dataclasses import replace
 
