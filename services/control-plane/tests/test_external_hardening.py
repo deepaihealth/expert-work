@@ -37,7 +37,12 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, Role
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs import (
+    InMemoryRunEventStore,
+    InMemoryRunStore,
+    RunStatus,
+    make_event_record,
+)
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -322,6 +327,20 @@ async def test_deactivated_user_sessions_stay_unreachable(ctx: _Ctx) -> None:
         tenant_id=ctx.tenant_id, subject_type="user", subject_id=subject_id
     )
     assert row is not None
+
+    # Self-containment: prove the session WAS reachable before the deactivate,
+    # so a later refactor that breaks the read path for an unrelated reason
+    # can't leave this test passing for the wrong reason (P1 final review,
+    # deferred Minor #6 — the assertion below is only meaningful against a
+    # non-empty "before").
+    before = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": target_user_id},
+        headers=ctx.headers,
+    )
+    assert before.status_code == 200, before.text
+    assert len(before.json()["data"]["sessions"]) == 1, before.text
+
     assert await users.deactivate(row.id, tenant_id=ctx.tenant_id, now=datetime.now(UTC)) is True
 
     resp = await ctx.client.get(
@@ -331,3 +350,130 @@ async def test_deactivated_user_sessions_stay_unreachable(ctx: _Ctx) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["sessions"] == []
+
+
+# ---------------------------------------------------------------------------
+# P1 final review, Critical C1 — ``load_owned_run`` must never mint either
+# ---------------------------------------------------------------------------
+
+
+async def _terminal_run(ctx: _Ctx, user_id: str) -> tuple[str, str]:
+    """Submit a run for ``user_id``, drive it terminal, seed one durable frame.
+
+    Terminal matters: a non-terminal run makes the events endpoint live-attach
+    to a bridge nothing is driving, so the request would hang instead of
+    answering. The durable frame matters too — without it a successful replay
+    is indistinguishable from the degenerate "no store wired, emit a bare
+    ``end``" branch, so "the gate leaked" would look the same as "the gate
+    held".
+    """
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": user_id, "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+    run_id = created.json()["run_id"]
+    await ctx.app.state.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=1, event_name="updates", data={"step": 1})
+    )
+    await ctx.app.state.run_store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+    return run_id, created.json()["thread_id"]
+
+
+@pytest.mark.asyncio
+async def test_run_events_never_mints_a_ghost_user(ctx: _Ctx) -> None:
+    """``GET .../runs/{id}/events`` is the third read endpoint, and it went
+    through ``load_owned_run`` — which resolved the end user with the
+    *mint-on-use* default. So spraying arbitrary ``user_id``s at it returned
+    404 every time while writing one ``tenant_user`` row per attempt (they
+    then show up on the user-dimension ops page). Same invariant as
+    ``test_list_sessions_never_mints_a_ghost_user``, on the endpoint that
+    was missed.
+    """
+    await ctx.seed_agent()
+    run_id, _thread_id = await _terminal_run(ctx, "cust-77")
+
+    for ghost in ("ghost-1", "ghost-2", "ghost-3"):
+        assert not await ctx.has_subject(external_subject_id(ghost))
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/runs/{run_id}/events",
+            params={"user_id": ghost},
+            headers=ctx.headers,
+        )
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == "RUN_NOT_FOUND"
+        assert not await ctx.has_subject(external_subject_id(ghost)), (
+            f"GET .../runs/{{id}}/events minted a tenant_user row for {ghost!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_events_neither_resurrect_nor_expose_a_purged_user(ctx: _Ctx) -> None:
+    """The two remaining halves of C1, which only the events endpoint had.
+
+    1. **Resurrection** — ``resolve`` clears ``deleted_at`` on purpose ("a
+       returning user comes back clean"), so routing a *read* through it
+       un-deleted a purged identity. Phase 3b's 90-day hard delete selects on
+       ``deleted_at``, so that row also became permanently uncollectable.
+    2. **Contradiction** — because the resurrection happened *before* the
+       ownership check, the purged user's own run events came back 200 with a
+       real event stream while their messages 404'd and their session list was
+       empty. Three read endpoints, same identity, three different answers.
+       This asserts all three agree.
+    """
+    await ctx.seed_agent()
+    run_id, thread_id = await _terminal_run(ctx, "soon-to-be-purged")
+
+    users = ctx.app.state.tenant_user_repo
+    row = await users.get_by_subject(
+        tenant_id=ctx.tenant_id,
+        subject_type="user",
+        subject_id=external_subject_id("soon-to-be-purged"),
+    )
+    assert row is not None
+
+    # Self-containment: the events endpoint must be reachable BEFORE the
+    # purge, or the 404 below proves nothing about the purge.
+    live = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "soon-to-be-purged"},
+        headers=ctx.headers,
+    )
+    assert live.status_code == 200, live.text
+    assert "event: updates" in live.text
+
+    assert await users.deactivate(row.id, tenant_id=ctx.tenant_id, now=datetime.now(UTC)) is True
+    purged_at = (await users.get(row.id, tenant_id=ctx.tenant_id)).deleted_at
+    assert purged_at is not None
+
+    events = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "soon-to-be-purged"},
+        headers=ctx.headers,
+    )
+    assert events.status_code == 404, events.text
+    assert events.json()["error"]["code"] == "RUN_NOT_FOUND"
+
+    still_purged = (await users.get(row.id, tenant_id=ctx.tenant_id)).deleted_at
+    assert still_purged == purged_at, "a read endpoint cleared deleted_at (resurrected the user)"
+
+    messages = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{thread_id}/messages",
+        params={"user_id": "soon-to-be-purged"},
+        headers=ctx.headers,
+    )
+    assert messages.status_code == 404, messages.text
+    sessions = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "soon-to-be-purged"},
+        headers=ctx.headers,
+    )
+    assert sessions.status_code == 200, sessions.text
+    assert sessions.json()["data"]["sessions"] == []

@@ -160,14 +160,17 @@ async def load_owned_session(
     semantics applies, and both are load-bearing — do not collapse this to
     one behavior:
 
-    - ``mint=True`` — the default, used by every endpoint that can create or
-      mutate state (session bind, run submit, upload, approval decision,
-      run cancel). A third party never pre-registers its end-users, so the
-      *first* call under a fresh ``user_id`` must mint the ``tenant_user``
-      row (mint-on-use is intentional product behavior here).
-    - ``mint=False`` — used only by the read-only message-history endpoint.
-      A GET must never write; an unrecognized ``user_id`` here means "no
-      such session", not "create a user and then report 404 anyway".
+    - ``mint=True`` — the default, used by the endpoints that address a
+      session the caller may not hold yet (session bind, run submit, and the
+      upload path that omits ``session_id``). A third party never
+      pre-registers its end-users, so the *first* call under a fresh
+      ``user_id`` must mint the ``tenant_user`` row (mint-on-use is
+      intentional product behavior here).
+    - ``mint=False`` — used by the read-only message-history endpoint and by
+      :func:`load_owned_run` (cancel / events / approval-decide). A GET must
+      never write; and for an already-existing run or session there is
+      nothing to mint — an unrecognized ``user_id`` there means "not yours",
+      not "create a user and then report 404 anyway".
     """
     if mint:
         end_user_id = await resolve_external_user_id(
@@ -203,6 +206,23 @@ async def load_owned_run(
     A run whose session fails the ownership check reports ``RUN_NOT_FOUND`` — not
     the session's code — so the caller cannot tell "this run exists but is
     someone else's" from "no such run".
+
+    Resolution is ``mint=False`` unconditionally, and that is structural, not a
+    per-caller preference: **a run that exists already has an owner with a
+    ``tenant_user`` row**, so there is nothing for this function to mint. Minting
+    here only ever creates a row for a ``user_id`` that is by definition *not*
+    the run's owner — i.e. exactly the enumeration case this must 404. With the
+    default ``mint=True`` it did three wrong things at once (P1 final review,
+    C1): a third party could spray arbitrary ``user_id``s at ``GET
+    .../runs/{id}/events``, get 404 every time, and still leave one ghost row
+    per attempt on the user-dimension ops page; a soft-deleted (purged) identity
+    was *resurrected* by that GET (``resolve`` clears ``deleted_at`` — the
+    "returning user comes back clean" design), which also made it permanently
+    uncollectable by the ``deleted_at``-driven Phase-3b hard delete; and,
+    because resurrection happened before the ownership check, the purged user's
+    own run events stayed readable (200) while their messages and session list
+    correctly reported 404 / empty. The mint belongs to real entry points
+    (``_resolve_session``: bind a session, submit a run), never here.
     """
     run = await runs.get(run_id=run_id, tenant_id=tenant_id)
     if run is None:
@@ -215,6 +235,7 @@ async def load_owned_run(
             session_id=run.thread_id,
             threads=threads,
             users=users,
+            mint=False,
         )
     except ExternalScopeError:
         raise ExternalScopeError("RUN_NOT_FOUND", "run not found", 404) from None
