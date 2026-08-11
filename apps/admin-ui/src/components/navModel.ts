@@ -277,39 +277,60 @@ export function isPlatformScope(scope: TenantScopeValue): boolean {
 }
 
 /**
+ * Scope-specific groups only — excludes ``global`` (the handbook), which
+ * is always visible and must NOT influence scope-based landing/defaults.
+ * Kept separate from :func:`visibleGroups` so ``defaultPathForScope``'s
+ * ``[0]`` pick below can never resolve to the handbook (§review 2026-08-11:
+ * ``visibleGroups("*", false)[0]`` used to become ``"global"`` once
+ * ``global`` was appended, sending ``defaultPathForScope("*", false)`` to
+ * ``/handbook`` instead of its ``/agents`` fallback — a combination that's
+ * genuinely reachable via a stale sessionStorage ``"*"`` scope from a prior
+ * admin session, since ``TenantScopeContext``'s stored-scope read seeds
+ * ``useState`` directly, bypassing the ``setScope`` gate).
+ */
+function scopedGroups(
+  scope: TenantScopeValue,
+  isSystemAdmin: boolean,
+): NavGroup[] {
+  return isPlatformScope(scope)
+    ? isSystemAdmin
+      ? ["platform"]
+      : []
+    : ["workspace", "tenant-settings"];
+}
+
+/**
  * Visible groups for ``(scope, isSystemAdmin)``.
  *
  *   - platform scope → platform group (with a ``isSystemAdmin`` belt-and
  *     -braces guard; the switcher only offers ``"*"`` to admins anyway).
  *   - any concrete tenant → workspace + tenant-settings.
  *   - ``global`` (the handbook) is appended in every case — it isn't
- *     scope-specific, so it never determines ``[0]`` (the default-landing
- *     pick below stays unaffected).
+ *     scope-specific. Used for Sidebar rendering and
+ *     :func:`pathAllowedForScope`; NOT used to pick the default landing
+ *     path (see :func:`scopedGroups`/:func:`defaultPathForScope`).
  */
 export function visibleGroups(
   scope: TenantScopeValue,
   isSystemAdmin: boolean,
 ): NavGroup[] {
-  const scoped: NavGroup[] = isPlatformScope(scope)
-    ? isSystemAdmin
-      ? ["platform"]
-      : []
-    : ["workspace", "tenant-settings"];
-  return [...scoped, "global"];
+  return [...scopedGroups(scope, isSystemAdmin), "global"];
 }
 
 /**
  * Landing route after a scope switch — the first sidebar entry of the
- * NEW scope's first visible group. Admin and tenant IAs differ too much
- * to preserve page context across a perspective switch (product call,
+ * NEW scope's first visible SCOPE-SPECIFIC group (``global`` excluded —
+ * see :func:`scopedGroups`). Admin and tenant IAs differ too much to
+ * preserve page context across a perspective switch (product call,
  * 2026-08-02): "*" lands on tenant governance, a concrete tenant lands
- * on its agents.
+ * on its agents; when no scope-specific group is visible (eg. a stale
+ * "*" scope on a non-admin), the ``/agents`` fallback below applies.
  */
 export function defaultPathForScope(
   scope: TenantScopeValue,
   isSystemAdmin: boolean,
 ): string {
-  const group = visibleGroups(scope, isSystemAdmin)[0];
+  const group = scopedGroups(scope, isSystemAdmin)[0];
   const first = ALL_NAV_ENTRIES.find((e) => e.group === group);
   return first?.path ?? "/agents";
 }
