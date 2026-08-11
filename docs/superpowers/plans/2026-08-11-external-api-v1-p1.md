@@ -25,9 +25,10 @@
 
 预检冲突分析已做(见每个 Task 的 Files 段):
 
-- **Wave 0(串行)**:Task 1 —— 建 `_external.py` + **5 个空壳路由文件** + `api/__init__.py` 导出 + `app.py` 注册 + `ext:` 前缀。**后续所有任务只填充自己那个文件,不再碰 `app.py` / `__init__.py`,因此零冲突。**
-- **Wave 1(6 个并行)**:Task 2 / 3 / 4 / 5 / 6 / 7 —— 各自独占文件。
-- **Wave 2(串行)**:Task 8 —— 全链集成测试。
+- **Wave 0(串行)**:Task 1 —— 建 `_external.py` + **5 个空壳路由文件** + `api/__init__.py` 导出 + `app.py` 注册 + `ext:` 前缀。**后续所有任务只填充自己那个文件,不再碰 `app.py` / `__init__.py`。**
+- **Wave 1(5 个并行)**:Task 2 / 3 / 4 / 5 / 6 —— 各自独占新文件。其中 Task 4 另改 `api/runs.py`(抽共享流式模块)、Task 5 另改 `api/uploads.py`(抽共享落盘函数),两者互不重叠。
+- **Wave 2(串行)**:Task 7 —— 控制台收口。**必须排在 Wave 1 之后**:它要给 `runs.py` / `uploads.py` 的路由装饰器加依赖,而这两个文件正是 Task 4 / Task 5 要改的(同文件并行会冲突)。
+- **Wave 3(串行)**:Task 8 —— 全链集成测试。
 
 ---
 
@@ -871,7 +872,9 @@ git commit -m "feat(control-plane): 对外会话列表 + 消息历史端点(user
 ### Task 4: 事件回放端点(断线重连)
 
 **Files:**
+- Create: `services/control-plane/src/control_plane/api/_run_event_stream.py`(两条路共用的流式生产者)
 - Modify: `services/control-plane/src/control_plane/api/external_events.py`(本任务独占)
+- Modify: `services/control-plane/src/control_plane/api/runs.py:1541-1580`(改为调用共享模块)
 - Test: `services/control-plane/tests/test_external_events.py`
 
 **Interfaces:**
@@ -879,7 +882,24 @@ git commit -m "feat(control-plane): 对外会话列表 + 消息历史端点(user
 - Produces: `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=&since_seq=` → `text/event-stream`,
   响应头 `X-Expert-Work-Run-Id` 与 `X-Expert-Work-Stream-Mode: replay|live`
 
-**范围边界(重要)**:本任务**只做对外包壳 + 归属校验**,把 `api/runs.py:1474-1587` 的 `stream_run_events` 主体逻辑(终态 → replay / 活跃 → live)搬过来并换成外部归属校验。**seq 错位、live 忽略 `since_seq`、回放分页三个 bug 属于 P3,不在本任务范围**——照搬现状即可,但要在文件 docstring 里写明这三条已知限制并指向 spec §六。
+**范围边界(重要)**:本任务**只做对外包壳 + 归属校验**。**seq 错位、live 忽略 `since_seq`、回放分页三个 bug 属于 P3,不在本任务范围**——行为照搬现状,但要在文件 docstring 里写明这三条已知限制并指向 spec §六。
+
+**不许复制粘贴流式逻辑**:`_stream_replay` / `_stream_live` 两个生产者必须**抽成共享模块** `api/_run_event_stream.py`,由控制台端点(`api/runs.py`)与本对外端点**共同调用**。理由:P3 要在这三个 bug 上动刀,两份副本必然只改一处(本仓库已有「同一语义分散多处实现、加约束只加了一处」的事故记录)。抽出的签名:
+
+```python
+def build_event_producer(
+    *,
+    run_id: UUID,
+    is_terminal: bool,
+    event_store: RunEventStore | None,
+    stream_bridge: StreamBridge,
+    since_seq: int | None,
+    scope: AbstractAsyncContextManager[None] | None = None,
+) -> AsyncIterator[bytes]:
+```
+
+`scope` 供控制台端点传 `applied_scope(scope)`(它的 DB 读要绑目标租户);对外端点传 `None`。
+改完 `api/runs.py` 后必须跑既有回放测试确认零行为变化。
 
 - [ ] **Step 1: 写失败测试** — `services/control-plane/tests/test_external_events.py`
 
@@ -955,11 +975,14 @@ Expected: FAIL —— 404(路由不存在)
 
 - [ ] **Step 3: 实现 `external_events.py`**
 
-结构照搬 `api/runs.py:1474-1587`,四处替换:
+先把 `api/runs.py:1541-1580` 的 `_stream_replay` / `_stream_live` 原样搬进新模块
+`api/_run_event_stream.py` 的 `build_event_producer(...)`(签名见上;`format_sse`、`HEARTBEAT_SENTINEL`、
+`END_SENTINEL`、`MAX_LIST_LIMIT` 的用法一字不改),把 `api/runs.py` 改成调用它,跑既有回放测试确认零变化。
+然后写对外端点,四处与控制台不同:
 
 1. **归属校验**换成 `load_owned_run(...)`(失败 → `external_error(exc)`,**必须在构造 `StreamingResponse` 之前**,保证 404 是普通 HTTP 错误而不是 SSE 帧)。
-2. 去掉 `ensure_single_tenant_scope` / `applied_scope` / `?tenant_id=` 跨租户参数(对外无意义),`tenant_id` 直接取 `request.state.tenant_id`。
-3. `_stream_replay` / `_stream_live` 两个内部函数**原样保留**(含 `format_sse`、`HEARTBEAT_SENTINEL`、`END_SENTINEL`、`MAX_LIST_LIMIT`、`TERMINAL_RUN_STATUSES` 的用法)。
+2. 去掉 `ensure_single_tenant_scope` / `applied_scope` / `?tenant_id=` 跨租户参数(对外无意义),`tenant_id` 直接取 `request.state.tenant_id`,`build_event_producer(..., scope=None)`。
+3. 终态判定沿用 `persisted.status in TERMINAL_RUN_STATUSES`。
 4. 依赖 `require("session", "read")`;`user_id` 为必填 query 参数(无默认值)。
 
 文件 docstring 必须写明三条已知限制(P3 修复):
@@ -993,10 +1016,11 @@ Expected: PASS(3 项)
 - [ ] **Step 6: 门禁 + Commit**
 
 ```bash
-uv run ruff check services/control-plane/src/control_plane/api/external_events.py services/control-plane/tests/test_external_events.py
-uv run ruff format --check services/control-plane/src/control_plane/api/external_events.py services/control-plane/tests/test_external_events.py
-uv run mypy services/control-plane/src/control_plane/api/external_events.py
-git add services/control-plane/src/control_plane/api/external_events.py services/control-plane/tests/test_external_events.py
+uv run pytest services/control-plane/tests/test_runs_api.py -q   # 既有回放行为零变化
+uv run ruff check services/control-plane/src/control_plane/api/external_events.py services/control-plane/src/control_plane/api/_run_event_stream.py services/control-plane/src/control_plane/api/runs.py services/control-plane/tests/test_external_events.py
+uv run ruff format --check services/control-plane/src/control_plane/api/external_events.py services/control-plane/src/control_plane/api/_run_event_stream.py services/control-plane/src/control_plane/api/runs.py services/control-plane/tests/test_external_events.py
+uv run mypy services/control-plane/src/control_plane/api/external_events.py services/control-plane/src/control_plane/api/_run_event_stream.py
+git add services/control-plane/src/control_plane/api/ services/control-plane/tests/test_external_events.py
 git commit -m "feat(control-plane): 对外事件回放端点(断线重连 + 闸先于流)"
 ```
 
