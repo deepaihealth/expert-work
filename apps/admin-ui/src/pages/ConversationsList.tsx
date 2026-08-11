@@ -309,7 +309,9 @@ export function ConversationsList() {
         key: "status",
         width: 120,
         render: (status: string) => (
-          <Tag color={STATUS_COLOR[status] ?? "default"}>{status}</Tag>
+          <Tag color={STATUS_COLOR[status] ?? "default"}>
+            {t(`conversations_page.status_${status}`, { defaultValue: status })}
+          </Tag>
         ),
       },
       {
@@ -458,7 +460,10 @@ export function ConversationsList() {
               data-testid="conversations-status-filter"
               options={[
                 { value: "all", label: t("conversations_page.filter_status_all") },
-                ...STATUS_OPTIONS.map((s) => ({ value: s, label: s })),
+                ...STATUS_OPTIONS.map((s) => ({
+                  value: s,
+                  label: t(`conversations_page.status_${s}`),
+                })),
               ]}
             />
             <Select<number | "all">

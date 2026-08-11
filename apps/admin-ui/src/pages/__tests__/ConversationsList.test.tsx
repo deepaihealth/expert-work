@@ -92,6 +92,22 @@ describe("ConversationsList", () => {
     expect(screen.getByText("v3.4.2")).toBeInTheDocument();
   });
 
+  it("localizes the status cell and the filter label instead of echoing the raw enum", async () => {
+    listConversationsMock.mockResolvedValue({
+      items: [{ ...sampleRow, status: "paused" }],
+      total: 1,
+      cross_tenant: false,
+    });
+    // status=paused in the URL makes the filter Select display that
+    // option's label too — both surfaces must show the translation.
+    renderPage("/conversations?status=paused");
+    // Wait for the async row first — the Select's label renders sync, so a
+    // bare findAllByText would resolve at 1 hit before the table loads.
+    expect(await screen.findByText("refund question")).toBeInTheDocument();
+    expect(screen.getAllByText("Paused")).toHaveLength(2);
+    expect(screen.queryByText("paused")).toBeNull();
+  });
+
   it("falls back to the untitled label when title is null", async () => {
     listConversationsMock.mockResolvedValue({
       items: [{ ...sampleRow, title: null }],

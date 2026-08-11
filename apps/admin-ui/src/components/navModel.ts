@@ -169,6 +169,13 @@ export const TENANT_SETTINGS_ITEMS: readonly NavEntry[] = [
     group: "tenant-settings",
   },
   {
+    key: "settings-tenant-quotas",
+    labelKey: "nav.tenant_quotas",
+    path: "/settings/tenant-quotas",
+    group: "tenant-settings",
+    adminOnly: true,
+  },
+  {
     key: "settings-quality",
     labelKey: "nav.quality",
     path: "/settings/quality",

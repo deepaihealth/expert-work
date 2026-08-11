@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   defaultPathForScope,
   pathAllowedForScope,
+  TENANT_SETTINGS_ITEMS,
   visibleGroups,
 } from "../navModel";
 
@@ -54,5 +55,18 @@ describe("visibleGroups — 'global' is still appended for Sidebar/pathAllowedFo
 
   it("platform scope, system_admin sees platform + global", () => {
     expect(visibleGroups("*", true)).toEqual(["platform", "global"]);
+  });
+});
+
+describe("tenant-quotas nav entry — regression for the missing sidebar entry", () => {
+  it("lives in tenant-settings and is gated to tenant admins", () => {
+    const entry = TENANT_SETTINGS_ITEMS.find(
+      (e) => e.path === "/settings/tenant-quotas",
+    );
+    expect(entry).toMatchObject({
+      key: "settings-tenant-quotas",
+      labelKey: "nav.tenant_quotas",
+      adminOnly: true,
+    });
   });
 });

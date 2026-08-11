@@ -25,7 +25,7 @@ order: 1
 
 ## 租户配额入口
 
-要给某个租户设置用量上限，先切入该租户（在租户列表点「管理」，或用顶栏的租户切换器选中它），再访问配额页（`/settings/tenant-quotas`；目前左侧菜单没有这个页面的直接入口，需要在地址栏手动打开）。可配置的维度包括 `qps`、`tokens_per_day`、`sandboxes`、`monthly_token_budget`、`image_upload_count_30d`、`image_storage_bytes`、`artifact_download_count_30d`、`workspace_bytes_per_user`。
+要给某个租户设置用量上限，先切入该租户（在租户列表点「管理」，或用顶栏的租户切换器选中它），再在左侧「设置」分组打开「租户配额」页（`/settings/tenant-quotas`）。可配置的维度包括 `qps`、`tokens_per_day`、`sandboxes`、`monthly_token_budget`、`image_upload_count_30d`、`image_storage_bytes`、`artifact_download_count_30d`、`workspace_bytes_per_user`。
 
 其中 `workspace_bytes_per_user` 是**按成员维度**的工作区容量上限——限制的是租户下单个成员能占用的工作区字节数，不是整个租户的总量；和 `image_storage_bytes` 一样以字节为单位，页面上会附带 GiB/MiB 的换算提示，方便按人肉可读的容量去设置。没有为某个维度建记录，等于该维度不设上限。
 
