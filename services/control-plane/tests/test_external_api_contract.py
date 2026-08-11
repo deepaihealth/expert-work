@@ -14,11 +14,15 @@ from __future__ import annotations
 import base64
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from typing import Any
+from typing import Annotated, Any, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -75,12 +79,39 @@ def _build_settings() -> Settings:
     )
 
 
+class _SeedState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+async def _seed_thread_messages(
+    checkpointer: InMemorySaver, thread_id: str, messages: list[BaseMessage]
+) -> None:
+    """Write one checkpoint holding ``messages`` for ``thread_id`` — same
+    helper ``test_external_sessions.py`` uses."""
+    graph = StateGraph(_SeedState)
+    graph.add_node("n", lambda _state: {"messages": []})
+    graph.add_edge(START, "n")
+    seeded = graph.compile(checkpointer=checkpointer)
+    await seeded.ainvoke(
+        {"messages": messages},
+        config={"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+    )
+
+
 class _Ctx:
-    def __init__(self, client: AsyncClient, app: Any, tenant_id: UUID, key_headers: dict[str, str]):
+    def __init__(
+        self,
+        client: AsyncClient,
+        app: Any,
+        tenant_id: UUID,
+        key_headers: dict[str, str],
+        checkpointer: InMemorySaver,
+    ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.key_headers = key_headers
+        self.checkpointer = checkpointer
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -108,6 +139,14 @@ async def ctx() -> AsyncIterator[_Ctx]:
     # workspace store (matches ``test_external_uploads.py``'s ctx fixture).
     app.state.object_store = InMemoryObjectStore()
     app.state.workspace_store = RecordingWorkspaceStore()
+    # ``stub_agent_runtime`` leaves ``durable_checkpointer`` unset, so step 5
+    # (message history) used to hit ``get_messages``'s ``checkpointer is None``
+    # early return: ``read_turns`` and the whole role/content/channel mapping
+    # never executed, and hard-coding the mapping to a constant still left the
+    # step green (P1 final review, deferred Minor #7). Wire a real saver so the
+    # walk reads back what a real run would have left behind.
+    checkpointer = InMemorySaver()
+    app.state.agent_runtime.durable_checkpointer = checkpointer
 
     tenant_id = uuid4()
     # A real third-party caller is a service-account (API-key) principal, not
@@ -125,7 +164,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     key_headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, key_headers)
+        yield _Ctx(client, app, tenant_id, key_headers, checkpointer)
 
 
 @pytest.mark.asyncio
@@ -204,13 +243,25 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
     assert session_id not in other_ids
     assert other_ids == [other_session_id]
 
-    # 5. Message history for that session is readable.
+    # 5. Message history for that session is readable — and really maps the
+    # durable checkpoint, so the session_id minted by the upload in step 1 is
+    # the same key ``read_turns`` reads under (an id-translation bug here would
+    # look identical to "no messages yet" if this only asserted the 200).
+    await _seed_thread_messages(
+        ctx.checkpointer,
+        session_id,
+        [HumanMessage(content="看下这张图"), AIMessage(content="收到")],
+    )
     msgs = await ctx.client.get(
         f"/v1/agents/support-bot/sessions/{session_id}/messages",
         params={"user_id": "cust-77"},
         headers=ctx.key_headers,
     )
     assert msgs.status_code == 200, msgs.text
+    assert msgs.json()["data"]["messages"] == [
+        {"role": "user", "content": "看下这张图", "channel": None},
+        {"role": "assistant", "content": "收到", "channel": "final"},
+    ], msgs.text
 
     # 6. Replaying the cancelled run's events works (reconnect path).
     events = await ctx.client.get(
