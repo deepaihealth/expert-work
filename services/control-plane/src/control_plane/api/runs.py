@@ -36,7 +36,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import require_key_scope
+from control_plane.api._authz import console_only, require_key_scope
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer
 from control_plane.api._session_title import title_from_text
@@ -928,7 +928,9 @@ def build_runs_router() -> APIRouter:
     router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
     @router.post(
-        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("write"))]
+        "/{thread_id}/runs",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def trigger_run(
         thread_id: UUID,
@@ -1094,7 +1096,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run(
         thread_id: UUID,
@@ -1215,7 +1217,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/trace",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run_trace(
         thread_id: UUID,
@@ -1267,7 +1269,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/trace/raw",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run_trace_raw(
         thread_id: UUID,
@@ -1324,7 +1326,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/messages",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_thread_messages(
         thread_id: UUID,
@@ -1408,7 +1410,9 @@ def build_runs_router() -> APIRouter:
         return JSONResponse({"success": True, "data": {"messages": out}})
 
     @router.get(
-        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("read"))]
+        "/{thread_id}/runs",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def list_thread_runs(
         thread_id: UUID,
@@ -1473,7 +1477,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/events",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def stream_run_events(
         thread_id: UUID,
@@ -1558,7 +1562,7 @@ def build_runs_router() -> APIRouter:
     @router.post(
         "/{thread_id}/runs/{run_id}/resume",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write"))],
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def resume_run(
         thread_id: UUID,
@@ -1729,7 +1733,11 @@ def build_runs_list_router() -> APIRouter:
     """
     router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
-    @router.get("", response_model=None, dependencies=[Depends(require_key_scope("read"))])
+    @router.get(
+        "",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
+    )
     async def list_runs(
         request: Request,
         runs: Annotated[RunStore, Depends(_get_run_store)],

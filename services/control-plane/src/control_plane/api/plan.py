@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from langchain_core.runnables import RunnableConfig
 
-from control_plane.api._authz import require_key_scope
+from control_plane.api._authz import console_only, require_key_scope
 from control_plane.api._user_scope import (
     caller_owns_thread,
     get_user_repo,
@@ -113,7 +113,9 @@ def build_plan_router() -> APIRouter:
         )
 
     @router.get(
-        "/{thread_id}/plan", response_model=None, dependencies=[Depends(require_key_scope("read"))]
+        "/{thread_id}/plan",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_plan(
         thread_id: UUID,
@@ -144,7 +146,9 @@ def build_plan_router() -> APIRouter:
         return JSONResponse(Plan.model_validate(plan).model_dump(mode="json"))
 
     @router.put(
-        "/{thread_id}/plan", response_model=None, dependencies=[Depends(require_key_scope("write"))]
+        "/{thread_id}/plan",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def put_plan(
         thread_id: UUID,

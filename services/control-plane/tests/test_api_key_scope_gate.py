@@ -1,22 +1,36 @@
-"""API-key scope enforcement on the session plane.
+"""API-key scope enforcement on the console plane — now defense in depth only.
 
 The ``/v1/sessions`` / ``/v1/approvals`` / ``/v1/runs`` / upload routers
 predate ``require(...)`` and enforced no scope for service-account (API-key)
 principals: any valid same-tenant key — including one minted with zero
 scopes — could read run output, start or resume runs (bypassing the
 ``require("session", "write")`` gate on ``POST /v1/agents/{agent_code}/runs``),
-decide approvals and purge sessions. These tests pin the gate:
+decide approvals and purge sessions. #1153 pinned a scope gate here.
 
-- zero-scope key → 403 on every endpoint of the plane
-- ``read`` key → read endpoints pass the gate, mutations 403
-- ``write`` key → mutations pass the gate, archive/purge (delete-class) 403
-- ``admin`` key → delete-class passes the gate
+P1 external-API lockdown (``console_only()``, ``api/_authz.py``) supersedes
+that: the console plane is now closed to every service-account (API-key)
+principal outright, regardless of scope — third parties use
+``/v1/agents/{agent_code}/...`` instead (see
+``tests/test_console_lockdown.py`` for the dedicated lockdown coverage,
+including a programmatic audit that every console route carries the gate).
+``require_key_scope`` stays wired underneath ``console_only()`` as defense
+in depth (belt-and-braces against a future regression that narrows or
+removes the lockdown), so this file still exercises it — but with the
+lockdown active, **any** key scope now 403s on **every** endpoint of this
+plane, including the ``read`` / ``write`` / ``admin`` scopes that used to
+pass their matching gate:
+
+- zero-scope key → 403 on every endpoint of the plane (unchanged)
+- ``read`` key → 403 everywhere (previously: passed read endpoints)
+- ``write`` key → 403 everywhere (previously: passed mutations)
+- ``admin`` key → 403 everywhere (previously: passed delete-class)
 - human JWTs never hit the key gate (their authz on these routers is
   unchanged — the gate keys off ``subject_type == "service_account"``)
 
-"Passes the gate" is asserted as ``status != 403``: the ids are random, so
-handlers typically 404 after the gate — which is exactly the point (the gate
-must fire *before* resource resolution so a 403 carries no existence info).
+"Passes the gate" (still used for the human-JWT test) is asserted as
+``status != 403``: the ids are random, so handlers typically 404 after the
+gate — which is exactly the point (the gate must fire *before* resource
+resolution so a 403 carries no existence info).
 """
 
 from __future__ import annotations
@@ -160,11 +174,12 @@ async def test_zero_scope_key_403_on_every_endpoint(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path", "kwargs"), READ_ENDPOINTS, ids=_ids(READ_ENDPOINTS))
-async def test_read_key_passes_read_gate(
+async def test_read_key_403_on_console_plane(
     client: AsyncClient, method: str, path: str, kwargs: dict[str, object]
 ) -> None:
+    """P1 lockdown: a ``read`` key used to pass this gate — now it 403s too."""
     response = await client.request(method, path, headers=_key_headers(("read",)), **kwargs)  # type: ignore[arg-type]
-    assert response.status_code != 403, response.text
+    assert response.status_code == 403, response.text
 
 
 @pytest.mark.asyncio
@@ -182,11 +197,12 @@ async def test_read_key_403_on_mutations(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path", "kwargs"), WRITE_ENDPOINTS, ids=_ids(WRITE_ENDPOINTS))
-async def test_write_key_passes_write_gate(
+async def test_write_key_403_on_console_plane(
     client: AsyncClient, method: str, path: str, kwargs: dict[str, object]
 ) -> None:
+    """P1 lockdown: a ``write`` key used to pass this gate — now it 403s too."""
     response = await client.request(method, path, headers=_key_headers(("write",)), **kwargs)  # type: ignore[arg-type]
-    assert response.status_code != 403, response.text
+    assert response.status_code == 403, response.text
 
 
 @pytest.mark.asyncio
@@ -200,11 +216,12 @@ async def test_write_key_403_on_delete_class(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path", "kwargs"), DELETE_ENDPOINTS, ids=_ids(DELETE_ENDPOINTS))
-async def test_admin_key_passes_delete_gate(
+async def test_admin_key_403_on_console_plane(
     client: AsyncClient, method: str, path: str, kwargs: dict[str, object]
 ) -> None:
+    """P1 lockdown: an ``admin`` key used to pass this gate — now it 403s too."""
     response = await client.request(method, path, headers=_key_headers(("admin",)), **kwargs)  # type: ignore[arg-type]
-    assert response.status_code != 403, response.text
+    assert response.status_code == 403, response.text
 
 
 @pytest.mark.asyncio

@@ -134,6 +134,53 @@ def require_key_scope(action: Action) -> Callable[..., Awaitable[None]]:
     return _dep
 
 
+def console_only() -> Callable[..., Awaitable[None]]:
+    """Route dependency — 403 a service-account (API-key) principal outright.
+
+    The console plane (``/v1/sessions`` / ``/v1/approvals`` / ``/v1/runs`` /
+    uploads / plan / feedback) is shaped for the admin UI: its ownership filter
+    resolves to "the calling user", which a machine principal does not have, so
+    an API key silently widens to the whole tenant. Third parties use the
+    external plane (``/v1/agents/{agent_code}/...``) instead, where every
+    endpoint takes an explicit ``user_id`` and verifies it. Employee JWTs and
+    mTLS service principals are unaffected.
+    """
+
+    async def _dep(
+        request: Request,
+        principal: Annotated[Principal, Depends(_principal)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> None:
+        if principal.subject_type != "service_account":
+            return
+        try:
+            await emit(
+                audit,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.AUTH_LOGIN_FAILED,
+                resource_type="user",
+                resource_id="console:api_key_denied",
+                result=AuditResult.DENIED,
+                reason="CONSOLE_PLANE_CLOSED_TO_API_KEYS",
+                trace_id=current_trace_id_hex(),
+                details={"subject_type": principal.subject_type},
+            )
+        except Exception:
+            logger.exception("authz.deny_audit_emit_failed")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": (
+                    "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+                ),
+            },
+        )
+
+    return _dep
+
+
 async def _conditioned_bindings(request: Request, principal: Principal) -> list[RoleBinding]:
     """The principal's conditioned tenant bindings (slow-path ABAC source).
 
