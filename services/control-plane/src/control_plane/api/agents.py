@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import ensure_resource_access, require
+from control_plane.api._authz import console_only, ensure_resource_access, require
 from control_plane.api._external import external_subject_id
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
@@ -468,6 +468,23 @@ def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+#: ``console_only()`` attached **per route**, not per prefix.
+#:
+#: ``/v1/agents`` is the one mount point the console plane and the external
+#: (third-party) plane share, so the prefix-driven lockdown that closed
+#: ``/v1/sessions``, ``/v1/users``, … to API keys structurally cannot be
+#: applied here: it would also 403 the eight ``/v1/agents/{agent_code}/…``
+#: routes that ARE the third-party surface. That is precisely why these
+#: routes were missed — a prefix sweep cannot see them (P1 final review,
+#: Critical C2). Routes carrying it below are console-only reads/writes of
+#: tenant-wide manifest + end-user data; each one measurably answered 200 to
+#: a **zero-scope** service-account key before this, since none of them has
+#: ``require(...)`` or an in-handler ``ensure_resource_access`` either.
+#: ``console_only`` only rejects ``subject_type == "service_account"`` —
+#: employee JWTs and mTLS service principals are untouched.
+_CONSOLE_ONLY = [Depends(console_only())]
+
+
 def build_agents_router() -> APIRouter:
     router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
@@ -907,7 +924,7 @@ def build_agents_router() -> APIRouter:
             on_behalf_of=str(end_user_id),
         )
 
-    @router.get("")
+    @router.get("", dependencies=_CONSOLE_ONLY)
     async def list_agents(
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
@@ -1085,7 +1102,7 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": AgentDetail(record=result.record).model_dump(mode="json")}
         )
 
-    @router.get("/{name}/{version}/revisions")
+    @router.get("/{name}/{version}/revisions", dependencies=_CONSOLE_ONLY)
     async def list_revisions(
         name: str,
         version: str,
@@ -1131,7 +1148,7 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": RevisionList(items=items).model_dump(mode="json")}
         )
 
-    @router.get("/{name}/{version}/revisions/{revision}")
+    @router.get("/{name}/{version}/revisions/{revision}", dependencies=_CONSOLE_ONLY)
     async def get_revision(
         name: str,
         version: str,
@@ -1161,7 +1178,7 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": RevisionDetail(record=snapshot).model_dump(mode="json")}
         )
 
-    @router.post("/{name}/{version}/revisions/{revision}/rollback")
+    @router.post("/{name}/{version}/revisions/{revision}/rollback", dependencies=_CONSOLE_ONLY)
     async def rollback_to_revision(
         name: str,
         version: str,

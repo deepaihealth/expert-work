@@ -171,7 +171,18 @@ def build_agent_users_router() -> APIRouter:
     """Mount ``GET /v1/agents/{name}/{version}/users``."""
     router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
-    @router.get("/{agent_name}/{agent_version}/users", response_model=None)
+    # ``console_only()`` per route, not per prefix: ``/v1/agents`` is shared
+    # with the third-party plane, so the prefix sweep that closed the rest of
+    # the console cannot reach here — which is why this one stayed open. It is
+    # the admin-UI "Agent → users" tab, the sibling of the ``/v1/users`` roster
+    # already locked in this same file, and it answered 200 to a **zero-scope**
+    # service-account key: every end-user id, display name, conversation / run /
+    # error counts, last-active time and token usage (P1 final review, C2).
+    @router.get(
+        "/{agent_name}/{agent_version}/users",
+        response_model=None,
+        dependencies=[Depends(console_only())],
+    )
     async def list_agent_users(
         agent_name: str,
         agent_version: str,
