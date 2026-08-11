@@ -1,13 +1,277 @@
-"""External file upload for third-party apps — ``/v1/agents/{agent_code}/uploads/...``.
+"""External file upload for third-party apps — ``/v1/agents/{agent_code}/uploads``.
 
-Filled in by the external-API P1 plan, Task 5.
+Multipart entry point for the external-API upload path (external-API P1 plan,
+Task 5): a third-party app posts a file on behalf of one of its own users
+(``user_id``), scoped to an agent + (optionally) a session it already holds.
+
+Images cannot exist outside a session — the object-store key and the
+``expert_work://image/...`` reference both embed the thread id (ADR-0004,
+see :mod:`expert_work.protocol.multimodal`) — so ``session_id`` is optional
+here: when omitted, the endpoint mints a new session (via
+``agents._resolve_session``, the same kill-switch + resolution the external
+run/session endpoints use) and hands it back in the response so the caller's
+next ``POST .../runs`` call can reuse it. Documents don't share that
+constraint but ride the same session-scoping for symmetry with the console
+upload endpoint (``POST /v1/sessions/{thread_id}/uploads``).
+
+This also fixes a bug in that console endpoint: its document branch 400s
+whenever ``caller_user_id is None`` (``api/uploads.py``'s
+``_handle_document_upload``) — but an API-key caller is a machine identity
+with no workspace of its own, so every document upload from a third-party
+app would 400. This endpoint lands documents in the *declared end user's*
+workspace (the ``tenant_user`` minted from ``user_id``), not the caller's.
+
+Type dispatch + landing logic is shared with the console endpoint via
+module-level functions in ``api/uploads.py`` (``_handle_document_upload`` /
+``_land_image_upload``) rather than duplicated here — see those functions'
+docstrings for why (two implementations of the same upload semantics is how
+this codebase has drifted before).
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+
+from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._authz import require
+from control_plane.api._external import (
+    ExternalScopeError,
+    external_error,
+    load_owned_session,
+)
+from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
+from control_plane.api._quota_admission import check_admission
+from control_plane.api._user_scope import get_user_repo
+from control_plane.api.agents import _resolve_session, _SessionError
+from control_plane.api.uploads import (
+    _EXT_BY_CONTENT_TYPE,
+    _handle_document_upload,
+    _land_image_upload,
+)
+from control_plane.quota.base import QuotaService
+from control_plane.settings import Settings
+from expert_work.persistence.agent_instance import AgentInstanceStore
+from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.image_upload import ImageUploadStore
+from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.protocol import Principal, QuotaDimension
+from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.storage import ObjectStore
+from orchestrator.tools import WorkspaceStore
+
+
+def _get_repo(request: Request) -> AgentSpecStore:
+    return request.app.state.agent_spec_repo  # type: ignore[no-any-return]
+
+
+def _get_thread_repo(request: Request) -> ThreadMetaStore:
+    return request.app.state.thread_meta_repo  # type: ignore[no-any-return]
+
+
+def _get_instance_store(request: Request) -> AgentInstanceStore:
+    return request.app.state.agent_instance_store  # type: ignore[no-any-return]
+
+
+def _get_disable_service(request: Request) -> AgentDisableService:
+    return request.app.state.agent_disable_service  # type: ignore[no-any-return]
+
+
+def _get_settings(request: Request) -> Settings:
+    return request.app.state.settings  # type: ignore[no-any-return]
+
+
+def _get_object_store(request: Request) -> ObjectStore | None:
+    return getattr(request.app.state, "object_store", None)
+
+
+def _get_quota(request: Request) -> QuotaService:
+    return request.app.state.quota_service  # type: ignore[no-any-return]
+
+
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _get_image_upload_store(request: Request) -> ImageUploadStore:
+    return request.app.state.image_upload_store  # type: ignore[no-any-return]
+
+
+def _get_workspace_store(request: Request) -> WorkspaceStore | None:
+    return getattr(request.app.state, "workspace_store", None)
 
 
 def build_external_uploads_router() -> APIRouter:
     """Mount the external upload endpoints."""
-    return APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(prefix="/v1/agents", tags=["external"])
+
+    @router.post("/{agent_code}/uploads", status_code=201, response_model=None)
+    async def upload_for_user(
+        agent_code: str,
+        request: Request,
+        file: Annotated[UploadFile, File()],
+        user_id: Annotated[str, Form(min_length=1, max_length=255)],
+        principal: Annotated[Principal, Depends(require("session", "write"))],
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        instances: Annotated[AgentInstanceStore, Depends(_get_instance_store)],
+        disable_service: Annotated[AgentDisableService, Depends(_get_disable_service)],
+        settings: Annotated[Settings, Depends(_get_settings)],
+        store: Annotated[ObjectStore | None, Depends(_get_object_store)],
+        quota: Annotated[QuotaService, Depends(_get_quota)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        session_id: Annotated[UUID | None, Form()] = None,
+    ) -> JSONResponse:
+        """Upload a file on behalf of an external-app end-user.
+
+        ``session_id`` omitted → mints a new session (same resolution +
+        kill-switch gate ``POST /{agent_code}/runs`` uses) and returns it so
+        the caller's next run reuses it. ``session_id`` supplied → the usual
+        external-plane ownership check (404 hides cross-user existence).
+        """
+        tenant_id: UUID = request.state.tenant_id
+        actor_id: str = request.state.actor_id
+
+        if session_id is None:
+            try:
+                _record, thread_id, end_user_id = await _resolve_session(
+                    tenant_id=tenant_id,
+                    agent_code=agent_code,
+                    actor_id=actor_id,
+                    user_id=user_id,
+                    session_id=None,
+                    repo=repo,
+                    threads=threads,
+                    users=users,
+                    instances=instances,
+                    disable_service=disable_service,
+                )
+            except _SessionError as exc:
+                return external_error(ExternalScopeError(exc.code, exc.message, exc.status_code))
+        else:
+            try:
+                meta = await load_owned_session(
+                    tenant_id=tenant_id,
+                    agent_code=agent_code,
+                    user_id=user_id,
+                    session_id=session_id,
+                    threads=threads,
+                    users=users,
+                )
+            except ExternalScopeError as exc:
+                return external_error(exc)
+            # ``load_owned_session`` already matched ``meta.user_id`` against
+            # the resolved end-user (else it would have raised above), so
+            # it's never None here — assert narrows the type for mypy.
+            assert meta.user_id is not None  # noqa: S101
+            thread_id = meta.thread_id
+            end_user_id = meta.user_id
+
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="uploaded file has no filename")
+        content_type = (file.content_type or "").lower()
+
+        # Document upload → lands in the declared end user's persistent
+        # workspace (not the API-key caller's — a machine principal has none).
+        if content_type in settings.document_allowed_content_types:
+            doc_result = await _handle_document_upload(
+                content_type=content_type,
+                filename=file.filename,
+                file=file,
+                request=request,
+                tenant_id=tenant_id,
+                caller_user_id=end_user_id,
+                thread_id=thread_id,
+                settings=settings,
+                workspace_store=workspace_store,
+                audit=audit,
+            )
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "success": True,
+                    "data": {
+                        "upload_id": doc_result.path,
+                        "session_id": str(thread_id),
+                        "type": "document",
+                        "mime": content_type,
+                        "size": doc_result.size_bytes,
+                    },
+                },
+            )
+
+        if store is None:
+            raise HTTPException(status_code=503, detail="object store unavailable")
+        if content_type not in settings.multimodal_allowed_content_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported content type: {content_type or 'missing'!r}",
+            )
+        ext = _EXT_BY_CONTENT_TYPE.get(content_type)
+        if ext is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"no extension known for content type {content_type!r}",
+            )
+
+        max_bytes = settings.multimodal_max_image_bytes
+        if file.size is not None and file.size > max_bytes:
+            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+        raw = await file.read()
+        if len(raw) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+        if not raw:
+            raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+        try:
+            raw = strip_exif(raw, mime_type=content_type)
+        except ImageSanitizeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        denial = await check_admission(
+            quota=quota,
+            audit=audit,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            agent=agent_code,
+            resource_kind="image_upload",
+            cost=1,
+            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: len(raw)},
+        )
+        if denial is not None:
+            return denial
+
+        image_ref = await _land_image_upload(
+            request=request,
+            store=store,
+            images=images,
+            audit=audit,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            user_id=end_user_id,
+            ext=ext,
+            raw=raw,
+            content_type=content_type,
+        )
+        return JSONResponse(
+            status_code=201,
+            content={
+                "success": True,
+                "data": {
+                    "upload_id": image_ref.to_uri(),
+                    "session_id": str(thread_id),
+                    "type": "image",
+                    "mime": content_type,
+                    "size": len(raw),
+                },
+            },
+        )
+
+    return router

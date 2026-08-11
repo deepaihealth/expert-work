@@ -20,6 +20,7 @@ import io
 import logging
 import re
 import zipfile
+from dataclasses import dataclass
 from typing import Annotated, Final
 from uuid import UUID, uuid4
 
@@ -116,6 +117,15 @@ def _reject_zip_bomb(raw: bytes, ext: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class DocumentUploadResult:
+    """Where a landed document ended up — the caller shapes its own response
+    envelope from this (the console and external upload endpoints differ)."""
+
+    path: str
+    size_bytes: int
+
+
 async def _handle_document_upload(
     *,
     content_type: str,
@@ -128,12 +138,16 @@ async def _handle_document_upload(
     settings: Settings,
     workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
-) -> JSONResponse:
-    """Land an uploaded document in the caller's persistent workspace.
+) -> DocumentUploadResult:
+    """Land an uploaded document in ``caller_user_id``'s persistent workspace.
 
     The parse itself runs later in the sandbox (``read_document``); the
     control-plane only validates + writes the bytes, keeping the malicious-
-    document attack surface out of this process."""
+    document attack surface out of this process. Shared by the console
+    (``POST /v1/sessions/{thread_id}/uploads``, landing target = the JWT
+    caller) and the external (``POST /v1/agents/{agent_code}/uploads``,
+    landing target = the declared end user — a machine principal has no
+    workspace of its own) endpoints."""
     ext = _DOC_EXT_BY_CONTENT_TYPE.get(content_type)
     if ext is None:
         # Config drift: the allowlist admitted a type the extension table
@@ -230,10 +244,7 @@ async def _handle_document_upload(
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return JSONResponse(
-        status_code=201,
-        content={"path": workspace_path, "kind": "document"},
-    )
+    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw))
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:
@@ -264,6 +275,90 @@ def _get_image_upload_store(request: Request) -> ImageUploadStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
+
+
+async def _land_image_upload(
+    *,
+    request: Request,
+    store: ObjectStore,
+    images: ImageUploadStore,
+    audit: AuditLogger,
+    tenant_id: UUID,
+    thread_id: UUID,
+    user_id: UUID | None,
+    ext: str,
+    raw: bytes,
+    content_type: str,
+) -> ImageRef:
+    """Persist an already-sanitised, already-admitted image: object store +
+    ``image_upload`` registry row + audit row. Shared by the console
+    (``POST /v1/sessions/{thread_id}/uploads``) and the external
+    (``POST /v1/agents/{agent_code}/uploads``) endpoints so Mini-ADR J-32
+    (registry) / J-31 (audit) can't drift between the two callers.
+
+    Callers are responsible for EXIF stripping, quota admission, and the
+    content-type → extension lookup before calling this."""
+    image_ref = ImageRef(
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        image_id=uuid4(),
+        ext=ext,
+    )
+    await store.put(image_ref.storage_key, raw, content_type=content_type)
+
+    # Mini-ADR J-32 (J.6.补强-3) — register the upload in the
+    # ``image_upload`` table so the lifecycle (soft-delete + retention
+    # sweep) can find it later. ``sha256`` doubles as a dedup key for
+    # ops investigations.
+    sha256_hex = hashlib.sha256(raw).hexdigest()
+    await images.insert(
+        image_id=image_ref.image_id,
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        object_key=image_ref.storage_key,
+        size_bytes=len(raw),
+        mime_type=content_type,
+        sha256=sha256_hex,
+    )
+
+    # Mini-ADR J-31 (J.6.补强-2) — uploads emit their own audit row.
+    # The audit middleware's SESSION_WRITE row covers run dispatch but
+    # not image-specific metadata (size / mime / object_key / sha256),
+    # which the SOC / compliance pipeline needs to trace every byte.
+    actor_id: str = getattr(request.state, "actor_id", "anonymous")
+    principal = getattr(request.state, "principal", None)
+    subject_type = (
+        principal.subject_type
+        if principal is not None and hasattr(principal, "subject_type")
+        else "user"
+    )
+    auth_method = (
+        principal.auth_method
+        if principal is not None and hasattr(principal, "auth_method")
+        else "jwt"
+    )
+    await audit_emit(
+        audit,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        action=AuditAction.IMAGE_UPLOAD,
+        resource_type="image_upload",
+        resource_id=str(image_ref.image_id),
+        result=AuditResult.SUCCESS,
+        trace_id=current_trace_id_hex(),
+        details={
+            "thread_id": str(thread_id),
+            "object_key": image_ref.storage_key,
+            "file_size_bytes": len(raw),
+            "mime_type": content_type,
+            "sha256": sha256_hex,
+            "subject_type": str(subject_type),
+            "auth_method": str(auth_method),
+            "ext": ext,
+        },
+    )
+    return image_ref
 
 
 def build_uploads_router() -> APIRouter:
@@ -319,7 +414,7 @@ def build_uploads_router() -> APIRouter:
         # run's ``read_document`` can parse it. Separate path from images: docs
         # ride the supervisor workspace-write, not the image object store.
         if content_type in settings.document_allowed_content_types:
-            return await _handle_document_upload(
+            result = await _handle_document_upload(
                 content_type=content_type,
                 filename=file.filename,
                 file=file,
@@ -330,6 +425,10 @@ def build_uploads_router() -> APIRouter:
                 settings=settings,
                 workspace_store=workspace_store,
                 audit=audit,
+            )
+            return JSONResponse(
+                status_code=201,
+                content={"path": result.path, "kind": "document"},
             )
 
         if store is None:
@@ -386,64 +485,17 @@ def build_uploads_router() -> APIRouter:
         if denial is not None:
             return denial
 
-        image_ref = ImageRef(
-            tenant_id=tenant_id,
-            thread_id=thread_id,
-            image_id=uuid4(),
-            ext=ext,
-        )
-        await store.put(image_ref.storage_key, raw, content_type=content_type)
-
-        # Mini-ADR J-32 (J.6.补强-3) — register the upload in the
-        # ``image_upload`` table so the lifecycle (soft-delete + retention
-        # sweep) can find it later. ``sha256`` doubles as a dedup key for
-        # ops investigations.
-        sha256_hex = hashlib.sha256(raw).hexdigest()
-        await images.insert(
-            image_id=image_ref.image_id,
+        image_ref = await _land_image_upload(
+            request=request,
+            store=store,
+            images=images,
+            audit=audit,
             tenant_id=tenant_id,
             thread_id=thread_id,
             user_id=caller_user_id,
-            object_key=image_ref.storage_key,
-            size_bytes=len(raw),
-            mime_type=content_type,
-            sha256=sha256_hex,
-        )
-
-        # Mini-ADR J-31 (J.6.补强-2) — uploads emit their own audit row.
-        # The audit middleware's SESSION_WRITE row covers run dispatch but
-        # not image-specific metadata (size / mime / object_key / sha256),
-        # which the SOC / compliance pipeline needs to trace every byte.
-        principal = getattr(request.state, "principal", None)
-        subject_type = (
-            principal.subject_type
-            if principal is not None and hasattr(principal, "subject_type")
-            else "user"
-        )
-        auth_method = (
-            principal.auth_method
-            if principal is not None and hasattr(principal, "auth_method")
-            else "jwt"
-        )
-        await audit_emit(
-            audit,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            action=AuditAction.IMAGE_UPLOAD,
-            resource_type="image_upload",
-            resource_id=str(image_ref.image_id),
-            result=AuditResult.SUCCESS,
-            trace_id=current_trace_id_hex(),
-            details={
-                "thread_id": str(thread_id),
-                "object_key": image_ref.storage_key,
-                "file_size_bytes": len(raw),
-                "mime_type": content_type,
-                "sha256": sha256_hex,
-                "subject_type": str(subject_type),
-                "auth_method": str(auth_method),
-                "ext": ext,
-            },
+            ext=ext,
+            raw=raw,
+            content_type=content_type,
         )
         return JSONResponse(status_code=201, content={"image_ref": image_ref.to_uri()})
 
