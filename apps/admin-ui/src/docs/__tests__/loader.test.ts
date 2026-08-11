@@ -65,4 +65,20 @@ describe("loadDocs — bundled content sanity", () => {
     const orders = docs.tenant.map((d) => d.order);
     expect(new Set(orders).size).toBe(orders.length);
   });
+
+  it("has at least 5 ops docs (Task 5 platform-ops handbook) with unique order values", () => {
+    const docs = loadDocs();
+    expect(docs.ops.length).toBeGreaterThanOrEqual(5);
+    const orders = docs.ops.map((d) => d.order);
+    expect(new Set(orders).size).toBe(orders.length);
+  });
+
+  it("includes the Task 5 ops docs by slug", () => {
+    const docs = loadDocs();
+    const slugs = docs.ops.map((d) => d.slug);
+    expect(slugs).toContain("user-ops");
+    expect(slugs).toContain("release");
+    expect(slugs).toContain("backup-restore");
+    expect(slugs).toContain("troubleshooting");
+  });
 });
