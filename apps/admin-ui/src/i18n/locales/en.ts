@@ -66,6 +66,7 @@ export interface TranslationKeys {
     agent_templates: string;
     platform_skills: string;
     usage: string;
+    tenant_quotas: string;
     chargeback: string;
     rate_card: string;
     observability: string;
@@ -349,6 +350,12 @@ export interface TranslationKeys {
     column_agent: string;
     column_user: string;
     column_status: string;
+    status_active: string;
+    status_paused: string;
+    status_completed: string;
+    status_failed: string;
+    status_cancelled: string;
+    status_archived: string;
     column_runs: string;
     column_tokens: string;
     column_last_active: string;
@@ -1174,7 +1181,6 @@ export interface TranslationKeys {
     file_delete_confirm: string;
     delete_ok: string;
     delete_cancel: string;
-    resume_label: string;
     resumed_notice: string;
     history_divider: string;
     history_loading: string;
@@ -2992,6 +2998,7 @@ const en: TranslationKeys = {
     agent_templates: "Agent Templates",
     platform_skills: "Platform Skills",
     usage: "Usage",
+    tenant_quotas: "Tenant Quotas",
     chargeback: "Chargeback",
     rate_card: "Model Pricing",
     observability: "Observability",
@@ -3302,6 +3309,12 @@ const en: TranslationKeys = {
     column_agent: "Agent",
     column_user: "User",
     column_status: "Status",
+    status_active: "Active",
+    status_paused: "Paused",
+    status_completed: "Completed",
+    status_failed: "Failed",
+    status_cancelled: "Cancelled",
+    status_archived: "Archived",
     column_runs: "Runs",
     column_tokens: "Tokens",
     column_last_active: "Last active",
@@ -4213,7 +4226,6 @@ const en: TranslationKeys = {
     file_delete_confirm: "Permanently delete this file? This cannot be undone.",
     delete_ok: "Delete",
     delete_cancel: "Cancel",
-    resume_label: "Resume…",
     resumed_notice:
       "Continuing an existing thread — prior conversation loaded below.",
     history_divider: "— new messages below —",
@@ -5825,7 +5837,7 @@ const en: TranslationKeys = {
     scope_help_read:
       "Read-only: query sessions, run results, the Agent list, and other GET endpoints",
     scope_help_write:
-      "Business write: invoke Agent runs, create/continue sessions, upload files (excludes read-only queries)",
+      "Business write: everything read allows, plus invoking Agent runs, creating/continuing sessions, uploading files",
     scope_help_admin:
       "Admin: manage service accounts and keys, change authorizations — do not share with third parties",
     expires_label: "Expires at",

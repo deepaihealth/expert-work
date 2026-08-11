@@ -143,7 +143,7 @@ describe("SettingsApiKeys", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Business write: invoke Agent runs, create/continue sessions, upload files (excludes read-only queries)",
+        "Business write: everything read allows, plus invoking Agent runs, creating/continuing sessions, uploading files",
       ),
     ).toBeInTheDocument();
     expect(
