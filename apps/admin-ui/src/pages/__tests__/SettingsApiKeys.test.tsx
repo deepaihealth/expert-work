@@ -9,7 +9,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
 
@@ -221,5 +221,31 @@ describe("SettingsApiKeys", () => {
     // rotate/revoke stay visible for grace rows — only view is gated.
     expect(screen.getByTestId("api-key-rotate-key-grace")).toBeInTheDocument();
     expect(screen.getByTestId("api-key-revoke-key-grace")).toBeInTheDocument();
+  });
+
+  it("status column filter narrows the list to the selected status", async () => {
+    const revokedKey = {
+      ...activeKey,
+      id: "key-2",
+      prefix: "ewk_zz99yy",
+      revoked_at: "2026-06-01T00:00:00Z",
+    };
+    installAdapter([saListHandler(), keyListHandler([activeKey, revokedKey])]);
+    renderPage();
+    await screen.findByText("ewk_ab12cd");
+
+    const trigger = document.querySelector(".ant-table-filter-trigger");
+    expect(trigger).not.toBeNull();
+    await userEvent.click(trigger as HTMLElement);
+    const dropdown = await waitFor(() => {
+      const el = document.querySelector(".ant-table-filter-dropdown");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    await userEvent.click(within(dropdown).getByText(/已撤销|revoked/i));
+    await userEvent.click(within(dropdown).getByText(/^OK$|^确\s?定$/));
+
+    await waitFor(() => expect(screen.queryByText("ewk_ab12cd")).toBeNull());
+    expect(screen.getByText("ewk_zz99yy")).toBeInTheDocument();
   });
 });
