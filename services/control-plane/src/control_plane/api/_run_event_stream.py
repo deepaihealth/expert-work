@@ -13,7 +13,7 @@ point.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from uuid import UUID
 
@@ -30,7 +30,7 @@ def build_event_producer(
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     since_seq: int | None,
-    scope: AbstractAsyncContextManager[None] | None = None,
+    scope: Callable[[], AbstractAsyncContextManager[None]] | None,
 ) -> AsyncIterator[bytes]:
     """Return the SSE byte producer for one run.
 
@@ -40,11 +40,16 @@ def build_event_producer(
       still catches the last 256 frames; older frames depend on the
       durable store).
 
-    ``scope`` is an already-entered-on-use tenant-scope context manager —
-    the console caller passes ``applied_scope(scope)`` (its DB read must
-    stay bound to the resolved target tenant, not the request middleware's
+    ``scope`` is a *factory* for a tenant-scope context manager, not an
+    already-constructed one — ``applied_scope(...)`` returns a
+    single-use ``_AsyncGeneratorContextManager`` (``__aenter__`` a second
+    time raises ``RuntimeError: generator didn't yield``), and P3's
+    paginated replay will need to enter scope once per page. The console
+    caller passes ``lambda: applied_scope(scope)`` (its DB read must stay
+    bound to the resolved target tenant, not the request middleware's
     home-tenant GUC); the external caller has no cross-tenant concept and
-    passes ``None``.
+    passes ``None`` explicitly — there is no default, so a caller cannot
+    silently forget this and fall back to an unscoped read.
     """
 
     async def _stream_replay() -> AsyncIterator[bytes]:
@@ -56,9 +61,10 @@ def build_event_producer(
             return
         # The generator body runs after the handler returned — re-apply
         # the resolved scope (when given) so this DB read stays bound to
-        # the target tenant.
+        # the target tenant. Call the factory fresh each time — the CM it
+        # returns is single-use.
         if scope is not None:
-            async with scope:
+            async with scope():
                 rows = await event_store.list(
                     run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT
                 )

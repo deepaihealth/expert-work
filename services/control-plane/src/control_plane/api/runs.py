@@ -1542,7 +1542,7 @@ def build_runs_router() -> APIRouter:
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             since_seq=since_seq,
-            scope=applied_scope(scope),
+            scope=lambda: applied_scope(scope),
         )
         return StreamingResponse(
             producer,

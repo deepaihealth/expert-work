@@ -8,6 +8,7 @@ missing, never a silent "list everything").
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -23,7 +24,12 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, Role
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
+from expert_work.runtime.runs import (
+    InMemoryRunEventStore,
+    InMemoryRunStore,
+    RunStatus,
+    make_event_record,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -74,12 +80,14 @@ class _Ctx:
         tenant_id: UUID,
         headers: dict[str, str],
         run_store: InMemoryRunStore,
+        run_event_store: InMemoryRunEventStore,
     ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
         self.run_store = run_store
+        self.run_event_store = run_event_store
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -107,7 +115,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, run_store)
+        yield _Ctx(client, app, tenant_id, headers, run_store, run_event_store)
 
 
 @pytest.mark.asyncio
@@ -119,6 +127,16 @@ async def test_events_replays_a_terminal_run(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     run_id = started.json()["run_id"]
+    # Seed durable frames BEFORE asserting anything — without real frames in
+    # the store, "event: end" alone is also what the event_store=None
+    # degenerate branch emits, so the test cannot tell "replayed real
+    # history" apart from "no store wired, bail to a bare end frame".
+    await ctx.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=1, event_name="metadata", data={"step": 1})
+    )
+    await ctx.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=2, event_name="updates", data={"step": 2})
+    )
     # Drive the run to a terminal state so the endpoint takes the replay path.
     await ctx.run_store.set_status(
         run_id=UUID(run_id),
@@ -135,7 +153,13 @@ async def test_events_replays_a_terminal_run(ctx: _Ctx) -> None:
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert resp.headers["X-Expert-Work-Stream-Mode"] == "replay"
+    assert "event: metadata" in resp.text
+    assert "event: updates" in resp.text
     assert "event: end" in resp.text
+    # SSE id is "{created_at_ms}-{seq}" — anchors the assertion to actual
+    # replayed rows (seq 1 and 2), not just "some end frame showed up".
+    assert re.search(r"id: \d+-1\n", resp.text)
+    assert re.search(r"id: \d+-2\n", resp.text)
 
 
 @pytest.mark.asyncio
@@ -147,6 +171,17 @@ async def test_events_404_for_another_user(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     run_id = started.json()["run_id"]
+    # Drive to terminal so a gate-bypass mutation resolves to a clean, fast
+    # "replay returns 200" (asserted against below) instead of falling into
+    # the live-attach path and hanging forever waiting for a bridge that will
+    # never emit anything for a run nothing is driving.
+    await ctx.run_store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
     resp = await ctx.client.get(
         f"/v1/agents/support-bot/runs/{run_id}/events",
         params={"user_id": "someone-else"},
