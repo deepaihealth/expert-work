@@ -58,4 +58,11 @@ describe("loadDocs — bundled content sanity", () => {
     expect(docs.tenant.map((d) => d.slug)).toContain("overview");
     expect(docs.ops.map((d) => d.slug)).toContain("tenant-lifecycle");
   });
+
+  it("has at least 6 tenant docs (Task 4 handbook) with unique order values", () => {
+    const docs = loadDocs();
+    expect(docs.tenant.length).toBeGreaterThanOrEqual(6);
+    const orders = docs.tenant.map((d) => d.order);
+    expect(new Set(orders).size).toBe(orders.length);
+  });
 });
