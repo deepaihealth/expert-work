@@ -73,7 +73,7 @@ const zhCN: TranslationKeys = {
     observability: "可观测性",
     keycloak: "Keycloak",
     quality: "质量",
-    handbook: "使用手册",
+    handbook: "文档",
   },
   quality_page: {
     page_title: "质量",
