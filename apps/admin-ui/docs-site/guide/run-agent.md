@@ -37,7 +37,7 @@ Content-Type: application/json
 }
 ```
 
-拿到 `run_id` / `thread_id` 后,轮询 `GET /v1/sessions/{thread_id}/runs/{run_id}` 看状态,或者用 `GET /v1/sessions/{thread_id}/runs/{run_id}/events` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。这两个只读接口,`read` scope 就够。
+拿到 `run_id` / `thread_id` 后,轮询 `GET /v1/sessions/{thread_id}/runs/{run_id}` 看状态,或者用 `GET /v1/sessions/{thread_id}/runs/{run_id}/events` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。这两个接口本身没有额外的 scope 门槛,使用调用方合法的 API key 即可(仍然要求这个会话是你自己铸造的那个 `user_id` 下的)。
 
 ## 续接会话
 
