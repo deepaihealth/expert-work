@@ -65,6 +65,7 @@ def status(url):
 print('healthz', status('http://localhost:8000/healthz/ready'))
 print('v1_auth', status('${PUBLIC_BASE}/v1/models'))
 print('public_home', status('${PUBLIC_BASE}/'))
+print('docs_site', status('${PUBLIC_BASE}/docs/'))
 print('keycloak', status('${PUBLIC_BASE}/kc/realms/expert-work/.well-known/openid-configuration'))
 print('langfuse_pub', status('${LANGFUSE_BASE}/api/public/health'))
 print('langfuse_int', status('http://langfuse-web:3000/api/public/health'))
@@ -85,6 +86,7 @@ check "control-plane /healthz/ready" "$(get healthz)" "200"
 # expected steady state for a bare /v1 endpoint.
 check "public /v1 auth gate" "$(get v1_auth)" "401"
 check "public admin-ui" "$(get public_home)" "200"
+check "public docs site" "$(get docs_site)" "200"
 check "keycloak oidc discovery" "$(get keycloak)" "200"
 check "langfuse public" "$(get langfuse_pub)" "200"
 check "langfuse in-cluster" "$(get langfuse_int)" "200"

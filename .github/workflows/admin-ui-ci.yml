@@ -61,6 +61,9 @@ jobs:
       - name: Build (vite)
         run: pnpm build
 
+      - name: Build docs-site
+        run: cd docs-site && pnpm install --frozen-lockfile && pnpm build
+
   storybook-build:
     name: admin-ui (storybook build)
     runs-on: ubuntu-latest
