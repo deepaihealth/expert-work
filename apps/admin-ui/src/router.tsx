@@ -49,6 +49,7 @@ import { UserProfile } from "./pages/UserProfile";
 import { SkillsList } from "./pages/SkillsList";
 import { TriggersList } from "./pages/TriggersList";
 import { WebhooksList } from "./pages/WebhooksList";
+import { Handbook } from "./pages/Handbook";
 import { ComingSoon } from "./pages/ComingSoon";
 
 /** Scope-aware landing for ``/`` — a system_admin at the platform level
@@ -96,6 +97,12 @@ export function AppRouter() {
       <Route path="/agent-template-marketplace" element={<AgentTemplateMarketplace />} />
       <Route path="/triggers" element={<TriggersList />} />
       <Route path="/webhooks" element={<WebhooksList />} />
+      {/* In-app handbook (spec 2026-08-11): usage docs for everyone, ops
+          docs for system_admin only (gated inside the page — see Handbook.tsx).
+          SPA route is ``/handbook``, distinct from the public ``/docs/``
+          static site served by nginx — the two must never collide. */}
+      <Route path="/handbook" element={<Handbook />} />
+      <Route path="/handbook/:slug" element={<Handbook />} />
       <Route path="/settings/api-keys" element={<SettingsApiKeys />} />
       <Route
         path="/settings/service-accounts"

@@ -71,6 +71,7 @@ export interface TranslationKeys {
     observability: string;
     keycloak: string;
     quality: string;
+    handbook: string;
   };
   quality_page: {
     page_title: string;
@@ -2850,6 +2851,13 @@ export interface TranslationKeys {
     other_pages_prefix: string;
     other_pages_suffix: string;
   };
+  handbook: {
+    group_tenant: string;
+    group_ops: string;
+    not_found_title: string;
+    not_found_body: string;
+    empty: string;
+  };
   cmdk: {
     placeholder: string;
     aria_label: string;
@@ -2989,6 +2997,7 @@ const en: TranslationKeys = {
     observability: "Observability",
     keycloak: "Keycloak",
     quality: "Quality",
+    handbook: "Handbook",
   },
   quality_page: {
     page_title: "Quality",
@@ -6054,6 +6063,13 @@ const en: TranslationKeys = {
     body: "Only the 4 core pages are available for now: Agents list / Agent detail (with Playground) / Run+Approval / Settings API Keys.",
     other_pages_prefix: "Other pages",
     other_pages_suffix: "will land in Stream H.",
+  },
+  handbook: {
+    group_tenant: "User guide",
+    group_ops: "Platform ops",
+    not_found_title: "Not found",
+    not_found_body: "This page doesn't exist, or you don't have access to it.",
+    empty: "No docs yet.",
   },
   cmdk: {
     placeholder: "Search or jump — type a command, Agent name, Run ID…",

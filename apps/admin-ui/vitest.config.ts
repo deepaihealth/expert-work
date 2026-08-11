@@ -11,6 +11,6 @@ export default defineConfig({
     // Vitest's default include picks up any *.test.* under the project
     // root — but Playwright owns ``e2e/``. Excluding it here keeps the
     // two runners cleanly separated.
-    exclude: ["e2e/**", "node_modules/**", "dist/**", "storybook-static/**"],
+    exclude: ["e2e/**", "node_modules/**", "dist/**", "storybook-static/**", "docs-site/**"],
   },
 });

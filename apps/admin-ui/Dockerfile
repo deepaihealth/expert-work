@@ -45,12 +45,16 @@ ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER} \
 
 RUN pnpm build
 
+# 公开 API 文档站(spec 2026-08-11):独立小站,产物挂到 nginx /docs/。
+RUN cd docs-site && pnpm install --frozen-lockfile && pnpm build
+
 # nginx-unprivileged ships pre-hardened for non-root K8s pods (listens on
 # 8080, master process already runs as an unprivileged uid) — avoids
 # hand-rolling the chown/USER dance stock nginx:alpine needs for that.
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 
 COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=build /app/docs-site/.vitepress/dist /usr/share/nginx/html/docs
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 8080

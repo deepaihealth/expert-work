@@ -73,6 +73,7 @@ const zhCN: TranslationKeys = {
     observability: "可观测性",
     keycloak: "Keycloak",
     quality: "质量",
+    handbook: "文档",
   },
   quality_page: {
     page_title: "质量",
@@ -3009,6 +3010,13 @@ const zhCN: TranslationKeys = {
     body: "目前仅提供 4 个核心页面:智能体列表 / 智能体详情(含调试台)/ 运行+审批 / 设置 API 密钥。",
     other_pages_prefix: "其他页面",
     other_pages_suffix: "将在 Stream H 全面落地。",
+  },
+  handbook: {
+    group_tenant: "使用手册",
+    group_ops: "平台运维",
+    not_found_title: "页面不存在",
+    not_found_body: "这个页面不存在，或者你没有权限访问。",
+    empty: "暂无文档。",
   },
   cmdk: {
     placeholder: "搜索或跳转 — 输入命令、智能体名、运行 ID…",

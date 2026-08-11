@@ -1,8 +1,10 @@
 import { useNavigate, useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { Menu } from "antd";
+import type { MenuProps } from "antd";
 import {
   Banknote,
+  BookMarked,
   Bot,
   ListChecks,
   CheckSquare,
@@ -37,6 +39,7 @@ import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import {
   ALL_NAV_ENTRIES,
+  GLOBAL_ITEMS,
   PLATFORM_ITEMS,
   TENANT_SETTINGS_ITEMS,
   WORKSPACE_ITEMS,
@@ -79,9 +82,12 @@ const ICONS: Record<string, React.ReactNode> = {
   "settings-observability": <LineChart size={16} strokeWidth={1.5} />,
   "settings-keycloak": <Fingerprint size={16} strokeWidth={1.5} />,
   "platform-members-all": <Users size={16} strokeWidth={1.5} />,
+  handbook: <BookMarked size={16} strokeWidth={1.5} />,
 };
 
-const GROUP_TITLE_KEY: Record<NavGroup, string> = {
+// The "global" group (handbook) has no category header — see the
+// ``menuItems`` builder below — so it's excluded from this map.
+const GROUP_TITLE_KEY: Record<Exclude<NavGroup, "global">, string> = {
   workspace: "nav.group_workspace",
   "tenant-settings": "nav.group_tenant_settings",
   platform: "nav.group_platform",
@@ -91,6 +97,7 @@ const GROUP_ITEMS: Record<NavGroup, readonly NavEntry[]> = {
   workspace: WORKSPACE_ITEMS,
   "tenant-settings": TENANT_SETTINGS_ITEMS,
   platform: PLATFORM_ITEMS,
+  global: GLOBAL_ITEMS,
 };
 
 export function Sidebar() {
@@ -122,21 +129,29 @@ export function Sidebar() {
       t(entry.labelKey)
     );
 
-  const menuItems = groups.flatMap((g, gi) => {
-    const groupItems = entriesFor(g).map((entry) => ({
-      key: entry.key,
-      label: labelFor(entry),
-      icon: ICONS[entry.key],
-    }));
-    const groupNode = {
-      key: `${g}-group`,
-      label: t(GROUP_TITLE_KEY[g]),
-      type: "group" as const,
-      children: groupItems,
-    };
-    // Divider between groups (but not before the first).
-    return gi === 0 ? [groupNode] : [{ type: "divider" as const }, groupNode];
-  });
+  const menuItems: MenuProps["items"] = groups.flatMap(
+    (g, gi): NonNullable<MenuProps["items"]> => {
+      const groupItems = entriesFor(g).map((entry) => ({
+        key: entry.key,
+        label: labelFor(entry),
+        icon: ICONS[entry.key],
+      }));
+      // "global" (handbook) is always visible and isn't a scope-specific
+      // section like Workspace/Tenant settings/Platform — render its
+      // entries flat, no category header.
+      if (g === "global") {
+        return gi === 0 ? groupItems : [{ type: "divider" as const }, ...groupItems];
+      }
+      const groupNode = {
+        key: `${g}-group`,
+        label: t(GROUP_TITLE_KEY[g]),
+        type: "group" as const,
+        children: groupItems,
+      };
+      // Divider between groups (but not before the first).
+      return gi === 0 ? [groupNode] : [{ type: "divider" as const }, groupNode];
+    },
+  );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
