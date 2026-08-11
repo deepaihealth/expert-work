@@ -277,6 +277,63 @@ def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
 
 
+async def _prepare_image_upload(
+    *,
+    file: UploadFile,
+    content_type: str,
+    settings: Settings,
+) -> tuple[bytes, str]:
+    """Validate + sanitise an image upload, returning ``(sanitised_bytes, ext)``.
+
+    Content-type whitelist, extension lookup, both size caps, the
+    empty-file check, and EXIF stripping (Mini-ADR J-34) — this exact gate
+    *sequence* is shared verbatim by the console
+    (``POST /v1/sessions/{thread_id}/uploads``) and external
+    (``POST /v1/agents/{agent_code}/uploads``) endpoints so a future new
+    image guard (magic-byte sniffing, a tighter size rule, a different EXIF
+    policy) can't be added to one and silently missed on the other — the
+    external endpoint is the larger attack surface of the two. Raises
+    ``HTTPException`` on any rejection.
+
+    Object-store availability and quota admission stay with the caller:
+    the former is a one-line dependency-injected ``None`` check, and the
+    latter needs a different ``agent`` audit label per caller."""
+    if content_type not in settings.multimodal_allowed_content_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported content type: {content_type or 'missing'!r}",
+        )
+    ext = _EXT_BY_CONTENT_TYPE.get(content_type)
+    if ext is None:
+        # Config drift: the allowlist admitted a type the canonical
+        # extension table doesn't know. Refuse rather than forge a key.
+        raise HTTPException(
+            status_code=400,
+            detail=f"no extension known for content type {content_type!r}",
+        )
+
+    max_bytes = settings.multimodal_max_image_bytes
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+    raw = await file.read()
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+    if not raw:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+    # Mini-ADR J-34 (J.6.补强-4) — strip EXIF / metadata before any
+    # downstream code touches the bytes. The sanitised payload is
+    # what lands in the object store + gets counted against quota
+    # + gets sha256'd for the audit row — every consumer sees the
+    # same metadata-free bytes.
+    try:
+        raw = strip_exif(raw, mime_type=content_type)
+    except ImageSanitizeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return raw, ext
+
+
 async def _land_image_upload(
     *,
     request: Request,
@@ -433,38 +490,9 @@ def build_uploads_router() -> APIRouter:
 
         if store is None:
             raise HTTPException(status_code=503, detail="object store unavailable")
-        if content_type not in settings.multimodal_allowed_content_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unsupported content type: {content_type or 'missing'!r}",
-            )
-        ext = _EXT_BY_CONTENT_TYPE.get(content_type)
-        if ext is None:
-            # Config drift: the allowlist admitted a type the canonical
-            # extension table doesn't know. Refuse rather than forge a key.
-            raise HTTPException(
-                status_code=400,
-                detail=f"no extension known for content type {content_type!r}",
-            )
-
-        max_bytes = settings.multimodal_max_image_bytes
-        if file.size is not None and file.size > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        raw = await file.read()
-        if len(raw) > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        if not raw:
-            raise HTTPException(status_code=400, detail="uploaded file is empty")
-
-        # Mini-ADR J-34 (J.6.补强-4) — strip EXIF / metadata before any
-        # downstream code touches the bytes. The sanitised payload is
-        # what lands in the object store + gets counted against quota
-        # + gets sha256'd for the audit row — every consumer sees the
-        # same metadata-free bytes.
-        try:
-            raw = strip_exif(raw, mime_type=content_type)
-        except ImageSanitizeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raw, ext = await _prepare_image_upload(
+            file=file, content_type=content_type, settings=settings
+        )
 
         # Mini-ADR J-30 (J.6.补强-1) — quota admission. The single
         # ``check`` call deducts ``cost=1`` from QPS +

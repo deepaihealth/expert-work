@@ -23,9 +23,19 @@ workspace (the ``tenant_user`` minted from ``user_id``), not the caller's.
 
 Type dispatch + landing logic is shared with the console endpoint via
 module-level functions in ``api/uploads.py`` (``_handle_document_upload`` /
-``_land_image_upload``) rather than duplicated here — see those functions'
-docstrings for why (two implementations of the same upload semantics is how
-this codebase has drifted before).
+``_prepare_image_upload`` / ``_land_image_upload``) rather than duplicated
+here — see those functions' docstrings for why (two implementations of the
+same upload semantics is how this codebase has drifted before).
+
+Every rejection this endpoint's own validation raises internally as a plain
+``HTTPException`` (missing filename, unsupported type, oversize, quota
+denial passthrough, etc. — including everything ``_handle_document_upload``
+/ ``_prepare_image_upload`` raise) is translated to the external plane's
+``{success, data, error}`` envelope by ``_upload_error_envelope`` before it
+reaches the wire — mirrors ``external_approvals.py``'s
+``_decision_error_envelope``, the sibling endpoint this task shipped
+alongside. A third-party SDK parsing ``error.code`` must never hit FastAPI's
+bare ``{"detail": ...}`` shape.
 """
 
 from __future__ import annotations
@@ -43,14 +53,13 @@ from control_plane.api._external import (
     external_error,
     load_owned_session,
 )
-from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
-    _EXT_BY_CONTENT_TYPE,
     _handle_document_upload,
     _land_image_upload,
+    _prepare_image_upload,
 )
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -63,6 +72,35 @@ from expert_work.protocol import Principal, QuotaDimension
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
+
+#: Fallback envelope ``code`` by HTTP status for an ``HTTPException`` raised
+#: during upload validation / landing (document or image path). Mirrors
+#: ``external_approvals.py``'s ``_DECISION_ERROR_CODES`` /
+#: ``_decision_error_envelope`` — every external endpoint owns translating
+#: its internal ``HTTPException``s into the ``{success, data, error}``
+#: contract rather than letting FastAPI's bare ``{"detail": ...}`` leak.
+_UPLOAD_ERROR_CODES: dict[int, str] = {
+    400: "INVALID_UPLOAD",
+    413: "UPLOAD_TOO_LARGE",
+    429: "QUOTA_EXCEEDED",
+    500: "UPLOAD_FAILED",
+    502: "UPLOAD_FAILED",
+    503: "UPLOAD_UNAVAILABLE",
+}
+
+
+def _upload_error_envelope(exc: HTTPException) -> JSONResponse:
+    """Render an ``HTTPException`` raised during upload validation / landing
+    as the standard external envelope."""
+    code = _UPLOAD_ERROR_CODES.get(exc.status_code, "UPLOAD_ERROR")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "data": None,
+            "error": {"code": code, "message": str(exc.detail)},
+        },
+    )
 
 
 def _get_repo(request: Request) -> AgentSpecStore:
@@ -174,104 +212,86 @@ def build_external_uploads_router() -> APIRouter:
             thread_id = meta.thread_id
             end_user_id = meta.user_id
 
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="uploaded file has no filename")
-        content_type = (file.content_type or "").lower()
+        try:
+            if not file.filename:
+                raise HTTPException(status_code=400, detail="uploaded file has no filename")
+            content_type = (file.content_type or "").lower()
 
-        # Document upload → lands in the declared end user's persistent
-        # workspace (not the API-key caller's — a machine principal has none).
-        if content_type in settings.document_allowed_content_types:
-            doc_result = await _handle_document_upload(
-                content_type=content_type,
-                filename=file.filename,
-                file=file,
-                request=request,
-                tenant_id=tenant_id,
-                caller_user_id=end_user_id,
-                thread_id=thread_id,
-                settings=settings,
-                workspace_store=workspace_store,
+            # Document upload → lands in the declared end user's persistent
+            # workspace (not the API-key caller's — a machine principal has
+            # none).
+            if content_type in settings.document_allowed_content_types:
+                doc_result = await _handle_document_upload(
+                    content_type=content_type,
+                    filename=file.filename,
+                    file=file,
+                    request=request,
+                    tenant_id=tenant_id,
+                    caller_user_id=end_user_id,
+                    thread_id=thread_id,
+                    settings=settings,
+                    workspace_store=workspace_store,
+                    audit=audit,
+                )
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "success": True,
+                        "data": {
+                            "upload_id": doc_result.path,
+                            "session_id": str(thread_id),
+                            "type": "document",
+                            "mime": content_type,
+                            "size": doc_result.size_bytes,
+                        },
+                    },
+                )
+
+            if store is None:
+                raise HTTPException(status_code=503, detail="object store unavailable")
+            raw, ext = await _prepare_image_upload(
+                file=file, content_type=content_type, settings=settings
+            )
+
+            denial = await check_admission(
+                quota=quota,
                 audit=audit,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                agent=agent_code,
+                resource_kind="image_upload",
+                cost=1,
+                cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: len(raw)},
+            )
+            if denial is not None:
+                return denial
+
+            image_ref = await _land_image_upload(
+                request=request,
+                store=store,
+                images=images,
+                audit=audit,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                user_id=end_user_id,
+                ext=ext,
+                raw=raw,
+                content_type=content_type,
             )
             return JSONResponse(
                 status_code=201,
                 content={
                     "success": True,
                     "data": {
-                        "upload_id": doc_result.path,
+                        "upload_id": image_ref.to_uri(),
                         "session_id": str(thread_id),
-                        "type": "document",
+                        "type": "image",
                         "mime": content_type,
-                        "size": doc_result.size_bytes,
+                        "size": len(raw),
                     },
                 },
             )
-
-        if store is None:
-            raise HTTPException(status_code=503, detail="object store unavailable")
-        if content_type not in settings.multimodal_allowed_content_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unsupported content type: {content_type or 'missing'!r}",
-            )
-        ext = _EXT_BY_CONTENT_TYPE.get(content_type)
-        if ext is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"no extension known for content type {content_type!r}",
-            )
-
-        max_bytes = settings.multimodal_max_image_bytes
-        if file.size is not None and file.size > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        raw = await file.read()
-        if len(raw) > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        if not raw:
-            raise HTTPException(status_code=400, detail="uploaded file is empty")
-
-        try:
-            raw = strip_exif(raw, mime_type=content_type)
-        except ImageSanitizeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        denial = await check_admission(
-            quota=quota,
-            audit=audit,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            agent=agent_code,
-            resource_kind="image_upload",
-            cost=1,
-            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: len(raw)},
-        )
-        if denial is not None:
-            return denial
-
-        image_ref = await _land_image_upload(
-            request=request,
-            store=store,
-            images=images,
-            audit=audit,
-            tenant_id=tenant_id,
-            thread_id=thread_id,
-            user_id=end_user_id,
-            ext=ext,
-            raw=raw,
-            content_type=content_type,
-        )
-        return JSONResponse(
-            status_code=201,
-            content={
-                "success": True,
-                "data": {
-                    "upload_id": image_ref.to_uri(),
-                    "session_id": str(thread_id),
-                    "type": "image",
-                    "mime": content_type,
-                    "size": len(raw),
-                },
-            },
-        )
+        except HTTPException as exc:
+            return _upload_error_envelope(exc)
 
     return router
