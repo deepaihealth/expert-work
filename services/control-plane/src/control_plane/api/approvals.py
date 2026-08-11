@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.api._authz import require_key_scope
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import (
     _get_agent_repo,
@@ -99,7 +100,7 @@ def _record_to_dict(record: ApprovalRecord) -> dict[str, Any]:
 def build_approvals_router() -> APIRouter:
     router = APIRouter(prefix="/v1/approvals", tags=["approvals"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(require_key_scope("read"))])
     async def list_approvals(
         request: Request,
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
@@ -140,7 +141,7 @@ def build_approvals_router() -> APIRouter:
             }
         )
 
-    @router.post(":decide", response_model=None)
+    @router.post(":decide", response_model=None, dependencies=[Depends(require_key_scope("write"))])
     async def decide_batch(
         payload: DecideBatchRequest,
         request: Request,

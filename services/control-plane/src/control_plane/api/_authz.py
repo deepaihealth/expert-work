@@ -76,6 +76,64 @@ def require(resource: Resource, action: Action) -> Callable[..., Awaitable[Princ
     return _dep
 
 
+def require_key_scope(action: Action) -> Callable[..., Awaitable[None]]:
+    """Route dependency — 403 a service-account (API-key) principal whose
+    scopes don't cover ``("session", action)``.
+
+    The session plane (``/v1/sessions`` / ``/v1/approvals`` / ``/v1/runs`` /
+    uploads) predates ``require(...)`` and carried no scope enforcement at
+    all: any valid same-tenant key — including one minted with zero scopes —
+    could read run output, start or resume runs (bypassing the
+    ``require("session", "write")`` gate on
+    ``POST /v1/agents/{agent_code}/runs``), decide approvals and purge
+    sessions. Human JWTs and mTLS service principals are deliberately NOT
+    gated here — their behavior on these routers is unchanged. Scope
+    semantics follow the key fallback in :func:`is_allowed`
+    (``admin`` → ADMIN, ``write`` → OPERATOR, ``read`` → VIEWER), so
+    ``write`` keys keep the documented "write includes read" behavior.
+    """
+
+    async def _dep(
+        request: Request,
+        principal: Annotated[Principal, Depends(_principal)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> None:
+        if principal.subject_type != "service_account":
+            return
+        if is_allowed(principal, resource="session", action=action):
+            return
+        try:
+            await emit(
+                audit,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.AUTH_LOGIN_FAILED,
+                resource_type="user",
+                resource_id=f"session:{action}",
+                result=AuditResult.DENIED,
+                reason="API_KEY_SCOPE_FORBIDDEN",
+                trace_id=current_trace_id_hex(),
+                details={
+                    "resource": "session",
+                    "action": action,
+                    "scopes": list(principal.scopes),
+                    "subject_type": principal.subject_type,
+                },
+            )
+        except Exception:
+            # Never block the 403 on audit failure; record it and proceed.
+            logger.exception("authz.deny_audit_emit_failed")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "API key scopes do not cover this operation",
+            },
+        )
+
+    return _dep
+
+
 async def _conditioned_bindings(request: Request, principal: Principal) -> list[RoleBinding]:
     """The principal's conditioned tenant bindings (slow-path ABAC source).
 
