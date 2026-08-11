@@ -18,7 +18,6 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ThreadMeta
 from expert_work.runtime.runs import RunInfo, RunStore
-from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 
 #: Namespace prefix for end-user identities minted from a third-party app's own
 #: ``user_id`` string. An employee's ``subject_id`` is a bare Keycloak ``sub``
@@ -122,22 +121,27 @@ async def lookup_external_user_id(
     client error, not "unknown user", so it still raises
     :class:`ExternalScopeError` rather than returning ``None``.
 
-    ``TenantUserStore`` has no indexed point lookup by ``subject_id``; this
-    reuses the same tenant-scoped, capped ``list_by_tenant`` scan the
-    user-dimension ops page already relies on (``agent_users.py``). A tenant
-    with more than ``MAX_LIST_LIMIT`` active users could in theory have a
-    match past the cap go unseen — the same bound that page already accepts;
-    a real point-lookup index is persistence-layer scope, outside this
-    task's file allowlist.
+    Uses ``TenantUserStore.get_by_subject`` — an indexed point lookup on
+    ``tenant_user_identity_uniq``, O(1) regardless of tenant size. This used
+    to scan ``list_by_tenant(limit=MAX_LIST_LIMIT)`` instead: a tenant with
+    more than 500 active users (the third-party mint-one-row-per-end-user
+    model makes this the norm, not an edge case) would have a session lookup
+    for any user past the first 500 most-recently-active silently return
+    "no sessions" — a correctness ceiling, not a documented limit.
+
+    ``get_by_subject`` itself does not filter ``deleted_at`` (it mirrors
+    ``get``'s semantics — see ``base.py``), so a soft-deactivated (purged)
+    identity is filtered out here instead, to match ``list_by_tenant``'s
+    prior behavior: a purged user's sessions must stay unreachable through
+    this read plane until they act again and ``resolve`` reactivates them.
     """
     subject_id = _external_subject_id_or_422(user_id)
-    rows = await users.list_by_tenant(
-        tenant_id, subject_type="user", limit=MAX_LIST_LIMIT, offset=0
+    row = await users.get_by_subject(
+        tenant_id=tenant_id, subject_type="user", subject_id=subject_id
     )
-    for row in rows:
-        if row.subject_id == subject_id:
-            return row.id
-    return None
+    if row is None or row.deleted_at is not None:
+        return None
+    return row.id
 
 
 async def load_owned_session(

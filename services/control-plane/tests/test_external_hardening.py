@@ -22,7 +22,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -220,3 +222,68 @@ async def test_missing_user_id_422_uses_the_external_envelope(ctx: _Ctx) -> None
     assert body["data"] is None
     assert body["error"]["code"] == "INVALID_REQUEST"
     assert body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# External-API-v1 P1 followup — lookup_external_user_id's 500-row scan ceiling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_lookup_survives_more_than_500_active_tenant_users(ctx: _Ctx) -> None:
+    """The core correctness-ceiling assertion this task removes.
+
+    Before the fix, ``lookup_external_user_id`` resolved ``user_id`` by
+    scanning ``list_by_tenant(subject_type="user", limit=MAX_LIST_LIMIT)``
+    — the top 500 rows ordered most-recently-active-first. A tenant with
+    more than 500 active end users (the third-party mint-one-row-per-
+    end-user model makes this the norm, not an edge case) would silently
+    lose the ability to look up any user whose row fell outside that
+    window: someone who registered a while ago and simply hasn't sent a
+    new message recently, while 500+ *other* users in the tenant have —
+    their own ``GET .../sessions`` call would come back empty, as if they
+    had never used the agent.
+
+    Reproduces exactly that: the target user's session is created first,
+    then 510 other users are minted with strictly later ``last_active_at``
+    timestamps (deterministically, via a patched clock — a bare loop of
+    real ``datetime.now(UTC)`` calls ties far too often on this hardware to
+    reliably rank the target last, and a stable ``sort(reverse=True)``
+    breaks such ties in favor of whichever row was inserted first, i.e. the
+    target — so an un-patched loop would not reliably reproduce the bug).
+    This guarantees the target's row ranks 511th — well outside any
+    500-row window — while ``get_by_subject`` (the fix) is a point lookup
+    that is immune to rank entirely.
+    """
+    await ctx.seed_agent()
+
+    target_user_id = "quiet-customer"
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": target_user_id, "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+    session_id = created.json()["thread_id"]
+
+    users = ctx.app.state.tenant_user_repo
+    # Every filler gets a last_active_at strictly after "now" at increasing
+    # 1ms steps — guaranteed later than the target's (real-clock) timestamp
+    # from the POST above, with no reliance on real-time tie-breaking.
+    base = datetime.now(UTC) + timedelta(seconds=1)
+    with patch("expert_work.persistence.tenant_user.memory.datetime") as mock_dt:
+        for i in range(510):
+            mock_dt.now.return_value = base + timedelta(milliseconds=i)
+            await users.resolve(
+                tenant_id=ctx.tenant_id, subject_type="user", subject_id=f"filler-{i}"
+            )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": target_user_id},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    sessions = resp.json()["data"]["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == session_id

@@ -49,6 +49,27 @@ class TenantUserStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def get_by_subject(
+        self, *, tenant_id: UUID, subject_type: SubjectType, subject_id: str
+    ) -> TenantUser | None:
+        """Point-lookup by identity, or ``None`` when absent — never creates.
+
+        The read-only counterpart of :meth:`resolve` (which is a mint-on-use
+        upsert). Hits the ``tenant_user_identity_uniq`` index directly, so it
+        stays O(1) regardless of how many users the tenant has — the external
+        read plane needs this because a third-party app mints one row per end
+        user and can easily exceed any list page.
+
+        ``deleted_at`` semantics: same as :meth:`get`, NOT :meth:`list_by_tenant`
+        — a soft-deactivated (purged) row is still returned, not hidden. This
+        keeps the two surrogate-vs-natural-key lookups consistent with each
+        other (both are "read this exact row" primitives; only the *listing*
+        method curates a roster). Callers that need "purged users are
+        invisible" behavior (matching :meth:`list_by_tenant`) must check
+        ``deleted_at`` themselves — this method does not decide that for them.
+        """
+
+    @abc.abstractmethod
     async def get_many(
         self, user_ids: Collection[UUID], *, tenant_id: UUID
     ) -> dict[UUID, TenantUser]:

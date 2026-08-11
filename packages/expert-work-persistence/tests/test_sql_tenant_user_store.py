@@ -112,6 +112,92 @@ async def test_get_filters_by_tenant(sql_store: SqlStoreFixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_by_subject_hits_then_misses(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant_id = uuid4()
+        created = await store.resolve(tenant_id=tenant_id, subject_type="user", subject_id="u-1")
+
+        found = await store.get_by_subject(
+            tenant_id=tenant_id, subject_type="user", subject_id="u-1"
+        )
+        assert found is not None
+        assert found.id == created.id
+
+        assert (
+            await store.get_by_subject(
+                tenant_id=tenant_id, subject_type="user", subject_id="never-seen"
+            )
+            is None
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_by_subject_is_not_visible_cross_tenant(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        owner, other = uuid4(), uuid4()
+        await store.resolve(tenant_id=owner, subject_type="user", subject_id="shared-id")
+
+        # Same subject_id, different tenant → must not be found.
+        assert (
+            await store.get_by_subject(tenant_id=other, subject_type="user", subject_id="shared-id")
+            is None
+        )
+        found = await store.get_by_subject(
+            tenant_id=owner, subject_type="user", subject_id="shared-id"
+        )
+        assert found is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_by_subject_distinguishes_subject_type(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant_id = uuid4()
+        svc = await store.resolve(
+            tenant_id=tenant_id, subject_type="service_account", subject_id="x"
+        )
+
+        assert (
+            await store.get_by_subject(tenant_id=tenant_id, subject_type="user", subject_id="x")
+            is None
+        )
+        found = await store.get_by_subject(
+            tenant_id=tenant_id, subject_type="service_account", subject_id="x"
+        )
+        assert found is not None
+        assert found.id == svc.id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_by_subject_returns_deactivated_row_like_get(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """``get_by_subject`` mirrors ``get``'s ``deleted_at`` semantics — a
+    purged row is still returned (not silently dropped like
+    ``list_by_tenant``); the caller decides what to do with it."""
+    store, engine = sql_store
+    try:
+        tenant_id = uuid4()
+        user = await store.resolve(tenant_id=tenant_id, subject_type="user", subject_id="x")
+        assert await store.deactivate(user.id, tenant_id=tenant_id, now=datetime.now(UTC)) is True
+
+        found = await store.get_by_subject(tenant_id=tenant_id, subject_type="user", subject_id="x")
+        assert found is not None
+        assert found.id == user.id
+        assert found.deleted_at is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_resolve_distinguishes_identity_axes(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

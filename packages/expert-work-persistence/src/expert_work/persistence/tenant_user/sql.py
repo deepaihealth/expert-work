@@ -86,6 +86,20 @@ class SqlTenantUserStore(TenantUserStore):
                 return None
             return _row_to_user(row)
 
+    async def get_by_subject(
+        self, *, tenant_id: UUID, subject_type: SubjectType, subject_id: str
+    ) -> TenantUser | None:
+        # Hits ``tenant_user_identity_uniq`` directly — no ``deleted_at``
+        # predicate (see base.py docstring: same semantics as ``get``).
+        stmt = select(TenantUserRow).where(
+            TenantUserRow.tenant_id == tenant_id,
+            TenantUserRow.subject_type == subject_type,
+            TenantUserRow.subject_id == subject_id,
+        )
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).scalar_one_or_none()
+        return None if row is None else _row_to_user(row)
+
     async def get_many(
         self, user_ids: Collection[UUID], *, tenant_id: UUID
     ) -> dict[UUID, TenantUser]:
