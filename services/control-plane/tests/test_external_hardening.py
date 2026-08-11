@@ -287,3 +287,47 @@ async def test_session_lookup_survives_more_than_500_active_tenant_users(ctx: _C
     sessions = resp.json()["data"]["sessions"]
     assert len(sessions) == 1
     assert sessions[0]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_deactivated_user_sessions_stay_unreachable(ctx: _Ctx) -> None:
+    """``lookup_external_user_id``'s ``row.deleted_at is not None`` gate
+    (``_external.py``) is the only thing preserving this invariant now that
+    the lookup goes through ``get_by_subject`` — which, unlike the old
+    ``list_by_tenant`` scan, does NOT filter ``deleted_at`` itself (it
+    mirrors ``get``'s semantics; see ``base.py``). Without that gate, a
+    soft-deactivated (purged) end user's sessions would resurface through
+    this read endpoint — reopening a retention/privacy hole the prior
+    ``list_by_tenant``-based scan closed for free (both store implementations
+    already filter ``deleted_at IS NULL`` there).
+
+    Creates a session, deactivates its owning user directly via the store's
+    ``deactivate`` (Phase 3a purge_user), then asserts the session is no
+    longer visible through the read endpoint — matching the pre-fix
+    behavior exactly, not a new restriction.
+    """
+    await ctx.seed_agent()
+
+    target_user_id = "soon-to-be-purged"
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": target_user_id, "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+
+    users = ctx.app.state.tenant_user_repo
+    subject_id = external_subject_id(target_user_id)
+    row = await users.get_by_subject(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id=subject_id
+    )
+    assert row is not None
+    assert await users.deactivate(row.id, tenant_id=ctx.tenant_id, now=datetime.now(UTC)) is True
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": target_user_id},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["sessions"] == []
