@@ -14,7 +14,7 @@
 }
 ```
 
-但一部分错误(scope 不足的 403、413 超限、429 里的"工作区满了")直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+但一部分错误(scope 不足的 403、429 里的"工作区满了")直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
 
 ## 401 —— key 无效 / 过期
 
@@ -59,10 +59,10 @@
 
 ## 413 —— 文档 / 图片超限
 
-只发生在上传接口(`POST /v1/sessions/{thread_id}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。走 FastAPI 默认 `detail` 字符串形状:
+只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。这个接口把自己抛出的每一种拒绝都翻成统一信封:
 
 ```json
-{ "detail": "document exceeds 26214400-byte limit" }
+{ "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }
 ```
 
 默认上限:文档 25 MiB,图片 10 MiB(以你的部署实际配置为准)。应对:压缩/裁剪后重传,或者把大文档拆成多份。

@@ -37,7 +37,9 @@ Content-Type: application/json
 }
 ```
 
-拿到 `run_id` / `thread_id` 后,轮询 `GET /v1/sessions/{thread_id}/runs/{run_id}` 看状态,或者用 `GET /v1/sessions/{thread_id}/runs/{run_id}/events` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。这两个接口本身没有额外的 scope 门槛,使用调用方合法的 API key 即可(仍然要求这个会话是你自己铸造的那个 `user_id` 下的)。
+拿到 `run_id` / `thread_id` 后,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。`user_id` 是必填查询参数,且必须是发起这次 run 的那个——对不上一律 404(`RUN_NOT_FOUND`),不会告诉你这个 run 到底存不存在。这条接口要 `read` scope,`write` key 含读所以也能直接调。
+
+想粗粒度知道"这段会话里还有没有 run 在跑",调 `GET /v1/agents/{agent_code}/sessions?user_id=<同一个 user_id>`,返回的每一项都带一个 `running` 布尔字段。
 
 ## 续接会话
 

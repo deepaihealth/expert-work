@@ -5,7 +5,7 @@
 ## 流从哪来
 
 - `mode: "stream"` 的 `POST /v1/agents/{agent_code}/runs` 响应体本身就是这条 SSE 流。
-- `mode: "queue"` 不返回流(直接 `202`);想看这次 run 的事件,用 `GET /v1/sessions/{thread_id}/runs/{run_id}/events`——run 还在跑就实时接进去,run 已经跑完就把持久化的帧按顺序回放一遍再收尾。
+- `mode: "queue"` 不返回流(直接 `202`);想看这次 run 的事件,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>`——run 还在跑就实时接进去,run 已经跑完就把持久化的帧按顺序回放一遍再收尾。
 
 每一帧都是标准 SSE 格式:
 
@@ -65,6 +65,6 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 ## 断线重连
 
 1. 从响应头(`X-Expert-Work-Session-Id` / `X-Expert-Work-Run-Id`)或第一条 `metadata` 帧里拿到 `thread_id` + `run_id`,尽早存好。
-2. 连接断开后,调 `GET /v1/sessions/{thread_id}/runs/{run_id}/events` 重新接上,不要重新调 `/runs`(那会开启新的一轮 run)。
+2. 连接断开后,调 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 重新接上,不要重新调 `/runs`(那会开启新的一轮 run)。`user_id` 必填,而且必须是发起这次 run 的那个,否则 404。
 3. 这条接口有两种情况:run 还在跑,直接实时续接最新事件;run 已经结束,把落库的帧按顺序回放一遍,结尾补一条 `end`——这种情况下可以加查询参数 `since_seq` 只回放某个位置之后的帧(SSE 帧的 `id` 是 `"{created_at_ms}-{seq}"` 形式,取你已经处理到的那个 `seq`)。
 4. 不管哪种情况,回放都拿不到 `token` 预览帧——这是预期行为,不是丢帧;重连后的界面状态应该以最近一条 `updates` / `metadata` 为准,而不是试图拼回断连前的逐 token 预览。
