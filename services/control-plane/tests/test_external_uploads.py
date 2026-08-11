@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api._external import external_subject_id
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -30,6 +31,7 @@ from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, CheckResult, QuotaDimension
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.tools import RecordingWorkspaceStore
 from tests.agent_fixtures import stub_agent_runtime
@@ -123,6 +125,15 @@ class _Ctx:
         await self.app.state.agent_spec_repo.create(
             tenant_id=self.tenant_id, spec=_spec(), spec_sha256="a" * 64, created_by="seed"
         )
+
+    async def has_subject(self, subject_id: str) -> bool:
+        """Whether a ``tenant_user`` row with this ``subject_id`` exists — the
+        ground truth for "did this request mint a ghost user" (same helper
+        ``test_external_hardening.py`` uses)."""
+        rows = await self.app.state.tenant_user_repo.list_by_tenant(
+            self.tenant_id, subject_type="user", limit=MAX_LIST_LIMIT
+        )
+        return any(row.subject_id == subject_id for row in rows)
 
 
 @pytest.fixture
@@ -410,3 +421,49 @@ async def test_upload_201_carries_the_full_envelope(
     assert body["success"] is True
     assert body["error"] is None
     assert body["data"]["type"] == expected_type
+
+
+@pytest.mark.asyncio
+async def test_upload_with_a_foreign_session_never_mints_a_ghost_user(ctx: _Ctx) -> None:
+    """The other half of Critical C1, on the upload path.
+
+    C1 closed ``load_owned_run`` (cancel / events / decide). This is the same
+    defect in the same shape: the ``session_id``-supplied branch resolves the
+    end user with the mint-on-use default, so pointing an **existing** session
+    id at a never-seen ``user_id`` 404s — correctly — while still writing one
+    ``tenant_user`` row per attempt, which then shows up on the user-dimension
+    ops page.
+
+    It is structural, not a preference: this branch only ever runs against a
+    session that already exists, and an existing session's owner already has a
+    ``tenant_user`` row. So there is nothing here to mint — the only row minting
+    can create is one for a ``user_id`` that by definition is NOT the owner,
+    i.e. exactly the case that must 404. Mint belongs to the branch that omits
+    ``session_id`` (``_resolve_session`` genuinely creates the session).
+    """
+    await ctx.seed_agent()
+    owner = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert owner.status_code == 201, owner.text
+    session_id = owner.json()["data"]["session_id"]
+
+    subject_id = external_subject_id("never-seen-before")
+    assert not await ctx.has_subject(subject_id)
+
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "never-seen-before", "session_id": session_id},
+        files={"file": ("b.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "SESSION_NOT_FOUND"
+
+    assert not await ctx.has_subject(subject_id), (
+        "POST .../uploads minted a tenant_user row for a user_id that does not "
+        "own the supplied session"
+    )

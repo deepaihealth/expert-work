@@ -160,17 +160,22 @@ async def load_owned_session(
     semantics applies, and both are load-bearing — do not collapse this to
     one behavior:
 
-    - ``mint=True`` — the default, used by the endpoints that address a
-      session the caller may not hold yet (session bind, run submit, and the
-      upload path that omits ``session_id``). A third party never
-      pre-registers its end-users, so the *first* call under a fresh
-      ``user_id`` must mint the ``tenant_user`` row (mint-on-use is
-      intentional product behavior here).
-    - ``mint=False`` — used by the read-only message-history endpoint and by
-      :func:`load_owned_run` (cancel / events / approval-decide). A GET must
-      never write; and for an already-existing run or session there is
-      nothing to mint — an unrecognized ``user_id`` there means "not yours",
-      not "create a user and then report 404 anyway".
+    The dividing line is **not** read-vs-write, it is *does this call create
+    the session it addresses*:
+
+    - ``mint=True`` — for the callers that bring a session into existence
+      (session bind, run submit, and the upload path that *omits*
+      ``session_id``). A third party never pre-registers its end-users, so the
+      first call under a fresh ``user_id`` must mint the ``tenant_user`` row;
+      mint-on-use is intentional product behavior there.
+    - ``mint=False`` — for every caller handed an **already-existing** session
+      or run id: message history, :func:`load_owned_run` (cancel / events /
+      approval-decide), and the upload path that *supplies* ``session_id``.
+      Such a resource's owner necessarily already has a ``tenant_user`` row,
+      so there is nothing to mint; the only row minting could add is one for a
+      ``user_id`` that is not the owner — exactly the case that must 404. Doing
+      it anyway is how enumerating ``user_id``s against a known id left one
+      ghost row per attempt (P1 final review, C1).
     """
     if mint:
         end_user_id = await resolve_external_user_id(

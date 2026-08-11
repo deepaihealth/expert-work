@@ -55,7 +55,8 @@
 `/v1/sessions/*`、`/v1/approvals*`、`/v1/runs`、`/v1/uploads/{image_id}` 对
 `subject_type == "service_account"` 主体一律 403。
 
-理由:攻击面从 31 个端点缩到 7 个;第三方不会依赖上内部形状,日后改控制台 API 不打断对接。
+理由:攻击面缩到「§二 那 7 个端点 + 既有的 `POST /v1/agents/{code}/sessions`(会话绑定)」
+这 8 条路由;第三方不会依赖上内部形状,日后改控制台 API 不打断对接。
 参照 Dify「API 无法访问 WebApp 创建的会话」的隔离原则。
 
 **实现注意**:#1153 已给这些端点装了 `require_key_scope`,收口后那批测试的期望要改

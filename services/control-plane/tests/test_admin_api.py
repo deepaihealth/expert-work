@@ -272,7 +272,9 @@ async def test_revoked_api_key_no_longer_authenticates(
     plaintext = body["plaintext"]
 
     # Pre-revoke: works.
-    pre = await admin_client.get(_AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"})
+    pre = await admin_client.get(
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
+    )
     assert pre.status_code == 200
 
     # Revoke.
@@ -280,7 +282,9 @@ async def test_revoked_api_key_no_longer_authenticates(
     assert revoked.status_code == 204
 
     # Post-revoke: 401.
-    post = await admin_client.get(_AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"})
+    post = await admin_client.get(
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
+    )
     assert post.status_code == 401
 
 

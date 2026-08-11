@@ -209,6 +209,17 @@ def build_external_uploads_router() -> APIRouter:
                     ExternalScopeError("AGENT_DISABLED", f"agent {agent_code!r} is disabled", 403)
                 )
             try:
+                # ``mint=False`` — this branch only ever runs against a session
+                # that already exists, and an existing session's owner already
+                # has a ``tenant_user`` row, so there is nothing here to mint.
+                # The only row minting could create is one for a ``user_id``
+                # that by definition does NOT own this session — i.e. exactly
+                # the case that must 404, which is how pointing an existing
+                # ``session_id`` at enumerated ``user_id``s left one ghost row
+                # per attempt on the user-dimension ops page. Same defect and
+                # same reasoning as ``load_owned_run`` (P1 final review, C1);
+                # the mint belongs to the ``session_id is None`` branch above,
+                # where ``_resolve_session`` genuinely creates the session.
                 meta = await load_owned_session(
                     tenant_id=tenant_id,
                     agent_code=agent_code,
@@ -216,6 +227,7 @@ def build_external_uploads_router() -> APIRouter:
                     session_id=session_id,
                     threads=threads,
                     users=users,
+                    mint=False,
                 )
             except ExternalScopeError as exc:
                 return external_error(exc)
