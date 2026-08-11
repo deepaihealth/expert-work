@@ -243,6 +243,11 @@ export function SettingsApiKeys() {
       title: t("api_keys.col_status"),
       key: "status",
       width: 120,
+      filters: (["active", "grace", "revoked", "expired"] as RowStatus[]).map((s) => ({
+        text: t(`api_keys.status_${s}`),
+        value: s,
+      })),
+      onFilter: (value, r) => classifyKey(r) === value,
       render: (_v, r) => {
         const cls = classifyKey(r);
         return (
