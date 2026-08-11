@@ -12,11 +12,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from typing import Any
+from datetime import UTC, datetime
+from typing import Annotated, Any, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -24,7 +29,7 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, Role
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -32,6 +37,27 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+
+
+class _SeedState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+async def _seed_thread_messages(
+    checkpointer: InMemorySaver, thread_id: str, messages: list[BaseMessage]
+) -> None:
+    """Write one checkpoint holding ``messages`` for ``thread_id`` (mirrors a
+    real run leaving a durable checkpoint). Same pattern as
+    ``test_sessions_api.py``'s helper of the same name."""
+    graph = StateGraph(_SeedState)
+    graph.add_node("n", lambda _state: {"messages": []})
+    graph.add_edge(START, "n")
+    seeded = graph.compile(checkpointer=checkpointer)
+    await seeded.ainvoke(
+        {"messages": messages},
+        config={"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+    )
+
 
 _SPEC: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -141,6 +167,54 @@ async def test_sessions_list_only_returns_this_users_sessions(ctx: _Ctx) -> None
 
 
 @pytest.mark.asyncio
+async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> None:
+    """``running`` must come from the durable ``RunStore`` — not
+    ``RunManager.has_inflight``, a per-process in-memory registry (its own
+    docstring says so) that a multi-replica deployment can't rely on: a run
+    executing on another instance would falsely read ``running: false``.
+    Flip a run's *durable* row directly (as if some other replica — or a
+    ``RunQueueWorker`` — owns it) and confirm the listing reflects it, with a
+    terminal run alongside to prove it isn't just always-True."""
+    await ctx.seed_agent()
+    running_run = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert running_run.status_code == 202, running_run.text
+    await ctx.run_store.set_status(
+        run_id=UUID(running_run.json()["run_id"]),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.RUNNING,
+        updated_at=datetime.now(UTC),
+    )
+
+    done_run = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert done_run.status_code == 202, done_run.text
+    await ctx.run_store.set_status(
+        run_id=UUID(done_run.json()["run_id"]),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
+    assert by_id[running_run.json()["thread_id"]]["running"] is True
+    assert by_id[done_run.json()["thread_id"]]["running"] is False
+
+
+@pytest.mark.asyncio
 async def test_sessions_list_requires_user_id(ctx: _Ctx) -> None:
     await ctx.seed_agent()
     resp = await ctx.client.get("/v1/agents/support-bot/sessions", headers=ctx.headers)
@@ -186,13 +260,40 @@ async def test_messages_404_for_another_user(ctx: _Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
+    """Exercises the real ``read_turns`` path end to end — not the
+    ``durable_checkpointer is None`` early return (``stub_agent_runtime``
+    never sets one, which made the original version of this test a
+    tautology: it asserted against a hard-coded ``{"messages": []}``
+    literal without ever running the field-mapping / hidden-message-filter
+    / pagination code). Wires an ``InMemorySaver`` in directly (mutating the
+    runtime object the fixture already built — no change to
+    ``agent_fixtures.py`` needed) and seeds a real checkpoint."""
     await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
     started = await ctx.client.post(
         "/v1/agents/support-bot/runs",
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
     session_id = started.json()["thread_id"]
+    await _seed_thread_messages(
+        checkpointer,
+        session_id,
+        [
+            HumanMessage(content="turn1 user"),
+            AIMessage(content="turn1 assistant"),
+            # Orchestrator scaffolding (CM-1-style recovery advisory) — must
+            # never reach a third-party app (``include_hidden=False``).
+            HumanMessage(
+                content="<recovery-advisory>internal only</recovery-advisory>",
+                additional_kwargs={"expert_work_hide_from_ui": True},
+            ),
+            HumanMessage(content="turn2 user"),
+            AIMessage(content="turn2 assistant"),
+        ],
+    )
+
     resp = await ctx.client.get(
         f"/v1/agents/support-bot/sessions/{session_id}/messages",
         params={"user_id": "cust-77"},
@@ -201,4 +302,23 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["success"] is True
-    assert isinstance(body["data"]["messages"], list)
+    # Hidden scaffolding dropped; role/content/channel mapped straight off
+    # ``read_turns`` — proves this isn't the ``checkpointer is None`` stub path.
+    assert body["data"]["messages"] == [
+        {"role": "user", "content": "turn1 user", "channel": None},
+        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
+        {"role": "user", "content": "turn2 user", "channel": None},
+        {"role": "assistant", "content": "turn2 assistant", "channel": "final"},
+    ]
+
+    # Pagination slices the (already hidden-filtered) turn list.
+    paged = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77", "limit": 2, "offset": 1},
+        headers=ctx.headers,
+    )
+    assert paged.status_code == 200, paged.text
+    assert paged.json()["data"]["messages"] == [
+        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
+        {"role": "user", "content": "turn2 user", "channel": None},
+    ]

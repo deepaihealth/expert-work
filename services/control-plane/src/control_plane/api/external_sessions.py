@@ -12,6 +12,7 @@ rejects a missing ``user_id`` with 422 before a handler ever runs.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from typing import Annotated
 from uuid import UUID
 
@@ -30,6 +31,8 @@ from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_turns
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.runtime.runs import RunStatus, RunStore
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 
 logger = logging.getLogger("expert_work.control_plane.api.external_sessions")
 
@@ -40,6 +43,37 @@ def _get_thread_repo(request: Request) -> ThreadMetaStore:
 
 def _get_runtime(request: Request) -> AgentRuntime:
     return request.app.state.agent_runtime  # type: ignore[no-any-return]
+
+
+def _get_run_store(request: Request) -> RunStore:
+    return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+async def _inflight_thread_ids(
+    runs: RunStore, *, tenant_id: UUID, thread_ids: Collection[UUID]
+) -> set[UUID]:
+    """Which of ``thread_ids`` have a PENDING/RUNNING run, batched (not one
+    query — or worse, one ``RunManager`` lock acquisition — per session row).
+
+    Reads the durable :class:`RunStore`, not :class:`RunManager.has_inflight`
+    (a per-process in-memory registry, per its own docstring) — this service
+    runs multi-replica, so a run executing on another instance must still
+    show ``running: true`` here. ``RunStore.list_for_tenant`` takes at most
+    one ``status`` per call, so this issues the two active statuses as two
+    tenant-scoped, thread-id-filtered queries rather than one per row.
+    """
+    if not thread_ids:
+        return set()
+    ids: set[UUID] = set()
+    for status in (RunStatus.PENDING, RunStatus.RUNNING):
+        active = await runs.list_for_tenant(
+            tenant_id=tenant_id,
+            status=status,
+            thread_ids=thread_ids,
+            limit=MAX_LIST_LIMIT,
+        )
+        ids.update(r.thread_id for r in active)
+    return ids
 
 
 def build_external_sessions_router() -> APIRouter:
@@ -56,7 +90,7 @@ def build_external_sessions_router() -> APIRouter:
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
-        runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -78,18 +112,19 @@ def build_external_sessions_router() -> APIRouter:
             limit=limit,
             offset=offset,
         )
-        sessions = []
-        for row in rows:
-            running = await runtime.run_manager.has_inflight(row.thread_id, tenant_id=tenant_id)
-            sessions.append(
-                {
-                    "session_id": str(row.thread_id),
-                    "title": row.title,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-                    "running": running,
-                }
-            )
+        inflight = await _inflight_thread_ids(
+            runs, tenant_id=tenant_id, thread_ids=[row.thread_id for row in rows]
+        )
+        sessions = [
+            {
+                "session_id": str(row.thread_id),
+                "title": row.title,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                "running": row.thread_id in inflight,
+            }
+            for row in rows
+        ]
         return JSONResponse(
             {
                 "success": True,
