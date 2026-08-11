@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery, TriggerRunRecord
+from expert_work.protocol import AuditAction, AuditQuery, Principal, TriggerRecord, TriggerRunRecord
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -127,6 +130,52 @@ async def _create_cron(client: AsyncClient, *, name: str = "nightly") -> dict[st
     )
     assert resp.status_code == 201, resp.text
     return resp.json()  # type: ignore[no-any-return]
+
+
+async def _seed_unowned_trigger(app: object, *, name: str) -> UUID:
+    """Insert a ``user_id=None`` trigger straight through the store.
+
+    P1 external-API lockdown (``console_only()``) closes ``POST
+    /v1/triggers`` to a ``service_account`` principal, which used to be how
+    these tests built a null-owner row (``resolve_caller_user_id`` returns
+    ``None`` for a machine principal, so the row it creates carries no
+    owner). This reproduces the exact same row shape directly through the
+    store — the row is otherwise indistinguishable (same
+    ``record.user_id is None`` the ownership gates key on), only the
+    construction path changed."""
+    now = datetime.now(UTC)
+    trigger_id = uuid4()
+    await app.state.trigger_store.create(  # type: ignore[attr-defined]
+        TriggerRecord(
+            id=trigger_id,
+            tenant_id=_DEFAULT_TENANT,
+            user_id=None,
+            agent_name="reporter",
+            agent_version="1.0.0",
+            name=name,
+            kind="cron",
+            config={"expr": "0 9 * * *"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    return trigger_id
+
+
+def _find_endpoint(app: object, *, method: str, path: str):  # type: ignore[no-untyped-def]
+    """The raw (undecorated) handler function for one mounted route.
+
+    ``APIRoute.endpoint`` is the plain callable FastAPI wraps to build the
+    dependency-injected request pipeline — calling it directly bypasses
+    that pipeline entirely, so a route dependency (``console_only()``,
+    ``require_key_scope(...)``) never runs. Used for the one test in this
+    file that needs to pin the handler's internal scoping logic for a
+    principal (``service_account``) the HTTP path no longer admits.
+    """
+    for route in app.routes:  # type: ignore[attr-defined]
+        if isinstance(route, APIRoute) and route.path == path and method in (route.methods or ()):
+            return route.endpoint
+    raise AssertionError(f"route not found: {method} {path}")
 
 
 # --- CRUD -----------------------------------------------------------------
@@ -722,18 +771,66 @@ async def test_list_triggers_non_admin_sees_only_own(triggers_client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_list_triggers_service_principal_sees_empty(triggers_client: AsyncClient) -> None:
-    """服务(非 user)principal 非 admin LIST —— 空列表而非报错或越权 —— named risk 确认。
-
-    先建一个别人的触发器作 distractor:旧代码(无 scoping)会把它一并列出;
-    新代码 caller_user_id 为 None 时提前判空,必须看不到它。
-    """
-    await _create_cron(triggers_client, name="someone-elses")
+async def test_service_account_key_cannot_list_triggers(triggers_client: AsyncClient) -> None:
+    """P1 external-API lockdown (``console_only()``, ``api/_authz.py``) — a
+    ``service_account`` (API-key) principal is refused ``/v1/triggers``
+    outright now; third parties list their own triggers via the external
+    plane instead. See
+    ``test_list_scoping_hides_other_users_triggers_from_an_unowned_caller``
+    for the "no tenant_user instance → empty, never someone else's rows"
+    invariant this endpoint still enforces for whichever machine principal
+    *can* still reach it (an mTLS ``service`` principal — ``console_only()``
+    only gates ``service_account``)."""
     sa = _client_as(triggers_client, subject="svc-1", roles=(), sub_type="service_account")
     async with sa:
         resp = await sa.get("/v1/triggers")
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_scoping_hides_other_users_triggers_from_an_unowned_caller(
+    triggers_client: AsyncClient,
+) -> None:
+    """非 admin LIST 且无 tenant_user 实例(``caller_user_id is None``)——空列表
+    而非报错或越权 —— named risk 确认(原 HTTP 覆盖见
+    ``test_service_account_key_cannot_list_triggers`` 的 docstring:那条路径
+    现在对 ``service_account`` 403 了,但这条不变式本身没变,mTLS
+    ``service`` 主体走的还是同一段代码)。
+
+    两个 distractor:一个是别人(真实 user)建的,一个是无主(``user_id IS
+    NULL``)的。旧代码(无 scoping)会把有主那个一并列出;新代码
+    ``caller_user_id`` 为 None 时提前判空,必须两个都看不到——尤其是无主
+    那个:提前判空一旦被撤掉,落到 ``list_by_user(user_id=caller_user_id,
+    ...)`` 时 ``caller_user_id`` 本身就是 ``None``,这条查询会精确匹配上
+    无主 distractor(而不会匹配有主的那个)——这正是让这条断言对"撤掉判
+    空"这个变异有牙齿的原因,单靠有主 distractor 测不出来。P1 收口后 HTTP
+    已经走不到"machine principal 打 LIST"这条路径了(service_account 被
+    堵,而测试夹具造不出 mTLS service 主体——``jwt_verifier.py`` 把任何非
+    ``service_account`` 的 ``sub_type`` 一律归一成 ``"user"``),所以改成
+    直接调 ``list_triggers`` 的裸处理函数(``_find_endpoint``,绕过 FastAPI
+    的依赖注入层,连带绕过 ``console_only()``/``require_key_scope``),这就
+    是"单元层"验证同一段 scoping 逻辑的意思——不是端到端,但被测的代码
+    没有变。
+    """
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    await _create_cron(triggers_client, name="someone-elses")  # owned distractor
+    await _seed_unowned_trigger(app, name="unowned-elses")  # unowned distractor
+
+    endpoint = _find_endpoint(app, method="GET", path="/v1/triggers")
+    principal = Principal(
+        subject_id="svc-1", subject_type="service_account", tenant_id=_DEFAULT_TENANT
+    )
+    fake_request = SimpleNamespace(
+        state=SimpleNamespace(principal=principal, tenant_id=_DEFAULT_TENANT)
+    )
+    resp = await endpoint(
+        request=fake_request,
+        triggers=app.state.trigger_store,
+        users=app.state.tenant_user_repo,
+        audit=app.state.audit_logger,
+    )
     assert resp.status_code == 200
-    assert resp.json() == {"items": [], "total": 0, "cross_tenant": False}
+    assert json.loads(resp.body) == {"items": [], "total": 0, "cross_tenant": False}
 
 
 # --- 终审 Important#1 — null-owner trigger admin guard ---------------------
@@ -753,18 +850,17 @@ async def test_list_triggers_service_principal_sees_empty(triggers_client: Async
 async def test_null_owner_trigger_delete_requires_admin(triggers_client: AsyncClient) -> None:
     """无主触发器(user_id IS NULL)DELETE —— 非 admin 403,admin 200。
 
-    用 SERVICE principal 建触发器:``resolve_caller_user_id`` 对
-    ``subject_type != "user"`` 返回 None,所以建出来的行 ``user_id IS
-    NULL`` —— 与 manifest 建的无主触发器同构。attacker 是另一个不同
-    subject、非 admin 的真实 user principal(不是同一 caller 打自己),
-    若堵所有权洞的 admin 闸被撤掉,``resolve_target_user_id`` 会把
-    ``requested=None`` 解成 attacker 自己的 caller_user_id 而不报 403 ——
-    此断言会随之失败,证明测试确实在验证这道闸。
+    P1 收口后 ``service_account`` principal 建不了 HTTP 触发器了(见
+    ``test_service_account_key_cannot_list_triggers``),直接用
+    ``_seed_unowned_trigger`` 走 store 造同形状的无主行(``user_id IS
+    NULL`` —— 与 manifest 建的无主触发器同构,也与 SERVICE principal 会建
+    出来的行同构)。attacker 是另一个不同 subject、非 admin 的真实 user
+    principal(不是同一 caller 打自己),若堵所有权洞的 admin 闸被撤掉,
+    ``resolve_target_user_id`` 会把 ``requested=None`` 解成 attacker 自己的
+    caller_user_id 而不报 403 —— 此断言会随之失败,证明测试确实在验证这道闸。
     """
-    sa = _client_as(triggers_client, subject="svc-1", roles=(), sub_type="service_account")
-    async with sa:
-        created = await _create_cron(sa, name="unowned")
-    trigger_id = created["id"]
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    trigger_id = await _seed_unowned_trigger(app, name="unowned")
 
     attacker = _client_as(triggers_client, subject="user-attacker", roles=("viewer",))
     async with attacker:
@@ -853,16 +949,14 @@ async def test_403_delete_leaves_trigger_run_rows_intact(
     孤儿行级联跑。若级联被误挪到权限门之前(比如为了顺手把
     ``runs_removed`` 算出来揣在 403 响应里),被拒绝的调用方虽然拿不到
     删除权限,却能把受害者的 trigger_run 行清空 —— 本测试锁定"403 时子行
-    原封不动"这条线。用无主(service principal 建)trigger 复用
-    ``test_null_owner_trigger_delete_requires_admin`` 的构造,让攻击者是
-    真实存在的非 admin user(不是同一 caller 打自己)。
+    原封不动"这条线。P1 收口后 ``service_account`` principal 建不了 HTTP
+    触发器了,改用 ``_seed_unowned_trigger`` 走 store 复用
+    ``test_null_owner_trigger_delete_requires_admin`` 的构造(同形状的无主
+    行),攻击者仍是真实存在的非 admin user(不是同一 caller 打自己)。
     """
-    sa = _client_as(triggers_client, subject="svc-1", roles=(), sub_type="service_account")
-    async with sa:
-        created = await _create_cron(sa, name="unowned-with-runs")
-    trigger_id = UUID(str(created["id"]))
-
     app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    trigger_id = await _seed_unowned_trigger(app, name="unowned-with-runs")
+
     await _seed_trigger_run(app, trigger_id=trigger_id)
     await _seed_trigger_run(app, trigger_id=trigger_id)
 
