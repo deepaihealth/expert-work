@@ -180,17 +180,27 @@ async def test_decide_404s_when_no_pending_approval(ctx: _Ctx) -> None:
     )
     # Ownership passes; there is simply nothing waiting on a verdict.
     assert resp.status_code == 404, resp.text
-    assert resp.json()["error"]["code"] != "RUN_NOT_FOUND"
+    # ``!=`` alone is too wide a net (fix-round review: any code other than
+    # the literal string would pass) — pin the actual code this branch
+    # returns so a regression that silently reintroduces RUN_NOT_FOUND here
+    # is the only thing that can make this fail.
+    assert resp.json()["error"]["code"] == "APPROVAL_NOT_FOUND"
 
 
-@pytest.mark.asyncio
-async def test_decide_approve_applies_and_returns_new_run_id(ctx: _Ctx) -> None:
-    """The invariant this endpoint exists for: a genuinely pending approval,
-    once approved, is actually decided — not just answered with a plausible
-    envelope. The stub orchestrator's fake LLM never emits a tool call (so it
-    can never itself pause a run for approval); this seeds the pending
-    ``agent_approval`` row directly, the way ``test_runs_api.py`` seeds one
-    for the internal resume endpoint's own tests.
+async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
+    """Seed a genuinely pending approval on a real run, ready to ``:decide``.
+
+    The stub orchestrator's fake LLM never emits a tool call (so nothing in
+    this test harness can *organically* pause a run for approval): this
+    starts a run, then seeds the pending ``agent_approval`` row directly
+    (same recipe ``test_runs_api.py::_seed_pending_approval`` uses for the
+    internal resume endpoint's own tests), plus the one extra step that
+    recipe doesn't need — a tool-calling ``AIMessage`` written into the
+    graph's own checkpoint, because THIS endpoint's ``resolve_approval_
+    decision`` call reaches an ``aupdate_state`` that inspects
+    ``state["messages"][-1]`` and IndexErrors on an empty history.
+
+    Returns ``(run_id, thread_id, end_user_id)``.
     """
     await ctx.seed_agent()
     started = await ctx.client.post(
@@ -207,15 +217,9 @@ async def test_decide_approve_applies_and_returns_new_run_id(ctx: _Ctx) -> None:
         tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:cust-77"
     )
 
-    # The stub orchestrator's fake LLM never emits a tool call on its own, so
-    # nothing in this test harness can *organically* pause a run for
-    # approval. Seed the graph's own checkpoint with a tool-calling AIMessage
-    # so the resume path's routing (``state["messages"][-1]``) has something
-    # real to inspect — otherwise ``resolve_approval_decision``'s
-    # ``aupdate_state`` IndexErrors on an empty message list. ``get_agent``
-    # cache-hits the same built graph the run-creation call above already
-    # built (Stream MCP-OAUTH: keyed on (tenant, name, version) here, no
-    # per-user OAuth pool configured in this fixture).
+    # ``get_agent`` cache-hits the same built graph the run-creation call
+    # above already built (Stream MCP-OAUTH: keyed on (tenant, name,
+    # version) here, no per-user OAuth pool configured in this fixture).
     built = await ctx.app.state.agent_runtime.get_agent(
         tenant_id=ctx.tenant_id,
         name="support-bot",
@@ -258,6 +262,16 @@ async def test_decide_approve_applies_and_returns_new_run_id(ctx: _Ctx) -> None:
             timeout_at=now + timedelta(hours=24),
         )
     )
+    return run_id, thread_id, end_user.id
+
+
+@pytest.mark.asyncio
+async def test_decide_approve_applies_and_returns_new_run_id(ctx: _Ctx) -> None:
+    """The invariant this endpoint exists for: a genuinely pending approval,
+    once approved, is actually decided — not just answered with a plausible
+    envelope. ``mode: "queue"`` path.
+    """
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
 
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
@@ -280,3 +294,64 @@ async def test_decide_approve_applies_and_returns_new_run_id(ctx: _Ctx) -> None:
     continuation = await ctx.run_store.get(run_id=new_run_id, tenant_id=ctx.tenant_id)
     assert continuation is not None
     assert continuation.is_resume is True
+
+
+@pytest.mark.asyncio
+async def test_decide_default_mode_streams_the_continuation(ctx: _Ctx) -> None:
+    """Fix-round review: all other cases use ``mode: "queue"`` (or never
+    reach a response at all), so the endpoint's DEFAULT branch — a
+    third-party caller that never sends ``mode`` at all, exactly as
+    documented ("stream" is the default) — had zero coverage. This drains
+    the SSE stream to completion and checks every side effect the queue
+    variant checks, plus the response shape unique to this branch.
+    """
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    new_run_id = UUID(resp.headers["X-Expert-Work-Run-Id"])
+    assert new_run_id != run_id
+
+    decided = await ctx.app.state.approval_store.get_by_run(run_id=run_id, tenant_id=ctx.tenant_id)
+    assert decided is not None
+    assert decided.status is ApprovalStatus.APPROVED
+
+    continuation = await ctx.run_store.get(run_id=new_run_id, tenant_id=ctx.tenant_id)
+    assert continuation is not None
+    assert continuation.is_resume is True
+
+
+@pytest.mark.asyncio
+async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ctx) -> None:
+    """Fix-round review: the kill-switch 403 must surface the SAME code the
+    public error-code contract documents and the run-creation endpoint
+    already returns (``AGENT_DISABLED``) — not a made-up ``AGENT_BLOCKED``
+    that collapses it together with ``TENANT_SUSPENDED``, which a
+    docs-driven caller could never branch on.
+    """
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+
+    disable = await ctx.client.post("/v1/agents/support-bot/disable", json={}, headers=ctx.headers)
+    assert disable.status_code == 200, disable.text
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "AGENT_DISABLED"
+
+    # The approval must stay untouched — RT-ADR-16 leaves it PENDING
+    # (fully reversible) rather than consuming the decision only to 403
+    # the spawn.
+    still_pending = await ctx.app.state.approval_store.get_by_run(
+        run_id=run_id, tenant_id=ctx.tenant_id
+    )
+    assert still_pending is not None
+    assert still_pending.status is ApprovalStatus.PENDING

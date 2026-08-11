@@ -22,6 +22,15 @@ event-replay endpoint (``GET .../runs/{run_id}/events``). Both modes report
 the idempotent-replay case (a retried ``idempotency_key`` matching an
 already-decided approval) as a plain JSON body — there is no live worker to
 stream in that case, mirroring the console endpoint's own 200 JSON reply.
+
+Note this ``mode`` is **not** the same mechanism as the run-creation
+endpoint's ``mode`` of the same name: there, ``queue`` persists a row a
+``RunQueueWorker`` on any replica later picks up. Here, ``resolve_approval_
+decision`` unconditionally builds the graph and spawns the continuation
+worker on THIS replica regardless of ``mode`` — ``queue`` only means "don't
+attach an SSE consumer to it, just hand back its run_id". Same third-party
+experience (no held-open connection needed), different operational
+mechanism underneath.
 """
 
 from __future__ import annotations
@@ -59,16 +68,28 @@ _STATUS_FOR: dict[str, ApprovalStatus] = {
     "modify": ApprovalStatus.MODIFIED,
 }
 
+#: ``run_block_reason`` (``runs.py:574``) raises 403 with ``detail =
+#: blocked.upper()`` — already the exact code the public error-code contract
+#: (``apps/admin-ui/docs-site/guide/errors.md``) documents and what the
+#: console run-creation endpoint returns for the same two conditions
+#: (``runs.py:962-963`` / ``1005-1006``). Used as the envelope ``code``
+#: as-is (see ``_decision_error_envelope``) instead of collapsing both into
+#: one made-up code a third party's docs-driven branching would never match.
+_BLOCKED_MESSAGES: dict[str, str] = {
+    "AGENT_DISABLED": "this agent is disabled",
+    "TENANT_SUSPENDED": "this tenant is suspended",
+}
+
 #: Fallback envelope ``code`` by HTTP status for an ``HTTPException`` raised
 #: inside ``resolve_approval_decision`` whose ``detail`` is a plain string
-#: (not the ``{code, message}`` shape ``AGENT_DELETED`` uses). That function
-#: is request-free (Stream 9.5) and never builds the external envelope
-#: itself — this endpoint owns that translation, same as every other
-#: external route's ``external_error``.
+#: (not the ``{code, message}`` shape ``AGENT_DELETED`` uses, nor the 403
+#: reason ``_BLOCKED_MESSAGES`` covers). That function is request-free
+#: (Stream 9.5) and never builds the external envelope itself — this
+#: endpoint owns that translation, same as every other external route's
+#: ``external_error``.
 _DECISION_ERROR_CODES: dict[int, str] = {
     404: "APPROVAL_NOT_FOUND",
     409: "APPROVAL_CONFLICT",
-    403: "AGENT_BLOCKED",
     422: "AGENT_BUILD_FAILED",
 }
 
@@ -84,7 +105,7 @@ class ExternalDecideRequest(BaseModel):
     ``ApprovalDecision`` (``expert_work.protocol.approval``).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     user_id: str = Field(min_length=1, max_length=255)
     decision: Literal["approve", "reject", "modify"]
@@ -136,7 +157,14 @@ def _get_approval_store(request: Request) -> ApprovalStore:
 
 def _decision_error_envelope(exc: HTTPException) -> JSONResponse:
     """Render an ``HTTPException`` raised inside ``resolve_approval_decision``
-    as the standard external envelope (``{success, data, error}``)."""
+    as the standard external envelope (``{success, data, error}``).
+
+    That function raises several distinct plain-string 404s / 409s that must
+    NOT collapse into one code — a caller cannot script "no pending
+    approval" vs. "the agent itself is gone" (both 404), or "already
+    decided" vs. "session isn't bound to an agent" (both 409), unless the
+    codes actually differ.
+    """
     # Stubs type ``HTTPException.detail`` as plain ``str``, but FastAPI's own
     # subclass accepts ``Any`` (``resolve_approval_decision`` really does
     # raise with a dict detail for AGENT_DELETED) — widen before narrowing so
@@ -145,6 +173,19 @@ def _decision_error_envelope(exc: HTTPException) -> JSONResponse:
     if isinstance(detail, dict) and "code" in detail:
         code = str(detail["code"])
         message = str(detail.get("message", code))
+    elif exc.status_code == 403:
+        code = str(detail)
+        message = _BLOCKED_MESSAGES.get(code, str(detail))
+    elif exc.status_code == 404 and str(detail).startswith("agent "):
+        # ``spec_record is None`` (runs.py:651-655) — the agent manifest
+        # itself is gone, distinct from "no pending approval" (runs.py:546).
+        code = "AGENT_NOT_FOUND"
+        message = str(detail)
+    elif exc.status_code == 409 and "not bound to an agent" in str(detail):
+        # ``meta.agent_name`` / ``agent_version`` unset (runs.py:560-561) —
+        # distinct from "approval already decided" (runs.py:556 / 612).
+        code = "SESSION_NOT_BOUND"
+        message = str(detail)
     else:
         code = _DECISION_ERROR_CODES.get(exc.status_code, "APPROVAL_ERROR")
         message = str(detail)
