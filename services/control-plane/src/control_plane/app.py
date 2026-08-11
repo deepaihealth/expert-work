@@ -2444,6 +2444,22 @@ def create_app(
     app.include_router(build_metrics_router())
     app.include_router(build_agent_schema_router())
     app.include_router(build_model_catalog_router())
+
+    # 第三方对接 API v1(P1)—— 对外契约,与控制台平面分开。必须注册在
+    # build_agents_router() 之前:后者的 GET /{name}/{version} 是两段
+    # 全参数路径,Starlette 按注册顺序而非具体性匹配路由,先注册的
+    # {name}/{version} 会把任何两段的 /{agent_code}/<字面量> 外部路由
+    # (如本组的 GET /{agent_code}/sessions)静默吞掉(version="sessions"
+    # 之类),导致该端点在真实 app 里根本不可达。反向不受影响:本组
+    # GET 路由第二段都是字面量(sessions/runs),GET /{name}/{version}
+    # 传入真实版本号时匹配不上它们,仍会正常落到 agents.py。见
+    # test_external_route_reachability.py 的可达性护栏。
+    app.include_router(build_external_runs_router())
+    app.include_router(build_external_events_router())
+    app.include_router(build_external_sessions_router())
+    app.include_router(build_external_uploads_router())
+    app.include_router(build_external_approvals_router())
+
     app.include_router(build_agents_router())
     app.include_router(build_sessions_router())
     app.include_router(build_runs_router())
@@ -2498,13 +2514,6 @@ def create_app(
     app.include_router(build_eval_runs_router())
     app.include_router(build_quality_router())
     app.include_router(build_platform_quality_config_router())
-
-    # 第三方对接 API v1(P1)—— 对外契约,与控制台平面分开。
-    app.include_router(build_external_runs_router())
-    app.include_router(build_external_events_router())
-    app.include_router(build_external_sessions_router())
-    app.include_router(build_external_uploads_router())
-    app.include_router(build_external_approvals_router())
 
     return app
 
