@@ -66,6 +66,7 @@ from control_plane.tenant_scope import (
 )
 from control_plane.tenant_status import TenantStatusService
 from control_plane.transcript import read_turns
+from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
     current_trace_id_hex,
     expert_work_counter,
@@ -309,6 +310,7 @@ def build_run_graph_input(
     image_refs: list[str],
     untrusted_content: list[str] | None,
     inputs: dict[str, Any] | None = None,
+    run_id: UUID | None = None,
 ) -> dict[str, Any]:
     """Assemble the graph input for a run from a built agent + user input.
 
@@ -320,17 +322,25 @@ def build_run_graph_input(
 
     Stream Dynamic-Prompt — ``inputs`` carries the run's Jinja variables; the
     system prompt is rendered here so stream and queue render identically.
+
+    P2 块 2 — ``run_id`` stamps the human message's ``additional_kwargs``
+    with ``created_at`` / ``run_id`` so the external messages endpoint can
+    surface them (LangGraph checkpoints don't store either). The system
+    message is never stamped — ``extract_turns`` filters it out anyway.
     """
+    human = _build_human_message(
+        input_text=input_text,
+        image_refs=image_refs,
+        supports_vision=built.supports_vision,
+        untrusted_content=untrusted_content,
+        spotlight_nonce=built.spotlight_nonce,
+    )
+    if run_id is not None:
+        human = stamp_message(human, run_id=str(run_id), now=datetime.now(UTC))
     return {
         "messages": [
             SystemMessage(content=render_system_prompt(built, inputs or {})),
-            _build_human_message(
-                input_text=input_text,
-                image_refs=image_refs,
-                supports_vision=built.supports_vision,
-                untrusted_content=untrusted_content,
-                spotlight_nonce=built.spotlight_nonce,
-            ),
+            human,
         ],
         "step_count": 0,
         "max_steps": built.max_steps,
@@ -864,6 +874,7 @@ async def spawn_run(
         image_refs=payload.image_refs,
         untrusted_content=payload.untrusted_content,
         inputs=payload.inputs,
+        run_id=run_id,
     )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),
