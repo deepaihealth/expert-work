@@ -102,6 +102,7 @@ from orchestrator.multimodal import (
     ImageResolver,
     ObjectStoreImageResolver,
 )
+from orchestrator.sse import ThreadStatsRecorder
 from orchestrator.tools import (
     AgentSandboxClient,
     AllowlistProvider,
@@ -207,6 +208,10 @@ class AgentRuntime:
     #: fuel, and the J.13 eval gate's input). Set in the app lifespan once the
     #: ObjectStore is open; ``None`` keeps trajectory recording off (no store).
     trajectory_recorder: TrajectoryRecorder | None = None
+    #: P2 块 2 — run 终局重算会话的对外可见消息条数(``thread_meta.message_count``)。
+    #: ``app.py`` 注入 :class:`~control_plane.thread_stats.ThreadStatsRecorderImpl`;
+    #: ``None``(测试 / 未接线)让计数保持 ``NULL``,不影响 run。
+    thread_stats_recorder: ThreadStatsRecorder | None = None
     #: 1.3 Orchestrator-Worker — per-run dynamic-worker spawn bounds. Set in
     #: the app lifespan from platform settings. ``enabled=False`` makes
     #: :meth:`new_worker_spawn_budget` return ``None`` (no per-run caps; the

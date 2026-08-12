@@ -40,6 +40,7 @@ from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import TriggerRecord
 from expert_work.protocol.agent_spec import AgentSpecStatus
 from expert_work.runtime.runs import RunInfo
+from orchestrator.sse import ThreadStatsRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ async def inject_delivery(
     result_text: str,
     source_run_id: UUID,
     trigger_id: UUID,
+    thread_stats_recorder: ThreadStatsRecorder | None = None,
 ) -> None:
     """Append ``result_text`` as an ``AIMessage`` to ``thread_id``'s checkpoint.
 
@@ -67,6 +69,10 @@ async def inject_delivery(
     already delivered is a no-op. This is what lets the scheduler's reconcile
     pass and the manual ``:fire`` endpoint (Spec 1 PR4) race on the same fired
     run without double-appending the result.
+
+    P2 块 2 —— 这条路径在 run **之外** 往会话追加助手消息,不经 ``run_agent``
+    的 ``finally``,所以计数要在这里同步更新一次;否则被投递的会话的
+    ``message_count`` 会一直停在上一次 run 的值,直到该会话下次真跑 run。
     """
     config: RunnableConfig = {
         "configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}
@@ -97,6 +103,15 @@ async def inject_delivery(
         {"messages": [message]},
         as_node="agent" if has_history else "__start__",
     )
+    if thread_stats_recorder is not None:
+        # ``messages`` 通道是 add_messages 追加 reducer,写完的状态就是
+        # ``existing + [message]`` —— 不再多读一次 checkpoint(那会给这条
+        # 已经写成功的投递路径凭空加一个失败点)。recorder 自吞异常。
+        await thread_stats_recorder.record(
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            messages=[*existing, message],
+        )
 
 
 @dataclass(frozen=True)
@@ -166,6 +181,7 @@ async def deliver_run_result(
             result_text=result,
             source_run_id=run.run_id,
             trigger_id=trigger.id,
+            thread_stats_recorder=runtime.thread_stats_recorder,
         )
         # FU2 — mirror the originating thread into content search. Its own
         # try/except: a mirror-sync failure must NOT downgrade an

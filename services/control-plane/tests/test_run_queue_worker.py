@@ -50,6 +50,7 @@ class _FakeRuntime:
         self.run_event_store = None
         self.skill_run_usage_recorder = None
         self.trajectory_recorder = None
+        self.thread_stats_recorder = None
 
     async def get_agent(self, **_kw):
         return SimpleNamespace(
