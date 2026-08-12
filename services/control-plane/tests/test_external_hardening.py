@@ -477,3 +477,141 @@ async def test_run_events_neither_resurrect_nor_expose_a_purged_user(ctx: _Ctx) 
     )
     assert sessions.status_code == 200, sessions.text
     assert sessions.json()["data"]["sessions"] == []
+
+
+# ---------------------------------------------------------------------------
+# P1 wrap-up, N1 — the same defect family on ``_resolve_session``'s two callers
+#
+# ``POST .../runs`` and ``POST .../sessions`` share ``agents.py:_resolve_session``,
+# which minted the end user *before* branching on ``session_id``. The
+# ``session_id is None`` branch genuinely creates the session it addresses, so
+# its mint is intentional product behavior (a third party never pre-registers
+# its end users) — but the branch that is *handed* a ``session_id`` addresses an
+# already-existing session, exactly like the upload path fixed in C1's second
+# half. Both halves are covered here: the mint must survive, the ghost row must
+# not.
+# ---------------------------------------------------------------------------
+
+
+async def _owned_session(ctx: _Ctx, user_id: str = "cust-77") -> str:
+    """Create a real session owned by ``user_id`` and return its id."""
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": user_id, "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+    return str(created.json()["thread_id"])
+
+
+async def _address_session(ctx: _Ctx, endpoint: str, *, user_id: str, session_id: str) -> Any:
+    """Call one of the two ``_resolve_session`` callers with an explicit
+    ``session_id`` — the branch that must NOT mint."""
+    if endpoint == "runs":
+        return await ctx.client.post(
+            "/v1/agents/support-bot/runs",
+            json={
+                "user_id": user_id,
+                "session_id": session_id,
+                "input": "hi",
+                "mode": "queue",
+            },
+            headers=ctx.headers,
+        )
+    return await ctx.client.post(
+        "/v1/agents/support-bot/sessions",
+        json={"user_id": user_id, "session_id": session_id},
+        headers=ctx.headers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_bind_without_session_id_still_mints_the_end_user(ctx: _Ctx) -> None:
+    """The half that must NOT change: ``POST .../sessions`` with no
+    ``session_id`` creates the session it addresses, so it mints the
+    ``tenant_user`` row on first use. Killing this mint would break the whole
+    integration model (third parties do not pre-register end users), which is
+    the headline risk of the N1 fix. ``test_run_submit_still_mints_the_end_user``
+    is the same guard for the other caller.
+    """
+    await ctx.seed_agent()
+    subject_id = external_subject_id("fresh-binder")
+    assert not await ctx.has_subject(subject_id)
+
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/sessions",
+        json={"user_id": "fresh-binder"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["session_id"]
+
+    assert await ctx.has_subject(subject_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["runs", "sessions"])
+async def test_addressing_a_foreign_session_never_mints_a_ghost_user(
+    ctx: _Ctx, endpoint: str
+) -> None:
+    """Point an existing ``session_id`` at enumerated ``user_id``s: every call
+    must 404 *and* leave no ``tenant_user`` row behind. Before the fix
+    ``_resolve_session`` resolved (upserted) the end user before checking
+    ownership, so each rejected attempt still wrote a ghost row that surfaces on
+    the user-dimension ops page — the same shape as C1 on the read endpoints and
+    on the upload path.
+    """
+    await ctx.seed_agent()
+    session_id = await _owned_session(ctx)
+
+    for ghost in ("ghost-1", "ghost-2"):
+        subject_id = external_subject_id(ghost)
+        assert not await ctx.has_subject(subject_id)
+
+        resp = await _address_session(ctx, endpoint, user_id=ghost, session_id=session_id)
+
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == "SESSION_NOT_FOUND"
+        assert not await ctx.has_subject(subject_id), (
+            f"POST .../{endpoint} minted a tenant_user row for {ghost!r}, "
+            "who does not own the supplied session"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["runs", "sessions"])
+async def test_addressing_a_foreign_session_never_resurrects_a_purged_user(
+    ctx: _Ctx, endpoint: str
+) -> None:
+    """The second half of the same defect: ``resolve`` clears ``deleted_at`` on
+    purpose ("a returning user comes back clean"), so a call that ends in 404
+    still un-deleted a purged identity — and Phase 3b's 90-day hard delete
+    selects on ``deleted_at``, so that row became permanently uncollectable.
+    A rejected call must leave the purge intact.
+    """
+    await ctx.seed_agent()
+    session_id = await _owned_session(ctx)
+
+    users = ctx.app.state.tenant_user_repo
+    # Give the purged identity a real row first (its own run), so the assertion
+    # below is about the purge surviving — not about a row that never existed.
+    await _owned_session(ctx, "soon-to-be-purged")
+    row = await users.get_by_subject(
+        tenant_id=ctx.tenant_id,
+        subject_type="user",
+        subject_id=external_subject_id("soon-to-be-purged"),
+    )
+    assert row is not None
+    assert await users.deactivate(row.id, tenant_id=ctx.tenant_id, now=datetime.now(UTC)) is True
+    purged_at = (await users.get(row.id, tenant_id=ctx.tenant_id)).deleted_at
+    assert purged_at is not None
+
+    resp = await _address_session(ctx, endpoint, user_id="soon-to-be-purged", session_id=session_id)
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "SESSION_NOT_FOUND"
+
+    still_purged = (await users.get(row.id, tenant_id=ctx.tenant_id)).deleted_at
+    assert still_purged == purged_at, (
+        f"POST .../{endpoint} cleared deleted_at (resurrected a purged user) "
+        "on a call it rejected with 404"
+    )

@@ -163,19 +163,26 @@ async def load_owned_session(
     The dividing line is **not** read-vs-write, it is *does this call create
     the session it addresses*:
 
-    - ``mint=True`` — for the callers that bring a session into existence
-      (session bind, run submit, and the upload path that *omits*
-      ``session_id``). A third party never pre-registers its end-users, so the
-      first call under a fresh ``user_id`` must mint the ``tenant_user`` row;
-      mint-on-use is intentional product behavior there.
+    - ``mint=True`` — the semantics for a call that brings a session into
+      existence: session bind, run submit and upload, **but only on the branch
+      where they omit ``session_id``**. A third party never pre-registers its
+      end-users, so the first call under a fresh ``user_id`` must mint the
+      ``tenant_user`` row; mint-on-use is intentional product behavior there.
+      Those branches mint through ``agents.py:_resolve_session``, which has to
+      create the thread in the same breath, rather than through this function
+      — so this is the documented counterpart of the rule below, not a mode
+      the external plane currently exercises here.
     - ``mint=False`` — for every caller handed an **already-existing** session
       or run id: message history, :func:`load_owned_run` (cancel / events /
-      approval-decide), and the upload path that *supplies* ``session_id``.
-      Such a resource's owner necessarily already has a ``tenant_user`` row,
-      so there is nothing to mint; the only row minting could add is one for a
-      ``user_id`` that is not the owner — exactly the case that must 404. Doing
-      it anyway is how enumerating ``user_id``s against a known id left one
-      ghost row per attempt (P1 final review, C1).
+      approval-decide), and the upload / session-bind / run-submit paths that
+      *supply* ``session_id``. Such a resource's owner necessarily already has
+      a ``tenant_user`` row, so there is nothing to mint; the only row minting
+      could add is one for a ``user_id`` that is not the owner — exactly the
+      case that must 404. Doing it anyway is how enumerating ``user_id``s
+      against a known id left one ghost row per attempt, and how a call that
+      answered 404 still resurrected a purged identity (P1 final review C1 —
+      read plane + upload; wrap-up N1 — session bind + run submit, which take
+      this branch inside ``_resolve_session`` rather than by calling here).
     """
     if mint:
         end_user_id = await resolve_external_user_id(
@@ -226,8 +233,9 @@ async def load_owned_run(
     uncollectable by the ``deleted_at``-driven Phase-3b hard delete; and,
     because resurrection happened before the ownership check, the purged user's
     own run events stayed readable (200) while their messages and session list
-    correctly reported 404 / empty. The mint belongs to real entry points
-    (``_resolve_session``: bind a session, submit a run), never here.
+    correctly reported 404 / empty. The mint belongs to the branch that
+    genuinely creates a session (``_resolve_session`` with no ``session_id``),
+    never here.
     """
     run = await runs.get(run_id=run_id, tenant_id=tenant_id)
     if run is None:

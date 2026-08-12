@@ -15,7 +15,7 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import TriggerStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
-from expert_work.protocol import AuditAction, AuditQuery, TriggerRecord
+from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRecord
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -340,6 +340,55 @@ async def test_rollback_unknown_revision_404(b5_client: AsyncClient) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
     response = await b5_client.post("/v1/agents/code-reviewer/1.0.0/revisions/7/rollback")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_rollback_needs_manifest_write_while_the_reads_stay_open(
+    b5_client: AsyncClient,
+) -> None:
+    """User ruling 2026-08-12 — of the five console routes the P1 lockdown
+    closed to API keys, ``rollback`` is the only **write**, and it carried no
+    employee-side authorization at all: any logged-in VIEWER could roll a
+    tenant's manifest back to an arbitrary older snapshot. It now needs
+    ``manifest:write``. The reads in the same group deliberately stay open to
+    every employee — blocking them was explicitly rejected, so this asserts
+    both halves; a bare ``console_only()`` on all five would satisfy only one.
+    """
+    await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    await b5_client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _UPDATED_YAML})
+
+    viewer = {
+        "Authorization": "Bearer "
+        + make_test_jwt(
+            tenant_id=_DEFAULT_TENANT, subject="viewer-user", roles=(Role.VIEWER.value,)
+        )
+    }
+
+    denied = await b5_client.post(
+        "/v1/agents/code-reviewer/1.0.0/revisions/1/rollback", headers=viewer
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["message"] == "principal lacks required role"
+
+    # The rollback really did not happen — a 403 that still writes would be
+    # worse than no gate at all.
+    listing = await b5_client.get("/v1/agents/code-reviewer/1.0.0/revisions")
+    assert [i["revision"] for i in listing.json()["data"]["items"]] == [2, 1]
+
+    # Same VIEWER, the reads that stay open.
+    for path in (
+        "/v1/agents",
+        "/v1/agents/code-reviewer/1.0.0/revisions",
+        "/v1/agents/code-reviewer/1.0.0/revisions/1",
+        "/v1/agents/code-reviewer/1.0.0/users",
+    ):
+        readable = await b5_client.get(path, headers=viewer)
+        assert readable.status_code == 200, f"{path} -> {readable.status_code} {readable.text}"
+
+    # And a role that does hold ``manifest:write`` still rolls back.
+    allowed = await b5_client.post("/v1/agents/code-reviewer/1.0.0/revisions/1/rollback")
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["data"]["rolled_back_to"] == 1
 
 
 # ---------------------------------------------------------------------------
