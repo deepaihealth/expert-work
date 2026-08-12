@@ -15,6 +15,13 @@ def test_new_fields_default_to_none() -> None:
 def test_new_fields_round_trip() -> None:
     now = datetime.now(UTC)
     rid = uuid4()
-    turn = MessageTurn(seq=1, role="assistant", content="答案", channel="final", created_at=now, run_id=rid)
+    turn = MessageTurn(
+        seq=1,
+        role="assistant",
+        content="答案",
+        channel="final",
+        created_at=now,
+        run_id=rid,
+    )
     assert turn.created_at == now
     assert turn.run_id == rid
