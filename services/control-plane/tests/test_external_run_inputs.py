@@ -119,6 +119,7 @@ class _ExternalCtx:
     app: Any
     tenant_id: UUID
     client: AsyncClient
+    run_store: InMemoryRunStore
 
 
 @pytest.fixture
@@ -154,7 +155,7 @@ async def _external_ctx() -> AsyncIterator[_ExternalCtx]:
         base_url="http://cp.test",
         headers={"Authorization": f"Bearer {jwt}"},
     ) as client:
-        yield _ExternalCtx(app=app, tenant_id=tenant_id, client=client)
+        yield _ExternalCtx(app=app, tenant_id=tenant_id, client=client, run_store=run_store)
 
 
 @pytest.fixture
@@ -179,12 +180,27 @@ async def jinja_agent(_external_ctx: _ExternalCtx) -> _JinjaAgent:
 
 
 @pytest.mark.asyncio
-async def test_inputs_reaches_prompt_render(external_client, jinja_agent) -> None:
+async def test_inputs_reaches_prompt_render(
+    external_client: AsyncClient, jinja_agent: _JinjaAgent, _external_ctx: _ExternalCtx
+) -> None:
     resp = await external_client.post(
         f"/v1/agents/{jinja_agent.code}/runs",
         json={"user_id": "u1", "input": "hi", "mode": "queue", "inputs": {"lang": "zh"}},
     )
     assert resp.status_code == 202
+
+    # 202 alone doesn't prove ``inputs`` reached anything — queue mode
+    # (``runs.py:830-850``) only persists ``enqueued_input`` synchronously;
+    # ``render_system_prompt`` runs later, in the queue worker, out of this
+    # request/response cycle. Read the persisted run back and assert the
+    # external ``inputs`` actually landed in ``enqueued_input`` — the exact
+    # dict the worker will hand to ``build_run_graph_input`` /
+    # ``render_system_prompt`` when it claims this run.
+    run_id = UUID(resp.json()["run_id"])
+    run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert run is not None
+    assert run.enqueued_input is not None
+    assert run.enqueued_input["inputs"] == {"lang": "zh"}
 
 
 @pytest.mark.asyncio
