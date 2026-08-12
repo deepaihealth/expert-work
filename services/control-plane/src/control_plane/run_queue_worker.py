@@ -269,6 +269,7 @@ class RunQueueWorker:
                 image_refs=list(payload.get("image_refs") or []),
                 untrusted_content=payload.get("untrusted_content"),
                 inputs=payload.get("inputs") or {},
+                run_id=run.run_id,
             )
 
             # Adopt the durable run into THIS instance's registry (no new

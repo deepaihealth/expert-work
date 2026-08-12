@@ -37,6 +37,7 @@ from control_plane.uplift.threat_metrics import (
     record_threat_scan,
     record_trigger_blocked,
 )
+from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import current_trace_id_hex, expert_work_counter
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.persistence import ApprovalStore, ThreadMetaStore, TriggerStore
@@ -253,7 +254,10 @@ async def fire_trigger(
     graph_input = {
         "messages": [
             SystemMessage(content=built.system_prompt),
-            HumanMessage(content=seed_text),
+            # P2 块 2 — stamp with the caller-supplied fire time, not a fresh
+            # ``datetime.now(UTC)`` read (``now`` already *is* the fire time;
+            # see the callers in scheduler.py / api/triggers.py).
+            stamp_message(HumanMessage(content=seed_text), run_id=str(run_id), now=now),
         ],
         "step_count": 0,
         "max_steps": built.max_steps,
