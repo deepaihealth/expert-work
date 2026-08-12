@@ -26,6 +26,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import String, cast, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import AgentRunRow, RunEventRow, ThreadMetaRow
@@ -41,6 +42,57 @@ from expert_work.runtime.runs.schemas import (
 #: Terminal run statuses that count as a conversation-level failure signal.
 _FAILED_RUN_VALUES: frozenset[str] = frozenset({RunStatus.ERROR.value, RunStatus.TIMEOUT.value})
 _PENDING_RUN_VALUES: frozenset[str] = frozenset({RunStatus.PAUSED.value})
+
+#: External-API-v1 P2 block 1-C — the ``agent_run`` partial unique index
+#: name. Must match ``0145_agent_run_idempotency``'s ``_INDEX`` and
+#: ``AgentRunRow.__table_args__`` verbatim: the SQL backend's ``create``
+#: recognises a conflict by matching this string against the failed
+#: constraint's name.
+_IDEMPOTENCY_INDEX_NAME = "uq_agent_run_tenant_idempotency_key"
+#: Quoted the way Postgres embeds a constraint name in its error text
+#: (``duplicate key value violates unique constraint "<name>"``).
+_IDEMPOTENCY_INDEX_QUOTED = f'"{_IDEMPOTENCY_INDEX_NAME}"'
+
+
+class RunIdempotencyConflict(Exception):  # noqa: N818 -- required name, External-API-v1 P2 interface
+    """A run already exists for this ``(tenant_id, idempotency_key)``.
+
+    Raised by :meth:`RunStore.create` when the caller's ``Idempotency-Key``
+    collides with an existing row under the same tenant. The partial unique
+    index on ``agent_run`` (migration 0145) is what makes "claim the key"
+    and "create the run row" the same atomic insert — there is no separate
+    key table, so this can only ever be raised from ``create`` itself, never
+    from a preceding lookup (which would leave a claim-without-a-run orphan
+    on a losing race).
+    """
+
+    def __init__(self, *, tenant_id: UUID, idempotency_key: str) -> None:
+        super().__init__(
+            f"agent_run idempotency conflict: tenant_id={tenant_id} "
+            f"idempotency_key={idempotency_key!r}"
+        )
+        self.tenant_id = tenant_id
+        self.idempotency_key = idempotency_key
+
+
+def _is_idempotency_conflict(exc: IntegrityError) -> bool:
+    """``True`` iff ``exc`` came from the idempotency partial unique index.
+
+    Distinguishes it from any other ``IntegrityError`` the insert could
+    raise (e.g. a ``run_id`` primary-key collision) so only the former
+    becomes :class:`RunIdempotencyConflict`.
+
+    SQLAlchemy's asyncpg dialect only forwards ``sqlstate`` from the
+    original driver error onto ``exc.orig`` (see
+    ``AsyncAdapt_asyncpg_dbapi._handle_exception``) — no structured
+    ``constraint_name`` survives the translation, unlike psycopg. The
+    constraint name is still in the error text Postgres sends (``duplicate
+    key value violates unique constraint "<name>"``), so this matches it
+    there, quoted the same way Postgres quotes it — specific enough to
+    tell this partial index apart from any other ``UniqueViolation``
+    (e.g. the ``run_id`` primary key, ``agent_run_pkey``).
+    """
+    return _IDEMPOTENCY_INDEX_QUOTED in str(exc.orig)
 
 
 def _only_status_values(only: Literal["failed", "pending"] | None) -> frozenset[str] | None:
@@ -72,6 +124,16 @@ class RunStore(abc.ABC):
         ``run_id`` is the primary key — a second ``create`` for the
         same id is a programming error and the SQL backend's primary
         key surfaces it.
+
+        External-API-v1 P2 block 1-C — when ``info.idempotency_key`` is not
+        ``None`` and another row already exists for ``(tenant_id,
+        idempotency_key)``, raises :class:`RunIdempotencyConflict` instead
+        of inserting. The partial unique index backing this is on
+        ``agent_run`` itself, so "claim the key" and "create the run row"
+        are the same atomic insert — a caller must never implement this as
+        a separate lookup-then-create (that leaves an orphaned claim on a
+        losing race). ``idempotency_key=None`` never conflicts — any number
+        of such rows can coexist.
         """
 
     @abc.abstractmethod
@@ -141,6 +203,17 @@ class RunStore(abc.ABC):
 
         ``None`` (never raising) on a cross-tenant probe so callers can
         turn it straight into a 404 that hides existence.
+        """
+
+    @abc.abstractmethod
+    async def find_by_idempotency_key(self, *, tenant_id: UUID, key: str) -> RunInfo | None:
+        """Return the run claimed by ``(tenant_id, key)``, or ``None``.
+
+        External-API-v1 P2 block 1-C — the read-path companion to
+        :meth:`create`'s conflict check: a caller that catches
+        :class:`RunIdempotencyConflict` calls this to fetch the run the
+        *first* request created, so a retried request returns the original
+        run instead of erroring.
         """
 
     @abc.abstractmethod
@@ -452,6 +525,15 @@ class InMemoryRunStore(RunStore):
         if info.run_id in self._rows:
             msg = f"run row already exists for run {info.run_id}"
             raise ValueError(msg)
+        # Same predicate as the SQL partial unique index — byte-identical:
+        # ``(tenant_id, idempotency_key)`` collides only when the key is
+        # not ``None``.
+        if info.idempotency_key is not None:
+            for row in self._rows.values():
+                if row.tenant_id == info.tenant_id and row.idempotency_key == info.idempotency_key:
+                    raise RunIdempotencyConflict(
+                        tenant_id=info.tenant_id, idempotency_key=info.idempotency_key
+                    )
         self._rows[info.run_id] = info
 
     async def set_status(
@@ -516,6 +598,12 @@ class InMemoryRunStore(RunStore):
         if row is None or row.tenant_id != tenant_id:
             return None
         return row
+
+    async def find_by_idempotency_key(self, *, tenant_id: UUID, key: str) -> RunInfo | None:
+        for row in self._rows.values():
+            if row.tenant_id == tenant_id and row.idempotency_key == key:
+                return row
+        return None
 
     async def list_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> list[RunInfo]:
         rows = [
@@ -831,6 +919,8 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         heartbeat_at=row.heartbeat_at,
         reclaim_count=row.reclaim_count,
         enqueued_input=row.enqueued_input,
+        idempotency_key=row.idempotency_key,
+        request_digest=row.request_digest,
     )
 
 
@@ -861,9 +951,21 @@ class SqlRunStore(RunStore):
                     heartbeat_at=info.heartbeat_at,
                     reclaim_count=info.reclaim_count,
                     enqueued_input=info.enqueued_input,
+                    idempotency_key=info.idempotency_key,
+                    request_digest=info.request_digest,
                 )
             )
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if _is_idempotency_conflict(exc):
+                    # The partial unique index only fires on a non-NULL key.
+                    assert info.idempotency_key is not None  # noqa: S101
+                    raise RunIdempotencyConflict(
+                        tenant_id=info.tenant_id, idempotency_key=info.idempotency_key
+                    ) from exc
+                raise
 
     async def set_status(
         self,
@@ -944,6 +1046,18 @@ class SqlRunStore(RunStore):
                     select(AgentRunRow).where(
                         AgentRunRow.id == run_id,
                         AgentRunRow.tenant_id == tenant_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        return _row_to_dto(row) if row is not None else None
+
+    async def find_by_idempotency_key(self, *, tenant_id: UUID, key: str) -> RunInfo | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(AgentRunRow).where(
+                        AgentRunRow.tenant_id == tenant_id,
+                        AgentRunRow.idempotency_key == key,
                     )
                 )
             ).scalar_one_or_none()

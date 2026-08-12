@@ -61,6 +61,14 @@ class AgentRunRow(Base):
     # and execute it. NULL for synchronous (SSE) runs and once a queued run is
     # claimed (the input then lives in the checkpoint / event log).
     enqueued_input: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # External-API-v1 P2 block 1-C (migration 0145) — third-party retry
+    # dedup. ``idempotency_key`` is the caller's ``Idempotency-Key`` header;
+    # ``request_digest`` is a hash of the request body so a *reused* key with
+    # a *different* body can be told apart from a genuine retry. Both NULL
+    # for runs created without the header (the common case) — the partial
+    # unique index below only ever fires on the non-NULL rows.
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(f"status IN {_STATUS_VALUES}", name="agent_run_status_valid"),
@@ -103,5 +111,17 @@ class AgentRunRow(Base):
             "user_id",
             text("created_at DESC"),
             postgresql_where=text("user_id IS NOT NULL"),
+        ),
+        # External-API-v1 P2 block 1-C (migration 0145) — the idempotency
+        # dedup key. Partial (only non-NULL keys) so runs without an
+        # ``Idempotency-Key`` header never collide; name must match
+        # ``0145_agent_run_idempotency``'s ``_INDEX`` verbatim — the SQL
+        # store's conflict detection matches on this constraint name.
+        Index(
+            "uq_agent_run_tenant_idempotency_key",
+            "tenant_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
         ),
     )
