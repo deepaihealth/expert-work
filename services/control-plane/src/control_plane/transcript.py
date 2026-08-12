@@ -32,36 +32,13 @@ from control_plane.api._session_title import message_text
 from expert_work.persistence import MessageTurn
 
 
-async def read_turns(
-    checkpointer: BaseCheckpointSaver[Any],
-    thread_id: UUID,
-    *,
-    include_hidden: bool = True,
-) -> list[MessageTurn]:
-    """Read a thread's user/assistant text turns off its durable checkpoint.
+def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> list[MessageTurn]:
+    """把检查点 ``messages`` 通道的原始消息抽成用户/助手文本轮次。
 
-    Raises on checkpointer failure — callers pick their own degradation
-    (the endpoint returns an empty transcript; the sweep skips the thread
-    and retries next cycle).
-
-    ``include_hidden`` (default ``True``) keeps the extraction *faithful*.
-    RT-2 PR-4 (RT-ADR-9) marks orchestrator-authored scaffolding persisted
-    into the checkpoint — e.g. the CM-1 ``<recovery-advisory>`` ``HumanMessage``
-    — with ``expert_work_hide_from_ui``. That scaffolding must stay in the durable
-    record, the search/audit mirror (``TranscriptMirrorSweep``) and the
-    cross-tenant audit drill-in, so faithful is the *safe default*: a new
-    persistence/audit caller that forgets the flag can never silently drop
-    content from the audited record. Only the UI bubble view opts out
-    (``include_hidden=False``) so scaffolding doesn't render as a turn — the
-    raw record still carries it and the model always sees it in-prompt. This
-    mirrors deer-flow, which reads the checkpoint faithfully and applies the
-    ``hide_from_ui`` visibility filter only at its UI-serving router.
+    从 :func:`read_turns` 拆出的纯函数(P2)。拆的目的是让「对外消息列表」
+    与「会话 message_count」共用同一个定义 —— 镜像表那摊语义债的根因正是
+    两套定义各写各的然后漂了。任何一侧改口径,另一侧自动跟随。
     """
-    config: RunnableConfig = {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
-    tup = await checkpointer.aget_tuple(config)
-    if tup is None:
-        return []
-    raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
     # Each row records whether IT opens a new segment, decided purely from its
     # own kwargs — never from list position. That keeps "channel" independent
     # of ``include_hidden`` (a hidden feedback row filtered out of the UI view
@@ -72,7 +49,7 @@ async def read_turns(
     # OWN segment instead of being appended onto — and stealing "final" from —
     # the user's real answer.
     collected: list[tuple[int, str, str, bool, bool]] = []
-    for seq, m in enumerate(raw):
+    for seq, m in enumerate(raw_messages):
         mtype = getattr(m, "type", None)
         if mtype not in ("human", "ai"):
             continue
@@ -103,4 +80,37 @@ async def read_turns(
     return out
 
 
-__all__ = ["read_turns"]
+async def read_turns(
+    checkpointer: BaseCheckpointSaver[Any],
+    thread_id: UUID,
+    *,
+    include_hidden: bool = True,
+) -> list[MessageTurn]:
+    """Read a thread's user/assistant text turns off its durable checkpoint.
+
+    Raises on checkpointer failure — callers pick their own degradation
+    (the endpoint returns an empty transcript; the sweep skips the thread
+    and retries next cycle).
+
+    ``include_hidden`` (default ``True``) keeps the extraction *faithful*.
+    RT-2 PR-4 (RT-ADR-9) marks orchestrator-authored scaffolding persisted
+    into the checkpoint — e.g. the CM-1 ``<recovery-advisory>`` ``HumanMessage``
+    — with ``expert_work_hide_from_ui``. That scaffolding must stay in the durable
+    record, the search/audit mirror (``TranscriptMirrorSweep``) and the
+    cross-tenant audit drill-in, so faithful is the *safe default*: a new
+    persistence/audit caller that forgets the flag can never silently drop
+    content from the audited record. Only the UI bubble view opts out
+    (``include_hidden=False``) so scaffolding doesn't render as a turn — the
+    raw record still carries it and the model always sees it in-prompt. This
+    mirrors deer-flow, which reads the checkpoint faithfully and applies the
+    ``hide_from_ui`` visibility filter only at its UI-serving router.
+    """
+    config: RunnableConfig = {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
+    tup = await checkpointer.aget_tuple(config)
+    if tup is None:
+        return []
+    raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
+    return extract_turns(raw, include_hidden=include_hidden)
+
+
+__all__ = ["extract_turns", "read_turns"]
