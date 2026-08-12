@@ -39,6 +39,7 @@ def _row_to_meta(row: ThreadMetaRow) -> ThreadMeta:
         title=row.title,
         agent_name=row.agent_name,
         agent_version=row.agent_version,
+        message_count=row.message_count,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -114,6 +115,7 @@ class SqlThreadMetaStore(ThreadMetaStore):
             status=ThreadStatus.ACTIVE.value,
             agent_name=agent_name,
             agent_version=agent_version,
+            message_count=0,
             created_at=now,
             updated_at=now,
         )
@@ -404,6 +406,26 @@ class SqlThreadMetaStore(ThreadMetaStore):
                 ThreadMetaRow.tenant_id == tenant_id,
             )
             .values(title=title, updated_at=datetime.now(UTC))
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def update_message_count(
+        self,
+        thread_id: UUID,
+        count: int,
+        *,
+        tenant_id: UUID,
+    ) -> bool:
+        stmt = (
+            update(ThreadMetaRow)
+            .where(
+                ThreadMetaRow.thread_id == thread_id,
+                ThreadMetaRow.tenant_id == tenant_id,
+            )
+            .values(message_count=count, updated_at=datetime.now(UTC))
         )
         async with self._sf() as session:
             result = await session.execute(stmt)

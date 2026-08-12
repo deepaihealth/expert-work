@@ -224,6 +224,23 @@ class ThreadMetaStore(abc.ABC):
         """Update status; returns True if a row matched the tenant filter."""
 
     @abc.abstractmethod
+    async def update_message_count(
+        self,
+        thread_id: UUID,
+        count: int,
+        *,
+        tenant_id: UUID,
+    ) -> bool:
+        """Set the third-party-visible message count; returns True if a row
+        matched the tenant filter.
+
+        ``count`` is the ``include_hidden=False`` message tally, recomputed
+        by run finalization. The column starts ``NULL`` ("not yet computed")
+        for pre-existing rows — this method is the only writer, and callers
+        should never write ``0`` to mean "not yet computed".
+        """
+
+    @abc.abstractmethod
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         """``True`` iff the thread exists and belongs to ``tenant_id``."""
 
