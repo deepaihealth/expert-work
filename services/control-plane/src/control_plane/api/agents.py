@@ -32,7 +32,7 @@ from control_plane.api._external import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
+from control_plane.api.runs import MAX_RUN_IMAGE_REFS, MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.manifest import (
@@ -967,6 +967,16 @@ def build_agents_router() -> APIRouter:
             *payload.image_refs,
             *(f.upload_id for f in payload.files if f.type == "image"),
         ]
+        # RunRequest is hand-constructed below (not the FastAPI request body),
+        # so a merged list past its own image_refs max_length never reaches
+        # the RequestValidationError → 422 path — it would raise an uncaught
+        # pydantic ValidationError (500) instead. Pre-check explicitly.
+        if len(image_refs) > MAX_RUN_IMAGE_REFS:
+            return _envelope_error(
+                "TOO_MANY_IMAGE_REFS",
+                f"files[] 与 image_refs 合计不能超过 {MAX_RUN_IMAGE_REFS} 张图片",
+                422,
+            )
         run_payload = RunRequest(
             input=payload.input,
             mode=payload.mode,

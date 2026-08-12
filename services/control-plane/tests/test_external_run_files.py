@@ -384,3 +384,49 @@ async def test_files_array_over_64_is_422(
         json={"user_id": "u1", "input": "x", "mode": "queue", "files": files},
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_merged_image_refs_over_limit_is_422_not_500(
+    external_client: AsyncClient,
+    vision_agent: _VisionAgent,
+    uploaded_image: _BoundImage,
+    _external_ctx: _ExternalCtx,
+) -> None:
+    """``image_refs`` (legacy) and ``files[]`` each individually stay within
+    their own pydantic ``max_length=64`` — but merged, they can exceed
+    ``RunRequest.image_refs``'s own ``max_length=64``. That merge happens by
+    hand-constructing ``RunRequest`` outside FastAPI's request-body
+    validation path, so an unguarded overflow raises an uncaught pydantic
+    ``ValidationError`` (500) rather than a clean 422. 60 legacy refs (<=64)
+    + 10 file image entries (<=64) = 70 (>64) reproduces exactly that gap.
+    """
+    legacy_refs = [
+        ImageRef(
+            tenant_id=_external_ctx.tenant_id,
+            thread_id=uploaded_image.session_id,
+            image_id=uuid4(),
+            ext=".png",
+        ).to_uri()
+        for _ in range(60)
+    ]
+    file_entries = [
+        {"type": "image", "transfer_method": "local_file", "upload_id": uploaded_image.uri}
+        for _ in range(10)
+    ]
+    resp = await external_client.post(
+        f"/v1/agents/{vision_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(uploaded_image.session_id),
+            "input": "x",
+            "mode": "queue",
+            "image_refs": legacy_refs,
+            "files": file_entries,
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"]
