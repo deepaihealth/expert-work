@@ -1,8 +1,11 @@
-"""Idempotency-Key —— 对外 run 端点判定(queue 模式,External-API-v1 P2-a Task 13)。
+"""Idempotency-Key —— 对外 run 端点判定(External-API-v1 P2-a Task 13 queue 模式 +
+Task 14 stream 模式重放)。
 
-同键同体(含 agent_code)返回原 run;同键异体、或跨 agent 复用同键,一律 422;
-stream 模式带 key 一律 422(裁定 2 —— "支持"是下一个 task 的事,静默忽略比
-明确拒绝更危险)。并发单赢家的"重查返回赢家"分支用一个确定性触发冲突的
+同键同体(含 agent_code)返回原 run;同键异体、或跨 agent 复用同键,一律 422。
+Task 13 曾让 stream 模式带 key 一律 422(裁定 2 —— "支持"是下一个 task 的事);
+Task 14 放宽了这条 422 —— stream 模式命中同键同体时,重放原 run 的事件流
+(``build_events_response``,与 ``GET .../runs/{id}/events`` 同一份实现),
+不再拒绝。并发单赢家的"重查返回赢家"分支用一个确定性触发冲突的
 ``RunStore`` 包装类覆盖,而不是伪装成真并发的 ``asyncio.gather``——见文件
 末尾那段测试前的注释,解释了为什么、以及真并发已经在哪里证过。
 
@@ -16,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,6 +27,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api.external_events import build_events_response
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -38,6 +42,7 @@ from expert_work.runtime.runs import (
     RunInfo,
     RunStatus,
 )
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
@@ -226,14 +231,13 @@ async def test_no_key_creates_distinct_runs(
 
 
 @pytest.mark.asyncio
-async def test_stream_mode_with_key_is_422(
+async def test_stream_mode_with_key_is_allowed(
     external_client: AsyncClient, plain_agent: _Agent
 ) -> None:
-    """Task 13 裁定 2 —— stream 模式返回的是 SSE 长连接,不是 {run_id} 信封;
-    "返回原 run" 在 stream 下意味着重放历史流,那是下一个 task 的事,本 task
-    不做。静默忽略幂等保证比明确拒绝更危险(第三方以为有重复保护,实际
-    没有,重试就是重复扣费/重复执行),所以本 task 对 stream + key 一律
-    422,不是放行、也不是悄悄忽略 header。
+    """Task 14 —— 放宽 Task 13 裁定 2 的 422。这条测试原来钉住"stream + key
+    一律 422";现在钉住反面:stream 模式带一个全新 key 的首次请求正常执行
+    (200,真正的 SSE 流,不是错误信封),不静默忽略 header,也不拒绝。同一
+    条测试改断言而不是删掉,否则"stream + key 走到哪条路径"会失去覆盖。
     """
     url = f"/v1/agents/{plain_agent.code}/runs"
     resp = await external_client.post(
@@ -241,8 +245,9 @@ async def test_stream_mode_with_key_is_422(
         json={"user_id": "u1", "input": "hi", "mode": "stream"},
         headers={"Idempotency-Key": "order-8899"},
     )
-    assert resp.status_code == 422, resp.text
-    assert resp.json()["error"]["code"] == "IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM"
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert "X-Expert-Work-Run-Id" in resp.headers
 
 
 @pytest.mark.asyncio
@@ -390,3 +395,113 @@ async def test_endpoint_catches_store_conflict_and_returns_winner() -> None:
     assert resp.status_code == 202, resp.text
     assert resp.json()["run_id"] == str(winner_run_id)
     assert resp.json()["thread_id"] == str(winner_thread_id)
+
+
+# ---------------------------------------------------------------------------
+# Task 14 —— stream 模式重放。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_attaches_to_original_run(
+    external_client: AsyncClient, plain_agent: _Agent
+) -> None:
+    """Brief Step 1 给定的场景——同键同体的第二次 stream 请求拿回同一个
+    run_id,而不是新建一个。``X-Expert-Work-Stream-Mode`` 接受 replay 或
+    live 两者之一:stub LLM 几乎瞬时执行完,第一次请求的响应体被 httpx 排空
+    时 run 是否已转终态取决于调度时序,两种结果都是"重放成功"的合法证据。
+    """
+    url = f"/v1/agents/{plain_agent.code}/runs"
+    h = {"Idempotency-Key": "stream-1"}
+    body = {"user_id": "u1", "input": "你好", "mode": "stream"}
+    first = await external_client.post(url, json=body, headers=h)
+    assert first.status_code == 200, first.text
+    original = first.headers["X-Expert-Work-Run-Id"]
+    second = await external_client.post(url, json=body, headers=h)
+    assert second.status_code == 200, second.text
+    assert second.headers["X-Expert-Work-Run-Id"] == original
+    assert second.headers["X-Expert-Work-Stream-Mode"] in {"replay", "live"}
+
+
+@pytest.mark.asyncio
+async def test_stream_first_request_persists_idempotency_key(
+    _external_ctx: _ExternalCtx, plain_agent: _Agent
+) -> None:
+    """裁定 1 的自证——stream 模式的第一次请求必须真的把
+    ``idempotency_key`` / ``request_digest`` 落到 run 行上,不能只靠"第二次
+    请求返回同一个 run_id"这种间接证据(那也可能是别的 bug 凑巧撞对)。直接
+    查 ``run_store``,而不是看 HTTP 响应。
+    """
+    url = f"/v1/agents/{plain_agent.code}/runs"
+    h = {"Idempotency-Key": "stream-persist-1"}
+    body = {"user_id": "u1", "input": "你好", "mode": "stream"}
+    resp = await _external_ctx.client.post(url, json=body, headers=h)
+    assert resp.status_code == 200, resp.text
+    run_id = UUID(resp.headers["X-Expert-Work-Run-Id"])
+    stored = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert stored is not None
+    assert stored.idempotency_key == "stream-persist-1"
+    assert stored.request_digest is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_replay_without_event_store_still_streams(
+    _external_ctx: _ExternalCtx, plain_agent: _Agent
+) -> None:
+    """裁定 4 —— 核实过 ``build_event_producer`` 对 ``event_store=None`` 早已
+    优雅退化(终态 run 只吐一个 end 帧,见 ``_run_event_stream.py`` 的
+    ``_stream_replay`` 文档字符串),不抛异常,所以不需要 brief 设想的那套
+    JSON 降级信封 / ``stream_unavailable`` 字段(那是没人要的复杂度)。这里
+    显式拔掉 ``app.state.run_event_store`` 复现"未配"的部署场景,证明重放
+    路径不会 500,而是仍然拿到一个合法的 200 SSE 响应,run_id 与首次请求一致。
+    """
+    _external_ctx.app.state.run_event_store = None
+    url = f"/v1/agents/{plain_agent.code}/runs"
+    h = {"Idempotency-Key": "stream-no-store-1"}
+    body = {"user_id": "u1", "input": "你好", "mode": "stream"}
+    first = await _external_ctx.client.post(url, json=body, headers=h)
+    assert first.status_code == 200, first.text
+    second = await _external_ctx.client.post(url, json=body, headers=h)
+    assert second.status_code == 200, second.text
+    assert second.headers["content-type"].startswith("text/event-stream")
+    assert second.headers["X-Expert-Work-Run-Id"] == first.headers["X-Expert-Work-Run-Id"]
+
+
+def test_build_events_response_is_terminal_reflects_run_status() -> None:
+    """裁定 5 自证(自证要求变异 3)——``build_events_response`` 里的
+    ``is_terminal`` 必须从传入 ``run.status`` 派生,不能写死成常量:写死为
+    ``True`` 会让非终态 run 也走 replay 分支(截断一条本该继续的直播流);
+    写死为 ``False`` 会让 ``test_external_events.py::
+    test_events_replays_a_terminal_run`` 的 ``X-Expert-Work-Stream-Mode ==
+    "replay"`` 断言翻红。直接调用函数、只看响应头,不排空 body —— 排空
+    live 分支的 body 会挂起等待一个永远不会发布事件的 run_id。
+    """
+    now = datetime.now(UTC)
+    running_run = RunInfo(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        thread_id=uuid4(),
+        user_id=None,
+        status=RunStatus.RUNNING,
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=False,
+        error=None,
+        created_at=now,
+        updated_at=now,
+        finished_at=None,
+    )
+    live_resp = build_events_response(
+        run=running_run,
+        event_store=InMemoryRunEventStore(),
+        stream_bridge=InMemoryStreamBridge(),
+    )
+    assert live_resp.headers["X-Expert-Work-Stream-Mode"] == "live"
+    assert live_resp.headers["X-Expert-Work-Run-Id"] == str(running_run.run_id)
+
+    terminal_run = replace(running_run, status=RunStatus.SUCCESS)
+    replay_resp = build_events_response(
+        run=terminal_run,
+        event_store=InMemoryRunEventStore(),
+        stream_bridge=InMemoryStreamBridge(),
+    )
+    assert replay_resp.headers["X-Expert-Work-Stream-Mode"] == "replay"

@@ -30,8 +30,9 @@ from control_plane.runtime import AgentRuntime
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import Principal
-from expert_work.runtime.runs import RunEventStore, RunStore
+from expert_work.runtime.runs import RunEventStore, RunInfo, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
+from expert_work.runtime.stream_bridge import StreamBridge
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:
@@ -49,6 +50,54 @@ def _get_run_event_store(request: Request) -> RunEventStore | None:
 
 def _get_runtime(request: Request) -> AgentRuntime:
     return request.app.state.agent_runtime  # type: ignore[no-any-return]
+
+
+def build_events_response(
+    *,
+    run: RunInfo,
+    event_store: RunEventStore | None,
+    stream_bridge: StreamBridge,
+    since_seq: int | None = None,
+) -> StreamingResponse:
+    """Build the SSE ``StreamingResponse`` for one run — replay or live-attach.
+
+    External-API-v1 P2-a Task 14 — extracted out of ``stream_run_events``'s
+    endpoint body (below) so the stream-mode idempotency-replay branch in
+    ``agents.py`` (a retried ``POST .../runs`` call that hit an existing
+    ``Idempotency-Key`` bound to a stream-mode run) can hand the client the
+    exact same wire format this endpoint already produces, instead of
+    re-deriving a second copy that could silently drift.
+
+    The ownership gate (``load_owned_run``) is deliberately NOT part of this
+    extraction — a replay caller already knows the run belongs to it (it just
+    looked it up via the key under its own tenant), so re-running that check
+    here would be redundant, not extra safety. Callers pass in the already-
+    resolved ``run: RunInfo`` (from ``load_owned_run`` or ``RunStore.
+    find_by_idempotency_key`` — both return the same type).
+
+    ``is_terminal`` is derived from ``run.status`` inside this function
+    (not accepted as a separate bool parameter) so there is exactly one
+    place a caller could get it wrong.
+    """
+    is_terminal = run.status in TERMINAL_RUN_STATUSES
+    producer = build_event_producer(
+        run_id=run.run_id,
+        is_terminal=is_terminal,
+        event_store=event_store,
+        stream_bridge=stream_bridge,
+        since_seq=since_seq,
+        scope=None,
+    )
+    return StreamingResponse(
+        producer,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Expert-Work-Run-Id": str(run.run_id),
+            "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
+        },
+    )
 
 
 def build_external_events_router() -> APIRouter:
@@ -91,24 +140,11 @@ def build_external_events_router() -> APIRouter:
         except ExternalScopeError as exc:
             return external_error(exc)
 
-        is_terminal = run.status in TERMINAL_RUN_STATUSES
-        producer = build_event_producer(
-            run_id=run_id,
-            is_terminal=is_terminal,
+        return build_events_response(
+            run=run,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             since_seq=since_seq,
-            scope=None,
-        )
-        return StreamingResponse(
-            producer,
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Expert-Work-Run-Id": str(run_id),
-                "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
-            },
         )
 
     return router

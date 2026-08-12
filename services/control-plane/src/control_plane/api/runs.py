@@ -822,14 +822,16 @@ async def spawn_run(
     OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
     acts for one.
 
-    ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13) are
-    forwarded to :meth:`RunManager.enqueue` on the ``mode="queue"`` branch only —
-    the caller (``agents.py``'s external run endpoint) has already rejected a
-    non-``queue`` request carrying a key with ``422
-    IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` before this function is ever called, so
-    the stream branch below never sees a non-``None`` key in practice. Both
-    default to ``None`` — the internal ``trigger_run`` caller never passes them,
-    so its behaviour is unchanged."""
+    ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13, Task
+    14) are forwarded to :meth:`RunManager.enqueue` on the ``mode="queue"``
+    branch and to :meth:`RunManager.create` on the ``mode="stream"`` branch —
+    both persist the key onto the ``agent_run`` row so a retried call can find
+    it via ``RunStore.find_by_idempotency_key`` (the caller, ``agents.py``'s
+    external run endpoint, does that lookup and — Task 14 — replays the
+    original run's event stream on a stream-mode hit instead of calling this
+    function again). Both parameters default to ``None`` — the internal
+    ``trigger_run`` caller never passes them, so its behaviour (both branches)
+    is unchanged."""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -906,6 +908,8 @@ async def spawn_run(
         user_id=effective_user_id,
         is_resume=bool(prior_runs),
         trace_id=trace_id,
+        idempotency_key=idempotency_key,
+        request_digest=request_digest,
     )
     run_record.bound_distilled_skills = built.bound_distilled_skills
     graph_input = build_run_graph_input(
