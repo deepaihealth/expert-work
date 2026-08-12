@@ -27,6 +27,7 @@ from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane.api.runs import MAX_RUN_INPUT_KEYS, MAX_RUN_INPUT_VALUE_CHARS
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.runtime import AgentRuntime
@@ -62,6 +63,21 @@ _SPEC: dict[str, Any] = {
 
 def _spec() -> AgentSpec:
     return AgentSpec.model_validate(deepcopy(_SPEC))
+
+
+def _wide_spec(*, variable_count: int) -> AgentSpec:
+    """A jinja agent declaring ``variable_count`` optional variables
+    (``v0``..``v{n-1}``), so a boundary-legal ``inputs`` payload (exactly
+    ``MAX_RUN_INPUT_KEYS`` keys) can be sent to a *real* endpoint call and
+    reach the ``202`` response — every key it carries is declared, so
+    ``validate_prompt_inputs``'s "unknown input variable" check never fires
+    and the only thing under test is the 64-key bound itself."""
+    spec = deepcopy(_SPEC)
+    spec["metadata"]["name"] = "wide-jinja-bot"
+    spec["spec"]["system_prompt"]["variables"] = [
+        {"name": f"v{i}", "required": False} for i in range(variable_count)
+    ]
+    return AgentSpec.model_validate(spec)
 
 
 def _build_settings() -> Settings:
@@ -179,6 +195,17 @@ async def jinja_agent(_external_ctx: _ExternalCtx) -> _JinjaAgent:
     return _JinjaAgent(code="jinja-bot")
 
 
+@pytest.fixture
+async def wide_jinja_agent(_external_ctx: _ExternalCtx) -> _JinjaAgent:
+    await _external_ctx.app.state.agent_spec_repo.create(
+        tenant_id=_external_ctx.tenant_id,
+        spec=_wide_spec(variable_count=MAX_RUN_INPUT_KEYS),
+        spec_sha256="c" * 64,
+        created_by="seed",
+    )
+    return _JinjaAgent(code="wide-jinja-bot")
+
+
 @pytest.mark.asyncio
 async def test_inputs_reaches_prompt_render(
     external_client: AsyncClient, jinja_agent: _JinjaAgent, _external_ctx: _ExternalCtx
@@ -210,3 +237,99 @@ async def test_undeclared_input_key_is_422(external_client, jinja_agent) -> None
         json={"user_id": "u1", "input": "hi", "mode": "queue", "inputs": {"没声明的键": "x"}},
     )
     assert resp.status_code == 422
+
+
+# --- inputs bounds (64 keys / 8192 chars per str value) ---------------------
+#
+# ``ExternalRunRequest`` has no ``field_validator`` of its own for these two
+# bounds — ``run_agent_for_user`` (``agents.py``) hand-constructs the internal
+# ``RunRequest`` (whose ``_bound_inputs`` enforces them) off the FastAPI
+# request-body validation path, so an unguarded overflow used to raise an
+# uncaught pydantic ``ValidationError`` — an actual 500, not a 422 — before
+# the endpoint added its own pre-check mirroring ``TOO_MANY_IMAGE_REFS``.
+# These keys/values are chosen so ONLY the bound under test can produce a
+# 422 — either declared-and-optional (``wide_jinja_agent``'s ``v0..v63``) or
+# the ``jinja_agent`` fixture's single declared ``lang`` key — so a red
+# result unambiguously means the bound check itself is missing/wrong, not
+# an unrelated "unknown input variable" rejection.
+
+
+@pytest.mark.asyncio
+async def test_65_keys_is_422_too_many_input_keys(external_client, jinja_agent) -> None:
+    inputs = {f"k{i}": "x" for i in range(MAX_RUN_INPUT_KEYS + 1)}
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={"user_id": "u1", "input": "hi", "mode": "queue", "inputs": inputs},
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "TOO_MANY_INPUT_KEYS"
+
+
+@pytest.mark.asyncio
+async def test_input_value_over_8192_chars_is_422(external_client, jinja_agent) -> None:
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "hi",
+            "mode": "queue",
+            "inputs": {"lang": "x" * (MAX_RUN_INPUT_VALUE_CHARS + 1)},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INPUT_VALUE_TOO_LONG"
+
+
+@pytest.mark.asyncio
+async def test_exactly_64_keys_is_not_422(external_client, wide_jinja_agent) -> None:
+    """Boundary-legal: the bound is a strict ``>``, so exactly
+    ``MAX_RUN_INPUT_KEYS`` keys must be accepted, not rejected."""
+    inputs = {f"v{i}": "x" for i in range(MAX_RUN_INPUT_KEYS)}
+    resp = await external_client.post(
+        f"/v1/agents/{wide_jinja_agent.code}/runs",
+        json={"user_id": "u1", "input": "hi", "mode": "queue", "inputs": inputs},
+    )
+    assert resp.status_code != 422, resp.text
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.asyncio
+async def test_exactly_8192_chars_is_not_422(external_client, jinja_agent) -> None:
+    """Boundary-legal: the bound is a strict ``>``, so a value of exactly
+    ``MAX_RUN_INPUT_VALUE_CHARS`` characters must be accepted, not rejected."""
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "hi",
+            "mode": "queue",
+            "inputs": {"lang": "x" * MAX_RUN_INPUT_VALUE_CHARS},
+        },
+    )
+    assert resp.status_code != 422, resp.text
+    assert resp.status_code == 202, resp.text
+
+
+@pytest.mark.asyncio
+async def test_non_string_oversized_value_not_rejected_by_length(
+    external_client, jinja_agent
+) -> None:
+    """The length bound only applies to ``str`` values (existing behaviour,
+    preserved here) — a huge non-string value (a 20k-element array) must not
+    be rejected on length grounds."""
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "hi",
+            "mode": "queue",
+            "inputs": {"lang": list(range(20_000))},
+        },
+    )
+    assert resp.status_code == 202, resp.text

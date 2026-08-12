@@ -117,6 +117,21 @@ MAX_RUN_INPUT_CHARS: Final[int] = 65536
 #: uncaught pydantic ``ValidationError`` escape as a 500.
 MAX_RUN_IMAGE_REFS: Final[int] = 64
 
+#: Cap on ``RunRequest.inputs`` key count, enforced by ``_bound_inputs``
+#: below. Named for the same reason as ``MAX_RUN_IMAGE_REFS`` — the external
+#: run endpoint (``agents.py``) also hand-constructs ``RunRequest`` off the
+#: FastAPI request-body validation path and must pre-check this bound
+#: itself before that construction, so it imports this constant instead of
+#: re-declaring the literal (a second copy could silently drift).
+MAX_RUN_INPUT_KEYS: Final[int] = 64
+
+#: Cap on each ``str``-valued ``RunRequest.inputs`` entry's length, enforced
+#: by ``_bound_inputs`` below. Same sharing rationale as
+#: ``MAX_RUN_INPUT_KEYS``. Non-``str`` values (numbers, lists, nested
+#: objects) are not length-checked — only their count toward
+#: ``MAX_RUN_INPUT_KEYS`` matters.
+MAX_RUN_INPUT_VALUE_CHARS: Final[int] = 8192
+
 
 class RunRequest(BaseModel):
     """POST body. ``input`` is the user's prompt for this run;
@@ -155,12 +170,12 @@ class RunRequest(BaseModel):
     @field_validator("inputs")
     @classmethod
     def _bound_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if len(value) > 64:
-            msg = "too many input variables (max 64)"
+        if len(value) > MAX_RUN_INPUT_KEYS:
+            msg = f"too many input variables (max {MAX_RUN_INPUT_KEYS})"
             raise ValueError(msg)
         for key, val in value.items():
-            if isinstance(val, str) and len(val) > 8192:
-                msg = f"input '{key}' exceeds 8192 chars"
+            if isinstance(val, str) and len(val) > MAX_RUN_INPUT_VALUE_CHARS:
+                msg = f"input '{key}' exceeds {MAX_RUN_INPUT_VALUE_CHARS} chars"
                 raise ValueError(msg)
         return value
 

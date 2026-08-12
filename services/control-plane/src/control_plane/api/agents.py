@@ -38,7 +38,14 @@ from control_plane.api._idempotency import (
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
-from control_plane.api.runs import MAX_RUN_IMAGE_REFS, MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
+from control_plane.api.runs import (
+    MAX_RUN_IMAGE_REFS,
+    MAX_RUN_INPUT_CHARS,
+    MAX_RUN_INPUT_KEYS,
+    MAX_RUN_INPUT_VALUE_CHARS,
+    RunRequest,
+    spawn_run,
+)
 from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
@@ -531,8 +538,11 @@ class ExternalRunRequest(BaseModel):
     image_refs: list[str] = Field(default_factory=list, max_length=64)
     untrusted_content: list[str] = Field(default_factory=list, max_length=16)
     #: P2 —— 提示词模板变量,与内部 ``RunRequest.inputs`` 同语义(未声明键 422、
-    #: 必填缺失 422、64 键 / 单值 8192 字符上限)。校验在 ``spawn_run`` 内部由
-    #: ``validate_prompt_inputs`` 统一执行,此处不重复。
+    #: 必填缺失 422)。未声明键 / 必填缺失校验在 ``spawn_run`` 内部由
+    #: ``validate_prompt_inputs`` 统一执行,此处不重复;但 64 键 / 单值 8192
+    #: 字符这两条上限(``RunRequest._bound_inputs``)必须在这个端点里手工
+    #: 预检——见下方 ``run_agent_for_user`` 里 ``RunRequest`` 手工构造前的
+    #: 检查,原因同 ``TOO_MANY_IMAGE_REFS``。
     inputs: dict[str, Any] = Field(default_factory=dict)
     #: P2 块 1 —— 统一附件引用。``type == "image"`` 的条目合并进
     #: ``image_refs`` 交给 ``spawn_run`` 里现成的 ``_validate_image_refs``
@@ -1132,6 +1142,27 @@ def build_agents_router() -> APIRouter:
                 detail.get("message", "invalid file reference"),
                 exc.status_code,
             )
+
+        # RunRequest is hand-constructed below (not the FastAPI request
+        # body), so ``inputs`` past ``RunRequest._bound_inputs``'s own
+        # bounds never reaches the RequestValidationError → 422 path — it
+        # would raise an uncaught pydantic ValidationError (500) instead.
+        # Pre-check explicitly, same pattern as the ``image_refs`` check
+        # above. ``validate_prompt_inputs`` (called inside ``spawn_run``)
+        # covers unknown/missing-required keys but not these two bounds.
+        if len(payload.inputs) > MAX_RUN_INPUT_KEYS:
+            return _envelope_error(
+                "TOO_MANY_INPUT_KEYS",
+                f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键",
+                422,
+            )
+        for _input_key, _input_val in payload.inputs.items():
+            if isinstance(_input_val, str) and len(_input_val) > MAX_RUN_INPUT_VALUE_CHARS:
+                return _envelope_error(
+                    "INPUT_VALUE_TOO_LONG",
+                    f"inputs['{_input_key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
+                    422,
+                )
 
         run_payload = RunRequest(
             input=payload.input,

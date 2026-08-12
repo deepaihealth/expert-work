@@ -27,7 +27,7 @@ Content-Type: application/json
 
 ## `inputs` —— 提示词模板变量
 
-只对系统提示词开启了 Jinja 模板、并声明了变量的 Agent 有意义(在管理控制台配置)。三种情况都会 422:
+只对系统提示词开启了 Jinja 模板、并声明了变量的 Agent 有意义(在管理控制台配置)。除了下面这两条上限,还有三种情况会 422:
 
 - Agent 没声明任何模板变量,却传了非空 `inputs`。
 - `inputs` 里出现了 Agent 没声明过的键。
@@ -46,6 +46,19 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 ```
 
 **注意**:这三种 `inputs` 校验失败**不是** `{success, data, error}` 信封,而是 FastAPI 默认的裸 `{"detail": "..."}` 字符串——比如未声明键会是 `{"detail": "unknown input variable: <key>"}`。别假设这条路径上也能读到 `error.code`,细节见 [错误码与限流](./errors)。
+
+### 两条硬上限
+
+不管 Agent 声明了多少模板变量,`inputs` 本身还有两条硬上限,**这两条走统一信封**(与上面三种"裸 `detail`"形状不同):
+
+| 上限 | 超限时的 `error.code` |
+|---|---|
+| 键的数量最多 64 个(**正好 64 个合法**,第 65 个才拒) | `TOO_MANY_INPUT_KEYS` |
+| 单个字符串值最多 8192 字符(**正好 8192 字符合法**,第 8193 个字符才拒);只检查字符串值,数字/数组/对象类型的值不受此限 | `INPUT_VALUE_TOO_LONG` |
+
+```json
+{ "success": false, "data": null, "error": { "code": "TOO_MANY_INPUT_KEYS", "message": "inputs 最多 64 个键" } }
+```
 
 ## `files[]` —— 统一附件引用(图片 / 文档)
 

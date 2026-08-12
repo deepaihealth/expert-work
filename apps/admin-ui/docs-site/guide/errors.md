@@ -77,7 +77,7 @@
 { "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Input should be 'local_file'" } }
 ```
 
-同一类里还有两个更具体的业务码,同样走统一信封:
+同一类里还有六个更具体的业务码,同样走统一信封:
 
 | `code` | 什么情况 |
 |---|---|
@@ -85,14 +85,16 @@
 | `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张 |
 | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` 头去空白后是空字符串,或超过 255 字符 |
 | `IDEMPOTENCY_KEY_REUSED` | 同一个 `Idempotency-Key` 配了不同的请求体,或者配给了不同的 `agent_code` |
+| `TOO_MANY_INPUT_KEYS` | `inputs` 的键数量超过 64 个(正好 64 个合法) |
+| `INPUT_VALUE_TOO_LONG` | `inputs` 里某个字符串值超过 8192 字符(正好 8192 字符合法;只检查字符串值) |
 
-**第二类,`inputs`(提示词模板变量)校验失败——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
+**第二类,`inputs`(提示词模板变量)与 Agent 声明不匹配——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
 
 ```json
 { "detail": "unknown input variable: foo" }
 ```
 
-三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
+三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。**`inputs` 本身的两条硬上限(键数量 / 单值长度)不属于这一类**——那两条走上面第一类的统一信封(`TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG`)。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
 
 ## 429 —— 两种情况,含义不同
 
