@@ -27,6 +27,8 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api._idempotency import request_digest as compute_request_digest
+from control_plane.api.agents import ExternalRunRequest
 from control_plane.api.external_events import build_events_response
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -38,6 +40,7 @@ from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
     InMemoryRunStore,
+    RunEventRecord,
     RunIdempotencyConflict,
     RunInfo,
     RunStatus,
@@ -374,15 +377,33 @@ class _ConflictOnceRunStore(InMemoryRunStore):
 
 
 @pytest.mark.asyncio
-async def test_endpoint_catches_store_conflict_and_returns_winner() -> None:
+async def test_conflict_requery_same_digest_returns_winner() -> None:
     """The endpoint catches ``RunIdempotencyConflict`` out of ``spawn_run``
-    and returns the WINNER's run — not a 500, not the loser's own run_id."""
+    and returns the WINNER's run — not a 500, not the loser's own run_id —
+    when the loser's request genuinely matches the winner's fingerprint.
+
+    Security-review fix (Critical) —— this used to be
+    ``test_endpoint_catches_store_conflict_and_returns_winner``, and its
+    ``winner_info`` carried a placeholder ``request_digest =
+    "irrelevant-to-this-branch"`` that never matched anything — the digest
+    genuinely was irrelevant, because the endpoint's requery branch didn't
+    check it at all before handing the winner's run back to ANY caller
+    holding the same key, regardless of what that caller actually asked for.
+    That is the cross-tenant-user data leak the fix closes (see the comment
+    at the ``winner.request_digest != digest`` check in ``agents.py``). This
+    test is the fix's regression fence in the OTHER direction: a same-digest
+    loser — the genuine concurrent-retry case idempotency exists to serve —
+    must still get the winner's run, not a wrongly-tightened 422. The digest
+    below is computed for real from ``BODY`` (not a placeholder) so this
+    fence is honest.
+    """
     lifecycle = Lifecycle()
     lifecycle.mark_ready()
     tenant_id = uuid4()
     winner_run_id = uuid4()
     winner_thread_id = uuid4()
     now = datetime.now(UTC)
+    matching_digest = compute_request_digest(ExternalRunRequest(**BODY), agent_code="plain-bot")
     winner_info = RunInfo(
         run_id=winner_run_id,
         tenant_id=tenant_id,
@@ -396,7 +417,7 @@ async def test_endpoint_catches_store_conflict_and_returns_winner() -> None:
         updated_at=now,
         finished_at=None,
         idempotency_key="race-1",
-        request_digest="irrelevant-to-this-branch",
+        request_digest=matching_digest,
     )
     run_store = _ConflictOnceRunStore(conflict_key="race-1", winner_info=winner_info)
     run_event_store = InMemoryRunEventStore()
@@ -437,6 +458,175 @@ async def test_endpoint_catches_store_conflict_and_returns_winner() -> None:
     assert body["data"]["thread_id"] == str(winner_thread_id)
 
 
+@pytest.mark.asyncio
+async def test_conflict_requery_digest_mismatch_is_422_queue_mode() -> None:
+    """Security-review fix (Critical) —— cross-tenant-user data leak.
+
+    An attacker (any same-tenant ``session:write`` key holder) guesses a
+    victim's ``Idempotency-Key`` and races a request under it. If the
+    attacker's request LOSES the race (the victim's insert wins), the
+    endpoint used to hand the loser — the attacker — the winner's
+    (the victim's) ``run_id`` / ``thread_id`` unconditionally: no digest
+    comparison at all on this requery branch, unlike the pre-``spawn_run``
+    cache-hit branch a few lines above it, which already 422s on mismatch.
+    Queue mode leaks the run/session identifiers themselves (an attacker can
+    then poll ``GET .../runs/{id}/events`` under its own key — session
+    ownership is keyed on ``(tenant, agent, user_id)``, and the endpoint
+    trusts the caller's own ``user_id``... but the run_id/thread_id
+    themselves are already a target-identification leak on their own,
+    handed to a caller who authored neither). The fix mirrors the cache-hit
+    branch's check exactly: a digest mismatch means this key was reused for
+    a genuinely different request, so it must 422, not disclose the
+    winner's identifiers.
+    """
+    lifecycle = Lifecycle()
+    lifecycle.mark_ready()
+    tenant_id = uuid4()
+    winner_run_id = uuid4()
+    winner_thread_id = uuid4()
+    now = datetime.now(UTC)
+    winner_info = RunInfo(
+        run_id=winner_run_id,
+        tenant_id=tenant_id,
+        thread_id=winner_thread_id,
+        user_id=None,
+        status=RunStatus.QUEUED,
+        on_disconnect=DisconnectMode.CONTINUE,
+        is_resume=False,
+        error=None,
+        created_at=now,
+        updated_at=now,
+        finished_at=None,
+        idempotency_key="race-2",
+        # A sha256 hex digest is 64 hex chars — this literal can never
+        # collide with one, so it is guaranteed to mismatch whatever the
+        # attacker's own (structurally valid) request body hashes to.
+        request_digest="irrelevant-to-this-branch",
+    )
+    run_store = _ConflictOnceRunStore(conflict_key="race-2", winner_info=winner_info)
+    run_event_store = InMemoryRunEventStore()
+    app = create_app(
+        settings=_build_settings(),
+        lifecycle=lifecycle,
+        jwt_verifier=build_test_jwt_verifier(),
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+    )
+    await app.state.agent_spec_repo.create(
+        tenant_id=tenant_id,
+        spec=_spec_for("plain-bot"),
+        spec_sha256="e" * 64,
+        created_by="seed",
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://cp.test",
+        headers={"Authorization": f"Bearer {_external_jwt(tenant_id)}"},
+    ) as client:
+        resp = await client.post(
+            "/v1/agents/plain-bot/runs",
+            json=BODY,
+            headers={"Idempotency-Key": "race-2"},
+        )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    # The whole point of the fix: no trace of the winner's (victim's)
+    # identifiers anywhere in the response body — a 422 that still echoed
+    # them back "for debugging" would be the same leak in a different shape.
+    assert str(winner_run_id) not in resp.text
+    assert str(winner_thread_id) not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_conflict_requery_digest_mismatch_is_422_stream_mode() -> None:
+    """Security-review fix (Critical) —— the stream-mode leak is the
+    severe one: a queue-mode leak hands the attacker identifiers it could
+    maybe use to poll for more; a stream-mode leak hands the attacker the
+    victim run's ENTIRE SSE event history in the same response — no further
+    action needed. This test seeds the winner run's event store with a
+    frame carrying an obvious secret marker and proves a digest-mismatched
+    loser's 422 response contains neither that secret nor any winner
+    identifier — the fix must stop ``_idempotent_run_response`` (and
+    therefore ``build_events_response``'s replay) from ever being reached
+    on a mismatch, not just filter its output after the fact.
+    """
+    lifecycle = Lifecycle()
+    lifecycle.mark_ready()
+    tenant_id = uuid4()
+    winner_run_id = uuid4()
+    winner_thread_id = uuid4()
+    now = datetime.now(UTC)
+    winner_info = RunInfo(
+        run_id=winner_run_id,
+        tenant_id=tenant_id,
+        thread_id=winner_thread_id,
+        user_id=None,
+        status=RunStatus.SUCCESS,  # terminal → replay path, deterministic body
+        on_disconnect=DisconnectMode.CONTINUE,
+        is_resume=False,
+        error=None,
+        created_at=now,
+        updated_at=now,
+        finished_at=now,
+        idempotency_key="race-3",
+        request_digest="irrelevant-to-this-branch",
+    )
+    run_store = _ConflictOnceRunStore(conflict_key="race-3", winner_info=winner_info)
+    run_event_store = InMemoryRunEventStore()
+    secret = "VICTIM SECRET: bank balance is 12345"
+    await run_event_store.append(
+        RunEventRecord(
+            run_id=winner_run_id,
+            seq=1,
+            event_name="updates",
+            data={"content": secret},
+            created_at_ms=int(now.timestamp() * 1000),
+            created_at=now,
+        )
+    )
+    app = create_app(
+        settings=_build_settings(),
+        lifecycle=lifecycle,
+        jwt_verifier=build_test_jwt_verifier(),
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+    )
+    await app.state.agent_spec_repo.create(
+        tenant_id=tenant_id,
+        spec=_spec_for("plain-bot"),
+        spec_sha256="e" * 64,
+        created_by="seed",
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://cp.test",
+        headers={"Authorization": f"Bearer {_external_jwt(tenant_id)}"},
+    ) as client:
+        resp = await client.post(
+            "/v1/agents/plain-bot/runs",
+            json={"user_id": "u1", "input": "你好", "mode": "stream"},
+            headers={"Idempotency-Key": "race-3"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert not resp.headers["content-type"].startswith("text/event-stream")
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+    assert secret not in resp.text
+    assert str(winner_run_id) not in resp.text
+    assert str(winner_thread_id) not in resp.text
+
+
 # ---------------------------------------------------------------------------
 # Task 14 —— stream 模式重放。
 # ---------------------------------------------------------------------------
@@ -457,10 +647,18 @@ async def test_stream_replay_attaches_to_original_run(
     first = await external_client.post(url, json=body, headers=h)
     assert first.status_code == 200, first.text
     original = first.headers["X-Expert-Work-Run-Id"]
+    original_session = first.headers["X-Expert-Work-Session-Id"]
     second = await external_client.post(url, json=body, headers=h)
     assert second.status_code == 200, second.text
     assert second.headers["X-Expert-Work-Run-Id"] == original
     assert second.headers["X-Expert-Work-Stream-Mode"] in {"replay", "live"}
+    # External-API-v1 P2-a security-review fix (Important) —— the replay
+    # response used to drop this header entirely (``build_events_response``
+    # only set Run-Id / Stream-Mode); every docs-site page describing stream
+    # mode tells the caller to read it to continue the conversation, so a
+    # caller that only reads headers (not the SSE body) would get it on the
+    # first response and never again on a retry.
+    assert second.headers["X-Expert-Work-Session-Id"] == original_session
 
 
 @pytest.mark.asyncio

@@ -484,6 +484,121 @@ async def test_merged_image_refs_over_limit_is_422_not_500(
 
 
 # ---------------------------------------------------------------------------
+# P2-a security-review fix (Critical) — image_refs / files[type=image] format
+# validation. Internal ``RunRequest._parse_image_refs`` (runs.py) calls
+# ``parse_image_ref`` on every ref and raises ``ValueError`` (→ a pydantic
+# field_validator failure) on anything malformed — but ``RunRequest`` is
+# hand-constructed here (off the FastAPI request-body validation path, same
+# root cause as the merged-length check above), so an unguarded malformed ref
+# used to raise an uncaught ``pydantic.ValidationError`` — a bare 500, not a
+# 422 — from EITHER of the two sources that feed the merged list: the
+# top-level ``image_refs`` field, and ``files[]`` entries with
+# ``type == "image"``. The second source is a bigger real-world risk than the
+# first: the docs site lists document and image ``files[]`` entries side by
+# side with the same ``upload_id`` field name, so a client that mislabels an
+# uploaded document as ``type: "image"`` hits this. (The mirror mistake —
+# labeling an image ref as ``type: "document"`` — was already caught cleanly
+# by ``_safe_document_name_or_422`` before this fix; only the image leg was
+# unguarded.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_malformed_top_level_image_ref_is_422_not_500(
+    external_client: AsyncClient, plain_agent: _PlainAgent
+) -> None:
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "image_refs": ["not-a-ref"],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_IMAGE_REF"
+
+
+@pytest.mark.asyncio
+async def test_document_shaped_upload_id_as_image_type_is_422_not_500(
+    external_client: AsyncClient, plain_agent: _PlainAgent
+) -> None:
+    """A document-style ``uploads/<name>`` upload_id mislabeled ``type:
+    "image"`` — the exact mistake the docs-site's side-by-side ``files[]``
+    examples invite (same field name, different ``type``)."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "files": [
+                {"type": "image", "transfer_method": "local_file", "upload_id": "uploads/pic.png"}
+            ],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_IMAGE_REF"
+
+
+# ---------------------------------------------------------------------------
+# P2-a security-review fix (Critical) — untrusted_content per-block length.
+# Internal ``RunRequest._bound_untrusted_blocks`` (runs.py) rejects any block
+# over 8192 chars — same hand-constructed-``RunRequest`` root cause as above,
+# so an unguarded oversized block used to be a bare 500. The docs site
+# actively recommends this field for "an email body, a ticket description" —
+# an 8KB email body is an everyday size, not an attack payload, so a
+# third party following the docs would hit this.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_untrusted_content_block_over_limit_is_422_not_500(
+    external_client: AsyncClient, plain_agent: _PlainAgent
+) -> None:
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "untrusted_content": ["x" * 9000],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "UNTRUSTED_CONTENT_BLOCK_TOO_LONG"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_content_block_at_exactly_8192_is_not_422(
+    external_client: AsyncClient, plain_agent: _PlainAgent
+) -> None:
+    """Boundary-legal: the bound is a strict ``>``, so a block of exactly
+    8192 chars (``MAX_UNTRUSTED_CONTENT_BLOCK_CHARS``) must be accepted."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "untrusted_content": ["x" * 8192],
+        },
+    )
+    assert resp.status_code != 422, resp.text
+    assert resp.status_code == 202, resp.text
+
+
+# ---------------------------------------------------------------------------
 # Task 11 — files[] document dispatch + path-traversal gate
 # ---------------------------------------------------------------------------
 
@@ -503,6 +618,14 @@ async def test_merged_image_refs_over_limit_is_422_not_500(
         "  ",  # whitespace-only — strips to empty, same as ""
         "x\\y.txt",  # backslash, no uploads/ prefix
         "uploads/a\x00.txt",  # NUL — not in _safe_workspace_name's allowed charset
+        # P2-a security-review follow-up — a clean bare filename with no
+        # path segments at all. Before this case, "/etc/passwd" (len 11) was
+        # the only entry that killed "must start with 'uploads/' (len 8)"
+        # purely by being long enough that a broken prefix check (e.g.
+        # case-insensitive, or `lstrip("uploads")` instead of `startswith`)
+        # could still coincidentally reject it. "report.pdf" carries no such
+        # accident — it only fails the missing-prefix rule.
+        "report.pdf",
     ],
 )
 @pytest.mark.asyncio

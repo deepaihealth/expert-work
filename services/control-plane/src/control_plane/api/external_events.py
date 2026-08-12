@@ -78,6 +78,24 @@ def build_events_response(
     ``is_terminal`` is derived from ``run.status`` inside this function
     (not accepted as a separate bool parameter) so there is exactly one
     place a caller could get it wrong.
+
+    External-API-v1 P2-a security-review fix (Important) —— the headers now
+    also carry ``X-Expert-Work-Session-Id`` (``run.thread_id``), matching the
+    first-response header set ``run_agent_for_user`` (``agents.py``) sends
+    via ``extra_headers``. Before this fix a stream-mode idempotency replay
+    (a retried ``POST .../runs`` that hit the ``Idempotency-Key`` cache, or
+    the concurrent-conflict-loser requery) dropped the session id — the
+    header set on retry was a strict subset of the header set on first
+    response. Every docs-site page describing stream mode tells the caller
+    to read this header to continue the conversation; a caller that starts a
+    session with no ``session_id`` (mint-on-first-use) *and* an
+    ``Idempotency-Key`` *and* only reads response headers (not the SSE body)
+    would get the session id on the first response but never again on
+    retry — unable to continue the conversation it just started. This
+    function backs BOTH the idempotency-replay call sites in ``agents.py``
+    and the plain ``GET .../runs/{run_id}/events`` reconnect endpoint below,
+    so the latter gains the header too — an addition, not a behavior change,
+    for a caller that was already free to ignore headers it doesn't know.
     """
     is_terminal = run.status in TERMINAL_RUN_STATUSES
     producer = build_event_producer(
@@ -95,6 +113,7 @@ def build_events_response(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "X-Expert-Work-Run-Id": str(run.run_id),
+            "X-Expert-Work-Session-Id": str(run.thread_id),
             "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
         },
     )

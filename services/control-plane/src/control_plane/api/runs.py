@@ -128,9 +128,35 @@ MAX_RUN_INPUT_KEYS: Final[int] = 64
 #: Cap on each ``str``-valued ``RunRequest.inputs`` entry's length, enforced
 #: by ``_bound_inputs`` below. Same sharing rationale as
 #: ``MAX_RUN_INPUT_KEYS``. Non-``str`` values (numbers, lists, nested
-#: objects) are not length-checked — only their count toward
-#: ``MAX_RUN_INPUT_KEYS`` matters.
+#: objects) are not length-checked by ``_bound_inputs`` — only their count
+#: toward ``MAX_RUN_INPUT_KEYS`` matters here.
 MAX_RUN_INPUT_VALUE_CHARS: Final[int] = 8192
+
+#: External-API-v1 P2-a security fix (Important) —— ``MAX_RUN_INPUT_VALUE_CHARS``
+#: only bounds ``str`` values; a non-``str`` value (a list/dict) sails past it
+#: regardless of size — wrapping an oversized string in a one-element list was
+#: an unbounded-payload bypass for a now-untrusted-caller endpoint. This is a
+#: **total serialized-bytes** cap on the whole ``inputs`` mapping, checked
+#: ONLY by the external run endpoint (``agents.py`` — see the pre-check next
+#: to ``TOO_MANY_INPUT_KEYS`` there); it is deliberately not enforced by
+#: ``_bound_inputs`` / the internal ``POST .../runs`` endpoint, whose caller
+#: (the console) is a trusted internal party this bound was never meant to
+#: guard against. Reuses ``MAX_RUN_INPUT_CHARS`` — the free-text ``input``
+#: field's 64KB DoS guardrail — verbatim: both cap "how much payload can one
+#: call hand this endpoint", so there is no reason for the structured side to
+#: be more permissive than the free-text side.
+MAX_RUN_INPUT_TOTAL_BYTES: Final[int] = MAX_RUN_INPUT_CHARS
+
+#: Cap on each ``untrusted_content`` block's length, enforced by
+#: ``_bound_untrusted_blocks`` below. Named for the same reason as
+#: ``MAX_RUN_INPUT_KEYS`` — the external run endpoint (``agents.py``) also
+#: hand-constructs ``RunRequest`` off the FastAPI request-body validation
+#: path and must pre-check this bound itself (External-API-v1 P2-a security
+#: fix, Critical — an unchecked block used to reach this validator as an
+#: uncaught ``pydantic.ValidationError`` → bare 500, not a 422) before that
+#: construction, so it imports this constant instead of re-declaring the
+#: literal.
+MAX_UNTRUSTED_CONTENT_BLOCK_CHARS: Final[int] = 8192
 
 
 class RunRequest(BaseModel):
@@ -183,8 +209,11 @@ class RunRequest(BaseModel):
     @classmethod
     def _bound_untrusted_blocks(cls, value: list[str]) -> list[str]:
         for block in value:
-            if len(block) > 8192:
-                msg = "each untrusted_content block must be <= 8192 chars"
+            if len(block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
+                msg = (
+                    f"each untrusted_content block must be "
+                    f"<= {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} chars"
+                )
                 raise ValueError(msg)
         return value
 

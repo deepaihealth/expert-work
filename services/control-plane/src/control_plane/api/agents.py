@@ -13,6 +13,7 @@ the boundary.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -42,7 +43,9 @@ from control_plane.api.runs import (
     MAX_RUN_IMAGE_REFS,
     MAX_RUN_INPUT_CHARS,
     MAX_RUN_INPUT_KEYS,
+    MAX_RUN_INPUT_TOTAL_BYTES,
     MAX_RUN_INPUT_VALUE_CHARS,
+    MAX_UNTRUSTED_CONTENT_BLOCK_CHARS,
     RunRequest,
     spawn_run,
 )
@@ -88,6 +91,7 @@ from expert_work.protocol import (
     TenantPlan,
     tier_satisfies,
 )
+from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunEventStore, RunIdempotencyConflict, RunInfo, RunStore
 from expert_work.runtime.stream_bridge import StreamBridge
@@ -289,8 +293,6 @@ def _safe_document_name_or_422(name: str) -> str:
 
 
 def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
-    import json
-
     canonical = json.dumps(spec_json, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -536,11 +538,18 @@ class ExternalRunRequest(BaseModel):
     input: str | None = Field(default=None, max_length=MAX_RUN_INPUT_CHARS)
     mode: Literal["stream", "queue"] = "stream"
     image_refs: list[str] = Field(default_factory=list, max_length=64)
+    #: 单块长度上限(``MAX_UNTRUSTED_CONTENT_BLOCK_CHARS``,与内部
+    #: ``RunRequest._bound_untrusted_blocks`` 同值)未在这个字段声明里体现
+    #: ——同 ``inputs`` 一样,必须在 ``run_agent_for_user`` 里手工预检(P2-a
+    #: 安全修复,Critical——否则一个超长块会在下方手工构造 ``RunRequest``
+    #: 时炸出裸 ``pydantic.ValidationError``,即 500,而不是 422)。
     untrusted_content: list[str] = Field(default_factory=list, max_length=16)
     #: P2 —— 提示词模板变量,与内部 ``RunRequest.inputs`` 同语义(未声明键 422、
     #: 必填缺失 422)。未声明键 / 必填缺失校验在 ``spawn_run`` 内部由
     #: ``validate_prompt_inputs`` 统一执行,此处不重复;但 64 键 / 单值 8192
-    #: 字符这两条上限(``RunRequest._bound_inputs``)必须在这个端点里手工
+    #: 字符 / 序列化后总字节数这三条上限(``RunRequest._bound_inputs`` 前两条 +
+    #: ``MAX_RUN_INPUT_TOTAL_BYTES`` 第三条,P2-a 安全修复,Important——单值
+    #: 长度检查只认 ``str``,包一层 list/dict 就绕过)必须在这个端点里手工
     #: 预检——见下方 ``run_agent_for_user`` 里 ``RunRequest`` 手工构造前的
     #: 检查,原因同 ``TOO_MANY_IMAGE_REFS``。
     inputs: dict[str, Any] = Field(default_factory=dict)
@@ -1122,6 +1131,33 @@ def build_agents_router() -> APIRouter:
                 f"files[] 与 image_refs 合计不能超过 {MAX_RUN_IMAGE_REFS} 张图片",
                 422,
             )
+        # P2-a 安全修复(Critical)—— 同样是"RunRequest 手工构造绕过了 FastAPI
+        # 请求体校验路径"这条根因:内部 ``RunRequest._parse_image_refs``
+        # (runs.py)会对每条 ref 调 ``parse_image_ref``,格式不对就 raise
+        # ValueError —— 但那是一个 pydantic field_validator,手工构造时它仍
+        # 会跑,只是 raise 出来的是裸 ``pydantic.ValidationError``(500),不
+        # 会被下方 ``RunRequest(...)`` 调用点前的任何一道闸拦住。合并后的
+        # image_refs 同时来自两个入口(顶层 ``image_refs`` 字段 + ``files[]``
+        # 里 ``type == "image"`` 的条目,见上面的合并),两个入口都要覆盖 ——
+        # 这里在合并之后统一校验,天然覆盖两者。
+        for _ref in image_refs:
+            try:
+                parse_image_ref(_ref)
+            except ValueError as exc:
+                return _envelope_error("INVALID_IMAGE_REF", str(exc), 422)
+
+        # P2-a 安全修复(Critical)—— 同一根因:内部 ``RunRequest.
+        # _bound_untrusted_blocks``(runs.py)对每块查 <= 8192 字符,超了同样
+        # 是裸 ``pydantic.ValidationError``(500)。文档站主动推荐这个字段装
+        # 一封邮件正文 / 一段工单描述,8KB 是日常量级,第三方按文档使用就会
+        # 撞上这个洞,必须在手工构造 ``RunRequest`` 之前拦下来。
+        for _idx, _block in enumerate(payload.untrusted_content):
+            if len(_block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
+                return _envelope_error(
+                    "UNTRUSTED_CONTENT_BLOCK_TOO_LONG",
+                    f"untrusted_content[{_idx}] 超过 {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} 字符",
+                    422,
+                )
 
         # P2 块 1(Task 11)—— files[] 的 document 条目逐个过路径净化闸,再并
         # 进 RunRequest.document_names。客户端给的是字符串,上传时走过的
@@ -1163,6 +1199,23 @@ def build_agents_router() -> APIRouter:
                     f"inputs['{_input_key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
                     422,
                 )
+        # P2-a 安全修复(Important)—— 上面这条单值长度检查只认 ``str``;把同一
+        # 个超大值包一层 list/dict 就绕过(``{"lang": ["A"*1200000]}``),两条
+        # 既有检查都不查。追加一道**序列化后总字节数**的界,堵住"值不是 str
+        # 就不查长度"这个洞;既有两条(键数 / 单值 str 长度)原样保留,新界是
+        # 追加不是替代——单值 8192 的界仍然有意义(限制单个变量),这条新界
+        # 限制的是整个 inputs 的总量。上限复用 ``MAX_RUN_INPUT_TOTAL_BYTES``
+        # (= ``MAX_RUN_INPUT_CHARS``,即 input 自由文本字段的 64KB 上限,见
+        # runs.py 该常量的文档字符串)。
+        _inputs_total_bytes = len(
+            json.dumps(payload.inputs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        if _inputs_total_bytes > MAX_RUN_INPUT_TOTAL_BYTES:
+            return _envelope_error(
+                "TOO_MANY_INPUT_BYTES",
+                f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
+                422,
+            )
 
         run_payload = RunRequest(
             input=payload.input,
@@ -1209,6 +1262,33 @@ def build_agents_router() -> APIRouter:
             if winner is None:  # pragma: no cover - the index guarantees a
                 # winner row exists the instant the conflict fires.
                 raise
+            # P2-a security fix (Critical) —— this requery used to hand the
+            # winner's run straight back with no digest check at all, unlike
+            # the pre-``spawn_run`` cache-hit branch above (which 422s on a
+            # digest mismatch). Any same-tenant ``session:write`` key holder
+            # could win an information leak by racing a guessable
+            # Idempotency-Key against a victim's request: land inside the
+            # window between the victim's ``find_by_idempotency_key`` miss
+            # and its ``run_store.create`` insert (that window spans
+            # ``_resolve_session`` + ``check_admission`` +
+            # ``runtime.get_agent`` — tens to hundreds of ms, not
+            # microseconds), lose the race, and this branch would hand back
+            # the *victim's* ``run_id`` / ``thread_id`` (queue mode) or the
+            # victim run's full SSE replay — including any secret content
+            # already in its event stream (stream mode). Same fix, same
+            # shape, as the cache-hit branch: a digest mismatch means this
+            # key was reused for a genuinely different request, not a retry
+            # of the request that's racing right now, so it must 422 rather
+            # than disclose the winner's run. A same-digest loser (the
+            # legitimate concurrent-retry case this branch exists for) still
+            # gets the winner's run — that's the value idempotency exists to
+            # provide, and this check must not break it.
+            if winner.request_digest != digest:
+                return _envelope_error(
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "this Idempotency-Key was already used with a different request",
+                    422,
+                )
             return _idempotent_run_response(
                 winner,
                 mode=payload.mode,

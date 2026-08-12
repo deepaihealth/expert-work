@@ -16,6 +16,7 @@ prompt.jinja`` / ``.variables`` onto the built agent.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -27,7 +28,11 @@ from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from control_plane.api.runs import MAX_RUN_INPUT_KEYS, MAX_RUN_INPUT_VALUE_CHARS
+from control_plane.api.runs import (
+    MAX_RUN_INPUT_KEYS,
+    MAX_RUN_INPUT_TOTAL_BYTES,
+    MAX_RUN_INPUT_VALUE_CHARS,
+)
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.runtime import AgentRuntime
@@ -316,20 +321,66 @@ async def test_exactly_8192_chars_is_not_422(external_client, jinja_agent) -> No
     assert resp.status_code == 202, resp.text
 
 
+# --- inputs total-bytes bound (P2-a security-review fix, Important) --------
+#
+# ``MAX_RUN_INPUT_VALUE_CHARS`` above only bounds ``str`` values — a
+# non-``str`` value (a list/dict) sails past it regardless of size. This used
+# to be documented and tested as INTENTIONAL ("existing behaviour, preserved
+# here") under the assumption that ``inputs`` only ever reached this endpoint
+# from a trusted console caller. This branch is the first to expose ``inputs``
+# to an untrusted third party, so that assumption stopped holding: a real
+# request of ``{"lang": ["A" * 1_200_000] * 3}`` — wrapping one oversized
+# string in a one-element-per-item list — got a 202 and put 3.6MB into
+# ``agent_run.enqueued_input`` (the worker later renders the whole thing into
+# the system prompt), with no global request-body-size middleware behind it
+# to catch it another way. ``MAX_RUN_INPUT_TOTAL_BYTES`` closes that gap with
+# a serialized-total-bytes cap on the whole ``inputs`` mapping — additive to,
+# not a replacement for, the two bounds above.
+
+
 @pytest.mark.asyncio
-async def test_non_string_oversized_value_not_rejected_by_length(
+async def test_list_wrapped_oversized_value_is_422_too_many_input_bytes(
     external_client, jinja_agent
 ) -> None:
-    """The length bound only applies to ``str`` values (existing behaviour,
-    preserved here) — a huge non-string value (a 20k-element array) must not
-    be rejected on length grounds."""
+    """The str-only length bound used to let a huge value through if it was
+    wrapped in a list — this is the exact bypass shape from the security
+    review (a 3.6MB payload past a str-only length gate). Must now be a
+    clean 422, not a 202 that quietly queues a multi-megabyte prompt."""
     resp = await external_client.post(
         f"/v1/agents/{jinja_agent.code}/runs",
         json={
             "user_id": "u1",
             "input": "hi",
             "mode": "queue",
-            "inputs": {"lang": list(range(20_000))},
+            "inputs": {"lang": ["A" * 1_200_000] * 3},
         },
     )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "TOO_MANY_INPUT_BYTES"
+
+
+@pytest.mark.asyncio
+async def test_inputs_total_bytes_at_boundary_is_not_422(external_client, jinja_agent) -> None:
+    """Boundary-legal: the bound is a strict ``>``, so an ``inputs`` mapping
+    whose serialized size is exactly ``MAX_RUN_INPUT_TOTAL_BYTES`` must be
+    accepted, not rejected. Uses a list-wrapped value (not a bare ``str``) so
+    this exercises the NEW total-bytes bound specifically, not the pre-existing
+    per-``str``-value bound (``test_exactly_8192_chars_is_not_422`` above
+    already covers that one)."""
+    # json.dumps({"lang": [""]}, separators=(",", ":")) is 13 bytes; pad the
+    # one list element so the whole mapping serializes to exactly the cap.
+    padding = "x" * (MAX_RUN_INPUT_TOTAL_BYTES - 13)
+    inputs = {"lang": [padding]}
+    assert (
+        len(json.dumps(inputs, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        == MAX_RUN_INPUT_TOTAL_BYTES
+    ), "test payload must land exactly at the boundary — precondition, not the thing under test"
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={"user_id": "u1", "input": "hi", "mode": "queue", "inputs": inputs},
+    )
+    assert resp.status_code != 422, resp.text
     assert resp.status_code == 202, resp.text
