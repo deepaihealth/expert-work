@@ -22,6 +22,7 @@ docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -29,7 +30,34 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from control_plane.api._session_title import message_text
+from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import MessageTurn
+
+
+def _parse_stamp_created_at(ak: dict[str, Any]) -> datetime | None:
+    """``expert_work_created_at`` → ``datetime``,缺失/损坏一律退化成 ``None``。
+
+    上线前写入的老消息、或手工构造的 ``additional_kwargs`` 都不能让整个
+    会话的读取炸掉。
+    """
+    raw = ak.get(STAMP_CREATED_AT)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _parse_stamp_run_id(ak: dict[str, Any]) -> UUID | None:
+    """``expert_work_run_id`` → ``UUID``,缺失/损坏一律退化成 ``None``。"""
+    raw = ak.get(STAMP_RUN_ID)
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
 
 
 def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> list[MessageTurn]:
@@ -48,7 +76,7 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
     # ``inject_delivery``, tagged ``expert_work_scheduled_delivery``) open its
     # OWN segment instead of being appended onto — and stealing "final" from —
     # the user's real answer.
-    collected: list[tuple[int, str, str, bool, bool]] = []
+    collected: list[tuple[int, str, str, bool, bool, datetime | None, UUID | None]] = []
     for seq, m in enumerate(raw_messages):
         mtype = getattr(m, "type", None)
         if mtype not in ("human", "ai"):
@@ -64,11 +92,19 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
         starts_segment = (mtype == "human" and not hidden) or (
             mtype == "ai" and bool(ak.get("expert_work_scheduled_delivery"))
         )
-        collected.append((seq, mtype, text, has_tool_calls, starts_segment))
+        created_at = _parse_stamp_created_at(ak)
+        run_id = _parse_stamp_run_id(ak)
+        collected.append((seq, mtype, text, has_tool_calls, starts_segment, created_at, run_id))
     out: list[MessageTurn] = []
-    for i, (seq, mtype, text, has_tool_calls, _starts_segment) in enumerate(collected):
+    for i, (seq, mtype, text, has_tool_calls, _starts_segment, created_at, run_id) in enumerate(
+        collected
+    ):
         if mtype == "human":
-            out.append(MessageTurn(seq=seq, role="user", content=text))
+            out.append(
+                MessageTurn(
+                    seq=seq, role="user", content=text, created_at=created_at, run_id=run_id
+                )
+            )
             continue
         # Channel is structural (spec): an assistant turn is "final" iff it is
         # the last visible turn of its user-delimited segment AND carries no
@@ -76,7 +112,16 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
         nxt = collected[i + 1] if i + 1 < len(collected) else None
         last_in_segment = nxt is None or nxt[4]
         channel = "final" if last_in_segment and not has_tool_calls else "commentary"
-        out.append(MessageTurn(seq=seq, role="assistant", content=text, channel=channel))
+        out.append(
+            MessageTurn(
+                seq=seq,
+                role="assistant",
+                content=text,
+                channel=channel,
+                created_at=created_at,
+                run_id=run_id,
+            )
+        )
     return out
 
 

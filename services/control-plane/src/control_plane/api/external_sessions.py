@@ -217,7 +217,16 @@ def build_external_sessions_router() -> APIRouter:
             logger.warning("external_messages.read_failed", exc_info=True)
             turns = []
         page = turns[offset : offset + limit]
-        out = [{"role": t.role, "content": t.content, "channel": t.channel} for t in page]
+        out = [
+            {
+                "role": t.role,
+                "content": t.content,
+                "channel": t.channel,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "run_id": str(t.run_id) if t.run_id else None,
+            }
+            for t in page
+        ]
         return JSONResponse(
             {
                 "success": True,

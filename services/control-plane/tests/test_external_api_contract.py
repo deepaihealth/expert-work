@@ -259,8 +259,20 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
     )
     assert msgs.status_code == 200, msgs.text
     assert msgs.json()["data"]["messages"] == [
-        {"role": "user", "content": "看下这张图", "channel": None},
-        {"role": "assistant", "content": "收到", "channel": "final"},
+        {
+            "role": "user",
+            "content": "看下这张图",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "assistant",
+            "content": "收到",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
     ], msgs.text
 
     # 6. Replaying the cancelled run's events works (reconnect path).

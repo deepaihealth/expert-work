@@ -27,6 +27,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
+from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, Role
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
@@ -341,11 +342,37 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
     assert body["success"] is True
     # Hidden scaffolding dropped; role/content/channel mapped straight off
     # ``read_turns`` — proves this isn't the ``checkpointer is None`` stub path.
+    # None of these messages carry a P2 stamp, so created_at/run_id must come
+    # back null — pre-stamp history is never backfilled.
     assert body["data"]["messages"] == [
-        {"role": "user", "content": "turn1 user", "channel": None},
-        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
-        {"role": "user", "content": "turn2 user", "channel": None},
-        {"role": "assistant", "content": "turn2 assistant", "channel": "final"},
+        {
+            "role": "user",
+            "content": "turn1 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "assistant",
+            "content": "turn1 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "user",
+            "content": "turn2 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "assistant",
+            "content": "turn2 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
     ]
 
     # Pagination slices the (already hidden-filtered) turn list.
@@ -356,6 +383,88 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
     )
     assert paged.status_code == 200, paged.text
     assert paged.json()["data"]["messages"] == [
-        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
-        {"role": "user", "content": "turn2 user", "channel": None},
+        {
+            "role": "assistant",
+            "content": "turn1 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "user",
+            "content": "turn2 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
+    """P2 Task 5: stamped messages must surface ``created_at``/``run_id`` on
+    the external endpoint, and a corrupt stamp on one message must not take
+    down the whole session's read.
+
+    Seeds real ``additional_kwargs`` stamps (not a hand-rolled ``MessageTurn``)
+    so this exercises the actual ``extract_turns`` parsing path end to end —
+    a test that only checked the field existed without ever setting a stamp
+    would pass even if the parser were a no-op.
+    """
+    await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    session_id = started.json()["thread_id"]
+    stamped_at = datetime(2026, 8, 12, 1, 2, 3, tzinfo=UTC)
+    run_id = uuid4()
+    await _seed_thread_messages(
+        checkpointer,
+        session_id,
+        [
+            HumanMessage(
+                content="stamped question",
+                additional_kwargs={
+                    STAMP_CREATED_AT: stamped_at.isoformat(),
+                    STAMP_RUN_ID: str(run_id),
+                },
+            ),
+            # Corrupt stamp on this one message must degrade to null, not
+            # blow up the whole session's read.
+            AIMessage(
+                content="stamped answer",
+                additional_kwargs={
+                    STAMP_CREATED_AT: "not-a-timestamp",
+                    STAMP_RUN_ID: "not-a-uuid",
+                },
+            ),
+        ],
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    messages = resp.json()["data"]["messages"]
+    assert messages == [
+        {
+            "role": "user",
+            "content": "stamped question",
+            "channel": None,
+            "created_at": stamped_at.isoformat(),
+            "run_id": str(run_id),
+        },
+        {
+            "role": "assistant",
+            "content": "stamped answer",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
     ]
