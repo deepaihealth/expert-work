@@ -296,6 +296,8 @@ async def fire_trigger(
             # Stream L.L7 — record the trajectory (curation / eval-gate source).
             trajectory_recorder=runtime.trajectory_recorder,
             trajectory_enabled=built.trajectory_recording,
+            # P2 块 2 — run 终局重算 thread_meta.message_count。
+            thread_stats_recorder=runtime.thread_stats_recorder,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(),
             # perf phase2 PR3 T3 — process-wide delegation concurrency gate.

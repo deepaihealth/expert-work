@@ -211,6 +211,27 @@ class StreamableGraph(Protocol):
         """
 
 
+class ThreadStatsRecorder(Protocol):
+    """run 终局重算会话的对外可见消息条数(第三方对接 API v1 P2)。
+
+    实现住在 control-plane(``control_plane.thread_stats``)—— 只有它能
+    import ``transcript.extract_turns``,而复用那个函数正是「对外消息列表」
+    与「会话 message_count」两处口径不漂的唯一保证。orchestrator 这侧只声明
+    形状并调用,依赖方向不反。
+
+    刻意 **不** 加 ``@runtime_checkable``:它的 ``isinstance`` 只看方法名在
+    不在、不看签名,给的是假保证(仓库既有陷阱)。
+
+    实现必须自吞异常 —— 这条调用挂在 run 的终局路径上,计数写失败绝不能影响
+    run 的终局。
+    """
+
+    async def record(
+        self, *, thread_id: UUID, tenant_id: UUID, messages: Sequence[BaseMessage]
+    ) -> None:
+        """把 ``messages`` 重算出的条数写回会话元数据。Best-effort。"""
+
+
 # ---------------------------------------------------------------------------
 # Producer — background run worker
 # ---------------------------------------------------------------------------
@@ -250,6 +271,7 @@ async def run_agent(
     stream_mode: str = DEFAULT_STREAM_MODE,
     trajectory_recorder: TrajectoryRecorder | None = None,
     trajectory_enabled: bool = True,
+    thread_stats_recorder: ThreadStatsRecorder | None = None,
     skill_run_usage_recorder: SkillRunUsageRecorder | None = None,
     approval_store: ApprovalStore | None = None,
     event_store: RunEventStore | None = None,
@@ -787,6 +809,12 @@ async def run_agent(
             time.monotonic() - session_started
         )
         await bridge.publish_end(run_id)
+        # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
+        # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
+        # 分支(正常结束 / RunCancelledError / CancelledError / MaxSteps /
+        # 兜底 Exception / PAUSED)。fire-and-forget,不 await —— ``finally``
+        # 也跑在 ``asyncio.CancelledError`` 的拆除路径上,那条路上 await 不可靠。
+        _dispatch_thread_stats(thread_stats_recorder, graph, effective_config, record)
         # Fire-and-forget cleanup; keep a reference so the task isn't
         # garbage-collected mid-flight.
         cleanup_task = asyncio.create_task(bridge.cleanup(run_id, delay=_CLEANUP_DELAY_S))
@@ -1035,6 +1063,61 @@ async def _record_trajectory_safe(
             record.run_id,
             outcome,
         )
+
+
+#: Strong refs to in-flight thread-stats dispatch tasks (P2 块 2) — same
+#: garbage-collection guard as ``_BACKGROUND_TRAJECTORY_TASKS``.
+_BACKGROUND_THREAD_STATS_TASKS: set[asyncio.Task[None]] = set()
+
+#: Wall-clock cap on the message-count recompute. The recorder swallows its
+#: own errors; this deadline keeps a wedged checkpointer read from piling up
+#: background tasks.
+_THREAD_STATS_DISPATCH_TIMEOUT_S: Final = 5.0
+
+
+def _dispatch_thread_stats(
+    recorder: ThreadStatsRecorder | None,
+    graph: StreamableGraph,
+    config: RunnableConfig,
+    record: RunRecord,
+) -> None:
+    """P2 块 2 — schedule a fire-and-forget message-count recompute.
+
+    Returns immediately. ``recorder=None`` is a no-op (orchestrator used as
+    a library without the control-plane wiring, or tests).
+    """
+    if recorder is None:
+        return
+    task = asyncio.create_task(_record_thread_stats_safe(recorder, graph, config, record))
+    _BACKGROUND_THREAD_STATS_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_THREAD_STATS_TASKS.discard)
+
+
+async def _record_thread_stats_safe(
+    recorder: ThreadStatsRecorder,
+    graph: StreamableGraph,
+    config: RunnableConfig,
+    record: RunRecord,
+) -> None:
+    """Background body for :func:`_dispatch_thread_stats`.
+
+    **重算,不累加**:同一个会话会被重试、被打断、在审批处暂停后续跑,累加型
+    计数器在这些路径上必然漂。每次都从终局 state 全量重算,任何一次成功的
+    run 终局都把计数纠回来。
+    """
+    try:
+        async with asyncio.timeout(_THREAD_STATS_DISPATCH_TIMEOUT_S):
+            messages = await _fetch_final_messages(graph, config)
+            tenant_id = _tenant_id_from_config(config) or record.tenant_id
+            await recorder.record(
+                thread_id=record.thread_id, tenant_id=tenant_id, messages=messages
+            )
+    except TimeoutError:
+        logger.warning("run_agent.thread_stats_timeout run_id=%s", record.run_id)
+    except Exception:
+        # The recorder catches its own errors; reaching here means the state
+        # fetch itself failed. Best-effort by design.
+        logger.exception("run_agent.thread_stats_failed run_id=%s", record.run_id)
 
 
 def _dispatch_skill_run_usage(
