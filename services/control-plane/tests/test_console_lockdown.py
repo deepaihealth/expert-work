@@ -481,6 +481,39 @@ async def test_employee_jwt_still_reaches_the_console_routes_under_agents(
 
 
 @pytest.mark.asyncio
+async def test_rollback_under_scoped_key_gets_the_console_pointer_not_a_role_denial(
+    ctx: _Ctx,
+) -> None:
+    """Wrapup2 N-B — pin the rollback route's ``dependencies=[...]`` order.
+
+    ``console_only()`` must run before ``Depends(require("manifest", "write"))``
+    so an **under-scoped** API key (here: zero-scope) still gets the
+    console-plane pointer message — the only hint a third party gets toward
+    ``/v1/agents/{agent_code}/...`` — instead of a bare role denial. This is
+    deliberately NOT ``ctx.key_headers`` (admin scope): an admin-scope key
+    passes the ``manifest:write`` role check either way, so it sees the same
+    message regardless of dependency order and cannot catch a swap. A
+    zero/under-scoped key is the population the order actually affects.
+    """
+    await ctx.seed_agent()
+    zero_scope_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-zero-scope",
+        sub_type="service_account",
+        roles=(),
+        scopes=(),
+    )
+    zero_scope_headers = {"Authorization": f"Bearer {zero_scope_jwt}"}
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/1.0.0/revisions/1/rollback", headers=zero_scope_headers
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["message"] == (
+        "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+    ), resp.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path"), sorted(_EXTERNAL_AGENT_ROUTES))
 async def test_api_key_still_reaches_every_external_agents_route(
     ctx: _Ctx, method: str, path: str

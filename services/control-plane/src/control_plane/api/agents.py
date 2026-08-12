@@ -1215,9 +1215,13 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": RevisionDetail(record=snapshot).model_dump(mode="json")}
         )
 
-    # ``console_only()`` first, so an API key keeps getting the console-plane
-    # message rather than a role denial (an ``admin``-scope key would pass the
-    # role check). ``require(...)`` second — a route-level role gate, per the
+    # ``console_only()`` first, so an **under-scoped** API key (zero-scope or
+    # ``read``-scope — anything that fails the ``manifest:write`` role check)
+    # keeps getting the console-plane pointer message rather than a role
+    # denial. An ``admin``- or ``write``-scope key passes the role check
+    # either way, so ordering makes no difference to what it sees (both
+    # dependencies deny it, same message) — only an under-scoped key is
+    # affected. ``require(...)`` second — a route-level role gate, per the
     # 2026-08-12 user ruling: of the five console routes closed to API keys in
     # C2, only this one is a **write**, and it had no employee-side RBAC at all,
     # so any logged-in VIEWER could roll a tenant's manifest back to an

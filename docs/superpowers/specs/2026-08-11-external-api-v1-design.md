@@ -170,6 +170,10 @@ Dify(「仅支持流式模式」)明确胜出的一点,且 queue 才是最需要
 >     迁移 0106),但它是给会话浏览器做内容检索的**异步索引**,不是对外服务路径:
 >     `thread_message.created_at` 是 sweep **写入镜像的时刻**,不是消息产生的时刻;没有
 >     `run_id` 列,连 `channel` 都没有;而且 sweep 没扫到的会话在表里根本不存在。
+>     即使扫到了、行也在,口径依然对不上:sweep 写镜像用 `include_hidden=True`
+>     (`transcript_mirror_sweep.py`,保留编排脚手架),对外消息端点读的是
+>     `include_hidden=False`(`external_sessions.py`,不暴露脚手架给第三方)——同一会话,
+>     镜像表算出的条数会比第三方**应该**看到的多。
 >     所以这条路是"扩列 + 改由写入侧同步 + 回填历史",不是"读现成的表"。
 >
 > P1 的目标是契约地基 + 安全收口,这三个字段(连同 §四-4 的 `message_count`)是展示增强,
