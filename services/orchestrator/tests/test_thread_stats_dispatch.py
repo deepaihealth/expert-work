@@ -224,6 +224,76 @@ async def test_dispatches_on_cancelled_run() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 「取不到 state」≠「会话是空的」
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BrokenStateGraph:
+    """``aget_state`` 抛异常 —— checkpointer 抖动 / 连接断的现场。"""
+
+    async def astream(
+        self, input: Any, config: Any = None, *, stream_mode: Any = None
+    ) -> AsyncIterator[Any]:
+        del input, config, stream_mode
+        yield {"agent": {"step_count": 1}}
+
+    async def aget_state(self, config: Any) -> Any:
+        del config
+        msg = "checkpointer broken"
+        raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_state_fetch_failure_skips_the_write_entirely() -> None:
+    """读不到终局 state 时**根本不调 recorder** —— 而不是拿一个空 messages
+    去调,把会话计数刷成 0。用错误数据盖掉正确数据比保留旧值糟得多。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    recorder = _CapturingRecorder()
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_BrokenStateGraph(),  # type: ignore[arg-type]
+        graph_input={},
+        config={"configurable": {"thread_id": str(record.thread_id)}},
+        thread_stats_recorder=recorder,
+    )
+    await _drain(bridge, record.run_id)
+    await _drain_thread_stats_tasks()
+
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_empty_state_still_writes_zero() -> None:
+    """读成功但真的没有消息 —— 该写 0 就写 0,别把这条也一起跳掉。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    recorder = _CapturingRecorder()
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}], final_messages=[])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={},
+        config={"configurable": {"thread_id": str(record.thread_id)}},
+        thread_stats_recorder=recorder,
+    )
+    await _drain(bridge, record.run_id)
+    await _drain_thread_stats_tasks()
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][2] == []
+
+
+# ---------------------------------------------------------------------------
 # 未接线 / 慢 recorder
 # ---------------------------------------------------------------------------
 

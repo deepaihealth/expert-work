@@ -15,8 +15,9 @@ P2 Task 7。三层各有一条:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -178,6 +179,147 @@ async def test_run_agent_finalization_persists_message_count() -> None:
 
     # 一轮 = 用户 1 + 助手 1;两轮 = 4(重算,不是 2 + 4 之类的累加值)。
     assert counts == [2, 4]
+
+
+@dataclass
+class _BrokenStateGraph:
+    """``aget_state`` 抛异常 —— checkpointer 抖动 / 连接断的现场。"""
+
+    async def astream(
+        self, input: Any, config: Any = None, *, stream_mode: Any = None
+    ) -> AsyncIterator[Any]:
+        del input, config, stream_mode
+        yield {"agent": {"step_count": 1}}
+
+    async def aget_state(self, config: Any) -> Any:
+        del config
+        msg = "checkpointer broken"
+        raise RuntimeError(msg)
+
+
+@dataclass
+class _EmptyStateGraph:
+    """``aget_state`` 读得到,但 ``messages`` 是空的 —— 真·空会话。"""
+
+    async def astream(
+        self, input: Any, config: Any = None, *, stream_mode: Any = None
+    ) -> AsyncIterator[Any]:
+        del input, config, stream_mode
+        yield {"agent": {"step_count": 1}}
+
+    async def aget_state(self, config: Any) -> Any:
+        del config
+        return SimpleNamespace(values={"messages": []})
+
+
+@pytest.mark.asyncio
+async def test_state_fetch_failure_keeps_previous_count() -> None:
+    """checkpointer 读不到时,已算好的计数必须**原封不动**。
+
+    先真跑一轮把计数写成 2,再让同一会话跑一轮读不到 state 的 run:计数
+    仍是 2,不能被刷成 0。用错误数据盖掉正确数据 = 第三方在会话列表上看到
+    一个 50 条消息的会话显示「0 条」,直到它下次真跑 run 才自愈。
+    """
+    thread_id, tenant_id = uuid4(), uuid4()
+    threads = InMemoryThreadMetaStore()
+    await threads.create(thread_id=thread_id, tenant_id=tenant_id, created_by="u")
+    recorder = ThreadStatsRecorderImpl(threads=threads)
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+
+    async with make_checkpointer("memory") as cp:
+        runner = GraphRunner(checkpointer=cp)
+        graph = runner.compile(
+            build_react_graph(llm_caller=_EchoLLM(), tool_registry=ToolRegistry())
+        )
+        config: dict[str, Any] = {
+            "configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}
+        }
+        record = await rm.create(
+            run_id=uuid4(),
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            on_disconnect=DisconnectMode.CANCEL,
+        )
+        await run_agent(
+            bridge=bridge,
+            run_manager=rm,
+            record=record,
+            graph=graph,
+            graph_input={
+                "messages": [HumanMessage(content="ping")],
+                "step_count": 0,
+                "max_steps": 5,
+            },
+            config=config,
+            thread_stats_recorder=recorder,
+        )
+        await _drain(bridge, record.run_id)
+        await _drain_thread_stats_tasks()
+
+    before = await threads.get(thread_id, tenant_id=tenant_id)
+    assert before is not None
+    assert before.message_count == 2, "前置没建立好,后面的断言就没意义了"
+
+    broken_record = await rm.create(
+        run_id=uuid4(),
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        on_disconnect=DisconnectMode.CANCEL,
+    )
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=broken_record,
+        graph=_BrokenStateGraph(),  # type: ignore[arg-type]
+        graph_input={},
+        config={"configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}},
+        thread_stats_recorder=recorder,
+    )
+    await _drain(bridge, broken_record.run_id)
+    await _drain_thread_stats_tasks()
+
+    after = await threads.get(thread_id, tenant_id=tenant_id)
+    assert after is not None
+    assert after.message_count == 2  # 保持原值,没被刷成 0
+
+
+@pytest.mark.asyncio
+async def test_genuinely_empty_thread_is_written_as_zero() -> None:
+    """读成功但真没有可见轮次 → 就该写 0(不能连这条也一起跳掉)。
+
+    先把计数种成 7,这样「写 0」是一次真实的变更 —— 否则 ``create`` 的初值
+    本来就是 0,断言 ``== 0`` 会是个重言式。
+    """
+    thread_id, tenant_id = uuid4(), uuid4()
+    threads = InMemoryThreadMetaStore()
+    await threads.create(thread_id=thread_id, tenant_id=tenant_id, created_by="u")
+    assert await threads.update_message_count(thread_id, 7, tenant_id=tenant_id)
+    recorder = ThreadStatsRecorderImpl(threads=threads)
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        on_disconnect=DisconnectMode.CANCEL,
+    )
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_EmptyStateGraph(),  # type: ignore[arg-type]
+        graph_input={},
+        config={"configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}},
+        thread_stats_recorder=recorder,
+    )
+    await _drain(bridge, record.run_id)
+    await _drain_thread_stats_tasks()
+
+    got = await threads.get(thread_id, tenant_id=tenant_id)
+    assert got is not None
+    assert got.message_count == 0
 
 
 # ---------------------------------------------------------------------------

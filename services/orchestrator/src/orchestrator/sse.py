@@ -1104,10 +1104,19 @@ async def _record_thread_stats_safe(
     **重算,不累加**:同一个会话会被重试、被打断、在审批处暂停后续跑,累加型
     计数器在这些路径上必然漂。每次都从终局 state 全量重算,任何一次成功的
     run 终局都把计数纠回来。
+
+    **「取不到」与「真的空」必须分开**:读不到终局 state 时跳过写入(保留上一
+    次的正确值),只有读成功了才写 —— 读成功但没有可见轮次就正常写 ``0``。
     """
     try:
         async with asyncio.timeout(_THREAD_STATS_DISPATCH_TIMEOUT_S):
-            messages = await _fetch_final_messages(graph, config)
+            messages = await _fetch_final_messages_or_none(graph, config)
+            if messages is None:
+                # 取不到 state ≠ 会话是空的。这时若照写 0,checkpointer 抖一下
+                # 就能把一个 50 条消息的会话在第三方眼里变成「0 条」—— 用错误
+                # 数据盖掉正确数据。跳过则计数停在上一次的正确值,下次 run 自愈。
+                logger.warning("run_agent.thread_stats_skipped_no_state run_id=%s", record.run_id)
+                return
             tenant_id = _tenant_id_from_config(config) or record.tenant_id
             await recorder.record(
                 thread_id=record.thread_id, tenant_id=tenant_id, messages=messages
@@ -1118,6 +1127,43 @@ async def _record_thread_stats_safe(
         # The recorder catches its own errors; reaching here means the state
         # fetch itself failed. Best-effort by design.
         logger.exception("run_agent.thread_stats_failed run_id=%s", record.run_id)
+
+
+async def _fetch_final_messages_or_none(
+    graph: StreamableGraph, config: RunnableConfig
+) -> Sequence[BaseMessage] | None:
+    """Like :func:`_fetch_final_messages`, but ``None`` means **couldn't read**.
+
+    ``_fetch_final_messages`` collapses every failure into ``[]``, which is fine
+    for the trajectory envelope (an empty ``messages`` list just means "no
+    conversation content recorded") but wrong for a counter: a caller can't tell
+    "the checkpointer was down" from "this thread genuinely has no messages",
+    and writing ``0`` in the first case destroys a correct count.
+
+    Deliberately a separate function rather than a refactor of
+    ``_fetch_final_messages`` — that one is also the trajectory path's, and
+    rewiring it would move its failure log (``trajectory_state_fetch_failed``)
+    out from under its own owner.
+
+    Returns the message list on a successful read (possibly empty — that's a
+    real, writable ``0``), ``None`` when the state could not be read at all.
+    """
+    aget_state = getattr(graph, "aget_state", None)
+    if not callable(aget_state):
+        return None
+    try:
+        snapshot = await aget_state(config)
+    except Exception:
+        logger.exception("run_agent.thread_stats_state_fetch_failed")
+        return None
+    values = getattr(snapshot, "values", None)
+    if not isinstance(values, Mapping):
+        return None
+    raw = values.get("messages")
+    if not isinstance(raw, Sequence):
+        # 包括 ``messages`` 键不存在的情况 —— 那也是「没读到」,不是「空会话」。
+        return None
+    return [m for m in raw if isinstance(m, BaseMessage)]
 
 
 def _dispatch_skill_run_usage(
