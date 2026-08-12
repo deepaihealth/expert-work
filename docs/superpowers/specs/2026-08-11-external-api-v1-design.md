@@ -166,6 +166,12 @@ Dify(「仅支持流式模式」)明确胜出的一点,且 queue 才是最需要
 > **补齐要二选一**:
 > (a) 改**写入**路径,把时间戳 / `run_id` 塞进消息元数据 —— 影响所有 agent 执行路径,
 >     且只对改动之后写入的消息生效(历史消息补不出来);
+>
+>     > **勘误(2026-08-12,P2 brainstorm 逐点实查)**:"影响所有 agent 执行路径"**偏夸大**。
+>     > 盖戳落点只有 4 处且全部已手握 `run_id`;`additional_kwargs` 写入时盖戳是本仓库现成
+>     > 惯用法,`trigger_delivery.py:87` 已经在塞 `expert_work_source_run_id`。详见
+>     > [P2 spec §一「勘误一」](./2026-08-12-external-api-v1-p2-design.md)。
+>     > 后半句(历史补不出来)成立,P2 据此定为不回填。
 > (b) 走**消息镜像表**。注意镜像表已经存在(`thread_message` / `thread_message_sync`,
 >     迁移 0106),但它是给会话浏览器做内容检索的**异步索引**,不是对外服务路径:
 >     `thread_message.created_at` 是 sweep **写入镜像的时刻**,不是消息产生的时刻;没有
