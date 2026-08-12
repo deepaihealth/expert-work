@@ -365,10 +365,11 @@ async def test_unknown_transfer_method_is_422(
 async def test_document_type_is_accepted_by_the_model(
     external_client: AsyncClient, vision_agent: _VisionAgent, uploaded_image: _BoundImage
 ) -> None:
-    """``type: "document"`` must not be a 422 at the model layer — the
-    enum is meant to be live now even though the dispatch (folding it
-    somewhere useful) is Task 11's job. This only proves the request body
-    is accepted; it says nothing about what happens to the document ref."""
+    """``type: "document"`` must not be a 422 at the model layer.
+
+    修复轮 1:``upload_id`` 改成 ``uploads/doc-1.txt``(Task 11 收紧闸之后,
+    真正合法的 upload_id 形状必须带 ``uploads/`` 前缀 —— 裸文件名不再是
+    合法值,见 ``is_safe_document_upload_id``)。"""
     resp = await external_client.post(
         f"/v1/agents/{vision_agent.code}/runs",
         json={
@@ -376,7 +377,13 @@ async def test_document_type_is_accepted_by_the_model(
             "session_id": str(uploaded_image.session_id),
             "input": "x",
             "mode": "queue",
-            "files": [{"type": "document", "transfer_method": "local_file", "upload_id": "doc-1"}],
+            "files": [
+                {
+                    "type": "document",
+                    "transfer_method": "local_file",
+                    "upload_id": "uploads/doc-1.txt",
+                }
+            ],
         },
     )
     assert resp.status_code != 422
@@ -481,15 +488,36 @@ async def test_merged_image_refs_over_limit_is_422_not_500(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", ["../etc/passwd", "/etc/passwd", "a/b.txt", "..", "  ", "x\\y.txt"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",  # absolute path
+        "a/b.txt",  # has a "/" but not the uploads/ prefix
+        "uploads/../../etc/passwd",  # correct prefix, still traverses — the critical case
+        "uploads/a/b.txt",  # multi-level — the leaf itself has a "/"
+        "uploads/",  # correct prefix, empty leaf
+        "uploads/..",  # correct prefix, leaf is exactly ".."
+        "..",
+        ".",
+        "  ",  # whitespace-only — strips to empty, same as ""
+        "x\\y.txt",  # backslash, no uploads/ prefix
+        "uploads/a\x00.txt",  # NUL — not in _safe_workspace_name's allowed charset
+    ],
+)
 @pytest.mark.asyncio
 async def test_document_path_traversal_rejected(
     external_client: AsyncClient, plain_agent: _PlainAgent, bad: str
 ) -> None:
-    """Every path-traversal / non-bare-filename shape is rejected 422 with
-    the structured ``INVALID_FILE_REF`` code — not just a bare FastAPI
-    ``{"detail": ...}`` body (this endpoint's contract is the enveloped
-    ``{success, data, error}`` shape, same as ``TOO_MANY_IMAGE_REFS``)."""
+    """Every path-traversal / non-``uploads/<safe-leaf>`` shape is rejected
+    422 with the structured ``INVALID_FILE_REF`` code — not just a bare
+    FastAPI ``{"detail": ...}`` body (this endpoint's contract is the
+    enveloped ``{success, data, error}`` shape, same as
+    ``TOO_MANY_IMAGE_REFS``).
+
+    修复轮 1:``uploads/../../etc/passwd`` 与 ``uploads/a/b.txt`` 是最关键的
+    两条——它们带着"正确"的 ``uploads/`` 前缀,如果闸只检查前缀存在就会被
+    放行;必须证明闸校验的是剥掉前缀之后剩下的那段也不含穿越。"""
     resp = await external_client.post(
         f"/v1/agents/{plain_agent.code}/runs",
         json={
@@ -546,13 +574,50 @@ async def test_document_name_lands_in_prompt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_document_upload_id_shapes_from_safe_workspace_name_accepted(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    """修复轮 1 —— the gate must accept every shape ``_safe_workspace_name``
+    can actually produce. Generated from the *real* function (not hand-typed
+    strings) so the gate and the generator are pinned together by the test,
+    not by us remembering to keep them in sync."""
+    from control_plane.api.uploads import _safe_workspace_name
+
+    real_ids = [
+        _safe_workspace_name("报告.docx", ".docx"),  # CJK stem → falls back to a uuid stem
+        _safe_workspace_name("a b/c.txt", ".txt"),  # embedded space + "/" in the raw filename
+    ]
+    for upload_id in real_ids:
+        resp = await external_client.post(
+            f"/v1/agents/{plain_agent.code}/runs",
+            json={
+                "user_id": "u1",
+                "input": "总结这份文件",
+                "mode": "queue",
+                "files": [
+                    {"type": "document", "transfer_method": "local_file", "upload_id": upload_id}
+                ],
+            },
+        )
+        assert resp.status_code == 202, f"{upload_id!r} 应被接受: {resp.text}"
+        run_id = UUID(resp.json()["run_id"])
+        run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+        assert run is not None
+        assert run.enqueued_input is not None
+        assert run.enqueued_input["document_names"] == [upload_id]
+
+
+@pytest.mark.asyncio
 async def test_document_ref_lands_in_enqueued_payload(
     external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
 ) -> None:
     """A 202 alone doesn't prove the document name actually reached
     ``RunRequest.document_names`` — read the persisted ``enqueued_input``
     back (queue mode only persists it synchronously; the graph never runs
-    in this test) and assert the sanitised name landed exactly."""
+    in this test) and assert the sanitised name landed exactly.
+
+    修复轮 1:``upload_id`` 改成真实合法形状(``uploads/`` 前缀)——裸文件名
+    不再是合法值。"""
     resp = await external_client.post(
         f"/v1/agents/{plain_agent.code}/runs",
         json={
@@ -560,7 +625,11 @@ async def test_document_ref_lands_in_enqueued_payload(
             "input": "总结这份文件",
             "mode": "queue",
             "files": [
-                {"type": "document", "transfer_method": "local_file", "upload_id": "report.pdf"}
+                {
+                    "type": "document",
+                    "transfer_method": "local_file",
+                    "upload_id": "uploads/report.pdf",
+                }
             ],
         },
     )
@@ -569,7 +638,7 @@ async def test_document_ref_lands_in_enqueued_payload(
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None
-    assert run.enqueued_input["document_names"] == ["report.pdf"]
+    assert run.enqueued_input["document_names"] == ["uploads/report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -595,7 +664,7 @@ async def test_mixed_image_and_document_files_dispatch_to_both_channels(
                 {
                     "type": "document",
                     "transfer_method": "local_file",
-                    "upload_id": "summary.docx",
+                    "upload_id": "uploads/summary.docx",
                 },
             ],
         },
@@ -606,7 +675,7 @@ async def test_mixed_image_and_document_files_dispatch_to_both_channels(
     assert run is not None
     assert run.enqueued_input is not None
     assert run.enqueued_input["image_refs"] == [uploaded_image.uri]
-    assert run.enqueued_input["document_names"] == ["summary.docx"]
+    assert run.enqueued_input["document_names"] == ["uploads/summary.docx"]
 
 
 @pytest.mark.asyncio

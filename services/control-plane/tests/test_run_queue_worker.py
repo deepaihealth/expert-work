@@ -171,6 +171,52 @@ async def test_claims_and_starts_queued_run(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_claimed_run_carries_document_names_into_graph_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """修复轮 1(原顾虑 2)—— P2 块 1(Task 11)加了 ``document_names`` 但漏了
+    这一处回读:``enqueued_input`` 里存了它,``_execute`` 重放时却没有读
+    回来喂给 ``build_run_graph_input``,queue 模式下的文档附件会静默消失
+    (只是被正确持久化,从未真正到达 agent)。
+
+    与既有的 ``test_claims_and_starts_queued_run`` 同一套装置(``run_agent``
+    monkeypatch 成录制型假函数),但断言的是 ``_execute`` 真正构造、准备喂
+    给 graph 的 ``HumanMessage`` —— 不是只断言 ``enqueued_input`` 里存着了
+    (那条在 ``test_external_run_files.py`` 已经测过,证明的是"持久化对不
+    对";这条证明的是"重放时有没有读回来喂给 agent",是两件不同的事——
+    这也正是本次要修的 bug 唯一会漏出来的地方)。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "总结这份文件",
+            "image_refs": [],
+            "untrusted_content": [],
+            "document_names": ["uploads/report.pdf"],
+        },
+    )
+
+    started = await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)  # let the spawned task body run
+
+    assert started == 1
+    assert len(spawns) == 1
+    human_message_content = spawns[0]["graph_input"]["messages"][1].content
+    assert "[file attached: uploads/report.pdf]" in human_message_content
+
+
+@pytest.mark.asyncio
 async def test_exactly_one_worker_claims(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _fake_run_agent(**kw):
         return None

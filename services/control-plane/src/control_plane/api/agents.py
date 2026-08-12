@@ -16,7 +16,6 @@ import hashlib
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -34,6 +33,7 @@ from control_plane.api._external import (
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import MAX_RUN_IMAGE_REFS, MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
+from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.manifest import (
@@ -202,34 +202,34 @@ def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
 
 
 def _safe_document_name_or_422(name: str) -> str:
-    """校验第三方回填的文档 ``upload_id``(= 工作区里的纯文件名)。
+    """校验第三方回填的文档 ``upload_id``。
 
-    上传时已经过 ``uploads.py`` 的 ``_safe_workspace_name`` 净化,但那是
-    **上传路径**的保证;run 请求体里的这个字符串是客户端自己给的,上传与
-    run 是两个独立请求,必须独立校验 —— 否则 ``../`` 就能读到工作区外
-    (攻击者可以直接调 run,不必经过上传路径)。只接受纯文件名:含路径
-    分隔符、``..``、绝对路径、空字符串一律拒绝。
+    修复轮 1(原顾虑 1)——早期实现按 brief 字面"只接受纯文件名,含 `/` 一律
+    拒",但 ``uploads.py`` 的 ``_safe_workspace_name`` 恒定产出
+    ``uploads/<stem><ext>``(带 ``uploads/`` 前缀),那条规则会把**唯一合法
+    的真实 upload_id 全部拒掉**,整条"上传 → run"流程端到端死——这是 brief
+    本身的规则错,不是"再加一层防御"的问题。
 
-    失败走 ``HTTPException``(结构化 ``detail``,与 ``TOO_MANY_IMAGE_REFS``
-    同一个 ``code``/``message`` 形状),调用方 ``run_agent_for_user`` 在端点
-    边界转译成对外 ``{success, data, error}`` 信封 —— 不放行裸
+    正确规则不是"拒绝一切 `/`",而是"必须正好是 ``_safe_workspace_name``
+    有可能生成的形状"——``is_safe_document_upload_id``(与 `_safe_workspace_name``
+    同文件、同源字符集)。上传与 run 是两个独立请求,即便生成规则收紧了,
+    run 这一侧仍然必须独立复核这个字符串(客户端给的是不可信输入,攻击者
+    可以直接调 run,不必经过上传路径)。
+
+    失败走 ``HTTPException``(结构化 ``detail``),调用方 ``run_agent_for_user``
+    在端点边界转译成对外 ``{success, data, error}`` 信封 —— 不放行裸
     ``{"detail": ...}``。
     """
     cleaned = name.strip()
-    if not cleaned or cleaned != PurePosixPath(cleaned).name or cleaned in {".", ".."}:
+    if not is_safe_document_upload_id(cleaned):
         raise HTTPException(
             status_code=422,
             detail={
                 "code": "INVALID_FILE_REF",
-                "message": "document upload_id must be a bare filename",
-            },
-        )
-    if "\\" in cleaned or "/" in cleaned:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "INVALID_FILE_REF",
-                "message": "document upload_id must not contain path separators",
+                "message": (
+                    "document upload_id must be a workspace ref returned by "
+                    "POST /v1/agents/{agent_code}/uploads (uploads/<name>)"
+                ),
             },
         )
     return cleaned

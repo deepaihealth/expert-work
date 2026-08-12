@@ -270,6 +270,11 @@ class RunQueueWorker:
                 untrusted_content=payload.get("untrusted_content"),
                 inputs=payload.get("inputs") or {},
                 run_id=run.run_id,
+                # 修复轮 1(原顾虑 2)—— P2 块 1(Task 11)加了 document_names,
+                # 但漏了这一处回读:enqueued_input 里存了它,重放时却没读
+                # 回来,queue 模式下的文档附件会静默消失。image_refs / inputs
+                # 都在这儿回读,document_names 补齐同一模式。
+                document_names=list(payload.get("document_names") or []),
             )
 
             # Adopt the durable run into THIS instance's registry (no new
