@@ -109,6 +109,14 @@ logger = logging.getLogger("expert_work.control_plane.runs")
 #: limit — there is no global request-body middleware behind it.
 MAX_RUN_INPUT_CHARS: Final[int] = 65536
 
+#: Cap on ``RunRequest.image_refs``. Named (not a bare ``max_length=64``
+#: literal) so the external run endpoint (P2 块 1 — merges ``files[]``'s
+#: image entries into this same list before constructing ``RunRequest``
+#: by hand, off the FastAPI request-body validation path) can pre-check the
+#: merged length itself and fail with a clean 422 instead of letting an
+#: uncaught pydantic ``ValidationError`` escape as a 500.
+MAX_RUN_IMAGE_REFS: Final[int] = 64
+
 
 class RunRequest(BaseModel):
     """POST body. ``input`` is the user's prompt for this run;
@@ -124,7 +132,7 @@ class RunRequest(BaseModel):
     #: the ``run_id`` immediately; a ``RunQueueWorker`` on any instance executes
     #: it, and the client reads the output over ``GET .../runs/{id}/events``.
     mode: Literal["stream", "queue"] = "stream"
-    image_refs: list[str] = Field(default_factory=list, max_length=64)
+    image_refs: list[str] = Field(default_factory=list, max_length=MAX_RUN_IMAGE_REFS)
     #: Stream PI-1c — structured untrusted input. A business system passes
     #: the data to act on (a ticket / email / document) here instead of
     #: concatenating it into ``input``, so expert_work knows which span is
