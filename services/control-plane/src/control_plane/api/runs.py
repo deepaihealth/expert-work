@@ -133,6 +133,11 @@ class RunRequest(BaseModel):
     #: it, and the client reads the output over ``GET .../runs/{id}/events``.
     mode: Literal["stream", "queue"] = "stream"
     image_refs: list[str] = Field(default_factory=list, max_length=MAX_RUN_IMAGE_REFS)
+    #: P2 块 1(Task 11)—— ``files[]`` 里 ``type == "document"`` 的条目,已经
+    #: 在调用方(``agents.py`` 的 ``run_agent_for_user``)过了
+    #: ``_safe_document_name_or_422`` 净化的纯文件名。拼进 ``_build_human_message``
+    #: 的 ``[file attached: <name>]`` 提示行,与图片引用各自独立。
+    document_names: list[str] = Field(default_factory=list, max_length=64)
     #: Stream PI-1c — structured untrusted input. A business system passes
     #: the data to act on (a ticket / email / document) here instead of
     #: concatenating it into ``input``, so expert_work knows which span is
@@ -269,6 +274,7 @@ def _build_human_message(
     supports_vision: bool,
     untrusted_content: list[str] | None = None,
     spotlight_nonce: str | None = None,
+    document_names: list[str] | None = None,
 ) -> HumanMessage:
     """Assemble the ``HumanMessage`` for a J.6 multimodal run input.
 
@@ -283,6 +289,12 @@ def _build_human_message(
 
     No-images case — emit plain text unchanged.
 
+    P2 块 1(Task 11)—— ``document_names`` mentions each uploaded document
+    as a ``[file attached: <name>]`` line, independent of the image path
+    (a text-only agent can have both images and documents attached in the
+    same run). The agent's workspace tools (``read_document``) resolve the
+    name.
+
     Stream PI-1c — when ``untrusted_content`` is supplied, the fenced
     blocks are appended after the trusted instruction text (as a trailing
     text segment in both the content-block and plain paths) so the model
@@ -294,20 +306,22 @@ def _build_human_message(
         if untrusted_content
         else ""
     )
+    doc_mentions = "\n".join(f"[file attached: {name}]" for name in (document_names or []))
     if not image_refs:
-        body = f"{text}\n\n{untrusted}" if untrusted and text else (untrusted or text)
-        return HumanMessage(content=body)
+        parts = [p for p in (text, doc_mentions, untrusted) if p]
+        return HumanMessage(content="\n\n".join(parts))
     if supports_vision:
         content: list[dict[str, Any]] = []
         if text:
             content.append({"type": "text", "text": text})
         for ref in image_refs:
             content.append(image_ref_block(ref))
-        if untrusted:
-            content.append({"type": "text", "text": untrusted})
+        trailer = "\n\n".join(p for p in (doc_mentions, untrusted) if p)
+        if trailer:
+            content.append({"type": "text", "text": trailer})
         return HumanMessage(content=content)
     mentions = "\n".join(f"[image attached: {ref}]" for ref in image_refs)
-    parts = [p for p in (text, mentions, untrusted) if p]
+    parts = [p for p in (text, mentions, doc_mentions, untrusted) if p]
     return HumanMessage(content="\n\n".join(parts))
 
 
@@ -319,6 +333,7 @@ def build_run_graph_input(
     untrusted_content: list[str] | None,
     inputs: dict[str, Any] | None = None,
     run_id: UUID | None = None,
+    document_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the graph input for a run from a built agent + user input.
 
@@ -342,6 +357,7 @@ def build_run_graph_input(
         supports_vision=built.supports_vision,
         untrusted_content=untrusted_content,
         spotlight_nonce=built.spotlight_nonce,
+        document_names=document_names,
     )
     if run_id is not None:
         human = stamp_message(human, run_id=str(run_id), now=datetime.now(UTC))
@@ -859,6 +875,7 @@ async def spawn_run(
                 "image_refs": payload.image_refs,
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
+                "document_names": payload.document_names,
             },
             is_resume=bool(prior_runs),
             trace_id=trace_id,
@@ -885,6 +902,7 @@ async def spawn_run(
         untrusted_content=payload.untrusted_content,
         inputs=payload.inputs,
         run_id=run_id,
+        document_names=payload.document_names,
     )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),

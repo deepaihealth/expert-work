@@ -16,6 +16,7 @@ import hashlib
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -198,6 +199,40 @@ def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
             "error": {"code": code, "message": message},
         },
     )
+
+
+def _safe_document_name_or_422(name: str) -> str:
+    """校验第三方回填的文档 ``upload_id``(= 工作区里的纯文件名)。
+
+    上传时已经过 ``uploads.py`` 的 ``_safe_workspace_name`` 净化,但那是
+    **上传路径**的保证;run 请求体里的这个字符串是客户端自己给的,上传与
+    run 是两个独立请求,必须独立校验 —— 否则 ``../`` 就能读到工作区外
+    (攻击者可以直接调 run,不必经过上传路径)。只接受纯文件名:含路径
+    分隔符、``..``、绝对路径、空字符串一律拒绝。
+
+    失败走 ``HTTPException``(结构化 ``detail``,与 ``TOO_MANY_IMAGE_REFS``
+    同一个 ``code``/``message`` 形状),调用方 ``run_agent_for_user`` 在端点
+    边界转译成对外 ``{success, data, error}`` 信封 —— 不放行裸
+    ``{"detail": ...}``。
+    """
+    cleaned = name.strip()
+    if not cleaned or cleaned != PurePosixPath(cleaned).name or cleaned in {".", ".."}:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_FILE_REF",
+                "message": "document upload_id must be a bare filename",
+            },
+        )
+    if "\\" in cleaned or "/" in cleaned:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_FILE_REF",
+                "message": "document upload_id must not contain path separators",
+            },
+        )
+    return cleaned
 
 
 def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
@@ -448,8 +483,9 @@ class ExternalRunRequest(BaseModel):
     #: P2 块 1 —— 统一附件引用。``type == "image"`` 的条目合并进
     #: ``image_refs`` 交给 ``spawn_run`` 里现成的 ``_validate_image_refs``
     #: 做 thread 绑定 / 条数上限 / ``supports_vision`` 三重校验(见
-    #: ``run_agent_for_user``)。``type == "document"`` 是后续任务的事,这里
-    #: 只让模型层的枚举先就位。
+    #: ``run_agent_for_user``)。``type == "document"`` 的条目在同一处过
+    #: ``_safe_document_name_or_422`` 净化后并入 ``RunRequest.document_names``
+    #: (Task 11)。
     files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
 
 
@@ -977,12 +1013,34 @@ def build_agents_router() -> APIRouter:
                 f"files[] 与 image_refs 合计不能超过 {MAX_RUN_IMAGE_REFS} 张图片",
                 422,
             )
+
+        # P2 块 1(Task 11)—— files[] 的 document 条目逐个过路径净化闸,再并
+        # 进 RunRequest.document_names。客户端给的是字符串,上传时走过的
+        # _safe_workspace_name 净化只保证了上传路径,run 这一侧必须独立
+        # 重新校验(否则 ../ 就能读到工作区外)。_safe_document_name_or_422
+        # 抛的是结构化 HTTPException(与 spawn_run 内部沿用的裸 detail 风格
+        # 不同),这里就地转译成对外信封,不让裸 {"detail": ...} 逃逸。
+        try:
+            document_names = [
+                _safe_document_name_or_422(f.upload_id)
+                for f in payload.files
+                if f.type == "document"
+            ]
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return _envelope_error(
+                detail.get("code", "INVALID_FILE_REF"),
+                detail.get("message", "invalid file reference"),
+                exc.status_code,
+            )
+
         run_payload = RunRequest(
             input=payload.input,
             mode=payload.mode,
             image_refs=image_refs,
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
+            document_names=document_names,
         )
         return await spawn_run(
             runtime=runtime,

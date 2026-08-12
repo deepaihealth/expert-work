@@ -1,4 +1,5 @@
-"""files[] —— 统一图片 / 文档引用(P2 块 1, Task 10: 只做 image 分发)。
+"""files[] —— 统一图片 / 文档引用(P2 块 1, Task 10: image 分发;Task 11: 文档
+分发 + 路径净化闸)。
 
 Fixture shape mirrors ``test_external_run_inputs.py`` (Task 9): app + service-
 account API-key client scoped to one tenant, plus a local ``AgentRuntime``
@@ -185,6 +186,49 @@ async def vision_agent(_external_ctx: _ExternalCtx) -> _VisionAgent:
         created_by="seed",
     )
     return _VisionAgent(code="vision-bot")
+
+
+# Task 11 — a non-vision agent, to prove document dispatch does not depend on
+# ``supports_vision`` (only the image-ref path is gated on it).
+_PLAIN_SPEC: dict[str, Any] = {
+    "apiVersion": "expert_work.io/v1",
+    "kind": "Agent",
+    "metadata": {"name": "plain-bot", "version": "1.0.0", "tenant": "acme"},
+    "spec": {
+        "tenant_config": {},
+        "model": {
+            "provider": "anthropic",
+            "name": "claude-sonnet-4-5",
+            "supports_vision": False,
+        },
+        "system_prompt": {"template": "you are a helpful assistant"},
+        "sandbox": {
+            "resources": {"cpu": "1.0", "memory": "1Gi"},
+            "network": {"egress": "proxy", "allowlist": ["api.anthropic.com"]},
+            "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+        },
+    },
+}
+
+
+def _plain_spec() -> AgentSpec:
+    return AgentSpec.model_validate(deepcopy(_PLAIN_SPEC))
+
+
+@dataclass
+class _PlainAgent:
+    code: str
+
+
+@pytest.fixture
+async def plain_agent(_external_ctx: _ExternalCtx) -> _PlainAgent:
+    await _external_ctx.app.state.agent_spec_repo.create(
+        tenant_id=_external_ctx.tenant_id,
+        spec=_plain_spec(),
+        spec_sha256="e" * 64,
+        created_by="seed",
+    )
+    return _PlainAgent(code="plain-bot")
 
 
 @dataclass
@@ -430,3 +474,155 @@ async def test_merged_image_refs_over_limit_is_422_not_500(
     assert body["success"] is False
     assert body["data"] is None
     assert body["error"]["code"]
+
+
+# ---------------------------------------------------------------------------
+# Task 11 — files[] document dispatch + path-traversal gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["../etc/passwd", "/etc/passwd", "a/b.txt", "..", "  ", "x\\y.txt"])
+@pytest.mark.asyncio
+async def test_document_path_traversal_rejected(
+    external_client: AsyncClient, plain_agent: _PlainAgent, bad: str
+) -> None:
+    """Every path-traversal / non-bare-filename shape is rejected 422 with
+    the structured ``INVALID_FILE_REF`` code — not just a bare FastAPI
+    ``{"detail": ...}`` body (this endpoint's contract is the enveloped
+    ``{success, data, error}`` shape, same as ``TOO_MANY_IMAGE_REFS``)."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "files": [{"type": "document", "transfer_method": "local_file", "upload_id": bad}],
+        },
+    )
+    assert resp.status_code == 422, f"{bad!r} 应被拒: {resp.text}"
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_FILE_REF"
+
+
+@pytest.mark.asyncio
+async def test_document_empty_upload_id_rejected(
+    external_client: AsyncClient, plain_agent: _PlainAgent
+) -> None:
+    """The empty string is rejected too — but earlier than the path gate:
+    ``ExternalFileRef.upload_id`` itself has ``min_length=1``, so this one
+    never reaches ``_safe_document_name_or_422`` and surfaces the app-wide
+    ``/v1/agents/`` validation envelope (``INVALID_REQUEST``) instead of
+    ``INVALID_FILE_REF``. Still 422, still enveloped — never a bare
+    ``{"detail": ...}``."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "x",
+            "mode": "queue",
+            "files": [{"type": "document", "transfer_method": "local_file", "upload_id": ""}],
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_document_name_lands_in_prompt() -> None:
+    from control_plane.api.runs import _build_human_message
+
+    msg = _build_human_message(
+        input_text="总结这份文件",
+        image_refs=[],
+        supports_vision=False,
+        document_names=["合同.pdf"],
+    )
+    assert "[file attached: 合同.pdf]" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_document_ref_lands_in_enqueued_payload(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    """A 202 alone doesn't prove the document name actually reached
+    ``RunRequest.document_names`` — read the persisted ``enqueued_input``
+    back (queue mode only persists it synchronously; the graph never runs
+    in this test) and assert the sanitised name landed exactly."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "input": "总结这份文件",
+            "mode": "queue",
+            "files": [
+                {"type": "document", "transfer_method": "local_file", "upload_id": "report.pdf"}
+            ],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = UUID(resp.json()["run_id"])
+    run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert run is not None
+    assert run.enqueued_input is not None
+    assert run.enqueued_input["document_names"] == ["report.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_image_and_document_files_dispatch_to_both_channels(
+    external_client: AsyncClient,
+    vision_agent: _VisionAgent,
+    uploaded_image: _BoundImage,
+    _external_ctx: _ExternalCtx,
+) -> None:
+    """A single ``files[]`` array carrying one image and one document must
+    fan out into both channels: the image lands in ``image_refs`` (the
+    existing multimodal path), the document lands in ``document_names`` —
+    independently, in the same request."""
+    resp = await external_client.post(
+        f"/v1/agents/{vision_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(uploaded_image.session_id),
+            "input": "看图并总结附件",
+            "mode": "queue",
+            "files": [
+                {"type": "image", "transfer_method": "local_file", "upload_id": uploaded_image.uri},
+                {
+                    "type": "document",
+                    "transfer_method": "local_file",
+                    "upload_id": "summary.docx",
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = UUID(resp.json()["run_id"])
+    run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert run is not None
+    assert run.enqueued_input is not None
+    assert run.enqueued_input["image_refs"] == [uploaded_image.uri]
+    assert run.enqueued_input["document_names"] == ["summary.docx"]
+
+
+@pytest.mark.asyncio
+async def test_no_files_document_names_stays_empty(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    """``files[]`` omitted entirely — the new ``document_names`` plumbing
+    must not perturb the pre-Task-11 behaviour of a plain run."""
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "input": "hello", "mode": "queue"},
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = UUID(resp.json()["run_id"])
+    run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert run is not None
+    assert run.enqueued_input is not None
+    assert run.enqueued_input["document_names"] == []
+    assert run.enqueued_input["image_refs"] == []
