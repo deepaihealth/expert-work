@@ -7,6 +7,12 @@
 - `mode: "stream"` 的 `POST /v1/agents/{agent_code}/runs` 响应体本身就是这条 SSE 流。
 - `mode: "queue"` 不返回流(直接 `202`);想看这次 run 的事件,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>`——run 还在跑就实时接进去,run 已经跑完就把持久化的帧按顺序回放一遍再收尾。
 
+::: warning 这条接口对没跑完的 run 是长连接
+`GET .../runs/{run_id}/events` 打在一个还没结束的 run 上时会**一直挂着**,直到那个 run 走到终态才返回——这是"实时接进去"的应有之义,不是卡死,但服务端不会替你设上限:run 跑多久,连接就开多久;run 因为排队一直没被执行,连接就一直不返回。
+
+所以客户端必须自己兜:设一个符合你业务的读超时(别用默认的"无限等"),超时后按 [断线重连](#断线重连) 那一节带 `since_seq` 重连,而不是重新调 `/runs`(那会开启新的一轮 run)。只想粗粒度知道 run 结束没有、不想挂着等,调 `GET /v1/agents/{agent_code}/sessions?user_id=…` 看每项的 `running` 布尔字段。
+:::
+
 每一帧都是标准 SSE 格式:
 
 ```

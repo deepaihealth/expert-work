@@ -39,6 +39,8 @@ Content-Type: application/json
 
 拿到 `run_id` / `thread_id` 后,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。`user_id` 是必填查询参数,且必须是发起这次 run 的那个——对不上一律 404(`RUN_NOT_FOUND`),不会告诉你这个 run 到底存不存在。这条接口要 `read` scope,`write` key 含读所以也能直接调。
 
+**注意**:run 还没结束时这条接口是长连接,会一直挂到 run 走到终态才返回,服务端不设上限——客户端必须自己设读超时,超时后带 `since_seq` 重连。细节见 [SSE 事件格式](./sse-events)。
+
 想粗粒度知道"这段会话里还有没有 run 在跑",调 `GET /v1/agents/{agent_code}/sessions?user_id=<同一个 user_id>`,返回的每一项都带一个 `running` 布尔字段。
 
 ## 续接会话

@@ -140,11 +140,40 @@ Dify(「仅支持流式模式」)明确胜出的一点,且 queue 才是最需要
 `running` = 该会话当前是否有 run 在执行(底层 `has_inflight` 现成),让第三方列表能直接标注
 "执行中",不必逐个查。
 
+> **⚠️ P1 未交付,已挪 P2(用户裁定 2026-08-12):`message_count`。**
+> P1 实际返回 `{session_id, title, created_at, updated_at, running}`,少一个 `message_count`。
+> 根因与下面 §四-5 的两个字段同源(消息本体只在 LangGraph 检查点里,SQL 侧没有可直接
+> 聚合的权威行):要么每列一行会话就展开一次检查点(列表页 N 次反序列化),要么读
+> `thread_message_sync.message_count` —— 那是 `TranscriptMirrorSweep` 的水位行,**扫到才有值**
+> (刚建的会话根本没有这一行),且只计入文本轮次,对外当权威计数会给出滞后/为 0 的答案。
+> 两条路都要真做,不是漏写一行。加字段向后兼容,晚补不破坏已对接的第三方。
+
+
+
 ### 5. `GET /v1/agents/{code}/sessions/{session_id}/messages`(新建)
 
 `?user_id=`(必填)`&limit=&offset=`。现有内部端点返回 `{role, content, channel}`,已足够干净,
 但**缺时间戳、缺所属 run、缺分页**——对外版本补上:
 `{role, content, channel, created_at, run_id}` + 分页信封。
+
+> **⚠️ P1 未交付,已挪 P2(用户裁定 2026-08-12):`created_at` 与 `run_id`。**
+> P1 交付的是 `{role, content, channel}` + 分页信封;分页做了,两个新字段没做。
+>
+> **根因**:LangGraph 的检查点里**压根没存**逐条消息的时间戳与所属 run —— `MessageTurn`
+> 只有 `seq/role/content/channel`,没有任何可以推出"这条消息什么时候产生、属于哪次 run"的
+> 信息。所以这不是映射时漏写一个字段,而是数据源里没有这份数据。
+>
+> **补齐要二选一**:
+> (a) 改**写入**路径,把时间戳 / `run_id` 塞进消息元数据 —— 影响所有 agent 执行路径,
+>     且只对改动之后写入的消息生效(历史消息补不出来);
+> (b) 走**消息镜像表**。注意镜像表已经存在(`thread_message` / `thread_message_sync`,
+>     迁移 0106),但它是给会话浏览器做内容检索的**异步索引**,不是对外服务路径:
+>     `thread_message.created_at` 是 sweep **写入镜像的时刻**,不是消息产生的时刻;没有
+>     `run_id` 列,连 `channel` 都没有;而且 sweep 没扫到的会话在表里根本不存在。
+>     所以这条路是"扩列 + 改由写入侧同步 + 回填历史",不是"读现成的表"。
+>
+> P1 的目标是契约地基 + 安全收口,这三个字段(连同 §四-4 的 `message_count`)是展示增强,
+> 不阻碍第三方跑通;P2 本来就要重做请求/响应体,一并做。加字段向后兼容,晚补不破坏已对接方。
 
 ### 6. `POST /v1/agents/{code}/uploads`(新建)
 
