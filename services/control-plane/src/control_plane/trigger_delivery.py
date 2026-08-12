@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -34,6 +34,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_turns
+from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import ThreadMessageStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import TriggerRecord
@@ -87,6 +88,8 @@ async def inject_delivery(
             "expert_work_scheduled_delivery": True,
             "expert_work_source_run_id": str(source_run_id),
             "expert_work_trigger_id": str(trigger_id),
+            STAMP_CREATED_AT: datetime.now(UTC).isoformat(),
+            STAMP_RUN_ID: str(source_run_id),
         },
     )
     await graph.aupdate_state(
