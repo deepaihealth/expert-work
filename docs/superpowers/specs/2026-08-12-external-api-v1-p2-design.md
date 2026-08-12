@@ -78,6 +78,8 @@ P1 spec 把三个字段并列,实际工作量差一个量级。
 1. **块 2 · 三个缺失字段** —— 消息盖戳(`created_at` + `run_id`)+ `thread_meta.message_count`
 2. **块 1 · 请求体做厚** —— `files[]`、`inputs` 透传、`Idempotency-Key`
 3. **块 3 · 响应信封化** —— `POST /v1/agents/{code}/runs` 的 202 响应
+4. **块 4 · 客户端补完** —— 工作区文件列表/下载 + 会话重命名/删除(见 §六;与前三块无代码耦合,
+   建议拆独立 PR)
 
 ### 不做什么
 
@@ -291,7 +293,55 @@ stream 模式是 SSE,无信封可言(帧格式的文档化属 P3 范围)。错�
 **这是破坏性改动。** #1155 于 2026-08-12 合入并当日发上测试集群,尚无第三方接入,现在破的
 成本约等于零;再拖就不是了。
 
-## 六、兼容与迁移
+## 六、块 4:客户端补完(建议在 P2 内拆独立 PR)
+
+### 为什么在这里
+
+2026-08-12 用户问:「这波改完,前端能做出 workbuddy / Claude 那类 agent 客户端的效果吗?」
+
+据实回答是**不能**,而且缺的东西不在 P2 的前三块里:
+
+- **还原 agent 交互过程**靠的是 SSE 帧,数据早就全在(对外流与调试台同源零裁剪,现发
+  `updates` / `token` / `worker` / `guard` / `compaction` / `metadata` / `retry` / `approval` /
+  `error` / `end` 十种帧),卡点是 `updates` 帧公开文档只有一行 —— 那是 **P3** 的头号内容。
+- 但 P3 做完仍差两样**契约面**的东西,而它们与 P2 前三块同形状(对外端点补齐),放 P3 是错配。
+
+所以列为块 4。它与前三块无代码耦合,**建议拆独立 PR** —— 前三块已含 2 次 DB 迁移 + 一个新的
+orchestrator recorder,再塞 5 个端点会让单个 PR 过大。
+
+### A. 工作区文件:列表 + 下载(高优先)
+
+**问题场景**:agent 生成了一份报表 Excel 落在用户工作区,第三方界面上**给不出下载按钮** ——
+文件出不来,这一整类"agent 产出物"的交互就不存在。
+
+现状:`api/workspace.py` 有完整的概览(`GET ""`)/ 列表(`GET /files`)/ 下载(`GET /file`)/
+删除(`DELETE /file`),但**四个全挂 `console_only()`** —— P1 的控制台平面收口是刻意锁的。
+
+对外镜像 `GET /v1/agents/{code}/workspace/files` 与 `GET /v1/agents/{code}/workspace/file`:
+
+- 复用 `_safe_workspace_relpath`、`infer_content_type`、`content_disposition_header`、
+  `workspace_store.read_file`(MIME 嗅探、XSS 安全的 `attachment` + `nosniff`、路径二次校验、
+  「权限失败 vs 文件不存在」分开 —— 全部白拿)
+- 把 `ensure_single_tenant_scope` + `resolve_target_user_id` 换成 P1 的 `_external.py` 解析
+  (`user_id` query → `external_subject_id` → `tenant_user`),`mint=False`
+- 走 `require("session", "read")` scope 闸 + 对外信封
+
+**不镜像 `DELETE /file`**:删文件是破坏性的,而第三方拿不到"这个文件重不重要"的上下文。
+需要时单独拍。
+
+### B. 会话管理:重命名 / 删除(中优先)
+
+现状对外只有 `GET .../sessions` 与 `GET .../sessions/{id}/messages` —— **读得到,管不了**。
+控制台侧 `api/sessions.py:879` rename(PATCH)、`:914` archive(DELETE)都在,同样 console-only。
+
+对外补 `PATCH /v1/agents/{code}/sessions/{session_id}`(改标题)与
+`DELETE /v1/agents/{code}/sessions/{session_id}`(归档)。归属校验走 `load_owned_session`,
+`require("session", "write")`。
+
+优先级低于 A 的理由:第三方 app 多半在自己库里存会话标题,重命名可以不依赖平台;但**删除**
+关系到终端用户「删掉这段对话」的诉求,而记录在平台这边,绕不过去。
+
+## 七、兼容与迁移
 
 | 改动 | 兼容性 |
 |---|---|
@@ -300,12 +350,13 @@ stream 模式是 SSE,无信封可言(帧格式的文档化属 P3 范围)。错�
 | `inputs` / `files[]` | 新增可选请求字段,向后兼容 |
 | `Idempotency-Key` | 可选请求头,不带 = 今天的行为 |
 | **202 信封化** | **破坏性** —— 见 §五 |
+| 块 4 的 4 个新端点 | 纯新增,向后兼容;控制台侧的 `console_only()` 端点一个不动 |
 
 数据库迁移两处:`thread_meta` 加一列;`agent_run` 加两列 + 一个部分唯一索引。
 
 > alembic revision 标识符上限 32 字符(仓库既有教训)。
 
-## 七、验收
+## 八、验收
 
 1. 第三方调 `GET .../sessions` 拿到的每条会话带 `message_count`,数值与该会话
    `GET .../sessions/{id}/messages` 返回的条数一致(同一 `include_hidden=False` 口径)
@@ -320,4 +371,28 @@ stream 模式是 SSE,无信封可言(帧格式的文档化属 P3 范围)。错�
 8. 同一 key 重发 stream 请求 → 拿到原 run 的事件流(响应头 `X-Expert-Work-Stream-Mode`
    为 `replay` 或 `live`),而非新建 run
 9. queue 模式 202 响应是 `{success, data, error}` 信封
-10. 真栈验收:测试集群端到端跑一遍上述 1–9
+
+块 4(若同期交付):
+
+10. agent 在工作区生成一个文件 → 第三方用 `GET .../workspace/files` 列得到 →
+    `GET .../workspace/file` 下得下来,且响应头是 `attachment` + `nosniff`
+11. 拿 A 用户的 `user_id` 去下 B 用户工作区的文件 → 404(与控制台侧同款不区分语义的 404)
+12. 工作区路径带 `../` → 400
+13. `PATCH .../sessions/{id}` 改标题、`DELETE .../sessions/{id}` 归档,均只对本 `(user, agent)`
+    名下的会话生效,越权 404
+
+14. 真栈验收:测试集群端到端跑一遍上述全部
+
+## 九、明确不做 / 留待拍板
+
+以下四项在 2026-08-12 的能力盘点中被识别为「离一个完整 agent 客户端还差的东西」,**本 spec
+不含**,记在这里以免下一轮又从零盘一遍。
+
+| # | 缺口 | 性质 | 判断 |
+|---|---|---|---|
+| 1 | `updates` 帧解析文档 + 三帧补录 + SSE 三个 bug | **P3 范围** | 这是「看得见 agent」的真正阻塞项,能力已在流里,缺文档 |
+| 2 | 重新生成 / 编辑重发 | **产品语义缺口** | 会话是 append-only checkpoint,没有「回退到某条消息重跑」的概念。要做是一道真设计题,不是加端点 |
+| 3 | 消息级点赞/点踩 | 接口缺口 | 内部已有 feedback 表,对外零暴露。薄,但需先定「反馈给谁看、进不进评测回路」 |
+| 4 | 工作区文件删除对外暴露 | 接口缺口 | 见 §六A —— 破坏性操作,第三方缺上下文,需单独拍 |
+
+第 2 项是其中唯一的**产品**问题;其余三项都是工程量确定的补齐。
