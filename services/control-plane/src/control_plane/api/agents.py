@@ -427,6 +427,10 @@ class ExternalRunRequest(BaseModel):
     mode: Literal["stream", "queue"] = "stream"
     image_refs: list[str] = Field(default_factory=list, max_length=64)
     untrusted_content: list[str] = Field(default_factory=list, max_length=16)
+    #: P2 —— 提示词模板变量,与内部 ``RunRequest.inputs`` 同语义(未声明键 422、
+    #: 必填缺失 422、64 键 / 单值 8192 字符上限)。校验在 ``spawn_run`` 内部由
+    #: ``validate_prompt_inputs`` 统一执行,此处不重复。
+    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentDisableRequest(BaseModel):
@@ -941,6 +945,7 @@ def build_agents_router() -> APIRouter:
             mode=payload.mode,
             image_refs=payload.image_refs,
             untrusted_content=payload.untrusted_content,
+            inputs=payload.inputs,
         )
         return await spawn_run(
             runtime=runtime,
