@@ -80,10 +80,14 @@ jobs:
     # Unit-only path; ``integration`` marker (testcontainers Postgres /
     # MinIO / pgbouncer compose) runs in the separate ``test-integration``
     # job so a slow Docker image pull on the runner never gates the PR.
-    # 20min: the suite crossed ~9m35s at 5222 tests (2026-07) — with
-    # checkout + uv sync the old 10min ceiling cancelled fully-green runs
-    # at the finish line ("N passed" then conclusion=cancelled).
-    timeout-minutes: 20
+    # 40min: this ceiling has now been hit twice. 10min → 20min (2026-07,
+    # suite at ~9m35s / 5222 tests); by 2026-08-11 main itself was running
+    # 17m50s-18m21s — under 2min of headroom — and one main run was already
+    # cancelled at the finish line. Raising the cap is a stopgap, not a fix:
+    # the real one is parallelising the suite (pytest-xdist ``-n auto`` on
+    # the 4-core runner), which needs the fixtures audited for parallel
+    # safety first. Tracked as a follow-up.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
