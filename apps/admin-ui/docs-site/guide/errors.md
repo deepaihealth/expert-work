@@ -1,6 +1,6 @@
 # 错误码与限流
 
-本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 401 / 403 / 404 / 413 / 429,以及限流和配额这两个容易混的概念。
+本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 401 / 403 / 404 / 413 / 422 / 429,以及限流和配额这两个容易混的概念。
 
 ## 先说一件容易踩的坑:错误响应的信封形状不统一
 
@@ -14,7 +14,7 @@
 }
 ```
 
-但一部分错误(比如 scope 不足的 403)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+但一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
 
 ## 401 —— key 无效 / 过期
 
@@ -66,6 +66,33 @@
 ```
 
 默认上限:文档 25 MiB,图片 10 MiB(以你的部署实际配置为准)。应对:压缩/裁剪后重传,或者把大文档拆成多份。
+
+## 422 —— 请求参数不合法
+
+`POST /v1/agents/{agent_code}/runs` 的 422 分两类,形状不一样。
+
+**第一类,请求体字段本身没通过校验**——比如 `files[].transfer_method` 传了 `local_file` 以外的值、`upload_id` 是空字符串、`files[]` / `image_refs` / `untrusted_content` 超过各自的条数上限。统一信封,`error.code` 固定是 `INVALID_REQUEST`:
+
+```json
+{ "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Input should be 'local_file'" } }
+```
+
+同一类里还有两个更具体的业务码,同样走统一信封:
+
+| `code` | 什么情况 |
+|---|---|
+| `INVALID_FILE_REF` | `files[]` 里 `type: "document"` 的 `upload_id` 不是上传接口返回的那种 `uploads/<name>` 形状(比如自己截成了裸文件名、或者带了路径穿越) |
+| `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张 |
+| `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` 头去空白后是空字符串,或超过 255 字符 |
+| `IDEMPOTENCY_KEY_REUSED` | 同一个 `Idempotency-Key` 配了不同的请求体,或者配给了不同的 `agent_code` |
+
+**第二类,`inputs`(提示词模板变量)校验失败——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
+
+```json
+{ "detail": "unknown input variable: foo" }
+```
+
+三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
 
 ## 429 —— 两种情况,含义不同
 
