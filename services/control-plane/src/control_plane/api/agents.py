@@ -415,6 +415,20 @@ class BindSessionRequest(BaseModel):
     session_id: UUID | None = None
 
 
+class ExternalFileRef(BaseModel):
+    """一条附件引用。``upload_id`` 是 ``POST /v1/agents/{code}/uploads`` 的返回值。
+
+    ``transfer_method`` 目前只有 ``local_file``。字段现在就存在是为了日后加
+    ``remote_url`` 时只是扩枚举(向后兼容),而不是改形状(破坏性)。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["image", "document"]
+    transfer_method: Literal["local_file"] = "local_file"
+    upload_id: str = Field(min_length=1, max_length=1024)
+
+
 class ExternalRunRequest(BaseModel):
     """Body for ``POST /v1/agents/{agent_code}/runs`` — Stream Agent-Templates
     (M1-5b-2). Binds / continues a per-user session and runs in one call."""
@@ -431,6 +445,12 @@ class ExternalRunRequest(BaseModel):
     #: 必填缺失 422、64 键 / 单值 8192 字符上限)。校验在 ``spawn_run`` 内部由
     #: ``validate_prompt_inputs`` 统一执行,此处不重复。
     inputs: dict[str, Any] = Field(default_factory=dict)
+    #: P2 块 1 —— 统一附件引用。``type == "image"`` 的条目合并进
+    #: ``image_refs`` 交给 ``spawn_run`` 里现成的 ``_validate_image_refs``
+    #: 做 thread 绑定 / 条数上限 / ``supports_vision`` 三重校验(见
+    #: ``run_agent_for_user``)。``type == "document"`` 是后续任务的事,这里
+    #: 只让模型层的枚举先就位。
+    files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
 
 
 class AgentDisableRequest(BaseModel):
@@ -940,10 +960,17 @@ def build_agents_router() -> APIRouter:
         except AgentFactoryError as exc:
             return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
 
+        # P2 块 1 —— files[] 的 image 条目并进 image_refs;_validate_image_refs
+        # (spawn_run 内部)对合并后的完整列表做 thread 绑定 / 条数上限 /
+        # supports_vision 三重校验,files[] 与既有 image_refs 都过同一道闸。
+        image_refs = [
+            *payload.image_refs,
+            *(f.upload_id for f in payload.files if f.type == "image"),
+        ]
         run_payload = RunRequest(
             input=payload.input,
             mode=payload.mode,
-            image_refs=payload.image_refs,
+            image_refs=image_refs,
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
         )
