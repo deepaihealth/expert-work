@@ -137,10 +137,20 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: "open" is a decision recorded here, not a route that quietly fell through.
 _OPEN_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/v1/agents/schema")})
 
-#: Routes under ``/v1/agents`` that reject an API key from inside the handler
-#: (``ensure_resource_access``) or via ``require(...)`` rather than
-#: ``console_only()``. Verified 403 for a zero-scope key; listed so the
-#: partition test below stays exhaustive without claiming they are external.
+#: Routes under ``/v1/agents`` whose authorization lives inside the handler
+#: (``ensure_resource_access``) or on a ``require(...)`` dependency rather than
+#: on ``console_only()``. Read the bucket name precisely: these reject an
+#: **under-scoped** key, not every key. A zero-scope key gets 403 — but an
+#: ``admin``-scope key passes, because ``rbac._collect_roles`` maps that scope
+#: to ``Role.ADMIN``; measured on one: ``GET /v1/agents/templates`` → 200,
+#: ``POST /v1/agents/{name}/disable`` → 200, ``DELETE /v1/agents/{name}/{version}``
+#: → 204 (the agent really is deleted). That is the documented meaning of the
+#: ``admin`` scope ("never hand it to a third-party integrator — it is the whole
+#: tenant"), not a hole this table hides; it is spelled out because reading the
+#: bucket as "API keys cannot reach these" would make the key-reachable surface
+#: under ``/v1/agents`` look like exactly the eight external routes, and it is
+#: not. Listed so the partition test below stays exhaustive without claiming
+#: they are external.
 _SELF_GATED_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/v1/agents"),
