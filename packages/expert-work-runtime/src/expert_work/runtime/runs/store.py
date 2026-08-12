@@ -47,11 +47,12 @@ _PENDING_RUN_VALUES: frozenset[str] = frozenset({RunStatus.PAUSED.value})
 #: name. Must match ``0145_agent_run_idempotency``'s ``_INDEX`` and
 #: ``AgentRunRow.__table_args__`` verbatim: the SQL backend's ``create``
 #: recognises a conflict by matching this string against the failed
-#: constraint's name.
+#: constraint's structured name (never the free-text error message — see
+#: :func:`_is_idempotency_conflict`).
 _IDEMPOTENCY_INDEX_NAME = "uq_agent_run_tenant_idempotency_key"
-#: Quoted the way Postgres embeds a constraint name in its error text
-#: (``duplicate key value violates unique constraint "<name>"``).
-_IDEMPOTENCY_INDEX_QUOTED = f'"{_IDEMPOTENCY_INDEX_NAME}"'
+#: Postgres ``unique_violation`` SQLSTATE — the first of two required
+#: structured checks in :func:`_is_idempotency_conflict`.
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
 
 
 class RunIdempotencyConflict(Exception):  # noqa: N818 -- required name, External-API-v1 P2 interface
@@ -79,20 +80,36 @@ def _is_idempotency_conflict(exc: IntegrityError) -> bool:
     """``True`` iff ``exc`` came from the idempotency partial unique index.
 
     Distinguishes it from any other ``IntegrityError`` the insert could
-    raise (e.g. a ``run_id`` primary-key collision) so only the former
-    becomes :class:`RunIdempotencyConflict`.
+    raise (e.g. a ``run_id`` primary-key collision, or any future CHECK /
+    NOT NULL constraint on ``agent_run``) so only the former becomes
+    :class:`RunIdempotencyConflict`. Both checks are on **structured**
+    driver fields, never on the free-text error message — Postgres embeds
+    the *entire failing row* (``DETAIL: Failing row contains (...)``) in
+    the text of every constraint violation, including whatever the caller
+    put in ``idempotency_key``. Matching that text against the index name
+    would let a caller who sends ``Idempotency-Key: "uq_agent_run_tenant_
+    idempotency_key"`` turn an unrelated CHECK-constraint failure into a
+    silently-wrong "idempotency conflict" (verified in review; see
+    ``test_check_violation_with_lookalike_key_is_not_misclassified``).
 
-    SQLAlchemy's asyncpg dialect only forwards ``sqlstate`` from the
-    original driver error onto ``exc.orig`` (see
-    ``AsyncAdapt_asyncpg_dbapi._handle_exception``) — no structured
-    ``constraint_name`` survives the translation, unlike psycopg. The
-    constraint name is still in the error text Postgres sends (``duplicate
-    key value violates unique constraint "<name>"``), so this matches it
-    there, quoted the same way Postgres quotes it — specific enough to
-    tell this partial index apart from any other ``UniqueViolation``
-    (e.g. the ``run_id`` primary key, ``agent_run_pkey``).
+    SQLAlchemy's asyncpg dialect only forwards ``sqlstate`` onto ``exc.orig``
+    itself when translating the driver error (see
+    ``AsyncAdapt_asyncpg_connection._handle_exception`` in
+    ``sqlalchemy/dialects/postgresql/asyncpg.py``) — no structured
+    ``constraint_name`` survives on ``exc.orig`` directly, unlike psycopg.
+    But the translation does ``raise translated_error from error``, so the
+    original ``asyncpg.exceptions.PostgresError`` — which *does* carry a
+    structured ``constraint_name`` — is still reachable one hop further, on
+    ``exc.orig.__cause__``. Both checks must pass: the SQLSTATE narrows to
+    "some unique violation", the constraint name narrows to "this specific
+    partial index". Either being unavailable/mismatched returns ``False``,
+    the fail-safe direction — the caller re-raises the plain
+    ``IntegrityError`` instead of silently mis-handling it.
     """
-    return _IDEMPOTENCY_INDEX_QUOTED in str(exc.orig)
+    if getattr(exc.orig, "sqlstate", None) != _UNIQUE_VIOLATION_SQLSTATE:
+        return False
+    cause = getattr(exc.orig, "__cause__", None)
+    return getattr(cause, "constraint_name", None) == _IDEMPOTENCY_INDEX_NAME
 
 
 def _only_status_values(only: Literal["failed", "pending"] | None) -> frozenset[str] | None:
