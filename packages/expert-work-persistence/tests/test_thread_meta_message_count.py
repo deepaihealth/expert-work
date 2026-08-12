@@ -14,6 +14,8 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
 from expert_work.persistence import (
@@ -61,6 +63,23 @@ async def thread_meta_store(request: pytest.FixtureRequest) -> AsyncIterator[Thr
         await engine.dispose()
 
 
+@pytest.fixture
+async def sql_engine(postgres_container: PostgresContainer) -> AsyncIterator[AsyncEngine]:
+    """Migrated engine for tests that need to bypass the ORM and hit the
+    table with raw SQL — e.g. proving the column has no ``server_default``
+    (the ORM's ``create()`` always writes ``0`` explicitly, so it can never
+    exercise the "column omitted from INSERT" path)."""
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_create_defaults_to_zero(thread_meta_store: ThreadMetaStore) -> None:
     tid, tenant = uuid4(), uuid4()
@@ -86,3 +105,30 @@ async def test_update_message_count_cross_tenant_is_noop(
     assert await thread_meta_store.update_message_count(tid, 7, tenant_id=uuid4()) is False
     got = await thread_meta_store.get(tid, tenant_id=tenant)
     assert got is not None and got.message_count == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_message_count_column_has_no_server_default(sql_engine: AsyncEngine) -> None:
+    """Guards the migration's core invariant directly at the SQL level:
+    a raw INSERT that never mentions ``message_count`` must leave it NULL
+    ("not yet computed"), not silently coerce to 0 ("empty conversation").
+
+    ``create()`` always writes ``0`` explicitly, so the ORM-backed tests
+    above can never exercise "column omitted from INSERT" — only a raw SQL
+    INSERT against the real table can catch a stray ``server_default``."""
+    thread_id, tenant_id = uuid4(), uuid4()
+    async with sql_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO thread_meta (thread_id, tenant_id, created_by) "
+                "VALUES (:thread_id, :tenant_id, :created_by)"
+            ),
+            {"thread_id": thread_id, "tenant_id": tenant_id, "created_by": "u"},
+        )
+        result = await conn.execute(
+            text("SELECT message_count FROM thread_meta WHERE thread_id = :thread_id"),
+            {"thread_id": thread_id},
+        )
+        row = result.one()
+    assert row.message_count is None
