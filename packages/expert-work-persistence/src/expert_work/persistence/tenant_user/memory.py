@@ -61,6 +61,20 @@ class InMemoryTenantUserStore(TenantUserStore):
             return None
         return row
 
+    async def get_by_subject(
+        self, *, tenant_id: UUID, subject_type: SubjectType, subject_id: str
+    ) -> TenantUser | None:
+        # No ``deleted_at`` filter — same semantics as ``get`` (see base.py
+        # docstring), unlike ``list_by_tenant`` which excludes purged rows.
+        for row in self._rows.values():
+            if (
+                row.tenant_id == tenant_id
+                and row.subject_type == subject_type
+                and row.subject_id == subject_id
+            ):
+                return row
+        return None
+
     async def get_many(
         self, user_ids: Collection[UUID], *, tenant_id: UUID
     ) -> dict[UUID, TenantUser]:

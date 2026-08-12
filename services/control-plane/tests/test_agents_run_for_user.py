@@ -119,9 +119,12 @@ async def test_queue_run_scoped_to_minted_end_user(ctx: _Ctx) -> None:
     assert resp.status_code == 202, resp.text
     run_id = UUID(resp.json()["run_id"])
 
-    # The minted end-user (mint-on-use, subject_id="cust-77").
+    # The minted end-user (mint-on-use). subject_id carries the `ext:` prefix
+    # (see control_plane.api._external.EXTERNAL_SUBJECT_PREFIX) so an
+    # app-supplied user_id can never collide with an employee's bare
+    # Keycloak sub.
     end_user = await ctx.app.state.tenant_user_repo.resolve(
-        tenant_id=ctx.tenant_id, subject_type="user", subject_id="cust-77"
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:cust-77"
     )
     # KEY: the run is scoped to the end-user, NOT the API-key caller.
     run = await ctx.run_store.get(run_id=run_id, tenant_id=ctx.tenant_id)

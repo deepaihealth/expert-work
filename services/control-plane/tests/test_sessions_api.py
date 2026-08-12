@@ -753,9 +753,18 @@ async def test_user_cannot_transition_another_users_session(
 
 
 @pytest.mark.asyncio
-async def test_machine_principal_session_is_unowned(session_client: AsyncClient) -> None:
-    """A service-account caller has no per-user instance — its threads
-    carry no ``user_id`` and stay tenant-scoped (legacy behaviour)."""
+async def test_machine_principal_cannot_create_console_session(
+    session_client: AsyncClient,
+) -> None:
+    """P1 external-API lockdown (``console_only()``, ``api/_authz.py``) — a
+    service-account (API-key) principal is refused the console plane
+    outright; the handler that used to stamp its thread with no owning user
+    never runs. Third parties create sessions via
+    ``POST /v1/agents/{agent_code}/runs`` instead. Unowned threads
+    (``user_id is None``) still exist — they now come only from an mTLS
+    ``service`` principal or a pre-J.14 historical row; see
+    ``test_plain_user_can_read_an_unowned_thread`` for that half of the old
+    test's coverage."""
     sa_jwt = make_test_jwt(
         tenant_id=_DEFAULT_TENANT,
         subject="sa-1",
@@ -763,12 +772,38 @@ async def test_machine_principal_session_is_unowned(session_client: AsyncClient)
         roles=("admin",),
     )
     sa_headers = {"Authorization": f"Bearer {sa_jwt}"}
-    tid = await _create_as(session_client, sa_headers)
-    create_meta = await session_client.get(f"/v1/sessions/{tid}", headers=sa_headers)
-    assert create_meta.json()["data"]["user_id"] is None
-    # A plain user can still read an unowned thread.
-    plain = await session_client.get(f"/v1/sessions/{tid}", headers=_user_headers("user-a"))
-    assert plain.status_code == 200
+    response = await session_client.post(
+        "/v1/sessions",
+        json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
+        headers=sa_headers,
+    )
+    assert response.status_code == 403, response.text
+
+
+@pytest.mark.asyncio
+async def test_plain_user_can_read_an_unowned_thread(session_client: AsyncClient) -> None:
+    """An unowned thread (``user_id is None``) is still readable by any
+    plain user in the tenant — ``caller_owns_thread``'s "unowned — legacy
+    tenant-scoped access" branch (``api/_user_scope.py``). Post-lockdown a
+    service-account caller can no longer produce one via
+    ``POST /v1/sessions`` (see
+    ``test_machine_principal_cannot_create_console_session``), so this seeds
+    one directly through the store — the way it would now actually arise (an
+    mTLS ``service`` principal, or a pre-J.14 historical row)."""
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    thread_id = uuid4()
+    await app.state.thread_meta_repo.create(
+        thread_id=thread_id,
+        tenant_id=_DEFAULT_TENANT,
+        created_by="sa-1",
+        agent_name="code-reviewer",
+        agent_version="1.0.0",
+    )
+    response = await session_client.get(
+        f"/v1/sessions/{thread_id}", headers=_user_headers("user-a")
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["user_id"] is None
 
 
 # ---------------------------------------------------------------------------

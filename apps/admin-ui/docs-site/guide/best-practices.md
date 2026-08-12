@@ -28,6 +28,6 @@ API Key 是持有者凭证,谁拿到就能以你的服务账号身份发起调�
 流式调用(`mode: "stream"`)是一条长连接,中间可能因为网络抖动 / 代理超时断掉。处理方式(细节见 [SSE 事件格式](./sse-events)):
 
 1. 连接一建立就把 `X-Expert-Work-Session-Id` / `X-Expert-Work-Run-Id`(或第一条 `metadata` 帧里的 `run_id` / `thread_id`)存下来。
-2. 断线后不要重新发起一次新的 `/runs` 调用(那会开启新的一轮 run)——用 `GET /v1/sessions/{thread_id}/runs/{run_id}/events` 接回这次 run 的事件流。
+2. 断线后不要重新发起一次新的 `/runs` 调用(那会开启新的一轮 run)——用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 接回这次 run 的事件流。
 3. `token` 预览帧断线后拿不回来,这是预期行为;界面状态以最近一条 `updates` / `metadata` 帧为准,不用还原逐 token 的打字机效果。
 4. 给读流加超时:正常情况下大约每 15 秒会有一条心跳注释帧,超过这个间隔什么都没收到,就判断连接已死,按上面第 2 步重连。

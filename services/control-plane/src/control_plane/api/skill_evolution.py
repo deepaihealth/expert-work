@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from control_plane.api._authz import console_only
 from control_plane.api.skills import (
     _get_audit,
     _get_skill_store,
@@ -148,7 +149,19 @@ def _kill_switch_dict(sw: KillSwitch | None) -> dict[str, Any] | None:
 
 def build_skill_evolution_router() -> APIRouter:
     """SE-8-2 admin governance router (read + promote-approval)."""
-    router = APIRouter(prefix="/v1/skill-evolution", tags=["skill-evolution"])
+    # Whole-prefix console lockdown: this is an admin governance surface with
+    # no third-party story at all, and it carried no ``require(...)`` — a
+    # **zero-scope** service-account key read the promote queue, the eval
+    # evidence and the kill-switch state, and could engage/release the
+    # kill-switch (P1 final review, C2 addendum). Router-level rather than
+    # per-route so a future endpoint here is locked by construction.
+    # ``console_only`` only rejects ``subject_type == "service_account"``;
+    # employee JWTs keep the ``ensure_tenant_scope`` behavior documented above.
+    router = APIRouter(
+        prefix="/v1/skill-evolution",
+        tags=["skill-evolution"],
+        dependencies=[Depends(console_only())],
+    )
 
     # ------------------------------------------------ review queue (read)
 

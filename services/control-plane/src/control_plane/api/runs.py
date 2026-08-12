@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
@@ -37,8 +36,9 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import require_key_scope
+from control_plane.api._authz import console_only, require_key_scope
 from control_plane.api._quota_admission import check_admission
+from control_plane.api._run_event_stream import build_event_producer
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
     caller_owns_thread,
@@ -93,10 +93,8 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunEventStore, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
-from expert_work.runtime.stream_bridge import END_SENTINEL, HEARTBEAT_SENTINEL
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
-from orchestrator.sse import format_sse
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -930,7 +928,9 @@ def build_runs_router() -> APIRouter:
     router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
     @router.post(
-        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("write"))]
+        "/{thread_id}/runs",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def trigger_run(
         thread_id: UUID,
@@ -1096,7 +1096,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run(
         thread_id: UUID,
@@ -1217,7 +1217,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/trace",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run_trace(
         thread_id: UUID,
@@ -1269,7 +1269,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/trace/raw",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_run_trace_raw(
         thread_id: UUID,
@@ -1326,7 +1326,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/messages",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def get_thread_messages(
         thread_id: UUID,
@@ -1410,7 +1410,9 @@ def build_runs_router() -> APIRouter:
         return JSONResponse({"success": True, "data": {"messages": out}})
 
     @router.get(
-        "/{thread_id}/runs", response_model=None, dependencies=[Depends(require_key_scope("read"))]
+        "/{thread_id}/runs",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def list_thread_runs(
         thread_id: UUID,
@@ -1475,7 +1477,7 @@ def build_runs_router() -> APIRouter:
     @router.get(
         "/{thread_id}/runs/{run_id}/events",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read"))],
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
     )
     async def stream_run_events(
         thread_id: UUID,
@@ -1538,45 +1540,14 @@ def build_runs_router() -> APIRouter:
         is_terminal = persisted.status in TERMINAL_RUN_STATUSES
         runtime: AgentRuntime = request.app.state.agent_runtime
 
-        async def _stream_replay() -> AsyncIterator[bytes]:
-            """Pull from RunEventStore (one shot, ordered by seq)."""
-            if event_store is None:
-                # No store wired — yield an end frame so the client closes
-                # cleanly instead of waiting forever.
-                yield format_sse("end", None)
-                return
-            # The generator body runs after the handler returned — re-apply
-            # the resolved scope so this DB read stays bound to the target
-            # tenant (not the request middleware's home-tenant GUC).
-            async with applied_scope(scope):
-                rows = await event_store.list(
-                    run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT
-                )
-            for row in rows:
-                yield format_sse(
-                    row.event_name,
-                    row.data,
-                    event_id=f"{row.created_at_ms}-{row.seq}",
-                )
-            yield format_sse("end", None)
-
-        async def _stream_live() -> AsyncIterator[bytes]:
-            """Subscribe to the in-memory bridge (live attach).
-
-            Disconnect is handled via the iterator's GeneratorExit when
-            the StreamingResponse is cancelled; the bridge subscription
-            naturally tears down.
-            """
-            async for entry in runtime.stream_bridge.subscribe(run_id, heartbeat_interval=15.0):
-                if entry is HEARTBEAT_SENTINEL:
-                    yield b": heartbeat\n\n"
-                    continue
-                if entry is END_SENTINEL:
-                    yield format_sse("end", None)
-                    return
-                yield format_sse(entry.event, entry.data, event_id=entry.id or None)
-
-        producer = _stream_replay() if is_terminal else _stream_live()
+        producer = build_event_producer(
+            run_id=run_id,
+            is_terminal=is_terminal,
+            event_store=event_store,
+            stream_bridge=runtime.stream_bridge,
+            since_seq=since_seq,
+            scope=lambda: applied_scope(scope),
+        )
         return StreamingResponse(
             producer,
             media_type="text/event-stream",
@@ -1591,7 +1562,7 @@ def build_runs_router() -> APIRouter:
     @router.post(
         "/{thread_id}/runs/{run_id}/resume",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write"))],
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def resume_run(
         thread_id: UUID,
@@ -1762,7 +1733,11 @@ def build_runs_list_router() -> APIRouter:
     """
     router = APIRouter(prefix="/v1/runs", tags=["runs"])
 
-    @router.get("", response_model=None, dependencies=[Depends(require_key_scope("read"))])
+    @router.get(
+        "",
+        response_model=None,
+        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
+    )
     async def list_runs(
         request: Request,
         runs: Annotated[RunStore, Depends(_get_run_store)],

@@ -30,7 +30,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit
 from control_plane.purge import PurgeUserDeps, purge_user
@@ -171,7 +171,18 @@ def build_agent_users_router() -> APIRouter:
     """Mount ``GET /v1/agents/{name}/{version}/users``."""
     router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
-    @router.get("/{agent_name}/{agent_version}/users", response_model=None)
+    # ``console_only()`` per route, not per prefix: ``/v1/agents`` is shared
+    # with the third-party plane, so the prefix sweep that closed the rest of
+    # the console cannot reach here — which is why this one stayed open. It is
+    # the admin-UI "Agent → users" tab, the sibling of the ``/v1/users`` roster
+    # already locked in this same file, and it answered 200 to a **zero-scope**
+    # service-account key: every end-user id, display name, conversation / run /
+    # error counts, last-active time and token usage (P1 final review, C2).
+    @router.get(
+        "/{agent_name}/{agent_version}/users",
+        response_model=None,
+        dependencies=[Depends(console_only())],
+    )
     async def list_agent_users(
         agent_name: str,
         agent_version: str,
@@ -329,7 +340,7 @@ def build_tenant_users_router() -> APIRouter:
     """
     router = APIRouter(prefix="/v1/users", tags=["users"])
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_users(
         request: Request,
         principal: Annotated[Principal, Depends(require("user", "read"))],
@@ -438,7 +449,7 @@ def build_tenant_users_router() -> APIRouter:
             headers=headers,
         )
 
-    @router.get("/{user_id}", response_model=None)
+    @router.get("/{user_id}", response_model=None, dependencies=[Depends(console_only())])
     async def get_tenant_user(
         user_id: UUID,
         request: Request,
@@ -501,7 +512,7 @@ def build_tenant_users_router() -> APIRouter:
             }
         )
 
-    @router.post("/{user_id}:purge", response_model=None)
+    @router.post("/{user_id}:purge", response_model=None, dependencies=[Depends(console_only())])
     async def purge_tenant_user(
         user_id: UUID,
         request: Request,

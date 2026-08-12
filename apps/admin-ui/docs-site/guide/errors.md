@@ -14,7 +14,7 @@
 }
 ```
 
-但一部分错误(scope 不足的 403、413 超限、429 里的"工作区满了")直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+但一部分错误(比如 scope 不足的 403)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
 
 ## 401 —— key 无效 / 过期
 
@@ -59,10 +59,10 @@
 
 ## 413 —— 文档 / 图片超限
 
-只发生在上传接口(`POST /v1/sessions/{thread_id}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。走 FastAPI 默认 `detail` 字符串形状:
+只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。这个接口把自己抛出的每一种拒绝都翻成统一信封:
 
 ```json
-{ "detail": "document exceeds 26214400-byte limit" }
+{ "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }
 ```
 
 默认上限:文档 25 MiB,图片 10 MiB(以你的部署实际配置为准)。应对:压缩/裁剪后重传,或者把大文档拆成多份。
@@ -86,13 +86,17 @@
 
 `dimension` 告诉你具体是哪一层限流触发的——网关按 IP / 按 key 的频率闸、租户维度的整体频率闸,或者业务层按资源维度的配额闸(比如某个 agent 的调用频率、图片上传的次数或存储字节数)。**但网关这一层的 429 不带 `dimension` 字段**(只有 `code` / `message` / `retry_after_s`)——解析时给 `dimension` 缺省兜底,别假设它总在。应对:按 `retry_after_s`(或 `Retry-After` 头)退避后重试,不要立刻重试。
 
-**第二种,工作区容量满了**——只出现在文档上传接口,`detail` 是固定文案,不是统一信封:
+**第二种,工作区容量满了**(`QUOTA_EXCEEDED`)——只出现在文档上传接口,和 413 一样走统一信封,**但没有 `Retry-After` 响应头**,因为退避重试解决不了:
 
 ```json
-{ "detail": "workspace is full — delete files to free space" }
+{
+  "success": false,
+  "data": null,
+  "error": { "code": "QUOTA_EXCEEDED", "message": "workspace is full — delete files to free space" }
+}
 ```
 
-应对:清理这个终端用户工作区里的旧文件(或者引导用户自己清理),不是退避重试能解决的。
+应对:清理这个终端用户工作区里的旧文件(或者引导用户自己清理),不是退避重试能解决的。注意这两种 429 靠 `error.code` 区分(`RATE_LIMIT_EXCEEDED` vs `QUOTA_EXCEEDED`),别只看状态码。
 
 ## 限流与配额,是两件事
 

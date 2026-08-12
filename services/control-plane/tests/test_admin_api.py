@@ -4,8 +4,7 @@
 Tests piggy-back on the existing in-memory app fixture from conftest,
 issuing JWTs with the appropriate role claim. The API-key bearer is
 also exercised end-to-end: after creating a key via the admin API we
-turn around and use it to call ``/v1/agents`` (which permits any
-authenticated principal in M0).
+turn around and use it to call ``_AUTHN_CANARY_PATH`` (see below).
 """
 
 from __future__ import annotations
@@ -32,6 +31,18 @@ from tests.auth_fixtures import (
 )
 
 _TENANT = DEFAULT_DEV_TENANT_ID
+
+#: Route used purely to answer "does this bearer authenticate?".
+#:
+#: Must stay an **authenticated but un-authorized** route: these four tests
+#: assert 200 / 401 to distinguish a live key from a revoked or expired one, so
+#: any authz gate on the target turns an authn regression into a silent pass
+#: (or, as happened, a false failure). It used to be ``GET /v1/agents``, which
+#: External-API-v1 P1 closed to API keys outright (``console_only()`` — the
+#: full manifest list is console data), making these tests read 403.
+#: ``GET /v1/agents/schema`` is the AgentSpec JSON Schema: the same static
+#: document for every caller, deliberately left open to API keys.
+_AUTHN_CANARY_PATH = "/v1/agents/schema"
 
 
 @pytest.fixture
@@ -222,7 +233,7 @@ async def test_admin_can_mint_api_key_and_then_use_it(
 
     # Now turn around and use the API key to authenticate to a non-admin route.
     response = await admin_client.get(
-        "/v1/agents", headers={"Authorization": f"Bearer {plaintext}"}
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
     )
     assert response.status_code == 200
 
@@ -261,7 +272,9 @@ async def test_revoked_api_key_no_longer_authenticates(
     plaintext = body["plaintext"]
 
     # Pre-revoke: works.
-    pre = await admin_client.get("/v1/agents", headers={"Authorization": f"Bearer {plaintext}"})
+    pre = await admin_client.get(
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
+    )
     assert pre.status_code == 200
 
     # Revoke.
@@ -269,7 +282,9 @@ async def test_revoked_api_key_no_longer_authenticates(
     assert revoked.status_code == 204
 
     # Post-revoke: 401.
-    post = await admin_client.get("/v1/agents", headers={"Authorization": f"Bearer {plaintext}"})
+    post = await admin_client.get(
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
+    )
     assert post.status_code == 401
 
 
@@ -362,10 +377,10 @@ async def test_api_key_rotation_double_active_during_grace(
 
     # Both verify.
     old_resp = await admin_client.get(
-        "/v1/agents", headers={"Authorization": f"Bearer {old_plaintext}"}
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {old_plaintext}"}
     )
     new_resp = await admin_client.get(
-        "/v1/agents", headers={"Authorization": f"Bearer {new_plaintext}"}
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {new_plaintext}"}
     )
     assert old_resp.status_code == 200, "old bearer must still verify inside grace"
     assert new_resp.status_code == 200, "new bearer must verify immediately"
@@ -394,10 +409,10 @@ async def test_api_key_rotation_old_rejected_after_grace_expires(
     new_plaintext = response.json()["data"]["new_api_key"]["plaintext"]
 
     old_resp = await admin_client.get(
-        "/v1/agents", headers={"Authorization": f"Bearer {old_plaintext}"}
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {old_plaintext}"}
     )
     new_resp = await admin_client.get(
-        "/v1/agents", headers={"Authorization": f"Bearer {new_plaintext}"}
+        _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {new_plaintext}"}
     )
     assert old_resp.status_code == 401, "old bearer must die when grace=0"
     assert new_resp.status_code == 200, "new bearer must work"

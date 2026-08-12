@@ -24,7 +24,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import ensure_resource_access, require
+from control_plane.api._authz import console_only, ensure_resource_access, require
+from control_plane.api._external import (
+    ExternalScopeError,
+    lookup_external_user_id,
+    resolve_external_user_id,
+)
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
@@ -322,15 +327,62 @@ async def _resolve_session(
         )
     record = active[0]
 
-    # Mint-on-use the end-user. The app owns its user_id namespace; subject type
-    # "user" + the app's id is unique per tenant. (Any valid tenant key may act
-    # for any of its users — network-layer hardening is a later addition; every
-    # call is audited with on_behalf_of.)
-    end_user = await users.resolve(tenant_id=tenant_id, subject_type="user", subject_id=user_id)
+    # Resolve the end-user. The app owns its user_id namespace; the id is
+    # namespaced with the `ext:` prefix before it becomes subject_id so it can
+    # never collide with an employee's bare Keycloak sub — see
+    # `_external.EXTERNAL_SUBJECT_PREFIX` for the full rationale. (Any valid
+    # tenant key may act for any of its users — network-layer hardening is a
+    # later addition; every call is audited with on_behalf_of.) Both helpers
+    # normalize (strip) `user_id` through the same `external_subject_id`, so a
+    # space-suffixed id mints/finds the same identity on every path
+    # (External-API-v1 P1 review, Important), and both surface a blank one as
+    # 422 `INVALID_USER_ID` rather than minting a namespaced empty identity.
+    #
+    # WHICH semantics apply is decided by `session_id`, and the dividing line is
+    # the one `_external.load_owned_session` documents: *does this call create
+    # the session it addresses* — not read-vs-write (both branches here are
+    # writes).
+    #
+    # - `session_id is None` → this call creates the session, so mint-on-use is
+    #   deliberate product behavior: a third party never pre-registers its end
+    #   users, and the first `POST .../runs` or `POST .../sessions` under a
+    #   fresh `user_id` must bring the `tenant_user` row into existence. Do not
+    #   "harden" this into a lookup — it would break the integration model.
+    # - `session_id is not None` → this call addresses an **already-existing**
+    #   session, whose owner therefore already has a row. The only row minting
+    #   could add here is one for a `user_id` that by definition does NOT own
+    #   the session — i.e. exactly the case that must 404. Resolving first and
+    #   checking ownership after is how pointing one known `session_id` at
+    #   enumerated `user_id`s left a ghost row per rejected attempt on the
+    #   user-dimension ops page, and how a *rejected* call still cleared a
+    #   purged identity's `deleted_at` (resurrecting it, and making it
+    #   permanently uncollectable by the `deleted_at`-driven Phase-3b hard
+    #   delete). Same defect and same reasoning as `load_owned_run` and the
+    #   upload path (P1 final review C1 + wrap-up N1); these two endpoints were
+    #   the last two members of the family.
+    try:
+        if session_id is None:
+            end_user_id = await resolve_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+        else:
+            looked_up = await lookup_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+            if looked_up is None:
+                # Unknown (or soft-deleted) end user + a session id they cannot
+                # own — indistinguishable from "no such session", and reported
+                # as such so the response leaks no existence information.
+                raise ExternalScopeError(
+                    "SESSION_NOT_FOUND", "session not found for this user / agent", 404
+                )
+            end_user_id = looked_up
+    except ExternalScopeError as exc:
+        raise _SessionError(exc.code, exc.message, exc.status_code) from exc
 
     if session_id is not None:
         meta = await threads.get(session_id, tenant_id=tenant_id)
-        if meta is None or meta.user_id != end_user.id or meta.agent_name != agent_code:
+        if meta is None or meta.user_id != end_user_id or meta.agent_name != agent_code:
             raise _SessionError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
         thread_id = session_id
     else:
@@ -339,13 +391,13 @@ async def _resolve_session(
             thread_id=thread_id,
             tenant_id=tenant_id,
             created_by=actor_id,
-            user_id=end_user.id,
+            user_id=end_user_id,
             agent_name=agent_code,
             agent_version=record.version,
         )
 
-    await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user.id)
-    return record, thread_id, end_user.id
+    await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
+    return record, thread_id, end_user_id
 
 
 class BindSessionRequest(BaseModel):
@@ -451,6 +503,23 @@ def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+
+
+#: ``console_only()`` attached **per route**, not per prefix.
+#:
+#: ``/v1/agents`` is the one mount point the console plane and the external
+#: (third-party) plane share, so the prefix-driven lockdown that closed
+#: ``/v1/sessions``, ``/v1/users``, … to API keys structurally cannot be
+#: applied here: it would also 403 the eight ``/v1/agents/{agent_code}/…``
+#: routes that ARE the third-party surface. That is precisely why these
+#: routes were missed — a prefix sweep cannot see them (P1 final review,
+#: Critical C2). Routes carrying it below are console-only reads/writes of
+#: tenant-wide manifest + end-user data; each one measurably answered 200 to
+#: a **zero-scope** service-account key before this, since none of them has
+#: ``require(...)`` or an in-handler ``ensure_resource_access`` either.
+#: ``console_only`` only rejects ``subject_type == "service_account"`` —
+#: employee JWTs and mTLS service principals are untouched.
+_CONSOLE_ONLY = [Depends(console_only())]
 
 
 def build_agents_router() -> APIRouter:
@@ -892,7 +961,7 @@ def build_agents_router() -> APIRouter:
             on_behalf_of=str(end_user_id),
         )
 
-    @router.get("")
+    @router.get("", dependencies=_CONSOLE_ONLY)
     async def list_agents(
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
@@ -1070,7 +1139,7 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": AgentDetail(record=result.record).model_dump(mode="json")}
         )
 
-    @router.get("/{name}/{version}/revisions")
+    @router.get("/{name}/{version}/revisions", dependencies=_CONSOLE_ONLY)
     async def list_revisions(
         name: str,
         version: str,
@@ -1116,7 +1185,7 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": RevisionList(items=items).model_dump(mode="json")}
         )
 
-    @router.get("/{name}/{version}/revisions/{revision}")
+    @router.get("/{name}/{version}/revisions/{revision}", dependencies=_CONSOLE_ONLY)
     async def get_revision(
         name: str,
         version: str,
@@ -1146,7 +1215,29 @@ def build_agents_router() -> APIRouter:
             {"success": True, "data": RevisionDetail(record=snapshot).model_dump(mode="json")}
         )
 
-    @router.post("/{name}/{version}/revisions/{revision}/rollback")
+    # ``console_only()`` first, so an **under-scoped** API key (zero-scope or
+    # ``read``-scope — anything that fails the ``manifest:write`` role check)
+    # keeps getting the console-plane pointer message rather than a role
+    # denial. An ``admin``- or ``write``-scope key passes the role check
+    # either way, so ordering makes no difference to what it sees (both
+    # dependencies deny it, same message) — only an under-scoped key is
+    # affected. ``require(...)`` second — a route-level role gate, per the
+    # 2026-08-12 user ruling: of the five console routes closed to API keys in
+    # C2, only this one is a **write**, and it had no employee-side RBAC at all,
+    # so any logged-in VIEWER could roll a tenant's manifest back to an
+    # arbitrary older snapshot. The three reads in the same group stay open to
+    # every employee on purpose (not blocking existing habits); a systematic
+    # employee-role sweep is a separate round. ``manifest:write`` is the same
+    # ``(resource, action)`` PUT authorizes with — this IS the PUT write path,
+    # appending a revision — except PUT uses the instance-level
+    # ``ensure_resource_access`` after loading the record, so a caller whose
+    # only grant is a *conditioned* binding can PUT but not roll back. That
+    # narrowing is deliberate for now: the ruling asked for a role gate, and a
+    # conditioned-binding holder can still reach the same end state via PUT.
+    @router.post(
+        "/{name}/{version}/revisions/{revision}/rollback",
+        dependencies=[*_CONSOLE_ONLY, Depends(require("manifest", "write"))],
+    )
     async def rollback_to_revision(
         name: str,
         version: str,

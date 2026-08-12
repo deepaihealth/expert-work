@@ -20,13 +20,14 @@ import io
 import logging
 import re
 import zipfile
+from dataclasses import dataclass
 from typing import Annotated, Final
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import require_key_scope
+from control_plane.api._authz import console_only, require_key_scope
 from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import (
@@ -116,6 +117,15 @@ def _reject_zip_bomb(raw: bytes, ext: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class DocumentUploadResult:
+    """Where a landed document ended up — the caller shapes its own response
+    envelope from this (the console and external upload endpoints differ)."""
+
+    path: str
+    size_bytes: int
+
+
 async def _handle_document_upload(
     *,
     content_type: str,
@@ -128,12 +138,16 @@ async def _handle_document_upload(
     settings: Settings,
     workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
-) -> JSONResponse:
-    """Land an uploaded document in the caller's persistent workspace.
+) -> DocumentUploadResult:
+    """Land an uploaded document in ``caller_user_id``'s persistent workspace.
 
     The parse itself runs later in the sandbox (``read_document``); the
     control-plane only validates + writes the bytes, keeping the malicious-
-    document attack surface out of this process."""
+    document attack surface out of this process. Shared by the console
+    (``POST /v1/sessions/{thread_id}/uploads``, landing target = the JWT
+    caller) and the external (``POST /v1/agents/{agent_code}/uploads``,
+    landing target = the declared end user — a machine principal has no
+    workspace of its own) endpoints."""
     ext = _DOC_EXT_BY_CONTENT_TYPE.get(content_type)
     if ext is None:
         # Config drift: the allowlist admitted a type the extension table
@@ -230,10 +244,7 @@ async def _handle_document_upload(
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return JSONResponse(
-        status_code=201,
-        content={"path": workspace_path, "kind": "document"},
-    )
+    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw))
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:
@@ -266,6 +277,147 @@ def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
 
 
+async def _prepare_image_upload(
+    *,
+    file: UploadFile,
+    content_type: str,
+    settings: Settings,
+) -> tuple[bytes, str]:
+    """Validate + sanitise an image upload, returning ``(sanitised_bytes, ext)``.
+
+    Content-type whitelist, extension lookup, both size caps, the
+    empty-file check, and EXIF stripping (Mini-ADR J-34) — this exact gate
+    *sequence* is shared verbatim by the console
+    (``POST /v1/sessions/{thread_id}/uploads``) and external
+    (``POST /v1/agents/{agent_code}/uploads``) endpoints so a future new
+    image guard (magic-byte sniffing, a tighter size rule, a different EXIF
+    policy) can't be added to one and silently missed on the other — the
+    external endpoint is the larger attack surface of the two. Raises
+    ``HTTPException`` on any rejection.
+
+    Object-store availability and quota admission stay with the caller:
+    the former is a one-line dependency-injected ``None`` check, and the
+    latter needs a different ``agent`` audit label per caller."""
+    if content_type not in settings.multimodal_allowed_content_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported content type: {content_type or 'missing'!r}",
+        )
+    ext = _EXT_BY_CONTENT_TYPE.get(content_type)
+    if ext is None:
+        # Config drift: the allowlist admitted a type the canonical
+        # extension table doesn't know. Refuse rather than forge a key.
+        raise HTTPException(
+            status_code=400,
+            detail=f"no extension known for content type {content_type!r}",
+        )
+
+    max_bytes = settings.multimodal_max_image_bytes
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+    raw = await file.read()
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
+    if not raw:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+    # Mini-ADR J-34 (J.6.补强-4) — strip EXIF / metadata before any
+    # downstream code touches the bytes. The sanitised payload is
+    # what lands in the object store + gets counted against quota
+    # + gets sha256'd for the audit row — every consumer sees the
+    # same metadata-free bytes.
+    try:
+        raw = strip_exif(raw, mime_type=content_type)
+    except ImageSanitizeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return raw, ext
+
+
+async def _land_image_upload(
+    *,
+    request: Request,
+    store: ObjectStore,
+    images: ImageUploadStore,
+    audit: AuditLogger,
+    tenant_id: UUID,
+    thread_id: UUID,
+    user_id: UUID | None,
+    ext: str,
+    raw: bytes,
+    content_type: str,
+) -> ImageRef:
+    """Persist an already-sanitised, already-admitted image: object store +
+    ``image_upload`` registry row + audit row. Shared by the console
+    (``POST /v1/sessions/{thread_id}/uploads``) and the external
+    (``POST /v1/agents/{agent_code}/uploads``) endpoints so Mini-ADR J-32
+    (registry) / J-31 (audit) can't drift between the two callers.
+
+    Callers are responsible for EXIF stripping, quota admission, and the
+    content-type → extension lookup before calling this."""
+    image_ref = ImageRef(
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        image_id=uuid4(),
+        ext=ext,
+    )
+    await store.put(image_ref.storage_key, raw, content_type=content_type)
+
+    # Mini-ADR J-32 (J.6.补强-3) — register the upload in the
+    # ``image_upload`` table so the lifecycle (soft-delete + retention
+    # sweep) can find it later. ``sha256`` doubles as a dedup key for
+    # ops investigations.
+    sha256_hex = hashlib.sha256(raw).hexdigest()
+    await images.insert(
+        image_id=image_ref.image_id,
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        object_key=image_ref.storage_key,
+        size_bytes=len(raw),
+        mime_type=content_type,
+        sha256=sha256_hex,
+    )
+
+    # Mini-ADR J-31 (J.6.补强-2) — uploads emit their own audit row.
+    # The audit middleware's SESSION_WRITE row covers run dispatch but
+    # not image-specific metadata (size / mime / object_key / sha256),
+    # which the SOC / compliance pipeline needs to trace every byte.
+    actor_id: str = getattr(request.state, "actor_id", "anonymous")
+    principal = getattr(request.state, "principal", None)
+    subject_type = (
+        principal.subject_type
+        if principal is not None and hasattr(principal, "subject_type")
+        else "user"
+    )
+    auth_method = (
+        principal.auth_method
+        if principal is not None and hasattr(principal, "auth_method")
+        else "jwt"
+    )
+    await audit_emit(
+        audit,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        action=AuditAction.IMAGE_UPLOAD,
+        resource_type="image_upload",
+        resource_id=str(image_ref.image_id),
+        result=AuditResult.SUCCESS,
+        trace_id=current_trace_id_hex(),
+        details={
+            "thread_id": str(thread_id),
+            "object_key": image_ref.storage_key,
+            "file_size_bytes": len(raw),
+            "mime_type": content_type,
+            "sha256": sha256_hex,
+            "subject_type": str(subject_type),
+            "auth_method": str(auth_method),
+            "ext": ext,
+        },
+    )
+    return image_ref
+
+
 def build_uploads_router() -> APIRouter:
     """One router housing the J.6 upload + lifecycle endpoints.
 
@@ -281,7 +433,7 @@ def build_uploads_router() -> APIRouter:
         "/v1/sessions/{thread_id}/uploads",
         response_model=None,
         tags=["sessions"],
-        dependencies=[Depends(require_key_scope("write"))],
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def upload_image(
         thread_id: UUID,
@@ -319,7 +471,7 @@ def build_uploads_router() -> APIRouter:
         # run's ``read_document`` can parse it. Separate path from images: docs
         # ride the supervisor workspace-write, not the image object store.
         if content_type in settings.document_allowed_content_types:
-            return await _handle_document_upload(
+            result = await _handle_document_upload(
                 content_type=content_type,
                 filename=file.filename,
                 file=file,
@@ -331,41 +483,16 @@ def build_uploads_router() -> APIRouter:
                 workspace_store=workspace_store,
                 audit=audit,
             )
+            return JSONResponse(
+                status_code=201,
+                content={"path": result.path, "kind": "document"},
+            )
 
         if store is None:
             raise HTTPException(status_code=503, detail="object store unavailable")
-        if content_type not in settings.multimodal_allowed_content_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unsupported content type: {content_type or 'missing'!r}",
-            )
-        ext = _EXT_BY_CONTENT_TYPE.get(content_type)
-        if ext is None:
-            # Config drift: the allowlist admitted a type the canonical
-            # extension table doesn't know. Refuse rather than forge a key.
-            raise HTTPException(
-                status_code=400,
-                detail=f"no extension known for content type {content_type!r}",
-            )
-
-        max_bytes = settings.multimodal_max_image_bytes
-        if file.size is not None and file.size > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        raw = await file.read()
-        if len(raw) > max_bytes:
-            raise HTTPException(status_code=413, detail=f"image exceeds {max_bytes}-byte limit")
-        if not raw:
-            raise HTTPException(status_code=400, detail="uploaded file is empty")
-
-        # Mini-ADR J-34 (J.6.补强-4) — strip EXIF / metadata before any
-        # downstream code touches the bytes. The sanitised payload is
-        # what lands in the object store + gets counted against quota
-        # + gets sha256'd for the audit row — every consumer sees the
-        # same metadata-free bytes.
-        try:
-            raw = strip_exif(raw, mime_type=content_type)
-        except ImageSanitizeError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raw, ext = await _prepare_image_upload(
+            file=file, content_type=content_type, settings=settings
+        )
 
         # Mini-ADR J-30 (J.6.补强-1) — quota admission. The single
         # ``check`` call deducts ``cost=1`` from QPS +
@@ -386,64 +513,17 @@ def build_uploads_router() -> APIRouter:
         if denial is not None:
             return denial
 
-        image_ref = ImageRef(
-            tenant_id=tenant_id,
-            thread_id=thread_id,
-            image_id=uuid4(),
-            ext=ext,
-        )
-        await store.put(image_ref.storage_key, raw, content_type=content_type)
-
-        # Mini-ADR J-32 (J.6.补强-3) — register the upload in the
-        # ``image_upload`` table so the lifecycle (soft-delete + retention
-        # sweep) can find it later. ``sha256`` doubles as a dedup key for
-        # ops investigations.
-        sha256_hex = hashlib.sha256(raw).hexdigest()
-        await images.insert(
-            image_id=image_ref.image_id,
+        image_ref = await _land_image_upload(
+            request=request,
+            store=store,
+            images=images,
+            audit=audit,
             tenant_id=tenant_id,
             thread_id=thread_id,
             user_id=caller_user_id,
-            object_key=image_ref.storage_key,
-            size_bytes=len(raw),
-            mime_type=content_type,
-            sha256=sha256_hex,
-        )
-
-        # Mini-ADR J-31 (J.6.补强-2) — uploads emit their own audit row.
-        # The audit middleware's SESSION_WRITE row covers run dispatch but
-        # not image-specific metadata (size / mime / object_key / sha256),
-        # which the SOC / compliance pipeline needs to trace every byte.
-        principal = getattr(request.state, "principal", None)
-        subject_type = (
-            principal.subject_type
-            if principal is not None and hasattr(principal, "subject_type")
-            else "user"
-        )
-        auth_method = (
-            principal.auth_method
-            if principal is not None and hasattr(principal, "auth_method")
-            else "jwt"
-        )
-        await audit_emit(
-            audit,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            action=AuditAction.IMAGE_UPLOAD,
-            resource_type="image_upload",
-            resource_id=str(image_ref.image_id),
-            result=AuditResult.SUCCESS,
-            trace_id=current_trace_id_hex(),
-            details={
-                "thread_id": str(thread_id),
-                "object_key": image_ref.storage_key,
-                "file_size_bytes": len(raw),
-                "mime_type": content_type,
-                "sha256": sha256_hex,
-                "subject_type": str(subject_type),
-                "auth_method": str(auth_method),
-                "ext": ext,
-            },
+            ext=ext,
+            raw=raw,
+            content_type=content_type,
         )
         return JSONResponse(status_code=201, content={"image_ref": image_ref.to_uri()})
 
@@ -451,7 +531,7 @@ def build_uploads_router() -> APIRouter:
         "/v1/uploads/{image_id}",
         response_model=None,
         tags=["uploads"],
-        dependencies=[Depends(require_key_scope("write"))],
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def delete_image(
         image_id: UUID,

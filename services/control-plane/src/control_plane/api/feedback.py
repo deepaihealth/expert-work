@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import require_key_scope
+from control_plane.api._authz import console_only, require_key_scope
 from control_plane.audit import emit
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.feedback_store import FeedbackRecord, FeedbackStore
@@ -52,7 +52,7 @@ def build_feedback_router() -> APIRouter:
         "/{thread_id}/feedback",
         response_model=None,
         status_code=201,
-        dependencies=[Depends(require_key_scope("write"))],
+        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
     )
     async def submit_feedback(
         thread_id: UUID,
