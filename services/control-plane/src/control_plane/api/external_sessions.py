@@ -153,6 +153,9 @@ def build_external_sessions_router() -> APIRouter:
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "updated_at": row.updated_at.isoformat() if row.updated_at else None,
                 "running": row.thread_id in inflight,
+                # None = 尚未算过(存量会话,从没跑过 run);0 = 算过、确实没有
+                # 可见轮次 —— 两者语义不同,serialize 成 null 而非 0。
+                "message_count": row.message_count,
             }
             for row in rows
         ]
