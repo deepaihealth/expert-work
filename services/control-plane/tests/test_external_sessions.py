@@ -164,7 +164,7 @@ async def test_sessions_list_only_returns_this_users_sessions(ctx: _Ctx) -> None
     # Queue-mode 202 carries the thread id in the body, not the
     # ``X-Expert-Work-Session-Id`` header (that's only set on the SSE path —
     # see runs.py:spawn_run's queue-mode branch, out of this task's scope).
-    assert sessions[0]["session_id"] == a.json()["thread_id"]
+    assert sessions[0]["session_id"] == a.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -197,7 +197,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert pending_run.status_code == 202, pending_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(pending_run.json()["run_id"]),
+        run_id=UUID(pending_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.PENDING,
         updated_at=datetime.now(UTC),
@@ -210,7 +210,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
         headers=ctx.headers,
     )
     assert queued_run.status_code == 202, queued_run.text
-    assert queued_run.json()["status"] == "queued"
+    assert queued_run.json()["data"]["status"] == "queued"
 
     running_run = await ctx.client.post(
         "/v1/agents/support-bot/runs",
@@ -219,7 +219,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert running_run.status_code == 202, running_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(running_run.json()["run_id"]),
+        run_id=UUID(running_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.RUNNING,
         updated_at=datetime.now(UTC),
@@ -232,7 +232,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert done_run.status_code == 202, done_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(done_run.json()["run_id"]),
+        run_id=UUID(done_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.SUCCESS,
         updated_at=datetime.now(UTC),
@@ -246,10 +246,10 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert resp.status_code == 200, resp.text
     by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
-    assert by_id[pending_run.json()["thread_id"]]["running"] is True
-    assert by_id[queued_run.json()["thread_id"]]["running"] is True
-    assert by_id[running_run.json()["thread_id"]]["running"] is True
-    assert by_id[done_run.json()["thread_id"]]["running"] is False
+    assert by_id[pending_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[queued_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[running_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[done_run.json()["data"]["thread_id"]]["running"] is False
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_messages_404_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    session_id = started.json()["thread_id"]
+    session_id = started.json()["data"]["thread_id"]
     resp = await ctx.client.get(
         f"/v1/agents/support-bot/sessions/{session_id}/messages",
         params={"user_id": "someone-else"},
@@ -314,7 +314,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    session_id = started.json()["thread_id"]
+    session_id = started.json()["data"]["thread_id"]
     await _seed_thread_messages(
         checkpointer,
         session_id,
@@ -419,7 +419,7 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    session_id = started.json()["thread_id"]
+    session_id = started.json()["data"]["thread_id"]
     stamped_at = datetime(2026, 8, 12, 1, 2, 3, tzinfo=UTC)
     run_id = uuid4()
     await _seed_thread_messages(
@@ -488,7 +488,7 @@ async def test_sessions_list_exposes_message_count(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    thread_id = UUID(started.json()["thread_id"])
+    thread_id = UUID(started.json()["data"]["thread_id"])
     updated = await ctx.app.state.thread_meta_repo.update_message_count(
         thread_id, 7, tenant_id=ctx.tenant_id
     )
@@ -529,7 +529,7 @@ async def test_sessions_list_message_count_null_when_never_computed(ctx: _Ctx) -
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    thread_id = UUID(started.json()["thread_id"])
+    thread_id = UUID(started.json()["data"]["thread_id"])
     repo = ctx.app.state.thread_meta_repo
     row = await repo.get(thread_id, tenant_id=ctx.tenant_id)
     assert row is not None
@@ -569,7 +569,7 @@ async def test_sessions_list_message_count_distinguishes_null_from_zero(ctx: _Ct
         headers=ctx.headers,
     )
     assert never_computed.status_code == 202, never_computed.text
-    never_computed_id = UUID(never_computed.json()["thread_id"])
+    never_computed_id = UUID(never_computed.json()["data"]["thread_id"])
     repo = ctx.app.state.thread_meta_repo
     row = await repo.get(never_computed_id, tenant_id=ctx.tenant_id)
     assert row is not None
@@ -582,5 +582,5 @@ async def test_sessions_list_message_count_distinguishes_null_from_zero(ctx: _Ct
     )
     assert resp.status_code == 200, resp.text
     by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
-    assert by_id[computed_zero.json()["thread_id"]]["message_count"] == 0
-    assert by_id[never_computed.json()["thread_id"]]["message_count"] is None
+    assert by_id[computed_zero.json()["data"]["thread_id"]]["message_count"] == 0
+    assert by_id[never_computed.json()["data"]["thread_id"]]["message_count"] is None

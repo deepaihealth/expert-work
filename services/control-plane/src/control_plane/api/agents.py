@@ -217,23 +217,32 @@ def _idempotent_run_response(
 ) -> StreamingResponse | JSONResponse:
     """Render an idempotency-hit ``run`` back in the shape its ``mode`` expects.
 
-    External-API-v1 P2-a Task 14 — queue mode keeps the pre-existing flat
-    ``{run_id, thread_id, status}`` 202 (matching ``spawn_run``'s own
-    queue-mode branch); stream mode now replays the run's event stream via
-    ``build_events_response`` (the same wire format ``GET .../runs/{id}/
-    events`` produces) instead of the ``422 IDEMPOTENCY_NOT_SUPPORTED_FOR_
-    STREAM`` Task 13 returned. Shared by both idempotency-hit call sites in
-    ``run_agent_for_user`` below: the pre-``spawn_run`` cache-hit check, and
-    the post-``spawn_run`` conflict-loser requery.
+    External-API-v1 P2-a Task 14 — stream mode replays the run's event
+    stream via ``build_events_response`` (the same wire format ``GET
+    .../runs/{id}/events`` produces) instead of the ``422
+    IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` Task 13 returned. Shared by both
+    idempotency-hit call sites in ``run_agent_for_user`` below: the
+    pre-``spawn_run`` cache-hit check, and the post-``spawn_run``
+    conflict-loser requery.
+
+    Task 15 — queue mode's 202 body is always the ``{success, data, error}``
+    envelope, matching ``spawn_run``'s own queue-mode branch called with
+    ``envelope=True`` (this helper has no console caller — both call sites
+    below sit inside the external ``run_agent_for_user`` endpoint — so unlike
+    ``spawn_run`` there is no flat-body branch to preserve).
     """
     if mode == "stream":
         return build_events_response(run=run, event_store=event_store, stream_bridge=stream_bridge)
     return JSONResponse(
         status_code=202,
         content={
-            "run_id": str(run.run_id),
-            "thread_id": str(run.thread_id),
-            "status": run.status.value,
+            "success": True,
+            "data": {
+                "run_id": str(run.run_id),
+                "thread_id": str(run.thread_id),
+                "status": run.status.value,
+            },
+            "error": None,
         },
     )
 
@@ -1006,9 +1015,10 @@ def build_agents_router() -> APIRouter:
         the branch (blank/oversized key, cache hit / mismatch, miss). Checked
         before any side effect — no session/thread minted, no admission
         charged — so a rejected call never mutates state. A cache hit renders
-        via ``_idempotent_run_response`` — flat JSON for queue mode, the same
-        SSE replay/live-attach ``GET .../runs/{id}/events`` would produce for
-        stream mode (Task 14 — Task 13 rejected a stream-mode key with 422
+        via ``_idempotent_run_response`` — the ``{success, data, error}``
+        envelope for queue mode (Task 15), the same SSE replay/live-attach
+        ``GET .../runs/{id}/events`` would produce for stream mode (Task 14 —
+        Task 13 rejected a stream-mode key with 422
         ``IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` instead; that branch is gone).
         """
         tenant_id = request.state.tenant_id
@@ -1151,6 +1161,7 @@ def build_agents_router() -> APIRouter:
                 on_behalf_of=str(end_user_id),
                 idempotency_key=key,
                 request_digest=digest,
+                envelope=True,
             )
         except RunIdempotencyConflict:
             # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single

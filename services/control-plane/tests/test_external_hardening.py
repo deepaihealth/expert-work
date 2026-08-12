@@ -192,7 +192,7 @@ async def test_user_id_normalizes_identically_on_write_and_read(ctx: _Ctx) -> No
     assert resp.status_code == 200, resp.text
     sessions = resp.json()["data"]["sessions"]
     assert len(sessions) == 1
-    assert sessions[0]["session_id"] == created.json()["thread_id"]
+    assert sessions[0]["session_id"] == created.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,7 @@ async def test_session_lookup_survives_more_than_500_active_tenant_users(ctx: _C
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    session_id = created.json()["thread_id"]
+    session_id = created.json()["data"]["thread_id"]
 
     users = ctx.app.state.tenant_user_repo
     # Every filler gets a last_active_at strictly after "now" at increasing
@@ -373,7 +373,7 @@ async def _terminal_run(ctx: _Ctx, user_id: str) -> tuple[str, str]:
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    run_id = created.json()["run_id"]
+    run_id = created.json()["data"]["run_id"]
     await ctx.app.state.run_event_store.append(
         make_event_record(run_id=UUID(run_id), seq=1, event_name="updates", data={"step": 1})
     )
@@ -384,7 +384,7 @@ async def _terminal_run(ctx: _Ctx, user_id: str) -> tuple[str, str]:
         updated_at=datetime.now(UTC),
         finished_at=datetime.now(UTC),
     )
-    return run_id, created.json()["thread_id"]
+    return run_id, created.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -501,7 +501,7 @@ async def _owned_session(ctx: _Ctx, user_id: str = "cust-77") -> str:
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    return str(created.json()["thread_id"])
+    return str(created.json()["data"]["thread_id"])
 
 
 async def _address_session(ctx: _Ctx, endpoint: str, *, user_id: str, session_id: str) -> Any:

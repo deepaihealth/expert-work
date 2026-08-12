@@ -810,6 +810,7 @@ async def spawn_run(
     on_behalf_of: str | None = None,
     idempotency_key: str | None = None,
     request_digest: str | None = None,
+    envelope: bool = False,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -831,7 +832,16 @@ async def spawn_run(
     original run's event stream on a stream-mode hit instead of calling this
     function again). Both parameters default to ``None`` — the internal
     ``trigger_run`` caller never passes them, so its behaviour (both branches)
-    is unchanged."""
+    is unchanged.
+
+    ``envelope`` (External-API-v1 P2-a Task 15) — when ``True``, the
+    ``mode="queue"`` branch's 202 body is wrapped in the external API's
+    ``{success, data, error}`` shape. Defaults to ``False`` so the console
+    ``trigger_run`` caller keeps its pre-existing flat ``{run_id, thread_id,
+    status}`` body — admin-ui consumes that shape directly. Only the
+    external ``run_agent_for_user`` endpoint (``agents.py``) passes
+    ``True``. Stream mode is unaffected: it returns a ``StreamingResponse``,
+    not a JSON body, so there is nothing to envelope."""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -896,10 +906,14 @@ async def spawn_run(
             request_digest=request_digest,
         )
         logger.info("control_plane.run.enqueued run_id=%s", run_id)
-        return JSONResponse(
-            status_code=202,
-            content={"run_id": str(run_id), "thread_id": str(thread_id), "status": "queued"},
-        )
+        content: dict[str, Any] = {
+            "run_id": str(run_id),
+            "thread_id": str(thread_id),
+            "status": "queued",
+        }
+        if envelope:
+            content = {"success": True, "data": content, "error": None}
+        return JSONResponse(status_code=202, content=content)
 
     run_record = await runtime.run_manager.create(
         run_id=run_id,

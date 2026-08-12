@@ -120,7 +120,7 @@ async def test_decide_404s_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "someone-else", "decision": "approve"},
@@ -138,7 +138,7 @@ async def test_decide_rejects_modified_args_without_modify(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "approve", "modified_args": {"x": 1}},
@@ -155,7 +155,7 @@ async def test_decide_requires_modified_args_for_modify(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "modify"},
@@ -172,7 +172,7 @@ async def test_decide_404s_when_no_pending_approval(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "approve"},
@@ -209,7 +209,7 @@ async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    body = started.json()
+    body = started.json()["data"]
     run_id = UUID(body["run_id"])
     thread_id = UUID(body["thread_id"])
 

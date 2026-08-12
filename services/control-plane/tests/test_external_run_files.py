@@ -302,7 +302,7 @@ async def test_image_file_ref_merges_into_image_refs(
     # queue mode only persists ``enqueued_input`` synchronously (the graph
     # never runs in this test). Read the persisted run back and assert the
     # merged list landed exactly as expected.
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None
@@ -338,7 +338,7 @@ async def test_image_file_ref_merges_alongside_existing_image_refs(
         },
     )
     assert resp.status_code == 202, resp.text
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None
@@ -600,7 +600,7 @@ async def test_document_upload_id_shapes_from_safe_workspace_name_accepted(
             },
         )
         assert resp.status_code == 202, f"{upload_id!r} 应被接受: {resp.text}"
-        run_id = UUID(resp.json()["run_id"])
+        run_id = UUID(resp.json()["data"]["run_id"])
         run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
         assert run is not None
         assert run.enqueued_input is not None
@@ -634,7 +634,7 @@ async def test_document_ref_lands_in_enqueued_payload(
         },
     )
     assert resp.status_code == 202, resp.text
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None
@@ -670,7 +670,7 @@ async def test_mixed_image_and_document_files_dispatch_to_both_channels(
         },
     )
     assert resp.status_code == 202, resp.text
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None
@@ -689,7 +689,7 @@ async def test_no_files_document_names_stays_empty(
         json={"user_id": "u1", "input": "hello", "mode": "queue"},
     )
     assert resp.status_code == 202, resp.text
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None

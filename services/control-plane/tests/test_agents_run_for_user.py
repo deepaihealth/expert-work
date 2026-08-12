@@ -117,7 +117,7 @@ async def test_queue_run_scoped_to_minted_end_user(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     assert resp.status_code == 202, resp.text
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
 
     # The minted end-user (mint-on-use). subject_id carries the `ext:` prefix
     # (see control_plane.api._external.EXTERNAL_SUBJECT_PREFIX) so an
@@ -158,7 +158,7 @@ async def test_continue_session_reuses_thread(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     assert resp.status_code == 202
-    assert resp.json()["thread_id"] == session_id
+    assert resp.json()["data"]["thread_id"] == session_id
 
 
 @pytest.mark.asyncio

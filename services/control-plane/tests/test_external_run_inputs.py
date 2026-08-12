@@ -196,7 +196,7 @@ async def test_inputs_reaches_prompt_render(
     # external ``inputs`` actually landed in ``enqueued_input`` — the exact
     # dict the worker will hand to ``build_run_graph_input`` /
     # ``render_system_prompt`` when it claims this run.
-    run_id = UUID(resp.json()["run_id"])
+    run_id = UUID(resp.json()["data"]["run_id"])
     run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
     assert run is not None
     assert run.enqueued_input is not None

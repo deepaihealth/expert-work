@@ -242,7 +242,7 @@ async def test_cancel_stops_a_still_queued_run(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
@@ -277,7 +277,7 @@ async def test_cancel_404s_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
@@ -296,7 +296,7 @@ async def test_cancel_404s_for_another_agent(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/other-bot/runs/{run_id}:cancel",

@@ -175,12 +175,46 @@ async def test_same_key_same_body_returns_same_run(
     second = await external_client.post(url, json=BODY, headers=h)
     assert first.status_code == 202, first.text
     assert second.status_code == 202, second.text
-    # The external run endpoint's queue-mode 202 body is flat — {run_id,
-    # thread_id, status} — not wrapped in the {success, data, error}
-    # envelope (that convention is for the ERROR responses this task adds;
-    # see spawn_run's pre-existing queue-mode branch in runs.py, and
-    # test_external_sessions.py's own assertions against the same shape).
-    assert first.json()["run_id"] == second.json()["run_id"]
+    # External-API-v1 P2-a Task 15 — the external run endpoint's queue-mode
+    # 202 body is now the {success, data, error} envelope (matching every
+    # other external endpoint), for BOTH the first-time creation and the
+    # idempotency-hit retry. See
+    # test_idempotent_retry_envelope_matches_first_request below, which pins
+    # that the two shapes are identical, not just that the run_id matches.
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["success"] is True and first_body["error"] is None
+    assert second_body["success"] is True and second_body["error"] is None
+    assert first_body["data"]["run_id"] == second_body["data"]["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_retry_envelope_matches_first_request(
+    external_client: AsyncClient, plain_agent: _Agent
+) -> None:
+    """External-API-v1 P2-a Task 15 裁定 1 —— the idempotency-hit response
+    (``_idempotent_run_response``'s queue branch) must be shaped EXACTLY
+    like a first-time request's response (``spawn_run``'s queue branch
+    called with ``envelope=True``): both the {success, data, error} envelope
+    with the same top-level AND ``data`` key sets. A retry that came back
+    flat while the first request came back enveloped — same endpoint, same
+    202, two different shapes — would land precisely on the path a real
+    client is most likely to hit on retry; this is the regression fence for
+    that.
+    """
+    url = f"/v1/agents/{plain_agent.code}/runs"
+    h = {"Idempotency-Key": "shape-parity-1"}
+    first = await external_client.post(url, json=BODY, headers=h)
+    second = await external_client.post(url, json=BODY, headers=h)
+    assert first.status_code == 202, first.text
+    assert second.status_code == 202, second.text
+    first_body = first.json()
+    second_body = second.json()
+    assert set(first_body) == {"success", "data", "error"}
+    assert set(second_body) == {"success", "data", "error"}
+    assert set(first_body["data"]) == {"run_id", "thread_id", "status"}
+    assert set(second_body["data"]) == {"run_id", "thread_id", "status"}
+    assert second_body["data"]["run_id"] == first_body["data"]["run_id"]
 
 
 @pytest.mark.asyncio
@@ -227,7 +261,7 @@ async def test_no_key_creates_distinct_runs(
     a = await external_client.post(url, json=BODY)
     b = await external_client.post(url, json=BODY)
     assert a.status_code == 202 and b.status_code == 202
-    assert a.json()["run_id"] != b.json()["run_id"]
+    assert a.json()["data"]["run_id"] != b.json()["data"]["run_id"]
 
 
 @pytest.mark.asyncio
@@ -393,8 +427,14 @@ async def test_endpoint_catches_store_conflict_and_returns_winner() -> None:
             headers={"Idempotency-Key": "race-1"},
         )
     assert resp.status_code == 202, resp.text
-    assert resp.json()["run_id"] == str(winner_run_id)
-    assert resp.json()["thread_id"] == str(winner_thread_id)
+    # External-API-v1 P2-a Task 15 —— this is the third of the three 202
+    # paths that must all envelope identically (裁定 1): the concurrent
+    # conflict-loser requery, same ``_idempotent_run_response`` helper as
+    # the plain cache-hit path above.
+    body = resp.json()
+    assert body["success"] is True and body["error"] is None
+    assert body["data"]["run_id"] == str(winner_run_id)
+    assert body["data"]["thread_id"] == str(winner_thread_id)
 
 
 # ---------------------------------------------------------------------------

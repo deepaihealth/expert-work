@@ -193,10 +193,16 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
         headers=ctx.key_headers,
     )
     assert run.status_code == 202, run.text
-    run_id = run.json()["run_id"]
+    # External-API-v1 P2-a Task 15 — the 202 body is the {success, data,
+    # error} envelope, like every other external endpoint.
+    run_body = run.json()
+    assert set(run_body) == {"success", "data", "error"}
+    assert run_body["success"] is True and run_body["error"] is None
+    assert set(run_body["data"]) == {"run_id", "thread_id", "status"}
+    run_id = run_body["data"]["run_id"]
     # The run must have landed in the SAME session the upload minted — proves
     # the upload's session_id needed no translation to be accepted by runs.
-    assert run.json()["thread_id"] == session_id
+    assert run_body["data"]["thread_id"] == session_id
 
     # 3. Cancel it.
     cancelled = await ctx.client.post(
