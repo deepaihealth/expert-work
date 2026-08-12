@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import DateTime, Index, Text, func, text
+from sqlalchemy import DateTime, Index, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,6 +32,10 @@ class ThreadMetaRow(Base):
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     agent_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     agent_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Third-party-visible message count (include_hidden=False), recomputed by
+    # run finalization. No server_default: pre-existing rows stay NULL
+    # ("not yet computed"), distinct from a genuinely empty thread (0).
+    message_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
