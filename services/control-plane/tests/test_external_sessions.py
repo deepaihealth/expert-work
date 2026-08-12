@@ -468,3 +468,119 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "run_id": None,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_exposes_message_count(ctx: _Ctx) -> None:
+    """Task 8: ``thread_meta.message_count`` (written by run finalization's
+    ``include_hidden=False`` recount — out of this task's scope, only read
+    here) must round-trip into the external sessions list response.
+
+    Seeds a distinctive non-zero value (7) rather than 0 — ``ThreadMeta``
+    already defaults ``message_count`` to 0 on creation
+    (``thread_meta/memory.py:49``), so asserting ``== 0`` here would pass
+    even if the field were never wired through the endpoint at all.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    thread_id = UUID(started.json()["thread_id"])
+    updated = await ctx.app.state.thread_meta_repo.update_message_count(
+        thread_id, 7, tenant_id=ctx.tenant_id
+    )
+    assert updated is True
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"]["sessions"][0]
+    assert "message_count" in item
+    assert item["message_count"] == 7
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_message_count_null_when_never_computed(ctx: _Ctx) -> None:
+    """A session whose run has never reached finalization has
+    ``message_count IS NULL`` ("not yet computed") — the column has no
+    ``server_default`` precisely so this is distinguishable from ``0``
+    ("computed, genuinely empty"; ``0144_thread_meta_msg_count.py``). The
+    response must serialize this as JSON ``null`` with the key present, not
+    omit the field and not coerce it to ``0``.
+
+    ``ThreadMetaStore.create()`` always writes ``0`` and
+    ``update_message_count()`` only accepts ``int`` (by design — its
+    docstring: "callers should never write 0 to mean not yet computed")
+    — there is no public API to put a row back into the NULL state, so
+    this reaches into the in-memory store's row dict directly, the same
+    way ``test_runs_api.py``/``test_resume_idempotency_flow.py`` do for
+    states with no public writer.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    thread_id = UUID(started.json()["thread_id"])
+    repo = ctx.app.state.thread_meta_repo
+    row = await repo.get(thread_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    repo._rows[thread_id] = row.model_copy(update={"message_count": None})
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"]["sessions"][0]
+    assert "message_count" in item
+    assert item["message_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_message_count_distinguishes_null_from_zero(ctx: _Ctx) -> None:
+    """Both states in the same response: one session genuinely computed to
+    0 (an agent run that finalized with no visible turns — the default
+    ``ThreadMeta.create()`` leaves in place), one never computed (``None``,
+    seeded the same way as the previous test). A regression that collapsed
+    either state into the other — e.g. hard-coding the field, or a stray
+    ``count or 0`` — would pass a test that only ever inspected one session
+    in isolation; asserting both in the same list catches it.
+    """
+    await ctx.seed_agent()
+    computed_zero = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert computed_zero.status_code == 202, computed_zero.text
+    never_computed = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert never_computed.status_code == 202, never_computed.text
+    never_computed_id = UUID(never_computed.json()["thread_id"])
+    repo = ctx.app.state.thread_meta_repo
+    row = await repo.get(never_computed_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    repo._rows[never_computed_id] = row.model_copy(update={"message_count": None})
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
+    assert by_id[computed_zero.json()["thread_id"]]["message_count"] == 0
+    assert by_id[never_computed.json()["thread_id"]]["message_count"] is None
