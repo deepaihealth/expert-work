@@ -17,7 +17,13 @@
 - 对外响应一律 `{success, data, error}` 信封;所有 404 隐藏存在性(不区分「不存在」与「不属于你」)。
 - 归属解析一律走 `_external.py` 的现成通路,读路径 `mint=False` —— 读操作**绝不**为没见过的 `user_id` 铸 `tenant_user` 行。
 - scope 闸:读用 `require("session", "read")`,写用 `require("session", "write")`,归档用 `require("session", "delete")`(`Action` 合法取值见 `auth/rbac.py:50`)。
-- 控制台侧的 `console_only()` 端点**一个都不动** —— 本计划只新增对外镜像。
+- **共用逻辑抽 helper,不做两份**(用户 2026-08-12 裁定,推翻本计划初稿的「逐段镜像」)。
+  控制台与对外两侧共用的那段(路径校验 → 读文件 → 权限失败/不存在分支 → 响应头)抽成一个
+  helper,两侧各自只保留**身份解析**的差异。理由:这段全是安全代码,两份实现将来必然漂 ——
+  改了一侧忘另一侧,而漂掉的那一侧不会有任何报错。
+  代价是要动控制台侧既有代码 —— **允许**,但必须是纯提取:控制台侧行为零变化,
+  `tests/test_workspace_api.py` 等既有测试必须原样绿,以此证明提取没改语义。
+- 控制台端点的 `console_only()` 闸**不动** —— 抽 helper 不等于放开控制台端点的可达性。
 - **不镜像 `DELETE /v1/workspace/file`**:破坏性操作,第三方缺「这文件重不重要」的上下文,需单独拍板(spec §九-4)。
 - 本地跑 integration 测试须先 `export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock`。
 
@@ -44,7 +50,12 @@
 - Produces: `GET /v1/agents/{agent_code}/workspace/files?user_id=` → `{success, data: {files: [{path, size}]}, error}`
 - Produces: `build_external_workspace_router() -> APIRouter`
 
-**镜像来源:** `api/workspace.py:171-217`(`list_workspace_files`)。逐条对照:
+**先做纯提取。** 从 `api/workspace.py:171-217` 里把「拿到 `(tenant_id, user_id)` 之后」的那段
+——`workspace_store.list_files` 调用 + `WorkspacePermissionError`→500 / `SandboxSupervisorError`→`[]`
+两个分支 + `files` 投影——抽成 `_workspace_files_payload(workspace_store, *, tenant_id, user_id)`,
+放进 `api/_workspace_shared.py`(新建)。控制台端点改为调它,**行为零变化**。
+
+然后对外端点复用同一个 helper,只自己做身份解析。逐条对照:
 
 | 控制台侧 | 对外侧 |
 |---|---|
@@ -52,8 +63,8 @@
 | `resolve_target_user_id(request, users, requested=user_id)` | `_external.py` 的 `user_id`(字符串)→ `external_subject_id` → `tenant_user`,`mint=False` |
 | `console_only()` | `require("session", "read")` |
 | 裸 `{"success": True, "data": ...}` | 同款信封(已一致) |
-| `WorkspacePermissionError` → 500 | **原样保留** |
-| `SandboxSupervisorError` → `[]` | **原样保留** |
+| `WorkspacePermissionError` → 500 | **进 helper,两侧共用** |
+| `SandboxSupervisorError` → `[]` | **进 helper,两侧共用** |
 
 > ⚠️ `WorkspacePermissionError` 与 `SandboxSupervisorError` 的 except **顺序不能反** ——
 > 前者是后者的子类,反了那一支永远走不到。控制台侧的注释写明了这点,镜像时一并抄过来。
@@ -142,18 +153,26 @@ router 挂 `prefix="/v1/agents"`,两个端点:`GET /{agent_code}/workspace/files
 (Task 2)`GET /{agent_code}/workspace/file`。列表端点体照上表逐条对照实现。
 `app.py` 里挂载新 router(照 P1 那 5 个 `build_external_*_router()` 的挂法)。
 
-- [ ] **Step 4: 跑测试**
+- [ ] **Step 4: 证明提取没改控制台行为**
+
+Run: `cd services/control-plane && DOCKER_HOST= uv run pytest -k workspace -v`
+Expected: 控制台侧既有工作区测试**原样全 PASS**。一条都不许改测试来迁就提取 ——
+测试要改就说明提取改了语义,那不是纯提取。
+
+- [ ] **Step 5: 跑新端点测试**
 
 Run: `cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_external_workspace.py tests/test_external_route_reachability.py -v`
 Expected: 全 PASS
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add services/control-plane/src/control_plane/api/external_workspace.py \
+git add services/control-plane/src/control_plane/api/_workspace_shared.py \
+        services/control-plane/src/control_plane/api/workspace.py \
+        services/control-plane/src/control_plane/api/external_workspace.py \
         services/control-plane/src/control_plane/app.py \
         services/control-plane/tests/test_external_workspace.py
-git commit -m "feat(control-plane): 对外工作区文件列表端点"
+git commit -m "feat(control-plane): 工作区列表逻辑抽公共 helper + 对外端点"
 ```
 
 ---
@@ -168,9 +187,15 @@ git commit -m "feat(control-plane): 对外工作区文件列表端点"
 - Consumes: Task 1 的 router 与身份解析
 - Produces: `GET /v1/agents/{agent_code}/workspace/file?user_id=&path=` → 文件字节流
 
-**镜像来源:** `api/workspace.py:218-276`(`download_workspace_file`)。必须原样复用的四样:
-`_safe_workspace_relpath`(路径校验)、`infer_content_type`、`content_disposition_header`
-(活动内容一律 `attachment`)、`X-Content-Type-Options: nosniff`。
+**同样先做纯提取。** 从 `api/workspace.py:219-276` 把「拿到 `(tenant_id, user_id, path)` 之后」
+的整段——`_safe_workspace_relpath` 校验 → `read_file` → `WorkspacePermissionError`→500 /
+`SandboxSupervisorError`→404 两个分支(**顺序不能反**,前者是后者子类)→ `infer_content_type`
++ `content_disposition_header` + `nosniff` 响应头——抽成
+`_workspace_file_response(workspace_store, *, tenant_id, user_id, path)`,同样放
+`api/_workspace_shared.py`。控制台端点改为调它,**行为零变化**。
+
+对外端点复用同一个 helper。安全性质(路径校验、活动内容强制 `attachment`、不透明 404)
+因此**天然两侧一致**,不靠人记得抄。
 
 > ⚠️ 跨用户 / 文件不存在 / 无 supervisor **一律同一个不透明 404** —— 控制台侧就是这么做的,
 > 镜像不能因为「对外要友好」就把它们区分开,那是存在性泄漏。
@@ -234,23 +259,29 @@ Expected: FAIL — 404(路由不存在)
 
 - [ ] **Step 3: 实现**
 
-照 `api/workspace.py:219-276` 逐段镜像,替换身份解析,except 顺序与 404 语义原样保留。
+先抽 `_workspace_file_response` 到 `api/_workspace_shared.py`,控制台端点改为调它;
+对外端点复用同一个 helper,自己只做身份解析。except 顺序(`WorkspacePermissionError`
+在 `SandboxSupervisorError` 之前)进 helper,两侧自动一致。
 
 - [ ] **Step 4: 变异自验**
 
 把 `_safe_workspace_relpath` 的调用临时改成直接用原始 `path`,重跑参数化的路径穿越测试,
 确认 **FAIL**(至少 `../../etc/passwd` 一例)。恢复后再跑绿。
 
-- [ ] **Step 5: 跑测试**
+- [ ] **Step 5: 跑测试(含控制台侧回归)**
 
-Run: `cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_external_workspace.py tests/test_external_hardening.py -v`
-Expected: 全 PASS
+Run: `cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_external_workspace.py tests/test_external_hardening.py -k "workspace or download" -v`
+再跑一次控制台侧:`DOCKER_HOST= uv run pytest -k workspace -v`
+Expected: 全 PASS,且控制台侧测试**一条未改**。
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add services/control-plane/src/control_plane/api/external_workspace.py services/control-plane/tests/test_external_workspace.py
-git commit -m "feat(control-plane): 对外工作区文件下载端点"
+git add services/control-plane/src/control_plane/api/_workspace_shared.py \
+        services/control-plane/src/control_plane/api/workspace.py \
+        services/control-plane/src/control_plane/api/external_workspace.py \
+        services/control-plane/tests/test_external_workspace.py
+git commit -m "feat(control-plane): 工作区下载逻辑抽公共 helper + 对外端点"
 ```
 
 ---
