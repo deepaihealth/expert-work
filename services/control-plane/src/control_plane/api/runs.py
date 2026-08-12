@@ -808,6 +808,8 @@ async def spawn_run(
     trace_id: str,
     extra_headers: dict[str, str] | None = None,
     on_behalf_of: str | None = None,
+    idempotency_key: str | None = None,
+    request_digest: str | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -818,7 +820,16 @@ async def spawn_run(
     accounting all key on it (the caller for a normal session run; the minted
     end-user for an on-behalf-of external run). ``oauth_subject`` keys the per-user
     OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
-    acts for one."""
+    acts for one.
+
+    ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13) are
+    forwarded to :meth:`RunManager.enqueue` on the ``mode="queue"`` branch only —
+    the caller (``agents.py``'s external run endpoint) has already rejected a
+    non-``queue`` request carrying a key with ``422
+    IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` before this function is ever called, so
+    the stream branch below never sees a non-``None`` key in practice. Both
+    default to ``None`` — the internal ``trigger_run`` caller never passes them,
+    so its behaviour is unchanged."""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -879,6 +890,8 @@ async def spawn_run(
             },
             is_resume=bool(prior_runs),
             trace_id=trace_id,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         logger.info("control_plane.run.enqueued run_id=%s", run_id)
         return JSONResponse(

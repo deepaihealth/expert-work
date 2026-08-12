@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -29,6 +29,11 @@ from control_plane.api._external import (
     ExternalScopeError,
     lookup_external_user_id,
     resolve_external_user_id,
+)
+from control_plane.api._idempotency import (
+    IDEMPOTENCY_HEADER,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    request_digest,
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
@@ -76,7 +81,7 @@ from expert_work.protocol import (
     tier_satisfies,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunStore
+from expert_work.runtime.runs import RunIdempotencyConflict, RunStore
 from orchestrator import AgentFactoryError
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -941,6 +946,8 @@ def build_agents_router() -> APIRouter:
         approvals: Annotated[ApprovalStore, Depends(_get_approvals)],
         quota: Annotated[QuotaService, Depends(_get_quota)],
         disable_service: Annotated[AgentDisableService, Depends(_get_agent_disable_service)],
+        run_store: Annotated[RunStore, Depends(_get_run_store)],
+        idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
     ) -> StreamingResponse | JSONResponse:
         """Run an agent on behalf of an external-app end-user (M1-5b-2).
 
@@ -950,10 +957,63 @@ def build_agents_router() -> APIRouter:
         the API-key caller. Returns the SSE stream (``X-Expert-Work-Session-Id`` header) or
         202 for queue mode. The agent definition is shared across the tenant's users;
         per-user isolation is the user-scoped state.
+
+        External-API-v1 P2-a Task 13 — an ``Idempotency-Key`` header (``mode=
+        "queue"`` only) makes a retried call return the original run instead of
+        spawning a duplicate. See ``_idempotency.request_digest`` for why the
+        fingerprint folds in ``agent_code``, and the block right below for the
+        four-way branch (blank/oversized key, stream mode, cache hit / mismatch,
+        miss). Checked before any side effect — no session/thread minted, no
+        admission charged — so a rejected or replayed call never mutates state.
         """
         tenant_id = request.state.tenant_id
         actor_id = request.state.actor_id
         trace_id = current_trace_id_hex()
+
+        key: str | None = None
+        digest: str | None = None
+        if idempotency_key is not None:
+            key = idempotency_key.strip()
+            if not key or len(key) > MAX_IDEMPOTENCY_KEY_LEN:
+                return _envelope_error(
+                    "INVALID_IDEMPOTENCY_KEY",
+                    f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} non-blank characters",
+                    422,
+                )
+            # P2-a Task 13 裁定 2 —— stream 模式返回的是 SSE 长连接,不是
+            # {run_id} 信封;"返回原 run" 在 stream 下意味着重放历史流,那是
+            # 下一个 task 的事,本 task 不做。静默忽略幂等保证比明确拒绝更
+            # 危险:第三方以为有重复保护,实际没有,重试就是重复扣费/重复
+            # 执行。下一个 task 放宽成"支持"对第三方是兼容变更(422→200)。
+            if payload.mode != "queue":
+                return _envelope_error(
+                    "IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM",
+                    "Idempotency-Key is only supported for mode='queue' runs",
+                    422,
+                )
+            digest = request_digest(payload, agent_code=agent_code)
+            existing = await run_store.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+            if existing is not None:
+                if existing.request_digest != digest:
+                    return _envelope_error(
+                        "IDEMPOTENCY_KEY_REUSED",
+                        "this Idempotency-Key was already used with a different request",
+                        422,
+                    )
+                # Same key, same fingerprint — hand back the original run
+                # untouched rather than spawning a duplicate. Same flat shape
+                # spawn_run's own queue-mode branch returns (no {success,
+                # data, error} envelope — that convention is for ERROR
+                # responses on this endpoint, see _envelope_error above).
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "run_id": str(existing.run_id),
+                        "thread_id": str(existing.thread_id),
+                        "status": existing.status.value,
+                    },
+                )
+
         try:
             record, thread_id, end_user_id = await _resolve_session(
                 tenant_id=tenant_id,
@@ -1042,24 +1102,49 @@ def build_agents_router() -> APIRouter:
             inputs=payload.inputs,
             document_names=document_names,
         )
-        return await spawn_run(
-            runtime=runtime,
-            audit=audit,
-            approvals=approvals,
-            request=request,
-            settings=request.app.state.settings,
-            built=built,
-            record_spec=record.spec,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            effective_user_id=end_user_id,
-            oauth_subject=str(end_user_id),
-            payload=run_payload,
-            trace_id=trace_id,
-            extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
-            on_behalf_of=str(end_user_id),
-        )
+        try:
+            return await spawn_run(
+                runtime=runtime,
+                audit=audit,
+                approvals=approvals,
+                request=request,
+                settings=request.app.state.settings,
+                built=built,
+                record_spec=record.spec,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                effective_user_id=end_user_id,
+                oauth_subject=str(end_user_id),
+                payload=run_payload,
+                trace_id=trace_id,
+                extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
+                on_behalf_of=str(end_user_id),
+                idempotency_key=key,
+                request_digest=digest,
+            )
+        except RunIdempotencyConflict:
+            # P2-a Task 13 —— concurrent single winner. Both requests missed
+            # each other in the ``find_by_idempotency_key`` check above (race
+            # window between that read and this create); the partial unique
+            # index on ``agent_run`` let exactly one insert through and
+            # raised this for the loser. Re-query and hand the loser's caller
+            # the winner's response instead of erroring or double-creating.
+            if key is None:  # pragma: no cover - unreachable: spawn_run only
+                # raises this when it was itself called with a non-None key.
+                raise
+            winner = await run_store.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+            if winner is None:  # pragma: no cover - the index guarantees a
+                # winner row exists the instant the conflict fires.
+                raise
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "run_id": str(winner.run_id),
+                    "thread_id": str(winner.thread_id),
+                    "status": winner.status.value,
+                },
+            )
 
     @router.get("", dependencies=_CONSOLE_ONLY)
     async def list_agents(

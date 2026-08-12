@@ -200,6 +200,8 @@ class RunManager:
         user_id: UUID | None = None,
         is_resume: bool = False,
         trace_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
     ) -> None:
         """Persist a ``QUEUED`` run for the distributed queue (Stream 9.5).
 
@@ -208,6 +210,18 @@ class RunManager:
         ``asyncio.Task``. A :class:`RunQueueWorker` on any instance later
         CAS-claims it (``status='queued'`` → ``running``), adopts it, and
         executes it from ``enqueued_input``. Requires a durable store.
+
+        External-API-v1 P2-a Task 13 — ``idempotency_key`` / ``request_digest``
+        thread straight onto the ``RunInfo`` so ``self._store.create`` makes
+        "claim the key" and "create the run row" the same atomic insert (the
+        partial unique index backing that is on ``agent_run`` itself — see
+        ``RunStore.create``'s docstring). A non-``None`` key that collides
+        with an existing ``(tenant_id, idempotency_key)`` row raises
+        :class:`~expert_work.runtime.runs.store.RunIdempotencyConflict` out of
+        this call — the caller (the external run endpoint) catches it and
+        re-queries the winner. Both default to ``None``, so every existing
+        caller (the internal session-run endpoint) is unaffected: no key,
+        no possible conflict, byte-identical behaviour to before this task.
         """
         if self._store is None:
             msg = "enqueue requires a durable RunStore"
@@ -227,6 +241,8 @@ class RunManager:
             finished_at=None,
             trace_id=trace_id,
             enqueued_input=enqueued_input,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         await self._store.create(info)
         logger.info("run.enqueue id=%s thread=%s tenant=%s", run_id, thread_id, tenant_id)
