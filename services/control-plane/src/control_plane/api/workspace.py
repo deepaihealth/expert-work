@@ -16,21 +16,23 @@ principal owns no per-user workspace.
 from __future__ import annotations
 
 import logging
-from pathlib import PurePosixPath
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only
 from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
     resolve_target_user_id,
 )
-from control_plane.api._workspace_shared import _workspace_files_payload
+from control_plane.api._workspace_shared import (
+    _safe_workspace_relpath,
+    _workspace_file_response,
+    _workspace_files_payload,
+)
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     applied_scope,
@@ -69,21 +71,6 @@ def _get_workspace_file_store(request: Request) -> WorkspaceStore | None:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
-
-
-def _safe_workspace_relpath(path: str) -> str | None:
-    """Return the cleaned relative path, or ``None`` if it escapes the workspace.
-
-    The ``path`` query param round-trips through the client untrusted, so the
-    download / delete endpoints re-check it here (the supervisor re-validates at
-    its own boundary — defence in depth). Rejects absolute paths and any ``..``
-    segment that would climb out of ``/workspace``. Mirrors the identical guard
-    on the thread-scoped routes in :mod:`control_plane.api.sessions`.
-    """
-    cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
-        return None
-    return cleaned
 
 
 def build_workspace_router() -> APIRouter:
@@ -223,6 +210,12 @@ def build_workspace_router() -> APIRouter:
         opaque response. No store call is made here — file isolation is
         delegated to the supervisor, which resolves the volume strictly by
         ``(tenant_id, user_id)``.
+
+        The security-relevant plumbing (path validation → read → permission-
+        failure-vs-missing-file split → headers) lives in
+        :func:`_workspace_file_response`, shared with the external plane's
+        ``GET /v1/agents/{agent_code}/workspace/file`` — see
+        ``api/_workspace_shared.py``.
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -234,34 +227,9 @@ def build_workspace_router() -> APIRouter:
         )
         # Caller-identity resolution stays OUTSIDE applied_scope.
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
-        safe_path = _safe_workspace_relpath(path)
-        if safe_path is None:
-            raise HTTPException(status_code=400, detail="invalid workspace path")
-        if target_user_id is None or workspace_store is None:
-            raise HTTPException(status_code=404, detail="file not found")
-        try:
-            data = await workspace_store.read_file(
-                tenant_id=scope.tenant_id, user_id=target_user_id, path=safe_path
-            )
-        except WorkspacePermissionError as exc:
-            # 权限失败是服务端配置问题,不是"这个文件不存在"——404 的语义是
-            # "不存在 / 你不该知道它存在";塞进 404 会让用户看到一份列在上一屏
-            # 却"文件不存在"的报错。必须排在下面的 SandboxSupervisorError 之
-            # 前——它是那个类的子类,顺序反了这一分支永远走不到。
-            logger.warning("workspace.read_permission_denied", exc_info=True)
-            raise HTTPException(status_code=500, detail="workspace file unavailable") from exc
-        except SandboxSupervisorError as exc:
-            logger.warning("workspace.read_failed", exc_info=True)
-            raise HTTPException(status_code=404, detail="file not found") from exc
-        filename = PurePosixPath(safe_path).name or "download"
-        inferred = infer_content_type(kind="other", path=safe_path)
-        headers = {
-            "Content-Disposition": content_disposition_header(
-                filename, disposition=inferred.disposition
-            ),
-            "X-Content-Type-Options": "nosniff",
-        }
-        return Response(content=data, media_type=inferred.content_type, headers=headers)
+        return await _workspace_file_response(
+            workspace_store, tenant_id=scope.tenant_id, user_id=target_user_id, path=path
+        )
 
     @router.delete("/file", response_model=None, dependencies=[Depends(console_only())])
     async def delete_workspace_file(
