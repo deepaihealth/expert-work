@@ -584,3 +584,138 @@ async def test_sessions_list_message_count_distinguishes_null_from_zero(ctx: _Ct
     by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
     assert by_id[computed_zero.json()["data"]["thread_id"]]["message_count"] == 0
     assert by_id[never_computed.json()["data"]["thread_id"]]["message_count"] is None
+
+
+# ---------------------------------------------------------------------------
+# External-API-v1 P2-b Task 3 — rename / archive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rename_session(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "cust-77", "title": "改过的标题"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+
+    listed = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"]["sessions"][0]["title"] == "改过的标题"
+
+
+@pytest.mark.asyncio
+async def test_rename_blank_title_is_422(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "cust-77", "title": "   "},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "INVALID_TITLE"
+
+
+@pytest.mark.asyncio
+async def test_rename_foreign_session_is_404(ctx: _Ctx) -> None:
+    """Renaming someone else's session must 404 — never 403 — so a third
+    party cannot distinguish "not yours" from "doesn't exist"."""
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "someone-else", "title": "偷改"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "SESSION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_archive_session_hides_from_list(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.delete(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+
+    listed = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"]["sessions"] == []
+
+
+@pytest.mark.asyncio
+async def test_archive_requires_delete_scope(ctx: _Ctx) -> None:
+    """``write`` scope is not enough — archive needs ``delete`` (an
+    ``admin``-scoped key), same split as the console side
+    (``sessions.py:914`` vs ``:880``). Proves the two endpoints sit on
+    different scope tiers, not the same one."""
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    write_only_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-write-only",
+        sub_type="service_account",
+        roles=(),
+        scopes=("write",),
+    )
+    resp = await ctx.client.delete(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        params={"user_id": "cust-77"},
+        headers={"Authorization": f"Bearer {write_only_jwt}"},
+    )
+    assert resp.status_code == 403, resp.text
