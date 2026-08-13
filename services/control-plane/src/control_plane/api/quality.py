@@ -23,6 +23,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
+from control_plane.api._authz import console_only
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -82,7 +83,9 @@ def _get_audit(request: Request) -> AuditLogger:
 
 def build_quality_router() -> APIRouter:
     """Read the per-agent quality series + drift alerts (scope-aware reads)."""
-    router = APIRouter(prefix="/v1/quality", tags=["quality"])
+    router = APIRouter(
+        prefix="/v1/quality", tags=["quality"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("/scores", response_model=None)
     async def list_scores(

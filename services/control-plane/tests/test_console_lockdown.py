@@ -87,6 +87,7 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     ("GET", f"/v1/curation/candidates/{_TID}"),
     ("GET", "/v1/eval-datasets"),
     ("GET", "/v1/eval-runs"),
+    ("GET", "/v1/quality/scores"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -135,6 +136,17 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: key — could read any end user's complete conversation verbatim.
 #: Backlog Task 5 also added /v1/eval-runs: zero RBAC on all 4 routes
 #: (list/enqueue/get/cases) — same shape as the rest of this batch.
+#: Backlog Task 5's last prefix: /v1/quality — zero RBAC on both routes
+#: (quality scores + drift alerts). Scores carry run_id/thread_id (can be
+#: traced back to a specific end-user conversation, though the content
+#: itself is a score + rationale, not the raw transcript); drift alerts are
+#: tenant-level aggregates with no per-session content. This closes the
+#: last of the six prefixes named in the CONSOLE_ENDPOINTS comment above —
+#: all 42 routes across skills/knowledge/curation/eval-datasets/eval-runs/
+#: quality now carry console_only(), verified by the structural self-audit
+#: below (test_every_console_route_carries_the_lockdown_dependency), which
+#: walks every live route under these prefixes and checks its dependency
+#: graph directly rather than relying on any hand-maintained route list.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -152,6 +164,7 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/curation",
     "/v1/eval-datasets",
     "/v1/eval-runs",
+    "/v1/quality",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under
