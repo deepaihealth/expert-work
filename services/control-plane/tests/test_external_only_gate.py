@@ -35,7 +35,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec, AuditQuery, Role
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -131,6 +131,7 @@ class _Ctx:
         tenant_id: UUID,
         employee_headers: dict[str, dict[str, str]],
         key_headers: dict[str, dict[str, str]],
+        audit_store: InMemoryAuditLogStore,
     ) -> None:
         self.client = client
         self.app = app
@@ -139,6 +140,7 @@ class _Ctx:
         self.employee_headers = employee_headers
         #: keyed by scope name: "read" / "write" / "admin"
         self.key_headers = key_headers
+        self.audit_store = audit_store
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -161,11 +163,12 @@ async def ctx() -> AsyncIterator[_Ctx]:
     lifecycle.mark_ready()
     run_store = InMemoryRunStore()
     run_event_store = InMemoryRunEventStore()
+    audit_store = InMemoryAuditLogStore()
     app = create_app(
         settings=_build_settings(),
         lifecycle=lifecycle,
         jwt_verifier=build_test_jwt_verifier(),
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        audit_logger=build_default_audit_logger(audit_store),
         agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
         run_repo=run_store,
         run_event_repo=run_event_store,
@@ -198,7 +201,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     }
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, employee_headers, key_headers)
+        yield _Ctx(client, app, tenant_id, employee_headers, key_headers, audit_store)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +225,29 @@ async def test_employee_jwt_is_denied_on_every_external_route(
     resp = await ctx.client.request(method, _concretize(path), headers=ctx.employee_headers[role])
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"]["message"] == _EXTERNAL_ONLY_MESSAGE, resp.text
+
+
+@pytest.mark.asyncio
+async def test_employee_jwt_denial_audit_includes_the_denied_path(ctx: _Ctx) -> None:
+    """Dual of ``test_console_lockdown.py``'s same-named test. The deny audit's
+    ``resource_id`` (``"external:non_service_account_denied"``) is a constant
+    shared by every route this gate closes; ``details.path`` now carries the
+    real request path so triage can tell routes apart.
+    """
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.employee_headers["viewer"],
+    )
+    assert resp.status_code == 403, resp.text
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=ctx.tenant_id, limit=1000))
+    matches = [r for r in page.entries if r.resource_id == "external:non_service_account_denied"]
+    assert len(matches) == 1, [r.model_dump() for r in page.entries]
+    assert matches[0].details.get("path") == "/v1/agents/support-bot/sessions"
+    # resource_id itself must stay the stable constant — see the brief: it
+    # may already be relied on by queries/dashboards, only `details` is free.
+    assert matches[0].resource_id == "external:non_service_account_denied"
 
 
 # ---------------------------------------------------------------------------

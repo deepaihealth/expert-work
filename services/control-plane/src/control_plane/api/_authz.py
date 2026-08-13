@@ -167,7 +167,7 @@ def console_only() -> Callable[..., Awaitable[None]]:
                 result=AuditResult.DENIED,
                 reason="CONSOLE_PLANE_CLOSED_TO_API_KEYS",
                 trace_id=current_trace_id_hex(),
-                details={"subject_type": principal.subject_type},
+                details={"subject_type": principal.subject_type, "path": request.url.path},
             )
         except Exception:
             logger.exception("authz.deny_audit_emit_failed")
@@ -225,7 +225,7 @@ def external_only() -> Callable[..., Awaitable[None]]:
                 result=AuditResult.DENIED,
                 reason="EXTERNAL_PLANE_CLOSED_TO_EMPLOYEE_JWT",
                 trace_id=current_trace_id_hex(),
-                details={"subject_type": principal.subject_type},
+                details={"subject_type": principal.subject_type, "path": request.url.path},
             )
         except Exception:
             logger.exception("authz.deny_audit_emit_failed")
