@@ -692,11 +692,16 @@ async def test_archive_session_hides_from_list(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_requires_delete_scope(ctx: _Ctx) -> None:
-    """``write`` scope is not enough — archive needs ``delete`` (an
-    ``admin``-scoped key), same split as the console side
-    (``sessions.py:914`` vs ``:880``). Proves the two endpoints sit on
-    different scope tiers, not the same one."""
+async def test_archive_requires_at_least_write_scope(ctx: _Ctx) -> None:
+    """A ``read``-only key cannot archive — archive is gated on ``"write"``
+    (same tier as ``rename_session``), not the console side's ``"delete"``
+    (User decision 2026-08-13: an external ``"delete"`` gate maps only to an
+    ``admin``-scoped key — ``rbac.py``'s OPERATOR grant for ``session`` has
+    no ``delete`` — which would force a third party to hold a key that can
+    also rewrite service accounts / role bindings just to archive a
+    session). This still proves the endpoint isn't open to every key: a
+    ``read``-only (VIEWER) principal must be refused.
+    """
     await ctx.seed_agent()
     started = await ctx.client.post(
         "/v1/agents/support-bot/runs",
@@ -706,16 +711,16 @@ async def test_archive_requires_delete_scope(ctx: _Ctx) -> None:
     assert started.status_code == 202, started.text
     session_id = started.json()["data"]["thread_id"]
 
-    write_only_jwt = make_test_jwt(
+    read_only_jwt = make_test_jwt(
         tenant_id=ctx.tenant_id,
-        subject="sa-write-only",
+        subject="sa-read-only",
         sub_type="service_account",
         roles=(),
-        scopes=("write",),
+        scopes=("read",),
     )
     resp = await ctx.client.delete(
         f"/v1/agents/support-bot/sessions/{session_id}",
         params={"user_id": "cust-77"},
-        headers={"Authorization": f"Bearer {write_only_jwt}"},
+        headers={"Authorization": f"Bearer {read_only_jwt}"},
     )
     assert resp.status_code == 403, resp.text

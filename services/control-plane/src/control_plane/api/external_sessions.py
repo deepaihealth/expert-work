@@ -331,7 +331,7 @@ def build_external_sessions_router() -> APIRouter:
     @router.delete(
         "/{agent_code}/sessions/{session_id}",
         response_model=None,
-        dependencies=[Depends(require("session", "delete"))],
+        dependencies=[Depends(require("session", "write"))],
     )
     async def archive_session(
         agent_code: str,
@@ -350,10 +350,21 @@ def build_external_sessions_router() -> APIRouter:
         404s unless the session belongs to ``(user, agent)`` — never 403,
         same rule every other external endpoint follows. ``mint=False``:
         archive only ever targets an already-existing session — see
-        ``load_owned_session``'s docstring. Gated on ``"delete"`` (not
-        ``"write"``, which only grants ``rename_session`` above) — a
-        distinct, narrower scope tier, matching the console side's own
-        ``sessions.py:archive_session``.
+        ``load_owned_session``'s docstring. Gated on ``"write"`` — same tier
+        as ``rename_session`` above, deliberately *not* the console side's
+        ``"delete"`` (``sessions.py:archive_session``): ``ApiKeyScope`` has no
+        standalone delete tier, so an external ``"delete"`` gate only a key
+        minted with ``admin`` scope can pass (``rbac.py``'s OPERATOR grant for
+        ``session`` — the role a ``write``-scope key maps to — is
+        ``{"read", "write", "debug"}``, no ``delete``). Requiring ``admin``
+        just to archive a session would force a third party to hold a key
+        that can also rewrite service accounts / role bindings — the opposite
+        of least privilege. Archiving is a reversible status write (data
+        stays, the console side's own ``:purge`` is the actual irreversible
+        delete and stays console-only), and ``ApiKeyScope.WRITE`` is
+        documented as covering "POST/PUT/DELETE business endpoints" — this
+        is exactly that. (User decision 2026-08-13, overriding the original
+        P2-b plan's Global Constraints, which had specified ``"delete"``.)
         """
         tenant_id: UUID = request.state.tenant_id
         try:
