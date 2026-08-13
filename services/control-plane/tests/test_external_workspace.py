@@ -90,6 +90,7 @@ class _Agent:
 class _SeededWorkspace:
     agent_code: str
     user_id: str
+    expected_bytes: bytes
 
 
 @dataclass
@@ -142,15 +143,23 @@ def user_store(_ctx: _Ctx) -> TenantUserStore:
 
 @pytest.fixture
 async def seeded_workspace(_ctx: _Ctx, user_store: TenantUserStore) -> _SeededWorkspace:
-    """A recognized end-user with one file already sitting in the recorder."""
+    """A recognized end-user with one file already sitting in the recorder.
+
+    ``RecordingWorkspaceStore.read_file`` ignores the requested ``path`` and
+    always returns ``workspace_file`` (a single fixture, not a per-path
+    map) — so ``expected_bytes`` is what any successful download of this
+    user's workspace returns, regardless of which path was asked for.
+    """
     user_id = "报表用户"
     await user_store.resolve(
         tenant_id=_TENANT_ID,
         subject_type="user",
         subject_id=external_subject_id(user_id),
     )
+    expected_bytes = b"report body"
     _ctx.workspace_store.workspace_files = [WorkspaceFileEntry(path="报表.xlsx", size=42)]
-    return _SeededWorkspace(agent_code=_AGENT_CODE, user_id=user_id)
+    _ctx.workspace_store.workspace_file = expected_bytes
+    return _SeededWorkspace(agent_code=_AGENT_CODE, user_id=user_id, expected_bytes=expected_bytes)
 
 
 @pytest.fixture
@@ -183,6 +192,20 @@ async def workspace_store_raising_supervisor_error(
         tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("u1")
     )
     _ctx.workspace_store.workspace_list_error = SandboxSupervisorError("supervisor unreachable")
+    return _ctx.workspace_store
+
+
+@pytest.fixture
+async def workspace_store_raising_file_permission_error(
+    _ctx: _Ctx, user_store: TenantUserStore
+) -> RecordingWorkspaceStore:
+    """A recognized user ("u1") whose file *read* (not list) blows up with a
+    permission error — the download-endpoint analogue of
+    ``workspace_store_raising_permission_error`` above."""
+    await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("u1")
+    )
+    _ctx.workspace_store.workspace_file_error = WorkspacePermissionError("boom")
     return _ctx.workspace_store
 
 
@@ -278,3 +301,161 @@ async def test_list_files_still_empty_on_a_generic_supervisor_error(
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["files"] == []
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/agents/{agent_code}/workspace/file  (Task 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_returns_bytes_with_safe_headers(external_client, seeded_workspace) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": seeded_workspace.user_id, "path": "报表.xlsx"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == seeded_workspace.expected_bytes
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    # ``.xlsx`` isn't in any inline whitelist (``_artifact_mime.py``) → the
+    # safe default is octet-stream + attachment.
+    assert resp.headers["Content-Disposition"].startswith("attachment")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "..",
+        "",
+        "a/../../etc/passwd",
+        "reports/..",
+        "  ",
+        "report\x00.txt",  # Pure NUL, no ``..`` segment — proves the NUL check itself,
+        # not the pre-existing ``..`` guard catching it incidentally.
+        "a\x00../../etc/passwd",  # NUL byte alongside a real traversal segment.
+    ],
+)
+@pytest.mark.asyncio
+async def test_download_path_traversal_rejected(external_client, seeded_workspace, bad) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": seeded_workspace.user_id, "path": bad},
+    )
+    assert resp.status_code == 400, f"{bad!r} 应被拒,实际 {resp.status_code}"
+
+
+@pytest.mark.asyncio
+async def test_download_html_forced_to_attachment(external_client, seeded_workspace) -> None:
+    """活动内容必须 attachment —— 否则是存储型 XSS。
+
+    ``RecordingWorkspaceStore.read_file`` ignores ``path`` and always returns
+    the same fixture bytes, so this reuses ``seeded_workspace`` (no separate
+    "html" fixture needed) and only checks the disposition, which is derived
+    purely from the ``path`` extension, not the actual bytes returned.
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": seeded_workspace.user_id, "path": "x.html"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["Content-Disposition"].startswith("attachment")
+
+
+@pytest.mark.asyncio
+async def test_download_scopes_store_call_to_the_requested_user(
+    external_client, _ctx: _Ctx, user_store: TenantUserStore
+) -> None:
+    """跨用户隔离 —— store 的 ``read_file`` 调用必须落在被请求的那个 ``user_id``
+    解析出的 ``tenant_user.id`` 上,不是别的用户 / 一个固定值。
+
+    Mirrors ``test_list_files_scopes_store_call_to_the_requested_user``:
+    ``RecordingWorkspaceStore`` returns the same bytes for any caller, so the
+    response body can't prove isolation — only the store's recorded call
+    args can. Hardcoding the download endpoint's identity resolution to one
+    fixed user (dropping ``lookup_external_user_id``) makes this assertion
+    fail.
+    """
+    user_a = await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("cust-a")
+    )
+    user_b = await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("cust-b")
+    )
+    assert user_a.id != user_b.id
+    _ctx.workspace_store.workspace_file = b"whatever"
+
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/workspace/file",
+        params={"user_id": "cust-a", "path": "report.txt"},
+    )
+    assert resp.status_code == 200
+    assert _ctx.workspace_store.workspace_reads[-1] == (_TENANT_ID, user_a.id, "report.txt")
+    assert _ctx.workspace_store.workspace_reads[-1][1] != user_b.id
+
+
+@pytest.mark.asyncio
+async def test_download_unknown_user_and_missing_file_are_the_same_opaque_404(
+    external_client, _ctx: _Ctx, seeded_workspace
+) -> None:
+    """跨用户(注册表压根没见过的 ``user_id``)与「文件不存在」必须是**同一个**
+    不透明 404 —— 第三方不能靠状态码 / 响应体差异探测出「这个用户没建过档」
+    还是「建过档但没这份文件」。
+
+    第一个请求走 ``lookup_external_user_id`` 的 ``None`` 分支(mint=False,从
+    没见过这个 user_id);第二个请求是已知用户,但把 store 配成对 ``read_file``
+    抛 ``SandboxSupervisorError``(真实 supervisor 里"文件不存在"的等价物)。
+    两者都必须落在 ``_workspace_file_response`` 里同一句
+    ``raise HTTPException(status_code=404, detail="file not found")``。
+    """
+    unknown_user_resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": "从没见过的用户", "path": "报表.xlsx"},
+    )
+    _ctx.workspace_store.workspace_file_error = SandboxSupervisorError("missing")
+    missing_file_resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": seeded_workspace.user_id, "path": "不存在.txt"},
+    )
+    assert unknown_user_resp.status_code == missing_file_resp.status_code == 404
+    assert unknown_user_resp.json() == missing_file_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_download_requires_read_scope(external_client_no_scope, plain_agent) -> None:
+    resp = await external_client_no_scope.get(
+        f"/v1/agents/{plain_agent.code}/workspace/file",
+        params={"user_id": "u1", "path": "report.txt"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_download_permission_error_is_500_not_404(
+    external_client, plain_agent, workspace_store_raising_file_permission_error
+) -> None:
+    """权限失败必须冒出来 —— 塞进不透明 404 会让用户看到"文件不存在",而它明明
+    列在上一屏(与 list 端点的 500 语义一致)。"""
+    resp = await external_client.get(
+        f"/v1/agents/{plain_agent.code}/workspace/file",
+        params={"user_id": "u1", "path": "报表.xlsx"},
+    )
+    assert resp.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_download_still_404s_on_a_generic_supervisor_error(
+    external_client, plain_agent, user_store: TenantUserStore, _ctx: _Ctx
+) -> None:
+    """对照组:普通 SandboxSupervisorError(非权限)仍是 404,不是 500 —— 只有
+    WorkspacePermissionError 那一支才升级。"""
+    await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("u1")
+    )
+    _ctx.workspace_store.workspace_file_error = SandboxSupervisorError("not found")
+    resp = await external_client.get(
+        f"/v1/agents/{plain_agent.code}/workspace/file",
+        params={"user_id": "u1", "path": "报表.xlsx"},
+    )
+    assert resp.status_code == 404

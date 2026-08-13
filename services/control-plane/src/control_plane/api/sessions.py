@@ -41,6 +41,7 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
     thread_list_filter,
 )
+from control_plane.api._workspace_shared import _safe_workspace_relpath
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
@@ -183,20 +184,6 @@ async def _backfill_titles(
                 m = m.model_copy(update={"title": title})
         out.append(m)
     return out
-
-
-def _safe_workspace_relpath(path: str) -> str | None:
-    """Return the cleaned relative path, or ``None`` if it escapes the workspace.
-
-    The ``path`` query param round-trips through the client untrusted, so the
-    download endpoint re-checks it here (the supervisor re-validates again at
-    its own boundary — defence in depth). Rejects absolute paths and any
-    ``..`` segment that would climb out of ``/workspace``.
-    """
-    cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
-        return None
-    return cleaned
 
 
 async def _resolve_agent_selection(
