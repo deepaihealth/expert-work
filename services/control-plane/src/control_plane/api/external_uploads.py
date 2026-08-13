@@ -47,7 +47,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import JSONResponse
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import require
+from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
@@ -149,7 +149,7 @@ def build_external_uploads_router() -> APIRouter:
     router = APIRouter(
         prefix="/v1/agents",
         tags=["external"],
-        dependencies=[Depends(reject_nul_path_params)],
+        dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
     )
 
     @router.post("/{agent_code}/uploads", status_code=201, response_model=None)

@@ -1456,6 +1456,15 @@ def console_only() -> Callable[..., Awaitable[None]]:
     return _dep
 ```
 
+> ⚠️ **收窄(External-API-v1 P2-b 安全修复,2026-08-13)**:上面代码块里
+> `"""...Employee JWTs and mTLS service principals are unaffected."""` 这句
+> 只在 `console_only()` 自身的作用域内成立(它确实不拦员工 JWT / mTLS),**不是**
+> "员工 JWT 在整个平台不受影响"的全局承诺 —— 对外平面(`/v1/agents/{agent_code}/...`)
+> 当时没有对偶闸,员工 JWT 能以自己的 RBAC 角色打对外端点读写任意终端用户数据
+> (真实实测:viewer 读到 SSN、operator 冒充终端用户发 run/裁审批)。已加
+> `external_only()`(见 `_authz.py`)堵上这个方向,现存源码的 docstring 已同步
+> 收窄;本代码块保留作历史记录,**不要照抄这句话**。
+
 - [ ] **Step 4: 挂到控制台路由上**
 
 给 `sessions.py` / `runs.py` / `approvals.py` / `uploads.py` / `plan.py` / `feedback.py` 里**每一个**

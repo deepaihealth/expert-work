@@ -42,7 +42,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from control_plane.api._authz import require
+from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
@@ -225,7 +225,7 @@ def build_external_approvals_router() -> APIRouter:
     router = APIRouter(
         prefix="/v1/agents",
         tags=["external"],
-        dependencies=[Depends(reject_nul_path_params)],
+        dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
     )
 
     @router.post("/{agent_code}/runs/{run_id}:decide", response_model=None)

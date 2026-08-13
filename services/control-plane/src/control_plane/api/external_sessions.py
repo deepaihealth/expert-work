@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from control_plane.api._authz import require
+from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
@@ -131,7 +131,7 @@ def build_external_sessions_router() -> APIRouter:
     router = APIRouter(
         prefix="/v1/agents",
         tags=["external"],
-        dependencies=[Depends(reject_nul_path_params)],
+        dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
     )
 
     @router.get(

@@ -80,7 +80,7 @@ from testcontainers.postgres import PostgresContainer
 
 from control_plane.app import create_app
 from control_plane.settings import Settings
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
@@ -168,7 +168,18 @@ async def ctx(sql_settings: Settings) -> AsyncIterator[_Ctx]:
         enable_curation_worker=False,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — the external
+    # plane is now service-account-only; this file's employee JWT was a
+    # borrowed fixture (predates the gate), not a deliberate test of
+    # console-JWT access. ``disable``/``enable`` (also exercised here) are
+    # NOT gated and remain reachable either way.
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
     # ``raise_app_exceptions=False`` matches a real deployment: Starlette's
     # ``ServerErrorMiddleware`` (always the outermost middleware) turns an

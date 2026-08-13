@@ -25,7 +25,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import console_only, ensure_resource_access, require
+from control_plane.api._authz import (
+    console_only,
+    ensure_resource_access,
+    external_only,
+    require,
+)
 from control_plane.api._external import (
     ExternalScopeError,
     lookup_external_user_id,
@@ -698,8 +703,26 @@ def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
 #: a **zero-scope** service-account key before this, since none of them has
 #: ``require(...)`` or an in-handler ``ensure_resource_access`` either.
 #: ``console_only`` only rejects ``subject_type == "service_account"`` —
-#: employee JWTs and mTLS service principals are untouched.
+#: employee JWTs and mTLS service principals are untouched **by this gate**.
+#: That is not a blanket exemption: ``bind_session`` / ``run_agent_for_user``
+#: below carry the dual gate, ``external_only()``, which rejects everything
+#: EXCEPT ``service_account`` — External-API-v1 P2-b security fix, closing
+#: the console JWT's access to the third-party plane the same way this gate
+#: closes the API key's access to the console plane.
 _CONSOLE_ONLY = [Depends(console_only())]
+
+#: ``external_only()`` — the dual of ``_CONSOLE_ONLY`` above, attached to the
+#: two third-party routes hosted on THIS router (``bind_session`` /
+#: ``run_agent_for_user``; the six ``external_*.py`` routers carry it as a
+#: router-level dependency instead, since every route they host is
+#: third-party). ``disable`` / ``enable`` deliberately do NOT get it — they
+#: are reachable by both an employee JWT (the admin-ui kill switch,
+#: ``apps/admin-ui/src/api/agents.ts::disableAgent``) and a ``write``-scope
+#: API key by design, and neither operation is scoped to a ``user_id`` — the
+#: vulnerability this gate closes (an employee JWT reaching per-end-user
+#: data/actions with no admin check) does not apply to a tenant-wide
+#: manifest flag.
+_EXTERNAL_ONLY = [Depends(external_only())]
 
 
 def build_agents_router() -> APIRouter:
@@ -997,7 +1020,7 @@ def build_agents_router() -> APIRouter:
             content={"success": True, "data": AgentDetail(record=record).model_dump(mode="json")},
         )
 
-    @router.post("/{agent_code}/sessions", status_code=201)
+    @router.post("/{agent_code}/sessions", status_code=201, dependencies=_EXTERNAL_ONLY)
     async def bind_session(
         agent_code: str,
         payload: BindSessionRequest,
@@ -1062,7 +1085,7 @@ def build_agents_router() -> APIRouter:
             },
         )
 
-    @router.post("/{agent_code}/runs", response_model=None)
+    @router.post("/{agent_code}/runs", response_model=None, dependencies=_EXTERNAL_ONLY)
     async def run_agent_for_user(
         agent_code: str,
         payload: ExternalRunRequest,
