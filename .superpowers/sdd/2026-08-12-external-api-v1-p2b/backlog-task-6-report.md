@@ -10,7 +10,7 @@
 
 ## Commit
 
-（见下方"commit"一节 — 本报告写完后立即提交,commit hash 会在返回消息里给出）
+`460c0d12`(`fix(control-plane): agent_private 技能补 owner 闸——堵租户内跨终端用户数据泄露`)
 
 ## 共享判定函数
 
