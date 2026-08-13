@@ -41,6 +41,7 @@ there, not here).
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
@@ -475,6 +476,41 @@ _AGENTS_ROUTER_EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+#: Structural discriminator identifying these four routes' shared shape —
+#: exactly ONE path parameter immediately followed by exactly ONE literal
+#: segment (``/{agent_code}/sessions``, ``/{name}/disable``, …) — as opposed
+#: to every other route on agents.py's own router (``""``/``"/fork"``/
+#: ``"/templates"`` have no path param; ``"/{name}/{version}"`` has two
+#: params and no trailing literal; the revisions/rollback routes have more
+#: than two segments and carry ``console_only()`` besides). Same shape,
+#: same rationale, and same four routes as
+#: ``test_external_only_gate.py``'s ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` — kept
+#: as an independent copy per this suite's own "each security-gate test file
+#: owns its table" convention (see that module's docstring).
+_AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
+
+
+def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
+    """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
+    agents.py's OWN router (excludes ``tags=["external"]`` routes — those live
+    on the six ``external_*.py`` routers, already covered by the tag-driven
+    audit above). A TRUE full enumeration of the live app — see the docstring
+    on ``test_agents_router_external_routes_carry_the_nul_path_guard`` for why
+    this replaced the previous, table-membership-filtered construction."""
+    live: dict[tuple[str, str], APIRoute] = {}
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents/"):
+            continue
+        if "external" in (route.tags or []):
+            continue
+        if not _AGENTS_ROUTER_CANDIDATE_SHAPE.match(route.path):
+            continue
+        for method in route.methods or ():
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            live[(method, route.path)] = route
+    return live
+
 
 def test_agents_router_external_routes_carry_the_nul_path_guard() -> None:
     """The ``agents.py``-hosted counterpart to the test above.
@@ -486,21 +522,27 @@ def test_agents_router_external_routes_carry_the_nul_path_guard() -> None:
     ``table ⊆ live``) so a stale entry (path renamed, route removed) fails
     loudly instead of silently no-oping — same shape as
     ``test_console_lockdown.py``'s ``test_agents_prefix_is_partitioned_exactly``.
+
+    Self-audit blind-spot fix (found in the same review pass as the
+    equivalent bug in ``test_external_only_gate.py``): despite the docstring
+    above already claiming ``live == table, not just table ⊆ live``, the
+    ORIGINAL ``live`` here was built by keeping only routes ALREADY present
+    in ``_AGENTS_ROUTER_EXTERNAL_ROUTES`` while walking ``app.routes`` — i.e.
+    exactly the same filtered-during-construction bug, just under a docstring
+    that asserted the opposite. That makes ``set(live)`` a subset of the
+    table by construction, so the "app has a route the table doesn't" branch
+    of the ``==`` comparison could never actually fire. Fixed by building
+    ``live`` from ``_agents_router_own_candidate_routes`` — a route-SHAPE
+    match against the full app, independent of this table's contents — the
+    same fix applied to ``test_external_only_gate.py``'s twin check.
     """
     app = _build_audit_app()
-    live: dict[tuple[str, str], APIRoute] = {}
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents/"):
-            continue
-        for method in route.methods or ():
-            if method in ("HEAD", "OPTIONS"):
-                continue
-            if (method, route.path) in _AGENTS_ROUTER_EXTERNAL_ROUTES:
-                live[(method, route.path)] = route
+    live = _agents_router_own_candidate_routes(app)
     assert set(live) == _AGENTS_ROUTER_EXTERNAL_ROUTES, (
         f"table out of sync with the live app — missing: "
         f"{sorted(_AGENTS_ROUTER_EXTERNAL_ROUTES - set(live))}, "
-        f"stale: {sorted(set(live) - _AGENTS_ROUTER_EXTERNAL_ROUTES)}"
+        f"stale (route exists in the app but not in the table): "
+        f"{sorted(set(live) - _AGENTS_ROUTER_EXTERNAL_ROUTES)}"
     )
     missing = [
         f"{method} {path}"

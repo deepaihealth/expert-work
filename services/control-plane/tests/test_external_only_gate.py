@@ -19,6 +19,7 @@ not ``"service_account"``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
@@ -406,18 +407,27 @@ _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES: frozenset[tuple[str, str]] = frozenset(
 
 #: The full universe this correspondence check walks: every third-party- (or
 #: write-scope-key-) reachable ``/v1/agents`` route hosted on agents.py's OWN
-#: router, NOT just the subset that must carry the guard. Independently
-#: pinned against the live app below (bidirectionally), same four routes as
+#: router, NOT just the subset that must carry the guard. Same four routes as
 #: ``test_external_path_param_nul_guard.py``'s ``_AGENTS_ROUTER_EXTERNAL_ROUTES``.
-#: Kept separate from ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES`` on purpose: if
-#: the ``live == table`` check below were built by filtering routes to "is
-#: already in ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES``" (as a naive port of
-#: that file's pattern would), silently DROPPING an entry from that table
-#: would shrink both sides of the comparison together and the check would
-#: stay green — exactly the "looks covered so nobody checks again" failure
-#: mode this whole fix exists to close. Walking a table that is independent
-#: of which routes must carry the guard is what makes the per-entry
-#: correspondence check below actually load-bearing.
+#: Kept separate from ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES`` on purpose (a
+#: shrunk/stale table must fail loudly, not vacuously) — see
+#: ``_agents_router_own_candidate_routes`` below for how ``live`` is now built:
+#: a TRUE full enumeration of the app, independent of this table's contents.
+#:
+#: Self-audit blind-spot fix (found in review): the ORIGINAL version of the
+#: enumeration below built ``live`` by walking ``app.routes`` and keeping only
+#: entries that were ALREADY present in this table
+#: (``if (method, route.path) in _AGENTS_ROUTER_UNIVERSE: live[...] = route``).
+#: That construction makes ``set(live)`` a subset of ``_AGENTS_ROUTER_UNIVERSE``
+#: BY CONSTRUCTION, so ``set(live) == _AGENTS_ROUTER_UNIVERSE`` can only ever
+#: fail in the "stale" direction (table lists a route the app no longer has) —
+#: the dangerous direction, a genuinely NEW route added to this router with no
+#: guard and no tag, was unreachable by construction: it never enters ``live``
+#: because it was never in the table to begin with, so it can never make the
+#: sides differ. A live-verified repro: adding an unguarded, untagged
+#: ``{agent_code}`` route to this router left this test (and the other 89 in
+#: this file) all green. See ``_agents_router_own_candidate_routes`` for the
+#: fix — enumeration keyed off route SHAPE, not table membership.
 _AGENTS_ROUTER_UNIVERSE: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/v1/agents/{agent_code}/sessions"),
@@ -427,31 +437,87 @@ _AGENTS_ROUTER_UNIVERSE: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+#: Structural discriminator for "is this route a candidate agents.py owns
+#: that the correspondence check below must see" — matches exactly ONE path
+#: parameter immediately followed by exactly ONE literal (non-parameter)
+#: segment, e.g. ``/{agent_code}/sessions`` or ``/{name}/disable``.
+#:
+#: This is what the four tracked routes (``sessions`` / ``runs`` / ``disable``
+#: / ``enable``) have in common, and every OTHER route on agents.py's own
+#: router is a different shape: ``""`` / ``"/fork"`` / ``"/templates"`` (no
+#: path param at all), ``"/{name}/{version}"`` (two params, no literal
+#: segment after — the manifest identity routes: get/put/delete), or
+#: ``"/{name}/{version}/revisions[...]"`` (more than two segments — those
+#: also carry ``console_only()`` and are not third-party-reachable at all).
+#: It is a fact about this router's URL design, not a hand-maintained list of
+#: names — a future route mounted directly on ``agents.py``'s own router in
+#: this same "one param, one action segment" shape is picked up automatically
+#: by matching the pattern, not by being named in advance.
+#:
+#: Known residual limitation (documented, not silently assumed): a
+#: hypothetical future route in a DIFFERENT shape (e.g. a second segment
+#: after ``sessions``) would not match this pattern and so would not be
+#: forced into ``live`` — the same way the original table-membership bug
+#: missed things, just a narrower gap. In practice a new third-party route is
+#: expected to be added to one of the six ``external_*.py`` routers (covered
+#: by the tag-driven audit above, ``test_every_external_agents_route_carries_
+#: the_external_only_guard``) rather than directly on ``agents.py``'s own
+#: router; this table only exists because ``sessions``/``runs``/``disable``/
+#: ``enable`` predate that split. The mutation proof this fix is required to
+#: pass (see the fix's report) adds a route in exactly the tracked shape —
+#: the realistic "someone copies the existing pattern and forgets the guard"
+#: case — and confirms it goes red.
+_AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
 
-def test_agents_router_external_only_routes_carry_the_guard() -> None:
-    """The ``agents.py``-hosted counterpart to the test above.
 
-    Walks the independent ``_AGENTS_ROUTER_UNIVERSE`` (cross-checked against
-    the live app in both directions, so a stale/missing entry in THAT table
-    fails loudly), then asserts an exact per-route correspondence between
-    "is in ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES``" and "actually carries the
-    guard" — not just "every listed route carries it", which a shrunk table
-    would still satisfy vacuously.
+def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
+    """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
+    agents.py's OWN router (excludes ``tags=["external"]`` routes, which live
+    on the six ``external_*.py`` routers and match the same path shape but are
+    already covered by the tag-driven audit above).
+
+    A TRUE full enumeration of the live app: nothing here is filtered by
+    membership in ``_AGENTS_ROUTER_UNIVERSE`` or any other table — that
+    filtering was the exact construction bug this helper replaces (see the
+    module-level docstring on ``_AGENTS_ROUTER_UNIVERSE``). A route that
+    matches the shape and exists in the app always lands in the returned
+    dict, whether or not any test-file table already knows about it.
     """
-    app = _build_audit_app()
     live: dict[tuple[str, str], APIRoute] = {}
     for route in app.routes:
         if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents/"):
             continue
+        if "external" in (route.tags or []):
+            continue
+        if not _AGENTS_ROUTER_CANDIDATE_SHAPE.match(route.path):
+            continue
         for method in route.methods or ():
             if method in ("HEAD", "OPTIONS"):
                 continue
-            if (method, route.path) in _AGENTS_ROUTER_UNIVERSE:
-                live[(method, route.path)] = route
+            live[(method, route.path)] = route
+    return live
+
+
+def test_agents_router_external_only_routes_carry_the_guard() -> None:
+    """The ``agents.py``-hosted counterpart to the test above.
+
+    Walks ``live`` — a full, table-independent enumeration of the app (see
+    ``_agents_router_own_candidate_routes``) — cross-checks it against
+    ``_AGENTS_ROUTER_UNIVERSE`` in both directions (so a stale table entry OR
+    a genuinely new, untracked route fails loudly), then asserts an exact
+    per-route correspondence between "is in
+    ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES``" and "actually carries the guard"
+    — not just "every listed route carries it", which a shrunk table would
+    still satisfy vacuously.
+    """
+    app = _build_audit_app()
+    live = _agents_router_own_candidate_routes(app)
     assert set(live) == _AGENTS_ROUTER_UNIVERSE, (
         f"universe table out of sync with the live app — missing: "
         f"{sorted(_AGENTS_ROUTER_UNIVERSE - set(live))}, "
-        f"stale: {sorted(set(live) - _AGENTS_ROUTER_UNIVERSE)}"
+        f"stale (route exists in the app but not in the table — a new route "
+        f"was added to agents.py's own router without updating this audit): "
+        f"{sorted(set(live) - _AGENTS_ROUTER_UNIVERSE)}"
     )
     mismatched = [
         f"{method} {path} (should_carry_guard={should_carry}, actually_carries={actually})"
