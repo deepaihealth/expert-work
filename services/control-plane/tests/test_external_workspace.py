@@ -332,6 +332,8 @@ async def test_download_returns_bytes_with_safe_headers(external_client, seeded_
         "a/../../etc/passwd",
         "reports/..",
         "  ",
+        "report\x00.txt",  # Pure NUL, no ``..`` segment — proves the NUL check itself,
+        # not the pre-existing ``..`` guard catching it incidentally.
         "a\x00../../etc/passwd",  # NUL byte alongside a real traversal segment.
     ],
 )

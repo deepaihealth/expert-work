@@ -47,13 +47,24 @@ def _safe_workspace_relpath(path: str) -> str | None:
 
     The ``path`` query param round-trips through the client untrusted, so the
     download / delete endpoints re-check it here (the supervisor re-validates
-    at its own boundary — defence in depth). Rejects absolute paths and any
-    ``..`` segment that would climb out of ``/workspace``. Mirrors the
-    identical guard on the thread-scoped routes in
-    :mod:`control_plane.api.sessions`.
+    at its own boundary — defence in depth). Rejects absolute paths, any
+    ``..`` segment that would climb out of ``/workspace``, and an embedded
+    NUL byte (``\\x00`` is a C-string terminator in POSIX path APIs — a
+    real filesystem-backed store could silently truncate
+    ``"report\\x00.txt"`` to ``"report"``, reading/deleting a different file
+    in the *same* workspace than the caller named; External-API-v1 P2-b
+    Task 2 review). This is now the single shared implementation — used by
+    the console workspace endpoints in this package, the external plane's
+    ``GET /v1/agents/{agent_code}/workspace/file``, and the thread-scoped
+    routes in :mod:`control_plane.api.sessions`.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+    if (
+        not cleaned
+        or cleaned.startswith("/")
+        or "\x00" in cleaned
+        or ".." in PurePosixPath(cleaned).parts
+    ):
         return None
     return cleaned
 
