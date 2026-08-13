@@ -10,6 +10,7 @@ so the response carries no existence information. Mirrors the check
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from fastapi.responses import JSONResponse
@@ -18,6 +19,77 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ThreadMeta
 from expert_work.runtime.runs import RunInfo, RunStore
+
+#: The one byte a Postgres ``text`` / ``jsonb`` column cannot store. Postgres
+#: represents ``text`` internally as a NUL-terminated C string, so asyncpg
+#: raises ``CharacterNotInRepertoireError: invalid byte sequence for encoding
+#: "UTF8": 0x00`` on ANY bound parameter that contains it — a SELECT's
+#: WHERE-clause comparison crashes exactly like an INSERT/UPDATE does (this is
+#: why a bare ``user_id=a%00b`` on a *read* endpoint 500s too, not just the
+#: ``PATCH .../sessions/{id}`` write). ``app.py`` registers no fallback
+#: ``@app.exception_handler(Exception)`` (by design — see its own comment), so
+#: an uncaught instance of that error escapes as Starlette's bare-text
+#: "Internal Server Error", breaking the external plane's ``{success, data,
+#: error}`` envelope contract.
+#:
+#: Only NUL is rejected here — not the rest of the C0 control-character range
+#: (``\x01``-``\x1F`` other than NUL, ``\x7F``). Those bytes are valid UTF-8
+#: and Postgres stores them in ``text`` / ``jsonb`` without complaint, so
+#: blocking them would fix no crash — and several external fields are
+#: *documented* to carry free-form text verbatim (an email body, a
+#: support-ticket description — ``input`` / ``inputs`` / ``untrusted_content``),
+#: where ``\n`` / ``\t`` / ``\r`` and other embedded control bytes are
+#: completely legitimate content, not attacks. NUL is the one byte with no
+#: legitimate use in any of these fields and the one byte that actually
+#: crashes the write.
+_NUL = "\x00"
+
+
+def reject_nul(value: str, *, field: str = "value") -> str:
+    """Raise ``ValueError`` if ``value`` embeds a NUL byte (``\\x00``); else
+    return it unchanged.
+
+    Pydantic-compatible: wrap this in a ``@field_validator`` on any
+    external-plane request-body field that ultimately lands in a Postgres
+    ``text`` / ``jsonb`` column. Raised as ``ValueError`` (not
+    :class:`ExternalScopeError`) so it flows through FastAPI's normal
+    body-parsing path — the resulting ``pydantic.ValidationError`` becomes a
+    ``RequestValidationError``, which ``app.py``'s existing
+    ``@app.exception_handler(RequestValidationError)`` already renders as the
+    external envelope's ``422 INVALID_REQUEST`` for every ``/v1/agents/...``
+    route. For a query / header / form parameter that is not a ``BaseModel``
+    field (so there is no validator to attach this to), call this directly
+    and translate the raised ``ValueError`` yourself — ``external_subject_id``
+    below and ``agents.py``'s ``Idempotency-Key`` header check both do this.
+    """
+    if _NUL in value:
+        raise ValueError(f"{field} must not contain a NUL byte (\\x00)")
+    return value
+
+
+def reject_nul_deep(value: Any, *, field: str = "value") -> Any:
+    """Recursive form of :func:`reject_nul` for a JSON-shaped field (a
+    ``dict[str, Any]`` such as ``inputs`` / ``modified_args``, or a
+    ``list[str]`` such as ``untrusted_content``) whose leaves are not
+    necessarily ``str`` themselves.
+
+    Checks dict KEYS as well as values — a JSON object key is user-controlled
+    input here exactly like a value is, and JSONB rejects an embedded NUL in
+    either position. Returns ``value`` unchanged (raises on the first NUL
+    found); intended to be called for its side effect from a
+    ``@field_validator``, mirroring :func:`reject_nul`'s calling convention.
+    """
+    if isinstance(value, str):
+        reject_nul(value, field=field)
+    elif isinstance(value, dict):
+        for key, val in value.items():
+            reject_nul(key, field=field)
+            reject_nul_deep(val, field=field)
+    elif isinstance(value, list):
+        for item in value:
+            reject_nul_deep(item, field=field)
+    return value
+
 
 #: Namespace prefix for end-user identities minted from a third-party app's own
 #: ``user_id`` string. An employee's ``subject_id`` is a bare Keycloak ``sub``
@@ -53,12 +125,17 @@ def external_subject_id(user_id: str) -> str:
     Raises ``ValueError`` when ``user_id`` normalizes to empty (e.g. it is
     all whitespace) — callers must turn that into a 4xx with a
     machine-readable code rather than minting a namespaced identity for
-    blank input.
+    blank input. Also raises (via :func:`reject_nul`) when ``user_id``
+    embeds a NUL byte — this is the single choke point every external
+    endpoint's ``user_id`` (query, form, or body field) passes through
+    (``resolve_external_user_id`` / ``lookup_external_user_id`` both call
+    this), so the guard lives here once rather than being repeated at every
+    call site.
     """
     normalized = normalize_external_user_id(user_id)
     if not normalized:
         raise ValueError("user_id must not be blank")
-    return f"{EXTERNAL_SUBJECT_PREFIX}{normalized}"
+    return reject_nul(f"{EXTERNAL_SUBJECT_PREFIX}{normalized}", field="user_id")
 
 
 class ExternalScopeError(Exception):

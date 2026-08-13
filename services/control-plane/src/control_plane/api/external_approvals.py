@@ -40,13 +40,15 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from control_plane.api._authz import require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_run,
+    reject_nul,
+    reject_nul_deep,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import resolve_approval_decision
@@ -129,6 +131,28 @@ class ExternalDecideRequest(BaseModel):
             msg = "modified_args is only valid with decision 'modify'"
             raise ValueError(msg)
         return self
+
+    # External-API-v1 P2-b NUL-byte hardening — ``modified_args`` lands in
+    # ``agent_approval.modified_args`` (a JSONB column) verbatim via
+    # ``ApprovalStore.mark_decided``; ``idempotency_key`` lands in
+    # ``agent_approval.idempotency_key`` (a ``Text`` column, the SAME CAS
+    # write) — distinct from the run-creation endpoint's ``Idempotency-Key``
+    # HEADER (``agents.py``), this is a body field feeding a different table.
+    # Both are JSONB/``text``, so both reject an embedded NUL the same way
+    # (see ``_external.py``'s ``_NUL`` doc comment). ``reason`` is
+    # deliberately NOT guarded here — it is only ever written into the
+    # LangGraph checkpoint's ``approval_resume`` state
+    # (``runs.py::resolve_approval_decision``), never into a SQLAlchemy
+    # ``text`` / ``jsonb`` column, so it cannot trigger this crash.
+    @field_validator("modified_args")
+    @classmethod
+    def _no_nul_modified_args(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return value if value is None else reject_nul_deep(value, field="modified_args")
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _no_nul_idempotency_key(cls, value: str | None) -> str | None:
+        return value if value is None else reject_nul(value, field="idempotency_key")
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:

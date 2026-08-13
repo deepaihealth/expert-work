@@ -459,3 +459,41 @@ async def test_download_still_404s_on_a_generic_supervisor_error(
         params={"user_id": "u1", "path": "报表.xlsx"},
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# External-API-v1 P2-b minor — ``path`` had no upper bound at all (terminal
+# review: a 30004-character ``path`` round-tripped as a 200 straight through
+# to the supervisor). 4096 (POSIX ``PATH_MAX``) is added below; see the
+# comment on the ``Query(max_length=4096)`` declaration in
+# ``external_workspace.py`` for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_path_over_max_length_is_422(external_client, plain_agent) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{plain_agent.code}/workspace/file",
+        params={"user_id": "u1", "path": "a" * 4097},
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_download_path_at_max_length_is_not_rejected(
+    external_client, seeded_workspace
+) -> None:
+    """The boundary itself must still work — 4096 exactly is a legitimate
+    (if unusual) path, not a validation error. ``RecordingWorkspaceStore``
+    ignores the requested path and always returns ``seeded_workspace``'s
+    fixed bytes, so 200 here proves the request reached the handler at all,
+    not that this exact path exists."""
+    resp = await external_client.get(
+        f"/v1/agents/{seeded_workspace.agent_code}/workspace/file",
+        params={"user_id": seeded_workspace.user_id, "path": "a" * 4096},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == seeded_workspace.expected_bytes

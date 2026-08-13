@@ -105,7 +105,18 @@ def build_external_workspace_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
-        path: Annotated[str, Query()],
+        # External-API-v1 P2-b — unlike ``user_id`` (255) / the session
+        # ``title`` (200), this had no upper bound at all: a 30004-character
+        # ``path`` round-tripped as a 200 straight through to the supervisor
+        # (terminal-review finding). 4096 matches POSIX ``PATH_MAX`` — the
+        # longest a real filesystem path can be — so every legitimate
+        # workspace path fits and an oversized one 422s before reaching
+        # ``_safe_workspace_relpath`` / the supervisor at all. The NUL check
+        # itself is NOT duplicated here — ``_safe_workspace_relpath``
+        # (``_workspace_shared.py``) already rejects an embedded ``\x00``
+        # (added the prior P2-b task), so this only adds the missing length
+        # bound.
+        path: Annotated[str, Query(max_length=4096)],
     ) -> Response:
         """Download one file from an end-user's persistent workspace volume.
 

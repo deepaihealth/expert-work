@@ -18,7 +18,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.api._authz import require
 from control_plane.api._external import (
@@ -26,6 +26,7 @@ from control_plane.api._external import (
     external_error,
     load_owned_session,
     lookup_external_user_id,
+    reject_nul,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.audit import emit
@@ -54,6 +55,18 @@ class ExternalRenameRequest(BaseModel):
 
     user_id: str = Field(min_length=1, max_length=255)
     title: str = Field(min_length=1, max_length=200)
+
+    # External-API-v1 P2-b NUL-byte hardening — ``title`` lands in
+    # ``thread_meta.title`` (a ``text`` column) verbatim; asyncpg raises an
+    # uncaught ``CharacterNotInRepertoireError`` on an embedded NUL byte,
+    # which escapes as a bare-text 500 (no fallback exception handler — see
+    # ``_external.py``'s ``_NUL`` doc comment). ``user_id`` needs no matching
+    # validator here: it is guarded once, for every external endpoint, inside
+    # ``external_subject_id`` (``_external.py``).
+    @field_validator("title")
+    @classmethod
+    def _no_nul_title(cls, value: str) -> str:
+        return reject_nul(value, field="title")
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:

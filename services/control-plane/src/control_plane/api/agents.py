@@ -22,13 +22,15 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api._authz import console_only, ensure_resource_access, require
 from control_plane.api._external import (
     ExternalScopeError,
     lookup_external_user_id,
+    reject_nul,
+    reject_nul_deep,
     resolve_external_user_id,
 )
 from control_plane.api._idempotency import (
@@ -561,6 +563,36 @@ class ExternalRunRequest(BaseModel):
     #: (Task 11)。
     files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
 
+    # External-API-v1 P2-b NUL-byte hardening — ``input`` lands in
+    # ``agent_run.enqueued_input`` (queue mode) verbatim; ``untrusted_content``
+    # / ``inputs`` land there too, and ``inputs`` also reaches
+    # ``validate_prompt_inputs``'s Jinja render. All three are JSONB, which —
+    # like ``text`` — rejects an embedded NUL byte (``\x00``) with a bare
+    # asyncpg ``CharacterNotInRepertoireError`` there is no fallback exception
+    # handler for (see ``_external.py``'s ``_NUL`` doc comment). Checked here,
+    # on the FastAPI request-body model itself, rather than as a hand-rolled
+    # pre-check next to the other bounds below (``TOO_MANY_IMAGE_REFS`` etc.):
+    # those exist because ``RunRequest`` is hand-constructed past FastAPI's
+    # validation path, but ``ExternalRunRequest`` *is* that path, so a
+    # ``field_validator`` here 422s through the existing
+    # ``RequestValidationError`` handler with no extra wiring.
+    @field_validator("input")
+    @classmethod
+    def _no_nul_input(cls, value: str | None) -> str | None:
+        return value if value is None else reject_nul(value, field="input")
+
+    @field_validator("untrusted_content")
+    @classmethod
+    def _no_nul_untrusted_content(cls, value: list[str]) -> list[str]:
+        for block in value:
+            reject_nul(block, field="untrusted_content")
+        return value
+
+    @field_validator("inputs")
+    @classmethod
+    def _no_nul_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return reject_nul_deep(value, field="inputs")
+
 
 class AgentDisableRequest(BaseModel):
     """Body for ``POST /v1/agents/{name}/disable|enable`` — Stream RT-4 (RT-ADR-16).
@@ -572,6 +604,20 @@ class AgentDisableRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     reason: str | None = Field(default=None, max_length=500)
+
+    # External-API-v1 P2-b NUL-byte hardening — ``reason`` lands in
+    # ``agent_disable.reason`` (a ``Text`` column) verbatim via
+    # ``AgentDisableStore.set_disabled``. Both routes gate on
+    # ``require("manifest", "write")``, not ``console_only()`` — a
+    # third-party API key minted with ``write`` scope maps to the OPERATOR
+    # role, which is granted ``manifest: {read, write}`` (``rbac.py``), so
+    # these two endpoints are reachable by the same external caller class as
+    # every other field this pass hardens, even though they predate
+    # External-API-v1 and live outside ``external_*.py``.
+    @field_validator("reason")
+    @classmethod
+    def _no_nul_reason(cls, value: str | None) -> str | None:
+        return value if value is None else reject_nul(value, field="reason")
 
 
 async def _load_manifest(
@@ -1054,6 +1100,16 @@ def build_agents_router() -> APIRouter:
                     f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} non-blank characters",
                     422,
                 )
+            # External-API-v1 P2-b NUL-byte hardening — ``key`` lands in
+            # ``agent_run.idempotency_key`` (a ``Text`` column) verbatim, for
+            # BOTH modes (``RunManager.enqueue`` / ``.create``, ``runs.py``).
+            # A header — not a pydantic field — so there is no
+            # ``field_validator`` to attach ``reject_nul`` to; check it here,
+            # same spot as the existing blank/oversize check above.
+            try:
+                reject_nul(key, field="Idempotency-Key")
+            except ValueError as exc:
+                return _envelope_error("INVALID_IDEMPOTENCY_KEY", str(exc), 422)
             digest = request_digest(payload, agent_code=agent_code)
             existing = await run_store.find_by_idempotency_key(tenant_id=tenant_id, key=key)
             if existing is not None:
