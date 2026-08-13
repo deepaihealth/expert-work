@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane._tenant_resource_lock import tenant_resource_lock
+from control_plane.api._authz import console_only
 from control_plane.audit import emit
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
@@ -183,7 +184,9 @@ class _PatchEvalDatasetBody(BaseModel):
 
 def build_curation_router() -> APIRouter:
     """Stream J.12 — curation-candidate review + promote / dismiss."""
-    router = APIRouter(prefix="/v1/curation", tags=["curation"])
+    router = APIRouter(
+        prefix="/v1/curation", tags=["curation"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("/candidates", response_model=None)
     async def list_candidates(
@@ -353,7 +356,9 @@ def build_curation_router() -> APIRouter:
 
 def build_eval_dataset_router() -> APIRouter:
     """Stream J.12 — curated eval-dataset CRUD."""
-    router = APIRouter(prefix="/v1/eval-datasets", tags=["eval-datasets"])
+    router = APIRouter(
+        prefix="/v1/eval-datasets", tags=["eval-datasets"], dependencies=[Depends(console_only())]
+    )
 
     @router.post("", response_model=None)
     async def create_eval_dataset(

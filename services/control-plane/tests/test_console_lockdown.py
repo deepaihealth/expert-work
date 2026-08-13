@@ -84,6 +84,8 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     # trajectory via TrajectoryReader with no owner check.
     ("GET", "/v1/skills"),
     ("GET", "/v1/knowledge/bases"),
+    ("GET", f"/v1/curation/candidates/{_TID}"),
+    ("GET", "/v1/eval-datasets"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -122,6 +124,14 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: Backlog Task 5 (security fix, spec/external-api-v1-p2b) — /v1/knowledge:
 #: zero RBAC on all 12 routes (base + document CRUD, reindex/reingest,
 #: chunk read, retrieval test) — same shape as /v1/skills above.
+#: Backlog Task 5 also added /v1/curation and /v1/eval-datasets
+#: (``curation.py`` builds two routers, both zero-RBAC): candidate list/get/
+#: promote/dismiss (4 routes) + eval-dataset CRUD (5 routes). ``GET
+#: /v1/curation/candidates/{id}`` is the worst finding in this whole batch —
+#: it returns the full conversation trajectory (``messages``, via
+#: ``TrajectoryReader``) for *any* end user's candidate in the tenant, no
+#: owner filter, so any same-tenant credential — including a zero-scope API
+#: key — could read any end user's complete conversation verbatim.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -136,6 +146,8 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/skill-evolution",
     "/v1/skills",
     "/v1/knowledge",
+    "/v1/curation",
+    "/v1/eval-datasets",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under
