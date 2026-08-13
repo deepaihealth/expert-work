@@ -31,6 +31,7 @@ from control_plane.api._external import (
     lookup_external_user_id,
     reject_nul,
     reject_nul_deep,
+    reject_nul_path_params,
     resolve_external_user_id,
 )
 from control_plane.api._idempotency import (
@@ -702,7 +703,23 @@ _CONSOLE_ONLY = [Depends(console_only())]
 
 
 def build_agents_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/agents", tags=["agents"])
+    # External-API-v1 P2-b review (Critical) — ``reject_nul_path_params``
+    # (``_external.py``) at the router constructor, not per-route: this one
+    # router hosts BOTH the third-party ``{agent_code}`` routes
+    # (``bind_session`` / ``run_agent_for_user``) AND the console-only
+    # ``{name}``/``{version}``/``{revision}`` routes below (including
+    # ``disable``/``enable`` — reachable by a ``write``-scope API key via
+    # ``require("manifest", "write")``, not ``console_only()``; see
+    # ``AgentDisableRequest``'s docstring), and there is no sub-router split
+    # between the two — attaching the guard once here is the only way to
+    # cover every path param on every route on this router by construction,
+    # the same structural argument that put it on each ``external_*.py``
+    # router's own constructor.
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["agents"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
     @router.post("", status_code=201)
     async def create_agent(

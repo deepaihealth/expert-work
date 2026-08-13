@@ -49,6 +49,7 @@ from control_plane.api._external import (
     load_owned_run,
     reject_nul,
     reject_nul_deep,
+    reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import resolve_approval_decision
@@ -221,7 +222,11 @@ def _decision_error_envelope(exc: HTTPException) -> JSONResponse:
 
 def build_external_approvals_router() -> APIRouter:
     """Mount the external approval-decision endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
     @router.post("/{agent_code}/runs/{run_id}:decide", response_model=None)
     async def decide_run(

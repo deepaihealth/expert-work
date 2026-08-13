@@ -33,6 +33,7 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     lookup_external_user_id,
+    reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import _workspace_file_response, _workspace_files_payload
@@ -46,7 +47,11 @@ def _get_workspace_store(request: Request) -> WorkspaceStore | None:
 
 def build_external_workspace_router() -> APIRouter:
     """Mount the external workspace endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
     @router.get(
         "/{agent_code}/workspace/files",
