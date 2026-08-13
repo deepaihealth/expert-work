@@ -273,6 +273,50 @@ async def test_list_promote_requests_skill_visibility_pagination_not_short() -> 
     assert seen == tenant_request_ids
 
 
+# ── list_promote_requests cursor/visibility parity (backlog task 9, I-1) ──
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_cursor_survives_visibility_filter() -> None:
+    """A non-admin cursor pointing at a row the ``skill_visibility`` filter
+    excludes must still resolve its keyset pivot and return the caller's
+    remaining page — not silently go empty.
+
+    ``pub_req`` (tenant-visible) is created first, ``priv_req``
+    (``agent_private``) second, so newest-first order is
+    ``[priv_req, pub_req]``. A non-admin caller pages with
+    ``skill_visibility="tenant"`` and ``cursor=priv_req.id`` (e.g. handed a
+    cursor from an admin's unfiltered view, or simply probing): the fixed
+    store must still resolve ``priv_req``'s ``(created_at, id)`` pivot from
+    the tenant-scoped-but-unfiltered set and return the next tenant-visible
+    row after it (``pub_req``) — mirroring the SQL backend's
+    ``test_list_promote_requests_cursor_survives_visibility_filter_real_pg``.
+    Before the I-1 fix this returned ``items=[]`` — the cursor lookup ran
+    against the already visibility-filtered list, didn't find ``priv_req``
+    there, and the resulting ``StopIteration`` was swallowed into an empty
+    page.
+    """
+    store = InMemorySkillStore()
+    tid = uuid4()
+    sid_pub = uuid4()
+    await store.create_skill(skill_id=sid_pub, tenant_id=tid, name="pub")
+    rid_pub = uuid4()
+    await store.request_skill_promote(
+        request_id=rid_pub, tenant_id=tid, skill_id=sid_pub, skill_version=1
+    )
+    sid_priv = await _agent_private_skill(store, tid, name="priv")
+    rid_priv = uuid4()
+    await store.request_skill_promote(
+        request_id=rid_priv, tenant_id=tid, skill_id=sid_priv, skill_version=1
+    )
+
+    items, cursor = await store.list_promote_requests(
+        tenant_id=tid, skill_visibility="tenant", cursor=rid_priv
+    )
+    assert [r.id for r in items] == [rid_pub]
+    assert cursor is None
+
+
 # ── list_skills filters (SE-8) ────────────────────────────────────────────
 
 
