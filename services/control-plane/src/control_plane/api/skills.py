@@ -534,8 +534,14 @@ def build_skills_router() -> APIRouter:
             if row is None:
                 raise HTTPException(status_code=404, detail="skill version not found")
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
-        if skill is not None:
-            _require_skill_owner_scope(skill, request.state.principal)
+        # M-1 (backlog task 7) — fail-closed: a ``skill`` row that can't be
+        # resolved for a version that just resolved is unreachable today (the
+        # FK should prevent an orphan), but a silent skip-the-gate on
+        # ``None`` doesn't match this file's own convention elsewhere
+        # (``skill is None`` → 404 before proceeding).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         entry = row.supporting_files.get(file_path)
         if entry is None:
             raise HTTPException(status_code=404, detail="supporting file not found")
@@ -598,8 +604,10 @@ def build_skills_router() -> APIRouter:
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
         skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
-        if skill is not None:
-            _require_skill_owner_scope(skill, request.state.principal)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
 
         # Validate base64 + size invariant (declared `size` must match)
         try:
@@ -730,8 +738,10 @@ def build_skills_router() -> APIRouter:
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
         skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
-        if skill is not None:
-            _require_skill_owner_scope(skill, request.state.principal)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         if file_path not in prior.supporting_files:
             raise HTTPException(status_code=404, detail="supporting file not found")
 
@@ -807,8 +817,10 @@ def build_skills_router() -> APIRouter:
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
         skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
-        if skill is not None:
-            _require_skill_owner_scope(skill, request.state.principal)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
 
         findings = scan_for_threats(body.prompt_fragment, scope="strict")
         if findings:
@@ -1328,8 +1340,10 @@ def build_skills_router() -> APIRouter:
             if version is None:
                 raise HTTPException(status_code=404, detail="skill version not found")
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
-        if skill is not None:
-            _require_skill_owner_scope(skill, request.state.principal)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         return JSONResponse(status_code=200, content=_version_dict(version))
 
     @router.post("/import", response_model=None)
@@ -1371,6 +1385,15 @@ def build_skills_router() -> APIRouter:
             raise HTTPException(status_code=400, detail=exc.detail) from exc
 
         existing = await store.get_skill_by_name(tenant_id=tenant_id, name=payload.name)
+        # SE-8 owner gate (backlog task 7, C-2) — a name collision with an
+        # ``agent_private`` skill must not be resolved silently: the
+        # idempotency-hit branch below would echo the victim's
+        # ``created_by_user_id`` / ``visibility``, and the fall-through would
+        # append the caller's ZIP content as a new version on the victim's
+        # skill. Gate immediately after resolution, before either the read
+        # (idempotency response) or the write (``add_version``) below.
+        if existing is not None:
+            _require_skill_owner_scope(existing, request.state.principal)
 
         # OFFICE-3 idempotency: if the latest version already carries this exact
         # content_hash, the re-import is a no-op — return it (200, created=False)
@@ -1404,6 +1427,13 @@ def build_skills_router() -> APIRouter:
                 existing = await store.get_skill_by_name(tenant_id=tenant_id, name=payload.name)
                 if existing is None:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
+                # SE-8 owner gate (backlog task 7, C-2) — this endpoint never
+                # creates ``agent_private`` rows itself, but re-check anyway:
+                # this is a second, independent resolution of ``existing``
+                # (the initial ``existing is not None`` gate above only
+                # covers the first ``get_skill_by_name`` call) and it also
+                # flows straight into ``add_version`` below.
+                _require_skill_owner_scope(existing, request.state.principal)
             await audit_emit(
                 audit,
                 tenant_id=tenant_id,

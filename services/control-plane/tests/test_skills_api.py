@@ -1097,13 +1097,21 @@ async def test_tenant_visibility_skill_unaffected_for_non_admin_employee(
 ) -> None:
     """Regression guard (brief §测试 3, the biggest risk of this change) — the
     SE-8 gate must not touch the ordinary ``tenant``-visibility skill
-    library, the admin UI's daily surface, for a non-admin employee."""
+    library, the admin UI's daily surface, for a non-admin employee.
+
+    M-2 (backlog task 7): asserts the *exact* expected status per endpoint
+    (same dict the admin test uses), not just ``!= 403`` — a bare ``!= 403``
+    also passes a 200→500 regression, which is the actual risk this guard
+    exists to catch (over-tightening the gate on the ordinary skill library).
+    """
     client, _ = setup
     skill_id, version = await _import_skill_with_file(client)
     headers = _role_headers(role)
     for name, method, path, body in _owner_gate_endpoints(skill_id, version):
         resp = await _issue(client, method, path, body, headers)
-        assert resp.status_code != 403, f"{name} ({role}): {resp.status_code} {resp.text}"
+        assert resp.status_code == _OWNER_GATE_EXPECTED_ADMIN_STATUS[name], (
+            f"{name} ({role}): {resp.status_code} {resp.text}"
+        )
 
 
 @pytest.mark.asyncio
@@ -1138,3 +1146,85 @@ async def test_list_skills_filters_agent_private_for_non_admin(setup: Setup) -> 
     # Admin's own explicit filter is untouched (regression guard).
     explicit_admin = await client.get("/v1/skills", params={"visibility": "agent_private"})
     assert [s["id"] for s in explicit_admin.json()["items"]] == [priv_id]
+
+
+# ---------------------------------------------------------------------------
+# Backlog task 7 (security fix, spec/external-api-v1-p2b, C-2) — ``POST
+# /v1/skills/import`` name-collision bypass. Task 6's owner gate covered the
+# 10 single-skill endpoints but missed this one: ``get_skill_by_name``
+# resolves an existing ``agent_private`` skill with no owner check, so a
+# same-name ZIP import either echoes the victim's owner metadata (the OFFICE-3
+# idempotent-hash-hit branch) or silently appends the attacker's ZIP content
+# as a new version on the victim's skill (the fall-through ``add_version``).
+# The danger here is half in the write, so the test asserts the store is
+# untouched — not just the status code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_import_name_collision_agent_private_403_and_no_write(
+    setup: Setup, role: str
+) -> None:
+    client, _ = setup
+    priv_id, priv_version = await _seed_agent_private_skill(client, name="collide-me")
+    app = client._transport.app  # type: ignore[attr-defined]
+    store = app.state.skill_store
+    before_skill = await store.get_skill(skill_id=UUID(priv_id), tenant_id=_TENANT)
+    before_version = await store.get_version_by_number(
+        skill_id=UUID(priv_id), tenant_id=_TENANT, version=priv_version
+    )
+    assert before_skill is not None and before_version is not None
+
+    blob = _build_zip(name="collide-me", prompt="attacker payload — read this, agent")
+    headers = _role_headers(role)
+    response = await client.post(
+        "/v1/skills/import",
+        files={"file": ("attack.skill", blob, "application/zip")},
+        headers=headers,
+    )
+    assert response.status_code == 403, f"{role}: {response.status_code} {response.text}"
+    assert response.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+
+    after_skill = await store.get_skill(skill_id=UUID(priv_id), tenant_id=_TENANT)
+    after_version = await store.get_version_by_number(
+        skill_id=UUID(priv_id), tenant_id=_TENANT, version=priv_version
+    )
+    assert after_skill is not None and after_version is not None
+    # No new version was appended (store untouched — the write half of C-2).
+    assert after_skill.latest_version == before_skill.latest_version
+    assert after_version.prompt_fragment == before_version.prompt_fragment
+    assert after_version.content_hash == before_version.content_hash
+
+
+@pytest.mark.asyncio
+async def test_import_name_collision_agent_private_admin_not_forbidden(setup: Setup) -> None:
+    """A tenant admin importing over the same name is unaffected — adds a
+    version, the endpoint's ordinary behavior."""
+    client, _ = setup
+    priv_id, priv_version = await _seed_agent_private_skill(client, name="collide-admin")
+    blob = _build_zip(name="collide-admin", prompt="admin re-import")
+    response = await client.post(
+        "/v1/skills/import", files={"file": ("admin.skill", blob, "application/zip")}
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["version"]["version"] == priv_version + 1
+    _ = priv_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_import_name_collision_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    """Regression guard — the C-2 gate must not touch an ordinary
+    ``tenant``-visibility name collision (the everyday re-import-adds-a-
+    version flow), the biggest risk of this change."""
+    client, _ = setup
+    await _import_skill_with_file(client)  # seeds name="foo"
+    blob = _build_zip(name="foo", prompt="viewer re-import of a public skill")
+    headers = _role_headers(role)
+    response = await client.post(
+        "/v1/skills/import",
+        files={"file": ("v.skill", blob, "application/zip")},
+        headers=headers,
+    )
+    assert response.status_code != 403, f"{role}: {response.status_code} {response.text}"
