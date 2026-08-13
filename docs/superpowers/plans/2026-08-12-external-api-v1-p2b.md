@@ -357,8 +357,11 @@ async def test_archive_session_hides_from_list(external_client, seeded_session) 
 
 
 @pytest.mark.asyncio
+# ⚠️ 用户 2026-08-13 裁定已推翻本用例:归档改用 write 档(理由见 Global Constraints)。
+# 实际交付的是 test_archive_requires_at_least_write_scope,压的边界改成
+# 「只读 key 归档 → 403」。下面这段仅存档对照,**不要照抄**。
 async def test_archive_requires_delete_scope(external_client_write_only, seeded_session) -> None:
-    """write 档不够 —— 归档要 delete 档(与控制台侧同款)。"""
+    """write 档不够 —— 归档要 delete 档(与控制台侧同款)。【已作废,见上方注释】"""
     resp = await external_client_write_only.delete(
         f"/v1/agents/{seeded_session.agent_code}/sessions/{seeded_session.session_id}",
         params={"user_id": seeded_session.user_id},
