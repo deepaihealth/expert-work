@@ -368,13 +368,25 @@ async def test_bind_session_legit_agent_code_is_unaffected(ctx: _Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_disable_then_enable_legit_name_is_unaffected(ctx: _Ctx) -> None:
+    """Backlog Task 2 (spec/external-api-v1-p2b) — ``disable``/``enable`` gained
+    ``console_only()``, so ``ctx.headers`` (a service-account principal — the
+    identity this whole file borrows for its actual subject, NUL-byte path
+    params) can no longer reach them at all, guard or no guard. An employee
+    JWT is the only caller class left that can exercise this route, so this
+    "a legit (non-NUL) name still works" check needs one of its own rather
+    than the shared service-account ``ctx.headers``.
+    """
     await ctx.seed_agent()
+    employee_jwt = make_test_jwt(tenant_id=ctx.tenant_id, subject=str(uuid4()))
+    employee_headers = {"Authorization": f"Bearer {employee_jwt}"}
     resp = await ctx.client.post(
-        "/v1/agents/support-bot/disable", json={"reason": "maintenance"}, headers=ctx.headers
+        "/v1/agents/support-bot/disable", json={"reason": "maintenance"}, headers=employee_headers
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["disabled"] is True
-    resp2 = await ctx.client.post("/v1/agents/support-bot/enable", json={}, headers=ctx.headers)
+    resp2 = await ctx.client.post(
+        "/v1/agents/support-bot/enable", json={}, headers=employee_headers
+    )
     assert resp2.status_code == 200, resp2.text
     assert resp2.json()["data"]["disabled"] is False
 

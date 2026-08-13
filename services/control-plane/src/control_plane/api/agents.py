@@ -614,13 +614,16 @@ class AgentDisableRequest(BaseModel):
 
     # External-API-v1 P2-b NUL-byte hardening — ``reason`` lands in
     # ``agent_disable.reason`` (a ``Text`` column) verbatim via
-    # ``AgentDisableStore.set_disabled``. Both routes gate on
-    # ``require("manifest", "write")``, not ``console_only()`` — a
+    # ``AgentDisableStore.set_disabled``. At the time this guard was added,
+    # both routes gated only on ``require("manifest", "write")`` — a
     # third-party API key minted with ``write`` scope maps to the OPERATOR
     # role, which is granted ``manifest: {read, write}`` (``rbac.py``), so
-    # these two endpoints are reachable by the same external caller class as
-    # every other field this pass hardens, even though they predate
-    # External-API-v1 and live outside ``external_*.py``.
+    # these two endpoints were reachable by the same external caller class as
+    # every other field this pass hardens. Backlog Task 2
+    # (spec/external-api-v1-p2b) closed that axis with ``_CONSOLE_ONLY``
+    # (see the route decorators below) — the guard on ``reason`` stays,
+    # since an employee JWT's free-text input lands in the same ``Text``
+    # column and deserves the same protection.
     @field_validator("reason")
     @classmethod
     def _no_nul_reason(cls, value: str | None) -> str | None:
@@ -717,12 +720,13 @@ _CONSOLE_ONLY = [Depends(console_only())]
 #: ``run_agent_for_user``; the six ``external_*.py`` routers carry it as a
 #: router-level dependency instead, since every route they host is
 #: third-party). ``disable`` / ``enable`` deliberately do NOT get it — they
-#: are reachable by both an employee JWT (the admin-ui kill switch,
-#: ``apps/admin-ui/src/api/agents.ts::disableAgent``) and a ``write``-scope
-#: API key by design, and neither operation is scoped to a ``user_id`` — the
-#: vulnerability this gate closes (an employee JWT reaching per-end-user
-#: data/actions with no admin check) does not apply to a tenant-wide
-#: manifest flag.
+#: are reachable by an employee JWT (the admin-ui kill switch,
+#: ``apps/admin-ui/src/api/agents.ts::disableAgent``) by design, and neither
+#: operation is scoped to a ``user_id`` — the vulnerability this gate closes
+#: (an employee JWT reaching per-end-user data/actions with no admin check)
+#: does not apply to a tenant-wide manifest flag. (A ``write``-scope API key
+#: could reach them too until Backlog Task 2, spec/external-api-v1-p2b, gave
+#: both routes ``_CONSOLE_ONLY`` below — that axis is closed now.)
 _EXTERNAL_ONLY = [Depends(external_only())]
 
 
@@ -745,7 +749,7 @@ def build_agents_router() -> APIRouter:
         dependencies=[Depends(reject_nul_path_params)],
     )
 
-    @router.post("", status_code=201)
+    @router.post("", status_code=201, dependencies=_CONSOLE_ONLY)
     async def create_agent(
         payload: ManifestPayload,
         request: Request,
@@ -866,7 +870,7 @@ def build_agents_router() -> APIRouter:
             content={"success": True, "data": AgentDetail(record=record).model_dump(mode="json")},
         )
 
-    @router.get("/templates")
+    @router.get("/templates", dependencies=_CONSOLE_ONLY)
     async def list_templates(
         request: Request,
         principal: Annotated[Principal, Depends(require("manifest", "read"))],
@@ -911,7 +915,7 @@ def build_agents_router() -> APIRouter:
             )
         return JSONResponse(content={"success": True, "data": items})
 
-    @router.post("/fork", status_code=201)
+    @router.post("/fork", status_code=201, dependencies=_CONSOLE_ONLY)
     async def fork_template(
         payload: ForkTemplateRequest,
         request: Request,
@@ -974,7 +978,15 @@ def build_agents_router() -> APIRouter:
         except ValidationError as exc:
             return _envelope_error("FORK_INVALID", str(exc), 422)
 
-        # 4. ABAC + provider whitelist gate (parity with create_agent).
+        # 4. ABAC + provider whitelist gate (parity with create_agent). Backlog
+        # Task 2 (spec/external-api-v1-p2b) verified this already blocks a
+        # VIEWER-role employee: ``ensure_resource_access`` checks
+        # ``is_allowed(manifest, write)`` first (same RBAC check ``require(...)``
+        # would run), and VIEWER's grants for ``manifest`` are read-only
+        # (``rbac.py``) — no conditioned binding can widen that, since ABAC
+        # only narrows a role's own grants. A separate ``require("manifest",
+        # "write")`` gate would therefore be redundant with this call, not an
+        # additional protection.
         await ensure_resource_access(
             request,
             resource="manifest",
@@ -1444,7 +1456,7 @@ def build_agents_router() -> APIRouter:
         )
         return JSONResponse({"success": True, "data": payload.model_dump(mode="json")})
 
-    @router.get("/{name}/{version}")
+    @router.get("/{name}/{version}", dependencies=_CONSOLE_ONLY)
     async def get_agent(
         name: str,
         version: str,
@@ -1500,7 +1512,7 @@ def build_agents_router() -> APIRouter:
             data["disable"] = None
         return JSONResponse({"success": True, "data": data})
 
-    @router.put("/{name}/{version}")
+    @router.put("/{name}/{version}", dependencies=_CONSOLE_ONLY)
     async def update_agent(
         name: str,
         version: str,
@@ -1727,7 +1739,7 @@ def build_agents_router() -> APIRouter:
             }
         )
 
-    @router.delete("/{name}/{version}", status_code=204)
+    @router.delete("/{name}/{version}", status_code=204, dependencies=_CONSOLE_ONLY)
     async def delete_agent(
         name: str,
         version: str,
@@ -1822,7 +1834,7 @@ def build_agents_router() -> APIRouter:
         rows = await repo.list_by_tenant(tenant_id=tenant_id, name=name, limit=1)
         return bool(rows)
 
-    @router.post("/{name}/disable")
+    @router.post("/{name}/disable", dependencies=_CONSOLE_ONLY)
     async def disable_agent(
         name: str,
         payload: AgentDisableRequest,
@@ -1906,7 +1918,7 @@ def build_agents_router() -> APIRouter:
             }
         )
 
-    @router.post("/{name}/enable")
+    @router.post("/{name}/enable", dependencies=_CONSOLE_ONLY)
     async def enable_agent(
         name: str,
         payload: AgentDisableRequest,

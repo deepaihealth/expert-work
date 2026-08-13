@@ -414,16 +414,20 @@ def test_every_external_agents_route_carries_the_external_only_guard() -> None:
 #: documents for the NUL-path-param guard on this router.
 #:
 #: ``disable`` / ``enable`` (``POST /v1/agents/{name}/disable|enable``) are
-#: deliberately NOT here, even though a ``write``-scope API key can reach
-#: them (``require("manifest", "write")`` maps that scope to OPERATOR). They
-#: are reachable by an employee JWT BY DESIGN — the admin-ui kill-switch
-#: button calls them directly (``apps/admin-ui/src/api/agents.ts::disableAgent``)
-#: — and neither operation is scoped to a ``user_id``: there is no per-end-user
-#: data or action here for an under-privileged employee to reach that the
-#: console side would have gated and the external side doesn't. Gating them
-#: would 403 the admin-ui kill switch for every employee, a real functional
-#: regression, to close a vulnerability shape (cross-user data/action access)
-#: that does not apply to a tenant-wide manifest flag.
+#: deliberately NOT here. They are reachable by an employee JWT BY DESIGN —
+#: the admin-ui kill-switch button calls them directly
+#: (``apps/admin-ui/src/api/agents.ts::disableAgent``) — and neither
+#: operation is scoped to a ``user_id``: there is no per-end-user data or
+#: action here for an under-privileged employee to reach that the console
+#: side would have gated and the external side doesn't. Gating them with
+#: ``external_only()`` would 403 the admin-ui kill switch for every
+#: employee, a real functional regression, to close a vulnerability shape
+#: (cross-user data/action access) that does not apply to a tenant-wide
+#: manifest flag. (A ``write``-scope API key used to reach them too —
+#: ``require("manifest", "write")`` maps that scope to OPERATOR — until
+#: Backlog Task 2, spec/external-api-v1-p2b, gave both routes
+#: ``console_only()``; that axis is closed now, which is orthogonal to the
+#: ``external_only()`` question this table answers.)
 _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/v1/agents/{agent_code}/sessions"),

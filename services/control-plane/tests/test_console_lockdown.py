@@ -111,12 +111,24 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
 #: third-party plane. Closing that prefix wholesale would 403 the external
 #: surface, so these carry ``console_only()`` per route instead, and this
 #: table is what keeps the self-audit below from having a blind spot there
-#: (P1 final review, Critical C2: all five answered 200 to a zero-scope
-#: service-account key, and the ``rollback`` one is a **write**).
+#: (P1 final review, Critical C2: the original five answered 200 to a
+#: zero-scope service-account key, and the ``rollback`` one is a **write**).
+#:
+#: Backlog Task 2 (spec/external-api-v1-p2b) added the remaining eight:
+#: ``create_agent`` / ``list_templates`` / ``fork_template`` / ``get_agent`` /
+#: ``update_agent`` / ``delete_agent`` / ``disable_agent`` / ``enable_agent``
+#: previously relied on ``require(...)`` / ``ensure_resource_access(...)``
+#: alone (or, for ``fork_template``, nothing at all) — RBAC checks a
+#: ``write``- or ``admin``-scope API key satisfies via the OPERATOR/ADMIN
+#: role mapping (``rbac.py``), since API-key scopes stand in for roles. That
+#: was ``_SELF_GATED_AGENT_ROUTES`` below (now removed — every route under
+#: ``/v1/agents`` is classified console or external, no third bucket).
+#: ``GET /v1/agents/schema`` (``agent_schema.py``) also moved here from
+#: ``_OPEN_AGENT_ROUTES``, closing the last unclassified route.
 #:
 #: Add a console route under ``/v1/agents``? Add it here too — otherwise the
 #: audit cannot see it. ``test_agents_prefix_is_partitioned_exactly`` forces
-#: that: any ``/v1/agents`` route missing from all three tables fails it.
+#: that: any ``/v1/agents`` route missing from both tables fails it.
 _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/v1/agents"),
@@ -124,6 +136,15 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{name}/{version}/revisions/{revision}"),
         ("POST", "/v1/agents/{name}/{version}/revisions/{revision}/rollback"),
         ("GET", "/v1/agents/{agent_name}/{agent_version}/users"),
+        ("POST", "/v1/agents"),
+        ("GET", "/v1/agents/templates"),
+        ("POST", "/v1/agents/fork"),
+        ("GET", "/v1/agents/{name}/{version}"),
+        ("PUT", "/v1/agents/{name}/{version}"),
+        ("DELETE", "/v1/agents/{name}/{version}"),
+        ("POST", "/v1/agents/{name}/disable"),
+        ("POST", "/v1/agents/{name}/enable"),
+        ("GET", "/v1/agents/schema"),
     }
 )
 
@@ -151,39 +172,6 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/v1/agents/{agent_code}/sessions/{session_id}"),
         ("GET", "/v1/agents/{agent_code}/workspace/files"),
         ("GET", "/v1/agents/{agent_code}/workspace/file"),
-    }
-)
-
-#: ``/v1/agents`` routes deliberately left open to API keys because they hold
-#: no tenant data and no per-tenant state: the AgentSpec JSON Schema is the
-#: same static document for every caller. Kept as an explicit third bucket so
-#: "open" is a decision recorded here, not a route that quietly fell through.
-_OPEN_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/v1/agents/schema")})
-
-#: Routes under ``/v1/agents`` whose authorization lives inside the handler
-#: (``ensure_resource_access``) or on a ``require(...)`` dependency rather than
-#: on ``console_only()``. Read the bucket name precisely: these reject an
-#: **under-scoped** key, not every key. A zero-scope key gets 403 — but an
-#: ``admin``-scope key passes, because ``rbac._collect_roles`` maps that scope
-#: to ``Role.ADMIN``; measured on one: ``GET /v1/agents/templates`` → 200,
-#: ``POST /v1/agents/{name}/disable`` → 200, ``DELETE /v1/agents/{name}/{version}``
-#: → 204 (the agent really is deleted). That is the documented meaning of the
-#: ``admin`` scope ("never hand it to a third-party integrator — it is the whole
-#: tenant"), not a hole this table hides; it is spelled out because reading the
-#: bucket as "API keys cannot reach these" would make the key-reachable surface
-#: under ``/v1/agents`` look like exactly the external routes listed above, and it is
-#: not. Listed so the partition test below stays exhaustive without claiming
-#: they are external.
-_SELF_GATED_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("POST", "/v1/agents"),
-        ("GET", "/v1/agents/templates"),
-        ("POST", "/v1/agents/fork"),
-        ("GET", "/v1/agents/{name}/{version}"),
-        ("PUT", "/v1/agents/{name}/{version}"),
-        ("DELETE", "/v1/agents/{name}/{version}"),
-        ("POST", "/v1/agents/{name}/disable"),
-        ("POST", "/v1/agents/{name}/enable"),
     }
 )
 
@@ -460,6 +448,14 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
     so five console routes under it were never audited by anything. A new
     route added here — either plane — now fails this test until someone
     decides which bucket it belongs in.
+
+    Backlog Task 2 (spec/external-api-v1-p2b) tightened this from four
+    buckets to two: every ``/v1/agents`` route is now either
+    ``_CONSOLE_ROUTES`` or ``_EXTERNAL_AGENT_ROUTES``, no third "open" or
+    "self-gated" class — the eight routes that used to tolerate an
+    ``ensure_resource_access(...)``/``require(...)``-only gate (reachable by
+    an ``admin``- or ``write``-scope API key) and the one genuinely-open
+    schema route all carry ``console_only()`` now.
     """
     app = create_app(
         settings=_build_settings(),
@@ -472,9 +468,7 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
         enable_curation_worker=False,
     )
     live = _agents_routes(app)
-    classified = (
-        _CONSOLE_ROUTES | _EXTERNAL_AGENT_ROUTES | _OPEN_AGENT_ROUTES | _SELF_GATED_AGENT_ROUTES
-    )
+    classified = _CONSOLE_ROUTES | _EXTERNAL_AGENT_ROUTES
     assert live - classified == set(), (
         f"unclassified /v1/agents routes — each needs a table: {sorted(live - classified)}"
     )
@@ -483,15 +477,9 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
     )
     # The buckets must not overlap, or "console" and "external" could both
     # claim a route and the two assertions below would contradict silently.
-    buckets = [
-        _CONSOLE_ROUTES,
-        _EXTERNAL_AGENT_ROUTES,
-        _OPEN_AGENT_ROUTES,
-        _SELF_GATED_AGENT_ROUTES,
-    ]
-    for i, first in enumerate(buckets):
-        for second in buckets[i + 1 :]:
-            assert not (first & second), f"route classified twice: {sorted(first & second)}"
+    assert not (_CONSOLE_ROUTES & _EXTERNAL_AGENT_ROUTES), (
+        f"route classified twice: {sorted(_CONSOLE_ROUTES & _EXTERNAL_AGENT_ROUTES)}"
+    )
 
 
 @pytest.mark.asyncio
@@ -575,3 +563,77 @@ async def test_api_key_still_reaches_every_external_agents_route(
     await ctx.seed_agent()
     resp = await ctx.client.request(method, _concretize(path), headers=ctx.key_headers)
     assert resp.status_code != 403, f"{method} {path} → {resp.status_code} {resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# Backlog Task 2 (spec/external-api-v1-p2b) — the eight routes above already
+# get generic coverage from the two ``_CONSOLE_ROUTES``-parametrized tests
+# (an ``admin``-scope key is denied, an employee JWT is unaffected). These
+# pin the exact vulnerability shape the brief measured: a ``write``-scope key
+# (not ``admin`` — ``write`` maps to OPERATOR, which ``rbac.py`` grants
+# ``manifest: {read, write}``, the precise gap ``ensure_resource_access`` /
+# ``require("manifest", "write")`` alone left open) and, for
+# ``fork_template`` specifically, a **zero**-scope key (it carried no
+# authorization check of its own at all before this fix).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/agents/fork"),
+        ("POST", "/v1/agents/{name}/disable"),
+        ("GET", "/v1/agents/{name}/{version}"),
+        ("DELETE", "/v1/agents/{name}/{version}"),
+    ],
+)
+async def test_write_scope_key_is_denied_on_the_newly_gated_agents_routes(
+    ctx: _Ctx, method: str, path: str
+) -> None:
+    """``write`` scope maps to OPERATOR (``rbac.py: _collect_roles``), which is
+    granted ``manifest: {read, write}`` — exactly the role ``ensure_resource_
+    access`` / ``require("manifest", "write")`` alone let through before
+    ``console_only()`` closed this axis. Covers the brief's named-risky
+    subset: fork, disable (cancels every in-flight run for the agent), the
+    read side (``get_agent``), and delete (previously blocked only because
+    OPERATOR happens not to have ``manifest:delete`` — a coincidence, not a
+    gate).
+    """
+    await ctx.seed_agent()
+    write_scope_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-write-scope",
+        sub_type="service_account",
+        roles=(),
+        scopes=("write",),
+    )
+    write_scope_headers = {"Authorization": f"Bearer {write_scope_jwt}"}
+    resp = await ctx.client.request(method, _concretize(path), headers=write_scope_headers)
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_key_is_denied_on_fork_template(ctx: _Ctx) -> None:
+    """``fork_template`` carried no authorization dependency at all before
+    Backlog Task 2 — not ``require(...)``, not an in-handler
+    ``ensure_resource_access`` gate at the route-entry level (it does call
+    one, but only after loading the template and checking tier
+    entitlement) — so a zero-scope key reached further into the handler
+    than any other route on this router. ``console_only()`` now rejects it
+    before any of that runs.
+    """
+    zero_scope_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-zero-scope",
+        sub_type="service_account",
+        roles=(),
+        scopes=(),
+    )
+    zero_scope_headers = {"Authorization": f"Bearer {zero_scope_jwt}"}
+    resp = await ctx.client.post(
+        "/v1/agents/fork",
+        json={"template_name": "support-bot", "template_version": "latest", "name": "x"},
+        headers=zero_scope_headers,
+    )
+    assert resp.status_code == 403, resp.text
