@@ -83,6 +83,7 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     # worst case: it returns another end user's full conversation
     # trajectory via TrajectoryReader with no owner check.
     ("GET", "/v1/skills"),
+    ("GET", "/v1/knowledge/bases"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -118,6 +119,9 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: inside PATCH for pinning/activating high-risk skills) are untouched and
 #: orthogonal — console_only() only closes the API-key axis; those checks
 #: still gate which *employee* role can do what.
+#: Backlog Task 5 (security fix, spec/external-api-v1-p2b) — /v1/knowledge:
+#: zero RBAC on all 12 routes (base + document CRUD, reindex/reingest,
+#: chunk read, retrieval test) — same shape as /v1/skills above.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -131,6 +135,7 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/webhook-endpoints",
     "/v1/skill-evolution",
     "/v1/skills",
+    "/v1/knowledge",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under

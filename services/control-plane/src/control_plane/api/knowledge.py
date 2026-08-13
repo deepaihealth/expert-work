@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from control_plane.api._authz import console_only
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.tenant_scope import (
@@ -197,7 +198,9 @@ async def _require_base(store: KnowledgeStore, tenant_id: UUID, name: str) -> Kn
 
 
 def build_knowledge_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
+    router = APIRouter(
+        prefix="/v1/knowledge", tags=["knowledge"], dependencies=[Depends(console_only())]
+    )
 
     @router.post("/bases", response_model=None)
     async def create_base(
