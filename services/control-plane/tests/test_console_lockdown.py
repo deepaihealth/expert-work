@@ -57,6 +57,13 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     ("GET", "/v1/workspace"),
     ("GET", "/v1/triggers"),
     ("GET", "/v1/skill-evolution/promote-requests"),
+    # Backlog Task 3 (security fix, spec/external-api-v1-p2) — the module's
+    # own docstring says it mirrors triggers' console_only() shape, but the
+    # gate itself was missing on all 5 routes; a zero-scope API key could
+    # register a delivery URL and receive every run.completed /
+    # artifact.saved event thereafter (an ongoing exfiltration channel, not
+    # just an over-broad read). Live probe here per the rationale above.
+    ("GET", "/v1/webhook-endpoints"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -80,6 +87,11 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: kill-switch engage/release writes) with no third-party story, which carried
 #: no ``require(...)`` at all — a zero-scope service-account key read all of it
 #: and could flip the kill-switch.
+#: Backlog Task 3 (security fix, spec/external-api-v1-p2) added
+#: /v1/webhook-endpoints — NOT to be confused with /v1/webhooks above: this is
+#: the outbound registration CRUD (``webhook_endpoints.py``), whose own
+#: docstring says it mirrors the triggers CRUD but was missing console_only()
+#: on all 5 routes. Locked as a whole prefix, same as /v1/triggers.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -90,6 +102,7 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/artifacts",
     "/v1/workspace",
     "/v1/triggers",
+    "/v1/webhook-endpoints",
     "/v1/skill-evolution",
 )
 

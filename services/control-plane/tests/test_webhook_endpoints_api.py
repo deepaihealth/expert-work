@@ -430,3 +430,79 @@ async def test_get_endpoint_tenant_id_star_400(client: AsyncClient) -> None:
     resp = await client.get(f"/v1/webhook-endpoints/{created['id']}", params={"tenant_id": "*"})
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+# ---------------------------------------------------------------------------
+# Backlog Task 3 (security fix, spec/external-api-v1-p2) — this module's own
+# docstring claims it mirrors the J.10 triggers CRUD, but all 5 routes were
+# missing console_only(): a zero-scope API key could hit POST and register a
+# delivery URL, after which the delivery worker fans every run.completed /
+# artifact.saved event out to it — an ongoing exfiltration channel, not just
+# an over-broad read. See ``api/triggers.py``'s identically-shaped gate.
+# ---------------------------------------------------------------------------
+
+
+def _service_account_headers(*, scopes: tuple[str, ...] = ()) -> dict[str, str]:
+    """Headers for a service-account (API-key) principal. Zero-scope by
+    default — the worst-case caller: a key with no scopes granted at all
+    still reached every route here before console_only()."""
+    token = make_test_jwt(
+        tenant_id=_DEFAULT_TENANT,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=scopes,
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_key_denied_on_every_route(client: AsyncClient) -> None:
+    created = await _create(client)  # via the employee JWT, ahead of the sa probes below
+    sa_headers = _service_account_headers()
+    cases: list[tuple[str, str, dict[str, object] | None]] = [
+        (
+            "POST",
+            "/v1/webhook-endpoints",
+            {
+                "name": "sa-try",
+                "url": "https://hooks.example.com/x",
+                "event_types": ["run.completed"],
+            },
+        ),
+        ("GET", "/v1/webhook-endpoints", None),
+        ("GET", f"/v1/webhook-endpoints/{created['id']}", None),
+        ("PATCH", f"/v1/webhook-endpoints/{created['id']}", {"enabled": False}),
+        ("DELETE", f"/v1/webhook-endpoints/{created['id']}", None),
+    ]
+    for method, path, body in cases:
+        resp = await client.request(method, path, json=body, headers=sa_headers)
+        assert resp.status_code == 403, f"{method} {path} -> {resp.status_code} {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_employee_jwt_still_reaches_every_route(client: AsyncClient) -> None:
+    """console_only()'s predicate only rejects service_account principals —
+    pin that the admin-ui's employee JWT (this file's default ``client``
+    fixture) stays unaffected on all 5 routes, so a mutation that widens the
+    predicate to "reject everyone" can't hide behind the zero-scope-key test
+    above."""
+    created = await _create(client)
+    cases: list[tuple[str, str, dict[str, object] | None]] = [
+        (
+            "POST",
+            "/v1/webhook-endpoints",
+            {
+                "name": "employee-try",
+                "url": "https://hooks.example.com/y",
+                "event_types": ["run.completed"],
+            },
+        ),
+        ("GET", "/v1/webhook-endpoints", None),
+        ("GET", f"/v1/webhook-endpoints/{created['id']}", None),
+        ("PATCH", f"/v1/webhook-endpoints/{created['id']}", {"enabled": False}),
+        ("DELETE", f"/v1/webhook-endpoints/{created['id']}", None),
+    ]
+    for method, path, body in cases:
+        resp = await client.request(method, path, json=body)
+        assert resp.status_code != 403, f"{method} {path} -> {resp.status_code} {resp.text}"
