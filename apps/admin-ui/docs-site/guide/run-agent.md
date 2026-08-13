@@ -21,13 +21,28 @@ Content-Type: application/json
 | `input` | string,≤65536 字符,可选 | 否 | 这一轮用户说的话/任务描述。 |
 | `mode` | `"stream"` \| `"queue"`,默认 `"stream"` | 否 | 见下方「`stream` vs `queue`」。 |
 | `image_refs` | string[],最多 64 项,可选 | 否 | 多模态输入——图片上传接口返回的 `expert_work://image/...` 引用,不是原始字节。 |
-| `untrusted_content` | string[],最多 16 项,可选 | 否 | 结构化的"不可信内容"(比如一封邮件正文、一段工单描述)。和 `input` 分开传,Agent 会把这部分当作**数据**而不是指令来处理——这是防止外部内容里挟带指令注入的推荐做法,优于把不可信文本直接拼进 `input` 里。 |
+| `untrusted_content` | string[],最多 16 项,可选 | 否 | 结构化的"不可信内容"(比如一封邮件正文、一段工单描述)。和 `input` 分开传,Agent 会把这部分当作**数据**而不是指令来处理——这是防止外部内容里挟带指令注入的推荐做法,优于把不可信文本直接拼进 `input` 里。单块长度上限见下方「`untrusted_content`」。 |
 | `inputs` | object,可选 | 否 | 提示词模板变量,见下方「`inputs`」。 |
 | `files` | 数组,最多 64 项,可选 | 否 | 统一的附件引用(图片 / 文档),见下方「`files[]`」。 |
 
+## `untrusted_content` —— 结构化的不可信内容
+
+推荐把外部来源的文本(一封邮件正文、一段工单描述)放进这个字段而不是拼进 `input`——细节见上方参数表这一行的说明。条数(最多 16 项)和单块长度是两条互相独立的硬上限,不是同一条限制的两种说法:
+
+| 上限 | 超限时的 `error.code` |
+|---|---|
+| 最多 16 项(**正好 16 项合法**,第 17 项才拒) | 走请求体字段校验,`error.code` 为 `INVALID_REQUEST` |
+| 单块最多 8192 字符(**正好 8192 字符合法**,第 8193 个字符才拒) | `UNTRUSTED_CONTENT_BLOCK_TOO_LONG` |
+
+```json
+{ "success": false, "data": null, "error": { "code": "UNTRUSTED_CONTENT_BLOCK_TOO_LONG", "message": "untrusted_content[0] 超过 8192 字符" } }
+```
+
+一封长邮件 / 一段长工单描述超过单块 8192 字符时,自己在客户端按块切开、放进数组的多个元素里(仍然要留在 16 项以内),不要拼成一个超长字符串塞进单个元素。
+
 ## `inputs` —— 提示词模板变量
 
-只对系统提示词开启了 Jinja 模板、并声明了变量的 Agent 有意义(在管理控制台配置)。除了下面这两条上限,还有三种情况会 422:
+只对系统提示词开启了 Jinja 模板、并声明了变量的 Agent 有意义(在管理控制台配置)。除了下面这三条上限,还有三种情况会 422:
 
 - Agent 没声明任何模板变量,却传了非空 `inputs`。
 - `inputs` 里出现了 Agent 没声明过的键。
@@ -47,14 +62,15 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 **注意**:这三种 `inputs` 校验失败**不是** `{success, data, error}` 信封,而是 FastAPI 默认的裸 `{"detail": "..."}` 字符串——比如未声明键会是 `{"detail": "unknown input variable: <key>"}`。别假设这条路径上也能读到 `error.code`,细节见 [错误码与限流](./errors)。
 
-### 两条硬上限
+### 三条硬上限
 
-不管 Agent 声明了多少模板变量,`inputs` 本身还有两条硬上限,**这两条走统一信封**(与上面三种"裸 `detail`"形状不同):
+不管 Agent 声明了多少模板变量,`inputs` 本身还有三条硬上限,**这三条走统一信封**(与上面三种"裸 `detail`"形状不同),三条互相独立、不是互相替代:
 
 | 上限 | 超限时的 `error.code` |
 |---|---|
 | 键的数量最多 64 个(**正好 64 个合法**,第 65 个才拒) | `TOO_MANY_INPUT_KEYS` |
 | 单个字符串值最多 8192 字符(**正好 8192 字符合法**,第 8193 个字符才拒);只检查字符串值,数字/数组/对象类型的值不受此限 | `INPUT_VALUE_TOO_LONG` |
+| `inputs` 整体序列化后的总字节数最多 65536 字节(**正好 65536 字节合法**,第 65537 字节才拒);按 **UTF-8 编码后的字节数**计算,不是字符数——一个中文字约占 3 字节,同样字符数的中文 `inputs` 比英文更容易撞上这条上限;数字/数组/对象类型的值也计入这条总量(不像上一条只查字符串值) | `TOO_MANY_INPUT_BYTES` |
 
 ```json
 { "success": false, "data": null, "error": { "code": "TOO_MANY_INPUT_KEYS", "message": "inputs 最多 64 个键" } }
@@ -145,7 +161,22 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 }
 ```
 
-`type: "image"` 的条目会并入 `image_refs` 一起校验——两者合计仍然不能超过 64 张,超了是 422、`error.code` 为 `TOO_MANY_IMAGE_REFS`(统一信封,不是裸 `detail`)。`remote_url` 传输方式(直接给一个外部 URL,不经过上传接口)**目前还不支持**——只有 `local_file` 一条路。
+`type: "image"` 的条目会并入 `image_refs` 一起校验——两者合计仍然不能超过 64 张,超了是 422、`error.code` 为 `TOO_MANY_IMAGE_REFS`(统一信封,不是裸 `detail`)。
+
+**最容易踩的另一个坑**:document 和 image 两种 `files[]` 条目字段名都叫 `upload_id`,但格式完全不同——document 的 `upload_id` 长得像 `uploads/report.pdf`,image 的 `upload_id`(不管是走 `image_refs` 还是 `files[]` 的 `type: "image"`)必须是上传接口对图片返回的那种 `expert_work://image/...` 引用(见上面「图片」示例响应)。两个入口(顶层 `image_refs` 字段、`files[]` 里 `type: "image"` 的条目)校验的是同一道格式闸。把 document 形态的 `upload_id` 填进了 `type: "image"` 的条目,会 422、`error.code` 为 `INVALID_IMAGE_REF`:
+
+```json
+{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "INVALID_IMAGE_REF",
+    "message": "image ref must start with 'expert_work://image/': 'uploads/report.pdf'"
+  }
+}
+```
+
+`remote_url` 传输方式(直接给一个外部 URL,不经过上传接口)**目前还不支持**——只有 `local_file` 一条路。
 
 ## `Idempotency-Key` —— 避免重复下发
 
