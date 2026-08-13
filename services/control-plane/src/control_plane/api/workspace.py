@@ -30,6 +30,7 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
     resolve_target_user_id,
 )
+from control_plane.api._workspace_shared import _workspace_files_payload
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     applied_scope,
@@ -195,25 +196,13 @@ def build_workspace_router() -> APIRouter:
         )
         # Caller-identity resolution stays OUTSIDE applied_scope.
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
-        if target_user_id is None or workspace_store is None:
+        if target_user_id is None:
+            # Machine principal — owns no per-user workspace.
             return JSONResponse({"success": True, "data": {"files": []}})
-        try:
-            entries = await workspace_store.list_files(
-                tenant_id=scope.tenant_id, user_id=target_user_id
-            )
-        except WorkspacePermissionError as exc:
-            # 权限失败(共享 uid 没配上/存量目录属主没迁移/mode 不对)是服务端配置
-            # 问题,不是"这个用户没有文件"。这里如果和下面的 SandboxSupervisorError
-            # 一样吞成空列表,用户会看到"工作区是空的"——比 404 更坏,连"出错了"
-            # 都看不到,诊断成本全压在服务端日志上。detail 只给固定文案,路径/uid/
-            # mode 只进下面这条结构化日志。
-            logger.warning("workspace.list_permission_denied", exc_info=True)
-            raise HTTPException(status_code=500, detail="workspace listing unavailable") from exc
-        except SandboxSupervisorError:
-            logger.warning("workspace.list_failed", exc_info=True)
-            return JSONResponse({"success": True, "data": {"files": []}})
-        files = [{"path": e.path, "size": e.size} for e in entries]
-        return JSONResponse({"success": True, "data": {"files": files}})
+        payload = await _workspace_files_payload(
+            workspace_store, tenant_id=scope.tenant_id, user_id=target_user_id
+        )
+        return JSONResponse({"success": True, "data": payload})
 
     @router.get("/file", response_model=None, dependencies=[Depends(console_only())])
     async def download_workspace_file(
