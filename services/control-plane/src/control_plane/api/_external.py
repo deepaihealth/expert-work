@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -89,6 +91,70 @@ def reject_nul_deep(value: Any, *, field: str = "value") -> Any:
         for item in value:
             reject_nul_deep(item, field=field)
     return value
+
+
+def reject_nul_path_params(request: Request) -> None:
+    """Router-level guard: reject a NUL byte (``\\x00``) in ANY path parameter
+    on the route it is attached to.
+
+    External-API-v1 P2-b review (Critical) — the P2-b pass above hardened
+    every external-plane body / query / header field against an embedded
+    NUL, but missed the one input class that isn't a pydantic field or a
+    ``Query(...)``/header at all: a **path** parameter. ``POST
+    /v1/agents/support%00bot/sessions`` 404s on its face, but the decoded
+    NUL survives into ``agent_code`` and flows straight into
+    ``AgentDisableStore.get`` / ``AgentSpecStore.list_by_tenant`` (both a
+    ``text``-column ``WHERE`` comparison) — the exact ``asyncpg
+    CharacterNotInRepertoireError`` → bare-text 500 this whole module exists
+    to prevent, on both the read and write side of ``_resolve_session``.
+    ``POST /v1/agents/{name}/disable|enable`` has the identical hole via the
+    same ``list_by_tenant`` call, on a route that lives outside every
+    ``external_*.py`` router (see this module's own docstring on those two).
+
+    Intended to be passed exactly ONCE, in a router's own
+    ``APIRouter(..., dependencies=[Depends(reject_nul_path_params)])``
+    constructor — never per-route — so a route added to that router later is
+    covered by construction, the same way the body/query fields above are
+    covered by a shared validator function rather than by remembering to
+    call ``reject_nul`` at each new call site. ``tests/test_external_route_...``-
+    style self-audits (``test_external_path_param_nul_guard.py``) assert
+    every third-party-reachable route actually carries this dependency, so a
+    future route that is mounted on the wrong router (or a router that drops
+    this from its constructor) fails CI instead of silently reopening this
+    hole.
+
+    Reads ``request.path_params`` directly rather than the endpoint's own
+    typed parameters: Starlette populates that dict from the raw, already
+    percent-decoded URL during routing — BEFORE FastAPI/pydantic coerces a
+    ``{run_id}`` segment to ``UUID`` or leaves a ``{agent_code}`` segment as
+    ``str`` — so every path segment is a plain ``str`` here regardless of
+    what type the endpoint eventually asks for. That is what lets one
+    dependency check every path param on every route without knowing each
+    route's parameter names or types; a UUID-typed param with an embedded
+    NUL is caught here as readily as ``agent_code``, which is redundant with
+    (but no less correct than) FastAPI's own UUID parsing rejecting it.
+
+    Raises :class:`fastapi.exceptions.RequestValidationError` — NOT a bare
+    ``ValueError`` (which a plain ``Depends(...)`` callable raising it would
+    NOT have translated into the external envelope; only pydantic's own
+    validation errors are caught by ``app.py``'s
+    ``@app.exception_handler(RequestValidationError)``) and not
+    :class:`ExternalScopeError` (that class is rendered by each endpoint's
+    own ``try/except`` — a router-level dependency runs before any endpoint
+    code and has no such block to be caught by). Constructing this exact
+    exception type is what lets a router-level dependency reuse the SAME
+    rendering path every body-field ``field_validator`` above already goes
+    through, verified with a real request rather than assumed.
+    """
+    for name, value in request.path_params.items():
+        if not isinstance(value, str):
+            continue
+        try:
+            reject_nul(value, field=name)
+        except ValueError as exc:
+            raise RequestValidationError(
+                [{"loc": ("path", name), "msg": str(exc), "type": "value_error"}]
+            ) from exc
 
 
 #: Namespace prefix for end-user identities minted from a third-party app's own

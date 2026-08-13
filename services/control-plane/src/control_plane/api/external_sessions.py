@@ -27,6 +27,7 @@ from control_plane.api._external import (
     load_owned_session,
     lookup_external_user_id,
     reject_nul,
+    reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.audit import emit
@@ -127,7 +128,11 @@ async def _inflight_thread_ids(
 
 def build_external_sessions_router() -> APIRouter:
     """Mount the external session-listing endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
     @router.get(
         "/{agent_code}/sessions",

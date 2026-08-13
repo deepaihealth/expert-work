@@ -23,6 +23,7 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_run,
+    reject_nul_path_params,
 )
 from control_plane.api._run_event_stream import build_event_producer
 from control_plane.api._user_scope import get_user_repo
@@ -121,7 +122,11 @@ def build_events_response(
 
 def build_external_events_router() -> APIRouter:
     """Mount the external event-replay endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
     @router.get("/{agent_code}/runs/{run_id}/events", response_model=None)
     async def stream_run_events(
