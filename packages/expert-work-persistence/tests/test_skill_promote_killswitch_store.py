@@ -202,6 +202,77 @@ async def test_list_promote_requests_all_tenants_spans() -> None:
     assert {r.tenant_id for r in rows} == {tid_a, tid_b}
 
 
+# ── list_promote_requests skill_visibility filter (backlog task 8) ────────
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_skill_visibility_filters() -> None:
+    """``skill_visibility="tenant"`` excludes requests targeting an
+    ``agent_private`` skill; the unfiltered call (admin path) still sees
+    both."""
+    store = InMemorySkillStore()
+    tid = uuid4()
+    sid_priv = await _agent_private_skill(store, tid, name="priv")
+    sid_pub = uuid4()
+    # default visibility=tenant
+    await store.create_skill(skill_id=sid_pub, tenant_id=tid, name="pub")
+    rid_priv, rid_pub = uuid4(), uuid4()
+    await store.request_skill_promote(
+        request_id=rid_priv, tenant_id=tid, skill_id=sid_priv, skill_version=1
+    )
+    await store.request_skill_promote(
+        request_id=rid_pub, tenant_id=tid, skill_id=sid_pub, skill_version=1
+    )
+
+    filtered, _ = await store.list_promote_requests(tenant_id=tid, skill_visibility="tenant")
+    assert [r.id for r in filtered] == [rid_pub]
+
+    unfiltered, _ = await store.list_promote_requests(tenant_id=tid)
+    assert {r.id for r in unfiltered} == {rid_priv, rid_pub}
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_skill_visibility_pagination_not_short() -> None:
+    """The filter must run before the keyset page is cut — a filtered page
+    must never come back short of ``limit`` while more matching rows exist
+    (the post-fetch-filter bug this store-layer approach avoids)."""
+    store = InMemorySkillStore()
+    tid = uuid4()
+    tenant_request_ids: set[UUID] = set()
+    # Interleave 3 agent_private + 3 tenant-visible skills, each with a
+    # pending promote request, so a naive "filter after fetching a page"
+    # implementation would visibly shrink a page below ``limit``.
+    for i in range(3):
+        sid_priv = await _agent_private_skill(store, tid, name=f"priv-{i}")
+        rid = uuid4()
+        await store.request_skill_promote(
+            request_id=rid, tenant_id=tid, skill_id=sid_priv, skill_version=1
+        )
+        sid_pub = uuid4()
+        await store.create_skill(skill_id=sid_pub, tenant_id=tid, name=f"pub-{i}")
+        rid_pub = uuid4()
+        await store.request_skill_promote(
+            request_id=rid_pub, tenant_id=tid, skill_id=sid_pub, skill_version=1
+        )
+        tenant_request_ids.add(rid_pub)
+
+    page1, cursor1 = await store.list_promote_requests(
+        tenant_id=tid, skill_visibility="tenant", limit=2
+    )
+    assert len(page1) == 2, "page short of limit while more tenant-visible rows exist"
+    assert all(r.id in tenant_request_ids for r in page1)
+    assert cursor1 is not None
+
+    page2, cursor2 = await store.list_promote_requests(
+        tenant_id=tid, skill_visibility="tenant", limit=2, cursor=cursor1
+    )
+    assert len(page2) == 1, "second page should hold the one remaining tenant-visible row"
+    assert cursor2 is None
+
+    seen = {r.id for r in page1} | {r.id for r in page2}
+    assert seen == tenant_request_ids
+
+
 # ── list_skills filters (SE-8) ────────────────────────────────────────────
 
 

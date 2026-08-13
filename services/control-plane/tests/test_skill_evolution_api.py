@@ -522,3 +522,71 @@ async def test_promote_flow_tenant_visibility_unaffected(setup: Setup, role: str
         f"/v1/skill-evolution/promote-requests/{rid}/approve", json={}, headers=headers
     )
     assert approved.status_code == 200, f"{role}: {approved.status_code} {approved.text}"
+
+
+# ── list_promote_requests owner filter (backlog task 8) ────────────────────
+#
+# The review queue itself carried zero filtering: any employee (viewer,
+# operator) could see a promote-request targeting an ``agent_private`` skill
+# — skill_id, nominator (``requested_by_user_id``), reason, decision
+# timeline — confirming the private skill's existence even though they're
+# 403'd from every write on it. Admin opening such a request is the normal,
+# ongoing governance workflow (the "propose to tenant" button in
+# ``GovernancePanel.tsx``), not just pre-fix leftovers, so the list must
+# filter every read, not only ones from before a hypothetical cutoff.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_list_promote_requests_hides_agent_private_from_non_admin(
+    setup: Setup, role: str
+) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"list-priv-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    assert opened.status_code == 201, opened.text
+    rid = opened.json()["id"]
+
+    headers = _role_headers(role)
+    q = await client.get(
+        "/v1/skill-evolution/promote-requests", params={"status": "pending"}, headers=headers
+    )
+    assert q.status_code == 200, f"{role}: {q.status_code} {q.text}"
+    ids = [x["id"] for x in q.json()["items"]]
+    assert rid not in ids, f"{role}: leaked into {ids}"
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_admin_sees_agent_private(setup: Setup) -> None:
+    """Admin is unaffected by the backlog task 8 filter."""
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name="list-priv-admin")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    q = await client.get("/v1/skill-evolution/promote-requests", params={"status": "pending"})
+    assert q.status_code == 200
+    assert rid in [x["id"] for x in q.json()["items"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_list_promote_requests_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    """Regression guard against over-filtering — a request targeting an
+    ordinary tenant-visibility skill must stay visible to non-admin
+    employees."""
+    client, _, _ = setup
+    sid = await _seed_tenant_skill(client, name=f"list-tenant-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    headers = _role_headers(role)
+    q = await client.get(
+        "/v1/skill-evolution/promote-requests", params={"status": "pending"}, headers=headers
+    )
+    assert q.status_code == 200, f"{role}: {q.status_code} {q.text}"
+    assert rid in [x["id"] for x in q.json()["items"]], f"{role}: {q.json()['items']}"

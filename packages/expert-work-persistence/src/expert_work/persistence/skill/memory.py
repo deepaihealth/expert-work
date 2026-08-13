@@ -588,8 +588,20 @@ class InMemorySkillStore(SkillStore):
         status: PromoteRequestStatus | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        skill_visibility: SkillVisibility | None = None,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         rows = [r for r in self._promote_requests.values() if r.tenant_id == tenant_id]
+        if skill_visibility is not None:
+            # Backlog task 8 — same join-by-visibility semantics as the SQL
+            # backend: a request whose target skill is missing (shouldn't
+            # happen — FK-equivalent invariant) is excluded, matching an
+            # INNER JOIN.
+            rows = [
+                r
+                for r in rows
+                if (skill := self._skills.get(r.skill_id)) is not None
+                and skill.visibility == skill_visibility
+            ]
         return _paginate_promote_requests(rows, status=status, cursor=cursor, limit=limit)
 
     async def list_promote_requests_all_tenants(

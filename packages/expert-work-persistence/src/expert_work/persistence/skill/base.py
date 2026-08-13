@@ -495,9 +495,20 @@ class SkillStore(abc.ABC):
         status: PromoteRequestStatus | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        # Backlog task 8 (SE-8) — mirrors ``list_skills``'s ``visibility``
+        # filter: narrows to requests targeting a skill with this visibility.
+        # ``None`` (default) = no filter, preserving the admin/system shape.
+        # Filtered at the query layer (before the cursor page is cut), same
+        # rule as ``list_skills``, so a filtered page never comes back short.
+        skill_visibility: SkillVisibility | None = None,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         """Page through a tenant's promote requests (newest first), the SE-8
-        review queue when ``status='pending'``. Keyset cursor = last row id."""
+        review queue when ``status='pending'``. Keyset cursor = last row id.
+
+        ``skill_visibility`` filters by the *target skill's* visibility (a
+        join, not a column on this row) — e.g. ``"tenant"`` to hide requests
+        aimed at ``agent_private`` skills from non-admin callers.
+        """
 
     @abc.abstractmethod
     async def list_promote_requests_all_tenants(

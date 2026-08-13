@@ -39,6 +39,7 @@ from control_plane.api.skills import (
     _version_dict,
 )
 from control_plane.audit import emit as audit_emit
+from control_plane.auth.rbac import is_admin
 from control_plane.tenant_scope import (
     CrossTenant,
     SingleTenant,
@@ -62,6 +63,7 @@ from expert_work.protocol import (
     PromoteRequestStatus,
     SkillEvalResult,
     SkillPromoteRequest,
+    SkillVisibility,
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -186,12 +188,33 @@ def build_skill_evolution_router() -> APIRouter:
         )
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
+                # ``CrossTenant`` (``tenant_id=*``) is system_admin-only
+                # (``ensure_tenant_scope``), and ``is_admin`` is True for
+                # system_admin too — no non-admin caller reaches this branch,
+                # so no ``skill_visibility`` filter is needed here (mirrors
+                # ``list_skills_all_tenants``).
                 rows, next_cursor = await store.list_promote_requests_all_tenants(
                     status=status, cursor=cursor, limit=limit
                 )
             else:
+                # Backlog task 8 (SE-8) — a non-admin employee must never see
+                # a promote-request targeting an ``agent_private`` skill (it
+                # confirms the private skill's existence + who nominated it +
+                # why). Admin-opened requests for private skills are a normal,
+                # ongoing part of this workflow (not just pre-fix leftovers),
+                # so this filters every read, not just historical rows.
+                # Filtered at the store query layer — never post-fetch — so a
+                # filtered page never comes back short (same rule as
+                # ``list_skills``).
+                skill_visibility: SkillVisibility | None = (
+                    None if is_admin(request.state.principal) else "tenant"
+                )
                 rows, next_cursor = await store.list_promote_requests(
-                    tenant_id=scope.tenant_id, status=status, cursor=cursor, limit=limit
+                    tenant_id=scope.tenant_id,
+                    status=status,
+                    cursor=cursor,
+                    limit=limit,
+                    skill_visibility=skill_visibility,
                 )
         return JSONResponse(
             status_code=200,
