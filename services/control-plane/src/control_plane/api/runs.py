@@ -23,8 +23,10 @@ at run end.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
@@ -159,6 +161,64 @@ MAX_RUN_INPUT_TOTAL_BYTES: Final[int] = MAX_RUN_INPUT_CHARS
 MAX_UNTRUSTED_CONTENT_BLOCK_CHARS: Final[int] = 8192
 
 
+@dataclass(frozen=True)
+class InputsBoundViolation:
+    """Which ``inputs`` bound :func:`check_run_inputs_bound` tripped.
+
+    Structured, not a rendered message — the pydantic validator and the
+    external run endpoint's hand-rolled precheck raise/render this
+    differently (an English ``ValueError`` vs a Chinese ``_envelope_error``
+    with its own error code), so the shared function hands back only the
+    ``kind`` (+ offending ``key`` for ``"value_too_long"``) and lets each
+    call site keep its own wording verbatim.
+    """
+
+    kind: Literal["too_many_keys", "value_too_long", "too_many_bytes"]
+    #: Only set when ``kind == "value_too_long"``.
+    key: str | None = None
+
+
+def check_run_inputs_bound(
+    value: dict[str, Any], *, check_total_bytes: bool
+) -> InputsBoundViolation | None:
+    """Shared bound-checking logic behind ``RunRequest._bound_inputs`` (the
+    pydantic validator, console-plane) and the external run endpoint's own
+    precheck (``agents.py`` — it hand-constructs ``RunRequest`` off the
+    FastAPI request-body validation path, so ``_bound_inputs`` never runs
+    for it; see the ``agents.py`` call site for why that precheck must
+    exist at all).
+
+    Checks, in order (first violation wins — matches both pre-extraction
+    call sites' check order):
+
+    1. key count ``<= MAX_RUN_INPUT_KEYS``.
+    2. each ``str``-valued entry ``<= MAX_RUN_INPUT_VALUE_CHARS``
+       (non-``str`` values are not length-checked here — only their count
+       toward (1) matters).
+    3. when ``check_total_bytes=True``: the whole mapping's serialized size
+       ``<= MAX_RUN_INPUT_TOTAL_BYTES`` — External-API-v1 P2-a security fix,
+       closes the "wrap an oversized value in a list/dict" bypass of (2).
+       **Not** checked when ``check_total_bytes=False`` — the console-plane
+       validator never enforced this bound (its caller is trusted internal
+       traffic this bound was never meant to guard), and extracting this
+       function must not silently add it there.
+
+    Returns ``None`` when ``value`` is within all applicable bounds.
+    """
+    if len(value) > MAX_RUN_INPUT_KEYS:
+        return InputsBoundViolation(kind="too_many_keys")
+    for key, val in value.items():
+        if isinstance(val, str) and len(val) > MAX_RUN_INPUT_VALUE_CHARS:
+            return InputsBoundViolation(kind="value_too_long", key=key)
+    if check_total_bytes:
+        total_bytes = len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        if total_bytes > MAX_RUN_INPUT_TOTAL_BYTES:
+            return InputsBoundViolation(kind="too_many_bytes")
+    return None
+
+
 class RunRequest(BaseModel):
     """POST body. ``input`` is the user's prompt for this run;
     ``image_refs`` is the list of J.6 ``expert_work://image/...`` references
@@ -196,13 +256,13 @@ class RunRequest(BaseModel):
     @field_validator("inputs")
     @classmethod
     def _bound_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if len(value) > MAX_RUN_INPUT_KEYS:
-            msg = f"too many input variables (max {MAX_RUN_INPUT_KEYS})"
+        violation = check_run_inputs_bound(value, check_total_bytes=False)
+        if violation is not None:
+            if violation.kind == "too_many_keys":
+                msg = f"too many input variables (max {MAX_RUN_INPUT_KEYS})"
+            else:
+                msg = f"input '{violation.key}' exceeds {MAX_RUN_INPUT_VALUE_CHARS} chars"
             raise ValueError(msg)
-        for key, val in value.items():
-            if isinstance(val, str) and len(val) > MAX_RUN_INPUT_VALUE_CHARS:
-                msg = f"input '{key}' exceeds {MAX_RUN_INPUT_VALUE_CHARS} chars"
-                raise ValueError(msg)
         return value
 
     @field_validator("untrusted_content")

@@ -55,6 +55,7 @@ from control_plane.api.runs import (
     MAX_RUN_INPUT_VALUE_CHARS,
     MAX_UNTRUSTED_CONTENT_BLOCK_CHARS,
     RunRequest,
+    check_run_inputs_bound,
     spawn_run,
 )
 from control_plane.api.uploads import is_safe_document_upload_id
@@ -1281,32 +1282,28 @@ def build_agents_router() -> APIRouter:
         # would raise an uncaught pydantic ValidationError (500) instead.
         # Pre-check explicitly, same pattern as the ``image_refs`` check
         # above. ``validate_prompt_inputs`` (called inside ``spawn_run``)
-        # covers unknown/missing-required keys but not these two bounds.
-        if len(payload.inputs) > MAX_RUN_INPUT_KEYS:
-            return _envelope_error(
-                "TOO_MANY_INPUT_KEYS",
-                f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键",
-                422,
-            )
-        for _input_key, _input_val in payload.inputs.items():
-            if isinstance(_input_val, str) and len(_input_val) > MAX_RUN_INPUT_VALUE_CHARS:
+        # covers unknown/missing-required keys but not these bounds.
+        #
+        # The three checks themselves (key count / per-value str length /
+        # total serialized bytes — the third is external-plane-only, P2-a
+        # security fix, Important) are shared with ``RunRequest._bound_inputs``
+        # via ``check_run_inputs_bound`` — see its docstring for the full
+        # rationale. Only the error code / Chinese message text below is
+        # local to this endpoint.
+        _inputs_violation = check_run_inputs_bound(payload.inputs, check_total_bytes=True)
+        if _inputs_violation is not None:
+            if _inputs_violation.kind == "too_many_keys":
                 return _envelope_error(
-                    "INPUT_VALUE_TOO_LONG",
-                    f"inputs['{_input_key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
+                    "TOO_MANY_INPUT_KEYS",
+                    f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键",
                     422,
                 )
-        # P2-a 安全修复(Important)—— 上面这条单值长度检查只认 ``str``;把同一
-        # 个超大值包一层 list/dict 就绕过(``{"lang": ["A"*1200000]}``),两条
-        # 既有检查都不查。追加一道**序列化后总字节数**的界,堵住"值不是 str
-        # 就不查长度"这个洞;既有两条(键数 / 单值 str 长度)原样保留,新界是
-        # 追加不是替代——单值 8192 的界仍然有意义(限制单个变量),这条新界
-        # 限制的是整个 inputs 的总量。上限复用 ``MAX_RUN_INPUT_TOTAL_BYTES``
-        # (= ``MAX_RUN_INPUT_CHARS``,即 input 自由文本字段的 64KB 上限,见
-        # runs.py 该常量的文档字符串)。
-        _inputs_total_bytes = len(
-            json.dumps(payload.inputs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-        if _inputs_total_bytes > MAX_RUN_INPUT_TOTAL_BYTES:
+            if _inputs_violation.kind == "value_too_long":
+                return _envelope_error(
+                    "INPUT_VALUE_TOO_LONG",
+                    f"inputs['{_inputs_violation.key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
+                    422,
+                )
             return _envelope_error(
                 "TOO_MANY_INPUT_BYTES",
                 f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
