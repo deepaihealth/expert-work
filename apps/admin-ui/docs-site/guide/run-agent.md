@@ -289,7 +289,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions?user_id=u-123&limit=
 - `null` = 这段会话还没被算过(存量会话还没跑过任何一次 run,或者这次更新上线前创建、之后也一直没再跑过 run)。
 - `0` = 已经算过,确实没有消息。
 
-`message_count` 在每次 run 跑完终态时重新计算并写回,不是实时累加——不要把 `null` 当成 `0` 处理。`user_id` 是这个租户从没见过的值时,返回空列表而不是 404。
+`message_count` 在每次 run 跑完终态时重新计算并写回,不是实时累加——不要把 `null` 当成 `0` 处理。`user_id` 是这个租户从没见过的值时,返回空列表而不是 404。这条列表默认不包含已归档(`archived`)的会话——见下方「会话管理:重命名 / 归档」一节。
 
 ### `GET /v1/agents/{agent_code}/sessions/{session_id}/messages` —— 历史消息
 
@@ -328,3 +328,136 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/message
 `role` 是 `"user"` 或 `"assistant"`;`channel` 只对 `assistant` 消息有意义(`"final"` = 这一步是这一轮对话里最终会展示的回答,`"commentary"` = 中间过程性输出),`user` 消息恒为 `null`。
 
 `created_at` / `run_id` 是这次更新新加的字段。**这次更新之前产生的历史消息,这两个字段是 `null`**——写入时才会盖上时间戳和归属 run id,不做历史回填,不要假设它们一定有值。`session_id` 不属于这个 `user_id` / `agent_code`,返回 404(`SESSION_NOT_FOUND`),不会告诉你这个会话到底存不存在。
+
+## 工作区文件
+
+Agent 执行任务时会往终端用户的持久工作区里写产出物(报表、导出文件等),这两个接口用来列出 / 下载这些文件。两条都要求 `read` scope(`write` key 含读)。
+
+::: warning `agent_code` 对这两个接口完全不生效
+工作区是按 **(租户, 终端用户)** 维度存的,不按 agent 分——URL 里的 `{agent_code}` 只是为了和这组接口里其它路径(`/v1/agents/{agent_code}/sessions` 等)保持同款形状,实际**不参与过滤或权限判定**。同一个 `user_id` 配任意 `agent_code`(甚至一个压根没建过的 `agent_code`)拿到的都是**同一份**文件列表,同样 200。
+
+这一点和这组接口里的其它端点行为不一致——会话列表 / 历史消息 / run 事件 / 审批操作全都把 `agent_code` 当成真实的过滤或归属校验维度(比如一个会话不属于这个 `agent_code` 会 404);工作区端点是这组里唯一的例外,同样的 URL 形状不代表同样的语义。
+
+**风险场景**:如果你给不同业务线注册了不同的 `agent_code`(比如"财务规划"和"公开问答"复用同一批终端用户 `user_id`),这两个接口会让一条业务线看到另一条业务线在同一个 `user_id` 下产生的文件。**如果需要按 agent 隔离文件,当前 API 不提供**——同一个 `user_id` 下所有 agent 共享同一份工作区。
+:::
+
+### `GET /v1/agents/{agent_code}/workspace/files` —— 列出文件
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "files": [
+      { "path": "report.pdf", "size": 235112 },
+      { "path": "charts/q3.png", "size": 88213 }
+    ]
+  },
+  "error": null
+}
+```
+
+`user_id` 是这个租户从没见过的值时,返回空文件列表而不是 404(这是读操作,不会为一个陌生 `user_id` 铸造终端用户)。`path` 可能带子目录,如上面第二项。
+
+### `GET /v1/agents/{agent_code}/workspace/file` —— 下载单个文件
+
+| 查询参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | 同上面「列出文件」。 |
+| `path` | 是 | 要下载的文件相对路径。**直接原样回传上面「列出文件」返回的 `path` 字段值,不要自己拼**——见下方「`path` 的合法形态」。 |
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&path=report.pdf" \
+  -H "Authorization: Bearer <key>" \
+  -o report.pdf
+```
+
+成功响应是文件字节流本身(**不是** `{success, data, error}` 信封——信封只包裹错误响应)。`Content-Type` 按 `path` 的扩展名推断:图片(`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico`)和结构化文本 / 代码类扩展名(`.json` / `.yaml` / `.toml` 等,以及 `.txt` / `.py` / `.md` 这类纯文本 / 代码)带 `Content-Disposition: inline`,浏览器可以直接预览。`.html` / `.htm` / `.xhtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.xslt` / `.mathml` 这类"可执行 / 可交互内容"扩展名,以及任何未识别的扩展名(含无扩展名文件),一律强制 `Content-Disposition: attachment`——前一类是刻意的 XSS 防护(避免浏览器把这些当成同源 HTML/SVG 内联渲染,执行里面夹带的脚本),后一类是"宁可多一次没必要的下载,也不要猜错类型"。响应始终带 `X-Content-Type-Options: nosniff`。
+
+#### `path` 的合法形态
+
+以下几种 `path` 形态一律拒绝,返回 400:
+
+- 绝对路径(以 `/` 开头)
+- 含 `..` 段(试图跳出工作区)
+- 含 NUL 字节(`\x00`)
+- 空字符串,或者去掉首尾空白后是空字符串
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "invalid workspace path" } }
+```
+
+避免这整类错误最简单的办法:`path` 直接用上面「列出文件」接口返回的 `path` 字段值原样回传,不要自己用字符串拼接构造路径。
+
+#### 错误情况
+
+`user_id` 未识别(不认识这个终端用户)、`path` 指向的文件不存在,这两种情况**返回同一个不透明的 404**(`WORKSPACE_FILE_FAILED`)——不要试图从响应里区分是哪一种,这是刻意的存在性隐藏,不是 bug:
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "file not found" } }
+```
+
+服务端工作区存储配置有问题(比如权限没配对)时返回 500,同样是 `WORKSPACE_FILE_FAILED`——这种情况不是你这边能解决的,重试没用,联系你的租户管理员:
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
+```
+
+细节见 [错误码与限流](./errors)。
+
+## 会话管理:重命名 / 归档
+
+### `PATCH /v1/agents/{agent_code}/sessions/{session_id}` —— 重命名
+
+要求 `write` scope。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `user_id` | string,1–255 字符 | 是 | 会话所属的终端用户——必须与这个 `session_id` 实际归属的用户一致。 |
+| `title` | string,1–200 字符 | 是 | 新标题,覆盖当前标题(不管是自动生成的还是上次手动设置的)。 |
+
+```bash
+curl -X PATCH https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id} \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "title": "退货咨询"}'
+```
+
+```json
+{ "success": true, "data": { "session_id": "...", "title": "退货咨询" }, "error": null }
+```
+
+`title` 去掉首尾空白后是空字符串(比如整串都是空格),422 `INVALID_TITLE`:
+
+```json
+{ "success": false, "data": null, "error": { "code": "INVALID_TITLE", "message": "title must not be empty" } }
+```
+
+`session_id` 不存在、或者不属于这个 `user_id` / `agent_code` 组合,404 `SESSION_NOT_FOUND`——同一个不透明 404,不会告诉你是"不存在"还是"存在但不是你的"。
+
+### `DELETE /v1/agents/{agent_code}/sessions/{session_id}` —— 归档(软删除)
+
+要求 `write` scope,**不是** `delete`——external API 没有单独的 delete 档位对第三方开放,给外部对接方发一把能归档会话的 key 只需要 `write`,不需要更高权限的 `admin`。
+
+```bash
+curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}?user_id=u-123" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{ "success": true, "data": { "session_id": "...", "status": "archived" }, "error": null }
+```
+
+::: warning 这是软删除,不是彻底删除
+归档只是把会话状态改成 `archived`。**checkpoint / 历史消息 / run 记录 / 工作区文件全部原样保留**,能照常查询(比如 `GET .../messages` 仍然能读到已归档会话的内容,归档不影响这条接口)。彻底物理删除(`purge`)只在管理控制台内部提供,不对外开放。
+
+归档后唯一可见的行为变化:这个会话会从 `GET /v1/agents/{agent_code}/sessions` 的**默认**列表里消失(该接口默认不返回 `archived` 状态的会话)。想恢复可见性(比如允许用户"取消归档"),当前 API 没有对外的反向操作。
+:::
+
+`session_id` 不存在、或者不属于这个 `user_id` / `agent_code` 组合,同样是不透明的 404 `SESSION_NOT_FOUND`。
+
+细节见 [错误码与限流](./errors)。
