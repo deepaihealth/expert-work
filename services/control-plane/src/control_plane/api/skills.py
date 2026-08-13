@@ -32,6 +32,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from control_plane.api._authz import console_only
 from control_plane.api._skill_moderation import (
     ModerationError,
     moderate_prompt_fragment,
@@ -321,7 +322,7 @@ def _version_dict(version: SkillVersion) -> dict[str, Any]:
 
 def build_skills_router() -> APIRouter:
     """Stream J.7a admin CRUD + ZIP import/export router."""
-    router = APIRouter(prefix="/v1/skills", tags=["skills"])
+    router = APIRouter(prefix="/v1/skills", tags=["skills"], dependencies=[Depends(console_only())])
 
     @router.post("", response_model=None)
     async def create_skill(

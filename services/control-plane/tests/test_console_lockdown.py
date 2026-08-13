@@ -71,6 +71,18 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     # artifact.saved event thereafter (an ongoing exfiltration channel, not
     # just an over-broad read). Live probe here per the rationale above.
     ("GET", "/v1/webhook-endpoints"),
+    # Backlog Task 5 (security fix, spec/external-api-v1-p2b) — six more
+    # prefixes landing across separate commits, one router file each
+    # (curation.py builds two routers): /v1/skills, /v1/knowledge,
+    # /v1/curation, /v1/eval-datasets, /v1/eval-runs, /v1/quality. All 42
+    # routes between them carried zero require(...)/console_only(); only
+    # ensure_tenant_scope/ensure_single_tenant_scope (which parse "which
+    # tenant", not "is this caller allowed"), so a zero-scope API key
+    # reached every one. One live probe per prefix, added alongside that
+    # prefix's own commit. The curation-candidate probe is the brief's
+    # worst case: it returns another end user's full conversation
+    # trajectory via TrajectoryReader with no owner check.
+    ("GET", "/v1/skills"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -99,6 +111,13 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: the outbound registration CRUD (``webhook_endpoints.py``), whose own
 #: docstring says it mirrors the triggers CRUD but was missing console_only()
 #: on all 5 routes. Locked as a whole prefix, same as /v1/triggers.
+#: Backlog Task 5 (security fix, spec/external-api-v1-p2b) — /v1/skills:
+#: zero RBAC on all 15 routes (see the CONSOLE_ENDPOINTS comment above for
+#: the full six-prefix batch this belongs to). skills.py's own inline role
+#: checks (``_require_subscribe_role``, and the ADMIN/SYSTEM_ADMIN branches
+#: inside PATCH for pinning/activating high-risk skills) are untouched and
+#: orthogonal — console_only() only closes the API-key axis; those checks
+#: still gate which *employee* role can do what.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -111,6 +130,7 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/triggers",
     "/v1/webhook-endpoints",
     "/v1/skill-evolution",
+    "/v1/skills",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under
