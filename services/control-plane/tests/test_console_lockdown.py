@@ -158,7 +158,7 @@ _OPEN_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/v1/agents/
 #: ``admin`` scope ("never hand it to a third-party integrator — it is the whole
 #: tenant"), not a hole this table hides; it is spelled out because reading the
 #: bucket as "API keys cannot reach these" would make the key-reachable surface
-#: under ``/v1/agents`` look like exactly the eight external routes, and it is
+#: under ``/v1/agents`` look like exactly the external routes listed above, and it is
 #: not. Listed so the partition test below stays exhaustive without claiming
 #: they are external.
 _SELF_GATED_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
@@ -531,7 +531,7 @@ async def test_api_key_still_reaches_every_external_agents_route(
     """The head risk of a route-level lockdown under a shared prefix: catching
     the third-party plane in the blast radius.
 
-    Every one of the eight external routes must stay reachable to an API key.
+    Every one of the external routes must stay reachable to an API key.
     A missing body / query param answers 4xx here — that is fine and expected;
     what must never appear is 403, which is the only thing ``console_only()``
     can produce.
