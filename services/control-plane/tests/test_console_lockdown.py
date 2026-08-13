@@ -22,7 +22,14 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, AuditQuery, Role
+from expert_work.protocol import (
+    AgentSpec,
+    AuditQuery,
+    PlatformAgentTemplateStatus,
+    PlatformAgentTemplateUpsert,
+    Role,
+    TenantPlan,
+)
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -596,9 +603,21 @@ async def test_write_scope_key_is_denied_on_the_newly_gated_agents_routes(
     access`` / ``require("manifest", "write")`` alone let through before
     ``console_only()`` closed this axis. Covers the brief's named-risky
     subset: fork, disable (cancels every in-flight run for the agent), the
-    read side (``get_agent``), and delete (previously blocked only because
-    OPERATOR happens not to have ``manifest:delete`` — a coincidence, not a
-    gate).
+    read side (``get_agent``), and delete.
+
+    DELETE is a special case, not this test's to prove: OPERATOR is NOT
+    granted ``manifest:delete`` (``rbac.py``), so a write-scope key 403s on
+    this route from RBAC alone — with or without ``console_only()`` on
+    ``delete_agent``. This instance therefore only confirms the write-scope
+    axis stays denied; it cannot, by itself, tell "the gate closed it" from
+    "OPERATOR never had delete" (that would be a reintroduced coincidence,
+    same shape as the pre-fix one). The causal proof that ``console_only()``
+    — not the coincidence — now guards DELETE belongs to
+    ``test_api_key_is_denied_on_the_console_routes_under_agents``: its
+    ``ctx.key_headers`` carries ``admin`` scope (→ ADMIN role, which DOES
+    have ``manifest:delete``), so removing ``console_only()`` from
+    ``delete_agent`` turns that test's DELETE case green→red, which this one
+    alone cannot.
     """
     await ctx.seed_agent()
     write_scope_jwt = make_test_jwt(
@@ -622,7 +641,37 @@ async def test_zero_scope_key_is_denied_on_fork_template(ctx: _Ctx) -> None:
     entitlement) — so a zero-scope key reached further into the handler
     than any other route on this router. ``console_only()`` now rejects it
     before any of that runs.
+
+    A published, tier-affordable template is pre-seeded here (same shape as
+    ``tests/test_agents_fork.py``'s ``_upsert()``/``seed_template``) so the
+    403 below cannot be riding on the fixture's ``InMemoryPlatformAgentTemplateStore``
+    happening to be empty. Without a seed, pulling ``console_only()`` off
+    this route would 404 at the handler's step-1 template lookup (``base is
+    None``, ``api/agents.py``) before step 4's ``ensure_resource_access``
+    ever runs, and the bare ``== 403`` assertion would pass for that wrong
+    reason.
+
+    Seeding is not enough by itself, though — verified by mutation, not just
+    read off the source: a zero-scope key that reaches step 4 gets denied
+    there too (no role, no binding — same final 403 as ``console_only()``
+    would have produced), so a bare status-code assertion stays green with
+    or without the gate; that is the exact tautology the seed was meant to
+    close, just moved one step deeper. Pinning the denial **message**, the
+    same idiom the other console-plane tests in this module use, is what
+    actually discriminates: only ``console_only()`` produces this pointer
+    text — strip it and the 403 survives (from
+    ``ensure_resource_access``) but the message changes to that call's
+    generic "principal lacks access to this resource".
     """
+    await ctx.app.state.platform_agent_template_store.create(
+        upsert=PlatformAgentTemplateUpsert(
+            spec=_spec(),
+            display_name="Support Bot",
+            status=PlatformAgentTemplateStatus.PUBLISHED,
+            required_tier=TenantPlan.FREE,
+        ),
+        created_by="sysadmin",
+    )
     zero_scope_jwt = make_test_jwt(
         tenant_id=ctx.tenant_id,
         subject="sa-zero-scope",
@@ -637,3 +686,6 @@ async def test_zero_scope_key_is_denied_on_fork_template(ctx: _Ctx) -> None:
         headers=zero_scope_headers,
     )
     assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["message"] == (
+        "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+    ), resp.text
