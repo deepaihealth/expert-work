@@ -16,7 +16,7 @@
 
 - 对外响应一律 `{success, data, error}` 信封;所有 404 隐藏存在性(不区分「不存在」与「不属于你」)。
 - 归属解析一律走 `_external.py` 的现成通路,读路径 `mint=False` —— 读操作**绝不**为没见过的 `user_id` 铸 `tenant_user` 行。
-- scope 闸:读用 `require("session", "read")`,写用 `require("session", "write")`,归档用 `require("session", "delete")`(`Action` 合法取值见 `auth/rbac.py:50`)。
+- scope 闸:读用 `require("session", "read")`,写用 `require("session", "write")`,归档用 `require("session", "write")`(`Action` 合法取值见 `auth/rbac.py:50`)(用户 2026-08-13 裁定推翻原 `"delete"` 方案——OPERATOR 角色对 `session` 资源没有 `delete` 授权,原方案会逼第三方为了归档配 `admin` scope key)。
 - **共用逻辑抽 helper,不做两份**(用户 2026-08-12 裁定,推翻本计划初稿的「逐段镜像」)。
   控制台与对外两侧共用的那段(路径校验 → 读文件 → 权限失败/不存在分支 → 响应头)抽成一个
   helper,两侧各自只保留**身份解析**的差异。理由:这段全是安全代码,两份实现将来必然漂 ——
@@ -395,7 +395,7 @@ async def rename_session(...) -> JSONResponse:
 @router.delete(
     "/{agent_code}/sessions/{session_id}",
     response_model=None,
-    dependencies=[Depends(require("session", "delete"))],
+    dependencies=[Depends(require("session", "write"))],  # 用户 2026-08-13 裁定,原为 "delete"
 )
 async def archive_session(...) -> JSONResponse:
     """归档会话 —— **软删**:从默认列表隐藏,可逆;检查点 / runs / 工作区都不动。
@@ -479,6 +479,6 @@ uv run pytest
 
 **类型一致性**：Task 1 建立的 router 与身份解析被 Task 2 复用(同一模块);Task 3 复用既有 `load_owned_session` / `update_title` / `update_status`,签名见 `api/sessions.py:879-943` 与 `thread_meta/base.py:204-226`。
 
-**scope 取值已核实**：`Action` 的合法取值定义在 `services/control-plane/src/control_plane/auth/rbac.py:50`,含 `read` / `write` / `delete`。对外归档用 `delete` 与控制台侧 `sessions.py:914` 的 `require_key_scope("delete")` 对齐。
+**scope 取值已核实**：`Action` 的合法取值定义在 `services/control-plane/src/control_plane/auth/rbac.py:50`,含 `read` / `write` / `delete`。~~对外归档用 `delete` 与控制台侧 `sessions.py:914` 的 `require_key_scope("delete")` 对齐。~~ **已推翻(用户 2026-08-13 裁定)**：`rbac.py`OPERATOR 角色对 `session` 资源无 `delete` 授权,外部 `"delete"` 闸只有 `admin` scope key 能过,会逼第三方为了归档配出可改服务账号/角色绑定的最高权限 key——归档实为可逆软删,改用 `require("session", "write")`,与 `rename_session` 同档。
 
 **已知需实现者补齐的**：测试 fixture(`external_client`、`external_client_no_scope`、`external_client_write_only`、`seeded_workspace`、`seeded_session`、`other_user`、`user_store`)—— 先查 `services/control-plane/tests/conftest.py` 里 P1 是否已建同名或等价 fixture,**优先复用,不新造一套桩**。
