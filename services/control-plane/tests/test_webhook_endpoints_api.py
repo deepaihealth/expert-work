@@ -546,7 +546,7 @@ async def test_viewer_cannot_register_webhook_for_skill_promote_requested(
         headers=viewer_headers,
     )
     assert resp.status_code == 403, resp.text
-    assert resp.json()["detail"]["code"] == "WEBHOOK_ENDPOINT_ADMIN_REQUIRED"
+    assert resp.json()["detail"]["code"] == "WEBHOOK_SCOPE_FORBIDDEN"
 
 
 @pytest.mark.asyncio
@@ -570,7 +570,7 @@ async def test_viewer_and_operator_denied_on_all_write_routes(client: AsyncClien
         for method, path, body in cases:
             resp = await client.request(method, path, json=body, headers=headers)
             assert resp.status_code == 403, f"{roles} {method} {path} -> {resp.status_code}"
-            assert resp.json()["detail"]["code"] == "WEBHOOK_ENDPOINT_ADMIN_REQUIRED"
+            assert resp.json()["detail"]["code"] == "WEBHOOK_SCOPE_FORBIDDEN"
 
 
 @pytest.mark.asyncio

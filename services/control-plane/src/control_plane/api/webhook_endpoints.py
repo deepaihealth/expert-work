@@ -119,7 +119,7 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(
             status_code=403,
             detail={
-                "code": "WEBHOOK_ENDPOINT_ADMIN_REQUIRED",
+                "code": "WEBHOOK_SCOPE_FORBIDDEN",
                 "message": "only tenant admins may register or modify webhook endpoints",
             },
         )
