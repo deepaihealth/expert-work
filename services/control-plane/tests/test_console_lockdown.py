@@ -128,6 +128,16 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/messages"),
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:decide"),
+        # P2-b — session rename / archive (external_sessions.py) and the
+        # workspace list / download mirror (external_workspace.py). All four
+        # are mounted on ``APIRouter(prefix="/v1/agents", tags=["external"])``
+        # and gated with ``Depends(require("session", ...))`` — never
+        # ``console_only()`` — so they belong to the third-party surface,
+        # same as the eight above.
+        ("PATCH", "/v1/agents/{agent_code}/sessions/{session_id}"),
+        ("DELETE", "/v1/agents/{agent_code}/sessions/{session_id}"),
+        ("GET", "/v1/agents/{agent_code}/workspace/files"),
+        ("GET", "/v1/agents/{agent_code}/workspace/file"),
     }
 )
 
