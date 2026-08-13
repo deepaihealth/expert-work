@@ -51,10 +51,14 @@ def content_disposition_header(filename: str, *, disposition: ContentDisposition
     ``filename=`` carries an ASCII-safe approximation (replacing anything
     outside printable ASCII with ``_``) for legacy clients; ``filename*=UTF-8''…``
     carries the percent-encoded original. Quoting the ASCII fallback escapes
-    embedded quotes — defence against a CR/LF / quote in the name leaking into
-    the header.
+    embedded quotes and backslashes — defence against a CR/LF / quote / backslash
+    in the name leaking into the header. A trailing backslash left unescaped
+    would otherwise escape the closing quote of the ``filename=`` quoted-string
+    (RFC 6266), letting lenient parsers swallow the following
+    ``filename*=UTF-8''…`` segment into the ``filename`` value and degrade the
+    display name.
     """
-    ascii_safe = "".join(c if 32 <= ord(c) < 127 and c != '"' else "_" for c in filename)
+    ascii_safe = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in filename)
     encoded = urllib.parse.quote(filename, safe="")
     return f"{disposition}; filename=\"{ascii_safe}\"; filename*=UTF-8''{encoded}"
 
