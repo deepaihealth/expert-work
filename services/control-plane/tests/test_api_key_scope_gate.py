@@ -28,15 +28,15 @@ pass their matching gate:
   unchanged — the gate keys off ``subject_type == "service_account"``)
 
 "Passes the gate" (still used for the human-JWT test) is asserted as
-``status != 403``: the ids are random, so handlers typically 404 after the
-gate — which is exactly the point (the gate must fire *before* resource
-resolution so a 403 carries no existence info).
+``status != 403``: the ids below name resources that do not exist, so handlers
+typically 404 after the gate — which is exactly the point (the gate must fire
+*before* resource resolution so a 403 carries no existence info).
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -55,9 +55,17 @@ from tests.auth_fixtures import (
 )
 
 _TENANT = DEFAULT_DEV_TENANT_ID
-_TID = uuid4()
-_RID = uuid4()
-_IMG = uuid4()
+# Fixed, NOT ``uuid4()`` — these ids get interpolated into the endpoint paths
+# below, and the paths become the ``parametrize`` ids. A fresh random value per
+# collection makes the test ids non-deterministic, which breaks anything that
+# compares two collections: ``pytest-xdist`` refuses to run outright
+# ("Different tests were collected between gw0 and gw1"), and ``--lf`` /
+# ``-k`` / CI report diffing all silently stop matching. The values themselves
+# are arbitrary — every case here asserts a 403 from the scope gate, which is
+# reached before any lookup, so these resources need not exist.
+_TID = UUID("00000000-0000-4000-8000-000000000001")
+_RID = UUID("00000000-0000-4000-8000-000000000002")
+_IMG = UUID("00000000-0000-4000-8000-000000000003")
 
 # (method, path, request-kwargs) — every session-plane endpoint, grouped by
 # the scope class its route dependency requires.

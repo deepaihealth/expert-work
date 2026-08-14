@@ -80,13 +80,20 @@ jobs:
     # Unit-only path; ``integration`` marker (testcontainers Postgres /
     # MinIO / pgbouncer compose) runs in the separate ``test-integration``
     # job so a slow Docker image pull on the runner never gates the PR.
-    # 40min: this ceiling has now been hit twice. 10min → 20min (2026-07,
-    # suite at ~9m35s / 5222 tests); by 2026-08-11 main itself was running
-    # 17m50s-18m21s — under 2min of headroom — and one main run was already
-    # cancelled at the finish line. Raising the cap is a stopgap, not a fix:
-    # the real one is parallelising the suite (pytest-xdist ``-n auto`` on
-    # the 4-core runner), which needs the fixtures audited for parallel
-    # safety first. Tracked as a follow-up.
+    # History: 10min → 20min (2026-07, suite at ~9m35s / 5222 tests) → 40min
+    # (2026-08-11, main itself running 17m50s-18m21s with one run already
+    # cancelled at the finish line). Both raises were stopgaps.
+    #
+    # 2026-08-14 — the real fix landed: ``-n auto`` (pytest-xdist) below.
+    # Measured on 7621 unit tests: 12m47s serial → 3m28s at -n 4 locally,
+    # so this job should come in around 5min. The cap stays at 40 as pure
+    # headroom; it is no longer load-bearing.
+    #
+    # The long-assumed blocker ("needs the fixtures audited for parallel
+    # safety first") turned out not to exist: zero fixtures needed changing.
+    # What actually blocked xdist was two modules interpolating ``uuid4()``
+    # into their parametrize ids, so every worker collected a different test
+    # set. Keep parametrize ids deterministic.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
@@ -106,7 +113,10 @@ jobs:
       - name: Run pytest (unit)
         # --timeout: a hung test (e.g. uvicorn SSE shutdown) fails fast + names
         # itself instead of hanging the job until the 10-min cancel.
-        run: uv run pytest -v -m "not integration" --timeout=120 --timeout-method=thread
+        # -n auto: one worker per runner core (see timeout-minutes above).
+        # Dropped -v: with workers interleaving, per-test lines lose their
+        # ordering anyway, and 7621 of them bury the failure summary.
+        run: uv run pytest -m "not integration" -n auto --timeout=120 --timeout-method=thread
 
   test-integration:
     name: Test (integration)

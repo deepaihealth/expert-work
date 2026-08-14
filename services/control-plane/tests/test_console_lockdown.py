@@ -39,8 +39,16 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
-_TID = uuid4()
-_RID = uuid4()
+# Fixed, NOT ``uuid4()`` — these ids get interpolated into the endpoint paths
+# below, which become the ``parametrize`` ids. A fresh random value per
+# collection makes the test ids non-deterministic, so ``pytest-xdist`` refuses
+# to run ("Different tests were collected between gw0 and gw1") and ``--lf`` /
+# ``-k`` / CI report diffing silently stop matching. The values are arbitrary:
+# every case asserts the plane gate fires *before* resource resolution, so
+# these resources need not exist. (``uuid4()`` inside test bodies is fine —
+# only module-level values that reach a parametrize id matter.)
+_TID = UUID("00000000-0000-4000-8000-000000000011")
+_RID = UUID("00000000-0000-4000-8000-000000000012")
 
 CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     ("GET", "/v1/sessions"),
