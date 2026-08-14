@@ -898,7 +898,14 @@ uv run mypy <CI 里的同款范围——照 .github/workflows/ci.yml 抄,别自�
 
 - [ ] **Step 3:前端全量**
 
-Run: `cd apps/admin-ui && pnpm vitest run && pnpm tsc --noEmit && pnpm build`
+Run: `cd apps/admin-ui && pnpm vitest run && pnpm typecheck && pnpm build`
+
+> **⚠️ 本节初稿写的 `pnpm tsc --noEmit` 是假绿(Task 6 实施实证,2026-08-14)。**
+> `apps/admin-ui/tsconfig.json` 是 solution 文件(`files: []` + references),
+> **裸 `tsc --noEmit` 一个源文件都不检查,永远退出 0**。要走 references 必须带 `-b`,
+> 也就是 `pnpm typecheck`(`tsc -b --noEmit`)。
+> 实证:删掉 `GanttTimeline.tsx` 一个必需 prop → `tsc --noEmit` 退出 0,
+> `pnpm typecheck` 报 TS2741。Task 6 实施时真被这条绿灯放过一次,`pnpm build` 才逮住。
 
 - [ ] **Step 4:开 PR**
 
@@ -906,9 +913,11 @@ PR 描述要列出:
 
 - 四条缺陷各自的**会红条件**与对应测试、变异自证的结果。
 - 前端 `end` 消费点的核查结论(实测是 **10 处**,不是本计划初稿写的 6 处)。
-- 两处对 spec 的增补及其理由:`truncated` 帧(浏览器 `EventSource` 读不到响应头,
-  只给 header 的信号对一整类客户端不可用)、`gap` 帧(缺口天然有界,且把状况交给
-  客户端判断而不是服务端积累无上限的记账)。
+- 两处对 spec 的增补及其理由:`truncated` 帧(**中间代理会剥掉不认识的响应头**,
+  body 里的帧不会被剥;跨源时该头还需服务端 expose,浏览器侧基本读不到 ——
+  **不许写成"浏览器 EventSource 读不到响应头"**,EventSource 设不了
+  `Authorization` / API-key 头,本来就用不了这套 API)、`gap` 帧(缺口天然有界,
+  且把状况交给客户端判断而不是服务端积累无上限的记账)。
 - **发号权归 bridge 这个架构裁定**及其依据(Redis Streams / Kafka / LangGraph Platform
   一致的做法:发号权归日志不归生产者),以及它删掉了哪些东西(pending 重排窗口、
   missing 名单、`_REORDER_WINDOW`、两个泄压维度)。
