@@ -232,9 +232,23 @@ async def test_admission_gate_rejects_new_run_on_disabled_agent(ctx: _Ctx) -> No
 @pytest.mark.asyncio
 async def test_external_run_gate_rejects_disabled_agent(ctx: _Ctx) -> None:
     await ctx.client.post("/v1/agents/support-bot/disable", json={})
+    # External-API-v1 P2-b security fix (external_only()) — the external run
+    # endpoint is now service-account-only, unlike the rest of this file's
+    # calls (``/v1/agents/support-bot/disable``, ``/v1/sessions``), which are
+    # genuinely console-plane and must keep using ``ctx.client``'s employee
+    # JWT. A dedicated service-account key for just this call, not a fixture
+    # flip — flipping ``ctx`` would 403 this file's console calls instead.
+    external_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("write",),
+    )
     resp = await ctx.client.post(
         "/v1/agents/support-bot/runs",
         json={"user_id": "cust-1", "input": "hi", "mode": "queue"},
+        headers={"Authorization": f"Bearer {external_jwt}"},
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["error"]["code"] == "AGENT_DISABLED"

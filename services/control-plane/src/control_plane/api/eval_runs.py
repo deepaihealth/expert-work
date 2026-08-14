@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.api._authz import console_only
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -87,7 +88,9 @@ class _EnqueueBody(BaseModel):
 
 def build_eval_runs_router() -> APIRouter:
     """Enqueue + read eval runs."""
-    router = APIRouter(prefix="/v1/eval-runs", tags=["eval"])
+    router = APIRouter(
+        prefix="/v1/eval-runs", tags=["eval"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("", response_model=None)
     async def list_runs(

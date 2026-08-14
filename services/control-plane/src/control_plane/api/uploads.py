@@ -98,6 +98,41 @@ def _safe_workspace_name(filename: str, ext: str) -> str:
     return f"{_UPLOAD_DIR}/{stem[:120]}{ext}"
 
 
+def is_safe_document_upload_id(value: str) -> bool:
+    """Is ``value`` a shape ``_safe_workspace_name`` could actually have
+    produced — i.e. ``{_UPLOAD_DIR}/<safe-leaf>``?
+
+    Every document ``upload_id`` this service hands back to a caller (console
+    or external — see ``_handle_document_upload`` / ``external_uploads.py``)
+    is exactly ``_safe_workspace_name(...)``'s return value, which is
+    *always* ``uploads/<stem><ext>`` — it is never a bare filename. A run
+    request's ``upload_id`` is untrusted client input from a *separate*
+    request (the upload and the run are two independent calls), so it must
+    be re-validated here rather than trusted — but the validation rule has
+    to accept the one shape that is actually legitimate, or every real
+    upload becomes unusable.
+
+    Colocated with (and reusing the regex from) ``_safe_workspace_name`` on
+    purpose: the generator and the validator living in different files is
+    exactly how these two rules would drift apart, and the drift is the
+    hole. Callers elsewhere (e.g. the external run endpoint) must import
+    this function rather than re-implement the shape check.
+
+    Rule: must start with ``{_UPLOAD_DIR}/``; what remains after the prefix
+    must be a single leaf — non-empty, no ``/`` or ``\\``, not ``.`` or
+    ``..`` — whose characters are all in ``_SAFE_STEM_RE``'s allowed set
+    (blocks NUL and anything else ``_safe_workspace_name`` could never have
+    emitted).
+    """
+    prefix = f"{_UPLOAD_DIR}/"
+    if not value.startswith(prefix):
+        return False
+    leaf = value[len(prefix) :]
+    if not leaf or "/" in leaf or "\\" in leaf or leaf in {".", ".."}:
+        return False
+    return _SAFE_STEM_RE.search(leaf) is None
+
+
 def _reject_zip_bomb(raw: bytes, ext: str) -> None:
     """Raise 400/413 if a ZIP-container document is malformed or a bomb.
 

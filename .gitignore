@@ -41,3 +41,6 @@ eval-out/
 
 # git worktrees for parallel SDD waves (never part of the tree itself)
 .worktrees/
+
+# SDD 工作区(brief / report / review package)——本地脚手架,不进仓库
+.superpowers/

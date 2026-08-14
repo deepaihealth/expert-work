@@ -46,5 +46,8 @@ class ThreadMeta(BaseModel):
     )
     agent_name: str | None = Field(default=None, description="manifest name")
     agent_version: str | None = Field(default=None, description="manifest version (semver)")
+    message_count: int | None = Field(
+        default=None, description="第三方可见口径的消息条数;None=尚未算过"
+    )
     created_at: datetime | None = None
     updated_at: datetime | None = None

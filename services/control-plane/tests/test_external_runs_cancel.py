@@ -49,7 +49,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import (
     InMemoryRunEventStore,
     InMemoryRunStore,
@@ -149,7 +149,17 @@ async def ctx() -> AsyncIterator[_Ctx]:
         run_event_repo=run_event_store,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — the external
+    # plane is now service-account-only; this file's employee JWT was a
+    # borrowed fixture (predates the gate), not a deliberate test of
+    # console-JWT access.
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
@@ -242,7 +252,7 @@ async def test_cancel_stops_a_still_queued_run(ctx: _Ctx) -> None:
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
@@ -277,7 +287,7 @@ async def test_cancel_404s_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:cancel",
@@ -296,7 +306,7 @@ async def test_cancel_404s_for_another_agent(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
 
     resp = await ctx.client.post(
         f"/v1/agents/other-bot/runs/{run_id}:cancel",

@@ -1327,6 +1327,10 @@ async def test_run_queue_mode_returns_202(runs_client: AsyncClient) -> None:
     assert body["status"] == "queued"
     assert body["thread_id"] == thread_id
     assert "run_id" in body
+    # External-API-v1 P2-a Task 15 — the console call site never opts into
+    # the {success, data, error} envelope (admin-ui consumes this flat shape
+    # directly), so the body must be EXACTLY these three keys — no wrapping.
+    assert set(body) == {"run_id", "thread_id", "status"}
     # Not an SSE stream — a plain JSON envelope.
     assert response.headers["content-type"].startswith("application/json")
 

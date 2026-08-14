@@ -27,8 +27,9 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
+from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -130,7 +131,17 @@ async def ctx() -> AsyncIterator[_Ctx]:
         run_event_repo=run_event_store,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — this file's whole
+    # point is proving the external plane works for a machine caller; the
+    # employee JWT here was a borrowed-fixture incidental, not a deliberate
+    # test of console-JWT access (this file predates the gate).
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
@@ -163,7 +174,7 @@ async def test_sessions_list_only_returns_this_users_sessions(ctx: _Ctx) -> None
     # Queue-mode 202 carries the thread id in the body, not the
     # ``X-Expert-Work-Session-Id`` header (that's only set on the SSE path —
     # see runs.py:spawn_run's queue-mode branch, out of this task's scope).
-    assert sessions[0]["session_id"] == a.json()["thread_id"]
+    assert sessions[0]["session_id"] == a.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -196,7 +207,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert pending_run.status_code == 202, pending_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(pending_run.json()["run_id"]),
+        run_id=UUID(pending_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.PENDING,
         updated_at=datetime.now(UTC),
@@ -209,7 +220,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
         headers=ctx.headers,
     )
     assert queued_run.status_code == 202, queued_run.text
-    assert queued_run.json()["status"] == "queued"
+    assert queued_run.json()["data"]["status"] == "queued"
 
     running_run = await ctx.client.post(
         "/v1/agents/support-bot/runs",
@@ -218,7 +229,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert running_run.status_code == 202, running_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(running_run.json()["run_id"]),
+        run_id=UUID(running_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.RUNNING,
         updated_at=datetime.now(UTC),
@@ -231,7 +242,7 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert done_run.status_code == 202, done_run.text
     await ctx.run_store.set_status(
-        run_id=UUID(done_run.json()["run_id"]),
+        run_id=UUID(done_run.json()["data"]["run_id"]),
         tenant_id=ctx.tenant_id,
         status=RunStatus.SUCCESS,
         updated_at=datetime.now(UTC),
@@ -245,10 +256,10 @@ async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> Non
     )
     assert resp.status_code == 200, resp.text
     by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
-    assert by_id[pending_run.json()["thread_id"]]["running"] is True
-    assert by_id[queued_run.json()["thread_id"]]["running"] is True
-    assert by_id[running_run.json()["thread_id"]]["running"] is True
-    assert by_id[done_run.json()["thread_id"]]["running"] is False
+    assert by_id[pending_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[queued_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[running_run.json()["data"]["thread_id"]]["running"] is True
+    assert by_id[done_run.json()["data"]["thread_id"]]["running"] is False
 
 
 @pytest.mark.asyncio
@@ -285,7 +296,7 @@ async def test_messages_404_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    session_id = started.json()["thread_id"]
+    session_id = started.json()["data"]["thread_id"]
     resp = await ctx.client.get(
         f"/v1/agents/support-bot/sessions/{session_id}/messages",
         params={"user_id": "someone-else"},
@@ -313,7 +324,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    session_id = started.json()["thread_id"]
+    session_id = started.json()["data"]["thread_id"]
     await _seed_thread_messages(
         checkpointer,
         session_id,
@@ -341,11 +352,37 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
     assert body["success"] is True
     # Hidden scaffolding dropped; role/content/channel mapped straight off
     # ``read_turns`` — proves this isn't the ``checkpointer is None`` stub path.
+    # None of these messages carry a P2 stamp, so created_at/run_id must come
+    # back null — pre-stamp history is never backfilled.
     assert body["data"]["messages"] == [
-        {"role": "user", "content": "turn1 user", "channel": None},
-        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
-        {"role": "user", "content": "turn2 user", "channel": None},
-        {"role": "assistant", "content": "turn2 assistant", "channel": "final"},
+        {
+            "role": "user",
+            "content": "turn1 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "assistant",
+            "content": "turn1 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "user",
+            "content": "turn2 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "assistant",
+            "content": "turn2 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
     ]
 
     # Pagination slices the (already hidden-filtered) turn list.
@@ -356,6 +393,344 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
     )
     assert paged.status_code == 200, paged.text
     assert paged.json()["data"]["messages"] == [
-        {"role": "assistant", "content": "turn1 assistant", "channel": "final"},
-        {"role": "user", "content": "turn2 user", "channel": None},
+        {
+            "role": "assistant",
+            "content": "turn1 assistant",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
+        {
+            "role": "user",
+            "content": "turn2 user",
+            "channel": None,
+            "created_at": None,
+            "run_id": None,
+        },
     ]
+
+
+@pytest.mark.asyncio
+async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
+    """P2 Task 5: stamped messages must surface ``created_at``/``run_id`` on
+    the external endpoint, and a corrupt stamp on one message must not take
+    down the whole session's read.
+
+    Seeds real ``additional_kwargs`` stamps (not a hand-rolled ``MessageTurn``)
+    so this exercises the actual ``extract_turns`` parsing path end to end —
+    a test that only checked the field existed without ever setting a stamp
+    would pass even if the parser were a no-op.
+    """
+    await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    session_id = started.json()["data"]["thread_id"]
+    stamped_at = datetime(2026, 8, 12, 1, 2, 3, tzinfo=UTC)
+    run_id = uuid4()
+    await _seed_thread_messages(
+        checkpointer,
+        session_id,
+        [
+            HumanMessage(
+                content="stamped question",
+                additional_kwargs={
+                    STAMP_CREATED_AT: stamped_at.isoformat(),
+                    STAMP_RUN_ID: str(run_id),
+                },
+            ),
+            # Corrupt stamp on this one message must degrade to null, not
+            # blow up the whole session's read.
+            AIMessage(
+                content="stamped answer",
+                additional_kwargs={
+                    STAMP_CREATED_AT: "not-a-timestamp",
+                    STAMP_RUN_ID: "not-a-uuid",
+                },
+            ),
+        ],
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    messages = resp.json()["data"]["messages"]
+    assert messages == [
+        {
+            "role": "user",
+            "content": "stamped question",
+            "channel": None,
+            "created_at": stamped_at.isoformat(),
+            "run_id": str(run_id),
+        },
+        {
+            "role": "assistant",
+            "content": "stamped answer",
+            "channel": "final",
+            "created_at": None,
+            "run_id": None,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_exposes_message_count(ctx: _Ctx) -> None:
+    """Task 8: ``thread_meta.message_count`` (written by run finalization's
+    ``include_hidden=False`` recount — out of this task's scope, only read
+    here) must round-trip into the external sessions list response.
+
+    Seeds a distinctive non-zero value (7) rather than 0 — ``ThreadMeta``
+    already defaults ``message_count`` to 0 on creation
+    (``thread_meta/memory.py:49``), so asserting ``== 0`` here would pass
+    even if the field were never wired through the endpoint at all.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    thread_id = UUID(started.json()["data"]["thread_id"])
+    updated = await ctx.app.state.thread_meta_repo.update_message_count(
+        thread_id, 7, tenant_id=ctx.tenant_id
+    )
+    assert updated is True
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"]["sessions"][0]
+    assert "message_count" in item
+    assert item["message_count"] == 7
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_message_count_null_when_never_computed(ctx: _Ctx) -> None:
+    """A session whose run has never reached finalization has
+    ``message_count IS NULL`` ("not yet computed") — the column has no
+    ``server_default`` precisely so this is distinguishable from ``0``
+    ("computed, genuinely empty"; ``0144_thread_meta_msg_count.py``). The
+    response must serialize this as JSON ``null`` with the key present, not
+    omit the field and not coerce it to ``0``.
+
+    ``ThreadMetaStore.create()`` always writes ``0`` and
+    ``update_message_count()`` only accepts ``int`` (by design — its
+    docstring: "callers should never write 0 to mean not yet computed")
+    — there is no public API to put a row back into the NULL state, so
+    this reaches into the in-memory store's row dict directly, the same
+    way ``test_runs_api.py``/``test_resume_idempotency_flow.py`` do for
+    states with no public writer.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    thread_id = UUID(started.json()["data"]["thread_id"])
+    repo = ctx.app.state.thread_meta_repo
+    row = await repo.get(thread_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    repo._rows[thread_id] = row.model_copy(update={"message_count": None})
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["data"]["sessions"][0]
+    assert "message_count" in item
+    assert item["message_count"] is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_list_message_count_distinguishes_null_from_zero(ctx: _Ctx) -> None:
+    """Both states in the same response: one session genuinely computed to
+    0 (an agent run that finalized with no visible turns — the default
+    ``ThreadMeta.create()`` leaves in place), one never computed (``None``,
+    seeded the same way as the previous test). A regression that collapsed
+    either state into the other — e.g. hard-coding the field, or a stray
+    ``count or 0`` — would pass a test that only ever inspected one session
+    in isolation; asserting both in the same list catches it.
+    """
+    await ctx.seed_agent()
+    computed_zero = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert computed_zero.status_code == 202, computed_zero.text
+    never_computed = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert never_computed.status_code == 202, never_computed.text
+    never_computed_id = UUID(never_computed.json()["data"]["thread_id"])
+    repo = ctx.app.state.thread_meta_repo
+    row = await repo.get(never_computed_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    repo._rows[never_computed_id] = row.model_copy(update={"message_count": None})
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    by_id = {s["session_id"]: s for s in resp.json()["data"]["sessions"]}
+    assert by_id[computed_zero.json()["data"]["thread_id"]]["message_count"] == 0
+    assert by_id[never_computed.json()["data"]["thread_id"]]["message_count"] is None
+
+
+# ---------------------------------------------------------------------------
+# External-API-v1 P2-b Task 3 — rename / archive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rename_session(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "cust-77", "title": "改过的标题"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+
+    listed = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"]["sessions"][0]["title"] == "改过的标题"
+
+
+@pytest.mark.asyncio
+async def test_rename_blank_title_is_422(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "cust-77", "title": "   "},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "INVALID_TITLE"
+
+
+@pytest.mark.asyncio
+async def test_rename_foreign_session_is_404(ctx: _Ctx) -> None:
+    """Renaming someone else's session must 404 — never 403 — so a third
+    party cannot distinguish "not yours" from "doesn't exist"."""
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.patch(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        json={"user_id": "someone-else", "title": "偷改"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "SESSION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_archive_session_hides_from_list(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    resp = await ctx.client.delete(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["success"] is True
+
+    listed = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"]["sessions"] == []
+
+
+@pytest.mark.asyncio
+async def test_archive_requires_at_least_write_scope(ctx: _Ctx) -> None:
+    """A ``read``-only key cannot archive — archive is gated on ``"write"``
+    (same tier as ``rename_session``), not the console side's ``"delete"``
+    (User decision 2026-08-13: an external ``"delete"`` gate maps only to an
+    ``admin``-scoped key — ``rbac.py``'s OPERATOR grant for ``session`` has
+    no ``delete`` — which would force a third party to hold a key that can
+    also rewrite service accounts / role bindings just to archive a
+    session). This still proves the endpoint isn't open to every key: a
+    ``read``-only (VIEWER) principal must be refused.
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    session_id = started.json()["data"]["thread_id"]
+
+    read_only_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-read-only",
+        sub_type="service_account",
+        roles=(),
+        scopes=("read",),
+    )
+    resp = await ctx.client.delete(
+        f"/v1/agents/support-bot/sessions/{session_id}",
+        params={"user_id": "cust-77"},
+        headers={"Authorization": f"Bearer {read_only_jwt}"},
+    )
+    assert resp.status_code == 403, resp.text

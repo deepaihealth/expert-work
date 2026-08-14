@@ -24,7 +24,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, ApprovalRecord, ApprovalStatus, Role
+from expert_work.protocol import AgentSpec, ApprovalRecord, ApprovalStatus
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -75,12 +75,18 @@ class _Ctx:
         app: Any,
         tenant_id: UUID,
         headers: dict[str, str],
+        console_headers: dict[str, str],
         run_store: InMemoryRunStore,
     ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
+        #: Employee JWT. ``headers`` above is a service account, which
+        #: ``console_only()`` bars from the console plane — so a test that
+        #: needs a *console* route (e.g. the kill switch) as a setup step
+        #: must use this one. See the fixture for why both exist.
+        self.console_headers = console_headers
         self.run_store = run_store
 
     async def seed_agent(self) -> None:
@@ -105,11 +111,33 @@ async def ctx() -> AsyncIterator[_Ctx]:
         run_event_repo=run_event_store,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — the external
+    # plane is now service-account-only; this file's employee JWT was a
+    # borrowed fixture (predates the gate), not a deliberate test of
+    # console-JWT access.
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
+    # External-API-v1 P2-b console lockdown — the kill switch
+    # (``POST /v1/agents/{name}/disable``) is a console route and now carries
+    # ``console_only()``, so the service account above cannot reach it. Setup
+    # steps that go through the console use this employee identity instead.
+    console_jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="employee-test",
+        sub_type="user",
+        roles=("admin",),
+        scopes=(),
+    )
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, run_store)
+        yield _Ctx(client, app, tenant_id, headers, console_headers, run_store)
 
 
 @pytest.mark.asyncio
@@ -120,7 +148,7 @@ async def test_decide_404s_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "someone-else", "decision": "approve"},
@@ -138,7 +166,7 @@ async def test_decide_rejects_modified_args_without_modify(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "approve", "modified_args": {"x": 1}},
@@ -155,7 +183,7 @@ async def test_decide_requires_modified_args_for_modify(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "modify"},
@@ -172,7 +200,7 @@ async def test_decide_404s_when_no_pending_approval(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/{run_id}:decide",
         json={"user_id": "cust-77", "decision": "approve"},
@@ -209,7 +237,7 @@ async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
         headers=ctx.headers,
     )
     assert started.status_code == 202, started.text
-    body = started.json()
+    body = started.json()["data"]
     run_id = UUID(body["run_id"])
     thread_id = UUID(body["thread_id"])
 
@@ -336,7 +364,9 @@ async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ct
     """
     run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
 
-    disable = await ctx.client.post("/v1/agents/support-bot/disable", json={}, headers=ctx.headers)
+    disable = await ctx.client.post(
+        "/v1/agents/support-bot/disable", json={}, headers=ctx.console_headers
+    )
     assert disable.status_code == 200, disable.text
 
     resp = await ctx.client.post(

@@ -89,6 +89,28 @@ async def _seed_agent_private(app: FastAPI, *, name: str) -> str:
     return str(skill_id)
 
 
+def _role_headers(role: str) -> dict[str, str]:
+    """JWT headers for a non-admin employee (``viewer`` / ``operator``).
+
+    Unlike ``test_skills_api.py``'s helper of the same name, the subject
+    must be a real UUID here — ``approve``/``reject`` resolve the decider
+    via ``_actor_uuid(request)``, which 403s with a *different* reason
+    ("a user identity is required to decide") for a non-UUID subject,
+    which would mask the SE-8 owner-gate 403 these tests are asserting on.
+    """
+    token = make_test_jwt(tenant_id=_TENANT, subject=str(uuid4()), roles=(role,))
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _seed_tenant_skill(client: AsyncClient, *, name: str) -> str:
+    """Create an ordinary ``tenant``-visibility skill (v1) through the public
+    admin-UI endpoints — the SE-8 owner gate must never touch this path."""
+    create = await client.post("/v1/skills", json={"name": name})
+    skill_id = create.json()["id"]
+    await client.post(f"/v1/skills/{skill_id}/versions", json={"prompt_fragment": "public prompt"})
+    return str(skill_id)
+
+
 @pytest.mark.asyncio
 async def test_request_review_approve_flow(setup: Setup) -> None:
     client, app, audit_store = setup
@@ -285,3 +307,286 @@ async def test_global_kill_switch_system_admin() -> None:
         g = (await c.get("/v1/skill-evolution/kill-switch")).json()
         assert g["global"]["engaged"] is True
         assert g["effective_halted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Backlog task 7 (security fix, spec/external-api-v1-p2b) — SE-8 owner gate,
+# the three routes task 6's fix missed (C-1 / I-1) plus one found during this
+# task's exhaustive scan (C-3, not in the brief).
+#
+# C-1: ``GET .../lineage`` reused ``skills.py``'s ``_version_dict`` serializer
+# (which carries ``prompt_fragment`` — full skill content) with zero owner
+# check. I-1: ``GET .../eval-results`` leaked an agent_private skill's
+# existence + performance metadata (no content) to any employee who can
+# guess/enumerate its id. C-3: ``POST .../promote-requests`` and
+# ``.../approve|reject`` operate on the target skill with no owner check at
+# all — and ``approve`` flips visibility ``agent_private`` → ``tenant``
+# *unconditionally* (``SkillStore.approve_skill_promote``), so a non-admin
+# could permanently de-privatize someone else's private skill via
+# request+approve. This router has no ``require(role, ...)`` check anywhere
+# (only ``console_only()``, which blocks service accounts, not employee
+# roles) — the SE-8 owner gate is the only thing standing between a viewer
+# JWT and every one of these actions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_lineage_403_for_non_admin_employee(setup: Setup, role: str) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"lineage-priv-{role}")
+    headers = _role_headers(role)
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/lineage", headers=headers)
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+    # The leak this gate closes: the private prompt body must not be
+    # anywhere in the response, in any shape.
+    assert "do the thing" not in r.text
+    assert "prompt_fragment" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_lineage_admin_not_forbidden(setup: Setup) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name="lineage-priv-admin")
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/lineage")
+    assert r.status_code == 200, r.text
+    assert r.json()["versions"][0]["prompt_fragment"] == "do the thing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_lineage_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    """Regression guard (biggest risk of this change) — an ordinary
+    tenant-visibility skill's lineage must stay readable by any employee."""
+    client, _, _ = setup
+    sid = await _seed_tenant_skill(client, name=f"lineage-tenant-{role}")
+    headers = _role_headers(role)
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/lineage", headers=headers)
+    assert r.status_code == 200, f"{role}: {r.status_code} {r.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_eval_results_403_for_non_admin_employee(setup: Setup, role: str) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"eval-priv-{role}")
+    await app.state.skill_store.record_eval_result(
+        result=SkillEvalResult(
+            id=uuid4(),
+            tenant_id=_TENANT,
+            skill_id=sid,  # type: ignore[arg-type]
+            skill_version=1,
+            baseline_score=0.4,
+            skill_score=0.85,
+            delta=0.45,
+            n_cases=12,
+            replay_source="trajectory",
+            verdict="pass",
+            created_at=datetime.now(UTC),
+        )
+    )
+    headers = _role_headers(role)
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/eval-results", headers=headers)
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+    assert "pass" not in r.text
+
+
+@pytest.mark.asyncio
+async def test_eval_results_admin_not_forbidden(setup: Setup) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name="eval-priv-admin")
+    await app.state.skill_store.record_eval_result(
+        result=SkillEvalResult(
+            id=uuid4(),
+            tenant_id=_TENANT,
+            skill_id=sid,  # type: ignore[arg-type]
+            skill_version=1,
+            baseline_score=0.4,
+            skill_score=0.85,
+            delta=0.45,
+            n_cases=12,
+            replay_source="trajectory",
+            verdict="pass",
+            created_at=datetime.now(UTC),
+        )
+    )
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/eval-results")
+    assert r.status_code == 200, r.text
+    assert r.json()["items"][0]["verdict"] == "pass"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_eval_results_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    client, _, _ = setup
+    sid = await _seed_tenant_skill(client, name=f"eval-tenant-{role}")
+    headers = _role_headers(role)
+    r = await client.get(f"/v1/skill-evolution/skills/{sid}/eval-results", headers=headers)
+    assert r.status_code == 200, f"{role}: {r.status_code} {r.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_request_promote_403_for_non_admin_employee_agent_private(
+    setup: Setup, role: str
+) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"promote-priv-{role}")
+    headers = _role_headers(role)
+    r = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests",
+        json={"skill_version": 1},
+        headers=headers,
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+    # No row was written: an admin can still open a fresh request afterward
+    # without hitting the "one pending request per skill" 409 — proof the
+    # forbidden attempt did not create a promote_request row.
+    admin_retry = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    assert admin_retry.status_code == 201, admin_retry.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_approve_promote_403_for_non_admin_employee_agent_private(
+    setup: Setup, role: str
+) -> None:
+    """C-3's most severe case: ``approve`` flips visibility agent_private→
+    tenant unconditionally. A non-admin must not be able to de-privatize
+    someone else's private skill this way."""
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"approve-priv-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    headers = _role_headers(role)
+    r = await client.post(
+        f"/v1/skill-evolution/promote-requests/{rid}/approve", json={}, headers=headers
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+    # The write half of C-3: the skill must still be private.
+    skill = (await client.get(f"/v1/skills/{sid}")).json()
+    assert skill["visibility"] == "agent_private"
+    # ... and the request must still be pending (decision never committed).
+    q = await client.get("/v1/skill-evolution/promote-requests", params={"status": "pending"})
+    assert rid in [x["id"] for x in q.json()["items"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_reject_promote_403_for_non_admin_employee_agent_private(
+    setup: Setup, role: str
+) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"reject-priv-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    headers = _role_headers(role)
+    r = await client.post(
+        f"/v1/skill-evolution/promote-requests/{rid}/reject", json={}, headers=headers
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "SKILL_SCOPE_FORBIDDEN"
+    q = await client.get("/v1/skill-evolution/promote-requests", params={"status": "pending"})
+    assert rid in [x["id"] for x in q.json()["items"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_promote_flow_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    """Regression guard (biggest risk of this change) — the C-3 gate must not
+    touch the ordinary tenant-visibility promote flow. This matters more here
+    than elsewhere: the router has *no* role check of its own anywhere, so
+    the SE-8 owner gate is the only thing that could accidentally 403 a
+    legitimate non-admin governance action on a public skill."""
+    client, _, _ = setup
+    sid = await _seed_tenant_skill(client, name=f"promote-tenant-{role}")
+    headers = _role_headers(role)
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests",
+        json={"skill_version": 1},
+        headers=headers,
+    )
+    assert opened.status_code == 201, f"{role}: {opened.status_code} {opened.text}"
+    rid = opened.json()["id"]
+    approved = await client.post(
+        f"/v1/skill-evolution/promote-requests/{rid}/approve", json={}, headers=headers
+    )
+    assert approved.status_code == 200, f"{role}: {approved.status_code} {approved.text}"
+
+
+# ── list_promote_requests owner filter (backlog task 8) ────────────────────
+#
+# The review queue itself carried zero filtering: any employee (viewer,
+# operator) could see a promote-request targeting an ``agent_private`` skill
+# — skill_id, nominator (``requested_by_user_id``), reason, decision
+# timeline — confirming the private skill's existence even though they're
+# 403'd from every write on it. Admin opening such a request is the normal,
+# ongoing governance workflow (the "propose to tenant" button in
+# ``GovernancePanel.tsx``), not just pre-fix leftovers, so the list must
+# filter every read, not only ones from before a hypothetical cutoff.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_list_promote_requests_hides_agent_private_from_non_admin(
+    setup: Setup, role: str
+) -> None:
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name=f"list-priv-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    assert opened.status_code == 201, opened.text
+    rid = opened.json()["id"]
+
+    headers = _role_headers(role)
+    q = await client.get(
+        "/v1/skill-evolution/promote-requests", params={"status": "pending"}, headers=headers
+    )
+    assert q.status_code == 200, f"{role}: {q.status_code} {q.text}"
+    ids = [x["id"] for x in q.json()["items"]]
+    assert rid not in ids, f"{role}: leaked into {ids}"
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_admin_sees_agent_private(setup: Setup) -> None:
+    """Admin is unaffected by the backlog task 8 filter."""
+    client, app, _ = setup
+    sid = await _seed_agent_private(app, name="list-priv-admin")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    q = await client.get("/v1/skill-evolution/promote-requests", params={"status": "pending"})
+    assert q.status_code == 200
+    assert rid in [x["id"] for x in q.json()["items"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_list_promote_requests_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
+    """Regression guard against over-filtering — a request targeting an
+    ordinary tenant-visibility skill must stay visible to non-admin
+    employees."""
+    client, _, _ = setup
+    sid = await _seed_tenant_skill(client, name=f"list-tenant-{role}")
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    rid = opened.json()["id"]
+    headers = _role_headers(role)
+    q = await client.get(
+        "/v1/skill-evolution/promote-requests", params={"status": "pending"}, headers=headers
+    )
+    assert q.status_code == 200, f"{role}: {q.status_code} {q.text}"
+    assert rid in [x["id"] for x in q.json()["items"]], f"{role}: {q.json()['items']}"

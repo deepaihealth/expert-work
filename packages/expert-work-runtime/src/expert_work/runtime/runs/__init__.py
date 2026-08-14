@@ -20,6 +20,7 @@ from expert_work.runtime.runs.schemas import DisconnectMode as DisconnectMode
 from expert_work.runtime.runs.schemas import RunInfo as RunInfo
 from expert_work.runtime.runs.schemas import RunStatus as RunStatus
 from expert_work.runtime.runs.store import InMemoryRunStore as InMemoryRunStore
+from expert_work.runtime.runs.store import RunIdempotencyConflict as RunIdempotencyConflict
 from expert_work.runtime.runs.store import RunStore as RunStore
 from expert_work.runtime.runs.store import SqlRunStore as SqlRunStore
 
@@ -29,6 +30,7 @@ __all__ = [
     "InMemoryRunStore",
     "RunEventRecord",
     "RunEventStore",
+    "RunIdempotencyConflict",
     "RunInfo",
     "RunManager",
     "RunRecord",

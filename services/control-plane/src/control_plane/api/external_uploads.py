@@ -47,11 +47,12 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import JSONResponse
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import require
+from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_session,
+    reject_nul_path_params,
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
@@ -145,7 +146,11 @@ def _get_workspace_store(request: Request) -> WorkspaceStore | None:
 
 def build_external_uploads_router() -> APIRouter:
     """Mount the external upload endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
+    )
 
     @router.post("/{agent_code}/uploads", status_code=201, response_model=None)
     async def upload_for_user(

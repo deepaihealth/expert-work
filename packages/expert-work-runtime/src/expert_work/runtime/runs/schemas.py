@@ -104,6 +104,16 @@ class RunInfo:
     #: ``None`` for synchronous (SSE) runs and after a queued run is claimed
     #: (nulled out — the input then lives in the checkpoint / event log).
     enqueued_input: dict[str, Any] | None = None
+    #: External-API-v1 P2 block 1-C — the caller's ``Idempotency-Key``
+    #: header. ``None`` for runs created without it (the common case).
+    #: Unique per ``(tenant_id, idempotency_key)`` via a partial index on
+    #: ``agent_run`` (migration 0145) — that index is what makes "claim
+    #: the key" and "create the run row" the same atomic insert.
+    idempotency_key: str | None = None
+    #: A digest of the retried request's body, so a *reused* key sent with
+    #: a *different* body can be distinguished from a genuine retry.
+    #: ``None`` whenever ``idempotency_key`` is ``None``.
+    request_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,6 +10,7 @@ turn around and use it to call ``_AUTHN_CANARY_PATH`` (see below).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -34,15 +35,37 @@ _TENANT = DEFAULT_DEV_TENANT_ID
 
 #: Route used purely to answer "does this bearer authenticate?".
 #:
-#: Must stay an **authenticated but un-authorized** route: these four tests
-#: assert 200 / 401 to distinguish a live key from a revoked or expired one, so
-#: any authz gate on the target turns an authn regression into a silent pass
-#: (or, as happened, a false failure). It used to be ``GET /v1/agents``, which
-#: External-API-v1 P1 closed to API keys outright (``console_only()`` — the
-#: full manifest list is console data), making these tests read 403.
-#: ``GET /v1/agents/schema`` is the AgentSpec JSON Schema: the same static
-#: document for every caller, deliberately left open to API keys.
+#: **The judgement is 403-vs-401, not 200-vs-401.** History: this was
+#: ``GET /v1/agents`` until External-API-v1 P1 closed it to API keys
+#: (``console_only()``); it moved here, annotated "deliberately left open to
+#: API keys" — and P2's console lockdown closed this one too. Chasing a route
+#: that stays open to API keys is a losing game: the whole direction of travel
+#: is that *no* console route stays open to them.
+#:
+#: So the canary stops depending on that. ``console_only()``'s 403 is itself
+#: proof of authentication: it is raised only after ``_principal`` resolved an
+#: identity, and its ``detail.code``/``message`` are unique to that gate.
+#: A bearer that fails to authenticate never reaches it — ``AuthMiddleware``
+#: 401s first. The live-vs-dead distinction these tests need is therefore
+#: fully preserved, and now survives any future lockdown.
 _AUTHN_CANARY_PATH = "/v1/agents/schema"
+
+
+def _assert_bearer_authenticates(resp: Any) -> None:
+    """The canary answered "this bearer IS authenticated" (403 from
+    ``console_only()``, which only runs once an identity resolved)."""
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "FORBIDDEN", detail
+    # Pin the gate, not merely the status: a 403 from anywhere else would not
+    # prove the bearer authenticated.
+    assert "not available to API keys" in detail["message"], detail
+
+
+def _assert_bearer_does_not_authenticate(resp: Any) -> None:
+    """The canary answered "this bearer is NOT authenticated" (401 from
+    ``AuthMiddleware``, before any route dependency runs)."""
+    assert resp.status_code == 401, resp.text
 
 
 @pytest.fixture
@@ -235,7 +258,7 @@ async def test_admin_can_mint_api_key_and_then_use_it(
     response = await admin_client.get(
         _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
     )
-    assert response.status_code == 200
+    _assert_bearer_authenticates(response)
 
     page = await audit_store.query(AuditQuery(tenant_id=_TENANT))
     assert any(r.action is AuditAction.API_KEY_CREATE for r in page.entries)
@@ -275,7 +298,7 @@ async def test_revoked_api_key_no_longer_authenticates(
     pre = await admin_client.get(
         _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
     )
-    assert pre.status_code == 200
+    _assert_bearer_authenticates(pre)
 
     # Revoke.
     revoked = await admin_client.delete(f"/v1/api_keys/{key_id}", headers=_admin_headers())
@@ -285,7 +308,7 @@ async def test_revoked_api_key_no_longer_authenticates(
     post = await admin_client.get(
         _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {plaintext}"}
     )
-    assert post.status_code == 401
+    _assert_bearer_does_not_authenticate(post)
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +405,8 @@ async def test_api_key_rotation_double_active_during_grace(
     new_resp = await admin_client.get(
         _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {new_plaintext}"}
     )
-    assert old_resp.status_code == 200, "old bearer must still verify inside grace"
-    assert new_resp.status_code == 200, "new bearer must verify immediately"
+    _assert_bearer_authenticates(old_resp)  # old bearer must still verify inside grace
+    _assert_bearer_authenticates(new_resp)  # new bearer must verify immediately
 
 
 @pytest.mark.asyncio
@@ -414,8 +437,8 @@ async def test_api_key_rotation_old_rejected_after_grace_expires(
     new_resp = await admin_client.get(
         _AUTHN_CANARY_PATH, headers={"Authorization": f"Bearer {new_plaintext}"}
     )
-    assert old_resp.status_code == 401, "old bearer must die when grace=0"
-    assert new_resp.status_code == 200, "new bearer must work"
+    _assert_bearer_does_not_authenticate(old_resp)  # old bearer must die when grace=0
+    _assert_bearer_authenticates(new_resp)  # new bearer must work
 
 
 @pytest.mark.asyncio

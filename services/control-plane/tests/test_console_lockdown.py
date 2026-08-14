@@ -22,7 +22,14 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import (
+    AgentSpec,
+    AuditQuery,
+    PlatformAgentTemplateStatus,
+    PlatformAgentTemplateUpsert,
+    Role,
+    TenantPlan,
+)
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -57,6 +64,30 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
     ("GET", "/v1/workspace"),
     ("GET", "/v1/triggers"),
     ("GET", "/v1/skill-evolution/promote-requests"),
+    # Backlog Task 3 (security fix, spec/external-api-v1-p2) — the module's
+    # own docstring says it mirrors triggers' console_only() shape, but the
+    # gate itself was missing on all 5 routes; a zero-scope API key could
+    # register a delivery URL and receive every run.completed /
+    # artifact.saved event thereafter (an ongoing exfiltration channel, not
+    # just an over-broad read). Live probe here per the rationale above.
+    ("GET", "/v1/webhook-endpoints"),
+    # Backlog Task 5 (security fix, spec/external-api-v1-p2b) — six more
+    # prefixes landing across separate commits, one router file each
+    # (curation.py builds two routers): /v1/skills, /v1/knowledge,
+    # /v1/curation, /v1/eval-datasets, /v1/eval-runs, /v1/quality. All 42
+    # routes between them carried zero require(...)/console_only(); only
+    # ensure_tenant_scope/ensure_single_tenant_scope (which parse "which
+    # tenant", not "is this caller allowed"), so a zero-scope API key
+    # reached every one. One live probe per prefix, added alongside that
+    # prefix's own commit. The curation-candidate probe is the brief's
+    # worst case: it returns another end user's full conversation
+    # trajectory via TrajectoryReader with no owner check.
+    ("GET", "/v1/skills"),
+    ("GET", "/v1/knowledge/bases"),
+    ("GET", f"/v1/curation/candidates/{_TID}"),
+    ("GET", "/v1/eval-datasets"),
+    ("GET", "/v1/eval-runs"),
+    ("GET", "/v1/quality/scores"),
 ]
 
 #: Path prefixes that make up the console plane (Step 4's programmatic
@@ -80,6 +111,42 @@ CONSOLE_ENDPOINTS: list[tuple[str, str]] = [
 #: kill-switch engage/release writes) with no third-party story, which carried
 #: no ``require(...)`` at all — a zero-scope service-account key read all of it
 #: and could flip the kill-switch.
+#: Backlog Task 3 (security fix, spec/external-api-v1-p2) added
+#: /v1/webhook-endpoints — NOT to be confused with /v1/webhooks above: this is
+#: the outbound registration CRUD (``webhook_endpoints.py``), whose own
+#: docstring says it mirrors the triggers CRUD but was missing console_only()
+#: on all 5 routes. Locked as a whole prefix, same as /v1/triggers.
+#: Backlog Task 5 (security fix, spec/external-api-v1-p2b) — /v1/skills:
+#: zero RBAC on all 15 routes (see the CONSOLE_ENDPOINTS comment above for
+#: the full six-prefix batch this belongs to). skills.py's own inline role
+#: checks (``_require_subscribe_role``, and the ADMIN/SYSTEM_ADMIN branches
+#: inside PATCH for pinning/activating high-risk skills) are untouched and
+#: orthogonal — console_only() only closes the API-key axis; those checks
+#: still gate which *employee* role can do what.
+#: Backlog Task 5 (security fix, spec/external-api-v1-p2b) — /v1/knowledge:
+#: zero RBAC on all 12 routes (base + document CRUD, reindex/reingest,
+#: chunk read, retrieval test) — same shape as /v1/skills above.
+#: Backlog Task 5 also added /v1/curation and /v1/eval-datasets
+#: (``curation.py`` builds two routers, both zero-RBAC): candidate list/get/
+#: promote/dismiss (4 routes) + eval-dataset CRUD (5 routes). ``GET
+#: /v1/curation/candidates/{id}`` is the worst finding in this whole batch —
+#: it returns the full conversation trajectory (``messages``, via
+#: ``TrajectoryReader``) for *any* end user's candidate in the tenant, no
+#: owner filter, so any same-tenant credential — including a zero-scope API
+#: key — could read any end user's complete conversation verbatim.
+#: Backlog Task 5 also added /v1/eval-runs: zero RBAC on all 4 routes
+#: (list/enqueue/get/cases) — same shape as the rest of this batch.
+#: Backlog Task 5's last prefix: /v1/quality — zero RBAC on both routes
+#: (quality scores + drift alerts). Scores carry run_id/thread_id (can be
+#: traced back to a specific end-user conversation, though the content
+#: itself is a score + rationale, not the raw transcript); drift alerts are
+#: tenant-level aggregates with no per-session content. This closes the
+#: last of the six prefixes named in the CONSOLE_ENDPOINTS comment above —
+#: all 42 routes across skills/knowledge/curation/eval-datasets/eval-runs/
+#: quality now carry console_only(), verified by the structural self-audit
+#: below (test_every_console_route_carries_the_lockdown_dependency), which
+#: walks every live route under these prefixes and checks its dependency
+#: graph directly rather than relying on any hand-maintained route list.
 _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/sessions",
     "/v1/approvals",
@@ -90,7 +157,14 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/artifacts",
     "/v1/workspace",
     "/v1/triggers",
+    "/v1/webhook-endpoints",
     "/v1/skill-evolution",
+    "/v1/skills",
+    "/v1/knowledge",
+    "/v1/curation",
+    "/v1/eval-datasets",
+    "/v1/eval-runs",
+    "/v1/quality",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under
@@ -98,12 +172,24 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
 #: third-party plane. Closing that prefix wholesale would 403 the external
 #: surface, so these carry ``console_only()`` per route instead, and this
 #: table is what keeps the self-audit below from having a blind spot there
-#: (P1 final review, Critical C2: all five answered 200 to a zero-scope
-#: service-account key, and the ``rollback`` one is a **write**).
+#: (P1 final review, Critical C2: the original five answered 200 to a
+#: zero-scope service-account key, and the ``rollback`` one is a **write**).
+#:
+#: Backlog Task 2 (spec/external-api-v1-p2b) added the remaining eight:
+#: ``create_agent`` / ``list_templates`` / ``fork_template`` / ``get_agent`` /
+#: ``update_agent`` / ``delete_agent`` / ``disable_agent`` / ``enable_agent``
+#: previously relied on ``require(...)`` / ``ensure_resource_access(...)``
+#: alone (or, for ``fork_template``, nothing at all) — RBAC checks a
+#: ``write``- or ``admin``-scope API key satisfies via the OPERATOR/ADMIN
+#: role mapping (``rbac.py``), since API-key scopes stand in for roles. That
+#: was ``_SELF_GATED_AGENT_ROUTES`` below (now removed — every route under
+#: ``/v1/agents`` is classified console or external, no third bucket).
+#: ``GET /v1/agents/schema`` (``agent_schema.py``) also moved here from
+#: ``_OPEN_AGENT_ROUTES``, closing the last unclassified route.
 #:
 #: Add a console route under ``/v1/agents``? Add it here too — otherwise the
 #: audit cannot see it. ``test_agents_prefix_is_partitioned_exactly`` forces
-#: that: any ``/v1/agents`` route missing from all three tables fails it.
+#: that: any ``/v1/agents`` route missing from both tables fails it.
 _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/v1/agents"),
@@ -111,6 +197,15 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{name}/{version}/revisions/{revision}"),
         ("POST", "/v1/agents/{name}/{version}/revisions/{revision}/rollback"),
         ("GET", "/v1/agents/{agent_name}/{agent_version}/users"),
+        ("POST", "/v1/agents"),
+        ("GET", "/v1/agents/templates"),
+        ("POST", "/v1/agents/fork"),
+        ("GET", "/v1/agents/{name}/{version}"),
+        ("PUT", "/v1/agents/{name}/{version}"),
+        ("DELETE", "/v1/agents/{name}/{version}"),
+        ("POST", "/v1/agents/{name}/disable"),
+        ("POST", "/v1/agents/{name}/enable"),
+        ("GET", "/v1/agents/schema"),
     }
 )
 
@@ -128,39 +223,16 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/messages"),
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:decide"),
-    }
-)
-
-#: ``/v1/agents`` routes deliberately left open to API keys because they hold
-#: no tenant data and no per-tenant state: the AgentSpec JSON Schema is the
-#: same static document for every caller. Kept as an explicit third bucket so
-#: "open" is a decision recorded here, not a route that quietly fell through.
-_OPEN_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset({("GET", "/v1/agents/schema")})
-
-#: Routes under ``/v1/agents`` whose authorization lives inside the handler
-#: (``ensure_resource_access``) or on a ``require(...)`` dependency rather than
-#: on ``console_only()``. Read the bucket name precisely: these reject an
-#: **under-scoped** key, not every key. A zero-scope key gets 403 — but an
-#: ``admin``-scope key passes, because ``rbac._collect_roles`` maps that scope
-#: to ``Role.ADMIN``; measured on one: ``GET /v1/agents/templates`` → 200,
-#: ``POST /v1/agents/{name}/disable`` → 200, ``DELETE /v1/agents/{name}/{version}``
-#: → 204 (the agent really is deleted). That is the documented meaning of the
-#: ``admin`` scope ("never hand it to a third-party integrator — it is the whole
-#: tenant"), not a hole this table hides; it is spelled out because reading the
-#: bucket as "API keys cannot reach these" would make the key-reachable surface
-#: under ``/v1/agents`` look like exactly the eight external routes, and it is
-#: not. Listed so the partition test below stays exhaustive without claiming
-#: they are external.
-_SELF_GATED_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("POST", "/v1/agents"),
-        ("GET", "/v1/agents/templates"),
-        ("POST", "/v1/agents/fork"),
-        ("GET", "/v1/agents/{name}/{version}"),
-        ("PUT", "/v1/agents/{name}/{version}"),
-        ("DELETE", "/v1/agents/{name}/{version}"),
-        ("POST", "/v1/agents/{name}/disable"),
-        ("POST", "/v1/agents/{name}/enable"),
+        # P2-b — session rename / archive (external_sessions.py) and the
+        # workspace list / download mirror (external_workspace.py). All four
+        # are mounted on ``APIRouter(prefix="/v1/agents", tags=["external"])``
+        # and gated with ``Depends(require("session", ...))`` — never
+        # ``console_only()`` — so they belong to the third-party surface,
+        # same as the eight above.
+        ("PATCH", "/v1/agents/{agent_code}/sessions/{session_id}"),
+        ("DELETE", "/v1/agents/{agent_code}/sessions/{session_id}"),
+        ("GET", "/v1/agents/{agent_code}/workspace/files"),
+        ("GET", "/v1/agents/{agent_code}/workspace/file"),
     }
 )
 
@@ -255,12 +327,14 @@ class _Ctx:
         tenant_id: UUID,
         headers: dict[str, str],
         key_headers: dict[str, str],
+        audit_store: InMemoryAuditLogStore,
     ) -> None:
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
         self.key_headers = key_headers
+        self.audit_store = audit_store
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -274,11 +348,12 @@ async def ctx() -> AsyncIterator[_Ctx]:
     lifecycle.mark_ready()
     run_store = InMemoryRunStore()
     run_event_store = InMemoryRunEventStore()
+    audit_store = InMemoryAuditLogStore()
     app = create_app(
         settings=_build_settings(),
         lifecycle=lifecycle,
         jwt_verifier=build_test_jwt_verifier(),
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        audit_logger=build_default_audit_logger(audit_store),
         agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
         run_repo=run_store,
         run_event_repo=run_event_store,
@@ -302,7 +377,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     key_headers = {"Authorization": f"Bearer {key_jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, key_headers)
+        yield _Ctx(client, app, tenant_id, headers, key_headers, audit_store)
 
 
 @pytest.mark.asyncio
@@ -318,6 +393,26 @@ async def test_api_key_is_denied_on_the_console_plane(ctx: _Ctx, method: str, pa
     assert resp.json()["detail"]["message"] == (
         "console API is not available to API keys; use /v1/agents/{agent_code}/…"
     ), resp.text
+
+
+@pytest.mark.asyncio
+async def test_api_key_denial_audit_includes_the_denied_path(ctx: _Ctx) -> None:
+    """Backlog item 3 — the deny audit's ``resource_id`` was a constant
+    (``"console:api_key_denied"``) shared by every route this gate closes;
+    with nothing else distinguishing rows, a triage pass through the audit
+    log cannot tell which route a caller actually hit. ``details.path`` now
+    carries the real request path so rows are distinguishable.
+    """
+    resp = await ctx.client.get("/v1/sessions", headers=ctx.key_headers)
+    assert resp.status_code == 403, resp.text
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=ctx.tenant_id, limit=1000))
+    matches = [r for r in page.entries if r.resource_id == "console:api_key_denied"]
+    assert len(matches) == 1, [r.model_dump() for r in page.entries]
+    assert matches[0].details.get("path") == "/v1/sessions"
+    # resource_id itself must stay the stable constant — see the brief: it
+    # may already be relied on by queries/dashboards, only `details` is free.
+    assert matches[0].resource_id == "console:api_key_denied"
 
 
 @pytest.mark.asyncio
@@ -414,6 +509,14 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
     so five console routes under it were never audited by anything. A new
     route added here — either plane — now fails this test until someone
     decides which bucket it belongs in.
+
+    Backlog Task 2 (spec/external-api-v1-p2b) tightened this from four
+    buckets to two: every ``/v1/agents`` route is now either
+    ``_CONSOLE_ROUTES`` or ``_EXTERNAL_AGENT_ROUTES``, no third "open" or
+    "self-gated" class — the eight routes that used to tolerate an
+    ``ensure_resource_access(...)``/``require(...)``-only gate (reachable by
+    an ``admin``- or ``write``-scope API key) and the one genuinely-open
+    schema route all carry ``console_only()`` now.
     """
     app = create_app(
         settings=_build_settings(),
@@ -426,9 +529,7 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
         enable_curation_worker=False,
     )
     live = _agents_routes(app)
-    classified = (
-        _CONSOLE_ROUTES | _EXTERNAL_AGENT_ROUTES | _OPEN_AGENT_ROUTES | _SELF_GATED_AGENT_ROUTES
-    )
+    classified = _CONSOLE_ROUTES | _EXTERNAL_AGENT_ROUTES
     assert live - classified == set(), (
         f"unclassified /v1/agents routes — each needs a table: {sorted(live - classified)}"
     )
@@ -437,15 +538,9 @@ def test_agents_prefix_is_partitioned_exactly() -> None:
     )
     # The buckets must not overlap, or "console" and "external" could both
     # claim a route and the two assertions below would contradict silently.
-    buckets = [
-        _CONSOLE_ROUTES,
-        _EXTERNAL_AGENT_ROUTES,
-        _OPEN_AGENT_ROUTES,
-        _SELF_GATED_AGENT_ROUTES,
-    ]
-    for i, first in enumerate(buckets):
-        for second in buckets[i + 1 :]:
-            assert not (first & second), f"route classified twice: {sorted(first & second)}"
+    assert not (_CONSOLE_ROUTES & _EXTERNAL_AGENT_ROUTES), (
+        f"route classified twice: {sorted(_CONSOLE_ROUTES & _EXTERNAL_AGENT_ROUTES)}"
+    )
 
 
 @pytest.mark.asyncio
@@ -521,7 +616,7 @@ async def test_api_key_still_reaches_every_external_agents_route(
     """The head risk of a route-level lockdown under a shared prefix: catching
     the third-party plane in the blast radius.
 
-    Every one of the eight external routes must stay reachable to an API key.
+    Every one of the external routes must stay reachable to an API key.
     A missing body / query param answers 4xx here — that is fine and expected;
     what must never appear is 403, which is the only thing ``console_only()``
     can produce.
@@ -529,3 +624,122 @@ async def test_api_key_still_reaches_every_external_agents_route(
     await ctx.seed_agent()
     resp = await ctx.client.request(method, _concretize(path), headers=ctx.key_headers)
     assert resp.status_code != 403, f"{method} {path} → {resp.status_code} {resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# Backlog Task 2 (spec/external-api-v1-p2b) — the eight routes above already
+# get generic coverage from the two ``_CONSOLE_ROUTES``-parametrized tests
+# (an ``admin``-scope key is denied, an employee JWT is unaffected). These
+# pin the exact vulnerability shape the brief measured: a ``write``-scope key
+# (not ``admin`` — ``write`` maps to OPERATOR, which ``rbac.py`` grants
+# ``manifest: {read, write}``, the precise gap ``ensure_resource_access`` /
+# ``require("manifest", "write")`` alone left open) and, for
+# ``fork_template`` specifically, a **zero**-scope key (it carried no
+# authorization check of its own at all before this fix).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/agents/fork"),
+        ("POST", "/v1/agents/{name}/disable"),
+        ("GET", "/v1/agents/{name}/{version}"),
+        ("DELETE", "/v1/agents/{name}/{version}"),
+    ],
+)
+async def test_write_scope_key_is_denied_on_the_newly_gated_agents_routes(
+    ctx: _Ctx, method: str, path: str
+) -> None:
+    """``write`` scope maps to OPERATOR (``rbac.py: _collect_roles``), which is
+    granted ``manifest: {read, write}`` — exactly the role ``ensure_resource_
+    access`` / ``require("manifest", "write")`` alone let through before
+    ``console_only()`` closed this axis. Covers the brief's named-risky
+    subset: fork, disable (cancels every in-flight run for the agent), the
+    read side (``get_agent``), and delete.
+
+    DELETE is a special case, not this test's to prove: OPERATOR is NOT
+    granted ``manifest:delete`` (``rbac.py``), so a write-scope key 403s on
+    this route from RBAC alone — with or without ``console_only()`` on
+    ``delete_agent``. This instance therefore only confirms the write-scope
+    axis stays denied; it cannot, by itself, tell "the gate closed it" from
+    "OPERATOR never had delete" (that would be a reintroduced coincidence,
+    same shape as the pre-fix one). The causal proof that ``console_only()``
+    — not the coincidence — now guards DELETE belongs to
+    ``test_api_key_is_denied_on_the_console_routes_under_agents``: its
+    ``ctx.key_headers`` carries ``admin`` scope (→ ADMIN role, which DOES
+    have ``manifest:delete``), so removing ``console_only()`` from
+    ``delete_agent`` turns that test's DELETE case green→red, which this one
+    alone cannot.
+    """
+    await ctx.seed_agent()
+    write_scope_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-write-scope",
+        sub_type="service_account",
+        roles=(),
+        scopes=("write",),
+    )
+    write_scope_headers = {"Authorization": f"Bearer {write_scope_jwt}"}
+    resp = await ctx.client.request(method, _concretize(path), headers=write_scope_headers)
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_key_is_denied_on_fork_template(ctx: _Ctx) -> None:
+    """``fork_template`` carried no authorization dependency at all before
+    Backlog Task 2 — not ``require(...)``, not an in-handler
+    ``ensure_resource_access`` gate at the route-entry level (it does call
+    one, but only after loading the template and checking tier
+    entitlement) — so a zero-scope key reached further into the handler
+    than any other route on this router. ``console_only()`` now rejects it
+    before any of that runs.
+
+    A published, tier-affordable template is pre-seeded here (same shape as
+    ``tests/test_agents_fork.py``'s ``_upsert()``/``seed_template``) so the
+    403 below cannot be riding on the fixture's ``InMemoryPlatformAgentTemplateStore``
+    happening to be empty. Without a seed, pulling ``console_only()`` off
+    this route would 404 at the handler's step-1 template lookup (``base is
+    None``, ``api/agents.py``) before step 4's ``ensure_resource_access``
+    ever runs, and the bare ``== 403`` assertion would pass for that wrong
+    reason.
+
+    Seeding is not enough by itself, though — verified by mutation, not just
+    read off the source: a zero-scope key that reaches step 4 gets denied
+    there too (no role, no binding — same final 403 as ``console_only()``
+    would have produced), so a bare status-code assertion stays green with
+    or without the gate; that is the exact tautology the seed was meant to
+    close, just moved one step deeper. Pinning the denial **message**, the
+    same idiom the other console-plane tests in this module use, is what
+    actually discriminates: only ``console_only()`` produces this pointer
+    text — strip it and the 403 survives (from
+    ``ensure_resource_access``) but the message changes to that call's
+    generic "principal lacks access to this resource".
+    """
+    await ctx.app.state.platform_agent_template_store.create(
+        upsert=PlatformAgentTemplateUpsert(
+            spec=_spec(),
+            display_name="Support Bot",
+            status=PlatformAgentTemplateStatus.PUBLISHED,
+            required_tier=TenantPlan.FREE,
+        ),
+        created_by="sysadmin",
+    )
+    zero_scope_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id,
+        subject="sa-zero-scope",
+        sub_type="service_account",
+        roles=(),
+        scopes=(),
+    )
+    zero_scope_headers = {"Authorization": f"Bearer {zero_scope_jwt}"}
+    resp = await ctx.client.post(
+        "/v1/agents/fork",
+        json={"template_name": "support-bot", "template_version": "latest", "name": "x"},
+        headers=zero_scope_headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["message"] == (
+        "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+    ), resp.text

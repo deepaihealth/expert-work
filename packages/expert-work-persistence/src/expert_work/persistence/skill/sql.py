@@ -803,9 +803,14 @@ class SqlSkillStore(SkillStore):
         status: PromoteRequestStatus | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        skill_visibility: SkillVisibility | None = None,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         return await self._list_promote_requests(
-            tenant_id=tenant_id, status=status, cursor=cursor, limit=limit
+            tenant_id=tenant_id,
+            status=status,
+            cursor=cursor,
+            limit=limit,
+            skill_visibility=skill_visibility,
         )
 
     async def list_promote_requests_all_tenants(
@@ -816,6 +821,9 @@ class SqlSkillStore(SkillStore):
         limit: int = 50,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         # Stream N — no tenant filter; caller must wrap in bypass_rls_session().
+        # No ``skill_visibility`` filter here, same as ``list_skills_all_tenants``
+        # — this path is system_admin-only (``ensure_tenant_scope`` gates
+        # ``CrossTenant``), so there is no non-admin caller to filter for.
         return await self._list_promote_requests(
             tenant_id=None, status=status, cursor=cursor, limit=limit
         )
@@ -827,11 +835,20 @@ class SqlSkillStore(SkillStore):
         status: PromoteRequestStatus | None,
         cursor: UUID | None,
         limit: int,
+        skill_visibility: SkillVisibility | None = None,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         async with self._sf() as session:
             stmt = select(SkillPromoteRequestRow).order_by(
                 SkillPromoteRequestRow.created_at.desc(), SkillPromoteRequestRow.id
             )
+            if skill_visibility is not None:
+                # Backlog task 8 — join to the target skill so a non-admin
+                # caller's page never contains a request aimed at an
+                # ``agent_private`` skill. Query-layer filter (before the
+                # ``LIMIT``/cursor cut), same rule as ``list_skills``.
+                stmt = stmt.join(SkillRow, SkillRow.id == SkillPromoteRequestRow.skill_id).where(
+                    SkillRow.visibility == skill_visibility
+                )
             if tenant_id is not None:
                 stmt = stmt.where(SkillPromoteRequestRow.tenant_id == tenant_id)
             if status is not None:

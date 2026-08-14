@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from control_plane.transcript import read_turns
 from control_plane.trigger_delivery import DeliveryOutcome, deliver_run_result, inject_delivery
+from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import InMemoryThreadMessageStore, MessageTurn
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.protocol import AgentSpec, TriggerRecord
@@ -159,6 +160,9 @@ async def test_delivery_metadata_tags_source() -> None:
         assert last.additional_kwargs["expert_work_scheduled_delivery"] is True
         assert last.additional_kwargs["expert_work_source_run_id"] == str(run_id)
         assert last.additional_kwargs["expert_work_trigger_id"] == str(trig)
+        # P2 Task 4 — standard stamp keys, run_id pinned to the source run.
+        assert last.additional_kwargs[STAMP_RUN_ID] == str(run_id)
+        assert last.additional_kwargs[STAMP_CREATED_AT]
         # NOT hidden from the UI
         assert "expert_work_hide_from_ui" not in last.additional_kwargs
 

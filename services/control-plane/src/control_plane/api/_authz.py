@@ -142,8 +142,11 @@ def console_only() -> Callable[..., Awaitable[None]]:
     resolves to "the calling user", which a machine principal does not have, so
     an API key silently widens to the whole tenant. Third parties use the
     external plane (``/v1/agents/{agent_code}/...``) instead, where every
-    endpoint takes an explicit ``user_id`` and verifies it. Employee JWTs and
-    mTLS service principals are unaffected.
+    endpoint takes an explicit ``user_id`` and verifies it. This gate's own
+    predicate leaves employee JWTs and mTLS service principals untouched **on
+    the console plane** — that is not a claim that employee JWTs can reach
+    the external plane too; see :func:`external_only`, its dual, for that
+    door.
     """
 
     async def _dep(
@@ -164,7 +167,7 @@ def console_only() -> Callable[..., Awaitable[None]]:
                 result=AuditResult.DENIED,
                 reason="CONSOLE_PLANE_CLOSED_TO_API_KEYS",
                 trace_id=current_trace_id_hex(),
-                details={"subject_type": principal.subject_type},
+                details={"subject_type": principal.subject_type, "path": request.url.path},
             )
         except Exception:
             logger.exception("authz.deny_audit_emit_failed")
@@ -174,6 +177,65 @@ def console_only() -> Callable[..., Awaitable[None]]:
                 "code": "FORBIDDEN",
                 "message": (
                     "console API is not available to API keys; use /v1/agents/{agent_code}/…"
+                ),
+            },
+        )
+
+    return _dep
+
+
+def external_only() -> Callable[..., Awaitable[None]]:
+    """Route dependency — 403 any non-service-account principal outright.
+
+    The dual of :func:`console_only`. The external (third-party) plane
+    (``/v1/agents/{agent_code}/...``) is shaped for a machine caller acting
+    on behalf of an end user it names explicitly via ``user_id`` — it has
+    none of the console plane's admin-only guard on cross-user access
+    (``resolve_target_user_id``'s "only tenant admins may act on another
+    user's resources" check). An employee JWT hitting this plane inherits
+    only its RBAC role, so a plain ``viewer`` could read any end user's
+    workspace files / conversation history and an ``operator`` could run
+    agents, decide approvals, or rename/archive sessions as any end user in
+    the tenant — a real tenant-internal privilege inconsistency, not just a
+    design nicety (External-API-v1 P2-b security fix). Bearer auth only ever
+    mints ``user`` or ``service_account`` (``jwt_verifier.py`` folds every
+    other ``sub_type`` claim into ``"user"``), so "service-account only" and
+    "not an employee JWT" are the same predicate here. The predicate is
+    ``== "service_account"`` rather than ``!= "user"`` on purpose — strictly
+    tighter, and mTLS ``service`` principals are pinned to the system tenant
+    (``auth/mtls.py``) so they could never legitimately reach a real
+    tenant's agent anyway.
+    """
+
+    async def _dep(
+        request: Request,
+        principal: Annotated[Principal, Depends(_principal)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> None:
+        if principal.subject_type == "service_account":
+            return
+        try:
+            await emit(
+                audit,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.AUTH_LOGIN_FAILED,
+                resource_type="user",
+                resource_id="external:non_service_account_denied",
+                result=AuditResult.DENIED,
+                reason="EXTERNAL_PLANE_CLOSED_TO_EMPLOYEE_JWT",
+                trace_id=current_trace_id_hex(),
+                details={"subject_type": principal.subject_type, "path": request.url.path},
+            )
+        except Exception:
+            logger.exception("authz.deny_audit_emit_failed")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FORBIDDEN",
+                "message": (
+                    "external API is not available to console credentials; "
+                    "use a service-account API key"
                 ),
             },
         )

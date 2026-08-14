@@ -1,6 +1,6 @@
 # 错误码与限流
 
-本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 401 / 403 / 404 / 413 / 429,以及限流和配额这两个容易混的概念。
+本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 400 / 401 / 403 / 404 / 413 / 422 / 429 / 500,以及限流和配额这两个容易混的概念。
 
 ## 先说一件容易踩的坑:错误响应的信封形状不统一
 
@@ -14,7 +14,17 @@
 }
 ```
 
-但一部分错误(比如 scope 不足的 403)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+但一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+
+## 400 —— 工作区文件路径不合法
+
+只发生在 `GET /v1/agents/{agent_code}/workspace/file`(下载工作区文件)的 `path` 查询参数上,统一信封,`error.code` 固定 `WORKSPACE_FILE_FAILED`:
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "invalid workspace path" } }
+```
+
+以下几种 `path` 形态会触发:绝对路径(以 `/` 开头)、含 `..` 段、含 NUL 字节(`\x00`)、空字符串或者去掉首尾空白后为空。应对:别自己拼路径——直接把 `GET .../workspace/files` 返回的 `path` 字段原样回传,细节见 [调用 Agent](./run-agent) 的「工作区文件」一节。
 
 ## 401 —— key 无效 / 过期
 
@@ -46,16 +56,17 @@
 
 另外两种 403 是统一信封形状,和 scope 无关:当前 Agent 被管理员下线(`AGENT_DISABLED`)、或者租户本身被暂停(`TENANT_SUSPENDED`)——都不是靠换 key 能解决的,需要联系你的租户管理员。
 
-## 404 —— agent 不存在 / 会话不存在
+## 404 —— agent 不存在 / 会话不存在 / 工作区文件不存在
 
-统一信封形状,两种情况:
+统一信封形状,三种情况:
 
 ```json
 { "success": false, "data": null, "error": { "code": "AGENT_NOT_FOUND", "message": "no active agent 'xxx' for this tenant" } }
 ```
 
 - `AGENT_NOT_FOUND`——`{agent_code}` 在你的租户下没有已发布(ACTIVE)的版本:要么这个名字从没建过,要么建了但还没发布 / 已经下线,两种情况返回同一个 404,不做区分。
-- `SESSION_NOT_FOUND`——传的 `session_id` 找不到,或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理,不会告诉你"存在但不是你的")。
+- `SESSION_NOT_FOUND`——传的 `session_id` 找不到,或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理,不会告诉你"存在但不是你的")。历史消息、重命名(`PATCH .../sessions/{session_id}`)、归档(`DELETE .../sessions/{session_id}`)三个接口都走这同一条不透明规则。
+- `WORKSPACE_FILE_FAILED`——`GET /v1/agents/{agent_code}/workspace/file` 下载文件时,`user_id` 未识别(不认识这个终端用户)和 `path` 指向的文件不存在,这两种情况返回同一个不透明的 404,不要试图从响应里区分是哪一种——这是刻意的存在性隐藏,不是 bug。同一个 `error.code` 在 400 / 500 也会出现,靠 HTTP 状态码区分,见下方「400」与「500」两节。
 
 ## 413 —— 文档 / 图片超限
 
@@ -66,6 +77,46 @@
 ```
 
 默认上限:文档 25 MiB,图片 10 MiB(以你的部署实际配置为准)。应对:压缩/裁剪后重传,或者把大文档拆成多份。
+
+## 422 —— 请求参数不合法
+
+`POST /v1/agents/{agent_code}/runs` 的 422 分两类,形状不一样。
+
+**第一类,请求体字段本身没通过校验**——比如 `files[].transfer_method` 传了 `local_file` 以外的值、`upload_id` 是空字符串、`files[]` / `image_refs` / `untrusted_content` 超过各自的条数上限。统一信封,`error.code` 固定是 `INVALID_REQUEST`:
+
+```json
+{ "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Input should be 'local_file'" } }
+```
+
+同一类里还有九个更具体的业务码,同样走统一信封:
+
+| `code` | 什么情况 |
+|---|---|
+| `INVALID_FILE_REF` | `files[]` 里 `type: "document"` 的 `upload_id` 不是上传接口返回的那种 `uploads/<name>` 形状(比如自己截成了裸文件名、或者带了路径穿越) |
+| `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张 |
+| `INVALID_IMAGE_REF` | `image_refs` 或 `files[]` 里 `type: "image"` 条目的引用格式不合法(不是上传接口对图片返回的那种 `expert_work://image/...` 引用)——两个入口都会触发这个码。最容易踩的坑:document 和 image 两种 `files[]` 条目字段名都叫 `upload_id`,把 document 形态的 `upload_id`(形如 `uploads/report.pdf`)填进了 `type: "image"` 的条目 |
+| `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` 头去空白后是空字符串,或超过 255 字符 |
+| `IDEMPOTENCY_KEY_REUSED` | 同一个 `Idempotency-Key` 配了不同的请求体,或者配给了不同的 `agent_code` |
+| `TOO_MANY_INPUT_KEYS` | `inputs` 的键数量超过 64 个(正好 64 个合法) |
+| `INPUT_VALUE_TOO_LONG` | `inputs` 里某个字符串值超过 8192 字符(正好 8192 字符合法;只检查字符串值) |
+| `TOO_MANY_INPUT_BYTES` | `inputs` 序列化后的总字节数(按 UTF-8 编码计算,不是字符数)超过 65536 字节(正好 65536 字节合法);与 `TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG` 是三条互相独立的限制,不是互相替代——单值用 list/dict 包一层绕开单值字符数检查时,这条总字节数上限仍然拦得住 |
+| `UNTRUSTED_CONTENT_BLOCK_TOO_LONG` | `untrusted_content` 里某一块超过 8192 字符(正好 8192 字符合法);与 `untrusted_content` 最多 16 项的条数上限是两条互相独立的限制 |
+
+**第二类,`inputs`(提示词模板变量)与 Agent 声明不匹配——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
+
+```json
+{ "detail": "unknown input variable: foo" }
+```
+
+三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。**`inputs` 本身的三条硬上限(键数量 / 单值长度 / 序列化后总字节数)不属于这一类**——这三条走上面第一类的统一信封(`TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG` / `TOO_MANY_INPUT_BYTES`)。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
+
+另外,`PATCH /v1/agents/{agent_code}/sessions/{session_id}`(重命名会话)有自己独立的一个业务码,和上面 `/runs` 那套无关,同样走统一信封:`title` 去掉首尾空白后是空字符串(比如整串都是空格),422 `INVALID_TITLE`:
+
+```json
+{ "success": false, "data": null, "error": { "code": "INVALID_TITLE", "message": "title must not be empty" } }
+```
+
+`title` 完全不传,或者传的是字面意义上的空字符串 `""`,走的是请求体字段校验(`title` 要求至少 1 个字符),422 `INVALID_REQUEST`,不是这个码——区别在于有没有先经过服务端的 `strip()`。
 
 ## 429 —— 两种情况,含义不同
 
@@ -97,6 +148,20 @@
 ```
 
 应对:清理这个终端用户工作区里的旧文件(或者引导用户自己清理),不是退避重试能解决的。注意这两种 429 靠 `error.code` 区分(`RATE_LIMIT_EXCEEDED` vs `QUOTA_EXCEEDED`),别只看状态码。
+
+## 500 —— 工作区服务端配置问题
+
+只出现在两个工作区接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载),统一信封:
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
+```
+
+```json
+{ "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
+```
+
+触发条件是服务端工作区存储的权限配置有问题(比如共享 uid 没配对),不是你这边的请求有问题,也不是"这个用户 / 文件不存在"——刻意不降级成空列表或 404,免得把服务端配置问题伪装成正常的业务响应。应对:不是退避重试能解决的,联系你的租户管理员核实工作区存储配置。
 
 ## 限流与配额,是两件事
 

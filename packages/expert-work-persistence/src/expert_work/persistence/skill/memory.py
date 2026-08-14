@@ -78,18 +78,31 @@ def _paginate_promote_requests(
     *,
     status: PromoteRequestStatus | None,
     cursor: UUID | None,
+    cursor_pivot: SkillPromoteRequest | None,
     limit: int,
 ) -> tuple[list[SkillPromoteRequest], UUID | None]:
-    """Keyset-pagination helper for the SE-8 promote-request review queue."""
+    """Keyset-pagination helper for the SE-8 promote-request review queue.
+
+    Backlog Task 9 (I-1) — ``cursor_pivot`` is resolved by the caller from
+    the *unfiltered* (tenant-scoped only, no ``status``/``skill_visibility``
+    row filter applied) set, mirroring the SQL backend's ``cur_stmt``
+    (``sql.py``'s ``_list_promote_requests``, which looks the cursor id up
+    by tenant only, then applies the ``created_at``/``id`` pivot to the
+    filtered main query). Resolving the pivot from ``rows`` itself — the
+    already-filtered set — used to silently return an empty page whenever
+    the cursor's own row didn't survive the filter (e.g. a non-admin caller
+    paginating past a request that targets an ``agent_private`` skill),
+    even though later rows the caller IS allowed to see still exist.
+    ``cursor_pivot is None`` means the id doesn't resolve at all within that
+    tenant scope — same as SQL's ``cur_row is None`` — so the cursor is
+    ignored rather than treated as "nothing more to show".
+    """
     if status is not None:
         rows = [r for r in rows if r.status == status]
     rows.sort(key=lambda r: (r.created_at, r.id), reverse=True)
-    if cursor is not None:
-        try:
-            cut_idx = next(i for i, r in enumerate(rows) if r.id == cursor)
-            rows = rows[cut_idx + 1 :]
-        except StopIteration:
-            rows = []
+    if cursor is not None and cursor_pivot is not None:
+        pivot_key = (cursor_pivot.created_at, cursor_pivot.id)
+        rows = [r for r in rows if (r.created_at, r.id) < pivot_key]
     page = rows[: limit + 1]
     if len(page) > limit:
         return page[:limit], page[limit - 1].id
@@ -588,9 +601,30 @@ class InMemorySkillStore(SkillStore):
         status: PromoteRequestStatus | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        skill_visibility: SkillVisibility | None = None,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         rows = [r for r in self._promote_requests.values() if r.tenant_id == tenant_id]
-        return _paginate_promote_requests(rows, status=status, cursor=cursor, limit=limit)
+        # Backlog task 9 (I-1) — resolve the cursor's pivot row from this
+        # tenant-scoped-but-not-yet-visibility-filtered set (matches SQL's
+        # ``cur_stmt``, which filters only by tenant_id), *before* the
+        # ``skill_visibility`` filter below removes rows from ``rows``.
+        cursor_pivot = None
+        if cursor is not None:
+            cursor_pivot = next((r for r in rows if r.id == cursor), None)
+        if skill_visibility is not None:
+            # Backlog task 8 — same join-by-visibility semantics as the SQL
+            # backend: a request whose target skill is missing (shouldn't
+            # happen — FK-equivalent invariant) is excluded, matching an
+            # INNER JOIN.
+            rows = [
+                r
+                for r in rows
+                if (skill := self._skills.get(r.skill_id)) is not None
+                and skill.visibility == skill_visibility
+            ]
+        return _paginate_promote_requests(
+            rows, status=status, cursor=cursor, cursor_pivot=cursor_pivot, limit=limit
+        )
 
     async def list_promote_requests_all_tenants(
         self,
@@ -600,7 +634,12 @@ class InMemorySkillStore(SkillStore):
         limit: int = 50,
     ) -> tuple[list[SkillPromoteRequest], UUID | None]:
         rows = list(self._promote_requests.values())
-        return _paginate_promote_requests(rows, status=status, cursor=cursor, limit=limit)
+        cursor_pivot = None
+        if cursor is not None:
+            cursor_pivot = next((r for r in rows if r.id == cursor), None)
+        return _paginate_promote_requests(
+            rows, status=status, cursor=cursor, cursor_pivot=cursor_pivot, limit=limit
+        )
 
     # -------------------------------------- evolution kill-switch (SE-8, SE-A13c)
 

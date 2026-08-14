@@ -67,6 +67,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -78,6 +79,7 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
 from expert_work.common.dlp import scan_and_redact
+from expert_work.common.message_stamp import stamp_messages
 from expert_work.common.observability import (
     ExpertWorkComponent,
     expert_work_counter,
@@ -126,6 +128,7 @@ from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
     compaction_sink_from_config,
+    current_run_id,
     token_sink_from_config,
 )
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
@@ -1089,6 +1092,10 @@ def build_react_graph(
             persisted_messages: list[BaseMessage] = list(new_messages)
             if advisory_message is not None and advisory_message not in persisted_messages:
                 persisted_messages = [advisory_message, *persisted_messages]
+            # P2 — stamp last: everything above (DLP / structured resend /
+            # judge) may have rebound ``response``; stamping earlier would
+            # be silently overwritten on the happy path.
+            persisted_messages = _stamp_agent_messages(persisted_messages, config)
             looped_this_turn = bool(ctx.payload.get("loop_detected")) or primary_loop_detected
             update_mw: dict[str, Any] = {
                 "messages": persisted_messages,
@@ -1118,6 +1125,8 @@ def build_react_graph(
         emit_messages: list[BaseMessage] = (
             [advisory_message, response] if advisory_message is not None else [response]
         )
+        # P2 — same rationale as the middleware path above: stamp last.
+        emit_messages = _stamp_agent_messages(emit_messages, config)
         update_plain: dict[str, Any] = {
             "messages": emit_messages,
             "step_count": step_count + 1,
@@ -2001,6 +2010,20 @@ def _dlp_redact_response(response: AIMessage) -> tuple[AIMessage, tuple[str, ...
         _output_dlp_redacted_total.labels(category=category).inc()
     logger.info("output_dlp.redacted categories=%s", ",".join(result.categories))
     return response.model_copy(update={"content": result.redacted}), tuple(result.categories)
+
+
+def _stamp_agent_messages(messages: list[BaseMessage], config: RunnableConfig) -> list[BaseMessage]:
+    """P2 — attach ``created_at``/``run_id`` to the turn's outgoing messages.
+
+    Must be called last, right before ``agent_node`` returns: ``response`` is
+    still rebindable up to that point (DLP redaction, judge escalation,
+    structured-output reconciliation all replace it), and stamping earlier
+    would be silently clobbered by one of those rebinds on the happy path.
+    """
+    run_id = current_run_id(config)
+    if run_id is None:
+        return messages
+    return stamp_messages(messages, run_id=run_id, now=datetime.now(UTC))
 
 
 def _latest_human_text(messages: Sequence[BaseMessage]) -> str:

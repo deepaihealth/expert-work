@@ -348,6 +348,107 @@ async def test_promote_request_tenant_isolation_real_pg(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_list_promote_requests_skill_visibility_filters_real_pg(
+    skill_store: tuple[SqlSkillStore, AsyncEngine],
+) -> None:
+    """Backlog task 8 — SQL-backend parity with the in-memory store's
+    ``skill_visibility`` filter (a join to the target skill's row, not a
+    column on the request itself)."""
+    store, engine = skill_store
+    tenant = uuid4()
+    try:
+        current_tenant_id_var.set(tenant)
+        sid_priv = uuid4()
+        await store.create_skill(
+            skill_id=sid_priv,
+            tenant_id=tenant,
+            name=f"priv-{uuid4().hex[:8]}",
+            visibility="agent_private",
+        )
+        await store.add_version(
+            version_id=uuid4(), skill_id=sid_priv, tenant_id=tenant, prompt_fragment="b"
+        )
+        sid_pub = uuid4()
+        await store.create_skill(skill_id=sid_pub, tenant_id=tenant, name=f"pub-{uuid4().hex[:8]}")
+        await store.add_version(
+            version_id=uuid4(), skill_id=sid_pub, tenant_id=tenant, prompt_fragment="b"
+        )
+        rid_priv, rid_pub = uuid4(), uuid4()
+        await store.request_skill_promote(
+            request_id=rid_priv, tenant_id=tenant, skill_id=sid_priv, skill_version=1
+        )
+        await store.request_skill_promote(
+            request_id=rid_pub, tenant_id=tenant, skill_id=sid_pub, skill_version=1
+        )
+
+        filtered, _ = await store.list_promote_requests(tenant_id=tenant, skill_visibility="tenant")
+        assert [r.id for r in filtered] == [rid_pub]
+
+        unfiltered, _ = await store.list_promote_requests(tenant_id=tenant)
+        assert {r.id for r in unfiltered} == {rid_priv, rid_pub}
+    finally:
+        current_tenant_id_var.set(None)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_promote_requests_cursor_survives_visibility_filter_real_pg(
+    skill_store: tuple[SqlSkillStore, AsyncEngine],
+) -> None:
+    """Backlog task 9 (I-1) — SQL-backend pin, parity with the in-memory
+    store's ``test_list_promote_requests_cursor_survives_visibility_filter``.
+
+    ``pub_req`` (tenant-visible) created first, ``priv_req``
+    (``agent_private``) second — newest-first order is
+    ``[priv_req, pub_req]``. Paginating with ``skill_visibility="tenant"``
+    and ``cursor=priv_req.id`` must resolve ``priv_req``'s pivot (SQL's
+    ``cur_stmt`` looks the cursor id up unfiltered, tenant-scoped only) and
+    return the next tenant-visible row after it, not an empty page. SQL
+    already got this right before I-1 (only the in-memory backend's cursor
+    resolution was wrong); this test pins that correct behavior so a future
+    change to ``_list_promote_requests`` can't quietly regress it without
+    the two backends ever being compared directly.
+    """
+    store, engine = skill_store
+    tenant = uuid4()
+    try:
+        current_tenant_id_var.set(tenant)
+        sid_pub = uuid4()
+        await store.create_skill(skill_id=sid_pub, tenant_id=tenant, name=f"pub-{uuid4().hex[:8]}")
+        await store.add_version(
+            version_id=uuid4(), skill_id=sid_pub, tenant_id=tenant, prompt_fragment="b"
+        )
+        rid_pub = uuid4()
+        await store.request_skill_promote(
+            request_id=rid_pub, tenant_id=tenant, skill_id=sid_pub, skill_version=1
+        )
+
+        sid_priv = uuid4()
+        await store.create_skill(
+            skill_id=sid_priv,
+            tenant_id=tenant,
+            name=f"priv-{uuid4().hex[:8]}",
+            visibility="agent_private",
+        )
+        await store.add_version(
+            version_id=uuid4(), skill_id=sid_priv, tenant_id=tenant, prompt_fragment="b"
+        )
+        rid_priv = uuid4()
+        await store.request_skill_promote(
+            request_id=rid_priv, tenant_id=tenant, skill_id=sid_priv, skill_version=1
+        )
+
+        items, cursor = await store.list_promote_requests(
+            tenant_id=tenant, skill_visibility="tenant", cursor=rid_priv
+        )
+        assert [r.id for r in items] == [rid_pub]
+        assert cursor is None
+    finally:
+        current_tenant_id_var.set(None)
+        await engine.dispose()
+
+
 # ── SE-8-1: persistent kill-switch (migration 0068) ───────────────────────
 
 

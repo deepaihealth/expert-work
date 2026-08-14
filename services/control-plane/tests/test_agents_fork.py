@@ -165,6 +165,31 @@ async def test_fork_tier_forbidden(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fork_viewer_role_is_forbidden(ctx: _Ctx) -> None:
+    """Backlog Task 2 (spec/external-api-v1-p2b) — a VIEWER-role employee
+    must not be able to fork a template into a new tenant-owned agent
+    (creating a tenant asset). This is enforced by step 4's
+    ``ensure_resource_access(manifest, write, ...)`` call (parity with
+    ``create_agent``), not by ``console_only()`` — that gate only rejects
+    service-account principals, and an employee JWT is a ``user`` principal.
+    VIEWER's grants for ``manifest`` are read-only (``rbac.py``), and ABAC
+    conditioned bindings only narrow a role's own grants, never widen them,
+    so no binding shape can let a VIEWER through here.
+    """
+    await ctx.seed_template(_upsert())
+    viewer_jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id, subject=str(uuid4()), roles=(Role.VIEWER.value,)
+    )
+    viewer_headers = {"Authorization": f"Bearer {viewer_jwt}"}
+    resp = await ctx.client.post(
+        "/v1/agents/fork",
+        json={"template_name": "support-bot", "template_version": "1.0.0", "name": "viewer-x"},
+        headers=viewer_headers,
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
 async def test_fork_draft_template_not_available(ctx: _Ctx) -> None:
     await ctx.seed_template(_upsert(status=PlatformAgentTemplateStatus.DRAFT))
     # @latest filters to PUBLISHED, so a draft-only template resolves to nothing.

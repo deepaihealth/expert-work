@@ -32,6 +32,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from control_plane.api._authz import console_only
 from control_plane.api._skill_moderation import (
     ModerationError,
     moderate_prompt_fragment,
@@ -47,7 +48,7 @@ from control_plane.api._skill_zip import (
     parse_skill_zip,
 )
 from control_plane.audit import emit as audit_emit
-from control_plane.auth.rbac import _collect_roles
+from control_plane.auth.rbac import _collect_roles, is_admin
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -75,6 +76,7 @@ from expert_work.protocol import (
     SKILL_REF_PATTERN,
     AuditAction,
     AuditResult,
+    Principal,
     Role,
     Skill,
     SkillStatus,
@@ -319,9 +321,37 @@ def _version_dict(version: SkillVersion) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# SE-8 owner gate — 租户内跨终端用户数据泄露修复(backlog task 6)
+# ---------------------------------------------------------------------------
+
+
+def _require_skill_owner_scope(skill: Skill, principal: Principal) -> None:
+    """403 unless ``principal`` may access an ``agent_private`` skill.
+
+    ``skill.created_by_user_id`` is a ``tenant_user`` id — the per-user
+    AGENT that owns an agent-self-authored skill. Every caller reaching this
+    router is a **member** (JWT) instead, a disjoint identity space from
+    ``tenant_user`` — so "principal is the owner" can never be true here.
+    The only carve-out is a tenant admin, mirroring the
+    ``resolve_target_user_id`` precedent (``api/_user_scope.py``: no match →
+    admin may still act, anyone else asking for someone else's resource is a
+    403). ``tenant``-visibility skills are unaffected — this only gates the
+    ``agent_private`` slice.
+    """
+    if skill.visibility == "agent_private" and not is_admin(principal):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "SKILL_SCOPE_FORBIDDEN",
+                "message": "this skill is agent-private; only a tenant admin may access it",
+            },
+        )
+
+
 def build_skills_router() -> APIRouter:
     """Stream J.7a admin CRUD + ZIP import/export router."""
-    router = APIRouter(prefix="/v1/skills", tags=["skills"])
+    router = APIRouter(prefix="/v1/skills", tags=["skills"], dependencies=[Depends(console_only())])
 
     @router.post("", response_model=None)
     async def create_skill(
@@ -411,6 +441,13 @@ def build_skills_router() -> APIRouter:
         content_hash = compute_content_hash(body.prompt_fragment, {})
         high_risk = is_high_risk_skill_version(tool_names=body.tool_names, supporting_file_paths=[])
 
+        # SE-8 owner gate — must run before the mutation, not just before the
+        # response, so a denied caller cannot create a version as a side effect.
+        target_skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        if target_skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(target_skill, request.state.principal)
+
         try:
             version = await store.add_version(
                 version_id=uuid4(),
@@ -494,8 +531,17 @@ def build_skills_router() -> APIRouter:
             row = await store.get_version_by_number(
                 skill_id=skill_id, tenant_id=scope.tenant_id, version=version
             )
-        if row is None:
-            raise HTTPException(status_code=404, detail="skill version not found")
+            if row is None:
+                raise HTTPException(status_code=404, detail="skill version not found")
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
+        # M-1 (backlog task 7) — fail-closed: a ``skill`` row that can't be
+        # resolved for a version that just resolved is unreachable today (the
+        # FK should prevent an orphan), but a silent skip-the-gate on
+        # ``None`` doesn't match this file's own convention elsewhere
+        # (``skill is None`` → 404 before proceeding).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         entry = row.supporting_files.get(file_path)
         if entry is None:
             raise HTTPException(status_code=404, detail="supporting file not found")
@@ -557,6 +603,11 @@ def build_skills_router() -> APIRouter:
         )
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
+        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
 
         # Validate base64 + size invariant (declared `size` must match)
         try:
@@ -686,6 +737,11 @@ def build_skills_router() -> APIRouter:
         )
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
+        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         if file_path not in prior.supporting_files:
             raise HTTPException(status_code=404, detail="supporting file not found")
 
@@ -760,6 +816,11 @@ def build_skills_router() -> APIRouter:
         )
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
+        skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
 
         findings = scan_for_threats(body.prompt_fragment, scope="strict")
         if findings:
@@ -841,6 +902,7 @@ def build_skills_router() -> APIRouter:
         prior = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
         if prior is None:
             raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(prior, request.state.principal)
 
         # ── Capability Uplift Sprint #4 (Mini-ADR U-30) ──────────────
         # Pin a high-risk skill = handing it a free pass to skip
@@ -1015,6 +1077,13 @@ def build_skills_router() -> APIRouter:
             endpoint="GET /v1/skills",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        # SE-8 owner gate — a non-admin caller may never see ``agent_private``
+        # rows. CrossTenant (``tenant_id=*``) is system_admin-only, and
+        # ``is_admin`` is True for system_admin too, so this only narrows the
+        # SingleTenant branch below. Filtered at the store query layer (WHERE
+        # clause, before the cursor page is cut) — never post-fetch — so a
+        # filtered page never comes back short.
+        principal_is_admin = is_admin(request.state.principal)
         # Stream X (X-6) merged view — the tenant's own skills ("items")
         # plus the platform-curated NULL-tenant library it can see
         # ("platform_items"), each tagged with ``source`` + ``entitled``.
@@ -1029,16 +1098,25 @@ def build_skills_router() -> APIRouter:
                     limit=limit,
                 )
             else:
-                rows, next_cursor = await store.list_skills(
-                    tenant_id=scope.tenant_id,
-                    status=status,
-                    category=category,
-                    visibility=visibility,
-                    created_by_user_id=created_by_user_id,
-                    created_by_agent_name=created_by_agent_name,
-                    cursor=cursor,
-                    limit=limit,
-                )
+                if not principal_is_admin and visibility == "agent_private":
+                    # Explicit ask for a slice this caller may never see →
+                    # empty page, not a silent narrow to "tenant" and not a
+                    # 403 (a 403 here would break the list endpoint for the
+                    # non-admin common case; see brief §3).
+                    effective_visibility: SkillVisibility | None = None
+                    rows, next_cursor = [], None
+                else:
+                    effective_visibility = visibility if principal_is_admin else "tenant"
+                    rows, next_cursor = await store.list_skills(
+                        tenant_id=scope.tenant_id,
+                        status=status,
+                        category=category,
+                        visibility=effective_visibility,
+                        created_by_user_id=created_by_user_id,
+                        created_by_agent_name=created_by_agent_name,
+                        cursor=cursor,
+                        limit=limit,
+                    )
                 # Resolve the tenant's plan under its own RLS scope
                 # (``tenant_config`` is a tenant-scoped table); an
                 # unconfigured tenant is treated as FREE.
@@ -1207,6 +1285,7 @@ def build_skills_router() -> APIRouter:
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         return JSONResponse(status_code=200, content=_skill_dict(skill))
 
     @router.get("/{skill_id}/versions", response_model=None)
@@ -1230,6 +1309,7 @@ def build_skills_router() -> APIRouter:
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
             if skill is None:
                 raise HTTPException(status_code=404, detail="skill not found")
+            _require_skill_owner_scope(skill, request.state.principal)
             versions = await store.list_versions(skill_id=skill_id, tenant_id=scope.tenant_id)
         return JSONResponse(
             status_code=200, content={"items": [_version_dict(v) for v in versions]}
@@ -1257,8 +1337,13 @@ def build_skills_router() -> APIRouter:
             version = await store.get_version_by_number(
                 skill_id=skill_id, tenant_id=scope.tenant_id, version=version_number
             )
-        if version is None:
-            raise HTTPException(status_code=404, detail="skill version not found")
+            if version is None:
+                raise HTTPException(status_code=404, detail="skill version not found")
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
+        # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
+        if skill is None:
+            raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         return JSONResponse(status_code=200, content=_version_dict(version))
 
     @router.post("/import", response_model=None)
@@ -1300,6 +1385,15 @@ def build_skills_router() -> APIRouter:
             raise HTTPException(status_code=400, detail=exc.detail) from exc
 
         existing = await store.get_skill_by_name(tenant_id=tenant_id, name=payload.name)
+        # SE-8 owner gate (backlog task 7, C-2) — a name collision with an
+        # ``agent_private`` skill must not be resolved silently: the
+        # idempotency-hit branch below would echo the victim's
+        # ``created_by_user_id`` / ``visibility``, and the fall-through would
+        # append the caller's ZIP content as a new version on the victim's
+        # skill. Gate immediately after resolution, before either the read
+        # (idempotency response) or the write (``add_version``) below.
+        if existing is not None:
+            _require_skill_owner_scope(existing, request.state.principal)
 
         # OFFICE-3 idempotency: if the latest version already carries this exact
         # content_hash, the re-import is a no-op — return it (200, created=False)
@@ -1333,6 +1427,13 @@ def build_skills_router() -> APIRouter:
                 existing = await store.get_skill_by_name(tenant_id=tenant_id, name=payload.name)
                 if existing is None:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
+                # SE-8 owner gate (backlog task 7, C-2) — this endpoint never
+                # creates ``agent_private`` rows itself, but re-check anyway:
+                # this is a second, independent resolution of ``existing``
+                # (the initial ``existing is not None`` gate above only
+                # covers the first ``get_skill_by_name`` call) and it also
+                # flows straight into ``add_version`` below.
+                _require_skill_owner_scope(existing, request.state.principal)
             await audit_emit(
                 audit,
                 tenant_id=tenant_id,
@@ -1421,6 +1522,7 @@ def build_skills_router() -> APIRouter:
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
+        _require_skill_owner_scope(skill, request.state.principal)
         # Dual-read (skill-asset-store): inflate external entries back to the
         # inline shape so the exported ZIP carries real bytes — a round-trip
         # (export → import) stays lossless either way.

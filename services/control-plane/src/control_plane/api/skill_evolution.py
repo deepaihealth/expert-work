@@ -34,10 +34,12 @@ from control_plane.api._authz import console_only
 from control_plane.api.skills import (
     _get_audit,
     _get_skill_store,
+    _require_skill_owner_scope,
     _skill_dict,
     _version_dict,
 )
 from control_plane.audit import emit as audit_emit
+from control_plane.auth.rbac import is_admin
 from control_plane.tenant_scope import (
     CrossTenant,
     SingleTenant,
@@ -61,6 +63,7 @@ from expert_work.protocol import (
     PromoteRequestStatus,
     SkillEvalResult,
     SkillPromoteRequest,
+    SkillVisibility,
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -185,12 +188,33 @@ def build_skill_evolution_router() -> APIRouter:
         )
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
+                # ``CrossTenant`` (``tenant_id=*``) is system_admin-only
+                # (``ensure_tenant_scope``), and ``is_admin`` is True for
+                # system_admin too — no non-admin caller reaches this branch,
+                # so no ``skill_visibility`` filter is needed here (mirrors
+                # ``list_skills_all_tenants``).
                 rows, next_cursor = await store.list_promote_requests_all_tenants(
                     status=status, cursor=cursor, limit=limit
                 )
             else:
+                # Backlog task 8 (SE-8) — a non-admin employee must never see
+                # a promote-request targeting an ``agent_private`` skill (it
+                # confirms the private skill's existence + who nominated it +
+                # why). Admin-opened requests for private skills are a normal,
+                # ongoing part of this workflow (not just pre-fix leftovers),
+                # so this filters every read, not just historical rows.
+                # Filtered at the store query layer — never post-fetch — so a
+                # filtered page never comes back short (same rule as
+                # ``list_skills``).
+                skill_visibility: SkillVisibility | None = (
+                    None if is_admin(request.state.principal) else "tenant"
+                )
                 rows, next_cursor = await store.list_promote_requests(
-                    tenant_id=scope.tenant_id, status=status, cursor=cursor, limit=limit
+                    tenant_id=scope.tenant_id,
+                    status=status,
+                    cursor=cursor,
+                    limit=limit,
+                    skill_visibility=skill_visibility,
                 )
         return JSONResponse(
             status_code=200,
@@ -216,6 +240,14 @@ def build_skill_evolution_router() -> APIRouter:
         actor_id = getattr(request.state, "actor_id", "anonymous")
         try:
             async with applied_scope(scope):
+                # SE-8 owner gate (backlog task 7, C-3) — a promote-request is
+                # a write tied to the target skill (and, on approval, flips
+                # its visibility straight to ``tenant``). Must be checked
+                # before the store mutation, same ordering rule as C-2.
+                target_skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
+                if target_skill is None:
+                    raise HTTPException(status_code=404, detail="skill not found")
+                _require_skill_owner_scope(target_skill, request.state.principal)
                 req = await store.request_skill_promote(
                     request_id=_new_uuid(),
                     tenant_id=scope.tenant_id,
@@ -299,6 +331,23 @@ def build_skill_evolution_router() -> APIRouter:
             raise HTTPException(status_code=403, detail="a user identity is required to decide")
         try:
             async with applied_scope(scope):
+                # SE-8 owner gate (backlog task 7, C-3) — ``approve`` flips the
+                # target skill's visibility ``agent_private`` → ``tenant``
+                # unconditionally (see ``SkillStore.approve_skill_promote``),
+                # which would otherwise let any employee de-privatize someone
+                # else's agent-authored skill. Load the request's target skill
+                # and gate before either decision mutates anything.
+                pending = await store.get_promote_request(
+                    request_id=request_id, tenant_id=scope.tenant_id
+                )
+                if pending is None:
+                    raise PromoteRequestNotFoundError(str(request_id))
+                target_skill = await store.get_skill(
+                    skill_id=pending.skill_id, tenant_id=scope.tenant_id
+                )
+                if target_skill is None:
+                    raise HTTPException(status_code=404, detail="skill not found")
+                _require_skill_owner_scope(target_skill, request.state.principal)
                 if approve:
                     decided = await store.approve_skill_promote(
                         request_id=request_id,
@@ -346,6 +395,14 @@ def build_skill_evolution_router() -> APIRouter:
     ) -> JSONResponse:
         scope = await _single_scope(request, tenant_id, audit, "GET .../eval-results")
         async with applied_scope(scope):
+            # SE-8 owner gate (backlog task 7, I-1) — ``SkillEvalResult`` rows
+            # don't carry skill content, but they do confirm an
+            # ``agent_private`` skill's existence + performance to any
+            # employee who can guess/enumerate the skill_id.
+            skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
+            if skill is None:
+                raise HTTPException(status_code=404, detail="skill not found")
+            _require_skill_owner_scope(skill, request.state.principal)
             rows = await store.list_eval_results(skill_id=skill_id, tenant_id=scope.tenant_id)
         return JSONResponse(
             status_code=200, content={"items": [_eval_result_dict(r) for r in rows]}
@@ -364,6 +421,11 @@ def build_skill_evolution_router() -> APIRouter:
             skill = await store.get_skill(skill_id=skill_id, tenant_id=scope.tenant_id)
             if skill is None:
                 raise HTTPException(status_code=404, detail="skill not found")
+            # SE-8 owner gate (backlog task 7, C-1) — ``versions`` carries the
+            # full ``prompt_fragment`` (skill content), the exact leak the
+            # complex review reproduced. Must run before either the versions
+            # fetch or the response is built.
+            _require_skill_owner_scope(skill, request.state.principal)
             versions = await store.list_versions(skill_id=skill_id, tenant_id=scope.tenant_id)
             # Resolve the fork source's name (same tenant) so the UI can render
             # the lineage edge without a second round-trip; None if it was
@@ -371,6 +433,16 @@ def build_skill_evolution_router() -> APIRouter:
             forked_from_source = None
             if skill.forked_from is not None:
                 src = await store.get_skill(skill_id=skill.forked_from, tenant_id=scope.tenant_id)
+                # The fork source can itself be a *different* skill than the
+                # one just gated above — e.g. a promoted (now tenant-visible)
+                # skill forked from a still-agent_private source. Omit it
+                # rather than 403 the whole lineage response, which the
+                # caller is otherwise entitled to see.
+                if src is not None:
+                    try:
+                        _require_skill_owner_scope(src, request.state.principal)
+                    except HTTPException:
+                        src = None
                 forked_from_source = _skill_dict(src) if src is not None else None
         return JSONResponse(
             status_code=200,

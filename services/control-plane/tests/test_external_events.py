@@ -23,7 +23,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import (
     InMemoryRunEventStore,
     InMemoryRunStore,
@@ -111,7 +111,17 @@ async def ctx() -> AsyncIterator[_Ctx]:
         run_event_repo=run_event_store,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — the external
+    # plane is now service-account-only; this file's employee JWT was a
+    # borrowed fixture (predates the gate), not a deliberate test of
+    # console-JWT access.
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
@@ -126,7 +136,7 @@ async def test_events_replays_a_terminal_run(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     # Seed durable frames BEFORE asserting anything — without real frames in
     # the store, "event: end" alone is also what the event_store=None
     # degenerate branch emits, so the test cannot tell "replayed real
@@ -170,7 +180,7 @@ async def test_events_404_for_another_user(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     # Drive to terminal so a gate-bypass mutation resolves to a clean, fast
     # "replay returns 200" (asserted against below) instead of falling into
     # the live-attach path and hanging forever waiting for a bridge that will
@@ -202,6 +212,6 @@ async def test_events_requires_user_id(ctx: _Ctx) -> None:
         json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
         headers=ctx.headers,
     )
-    run_id = started.json()["run_id"]
+    run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.get(f"/v1/agents/support-bot/runs/{run_id}/events", headers=ctx.headers)
     assert resp.status_code == 422, resp.text

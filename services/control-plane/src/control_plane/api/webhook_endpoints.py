@@ -25,7 +25,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane._tenant_resource_lock import tenant_resource_lock
+from control_plane.api._authz import console_only
 from control_plane.audit import emit
+from control_plane.auth.rbac import is_admin
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -92,6 +94,37 @@ def _validate_url(url: str) -> None:
         raise HTTPException(status_code=422, detail=f"invalid webhook url: {exc}") from exc
 
 
+def _require_admin(request: Request) -> None:
+    """Backlog Task 9 (C-1) — mutating a webhook endpoint requires a tenant admin.
+
+    An endpoint subscribed to ``skill_promote.requested`` receives the
+    delivery worker's fan-out for *every* pending promote-request in the
+    tenant, including ones targeting an ``agent_private`` skill
+    (``webhook_delivery_worker.py``'s ``enqueue_once`` scans
+    ``list_promote_requests_all_tenants`` unfiltered by visibility — see
+    that call site's docstring; it is correct only because it assumes
+    every endpoint able to receive that fan-out was registered by someone
+    who could already see ``agent_private`` skills, i.e. an admin). Before
+    this gate, ``console_only()`` above was the *only* check — it rejects
+    API keys but does not look at role — so any employee JWT, including a
+    plain ``viewer``, could ``POST`` a URL of their own and receive that
+    private data within one delivery-worker tick. Reads
+    (``GET /v1/webhook-endpoints[/…]``) deliberately stay open to every
+    employee role: the admin-ui webhook page has no role gate of its own
+    (``apps/admin-ui/src/pages/WebhooksList.tsx``), so tightening reads too
+    would 403 the page for non-admin employees who merely want to see
+    already-registered endpoints.
+    """
+    if not is_admin(request.state.principal):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "WEBHOOK_SCOPE_FORBIDDEN",
+                "message": "only tenant admins may register or modify webhook endpoints",
+            },
+        )
+
+
 def _validate_event_types(event_types: list[str]) -> tuple[WebhookEventType, ...]:
     """At least one subscribed type, all from the known set."""
     if not event_types:
@@ -156,7 +189,11 @@ def build_webhook_endpoints_router() -> APIRouter:
     """HX-9 — authenticated outbound webhook endpoint CRUD."""
     router = APIRouter(prefix="/v1/webhook-endpoints", tags=["webhook-endpoints"])
 
-    @router.post("", response_model=None)
+    @router.post(
+        "",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(_require_admin)],
+    )
     async def create_endpoint(
         body: _CreateBody,
         request: Request,
@@ -232,7 +269,7 @@ def build_webhook_endpoints_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_endpoint_dict(record, secret=secret))
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(console_only())])
     async def list_endpoints(
         request: Request,
         store: Annotated[WebhookEndpointStore, Depends(_get_store)],
@@ -261,7 +298,7 @@ def build_webhook_endpoints_router() -> APIRouter:
             }
         )
 
-    @router.get("/{endpoint_id}", response_model=None)
+    @router.get("/{endpoint_id}", response_model=None, dependencies=[Depends(console_only())])
     async def get_endpoint(
         endpoint_id: UUID,
         request: Request,
@@ -285,7 +322,11 @@ def build_webhook_endpoints_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="webhook endpoint not found")
         return JSONResponse(content=_endpoint_dict(record))
 
-    @router.patch("/{endpoint_id}", response_model=None)
+    @router.patch(
+        "/{endpoint_id}",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(_require_admin)],
+    )
     async def patch_endpoint(
         endpoint_id: UUID,
         body: _PatchBody,
@@ -334,7 +375,11 @@ def build_webhook_endpoints_router() -> APIRouter:
         )
         return JSONResponse(content=_endpoint_dict(updated))
 
-    @router.delete("/{endpoint_id}", response_model=None)
+    @router.delete(
+        "/{endpoint_id}",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(_require_admin)],
+    )
     async def delete_endpoint(
         endpoint_id: UUID,
         request: Request,

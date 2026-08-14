@@ -1,10 +1,13 @@
-"""Unit tests for ``_artifact_mime.infer_content_type`` — STREAM-J-DESIGN § 10.5."""
+"""Unit tests for ``_artifact_mime`` — STREAM-J-DESIGN § 10.5."""
 
 from __future__ import annotations
 
+import re
+import urllib.parse
+
 import pytest
 
-from control_plane.api._artifact_mime import infer_content_type
+from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 
 
 @pytest.mark.parametrize(
@@ -85,3 +88,23 @@ def test_active_content_real_mime_in_response() -> None:
     inferred = infer_content_type(kind="document", path="page.html")
     assert "text/html" in inferred.content_type
     assert inferred.disposition == "attachment"
+
+
+def test_content_disposition_header_strips_backslash_from_ascii_fallback() -> None:
+    """A stray backslash must not survive into the quoted ``filename=`` value.
+
+    Left unescaped, a trailing backslash would escape the closing quote of the
+    RFC 6266 quoted-string, letting lenient parsers swallow the following
+    ``filename*=UTF-8''…`` segment into the ``filename`` value and degrade the
+    displayed name.
+    """
+    filename = "back\\slash"
+    header = content_disposition_header(filename, disposition="attachment")
+
+    fallback_match = re.search(r'filename="([^"]*)"', header)
+    assert fallback_match is not None
+    assert "\\" not in fallback_match.group(1)
+
+    star_match = re.search(r"filename\*=UTF-8''(\S+)$", header)
+    assert star_match is not None
+    assert star_match.group(1) == urllib.parse.quote(filename, safe="")

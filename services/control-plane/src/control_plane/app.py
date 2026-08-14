@@ -58,6 +58,7 @@ from control_plane.api import (
     build_external_runs_router,
     build_external_sessions_router,
     build_external_uploads_router,
+    build_external_workspace_router,
     build_feedback_router,
     build_health_router,
     build_knowledge_router,
@@ -237,6 +238,7 @@ from control_plane.tenant_mcp_pool import TenantMcpPoolService
 from control_plane.tenant_scope import bypass_rls_session
 from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
 from control_plane.tenant_status import TenantStatusService
+from control_plane.thread_stats import ThreadStatsRecorderImpl
 from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolService
 from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
@@ -767,6 +769,10 @@ def create_app(
     resolved_agent_runtime.skill_run_usage_recorder = StoreSkillRunUsageRecorder(
         store=resolved_skill_store
     )
+    # P2 块 2 — run 终局重算 ``thread_meta.message_count``。实现必须住在
+    # control-plane(只有它能 import ``transcript.extract_turns``,对外消息
+    # 端点的同一口径),orchestrator 那侧只有 Protocol,这里注入。
+    resolved_agent_runtime.thread_stats_recorder = ThreadStatsRecorderImpl(threads=resolved_threads)
     # Late-bound PII resolver: lets the audit logger reference
     # tenant_config without forcing it to exist yet (D.2 cycle break).
     pii_resolver = TenantConfigPiiResolver()
@@ -2462,6 +2468,7 @@ def create_app(
     app.include_router(build_external_sessions_router())
     app.include_router(build_external_uploads_router())
     app.include_router(build_external_approvals_router())
+    app.include_router(build_external_workspace_router())
 
     app.include_router(build_agents_router())
     app.include_router(build_sessions_router())

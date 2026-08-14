@@ -36,7 +36,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, Role
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import (
     InMemoryRunEventStore,
     InMemoryRunStore,
@@ -123,7 +123,17 @@ async def ctx() -> AsyncIterator[_Ctx]:
         run_event_repo=run_event_store,
     )
     tenant_id = uuid4()
-    jwt = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    # External-API-v1 P2-b security fix (external_only()) — the external
+    # plane is now service-account-only; this file's employee JWT was a
+    # borrowed fixture (predates the gate), not a deliberate test of
+    # console-JWT access.
+    jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=("admin",),
+    )
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
@@ -192,7 +202,7 @@ async def test_user_id_normalizes_identically_on_write_and_read(ctx: _Ctx) -> No
     assert resp.status_code == 200, resp.text
     sessions = resp.json()["data"]["sessions"]
     assert len(sessions) == 1
-    assert sessions[0]["session_id"] == created.json()["thread_id"]
+    assert sessions[0]["session_id"] == created.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -269,7 +279,7 @@ async def test_session_lookup_survives_more_than_500_active_tenant_users(ctx: _C
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    session_id = created.json()["thread_id"]
+    session_id = created.json()["data"]["thread_id"]
 
     users = ctx.app.state.tenant_user_repo
     # Every filler gets a last_active_at strictly after "now" at increasing
@@ -373,7 +383,7 @@ async def _terminal_run(ctx: _Ctx, user_id: str) -> tuple[str, str]:
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    run_id = created.json()["run_id"]
+    run_id = created.json()["data"]["run_id"]
     await ctx.app.state.run_event_store.append(
         make_event_record(run_id=UUID(run_id), seq=1, event_name="updates", data={"step": 1})
     )
@@ -384,7 +394,7 @@ async def _terminal_run(ctx: _Ctx, user_id: str) -> tuple[str, str]:
         updated_at=datetime.now(UTC),
         finished_at=datetime.now(UTC),
     )
-    return run_id, created.json()["thread_id"]
+    return run_id, created.json()["data"]["thread_id"]
 
 
 @pytest.mark.asyncio
@@ -501,7 +511,7 @@ async def _owned_session(ctx: _Ctx, user_id: str = "cust-77") -> str:
         headers=ctx.headers,
     )
     assert created.status_code == 202, created.text
-    return str(created.json()["thread_id"])
+    return str(created.json()["data"]["thread_id"])
 
 
 async def _address_session(ctx: _Ctx, endpoint: str, *, user_id: str, session_id: str) -> Any:

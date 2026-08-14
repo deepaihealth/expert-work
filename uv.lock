@@ -877,6 +877,7 @@ version = "0.0.0"
 source = { editable = "packages/expert-work-common" }
 dependencies = [
     { name = "httpx" },
+    { name = "langchain-core" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
@@ -886,6 +887,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "langchain-core", specifier = ">=1.3,<2" },
     { name = "opentelemetry-api", specifier = ">=1.27,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.27,<2" },
     { name = "opentelemetry-sdk", specifier = ">=1.27,<2" },

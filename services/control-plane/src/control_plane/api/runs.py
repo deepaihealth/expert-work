@@ -23,8 +23,10 @@ at run end.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
@@ -66,6 +68,7 @@ from control_plane.tenant_scope import (
 )
 from control_plane.tenant_status import TenantStatusService
 from control_plane.transcript import read_turns
+from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
     current_trace_id_hex,
     expert_work_counter,
@@ -108,6 +111,113 @@ logger = logging.getLogger("expert_work.control_plane.runs")
 #: limit — there is no global request-body middleware behind it.
 MAX_RUN_INPUT_CHARS: Final[int] = 65536
 
+#: Cap on ``RunRequest.image_refs``. Named (not a bare ``max_length=64``
+#: literal) so the external run endpoint (P2 块 1 — merges ``files[]``'s
+#: image entries into this same list before constructing ``RunRequest``
+#: by hand, off the FastAPI request-body validation path) can pre-check the
+#: merged length itself and fail with a clean 422 instead of letting an
+#: uncaught pydantic ``ValidationError`` escape as a 500.
+MAX_RUN_IMAGE_REFS: Final[int] = 64
+
+#: Cap on ``RunRequest.inputs`` key count, enforced by ``_bound_inputs``
+#: below. Named for the same reason as ``MAX_RUN_IMAGE_REFS`` — the external
+#: run endpoint (``agents.py``) also hand-constructs ``RunRequest`` off the
+#: FastAPI request-body validation path and must pre-check this bound
+#: itself before that construction, so it imports this constant instead of
+#: re-declaring the literal (a second copy could silently drift).
+MAX_RUN_INPUT_KEYS: Final[int] = 64
+
+#: Cap on each ``str``-valued ``RunRequest.inputs`` entry's length, enforced
+#: by ``_bound_inputs`` below. Same sharing rationale as
+#: ``MAX_RUN_INPUT_KEYS``. Non-``str`` values (numbers, lists, nested
+#: objects) are not length-checked by ``_bound_inputs`` — only their count
+#: toward ``MAX_RUN_INPUT_KEYS`` matters here.
+MAX_RUN_INPUT_VALUE_CHARS: Final[int] = 8192
+
+#: External-API-v1 P2-a security fix (Important) —— ``MAX_RUN_INPUT_VALUE_CHARS``
+#: only bounds ``str`` values; a non-``str`` value (a list/dict) sails past it
+#: regardless of size — wrapping an oversized string in a one-element list was
+#: an unbounded-payload bypass for a now-untrusted-caller endpoint. This is a
+#: **total serialized-bytes** cap on the whole ``inputs`` mapping, checked
+#: ONLY by the external run endpoint (``agents.py`` — see the pre-check next
+#: to ``TOO_MANY_INPUT_KEYS`` there); it is deliberately not enforced by
+#: ``_bound_inputs`` / the internal ``POST .../runs`` endpoint, whose caller
+#: (the console) is a trusted internal party this bound was never meant to
+#: guard against. Reuses ``MAX_RUN_INPUT_CHARS`` — the free-text ``input``
+#: field's 64KB DoS guardrail — verbatim: both cap "how much payload can one
+#: call hand this endpoint", so there is no reason for the structured side to
+#: be more permissive than the free-text side.
+MAX_RUN_INPUT_TOTAL_BYTES: Final[int] = MAX_RUN_INPUT_CHARS
+
+#: Cap on each ``untrusted_content`` block's length, enforced by
+#: ``_bound_untrusted_blocks`` below. Named for the same reason as
+#: ``MAX_RUN_INPUT_KEYS`` — the external run endpoint (``agents.py``) also
+#: hand-constructs ``RunRequest`` off the FastAPI request-body validation
+#: path and must pre-check this bound itself (External-API-v1 P2-a security
+#: fix, Critical — an unchecked block used to reach this validator as an
+#: uncaught ``pydantic.ValidationError`` → bare 500, not a 422) before that
+#: construction, so it imports this constant instead of re-declaring the
+#: literal.
+MAX_UNTRUSTED_CONTENT_BLOCK_CHARS: Final[int] = 8192
+
+
+@dataclass(frozen=True)
+class InputsBoundViolation:
+    """Which ``inputs`` bound :func:`check_run_inputs_bound` tripped.
+
+    Structured, not a rendered message — the pydantic validator and the
+    external run endpoint's hand-rolled precheck raise/render this
+    differently (an English ``ValueError`` vs a Chinese ``_envelope_error``
+    with its own error code), so the shared function hands back only the
+    ``kind`` (+ offending ``key`` for ``"value_too_long"``) and lets each
+    call site keep its own wording verbatim.
+    """
+
+    kind: Literal["too_many_keys", "value_too_long", "too_many_bytes"]
+    #: Only set when ``kind == "value_too_long"``.
+    key: str | None = None
+
+
+def check_run_inputs_bound(
+    value: dict[str, Any], *, check_total_bytes: bool
+) -> InputsBoundViolation | None:
+    """Shared bound-checking logic behind ``RunRequest._bound_inputs`` (the
+    pydantic validator, console-plane) and the external run endpoint's own
+    precheck (``agents.py`` — it hand-constructs ``RunRequest`` off the
+    FastAPI request-body validation path, so ``_bound_inputs`` never runs
+    for it; see the ``agents.py`` call site for why that precheck must
+    exist at all).
+
+    Checks, in order (first violation wins — matches both pre-extraction
+    call sites' check order):
+
+    1. key count ``<= MAX_RUN_INPUT_KEYS``.
+    2. each ``str``-valued entry ``<= MAX_RUN_INPUT_VALUE_CHARS``
+       (non-``str`` values are not length-checked here — only their count
+       toward (1) matters).
+    3. when ``check_total_bytes=True``: the whole mapping's serialized size
+       ``<= MAX_RUN_INPUT_TOTAL_BYTES`` — External-API-v1 P2-a security fix,
+       closes the "wrap an oversized value in a list/dict" bypass of (2).
+       **Not** checked when ``check_total_bytes=False`` — the console-plane
+       validator never enforced this bound (its caller is trusted internal
+       traffic this bound was never meant to guard), and extracting this
+       function must not silently add it there.
+
+    Returns ``None`` when ``value`` is within all applicable bounds.
+    """
+    if len(value) > MAX_RUN_INPUT_KEYS:
+        return InputsBoundViolation(kind="too_many_keys")
+    for key, val in value.items():
+        if isinstance(val, str) and len(val) > MAX_RUN_INPUT_VALUE_CHARS:
+            return InputsBoundViolation(kind="value_too_long", key=key)
+    if check_total_bytes:
+        total_bytes = len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        if total_bytes > MAX_RUN_INPUT_TOTAL_BYTES:
+            return InputsBoundViolation(kind="too_many_bytes")
+    return None
+
 
 class RunRequest(BaseModel):
     """POST body. ``input`` is the user's prompt for this run;
@@ -123,7 +233,12 @@ class RunRequest(BaseModel):
     #: the ``run_id`` immediately; a ``RunQueueWorker`` on any instance executes
     #: it, and the client reads the output over ``GET .../runs/{id}/events``.
     mode: Literal["stream", "queue"] = "stream"
-    image_refs: list[str] = Field(default_factory=list, max_length=64)
+    image_refs: list[str] = Field(default_factory=list, max_length=MAX_RUN_IMAGE_REFS)
+    #: P2 块 1(Task 11)—— ``files[]`` 里 ``type == "document"`` 的条目,已经
+    #: 在调用方(``agents.py`` 的 ``run_agent_for_user``)过了
+    #: ``_safe_document_name_or_422`` 净化的纯文件名。拼进 ``_build_human_message``
+    #: 的 ``[file attached: <name>]`` 提示行,与图片引用各自独立。
+    document_names: list[str] = Field(default_factory=list, max_length=64)
     #: Stream PI-1c — structured untrusted input. A business system passes
     #: the data to act on (a ticket / email / document) here instead of
     #: concatenating it into ``input``, so expert_work knows which span is
@@ -141,21 +256,24 @@ class RunRequest(BaseModel):
     @field_validator("inputs")
     @classmethod
     def _bound_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if len(value) > 64:
-            msg = "too many input variables (max 64)"
+        violation = check_run_inputs_bound(value, check_total_bytes=False)
+        if violation is not None:
+            if violation.kind == "too_many_keys":
+                msg = f"too many input variables (max {MAX_RUN_INPUT_KEYS})"
+            else:
+                msg = f"input '{violation.key}' exceeds {MAX_RUN_INPUT_VALUE_CHARS} chars"
             raise ValueError(msg)
-        for key, val in value.items():
-            if isinstance(val, str) and len(val) > 8192:
-                msg = f"input '{key}' exceeds 8192 chars"
-                raise ValueError(msg)
         return value
 
     @field_validator("untrusted_content")
     @classmethod
     def _bound_untrusted_blocks(cls, value: list[str]) -> list[str]:
         for block in value:
-            if len(block) > 8192:
-                msg = "each untrusted_content block must be <= 8192 chars"
+            if len(block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
+                msg = (
+                    f"each untrusted_content block must be "
+                    f"<= {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} chars"
+                )
                 raise ValueError(msg)
         return value
 
@@ -260,6 +378,7 @@ def _build_human_message(
     supports_vision: bool,
     untrusted_content: list[str] | None = None,
     spotlight_nonce: str | None = None,
+    document_names: list[str] | None = None,
 ) -> HumanMessage:
     """Assemble the ``HumanMessage`` for a J.6 multimodal run input.
 
@@ -274,6 +393,12 @@ def _build_human_message(
 
     No-images case — emit plain text unchanged.
 
+    P2 块 1(Task 11)—— ``document_names`` mentions each uploaded document
+    as a ``[file attached: <name>]`` line, independent of the image path
+    (a text-only agent can have both images and documents attached in the
+    same run). The agent's workspace tools (``read_document``) resolve the
+    name.
+
     Stream PI-1c — when ``untrusted_content`` is supplied, the fenced
     blocks are appended after the trusted instruction text (as a trailing
     text segment in both the content-block and plain paths) so the model
@@ -285,20 +410,22 @@ def _build_human_message(
         if untrusted_content
         else ""
     )
+    doc_mentions = "\n".join(f"[file attached: {name}]" for name in (document_names or []))
     if not image_refs:
-        body = f"{text}\n\n{untrusted}" if untrusted and text else (untrusted or text)
-        return HumanMessage(content=body)
+        parts = [p for p in (text, doc_mentions, untrusted) if p]
+        return HumanMessage(content="\n\n".join(parts))
     if supports_vision:
         content: list[dict[str, Any]] = []
         if text:
             content.append({"type": "text", "text": text})
         for ref in image_refs:
             content.append(image_ref_block(ref))
-        if untrusted:
-            content.append({"type": "text", "text": untrusted})
+        trailer = "\n\n".join(p for p in (doc_mentions, untrusted) if p)
+        if trailer:
+            content.append({"type": "text", "text": trailer})
         return HumanMessage(content=content)
     mentions = "\n".join(f"[image attached: {ref}]" for ref in image_refs)
-    parts = [p for p in (text, mentions, untrusted) if p]
+    parts = [p for p in (text, mentions, doc_mentions, untrusted) if p]
     return HumanMessage(content="\n\n".join(parts))
 
 
@@ -309,6 +436,8 @@ def build_run_graph_input(
     image_refs: list[str],
     untrusted_content: list[str] | None,
     inputs: dict[str, Any] | None = None,
+    run_id: UUID | None = None,
+    document_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the graph input for a run from a built agent + user input.
 
@@ -320,17 +449,26 @@ def build_run_graph_input(
 
     Stream Dynamic-Prompt — ``inputs`` carries the run's Jinja variables; the
     system prompt is rendered here so stream and queue render identically.
+
+    P2 块 2 — ``run_id`` stamps the human message's ``additional_kwargs``
+    with ``created_at`` / ``run_id`` so the external messages endpoint can
+    surface them (LangGraph checkpoints don't store either). The system
+    message is never stamped — ``extract_turns`` filters it out anyway.
     """
+    human = _build_human_message(
+        input_text=input_text,
+        image_refs=image_refs,
+        supports_vision=built.supports_vision,
+        untrusted_content=untrusted_content,
+        spotlight_nonce=built.spotlight_nonce,
+        document_names=document_names,
+    )
+    if run_id is not None:
+        human = stamp_message(human, run_id=str(run_id), now=datetime.now(UTC))
     return {
         "messages": [
             SystemMessage(content=render_system_prompt(built, inputs or {})),
-            _build_human_message(
-                input_text=input_text,
-                image_refs=image_refs,
-                supports_vision=built.supports_vision,
-                untrusted_content=untrusted_content,
-                spotlight_nonce=built.spotlight_nonce,
-            ),
+            human,
         ],
         "step_count": 0,
         "max_steps": built.max_steps,
@@ -742,6 +880,8 @@ async def resolve_approval_decision(
             # Stream L.L7 — record the trajectory (curation / eval-gate source).
             trajectory_recorder=runtime.trajectory_recorder,
             trajectory_enabled=built.trajectory_recording,
+            # P2 块 2 — run 终局重算 thread_meta.message_count。
+            thread_stats_recorder=runtime.thread_stats_recorder,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(),
             # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
@@ -772,6 +912,9 @@ async def spawn_run(
     trace_id: str,
     extra_headers: dict[str, str] | None = None,
     on_behalf_of: str | None = None,
+    idempotency_key: str | None = None,
+    request_digest: str | None = None,
+    envelope: bool = False,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -782,7 +925,27 @@ async def spawn_run(
     accounting all key on it (the caller for a normal session run; the minted
     end-user for an on-behalf-of external run). ``oauth_subject`` keys the per-user
     OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
-    acts for one."""
+    acts for one.
+
+    ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13, Task
+    14) are forwarded to :meth:`RunManager.enqueue` on the ``mode="queue"``
+    branch and to :meth:`RunManager.create` on the ``mode="stream"`` branch —
+    both persist the key onto the ``agent_run`` row so a retried call can find
+    it via ``RunStore.find_by_idempotency_key`` (the caller, ``agents.py``'s
+    external run endpoint, does that lookup and — Task 14 — replays the
+    original run's event stream on a stream-mode hit instead of calling this
+    function again). Both parameters default to ``None`` — the internal
+    ``trigger_run`` caller never passes them, so its behaviour (both branches)
+    is unchanged.
+
+    ``envelope`` (External-API-v1 P2-a Task 15) — when ``True``, the
+    ``mode="queue"`` branch's 202 body is wrapped in the external API's
+    ``{success, data, error}`` shape. Defaults to ``False`` so the console
+    ``trigger_run`` caller keeps its pre-existing flat ``{run_id, thread_id,
+    status}`` body — admin-ui consumes that shape directly. Only the
+    external ``run_agent_for_user`` endpoint (``agents.py``) passes
+    ``True``. Stream mode is unaffected: it returns a ``StreamingResponse``,
+    not a JSON body, so there is nothing to envelope."""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -839,15 +1002,22 @@ async def spawn_run(
                 "image_refs": payload.image_refs,
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
+                "document_names": payload.document_names,
             },
             is_resume=bool(prior_runs),
             trace_id=trace_id,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         logger.info("control_plane.run.enqueued run_id=%s", run_id)
-        return JSONResponse(
-            status_code=202,
-            content={"run_id": str(run_id), "thread_id": str(thread_id), "status": "queued"},
-        )
+        content: dict[str, Any] = {
+            "run_id": str(run_id),
+            "thread_id": str(thread_id),
+            "status": "queued",
+        }
+        if envelope:
+            content = {"success": True, "data": content, "error": None}
+        return JSONResponse(status_code=202, content=content)
 
     run_record = await runtime.run_manager.create(
         run_id=run_id,
@@ -856,6 +1026,8 @@ async def spawn_run(
         user_id=effective_user_id,
         is_resume=bool(prior_runs),
         trace_id=trace_id,
+        idempotency_key=idempotency_key,
+        request_digest=request_digest,
     )
     run_record.bound_distilled_skills = built.bound_distilled_skills
     graph_input = build_run_graph_input(
@@ -864,6 +1036,8 @@ async def spawn_run(
         image_refs=payload.image_refs,
         untrusted_content=payload.untrusted_content,
         inputs=payload.inputs,
+        run_id=run_id,
+        document_names=payload.document_names,
     )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),
@@ -894,6 +1068,8 @@ async def spawn_run(
             skill_run_usage_recorder=runtime.skill_run_usage_recorder,
             trajectory_recorder=runtime.trajectory_recorder,
             trajectory_enabled=built.trajectory_recording,
+            # P2 块 2 — run 终局重算 thread_meta.message_count。
+            thread_stats_recorder=runtime.thread_stats_recorder,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(),
             # perf phase2 PR3 T3 — process-wide delegation concurrency gate.

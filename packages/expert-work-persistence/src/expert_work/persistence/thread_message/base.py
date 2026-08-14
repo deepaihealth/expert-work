@@ -37,6 +37,12 @@ class MessageTurn:
     #: (everything else); always None for user turns. See
     #: docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
     channel: str | None = None
+    #: P2 —— 这条消息产生的时刻,来自写入侧盖的 ``expert_work_created_at``
+    #: (ISO8601)。``None`` = 盖戳上线之前写入的消息(不回填,见 P2 spec §二)。
+    created_at: datetime | None = None
+    #: P2 —— 产生这条消息的 run。来自写入侧盖的 ``expert_work_run_id``。
+    #: ``None`` 同上。
+    run_id: UUID | None = None
 
 
 class ThreadMessageStore(abc.ABC):

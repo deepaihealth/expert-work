@@ -13,26 +13,52 @@ the boundary.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import console_only, ensure_resource_access, require
+from control_plane.api._authz import (
+    console_only,
+    ensure_resource_access,
+    external_only,
+    require,
+)
 from control_plane.api._external import (
     ExternalScopeError,
     lookup_external_user_id,
+    reject_nul,
+    reject_nul_deep,
+    reject_nul_path_params,
     resolve_external_user_id,
+)
+from control_plane.api._idempotency import (
+    IDEMPOTENCY_HEADER,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    request_digest,
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, spawn_run
+from control_plane.api.external_events import build_events_response
+from control_plane.api.runs import (
+    MAX_RUN_IMAGE_REFS,
+    MAX_RUN_INPUT_CHARS,
+    MAX_RUN_INPUT_KEYS,
+    MAX_RUN_INPUT_TOTAL_BYTES,
+    MAX_RUN_INPUT_VALUE_CHARS,
+    MAX_UNTRUSTED_CONTENT_BLOCK_CHARS,
+    RunRequest,
+    check_run_inputs_bound,
+    spawn_run,
+)
+from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.manifest import (
@@ -74,8 +100,10 @@ from expert_work.protocol import (
     TenantPlan,
     tier_satisfies,
 )
+from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunStore
+from expert_work.runtime.runs import RunEventStore, RunIdempotencyConflict, RunInfo, RunStore
+from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -200,9 +228,80 @@ def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
     )
 
 
-def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
-    import json
+def _idempotent_run_response(
+    run: RunInfo,
+    *,
+    mode: Literal["stream", "queue"],
+    event_store: RunEventStore | None,
+    stream_bridge: StreamBridge,
+) -> StreamingResponse | JSONResponse:
+    """Render an idempotency-hit ``run`` back in the shape its ``mode`` expects.
 
+    External-API-v1 P2-a Task 14 — stream mode replays the run's event
+    stream via ``build_events_response`` (the same wire format ``GET
+    .../runs/{id}/events`` produces) instead of the ``422
+    IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` Task 13 returned. Shared by both
+    idempotency-hit call sites in ``run_agent_for_user`` below: the
+    pre-``spawn_run`` cache-hit check, and the post-``spawn_run``
+    conflict-loser requery.
+
+    Task 15 — queue mode's 202 body is always the ``{success, data, error}``
+    envelope, matching ``spawn_run``'s own queue-mode branch called with
+    ``envelope=True`` (this helper has no console caller — both call sites
+    below sit inside the external ``run_agent_for_user`` endpoint — so unlike
+    ``spawn_run`` there is no flat-body branch to preserve).
+    """
+    if mode == "stream":
+        return build_events_response(run=run, event_store=event_store, stream_bridge=stream_bridge)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "success": True,
+            "data": {
+                "run_id": str(run.run_id),
+                "thread_id": str(run.thread_id),
+                "status": run.status.value,
+            },
+            "error": None,
+        },
+    )
+
+
+def _safe_document_name_or_422(name: str) -> str:
+    """校验第三方回填的文档 ``upload_id``。
+
+    修复轮 1(原顾虑 1)——早期实现按 brief 字面"只接受纯文件名,含 `/` 一律
+    拒",但 ``uploads.py`` 的 ``_safe_workspace_name`` 恒定产出
+    ``uploads/<stem><ext>``(带 ``uploads/`` 前缀),那条规则会把**唯一合法
+    的真实 upload_id 全部拒掉**,整条"上传 → run"流程端到端死——这是 brief
+    本身的规则错,不是"再加一层防御"的问题。
+
+    正确规则不是"拒绝一切 `/`",而是"必须正好是 ``_safe_workspace_name``
+    有可能生成的形状"——``is_safe_document_upload_id``(与 `_safe_workspace_name``
+    同文件、同源字符集)。上传与 run 是两个独立请求,即便生成规则收紧了,
+    run 这一侧仍然必须独立复核这个字符串(客户端给的是不可信输入,攻击者
+    可以直接调 run,不必经过上传路径)。
+
+    失败走 ``HTTPException``(结构化 ``detail``),调用方 ``run_agent_for_user``
+    在端点边界转译成对外 ``{success, data, error}`` 信封 —— 不放行裸
+    ``{"detail": ...}``。
+    """
+    cleaned = name.strip()
+    if not is_safe_document_upload_id(cleaned):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_FILE_REF",
+                "message": (
+                    "document upload_id must be a workspace ref returned by "
+                    "POST /v1/agents/{agent_code}/uploads (uploads/<name>)"
+                ),
+            },
+        )
+    return cleaned
+
+
+def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
     canonical = json.dumps(spec_json, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -278,6 +377,14 @@ def _get_agent_disable_service(request: Request) -> AgentDisableService:
 
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+def _get_run_event_store(request: Request) -> RunEventStore | None:
+    # External-API-v1 P2-a Task 14 — same accessor as external_events.py /
+    # runs.py (each file already carries its own copy of this one-liner;
+    # not worth a shared import for something this small).
+    store: RunEventStore | None = getattr(request.app.state, "run_event_store", None)
+    return store
 
 
 def _get_trigger_store(request: Request) -> TriggerStore:
@@ -415,6 +522,20 @@ class BindSessionRequest(BaseModel):
     session_id: UUID | None = None
 
 
+class ExternalFileRef(BaseModel):
+    """一条附件引用。``upload_id`` 是 ``POST /v1/agents/{code}/uploads`` 的返回值。
+
+    ``transfer_method`` 目前只有 ``local_file``。字段现在就存在是为了日后加
+    ``remote_url`` 时只是扩枚举(向后兼容),而不是改形状(破坏性)。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["image", "document"]
+    transfer_method: Literal["local_file"] = "local_file"
+    upload_id: str = Field(min_length=1, max_length=1024)
+
+
 class ExternalRunRequest(BaseModel):
     """Body for ``POST /v1/agents/{agent_code}/runs`` — Stream Agent-Templates
     (M1-5b-2). Binds / continues a per-user session and runs in one call."""
@@ -426,7 +547,58 @@ class ExternalRunRequest(BaseModel):
     input: str | None = Field(default=None, max_length=MAX_RUN_INPUT_CHARS)
     mode: Literal["stream", "queue"] = "stream"
     image_refs: list[str] = Field(default_factory=list, max_length=64)
+    #: 单块长度上限(``MAX_UNTRUSTED_CONTENT_BLOCK_CHARS``,与内部
+    #: ``RunRequest._bound_untrusted_blocks`` 同值)未在这个字段声明里体现
+    #: ——同 ``inputs`` 一样,必须在 ``run_agent_for_user`` 里手工预检(P2-a
+    #: 安全修复,Critical——否则一个超长块会在下方手工构造 ``RunRequest``
+    #: 时炸出裸 ``pydantic.ValidationError``,即 500,而不是 422)。
     untrusted_content: list[str] = Field(default_factory=list, max_length=16)
+    #: P2 —— 提示词模板变量,与内部 ``RunRequest.inputs`` 同语义(未声明键 422、
+    #: 必填缺失 422)。未声明键 / 必填缺失校验在 ``spawn_run`` 内部由
+    #: ``validate_prompt_inputs`` 统一执行,此处不重复;但 64 键 / 单值 8192
+    #: 字符 / 序列化后总字节数这三条上限(``RunRequest._bound_inputs`` 前两条 +
+    #: ``MAX_RUN_INPUT_TOTAL_BYTES`` 第三条,P2-a 安全修复,Important——单值
+    #: 长度检查只认 ``str``,包一层 list/dict 就绕过)必须在这个端点里手工
+    #: 预检——见下方 ``run_agent_for_user`` 里 ``RunRequest`` 手工构造前的
+    #: 检查,原因同 ``TOO_MANY_IMAGE_REFS``。
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    #: P2 块 1 —— 统一附件引用。``type == "image"`` 的条目合并进
+    #: ``image_refs`` 交给 ``spawn_run`` 里现成的 ``_validate_image_refs``
+    #: 做 thread 绑定 / 条数上限 / ``supports_vision`` 三重校验(见
+    #: ``run_agent_for_user``)。``type == "document"`` 的条目在同一处过
+    #: ``_safe_document_name_or_422`` 净化后并入 ``RunRequest.document_names``
+    #: (Task 11)。
+    files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
+
+    # External-API-v1 P2-b NUL-byte hardening — ``input`` lands in
+    # ``agent_run.enqueued_input`` (queue mode) verbatim; ``untrusted_content``
+    # / ``inputs`` land there too, and ``inputs`` also reaches
+    # ``validate_prompt_inputs``'s Jinja render. All three are JSONB, which —
+    # like ``text`` — rejects an embedded NUL byte (``\x00``) with a bare
+    # asyncpg ``CharacterNotInRepertoireError`` there is no fallback exception
+    # handler for (see ``_external.py``'s ``_NUL`` doc comment). Checked here,
+    # on the FastAPI request-body model itself, rather than as a hand-rolled
+    # pre-check next to the other bounds below (``TOO_MANY_IMAGE_REFS`` etc.):
+    # those exist because ``RunRequest`` is hand-constructed past FastAPI's
+    # validation path, but ``ExternalRunRequest`` *is* that path, so a
+    # ``field_validator`` here 422s through the existing
+    # ``RequestValidationError`` handler with no extra wiring.
+    @field_validator("input")
+    @classmethod
+    def _no_nul_input(cls, value: str | None) -> str | None:
+        return value if value is None else reject_nul(value, field="input")
+
+    @field_validator("untrusted_content")
+    @classmethod
+    def _no_nul_untrusted_content(cls, value: list[str]) -> list[str]:
+        for block in value:
+            reject_nul(block, field="untrusted_content")
+        return value
+
+    @field_validator("inputs")
+    @classmethod
+    def _no_nul_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return reject_nul_deep(value, field="inputs")
 
 
 class AgentDisableRequest(BaseModel):
@@ -439,6 +611,23 @@ class AgentDisableRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     reason: str | None = Field(default=None, max_length=500)
+
+    # External-API-v1 P2-b NUL-byte hardening — ``reason`` lands in
+    # ``agent_disable.reason`` (a ``Text`` column) verbatim via
+    # ``AgentDisableStore.set_disabled``. At the time this guard was added,
+    # both routes gated only on ``require("manifest", "write")`` — a
+    # third-party API key minted with ``write`` scope maps to the OPERATOR
+    # role, which is granted ``manifest: {read, write}`` (``rbac.py``), so
+    # these two endpoints were reachable by the same external caller class as
+    # every other field this pass hardens. Backlog Task 2
+    # (spec/external-api-v1-p2b) closed that axis with ``_CONSOLE_ONLY``
+    # (see the route decorators below) — the guard on ``reason`` stays,
+    # since an employee JWT's free-text input lands in the same ``Text``
+    # column and deserves the same protection.
+    @field_validator("reason")
+    @classmethod
+    def _no_nul_reason(cls, value: str | None) -> str | None:
+        return value if value is None else reject_nul(value, field="reason")
 
 
 async def _load_manifest(
@@ -518,14 +707,49 @@ def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
 #: a **zero-scope** service-account key before this, since none of them has
 #: ``require(...)`` or an in-handler ``ensure_resource_access`` either.
 #: ``console_only`` only rejects ``subject_type == "service_account"`` —
-#: employee JWTs and mTLS service principals are untouched.
+#: employee JWTs and mTLS service principals are untouched **by this gate**.
+#: That is not a blanket exemption: ``bind_session`` / ``run_agent_for_user``
+#: below carry the dual gate, ``external_only()``, which rejects everything
+#: EXCEPT ``service_account`` — External-API-v1 P2-b security fix, closing
+#: the console JWT's access to the third-party plane the same way this gate
+#: closes the API key's access to the console plane.
 _CONSOLE_ONLY = [Depends(console_only())]
+
+#: ``external_only()`` — the dual of ``_CONSOLE_ONLY`` above, attached to the
+#: two third-party routes hosted on THIS router (``bind_session`` /
+#: ``run_agent_for_user``; the six ``external_*.py`` routers carry it as a
+#: router-level dependency instead, since every route they host is
+#: third-party). ``disable`` / ``enable`` deliberately do NOT get it — they
+#: are reachable by an employee JWT (the admin-ui kill switch,
+#: ``apps/admin-ui/src/api/agents.ts::disableAgent``) by design, and neither
+#: operation is scoped to a ``user_id`` — the vulnerability this gate closes
+#: (an employee JWT reaching per-end-user data/actions with no admin check)
+#: does not apply to a tenant-wide manifest flag. (A ``write``-scope API key
+#: could reach them too until Backlog Task 2, spec/external-api-v1-p2b, gave
+#: both routes ``_CONSOLE_ONLY`` below — that axis is closed now.)
+_EXTERNAL_ONLY = [Depends(external_only())]
 
 
 def build_agents_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/agents", tags=["agents"])
+    # External-API-v1 P2-b review (Critical) — ``reject_nul_path_params``
+    # (``_external.py``) at the router constructor, not per-route: this one
+    # router hosts BOTH the third-party ``{agent_code}`` routes
+    # (``bind_session`` / ``run_agent_for_user``) AND the console-only
+    # ``{name}``/``{version}``/``{revision}`` routes below (including
+    # ``disable``/``enable`` — reachable by a ``write``-scope API key via
+    # ``require("manifest", "write")``, not ``console_only()``; see
+    # ``AgentDisableRequest``'s docstring), and there is no sub-router split
+    # between the two — attaching the guard once here is the only way to
+    # cover every path param on every route on this router by construction,
+    # the same structural argument that put it on each ``external_*.py``
+    # router's own constructor.
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["agents"],
+        dependencies=[Depends(reject_nul_path_params)],
+    )
 
-    @router.post("", status_code=201)
+    @router.post("", status_code=201, dependencies=_CONSOLE_ONLY)
     async def create_agent(
         payload: ManifestPayload,
         request: Request,
@@ -646,7 +870,7 @@ def build_agents_router() -> APIRouter:
             content={"success": True, "data": AgentDetail(record=record).model_dump(mode="json")},
         )
 
-    @router.get("/templates")
+    @router.get("/templates", dependencies=_CONSOLE_ONLY)
     async def list_templates(
         request: Request,
         principal: Annotated[Principal, Depends(require("manifest", "read"))],
@@ -691,7 +915,7 @@ def build_agents_router() -> APIRouter:
             )
         return JSONResponse(content={"success": True, "data": items})
 
-    @router.post("/fork", status_code=201)
+    @router.post("/fork", status_code=201, dependencies=_CONSOLE_ONLY)
     async def fork_template(
         payload: ForkTemplateRequest,
         request: Request,
@@ -754,7 +978,15 @@ def build_agents_router() -> APIRouter:
         except ValidationError as exc:
             return _envelope_error("FORK_INVALID", str(exc), 422)
 
-        # 4. ABAC + provider whitelist gate (parity with create_agent).
+        # 4. ABAC + provider whitelist gate (parity with create_agent). Backlog
+        # Task 2 (spec/external-api-v1-p2b) verified this already blocks a
+        # VIEWER-role employee: ``ensure_resource_access`` checks
+        # ``is_allowed(manifest, write)`` first (same RBAC check ``require(...)``
+        # would run), and VIEWER's grants for ``manifest`` are read-only
+        # (``rbac.py``) — no conditioned binding can widen that, since ABAC
+        # only narrows a role's own grants. A separate ``require("manifest",
+        # "write")`` gate would therefore be redundant with this call, not an
+        # additional protection.
         await ensure_resource_access(
             request,
             resource="manifest",
@@ -801,7 +1033,7 @@ def build_agents_router() -> APIRouter:
             content={"success": True, "data": AgentDetail(record=record).model_dump(mode="json")},
         )
 
-    @router.post("/{agent_code}/sessions", status_code=201)
+    @router.post("/{agent_code}/sessions", status_code=201, dependencies=_EXTERNAL_ONLY)
     async def bind_session(
         agent_code: str,
         payload: BindSessionRequest,
@@ -866,7 +1098,7 @@ def build_agents_router() -> APIRouter:
             },
         )
 
-    @router.post("/{agent_code}/runs", response_model=None)
+    @router.post("/{agent_code}/runs", response_model=None, dependencies=_EXTERNAL_ONLY)
     async def run_agent_for_user(
         agent_code: str,
         payload: ExternalRunRequest,
@@ -881,6 +1113,9 @@ def build_agents_router() -> APIRouter:
         approvals: Annotated[ApprovalStore, Depends(_get_approvals)],
         quota: Annotated[QuotaService, Depends(_get_quota)],
         disable_service: Annotated[AgentDisableService, Depends(_get_agent_disable_service)],
+        run_store: Annotated[RunStore, Depends(_get_run_store)],
+        event_store: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
+        idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
     ) -> StreamingResponse | JSONResponse:
         """Run an agent on behalf of an external-app end-user (M1-5b-2).
 
@@ -890,10 +1125,62 @@ def build_agents_router() -> APIRouter:
         the API-key caller. Returns the SSE stream (``X-Expert-Work-Session-Id`` header) or
         202 for queue mode. The agent definition is shared across the tenant's users;
         per-user isolation is the user-scoped state.
+
+        External-API-v1 P2-a Task 13 / Task 14 — an ``Idempotency-Key`` header
+        makes a retried call return the original run instead of spawning a
+        duplicate, for BOTH modes. See ``_idempotency.request_digest`` for why
+        the fingerprint folds in ``agent_code``, and the block right below for
+        the branch (blank/oversized key, cache hit / mismatch, miss). Checked
+        before any side effect — no session/thread minted, no admission
+        charged — so a rejected call never mutates state. A cache hit renders
+        via ``_idempotent_run_response`` — the ``{success, data, error}``
+        envelope for queue mode (Task 15), the same SSE replay/live-attach
+        ``GET .../runs/{id}/events`` would produce for stream mode (Task 14 —
+        Task 13 rejected a stream-mode key with 422
+        ``IDEMPOTENCY_NOT_SUPPORTED_FOR_STREAM`` instead; that branch is gone).
         """
         tenant_id = request.state.tenant_id
         actor_id = request.state.actor_id
         trace_id = current_trace_id_hex()
+
+        key: str | None = None
+        digest: str | None = None
+        if idempotency_key is not None:
+            key = idempotency_key.strip()
+            if not key or len(key) > MAX_IDEMPOTENCY_KEY_LEN:
+                return _envelope_error(
+                    "INVALID_IDEMPOTENCY_KEY",
+                    f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} non-blank characters",
+                    422,
+                )
+            # External-API-v1 P2-b NUL-byte hardening — ``key`` lands in
+            # ``agent_run.idempotency_key`` (a ``Text`` column) verbatim, for
+            # BOTH modes (``RunManager.enqueue`` / ``.create``, ``runs.py``).
+            # A header — not a pydantic field — so there is no
+            # ``field_validator`` to attach ``reject_nul`` to; check it here,
+            # same spot as the existing blank/oversize check above.
+            try:
+                reject_nul(key, field="Idempotency-Key")
+            except ValueError as exc:
+                return _envelope_error("INVALID_IDEMPOTENCY_KEY", str(exc), 422)
+            digest = request_digest(payload, agent_code=agent_code)
+            existing = await run_store.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+            if existing is not None:
+                if existing.request_digest != digest:
+                    return _envelope_error(
+                        "IDEMPOTENCY_KEY_REUSED",
+                        "this Idempotency-Key was already used with a different request",
+                        422,
+                    )
+                # Same key, same fingerprint — hand back the original run
+                # untouched rather than spawning a duplicate.
+                return _idempotent_run_response(
+                    existing,
+                    mode=payload.mode,
+                    event_store=event_store,
+                    stream_bridge=runtime.stream_bridge,
+                )
+
         try:
             record, thread_id, end_user_id = await _resolve_session(
                 tenant_id=tenant_id,
@@ -936,30 +1223,183 @@ def build_agents_router() -> APIRouter:
         except AgentFactoryError as exc:
             return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
 
+        # P2 块 1 —— files[] 的 image 条目并进 image_refs;_validate_image_refs
+        # (spawn_run 内部)对合并后的完整列表做 thread 绑定 / 条数上限 /
+        # supports_vision 三重校验,files[] 与既有 image_refs 都过同一道闸。
+        image_refs = [
+            *payload.image_refs,
+            *(f.upload_id for f in payload.files if f.type == "image"),
+        ]
+        # RunRequest is hand-constructed below (not the FastAPI request body),
+        # so a merged list past its own image_refs max_length never reaches
+        # the RequestValidationError → 422 path — it would raise an uncaught
+        # pydantic ValidationError (500) instead. Pre-check explicitly.
+        if len(image_refs) > MAX_RUN_IMAGE_REFS:
+            return _envelope_error(
+                "TOO_MANY_IMAGE_REFS",
+                f"files[] 与 image_refs 合计不能超过 {MAX_RUN_IMAGE_REFS} 张图片",
+                422,
+            )
+        # P2-a 安全修复(Critical)—— 同样是"RunRequest 手工构造绕过了 FastAPI
+        # 请求体校验路径"这条根因:内部 ``RunRequest._parse_image_refs``
+        # (runs.py)会对每条 ref 调 ``parse_image_ref``,格式不对就 raise
+        # ValueError —— 但那是一个 pydantic field_validator,手工构造时它仍
+        # 会跑,只是 raise 出来的是裸 ``pydantic.ValidationError``(500),不
+        # 会被下方 ``RunRequest(...)`` 调用点前的任何一道闸拦住。合并后的
+        # image_refs 同时来自两个入口(顶层 ``image_refs`` 字段 + ``files[]``
+        # 里 ``type == "image"`` 的条目,见上面的合并),两个入口都要覆盖 ——
+        # 这里在合并之后统一校验,天然覆盖两者。
+        for _ref in image_refs:
+            try:
+                parse_image_ref(_ref)
+            except ValueError as exc:
+                return _envelope_error("INVALID_IMAGE_REF", str(exc), 422)
+
+        # P2-a 安全修复(Critical)—— 同一根因:内部 ``RunRequest.
+        # _bound_untrusted_blocks``(runs.py)对每块查 <= 8192 字符,超了同样
+        # 是裸 ``pydantic.ValidationError``(500)。文档站主动推荐这个字段装
+        # 一封邮件正文 / 一段工单描述,8KB 是日常量级,第三方按文档使用就会
+        # 撞上这个洞,必须在手工构造 ``RunRequest`` 之前拦下来。
+        for _idx, _block in enumerate(payload.untrusted_content):
+            if len(_block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
+                return _envelope_error(
+                    "UNTRUSTED_CONTENT_BLOCK_TOO_LONG",
+                    f"untrusted_content[{_idx}] 超过 {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} 字符",
+                    422,
+                )
+
+        # P2 块 1(Task 11)—— files[] 的 document 条目逐个过路径净化闸,再并
+        # 进 RunRequest.document_names。客户端给的是字符串,上传时走过的
+        # _safe_workspace_name 净化只保证了上传路径,run 这一侧必须独立
+        # 重新校验(否则 ../ 就能读到工作区外)。_safe_document_name_or_422
+        # 抛的是结构化 HTTPException(与 spawn_run 内部沿用的裸 detail 风格
+        # 不同),这里就地转译成对外信封,不让裸 {"detail": ...} 逃逸。
+        try:
+            document_names = [
+                _safe_document_name_or_422(f.upload_id)
+                for f in payload.files
+                if f.type == "document"
+            ]
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return _envelope_error(
+                detail.get("code", "INVALID_FILE_REF"),
+                detail.get("message", "invalid file reference"),
+                exc.status_code,
+            )
+
+        # RunRequest is hand-constructed below (not the FastAPI request
+        # body), so ``inputs`` past ``RunRequest._bound_inputs``'s own
+        # bounds never reaches the RequestValidationError → 422 path — it
+        # would raise an uncaught pydantic ValidationError (500) instead.
+        # Pre-check explicitly, same pattern as the ``image_refs`` check
+        # above. ``validate_prompt_inputs`` (called inside ``spawn_run``)
+        # covers unknown/missing-required keys but not these bounds.
+        #
+        # The three checks themselves (key count / per-value str length /
+        # total serialized bytes — the third is external-plane-only, P2-a
+        # security fix, Important) are shared with ``RunRequest._bound_inputs``
+        # via ``check_run_inputs_bound`` — see its docstring for the full
+        # rationale. Only the error code / Chinese message text below is
+        # local to this endpoint.
+        _inputs_violation = check_run_inputs_bound(payload.inputs, check_total_bytes=True)
+        if _inputs_violation is not None:
+            if _inputs_violation.kind == "too_many_keys":
+                return _envelope_error(
+                    "TOO_MANY_INPUT_KEYS",
+                    f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键",
+                    422,
+                )
+            if _inputs_violation.kind == "value_too_long":
+                return _envelope_error(
+                    "INPUT_VALUE_TOO_LONG",
+                    f"inputs['{_inputs_violation.key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
+                    422,
+                )
+            return _envelope_error(
+                "TOO_MANY_INPUT_BYTES",
+                f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
+                422,
+            )
+
         run_payload = RunRequest(
             input=payload.input,
             mode=payload.mode,
-            image_refs=payload.image_refs,
+            image_refs=image_refs,
             untrusted_content=payload.untrusted_content,
+            inputs=payload.inputs,
+            document_names=document_names,
         )
-        return await spawn_run(
-            runtime=runtime,
-            audit=audit,
-            approvals=approvals,
-            request=request,
-            settings=request.app.state.settings,
-            built=built,
-            record_spec=record.spec,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            effective_user_id=end_user_id,
-            oauth_subject=str(end_user_id),
-            payload=run_payload,
-            trace_id=trace_id,
-            extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
-            on_behalf_of=str(end_user_id),
-        )
+        try:
+            return await spawn_run(
+                runtime=runtime,
+                audit=audit,
+                approvals=approvals,
+                request=request,
+                settings=request.app.state.settings,
+                built=built,
+                record_spec=record.spec,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                effective_user_id=end_user_id,
+                oauth_subject=str(end_user_id),
+                payload=run_payload,
+                trace_id=trace_id,
+                extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
+                on_behalf_of=str(end_user_id),
+                idempotency_key=key,
+                request_digest=digest,
+                envelope=True,
+            )
+        except RunIdempotencyConflict:
+            # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single
+            # winner. Both requests missed each other in the
+            # ``find_by_idempotency_key`` check above (race window between
+            # that read and this create); the partial unique index on
+            # ``agent_run`` let exactly one insert through and raised this
+            # for the loser. Re-query and hand the loser's caller the
+            # winner's response instead of erroring or double-creating.
+            if key is None:  # pragma: no cover - unreachable: spawn_run only
+                # raises this when it was itself called with a non-None key.
+                raise
+            winner = await run_store.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+            if winner is None:  # pragma: no cover - the index guarantees a
+                # winner row exists the instant the conflict fires.
+                raise
+            # P2-a security fix (Critical) —— this requery used to hand the
+            # winner's run straight back with no digest check at all, unlike
+            # the pre-``spawn_run`` cache-hit branch above (which 422s on a
+            # digest mismatch). Any same-tenant ``session:write`` key holder
+            # could win an information leak by racing a guessable
+            # Idempotency-Key against a victim's request: land inside the
+            # window between the victim's ``find_by_idempotency_key`` miss
+            # and its ``run_store.create`` insert (that window spans
+            # ``_resolve_session`` + ``check_admission`` +
+            # ``runtime.get_agent`` — tens to hundreds of ms, not
+            # microseconds), lose the race, and this branch would hand back
+            # the *victim's* ``run_id`` / ``thread_id`` (queue mode) or the
+            # victim run's full SSE replay — including any secret content
+            # already in its event stream (stream mode). Same fix, same
+            # shape, as the cache-hit branch: a digest mismatch means this
+            # key was reused for a genuinely different request, not a retry
+            # of the request that's racing right now, so it must 422 rather
+            # than disclose the winner's run. A same-digest loser (the
+            # legitimate concurrent-retry case this branch exists for) still
+            # gets the winner's run — that's the value idempotency exists to
+            # provide, and this check must not break it.
+            if winner.request_digest != digest:
+                return _envelope_error(
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "this Idempotency-Key was already used with a different request",
+                    422,
+                )
+            return _idempotent_run_response(
+                winner,
+                mode=payload.mode,
+                event_store=event_store,
+                stream_bridge=runtime.stream_bridge,
+            )
 
     @router.get("", dependencies=_CONSOLE_ONLY)
     async def list_agents(
@@ -1016,7 +1456,7 @@ def build_agents_router() -> APIRouter:
         )
         return JSONResponse({"success": True, "data": payload.model_dump(mode="json")})
 
-    @router.get("/{name}/{version}")
+    @router.get("/{name}/{version}", dependencies=_CONSOLE_ONLY)
     async def get_agent(
         name: str,
         version: str,
@@ -1072,7 +1512,7 @@ def build_agents_router() -> APIRouter:
             data["disable"] = None
         return JSONResponse({"success": True, "data": data})
 
-    @router.put("/{name}/{version}")
+    @router.put("/{name}/{version}", dependencies=_CONSOLE_ONLY)
     async def update_agent(
         name: str,
         version: str,
@@ -1299,7 +1739,7 @@ def build_agents_router() -> APIRouter:
             }
         )
 
-    @router.delete("/{name}/{version}", status_code=204)
+    @router.delete("/{name}/{version}", status_code=204, dependencies=_CONSOLE_ONLY)
     async def delete_agent(
         name: str,
         version: str,
@@ -1394,7 +1834,7 @@ def build_agents_router() -> APIRouter:
         rows = await repo.list_by_tenant(tenant_id=tenant_id, name=name, limit=1)
         return bool(rows)
 
-    @router.post("/{name}/disable")
+    @router.post("/{name}/disable", dependencies=_CONSOLE_ONLY)
     async def disable_agent(
         name: str,
         payload: AgentDisableRequest,
@@ -1478,7 +1918,7 @@ def build_agents_router() -> APIRouter:
             }
         )
 
-    @router.post("/{name}/enable")
+    @router.post("/{name}/enable", dependencies=_CONSOLE_ONLY)
     async def enable_agent(
         name: str,
         payload: AgentDisableRequest,

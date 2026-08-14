@@ -430,3 +430,193 @@ async def test_get_endpoint_tenant_id_star_400(client: AsyncClient) -> None:
     resp = await client.get(f"/v1/webhook-endpoints/{created['id']}", params={"tenant_id": "*"})
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+# ---------------------------------------------------------------------------
+# Backlog Task 3 (security fix, spec/external-api-v1-p2) — this module's own
+# docstring claims it mirrors the J.10 triggers CRUD, but all 5 routes were
+# missing console_only(): a zero-scope API key could hit POST and register a
+# delivery URL, after which the delivery worker fans every run.completed /
+# artifact.saved event out to it — an ongoing exfiltration channel, not just
+# an over-broad read. See ``api/triggers.py``'s identically-shaped gate.
+# ---------------------------------------------------------------------------
+
+
+def _service_account_headers(*, scopes: tuple[str, ...] = ()) -> dict[str, str]:
+    """Headers for a service-account (API-key) principal. Zero-scope by
+    default — the worst-case caller: a key with no scopes granted at all
+    still reached every route here before console_only()."""
+    token = make_test_jwt(
+        tenant_id=_DEFAULT_TENANT,
+        subject="sa-test",
+        sub_type="service_account",
+        roles=(),
+        scopes=scopes,
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_key_denied_on_every_route(client: AsyncClient) -> None:
+    created = await _create(client)  # via the employee JWT, ahead of the sa probes below
+    sa_headers = _service_account_headers()
+    cases: list[tuple[str, str, dict[str, object] | None]] = [
+        (
+            "POST",
+            "/v1/webhook-endpoints",
+            {
+                "name": "sa-try",
+                "url": "https://hooks.example.com/x",
+                "event_types": ["run.completed"],
+            },
+        ),
+        ("GET", "/v1/webhook-endpoints", None),
+        ("GET", f"/v1/webhook-endpoints/{created['id']}", None),
+        ("PATCH", f"/v1/webhook-endpoints/{created['id']}", {"enabled": False}),
+        ("DELETE", f"/v1/webhook-endpoints/{created['id']}", None),
+    ]
+    for method, path, body in cases:
+        resp = await client.request(method, path, json=body, headers=sa_headers)
+        assert resp.status_code == 403, f"{method} {path} -> {resp.status_code} {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_employee_jwt_still_reaches_every_route(client: AsyncClient) -> None:
+    """console_only()'s predicate only rejects service_account principals —
+    pin that the admin-ui's employee JWT (this file's default ``client``
+    fixture) stays unaffected on all 5 routes, so a mutation that widens the
+    predicate to "reject everyone" can't hide behind the zero-scope-key test
+    above."""
+    created = await _create(client)
+    cases: list[tuple[str, str, dict[str, object] | None]] = [
+        (
+            "POST",
+            "/v1/webhook-endpoints",
+            {
+                "name": "employee-try",
+                "url": "https://hooks.example.com/y",
+                "event_types": ["run.completed"],
+            },
+        ),
+        ("GET", "/v1/webhook-endpoints", None),
+        ("GET", f"/v1/webhook-endpoints/{created['id']}", None),
+        ("PATCH", f"/v1/webhook-endpoints/{created['id']}", {"enabled": False}),
+        ("DELETE", f"/v1/webhook-endpoints/{created['id']}", None),
+    ]
+    for method, path, body in cases:
+        resp = await client.request(method, path, json=body)
+        assert resp.status_code != 403, f"{method} {path} -> {resp.status_code} {resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# Backlog Task 9 (Critical fast-follow, C-1) — console_only() rejects API
+# keys but does not look at role, so a plain ``viewer`` employee JWT could
+# POST a webhook subscribed to "skill_promote.requested" and receive the
+# delivery worker's fan-out of *every* pending promote-request in the
+# tenant — including ones targeting an ``agent_private`` skill (created by
+# a normal admin governance workflow) — within one delivery-worker tick.
+# Write ops now additionally require ``is_admin()``; reads stay open to any
+# employee role (the admin-ui webhook page has no role gate of its own).
+# ---------------------------------------------------------------------------
+
+
+def _employee_headers(*, roles: tuple[str, ...], subject: str = "dev-user") -> dict[str, str]:
+    """Headers for an employee (``sub_type=user``) principal with the given roles."""
+    token = make_test_jwt(tenant_id=_DEFAULT_TENANT, subject=subject, roles=roles)
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_register_webhook_for_skill_promote_requested(
+    client: AsyncClient,
+) -> None:
+    """C-1's headline attack: a viewer registers a URL subscribed to
+    ``skill_promote.requested`` — the event type whose payload carries a
+    private skill's id/reason/requesting-agent. Must be rejected outright,
+    not merely accepted-then-never-fired; the registration itself is the
+    exfiltration channel."""
+    viewer_headers = _employee_headers(roles=("viewer",))
+    resp = await client.post(
+        "/v1/webhook-endpoints",
+        json={
+            "name": "viewer-attack",
+            "url": "https://attacker.example.com/hook",
+            "event_types": ["skill_promote.requested"],
+        },
+        headers=viewer_headers,
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "WEBHOOK_SCOPE_FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_viewer_and_operator_denied_on_all_write_routes(client: AsyncClient) -> None:
+    created = await _create(client, name="admin-seeded")
+    for roles in [("viewer",), ("operator",)]:
+        headers = _employee_headers(roles=roles)
+        cases: list[tuple[str, str, dict[str, object] | None]] = [
+            (
+                "POST",
+                "/v1/webhook-endpoints",
+                {
+                    "name": f"try-{roles[0]}",
+                    "url": "https://hooks.example.com/x",
+                    "event_types": ["run.completed"],
+                },
+            ),
+            ("PATCH", f"/v1/webhook-endpoints/{created['id']}", {"enabled": False}),
+            ("DELETE", f"/v1/webhook-endpoints/{created['id']}", None),
+        ]
+        for method, path, body in cases:
+            resp = await client.request(method, path, json=body, headers=headers)
+            assert resp.status_code == 403, f"{roles} {method} {path} -> {resp.status_code}"
+            assert resp.json()["detail"]["code"] == "WEBHOOK_SCOPE_FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_admin_still_passes_all_write_routes(client: AsyncClient) -> None:
+    """``client`` fixture's default JWT already carries roles=("admin",);
+    a distinct admin subject must also pass, so the fix is "requires
+    is_admin", not "requires this exact caller"."""
+    admin_headers = _employee_headers(roles=("admin",), subject="other-admin")
+    created = await _create(client, name="admin-owned")
+
+    create_resp = await client.post(
+        "/v1/webhook-endpoints",
+        json={
+            "name": "admin-created",
+            "url": "https://hooks.example.com/admin",
+            "event_types": ["skill_promote.requested"],
+        },
+        headers=admin_headers,
+    )
+    assert create_resp.status_code == 201, create_resp.text
+
+    patch_resp = await client.patch(
+        f"/v1/webhook-endpoints/{created['id']}",
+        json={"enabled": False},
+        headers=admin_headers,
+    )
+    assert patch_resp.status_code == 200, patch_resp.text
+
+    delete_resp = await client.delete(
+        f"/v1/webhook-endpoints/{created['id']}", headers=admin_headers
+    )
+    assert delete_resp.status_code == 200, delete_resp.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_reads_are_unaffected(client: AsyncClient) -> None:
+    """The pagination/read routes must stay open to non-admin employees —
+    the webhook page's list/detail view has no role gate in the admin-ui
+    (WebhooksList.tsx), so tightening reads too would 403 the page open."""
+    created = await _create(client, name="readable")
+    viewer_headers = _employee_headers(roles=("viewer",))
+
+    listed = await client.get("/v1/webhook-endpoints", headers=viewer_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["total"] >= 1
+
+    got = await client.get(f"/v1/webhook-endpoints/{created['id']}", headers=viewer_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["id"] == created["id"]

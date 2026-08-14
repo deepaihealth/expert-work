@@ -429,6 +429,21 @@ async def test_delete_traversal_path_is_400(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["../etc/passwd", "a/../../b", ".."])
+async def test_delete_actual_traversal_payload_is_400(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+    path: str,
+) -> None:
+    """``test_delete_traversal_path_is_400`` only ever sent an absolute path —
+    a real ``..``-segment payload had zero coverage. Cover it directly.
+    """
+    client, supervisor, _ = setup
+    resp = await client.delete("/v1/workspace/file", params={"path": path})
+    assert resp.status_code == 400, resp.text
+    assert supervisor.workspace_deletes == []
+
+
+@pytest.mark.asyncio
 async def test_delete_file_reports_permission_denied_as_server_error(
     setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:

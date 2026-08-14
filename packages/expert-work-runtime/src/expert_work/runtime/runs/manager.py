@@ -71,6 +71,13 @@ class RunRecord:
     #: worker emits one ``skill_run_usage`` row per entry at the run's terminal
     #: hook so the rollback monitor can attribute the outcome. Not serialized.
     bound_distilled_skills: tuple[BoundDistilledSkill, ...] = ()
+    #: External-API-v1 P2-a Task 14 — the caller's ``Idempotency-Key`` /
+    #: request-fingerprint, write-once at creation (mirrors ``trace_id``
+    #: above: read only by :func:`_record_to_info`, never mutated after
+    #: create). ``None`` for the vast majority of runs — only a stream-mode
+    #: external run created with a header carries these.
+    idempotency_key: str | None = None
+    request_digest: str | None = None
 
 
 def _record_to_info(record: RunRecord) -> RunInfo:
@@ -93,6 +100,8 @@ def _record_to_info(record: RunRecord) -> RunInfo:
         updated_at=record.updated_at,
         finished_at=None,
         trace_id=record.trace_id,
+        idempotency_key=record.idempotency_key,
+        request_digest=record.request_digest,
     )
 
 
@@ -156,6 +165,8 @@ class RunManager:
         on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
         is_resume: bool = False,
         trace_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
     ) -> RunRecord:
         """Create + register a new run in PENDING state.
 
@@ -167,6 +178,17 @@ class RunManager:
         trace id the caller observed; pass ``None`` for auto-triggered
         runs that have no user-bound trace. The value is written through
         to the durable ``agent_run`` row as part of the initial insert.
+
+        ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a
+        Task 14) mirror the same-named parameters :meth:`enqueue` already
+        accepts (Task 13) — this is the stream-mode counterpart. Threaded
+        straight onto the ``RunInfo`` so ``self._store.create`` makes "claim
+        the key" and "create the run row" the same atomic insert; a
+        colliding key raises :class:`~expert_work.runtime.runs.store.
+        RunIdempotencyConflict` out of this call, same as ``enqueue``. Both
+        default to ``None`` — every pre-existing caller (the internal
+        session-run endpoint, and every stream-mode run before this task)
+        is unaffected.
         """
         async with self._lock:
             if run_id in self._runs:
@@ -181,6 +203,8 @@ class RunManager:
                 on_disconnect=on_disconnect,
                 is_resume=is_resume,
                 trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
             )
             # Mirror to the durable store before the in-memory insert —
             # a store failure then leaves no orphan registry entry.
@@ -200,6 +224,8 @@ class RunManager:
         user_id: UUID | None = None,
         is_resume: bool = False,
         trace_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_digest: str | None = None,
     ) -> None:
         """Persist a ``QUEUED`` run for the distributed queue (Stream 9.5).
 
@@ -208,6 +234,18 @@ class RunManager:
         ``asyncio.Task``. A :class:`RunQueueWorker` on any instance later
         CAS-claims it (``status='queued'`` → ``running``), adopts it, and
         executes it from ``enqueued_input``. Requires a durable store.
+
+        External-API-v1 P2-a Task 13 — ``idempotency_key`` / ``request_digest``
+        thread straight onto the ``RunInfo`` so ``self._store.create`` makes
+        "claim the key" and "create the run row" the same atomic insert (the
+        partial unique index backing that is on ``agent_run`` itself — see
+        ``RunStore.create``'s docstring). A non-``None`` key that collides
+        with an existing ``(tenant_id, idempotency_key)`` row raises
+        :class:`~expert_work.runtime.runs.store.RunIdempotencyConflict` out of
+        this call — the caller (the external run endpoint) catches it and
+        re-queries the winner. Both default to ``None``, so every existing
+        caller (the internal session-run endpoint) is unaffected: no key,
+        no possible conflict, byte-identical behaviour to before this task.
         """
         if self._store is None:
             msg = "enqueue requires a durable RunStore"
@@ -227,6 +265,8 @@ class RunManager:
             finished_at=None,
             trace_id=trace_id,
             enqueued_input=enqueued_input,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         await self._store.create(info)
         logger.info("run.enqueue id=%s thread=%s tenant=%s", run_id, thread_id, tenant_id)

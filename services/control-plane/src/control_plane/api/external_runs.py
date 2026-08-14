@@ -17,11 +17,12 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import require
+from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_run,
+    reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -53,7 +54,11 @@ def _get_run_store(request: Request) -> RunStore:
 
 def build_external_runs_router() -> APIRouter:
     """Mount the external run-control endpoints."""
-    router = APIRouter(prefix="/v1/agents", tags=["external"])
+    router = APIRouter(
+        prefix="/v1/agents",
+        tags=["external"],
+        dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
+    )
 
     @router.post("/{agent_code}/runs/{run_id}:cancel", response_model=None)
     async def cancel_run(
