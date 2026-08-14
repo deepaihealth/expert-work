@@ -41,10 +41,39 @@ check() {
     fi
 }
 
+# ``release.sh`` calls this the instant the last rollout reports done, and at
+# that instant the cluster is legitimately still converging: the old pods are
+# Terminating and Prometheus has not re-scraped the new ones yet. Neither is a
+# failure, but both used to be reported as one — the 2026-08-13 and 2026-08-14
+# releases each needed three runs before a green one, and "run it again" is not
+# a smoke test, it is a coin flip.
+#
+# So the two transient checks get a bounded settle. Bounded is the point: a pod
+# stuck Terminating for two minutes IS a real failure and must still be
+# reported, so the deadline expires into the normal FAIL path rather than
+# looping forever.
+settle() {
+    local name="$1" want="$2" budget_s="$3"
+    shift 3
+    local got deadline=$((SECONDS + budget_s))
+    while :; do
+        got="$("$@")"
+        [[ "${got}" == "${want}" ]] && break
+        ((SECONDS >= deadline)) && break
+        sleep 3
+    done
+    check "${name}" "${got}" "${want}"
+}
+
+pods_not_ready() {
+    local out
+    out="$(kubectl -n expert-work get pods --no-headers \
+        | awk '$3 != "Running" && $3 != "Completed" {print $1"("$3")"}' | paste -sd, - || true)"
+    echo "${out:-none}"
+}
+
 echo "== pods =="
-not_ready="$(kubectl -n expert-work get pods --no-headers \
-    | awk '$3 != "Running" && $3 != "Completed" {print $1"("$3")"}' | paste -sd, - || true)"
-check "all pods Running/Completed" "${not_ready:-none}" "none"
+settle "all pods Running/Completed" "none" 120 pods_not_ready
 
 # Pick a pod that can actually be exec'd into. ``items[0]`` alone picks
 # whatever comes first, which right after a rollout is routinely the OLD pod
@@ -74,7 +103,7 @@ fi
 
 echo "== http (via ${POD}) =="
 # One python invocation, one line per probe: "<name> <status-or-error>".
-probes="$(kubectl -n expert-work exec "${POD}" -- python -c "
+run_probes() { kubectl -n expert-work exec "${POD}" -- python -c "
 import json, urllib.request, urllib.error
 
 def status(url):
@@ -100,7 +129,8 @@ try:
     print('prom_targets', f'{up}/{total}')
 except Exception as e:
     print('prom_targets', type(e).__name__)
-")"
+"; }
+probes="$(run_probes)"
 
 get() { echo "${probes}" | awk -v k="$1" '$1==k{print $2}'; }
 
@@ -115,8 +145,24 @@ check "langfuse public" "$(get langfuse_pub)" "200"
 check "langfuse in-cluster" "$(get langfuse_int)" "200"
 check "grafana" "$(get grafana)" "200"
 
+all_up() {
+    local t="$1"
+    [[ "${t}" == */* && "${t%%/*}" == "${t##*/}" && "${t%%/*}" != "0" ]]
+}
+
+# Prometheus finds the new pods through Kubernetes SD and needs a scrape
+# interval before they report up, so right after a rollout this legitimately
+# reads 2/3. Re-probe until it settles. Re-running the whole blob rather than
+# just this one target keeps it to a single ``kubectl exec`` per attempt; the
+# probes are read-only, so repeating them costs nothing but a round trip.
 targets="$(get prom_targets)"
-if [[ "${targets}" == */* && "${targets%%/*}" == "${targets##*/}" && "${targets%%/*}" != "0" ]]; then
+prom_deadline=$((SECONDS + 90))
+while ! all_up "${targets}" && ((SECONDS < prom_deadline)); do
+    sleep 5
+    probes="$(run_probes)"
+    targets="$(get prom_targets)"
+done
+if all_up "${targets}"; then
     echo "OK   prometheus targets all up (${targets})"
 else
     echo "FAIL prometheus targets: ${targets} (want all up, non-zero)"
