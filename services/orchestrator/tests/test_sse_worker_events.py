@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID, uuid4
@@ -32,10 +33,25 @@ class _YieldingBridge(InMemoryStreamBridge):
     await between them) is not racy under single-threaded cooperative
     asyncio — the danger is specifically a split read/write, matching
     ``_publish_worker``'s own guarding comment in ``sse.py``.
+
+    P3 PR-1 Task 2.5 —— 额外记录每次 ``publish`` 收到的 ``seq`` 和帧本身。撞号在
+    生产链路上会先被后台 persist writer 的 H-7 swallow 吃掉(``append_batch`` 抛
+    ``duplicate seq=...`` → 整批丢 → 只剩一条 warning),所以**落库行里永远不会
+    出现重复 seq**;分配出来、交给 bridge 的那串号是撞号唯一可以被直接观察到的
+    地方,断言的失败信息因此才能直接点名撞的是哪个号,而不是去翻日志。
     """
+
+    def __init__(self, *, queue_maxsize: int = 256) -> None:
+        super().__init__(queue_maxsize=queue_maxsize)
+        #: 每次 ``publish`` 收到的 ``seq``,按到达 bridge 的顺序(token 帧为 ``None``)。
+        self.published_seqs: list[int | None] = []
+        #: ``(event, data)`` 同序 —— 用来验证这个桩确实还在强制交错。
+        self.published_frames: list[tuple[str, Any]] = []
 
     async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
         await asyncio.sleep(0)  # 让出事件循环 — 强制并发 sink 交错
+        self.published_seqs.append(seq)
+        self.published_frames.append((event, data))
         await super().publish(run_id, event, data, seq=seq)
 
 
@@ -98,9 +114,21 @@ async def test_concurrent_publish_frame_allocates_a_contiguous_seq_range() -> No
 
     ``_publish_frame`` 先同步 ``_alloc_seq()`` 再 ``await bridge.publish``。把
     自增挪到 await 之后(经典 TOCTOU:读号 → await → 才写回),两个协程会读到
-    同一个 ``event_seq``,``append_batch`` 撞 ``(run_id, seq)`` 抛错、整批帧丢
-    在后台 writer 的 swallow 里 —— 下面「恰好 range(总数)」的断言随之破。
-    ``_YieldingBridge`` 是让这条并发真交错的前提(见其 docstring)。
+    同一个 ``event_seq``。
+
+    **观察点是 bridge 收到的 seq,不是落库行**(Task 2.5 的加固点)。撞号在生产
+    链路上先被后台 persist writer 的 H-7 swallow 吃掉:``append_batch`` 抛
+    ``duplicate seq=...`` → 整批丢 → 只剩一条 warning。也就是说**落库行里永远
+    不会出现重复 seq**,拿落库行做「无重复」断言是恒真的假验证;它只能间接红在
+    「行数少了」上,归因还得去翻日志。分配出来交给 bridge 的那串号才是撞号唯一
+    可直接观察的地方,失败信息因此能直接点名撞的是哪个号。落库行的连续性作为
+    「撞号会变成静默丢帧」这个后果层,保留在最后一组断言里。
+
+    **本测试必须用强制交错的桩 ``_YieldingBridge``,换成裸
+    ``InMemoryStreamBridge`` 会退化成恒绿** —— 裸 bridge 的 ``publish`` 全程不
+    挂起,``asyncio.gather`` 下两个协程根本不交错,TOCTOU 永远不发生。下面两条
+    元断言把这个前提钉死:一条认桩的身份,一条认桩**真的还在**强制交错(光认
+    身份挡不住有人把桩里那句 ``await asyncio.sleep(0)`` 删掉)。
     """
     n = 8
     bridge = _YieldingBridge()
@@ -118,9 +146,30 @@ async def test_concurrent_publish_frame_allocates_a_contiguous_seq_range() -> No
         event_store=store,
     )
 
-    events = await store.list(run_id=record.run_id, limit=500)
     # metadata 1 帧 + 两个协程各 n 帧 worker + astream 的 1 帧 updates
     expected_total = 2 * n + 2
+
+    # 元断言 1 —— 桩没被换成裸 bridge。
+    assert isinstance(bridge, _YieldingBridge), (
+        "本测试依赖强制交错的桩;换成裸 InMemoryStreamBridge 会退化成恒绿的假验证"
+    )
+    # 元断言 2 —— 桩**真的还在**交错:两个协程的 worker 帧必须交替到达 bridge。
+    # 裸 bridge(或桩里的 sleep(0) 被删)下顺序是 aaaa…bbbb,transitions == 1。
+    worker_order = [d["worker_id"] for name, d in bridge.published_frames if name == "worker"]
+    transitions = sum(1 for x, y in itertools.pairwise(worker_order) if x != y)
+    assert transitions >= n, (
+        f"两个协程的帧没有真正交错(transitions={transitions},order={worker_order})"
+        " —— 强制交错的前提没了,本测试已退化成恒绿"
+    )
+
+    # 主断言 —— 分配出去的号无重复,失败信息直接点名撞的是哪个号。
+    allocated = [s for s in bridge.published_seqs if s is not None]
+    duplicated = sorted({s for s in allocated if allocated.count(s) > 1})
+    assert not duplicated, f"seq 撞号:{duplicated};分配给 bridge 的号依次为 {allocated}"
+    assert sorted(allocated) == list(range(expected_total))
+
+    # 后果层 —— 撞号会被 H-7 吃成静默丢帧,落库行必须仍然连续完整。
+    events = await store.list(run_id=record.run_id, limit=500)
     assert len(events) == expected_total
     assert [e.seq for e in events] == list(range(expected_total))  # 无重复、无缺口
     assert len([e for e in events if e.event_name == "worker"]) == 2 * n
