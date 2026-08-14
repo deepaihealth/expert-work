@@ -259,13 +259,29 @@ last = since_seq if since_seq is not None else -1
    - entry.seq == last + 1    → yield,last += 1;然后把 pending 里
                                  last+1、last+2 … 连续的部分一并 yield 掉
    - entry.seq >  last + 1    → 暂存进 pending(见下),**不要立刻当缺口处理**
-3. pending 泄压:当 len(pending) > _REORDER_WINDOW(=32)时,才认定
-   last+1 真的丢了 —— 去 event_store.list(since_seq=last, limit=…) 把
-   last+1 .. min(pending) - 1 补齐并 yield(补到多少算多少),再排空 pending 里
-   连续的部分。补不齐时打 warning 日志,不抛异常 —— 这一段帧在 run 结束后
-   仍可由客户端重新回放拿到。
-4. 流结束(end 帧)前:把 pending 里剩下的按 seq 升序全部 yield 掉,别吞。
+   - entry.seq <= last 但 seq ∈ missing → **照发**(见第 5 条),并从 missing 移除
+3. pending 泄压,两个维度**任一**触发:
+     (a) len(pending) > _REORDER_WINDOW(=32),或
+     (b) min(pending) - last - 1 > _REORDER_WINDOW
+   触发后认定 last+1 起真的缺了 —— 去 event_store.list(since_seq=last, limit=…)
+   把 last+1 .. min(pending) - 1 补齐并 yield(补到多少算多少),再排空 pending 里
+   连续的部分。
+4. 补不齐的那些 seq 记进 missing 集合,打一条 warning
+   (`missing_from=… missing_to=…`),不抛异常。
+5. missing 是"写过检讨但还没死心"的名单:后到的帧只要在 missing 里就照发,
+   不因为 seq <= last 被丢。它保证**任何真实存在过的帧都不会因为本算法的
+   判断失误而消失**,代价只是它可能乱序到达(客户端本来就按 seq 排)。
+6. 流结束(end 帧)前:把 pending 里剩下的按 seq 升序全部 yield 掉,别吞。
 ```
+
+**为什么泄压要两个维度 + 一个 missing 名单**(Task 3 实施反馈,控制方 2026-08-14 裁定):
+只有 (a) 一个维度时,"跳号之后 run 恰好安静下来"这种情况永远撑不爆窗口 —— 缺的那段
+在这条 live 连接上根本不补,而"服务端补齐"正是本项对外承诺的东西。加了 (b) 之后,
+一个孤立的大跳号立刻触发回填。
+但 (b) 单独存在会**重新引入它本来要避免的伤害**:并发 worker 上限可配到 64,理论上
+真有可能 40 帧同时在飞、跳号 40 却一帧没丢;此时查库(后台攒批 writer 还没落盘)拿不到,
+等真帧到达时又已经 `seq <= last` 被丢弃。missing 名单就是为这一种情况兜底 —— 我们
+可以判断错,但**不能因为判断错就把真实存在的帧扔掉**。
 
 **为什么要 pending 重排窗口,而不是见缺口就查库**(Task 1 实施反馈补入):`_publish_frame` 是"同步分号 → await publish",并发 worker 下**先分到号的帧可能后进 bridge**。所以 seq 跳号的第一解释是"乱序到达",不是"丢了"。见缺口就查库会有两个后果:一是把还在路上的帧当丢帧去查一次库(此时后台攒批 writer 多半还没落盘,查了也拿不到),二是等真帧从 bridge 到达时它已经 `<= last` 被丢弃 —— **本来没丢的帧被这个逻辑弄丢了**。重排窗口先给乱序一个收敛机会,窗口撑爆了才认定是真缺口。
 
@@ -280,6 +296,8 @@ last = since_seq if since_seq is not None else -1
 3. `test_live_reconnect_fills_gap`:补库给到 seq 2,bridge **只**推 seq 35(跳过 3..34,超过重排窗口),而库里此时有 3,4 → 客户端按序收到 3,4,然后 35,并且日志里有一条 warning 说明 5..34 补不齐。
 4. `test_live_out_of_order_frames_are_reordered_not_dropped`:bridge 按 `5,3,4,6` 的顺序推(模拟并发 worker 下先分号后进 bridge),客户端收到的必须是 `3,4,5,6` —— **一帧不丢**。这条钉住重排窗口:见缺口就查库的写法会让 3、4 到达时已经 `<= last` 而被丢弃,这条测试会红。
 5. `test_pending_frames_are_flushed_before_end`:bridge 推 `3,5` 然后 end,窗口没撑爆 → 5 必须在 end 之前被 yield 掉,不能被吞。
+6. `test_isolated_large_jump_triggers_backfill`(维度 b):补库给到 seq 2,bridge **只推一帧** seq 35 之后就安静,库里此时有 3,4 → 必须**立刻**回填 3,4 并发出 35,不能等到 end。这条钉住泄压条件的第二个维度 —— 只有 `len(pending) > 窗口` 那一维时它永远撑不爆,必然红。
+7. `test_late_frame_written_off_is_still_delivered`(missing 名单):制造一次回填失败(库里没有 5),让 5 进 missing;随后 bridge 才把 seq 5 推过来 → **必须照发**,不能因为 `5 <= last` 被丢。这条钉住"判断可以错,但不能因此扔掉真实存在的帧"。
 
 五条都必须在 **RUNNING** 状态的 run 上跑(`is_terminal=False`),否则走的是 replay 分支,测了等于没测。
 
@@ -299,6 +317,8 @@ Run: `cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_run_eve
 - 删掉缺口回填分支 → 测试 3 必须红。
 - 把重排窗口去掉、改成见缺口立刻查库 → 测试 4 必须红。
 - 把 end 前排空 pending 那步删掉 → 测试 5 必须红。
+- 去掉泄压条件的 (b) 维度 → 测试 6 必须红。
+- 去掉 missing 名单(后到帧一律按 `seq <= last` 丢) → 测试 7 必须红。
 - 把补库循环改成只读一页 → 造一个 >`MAX_LIST_LIMIT` 帧的 RUNNING run 的测试必须红(如果现有测试都不咬这个变异,就补一条)。
 
 每次变异前 `git diff` 确认真的改到了文件。
