@@ -214,6 +214,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 `mode: "stream"` 的重试是 `200`,一条 SSE 流,重新接上(不是报错、也不是静默丢弃这个 header)**原来那次 run** 的事件——`X-Expert-Work-Run-Id` 与首次请求一致,并且多一个首次请求没有的响应头 `X-Expert-Work-Stream-Mode: live`(原 run 还没跑完,实时接上)或 `replay`(原 run 已经跑完,把落库的帧按顺序回放一遍再收尾)。这一段的行为和断线重连用的 `GET .../runs/{run_id}/events` 是同一份实现——包括回放分页(帧太多时以 `truncated` 帧收尾而不是 `end`),细节见 [SSE 事件格式](./sse-events)。
 
+**这里有一个必须知道的岔口**:重试如果以 `truncated` 收尾,**不能靠再发一次这个 POST 来翻页** —— `POST .../runs` 的请求体和查询参数里都没有 `since_seq`,原样重发只会永远拿回同一个第一页。翻页要换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…&since_seq=<next_seq>`,`run_id` 从 `X-Expert-Work-Run-Id` 响应头里取。
+
 ## 响应:`stream` vs `queue`
 
 **`mode: "stream"`(默认)**——响应就是 SSE 流本身:`200`,`Content-Type: text/event-stream`,响应头带 `X-Expert-Work-Session-Id`(这次绑定/续接到的会话 id)和 `X-Expert-Work-Run-Id`。事件格式见 [SSE 事件格式](./sse-events)。
