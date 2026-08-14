@@ -15,6 +15,7 @@ import asyncio
 import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 
 import pytest
 import uvicorn
@@ -154,14 +155,23 @@ async def test_remote_client_timeout_raises_mcp_call_timeout_error() -> None:
     app = server.streamable_http_app()
     port = _free_port()
     async with _run_uvicorn(app, port):
+        # ``timeout_s`` feeds two different clocks: the httpx client-wide
+        # timeout, baked in when ``start()`` builds the client, and the
+        # per-call ``asyncio.wait_for`` cap, read fresh on every
+        # ``call_tool``. Constructing with the tight value puts the MCP
+        # ``initialize`` handshake on the same 100ms budget — a handshake
+        # that loses that race fails the test in ``start()`` with
+        # ``httpx.ReadTimeout``, never reaching the assertion below. Give
+        # ``start()`` a sane budget, then tighten only the call cap.
         cfg = MCPServerConfig(
             name="e2e-slow",
             transport="streamable_http",
             url=f"http://127.0.0.1:{port}/mcp",
-            timeout_s=0.1,  # 100ms — guaranteed to bite the 2s sleep
+            timeout_s=5.0,
         )
         client = StreamableHttpMCPClient(config=cfg)
         await client.start()
+        client.config = replace(cfg, timeout_s=0.1)  # 100ms — bites the 2s sleep
         try:
             from orchestrator.tools.mcp import MCPCallTimeoutError
 
