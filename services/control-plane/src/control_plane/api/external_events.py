@@ -117,7 +117,10 @@ async def build_events_response(
     }
     if plan.next_seq is not None:
         # P3 PR-1 Task 4 —— 回放被截断。同一个值也在 body 末尾的 ``truncated``
-        # 帧里(浏览器 EventSource 读不到响应头)。
+        # 帧里,**帧才是首选**:中间代理会剥掉不认识的响应头,而 body 不会被剥;
+        # 跨源调用时这个头还需要服务端 expose 才读得到,浏览器侧基本读不到。
+        # (别把理由写成"浏览器 EventSource 读不到响应头"—— EventSource 设不了
+        # Authorization / API-key 头,本来就用不了这套 API。)
         headers["X-Expert-Work-Next-Seq"] = str(plan.next_seq)
     return StreamingResponse(
         plan.producer,
