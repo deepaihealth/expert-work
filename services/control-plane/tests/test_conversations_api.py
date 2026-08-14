@@ -415,3 +415,55 @@ async def test_since_composes_with_has_error(
     )
     assert late.json()["data"]["items"] == []
     assert late.json()["data"]["total"] == 0
+
+
+# --- 阶段 1.1 员工 RBAC ------------------------------------------------------
+#
+# ``console_only`` (P2) blocks a third-party API key; it says nothing about
+# which *employee* may read. ``GET /v1/conversations`` takes ``user_id`` as a
+# query parameter and ``q`` searches transcript content, so before this any
+# authenticated employee — including one holding no role — could search any
+# end user's conversation text. Ruling (2026-08-14): reads stay open to every
+# employee, so the gate is ``session:read`` (viewer/operator/admin all hold it).
+
+
+def _employee(*roles: str) -> dict[str, str]:
+    """Authorization header for an employee JWT carrying exactly ``roles``."""
+    return {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT, roles=roles)}"}
+
+
+@pytest.mark.asyncio
+async def test_viewer_can_read_conversations(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    client, ids = client_and_threads
+    listed = await client.get("/v1/conversations", headers=_employee("viewer"))
+    assert listed.status_code == 200, listed.text
+    detail = await client.get(f"/v1/conversations/{ids['convo']}", headers=_employee("viewer"))
+    assert detail.status_code == 200, detail.text
+
+
+@pytest.mark.asyncio
+async def test_roleless_employee_cannot_read_conversations(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """A JWT carrying no role grants nothing. viewer/operator/admin all hold
+    ``session:read``, so only a role-less principal can prove the gate is
+    actually wired."""
+    client, ids = client_and_threads
+    for path in ("/v1/conversations", f"/v1/conversations/{ids['convo']}"):
+        resp = await client.get(path, headers=_employee())
+        assert resp.status_code == 403, f"{path}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "FORBIDDEN", path
+
+
+@pytest.mark.asyncio
+async def test_roleless_employee_cannot_search_transcripts(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """``q`` is full-text over transcript content — the same gate must cover it,
+    otherwise a filtered list is worthless: you could still confirm that a given
+    end user said a given sentence."""
+    client, _ = client_and_threads
+    resp = await client.get("/v1/conversations", params={"q": "refund"}, headers=_employee())
+    assert resp.status_code == 403, resp.text
