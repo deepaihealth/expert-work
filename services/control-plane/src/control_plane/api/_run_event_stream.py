@@ -229,28 +229,47 @@ async def build_event_producer(
             holes.difference_update(doomed)
             return _gap_frames(doomed, reason="hole_passed")
 
-        def _record_holes(lo: int, end_exclusive: int) -> list[bytes]:
-            """记下 ``[lo, end_exclusive)`` 这段落库空洞;装不下的立刻冲成 gap。"""
+        def _record_holes(end_exclusive: int) -> list[bytes]:
+            """记下 ``(last, end_exclusive)`` 这段落库空洞;装不下的立刻冲成 gap。
+
+            **起点不由调用方给** —— 它恒等于 ``last + 1``。这不是省一个参数,是把
+            "``holes`` 里的号恒 ``< last``"这条不变式做成**结构性**的:消费侧
+            ``if seq in holes`` 之所以能排在 ``if seq <= last`` 前面,靠的正是它。
+            起点若可由调用方指定,将来有人记进一个 ``>= last`` 的号,补洞分支会
+            重发一帧却**不推进 ``last``**,下一帧就走进一个虚假的缺口分支。
+            (原本想在这里加一句 ``assert`` 钉住,但本仓 lint 禁止 src 用 assert
+            —— 改成结构上不可能发生,比断言更彻底。)
+
+            淘汰策略是**丢老的、留新的** —— 依据是 bridge 的 256 帧缓冲里只可能
+            还留着最新的,老洞就算继续跟踪也永远等不到补发,不如立刻告诉客户端。
+            裁剪要对 ``holes`` **整体**做,不能只裁新进来的这一段:只裁新段会
+            把还可能补上的新洞判死刑、却把补不上的老洞留着,方向正好反过来。
+            """
+            lo = last + 1
             if end_exclusive <= lo:
                 return []
             frames: list[bytes] = []
-            room = max(_MAX_TRACKED_HOLES - len(holes), 0)
-            if end_exclusive - lo > room:
-                # 老的那一段不再跟踪 —— bridge 的 256 帧缓冲里只可能还留着最新的。
-                cut = end_exclusive - room
+            # 超过上限的那一段直接一帧 gap 带过,**不物化成 set** ——
+            # 所以百万级的洞也只花常数内存。
+            if end_exclusive - lo > _MAX_TRACKED_HOLES:
+                cut = end_exclusive - _MAX_TRACKED_HOLES
                 logger.warning(
                     "live_stream.holes_overflow run_id=%s from=%s to=%s", run_id, lo, cut - 1
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": cut - 1}))
                 lo = cut
             holes.update(range(lo, end_exclusive))
+            if len(holes) > _MAX_TRACKED_HOLES:
+                evicted = set(sorted(holes)[: len(holes) - _MAX_TRACKED_HOLES])
+                holes.difference_update(evicted)
+                frames.extend(_gap_frames(evicted, reason="holes_overflow"))
             return frames
 
         # 1. 补库 —— 跳号不能让 last 无声推过去。
         while True:
             rows = await _list_page(last)
             for row in rows:
-                for chunk in _record_holes(last + 1, row.seq):
+                for chunk in _record_holes(row.seq):
                     yield chunk
                 yield format_sse(
                     row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
@@ -300,7 +319,7 @@ async def build_event_producer(
                         if row.seq >= seq:
                             reached = True
                             break
-                        for chunk in _record_holes(last + 1, row.seq):
+                        for chunk in _record_holes(row.seq):
                             yield chunk
                         yield format_sse(
                             row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"

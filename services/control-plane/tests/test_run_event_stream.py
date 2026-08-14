@@ -879,3 +879,42 @@ async def test_hole_tracking_overflow_emits_gap_and_keeps_the_newest(
     # 16 / 18 / 19 始终没等到,最后必须报缺口,一个都不许吞。
     covered = {s for g in gaps for s in range(int(g["from"]), int(g["to"]) + 1)}
     assert {16, 18, 19} <= covered, f"未补上的洞被吞了:gaps={gaps}"
+
+
+@pytest.mark.asyncio
+async def test_hole_tracking_overflow_evicts_across_already_tracked_holes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """溢出淘汰必须对 ``holes`` **整体**做,不能只裁新进来的那一段。
+
+    只裁新段的写法(``room = 上限 - len(holes)``,``cut = end - room``)在老洞
+    已经占满名额时 ``room`` 归零 —— 于是**整段新洞**被冲成 gap、老洞一个不动。
+    方向正好反了:bridge 的 256 帧缓冲里只可能还留着**最新的**,老洞占着名额
+    等一个永远不会来的帧,同时把真能补上的新洞判了死刑,那是实打实的丢帧。
+
+    构造(必须让老洞占满名额,否则两种实现都会交付,测了等于没测 —— 本测试
+    第一版就栽在这里,``{0,5,15}`` + 上限 6 两种实现都能交付 14):
+    上限 4,库 ``{0, 5, 10}`` → 第一段洞 ``1..4`` 正好占满,第二段 ``6..9``
+    要进来时 ``room`` 已是 0。bridge 随后把 8 推过来 ——
+    只裁新段:8 早被 gap 掉且不在 ``holes`` 里,``8 <= last(10)`` → **丢弃**;
+    整体淘汰:老洞 ``1..4`` 让位,``8`` 还在 ``holes`` 里 → **补发**。
+    """
+    monkeypatch.setattr(stream_module, "_MAX_TRACKED_HOLES", 4)
+
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 5, 10])  # 洞:1..4(占满)+ 6..9
+    bridge = _ScriptedBridge([_live_frame(8), _live_frame(11)])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=None)
+
+    gaps = [d for _fid, name, d in frames if name == "gap"]
+    covered = {s for g in gaps for s in range(int(g["from"]), int(g["to"]) + 1)}
+
+    # 判据:最新那段里的 8 必须被补发 —— 只裁新段的实现会把它丢掉。
+    assert 8 in _seqs(frames), f"新洞 8 没能从 bridge 补上,说明淘汰方向反了:gaps={gaps}"
+    # 老洞让了位就必须报出来。
+    assert {1, 2, 3, 4} <= covered, f"被淘汰的老洞没有报成 gap:{gaps}"
+    # 一帧不许吞:1..9 要么交付要么落在某个 gap 区间里。
+    delivered = set(_seqs(frames))
+    assert all(s in delivered or s in covered for s in range(1, 10)), f"{delivered} / {gaps}"
