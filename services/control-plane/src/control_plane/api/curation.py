@@ -402,7 +402,7 @@ def build_eval_dataset_router() -> APIRouter:
         prefix="/v1/eval-datasets", tags=["eval-datasets"], dependencies=[Depends(console_only())]
     )
 
-    @router.post("", response_model=None)
+    @router.post("", response_model=None, dependencies=[Depends(require("manifest", "write"))])
     async def create_eval_dataset(
         body: _CreateEvalDatasetBody,
         request: Request,
@@ -445,7 +445,7 @@ def build_eval_dataset_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_eval_dataset_dict(record))
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(require("manifest", "read"))])
     async def list_eval_datasets(
         request: Request,
         datasets: Annotated[EvalDatasetStore, Depends(_get_eval_dataset_store)],
@@ -481,7 +481,9 @@ def build_eval_dataset_router() -> APIRouter:
             }
         )
 
-    @router.get("/{dataset_id}", response_model=None)
+    @router.get(
+        "/{dataset_id}", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def get_eval_dataset(
         dataset_id: UUID,
         request: Request,
@@ -504,7 +506,9 @@ def build_eval_dataset_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="eval-dataset row not found")
         return JSONResponse(content=_eval_dataset_dict(record))
 
-    @router.patch("/{dataset_id}", response_model=None)
+    @router.patch(
+        "/{dataset_id}", response_model=None, dependencies=[Depends(require("manifest", "write"))]
+    )
     async def patch_eval_dataset(
         dataset_id: UUID,
         body: _PatchEvalDatasetBody,
@@ -537,7 +541,9 @@ def build_eval_dataset_router() -> APIRouter:
         )
         return JSONResponse(content=_eval_dataset_dict(updated))
 
-    @router.delete("/{dataset_id}", response_model=None)
+    @router.delete(
+        "/{dataset_id}", response_model=None, dependencies=[Depends(require("manifest", "delete"))]
+    )
     async def delete_eval_dataset(
         dataset_id: UUID,
         request: Request,

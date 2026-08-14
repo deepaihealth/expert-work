@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -92,7 +92,7 @@ def build_eval_runs_router() -> APIRouter:
         prefix="/v1/eval-runs", tags=["eval"], dependencies=[Depends(console_only())]
     )
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(require("manifest", "read"))])
     async def list_runs(
         request: Request,
         store: Annotated[EvalRunStore, Depends(_get_eval_run_store)],
@@ -133,7 +133,7 @@ def build_eval_runs_router() -> APIRouter:
             },
         )
 
-    @router.post("", response_model=None)
+    @router.post("", response_model=None, dependencies=[Depends(require("manifest", "write"))])
     async def enqueue_run(
         body: _EnqueueBody,
         request: Request,
@@ -156,7 +156,9 @@ def build_eval_runs_router() -> APIRouter:
         await store.create_run(record)
         return JSONResponse(status_code=202, content=_run_dict(record))
 
-    @router.get("/{run_id}", response_model=None)
+    @router.get(
+        "/{run_id}", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def get_run(
         run_id: UUID,
         request: Request,
@@ -179,7 +181,9 @@ def build_eval_runs_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="eval run not found")
         return JSONResponse(content=_run_dict(record))
 
-    @router.get("/{run_id}/cases", response_model=None)
+    @router.get(
+        "/{run_id}/cases", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def list_cases(
         run_id: UUID,
         request: Request,
