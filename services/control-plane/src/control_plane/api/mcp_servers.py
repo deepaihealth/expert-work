@@ -14,7 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenancy.tenant_config import TenantConfigNotConfiguredError
@@ -396,7 +396,9 @@ async def _record_health(
 
 
 def build_mcp_servers_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/mcp-servers", tags=["mcp-servers"])
+    router = APIRouter(
+        prefix="/v1/mcp-servers", tags=["mcp-servers"], dependencies=[Depends(console_only())]
+    )
 
     @router.post("", status_code=201)
     async def create_mcp_server(

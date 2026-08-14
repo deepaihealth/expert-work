@@ -25,7 +25,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Reques
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit as audit_emit
 from control_plane.mcp_oauth import (
     McpOAuthError,
@@ -176,7 +176,7 @@ async def _invalidate_user_caches(request: Request, tenant_id: UUID, user_id: st
 
 def build_mcp_oauth_router() -> APIRouter:
     """OA-3a per-user OAuth initiate + callback."""
-    router = APIRouter(tags=["mcp_oauth"])
+    router = APIRouter(tags=["mcp_oauth"], dependencies=[Depends(console_only())])
 
     @router.post("/v1/mcp-servers/catalog/{catalog_id}/oauth/initiate", response_model=None)
     async def initiate(

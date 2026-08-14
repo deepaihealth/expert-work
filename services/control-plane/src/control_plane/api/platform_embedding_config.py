@@ -20,7 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, console_only
 from control_plane.audit import emit
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_secrets import PlatformSecretsService
@@ -135,7 +135,10 @@ def build_platform_embedding_config_router() -> APIRouter:
             "error": None,
         }
 
-    @router.get("/status")
+    # 阶段 1.2 —— deliberately role-agnostic (see the handler docstring), but
+    # that means "any *employee*", not "any API key": a third party has no
+    # business probing the platform's embedding configuration at all.
+    @router.get("/status", dependencies=[Depends(console_only())])
     async def get_platform_embedding_config_status(
         principal: Annotated[Principal, Depends(_principal)],
         embedding_config_service: Annotated[

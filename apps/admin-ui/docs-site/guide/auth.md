@@ -28,17 +28,30 @@ aforge_pat_<5位十六进制>_<32位随机串>
 |---|---|---|
 | `read` | 只读——查会话/run 状态、拉配额信息等 | 只需要轮询 run 状态或重放 SSE 事件(比如 `queue` 模式的轮询),不需要发起新 run |
 | `write` | 在 `read` 之上,可以创建/推进会话、发起 run | 调用 `POST /v1/agents/{agent_code}/runs` 必须要有它——接口要求调用方具备 session 资源的写权限 |
-| `admin` | 租户内几乎所有资源的读写删,包括创建/轮换/吊销其它 API Key、读密钥(secret)、改 role binding | **永远不要发给第三方对接方**——这档 scope 能让持有者给自己或别人再发新 key、读密钥,一旦泄露等于交出整个租户 |
+| `admin` | 在 `write` 之上,租户内资源的删除权 | 内部用途。API Key **不论 scope 都到不了租户控制台面**(见下),所以 `admin` 不再等于"交出整个租户";但它仍比对接方需要的权限宽,别发给第三方 |
 
-实操建议:发给外部集成方的 key 只给 `write`——发起 run、轮询状态、重放事件都够(`write` 含 `read` 的只读能力),不多给。纯只读的集成(只查不发起)给 `read` 一档即可。`admin` 只留给你自己团队内部管理这批 key 的场景。
+实操建议:发给外部集成方的 key 只给 `write`——发起 run、轮询状态、重放事件都够(`write` 含 `read` 的只读能力),不多给。纯只读的集成(只查不发起)给 `read` 一档即可。`admin` 现在只多出删除权,**管不了 key 本身**(那要管理员登录凭证),没什么理由发它。
 
-管理 key 本身的这几个接口对权限要求不完全一样——创建 / 轮换 / 查看明文需要 `api_key` 资源的写权限,吊销需要的是删除权限——但不管哪一种,都只有租户 `admin` 角色拥有,`write` / `read` scope 的 key 都够不着。也就是说这些操作通常是你的租户管理员在控制台里做,不是拿对接方自己的 key 去做。
+### API Key 够不到租户控制台面
+
+Key 只能走第三方对接面(`/v1/agents/{agent_code}/…`)。租户管理面——**管理 key 本身、
+成员名册、审计流水、租户配置与配额、MCP 注册表、长期记忆**——一律拒绝 API Key,
+返回 403:
+
+```json
+{"detail": {"code": "FORBIDDEN",
+            "message": "console API is not available to API keys; use /v1/agents/{agent_code}/…"}}
+```
+
+**这跟 scope 无关**——`admin` scope 的 key 一样被拒。scope 只在对接面内部区分能做什么。
+所以下面这些操作要用**租户管理员本人登录后的凭证**(控制台里做,或拿管理员 JWT 调),
+不能拿对接方的 key 去做。
 
 ## 创建一把 Key
 
 ```bash
 curl -X POST https://<your-domain>/v1/service_accounts/{service_account_id}/api_keys \
-  -H "Authorization: Bearer <管理员的凭证>" \
+  -H "Authorization: Bearer <租户管理员登录后的 JWT,不能用 API Key>" \
   -H "Content-Type: application/json" \
   -d '{"scopes": ["write"], "expires_at": null}'
 ```
@@ -74,7 +87,7 @@ curl -X POST https://<your-domain>/v1/service_accounts/{service_account_id}/api_
 
 ```bash
 curl -X POST https://<your-domain>/v1/api_keys/{api_key_id}/rotate \
-  -H "Authorization: Bearer <管理员的凭证>" \
+  -H "Authorization: Bearer <租户管理员登录后的 JWT,不能用 API Key>" \
   -H "Content-Type: application/json" \
   -d '{"grace_period_s": 300}'
 ```

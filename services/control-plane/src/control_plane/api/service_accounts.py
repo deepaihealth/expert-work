@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api.api_keys import _vault_name
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
@@ -61,7 +61,11 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_service_accounts_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/service_accounts", tags=["service_accounts"])
+    router = APIRouter(
+        prefix="/v1/service_accounts",
+        tags=["service_accounts"],
+        dependencies=[Depends(console_only())],
+    )
 
     @router.post("", status_code=201)
     async def create_service_account(

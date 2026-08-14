@@ -35,7 +35,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo, resolve_caller_user_id
 from control_plane.audit import emit
 from control_plane.auth.rbac import is_admin
@@ -199,7 +199,7 @@ async def _resolve_target_user(
 
 
 def build_memory_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/memory", tags=["memory"])
+    router = APIRouter(prefix="/v1/memory", tags=["memory"], dependencies=[Depends(console_only())])
 
     @router.get("")
     async def list_memories(

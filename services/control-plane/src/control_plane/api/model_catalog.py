@@ -13,6 +13,7 @@ from typing import Annotated, Protocol
 
 from fastapi import APIRouter, Depends, Request
 
+from control_plane.api._authz import console_only
 from control_plane.platform_secrets import PlatformSecretsService
 from expert_work.protocol import models_for_provider
 from expert_work.protocol.provider_catalog import PROVIDER_CATALOG
@@ -46,7 +47,9 @@ def _get_providers(request: Request) -> ConfiguredProviders:
 
 
 def build_model_catalog_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/model-catalog", tags=["agents"])
+    router = APIRouter(
+        prefix="/v1/model-catalog", tags=["agents"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("")
     async def get_model_catalog(

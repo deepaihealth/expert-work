@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -61,7 +61,14 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_role_bindings_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/role_bindings", tags=["role_bindings"])
+    router = APIRouter(
+        prefix="/v1/role_bindings",
+        tags=["role_bindings"],
+        # 阶段 1.2 —— tenant management surface, not a third-party one. The
+        # DELETE carried only RBAC; its two siblings gate on system_admin
+        # inline. Router level so the whole surface answers one way.
+        dependencies=[Depends(console_only())],
+    )
 
     @router.post("", status_code=201)
     async def create_role_binding(
@@ -169,7 +176,9 @@ def build_role_bindings_router() -> APIRouter:
             "error": None,
         }
 
-    @router.delete("/{binding_id}", status_code=204)
+    # 阶段 1.2 —— the sibling routes on this router are system_admin-gated
+    # inline; this one was reachable by any API key whose scopes cover it.
+    @router.delete("/{binding_id}", status_code=204, dependencies=[Depends(console_only())])
     async def delete_role_binding(
         binding_id: UUID,
         principal: Annotated[Principal, Depends(require("role_binding", "delete"))],

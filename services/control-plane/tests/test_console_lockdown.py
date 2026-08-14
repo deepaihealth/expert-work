@@ -173,6 +173,22 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
     "/v1/eval-datasets",
     "/v1/eval-runs",
     "/v1/quality",
+    # 阶段 1.2 — the tenant-management surface. These carried RBAC but no
+    # *plane* gate, so an ``admin``-scope API key reached them: minting and
+    # revealing sibling keys, inviting members and resetting their passwords,
+    # reading the audit trail, rewriting tenant config and quota.
+    "/v1/members",
+    "/v1/api_keys",
+    "/v1/service_accounts",
+    "/v1/role_bindings",
+    "/v1/audit",
+    "/v1/sandbox-egress-audit",
+    "/v1/usage",
+    "/v1/quota",
+    "/v1/memory",
+    "/v1/mcp-servers",
+    "/v1/mcp-oauth",
+    "/v1/model-catalog",
 )
 
 #: Console routes that a **prefix** can never reach, because they live under

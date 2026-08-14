@@ -17,7 +17,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.tenant_scope import (
     CrossTenant,
     cross_tenant_query_enabled,
@@ -73,7 +73,9 @@ def _record_dict(r: EgressAuditRecord) -> dict[str, object]:
 
 
 def build_sandbox_egress_audit_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/sandbox-egress-audit", tags=["audit"])
+    router = APIRouter(
+        prefix="/v1/sandbox-egress-audit", tags=["audit"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("", response_model=None)
     async def list_egress_audit(
