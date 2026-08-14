@@ -18,6 +18,29 @@
 - 对外契约变更要同步文档站,**不允许把说谎的文档留在 main 上**(Task 7)。
 - 提交信息用中文,遵循 `<type>: <description>`。
 
+---
+
+> ## ⚠️ 2026-08-14 重做裁定 —— 先读这一段
+>
+> **Task 1 的"生产者预分配 seq"方案、Task 2.5 的不变式、以及 Task 3 的整套接合算法
+> (pending 重排窗口 / 两个泄压维度 / missing 名单)全部作废,由下方的 【Task 3R】取代。**
+>
+> 起因:用户要求先看业界怎么解决。查下来结论很干脆 —— **乱序是我们自己造出来的**。
+> Redis Streams(`XADD *` 由服务端在 append 那一刻发号)、Kafka(broker 作为单写者
+> 在 append 时分配 offset,顺序与幂等去重都建立在这个串行化点上)、LangGraph Platform
+> (事件自带顺序元数据),做法一致:**发号权归日志,不归生产者**。
+>
+> 我们现在是生产者先领号、再 `await` 推 bridge,领号与入队之间那个 await 就是乱序的
+> 来源;而 bridge 自己的发号(`memory.py::_next_id`)又恰好写在临界区**外面**。
+> 把发号挪进 `async with stream.condition` 并让 `publish` 返回 seq,
+> **bridge 顺序恒等于 seq 顺序,乱序在物理上不可能发生**,撞号也由锁本身杜绝
+> (比"抢在 await 之前"这种时序约定可靠得多)。
+>
+> 于是 pending / missing / `_REORDER_WINDOW` / 泄压两维度**全部退场** —— 删掉的正是
+> 全 PR 最难证明正确的那一段。**净减代码。**
+>
+> 已完成且**不受影响**的:Task 2(端到端 seq 自证)、Task 4(回放分页)、Task 5(end 帧状态)。
+
 ## 验证条件矩阵(每个 Task 的测试必须落在"会红"那一列)
 
 | 改的东西 | 会红的条件 | 恒绿的假验证(明确避开) |
@@ -331,6 +354,177 @@ git add -A && git commit -m "fix(sse): live 分支认 since_seq——补库接�
 
 ---
 
+### 【Task 3R】重做:发号权归 bridge,接合退化成去重
+
+**本 Task 取代 Task 1 的"生产者预分配 seq"、Task 2.5 的不变式、以及 Task 3 的整套接合算法。**
+已落地的 `57d0f648`(Task 3)和 `3432a82d`(Task 3-fix)的接合逻辑要重写;`ee49b042`(Task 2.5)
+钉的不变式将不复存在,那条测试必须**改成钉新不变式或删除** —— 不允许留一条测不到任何东西的测试。
+
+**Files:**
+- Modify: `packages/expert-work-runtime/src/expert_work/runtime/stream_bridge/base.py`
+- Modify: `packages/expert-work-runtime/src/expert_work/runtime/stream_bridge/memory.py`
+- Modify: `services/orchestrator/src/orchestrator/sse.py`
+- Modify: `services/control-plane/src/control_plane/api/_run_event_stream.py`
+- Test: `packages/expert-work-runtime/tests/test_in_memory_stream_bridge.py`
+- Test: `services/control-plane/tests/test_run_event_stream.py`
+- Test: Task 2.5 那条并发测试所在文件
+
+#### 为什么重做(裁定依据)
+
+现在是**生产者预分配**:`seq = _alloc_seq()` → `await bridge.publish(...)` → `_enqueue_event(seq, ...)`。
+领号和入队之间隔着一个 `await`,并发 worker 一交错就乱序。而 bridge 自己的发号
+(`memory.py::_next_id`)又恰好写在 `async with stream.condition` **外面**。
+
+业界做法一致 —— **发号权归日志,不归生产者**:
+
+- **Redis Streams**:`XADD *` 由服务端在 append 那一刻发 `<毫秒>-<序号>`。客户端自带 ID 时,
+  必须自己保证严格大于流中现有全部 ID,否则命令失败。
+- **Kafka**:broker 作为单写者在 append 时分配 offset;顺序与幂等去重都建立在这个串行化点上。
+  生产者预分配序号正是它明确不做的事。
+- **LangGraph Platform**(本 bridge 结构上照抄的对象):事件自带顺序元数据,客户端凭
+  "最后见过的那个"续接。
+
+把发号挪进临界区并让 `publish` 返回号之后:**bridge 顺序恒等于 seq 顺序,乱序在物理上
+不可能发生**;撞号由锁本身杜绝,比"抢在 await 之前"这种时序约定可靠得多。
+
+#### 契约(照这个实现,别自创)
+
+```python
+# base.py —— 两个方法代替原来一个,避免 Optional 返回值污染调用方
+async def publish(self, run_id: UUID, event: str, data: Any) -> int:
+    """发布一帧可回放的事件,返回 bridge 分配的 seq。
+
+    seq 的分配与入队在同一个临界区内完成 —— 这是本类的核心不变式:
+    **订阅者看到的帧顺序恒等于 seq 顺序**。调用方不得自己发号。
+    """
+
+async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
+    """发布一帧一次性事件(当前只有 ``token``):不发号、不带 ``id:``、不可回放。"""
+
+async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
+    """HA failover:被接管的 run 在新副本上重入时,把发号器推过前任已落库的尾部,
+    否则新号会与前任的行撞 ``(run_id, seq)`` 主键。"""
+```
+
+`memory.py` 的实现要点:
+
+```python
+async def publish(self, run_id, event, data) -> int:
+    stream = self._get_or_create_stream(run_id)
+    async with stream.condition:                    # ← 发号必须在锁内
+        seq = self._counters[run_id]
+        self._counters[run_id] = seq + 1
+        entry = StreamEvent(id=f"{int(time.time() * 1000)}-{seq}", event=event, data=data)
+        stream.events.append(entry)
+        ...(溢出丢弃逻辑不变)...
+        stream.condition.notify_all()
+    return seq
+```
+
+`seed_seq` 用 `max(现值, next_seq)` 写入,防止迟到的播种把发号器往回拨。
+`_next_id` 删除。
+
+`sse.py` 的改动:
+
+- **删掉** `_alloc_seq` 和 `event_seq` 这个 nonlocal —— 生产者不再持有任何计数器。
+- `_publish_frame` 变成两行:`seq = await bridge.publish(run_id, event_name, data)`
+  然后 `_enqueue_event(seq, event_name, data)`。
+- `_publish_token` 改调 `publish_ephemeral`。
+- resume 播种从 `event_seq = await event_store.next_seq(...)` 改成
+  `await bridge.seed_seq(run_id, next_seq=await event_store.next_seq(run_id=run_id))`,
+  触发条件不变(`event_store is not None and is_resume`)。
+
+#### live 接合(取代 Task 3 的整套算法)
+
+```
+last = since_seq if since_seq is not None else -1
+
+1. 补库:循环 event_store.list(run_id, since_seq=last, limit=MAX_LIST_LIMIT)
+   直到某页返回条数 < limit。每行 yield,last = row.seq。
+2. 挂实时流 async for entry in bridge.subscribe(run_id, ...):
+   - entry.id is None(token 帧) → 直接 yield
+   - seq <= last   → 丢弃(补库阶段已发过)
+   - seq == last+1 → yield,last = seq
+   - seq >  last+1 → **真缺口**(唯一成因是 bridge 缓冲区 256 帧 drop-oldest)。
+       先 event_store.list(since_seq=last, limit=MAX_LIST_LIMIT) 补齐能补的,
+       逐行 yield 并推进 last;
+       若补完仍有 last+1 < seq,yield 一帧 `gap`:
+           event: gap
+           data: {"from": last+1, "to": seq-1}
+       再 yield entry,last = seq。
+```
+
+**pending / missing / `_REORDER_WINDOW` / 两个泄压维度 / end 前排空 pending —— 全部删除。**
+跳号现在**没有歧义**:bridge 顺序恒等于 seq 顺序,所以 `seq > last+1` 只可能是真缺口。
+
+**为什么用 `gap` 帧而不是服务端记账**:缺口天然有界(一帧就是一帧,不占内存),而且把
+"这里缺了 5~34"变成客户端看得见、能自己决定要不要重拉的信息,而不是服务端偷偷积累一个
+无上限的集合。pub/sub 领域的通行做法(缺口 tombstone 帧)就是这个。`gap` 帧**无 `id:`、不落库**
+——它描述的是这条连接的状况,不是 run 的事件。
+
+- [ ] **Step 1:写失败测试(六条)**
+
+1. `test_bridge_order_equals_seq_order_under_concurrency`(**本 Task 的命门**)——
+   N 个协程并发 `publish`,订阅者收到的 numbered 帧 id 里的 seq 必须**严格递增**,
+   且 `publish` 各自的返回值集合恰为 `range(N)`、无重复。
+2. `test_ephemeral_frames_carry_no_id_and_no_seq` —— `publish_ephemeral` 的帧 `id is None`,
+   且不消耗号(前后两帧 numbered 的 seq 连续)。
+3. `test_seed_seq_pushes_counter_past_durable_tail` —— 播种后第一个 `publish` 返回 `next_seq`;
+   迟到的小值播种不会把发号器拨回去。
+4. `test_live_reconnect_backfills_from_store` —— **RUNNING** 状态的 run,库里已有 seq 0..4,
+   带 `since_seq=1` 重连 → 收到 2,3,4。
+5. `test_live_reconnect_dedupes_overlap` —— 补库给到 seq 4,bridge 推 3,4,5 → 只收到 5。
+6. `test_live_unfillable_gap_emits_gap_frame` —— 补库给到 seq 2,bridge 推 seq 8,库里只有 3,4
+   → 依次收到 3、4、一帧 `gap {"from":5,"to":7}`、然后 8。
+
+第 4~6 条**必须在 RUNNING 状态的 run 上跑**(`is_terminal=False`),否则走的是 replay 分支,
+测了等于没测。
+
+- [ ] **Step 2:跑测试确认失败**
+
+Run:
+```bash
+cd packages/expert-work-runtime && DOCKER_HOST= uv run pytest tests/test_in_memory_stream_bridge.py -v
+cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_run_event_stream.py -v -k live
+```
+
+- [ ] **Step 3:实现契约变更(bridge + sse.py)**
+
+- [ ] **Step 4:重写 live 接合,删掉旧机制**
+
+删除清单(逐项确认没有残留死代码):`_REORDER_WINDOW`、pending 容器、missing 容器、
+两个泄压维度、end 前排空 pending 的分支、`sse.py::_alloc_seq`、`event_seq` nonlocal。
+
+- [ ] **Step 5:处置 Task 2.5 那条并发测试**
+
+它钉的不变式("同步分配抢在 await 之前")已经不存在。两条路二选一,在报告里说明选了哪条:
+(a) 改成钉新不变式 —— 与测试 1 合并;(b) 删除。**不允许原样留着** —— 一条测不到任何
+东西的测试比没有测试更坏,它会给坏版本发合格证。
+
+- [ ] **Step 6:跑测试确认通过**
+
+- [ ] **Step 7:变异自证(四条)**
+
+| 变异 | 必须变红 |
+|---|---|
+| 把发号从 `async with stream.condition` 里挪到锁外面,**并在发号与加锁之间插一句 `await asyncio.sleep(0)`** | 测试 1 |
+| 去重条件 `<= last` 改成 `< last` | 测试 5 |
+| 删掉 `gap` 帧那一支 | 测试 6 |
+| 补库循环改成只读一页(需配一个 >`MAX_LIST_LIMIT` 帧的 RUNNING run 测试;现有六条不咬就补第七条) | 新测试 |
+
+**第一条变异必须带那句 `sleep(0)`,这不是可选的**:未争用的 `asyncio.Lock` 获取**不会**让出
+控制权,所以只把发号移出锁而不加让出点,协程根本不会交错,变异会"存活"而让你误判测试
+是空转。这正是本仓库记录过的失败形态。每次变异前 `git diff` 确认落地;还原**一律用
+scratchpad 副本**,不许用任何 git 命令还原未提交状态。
+
+- [ ] **Step 8:提交**
+
+```bash
+git add -A && git commit -m "refactor(sse): 发号权归 bridge——锁内原子分配,接合退化成去重 + gap 帧"
+```
+
+---
+
 ### Task 4:回放分页 —— 截断不再假装流结束
 
 **Files:**
@@ -488,9 +682,18 @@ git add -A && git commit -m "fix(admin-ui): 事件流跟游标翻页,长 run 不
 | `run-agent.md:247` | 同样说 `since_seq` 在 live 分支不生效 | 同步改 |
 | `quickstart.md:38` | 样例 `data: {"run_id":"...","thread_id":"...","trace_id":"..."}` | 删掉 `trace_id` |
 
-- [ ] **Step 2:补 `truncated` 帧和 `end.status` 到事件表**
+- [ ] **Step 2:补 `truncated` / `gap` 帧和 `end.status` 到事件表**
 
-`sse-events.md` 的事件类型表加两行(`truncated` 一行;`end` 行补 `data` 说明)。完整的帧字段详解归 PR-2。
+`sse-events.md` 的事件类型表加三行(`truncated`、`gap`;`end` 行补 `data` 说明)。完整的帧字段详解归 PR-2。
+
+三条**必须写清楚**的口径(都是本 PR 造成的行为变化,漏了就是留说谎文档):
+
+1. **不带 `since_seq` 重连 = 从落库第 0 帧回放整个 run**,不是只补最近一段。
+   (旧行为是从 bridge 缓冲区最早保留的那帧开始,最多回看 256 帧。)
+2. **`truncated` 收尾的那一页不发 `end`**,所以那一页没有 `status` —— 客户端要循环拉到
+   收到 `end` 才看得到终局状态。
+3. **`gap` 帧的含义**:这一段帧在**这条连接**上补不到了(服务端缓冲已滚过、且尚未落盘),
+   不代表它们不存在。run 结束后重新回放通常能拿到。`gap` 帧无 `id:`、不可回放。
 
 - [ ] **Step 3:文档站构建**
 
@@ -536,4 +739,16 @@ Run: `cd apps/admin-ui && pnpm vitest run && pnpm tsc --noEmit && pnpm build`
 
 - [ ] **Step 4:开 PR**
 
-PR 描述要列出:四条缺陷各自的**会红条件**与对应测试、变异自证的结果、前端 6 处 `end` 消费点的核查结论、以及 `truncated` 帧这一处对 spec 的增补及其理由。
+PR 描述要列出:
+
+- 四条缺陷各自的**会红条件**与对应测试、变异自证的结果。
+- 前端 `end` 消费点的核查结论(实测是 **10 处**,不是本计划初稿写的 6 处)。
+- 两处对 spec 的增补及其理由:`truncated` 帧(浏览器 `EventSource` 读不到响应头,
+  只给 header 的信号对一整类客户端不可用)、`gap` 帧(缺口天然有界,且把状况交给
+  客户端判断而不是服务端积累无上限的记账)。
+- **发号权归 bridge 这个架构裁定**及其依据(Redis Streams / Kafka / LangGraph Platform
+  一致的做法:发号权归日志不归生产者),以及它删掉了哪些东西(pending 重排窗口、
+  missing 名单、`_REORDER_WINDOW`、两个泄压维度)。
+- **行为变化**:`since_seq=None` 的 live 重连从"bridge 缓冲区最早保留帧(≤256)"
+  变成"落库第 0 帧起回放整个 run";控制台调试台 / 对话详情页 / run 详情页三个页面
+  都吃这条路径。
