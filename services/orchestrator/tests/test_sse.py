@@ -25,7 +25,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from expert_work.common.observability import init_tracing
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult
 from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord, RunStatus
-from expert_work.runtime.stream_bridge import END_SENTINEL, InMemoryStreamBridge
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator.sse import (
     _to_jsonable,
     format_sse,
@@ -90,7 +90,7 @@ async def _drain(bridge: InMemoryStreamBridge, run_id: Any) -> list[Any]:
     """Collect all retained events for a finished run, up to END."""
     events: list[Any] = []
     async for entry in bridge.subscribe(run_id, heartbeat_interval=5.0):
-        if entry is END_SENTINEL:
+        if is_end(entry):
             break
         events.append(entry)
     return events
@@ -352,7 +352,7 @@ async def test_backpressure_drop_oldest() -> None:
 
     for seq in range(20):
         await bridge.publish(run_id, "updates", {"seq": seq})
-    await bridge.publish_end(run_id)
+    await bridge.publish_end(run_id, status="success")
 
     events = await _drain(bridge, run_id)
     # Only the last 8 survive; the first 12 were dropped.
@@ -417,7 +417,7 @@ async def test_disconnect_after_run_finished_is_noop() -> None:
     rm = RunManager()
     record = await _new_record(rm)
     await rm.set_status(record.run_id, RunStatus.SUCCESS)
-    await bridge.publish_end(record.run_id)
+    await bridge.publish_end(record.run_id, status="success")
 
     async for _frame in sse_consumer(
         bridge=bridge,

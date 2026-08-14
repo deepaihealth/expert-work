@@ -27,6 +27,7 @@ from expert_work.runtime.stream_bridge.base import (
     HEARTBEAT_SENTINEL,
     StreamBridge,
     StreamEvent,
+    is_end,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,11 @@ class _RunStream:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     ended: bool = False
     start_offset: int = 0
+    #: Terminal status handed to :meth:`InMemoryStreamBridge.publish_end`.
+    #: Lives per run — the end frame is minted from it at subscribe time
+    #: rather than stored on the module-level ``END_SENTINEL`` singleton,
+    #: which would leak one run's status into every other run's stream.
+    end_status: str | None = None
 
 
 class InMemoryStreamBridge(StreamBridge):
@@ -54,26 +60,21 @@ class InMemoryStreamBridge(StreamBridge):
     def __init__(self, *, queue_maxsize: int = 256) -> None:
         self._maxsize = queue_maxsize
         self._streams: dict[UUID, _RunStream] = {}
-        self._counters: dict[UUID, int] = {}
 
     # -- helpers ---------------------------------------------------------------
 
     def _get_or_create_stream(self, run_id: UUID) -> _RunStream:
         if run_id not in self._streams:
             self._streams[run_id] = _RunStream()
-            self._counters[run_id] = 0
         return self._streams[run_id]
-
-    def _next_id(self, run_id: UUID) -> str:
-        self._counters[run_id] = self._counters.get(run_id, 0) + 1
-        ts = int(time.time() * 1000)
-        seq = self._counters[run_id] - 1
-        return f"{ts}-{seq}"
 
     def _resolve_start_offset(self, stream: _RunStream, last_event_id: str | None) -> int:
         if last_event_id is None:
             return stream.start_offset
         for index, entry in enumerate(stream.events):
+            # ``entry.id`` is ``None`` for token frames; ``None == str`` is
+            # always False, so they can never match a cursor. Intentional —
+            # a non-replayable frame is not a legal resume anchor.
             if entry.id == last_event_id:
                 return stream.start_offset + index + 1
         if stream.events:
@@ -85,9 +86,12 @@ class InMemoryStreamBridge(StreamBridge):
 
     # -- StreamBridge API ------------------------------------------------------
 
-    async def publish(self, run_id: UUID, event: str, data: Any) -> None:
+    async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
         stream = self._get_or_create_stream(run_id)
-        entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
+        # ``seq`` comes from the caller (``run_agent``'s durable counter) —
+        # the bridge no longer numbers frames itself. ``None`` ⇒ no ``id:``.
+        entry_id = None if seq is None else f"{int(time.time() * 1000)}-{seq}"
+        entry = StreamEvent(id=entry_id, event=event, data=data)
         async with stream.condition:
             stream.events.append(entry)
             if len(stream.events) > self._maxsize:
@@ -96,10 +100,11 @@ class InMemoryStreamBridge(StreamBridge):
                 stream.start_offset += overflow
             stream.condition.notify_all()
 
-    async def publish_end(self, run_id: UUID) -> None:
+    async def publish_end(self, run_id: UUID, *, status: str) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             stream.ended = True
+            stream.end_status = status
             stream.condition.notify_all()
 
     async def subscribe(
@@ -128,7 +133,13 @@ class InMemoryStreamBridge(StreamBridge):
                     entry = stream.events[local_index]
                     next_offset += 1
                 elif stream.ended:
-                    entry = END_SENTINEL
+                    # Minted per subscription so it carries *this* run's
+                    # terminal status; read under the lock with the flag.
+                    entry = StreamEvent(
+                        id=None,
+                        event=END_SENTINEL.event,
+                        data={"status": stream.end_status},
+                    )
                 else:
                     try:
                         await asyncio.wait_for(stream.condition.wait(), timeout=heartbeat_interval)
@@ -137,17 +148,14 @@ class InMemoryStreamBridge(StreamBridge):
                     else:
                         continue
 
-            if entry is END_SENTINEL:
-                yield END_SENTINEL
-                return
             yield entry
+            if is_end(entry):
+                return
 
     async def cleanup(self, run_id: UUID, *, delay: float = 0) -> None:
         if delay > 0:
             await asyncio.sleep(delay)
         self._streams.pop(run_id, None)
-        self._counters.pop(run_id, None)
 
     async def close(self) -> None:
         self._streams.clear()
-        self._counters.clear()

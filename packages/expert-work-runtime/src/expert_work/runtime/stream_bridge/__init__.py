@@ -16,6 +16,9 @@ from expert_work.runtime.stream_bridge.base import (
 from expert_work.runtime.stream_bridge.base import (
     StreamEvent as StreamEvent,
 )
+from expert_work.runtime.stream_bridge.base import (
+    is_end as is_end,
+)
 from expert_work.runtime.stream_bridge.factory import (
     StreamBridgeBackend as StreamBridgeBackend,
 )
@@ -33,5 +36,6 @@ __all__ = [
     "StreamBridge",
     "StreamBridgeBackend",
     "StreamEvent",
+    "is_end",
     "make_stream_bridge",
 ]

@@ -126,6 +126,9 @@ from expert_work.runtime.stream_bridge import (
     StreamEvent as StreamEvent,
 )
 from expert_work.runtime.stream_bridge import (
+    is_end as is_end,
+)
+from expert_work.runtime.stream_bridge import (
     make_stream_bridge as make_stream_bridge,
 )
 
@@ -166,6 +169,7 @@ __all__ = [
     "TenantAwareRedactor",
     "get_current_tenant",
     "get_current_trace_id",
+    "is_end",
     "make_checkpointer",
     "make_object_store",
     "make_store",

@@ -19,7 +19,7 @@ from uuid import UUID
 
 from expert_work.runtime.runs import RunEventStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
-from expert_work.runtime.stream_bridge import END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge
+from expert_work.runtime.stream_bridge import HEARTBEAT_SENTINEL, StreamBridge, is_end
 from orchestrator.sse import format_sse
 
 
@@ -89,7 +89,9 @@ def build_event_producer(
             if entry is HEARTBEAT_SENTINEL:
                 yield b": heartbeat\n\n"
                 continue
-            if entry is END_SENTINEL:
+            if is_end(entry):
+                # Task 5 will surface ``entry.data``'s terminal status here;
+                # for now the wire format is unchanged (``data: null``).
                 yield format_sse("end", None)
                 return
             yield format_sse(entry.event, entry.data, event_id=entry.id or None)

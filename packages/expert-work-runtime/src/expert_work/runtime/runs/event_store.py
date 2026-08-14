@@ -310,7 +310,8 @@ def make_event_record(
 
     Producer-side helper so ``run_agent`` can drop one-liners next to
     its existing ``bridge.publish`` calls; ``created_at_ms`` defaults to
-    ``time.time() * 1000`` matching ``StreamBridge._next_id``.
+    ``time.time() * 1000``, the same clock ``InMemoryStreamBridge.publish``
+    stamps the live frame id with.
     """
     if created_at_ms is None:
         import time

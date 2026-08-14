@@ -26,7 +26,7 @@ from expert_work.runtime.runs import (
     RunStatus,
     make_event_record,
 )
-from expert_work.runtime.stream_bridge import END_SENTINEL, InMemoryStreamBridge
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator import sse as sse_module
 from orchestrator.sse import (
     _BACKGROUND_PERSIST_WRITERS,
@@ -73,7 +73,7 @@ async def _new_record(rm: RunManager) -> RunRecord:
 async def _drain(bridge: InMemoryStreamBridge, run_id: UUID) -> list[Any]:
     events: list[Any] = []
     async for entry in bridge.subscribe(run_id, heartbeat_interval=5.0):
-        if entry is END_SENTINEL:
+        if is_end(entry):
             break
         events.append(entry)
     return events

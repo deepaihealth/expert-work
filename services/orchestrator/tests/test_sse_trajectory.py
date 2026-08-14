@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord
 from expert_work.runtime.storage import InMemoryObjectStore
-from expert_work.runtime.stream_bridge import END_SENTINEL, InMemoryStreamBridge
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator.errors import MaxStepsExceededError
 from orchestrator.sse import run_agent
 from orchestrator.trajectory import TrajectoryRecorder
@@ -76,7 +76,7 @@ async def _new_record(
 async def _drain(bridge: InMemoryStreamBridge, run_id: Any) -> None:
     """Drain the bridge to END so the test doesn't leak the subscriber."""
     async for entry in bridge.subscribe(run_id, heartbeat_interval=5.0):
-        if entry is END_SENTINEL:
+        if is_end(entry):
             break
 
 

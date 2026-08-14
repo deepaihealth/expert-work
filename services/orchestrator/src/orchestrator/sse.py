@@ -79,9 +79,9 @@ from expert_work.runtime.runs import (
     make_event_record,
 )
 from expert_work.runtime.stream_bridge import (
-    END_SENTINEL,
     HEARTBEAT_SENTINEL,
     StreamBridge,
+    is_end,
 )
 from orchestrator.errors import MaxStepsExceededError
 from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY, COMPACTION_SINK_KEY, TOKEN_SINK_KEY
@@ -259,6 +259,26 @@ async def _heartbeat_loop(run_manager: RunManager, run_id: UUID, record: Any) ->
         return
 
 
+#: 内部 outcome 词表 → 对外 end 帧的 status。对外只暴露四值:
+#: 内部把"用户取消"分成 INTERRUPTED 与 RunCancelledError 两条路径,
+#: 对第三方没有区别;max_steps 对客户端而言就是失败。
+#: ``paused`` 必须独立 —— 它是"等人审批,对话还会继续",不是错误,
+#: 客户端要弹审批界面而不是报错。
+_EXTERNAL_END_STATUS: Final = {
+    "success": "success",
+    "paused": "paused",
+    "interrupted": "interrupted",
+    "cancelled": "interrupted",
+    "max_steps": "error",
+    "error": "error",
+}
+
+
+def _external_end_status(session_outcome: str) -> str:
+    """Map ``run_agent``'s internal outcome label to the client-facing status."""
+    return _EXTERNAL_END_STATUS.get(session_outcome, "error")
+
+
 async def run_agent(
     *,
     bridge: StreamBridge,
@@ -350,9 +370,12 @@ async def run_agent(
     retry_attempts = 0
     # Stream H.3 PR 3 — per-run sequence counter for RunEventStore mirror.
     # Starts at 0; increments before each persist call so the seq in the
-    # durable row matches its insertion order. The bridge has its own
-    # internal counter; the two are independent (replay endpoint emits
-    # SSE id from the persisted ``created_at_ms`` + ``seq``).
+    # durable row matches its insertion order. P3 PR-1 — this is now the
+    # **only** counter in the system: the same number is handed to
+    # ``bridge.publish(seq=...)``, so a live frame's SSE id and its durable
+    # row agree. (It used to be one of two, and the bridge's own counter also
+    # numbered token frames, which made every live id run ahead of the seq a
+    # client could replay from.)
     # Stream 9.4 (HA failover) — a peer that resumed a reclaimed run re-enters
     # here; seed past the prior owner's durable frames so the resumed run's
     # events stay append-only (a fresh 0 would collide on ``(run_id, seq)``).
@@ -366,12 +389,19 @@ async def run_agent(
     # 队满 drop-oldest(H-7 立场:调试台 replay 可容忍缺帧,live SSE 不能慢)。
     persist_queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=_PERSIST_QUEUE_MAX)
 
-    def _enqueue_event(event_name: str, data: Any) -> None:
+    def _alloc_seq() -> int:
+        """同步分配落库 seq —— 全程无 await。并发 worker 交错调用本函数
+        不会撞号(sse.py 原 _enqueue_event 的铁律,提取后仍然成立)。"""
         nonlocal event_seq
-        # seq 分配先于 event_store 判空——与现状 event_seq 无条件递增的
-        # 行为完全一致(即便没有 store,resume 场景的种子计数仍要对齐)。
         seq = event_seq
         event_seq += 1
+        return seq
+
+    def _enqueue_event(seq: int, event_name: str, data: Any) -> None:
+        # 号由调用方(_publish_frame)在任何 await 之前分配好传进来;
+        # 本函数只负责落库入队。没有 store 时整帧不落库,但号照发 ——
+        # 与现状 event_seq 无条件递增的行为完全一致(resume 场景的种子
+        # 计数仍要对齐)。
         if event_store is None:
             return
         record_ = make_event_record(run_id=run_id, seq=seq, event_name=event_name, data=data)
@@ -379,6 +409,17 @@ async def run_agent(
             persist_queue.put_nowait(record_)
         except asyncio.QueueFull:
             _put_dropping_oldest(persist_queue, record_)
+
+    async def _publish_frame(event_name: str, data: Any) -> None:
+        """一帧同时进 bridge(实时)和落库队列(回放),共用同一个 seq。
+
+        实时帧的 SSE ``id:`` 与落库行的 ``run_event.seq`` 因此同源 —— 客户端
+        从帧 id 里取出的 seq 拿去当 ``since_seq`` 回放才不会跳过真实存在的帧。
+        token 帧不走这里(它不落库、不占号,见 ``_publish_token``)。
+        """
+        seq = _alloc_seq()
+        await bridge.publish(run_id, event_name, data, seq=seq)
+        _enqueue_event(seq, event_name, data)
 
     # mypy: event_store is RunEventStore | None here; _persist_writer wants a
     # concrete RunEventStore. No writer (and no queue consumer) when there's
@@ -430,8 +471,7 @@ async def run_agent(
     # never raises (queue put is synchronous) and the background persist
     # writer swallows its own (H-7).
     async def _publish_compaction(payload: Any) -> None:
-        await bridge.publish(run_id, EventType.COMPACTION.value, payload)
-        _enqueue_event(EventType.COMPACTION.value, payload)
+        await _publish_frame(EventType.COMPACTION.value, payload)
 
     # 一期 Task 3 —— ``source`` 路径的赢家标记。token / node 两条路径互斥、
     # 先到先得;声明在 ``_publish_token`` 定义之前,闭包用 ``nonlocal`` 改写。
@@ -440,7 +480,10 @@ async def run_agent(
     async def _publish_token(frame: Any) -> None:
         nonlocal first_output_recorded
         # Live-only: token frames are provisional; do NOT mirror to the event
-        # store (the authoritative ``updates`` frame is what replays).
+        # store (the authoritative ``updates`` frame is what replays). No
+        # ``seq`` either — an unreplayable frame must not burn a sequence
+        # number, or every id a client parses off the live stream runs ahead
+        # of what ``since_seq`` can actually replay.
         if not first_output_recorded:
             first_output_recorded = True
             _first_output_seconds.labels(source="token").observe(time.monotonic() - ttft_started)
@@ -451,19 +494,16 @@ async def run_agent(
     # 库,实时与回放同源。与 _publish_compaction 的关键差异:并发
     # worker(≤dynamic_worker_max_concurrent)会交错 await 本函数,seq
     # 必须在任何 await 之前同步分配,否则两帧读到同一 event_seq 撞
-    # (run_id, seq) 主键 —— 二期 PR3 起这条铁律由 _enqueue_event 内部
-    # 保证(其 seq 读取+自增全程无 await,不管调用方在 bridge.publish
-    # 前后调它都不会撞号),本函数不再手工预分配。
+    # (run_id, seq) 主键 —— P3 PR-1 起这条铁律由 _publish_frame 保证
+    # (它先同步 _alloc_seq() 再 await),本函数不再手工预分配。
     async def _publish_worker(frame: dict[str, Any]) -> None:
-        await bridge.publish(run_id, "worker", frame)
-        _enqueue_event("worker", frame)
+        await _publish_frame("worker", frame)
 
     # B3 — guard marker 帧 sink(_publish_worker 同款:seq 分配交给
-    # _enqueue_event;worker 树里的 guard 也经它)。无条件注入 ——
+    # _publish_frame;worker 树里的 guard 也经它)。无条件注入 ——
     # max_steps / no_progress 的 tripped 可见化与 token 预算是否启用无关。
     async def _publish_guard(frame: dict[str, Any]) -> None:
-        await bridge.publish(run_id, "guard", frame)
-        _enqueue_event("guard", frame)
+        await _publish_frame("guard", frame)
 
     # ``configurable`` was populated in the effective_config literal above.
     effective_config["configurable"][COMPACTION_SINK_KEY] = _publish_compaction
@@ -482,8 +522,7 @@ async def run_agent(
             _heartbeat_loop(run_manager, run_id, record), name=f"run-heartbeat-{run_id}"
         )
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
-        await bridge.publish(run_id, "metadata", metadata_payload)
-        _enqueue_event("metadata", metadata_payload)
+        await _publish_frame("metadata", metadata_payload)
 
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,
@@ -545,8 +584,7 @@ async def run_agent(
                             for node_val in jsonable_chunk.values():
                                 if isinstance(node_val, dict):
                                     node_val["_duration_ms"] = duration_ms
-                        await bridge.publish(run_id, stream_mode, jsonable_chunk)
-                        _enqueue_event(stream_mode, jsonable_chunk)
+                        await _publish_frame(stream_mode, jsonable_chunk)
                 except Exception as exc:
                     if (
                         retry_attempts >= MAX_RUN_RETRIES
@@ -570,8 +608,7 @@ async def run_agent(
                         "error_class": type(exc).__name__,
                         "backoff_s": backoff_s,
                     }
-                    await bridge.publish(run_id, "retry", retry_payload)
-                    _enqueue_event("retry", retry_payload)
+                    await _publish_frame("retry", retry_payload)
                     # Abort-aware backoff: a timeout means the backoff simply
                     # elapsed; a cancel during the wait exits immediately and
                     # takes the INTERRUPTED path below.
@@ -646,8 +683,7 @@ async def run_agent(
                 "thread_id": str(record.thread_id),
                 **pending_request.model_dump(mode="json"),
             }
-            await bridge.publish(run_id, "approval", approval_payload)
-            _enqueue_event("approval", approval_payload)
+            await _publish_frame("approval", approval_payload)
             # PAUSED is itself a terminal branch here (no further set_status
             # call follows on this path within this function invocation) —
             # flush now so the approval row is durable before run_agent
@@ -730,8 +766,7 @@ async def run_agent(
             exc.max_steps,
         )
         error_payload = {"message": str(exc), "name": type(exc).__name__}
-        await bridge.publish(run_id, "error", error_payload)
-        _enqueue_event("error", error_payload)
+        await _publish_frame("error", error_payload)
         # set_status(ERROR) already fired above (before the error frame
         # existed) — drain here instead flushes it (+ anything still queued)
         # before the run's terminal path continues.
@@ -760,8 +795,7 @@ async def run_agent(
         await run_manager.set_status(run_id, RunStatus.ERROR, error=str(exc))
         logger.exception("run_agent.failed run_id=%s", run_id)
         error_payload = {"message": str(exc), "name": type(exc).__name__}
-        await bridge.publish(run_id, "error", error_payload)
-        _enqueue_event("error", error_payload)
+        await _publish_frame("error", error_payload)
         # Same rationale as the MaxSteps branch above.
         await _drain_persist_queue()
         await _emit_run_end_audit(
@@ -808,7 +842,7 @@ async def run_agent(
         _session_duration_seconds.labels(outcome=session_outcome).observe(
             time.monotonic() - session_started
         )
-        await bridge.publish_end(run_id)
+        await bridge.publish_end(run_id, status=_external_end_status(session_outcome))
         # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
         # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
         # 分支(正常结束 / RunCancelledError / CancelledError / MaxSteps /
@@ -1387,8 +1421,8 @@ async def sse_consumer(
 
     Subscribes to ``bridge`` and translates each :class:`StreamEvent`
     into an SSE frame. :data:`HEARTBEAT_SENTINEL` becomes an SSE comment
-    (``: heartbeat``); :data:`END_SENTINEL` becomes a final ``end``
-    event and terminates the generator.
+    (``: heartbeat``); the bridge's end frame (:func:`is_end`) becomes a
+    final ``end`` event and terminates the generator.
 
     ``is_disconnected`` is an injected coroutine (FastAPI's
     ``request.is_disconnected`` in production) — checked before each
@@ -1412,7 +1446,7 @@ async def sse_consumer(
                 yield b": heartbeat\n\n"
                 continue
 
-            if entry is END_SENTINEL:
+            if is_end(entry):
                 yield format_sse("end", None)
                 return
 
