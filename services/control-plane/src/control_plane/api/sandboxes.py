@@ -13,7 +13,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.protocol import AuditAction, Principal
@@ -30,7 +30,11 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_sandboxes_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/sandboxes", tags=["sandboxes"])
+    router = APIRouter(
+        prefix="/v1/sandboxes",
+        tags=["sandboxes"],
+        dependencies=[Depends(platform_only("only a system admin may reap sandboxes"))],
+    )
 
     @router.post("/reap")
     async def reap_sandboxes(
@@ -39,14 +43,6 @@ def build_sandboxes_router() -> APIRouter:
         request: Request,
         force: Annotated[bool, Query()] = False,
     ) -> dict[str, object]:
-        if not principal.is_system_admin:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "PLATFORM_SCOPE_FORBIDDEN",
-                    "message": "only a system admin may reap sandboxes",
-                },
-            )
         client = _get_sandbox_runtime(request)
         if client is None:
             raise HTTPException(

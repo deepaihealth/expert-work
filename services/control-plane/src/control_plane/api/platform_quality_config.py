@@ -20,7 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
 from control_plane.platform_quality_config import (
     EffectiveQualityConfig,
@@ -31,6 +31,10 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.platform_quality_config import PlatformQualityConfigRow
 from expert_work.protocol import AuditAction, Principal, models_for_provider
 from expert_work.runtime.audit.logger import AuditLogger
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform quality config"
 
 
 class PlatformQualityConfigWrite(BaseModel):
@@ -51,17 +55,6 @@ class PlatformQualityConfigWrite(BaseModel):
     drift_min_samples: int = Field(gt=0)
     drift_threshold: float = Field(gt=0, le=1)
     drift_cooldown_h: int = Field(gt=0)
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the platform quality config",
-            },
-        )
 
 
 def _get_service(request: Request) -> PlatformQualityConfigService:
@@ -103,7 +96,11 @@ def _effective_dict(cfg: EffectiveQualityConfig) -> dict[str, object]:
 
 
 def build_platform_quality_config_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/quality-config", tags=["platform_config"])
+    router = APIRouter(
+        prefix="/v1/platform/quality-config",
+        tags=["platform_config"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.get("")
     async def get_platform_quality_config(
@@ -111,7 +108,6 @@ def build_platform_quality_config_router() -> APIRouter:
         service: Annotated[PlatformQualityConfigService, Depends(_get_service)],
     ) -> dict[str, object]:
         """Effective quality config + whether it is still the (unsaved) default."""
-        _require_system_admin(principal)
         cfg = await service.effective()
         is_default = (await service.get_row()) is None
         return {
@@ -133,7 +129,6 @@ def build_platform_quality_config_router() -> APIRouter:
         The judge provider must have a configured platform credential (else the
         judge would silently fail on every sample, as the RT-5 live run showed).
         """
-        _require_system_admin(principal)
 
         configured = set(await secrets_service.effective_provider_credentials())
         if payload.judge_provider not in configured:

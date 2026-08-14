@@ -16,7 +16,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_secrets import PlatformSecretsService
@@ -29,6 +29,10 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform judge config"
+
 
 class PlatformJudgeConfigWrite(BaseModel):
     """Write payload for the platform judge selection (Stream PI-3-A1).
@@ -40,17 +44,6 @@ class PlatformJudgeConfigWrite(BaseModel):
     model_config = ConfigDict(extra="forbid")
     judge_provider: str | None = None
     judge_model: str | None = None
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the platform judge config",
-            },
-        )
 
 
 def _get_judge_config_service(request: Request) -> PlatformJudgeConfigService:
@@ -93,7 +86,11 @@ def _available(configured: set[str]) -> list[dict[str, str]]:
 
 
 def build_platform_judge_config_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/judge-config", tags=["platform_config"])
+    router = APIRouter(
+        prefix="/v1/platform/judge-config",
+        tags=["platform_config"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.get("")
     async def get_platform_judge_config(
@@ -107,7 +104,6 @@ def build_platform_judge_config_router() -> APIRouter:
 
         ``judge`` is ``{"provider","model"}`` or ``null`` (→ agent's own model);
         ``available`` lists chat-capable catalog models for configured providers."""
-        _require_system_admin(principal)
         judge = await judge_config_service.effective_judge_config()
         configured = set(await secrets_service.effective_provider_credentials())
         return {
@@ -133,7 +129,6 @@ def build_platform_judge_config_router() -> APIRouter:
 
         Both fields ``None`` clears the config; otherwise both required + the
         provider key must be configured + the model must be a chat model."""
-        _require_system_admin(principal)
 
         # Both-or-neither.
         if (payload.judge_provider is None) != (payload.judge_model is None):

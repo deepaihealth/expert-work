@@ -134,6 +134,71 @@ def require_key_scope(action: Action) -> Callable[..., Awaitable[None]]:
     return _dep
 
 
+def platform_only(message: str) -> Callable[..., Awaitable[None]]:
+    """Route dependency — 403 anyone who is not a platform ``system_admin``.
+
+    Before this, all 47 platform routes hand-copied the same check into their
+    handler bodies, most behind a per-module ``_require_system_admin`` helper
+    that was itself copied 14 times; ``tenants.py`` inlined the ``if`` three
+    times with no helper at all. Nothing verified that a newly added platform
+    route remembered to call it — the check lived *inside* the handler, so it
+    was invisible to any route-level audit.
+
+    Moving it to a dependency changes two things beyond deduplication:
+
+    * it is now visible in ``route.dependant``, which is what
+      ``test_route_plane_partition`` inspects — a platform route that forgets
+      the gate fails a test instead of shipping open;
+    * it runs **before** request-body validation, so a malformed body from an
+      unauthorised caller gets 403 rather than 422 (previously the handler had
+      to parse the body before it could refuse).
+
+    ``message`` stays per-router on purpose. The 19 existing messages each name
+    the resource being protected ("only a system admin may manage the model
+    rate card"), which is what makes the 403 actionable; collapsing them into
+    one generic string would lose that and break the tests that assert them.
+
+    **Not for conditional checks.** ``role_bindings.py`` gates on
+    ``payload.platform_scope and not principal.is_system_admin`` — the route
+    is open to tenant admins and only *platform-scope* bindings need
+    system_admin. That is request-dependent business logic, not a plane gate;
+    hoisting it here would lock the whole route.
+    """
+
+    async def _dep(
+        request: Request,
+        principal: Annotated[Principal, Depends(_principal)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> None:
+        if principal.is_system_admin:
+            return
+        try:
+            await emit(
+                audit,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.AUTH_LOGIN_FAILED,
+                resource_type="user",
+                resource_id="platform:non_system_admin_denied",
+                result=AuditResult.DENIED,
+                reason="PLATFORM_SCOPE_FORBIDDEN",
+                trace_id=current_trace_id_hex(),
+                details={
+                    "subject_type": principal.subject_type,
+                    "path": request.url.path,
+                    "roles": list(collect_roles_for_audit(principal)),
+                },
+            )
+        except Exception:
+            logger.exception("authz.deny_audit_emit_failed")
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "PLATFORM_SCOPE_FORBIDDEN", "message": message},
+        )
+
+    return _dep
+
+
 def console_only() -> Callable[..., Awaitable[None]]:
     """Route dependency — 403 a service-account (API-key) principal outright.
 

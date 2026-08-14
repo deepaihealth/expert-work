@@ -17,15 +17,19 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.platform_billing_config import PlatformBillingConfigStore
 from expert_work.protocol import AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform billing config"
 
 
 class PlatformBillingConfigWrite(BaseModel):
@@ -33,17 +37,6 @@ class PlatformBillingConfigWrite(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     rollup_enabled: bool
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the platform billing config",
-            },
-        )
 
 
 def _get_store(request: Request) -> PlatformBillingConfigStore:
@@ -55,7 +48,11 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_platform_billing_config_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/billing-config", tags=["platform_config"])
+    router = APIRouter(
+        prefix="/v1/platform/billing-config",
+        tags=["platform_config"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.get("")
     async def get_platform_billing_config(
@@ -63,7 +60,6 @@ def build_platform_billing_config_router() -> APIRouter:
         store: Annotated[PlatformBillingConfigStore, Depends(_get_store)],
     ) -> dict[str, object]:
         """The platform billing-rollup toggle. Absent row → default enabled."""
-        _require_system_admin(principal)
         row = await store.get()
         return {
             "success": True,
@@ -79,7 +75,6 @@ def build_platform_billing_config_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         """Set the platform billing-rollup enable flag. system_admin-only."""
-        _require_system_admin(principal)
         await store.put(rollup_enabled=payload.rollup_enabled, updated_by=principal.subject_id)
         await emit(
             audit,
