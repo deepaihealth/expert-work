@@ -37,14 +37,18 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 ```
 event: metadata
-data: {"run_id":"...","thread_id":"...","trace_id":"..."}
+data: {"run_id":"...","thread_id":"..."}
 
 event: updates
 data: {...}
 
 event: end
-data: null
+data: {"status":"success","run_id":"..."}
 ```
+
+`end` 帧的 `status` 就是这次 run 的终局状态,四个取值:`success`(答完了)/ `paused`(停在人工审批节点等你决策,**不是失败**)/ `interrupted`(被中断)/ `error`(失败,超时也算这一档)。
+
+可回放的帧还会多一行 `id: {毫秒时间戳}-{seq}`(`end` / `token` 这类帧没有)——断线重连时要把见过的最大 `seq` 传回去,服务端只补它之后的帧。
 
 完整的事件类型、字段含义、断线重连怎么处理,见 [SSE 事件格式](./sse-events)。
 
