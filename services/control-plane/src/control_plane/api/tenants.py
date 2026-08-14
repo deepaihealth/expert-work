@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.api.first_admin import (
     FirstAdminConflictError,
     FirstAdminKeycloakUnavailableError,
@@ -196,7 +196,11 @@ async def _bulk_cancel_tenant_runs(
 def build_tenants_router() -> APIRouter:
     router = APIRouter(prefix="/v1/tenants", tags=["tenants"])
 
-    @router.post("", status_code=201)
+    @router.post(
+        "",
+        status_code=201,
+        dependencies=[Depends(platform_only("only a system admin may create tenants"))],
+    )
     async def create_tenant(
         payload: CreateTenantRequest,
         principal: Annotated[Principal, Depends(_principal)],
@@ -208,14 +212,6 @@ def build_tenants_router() -> APIRouter:
         settings: Annotated[Settings, Depends(_get_settings)],
     ) -> dict[str, object]:
         # Mini-ADR P-2 — tenant creation is platform-level; only system admins.
-        if not principal.is_system_admin:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "PLATFORM_SCOPE_FORBIDDEN",
-                    "message": "only a system admin may create tenants",
-                },
-            )
         tenant_id = payload.tenant_id or uuid4()
         # The new tenant_id is not the caller's home tenant, so the write +
         # its audit row must bypass RLS (Mini-ADR P-1, risk: audit-in-bypass).
@@ -298,7 +294,10 @@ def build_tenants_router() -> APIRouter:
             data["first_admin"] = first_admin
         return {"success": True, "data": data, "error": None}
 
-    @router.get("")
+    @router.get(
+        "",
+        dependencies=[Depends(platform_only("only a system admin may list tenants"))],
+    )
     async def list_tenants(
         principal: Annotated[Principal, Depends(_principal)],
         repo: Annotated[TenantConfigStore, Depends(_get_repo)],
@@ -311,14 +310,6 @@ def build_tenants_router() -> APIRouter:
         # cross-tenant platform read, so it requires system admin and a
         # bypass-RLS session (FORCE-RLS tenant_config would filter to the
         # caller's home tenant otherwise).
-        if not principal.is_system_admin:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "PLATFORM_SCOPE_FORBIDDEN",
-                    "message": "only a system admin may list tenants",
-                },
-            )
         capped = max(1, min(limit, 200))
         async with bypass_rls_session():
             records = await repo.list_all(limit=capped, offset=max(0, offset))
@@ -358,14 +349,6 @@ def build_tenants_router() -> APIRouter:
         # the write + its audit row bypass RLS (the target tenant is not the
         # caller's home tenant; the FORCE-RLS tenant_config policy would reject
         # the UPDATE otherwise).
-        if not principal.is_system_admin:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "PLATFORM_SCOPE_FORBIDDEN",
-                    "message": "only a system admin may change tenant status",
-                },
-            )
         async with bypass_rls_session():
             try:
                 await repo.set_status(
@@ -394,7 +377,10 @@ def build_tenants_router() -> APIRouter:
             "error": None,
         }
 
-    @router.post("/{tenant_id}/deactivate")
+    @router.post(
+        "/{tenant_id}/deactivate",
+        dependencies=[Depends(platform_only("only a system admin may change tenant status"))],
+    )
     async def deactivate_tenant(
         tenant_id: UUID,
         principal: Annotated[Principal, Depends(_principal)],
@@ -430,7 +416,10 @@ def build_tenants_router() -> APIRouter:
             )
         return result
 
-    @router.post("/{tenant_id}/activate")
+    @router.post(
+        "/{tenant_id}/activate",
+        dependencies=[Depends(platform_only("only a system admin may change tenant status"))],
+    )
     async def activate_tenant(
         tenant_id: UUID,
         principal: Annotated[Principal, Depends(_principal)],

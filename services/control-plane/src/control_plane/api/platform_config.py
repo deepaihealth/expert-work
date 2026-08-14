@@ -26,7 +26,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
-from control_plane.api._authz import _principal
+from control_plane.api._authz import _principal, platform_only
 from control_plane.api.tenant_config import (
     _embedding_provider,
     _get_agent_spec_store,
@@ -53,6 +53,11 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.secret_store import SecretStore
 
 logger = logging.getLogger("expert_work.control_plane.api.platform_config")
+
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage platform credentials"
 
 
 class PlatformSecretWrite(BaseModel):
@@ -151,17 +156,6 @@ def _invalidate_built_agents(request: Request, *, tenant_id: UUID | None = None)
             cache.invalidate_tenant(tenant_id)
 
 
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage platform credentials",
-            },
-        )
-
-
 async def _require_tenant(request: Request, tenant_id: UUID) -> None:
     """404 unless the tenant exists (Stream HX-8 tenant override endpoints)."""
     service = getattr(request.app.state, "tenant_config_service", None)
@@ -245,7 +239,11 @@ async def _delete_managed_secret(
 
 
 def build_platform_config_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/credentials", tags=["platform_config"])
+    router = APIRouter(
+        prefix="/v1/platform/credentials",
+        tags=["platform_config"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.get("")
     async def get_platform_credentials(
@@ -256,7 +254,6 @@ def build_platform_config_router() -> APIRouter:
         """Full catalog view: per provider/tool → source (env/db/unset),
         secret_ref (effective; DB wins), enabled, used_by_agents (cross-tenant).
         Refs + flags only — no secret values."""
-        _require_system_admin(principal)
         env_provs = _env_provider_refs(request)
         env_tools = _env_tool_refs(request)
         agent_store = _get_agent_spec_store(request)
@@ -336,7 +333,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: SecretStore,
         request: Request,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         if provider not in PROVIDER_CATALOG:
             raise HTTPException(
                 status_code=422,
@@ -434,7 +430,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         if tool not in TOOL_CATALOG:
             raise HTTPException(
                 status_code=422,
@@ -471,7 +466,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> None:
-        _require_system_admin(principal)
         if provider in _env_provider_refs(request):
             raise HTTPException(
                 status_code=409,
@@ -532,7 +526,6 @@ def build_platform_config_router() -> APIRouter:
         """Stream Y-MK — delete one key. Blocked only when it is the *last*
         remaining key of an in-use, non-env provider (would orphan agents);
         deleting a sibling while others remain is always allowed."""
-        _require_system_admin(principal)
         agent_store = _get_agent_spec_store(request)
         embedding_provider = _embedding_provider(request)
         async with bypass_rls_session():
@@ -587,7 +580,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> None:
-        _require_system_admin(principal)
         if tool in _env_tool_refs(request):
             raise HTTPException(
                 status_code=409,
@@ -643,7 +635,6 @@ def build_platform_config_router() -> APIRouter:
         """Per-tenant override view: every catalog key with its override row
         (if any) and the tenant-effective source (tenant / suppressed /
         db / env / unset). Refs + flags only — no secret values."""
-        _require_system_admin(principal)
         await _require_tenant(request, tenant_id)
         env_provs = _env_provider_refs(request)
         env_tools = _env_tool_refs(request)
@@ -715,7 +706,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         if provider not in PROVIDER_CATALOG:
             raise HTTPException(
                 status_code=422,
@@ -765,7 +755,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         if tool not in TOOL_CATALOG:
             raise HTTPException(
                 status_code=422,
@@ -814,7 +803,6 @@ def build_platform_config_router() -> APIRouter:
         # Deleting an override just falls the tenant back to the platform
         # view — never an outage by itself, so no in-use guard (unlike the
         # platform-row delete above).
-        _require_system_admin(principal)
         async with bypass_rls_session():
             target = next(
                 (r for r in await store.list_tenant_providers(tenant_id) if r.provider == provider),
@@ -851,7 +839,6 @@ def build_platform_config_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         request: Request,
     ) -> None:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             target = next(
                 (r for r in await store.list_tenant_tools(tenant_id) if r.tool == tool),

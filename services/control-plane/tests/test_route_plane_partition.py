@@ -62,6 +62,11 @@ PUBLIC_PREFIXES = ("/healthz", "/metrics", "/v1/webhooks", "/v1/setup")
 _PLANE_DEPENDENCIES: tuple[tuple[str, str], ...] = (
     ("console_only", "console"),
     ("external_only", "external"),
+    # 阶段 1.4 hoisted the platform gate out of handler bodies into a shared
+    # dependency. The inline patterns below stay: they still cover whatever
+    # has not been converted, and their absence is what proves a conversion
+    # actually landed rather than silently dropping the gate.
+    ("platform_only", "platform"),
 )
 
 #: Source pattern → plane, for gates written inline in a handler body.
@@ -361,3 +366,42 @@ async def test_employee_jwt_is_denied_on_the_external_plane(client: AsyncClient)
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"]["code"] == "FORBIDDEN", resp.text
+
+
+@pytest.mark.asyncio
+async def test_every_platform_route_actually_refuses_a_tenant_admin() -> None:
+    """阶段 1.4's net: sweep **every** platform-classified route with a tenant
+    admin and require the 403.
+
+    This assertion was impossible before the refactor. The gate used to live
+    inside each handler body, which runs *after* FastAPI validates the request
+    — so a POST with no body answered 422, and a sweep could not tell "refused
+    me" from "did not like my payload". As a route dependency it runs first,
+    so an empty request is enough and every verb is reachable.
+
+    A tenant ``admin`` is the prover: it is the strongest non-platform
+    principal there is, so a 403 here can only be the platform gate.
+    """
+    app = _build_app()
+    jwt = make_test_jwt(tenant_id=uuid4(), subject=str(uuid4()), roles=(Role.ADMIN.value,))
+    headers = {"Authorization": f"Bearer {jwt}"}
+    platform_routes = [r for r in _routes(app) if _classify(r) == "platform"]
+    assert len(platform_routes) > 40, (
+        f"only {len(platform_routes)} platform routes — classifier broke"
+    )
+
+    transport = ASGITransport(app=app)
+    bad: list[str] = []
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        for route in platform_routes:
+            path = re.sub(r"\{[^}]+\}", "00000000-0000-4000-8000-000000000001", route.path)
+            for method in sorted(m for m in (route.methods or ()) if m not in ("HEAD", "OPTIONS")):
+                resp = await client.request(method, path, json={}, headers=headers)
+                if resp.status_code != 403:
+                    bad.append(f"{method} {route.path} → {resp.status_code}")
+                    continue
+                detail = resp.json().get("detail")
+                code = detail.get("code") if isinstance(detail, dict) else None
+                if code != "PLATFORM_SCOPE_FORBIDDEN":
+                    bad.append(f"{method} {route.path} → 403 but code={code!r}")
+    assert not bad, "platform routes that did not refuse a tenant admin: " + repr(bad)

@@ -23,7 +23,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenant_scope import bypass_rls_session
@@ -50,6 +50,11 @@ from orchestrator.tools.mcp import MCPToolDef
 logger = logging.getLogger("expert_work.control_plane.mcp_catalog")
 
 _DEFAULT_PROBE_TIMEOUT_S = 30.0
+
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the MCP connector catalog"
 
 
 def _get_catalog_store(request: Request) -> McpConnectorCatalogStore:
@@ -131,19 +136,12 @@ def _public(record: McpConnectorCatalogRecord) -> dict[str, object]:
     return data
 
 
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the MCP connector catalog",
-            },
-        )
-
-
 def build_mcp_catalog_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/mcp-catalog", tags=["mcp_catalog"])
+    router = APIRouter(
+        prefix="/v1/platform/mcp-catalog",
+        tags=["mcp_catalog"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.post("", status_code=201)
     async def create_catalog_entry(
@@ -155,7 +153,6 @@ def build_mcp_catalog_router() -> APIRouter:
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         upsert = payload
         # Validate connectivity BEFORE persisting (parity with custom-server
         # registration): a none/bearer server must connect + list tools. oauth2
@@ -219,7 +216,6 @@ def build_mcp_catalog_router() -> APIRouter:
         store: Annotated[McpConnectorCatalogStore, Depends(_get_catalog_store)],
         category: Annotated[str | None, Query()] = None,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             rows = await store.list(category=category)
         return {
@@ -234,7 +230,6 @@ def build_mcp_catalog_router() -> APIRouter:
         principal: Annotated[Principal, Depends(require("mcp_catalog", "read"))],
         store: Annotated[McpConnectorCatalogStore, Depends(_get_catalog_store)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             record = await store.get_by_id(catalog_id)
         if record is None:
@@ -258,7 +253,6 @@ def build_mcp_catalog_router() -> APIRouter:
         platform never holds). Always 200 (except 404/403) so the edit drawer can
         render the outcome inline rather than treating it as a request failure.
         """
-        _require_system_admin(principal)
         async with bypass_rls_session():
             record = await store.get_by_id(catalog_id)
         if record is None:
@@ -329,7 +323,6 @@ def build_mcp_catalog_router() -> APIRouter:
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         patch = payload
         # Load the existing row when the URL or token changes — needed to re-probe
         # and (for a re-pasted token) to resolve the secret path.
@@ -427,7 +420,6 @@ def build_mcp_catalog_router() -> APIRouter:
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
         force: Annotated[bool, Query()] = False,
     ) -> None:
-        _require_system_admin(principal)
         # Resolve the row first so the audit record carries the stable name.
         async with bypass_rls_session():
             existing = await store.get_by_id(catalog_id)

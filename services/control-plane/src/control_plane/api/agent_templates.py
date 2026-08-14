@@ -22,7 +22,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
@@ -51,6 +51,11 @@ _DEPENDENT_PAGE_SIZE = 200
 _DEPENDENT_LIST_CAP = 20
 
 
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the Agent template catalog"
+
+
 def _get_template_store(request: Request) -> PlatformAgentTemplateStore:
     return request.app.state.platform_agent_template_store  # type: ignore[no-any-return]
 
@@ -77,17 +82,6 @@ def _invalidate_agents(agent_runtime: object) -> None:
 def _public(record: PlatformAgentTemplateRecord) -> dict[str, object]:
     """Response projection — the full base manifest + marketplace metadata."""
     return record.model_dump(mode="json")
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the Agent template catalog",
-            },
-        )
 
 
 async def _find_extends_dependents(
@@ -159,7 +153,11 @@ def _reject_extends(spec: AgentSpec) -> None:
 
 
 def build_agent_templates_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/agent-templates", tags=["agent_templates"])
+    router = APIRouter(
+        prefix="/v1/platform/agent-templates",
+        tags=["agent_templates"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.post("", status_code=201)
     async def create_template(
@@ -169,7 +167,6 @@ def build_agent_templates_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         _reject_extends(payload.spec)
         try:
             async with bypass_rls_session():
@@ -193,7 +190,6 @@ def build_agent_templates_router() -> APIRouter:
         category: Annotated[str | None, Query()] = None,
         status: Annotated[PlatformAgentTemplateStatus | None, Query()] = None,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             rows = await store.list(category=category, status=status)
         return {"success": True, "data": [_public(r) for r in rows], "error": None}
@@ -205,7 +201,6 @@ def build_agent_templates_router() -> APIRouter:
         principal: Annotated[Principal, Depends(require("agent_template", "read"))],
         store: Annotated[PlatformAgentTemplateStore, Depends(_get_template_store)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             record = await store.get(name=name, version=version)
         if record is None:
@@ -225,7 +220,6 @@ def build_agent_templates_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         _reject_extends(payload)
         if payload.metadata.name != name or payload.metadata.version != version:
             raise HTTPException(
@@ -258,7 +252,6 @@ def build_agent_templates_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             record = await store.update_meta(name=name, version=version, patch=patch)
         if record is None:
@@ -281,7 +274,6 @@ def build_agent_templates_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
     ) -> None:
-        _require_system_admin(principal)
         try:
             async with bypass_rls_session():
                 # PR4 Task 2 (D1, no force): block the delete while live tenant

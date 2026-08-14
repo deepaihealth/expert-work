@@ -20,7 +20,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
@@ -38,6 +38,10 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.audit.logger import AuditLogger
 
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the model rate card"
+
 
 def _get_rate_card_store(request: Request) -> ModelRateCardStore:
     return request.app.state.model_rate_card_store  # type: ignore[no-any-return]
@@ -45,17 +49,6 @@ def _get_rate_card_store(request: Request) -> ModelRateCardStore:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the model rate card",
-            },
-        )
 
 
 def _price_details(record: ModelRateCardRecord) -> dict[str, object]:
@@ -69,7 +62,11 @@ def _price_details(record: ModelRateCardRecord) -> dict[str, object]:
 
 
 def build_rate_card_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/platform/rate-card", tags=["rate_card"])
+    router = APIRouter(
+        prefix="/v1/platform/rate-card",
+        tags=["rate_card"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.post("", status_code=201)
     async def create_rate_card(
@@ -78,7 +75,6 @@ def build_rate_card_router() -> APIRouter:
         store: Annotated[ModelRateCardStore, Depends(_get_rate_card_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         try:
             async with bypass_rls_session():
                 record = await store.create(upsert=payload, actor_id=principal.subject_id)
@@ -109,7 +105,6 @@ def build_rate_card_router() -> APIRouter:
         provider: Annotated[str | None, Query()] = None,
         model: Annotated[str | None, Query()] = None,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             rows = await store.list(provider=provider, model=model)
         return {
@@ -124,7 +119,6 @@ def build_rate_card_router() -> APIRouter:
         principal: Annotated[Principal, Depends(require("billing", "read"))],
         store: Annotated[ModelRateCardStore, Depends(_get_rate_card_store)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         async with bypass_rls_session():
             record = await store.get(rate_card_id)
         if record is None:
@@ -142,7 +136,6 @@ def build_rate_card_router() -> APIRouter:
         store: Annotated[ModelRateCardStore, Depends(_get_rate_card_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         try:
             async with bypass_rls_session():
                 record = await store.patch(rate_card_id=rate_card_id, patch=payload)
@@ -177,7 +170,6 @@ def build_rate_card_router() -> APIRouter:
         store: Annotated[ModelRateCardStore, Depends(_get_rate_card_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
-        _require_system_admin(principal)
         # Resolve the row first so the audit record carries the pricing facts.
         async with bypass_rls_session():
             existing = await store.get(rate_card_id)

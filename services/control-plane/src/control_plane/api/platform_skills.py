@@ -7,7 +7,7 @@ Every handler:
 * resolves the principal from ``request.state.principal`` (skills have no
   RBAC resource, so there is no ``require(...)`` dependency to lean on) and
   re-checks ``principal.is_system_admin`` inline via
-  ``_require_system_admin`` — same 403 ``PLATFORM_SCOPE_FORBIDDEN`` shape
+  the shared ``platform_only()`` dependency — same 403 ``PLATFORM_SCOPE_FORBIDDEN`` shape
   as ``platform_config.py`` / ``mcp_catalog.py``;
 * drives every store call inside ``bypass_rls_session()`` because the rows
   are tenant-less and the RLS policy would otherwise hide them from a
@@ -26,11 +26,12 @@ from pathlib import PurePosixPath
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, File, HTTPException, Path, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from control_plane.api import _skill_github
+from control_plane.api._authz import platform_only
 from control_plane.api._skill_moderation import (
     ModerationError,
     moderate_prompt_fragment,
@@ -118,6 +119,11 @@ SEED_PLATFORM_CATEGORIES: tuple[str, ...] = (
     "效率",
     "通用",
 )
+
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform skill library"
 
 
 class _CreatePlatformSkillBody(BaseModel):
@@ -227,17 +233,6 @@ class _BatchPlatformSkillsBody(BaseModel):
     filter: _BatchFilter | None = None
 
 
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the platform skill library",
-            },
-        )
-
-
 def _principal(request: Request) -> Principal:
     principal: Principal | None = getattr(request.state, "principal", None)
     if principal is None:
@@ -248,7 +243,6 @@ def _principal(request: Request) -> Principal:
                 "message": "only a system admin may manage the platform skill library",
             },
         )
-    _require_system_admin(principal)
     return principal
 
 
@@ -562,7 +556,11 @@ def _result_version(content: dict[str, object]) -> int | None:
 
 def build_platform_skills_router() -> APIRouter:
     """Stream X (X4) platform skill library CRUD router."""
-    router = APIRouter(prefix="/v1/platform/skills", tags=["platform_skills"])
+    router = APIRouter(
+        prefix="/v1/platform/skills",
+        tags=["platform_skills"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.post("", response_model=None)
     async def create_platform_skill(

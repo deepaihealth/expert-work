@@ -19,29 +19,22 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import platform_only, require
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import TenantBillingLedgerStore
 from expert_work.protocol import Principal
 
 from .usage import _parse_month  # shared YYYY-MM parser (422 on bad input)
 
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may view cross-tenant chargeback"
+
 
 def _get_ledger_store(request: Request) -> TenantBillingLedgerStore:
     return request.app.state.tenant_billing_ledger_store  # type: ignore[no-any-return]
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may view cross-tenant chargeback",
-            },
-        )
 
 
 @dataclass
@@ -82,7 +75,11 @@ class _AgentCharge:
 
 
 def build_billing_admin_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/admin/billing", tags=["billing_admin"])
+    router = APIRouter(
+        prefix="/v1/admin/billing",
+        tags=["billing_admin"],
+        dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))],
+    )
 
     @router.get("/chargeback")
     async def chargeback(
@@ -91,7 +88,6 @@ def build_billing_admin_router() -> APIRouter:
         month: Annotated[str | None, Query()] = None,
         tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> dict[str, object]:
-        _require_system_admin(principal)
         target = _parse_month(month)
         async with bypass_rls_session():
             rows = await store.list_for_month_all_tenants(month=target)

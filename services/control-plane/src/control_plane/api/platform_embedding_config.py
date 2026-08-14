@@ -20,7 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from control_plane.api._authz import _principal, console_only
+from control_plane.api._authz import _principal, console_only, platform_only
 from control_plane.audit import emit
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_secrets import PlatformSecretsService
@@ -32,6 +32,10 @@ from expert_work.protocol import (
     models_for_provider,
 )
 from expert_work.runtime.audit.logger import AuditLogger
+
+#: 403 body for a non-system-admin caller. Per-router on purpose: the message
+#: names the resource being protected, which is what makes the refusal actionable.
+_PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform embedding config"
 
 
 class PlatformEmbeddingConfigWrite(BaseModel):
@@ -45,17 +49,6 @@ class PlatformEmbeddingConfigWrite(BaseModel):
     embedding_model: str
     rerank_provider: str | None = None
     rerank_model: str | None = None
-
-
-def _require_system_admin(principal: Principal) -> None:
-    if not principal.is_system_admin:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "PLATFORM_SCOPE_FORBIDDEN",
-                "message": "only a system admin may manage the platform embedding config",
-            },
-        )
 
 
 def _get_embedding_config_service(request: Request) -> PlatformEmbeddingConfigService:
@@ -107,7 +100,7 @@ def _available(configured: set[str], *, kind: str) -> list[dict[str, str]]:
 def build_platform_embedding_config_router() -> APIRouter:
     router = APIRouter(prefix="/v1/platform/embedding-config", tags=["platform_config"])
 
-    @router.get("")
+    @router.get("", dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))])
     async def get_platform_embedding_config(
         principal: Annotated[Principal, Depends(_principal)],
         embedding_config_service: Annotated[
@@ -120,7 +113,6 @@ def build_platform_embedding_config_router() -> APIRouter:
         ``embedding`` / ``rerank`` are ``{"provider", "model"}`` or ``null``;
         ``available_embedding`` / ``available_rerank`` list the capable catalog
         models for every configured platform provider."""
-        _require_system_admin(principal)
         embedding = await embedding_config_service.effective_embedding_config()
         rerank = await embedding_config_service.effective_rerank_config()
         configured = set(await secrets_service.effective_provider_credentials())
@@ -158,7 +150,7 @@ def build_platform_embedding_config_router() -> APIRouter:
             "error": None,
         }
 
-    @router.put("")
+    @router.put("", dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))])
     async def put_platform_embedding_config(
         payload: PlatformEmbeddingConfigWrite,
         principal: Annotated[Principal, Depends(_principal)],
@@ -174,7 +166,6 @@ def build_platform_embedding_config_router() -> APIRouter:
         persists it (which invalidates the cache → immediate effect), and emits
         a ``PLATFORM_EMBEDDING_CONFIG_UPDATED`` audit row carrying only
         provider/model names (no secrets)."""
-        _require_system_admin(principal)
 
         # 1. rerank must be supplied as a pair (both or neither).
         if (payload.rerank_provider is None) != (payload.rerank_model is None):
