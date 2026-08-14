@@ -212,7 +212,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   -d '{"user_id": "u-123", "input": "帮我下单", "mode": "queue"}'
 ```
 
-`mode: "stream"` 的重试是 `200`,一条 SSE 流,重新接上(不是报错、也不是静默丢弃这个 header)**原来那次 run** 的事件——`X-Expert-Work-Run-Id` 与首次请求一致,并且多一个首次请求没有的响应头 `X-Expert-Work-Stream-Mode: live`(原 run 还没跑完,实时接上)或 `replay`(原 run 已经跑完,把落库的帧按顺序回放一遍再收尾 `end`)。这一段的行为和断线重连用的 `GET .../runs/{run_id}/events` 是同一份实现,细节见 [SSE 事件格式](./sse-events)。
+`mode: "stream"` 的重试是 `200`,一条 SSE 流,重新接上(不是报错、也不是静默丢弃这个 header)**原来那次 run** 的事件——`X-Expert-Work-Run-Id` 与首次请求一致,并且多一个首次请求没有的响应头 `X-Expert-Work-Stream-Mode: live`(原 run 还没跑完,实时接上)或 `replay`(原 run 已经跑完,把落库的帧按顺序回放一遍再收尾)。这一段的行为和断线重连用的 `GET .../runs/{run_id}/events` 是同一份实现——包括回放分页(帧太多时以 `truncated` 帧收尾而不是 `end`),细节见 [SSE 事件格式](./sse-events)。
 
 ## 响应:`stream` vs `queue`
 
@@ -242,9 +242,9 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 现在这三个字段都挪进了 `data` 里,顶层多了 `success` / `error`。按 `data.run_id` / `data.thread_id` / `data.status` 读取,不要再假设它们在顶层。
 :::
 
-拿到 `run_id` / `thread_id` 后,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条 `end`)。`user_id` 是必填查询参数,且必须是发起这次 run 的那个——对不上一律 404(`RUN_NOT_FOUND`),不会告诉你这个 run 到底存不存在。这条接口要 `read` scope,`write` key 含读所以也能直接调。
+拿到 `run_id` / `thread_id` 后,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>` 拿完整的 SSE 事件(这条接口在 run 还在跑的时候会实时接进去,跑完了就把持久化下来的帧按顺序回放一遍,结尾补一条带终局状态的 `end`;帧多到一页装不下时,这一页改以 `truncated` 帧收尾、**不发 `end`**,要带它给的 `next_seq` 再拉一次——见 [SSE 事件格式](./sse-events))。`user_id` 是必填查询参数,且必须是发起这次 run 的那个——对不上一律 404(`RUN_NOT_FOUND`),不会告诉你这个 run 到底存不存在。这条接口要 `read` scope,`write` key 含读所以也能直接调。
 
-**注意**:run 还没结束时这条接口是长连接,会一直挂到 run 走到终态才返回,服务端不设上限——客户端必须自己设读超时,超时后直接重连。重连时 run 通常还没跑完,接的是实时分支,`since_seq` 在这条分支上不生效,重连会把最近缓冲的帧重推一遍,客户端要按帧 `id` 里的 `seq` 自行去重。细节见 [SSE 事件格式](./sse-events)。
+**注意**:run 还没结束时这条接口是长连接,会一直挂到 run 走到终态才返回,服务端不设上限——客户端必须自己设读超时,超时后直接重连。重连时带上查询参数 `since_seq=<你已经见过的最大 seq>`(seq 从帧的 `id:` 里取,格式是 `"{毫秒时间戳}-{seq}"`):run 还在跑、run 已经结束这两种情况下它**都生效**,服务端只发这个序号之后的帧。**不带 `since_seq` 不会报错,但会从第 0 帧起把整个 run 重发一遍**,不是只补最近一段。细节见 [SSE 事件格式](./sse-events)。
 
 想粗粒度知道"这段会话里还有没有 run 在跑",调 `GET /v1/agents/{agent_code}/sessions?user_id=<同一个 user_id>`,返回的每一项都带一个 `running` 布尔字段。
 
