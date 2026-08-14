@@ -21,7 +21,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api._quota_admission import quota_engine_unavailable_as_503
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
@@ -52,7 +52,7 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_quota_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/quota", tags=["quota"])
+    router = APIRouter(prefix="/v1/quota", tags=["quota"], dependencies=[Depends(console_only())])
 
     @router.post("/check")
     async def check_quota(

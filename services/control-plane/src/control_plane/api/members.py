@@ -22,7 +22,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo
 
 # Same-app private share (deletion-hygiene PR5 design decision): the purge-deps
@@ -107,7 +107,9 @@ def _get_settings(request: Request) -> Settings:
 
 
 def build_members_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/members", tags=["members"])
+    router = APIRouter(
+        prefix="/v1/members", tags=["members"], dependencies=[Depends(console_only())]
+    )
 
     @router.post("/invite", status_code=201)
     async def invite(

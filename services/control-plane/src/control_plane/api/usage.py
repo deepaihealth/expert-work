@@ -30,7 +30,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -125,7 +125,7 @@ def _token_add(slot: dict[str, int], r: TokenUsageRecord) -> None:
 
 
 def build_usage_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/usage", tags=["usage"])
+    router = APIRouter(prefix="/v1/usage", tags=["usage"], dependencies=[Depends(console_only())])
 
     @router.get("/cost")
     async def usage_cost(

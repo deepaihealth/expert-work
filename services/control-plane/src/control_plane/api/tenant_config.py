@@ -20,7 +20,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.ratelimit import parse_rate_limit_override
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_scope import (
@@ -160,7 +160,9 @@ def _tool_usage_counts(specs: Iterable[AgentSpecRecord]) -> dict[Tool, int]:
 
 
 def build_tenant_config_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/tenants", tags=["tenant_config"])
+    router = APIRouter(
+        prefix="/v1/tenants", tags=["tenant_config"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("/{tenant_id}/config")
     async def get_tenant_config(

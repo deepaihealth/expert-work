@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
@@ -14,7 +17,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryMemoryStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditAction, AuditQuery, MemoryItem
+from expert_work.protocol import AuditAction, AuditQuery, MemoryItem, Principal
 from orchestrator import AgentFactoryError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -217,10 +220,44 @@ async def test_non_admin_user_id_for_someone_else_is_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_for_machine_principal_returns_403() -> None:
-    """A JWT carrying a service-account principal has no user binding;
-    memory endpoints must refuse — 403, not 200 with someone else's
-    list."""
+async def test_require_caller_user_refuses_a_machine_principal() -> None:
+    """Memory is per-user; a principal with no user binding must 403.
+
+    Exercised directly, not over HTTP, and that is not laziness. The JWT
+    verifier maps ``sub_type`` to ``service_account`` or ``user`` and nothing
+    else (``jwt_verifier.py``), so an mTLS ``service`` principal — the caller
+    that still reaches this branch after 阶段 1.2 put ``console_only()`` on the
+    router — cannot be minted with ``make_test_jwt`` at all. The API-key door
+    is covered over HTTP by the plane test below.
+    """
+    from control_plane.api.memory import _require_caller_user
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            principal=Principal(
+                subject_id="svc-mtls",
+                subject_type="service",
+                tenant_id=_TENANT,
+                roles=("operator",),
+            )
+        )
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        await _require_caller_user(cast(Any, request), InMemoryTenantUserStore())
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.detail["code"] == "USER_SCOPE_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_list_for_api_key_is_denied_by_the_console_plane() -> None:
+    """阶段 1.2 — long-term memory is console-plane.
+
+    Before this the router carried no plane gate at all: an API key was
+    stopped only because ``resolve_caller_user_id`` happens to return ``None``
+    for a machine principal. That is an accident of the owner gate, not a
+    designed door, and it would have evaporated the moment someone gave keys a
+    user binding. Now the plane says no first, and says so in the audit log.
+    """
     users, store, _, _ = await _seed()
     app = create_app(
         settings=_settings(),
@@ -230,21 +267,23 @@ async def test_list_for_machine_principal_returns_403() -> None:
         jwt_verifier=build_test_jwt_verifier(),
     )
     app.state.embedder = _StubEmbedder()
-    sa_jwt = make_test_jwt(
+    key_jwt = make_test_jwt(
         tenant_id=_TENANT,
         subject="sa-123",
         sub_type="service_account",
-        roles=("admin",),
+        roles=(),
+        scopes=("admin",),
     )
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
         base_url="http://cp.test",
-        headers={"Authorization": f"Bearer {sa_jwt}"},
+        headers={"Authorization": f"Bearer {key_jwt}"},
     ) as client:
         resp = await client.get("/v1/memory")
     assert resp.status_code == 403
-    assert resp.json()["detail"]["code"] == "USER_SCOPE_REQUIRED"
+    assert resp.json()["detail"]["code"] == "FORBIDDEN"
+    assert "not available to API keys" in resp.json()["detail"]["message"]
 
 
 @pytest.mark.asyncio

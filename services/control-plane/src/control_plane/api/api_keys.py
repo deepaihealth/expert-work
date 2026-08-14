@@ -14,7 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.auth.api_key_verifier import mint_api_key
 from control_plane.tenant_scope import (
@@ -95,7 +95,7 @@ async def _find_api_key(keys: ApiKeyStore, *, tenant_id: UUID, api_key_id: UUID)
 
 
 def build_api_keys_router() -> APIRouter:
-    router = APIRouter(tags=["api_keys"])
+    router = APIRouter(tags=["api_keys"], dependencies=[Depends(console_only())])
 
     @router.post(
         "/v1/service_accounts/{service_account_id}/api_keys",

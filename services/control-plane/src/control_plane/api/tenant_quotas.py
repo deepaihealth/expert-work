@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from control_plane.api._authz import require
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     applied_scope,
@@ -37,7 +37,9 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def build_tenant_quotas_router() -> APIRouter:
-    router = APIRouter(prefix="/v1/tenants", tags=["tenant_quotas"])
+    router = APIRouter(
+        prefix="/v1/tenants", tags=["tenant_quotas"], dependencies=[Depends(console_only())]
+    )
 
     @router.get("/{tenant_id}/quotas")
     async def list_tenant_quotas(

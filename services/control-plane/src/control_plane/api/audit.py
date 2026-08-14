@@ -32,6 +32,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from control_plane.api._authz import console_only
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -106,7 +107,7 @@ def _get_audit(request: Request) -> AuditLogger:
 
 def build_audit_router() -> APIRouter:
     """Read-side audit endpoints. Stream H.4 PR 3."""
-    router = APIRouter(prefix="/v1/audit", tags=["audit"])
+    router = APIRouter(prefix="/v1/audit", tags=["audit"], dependencies=[Depends(console_only())])
 
     @router.get("", response_model=None)
     async def list_audit(
