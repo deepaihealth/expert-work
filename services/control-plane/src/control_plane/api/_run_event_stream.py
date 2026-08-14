@@ -127,18 +127,29 @@ def build_event_producer(
         1. **补库**:从 ``since_seq`` 起循环读 :meth:`RunEventStore.list`,直到
            某页不满一页为止,逐行发出。live 分支**不做**分页截断 —— 截断是
            replay 分支的语义。
-        2. **挂实时流**:``seq <= last`` 丢弃(补库阶段已经发过);
-           ``seq == last + 1`` 直接发,并把 pending 里紧接着的连续段一并排空;
-           ``seq > last + 1`` 先进 pending,**不要立刻当缺口处理**
-           (见 :data:`_REORDER_WINDOW`);无 seq 的 token 帧直接放行。
-        3. **泄压**:pending 攒到超过重排窗口,才认定 ``last + 1`` 真的丢了 ——
-           去库里把 ``last+1 .. min(pending)-1`` 补齐(补到多少算多少),补不齐
-           的那段打一条 warning 就往前走,不抛异常:那些帧在 run 结束后客户端
-           仍可以从 replay 分支重新拿到。bridge 缓冲区只有 256 帧且 drop-oldest,
-           而落库走攒批后台 writer,所以「补库读完 → 挂上实时流」这个缝里确实
-           可能有帧既不在缓冲区、也还没落库;这一步是把它变成**可观测的
-           warning** 而不是静默丢帧的唯一位置。
-        4. **end 之前**把 pending 里剩下的按 seq 升序全放出去,别吞。
+        2. **挂实时流**:``seq <= last`` 丢弃(补库阶段已经发过),**但落在
+           ``missing`` 名单里的照发**(见第 5 条);``seq == last + 1`` 直接发,
+           并把 pending 里紧接着的连续段一并排空;``seq > last + 1`` 先进
+           pending,**不要立刻当缺口处理**(见 :data:`_REORDER_WINDOW`);
+           无 seq 的 token 帧直接放行。
+        3. **泄压**,两个维度**任一**触发:(a) ``len(pending)`` 超过重排窗口,
+           或 (b) 跳号宽度 ``min(pending) - last - 1`` 超过重排窗口。触发后才
+           认定 ``last + 1`` 起真的缺了 —— 去库里把 ``last+1 .. min(pending)-1``
+           补齐(补到多少算多少),再排空 pending 里连续的部分。
+           只有 (a) 的话,「跳号之后 run 恰好安静下来」永远撑不爆窗口,缺的那段
+           在这条连接上根本不补 —— 而服务端补齐正是本项对外承诺的东西。
+        4. 补不齐的那些 seq 记进 ``missing``,打一条 warning,不抛异常。
+           bridge 缓冲区只有 256 帧且 drop-oldest,而落库走攒批后台 writer,
+           所以「补库读完 → 挂上实时流」这个缝里确实可能有帧既不在缓冲区、
+           也还没落库;这一步是把它变成**可观测的 warning** 而不是静默丢帧。
+        5. ``missing`` 是「写过检讨但还没死心」的名单:后到的帧只要在里面就
+           照发,不因为 ``seq <= last`` 被丢。只有 (b) 而没有这份名单会**重新
+           引入它本来要避免的伤害** —— 并发 worker 上限可配到 64,真有可能 40
+           帧同时在飞、跳号 40 却一帧没丢,那时查库(攒批 writer 还没落盘)拿
+           不到,等真帧到达又被 ``<= last`` 丢掉。**我们可以判断错,但不能因为
+           判断错就把真实存在过的帧扔掉**;代价只是它可能乱序到达,而客户端
+           本来就按 seq 排。
+        6. **end 之前**把 pending 里剩下的按 seq 升序全放出去,别吞。
 
         Disconnect is handled via the iterator's GeneratorExit when
         the StreamingResponse is cancelled; the bridge subscription
@@ -146,6 +157,9 @@ def build_event_producer(
         """
         last = since_seq if since_seq is not None else -1
         pending: dict[int, StreamEvent] = {}
+        #: 回填补不齐、已经被「写掉」的 seq。后到的帧只要在这里面就照发 ——
+        #: 判断可以错,但不能因为判断错就把真实存在过的帧扔掉。
+        missing: set[int] = set()
 
         async def _drain_pending() -> AsyncIterator[bytes]:
             """把 pending 里从 ``last + 1`` 起连续的那一段排空。"""
@@ -186,13 +200,20 @@ def build_event_producer(
                 # token 帧:一次性预览,重复或缺失都无害 —— 原样放行。
                 yield format_sse(entry.event, entry.data, event_id=None)
                 continue
+            if seq in missing:
+                # 5. 之前判它丢了、还写了检讨 —— 它自己回来了,照发。
+                missing.discard(seq)
+                yield format_sse(entry.event, entry.data, event_id=entry.id)
+                continue
             if seq <= last:
                 continue  # 补库阶段已经发过
             if seq > last + 1:
                 pending[seq] = entry
-                if len(pending) > _REORDER_WINDOW:
-                    # 3. 窗口撑爆 —— 现在才认定 last + 1 是真缺口。
-                    target = min(pending)
+                target = min(pending)
+                # 3. 泄压两个维度,任一触发才认定 last + 1 是真缺口:
+                #    (a) 攒的帧数超过窗口;(b) 跳号宽度超过窗口 —— 后者管
+                #    「跳号之后 run 恰好安静下来」那种永远撑不爆 (a) 的情况。
+                if len(pending) > _REORDER_WINDOW or target - last - 1 > _REORDER_WINDOW:
                     for row in await _list_page(last):
                         if row.seq >= target:
                             break
@@ -207,8 +228,10 @@ def build_event_producer(
                             last + 1,
                             target - 1,
                         )
-                        # 补不齐就跨过去 —— 不跨的话 pending 永远排不空,后面
-                        # 每一帧都会再查一次库。
+                        # 4. 补不齐的记进名单再跨过去 —— 不跨的话 pending 永远
+                        #    排不空,后面每一帧都会再查一次库;记名单是为了它们
+                        #    后到时还能被认出来(第 5 条)。
+                        missing.update(range(last + 1, target))
                         last = target - 1
                     async for chunk in _drain_pending():
                         yield chunk

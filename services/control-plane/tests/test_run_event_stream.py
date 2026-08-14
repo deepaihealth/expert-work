@@ -37,7 +37,7 @@ import pytest
 from httpx import AsyncClient
 
 import control_plane.api.runs as runs_module
-from control_plane.api._run_event_stream import build_event_producer
+from control_plane.api._run_event_stream import _REORDER_WINDOW, build_event_producer
 from expert_work.runtime.runs import InMemoryRunEventStore, make_event_record
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
@@ -393,3 +393,68 @@ async def test_live_token_frames_pass_through_without_id() -> None:
         (None, "token"),
         (None, "end"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_isolated_large_jump_triggers_backfill(caplog: pytest.LogCaptureFixture) -> None:
+    """孤立的大跳号 —— bridge 只推一帧就安静下来,也必须**立刻**回填。
+
+    钉住泄压条件的第二个维度 ``min(pending) - last - 1 > _REORDER_WINDOW``。
+    只有 ``len(pending) > _REORDER_WINDOW`` 那一维时,单独一帧永远撑不爆窗口,
+    缺的 3、4 在这条连接上根本不补(要等到 end 才把 35 吐出来)—— 而"服务端
+    补齐"正是本项对外承诺的东西。
+
+    跳号取 ``last + _REORDER_WINDOW + 2``:比窗口**恰好多 1**。计划正文举的
+    ``seq 35``(``last=2``)算出来的跳号宽度正好 ``== _REORDER_WINDOW``,
+    ``>`` 不成立、触发不了 —— 所以这里从常量算,不写死数字。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(3))  # 补库阶段:库里只有 0..2
+
+    async def _late_persist() -> None:
+        await _seed_rows(store, run_id, [3, 4])
+
+    jump = 2 + _REORDER_WINDOW + 2  # last=2 → 跳号宽度 = _REORDER_WINDOW + 1
+    bridge = _ScriptedBridge([_late_persist, _live_frame(jump)])
+
+    with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
+        frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
+
+    # 3、4 必须在 jump 之前发出 —— 而不是 jump 先出、3/4 永不出现。
+    assert _seqs(frames) == [3, 4, jump]
+    gap_logs = [r.getMessage() for r in caplog.records if "gap_unfilled" in r.getMessage()]
+    assert len(gap_logs) == 1, gap_logs
+    assert "missing_from=5" in gap_logs[0]
+    assert f"missing_to={jump - 1}" in gap_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_late_frame_written_off_is_still_delivered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """被判过"丢了"的 seq 后来自己回来了 —— 必须照发,不能因为 ``<= last`` 被丢。
+
+    钉住 ``missing`` 名单。形态:补库到 2;库里随后只补上 3、4(**没有 5**);
+    bridge 先推一个大跳号触发回填 → 5..jump-1 补不齐、进 missing、``last`` 被
+    推到 jump-1;**之后** bridge 才把 seq 5 推过来(并发 worker 下先分号的帧
+    后进 bridge,这是真会发生的形态)。
+
+    没有 missing 名单时,5 到达时已经 ``5 <= last``,会被当成"补库阶段已经发过"
+    静默丢弃 —— 一帧真实存在过的帧因为算法判断失误而消失。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(3))  # 补库阶段:库里只有 0..2
+
+    async def _late_persist_without_5() -> None:
+        await _seed_rows(store, run_id, [3, 4])  # 注意:没有 5
+
+    jump = 2 + _REORDER_WINDOW + 2
+    bridge = _ScriptedBridge([_late_persist_without_5, _live_frame(jump), _live_frame(5)])
+
+    with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
+        frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
+
+    # 5 迟到但仍然送达(乱序是可接受的代价 —— 客户端本来就按 seq 排)。
+    assert _seqs(frames) == [3, 4, jump, 5]
