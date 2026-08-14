@@ -6,10 +6,14 @@ actors when the latest version is high_risk (tool_names ∩
 with ``scripts/``), and that admin / system_admin role allows
 activation with the SKILL_HIGH_RISK_ACTIVATED audit trail.
 
-M0 reality: all skill mutations are admin-only so the gate is
-transparent. This test exercises a synthetic VIEWER role via the
-``make_test_jwt(roles=...)`` fixture to verify the gate code path that
-will become live with M1-K J.7b-1 agent-self-authored skills.
+The gate under test is about *high_risk vs not*, so it needs the weakest
+role that can still mutate a skill at all. 阶段 1.5 made that role
+``operator``: skill routes now carry ``require("manifest", …)``, so a
+``viewer`` — which these cases used to use — is stopped by the role gate
+before the high-risk check ever runs, and the case would pass for the
+wrong reason. (This module's original note claimed "all skill mutations
+are admin-only"; that was the *intent*, never enforced — skills.py
+carried no route-level authorization until 阶段 1.5.)
 
 See ``docs/streams/STREAM-UPLIFT-DESIGN.md`` § 4.3.12.
 """
@@ -55,11 +59,11 @@ def _admin_headers() -> dict[str, str]:
     }
 
 
-def _viewer_headers() -> dict[str, str]:
+def _operator_headers() -> dict[str, str]:
     """VIEWER actor — U-24 rejects."""
     return {
         "Authorization": "Bearer "
-        + make_test_jwt(tenant_id=_TENANT, subject="viewer-user", roles=("viewer",))
+        + make_test_jwt(tenant_id=_TENANT, subject="operator-user", roles=("operator",))
     }
 
 
@@ -110,7 +114,7 @@ async def _create_skill_with_version(
 
 
 @pytest.mark.asyncio
-async def test_viewer_cannot_activate_high_risk_skill_with_exec_python(
+async def test_operator_cannot_activate_high_risk_skill_with_exec_python(
     app_client: tuple[AsyncClient, InMemoryAuditLogStore],
 ) -> None:
     client, audit_store = app_client
@@ -121,7 +125,7 @@ async def test_viewer_cannot_activate_high_risk_skill_with_exec_python(
     response = await client.patch(
         f"/v1/skills/{skill_id}",
         json={"status": "active"},
-        headers=_viewer_headers(),
+        headers=_operator_headers(),
     )
     assert response.status_code == 403
     assert "high-risk skill requires tenant admin" in response.json()["detail"]
@@ -146,7 +150,7 @@ async def test_viewer_cannot_activate_high_risk_skill_with_http(
     response = await client.patch(
         f"/v1/skills/{skill_id}",
         json={"status": "active"},
-        headers=_viewer_headers(),
+        headers=_operator_headers(),
     )
     assert response.status_code == 403
 
@@ -189,7 +193,7 @@ async def test_admin_can_activate_high_risk_skill_with_audit_trail(
 
 
 @pytest.mark.asyncio
-async def test_viewer_can_activate_low_risk_skill(
+async def test_operator_can_activate_low_risk_skill(
     app_client: tuple[AsyncClient, InMemoryAuditLogStore],
 ) -> None:
     """Low-risk skill is NOT gated — confirms the gate is scoped to
@@ -202,7 +206,7 @@ async def test_viewer_can_activate_low_risk_skill(
     response = await client.patch(
         f"/v1/skills/{skill_id}",
         json={"status": "active"},
-        headers=_viewer_headers(),
+        headers=_operator_headers(),
     )
     assert response.status_code == 200
 
@@ -241,7 +245,7 @@ async def test_status_change_to_draft_or_archived_not_gated(
     )
 
     response = await client.patch(
-        f"/v1/skills/{skill_id}", json={"status": "archived"}, headers=_viewer_headers()
+        f"/v1/skills/{skill_id}", json={"status": "archived"}, headers=_operator_headers()
     )
     # Viewer can archive (no gate on archived).
     assert response.status_code == 200

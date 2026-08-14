@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.tenant_scope import (
@@ -202,7 +202,9 @@ def build_knowledge_router() -> APIRouter:
         prefix="/v1/knowledge", tags=["knowledge"], dependencies=[Depends(console_only())]
     )
 
-    @router.post("/bases", response_model=None)
+    @router.post(
+        "/bases", response_model=None, dependencies=[Depends(require("manifest", "write"))]
+    )
     async def create_base(
         body: _CreateBaseBody,
         request: Request,
@@ -246,7 +248,7 @@ def build_knowledge_router() -> APIRouter:
             status_code=201, content=_base_dict(base, needs_reindex=_needs_reindex(base, current))
         )
 
-    @router.get("/bases", response_model=None)
+    @router.get("/bases", response_model=None, dependencies=[Depends(require("manifest", "read"))])
     async def list_bases(
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
@@ -295,7 +297,9 @@ def build_knowledge_router() -> APIRouter:
             }
         )
 
-    @router.get("/bases/{name}", response_model=None)
+    @router.get(
+        "/bases/{name}", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def get_base(
         name: str,
         request: Request,
@@ -321,7 +325,9 @@ def build_knowledge_router() -> APIRouter:
             content=_base_dict(base, stats, needs_reindex=_needs_reindex(base, current))
         )
 
-    @router.patch("/bases/{name}", response_model=None)
+    @router.patch(
+        "/bases/{name}", response_model=None, dependencies=[Depends(require("manifest", "write"))]
+    )
     async def update_base(
         name: str,
         body: _UpdateBaseBody,
@@ -373,7 +379,11 @@ def build_knowledge_router() -> APIRouter:
             content=_base_dict(updated, stats, needs_reindex=_needs_reindex(updated, current))
         )
 
-    @router.post("/bases/{name}/reindex", response_model=None)
+    @router.post(
+        "/bases/{name}/reindex",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def reindex_base(
         name: str,
         request: Request,
@@ -406,7 +416,12 @@ def build_knowledge_router() -> APIRouter:
         )
         return JSONResponse(status_code=202, content={"status": "reindexing", "name": base.name})
 
-    @router.delete("/bases/{name}", status_code=204, response_model=None)
+    @router.delete(
+        "/bases/{name}",
+        status_code=204,
+        response_model=None,
+        dependencies=[Depends(require("manifest", "delete"))],
+    )
     async def delete_base(
         name: str,
         request: Request,
@@ -417,7 +432,11 @@ def build_knowledge_router() -> APIRouter:
         await store.delete_base(tenant_id=tenant_id, kb_id=base.id)
         return Response(status_code=204)
 
-    @router.post("/bases/{name}/documents", response_model=None)
+    @router.post(
+        "/bases/{name}/documents",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def upload_document(
         name: str,
         request: Request,
@@ -460,7 +479,11 @@ def build_knowledge_router() -> APIRouter:
         # document list for its status.
         return JSONResponse(status_code=202, content=_document_dict(document))
 
-    @router.get("/bases/{name}/documents", response_model=None)
+    @router.get(
+        "/bases/{name}/documents",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def list_documents(
         name: str,
         request: Request,
@@ -482,7 +505,12 @@ def build_knowledge_router() -> APIRouter:
             documents = await store.list_documents(tenant_id=scope.tenant_id, kb_id=base.id)
         return JSONResponse(content={"documents": [_document_dict(doc) for doc in documents]})
 
-    @router.delete("/bases/{name}/documents/{document_id}", status_code=204, response_model=None)
+    @router.delete(
+        "/bases/{name}/documents/{document_id}",
+        status_code=204,
+        response_model=None,
+        dependencies=[Depends(require("manifest", "delete"))],
+    )
     async def delete_document(
         name: str,
         document_id: UUID,
@@ -496,7 +524,11 @@ def build_knowledge_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="document not found")
         return Response(status_code=204)
 
-    @router.post("/bases/{name}/documents/{document_id}/reingest", response_model=None)
+    @router.post(
+        "/bases/{name}/documents/{document_id}/reingest",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def reingest_document(
         name: str,
         document_id: UUID,
@@ -540,7 +572,11 @@ def build_knowledge_router() -> APIRouter:
         )
         return JSONResponse(status_code=202, content=_document_dict(reset))
 
-    @router.get("/bases/{name}/documents/{document_id}/chunks", response_model=None)
+    @router.get(
+        "/bases/{name}/documents/{document_id}/chunks",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def list_chunks(
         name: str,
         document_id: UUID,
@@ -585,7 +621,11 @@ def build_knowledge_router() -> APIRouter:
             }
         )
 
-    @router.post("/bases/{name}/test", response_model=None)
+    @router.post(
+        "/bases/{name}/test",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def test_retrieval(
         name: str,
         body: _TestBody,

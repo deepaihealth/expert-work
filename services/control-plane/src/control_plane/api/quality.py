@@ -23,7 +23,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -87,7 +87,7 @@ def build_quality_router() -> APIRouter:
         prefix="/v1/quality", tags=["quality"], dependencies=[Depends(console_only())]
     )
 
-    @router.get("/scores", response_model=None)
+    @router.get("/scores", response_model=None, dependencies=[Depends(require("manifest", "read"))])
     async def list_scores(
         request: Request,
         store: Annotated[QualityScoreStore, Depends(_get_score_store)],
@@ -128,7 +128,9 @@ def build_quality_router() -> APIRouter:
             }
         )
 
-    @router.get("/drift-alerts", response_model=None)
+    @router.get(
+        "/drift-alerts", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def list_drift_alerts(
         request: Request,
         store: Annotated[QualityDriftAlertStore, Depends(_get_alert_store)],

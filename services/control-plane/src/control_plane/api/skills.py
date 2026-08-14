@@ -32,7 +32,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.api._skill_moderation import (
     ModerationError,
     moderate_prompt_fragment,
@@ -353,7 +353,7 @@ def build_skills_router() -> APIRouter:
     """Stream J.7a admin CRUD + ZIP import/export router."""
     router = APIRouter(prefix="/v1/skills", tags=["skills"], dependencies=[Depends(console_only())])
 
-    @router.post("", response_model=None)
+    @router.post("", response_model=None, dependencies=[Depends(require("manifest", "write"))])
     async def create_skill(
         body: _CreateSkillBody,
         request: Request,
@@ -389,7 +389,11 @@ def build_skills_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_skill_dict(skill))
 
-    @router.post("/{skill_id}/versions", response_model=None)
+    @router.post(
+        "/{skill_id}/versions",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def add_version(
         skill_id: UUID,
         body: _AddVersionBody,
@@ -485,6 +489,7 @@ def build_skills_router() -> APIRouter:
     @router.get(
         "/{skill_id}/versions/{version}/supporting-files/{file_path:path}",
         response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
     )
     async def get_supporting_file(
         skill_id: UUID,
@@ -568,6 +573,7 @@ def build_skills_router() -> APIRouter:
     @router.put(
         "/{skill_id}/versions/{version}/supporting-files/{file_path:path}",
         response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
     )
     async def put_supporting_file(
         skill_id: UUID,
@@ -714,6 +720,7 @@ def build_skills_router() -> APIRouter:
     @router.delete(
         "/{skill_id}/versions/{version}/supporting-files/{file_path:path}",
         response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
     )
     async def delete_supporting_file(
         skill_id: UUID,
@@ -787,7 +794,11 @@ def build_skills_router() -> APIRouter:
         )
         return JSONResponse(status_code=200, content=_version_dict(new_version))
 
-    @router.put("/{skill_id}/versions/{version}/prompt", response_model=None)
+    @router.put(
+        "/{skill_id}/versions/{version}/prompt",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def put_prompt(
         skill_id: UUID,
         version: int,
@@ -884,7 +895,9 @@ def build_skills_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_version_dict(new_version))
 
-    @router.patch("/{skill_id}", response_model=None)
+    @router.patch(
+        "/{skill_id}", response_model=None, dependencies=[Depends(require("manifest", "write"))]
+    )
     async def patch_status(
         skill_id: UUID,
         body: _PatchStatusBody,
@@ -1050,7 +1063,7 @@ def build_skills_router() -> APIRouter:
 
         return JSONResponse(status_code=200, content=_skill_dict(updated))
 
-    @router.get("", response_model=None)
+    @router.get("", response_model=None, dependencies=[Depends(require("manifest", "read"))])
     async def list_skills(
         request: Request,
         store: Annotated[SkillStore, Depends(_get_skill_store)],
@@ -1190,7 +1203,11 @@ def build_skills_router() -> APIRouter:
                 detail="subscribing to a platform skill requires admin or operator role",
             )
 
-    @router.post("/{platform_skill_id}/subscribe", response_model=None)
+    @router.post(
+        "/{platform_skill_id}/subscribe",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def subscribe_skill(
         platform_skill_id: UUID,
         request: Request,
@@ -1230,7 +1247,11 @@ def build_skills_router() -> APIRouter:
         )
         return JSONResponse(status_code=200, content=_subscription_dict(record))
 
-    @router.delete("/{platform_skill_id}/subscribe", response_model=None)
+    @router.delete(
+        "/{platform_skill_id}/subscribe",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def unsubscribe_skill(
         platform_skill_id: UUID,
         request: Request,
@@ -1263,7 +1284,9 @@ def build_skills_router() -> APIRouter:
         )
         return JSONResponse(status_code=200, content=_subscription_dict(record))
 
-    @router.get("/{skill_id}", response_model=None)
+    @router.get(
+        "/{skill_id}", response_model=None, dependencies=[Depends(require("manifest", "read"))]
+    )
     async def get_skill(
         skill_id: UUID,
         request: Request,
@@ -1288,7 +1311,11 @@ def build_skills_router() -> APIRouter:
         _require_skill_owner_scope(skill, request.state.principal)
         return JSONResponse(status_code=200, content=_skill_dict(skill))
 
-    @router.get("/{skill_id}/versions", response_model=None)
+    @router.get(
+        "/{skill_id}/versions",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def list_versions(
         skill_id: UUID,
         request: Request,
@@ -1315,7 +1342,11 @@ def build_skills_router() -> APIRouter:
             status_code=200, content={"items": [_version_dict(v) for v in versions]}
         )
 
-    @router.get("/{skill_id}/versions/{version_number}", response_model=None)
+    @router.get(
+        "/{skill_id}/versions/{version_number}",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def get_version(
         skill_id: UUID,
         version_number: int,
@@ -1346,7 +1377,9 @@ def build_skills_router() -> APIRouter:
         _require_skill_owner_scope(skill, request.state.principal)
         return JSONResponse(status_code=200, content=_version_dict(version))
 
-    @router.post("/import", response_model=None)
+    @router.post(
+        "/import", response_model=None, dependencies=[Depends(require("manifest", "write"))]
+    )
     async def import_skill(
         request: Request,
         file: Annotated[UploadFile, File()],
@@ -1495,7 +1528,11 @@ def build_skills_router() -> APIRouter:
             },
         )
 
-    @router.get("/{skill_id}/versions/{version_number}/export", response_model=None)
+    @router.get(
+        "/{skill_id}/versions/{version_number}/export",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
     async def export_version(
         skill_id: UUID,
         version_number: int,

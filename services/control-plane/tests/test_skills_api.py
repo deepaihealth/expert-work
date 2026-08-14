@@ -1063,7 +1063,11 @@ async def _issue(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# 阶段 1.5 — ``viewer`` dropped: skill routes now carry
+# ``require("manifest", …)``, so a viewer is stopped by the role gate before
+# reaching the ownership gate these cases are about. That a viewer cannot
+# write at all is covered in ``test_content_plane_rbac.py``.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_agent_private_skill_403_for_non_admin_employee(setup: Setup, role: str) -> None:
     """A non-admin employee (viewer / operator) is 403'd on every one of the
     10 single-skill endpoints against an ``agent_private`` skill."""
@@ -1091,7 +1095,11 @@ async def test_agent_private_skill_admin_not_forbidden(setup: Setup) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# 阶段 1.5 — ``viewer`` dropped: skill routes now carry
+# ``require("manifest", …)``, so a viewer is stopped by the role gate before
+# reaching the ownership gate these cases are about. That a viewer cannot
+# write at all is covered in ``test_content_plane_rbac.py``.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_tenant_visibility_skill_unaffected_for_non_admin_employee(
     setup: Setup, role: str
 ) -> None:
@@ -1162,7 +1170,11 @@ async def test_list_skills_filters_agent_private_for_non_admin(setup: Setup) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# 阶段 1.5 — ``viewer`` dropped: skill routes now carry
+# ``require("manifest", …)``, so a viewer is stopped by the role gate before
+# reaching the ownership gate these cases are about. That a viewer cannot
+# write at all is covered in ``test_content_plane_rbac.py``.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_import_name_collision_agent_private_403_and_no_write(
     setup: Setup, role: str
 ) -> None:
@@ -1213,7 +1225,11 @@ async def test_import_name_collision_agent_private_admin_not_forbidden(setup: Se
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# 阶段 1.5 — ``viewer`` dropped: skill routes now carry
+# ``require("manifest", …)``, so a viewer is stopped by the role gate before
+# reaching the ownership gate these cases are about. That a viewer cannot
+# write at all is covered in ``test_content_plane_rbac.py``.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_import_name_collision_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
     """Regression guard — the C-2 gate must not touch an ordinary
     ``tenant``-visibility name collision (the everyday re-import-adds-a-
