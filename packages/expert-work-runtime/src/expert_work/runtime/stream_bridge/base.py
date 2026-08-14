@@ -29,12 +29,14 @@ class StreamEvent:
 
     Attributes:
         id: SSE ``id:`` field, ``f"{created_at_ms}-{seq}"`` where ``seq`` is
-            the frame's durable ``run_event.seq`` (used by the client as
-            ``since_seq`` / ``Last-Event-ID`` on reconnect).
+            the number :meth:`StreamBridge.publish` allocated for this frame
+            (and therefore also its durable ``run_event.seq``; the client
+            feeds it back as ``since_seq`` / ``Last-Event-ID`` on reconnect).
             ``None`` means **this frame is not replayable** and therefore
             carries no ``id:`` line and consumes no sequence number — today
             that is only the ``token`` frame (a live-only preview; the
-            authoritative ``updates`` frame is what replays).
+            authoritative ``updates`` frame is what replays) and the
+            connection-scoped ``gap`` frame the API emits.
         event: SSE event name, e.g. ``"metadata"`` / ``"updates"`` /
             ``"events"`` / ``"error"`` / ``"end"``.
         data: JSON-serialisable payload.
@@ -68,19 +70,36 @@ class StreamBridge(abc.ABC):
     """Abstract async pub/sub bus per ``run_id``."""
 
     @abc.abstractmethod
-    async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
-        """Enqueue a single event for ``run_id`` (producer side).
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
+        """Enqueue one **replayable** event for ``run_id``; return its ``seq``.
 
-        ``seq`` is allocated **by the caller** and must be the very same
-        number the frame is persisted under (``run_event.seq``) — the bridge
-        does not hand out sequence numbers. There used to be two independent
-        counters (one here, one in ``run_agent``) and they disagreed on every
-        run that streamed tokens, so the ``seq`` a client parsed out of a live
-        frame id skipped real frames when replayed as ``since_seq``.
+        **发号权归日志,不归生产者。** 号的分配与入队必须在同一个临界区里完成
+        —— 这是本类的核心不变式:**订阅者看到的帧顺序恒等于 seq 顺序**。调用方
+        不得自己发号,拿到返回值原样落库(``run_event.seq``)即可,live 帧 id 与
+        durable 行因此天然同源。
 
-        ``seq=None`` marks a frame that is **not replayable**: it gets no
-        ``id:`` line and burns no sequence number. Only ``token`` frames
-        qualify today.
+        这条不变式是 Redis Streams(``XADD *`` 由服务端在 append 那一刻发号)、
+        Kafka(broker 作为单写者在 append 时分配 offset)和 LangGraph Platform
+        的一致做法。曾经的写法是生产者先领号、再 ``await`` 推 bridge —— 领号与
+        入队之间那个 await 就是乱序的来源,消费侧不得不为此建一整套重排窗口。
+        """
+
+    @abc.abstractmethod
+    async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
+        """Enqueue one **one-shot** event: no ``seq``, no ``id:``, not replayable.
+
+        今天只有 ``token`` 帧(逐字预览;权威内容随后由 ``updates`` 帧给出)。
+        与 :meth:`publish` 分成两个方法而不是一个可选参数,是为了不让
+        ``int | None`` 这种返回值污染每一个调用点。
+        """
+
+    @abc.abstractmethod
+    async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
+        """Push this run's allocator past ``next_seq`` (HA failover 接管用)。
+
+        被接管的 run 在新副本上重入时,发号器从 0 起会与前任已落库的行撞
+        ``(run_id, seq)`` 主键。实现必须用 ``max(现值, next_seq)`` 写入 ——
+        一条迟到的播种不能把发号器往回拨。
         """
 
     @abc.abstractmethod

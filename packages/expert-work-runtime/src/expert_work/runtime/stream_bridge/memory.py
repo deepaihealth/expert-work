@@ -44,6 +44,9 @@ class _RunStream:
     #: rather than stored on the module-level ``END_SENTINEL`` singleton,
     #: which would leak one run's status into every other run's stream.
     end_status: str | None = None
+    #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
+    #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
+    next_seq: int = 0
 
 
 class InMemoryStreamBridge(StreamBridge):
@@ -86,19 +89,37 @@ class InMemoryStreamBridge(StreamBridge):
 
     # -- StreamBridge API ------------------------------------------------------
 
-    async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
+    def _append_locked(self, stream: _RunStream, entry: StreamEvent) -> None:
+        """Append + drop-oldest overflow. Caller must hold ``stream.condition``."""
+        stream.events.append(entry)
+        if len(stream.events) > self._maxsize:
+            overflow = len(stream.events) - self._maxsize
+            del stream.events[:overflow]
+            stream.start_offset += overflow
+        stream.condition.notify_all()
+
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
         stream = self._get_or_create_stream(run_id)
-        # ``seq`` comes from the caller (``run_agent``'s durable counter) —
-        # the bridge no longer numbers frames itself. ``None`` ⇒ no ``id:``.
-        entry_id = None if seq is None else f"{int(time.time() * 1000)}-{seq}"
-        entry = StreamEvent(id=entry_id, event=event, data=data)
         async with stream.condition:
-            stream.events.append(entry)
-            if len(stream.events) > self._maxsize:
-                overflow = len(stream.events) - self._maxsize
-                del stream.events[:overflow]
-                stream.start_offset += overflow
-            stream.condition.notify_all()
+            # 发号必须在锁内,与入队原子完成 —— 把这两步拆开(哪怕只隔一个
+            # await)就会让「先拿到号的帧后进缓冲区」成为可能,消费侧就得为乱序
+            # 建一整套重排机制。这一行的位置就是那整套机制的替代品。
+            seq = stream.next_seq
+            stream.next_seq = seq + 1
+            entry = StreamEvent(id=f"{int(time.time() * 1000)}-{seq}", event=event, data=data)
+            self._append_locked(stream, entry)
+        return seq
+
+    async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            self._append_locked(stream, StreamEvent(id=None, event=event, data=data))
+
+    async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            # ``max`` —— 迟到的播种不能把发号器往回拨(回拨 = 撞 (run_id, seq) 主键)。
+            stream.next_seq = max(stream.next_seq, next_seq)
 
     async def publish_end(self, run_id: UUID, *, status: str) -> None:
         stream = self._get_or_create_stream(run_id)

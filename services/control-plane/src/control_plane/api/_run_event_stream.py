@@ -44,19 +44,12 @@ _RUN_STATUS_END_STATUS: dict[RunStatus, str] = {
     RunStatus.TIMEOUT: "error",
 }
 
-#: 实时接合的**乱序重排窗口**。``_publish_frame`` 是「同步分号 → await publish」,
-#: 并发 worker 下先分到号的帧可能后进 bridge,所以 seq 跳号的第一解释是「乱序
-#: 到达」而不是「丢帧」。见缺口就查库有两个后果:一是把还在路上的帧当丢帧去查
-#: 一次库(此时后台攒批 writer 多半还没落盘,查了也拿不到),二是等真帧从
-#: bridge 到达时它已经 ``<= last`` 被丢弃 —— **本来没丢的帧被那个逻辑弄丢**。
-#: 所以先攒进 pending 给乱序一个收敛机会,攒到超过这个数才认定是真缺口。
-_REORDER_WINDOW = 32
-
 
 def _seq_of(entry: StreamEvent) -> int | None:
     """从帧 id 里解析落库 ``seq``;``None`` 表示这帧不参与接合。
 
-    ``entry.id is None`` 是 token 帧 —— 不可回放、不占号(Task 1 的契约)。
+    ``entry.id is None`` 是一次性帧 —— 不可回放、不占号(今天只有 ``token``,
+    见 :meth:`StreamBridge.publish_ephemeral`)。
     id 形状不认识时同样返回 ``None``:放行总比把它当成某个号去参与去重安全。
     """
     if entry.id is None:
@@ -106,7 +99,7 @@ async def build_event_producer(
       按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
       流并没有结束,客户端得带 ``next_seq`` 再来一次。
     * Active run → 先把 ``since_seq`` 之后的落库帧补齐,再挂
-      :meth:`StreamBridge.subscribe` 的实时流,按 seq 去重 / 重排 / 回填缺口
+      :meth:`StreamBridge.subscribe` 的实时流,按 seq 去重 + 回填真缺口
       (见 ``_stream_live`` 的 docstring)。live 分支**不截断**。
 
     ``scope`` is a *factory* for a tenant-scope context manager, not an
@@ -160,52 +153,31 @@ async def build_event_producer(
         )
 
     async def _stream_live() -> AsyncIterator[bytes]:
-        """Live attach —— 先补库,再接实时流(P3 PR-1 Task 3 的接合算法)。
+        """Live attach —— 先补库,再接实时流;接合就是**去重**(Task 3R)。
 
         1. **补库**:从 ``since_seq`` 起循环读 :meth:`RunEventStore.list`,直到
            某页不满一页为止,逐行发出。live 分支**不做**分页截断 —— 截断是
            replay 分支的语义。
-        2. **挂实时流**:``seq <= last`` 丢弃(补库阶段已经发过),**但落在
-           ``missing`` 名单里的照发**(见第 5 条);``seq == last + 1`` 直接发,
-           并把 pending 里紧接着的连续段一并排空;``seq > last + 1`` 先进
-           pending,**不要立刻当缺口处理**(见 :data:`_REORDER_WINDOW`);
-           无 seq 的 token 帧直接放行。
-        3. **泄压**,两个维度**任一**触发:(a) ``len(pending)`` 超过重排窗口,
-           或 (b) 跳号宽度 ``min(pending) - last - 1`` 超过重排窗口。触发后才
-           认定 ``last + 1`` 起真的缺了 —— 去库里把 ``last+1 .. min(pending)-1``
-           补齐(补到多少算多少),再排空 pending 里连续的部分。
-           只有 (a) 的话,「跳号之后 run 恰好安静下来」永远撑不爆窗口,缺的那段
-           在这条连接上根本不补 —— 而服务端补齐正是本项对外承诺的东西。
-        4. 补不齐的那些 seq 记进 ``missing``,打一条 warning,不抛异常。
-           bridge 缓冲区只有 256 帧且 drop-oldest,而落库走攒批后台 writer,
-           所以「补库读完 → 挂上实时流」这个缝里确实可能有帧既不在缓冲区、
-           也还没落库;这一步是把它变成**可观测的 warning** 而不是静默丢帧。
-        5. ``missing`` 是「写过检讨但还没死心」的名单:后到的帧只要在里面就
-           照发,不因为 ``seq <= last`` 被丢。只有 (b) 而没有这份名单会**重新
-           引入它本来要避免的伤害** —— 并发 worker 上限可配到 64,真有可能 40
-           帧同时在飞、跳号 40 却一帧没丢,那时查库(攒批 writer 还没落盘)拿
-           不到,等真帧到达又被 ``<= last`` 丢掉。**我们可以判断错,但不能因为
-           判断错就把真实存在过的帧扔掉**;代价只是它可能乱序到达,而客户端
-           本来就按 seq 排。
-        6. **end 之前**把 pending 里剩下的按 seq 升序全放出去,别吞。
+        2. **挂实时流**:无 seq 的 token 帧直接放行;``seq <= last`` 丢弃
+           (补库阶段已经发过);``seq == last + 1`` 直接发。
+        3. ``seq > last + 1`` 是**真缺口**,没有第二种解释 ——
+           :meth:`StreamBridge.publish` 在自己的临界区里发号并入队,所以订阅者
+           看到的帧顺序恒等于 seq 顺序,"先分到号的帧后进 bridge"在物理上不
+           可能发生。缺口唯一的成因是 bridge 缓冲区(256 帧,drop-oldest)在
+           "补库读完 → 挂上实时流"这个缝里滚过去了。处置:先去库里补能补的,
+           补不齐的那一段发一帧 ``gap``。
+
+        ``gap`` 帧(``{"from": N, "to": M}``,**无 ``id:``、不落库**)描述的是
+        **这条连接**的状况,不是 run 的事件:这段帧在这里补不到了(缓冲已滚过、
+        且尚未落盘),不代表它们不存在 —— run 结束后重新回放通常能拿到。用一帧
+        tombstone 而不是服务端记账,是因为缺口天然有界(一帧就是一帧),而且把
+        判断权交给客户端,不让服务端积累一个无上限的集合。
 
         Disconnect is handled via the iterator's GeneratorExit when
         the StreamingResponse is cancelled; the bridge subscription
         naturally tears down.
         """
         last = since_seq if since_seq is not None else -1
-        pending: dict[int, StreamEvent] = {}
-        #: 回填补不齐、已经被「写掉」的 seq。后到的帧只要在这里面就照发 ——
-        #: 判断可以错,但不能因为判断错就把真实存在过的帧扔掉。
-        missing: set[int] = set()
-
-        async def _drain_pending() -> AsyncIterator[bytes]:
-            """把 pending 里从 ``last + 1`` 起连续的那一段排空。"""
-            nonlocal last
-            while last + 1 in pending:
-                entry = pending.pop(last + 1)
-                yield format_sse(entry.event, entry.data, event_id=entry.id)
-                last += 1
 
         # 1. 补库。
         while True:
@@ -224,13 +196,8 @@ async def build_event_producer(
                 yield b": heartbeat\n\n"
                 continue
             if is_end(entry):
-                # 4. 压在窗口里的帧不能跟着流一起消失。
-                for pending_seq in sorted(pending):
-                    leftover = pending.pop(pending_seq)
-                    yield format_sse(leftover.event, leftover.data, event_id=leftover.id)
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
-                # (``publish_end(status=...)`` 存的)。**先 flush pending 再发
-                # end**,顺序不能反。
+                # (``publish_end(status=...)`` 存的)。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
                 yield format_sse("end", end_frame_data(run_id=run_id, status=status))
                 return
@@ -240,48 +207,25 @@ async def build_event_producer(
                 # token 帧:一次性预览,重复或缺失都无害 —— 原样放行。
                 yield format_sse(entry.event, entry.data, event_id=None)
                 continue
-            if seq in missing:
-                # 5. 之前判它丢了、还写了检讨 —— 它自己回来了,照发。
-                missing.discard(seq)
-                yield format_sse(entry.event, entry.data, event_id=entry.id)
-                continue
             if seq <= last:
                 continue  # 补库阶段已经发过
             if seq > last + 1:
-                pending[seq] = entry
-                target = min(pending)
-                # 3. 泄压两个维度,任一触发才认定 last + 1 是真缺口:
-                #    (a) 攒的帧数超过窗口;(b) 跳号宽度超过窗口 —— 后者管
-                #    「跳号之后 run 恰好安静下来」那种永远撑不爆 (a) 的情况。
-                if len(pending) > _REORDER_WINDOW or target - last - 1 > _REORDER_WINDOW:
-                    for row in await _list_page(last):
-                        if row.seq >= target:
-                            break
-                        yield format_sse(
-                            row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
-                        )
-                        last = row.seq
-                    if last + 1 < target:
-                        logger.warning(
-                            "live_stream.gap_unfilled run_id=%s missing_from=%s missing_to=%s",
-                            run_id,
-                            last + 1,
-                            target - 1,
-                        )
-                        # 4. 补不齐的记进名单再跨过去 —— 不跨的话 pending 永远
-                        #    排不空,后面每一帧都会再查一次库;记名单是为了它们
-                        #    后到时还能被认出来(第 5 条)。
-                        missing.update(range(last + 1, target))
-                        last = target - 1
-                    async for chunk in _drain_pending():
-                        yield chunk
-                continue
+                # 3. 真缺口 —— 先尽量从库里补。
+                for row in await _list_page(last):
+                    if row.seq >= seq:
+                        break
+                    yield format_sse(
+                        row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
+                    )
+                    last = row.seq
+                if last + 1 < seq:
+                    logger.warning(
+                        "live_stream.gap run_id=%s from=%s to=%s", run_id, last + 1, seq - 1
+                    )
+                    yield format_sse("gap", {"from": last + 1, "to": seq - 1})
 
-            # seq == last + 1
             yield format_sse(entry.event, entry.data, event_id=entry.id)
             last = seq
-            async for chunk in _drain_pending():
-                yield chunk
 
     if run_status not in TERMINAL_RUN_STATUSES:
         return EventStreamPlan(producer=_stream_live(), next_seq=None)

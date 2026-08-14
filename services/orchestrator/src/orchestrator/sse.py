@@ -368,40 +368,26 @@ async def run_agent(
     # Stream HX-3 — count of in-worker transient retries this run took.
     # Initialised before the ``try`` so every except handler can read it.
     retry_attempts = 0
-    # Stream H.3 PR 3 — per-run sequence counter for RunEventStore mirror.
-    # Starts at 0; increments before each persist call so the seq in the
-    # durable row matches its insertion order. P3 PR-1 — this is now the
-    # **only** counter in the system: the same number is handed to
-    # ``bridge.publish(seq=...)``, so a live frame's SSE id and its durable
-    # row agree. (It used to be one of two, and the bridge's own counter also
-    # numbered token frames, which made every live id run ahead of the seq a
-    # client could replay from.)
+    # P3 PR-1 Task 3R —— **生产者不再持有任何计数器**。发号权归 bridge:
+    # ``publish`` 在自己的临界区里发号并入队,返回的 seq 就是这一帧落库该用的
+    # ``run_event.seq``。live 帧 id 与 durable 行因此天然同源,而且订阅者看到的
+    # 帧顺序恒等于 seq 顺序(Redis Streams / Kafka / LangGraph Platform 一致的
+    # 做法:发号权归日志不归生产者)。
     # Stream 9.4 (HA failover) — a peer that resumed a reclaimed run re-enters
     # here; seed past the prior owner's durable frames so the resumed run's
     # events stay append-only (a fresh 0 would collide on ``(run_id, seq)``).
-    event_seq = 0
     if event_store is not None and getattr(record, "is_resume", False):
-        event_seq = await event_store.next_seq(run_id=run_id)
+        await bridge.seed_seq(run_id, next_seq=await event_store.next_seq(run_id=run_id))
 
     # 二期 PR3 — run_event 持久化移出流路径(spec PR3 Task 2)。
-    # 主循环每帧只做「seq 同步预分配 + put_nowait」;后台 writer 攒批
+    # 主循环每帧只做「拿 bridge 发的号 + put_nowait」;后台 writer 攒批
     # (≤_PERSIST_BATCH_MAX 条或 _PERSIST_FLUSH_INTERVAL_S)写 append_batch。
     # 队满 drop-oldest(H-7 立场:调试台 replay 可容忍缺帧,live SSE 不能慢)。
     persist_queue: asyncio.Queue[RunEventRecord | None] = asyncio.Queue(maxsize=_PERSIST_QUEUE_MAX)
 
-    def _alloc_seq() -> int:
-        """同步分配落库 seq —— 全程无 await。并发 worker 交错调用本函数
-        不会撞号(sse.py 原 _enqueue_event 的铁律,提取后仍然成立)。"""
-        nonlocal event_seq
-        seq = event_seq
-        event_seq += 1
-        return seq
-
     def _enqueue_event(seq: int, event_name: str, data: Any) -> None:
-        # 号由调用方(_publish_frame)在任何 await 之前分配好传进来;
-        # 本函数只负责落库入队。没有 store 时整帧不落库,但号照发 ——
-        # 与现状 event_seq 无条件递增的行为完全一致(resume 场景的种子
-        # 计数仍要对齐)。
+        # ``seq`` 一律来自 ``bridge.publish`` 的返回值 —— 本函数只负责落库入队。
+        # 没有 store 时整帧不落库,号照发(bridge 的发号器与有没有 store 无关)。
         if event_store is None:
             return
         record_ = make_event_record(run_id=run_id, seq=seq, event_name=event_name, data=data)
@@ -411,14 +397,13 @@ async def run_agent(
             _put_dropping_oldest(persist_queue, record_)
 
     async def _publish_frame(event_name: str, data: Any) -> None:
-        """一帧同时进 bridge(实时)和落库队列(回放),共用同一个 seq。
+        """一帧同时进 bridge(实时)和落库队列(回放),共用 bridge 发的那个 seq。
 
         实时帧的 SSE ``id:`` 与落库行的 ``run_event.seq`` 因此同源 —— 客户端
         从帧 id 里取出的 seq 拿去当 ``since_seq`` 回放才不会跳过真实存在的帧。
         token 帧不走这里(它不落库、不占号,见 ``_publish_token``)。
         """
-        seq = _alloc_seq()
-        await bridge.publish(run_id, event_name, data, seq=seq)
+        seq = await bridge.publish(run_id, event_name, data)
         _enqueue_event(seq, event_name, data)
 
     # mypy: event_store is RunEventStore | None here; _persist_writer wants a
@@ -464,7 +449,7 @@ async def run_agent(
     # driver owns the bridge + event store), so the graph layer stays
     # SSE-agnostic. The frame is a free-string ``"compaction"`` event
     # (``EventType.COMPACTION`` names it in the canonical taxonomy) mirrored to
-    # the durable store on the same monotonic ``event_seq`` as every other
+    # the durable store on the same bridge-allocated ``seq`` as every other
     # frame; it runs inside the node's turn, before the ``updates`` chunk that
     # turn yields, so it lands earlier in the stream. Best-effort by contract —
     # the caller (agent_node) already swallows failures; ``_enqueue_event``
@@ -483,19 +468,18 @@ async def run_agent(
         # store (the authoritative ``updates`` frame is what replays). No
         # ``seq`` either — an unreplayable frame must not burn a sequence
         # number, or every id a client parses off the live stream runs ahead
-        # of what ``since_seq`` can actually replay.
+        # of what ``since_seq`` can actually replay. ``publish_ephemeral`` is
+        # the bridge-side expression of exactly that.
         if not first_output_recorded:
             first_output_recorded = True
             _first_output_seconds.labels(source="token").observe(time.monotonic() - ttft_started)
-        await bridge.publish(run_id, "token", frame)
+        await bridge.publish_ephemeral(run_id, "token", frame)
 
     # B2 worker 可观测性 — worker 事件 sink。child run(spawn_worker /
     # 静态 subagent)的 start/update/end 帧经此进父 run 的 bridge + 事件
-    # 库,实时与回放同源。与 _publish_compaction 的关键差异:并发
-    # worker(≤dynamic_worker_max_concurrent)会交错 await 本函数,seq
-    # 必须在任何 await 之前同步分配,否则两帧读到同一 event_seq 撞
-    # (run_id, seq) 主键 —— P3 PR-1 起这条铁律由 _publish_frame 保证
-    # (它先同步 _alloc_seq() 再 await),本函数不再手工预分配。
+    # 库,实时与回放同源。并发 worker(≤dynamic_worker_max_concurrent)会
+    # 交错 await 本函数 —— P3 PR-1 Task 3R 起这里不再有任何时序约定要遵守:
+    # 号由 bridge 在自己的临界区里发,撞号与乱序都由那把锁杜绝。
     async def _publish_worker(frame: dict[str, Any]) -> None:
         await _publish_frame("worker", frame)
 

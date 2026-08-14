@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,35 +25,48 @@ class _YieldingBridge(InMemoryStreamBridge):
     so concurrent ``sink()`` calls under ``asyncio.gather`` never interleave
     — the vacuous-test bug this class exists to fix. Forcing a genuine
     ``await`` here makes concurrent ``_publish_worker`` invocations actually
-    interleave at their own internal await point, so a regression that
-    splits the ``seq`` read from its write-back across that await (a
-    classic TOCTOU: read ``event_seq``, await, then commit the increment)
-    manifests as a duplicate-seq collision the in-memory event store
-    raises on. A merely *late but still atomic* allocation (both the read
-    and the increment happening back-to-back after the await, with no
-    await between them) is not racy under single-threaded cooperative
-    asyncio — the danger is specifically a split read/write, matching
-    ``_publish_worker``'s own guarding comment in ``sse.py``.
+    interleave, which is the precondition for observing anything at all about
+    concurrent numbering.
 
-    P3 PR-1 Task 2.5 —— 额外记录每次 ``publish`` 收到的 ``seq`` 和帧本身。撞号在
-    生产链路上会先被后台 persist writer 的 H-7 swallow 吃掉(``append_batch`` 抛
-    ``duplicate seq=...`` → 整批丢 → 只剩一条 warning),所以**落库行里永远不会
-    出现重复 seq**;分配出来、交给 bridge 的那串号是撞号唯一可以被直接观察到的
-    地方,断言的失败信息因此才能直接点名撞的是哪个号,而不是去翻日志。
+    P3 PR-1 Task 3R —— 额外做两件事:
+
+    1. 记录每帧「bridge 分配的号 ↔ 帧内容」的对应关系。发号权归 bridge 之后,
+       生产者侧唯一还能出错的地方是**没把返回值当回事**(自己另发一个号、或者
+       把号配错帧),而那种错误只有把这份对应关系与落库行逐帧比对才看得出来 ——
+       光看「号的集合对不对」是看不出来的。
+    2. **按帧给出不等长的延迟**。真 bridge(Redis / 网络)每次调用耗时不同,
+       所以生产者的**调用顺序不等于帧到达 bridge 的顺序**。这一条是判据的命门:
+       延迟等长时,单线程事件循环的 FIFO 就绪队列会让"生产者自己发号"与
+       "bridge 发号"给出**一模一样**的结果 —— 那种变异就会存活,测试实际上什么
+       也没测到(本仓库记录过的恒绿形态)。实测:延迟等长时变异存活,不等长时
+       立刻红。
     """
+
+    #: worker ``a`` 的帧比别的帧多让出几轮 —— 制造"调用顺序 ≠ 到达顺序"。
+    _SLOW_WORKER = "a"
+    _SLOW_YIELDS = 3
+    _FAST_YIELDS = 1
 
     def __init__(self, *, queue_maxsize: int = 256) -> None:
         super().__init__(queue_maxsize=queue_maxsize)
-        #: 每次 ``publish`` 收到的 ``seq``,按到达 bridge 的顺序(token 帧为 ``None``)。
-        self.published_seqs: list[int | None] = []
-        #: ``(event, data)`` 同序 —— 用来验证这个桩确实还在强制交错。
-        self.published_frames: list[tuple[str, Any]] = []
+        #: ``(event, data, bridge 分配的 seq)``,按帧进入 bridge 的顺序。
+        self.assigned: list[tuple[str, Any, int]] = []
 
-    async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
-        await asyncio.sleep(0)  # 让出事件循环 — 强制并发 sink 交错
-        self.published_seqs.append(seq)
-        self.published_frames.append((event, data))
-        await super().publish(run_id, event, data, seq=seq)
+    def _yields_for(self, event: str, data: Any) -> int:
+        if (
+            event == "worker"
+            and isinstance(data, dict)
+            and data.get("worker_id") == self._SLOW_WORKER
+        ):
+            return self._SLOW_YIELDS
+        return self._FAST_YIELDS
+
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
+        for _ in range(self._yields_for(event, data)):
+            await asyncio.sleep(0)  # 让出事件循环 — 强制并发 sink 交错(且不等长)
+        seq = await super().publish(run_id, event, data)
+        self.assigned.append((event, data, seq))
+        return seq
 
 
 async def _new_record(rm: RunManager) -> RunRecord:
@@ -109,26 +123,25 @@ class _TwoCoroutineSinkGraph:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_publish_frame_allocates_a_contiguous_seq_range() -> None:
-    """P3 PR-1 —— 钉住「seq 同步分配不跨 await」。
+async def test_persisted_seq_is_exactly_what_the_bridge_assigned() -> None:
+    """P3 PR-1 Task 3R —— 钉住新不变式:**落库的号必须是 bridge 发的那个号**。
 
-    ``_publish_frame`` 先同步 ``_alloc_seq()`` 再 ``await bridge.publish``。把
-    自增挪到 await 之后(经典 TOCTOU:读号 → await → 才写回),两个协程会读到
-    同一个 ``event_seq``。
+    这条测试取代了 Task 2.5 的 ``test_concurrent_publish_frame_allocates_a_
+    contiguous_seq_range``。那条钉的是「seq 同步分配抢在 await 之前」——
+    发号权归 bridge 之后,生产者根本不再持有计数器,那条不变式**已不存在**,
+    留着它就是一条测不到任何东西的绿灯。
 
-    **观察点是 bridge 收到的 seq,不是落库行**(Task 2.5 的加固点)。撞号在生产
-    链路上先被后台 persist writer 的 H-7 swallow 吃掉:``append_batch`` 抛
-    ``duplicate seq=...`` → 整批丢 → 只剩一条 warning。也就是说**落库行里永远
-    不会出现重复 seq**,拿落库行做「无重复」断言是恒真的假验证;它只能间接红在
-    「行数少了」上,归因还得去翻日志。分配出来交给 bridge 的那串号才是撞号唯一
-    可直接观察的地方,失败信息因此能直接点名撞的是哪个号。落库行的连续性作为
-    「撞号会变成静默丢帧」这个后果层,保留在最后一组断言里。
+    新不变式是生产者侧现在唯一还能出错的地方:``_publish_frame`` 必须把
+    ``await bridge.publish(...)`` 的返回值原样交给 ``_enqueue_event``。
+    自己另发一个号、或者把号配错帧,live 帧 id 与 durable 行就再次对不上 ——
+    正是本 PR 头号缺陷 C 的形态。所以断言是**逐帧**的对应关系,不是「号的集合
+    对不对」(集合相等挡不住"号配错了帧"这一类)。
 
-    **本测试必须用强制交错的桩 ``_YieldingBridge``,换成裸
-    ``InMemoryStreamBridge`` 会退化成恒绿** —— 裸 bridge 的 ``publish`` 全程不
-    挂起,``asyncio.gather`` 下两个协程根本不交错,TOCTOU 永远不发生。下面两条
-    元断言把这个前提钉死:一条认桩的身份,一条认桩**真的还在**强制交错(光认
-    身份挡不住有人把桩里那句 ``await asyncio.sleep(0)`` 删掉)。
+    并发**且延迟不等长**是判据的一部分:单协程下、或者每帧延迟一样长时,生产者
+    自己发号也会给出一模一样的结果(FIFO 就绪队列把调用顺序原样保住),错配根本
+    不会发生 —— 实测过,那种条件下"生产者自己发号"的变异存活。``_YieldingBridge``
+    给 worker ``a`` 的帧更长的延迟,调用顺序与到达 bridge 的顺序因此分岔。
+    下面三条元断言钉住这个前提。
     """
     n = 8
     bridge = _YieldingBridge()
@@ -151,28 +164,42 @@ async def test_concurrent_publish_frame_allocates_a_contiguous_seq_range() -> No
 
     # 元断言 1 —— 桩没被换成裸 bridge。
     assert isinstance(bridge, _YieldingBridge), (
-        "本测试依赖强制交错的桩;换成裸 InMemoryStreamBridge 会退化成恒绿的假验证"
+        "本测试依赖强制交错的桩;换成裸 InMemoryStreamBridge 并发不会交错,错配就藏得住"
     )
-    # 元断言 2 —— 桩**真的还在**交错:两个协程的 worker 帧必须交替到达 bridge。
-    # 裸 bridge(或桩里的 sleep(0) 被删)下顺序是 aaaa…bbbb,transitions == 1。
-    worker_order = [d["worker_id"] for name, d in bridge.published_frames if name == "worker"]
+    # 元断言 2 —— 桩**真的还在**交错:两个协程的 worker 帧必须交替进 bridge。
+    worker_order = [d["worker_id"] for name, d, _seq in bridge.assigned if name == "worker"]
     transitions = sum(1 for x, y in itertools.pairwise(worker_order) if x != y)
-    assert transitions >= n, (
+    assert transitions >= n // 2, (
         f"两个协程的帧没有真正交错(transitions={transitions},order={worker_order})"
-        " —— 强制交错的前提没了,本测试已退化成恒绿"
+        " —— 强制交错的前提没了,本测试已退化"
+    )
+    # 元断言 3 —— 桩的延迟**确实不等长**:调用顺序 ≠ 到达 bridge 的顺序。
+    # 等长的话本测试测不出"生产者自己发号"(实测该变异会存活)。
+    assert bridge._SLOW_YIELDS != bridge._FAST_YIELDS, (
+        "桩的延迟被改成等长了 —— 调用顺序会等于到达顺序,本测试退化成恒绿"
     )
 
-    # 主断言 —— 分配出去的号无重复,失败信息直接点名撞的是哪个号。
-    allocated = [s for s in bridge.published_seqs if s is not None]
-    duplicated = sorted({s for s in allocated if allocated.count(s) > 1})
-    assert not duplicated, f"seq 撞号:{duplicated};分配给 bridge 的号依次为 {allocated}"
-    assert sorted(allocated) == list(range(expected_total))
+    # bridge 发的号:锁内原子分配 → 无重复、无缺口。
+    assigned_seqs = [seq for _name, _data, seq in bridge.assigned]
+    duplicated = sorted({s for s in assigned_seqs if assigned_seqs.count(s) > 1})
+    assert not duplicated, f"bridge 发号撞号:{duplicated};依次为 {assigned_seqs}"
+    assert sorted(assigned_seqs) == list(range(expected_total))
 
-    # 后果层 —— 撞号会被 H-7 吃成静默丢帧,落库行必须仍然连续完整。
-    events = await store.list(run_id=record.run_id, limit=500)
-    assert len(events) == expected_total
-    assert [e.seq for e in events] == list(range(expected_total))  # 无重复、无缺口
-    assert len([e for e in events if e.event_name == "worker"]) == 2 * n
+    # **主断言** —— 逐帧对应:每一帧落库行的 seq 必须等于 bridge 给这一帧的号。
+    assigned_by_frame = {
+        (name, json.dumps(data, sort_keys=True, default=str)): seq
+        for name, data, seq in bridge.assigned
+    }
+    rows = await store.list(run_id=record.run_id, limit=500)
+    persisted_by_frame = {
+        (r.event_name, json.dumps(r.data, sort_keys=True, default=str)): r.seq for r in rows
+    }
+    assert len(assigned_by_frame) == expected_total, "帧内容不唯一,逐帧比对失效"
+    assert persisted_by_frame == assigned_by_frame, (
+        "落库的号与 bridge 发的号对不上(生产者又在自己发号 / 号配错了帧)"
+    )
+    assert len(rows) == expected_total
+    assert [r.seq for r in rows] == list(range(expected_total))
 
 
 @pytest.mark.asyncio

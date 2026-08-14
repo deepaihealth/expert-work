@@ -38,7 +38,7 @@ import pytest
 from httpx import AsyncClient
 
 import control_plane.api.runs as runs_module
-from control_plane.api._run_event_stream import _REORDER_WINDOW, build_event_producer
+from control_plane.api._run_event_stream import build_event_producer
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
@@ -122,7 +122,7 @@ async def test_console_events_endpoint_passes_a_live_scope_factory(
 
 
 # ---------------------------------------------------------------------------
-# P3 PR-1 / Task 3 —— live 分支认 ``since_seq``:补库 + 重排窗口 + 缺口回填
+# P3 PR-1 / Task 3R —— live 分支认 ``since_seq``:补库 + 去重 + gap 帧
 #
 # 「验证条件矩阵」D 那一行:**run 仍在跑时重连**才走得到这段代码。下面每条
 # 都传 ``run_status=RUNNING``;终态的 run 走的是 replay 分支,测了等于没测。
@@ -132,15 +132,16 @@ _LIVE_LOGGER = "control_plane.api._run_event_stream"
 
 
 class _ScriptedBridge(StreamBridge):
-    """按脚本推帧的 bridge —— 精确摆出「乱序 / 重叠 / 缺口」三种到达形态。
+    """按脚本推帧的 bridge —— 精确摆出「重叠」和「缺口」两种到达形态。
 
     脚本里的元素要么是一帧 :class:`StreamEvent`(直接推给订阅者),要么是一个
     零参协程函数(推帧途中执行的副作用,用来模拟「后台攒批 writer 此刻才把某
     几行落盘」)。脚本走完后自动补一帧 end。
 
-    真 :class:`InMemoryStreamBridge` 到达顺序由生产者决定,没法在测试里摆出
-    「seq 5 先于 seq 3 到」这种形态 —— 而那恰恰是并发 worker 下的真实形态
-    (先分到号的帧可能后进 bridge),也是重排窗口存在的理由。
+    真 :class:`InMemoryStreamBridge` 摆不出「缓冲区滚过一段之后订阅者才挂上」
+    这种时序。**注意脚本里的 seq 必须递增** —— Task 3R 之后 bridge 保证订阅者
+    看到的帧顺序恒等于 seq 顺序,写一个递减的脚本就是在测一个真 bridge 产不出
+    的形态。
     """
 
     def __init__(
@@ -153,8 +154,14 @@ class _ScriptedBridge(StreamBridge):
         self._end_status = end_status
         self.subscribe_calls = 0
 
-    async def publish(self, run_id: UUID, event: str, data: Any, *, seq: int | None = None) -> None:
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
         raise AssertionError("消费侧的测试不应该往 bridge 里发帧")
+
+    async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
+        raise AssertionError("消费侧的测试不应该往 bridge 里发帧")
+
+    async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
+        raise AssertionError("消费侧的测试不应该动 bridge 的发号器")
 
     async def publish_end(self, run_id: UUID, *, status: str) -> None:
         raise AssertionError("消费侧的测试不应该往 bridge 里发帧")
@@ -179,7 +186,7 @@ class _ScriptedBridge(StreamBridge):
 
 
 def _live_frame(seq: int, *, event: str = "updates") -> StreamEvent:
-    """一帧 bridge 实时帧,id 与落库 seq 同源(Task 1 起的契约)。"""
+    """一帧 bridge 实时帧,id 里的 seq 就是 ``publish`` 分配的那个号。"""
     return StreamEvent(id=f"1700000000000-{seq}", event=event, data={"n": seq})
 
 
@@ -280,81 +287,47 @@ async def test_live_reconnect_dedupes_overlap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_out_of_order_frames_are_reordered_not_dropped() -> None:
-    """bridge 按 ``5,3,4,6`` 推(并发 worker 下先分号后进 bridge)—— 一帧不丢。
+async def test_live_unfillable_gap_emits_gap_frame(caplog: pytest.LogCaptureFixture) -> None:
+    """真缺口:能从库里补的补上,补不齐的那一段发一帧 ``gap``。
 
-    这条钉住重排窗口本身。「见缺口就立刻查库」的写法下:5 到达时 last 会被推到
-    4,等真正的 3、4 到达时它们已经 ``<= last`` 被丢弃 —— **本来没丢的帧被那个
-    逻辑弄丢**。那种写法下本测试收到的是 ``[5, 6]``。
-    """
-    run_id = uuid4()
-    store = InMemoryRunEventStore()
-    await _seed_rows(store, run_id, range(3))  # 库里 0..2
-    bridge = _ScriptedBridge([_live_frame(5), _live_frame(3), _live_frame(4), _live_frame(6)])
+    形态:补库给到 seq 2;后台 writer 随后才把 3、4 落盘;bridge 推 seq 8
+    (5..7 既不在 bridge 缓冲区里、也没落库)。客户端必须依次收到
+    3、4、一帧 ``gap {"from": 5, "to": 7}``、然后 8。
 
-    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
-
-    assert _seqs(frames) == [3, 4, 5, 6]
-
-
-@pytest.mark.asyncio
-async def test_pending_frames_are_flushed_before_end(caplog: pytest.LogCaptureFixture) -> None:
-    """窗口没撑爆就到了 end —— 压在 pending 里的帧必须在 end 之前放出去,不能吞。"""
-    run_id = uuid4()
-    store = InMemoryRunEventStore()
-    await _seed_rows(store, run_id, range(3))  # 库里 0..2
-    bridge = _ScriptedBridge([_live_frame(3), _live_frame(5)])
-
-    with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
-        frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
-
-    assert _seqs(frames) == [3, 5]
-    assert frames[-1][1] == "end"  # 5 在 end 之前
-    # 窗口没撑爆 → 不该去查库、也不该报缺口。
-    assert [r.getMessage() for r in caplog.records if "gap_unfilled" in r.getMessage()] == []
-
-
-@pytest.mark.asyncio
-async def test_live_reconnect_fills_gap(caplog: pytest.LogCaptureFixture) -> None:
-    """重排窗口撑爆 → 才认定真缺口,去库里回填,补不齐的那段报 warning。
-
-    形态:补库给到 seq 2;随后后台 writer 才把 3、4 落盘;bridge 从 seq 35 起
-    连推 33 帧(> 重排窗口 32)。客户端必须按序收到 3、4,然后 35…67,
-    并且日志里有一条 warning 说明 5..34 补不齐。
-
-    **与计划 Step 1 第 3 条的偏差**:计划那条写「bridge **只**推 seq 35」。泄压
-    条件是 ``len(pending) > _REORDER_WINDOW``(计划自己写死的算法),单独一帧
-    只会让 ``len(pending) == 1``,永远撑不爆窗口 —— 那样写的测试根本走不到回填
-    分支。这里保持算法逐字不变,改成推满 33 帧让窗口真的撑爆。
+    Task 3R 之后跳号**没有歧义** —— bridge 在自己的临界区里发号并入队,订阅者
+    看到的帧顺序恒等于 seq 顺序,所以 ``seq > last + 1`` 只可能是真缺口。
     """
     run_id = uuid4()
     store = InMemoryRunEventStore()
     await _seed_rows(store, run_id, range(3))  # 补库阶段:库里只有 0..2
 
     async def _late_persist() -> None:
-        """后台攒批 writer 迟到 —— 补库读完之后 3、4 才落盘。"""
+        """后台攒批 writer 迟到 —— 补库读完之后 3、4 才落盘(5..7 始终没有)。"""
         await _seed_rows(store, run_id, [3, 4])
 
-    script: list[StreamEvent | Callable[[], Awaitable[None]]] = [_late_persist]
-    script += [_live_frame(s) for s in range(35, 68)]  # 33 帧 > 窗口 32
-    bridge = _ScriptedBridge(script)
+    bridge = _ScriptedBridge([_late_persist, _live_frame(8)])
 
     with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
         frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
 
-    assert _seqs(frames) == [3, 4, *range(35, 68)]
-
-    gap_logs = [r.getMessage() for r in caplog.records if "gap_unfilled" in r.getMessage()]
+    assert [(name, data) for _fid, name, data in frames] == [
+        ("updates", {"n": 3}),
+        ("updates", {"n": 4}),
+        ("gap", {"from": 5, "to": 7}),
+        ("updates", {"n": 8}),
+        ("end", {"status": "success", "run_id": str(run_id)}),
+    ]
+    # ``gap`` 帧不可回放 —— 它描述的是这条连接的状况,不是 run 的事件。
+    assert next(fid for fid, name, _ in frames if name == "gap") is None
+    gap_logs = [r.getMessage() for r in caplog.records if "live_stream.gap " in r.getMessage()]
     assert len(gap_logs) == 1, gap_logs
-    assert "missing_from=5" in gap_logs[0]
-    assert "missing_to=34" in gap_logs[0]
 
 
 @pytest.mark.asyncio
 async def test_live_backfill_pages_through_more_than_one_page() -> None:
     """补库是**循环**读到某页不满为止,不是只读一页。
 
-    钉住计划 Step 5 最后那条变异(「把补库循环改成只读一页」)。顺带钉住
+    钉住计划 Step 7 最后那条变异(「把补库循环改成只读一页」)。顺带钉住
     ``scope`` 工厂在 live 分支的每一次读上都被重新调用一次 —— 工厂返回的 CM
     是单次可用的,复用会炸 ``generator didn't yield``。
     """
@@ -387,7 +360,7 @@ async def test_live_backfill_pages_through_more_than_one_page() -> None:
 
 @pytest.mark.asyncio
 async def test_live_token_frames_pass_through_without_id() -> None:
-    """token 帧不可回放:不参与去重 / 重排,原样放行且不带 ``id:``。"""
+    """token 帧不可回放:不参与去重,原样放行且不带 ``id:``。"""
     run_id = uuid4()
     store = InMemoryRunEventStore()
     await _seed_rows(store, run_id, range(3))  # 库里 0..2
@@ -403,73 +376,6 @@ async def test_live_token_frames_pass_through_without_id() -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_isolated_large_jump_triggers_backfill(caplog: pytest.LogCaptureFixture) -> None:
-    """孤立的大跳号 —— bridge 只推一帧就安静下来,也必须**立刻**回填。
-
-    钉住泄压条件的第二个维度 ``min(pending) - last - 1 > _REORDER_WINDOW``。
-    只有 ``len(pending) > _REORDER_WINDOW`` 那一维时,单独一帧永远撑不爆窗口,
-    缺的 3、4 在这条连接上根本不补(要等到 end 才把 35 吐出来)—— 而"服务端
-    补齐"正是本项对外承诺的东西。
-
-    跳号取 ``last + _REORDER_WINDOW + 2``:比窗口**恰好多 1**。计划正文举的
-    ``seq 35``(``last=2``)算出来的跳号宽度正好 ``== _REORDER_WINDOW``,
-    ``>`` 不成立、触发不了 —— 所以这里从常量算,不写死数字。
-    """
-    run_id = uuid4()
-    store = InMemoryRunEventStore()
-    await _seed_rows(store, run_id, range(3))  # 补库阶段:库里只有 0..2
-
-    async def _late_persist() -> None:
-        await _seed_rows(store, run_id, [3, 4])
-
-    jump = 2 + _REORDER_WINDOW + 2  # last=2 → 跳号宽度 = _REORDER_WINDOW + 1
-    bridge = _ScriptedBridge([_late_persist, _live_frame(jump)])
-
-    with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
-        frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
-
-    # 3、4 必须在 jump 之前发出 —— 而不是 jump 先出、3/4 永不出现。
-    assert _seqs(frames) == [3, 4, jump]
-    gap_logs = [r.getMessage() for r in caplog.records if "gap_unfilled" in r.getMessage()]
-    assert len(gap_logs) == 1, gap_logs
-    assert "missing_from=5" in gap_logs[0]
-    assert f"missing_to={jump - 1}" in gap_logs[0]
-
-
-@pytest.mark.asyncio
-async def test_late_frame_written_off_is_still_delivered(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """被判过"丢了"的 seq 后来自己回来了 —— 必须照发,不能因为 ``<= last`` 被丢。
-
-    钉住 ``missing`` 名单。形态:补库到 2;库里随后只补上 3、4(**没有 5**);
-    bridge 先推一个大跳号触发回填 → 5..jump-1 补不齐、进 missing、``last`` 被
-    推到 jump-1;**之后** bridge 才把 seq 5 推过来(并发 worker 下先分号的帧
-    后进 bridge,这是真会发生的形态)。
-
-    没有 missing 名单时,5 到达时已经 ``5 <= last``,会被当成"补库阶段已经发过"
-    静默丢弃 —— 一帧真实存在过的帧因为算法判断失误而消失。
-    """
-    run_id = uuid4()
-    store = InMemoryRunEventStore()
-    await _seed_rows(store, run_id, range(3))  # 补库阶段:库里只有 0..2
-
-    async def _late_persist_without_5() -> None:
-        await _seed_rows(store, run_id, [3, 4])  # 注意:没有 5
-
-    jump = 2 + _REORDER_WINDOW + 2
-    bridge = _ScriptedBridge([_late_persist_without_5, _live_frame(jump), _live_frame(5)])
-
-    with caplog.at_level(logging.WARNING, logger=_LIVE_LOGGER):
-        frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
-
-    # 5 迟到但仍然送达(乱序是可接受的代价 —— 客户端本来就按 seq 排)。
-    assert _seqs(frames) == [3, 4, jump, 5]
-
-
-# ---------------------------------------------------------------------------
-# P3 PR-1 / Task 4 —— 回放分页:截断不再假装流结束
 #
 # 「验证条件矩阵」E 那一行:**帧数 > 页大小**才走得到截断分支;短 run 上
 # 怎么写都绿。
@@ -668,8 +574,8 @@ async def test_live_end_frame_carries_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_end_frame_flushes_pending_before_status() -> None:
-    """Task 3 的 pending flush 与 Task 5 的 status 不能互相踩:先放帧再发 end。"""
+async def test_live_gap_frame_does_not_disturb_end_status() -> None:
+    """Task 3R 的 ``gap`` 帧与 Task 5 的 end status 不互相踩。"""
     run_id = uuid4()
     store = InMemoryRunEventStore()
     await _seed_rows(store, run_id, range(3))
@@ -677,8 +583,9 @@ async def test_live_end_frame_flushes_pending_before_status() -> None:
 
     frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
 
+    assert [name for _fid, name, _d in frames] == ["gap", "updates", "end"]
+    assert frames[0][2] == {"from": 3, "to": 4}
     assert _seqs(frames) == [5]
-    assert frames[-1][1] == "end"
     assert frames[-1][2]["status"] == "paused"
 
 
