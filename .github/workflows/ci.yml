@@ -82,12 +82,15 @@ jobs:
     # job so a slow Docker image pull on the runner never gates the PR.
     # History: 10min → 20min (2026-07, suite at ~9m35s / 5222 tests) → 40min
     # (2026-08-11, main itself running 17m50s-18m21s with one run already
-    # cancelled at the finish line). Both raises were stopgaps.
+    # cancelled at the finish line). Both raises were stopgaps, and by
+    # 2026-08-14 main was at 29m17s — 11 minutes from the cap again.
     #
-    # 2026-08-14 — the real fix landed: ``-n auto`` (pytest-xdist) below.
-    # Measured on 7621 unit tests: 12m47s serial → 3m28s at -n 4 locally,
-    # so this job should come in around 5min. The cap stays at 40 as pure
-    # headroom; it is no longer load-bearing.
+    # 2026-08-14 — the real fix: ``-n auto`` (pytest-xdist) below.
+    # Measured job time on this runner: 29m17s → 11m32s (2.5x).
+    #
+    # Do NOT extrapolate the local numbers: 12m47s serial → 3m28s at -n 4
+    # locally is 3.7x, but the runner only delivers 2.5x. Per-worker startup
+    # (each imports the whole app) is a fixed cost the local box hides.
     #
     # The long-assumed blocker ("needs the fixtures audited for parallel
     # safety first") turned out not to exist: zero fixtures needed changing.
