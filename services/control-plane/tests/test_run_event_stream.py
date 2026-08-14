@@ -37,6 +37,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
+import control_plane.api._run_event_stream as stream_module
 import control_plane.api.runs as runs_module
 from control_plane.api._run_event_stream import build_event_producer
 from expert_work.runtime.runs import (
@@ -841,3 +842,40 @@ def test_end_status_vocabulary_round_trip() -> None:
         f"sse.py 赋了这些 session_outcome 但 _EXTERNAL_END_STATUS 没有对应键:{sorted(unmapped)}"
         " —— 它们会被静默兜成 error"
     )
+
+
+@pytest.mark.asyncio
+async def test_hole_tracking_overflow_emits_gap_and_keeps_the_newest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``holes`` 的容量上限那一支 —— 唯一一条没有测试保护的分支(实施者自报)。
+
+    真要触发得造 >4096 个洞,代价与收益不成比例;把上限调小就能在几行里覆盖它。
+
+    策略是"丢老的、留新的",依据是 bridge 的 256 帧缓冲里**只可能还留着最新的** ——
+    老的那一段就算继续跟踪也永远等不到补发,不如立刻告诉客户端。本测试同时钉住
+    这个方向:溢出时被冲成 ``gap`` 的必须是**小的那一段**,留在 ``holes`` 里、
+    随后真的被 bridge 补上的必须是**大的那一段**。反过来实现就会红。
+
+    另一半价值:实现里 ``[lo, cut)`` 是直接一帧 ``gap`` 带过的,**不会把大 range
+    物化成 set** —— 所以百万级的洞也只花常数内存。把那一支写成先 ``update`` 再裁剪
+    的人会让这条测试仍然绿,但会在生产上炸内存;这里留一句话给下一个改它的人。
+    """
+    monkeypatch.setattr(stream_module, "_MAX_TRACKED_HOLES", 4)
+
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 20])  # 1..19 全是落库空洞,共 19 个 > 上限 4
+    # 17 落在"留下来跟踪"的那一段(16..19),21 是正常续接的下一帧。
+    bridge = _ScriptedBridge([_live_frame(17), _live_frame(21)])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=None)
+
+    gaps = [d for _fid, name, d in frames if name == "gap"]
+    # 溢出的是小的那一段:1..15 被立刻冲掉(19 个洞,只留得下最新的 4 个 16..19)。
+    assert {"from": 1, "to": 15} in gaps, f"溢出段没有被冲成 gap:{gaps}"
+    # 留下来的那一段真的还能被 bridge 补上 —— 这就是"留新的"的意义。
+    assert 17 in _seqs(frames), f"上限内的洞 17 没有被补发:{_seqs(frames)}"
+    # 16 / 18 / 19 始终没等到,最后必须报缺口,一个都不许吞。
+    covered = {s for g in gaps for s in range(int(g["from"]), int(g["to"]) + 1)}
+    assert {16, 18, 19} <= covered, f"未补上的洞被吞了:gaps={gaps}"

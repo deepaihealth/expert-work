@@ -159,8 +159,11 @@ async def build_event_producer(
         if next_seq is not None:
             # 截断 —— **不发 end**。以前这里补一个 end,客户端会以为流正常结束,
             # 把后面的帧静默丢掉。``truncated`` 帧与 ``X-Expert-Work-Next-Seq``
-            # 头同时给:浏览器 ``EventSource`` 读不到响应头,只给 header 的信号
-            # 对一整类客户端不可用。
+            # 头同时给:**中间代理会剥掉不认识的响应头**,而 body 里的帧不会被剥,
+            # 所以信号放在流里比放在头里稳;头照发,能读到的客户端直接用。
+            # (别把理由写成"浏览器 EventSource 读不到响应头"—— EventSource 设不了
+            # Authorization / API-key 头,本来就用不了这套 API,那等于宣称一个
+            # 我们并不提供的能力。)
             yield format_sse("truncated", {"next_seq": next_seq})
             return
         yield format_sse(
@@ -208,10 +211,15 @@ async def build_event_producer(
         last = since_seq if since_seq is not None else -1
         holes: set[int] = set()
 
-        def _gap_frames(seqs: set[int]) -> list[bytes]:
+        def _gap_frames(seqs: set[int], *, reason: str) -> list[bytes]:
+            """``reason`` 只进日志,不进 wire —— 客户端不需要区分 ``gap`` 的来源
+            (处置方式都是"这段在这条连接上拿不到"),但排障时分得清是
+            "落库空洞被判死刑" 还是 "缺口分支翻页也补不齐" 能省一轮猜。"""
             frames: list[bytes] = []
             for lo, hi in _merge_ranges(seqs):
-                logger.warning("live_stream.gap run_id=%s from=%s to=%s", run_id, lo, hi)
+                logger.warning(
+                    "live_stream.gap run_id=%s from=%s to=%s reason=%s", run_id, lo, hi, reason
+                )
                 frames.append(format_sse("gap", {"from": lo, "to": hi}))
             return frames
 
@@ -219,7 +227,7 @@ async def build_event_producer(
             """``< bound`` 的洞再也不会从 bridge 补上了 —— 冲成 ``gap`` 帧。"""
             doomed = {h for h in holes if h < bound}
             holes.difference_update(doomed)
-            return _gap_frames(doomed)
+            return _gap_frames(doomed, reason="hole_passed")
 
         def _record_holes(lo: int, end_exclusive: int) -> list[bytes]:
             """记下 ``[lo, end_exclusive)`` 这段落库空洞;装不下的立刻冲成 gap。"""
@@ -258,7 +266,7 @@ async def build_event_producer(
                 continue
             if is_end(entry):
                 # 还没决出结果的洞不能跟着流一起消失。
-                for chunk in _gap_frames(holes):
+                for chunk in _gap_frames(holes, reason="hole_unfilled_at_end"):
                     yield chunk
                 holes.clear()
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
@@ -302,7 +310,11 @@ async def build_event_producer(
                         break
                 if last + 1 < seq:
                     logger.warning(
-                        "live_stream.gap run_id=%s from=%s to=%s", run_id, last + 1, seq - 1
+                        "live_stream.gap run_id=%s from=%s to=%s reason=%s",
+                        run_id,
+                        last + 1,
+                        seq - 1,
+                        "backfill_short",
                     )
                     yield format_sse("gap", {"from": last + 1, "to": seq - 1})
 
