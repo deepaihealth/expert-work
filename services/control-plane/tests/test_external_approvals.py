@@ -75,12 +75,18 @@ class _Ctx:
         app: Any,
         tenant_id: UUID,
         headers: dict[str, str],
+        console_headers: dict[str, str],
         run_store: InMemoryRunStore,
     ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
+        #: Employee JWT. ``headers`` above is a service account, which
+        #: ``console_only()`` bars from the console plane — so a test that
+        #: needs a *console* route (e.g. the kill switch) as a setup step
+        #: must use this one. See the fixture for why both exist.
+        self.console_headers = console_headers
         self.run_store = run_store
 
     async def seed_agent(self) -> None:
@@ -117,9 +123,21 @@ async def ctx() -> AsyncIterator[_Ctx]:
         scopes=("admin",),
     )
     headers = {"Authorization": f"Bearer {jwt}"}
+    # External-API-v1 P2-b console lockdown — the kill switch
+    # (``POST /v1/agents/{name}/disable``) is a console route and now carries
+    # ``console_only()``, so the service account above cannot reach it. Setup
+    # steps that go through the console use this employee identity instead.
+    console_jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="employee-test",
+        sub_type="user",
+        roles=("admin",),
+        scopes=(),
+    )
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, run_store)
+        yield _Ctx(client, app, tenant_id, headers, console_headers, run_store)
 
 
 @pytest.mark.asyncio
@@ -346,7 +364,9 @@ async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ct
     """
     run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
 
-    disable = await ctx.client.post("/v1/agents/support-bot/disable", json={}, headers=ctx.headers)
+    disable = await ctx.client.post(
+        "/v1/agents/support-bot/disable", json={}, headers=ctx.console_headers
+    )
     assert disable.status_code == 200, disable.text
 
     resp = await ctx.client.post(

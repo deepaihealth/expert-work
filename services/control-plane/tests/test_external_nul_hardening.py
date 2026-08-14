@@ -76,11 +76,21 @@ def _build_settings() -> Settings:
 
 
 class _Ctx:
-    def __init__(self, client: AsyncClient, app: Any, tenant_id: UUID, headers: dict[str, str]):
+    def __init__(
+        self,
+        client: AsyncClient,
+        app: Any,
+        tenant_id: UUID,
+        headers: dict[str, str],
+        console_headers: dict[str, str],
+    ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
+        #: Employee JWT — ``headers`` is a service account, which
+        #: ``console_only()`` bars from console routes. See the fixture.
+        self.console_headers = console_headers
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -125,9 +135,21 @@ async def ctx() -> AsyncIterator[_Ctx]:
         scopes=("admin",),
     )
     headers = {"Authorization": f"Bearer {jwt}"}
+    # External-API-v1 P2-b console lockdown — the kill switch
+    # (``POST /v1/agents/{name}/disable``) became ``console_only()``, so the
+    # service account above can no longer reach it. Its NUL check still needs
+    # coverage, from the caller class that CAN still get there: an employee.
+    console_jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="employee-test",
+        sub_type="user",
+        roles=("admin",),
+        scopes=(),
+    )
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers)
+        yield _Ctx(client, app, tenant_id, headers, console_headers)
 
 
 def _assert_envelope_422(resp: Any, *, code: str) -> None:
@@ -306,17 +328,31 @@ async def test_decide_idempotency_key_body_field_with_nul_is_422(ctx: _Ctx) -> N
 
 @pytest.mark.asyncio
 async def test_disable_reason_with_nul_is_422(ctx: _Ctx) -> None:
-    """Bonus finding, not in the original field list: ``POST
-    /{name}/disable|enable`` are not ``console_only()`` — a ``write``-scope
-    API key maps to OPERATOR, which is granted ``manifest: {read, write}``
-    (``rbac.py``), so this is reachable by the same external caller class as
-    every other field above. ``reason`` lands in ``agent_disable.reason``
-    (``Text``) verbatim."""
+    """Bonus finding, not in the original field list. ``reason`` lands in
+    ``agent_disable.reason`` (``Text``) verbatim, so a NUL byte reaches the
+    driver.
+
+    **The premise this was written under is gone.** It originally read: "``POST
+    /{name}/disable|enable`` are not ``console_only()`` — a ``write``-scope API
+    key maps to OPERATOR, which is granted ``manifest: {read, write}``, so this
+    is reachable by the same external caller class as every other field above."
+    The P2-b console lockdown closed that door: an API key now gets 403 here,
+    which is a *stronger* outcome than the 422 this asserts. The NUL check
+    still has to hold for the caller class that CAN reach it — an employee —
+    so the test moves to ``console_headers`` rather than being deleted."""
     await ctx.seed_agent()
+    # Guard the premise itself: if the console gate ever comes off this route,
+    # the API key goes back to reaching the handler and this assertion fails,
+    # putting the docstring above back under review.
+    via_key = await ctx.client.post(
+        "/v1/agents/support-bot/disable", json={"reason": "a\x00b"}, headers=ctx.headers
+    )
+    assert via_key.status_code == 403, via_key.text
+
     resp = await ctx.client.post(
         "/v1/agents/support-bot/disable",
         json={"reason": "a\x00b"},
-        headers=ctx.headers,
+        headers=ctx.console_headers,
     )
     _assert_envelope_422(resp, code="INVALID_REQUEST")
 
