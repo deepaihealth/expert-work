@@ -76,7 +76,7 @@ async def test_replay_enters_the_given_scope_factory_exactly_once() -> None:
 
     plan = await build_event_producer(
         run_id=run_id,
-        is_terminal=True,
+        run_status=RunStatus.SUCCESS,
         event_store=event_store,
         stream_bridge=InMemoryStreamBridge(),
         since_seq=None,
@@ -125,7 +125,7 @@ async def test_console_events_endpoint_passes_a_live_scope_factory(
 # P3 PR-1 / Task 3 —— live 分支认 ``since_seq``:补库 + 重排窗口 + 缺口回填
 #
 # 「验证条件矩阵」D 那一行:**run 仍在跑时重连**才走得到这段代码。下面每条
-# 都传 ``is_terminal=False``;终态的 run 走的是 replay 分支,测了等于没测。
+# 都传 ``run_status=RUNNING``;终态的 run 走的是 replay 分支,测了等于没测。
 # ---------------------------------------------------------------------------
 
 _LIVE_LOGGER = "control_plane.api._run_event_stream"
@@ -237,7 +237,7 @@ async def _collect_live(
 ) -> list[tuple[str | None, str, Any]]:
     plan = await build_event_producer(
         run_id=run_id,
-        is_terminal=False,  # RUNNING —— 不这样就走 replay 分支,测了等于没测
+        run_status=RunStatus.RUNNING,  # 不这样就走 replay 分支,测了等于没测
         event_store=event_store,
         stream_bridge=bridge,
         since_seq=since_seq,
@@ -481,10 +481,11 @@ async def _collect_replay(
     run_id: UUID,
     store: InMemoryRunEventStore,
     since_seq: int | None = None,
+    run_status: RunStatus = RunStatus.SUCCESS,
 ) -> tuple[list[tuple[str | None, str, Any]], int | None]:
     plan = await build_event_producer(
         run_id=run_id,
-        is_terminal=True,
+        run_status=run_status,
         event_store=store,
         stream_bridge=InMemoryStreamBridge(),
         since_seq=since_seq,
@@ -615,3 +616,156 @@ async def test_console_events_endpoint_carries_next_seq_header(
     assert resp.status_code == 200, resp.text
     assert resp.headers["x-expert-work-next-seq"] == str(MAX_LIST_LIMIT - 1)
     assert _parse_sse([resp.content])[-1][1] == "truncated"
+
+
+# ---------------------------------------------------------------------------
+# P3 PR-1 / Task 5 —— ``end`` 帧带终局状态
+#
+# 「验证条件矩阵」F 那一行:**必须用被取消 / PAUSED 的 run**。正常跑完的 run
+# 上 status 恒 ``success``,任何写错的映射表都能跑绿。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (RunStatus.INTERRUPTED, "interrupted"),
+        (RunStatus.PAUSED, "paused"),  # 等审批不是失败
+        (RunStatus.ERROR, "error"),
+        (RunStatus.TIMEOUT, "error"),
+        (RunStatus.SUCCESS, "success"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_replay_end_frame_carries_status(status: RunStatus, expected: str) -> None:
+    """回放分支的 ``end`` 帧带 ``{"status", "run_id"}``。
+
+    以前 run 被取消也只发 ``end`` + ``data: null``,第三方分不清"正常答完"和
+    "被取消",得再查一次 REST。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(3))
+
+    frames, _ = await _collect_replay(run_id=run_id, store=store, run_status=status)
+
+    assert frames[-1][1] == "end"
+    assert frames[-1][2] == {"status": expected, "run_id": str(run_id)}
+
+
+@pytest.mark.asyncio
+async def test_live_end_frame_carries_status() -> None:
+    """live 分支的 ``end`` 帧同样带 status —— 从 bridge 的 end 帧 data 里取。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(2))
+    bridge = _ScriptedBridge([], end_status="interrupted")
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=None)
+
+    assert frames[-1][1] == "end"
+    assert frames[-1][2] == {"status": "interrupted", "run_id": str(run_id)}
+
+
+@pytest.mark.asyncio
+async def test_live_end_frame_flushes_pending_before_status() -> None:
+    """Task 3 的 pending flush 与 Task 5 的 status 不能互相踩:先放帧再发 end。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(3))
+    bridge = _ScriptedBridge([_live_frame(5)], end_status="paused")
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
+
+    assert _seqs(frames) == [5]
+    assert frames[-1][1] == "end"
+    assert frames[-1][2]["status"] == "paused"
+
+
+@pytest.mark.asyncio
+async def test_both_sse_paths_emit_the_same_end_shape() -> None:
+    """防分叉哨兵 —— 同一个 run,两条 SSE 流的 ``end`` 帧 data 必须一模一样。
+
+    路径一:``sse_consumer``(``POST /v1/agents/{code}/runs`` 的 ``mode:
+    "stream"``,第三方主路径,经 ``spawn_run`` 走到);
+    路径二:``GET .../runs/{run_id}/events``(断线重连,本模块)。
+
+    只改其中一条时这条必须红。这个仓库刚在 P2-a 修过一次同类的「重放响应的
+    字段集合是首次响应的真子集」问题 —— 结构上共用一个构造口(``sse.py`` 的
+    ``end_frame_data``)是根治,这条测试是它的看门狗。
+    """
+    from expert_work.runtime.runs import RunManager
+    from orchestrator.sse import run_agent, sse_consumer
+
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+    )
+    store = InMemoryRunEventStore()
+    record.abort_event.set()  # → INTERRUPTED,不是恒 success 的正常收尾
+
+    class _OneChunkGraph:
+        async def astream(
+            self, _input: Any, _config: Any = None, *, stream_mode: str = "updates"
+        ) -> AsyncIterator[Any]:
+            yield {"agent": {"step_count": 1}}
+
+        async def aget_state(self, _config: Any) -> Any:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(values={})
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_OneChunkGraph(),
+        graph_input={"messages": []},
+        config={},
+        event_store=store,
+    )
+    assert rm.get(record.run_id).status is RunStatus.INTERRUPTED  # 前置条件
+
+    async def _never_disconnected() -> bool:
+        return False
+
+    consumer_frames = _parse_sse(
+        [
+            chunk
+            async for chunk in sse_consumer(
+                bridge=bridge,
+                record=record,
+                run_manager=rm,
+                is_disconnected=_never_disconnected,
+                heartbeat_interval=5.0,
+            )
+        ]
+    )
+    events_frames, _ = await _collect_replay(
+        run_id=record.run_id, store=store, run_status=RunStatus.INTERRUPTED
+    )
+
+    consumer_end = consumer_frames[-1]
+    events_end = events_frames[-1]
+    assert consumer_end[1] == events_end[1] == "end"
+    # 字段集合先比。``data`` 不是 dict(比如某条路径还在发 ``null``)时归一成
+    # ``None``,好让失败信息直接指出是哪条路径掉队,而不是抛 TypeError。
+    consumer_fields = sorted(consumer_end[2]) if isinstance(consumer_end[2], dict) else None
+    events_fields = sorted(events_end[2]) if isinstance(events_end[2], dict) else None
+    assert consumer_fields == events_fields, (
+        f"两条流的 end 帧 data 分叉了:sse_consumer={consumer_end[2]!r} "
+        f"vs GET events={events_end[2]!r}"
+    )
+    # 字段集合相同还不够 —— 同一个 run 的值也必须一致。
+    assert (
+        consumer_end[2]
+        == events_end[2]
+        == {
+            "status": "interrupted",
+            "run_id": str(record.run_id),
+        }
+    )

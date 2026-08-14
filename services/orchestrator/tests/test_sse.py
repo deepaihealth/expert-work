@@ -330,7 +330,10 @@ async def test_sse_consumer_frames_in_order_end_terminates() -> None:
     text = b"".join(frames).decode()
     assert "event: metadata" in text
     assert "event: updates" in text
-    assert text.rstrip().endswith("event: end\ndata: null")
+    # P3 PR-1 Task 5 —— end 帧不再是 ``data: null``,带终局状态 + run_id。
+    assert text.rstrip().endswith(
+        'event: end\ndata: {"status":"success","run_id":"' + str(record.run_id) + '"}'
+    )
 
 
 async def _never_disconnected() -> bool:
@@ -1183,3 +1186,50 @@ def test_to_jsonable_serializes_dataclass() -> None:
             ]
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# P3 PR-1 Task 5 —— sse_consumer 的 end 帧带终局状态
+#
+# 这条流是 **POST /v1/agents/{code}/runs 且 mode: "stream"** 走的路
+# (runs.py:1091 / runs.py:1797 / external_approvals.py:311),第三方最常用的
+# 路径。只改 ``_run_event_stream.py`` 的话它依然发 ``data: null``,两条流的
+# end 帧字段集合会分叉。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sse_consumer_end_frame_carries_status_on_cancelled_run() -> None:
+    """被取消的 run 走 ``sse_consumer`` —— end 帧必须说清它是被取消的。
+
+    **必须用被取消的 run**:正常跑完的 run 上 status 恒 ``success``,写错的
+    映射表也能跑绿(「验证条件矩阵」F 那一行)。
+    """
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    record.abort_event.set()  # set before astream → 第一轮就 break → INTERRUPTED
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_ScriptedGraph(chunks=[{"agent": {"step_count": 1}}]),
+        graph_input={"messages": []},
+        config={},
+    )
+    assert rm.get(record.run_id).status is RunStatus.INTERRUPTED  # 前置条件
+
+    frames: list[bytes] = []
+    async for frame in sse_consumer(
+        bridge=bridge,
+        record=record,
+        run_manager=rm,
+        is_disconnected=_never_disconnected,
+        heartbeat_interval=5.0,
+    ):
+        frames.append(frame)
+
+    text = b"".join(frames).decode()
+    payload = json.loads(text.rstrip().rsplit("data: ", 1)[1])
+    assert payload == {"status": "interrupted", "run_id": str(record.run_id)}

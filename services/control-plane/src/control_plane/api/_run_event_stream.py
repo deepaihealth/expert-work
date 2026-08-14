@@ -19,7 +19,8 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from uuid import UUID
 
-from expert_work.runtime.runs import RunEventRecord, RunEventStore
+from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus
+from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     HEARTBEAT_SENTINEL,
@@ -27,9 +28,21 @@ from expert_work.runtime.stream_bridge import (
     StreamEvent,
     is_end,
 )
-from orchestrator.sse import format_sse
+from orchestrator.sse import end_frame_data, format_sse
 
 logger = logging.getLogger(__name__)
+
+#: ``RunStatus`` → 对外 ``end`` 帧的 status。词表与 ``sse.py`` 的
+#: ``_EXTERNAL_END_STATUS`` 同源(见 ``EXTERNAL_END_STATUSES``):
+#: ``PAUSED`` 必须独立 —— 它是"等人审批,对话还会继续",不是错误,客户端要
+#: 弹审批界面而不是报错;``TIMEOUT`` 对客户端而言就是失败。
+_RUN_STATUS_END_STATUS: dict[RunStatus, str] = {
+    RunStatus.SUCCESS: "success",
+    RunStatus.PAUSED: "paused",
+    RunStatus.INTERRUPTED: "interrupted",
+    RunStatus.ERROR: "error",
+    RunStatus.TIMEOUT: "error",
+}
 
 #: 实时接合的**乱序重排窗口**。``_publish_frame`` 是「同步分号 → await publish」,
 #: 并发 worker 下先分到号的帧可能后进 bridge,所以 seq 跳号的第一解释是「乱序
@@ -77,13 +90,17 @@ class EventStreamPlan:
 async def build_event_producer(
     *,
     run_id: UUID,
-    is_terminal: bool,
+    run_status: RunStatus,
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
 ) -> EventStreamPlan:
     """Return the SSE byte producer for one run, plus the replay cursor.
+
+    收的是 ``run_status`` 而不是 ``is_terminal``:终态与否**在函数内部推导**,
+    所以只有一处可能弄错;而回放分支的 ``end`` 帧还需要这个状态本身
+    (P3 PR-1 Task 5 —— 取消与答完必须可区分)。
 
     * Terminal run → :meth:`RunEventStore.list`,**一页**(``MAX_LIST_LIMIT``),
       按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
@@ -137,7 +154,10 @@ async def build_event_producer(
             # 对一整类客户端不可用。
             yield format_sse("truncated", {"next_seq": next_seq})
             return
-        yield format_sse("end", None)
+        yield format_sse(
+            "end",
+            end_frame_data(run_id=run_id, status=_RUN_STATUS_END_STATUS.get(run_status)),
+        )
 
     async def _stream_live() -> AsyncIterator[bytes]:
         """Live attach —— 先补库,再接实时流(P3 PR-1 Task 3 的接合算法)。
@@ -208,9 +228,11 @@ async def build_event_producer(
                 for pending_seq in sorted(pending):
                     leftover = pending.pop(pending_seq)
                     yield format_sse(leftover.event, leftover.data, event_id=leftover.id)
-                # Task 5 will surface ``entry.data``'s terminal status here;
-                # for now the wire format is unchanged (``data: null``).
-                yield format_sse("end", None)
+                # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
+                # (``publish_end(status=...)`` 存的)。**先 flush pending 再发
+                # end**,顺序不能反。
+                status = entry.data.get("status") if isinstance(entry.data, dict) else None
+                yield format_sse("end", end_frame_data(run_id=run_id, status=status))
                 return
 
             seq = _seq_of(entry)
@@ -261,7 +283,7 @@ async def build_event_producer(
             async for chunk in _drain_pending():
                 yield chunk
 
-    if not is_terminal:
+    if run_status not in TERMINAL_RUN_STATUSES:
         return EventStreamPlan(producer=_stream_live(), next_seq=None)
 
     # 回放:第一页在**返回迭代器之前**读掉,好让 next_seq 在构造

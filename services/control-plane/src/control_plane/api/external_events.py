@@ -102,7 +102,7 @@ async def build_events_response(
     is_terminal = run.status in TERMINAL_RUN_STATUSES
     plan = await build_event_producer(
         run_id=run.run_id,
-        is_terminal=is_terminal,
+        run_status=run.status,
         event_store=event_store,
         stream_bridge=stream_bridge,
         since_seq=since_seq,

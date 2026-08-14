@@ -1447,7 +1447,12 @@ async def sse_consumer(
                 continue
 
             if is_end(entry):
-                yield format_sse("end", None)
+                # P3 PR-1 Task 5 —— 把 bridge end 帧里的终局状态透传出去,别再
+                # 合成一个 ``None``。这条流是第三方的主路径(POST 建 run 的
+                # stream 模式);只改 ``_run_event_stream.py`` 的话,两条流的
+                # ``end`` 帧字段集合会分叉。
+                status = entry.data.get("status") if isinstance(entry.data, dict) else None
+                yield format_sse("end", end_frame_data(run_id=record.run_id, status=status))
                 return
 
             yield format_sse(entry.event, entry.data, event_id=entry.id or None)
@@ -1459,6 +1464,30 @@ async def sse_consumer(
             and record.on_disconnect is DisconnectMode.CANCEL
         ):
             await run_manager.cancel(record.run_id)
+
+
+#: 对外 ``end`` 帧允许出现的 status 四值。``_EXTERNAL_END_STATUS``(内部
+#: outcome → 对外 status)和 ``_run_event_stream._RUN_STATUS_END_STATUS``
+#: (``RunStatus`` → 对外 status)是同一套词表的两个入口,值域必须一致。
+EXTERNAL_END_STATUSES: frozenset[str] = frozenset({"success", "paused", "interrupted", "error"})
+
+
+def end_frame_data(*, run_id: UUID, status: str | None) -> dict[str, Any]:
+    """``end`` 帧的 ``data`` —— **两条 SSE 路径共用的唯一构造口**。
+
+    路径一是 ``sse_consumer``(``POST /v1/agents/{code}/runs`` 的 ``mode:
+    "stream"``,第三方主路径),路径二是 ``GET .../runs/{run_id}/events``
+    (``control_plane.api._run_event_stream``)。两条流的 ``end`` 帧字段集合
+    分叉过一次同类问题(P2-a:重放响应头是首次响应的真子集),所以这里做成
+    一个函数而不是两处字面量。
+
+    ``status`` 认不出来时归 ``error``:调用方总该知道 run 是怎么结束的,认不
+    出来本身就说明出了问题,而对外契约只允许四值。
+    """
+    return {
+        "status": status if status in EXTERNAL_END_STATUSES else "error",
+        "run_id": str(run_id),
+    }
 
 
 def format_sse(event: str, data: Any, *, event_id: str | None = None) -> bytes:
