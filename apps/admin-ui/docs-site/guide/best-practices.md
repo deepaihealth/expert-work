@@ -39,7 +39,12 @@ API Key 是持有者凭证,谁拿到就能以你的服务账号身份发起调�
 
 **`session_id` 从哪来?不传会怎样?**
 
-从上一次响应的 `X-Expert-Work-Session-Id` 响应头拿(见 [通用约定](./conventions) 的「公共请求头」一节)。请求时不传 `session_id` 就是开一段全新会话;传了但不属于这个 `user_id` / `agent_code`,返回 404(见 [错误码与限流](./errors))。
+请求时不传 `session_id` 就是开一段全新会话;传了但不属于这个 `user_id` / `agent_code`,返回 404(见 [错误码与限流](./errors))。拿到 `session_id` 的方式**按 `mode` 不同,别混用**:
+
+- `mode: "stream"`——响应头 `X-Expert-Work-Session-Id`(见 [通用约定](./conventions) 的「公共请求头」一节)。
+- `mode: "queue"`——**没有响应头**,202 响应体的 `data.thread_id` 字段就是这次绑定/续接到的会话 id(字段名叫 `thread_id`,不是 `session_id`——两个名字指的是同一个值,下次请求续接时仍然填进请求体的 `session_id` 字段)。
+
+会话绑定(`POST /v1/agents/{agent_code}/sessions`)和上传接口(`POST /v1/agents/{agent_code}/uploads`)这两个端点则是在响应体的 `data.session_id` 字段里给,字段名又不一样——原样按各自接口的参数表读,别假设所有端点用同一个字段名或者都走响应头。
 
 ## 7.6 联调自测清单
 

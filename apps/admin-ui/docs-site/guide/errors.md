@@ -1,6 +1,6 @@
 # 错误码与限流
 
-本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 400 / 401 / 403 / 404 / 409 / 410 / 413 / 422 / 429 / 500 / 502 / 503,以及限流和配额这两个容易混的概念。
+本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 400 / 401 / 403 / 404 / 409 / 410 / 413 / 422 / 429 / 500 / 502 / 503 / 504,以及限流和配额这两个容易混的概念。
 
 ## 6.1 错误码总表
 
@@ -28,7 +28,7 @@
 | [`INVALID_REQUEST`](#_422-——-请求参数不合法) | 422 | 请求体字段本身没通过基础校验 | 检查字段类型 / 长度 / 取值范围 |
 | [`INVALID_USER_ID`](#_422-——-请求参数不合法) | 422 | `user_id` 去掉首尾空白后是空字符串 | 传一个非空白的 `user_id` |
 | [`INVALID_FILE_REF`](#_422-——-请求参数不合法) | 422 | `files[]` 里 document 条目的 `upload_id` 格式不对 | 原样回传上传接口返回的值,不要自己改写 |
-| [`TOO_MANY_IMAGE_REFS`](#_422-——-请求参数不合法) | 422 | 图片条目(`image_refs` + `files[]` 里的 image)总数超过 64 | 拆分成多次调用 |
+| [`TOO_MANY_IMAGE_REFS`](#_422-——-请求参数不合法) | 422 | 图片条目(`image_refs` + `files[]` 里的 image)总数超过 64——这是外层的合计上限,单次 run 实际允许的图片数通常更低(默认 8,见下方 422 节) | 拆分成多次调用 |
 | [`INVALID_IMAGE_REF`](#_422-——-请求参数不合法) | 422 | image 条目引用格式不对 | 用上传接口对图片返回的引用,不要用 document 的 |
 | [`INVALID_IDEMPOTENCY_KEY`](./conventions) | 422 | `Idempotency-Key` 去空白后为空,或超过 255 字符 | 检查请求头取值 |
 | [`IDEMPOTENCY_KEY_REUSED`](./conventions) | 422 | 同一个 key 换了请求体,或打给了不同的 `agent_code` | 换一个新 key,不要复用 |
@@ -43,9 +43,11 @@
 | [`WORKSPACE_LIST_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 工作区存储服务端配置有问题 | 不是你这边能解决的,联系租户管理员 |
 | [`WORKSPACE_FILE_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 同上 | 联系租户管理员 |
 | [`UPLOAD_FAILED`](#_500-——-工作区服务端配置问题) | 500 / [502](#_502-——-上传写入失败-上游错误) | 文件上传落盘失败(服务端配置问题,或写入时的上游错误) | 重试;持续失败联系租户管理员 |
-| [`UPLOAD_UNAVAILABLE`](#_503-——-上传通路未就绪) | 503 | 对象存储或沙箱工作区未就绪 | 稍后重试;持续失败联系租户管理员 |
+| [`UPLOAD_UNAVAILABLE`](#_503-——-服务不可用-两种含义不同) | 503 | 上传接口专属:对象存储或沙箱工作区未就绪 | 稍后重试;持续失败联系租户管理员 |
+| [`SERVER_OVERLOADED`](#_503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**,不只是上传 | 按 `Retry-After` 头退避重试 |
+| [`DEADLINE_EXCEEDED`](#_504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值,或者干脆别传它 |
 
-**这张表只覆盖对外契约的 `error.code`。** 401 / 403 的裸 `detail` 形状、`inputs` 模板变量不匹配的裸 `detail`,这两类没有 `error.code`,靠 HTTP 状态码 + `message` 判断,见下面「先说一件容易踩的坑」。
+**这张表只覆盖有 `error.code` 的失败,不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是 FastAPI 默认的裸 `{"detail": "..."}` 字符串(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422),有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限""图片引用不属于这个会话",都是 4xx;配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表,完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
 
 ## 先说一件容易踩的坑:错误响应的信封形状不统一
 
@@ -71,7 +73,7 @@
 
 以下几种 `path` 形态会触发:绝对路径(以 `/` 开头)、含 `..` 段、含 NUL 字节(`\x00`)、空字符串或者去掉首尾空白后为空。应对:别自己拼路径——直接把 `GET .../workspace/files` 返回的 `path` 字段原样回传,细节见 [调用 Agent](./run-agent) 的「工作区文件」一节。
 
-**另一个 400 只发生在上传接口**(`POST /v1/agents/{agent_code}/uploads`),`error.code` 为 `INVALID_UPLOAD`:上传的文件本身没通过校验——常见情况是文件内容为空、没有文件名。检查文件后重传。
+**另一个 400 只发生在上传接口**(`POST /v1/agents/{agent_code}/uploads`),`error.code` 为 `INVALID_UPLOAD`:上传的文件本身没通过校验——最常见的是文件类型不在允许列表内(图片只收 png/jpeg/webp/gif,文档只收 pdf/docx/xlsx/pptx/txt/md/csv,传了别的类型就是这个码),其次是文件内容为空、没有文件名。检查文件类型和内容后重传。
 
 ## 401 —— key 无效 / 过期
 
@@ -116,6 +118,8 @@
 - `WORKSPACE_FILE_FAILED`——`GET /v1/agents/{agent_code}/workspace/file` 下载文件时,`user_id` 未识别(不认识这个终端用户)和 `path` 指向的文件不存在,这两种情况返回同一个不透明的 404,不要试图从响应里区分是哪一种——这是刻意的存在性隐藏,不是 bug。同一个 `error.code` 在 400 / 500 也会出现,靠 HTTP 状态码区分,见下方「400」与「500」两节。
 - `RUN_NOT_FOUND` / `APPROVAL_NOT_FOUND`——取消 run(`:cancel`)与审批决策(`:decide`)这两个端点各自的归属校验 / 审批查找失败码,完整的失败码表(含这两个端点特有的 409 / 403 / 410 / 422 情况)见 [取消 run 与审批决策](./run-control)。
 
+**还有一种 404 没有 `error.code`,是裸 `{"detail": "image ref not found"}`**:`POST /v1/agents/{agent_code}/runs` 的 `image_refs` / `files[]` 里的图片引用是绑定会话的(引用里编了 `thread_id`),传了一个不属于这次请求最终绑定到的那个会话的图片引用就会撞上这个 404。**一个真实会踩的顺序**:先调上传接口传了一张图但没带 `session_id`(接口顺手给你铸了一个新会话 A,图片引用绑定的是 A),然后发起 run 时又没传 `session_id`(这次请求又铸了一个新会话 B)——图片引用属于 A,run 绑定到了 B,直接 404。避免办法:上传时如果打算紧接着发一次带这张图的 run,把上传响应里的 `session_id` 原样带进发起 run 的请求体。
+
 ## 409 —— 审批冲突
 
 只发生在审批决策端点(`POST /v1/agents/{agent_code}/runs/{run_id}:decide`):`APPROVAL_CONFLICT`(这条审批已经被决定过,重复决策或并发竞争落败)、`SESSION_NOT_BOUND`(这个 run 所在会话没有绑定 agent,内部状态异常)。两个码的完整触发条件见 [取消 run 与审批决策](./run-control)。
@@ -149,7 +153,7 @@
 | `code` | 什么情况 |
 |---|---|
 | `INVALID_FILE_REF` | `files[]` 里 `type: "document"` 的 `upload_id` 不是上传接口返回的那种 `uploads/<name>` 形状(比如自己截成了裸文件名、或者带了路径穿越) |
-| `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张 |
+| `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张——这是请求体层面的合计上限,不代表单次 run 真的能处理 64 张图,见下方「图片数还有一道更严的闸」 |
 | `INVALID_IMAGE_REF` | `image_refs` 或 `files[]` 里 `type: "image"` 条目的引用格式不合法(不是上传接口对图片返回的那种 `expert_work://image/...` 引用)——两个入口都会触发这个码。最容易踩的坑:document 和 image 两种 `files[]` 条目字段名都叫 `upload_id`,把 document 形态的 `upload_id`(形如 `uploads/report.pdf`)填进了 `type: "image"` 的条目 |
 | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` 头去空白后是空字符串,或超过 255 字符 |
 | `IDEMPOTENCY_KEY_REUSED` | 同一个 `Idempotency-Key` 配了不同的请求体,或者配给了不同的 `agent_code` |
@@ -160,6 +164,13 @@
 | `INVALID_USER_ID` | `user_id` 去掉首尾空白后是空字符串(比如整串都是空格)——这条不止 `/runs`,凡是要求 `user_id` 的端点都会触发,包括会话绑定 / 取消 / 审批决策 / 会话列表与消息 / 重命名 / 归档 / 上传 / 工作区读取 |
 
 **agent 构建失败是另一种独立的 422**,`error.code` 为 `AGENT_BUILD_FAILED`——命中已发布 Agent 的 manifest 因服务端配置问题构建失败(比如引用了不存在的模型 / 工具),`/runs` 与审批决策(`:decide`)续跑都可能遇到。这不是你这边能解决的,联系租户管理员。
+
+**图片数还有一道更严的闸,而且撞上时拿到的是裸 `detail`,不是上面的统一信封**:`TOO_MANY_IMAGE_REFS`(64 张)只是请求体字段层面的合计上限;`/runs` 内部对单次 run 实际处理的图片数另有一条独立限制(部署可配,默认 **8** 张),超过时是 422 `{"detail": "too many images: max 8 per run"}`,没有 `error.code`,和 `TOO_MANY_IMAGE_REFS` 是两道完全独立的闸——9~64 张这个区间会先过掉 `TOO_MANY_IMAGE_REFS` 那道闸,再被这道闸拦下,拿到的是这个裸 `detail` 而不是统一信封。同一道闸还有两种关联失败,同样是裸 `detail`、没有 `error.code`:
+
+- 422 `{"detail": "agent does not accept image input: ..."}`——这个 Agent 没开启图片能力(既没声明支持视觉的模型,Agent 配置里也没声明 `vision` 相关能力),传了 `image_refs` / `files[]` 里的图片条目就会撞上,不管数量。
+- 404 `{"detail": "image ref not found"}`——图片引用不属于这次请求最终绑定的会话,细节见上方「404」一节。
+
+三条都不走 `{success, data, error}` 信封,写解析逻辑时不要假设"拿到 image 相关的 422/404 就一定有 `error.code` 可读"。
 
 **第二类,`inputs`(提示词模板变量)与 Agent 声明不匹配——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
 
@@ -234,16 +245,36 @@
 
 只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`)的文档分支,`error.code` 为 `UPLOAD_FAILED`(与上面 500 节的同名码同一次落盘失败的两种可能状态码,消息也相同):写入工作区时遇到沙箱侧的上游错误,不是权限配置问题。应对同上——不是退避重试能解决的,持续失败联系租户管理员。
 
-## 503 —— 上传通路未就绪
+## 503 —— 服务不可用,两种含义不同
 
-只发生在上传接口,`error.code` 为 `UPLOAD_UNAVAILABLE`:
+**第一种,全站过载保护——任何端点都可能遇到,不只是上传接口**:服务端同时处理的请求数超过软上限时,新请求直接被挡在外面,`error.code` 为 `SERVER_OVERLOADED`,带 `Retry-After` 响应头:
+
+```json
+{ "success": false, "data": null, "error": { "code": "SERVER_OVERLOADED", "message": "Server is shedding load; retry after a moment." } }
+```
+
+应对:按 `Retry-After` 头退避重试——这是典型的"这会儿太忙,等等再试就好"场景。
+
+**第二种,只发生在上传接口**(`POST /v1/agents/{agent_code}/uploads`),`error.code` 为 `UPLOAD_UNAVAILABLE`,**没有 `Retry-After` 头**:
 
 ```json
 { "success": false, "data": null, "error": { "code": "UPLOAD_UNAVAILABLE", "message": "object store unavailable" } }
 ```
 
-触发条件是服务端没有配置好对应的存储通路——图片走对象存储(`store` 未配置),文档走沙箱工作区(`workspace_store` 未配置)。都是部署 / 配置问题,不是你这边能解决的,联系你的租户管理员。
+触发条件是服务端没有配置好对应的存储通路——图片走的对象存储、文档走的沙箱工作区,任一个没接好都会触发。这是部署 / 配置问题,不是你这边能解决的,联系你的租户管理员;重试没用。
+
+**另外还有一种 503 没有 `error.code`**:发起 run 或者上传图片时,如果服务端的配额引擎本身不可用,响应是裸 `{"detail": "quota_engine_unavailable"}`,连 `{success, data, error}` 信封都没有。概率很低,但要知道这种形状存在——别假设 503 一定能读到 `error.code`。
+
+## 504 —— 请求超过了你自己设的截止时间
+
+只有你自己在请求上带了 `X-Expert-Work-Deadline-Ms` 头(见 [通用约定](./conventions)),且这个时间戳已经过去,才会触发——服务端不会主动给你的请求安一个截止时间,不用这个头就不会遇到这个状态码。统一信封:
+
+```json
+{ "success": false, "data": null, "error": { "code": "DEADLINE_EXCEEDED", "message": "X-Expert-Work-Deadline-Ms has already passed." } }
+```
+
+应对:检查这个头的取值是不是未来的 unix 毫秒时间戳;不需要端到端超时控制的话,别传这个头。
 
 ## 限流与配额,是两件事
 
-限流(rate limit)按时间窗口限制"多快",配额(quota)按资源维度限制"多少"——两者都复用同一个 `RATE_LIMIT_EXCEEDED` 错误码 + `dimension` 字段区分,但成因不同:限流是网关/租户层面的频率闸,不管你在做什么业务操作;配额是业务层面按资源计的账本(这个 agent 这段时间跑了多少次、这个用户的存储用了多少),超了同样 429,但解决办法可能不是"等等再试",而是"先把占用的资源清掉"或者"找管理员提额度"。拿到 429 先看 `error.message` / `error.dimension` 判断是哪一种,再决定退避重试还是清理资源。
+限流(rate limit)按时间窗口限制"多快",配额(quota)按资源维度限制"多少"——**这两个 429 对应不同的 `error.code`**(见上方「429」一节):限流是 `RATE_LIMIT_EXCEEDED`(带 `dimension` 字段和 `Retry-After` 头,网关/租户层面的频率闸,不管你在做什么业务操作);配额是 `QUOTA_EXCEEDED`(工作区容量满了,不带 `Retry-After`,因为等待不会让容量变大)。拿到 429 先看 `error.code` 判断是哪一种(别只看状态码,也别指望 `dimension` 字段总在——网关这一层的限流就不带它),再决定退避重试还是清理资源 / 找管理员提额度。

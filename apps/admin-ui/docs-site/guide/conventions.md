@@ -33,14 +33,15 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 | `Authorization: Bearer <key>` | 全部端点 | 见 [认证](./auth)。 |
 | `Content-Type: application/json` | 除文件上传外的全部写请求 | 文件上传接口(`POST /v1/agents/{agent_code}/uploads`)用 `multipart/form-data`。 |
 | `Idempotency-Key` | 仅 `POST /v1/agents/{agent_code}/runs` | 请求头形式的幂等键,见下方「2.6 幂等性」。 |
+| `X-Expert-Work-Deadline-Ms`(可选) | 任意端点 | 你自己设的一个绝对截止时间(unix 毫秒时间戳)。已经过去就直接 504(`DEADLINE_EXCEEDED`,见 [错误码与限流](./errors));不需要端到端超时控制就别传它。 |
 
-对应地,以下两个响应头会出现在发起 run(`stream` 模式)、审批决策(`stream` 模式)、事件回放这几类响应上:
+对应地,以下三个响应头**不是每种响应都会一起出现**——具体哪个端点、哪种情况带哪个,以下表为准,别假设它们总是成套出现:
 
-| 响应头 | 含义 |
-|---|---|
-| `X-Expert-Work-Run-Id` | 这次响应对应的 `run_id`。审批决策续跑后,这里给的是**新** run 的 id,不是被决策的那个 run。 |
-| `X-Expert-Work-Session-Id` | 这次响应绑定/续接到的 `session_id`。 |
-| `X-Expert-Work-Stream-Mode` | 只出现在事件回放端点(`GET .../runs/{run_id}/events`):`live`(run 还在跑,接的是实时流)或 `replay`(run 已终态,按落库帧顺序回放)。 |
+| 响应头 | 出现在哪 | 含义 |
+|---|---|---|
+| `X-Expert-Work-Run-Id` | 发起 run 的 `stream` 模式(含幂等重放)、事件回放、审批决策(`stream` / `queue` 两种响应路径都带) | 这次响应对应的 `run_id`。审批决策续跑后,这里给的是**新** run 的 id,不是被决策的那个 run。**发起 run 的 `queue` 模式响应不带这个头**——`run_id` 只在响应体的 `data.run_id` 字段里,这是和审批决策端点不一样的地方(审批决策 `queue` 模式响应头也带 `Run-Id`)。 |
+| `X-Expert-Work-Session-Id` | 发起 run(`stream` 模式,含幂等重放)、事件回放 | 这次响应绑定/续接到的 `session_id`。**审批决策(`:decide`)的两种响应路径都不带这个头**——续跑的会话就是原会话,没有变化,所以没必要重复给。 |
+| `X-Expert-Work-Stream-Mode` | 事件回放;以及发起 run 在 `stream` 模式下命中 `Idempotency-Key` 幂等重放时的响应 | `live`(run 还在跑,接的是实时流)或 `replay`(run 已终态,按落库帧顺序回放)。**首次发起(非重放)的 `stream` 响应不带这个头**(直接就是新开的实时流,没有"重放/实时"的区分);**审批决策的两种响应路径也都不带**。 |
 
 ::: warning 同一资源的两个写操作,`user_id` 位置不一致
 `PATCH /v1/agents/{agent_code}/sessions/{session_id}`(重命名会话)的 `user_id` 在**请求体**里;`DELETE /v1/agents/{agent_code}/sessions/{session_id}`(归档会话)的 `user_id` 在**查询参数**里。这不是笔误,是两个端点现有的真实形状——按 query 传 PATCH 会拿到 422。发请求前照 [调用 Agent](./run-agent) 里各自的参数表核对,不要假设两个写操作同一种传法。
@@ -55,6 +56,8 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 ```json
 { "success": true, "data": { /* 具体端点的数据 */ }, "error": null }
 ```
+
+（绝大多数成功响应都是这个形状,但不是没有例外——`error: null` 这个键不保证每个端点都给,解析时按键存在与否读,别假设它一定在。）
 
 失败:
 

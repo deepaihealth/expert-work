@@ -10,7 +10,7 @@ Authorization: Bearer <key>   # 需要 write scope
 Content-Type: application/json
 ```
 
-`stream` 与 `queue` 两种执行模式都能取消。取消是幂等的——重复取消同一个 run 不会报错,只是第二次起 `stopped` 字段变成 `false`。
+`stream` 与 `queue` 两种执行模式都能取消。取消是幂等的——重复取消同一个 run 不会报错;`stopped` 字段表示**这次调用**是否真的打断了一个当时仍在执行的 run,不是"第几次调用"的计数器。run 从"打断"落到数据库里的终态(`INTERRUPTED`)需要一点时间(worker 异步收敛),这个窗口内连续调用两次取消,第二次仍然可能读到 `stopped: true`——不要把 `stopped: false` 当成"取消已确认生效"的信号去轮询等待,真正确认 run 结束要看它的终态(比如查 SSE 流的收尾,或者会话列表的 `running` 字段)。
 
 ### 请求参数
 
@@ -42,7 +42,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 | 状态码 | `error.code` | 触发条件 |
 |---|---|---|
 | 404 | `RUN_NOT_FOUND` | `run_id` 不存在,或者存在但不属于这个 `(user_id, agent_code)` 组合——**两种情况返回同一个不透明 404,不区分**。这里的"不透明"和其它端点的存在性隐藏是同一条规则,但取消场景容易被误判:收到这个 404 **不代表"run 还没创建好、稍后重试就有"**——如果你确信 `run_id` / `user_id` / `agent_code` 三者都对,这个 404 就是"这不是你的 run",重试不会有不同结果。 |
-| 422 | `INVALID_REQUEST` | `user_id` 缺失、为空、或超过 255 字符(请求体字段校验) |
+| 422 | `INVALID_REQUEST` | `user_id` 缺失,或超过 255 字符(请求体字段校验) |
+| 422 | `INVALID_USER_ID` | `user_id` 传了但去掉首尾空白后是空字符串(比如整串都是空格)——能过字段校验(长度 ≥ 1),但过不了后面的归属解析 |
 | 403 | `FORBIDDEN`(裸 `detail` 形状,非统一信封) | key 的 scope 不足(缺 `write`) |
 
 401 相关的 key 失效情况和全站规则一致,见 [错误码与限流](./errors)。
@@ -109,7 +110,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:decide \
 | 404 | `AGENT_NOT_FOUND` | agent 的 manifest 记录本身已经不存在(比这个会话绑定的版本更底层的缺失) |
 | 410 | `AGENT_DELETED` | agent 已被(软)删除 |
 | 422 | `AGENT_BUILD_FAILED` | agent manifest 构建失败——服务端配置问题,不是你这边能解决的 |
-| 422 | `INVALID_REQUEST` | 请求体字段没通过校验,比如 `decision: "modify"` 却没传 `modified_args`,或者非 `modify` 却传了 `modified_args` |
+| 422 | `INVALID_REQUEST` | 请求体字段没通过基础校验,比如 `decision: "modify"` 却没传 `modified_args`,或者非 `modify` 却传了 `modified_args`,或者 `user_id` 缺失/超过 255 字符 |
+| 422 | `INVALID_USER_ID` | `user_id` 传了但去掉首尾空白后是空字符串——和「4.2 取消 run」同一条规则 |
 | 403 | `FORBIDDEN`(裸 `detail` 形状,非统一信封) | key 的 scope 不足(缺 `write`) |
 
 401 相关的 key 失效情况和全站规则一致,见 [错误码与限流](./errors)。
