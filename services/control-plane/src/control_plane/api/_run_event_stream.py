@@ -45,6 +45,22 @@ _RUN_STATUS_END_STATUS: dict[RunStatus, str] = {
 }
 
 
+#: live 接合跟踪「落库空洞」的容量上限。超出的部分立刻冲成 ``gap`` 帧、不再跟踪,
+#: 所以这个集合永远有界。
+_MAX_TRACKED_HOLES = 4096
+
+
+def _merge_ranges(seqs: set[int]) -> list[tuple[int, int]]:
+    """把一组 seq 合并成连续闭区间 —— 一个洞段只发一帧 ``gap``。"""
+    merged: list[tuple[int, int]] = []
+    for seq in sorted(seqs):
+        if merged and seq == merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], seq)
+        else:
+            merged.append((seq, seq))
+    return merged
+
+
 def _seq_of(entry: StreamEvent) -> int | None:
     """从帧 id 里解析落库 ``seq``;``None`` 表示这帧不参与接合。
 
@@ -163,26 +179,71 @@ async def build_event_producer(
         3. ``seq > last + 1`` 是**真缺口**,没有第二种解释 ——
            :meth:`StreamBridge.publish` 在自己的临界区里发号并入队,所以订阅者
            看到的帧顺序恒等于 seq 顺序,"先分到号的帧后进 bridge"在物理上不
-           可能发生。缺口唯一的成因是 bridge 缓冲区(256 帧,drop-oldest)在
-           "补库读完 → 挂上实时流"这个缝里滚过去了。处置:先去库里补能补的,
-           补不齐的那一段发一帧 ``gap``。
+           可能发生。处置:先去库里**翻页**补能补的,补不齐的那一段发一帧 ``gap``。
+        4. **落库的行不一定连续**(Task 3R-fix):``_flush_batch`` 在 DB 出错时按
+           H-7 立场整批吞掉(只打 warning),落库队列满时 drop-oldest,所以
+           ``run_event`` 表里真的会有内部空洞。补库遇到跳号不能让 ``last`` 无声
+           推过去 —— 那一段记进 ``holes``。
+
+        ``holes`` 的处置:看到 bridge 上出现 ``seq`` 时,所有 ``< seq`` 的洞就
+        **永远不会再来**(帧顺序恒等于 seq 顺序),合并成连续区间冲成 ``gap`` 帧;
+        而正好等于某个洞的帧说明 bridge 缓冲区里还留着它,直接补发。``end`` 之前
+        把剩下的冲干净。
 
         ``gap`` 帧(``{"from": N, "to": M}``,**无 ``id:``、不落库**)描述的是
-        **这条连接**的状况,不是 run 的事件:这段帧在这里补不到了(缓冲已滚过、
-        且尚未落盘),不代表它们不存在 —— run 结束后重新回放通常能拿到。用一帧
-        tombstone 而不是服务端记账,是因为缺口天然有界(一帧就是一帧),而且把
-        判断权交给客户端,不让服务端积累一个无上限的集合。
+        **这条连接**的状况,不是 run 的事件:这段帧在这里补不到了,不代表它们
+        不存在 —— run 结束后重新回放通常能拿到。
+
+        **``holes`` 不是被删掉的 ``missing`` 借尸还魂,别"顺手"删它。**
+        ``missing`` 治的是**乱序歧义**("跳号到底是丢了还是还在路上"),那个歧义
+        已经随发号权归 bridge **彻底消失**,重排窗口不会回来。``holes`` 治的是
+        **落库真实空洞** —— H-7 主动吞批 / 队满 drop-oldest 的设计后果,一直存在,
+        与乱序无关。而且它有界(:data:`_MAX_TRACKED_HOLES`,超出立刻冲成 ``gap``),
+        不是当年那个无上限的集合。
 
         Disconnect is handled via the iterator's GeneratorExit when
         the StreamingResponse is cancelled; the bridge subscription
         naturally tears down.
         """
         last = since_seq if since_seq is not None else -1
+        holes: set[int] = set()
 
-        # 1. 补库。
+        def _gap_frames(seqs: set[int]) -> list[bytes]:
+            frames: list[bytes] = []
+            for lo, hi in _merge_ranges(seqs):
+                logger.warning("live_stream.gap run_id=%s from=%s to=%s", run_id, lo, hi)
+                frames.append(format_sse("gap", {"from": lo, "to": hi}))
+            return frames
+
+        def _flush_holes_below(bound: int) -> list[bytes]:
+            """``< bound`` 的洞再也不会从 bridge 补上了 —— 冲成 ``gap`` 帧。"""
+            doomed = {h for h in holes if h < bound}
+            holes.difference_update(doomed)
+            return _gap_frames(doomed)
+
+        def _record_holes(lo: int, end_exclusive: int) -> list[bytes]:
+            """记下 ``[lo, end_exclusive)`` 这段落库空洞;装不下的立刻冲成 gap。"""
+            if end_exclusive <= lo:
+                return []
+            frames: list[bytes] = []
+            room = max(_MAX_TRACKED_HOLES - len(holes), 0)
+            if end_exclusive - lo > room:
+                # 老的那一段不再跟踪 —— bridge 的 256 帧缓冲里只可能还留着最新的。
+                cut = end_exclusive - room
+                logger.warning(
+                    "live_stream.holes_overflow run_id=%s from=%s to=%s", run_id, lo, cut - 1
+                )
+                frames.append(format_sse("gap", {"from": lo, "to": cut - 1}))
+                lo = cut
+            holes.update(range(lo, end_exclusive))
+            return frames
+
+        # 1. 补库 —— 跳号不能让 last 无声推过去。
         while True:
             rows = await _list_page(last)
             for row in rows:
+                for chunk in _record_holes(last + 1, row.seq):
+                    yield chunk
                 yield format_sse(
                     row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
                 )
@@ -196,6 +257,10 @@ async def build_event_producer(
                 yield b": heartbeat\n\n"
                 continue
             if is_end(entry):
+                # 还没决出结果的洞不能跟着流一起消失。
+                for chunk in _gap_frames(holes):
+                    yield chunk
+                holes.clear()
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
                 # (``publish_end(status=...)`` 存的)。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
@@ -207,17 +272,34 @@ async def build_event_producer(
                 # token 帧:一次性预览,重复或缺失都无害 —— 原样放行。
                 yield format_sse(entry.event, entry.data, event_id=None)
                 continue
+
+            # 帧顺序恒等于 seq 顺序 ⇒ 看到 seq 之后,比它小的洞判死刑。
+            for chunk in _flush_holes_below(seq):
+                yield chunk
+            if seq in holes:
+                # 落库没有它,但 bridge 缓冲区里还留着 —— 补发。
+                holes.discard(seq)
+                yield format_sse(entry.event, entry.data, event_id=entry.id)
+                continue
             if seq <= last:
                 continue  # 补库阶段已经发过
             if seq > last + 1:
-                # 3. 真缺口 —— 先尽量从库里补。
-                for row in await _list_page(last):
-                    if row.seq >= seq:
+                # 3. 真缺口 —— 先尽量从库里补,**翻页**直到够到 seq 或读完。
+                reached = False
+                while not reached:
+                    rows = await _list_page(last)
+                    for row in rows:
+                        if row.seq >= seq:
+                            reached = True
+                            break
+                        for chunk in _record_holes(last + 1, row.seq):
+                            yield chunk
+                        yield format_sse(
+                            row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
+                        )
+                        last = row.seq
+                    if len(rows) < MAX_LIST_LIMIT:
                         break
-                    yield format_sse(
-                        row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
-                    )
-                    last = row.seq
                 if last + 1 < seq:
                     logger.warning(
                         "live_stream.gap run_id=%s from=%s to=%s", run_id, last + 1, seq - 1

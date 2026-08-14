@@ -676,3 +676,108 @@ async def test_both_sse_paths_emit_the_same_end_shape() -> None:
             "run_id": str(record.run_id),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# P3 PR-1 / Task 3R-fix —— 落库真的会有洞(复审实测复现)
+#
+# `_flush_batch` 在 DB 出错时按 H-7 立场**整批吞掉**(只打 warning),落库队列满
+# 时 drop-oldest —— 所以 `run_event` 表里真的会出现内部空洞。Task 3R 的接合算法
+# 建立在「落库行连续」这个不成立的隐含假设上。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_live_interior_hole_is_filled_from_bridge() -> None:
+    """落库中间缺了 3、4,而 bridge 缓冲区里还留着 —— 必须交付,不能静默跳过。
+
+    今天的行为:补库时 ``last`` 一路推到 6,3/4 从没被注意到;随后 bridge 推来的
+    3、4 因为 ``<= last`` 被当成"已经发过"丢掉。客户端收到 ``0,1,2,5,6,7``,
+    **没有任何缺口信号** —— 正是本 PR 要消灭的那类静默丢数据。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 1, 2, 5, 6])  # 3、4 是落库空洞
+    bridge = _ScriptedBridge([_live_frame(s) for s in (3, 4, 5, 6, 7)])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=None)
+
+    delivered = _seqs(frames)
+    assert 3 in delivered and 4 in delivered, f"落库空洞 3/4 在 bridge 里还留着却没交付:{delivered}"
+    assert sorted(delivered) == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert [name for _fid, name, _d in frames].count("gap") == 0  # 补上了就不该报缺口
+
+
+@pytest.mark.asyncio
+async def test_live_hole_discovered_in_gap_branch_emits_gap() -> None:
+    """缺口分支补库时发现的空洞也要变成 ``gap`` 帧,不能无声跳过。
+
+    形态:补库时库里只有 0..2;随后后台 writer 落下 6、7(**3~5 永远不会有**,
+    那一批被 H-7 吞了);bridge 推 8。今天:客户端收到 6,7,8,end —— 少了 3 帧
+    却看起来完整。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 1, 2])
+
+    async def _late_persist() -> None:
+        await _seed_rows(store, run_id, [6, 7])  # 3、4、5 那一批被吞了
+
+    bridge = _ScriptedBridge([_late_persist, _live_frame(8)])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=2)
+
+    gaps = [d for _fid, name, d in frames if name == "gap"]
+    assert gaps == [{"from": 3, "to": 5}], f"缺口分支里发现的空洞没报出来:{frames}"
+    assert _seqs(frames) == [6, 7, 8]
+
+
+@pytest.mark.asyncio
+async def test_gap_branch_backfill_pages_beyond_one_page() -> None:
+    """缺口分支的补库也要**循环翻页** —— 只读一页会造出假 gap。
+
+    形态:补库时库里空;随后后台 writer 一次性落下 1..699;bridge 推 700。
+    今天:缺口分支只读一页,客户端收到 1..500 + ``gap{501,699}`` + 700 ——
+    501~699 就躺在库里,却告诉客户端拿不到。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    total = MAX_LIST_LIMIT + 199  # 699:超过一页
+
+    async def _late_persist() -> None:
+        await _seed_rows(store, run_id, range(1, total + 1))
+
+    bridge = _ScriptedBridge([_late_persist, _live_frame(total + 1)])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=0)
+
+    assert [name for _fid, name, _d in frames].count("gap") == 0, (
+        f"库里明明有的帧被报成了缺口:{[(n, d) for _f, n, d in frames if n == 'gap']}"
+    )
+    assert _seqs(frames) == list(range(1, total + 2))
+
+
+@pytest.mark.asyncio
+async def test_pending_holes_are_flushed_before_end() -> None:
+    """run 结束时仍有未决的洞 —— ``end`` 之前必须冲成 ``gap``,不能吞掉。
+
+    形态:库里 ``{0,1,2,5}``(3、4 那一批被 H-7 吞了),bridge 上再没有新帧就
+    结束了。3、4 到最后也没能补上,客户端必须被告知。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 1, 2, 5])
+    bridge = _ScriptedBridge([])
+
+    frames = await _collect_live(run_id=run_id, event_store=store, bridge=bridge, since_seq=None)
+
+    assert [name for _fid, name, _d in frames] == [
+        "updates",
+        "updates",
+        "updates",
+        "updates",
+        "gap",
+        "end",
+    ]
+    assert frames[-2][2] == {"from": 3, "to": 4}
+    assert _seqs(frames) == [0, 1, 2, 5]
