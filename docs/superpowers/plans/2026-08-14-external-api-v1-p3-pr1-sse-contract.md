@@ -197,6 +197,43 @@ git add -A && git commit -m "test(sse): 端到端钉住 live 帧 id 与落库 se
 
 ---
 
+### Task 2.5:加固 Task 1 的不变式钉子(实施反馈补入)
+
+**Files:**
+- Modify: Task 1 Step 7 那条并发不撞号的测试(位置见 `.superpowers/sdd/2026-08-14-p3-pr1/task-1-report.md`)
+
+**为什么补这个 Task**:Task 1 的实施者自报了一条软肋 —— 那条测试红在"落库行数不连续",真正的归因(`duplicate seq=1`)只出现在**日志**里,不在断言里;而且它依赖一个强制交错的 `_YieldingBridge` 桩,**换成裸 bridge 会退化成恒绿**。这正是本仓库记录过的失败形态:测试在"不可能失败的条件下"跑绿,看起来跟真的钉住了一模一样。
+
+- [ ] **Step 1:把归因搬进断言**
+
+不要断言"行数连续"这种间接量。直接收集全部分配到的 seq,断言:
+
+```python
+seqs = [r.seq for r in persisted_rows]
+assert len(seqs) == len(set(seqs)), f"seq 撞号: {sorted(s for s in seqs if seqs.count(s) > 1)}"
+assert sorted(seqs) == list(range(2 * N))
+```
+
+第一条断言的失败信息必须**直接指出撞的是哪个号**,不依赖读日志。
+
+- [ ] **Step 2:让桩的必要性变成显式的**
+
+`_YieldingBridge` 是这条测试成立的前提(裸 bridge 不强制交错 → 测试恒绿 → 假验证)。两件事:
+1. 在测试的 docstring 里写明这一点 —— "本测试**必须**用强制交错的桩,换成裸 bridge 会退化成恒绿"。
+2. 加一条**元断言**钉住这个前提:在测试里断言所用 bridge 确实是那个桩(`assert isinstance(bridge, _YieldingBridge)`),这样后人把它换成裸 bridge 时测试会立刻红,而不是静静地变成空转。
+
+- [ ] **Step 3:变异复验**
+
+把 `_alloc_seq` 的自增挪到 `await` 之后,断言必须红,**且失败信息里直接出现撞掉的那个 seq**(不用去翻日志)。`git diff` 先确认变异落地。恢复。
+
+- [ ] **Step 4:提交**
+
+```bash
+git add -A && git commit -m "test(sse): 并发不撞号的断言直接归因,并钉住交错桩这个前提"
+```
+
+---
+
 ### Task 3:live 分支认 `since_seq` —— 补库 + 接合 + 缺口回填
 
 **Files:**
@@ -219,14 +256,20 @@ last = since_seq if since_seq is not None else -1
 2. 挂实时流:async for entry in bridge.subscribe(run_id, ...)
    - entry 无 seq(token 帧) → 直接 yield(它本就是一次性预览,重复或缺失都无害)
    - entry.seq <= last        → 丢弃(补库阶段已经发过)
-   - entry.seq == last + 1    → yield,last += 1
-   - entry.seq >  last + 1    → 缺口。先 event_store.list(since_seq=last, limit=…)
-     把 last+1 .. entry.seq-1 补齐并 yield(补到多少算多少),再 yield entry,
-     last = entry.seq。补不齐时打 warning 日志,不抛异常
-     —— 这一段帧在 run 结束后仍可由客户端重新回放拿到。
+   - entry.seq == last + 1    → yield,last += 1;然后把 pending 里
+                                 last+1、last+2 … 连续的部分一并 yield 掉
+   - entry.seq >  last + 1    → 暂存进 pending(见下),**不要立刻当缺口处理**
+3. pending 泄压:当 len(pending) > _REORDER_WINDOW(=32)时,才认定
+   last+1 真的丢了 —— 去 event_store.list(since_seq=last, limit=…) 把
+   last+1 .. min(pending) - 1 补齐并 yield(补到多少算多少),再排空 pending 里
+   连续的部分。补不齐时打 warning 日志,不抛异常 —— 这一段帧在 run 结束后
+   仍可由客户端重新回放拿到。
+4. 流结束(end 帧)前:把 pending 里剩下的按 seq 升序全部 yield 掉,别吞。
 ```
 
-**为什么要缺口回填**:bridge 缓冲区只有 256 帧、drop-oldest,而落库走的是攒批后台 writer。补库读完到挂上实时流之间,如果有超过 256 帧飞过,中间那段既不在缓冲区里也可能还没落库。上面第 4 分支是唯一能把这种情况变成"可观测的 warning"而不是"静默丢帧"的写法。
+**为什么要 pending 重排窗口,而不是见缺口就查库**(Task 1 实施反馈补入):`_publish_frame` 是"同步分号 → await publish",并发 worker 下**先分到号的帧可能后进 bridge**。所以 seq 跳号的第一解释是"乱序到达",不是"丢了"。见缺口就查库会有两个后果:一是把还在路上的帧当丢帧去查一次库(此时后台攒批 writer 多半还没落盘,查了也拿不到),二是等真帧从 bridge 到达时它已经 `<= last` 被丢弃 —— **本来没丢的帧被这个逻辑弄丢了**。重排窗口先给乱序一个收敛机会,窗口撑爆了才认定是真缺口。
+
+**为什么仍然需要缺口回填(第 3 步)**:bridge 缓冲区只有 256 帧、drop-oldest,而落库走的是攒批后台 writer。补库读完到挂上实时流之间,如果有超过 256 帧飞过,中间那段既不在缓冲区里也可能还没落库。第 3 步是唯一能把这种情况变成"可观测的 warning"而不是"静默丢帧"的写法。
 
 `entry.seq` 不在 `StreamEvent` 上 —— 从 `entry.id` 解析(`int(entry.id.rsplit("-", 1)[1])`),`id is None` 即 token 帧。在 `_run_event_stream.py` 里写一个模块级 `def _seq_of(entry) -> int | None` 承担这件事,别在循环里内联。
 
@@ -234,9 +277,11 @@ last = since_seq if since_seq is not None else -1
 
 1. `test_live_reconnect_backfills_from_store`:run 处于 RUNNING;库里已有 seq 0..4;带 `since_seq=1` 重连 → 必须先收到 seq 2,3,4。
 2. `test_live_reconnect_dedupes_overlap`:补库给到 seq 4,随后 bridge 推 seq 3,4,5 → 客户端只收到 5,且 3/4 不重复。
-3. `test_live_reconnect_fills_gap`:补库给到 seq 2,bridge 直接推 seq 5,而库里此时有 3,4 → 客户端按序收到 3,4,5。
+3. `test_live_reconnect_fills_gap`:补库给到 seq 2,bridge **只**推 seq 35(跳过 3..34,超过重排窗口),而库里此时有 3,4 → 客户端按序收到 3,4,然后 35,并且日志里有一条 warning 说明 5..34 补不齐。
+4. `test_live_out_of_order_frames_are_reordered_not_dropped`:bridge 按 `5,3,4,6` 的顺序推(模拟并发 worker 下先分号后进 bridge),客户端收到的必须是 `3,4,5,6` —— **一帧不丢**。这条钉住重排窗口:见缺口就查库的写法会让 3、4 到达时已经 `<= last` 而被丢弃,这条测试会红。
+5. `test_pending_frames_are_flushed_before_end`:bridge 推 `3,5` 然后 end,窗口没撑爆 → 5 必须在 end 之前被 yield 掉,不能被吞。
 
-三条都必须在 **RUNNING** 状态的 run 上跑(`is_terminal=False`),否则走的是 replay 分支,测了等于没测。
+五条都必须在 **RUNNING** 状态的 run 上跑(`is_terminal=False`),否则走的是 replay 分支,测了等于没测。
 
 - [ ] **Step 2:跑测试确认失败**
 
@@ -252,7 +297,9 @@ Run: `cd services/control-plane && DOCKER_HOST= uv run pytest tests/test_run_eve
 
 - 把去重条件从 `<= last` 改成 `< last` → 测试 2 必须红。
 - 删掉缺口回填分支 → 测试 3 必须红。
-- 把补库循环改成只读一页 → 造一个 >`MAX_LIST_LIMIT` 帧的 RUNNING run 的测试必须红(如果现有三条测试都不咬这个变异,就补第四条)。
+- 把重排窗口去掉、改成见缺口立刻查库 → 测试 4 必须红。
+- 把 end 前排空 pending 那步删掉 → 测试 5 必须红。
+- 把补库循环改成只读一页 → 造一个 >`MAX_LIST_LIMIT` 帧的 RUNNING run 的测试必须红(如果现有测试都不咬这个变异,就补一条)。
 
 每次变异前 `git diff` 确认真的改到了文件。
 
@@ -315,7 +362,9 @@ git add -A && git commit -m "fix(sse): 回放分页——截断发 truncated 帧
 
 **Files:**
 - Modify: `services/control-plane/src/control_plane/api/_run_event_stream.py`
+- Modify: `services/orchestrator/src/orchestrator/sse.py`(`sse_consumer`,约 `:1449`)
 - Test: `services/control-plane/tests/test_run_event_stream.py`
+- Test: `services/orchestrator/tests/`(`sse_consumer` 的 end 帧)
 
 **Interfaces:**
 - Consumes:Task 1 的 `publish_end(status=...)`;Task 4 的 `EventStreamPlan`
@@ -323,15 +372,21 @@ git add -A && git commit -m "fix(sse): 回放分页——截断发 truncated 帧
 
 **背景**:现在 run 被取消只发 `end` + `data: null`,第三方分不清"正常答完"和"被取消",得再查一次 REST。
 
-两条路径的 status 来源不同,**都要接**:
+**⚠️ 本 Task 有第三条路径,是 Task 1 实施反馈补入的 —— 而且它是第三方的主路径。**
+`sse_consumer`(`sse.py:1449`)在 `is_end(entry)` 时写死 `yield format_sse("end", None)`,**把 Task 1 刚放进 bridge end 帧里的 status 又丢掉了**。它服务于 `runs.py:1091`、`runs.py:1797`、`external_approvals.py:311` —— 也就是 **`POST /v1/agents/{code}/runs` 且 `mode: "stream"`** 那条流(第三方最常用的路径,经 `spawn_run` 走到这里)以及审批决策的续跑流。只改 `_run_event_stream.py` 的话,F 只在"断线重连"这条次要路径上生效,主路径依然发 `data: null`,而且两条流的 `end` 帧字段集合会分叉 —— 这个仓库刚在 P2-a 修过一次同类的"重放响应头是首次响应的真子集"问题。
+
+三条路径的 status 来源不同,**都要接**:
 - replay 分支:`run.status` 映射(`SUCCESS→success` / `PAUSED→paused` / `INTERRUPTED→interrupted` / `ERROR`、`TIMEOUT→error`)。`build_event_producer` 现在只收 `is_terminal: bool`,要改成同时收终局状态 —— 让调用方传 `run.status`,`is_terminal` 在函数内部推导(现有 docstring 已经写明"`is_terminal` 在函数内部推导,所以只有一处可能弄错",保持这个立场)。
 - live 分支:从 bridge 的 end 帧 data 里取(Task 1 Step 4 已存 `end_status`)。
+- `sse_consumer`:同样从 bridge 的 end 帧 data 里取 —— `is_end(entry)` 那一支现在手上就有 `entry.data`,把它透传即可,别再合成一个 `None`。`run_id` 从 `record.run_id` 取。
 
 - [ ] **Step 1:写失败测试**
 
 1. `test_end_frame_carries_status_on_cancelled_run`:终态为 `INTERRUPTED` 的 run 回放 → `end` 帧 data 是 `{"status": "interrupted", "run_id": ...}`。
 2. `test_end_frame_status_on_paused_run`:`PAUSED` → `"paused"`(**不是** `error` —— 等审批不是失败)。
 3. `test_live_end_frame_carries_status`:live 分支收到的 `end` 帧同样带 status。
+4. `test_sse_consumer_end_frame_carries_status`:走 `sse_consumer` 的那条流(POST 建 run 的 stream 模式),被取消的 run 的 `end` 帧同样带 `{"status": "interrupted", "run_id": ...}`。
+5. `test_both_sse_paths_emit_the_same_end_shape`:同一个 run,`sse_consumer` 那条流和 `GET .../events` 那条流的 `end` 帧 **data 字段集合必须相同**。这条是防分叉的哨兵 —— 只改一条路径时它必须红。
 
 **必须用被取消 / PAUSED 的 run** —— 正常跑完的 run 上 status 恒 `success`,任何写错的映射表都能跑绿。
 
