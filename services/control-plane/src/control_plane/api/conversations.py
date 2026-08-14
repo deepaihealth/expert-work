@@ -30,7 +30,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -147,7 +147,19 @@ def build_conversations_router() -> APIRouter:
     """Mount ``GET /v1/conversations`` (list) + ``/{thread_id}`` (detail)."""
     router = APIRouter(prefix="/v1/conversations", tags=["conversations"])
 
-    @router.get("", response_model=None, dependencies=[Depends(console_only())])
+    # ``console_only`` blocks a third-party API key (plane isolation); it says
+    # nothing about which employee may read. ``user_id`` is a query parameter
+    # and ``q`` is full-text over transcript content, so without a role gate any
+    # authenticated employee could search any end user's conversation text.
+    # Ruling (2026-08-14): a conversation is an operations object (QA review,
+    # eval curation), so reads stay open to every employee — viewer / operator /
+    # admin all hold ``session:read``. The gate's real job is to deny a
+    # principal carrying no role at all.
+    @router.get(
+        "",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(require("session", "read"))],
+    )
     async def list_conversations(
         request: Request,
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
@@ -327,7 +339,11 @@ def build_conversations_router() -> APIRouter:
             headers=headers,
         )
 
-    @router.get("/{thread_id}", response_model=None, dependencies=[Depends(console_only())])
+    @router.get(
+        "/{thread_id}",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(require("session", "read"))],
+    )
     async def get_conversation(
         thread_id: UUID,
         request: Request,

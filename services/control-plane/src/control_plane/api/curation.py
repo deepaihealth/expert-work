@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane._tenant_resource_lock import tenant_resource_lock
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
@@ -47,6 +47,7 @@ from expert_work.persistence.curation import (
 )
 from expert_work.protocol import (
     AuditAction,
+    AuditResult,
     CandidateStatus,
     CurationCandidateRecord,
     CurationSignal,
@@ -188,7 +189,17 @@ def build_curation_router() -> APIRouter:
         prefix="/v1/curation", tags=["curation"], dependencies=[Depends(console_only())]
     )
 
-    @router.get("/candidates", response_model=None)
+    # Employee RBAC (2026-08-14). The router-level ``console_only`` blocks a
+    # third-party API key; it says nothing about which employee may do what, and
+    # ``GET /candidates/{id}`` returns the end user's full conversation
+    # transcript. Ruling: curation is an operations workflow, so every employee
+    # may read (viewer / operator / admin all hold ``session:read``); deciding a
+    # candidate's fate is a write and needs operator+.
+    @router.get(
+        "/candidates",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
     async def list_candidates(
         request: Request,
         candidates: Annotated[CurationCandidateStore, Depends(_get_curation_store)],
@@ -226,7 +237,11 @@ def build_curation_router() -> APIRouter:
             }
         )
 
-    @router.get("/candidates/{candidate_id}", response_model=None)
+    @router.get(
+        "/candidates/{candidate_id}",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
     async def get_candidate(
         candidate_id: UUID,
         request: Request,
@@ -258,9 +273,32 @@ def build_curation_router() -> APIRouter:
             if stored is not None:
                 trajectory = {"messages": stored.messages, "step_count": stored.step_count}
         body["trajectory"] = trajectory
+        # A full end-user transcript leaving the platform must leave a trace.
+        # ``ensure_single_tenant_scope`` above takes the audit logger but only
+        # writes on a cross-tenant decision, so a same-tenant read — the common
+        # case — was invisible until now.
+        await emit(
+            audit,
+            tenant_id=request.state.tenant_id,
+            actor_id=request.state.actor_id,
+            action=AuditAction.SESSION_READ,
+            resource_type="session",
+            resource_id=str(record.thread_id),
+            result=AuditResult.SUCCESS,
+            trace_id=current_trace_id_hex(),
+            details={
+                "view": "curation_candidate_trajectory",
+                "candidate_id": str(candidate_id),
+                "trajectory_present": trajectory is not None,
+            },
+        )
         return JSONResponse(content=body)
 
-    @router.post("/candidates/{candidate_id}/promote", response_model=None)
+    @router.post(
+        "/candidates/{candidate_id}/promote",
+        response_model=None,
+        dependencies=[Depends(require("session", "write"))],
+    )
     async def promote_candidate(
         candidate_id: UUID,
         body: _PromoteBody,
@@ -321,7 +359,11 @@ def build_curation_router() -> APIRouter:
         )
         return JSONResponse(status_code=201, content=_eval_dataset_dict(dataset))
 
-    @router.post("/candidates/{candidate_id}/dismiss", response_model=None)
+    @router.post(
+        "/candidates/{candidate_id}/dismiss",
+        response_model=None,
+        dependencies=[Depends(require("session", "write"))],
+    )
     async def dismiss_candidate(
         candidate_id: UUID,
         request: Request,

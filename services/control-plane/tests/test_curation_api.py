@@ -566,3 +566,111 @@ async def test_curation_detail_tenant_id_star_400(ctx: _Ctx) -> None:
         resp = await ctx.client.get(path, params={"tenant_id": "*"})
         assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
         assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+# --- 阶段 1.1 员工 RBAC ------------------------------------------------------
+#
+# The plane gate (``console_only``) that P2 put on this router blocks a
+# third-party API key; it says nothing about which *employee* may do what.
+# Before this, a ``viewer`` could read any end user's full conversation
+# transcript AND promote/dismiss candidates. Ruling (2026-08-14): reads stay
+# open to every employee (a conversation is an operations object — QA review,
+# eval curation), writes need operator+.
+
+
+def _employee(*roles: str) -> dict[str, str]:
+    """Authorization header for an employee JWT carrying exactly ``roles``."""
+    return {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT, roles=roles)}"}
+
+
+@pytest.mark.asyncio
+async def test_viewer_reads_candidates(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    listed = await ctx.client.get("/v1/curation/candidates", headers=_employee("viewer"))
+    assert listed.status_code == 200, listed.text
+    detail = await ctx.client.get(
+        f"/v1/curation/candidates/{candidate.id}", headers=_employee("viewer")
+    )
+    assert detail.status_code == 200, detail.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_promote_or_dismiss(ctx: _Ctx) -> None:
+    candidate = await ctx.seed_candidate()
+    promote = await ctx.client.post(
+        f"/v1/curation/candidates/{candidate.id}/promote",
+        json={"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"},
+        headers=_employee("viewer"),
+    )
+    assert promote.status_code == 403, promote.text
+    assert promote.json()["detail"]["code"] == "FORBIDDEN"
+
+    dismiss = await ctx.client.post(
+        f"/v1/curation/candidates/{candidate.id}/dismiss", headers=_employee("viewer")
+    )
+    assert dismiss.status_code == 403, dismiss.text
+
+    # The 403 is the gate, not a cosmetic status code — neither write landed.
+    stored = await ctx.candidates.get(candidate_id=candidate.id, tenant_id=_TENANT)
+    assert stored is not None
+    assert stored.status.value == "pending"
+
+
+@pytest.mark.asyncio
+async def test_operator_can_promote_and_dismiss(ctx: _Ctx) -> None:
+    promoted = await ctx.seed_candidate()
+    resp = await ctx.client.post(
+        f"/v1/curation/candidates/{promoted.id}/promote",
+        json={"name": "s", "input": {}, "expected": {"a": 1}, "source": "regression"},
+        headers=_employee("operator"),
+    )
+    assert resp.status_code == 201, resp.text
+
+    dismissed = await ctx.seed_candidate()
+    resp = await ctx.client.post(
+        f"/v1/curation/candidates/{dismissed.id}/dismiss", headers=_employee("operator")
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_roleless_employee_cannot_read_candidates(ctx: _Ctx) -> None:
+    """A JWT that carries no role at all grants nothing — this is the assertion
+    that would still fail if the gate were removed (viewer/operator/admin all
+    hold ``session:read``, so none of them can prove the gate exists)."""
+    candidate = await ctx.seed_candidate()
+    for path in ("/v1/curation/candidates", f"/v1/curation/candidates/{candidate.id}"):
+        resp = await ctx.client.get(path, headers=_employee())
+        assert resp.status_code == 403, f"{path}: {resp.status_code} {resp.text}"
+        assert resp.json()["detail"]["code"] == "FORBIDDEN", path
+
+
+@pytest.mark.asyncio
+async def test_candidate_trajectory_read_is_audited(ctx: _Ctx) -> None:
+    """A full end-user transcript leaving the platform must leave a trace.
+
+    ``ensure_single_tenant_scope`` takes the audit logger but only writes on a
+    cross-tenant decision, so a same-tenant read used to be invisible.
+    """
+    thread_id = uuid4()
+    recorder = TrajectoryRecorder(object_store=ctx.object_store)
+    record = TrajectoryRecord(
+        thread_id=thread_id,
+        tenant_id=_TENANT,
+        outcome="failed",
+        messages=[HumanMessage(content="hi"), AIMessage(content="bye")],
+        finished_at=_BASE,
+    )
+    key = recorder.key_for(record)
+    await recorder.record(record)
+    candidate = await ctx.seed_candidate(trajectory_key=key)
+
+    resp = await ctx.client.get(f"/v1/curation/candidates/{candidate.id}")
+    assert resp.status_code == 200
+    assert resp.json()["trajectory"] is not None
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=_TENANT))
+    rows = [e for e in page.entries if e.action.value == "session:read"]
+    assert len(rows) == 1, [e.action.value for e in page.entries]
+    assert rows[0].resource_id == str(candidate.thread_id)
+    assert rows[0].details["view"] == "curation_candidate_trajectory"
