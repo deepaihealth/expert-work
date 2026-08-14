@@ -705,7 +705,8 @@ async def test_stream_replay_without_event_store_still_streams(
     assert second.headers["X-Expert-Work-Run-Id"] == first.headers["X-Expert-Work-Run-Id"]
 
 
-def test_build_events_response_is_terminal_reflects_run_status() -> None:
+@pytest.mark.asyncio
+async def test_build_events_response_is_terminal_reflects_run_status() -> None:
     """裁定 5 自证(自证要求变异 3)——``build_events_response`` 里的
     ``is_terminal`` 必须从传入 ``run.status`` 派生,不能写死成常量:写死为
     ``True`` 会让非终态 run 也走 replay 分支(截断一条本该继续的直播流);
@@ -728,7 +729,7 @@ def test_build_events_response_is_terminal_reflects_run_status() -> None:
         updated_at=now,
         finished_at=None,
     )
-    live_resp = build_events_response(
+    live_resp = await build_events_response(
         run=running_run,
         event_store=InMemoryRunEventStore(),
         stream_bridge=InMemoryStreamBridge(),
@@ -737,7 +738,7 @@ def test_build_events_response_is_terminal_reflects_run_status() -> None:
     assert live_resp.headers["X-Expert-Work-Run-Id"] == str(running_run.run_id)
 
     terminal_run = replace(running_run, status=RunStatus.SUCCESS)
-    replay_resp = build_events_response(
+    replay_resp = await build_events_response(
         run=terminal_run,
         event_store=InMemoryRunEventStore(),
         stream_bridge=InMemoryStreamBridge(),

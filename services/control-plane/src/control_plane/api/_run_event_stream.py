@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from uuid import UUID
 
 from expert_work.runtime.runs import RunEventRecord, RunEventStore
@@ -54,7 +55,26 @@ def _seq_of(entry: StreamEvent) -> int | None:
         return None
 
 
-def build_event_producer(
+@dataclass(frozen=True)
+class EventStreamPlan:
+    """一次 SSE 响应的构造结果 —— 字节生成器 + 回放游标。
+
+    ``next_seq`` **只在回放被截断时**非 ``None``。它是客户端下一次请求应当原样
+    传回来的 ``since_seq`` 值(也就是本页最后一帧的 seq),调用方据此加一个
+    ``X-Expert-Work-Next-Seq`` 响应头。
+
+    为什么要有这个 dataclass:HTTP 响应头在流开始之前就发完了,而"这一页是不
+    是被截断了"只有读完一页才知道 —— **在生成器体内没有任何办法再改响应头**。
+    所以第一页在返回迭代器**之前**就读掉,``next_seq`` 因此在构造
+    ``StreamingResponse`` 时已知。附带好处:数据库出错变成正常的 500 JSON,
+    而不是一个已经开始流式输出、半截截断的 body。
+    """
+
+    producer: AsyncIterator[bytes]
+    next_seq: int | None
+
+
+async def build_event_producer(
     *,
     run_id: UUID,
     is_terminal: bool,
@@ -62,19 +82,22 @@ def build_event_producer(
     stream_bridge: StreamBridge,
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
-) -> AsyncIterator[bytes]:
-    """Return the SSE byte producer for one run.
+) -> EventStreamPlan:
+    """Return the SSE byte producer for one run, plus the replay cursor.
 
-    * Terminal run → :meth:`RunEventStore.list`, one shot, ordered by seq.
+    * Terminal run → :meth:`RunEventStore.list`,**一页**(``MAX_LIST_LIMIT``),
+      按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
+      流并没有结束,客户端得带 ``next_seq`` 再来一次。
     * Active run → 先把 ``since_seq`` 之后的落库帧补齐,再挂
       :meth:`StreamBridge.subscribe` 的实时流,按 seq 去重 / 重排 / 回填缺口
-      (见 ``_stream_live`` 的 docstring)。
+      (见 ``_stream_live`` 的 docstring)。live 分支**不截断**。
 
     ``scope`` is a *factory* for a tenant-scope context manager, not an
     already-constructed one — ``applied_scope(...)`` returns a
     single-use ``_AsyncGeneratorContextManager`` (``__aenter__`` a second
-    time raises ``RuntimeError: generator didn't yield``), and P3's
-    paginated replay will need to enter scope once per page. The console
+    time raises ``RuntimeError: generator didn't yield``), and both branches
+    read the store more than once (replay: 一页 + 一次"还有没有"的探测;
+    live: 补库分页 + 缺口回填). The console
     caller passes ``lambda: applied_scope(scope)`` (its DB read must stay
     bound to the resolved target tenant, not the request middleware's
     home-tenant GUC); the external caller has no cross-tenant concept and
@@ -82,8 +105,10 @@ def build_event_producer(
     silently forget this and fall back to an unscoped read.
     """
 
-    async def _list_page(after: int) -> Sequence[RunEventRecord]:
-        """读一页落库帧(``seq > after``,最多 ``MAX_LIST_LIMIT`` 条)。
+    async def _list_page(
+        after: int | None, *, limit: int = MAX_LIST_LIMIT
+    ) -> Sequence[RunEventRecord]:
+        """读一页落库帧(``seq > after``,最多 ``limit`` 条)。
 
         ``scope`` 工厂**每次读都要重新调**:它返回的 CM 是单次可用的,复用会
         炸 ``generator didn't yield``。
@@ -92,33 +117,26 @@ def build_event_producer(
             return []
         if scope is not None:
             async with scope():
-                return await event_store.list(run_id=run_id, since_seq=after, limit=MAX_LIST_LIMIT)
-        return await event_store.list(run_id=run_id, since_seq=after, limit=MAX_LIST_LIMIT)
+                return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
+        return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
 
-    async def _stream_replay() -> AsyncIterator[bytes]:
-        """Pull from RunEventStore (one shot, ordered by seq)."""
-        if event_store is None:
-            # No store wired — yield an end frame so the client closes
-            # cleanly instead of waiting forever.
-            yield format_sse("end", None)
-            return
-        # The generator body runs after the handler returned — re-apply
-        # the resolved scope (when given) so this DB read stays bound to
-        # the target tenant. Call the factory fresh each time — the CM it
-        # returns is single-use.
-        if scope is not None:
-            async with scope():
-                rows = await event_store.list(
-                    run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT
-                )
-        else:
-            rows = await event_store.list(run_id=run_id, since_seq=since_seq, limit=MAX_LIST_LIMIT)
+    async def _stream_replay(
+        rows: Sequence[RunEventRecord], next_seq: int | None
+    ) -> AsyncIterator[bytes]:
+        """把已经读好的一页帧吐出去;截断时以 ``truncated`` 收尾。"""
         for row in rows:
             yield format_sse(
                 row.event_name,
                 row.data,
                 event_id=f"{row.created_at_ms}-{row.seq}",
             )
+        if next_seq is not None:
+            # 截断 —— **不发 end**。以前这里补一个 end,客户端会以为流正常结束,
+            # 把后面的帧静默丢掉。``truncated`` 帧与 ``X-Expert-Work-Next-Seq``
+            # 头同时给:浏览器 ``EventSource`` 读不到响应头,只给 header 的信号
+            # 对一整类客户端不可用。
+            yield format_sse("truncated", {"next_seq": next_seq})
+            return
         yield format_sse("end", None)
 
     async def _stream_live() -> AsyncIterator[bytes]:
@@ -243,4 +261,16 @@ def build_event_producer(
             async for chunk in _drain_pending():
                 yield chunk
 
-    return _stream_replay() if is_terminal else _stream_live()
+    if not is_terminal:
+        return EventStreamPlan(producer=_stream_live(), next_seq=None)
+
+    # 回放:第一页在**返回迭代器之前**读掉,好让 next_seq 在构造
+    # StreamingResponse 时就已知(响应头没法在流开始后再改)。
+    rows = await _list_page(since_seq)
+    next_seq: int | None = None
+    if len(rows) == MAX_LIST_LIMIT:
+        # **不能**用「行数 == 页大小」单独判定 —— 总帧数恰好整除页大小时会误报
+        # 截断,客户端白拉一页空的。真去看后面还有没有东西。
+        if await _list_page(rows[-1].seq, limit=1):
+            next_seq = rows[-1].seq
+    return EventStreamPlan(producer=_stream_replay(rows, next_seq), next_seq=next_seq)

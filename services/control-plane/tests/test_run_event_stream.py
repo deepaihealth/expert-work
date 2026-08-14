@@ -30,6 +30,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -38,7 +39,13 @@ from httpx import AsyncClient
 
 import control_plane.api.runs as runs_module
 from control_plane.api._run_event_stream import _REORDER_WINDOW, build_event_producer
-from expert_work.runtime.runs import InMemoryRunEventStore, make_event_record
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    InMemoryRunEventStore,
+    RunInfo,
+    RunStatus,
+    make_event_record,
+)
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     END_SENTINEL,
@@ -67,7 +74,7 @@ async def test_replay_enters_the_given_scope_factory_exactly_once() -> None:
         entered += 1
         yield
 
-    producer = build_event_producer(
+    plan = await build_event_producer(
         run_id=run_id,
         is_terminal=True,
         event_store=event_store,
@@ -75,7 +82,7 @@ async def test_replay_enters_the_given_scope_factory_exactly_once() -> None:
         since_seq=None,
         scope=_spy_scope,
     )
-    frames = [chunk async for chunk in producer]
+    frames = [chunk async for chunk in plan.producer]
     assert frames  # sanity: the replay actually produced real frames
     assert entered == 1
 
@@ -228,7 +235,7 @@ async def _collect_live(
     since_seq: int | None,
     scope: Callable[[], Any] | None = None,
 ) -> list[tuple[str | None, str, Any]]:
-    producer = build_event_producer(
+    plan = await build_event_producer(
         run_id=run_id,
         is_terminal=False,  # RUNNING —— 不这样就走 replay 分支,测了等于没测
         event_store=event_store,
@@ -236,7 +243,8 @@ async def _collect_live(
         since_seq=since_seq,
         scope=scope,
     )
-    return _parse_sse([chunk async for chunk in producer])
+    assert plan.next_seq is None  # live 分支不截断
+    return _parse_sse([chunk async for chunk in plan.producer])
 
 
 @pytest.mark.asyncio
@@ -458,3 +466,152 @@ async def test_late_frame_written_off_is_still_delivered(
 
     # 5 迟到但仍然送达(乱序是可接受的代价 —— 客户端本来就按 seq 排)。
     assert _seqs(frames) == [3, 4, jump, 5]
+
+
+# ---------------------------------------------------------------------------
+# P3 PR-1 / Task 4 —— 回放分页:截断不再假装流结束
+#
+# 「验证条件矩阵」E 那一行:**帧数 > 页大小**才走得到截断分支;短 run 上
+# 怎么写都绿。
+# ---------------------------------------------------------------------------
+
+
+async def _collect_replay(
+    *,
+    run_id: UUID,
+    store: InMemoryRunEventStore,
+    since_seq: int | None = None,
+) -> tuple[list[tuple[str | None, str, Any]], int | None]:
+    plan = await build_event_producer(
+        run_id=run_id,
+        is_terminal=True,
+        event_store=store,
+        stream_bridge=InMemoryStreamBridge(),
+        since_seq=since_seq,
+        scope=None,
+    )
+    return _parse_sse([chunk async for chunk in plan.producer]), plan.next_seq
+
+
+@pytest.mark.asyncio
+async def test_replay_truncates_without_end_frame() -> None:
+    """帧数超过一页 → 收尾是 ``truncated``,**不是** ``end``。
+
+    以前这里无条件补一个 ``end``,客户端会以为流正常结束,把 500 帧之后的东西
+    静默丢掉 —— 而且没有任何报错。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(MAX_LIST_LIMIT + 10))
+
+    frames, next_seq = await _collect_replay(run_id=run_id, store=store)
+
+    assert len(frames) == MAX_LIST_LIMIT + 1  # 一页帧 + 一帧 truncated
+    assert [name for _fid, name, _d in frames].count("end") == 0
+    assert frames[-1][1] == "truncated"
+    assert frames[-1][2] == {"next_seq": MAX_LIST_LIMIT - 1}
+    assert next_seq == MAX_LIST_LIMIT - 1
+    assert _seqs(frames) == list(range(MAX_LIST_LIMIT))
+
+
+@pytest.mark.asyncio
+async def test_replay_exact_page_size_is_not_truncated() -> None:
+    """恰好一页 → **没有** ``next_seq``,收尾是 ``end``。
+
+    钉住那个 off-by-one:用「行数 == 页大小」单独判定截断,总帧数恰好整除页
+    大小时会误报,客户端白拉一页空的、还永远等不到 ``end``。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, range(MAX_LIST_LIMIT))
+
+    frames, next_seq = await _collect_replay(run_id=run_id, store=store)
+
+    assert next_seq is None
+    assert frames[-1][1] == "end"
+    assert [name for _fid, name, _d in frames].count("truncated") == 0
+    assert len(frames) == MAX_LIST_LIMIT + 1  # 一页帧 + 一帧 end
+
+
+@pytest.mark.asyncio
+async def test_replay_cursor_loop_covers_every_frame() -> None:
+    """按 ``next_seq`` 循环拉到 ``end`` —— 拼起来必须是 ``range(总帧数)``。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    total = MAX_LIST_LIMIT * 2 + 7
+    await _seed_rows(store, run_id, range(total))
+
+    collected: list[int] = []
+    cursor: int | None = None
+    pages = 0
+    while True:
+        pages += 1
+        assert pages <= 10, "游标循环没有收敛"
+        frames, next_seq = await _collect_replay(run_id=run_id, store=store, since_seq=cursor)
+        collected += _seqs(frames)
+        if next_seq is None:
+            assert frames[-1][1] == "end"
+            break
+        assert frames[-1][1] == "truncated"
+        cursor = next_seq
+
+    assert pages == 3
+    assert collected == list(range(total))  # 无重复、无缺口
+
+
+@pytest.mark.asyncio
+async def test_external_response_carries_next_seq_header_only_when_truncated() -> None:
+    """外部面 ``build_events_response``:截断时才带 ``X-Expert-Work-Next-Seq``。
+
+    头和 ``truncated`` 帧**两者都要**:浏览器 ``EventSource`` 读不到响应头,
+    只给 header 的信号对一整类客户端不可用;而非浏览器客户端读头最省事。
+    """
+    from control_plane.api.external_events import build_events_response
+
+    async def _response_for(frame_count: int) -> Any:
+        run_id = uuid4()
+        store = InMemoryRunEventStore()
+        await _seed_rows(store, run_id, range(frame_count))
+        run = RunInfo(
+            run_id=run_id,
+            tenant_id=uuid4(),
+            thread_id=uuid4(),
+            user_id=None,
+            status=RunStatus.SUCCESS,  # 终态 → 走 replay 分支
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+        )
+        return await build_events_response(
+            run=run, event_store=store, stream_bridge=InMemoryStreamBridge()
+        )
+
+    truncated = await _response_for(MAX_LIST_LIMIT + 10)
+    assert truncated.headers["x-expert-work-next-seq"] == str(MAX_LIST_LIMIT - 1)
+
+    short = await _response_for(3)
+    assert "x-expert-work-next-seq" not in short.headers
+
+
+@pytest.mark.asyncio
+async def test_console_events_endpoint_carries_next_seq_header(
+    runs_client: AsyncClient,  # noqa: F811 -- pytest fixture injection, not a redefinition
+) -> None:
+    """控制台面那条路也要带这个头 —— 两个调用点的头集合不能分叉。
+
+    P2-a 刚修过一次同类问题(重放响应的头是首次响应的真子集)。只在
+    ``external_events.py`` 上加头、忘了 ``runs.py``,这条会红。
+    """
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    store = runs_client._transport.app.state.run_event_store  # type: ignore[attr-defined]
+    existing = await store.list(run_id=UUID(run_id), limit=MAX_LIST_LIMIT)
+    base = max(r.seq for r in existing) + 1
+    await _seed_rows(store, UUID(run_id), range(base, base + MAX_LIST_LIMIT + 10))
+
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}/events")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-expert-work-next-seq"] == str(MAX_LIST_LIMIT - 1)
+    assert _parse_sse([resp.content])[-1][1] == "truncated"
