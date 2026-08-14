@@ -546,6 +546,134 @@ git add -A && git commit -m "refactor(sse): 发号权归 bridge——锁内原�
 
 ---
 
+### 【Task 3R-fix】落库真的会有洞 —— 三条静默丢帧(复审实测复现)
+
+**Files:**
+- Modify: `services/control-plane/src/control_plane/api/_run_event_stream.py`
+- Test: `services/control-plane/tests/test_run_event_stream.py`
+
+#### 为什么会有这个 Task
+
+Task 3R 的接合算法建立在一个我没写出来、也不成立的隐含假设上:**"落库的行是连续的"**。
+它不连续 —— 而且是**设计使然**:`_flush_batch` 在 DB 出错时按 H-7 立场**整批吞掉**(只打 warning),
+落库队列满时 drop-oldest。所以 `run_event` 表里**真的会出现内部空洞**。
+
+三条缺陷同源,复审都跑探针复现了:
+
+| # | 位置 | 复现 | 后果 |
+|---|---|---|---|
+| 1 | `:186-190` 补库循环 `last = row.seq` 无连续性检查 | 库 `{0,1,2,6,7}`,bridge 推 8,`since_seq=2` → 客户端收到 6,7,8,end,**没有 gap 帧** | 少 32 帧却看起来完整 —— **正是本 PR 要消灭的那类静默丢数据,被修复本身重新引入** |
+| 2 | `:210` `if seq <= last: continue` | 库 `{0,1,2,5,6}`,bridge 里还留着 3,4,5,6,7 → 客户端收到 `0,1,2,5,6,7`,**3 和 4 被丢掉** | **对 main 的回归** —— 旧 `_stream_live` 整个重推 bridge 缓冲,3、4 本来能拿到 |
+| 3 | `:214` gap 分支只读一页(步骤 1 是 `while` 循环,这里不是) | 库有 `1..699`,`last=0`,bridge 推 700 → 收到 `1..500` + `gap{501,699}` + 700 | **假 gap** —— 501~699 就躺在库里,却告诉客户端拿不到 |
+
+#### 修法(照这个实现)
+
+关键洞察:**Task 3R 已经保证 bridge 顺序恒等于 seq 顺序** —— 所以"某个洞还会不会从 bridge 补上"
+是**可判定**的:一旦看到 bridge 上出现比它大的 seq,它就永远不会来了。
+
+```
+holes: set[int]   # 落库里真实缺失的 seq
+
+# 步骤 1 补库 —— 不让 last 无声跳过洞
+while True:
+    rows = await _list_page(last)
+    for row in rows:
+        if row.seq > last + 1:
+            holes.update(range(last + 1, row.seq))     # ← 新增
+        yield row; last = row.seq
+    if len(rows) < MAX_LIST_LIMIT: break
+
+# 步骤 2 挂流,对每个 numbered 帧 seq:
+    flush_holes_below(seq)        # ← 新增:< seq 的洞再也不会来了,合并成连续区间发 gap 帧
+    if seq in holes:              # ← 新增:bridge 还留着这帧,补上
+        holes.discard(seq); yield entry; continue
+    if seq <= last: continue
+    if seq > last + 1:
+        # ← 改:这里的补库也要**循环翻页**,直到 row.seq >= seq 或短页为止
+        #    同样对不连续调用 holes.update(...)
+        ...
+        if last + 1 < seq: yield gap{from: last+1, to: seq-1}
+    yield entry; last = seq
+
+# end 帧之前:把 holes 里剩下的全部合并成 gap 帧发掉,别吞
+```
+
+`holes` 设容量上限 `_MAX_TRACKED_HOLES = 4096`;超了就**立即**把溢出部分冲成 gap 帧并停止跟踪,
+打一条 warning。
+
+**为什么这次的 `holes` 不是被删掉的 `missing` 借尸还魂**(必须在代码注释里写清楚,否则下一个人
+会以为重排窗口又回来了):旧的 `missing` 是为了处理**乱序歧义** —— 那个歧义已经因为发号权归 bridge
+而彻底消失。这里的 `holes` 是为了处理**落库真实空洞**,那是 H-7 主动吞批的设计后果,一直存在、
+与乱序无关。而且它有界:洞来自 DB 写失败,不是每帧都可能进。
+
+- [ ] **Step 1:写失败测试(三条,复审给的用例照抄)**
+
+1. `test_live_interior_hole_is_filled_from_bridge` —— 库 `{0,1,2,5,6}`,bridge 推 `3,4,5,6,7`,
+   `since_seq=None`,**RUNNING** → 客户端必须收到 3 和 4(或至少一帧 `gap{"from":3,"to":4}`)。
+   **今天必须红**(今天静默给出 `0,1,2,5,6,7` 且无 gap)。
+2. `test_live_hole_discovered_in_gap_branch_emits_gap` —— 库 `{0,1,2}`,随后迟到落库 `{6,7}`,
+   bridge 推 `8`,`since_seq=2` → 必须发 `gap{"from":3,"to":5}`。今天红。
+3. `test_gap_branch_backfill_pages_beyond_one_page` —— 库有 `1..699`,`since_seq=0`,bridge 推 `700`
+   → **不许**出现 gap 帧,699 行全部送到。今天红。这条是 `test_live_backfill_pages_through_more_than_one_page`
+   在 gap 分支的孪生兄弟,专杀"gap 分支只读一页"这个变异。
+
+- [ ] **Step 2:跑测试确认三条全红**
+
+- [ ] **Step 3:实现**
+
+- [ ] **Step 4:跑测试确认通过 + 全量回归**
+
+- [ ] **Step 5:变异自证**
+
+| 变异 | 必须红 |
+|---|---|
+| 补库循环去掉 `holes.update(...)` | 测试 1 或 2 |
+| `if seq in holes` 那一支删掉 | 测试 1 |
+| gap 分支的翻页循环改回只读一页 | 测试 3 |
+| `end` 前不冲剩余 holes | 补一条(run 结束时仍有未决洞) |
+
+- [ ] **Step 6:提交**
+
+```bash
+git add -A && git commit -m "fix(sse): 落库空洞不再被静默跳过——holes 跟踪 + gap 分支翻页"
+```
+
+---
+
+### 【Task 3R-guard】词表 round-trip 闸 + 探针前置条件(复审 Minor 5/6)
+
+**Files:**
+- Test: `services/control-plane/tests/`(新建或并入现有契约测试)
+- Test: `packages/expert-work-runtime/tests/test_in_memory_stream_bridge.py`
+
+- [ ] **Step 1:四条 round-trip 断言**
+
+`_RUN_STATUS_END_STATUS` 今天恰好以 `TERMINAL_RUN_STATUSES` 为键、`_EXTERNAL_END_STATUS` today 覆盖
+`sse.py` 里赋值过的全部六个 `session_outcome` 字面量 —— **但没有任何东西钉住这一点**。将来加一个终态
+`RunStatus`,`.get()` 返回 `None`,`end_frame_data` 兜成 `"error"` —— **一个错误的终局状态被静默发给第三方**。
+
+```python
+assert set(_RUN_STATUS_END_STATUS) == TERMINAL_RUN_STATUSES
+assert set(_RUN_STATUS_END_STATUS.values()) <= EXTERNAL_END_STATUSES
+assert set(_EXTERNAL_END_STATUS.values()) <= EXTERNAL_END_STATUSES
+# 以及:sse.py 里赋值过的每个 session_outcome 字面量都是 _EXTERNAL_END_STATUS 的键
+```
+
+- [ ] **Step 2:给原子性探针补前置条件**
+
+`test_in_memory_stream_bridge.py` 的探针不变式 `next_seq == numbered + start_offset` 在**有 ephemeral 帧
+被溢出淘汰**时会多算(`start_offset` 两种帧都数)。今天成立(`queue_maxsize=1024`、64 帧、无 ephemeral),
+但将来改这条测试会产生**假红**。加一行 `assert stream.start_offset == 0` 把前置条件显式化,与本仓
+其它元断言的风格一致。
+
+- [ ] **Step 3:提交**
+
+```bash
+git add -A && git commit -m "test(sse): 终局状态词表 round-trip 闸 + 原子性探针前置条件"
+```
+
+---
+
 ### Task 4:回放分页 —— 截断不再假装流结束
 
 **Files:**
@@ -563,7 +691,16 @@ git add -A && git commit -m "refactor(sse): 发号权归 bridge——锁内原�
 **背景与一处必须知道的约束**:spec §六E 写的是"响应头给 `X-Expert-Work-Next-Seq`"。但 HTTP 响应头在流开始前就发完了,而"是否截断"只有读完一页才知道 —— **在生成器体内没有任何办法再改响应头**。所以:
 
 1. `build_event_producer` 改成 `async def`,回放分支的第一页在**返回迭代器之前**就读掉,`next_seq` 因此在构造 `StreamingResponse` 时已知。附带好处:数据库出错会变成正常的 500 JSON,而不是一个已经开始流式输出、半截截断的 body。
-2. **同时发一个 `truncated` 帧**。这是对 spec 的**增补**,理由:浏览器 `EventSource` 读不到响应头 —— 只给 header 的信号对一整类客户端不可用。帧和头同时给,成本是几行代码。
+2. **同时发一个 `truncated` 帧**。这是对 spec 的**增补**。
+
+   **⚠️ 本节初稿给的理由是错的(复审 2026-08-14 纠正)**:初稿写"浏览器 `EventSource` 读不到响应头"。
+   但 `EventSource` **本来就用不了这套 API** —— 控制台走 `fetch` 带 `Authorization`
+   (`api/runs.ts:151-160`),对外端点要 API-key 头,而 `EventSource` 设不了请求头
+   (`api/sessions.ts:14` 自己就记着这件事)。**Task 7 写文档时不许拿 EventSource 当理由**,
+   那等于宣称一个我们并不提供的能力。
+
+   真正站得住的理由:**中间代理会剥掉不认识的响应头**,而 body 里的帧不会被剥;
+   信号放在流里比放在头里稳。头照发(能读到的客户端直接用),帧是兜底。帧和头同时给,成本是几行代码。
 
 页大小沿用 `MAX_LIST_LIMIT`(=500,`runs/store.py:507`)。截断判定:读回的行数 == 页大小,且 `event_store.list(since_seq=最后一行.seq, limit=1)` 非空。**不要**用"行数 == 页大小"单独判定 —— 恰好整除时会误报截断。
 
@@ -715,6 +852,11 @@ git add -A && git commit -m "fix(admin-ui): 事件流跟游标翻页,长 run 不
    收到 `end` 才看得到终局状态。
 3. **`gap` 帧的含义**:这一段帧在**这条连接**上补不到了(服务端缓冲已滚过、且尚未落盘),
    不代表它们不存在。run 结束后重新回放通常能拿到。`gap` 帧无 `id:`、不可回放。
+4. **`since_seq` 必须来自服务端发过的帧 id**(复审 Minor 4)。传一个超过该 run 真实尾部的值,
+   服务端会安静地什么都不发(补库为空,后续实时帧全部 `<= last` 被判为已发过),
+   只有心跳和最后的 `end`。**服务端不做校验也不报错** —— 因为落库尾部本来就合法地落后于
+   实时流(攒批 writer),分不清"客户端传错"与"还没落盘",钳制反而会造成重复投递。
+5. **`truncated` 帧的理由写"代理会剥掉不认识的响应头"**,不许写 EventSource(见 Task 4 的更正)。
 
 - [ ] **Step 3:文档站构建**
 
