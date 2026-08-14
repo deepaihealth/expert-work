@@ -781,3 +781,63 @@ async def test_pending_holes_are_flushed_before_end() -> None:
     ]
     assert frames[-2][2] == {"from": 3, "to": 4}
     assert _seqs(frames) == [0, 1, 2, 5]
+
+
+# ---------------------------------------------------------------------------
+# P3 PR-1 / Task 3R-guard —— 终局状态词表的 round-trip 闸(复审 Minor 5)
+# ---------------------------------------------------------------------------
+
+
+def _session_outcome_literals() -> set[str]:
+    """扫出 ``sse.py`` 里赋给 ``session_outcome`` 的**全部**字符串字面量。
+
+    两种写法都要覆盖:直接 ``session_outcome = "error"``,以及
+    ``session_outcome = {RunStatus.X: "...", ...}[final]``。
+    """
+    import ast
+    import inspect
+    from pathlib import Path
+
+    import orchestrator.sse as sse_module
+
+    source = Path(inspect.getsourcefile(sse_module) or "").read_text(encoding="utf-8")
+    literals: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "session_outcome" for t in node.targets):
+            continue
+        for sub in ast.walk(node.value):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                literals.add(sub.value)
+    return literals
+
+
+def test_end_status_vocabulary_round_trip() -> None:
+    """两张映射表的键与值都必须闭合在四值词表里,否则会静默发错终局状态。
+
+    ``end_frame_data`` 对认不出来的 status 兜成 ``"error"``。所以将来加一个终态
+    ``RunStatus`` 而忘了进 ``_RUN_STATUS_END_STATUS``,``.get()`` 返回 ``None``,
+    **一个错误的终局状态被静默发给第三方** —— 没有任何测试会红。这条就是那道闸。
+    """
+    from control_plane.api._run_event_stream import _RUN_STATUS_END_STATUS
+    from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
+    from orchestrator.sse import _EXTERNAL_END_STATUS, EXTERNAL_END_STATUSES
+
+    # ① 每个终态都有映射,且没有多余的键(非终态不该出现在这里)。
+    assert set(_RUN_STATUS_END_STATUS) == TERMINAL_RUN_STATUSES, (
+        f"RunStatus 终态与映射表不闭合:缺 {TERMINAL_RUN_STATUSES - set(_RUN_STATUS_END_STATUS)},"
+        f"多 {set(_RUN_STATUS_END_STATUS) - TERMINAL_RUN_STATUSES}"
+    )
+    # ②③ 两张表的值都必须落在对外四值词表里。
+    assert set(_RUN_STATUS_END_STATUS.values()) <= EXTERNAL_END_STATUSES
+    assert set(_EXTERNAL_END_STATUS.values()) <= EXTERNAL_END_STATUSES
+
+    # ④ sse.py 里赋值过的每个 session_outcome 字面量都必须是 _EXTERNAL_END_STATUS 的键。
+    literals = _session_outcome_literals()
+    assert literals, "一个 session_outcome 字面量都没扫到 —— 扫描器失效,本断言已空转"
+    unmapped = literals - set(_EXTERNAL_END_STATUS)
+    assert not unmapped, (
+        f"sse.py 赋了这些 session_outcome 但 _EXTERNAL_END_STATUS 没有对应键:{sorted(unmapped)}"
+        " —— 它们会被静默兜成 error"
+    )

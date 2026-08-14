@@ -96,6 +96,15 @@ async def test_bridge_order_equals_seq_order_under_concurrency() -> None:
     await watcher
     await bridge.publish_end(run_id, status="success")
 
+    # 探针不变式的**前置条件**:整条 run 没触发过缓冲区溢出。溢出时
+    # ``start_offset`` 会把 ephemeral 帧也数进去,``next_seq == numbered +
+    # start_offset`` 就会多算 —— 今天 ``queue_maxsize=1024``、64 帧、零 ephemeral
+    # 所以成立。谁改了这条测试的规模或加了 ephemeral 帧,先看这一行:那时上面的
+    # violations 是**假红**,不是真 bug。
+    assert bridge._streams[run_id].start_offset == 0, (
+        "缓冲区溢出了 —— 原子性探针的不变式在这种条件下会多算,先修前置条件"
+    )
+
     # 1. 号本身。
     assigned = sorted(seq for group in groups for seq in group)
     duplicated = sorted({s for s in assigned if assigned.count(s) > 1})
