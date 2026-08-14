@@ -40,7 +40,19 @@ def _async_dsn(container: PostgresContainer) -> str:
     return url.replace("+psycopg2", "+asyncpg").replace("postgresql://", "postgresql+asyncpg://", 1)
 
 
-@pytest.fixture(params=["memory", "sql"])
+@pytest.fixture(
+    params=[
+        "memory",
+        # The marker has to ride on the param, not be added from inside the
+        # fixture body: ``-m "not integration"`` deselects at COLLECTION time,
+        # and a fixture only runs long after that. Adding it via
+        # ``request.node.add_marker`` therefore never reaches the filter — the
+        # sql variant still executed under ``-m "not integration"`` and dragged
+        # testcontainers into the unit job (erroring outright wherever no
+        # Docker daemon is reachable).
+        pytest.param("sql", marks=pytest.mark.integration),
+    ]
+)
 async def thread_meta_store(request: pytest.FixtureRequest) -> AsyncIterator[ThreadMetaStore]:
     """Yields both the in-memory and the Postgres-backed store — every test
     in this module runs once per backend so the two predicates can't drift
@@ -49,7 +61,6 @@ async def thread_meta_store(request: pytest.FixtureRequest) -> AsyncIterator[Thr
         yield InMemoryThreadMetaStore()
         return
 
-    request.node.add_marker(pytest.mark.integration)
     postgres_container: PostgresContainer = request.getfixturevalue("postgres_container")
     cfg = Config(str(ALEMBIC_INI))
     cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
