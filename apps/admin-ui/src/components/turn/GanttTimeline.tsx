@@ -64,6 +64,8 @@ const MARKER_COLOR: Record<GanttMarker["kind"], string> = {
   approval: "var(--ew-accent-violet, #a855f7)",
   guard: "var(--ew-text-warning, #f59e0b)",
   end: "var(--ew-text-success, #34d399)",
+  // P3 PR-1 —— ``gap`` 是"这条连接补不到这段帧",不是运行出错,所以走 warning。
+  gap: "var(--ew-text-warning, #f59e0b)",
 };
 
 const MIN_BAR_WIDTH_PCT = 0.35;

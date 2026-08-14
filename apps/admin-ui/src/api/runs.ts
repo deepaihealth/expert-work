@@ -7,6 +7,7 @@
  * endpoints that returns the raw payload (no envelope) — see :func:`getRun`.
  */
 import { apiClient, unwrap, withTenantScope, type ApiEnvelope, type TenantScope } from "./client";
+import { seqOf } from "./sse_id";
 
 export type RunStatus =
   // Server-side ``RunStatus`` enum (expert_work.runtime.runs.RunStatus).
@@ -119,6 +120,38 @@ export async function resumeRun(
   return response.data;
 }
 
+/** 回放翻页上限。一页 500 帧 ⇒ 一次消费封顶 1 万帧。到顶就停下并打日志 ——
+ *  服务端若因 bug 一直回 ``truncated``,这个循环不能变成能无限拉的循环。 */
+const MAX_EVENT_PAGES = 20;
+
+/** 下一页的 ``since_seq``。三处来源取最大值,保证游标只前进不后退:
+ *
+ *  1. ``truncated`` 帧的 ``next_seq`` —— 首选,body 里的帧不会被中间代理剥掉;
+ *  2. ``X-Expert-Work-Next-Seq`` 响应头 —— 帧里读不到时的兜底(代理会剥掉不认识
+ *     的响应头,跨源还得服务端 expose,所以只当兜底);
+ *  3. ``maxSeqSeen`` —— 前两者都读不到时的最后一根稻草。
+ *
+ *  ``headers`` 用可选链取:老测试替身的 fetch mock 只有 ``{ok, body}``。 */
+function nextCursorOf(
+  truncatedFrame: import("./sessions").SseEvent,
+  response: Response,
+  maxSeqSeen: number | null,
+): number | null {
+  const candidates: number[] = [];
+  const data = truncatedFrame.data;
+  if (data !== null && typeof data === "object") {
+    const raw = (data as { next_seq?: unknown }).next_seq;
+    if (typeof raw === "number" && Number.isInteger(raw)) candidates.push(raw);
+  }
+  const header = response.headers?.get("X-Expert-Work-Next-Seq");
+  if (header !== null && header !== undefined && header !== "") {
+    const parsed = Number(header);
+    if (Number.isInteger(parsed)) candidates.push(parsed);
+  }
+  if (maxSeqSeen !== null) candidates.push(maxSeqSeen);
+  return candidates.length === 0 ? null : Math.max(...candidates);
+}
+
 /** GET /v1/sessions/{thread}/runs/{run}/events — SSE stream.
  *
  *  Active runs (running/paused/pending) get a live attach via the
@@ -129,6 +162,16 @@ export async function resumeRun(
  *
  *  ``sinceSeq`` is Last-Event-ID semantics: ``undefined`` returns the
  *  stream from the beginning; ``N`` returns events with ``seq > N``.
+ *
+ *  **翻页(P3 PR-1)**:回放一页装不下时,后端以 ``truncated`` 帧收尾并且
+ *  **不发 ``end``** —— 流并没有结束。这个生成器据此带 ``next_seq`` 再拉一页,
+ *  拼接后继续吐给调用方,直到收到 ``end``;续拉成功时 ``truncated`` 帧本身不
+ *  外泄(它是传输层控制帧)。翻不动了(游标不前进 / 到页数上限)才把最后那帧
+ *  ``truncated`` 吐出去 —— 调用方据此知道流没走完,**这一页没有终局状态**。
+ *
+ *  游标取**见过的最大 seq**,不是最后一帧的 seq:补发的落库空洞帧会排在更大
+ *  seq 之后(wire 上不保证按 seq 递增到达),拿最后一帧当游标会把中间那段重收
+ *  一遍。
  *
  *  ``tenantScope`` (Track C W2) — hand-built URL, so ``tenant_id`` is
  *  appended manually (cf. ``listThreadRuns``); ``undefined`` omits it. */
@@ -143,26 +186,62 @@ export async function* streamRunEvents(
   } = {},
 ): AsyncGenerator<import("./sessions").SseEvent, void, void> {
   const { sinceSeq, signal, baseUrl = "", tenantScope } = options;
-  const params = new URLSearchParams();
-  if (sinceSeq !== undefined) params.set("since_seq", String(sinceSeq));
-  if (tenantScope !== undefined) params.set("tenant_id", tenantScope);
-  const qs = params.toString();
-  const url =
-    `${baseUrl}/v1/sessions/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/events` +
-    (qs ? `?${qs}` : "");
   const { getStoredToken } = await import("./client");
+  const { parseSseStream } = await import("./sessions");
   const token = getStoredToken();
   const headers: Record<string, string> = { Accept: "text/event-stream" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const response = await fetch(url, { method: "GET", headers, signal });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} on /events`);
+  const endpoint = `${baseUrl}/v1/sessions/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/events`;
+
+  let cursor = sinceSeq;
+  let maxSeqSeen: number | null = sinceSeq ?? null;
+
+  for (let pageCount = 1; ; pageCount += 1) {
+    const params = new URLSearchParams();
+    if (cursor !== undefined) params.set("since_seq", String(cursor));
+    if (tenantScope !== undefined) params.set("tenant_id", tenantScope);
+    const qs = params.toString();
+    const response = await fetch(endpoint + (qs ? `?${qs}` : ""), {
+      method: "GET",
+      headers,
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} on /events`);
+    }
+    if (!response.body) {
+      throw new Error("response has no body — SSE not available");
+    }
+
+    let truncatedFrame: import("./sessions").SseEvent | null = null;
+    for await (const frame of parseSseStream(response.body, signal)) {
+      // ``maxSeqSeen`` **只是翻页游标,不是去重判据**。到达顺序不等于 seq 顺序
+      // (契约实况表 B:0,1,2,5,6,3,4 —— 3、4 是补发的真帧,在 6 之后才到),
+      // 拿它当 ``seq <= maxSeqSeen → drop`` 会把补发帧静默丢掉。每一帧都照发。
+      const seq = seqOf(frame.id);
+      if (seq !== null && (maxSeqSeen === null || seq > maxSeqSeen)) maxSeqSeen = seq;
+      if (frame.event === "truncated") {
+        truncatedFrame = frame;
+        break;
+      }
+      yield frame;
+    }
+    // 流自然走完(``end``,或连接断开)—— 没有下一页。
+    if (truncatedFrame === null) return;
+
+    const next = nextCursorOf(truncatedFrame, response, maxSeqSeen);
+    const stalled = next === null || (cursor !== undefined && next <= cursor);
+    if (stalled || pageCount >= MAX_EVENT_PAGES) {
+      console.warn(
+        `[streamRunEvents] 回放翻页中止 run=${runId} pages=${pageCount} cursor=${String(cursor)} next=${String(next)} — ` +
+          (stalled ? "游标不前进" : `到达 ${MAX_EVENT_PAGES} 页上限`) +
+          ";流未走完,没有终局状态",
+      );
+      yield truncatedFrame;
+      return;
+    }
+    cursor = next;
   }
-  if (!response.body) {
-    throw new Error("response has no body — SSE not available");
-  }
-  const { parseSseStream } = await import("./sessions");
-  yield* parseSseStream(response.body, signal);
 }
 
 /** Playground history reconstruction — one row of ``GET

@@ -148,4 +148,34 @@ describe("parseTimeline", () => {
     expect(items[1]).toMatchObject({ kind: "guard", tone: "bad" });
     expect(items[1].kind === "guard" && items[1].text).toContain("步数耗尽");
   });
+
+  // ——— P3 PR-1 契约变更 ———
+
+  it("renders a gap frame as a warn marker naming the missing range", () => {
+    // ``gap``(只出现在 live 分支)= 这段帧在这条连接上补不到了。既不是错误,
+    // 也不能当未知帧丢掉 —— 时间线上真的缺了一段。
+    const items = parseTimeline([ev("gap", { from: 3, to: 7 }, "t1")]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "gap", tone: "warn" });
+    expect(items[0].kind === "gap" && items[0].text).toContain("3");
+    expect(items[0].kind === "gap" && items[0].text).toContain("7");
+  });
+
+  it("reads end.status — paused/interrupted/error are not 运行完成", () => {
+    const cases: Array<[string, string, string]> = [
+      ["success", "运行完成", "good"],
+      ["paused", "等待人工审批", "pause"],
+      ["interrupted", "运行已取消", "warn"],
+      ["error", "运行失败", "bad"],
+    ];
+    for (const [status, text, tone] of cases) {
+      const items = parseTimeline([ev("end", { status, run_id: "r1" }, "t1")]);
+      expect(items[0]).toMatchObject({ kind: "end", text, tone });
+    }
+  });
+
+  it("falls back to 运行完成 for a legacy end frame with null data", () => {
+    const items = parseTimeline([ev("end", null, "t1")]);
+    expect(items[0]).toMatchObject({ kind: "end", text: "运行完成", tone: "good" });
+  });
 });

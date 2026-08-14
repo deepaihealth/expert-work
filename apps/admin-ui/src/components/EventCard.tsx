@@ -19,6 +19,10 @@ const EVENT_COLOR: Record<string, string> = {
   error: "red",
   end: "green",
   compaction: "purple",
+  // P3 PR-1 的两个新帧型。``gap`` = 这条连接补不到的一段(不是错误,别用红);
+  // ``truncated`` 通常被 SDK 的翻页吃掉,翻不动了才会露到这里。
+  gap: "orange",
+  truncated: "orange",
 };
 
 export function EventCard({ evt }: { evt: SseEvent }) {

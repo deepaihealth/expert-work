@@ -112,6 +112,7 @@ export function StepTimeline({
             case "approval":
             case "guard":
             case "end":
+            case "gap":
               return <MarkerRow key={item.seq} item={item} />;
             default:
               return <AuxNodeRow key={item.seq} item={item} />;
