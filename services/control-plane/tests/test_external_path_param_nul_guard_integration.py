@@ -141,11 +141,21 @@ def sql_settings(postgres_container: PostgresContainer) -> Iterator[Settings]:
 
 
 class _Ctx:
-    def __init__(self, client: AsyncClient, app: Any, tenant_id: UUID, headers: dict[str, str]):
+    def __init__(
+        self,
+        client: AsyncClient,
+        app: Any,
+        tenant_id: UUID,
+        headers: dict[str, str],
+        console_headers: dict[str, str],
+    ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
+        #: Employee JWT — ``headers`` is a service account, which
+        #: ``console_only()`` bars from console routes. See the fixture.
+        self.console_headers = console_headers
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -171,8 +181,7 @@ async def ctx(sql_settings: Settings) -> AsyncIterator[_Ctx]:
     # External-API-v1 P2-b security fix (external_only()) — the external
     # plane is now service-account-only; this file's employee JWT was a
     # borrowed fixture (predates the gate), not a deliberate test of
-    # console-JWT access. ``disable``/``enable`` (also exercised here) are
-    # NOT gated and remain reachable either way.
+    # console-JWT access.
     jwt = make_test_jwt(
         tenant_id=tenant_id,
         subject="sa-test",
@@ -181,6 +190,22 @@ async def ctx(sql_settings: Settings) -> AsyncIterator[_Ctx]:
         scopes=("admin",),
     )
     headers = {"Authorization": f"Bearer {jwt}"}
+    # The comment above used to continue: "``disable``/``enable`` (also
+    # exercised here) are NOT gated and remain reachable either way." The
+    # console lockdown later in P2-b made that false — both are
+    # ``console_only()`` now, so the service account gets 403. The NUL cases
+    # on those two routes still pass with the key, because
+    # ``reject_nul_path_params`` is a ROUTER-level dependency and runs before
+    # the route-level gate; only the "legitimate name still 200s"
+    # non-regression case reaches the handler and therefore needs an employee.
+    console_jwt = make_test_jwt(
+        tenant_id=tenant_id,
+        subject="employee-test",
+        sub_type="user",
+        roles=("admin",),
+        scopes=(),
+    )
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
     # ``raise_app_exceptions=False`` matches a real deployment: Starlette's
     # ``ServerErrorMiddleware`` (always the outermost middleware) turns an
     # uncaught exception into a bare-text 500 response AND re-raises it for
@@ -191,7 +216,7 @@ async def ctx(sql_settings: Settings) -> AsyncIterator[_Ctx]:
     # never fires either way; it only matters for the ablation exercise.
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers)
+        yield _Ctx(client, app, tenant_id, headers, console_headers)
 
 
 def _assert_envelope_422(resp: Any) -> None:
@@ -300,8 +325,18 @@ async def test_sql_bind_session_legit_agent_code_still_201s(ctx: _Ctx) -> None:
 @pytest.mark.asyncio
 async def test_sql_disable_agent_legit_name_still_200s(ctx: _Ctx) -> None:
     await ctx.seed_agent()
+    # Console route — needs the employee identity (see the fixture).
     resp = await ctx.client.post(
-        "/v1/agents/support-bot/disable", json={"reason": "maintenance"}, headers=ctx.headers
+        "/v1/agents/support-bot/disable",
+        json={"reason": "maintenance"},
+        headers=ctx.console_headers,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["disabled"] is True
+    # Guard the premise: the API key must NOT reach this handler. Without
+    # this, someone removing the gate would see every assertion here still
+    # green and the fixture comment above silently become wrong again.
+    via_key = await ctx.client.post(
+        "/v1/agents/support-bot/disable", json={"reason": "maintenance"}, headers=ctx.headers
+    )
+    assert via_key.status_code == 403, via_key.text
