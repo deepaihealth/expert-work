@@ -46,8 +46,31 @@ not_ready="$(kubectl -n expert-work get pods --no-headers \
     | awk '$3 != "Running" && $3 != "Completed" {print $1"("$3")"}' | paste -sd, - || true)"
 check "all pods Running/Completed" "${not_ready:-none}" "none"
 
+# Pick a pod that can actually be exec'd into. ``items[0]`` alone picks
+# whatever comes first, which right after a rollout is routinely the OLD pod
+# mid-Terminating or an already-Succeeded one — ``kubectl exec`` then fails
+# with "cannot exec into a container in a completed pod" and the smoke reports
+# a phantom failure. Seen twice on the 2026-08-13 release; the third run passed
+# only because the terminating pod had finally gone away.
+#
+# ``--field-selector status.phase=Running`` drops Succeeded/Failed but NOT a
+# Terminating pod (it keeps phase=Running while its deletionTimestamp ticks
+# down), so also require Ready=True and an empty deletionTimestamp.
+#
+# Both extra conditions are filtered in awk rather than in the jsonpath:
+# kubectl's jsonpath has no negation — `items[?(!@.metadata.deletionTimestamp)]`
+# fails outright with "unrecognized character in action: U+0021 '!'". Printing
+# the fields with a `|` separator and testing them in awk sidesteps that, and
+# the separator matters: an absent deletionTimestamp prints as empty, which
+# whitespace-splitting awk would silently collapse into the wrong column.
 POD="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
-    -o jsonpath='{.items[0].metadata.name}')"
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}|{.metadata.deletionTimestamp}|{.metadata.name}{"\n"}{end}' \
+    | awk -F'|' '$1 == "True" && $2 == "" {print $3; exit}')"
+if [[ -z "${POD}" ]]; then
+    echo "FAIL no Running+Ready control-plane pod to probe from" >&2
+    exit 1
+fi
 
 echo "== http (via ${POD}) =="
 # One python invocation, one line per probe: "<name> <status-or-error>".
