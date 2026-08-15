@@ -1,4 +1,4 @@
-# 错误码与限流
+# 6 错误码总表
 
 本篇讲清楚调用失败时你会看到什么、为什么、该怎么应对——覆盖 400 / 401 / 403 / 404 / 409 / 410 / 413 / 422 / 429 / 500 / 502 / 503 / 504,以及限流和配额这两个容易混的概念。
 
@@ -47,11 +47,11 @@
 | [`SERVER_OVERLOADED`](#_503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**,不只是上传 | 按 `Retry-After` 头退避重试 |
 | [`DEADLINE_EXCEEDED`](#_504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值,或者干脆别传它 |
 
-**这张表只覆盖有 `error.code` 的失败,不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是 FastAPI 默认的裸 `{"detail": "..."}` 字符串(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422),有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限""图片引用不属于这个会话",都是 4xx;配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表,完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
+**这张表只覆盖有 `error.code` 的失败,不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是只有一个 `detail` 字段的简易格式(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422,这类 `detail` 是字符串),有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限""图片引用不属于这个会话",都是 4xx;配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表,完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
 
-## 先说一件容易踩的坑:错误响应的信封形状不统一
+## 先说一件容易踩的坑:错误响应的形状不统一
 
-大多数错误会用统一信封返回:
+大多数错误会用**标准格式**返回,能读到 `error.code`:
 
 ```json
 {
@@ -61,11 +61,17 @@
 }
 ```
 
-但一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)直接用了 FastAPI 默认的 `{"detail": ...}` 形状(`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象)。写解析逻辑时不要假设所有错误都是同一个信封——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
+但一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)是**简易格式**,只有一个 `detail` 字段,读不到 `error.code`:
+
+```json
+{ "detail": "..." }
+```
+
+`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象。写解析逻辑时不要假设所有错误都是标准格式——先看 HTTP 状态码兜底,body 里有 `error.code` 就用它,没有就退化读 `detail`。下面每一节会标出具体是哪种形状。
 
 ## 400 —— 工作区文件路径不合法
 
-只发生在 `GET /v1/agents/{agent_code}/workspace/file`(下载工作区文件)的 `path` 查询参数上,统一信封,`error.code` 固定 `WORKSPACE_FILE_FAILED`:
+只发生在 `GET /v1/agents/{agent_code}/workspace/file`(下载工作区文件)的 `path` 查询参数上,能读到 `error.code`,固定 `WORKSPACE_FILE_FAILED`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "invalid workspace path" } }
@@ -77,7 +83,7 @@
 
 ## 401 —— key 无效 / 过期
 
-认证失败一律 401,统一信封形状,并带 `WWW-Authenticate: Bearer realm="expert-work"` 响应头:
+认证失败一律 401,能读到 `error.code`,并带 `WWW-Authenticate: Bearer realm="expert-work"` 响应头:
 
 ```json
 { "success": false, "data": null, "error": { "code": "AUTH_INVALID_TOKEN", "message": "Invalid or unrecognised token" } }
@@ -95,7 +101,7 @@
 
 ## 403 —— scope 不足 / 其它权限阻断
 
-**scope 不够**是最常见的 403 场景——比如拿一把只有 `read` scope 的 key 去调 `POST /v1/agents/{agent_code}/runs`(这个接口要求 `write`)。这类 403 走 FastAPI 默认 `detail` 形状,不是统一信封:
+**scope 不够**是最常见的 403 场景——比如拿一把只有 `read` scope 的 key 去调 `POST /v1/agents/{agent_code}/runs`(这个接口要求 `write`)。这类 403 读不到 `error.code`——码在 `detail.code`:
 
 ```json
 { "detail": { "code": "FORBIDDEN", "message": "principal lacks required role" } }
@@ -103,11 +109,11 @@
 
 应对:换一把带 `write` scope 的 key(见 [认证](./auth) 的 scope 选择表)。
 
-另外两种 403 是统一信封形状,和 scope 无关:当前 Agent 被管理员下线(`AGENT_DISABLED`)、或者租户本身被暂停(`TENANT_SUSPENDED`)——都不是靠换 key 能解决的,需要联系你的租户管理员。
+另外两种 403 能读到 `error.code`,和 scope 无关:当前 Agent 被管理员下线(`AGENT_DISABLED`)、或者租户本身被暂停(`TENANT_SUSPENDED`)——都不是靠换 key 能解决的,需要联系你的租户管理员。
 
 ## 404 —— agent 不存在 / 会话不存在 / 工作区文件不存在
 
-统一信封形状,三种情况:
+能读到 `error.code`,三种情况:
 
 ```json
 { "success": false, "data": null, "error": { "code": "AGENT_NOT_FOUND", "message": "no active agent 'xxx' for this tenant" } }
@@ -130,7 +136,7 @@
 
 ## 413 —— 文档 / 图片超限
 
-只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。这个接口把自己抛出的每一种拒绝都翻成统一信封:
+只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`),不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用,不是原始字节。这个接口把自己抛出的每一种拒绝都翻成能读到 `error.code` 的形状:
 
 ```json
 { "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }
@@ -142,13 +148,13 @@
 
 `POST /v1/agents/{agent_code}/runs` 的 422 分两类,形状不一样。
 
-**第一类,请求体字段本身没通过校验**——比如 `files[].transfer_method` 传了 `local_file` 以外的值、`upload_id` 是空字符串、`files[]` / `image_refs` / `untrusted_content` 超过各自的条数上限。统一信封,`error.code` 固定是 `INVALID_REQUEST`:
+**第一类,请求体字段本身没通过校验**——比如 `files[].transfer_method` 传了 `local_file` 以外的值、`upload_id` 是空字符串、`files[]` / `image_refs` / `untrusted_content` 超过各自的条数上限。能读到 `error.code`,固定是 `INVALID_REQUEST`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Input should be 'local_file'" } }
 ```
 
-同一类里还有十个更具体的业务码,同样走统一信封:
+同一类里还有十个更具体的业务码,同样能读到 `error.code`:
 
 | `code` | 什么情况 |
 |---|---|
@@ -165,22 +171,22 @@
 
 **agent 构建失败是另一种独立的 422**,`error.code` 为 `AGENT_BUILD_FAILED`——命中已发布 Agent 的 manifest 因服务端配置问题构建失败(比如引用了不存在的模型 / 工具),`/runs` 与审批决策(`:decide`)续跑都可能遇到。这不是你这边能解决的,联系租户管理员。
 
-**图片数还有一道更严的闸,而且撞上时拿到的是裸 `detail`,不是上面的统一信封**:`TOO_MANY_IMAGE_REFS`(64 张)只是请求体字段层面的合计上限;`/runs` 内部对单次 run 实际处理的图片数另有一条独立限制(部署可配,默认 **8** 张),超过时是 422 `{"detail": "too many images: max 8 per run"}`,没有 `error.code`,和 `TOO_MANY_IMAGE_REFS` 是两道完全独立的闸——9~64 张这个区间会先过掉 `TOO_MANY_IMAGE_REFS` 那道闸,再被这道闸拦下,拿到的是这个裸 `detail` 而不是统一信封。同一道闸还有两种关联失败,同样是裸 `detail`、没有 `error.code`:
+**图片数还有一道更严的闸,而且撞上时拿到的是裸 `detail`,没有 `error.code`**:`TOO_MANY_IMAGE_REFS`(64 张)只是请求体字段层面的合计上限;`/runs` 内部对单次 run 实际处理的图片数另有一条独立限制(部署可配,默认 **8** 张),超过时是 422 `{"detail": "too many images: max 8 per run"}`,没有 `error.code`,和 `TOO_MANY_IMAGE_REFS` 是两道完全独立的闸——9~64 张这个区间会先过掉 `TOO_MANY_IMAGE_REFS` 那道闸,再被这道闸拦下,拿到的是这个裸 `detail`,读不到 `error.code`。同一道闸还有两种关联失败,同样是裸 `detail`、没有 `error.code`:
 
 - 422 `{"detail": "agent does not accept image input: ..."}`——这个 Agent 没开启图片能力(既没声明支持视觉的模型,Agent 配置里也没声明 `vision` 相关能力),传了 `image_refs` / `files[]` 里的图片条目就会撞上,不管数量。
 - 404 `{"detail": "image ref not found"}`——图片引用不属于这次请求最终绑定的会话,细节见上方「404」一节。
 
-三条都不走 `{success, data, error}` 信封,写解析逻辑时不要假设"拿到 image 相关的 422/404 就一定有 `error.code` 可读"。
+三条都不是 `{success, data, error}` 这个形状,写解析逻辑时不要假设"拿到 image 相关的 422/404 就一定有 `error.code` 可读"。
 
-**第二类,`inputs`(提示词模板变量)与 Agent 声明不匹配——不走统一信封**,是裸的 FastAPI `{"detail": ...}` 字符串,没有 `error.code`:
+**第二类,`inputs`(提示词模板变量)与 Agent 声明不匹配——没有 `error.code`**,是只有一个 `detail` 字段的简易格式字符串:
 
 ```json
 { "detail": "unknown input variable: foo" }
 ```
 
-三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。**`inputs` 本身的三条硬上限(键数量 / 单值长度 / 序列化后总字节数)不属于这一类**——这三条走上面第一类的统一信封(`TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG` / `TOO_MANY_INPUT_BYTES`)。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
+三种情况都是这个形状:Agent 没声明模板变量却传了非空 `inputs`、`inputs` 里有未声明的键、Agent 声明的必填变量没给。**`inputs` 本身的三条硬上限(键数量 / 单值长度 / 序列化后总字节数)不属于这一类**——这三条和上面第一类一样能读到 `error.code`(`TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG` / `TOO_MANY_INPUT_BYTES`)。细节见 [调用 Agent](./run-agent) 的「`inputs`」一节。
 
-另外,`PATCH /v1/agents/{agent_code}/sessions/{session_id}`(重命名会话)有自己独立的一个业务码,和上面 `/runs` 那套无关,同样走统一信封:`title` 去掉首尾空白后是空字符串(比如整串都是空格),422 `INVALID_TITLE`:
+另外,`PATCH /v1/agents/{agent_code}/sessions/{session_id}`(重命名会话)有自己独立的一个业务码,和上面 `/runs` 那套无关,同样能读到 `error.code`:`title` 去掉首尾空白后是空字符串(比如整串都是空格),422 `INVALID_TITLE`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "INVALID_TITLE", "message": "title must not be empty" } }
@@ -190,7 +196,7 @@
 
 ## 429 —— 两种情况,含义不同
 
-**第一种,限流 / 配额超限**(`RATE_LIMIT_EXCEEDED`)——统一信封形状,带 `Retry-After` 响应头:
+**第一种,限流 / 配额超限**(`RATE_LIMIT_EXCEEDED`)——能读到 `error.code`,带 `Retry-After` 响应头:
 
 ```json
 {
@@ -207,7 +213,7 @@
 
 `dimension` 告诉你具体是哪一层限流触发的——网关按 IP / 按 key 的频率闸、租户维度的整体频率闸,或者业务层按资源维度的配额闸(比如某个 agent 的调用频率、图片上传的次数或存储字节数)。**但网关这一层的 429 不带 `dimension` 字段**(只有 `code` / `message` / `retry_after_s`)——解析时给 `dimension` 缺省兜底,别假设它总在。应对:按 `retry_after_s`(或 `Retry-After` 头)退避后重试,不要立刻重试。
 
-**第二种,工作区容量满了**(`QUOTA_EXCEEDED`)——只出现在文档上传接口,和 413 一样走统一信封,**但没有 `Retry-After` 响应头**,因为退避重试解决不了:
+**第二种,工作区容量满了**(`QUOTA_EXCEEDED`)——只出现在文档上传接口,和 413 一样能读到 `error.code`,**但没有 `Retry-After` 响应头**,因为退避重试解决不了:
 
 ```json
 {
@@ -221,7 +227,7 @@
 
 ## 500 —— 工作区服务端配置问题
 
-以下两种 500 出现在两个工作区接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载),统一信封:
+以下两种 500 出现在两个工作区接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载),能读到 `error.code`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
@@ -233,7 +239,7 @@
 
 触发条件是服务端工作区存储的权限配置有问题(比如共享 uid 没配对),不是你这边的请求有问题,也不是"这个用户 / 文件不存在"——刻意不降级成空列表或 404,免得把服务端配置问题伪装成正常的业务响应。应对:不是退避重试能解决的,联系你的租户管理员核实工作区存储配置。
 
-**上传接口(`POST /v1/agents/{agent_code}/uploads`)文档分支的落盘失败是另一个独立的 `code`**——`UPLOAD_FAILED`,统一信封:
+**上传接口(`POST /v1/agents/{agent_code}/uploads`)文档分支的落盘失败是另一个独立的 `code`**——`UPLOAD_FAILED`,能读到 `error.code`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "UPLOAD_FAILED", "message": "workspace write failed" } }
@@ -263,11 +269,11 @@
 
 触发条件是服务端没有配置好对应的存储通路——图片走的对象存储、文档走的沙箱工作区,任一个没接好都会触发。这是部署 / 配置问题,不是你这边能解决的,联系你的租户管理员;重试没用。
 
-**另外还有一种 503 没有 `error.code`**:发起 run 时,如果服务端的配额引擎本身不可用,响应是裸 `{"detail": "quota_engine_unavailable"}`,连 `{success, data, error}` 信封都没有(上传接口遇到同一种故障时会包成统一信封的 `UPLOAD_UNAVAILABLE`,不是这种裸形状)。概率很低,但要知道这种形状存在——别假设 503 一定能读到 `error.code`。
+**另外还有一种 503 没有 `error.code`**:发起 run 时,如果服务端的配额引擎本身不可用,响应是裸 `{"detail": "quota_engine_unavailable"}`,连 `{success, data, error}` 这个形状都不是(上传接口遇到同一种故障时会包成能读到 `error.code` 的 `UPLOAD_UNAVAILABLE`,不是这种裸形状)。概率很低,但要知道这种形状存在——别假设 503 一定能读到 `error.code`。
 
 ## 504 —— 请求超过了你自己设的截止时间
 
-只有你自己在请求上带了 `X-Expert-Work-Deadline-Ms` 头(见 [通用约定](./conventions)),且这个时间戳已经过去,才会触发——服务端不会主动给你的请求安一个截止时间,不用这个头就不会遇到这个状态码。统一信封:
+只有你自己在请求上带了 `X-Expert-Work-Deadline-Ms` 头(见 [通用约定](./conventions)),且这个时间戳已经过去,才会触发——服务端不会主动给你的请求安一个截止时间,不用这个头就不会遇到这个状态码。能读到 `error.code`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "DEADLINE_EXCEEDED", "message": "X-Expert-Work-Deadline-Ms has already passed." } }
