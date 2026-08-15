@@ -1604,15 +1604,30 @@ READ_TIMEOUT_S = 30  # 自己设的读超时,不能用默认的"无限等"
 
 
 def iter_sse_frames(response):
-    buffer = ""
+    """
+    按行读(response.readline()),攒到一个空行(帧结束标记)才 yield 整帧。
+
+    **不要**改用 response.read(1024) 这种按固定字节数读的写法——`response` 是 chunked
+    传输编码,Python 的 http.client 为了凑够 1024 字节,会在当前已到手的数据不够时
+    反复等下一个 HTTP chunk;这条连接一旦读超时,已经到手但不满 1024 字节的数据会被
+    整个丢弃(不会部分返回),表现为"服务端明明发了 metadata 帧,客户端却什么都没
+    收到就超时"——这个坑比"半截帧"更隐蔽,断线重连场景下会直接导致 cursor 永远停在
+    None、每次重连都不带 since_seq,和游标丢失是两个独立但会叠加的问题。
+    readline() 天然按需向底层多次取数据直到凑出一整行,不会有这个"为了凑够定长反而
+    卡住"的毛病。
+    """
+    lines = []
     while True:
-        chunk = response.read(1024)
-        if not chunk:
-            return
-        buffer += chunk.decode("utf-8")
-        while "\n\n" in buffer:
-            raw_frame, buffer = buffer.split("\n\n", 1)
-            yield raw_frame
+        raw_line = response.readline()
+        if not raw_line:
+            return  # 连接关闭
+        line = raw_line.decode("utf-8").rstrip("\n")
+        if line == "":
+            if lines:
+                yield "\n".join(lines)
+                lines = []
+            continue
+        lines.append(line)
 
 
 def parse_frame(raw_frame):
@@ -1631,48 +1646,62 @@ def parse_frame(raw_frame):
     return event, data, seq
 
 
+class Cursor:
+    """可变的游标容器——见下面 consume_one_connection 为什么必须用它而不是普通返回值。"""
+
+    def __init__(self):
+        self.value = None  # None = 还没见过任何一帧
+
+
 def consume_one_connection(response, cursor):
     """
-    消费一条已建立的连接,返回 (done, new_cursor)。
-    done=True 表示收到了 end,整个 run 已经结束。
-    done=False 表示这条连接被 truncated 或读超时打断,要用 new_cursor 重连。
+    消费一条已建立的连接,返回是否收到了 end(真正结束)。
+
+    cursor 用可变容器(Cursor 实例)传入、原地更新 cursor.value,而不是"处理完再一次性
+    返回"——读超时是用抛异常(socket.timeout)实现的,如果 cursor 只在这个函数正常
+    return 时才回传给调用方,一旦中途超时抛出,这条连接里已经确认过的 seq 会全部丢失,
+    下次重连还是带着旧的 since_seq,拿到的还是这条连接里已经处理过的帧——会卡成死循环。
+    用同一个 Cursor 实例原地更新,不管这个函数是正常返回还是抛异常退出,调用方读到的都是
+    目前为止真实见过的最大 seq。
     """
     for raw_frame in iter_sse_frames(response):
         if not raw_frame.strip():
             continue
         event, data, seq = parse_frame(raw_frame)
         if seq is not None:
-            cursor = seq if cursor is None else max(cursor, seq)  # 见过的最大 seq,不是最后一帧的 seq
+            # 见过的最大 seq,不是最后一帧的 seq
+            cursor.value = seq if cursor.value is None else max(cursor.value, seq)
 
         if event == "end":
             print("run 结束,status =", data["status"])
-            return True, cursor
+            return True
         if event == "truncated":
             print("这一页到此为止(未结束),next_seq =", data["next_seq"])
-            return False, data["next_seq"]  # 直接拿 next_seq 当下一次 since_seq
+            cursor.value = data["next_seq"]  # 直接拿 next_seq 当下一次 since_seq
+            return False
         if event is not None:
             print(event, data)
 
-    return False, cursor  # 连接被关闭但没收到 end(比如读超时),外层用当前 cursor 重连
+    return False  # 连接被关闭但没收到 end(比如读超时),外层用当前 cursor 重连
 
 
 def consume_with_reconnect(user_id, run_id):
-    cursor = None  # None = 还没见过任何一帧,首次连接不带 since_seq
+    cursor = Cursor()  # cursor.value is None = 还没见过任何一帧,首次连接不带 since_seq
     done = False
 
     while not done:
         params = {"user_id": user_id}
-        if cursor is not None:
-            params["since_seq"] = cursor
+        if cursor.value is not None:
+            params["since_seq"] = cursor.value
         query = urllib.parse.urlencode(params)
         url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs/{run_id}/events?{query}"
 
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})
         try:
             with urllib.request.urlopen(req, timeout=READ_TIMEOUT_S) as response:
-                done, cursor = consume_one_connection(response, cursor)
+                done = consume_one_connection(response, cursor)
         except (urllib.error.URLError, socket.timeout):
-            # 读超时或连接中断——不重新调 /runs,带着当前 cursor 原样重连
+            # 读超时或连接中断——不重新调 /runs,带着当前 cursor(已经原地更新过)原样重连
             continue
 
 
