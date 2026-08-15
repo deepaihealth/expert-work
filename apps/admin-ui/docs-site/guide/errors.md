@@ -101,7 +101,7 @@
 
 ## 403 —— scope 不足 / 其它权限阻断
 
-**scope 不够**是最常见的 403 场景——比如拿一把只有 `read` scope 的 key 去调 `POST /v1/agents/{agent_code}/runs`(这个接口要求 `write`)。这类 403 只有 `detail`,**没有 `error.code`**:
+**scope 不够**是最常见的 403 场景——比如拿一把只有 `read` scope 的 key 去调 `POST /v1/agents/{agent_code}/runs`(这个接口要求 `write`)。这类 403 读不到 `error.code`——码在 `detail.code`:
 
 ```json
 { "detail": { "code": "FORBIDDEN", "message": "principal lacks required role" } }

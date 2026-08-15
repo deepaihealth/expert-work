@@ -12,7 +12,7 @@
 
 所以客户端必须自己兜:设一个符合你业务的读超时(别用默认的"无限等"),超时后直接重新发起同一条请求重连,而不是重新调 `/runs`(那会开启新的一轮 run)。
 
-**重连时一定要带上 `since_seq`**,而且带的是你已经见过的**最大** seq——服务端会只发它之后的帧。不带 `since_seq` 不会报错,但服务端会把这个 run **从第 0 帧起整个重发一遍**,你已经处理过的部分会全部再来一次。细节和坑见下面 [断线重连](#断线重连)。
+**重连时一定要带上 `since_seq`**,而且带的是你已经见过的**最大** seq——服务端会只发它之后的帧。不带 `since_seq` 不会报错,但服务端会把这个 run **从第 0 帧起整个重发一遍**,你已经处理过的部分会全部再来一次。细节和坑见下面 [断线重连](#_5-6-断线重连)。
 
 只想粗粒度知道 run 结束没有、不想挂着等,调 `GET /v1/agents/{agent_code}/sessions?user_id=…` 看每项的 `running` 布尔字段。
 :::
@@ -125,7 +125,7 @@ data: {"memory_writeback": null}
 | 字段 | 含义 |
 |---|---|
 | `messages` | 这一步新产出的消息(数组,可能是空数组) |
-| `step_count` | 到这一步为止 agent 已经执行的步数;**只出现在 `agent` 节点的写入里**,`tools` 节点没有这个字段 |
+| `step_count` | 这一步的编号,**从 `1` 开始**;只出现在 `agent` 节点的写入里,`tools` 节点没有这个字段 |
 | `_duration_ms` | 距上一帧过去了多少毫秒(平台注入,每个非 `null` 的节点写入都有) |
 
 其余通道是内部调度用的,不保证稳定——列在这里只是免得你以为自己漏读了:
@@ -249,13 +249,13 @@ Wrote▁ 11▁ bytes▁ to▁ probe_note.txt
 
 ```
 event: token
-data: {"step": 0, "channel": "content", "text": "部分答案片段"}
+data: {"step": 1, "channel": "content", "text": "部分答案片段"}
 
 event: token
-data: {"step": 0, "channel": "reasoning", "text": "让我想想..."}
+data: {"step": 1, "channel": "reasoning", "text": "让我想想..."}
 
 event: token
-data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
+data: {"step": 1, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 ```
 
 - `step`——这个片段属于第几个 agent 步骤。
@@ -266,7 +266,7 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 把 `token` 当纯预览用:
 
 1. 按 `step` 把 `token.text` 累积起来做实时打字机效果。
-2. 同一个 `step` 的 `updates` 帧一到,就用它替换掉之前攒的预览——`updates` 里的内容才是过了完整输出安全审查的最终结果;如果这一步被安全策略拦了,`updates` 里会是拒答文案,直接覆盖预览。
+2. 同一个 `step` 的 `updates` 帧一到,就用它替换掉之前攒的预览——这里的 `step` 和 `updates` 帧里 `agent` 节点写入的 `step_count` 是同一个编号(都从 `1` 开始),按它配对;`updates` 里的内容才是过了完整输出安全审查的最终结果;如果这一步被安全策略拦了,`updates` 里会是拒答文案,直接覆盖预览。
 3. **断线重连时 `token` 帧不会被重新推给你**——只有 `metadata` / `updates` / `worker` / `guard` / `compaction` / `approval` / `retry` / `error` 这些落库的帧会回放。重连后凭这些帧重建状态,不要指望拿回丢失的逐 token 预览。
 4. `token` 帧**没有 `id:`、不占 seq 序号**,所以它既不影响你的重连游标,也不会因为重复或丢失而破坏去重。
 
