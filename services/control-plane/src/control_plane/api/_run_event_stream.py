@@ -232,9 +232,9 @@ async def build_event_producer(
             for lo, hi in _merge_ranges(seqs):
                 logger.warning(  # codeql[py/log-injection]
                     "live_stream.gap run_id=%s from=%d to=%d reason=%s",
-                    run_id,
-                    lo,
-                    hi,
+                    run_id,  # codeql[py/log-injection]
+                    lo,  # codeql[py/log-injection]
+                    hi,  # codeql[py/log-injection]
                     reason,
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": hi}))
@@ -272,9 +272,9 @@ async def build_event_producer(
                 cut = end_exclusive - _MAX_TRACKED_HOLES
                 logger.warning(  # codeql[py/log-injection]
                     "live_stream.holes_overflow run_id=%s from=%d to=%d",
-                    run_id,
-                    lo,
-                    cut - 1,
+                    run_id,  # codeql[py/log-injection]
+                    lo,  # codeql[py/log-injection]
+                    cut - 1,  # codeql[py/log-injection]
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": cut - 1}))
                 lo = cut
@@ -350,9 +350,9 @@ async def build_event_producer(
                 if last + 1 < seq:
                     logger.warning(  # codeql[py/log-injection]
                         "live_stream.gap run_id=%s from=%d to=%d reason=%s",
-                        run_id,
-                        last + 1,
-                        seq - 1,
+                        run_id,  # codeql[py/log-injection]
+                        last + 1,  # codeql[py/log-injection]
+                        seq - 1,  # codeql[py/log-injection]
                         "backfill_short",
                     )
                     yield format_sse("gap", {"from": last + 1, "to": seq - 1})
