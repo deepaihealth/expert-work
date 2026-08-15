@@ -50,6 +50,19 @@ _RUN_STATUS_END_STATUS: dict[RunStatus, str] = {
 _MAX_TRACKED_HOLES = 4096
 
 
+#: CodeQL 的 ``py/log-injection`` 会盯上本模块三条 ``logger.warning`` —— 它追踪
+#: ``since_seq`` 这个 query 参数流进日志。**判定为误报,理由逐项可核**:
+#:
+#: * ``since_seq`` 的声明是 ``Annotated[int | None, Query(ge=0)]`` —— pydantic
+#:   校验过的整数,不是字符串;由它派生的 ``last`` / ``lo`` / ``hi`` / ``seq``
+#:   同样是整数,格式符也已收紧成 ``%d``(真混进字符串会当场抛错,而不是默默拼进去)。
+#: * ``run_id`` 是路由上的 ``UUID`` 路径参数,由 FastAPI 解析成 ``UUID`` 对象。
+#: * ``reason`` 在全部四个调用点都是模块内的字面量常量,不接受外部输入。
+#:
+#: 日志注入的前提是把换行塞进日志行伪造条目;上述取值里没有任何一个能承载换行。
+#: 若将来这三条日志新增了**字符串**参数,必须重新评估并删掉对应的抑制注释。
+
+
 def _merge_ranges(seqs: set[int]) -> list[tuple[int, int]]:
     """把一组 seq 合并成连续闭区间 —— 一个洞段只发一帧 ``gap``。"""
     merged: list[tuple[int, int]] = []
@@ -217,8 +230,12 @@ async def build_event_producer(
             "落库空洞被判死刑" 还是 "缺口分支翻页也补不齐" 能省一轮猜。"""
             frames: list[bytes] = []
             for lo, hi in _merge_ranges(seqs):
-                logger.warning(
-                    "live_stream.gap run_id=%s from=%d to=%d reason=%s", run_id, lo, hi, reason
+                logger.warning(  # codeql[py/log-injection]
+                    "live_stream.gap run_id=%s from=%d to=%d reason=%s",
+                    run_id,
+                    lo,
+                    hi,
+                    reason,
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": hi}))
             return frames
@@ -253,8 +270,11 @@ async def build_event_producer(
             # 所以百万级的洞也只花常数内存。
             if end_exclusive - lo > _MAX_TRACKED_HOLES:
                 cut = end_exclusive - _MAX_TRACKED_HOLES
-                logger.warning(
-                    "live_stream.holes_overflow run_id=%s from=%d to=%d", run_id, lo, cut - 1
+                logger.warning(  # codeql[py/log-injection]
+                    "live_stream.holes_overflow run_id=%s from=%d to=%d",
+                    run_id,
+                    lo,
+                    cut - 1,
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": cut - 1}))
                 lo = cut
@@ -328,7 +348,7 @@ async def build_event_producer(
                     if len(rows) < MAX_LIST_LIMIT:
                         break
                 if last + 1 < seq:
-                    logger.warning(
+                    logger.warning(  # codeql[py/log-injection]
                         "live_stream.gap run_id=%s from=%d to=%d reason=%s",
                         run_id,
                         last + 1,
