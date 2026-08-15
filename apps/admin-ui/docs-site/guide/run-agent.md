@@ -1,4 +1,4 @@
-# 调用 Agent
+# 4 接口详情
 
 本篇是 `POST /v1/agents/{agent_code}/runs` 的完整参数表——发起一次 Agent 对话/任务执行的核心接口。
 
@@ -60,11 +60,11 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   }'
 ```
 
-**注意**:这三种 `inputs` 校验失败**不是** `{success, data, error}` 信封,而是 FastAPI 默认的裸 `{"detail": "..."}` 字符串——比如未声明键会是 `{"detail": "unknown input variable: <key>"}`。别假设这条路径上也能读到 `error.code`,细节见 [错误码与限流](./errors)。
+**注意**:这三种 `inputs` 校验失败**不是** `{success, data, error}` 这个形状,而是只有一个 `detail` 字段的简易格式字符串——比如未声明键会是 `{"detail": "unknown input variable: <key>"}`。别假设这条路径上也能读到 `error.code`,细节见 [错误码与限流](./errors)。
 
 ### 三条硬上限
 
-不管 Agent 声明了多少模板变量,`inputs` 本身还有三条硬上限,**这三条走统一信封**(与上面三种"裸 `detail`"形状不同),三条互相独立、不是互相替代:
+不管 Agent 声明了多少模板变量,`inputs` 本身还有三条硬上限,**这三条能读到 `error.code`**(与上面三种"裸 `detail`"形状不同),三条互相独立、不是互相替代:
 
 | 上限 | 超限时的 `error.code` |
 |---|---|
@@ -209,7 +209,7 @@ Idempotency-Key: order-8899
 
 - **这份"key → run"的记忆永久保留,没有过期时间**——不会因为时间久了就自动允许同一个 key 再次绑定不同的请求体。
 
-`mode: "queue"` 的重试拿到的是和首次请求**完全同形状**的 202 信封(见下方),`data.run_id` 与首次一致:
+`mode: "queue"` 的重试拿到的是和首次请求**完全同形状**的 202 响应体(见下方),`data.run_id` 与首次一致:
 
 ```bash
 curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
@@ -241,8 +241,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 }
 ```
 
-::: warning 破坏性变更——202 响应体已改成统一信封
-这个信封形状是当前的、也是唯一正确的形状。如果你的对接代码是在这次更新之前写的,请检查它有没有直接读顶层的 `run_id` / `thread_id` / `status`——旧版本的响应体是不带信封的扁平结构:
+::: warning 破坏性变更——202 响应体已改成 `{success, data, error}` 形状
+这个形状是当前的、也是唯一正确的形状。如果你的对接代码是在这次更新之前写的,请检查它有没有直接读顶层的 `run_id` / `thread_id` / `status`——旧版本的响应体是不带 `success`/`data`/`error` 包裹的扁平结构:
 
 ```json
 { "run_id": "...", "thread_id": "...", "status": "queued" }
@@ -385,7 +385,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
   -o report.pdf
 ```
 
-成功响应是文件字节流本身(**不是** `{success, data, error}` 信封——信封只包裹错误响应)。`Content-Type` 按 `path` 的扩展名推断:图片(`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico`)和结构化文本 / 代码类扩展名(`.json` / `.yaml` / `.toml` 等,以及 `.txt` / `.py` / `.md` 这类纯文本 / 代码)带 `Content-Disposition: inline`,浏览器可以直接预览。`.html` / `.htm` / `.xhtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.xslt` / `.mathml` 这类"可执行 / 可交互内容"扩展名,以及任何未识别的扩展名(含无扩展名文件),一律强制 `Content-Disposition: attachment`——前一类是刻意的 XSS 防护(避免浏览器把这些当成同源 HTML/SVG 内联渲染,执行里面夹带的脚本),后一类是"宁可多一次没必要的下载,也不要猜错类型"。响应始终带 `X-Content-Type-Options: nosniff`。
+成功响应是文件字节流本身(**不是** `{success, data, error}` 这个形状——这个形状只用来包裹错误响应)。`Content-Type` 按 `path` 的扩展名推断:图片(`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico`)和结构化文本 / 代码类扩展名(`.json` / `.yaml` / `.toml` 等,以及 `.txt` / `.py` / `.md` 这类纯文本 / 代码)带 `Content-Disposition: inline`,浏览器可以直接预览。`.html` / `.htm` / `.xhtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.xslt` / `.mathml` 这类"可执行 / 可交互内容"扩展名,以及任何未识别的扩展名(含无扩展名文件),一律强制 `Content-Disposition: attachment`——前一类是刻意的 XSS 防护(避免浏览器把这些当成同源 HTML/SVG 内联渲染,执行里面夹带的脚本),后一类是"宁可多一次没必要的下载,也不要猜错类型"。响应始终带 `X-Content-Type-Options: nosniff`。
 
 #### `path` 的合法形态
 

@@ -1,6 +1,6 @@
 # 4.2 / 4.7 取消 run 与审批决策
 
-本篇是「4 接口详情」的两个补充端点——取消一次正在执行的 run,以及对一个暂停等待人工审批的 run 下达决策。参数表之外的通用约定(信封形状、`user_id` 规则、幂等性作用域)见 [通用约定](./conventions);认证与 scope 见 [认证](./auth)。
+本篇是「4 接口详情」的两个补充端点——取消一次正在执行的 run,以及对一个暂停等待人工审批的 run 下达决策。参数表之外的通用约定(响应格式、`user_id` 规则、幂等性作用域)见 [通用约定](./conventions);认证与 scope 见 [认证](./auth)。
 
 ## 4.2 取消 run
 
@@ -44,7 +44,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 | 404 | `RUN_NOT_FOUND` | `run_id` 不存在,或者存在但不属于这个 `(user_id, agent_code)` 组合——**两种情况返回同一个不透明 404,不区分**。这里的"不透明"和其它端点的存在性隐藏是同一条规则,但取消场景容易被误判:收到这个 404 **不代表"run 还没创建好、稍后重试就有"**——如果你确信 `run_id` / `user_id` / `agent_code` 三者都对,这个 404 就是"这不是你的 run",重试不会有不同结果。 |
 | 422 | `INVALID_REQUEST` | `user_id` 缺失,或超过 255 字符(请求体字段校验) |
 | 422 | `INVALID_USER_ID` | `user_id` 传了但去掉首尾空白后是空字符串(比如整串都是空格)——能过字段校验(长度 ≥ 1),但过不了后面的归属解析 |
-| 403 | `FORBIDDEN`(裸 `detail` 形状,非统一信封) | key 的 scope 不足(缺 `write`) |
+| 403 | `FORBIDDEN`(只有 `detail`,**没有 `error.code`**) | key 的 scope 不足(缺 `write`) |
 
 401 相关的 key 失效情况和全站规则一致,见 [错误码与限流](./errors)。
 
@@ -105,13 +105,13 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:decide \
 | 404 | `APPROVAL_NOT_FOUND` | 归属校验通过,但这个 `run_id` 名下压根没有一条审批记录 |
 | 409 | `APPROVAL_CONFLICT` | 这条审批已经被决定过(重复决策,或与另一次并发决策竞争后落败),且这次请求的 `idempotency_key` 对不上已落库的那次决策(对上了则不是失败,走幂等重放) |
 | 409 | `SESSION_NOT_BOUND` | 这个 run 所在的会话没有绑定 `agent_name` / `agent_version`——内部状态异常,正常对接流程不会遇到 |
-| 403 | `AGENT_DISABLED`(统一信封,和 scope 无关) | 这个 `agent_code` 已被管理员下线 |
-| 403 | `TENANT_SUSPENDED`(统一信封,和 scope 无关) | 租户被暂停 |
+| 403 | `AGENT_DISABLED`(**能读到 `error.code`**,和 scope 无关) | 这个 `agent_code` 已被管理员下线 |
+| 403 | `TENANT_SUSPENDED`(**能读到 `error.code`**,和 scope 无关) | 租户被暂停 |
 | 404 | `AGENT_NOT_FOUND` | agent 的 manifest 记录本身已经不存在(比这个会话绑定的版本更底层的缺失) |
 | 410 | `AGENT_DELETED` | agent 已被(软)删除 |
 | 422 | `AGENT_BUILD_FAILED` | agent manifest 构建失败——服务端配置问题,不是你这边能解决的 |
 | 422 | `INVALID_REQUEST` | 请求体字段没通过基础校验,比如 `decision: "modify"` 却没传 `modified_args`,或者非 `modify` 却传了 `modified_args`,或者 `user_id` 缺失/超过 255 字符 |
 | 422 | `INVALID_USER_ID` | `user_id` 传了但去掉首尾空白后是空字符串——和「4.2 取消 run」同一条规则 |
-| 403 | `FORBIDDEN`(裸 `detail` 形状,非统一信封) | key 的 scope 不足(缺 `write`) |
+| 403 | `FORBIDDEN`(只有 `detail`,**没有 `error.code`**) | key 的 scope 不足(缺 `write`) |
 
 401 相关的 key 失效情况和全站规则一致,见 [错误码与限流](./errors)。

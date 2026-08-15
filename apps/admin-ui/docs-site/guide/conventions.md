@@ -49,7 +49,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 ## 2.4 统一响应格式
 
-大多数响应是这个信封:
+大多数响应是这个标准格式:
 
 成功:
 
@@ -65,7 +65,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 { "success": false, "data": null, "error": { "code": "SOME_CODE", "message": "..." } }
 ```
 
-**但这个信封不是全站统一的**——一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)直接用了 FastAPI 默认的裸 `{"detail": ...}` 形状,`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象。写响应解析逻辑时不要假设所有错误都走同一个信封——完整的形状对照表见 [错误码与限流](./errors)。
+**但不是所有错误都能读到 `error.code`**——一部分错误(比如 scope 不足的 403、`inputs` 模板变量校验失败的 422)是只有一个 `detail` 字段的简易格式,`detail` 有时是字符串,有时是 `{"code":..., "message":...}` 对象。写响应解析逻辑时不要假设所有错误都能读到 `error.code`——完整的形状对照表见 [错误码与限流](./errors)。
 
 ## 2.5 限流与配额
 
