@@ -81,6 +81,7 @@ FIELD_TIERS: dict[str, FieldTier] = {
     "vision": FieldTier.TENANT_OWNED,
     "cache": FieldTier.TENANT_OWNED,
     "description": FieldTier.TENANT_OWNED,
+    "display_name": FieldTier.TENANT_OWNED,
     "triggers": FieldTier.TENANT_OWNED,
     "tenant_config": FieldTier.TENANT_OWNED,
     "dynamic_context": FieldTier.TENANT_OWNED,
