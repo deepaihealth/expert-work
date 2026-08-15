@@ -78,9 +78,19 @@ def build_external_agent_catalog_router() -> APIRouter:
         """
         tenant_id: UUID = request.state.tenant_id
 
-        # ACTIVE 版本决定「这个 code 能不能调」,也是分页的主驱动。同一个
+        # ACTIVE 版本决定「这个 code 能不能调」,也是分页的唯一驱动。同一个
         # name 可能有多个版本行,按 name 去重 —— 第三方不选版本,平台自动用
         # ACTIVE 的那个。
+        #
+        # 只有 DEPRECATED / DELETED 版本、没有任何 ACTIVE 版本的 code **不出
+        # 现在目录里**(而不是以 available: false 出现),原因有三:
+        # 1. 目录回答的是「这个租户有哪些 agent 可以调」——一个 code 没有任何
+        #    可调版本 = 已退役,不属于这个问题的答案。
+        # 2. disabled 和 deprecated-only 语义不同,不该一致处理:disabled 是
+        #    kill switch,可逆的临时管理动作,置灰等它回来对客户端有意义;
+        #    deprecated-only 是版本生命周期的终态,不会自己变回可用,列一个
+        #    永远 false 且不会变的条目只是噪音。
+        # 3. deprecated 是租户内部的版本管理状态,不该对第三方暴露。
         active = await repo.list_by_tenant(
             tenant_id=tenant_id, status=AgentSpecStatus.ACTIVE, limit=limit, offset=offset
         )
@@ -101,32 +111,6 @@ def build_external_agent_catalog_router() -> APIRouter:
                     "display_name": body.display_name or record.name,
                     "description": body.description,
                     "available": record.name not in disabled,
-                }
-            )
-
-        # 第二道判据的另一半:一个 code **只有** DEPRECATED 版本、没有任何
-        # ACTIVE 版本时,run 端点会 404 AGENT_NOT_FOUND —— 目录必须把它也列
-        # 出来(而不是让它凭空消失),否则「available」这件事本身就没法对
-        # 这类 agent 下断言。只查 DEPRECATED(不查 status=None 的全量,那样
-        # 会连 DELETED 的软删行也捞回来,一个已经不存在的 agent 不该出现在
-        # 对外目录里)。这一段不占用 ``limit``/``offset`` 的分页配额 —— 常见
-        # 路径(所有 agent 都有 ACTIVE 版本)与改动前完全一致。
-        deprecated = await repo.list_by_tenant(
-            tenant_id=tenant_id, status=AgentSpecStatus.DEPRECATED, limit=limit, offset=offset
-        )
-        for record in deprecated:
-            if record.name in seen:
-                continue  # 有 ACTIVE 版本在,上面已经列过了。
-            seen.add(record.name)
-            body = record.spec.spec
-            agents.append(
-                {
-                    "agent_code": record.name,
-                    "display_name": body.display_name or record.name,
-                    "description": body.description,
-                    # 没有 ACTIVE 版本 → 不管是否被禁用,run 端点都会拒绝
-                    # (404 或 403),所以这里恒为 False。
-                    "available": False,
                 }
             )
 

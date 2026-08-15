@@ -222,9 +222,16 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx_write: 
 
 
 @pytest.mark.asyncio
-async def test_agent_with_no_active_version_is_unavailable(ctx: _Ctx) -> None:
-    """``available`` 的第二道判据:必须存在 ``status=ACTIVE`` 的版本。
-    只有 DEPRECATED 版本的 agent,run 端点会 404 AGENT_NOT_FOUND。"""
+async def test_agent_with_no_active_version_is_absent_from_the_catalog(ctx: _Ctx) -> None:
+    """目录 = 「能调什么」。一个 code 只剩 DEPRECATED 版本时没有任何可调版本
+    (run 端点会 404 AGENT_NOT_FOUND),所以它不出现在目录里 —— 而不是以
+    ``available: false`` 出现。
+
+    与 kill-switch 禁用**刻意不同**:那是可逆的临时状态,置灰等它回来是对的;
+    只剩 deprecated 是终态,列一个永远 false 的条目对客户端是噪音,而且
+    deprecated 属于租户内部的版本管理状态,不该对第三方暴露。
+    """
+    await ctx.seed_agent("healthy")
     await ctx.seed_agent("deprecated-only")
     await ctx.app.state.agent_spec_repo.update_status(
         tenant_id=ctx.tenant_id,
@@ -235,8 +242,8 @@ async def test_agent_with_no_active_version_is_unavailable(ctx: _Ctx) -> None:
 
     resp = await ctx.client.get("/v1/agent-catalog", headers=ctx.headers)
 
-    agents = {a["agent_code"]: a for a in resp.json()["data"]["agents"]}
-    assert agents["deprecated-only"]["available"] is False
+    codes = {a["agent_code"] for a in resp.json()["data"]["agents"]}
+    assert codes == {"healthy"}, f"deprecated-only 不该出现在目录里,实际: {codes}"
 
 
 @pytest.mark.asyncio
