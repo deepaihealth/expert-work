@@ -71,6 +71,7 @@ export default defineConfig({
               { text: "7.6 联调自测清单", link: "/guide/best-practices#_7-6-联调自测清单" },
             ],
           },
+          { text: "8 附录:多语言示例", link: "/guide/examples" },
         ],
       },
     ],
