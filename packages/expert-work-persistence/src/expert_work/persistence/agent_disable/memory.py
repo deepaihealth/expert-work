@@ -48,3 +48,11 @@ class InMemoryAgentDisableStore(AgentDisableStore):
             )
             self._rows[(tenant_id, agent_name)] = record
             return record
+
+    async def list_disabled_names(self, *, tenant_id: UUID) -> set[str]:
+        async with self._lock:
+            return {
+                name
+                for (row_tenant, name), record in self._rows.items()
+                if row_tenant == tenant_id and record.disabled
+            }
