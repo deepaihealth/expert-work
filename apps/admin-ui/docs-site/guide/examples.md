@@ -42,18 +42,30 @@ AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
 def iter_sse_frames(response):
     """
-    从响应里边读边攒 buffer,按空行("\n\n")分帧——①不是按行分帧。
-    一帧可能有 id / event / data 好几行,按行处理会把一帧拆散、data 里的换行也会被切碎。
+    按行读(response.readline()),攒到一个空行才 yield 整帧——①一帧可能有
+    id / event / data 好几行,必须攒够一整帧(遇到空行)才能处理,逐行单独处理会把
+    一帧拆散。
+
+    这里特意用 response.readline() 而不是 response.read(1024) 这种按固定字节数读的
+    写法——`response` 是 chunked 传输编码,Python 的 http.client 为了凑够调用方要求
+    的字节数,会在当前已到手的数据不够时反复等下一个 HTTP chunk;这条连接一旦读超时,
+    已经到手但不满请求字节数的数据会被整个丢弃。哪怕不超时,也会表现成"stream 模式
+    不流式、界面攒够一批才一次性出字、看起来卡住"——容易被第三方误判成平台的问题。
+    readline() 天然按需向底层多次取数据直到凑出一整行,一行(遇到 SSE 帧内单个字段的
+    行尾 "\n")一到就返回,不会有这个"为了凑够定长反而卡住"的毛病。
     """
-    buffer = ""
+    lines = []
     while True:
-        chunk = response.read(1024)
-        if not chunk:
-            return
-        buffer += chunk.decode("utf-8")
-        while "\n\n" in buffer:
-            raw_frame, buffer = buffer.split("\n\n", 1)
-            yield raw_frame
+        raw_line = response.readline()
+        if not raw_line:
+            return  # 连接关闭
+        line = raw_line.decode("utf-8").rstrip("\n")
+        if line == "":
+            if lines:
+                yield "\n".join(lines)
+                lines = []
+            continue
+        lines.append(line)
 
 
 def parse_frame(raw_frame):
@@ -1238,16 +1250,23 @@ def run_stream_and_wait(user_id, input_text, session_id=None):
 
     with urllib.request.urlopen(req) as response:
         new_session_id = response.headers.get("X-Expert-Work-Session-Id")
-        buffer = ""
+        # 按行读(response.readline()),不要用 response.read(1024) 这种按固定字节数读的
+        # 写法——chunked 传输编码下会为了凑够字节数反复等下一个 HTTP chunk,响应会被
+        # 攒到凑够一批才处理甚至在读超时时丢数据,完整原因见 8.1 的 iter_sse_frames 注释。
+        lines = []
         while True:
-            chunk = response.read(1024)
-            if not chunk:
+            raw_line = response.readline()
+            if not raw_line:
                 break
-            buffer += chunk.decode("utf-8")
-            while "\n\n" in buffer:
-                raw_frame, buffer = buffer.split("\n\n", 1)
-                if "event: end" in raw_frame:
-                    return new_session_id
+            line = raw_line.decode("utf-8").rstrip("\n")
+            if line == "":
+                if lines:
+                    raw_frame = "\n".join(lines)
+                    lines = []
+                    if "event: end" in raw_frame:
+                        return new_session_id
+                continue
+            lines.append(line)
 
     return new_session_id
 
