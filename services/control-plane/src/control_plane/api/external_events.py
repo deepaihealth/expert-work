@@ -6,8 +6,9 @@ ownership gate differs. Three known limitations carried over verbatim, all
 scheduled for P3 (see docs/superpowers/specs/2026-08-11-external-api-v1-design.md §六):
 
 1. ``token`` frames are live-only — a replay never returns them.
-2. ``since_seq`` is honoured on the replay path only; the live path ignores it.
-3. Replay is capped at one page and appends ``end`` even when truncated.
+2. (P3 PR-1 Task 3 已修)``since_seq`` 两条分支都生效。
+3. (P3 PR-1 Task 4 已修)回放仍是一页,但截断时以 ``truncated`` 帧 +
+   ``X-Expert-Work-Next-Seq`` 头收尾,不再补一个假的 ``end``。
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def _get_runtime(request: Request) -> AgentRuntime:
     return request.app.state.agent_runtime  # type: ignore[no-any-return]
 
 
-def build_events_response(
+async def build_events_response(
     *,
     run: RunInfo,
     event_store: RunEventStore | None,
@@ -99,24 +100,32 @@ def build_events_response(
     for a caller that was already free to ignore headers it doesn't know.
     """
     is_terminal = run.status in TERMINAL_RUN_STATUSES
-    producer = build_event_producer(
+    plan = await build_event_producer(
         run_id=run.run_id,
-        is_terminal=is_terminal,
+        run_status=run.status,
         event_store=event_store,
         stream_bridge=stream_bridge,
         since_seq=since_seq,
         scope=None,
     )
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "X-Expert-Work-Run-Id": str(run.run_id),
+        "X-Expert-Work-Session-Id": str(run.thread_id),
+        "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
+    }
+    if plan.next_seq is not None:
+        # P3 PR-1 Task 4 —— 回放被截断。同一个值也在 body 末尾的 ``truncated``
+        # 帧里,**帧才是首选**:中间代理会剥掉不认识的响应头,而 body 不会被剥;
+        # 跨源调用时这个头还需要服务端 expose 才读得到,浏览器侧基本读不到。
+        # (别把理由写成"浏览器 EventSource 读不到响应头"—— EventSource 设不了
+        # Authorization / API-key 头,本来就用不了这套 API。)
+        headers["X-Expert-Work-Next-Seq"] = str(plan.next_seq)
     return StreamingResponse(
-        producer,
+        plan.producer,
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "X-Expert-Work-Run-Id": str(run.run_id),
-            "X-Expert-Work-Session-Id": str(run.thread_id),
-            "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
-        },
+        headers=headers,
     )
 
 
@@ -164,7 +173,7 @@ def build_external_events_router() -> APIRouter:
         except ExternalScopeError as exc:
             return external_error(exc)
 
-        return build_events_response(
+        return await build_events_response(
             run=run,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,

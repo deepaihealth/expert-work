@@ -228,7 +228,7 @@ def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
     )
 
 
-def _idempotent_run_response(
+async def _idempotent_run_response(
     run: RunInfo,
     *,
     mode: Literal["stream", "queue"],
@@ -252,7 +252,9 @@ def _idempotent_run_response(
     ``spawn_run`` there is no flat-body branch to preserve).
     """
     if mode == "stream":
-        return build_events_response(run=run, event_store=event_store, stream_bridge=stream_bridge)
+        return await build_events_response(
+            run=run, event_store=event_store, stream_bridge=stream_bridge
+        )
     return JSONResponse(
         status_code=202,
         content={
@@ -1174,7 +1176,7 @@ def build_agents_router() -> APIRouter:
                     )
                 # Same key, same fingerprint — hand back the original run
                 # untouched rather than spawning a duplicate.
-                return _idempotent_run_response(
+                return await _idempotent_run_response(
                     existing,
                     mode=payload.mode,
                     event_store=event_store,
@@ -1394,7 +1396,7 @@ def build_agents_router() -> APIRouter:
                     "this Idempotency-Key was already used with a different request",
                     422,
                 )
-            return _idempotent_run_response(
+            return await _idempotent_run_response(
                 winner,
                 mode=payload.mode,
                 event_store=event_store,

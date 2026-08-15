@@ -170,9 +170,13 @@ export function useHistoryTurns(): UseHistoryTurns {
         collected.push(frame);
         if (frame.event === "end") break;
       }
-      // The terminal-replay endpoint ALWAYS appends an ``end`` frame after the
-      // stored rows (runs.py ``_stream_replay``), so an empty run replays as a
-      // lone ``[{event:"end"}]``. Only mark ``done`` when the replay actually
+      // The terminal-replay endpoint appends an ``end`` frame after the stored
+      // rows (``_run_event_stream.py`` ``_stream_replay``), so an empty run
+      // replays as a lone ``[{event:"end"}]``. 一页装不下的长 run 以 ``truncated``
+      // 收尾而不发 ``end``,``streamRunEvents`` 会自己带 ``next_seq`` 翻页续拉,
+      // 所以到这里时"看得到 ``end``"依旧等价于"流走完了"—— 除非翻页也走不动了
+      // (那时 SDK 把 ``truncated`` 吐出来,这里照旧降级)。
+      // Only mark ``done`` when the replay actually
       // delivered renderable content AND completed; an empty replay
       // (no non-end frame) or a truncated one (no end frame) degrades to
       // ``error`` — which keeps the placeholder showing ``fallbackLines``

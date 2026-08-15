@@ -17,3 +17,14 @@ export function serverMsOf(id: string | null): number | null {
   const m = /^(\d{10,})-\d+$/.exec(id);
   return m === null ? null : Number(m[1]);
 }
+
+/** Extract the seq segment from an SSE frame id (`"{server_ms}-{seq}"`) —
+ *  the durable `run_event.seq`, which is what `since_seq` takes on reconnect.
+ *  `null` on a missing or malformed id, which covers every frame the server
+ *  deliberately sends without an `id:` line (`end` / `truncated` / `gap` /
+ *  `token` — see the SSE contract table). */
+export function seqOf(id: string | null): number | null {
+  if (id === null) return null;
+  const m = /^\d{10,}-(\d+)$/.exec(id);
+  return m === null ? null : Number(m[1]);
+}

@@ -43,7 +43,9 @@ export interface AuxNodeItem {
   durationMs: number | null;
 }
 export interface MarkerItem {
-  kind: "compaction" | "retry" | "error" | "approval" | "guard" | "end";
+  /** ``gap``(P3 PR-1)= 这一段帧在**这条连接**上补不到了 —— 只在 live 分支出现;
+   *  回放遇到落库空洞是静默跳过的,两条分支的缺口契约不同。 */
+  kind: "compaction" | "retry" | "error" | "approval" | "guard" | "end" | "gap";
   seq: number;
   receivedAt: string;
   serverMs?: number | null;
@@ -53,6 +55,14 @@ export interface MarkerItem {
 export type TimelineItem = AgentStep | AuxNodeItem | MarkerItem;
 
 const AI = "ai";
+/** ``end.status`` → 结束标记的文案与色调。**``paused`` 不是失败** —— 等人审批,
+ *  对话还会继续,所以用 pause 而不是 bad。 */
+const END_MARKER: Record<string, { text: string; tone: MarkerItem["tone"] }> = {
+  success: { text: "运行完成", tone: "good" },
+  paused: { text: "等待人工审批", tone: "pause" },
+  interrupted: { text: "运行已取消", tone: "warn" },
+  error: { text: "运行失败", tone: "bad" },
+};
 function obj(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {};
 }
@@ -139,8 +149,20 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
       push({ kind: "guard", receivedAt: at, tone: warn ? "warn" : "bad", text });
       continue;
     }
+    if (evt.event === "gap") {
+      // 服务端缓冲已经滚过这一段、而它们又还没落盘,所以**这条连接**补不到了 ——
+      // 不代表这些帧不存在,run 结束后重新回放通常能拿到。不是错误(别渲染成
+      // 红的),但也不能当未知帧丢掉:时间线上真的缺了一段。
+      const d = obj(evt.data);
+      push({ kind: "gap", receivedAt: at, tone: "warn",
+        text: `缺失第 ${int(d.from)}–${int(d.to)} 帧(本次连接补不到,重新回放通常能拿到)` });
+      continue;
+    }
     if (evt.event === "end") {
-      push({ kind: "end", receivedAt: at, tone: "good", text: "运行完成" });
+      // ``end`` 的 data 从 null 变成 {status, run_id}(P3 PR-1)。四值见契约实况
+      // 表 F;``timeout`` 后端已归到 ``error``。老流(data 为 null)落回"运行完成"。
+      const m = END_MARKER[str(obj(evt.data).status)] ?? END_MARKER.success;
+      push({ kind: "end", receivedAt: at, tone: m.tone, text: m.text });
       continue;
     }
     if (evt.event === "worker") continue; // 已由 parseWorkerFrames 预扫,挂在工具卡上

@@ -29,7 +29,7 @@ from control_plane.trigger_delivery import inject_delivery
 from expert_work.persistence import InMemoryThreadMetaStore
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.runs import DisconnectMode, RunManager
-from expert_work.runtime.stream_bridge import END_SENTINEL, InMemoryStreamBridge
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.sse import run_agent
@@ -50,7 +50,7 @@ class _EchoLLM:
 
 async def _drain(bridge: InMemoryStreamBridge, run_id: UUID) -> None:
     async for entry in bridge.subscribe(run_id, heartbeat_interval=5.0):
-        if entry is END_SENTINEL:
+        if is_end(entry):
             break
 
 

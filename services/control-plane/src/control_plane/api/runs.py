@@ -1716,23 +1716,28 @@ def build_runs_router() -> APIRouter:
         is_terminal = persisted.status in TERMINAL_RUN_STATUSES
         runtime: AgentRuntime = request.app.state.agent_runtime
 
-        producer = build_event_producer(
+        plan = await build_event_producer(
             run_id=run_id,
-            is_terminal=is_terminal,
+            run_status=persisted.status,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             since_seq=since_seq,
             scope=lambda: applied_scope(scope),
         )
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Expert-Work-Run-Id": str(run_id),
+            "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
+        }
+        if plan.next_seq is not None:
+            # P3 PR-1 Task 4 —— 回放被截断;同一个值也在 body 末尾的
+            # ``truncated`` 帧里。两个调用点的头集合必须一致。
+            headers["X-Expert-Work-Next-Seq"] = str(plan.next_seq)
         return StreamingResponse(
-            producer,
+            plan.producer,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Expert-Work-Run-Id": str(run_id),
-                "X-Expert-Work-Stream-Mode": "replay" if is_terminal else "live",
-            },
+            headers=headers,
         )
 
     @router.post(

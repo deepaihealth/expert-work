@@ -27,6 +27,7 @@ from expert_work.runtime.stream_bridge.base import (
     HEARTBEAT_SENTINEL,
     StreamBridge,
     StreamEvent,
+    is_end,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,14 @@ class _RunStream:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     ended: bool = False
     start_offset: int = 0
+    #: Terminal status handed to :meth:`InMemoryStreamBridge.publish_end`.
+    #: Lives per run — the end frame is minted from it at subscribe time
+    #: rather than stored on the module-level ``END_SENTINEL`` singleton,
+    #: which would leak one run's status into every other run's stream.
+    end_status: str | None = None
+    #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
+    #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
+    next_seq: int = 0
 
 
 class InMemoryStreamBridge(StreamBridge):
@@ -54,26 +63,21 @@ class InMemoryStreamBridge(StreamBridge):
     def __init__(self, *, queue_maxsize: int = 256) -> None:
         self._maxsize = queue_maxsize
         self._streams: dict[UUID, _RunStream] = {}
-        self._counters: dict[UUID, int] = {}
 
     # -- helpers ---------------------------------------------------------------
 
     def _get_or_create_stream(self, run_id: UUID) -> _RunStream:
         if run_id not in self._streams:
             self._streams[run_id] = _RunStream()
-            self._counters[run_id] = 0
         return self._streams[run_id]
-
-    def _next_id(self, run_id: UUID) -> str:
-        self._counters[run_id] = self._counters.get(run_id, 0) + 1
-        ts = int(time.time() * 1000)
-        seq = self._counters[run_id] - 1
-        return f"{ts}-{seq}"
 
     def _resolve_start_offset(self, stream: _RunStream, last_event_id: str | None) -> int:
         if last_event_id is None:
             return stream.start_offset
         for index, entry in enumerate(stream.events):
+            # ``entry.id`` is ``None`` for token frames; ``None == str`` is
+            # always False, so they can never match a cursor. Intentional —
+            # a non-replayable frame is not a legal resume anchor.
             if entry.id == last_event_id:
                 return stream.start_offset + index + 1
         if stream.events:
@@ -85,21 +89,43 @@ class InMemoryStreamBridge(StreamBridge):
 
     # -- StreamBridge API ------------------------------------------------------
 
-    async def publish(self, run_id: UUID, event: str, data: Any) -> None:
-        stream = self._get_or_create_stream(run_id)
-        entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
-        async with stream.condition:
-            stream.events.append(entry)
-            if len(stream.events) > self._maxsize:
-                overflow = len(stream.events) - self._maxsize
-                del stream.events[:overflow]
-                stream.start_offset += overflow
-            stream.condition.notify_all()
+    def _append_locked(self, stream: _RunStream, entry: StreamEvent) -> None:
+        """Append + drop-oldest overflow. Caller must hold ``stream.condition``."""
+        stream.events.append(entry)
+        if len(stream.events) > self._maxsize:
+            overflow = len(stream.events) - self._maxsize
+            del stream.events[:overflow]
+            stream.start_offset += overflow
+        stream.condition.notify_all()
 
-    async def publish_end(self, run_id: UUID) -> None:
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            # 发号必须在锁内,与入队原子完成 —— 把这两步拆开(哪怕只隔一个
+            # await)就会让「先拿到号的帧后进缓冲区」成为可能,消费侧就得为乱序
+            # 建一整套重排机制。这一行的位置就是那整套机制的替代品。
+            seq = stream.next_seq
+            stream.next_seq = seq + 1
+            entry = StreamEvent(id=f"{int(time.time() * 1000)}-{seq}", event=event, data=data)
+            self._append_locked(stream, entry)
+        return seq
+
+    async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            self._append_locked(stream, StreamEvent(id=None, event=event, data=data))
+
+    async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
+        stream = self._get_or_create_stream(run_id)
+        async with stream.condition:
+            # ``max`` —— 迟到的播种不能把发号器往回拨(回拨 = 撞 (run_id, seq) 主键)。
+            stream.next_seq = max(stream.next_seq, next_seq)
+
+    async def publish_end(self, run_id: UUID, *, status: str) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             stream.ended = True
+            stream.end_status = status
             stream.condition.notify_all()
 
     async def subscribe(
@@ -128,7 +154,13 @@ class InMemoryStreamBridge(StreamBridge):
                     entry = stream.events[local_index]
                     next_offset += 1
                 elif stream.ended:
-                    entry = END_SENTINEL
+                    # Minted per subscription so it carries *this* run's
+                    # terminal status; read under the lock with the flag.
+                    entry = StreamEvent(
+                        id=None,
+                        event=END_SENTINEL.event,
+                        data={"status": stream.end_status},
+                    )
                 else:
                     try:
                         await asyncio.wait_for(stream.condition.wait(), timeout=heartbeat_interval)
@@ -137,17 +169,14 @@ class InMemoryStreamBridge(StreamBridge):
                     else:
                         continue
 
-            if entry is END_SENTINEL:
-                yield END_SENTINEL
-                return
             yield entry
+            if is_end(entry):
+                return
 
     async def cleanup(self, run_id: UUID, *, delay: float = 0) -> None:
         if delay > 0:
             await asyncio.sleep(delay)
         self._streams.pop(run_id, None)
-        self._counters.pop(run_id, None)
 
     async def close(self) -> None:
         self._streams.clear()
-        self._counters.clear()

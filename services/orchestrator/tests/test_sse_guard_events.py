@@ -25,9 +25,9 @@ class _YieldingBridge(InMemoryStreamBridge):
     forced ``await`` here — the vacuous-test bug this class exists to fix.
     """
 
-    async def publish(self, run_id: UUID, event: str, data: Any) -> None:
+    async def publish(self, run_id: UUID, event: str, data: Any) -> int:
         await asyncio.sleep(0)  # 让出事件循环 — 强制并发 sink 交错
-        await super().publish(run_id, event, data)
+        return await super().publish(run_id, event, data)
 
 
 async def _new_record(rm: RunManager) -> RunRecord:
