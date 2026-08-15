@@ -941,6 +941,8 @@ export interface TranslationKeys {
     field_name_required: string;
     field_name_placeholder: string;
     field_description: string;
+    field_display_name: string;
+    field_display_name_help: string;
     basic_yaml_note: string;
     section_model: string;
     section_prompt: string;
@@ -3925,6 +3927,9 @@ const en: TranslationKeys = {
     field_name_required: "Name is required",
     field_name_placeholder: "my-agent",
     field_description: "Description",
+    field_display_name: "Display name",
+    field_display_name_help:
+      "The name end users see in third-party apps. Leave blank to fall back to the agent name.",
     basic_yaml_note:
       "Advanced items like template inheritance (extends) and tenant compliance tags (compliance_pack, etc.) need the YAML view.\nThe latter three (compliance_pack / isolation_level / data_residency) currently just pass format validation and aren't read at runtime (sandbox isolation is always shared for now); the audit retention period is set platform-wide for now.",
     section_model: "Model",

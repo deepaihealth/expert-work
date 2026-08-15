@@ -32,6 +32,7 @@ import { ModelSelect } from "./widgets/ModelSelect";
 import {
   hasBuiltinTool,
   readDescription,
+  readDisplayName,
   readFallback,
   readInjectCurrentDate,
   readMainSupportsVision,
@@ -45,6 +46,7 @@ import {
   readVisionOn,
   setBuiltinTool,
   setDescription,
+  setDisplayName,
   setFallback,
   setInjectCurrentDate,
   setMcp,
@@ -179,6 +181,27 @@ export function FormView({
             onChange={(e) => onChange(setName(formData, e.target.value))}
           />
         </div>
+        {/* 显示名 —— 给终端用户看的名字(阶段 3, 3.1)。``name`` 是机器
+            标识(对外的 agent_code),直接显示在第三方界面上很难看。
+            与描述同款:折进别的 tab(``bare``)时不渲染。 */}
+        {!bare && (
+          <div style={FIELD} data-testid="af-display-name">
+            <label style={LABEL}>
+              {t("agent_form.field_display_name")}
+              <FieldHelp
+                text={t("agent_form.field_display_name_help")}
+                testId="af-display-name"
+              />
+            </label>
+            <Input
+              value={readDisplayName(formData)}
+              aria-label={t("agent_form.field_display_name")}
+              onChange={(e) =>
+                onChange(setDisplayName(formData, e.target.value))
+              }
+            />
+          </div>
+        )}
         {/* When folded into another tab (``bare``) the description is dropped —
             that tab carries its own description field (no duplicate). */}
         {!bare && (

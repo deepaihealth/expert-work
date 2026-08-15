@@ -77,6 +77,7 @@ export interface AgentManifest {
   };
   spec?: {
     description?: string;
+    display_name?: string;
     model?: ModelFields;
     system_prompt?: {
       template?: string;
@@ -426,6 +427,8 @@ function patchDefenses(
 export const readName = (m: unknown): string => asObj(m).metadata?.name ?? "";
 export const readDescription = (m: unknown): string =>
   specOf(m).description ?? "";
+export const readDisplayName = (m: unknown): string =>
+  specOf(m).display_name ?? "";
 export const readModel = (m: unknown): ModelFields => specOf(m).model ?? {};
 // E.11 — the main model's fallback chain (flat list, primary excluded).
 export const readFallback = (m: unknown): ModelFields[] => {
@@ -516,6 +519,10 @@ export const setDescription = (
   m: unknown,
   description: string,
 ): AgentManifest => patchSpec(m, { description });
+export const setDisplayName = (
+  m: unknown,
+  display_name: string,
+): AgentManifest => patchSpec(m, { display_name });
 export function setModel(m: unknown, model: ModelFields): AgentManifest {
   return patchSpec(m, { model: { ...readModel(m), ...model } });
 }
