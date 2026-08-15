@@ -381,6 +381,27 @@ public class RunAndStream {
         return sb.toString();
     }
 
+    /**
+     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接拿去读会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        if (err == null) {
+            return "";
+        }
+        try (Reader reader = new InputStreamReader(err, StandardCharsets.UTF_8)) {
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[512];
+            int n;
+            while ((n = reader.read(buf)) != -1) {
+                sb.append(buf, 0, n);
+            }
+            return sb.toString();
+        }
+    }
+
     static String runAndStream(String userId, String inputText) throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -399,6 +420,14 @@ public class RunAndStream {
         }
 
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 直接 getInputStream() 只会抛一句 "Server returned HTTP response code: 4xx",
+                // 到底是 agent_code 敲错了还是 key 缺 scope,得从 getErrorStream() 里读响应体
+                // 才看得到——不显式查状态码就永远读不到它。
+                throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
+            }
+
             String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
             Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
 
@@ -812,10 +841,27 @@ public class QueueAndPoll {
         return sb.toString();
     }
 
+    /**
+     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
     static String getJson(String url) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 先查状态码再读:直接 getInputStream() 只会抛一句
+                // "Server returned HTTP response code: 4xx",错误码和原因得从
+                // getErrorStream() 里读响应体才看得到。
+                throw new IOException("请求失败:" + status + " " + readErrorBody(connection));
+            }
             return readBody(connection.getInputStream());
         } finally {
             connection.disconnect();
@@ -837,6 +883,11 @@ public class QueueAndPoll {
         }
 
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 同上:非 2xx 的原因只在 getErrorStream() 里,不查状态码就直接读会丢掉它
+                throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
+            }
             String responseBody = readBody(connection.getInputStream());
             return jsonValue(responseBody, "data"); // {"run_id": "...", "thread_id": "...", "status": "queued"}
         } finally {
@@ -933,8 +984,8 @@ API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
 AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
-# 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器,
-# 内容和下面 Node.js / Java 两份表逐条一致。
+# 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+# 不是通用 MIME 猜测器,内容和下面 Node.js / Java 两份表逐条一致。
 # **不要用 mimetypes.guess_type**:它认得哪些类型既跟 Python 版本走,也跟宿主机的 mime
 # 配置文件走(标准库启动时会去读 /etc/mime.types 这类系统文件),同一份代码换个环境
 # 结果就可能不一样。实测 CPython 3.9 / 3.10 / 3.11 上 `.md` 返回 None、3.12 起才认得;
@@ -1051,9 +1102,10 @@ const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
-// 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器。
-// new Blob([...]) 不传 type 时,fetch/undici 发出的 Content-Type 会是 application/octet-stream——
-// 这个类型不在文档类/图片类任何一个白名单里,上传会**每次必然** 400 INVALID_UPLOAD。
+// 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+// 不是通用 MIME 猜测器。new Blob([...]) 不传 type 时,fetch/undici 发出的 Content-Type
+// 会是 application/octet-stream——这个类型不在文档类/图片类任何一个白名单里,
+// 上传会**每次必然** 400 INVALID_UPLOAD。
 const EXTENSION_MIME_TYPES = {
   ".pdf": "application/pdf",
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1171,8 +1223,8 @@ public class UploadAndRun {
     static final String BASE_URL = "https://<your-domain>";
     static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
-    // 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器,
-    // 内容和上面 Python / Node.js 两份表逐条一致。
+    // 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+    // 不是通用 MIME 猜测器,内容和上面 Python / Node.js 两份表逐条一致。
     // **不要用 URLConnection.guessContentTypeFromName**:它查的是 JDK 自带的那张老
     // content-types.properties,JDK 8 上 .docx / .xlsx / .pptx / .md / .csv / .webp
     // 六种全部返回 null(只有 .pdf / .txt / .png / .jpg / .jpeg / .gif 能查到),
@@ -1788,6 +1840,16 @@ public class ContinueSession {
         return sb.toString();
     }
 
+    /**
+     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
     static String runStreamAndWait(String userId, String inputText, String sessionId) throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -1810,6 +1872,14 @@ public class ContinueSession {
         }
 
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 和 8.1 同一形态:直接 getInputStream() 只会抛一句
+                // "Server returned HTTP response code: 4xx",错误码和原因得从
+                // getErrorStream() 里读响应体才看得到。
+                throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
+            }
+
             String newSessionId = connection.getHeaderField("X-Expert-Work-Session-Id");
 
             try (InputStream in = connection.getInputStream()) {
@@ -1854,6 +1924,12 @@ public class ContinueSession {
         connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
         String responseBody;
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 同上:404(session_id 敲错了)时 getInputStream() 抛的是一句只带 URL 的
+                // FileNotFoundException,连状态码是什么、服务端说了什么都看不到。
+                throw new IOException("拉取历史消息失败:" + status + " " + readErrorBody(connection));
+            }
             responseBody = readBody(connection.getInputStream());
         } finally {
             connection.disconnect();
@@ -2013,13 +2089,9 @@ def consume_with_reconnect(user_id, run_id):
                 done = consume_one_connection(response, cursor)
             if done:
                 break
-            if cursor.value != seen_before:
-                attempt = 0  # 这条连接真的推进了游标,才算"成功过一次",重置重试计数
-                continue
-            # 200 + 干净读到 EOF、但一帧都没推进——nginx 的 proxy_read_timeout、
-            # 网关/负载均衡的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,
-            # 所以走不到下面的 except。**这条路必须和异常路径一样计入重试预算**,
-            # 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
+            # 200 + 干净读到 EOF 却没收到 end——nginx 的 proxy_read_timeout、网关/负载均衡
+            # 的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,所以走不到下面的
+            # except。这条路和异常路径一样,算不算失败由下面那个共用的"推进过没有"说了算。
             error = RuntimeError("连接被关闭时没有推进任何 seq(可能是网关回收了空闲连接)")
         except urllib.error.HTTPError:
             # 非 2xx——服务端给出的明确错误响应,不是网络层瞬时故障,不该重试。
@@ -2034,7 +2106,15 @@ def consume_with_reconnect(user_id, run_id):
             # 断线时示例本身会崩溃(未捕获异常、退出码非 0)。
             error = exc
 
-        # 退避 + 上限:异常断线和"200 但没推进"两条路共用,不要无退避无上限地立刻重试。
+        # 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+        # 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
+        # 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
+        # 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+        if cursor.value != seen_before:
+            attempt = 0
+            continue
+        # 一帧都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
+        # 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
         attempt += 1
         if attempt > MAX_RETRIES:
             raise RuntimeError(f"重连 {MAX_RETRIES} 次仍未成功,放弃") from error
@@ -2189,14 +2269,9 @@ async function consumeWithReconnect(userId, runId) {
       if (done) {
         break;
       }
-      if (cursorRef.value !== seenBefore) {
-        attempt = 0; // 这条连接真的推进了游标,才算"成功过一次",重置重试计数
-        continue;
-      }
-      // 200 + 干净读到 EOF、但一帧都没推进——nginx 的 proxy_read_timeout、
-      // 网关/负载均衡的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,
-      // 所以走不到下面的 catch。**这条路必须和异常路径一样计入重试预算**,
-      // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
+      // 200 + 干净读到 EOF 却没收到 end——nginx 的 proxy_read_timeout、网关/负载均衡
+      // 的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,所以走不到下面的
+      // catch。这条路和异常路径一样,算不算失败由下面那个共用的"推进过没有"说了算。
       error = new Error("连接被关闭时没有推进任何 seq(可能是网关回收了空闲连接)");
     } catch (err) {
       if (err instanceof HttpStatusError) {
@@ -2207,7 +2282,16 @@ async function consumeWithReconnect(userId, runId) {
       error = err;
     }
 
-    // 退避 + 上限:异常断线和"200 但没推进"两条路共用,超过上限就把最后一次的错误抛出去。
+    // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+    // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
+    // 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
+    // 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+    if (cursorRef.value !== seenBefore) {
+      attempt = 0;
+      continue;
+    }
+    // 一帧都没推进的失败才计入预算:退避 + 上限,超过上限就把最后一次的错误抛出去,
+    // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
     attempt++;
     if (attempt > MAX_RETRIES) {
       throw new Error(`重连 ${MAX_RETRIES} 次仍未成功,放弃`, { cause: error });
@@ -2477,14 +2561,10 @@ public class ReconnectEvents {
                 if (done) {
                     break;
                 }
-                if (!Objects.equals(cursor.value, seenBefore)) {
-                    attempt = 0; // 这条连接真的推进了游标,才算"成功过一次",重置重试计数
-                    continue;
-                }
-                // 200 + 干净读到 EOF、但一帧都没推进——nginx 的 proxy_read_timeout、
-                // 网关/负载均衡的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,
-                // 所以走不到下面的 catch。**这条路必须和异常路径一样计入重试预算**,
-                // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
+                // 200 + 干净读到 EOF 却没收到 end——nginx 的 proxy_read_timeout、网关/负载
+                // 均衡的空闲连接回收都是这个形状:先回 200 再优雅关闭,不是 RST,所以走不到
+                // 下面的 catch。这条路和异常路径一样,算不算失败由下面那个共用的
+                // "推进过没有"说了算。
                 error = new IOException("连接被关闭时没有推进任何 seq(可能是网关回收了空闲连接)");
             } catch (HttpStatusException e) {
                 throw e; // 明确的错误响应,不重试,直接冒泡
@@ -2495,7 +2575,16 @@ public class ReconnectEvents {
                 connection.disconnect();
             }
 
-            // 退避 + 上限:异常断线和"200 但没推进"两条路共用,不要无退避无上限地立刻重试。
+            // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+            // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
+            // 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
+            // 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+            if (!Objects.equals(cursor.value, seenBefore)) {
+                attempt = 0;
+                continue;
+            }
+            // 一帧都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
+            // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
             attempt++;
             if (attempt > MAX_RETRIES) {
                 throw new IOException("重连 " + MAX_RETRIES + " 次仍未成功,放弃", error);
@@ -2558,8 +2647,15 @@ def cancel_run(user_id, run_id):
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
-        # 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表
-        error_body = json.loads(exc.read().decode("utf-8"))
+        # 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表。
+        # 先读成文本、解得动才当 JSON 用:失败响应不一定是 JSON(网关自己返回的 502 常常是
+        # HTML,也可能整个是空的),无条件 json.loads 会当场抛 JSONDecodeError 顶掉原来的
+        # HTTPError,状态码和响应体全看不见,下面这行想打的错误信息永远打不出来。
+        error_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_body = json.loads(error_text)
+        except ValueError:
+            error_body = error_text  # 不是 JSON,原样打出来
         print("取消失败:", exc.code, error_body)
         raise
 
@@ -2638,6 +2734,16 @@ public class CancelRun {
         }
     }
 
+    /**
+     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
     // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。生产代码请用 Gson / Jackson
     // 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
@@ -2683,8 +2789,7 @@ public class CancelRun {
 
             // 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
             // 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表
-            String errorBody = readBody(connection.getErrorStream());
-            System.out.println("取消失败:" + status + " " + errorBody);
+            System.out.println("取消失败:" + status + " " + readErrorBody(connection));
             throw new IOException("cancel failed: " + status);
         } finally {
             connection.disconnect();
@@ -2881,6 +2986,16 @@ public class ApprovalDecision {
     }
 
     /**
+     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
+    /**
      * 返回 [响应体 JSON 文本, 续跑用的新 run_id]。decision 为 "modify" 时 modifiedArgsJson 必填
      * (直接传一段手拼好的 JSON 对象文本);其余两种 decision 下必须传 null——不传的字段不会出现在请求体里。
      */
@@ -2910,6 +3025,13 @@ public class ApprovalDecision {
         }
 
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 和 8.6 取消同一形态:失败响应可能是带 error.code 的 JSON、可能是裸
+                // {"detail": ...},也可能是网关自己返回的 HTML 甚至空体,一律当文本原样打出来。
+                System.out.println("决策失败:" + status + " " + readErrorBody(connection));
+                throw new IOException("decide failed: " + status);
+            }
             String responseBody = readBody(connection.getInputStream());
             String newRunId = connection.getHeaderField("X-Expert-Work-Run-Id"); // 续跑用的新 run_id,不是路径里那个
             return new String[] {responseBody, newRunId};
