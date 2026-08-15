@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,6 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -29,6 +31,7 @@ from expert_work.persistence.agent_spec import (
     InMemoryAgentSpecStore,
     SqlAgentSpecStore,
 )
+from expert_work.persistence.models import AgentSpecRow
 from expert_work.protocol import AgentSpec, AgentSpecStatus
 
 pytestmark = pytest.mark.integration
@@ -422,5 +425,78 @@ async def test_list_distinct_active_by_tenant_matches_the_in_memory_store(
         assert await store.count_distinct_active_by_tenant(
             tenant_id=tenant
         ) == await mem_store.count_distinct_active_by_tenant(tenant_id=tenant)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_tie_break_matches_on_created_at_collision(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """复审二轮必修 1:tie-break 是承重代码,此前零覆盖。两个变异(内存侧
+    tie-break 反向 / SQL 侧删掉 ``id.desc()``)都不会让任何既有测试变红,
+    因为 ``test_..._matches_the_in_memory_store`` 从不制造 ``created_at``
+    撞车,次级键子句没有测试咬得住。
+
+    这里把三个版本的 ``created_at`` 压平到完全相同,并把 ``id`` 显式设成
+    三个固定值(不用 store 各自随机生成的——SQL 用 ``gen_random_uuid()``、
+    内存用 ``uuid4()``,两边独立随机不可能自然撞出同一个"赢家",测试必须
+    自己控制这三个值才能断言"两边选的是同一行")。Postgres uuid 的
+    bytewise 序与 Python ``UUID.__gt__`` 的 ``.int`` 序一致,是复审实测出
+    来的事实——这条测试把它钉成断言,而不是继续靠"没人踩过"活着。
+    """
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        mem_store = InMemoryAgentSpecStore()
+
+        # 固定三个 id(升序:低/中/高),两个后端都用同一组值——否则两边各自
+        # 随机生成的 id 不可能保证选出同一个"赢家"。
+        id_low, id_mid, id_high = sorted((uuid4(), uuid4(), uuid4()))
+        same_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+        rows = [
+            ("1.0.0", "v-low", id_low),
+            ("1.0.1", "v-mid", id_mid),
+            ("1.0.2", "v-high", id_high),
+        ]
+
+        for version, display_name, forced_id in rows:
+            await store.create(
+                tenant_id=tenant,
+                spec=_spec(name="alpha", version=version, display_name=display_name),
+                spec_sha256=_sha(),
+                created_by="a",
+            )
+            async with store._sf() as session:
+                await session.execute(
+                    update(AgentSpecRow)
+                    .where(
+                        AgentSpecRow.tenant_id == tenant,
+                        AgentSpecRow.name == "alpha",
+                        AgentSpecRow.version == version,
+                    )
+                    .values(id=forced_id, created_at=same_created_at)
+                )
+                await session.commit()
+
+            await mem_store.create(
+                tenant_id=tenant,
+                spec=_spec(name="alpha", version=version, display_name=display_name),
+                spec_sha256=_sha(),
+                created_by="a",
+            )
+            key = (tenant, "alpha", version)
+            existing = mem_store._rows[key]
+            mem_store._rows[key] = existing.model_copy(
+                update={"id": forced_id, "created_at": same_created_at}
+            )
+
+        sql_rows = await store.list_distinct_active_by_tenant(tenant_id=tenant)
+        mem_rows = await mem_store.list_distinct_active_by_tenant(tenant_id=tenant)
+
+        assert len(sql_rows) == 1 and len(mem_rows) == 1
+        # id 最大的那行(v-high / 1.0.2)必须是两个后端各自的赢家。
+        assert sql_rows[0].id == id_high and sql_rows[0].version == "1.0.2"
+        assert mem_rows[0].id == id_high and mem_rows[0].version == "1.0.2"
     finally:
         await engine.dispose()

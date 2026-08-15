@@ -225,12 +225,13 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx_write: 
     被 RBAC 挡在门外,那样测的是权限矩阵而不是本测试要证的东西。
     """
     ctx = ctx_write
-    # 顺序要紧:multi 的两个版本必须是创建时间最新的两行 —— C-1 的 bug 形态
-    # (分页打在版本行、按 created_at DESC 排序)会让它们落进**同一页**,那一页
-    # 去重后只剩 1 条、短于 limit,触发客户端「不足一页即最后一页」的标准
-    # 循环提前 break,healthy / killed 因此被静默漏掉、连取都没取到。如果
-    # multi 的两个版本跟别的 agent 穿插创建,它们会落进不同页,bug 不表现为
-    # 「漏 code」而只是「重复出现」,咬不住这条断言。
+    # multi 的两个版本创建在最后 —— 在 C-1 的 bug 形态(分页打在版本行、按
+    # created_at DESC 排序)下,它们是创建时间最新的两行,会落进同一页,
+    # 那一页去重后短于 limit,触发客户端「不足一页即最后一页」的标准循环
+    # 提前 break,healthy / killed 因此被静默漏掉。但下面两条断言**不依赖
+    # 这个种子顺序**才能咬住 bug(复审二轮建议 3):就算以后有人把
+    # seed_agent 调用挪了位置、bug 表现成"跨页重复"而不是"整页消失",
+    # 「翻页过程中无重复」那条断言照样会红。
     await ctx.seed_agent("healthy")
     await ctx.seed_agent("killed")
     await ctx.disable_agent("killed")
@@ -238,9 +239,9 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx_write: 
     await ctx.seed_agent("multi", version="1.0.1", display_name="v2")
     seeded_codes = {"healthy", "multi", "killed"}
 
-    # 走完整个分页 —— limit=2 强制至少翻两页(3 个 name),C-1 的 bug 形态
-    # 会让 multi 在某一页因为占了两个槽位而把别的 code 挤出这一页。
+    # 走完整个分页 —— limit=2 强制至少翻两页(3 个 name)。
     catalog_agents: list[dict[str, Any]] = []
+    codes_seen_in_order: list[str] = []
     offset = 0
     limit = 2
     while True:
@@ -249,9 +250,18 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx_write: 
         )
         page_agents = page.json()["data"]["agents"]
         catalog_agents.extend(page_agents)
+        codes_seen_in_order.extend(a["agent_code"] for a in page_agents)
         if len(page_agents) < limit:
             break
         offset += limit
+
+    # 与 seed 顺序无关的断言:不管 multi 的两个版本行落在分页的哪个位置,
+    # C-1 的 bug 形态要么让某个 code 跨页/同页重复出现(这条断言咬),
+    # 要么让某个 code 整页消失(下面的集合相等断言咬)——两条一起才不用
+    # 靠特定的种子顺序去触发 bug。
+    assert len(codes_seen_in_order) == len(set(codes_seen_in_order)), (
+        f"翻页过程中有 code 重复出现: {codes_seen_in_order}"
+    )
 
     by_code = {a["agent_code"]: a["available"] for a in catalog_agents}
     catalog_codes = set(by_code)

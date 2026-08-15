@@ -98,9 +98,13 @@ class AgentSpecStore(abc.ABC):
         「不足一页即最后一页」的标准循环会**静默漏掉**后面的 agent,而响应里
         没有 ``total``,它无从察觉。
 
-        每个 name 保留 ``created_at`` 最新的那一行 —— 与
-        ``agents.py:_resolve_session`` 用 ``limit=1`` 取最新 ACTIVE 选的是
-        同一行,这是「目录说 available 就一定调得通」的前提。
+        每个 name 保留 ``created_at`` 最新的那一行——绝大多数情况下和
+        ``agents.py:_resolve_session`` 用 ``limit=1``(即 ``list_by_tenant``,
+        只 ``ORDER BY created_at DESC``,**没有** ``id`` 次级键)取到的是同一
+        行。但 ``created_at`` 完全相同时,本方法用 ``id DESC`` 定序而
+        ``_resolve_session`` 未定序,两者选出的行**可能不是同一个**——目录
+        显示的 ``display_name`` / ``description`` 会跟实际被 run 端点执行的
+        版本对不上。这是既有行为,不在本方法要解决的问题范围内。
 
         排序键是 ``name``(不是 ``created_at``):分页要求全序稳定,而
         ``created_at`` 在去重后不再唯一。同一 name 的 ``created_at`` 撞车时
