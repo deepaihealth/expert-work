@@ -35,6 +35,15 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # @types/node 必须跟运行时的 Node 大版本走(CI 三处 setup-node 都钉在 22)。
+      # 把类型升到更高的大版本 = 让 tsc 按一套运行时并不存在的 API 面校验,
+      # 编译期放行的调用到了运行时才炸——这是制造错配,不是消除错配。
+      # 2026-08-15 因此关掉了 #1173(22 → 26)。Node 大版本升级时,连同这条
+      # ignore 一起改,让两者始终同步。
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
 
   # 沙箱镜像的 Python 依赖。注意合并这类 PR 只改仓库:镜像要重建推 ACR、
   # SandboxSet 换 tag,测试/生产集群才吃到新版本。
