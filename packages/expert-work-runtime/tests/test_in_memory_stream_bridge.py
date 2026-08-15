@@ -93,7 +93,9 @@ async def test_bridge_order_equals_seq_order_under_concurrency() -> None:
     watcher = asyncio.create_task(_watch())
     groups = await asyncio.gather(_burst("a"), _burst("b"))
     done.set()
-    await watcher
+    # ``await asyncio.gather(watcher)`` 而不是裸 ``await watcher``:CodeQL 把
+    # await 一个裸名字读成"这条语句没有效果"并卡住合并(本仓既有先例)。
+    await asyncio.gather(watcher)
     await bridge.publish_end(run_id, status="success")
 
     # 探针不变式的**前置条件**:整条 run 没触发过缓冲区溢出。溢出时

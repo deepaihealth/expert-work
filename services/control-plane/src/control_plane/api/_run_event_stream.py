@@ -218,7 +218,7 @@ async def build_event_producer(
             frames: list[bytes] = []
             for lo, hi in _merge_ranges(seqs):
                 logger.warning(
-                    "live_stream.gap run_id=%s from=%s to=%s reason=%s", run_id, lo, hi, reason
+                    "live_stream.gap run_id=%s from=%d to=%d reason=%s", run_id, lo, hi, reason
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": hi}))
             return frames
@@ -254,7 +254,7 @@ async def build_event_producer(
             if end_exclusive - lo > _MAX_TRACKED_HOLES:
                 cut = end_exclusive - _MAX_TRACKED_HOLES
                 logger.warning(
-                    "live_stream.holes_overflow run_id=%s from=%s to=%s", run_id, lo, cut - 1
+                    "live_stream.holes_overflow run_id=%s from=%d to=%d", run_id, lo, cut - 1
                 )
                 frames.append(format_sse("gap", {"from": lo, "to": cut - 1}))
                 lo = cut
@@ -329,7 +329,7 @@ async def build_event_producer(
                         break
                 if last + 1 < seq:
                     logger.warning(
-                        "live_stream.gap run_id=%s from=%s to=%s reason=%s",
+                        "live_stream.gap run_id=%s from=%d to=%d reason=%s",
                         run_id,
                         last + 1,
                         seq - 1,

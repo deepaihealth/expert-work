@@ -37,7 +37,6 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
-import control_plane.api._run_event_stream as stream_module
 import control_plane.api.runs as runs_module
 from control_plane.api._run_event_stream import build_event_producer
 from expert_work.runtime.runs import (
@@ -799,9 +798,12 @@ def _session_outcome_literals() -> set[str]:
     import inspect
     from pathlib import Path
 
-    import orchestrator.sse as sse_module
+    # 用 from-import 的函数对象定位源文件,而不是 ``import orchestrator.sse``:
+    # 本文件别处已经 ``from orchestrator.sse import ...``,同一模块两种导入方式
+    # 并存会被 CodeQL 判为缺陷并卡住合并。
+    from orchestrator.sse import format_sse
 
-    source = Path(inspect.getsourcefile(sse_module) or "").read_text(encoding="utf-8")
+    source = Path(inspect.getsourcefile(format_sse) or "").read_text(encoding="utf-8")
     literals: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Assign):
@@ -861,7 +863,7 @@ async def test_hole_tracking_overflow_emits_gap_and_keeps_the_newest(
     物化成 set** —— 所以百万级的洞也只花常数内存。把那一支写成先 ``update`` 再裁剪
     的人会让这条测试仍然绿,但会在生产上炸内存;这里留一句话给下一个改它的人。
     """
-    monkeypatch.setattr(stream_module, "_MAX_TRACKED_HOLES", 4)
+    monkeypatch.setattr("control_plane.api._run_event_stream._MAX_TRACKED_HOLES", 4)
 
     run_id = uuid4()
     store = InMemoryRunEventStore()
@@ -899,7 +901,7 @@ async def test_hole_tracking_overflow_evicts_across_already_tracked_holes(
     只裁新段:8 早被 gap 掉且不在 ``holes`` 里,``8 <= last(10)`` → **丢弃**;
     整体淘汰:老洞 ``1..4`` 让位,``8`` 还在 ``holes`` 里 → **补发**。
     """
-    monkeypatch.setattr(stream_module, "_MAX_TRACKED_HOLES", 4)
+    monkeypatch.setattr("control_plane.api._run_event_stream._MAX_TRACKED_HOLES", 4)
 
     run_id = uuid4()
     store = InMemoryRunEventStore()
