@@ -35,6 +35,14 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 
 `stopped: true` 表示这次调用真的触发了取消(run 当时确实在执行中);`stopped: false` 表示这个 run 已经处于终态——**包括正常结束(SUCCESS)、失败(ERROR/TIMEOUT)、已被取消(INTERRUPTED),也包括暂停等待审批(PAUSED)**——这几种状态下取消端点不做任何操作,直接报告 `stopped: false`,不会报错。换句话说,对一个暂停等待审批的 run 调用取消,不会让它消失或改变状态——它仍然停在原地等审批决策(见下方「4.7」)。
 
+::: warning `stopped: true` 不等于"这次 run 一定会以 interrupted 收场"
+取消是**尽力而为**的:打断信号在 Agent 的**步与步之间**生效。如果这个 run 在下一个检查点到来之前就自己跑完了(比如它正处在最后一步的生成过程中),它会**照常以 `success` 收尾**——尽管取消调用返回的是 `stopped: true`。
+
+真栈实测过这两种结果:同一段代码、同一个提示词,一次拿到 `end.status = "interrupted"`,一次拿到 `end.status = "success"`(那次 run 在打断生效前 12 秒就答完了)。
+
+所以:**`stopped: true` 只说明"调用那一刻它确实在执行中、信号已经送到",不是终局状态的承诺。** 要知道这次 run 到底怎么结束的,一律以 `end` 帧的 `status` 为准(见 [SSE 事件格式](./sse-events)),别用取消接口的返回值去推断。
+:::
+
 取消生效后这次 run 在 SSE 流上会怎样收尾,见 [SSE 事件格式](./sse-events)。
 
 ### 失败情况
