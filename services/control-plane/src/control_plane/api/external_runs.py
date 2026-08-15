@@ -85,33 +85,25 @@ def build_external_runs_router() -> APIRouter:
 
         ``session_id`` 选填:给了就先验它属于 ``(user, agent)``(不属于就
         404,不是空列表 —— 响应不能携带存在性信息),再按那个 thread 过滤。
+        给了 ``session_id`` 时,``load_owned_session`` 返回的 ``meta.user_id``
+        才是权威值(直接复用授权那次读,不再另外查一次 —— 也避免两次查询
+        之间出现 TOCTOU 窗口)。
 
-        ``mint=False``:一个这个租户从没见过的 ``user_id`` 返回空列表,
-        不建 ``tenant_user`` 行(P1 复审 T3)。「没跑过 run」和「没这个人」
-        对第三方是同一个事实,空列表泄露的信息不比 404 多。
+        ``mint=False``:一个这个租户从没见过的 ``user_id``,在**没给**
+        ``session_id`` 时返回空列表且不建 ``tenant_user`` 行(P1 复审
+        T3)——「没跑过 run」和「没这个人」对第三方是同一个事实。给了
+        ``session_id`` 则统一走上面的 404(未知用户不构成特例)。
 
         ``error`` 与 SSE ``error`` 帧携带的是同一个字符串(两者都是
         ``str(exc)``,``orchestrator/sse.py:745``/``:779``),所以这里给出
         它没有新开任何泄露面。
         """
         tenant_id: UUID = request.state.tenant_id
-        try:
-            end_user_id = await lookup_external_user_id(
-                tenant_id=tenant_id, user_id=user_id, users=users
-            )
-        except ExternalScopeError as exc:
-            return external_error(exc)
-
         thread_ids: list[UUID] | None = None
+        end_user_id: UUID | None
         if session_id is not None:
-            # ``session_id`` given: ownership is authoritative even when
-            # ``end_user_id`` is None (this same ``user_id`` never acted
-            # before) — ``load_owned_session(mint=False)`` re-derives it and
-            # 404s either way, so an unseen ``user_id`` probing a real
-            # session still gets SESSION_NOT_FOUND, not an empty-list 200
-            # that would leak "that session belongs to someone".
             try:
-                await load_owned_session(
+                meta = await load_owned_session(
                     tenant_id=tenant_id,
                     agent_code=agent_code,
                     user_id=user_id,
@@ -122,15 +114,23 @@ def build_external_runs_router() -> APIRouter:
                 )
             except ExternalScopeError as exc:
                 return external_error(exc)
+            end_user_id = meta.user_id
             thread_ids = [session_id]
-        elif end_user_id is None:
-            return JSONResponse(
-                {
-                    "success": True,
-                    "data": {"runs": [], "limit": limit, "offset": offset},
-                    "error": None,
-                }
-            )
+        else:
+            try:
+                end_user_id = await lookup_external_user_id(
+                    tenant_id=tenant_id, user_id=user_id, users=users
+                )
+            except ExternalScopeError as exc:
+                return external_error(exc)
+            if end_user_id is None:
+                return JSONResponse(
+                    {
+                        "success": True,
+                        "data": {"runs": [], "limit": limit, "offset": offset},
+                        "error": None,
+                    }
+                )
 
         rows = await runs.list_for_tenant(
             tenant_id=tenant_id,

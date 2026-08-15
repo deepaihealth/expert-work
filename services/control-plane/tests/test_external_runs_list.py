@@ -339,7 +339,9 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
         "/v1/agents/support-bot/runs", params={"user_id": "cust-77"}, headers=ctx.headers
     )
 
-    for run in resp.json()["data"]["runs"]:
+    runs = resp.json()["data"]["runs"]
+    assert runs, "fixture must actually produce a run or the loop below asserts nothing"
+    for run in runs:
         assert set(run.keys()) == {
             "run_id",
             "session_id",
@@ -348,3 +350,38 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "finished_at",
             "error",
         }
+
+
+@pytest.mark.asyncio
+async def test_session_id_filter_narrows_to_that_session(ctx: _Ctx) -> None:
+    """``session_id`` is a real filter, not just an ownership check — a run on
+    the SAME user's OTHER session must not appear (review Important I-1: with
+    ``thread_ids = [session_id]`` deleted, all 9 original tests stayed green,
+    because none of them ever had a second session to leak from)."""
+    await ctx.seed_agent()
+    first = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    first_session = first.json()["data"]["thread_id"]
+    second = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue", "session_id": None},
+        headers=ctx.headers,
+    )
+    # Two POSTs with no session_id each mint their own new session — assert
+    # that actually happened, or this test would silently degrade to
+    # re-testing "only this user's runs" instead of "only this session's".
+    assert second.json()["data"]["thread_id"] != first_session
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/runs",
+        params={"user_id": "cust-77", "session_id": first_session},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["data"]["runs"]
+    assert len(runs) == 1
+    assert runs[0]["session_id"] == first_session

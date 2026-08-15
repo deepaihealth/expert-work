@@ -240,6 +240,7 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
 _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/v1/agents/{agent_code}/runs"),
+        ("GET", "/v1/agents/{agent_code}/runs"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:cancel"),
         ("GET", "/v1/agents/{agent_code}/runs/{run_id}/events"),
         ("GET", "/v1/agents/{agent_code}/sessions"),
