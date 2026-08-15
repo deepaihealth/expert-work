@@ -925,7 +925,6 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs" \
 
 ```python [Python]
 import json
-import mimetypes
 import os
 import urllib.request
 import uuid
@@ -934,12 +933,45 @@ API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
 AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
+# 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器,
+# 内容和下面 Node.js / Java 两份表逐条一致。
+# **不要用 mimetypes.guess_type**:它认得哪些类型既跟 Python 版本走,也跟宿主机的 mime
+# 配置文件走(标准库启动时会去读 /etc/mime.types 这类系统文件),同一份代码换个环境
+# 结果就可能不一样。实测 CPython 3.9 / 3.10 / 3.11 上 `.md` 返回 None、3.12 起才认得;
+# None 回退成 application/octet-stream 后不在任何白名单里,上传每次必然 400 INVALID_UPLOAD。
+EXTENSION_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def guess_mime_type(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    mime_type = EXTENSION_MIME_TYPES.get(ext)
+    if mime_type is None:
+        # 不回退到 application/octet-stream:那个值一定会被服务端拒掉,与其发一次注定
+        # 400 的请求,不如在本地就报清楚是哪个文件、支持哪些扩展名。
+        raise ValueError(
+            f"不支持的文件类型:{filename};"
+            f"受支持的扩展名:{' '.join(EXTENSION_MIME_TYPES)}"
+        )
+    return mime_type
+
 
 def upload_file(user_id, file_path):
     boundary = uuid.uuid4().hex
-    mime_type, _ = mimetypes.guess_type(file_path)
-    mime_type = mime_type or "application/octet-stream"
     filename = os.path.basename(file_path)
+    mime_type = guess_mime_type(filename)
 
     with open(file_path, "rb") as f:
         file_bytes = f.read()
@@ -1140,7 +1172,7 @@ public class UploadAndRun {
     static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
     // 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器,
-    // 内容和上面 Node.js 那份表逐条一致。
+    // 内容和上面 Python / Node.js 两份表逐条一致。
     // **不要用 URLConnection.guessContentTypeFromName**:它查的是 JDK 自带的那张老
     // content-types.properties,JDK 8 上 .docx / .xlsx / .pptx / .md / .csv / .webp
     // 六种全部返回 null(只有 .pdf / .txt / .png / .jpg / .jpeg / .gif 能查到),
@@ -1355,6 +1387,13 @@ public class UploadAndRun {
         }
 
         try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                // 和上面 uploadFile 同一形态:直接 getInputStream() 只会抛一句
+                // "Server returned HTTP response code: 4xx",错误码和原因得从
+                // getErrorStream() 里读响应体才看得到。
+                throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
+            }
             return readBody(connection.getInputStream());
         } finally {
             connection.disconnect();
