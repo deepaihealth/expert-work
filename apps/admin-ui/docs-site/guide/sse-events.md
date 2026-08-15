@@ -154,20 +154,21 @@ data: {"memory_writeback": null}
 {
   "content": "",
   "additional_kwargs": {
-    "expert_work_created_at": "2026-08-15T03:42:38.339864+00:00",
+    "reasoning_content": "The user wants me to create a file called probe_note.txt in the workspace with content \"hello-probe\", then read it back and tell them what the content is. Let me do both the write and read. Since I want to write then read, these are dependent (I should write first, then read). Actually, the read depends on the write being complete, so I should do them sequentially. But actually, write_file is atomic and returns immediately, so I can do the write and then the read. Let me do the write first.\n\nActually, the instructions say if there are no dependencies between calls, make them in the same block. But here the read depends on the write being done first. So I should do them sequentially.\n\nLet me write the file first.",
+    "expert_work_created_at": "2026-08-15T03:42:32.138398+00:00",
     "expert_work_run_id": "67262572-5470-41a4-800d-592762ec679d"
   },
   "response_metadata": {"finish_reason": "tool_calls", "model_name": "glm-5.2"},
   "type": "ai",
   "name": null,
-  "id": "4f44fec1-…",
+  "id": "19bad813-…",
   "tool_calls": [
-    {"name": "read_file", "args": {"path": "probe_note.txt"}, "id": "call_53590de9cd6149f9abd25d03", "type": "tool_call"}
+    {"name": "write_file", "args": {"path": "probe_note.txt", "content": "hello-probe"}, "id": "call_de58e676916d442d925bff27", "type": "tool_call"}
   ],
   "invalid_tool_calls": [],
   "usage_metadata": {
-    "input_tokens": 6107, "output_tokens": 14, "total_tokens": 6121,
-    "input_token_details": {"cache_read": 6080}, "output_token_details": {"reasoning": 0}
+    "input_tokens": 6027, "output_tokens": 178, "total_tokens": 6205,
+    "input_token_details": {"cache_read": 5952}, "output_token_details": {"reasoning": 156}
   }
 }
 ```
@@ -201,7 +202,7 @@ data: {"memory_writeback": null}
 
 ### 配对键:`ai.tool_calls[].id` ↔ `tool.tool_call_id`
 
-界面把"调用"和"结果"连成一条,**只能靠这一对 id**:上面 `ai` 消息里 `tool_calls[].id` 是 `call_de58e676916d442d925bff27`,下面 `tool` 消息里 `tool_call_id` 是同一个值——它们是同一次工具调用的两半。一次 `agent` 步里可能有多个并行的 `tool_calls`,配对时按 id 逐个对,不要按数组下标对。
+界面把"调用"和"结果"连成一条,**只能靠这一对 id**:上面 `ai` 消息里 `tool_calls[].id` 是 `call_de58e676916d442d925bff27`,下面 `tool` 消息里 `tool_call_id` 是同一个值——它们是同一次工具调用的两半。`tool_calls` 是数组,理论上一次 `agent` 步可以有多个并行调用(本次三个场景实测都只有一个,没观察到并行的例子)——配对时按 id 逐个对,不要按数组下标对。
 
 ::: danger 工具结果的文本是防注入包装过的——直接渲染是乱码
 上面那条真实样例里的 `content` 原文长这样:
@@ -214,7 +215,7 @@ Wrote▁ 11▁ bytes▁ to▁ probe_note.txt
 
 这是平台对工具结果做的防间接提示注入处理,**流里带出去的就是处理后的文本**——不做处理直接显示,用户看到的就是这种夹着 `«UNTRUSTED …»` 围栏和 `▁` 字形的乱码。处理分两部分:
 
-1. **围栏**:前后包一层 `«UNTRUSTED nonce=<每 run 随机>»` / `«/UNTRUSTED nonce=…»`。
+1. **围栏**:前后包一层 `«UNTRUSTED nonce=<不可预测的随机串>»` / `«/UNTRUSTED nonce=…»`——**别假设这个串每次 run 都会换**:真栈实测,同一次构建里不同的 run 会拿到同一个 nonce,它是按构建生成、在会话内保持稳定的(为 prompt-cache 友好),不是逐 run 生成。
 2. **空白标记**:每一段连续空白被替换成 `▁ `(一个 U+2581 字形加一个空格)——所以 `Wrote 11 bytes to probe_note.txt` 变成了 `Wrote▁ 11▁ bytes▁ to▁ probe_note.txt`。
 
 要给人看就必须还原,三步(可以直接抄):
