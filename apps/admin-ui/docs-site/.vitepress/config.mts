@@ -46,7 +46,18 @@ export default defineConfig({
               { text: "4.7 审批决策", link: "/guide/run-control#_4-7-审批决策" },
             ],
           },
-          { text: "5 SSE 事件格式", link: "/guide/sse-events" },
+          {
+            text: "5 SSE 事件格式",
+            link: "/guide/sse-events",
+            items: [
+              { text: "5.1 帧格式", link: "/guide/sse-events#_5-1-帧格式" },
+              { text: "5.2 事件总表", link: "/guide/sse-events#_5-2-事件总表" },
+              { text: "5.3 updates 帧怎么解析", link: "/guide/sse-events#_5-3-updates-帧怎么解析" },
+              { text: "5.4 token 帧", link: "/guide/sse-events#_5-4-token-帧" },
+              { text: "5.5 worker / guard / compaction 帧", link: "/guide/sse-events#_5-5-worker-guard-compaction-帧" },
+              { text: "5.6 断线重连", link: "/guide/sse-events#_5-6-断线重连" },
+            ],
+          },
           { text: "6 错误码总表", link: "/guide/errors" },
           {
             text: "7 对接注意事项与 FAQ",

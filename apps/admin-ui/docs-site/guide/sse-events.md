@@ -2,7 +2,7 @@
 
 本篇讲清楚 Agent run 的流式响应长什么样——有哪些事件类型、每种事件的字段、以及连接断了之后怎么接回去。
 
-## 流从哪来
+## 5.1 帧格式
 
 - `mode: "stream"` 的 `POST /v1/agents/{agent_code}/runs` 响应体本身就是这条 SSE 流。
 - `mode: "queue"` 不返回流(直接 `202`);想看这次 run 的事件,用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>`——run 还在跑就实时接进去,run 已经跑完就把持久化的帧按顺序回放一遍再收尾。
@@ -38,13 +38,16 @@ id 的格式是 `"{毫秒时间戳}-{seq}"`。`seq` 是这一帧在这次 run �
 
 那四种没有 `id:` 的帧各有原因:`token` 是一次性预览(不落库、不占序号),`gap` / `truncated` 描述的是**这条连接**的状况而不是 run 本身的事件,`end` 是流的终止标记。它们都不参与 `since_seq` 的计算。
 
-## 事件类型一览
+## 5.2 事件总表
 
 | `event:` | 什么时候出现 | 有 `id:` | 断线重连能拿回来吗 |
 |---|---|---|---|
 | `metadata` | run 开始时发一次,`data` 是 `{"run_id": "…", "thread_id": "…"}` | 有 | 能 |
 | `updates` | 每完成一步 agent/tool 步骤发一次——**这一步权威的最终结果** | 有 | 能 |
 | `token` | LLM 生成过程中的逐 token 预览(见下) | 无 | **不能,只在实时连接里出现** |
+| `worker` | Agent 委托子任务(worker)时,子任务的开始 / 每步 / 结束各发一次 | 有 | 能 |
+| `guard` | 平台护栏触发或预警(步数上限 / token 预算 / 无进展) | 有 | 能 |
+| `compaction` | 上下文过长被自动压缩时发一次 | 有 | 能 |
 | `approval` | run 在人工审批节点暂停 | 有 | 能 |
 | `retry` | 出现可重试的失败,发一条提示 | 有 | 能 |
 | `error` | run 失败 | 有 | 能 |
@@ -56,7 +59,7 @@ id 的格式是 `"{毫秒时间戳}-{seq}"`。`seq` 是这一帧在这次 run �
 
 此外,连接存活期间服务端大约每 15 秒发一个 `: heartbeat` 注释帧(不是 `event:`,只是 SSE 注释行)保活——客户端可以忽略它的内容,但如果一段时间里连心跳都没收到,就该判断连接已经断了。
 
-## `end` 事件:流怎么结束的
+### end 帧的终局状态
 
 ```
 event: end
@@ -80,7 +83,9 @@ data: {"status":"success","run_id":"5ee4e7f0-9074-42c6-88ef-3c3ed2ceb63d"}
 
 **唯一拿不到终局状态的情况是 `truncated`**:那一页以 `truncated` 收尾、**不发 `end`**,所以这一页里没有任何 status。要看到终局状态,必须按下面「回放分页」一节循环拉到收到 `end` 为止。
 
-## `token` 事件:仅供预览,不是最终结果
+## 5.3 updates 帧怎么解析
+
+## 5.4 token 帧
 
 流式能力的模型在生成答案时,会先把文本按 token 逐步预览出来:
 
@@ -109,7 +114,9 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 
 什么时候没有 `token` 事件:`mode: "queue"` 的 run、命中缓存的回答、不支持流式的 provider,以及开启了输出结果二次判定(judge)的 Agent——这些情况下只有 step 级的 `updates`。开启结构化输出(structured output)的 run 仍然会为主候选结果发 `token` 帧(schema 校验只发生在需要纠错重发的那一次,那一次不走流式)。
 
-## 断线重连
+## 5.5 worker / guard / compaction 帧
+
+## 5.6 断线重连
 
 ### 基本流程
 
