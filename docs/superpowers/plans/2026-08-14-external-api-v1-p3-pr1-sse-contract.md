@@ -76,7 +76,7 @@
 - Produces:
   - `StreamEvent.id: str | None`(token 帧为 `None`)
   - `StreamBridge.publish(run_id, event, data, *, seq: int | None = None)` —— `seq is None` ⇒ 帧无 id
-  - `StreamBridge.publish_end(run_id, *, status: str)` 
+  - `StreamBridge.publish_end(run_id, *, status: str)`
 - Consumes:无(本 Task 是地基)
 
 **背景(实现者必读)**:现在有**两个**独立的计数器。`memory.py:_next_id` 每发布一帧就 +1,**包含 token 帧**;`sse.py:_enqueue_event` 里的 `event_seq` 只在落库帧上 +1,**跳过 token 帧**。于是 live 流里 `id: {ms}-{seq}` 的 seq 恒 ≥ 落库 seq。文档教客户端从帧 id 里取 seq 当 `since_seq` —— 回放时就**跳过了真实存在的帧**,而且没有任何报错。这是本 PR 头号缺陷。
