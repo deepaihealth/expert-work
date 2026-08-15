@@ -1,6 +1,6 @@
 # 8 附录:多语言示例
 
-本章给八个常见场景各配一份完整可跑的最小示例,每个场景给 curl / Python / Node.js / Java 四种语言。几条通用约定:
+本章给七个常见场景各配一份完整可跑的最小示例,每个场景给 curl / Python / Node.js / Java 四种语言。几条通用约定:
 
 - **key 一律从环境变量读,示例代码里绝不出现明文 key。** 运行前自己设好:
 
@@ -186,6 +186,13 @@ async function runAndStream(userId, inputText) {
     body: JSON.stringify({ user_id: userId, input: inputText, mode: "stream" }),
   });
 
+  if (!response.ok) {
+    // 不查这个会静默失败:错误响应体是普通 JSON(没有 "\n\n"),分帧循环直接收不到东西就结束,
+    // 退出码 0、零输出——把 agent_code 敲错或者 key 缺 scope 这种情况会看起来"什么都没发生"。
+    const body = await response.text();
+    throw new Error(`创建 run 失败:${response.status} ${body}`);
+  }
+
   const runId = response.headers.get("X-Expert-Work-Run-Id");
   let maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
 
@@ -350,6 +357,30 @@ public class RunAndStream {
         }
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
+    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     static String runAndStream(String userId, String inputText) throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -359,54 +390,57 @@ public class RunAndStream {
         connection.setDoOutput(true);
 
         String body = "{"
-                + "\"user_id\":\"" + userId + "\","
-                + "\"input\":\"" + inputText + "\","
+                + "\"user_id\":\"" + jsonEscape(userId) + "\","
+                + "\"input\":\"" + jsonEscape(inputText) + "\","
                 + "\"mode\":\"stream\""
                 + "}";
         try (OutputStream out = connection.getOutputStream()) {
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
-        String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
-        Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
+        try {
+            String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
+            Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
 
-        try (InputStream in = connection.getInputStream()) {
-            // InputStreamReader 必须显式指定 UTF-8——JDK 8 的默认字符集跟平台走,不指定在中文环境下会乱码
-            Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
-            char[] chunk = new char[1024];
-            StringBuilder buffer = new StringBuilder();
-            int n;
-            readLoop:
-            while ((n = reader.read(chunk)) != -1) {
-                buffer.append(chunk, 0, n);
-                int sep;
-                while ((sep = buffer.indexOf("\n\n")) != -1) {
-                    String rawFrame = buffer.substring(0, sep);
-                    buffer.delete(0, sep + 2);
-                    if (rawFrame.trim().isEmpty()) {
-                        continue; // 心跳可能在缓冲区里留下一个空帧,跳过
-                    }
-                    Frame frame = parseFrame(rawFrame);
-                    if (frame.seq != null) {
-                        maxSeqSeen = (maxSeqSeen == null) ? frame.seq : Math.max(maxSeqSeen, frame.seq);
-                    }
-                    if ("end".equals(frame.event)) {
-                        // ④收到 end 才算结束;end 帧带这次 run 的终局 status
-                        System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
-                        break readLoop;
-                    } else if ("truncated".equals(frame.event)) {
-                        // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 8.5)
-                        System.out.println("这一页被截断,next_seq = " + jsonValue(frame.rawData, "next_seq"));
-                    } else if (frame.event != null) {
-                        // metadata / updates / approval / retry / error,以及未来可能新增的类型
-                        System.out.println(frame.event + " " + frame.rawData);
+            try (InputStream in = connection.getInputStream()) {
+                // InputStreamReader 必须显式指定 UTF-8——JDK 8 的默认字符集跟平台走,不指定在中文环境下会乱码
+                Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
+                char[] chunk = new char[1024];
+                StringBuilder buffer = new StringBuilder();
+                int n;
+                readLoop:
+                while ((n = reader.read(chunk)) != -1) {
+                    buffer.append(chunk, 0, n);
+                    int sep;
+                    while ((sep = buffer.indexOf("\n\n")) != -1) {
+                        String rawFrame = buffer.substring(0, sep);
+                        buffer.delete(0, sep + 2);
+                        if (rawFrame.trim().isEmpty()) {
+                            continue; // 心跳可能在缓冲区里留下一个空帧,跳过
+                        }
+                        Frame frame = parseFrame(rawFrame);
+                        if (frame.seq != null) {
+                            maxSeqSeen = (maxSeqSeen == null) ? frame.seq : Math.max(maxSeqSeen, frame.seq);
+                        }
+                        if ("end".equals(frame.event)) {
+                            // ④收到 end 才算结束;end 帧带这次 run 的终局 status
+                            System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
+                            break readLoop;
+                        } else if ("truncated".equals(frame.event)) {
+                            // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 8.5)
+                            System.out.println("这一页被截断,next_seq = " + jsonValue(frame.rawData, "next_seq"));
+                        } else if (frame.event != null) {
+                            // metadata / updates / approval / retry / error,以及未来可能新增的类型
+                            System.out.println(frame.event + " " + frame.rawData);
+                        }
                     }
                 }
             }
-        }
 
-        connection.disconnect();
-        return runId;
+            return runId;
+        } finally {
+            connection.disconnect();
+        }
     }
 
     public static void main(String[] args) throws IOException {
@@ -523,6 +557,9 @@ async function getJson(url) {
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${API_KEY}` },
   });
+  if (!response.ok) {
+    throw new Error(`请求失败:${response.status} ${await response.text()}`);
+  }
   return response.json();
 }
 
@@ -536,6 +573,9 @@ async function startQueueRun(userId, inputText) {
     },
     body: JSON.stringify({ user_id: userId, input: inputText, mode: "queue" }),
   });
+  if (!response.ok) {
+    throw new Error(`创建 run 失败:${response.status} ${await response.text()}`);
+  }
   const payload = await response.json();
   return payload.data; // {"run_id": "...", "thread_id": "...", "status": "queued"}
 }
@@ -748,12 +788,38 @@ public class QueueAndPoll {
         return items;
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
+    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     static String getJson(String url) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
-        String responseBody = readBody(connection.getInputStream());
-        connection.disconnect();
-        return responseBody;
+        try {
+            return readBody(connection.getInputStream());
+        } finally {
+            connection.disconnect();
+        }
     }
 
     static String startQueueRun(String userId, String inputText) throws IOException {
@@ -764,14 +830,18 @@ public class QueueAndPoll {
         connection.setRequestProperty("Content-Type", "application/json");
         connection.setDoOutput(true);
 
-        String body = "{\"user_id\":\"" + userId + "\",\"input\":\"" + inputText + "\",\"mode\":\"queue\"}";
+        String body = "{\"user_id\":\"" + jsonEscape(userId) + "\",\"input\":\"" + jsonEscape(inputText)
+                + "\",\"mode\":\"queue\"}";
         try (OutputStream out = connection.getOutputStream()) {
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
-        String responseBody = readBody(connection.getInputStream());
-        connection.disconnect();
-        return jsonValue(responseBody, "data"); // {"run_id": "...", "thread_id": "...", "status": "queued"}
+        try {
+            String responseBody = readBody(connection.getInputStream());
+            return jsonValue(responseBody, "data"); // {"run_id": "...", "thread_id": "...", "status": "queued"}
+        } finally {
+            connection.disconnect();
+        }
     }
 
     static boolean isSessionRunning(String userId, String sessionId) throws IOException {
@@ -949,6 +1019,29 @@ const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
+// 只按扩展名猜文档站「上传文件」一节列出的那几种受支持类型,不是通用 MIME 猜测器。
+// new Blob([...]) 不传 type 时,fetch/undici 发出的 Content-Type 会是 application/octet-stream——
+// 这个类型不在文档类/图片类任何一个白名单里,上传会**每次必然** 400 INVALID_UPLOAD。
+const EXTENSION_MIME_TYPES = {
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".csv": "text/csv",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+function guessMimeType(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  return EXTENSION_MIME_TYPES[ext] || "application/octet-stream";
+}
+
 async function uploadFile(userId, filePath) {
   // Node 内建 FormData + fetch 会自动生成 multipart/form-data 边界并设置 Content-Type,
   // 不需要像 Python 标准库那样手写 multipart 编码。
@@ -956,7 +1049,7 @@ async function uploadFile(userId, filePath) {
   const filename = path.basename(filePath);
   const form = new FormData();
   form.append("user_id", userId);
-  form.append("file", new Blob([fileBuffer]), filename);
+  form.append("file", new Blob([fileBuffer], { type: guessMimeType(filename) }), filename);
 
   const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/uploads`;
   const response = await fetch(url, {
@@ -964,6 +1057,9 @@ async function uploadFile(userId, filePath) {
     headers: { Authorization: `Bearer ${API_KEY}` }, // 不要手动设置 Content-Type,fetch 会带上正确的 boundary
     body: form,
   });
+  if (!response.ok) {
+    throw new Error(`上传失败:${response.status} ${await response.text()}`);
+  }
   const payload = await response.json();
   return payload.data; // {"upload_id": ..., "session_id": ..., "type": ..., "mime": ..., "size": ...}
 }
@@ -984,6 +1080,9 @@ async function runWithAttachment(userId, sessionId, uploadId, uploadType, inputT
       files: [{ type: uploadType, transfer_method: "local_file", upload_id: uploadId }],
     }),
   });
+  if (!response.ok) {
+    throw new Error(`创建 run 失败:${response.status} ${await response.text()}`);
+  }
   return response.json();
 }
 
@@ -1113,6 +1212,30 @@ public class UploadAndRun {
         }
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
+    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     static String uploadFile(String userId, String filePath) throws IOException {
         String boundary = UUID.randomUUID().toString();
         byte[] fileBytes = Files.readAllBytes(Paths.get(filePath));
@@ -1142,9 +1265,12 @@ public class UploadAndRun {
             out.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
         }
 
-        String responseBody = readBody(connection.getInputStream());
-        connection.disconnect();
-        return jsonValue(responseBody, "data"); // {"upload_id": ..., "session_id": ..., "type": ..., "mime": ..., "size": ...}
+        try {
+            String responseBody = readBody(connection.getInputStream());
+            return jsonValue(responseBody, "data"); // {"upload_id": ..., "session_id": ..., "type": ..., "mime": ..., "size": ...}
+        } finally {
+            connection.disconnect();
+        }
     }
 
     static String runWithAttachment(
@@ -1158,20 +1284,22 @@ public class UploadAndRun {
         connection.setDoOutput(true);
 
         String body = "{"
-                + "\"user_id\":\"" + userId + "\","
-                + "\"session_id\":\"" + sessionId + "\","
-                + "\"input\":\"" + inputText + "\","
+                + "\"user_id\":\"" + jsonEscape(userId) + "\","
+                + "\"session_id\":\"" + jsonEscape(sessionId) + "\","
+                + "\"input\":\"" + jsonEscape(inputText) + "\","
                 + "\"mode\":\"queue\","
-                + "\"files\":[{\"type\":\"" + uploadType + "\",\"transfer_method\":\"local_file\","
-                + "\"upload_id\":\"" + uploadId + "\"}]"
+                + "\"files\":[{\"type\":\"" + jsonEscape(uploadType) + "\",\"transfer_method\":\"local_file\","
+                + "\"upload_id\":\"" + jsonEscape(uploadId) + "\"}]"
                 + "}";
         try (OutputStream out = connection.getOutputStream()) {
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
-        String responseBody = readBody(connection.getInputStream());
-        connection.disconnect();
-        return responseBody;
+        try {
+            return readBody(connection.getInputStream());
+        } finally {
+            connection.disconnect();
+        }
     }
 
     public static void main(String[] args) throws IOException {
@@ -1253,20 +1381,24 @@ def run_stream_and_wait(user_id, input_text, session_id=None):
         # 按行读(response.readline()),不要用 response.read(1024) 这种按固定字节数读的
         # 写法——chunked 传输编码下会为了凑够字节数反复等下一个 HTTP chunk,响应会被
         # 攒到凑够一批才处理甚至在读超时时丢数据,完整原因见 8.1 的 iter_sse_frames 注释。
-        lines = []
+        #
+        # 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end" 子串匹配——
+        # 服务端会流式吐 token 帧,里面是模型生成的原始文本,如果模型回答里恰好出现
+        # "event: end" 这几个字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的
+        # session_id 返回给你。
+        event = None
         while True:
             raw_line = response.readline()
             if not raw_line:
                 break
             line = raw_line.decode("utf-8").rstrip("\n")
             if line == "":
-                if lines:
-                    raw_frame = "\n".join(lines)
-                    lines = []
-                    if "event: end" in raw_frame:
-                        return new_session_id
+                if event == "end":
+                    return new_session_id
+                event = None
                 continue
-            lines.append(line)
+            if line.startswith("event:"):
+                event = line[len("event:"):].strip()
 
     return new_session_id
 
@@ -1315,16 +1447,29 @@ async function runStreamAndWait(userId, inputText, sessionId) {
     body: JSON.stringify(body),
   });
 
+  if (!response.ok) {
+    throw new Error(`创建 run 失败:${response.status} ${await response.text()}`);
+  }
+
   const newSessionId = response.headers.get("X-Expert-Work-Session-Id");
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  // 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end" 子串匹配——服务端会
+  // 流式吐 token 帧,里面是模型生成的原始文本,如果模型回答里恰好出现 "event: end" 这几个
+  // 字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的 session_id 返回给你。
   for await (const chunk of response.body) {
     buffer += decoder.decode(chunk, { stream: true });
     let sepIndex;
     while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
       const rawFrame = buffer.slice(0, sepIndex);
       buffer = buffer.slice(sepIndex + 2);
-      if (rawFrame.includes("event: end")) {
+      let event = null;
+      for (const line of rawFrame.split("\n")) {
+        if (line.startsWith("event:")) {
+          event = line.slice("event:".length).trim();
+        }
+      }
+      if (event === "end") {
         return newSessionId;
       }
     }
@@ -1516,6 +1661,30 @@ public class ContinueSession {
         return items;
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
+    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     static String runStreamAndWait(String userId, String inputText, String sessionId) throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -1525,11 +1694,11 @@ public class ContinueSession {
         connection.setDoOutput(true);
 
         StringBuilder bodyBuilder = new StringBuilder();
-        bodyBuilder.append("{\"user_id\":\"").append(userId).append("\",");
-        bodyBuilder.append("\"input\":\"").append(inputText).append("\",");
+        bodyBuilder.append("{\"user_id\":\"").append(jsonEscape(userId)).append("\",");
+        bodyBuilder.append("\"input\":\"").append(jsonEscape(inputText)).append("\",");
         if (sessionId != null) {
             // 传了就续接这段会话,不传就开一段新会话
-            bodyBuilder.append("\"session_id\":\"").append(sessionId).append("\",");
+            bodyBuilder.append("\"session_id\":\"").append(jsonEscape(sessionId)).append("\",");
         }
         bodyBuilder.append("\"mode\":\"stream\"}");
 
@@ -1537,30 +1706,42 @@ public class ContinueSession {
             out.write(bodyBuilder.toString().getBytes(StandardCharsets.UTF_8));
         }
 
-        String newSessionId = connection.getHeaderField("X-Expert-Work-Session-Id");
+        try {
+            String newSessionId = connection.getHeaderField("X-Expert-Work-Session-Id");
 
-        try (InputStream in = connection.getInputStream()) {
-            // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
-            Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
-            char[] chunk = new char[1024];
-            StringBuilder buffer = new StringBuilder();
-            int n;
-            while ((n = reader.read(chunk)) != -1) {
-                buffer.append(chunk, 0, n);
-                int sep;
-                while ((sep = buffer.indexOf("\n\n")) != -1) {
-                    String rawFrame = buffer.substring(0, sep);
-                    buffer.delete(0, sep + 2);
-                    if (rawFrame.contains("event: end")) {
-                        connection.disconnect();
-                        return newSessionId;
+            try (InputStream in = connection.getInputStream()) {
+                // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
+                Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
+                char[] chunk = new char[1024];
+                StringBuilder buffer = new StringBuilder();
+                int n;
+                while ((n = reader.read(chunk)) != -1) {
+                    buffer.append(chunk, 0, n);
+                    int sep;
+                    while ((sep = buffer.indexOf("\n\n")) != -1) {
+                        String rawFrame = buffer.substring(0, sep);
+                        buffer.delete(0, sep + 2);
+                        // 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end"
+                        // 子串匹配——服务端会流式吐 token 帧,里面是模型生成的原始文本,
+                        // 如果模型回答里恰好出现这几个字符,子串匹配会被骗过,提前把
+                        // "其实没跑完"的 session_id 返回给你。
+                        String event = null;
+                        for (String line : rawFrame.split("\n", -1)) {
+                            if (line.startsWith("event:")) {
+                                event = line.substring("event:".length()).trim();
+                            }
+                        }
+                        if ("end".equals(event)) {
+                            return newSessionId;
+                        }
                     }
                 }
             }
-        }
 
-        connection.disconnect();
-        return newSessionId;
+            return newSessionId;
+        } finally {
+            connection.disconnect();
+        }
     }
 
     static String fetchLastFinalAnswer(String userId, String sessionId) throws IOException {
@@ -1568,8 +1749,12 @@ public class ContinueSession {
         String url = BASE_URL + "/v1/agents/" + AGENT_CODE + "/sessions/" + sessionId + "/messages?" + query;
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
-        String responseBody = readBody(connection.getInputStream());
-        connection.disconnect();
+        String responseBody;
+        try {
+            responseBody = readBody(connection.getInputStream());
+        } finally {
+            connection.disconnect();
+        }
 
         String messagesArray = jsonValue(jsonValue(responseBody, "data"), "messages");
         List<String> messages = splitJsonArray(messagesArray);
@@ -1597,7 +1782,7 @@ public class ContinueSession {
 
 ## 8.5 断线重连(带 since_seq)
 
-连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 帧也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
+连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 帧也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 也带了同一个值,下面示例统一走读帧这条路(更抗代理:有些代理/网关会丢弃或改写自定义响应头,帧本身是响应体的一部分,不会被丢)。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -1609,9 +1794,11 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 ```
 
 ```python [Python]
+import http.client
 import json
 import os
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1620,6 +1807,7 @@ API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
 AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 READ_TIMEOUT_S = 30  # 自己设的读超时,不能用默认的"无限等"
+MAX_RETRIES = 5  # 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
 
 
 def iter_sse_frames(response):
@@ -1707,6 +1895,7 @@ def consume_one_connection(response, cursor):
 def consume_with_reconnect(user_id, run_id):
     cursor = Cursor()  # cursor.value is None = 还没见过任何一帧,首次连接不带 since_seq
     done = False
+    attempt = 0
 
     while not done:
         params = {"user_id": user_id}
@@ -1719,9 +1908,23 @@ def consume_with_reconnect(user_id, run_id):
         try:
             with urllib.request.urlopen(req, timeout=READ_TIMEOUT_S) as response:
                 done = consume_one_connection(response, cursor)
-        except (urllib.error.URLError, socket.timeout):
-            # 读超时或连接中断——不重新调 /runs,带着当前 cursor(已经原地更新过)原样重连
-            continue
+            attempt = 0  # 成功建立并处理过一条连接,重置重试计数
+        except urllib.error.HTTPError:
+            # 非 2xx——服务端给出的明确错误响应,不是网络层瞬时故障,不该重试。
+            # 比如 404 RUN_NOT_FOUND(run_id 敲错了)重试不会有不同结果,见 run-control.md;
+            # 这种错误以前会被下面那个更宽的 except 一起接住,当成网络抖动无限重连,
+            # 把平台打了——HTTPError 是 URLError 的子类,必须单独列在前面先接住它。
+            raise
+        except (OSError, http.client.HTTPException):
+            # 读超时或连接中断——ConnectionResetError / http.client.RemoteDisconnected /
+            # http.client.IncompleteRead 这些"流被中途掐断"的异常都在这里,才是真正
+            # 值得重试的瞬时故障。原来这里只接 (URLError, socket.timeout),接不住这几种,
+            # 断线时示例本身会崩溃(未捕获异常、退出码非 0)。加指数退避 + 次数上限,
+            # 不要无退避无上限地立刻重试。
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                raise RuntimeError(f"重连 {MAX_RETRIES} 次仍未成功,放弃") from None
+            time.sleep(min(2 ** (attempt - 1), 30))
 
 
 if __name__ == "__main__":
@@ -1733,6 +1936,21 @@ const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 const READ_TIMEOUT_MS = 30000; // 自己设的读超时,不能用默认的"无限等"
+const MAX_RETRIES = 5; // 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
+
+// 非 2xx 响应——服务端给出的明确错误,不是网络层瞬时故障,不该重试(比如 404
+// RUN_NOT_FOUND,run_id 敲错了重试不会有不同结果,见 run-control.md)。用一个专门的
+// 错误类型和"读超时/连接中断"这类真正值得重试的瞬时故障区分开。
+class HttpStatusError extends Error {
+  constructor(status, body) {
+    super(`GET events failed: ${status} ${body}`);
+    this.status = status;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function parseFrame(rawFrame) {
   let event = null;
@@ -1822,6 +2040,11 @@ async function consumeOneConnection(response, cursorRef) {
       }
     }
   } finally {
+    // cancel() 才会真的通知底层关掉这条连接;只 releaseLock() 不会关连接——如果这个函数
+    // 提前 return(比如收到 truncated)或者读超时导致外层 catch 接住,连接会一直挂着,
+    // 直到 GC 或者对端超时才收场。事件端点对没跑完的 run 是长连接、服务端不设上限,
+    // 生产里没有任何东西会替它关。
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
   return false; // 连接被关闭但没收到 end(比如读超时),外层用当前 cursor 重连
@@ -1830,6 +2053,7 @@ async function consumeOneConnection(response, cursorRef) {
 async function consumeWithReconnect(userId, runId) {
   const cursorRef = { value: null }; // value === null = 还没见过任何一帧,首次连接不带 since_seq
   let done = false;
+  let attempt = 0;
 
   while (!done) {
     const params = new URLSearchParams({ user_id: userId });
@@ -1842,9 +2066,23 @@ async function consumeWithReconnect(userId, runId) {
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${API_KEY}` },
       });
+      if (!response.ok) {
+        throw new HttpStatusError(response.status, await response.text());
+      }
       done = await consumeOneConnection(response, cursorRef);
-    } catch {
-      // 读超时或连接中断——不重新调 /runs,带着当前 cursor(已经原地更新过)原样重连
+      attempt = 0; // 成功建立并处理过一条连接,重置重试计数
+    } catch (err) {
+      if (err instanceof HttpStatusError) {
+        throw err; // 明确的错误响应,不重试,直接冒泡
+      }
+      // 读超时或连接中断——才是真正值得重试的瞬时故障。之前这里是裸 catch {},
+      // 无退避无上限地立刻重试,还会把真正的程序错误一起吞掉;现在加指数退避 +
+      // 次数上限,超过上限就把最后一次的错误抛出去。
+      attempt++;
+      if (attempt > MAX_RETRIES) {
+        throw new Error(`重连 ${MAX_RETRIES} 次仍未成功,放弃`, { cause: err });
+      }
+      await sleep(Math.min(2 ** (attempt - 1), 30) * 1000);
     }
   }
 }
@@ -1880,6 +2118,21 @@ public class ReconnectEvents {
     static final String BASE_URL = "https://<your-domain>";
     static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
     static final int READ_TIMEOUT_MS = 30000; // 自己设的读超时,不能用默认的"无限等"
+    static final int MAX_RETRIES = 5; // 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
+
+    /**
+     * 非 2xx 响应——服务端给出的明确错误,不是网络层瞬时故障,不该重试(比如 404
+     * RUN_NOT_FOUND,run_id 敲错了重试不会有不同结果,见 run-control.md)。用一个专门的
+     * 异常类型和"读超时/连接中断"这类真正值得重试的瞬时故障区分开。
+     */
+    static class HttpStatusException extends IOException {
+        final int status;
+
+        HttpStatusException(int status, String body) {
+            super("GET events failed: " + status + " " + body);
+            this.status = status;
+        }
+    }
 
     static class Frame {
         String event;
@@ -2005,7 +2258,31 @@ public class ReconnectEvents {
      * 原地更新,不管这个方法是正常返回还是抛异常退出,调用方读到的都是目前为止真实见过的
      * 最大 seq。
      */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        if (err == null) {
+            return "";
+        }
+        try (Reader reader = new InputStreamReader(err, StandardCharsets.UTF_8)) {
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[512];
+            int n;
+            while ((n = reader.read(buf)) != -1) {
+                sb.append(buf, 0, n);
+            }
+            return sb.toString();
+        }
+    }
+
     static boolean consumeOneConnection(HttpURLConnection connection, Cursor cursor) throws IOException {
+        int status = connection.getResponseCode();
+        if (status < 200 || status >= 300) {
+            // 之前直接调 getInputStream(),非 2xx(比如 404)会抛 FileNotFoundException/
+            // IOException,被下面 consumeWithReconnect 的 catch (IOException) 一起接住,
+            // 当成网络抖动无限重连,把平台打了——这里先显式查状态码,非 2xx 就抛专门的
+            // 异常类型,不进重连循环。
+            throw new HttpStatusException(status, readErrorBody(connection));
+        }
         try (InputStream in = connection.getInputStream()) {
             // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
             Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
@@ -2047,6 +2324,7 @@ public class ReconnectEvents {
     static void consumeWithReconnect(String userId, String runId) throws IOException {
         Cursor cursor = new Cursor(); // cursor.value == null = 还没见过任何一帧,首次连接不带 since_seq
         boolean done = false;
+        int attempt = 0;
 
         while (!done) {
             StringBuilder query = new StringBuilder("user_id=").append(urlEncode(userId));
@@ -2061,8 +2339,22 @@ public class ReconnectEvents {
 
             try {
                 done = consumeOneConnection(connection, cursor);
+                attempt = 0; // 成功建立并处理过一条连接,重置重试计数
+            } catch (HttpStatusException e) {
+                throw e; // 明确的错误响应,不重试,直接冒泡
             } catch (IOException e) {
-                // 读超时或连接中断——不重新调 /runs,带着当前 cursor(已经原地更新过)原样重连
+                // 读超时或连接中断——才是真正值得重试的瞬时故障。加指数退避 + 次数上限,
+                // 不要无退避无上限地立刻重试。
+                attempt++;
+                if (attempt > MAX_RETRIES) {
+                    throw new IOException("重连 " + MAX_RETRIES + " 次仍未成功,放弃", e);
+                }
+                try {
+                    Thread.sleep(Math.min(1000L * (1L << (attempt - 1)), 30000L));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
             } finally {
                 connection.disconnect();
             }
@@ -2197,6 +2489,30 @@ public class CancelRun {
         }
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。生产代码请用 Gson / Jackson
+    // 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     static String cancelRun(String userId, String runId) throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs/" + runId + ":cancel");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -2205,24 +2521,25 @@ public class CancelRun {
         connection.setRequestProperty("Content-Type", "application/json");
         connection.setDoOutput(true);
 
-        String body = "{\"user_id\":\"" + userId + "\"}"; // user_id 在请求体,不是 query
+        String body = "{\"user_id\":\"" + jsonEscape(userId) + "\"}"; // user_id 在请求体,不是 query
         try (OutputStream out = connection.getOutputStream()) {
             out.write(body.getBytes(StandardCharsets.UTF_8));
         }
 
-        int status = connection.getResponseCode();
-        if (status >= 200 && status < 300) {
-            String responseBody = readBody(connection.getInputStream());
-            connection.disconnect();
-            return responseBody;
-        }
+        try {
+            int status = connection.getResponseCode();
+            if (status >= 200 && status < 300) {
+                return readBody(connection.getInputStream());
+            }
 
-        // 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
-        // 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表
-        String errorBody = readBody(connection.getErrorStream());
-        connection.disconnect();
-        System.out.println("取消失败:" + status + " " + errorBody);
-        throw new IOException("cancel failed: " + status);
+            // 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
+            // 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表
+            String errorBody = readBody(connection.getErrorStream());
+            System.out.println("取消失败:" + status + " " + errorBody);
+            throw new IOException("cancel failed: " + status);
+        } finally {
+            connection.disconnect();
+        }
     }
 
     public static void main(String[] args) throws IOException {
@@ -2331,6 +2648,10 @@ async function decideRun(userId, runId, decision, modifiedArgs, reason) {
     body: JSON.stringify(body),
   });
   const payload = await response.json();
+  if (!response.ok) {
+    console.error("决策失败:", response.status, payload);
+    throw new Error(`decide failed: ${response.status}`);
+  }
   const newRunId = response.headers.get("X-Expert-Work-Run-Id"); // 续跑用的新 run_id,不是路径里那个
   return { payload, newRunId };
 }
@@ -2382,6 +2703,32 @@ public class ApprovalDecision {
         }
     }
 
+    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // (比如 reason 是 超预算,原因是"临时项目")就会把请求体拼坏,服务端解析失败(422),
+    // 不是风格建议。生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了
+    // 保持示例零依赖。注意 modifiedArgsJson 不走这个函数——它本身就是调用方传进来的一段
+    // 已经拼好的 JSON 对象文本,原样拼进请求体,再转义一遍反而会转义出双重转义。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
     /**
      * 返回 [响应体 JSON 文本, 续跑用的新 run_id]。decision 为 "modify" 时 modifiedArgsJson 必填
      * (直接传一段手拼好的 JSON 对象文本);其余两种 decision 下必须传 null——不传的字段不会出现在请求体里。
@@ -2396,14 +2743,14 @@ public class ApprovalDecision {
         connection.setDoOutput(true);
 
         StringBuilder bodyBuilder = new StringBuilder();
-        bodyBuilder.append("{\"user_id\":\"").append(userId).append("\",");
-        bodyBuilder.append("\"decision\":\"").append(decision).append("\",");
+        bodyBuilder.append("{\"user_id\":\"").append(jsonEscape(userId)).append("\",");
+        bodyBuilder.append("\"decision\":\"").append(jsonEscape(decision)).append("\",");
         if ("modify".equals(decision)) {
             // 仅 modify 时必填,其余两种 decision 下禁止传
             bodyBuilder.append("\"modified_args\":").append(modifiedArgsJson).append(",");
         }
         if (reason != null) {
-            bodyBuilder.append("\"reason\":\"").append(reason).append("\",");
+            bodyBuilder.append("\"reason\":\"").append(jsonEscape(reason)).append("\",");
         }
         bodyBuilder.append("\"mode\":\"queue\"}");
 
@@ -2411,10 +2758,13 @@ public class ApprovalDecision {
             out.write(bodyBuilder.toString().getBytes(StandardCharsets.UTF_8));
         }
 
-        String responseBody = readBody(connection.getInputStream());
-        String newRunId = connection.getHeaderField("X-Expert-Work-Run-Id"); // 续跑用的新 run_id,不是路径里那个
-        connection.disconnect();
-        return new String[] {responseBody, newRunId};
+        try {
+            String responseBody = readBody(connection.getInputStream());
+            String newRunId = connection.getHeaderField("X-Expert-Work-Run-Id"); // 续跑用的新 run_id,不是路径里那个
+            return new String[] {responseBody, newRunId};
+        } finally {
+            connection.disconnect();
+        }
     }
 
     public static void main(String[] args) throws IOException {
