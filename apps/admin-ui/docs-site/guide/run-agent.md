@@ -161,7 +161,14 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 }
 ```
 
-`type: "image"` 的条目会并入 `image_refs` 一起校验——两者合计仍然不能超过 64 张,超了是 422、`error.code` 为 `TOO_MANY_IMAGE_REFS`(统一信封,不是裸 `detail`)。
+`type: "image"` 的条目会并入 `image_refs` 一起校验,但实际是**两道独立的闸**,撞上哪一道要看总张数:
+
+| 张数(`image_refs` + `files[]` 里 image 条目合计) | 响应 |
+|---|---|
+| 超过 64 张 | 422,能读到 `error.code`,值为 `TOO_MANY_IMAGE_REFS` |
+| 9~64 张(没撞上面那道,但超过平台配置的单次上限) | 422,只有 `detail`:`{"detail": "too many images: max 8 per run"}`,**没有 `error.code`** |
+
+实际能过的张数是平台配置的单次上限,**默认 8 张**——64 只是"请求体里图片条目总数"这一步的合计上限,不代表单次 run 真能处理到 64 张。两档错误响应形状不一样,解析出错逻辑时两种都要认。细节见 [错误码与限流](./errors)。
 
 **最容易踩的另一个坑**:document 和 image 两种 `files[]` 条目字段名都叫 `upload_id`,但格式完全不同——document 的 `upload_id` 长得像 `uploads/report.pdf`,image 的 `upload_id`(不管是走 `image_refs` 还是 `files[]` 的 `type: "image"`)必须是上传接口对图片返回的那种 `expert_work://image/...` 引用(见上面「图片」示例响应)。两个入口(顶层 `image_refs` 字段、`files[]` 里 `type: "image"` 的条目)校验的是同一道格式闸。把 document 形态的 `upload_id` 填进了 `type: "image"` 的条目,会 422、`error.code` 为 `INVALID_IMAGE_REF`:
 

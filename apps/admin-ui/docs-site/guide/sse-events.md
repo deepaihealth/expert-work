@@ -273,6 +273,112 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 
 ## 5.5 worker / guard / compaction 帧
 
+这三种事件不是另一套跟 `updates` 平行的"结果"通道,而是三类平台内部机制向外暴露的可观测切面——子任务委托(`worker`)、护栏动作(`guard`)、自动压缩(`compaction`)。界面可以用它们把 agent 的内部动作展示给用户,但"这一步权威结果"仍然只认 `updates`(见 5.3)。
+
+### worker 帧
+
+Agent 委托子任务(worker)时,子任务的开始 / 每步 / 结束各发一次 `worker` 事件——比如子 agent、并行执行的子任务。
+
+每一条 `worker` 帧都带这组固定字段,`data` 的形状再按 `kind` 分:
+
+| 字段 | 含义 |
+|---|---|
+| `worker_id` | 这个 worker 实例的唯一标识 |
+| `parent_worker_id` | 委托出这个 worker 的上一级 worker 的 `worker_id`;不是由另一个 worker 委托出来的(比如直接挂在主 run 下)时是 `null` |
+| `parent_tool_call_id` | 触发这个 worker 的那次工具调用的 id,和 5.3 里 `ai` 消息 `tool_calls[].id` 是同一种值——**界面把子任务的时间线挂到对应的工具卡下面,靠的就是这个字段** |
+| `label` | 这个子任务的人类可读标签 |
+| `agent_ref` | 这个 worker 用的是哪个 Agent |
+| `depth` | 委托层级,数值越大说明委托嵌套得越深 |
+| `kind` | `start` / `update` / `end`,决定 `data` 的形状,见下面三张表 |
+| `wseq` | 见下面的坑 |
+| `data` | 按 `kind` 而定 |
+
+::: warning `wseq` 不是 SSE 的 `seq`,不能拿它当重连游标
+`wseq` 是**这一个 worker 自己的序号**,从 0 起数,作用域只在这个 worker 内部——同一个 run 里不同 worker 的 `wseq` 各自独立计数,互不相干。它和 5.1 讲的、决定 `since_seq` 的那个 `seq` 是两回事:断线重连、去重仍然只认帧的 `seq`,`wseq` 不参与。
+:::
+
+`kind: "start"` 的 `data`:
+
+| 字段 | 含义 |
+|---|---|
+| `task_excerpt` | 委托给这个 worker 的任务描述(摘要) |
+| `role` | 这个 worker 的角色 |
+| `max_steps` | 这个 worker 允许执行的最大步数 |
+
+`kind: "update"` 的 `data`:
+
+| 字段 | 含义 |
+|---|---|
+| `node` | 触发这次更新的节点名,含义同 5.3 |
+| `_duration_ms` | 距这个 worker 上一帧过去了多少毫秒 |
+| `step_count` | 到这一步为止的步数(可选,只在部分节点出现) |
+| `messages` | 这一步新产出消息的**摘要**——不是 5.3 那种原样消息,见下面的坑 |
+
+::: warning `update` 帧里的 `messages` 是摘要,不是原样消息,而且同样带着防注入包装
+这里的 `messages` 长得像 5.3 里的 `messages`,但**不是同一种东西**:每一项是摘要,字段名都带 `_excerpt` 后缀,而且有截断上限——正文摘要最长 500 字符,工具参数摘要最长 200 字符,工具结果摘要最长 500 字符,超过部分被截掉。
+
+按 `type` 分两种形状:
+
+- `type: "ai"`:`{type, content_excerpt, tool_calls: [{name, args_excerpt}]}`
+- `type: "tool"`:`{type, name, tool_result_excerpt, exec?: {exit_code, timed_out, stdout_excerpt, stderr_excerpt}}`——`exec` 只在沙箱执行类工具上才有
+
+**这些 `_excerpt` 字段同样没有剥掉防注入包装**(围栏 + 空白标记那一套,见 5.3「配对键」那一节的说明),渲染给人看之前要照 5.3 讲的那三步还原,做法完全一样,这里不重复。
+:::
+
+`kind: "end"` 的 `data`:
+
+| 字段 | 含义 |
+|---|---|
+| `outcome` | 这个 worker 执行完的结果;契约里没有列全取值,不在这里穷举,遇到没见过的值照常展示即可 |
+| `iteration_used` | 实际用掉的步数 |
+| `llm_call_count` | 这个 worker 内部发起的 LLM 调用次数 |
+| `wall_clock_ms` | 这个 worker 从 `start` 到 `end` 的墙钟耗时(毫秒) |
+
+### guard 帧
+
+平台护栏触发或预警时发一条 `guard` 事件——覆盖步数上限、token 预算、检测到没有实际进展这三类护栏。
+
+```
+event: guard
+data: {"kind": "tripped", "guard": "max_steps", "detail": {"steps": 32, "max": 32}}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | `tripped`(护栏触发,见下面的说明)/ `warning`(预警,还没真的触发) |
+| `guard` | 哪一类护栏:`max_steps`(步数上限)/ `token_budget`(token 预算)/ `no_progress`(检测到没有实际进展) |
+| `detail` | 具体数值,形状按 `guard` 而定 |
+
+`detail` 的形状:
+
+| `guard` | `detail` |
+|---|---|
+| `max_steps` | `{steps, max}` —— 已执行步数 / 步数上限 |
+| `token_budget` | `{spent, limit}` —— 已花费 token / token 预算上限 |
+| `no_progress` | `{streak, max}` —— 连续无进展的步数 / 允许的上限 |
+
+::: warning `guard` 不是错误——`tripped` 意味着这一轮被收尾,不是 run 崩了
+收到 `kind: "tripped"` 的 `guard` 帧,意味着平台主动把这一轮对话收了尾(比如步数到了上限就不再继续往下执行),**不是执行出错崩溃**。把 `guard: tripped` 当错误处理、弹错误提示给用户,是把一次正常的护栏收尾误报成了失败。
+
+`kind: "warning"` 比 `tripped` 更轻,只是"快到上限了"的提示,不代表任何收尾动作已经发生。
+:::
+
+### compaction 帧
+
+```
+event: compaction
+data: {"passes": 1, "tokens_before": 18420, "tokens_after": 6103, "summary_chars": 2048}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `passes` | 这次压缩执行了几轮 |
+| `tokens_before` | 压缩前的 token 数 |
+| `tokens_after` | 压缩后的 token 数 |
+| `summary_chars` | 压缩后摘要文本的字符数 |
+
+上下文太长时,平台会自动把早于当前请求的历史对话压缩成摘要——`compaction` 帧就是这个动作发生时的通知。**这不影响这次回答的正确性**,但界面可以拿它给用户一个提示,比如"对话较长,已自动整理过历史记录"。
+
 ## 5.6 断线重连
 
 ### 基本流程
