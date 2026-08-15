@@ -85,6 +85,163 @@ data: {"status":"success","run_id":"5ee4e7f0-9074-42c6-88ef-3c3ed2ceb63d"}
 
 ## 5.3 updates 帧怎么解析
 
+`updates` 是这一步的**权威结果**——界面该拿它来重建交互过程;`token` 帧只是生成过程中的预览,不能拿来当状态用(细节见 5.4)。
+
+### 形状:`data` 是 `{节点名: 节点写入}`
+
+`data` 是一个对象,键是节点名,值是这个节点这一步写入的内容——**一帧通常只有一个节点键**。真实样例(B 场景):
+
+```
+event: updates
+data: {"memory_recall":{"recalled_memories":[],"_duration_ms":198}}
+```
+
+::: warning 节点写入可能是 `null`——这是第一天就会踩到的坑
+真栈实测,三个场景全部出现过:
+
+```
+event: updates
+data: {"workspace_ingest": null}
+```
+
+```
+event: updates
+data: {"memory_writeback": null}
+```
+
+客户端不能无条件 `data[节点名].messages`——**先判断整个节点写入是不是 `null`,再取 `messages`**。真栈三个场景里,`workspace_ingest` 和 `memory_writeback` 每次都是整体 `null`。
+:::
+
+### 节点名不是固定枚举
+
+真栈见过的节点名:`memory_recall`、`workspace_ingest`、`agent`、`tools`、`memory_writeback`(三个场景里出现的顺序大致是 `memory_recall` → `workspace_ingest` → `agent` → `tools`/`agent` 交替若干次 → `memory_writeback`)。还有一些节点按 Agent 配置才会注册、才会出现,不必列全。
+
+**遇到不认识的节点名,忽略这一帧就好,不要报错**——节点词表会随平台演进变化。
+
+### 只需要读三个字段
+
+节点写入(非 `null` 时)里可能带不少通道,但对接方只需要读三个:
+
+| 字段 | 含义 |
+|---|---|
+| `messages` | 这一步新产出的消息(数组,可能是空数组) |
+| `step_count` | 到这一步为止 agent 已经执行的步数;**只出现在 `agent` 节点的写入里**,`tools` 节点没有这个字段 |
+| `_duration_ms` | 距上一帧过去了多少毫秒(平台注入,每个非 `null` 的节点写入都有) |
+
+其余通道是内部调度用的,不保证稳定——列在这里只是免得你以为自己漏读了:
+
+- `agent` 节点还有:`escalate_next`、`last_plan_goal`、`no_progress_streak`、`step_count_refund_pending`、`tool_failures`
+- `tools` 节点还有:`step_count_refund_pending`
+- `memory_recall` 节点还有:`recalled_memories`(真栈实测里是空数组)
+
+### `messages[]` 里的消息形状
+
+`messages` 数组里的每一项按 `type` 分两种。
+
+**`type: "ai"`**(来自 `agent` 节点)
+
+| 字段 | 含义 |
+|---|---|
+| `content` | 这一步的文本产出;**空串是正常的**——这一步只发工具调用时就是空,别当异常或"答完了" |
+| `tool_calls[]` | 这一步发起的工具调用,每项 `{name, args, id}` |
+| `response_metadata.finish_reason` | `"tool_calls"`(还要继续下一步)/ `"stop"`(这一步已经答完) |
+| `usage_metadata` | 这一步的 token 用量,可以直接拿来做用量展示 |
+| `additional_kwargs.reasoning_content` | 模型的思维链原文;**不保证每个模型都有,也不保证长期存在**,别当结构化字段依赖 |
+
+真实样例(B 场景,截断):
+
+```json
+{
+  "content": "",
+  "additional_kwargs": {
+    "expert_work_created_at": "2026-08-15T03:42:38.339864+00:00",
+    "expert_work_run_id": "67262572-5470-41a4-800d-592762ec679d"
+  },
+  "response_metadata": {"finish_reason": "tool_calls", "model_name": "glm-5.2"},
+  "type": "ai",
+  "name": null,
+  "id": "4f44fec1-…",
+  "tool_calls": [
+    {"name": "read_file", "args": {"path": "probe_note.txt"}, "id": "call_53590de9cd6149f9abd25d03", "type": "tool_call"}
+  ],
+  "invalid_tool_calls": [],
+  "usage_metadata": {
+    "input_tokens": 6107, "output_tokens": 14, "total_tokens": 6121,
+    "input_token_details": {"cache_read": 6080}, "output_token_details": {"reasoning": 0}
+  }
+}
+```
+
+**`type: "tool"`**(来自 `tools` 节点)
+
+| 字段 | 含义 |
+|---|---|
+| `name` | 工具名 |
+| `tool_call_id` | 配对键,见下 |
+| `content` | 工具执行结果的文本;**经过防注入包装,直接渲染是乱码**,还原方法见下面的红色提示 |
+| `status` | 执行状态;实测 `"success"`。非 `"success"` 即为这一步工具失败,具体取值不在这里穷举 |
+| `artifact` | 工具产出的结构化数据,**形状按工具而定**——有就用,不认识就忽略 |
+| `additional_kwargs.duration_ms` | 这个工具本身跑了多久(毫秒) |
+
+真实样例(B 场景):
+
+```json
+{
+  "content": "«UNTRUSTED nonce=<random>»\nWrote▁ 11▁ bytes▁ to▁ probe_note.txt\n«/UNTRUSTED nonce=<random>»",
+  "additional_kwargs": {"duration_ms": 1848},
+  "response_metadata": {},
+  "type": "tool",
+  "name": "write_file",
+  "id": "89479877-…",
+  "tool_call_id": "call_de58e676916d442d925bff27",
+  "artifact": {"path": "probe_note.txt", "content_hash": "aded7388…", "size": 11},
+  "status": "success"
+}
+```
+
+### 配对键:`ai.tool_calls[].id` ↔ `tool.tool_call_id`
+
+界面把"调用"和"结果"连成一条,**只能靠这一对 id**:上面 `ai` 消息里 `tool_calls[].id` 是 `call_de58e676916d442d925bff27`,下面 `tool` 消息里 `tool_call_id` 是同一个值——它们是同一次工具调用的两半。一次 `agent` 步里可能有多个并行的 `tool_calls`,配对时按 id 逐个对,不要按数组下标对。
+
+::: danger 工具结果的文本是防注入包装过的——直接渲染是乱码
+上面那条真实样例里的 `content` 原文长这样:
+
+```
+«UNTRUSTED nonce=<random>»
+Wrote▁ 11▁ bytes▁ to▁ probe_note.txt
+«/UNTRUSTED nonce=<random>»
+```
+
+这是平台对工具结果做的防间接提示注入处理,**流里带出去的就是处理后的文本**——不做处理直接显示,用户看到的就是这种夹着 `«UNTRUSTED …»` 围栏和 `▁` 字形的乱码。处理分两部分:
+
+1. **围栏**:前后包一层 `«UNTRUSTED nonce=<每 run 随机>»` / `«/UNTRUSTED nonce=…»`。
+2. **空白标记**:每一段连续空白被替换成 `▁ `(一个 U+2581 字形加一个空格)——所以 `Wrote 11 bytes to probe_note.txt` 变成了 `Wrote▁ 11▁ bytes▁ to▁ probe_note.txt`。
+
+要给人看就必须还原,三步(可以直接抄):
+
+```
+去掉  /«UNTRUSTED nonce=[^»]*»\n?/g           ← 开围栏
+去掉  /\n?«\/UNTRUSTED nonce=[^»]*»/g          ← 闭围栏
+删掉  /▁/g                                     ← 只删字形,后面那个空格留着,空白因此还原成一个空格
+```
+
+**还原是有损的**:原文里的换行在标记空白时变成了 `▁ `,删掉 `▁` 字形之后剩下的是一个空格——**原文的换行拿不回来**。
+
+围栏在不在,本身是个有用信号(意味着这段内容来自外部、不可信)。建议在还原之前先记一个标志位(比如"这条消息是否包含过 `UNTRUSTED` 围栏"),而不是只留下还原后的文本。
+:::
+
+### 帧量级:别拿 `token` 重建状态
+
+真栈实测三个场景的帧数:
+
+| 场景 | `updates` | `token` |
+|---|---|---|
+| 简单问答 | 4 | 58 |
+| 工具调用 | 8 | 146 |
+| 分两步 | 6 | 954 |
+
+`token` 帧占九成以上。界面该用 `updates` 重建状态、`token` 只做打字机预览,这张表是实测依据。
+
 ## 5.4 token 帧
 
 流式能力的模型在生成答案时,会先把文本按 token 逐步预览出来:
@@ -109,7 +266,7 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
 
 1. 按 `step` 把 `token.text` 累积起来做实时打字机效果。
 2. 同一个 `step` 的 `updates` 帧一到,就用它替换掉之前攒的预览——`updates` 里的内容才是过了完整输出安全审查的最终结果;如果这一步被安全策略拦了,`updates` 里会是拒答文案,直接覆盖预览。
-3. **断线重连时 `token` 帧不会被重新推给你**——只有 `metadata` / `updates` / `approval` / `retry` / `error` 这些落库的帧会回放。重连后凭这些帧重建状态,不要指望拿回丢失的逐 token 预览。
+3. **断线重连时 `token` 帧不会被重新推给你**——只有 `metadata` / `updates` / `worker` / `guard` / `compaction` / `approval` / `retry` / `error` 这些落库的帧会回放。重连后凭这些帧重建状态,不要指望拿回丢失的逐 token 预览。
 4. `token` 帧**没有 `id:`、不占 seq 序号**,所以它既不影响你的重连游标,也不会因为重复或丢失而破坏去重。
 
 什么时候没有 `token` 事件:`mode: "queue"` 的 run、命中缓存的回答、不支持流式的 provider,以及开启了输出结果二次判定(judge)的 Agent——这些情况下只有 step 级的 `updates`。开启结构化输出(structured output)的 run 仍然会为主候选结果发 `token` 帧(schema 校验只发生在需要纠错重发的那一次,那一次不走流式)。
