@@ -86,6 +86,39 @@ class AgentSpecStore(abc.ABC):
         """Paginated list, newest first."""
 
     @abc.abstractmethod
+    async def list_distinct_active_by_tenant(
+        self, *, tenant_id: UUID, limit: int = 100, offset: int = 0
+    ) -> list[AgentSpecRecord]:
+        """每个 name 一条(最新的 ACTIVE 版本),按 name 排序,分页。
+
+        阶段 3 (3.1) —— ``GET /v1/agent-catalog`` 列的是 **agent**,而
+        :meth:`list_by_tenant` 分页的是**版本行**。一个 name 有多个 ACTIVE
+        版本行是常态(发新版本只 create 一行,没有代码把旧版本降级),所以
+        「先分页、再按 name 去重」会让去重后的页短于 ``limit`` —— 客户端按
+        「不足一页即最后一页」的标准循环会**静默漏掉**后面的 agent,而响应里
+        没有 ``total``,它无从察觉。
+
+        每个 name 保留 ``created_at`` 最新的那一行 —— 与
+        ``agents.py:_resolve_session`` 用 ``limit=1`` 取最新 ACTIVE 选的是
+        同一行,这是「目录说 available 就一定调得通」的前提。
+
+        排序键是 ``name``(不是 ``created_at``):分页要求全序稳定,而
+        ``created_at`` 在去重后不再唯一。同一 name 的 ``created_at`` 撞车时
+        用 ``id`` 降序做次级 tie-break——两个后端必须用同一个 tie-break 键,
+        否则同一批数据在两边可能选出不同的"最新"行。
+        """
+
+    @abc.abstractmethod
+    async def count_distinct_active_by_tenant(self, *, tenant_id: UUID) -> int:
+        """去重后(按 name)这个租户有多少个 ACTIVE agent——不分页。
+
+        配 :meth:`list_distinct_active_by_tenant` 使用,让 ``GET
+        /v1/agent-catalog`` 能在响应里给出 ``total``,客户端才有办法判断
+        "还有没有下一页",而不是只能靠"这页数量 < limit"去猜——那个启发式
+        在最后一页恰好凑满 limit 时会给出错误的"还有更多"信号。
+        """
+
+    @abc.abstractmethod
     async def list_all_tenants(
         self,
         *,

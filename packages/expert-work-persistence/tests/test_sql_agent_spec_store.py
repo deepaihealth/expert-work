@@ -24,7 +24,11 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.agent_spec import DuplicateAgentSpecError, SqlAgentSpecStore
+from expert_work.persistence.agent_spec import (
+    DuplicateAgentSpecError,
+    InMemoryAgentSpecStore,
+    SqlAgentSpecStore,
+)
 from expert_work.protocol import AgentSpec, AgentSpecStatus
 
 pytestmark = pytest.mark.integration
@@ -48,10 +52,13 @@ _BASE_SPEC: dict[str, Any] = {
 }
 
 
-def _spec(*, version: str = "1.0.0", name: str = "code-reviewer") -> AgentSpec:
+def _spec(
+    *, version: str = "1.0.0", name: str = "code-reviewer", display_name: str = ""
+) -> AgentSpec:
     doc = deepcopy(_BASE_SPEC)
     doc["metadata"]["version"] = version
     doc["metadata"]["name"] = name
+    doc["spec"]["display_name"] = display_name
     return AgentSpec.model_validate(doc)
 
 
@@ -232,5 +239,188 @@ async def test_soft_delete_hides_from_get(sql_store: SqlStoreFixture) -> None:
             tenant_id=tenant, name="code-reviewer", version="1.0.0", include_deleted=True
         )
         assert fetched is not None and fetched.status is AgentSpecStatus.DELETED
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (3.1) C-1 — list_distinct_active_by_tenant / count_distinct_active_by_tenant
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_dedupes_before_paginating(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """C-1 的核心断言,真容器上验证 ``DISTINCT ON`` + 子查询确实把
+    LIMIT/OFFSET 打在去重之后。一个 name 有多个 ACTIVE 版本行是常态
+    (发新版本只 create,没有代码把旧版本降级)——分页若打在版本行上,
+    ``limit=2 offset=0`` 会因为 alpha 占两个槽位而只剩 1 个去重后的结果,
+    客户端按"不足一页即最后一页"的标准循环会静默漏掉 beta / gamma。"""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.0"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.1"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="beta", version="1.0.0"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="gamma", version="1.0.0"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+
+        page0 = await store.list_distinct_active_by_tenant(tenant_id=tenant, limit=2, offset=0)
+        assert [r.name for r in page0] == ["alpha", "beta"]
+
+        page1 = await store.list_distinct_active_by_tenant(tenant_id=tenant, limit=2, offset=2)
+        assert [r.name for r in page1] == ["gamma"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_keeps_newest_version_fields(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """去重保留的必须是 ``created_at`` 最新的那一行,用不同 ``display_name``
+    标记两个版本,"取错版本"也会被逮到。"""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.0", display_name="v1 name"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.1", display_name="v2 name"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+
+        rows = await store.list_distinct_active_by_tenant(tenant_id=tenant)
+
+        assert len(rows) == 1
+        assert rows[0].version == "1.0.1"
+        assert rows[0].spec.spec.display_name == "v2 name"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_excludes_non_active_and_other_tenants(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        tenant, other = uuid4(), uuid4()
+        await store.create(
+            tenant_id=tenant, spec=_spec(name="alpha"), spec_sha256=_sha(), created_by="a"
+        )
+        await store.create(
+            tenant_id=tenant, spec=_spec(name="beta"), spec_sha256=_sha(), created_by="a"
+        )
+        await store.update_status(
+            tenant_id=tenant, name="beta", version="1.0.0", status=AgentSpecStatus.DEPRECATED
+        )
+        await store.create(
+            tenant_id=other, spec=_spec(name="gamma"), spec_sha256=_sha(), created_by="a"
+        )
+
+        rows = await store.list_distinct_active_by_tenant(tenant_id=tenant)
+
+        assert [r.name for r in rows] == ["alpha"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_count_distinct_active_by_tenant_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.0"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant,
+            spec=_spec(name="alpha", version="1.0.1"),
+            spec_sha256=_sha(),
+            created_by="a",
+        )
+        await store.create(
+            tenant_id=tenant, spec=_spec(name="beta"), spec_sha256=_sha(), created_by="a"
+        )
+
+        # 两个 name(alpha 两个版本合一),不是三行。
+        assert await store.count_distinct_active_by_tenant(tenant_id=tenant) == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_matches_the_in_memory_store(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """两个后端各写一遍去重 + 分页谓词,是本仓反复出问题的地方(SQL 的
+    ``DISTINCT ON`` 与内存的逐条比较不是自动等价的)。同一组输入喂两边,
+    多版本 + 单版本混在一起,断言完整翻页后的结果集相同。"""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        mem_store = InMemoryAgentSpecStore()
+        layout = [
+            ("alpha", "1.0.0", "v1"),
+            ("alpha", "1.0.1", "v2"),
+            ("beta", "1.0.0", "only"),
+            ("gamma", "1.0.0", "only"),
+        ]
+        for name, version, display_name in layout:
+            for backend in (store, mem_store):
+                await backend.create(
+                    tenant_id=tenant,
+                    spec=_spec(name=name, version=version, display_name=display_name),
+                    spec_sha256=_sha(),
+                    created_by="a",
+                )
+
+        for limit, offset in ((2, 0), (2, 2), (100, 0)):
+            sql_rows = await store.list_distinct_active_by_tenant(
+                tenant_id=tenant, limit=limit, offset=offset
+            )
+            mem_rows = await mem_store.list_distinct_active_by_tenant(
+                tenant_id=tenant, limit=limit, offset=offset
+            )
+            assert [r.name for r in sql_rows] == [r.name for r in mem_rows], (
+                f"limit={limit} offset={offset} 两个后端结果不一致"
+            )
+            assert [r.version for r in sql_rows] == [r.version for r in mem_rows], (
+                f"limit={limit} offset={offset} 两个后端选出的版本不一致"
+            )
+
+        assert await store.count_distinct_active_by_tenant(
+            tenant_id=tenant
+        ) == await mem_store.count_distinct_active_by_tenant(tenant_id=tenant)
     finally:
         await engine.dispose()

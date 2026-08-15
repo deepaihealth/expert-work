@@ -121,6 +121,36 @@ class InMemoryAgentSpecStore(AgentSpecStore):
         matched.sort(key=lambda r: r.created_at, reverse=True)
         return matched[offset : offset + limit]
 
+    async def list_distinct_active_by_tenant(
+        self, *, tenant_id: UUID, limit: int = 100, offset: int = 0
+    ) -> list[AgentSpecRecord]:
+        async with self._lock:
+            active = [
+                r
+                for r in self._rows.values()
+                if r.tenant_id == tenant_id and r.status is AgentSpecStatus.ACTIVE
+            ]
+        by_name: dict[str, AgentSpecRecord] = {}
+        for r in active:
+            current = by_name.get(r.name)
+            # tie-break: created_at DESC, id DESC — must match the SQL
+            # backend's ORDER BY name, created_at DESC, id DESC exactly (see
+            # base.py docstring), or the two stores can pick a different
+            # "newest" row on a created_at tie.
+            if current is None or (r.created_at, r.id) > (current.created_at, current.id):
+                by_name[r.name] = r
+        ordered = sorted(by_name.values(), key=lambda r: r.name)
+        return ordered[offset : offset + limit]
+
+    async def count_distinct_active_by_tenant(self, *, tenant_id: UUID) -> int:
+        async with self._lock:
+            names = {
+                r.name
+                for r in self._rows.values()
+                if r.tenant_id == tenant_id and r.status is AgentSpecStatus.ACTIVE
+            }
+        return len(names)
+
     async def list_all_tenants(
         self,
         *,

@@ -28,7 +28,6 @@ from control_plane.api._authz import external_only, require
 from control_plane.api._external import reject_nul_path_params
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_spec import AgentSpecStore
-from expert_work.protocol import AgentSpecStatus
 
 
 def _get_agent_spec_repo(request: Request) -> AgentSpecStore:
@@ -68,56 +67,75 @@ def build_external_agent_catalog_router() -> APIRouter:
     ) -> JSONResponse:
         """这个租户有哪些 agent 可以调。
 
-        ``available`` 与 ``agents.py:_resolve_session`` 用**同一对判据**:
-        没被 kill switch 禁用,且存在 ``status=ACTIVE`` 的版本。两处判据
-        各自漂移会让目录列出一个「点了就 403」的 agent,是客户端最难排查
-        的那类不一致 —— 所以测试里把两边对在同一个断言下。
+        列出来的每个 code 都存在一个 ``status=ACTIVE`` 的版本——这半条判据
+        由「在不在返回列表里」编码,不在列表里的 code 已经在
+        ``agents.py:_resolve_session`` 里会 404 AGENT_NOT_FOUND。``available``
+        字段本身**只**编码另外那半:是否被 kill switch 禁用。两者合起来才是
+        跟 run 端点对齐的完整判据——目录列出一个「点了就 403/404」的 agent,
+        是客户端最难排查的那类不一致。
+
+        只有 DEPRECATED / DELETED 版本、没有任何 ACTIVE 版本的 code **不出
+        现在目录里**(而不是以 available: false 出现),原因:
+        1. 目录回答的是「这个租户有哪些 agent 可以调」——一个 code 没有任何
+           可调版本 = 已退役,不属于这个问题的答案。
+        2. disabled 和"没有 ACTIVE 版本"语义不同,不该一致处理:disabled 是
+           kill switch,可逆的临时管理动作,置灰等它回来对客户端有意义;
+           没有 ACTIVE 版本是版本生命周期的终态,不会自己变回可用,列一个
+           永远 false 且不会变的条目只是噪音。
+        3. 这属于租户内部的版本管理状态,不该对第三方暴露。
+        (当前产品里这一支只有 DELETED 会触发——全仓唯一的生产
+        ``update_status`` 调用是软删置 DELETED,DEPRECATED 目前不可达;
+        但判据按状态语义写,不依赖这一实现细节。)
 
         禁用的 agent **仍然列出**,只是 ``available: false``:客户端界面上
-        置灰比「凭空消失」好排查。
+        置灰比「凭空消失」好排查——disabled 是可逆的临时状态,这个信息对
+        客户端有意义。
+
+        新鲜度提示:目录这里直接查 store,是当下最新状态;run 端点走的是
+        ``AgentDisableStatusService`` 的 30s TTL 缓存(见
+        ``agent_disable_status.py``),所以重新启用一个 agent 后,最长 30s
+        内可能出现目录说 ``available: true``、run 却仍 403 的窗口。这个窗口
+        有界且自愈,目录读得更新是更正确的一侧——不要为了对齐而改成读缓存,
+        那会退回 N+1(每个 agent 一次 service 调用)。
         """
         tenant_id: UUID = request.state.tenant_id
 
-        # ACTIVE 版本决定「这个 code 能不能调」,也是分页的唯一驱动。同一个
-        # name 可能有多个版本行,按 name 去重 —— 第三方不选版本,平台自动用
-        # ACTIVE 的那个。
-        #
-        # 只有 DEPRECATED / DELETED 版本、没有任何 ACTIVE 版本的 code **不出
-        # 现在目录里**(而不是以 available: false 出现),原因有三:
-        # 1. 目录回答的是「这个租户有哪些 agent 可以调」——一个 code 没有任何
-        #    可调版本 = 已退役,不属于这个问题的答案。
-        # 2. disabled 和 deprecated-only 语义不同,不该一致处理:disabled 是
-        #    kill switch,可逆的临时管理动作,置灰等它回来对客户端有意义;
-        #    deprecated-only 是版本生命周期的终态,不会自己变回可用,列一个
-        #    永远 false 且不会变的条目只是噪音。
-        # 3. deprecated 是租户内部的版本管理状态,不该对第三方暴露。
-        active = await repo.list_by_tenant(
-            tenant_id=tenant_id, status=AgentSpecStatus.ACTIVE, limit=limit, offset=offset
+        # C-1:list_by_tenant() 分页的是**版本行**,同一个 name 有多个 ACTIVE
+        # 版本行是常态(发新版本只 create,没有代码把旧版本降级)。如果先分页
+        # 再按 name 去重,去重后的页会短于 limit——客户端按「不足一页即最后
+        # 一页」的标准循环会静默漏掉后面的 agent。改用 store 里去重在分页
+        # 之前完成的方法,分页打在去重后的结果上,不在这里再去重一次。
+        active = await repo.list_distinct_active_by_tenant(
+            tenant_id=tenant_id, limit=limit, offset=offset
         )
+        # 去重后(按 name)的总数,不分页 —— 让客户端能判断翻完没有
+        # (offset + len(agents) < total),而不是只能靠"这页数量 < limit"
+        # 去猜:那个启发式在最后一页恰好凑满 limit 时会给出错误的"还有
+        # 更多"信号。
+        total = await repo.count_distinct_active_by_tenant(tenant_id=tenant_id)
         # 一次拿全租户的禁用集,而不是每个 agent 查一次(N+1)。
         disabled = await disable_repo.list_disabled_names(tenant_id=tenant_id)
 
-        seen: set[str] = set()
-        agents: list[dict[str, object]] = []
-        for record in active:
-            if record.name in seen:
-                continue
-            seen.add(record.name)
-            body = record.spec.spec
-            agents.append(
-                {
-                    "agent_code": record.name,
-                    # 空显示名回落到 code —— 对外响应里这个字段永远非空。
-                    "display_name": body.display_name or record.name,
-                    "description": body.description,
-                    "available": record.name not in disabled,
-                }
-            )
+        agents: list[dict[str, object]] = [
+            {
+                "agent_code": record.name,
+                # 空显示名回落到 code —— 对外响应里这个字段永远非空。
+                "display_name": record.spec.spec.display_name or record.name,
+                "description": record.spec.spec.description,
+                "available": record.name not in disabled,
+            }
+            for record in active
+        ]
 
         return JSONResponse(
             {
                 "success": True,
-                "data": {"agents": agents, "limit": limit, "offset": offset},
+                "data": {
+                    "agents": agents,
+                    "limit": limit,
+                    "offset": offset,
+                    "total": total,
+                },
                 "error": None,
             }
         )

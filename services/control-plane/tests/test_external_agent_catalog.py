@@ -31,11 +31,13 @@ from tests.auth_fixtures import (
 )
 
 
-def _spec_dict(name: str, *, display_name: str = "", description: str = "") -> dict[str, Any]:
+def _spec_dict(
+    name: str, *, version: str = "1.0.0", display_name: str = "", description: str = ""
+) -> dict[str, Any]:
     return {
         "apiVersion": "expert_work.io/v1",
         "kind": "Agent",
-        "metadata": {"name": name, "version": "1.0.0", "tenant": "acme"},
+        "metadata": {"name": name, "version": version, "tenant": "acme"},
         "spec": {
             "display_name": display_name,
             "description": description,
@@ -75,11 +77,22 @@ class _Ctx:
         self.tenant_id = tenant_id
         self.headers = headers
 
-    async def seed_agent(self, name: str, *, display_name: str = "", description: str = "") -> None:
+    async def seed_agent(
+        self,
+        name: str,
+        *,
+        version: str = "1.0.0",
+        display_name: str = "",
+        description: str = "",
+    ) -> None:
         await self.app.state.agent_spec_repo.create(
             tenant_id=self.tenant_id,
             spec=AgentSpec.model_validate(
-                deepcopy(_spec_dict(name, display_name=display_name, description=description))
+                deepcopy(
+                    _spec_dict(
+                        name, version=version, display_name=display_name, description=description
+                    )
+                )
             ),
             spec_sha256="a" * 64,
             created_by="seed",
@@ -194,31 +207,86 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx_write: 
     ``true``,run 就必须被接受。两处判据各自漂移,会让客户端列出一个
     「点了就 403」的 agent —— 最难排查的那类不一致。
 
-    所以这里不是分别测两个端点,而是在**同一个测试**里把两边对起来。
+    I-2:此前的版本只验证了一个方向 —— 遍历「目录里有的」再去打 run,所以
+    「run 端点会接受、但目录压根没列出来」这个方向完全不设防。而 C-1 正是
+    这个形态:``multi`` 因为有两个 ACTIVE 版本行占了分页配额,能被 run 端点
+    正常接受,却可能因为分页打在版本行上而从目录的某一页静默消失。
+
+    所以这里:①用小 ``limit`` 强制走完整个分页(拿到的是「目录说的完整
+    code 集合」,不是只看第一页);②``run_accepted_codes`` 由种子里已知的
+    ground-truth code 集合独立算出(不是从目录响应里派生的,否则目录漏了
+    什么,派生集合也会跟着漏,测试永远不咬);③两个独立算出的集合做
+    **相等**断言,不是「目录 ⊆ run 接受集」这种单向包含——单向包含测不出
+    「目录漏了一个 run 能接受的 code」。顺带 seed 一个多版本 agent,同时
+    覆盖 I-1 的分页交互面。
 
     用 ``ctx_write`` 而非共享的 ``ctx``:run 端点要求 ``session:write``
     (OPERATOR),``ctx`` 的 ``read`` scope(VIEWER)在到达可用性判据之前就会
     被 RBAC 挡在门外,那样测的是权限矩阵而不是本测试要证的东西。
     """
     ctx = ctx_write
+    # 顺序要紧:multi 的两个版本必须是创建时间最新的两行 —— C-1 的 bug 形态
+    # (分页打在版本行、按 created_at DESC 排序)会让它们落进**同一页**,那一页
+    # 去重后只剩 1 条、短于 limit,触发客户端「不足一页即最后一页」的标准
+    # 循环提前 break,healthy / killed 因此被静默漏掉、连取都没取到。如果
+    # multi 的两个版本跟别的 agent 穿插创建,它们会落进不同页,bug 不表现为
+    # 「漏 code」而只是「重复出现」,咬不住这条断言。
     await ctx.seed_agent("healthy")
     await ctx.seed_agent("killed")
     await ctx.disable_agent("killed")
+    await ctx.seed_agent("multi", version="1.0.0", display_name="v1")
+    await ctx.seed_agent("multi", version="1.0.1", display_name="v2")
+    seeded_codes = {"healthy", "multi", "killed"}
 
-    catalog = await ctx.client.get("/v1/agent-catalog", headers=ctx.headers)
-    by_code = {a["agent_code"]: a["available"] for a in catalog.json()["data"]["agents"]}
+    # 走完整个分页 —— limit=2 强制至少翻两页(3 个 name),C-1 的 bug 形态
+    # 会让 multi 在某一页因为占了两个槽位而把别的 code 挤出这一页。
+    catalog_agents: list[dict[str, Any]] = []
+    offset = 0
+    limit = 2
+    while True:
+        page = await ctx.client.get(
+            "/v1/agent-catalog", params={"limit": limit, "offset": offset}, headers=ctx.headers
+        )
+        page_agents = page.json()["data"]["agents"]
+        catalog_agents.extend(page_agents)
+        if len(page_agents) < limit:
+            break
+        offset += limit
 
-    for code, available in by_code.items():
+    by_code = {a["agent_code"]: a["available"] for a in catalog_agents}
+    catalog_codes = set(by_code)
+    # C-1 的核心断言:翻完页拿到的 code 集合必须等于种下去的全部 code——
+    # 一个都不能因为分页打在版本行上而从某一页静默消失(不管它 available
+    # 是 true 还是 false)。
+    assert catalog_codes == seeded_codes, (
+        f"翻完页拿到的目录 code 集合是 {catalog_codes},应该是 {seeded_codes}"
+    )
+    catalog_available_codes = {code for code, available in by_code.items() if available}
+
+    run_accepted_codes: set[str] = set()
+    for code in seeded_codes:
         run = await ctx.client.post(
             f"/v1/agents/{code}/runs",
             json={"user_id": "cust-1", "input": "hi", "mode": "queue"},
             headers=ctx.headers,
         )
         accepted = run.status_code == 202
-        assert accepted == available, (
-            f"{code}: 目录说 available={available},但 run 端点回 {run.status_code} "
+        assert accepted == by_code[code], (
+            f"{code}: 目录说 available={by_code[code]},但 run 端点回 {run.status_code} "
             f"({run.text[:200]})"
         )
+        if accepted:
+            run_accepted_codes.add(code)
+
+    # 两个独立来源(目录里 available=true 的子集 / 逐个打 run 得到 202 的
+    # 集合)必须相等,不是「目录 ⊆ run 接受集」——后者测不出「目录漏了一个
+    # run 能接受的 code」这个方向(注意:被禁用的 killed 仍会出现在
+    # catalog_codes 里,但 available=false,所以不在这个子集里 —— 那是
+    # 设计意图,不是要修的 bug)。
+    assert catalog_available_codes == run_accepted_codes, (
+        f"目录里 available=true 的 code 集合 {catalog_available_codes} 与 "
+        f"run 端点接受的集合 {run_accepted_codes} 不相等"
+    )
 
 
 @pytest.mark.asyncio
@@ -247,6 +315,25 @@ async def test_agent_with_no_active_version_is_absent_from_the_catalog(ctx: _Ctx
 
 
 @pytest.mark.asyncio
+async def test_multi_version_agent_appears_once_with_newest_display_name(ctx: _Ctx) -> None:
+    """C-1 / I-1:同一个 name 有多个 ACTIVE 版本行是常态(发新版本只
+    ``create``,没有代码把旧版本降级)。去重前这条断言此前完全没有测试覆盖
+    ——评审把 ``if record.name in seen: continue`` 整段删掉,原先那 9 条测试
+    依然全绿。目录里这个 code 只能出现一次,且带的是**新版本**的
+    ``display_name``(两个版本给不同的 display_name,这样"取错版本"也会
+    被逮到)。"""
+    await ctx.seed_agent("multi", version="1.0.0", display_name="v1 name")
+    await ctx.seed_agent("multi", version="1.0.1", display_name="v2 name")
+
+    resp = await ctx.client.get("/v1/agent-catalog", headers=ctx.headers)
+
+    agents = resp.json()["data"]["agents"]
+    matches = [a for a in agents if a["agent_code"] == "multi"]
+    assert len(matches) == 1, f"multi 应该只出现一次,实际: {matches}"
+    assert matches[0]["display_name"] == "v2 name"
+
+
+@pytest.mark.asyncio
 async def test_pagination(ctx: _Ctx) -> None:
     for i in range(3):
         await ctx.seed_agent(f"agent-{i}")
@@ -257,11 +344,15 @@ async def test_pagination(ctx: _Ctx) -> None:
     assert len(page.json()["data"]["agents"]) == 2
     assert page.json()["data"]["limit"] == 2
     assert page.json()["data"]["offset"] == 0
+    # M-3 — total(去重后的总数,不分页)让客户端能判断翻完没有,不用只靠
+    # 「这页数量 < limit」去猜。
+    assert page.json()["data"]["total"] == 3
 
     rest = await ctx.client.get(
         "/v1/agent-catalog", params={"limit": 2, "offset": 2}, headers=ctx.headers
     )
     assert len(rest.json()["data"]["agents"]) == 1
+    assert rest.json()["data"]["total"] == 3
 
 
 @pytest.mark.asyncio
