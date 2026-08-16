@@ -258,6 +258,10 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/v1/agents/{agent_code}/sessions/{session_id}"),
         ("GET", "/v1/agents/{agent_code}/workspace/files"),
         ("GET", "/v1/agents/{agent_code}/workspace/file"),
+        # 阶段 3 PR-B — 对外产物视图(external_artifacts.py)。同样挂在
+        # ``APIRouter(prefix="/v1/agents", tags=["external"])`` 上,用
+        # ``require("session", ...)`` 而非 ``console_only()``。
+        ("GET", "/v1/agents/{agent_code}/artifacts"),
     }
 )
 
