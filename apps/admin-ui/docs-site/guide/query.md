@@ -455,14 +455,16 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 成功响应是文件字节流本身，**不是** `{success, data, error}` 形状——那个形状只包裹错误响应。`Content-Disposition` 的规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致：HTML / SVG 这类可执行内容强制 `attachment`，响应始终带 `X-Content-Type-Options: nosniff`。
 
-**这条接口计入配额。** 每次下载扣 1 次 `artifact_download` 额度，超限时返回 429，见 [7.6 限流与配额](./conventions#_7-6-限流与配额)。
+**这条接口计入配额。** 每次下载扣 1 次 `artifact_download` 额度（同时计入 `ARTIFACT_DOWNLOAD_COUNT_30D` 这个 30 天滑动窗口维度）。超限时返回 **429 `RATE_LIMIT_EXCEEDED`**（带 `Retry-After` 头）——**不是** `QUOTA_EXCEEDED`：这条接口的配额准入统一走限流引擎，任何维度耗尽都翻成同一个 `RATE_LIMIT_EXCEEDED`，见 [8.11 429](./errors#_8-11-429-——-两种情况-含义不同)。**不要**照 `Retry-After` 头做短退避重试——`ARTIFACT_DOWNLOAD_COUNT_30D` 是 30 天窗口慢速回补，短退避基本等于无限重试打空，命中这个 429 应该当作「这个终端用户的下载额度打满了」来处理，不是「这会儿太忙等等再试」。
 
 错误响应：
 
 | 状态码 | `error.code` | 含义 |
 |---|---|---|
 | 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、或不属于这个 `user_id`——**三种情况统一返回这一个 404**，不区分 |
+| 429 | `RATE_LIMIT_EXCEEDED` | `artifact_download` 配额（含 `ARTIFACT_DOWNLOAD_COUNT_30D` 30 天窗口）耗尽，见上方说明 |
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录在，但服务端读不到内容（存储配置问题）。**这不是"不存在"**，重试没用，联系你的租户管理员 |
+| 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储通路，产物内容整体不可读——同一个 `error.code`，靠状态码区分「配置缺失」（503）与「权限配置有问题」（500）两种服务端故障，都不是退避重试能解决的 |
 
 ### 删除产物
 
@@ -486,8 +488,10 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u
 { "success": true, "data": { "deleted": "2026-08 周报.docx" }, "error": null }
 ```
 
-::: warning 这是软删除
-产物从列表里消失、也下载不到了，但**工作区里的文件字节没有删**。到保留期后由后台清理任务真正删除。
+::: warning 这是软删除——工作区里的字节不会被这个 API 清除
+产物从「产物视图」（这三条接口：列表、下载、删除）里消失了，但**工作区里的文件字节从始至终没有被删除**，保留期后台清理任务到期后做的也**不是**删字节——那个任务只物理清掉产物的元数据行（名字、版本号这些），不碰底层文件本身。
+
+也就是说：只要还记得这个文件在工作区里的原始路径，删除之后（甚至保留期过了、元数据行都被后台任务清掉之后）仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的 `GET /v1/agents/{agent_code}/workspace/file` 原样下载到这份内容。**如果你把「删除产物」当成对终端用户「删除我的数据」的承诺，这条 API 目前不满足这个承诺**——它只是把这份产物从「成果清单」里摘下来，不是销毁数据；真要清除底层字节，眼下没有对外的操作能做到。
 
 如果 Agent 之后又用同一个 `name` 保存了一次，这个产物会**恢复**（版本号接着往上加）。
 
