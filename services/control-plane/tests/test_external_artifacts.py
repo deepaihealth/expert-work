@@ -328,7 +328,13 @@ def audit_entries(_ctx: _Ctx) -> Callable[[], list[AuditEntry]]:
 
 @pytest.mark.asyncio
 async def test_list_returns_active_artifacts(external_client, seed_artifact) -> None:
-    """列表返回 name/kind/latest_version/created_at/updated_at 五个字段。"""
+    """列表返回 name/kind/latest_version/created_at/updated_at 五个字段,值也要对。
+
+    终审 C2 顺带项:此前只断言了字段名集合和 ``name`` 的值,``kind`` /
+    ``latest_version`` / ``created_at`` / ``updated_at`` 四个字段的值从没被
+    断言过 —— 一个把 ``a.kind`` 错写成常量 ``"document"``、或者
+    ``a.latest_version`` 错写成 0 的实现改动,这条测试此前不会变红。
+    """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
     resp = await external_client.get("/v1/agents/test-agent/artifacts", params={"user_id": "u-1"})
     assert resp.status_code == 200
@@ -344,6 +350,10 @@ async def test_list_returns_active_artifacts(external_client, seed_artifact) -> 
         "updated_at",
     }, "字段集必须精确 —— 多给 size_bytes 会误导(它只在首次下载后才有值)"
     assert items[0]["name"] == "report.docx"
+    assert items[0]["kind"] == "document"
+    assert items[0]["latest_version"] == 1
+    assert items[0]["created_at"] is not None
+    assert items[0]["updated_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -355,6 +365,27 @@ async def test_list_hides_soft_deleted(
     await soft_delete_artifact(user_id="u-1", name="gone.docx")
     resp = await external_client.get("/v1/agents/test-agent/artifacts", params={"user_id": "u-1"})
     assert [a["name"] for a in resp.json()["data"]["artifacts"]] == []
+
+
+@pytest.mark.asyncio
+async def test_list_cross_user_isolation(external_client, seed_artifact) -> None:
+    """终审 Critical C2:两个不同的终端用户各有一份产物,列表绝不能串。
+
+    此前 20 条测试全部只 seed 单个用户,一个把 ``list_artifacts`` 里的
+    ``store.list_for_user(tenant_id=tenant_id, user_id=end_user_id)`` 换成
+    ``[a for a in store.list_all_tenants() if a.tenant_id == tenant_id]``
+    (丢了 user 维度、只剩 tenant 级过滤)的改动,全套件不会变红 —— 第三方
+    拿一把 read key、传任意 ``user_id``,就能列出该租户全部终端用户的产物名。
+    这条必须真的用两个真实存在的用户、各自不同的 name,才咬得住这类 bug。
+    """
+    await seed_artifact(user_id="user-a", name="user-a-report.docx", kind="document")
+    await seed_artifact(user_id="user-b", name="user-b-secret.docx", kind="document")
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts", params={"user_id": "user-a"}
+    )
+    assert resp.status_code == 200
+    names = [a["name"] for a in resp.json()["data"]["artifacts"]]
+    assert names == ["user-a-report.docx"], f"user-a 的列表里出现了不属于 user-a 的产物: {names!r}"
 
 
 @pytest.mark.asyncio
@@ -620,6 +651,55 @@ async def test_download_deducts_quota(
 
 
 @pytest.mark.asyncio
+async def test_download_429_when_download_count_quota_exhausted(
+    _ctx: _Ctx, external_client, seed_artifact_with_content
+) -> None:
+    """终审 Important I1:配额真的打满时,下载必须被拒 —— 不只是「配额函数被
+    调用过」。
+
+    ``test_download_deducts_quota`` 只用 monkeypatch 记录了
+    ``check_admission`` 被调过一次,这挡不住把 ``external_artifacts.py`` 里
+    ``if denial is not None: return denial`` 两行删掉这种改动(拒绝結果被拿到
+    但直接被扔掉,请求照样往下走)—— 那样改了之后 20 条既有测试全绿。这条镜像
+    ``test_artifacts_api.py::test_download_429_when_download_count_quota_exhausted``
+    的写法:把 ``ARTIFACT_DOWNLOAD_COUNT_30D`` 的桶配成 2,前两次下载在额度内
+    成功,第三次必须拿到 429 + ``RATE_LIMIT_EXCEEDED``。
+    """
+    from expert_work.protocol import QuotaDimension, TenantQuotaPatch
+
+    patch = TenantQuotaPatch(
+        dimension=QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D,
+        scope={},
+        limit_value=2,
+        burst=2,
+    )
+    await _ctx.app.state.tenant_quota_repo.upsert(  # type: ignore[attr-defined]
+        tenant_id=_TENANT_ID, patch=patch, updated_by="test"
+    )
+    await seed_artifact_with_content(
+        user_id="u-1", name="report.txt", kind="document", content=b"x"
+    )
+
+    for _ in range(2):
+        ok = await external_client.get(
+            "/v1/agents/test-agent/artifacts/download",
+            params={"user_id": "u-1", "name": "report.txt"},
+        )
+        assert ok.status_code == 200, ok.text
+
+    denied = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
+    )
+    assert denied.status_code == 429, denied.text
+    body = denied.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+    assert body["error"]["dimension"] == QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D.value
+    assert denied.headers["Retry-After"]
+
+
+@pytest.mark.asyncio
 async def test_download_requires_read_scope(external_client_no_scope) -> None:
     """零 scope 的 key 必须被 ``require("session", "read")`` 拒掉 —— 同
     ``test_list_requires_read_scope``,下载端点是这道闸独立的第二个挂点,删掉
@@ -630,6 +710,31 @@ async def test_download_requires_read_scope(external_client_no_scope) -> None:
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_download_name_with_nul_is_422_enveloped(external_client) -> None:
+    """终审 Critical C1:``name`` 含 NUL 字节 → 422,信封形状,不是裸文本 500。
+
+    ``name`` 走 ``get_latest_version`` 里 ``ArtifactRow.name == name`` 这个
+    text 列绑参(``persistence/artifact/sql.py``)——不过 ``reject_nul`` 就直接
+    崩到 asyncpg ``CharacterNotInRepertoireError``,而 ``app.py`` 没有兜底
+    ``@app.exception_handler(Exception)``,逃逸成 Starlette 裸文本
+    "Internal Server Error",不是 ``{success, data, error}`` 信封。这里用内存
+    store(不连真 Postgres)所以感受不到那次 asyncpg 崩溃本身,但闸必须在请求
+    真正碰到 store 之前就拦下 —— 断言的是 422 信封,不是「没有 500」。
+    """
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report\x00.txt"},
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert "detail" not in body
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_ARTIFACT_NAME"
+    assert body["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +864,24 @@ async def test_delete_requires_write_not_delete_scope(external_client, seed_arti
 
 
 @pytest.mark.asyncio
+async def test_delete_rejects_read_only_scope(external_client, seed_artifact) -> None:
+    """终审 Important I2:只有 ``read`` scope 的 key 打 DELETE 必须 403 ——
+    上一条测试只验了「write 能删」(收紧方向的自证),没验「read 不能删」这个
+    放松方向。把实现里的 ``require("session", "write")`` 改成
+    ``require("session", "read")`` 时,这条必须红(把上面
+    ``test_delete_requires_write_not_delete_scope`` 也变绿,因为 write scope
+    同时满足 read 档,那条测试挡不住这个方向的放松)。
+    """
+    await seed_artifact(user_id="u-1", name="report.docx", kind="document")
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=_headers(scopes=("read",)),
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_delete_emits_audit_with_on_behalf_of(
     external_client, seed_artifact, audit_entries
 ) -> None:
@@ -804,3 +927,26 @@ async def test_delete_miss_writes_no_audit(external_client, seed_artifact, audit
     )
     assert resp.status_code == 404
     assert [e for e in audit_entries() if e.action.value == "artifact:delete"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_name_with_nul_is_422_enveloped(external_client) -> None:
+    """终审 Critical C1:DELETE 的 ``name`` 含 NUL 字节 → 422,信封形状。
+
+    与 ``test_download_name_with_nul_is_422_enveloped`` 互补 —— DELETE 走
+    ``store.soft_delete`` 里独立的一处 ``ArtifactRow.name == name`` 绑参
+    (``persistence/artifact/sql.py``),是这道闸的第二个、独立的挂点,不会被
+    download 那条测试覆盖到。
+    """
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report\x00.txt"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert "detail" not in body
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_ARTIFACT_NAME"
+    assert body["error"]["message"]

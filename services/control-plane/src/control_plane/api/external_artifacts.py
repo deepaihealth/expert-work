@@ -40,6 +40,7 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     lookup_external_user_id,
+    reject_nul,
     reject_nul_path_params,
 )
 from control_plane.api._quota_admission import check_admission
@@ -70,6 +71,28 @@ def _get_quota(request: Request) -> QuotaService:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _name_or_422(name: str) -> str:
+    """``reject_nul`` for the ``name`` query param, translated into the same
+    envelope shape ``user_id``'s NUL check already produces.
+
+    Unlike ``user_id``, ``name`` is a raw ``Query(...)`` parameter — not a
+    pydantic body field with a ``field_validator`` to attach to — so this
+    calls :func:`reject_nul` directly and translates its ``ValueError``
+    itself, the same calling convention ``_external.py``'s own
+    ``_external_subject_id_or_422`` documents and uses for ``user_id``.
+    Without this, a NUL byte in ``name`` reaches ``ArtifactRow.name == name``
+    (a ``text``-column bind parameter in both ``get_latest_version`` and
+    ``soft_delete``, ``persistence/artifact/sql.py``) and asyncpg raises
+    ``CharacterNotInRepertoireError`` — uncaught, so it escapes as
+    Starlette's bare-text 500, breaking the external plane's envelope
+    contract (终审 C1).
+    """
+    try:
+        return reject_nul(name, field="name")
+    except ValueError as exc:
+        raise ExternalScopeError("INVALID_ARTIFACT_NAME", str(exc), 422) from exc
 
 
 def _artifact_error(code: str, message: str, status: int) -> JSONResponse:
@@ -153,7 +176,7 @@ def build_external_artifacts_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
-        name: Annotated[str, Query(min_length=1, max_length=1024)],
+        name: Annotated[str, Query(min_length=1, max_length=512)],
     ) -> Response:
         """Download the latest version of one artifact.
 
@@ -169,6 +192,7 @@ def build_external_artifacts_router() -> APIRouter:
         del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
         tenant_id: UUID = request.state.tenant_id
         try:
+            name = _name_or_422(name)
             end_user_id = await lookup_external_user_id(
                 tenant_id=tenant_id, user_id=user_id, users=users
             )
@@ -255,7 +279,7 @@ def build_external_artifacts_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
-        name: Annotated[str, Query(min_length=1, max_length=1024)],
+        name: Annotated[str, Query(min_length=1, max_length=512)],
     ) -> JSONResponse:
         """Soft-delete one artifact (metadata only).
 
@@ -274,6 +298,7 @@ def build_external_artifacts_router() -> APIRouter:
         del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
         tenant_id: UUID = request.state.tenant_id
         try:
+            name = _name_or_422(name)
             end_user_id = await lookup_external_user_id(
                 tenant_id=tenant_id, user_id=user_id, users=users
             )
