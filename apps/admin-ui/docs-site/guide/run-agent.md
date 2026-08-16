@@ -2,6 +2,50 @@
 
 本篇是 `POST /v1/agents/{agent_code}/runs` 的完整参数表——发起一次 Agent 对话/任务执行的核心接口。
 
+## Agent 目录
+
+`GET /v1/agent-catalog` 列出你的租户里当前有哪些 Agent 可以调——对接的第一步,发 run 之前先知道能发给谁,不用把 `agent_code` 写死在客户端里。这条接口是租户级的,**不需要 `user_id`**(目录跟具体哪个终端用户无关),路径下也没有 `{agent_code}`。
+
+```bash
+curl "https://<your-domain>/v1/agent-catalog?limit=50&offset=0" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "agents": [
+      {
+        "agent_code": "report-writer",
+        "display_name": "报表助手",
+        "description": "生成周报",
+        "available": true
+      }
+    ],
+    "limit": 50,
+    "offset": 0,
+    "total": 1
+  },
+  "error": null
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `agent_code` | string | 发 run 时填进 `POST /v1/agents/{agent_code}/runs` 路径里的那个值。 |
+| `display_name` | string | 展示名。**永远非空**——没在管理控制台配置显示名的 Agent,这里回落成 `agent_code` 本身,不用自己做空值判断。 |
+| `description` | string | Agent 的描述文本,租户内员工在管理控制台自己填的自由文本。 |
+| `available` | boolean | 现在能不能对它发 run。见下面这条。 |
+
+**注意事项**:
+
+- `available: false` 的 agent **仍然会出现在列表里**,只是标记不可用(界面上置灰即可)——这是"被禁用"(kill switch)的状态,**可逆**,随时可能被重新启用;对一个 `available: false` 的 agent 发 run 会被拒。
+- **只剩已弃用版本、没有任何可发 run 版本的 agent,不会出现在这份目录里**——这与上面"被禁用"是刻意不同的两种语义:被禁用是临时的、可逆的管理动作,列出来置灰对客户端有意义;没有可用版本是版本生命周期的终态,不会自己恢复,列一个永远 `false` 且不会变的条目只是噪音,所以干脆不出现在目录里,而不是以 `available: false` 的形式挂着。
+- 分页:`limit`(1–200,默认 50)/ `offset`(≥0,默认 0)/ `total`(去重后的 agent 总数——不是版本行数,也不是当前页的条目数)。
+- **翻页请用 `total` 判断有没有翻完**:`offset + 这一页的条目数 < total` 时还有下一页。**不要用"这一页条目数 < limit 就是最后一页"这个启发式**——同一个 `agent_code` 可能同时存在多个版本,目录按 `agent_code` 去重后返回,去重可能让恰好翻到的某一页天然短于 `limit`,用这个启发式会在还没翻完的时候提前退出,静默漏掉排在后面的 agent。
+- scope 要求:`read` 及以上(`write` key 含读,可以直接用)。
+
 ## 端点
 
 ```
@@ -337,6 +381,69 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/message
 `role` 是 `"user"` 或 `"assistant"`;`channel` 只对 `assistant` 消息有意义(`"final"` = 这一步是这一轮对话里最终会展示的回答,`"commentary"` = 中间过程性输出),`user` 消息恒为 `null`。
 
 `created_at` / `run_id` 是这次更新新加的字段。**这次更新之前产生的历史消息,这两个字段是 `null`**——写入时才会盖上时间戳和归属 run id,不做历史回填,不要假设它们一定有值。`session_id` 不属于这个 `user_id` / `agent_code`,返回 404(`SESSION_NOT_FOUND`),不会告诉你这个会话到底存不存在。
+
+## run 列表
+
+`GET /v1/agents/{agent_code}/runs` 列出这个终端用户在这个 Agent 上跑过的 run——不用自己在本地攒一份 `run_id` 清单来实现"我的任务列表"。
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "runs": [
+      {
+        "run_id": "...",
+        "session_id": "...",
+        "status": "success",
+        "created_at": "2026-08-12T10:00:00+00:00",
+        "finished_at": "2026-08-12T10:00:08+00:00",
+        "error": null
+      }
+    ],
+    "limit": 20,
+    "offset": 0
+  },
+  "error": null
+}
+```
+
+查询参数:
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | 只看这个终端用户的 run。**没有默认值,漏传直接 422**,不会降级成"列出整个租户的 run"。 |
+| `session_id` | 否 | 只看这一段会话里的 run。省略则不按会话过滤。**传了但这个会话不属于这个 `user_id` / `agent_code`,返回 404(`SESSION_NOT_FOUND`),不是空列表**——响应不能携带"这个会话到底存不存在"这类信息。 |
+| `status` | 否 | 只看这个状态的 run,可取值见下方「`status` 可取值」。 |
+| `limit` | 否 | 1–200,默认 50。 |
+| `offset` | 否 | ≥0,默认 0。 |
+
+响应字段:
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `run_id` | string(UUID) | 这次 run 的 id。 |
+| `session_id` | string(UUID) | 这次 run 所属的会话 id。 |
+| `status` | string | 见下方「`status` 可取值」。 |
+| `created_at` | string(ISO 8601) | run 创建时间。 |
+| `finished_at` | string(ISO 8601) \| null | run 走到终态的时间;还没走到终态时是 `null`。 |
+| `error` | string \| null | 失败原因,只在失败时非空,见下方「`error` 字段的语义」。 |
+
+### `status` 可取值
+
+`pending` / `queued` / `running` / `success` / `error` / `timeout` / `interrupted` / `paused`。其中 `success` / `error` / `timeout` / `interrupted` / `paused` 是终态——只有走到终态,`finished_at` 才会被写上。
+
+### `error` 字段的语义
+
+`error` 是一段自由格式的失败诊断文本,**与这次 run 在 SSE 事件流里发出的 `error` 帧携带的 `message` 是同一个字符串**(两者写自同一处)——要判断这次 run 失败的原因,读这个字段(或者对应的 SSE `error` 帧)就够了,内容逐字节一致。它**不是**另外一套结构化的错误码体系,不要按文案内容做模式匹配去反推分类(比如"是不是超时""是不是上游拒绝")——这个字段只保证内容和 SSE 帧一致,不保证文案格式跨版本稳定。
+
+`user_id` 是这个租户从没见过的值、且没传 `session_id` 时,返回空列表(不会为一个陌生 `user_id` 铸造终端用户)——与「会话列表」接口是同一条规则。
+
+scope 要求:`read` 及以上(`write` key 含读,可以直接用)。
 
 ## 工作区文件
 
