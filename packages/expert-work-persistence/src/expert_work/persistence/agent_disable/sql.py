@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -82,3 +83,15 @@ class SqlAgentDisableStore(AgentDisableStore):
             await session.commit()
             await session.refresh(row)
             return _row_to_record(row)
+
+    async def list_disabled_names(self, *, tenant_id: UUID) -> set[str]:
+        # 只 SELECT 名字这一列 —— 调用方只要名字集合,不需要整行。
+        # ``disabled.is_(True)`` 而不是 ``== True``:enable 过的行仍在表里
+        # (disabled=False),必须被过滤掉。
+        stmt = select(AgentDisableRow.agent_name).where(
+            AgentDisableRow.tenant_id == tenant_id,
+            AgentDisableRow.disabled.is_(True),
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return set(rows)

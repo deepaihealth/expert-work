@@ -37,7 +37,14 @@ export default defineConfig({
               { text: "3.7 Key 失效时会发生什么", link: "/guide/auth#_3-7-key-失效时会发生什么" },
             ],
           },
-          { text: "4 接口详情", link: "/guide/run-agent" },
+          {
+            text: "4 接口详情",
+            link: "/guide/run-agent",
+            items: [
+              { text: "Agent 目录", link: "/guide/run-agent#agent-目录" },
+              { text: "run 列表", link: "/guide/run-agent#run-列表" },
+            ],
+          },
           {
             text: "4.2/4.7 取消 run 与审批决策",
             link: "/guide/run-control",

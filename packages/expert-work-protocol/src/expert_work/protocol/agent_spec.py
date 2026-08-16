@@ -1150,6 +1150,11 @@ class AgentSpecBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     description: str = ""
+    #: 阶段 3 (3.1) — 给终端用户看的名字。``metadata.name``(= 对外的
+    #: ``agent_code``)是机器标识,直接显示在第三方界面上很难看。
+    #: 可选:为空时 ``GET /v1/agent-catalog`` 回落到 ``agent_code``,
+    #: 所以对外响应里这个字段永远非空,客户端不用做空判断。
+    display_name: str = ""
     extends: str | None = None
     tenant_config: TenantConfig
     model: ModelSpec

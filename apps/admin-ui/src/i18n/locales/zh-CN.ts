@@ -953,6 +953,9 @@ const zhCN: TranslationKeys = {
     field_name_required: "名称必填",
     field_name_placeholder: "my-agent",
     field_description: "描述",
+    field_display_name: "显示名",
+    field_display_name_help:
+      "第三方 App 里终端用户看到的名字。留空则回落到 agent 名称。",
     basic_yaml_note:
       "模板继承(extends)、租户合规标签(compliance_pack 等)这些高级项请到 YAML 视图配置。\n后三项(compliance_pack/isolation_level/data_residency)目前只校验格式,运行时不生效(沙箱隔离当前恒为 shared),审计保留天数暂由平台统一配置。",
     section_model: "模型",

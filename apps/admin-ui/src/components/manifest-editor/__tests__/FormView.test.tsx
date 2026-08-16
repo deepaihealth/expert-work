@@ -378,3 +378,48 @@ describe("FormView", () => {
     expect(screen.getByTestId("af-tools-config-note")).toBeInTheDocument();
   });
 });
+
+describe("FormView basic section — display_name", () => {
+  it("renders the current spec.display_name", () => {
+    render(
+      <FormView
+        formData={{ metadata: { name: "a" }, spec: { display_name: "报表助手" } }}
+        onChange={() => {}}
+        section="basic"
+      />,
+    );
+    const field = screen.getByTestId("af-display-name");
+    expect(within(field).getByRole("textbox")).toHaveValue("报表助手");
+  });
+
+  it("falls back to an empty box when spec.display_name is absent", () => {
+    render(
+      <FormView
+        formData={{ metadata: { name: "a" }, spec: {} }}
+        onChange={() => {}}
+        section="basic"
+      />,
+    );
+    const field = screen.getByTestId("af-display-name");
+    expect(within(field).getByRole("textbox")).toHaveValue("");
+  });
+
+  it("writes through to spec.display_name without clobbering siblings", async () => {
+    const onChange = vi.fn();
+    render(
+      <FormView
+        formData={{ metadata: { name: "a" }, spec: { description: "keep me" } }}
+        onChange={onChange}
+        section="basic"
+      />,
+    );
+
+    const field = screen.getByTestId("af-display-name");
+    await userEvent.type(within(field).getByRole("textbox"), "X");
+
+    const written = onChange.mock.calls.at(-1)?.[0];
+    expect(written.spec.display_name).toBe("X");
+    // 兄弟字段不能被写坏 —— patchSpec 的既有语义。
+    expect(written.spec.description).toBe("keep me");
+  });
+});

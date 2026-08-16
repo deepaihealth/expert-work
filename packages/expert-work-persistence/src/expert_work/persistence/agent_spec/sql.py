@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from expert_work.persistence.agent_spec.base import (
     AgentSpecStore,
@@ -142,6 +143,37 @@ class SqlAgentSpecStore(AgentSpecStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
+
+    async def list_distinct_active_by_tenant(
+        self, *, tenant_id: UUID, limit: int = 100, offset: int = 0
+    ) -> list[AgentSpecRecord]:
+        # DISTINCT ON (name) 要求 ORDER BY 以 name 起头;name, created_at DESC,
+        # id DESC(tie-break,见 base.py 抽象方法的 docstring)让每组保留最新
+        # 那行。外层再按 name 稳定排序后切片 —— LIMIT/OFFSET 必须打在去重
+        # **之后**,否则就是本方法要修的那个 bug(C-1)。
+        inner = (
+            select(AgentSpecRow)
+            .where(
+                AgentSpecRow.tenant_id == tenant_id,
+                AgentSpecRow.status == AgentSpecStatus.ACTIVE.value,
+            )
+            .distinct(AgentSpecRow.name)
+            .order_by(AgentSpecRow.name, AgentSpecRow.created_at.desc(), AgentSpecRow.id.desc())
+            .subquery()
+        )
+        row_cls = aliased(AgentSpecRow, inner)
+        stmt = select(row_cls).order_by(inner.c.name).limit(limit).offset(offset)
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_record(r) for r in rows]
+
+    async def count_distinct_active_by_tenant(self, *, tenant_id: UUID) -> int:
+        stmt = select(func.count(func.distinct(AgentSpecRow.name))).where(
+            AgentSpecRow.tenant_id == tenant_id,
+            AgentSpecRow.status == AgentSpecStatus.ACTIVE.value,
+        )
+        async with self._sf() as session:
+            return (await session.execute(stmt)).scalar_one()
 
     async def list_all_tenants(
         self,

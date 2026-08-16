@@ -19,8 +19,10 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.thread_meta import InMemoryThreadMetaStore, SqlThreadMetaStore
 from expert_work.runtime.runs import (
     DisconnectMode,
+    InMemoryRunStore,
     RunInfo,
     RunStatus,
     SqlRunEventStore,
@@ -69,6 +71,20 @@ def run_event_store(postgres_container: PostgresContainer) -> Iterator[SqlRunEve
         DatabaseConfig(dsn=_async_dsn(postgres_container))
     )
     yield SqlRunEventStore(create_async_session_factory(engine))
+
+
+@pytest.fixture
+def thread_meta_store(postgres_container: PostgresContainer) -> Iterator[SqlThreadMetaStore]:
+    """``SqlThreadMetaStore`` on the same database as ``run_store`` —— agent
+    过滤 join 的是 ``thread_meta``,所以两个 store 必须落在同一个库上。"""
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+
+    engine: AsyncEngine = create_async_engine_from_config(
+        DatabaseConfig(dsn=_async_dsn(postgres_container))
+    )
+    yield SqlThreadMetaStore(create_async_session_factory(engine))
 
 
 def _info(
@@ -760,3 +776,38 @@ async def test_list_running_for_agent_filters_by_version_when_given(
         tenant_id=tenant, agent_name="foo", agent_version="1.0.0"
     )
     assert {r.run_id for r in only_v1} == {run_v1}  # version sentinel; NULL row excluded
+
+
+@pytest.mark.asyncio
+async def test_agent_name_filter_matches_the_in_memory_store(
+    run_store: SqlRunStore, thread_meta_store: SqlThreadMetaStore
+) -> None:
+    """两个后端各写一遍谓词,是本仓反复出问题的地方(SQL 的 join 语义与
+    内存的逐行比较不是自动等价的)。同一组输入喂两边,断言结果集相同。
+
+    覆盖四种输入:两个命中的、一个不命中的、``None``(不过滤)。只测命中
+    的话,「SQL 把过滤条件写反了」和「写对了」会给出同样的绿。
+    """
+    mem_threads = InMemoryThreadMetaStore()
+    mem_runs = InMemoryRunStore(thread_meta_store=mem_threads)
+    tenant_id = uuid4()
+    layout = [("alpha", uuid4()), ("beta", uuid4()), ("alpha", uuid4())]
+
+    for agent_name, thread_id in layout:
+        for threads in (thread_meta_store, mem_threads):
+            await threads.create(
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                created_by="seed",
+                agent_name=agent_name,
+            )
+        run_id = uuid4()
+        for runs in (run_store, mem_runs):
+            await runs.create(_info(run_id=run_id, tenant_id=tenant_id, thread_id=thread_id))
+
+    for probe in ("alpha", "beta", "nonexistent", None):
+        sql_rows = await run_store.list_for_tenant(tenant_id=tenant_id, agent_name=probe)
+        mem_rows = await mem_runs.list_for_tenant(tenant_id=tenant_id, agent_name=probe)
+        assert {r.run_id for r in sql_rows} == {r.run_id for r in mem_rows}, (
+            f"agent_name={probe!r} 两个后端结果不一致"
+        )

@@ -2,7 +2,7 @@
 
 Starlette's router matches by **registration order, not specificity**
 (``app.py``'s comment above the ``build_external_*_router()`` calls). The
-five external routers must stay registered *before* ``build_agents_router()``:
+seven external routers must stay registered *before* ``build_agents_router()``:
 its ``GET /{name}/{version}`` is a two-segment, fully-parameterised path that
 silently swallows any two-segment ``/{agent_code}/<literal>`` external route
 registered after it (``version`` would just bind to the literal, e.g.
@@ -92,12 +92,13 @@ def _first_match(routes: list[BaseRoute], path: str, method: str) -> BaseRoute |
 
 
 def _external_routes(routes: list[BaseRoute]) -> list[Route]:
+    """Discovery is by ``tags=["external"]`` alone — see the same-named
+    function in ``test_external_only_gate.py`` for why the path-prefix
+    condition this used to also require was dropped."""
     return [
         route
         for route in routes
-        if isinstance(route, Route)
-        and route.path.startswith("/v1/agents/")
-        and "external" in (getattr(route, "tags", None) or [])
+        if isinstance(route, Route) and "external" in (getattr(route, "tags", None) or [])
     ]
 
 
@@ -111,7 +112,7 @@ def test_every_external_agents_route_is_reachable() -> None:
     """
     routes = _build_routes()
     external_routes = _external_routes(routes)
-    assert external_routes, "expected at least one tags=['external'] route under /v1/agents/"
+    assert external_routes, "expected at least one tags=['external'] route"
 
     for route in external_routes:
         for method in sorted(route.methods or set()):
@@ -142,3 +143,12 @@ def test_name_version_route_still_wins_for_a_real_agent_and_version() -> None:
     assert winner.path == "/v1/agents/{name}/{version}"
     assert "agents" in (winner.tags or [])
     assert "external" not in (winner.tags or [])
+
+
+def test_the_discovery_is_not_tied_to_the_agents_path_prefix() -> None:
+    """See ``test_external_only_gate.py``'s same-named test's docstring."""
+    paths = {r.path for r in _external_routes(_build_routes())}
+    assert "/v1/agent-catalog" in paths, (
+        "external route /v1/agent-catalog was not picked up by the "
+        "discoverer — it is still filtering by path prefix"
+    )

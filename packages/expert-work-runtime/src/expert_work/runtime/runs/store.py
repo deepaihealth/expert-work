@@ -270,6 +270,7 @@ class RunStore(abc.ABC):
         status: RunStatus | None = None,
         thread_ids: Collection[UUID] | None = None,
         user_id: UUID | None = None,
+        agent_name: str | None = None,
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
@@ -282,6 +283,20 @@ class RunStore(abc.ABC):
         Mini-ADR H-10 — the API layer resolves an agent to its thread
         window via ``ThreadMetaStore`` and passes the ids here; an empty
         collection returns no rows).
+
+        ``agent_name`` (阶段 3, 3.2) narrows to runs whose thread is bound
+        to that agent. Runs carry no agent — the binding lives on
+        ``thread_meta`` — so this is a join, exactly like
+        :meth:`list_running_for_agent`. Doing it in the API layer instead
+        (fetch the thread ids first, pass ``thread_ids=``) breaks
+        pagination: a tenant's thread count is unbounded, so taking one
+        page of threads and then filtering runs makes ``offset`` mean
+        something else entirely.
+
+        An in-memory store with no ``thread_meta_store`` wired returns
+        ``[]`` for any ``agent_name`` query rather than silently ignoring
+        the filter — same rule as :meth:`list_running_for_agent`. Silently
+        dropping the predicate would leak other agents' runs.
         """
 
     @abc.abstractmethod
@@ -657,6 +672,7 @@ class InMemoryRunStore(RunStore):
         status: RunStatus | None = None,
         thread_ids: Collection[UUID] | None = None,
         user_id: UUID | None = None,
+        agent_name: str | None = None,
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
@@ -669,6 +685,15 @@ class InMemoryRunStore(RunStore):
         if thread_ids is not None:
             wanted = set(thread_ids)
             rows = [r for r in rows if r.thread_id in wanted]
+        if agent_name is not None:
+            if self._thread_meta_store is None:
+                return []
+            kept: list[RunInfo] = []
+            for r in rows:
+                meta = await self._thread_meta_store.get(r.thread_id, tenant_id=tenant_id)
+                if meta is not None and meta.agent_name == agent_name:
+                    kept.append(r)
+            rows = kept
         if q:
             ql = q.lower()
             rows = [
@@ -1145,6 +1170,7 @@ class SqlRunStore(RunStore):
         status: RunStatus | None = None,
         thread_ids: Collection[UUID] | None = None,
         user_id: UUID | None = None,
+        agent_name: str | None = None,
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
@@ -1165,6 +1191,14 @@ class SqlRunStore(RunStore):
             stmt = stmt.where(AgentRunRow.user_id == user_id)
         if thread_ids is not None:
             stmt = stmt.where(AgentRunRow.thread_id.in_(list(thread_ids)))
+        if agent_name is not None:
+            # agent 绑定在 thread_meta 上,不在 agent_run 上 —— 与
+            # ``list_running_for_agent`` 同一个 join。注意这个 join 必须
+            # 只在需要时加:无条件 join 会把没有 thread_meta 行的 run
+            # (理论上不该有,但历史数据里可能存在)从默认列表里静默剔掉。
+            stmt = stmt.join(ThreadMetaRow, ThreadMetaRow.thread_id == AgentRunRow.thread_id).where(
+                ThreadMetaRow.agent_name == agent_name
+            )
         if q:
             pat = _like_contains(q)
             stmt = stmt.where(

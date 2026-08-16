@@ -12,6 +12,7 @@ from control_plane.api.billing_admin import build_billing_admin_router
 from control_plane.api.conversations import build_conversations_router
 from control_plane.api.curation import build_curation_router, build_eval_dataset_router
 from control_plane.api.eval_runs import build_eval_runs_router
+from control_plane.api.external_agent_catalog import build_external_agent_catalog_router
 from control_plane.api.external_approvals import build_external_approvals_router
 from control_plane.api.external_events import build_external_events_router
 from control_plane.api.external_runs import build_external_runs_router
@@ -88,6 +89,7 @@ __all__ = [
     "build_curation_router",
     "build_eval_dataset_router",
     "build_eval_runs_router",
+    "build_external_agent_catalog_router",
     "build_external_approvals_router",
     "build_external_events_router",
     "build_external_runs_router",

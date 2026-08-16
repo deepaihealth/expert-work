@@ -414,15 +414,23 @@ def _build_audit_app() -> Any:
 
 
 def _external_agents_routes(app: Any) -> list[APIRoute]:
-    """Every route under ``/v1/agents`` tagged ``external`` — discovered from
-    the live app, not a hand-maintained list, so a new route mounted on any
-    of the six ``external_*.py`` routers is picked up automatically."""
+    """Every route tagged ``external`` — discovered from the live app, not a
+    hand-maintained list, so a new route mounted on any of the seven
+    ``external_*.py`` routers is picked up automatically.
+
+    Discovery is by ``tags=["external"]`` **alone** — no path-prefix
+    condition. All of this suite's tests used to also require
+    ``route.path.startswith("/v1/agents/")``, which made ``GET
+    /v1/agent-catalog`` (phase 3's first external route NOT under
+    ``/v1/agents/``) invisible to this audit while it stayed green. Only
+    ``external_*.py`` ever sets this tag, so the tag alone is already
+    precise, and dropping the prefix means any future new prefix is covered
+    automatically instead of silently falling outside this audit.
+    """
     return [
         route
         for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path.startswith("/v1/agents/")
-        and "external" in (route.tags or [])
+        if isinstance(route, APIRoute) and "external" in (route.tags or [])
     ]
 
 
@@ -442,7 +450,7 @@ def test_every_external_agents_route_carries_the_nul_path_guard() -> None:
     Discovery is by ``tags=["external"]``, not a fixed route table — unlike
     the console-lockdown audit (which has to hand-maintain a prefix/route
     table because ``console_only()`` is NOT applied uniformly to a whole
-    router), every route on these six routers gets the guard by
+    router), every route on these seven routers gets the guard by
     construction, so there is nothing here that can go stale the way a
     hand-maintained list can. Mutation proof for "this is per-route, not a
     loose match": temporarily drop ``dependencies=[Depends(reject_nul_path_params)]``
@@ -457,7 +465,7 @@ def test_every_external_agents_route_carries_the_nul_path_guard() -> None:
     # external routers are registered (a much bigger regression) or the tag
     # convention itself has drifted, and either way this audit has gone
     # blind and must fail loudly rather than vacuously pass.
-    assert external_routes, "expected at least one tags=['external'] route under /v1/agents/"
+    assert external_routes, "expected at least one tags=['external'] route"
     missing = [
         f"{sorted(m for m in (r.methods or ()) if m not in ('HEAD', 'OPTIONS'))} {r.path}"
         for r in external_routes
@@ -466,9 +474,21 @@ def test_every_external_agents_route_carries_the_nul_path_guard() -> None:
     assert not missing, f"external routes missing reject_nul_path_params: {missing}"
 
 
+def test_the_discovery_is_not_tied_to_the_agents_path_prefix() -> None:
+    """See the same-named test in ``test_external_only_gate.py`` for why:
+    discovery must key off ``tags=["external"]`` alone, not a path prefix.
+    """
+    app = _build_audit_app()
+    paths = {r.path for r in _external_agents_routes(app)}
+    assert "/v1/agent-catalog" in paths, (
+        "external route /v1/agent-catalog was not picked up by the "
+        "discoverer — it is still filtering by path prefix"
+    )
+
+
 #: The third-party-reachable ``/v1/agents/{agent_code}`` / ``{name}`` routes
 #: that live on ``agents.py``'s OWN router (``tags=["agents"]``, not
-#: ``"external"``) rather than one of the six ``external_*.py`` routers —
+#: ``"external"``) rather than one of the seven ``external_*.py`` routers —
 #: ``bind_session`` / ``run_agent_for_user`` predate the ``external_*.py``
 #: split (External-API-v1 P1), and ``disable``/``enable`` are reachable by
 #: the same ``write``-scope API key class via ``require("manifest",
@@ -505,7 +525,7 @@ _AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
 def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
     """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
     agents.py's OWN router (excludes ``tags=["external"]`` routes — those live
-    on the six ``external_*.py`` routers, already covered by the tag-driven
+    on the seven ``external_*.py`` routers, already covered by the tag-driven
     audit above). A TRUE full enumeration of the live app — see the docstring
     on ``test_agents_router_external_routes_carry_the_nul_path_guard`` for why
     this replaced the previous, table-membership-filtered construction."""

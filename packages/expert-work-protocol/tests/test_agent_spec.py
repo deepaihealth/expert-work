@@ -1009,3 +1009,30 @@ def test_token_budget_defaults_zero_and_rejects_negative() -> None:
     doc["spec"]["policies"] = {"token_budget": -1}
     with pytest.raises(ValidationError):
         AgentSpec.model_validate(doc)
+
+
+def test_display_name_defaults_to_empty_string() -> None:
+    """存量 manifest(没有这个字段)必须照常反序列化,不能抛 ValidationError。
+
+    ``AgentSpecBody`` 是 ``extra="forbid"``,所以新增字段只影响写入侧;
+    这条证明读取侧对老数据向后兼容。``_doc()`` 就是这样一份不含
+    ``display_name`` 的既有 manifest。
+    """
+    spec = AgentSpec.model_validate(_doc())
+    assert spec.spec.display_name == ""
+
+
+def test_display_name_round_trips() -> None:
+    doc = _doc()
+    doc["spec"]["display_name"] = "报表助手"
+    spec = AgentSpec.model_validate(doc)
+    assert spec.spec.display_name == "报表助手"
+    assert spec.model_dump(mode="json")["spec"]["display_name"] == "报表助手"
+
+
+def test_display_name_appears_in_the_generated_json_schema() -> None:
+    """``GET /v1/agents/schema`` 由 ``AgentSpec.model_json_schema()`` 生成,
+    manifest 编辑器直接吃它。字段进不了 schema,编辑器就永远看不到。"""
+    schema = AgentSpec.model_json_schema(by_alias=True)
+    body = schema["$defs"]["AgentSpecBody"]["properties"]
+    assert "display_name" in body

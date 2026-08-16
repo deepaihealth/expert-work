@@ -34,10 +34,13 @@ _BASE_SPEC: dict[str, Any] = {
 }
 
 
-def _spec(*, version: str = "1.0.0", name: str = "code-reviewer") -> AgentSpec:
+def _spec(
+    *, version: str = "1.0.0", name: str = "code-reviewer", display_name: str = ""
+) -> AgentSpec:
     doc = deepcopy(_BASE_SPEC)
     doc["metadata"]["version"] = version
     doc["metadata"]["name"] = name
+    doc["spec"]["display_name"] = display_name
     return AgentSpec.model_validate(doc)
 
 
@@ -238,3 +241,120 @@ async def test_revisions_do_not_leak_cross_tenant(store: InMemoryAgentSpecStore)
     assert (
         await store.list_revisions(tenant_id=_TENANT_B, name="code-reviewer", version="1.0.0") == []
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (3.1) C-1 — list_distinct_active_by_tenant / count_distinct_active_by_tenant
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_dedupes_before_paginating(
+    store: InMemoryAgentSpecStore,
+) -> None:
+    """C-1 的核心断言。一个 name 有多个 ACTIVE 版本行是常态(发新版本只
+    create,没有代码把旧版本降级)。分页必须打在去重后的结果上 —— 如果先
+    分页再去重,``limit=2 offset=0`` 会因为 alpha 占了两个槽位而只剩 1 个
+    去重后的结果,客户端按标准的"不足一页即最后一页"循环会静默漏掉
+    beta / gamma。"""
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.0"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.1"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="beta", version="1.0.0"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="gamma", version="1.0.0"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+
+    page0 = await store.list_distinct_active_by_tenant(tenant_id=_TENANT_A, limit=2, offset=0)
+    assert [r.name for r in page0] == ["alpha", "beta"]
+
+    page1 = await store.list_distinct_active_by_tenant(tenant_id=_TENANT_A, limit=2, offset=2)
+    assert [r.name for r in page1] == ["gamma"]
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_keeps_newest_version_fields(
+    store: InMemoryAgentSpecStore,
+) -> None:
+    """去重保留的必须是 ``created_at`` 最新的那一行 —— 与
+    ``agents.py:_resolve_session`` 用 ``limit=1`` 取最新 ACTIVE 选的是同一
+    行。用不同 ``display_name`` 标记两个版本,这样"取错版本"也会被逮到。"""
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.0", display_name="v1 name"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.1", display_name="v2 name"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+
+    rows = await store.list_distinct_active_by_tenant(tenant_id=_TENANT_A)
+
+    assert len(rows) == 1
+    assert rows[0].version == "1.0.1"
+    assert rows[0].spec.spec.display_name == "v2 name"
+
+
+@pytest.mark.asyncio
+async def test_list_distinct_active_by_tenant_excludes_non_active_and_other_tenants(
+    store: InMemoryAgentSpecStore,
+) -> None:
+    await store.create(
+        tenant_id=_TENANT_A, spec=_spec(name="alpha"), spec_sha256=_sha(), created_by="a"
+    )
+    await store.create(
+        tenant_id=_TENANT_A, spec=_spec(name="beta"), spec_sha256=_sha(), created_by="a"
+    )
+    await store.update_status(
+        tenant_id=_TENANT_A, name="beta", version="1.0.0", status=AgentSpecStatus.DEPRECATED
+    )
+    await store.create(
+        tenant_id=_TENANT_B, spec=_spec(name="gamma"), spec_sha256=_sha(), created_by="a"
+    )
+
+    rows = await store.list_distinct_active_by_tenant(tenant_id=_TENANT_A)
+
+    assert [r.name for r in rows] == ["alpha"]
+
+
+@pytest.mark.asyncio
+async def test_count_distinct_active_by_tenant(store: InMemoryAgentSpecStore) -> None:
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.0"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A,
+        spec=_spec(name="alpha", version="1.0.1"),
+        spec_sha256=_sha(),
+        created_by="a",
+    )
+    await store.create(
+        tenant_id=_TENANT_A, spec=_spec(name="beta"), spec_sha256=_sha(), created_by="a"
+    )
+
+    # 两个 name(alpha 两个版本合一),不是三行。
+    assert await store.count_distinct_active_by_tenant(tenant_id=_TENANT_A) == 2

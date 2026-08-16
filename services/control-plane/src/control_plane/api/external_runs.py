@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,13 +22,15 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_run,
+    load_owned_session,
+    lookup_external_user_id,
     reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import Principal
-from expert_work.runtime.runs import RunStore
+from expert_work.runtime.runs import RunStatus, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 
 
@@ -59,6 +61,107 @@ def build_external_runs_router() -> APIRouter:
         tags=["external"],
         dependencies=[Depends(reject_nul_path_params), Depends(external_only())],
     )
+
+    @router.get(
+        "/{agent_code}/runs",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
+    async def list_runs(
+        agent_code: str,
+        request: Request,
+        runs: Annotated[RunStore, Depends(_get_run_store)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        user_id: Annotated[str, Query(min_length=1, max_length=255)],
+        session_id: Annotated[UUID | None, Query()] = None,
+        status: Annotated[RunStatus | None, Query()] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> JSONResponse:
+        """列出这个终端用户在这个 agent 上跑过的 run。
+
+        ``user_id`` 必填、无默认 —— 漏传是 422,不是「列出整个租户」。
+
+        ``session_id`` 选填:给了就先验它属于 ``(user, agent)``(不属于就
+        404,不是空列表 —— 响应不能携带存在性信息),再按那个 thread 过滤。
+        给了 ``session_id`` 时,``load_owned_session`` 返回的 ``meta.user_id``
+        才是权威值(直接复用授权那次读,不再另外查一次 —— 也避免两次查询
+        之间出现 TOCTOU 窗口)。
+
+        ``mint=False``:一个这个租户从没见过的 ``user_id``,在**没给**
+        ``session_id`` 时返回空列表且不建 ``tenant_user`` 行(P1 复审
+        T3)——「没跑过 run」和「没这个人」对第三方是同一个事实。给了
+        ``session_id`` 则统一走上面的 404(未知用户不构成特例)。
+
+        ``error`` 与 SSE ``error`` 帧携带的是同一个字符串(两者都是
+        ``str(exc)``,``orchestrator/sse.py:745``/``:779``),所以这里给出
+        它没有新开任何泄露面。
+        """
+        tenant_id: UUID = request.state.tenant_id
+        thread_ids: list[UUID] | None = None
+        end_user_id: UUID | None
+        if session_id is not None:
+            try:
+                meta = await load_owned_session(
+                    tenant_id=tenant_id,
+                    agent_code=agent_code,
+                    user_id=user_id,
+                    session_id=session_id,
+                    threads=threads,
+                    users=users,
+                    mint=False,
+                )
+            except ExternalScopeError as exc:
+                return external_error(exc)
+            end_user_id = meta.user_id
+            thread_ids = [session_id]
+        else:
+            try:
+                end_user_id = await lookup_external_user_id(
+                    tenant_id=tenant_id, user_id=user_id, users=users
+                )
+            except ExternalScopeError as exc:
+                return external_error(exc)
+            if end_user_id is None:
+                return JSONResponse(
+                    {
+                        "success": True,
+                        "data": {"runs": [], "limit": limit, "offset": offset},
+                        "error": None,
+                    }
+                )
+
+        rows = await runs.list_for_tenant(
+            tenant_id=tenant_id,
+            user_id=end_user_id,
+            agent_name=agent_code,
+            thread_ids=thread_ids,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        return JSONResponse(
+            {
+                "success": True,
+                "data": {
+                    "runs": [
+                        {
+                            "run_id": str(r.run_id),
+                            "session_id": str(r.thread_id),
+                            "status": r.status.value,
+                            "created_at": r.created_at.isoformat() if r.created_at else None,
+                            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                            "error": r.error,
+                        }
+                        for r in rows
+                    ],
+                    "limit": limit,
+                    "offset": offset,
+                },
+                "error": None,
+            }
+        )
 
     @router.post("/{agent_code}/runs/{run_id}:cancel", response_model=None)
     async def cancel_run(

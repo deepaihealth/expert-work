@@ -177,3 +177,57 @@ async def test_rls_blocks_cross_tenant_read(
         assert await store.get(tenant_id=tenant_a, agent_name="a") is None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_disabled_names_matches_the_in_memory_store(
+    agent_disable_store: tuple[SqlAgentDisableStore, AsyncEngine],
+) -> None:
+    """SQL 与 in-memory 的谓词必须同义 —— 两个后端各写一遍过滤条件,
+    是本仓反复出问题的地方(SQL 用 ``== True`` / 内存用 ``is True``
+    这类差异不会被单后端测试发现)。同一组输入喂两个 store,断言输出相等。
+    """
+    from expert_work.persistence.agent_disable.memory import InMemoryAgentDisableStore
+
+    sql_store, engine = agent_disable_store
+    try:
+        mem_store = InMemoryAgentDisableStore()
+        tenant_id = uuid4()
+        current_tenant_id_var.set(tenant_id)
+        fixtures = [("off-1", True), ("off-2", True), ("back-on", False)]
+        for name, disabled in fixtures:
+            for store in (sql_store, mem_store):
+                await store.set_disabled(
+                    tenant_id=tenant_id,
+                    agent_name=name,
+                    disabled=disabled,
+                    reason=None,
+                    disabled_by=None,
+                )
+
+        sql_result = await sql_store.list_disabled_names(tenant_id=tenant_id)
+        mem_result = await mem_store.list_disabled_names(tenant_id=tenant_id)
+        assert sql_result == mem_result == {"off-1", "off-2"}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_disabled_names_does_not_leak_across_tenants(
+    agent_disable_store: tuple[SqlAgentDisableStore, AsyncEngine],
+) -> None:
+    store, engine = agent_disable_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        current_tenant_id_var.set(tenant_a)
+        await store.set_disabled(
+            tenant_id=tenant_a, agent_name="mine", disabled=True, reason=None, disabled_by=None
+        )
+        current_tenant_id_var.set(tenant_b)
+        await store.set_disabled(
+            tenant_id=tenant_b, agent_name="theirs", disabled=True, reason=None, disabled_by=None
+        )
+        current_tenant_id_var.set(tenant_a)
+        assert await store.list_disabled_names(tenant_id=tenant_a) == {"mine"}
+    finally:
+        await engine.dispose()

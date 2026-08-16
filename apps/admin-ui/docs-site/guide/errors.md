@@ -120,7 +120,7 @@
 ```
 
 - `AGENT_NOT_FOUND`——`{agent_code}` 在你的租户下没有已发布(ACTIVE)的版本:要么这个名字从没建过,要么建了但还没发布 / 已经下线,两种情况返回同一个 404,不做区分。
-- `SESSION_NOT_FOUND`——传的 `session_id` 找不到,或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理,不会告诉你"存在但不是你的")。历史消息、重命名(`PATCH .../sessions/{session_id}`)、归档(`DELETE .../sessions/{session_id}`)三个接口都走这同一条不透明规则。
+- `SESSION_NOT_FOUND`——传的 `session_id` 找不到,或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理,不会告诉你"存在但不是你的")。历史消息、重命名(`PATCH .../sessions/{session_id}`)、归档(`DELETE .../sessions/{session_id}`)、run 列表(`GET .../runs?session_id=`)四个接口都走这同一条不透明规则。
 - `WORKSPACE_FILE_FAILED`——`GET /v1/agents/{agent_code}/workspace/file` 下载文件时,`user_id` 未识别(不认识这个终端用户)和 `path` 指向的文件不存在,这两种情况返回同一个不透明的 404,不要试图从响应里区分是哪一种——这是刻意的存在性隐藏,不是 bug。同一个 `error.code` 在 400 / 500 也会出现,靠 HTTP 状态码区分,见下方「400」与「500」两节。
 - `RUN_NOT_FOUND` / `APPROVAL_NOT_FOUND`——取消 run(`:cancel`)与审批决策(`:decide`)这两个端点各自的归属校验 / 审批查找失败码,完整的失败码表(含这两个端点特有的 409 / 403 / 410 / 422 情况)见 [取消 run 与审批决策](./run-control)。
 
