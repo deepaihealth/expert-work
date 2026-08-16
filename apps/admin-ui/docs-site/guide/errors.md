@@ -21,6 +21,7 @@
 | [`WORKSPACE_FILE_FAILED`](#_404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `user_id` 未识别，或文件不存在 | 核对 `user_id` / `path` |
 | [`RUN_NOT_FOUND`](./run-control) | 404 | `run_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；不要当作"还没创建好"去重试 |
 | [`APPROVAL_NOT_FOUND`](./run-control) | 404 | 这个 `run_id` 没有一条待审批记录 | 确认这个 run 真的处于等待审批状态 |
+| [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物不存在、已删除，或不属于这个 `user_id` | 核对 `user_id` / `name`；三种情况不区分 |
 | [`APPROVAL_CONFLICT`](./run-control) | 409 | 这条审批已经被决定过 | 不要重复决策；要重放上次结果，带上当时用的 `idempotency_key` |
 | [`SESSION_NOT_BOUND`](./run-control) | 409 | run 所在会话没有绑定 agent(内部状态异常) | 联系租户管理员 |
 | [`AGENT_DELETED`](./run-control) | 410 | agent 已被(软)删除 | 不可恢复，换一个 `agent_code` |
@@ -43,6 +44,7 @@
 | [`WORKSPACE_LIST_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 工作区存储服务端配置有问题 | 不是你这边能解决的，联系租户管理员 |
 | [`WORKSPACE_FILE_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 同上 | 联系租户管理员 |
 | [`UPLOAD_FAILED`](#_500-——-工作区服务端配置问题) | 500 / [502](#_502-——-上传写入失败-上游错误) | 文件上传落盘失败(服务端配置问题，或写入时的上游错误) | 重试；持续失败联系租户管理员 |
+| [`ARTIFACT_CONTENT_UNAVAILABLE`](./query#_5-7-产物) | 500 | 产物记录在，服务端读不到内容 | 服务端存储配置问题，重试无效，联系租户管理员 |
 | [`UPLOAD_UNAVAILABLE`](#_503-——-服务不可用-两种含义不同) | 503 | 上传接口专属:对象存储或沙箱工作区未就绪 | 稍后重试；持续失败联系租户管理员 |
 | [`SERVER_OVERLOADED`](#_503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**，不只是上传 | 按 `Retry-After` 头退避重试 |
 | [`DEADLINE_EXCEEDED`](#_504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值，或者干脆别传它 |

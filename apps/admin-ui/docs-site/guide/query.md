@@ -387,3 +387,111 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 ```
 
 细节见 [8 错误码总表](./errors)。
+
+## 5.7 产物
+
+Agent 在执行过程中可以把一份成果**登记成产物**（比如一份周报、一份导出数据）。产物和工作区文件的区别：工作区是 Agent 的原始文件系统，产物是 Agent 主动挑出来、给人看的那些，带名字、类型和版本号。下面这三条接口分别用来列出、下载和删除产物。
+
+这三条接口的 `agent_code` **不参与过滤**——产物按 (租户, 终端用户) 维度存，与 [5.6 工作区文件](#_5-6-工作区文件) 同一条规则。
+
+### 列出产物
+
+```
+GET /v1/agents/{agent_code}/artifacts
+```
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "artifacts": [
+      {
+        "name": "2026-08 周报.docx",
+        "kind": "document",
+        "latest_version": 3,
+        "created_at": "2026-08-12T10:00:00+00:00",
+        "updated_at": "2026-08-14T09:30:00+00:00"
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 产物名，在同一个终端用户下唯一。下载和删除都用它 |
+| `kind` | `document` / `code` / `data` / `other`，由 Agent 保存时声明 |
+| `latest_version` | 版本号。Agent 每次用同名保存一次就 +1 |
+| `created_at` / `updated_at` | 首次创建 / 最近一次更新时间 |
+
+**列表里没有文件大小。** 大小和校验和是**首次下载时才记录**的，列表里给出来大部分是 `null`，反而误导。
+
+已删除的产物不出现在这个列表里。`user_id` 是这个租户从没见过的值时返回空列表，不是 404。
+
+### 下载产物
+
+```
+GET /v1/agents/{agent_code}/artifacts/download
+```
+
+下载的永远是**最新版本**，当前不提供按版本号下载。
+
+| 查询参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | |
+| `name` | 是 | 原样回传列表里的 `name`，不要自己拼 |
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-123&name=2026-08%20周报.docx" \
+  -H "Authorization: Bearer <key>" \
+  -o report.docx
+```
+
+成功响应是文件字节流本身，**不是** `{success, data, error}` 形状——那个形状只包裹错误响应。`Content-Disposition` 的规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致：HTML / SVG 这类可执行内容强制 `attachment`，响应始终带 `X-Content-Type-Options: nosniff`。
+
+**这条接口计入配额。** 每次下载扣 1 次 `artifact_download` 额度，超限时返回 429，见 [7.6 限流与配额](./conventions#_7-6-限流与配额)。
+
+错误响应：
+
+| 状态码 | `error.code` | 含义 |
+|---|---|---|
+| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、或不属于这个 `user_id`——**三种情况统一返回这一个 404**，不区分 |
+| 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录在，但服务端读不到内容（存储配置问题）。**这不是"不存在"**，重试没用，联系你的租户管理员 |
+
+### 删除产物
+
+```
+DELETE /v1/agents/{agent_code}/artifacts
+```
+
+要求 `write` 权限（与归档会话一样，对外 API 没有单独的删除权限档位）。
+
+| 查询参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | |
+| `name` | 是 | |
+
+```bash
+curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123&name=2026-08%20周报.docx" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{ "success": true, "data": { "deleted": "2026-08 周报.docx" }, "error": null }
+```
+
+::: warning 这是软删除
+产物从列表里消失、也下载不到了，但**工作区里的文件字节没有删**。到保留期后由后台清理任务真正删除。
+
+如果 Agent 之后又用同一个 `name` 保存了一次，这个产物会**恢复**（版本号接着往上加）。
+
+当前 API 没有对外的撤销删除操作。
+:::
+
+产物不存在、已经删过、或不属于这个 `user_id`，都返回同一个 404 `ARTIFACT_NOT_FOUND`，不区分。
