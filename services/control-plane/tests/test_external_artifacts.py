@@ -119,6 +119,25 @@ async def external_client(_ctx: _Ctx) -> AsyncIterator[AsyncClient]:
 
 
 @pytest.fixture
+async def external_client_no_scope(_ctx: _Ctx) -> AsyncIterator[AsyncClient]:
+    """Same tenant, same app, but a service-account key minted with zero scopes.
+
+    Mirrors ``test_external_workspace.py``'s fixture of the same name — the
+    ``require("session", "read")`` gate on this router is otherwise untested
+    behaviourally (``test_external_only_gate.py``'s auto-discovery only checks
+    ``external_only()`` / employee-JWT denial, not scope; the
+    ``test_console_lockdown.py`` behavioural table uses an ``admin``-scope key,
+    which trivially satisfies ``read`` and so can't catch this gate being
+    dropped or miswired).
+    """
+    transport = ASGITransport(app=_ctx.app)
+    async with AsyncClient(
+        transport=transport, base_url="http://cp.test", headers=_headers(scopes=())
+    ) as client:
+        yield client
+
+
+@pytest.fixture
 def user_store(_ctx: _Ctx) -> TenantUserStore:
     return _ctx.app.state.tenant_user_repo  # type: ignore[no-any-return,attr-defined]
 
@@ -245,3 +264,18 @@ async def test_agent_code_does_not_filter(external_client, seed_artifact) -> Non
     )
     assert a.status_code == b.status_code == 200
     assert a.json()["data"] == b.json()["data"]
+
+
+@pytest.mark.asyncio
+async def test_list_requires_read_scope(external_client_no_scope) -> None:
+    """零 scope 的 key 必须被 ``require("session", "read")`` 拒掉。
+
+    评审 Important:这道闸此前没有任何行为测试守着 —— 手滑删掉 / 改错
+    ``Depends(require("session", "read"))`` 时,全仓测试套件不会变红,第三方
+    拿一把零 scope 的 key 就能列出任意终端用户的产物清单。见
+    ``test_external_workspace.py::test_list_files_requires_read_scope``。
+    """
+    resp = await external_client_no_scope.get(
+        "/v1/agents/test-agent/artifacts", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 403
