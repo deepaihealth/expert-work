@@ -1,4 +1,4 @@
-# 8 附录:多语言示例
+# 10 多语言示例
 
 本章给七个常见场景各配一份完整可跑的最小示例,每个场景给 curl / Python / Node.js / Java 四种语言。几条通用约定:
 
@@ -11,9 +11,9 @@
   key 长什么样、怎么申请,见 [认证](./auth)。
 - **域名统一写成 `https://<your-domain>`**,替换成你实际对接的地址,见 [通用约定](./conventions) 的「环境地址」。
 - `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符,替换成你自己的真实值。
-- 请求 / 响应字段含义见 [调用 Agent](./run-agent) 与 [取消 run 与审批决策](./run-control);SSE 帧含义见 [SSE 事件格式](./sse-events)。
+- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 帧含义见 [3 读懂 SSE 流](./sse-events)。
 
-## 8.1 发起 run(stream)并解析 SSE
+## 10.1 发起 run(stream)并解析 SSE
 
 发一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。第三方最容易在这一步踩坑的是 SSE 分帧——下面示例的注释里标出了必须处理对的四件事。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例里直接原样打印 `data`,没有再展开解析——具体字段含义见 [SSE 事件格式](./sse-events)。
 
@@ -480,7 +480,7 @@ public class RunAndStream {
 
 :::
 
-## 8.2 queue 模式 + 轮询结果
+## 10.2 queue 模式 + 轮询结果
 
 `mode: "queue"` 立即返回 `202`,不建流。202 响应体的 `data.thread_id` 就是这次绑定的 `session_id`(字段名不一样,值是同一个)。用 `GET /v1/agents/{agent_code}/sessions` 里每一项的 `running` 字段粗粒度轮询,`running` 变成 `false` 后再去拉历史消息拿最终回答。
 
@@ -945,9 +945,9 @@ public class QueueAndPoll {
 
 :::
 
-## 8.3 上传文件并带进 run
+## 10.3 上传文件并带进 run
 
-先调上传接口拿 `upload_id`,再原样放进 `files[]` 发起 run。下面示例传一份文档(`type: "document"`);图片走法一样,唯一区别是 `upload_id` 的格式(`expert_work://image/...`),细节见 [调用 Agent](./run-agent) 的「`files[]`」一节。
+先调上传接口拿 `upload_id`,再原样放进 `files[]` 发起 run。下面示例传一份文档(`type: "document"`);图片走法一样,唯一区别是 `upload_id` 的格式(`expert_work://image/...`),细节见 [2.6 带图片和文档](./chat#_2-6-带图片和文档) 的「`files[]`」一节。
 
 ::: code-group
 
@@ -1465,7 +1465,7 @@ public class UploadAndRun {
 
 :::
 
-## 8.4 续接会话
+## 10.4 续接会话
 
 把上一次响应拿到的 `session_id` 传回下一次请求的 body,就是同一段会话的下一轮;不传就是另开一段新会话。`stream` 模式下这个 id 在响应头 `X-Expert-Work-Session-Id` 里,不在响应体。
 
@@ -1959,7 +1959,7 @@ public class ContinueSession {
 
 :::
 
-## 8.5 断线重连(带 since_seq)
+## 10.5 断线重连(带 since_seq)
 
 连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 帧也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 也带了同一个值,下面示例统一走读帧这条路(更抗代理:有些代理/网关会丢弃或改写自定义响应头,帧本身是响应体的一部分,不会被丢)。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
 
@@ -2606,7 +2606,7 @@ public class ReconnectEvents {
 
 :::
 
-## 8.6 取消 run
+## 10.6 取消 run
 
 `user_id` 在**请求体**里,不是 query——归属校验用它确认这是发起这次 run 的那个终端用户。取消是幂等的,重复调用不会报错。
 
@@ -2805,7 +2805,7 @@ public class CancelRun {
 
 :::
 
-## 8.7 审批决策
+## 10.7 审批决策
 
 `user_id` 同样在**请求体**里。下面给 `approve` 与 `reject` 两个例子;`decision: "modify"` 时必须带 `modified_args`,另外两种 `decision` 下禁止传它。
 
