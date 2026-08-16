@@ -93,40 +93,56 @@ class _Ctx:
         )
 
 
-@pytest.fixture
-async def ctx() -> AsyncIterator[_Ctx]:
-    lifecycle = Lifecycle()
-    lifecycle.mark_ready()
-    # ``list_for_tenant(agent_name=...)`` (Task 5) is a join against
-    # thread_meta on the SQL backend; the in-memory double emulates it by
-    # holding the SAME ThreadMetaStore instance the app itself writes
-    # sessions to (store.py:549's docstring) — without this, the filter
-    # silently returns [] for every query (no join source wired).
-    threads = InMemoryThreadMetaStore()
-    run_store = InMemoryRunStore(thread_meta_store=threads)
-    run_event_store = InMemoryRunEventStore()
-    app = create_app(
-        settings=_build_settings(),
-        lifecycle=lifecycle,
-        jwt_verifier=build_test_jwt_verifier(),
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
-        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
-        run_repo=run_store,
-        run_event_repo=run_event_store,
-        thread_meta_repo=threads,
-    )
-    tenant_id = uuid4()
-    jwt = make_test_jwt(
-        tenant_id=tenant_id,
-        subject="sa-test",
-        sub_type="service_account",
-        roles=(),
-        scopes=("admin",),
-    )
-    headers = {"Authorization": f"Bearer {jwt}"}
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, run_store)
+def _ctx_factory(scopes: tuple[str, ...]) -> Any:
+    """Scope-parameterized fixture builder — mirrors
+    ``test_external_agent_catalog.py``'s ``_ctx_factory`` so the scope-gate
+    tests below (review Minor: this router's ``require("session", "read")``
+    had zero test coverage — a refactor could delete that ``dependencies=``
+    entirely and none of the original 10 tests, all run on an ``admin``-scope
+    key, would notice) can each get their own key without duplicating the
+    whole app-wiring block.
+    """
+
+    async def _make() -> AsyncIterator[_Ctx]:
+        lifecycle = Lifecycle()
+        lifecycle.mark_ready()
+        # ``list_for_tenant(agent_name=...)`` (Task 5) is a join against
+        # thread_meta on the SQL backend; the in-memory double emulates it by
+        # holding the SAME ThreadMetaStore instance the app itself writes
+        # sessions to (store.py:549's docstring) — without this, the filter
+        # silently returns [] for every query (no join source wired).
+        threads = InMemoryThreadMetaStore()
+        run_store = InMemoryRunStore(thread_meta_store=threads)
+        run_event_store = InMemoryRunEventStore()
+        app = create_app(
+            settings=_build_settings(),
+            lifecycle=lifecycle,
+            jwt_verifier=build_test_jwt_verifier(),
+            audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+            agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+            run_repo=run_store,
+            run_event_repo=run_event_store,
+            thread_meta_repo=threads,
+        )
+        tenant_id = uuid4()
+        jwt = make_test_jwt(
+            tenant_id=tenant_id,
+            subject="sa-test",
+            sub_type="service_account",
+            roles=(),
+            scopes=scopes,
+        )
+        headers = {"Authorization": f"Bearer {jwt}"}
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+            yield _Ctx(client, app, tenant_id, headers, run_store)
+
+    return _make
+
+
+ctx = pytest.fixture(_ctx_factory(("admin",)))
+ctx_no_scope = pytest.fixture(_ctx_factory(()))
+ctx_read = pytest.fixture(_ctx_factory(("read",)))
 
 
 @pytest.mark.asyncio
@@ -385,3 +401,37 @@ async def test_session_id_filter_narrows_to_that_session(ctx: _Ctx) -> None:
     runs = resp.json()["data"]["runs"]
     assert len(runs) == 1
     assert runs[0]["session_id"] == first_session
+
+
+@pytest.mark.asyncio
+async def test_zero_scope_key_is_denied(ctx_no_scope: _Ctx) -> None:
+    """A zero-scope key must not read the run list — the
+    ``dependencies=[Depends(require("session", "read"))]`` on this route is
+    otherwise load-bearing code with no test watching it (review Minor:
+    delete that dependency and every other test in this file, all run on an
+    ``admin``-scope key, stays green)."""
+    await ctx_no_scope.seed_agent()
+
+    resp = await ctx_no_scope.client.get(
+        "/v1/agents/support-bot/runs",
+        params={"user_id": "cust-77"},
+        headers=ctx_no_scope.headers,
+    )
+
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_read_scope_key_is_allowed(ctx_read: _Ctx) -> None:
+    """A ``read``-scope key IS let through — proving the gate above sits at
+    the documented level (``read`` → VIEWER passes ``session:read``), not
+    that it happens to reject everyone."""
+    await ctx_read.seed_agent()
+
+    resp = await ctx_read.client.get(
+        "/v1/agents/support-bot/runs",
+        params={"user_id": "cust-77"},
+        headers=ctx_read.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
