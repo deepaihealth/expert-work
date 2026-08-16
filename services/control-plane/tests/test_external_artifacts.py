@@ -421,8 +421,18 @@ async def test_download_forces_attachment_for_active_content(
 
 
 @pytest.mark.asyncio
-async def test_download_unknown_name_is_404_enveloped(external_client) -> None:
-    """不存在的 name → 404,错误路径套信封。"""
+async def test_download_unknown_user_is_404_enveloped(external_client) -> None:
+    """未知 user_id(从未被任何测试 seed 过)→ 404,错误路径套信封。
+
+    命中 ``external_artifacts.py`` 里 ``end_user_id is None`` 那个分支(尚未
+    resolve 过的 ``user_id`` 直接短路,``mint=False``)—— **不是**「已知用户
+    但请求的 name 不存在」那个分支(``version is None``,在前者之后、需要一个
+    真实 tenant_user 行才能到达)。这条测试此前的名字/docstring 声称在测后者,
+    实际因为 ``_ctx`` 每个测试都是全新内存 store、从没 seed 过 "u-1",一直在测
+    前者;见 ``test_download_known_user_unknown_name_is_404_enveloped`` /
+    ``test_download_cross_user_name_is_404_not_leaked`` 补上真正咬住后一个
+    分支、以及跨用户隔离的覆盖(评审 Important A)。
+    """
     resp = await external_client.get(
         "/v1/agents/test-agent/artifacts/download",
         params={"user_id": "u-1", "name": "nope.txt"},
@@ -431,6 +441,105 @@ async def test_download_unknown_name_is_404_enveloped(external_client) -> None:
     body = resp.json()
     assert body["success"] is False
     assert body["error"]["code"] == "ARTIFACT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_download_known_user_unknown_name_is_404_enveloped(
+    external_client, seed_artifact_with_content
+) -> None:
+    """已知 user_id(seed 过别的产物,真实 tenant_user 行存在),但请求的 name
+    这个用户没有 → 404,错误路径套信封。
+
+    真正咬住 ``version is None`` 分支 —— 与
+    ``test_download_unknown_user_is_404_enveloped`` 互补,两者各自独立覆盖
+    ``end_user_id is None`` / ``version is None`` 两条彼此独立的短路路径。
+    """
+    await seed_artifact_with_content(user_id="u-1", name="other.txt", kind="document", content=b"x")
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "nope.txt"},
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "ARTIFACT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_download_cross_user_name_is_404_not_leaked(
+    external_client, seed_artifact_with_content
+) -> None:
+    """用户 A 拿自己的 user_id 请求用户 B 的 name → 404,不能读到用户 B 的字节。
+
+    这是评审 Important A 指出的要命场景:此前 12 条测试没有一条会在
+    ``get_latest_version`` / ``list_for_user`` 的调用点被误改成不再按
+    ``user_id`` 过滤时变红(比如复制粘贴漏传 ``user_id=end_user_id``)。这里
+    user-a 必须是**真正被 seed 过**的已知用户(不是从未见过的 id)—— 否则请求
+    会在 ``end_user_id is None`` 短路掉,根本测不到 store 层的过滤逻辑。
+    """
+    await seed_artifact_with_content(
+        user_id="user-a", name="user-a-report.txt", kind="document", content=b"user-a stuff"
+    )
+    await seed_artifact_with_content(
+        user_id="user-b", name="secret.txt", kind="document", content=b"user-b's secret"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "user-a", "name": "secret.txt"},
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "ARTIFACT_NOT_FOUND"
+    # 内容真的没有泄漏出来 —— 不能是 user-b 的字节。
+    assert resp.content != b"user-b's secret"
+
+
+@pytest.mark.asyncio
+async def test_download_not_found_variants_return_byte_identical_response(
+    external_client, seed_artifact_with_content
+) -> None:
+    """未知 user / 已知 user 但没有这份 name / 跨用户读别人的 name —— 三种情况
+    必须是**同一个**不可区分的 404,响应体逐字节相同。
+
+    上面三条测试各自证明了状态码 + error.code,但没有排除「响应体其它字段
+    (比如藏一个 debug-only 的内部字段)悄悄泄漏出这三种情况的差异」这种可能。
+    这条直接逐字节比较 ``resp.content``,把「同一个不可区分 404」从代码走查
+    推断变成显式断言(评审 Important A 第 3 点)。
+    """
+    await seed_artifact_with_content(
+        user_id="user-a", name="user-a-report.txt", kind="document", content=b"user-a stuff"
+    )
+    await seed_artifact_with_content(
+        user_id="user-b", name="secret.txt", kind="document", content=b"user-b's secret"
+    )
+
+    unknown_user_resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "never-seen-before", "name": "secret.txt"},
+    )
+    known_user_unknown_name_resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "user-a", "name": "nope.txt"},
+    )
+    cross_user_resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "user-a", "name": "secret.txt"},
+    )
+
+    assert (
+        unknown_user_resp.status_code
+        == known_user_unknown_name_resp.status_code
+        == cross_user_resp.status_code
+        == 404
+    ), (
+        unknown_user_resp.status_code,
+        known_user_unknown_name_resp.status_code,
+        cross_user_resp.status_code,
+    )
+    assert (
+        unknown_user_resp.content == known_user_unknown_name_resp.content == cross_user_resp.content
+    )
 
 
 @pytest.mark.asyncio

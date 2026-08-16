@@ -67,6 +67,12 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("GET", "/v1/agents/{agent_code}/workspace/files"),
         ("GET", "/v1/agents/{agent_code}/workspace/file"),
+        # 阶段 3 PR-B — 对外产物视图(external_artifacts.py)。评审 Important B:
+        # 两个端点(list + download)都漏登记在这张表里,导致没有任何测试用真实
+        # 员工 JWT 请求过它们并断言 403 —— tag 驱动的静态审计只查依赖有没有挂
+        # 上,查不出 handler 内部对某种 principal 特殊放行这类问题。
+        ("GET", "/v1/agents/{agent_code}/artifacts"),
+        ("GET", "/v1/agents/{agent_code}/artifacts/download"),
     }
 )
 
