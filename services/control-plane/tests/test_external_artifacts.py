@@ -777,8 +777,26 @@ async def test_delete_emits_audit_with_on_behalf_of(
 
 
 @pytest.mark.asyncio
-async def test_delete_miss_writes_no_audit(external_client, audit_entries) -> None:
-    """未命中不写审计 —— 否则第三方能用审计流水反推名字存不存在。"""
+async def test_delete_miss_writes_no_audit(external_client, seed_artifact, audit_entries) -> None:
+    """未命中不写审计 —— 否则第三方能用审计流水反推名字存不存在。
+
+    评审 Important:必须先 ``seed_artifact`` 让 ``u-1`` 成为真实存在的用户,
+    否则请求会在 ``lookup_external_user_id`` 返回 ``None`` 时于
+    ``external_artifacts.py`` 的 ``end_user_id is None`` 分支短路 404 ——
+    这个分支里 ``audit_emit`` 在物理上还没执行到,不写审计是平凡事实,不需要
+    任何业务逻辑保证,测不出真正要守的东西。
+
+    真正要守的是 spec 担心的场景:第三方拿**自己已知的** ``user_id``,对一个
+    不存在(或已删除)的 ``name`` 反复探测,企图从审计流水反推这个名字是否
+    存在。这对应的是「已知用户 + ``store.soft_delete`` 返回 ``False``」这条
+    分支 —— 这里先 seed 一个*别的* name(``other.docx``),把 ``u-1`` 变成
+    真实存在的用户(``tenant_user`` 行确实建立),再对从没seed 过的
+    ``never-existed.docx`` 发起删除:``end_user_id`` 非 ``None``,请求会真正
+    进入 ``store.soft_delete``,在 store 层因为找不到这个 name 而返回
+    ``False``,然后才 404 —— 这才是「未命中不写审计」这句话真正需要为之负责
+    的分支。
+    """
+    await seed_artifact(user_id="u-1", name="other.docx", kind="document")
     resp = await external_client.delete(
         "/v1/agents/test-agent/artifacts",
         params={"user_id": "u-1", "name": "never-existed.docx"},
