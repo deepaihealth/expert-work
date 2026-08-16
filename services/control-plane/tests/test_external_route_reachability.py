@@ -2,7 +2,7 @@
 
 Starlette's router matches by **registration order, not specificity**
 (``app.py``'s comment above the ``build_external_*_router()`` calls). The
-five external routers must stay registered *before* ``build_agents_router()``:
+seven external routers must stay registered *before* ``build_agents_router()``:
 its ``GET /{name}/{version}`` is a two-segment, fully-parameterised path that
 silently swallows any two-segment ``/{agent_code}/<literal>`` external route
 registered after it (``version`` would just bind to the literal, e.g.

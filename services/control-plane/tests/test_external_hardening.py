@@ -247,9 +247,13 @@ async def test_agent_catalog_422_uses_the_external_envelope(ctx: _Ctx) -> None:
     prefix — fell through to FastAPI's bare ``{"detail": [...]}`` instead of
     the external envelope, breaking the same contract
     ``test_missing_user_id_422_uses_the_external_envelope`` guards for
-    ``/v1/agents/...``. The fix keys off ``request.scope["route"].tags``
-    instead. Compares both response shapes field-for-field so a future
-    regression that only breaks one side fails loudly.
+    ``/v1/agents/...``. The fix checks ``request.scope["route"].tags`` in
+    addition to the ``/v1/agents/`` prefix check — not instead of it; the
+    prefix check stays because it is still required for other routes on
+    ``agents.py``'s own router (see
+    ``test_bind_session_and_run_422_use_the_external_envelope`` below).
+    Compares both response shapes field-for-field so a future regression
+    that only breaks one side fails loudly.
     """
     catalog_resp = await ctx.client.get(
         "/v1/agent-catalog", params={"limit": 999}, headers=ctx.headers
@@ -281,19 +285,21 @@ async def test_bind_session_and_run_422_use_the_external_envelope(ctx: _Ctx) -> 
     router, tagged ``"agents"`` — not ``"external"`` — because they predate
     the ``external_*.py`` split, even though they are third-party-reachable
     and ``external_only()``-gated (see ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES``
-    in ``test_external_only_gate.py``). No test covered their 422 shape
-    before this one — found missing during the Task 4 follow-up
-    investigation: a tag-only replacement of ``app.py``'s
-    ``/v1/agents/`` prefix check (to fix
-    ``test_agent_catalog_422_uses_the_external_envelope`` above) silently
-    dropped both back to FastAPI's bare ``{"detail": [...]}``, live-verified
-    before this test existed. ``app.py`` keeps the ``/v1/agents/`` prefix
-    check and ADDS the tag check as an alternative (not a replacement) for
-    exactly this reason — the whole ``agents.py`` router needs the envelope
-    regardless of which guard a given route carries (``disable``/``enable``
-    are ``console_only()``, not ``external_only()``, and are covered by the
-    NUL-guard envelope tests in ``test_external_path_param_nul_guard.py``).
-    Locks in that both bind/run stay enveloped.
+    in ``test_external_only_gate.py``). Their 422 envelope shape already had
+    coverage via a NUL-byte path param
+    (``test_external_path_param_nul_guard.py``'s ``_assert_envelope_422()``,
+    and ``test_external_nul_hardening.py``'s same-named helper on several
+    ``POST .../runs`` variants) — this test adds coverage via a DIFFERENT
+    trigger, a plain missing required body field (vanilla pydantic
+    validation, no NUL involved), so the envelope is proven on both
+    validation paths, not just the NUL one. ``app.py`` keeps the
+    ``/v1/agents/`` prefix check and ADDS the tag check in addition to it
+    (not a replacement) for this reason — the whole ``agents.py`` router
+    needs the envelope regardless of which guard a given route carries
+    (``disable``/``enable`` are ``console_only()``, not ``external_only()``,
+    and are covered by the NUL-guard envelope tests in
+    ``test_external_path_param_nul_guard.py``). Locks in that both bind/run
+    stay enveloped on this trigger path too.
     """
     await ctx.seed_agent()
     bind_resp = await ctx.client.post(
