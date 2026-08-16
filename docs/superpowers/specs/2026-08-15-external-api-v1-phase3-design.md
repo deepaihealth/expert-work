@@ -89,6 +89,14 @@ if not active:                                                  # → 404 AGENT_
 
 **禁用的 agent 出不出现在列表里**:出现,`available: false`。客户端界面上置灰比「凭空消失」好排查。
 
+**只剩 DEPRECATED 版本的 agent 呢**:**不出现**。这与上一条刻意不同,理由三条:
+
+1. 目录的语义是「这个租户有哪些 agent 可以调」。一个 code 没有任何 ACTIVE 版本 = 没有可调版本 = 已退役,不属于这个问题的答案。
+2. **`disabled` 是可逆的临时状态**(kill switch,随时可能 enable),所以置灰等它回来是对的;**只剩 deprecated 是终态**,不会自己变回 true。列一个永远 `false` 且不会变的条目,对客户端是纯噪音。
+3. `deprecated` 是租户内部的版本管理状态,没必要对第三方暴露 —— 告诉对接方「我们有个 agent 但退役了」属于内部信息。
+
+(这条是实施期拍板的:原计划的示例实现只查 ACTIVE、而它自带的测试却要求 deprecated-only 显示 `available: false`,两者自相矛盾。实施者把矛盾摆了出来而没有自己挑一边,决策回写到这里。)
+
 #### `display_name` 全栈改动
 
 | 层 | 改什么 |

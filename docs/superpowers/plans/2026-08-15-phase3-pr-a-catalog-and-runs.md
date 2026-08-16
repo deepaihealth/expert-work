@@ -447,6 +447,15 @@ def _spec_dict(name: str, *, display_name: str = "", description: str = "") -> d
             "tenant_config": {},
             "model": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
             "system_prompt": {"template": "you are support"},
+            # ``sandbox`` 在 ``AgentSpecBody`` 上**没有默认值**(必填)——
+            # 漏了它 ``model_validate`` 会因为 ``spec.sandbox`` 缺失而炸,
+            # 报的错跟 display_name 毫无关系,很浪费排查时间。这一块照抄
+            # ``tests/test_external_sessions.py`` 的 ``_SPEC``。
+            "sandbox": {
+                "resources": {"cpu": "1.0", "memory": "1Gi"},
+                "network": {"egress": "proxy", "allowlist": ["api.anthropic.com"]},
+                "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+            },
         },
     }
 
@@ -597,9 +606,16 @@ async def test_available_matches_what_the_run_endpoint_actually_does(ctx: _Ctx) 
 
 
 @pytest.mark.asyncio
-async def test_agent_with_no_active_version_is_unavailable(ctx: _Ctx) -> None:
-    """``available`` 的第二道判据:必须存在 ``status=ACTIVE`` 的版本。
-    只有 DEPRECATED 版本的 agent,run 端点会 404 AGENT_NOT_FOUND。"""
+async def test_agent_with_no_active_version_is_absent_from_the_catalog(ctx: _Ctx) -> None:
+    """目录 = 「能调什么」。一个 code 只剩 DEPRECATED 版本时没有任何可调版本
+    (run 端点会 404 AGENT_NOT_FOUND),所以它**不出现在目录里** —— 而不是
+    以 ``available: false`` 出现。
+
+    与 kill-switch 禁用**刻意不同**:那是可逆的临时状态,置灰等它回来是对的;
+    只剩 deprecated 是终态,列一个永远 false 的条目对客户端是噪音,而且
+    deprecated 属于租户内部的版本管理状态,不该对第三方暴露。
+    """
+    await ctx.seed_agent("healthy")
     await ctx.seed_agent("deprecated-only")
     await ctx.app.state.agent_spec_repo.update_status(
         tenant_id=ctx.tenant_id,
@@ -610,8 +626,10 @@ async def test_agent_with_no_active_version_is_unavailable(ctx: _Ctx) -> None:
 
     resp = await ctx.client.get("/v1/agent-catalog", headers=ctx.headers)
 
-    agents = {a["agent_code"]: a for a in resp.json()["data"]["agents"]}
-    assert agents["deprecated-only"]["available"] is False
+    codes = {a["agent_code"] for a in resp.json()["data"]["agents"]}
+    # 断言 ``== {"healthy"}`` 而不是 ``"deprecated-only" not in codes`` ——
+    # 后者在「端点坏了返回空列表」时也会绿,是个假绿陷阱。
+    assert codes == {"healthy"}, f"deprecated-only 不该出现在目录里,实际: {codes}"
 
 
 @pytest.mark.asyncio
@@ -1642,17 +1660,20 @@ from expert_work.runtime.runs import RunStatus, RunStore
             )
         except ExternalScopeError as exc:
             return external_error(exc)
-        if end_user_id is None:
-            return JSONResponse(
-                {
-                    "success": True,
-                    "data": {"runs": [], "limit": limit, "offset": offset},
-                    "error": None,
-                }
-            )
-
         thread_ids: list[UUID] | None = None
         if session_id is not None:
+            # 给了 ``session_id`` 时,归属校验是权威的,**即使 ``end_user_id``
+            # 是 None**(这个 user_id 从没在本租户出现过)——
+            # ``load_owned_session(mint=False)`` 自己会再解析一次并且两种情况
+            # 都 404。把「陌生 user 返回空列表」的早返回放在这个分支**之前**
+            # 是错的:那样一个陌生 ``user_id`` 拿别人的真实 ``session_id`` 来探,
+            # 会拿到 200 空列表而不是 404 —— 200-empty 与 404 可区分,等于把
+            # 「这个 user_id 在本租户存在过没有」变成可枚举的。
+            #
+            # 还有第二层理由:``list_for_tenant(user_id=None)`` 的语义是
+            # **不按 user 过滤**。所以 ``end_user_id`` 为 None 时绝不能落到
+            # 下面那个查询上 —— 下面的 ``elif`` 保证了这一点(走到查询时
+            # ``end_user_id`` 必非 None:session 校验通过 ⟹ 该 user 存在)。
             try:
                 await load_owned_session(
                     tenant_id=tenant_id,
@@ -1666,6 +1687,14 @@ from expert_work.runtime.runs import RunStatus, RunStore
             except ExternalScopeError as exc:
                 return external_error(exc)
             thread_ids = [session_id]
+        elif end_user_id is None:
+            return JSONResponse(
+                {
+                    "success": True,
+                    "data": {"runs": [], "limit": limit, "offset": offset},
+                    "error": None,
+                }
+            )
 
         rows = await runs.list_for_tenant(
             tenant_id=tenant_id,
@@ -1943,7 +1972,10 @@ git commit -m "feat(admin-ui): Agent 配置页基础组加「显示名」输入�
 - 路径 `GET /v1/agent-catalog`,只需要 `Authorization`,不需要 `user_id`(目录是租户级的,与具体终端用户无关)
 - 四个字段的表:`agent_code`(发 run 时填在路径里的那个)、`display_name`(**永远非空**,没配就是 `agent_code`)、`description`、`available`
 - 明写:**`available: false` 的 agent 仍然会列出来**,界面上置灰即可;直接对它发 run 会被拒
-- 分页 `limit`(1–200,默认 50)/ `offset`
+- 明写:**只剩已弃用版本的 agent 不会出现在目录里**(没有可调版本 = 不属于「能调什么」这个问题的答案)
+- 分页 `limit`(1–200,默认 50)/ `offset` / **`total`**(去重后的 agent 总数,不是版本行数、也不是当前页长度)
+  - **`total` 是实施期新增的字段**(Task 3 修复轮 M-3),原计划的响应示例里没有 —— 写文档时以实际响应为准,别照抄本计划早先那份示例
+  - 顺带写一句翻页建议:**用 `total` 判断是否翻完,不要用「返回数 < limit 即最后一页」** —— 后者是这个端点曾经出过的 bug 形态
 - 需要的 scope:`read` 及以上
 
 - [ ] **Step 2: 加 run 列表一节**
