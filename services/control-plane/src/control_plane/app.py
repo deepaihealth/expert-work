@@ -2532,13 +2532,39 @@ def create_app(
     # shape that breaks the third-party envelope contract
     # (``{"success", "data", "error"}``), and parameter validation is the
     # error class a third-party integrator hits the most. Scoped to
-    # ``/v1/agents/`` only: the console's own frontend already parses
-    # FastAPI's default shape, so every other route keeps it unchanged.
+    # ``/v1/agents/`` + ``tags=["external"]``: the console's own frontend
+    # already parses FastAPI's default shape, so every other route keeps it
+    # unchanged.
+    #
+    # Phase 3 PR-A Task 4 follow-up (production bug found in review): this
+    # used to be ``/v1/agents/`` alone, so ``GET /v1/agent-catalog`` — not
+    # under that prefix — fell back to the bare FastAPI shape (see
+    # ``test_external_hardening.py::test_agent_catalog_422_uses_the_external_envelope``
+    # for the regression test and its mutation proof). The ``/v1/agents/``
+    # half is kept AS-IS rather than replaced by a tag check: that whole
+    # router (``agents.py``) needs the envelope regardless of which guard a
+    # given route carries — ``bind_session``/``run_agent_for_user`` are
+    # ``external_only()``-gated, ``disable``/``enable`` are
+    # ``console_only()``, and both are tagged ``"agents"``, not
+    # ``"external"`` (confirmed live: a tag-only replacement of the prefix
+    # check regressed ``test_bind_session_and_run_422_use_the_external_envelope``
+    # AND ``test_disable_agent_nul_name_is_422`` /
+    # ``test_enable_agent_nul_name_is_422`` in
+    # ``test_external_path_param_nul_guard.py`` — three routes across two
+    # different guard mechanisms a tag-only check cannot see). The
+    # ``tags=["external"]`` half is ADDED, not substituted, so a future
+    # external router under yet another new prefix is covered without
+    # extending a hand-maintained prefix table (the anti-pattern Task 4
+    # exists to remove from the three self-audit tests).
     @app.exception_handler(RequestValidationError)
     async def _external_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        if not request.url.path.startswith("/v1/agents/"):
+        route = request.scope.get("route")
+        is_external = request.url.path.startswith("/v1/agents/") or "external" in (
+            getattr(route, "tags", None) or []
+        )
+        if not is_external:
             return await request_validation_exception_handler(request, exc)
         errors = exc.errors()
         message = errors[0]["msg"] if errors else "invalid request"

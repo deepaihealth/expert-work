@@ -361,7 +361,7 @@ def _build_audit_app() -> Any:
 
 def _external_agents_routes(app: Any) -> list[APIRoute]:
     """Every route tagged ``external`` — discovered from the live app, not a
-    hand-maintained list, so a new route mounted on any of the six
+    hand-maintained list, so a new route mounted on any of the seven
     ``external_*.py`` routers is picked up automatically.
 
     Discovery is by ``tags=["external"]`` **alone** — no path-prefix
@@ -404,7 +404,7 @@ def test_every_external_agents_route_carries_the_external_only_guard() -> None:
     """
     app = _build_audit_app()
     external_routes = _external_agents_routes(app)
-    assert external_routes, "expected at least one tags=['external'] route under /v1/agents/"
+    assert external_routes, "expected at least one tags=['external'] route"
     missing = [
         f"{sorted(m for m in (r.methods or ()) if m not in ('HEAD', 'OPTIONS'))} {r.path}"
         for r in external_routes
@@ -432,7 +432,7 @@ def test_the_discovery_is_not_tied_to_the_agents_path_prefix() -> None:
 
 #: The third-party-reachable ``/v1/agents/{agent_code}`` routes that live on
 #: ``agents.py``'s OWN router (``tags=["agents"]``, not ``"external"``)
-#: rather than one of the six ``external_*.py`` routers —
+#: rather than one of the seven ``external_*.py`` routers —
 #: ``bind_session`` / ``run_agent_for_user`` predate the ``external_*.py``
 #: split (External-API-v1 P1). A ``tags=["external"]``-only audit would never
 #: see these two — the same blind spot ``test_external_path_param_nul_guard.py``
@@ -514,7 +514,7 @@ _AGENTS_ROUTER_UNIVERSE: frozenset[tuple[str, str]] = frozenset(
 #: after ``sessions``) would not match this pattern and so would not be
 #: forced into ``live`` — the same way the original table-membership bug
 #: missed things, just a narrower gap. In practice a new third-party route is
-#: expected to be added to one of the six ``external_*.py`` routers (covered
+#: expected to be added to one of the seven ``external_*.py`` routers (covered
 #: by the tag-driven audit above, ``test_every_external_agents_route_carries_
 #: the_external_only_guard``) rather than directly on ``agents.py``'s own
 #: router; this table only exists because ``sessions``/``runs``/``disable``/
@@ -528,7 +528,7 @@ _AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
 def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
     """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
     agents.py's OWN router (excludes ``tags=["external"]`` routes, which live
-    on the six ``external_*.py`` routers and match the same path shape but are
+    on the seven ``external_*.py`` routers and match the same path shape but are
     already covered by the tag-driven audit above).
 
     A TRUE full enumeration of the live app: nothing here is filtered by

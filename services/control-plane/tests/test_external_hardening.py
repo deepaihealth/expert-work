@@ -239,6 +239,82 @@ async def test_missing_user_id_422_uses_the_external_envelope(ctx: _Ctx) -> None
     assert body["error"]["message"]
 
 
+@pytest.mark.asyncio
+async def test_agent_catalog_422_uses_the_external_envelope(ctx: _Ctx) -> None:
+    """Phase 3 PR-A Task 4 follow-up (production bug found in review): this
+    handler used to key off ``request.url.path.startswith("/v1/agents/")``,
+    so ``GET /v1/agent-catalog`` — the first external route NOT under that
+    prefix — fell through to FastAPI's bare ``{"detail": [...]}`` instead of
+    the external envelope, breaking the same contract
+    ``test_missing_user_id_422_uses_the_external_envelope`` guards for
+    ``/v1/agents/...``. The fix keys off ``request.scope["route"].tags``
+    instead. Compares both response shapes field-for-field so a future
+    regression that only breaks one side fails loudly.
+    """
+    catalog_resp = await ctx.client.get(
+        "/v1/agent-catalog", params={"limit": 999}, headers=ctx.headers
+    )
+    sessions_resp = await ctx.client.get("/v1/agents/support-bot/sessions", headers=ctx.headers)
+
+    assert catalog_resp.status_code == 422, catalog_resp.text
+    assert sessions_resp.status_code == 422, sessions_resp.text
+
+    catalog_body = catalog_resp.json()
+    sessions_body = sessions_resp.json()
+
+    assert "detail" not in catalog_body
+    assert catalog_body["success"] is False
+    assert catalog_body["data"] is None
+    assert catalog_body["error"]["code"] == "INVALID_REQUEST"
+    assert catalog_body["error"]["message"]
+
+    # Shape must match the /v1/agents/... side field-for-field — values
+    # differ (different validation failure), keys must not.
+    assert set(catalog_body.keys()) == set(sessions_body.keys())
+    assert set(catalog_body["error"].keys()) == set(sessions_body["error"].keys())
+
+
+@pytest.mark.asyncio
+async def test_bind_session_and_run_422_use_the_external_envelope(ctx: _Ctx) -> None:
+    """``bind_session`` / ``run_agent_for_user`` (``POST
+    /v1/agents/{agent_code}/sessions|runs``) live on ``agents.py``'s OWN
+    router, tagged ``"agents"`` — not ``"external"`` — because they predate
+    the ``external_*.py`` split, even though they are third-party-reachable
+    and ``external_only()``-gated (see ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES``
+    in ``test_external_only_gate.py``). No test covered their 422 shape
+    before this one — found missing during the Task 4 follow-up
+    investigation: a tag-only replacement of ``app.py``'s
+    ``/v1/agents/`` prefix check (to fix
+    ``test_agent_catalog_422_uses_the_external_envelope`` above) silently
+    dropped both back to FastAPI's bare ``{"detail": [...]}``, live-verified
+    before this test existed. ``app.py`` keeps the ``/v1/agents/`` prefix
+    check and ADDS the tag check as an alternative (not a replacement) for
+    exactly this reason — the whole ``agents.py`` router needs the envelope
+    regardless of which guard a given route carries (``disable``/``enable``
+    are ``console_only()``, not ``external_only()``, and are covered by the
+    NUL-guard envelope tests in ``test_external_path_param_nul_guard.py``).
+    Locks in that both bind/run stay enveloped.
+    """
+    await ctx.seed_agent()
+    bind_resp = await ctx.client.post(
+        "/v1/agents/support-bot/sessions", json={}, headers=ctx.headers
+    )
+    assert bind_resp.status_code == 422, bind_resp.text
+    bind_body = bind_resp.json()
+    assert "detail" not in bind_body
+    assert bind_body["success"] is False
+    assert bind_body["data"] is None
+    assert bind_body["error"]["code"] == "INVALID_REQUEST"
+
+    run_resp = await ctx.client.post("/v1/agents/support-bot/runs", json={}, headers=ctx.headers)
+    assert run_resp.status_code == 422, run_resp.text
+    run_body = run_resp.json()
+    assert "detail" not in run_body
+    assert run_body["success"] is False
+    assert run_body["data"] is None
+    assert run_body["error"]["code"] == "INVALID_REQUEST"
+
+
 # ---------------------------------------------------------------------------
 # External-API-v1 P1 followup — lookup_external_user_id's 500-row scan ceiling
 # ---------------------------------------------------------------------------

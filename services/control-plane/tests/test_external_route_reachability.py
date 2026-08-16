@@ -112,7 +112,7 @@ def test_every_external_agents_route_is_reachable() -> None:
     """
     routes = _build_routes()
     external_routes = _external_routes(routes)
-    assert external_routes, "expected at least one tags=['external'] route under /v1/agents/"
+    assert external_routes, "expected at least one tags=['external'] route"
 
     for route in external_routes:
         for method in sorted(route.methods or set()):
