@@ -360,15 +360,23 @@ def _build_audit_app() -> Any:
 
 
 def _external_agents_routes(app: Any) -> list[APIRoute]:
-    """Every route under ``/v1/agents`` tagged ``external`` — discovered from
-    the live app, not a hand-maintained list, so a new route mounted on any
-    of the six ``external_*.py`` routers is picked up automatically."""
+    """Every route tagged ``external`` — discovered from the live app, not a
+    hand-maintained list, so a new route mounted on any of the six
+    ``external_*.py`` routers is picked up automatically.
+
+    Discovery is by ``tags=["external"]`` **alone** — no path-prefix
+    condition. All of this suite's tests used to also require
+    ``route.path.startswith("/v1/agents/")``, which made ``GET
+    /v1/agent-catalog`` (phase 3's first external route NOT under
+    ``/v1/agents/``) invisible to this audit while it stayed green. Only
+    ``external_*.py`` ever sets this tag, so the tag alone is already
+    precise, and dropping the prefix means any future new prefix is covered
+    automatically instead of silently falling outside this audit.
+    """
     return [
         route
         for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path.startswith("/v1/agents/")
-        and "external" in (route.tags or [])
+        if isinstance(route, APIRoute) and "external" in (route.tags or [])
     ]
 
 
@@ -403,6 +411,23 @@ def test_every_external_agents_route_carries_the_external_only_guard() -> None:
         if not _carries_external_only_guard(r)
     ]
     assert not missing, f"external routes missing external_only(): {missing}"
+
+
+def test_the_discovery_is_not_tied_to_the_agents_path_prefix() -> None:
+    """Discovery must key off ``tags=["external"]`` alone, not a path prefix.
+
+    ``GET /v1/agent-catalog`` (phase 3) is the first external route NOT
+    under ``/v1/agents/``. If the discoverer still carried a path-prefix
+    condition, this route would fall out of the audit entirely — while the
+    audit itself stayed green. That is the worst failure mode: it looks
+    protective but covers nothing.
+    """
+    app = _build_audit_app()
+    paths = {r.path for r in _external_agents_routes(app)}
+    assert "/v1/agent-catalog" in paths, (
+        "external route /v1/agent-catalog was not picked up by the "
+        "discoverer — it is still filtering by path prefix"
+    )
 
 
 #: The third-party-reachable ``/v1/agents/{agent_code}`` routes that live on
