@@ -1069,6 +1069,12 @@ for url,html in files.items():
         if path.endswith('.html'): path=path[:-5]
         if path not in pages: bad.append((url,href,'PAGE')); continue
         if frag and urllib.parse.unquote(frag) not in pages[path]: bad.append((url,href,'锚点'))
+    # 同页锚点 —— 渲染成 href="#..."(没有 /docs/ 前缀),上面那条正则匹配不到。
+    # 2026-08-16 的文档重构给标题加编号后,31 条同页锚点全失效而脚本报「零死链」,
+    # 这一段就是补那个盲区的,别删。
+    for href in re.findall(r'href="(#[^"]+)"',html):
+        total+=1
+        if urllib.parse.unquote(href[1:]) not in pages[url]: bad.append((url,href,'同页锚点'))
 print(f'{total} 条站内链接 / {len(pages)} 页')
 for s,h,w in bad: print(f'  ❌ [{w}] {h} ← {s}')
 print('✅ 无死链' if not bad else f'{len(bad)} 条死链')
