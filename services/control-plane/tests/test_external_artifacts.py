@@ -47,7 +47,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.persistence import ArtifactStore, TenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import ArtifactVersion
+from expert_work.protocol import ArtifactVersion, AuditEntry
 from orchestrator.tools import RecordingWorkspaceStore, WorkspacePermissionError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -100,14 +100,16 @@ class _Ctx:
     app: object
     artifact_store: ArtifactStore
     workspace_store: RecordingWorkspaceStore
+    audit_store: InMemoryAuditLogStore
 
 
 @pytest.fixture
 def _ctx() -> _Ctx:
+    audit_store = InMemoryAuditLogStore()
     app = create_app(
         settings=_build_settings(),
         jwt_verifier=build_test_jwt_verifier(),
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        audit_logger=build_default_audit_logger(audit_store),
     )
     workspace_store = RecordingWorkspaceStore()
     app.state.workspace_store = workspace_store  # type: ignore[attr-defined]
@@ -115,6 +117,7 @@ def _ctx() -> _Ctx:
         app=app,
         artifact_store=app.state.artifact_store,  # type: ignore[attr-defined]
         workspace_store=workspace_store,
+        audit_store=audit_store,
     )
 
 
@@ -303,6 +306,24 @@ def quota_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
 
     monkeypatch.setattr(_external_artifacts_module, "check_admission", _recording)
     return calls
+
+
+@pytest.fixture
+def audit_entries(_ctx: _Ctx) -> Callable[[], list[AuditEntry]]:
+    """Read back every audit entry written so far, synchronously.
+
+    ``InMemoryAuditLogStore`` keeps rows in a plain ``dict[int, AuditEntry]``
+    (``_rows``); reading it directly — rather than the async ``query()``
+    API — matches the existing precedent in ``test_platform_config_api.py``
+    and lets the delete-endpoint audit assertions stay plain, non-``await``
+    one-liners (as the task brief's sample test calls them:
+    ``audit_entries()``, not ``await audit_entries()``).
+    """
+
+    def _read() -> list[AuditEntry]:
+        return list(_ctx.audit_store._rows.values())
+
+    return _read
 
 
 @pytest.mark.asyncio
@@ -609,3 +630,159 @@ async def test_download_requires_read_scope(external_client_no_scope) -> None:
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/agents/{agent_code}/artifacts  (Task 3)
+# ---------------------------------------------------------------------------
+
+
+# ``external_client`` (module-level fixture) bakes in ``scopes=("read",)`` —
+# too low for DELETE, which is gated on ``require("session", "write")``.
+# Every request below overrides the client's default Authorization header
+# with a write-scope one via ``headers=`` (same per-request-override
+# approach as ``test_external_sessions.py::
+# test_archive_requires_at_least_write_scope``, reusing this file's own
+# ``_headers()`` rather than standing up a new client fixture). A
+# write-scope key also satisfies ``require("session", "read")`` — RBAC maps
+# ``"write"`` to ``Role.OPERATOR``, whose ``session`` grant is
+# ``{"read", "write", "debug"}`` — so the same headers cover the mixed
+# GET+DELETE sequence in the first test below.
+
+
+@pytest.mark.asyncio
+async def test_delete_soft_deletes_and_hides_from_list(external_client, seed_artifact) -> None:
+    """删除命中 → 200 {deleted: name};之后列表里不再出现。"""
+    await seed_artifact(user_id="u-1", name="report.docx", kind="document")
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == {"deleted": "report.docx"}
+    listing = await external_client.get(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert listing.json()["data"]["artifacts"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_is_idempotent_miss_404(external_client, seed_artifact) -> None:
+    """已软删 / 不存在 / 跨用户 → 同一个不可区分的 404。
+
+    三条子场景都必须真的咬住它声称的分支(Task 2 评审的教训 —— 一个从没被
+    seed 过的 user 会在 ``lookup_external_user_id`` 短路成「未知 user」分支,
+    根本测不到 store 层的过滤逻辑):
+
+    * ``cross_user`` —— u-2 也真实存在(seed 了另一个 name,``other.docx``),
+      拿 u-2 的身份去删 u-1 仍然*活跃*的 ``report.docx``,必须命中 store 层
+      按 ``user_id`` 过滤失败,而不是「未知 user」短路。**顺序是关键**:这一步
+      排在 u-1 自己真正删除 ``report.docx`` 之前 —— 如果这里改成在
+      ``report.docx`` 已经被删掉之后才发起跨用户请求,无论 store 调用点有没有
+      正确按 user_id 过滤,结果都会是 404("已经不存在" vs "不属于你" 两个原因
+      都指向同一个状态码),测试就测不出跨用户读写隔离到底有没有生效 —— 只有
+      在资源仍然存活的窗口发起跨用户删除,才能让"店铺调用点丢了 user_id 维度"
+      这类 bug 现出原形(变成意外的 200)。
+    * ``already_deleted`` —— u-1 自己删两次,第二次命中 ``store.soft_delete``
+      但 ``deleted_at`` 已经设过,返回 ``False``。
+    * ``unknown_name`` —— u-1 是真实存在的用户,但从没拥有过
+      ``never-existed.docx`` 这个 name。
+    """
+    await seed_artifact(user_id="u-1", name="report.docx", kind="document")
+    # u-2 必须真的被 seed 过 —— 否则「跨用户」这条会退化成「未知 user」分支。
+    await seed_artifact(user_id="u-2", name="other.docx", kind="document")
+
+    write_headers = _headers(scopes=("write",))
+
+    # 跨用户尝试必须在 report.docx 仍然活跃的时候发起(见上面 docstring)。
+    cross_user = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-2", "name": "report.docx"},
+        headers=write_headers,
+    )
+    assert cross_user.status_code == 404, (
+        "u-2 不该能删掉 u-1 的 report.docx —— 这里的 200 意味着 store 调用点丢了 user_id 维度"
+    )
+
+    # 真正的 owner 现在还能成功删除 —— 反证上面那次跨用户请求没有把它删掉
+    # (如果被跨用户请求偷偷删了,这里会意外变成 404)。
+    first = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=write_headers,
+    )
+    assert first.status_code == 200
+
+    already_deleted = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=write_headers,
+    )
+    unknown_name = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "never-existed.docx"},
+        headers=write_headers,
+    )
+    assert (
+        already_deleted.status_code == unknown_name.status_code == cross_user.status_code == 404
+    ), (already_deleted.status_code, unknown_name.status_code, cross_user.status_code)
+    assert already_deleted.json()["error"]["code"] == "ARTIFACT_NOT_FOUND"
+    assert already_deleted.content == unknown_name.content == cross_user.content, (
+        "三种情况的响应体必须逐字节相同 —— 任何差异都是存在性预言机"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_write_not_delete_scope(external_client, seed_artifact) -> None:
+    """write 档的 key 就能删 —— 不是 delete 档。
+
+    ``ApiKeyScope`` 没有独立 delete 档,挂 ``"delete"`` 等于只有 admin scope
+    的 key 能删,逼第三方拿一把能改服务账号的钥匙才能删自己的文件。把实现里
+    的 ``require("session", "write")`` 改成 ``"delete"`` 时这条必须红。
+
+    复用既有的 ``_headers()`` helper(本文件顶部,``external_client`` /
+    ``external_client_no_scope`` 两个 fixture 已经在用同一个)在单次请求上
+    覆盖默认的 Authorization header —— 与 ``test_external_sessions.py::
+    test_archive_requires_at_least_write_scope`` 同一个搭法,不用为一个
+    scope 值另起一个平行的 client fixture。
+    """
+    await seed_artifact(user_id="u-1", name="report.docx", kind="document")
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_delete_emits_audit_with_on_behalf_of(
+    external_client, seed_artifact, audit_entries
+) -> None:
+    """审计写 ``ARTIFACT_DELETE``(值是 ``"artifact:delete"``,冒号不是点号),
+    带 ``on_behalf_of=`` 终端用户。"""
+    await seed_artifact(user_id="u-1", name="report.docx", kind="document")
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "report.docx"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert resp.status_code == 200
+    entry = next(e for e in audit_entries() if e.action.value == "artifact:delete")
+    assert entry.resource_id == "report.docx"
+    assert entry.on_behalf_of is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_miss_writes_no_audit(external_client, audit_entries) -> None:
+    """未命中不写审计 —— 否则第三方能用审计流水反推名字存不存在。"""
+    resp = await external_client.delete(
+        "/v1/agents/test-agent/artifacts",
+        params={"user_id": "u-1", "name": "never-existed.docx"},
+        headers=_headers(scopes=("write",)),
+    )
+    assert resp.status_code == 404
+    assert [e for e in audit_entries() if e.action.value == "artifact:delete"] == []

@@ -73,6 +73,7 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # 上,查不出 handler 内部对某种 principal 特殊放行这类问题。
         ("GET", "/v1/agents/{agent_code}/artifacts"),
         ("GET", "/v1/agents/{agent_code}/artifacts/download"),
+        ("DELETE", "/v1/agents/{agent_code}/artifacts"),
     }
 )
 

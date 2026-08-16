@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -43,9 +44,12 @@ from control_plane.api._external import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
+from control_plane.audit import emit as audit_emit
 from control_plane.quota.base import QuotaService
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import ArtifactStore
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
@@ -238,5 +242,61 @@ def build_external_artifacts_router() -> APIRouter:
             "X-Content-Type-Options": "nosniff",
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
+
+    @router.delete(
+        "/{agent_code}/artifacts",
+        response_model=None,
+        dependencies=[Depends(require("session", "write"))],
+    )
+    async def delete_artifact(
+        agent_code: str,
+        request: Request,
+        store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        user_id: Annotated[str, Query(min_length=1, max_length=255)],
+        name: Annotated[str, Query(min_length=1, max_length=1024)],
+    ) -> JSONResponse:
+        """Soft-delete one artifact (metadata only).
+
+        ``require("session", "write")`` — **not** ``"delete"``:
+        ``ApiKeyScope`` has no standalone delete tier, so gating on it would
+        mean only an ``admin``-scope key could delete, forcing a third party
+        to hold a key that can also rewrite service accounts just to remove
+        its own file. Same ruling as ``archive_session``.
+
+        The workspace bytes are untouched — the retention sweep hard-deletes
+        later, and an agent re-saving the same name un-deletes the row.
+
+        Unknown / already-deleted / cross-user all collapse to one 404 so the
+        response never reveals whether the name exists.
+        """
+        del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
+        tenant_id: UUID = request.state.tenant_id
+        try:
+            end_user_id = await lookup_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+        if end_user_id is None:
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        hit = await store.soft_delete(
+            tenant_id=tenant_id, user_id=end_user_id, name=name, now=datetime.now(UTC)
+        )
+        if not hit:
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        await audit_emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=request.state.actor_id,
+            action=AuditAction.ARTIFACT_DELETE,
+            resource_type="artifact",
+            resource_id=name,
+            trace_id=current_trace_id_hex(),
+            details={"op": "soft_delete"},
+            on_behalf_of=str(end_user_id),
+        )
+        return JSONResponse({"success": True, "data": {"deleted": name}, "error": None})
 
     return router
