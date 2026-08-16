@@ -262,6 +262,7 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # ``APIRouter(prefix="/v1/agents", tags=["external"])`` 上,用
         # ``require("session", ...)`` 而非 ``console_only()``。
         ("GET", "/v1/agents/{agent_code}/artifacts"),
+        ("GET", "/v1/agents/{agent_code}/artifacts/download"),
     }
 )
 

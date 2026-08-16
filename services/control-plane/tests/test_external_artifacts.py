@@ -40,12 +40,15 @@ from uuid import uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api import external_artifacts as _external_artifacts_module
 from control_plane.api._external import external_subject_id
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.persistence import ArtifactStore, TenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import ArtifactVersion
+from orchestrator.tools import RecordingWorkspaceStore, WorkspacePermissionError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -96,6 +99,7 @@ def _headers(*, scopes: tuple[str, ...]) -> dict[str, str]:
 class _Ctx:
     app: object
     artifact_store: ArtifactStore
+    workspace_store: RecordingWorkspaceStore
 
 
 @pytest.fixture
@@ -105,7 +109,13 @@ def _ctx() -> _Ctx:
         jwt_verifier=build_test_jwt_verifier(),
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
     )
-    return _Ctx(app=app, artifact_store=app.state.artifact_store)  # type: ignore[attr-defined]
+    workspace_store = RecordingWorkspaceStore()
+    app.state.workspace_store = workspace_store  # type: ignore[attr-defined]
+    return _Ctx(
+        app=app,
+        artifact_store=app.state.artifact_store,  # type: ignore[attr-defined]
+        workspace_store=workspace_store,
+    )
 
 
 @pytest.fixture
@@ -204,6 +214,97 @@ def count_tenant_users(user_store: TenantUserStore) -> Callable[[], Awaitable[in
     return _count
 
 
+@pytest.fixture
+def seed_artifact_with_content(
+    _ctx: _Ctx, user_store: TenantUserStore
+) -> Callable[..., Awaitable[None]]:
+    """Like ``seed_artifact``, but also drops real bytes into the
+    workspace-store recorder so the download endpoint has something to read.
+
+    ``RecordingWorkspaceStore.read_file`` ignores the requested path and
+    always returns whatever ``workspace_file`` is currently set to (same
+    single-fixture shape ``test_external_workspace.py``'s ``seeded_workspace``
+    relies on) — fine here because every test using this fixture seeds and
+    downloads exactly one artifact.
+    """
+
+    async def _seed(*, user_id: str, name: str, content: bytes, kind: str = "document") -> None:
+        row = await user_store.resolve(
+            tenant_id=_TENANT_ID,
+            subject_type="user",
+            subject_id=external_subject_id(user_id),
+        )
+        await _ctx.artifact_store.save_version(
+            tenant_id=_TENANT_ID,
+            user_id=row.id,
+            name=name,
+            kind=kind,  # type: ignore[arg-type]
+            path_in_workspace=name,
+            created_in_thread="t-1",
+        )
+        _ctx.workspace_store.workspace_file = content
+
+    return _seed
+
+
+@pytest.fixture
+def break_workspace_permission(_ctx: _Ctx) -> Callable[[], None]:
+    """Make the next ``workspace_store.read_file`` call raise
+    ``WorkspacePermissionError`` — the download handler's permission-failure
+    path (see ``test_permission_error_is_500_not_404`` and its except-order
+    mutation test)."""
+
+    def _break() -> None:
+        _ctx.workspace_store.workspace_file_error = WorkspacePermissionError("boom")
+
+    return _break
+
+
+@pytest.fixture
+def get_latest_version(
+    _ctx: _Ctx, user_store: TenantUserStore
+) -> Callable[[str, str], Awaitable[ArtifactVersion | None]]:
+    """Read back an artifact's latest version row by the app-supplied
+    ``user_id`` — used to assert the digest-backfill side effect."""
+
+    async def _get(user_id: str, name: str) -> ArtifactVersion | None:
+        row = await user_store.resolve(
+            tenant_id=_TENANT_ID,
+            subject_type="user",
+            subject_id=external_subject_id(user_id),
+        )
+        return await _ctx.artifact_store.get_latest_version(
+            tenant_id=_TENANT_ID, user_id=row.id, name=name
+        )
+
+    return _get
+
+
+@pytest.fixture
+def quota_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
+    """Record ``(resource_kind, cost)`` pairs the download handler passes to
+    ``check_admission``.
+
+    ``check_admission``'s underlying ``CheckRequest`` has no ``resource_kind``
+    field at all — it only reaches the audit log's ``resource_id`` on a
+    *denial*, which this suite's unconfigured (always-allow) default quota
+    service never produces. So the only way to observe "the handler really
+    passed resource_kind='artifact_download'" is to wrap the name the
+    handler calls (module-level import, patched where it is looked up —
+    ``external_artifacts.check_admission``), not to stub
+    ``QuotaService.check``.
+    """
+    calls: list[tuple[str, int]] = []
+    original = _external_artifacts_module.check_admission
+
+    async def _recording(*, resource_kind: str, cost: int = 1, **kwargs: object):
+        calls.append((resource_kind, cost))
+        return await original(resource_kind=resource_kind, cost=cost, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_external_artifacts_module, "check_admission", _recording)
+    return calls
+
+
 @pytest.mark.asyncio
 async def test_list_returns_active_artifacts(external_client, seed_artifact) -> None:
     """列表返回 name/kind/latest_version/created_at/updated_at 五个字段。"""
@@ -277,5 +378,125 @@ async def test_list_requires_read_scope(external_client_no_scope) -> None:
     """
     resp = await external_client_no_scope.get(
         "/v1/agents/test-agent/artifacts", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/agents/{agent_code}/artifacts/download  (Task 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_returns_raw_bytes_not_envelope(
+    external_client, seed_artifact_with_content
+) -> None:
+    """成功响应是裸字节流,不套 {success, data, error}。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="report.txt", kind="document", content=b"hello"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"hello"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_forces_attachment_for_active_content(
+    external_client, seed_artifact_with_content
+) -> None:
+    """HTML/SVG 这类可执行内容强制 attachment —— XSS 防护。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="page.html", kind="document", content=b"<script>alert(1)</script>"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "page.html"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-disposition"].startswith("attachment")
+
+
+@pytest.mark.asyncio
+async def test_download_unknown_name_is_404_enveloped(external_client) -> None:
+    """不存在的 name → 404,错误路径套信封。"""
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "nope.txt"},
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "ARTIFACT_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_permission_error_is_500_not_404(
+    external_client, seed_artifact_with_content, break_workspace_permission
+) -> None:
+    """权限失败 → 500,不能和「不存在」合并成 404。
+
+    W2-BUG-1 的教训:元数据行在、内容读不动是**服务端配置问题**,报 404 会
+    让对接方永远在查自己的 name 是不是拼错了。这条测试同时锁住 except 顺序 ——
+    WorkspacePermissionError 是 SandboxSupervisorError 的子类,把它写在后面
+    就永远走不到,这个断言会红。
+    """
+    await seed_artifact_with_content(
+        user_id="u-1", name="report.txt", kind="document", content=b"x"
+    )
+    break_workspace_permission()
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "ARTIFACT_CONTENT_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_download_backfills_digest_on_first_read(
+    external_client, seed_artifact_with_content, get_latest_version
+) -> None:
+    """首次下载回填 size_bytes / sha256。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="report.txt", kind="document", content=b"hello"
+    )
+    assert (await get_latest_version("u-1", "report.txt")).size_bytes is None
+    await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
+    )
+    version = await get_latest_version("u-1", "report.txt")
+    assert version.size_bytes == 5
+    assert version.sha256 == ("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+
+
+@pytest.mark.asyncio
+async def test_download_deducts_quota(
+    external_client, seed_artifact_with_content, quota_calls
+) -> None:
+    """下载走配额准入 —— resource_kind='artifact_download', cost=1。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="report.txt", kind="document", content=b"x"
+    )
+    await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
+    )
+    assert ("artifact_download", 1) in quota_calls
+
+
+@pytest.mark.asyncio
+async def test_download_requires_read_scope(external_client_no_scope) -> None:
+    """零 scope 的 key 必须被 ``require("session", "read")`` 拒掉 —— 同
+    ``test_list_requires_read_scope``,下载端点是这道闸独立的第二个挂点,删掉
+    / 改错不会被上一条测试捕获(评审 Important,见 Task 1 review 留下的经验)。
+    """
+    resp = await external_client_no_scope.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 403

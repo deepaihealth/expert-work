@@ -25,13 +25,15 @@ active content 强制 attachment / nosniff / 权限失败与不存在分开)全�
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
@@ -39,10 +41,13 @@ from control_plane.api._external import (
     lookup_external_user_id,
     reject_nul_path_params,
 )
+from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
+from control_plane.quota.base import QuotaService
 from expert_work.persistence import ArtifactStore
 from expert_work.persistence.tenant_user import TenantUserStore
-from orchestrator.tools import WorkspaceStore
+from expert_work.runtime.audit.logger import AuditLogger
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.external_artifacts")
 
@@ -53,6 +58,26 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return request.app.state.workspace_store  # type: ignore[no-any-return]
+
+
+def _get_quota(request: Request) -> QuotaService:
+    return request.app.state.quota_service  # type: ignore[no-any-return]
+
+
+def _get_audit(request: Request) -> AuditLogger:
+    return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _artifact_error(code: str, message: str, status: int) -> JSONResponse:
+    """错误路径的 ``{success, data, error}`` 信封。
+
+    成功路径**不走这里** —— 下载的成功响应是裸文件字节流(信封与「文件不是
+    JSON」这个事实冲突,同 ``workspace/file``)。
+    """
+    return JSONResponse(
+        status_code=status,
+        content={"success": False, "data": None, "error": {"code": code, "message": message}},
+    )
 
 
 def build_external_artifacts_router() -> APIRouter:
@@ -109,5 +134,109 @@ def build_external_artifacts_router() -> APIRouter:
             for a in artifacts
         ]
         return JSONResponse({"success": True, "data": {"artifacts": items}, "error": None})
+
+    @router.get(
+        "/{agent_code}/artifacts/download",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
+    async def download_artifact(
+        agent_code: str,
+        request: Request,
+        store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        quota: Annotated[QuotaService, Depends(_get_quota)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        user_id: Annotated[str, Query(min_length=1, max_length=255)],
+        name: Annotated[str, Query(min_length=1, max_length=1024)],
+    ) -> Response:
+        """Download the latest version of one artifact.
+
+        Success is the raw file body, not the ``{success, data, error}``
+        envelope (see module docstring); only error paths render it.
+
+        ``mint=False`` — same rationale as the list endpoint. An
+        unrecognized ``user_id`` falls through to the same opaque 404 as a
+        cross-user / unknown name: a third party must not be able to tell
+        "that user doesn't exist" apart from "that user has no such
+        artifact".
+        """
+        del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
+        tenant_id: UUID = request.state.tenant_id
+        try:
+            end_user_id = await lookup_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+        if end_user_id is None:
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        version = await store.get_latest_version(
+            tenant_id=tenant_id, user_id=end_user_id, name=name
+        )
+        if version is None:
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=end_user_id)
+        artifact = next((a for a in artifacts if a.name == name), None)
+        if artifact is None:
+            # Defensive — a version without its parent row violates a store
+            # invariant; stay opaque rather than 500.
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        # 配额准入 —— 第三方比员工更需要这道限制。cost=1 扣 QPS +
+        # ARTIFACT_DOWNLOAD_COUNT_30D(租户没有对应维度行时是 no-op)。
+        actor_id: str = getattr(request.state, "actor_id", "anonymous")
+        denial = await check_admission(
+            quota=quota,
+            audit=audit,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            agent=None,
+            resource_kind="artifact_download",
+            cost=1,
+        )
+        if denial is not None:
+            return denial
+        if workspace_store is None:
+            return _artifact_error(
+                "ARTIFACT_CONTENT_UNAVAILABLE", "artifact content unavailable", 503
+            )
+        try:
+            data = await workspace_store.read_file(
+                tenant_id=tenant_id, user_id=end_user_id, path=version.path_in_workspace
+            )
+        except WorkspacePermissionError:
+            # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」——
+            # 两者不能合并成一个 404(沙箱迁移 W2-BUG-1 的教训)。这个 except
+            # **必须排在** SandboxSupervisorError 之前:它是后者的子类,顺序
+            # 反了永远走不到。traceback 只进日志,不进响应体。
+            logger.warning(
+                "external_artifact.permission_denied version=%s", version.id, exc_info=True
+            )
+            return _artifact_error(
+                "ARTIFACT_CONTENT_UNAVAILABLE", "artifact content unavailable", 500
+            )
+        except SandboxSupervisorError as exc:
+            logger.warning(
+                "external_artifact.content_unavailable version=%s reason=%s", version.id, exc
+            )
+            return _artifact_error("ARTIFACT_NOT_FOUND", "artifact content not found", 404)
+        # 首次读回填摘要 —— save 时读不到内容(它在工作区卷里),所以那时未知。
+        if version.size_bytes is None:
+            await store.set_version_digest(
+                version_id=version.id,
+                size_bytes=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+        # MIME 推断 + XSS 安全 disposition:可执行内容(HTML / SVG 等)一律
+        # attachment,未识别扩展名回退 application/octet-stream + attachment。
+        inferred = infer_content_type(kind=artifact.kind, path=version.path_in_workspace)
+        headers = {
+            "Content-Disposition": content_disposition_header(
+                artifact.name, disposition=inferred.disposition
+            ),
+            "X-Content-Type-Options": "nosniff",
+        }
+        return Response(content=data, media_type=inferred.content_type, headers=headers)
 
     return router
