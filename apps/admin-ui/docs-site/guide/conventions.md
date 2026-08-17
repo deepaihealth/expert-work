@@ -24,7 +24,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 - **HTTPS**，不提供明文 HTTP。
 - **字符编码 UTF-8**。
-- **请求/响应体为 JSON**，两处例外：SSE 端点（`Content-Type: text/event-stream`，见 [3 读懂 SSE 流](./sse-events)）和工作区文件下载（响应体是文件字节流，见 [5.6 工作区文件](./query#_5-6-工作区文件)）。
+- **请求/响应体为 JSON**，四处例外：SSE 端点（`Content-Type: text/event-stream`，见 [3 读懂 SSE 流](./sse-events)）、工作区文件下载（响应体是文件字节流，见 [5.6 工作区文件](./query#_5-6-工作区文件)）、产物下载（响应体是文件字节流，见 [5.7 产物](./query#_5-7-产物)）、附件下载（响应体是文件字节流，见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)）。
 - **时间戳**：ISO-8601 带时区偏移，比如 `2026-08-12T10:00:00+00:00`。
 - **id 形态**：`session_id`、`run_id` 是标准 UUID（带连字符的小写十六进制，如 `550e8400-e29b-41d4-a716-446655440000`）；`user_id` **不是** UUID，是你自己业务系统里的标识字符串（1–255 字符）。
 

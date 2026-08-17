@@ -40,18 +40,21 @@ bare ``{"detail": ...}`` shape.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
 
 from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_session,
+    lookup_external_user_id,
     reject_nul_path_params,
 )
 from control_plane.api._quota_admission import check_admission
@@ -69,10 +72,14 @@ from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.protocol import Principal, QuotaDimension
+from expert_work.persistence.user_upload import UserUploadStore
+from expert_work.protocol import Principal, QuotaDimension, parse_upload_id, render_upload_id
+from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.storage import ObjectStore
-from orchestrator.tools import WorkspaceStore
+from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore, ObjectStoreError
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+
+logger = logging.getLogger("expert_work.control_plane.external_uploads")
 
 #: Fallback envelope ``code`` by HTTP status for an ``HTTPException`` raised
 #: during upload validation / landing (document or image path). Mirrors
@@ -102,6 +109,34 @@ def _upload_error_envelope(exc: HTTPException) -> JSONResponse:
             "error": {"code": code, "message": str(exc.detail)},
         },
     )
+
+
+def _upload_download_error(code: str, message: str, status: int) -> JSONResponse:
+    """错误路径的 ``{success, data, error}`` 信封 —— 下载端点专用。
+
+    成功路径**不走这里**——下载的成功响应是裸文件字节流,与「文件不是
+    JSON」这个事实冲突(同 ``external_artifacts._artifact_error``)。与
+    ``POST .../uploads`` 的 ``_upload_error_envelope``(按 HTTP 状态码猜
+    code)不同,下载端点每条分支的 code 都是明确已知的,直接传参更直白。
+    """
+    return JSONResponse(
+        status_code=status,
+        content={"success": False, "data": None, "error": {"code": code, "message": message}},
+    )
+
+
+def _upload_id_or_422(raw: str) -> UUID:
+    """Parse the ``upload_id`` path segment; raise the shared
+    :class:`ExternalScopeError` (422) on any shape other than ``upl_<uuid>``
+    — mirrors ``external_artifacts._name_or_422``'s calling convention."""
+    parsed = parse_upload_id(raw)
+    if parsed is None:
+        raise ExternalScopeError(
+            "INVALID_UPLOAD_ID",
+            "upload_id must be the value returned by POST /v1/agents/{agent_code}/uploads",
+            422,
+        )
+    return parsed
 
 
 def _get_repo(request: Request) -> AgentSpecStore:
@@ -140,6 +175,10 @@ def _get_image_upload_store(request: Request) -> ImageUploadStore:
     return request.app.state.image_upload_store  # type: ignore[no-any-return]
 
 
+def _get_user_upload_store(request: Request) -> UserUploadStore:
+    return request.app.state.user_upload_store  # type: ignore[no-any-return]
+
+
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
 
@@ -169,6 +208,7 @@ def build_external_uploads_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         session_id: Annotated[UUID | None, Form()] = None,
     ) -> JSONResponse:
@@ -264,12 +304,23 @@ def build_external_uploads_router() -> APIRouter:
                     workspace_store=workspace_store,
                     audit=audit,
                 )
+                row = await uploads.insert(
+                    upload_id=uuid4(),
+                    tenant_id=tenant_id,
+                    user_id=end_user_id,
+                    thread_id=thread_id,
+                    kind="document",
+                    ref=doc_result.path,
+                    mime_type=content_type,
+                    size_bytes=doc_result.size_bytes,
+                    filename=doc_result.path.rsplit("/", 1)[-1],
+                )
                 return JSONResponse(
                     status_code=201,
                     content={
                         "success": True,
                         "data": {
-                            "upload_id": doc_result.path,
+                            "upload_id": render_upload_id(row.id),
                             "session_id": str(thread_id),
                             "type": "document",
                             "mime": content_type,
@@ -310,12 +361,23 @@ def build_external_uploads_router() -> APIRouter:
                 raw=raw,
                 content_type=content_type,
             )
+            row = await uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant_id,
+                user_id=end_user_id,
+                thread_id=thread_id,
+                kind="image",
+                ref=image_ref.to_uri(),
+                mime_type=content_type,
+                size_bytes=len(raw),
+                filename=f"{image_ref.image_id}{image_ref.ext}",
+            )
             return JSONResponse(
                 status_code=201,
                 content={
                     "success": True,
                     "data": {
-                        "upload_id": image_ref.to_uri(),
+                        "upload_id": render_upload_id(row.id),
                         "session_id": str(thread_id),
                         "type": "image",
                         "mime": content_type,
@@ -326,5 +388,146 @@ def build_external_uploads_router() -> APIRouter:
             )
         except HTTPException as exc:
             return _upload_error_envelope(exc)
+
+    @router.get(
+        "/{agent_code}/uploads/{upload_id}",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
+    async def download_upload(
+        agent_code: str,
+        upload_id: str,
+        request: Request,
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
+        images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
+        store: Annotated[ObjectStore | None, Depends(_get_object_store)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        user_id: Annotated[str, Query(min_length=1, max_length=255)],
+    ) -> Response:
+        """Download one previously-uploaded document or image's raw bytes.
+
+        Structural mirror of ``external_artifacts.download_artifact``:
+        success is the raw file body, not the ``{success, data, error}``
+        envelope (see ``_upload_download_error``'s docstring); only error
+        paths render it. ``lookup_external_user_id`` never mints — an
+        unrecognized ``user_id`` must not create a ``tenant_user`` row just
+        because a third party probed this GET (same P1 review T3 rule every
+        other external read endpoint follows).
+        """
+        del agent_code  # uploads are (tenant, user)-scoped — mirrors external_artifacts.
+        tenant_id: UUID = request.state.tenant_id
+        try:
+            parsed_id = _upload_id_or_422(upload_id)
+            end_user_id = await lookup_external_user_id(
+                tenant_id=tenant_id, user_id=user_id, users=users
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+        if end_user_id is None:
+            return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
+        row = await uploads.get(upload_id=parsed_id, tenant_id=tenant_id)
+        if row is None or row.user_id != end_user_id or row.deleted_at is not None:
+            return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
+
+        if row.kind == "document":
+            if workspace_store is None:
+                return _upload_download_error(
+                    "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503
+                )
+            try:
+                data = await workspace_store.read_file(
+                    tenant_id=tenant_id, user_id=end_user_id, path=row.ref
+                )
+            except WorkspacePermissionError:
+                # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」
+                # ——两者不能合并成一个 404(沙箱迁移 W2-BUG-1 的教训)。这个
+                # except **必须排在** SandboxSupervisorError 之前:它是后者的
+                # 子类,顺序反了永远走不到(同 external_artifacts.download_
+                # artifact 的同款注释)。traceback 只进日志,不进响应体。
+                logger.warning(
+                    "external_upload.permission_denied upload_id=%s", parsed_id, exc_info=True
+                )
+                return _upload_download_error(
+                    "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
+                )
+            except SandboxSupervisorError as exc:
+                logger.warning(
+                    "external_upload.content_unavailable upload_id=%s reason=%s", parsed_id, exc
+                )
+                return _upload_download_error("UPLOAD_NOT_FOUND", "upload content not found", 404)
+            # ArtifactKind = Literal["document", "code", "data", "other"]
+            # (expert_work.protocol.artifact) — "document" is an exact match
+            # for this branch, no substitution needed.
+            inferred = infer_content_type(kind="document", path=row.filename)
+        else:
+            # row.kind == "image". ``row.ref`` is always a well-formed
+            # ``expert_work://image/...`` URI here — the only writer is this
+            # same module's ``upload_for_user`` (``image_ref.to_uri()``) — but
+            # stay defensive rather than let a violated store invariant escape
+            # as a raw 500 (same rule ``download_artifact``'s "artifact is
+            # None" guard documents).
+            try:
+                image_id = parse_image_ref(row.ref).image_id
+            except ValueError:
+                return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
+            image_row = await images.get(image_id=image_id, tenant_id=tenant_id)
+            # ``ImageUploadStore.get`` does not filter ``deleted_at`` — the
+            # caller must (same contract ``uploads.py``'s console-side
+            # ``delete_image`` documents: ``if row is None or row.deleted_at
+            # is not None``). Without this, a console-deleted image whose
+            # bytes are still awaiting the retention sweep stays downloadable
+            # to a third party through this endpoint.
+            if image_row is None or image_row.deleted_at is not None:
+                return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
+            if store is None:
+                return _upload_download_error(
+                    "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503
+                )
+            try:
+                data = await store.get(image_row.object_key)
+            except ObjectNotFoundError:
+                return _upload_download_error("UPLOAD_NOT_FOUND", "upload content not found", 404)
+            except ObjectStoreError:
+                # 对象未丢(上面已排除),但读不动——凭证 / bucket 策略 / 存储侧
+                # 5xx 等。同一条「底层读不动就是 500,不能让它逃逸成裸异常」
+                # 规则,同上面文档分支的 WorkspacePermissionError 处理(模块
+                # docstring 讲的「每种拒绝都翻成信封」);ObjectNotFoundError 是 ObjectStoreError
+                # 的子类,顺序必须子类在前(同 WorkspacePermissionError /
+                # SandboxSupervisorError 那对的顺序规则)。traceback 只进日志。
+                logger.warning(
+                    "external_upload.object_store_failed upload_id=%s", parsed_id, exc_info=True
+                )
+                return _upload_download_error(
+                    "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
+                )
+            # ArtifactKind (expert_work.protocol.artifact) has no "image"
+            # value — Literal["document", "code", "data", "other"] — so
+            # "other" is the closest fit (not "document"/"code"/"data").
+            # This has no behavioral effect either way: infer_content_type's
+            # dispatch is purely extension-based in every branch (`kind` is
+            # `del`eted, unused, even in its own fallback branch — verified by
+            # reading its body) — "other" is chosen for readability, not
+            # because it changes the inferred disposition (the only field of
+            # ``inferred`` this endpoint still reads — see the Content-Type
+            # comment below).
+            inferred = infer_content_type(kind="other", path=row.filename)
+
+        headers = {
+            "Content-Disposition": content_disposition_header(
+                row.filename, disposition=inferred.disposition
+            ),
+            "X-Content-Type-Options": "nosniff",
+        }
+        # spec §一.3 — Content-Type is the MIME recorded at upload time
+        # (``row.mime_type``), NOT ``infer_content_type``'s extension-based
+        # guess: that guess falls to ``application/octet-stream`` for
+        # ``application/pdf`` / the three ``openxmlformats`` document types
+        # (none are in ``_artifact_mime``'s whitelist) and to ``text/plain``
+        # for ``.csv`` (whose real MIME is ``text/csv``). Only the
+        # DISPOSITION side of ``infer_content_type``'s verdict is used —
+        # the active-content-forces-attachment / unknown-forces-attachment
+        # rule stays in force regardless of what MIME the upload declared.
+        return Response(content=data, media_type=row.mime_type, headers=headers)
 
     return router

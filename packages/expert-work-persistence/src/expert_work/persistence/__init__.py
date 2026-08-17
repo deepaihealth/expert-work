@@ -154,6 +154,7 @@ from expert_work.persistence.models import TenantUserRow as TenantUserRow
 from expert_work.persistence.models import ThreadMessageRow as ThreadMessageRow
 from expert_work.persistence.models import ThreadMessageSyncRow as ThreadMessageSyncRow
 from expert_work.persistence.models import ThreadMetaRow as ThreadMetaRow
+from expert_work.persistence.models import UserUploadRow as UserUploadRow
 from expert_work.persistence.models import UserWorkspaceRow as UserWorkspaceRow
 from expert_work.persistence.platform_agent_template import (
     InMemoryPlatformAgentTemplateStore as InMemoryPlatformAgentTemplateStore,
@@ -331,6 +332,11 @@ from expert_work.persistence.trigger import SqlTriggerRunStore as SqlTriggerRunS
 from expert_work.persistence.trigger import SqlTriggerStore as SqlTriggerStore
 from expert_work.persistence.trigger import TriggerRunStore as TriggerRunStore
 from expert_work.persistence.trigger import TriggerStore as TriggerStore
+from expert_work.persistence.user_upload import (
+    InMemoryUserUploadStore as InMemoryUserUploadStore,
+)
+from expert_work.persistence.user_upload import SqlUserUploadStore as SqlUserUploadStore
+from expert_work.persistence.user_upload import UserUploadStore as UserUploadStore
 from expert_work.persistence.webhook import (
     InMemoryWebhookDeliveryStore as InMemoryWebhookDeliveryStore,
 )
@@ -446,6 +452,7 @@ __all__ = [
     "InMemoryTokenReservationStore",
     "InMemoryTriggerRunStore",
     "InMemoryTriggerStore",
+    "InMemoryUserUploadStore",
     "InMemoryUserWorkspaceStore",
     "InMemoryVolumeBackupDLQ",
     "InMemoryWebhookDeliveryStore",
@@ -505,6 +512,7 @@ __all__ = [
     "SqlTokenReservationStore",
     "SqlTriggerRunStore",
     "SqlTriggerStore",
+    "SqlUserUploadStore",
     "SqlUserWorkspaceStore",
     "SqlVolumeBackupDLQ",
     "SqlWebhookDeliveryStore",
@@ -530,6 +538,8 @@ __all__ = [
     "TokenReservationStore",
     "TriggerRunStore",
     "TriggerStore",
+    "UserUploadRow",
+    "UserUploadStore",
     "UserWorkspaceRow",
     "UserWorkspaceStore",
     "VolumeBackupDLQ",

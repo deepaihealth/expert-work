@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
+from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError, ObjectStoreError
 from expert_work.runtime.storage.s3_compatible import S3CompatibleObjectStore
 
 
@@ -127,3 +127,55 @@ async def test_s3_producer_error_aborts_and_propagates() -> None:
     with pytest.raises(RuntimeError, match="tar failed"):
         await store.put_stream("k", _boom())
     assert client.aborted
+
+
+# ---------------------------------------------------------------------------
+# get() — non-NoSuchKey ClientError must wrap into ObjectStoreError too
+# (external-upload-unification 终审修复 A1: ``put`` / ``put_stream`` /
+# ``list_prefix`` already give this guarantee; ``get`` didn't).
+# ---------------------------------------------------------------------------
+
+
+class _FakeGetExceptions:
+    class ClientError(Exception):
+        pass
+
+    class _NoSuchKeyError(ClientError):
+        pass
+
+    NoSuchKey = _NoSuchKeyError
+
+
+class _FakeGetClient:
+    """Minimal fake exposing only what ``get`` touches — a distinct
+    ``NoSuchKey`` subclass of ``ClientError`` (unlike ``_FakeExceptions``
+    above, which aliases them) so the two branches can be told apart."""
+
+    def __init__(self, *, error: Exception) -> None:
+        self.exceptions = _FakeGetExceptions()
+        self._error = error
+
+    async def get_object(self, **kw: Any) -> dict[str, Any]:
+        raise self._error
+
+
+@pytest.mark.asyncio
+async def test_s3_get_wraps_non_not_found_client_error() -> None:
+    """凭证 / bucket 策略 / 存储侧 5xx 等「对象没丢,但读不动」的错误必须
+    包成 ``ObjectStoreError``,不能让裸 botocore 异常逃逸——``NoSuchKey`` 分支
+    已经处理「对象丢了」,这里测的是它的兄弟分支。"""
+    client = _FakeGetClient(error=_FakeGetExceptions.ClientError("access denied"))
+    store = S3CompatibleObjectStore(client=client, bucket="b")
+    with pytest.raises(ObjectStoreError) as exc_info:
+        await store.get("k")
+    assert not isinstance(exc_info.value, ObjectNotFoundError)
+
+
+@pytest.mark.asyncio
+async def test_s3_get_still_raises_object_not_found_for_no_such_key() -> None:
+    """回归:``NoSuchKey`` 分支没被上面新加的 ``except ClientError`` 挤掉
+    ——顺序反了这条就会红(``NoSuchKey`` 是 ``ClientError`` 的子类)。"""
+    client = _FakeGetClient(error=_FakeGetExceptions.NoSuchKey("not found"))
+    store = S3CompatibleObjectStore(client=client, bucket="b")
+    with pytest.raises(ObjectNotFoundError):
+        await store.get("k")

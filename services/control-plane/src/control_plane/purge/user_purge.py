@@ -53,6 +53,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.persistence.trigger import TriggerRunStore, TriggerStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.persistence.webhook import WebhookDeliveryStore, WebhookEndpointStore
 from expert_work.persistence.workspace.dlq import VolumeBackupDLQ
 from expert_work.protocol import AuditAction, AuditResult
@@ -88,6 +89,8 @@ class PurgeUserDeps:
     webhook_endpoints: WebhookEndpointStore
     webhook_deliveries: WebhookDeliveryStore
     image_uploads: ImageUploadStore
+    #: 对外附件模型统一(spec 2026-08-17) — third-party upload registry rows.
+    user_uploads: UserUploadStore
     #: Deletion-hygiene purge (Task 8) — feedback rows on the user's threads.
     feedback: FeedbackStore
     #: ``None`` when no object store is wired (e.g. some dev/test deployments)
@@ -408,6 +411,16 @@ async def purge_user(
         "image_upload",
         _purge_images(deps, summary, tenant_id=tenant_id, user_id=user_id),
         default=None,
+    )
+    # 对外附件模型统一(spec 2026-08-17) — the user_upload registry rows
+    # (documents + images alike) are separate from image_upload's own
+    # object-store-blob lifecycle; delete_all_for_user is a plain hard
+    # delete, no blob to reap.
+    summary.deleted["user_upload"] = await _step(
+        summary,
+        "user_upload",
+        deps.user_uploads.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+        default=0,
     )
     if deps.volume_backup_dlq is not None:
         summary.deleted["volume_backup_dlq"] = await _step(

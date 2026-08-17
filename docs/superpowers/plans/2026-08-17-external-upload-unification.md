@@ -399,24 +399,37 @@ if len(image_refs) > MAX_RUN_IMAGE_REFS:
 
 ---
 
-### Task 5: 文档 —— chat.md / errors.md 整章(接口新形状 + 可读性 + 术语 + 代码块标题)
+### Task 5: 文档 —— chat.md / errors.md 整章 + examples.md §10.3(接口新形状 + 可读性 + 术语 + 代码块标题)
+
+> 2026-08-17 修订:线 B(文档可读性,PR #1189)已先合进 main,本 task 在 rebase 之后做。线 B 的 Task 0 代码块标题插件、术语规则、可读性四条已经落地,本 task **直接沿用**;线 B 刻意不碰的 chat.md / errors.md 整章可读性由本 task 负责;线 B 只做了轻量修补的 examples.md §10.3 因接口形状变了必须重写。
 
 **Files:**
 - Modify: `apps/admin-ui/docs-site/guide/chat.md`(§2.3 表、§2.6 整节、「三个容易踩的地方」;**同时整章过可读性**)
-- Modify: `apps/admin-ui/docs-site/guide/errors.md`(码表两处 `:31`/`:33` 与 `:164`/`:166`;**同时整章过可读性**)
-- Modify: `apps/admin-ui/docs-site/guide/query.md`(若 §5.6 工作区文件一节提到 `uploads/` 可下载,补一句指向新下载端点;没提就不动——线 B Task 3 已留指针的话就不重复)
+- Modify: `apps/admin-ui/docs-site/guide/errors.md`(总表 `:31`–`:33`、`:130` 裸 404 段、`:142`、`:154`、`:164`–`:166`、`:173`、8.11、8.12;**同时整章过可读性**)
+- Modify: `apps/admin-ui/docs-site/guide/examples.md`(§10.3「上传文件并带进 run」四语言样例整节改写;`:950` 一段引用 `expert_work://image/` 删)
+- Modify: `apps/admin-ui/docs-site/guide/conventions.md`(**只改一行** `:26`:「请求/响应体为 JSON,两处例外」→ 列全:SSE 端点、工作区文件下载、产物下载、附件下载,四处都指到对应小节)
+- 不动:`guide/query.md`(§5.6 工作区文件一节没有提 `uploads/`,已核实)、`.vitepress/config.mts` 侧栏(§2.6 标题「带图片和文档」**不改**,锚点 `_2-6-带图片和文档` 全站有引用)
 
-**Interfaces:** Consumes Task 2/3/4 的最终形状(实施前 `git log` 确认三者已合)。**同时 consumes 线 B**(`docs/superpowers/plans/2026-08-17-external-docs-readability.md`)的三样东西:① Task 0 的代码块标题语法 ```` ```bash [请求] ```` / ```` ```json [响应 200] ````;② Global Constraints 里的可读性四条 + 术语规则(「帧」→「事件」);③ 线 B Task 1 report 里「交线 A」段列出的 chat.md / errors.md 需要同步的 SSE 锚点。**这两份文件线 B 刻意不碰,整章可读性由本 task 负责。**
+**Interfaces:** Consumes Task 2/3/4 的最终形状(实施前 `git log` 确认 `feature/external-upload-unification` 含 Task 1–4 且已 rebase 到含 #1189 的 main)。沿用线 B 已落地的三样东西:① 代码块标题语法 ```` ```bash [请求] ```` / ```` ```json [响应 201] ````(标题里**不能有 `[` `]`**);② 术语「帧」一律「事件」;③ 可读性四条(一条 bullet 只说一件事 / 一个列表只装一类事 / 占位符 `{user_id}` `{agent_code}` `{upload_id}` 花括号风格且行内代码不夹中文 / 「**加粗:**」伪标题升 `###`)。示例 id 全站已统一:`user_id` 用 `"u-123"`,session/run 用带连字符小写 UUID;本节 `upload_id` 固定用 `upl_3f2c9a1e-7b44-4d3e-9c1a-2f6d0e8b5a17`(文档)与 `upl_9b7d2c40-1e5a-4f88-b3c6-7a0d4e2f9c11`(图片)贯穿 chat.md 与 examples.md。
+
+**接口事实(以代码为准,写前 `rg` 核对):**
+- 上传 `POST /v1/agents/{agent_code}/uploads` 响应 `data` 仍是 `{upload_id, session_id, type, mime, size}`,只有 `upload_id` 形状变成 `upl_<uuid>`(文档、图片同一形状)。
+- 发起 run 请求体:`files[]` 每项**只有** `upload_id`(`extra="forbid"`,多传 `type` / `transfer_method` → 422 `INVALID_REQUEST`);顶层 `image_refs` **已删**(传了也是 422 `INVALID_REQUEST`)。`files[]` 上限 64 条(超过 → 422 `INVALID_REQUEST`)。
+- 解析顺序与错误码:`upload_id` 格式不对 → 422 `INVALID_UPLOAD_ID`;查不到 / 不属于这个 `user_id` / 已软删 / 图片不属于本次会话 → **统一** 404 `UPLOAD_NOT_FOUND`(不透露存在性,与 `SESSION_NOT_FOUND` 同模式)。**原来那个裸 `{"detail": "image ref not found"}` 的 404 已经不可达**(errors.md `:130` 整段改写成 `UPLOAD_NOT_FOUND` 的会话绑定说明,「上传没带 session_id 又发 run 没带 session_id」那个真实顺序保留)。`TOO_MANY_IMAGE_REFS`(files 上限与其相等,真实请求撞不到)与 `INVALID_FILE_REF` / `INVALID_IMAGE_REF` **从文档删除**。仍会出现的裸 `detail` 422:`agent does not accept image input: …` 与 `too many images: max N per run`(保留 `:179` 那两条)。
+- 下载 `GET /v1/agents/{agent_code}/uploads/{upload_id}?user_id={user_id}`,权限档同读会话;成功返回裸字节,`Content-Type` = 上传时记录的 MIME,`Content-Disposition` 按扩展名:图片 / 纯文本 / csv / json 类 `inline`,pdf / docx / xlsx / pptx 与一切可执行内容 `attachment`;`X-Content-Type-Options: nosniff`。不计配额、不写审计。错误:422 `INVALID_UPLOAD_ID`、404 `UPLOAD_NOT_FOUND`(同上四种情况合一)、500 `UPLOAD_CONTENT_UNAVAILABLE`(底层字节读不出;errors.md 8.12 加一句,与 `ARTIFACT_CONTENT_UNAVAILABLE` 同类)。
 
 - [ ] **Step 1: §2.3 请求表**:删 `image_refs` 行;`files` 行改「附件。每项 `{ "upload_id": "…" }`,值来自上传接口。见 2.6」。
-- [ ] **Step 2: §2.6 重写**(保留 mermaid 时序图,改文字与载荷):
+- [ ] **Step 2: §2.6 重写**(保留 mermaid 时序图,改文字与载荷;**不用 `::: code-group`**——VitePress 一个 tab 只装一个 fence,请求+响应成对放不进去):
   - 开头一句:附件三步——上传拿 `upload_id` → 放进 `files[]` 发起对话 →(需要回显时)用同一个 `upload_id` 下载。
   - `files[]` 字段表只剩 `upload_id` 一行。
-  - 「第一步:上传」——两个代码组(文档 / 图片),每组请求块标 `[请求]`、响应块标 `[响应 201]`,响应里 `upload_id` 用 `upl_…` 真形状(**用一个固定示例值贯穿全节**,如 `upl_3f2c9a1e-7b44-4d3e-9c1a-2f6d0e8b5a17`)。
-  - 「第二步:带进对话」——`files:[{"upload_id":"upl_…"},{"upload_id":"upl_…"}]`。
-  - 新增「第三步:下载 / 回显」——`GET …/uploads/{upload_id}?user_id=…`,说明返回裸字节、`Content-Type` 与 `Content-Disposition`、图片可直接 `<img src>`(需带 key,所以通常由你的服务端转发)。
-  - 「容易踩的地方」只留:① `upload_id` 原样回传别解析;② 图片必须与发起对话的会话是同一段(上传返回的 `session_id` 要传回 `session_id`);③ 未知/别人的 `upload_id` 一律 404 不区分。
-- [ ] **Step 3: errors.md**:删 `INVALID_FILE_REF` / `INVALID_IMAGE_REF`(两处表);加 `INVALID_UPLOAD_ID`(422)/ `UPLOAD_NOT_FOUND`(404)/ `UPLOAD_CONTENT_UNAVAILABLE`(500),链接锚点指向 `./chat#_2-6-带图片和文档`(**构建后 grep 产物 HTML 核对 id**)。
-- [ ] **Step 4: 构建 + 死链/死锚点检查**:`cd apps/admin-ui && pnpm --filter docs-site build`(命令以 `package.json` 为准),再跑 `docs/superpowers/plans/2026-08-16-phase3-pr-b-artifacts.md` 里那段死链脚本(含同页锚点)。
-- [ ] **Step 5: 红线扫描**:`rg -n "aliyuncs|kubeconfig|127\.0\.0\.1|crpi-|expert_work\.|control_plane\.|packages/|services/" apps/admin-ui/docs-site/guide/chat.md apps/admin-ui/docs-site/guide/errors.md` 必须为空(`expert_work://image/` 这个 URI 形态也不能再出现在公开文档里)。
-- [ ] **Step 6: Commit** `docs(external-api): 附件章按统一 upload_id 重写 —— 上传/回传/下载三步 + 错误码(Task 5)`
+  - 「第一步:上传」——`####` 两个小节(上传文档 / 上传图片),每个小节请求块标 `[请求]`、响应块标 `[响应 201]`,响应里 `upload_id` 用上面约定的固定示例值。
+  - 「第二步:带进对话」——`files:[{"upload_id":"upl_3f2c…"},{"upload_id":"upl_9b7d…"}]`,一个 `[请求]` 块。
+  - 新增「第三步:下载 / 回显」——`[请求]` 块 + 一个「响应头」块(`Content-Type` / `Content-Disposition` / `X-Content-Type-Options` 三行),正文说明返回裸字节、图片可直接喂给 `<img src>`(需带 key,所以通常由你的服务端转发)。
+  - 「容易踩的地方」只留:① `upload_id` 原样回传别解析;② 图片必须与发起对话的会话是同一段(上传返回的 `session_id` 要传回 `session_id`,否则 404 `UPLOAD_NOT_FOUND`);③ 未知 / 别人的 / 已删除的 `upload_id` 一律 404 不区分。
+  - **chat.md 整章**按可读性四条过一遍(其它小节只做格式与术语,不改事实)。
+- [ ] **Step 3: errors.md**:总表与 422 表删 `INVALID_FILE_REF` / `INVALID_IMAGE_REF` / `TOO_MANY_IMAGE_REFS`(共四行);加 `INVALID_UPLOAD_ID`(422)/ `UPLOAD_NOT_FOUND`(404)/ `UPLOAD_CONTENT_UNAVAILABLE`(500)/ **`INVALID_ARTIFACT_NAME`(422,产物 `name` 含 NUL,PR-B 终审加的闸,总表一直漏)**;`:130` 裸 404 段改写;`:142`「`/runs` 收的是 `image_refs` 引用」改;`:154` INVALID_REQUEST 触发列表去掉 `transfer_method` / `image_refs`,加「`files[]` 条目多传字段」;`:173` `INVALID_USER_ID` 端点枚举**去掉「取消 / 审批决策」**(这两条端点空 `user_id` 折成 404 `RUN_NOT_FOUND`),加「附件下载」;8.11 第一段「配额」措辞对齐 conventions 7.6:一般配额是 `QUOTA_EXCEEDED` 无 `Retry-After`,**只有产物下载的配额翻成 `RATE_LIMIT_EXCEEDED` 且是 30 天滑窗、短退避无效**;8.12 加 `UPLOAD_CONTENT_UNAVAILABLE`。链接锚点指向 `./chat#_2-6-带图片和文档`(**构建后 grep 产物 HTML 核对 id**)。**errors.md 整章**按可读性四条过一遍。
+- [ ] **Step 4: examples.md §10.3 改写**:四种语言(curl / Python / Node / Java)样例都改成新契约——上传响应取 `data.upload_id`(不再看 `type`),发起 run 的 `files` 只放 `{"upload_id": …}`;`:950` 那段引言重写(删 `expert_work://image/`,改成「文档与图片拿到的 `upload_id` 形状相同,走法完全一样」);每个语言块加标题(`[curl]` `[Python]` `[Node.js]` `[Java]` 已有的沿用)。**改完把四份样例各自本地跑一次语法检查**(`python -c "import ast; ast.parse(open(...).read())"` / `node --check` / `javac`;curl 不用跑),真栈实跑放到发布后的验收步。
+- [ ] **Step 5: conventions.md `:26`** 一行改写(见 Files)。
+- [ ] **Step 6: 构建 + 死链/死锚点检查**:`cd apps/admin-ui/docs-site && pnpm exec vitepress build .`(命令以 `package.json` 为准),再跑 `docs/superpowers/plans/2026-08-16-phase3-pr-b-artifacts.md` 末尾那段死链脚本(含同页锚点;**取脚本时用 `rg -v '^```'` 剥掉 fence 行**)。
+- [ ] **Step 7: 红线扫描**:`rg -n "aliyuncs|kubeconfig|127\.0\.0\.1|crpi-|expert_work[:.]|control_plane\.|orchestrator\.|packages/|services/|image_refs|transfer_method|INVALID_IMAGE_REF|INVALID_FILE_REF|TOO_MANY_IMAGE_REFS" apps/admin-ui/docs-site/guide/` 必须为空(`expert_work://image/` 这个 URI 形态不能再出现在公开文档里;旧字段名 / 旧错误码全站清零)。
+- [ ] **Step 8: Commit** `docs(external-api): 附件章按统一 upload_id 重写 —— 上传/回传/下载三步 + 错误码 + 四语言样例(Task 5)`

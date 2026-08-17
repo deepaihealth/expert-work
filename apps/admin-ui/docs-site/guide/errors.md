@@ -18,6 +18,7 @@
 | [`TENANT_SUSPENDED`](#_8-5-403-——-权限不足或被阻断) | 403 | 租户被暂停 | 联系租户管理员 |
 | [`AGENT_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `agent_code` 在你的租户下没有已发布版本 | 检查 `agent_code` 拼写与发布状态 |
 | [`SESSION_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `session_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；统一的 404，不区分"不存在"与"不是你的" |
+| [`UPLOAD_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `upload_id` 不存在、不属于这个 `user_id`、已被软删；（仅发起 run 时）图片不属于本次绑定的会话；（仅下载时）底层内容已被回收 | 核对 `upload_id` / `user_id`（图片还要核对 `session_id`）是否匹配；五种情况统一的 404，不区分 |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `user_id` 未识别，或文件不存在 | 核对 `user_id` / `path` |
 | [`RUN_NOT_FOUND`](./run-control) | 404 | `run_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；不要当作"还没创建好"去重试 |
 | [`APPROVAL_NOT_FOUND`](./run-control) | 404 | 这个 `run_id` 没有一条待审批记录 | 确认这个 run 真的处于等待审批状态 |
@@ -28,9 +29,7 @@
 | [`UPLOAD_TOO_LARGE`](#_8-9-413-——-文档-图片超限) | 413 | 文档 / 图片超过大小上限 | 压缩或裁剪后重传，或拆分成多份 |
 | [`INVALID_REQUEST`](#_8-10-422-——-请求参数不合法) | 422 | 请求体字段本身没通过基础校验 | 检查字段类型 / 长度 / 取值范围 |
 | [`INVALID_USER_ID`](#_8-10-422-——-请求参数不合法) | 422 | `user_id` 去掉首尾空白后是空字符串 | 传一个非空白的 `user_id` |
-| [`INVALID_FILE_REF`](#_8-10-422-——-请求参数不合法) | 422 | `files[]` 里 document 条目的 `upload_id` 格式不对 | 原样回传上传接口返回的值，不要自己改写 |
-| [`TOO_MANY_IMAGE_REFS`](#_8-10-422-——-请求参数不合法) | 422 | 图片条目(`image_refs` + `files[]` 里的 image)总数超过 64——这是外层的合计上限，单次 run 实际允许的图片数通常更低(默认 8，见下方 422 节) | 拆分成多次调用 |
-| [`INVALID_IMAGE_REF`](#_8-10-422-——-请求参数不合法) | 422 | image 条目引用格式不对 | 用上传接口对图片返回的引用，不要用 document 的 |
+| [`INVALID_UPLOAD_ID`](#_8-10-422-——-请求参数不合法) | 422 | `files[]` 里的 `upload_id` 不是 `upl_<uuid>` 那个形状 | 原样回传上传接口返回的 `data.upload_id`，不要自己改写 |
 | [`INVALID_IDEMPOTENCY_KEY`](./conventions) | 422 | `Idempotency-Key` 去空白后为空，或超过 255 字符 | 检查请求头取值 |
 | [`IDEMPOTENCY_KEY_REUSED`](./conventions) | 422 | 同一个 key 换了请求体，或打给了不同的 `agent_code` | 换一个新 key，不要复用 |
 | [`TOO_MANY_INPUT_KEYS`](#_8-10-422-——-请求参数不合法) | 422 | `inputs` 键数量超过 64 | 精简 `inputs` |
@@ -38,25 +37,28 @@
 | [`TOO_MANY_INPUT_BYTES`](#_8-10-422-——-请求参数不合法) | 422 | `inputs` 序列化后总字节数超过 65536 | 精简 `inputs` 整体 |
 | [`UNTRUSTED_CONTENT_BLOCK_TOO_LONG`](#_8-10-422-——-请求参数不合法) | 422 | `untrusted_content` 单块超过 8192 字符 | 拆成多个数组元素 |
 | [`INVALID_TITLE`](#_8-10-422-——-请求参数不合法) | 422 | 会话标题去掉首尾空白后是空字符串 | 传一个非空标题 |
+| [`INVALID_ARTIFACT_NAME`](./query#_5-7-产物) | 422 | 产物 `name` 含 NUL 字节 | 原样回传列表接口给的 `name`，不要自己拼 |
 | [`AGENT_BUILD_FAILED`](./run-control) | 422 | agent manifest 构建失败——发起 run、审批决策续跑都可能遇到，含义相同 | 服务端配置问题，不是你这边能解决的，联系租户管理员 |
 | [`RATE_LIMIT_EXCEEDED`](#_8-11-429-——-两种情况-含义不同) | 429 | 触发限流(网关 / 租户 / 业务维度) | 按 `retry_after_s`(或 `Retry-After` 头)退避重试 |
 | [`QUOTA_EXCEEDED`](#_8-11-429-——-两种情况-含义不同) | 429 | 工作区容量满(文档上传) | 清理资源或联系管理员提额度——重试没用 |
 | [`WORKSPACE_LIST_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 | 工作区存储服务端配置有问题 | 不是你这边能解决的，联系租户管理员 |
 | [`WORKSPACE_FILE_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 | 同上 | 联系租户管理员 |
 | [`UPLOAD_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 / [502](#_8-13-502-——-上传写入失败-上游错误) | 文件上传落盘失败(服务端配置问题，或写入时的上游错误) | 重试；持续失败联系租户管理员 |
+| [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-12-500-——-工作区服务端配置问题) | 500 | 附件下载:元数据行在，服务端读不到文档内容(权限配置问题) | 服务端存储配置问题，重试无效，联系租户管理员 |
 | [`ARTIFACT_CONTENT_UNAVAILABLE`](./query#_5-7-产物) | 500 | 产物记录在，服务端读不到内容(权限配置问题) | 服务端存储配置问题，重试无效，联系租户管理员 |
 | [`UPLOAD_UNAVAILABLE`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 上传接口专属:对象存储或沙箱工作区未就绪 | 稍后重试；持续失败联系租户管理员 |
+| [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 附件下载:服务端整体没有配置对应的存储通路(与上面 500 是同一个 `code`,靠状态码区分两种服务端故障) | 部署/配置问题，重试无效，联系租户管理员 |
 | [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 服务端整体没有配置工作区存储通路(与上面 500 是同一个 `code`,靠状态码区分两种服务端故障) | 部署/配置问题，重试无效，联系租户管理员 |
 | [`SERVER_OVERLOADED`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**，不只是上传 | 按 `Retry-After` 头退避重试 |
 | [`DEADLINE_EXCEEDED`](#_8-15-504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值，或者干脆别传它 |
 
-**这张表只覆盖有 `error.code` 的失败，不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是只有一个 `detail` 字段的简易格式(比如 权限不足的 403、`inputs` 模板变量校验失败的 422，这类 `detail` 是字符串)，有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限""图片引用不属于这个会话"，都是 4xx；配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表，完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
+**这张表只覆盖有 `error.code` 的失败，不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是只有一个 `detail` 字段的简易格式(比如 权限不足的 403、`inputs` 模板变量校验失败的 422，这类 `detail` 是字符串)，有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限"，都是 422；配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表，完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
 
 ## 8.2 错误响应的形状不统一
 
 大多数错误会用**标准格式**返回，能读到 `error.code`:
 
-```json
+```json [响应 · 标准格式]
 {
   "success": false,
   "data": null,
@@ -66,7 +68,7 @@
 
 但一部分错误(比如 权限不足的 403、`inputs` 模板变量校验失败的 422)是**简易格式**，只有一个 `detail` 字段，读不到 `error.code`:
 
-```json
+```json [响应 · 简易格式]
 { "detail": "..." }
 ```
 
@@ -76,7 +78,7 @@
 
 只发生在 `GET /v1/agents/{agent_code}/workspace/file`(下载工作区文件)的 `path` 查询参数上，能读到 `error.code`，固定 `WORKSPACE_FILE_FAILED`:
 
-```json
+```json [响应 400]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "invalid workspace path" } }
 ```
 
@@ -88,7 +90,7 @@
 
 认证失败一律 401，能读到 `error.code`，并带 `WWW-Authenticate: Bearer realm="expert-work"` 响应头:
 
-```json
+```json [响应 401]
 { "success": false, "data": null, "error": { "code": "AUTH_INVALID_TOKEN", "message": "Invalid or unrecognised token" } }
 ```
 
@@ -106,7 +108,7 @@
 
 **scope 不够**是最常见的 403 场景——比如拿一把只有 `read` scope 的 key 去调 `POST /v1/agents/{agent_code}/runs`(这个接口要求 `write`)。这类 403 读不到 `error.code`——码在 `detail.code`:
 
-```json
+```json [响应 · 简易格式]
 { "detail": { "code": "FORBIDDEN", "message": "principal lacks required role" } }
 ```
 
@@ -116,18 +118,22 @@
 
 ## 8.6 404 —— agent 不存在 / 会话不存在 / 工作区文件不存在
 
-能读到 `error.code`，三种情况:
+能读到 `error.code`，四种情况:
 
-```json
+```json [响应 404]
 { "success": false, "data": null, "error": { "code": "AGENT_NOT_FOUND", "message": "no active agent 'xxx' for this tenant" } }
 ```
 
 - `AGENT_NOT_FOUND`——`{agent_code}` 在你的租户下没有已发布(ACTIVE)的版本:要么这个名字从没建过，要么建了但还没发布 / 已经下线，两种情况返回同一个 404，不做区分。
 - `SESSION_NOT_FOUND`——传的 `session_id` 找不到，或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理，不会告诉你"存在但不是你的")。历史消息、重命名(`PATCH .../sessions/{session_id}`)、归档(`DELETE .../sessions/{session_id}`)、run 列表(`GET .../runs?session_id=`)四个接口都走这同一条不透明规则。
+- `UPLOAD_NOT_FOUND`——发起 run 请求体 `files[]` 里的 `upload_id`、或下载接口 `GET /v1/agents/{agent_code}/uploads/{upload_id}` 的路径参数，撞上以下任意一种都返回这同一个 404，不区分是哪一种；但折叠的具体条件按两个入口有差别:
+  - **两处都会触发**:`upload_id` 查不到；查到了但不属于这个 `user_id`；已被软删。
+  - **只在发起 run 时触发**(`files[]` 解析)：图片行还额外要求属于当前请求最终绑定的那段会话(`session_id`)，不属于同样是这个 404——下载接口本身不带 `session_id` 参数，不做这项检查，文档类附件也没有这条限制。
+  - **只在下载时触发**:元数据行还在、也确实属于这个 `user_id`，但底层字节已经不在了(比如对象存储 / 工作区侧的内容已被回收)，`error.message` 是 `"upload content not found"`(仍是同一个 `code`，同样是这个 404)。
+
+  **一个真实会踩的顺序**(图片会话绑定这条):先调上传接口传了一张图但没带 `session_id`(接口顺手给你铸了一个新会话 A，这次上传绑定的是 A)，然后发起 run 时又没传 `session_id`(这次请求又铸了一个新会话 B)——上传绑定的是 A，run 绑定到了 B，直接 404。避免办法:上传时如果打算紧接着发一次带这个附件的 run，把上传响应里的 `session_id` 原样带进发起 run 的请求体。完整的上传 / 携带流程见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
 - `WORKSPACE_FILE_FAILED`——`GET /v1/agents/{agent_code}/workspace/file` 下载文件时，`user_id` 未识别(不认识这个终端用户)和 `path` 指向的文件不存在，这两种情况返回同一个统一的 404，不要试图从响应里区分是哪一种——这是刻意的存在性隐藏，不是 bug。同一个 `error.code` 在 400 / 500 也会出现，靠 HTTP 状态码区分，见下方「400」与「500」两节。
 - `RUN_NOT_FOUND` / `APPROVAL_NOT_FOUND`——取消 run(`:cancel`)与审批决策(`:decide`)这两个端点各自的归属校验 / 审批查找失败码，完整的失败码表(含这两个端点特有的 409 / 403 / 410 / 422 情况)见 [取消 run 与审批决策](./run-control)。
-
-**还有一种 404 没有 `error.code`，是裸 `{"detail": "image ref not found"}`**:`POST /v1/agents/{agent_code}/runs` 的 `image_refs` / `files[]` 里的图片引用是绑定会话的(引用里编了 `thread_id`)，传了一个不属于这次请求最终绑定到的那个会话的图片引用就会撞上这个 404。**一个真实会踩的顺序**:先调上传接口传了一张图但没带 `session_id`(接口顺手给你铸了一个新会话 A，图片引用绑定的是 A)，然后发起 run 时又没传 `session_id`(这次请求又铸了一个新会话 B)——图片引用属于 A，run 绑定到了 B，直接 404。避免办法:上传时如果打算紧接着发一次带这张图的 run，把上传响应里的 `session_id` 原样带进发起 run 的请求体。
 
 ## 8.7 409 —— 审批冲突
 
@@ -139,9 +145,9 @@
 
 ## 8.9 413 —— 文档 / 图片超限
 
-只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`)，不是 `/runs` 本身——`/runs` 收的是 `image_refs` 引用，不是原始字节。这个接口把自己抛出的每一种拒绝都翻成能读到 `error.code` 的形状:
+只发生在上传接口(`POST /v1/agents/{agent_code}/uploads`)，不是 `/runs` 本身——`/runs` 收的是 `upload_id` 引用(`files[]` 里的条目)，不是原始字节。这个接口把自己抛出的每一种拒绝都翻成能读到 `error.code` 的形状:
 
-```json
+```json [响应 413]
 { "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }
 ```
 
@@ -151,39 +157,36 @@
 
 `POST /v1/agents/{agent_code}/runs` 的 422 分两类，形状不一样。
 
-**第一类，请求体字段本身没通过校验**——比如 `files[].transfer_method` 传了 `local_file` 以外的值、`upload_id` 是空字符串、`files[]` / `image_refs` / `untrusted_content` 超过各自的条数上限。能读到 `error.code`，固定是 `INVALID_REQUEST`:
+**第一类，请求体字段本身没通过校验**——比如 `files[]` 条目多传了 `upload_id` 以外的字段(这个请求体不允许未声明字段)、`upload_id` 是空字符串、`files[]` / `untrusted_content` 超过各自的条数上限。能读到 `error.code`，固定是 `INVALID_REQUEST`:
 
-```json
-{ "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Input should be 'local_file'" } }
+```json [响应 422]
+{ "success": false, "data": null, "error": { "code": "INVALID_REQUEST", "message": "Extra inputs are not permitted" } }
 ```
 
-同一类里还有十个更具体的业务码，同样能读到 `error.code`:
+同一类里还有八个更具体的业务码，同样能读到 `error.code`:
 
 | `code` | 什么情况 |
 |---|---|
-| `INVALID_FILE_REF` | `files[]` 里 `type: "document"` 的 `upload_id` 不是上传接口返回的那种 `uploads/<name>` 形状(比如自己截成了裸文件名、或者带了路径穿越) |
-| `TOO_MANY_IMAGE_REFS` | `files[]` 里的图片条目和 `image_refs` 合并后总数超过 64 张——这是请求体层面的合计上限，不代表单次 run 真的能处理 64 张图，见下方「图片数还有一道更严的限制」 |
-| `INVALID_IMAGE_REF` | `image_refs` 或 `files[]` 里 `type: "image"` 条目的引用格式不合法(不是上传接口对图片返回的那种 `expert_work://image/...` 引用)——两个入口都会触发这个码。最容易踩的坑:document 和 image 两种 `files[]` 条目字段名都叫 `upload_id`，把 document 形态的 `upload_id`(形如 `uploads/report.pdf`)填进了 `type: "image"` 的条目 |
+| `INVALID_UPLOAD_ID` | `files[]` 里某一项的 `upload_id` 不是 `upl_<uuid>` 那个形状(比如自己拼了别的字符串、截断了、大小写不对) |
 | `INVALID_IDEMPOTENCY_KEY` | `Idempotency-Key` 头去空白后是空字符串，或超过 255 字符 |
 | `IDEMPOTENCY_KEY_REUSED` | 同一个 `Idempotency-Key` 配了不同的请求体，或者配给了不同的 `agent_code` |
 | `TOO_MANY_INPUT_KEYS` | `inputs` 的键数量超过 64 个(正好 64 个合法) |
 | `INPUT_VALUE_TOO_LONG` | `inputs` 里某个字符串值超过 8192 字符(正好 8192 字符合法；只检查字符串值) |
 | `TOO_MANY_INPUT_BYTES` | `inputs` 序列化后的总字节数(按 UTF-8 编码计算，不是字符数)超过 65536 字节(正好 65536 字节合法)；与 `TOO_MANY_INPUT_KEYS` / `INPUT_VALUE_TOO_LONG` 是三条互相独立的限制，不是互相替代——单值用 list/dict 包一层绕开单值字符数检查时，这条总字节数上限仍然拦得住 |
 | `UNTRUSTED_CONTENT_BLOCK_TOO_LONG` | `untrusted_content` 里某一块超过 8192 字符(正好 8192 字符合法)；与 `untrusted_content` 最多 16 项的条数上限是两条互相独立的限制 |
-| `INVALID_USER_ID` | `user_id` 去掉首尾空白后是空字符串(比如整串都是空格)——这条不止 `/runs`，凡是要求 `user_id` 的端点都会触发，包括会话绑定 / 取消 / 审批决策 / 会话列表与消息 / 重命名 / 归档 / 上传 / 工作区读取 |
+| `INVALID_USER_ID` | `user_id` 去掉首尾空白后是空字符串(比如整串都是空格)——这条不止 `/runs`，凡是要求 `user_id` 的端点都会触发，包括会话绑定 / 会话列表与消息 / 重命名 / 归档 / 上传 / 附件下载 / 工作区读取(取消 run 与审批决策这两个端点比较特殊:空 `user_id` 不会走到这条校验，而是被 `run_id` 归属校验统一折成 404 `RUN_NOT_FOUND`，见 [取消 run 与审批决策](./run-control)) |
 
 **agent 构建失败是另一种独立的 422**，`error.code` 为 `AGENT_BUILD_FAILED`——命中已发布 Agent 的 manifest 因服务端配置问题构建失败(比如引用了不存在的模型 / 工具)，`/runs` 与审批决策(`:decide`)续跑都可能遇到。这不是你这边能解决的，联系租户管理员。
 
-**图片数还有一道更严的限制，而且撞上时拿到的是裸 `detail`，没有 `error.code`**:`TOO_MANY_IMAGE_REFS`(64 张)只是请求体字段层面的合计上限；`/runs` 内部对单次 run 实际处理的图片数另有一条独立限制(部署可配，默认 **8** 张)，超过时是 422 `{"detail": "too many images: max 8 per run"}`，没有 `error.code`，和 `TOO_MANY_IMAGE_REFS` 是两道完全独立的校验——9~64 张这个区间会先过掉 `TOO_MANY_IMAGE_REFS` 那道校验，再被这道校验拦下，拿到的是这个裸 `detail`，读不到 `error.code`。同一类限制还有两种关联失败，同样是裸 `detail`、没有 `error.code`:
+**图片数还有一道更严的限制，而且撞上时拿到的是裸 `detail`，没有 `error.code`**:`files[]` 最多 64 项是请求体字段层面的合计上限(含图片和文档，超过是上面的 `INVALID_REQUEST`)；`/runs` 内部对单次 run 实际处理的图片数另有一条独立限制(部署可配，默认 **8** 张)，超过时是 422 `{"detail": "too many images: max 8 per run"}`，没有 `error.code`，和 `files[]` 的条数上限是两道完全独立的校验。同一类限制还有一种关联失败，同样是裸 `detail`、没有 `error.code`:
 
-- 422 `{"detail": "agent does not accept image input: ..."}`——这个 Agent 没开启图片能力(既没声明支持视觉的模型，Agent 配置里也没声明 `vision` 相关能力)，传了 `image_refs` / `files[]` 里的图片条目就会撞上，不管数量。
-- 404 `{"detail": "image ref not found"}`——图片引用不属于这次请求最终绑定的会话，细节见上方「404」一节。
+- 422 `{"detail": "agent does not accept image input: ..."}`——这个 Agent 没开启图片能力(既没声明支持视觉的模型，Agent 配置里也没声明 `vision` 相关能力)，`files[]` 里带了图片条目就会撞上，不管数量。
 
-三条都不是 `{success, data, error}` 这个形状，写解析逻辑时不要假设"拿到 image 相关的 422/404 就一定有 `error.code` 可读"。
+两条都不是 `{success, data, error}` 这个形状，写解析逻辑时不要假设"拿到 image 相关的 422 就一定有 `error.code` 可读"。
 
 **第二类，`inputs`(提示词模板变量)与 Agent 声明不匹配——没有 `error.code`**，是只有一个 `detail` 字段的简易格式字符串:
 
-```json
+```json [响应 · 简易格式]
 { "detail": "unknown input variable: foo" }
 ```
 
@@ -191,7 +194,7 @@
 
 另外，`PATCH /v1/agents/{agent_code}/sessions/{session_id}`(重命名会话)有自己独立的一个业务码，和上面 `/runs` 那套无关，同样能读到 `error.code`:`title` 去掉首尾空白后是空字符串(比如整串都是空格)，422 `INVALID_TITLE`:
 
-```json
+```json [响应 422]
 { "success": false, "data": null, "error": { "code": "INVALID_TITLE", "message": "title must not be empty" } }
 ```
 
@@ -199,9 +202,9 @@
 
 ## 8.11 429 —— 两种情况，含义不同
 
-**第一种，限流 / 配额超限**(`RATE_LIMIT_EXCEEDED`)——能读到 `error.code`，带 `Retry-After` 响应头:
+**第一种，限流**(`RATE_LIMIT_EXCEEDED`)——能读到 `error.code`，带 `Retry-After` 响应头:
 
-```json
+```json [响应 429]
 {
   "success": false,
   "data": null,
@@ -218,7 +221,7 @@
 
 **第二种，工作区容量满了**(`QUOTA_EXCEEDED`)——只出现在文档上传接口，和 413 一样能读到 `error.code`，**但没有 `Retry-After` 响应头**，因为退避重试解决不了:
 
-```json
+```json [响应 429]
 {
   "success": false,
   "data": null,
@@ -226,21 +229,25 @@
 }
 ```
 
-应对:清理这个终端用户工作区里的旧文件(或者引导用户自己清理)，不是退避重试能解决的。注意这两种 429 靠 `error.code` 区分(`RATE_LIMIT_EXCEEDED` vs `QUOTA_EXCEEDED`)，别只看状态码。
+应对:清理这个终端用户工作区里的旧文件(或者引导用户自己清理)，不是退避重试能解决的。
+
+一般配额走的都是这条 `QUOTA_EXCEEDED` 规则、不带 `Retry-After`。**唯一的例外是产物下载**(`GET /v1/agents/{agent_code}/artifacts/download`):它的配额准入统一走限流引擎，超限时翻成 `RATE_LIMIT_EXCEEDED` 而不是 `QUOTA_EXCEEDED`，也带 `Retry-After` 头——但它扣的是 `ARTIFACT_DOWNLOAD_COUNT_30D` 这个 **30 天滑动窗口**，照 `Retry-After` 做短退避重试是无效的，那个额度不会在几秒内回补。命中它应当按「这个终端用户的下载额度打满了」处理，不是「这会儿太忙等等再试」。细节见 [7.6 限流与配额](./conventions#_7-6-限流与配额) 与 [5.7 产物](./query#_5-7-产物)。
+
+注意这两种 429(以及产物下载那个例外)靠 `error.code` 区分，别只看状态码，也别只看有没有 `Retry-After` 头。
 
 ## 8.12 500 —— 工作区服务端配置问题
 
 以下三种 500 出现在三条接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载、`GET .../artifacts/download` 下载产物)，能读到 `error.code`:
 
-```json
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
 ```
 
-```json
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
 ```
 
-```json
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "ARTIFACT_CONTENT_UNAVAILABLE", "message": "artifact content unavailable" } }
 ```
 
@@ -248,11 +255,19 @@
 
 **上传接口(`POST /v1/agents/{agent_code}/uploads`)文档分支的落盘失败是另一个独立的 `code`**——`UPLOAD_FAILED`，能读到 `error.code`:
 
-```json
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "UPLOAD_FAILED", "message": "workspace write failed" } }
 ```
 
 500 对应服务端工作区权限配置问题(和上面两个 `WORKSPACE_*` 码同一类根因，但这是上传落盘、不是列出 / 下载)；502 对应写入时遇到的上游错误(见下一节)。两种状态码下 `error.code` 和 `error.message` 完全一样，只能靠 HTTP 状态码分——但应对方式相同:都不是退避重试能解决的，持续失败联系租户管理员。
+
+**附件下载(`GET /v1/agents/{agent_code}/uploads/{upload_id}`)读文档内容失败也是一个独立的 `code`**——`UPLOAD_CONTENT_UNAVAILABLE`，与 `ARTIFACT_CONTENT_UNAVAILABLE` 同一类:
+
+```json [响应 500]
+{ "success": false, "data": null, "error": { "code": "UPLOAD_CONTENT_UNAVAILABLE", "message": "upload content unavailable" } }
+```
+
+触发条件按附件类型分两种:**文档**类附件是服务端工作区权限配置有问题(同上一段);**图片**类附件是对象存储读取失败(凭证 / bucket 策略 / 存储侧 5xx 等除「对象不存在」外的其它错误)——两者共用同一个 `UPLOAD_CONTENT_UNAVAILABLE` 码,状态码也一样,只能从你自己知道传的是文档还是图片来区分根因。图片分支完整的三种结果:存储没配置 → 503 `UPLOAD_CONTENT_UNAVAILABLE`(见下一节 [8.14](#_8-14-503-——-服务不可用-两种含义不同));读取时对象已经不在了 → 404 `UPLOAD_NOT_FOUND`;对象存储读取失败(其它错误)→ 500 `UPLOAD_CONTENT_UNAVAILABLE`,和文档分支的这个 500 是同一个码。应对:不是退避重试能解决的，联系你的租户管理员。
 
 ## 8.13 502 —— 上传写入失败(上游错误)
 
@@ -262,7 +277,7 @@
 
 **第一种，全站过载保护——任何端点都可能遇到，不只是上传接口**:服务端同时处理的请求数超过软上限时，新请求直接被挡在外面，`error.code` 为 `SERVER_OVERLOADED`，带 `Retry-After` 响应头:
 
-```json
+```json [响应 503]
 { "success": false, "data": null, "error": { "code": "SERVER_OVERLOADED", "message": "Server is shedding load; retry after a moment." } }
 ```
 
@@ -270,11 +285,13 @@
 
 **第二种，只发生在上传接口**(`POST /v1/agents/{agent_code}/uploads`)，`error.code` 为 `UPLOAD_UNAVAILABLE`，**没有 `Retry-After` 头**:
 
-```json
+```json [响应 503]
 { "success": false, "data": null, "error": { "code": "UPLOAD_UNAVAILABLE", "message": "object store unavailable" } }
 ```
 
 触发条件是服务端没有配置好对应的存储通路——图片走的对象存储、文档走的沙箱工作区，任一个没接好都会触发。这是部署 / 配置问题，不是你这边能解决的，联系你的租户管理员；重试没用。
+
+**附件下载(`GET /v1/agents/{agent_code}/uploads/{upload_id}`)也有一个 503**，`error.code` 为 `UPLOAD_CONTENT_UNAVAILABLE`——与 [8.12](#_8-12-500-——-工作区服务端配置问题) 的同名码同一个 `code`，靠状态码区分:503 是服务端整体没有配置对应的存储通路(图片走对象存储、文档走工作区，任一个没接好都会触发)，500 是配置了但读不动(文档分支是权限问题;图片分支是对象存储读取失败——除「对象不存在」外的其它错误,那种情况走 404,不是这两个状态码),完整对照见 [8.12](#_8-12-500-——-工作区服务端配置问题)。两种都不是退避重试能解决的，都要联系租户管理员。
 
 **产物下载(`GET /v1/agents/{agent_code}/artifacts/download`)也有一个 503**，`error.code` 同样能读到，是 `ARTIFACT_CONTENT_UNAVAILABLE`——与 [8.1 速查表](#_8-1-错误码速查表) / [5.7 产物](./query#_5-7-产物) 里同名码的 500 形态是同一个 `code`,靠状态码区分:503 是服务端整体没有配置工作区存储通路(部署问题),500 是配置了但权限有问题(比如共享 uid 没配对,见 [8.12](#_8-12-500-——-工作区服务端配置问题))。两种都不是退避重试能解决的,都要联系租户管理员。
 
@@ -284,7 +301,7 @@
 
 只有你自己在请求上带了 `X-Expert-Work-Deadline-Ms` 头(见 [通用约定](./conventions))，且这个时间戳已经过去，才会触发——服务端不会主动给你的请求安一个截止时间，不用这个头就不会遇到这个状态码。能读到 `error.code`:
 
-```json
+```json [响应 504]
 { "success": false, "data": null, "error": { "code": "DEADLINE_EXCEEDED", "message": "X-Expert-Work-Deadline-Ms has already passed." } }
 ```
 
@@ -292,4 +309,4 @@
 
 ## 8.16 限流与配额的区别
 
-限流(rate limit)按时间窗口限制"多快"，配额(quota)按资源维度限制"多少"——**这两个 429 对应不同的 `error.code`**(见上方「429」一节):限流是 `RATE_LIMIT_EXCEEDED`(带 `dimension` 字段和 `Retry-After` 头，网关/租户层面的频率限制，不管你在做什么业务操作)；配额是 `QUOTA_EXCEEDED`(工作区容量满了，不带 `Retry-After`，因为等待不会让容量变大)。拿到 429 先看 `error.code` 判断是哪一种(别只看状态码，也别指望 `dimension` 字段总在——网关这一层的限流就不带它)，再决定退避重试还是清理资源 / 找管理员提额度。
+限流(rate limit)按时间窗口限制"多快"，配额(quota)按资源维度限制"多少"——**这两个 429 对应不同的 `error.code`**(见上方「429」一节):限流是 `RATE_LIMIT_EXCEEDED`(带 `dimension` 字段和 `Retry-After` 头，网关/租户层面的频率限制，不管你在做什么业务操作)；配额是 `QUOTA_EXCEEDED`(工作区容量满了，不带 `Retry-After`，因为等待不会让容量变大)。拿到 429 先看 `error.code` 判断是哪一种(别只看状态码，也别指望 `dimension` 字段总在——网关这一层的限流就不带它)，再决定退避重试还是清理资源 / 找管理员提额度。产物下载的配额是这条规则的一个例外，见 [8.11](#_8-11-429-——-两种情况-含义不同)。

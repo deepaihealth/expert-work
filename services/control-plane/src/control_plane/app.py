@@ -476,6 +476,11 @@ from expert_work.persistence.trigger import (
     TriggerRunStore,
     TriggerStore,
 )
+from expert_work.persistence.user_upload import (
+    InMemoryUserUploadStore,
+    SqlUserUploadStore,
+    UserUploadStore,
+)
 from expert_work.persistence.webhook import (
     InMemoryWebhookDeliveryStore,
     InMemoryWebhookEndpointStore,
@@ -541,6 +546,7 @@ def create_app(
     artifact_repo: ArtifactStore | None = None,
     knowledge_repo: KnowledgeStore | None = None,
     image_upload_repo: ImageUploadStore | None = None,
+    user_upload_repo: UserUploadStore | None = None,
     approval_repo: ApprovalStore | None = None,
     run_repo: RunStore | None = None,
     run_event_repo: RunEventStore | None = None,
@@ -654,6 +660,10 @@ def create_app(
     # Stream J.6.补强-3 (Mini-ADR J-32) — image upload registry.
     resolved_image_upload_store: ImageUploadStore = image_upload_repo or (
         sql_stores.image_upload if sql_stores else InMemoryImageUploadStore()
+    )
+    # 对外附件模型统一(spec 2026-08-17) — third-party upload registry.
+    resolved_user_upload_store: UserUploadStore = user_upload_repo or (
+        sql_stores.user_upload if sql_stores else InMemoryUserUploadStore()
     )
     # Stream J.8 (Mini-ADR J-24) — paused-run approval registry.
     resolved_approval_store: ApprovalStore = approval_repo or (
@@ -2286,6 +2296,7 @@ def create_app(
     app.state.sandbox_egress_audit_store = resolved_egress_audit_store
     app.state.knowledge_store = resolved_knowledge_store
     app.state.image_upload_store = resolved_image_upload_store
+    app.state.user_upload_store = resolved_user_upload_store
     app.state.skill_store = resolved_skill_store
     # Skill Marketplace Phase 1 — subscribe/unsubscribe endpoints in the skills
     # router resolve this off app.state (semantic A; runtime path untouched).
@@ -2603,6 +2614,7 @@ class _SqlStores:
     knowledge: KnowledgeStore
     skill: SkillStore
     image_upload: ImageUploadStore  # Stream J.6.补强-3 (Mini-ADR J-32)
+    user_upload: UserUploadStore  # 对外附件模型统一(spec 2026-08-17)
     artifact: ArtifactStore
     approval: ApprovalStore  # Stream J.8 (Mini-ADR J-24)
     run: RunStore  # Stream J.8 closeout follow-up (Mini-ADR J-41)
@@ -2826,6 +2838,7 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         knowledge=SqlKnowledgeStore(session_factory),
         skill=SqlSkillStore(session_factory),
         image_upload=SqlImageUploadStore(session_factory),
+        user_upload=SqlUserUploadStore(session_factory),
         artifact=SqlArtifactStore(session_factory),
         approval=SqlApprovalStore(session_factory),
         run=SqlRunStore(session_factory),
