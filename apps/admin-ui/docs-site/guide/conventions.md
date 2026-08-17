@@ -51,13 +51,13 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 成功：
 
-```json
+```json [响应 · 成功]
 { "success": true, "data": { /* 具体端点的数据 */ }, "error": null }
 ```
 
 失败：
 
-```json
+```json [响应 · 失败]
 { "success": false, "data": null, "error": { "code": "SOME_CODE", "message": "..." } }
 ```
 

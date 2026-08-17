@@ -4,18 +4,18 @@
 
 - **key 一律从环境变量读,示例代码里绝不出现明文 key。** 运行前自己设好:
 
-  ```bash
+  ```bash [环境变量]
   export EXPERT_WORK_API_KEY="aforge_pat_..."
   ```
 
   key 长什么样、怎么申请,见 [认证](./auth)。
 - **域名统一写成 `https://<your-domain>`**,替换成你实际对接的地址,见 [通用约定](./conventions) 的「环境地址」。
 - `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符,替换成你自己的真实值。
-- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 帧含义见 [3 读懂 SSE 流](./sse-events)。
+- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
 
 ## 10.1 发起 run(stream)并解析 SSE
 
-发一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。第三方最容易在这一步踩坑的是 SSE 分帧——下面示例的注释里标出了必须处理对的四件事。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例里直接原样打印 `data`,没有再展开解析——具体字段含义见 [SSE 事件格式](./sse-events)。
+发一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。第三方最容易在这一步踩坑的是 SSE 事件拆分——下面示例的注释里标出了必须处理对的四件事。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例里直接原样打印 `data`,没有再展开解析——具体字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -42,16 +42,16 @@ AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
 def iter_sse_frames(response):
     """
-    按行读(response.readline()),攒到一个空行才 yield 整帧——①一帧可能有
-    id / event / data 好几行,必须攒够一整帧(遇到空行)才能处理,逐行单独处理会把
-    一帧拆散。
+    按行读(response.readline()),攒到一个空行才 yield 整条事件——①一条事件可能有
+    id / event / data 好几行,必须攒够一整条事件(遇到空行)才能处理,逐行单独处理会把
+    一条事件拆散。
 
     这里特意用 response.readline() 而不是 response.read(1024) 这种按固定字节数读的
     写法——`response` 是 chunked 传输编码,Python 的 http.client 为了凑够调用方要求
     的字节数,会在当前已到手的数据不够时反复等下一个 HTTP chunk;这条连接一旦读超时,
     已经到手但不满请求字节数的数据会被整个丢弃。哪怕不超时,也会表现成"stream 模式
     不流式、界面攒够一批才一次性出字、看起来卡住"——容易被第三方误判成平台的问题。
-    readline() 天然按需向底层多次取数据直到凑出一整行,一行(遇到 SSE 帧内单个字段的
+    readline() 天然按需向底层多次取数据直到凑出一整行,一行(遇到 SSE 事件内单个字段的
     行尾 "\n")一到就返回,不会有这个"为了凑够定长反而卡住"的毛病。
     """
     lines = []
@@ -101,24 +101,24 @@ def run_and_stream(user_id, input_text):
         },
     )
 
-    max_seq_seen = None  # 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
+    max_seq_seen = None  # 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
 
     with urllib.request.urlopen(req) as response:
         run_id = response.headers.get("X-Expert-Work-Run-Id")
 
         for raw_frame in iter_sse_frames(response):
             if not raw_frame.strip():
-                continue  # 心跳可能在缓冲区里留下一个空帧,跳过
+                continue  # 心跳可能在缓冲区里留下一段空白,跳过
             event, data, seq = parse_frame(raw_frame)
             if seq is not None:
                 max_seq_seen = seq if max_seq_seen is None else max(max_seq_seen, seq)
 
             if event == "end":
-                # ④收到 end 才算结束;end 帧带这次 run 的终局 status
+                # ④收到 end 才算结束;end 事件带这次 run 的终局 status
                 print("run 结束,status =", data["status"])
                 break
             elif event == "truncated":
-                # ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 8.5)
+                # ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
                 print("这一页被截断,next_seq =", data["next_seq"])
                 continue
             elif event is not None:
@@ -138,9 +138,9 @@ const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
 async function* iterSseFrames(body) {
-  // 从响应流里边读边攒 buffer,按空行("\n\n")分帧——①不是按行分帧,也不是按 chunk 分帧。
-  // 网络分片不会正好落在帧边界上:一个 chunk 可能只送来半帧,也可能一次送来不止一帧;
-  // 必须用 buffer 接住上次没读完的部分,下次收到新 chunk 时接着拼,只在真正出现 "\n\n" 时才切出一帧。
+  // 从响应流里边读边攒 buffer,按空行("\n\n")拆分事件——①不是按行拆分,也不是按 chunk 拆分。
+  // 网络分片不会正好落在事件边界上:一个 chunk 可能只送来半条事件,也可能一次送来不止一条事件;
+  // 必须用 buffer 接住上次没读完的部分,下次收到新 chunk 时接着拼,只在真正出现 "\n\n" 时才切出一条事件。
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   for await (const chunk of body) {
@@ -187,18 +187,18 @@ async function runAndStream(userId, inputText) {
   });
 
   if (!response.ok) {
-    // 不查这个会静默失败:错误响应体是普通 JSON(没有 "\n\n"),分帧循环直接收不到东西就结束,
+    // 不查这个会静默失败:错误响应体是普通 JSON(没有 "\n\n"),事件拆分循环直接收不到东西就结束,
     // 退出码 0、零输出——把 agent_code 敲错或者 key 缺 scope 这种情况会看起来"什么都没发生"。
     const body = await response.text();
     throw new Error(`创建 run 失败:${response.status} ${body}`);
   }
 
   const runId = response.headers.get("X-Expert-Work-Run-Id");
-  let maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
+  let maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
 
   for await (const rawFrame of iterSseFrames(response.body)) {
     if (!rawFrame.trim()) {
-      continue; // 心跳可能在缓冲区里留下一个空帧,跳过
+      continue; // 心跳可能在缓冲区里留下一段空白,跳过
     }
     const { event, data, seq } = parseFrame(rawFrame);
     if (seq !== null) {
@@ -206,11 +206,11 @@ async function runAndStream(userId, inputText) {
     }
 
     if (event === "end") {
-      // ④收到 end 才算结束;end 帧带这次 run 的终局 status
+      // ④收到 end 才算结束;end 事件带这次 run 的终局 status
       console.log("run 结束,status =", data.status);
       break;
     } else if (event === "truncated") {
-      // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 8.5)
+      // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
       console.log("这一页被截断,next_seq =", data.next_seq);
     } else if (event !== null) {
       // metadata / updates / approval / retry / error,以及未来可能新增的类型
@@ -242,7 +242,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 8.1 发起 run(stream)并解析 SSE —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.1 发起 run(stream)并解析 SSE —— JDK 8 + HttpURLConnection,零依赖。
  * JSON 用手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
  */
 public class RunAndStream {
@@ -251,7 +251,7 @@ public class RunAndStream {
     static final String BASE_URL = "https://<your-domain>";
     static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
-    /** 一帧的内容:event 名 + 原始 data JSON 文本(未解析) + seq。 */
+    /** 一条事件的内容:event 名 + 原始 data JSON 文本(未解析) + seq。 */
     static class Frame {
         String event;
         String rawData;
@@ -429,7 +429,7 @@ public class RunAndStream {
             }
 
             String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
-            Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 8.5)
+            Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
 
             try (InputStream in = connection.getInputStream()) {
                 // InputStreamReader 必须显式指定 UTF-8——JDK 8 的默认字符集跟平台走,不指定在中文环境下会乱码
@@ -445,18 +445,18 @@ public class RunAndStream {
                         String rawFrame = buffer.substring(0, sep);
                         buffer.delete(0, sep + 2);
                         if (rawFrame.trim().isEmpty()) {
-                            continue; // 心跳可能在缓冲区里留下一个空帧,跳过
+                            continue; // 心跳可能在缓冲区里留下一段空白,跳过
                         }
                         Frame frame = parseFrame(rawFrame);
                         if (frame.seq != null) {
                             maxSeqSeen = (maxSeqSeen == null) ? frame.seq : Math.max(maxSeqSeen, frame.seq);
                         }
                         if ("end".equals(frame.event)) {
-                            // ④收到 end 才算结束;end 帧带这次 run 的终局 status
+                            // ④收到 end 才算结束;end 事件带这次 run 的终局 status
                             System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
                             break readLoop;
                         } else if ("truncated".equals(frame.event)) {
-                            // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 8.5)
+                            // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
                             System.out.println("这一页被截断,next_seq = " + jsonValue(frame.rawData, "next_seq"));
                         } else if (frame.event != null) {
                             // metadata / updates / approval / retry / error,以及未来可能新增的类型
@@ -677,7 +677,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 8.2 queue 模式 + 轮询结果 —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.2 queue 模式 + 轮询结果 —— JDK 8 + HttpURLConnection,零依赖。
  * JSON 用手拼字符串构造请求体,响应用下面的极简取值函数抠字段,生产代码请用 Gson / Jackson
  * 这类正经 JSON 库,别手拼、也别自己写 parser。
  */
@@ -984,7 +984,7 @@ API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
 AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
-# 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+# 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
 # 不是通用 MIME 猜测器,内容和下面 Node.js / Java 两份表逐条一致。
 # **不要用 mimetypes.guess_type**:它认得哪些类型既跟 Python 版本走,也跟宿主机的 mime
 # 配置文件走(标准库启动时会去读 /etc/mime.types 这类系统文件),同一份代码换个环境
@@ -1102,7 +1102,7 @@ const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
-// 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+// 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
 // 不是通用 MIME 猜测器。new Blob([...]) 不传 type 时,fetch/undici 发出的 Content-Type
 // 会是 application/octet-stream——这个类型不在文档类/图片类任何一个白名单里,
 // 上传会**每次必然** 400 INVALID_UPLOAD。
@@ -1213,7 +1213,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * 8.3 上传文件并带进 run —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.3 上传文件并带进 run —— JDK 8 + HttpURLConnection,零依赖。
  * multipart/form-data 请求体需要手写(java.net 标准库没有内置 multipart 编码器);
  * JSON 同样手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
  */
@@ -1223,7 +1223,7 @@ public class UploadAndRun {
     static final String BASE_URL = "https://<your-domain>";
     static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
-    // 只按扩展名猜第 6 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
+    // 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
     // 不是通用 MIME 猜测器,内容和上面 Python / Node.js 两份表逐条一致。
     // **不要用 URLConnection.guessContentTypeFromName**:它查的是 JDK 自带的那张老
     // content-types.properties,JDK 8 上 .docx / .xlsx / .pptx / .md / .csv / .webp
@@ -1281,7 +1281,7 @@ public class UploadAndRun {
         return (err == null) ? "" : readBody(err);
     }
 
-    // 极简 JSON 取值,详细注释见 8.1/8.2 示例;这里只用到抠 "data" 这个嵌套对象。
+    // 极简 JSON 取值,详细注释见 10.1/10.2 示例;这里只用到抠 "data" 这个嵌套对象。
     static String jsonValue(String json, String key) {
         if (json == null) {
             return null;
@@ -1508,8 +1508,8 @@ AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
 def run_stream_and_wait(user_id, input_text, session_id=None):
     """
-    发起一次 stream 模式的 run,读到 end 帧为止,返回这次绑定/续接到的 session_id。
-    这里只关心"什么时候结束",完整的 SSE 分帧/重连处理见 8.1、8.5。
+    发起一次 stream 模式的 run,读到 end 事件为止,返回这次绑定/续接到的 session_id。
+    这里只关心"什么时候结束",完整的 SSE 事件拆分/重连处理见 10.1、10.5。
     """
     url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs"
     body = {"user_id": user_id, "input": input_text, "mode": "stream"}
@@ -1530,10 +1530,10 @@ def run_stream_and_wait(user_id, input_text, session_id=None):
         new_session_id = response.headers.get("X-Expert-Work-Session-Id")
         # 按行读(response.readline()),不要用 response.read(1024) 这种按固定字节数读的
         # 写法——chunked 传输编码下会为了凑够字节数反复等下一个 HTTP chunk,响应会被
-        # 攒到凑够一批才处理甚至在读超时时丢数据,完整原因见 8.1 的 iter_sse_frames 注释。
+        # 攒到凑够一批才处理甚至在读超时时丢数据,完整原因见 10.1 的 iter_sse_frames 注释。
         #
-        # 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end" 子串匹配——
-        # 服务端会流式吐 token 帧,里面是模型生成的原始文本,如果模型回答里恰好出现
+        # 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end" 子串匹配——
+        # 服务端会流式吐 token 事件,里面是模型生成的原始文本,如果模型回答里恰好出现
         # "event: end" 这几个字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的
         # session_id 返回给你。
         event = None
@@ -1580,8 +1580,8 @@ const BASE_URL = "https://<your-domain>";
 const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
 
 async function runStreamAndWait(userId, inputText, sessionId) {
-  // 发起一次 stream 模式的 run,读到 end 帧为止,返回这次绑定/续接到的 session_id。
-  // 这里只关心"什么时候结束",完整的 SSE 分帧/重连处理见 8.1、8.5。
+  // 发起一次 stream 模式的 run,读到 end 事件为止,返回这次绑定/续接到的 session_id。
+  // 这里只关心"什么时候结束",完整的 SSE 事件拆分/重连处理见 10.1、10.5。
   const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs`;
   const body = { user_id: userId, input: inputText, mode: "stream" };
   if (sessionId) {
@@ -1604,8 +1604,8 @@ async function runStreamAndWait(userId, inputText, sessionId) {
   const newSessionId = response.headers.get("X-Expert-Work-Session-Id");
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  // 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end" 子串匹配——服务端会
-  // 流式吐 token 帧,里面是模型生成的原始文本,如果模型回答里恰好出现 "event: end" 这几个
+  // 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end" 子串匹配——服务端会
+  // 流式吐 token 事件,里面是模型生成的原始文本,如果模型回答里恰好出现 "event: end" 这几个
   // 字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的 session_id 返回给你。
   for await (const chunk of response.body) {
     buffer += decoder.decode(chunk, { stream: true });
@@ -1681,8 +1681,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 8.4 续接会话 —— JDK 8 + HttpURLConnection,零依赖。
- * 这里只关心"什么时候结束",完整的 SSE 分帧/重连处理见 8.1、8.5;
+ * 10.4 续接会话 —— JDK 8 + HttpURLConnection,零依赖。
+ * 这里只关心"什么时候结束",完整的 SSE 事件拆分/重连处理见 10.1、10.5;
  * JSON 手拼字符串构造请求体,响应用下面的极简取值函数抠字段,生产代码请用正经 JSON 库。
  */
 public class ContinueSession {
@@ -1874,7 +1874,7 @@ public class ContinueSession {
         try {
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
-                // 和 8.1 同一形态:直接 getInputStream() 只会抛一句
+                // 和 10.1 同一形态:直接 getInputStream() 只会抛一句
                 // "Server returned HTTP response code: 4xx",错误码和原因得从
                 // getErrorStream() 里读响应体才看得到。
                 throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
@@ -1894,8 +1894,8 @@ public class ContinueSession {
                     while ((sep = buffer.indexOf("\n\n")) != -1) {
                         String rawFrame = buffer.substring(0, sep);
                         buffer.delete(0, sep + 2);
-                        // 只看 event: 字段的值是不是 "end",不要对整帧文本做 "event: end"
-                        // 子串匹配——服务端会流式吐 token 帧,里面是模型生成的原始文本,
+                        // 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end"
+                        // 子串匹配——服务端会流式吐 token 事件,里面是模型生成的原始文本,
                         // 如果模型回答里恰好出现这几个字符,子串匹配会被骗过,提前把
                         // "其实没跑完"的 session_id 返回给你。
                         String event = null;
@@ -1961,7 +1961,7 @@ public class ContinueSession {
 
 ## 10.5 断线重连(带 since_seq)
 
-连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 帧也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 也带了同一个值,下面示例统一走读帧这条路(更抗代理:有些代理/网关会丢弃或改写自定义响应头,帧本身是响应体的一部分,不会被丢)。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
+连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 事件也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 也带了同一个值,下面示例统一走读事件这条路(更抗代理:有些代理/网关会丢弃或改写自定义响应头,事件本身是响应体的一部分,不会被丢)。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -1969,7 +1969,7 @@ public class ContinueSession {
 # 假设上一条连接处理到 seq=41(见过的最大值)就断了,重连时带上它:
 curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_id=u-123&since_seq=41" \
   -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}"
-# 不带 since_seq 会从第 0 帧起重发整个 run,断线重连务必带上这个参数
+# 不带 since_seq 会从第 0 号事件起重发整个 run,断线重连务必带上这个参数
 ```
 
 ```python [Python]
@@ -1990,13 +1990,13 @@ MAX_RETRIES = 5  # 重连次数上限,别无限重试——404 这类明确错�
 
 def iter_sse_frames(response):
     """
-    按行读(response.readline()),攒到一个空行(帧结束标记)才 yield 整帧。
+    按行读(response.readline()),攒到一个空行(事件结束标记)才 yield 整条事件。
 
     **不要**改用 response.read(1024) 这种按固定字节数读的写法——`response` 是 chunked
     传输编码,Python 的 http.client 为了凑够 1024 字节,会在当前已到手的数据不够时
     反复等下一个 HTTP chunk;这条连接一旦读超时,已经到手但不满 1024 字节的数据会被
-    整个丢弃(不会部分返回),表现为"服务端明明发了 metadata 帧,客户端却什么都没
-    收到就超时"——这个坑比"半截帧"更隐蔽,断线重连场景下会直接导致 cursor 永远停在
+    整个丢弃(不会部分返回),表现为"服务端明明发了 metadata 事件,客户端却什么都没
+    收到就超时"——这个坑比"半条事件"更隐蔽,断线重连场景下会直接导致 cursor 永远停在
     None、每次重连都不带 since_seq,和游标丢失是两个独立但会叠加的问题。
     readline() 天然按需向底层多次取数据直到凑出一整行,不会有这个"为了凑够定长反而
     卡住"的毛病。
@@ -2035,7 +2035,7 @@ class Cursor:
     """可变的游标容器——见下面 consume_one_connection 为什么必须用它而不是普通返回值。"""
 
     def __init__(self):
-        self.value = None  # None = 还没见过任何一帧
+        self.value = None  # None = 还没见过任何一条事件
 
 
 def consume_one_connection(response, cursor):
@@ -2045,7 +2045,7 @@ def consume_one_connection(response, cursor):
     cursor 用可变容器(Cursor 实例)传入、原地更新 cursor.value,而不是"处理完再一次性
     返回"——读超时是用抛异常(socket.timeout)实现的,如果 cursor 只在这个函数正常
     return 时才回传给调用方,一旦中途超时抛出,这条连接里已经确认过的 seq 会全部丢失,
-    下次重连还是带着旧的 since_seq,拿到的还是这条连接里已经处理过的帧——会卡成死循环。
+    下次重连还是带着旧的 since_seq,拿到的还是这条连接里已经处理过的事件——会卡成死循环。
     用同一个 Cursor 实例原地更新,不管这个函数是正常返回还是抛异常退出,调用方读到的都是
     目前为止真实见过的最大 seq。
     """
@@ -2054,7 +2054,7 @@ def consume_one_connection(response, cursor):
             continue
         event, data, seq = parse_frame(raw_frame)
         if seq is not None:
-            # 见过的最大 seq,不是最后一帧的 seq
+            # 见过的最大 seq,不是最后一条事件的 seq
             cursor.value = seq if cursor.value is None else max(cursor.value, seq)
 
         if event == "end":
@@ -2071,7 +2071,7 @@ def consume_one_connection(response, cursor):
 
 
 def consume_with_reconnect(user_id, run_id):
-    cursor = Cursor()  # cursor.value is None = 还没见过任何一帧,首次连接不带 since_seq
+    cursor = Cursor()  # cursor.value is None = 还没见过任何一条事件,首次连接不带 since_seq
     done = False
     attempt = 0
 
@@ -2108,12 +2108,12 @@ def consume_with_reconnect(user_id, run_id):
 
         # 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
         # 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
-        # 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
-        # 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+        # 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
+        # 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
         if cursor.value != seen_before:
             attempt = 0
             continue
-        # 一帧都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
+        # 一条事件都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
         # 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
         attempt += 1
         if attempt > MAX_RETRIES:
@@ -2192,7 +2192,7 @@ function readWithTimeout(reader, timeoutMs) {
  * cursorRef 是 { value } 这样的可变容器,在读取过程中原地更新,而不是"处理完再一次性
  * 返回"——读超时是靠 readWithTimeout 抛异常实现的,如果 cursor 只在这个函数正常
  * return 时才回传给调用方,一旦中途超时抛出,这条连接里已经确认过的 seq 会全部丢失,
- * 下次重连还是带着旧的 since_seq,拿到的还是这条连接里处理过的帧——会卡成死循环。
+ * 下次重连还是带着旧的 since_seq,拿到的还是这条连接里处理过的事件——会卡成死循环。
  * 用同一个 cursorRef 对象原地更新,不管这个函数是正常返回还是抛异常退出,调用方读到的
  * 都是目前为止真实见过的最大 seq。
  */
@@ -2216,7 +2216,7 @@ async function consumeOneConnection(response, cursorRef) {
         }
         const { event, data, seq } = parseFrame(rawFrame);
         if (seq !== null) {
-          // 见过的最大 seq,不是最后一帧的 seq
+          // 见过的最大 seq,不是最后一条事件的 seq
           cursorRef.value = cursorRef.value === null ? seq : Math.max(cursorRef.value, seq);
         }
         if (event === "end") {
@@ -2245,7 +2245,7 @@ async function consumeOneConnection(response, cursorRef) {
 }
 
 async function consumeWithReconnect(userId, runId) {
-  const cursorRef = { value: null }; // value === null = 还没见过任何一帧,首次连接不带 since_seq
+  const cursorRef = { value: null }; // value === null = 还没见过任何一条事件,首次连接不带 since_seq
   let done = false;
   let attempt = 0;
 
@@ -2284,13 +2284,13 @@ async function consumeWithReconnect(userId, runId) {
 
     // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
     // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
-    // 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
-    // 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+    // 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
+    // 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
     if (cursorRef.value !== seenBefore) {
       attempt = 0;
       continue;
     }
-    // 一帧都没推进的失败才计入预算:退避 + 上限,超过上限就把最后一次的错误抛出去,
+    // 一条事件都没推进的失败才计入预算:退避 + 上限,超过上限就把最后一次的错误抛出去,
     // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
     attempt++;
     if (attempt > MAX_RETRIES) {
@@ -2323,7 +2323,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 /**
- * 8.5 断线重连(带 since_seq) —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.5 断线重连(带 since_seq) —— JDK 8 + HttpURLConnection,零依赖。
  * JSON 用下面的极简取值函数抠字段,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手写 parser。
  */
 public class ReconnectEvents {
@@ -2461,7 +2461,7 @@ public class ReconnectEvents {
 
     /** 可变的游标容器——见下方 consumeOneConnection 为什么必须用它而不是普通返回值。 */
     static class Cursor {
-        Long value; // null = 还没见过任何一帧
+        Long value; // null = 还没见过任何一条事件
     }
 
     /** 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。 */
@@ -2487,7 +2487,7 @@ public class ReconnectEvents {
      * cursor 用可变容器传入、原地更新,而不是"处理完再一次性返回"——读超时是用抛异常
      * (SocketTimeoutException)实现的,如果 cursor 只在方法正常 return 时才回传给调用方,
      * 一旦中途超时抛出,这条连接里已经确认过的 seq 会全部丢失,下次重连还是带着旧的
-     * since_seq,拿到的还是这条连接里已经处理过的帧——会卡成死循环。用同一个 Cursor 实例
+     * since_seq,拿到的还是这条连接里已经处理过的事件——会卡成死循环。用同一个 Cursor 实例
      * 原地更新,不管这个方法是正常返回还是抛异常退出,调用方读到的都是目前为止真实见过的
      * 最大 seq。
      */
@@ -2517,7 +2517,7 @@ public class ReconnectEvents {
                     }
                     Frame frame = parseFrame(rawFrame);
                     if (frame.seq != null) {
-                        // 见过的最大 seq,不是最后一帧的 seq
+                        // 见过的最大 seq,不是最后一条事件的 seq
                         cursor.value = (cursor.value == null) ? frame.seq : Math.max(cursor.value, frame.seq);
                     }
                     if ("end".equals(frame.event)) {
@@ -2539,7 +2539,7 @@ public class ReconnectEvents {
     }
 
     static void consumeWithReconnect(String userId, String runId) throws IOException {
-        Cursor cursor = new Cursor(); // cursor.value == null = 还没见过任何一帧,首次连接不带 since_seq
+        Cursor cursor = new Cursor(); // cursor.value == null = 还没见过任何一条事件,首次连接不带 since_seq
         boolean done = false;
         int attempt = 0;
 
@@ -2577,13 +2577,13 @@ public class ReconnectEvents {
 
             // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
             // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
-            // 干净 EOF 那一侧的话,一条"送出了帧、然后被 RST"的连接会被当成纯失败计费,已经
-            // 重连成功好几次、收了十几帧,照样报"重连 N 次仍未成功"中止掉。
+            // 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
+            // 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
             if (!Objects.equals(cursor.value, seenBefore)) {
                 attempt = 0;
                 continue;
             }
-            // 一帧都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
+            // 一条事件都没推进的失败才计入预算:退避 + 上限,不要无退避无上限地立刻重试,
             // 否则 attempt 永远清零,退避和上限形同虚设,会变成对着平台的重连洪水。
             attempt++;
             if (attempt > MAX_RETRIES) {
@@ -2713,7 +2713,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 8.6 取消 run —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.6 取消 run —— JDK 8 + HttpURLConnection,零依赖。
  * JSON 手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
  */
 public class CancelRun {
@@ -2938,7 +2938,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 8.7 审批决策 —— JDK 8 + HttpURLConnection,零依赖。
+ * 10.7 审批决策 —— JDK 8 + HttpURLConnection,零依赖。
  * JSON 手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
  */
 public class ApprovalDecision {
@@ -3027,7 +3027,7 @@ public class ApprovalDecision {
         try {
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
-                // 和 8.6 取消同一形态:失败响应可能是带 error.code 的 JSON、可能是裸
+                // 和 10.6 取消同一形态:失败响应可能是带 error.code 的 JSON、可能是裸
                 // {"detail": ...},也可能是网关自己返回的 HTML 甚至空体,一律当文本原样打出来。
                 System.out.println("决策失败:" + status + " " + readErrorBody(connection));
                 throw new IOException("decide failed: " + status);

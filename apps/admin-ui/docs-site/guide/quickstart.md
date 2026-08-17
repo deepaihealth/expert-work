@@ -42,7 +42,7 @@ Authorization: Bearer aforge_pat_xxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## 1.2 发起第一次对话
 
-```bash
+```bash [请求]
 curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
@@ -68,7 +68,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 响应体是一串 SSE 事件：
 
-```
+``` [事件流片段]
 event: metadata
 data: {"run_id":"...","thread_id":"..."}
 
@@ -79,7 +79,7 @@ event: end
 data: {"status":"success","run_id":"..."}
 ```
 
-最后一帧 `end` 的 `status` 是这次执行的最终状态，四个取值：
+最后一个 `end` 事件的 `status` 是这次执行的最终状态，四个取值：
 
 | `status` | 含义 |
 |---|---|
@@ -88,7 +88,7 @@ data: {"status":"success","run_id":"..."}
 | `interrupted` | 被取消或中断 |
 | `error` | 失败，超时也归这一档 |
 
-可回放的事件还会多一行 `id: {毫秒时间戳}-{seq}`（`end`、`token` 这类事件没有）。断线重连时把见过的最大 `seq` 传回去，服务端只补它之后的事件。
+可回放的事件还会多一行 `id:`，格式是"毫秒时间戳-序号"（`end`、`token` 这类事件没有）。断线重连时把见过的最大 `seq` 传回去，服务端只补它之后的事件。
 
 完整事件类型、字段含义、断线重连见 [读懂 SSE 流](./sse-events)。
 
@@ -96,13 +96,13 @@ data: {"status":"success","run_id":"..."}
 
 把上一步拿到的 `X-Expert-Work-Session-Id` 作为下次请求体里的 `session_id` 传回去，就是同一段会话的下一轮；不传就是另开一段新会话。
 
-```bash
+```bash [请求]
 curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{
     "user_id": "u-123",
-    "session_id": "<上一步响应头里的 Session-Id>",
+    "session_id": "{session_id}",
     "input": "刚才那个再详细说说",
     "mode": "stream"
   }'

@@ -20,10 +20,10 @@ flowchart LR
 ## 6.2 Key 的格式
 
 ```
-aforge_pat_<5位十六进制>_<32位随机串>
+aforge_pat_<hex>_<random>
 ```
 
-例如 `aforge_pat_a1b2c_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`（示例，非真实值）。开头 5 位十六进制取自租户 id 的前 5 个字符，方便在日志或审计面板里快速识别这把 key 属于哪个租户，但不会泄露完整租户 id。
+例如 `aforge_pat_a1b2c_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`（示例，非真实值）——`<hex>` 是 5 位十六进制，取自租户 id 的前 5 个字符，方便在日志或审计面板里快速识别这把 key 属于哪个租户，但不会泄露完整租户 id；`<random>` 是 32 位随机字符串。
 
 ::: warning 明文只在创建（或轮换）时返回一次
 服务端只存 key 的前 25 位字符（用于查找）加上完整明文的 argon2id 哈希，数据库里从来没有完整明文。
@@ -47,7 +47,7 @@ aforge_pat_<5位十六进制>_<32位随机串>
 
 Key 只能访问第三方对接接口（`/v1/agents/{agent_code}/…` 与 `/v1/agent-catalog`）。租户管理面——**管理 key 本身、成员名册、审计流水、租户配置与配额、MCP 注册表、长期记忆**——一律拒绝 API Key，返回 403：
 
-```json
+```json [响应 403]
 {"detail": {"code": "FORBIDDEN",
             "message": "console API is not available to API keys; use /v1/agents/{agent_code}/…"}}
 ```
@@ -56,16 +56,16 @@ Key 只能访问第三方对接接口（`/v1/agents/{agent_code}/…` 与 `/v1/a
 
 ## 6.4 创建一把 Key
 
-由租户管理员执行：
+由租户管理员执行；`{admin_jwt}` 是租户管理员登录后取得的凭证，不能用 API Key 代替：
 
-```bash
+```bash [请求]
 curl -X POST https://<your-domain>/v1/service_accounts/{service_account_id}/api_keys \
-  -H "Authorization: Bearer <租户管理员登录后的 JWT，不能用 API Key>" \
+  -H "Authorization: Bearer {admin_jwt}" \
   -H "Content-Type: application/json" \
   -d '{"scopes": ["write"], "expires_at": null}'
 ```
 
-```json
+```json [响应 200]
 {
   "success": true,
   "data": {
@@ -108,9 +108,9 @@ sequenceDiagram
     Note over E: 宽限期结束：旧 key 立即 401
 ```
 
-```bash
+```bash [请求]
 curl -X POST https://<your-domain>/v1/api_keys/{api_key_id}/rotate \
-  -H "Authorization: Bearer <租户管理员登录后的 JWT，不能用 API Key>" \
+  -H "Authorization: Bearer {admin_jwt}" \
   -H "Content-Type: application/json" \
   -d '{"grace_period_s": 300}'
 ```
