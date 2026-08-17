@@ -183,6 +183,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/uploads \
 }
 ```
 
+同名文档会覆盖同一份工作区文件：同一个用户重复上传同一个文件名后，两个 `upload_id` 下载到的都是最后一次上传的内容。
+
 #### 上传图片
 
 ```bash [请求]
@@ -233,6 +235,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 需要把附件内容拿回来（比如在你自己的界面上预览用户刚上传的图片）时，原样拿 `upload_id` 去调下载接口：
 
 ```bash [请求]
+# 需要 read 权限（write key 含读）
 curl -X GET "https://<your-domain>/v1/agents/{agent_code}/uploads/upl_3f2c9a1e-7b44-4d3e-9c1a-2f6d0e8b5a17?user_id=u-123" \
   -H "Authorization: Bearer <key>" \
   -o report.pdf
@@ -245,6 +248,8 @@ X-Content-Type-Options: nosniff
 ```
 
 成功响应是**裸文件字节**，不套 `{success, data, error}` 信封。`Content-Type` 是上传时记录的 MIME；`Content-Disposition` 按扩展名分类：图片 / 纯文本 / CSV 这类走 `inline`，PDF / DOCX / XLSX / PPTX 以及一切可执行内容（HTML、SVG 等）一律 `attachment`（附件上传只收 PDF / DOCX / XLSX / PPTX / TXT / MD / CSV 这几种，JSON 走不到这条 `inline` 分支）。这条接口不计配额、不写审计。
+
+`Content-Disposition` 的 `filename` 两种附件取值方式不同：文档保留净化后的原始文件名（如上例的 `report.pdf`）；图片用的是服务端生成的图片 id 加扩展名（形如 `{image_id}.png`），不是上传时用的原始文件名——拿它当展示名会文不对题。
 
 图片可以直接喂给 `<img src>` 显示——但这个地址需要带 `Authorization` 头才能访问，浏览器没法直接当图片 URL 用，通常做法是由你的服务端转发一层，再把字节交给前端。
 
@@ -274,6 +279,8 @@ X-Content-Type-Options: nosniff
 ```
 
 **三、未知的、别人的、已删除的 `upload_id`，一律是同一个 404，不区分原因。** 这是刻意的存在性隐藏，和 `SESSION_NOT_FOUND` / `RUN_NOT_FOUND` 同一模式——完整规则见 [8 错误码总表](./errors)。
+
+`files` 最多 64 项只是请求体字段层面的合计上限（图片和文档一起算）；图片还有一道更严的单次 run 处理上限（默认 8 张），撞上是没有 `error.code` 的裸 `detail` 422，完整规则见 [8.10 422 —— 请求参数不合法](./errors#_8-10-422-——-请求参数不合法)。
 
 ## 2.7 外部内容与模板变量
 

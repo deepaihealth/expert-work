@@ -66,7 +66,8 @@
 - 权限 `session:read`(`write` key 含读)。
 - 成功:**裸字节**(不套信封),`Content-Type` = 上传时记录的 MIME;`Content-Disposition`
   沿用 `_artifact_mime.infer_content_type` 的白名单规则(图片与安全文本 inline、
-  可执行内容强制 attachment、未知一律 attachment),`filename` 用上传时的原始文件名(已净化);
+  可执行内容强制 attachment、未知一律 attachment),`filename` 取上传时登记的名(文档是净化后的
+  原始文件名;图片是 `{image_id}{ext}`,与 §二.3 一致,不是原始文件名);
   `X-Content-Type-Options: nosniff`。
 - 失败:套 `{success:false, error}` 信封:
 
@@ -74,7 +75,8 @@
 |---|---|---|
 | `upload_id` 形状不对 | 422 | `INVALID_UPLOAD_ID` |
 | `user_id` 未知 / 行不存在 / 不属于该用户 / 已软删 / 底层字节已被回收 | 404 | `UPLOAD_NOT_FOUND` |
-| 底层读不动(权限)| 500 | `UPLOAD_CONTENT_UNAVAILABLE` |
+| 底层读不动(权限,仅文档;图片是对象存储读取失败,除「对象不存在」外的其它错误)| 500 | `UPLOAD_CONTENT_UNAVAILABLE` |
+| 存储通路未配置(图片走对象存储 / 文档走工作区,任一没接好)| 503 | `UPLOAD_CONTENT_UNAVAILABLE` |
 
 - `agent_code` 只是 URL 结构的一部分,**不参与权限判定与过滤**(与 artifacts / sessions 同款,
   附件是 (tenant, user) 维度)。
