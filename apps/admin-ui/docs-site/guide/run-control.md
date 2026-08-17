@@ -130,7 +130,7 @@ SSE `approval` 事件（见 [3 读懂 SSE 流](./sse-events)）里带的 `reques
 
 `reject` 之后 run 是否终止，取决于这次审批是怎么触发的：
 
-- **Agent manifest 里配置的强制审批点**（声明式审批，常见于高风险工具）：拒绝会终止整个 run。**但 `end.status` 依然是 `success`**——目前没有专门的"已拒绝"终态，要判断这次调用是否被拒绝，得看事件流里这次工具调用对应的结果消息。
+- **Agent 的策略里配置的强制审批点**（在 Agent 配置(manifest)里声明，常见于高风险工具；对应 SSE `approval` 事件里 `reason_kind: policy_gate`）：拒绝会终止整个 run。**但 `end.status` 依然是 `success`**——目前没有专门的"已拒绝"终态，要判断这次调用是否被拒绝，得看事件流里这次工具调用对应的结果消息。
 - **Agent 在执行过程中自己发起的确认请求**（内置的 `ask_for_approval`）：拒绝只是把一条"审批被拒绝"的结果喂给 Agent，run 会继续往下跑，Agent 可能换个方式重试或调整计划。
 
 #### modified_args 的形状

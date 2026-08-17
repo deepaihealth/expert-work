@@ -86,7 +86,7 @@ data: {"status":"success","run_id":"..."}
 | `success` | 正常答完 |
 | `paused` | 停在人工审批节点等你决策，**不是失败**，见 [4.2 审批决策](./run-control#_4-2-审批决策) |
 | `interrupted` | 被取消或中断 |
-| `error` | 失败，超时也归这一档 |
+| `error` | 失败，超时和步数用尽也归这一档 |
 
 这张表只是摘要。每个取值下客户端具体该做什么，见 [3.4 的 `end` 事件](./sse-events#end)。
 

@@ -472,7 +472,7 @@ Idempotency-Key: order-8899
 
 ### 重试时拿到什么
 
-**`queue` 模式**：和首次请求完全同形状的 202 响应体，`data.run_id` 与首次一致。
+**`queue` 模式**：和首次请求完全同形状的 202 响应体，`data.run_id` 与首次一致。**但 `data.status` 不一样**——首次请求恒为字面量 `queued`，幂等重放拿到的是原 run 当时的**真实状态**，可能是 [5.4 run 列表](./query#_5-4-run-列表) 那 8 个值里的任意一个(比如已经跑完的 `success`)。别按「等于 `queued` 才轮询」写分支，按「不是最终状态就轮询」写。
 
 ```bash [请求]
 curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
@@ -494,5 +494,5 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 ::: warning 重放以 `truncated` 收尾时，不能靠重发 POST 翻页
 `POST .../runs` 的请求体和查询参数里都没有 `since_seq`，原样重发只会永远拿回同一个第一页。
 
-翻页要换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…&since_seq=<next_seq>`，其中 `run_id` 从 `X-Expert-Work-Run-Id` 响应头取。见 [3 读懂 SSE 流](./sse-events)。
+翻页要换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…&since_seq={next_seq}`，其中 `run_id` 从 `X-Expert-Work-Run-Id` 响应头取。见 [3 读懂 SSE 流](./sse-events)。
 :::

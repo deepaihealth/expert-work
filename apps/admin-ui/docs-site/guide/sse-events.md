@@ -362,7 +362,7 @@ data: {"memory_writeback":null}
 
 #### 会出现哪些节点名
 
-节点名是一个**闭集，一共 7 个**。具体哪几个会出现在你对接的这个 Agent 上，由**租户管理员在管理控制台给它开了哪些功能**决定——对接方改不了，想确认就找管理员。
+节点名**今天**是一个**闭集，一共 7 个**(平台演进可能新增，见表下)。具体哪几个会出现在你对接的这个 Agent 上，由**租户管理员在管理控制台给它开了哪些功能**决定——对接方改不了，想确认就找管理员。
 
 | 节点名 | 是不是每次都有 | 什么条件下会出现 | 这个节点在做什么 |
 |---|---|---|---|
@@ -593,8 +593,8 @@ function onUpdates(data) {
 
 | 产生路径 | `label` | `agent_ref` | `start` 里的 `role` |
 |---|---|---|---|
-| 静态子 Agent(Agent 配置里声明好的) | 这个子 Agent 的工具名 | 形如 `名字@版本` | **恒为 `null`** |
-| 动态派子任务(模型自己调内建的派子任务工具) | **恒为 `spawn_worker`** | 形如 `dynamic:<角色>`;模型没给角色时是 `dynamic:general` | 模型自己写的一段自由文本(开集);写的是空白则为 `null` |
+| 静态子 Agent(Agent 配置里声明好的) | 这个子 Agent 的工具名 | 形如 `{name}@{version}`(子 Agent 名 + 版本号) | **恒为 `null`** |
+| 动态派子任务(模型自己调内建的派子任务工具) | **恒为 `spawn_worker`** | 形如 `dynamic:{role}`(`dynamic:` + 模型给的角色名);模型没给角色时是 `dynamic:general` | 模型自己写的一段自由文本(开集);写的是空白则为 `null` |
 
 所以看到 `role` 不是 `null`，就一定是动态派子任务那一条路径。
 
@@ -652,7 +652,7 @@ function onUpdates(data) {
 
 #### 完整示例
 
-下面这三条是**动态派子任务**那一条路径:`label` 是 `spawn_worker`、`agent_ref` 是 `dynamic:researcher`、`role` 是模型自己写的 `researcher`——三个字段成套对应，不能混着抄。走静态子 Agent 那条路径的话，这三个值会是「子 Agent 的工具名 / `名字@版本` / `null`」。
+下面这三条是**动态派子任务**那一条路径:`label` 是 `spawn_worker`、`agent_ref` 是 `dynamic:researcher`、`role` 是模型自己写的 `researcher`——三个字段成套对应，不能混着抄。走静态子 Agent 那条路径的话，这三个值会是「子 Agent 的工具名 / `{name}@{version}` / `null`」。
 
 ``` [事件流片段]
 id: 1755229358102-6
