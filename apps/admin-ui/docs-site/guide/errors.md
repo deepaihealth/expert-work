@@ -18,7 +18,7 @@
 | [`TENANT_SUSPENDED`](#_8-5-403-——-权限不足或被阻断) | 403 | 租户被暂停 | 联系租户管理员 |
 | [`AGENT_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `agent_code` 在你的租户下没有已发布版本 | 检查 `agent_code` 拼写与发布状态 |
 | [`SESSION_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `session_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；统一的 404，不区分"不存在"与"不是你的" |
-| [`UPLOAD_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `upload_id` 不存在，不属于这个 `user_id`，已被软删，或（图片）不属于本次绑定的会话 | 核对 `upload_id` / `user_id` / `session_id` 是否匹配；四种情况统一的 404，不区分 |
+| [`UPLOAD_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `upload_id` 不存在、不属于这个 `user_id`、已被软删；（仅发起 run 时）图片不属于本次绑定的会话；（仅下载时）底层内容已被回收 | 核对 `upload_id` / `user_id`（图片还要核对 `session_id`）是否匹配；五种情况统一的 404，不区分 |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `user_id` 未识别，或文件不存在 | 核对 `user_id` / `path` |
 | [`RUN_NOT_FOUND`](./run-control) | 404 | `run_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；不要当作"还没创建好"去重试 |
 | [`APPROVAL_NOT_FOUND`](./run-control) | 404 | 这个 `run_id` 没有一条待审批记录 | 确认这个 run 真的处于等待审批状态 |
@@ -126,7 +126,12 @@
 
 - `AGENT_NOT_FOUND`——`{agent_code}` 在你的租户下没有已发布(ACTIVE)的版本:要么这个名字从没建过，要么建了但还没发布 / 已经下线，两种情况返回同一个 404，不做区分。
 - `SESSION_NOT_FOUND`——传的 `session_id` 找不到，或者它不属于这个 `user_id` / `agent_code` 组合(跨用户 / 跨 agent 的会话 id 一律当不存在处理，不会告诉你"存在但不是你的")。历史消息、重命名(`PATCH .../sessions/{session_id}`)、归档(`DELETE .../sessions/{session_id}`)、run 列表(`GET .../runs?session_id=`)四个接口都走这同一条不透明规则。
-- `UPLOAD_NOT_FOUND`——发起 run 请求体 `files[]` 里的 `upload_id`、或下载接口 `GET /v1/agents/{agent_code}/uploads/{upload_id}` 的路径参数，撞上以下任意一种都返回这同一个 404，不区分是哪一种:`upload_id` 查不到；查到了但不属于这个 `user_id`；已被软删；图片行还额外要求属于当前请求最终绑定的那段会话(`session_id`)，不属于同样是这个 404。**一个真实会踩的顺序**:先调上传接口传了一张图但没带 `session_id`(接口顺手给你铸了一个新会话 A，这次上传绑定的是 A)，然后发起 run 时又没传 `session_id`(这次请求又铸了一个新会话 B)——上传绑定的是 A，run 绑定到了 B，直接 404。避免办法:上传时如果打算紧接着发一次带这个附件的 run，把上传响应里的 `session_id` 原样带进发起 run 的请求体。文档没有这条会话绑定限制，只检查 `user_id` 归属。完整的上传 / 携带流程见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
+- `UPLOAD_NOT_FOUND`——发起 run 请求体 `files[]` 里的 `upload_id`、或下载接口 `GET /v1/agents/{agent_code}/uploads/{upload_id}` 的路径参数，撞上以下任意一种都返回这同一个 404，不区分是哪一种；但折叠的具体条件按两个入口有差别:
+  - **两处都会触发**:`upload_id` 查不到；查到了但不属于这个 `user_id`；已被软删。
+  - **只在发起 run 时触发**(`files[]` 解析)：图片行还额外要求属于当前请求最终绑定的那段会话(`session_id`)，不属于同样是这个 404——下载接口本身不带 `session_id` 参数，不做这项检查，文档类附件也没有这条限制。
+  - **只在下载时触发**:元数据行还在、也确实属于这个 `user_id`，但底层字节已经不在了(比如对象存储 / 工作区侧的内容已被回收)，`error.message` 是 `"upload content not found"`(仍是同一个 `code`，同样是这个 404)。
+
+  **一个真实会踩的顺序**(图片会话绑定这条):先调上传接口传了一张图但没带 `session_id`(接口顺手给你铸了一个新会话 A，这次上传绑定的是 A)，然后发起 run 时又没传 `session_id`(这次请求又铸了一个新会话 B)——上传绑定的是 A，run 绑定到了 B，直接 404。避免办法:上传时如果打算紧接着发一次带这个附件的 run，把上传响应里的 `session_id` 原样带进发起 run 的请求体。完整的上传 / 携带流程见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
 - `WORKSPACE_FILE_FAILED`——`GET /v1/agents/{agent_code}/workspace/file` 下载文件时，`user_id` 未识别(不认识这个终端用户)和 `path` 指向的文件不存在，这两种情况返回同一个统一的 404，不要试图从响应里区分是哪一种——这是刻意的存在性隐藏，不是 bug。同一个 `error.code` 在 400 / 500 也会出现，靠 HTTP 状态码区分，见下方「400」与「500」两节。
 - `RUN_NOT_FOUND` / `APPROVAL_NOT_FOUND`——取消 run(`:cancel`)与审批决策(`:decide`)这两个端点各自的归属校验 / 审批查找失败码，完整的失败码表(含这两个端点特有的 409 / 403 / 410 / 422 情况)见 [取消 run 与审批决策](./run-control)。
 
@@ -262,7 +267,7 @@
 { "success": false, "data": null, "error": { "code": "UPLOAD_CONTENT_UNAVAILABLE", "message": "upload content unavailable" } }
 ```
 
-触发条件同上——服务端工作区权限配置有问题，只发生在**文档**类附件(图片走对象存储，读取失败走的是下一节 503 的 `UPLOAD_UNAVAILABLE`/404 分支，不会落到这个 500)。这个 `code` 也会以 503 出现，见 [8.14](#_8-14-503-——-服务不可用-两种含义不同)。应对:不是退避重试能解决的，联系你的租户管理员。
+触发条件同上——服务端工作区权限配置有问题，只发生在**文档**类附件(图片走对象存储，没有对应的权限失败分支:存储没配置是下一节 503 的同一个 `UPLOAD_CONTENT_UNAVAILABLE`，读取时对象已经不在了是 404 `UPLOAD_NOT_FOUND`，都不会落到这个 500)。这个 `code` 也会以 503 出现，见 [8.14](#_8-14-503-——-服务不可用-两种含义不同)。应对:不是退避重试能解决的，联系你的租户管理员。
 
 ## 8.13 502 —— 上传写入失败(上游错误)
 

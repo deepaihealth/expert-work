@@ -244,7 +244,7 @@ Content-Disposition: attachment; filename="report.pdf"; filename*=UTF-8''report.
 X-Content-Type-Options: nosniff
 ```
 
-成功响应是**裸文件字节**，不套 `{success, data, error}` 信封。`Content-Type` 是上传时记录的 MIME；`Content-Disposition` 按扩展名分类：图片 / 纯文本 / CSV / JSON 这类走 `inline`，PDF / DOCX / XLSX / PPTX 以及一切可执行内容（HTML、SVG 等）一律 `attachment`。这条接口不计配额、不写审计。
+成功响应是**裸文件字节**，不套 `{success, data, error}` 信封。`Content-Type` 是上传时记录的 MIME；`Content-Disposition` 按扩展名分类：图片 / 纯文本 / CSV 这类走 `inline`，PDF / DOCX / XLSX / PPTX 以及一切可执行内容（HTML、SVG 等）一律 `attachment`（附件上传只收 PDF / DOCX / XLSX / PPTX / TXT / MD / CSV 这几种，JSON 走不到这条 `inline` 分支）。这条接口不计配额、不写审计。
 
 图片可以直接喂给 `<img src>` 显示——但这个地址需要带 `Authorization` 头才能访问，浏览器没法直接当图片 URL 用，通常做法是由你的服务端转发一层，再把字节交给前端。
 
