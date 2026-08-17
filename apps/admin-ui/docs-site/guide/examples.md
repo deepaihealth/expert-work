@@ -1,21 +1,21 @@
 # 10 多语言示例
 
-本章给七个常见场景各配一份完整可跑的最小示例,每个场景给 curl / Python / Node.js / Java 四种语言。几条通用约定:
+本章为七个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
 
-- **key 一律从环境变量读,示例代码里绝不出现明文 key。** 运行前自己设好:
+- **key 只能从环境变量读取，示例代码中不出现明文 key。** 运行示例前，先设置这个环境变量：
 
   ```bash [环境变量]
   export EXPERT_WORK_API_KEY="aforge_pat_..."
   ```
 
-  key 长什么样、怎么申请,见 [认证](./auth)。
-- **域名统一写成 `https://<your-domain>`**,替换成你实际对接的地址,见 [通用约定](./conventions) 的「环境地址」。
-- `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符,替换成你自己的真实值。
-- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
+  key 的格式与申请方式，见 [认证](./auth)。
+- **域名统一写成 `https://<your-domain>`**，使用时替换成实际对接的地址，见 [通用约定](./conventions) 的「环境地址」。
+- `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符，使用时替换成实际值。
+- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query)；SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
 
-## 10.1 发起 run(stream)并解析 SSE
+## 10.1 发起 stream 模式的 run 并解析事件流
 
-发一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。第三方最容易在这一步踩坑的是 SSE 事件拆分——下面示例的注释里标出了必须处理对的四件事。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例里直接原样打印 `data`,没有再展开解析——具体字段含义见 [SSE 事件格式](./sse-events)。
+发起一次 `mode: "stream"` 的 run，响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件，示例中直接原样打印 `data` 字段，不做进一步解析，字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -37,14 +37,13 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
 
 def iter_sse_frames(response):
     """
-    ①按行读(response.readline()),攒到一个空行才 yield 整条事件。别改成
-    response.read(1024) 这种按固定字节数读的写法——为什么,见 3.5「第一步:把
-    字节流切成事件」。
+    ①按行读(response.readline()),攒到一个空行才 yield 整条事件。不要改用
+    response.read(1024) 这种按固定字节数读的写法——原因见 3.5「把字节流切成事件」。
     """
     lines = []
     while True:
@@ -93,7 +92,7 @@ def run_and_stream(user_id, input_text):
         },
     )
 
-    max_seq_seen = None  # 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
+    max_seq_seen = None  # 维护"见过的最大 seq",断线重连时用作续传位置(完整重连示例见 10.5)
 
     with urllib.request.urlopen(req) as response:
         run_id = response.headers.get("X-Expert-Work-Run-Id")
@@ -127,7 +126,7 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 async function* iterSseFrames(body) {
   // 从响应流里边读边攒 buffer,按空行("\n\n")拆分事件——①不是按行拆分,也不是按 chunk 拆分。
@@ -186,7 +185,7 @@ async function runAndStream(userId, inputText) {
   }
 
   const runId = response.headers.get("X-Expert-Work-Run-Id");
-  let maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
+  let maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时用作续传位置(完整重连示例见 10.5)
 
   for await (const rawFrame of iterSseFrames(response.body)) {
     if (!rawFrame.trim()) {
@@ -235,13 +234,13 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * 10.1 发起 run(stream)并解析 SSE —— JDK 8 + HttpURLConnection,零依赖。
- * JSON 用手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
+ * JSON 用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
  */
 public class RunAndStream {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     /** 一条事件的内容:event 名 + 原始 data JSON 文本(未解析) + seq。 */
     static class Frame {
@@ -278,7 +277,7 @@ public class RunAndStream {
 
     // 极简 JSON 取值——从 JSON 文本里找到 "key": 后面的值:对象/数组保留原始文本({...} / [...]),
     // 字符串去掉外层引号并处理转义,数字/true/false/null 原样返回。只扫描一层,不是通用 JSON
-    // parser。生产代码请用 Gson / Jackson 这类正经 JSON 库,这里为了保持示例零依赖才手写。
+    // parser。生产环境建议使用 Gson / Jackson 等成熟的 JSON 库,这里为了保持示例零依赖才手写。
     static String jsonValue(String json, String key) {
         if (json == null) {
             return null;
@@ -349,9 +348,9 @@ public class RunAndStream {
         }
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
-    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    // 生产环境建议使用 Gson / Jackson 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
     static String jsonEscape(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -374,7 +373,7 @@ public class RunAndStream {
     }
 
     /**
-     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
      * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
      * null,直接拿去读会当场 NPE,连状态码都跟着一起丢掉。
      */
@@ -421,7 +420,7 @@ public class RunAndStream {
             }
 
             String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
-            Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时当游标用(完整重连示例见 10.5)
+            Long maxSeqSeen = null; // 维护"见过的最大 seq",断线重连时用作续传位置(完整重连示例见 10.5)
 
             try (InputStream in = connection.getInputStream()) {
                 // InputStreamReader 必须显式指定 UTF-8——JDK 8 的默认字符集跟平台走,不指定在中文环境下会乱码
@@ -472,9 +471,9 @@ public class RunAndStream {
 
 :::
 
-## 10.2 queue 模式 + 轮询结果
+## 10.2 queue 模式与轮询结果
 
-`mode: "queue"` 立即返回 `202`,不建流。202 响应体的 `data.thread_id` 就是这次绑定的 `session_id`(字段名不一样,值是同一个)。用 `GET /v1/agents/{agent_code}/sessions` 里每一项的 `running` 字段粗粒度轮询,`running` 变成 `false` 后再去拉历史消息拿最终回答。
+`mode: "queue"` 立即返回 `202`，不返回 SSE 流。202 响应体中的 `data.thread_id` 就是这次绑定的 `session_id`（字段名不同，值相同）。可以用 `GET /v1/agents/{agent_code}/sessions` 中每一项的 `running` 字段轮询；`running` 变为 `false` 后，再拉取历史消息获取最终回答。
 
 ::: code-group
 
@@ -508,7 +507,7 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
 
 def _get(url):
@@ -572,7 +571,7 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 async function getJson(url) {
   const response = await fetch(url, {
@@ -670,14 +669,14 @@ import java.util.List;
 
 /**
  * 10.2 queue 模式 + 轮询结果 —— JDK 8 + HttpURLConnection,零依赖。
- * JSON 用手拼字符串构造请求体,响应用下面的极简取值函数抠字段,生产代码请用 Gson / Jackson
- * 这类正经 JSON 库,别手拼、也别自己写 parser。
+ * JSON 用手工拼接字符串构造请求体,响应用下面的极简取值函数提取字段,生产环境建议使用
+ * Gson / Jackson 等成熟的 JSON 库,不建议手工拼接或自行实现解析器。
  */
 public class QueueAndPoll {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     static String readBody(InputStream in) throws IOException {
         // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
@@ -701,7 +700,7 @@ public class QueueAndPoll {
 
     // 极简 JSON 取值——从 JSON 文本里找到 "key": 后面的值:对象/数组保留原始文本({...} / [...]),
     // 字符串去掉外层引号并处理转义,数字/true/false/null 原样返回。只扫描一层,不是通用 JSON
-    // parser。生产代码请用 Gson / Jackson 这类正经 JSON 库,这里为了保持示例零依赖才手写。
+    // parser。生产环境建议使用 Gson / Jackson 等成熟的 JSON 库,这里为了保持示例零依赖才手写。
     static String jsonValue(String json, String key) {
         if (json == null) {
             return null;
@@ -809,9 +808,9 @@ public class QueueAndPoll {
         return items;
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
-    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    // 生产环境建议使用 Gson / Jackson 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
     static String jsonEscape(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -834,7 +833,7 @@ public class QueueAndPoll {
     }
 
     /**
-     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
      * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
      * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
      */
@@ -939,7 +938,7 @@ public class QueueAndPoll {
 
 ## 10.3 上传文件并带进 run
 
-先调上传接口拿 `upload_id`,再原样放进 `files[]` 发起 run。下面示例传一份文档;文档与图片拿到的 `upload_id` 形状相同,走法完全一样,细节见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
+先调用上传接口获取 `upload_id`，再将其原样放入 `files[]` 发起 run。下面示例上传一份文档；文档与图片得到的 `upload_id` 形状相同，处理方式完全一致，详见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
 
 ::: code-group
 
@@ -974,14 +973,12 @@ import uuid
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
-# 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
-# 不是通用 MIME 猜测器,内容和下面 Node.js / Java 两份表逐条一致。
-# **不要用 mimetypes.guess_type**:它认得哪些类型既跟 Python 版本走,也跟宿主机的 mime
-# 配置文件走(标准库启动时会去读 /etc/mime.types 这类系统文件),同一份代码换个环境
-# 结果就可能不一样。实测 CPython 3.9 / 3.10 / 3.11 上 `.md` 返回 None、3.12 起才认得;
-# None 回退成 application/octet-stream 后不在任何白名单里,上传每次必然 400 INVALID_UPLOAD。
+# 扩展名 → Content-Type 的固定映射,只覆盖上传接口允许的类型(见 2.5「允许的文件类型」),
+# 与下面 Node.js / Java 两份表一致。不要改用 mimetypes.guess_type:它的结果随 Python 版本
+# 和宿主机的 mime 配置变化(例如部分版本不认识 .md),猜不出时回退成 application/octet-stream,
+# 上传会返回 400 INVALID_UPLOAD。
 EXTENSION_MIME_TYPES = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1089,7 +1086,7 @@ const path = require("node:path");
 
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 // 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
 // 不是通用 MIME 猜测器。new Blob([...]) 不传 type 时,fetch/undici 发出的 Content-Type
@@ -1203,13 +1200,13 @@ import java.util.UUID;
 /**
  * 10.3 上传文件并带进 run —— JDK 8 + HttpURLConnection,零依赖。
  * multipart/form-data 请求体需要手写(java.net 标准库没有内置 multipart 编码器);
- * JSON 同样手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
+ * JSON 同样用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
  */
 public class UploadAndRun {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     // 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
     // 不是通用 MIME 猜测器,内容和上面 Python / Node.js 两份表逐条一致。
@@ -1263,13 +1260,13 @@ public class UploadAndRun {
         }
     }
 
-    /** 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。 */
+    /** 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。 */
     static String readErrorBody(HttpURLConnection connection) throws IOException {
         InputStream err = connection.getErrorStream();
         return (err == null) ? "" : readBody(err);
     }
 
-    // 极简 JSON 取值,详细注释见 10.1/10.2 示例;这里只用到抠 "data" 这个嵌套对象。
+    // 极简 JSON 取值,详细注释见 10.1/10.2 示例;这里只用到提取 "data" 这个嵌套对象。
     static String jsonValue(String json, String key) {
         if (json == null) {
             return null;
@@ -1340,9 +1337,9 @@ public class UploadAndRun {
         }
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
-    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    // 生产环境建议使用 Gson / Jackson 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
     static String jsonEscape(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -1453,7 +1450,7 @@ public class UploadAndRun {
 
 ## 10.4 续接会话
 
-把上一次响应拿到的 `session_id` 传回下一次请求的 body,就是同一段会话的下一轮;不传就是另开一段新会话。`stream` 模式下这个 id 在响应头 `X-Expert-Work-Session-Id` 里,不在响应体。
+将上一次响应得到的 `session_id` 传入下一次请求体，即为同一段会话的下一轮；不传则开启一段新会话。`stream` 模式下，这个 id 在响应头 `X-Expert-Work-Session-Id` 中返回，不在响应体里。
 
 ::: code-group
 
@@ -1489,7 +1486,7 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
 
 def run_stream_and_wait(user_id, input_text, session_id=None):
@@ -1519,9 +1516,9 @@ def run_stream_and_wait(user_id, input_text, session_id=None):
         # 攒到凑够一批才处理甚至在读超时时丢数据,完整原因见 10.1 的 iter_sse_frames 注释。
         #
         # 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end" 子串匹配——
-        # 服务端会流式吐 token 事件,里面是模型生成的原始文本,如果模型回答里恰好出现
-        # "event: end" 这几个字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的
-        # session_id 返回给你。
+        # 服务端会流式输出 token 事件,内容是模型生成的原始文本,如果模型回答里恰好出现
+        # "event: end" 这几个字符,子串匹配会被这段文本误判,提前把尚未结束的 run 的
+        # session_id 返回。
         event = None
         while True:
             raw_line = response.readline()
@@ -1555,7 +1552,7 @@ if __name__ == "__main__":
     session_id = run_stream_and_wait("u-123", "你好,帮我查一下上个月的订单")
     print("第一轮:", fetch_last_final_answer("u-123", session_id))
 
-    # 把上一轮拿到的 session_id 传回去,续接同一段会话
+    # 把第一轮拿到的 session_id 传回去,续接同一段会话
     session_id = run_stream_and_wait("u-123", "那这个月呢?", session_id=session_id)
     print("第二轮:", fetch_last_final_answer("u-123", session_id))
 ```
@@ -1563,7 +1560,7 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 async function runStreamAndWait(userId, inputText, sessionId) {
   // 发起一次 stream 模式的 run,读到 end 事件为止,返回这次绑定/续接到的 session_id。
@@ -1591,8 +1588,8 @@ async function runStreamAndWait(userId, inputText, sessionId) {
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   // 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end" 子串匹配——服务端会
-  // 流式吐 token 事件,里面是模型生成的原始文本,如果模型回答里恰好出现 "event: end" 这几个
-  // 字符,子串匹配会被这段文本骗过,提前把"其实没跑完"的 session_id 返回给你。
+  // 流式输出 token 事件,内容是模型生成的原始文本,如果模型回答里恰好出现 "event: end" 这几个
+  // 字符,子串匹配会被这段文本误判,提前把尚未结束的 run 的 session_id 返回。
   for await (const chunk of response.body) {
     buffer += decoder.decode(chunk, { stream: true });
     let sepIndex;
@@ -1640,7 +1637,7 @@ async function main() {
   let sessionId = await runStreamAndWait("u-123", "你好,帮我查一下上个月的订单");
   console.log("第一轮:", await fetchLastFinalAnswer("u-123", sessionId));
 
-  // 把上一轮拿到的 session_id 传回去,续接同一段会话
+  // 把第一轮拿到的 session_id 传回去,续接同一段会话
   sessionId = await runStreamAndWait("u-123", "那这个月呢?", sessionId);
   console.log("第二轮:", await fetchLastFinalAnswer("u-123", sessionId));
 }
@@ -1669,13 +1666,13 @@ import java.util.List;
 /**
  * 10.4 续接会话 —— JDK 8 + HttpURLConnection,零依赖。
  * 这里只关心"什么时候结束",完整的 SSE 事件拆分/重连处理见 10.1、10.5;
- * JSON 手拼字符串构造请求体,响应用下面的极简取值函数抠字段,生产代码请用正经 JSON 库。
+ * JSON 用手工拼接字符串构造请求体,响应用下面的极简取值函数提取字段,生产环境建议使用成熟的 JSON 库。
  */
 public class ContinueSession {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     static String readBody(InputStream in) throws IOException {
         // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
@@ -1802,9 +1799,9 @@ public class ContinueSession {
         return items;
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // (比如 input 是 他说"你好")就会把请求体拼坏,服务端解析失败(422),不是风格建议。
-    // 生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    // 生产环境建议使用 Gson / Jackson 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
     static String jsonEscape(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -1827,7 +1824,7 @@ public class ContinueSession {
     }
 
     /**
-     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
      * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
      * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
      */
@@ -1881,9 +1878,9 @@ public class ContinueSession {
                         String rawFrame = buffer.substring(0, sep);
                         buffer.delete(0, sep + 2);
                         // 只看 event: 字段的值是不是 "end",不要对整条事件文本做 "event: end"
-                        // 子串匹配——服务端会流式吐 token 事件,里面是模型生成的原始文本,
-                        // 如果模型回答里恰好出现这几个字符,子串匹配会被骗过,提前把
-                        // "其实没跑完"的 session_id 返回给你。
+                        // 子串匹配——服务端会流式输出 token 事件,内容是模型生成的原始文本,
+                        // 如果模型回答里恰好出现这几个字符,子串匹配会被误判,提前把
+                        // 尚未结束的 run 的 session_id 返回。
                         String event = null;
                         for (String line : rawFrame.split("\n", -1)) {
                             if (line.startsWith("event:")) {
@@ -1936,7 +1933,7 @@ public class ContinueSession {
         String sessionId = runStreamAndWait("u-123", "你好,帮我查一下上个月的订单", null);
         System.out.println("第一轮:" + fetchLastFinalAnswer("u-123", sessionId));
 
-        // 把上一轮拿到的 session_id 传回去,续接同一段会话
+        // 把第一轮拿到的 session_id 传回去,续接同一段会话
         sessionId = runStreamAndWait("u-123", "那这个月呢?", sessionId);
         System.out.println("第二轮:" + fetchLastFinalAnswer("u-123", sessionId));
     }
@@ -1945,9 +1942,9 @@ public class ContinueSession {
 
 :::
 
-## 10.5 断线重连(带 since_seq)
+## 10.5 断线重连与 since_seq
 
-连接断了不要重新调 `POST .../runs`(那会开一轮新 run)——改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,带上"见过的最大 seq"当 `since_seq` 重新接上。`truncated` 事件也走同一条重连路径:把它给的 `next_seq` 直接当下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 也带了同一个值,下面示例统一走读事件这条路(更抗代理:有些代理/网关会丢弃或改写自定义响应头,事件本身是响应体的一部分,不会被丢)。示例里同样原样打印未分类事件的 `data`,字段含义见 [SSE 事件格式](./sse-events)。
+连接中断后不要重新调用 `POST .../runs`（那样会开启一个新的 run）。应改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`，并把已经收到的最大 `seq` 作为 `since_seq` 参数重新连接。`truncated` 事件走同一条重连路径：把它返回的 `next_seq` 直接作为下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 携带同一个值，但下面示例统一从事件正文读取这个值（部分代理或网关会丢弃或改写自定义响应头，事件本身是响应体的一部分，不会被丢弃）。示例中同样原样打印未分类事件的 `data` 字段，字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -1969,9 +1966,9 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 READ_TIMEOUT_S = 30  # 自己设的读超时,不能用默认的"无限等"
-MAX_RETRIES = 5  # 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
+MAX_RETRIES = 5  # 重连次数上限,不应无限重试——404 这类明确错误更不该重试
 
 
 def iter_sse_frames(response):
@@ -1982,10 +1979,10 @@ def iter_sse_frames(response):
     传输编码,Python 的 http.client 为了凑够 1024 字节,会在当前已到手的数据不够时
     反复等下一个 HTTP chunk;这条连接一旦读超时,已经到手但不满 1024 字节的数据会被
     整个丢弃(不会部分返回),表现为"服务端明明发了 metadata 事件,客户端却什么都没
-    收到就超时"——这个坑比"半条事件"更隐蔽,断线重连场景下会直接导致 cursor 永远停在
-    None、每次重连都不带 since_seq,和游标丢失是两个独立但会叠加的问题。
+    收到就超时"——这个问题比"半条事件被截断"更隐蔽,断线重连场景下会直接导致 cursor
+    永远停在 None、每次重连都不带 since_seq,和续传位置丢失是两个独立但会叠加的问题。
     readline() 天然按需向底层多次取数据直到凑出一整行,不会有这个"为了凑够定长反而
-    卡住"的毛病。
+    卡住"的问题。
     """
     lines = []
     while True:
@@ -2018,7 +2015,7 @@ def parse_frame(raw_frame):
 
 
 class Cursor:
-    """可变的游标容器——见下面 consume_one_connection 为什么必须用它而不是普通返回值。"""
+    """保存续传位置(since_seq)的可变容器——见下面 consume_one_connection 为什么必须用它而不是普通返回值。"""
 
     def __init__(self):
         self.value = None  # None = 还没见过任何一条事件
@@ -2069,7 +2066,7 @@ def consume_with_reconnect(user_id, run_id):
         url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs/{run_id}/events?{query}"
 
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {API_KEY}"})
-        seen_before = cursor.value  # 这条连接开始前的游标,用来判断它有没有真的推进
+        seen_before = cursor.value  # 这条连接开始前的续传位置,用来判断它有没有真的推进
         try:
             with urllib.request.urlopen(req, timeout=READ_TIMEOUT_S) as response:
                 done = consume_one_connection(response, cursor)
@@ -2083,7 +2080,7 @@ def consume_with_reconnect(user_id, run_id):
             # 非 2xx——服务端给出的明确错误响应,不是网络层瞬时故障,不该重试。
             # 比如 404 RUN_NOT_FOUND(run_id 敲错了)重试不会有不同结果,见 run-control.md;
             # 这种错误以前会被下面那个更宽的 except 一起接住,当成网络抖动无限重连,
-            # 把平台打了——HTTPError 是 URLError 的子类,必须单独列在前面先接住它。
+            # 对平台造成过大的请求压力——HTTPError 是 URLError 的子类,必须单独列在前面先接住它。
             raise
         except (OSError, http.client.HTTPException) as exc:
             # 读超时或连接中断——ConnectionResetError / http.client.RemoteDisconnected /
@@ -2092,7 +2089,7 @@ def consume_with_reconnect(user_id, run_id):
             # 断线时示例本身会崩溃(未捕获异常、退出码非 0)。
             error = exc
 
-        # 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+        # 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进续传位置:
         # 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
         # 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
         # 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
@@ -2114,9 +2111,9 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 const READ_TIMEOUT_MS = 30000; // 自己设的读超时,不能用默认的"无限等"
-const MAX_RETRIES = 5; // 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
+const MAX_RETRIES = 5; // 重连次数上限,不应无限重试——404 这类明确错误更不该重试
 
 // 非 2xx 响应——服务端给出的明确错误,不是网络层瞬时故障,不该重试(比如 404
 // RUN_NOT_FOUND,run_id 敲错了重试不会有不同结果,见 run-control.md)。用一个专门的
@@ -2242,7 +2239,7 @@ async function consumeWithReconnect(userId, runId) {
     }
     const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs/${runId}/events?${params}`;
 
-    const seenBefore = cursorRef.value; // 这条连接开始前的游标,用来判断它有没有真的推进
+    const seenBefore = cursorRef.value; // 这条连接开始前的续传位置,用来判断它有没有真的推进
     let error;
     try {
       const response = await fetch(url, {
@@ -2263,12 +2260,12 @@ async function consumeWithReconnect(userId, runId) {
       if (err instanceof HttpStatusError) {
         throw err; // 明确的错误响应,不重试,直接冒泡
       }
-      // 读超时或连接中断——才是真正值得重试的瞬时故障。之前这里是裸 catch {},
-      // 无退避无上限地立刻重试,还会把真正的程序错误一起吞掉。
+      // 读超时或连接中断——才是值得重试的瞬时故障。不要写成不加判断的 catch {}:
+      // 那样会无退避、无上限地立刻重试,还会把程序错误一起吞掉。
       error = err;
     }
 
-    // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+    // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进续传位置:
     // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
     // 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
     // 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
@@ -2310,15 +2307,15 @@ import java.util.Objects;
 
 /**
  * 10.5 断线重连(带 since_seq) —— JDK 8 + HttpURLConnection,零依赖。
- * JSON 用下面的极简取值函数抠字段,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手写 parser。
+ * JSON 用下面的极简取值函数提取字段,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库,不建议自行实现解析器。
  */
 public class ReconnectEvents {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
     static final int READ_TIMEOUT_MS = 30000; // 自己设的读超时,不能用默认的"无限等"
-    static final int MAX_RETRIES = 5; // 重连次数上限,别无限重试——404 这类明确错误更是直接不该重试
+    static final int MAX_RETRIES = 5; // 重连次数上限,不应无限重试——404 这类明确错误更不该重试
 
     /**
      * 非 2xx 响应——服务端给出的明确错误,不是网络层瞬时故障,不该重试(比如 404
@@ -2445,12 +2442,12 @@ public class ReconnectEvents {
         }
     }
 
-    /** 可变的游标容器——见下方 consumeOneConnection 为什么必须用它而不是普通返回值。 */
+    /** 保存续传位置(since_seq)的可变容器——见下方 consumeOneConnection 为什么必须用它而不是普通返回值。 */
     static class Cursor {
         Long value; // null = 还没见过任何一条事件
     }
 
-    /** 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。 */
+    /** 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。 */
     static String readErrorBody(HttpURLConnection connection) throws IOException {
         InputStream err = connection.getErrorStream();
         if (err == null) {
@@ -2482,8 +2479,8 @@ public class ReconnectEvents {
         if (status < 200 || status >= 300) {
             // 之前直接调 getInputStream(),非 2xx(比如 404)会抛 FileNotFoundException/
             // IOException,被下面 consumeWithReconnect 的 catch (IOException) 一起接住,
-            // 当成网络抖动无限重连,把平台打了——这里先显式查状态码,非 2xx 就抛专门的
-            // 异常类型,不进重连循环。
+            // 当成网络抖动无限重连,对平台造成过大的请求压力——这里先显式查状态码,非 2xx
+            // 就抛专门的异常类型,不进重连循环。
             throw new HttpStatusException(status, readErrorBody(connection));
         }
         try (InputStream in = connection.getInputStream()) {
@@ -2540,7 +2537,7 @@ public class ReconnectEvents {
             connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
             connection.setReadTimeout(READ_TIMEOUT_MS);
 
-            Long seenBefore = cursor.value; // 这条连接开始前的游标,用来判断它有没有真的推进
+            Long seenBefore = cursor.value; // 这条连接开始前的续传位置,用来判断它有没有真的推进
             IOException error;
             try {
                 done = consumeOneConnection(connection, cursor);
@@ -2561,7 +2558,7 @@ public class ReconnectEvents {
                 connection.disconnect();
             }
 
-            // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进游标:
+            // 干净 EOF 和异常断线两个出口共用下面这段。先问这条连接有没有真的推进续传位置:
             // 推进过就算"成功过一次",重置重试计数。这个判断必须放在两个出口的下游——只挂在
             // 干净 EOF 那一侧的话,一条"送出了事件、然后被 RST"的连接会被当成纯失败计费,已经
             // 重连成功好几次、收了十几条事件,照样报"重连 N 次仍未成功"中止掉。
@@ -2594,7 +2591,7 @@ public class ReconnectEvents {
 
 ## 10.6 取消 run
 
-`user_id` 在**请求体**里,不是 query——归属校验用它确认这是发起这次 run 的那个终端用户。取消是幂等的,重复调用不会报错。
+`user_id` 在**请求体**里，不是 query——归属校验用它确认这是发起这次 run 的那个终端用户。取消是幂等的，重复调用不会报错。
 
 ::: code-group
 
@@ -2613,7 +2610,7 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
 
 def cancel_run(user_id, run_id):
@@ -2633,7 +2630,7 @@ def cancel_run(user_id, run_id):
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
-        # 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表。
+        # 但 scope 不足的 403 只有 detail 字段——读不到 error.code,完整对照表见错误码总表。
         # 先读成文本、解得动才当 JSON 用:失败响应不一定是 JSON(网关自己返回的 502 常常是
         # HTML,也可能整个是空的),无条件 json.loads 会当场抛 JSONDecodeError 顶掉原来的
         # HTTPError,状态码和响应体全看不见,下面这行想打的错误信息永远打不出来。
@@ -2654,7 +2651,7 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 async function cancelRun(userId, runId) {
   const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs/${runId}:cancel`;
@@ -2668,7 +2665,7 @@ async function cancelRun(userId, runId) {
   });
   if (!response.ok) {
     // 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
-    // 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表。
+    // 但 scope 不足的 403 只有 detail 字段——读不到 error.code,完整对照表见错误码总表。
     // 这里用 text() 而不是 json():失败响应不一定是 JSON(网关自己返回的 502 常常是 HTML),
     // 先 await response.json() 会当场抛 SyntaxError,想打的错误信息反而永远打不出来。
     console.error("取消失败:", response.status, await response.text());
@@ -2700,13 +2697,13 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * 10.6 取消 run —— JDK 8 + HttpURLConnection,零依赖。
- * JSON 手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
+ * JSON 用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
  */
 public class CancelRun {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     static String readBody(InputStream in) throws IOException {
         // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
@@ -2721,7 +2718,7 @@ public class CancelRun {
     }
 
     /**
-     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
      * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
      * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
      */
@@ -2730,9 +2727,9 @@ public class CancelRun {
         return (err == null) ? "" : readBody(err);
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
-    // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。生产代码请用 Gson / Jackson
-    // 这类正经 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。生产环境建议使用 Gson / Jackson
+    // 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
     static String jsonEscape(String s) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -2774,7 +2771,7 @@ public class CancelRun {
             }
 
             // 大多数失败响应是 {"success": false, "data": null, "error": {"code": ..., "message": ...}}
-            // 但 scope 不足的 403 是裸 {"detail": ...}——读不到 error.code,完整对照表见错误码总表
+            // 但 scope 不足的 403 只有 detail 字段——读不到 error.code,完整对照表见错误码总表
             System.out.println("取消失败:" + status + " " + readErrorBody(connection));
             throw new IOException("cancel failed: " + status);
         } finally {
@@ -2793,7 +2790,7 @@ public class CancelRun {
 
 ## 10.7 审批决策
 
-`user_id` 同样在**请求体**里。下面给 `approve` 与 `reject` 两个例子;`decision: "modify"` 时必须带 `modified_args`,另外两种 `decision` 下禁止传它。
+`user_id` 同样在**请求体**里。下面给出 `approve` 与 `reject` 两个示例；`decision: "modify"` 时必须带 `modified_args`，另外两种 `decision` 下禁止传它。
 
 ::: code-group
 
@@ -2827,7 +2824,7 @@ import urllib.request
 
 API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
-AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
 
 def decide_run(user_id, run_id, decision, modified_args=None, reason=None):
@@ -2867,7 +2864,7 @@ if __name__ == "__main__":
 ```js [Node.js]
 const API_KEY = process.env.EXPERT_WORK_API_KEY;
 const BASE_URL = "https://<your-domain>";
-const AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
 async function decideRun(userId, runId, decision, modifiedArgs, reason) {
   const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs/${runId}:decide`;
@@ -2925,13 +2922,13 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * 10.7 审批决策 —— JDK 8 + HttpURLConnection,零依赖。
- * JSON 手拼字符串构造请求体,生产代码请用 Gson / Jackson 这类正经 JSON 库,别手拼。
+ * JSON 用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
  */
 public class ApprovalDecision {
 
     static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
     static final String BASE_URL = "https://<your-domain>";
-    static final String AGENT_CODE = "{agent_code}"; // 替换成你的 agent_code
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
 
     static String readBody(InputStream in) throws IOException {
         // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
@@ -2945,9 +2942,9 @@ public class ApprovalDecision {
         }
     }
 
-    // JSON 字符串转义——手拼 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
     // (比如 reason 是 超预算,原因是"临时项目")就会把请求体拼坏,服务端解析失败(422),
-    // 不是风格建议。生产代码请用 Gson / Jackson 这类正经 JSON 库自动处理,这里手写是为了
+    // 不是风格建议。生产环境建议使用 Gson / Jackson 等成熟的 JSON 库自动处理,这里手写是为了
     // 保持示例零依赖。注意 modifiedArgsJson 不走这个函数——它本身就是调用方传进来的一段
     // 已经拼好的 JSON 对象文本,原样拼进请求体,再转义一遍反而会转义出双重转义。
     static String jsonEscape(String s) {
@@ -2972,7 +2969,7 @@ public class ApprovalDecision {
     }
 
     /**
-     * 非 2xx 时真正的原因在 getErrorStream() 里,getInputStream() 只会抛一句干巴巴的状态码。
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
      * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
      * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
      */
@@ -2983,7 +2980,7 @@ public class ApprovalDecision {
 
     /**
      * 返回 [响应体 JSON 文本, 续跑用的新 run_id]。decision 为 "modify" 时 modifiedArgsJson 必填
-     * (直接传一段手拼好的 JSON 对象文本);其余两种 decision 下必须传 null——不传的字段不会出现在请求体里。
+     * (直接传一段手工拼接好的 JSON 对象文本);其余两种 decision 下必须传 null——不传的字段不会出现在请求体里。
      */
     static String[] decideRun(String userId, String runId, String decision, String modifiedArgsJson, String reason)
             throws IOException {
@@ -3013,8 +3010,8 @@ public class ApprovalDecision {
         try {
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
-                // 和 10.6 取消同一形态:失败响应可能是带 error.code 的 JSON、可能是裸
-                // {"detail": ...},也可能是网关自己返回的 HTML 甚至空体,一律当文本原样打出来。
+                // 和 10.6 取消同一形态:失败响应可能是带 error.code 的 JSON、可能是只有
+                // detail 字段的错误响应,也可能是网关自己返回的 HTML 甚至空体,统一按文本原样输出。
                 System.out.println("决策失败:" + status + " " + readErrorBody(connection));
                 throw new IOException("decide failed: " + status);
             }
