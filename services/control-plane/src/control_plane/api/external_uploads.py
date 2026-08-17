@@ -491,8 +491,8 @@ def build_external_uploads_router() -> APIRouter:
             except ObjectStoreError:
                 # 对象未丢(上面已排除),但读不动——凭证 / bucket 策略 / 存储侧
                 # 5xx 等。同一条「底层读不动就是 500,不能让它逃逸成裸异常」
-                # 规则,同文档分支的 WorkspacePermissionError 处理(本文件
-                # docstring 第 36-38 行);ObjectNotFoundError 是 ObjectStoreError
+                # 规则,同上面文档分支的 WorkspacePermissionError 处理(模块
+                # docstring 讲的「每种拒绝都翻成信封」);ObjectNotFoundError 是 ObjectStoreError
                 # 的子类,顺序必须子类在前(同 WorkspacePermissionError /
                 # SandboxSupervisorError 那对的顺序规则)。traceback 只进日志。
                 logger.warning(
