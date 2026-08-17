@@ -35,7 +35,9 @@ event: updates       ← 最后一个节点跑完(记忆回写)
 event: end           ← 流结束。data 里带这次 run 的最终状态
 ```
 
-注意 `token` 出现的位置:它只在 `agent` 节点跑的时候产生。`agent` 之前的准备节点(记忆召回、工作区读入)只发 `updates`，**所以流的开头一定是 `metadata` 加若干个 `updates`，第一个 `token` 在它们之后。**
+注意 `token` 出现的位置:它只在 `agent` 节点跑的时候产生，`agent` 之前的准备节点只发 `updates`。
+
+不过**准备节点有几个、有没有，取决于这个 Agent 怎么配**:上面这个示例配了记忆召回和工作区读入,所以流的开头是 `metadata` 加两个 `updates`;两样都没配的 Agent 直接从 `agent` 节点开始跑，第一个 `token` 可以紧跟在 `metadata` 后面。**别按「开头一定有几个 `updates`」写代码。**
 
 整条流是三段:
 
@@ -290,7 +292,7 @@ function onToken(data) {
 | 工具调用 | 8 | 146 |
 | 分两步 | 6 | 954 |
 
-`token` 占九成以上，而且**一条都不会回放**。界面的真实状态必须由 `updates` 重建，`token` 只做视觉预览。
+`token` 占九成以上，而且**断连期间那些一个也补不回来**(重连之后只会收到新产生的)。界面的真实状态必须由 `updates` 重建，`token` 只做视觉预览。
 
 还有一层:`updates` 里的内容才是过了完整输出安全审查的最终结果。如果这一步被安全策略拦了，`updates` 里会是拒答文案——**直接覆盖你攒的预览**，不要把两者拼在一起显示。
 :::
@@ -997,6 +999,12 @@ async function consume(res, readTimeoutMs = 60_000) {
 // 跑完一次 run:发起 → 读流 → 断了就重连 / 截断了就翻页,直到收到 end
 // body 里要写 mode: "stream",POST 的响应体才是 SSE 流
 async function runToEnd({ base, agentCode, userId, key, body }) {
+  // 先清干净:下面这些是模块级状态,不重置的话第二次调用会读到上一次 run 的
+  // 游标和 run_id(响应头读不到时那个 ?? 兜底就会兜到错的 run 上)
+  store.runId = null; store.sessionId = null;
+  store.steps.clear(); store.toolCalls.clear(); store.workers.clear();
+  maxSeq = -1; handled.clear();
+
   const first = await fetch(`${base}/v1/agents/${agentCode}/runs`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
