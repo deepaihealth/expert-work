@@ -264,6 +264,9 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{agent_code}/artifacts"),
         ("GET", "/v1/agents/{agent_code}/artifacts/download"),
         ("DELETE", "/v1/agents/{agent_code}/artifacts"),
+        # 附件模型统一 Task 4 — 对外下载端点(external_uploads.py),同样挂
+        # ``require("session", "read")`` 而非 ``console_only()``。
+        ("GET", "/v1/agents/{agent_code}/uploads/{upload_id}"),
     }
 )
 
@@ -279,6 +282,7 @@ _SAMPLE_PARAMS: dict[str, str] = {
     "session_id": str(_TID),
     "run_id": str(_RID),
     "revision": "1",
+    "upload_id": "upl_00000000-0000-4000-8000-000000000013",
 }
 
 _PARAM_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)(?::[a-zA-Z_]+)?\}")

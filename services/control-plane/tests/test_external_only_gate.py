@@ -75,6 +75,8 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{agent_code}/artifacts"),
         ("GET", "/v1/agents/{agent_code}/artifacts/download"),
         ("DELETE", "/v1/agents/{agent_code}/artifacts"),
+        # 附件模型统一 Task 4 — 对外下载端点(external_uploads.py)。
+        ("GET", "/v1/agents/{agent_code}/uploads/{upload_id}"),
     }
 )
 
@@ -82,6 +84,7 @@ _SAMPLE_PARAMS: dict[str, str] = {
     "agent_code": "support-bot",
     "session_id": str(_TID),
     "run_id": str(_RID),
+    "upload_id": "upl_00000000-0000-4000-8000-000000000013",
 }
 
 
