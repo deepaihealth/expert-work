@@ -14,6 +14,11 @@
   - #1195 第三轮可读性(审计驱动,枚举值取代码真值;审计 `docs/superpowers/specs/2026-08-17-external-docs-readability-w3-audit.md`)
   - #1197 第四轮整站重写(第三方工程师视角 + 企业级语气;**写作规范 `docs/superpowers/specs/2026-08-17-external-docs-style-guide.md`,以后改对外文档先按它自检**)
 - **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1、「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)。
+- **新 program(2026-08-17 立项,先于上面剩余项):调试台 / 对话记录 / Run 详情交互重设计**,设计
+  `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`(八条决策已拍板);六个 PR:
+  PR0 两条 bug(调试台 Jinja 变量框不显示 / `{{ }}` 保存报错——拆掉「保存时填空」`template_vars` 整层)→
+  PR1 对外 `plan` SSE 事件 + 文档 → PR2 调试台三栏壳 → PR3 轨迹合一 → PR4 对话记录页 → PR5 Run 详情页。
+  每个 PR 出实施计划时再拆任务。
 
 ---
 
