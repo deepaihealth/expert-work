@@ -2,7 +2,7 @@
 
 本章的接口用来读取和管理已经产生的数据：租户里可以调用的 Agent、某个终端用户的会话与历史消息、跑过的 run、Agent 产出的工作区文件与产物，以及会话的重命名与归档。
 
-除各小节另有说明外，本章接口要求 key 带 `read` 权限（`write` 权限的 key 同时含读，可以直接使用），并且查询参数 `user_id` 必填。例外有两类：5.1 Agent 目录是租户级接口，不接受 `user_id`；5.5 的重命名与归档、5.7 的删除产物是写操作，要求 `write` 权限。
+除各小节另有说明外，本章接口要求 key 带 `read` 权限（`write` 权限的 key 同时含读，可以直接使用），并且 `user_id` 必填（多数接口把它放在查询字符串里，5.5 的重命名接口放在请求体里）。例外有两类：5.1 Agent 目录是租户级接口，不需要 `user_id`；5.5 的重命名与归档、5.7 的删除产物是写操作，要求 `write` 权限。
 
 ### 分页
 
@@ -17,13 +17,13 @@
 | 5.1 Agent 目录 | 响应里有 `total`。`offset` 加上这一页的条目数小于 `total` 时还有下一页 |
 | 5.2 会话列表 / 5.3 历史消息 / 5.4 run 列表 | 响应里没有 `total`，也没有 `has_more`，只回显请求里的 `limit` 与 `offset`。这一页的条目数等于 `limit` 时可能还有下一页，小于 `limit` 时已经翻完 |
 
-翻下一页时，把 `offset` 加上这一页的条目数。**Agent 目录不适用「条目数小于 `limit` 就是最后一页」这条规则**：同一个 `agent_code` 可能存在多个版本，目录按 `agent_code` 去重后返回，去重会让某一页天然短于 `limit`。
+翻下一页时，把 `offset` 加上这一页的条目数。**Agent 目录请用 `total` 判断**：只看条目数时，最后一页恰好凑满 `limit` 会让客户端误以为后面还有，白发一次请求才发现是空的。
 
 ## 5.1 Agent 目录
 
 列出当前租户里可以调用的 Agent。接入的第一步通常是调用它取得 `agent_code`，而不是把 Agent 的名字写死在客户端里。
 
-这个接口是租户级的：路径里没有 `{agent_code}`，也不接受 `user_id`，目录与具体哪个终端用户无关。
+这个接口是租户级的：路径里没有 `{agent_code}`，也不需要 `user_id`（传了会被忽略），目录与具体哪个终端用户无关。
 
 ### 请求
 
@@ -363,10 +363,10 @@ PATCH /v1/agents/{agent_code}/sessions/{session_id}
 
 `agent_code` 与 `session_id` 在路径里，`user_id` 与 `title` 在请求体里。
 
-| 字段 | 类型 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
-| `user_id` | string | 必填。必须与这段会话实际归属的终端用户一致，长度 1–255 字符 |
-| `title` | string | 必填。新标题，覆盖当前标题，长度 1–200 字符 |
+| `user_id` | 是 | 必须与这段会话实际归属的终端用户一致，长度 1–255 字符 |
+| `title` | 是 | 新标题，覆盖当前标题，长度 1–200 字符 |
 
 去掉首尾空白后为空的 `title`（例如整串都是空格）返回 422 `INVALID_TITLE`。
 
@@ -461,7 +461,7 @@ GET /v1/agents/{agent_code}/workspace/files
 |---|---|---|
 | `user_id` | 是 | 要查看的终端用户，长度 1–255 字符 |
 
-这个接口不支持分页：没有 `limit` 与 `offset` 参数，一次返回全部文件，传了也会被忽略。
+这个接口不支持分页，一次返回全部文件（见本章开头的[分页](#分页)）。
 
 #### 响应
 
@@ -510,7 +510,7 @@ GET /v1/agents/{agent_code}/workspace/file
 | 参数 | 必填 | 说明 |
 |---|---|---|
 | `user_id` | 是 | 文件所属的终端用户，长度 1–255 字符 |
-| `path` | 是 | 要下载的文件相对路径，最长 4096 字符。**原样回传列出文件接口给出的 `path`，不要自己拼接字符串** |
+| `path` | 是 | 要下载的文件相对路径，最长 4096 字符。原样回传列出文件接口给出的 `path`，不要自己拼接字符串 |
 
 #### 响应
 
@@ -555,7 +555,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "invalid workspace path" } }
 ```
 
-避免这一类错误最直接的做法：`path` 用列出文件接口返回的值原样回传。
+避免这一类错误最直接的做法：**`path` 用列出文件接口返回的值原样回传，不要自己拼接字符串**。
 
 #### 错误
 
@@ -593,7 +593,7 @@ GET /v1/agents/{agent_code}/artifacts
 |---|---|---|
 | `user_id` | 是 | 要查看的终端用户，长度 1–255 字符 |
 
-这个接口不支持分页：没有 `limit` 与 `offset` 参数，一次返回全部产物，传了也会被忽略。
+这个接口不支持分页，一次返回全部产物（见本章开头的[分页](#分页)）。
 
 #### 响应
 
@@ -666,7 +666,7 @@ GET /v1/agents/{agent_code}/artifacts/download
 #### 示例
 
 ```bash [请求]
-curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-123&name=2026-08%20周报.docx" \
+curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-123&name=2026-08%20%E5%91%A8%E6%8A%A5.docx" \
   -H "Authorization: Bearer <key>" \
   -o report.docx
 ```
@@ -703,7 +703,7 @@ DELETE /v1/agents/{agent_code}/artifacts
 #### 示例
 
 ```bash [请求]
-curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123&name=2026-08%20周报.docx" \
+curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123&name=2026-08%20%E5%91%A8%E6%8A%A5.docx" \
   -H "Authorization: Bearer <key>"
 ```
 
@@ -715,11 +715,13 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u
 
 删除只把这份产物从产物这一组接口里移除：它不再出现在列出产物的结果里，下载它会返回 404。
 
+除了调用方主动删除，产物还有一条自动清理规则：超过保留期没有更新的产物会自动从列表里移出，再过一段宽限期，它的登记信息会被清除。两个期限由平台配置，默认分别是 90 天与 60 天，实际值以租户管理员的配置为准。
+
 ::: danger 删除产物不会清除文件内容
 工作区里的文件字节不会被这个接口清除。保留期结束后，后台清理作业清除的也只是产物的登记信息（名字、版本号等），底层文件不受影响。
 :::
 
-只要知道这份内容在工作区里的原始路径，删除之后仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的下载接口取到它。**调用方如果需要向终端用户兑现「删除我的数据」，这个接口不满足这个承诺**：当前对外 API 没有清除底层文件的操作。
+只要知道这份内容在工作区里的原始路径，删除之后仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的下载接口取到它，登记信息被清除之后同样可以。**调用方如果需要向终端用户兑现「删除我的数据」，这个接口不满足这个承诺**：当前对外 API 没有清除底层文件的操作。
 
 删除之后，Agent 如果再用同一个 `name` 保存一次，这份产物会恢复，版本号接着往上加。对外 API 没有撤销删除的操作。
 

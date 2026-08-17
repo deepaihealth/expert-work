@@ -52,7 +52,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 ### 取消的生效方式
 
 ::: warning stopped 为 true 不代表这次 run 一定以 interrupted 收场
-取消是尽力而为的：中断请求在 Agent 的两个步骤之间生效。如果这个 run 在下一次检查之前就自己跑完了（例如它正处在最后一步的生成过程中），它会照常以 `success` 收尾，尽管取消调用返回的是 `stopped: true`。
+取消是尽力而为的：中断请求在 Agent 的两个步骤之间生效。如果这个 run 在下一次步骤之间的检查到来之前就自己跑完了（例如它正处在最后一步的生成过程中），它会照常以 `success` 收尾，尽管取消调用返回的是 `stopped: true`。
 
 要知道这次 run 到底怎么结束，以 `end` 事件的 `status` 为准，不要用取消接口的返回值推断。
 :::
@@ -137,10 +137,10 @@ Content-Type: application/json
 | `modify` | 同意执行，但要先改掉这次调用的参数，例如去掉一个危险选项或纠正一个路径 | 用 `modified_args` 整体替换这次调用的参数后执行，然后继续往下跑 |
 | `reject` | 不同意这次工具调用 | 不执行这次调用；整个 run 是否终止，取决于这次审批的类型 |
 
-`reject` 之后 run 是否终止，取决于这次审批是怎么触发的：
+`reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源，客户端在下达决策之前就能据此区分两条路径（五个取值见 [3.4 的 `approval`](./sse-events#approval)）：
 
-- Agent 配置里声明的强制审批点，常见于高风险工具，对应事件流里 `approval` 事件的 `reason_kind` 为 `policy_gate`：拒绝会终止整个 run。
-- Agent 在执行过程中自己发起的确认请求：拒绝只是把一条「审批被拒绝」的结果交回给 Agent，run 会继续往下跑，Agent 可能换一种方式重试或者调整计划。
+- `reason_kind` 为 `policy_gate`：这是 Agent 配置里声明的强制审批点，常见于高风险工具，拒绝会终止整个 run。
+- `reason_kind` 为其余四个取值：这是 Agent 在执行过程中自己发起的确认请求，拒绝只是把一条「审批被拒绝」的结果交回给 Agent，run 会继续往下跑，Agent 可能换一种方式重试或者调整计划。
 
 强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态。**要确认这次工具调用是否被拒绝，看事件流里这次调用对应的结果消息。**
 
@@ -223,7 +223,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/67262572-5470-41
 | 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或者不属于这个 `user_id` 与 `agent_code` 的组合。归属校验先于审批逻辑执行，`user_id` 为纯空白时同样归到这个 404 | 核对三个值是否匹配；确认无误后不要重试 |
 | 404 | `APPROVAL_NOT_FOUND` | 归属校验通过，但这个 `run_id` 名下没有任何审批记录 | 确认这个 run 确实在等待审批，例如它没有被上一次调用决策过 |
 | 409 | `APPROVAL_CONFLICT` | 这条审批已经被决定过，或者与另一次并发决策竞争后落败，且这次请求的 `idempotency_key` 与已记录的那次决策对不上 | 不要重复决策；要重放上一次的结果，带上当时用的 `idempotency_key` 重新请求 |
-| 409 | `SESSION_NOT_BOUND` | 这个 run 所在的会话没有绑定 Agent 名称与版本，属于服务端状态异常 | 联系租户管理员 |
+| 409 | `SESSION_NOT_BOUND` | 这个 run 所在的会话没有绑定 Agent 名称与版本，属于服务端状态异常，正常对接流程不会遇到 | 联系租户管理员 |
 | 403 | `AGENT_DISABLED` | 这个 `agent_code` 已被管理员下线。这个码在 `error.code` 里，与 key 的权限无关 | 联系租户管理员启用该 Agent，或者换一个 `agent_code` |
 | 403 | `TENANT_SUSPENDED` | 租户被暂停。这个码在 `error.code` 里，与 key 的权限无关 | 联系租户管理员 |
 | 404 | `AGENT_NOT_FOUND` | Agent 的定义记录已不存在 | 联系租户管理员 |
