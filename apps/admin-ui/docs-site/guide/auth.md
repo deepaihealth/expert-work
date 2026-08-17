@@ -19,7 +19,7 @@ flowchart LR
 
 ## 6.2 Key 的格式
 
-```
+``` [Key 的格式]
 aforge_pat_<hex>_<random>
 ```
 

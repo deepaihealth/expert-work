@@ -41,17 +41,17 @@ flowchart LR
 
 ## 9.5 常见问题
 
-**`agent_code` 从哪拿？**
+### `agent_code` 从哪拿？
 
 两个途径：调 [5.1 Agent 目录](./query#_5-1-agent-目录) 查（推荐，不用把名字写死在客户端），或者由租户管理员直接告诉你。
 
 注意 `GET /v1/agents`（Agent 列表接口）是管理面接口，只对租户管理员登录后的凭证开放，API Key 调用一律 403——查目录要用 `/v1/agent-catalog` 那条。
 
-**key 轮换期间，旧 key 还能用多久？**
+### key 轮换期间，旧 key 还能用多久？
 
 由发起轮换时的 `grace_period_s` 决定，默认 300 秒，最长 3600 秒。宽限期内新旧 key 都验证通过，一过立刻 401。见 [6.6 轮换与吊销](./auth#_6-6-轮换与吊销)。
 
-**`session_id` 从哪来？不传会怎样？**
+### `session_id` 从哪来？不传会怎样？
 
 不传就是开一段全新会话；传了但不属于这个 `user_id` / `agent_code` 组合，返回 404。
 
@@ -61,12 +61,12 @@ flowchart LR
 |---|---|
 | 发起对话，`mode: "stream"` | 响应头 `X-Expert-Work-Session-Id` |
 | 发起对话，`mode: "queue"` | **没有响应头**，读 202 响应体的 `data.thread_id`（字段名叫 `thread_id`，与 `session_id` 是同一个值，下次续接时仍填进请求体的 `session_id`） |
-| 会话绑定 `POST /v1/agents/{agent_code}/sessions` | 响应体 `data.session_id` |
-| 文件上传 `POST /v1/agents/{agent_code}/uploads` | 响应体 `data.session_id` |
+| [提前拿一个 session_id](./chat#提前拿一个-session-id) `POST /v1/agents/{agent_code}/sessions` | 响应体 `data.session_id` |
+| 上传附件 `POST /v1/agents/{agent_code}/uploads` | 响应体 `data.session_id` |
 
 别假设所有端点用同一个字段名，或者都走响应头。
 
-**run 失败了，`error` 字段能用来做错误分类吗？**
+### run 失败了，`error` 字段能用来做错误分类吗？
 
 不能。它是一段诊断文本，不是结构化错误码，不要按文案做模式匹配。见 [5.4 run 列表](./query#_5-4-run-列表) 的说明。
 
