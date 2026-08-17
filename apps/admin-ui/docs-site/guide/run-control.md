@@ -34,7 +34,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 ### 响应
 
 ```json [响应 200]
-{ "success": true, "data": { "run_id": "550e8400-e29b-41d4-a716-446655440000", "stopped": true }, "error": null }
+{ "success": true, "data": { "run_id": "67262572-5470-41a4-800d-592762ec679d", "stopped": true }, "error": null }
 ```
 
 | `stopped` | 含义 |
@@ -60,9 +60,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 
 | 状态码 | `error.code` | 触发条件 | 你该怎么办 |
 |---|---|---|---|
-| 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或存在但不属于这个 `(user_id, agent_code)` 组合——**两种情况返回同一个 404，不区分**。收到这个 404 **不代表"run 还没创建好、稍后重试就有"** | 核对 `run_id` / `user_id` / `agent_code` 三者是否都对；如果确信三个值都对，它的含义就是"这不是你的 run"，重试不会有不同结果 |
+| 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或存在但不属于这个 `(user_id, agent_code)` 组合——**两种情况返回同一个 404，不区分**。收到这个 404 **不代表"run 还没创建好、稍后重试就有"**。`user_id` 传了但去掉首尾空白后为空（整串都是空格）时，也折叠进这个 404，而不是单独报参数错 | 核对 `run_id` / `user_id` / `agent_code` 三者是否都对（含 `user_id` 是不是纯空白）；如果确信三个值都对，它的含义就是"这不是你的 run"，重试不会有不同结果 |
 | 422 | `INVALID_REQUEST` | `user_id` 缺失，或超过 255 字符，或请求体带了未知字段 | 补全或截短 `user_id`；去掉多余字段 |
-| 422 | `INVALID_USER_ID` | `user_id` 传了但去掉首尾空白后为空（比如整串都是空格）——能过字段长度校验，过不了后面的归属解析 | 检查 `user_id` 是不是纯空白 |
 | 403 | `FORBIDDEN`（码在 `detail.code`，不是 `error.code`） | key 权限不足（缺 `write`） | 换一个带 `write` 权限的 key |
 
 401 相关的 key 失效情况见 [8 错误码总表](./errors)。
@@ -150,10 +149,16 @@ sequenceDiagram
 
 `reason` 只在 `decision: "reject"` 时有实际效果：它的文本会被塞进这次工具调用返回给 Agent 的结果消息里（类似 `[approval rejected] {reason}`），Agent 能看到这句话并据此调整。
 
-`approve` / `modify` 下传 `reason` 不会报错，但也不会被使用——**它不会写进审计日志，也不会出现在任何 SSE 事件里**，只在这次续跑内部短暂存在。想让拒绝理由可追溯，记在你自己的系统里。
+`approve` / `modify` 下传 `reason` 不会报错，但也不会被使用。想让拒绝理由可追溯，记在你自己的系统里——**它不会写进审计日志**。
+
+::: danger `reason` 会被终端用户看到
+`reject` 的 `reason` **会出现在续跑流的 `updates` 事件里**——它是喂回给 Agent 的那条工具结果的一部分（`[approval rejected] {reason}`），而 [3.4 的 `updates`](./sse-events#updates) 正是让前端把工具结果渲染到工具卡上。也就是说，这段文字会顺着 SSE 一路流到界面上，重连回放时同样会再来一遍。
+
+**别在 `reason` 里写不想让终端用户看到的内容**（内部工单号、风控判据、同事的评价……）。省略 `reason` 时平台用的默认文案是 `approval rejected by reviewer`。
+:::
 
 ```bash [请求]
-curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide \
+curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/67262572-5470-41a4-800d-592762ec679d:decide \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve", "mode": "queue"}'
@@ -166,7 +171,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d
 #### stream 模式（默认）
 
 ```bash [请求]
-curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide" \
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/67262572-5470-41a4-800d-592762ec679d:decide" \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve"}'
@@ -179,7 +184,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41
 #### queue 模式
 
 ```bash [请求]
-curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide" \
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/67262572-5470-41a4-800d-592762ec679d:decide" \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve", "mode": "queue"}'
@@ -203,7 +208,9 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41
 | `mode: "queue"` | 202 | 上面 `queue` 标签页里那样的 JSON |
 | `mode: "stream"` 但命中幂等重放 | 200 | 同上的 JSON；此时没有正在执行的续跑可接流 |
 
-三种情况的响应头都带 `X-Expert-Work-Run-Id`（续跑的新 run_id）。拿到之后用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}` 接上它的事件流（`{user_id}` 与发起这次 run 时相同）。
+三种情况的响应头都带 `X-Expert-Work-Run-Id`——**这是续跑的新 `run_id`，不是原来那个**。拿到之后用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}` 接上它的事件流（`{user_id}` 与发起这次 run 时相同）。
+
+用 [3.5 的接收器骨架](./sse-events#_3-5-建议的接收器骨架) 的话，从它那个循环里 `consume(await fetch(url))` 那一步进入即可——换成新 `run_id`，游标从头算（`maxSeq` 记得清）。
 
 `stream` 模式的幂等重放和发起对话端点的 stream 幂等重放不是一回事：这里重放的是"决策"本身，不是"run"本身。
 
@@ -211,7 +218,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41
 
 | 状态码 | `error.code` | 触发条件 | 你该怎么办 |
 |---|---|---|---|
-| 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或不属于这个 `(user_id, agent_code)` 组合——归属校验先于审批逻辑执行，与 [4.1](#_4-1-取消-run) 同一条规则 | 核对三者是否匹配；确认无误后不要重试 |
+| 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或不属于这个 `(user_id, agent_code)` 组合——归属校验先于审批逻辑执行，与 [4.1](#_4-1-取消-run) 同一条规则。`user_id` 为纯空白时同样折叠进这个 404 | 核对三者是否匹配（含 `user_id` 是不是纯空白）；确认无误后不要重试 |
 | 404 | `APPROVAL_NOT_FOUND` | 归属校验通过，但这个 `run_id` 名下没有任何审批记录 | 确认这个 run 真的处于等待审批状态（比如没有已经被上一次调用决策过） |
 | 409 | `APPROVAL_CONFLICT` | 这条审批已经被决定过（重复决策，或与另一次并发决策竞争后落败），且这次请求的 `idempotency_key` 对不上已落库的那次决策（对得上则不是失败，走幂等重放） | 不要重复决策；要重放上次结果，带上当时用的 `idempotency_key` 重新请求 |
 | 409 | `SESSION_NOT_BOUND` | 这个 run 所在的会话没有绑定 Agent 名称/版本——内部状态异常，正常对接流程不会遇到 | 联系租户管理员 |
@@ -221,7 +228,6 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41
 | 410 | `AGENT_DELETED` | Agent 已被软删除 | 不可恢复，换一个 `agent_code` |
 | 422 | `AGENT_BUILD_FAILED` | Agent 定义构建失败——服务端配置问题，不是你这边能解决的 | 联系租户管理员 |
 | 422 | `INVALID_REQUEST` | 请求体没通过基础校验，比如 `decision: "modify"` 却没传 `modified_args`、非 `modify` 却传了 `modified_args`、`decision` / `mode` 不是允许的枚举值、`user_id` 缺失或超长、带了未知字段 | 对照上方参数表逐项检查请求体 |
-| 422 | `INVALID_USER_ID` | `user_id` 去掉首尾空白后为空——与 [4.1](#_4-1-取消-run) 同一条规则 | 检查 `user_id` 是不是纯空白 |
 | 403 | `FORBIDDEN`（码在 `detail.code`，不是 `error.code`） | key 权限不足（缺 `write`） | 换一个带 `write` 权限的 key |
 
 401 相关的 key 失效情况见 [8 错误码总表](./errors)。

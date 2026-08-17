@@ -114,7 +114,7 @@ def run_and_stream(user_id, input_text):
                 max_seq_seen = seq if max_seq_seen is None else max(max_seq_seen, seq)
 
             if event == "end":
-                # ④收到 end 才算结束;end 事件带这次 run 的终局 status
+                # ④收到 end 才算结束;end 事件带这次 run 的最终 status
                 print("run 结束,status =", data["status"])
                 break
             elif event == "truncated":
@@ -206,7 +206,7 @@ async function runAndStream(userId, inputText) {
     }
 
     if (event === "end") {
-      // ④收到 end 才算结束;end 事件带这次 run 的终局 status
+      // ④收到 end 才算结束;end 事件带这次 run 的最终 status
       console.log("run 结束,status =", data.status);
       break;
     } else if (event === "truncated") {
@@ -452,7 +452,7 @@ public class RunAndStream {
                             maxSeqSeen = (maxSeqSeen == null) ? frame.seq : Math.max(maxSeqSeen, frame.seq);
                         }
                         if ("end".equals(frame.event)) {
-                            // ④收到 end 才算结束;end 事件带这次 run 的终局 status
+                            // ④收到 end 才算结束;end 事件带这次 run 的最终 status
                             System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
                             break readLoop;
                         } else if ("truncated".equals(frame.event)) {

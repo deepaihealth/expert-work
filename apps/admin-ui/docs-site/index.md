@@ -26,9 +26,13 @@ features:
     link: /guide/chat
     linkText: 查看参数表
   - title: 3 读懂 SSE 流
-    details: 事件类型总表、updates 怎么解析、断线怎么重连接回同一个 run。
+    details: 事件一览与逐个事件的字段、前端渲染示例、可直接抄的接收器骨架、断线重连与回放分页。
     link: /guide/sse-events
     linkText: 解析事件流
+  - title: 4 对话过程中的控制
+    details: 中途取消一次 run、以及 run 停在人工审批节点时怎么提交决策。
+    link: /guide/run-control
+    linkText: 取消与审批
   - title: 5 查询与管理
     details: 有哪些 Agent 可调、会话与历史消息、执行记录、下载 Agent 产出的文件。
     link: /guide/query

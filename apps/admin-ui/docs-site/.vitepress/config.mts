@@ -140,7 +140,7 @@ export default withMermaid(
       outline: { label: "本页目录", level: [2, 3] },
       footer: {
         message: "对外 API 版本 v1",
-        copyright: "文档更新于 2026-08-16",
+        copyright: "文档更新于 2026-08-17",
       },
     },
     markdown: {

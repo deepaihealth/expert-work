@@ -56,11 +56,11 @@ curl "https://<your-domain>/v1/agent-catalog?limit=50&offset=0" \
 | `available` | boolean | 现在能不能对它发起对话。 |
 | `total` | number | 去重后的 Agent 总数，不是版本记录数，也不是当前页条目数。 |
 
-### `available` 与实际可用性有最长 30 秒的偏差
+### `available` 与实际可用性有最长约 5 秒的偏差
 
-目录的 `available` 是实时读的，而发起对话时的禁用检查走 30 秒缓存。**两个方向都可能不一致**：
+目录的 `available` 是实时读的，而发起对话时的禁用检查走一层短缓存（默认约 5 秒，平台可配）。**两个方向都可能不一致**：
 
-| 刚发生的操作 | 30 秒内可能出现的现象 |
+| 刚发生的操作 | 缓存过期前可能出现的现象 |
 |---|---|
 | 管理员**重新启用**了某个 Agent | 目录已显示 `available: true`，但发起对话仍被拒 |
 | 管理员**禁用**了某个 Agent | 目录已显示 `available: false`，但发起对话仍被接受 |
@@ -271,6 +271,8 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 |---|---|
 | `pending` / `queued` / `running` | 否 |
 | `success` / `error` / `timeout` / `interrupted` / `paused` | 是。只有走到最终状态，`finished_at` 才会被写上 |
+
+这里的取值比 SSE `end` 事件的 `status` 更细：`end` 只有四值，**这里的 `timeout` 在 `end` 里显示为 `error`**（见 [3.4 的 `end`](./sse-events#end)）。同一次 run 两处字样不同是正常的。
 
 #### `error` 字段怎么读
 
@@ -560,7 +562,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 | 状态码 | `error.code` | 含义 |
 |---|---|---|
-| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、或不属于这个 `user_id`——**三种情况统一返回这一个 404**，不区分 |
+| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、或不属于这个 `user_id`——**三种情况统一返回这一个 404**，不区分。服务端读产物记录时的瞬时故障也会落到这个 404 上，所以它并非 100% 等价于「这东西不存在」 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 里含 NUL 字节 |
 | 429 | `RATE_LIMIT_EXCEEDED` | `artifact_download` 配额（含 `ARTIFACT_DOWNLOAD_COUNT_30D` 30 天窗口）耗尽，见上方说明 |
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录在，但服务端读不到内容（存储配置问题）。**这不是"不存在"**，重试没用，联系你的租户管理员 |

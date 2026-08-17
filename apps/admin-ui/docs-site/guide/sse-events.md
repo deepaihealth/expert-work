@@ -68,7 +68,7 @@ data: {"run_id":"67262572-5470-41a4-800d-592762ec679d","thread_id":"9f2c1a44-6d3
 
 ### 心跳是注释行，不是事件
 
-连接活着的时候，服务端大约每 15 秒发一行心跳:
+连接活着、但**空闲约 15 秒没有任何事件**时，服务端发一行心跳:
 
 ``` [事件流片段]
 : heartbeat
@@ -127,6 +127,8 @@ id 里的**毫秒段不保证两次一致**:实时连接和回放是两次独立
 ## 3.3 事件一览(按出现顺序)
 
 下表按事件在流里**实际出现的先后**排。每一行的详细说明见 3.4 对应小节。
+
+`token` 排在 `updates` 前面是就「一步之内」而言的:模型先逐字吐,这一步才落成 `updates`。但**第一个 `token` 到底出现在流的第几位,取决于这个 Agent 配了几个准备节点**(见 3.1)——准备节点只发 `updates`,它们都排在第一个 `token` 之前。
 
 | `event:` | 什么时候出现 | `data` 里有什么 | 前端该做什么 | 有 `id:` |
 |---|---|---|---|---|
@@ -325,6 +327,8 @@ function onToken(data) {
 - `agent` 节点——`escalate_next`、`last_plan_goal`、`no_progress_streak`、`step_count_refund_pending`、`tool_failures`
 - `tools` 节点——`step_count_refund_pending`
 - `memory_recall` 节点——`recalled_memories`
+
+这几条也**不是穷举**,按 Agent 配置还会有别的;一律忽略即可。
 
 ::: danger 节点写入可能整个是 `null`——这是第一天就会踩到的坑
 真栈实测三个场景全部出现过:
@@ -726,7 +730,7 @@ run 走到人工审批节点、停下来等人决策时发一次。发完这个�
 |---|---|---|
 | `run_id` | string(UUID) | 这次 run 的 id |
 | `thread_id` | string(UUID) | 这段会话的 id |
-| `request_id` | string | 这条审批请求的 id。**提交决策时要原样带回去** |
+| `request_id` | string | 这条审批请求的 id。界面上用它区分 / 去重多条审批,**提交决策时不需要传** |
 | `node` | string | 是哪个节点提出的审批请求 |
 | `reason_kind` | string | 为什么要审批，五值:`policy_gate`(平台策略要求)/ `missing_info`(缺信息)/ `ambiguous_requirement`(需求有歧义)/ `approach_choice`(要在几种做法里选)/ `risk_confirmation`(高风险确认) |
 | `action_summary` | string | 一句人话说明在等批什么。**直接显示给用户看** |
@@ -763,8 +767,8 @@ function onApproval(data) {
   $(`#apr-${data.request_id}`).addEventListener("click", (e) => {
     const decision = e.target.dataset.d;
     if (!decision) return;
-    // 提交决策的接口见 4.2;request_id 要原样带回去
-    submitApproval(data.run_id, data.request_id, decision);
+    // 提交决策的接口见 4.2 —— 定位靠 run_id,不传 request_id
+    submitApproval(data.run_id, decision);
   });
 }
 ```
@@ -775,7 +779,7 @@ function onApproval(data) {
 
 #### 什么时候发
 
-run 遇到一次**可以重试**的失败(比如上游临时抽风)时发一条提示，然后等一段时间自动重来。这不是终局——重试成功的话 run 会照常跑完。
+run 遇到一次**可以重试**的失败(比如上游临时抽风)时发一条提示，然后等一段时间自动重来。这不是最终状态——重试成功的话 run 会照常跑完。
 
 #### `data` 字段
 
@@ -881,6 +885,8 @@ HTTP 层的错误码(4xx / 5xx、限流、配额)是另一回事，见 [8 错误
 | `interrupted` | run 被中断，比如调用方主动取消 | 按「已取消」处理，不必重试 |
 | `error` | 执行失败。**超时也归在这里**，没有单独的 timeout 值 | 按失败处理，细节查 [8 错误码总表](./errors) |
 
+run 记录里还有 `timeout` 等更细的状态(见 [5.4 run 列表](./query#_5-4-run-列表)),SSE 的 `end` 把它们**收敛成上面这四个**——同一次 run 在两个地方看到不同的字样是正常的。
+
 #### 完整示例
 
 ``` [事件流片段]
@@ -981,7 +987,9 @@ const handled = new Set();               // 去重:已经处理过的 seq
 // 读一条流,直到它结束。返回值告诉外层要不要再来一次
 async function consume(res, readTimeoutMs = 60_000) {
   for await (const ev of parseSse(res, readTimeoutMs)) {
-    const data = JSON.parse(ev.data);
+    let data;
+    try { data = JSON.parse(ev.data); }
+    catch { continue; }                  // data 不是 JSON:按 3.3 的规矩忽略
     if (ev.event === "end") { onEnd(data); return { finished: true }; }
     if (ev.event === "truncated") return { finished: false, since: data.next_seq };
 
@@ -1010,6 +1018,10 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  // 先看 HTTP 状态:403 / 422 / 429 的响应体是 JSON 错误,不是 SSE 流。
+  // 不看就会一路走到下面「拿不到 run_id」,把真正的原因盖掉
+  if (!first.ok) throw new Error(`发起 run 失败 ${first.status}: ${await first.text()}`);
+
   let r;
   try {
     r = await consume(first);            // 第一条流也要兜:它同样会读超时 / 断
@@ -1039,6 +1051,10 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 ```
 
 这份骨架已经覆盖了 3.6 讲的全部要点:自设读超时、按最大 seq 维护游标、按 seq 精确去重、`truncated` 自动翻页、不认识的事件忽略、循环有上限。
+
+::: tip 审批决策之后是**另一个 run**
+提交审批决策(见 [4.2 审批决策](./run-control#_4-2-审批决策))之后,平台开的是一个**新的 `run_id`**——不是把原来那个接着跑。所以别拿旧 `run_id` 去重连;从响应头 `X-Expert-Work-Run-Id` 取新的那个,然后**从上面循环里 `consume(await fetch(url))` 那一步进入**(游标重新从头算,`maxSeq` 记得清)。
+:::
 
 ## 3.6 断线重连与回放分页
 
