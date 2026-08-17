@@ -75,12 +75,6 @@ data: {"status":"success","run_id":"5ee4e7f0-9074-42c6-88ef-3c3ed2ceb63d"}
 | `interrupted` | run 被中断(比如调用方主动取消) | 按"已取消"处理，不必重试 |
 | `error` | 执行失败。**超时也归在这里**，没有单独的 timeout 值 | 按失败处理，细节查 [错误码与限流](./errors) |
 
-::: warning 破坏性变更——`end` 帧的 `data` 以前是 `null`
-旧版本的 `end` 帧是 `data: null`，第三方分不清"正常答完"和"被取消"，只能再查一次 REST 接口。现在 `data` 是一个带 `status` / `run_id` 的对象。
-
-如果你的对接代码写死了"`end` 帧的 data 一定是 null"或者对它做了 `null` 断言，改成读 `data.status`。
-:::
-
 **唯一拿不到最终状态的情况是 `truncated`**:那一页以 `truncated` 收尾、**不发 `end`**，所以这一页里没有任何 status。要看到最终状态，必须按下面「回放分页」一节循环拉到收到 `end` 为止。
 
 ## 3.3 updates 帧怎么解析
