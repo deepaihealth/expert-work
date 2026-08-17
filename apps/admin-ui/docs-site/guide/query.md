@@ -196,12 +196,13 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/message
 
 ### 响应字段
 
-| 字段 | 说明 |
-|---|---|
-| `role` | `"user"` 或 `"assistant"`。 |
-| `content` | 消息正文。 |
-| `channel` | 只对 `assistant` 消息有意义：`"final"` = 这一轮最终展示给用户的回答，`"commentary"` = 中间过程输出。`user` 消息恒为 `null`。 |
-| `created_at` / `run_id` | 本次更新新增的字段。**更新之前产生的历史消息这两个字段是 `null`**——写入时才记录，不做历史回填。 |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `role` | string | `"user"` 或 `"assistant"`。 |
+| `content` | string | 消息正文。 |
+| `channel` | string \| null | 只对 `assistant` 消息有意义：`"final"` = 这一轮最终展示给用户的回答，`"commentary"` = 中间过程输出。`user` 消息恒为 `null`。 |
+| `created_at` | string（ISO 8601）\| null | 本次更新新增的字段。**更新之前产生的历史消息这个字段是 `null`**——写入时才记录，不做历史回填。 |
+| `run_id` | string（UUID）\| null | 同上，本次更新新增，更新之前产生的历史消息是 `null`。 |
 
 ### 注意
 
@@ -411,10 +412,10 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
 GET /v1/agents/{agent_code}/workspace/file
 ```
 
-| 查询参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 是 | 同上。 |
-| `path` | 是 | 要下载的文件相对路径。**直接原样回传上面列出文件返回的 `path` 值，不要自己拼字符串。** |
+| 参数 | 位置 | 必填 | 取值/默认 | 说明 |
+|---|---|---|---|---|
+| `user_id` | 查询 | 是 | 1–255 字符 | 同上。 |
+| `path` | 查询 | 是 | ≤4096 字符 | 要下载的文件相对路径。**直接原样回传上面列出文件返回的 `path` 值，不要自己拼字符串。** |
 
 ```bash [请求]
 curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&path=report.pdf" \
@@ -538,10 +539,10 @@ GET /v1/agents/{agent_code}/artifacts/download
 
 下载的永远是**最新版本**，当前不提供按版本号下载。
 
-| 查询参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 是 | |
-| `name` | 是 | 原样回传列表里的 `name`，不要自己拼；含 NUL 字节会被拒绝，返回 422 `INVALID_ARTIFACT_NAME` |
+| 参数 | 位置 | 必填 | 取值/默认 | 说明 |
+|---|---|---|---|---|
+| `user_id` | 查询 | 是 | 1–255 字符 | — |
+| `name` | 查询 | 是 | ≤512 字符 | 原样回传列表里的 `name`，不要自己拼；含 NUL 字节会被拒绝，返回 422 `INVALID_ARTIFACT_NAME` |
 
 ```bash [请求]
 curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-123&name=2026-08%20周报.docx" \
@@ -573,10 +574,10 @@ DELETE /v1/agents/{agent_code}/artifacts
 
 要求 `write` 权限（与归档会话一样，对外 API 没有单独的删除权限档位）。
 
-| 查询参数 | 必填 | 说明 |
-|---|---|---|
-| `user_id` | 是 | |
-| `name` | 是 | 含 NUL 字节会被拒绝，返回 422 `INVALID_ARTIFACT_NAME` |
+| 参数 | 位置 | 必填 | 取值/默认 | 说明 |
+|---|---|---|---|---|
+| `user_id` | 查询 | 是 | 1–255 字符 | — |
+| `name` | 查询 | 是 | ≤512 字符 | 含 NUL 字节会被拒绝，返回 422 `INVALID_ARTIFACT_NAME` |
 
 ```bash [请求]
 curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123&name=2026-08%20周报.docx" \
