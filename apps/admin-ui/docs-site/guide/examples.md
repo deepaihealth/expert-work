@@ -13,7 +13,7 @@
 - `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符,使用时替换成实际值。
 - 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
 
-## 10.1 发起 run(stream)并解析 SSE
+## 10.1 发起 stream 模式的 run 并解析事件流
 
 发起一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例中直接原样打印 `data` 字段,不做进一步解析,字段含义见 [SSE 事件格式](./sse-events)。
 
@@ -472,7 +472,7 @@ public class RunAndStream {
 
 :::
 
-## 10.2 queue 模式 + 轮询结果
+## 10.2 queue 模式与轮询结果
 
 `mode: "queue"` 立即返回 `202`,不返回 SSE 流。202 响应体中的 `data.thread_id` 就是这次绑定的 `session_id`(字段名不同,值相同)。可以用 `GET /v1/agents/{agent_code}/sessions` 中每一项的 `running` 字段轮询;`running` 变为 `false` 后,再拉取历史消息获取最终回答。
 
@@ -1945,7 +1945,7 @@ public class ContinueSession {
 
 :::
 
-## 10.5 断线重连(带 since_seq)
+## 10.5 断线重连与 since_seq
 
 连接中断后不要重新调用 `POST .../runs`(那样会开启一个新的 run)。应改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,并把已经收到的最大 `seq` 作为 `since_seq` 参数重新连接。`truncated` 事件走同一条重连路径:把它返回的 `next_seq` 直接作为下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 携带同一个值,但下面示例统一从事件正文读取这个值(部分代理或网关会丢弃或改写自定义响应头,事件本身是响应体的一部分,不会被丢弃)。示例中同样原样打印未分类事件的 `data` 字段,字段含义见 [SSE 事件格式](./sse-events)。
 
