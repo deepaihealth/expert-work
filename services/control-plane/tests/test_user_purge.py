@@ -44,6 +44,7 @@ from expert_work.persistence.image_upload import InMemoryImageUploadStore
 from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.persistence.token_usage_store import InMemoryTokenUsageStore, TokenUsageRecord
+from expert_work.persistence.user_upload import InMemoryUserUploadStore
 from expert_work.persistence.workspace.dlq import InMemoryVolumeBackupDLQ
 from expert_work.protocol import ApprovalRecord, AuditAction, AuditQuery, MemoryItem
 from expert_work.runtime.runs import (
@@ -139,6 +140,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
     feedback = InMemoryFeedbackStore()
     object_store = InMemoryObjectStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
@@ -234,6 +236,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         webhook_endpoints=webhook_endpoints,
         webhook_deliveries=webhook_deliveries,
         image_uploads=image_uploads,
+        user_uploads=user_uploads,
         feedback=feedback,
         object_store=object_store,
         volume_backup_dlq=volume_backup_dlq,
@@ -334,6 +337,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
     feedback = InMemoryFeedbackStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
     token_usage = InMemoryTokenUsageStore()
@@ -372,6 +376,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
         webhook_endpoints=webhook_endpoints,
         webhook_deliveries=webhook_deliveries,
         image_uploads=image_uploads,
+        user_uploads=user_uploads,
         feedback=feedback,
         object_store=None,
         volume_backup_dlq=volume_backup_dlq,
@@ -395,6 +400,116 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
     assert summary.image_blobs_removed == 0
     assert summary.image_blobs_failed == 0
     assert await image_uploads.list_for_user(tenant_id=t1, user_id=a.id) == []
+
+
+@pytest.mark.asyncio
+async def test_purge_user_deletes_user_upload_rows() -> None:
+    """对外附件模型统一(spec 2026-08-17) —— purge hard-deletes every
+    ``user_upload`` row (document + image alike) for the target user, and
+    leaves other users'/tenants' rows untouched."""
+    t1 = uuid4()
+    threads = InMemoryThreadMetaStore()
+    memory = InMemoryMemoryStore()
+    memory_dlq = InMemoryMemoryWritebackDLQ()
+    artifacts = InMemoryArtifactStore()
+    mcp_oauth = InMemoryMcpOAuthConnectionStore()
+    agent_instances = InMemoryAgentInstanceStore()
+    approvals = InMemoryApprovalStore()
+    triggers = InMemoryTriggerStore()
+    trigger_runs = InMemoryTriggerRunStore()
+    webhook_endpoints = InMemoryWebhookEndpointStore()
+    webhook_deliveries = InMemoryWebhookDeliveryStore()
+    image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
+    feedback = InMemoryFeedbackStore()
+    volume_backup_dlq = InMemoryVolumeBackupDLQ()
+    token_usage = InMemoryTokenUsageStore()
+    runs = InMemoryRunStore()
+    skills = InMemorySkillStore()
+    eval_datasets = InMemoryEvalDatasetStore()
+    curation = InMemoryCurationCandidateStore()
+    users = InMemoryTenantUserStore()
+    audit_store = InMemoryAuditLogStore()
+    workspace_store = RecordingWorkspaceStore()
+
+    a = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
+    b = await users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-b")
+    doc_id = uuid4()
+    image_id = uuid4()
+    await user_uploads.insert(
+        upload_id=doc_id,
+        tenant_id=t1,
+        user_id=a.id,
+        thread_id=uuid4(),
+        kind="document",
+        ref="uploads/report.pdf",
+        mime_type="application/pdf",
+        size_bytes=10,
+        filename="report.pdf",
+    )
+    await user_uploads.insert(
+        upload_id=image_id,
+        tenant_id=t1,
+        user_id=a.id,
+        thread_id=uuid4(),
+        kind="image",
+        ref="expert_work://image/x/y/z.png",
+        mime_type="image/png",
+        size_bytes=1,
+        filename="z.png",
+    )
+    # Another user's row in the same tenant — must survive.
+    other_upload_id = uuid4()
+    await user_uploads.insert(
+        upload_id=other_upload_id,
+        tenant_id=t1,
+        user_id=b.id,
+        thread_id=uuid4(),
+        kind="document",
+        ref="uploads/other.pdf",
+        mime_type="application/pdf",
+        size_bytes=1,
+        filename="other.pdf",
+    )
+
+    deps = PurgeUserDeps(
+        threads=threads,
+        runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
+        memory=memory,
+        memory_dlq=memory_dlq,
+        artifacts=artifacts,
+        mcp_oauth=mcp_oauth,
+        agent_instances=agent_instances,
+        approvals=approvals,
+        triggers=triggers,
+        trigger_runs=trigger_runs,
+        webhook_endpoints=webhook_endpoints,
+        webhook_deliveries=webhook_deliveries,
+        image_uploads=image_uploads,
+        user_uploads=user_uploads,
+        feedback=feedback,
+        object_store=None,
+        volume_backup_dlq=volume_backup_dlq,
+        token_usage=token_usage,
+        runs=runs,
+        skills=skills,
+        eval_datasets=eval_datasets,
+        curation_candidates=curation,
+        tenant_users=users,
+        audit=build_default_audit_logger(audit_store),
+        workspace_store=workspace_store,
+    )
+
+    summary = await purge_user(
+        tenant_id=t1, user_id=a.id, subject_id="subj-a", deps=deps, actor_id="admin"
+    )
+
+    assert "user_upload" not in summary.failures
+    assert summary.deleted["user_upload"] == 2
+    assert await user_uploads.get(upload_id=doc_id, tenant_id=t1) is None
+    assert await user_uploads.get(upload_id=image_id, tenant_id=t1) is None
+    # User B's row is untouched.
+    assert await user_uploads.get(upload_id=other_upload_id, tenant_id=t1) is not None
 
 
 class _FailingObjectStore(InMemoryObjectStore):
@@ -433,6 +548,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
     feedback = InMemoryFeedbackStore()
     object_store = _FailingObjectStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
@@ -476,6 +592,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
         webhook_endpoints=webhook_endpoints,
         webhook_deliveries=webhook_deliveries,
         image_uploads=image_uploads,
+        user_uploads=user_uploads,
         feedback=feedback,
         object_store=object_store,
         volume_backup_dlq=volume_backup_dlq,
@@ -525,6 +642,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
     feedback = InMemoryFeedbackStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
     token_usage = InMemoryTokenUsageStore()
@@ -574,6 +692,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
         webhook_endpoints=webhook_endpoints,
         webhook_deliveries=webhook_deliveries,
         image_uploads=image_uploads,
+        user_uploads=user_uploads,
         feedback=feedback,
         object_store=None,
         volume_backup_dlq=volume_backup_dlq,
@@ -677,6 +796,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     webhook_endpoints = InMemoryWebhookEndpointStore()
     webhook_deliveries = InMemoryWebhookDeliveryStore()
     image_uploads = InMemoryImageUploadStore()
+    user_uploads = InMemoryUserUploadStore()
     feedback = _FailingFeedbackStore()
     volume_backup_dlq = InMemoryVolumeBackupDLQ()
     token_usage = InMemoryTokenUsageStore()
@@ -714,6 +834,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         webhook_endpoints=webhook_endpoints,
         webhook_deliveries=webhook_deliveries,
         image_uploads=image_uploads,
+        user_uploads=user_uploads,
         feedback=feedback,
         object_store=None,
         volume_backup_dlq=volume_backup_dlq,

@@ -315,6 +315,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         webhook_endpoints=state.webhook_endpoint_store,
         webhook_deliveries=state.webhook_delivery_store,
         image_uploads=state.image_upload_store,
+        user_uploads=state.user_upload_store,
         feedback=state.feedback_store,
         object_store=getattr(state, "object_store", None),
         volume_backup_dlq=getattr(state, "volume_backup_dlq", None),

@@ -93,6 +93,7 @@ from expert_work.persistence.models.thread_message import (
 from expert_work.persistence.models.thread_meta import ThreadMetaRow
 from expert_work.persistence.models.token_budget_ledger import TokenBudgetLedgerRow
 from expert_work.persistence.models.token_reservation import TokenReservationRow
+from expert_work.persistence.models.user_upload import UserUploadRow
 from expert_work.persistence.models.user_workspace import UserWorkspaceRow
 from expert_work.persistence.models.volume_backup_dlq import VolumeBackupDLQRow
 from expert_work.persistence.models.webhook import WebhookDeliveryRow, WebhookEndpointRow
@@ -168,6 +169,7 @@ __all__ = [
     "TokenBudgetLedgerRow",
     "TokenReservationRow",
     "TriggerRunRow",
+    "UserUploadRow",
     "UserWorkspaceRow",
     "VolumeBackupDLQRow",
     "WebhookDeliveryRow",

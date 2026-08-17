@@ -253,6 +253,13 @@ from expert_work.protocol.trigger import (
     TriggerSource,
     TriggerSpec,
 )
+from expert_work.protocol.user_upload import (
+    UPLOAD_ID_PREFIX,
+    UserUpload,
+    UserUploadKind,
+    parse_upload_id,
+    render_upload_id,
+)
 from expert_work.protocol.user_workspace import UserWorkspace
 from expert_work.protocol.webhook import (
     WebhookDeliveryRecord,
@@ -281,6 +288,7 @@ __all__ = [
     "TENANT_SCOPE_ROLES",
     "TIER_ORDER",
     "TOOL_CATALOG",
+    "UPLOAD_ID_PREFIX",
     "AgentDisableRecord",
     "AgentInstanceRecord",
     "AgentMetadata",
@@ -458,6 +466,8 @@ __all__ = [
     "TriggerRunStatus",
     "TriggerSource",
     "TriggerSpec",
+    "UserUpload",
+    "UserUploadKind",
     "UserWorkspace",
     "VisionSpec",
     "WebhookDeliveryRecord",
@@ -477,7 +487,9 @@ __all__ = [
     "parse_extends_ref",
     "parse_image_ref",
     "parse_skill_ref",
+    "parse_upload_id",
     "provider_for_model",
+    "render_upload_id",
     "resolve_extends",
     "tier_satisfies",
     "validate_secret_ref",
