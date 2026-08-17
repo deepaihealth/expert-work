@@ -50,12 +50,12 @@ export default withMermaid(
               text: "3 读懂 SSE 流",
               link: "/guide/sse-events",
               items: [
-                { text: "3.1 帧格式", link: "/guide/sse-events#_3-1-帧格式" },
-                { text: "3.2 事件总表", link: "/guide/sse-events#_3-2-事件总表" },
-                { text: "3.3 updates 帧怎么解析", link: "/guide/sse-events#_3-3-updates-帧怎么解析" },
-                { text: "3.4 token 帧", link: "/guide/sse-events#_3-4-token-帧" },
-                { text: "3.5 worker / guard / compaction 帧", link: "/guide/sse-events#_3-5-worker-guard-compaction-帧" },
-                { text: "3.6 断线重连", link: "/guide/sse-events#_3-6-断线重连" },
+                { text: "3.1 先看一眼:事件流长什么样", link: "/guide/sse-events#_3-1-先看一眼-一次-run-的事件流长什么样" },
+                { text: "3.2 事件的格式", link: "/guide/sse-events#_3-2-事件的格式" },
+                { text: "3.3 事件一览(按出现顺序)", link: "/guide/sse-events#_3-3-事件一览-按出现顺序" },
+                { text: "3.4 每个事件怎么处理", link: "/guide/sse-events#_3-4-每个事件怎么处理" },
+                { text: "3.5 建议的接收器骨架", link: "/guide/sse-events#_3-5-建议的接收器骨架" },
+                { text: "3.6 断线重连与回放分页", link: "/guide/sse-events#_3-6-断线重连与回放分页" },
               ],
             },
             {
