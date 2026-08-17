@@ -4,11 +4,10 @@
 
 3.5 给出一份可以直接使用的接收器骨架。
 
-全章示例统一使用下列值：
+全章示例统一使用下列值。`{agent_code}` 在本章保持占位符形式，实际调用时替换成调用方自己的 Agent 编码。
 
 | 占位符 | 本章使用的值 | 说明 |
 |---|---|---|
-| `{agent_code}` | `{agent_code}` | 本章保留这个占位符；实际调用时替换成调用方自己的 Agent 编码 |
 | `{user_id}` | `u-123` | 发起这次 run 的终端用户 id |
 | `{run_id}` | `67262572-5470-41a4-800d-592762ec679d` | 这次 run 的 id |
 | 会话 id | `9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37` | 请求体里的字段名是 `session_id`，SSE 事件里的字段名是 `thread_id`，两者是同一个值 |
@@ -45,9 +44,7 @@ event: end           ← 流结束,事件里带这次 run 的最终状态
 2. 中间——`token` 与 `updates` 交替出现，轮数取决于这次 run 走了几步；其间还可能出现 `worker`、`guard`、`compaction`、`approval`、`retry`、`error`。
 3. 收尾——一个 `end`，给出这次 run 的最终状态。
 
-::: tip 只有两个事件每次都会出现
-`metadata` 和 `end` 每次都会出现，`end` 的唯一例外见 3.6 的分页。其余事件取决于这次 run 实际发生了什么：没有调用工具就没有工具那一步的 `updates`，没有触及限制就没有 `guard`。客户端不要把「某个事件一定会到达」写进代码。
-:::
+这三段里每次都会出现的只有 `metadata` 和 `end` 两个事件，`end` 的唯一例外是续传被分页截断，见 [3.6 断线重连与续传](#_3-6-断线重连与续传)。其余事件取决于这次 run 实际发生了什么：没有调用工具就没有工具那一步的 `updates`，没有触及限制就没有 `guard`。**客户端不要把「某个事件一定会到达」写进代码。**
 
 ## 3.2 事件的格式
 
@@ -72,7 +69,7 @@ data: {"run_id":"67262572-5470-41a4-800d-592762ec679d","thread_id":"9f2c1a44-6d3
 
 心跳用来维持连接，并让客户端判断连接是否还活着。
 
-- 谁发：服务端通过当前这条 SSE 连接发出。实时连接都会发，即 `mode: "stream"` 的响应流，以及 run 未结束时的事件接口（`GET /v1/agents/{agent_code}/runs/{run_id}/events`，见 [3.6 断线重连与续传](#_3-6-断线重连与续传)）；run 已结束后的事件续传不发，因为续传一次性返回、不会挂起等待。
+- 谁发：服务端通过当前这条 SSE 连接发出。实时连接都会发，即 `mode: "stream"` 的响应流、`mode` 为 `stream` 的审批决策（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`，见 [4.2 审批决策](./run-control#_4-2-审批决策)）的续跑事件流，以及 run 未结束时的事件接口（`GET /v1/agents/{agent_code}/runs/{run_id}/events`，见 [3.6 断线重连与续传](#_3-6-断线重连与续传)）；run 已结束后的事件续传不发，因为续传一次性返回、不会挂起等待。
 - 什么时候发：连接上连续 15 秒没有任何事件时发一行；有事件时不发，任何一个事件都会把这个计时重新归零。
 - 内容：一行以冒号开头的注释，不带 `event:` 和 `data:`，不占序号，断线后也不会补发。
 
@@ -175,8 +172,8 @@ const esc = (s) => String(s).replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp
 const store = {
   runId: null, sessionId: null,
   steps: new Map(),        // 步骤编号 → 这一步的预览文本
-  toolCalls: new Map(),    // tool_call_id → 工具卡的 DOM 元素
-  workers: new Map(),      // worker_id → 子时间线的 DOM 元素
+  toolCalls: new Map(),    // tool_call_id → 这次工具调用的显示区块
+  workers: new Map(),      // worker_id → 这个子任务的事件列表
 };
 ```
 
@@ -230,12 +227,10 @@ function onMetadata(data) {
 
 下面四种情况下一个 `token` 都不会出现，决定权分别在四个不同的角色：
 
-- 调用方：这次 run 使用 `mode: "queue"`，响应是 202,本身不是 SSE 流；要取得逐字预览只能在 run 未结束时接上[事件接口](#_3-6-断线重连与续传)，run 结束后的续传不发 `token`。
+- 调用方：这次 run 使用 `mode: "queue"`，响应是 202，本身不是 SSE 流；要取得逐字预览只能在 run 未结束时接上[事件接口](#_3-6-断线重连与续传)，run 结束后的续传不发 `token`。
 - 平台：这次回答命中了缓存，没有真正调用模型。
 - 模型：这个模型不支持流式输出。
-- 租户管理员：他为这个 Agent 开启了输出结果二次判定，模型答完要先整体判定再放行，因此没有逐字输出。
-
-开启结构化输出的 run 仍然会为主候选结果发 `token`，只有需要纠错重发的那一次不使用流式。
+- 租户管理员：他为这个 Agent 开启了输出内容的整体安全审查，模型答完要先整体判定再放行，因此没有逐字输出。
 
 因此，**打字机效果是可选增强，不能作为唯一的显示路径**。客户端必须能在一个 `token` 都收不到的情况下，只依靠 `updates` 完整显示整轮对话。
 
@@ -251,9 +246,7 @@ function onMetadata(data) {
 | `tool_index` | integer | 这是本步里第几个并行的工具调用，从 `0` 开始。只有 `tool_args` 带此字段 |
 | `name` | string | 工具名。同一个 `tool_index` 只发一次，即第一次出现这个调用的时候。只有 `tool_args` 带此字段 |
 
-::: warning 工具的调用参数不会逐字推送
-`tool_args` 只给出这次调用的序号和工具名，没有参数内容。完整参数出现在这一步的 `updates` 里。客户端可以先显示工具卡的外壳，即工具名加一个等待指示，参数等 `updates` 到达后再填入。
-:::
+`tool_args` 只给出这次调用的序号和工具名，没有参数内容，完整参数出现在这一步的 `updates` 里。客户端可以先显示工具卡，也就是界面上代表这次工具调用的那张卡片，先只放工具名和一个等待指示，参数等 `updates` 到达后再填入。
 
 #### 示例
 
@@ -295,13 +288,13 @@ function onToken(data) {
 }
 ```
 
-::: danger 不要用 token 重建状态
+::: warning 不要用 token 重建状态
 一次 run 里 `token` 事件的数量通常远多于 `updates`，而且断连期间的 `token` 一个也补不回来，重连之后只会收到新产生的。
 
 界面的真实状态必须由 `updates` 重建，`token` 只用于视觉预览。
 :::
 
-::: danger 内容被安全策略拦下时 updates 会推翻已经累积的预览
+::: warning 内容被安全策略拦下时 updates 会推翻已经累积的预览
 `updates` 里的内容才是经过完整输出安全审查的最终结果。如果这一步被安全策略拦下，`updates` 里会是一段拒答文案。
 
 拿到 `updates` 时直接整段覆盖同一步累积的预览，不要把两者拼接显示，否则用户会同时看到被拦下的内容和拒答文案。
@@ -311,7 +304,7 @@ function onToken(data) {
 
 #### 什么时候发
 
-run 的每一个步骤完成时，服务端通过当前这条连接发出一次。它是这一步的最终结果：对话气泡、工具卡（界面上代表一次工具调用的卡片）、步数都以它为准重建。
+run 的每一个步骤完成时，服务端通过当前这条连接发出一次。它是这一步的最终结果：对话气泡、工具卡、步数都以它为准重建。
 
 #### data 字段
 
@@ -394,16 +387,12 @@ run 的每一个步骤完成时，服务端通过当前这条连接发出一次�
 | `artifact` | object | 工具产出的结构化数据，结构随工具而定，也可能整个字段不存在。能够解析就使用，不能解析就忽略 |
 | `additional_kwargs.duration_ms` | integer | 这个工具本身执行了多少毫秒 |
 
-`status` 为 `error` 有八种成因。客户端不需要按成因分支，统一按「这一步的工具调用失败」显示；列出成因是为了便于排查：
+`status` 为 `error` 时，客户端不需要按成因分支，统一按「这一步的工具调用失败」显示。常见成因有四类，排查时可以对照：
 
-1. 平台的动作安全屏拦下了这次调用。
-2. 工具执行时抛出异常。
-3. 这个工具被 Agent 的策略禁用。
-4. 模型给出的参数没有通过这个工具的参数校验。
-5. 平台派发这次调用时出错。
-6. 这次调用需要人工审批，审批被拒绝。
-7. 续跑时审批当时的参数摘要不一致，平台拒绝执行。
-8. 审批续跑时，平台为没有真正执行的调用补上的占位结果。
+1. 平台的安全策略拦下了这次调用。
+2. 工具本身执行时报错。
+3. 模型给出的参数没有通过这个工具的参数校验。
+4. 这次调用需要人工审批，审批被拒绝。
 
 #### 示例
 
@@ -436,7 +425,7 @@ run 的每一个步骤完成时，服务端通过当前这条连接发出一次�
 
 ```json [updates 里 tools 这一步的第一条消息]
 {
-  "content": "«UNTRUSTED nonce={random}»\nWrote▁ 5▁ bytes▁ to▁ note.txt\n«/UNTRUSTED nonce={random}»",
+  "content": "«UNTRUSTED nonce=8f3a2c1e»\nWrote▁ 5▁ bytes▁ to▁ note.txt\n«/UNTRUSTED nonce=8f3a2c1e»",
   "additional_kwargs": {"duration_ms": 1848},
   "response_metadata": {},
   "type": "tool",
@@ -447,6 +436,8 @@ run 的每一个步骤完成时，服务端通过当前这条连接发出一次�
   "status": "success"
 }
 ```
+
+`content` 里的 `nonce=8f3a2c1e` 是平台为每条消息各自随机生成的值，示例里的取值只用于说明，客户端按任意值匹配、不要写死，还原方法见下文「工具结果文本的还原」。
 
 某一步没有产出时，这个键对应的值是 `null`：
 
@@ -466,9 +457,9 @@ data: {"workspace_ingest":null}
 `tool` 消息的 `content` 经过防注入包装，直接显示的话，用户看到的是夹着围栏和特殊字形的乱码：
 
 ``` [工具结果的原文]
-«UNTRUSTED nonce={random}»
+«UNTRUSTED nonce=8f3a2c1e»
 Wrote▁ 5▁ bytes▁ to▁ note.txt
-«/UNTRUSTED nonce={random}»
+«/UNTRUSTED nonce=8f3a2c1e»
 ```
 
 包装分两部分：
@@ -491,9 +482,7 @@ function unwrapToolResult(raw) {
 }
 ```
 
-::: warning 还原是有损的
-原文里的换行在标记空白时也变成了 `▁ `，删掉字形之后剩下的是一个空格，**原文的换行无法恢复**。
-:::
+这个还原是有损的：原文里的换行在标记空白时也变成了 `▁ `，删掉字形之后剩下的是一个空格，**原文的换行无法恢复**。
 
 ::: warning 来自外部的标记不要丢
 围栏在不在，意味着这段内容是否来自外部、是否可信。建议像上面的示例那样，在还原之前先记一个标志位。
@@ -604,21 +593,17 @@ function onUpdates(data) {
 | `node` | string | 这一步由谁完成。取值与 [`updates` 的键](#updates)相同 |
 | `_duration_ms` | integer | 距这个子任务上一个事件经过的毫秒数，非负整数 |
 | `step_count` | integer | 到这一步为止的步数，正整数。只有 `node` 为 `agent` 的事件带此字段 |
-| `messages` | array | 这一步新产生消息的摘要，不是 `updates` 里的原样消息。每一项的结构见下面的提示 |
+| `messages` | array | 这一步新产生消息的摘要，不是 `updates` 里的原样消息。每一项的结构见下文 |
 
-::: warning update 里的 messages 是摘要
-每一项都是摘要，字段名带 `_excerpt` 后缀，超出上限的部分被截掉、末尾补一个 `…`。三个上限是：正文 500 字符、工具参数 200 字符、工具结果 500 字符。补上的 `…` 也算一个字符，所以截断后的长度是 501 / 201 / 501,按长度做校验时要算上它。
+`messages` 里的每一项都是摘要，字段名带 `_excerpt` 后缀，超出上限的部分被截掉、末尾补一个 `…`。三个上限是：正文 500 字符、工具参数 200 字符、工具结果 500 字符；补上的 `…` 也算一个字符，所以截断后的长度是 501 / 201 / 501，按长度做校验时要算上它。
 
 摘要按 `type` 分三种结构：
 
 - `ai`——`{type, content_excerpt}`；只有这一步真的发起了工具调用时，才多一个 `tool_calls: [{name, args_excerpt}]`。
 - `tool`——`{type, name, tool_result_excerpt}`；沙箱执行类工具还多一个 `exec: {exit_code, timed_out, stdout_excerpt, stderr_excerpt}`。
 - 其余 `type`——`{type, content_excerpt}`。
-:::
 
-::: warning 摘要同样带有防注入包装
 `_excerpt` 字段没有去掉防注入包装。显示给用户之前要按上文「工具结果文本的还原」处理，做法完全相同。
-:::
 
 #### kind 为 end 时的 data
 
@@ -629,11 +614,7 @@ function onUpdates(data) {
 | `llm_call_count` | integer | 这个子任务内部发起的模型调用次数，非负整数 |
 | `wall_clock_ms` | integer | 这个子任务从开始到结束的墙钟耗时，单位毫秒，非负整数 |
 
-::: warning 子任务异常终止时不会有 kind 为 end 的事件
-上面三个 `outcome` 覆盖的是正常收尾的三种情况。子任务因为未捕获的异常终止时，平台不发这条事件，这个子任务就此没有后续事件。
-
-因此不要把「收到 `end`」当作子任务一定会走到的终点。父 run 的 `end` 到达时，把所有还停在「运行中」的子任务卡收掉，标为「结果未知」。
-:::
+这三个 `outcome` 覆盖的是正常收尾的三种情况。子任务因为未捕获的异常终止时，平台不发这条事件，这个子任务就此没有后续事件；客户端的处置方式见本节「什么时候发」的第二条容错规则。
 
 #### 示例
 
@@ -718,17 +699,9 @@ function onWorker(w) {
 
 三道限制的 `tripped` 出自同一个判断，因此同一步可能一次到达两条或三条 `tripped`，客户端不要假设一轮只有一条。
 
-::: tip 只有 token_budget 会发 warning
-预警在用量达到预算 80% 时发一次，整棵委托树只发一次。`max_steps` 与 `no_progress` 当前只有 `tripped`，没有预警；不要写一个等待 `max_steps` 预警的分支，它不会到达。
-:::
+三道限制里只有 `token_budget` 会发 `warning`：用量达到预算 80% 时发一次，整棵委托树只发一次。`max_steps` 与 `no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它们预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
 
-::: warning 收到 guard 时不要按错误显示
-`kind` 为 `tripped` 表示平台主动为这一轮对话收了尾：追加一条收尾指令，并且这一步不再提供任何工具，模型直接作答。用户仍然拿到一段完整回答，不是执行崩溃，所以界面上给一个「已到上限」的提示即可。
-
-`kind` 为 `warning` 更轻，只表示接近上限，不代表任何收尾动作已经发生。
-:::
-
-上面这条结论只适用于 `guard` 事件本身。`guard` 为 `max_steps` 的那一路收尾之后，这次 run 在 `end` 事件里的 `status` 仍然是 `error`。**run 成功还是失败，以 `end` 的 `status` 为准。**
+「不按错误显示」只适用于 `guard` 事件本身。`guard` 为 `max_steps` 的那一路收尾之后，这次 run 在 `end` 事件里的 `status` 仍然是 `error`。**run 成功还是失败，以 `end` 的 `status` 为准。**
 
 #### 示例
 
@@ -781,11 +754,7 @@ function onGuard(data) {
 | `tokens_after` | integer | 压缩后的上下文大小，是估算值，非负整数，与 `tokens_before` 采用同一种估算方式 |
 | `summary_chars` | integer | 结果里那条摘要的字符数，非负整数；没有摘要时是 `0` |
 
-::: warning 这四个数只用于提示
-`tokens_before` 与 `tokens_after` 都是按字符数折算出来的估算值，既不是计费依据，也不是模型返回的真实用量。真实用量在 `updates` 里 `ai` 消息的 `usage_metadata` 中。
-
-正因为是两次估算，两者相减可能是负数。要显示「节省了多少」，先把下界夹住，下面的示例使用的是 `Math.max(0, …)`；否则用户会看到「节省约 -37 token」。
-:::
+这四个数只用于提示。`tokens_before` 与 `tokens_after` 都是按字符数折算出来的估算值，既不是计费依据，也不是模型返回的真实用量，真实用量在 `updates` 里 `ai` 消息的 `usage_metadata` 中。正因为是两次估算，两者相减可能是负数：要显示「节省了多少」，先把下界夹住，下面的示例使用的是 `Math.max(0, …)`，否则用户会看到「节省约 -37 token」。
 
 #### 示例
 
@@ -845,7 +814,7 @@ run 走到人工审批点、停下等待人决策时，服务端发一次到当�
 | `node` | string | 提出这次审批请求的步骤。恒为 `tools`，审批都由执行工具的那一步提出，客户端不需要按它分支 |
 | `reason_kind` | string | 为什么要审批。五个取值见下表 |
 | `action_summary` | string | 一句话说明在等待批准什么，可以直接显示给用户 |
-| `proposed_args` | object | 待批准的工具调用参数，键随这个工具而定。审批时可以修改，改法见 4.2 |
+| `proposed_args` | object | 待批准的工具调用参数，键随这个工具而定。审批时可以修改，改法见 [4.2 审批决策](./run-control#_4-2-审批决策) |
 | `requested_at` | string | 发起这次审批的时间，ISO-8601 时间串 |
 | `timeout_at` | string | 这次审批的超时时间点，ISO-8601 时间串。超过这个时间点会被后台按「拒绝」处理 |
 | `binding_digest` | string | 参数绑定摘要，平台用来校验参数没有被篡改。客户端不需要处理，原样忽略即可 |
@@ -1193,9 +1162,7 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 
 这份骨架已经覆盖了 3.6 的全部要点：自设读超时、按最大 seq 维护续传位置、按 seq 精确去重、`truncated` 自动翻页、不认识的事件忽略、循环有上限。
 
-::: tip 审批决策之后是另一个 run
 提交审批决策（见 [4.2 审批决策](./run-control#_4-2-审批决策)）之后，平台开的是一个新的 `run_id`，不是把原来那个接着执行。因此不要用旧 `run_id` 重连：从响应头 `X-Expert-Work-Run-Id` 取新的那个，然后从上面循环里 `consume(await fetch(url))` 那一步进入，续传位置重新从头计算，`maxSeq` 记得清空。
-:::
 
 ## 3.6 断线重连与续传
 
@@ -1216,7 +1183,7 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 
 查询参数两个：
 
-| 参数 | 是否必填 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
 | `user_id` | 是 | 发起这次 run 的那个终端用户 id。传成别的值返回 `404` |
 | `since_seq` | 否 | 续传位置，服务端只发 seq 严格大于它的事件。取值必须大于等于 `0`，负数返回 `422`；不带它的后果见下面的提示 |
@@ -1271,7 +1238,7 @@ sequenceDiagram
 
 `since_seq` 的语义是开区间：服务端只发 seq 严格大于它的事件，客户端传回去的那一个不会重复发送。
 
-::: danger 重连一定要带 since_seq
+::: warning 重连一定要带 since_seq
 不带不会报错，但服务端会把这个 run 从第 0 个事件起整个重发一遍。长 run 上这意味着大量重复事件，而且可能触发下面的分页。
 :::
 
@@ -1312,7 +1279,7 @@ seq: 0, 1, 2, 5, 6, 3, 4, 7
 
 **这两个之外没有第三个来源**：不要自行计算、不要自行加一、不要用客户端本地的消息条数去凑。
 
-::: danger 超出范围的 since_seq 不会报错
+::: warning 超出范围的 since_seq 不会报错
 传一个超出范围的值，服务端不返回错误，而是什么都不发。两种情形的表现还不一样：
 
 - run 还在执行时，客户端只会收到心跳，以及它走到最终状态时的那个 `end`；
@@ -1366,11 +1333,9 @@ function onGap(data) {
 }
 ```
 
-::: warning gap 不代表这些事件不存在
-多数情况下它们只是当时还没有记录完成（事件的持久化是异步批量进行的），或者已经滚出了服务端的实时缓冲。**run 结束后重新发起一次不带 `since_seq` 的完整续传，通常能完整取到。**
+`gap` 不代表这些事件不存在：多数情况下它们只是当时还没有记录完成（事件的持久化是异步批量进行的），或者已经滚出了服务端的实时缓冲。**run 结束后重新发起一次不带 `since_seq` 的完整续传，通常能完整取到。**
 
 `gap` 没有 `id:` 行，服务端不记录它，它也不参与续传位置的计算。
-:::
 
 ::: tip 什么时候该校验 seq 连续性
 run 还在执行时不要校验：补发的事件可能乱序到达，连续性要等流结束之后再算。完整续传上可以校验，而且一旦发现跳号，就是真的缺失——一次完整续传（不带 `since_seq`）返回的 seq 应当是连续的，出现跳号意味着那几条从来没有被记录，而这种情形不会发送 `gap`。
@@ -1392,11 +1357,7 @@ run 还在执行时不要校验：补发的事件可能乱序到达，连续性�
 |---|---|---|
 | `next_seq` | integer | 下一次请求应当原样传回去的 `since_seq`，非负整数 |
 
-同一个值也在响应头 `X-Expert-Work-Next-Seq` 里，事件和响应头一定同时给出，取值一定一致。
-
-::: tip 为什么两处都给
-中间代理会剥掉它不认识的响应头，而响应体里的事件不会被剥掉，把信号放在流里比放在响应头里稳妥。能读到响应头的客户端直接用响应头，读不到的以事件为准，两条都实现最省心。
-:::
+同一个值也在响应头 `X-Expert-Work-Next-Seq` 里，事件和响应头一定同时给出，取值一定一致。两处都给，是因为中间代理会剥掉它不认识的响应头，而响应体里的事件不会被剥掉。能读到响应头的客户端直接用响应头，读不到的以事件为准，两条都实现最稳妥。
 
 #### 示例
 
@@ -1420,7 +1381,7 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 
 #### 客户端怎么处理
 
-`truncated` 本身没有可显示的内容，它触发的是「再拉一页」这个动作,3.5 的骨架已经实现了。
+`truncated` 本身没有可显示的内容，它触发的是「再拉一页」这个动作，3.5 的骨架已经实现了。
 
 ```js [示例代码]
 // 在 consume() 里:收到 truncated 就带 next_seq 再来一次,不要当作流结束
@@ -1430,14 +1391,10 @@ if (ev.event === "truncated") {
 }
 ```
 
-::: danger truncated 不是终点
+::: warning truncated 不是终点
 那一页里没有 `end`，也就没有最终 `status`，不循环拉完就无从知道这次 run 是成功、被取消，还是在等待审批。把 `truncated` 当成流结束会静默丢掉后面所有事件。
 
 同时，给翻页循环加一个上限。不要写一个理论上能无限拉下去的循环，超过设定的页数上限就告警，不要默默空转。
 :::
 
-::: warning 重试 POST 请求时收到 truncated 的翻页方式
-带同一个 `Idempotency-Key` 重试 `POST .../runs`（`mode: "stream"`）时，拿到的是同一份续传输出，同样会截断。但 `POST .../runs` 的请求体和查询参数里都没有 `since_seq`，原样重发这个 `POST` 只会一直拿回同一个第一页。
-
-翻页必须换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}&since_seq={next_seq}`，其中 `run_id` 从响应头 `X-Expert-Work-Run-Id` 取。
-:::
+带同一个 `Idempotency-Key` 重试 `POST .../runs`（`mode: "stream"`）时，拿到的是同一份续传输出，同样会截断。但 `POST .../runs` 的请求体和查询参数里都没有 `since_seq`，原样重发这个 `POST` 只会一直拿回同一个第一页。这种情况下翻页必须换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}&since_seq={next_seq}`，其中 `run_id` 从响应头 `X-Expert-Work-Run-Id` 取。
