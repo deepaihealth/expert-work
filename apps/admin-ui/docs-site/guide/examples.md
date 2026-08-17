@@ -42,17 +42,9 @@ AGENT_CODE = "{agent_code}"  # 替换成你的 agent_code
 
 def iter_sse_frames(response):
     """
-    按行读(response.readline()),攒到一个空行才 yield 整条事件——①一条事件可能有
-    id / event / data 好几行,必须攒够一整条事件(遇到空行)才能处理,逐行单独处理会把
-    一条事件拆散。
-
-    这里特意用 response.readline() 而不是 response.read(1024) 这种按固定字节数读的
-    写法——`response` 是 chunked 传输编码,Python 的 http.client 为了凑够调用方要求
-    的字节数,会在当前已到手的数据不够时反复等下一个 HTTP chunk;这条连接一旦读超时,
-    已经到手但不满请求字节数的数据会被整个丢弃。哪怕不超时,也会表现成"stream 模式
-    不流式、界面攒够一批才一次性出字、看起来卡住"——容易被第三方误判成平台的问题。
-    readline() 天然按需向底层多次取数据直到凑出一整行,一行(遇到 SSE 事件内单个字段的
-    行尾 "\n")一到就返回,不会有这个"为了凑够定长反而卡住"的毛病。
+    ①按行读(response.readline()),攒到一个空行才 yield 整条事件。别改成
+    response.read(1024) 这种按固定字节数读的写法——为什么,见 3.5「第一步:把
+    字节流切成事件」。
     """
     lines = []
     while True:
