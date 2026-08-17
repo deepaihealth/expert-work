@@ -947,7 +947,7 @@ public class QueueAndPoll {
 
 ## 10.3 上传文件并带进 run
 
-先调上传接口拿 `upload_id`,再原样放进 `files[]` 发起 run。下面示例传一份文档(`type: "document"`);图片走法一样,唯一区别是 `upload_id` 的格式(`expert_work://image/...`),细节见 [2.6 带图片和文档](./chat#_2-6-带图片和文档) 的「`files[]`」一节。
+先调上传接口拿 `upload_id`,再原样放进 `files[]` 发起 run。下面示例传一份文档;文档与图片拿到的 `upload_id` 形状相同,走法完全一样,细节见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
 
 ::: code-group
 
@@ -957,7 +957,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/uploads" \
   -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}" \
   -F "user_id=u-123" \
   -F "file=@report.pdf;type=application/pdf"
-# → data.upload_id 形如 "uploads/report.pdf",原样回传,不要自己截取或改写
+# → data.upload_id 形如 "upl_3f2c9a1e-7b44-4d3e-9c1a-2f6d0e8b5a17",原样回传,不要自己截取或改写
 
 # 把 upload_id 放进 files[],发起 run(upload_id / session_id 换成上一步返回的值)
 curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs" \
@@ -969,7 +969,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs" \
     "input": "帮我看看这份文件",
     "mode": "queue",
     "files": [
-      { "type": "document", "transfer_method": "local_file", "upload_id": "uploads/report.pdf" }
+      { "upload_id": "upl_3f2c9a1e-7b44-4d3e-9c1a-2f6d0e8b5a17" }
     ]
   }'
 ```
@@ -1056,7 +1056,7 @@ def upload_file(user_id, file_path):
     return payload["data"]  # {"upload_id": ..., "session_id": ..., "type": ..., "mime": ..., "size": ...}
 
 
-def run_with_attachment(user_id, session_id, upload_id, upload_type, input_text):
+def run_with_attachment(user_id, session_id, upload_id, input_text):
     url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs"
     body = json.dumps(
         {
@@ -1064,9 +1064,7 @@ def run_with_attachment(user_id, session_id, upload_id, upload_type, input_text)
             "session_id": session_id,
             "input": input_text,
             "mode": "queue",
-            "files": [
-                {"type": upload_type, "transfer_method": "local_file", "upload_id": upload_id}
-            ],
+            "files": [{"upload_id": upload_id}],
         }
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -1088,7 +1086,6 @@ if __name__ == "__main__":
         "u-123",
         upload["session_id"],
         upload["upload_id"],
-        upload["type"],
         "帮我看看这份文件",
     )
     print(result)
@@ -1156,7 +1153,7 @@ async function uploadFile(userId, filePath) {
   return payload.data; // {"upload_id": ..., "session_id": ..., "type": ..., "mime": ..., "size": ...}
 }
 
-async function runWithAttachment(userId, sessionId, uploadId, uploadType, inputText) {
+async function runWithAttachment(userId, sessionId, uploadId, inputText) {
   const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs`;
   const response = await fetch(url, {
     method: "POST",
@@ -1169,7 +1166,7 @@ async function runWithAttachment(userId, sessionId, uploadId, uploadType, inputT
       session_id: sessionId,
       input: inputText,
       mode: "queue",
-      files: [{ type: uploadType, transfer_method: "local_file", upload_id: uploadId }],
+      files: [{ upload_id: uploadId }],
     }),
   });
   if (!response.ok) {
@@ -1184,7 +1181,6 @@ async function main() {
     "u-123",
     upload.session_id,
     upload.upload_id,
-    upload.type,
     "帮我看看这份文件"
   );
   console.log(result);
@@ -1417,7 +1413,7 @@ public class UploadAndRun {
     }
 
     static String runWithAttachment(
-            String userId, String sessionId, String uploadId, String uploadType, String inputText)
+            String userId, String sessionId, String uploadId, String inputText)
             throws IOException {
         URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
@@ -1431,8 +1427,7 @@ public class UploadAndRun {
                 + "\"session_id\":\"" + jsonEscape(sessionId) + "\","
                 + "\"input\":\"" + jsonEscape(inputText) + "\","
                 + "\"mode\":\"queue\","
-                + "\"files\":[{\"type\":\"" + jsonEscape(uploadType) + "\",\"transfer_method\":\"local_file\","
-                + "\"upload_id\":\"" + jsonEscape(uploadId) + "\"}]"
+                + "\"files\":[{\"upload_id\":\"" + jsonEscape(uploadId) + "\"}]"
                 + "}";
         try (OutputStream out = connection.getOutputStream()) {
             out.write(body.getBytes(StandardCharsets.UTF_8));
@@ -1456,8 +1451,7 @@ public class UploadAndRun {
         String upload = uploadFile("u-123", "report.pdf");
         String sessionId = jsonValue(upload, "session_id");
         String uploadId = jsonValue(upload, "upload_id");
-        String uploadType = jsonValue(upload, "type");
-        String result = runWithAttachment("u-123", sessionId, uploadId, uploadType, "帮我看看这份文件");
+        String result = runWithAttachment("u-123", sessionId, uploadId, "帮我看看这份文件");
         System.out.println(result);
     }
 }
