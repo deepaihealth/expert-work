@@ -472,7 +472,13 @@ def build_external_uploads_router() -> APIRouter:
             except ValueError:
                 return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
             image_row = await images.get(image_id=image_id, tenant_id=tenant_id)
-            if image_row is None:
+            # ``ImageUploadStore.get`` does not filter ``deleted_at`` — the
+            # caller must (same contract ``uploads.py``'s console-side
+            # ``delete_image`` documents: ``if row is None or row.deleted_at
+            # is not None``). Without this, a console-deleted image whose
+            # bytes are still awaiting the retention sweep stays downloadable
+            # to a third party through this endpoint.
+            if image_row is None or image_row.deleted_at is not None:
                 return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
             if store is None:
                 return _upload_download_error(
@@ -489,7 +495,9 @@ def build_external_uploads_router() -> APIRouter:
             # dispatch is purely extension-based in every branch (`kind` is
             # `del`eted, unused, even in its own fallback branch — verified by
             # reading its body) — "other" is chosen for readability, not
-            # because it changes the inferred MIME/disposition.
+            # because it changes the inferred disposition (the only field of
+            # ``inferred`` this endpoint still reads — see the Content-Type
+            # comment below).
             inferred = infer_content_type(kind="other", path=row.filename)
 
         headers = {
@@ -498,6 +506,15 @@ def build_external_uploads_router() -> APIRouter:
             ),
             "X-Content-Type-Options": "nosniff",
         }
-        return Response(content=data, media_type=inferred.content_type, headers=headers)
+        # spec §一.3 — Content-Type is the MIME recorded at upload time
+        # (``row.mime_type``), NOT ``infer_content_type``'s extension-based
+        # guess: that guess falls to ``application/octet-stream`` for
+        # ``application/pdf`` / the three ``openxmlformats`` document types
+        # (none are in ``_artifact_mime``'s whitelist) and to ``text/plain``
+        # for ``.csv`` (whose real MIME is ``text/csv``). Only the
+        # DISPOSITION side of ``infer_content_type``'s verdict is used —
+        # the active-content-forces-attachment / unknown-forces-attachment
+        # rule stays in force regardless of what MIME the upload declared.
+        return Response(content=data, media_type=row.mime_type, headers=headers)
 
     return router

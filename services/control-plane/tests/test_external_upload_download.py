@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -265,6 +266,52 @@ def seed_image_upload_row_only(
 
 
 @pytest.fixture
+def seed_soft_deleted_image(
+    _ctx: _Ctx, user_store: TenantUserStore
+) -> Callable[..., Awaitable[str]]:
+    """Like ``seed_image``, but the ``image_upload`` row is soft-deleted
+    (console-side ``delete_image`` shape) right after being created — the
+    "console deleted it, retention hasn't reaped the bytes yet" 404 case.
+    Returns the rendered ``upl_<uuid>`` id."""
+
+    async def _seed(*, user_id: str, ext: str, content: bytes, mime: str) -> str:
+        owner = await _resolve(user_store, user_id)
+        thread_id = uuid4()
+        image_id = uuid4()
+        image_ref = ImageRef(tenant_id=_TENANT_ID, thread_id=thread_id, image_id=image_id, ext=ext)
+        await _ctx.images.insert(
+            image_id=image_id,
+            tenant_id=_TENANT_ID,
+            thread_id=thread_id,
+            user_id=owner,
+            object_key=image_ref.storage_key,
+            size_bytes=len(content),
+            mime_type=mime,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        await _ctx.object_store.put(image_ref.storage_key, content, content_type=mime)
+        flipped = await _ctx.images.soft_delete(
+            image_id=image_id, tenant_id=_TENANT_ID, now=datetime.now(UTC)
+        )
+        assert flipped, "seed_soft_deleted_image: soft_delete did not hit the row it just inserted"
+        upload_id = uuid4()
+        row = await _ctx.uploads.insert(
+            upload_id=upload_id,
+            tenant_id=_TENANT_ID,
+            user_id=owner,
+            thread_id=thread_id,
+            kind="image",
+            ref=image_ref.to_uri(),
+            mime_type=mime,
+            size_bytes=len(content),
+            filename=f"{image_id}{ext}",
+        )
+        return render_upload_id(row.id)
+
+    return _seed
+
+
+@pytest.fixture
 def break_workspace_permission(_ctx: _Ctx) -> Callable[[], None]:
     """Make the next ``workspace_store.read_file`` call raise
     ``WorkspacePermissionError`` — the download handler's permission-failure
@@ -325,6 +372,44 @@ async def test_download_document_html_forces_attachment(external_client, seed_do
 
 
 @pytest.mark.asyncio
+async def test_download_document_pdf_content_type_is_upload_time_mime(
+    external_client, seed_document
+) -> None:
+    """spec §一.3:Content-Type 是上传时记录的 MIME(``row.mime_type``),不是
+    ``infer_content_type`` 的扩展名猜测——``.pdf`` 不在 ``_artifact_mime`` 的
+    任何白名单表里,猜测会落到 ``application/octet-stream``。disposition 仍
+    走白名单规则:未识别扩展名 → attachment。"""
+    upload_id = await seed_document(
+        user_id="u-1", filename="report.pdf", content=b"%PDF-1.4", mime="application/pdf"
+    )
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("application/pdf")
+    assert resp.headers["content-disposition"].startswith("attachment")
+
+
+@pytest.mark.asyncio
+async def test_download_document_csv_content_type_is_upload_time_mime(
+    external_client, seed_document
+) -> None:
+    """同上,反方向的例子:``.csv`` 在 ``_artifact_mime`` 白名单里会被猜成
+    ``text/plain``(它落在 text-like 分支),但真实 MIME 是 ``text/csv``。"""
+    upload_id = await seed_document(
+        user_id="u-1", filename="data.csv", content=b"a,b\n1,2", mime="text/csv"
+    )
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 200, resp.text
+    # Starlette's ``Response`` appends ``; charset=utf-8`` to any ``text/*``
+    # media type automatically — assert the MIME prefix, same convention the
+    # ``.pdf`` test above uses.
+    assert resp.headers["content-type"].startswith("text/csv")
+
+
+@pytest.mark.asyncio
 async def test_download_image_png_is_inline_with_nosniff(external_client, seed_image) -> None:
     upload_id = await seed_image(
         user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
@@ -382,6 +467,7 @@ async def test_row_owned_by_a_different_known_user_is_404(external_client, seed_
         f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "user-b"}
     )
     assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
     assert resp.content != b"user-a stuff"
 
 
@@ -390,6 +476,21 @@ async def test_image_row_present_but_image_upload_missing_is_404(
     external_client, seed_image_upload_row_only
 ) -> None:
     upload_id = await seed_image_upload_row_only(user_id="u-1")
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_image_upload_is_404(external_client, seed_soft_deleted_image) -> None:
+    """console 侧软删了这张图(``deleted_at`` 已设,字节还没等到 retention
+    扫过)——``ImageUploadStore.get`` 不过滤 ``deleted_at``,调用方必须自己判。
+    没有这道判,第三方仍能下到一张已被用户删除的图。"""
+    upload_id = await seed_soft_deleted_image(
+        user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
+    )
     resp = await external_client.get(
         f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
     )
