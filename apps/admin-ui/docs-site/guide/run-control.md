@@ -148,12 +148,12 @@ sequenceDiagram
 
 #### reason 的作用范围
 
-`reason` 只在 `decision: "reject"` 时有实际效果：它的文本会被塞进这次工具调用返回给 Agent 的结果消息里（类似 `[approval rejected] <reason>`），Agent 能看到这句话并据此调整。
+`reason` 只在 `decision: "reject"` 时有实际效果：它的文本会被塞进这次工具调用返回给 Agent 的结果消息里（类似 `[approval rejected] {reason}`），Agent 能看到这句话并据此调整。
 
 `approve` / `modify` 下传 `reason` 不会报错，但也不会被使用——**它不会写进审计日志，也不会出现在任何 SSE 事件里**，只在这次续跑内部短暂存在。想让拒绝理由可追溯，记在你自己的系统里。
 
 ```bash [请求]
-curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:decide \
+curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve", "mode": "queue"}'
@@ -163,29 +163,29 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:decide \
 
 行为取决于 `mode`，以及这次决策是不是一次**幂等重放**（带着和某次已完成决策相同的 `idempotency_key` 重试）：
 
-::: code-group
+#### stream 模式（默认）
 
-```bash [stream（默认）]
+```bash [请求]
 curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide" \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve"}'
-
-# 非重放时:响应 200,Content-Type: text/event-stream
-# 响应头 X-Expert-Work-Run-Id: 7c9e6679-7425-40de-944b-e07fc1f90ae7（续跑的新 run_id）
-# 响应体就是续跑的 SSE 事件流本身,事件格式见「3 读懂 SSE 流」
-#
-# 命中幂等重放时(没有正在执行的续跑可接流),退化成 200 JSON,
-# 形状和 queue 标签页的响应体一样
 ```
 
-```bash [queue]
+非重放时，响应是 200，`Content-Type: text/event-stream`，响应头 `X-Expert-Work-Run-Id: 7c9e6679-7425-40de-944b-e07fc1f90ae7`（续跑的新 run_id），响应体就是续跑的 SSE 事件流本身，事件格式见「3 读懂 SSE 流」。
+
+命中幂等重放时（没有正在执行的续跑可接流），退化成 200 JSON，形状和下面 queue 模式的响应体一样。
+
+#### queue 模式
+
+```bash [请求]
 curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41d4-a716-446655440000:decide" \
   -H "Authorization: Bearer <key>" \
   -H "Content-Type: application/json" \
   -d '{"user_id": "u-123", "decision": "approve", "mode": "queue"}'
+```
 
-# 响应 202,响应头 X-Expert-Work-Run-Id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+```json [响应 202]
 {
   "success": true,
   "data": { "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7" },
@@ -193,7 +193,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/550e8400-e29b-41
 }
 ```
 
-:::
+响应头同样带 `X-Expert-Work-Run-Id: 7c9e6679-7425-40de-944b-e07fc1f90ae7`。
 
 三种情况汇总：
 
