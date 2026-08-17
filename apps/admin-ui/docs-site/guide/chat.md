@@ -140,7 +140,7 @@ sequenceDiagram
 
 会话的重命名、归档、历史消息查询见 [5 查询与管理](./query)。
 
-#### 提前拿一个 session_id
+### 提前拿一个 session_id
 
 想在发起第一次对话**之前**就拿到一个 `session_id`（最常见的用途：先把附件绑到这段会话上，再发起带这些附件的 run），调这个端点：
 
@@ -172,19 +172,18 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/sessions \
     "agent_code": "my-agent",
     "agent_version": "1.0.0",
     "user_id": "3b0c7f26-51ad-4a92-8f0e-1c7d9b6e4a35"
-  },
-  "error": null
+  }
 }
 ```
 
-响应字段：
+这个端点的成功响应**不带 `error` 这个键**（见 [7.5 统一响应格式](./conventions#_7-5-统一响应格式) 的第一条例外）。响应字段：
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `session_id` | UUID | 这次新建（或续接）的会话 id。原样填进后续请求体的 `session_id` |
-| `agent_code` | string | 路径里传的那个 `agent_code`，原样回显 |
-| `agent_version` | string | 这段会话绑定到的 Agent 版本号 |
-| `user_id` | UUID | 平台为这个终端用户铸出的内部标识，**不是**你传进来的那个 `user_id`——后续请求仍然传你自己的值 |
+| 字段 | 类型 | 含义 | 取值 |
+|---|---|---|---|
+| `session_id` | UUID | 这次新建（或续接）的会话 id | 标准 UUID。原样填进后续请求体的 `session_id` |
+| `agent_code` | string | 路径里传的那个 `agent_code`，原样回显 | 与你请求路径里的值相同 |
+| `agent_version` | string | 这段会话绑定到的 Agent 版本号 | 该 Agent 当前已发布版本的版本号字符串 |
+| `user_id` | UUID | 平台为这个终端用户铸出的内部标识 | 标准 UUID，**不是**你传进来的那个 `user_id`——后续请求仍然传你自己的值 |
 
 失败情况（都能读到 `error.code`）：
 

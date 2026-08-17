@@ -61,7 +61,7 @@ flowchart LR
 |---|---|
 | 发起对话，`mode: "stream"` | 响应头 `X-Expert-Work-Session-Id` |
 | 发起对话，`mode: "queue"` | **没有响应头**，读 202 响应体的 `data.thread_id`（字段名叫 `thread_id`，与 `session_id` 是同一个值，下次续接时仍填进请求体的 `session_id`） |
-| [预建会话](./chat#提前拿一个-session-id) `POST /v1/agents/{agent_code}/sessions` | 响应体 `data.session_id` |
+| [提前拿一个 session_id](./chat#提前拿一个-session-id) `POST /v1/agents/{agent_code}/sessions` | 响应体 `data.session_id` |
 | 上传附件 `POST /v1/agents/{agent_code}/uploads` | 响应体 `data.session_id` |
 
 别假设所有端点用同一个字段名，或者都走响应头。
