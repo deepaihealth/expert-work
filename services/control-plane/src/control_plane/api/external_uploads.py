@@ -76,7 +76,7 @@ from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import Principal, QuotaDimension, parse_upload_id, render_upload_id
 from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore
+from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore, ObjectStoreError
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 
 logger = logging.getLogger("expert_work.control_plane.external_uploads")
@@ -410,10 +410,10 @@ def build_external_uploads_router() -> APIRouter:
         Structural mirror of ``external_artifacts.download_artifact``:
         success is the raw file body, not the ``{success, data, error}``
         envelope (see ``_upload_download_error``'s docstring); only error
-        paths render it. ``mint=False`` — an unrecognized ``user_id`` must
-        not mint a ``tenant_user`` row just because a third party probed
-        this GET (same P1 review T3 rule every other external read
-        endpoint follows).
+        paths render it. ``lookup_external_user_id`` never mints — an
+        unrecognized ``user_id`` must not create a ``tenant_user`` row just
+        because a third party probed this GET (same P1 review T3 rule every
+        other external read endpoint follows).
         """
         del agent_code  # uploads are (tenant, user)-scoped — mirrors external_artifacts.
         tenant_id: UUID = request.state.tenant_id
@@ -488,6 +488,19 @@ def build_external_uploads_router() -> APIRouter:
                 data = await store.get(image_row.object_key)
             except ObjectNotFoundError:
                 return _upload_download_error("UPLOAD_NOT_FOUND", "upload content not found", 404)
+            except ObjectStoreError:
+                # 对象未丢(上面已排除),但读不动——凭证 / bucket 策略 / 存储侧
+                # 5xx 等。同一条「底层读不动就是 500,不能让它逃逸成裸异常」
+                # 规则,同文档分支的 WorkspacePermissionError 处理(本文件
+                # docstring 第 36-38 行);ObjectNotFoundError 是 ObjectStoreError
+                # 的子类,顺序必须子类在前(同 WorkspacePermissionError /
+                # SandboxSupervisorError 那对的顺序规则)。traceback 只进日志。
+                logger.warning(
+                    "external_upload.object_store_failed upload_id=%s", parsed_id, exc_info=True
+                )
+                return _upload_download_error(
+                    "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
+                )
             # ArtifactKind (expert_work.protocol.artifact) has no "image"
             # value — Literal["document", "code", "data", "other"] — so
             # "other" is the closest fit (not "document"/"code"/"data").

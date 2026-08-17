@@ -31,6 +31,7 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, CheckResult, QuotaDimension, parse_upload_id
+from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import InMemoryObjectStore
@@ -222,6 +223,11 @@ async def test_upload_image_without_session_creates_one(ctx: _Ctx) -> None:
     assert user_upload_row.kind == "image"
     assert user_upload_row.ref.startswith("expert_work://image/")
     assert user_upload_row.user_id == end_user.id
+    # The ref's embedded thread segment must be the row's own thread_id —
+    # this is the invariant that makes the download endpoint's image branch
+    # able to trust ``parse_image_ref(row.ref)`` without a mismatch ever
+    # producing the old bare ``{"detail": "image ref not found"}`` shape.
+    assert parse_image_ref(user_upload_row.ref).thread_id == user_upload_row.thread_id
 
 
 @pytest.mark.asyncio

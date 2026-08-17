@@ -161,6 +161,14 @@ class S3CompatibleObjectStore:
         except self._client.exceptions.NoSuchKey as exc:
             msg = f"object not found: {key!r}"
             raise ObjectNotFoundError(msg) from exc
+        except self._client.exceptions.ClientError as exc:
+            # Credential / bucket-policy / storage-side 5xx errors surface
+            # here — everything that isn't "the key is missing". Wrap so
+            # call sites don't have to know about botocore exception shapes
+            # (same rule ``put`` / ``put_stream`` / ``list_prefix`` already
+            # follow in this class).
+            msg = f"get failed: {key!r}: {exc}"
+            raise ObjectStoreError(msg) from exc
 
         async with response["Body"] as stream:
             data: bytes = await stream.read()

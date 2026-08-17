@@ -32,7 +32,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import render_upload_id
 from expert_work.protocol.multimodal import ImageRef
-from expert_work.runtime.storage import InMemoryObjectStore
+from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
 from orchestrator.tools import (
     RecordingWorkspaceStore,
     SandboxSupervisorError,
@@ -336,6 +336,21 @@ def break_workspace_sandbox(_ctx: _Ctx) -> Callable[[], None]:
     return _break
 
 
+@pytest.fixture
+def break_object_store(_ctx: _Ctx, monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """Make the next ``store.get`` call raise ``ObjectStoreError`` — not
+    ``ObjectNotFoundError`` — the "object store is broken, not merely empty"
+    500 path (external-upload-unification 终审修复 A1)."""
+
+    def _break() -> None:
+        async def _raise(key: str) -> bytes:
+            raise ObjectStoreError("boom")
+
+        monkeypatch.setattr(_ctx.object_store, "get", _raise)
+
+    return _break
+
+
 # ---------------------------------------------------------------------------
 # Success paths
 # ---------------------------------------------------------------------------
@@ -537,3 +552,56 @@ async def test_requires_read_scope(external_client_no_scope) -> None:
         f"/v1/agents/test-agent/uploads/{render_upload_id(uuid4())}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_object_store_error_is_500_content_unavailable(
+    external_client, seed_image, break_object_store
+) -> None:
+    """终审修复 A1:对象没丢(不是 ``ObjectNotFoundError``),但对象存储读不动
+    (凭证 / bucket 策略 / 存储侧 5xx 等)——必须落进 ``{success, data, error}``
+    信封的 500 ``UPLOAD_CONTENT_UNAVAILABLE``,不能逃逸成裸 500。"""
+    upload_id = await seed_image(
+        user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
+    )
+    break_object_store()
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 500, resp.text
+    assert resp.json() == {
+        "success": False,
+        "data": None,
+        "error": {"code": "UPLOAD_CONTENT_UNAVAILABLE", "message": "upload content unavailable"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_document_workspace_store_none_is_503(
+    external_client, seed_document, _ctx: _Ctx
+) -> None:
+    """spec §一.3 / errors.md 8.14:文档分支的存储通路(工作区)整体没配置
+    是 503,不是 404 也不是 500。"""
+    upload_id = await seed_document(
+        user_id="u-1", filename="report.txt", content=b"x", mime="text/plain"
+    )
+    _ctx.app.state.workspace_store = None  # type: ignore[attr-defined]
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["code"] == "UPLOAD_CONTENT_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_image_object_store_none_is_503(external_client, seed_image, _ctx: _Ctx) -> None:
+    """同上,图片分支的存储通路(对象存储)整体没配置 —— 同一个 503 码。"""
+    upload_id = await seed_image(
+        user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
+    )
+    _ctx.app.state.object_store = None  # type: ignore[attr-defined]
+    resp = await external_client.get(
+        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["code"] == "UPLOAD_CONTENT_UNAVAILABLE"

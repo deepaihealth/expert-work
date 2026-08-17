@@ -574,6 +574,10 @@ async def test_files_array_over_64_is_422(
         json={"user_id": "u1", "input": "x", "mode": "queue", "files": files},
     )
     assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_REQUEST"
 
 
 @pytest.mark.asyncio
