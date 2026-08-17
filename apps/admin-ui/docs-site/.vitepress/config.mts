@@ -143,5 +143,29 @@ export default withMermaid(
         copyright: "文档更新于 2026-08-16",
       },
     },
+    markdown: {
+      config(md) {
+        const fence = md.renderer.rules.fence!
+        md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+          // VitePress 内置 preWrapperPlugin 会在渲染时把 [title] 从 token.info 剥掉
+          // (副作用发生在下面这次 fence() 调用内部),所以必须在调用前先取值
+          const token = tokens[idx]
+          const m = /\[([^\]]+)\]/.exec(token.info)
+          const html = fence(tokens, idx, options, env, self)
+          if (!m) return html
+          // 在 ::: code-group 里,[title] 已经是 tab 名,不再重复画标题栏
+          for (let i = idx - 1; i >= 0; i--) {
+            const t = tokens[i]
+            if (t.type === 'container_code-group_open') return html
+            if (t.type === 'container_code-group_close') break
+          }
+          const title = md.utils.escapeHtml(m[1])
+          return html.replace(
+            /^(<div class="language-[^"]*"[^>]*>)/,
+            `$1<div class="ew-code-title">${title}</div>`
+          )
+        }
+      },
+    },
   }),
 );

@@ -1,0 +1,12 @@
+.vp-doc div[class*='language-'] .ew-code-title {
+  font-family: var(--vp-font-family-base);
+  font-size: 12px; font-weight: 600; letter-spacing: .02em;
+  color: var(--vp-c-text-2);
+  background: var(--vp-code-block-bg);
+  border-bottom: 1px solid var(--vp-c-divider);
+  padding: 8px 20px; margin: 0;
+  border-radius: 8px 8px 0 0;
+}
+.vp-doc div[class*='language-']:has(.ew-code-title) > pre { margin-top: 0; }
+.vp-doc div[class*='language-']:has(.ew-code-title) > .lang { top: 8px; }
+.vp-doc div[class*='language-']:has(.ew-code-title) > .copy { top: 44px; }
