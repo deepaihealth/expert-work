@@ -123,4 +123,5 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | 创建 key、选权限档位、轮换与吊销 | [6 认证与 Key](./auth) |
 | 接口地址、公共请求头与响应头、统一响应格式、限流与配额 | [7 通用约定](./conventions) |
 | 按状态码查错误、按 `error.code` 查含义 | [8 错误码总表](./errors) |
+| 对接前的约定、常见问题、上线前的自测清单 | [9 对接注意事项与常见问题](./best-practices) |
 | 各语言完整可运行示例 | [10 多语言示例](./examples) |

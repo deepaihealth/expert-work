@@ -56,9 +56,9 @@
 | [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-12-500-服务端存储配置问题) | 500 | 附件下载 | 附件的记录还在，但服务端读不到它的内容。重试无效，联系租户管理员 |
 | [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-12-500-服务端存储配置问题) | 500 | 产物下载 | 产物的记录还在，但服务端读不到它的内容。重试无效，联系租户管理员 |
 | [`UPLOAD_FAILED`](#_8-13-502-上传文件时遇到上游错误) | 502 | 上传附件（文档） | 保存文件时遇到上游存储服务的错误。重试无效，联系租户管理员 |
-| [`UPLOAD_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 上传附件 | 服务端没有配置对应的存储通路。重试无效，联系租户管理员 |
-| [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 附件下载 | 服务端没有配置对应的存储通路，与上面 500 是同一个错误码，靠状态码区分。重试无效，联系租户管理员 |
-| [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 产物下载 | 服务端没有配置工作区存储通路，与上面 500 是同一个错误码，靠状态码区分。重试无效，联系租户管理员 |
+| [`UPLOAD_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 上传附件 | 服务端没有配置对应的存储。重试无效，联系租户管理员 |
+| [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 附件下载 | 服务端没有配置对应的存储，与上面 500 是同一个错误码，靠状态码区分。重试无效，联系租户管理员 |
+| [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 产物下载 | 服务端没有配置工作区存储，与上面 500 是同一个错误码，靠状态码区分。重试无效，联系租户管理员 |
 | [`SERVER_OVERLOADED`](#_8-14-503-服务不可用) | 503 | 全部端点 | 服务端整体过载，本次请求被拒绝。按 `Retry-After` 头退避重试 |
 | [`AUTH_BACKEND_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 全部端点 | 认证服务不可用，本次请求无法校验，很少出现。稍后重试，持续失败则联系租户管理员 |
 | [`DEADLINE_EXCEEDED`](#_8-15-504-请求超过截止时间) | 504 | 全部端点，仅在请求带了 `X-Expert-Work-Deadline-Ms` 时 | 请求携带的截止时间已经过去。检查该头的取值，或者不传这个头 |
@@ -76,7 +76,7 @@
 
 大多数失败使用标准格式，能读到 `error.code`：
 
-```json [响应 · 标准格式]
+```json [标准格式]
 {
   "success": false,
   "data": null,
@@ -86,7 +86,7 @@
 
 少数失败使用简易格式，只有一个 `detail` 字段，读不到 `error.code`。`detail` 有时是字符串，有时是 `{"code": ..., "message": ...}` 这样的对象：
 
-```json [响应 · 简易格式]
+```json [简易格式]
 { "detail": "..." }
 ```
 
@@ -94,7 +94,7 @@
 
 - 权限检查不通过的 403，全部端点通用。
 - 发起对话端点的三条校验，都是 422：「这个 Agent 不支持图片输入」「单次 run 的图片数超过上限」，以及 `inputs` 模板变量与 Agent 的声明不匹配。
-- 发起对话时配额服务不可用，503。
+- 发起对话与产物下载时配额服务不可用，503。
 
 请求体与查询参数的格式校验失败是统一处理的，固定为标准格式的 422 `INVALID_REQUEST`。
 
@@ -144,7 +144,7 @@
 
 权限档位不足是最常见的 403，例如用只有 `read` 档位的 key 调用 `POST /v1/agents/{agent_code}/runs`（该接口要求 `write`）。这类 403 是简易格式，错误码在 `detail.code` 里：
 
-```json [响应 · 简易格式]
+```json [响应 403]
 { "detail": { "code": "FORBIDDEN", "message": "principal lacks required role" } }
 ```
 
@@ -241,7 +241,7 @@
 
 这一类是简易格式，只有一个 `detail` 字符串，读不到 `error.code`：
 
-```json [响应 · 简易格式]
+```json [响应 422]
 { "detail": "unknown input variable: foo" }
 ```
 
@@ -299,7 +299,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 | `image_storage_bytes` | 图片存储总字节数配额 | 重试无效。这项配额不随时间回补，联系租户管理员调整 |
 | `artifact_storage_bytes` | 产物存储总字节数配额 | 重试无效。同上 |
 
-频率类（前三行）的 `Retry-After` 通常是几秒。按次数计的 30 天配额（中间两行）也带 `Retry-After`，但它的值是下一次配额回补的时间，可能长达数小时；按字节计的配额（最后两行）不会随时间回补。**不要对所有 `RATE_LIMIT_EXCEEDED` 一律按 `Retry-After` 循环重试**，先读 `dimension`。解析时给 `dimension` 留缺省值：网关这一层的 429 没有这个字段。
+频率类（前三行）的 `Retry-After` 通常是几秒。按次数计的 30 天配额（中间两行）也带 `Retry-After`，但它的值是下一次配额回补的时间，可能长达数小时；按字节计的配额（最后两行）不会随时间回补。**不要对所有 `RATE_LIMIT_EXCEEDED` 都按 `Retry-After` 循环重试**，先读 `dimension`。解析时给 `dimension` 留缺省值：网关这一层的 429 没有这个字段。
 
 哪些接口会遇到：调用频率限制作用于全部接口；图片上传的两项配额出现在上传附件（图片）；产物下载配额出现在产物下载。
 
@@ -323,15 +323,15 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 工作区文件列表（`GET /v1/agents/{agent_code}/workspace/files`）、工作区文件下载（`GET .../workspace/file`）、产物下载（`GET .../artifacts/download`）在服务端存储配置有问题时返回 500，标准格式，三个错误码：
 
-```json [响应 500 WORKSPACE_LIST_FAILED]
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
 ```
 
-```json [响应 500 WORKSPACE_FILE_FAILED]
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
 ```
 
-```json [响应 500 ARTIFACT_CONTENT_UNAVAILABLE]
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "ARTIFACT_CONTENT_UNAVAILABLE", "message": "artifact content unavailable" } }
 ```
 
@@ -341,7 +341,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 上传附件的文档分支保存失败是另一个独立的错误码 `UPLOAD_FAILED`，标准格式：
 
-```json [响应 500 UPLOAD_FAILED]
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "UPLOAD_FAILED", "message": "workspace write failed" } }
 ```
 
@@ -349,7 +349,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 附件下载（`GET /v1/agents/{agent_code}/uploads/{upload_id}`）读不到内容时返回 `UPLOAD_CONTENT_UNAVAILABLE`，标准格式：
 
-```json [响应 500 UPLOAD_CONTENT_UNAVAILABLE]
+```json [响应 500]
 { "success": false, "data": null, "error": { "code": "UPLOAD_CONTENT_UNAVAILABLE", "message": "upload content unavailable" } }
 ```
 
@@ -383,11 +383,11 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 { "success": false, "data": null, "error": { "code": "UPLOAD_UNAVAILABLE", "message": "object store unavailable" } }
 ```
 
-触发条件是服务端没有配置对应的存储通路——图片使用的图片存储、文档使用的工作区存储，任意一处没有配置好都会触发。处理方式：重试无效，联系租户管理员。
+触发条件是服务端没有配置对应的存储——图片使用的图片存储、文档使用的工作区存储，任意一处没有配置好都会触发。处理方式：重试无效，联系租户管理员。
 
-第三种出现在附件下载（`GET /v1/agents/{agent_code}/uploads/{upload_id}`），错误码为 `UPLOAD_CONTENT_UNAVAILABLE`，与 [8.12](#_8-12-500-服务端存储配置问题) 里的 500 是同一个错误码，靠状态码区分：503 表示服务端整体没有配置对应的存储通路，500 表示通路配了但读不到内容。
+第三种出现在附件下载（`GET /v1/agents/{agent_code}/uploads/{upload_id}`），错误码为 `UPLOAD_CONTENT_UNAVAILABLE`，与 [8.12](#_8-12-500-服务端存储配置问题) 里的 500 是同一个错误码，靠状态码区分：503 表示服务端整体没有配置对应的存储，500 表示存储配了但读不到内容。
 
-第四种出现在产物下载（`GET /v1/agents/{agent_code}/artifacts/download`），错误码为 `ARTIFACT_CONTENT_UNAVAILABLE`，同样与 500 共用一个错误码：503 表示服务端没有配置工作区存储通路，500 表示配了但权限有问题。第三种与第四种的处理方式相同：重试无效，联系租户管理员。
+第四种出现在产物下载（`GET /v1/agents/{agent_code}/artifacts/download`），错误码为 `ARTIFACT_CONTENT_UNAVAILABLE`，同样与 500 共用一个错误码：503 表示服务端没有配置工作区存储，500 表示配了但权限有问题。第三种与第四种的处理方式相同：重试无效，联系租户管理员。产物下载在配额服务不可用时另有一个只有 `detail` 字段的 503，见 [8.2](#_8-2-错误响应的两种格式)。
 
 第五种是认证服务不可用（`AUTH_BACKEND_UNAVAILABLE`），任何端点都可能返回，标准格式：本次请求无法完成认证校验。这种情况很少出现，处理方式是稍后重试，持续失败时联系租户管理员。
 

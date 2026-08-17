@@ -43,7 +43,7 @@ Authorization: Bearer <key>   # 需要 write 权限，见「6 认证与 Key」
 Content-Type: application/json
 ```
 
-`{agent_code}` 是租户下已发布、状态为 ACTIVE 的 Agent 名称。同一个名称同时只有一个 ACTIVE 版本生效；该名称下没有 ACTIVE 版本时返回 404（`AGENT_NOT_FOUND`）。
+`{agent_code}` 是租户下已发布且当前生效的 Agent 名称。同一个名称同时只有一个版本生效；该名称下没有生效版本时返回 404（`AGENT_NOT_FOUND`）。
 
 可用的 `agent_code` 通过 [5.1 Agent 目录](./query#_5-1-agent-目录) 查询。示例里的 `https://<your-domain>` 按对接的环境替换，接口地址见 [7.1 环境地址](./conventions#_7-1-环境地址)。
 
@@ -58,15 +58,15 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 请求体只有 `user_id` 必填，其余字段均可省略（不带 `input` 也是合法请求）。请求体不接受下表以外的字段。
 
-| 字段 | 类型 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
-| `user_id` | string | 必填。终端用户在调用方系统里的标识，长度 1–255 字符。作用见下文「`user_id` 的作用」 |
-| `session_id` | UUID | 续接一段已有会话；省略时新建一段。这段会话不属于该 `user_id` 与 `agent_code` 时返回 404（`SESSION_NOT_FOUND`） |
-| `input` | string | 这一轮终端用户说的话或任务描述，不超过 65536 字符 |
-| `mode` | string | 执行模式。取值：`stream`（默认，同步返回 SSE 流）/ `queue`（后台异步执行）。见 [2.4](#_2-4-stream-还是-queue) |
-| `untrusted_content` | string[] | 来自外部、不可信任的文本内容，最多 16 项。见 [2.7](#_2-7-外部内容与模板变量) |
-| `inputs` | object | 提示词模板变量。见 [2.7](#_2-7-外部内容与模板变量) |
-| `files` | array | 附件列表，最多 64 项，每项形如 `{ "upload_id": "…" }`。见 [2.6](#_2-6-带图片和文档) |
+| `user_id` | 是 | string，长度 1–255 字符。终端用户在调用方系统里的标识，作用见下文「`user_id` 的作用」 |
+| `session_id` | 否 | UUID。续接一段已有会话；省略时新建一段。这段会话不属于该 `user_id` 与 `agent_code` 时返回 404（`SESSION_NOT_FOUND`） |
+| `input` | 否 | string，不超过 65536 字符。这一轮终端用户说的话或任务描述 |
+| `mode` | 否 | string。执行模式，取值：`stream`（默认，同步返回 SSE 流）/ `queue`（后台异步执行）。见 [2.4](#_2-4-stream-还是-queue) |
+| `untrusted_content` | 否 | string 数组，最多 16 项。来自外部、不可信任的文本内容。见 [2.7](#_2-7-外部内容与模板变量) |
+| `inputs` | 否 | object。提示词模板变量。见 [2.7](#_2-7-外部内容与模板变量) |
+| `files` | 否 | 数组，最多 64 项，每项形如 `{ "upload_id": "…" }`。附件列表。见 [2.6](#_2-6-带图片和文档) |
 
 ### `user_id` 的作用
 
@@ -91,7 +91,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | 对比维度 | `mode: "stream"` | `mode: "queue"` |
 |---|---|---|
 | 响应 | `200`，`Content-Type: text/event-stream`，响应体是 SSE 流 | `202`，立即返回 JSON，Agent 在后台执行 |
-| 响应头 | 带 `X-Expert-Work-Session-Id` 与 `X-Expert-Work-Run-Id` | 不带这两个头；每种响应都有的 `X-Expert-Work-Trace-Id` 仍然存在 |
+| 响应头 | 带 `X-Expert-Work-Session-Id` 与 `X-Expert-Work-Run-Id` | 不带这两个头；每种响应都有的 `X-Expert-Work-Trace-Id`（见 [7.4 响应头](./conventions#_7-4-响应头)）仍然存在 |
 | 会话 id 的位置 | 响应头 `X-Expert-Work-Session-Id` | 响应体的 `data.thread_id` 字段 |
 | 适用情形 | 需要实时展示生成过程 | 执行时间长、无需实时展示，或调用方不便维持长连接 |
 
@@ -162,10 +162,10 @@ Content-Type: application/json
 
 请求体只有 `user_id` 必填。
 
-| 字段 | 类型 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
-| `user_id` | string | 必填。终端用户在调用方系统里的标识，与发起对话用的是同一个值，长度 1–255 字符 |
-| `session_id` | UUID | 传入时只校验这段会话属于该 `user_id` 与 `agent_code`，不新建；省略时新建一段 |
+| `user_id` | 是 | string，长度 1–255 字符。终端用户在调用方系统里的标识，与发起对话用的是同一个值 |
+| `session_id` | 否 | UUID。传入时只校验这段会话属于该 `user_id` 与 `agent_code`，不新建；省略时新建一段 |
 
 ```bash [请求]
 curl -X POST https://<your-domain>/v1/agents/{agent_code}/sessions \
@@ -242,17 +242,17 @@ Content-Type: multipart/form-data
 
 表单字段：
 
-| 字段 | 类型 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
-| `file` | file | 必填。附件本体。这份文件声明的 `Content-Type` 决定走哪条通路，见下文「允许的文件类型」 |
-| `user_id` | string | 必填。终端用户在调用方系统里的标识，与发起对话用的是同一个值，长度 1–255 字符 |
-| `session_id` | UUID | 这份附件绑定的会话；省略时接口新建一段会话并在响应里返回 |
+| `file` | 是 | 文件本体。这份文件声明的 `Content-Type` 决定它按文档还是按图片处理，见下文「允许的文件类型」 |
+| `user_id` | 是 | string，长度 1–255 字符。终端用户在调用方系统里的标识，与发起对话用的是同一个值 |
+| `session_id` | 否 | UUID。这份附件绑定的会话；省略时接口新建一段会话并在响应里返回 |
 
 #### 允许的文件类型
 
-服务端按 `multipart` 里声明的 `Content-Type` 判断走哪条通路，不看文件名后缀。后缀写对了但 `Content-Type` 不在下表里的文件同样会被拒绝（400 `INVALID_UPLOAD`）。
+服务端按 `multipart` 里声明的 `Content-Type` 判断按文档还是按图片处理，不看文件名后缀。后缀写对了但 `Content-Type` 不在下表里的文件同样会被拒绝（400 `INVALID_UPLOAD`）。
 
-| 通路 | 允许的 `Content-Type` | 单个文件大小上限 |
+| 类别 | 允许的 `Content-Type` | 单个文件大小上限 |
 |---|---|---|
 | 文档 | `application/pdf`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（.docx）、`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（.xlsx）、`application/vnd.openxmlformats-officedocument.presentationml.presentation`（.pptx）、`text/plain`、`text/markdown`、`text/csv` | 25 MiB |
 | 图片 | `image/png`、`image/jpeg`、`image/webp`、`image/gif` | 10 MiB |
@@ -315,15 +315,15 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/uploads \
 
 #### 上传响应的字段
 
-两条通路的 201 响应是同一个形状。
+文档和图片的 201 响应是同一个形状。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `upload_id` | string | 这份附件的标识，形如 `upl_<uuid>`。原样存下来，原样回传 |
 | `session_id` | UUID | 这份附件绑定的会话。请求里传了 `session_id` 时是传入的那个值，没传时是这次新建的那一段 |
-| `type` | string | 这份附件走的通路。取值：`document`（文档通路，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片通路，内容由平台单独保存，拍摄参数等 EXIF 信息已被移除） |
+| `type` | string | 这份附件的类别。取值：`document`（文档，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片，内容由平台单独保存，拍摄参数等 EXIF 信息已被移除） |
 | `mime` | string | 服务端记下来的 `Content-Type`，取值见上文「允许的文件类型」 |
-| `size` | integer | 这份附件的字节数，非负整数，不超过对应通路的大小上限 |
+| `size` | integer | 这份附件的字节数，非负整数，不超过对应类别的大小上限 |
 
 ### 第二步 在对话中携带
 

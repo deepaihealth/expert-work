@@ -146,7 +146,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions?user_id=u-123&limit=
   "data": {
     "sessions": [
       {
-        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+        "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37",
         "title": "退货咨询",
         "created_at": "2026-08-12T10:00:00+00:00",
         "updated_at": "2026-08-12T10:05:00+00:00",
@@ -303,7 +303,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
     "runs": [
       {
         "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+        "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37",
         "status": "success",
         "created_at": "2026-08-12T10:00:00+00:00",
         "finished_at": "2026-08-12T10:00:08+00:00",
@@ -382,7 +382,7 @@ curl -X PATCH https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}
 ```
 
 ```json [响应 200]
-{ "success": true, "data": { "session_id": "550e8400-e29b-41d4-a716-446655440000", "title": "退货咨询" }, "error": null }
+{ "success": true, "data": { "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37", "title": "退货咨询" }, "error": null }
 ```
 
 ### 归档
@@ -417,7 +417,7 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 ```
 
 ```json [响应 200]
-{ "success": true, "data": { "session_id": "550e8400-e29b-41d4-a716-446655440000", "status": "archived" }, "error": null }
+{ "success": true, "data": { "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37", "status": "archived" }, "error": null }
 ```
 
 #### 归档的影响
@@ -470,7 +470,7 @@ GET /v1/agents/{agent_code}/workspace/files
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `path` | string | 文件在工作区里的相对路径，可能包含子目录。下载时原样回传给下载接口 |
-| `size` | number | 文件大小，单位是字节 |
+| `size` | integer | 文件大小，单位是字节 |
 
 #### 示例
 
@@ -603,7 +603,7 @@ GET /v1/agents/{agent_code}/artifacts
 |---|---|---|
 | `name` | string | 产物名，在同一个终端用户下唯一。下载和删除都用这个值 |
 | `kind` | string | 产物类别，由 Agent 保存时声明。取值：`document`（文稿或报表）/ `code`（源码）/ `data`（数据文件）/ `other`（其它） |
-| `latest_version` | number | 版本号。Agent 每用同一个 `name` 保存一次就加 1 |
+| `latest_version` | integer | 版本号。Agent 每用同一个 `name` 保存一次就加 1 |
 | `created_at` | string（ISO 8601） | 首次创建时间 |
 | `updated_at` | string（ISO 8601） | 最近一次更新时间 |
 
@@ -679,9 +679,9 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
 | 429 | `RATE_LIMIT_EXCEEDED` | 产物下载配额用尽（`error.dimension` 为 `artifact_download_count_30d`），或调用频率超限 |
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录存在，服务端读不到它的内容。重试无效，请联系租户管理员 |
-| 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储通路，产物内容整体不可读。重试无效，请联系租户管理员 |
+| 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储，产物内容整体不可读。重试无效，请联系租户管理员 |
 
-500 与 503 的 `error.code` 相同，靠 HTTP 状态码区分是「读取权限配置有问题」（500）还是「存储通路缺失」（503）。两者都不是退避重试能解决的。
+500 与 503 的 `error.code` 相同，靠 HTTP 状态码区分是「读取权限配置有问题」（500）还是「没有配置存储」（503）。两者都不是退避重试能解决的。
 
 ### 删除产物
 

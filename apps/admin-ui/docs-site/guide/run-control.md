@@ -32,7 +32,7 @@ Content-Type: application/json
 | `true` | 这次调用真的触发了取消：run 当时确实在执行中，中断请求已经送达 |
 | `false` | 这个 run 已经处于最终状态，端点不做任何操作，也不报错 |
 
-`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、失败（`error` / `timeout`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
+`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、失败（`error`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
 
 中断请求生效之后，这次 run 最终会落到 `interrupted` 状态，可以在 [5.4 run 列表](./query#_5-4-run-列表) 的 `status`，或者事件流末尾 `end` 事件的 `status` 里看到。
 
@@ -65,7 +65,7 @@ run 从收到中断请求，到最终状态被服务端记录下来，中间有�
 
 ### 错误
 
-| 状态码 | `error.code` | 触发条件 | 处理方式 |
+| 状态码 | 错误码 | 触发条件 | 处理方式 |
 |---|---|---|---|
 | 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或者存在但不属于这个 `user_id` 与 `agent_code` 的组合，两种情况不区分 | 核对 `run_id`、`user_id`、`agent_code` 三个值；三者都正确时，重试不会得到不同的结果 |
 | 422 | `INVALID_REQUEST` | `user_id` 缺失、超过 255 字符，或者请求体带了未知字段 | 补全或截短 `user_id`，去掉多余的字段 |
@@ -116,7 +116,7 @@ Content-Type: application/json
 
 `agent_code` 与 `run_id` 在路径里，其余字段在请求体里。请求体只接受下表列出的字段，多传一个未知字段会返回 422 `INVALID_REQUEST`。
 
-| 字段 | 必填 | 说明 |
+| 参数 | 必填 | 说明 |
 |---|---|---|
 | `agent_code` | 是 | 路径参数。这次 run 所属的 Agent 标识，与发起这次 run 时用的是同一个值 |
 | `run_id` | 是 | 路径参数。暂停等待审批的那个 run，UUID |
@@ -218,7 +218,7 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/67262572-5470-41
 
 ### 错误
 
-| 状态码 | `error.code` | 触发条件 | 处理方式 |
+| 状态码 | 错误码 | 触发条件 | 处理方式 |
 |---|---|---|---|
 | 404 | `RUN_NOT_FOUND` | `run_id` 不存在，或者不属于这个 `user_id` 与 `agent_code` 的组合。归属校验先于审批逻辑执行，`user_id` 为纯空白时同样归到这个 404 | 核对三个值是否匹配；确认无误后不要重试 |
 | 404 | `APPROVAL_NOT_FOUND` | 归属校验通过，但这个 `run_id` 名下没有任何审批记录 | 确认这个 run 确实在等待审批，例如它没有被上一次调用决策过 |

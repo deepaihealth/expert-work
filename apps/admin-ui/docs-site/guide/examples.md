@@ -43,8 +43,7 @@ AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 def iter_sse_frames(response):
     """
     ①按行读(response.readline()),攒到一个空行才 yield 整条事件。不要改用
-    response.read(1024) 这种按固定字节数读的写法——原因见 3.5「第一步:把
-    字节流切成事件」。
+    response.read(1024) 这种按固定字节数读的写法——原因见 3.5「把字节流切成事件」。
     """
     lines = []
     while True:
@@ -976,12 +975,10 @@ API_KEY = os.environ["EXPERT_WORK_API_KEY"]
 BASE_URL = "https://<your-domain>"
 AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
 
-# 只按扩展名猜第 8 章 错误码总表(`INVALID_UPLOAD` 那条)列出的那几种受支持类型,
-# 不是通用 MIME 猜测器,内容和下面 Node.js / Java 两份表逐条一致。
-# **不要用 mimetypes.guess_type**:它认得哪些类型既跟 Python 版本走,也跟宿主机的 mime
-# 配置文件走(标准库启动时会去读 /etc/mime.types 这类系统文件),同一份代码换个环境
-# 结果就可能不一样。实测 CPython 3.9 / 3.10 / 3.11 上 `.md` 返回 None、3.12 起才认得;
-# None 回退成 application/octet-stream 后不在任何白名单里,上传每次必然 400 INVALID_UPLOAD。
+# 扩展名 → Content-Type 的固定映射,只覆盖上传接口允许的类型(见 2.5「允许的文件类型」),
+# 与下面 Node.js / Java 两份表一致。不要改用 mimetypes.guess_type:它的结果随 Python 版本
+# 和宿主机的 mime 配置变化(例如部分版本不认识 .md),猜不出时回退成 application/octet-stream,
+# 上传会返回 400 INVALID_UPLOAD。
 EXTENSION_MIME_TYPES = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2263,8 +2260,8 @@ async function consumeWithReconnect(userId, runId) {
       if (err instanceof HttpStatusError) {
         throw err; // 明确的错误响应,不重试,直接冒泡
       }
-      // 读超时或连接中断——才是真正值得重试的瞬时故障。之前这里是裸 catch {},
-      // 无退避无上限地立刻重试,还会把真正的程序错误一起吞掉。
+      // 读超时或连接中断——才是值得重试的瞬时故障。不要写成不加判断的 catch {}:
+      // 那样会无退避、无上限地立刻重试,还会把程序错误一起吞掉。
       error = err;
     }
 

@@ -20,13 +20,15 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 生产环境目前未开放，开放时间另行通知。
 
+本站示例里的两种占位符：尖括号 `<…>`（如 `<your-domain>`、`<key>`）是调用方自备的值，按对接的环境和自己的 key 替换；花括号 `{…}`（如 `{agent_code}`、`{user_id}`）是要替换成实际取值的路径参数或请求参数。
+
 ## 7.2 协议约定
 
 - 传输协议为 HTTPS，不提供明文 HTTP。
 - 字符编码为 UTF-8。
 - 请求体与响应体为 JSON，有四处例外：SSE 端点的响应是 `text/event-stream`（见 [3 读懂 SSE 流](./sse-events)），工作区文件下载（见 [5.6 工作区文件](./query#_5-6-工作区文件)）、产物下载（见 [5.7 产物](./query#_5-7-产物)）、附件下载（见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)）的响应是文件字节流。
 - 时间戳为 ISO-8601 格式并带时区偏移，例如 `2026-08-12T10:00:00+00:00`。
-- `session_id` 与 `run_id` 是标准 UUID（带连字符的小写十六进制，例如 `550e8400-e29b-41d4-a716-446655440000`）。`user_id` 不是 UUID，它是调用方自己业务系统里的标识字符串，长度 1–255 字符。
+- `session_id` 与 `run_id` 是标准 UUID（带连字符的小写十六进制，例如 `9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37`）。`user_id` 不是 UUID，它是调用方自己业务系统里的标识字符串，长度 1–255 字符。
 
 ### 三类文件的区别
 
@@ -76,13 +78,13 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 成功：
 
-```json [响应 · 成功]
+```json [成功响应]
 { "success": true, "data": { /* 具体端点的数据 */ }, "error": null }
 ```
 
 失败：
 
-```json [响应 · 失败]
+```json [失败响应]
 { "success": false, "data": null, "error": { "code": "SOME_CODE", "message": "..." } }
 ```
 
