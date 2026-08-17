@@ -1,21 +1,21 @@
 # 10 多语言示例
 
-本章为七个常见场景各提供一份可直接运行的最小示例,每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下:
+本章为七个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
 
-- **key 只能从环境变量读取,示例代码中不出现明文 key。** 运行示例前,先设置这个环境变量:
+- **key 只能从环境变量读取，示例代码中不出现明文 key。** 运行示例前，先设置这个环境变量：
 
   ```bash [环境变量]
   export EXPERT_WORK_API_KEY="aforge_pat_..."
   ```
 
-  key 的格式与申请方式,见 [认证](./auth)。
-- **域名统一写成 `https://<your-domain>`**,使用时替换成实际对接的地址,见 [通用约定](./conventions) 的「环境地址」。
-- `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符,使用时替换成实际值。
-- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query);SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
+  key 的格式与申请方式，见 [认证](./auth)。
+- **域名统一写成 `https://<your-domain>`**，使用时替换成实际对接的地址，见 [通用约定](./conventions) 的「环境地址」。
+- `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符，使用时替换成实际值。
+- 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query)；SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
 
 ## 10.1 发起 stream 模式的 run 并解析事件流
 
-发起一次 `mode: "stream"` 的 run,响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件,示例中直接原样打印 `data` 字段,不做进一步解析,字段含义见 [SSE 事件格式](./sse-events)。
+发起一次 `mode: "stream"` 的 run，响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件，示例中直接原样打印 `data` 字段，不做进一步解析，字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -474,7 +474,7 @@ public class RunAndStream {
 
 ## 10.2 queue 模式与轮询结果
 
-`mode: "queue"` 立即返回 `202`,不返回 SSE 流。202 响应体中的 `data.thread_id` 就是这次绑定的 `session_id`(字段名不同,值相同)。可以用 `GET /v1/agents/{agent_code}/sessions` 中每一项的 `running` 字段轮询;`running` 变为 `false` 后,再拉取历史消息获取最终回答。
+`mode: "queue"` 立即返回 `202`，不返回 SSE 流。202 响应体中的 `data.thread_id` 就是这次绑定的 `session_id`（字段名不同，值相同）。可以用 `GET /v1/agents/{agent_code}/sessions` 中每一项的 `running` 字段轮询；`running` 变为 `false` 后，再拉取历史消息获取最终回答。
 
 ::: code-group
 
@@ -939,7 +939,7 @@ public class QueueAndPoll {
 
 ## 10.3 上传文件并带进 run
 
-先调用上传接口获取 `upload_id`,再将其原样放入 `files[]` 发起 run。下面示例上传一份文档;文档与图片得到的 `upload_id` 形状相同,处理方式完全一致,详见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
+先调用上传接口获取 `upload_id`，再将其原样放入 `files[]` 发起 run。下面示例上传一份文档；文档与图片得到的 `upload_id` 形状相同，处理方式完全一致，详见 [2.6 带图片和文档](./chat#_2-6-带图片和文档)。
 
 ::: code-group
 
@@ -1453,7 +1453,7 @@ public class UploadAndRun {
 
 ## 10.4 续接会话
 
-将上一次响应得到的 `session_id` 传入下一次请求体,即为同一段会话的下一轮;不传则开启一段新会话。`stream` 模式下,这个 id 在响应头 `X-Expert-Work-Session-Id` 中返回,不在响应体里。
+将上一次响应得到的 `session_id` 传入下一次请求体，即为同一段会话的下一轮；不传则开启一段新会话。`stream` 模式下，这个 id 在响应头 `X-Expert-Work-Session-Id` 中返回，不在响应体里。
 
 ::: code-group
 
@@ -1947,7 +1947,7 @@ public class ContinueSession {
 
 ## 10.5 断线重连与 since_seq
 
-连接中断后不要重新调用 `POST .../runs`(那样会开启一个新的 run)。应改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`,并把已经收到的最大 `seq` 作为 `since_seq` 参数重新连接。`truncated` 事件走同一条重连路径:把它返回的 `next_seq` 直接作为下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 携带同一个值,但下面示例统一从事件正文读取这个值(部分代理或网关会丢弃或改写自定义响应头,事件本身是响应体的一部分,不会被丢弃)。示例中同样原样打印未分类事件的 `data` 字段,字段含义见 [SSE 事件格式](./sse-events)。
+连接中断后不要重新调用 `POST .../runs`（那样会开启一个新的 run）。应改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`，并把已经收到的最大 `seq` 作为 `since_seq` 参数重新连接。`truncated` 事件走同一条重连路径：把它返回的 `next_seq` 直接作为下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 携带同一个值，但下面示例统一从事件正文读取这个值（部分代理或网关会丢弃或改写自定义响应头，事件本身是响应体的一部分，不会被丢弃）。示例中同样原样打印未分类事件的 `data` 字段，字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
@@ -2594,7 +2594,7 @@ public class ReconnectEvents {
 
 ## 10.6 取消 run
 
-`user_id` 在**请求体**里,不是 query——归属校验用它确认这是发起这次 run 的那个终端用户。取消是幂等的,重复调用不会报错。
+`user_id` 在**请求体**里，不是 query——归属校验用它确认这是发起这次 run 的那个终端用户。取消是幂等的，重复调用不会报错。
 
 ::: code-group
 
@@ -2793,7 +2793,7 @@ public class CancelRun {
 
 ## 10.7 审批决策
 
-`user_id` 同样在**请求体**里。下面给出 `approve` 与 `reject` 两个示例;`decision: "modify"` 时必须带 `modified_args`,另外两种 `decision` 下禁止传它。
+`user_id` 同样在**请求体**里。下面给出 `approve` 与 `reject` 两个示例；`decision: "modify"` 时必须带 `modified_args`，另外两种 `decision` 下禁止传它。
 
 ::: code-group
 
