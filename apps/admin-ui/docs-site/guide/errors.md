@@ -4,7 +4,15 @@
 
 ## 8.1 错误码速查表
 
-「端点」列写明这个错误码只可能来自哪些接口；写「全部端点」的表示任何一条对外接口都可能返回。取消 run 与审批决策两个端点的错误码，详解在 [4 对话过程中的控制](./run-control)，其余错误码链接到本章对应小节。
+「端点」列写明这个错误码只可能来自哪些接口；写「全部端点」的表示任何一条对外接口都可能返回。多数错误码链接到本章对应小节；取消 run 与审批决策两个端点的错误码详解在 [4 对话过程中的控制](./run-control)，产物与幂等相关的几个码分别链接到 [5.7 产物](./query#_5-7-产物) 与 [7.7 幂等性](./conventions#_7-7-幂等性)。
+
+表中这几个端点名对应的路径如下，其余端点的路径写在下面各节里：
+
+- 提前获取 session_id：`POST /v1/agents/{agent_code}/sessions`
+- 会话列表：`GET /v1/agents/{agent_code}/sessions`
+- 历史消息：`GET /v1/agents/{agent_code}/sessions/{session_id}/messages`
+- 事件接口：`GET /v1/agents/{agent_code}/runs/{run_id}/events`，断线后的续传也走它，见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)
+- 产物删除：`DELETE /v1/agents/{agent_code}/artifacts`
 
 | 错误码 | HTTP 状态 | 端点 | 含义与处理 |
 |---|---|---|---|
@@ -40,13 +48,13 @@
 | [`INVALID_TITLE`](#_8-10-422-请求参数不合法) | 422 | 重命名会话 | 会话标题去掉首尾空白后是空字符串。传一个非空标题 |
 | [`INVALID_ARTIFACT_NAME`](./query#_5-7-产物) | 422 | 产物下载 / 产物删除 | 产物 `name` 含 NUL 字节。原样回传产物列表接口返回的 `name`，不要自行拼接 |
 | [`AGENT_BUILD_FAILED`](#_8-10-422-请求参数不合法) | 422 | 发起对话 / 审批决策 | Agent 的配置构建失败，两个端点上含义相同。属于服务端配置问题，联系租户管理员 |
-| [`RATE_LIMIT_EXCEEDED`](#_8-11-429-请求过于频繁或额度用尽) | 429 | 全部端点；发起对话 / 上传图片 / 产物下载另有各自的额度 | 触发频率限制或资源额度限制。按 `retry_after_s` 或 `Retry-After` 头退避重试，产物下载是例外 |
-| [`QUOTA_EXCEEDED`](#_8-11-429-请求过于频繁或额度用尽) | 429 | 上传附件（文档） | 这个终端用户的工作区容量已满。清理文件或联系管理员提高额度，退避重试无效 |
+| [`RATE_LIMIT_EXCEEDED`](#_8-11-429-请求过于频繁或配额用尽) | 429 | 全部端点；发起对话 / 上传图片 / 产物下载另有各自的配额 | 触发频率限制或资源配额限制。按 `retry_after_s` 或 `Retry-After` 头退避重试，产物下载是例外 |
+| [`QUOTA_EXCEEDED`](#_8-11-429-请求过于频繁或配额用尽) | 429 | 上传附件（文档） | 这个终端用户的工作区配额已用满。清理文件或联系管理员提高配额，退避重试无效 |
 | [`WORKSPACE_LIST_FAILED`](#_8-12-500-服务端存储配置问题) | 500 | 工作区文件列表 | 服务端的工作区存储配置有问题。重试无效，联系租户管理员 |
 | [`WORKSPACE_FILE_FAILED`](#_8-12-500-服务端存储配置问题) | 500 | 工作区文件下载 | 服务端的工作区存储配置有问题。重试无效，联系租户管理员 |
 | [`UPLOAD_FAILED`](#_8-12-500-服务端存储配置问题) | 500 | 上传附件（文档） | 保存文件失败，原因是服务端的工作区权限配置有问题。重试无效，联系租户管理员 |
 | [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-12-500-服务端存储配置问题) | 500 | 附件下载 | 附件的记录还在，但服务端读不到它的内容。重试无效，联系租户管理员 |
-| [`ARTIFACT_CONTENT_UNAVAILABLE`](./query#_5-7-产物) | 500 | 产物下载 | 产物的记录还在，但服务端读不到它的内容。重试无效，联系租户管理员 |
+| [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-12-500-服务端存储配置问题) | 500 | 产物下载 | 产物的记录还在，但服务端读不到它的内容。重试无效，联系租户管理员 |
 | [`UPLOAD_FAILED`](#_8-13-502-上传文件时遇到上游错误) | 502 | 上传附件（文档） | 保存文件时遇到上游存储服务的错误。重试无效，联系租户管理员 |
 | [`UPLOAD_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 上传附件 | 服务端没有配置对应的存储通路。重试无效，联系租户管理员 |
 | [`UPLOAD_CONTENT_UNAVAILABLE`](#_8-14-503-服务不可用) | 503 | 附件下载 | 服务端没有配置对应的存储通路，与上面 500 是同一个错误码，靠状态码区分。重试无效，联系租户管理员 |
@@ -128,6 +136,8 @@
 | `AUTH_INVALID_TOKEN` | key 的格式正确但校验不通过，包括不存在、已被吊销、轮换后的宽限期已过 |
 | `AUTH_TOKEN_EXPIRED` | key 有效，但 `expires_at` 已经过去 |
 
+其余认证失败情况返回 `AUTH_UNAUTHENTICATED`，处理方式与上面三种相同。
+
 处理方式：确认 key 是否复制完整、是否过期、是否已被吊销，必要时更换一把新 key，见 [6 认证与 Key](./auth)。
 
 ## 8.5 403 权限不足或被阻断
@@ -198,7 +208,7 @@
 
 ## 8.10 422 请求参数不合法
 
-发起对话（`POST /v1/agents/{agent_code}/runs`）的 422 分两类，格式不同；本节最后另有三种独立的 422。
+发起对话（`POST /v1/agents/{agent_code}/runs`）的 422 分两类，格式不同；本节最后另有三种独立的 422。下面表中的个别错误码同样适用于其它端点，已在触发条件里标明。
 
 ### 请求体字段没通过校验
 
@@ -256,7 +266,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 `title` 完全不传、或者传字面上的空字符串 `""`，走的是请求体字段校验（`title` 要求至少 1 个字符），返回 422 `INVALID_REQUEST`，不是这个错误码。区别在于有没有先经过服务端的空白裁剪。
 
-## 8.11 429 请求过于频繁或额度用尽
+## 8.11 429 请求过于频繁或配额用尽
 
 429 有两种含义，靠 `error.code` 区分，不能只看状态码，也不能只看有没有 `Retry-After` 头。
 
@@ -275,11 +285,11 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 }
 ```
 
-`dimension` 说明是哪一层限制被触发的：网关按 IP 或按 key 的频率限制、租户整体的频率限制，或者按资源维度的额度限制（例如某个 Agent 的调用频率、图片上传的次数与存储字节数）。**网关这一层返回的 429 不带 `dimension` 字段**，只有 `code`、`message`、`retry_after_s`，解析时要给 `dimension` 留缺省值。
+`dimension` 说明是哪一层限制被触发的：网关按 IP 或按 key 的频率限制、租户整体的频率限制，或者按资源维度的配额限制（例如某个 Agent 的调用频率、图片上传的次数与存储字节数）。**网关这一层返回的 429 不带 `dimension` 字段**，只有 `code`、`message`、`retry_after_s`，解析时要给 `dimension` 留缺省值。
 
 处理方式：按 `retry_after_s`（或 `Retry-After` 头）退避后重试，不要立即重试。
 
-第二种是工作区容量已满（`QUOTA_EXCEEDED`），只出现在文档上传，标准格式，但没有 `Retry-After` 响应头，因为退避重试解决不了：
+第二种是工作区配额已用满（`QUOTA_EXCEEDED`），只出现在文档上传，标准格式，但没有 `Retry-After` 响应头，因为退避重试解决不了：
 
 ```json [响应 429]
 {
@@ -291,12 +301,12 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 处理方式：清理这个终端用户工作区里的旧文件，或者引导终端用户自行清理。
 
-产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）是额度限制里的唯一例外，四点差别：
+产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）是配额里的唯一例外，四点差别：
 
-- 它的额度准入走频率限制这条通路，超限时返回 `RATE_LIMIT_EXCEEDED`，不是 `QUOTA_EXCEEDED`。
+- 它的配额准入走频率限制这条通路，超限时返回 `RATE_LIMIT_EXCEEDED`，不是 `QUOTA_EXCEEDED`。
 - 它带 `Retry-After` 响应头。
-- 它扣减的是 `ARTIFACT_DOWNLOAD_COUNT_30D`，一个 30 天的滑动窗口，额度不会在几秒内回补。
-- 因此按 `Retry-After` 做短退避重试对它无效。命中时应当按「这个终端用户的下载额度已用尽」处理，而不是「服务端正忙，稍后重试」。
+- 它扣减的是 `ARTIFACT_DOWNLOAD_COUNT_30D`，一个 30 天的滑动窗口，配额不会在几秒内回补。
+- 因此按 `Retry-After` 做短退避重试对它无效。命中时应当按「这个终端用户的下载配额已用尽」处理，而不是「服务端正忙，稍后重试」。
 
 产物一侧的说明见 [5.7 产物](./query#_5-7-产物)。
 
@@ -304,15 +314,15 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 工作区文件列表（`GET /v1/agents/{agent_code}/workspace/files`）、工作区文件下载（`GET .../workspace/file`）、产物下载（`GET .../artifacts/download`）在服务端存储配置有问题时返回 500，标准格式，三个错误码：
 
-```json [响应 500]
+```json [响应 500 WORKSPACE_LIST_FAILED]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
 ```
 
-```json [响应 500]
+```json [响应 500 WORKSPACE_FILE_FAILED]
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
 ```
 
-```json [响应 500]
+```json [响应 500 ARTIFACT_CONTENT_UNAVAILABLE]
 { "success": false, "data": null, "error": { "code": "ARTIFACT_CONTENT_UNAVAILABLE", "message": "artifact content unavailable" } }
 ```
 
@@ -322,7 +332,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 上传附件的文档分支保存失败是另一个独立的错误码 `UPLOAD_FAILED`，标准格式：
 
-```json [响应 500]
+```json [响应 500 UPLOAD_FAILED]
 { "success": false, "data": null, "error": { "code": "UPLOAD_FAILED", "message": "workspace write failed" } }
 ```
 
@@ -330,7 +340,7 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 附件下载（`GET /v1/agents/{agent_code}/uploads/{upload_id}`）读不到内容时返回 `UPLOAD_CONTENT_UNAVAILABLE`，标准格式：
 
-```json [响应 500]
+```json [响应 500 UPLOAD_CONTENT_UNAVAILABLE]
 { "success": false, "data": null, "error": { "code": "UPLOAD_CONTENT_UNAVAILABLE", "message": "upload content unavailable" } }
 ```
 
@@ -388,4 +398,4 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 限流按时间窗口限制调用的频率，配额按资源维度限制用量。两者都返回 429，靠 `error.code` 区分：限流是 `RATE_LIMIT_EXCEEDED`，配额是 `QUOTA_EXCEEDED`。
 
-两者的完整对照，包括 `dimension` 字段、`Retry-After` 响应头的有无、以及产物下载这个例外，见 [8.11](#_8-11-429-请求过于频繁或额度用尽)。
+两者的完整对照，包括 `dimension` 字段、`Retry-After` 响应头的有无、以及产物下载这个例外，见 [8.11](#_8-11-429-请求过于频繁或配额用尽)。

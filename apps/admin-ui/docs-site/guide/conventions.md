@@ -38,7 +38,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 | 工作区文件 | Agent 执行过程中写出的文件，构成这个终端用户工作区的全部内容 | 列出 `GET /v1/agents/{agent_code}/workspace/files`、下载 `GET /v1/agents/{agent_code}/workspace/file`，见 [5.6 工作区文件](./query#_5-6-工作区文件) | 文件在工作区里的 `path` |
 | 产物 | Agent 登记为成果的那几份文件，例如一份周报 | 列出 `GET /v1/agents/{agent_code}/artifacts`、下载 `GET /v1/agents/{agent_code}/artifacts/download`，见 [5.7 产物](./query#_5-7-产物) | 产物 `name` |
 
-删除方式：只有产物有对外的删除接口（`DELETE /v1/agents/{agent_code}/artifacts`），删除后不再出现在产物列表里、也不能再下载，但文件本身仍留在工作区中。附件与工作区文件没有对外的删除接口。
+删除方式：只有产物有对外的删除接口（`DELETE /v1/agents/{agent_code}/artifacts`），删除后不再出现在产物列表里，也不能再通过产物下载接口下载；文件本身仍留在工作区中，仍可用工作区文件下载接口取回。附件与工作区文件没有对外的删除接口。
 
 三者之间还有两条关系：
 
@@ -56,7 +56,11 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 ## 7.4 响应头
 
-先说明两个词。「事件接口」指按 `run_id` 拉取事件的接口（`GET /v1/agents/{agent_code}/runs/{run_id}/events`）；「续传」指断线重连或 run 结束之后，服务端把客户端未收到的那一段事件重新发送，操作步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
+先说明三个词：
+
+- 「事件接口」指按 `run_id` 拉取事件的接口（`GET /v1/agents/{agent_code}/runs/{run_id}/events`）。
+- 「续传」指断线重连或 run 结束之后，服务端把客户端未收到的那一段事件重新发送，操作步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
+- 「幂等重放」指用同一个 `Idempotency-Key` 重复发起对话时，服务端直接返回上一次的结果，规则见 [7.7 幂等性](#_7-7-幂等性)。
 
 `X-Expert-Work-Trace-Id` 是唯一一个每个响应都带的头，**其余四个按端点和模式出现，不要假设它们成套出现**：
 
@@ -98,7 +102,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 | `Retry-After` 响应头 | 带 | 不带 |
 | 处理方式 | 退避后重试 | 退避重试无效，先清理占用的资源 |
 
-拿到 429 时先读 `error.code` 判断属于哪一种。`dimension` 字段的含义、两种响应的样例，以及产物下载这个例外（它的额度限制也返回 `RATE_LIMIT_EXCEEDED`、也带 `Retry-After`，但短退避重试对它无效），都在 [8.11 429](./errors#_8-11-429-请求过于频繁或额度用尽)，那一节是这件事的完整说明。
+拿到 429 时先读 `error.code` 判断属于哪一种。`dimension` 字段的含义、两种响应的样例，以及产物下载这个例外（它的配额也返回 `RATE_LIMIT_EXCEEDED`、也带 `Retry-After`，但短退避重试对它无效），都在 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)，那一节是这件事的完整说明。
 
 ## 7.7 幂等性
 
