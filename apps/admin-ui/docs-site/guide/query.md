@@ -387,3 +387,115 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 ```
 
 细节见 [8 错误码总表](./errors)。
+
+## 5.7 产物
+
+Agent 在执行过程中可以把一份成果**登记成产物**（比如一份周报、一份导出数据）。产物和工作区文件的区别：工作区是 Agent 的原始文件系统，产物是 Agent 主动挑出来、给人看的那些，带名字、类型和版本号。下面这三条接口分别用来列出、下载和删除产物。
+
+这三条接口的 `agent_code` **不参与过滤**——产物按 (租户, 终端用户) 维度存，与 [5.6 工作区文件](#_5-6-工作区文件) 同一条规则。
+
+### 列出产物
+
+```
+GET /v1/agents/{agent_code}/artifacts
+```
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "artifacts": [
+      {
+        "name": "2026-08 周报.docx",
+        "kind": "document",
+        "latest_version": 3,
+        "created_at": "2026-08-12T10:00:00+00:00",
+        "updated_at": "2026-08-14T09:30:00+00:00"
+      }
+    ]
+  },
+  "error": null
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 产物名，在同一个终端用户下唯一。下载和删除都用它 |
+| `kind` | `document` / `code` / `data` / `other`，由 Agent 保存时声明 |
+| `latest_version` | 版本号。Agent 每次用同名保存一次就 +1 |
+| `created_at` / `updated_at` | 首次创建 / 最近一次更新时间 |
+
+**列表里没有文件大小。** 大小和校验和是**首次下载时才记录**的，列表里给出来大部分是 `null`，反而误导。
+
+已删除的产物不出现在这个列表里。`user_id` 是这个租户从没见过的值时返回空列表，不是 404。
+
+### 下载产物
+
+```
+GET /v1/agents/{agent_code}/artifacts/download
+```
+
+下载的永远是**最新版本**，当前不提供按版本号下载。
+
+| 查询参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | |
+| `name` | 是 | 原样回传列表里的 `name`，不要自己拼 |
+
+```bash
+curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-123&name=2026-08%20周报.docx" \
+  -H "Authorization: Bearer <key>" \
+  -o report.docx
+```
+
+成功响应是文件字节流本身，**不是** `{success, data, error}` 形状——那个形状只包裹错误响应。`Content-Disposition` 的规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致：HTML / SVG 这类可执行内容强制 `attachment`，响应始终带 `X-Content-Type-Options: nosniff`。
+
+**这条接口计入配额。** 每次下载扣 1 次 `artifact_download` 额度（同时计入 `ARTIFACT_DOWNLOAD_COUNT_30D` 这个 30 天滑动窗口维度）。超限时返回 **429 `RATE_LIMIT_EXCEEDED`**（带 `Retry-After` 头）——**不是** `QUOTA_EXCEEDED`：这条接口的配额准入统一走限流引擎，任何维度耗尽都翻成同一个 `RATE_LIMIT_EXCEEDED`，见 [8.11 429](./errors#_8-11-429-——-两种情况-含义不同)。**不要**照 `Retry-After` 头做短退避重试——`ARTIFACT_DOWNLOAD_COUNT_30D` 是 30 天窗口慢速回补，短退避基本等于无限重试打空，命中这个 429 应该当作「这个终端用户的下载额度打满了」来处理，不是「这会儿太忙等等再试」。
+
+错误响应：
+
+| 状态码 | `error.code` | 含义 |
+|---|---|---|
+| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、或不属于这个 `user_id`——**三种情况统一返回这一个 404**，不区分 |
+| 429 | `RATE_LIMIT_EXCEEDED` | `artifact_download` 配额（含 `ARTIFACT_DOWNLOAD_COUNT_30D` 30 天窗口）耗尽，见上方说明 |
+| 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录在，但服务端读不到内容（存储配置问题）。**这不是"不存在"**，重试没用，联系你的租户管理员 |
+| 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储通路，产物内容整体不可读——同一个 `error.code`，靠状态码区分「配置缺失」（503）与「权限配置有问题」（500）两种服务端故障，都不是退避重试能解决的 |
+
+### 删除产物
+
+```
+DELETE /v1/agents/{agent_code}/artifacts
+```
+
+要求 `write` 权限（与归档会话一样，对外 API 没有单独的删除权限档位）。
+
+| 查询参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | |
+| `name` | 是 | |
+
+```bash
+curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123&name=2026-08%20周报.docx" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json
+{ "success": true, "data": { "deleted": "2026-08 周报.docx" }, "error": null }
+```
+
+::: warning 这是软删除——工作区里的字节不会被这个 API 清除
+产物从「产物视图」（这三条接口：列表、下载、删除）里消失了，但**工作区里的文件字节从始至终没有被删除**，保留期后台清理任务到期后做的也**不是**删字节——那个任务只物理清掉产物的元数据行（名字、版本号这些），不碰底层文件本身。
+
+也就是说：只要还记得这个文件在工作区里的原始路径，删除之后（甚至保留期过了、元数据行都被后台任务清掉之后）仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的 `GET /v1/agents/{agent_code}/workspace/file` 原样下载到这份内容。**如果你把「删除产物」当成对终端用户「删除我的数据」的承诺，这条 API 目前不满足这个承诺**——它只是把这份产物从「成果清单」里摘下来，不是销毁数据；真要清除底层字节，眼下没有对外的操作能做到。
+
+如果 Agent 之后又用同一个 `name` 保存了一次，这个产物会**恢复**（版本号接着往上加）。
+
+当前 API 没有对外的撤销删除操作。
+:::
+
+产物不存在、已经删过、或不属于这个 `user_id`，都返回同一个 404 `ARTIFACT_NOT_FOUND`，不区分。

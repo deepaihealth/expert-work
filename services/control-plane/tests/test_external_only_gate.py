@@ -48,7 +48,7 @@ from tests.auth_fixtures import (
 _TID = uuid4()
 _RID = uuid4()
 
-#: The full third-party surface under ``/v1/agents`` — same twelve routes as
+#: The full third-party surface under ``/v1/agents`` — same fifteen routes as
 #: ``test_console_lockdown.py``'s ``_EXTERNAL_AGENT_ROUTES``. Kept as an
 #: independent local table (not imported) — each security-gate test file in
 #: this suite owns its own route table so it can't silently start passing
@@ -67,6 +67,14 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("GET", "/v1/agents/{agent_code}/workspace/files"),
         ("GET", "/v1/agents/{agent_code}/workspace/file"),
+        # 阶段 3 PR-B — 对外产物视图(external_artifacts.py)三个端点。list +
+        # download 两个端点最初漏登记在这张表里(评审 Important B),导致没有
+        # 任何测试用真实员工 JWT 请求过它们并断言 403 —— tag 驱动的静态审计
+        # 只查依赖有没有挂上,查不出 handler 内部对某种 principal 特殊放行这
+        # 类问题。delete 端点(Task 3)登记时一并补齐,下面三条都已登记。
+        ("GET", "/v1/agents/{agent_code}/artifacts"),
+        ("GET", "/v1/agents/{agent_code}/artifacts/download"),
+        ("DELETE", "/v1/agents/{agent_code}/artifacts"),
     }
 )
 

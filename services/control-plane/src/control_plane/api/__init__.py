@@ -14,6 +14,7 @@ from control_plane.api.curation import build_curation_router, build_eval_dataset
 from control_plane.api.eval_runs import build_eval_runs_router
 from control_plane.api.external_agent_catalog import build_external_agent_catalog_router
 from control_plane.api.external_approvals import build_external_approvals_router
+from control_plane.api.external_artifacts import build_external_artifacts_router
 from control_plane.api.external_events import build_external_events_router
 from control_plane.api.external_runs import build_external_runs_router
 from control_plane.api.external_sessions import build_external_sessions_router
@@ -91,6 +92,7 @@ __all__ = [
     "build_eval_runs_router",
     "build_external_agent_catalog_router",
     "build_external_approvals_router",
+    "build_external_artifacts_router",
     "build_external_events_router",
     "build_external_runs_router",
     "build_external_sessions_router",

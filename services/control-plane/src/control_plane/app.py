@@ -55,6 +55,7 @@ from control_plane.api import (
     build_eval_runs_router,
     build_external_agent_catalog_router,
     build_external_approvals_router,
+    build_external_artifacts_router,
     build_external_events_router,
     build_external_runs_router,
     build_external_sessions_router,
@@ -2471,6 +2472,7 @@ def create_app(
     app.include_router(build_external_approvals_router())
     app.include_router(build_external_workspace_router())
     app.include_router(build_external_agent_catalog_router())
+    app.include_router(build_external_artifacts_router())
 
     app.include_router(build_agents_router())
     app.include_router(build_sessions_router())

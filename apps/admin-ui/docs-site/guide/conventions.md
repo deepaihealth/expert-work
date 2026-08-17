@@ -34,7 +34,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 |---|---|---|
 | `Authorization: Bearer <key>` | 全部端点 | 见 [6 认证与 Key](./auth) |
 | `Content-Type: application/json` | 除文件上传外的全部写请求 | 文件上传（`POST /v1/agents/{agent_code}/uploads`）用 `multipart/form-data` |
-| `Idempotency-Key` | 仅 `POST /v1/agents/{agent_code}/runs` | 见 [7.6 幂等性](#_7-6-幂等性) |
+| `Idempotency-Key` | 仅 `POST /v1/agents/{agent_code}/runs` | 见 [7.6 幂等性](#_7-7-幂等性) |
 | `X-Expert-Work-Deadline-Ms`（可选） | 任意端点 | 你自己设的绝对截止时间（unix 毫秒时间戳）。已经过去就直接 504（`DEADLINE_EXCEEDED`）。不需要端到端超时控制就别传 |
 
 ## 7.4 响应头

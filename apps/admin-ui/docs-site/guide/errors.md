@@ -8,44 +8,47 @@
 
 | `code` | HTTP 状态 | 含义 | 建议处理 |
 |---|---|---|---|
-| [`WORKSPACE_FILE_FAILED`](#_400-——-工作区文件路径不合法) | 400 | 工作区文件路径不合法 | 别自己拼路径，原样回传「列出文件」接口给的 `path` |
-| [`INVALID_UPLOAD`](#_400-——-工作区文件路径不合法) | 400 | 上传接口自身的校验失败(文件为空、没有文件名等) | 检查文件内容后重传 |
-| [`AUTH_MISSING_CREDENTIALS`](#_401-——-key-无效-过期) | 401 | 没带 `Authorization` 头，或格式不对 | 检查请求头 |
-| [`AUTH_INVALID_TOKEN`](#_401-——-key-无效-过期) | 401 | key 不存在 / 已吊销 / 轮换宽限期已过 | 换一把新 key |
-| [`AUTH_TOKEN_EXPIRED`](#_401-——-key-无效-过期) | 401 | key 本身没问题但已过期 | 换一把新 key |
-| [`FORBIDDEN`](#_403-——-scope-不足-其它权限阻断)(裸 `detail`) | 403 | key 的 权限不足 | 换一把带所需 scope 的 key |
-| [`AGENT_DISABLED`](#_403-——-scope-不足-其它权限阻断) | 403 | 这个 agent 已被管理员下线 | 联系租户管理员 |
-| [`TENANT_SUSPENDED`](#_403-——-scope-不足-其它权限阻断) | 403 | 租户被暂停 | 联系租户管理员 |
-| [`AGENT_NOT_FOUND`](#_404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `agent_code` 在你的租户下没有已发布版本 | 检查 `agent_code` 拼写与发布状态 |
-| [`SESSION_NOT_FOUND`](#_404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `session_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；统一的 404，不区分"不存在"与"不是你的" |
-| [`WORKSPACE_FILE_FAILED`](#_404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `user_id` 未识别，或文件不存在 | 核对 `user_id` / `path` |
+| [`WORKSPACE_FILE_FAILED`](#_8-3-400-——-工作区文件路径不合法) | 400 | 工作区文件路径不合法 | 别自己拼路径，原样回传「列出文件」接口给的 `path` |
+| [`INVALID_UPLOAD`](#_8-3-400-——-工作区文件路径不合法) | 400 | 上传接口自身的校验失败(文件为空、没有文件名等) | 检查文件内容后重传 |
+| [`AUTH_MISSING_CREDENTIALS`](#_8-4-401-——-key-无效-过期) | 401 | 没带 `Authorization` 头，或格式不对 | 检查请求头 |
+| [`AUTH_INVALID_TOKEN`](#_8-4-401-——-key-无效-过期) | 401 | key 不存在 / 已吊销 / 轮换宽限期已过 | 换一把新 key |
+| [`AUTH_TOKEN_EXPIRED`](#_8-4-401-——-key-无效-过期) | 401 | key 本身没问题但已过期 | 换一把新 key |
+| [`FORBIDDEN`](#_8-5-403-——-权限不足或被阻断)(裸 `detail`) | 403 | key 的 权限不足 | 换一把带所需 scope 的 key |
+| [`AGENT_DISABLED`](#_8-5-403-——-权限不足或被阻断) | 403 | 这个 agent 已被管理员下线 | 联系租户管理员 |
+| [`TENANT_SUSPENDED`](#_8-5-403-——-权限不足或被阻断) | 403 | 租户被暂停 | 联系租户管理员 |
+| [`AGENT_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `agent_code` 在你的租户下没有已发布版本 | 检查 `agent_code` 拼写与发布状态 |
+| [`SESSION_NOT_FOUND`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `session_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；统一的 404，不区分"不存在"与"不是你的" |
+| [`WORKSPACE_FILE_FAILED`](#_8-6-404-——-agent-不存在-会话不存在-工作区文件不存在) | 404 | `user_id` 未识别，或文件不存在 | 核对 `user_id` / `path` |
 | [`RUN_NOT_FOUND`](./run-control) | 404 | `run_id` 不存在，或不属于这个 `user_id` / `agent_code` | 核对三者是否匹配；不要当作"还没创建好"去重试 |
 | [`APPROVAL_NOT_FOUND`](./run-control) | 404 | 这个 `run_id` 没有一条待审批记录 | 确认这个 run 真的处于等待审批状态 |
+| [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物不存在、已删除，或不属于这个 `user_id` | 核对 `user_id` / `name`；三种情况不区分 |
 | [`APPROVAL_CONFLICT`](./run-control) | 409 | 这条审批已经被决定过 | 不要重复决策；要重放上次结果，带上当时用的 `idempotency_key` |
 | [`SESSION_NOT_BOUND`](./run-control) | 409 | run 所在会话没有绑定 agent(内部状态异常) | 联系租户管理员 |
 | [`AGENT_DELETED`](./run-control) | 410 | agent 已被(软)删除 | 不可恢复，换一个 `agent_code` |
-| [`UPLOAD_TOO_LARGE`](#_413-——-文档-图片超限) | 413 | 文档 / 图片超过大小上限 | 压缩或裁剪后重传，或拆分成多份 |
-| [`INVALID_REQUEST`](#_422-——-请求参数不合法) | 422 | 请求体字段本身没通过基础校验 | 检查字段类型 / 长度 / 取值范围 |
-| [`INVALID_USER_ID`](#_422-——-请求参数不合法) | 422 | `user_id` 去掉首尾空白后是空字符串 | 传一个非空白的 `user_id` |
-| [`INVALID_FILE_REF`](#_422-——-请求参数不合法) | 422 | `files[]` 里 document 条目的 `upload_id` 格式不对 | 原样回传上传接口返回的值，不要自己改写 |
-| [`TOO_MANY_IMAGE_REFS`](#_422-——-请求参数不合法) | 422 | 图片条目(`image_refs` + `files[]` 里的 image)总数超过 64——这是外层的合计上限，单次 run 实际允许的图片数通常更低(默认 8，见下方 422 节) | 拆分成多次调用 |
-| [`INVALID_IMAGE_REF`](#_422-——-请求参数不合法) | 422 | image 条目引用格式不对 | 用上传接口对图片返回的引用，不要用 document 的 |
+| [`UPLOAD_TOO_LARGE`](#_8-9-413-——-文档-图片超限) | 413 | 文档 / 图片超过大小上限 | 压缩或裁剪后重传，或拆分成多份 |
+| [`INVALID_REQUEST`](#_8-10-422-——-请求参数不合法) | 422 | 请求体字段本身没通过基础校验 | 检查字段类型 / 长度 / 取值范围 |
+| [`INVALID_USER_ID`](#_8-10-422-——-请求参数不合法) | 422 | `user_id` 去掉首尾空白后是空字符串 | 传一个非空白的 `user_id` |
+| [`INVALID_FILE_REF`](#_8-10-422-——-请求参数不合法) | 422 | `files[]` 里 document 条目的 `upload_id` 格式不对 | 原样回传上传接口返回的值，不要自己改写 |
+| [`TOO_MANY_IMAGE_REFS`](#_8-10-422-——-请求参数不合法) | 422 | 图片条目(`image_refs` + `files[]` 里的 image)总数超过 64——这是外层的合计上限，单次 run 实际允许的图片数通常更低(默认 8，见下方 422 节) | 拆分成多次调用 |
+| [`INVALID_IMAGE_REF`](#_8-10-422-——-请求参数不合法) | 422 | image 条目引用格式不对 | 用上传接口对图片返回的引用，不要用 document 的 |
 | [`INVALID_IDEMPOTENCY_KEY`](./conventions) | 422 | `Idempotency-Key` 去空白后为空，或超过 255 字符 | 检查请求头取值 |
 | [`IDEMPOTENCY_KEY_REUSED`](./conventions) | 422 | 同一个 key 换了请求体，或打给了不同的 `agent_code` | 换一个新 key，不要复用 |
-| [`TOO_MANY_INPUT_KEYS`](#_422-——-请求参数不合法) | 422 | `inputs` 键数量超过 64 | 精简 `inputs` |
-| [`INPUT_VALUE_TOO_LONG`](#_422-——-请求参数不合法) | 422 | `inputs` 某个字符串值超过 8192 字符 | 精简该值 |
-| [`TOO_MANY_INPUT_BYTES`](#_422-——-请求参数不合法) | 422 | `inputs` 序列化后总字节数超过 65536 | 精简 `inputs` 整体 |
-| [`UNTRUSTED_CONTENT_BLOCK_TOO_LONG`](#_422-——-请求参数不合法) | 422 | `untrusted_content` 单块超过 8192 字符 | 拆成多个数组元素 |
-| [`INVALID_TITLE`](#_422-——-请求参数不合法) | 422 | 会话标题去掉首尾空白后是空字符串 | 传一个非空标题 |
+| [`TOO_MANY_INPUT_KEYS`](#_8-10-422-——-请求参数不合法) | 422 | `inputs` 键数量超过 64 | 精简 `inputs` |
+| [`INPUT_VALUE_TOO_LONG`](#_8-10-422-——-请求参数不合法) | 422 | `inputs` 某个字符串值超过 8192 字符 | 精简该值 |
+| [`TOO_MANY_INPUT_BYTES`](#_8-10-422-——-请求参数不合法) | 422 | `inputs` 序列化后总字节数超过 65536 | 精简 `inputs` 整体 |
+| [`UNTRUSTED_CONTENT_BLOCK_TOO_LONG`](#_8-10-422-——-请求参数不合法) | 422 | `untrusted_content` 单块超过 8192 字符 | 拆成多个数组元素 |
+| [`INVALID_TITLE`](#_8-10-422-——-请求参数不合法) | 422 | 会话标题去掉首尾空白后是空字符串 | 传一个非空标题 |
 | [`AGENT_BUILD_FAILED`](./run-control) | 422 | agent manifest 构建失败——发起 run、审批决策续跑都可能遇到，含义相同 | 服务端配置问题，不是你这边能解决的，联系租户管理员 |
-| [`RATE_LIMIT_EXCEEDED`](#_429-——-两种情况-含义不同) | 429 | 触发限流(网关 / 租户 / 业务维度) | 按 `retry_after_s`(或 `Retry-After` 头)退避重试 |
-| [`QUOTA_EXCEEDED`](#_429-——-两种情况-含义不同) | 429 | 工作区容量满(文档上传) | 清理资源或联系管理员提额度——重试没用 |
-| [`WORKSPACE_LIST_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 工作区存储服务端配置有问题 | 不是你这边能解决的，联系租户管理员 |
-| [`WORKSPACE_FILE_FAILED`](#_500-——-工作区服务端配置问题) | 500 | 同上 | 联系租户管理员 |
-| [`UPLOAD_FAILED`](#_500-——-工作区服务端配置问题) | 500 / [502](#_502-——-上传写入失败-上游错误) | 文件上传落盘失败(服务端配置问题，或写入时的上游错误) | 重试；持续失败联系租户管理员 |
-| [`UPLOAD_UNAVAILABLE`](#_503-——-服务不可用-两种含义不同) | 503 | 上传接口专属:对象存储或沙箱工作区未就绪 | 稍后重试；持续失败联系租户管理员 |
-| [`SERVER_OVERLOADED`](#_503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**，不只是上传 | 按 `Retry-After` 头退避重试 |
-| [`DEADLINE_EXCEEDED`](#_504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值，或者干脆别传它 |
+| [`RATE_LIMIT_EXCEEDED`](#_8-11-429-——-两种情况-含义不同) | 429 | 触发限流(网关 / 租户 / 业务维度) | 按 `retry_after_s`(或 `Retry-After` 头)退避重试 |
+| [`QUOTA_EXCEEDED`](#_8-11-429-——-两种情况-含义不同) | 429 | 工作区容量满(文档上传) | 清理资源或联系管理员提额度——重试没用 |
+| [`WORKSPACE_LIST_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 | 工作区存储服务端配置有问题 | 不是你这边能解决的，联系租户管理员 |
+| [`WORKSPACE_FILE_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 | 同上 | 联系租户管理员 |
+| [`UPLOAD_FAILED`](#_8-12-500-——-工作区服务端配置问题) | 500 / [502](#_8-13-502-——-上传写入失败-上游错误) | 文件上传落盘失败(服务端配置问题，或写入时的上游错误) | 重试；持续失败联系租户管理员 |
+| [`ARTIFACT_CONTENT_UNAVAILABLE`](./query#_5-7-产物) | 500 | 产物记录在，服务端读不到内容(权限配置问题) | 服务端存储配置问题，重试无效，联系租户管理员 |
+| [`UPLOAD_UNAVAILABLE`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 上传接口专属:对象存储或沙箱工作区未就绪 | 稍后重试；持续失败联系租户管理员 |
+| [`ARTIFACT_CONTENT_UNAVAILABLE`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 服务端整体没有配置工作区存储通路(与上面 500 是同一个 `code`,靠状态码区分两种服务端故障) | 部署/配置问题，重试无效，联系租户管理员 |
+| [`SERVER_OVERLOADED`](#_8-14-503-——-服务不可用-两种含义不同) | 503 | 全站过载保护——**任何端点都可能遇到**，不只是上传 | 按 `Retry-After` 头退避重试 |
+| [`DEADLINE_EXCEEDED`](#_8-15-504-——-请求超过了你自己设的截止时间) | 504 | 你自己传的 `X-Expert-Work-Deadline-Ms` 已经过去 | 检查这个头的取值，或者干脆别传它 |
 
 **这张表只覆盖有 `error.code` 的失败，不是全部失败的穷尽清单。** 有一部分失败连 `error.code` 都没有——有的是只有一个 `detail` 字段的简易格式(比如 权限不足的 403、`inputs` 模板变量校验失败的 422，这类 `detail` 是字符串)，有的干脆是内部一次校验函数直接抛出的裸文案(比如"这个 agent 不支持图片输入""单次 run 图片数超过上限""图片引用不属于这个会话"，都是 4xx；配额引擎本身不可用是 503)。这类没有 `code` 的失败没法进这张按 `code` 查的表，完整列表分散在下面各节和「先说一件容易踩的坑」——别假设"表里没列到的码"就等于"这个失败不存在"。
 
@@ -227,7 +230,7 @@
 
 ## 8.12 500 —— 工作区服务端配置问题
 
-以下两种 500 出现在两个工作区接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载)，能读到 `error.code`:
+以下三种 500 出现在三条接口(`GET /v1/agents/{agent_code}/workspace/files` 列表、`GET .../workspace/file` 下载、`GET .../artifacts/download` 下载产物)，能读到 `error.code`:
 
 ```json
 { "success": false, "data": null, "error": { "code": "WORKSPACE_LIST_FAILED", "message": "workspace listing unavailable" } }
@@ -235,6 +238,10 @@
 
 ```json
 { "success": false, "data": null, "error": { "code": "WORKSPACE_FILE_FAILED", "message": "workspace file unavailable" } }
+```
+
+```json
+{ "success": false, "data": null, "error": { "code": "ARTIFACT_CONTENT_UNAVAILABLE", "message": "artifact content unavailable" } }
 ```
 
 触发条件是服务端工作区存储的权限配置有问题(比如共享 uid 没配对)，不是你这边的请求有问题，也不是"这个用户 / 文件不存在"——刻意不降级成空列表或 404，免得把服务端配置问题伪装成正常的业务响应。应对:不是退避重试能解决的，联系你的租户管理员核实工作区存储配置。
@@ -268,6 +275,8 @@
 ```
 
 触发条件是服务端没有配置好对应的存储通路——图片走的对象存储、文档走的沙箱工作区，任一个没接好都会触发。这是部署 / 配置问题，不是你这边能解决的，联系你的租户管理员；重试没用。
+
+**产物下载(`GET /v1/agents/{agent_code}/artifacts/download`)也有一个 503**，`error.code` 同样能读到，是 `ARTIFACT_CONTENT_UNAVAILABLE`——与 [8.1 速查表](#_8-1-错误码速查表) / [5.7 产物](./query#_5-7-产物) 里同名码的 500 形态是同一个 `code`,靠状态码区分:503 是服务端整体没有配置工作区存储通路(部署问题),500 是配置了但权限有问题(比如共享 uid 没配对,见 [8.12](#_8-12-500-——-工作区服务端配置问题))。两种都不是退避重试能解决的,都要联系租户管理员。
 
 **另外还有一种 503 没有 `error.code`**:发起 run 时，如果服务端的配额引擎本身不可用，响应是裸 `{"detail": "quota_engine_unavailable"}`，连 `{success, data, error}` 这个形状都不是(上传接口遇到同一种故障时会包成能读到 `error.code` 的 `UPLOAD_UNAVAILABLE`，不是这种裸形状)。概率很低，但要知道这种形状存在——别假设 503 一定能读到 `error.code`。
 
