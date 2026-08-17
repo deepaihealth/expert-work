@@ -15,6 +15,7 @@ plane's ``{success, data, error}`` envelope (not FastAPI's bare ``detail``).
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
@@ -29,7 +30,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, CheckResult, QuotaDimension
+from expert_work.protocol import AgentSpec, CheckResult, QuotaDimension, parse_upload_id
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import InMemoryObjectStore
@@ -71,6 +72,9 @@ class _AlwaysDenyQuotaService:
 _PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
+
+# The external plane's opaque upload id — see ``expert_work.protocol.user_upload``.
+_UPL = re.compile(r"^upl_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 _SPEC: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -189,7 +193,7 @@ async def test_upload_image_without_session_creates_one(ctx: _Ctx) -> None:
     assert resp.status_code == 201, resp.text
     data = resp.json()["data"]
     assert data["type"] == "image"
-    assert data["upload_id"]
+    assert _UPL.fullmatch(data["upload_id"])
     # Images cannot exist outside a session (the storage key embeds it), so the
     # endpoint mints one and hands it back for the follow-up run call.
     assert data["session_id"]
@@ -208,6 +212,16 @@ async def test_upload_image_without_session_creates_one(ctx: _Ctx) -> None:
     assert len(rows) == 1
     assert rows[0].user_id == end_user.id
     assert rows[0].thread_id == session_id
+
+    # The unified ``user_upload`` registry row (external附件模型统一, Task 2)
+    # must also exist, opaque-id-addressable, pointing at the same image ref.
+    user_upload_row = await ctx.app.state.user_upload_store.get(
+        upload_id=parse_upload_id(data["upload_id"]), tenant_id=ctx.tenant_id
+    )
+    assert user_upload_row is not None
+    assert user_upload_row.kind == "image"
+    assert user_upload_row.ref.startswith("expert_work://image/")
+    assert user_upload_row.user_id == end_user.id
 
 
 @pytest.mark.asyncio
@@ -262,7 +276,9 @@ async def test_upload_document_succeeds_for_an_api_key_caller(ctx: _Ctx) -> None
         headers=ctx.headers,
     )
     assert resp.status_code == 201, resp.text
-    assert resp.json()["data"]["type"] == "document"
+    body = resp.json()
+    assert body["data"]["type"] == "document"
+    assert _UPL.fullmatch(body["data"]["upload_id"])
 
     # The document must land in the DECLARED end user's workspace, not
     # merely "some non-None user" (a wrong-but-non-None user_id would slip
@@ -277,6 +293,16 @@ async def test_upload_document_succeeds_for_an_api_key_caller(ctx: _Ctx) -> None
     assert written_tenant_id == ctx.tenant_id
     assert written_user_id == end_user.id
     assert written_path.startswith("uploads/")
+
+    # The unified ``user_upload`` registry row (external附件模型统一, Task 2)
+    # must also exist, opaque-id-addressable, pointing at the same workspace path.
+    user_upload_row = await ctx.app.state.user_upload_store.get(
+        upload_id=parse_upload_id(body["data"]["upload_id"]), tenant_id=ctx.tenant_id
+    )
+    assert user_upload_row is not None
+    assert user_upload_row.kind == "document"
+    assert user_upload_row.ref.startswith("uploads/")
+    assert user_upload_row.user_id == end_user.id
 
 
 @pytest.mark.asyncio

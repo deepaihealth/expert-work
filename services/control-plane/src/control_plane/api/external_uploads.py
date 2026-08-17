@@ -41,7 +41,7 @@ bare ``{"detail": ...}`` shape.
 from __future__ import annotations
 
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -69,7 +69,8 @@ from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.protocol import Principal, QuotaDimension
+from expert_work.persistence.user_upload import UserUploadStore
+from expert_work.protocol import Principal, QuotaDimension, render_upload_id
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
@@ -140,6 +141,10 @@ def _get_image_upload_store(request: Request) -> ImageUploadStore:
     return request.app.state.image_upload_store  # type: ignore[no-any-return]
 
 
+def _get_user_upload_store(request: Request) -> UserUploadStore:
+    return request.app.state.user_upload_store  # type: ignore[no-any-return]
+
+
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
 
@@ -169,6 +174,7 @@ def build_external_uploads_router() -> APIRouter:
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         session_id: Annotated[UUID | None, Form()] = None,
     ) -> JSONResponse:
@@ -264,12 +270,23 @@ def build_external_uploads_router() -> APIRouter:
                     workspace_store=workspace_store,
                     audit=audit,
                 )
+                row = await uploads.insert(
+                    upload_id=uuid4(),
+                    tenant_id=tenant_id,
+                    user_id=end_user_id,
+                    thread_id=thread_id,
+                    kind="document",
+                    ref=doc_result.path,
+                    mime_type=content_type,
+                    size_bytes=doc_result.size_bytes,
+                    filename=doc_result.path.rsplit("/", 1)[-1],
+                )
                 return JSONResponse(
                     status_code=201,
                     content={
                         "success": True,
                         "data": {
-                            "upload_id": doc_result.path,
+                            "upload_id": render_upload_id(row.id),
                             "session_id": str(thread_id),
                             "type": "document",
                             "mime": content_type,
@@ -310,12 +327,23 @@ def build_external_uploads_router() -> APIRouter:
                 raw=raw,
                 content_type=content_type,
             )
+            row = await uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant_id,
+                user_id=end_user_id,
+                thread_id=thread_id,
+                kind="image",
+                ref=image_ref.to_uri(),
+                mime_type=content_type,
+                size_bytes=len(raw),
+                filename=f"{image_ref.image_id}{image_ref.ext}",
+            )
             return JSONResponse(
                 status_code=201,
                 content={
                     "success": True,
                     "data": {
-                        "upload_id": image_ref.to_uri(),
+                        "upload_id": render_upload_id(row.id),
                         "session_id": str(thread_id),
                         "type": "image",
                         "mime": content_type,
