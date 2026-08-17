@@ -36,7 +36,7 @@ sequenceDiagram
 
 创建方式、权限档位、轮换规则见 [认证与 Key](./auth)。拿到后放进每次请求的请求头：
 
-```
+``` [请求头]
 Authorization: Bearer aforge_pat_xxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -86,7 +86,9 @@ data: {"status":"success","run_id":"..."}
 | `success` | 正常答完 |
 | `paused` | 停在人工审批节点等你决策，**不是失败**，见 [4.2 审批决策](./run-control#_4-2-审批决策) |
 | `interrupted` | 被取消或中断 |
-| `error` | 失败，超时也归这一档 |
+| `error` | 失败，超时和步数用尽也归这一档 |
+
+这张表只是摘要。每个取值下客户端具体该做什么，见 [3.4 的 `end` 事件](./sse-events#end)。
 
 可回放的事件还会多一行 `id:`，格式是"毫秒时间戳-序号"（`end`、`token` 这类事件没有）。断线重连时把见过的最大 `seq` 传回去，服务端只补它之后的事件。
 
@@ -116,6 +118,6 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 |---|---|
 | 完整的请求参数、带附件、模板变量、防重复下发 | [2 跟 Agent 对话](./chat) |
 | 解析 SSE 事件、断线重连 | [3 读懂 SSE 流](./sse-events) |
-| 取消正在执行的任务、处理人工审批 | [4 对话过程中的控制](./run-control) |
+| 取消正在执行的 run、处理人工审批 | [4 对话过程中的控制](./run-control) |
 | 查历史会话、查执行记录、下载产出文件 | [5 查询与管理](./query) |
 | 各语言完整可运行示例 | [10 多语言示例](./examples) |

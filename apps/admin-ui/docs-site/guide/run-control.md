@@ -6,7 +6,7 @@ run 跑起来之后有两种介入方式：中途取消，或者对停在人工�
 
 ## 4.1 取消 run
 
-```
+``` [端点]
 POST /v1/agents/{agent_code}/runs/{run_id}:cancel
 Authorization: Bearer <key>   # 需要 write 权限
 Content-Type: application/json
@@ -44,6 +44,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 
 `stopped: false` 覆盖的最终状态包括：正常结束（`success`）、失败（`error` / `timeout`）、已被取消（`interrupted`），**也包括暂停等待审批（`paused`）**。换句话说，对一个等待审批的 run 调用取消，它不会消失也不会改变状态，仍然停在原地等决策。
 
+`stopped: true` 且中断信号真正生效时，这次 run 最终会落到 `interrupted` 状态（能在 [5.4 run 列表](./query#_5-4-run-列表) 的 `status`，或 SSE `end.status` 里看到）——但请看下面的 warning，`stopped: true` 不保证一定会走到这一步。
+
 ::: warning `stopped: true` 不等于"这次 run 一定以 interrupted 收场"
 取消是**尽力而为**的：中断信号在 Agent 的**步与步之间**生效。如果这个 run 在下一个检查点到来之前就自己跑完了（比如它正处在最后一步的生成过程中），它会**照常以 `success` 收尾**，尽管取消调用返回的是 `stopped: true`。
 
@@ -68,7 +70,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:cancel \
 
 ## 4.2 审批决策
 
-```
+``` [端点]
 POST /v1/agents/{agent_code}/runs/{run_id}:decide
 Authorization: Bearer <key>   # 需要 write 权限
 Content-Type: application/json
@@ -112,9 +114,11 @@ sequenceDiagram
 | `modified_args` | 请求体 | object | 仅 `decision: "modify"` 时必填 | 无默认；`decision` 非 `modify` 时**禁止**传，传了会 422 | 覆盖审批节点原参数的对象，形状见下文「modified_args 的形状」 |
 | `reason` | 请求体 | string | 否 | ≤2048 字符，无默认 | 只在 `decision: "reject"` 时有实际效果，见下文「reason 的作用范围」 |
 | `idempotency_key` | 请求体 | string | 否 | ≤255 字符，无默认 | **独立于发起对话用的 `Idempotency-Key` 请求头**，是另一套幂等域，按这次决策计算而非按 run 创建 |
-| `mode` | 请求体 | string（枚举） | 否 | `"stream"` \| `"queue"`，默认 `"stream"` | 决定响应形态，两种差异见下文「响应」一节 |
+| `mode` | 请求体 | string（枚举） | 否 | `"stream"` \| `"queue"`，默认 `"stream"` | `stream`：响应体直接是续跑的 SSE 事件流；`queue`：响应体是 202 JSON，不建立 SSE 连接。两种差异见下文「响应」一节 |
 
 请求体只接受上面这些字段；多传一个不认识的字段会 422（`INVALID_REQUEST`）。
+
+SSE `approval` 事件（见 [3 读懂 SSE 流](./sse-events)）里带的 `request_id`，只是那次审批请求自身的标识——**这个接口不接受它**：请求体只认上表列出的字段，多传任何字段（包括 `request_id`）都会 422 `INVALID_REQUEST`。
 
 #### decision 的三个取值
 
@@ -126,7 +130,7 @@ sequenceDiagram
 
 `reject` 之后 run 是否终止，取决于这次审批是怎么触发的：
 
-- **Agent manifest 里配置的强制审批点**（声明式审批，常见于高风险工具）：拒绝会终止整个 run。**但 `end.status` 依然是 `success`**——目前没有专门的"已拒绝"终态，要判断这次调用是否被拒绝，得看事件流里这次工具调用对应的结果消息。
+- **Agent 的策略里配置的强制审批点**（在 Agent 配置(manifest)里声明，常见于高风险工具；对应 SSE `approval` 事件里 `reason_kind: policy_gate`）：拒绝会终止整个 run。**但 `end.status` 依然是 `success`**——目前没有专门的"已拒绝"终态，要判断这次调用是否被拒绝，得看事件流里这次工具调用对应的结果消息。
 - **Agent 在执行过程中自己发起的确认请求**（内置的 `ask_for_approval`）：拒绝只是把一条"审批被拒绝"的结果喂给 Agent，run 会继续往下跑，Agent 可能换个方式重试或调整计划。
 
 #### modified_args 的形状

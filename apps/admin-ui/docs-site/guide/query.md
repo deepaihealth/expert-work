@@ -2,11 +2,13 @@
 
 本篇是发起对话之外的只读与管理接口：有哪些 Agent 可调、这个用户有哪些会话、某段会话说过什么、跑过哪些 run、Agent 产出的文件怎么下载、会话怎么重命名和归档。
 
-除标注外，这些接口都要求 `read` 权限（`write` key 含读，可直接用），查询参数 `user_id` 必填，分页参数为 `limit`（1–200，默认 50）和 `offset`（≥0，默认 0）。**例外见各小节**——5.1 不需要 `user_id`；5.6「列出文件」与 5.7「列出产物」不支持分页。
+除标注外，这些接口都要求 `read` 权限（`write` key 含读，可直接用），查询参数 `user_id` 必填，分页参数为 `limit`（1–200，默认 50）和 `offset`（≥0，默认 0）。`limit`/`offset` 传了范围外的值（比如 `limit=0`、`limit=201`、`offset=-1`）→ 422 `INVALID_REQUEST`。**例外见各小节**——5.1 不需要 `user_id`；5.6「列出文件」与 5.7「列出产物」不支持分页。
+
+**怎么判断翻到了最后一页**：5.1 Agent 目录的响应里有 `total`，判据见该小节。**5.2 会话列表、5.3 历史消息、5.4 run 列表这三个列表不返回 `total`，也不返回 `has_more`，响应里只回显你传入的 `limit`/`offset`**。这三个列表要判断是否翻到了最后一页，只能看这一页实际返回的条目数：等于 `limit` 说明可能还有下一页（把 `offset` 加上这一页条目数继续翻），小于 `limit` 说明已经翻完。
 
 ## 5.1 Agent 目录
 
-```
+``` [端点]
 GET /v1/agent-catalog
 ```
 
@@ -48,13 +50,15 @@ curl "https://<your-domain>/v1/agent-catalog?limit=50&offset=0" \
 
 ### 响应字段
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `agent_code` | string | 发起对话时填进 `POST /v1/agents/{agent_code}/runs` 路径的那个值。 |
-| `display_name` | string | 展示名。**永远非空**——没配置显示名的 Agent 这里回退成 `agent_code` 本身，不用自己做空值判断。 |
-| `description` | string | Agent 描述，租户内员工在管理控制台自己填的自由文本。 |
-| `available` | boolean | 现在能不能对它发起对话。 |
-| `total` | number | 去重后的 Agent 总数，不是版本记录数，也不是当前页条目数。 |
+| 字段 | 类型 | 含义 | 取值 |
+|---|---|---|---|
+| `agent_code` | string | 发起对话时填进 `POST /v1/agents/{agent_code}/runs` 路径的那个值 | 租户内唯一的标识串 |
+| `display_name` | string | 展示名。**永远非空**——没配置显示名的 Agent 这里回退成 `agent_code` 本身，不用自己做空值判断 | 非空字符串 |
+| `description` | string | Agent 描述，租户内员工在管理控制台自己填的自由文本 | 可能是空串 `""` |
+| `available` | boolean | 管理员有没有把这个 Agent **下线**。**只反映这一件事**——配额打满、租户被暂停、Agent 配置构建失败都不会让它变 `false`，但都会让发起对话失败(各有自己的错误码，见 [8 错误码总表](./errors)) | `true`(没下线)/ `false`(已下线，发起对话会得到 403 `AGENT_DISABLED`) |
+| `total` | number | 去重后的 Agent 总数，不是版本记录数，也不是当前页条目数 | 非负整数 |
+
+条目里**没有** `status` / `mode` / 版本号这类字段：「已上线」是靠「出现在列表里」表达的——一个 Agent 只要有一个已发布版本就会出现，全部版本都被废弃或删除时整条不出现(见下文)。想知道「能不能用」只看 `available`。
 
 ### `available` 与实际可用性有最长约 5 秒的偏差
 
@@ -81,7 +85,7 @@ curl "https://<your-domain>/v1/agent-catalog?limit=50&offset=0" \
 
 ## 5.2 会话列表
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/sessions
 ```
 
@@ -127,8 +131,14 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions?user_id=u-123&limit=
 | `session_id` | string（UUID） | 会话 id。 |
 | `title` | string | 会话标题，自动生成或由 [5.5 重命名](#_5-5-重命名与归档) 覆盖。 |
 | `created_at` / `updated_at` | string（ISO 8601） | 创建 / 最近更新时间。 |
-| `running` | boolean | 这段会话里当前还有没有 run 在执行——想粗粒度轮询"任务跑完没有"，看这个字段。 |
+| `running` | boolean | 这段会话里当前还有没有 run 在执行——想粗粒度轮询 run 跑完没有，看这个字段。判据见下方「`running` 的判据」。 |
 | `message_count` | number \| null | 见下方「`message_count` 的 `null` 与 `0`」。 |
+
+#### `running` 的判据
+
+`running` 为 `true`，当且仅当这段会话里存在至少一个 run 处于 `pending`、`queued`、`running` 三个状态之一（取值含义见 [5.4 run 列表](#_5-4-run-列表) 的 `status` 取值表）。
+
+**`paused`（停在审批门等人决策）不算 running**——一段有 run 在等审批的会话，这里是 `false`。想靠轮询这个字段等它变 `true` 来发现"有 run 在等审批"会永远等不到；要发现这种情况，看 SSE 的 `approval` 事件，或直接查 [5.4 run 列表](#_5-4-run-列表) 里 `status: "paused"` 的记录。
 
 #### `message_count` 的 `null` 与 `0`
 
@@ -145,10 +155,11 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions?user_id=u-123&limit=
 
 - `user_id` 是这个租户从没见过的值时，返回空列表而不是 404。
 - 已归档的会话默认不在这个列表里，见 [5.5](#_5-5-重命名与归档)；这个接口当前没有查询参数能拿回已归档的会话。
+- 这个接口不返回 `total` 或 `has_more`，判断是否翻到最后一页看这一页条目数是否小于 `limit`（见 5 章开头「怎么判断翻到了最后一页」）。
 
 ## 5.3 历史消息
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/sessions/{session_id}/messages
 ```
 
@@ -208,14 +219,16 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/message
 
 - `session_id` 不属于这个 `user_id` / `agent_code` 时返回 404（`SESSION_NOT_FOUND`），响应不会透露这段会话是否存在。
 - 如果服务端没有配置对话持久化组件，这个接口会对**所有**会话返回空消息列表，而不是报错——这是纯服务端配置问题，不是"这段会话真的没有消息"，你这边查不出来，遇到大面积异常的空历史可以联系租户管理员确认。
+- 这个接口不返回 `total` 或 `has_more`，判断是否翻到最后一页看这一页条目数是否小于 `limit`（见 5 章开头「怎么判断翻到了最后一页」）。
+- 这个接口的分页是在内存里对这段会话的完整历史做切片，不是数据库分页——会话越长，每次请求要读的历史就越多，不是一个恒定开销的操作。
 
 ## 5.4 run 列表
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/runs
 ```
 
-列出这个终端用户在这个 Agent 上跑过的 run——不用自己在本地攒一份 `run_id` 清单来做"我的任务列表"。
+列出这个终端用户在这个 Agent 上跑过的 run——不用自己在本地攒一份 `run_id` 清单来做"我的 run 列表"。
 
 ### 请求参数
 
@@ -224,7 +237,7 @@ GET /v1/agents/{agent_code}/runs
 | `agent_code` | 路径 | 是 | — | 要查询的 Agent 代码 |
 | `user_id` | 查询 | 是 | 1–255 字符 | 只看这个终端用户的 run。**没有默认值，漏传直接 422**，不会降级成"列出整个租户的 run"。 |
 | `session_id` | 查询 | 否 | UUID | 只看这一段会话里的 run。传了但这段会话不属于这个 `user_id` / `agent_code`，返回 404（`SESSION_NOT_FOUND`），不是空列表。 |
-| `status` | 查询 | 否 | 见下方「`status` 取值」 | 只看这个状态的 run |
+| `status` | 查询 | 否 | 见下方「`status` 取值」 | 只看这个状态的 run。传了枚举外的值 → 422 `INVALID_REQUEST` |
 | `limit` | 查询 | 否 | 1–200，默认 50 | 分页大小 |
 | `offset` | 查询 | 否 | ≥0，默认 0 | 分页偏移 |
 
@@ -267,12 +280,18 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 
 #### `status` 取值
 
-| 取值 | 是否最终状态 |
-|---|---|
-| `pending` / `queued` / `running` | 否 |
-| `success` / `error` / `timeout` / `interrupted` / `paused` | 是。只有走到最终状态，`finished_at` 才会被写上 |
+| 取值 | 含义 | 是否最终状态 | 客户端该怎么做 |
+|---|---|---|---|
+| `pending` | 刚创建，正在转成 `running` 的瞬时态 | 否 | 非终态，继续等待或接 SSE |
+| `queued` | 已进入队列，还没有实例认领执行 | 否 | 非终态，继续等待或接 SSE |
+| `running` | 正在执行 | 否 | 非终态，继续等待或接 SSE |
+| `success` | 正常跑完 | 是 | 按正常结果处理 |
+| `error` | 执行失败（含步数预算耗尽的情况） | 是 | 读下方「`error` 字段怎么读」 |
+| `timeout` | 保留值，今天不会出现 | 是 | 不用为它写处理分支 |
+| `interrupted` | 被主动取消 | 是 | 视为调用方自己中止的结果 |
+| `paused` | 停在审批门等人决策，**可以续跑** | 是 | 去 [4.2 审批决策](./run-control#_4-2-审批决策) 下达决策才能让这个 run 继续 |
 
-这里的取值比 SSE `end` 事件的 `status` 更细：`end` 只有四值，**这里的 `timeout` 在 `end` 里显示为 `error`**（见 [3.4 的 `end`](./sse-events#end)）。同一次 run 两处字样不同是正常的。
+只有走到最终状态，`finished_at` 才会被写上。这 8 个值是数据库里的原始状态；SSE `end` 事件的 `status`（见 [3.4 的 `end`](./sse-events#end)）只有四值，只在流即将收尾时出现一次——两者服务于不同的场景，不是同一套枚举，不用因为字段名相同就假设它们该完全对齐。
 
 #### `error` 字段怎么读
 
@@ -286,12 +305,13 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 ### 注意
 
 - `user_id` 是这个租户从没见过的值、且没传 `session_id` 时，返回空列表——与会话列表同一条规则。
+- 这个接口不返回 `total` 或 `has_more`，判断是否翻到最后一页看这一页条目数是否小于 `limit`（见 5 章开头「怎么判断翻到了最后一页」）。
 
 ## 5.5 重命名与归档
 
 ### 重命名
 
-```
+``` [端点]
 PATCH /v1/agents/{agent_code}/sessions/{session_id}
 ```
 
@@ -319,7 +339,9 @@ curl -X PATCH https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}
 
 ### 归档
 
-```
+对接方（你的服务端）随时可以把一段会话标记为归档——不需要它当前没有 run 在执行；归档只影响这段会话在默认列表里的可见性，不清除任何数据，细节见下方 warning。
+
+``` [端点]
 DELETE /v1/agents/{agent_code}/sessions/{session_id}
 ```
 
@@ -341,6 +363,8 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 ::: warning 归档是软删除，不是彻底删除
 归档只是把会话状态改成 `archived`。**历史消息、run 记录、工作区文件全部原样保留**，也照常能查（比如 `GET .../messages` 仍能读到已归档会话的内容）。彻底物理删除只在管理控制台内部提供，不对外开放。
 
+归档不影响这段会话里正在执行的 run——已经在跑的 run 会照常跑完，不会被归档动作打断或取消。
+
 归档后唯一可见的变化：这段会话从 `GET .../sessions` 的**默认**列表里消失。当前 API 没有对外的取消归档操作。
 :::
 
@@ -356,7 +380,7 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 
 ## 5.6 工作区文件
 
-Agent 执行任务时会往终端用户的持久工作区里写产出文件（报表、导出文件等），这两个接口用来列出和下载。
+Agent 执行 run 时会往终端用户的持久工作区里写产出文件（报表、导出文件等），这两个接口用来列出和下载。
 
 ::: warning `agent_code` 对这两个接口不生效
 工作区按 **(租户, 终端用户)** 维度存储，不按 Agent 分。URL 里的 `{agent_code}` 只是为了和这组接口的其它路径保持同样形状，**不参与过滤或权限判定**。同一个 `user_id` 配任意 `agent_code`（哪怕是一个根本不存在的 `agent_code`）拿到的都是**同一份**文件列表，同样返回 200。
@@ -368,7 +392,7 @@ Agent 执行任务时会往终端用户的持久工作区里写产出文件（�
 
 ### 列出文件
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/workspace/files
 ```
 
@@ -410,7 +434,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
 
 ### 下载单个文件
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/workspace/file
 ```
 
@@ -439,11 +463,15 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 
 #### `Content-Disposition` 分类
 
+判定按下表从上到下的顺序进行，一个扩展名只落进第一个匹配的分类：
+
 | 扩展名 | `Content-Disposition` | 原因 |
 |---|---|---|
-| 图片（`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico`）、结构化文本与代码（`.json` / `.yaml` / `.toml` / `.txt` / `.py` / `.md` 等） | `inline`，浏览器可直接预览 | — |
-| `.html` / `.htm` / `.xhtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.xslt` / `.mathml` | 强制 `attachment` | XSS 防护：避免浏览器把这些当同源 HTML/SVG 内联渲染，执行其中夹带的脚本 |
-| 任何未识别的扩展名（含无扩展名文件） | 强制 `attachment` | 宁可多一次没必要的下载，也不猜错类型 |
+| `.html` / `.htm` / `.xhtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.xslt` / `.mathml` | `attachment`（优先于下面所有分类判断） | XSS 防护：避免浏览器把这些当同源 HTML/SVG 内联渲染，执行其中夹带的脚本 |
+| `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico` | `inline` | 图片，浏览器可直接预览，不会被当脚本执行 |
+| `.json` / `.jsonl` / `.ndjson` / `.yaml` / `.yml` / `.toml` | `inline` | 结构化文本数据，浏览器可直接预览，不会被当脚本执行 |
+| `.txt` / `.log` / `.md` / `.markdown` / `.rst` / `.csv` / `.tsv` / `.ini` / `.conf` / `.py` / `.js` / `.mjs` / `.cjs` / `.jsx` / `.ts` / `.tsx` / `.go` / `.rs` / `.java` / `.kt` / `.scala` / `.rb` / `.php` / `.sh` / `.bash` / `.zsh` / `.fish` / `.sql` / `.c` / `.h` / `.cc` / `.cpp` / `.hpp` / `.cs` / `.swift` / `.dart` / `.lua` / `.r` / `.jl` / `.pl` / `.vue` | `inline` | 纯文本与源码，统一按文本展示，浏览器会显示源码而不会执行它 |
+| 其它任何未识别的扩展名（含无扩展名文件） | `attachment` | 宁可多一次没必要的下载，也不猜错类型 |
 
 #### `path` 的合法形态
 
@@ -484,7 +512,7 @@ Agent 在执行过程中可以把一份成果**登记成产物**（比如一份�
 
 ### 列出产物
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/artifacts
 ```
 
@@ -522,11 +550,13 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 | 字段 | 说明 |
 |---|---|
 | `name` | 产物名，在同一个终端用户下唯一。下载和删除都用它 |
-| `kind` | `document` / `code` / `data` / `other`，由 Agent 保存时声明 |
+| `kind` | 产物类别，由 Agent 保存时声明:`document`(文稿 / 报表类)/ `code`(源码)/ `data`(数据文件)/ `other`(其它)。服务端**不校验**这个值，也不提供对外改它的接口——解析时遇到这四个之外的值按 `other` 处理 |
 | `latest_version` | 版本号。Agent 每次用同名保存一次就 +1 |
 | `created_at` / `updated_at` | 首次创建 / 最近一次更新时间 |
 
 **列表里没有文件大小。** 大小和校验和是**首次下载时才记录**的，列表里给出来大部分是 `null`，反而误导。
+
+**列表里也没有状态字段。** 产物没有「草稿 / 已发布」这类状态:出现在列表里就是存活的，被删除的不再出现(见下文「删除产物」)。
 
 #### 注意
 
@@ -535,7 +565,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 
 ### 下载产物
 
-```
+``` [端点]
 GET /v1/agents/{agent_code}/artifacts/download
 ```
 
@@ -556,7 +586,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 成功响应是**文件字节流本身**，**不套 `{success, data, error}` 信封**——那个形状只包裹错误响应。`Content-Disposition` 的规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致：HTML / SVG 这类可执行内容强制 `attachment`，响应始终带 `X-Content-Type-Options: nosniff`。
 
-**这条接口计入配额。** 每次下载扣 1 次 `artifact_download` 额度（同时计入 `ARTIFACT_DOWNLOAD_COUNT_30D` 这个 30 天滑动窗口维度）。超限时返回 **429 `RATE_LIMIT_EXCEEDED`**（带 `Retry-After` 头）——**不是** `QUOTA_EXCEEDED`：这条接口的配额准入统一走限流引擎，任何维度耗尽都翻成同一个 `RATE_LIMIT_EXCEEDED`，见 [8.11 429](./errors#_8-11-429-——-两种情况-含义不同)。**不要**照 `Retry-After` 头做短退避重试——`ARTIFACT_DOWNLOAD_COUNT_30D` 是 30 天窗口慢速回补，短退避基本等于无限重试打空，命中这个 429 应该当作「这个终端用户的下载额度打满了」来处理，不是「这会儿太忙等等再试」。
+这条接口计入 `artifact_download` 配额（30 天滑动窗口），超限时返回 429 `RATE_LIMIT_EXCEEDED`；完整含义、和 `QUOTA_EXCEEDED` 的区别、`Retry-After` 该怎么用，见 [8.11 429](./errors#_8-11-429-——-两种情况-含义不同)。
 
 #### 错误情况
 
@@ -570,7 +600,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 ### 删除产物
 
-```
+``` [端点]
 DELETE /v1/agents/{agent_code}/artifacts
 ```
 
@@ -590,15 +620,14 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u
 { "success": true, "data": { "deleted": "2026-08 周报.docx" }, "error": null }
 ```
 
-::: warning 这是软删除——工作区里的字节不会被这个 API 清除
-产物从「产物视图」（这三条接口：列表、下载、删除）里消失了，但**工作区里的文件字节从始至终没有被删除**，保留期后台清理任务到期后做的也**不是**删字节——那个任务只物理清掉产物的元数据行（名字、版本号这些），不碰底层文件本身。
-
-也就是说：只要还记得这个文件在工作区里的原始路径，删除之后（甚至保留期过了、元数据行都被后台任务清掉之后）仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的 `GET /v1/agents/{agent_code}/workspace/file` 原样下载到这份内容。**如果你把「删除产物」当成对终端用户「删除我的数据」的承诺，这条 API 目前不满足这个承诺**——它只是把这份产物从「成果清单」里摘下来，不是销毁数据；真要清除底层字节，眼下没有对外的操作能做到。
-
-如果 Agent 之后又用同一个 `name` 保存了一次，这个产物会**恢复**（版本号接着往上加）。
-
-当前 API 没有对外的撤销删除操作。
+::: danger 这不是「删除数据」——工作区里的字节不会被这个 API 清除
+- 产物从「产物视图」（这三条接口：列表、下载、删除）里消失了，但**工作区里的文件字节从始至终没有被删除**。
+- 保留期到了之后后台清理作业做的也**不是**删字节——它只物理清掉产物的元数据行（名字、版本号这些），不碰底层文件本身。
+- 所以只要还记得这个文件在工作区里的原始路径，删除之后（甚至元数据行都被清掉之后）仍然可以用 [5.6 工作区文件](#_5-6-工作区文件) 的 `GET /v1/agents/{agent_code}/workspace/file` 原样下载到这份内容。
+- **如果你把「删除产物」当成对终端用户「删除我的数据」的承诺，这条 API 目前不满足这个承诺**——它只是把这份产物从「成果清单」里摘下来；真要清除底层字节，眼下没有对外的操作能做到。
 :::
+
+删除后如果 Agent 又用同一个 `name` 保存了一次，这个产物会**恢复**（版本号接着往上加）。当前 API 没有对外的撤销删除操作。
 
 #### 注意
 
