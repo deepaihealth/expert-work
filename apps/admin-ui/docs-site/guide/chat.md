@@ -76,7 +76,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 ### 发起对话的常见错误
 
-| 状态码 | `error.code` | 触发条件 |
+| 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 403 | `AGENT_DISABLED` | 这个 Agent 已被管理员下线 |
 | 404 | `AGENT_NOT_FOUND` | `{agent_code}` 在该租户下没有已发布版本 |
@@ -197,7 +197,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/sessions \
 
 这个端点特有的失败响应，都能读到 `error.code`：
 
-| 状态码 | `error.code` | 触发条件 |
+| 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 403 | `AGENT_DISABLED` | 这个 Agent 已被管理员下线 |
 | 404 | `AGENT_NOT_FOUND` | `{agent_code}` 在该租户下没有已发布版本 |
@@ -423,7 +423,7 @@ HTML、SVG 这类可执行内容在平台上强制为 `attachment`；上传接�
 
 条数与单块长度是两条互相独立的限制，两者都取闭区间：等于上限值合法，超过才拒绝。
 
-| 限制项 | 上限值 | 超限时的 `error.code` |
+| 限制项 | 上限值 | 超限时的错误码 |
 |---|---|---|
 | 数组条数 | 16 项 | `INVALID_REQUEST`（走请求体字段校验） |
 | 单块字符数 | 8192 字符 | `UNTRUSTED_CONTENT_BLOCK_TOO_LONG` |
@@ -458,7 +458,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 另有三条容量限制，超限时的响应能读到 `error.code`。三条互相独立，同样取闭区间：等于上限值合法，超过才拒绝。
 
-| 限制项 | 上限值 | 超限时的 `error.code` |
+| 限制项 | 上限值 | 超限时的错误码 |
 |---|---|---|
 | 键数量 | 64 个 | `TOO_MANY_INPUT_KEYS` |
 | 单个字符串值的字符数 | 8192 字符 | `INPUT_VALUE_TOO_LONG` |

@@ -131,7 +131,7 @@ GET /v1/agents/{agent_code}/sessions
 | `created_at` | string（ISO 8601） | 创建时间 |
 | `updated_at` | string（ISO 8601） | 最近更新时间 |
 | `running` | boolean | 这段会话里当前有没有正在执行的 run，取值规则见下文 |
-| `message_count` | number \| null | 这段会话里客户端可见的消息条数。`null` 与 `0` 含义不同，见下文 |
+| `message_count` | integer \| null | 这段会话里客户端可见的消息条数。`null` 与 `0` 含义不同，见下文 |
 
 ### 示例
 
@@ -559,7 +559,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 
 #### 错误
 
-| 状态码 | `error.code` | 触发条件 |
+| 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 400 | `WORKSPACE_FILE_FAILED` | `path` 不合法，见上文「path 的合法形态」 |
 | 404 | `WORKSPACE_FILE_FAILED` | `user_id` 不存在，或者 `path` 指向的文件不存在。两种情况返回同一个 404，服务端刻意不区分 |
@@ -673,7 +673,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 #### 错误
 
-| 状态码 | `error.code` | 触发条件 |
+| 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除，或者不属于这个 `user_id`，三种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
@@ -681,7 +681,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录存在，服务端读不到它的内容。重试无效，请联系租户管理员 |
 | 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储，产物内容整体不可读。重试无效，请联系租户管理员 |
 
-500 与 503 的 `error.code` 相同，靠 HTTP 状态码区分是「读取权限配置有问题」（500）还是「没有配置存储」（503）。两者都不是退避重试能解决的。
+500 与 503 的 `error.code` 相同，靠 HTTP 状态码区分是「读取权限配置有问题」（500）还是「没有配置存储」（503）。两者都不是退避重试能解决的。配额服务不可用时，这个接口另有一个只有 `detail` 字段的 503，见 [8.2](./errors#_8-2-错误响应的两种格式)。
 
 ### 删除产物
 

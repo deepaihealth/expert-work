@@ -99,7 +99,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 429 的错误码只有两个：
 
-- `RATE_LIMIT_EXCEEDED`：调用频率超限，或者按次数、按字节计的配额用尽。响应带 `Retry-After` 头，`error.dimension` 说明是哪一项限制被触发。
+- `RATE_LIMIT_EXCEEDED`：调用频率超限，或者按次数、按字节计的配额用尽。响应带 `Retry-After` 头，`error.dimension` 说明是哪一项限制被触发；网关这一层的 429 没有 `dimension`，解析时留缺省值。
 - `QUOTA_EXCEEDED`：只出现在上传文档时终端用户的工作区容量已满。响应不带 `Retry-After` 头，也没有 `dimension` 字段。
 
 拿到 429 时的处理顺序：先读 `error.code`；是 `RATE_LIMIT_EXCEEDED` 时再读 `error.dimension`，按它决定是退避后重试，还是按「配额已用尽」处理。`dimension` 的取值、每个取值对应的处理方式，以及两种响应的样例，都在 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)。
