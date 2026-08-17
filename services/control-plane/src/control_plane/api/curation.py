@@ -189,12 +189,15 @@ def build_curation_router() -> APIRouter:
         prefix="/v1/curation", tags=["curation"], dependencies=[Depends(console_only())]
     )
 
-    # Employee RBAC (2026-08-14). The router-level ``console_only`` blocks a
-    # third-party API key; it says nothing about which employee may do what, and
-    # ``GET /candidates/{id}`` returns the end user's full conversation
-    # transcript. Ruling: curation is an operations workflow, so every employee
-    # may read (viewer / operator / admin all hold ``session:read``); deciding a
-    # candidate's fate is a write and needs operator+.
+    # Employee RBAC. The router-level ``console_only`` blocks a third-party API
+    # key; it says nothing about which employee may do what.
+    #
+    # 2026-08-14:候选的 promote / dismiss 收到 operator+(决定一条候选的去留是写)。
+    # 2026-08-17(阶段 1 收尾):**详情读也收到 operator+**。分界线划在"要不要交出
+    # 终端用户的完整对话原文"这一层 —— 候选列表只有元数据,仍是 ``session:read``,
+    # 全员可读;``GET /candidates/{id}`` 交出 ``trajectory.messages`` 原文,挂
+    # ``session:write``。RBAC 里 viewer 与 operator 的唯一分界就是 write / debug,
+    # 所以一条读端点挂 write 是刻意的,不是笔误。
     @router.get(
         "/candidates",
         response_model=None,
@@ -240,7 +243,17 @@ def build_curation_router() -> APIRouter:
     @router.get(
         "/candidates/{candidate_id}",
         response_model=None,
-        dependencies=[Depends(require("session", "read"))],
+        # 阶段 1 收尾裁决(2026-08-17):这是一条**读**端点,却挂 ``"write"``。
+        # 它交出的是终端用户的完整对话原文(``trajectory.messages``),而 RBAC 里
+        # viewer 与 operator 的唯一分界就是 ``write`` / ``debug`` —— viewer 也持
+        # ``session:read``,挂 read 等于不设防。候选**列表**(只有元数据)仍是
+        # ``read``,分界线刻意划在"要不要交出原文"这一层。
+        #
+        # 对齐关系:``sessions.py`` / ``runs.py`` / ``plan.py`` 走
+        # ``caller_owns_thread``,对非 admin 员工直接拒;curation 是运营审阅面,
+        # 需要跨用户可见(模块 docstring 有明文),所以收到 operator+ 而不是加
+        # owner 过滤 —— 后者会让候选列表对审阅员恒空,等于废掉这个功能。
+        dependencies=[Depends(require("session", "write"))],
     )
     async def get_candidate(
         candidate_id: UUID,

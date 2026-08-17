@@ -576,6 +576,12 @@ async def test_curation_detail_tenant_id_star_400(ctx: _Ctx) -> None:
 # transcript AND promote/dismiss candidates. Ruling (2026-08-14): reads stay
 # open to every employee (a conversation is an operations object — QA review,
 # eval curation), writes need operator+.
+#
+# 阶段 1 收尾裁决(2026-08-17,用户拍板):**详情读也收到 operator+**。
+# 候选列表只有元数据,读它仍是全员;但详情端点交出的是终端用户的**完整对话原文**,
+# 而 viewer 是最宽的一档(常发给"只需要看看指标"的人)。审阅是主动工作,本来就是
+# operator 的职责。这也把 curation 与 ``sessions.py`` / ``runs.py`` / ``plan.py``
+# 的差距收窄了一档——那三处走 ``caller_owns_thread``,对非 admin 员工直接拒。
 
 
 def _employee(*roles: str) -> dict[str, str]:
@@ -584,14 +590,34 @@ def _employee(*roles: str) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_viewer_reads_candidates(ctx: _Ctx) -> None:
+async def test_viewer_reads_list_but_not_transcript(ctx: _Ctx) -> None:
+    """viewer 能看候选列表(元数据),但读不到完整对话原文。
+
+    列表与详情分开断言:两条端点挂的是不同的闸,把它们写进同一条测试是为了
+    钉住"分界线在详情这一层"——只收紧详情、不误伤列表。
+    """
     candidate = await ctx.seed_candidate()
     listed = await ctx.client.get("/v1/curation/candidates", headers=_employee("viewer"))
     assert listed.status_code == 200, listed.text
+
     detail = await ctx.client.get(
         f"/v1/curation/candidates/{candidate.id}", headers=_employee("viewer")
     )
+    assert detail.status_code == 403, detail.text
+    assert detail.json()["detail"]["code"] == "FORBIDDEN"
+    # 403 要真的挡在交出原文之前 —— 响应体里不能有轨迹。
+    assert "trajectory" not in detail.text
+
+
+@pytest.mark.asyncio
+async def test_operator_reads_transcript(ctx: _Ctx) -> None:
+    """operator 照旧能读完整轨迹 —— 收紧不能把审阅功能本身废掉。"""
+    candidate = await ctx.seed_candidate()
+    detail = await ctx.client.get(
+        f"/v1/curation/candidates/{candidate.id}", headers=_employee("operator")
+    )
     assert detail.status_code == 200, detail.text
+    assert "trajectory" in detail.json()
 
 
 @pytest.mark.asyncio
