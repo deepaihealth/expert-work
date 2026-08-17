@@ -98,16 +98,6 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 }
 ```
 
-::: warning 破坏性变更：202 响应体已改成 `{success, data, error}` 形状
-这个形状是当前的、也是唯一正确的形状。如果你的对接代码写于这次更新之前，请检查它有没有直接读顶层的 `run_id` / `thread_id` / `status`——旧版本的响应体是不带 `success` / `data` / `error` 包裹的扁平结构：
-
-```json
-{ "run_id": "...", "thread_id": "...", "status": "queued" }
-```
-
-现在这三个字段都在 `data` 里。按 `data.run_id` / `data.thread_id` / `data.status` 读取。
-:::
-
 `queue` 模式下想看执行过程或拿最终结果，有两条路：
 
 **接事件流**：`GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=<同一个 user_id>`。run 还在跑就实时接进去，跑完了就把存下来的事件按顺序回放一遍，结尾补一条带最终状态的 `end`。

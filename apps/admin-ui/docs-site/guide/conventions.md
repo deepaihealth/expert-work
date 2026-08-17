@@ -34,30 +34,31 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 |---|---|---|
 | `Authorization: Bearer <key>` | 全部端点 | 见 [6 认证与 Key](./auth) |
 | `Content-Type: application/json` | 除文件上传外的全部写请求 | 文件上传（`POST /v1/agents/{agent_code}/uploads`）用 `multipart/form-data` |
-| `Idempotency-Key` | 仅 `POST /v1/agents/{agent_code}/runs` | 见 [7.6 幂等性](#_7-7-幂等性) |
+| `Idempotency-Key` | 仅 `POST /v1/agents/{agent_code}/runs` | 见 [7.7 幂等性](#_7-7-幂等性) |
 | `X-Expert-Work-Deadline-Ms`（可选） | 任意端点 | 你自己设的绝对截止时间（unix 毫秒时间戳）。已经过去就直接 504（`DEADLINE_EXCEEDED`）。不需要端到端超时控制就别传 |
 
 ## 7.4 响应头
 
-这三个响应头**不是每种响应都会一起出现**，别假设它们成套出现：
+下面这些响应头**不是每种响应都会一起出现**，别假设它们成套出现：
 
 | 响应头 | 出现在哪 | 含义 |
 |---|---|---|
 | `X-Expert-Work-Run-Id` | 发起对话的 `stream` 模式（含幂等重放）、事件回放、审批决策（两种模式都带） | 这次响应对应的 `run_id`。**发起对话的 `queue` 模式不带这个头**——`run_id` 只在响应体 `data.run_id` 里。审批决策给的是**续跑的新 run id** |
 | `X-Expert-Work-Session-Id` | 发起对话的 `stream` 模式（含幂等重放）、事件回放 | 这次绑定或续接到的 `session_id`。**审批决策的两种响应都不带**——续跑的会话就是原会话，没有变化 |
 | `X-Expert-Work-Stream-Mode` | 事件回放；以及发起对话在 `stream` 模式下命中幂等重放时 | `live`（run 还在跑，接的是实时流）或 `replay`（run 已结束，按存下来的事件顺序回放）。**首次发起的 `stream` 响应不带**（直接就是新流，没有实时/回放之分）；**审批决策的两种响应也都不带** |
+| `X-Expert-Work-Next-Seq` | 只在回放被分页截断时 | 下一页应当传回去的 `since_seq`。同一个值也在流末尾的 `truncated` 事件里，**以事件为准更稳**（中间代理会剥掉不认识的响应头）。见 [3.6 断线重连与回放分页](./sse-events#_3-6-断线重连与回放分页) |
 
 ## 7.5 统一响应格式
 
 成功：
 
-```json
+```json [响应 · 成功]
 { "success": true, "data": { /* 具体端点的数据 */ }, "error": null }
 ```
 
 失败：
 
-```json
+```json [响应 · 失败]
 { "success": false, "data": null, "error": { "code": "SOME_CODE", "message": "..." } }
 ```
 
@@ -78,6 +79,10 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 | 怎么办 | 退避重试 | 退避重试解决不了，先清理占用的资源 |
 
 拿到 429 先看 `error.code` 判断是哪一种。完整的 `dimension` 字段含义和响应样例见 [8.11 429](./errors)。
+
+::: warning 一个例外:产物下载
+产物下载端点的**配额**也翻成 `RATE_LIMIT_EXCEEDED`（并且带 `Retry-After`），因为它的配额准入统一走限流引擎。但它扣的是 `ARTIFACT_DOWNLOAD_COUNT_30D` 这个 **30 天滑动窗口**——**照 `Retry-After` 做短退避重试是无效的**，那个额度不会在几秒内回补。命中它应当按「这个终端用户的下载额度打满了」处理。见 [5.7 产物](./query#_5-7-产物)。
+:::
 
 ## 7.7 幂等性
 

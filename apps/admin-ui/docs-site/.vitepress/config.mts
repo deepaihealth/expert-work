@@ -50,12 +50,12 @@ export default withMermaid(
               text: "3 读懂 SSE 流",
               link: "/guide/sse-events",
               items: [
-                { text: "3.1 帧格式", link: "/guide/sse-events#_3-1-帧格式" },
-                { text: "3.2 事件总表", link: "/guide/sse-events#_3-2-事件总表" },
-                { text: "3.3 updates 帧怎么解析", link: "/guide/sse-events#_3-3-updates-帧怎么解析" },
-                { text: "3.4 token 帧", link: "/guide/sse-events#_3-4-token-帧" },
-                { text: "3.5 worker / guard / compaction 帧", link: "/guide/sse-events#_3-5-worker-guard-compaction-帧" },
-                { text: "3.6 断线重连", link: "/guide/sse-events#_3-6-断线重连" },
+                { text: "3.1 先看一眼:事件流长什么样", link: "/guide/sse-events#_3-1-先看一眼-一次-run-的事件流长什么样" },
+                { text: "3.2 事件的格式", link: "/guide/sse-events#_3-2-事件的格式" },
+                { text: "3.3 事件一览(按出现顺序)", link: "/guide/sse-events#_3-3-事件一览-按出现顺序" },
+                { text: "3.4 每个事件怎么处理", link: "/guide/sse-events#_3-4-每个事件怎么处理" },
+                { text: "3.5 建议的接收器骨架", link: "/guide/sse-events#_3-5-建议的接收器骨架" },
+                { text: "3.6 断线重连与回放分页", link: "/guide/sse-events#_3-6-断线重连与回放分页" },
               ],
             },
             {
@@ -140,7 +140,31 @@ export default withMermaid(
       outline: { label: "本页目录", level: [2, 3] },
       footer: {
         message: "对外 API 版本 v1",
-        copyright: "文档更新于 2026-08-16",
+        copyright: "文档更新于 2026-08-17",
+      },
+    },
+    markdown: {
+      config(md) {
+        const fence = md.renderer.rules.fence!
+        md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+          // VitePress 内置 preWrapperPlugin 会在渲染时把 [title] 从 token.info 剥掉
+          // (副作用发生在下面这次 fence() 调用内部),所以必须在调用前先取值
+          const token = tokens[idx]
+          const m = /\[([^\]]+)\]/.exec(token.info)
+          const html = fence(tokens, idx, options, env, self)
+          if (!m) return html
+          // 在 ::: code-group 里,[title] 已经是 tab 名,不再重复画标题栏
+          for (let i = idx - 1; i >= 0; i--) {
+            const t = tokens[i]
+            if (t.type === 'container_code-group_open') return html
+            if (t.type === 'container_code-group_close') break
+          }
+          const title = md.utils.escapeHtml(m[1])
+          return html.replace(
+            /^(<div class="language-[^"]*"[^>]*>)/,
+            `$1<div class="ew-code-title">${title}</div>`
+          )
+        }
       },
     },
   }),
