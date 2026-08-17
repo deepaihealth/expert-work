@@ -10,3 +10,12 @@
 .vp-doc div[class*='language-']:has(.ew-code-title) > pre { margin-top: 0; }
 .vp-doc div[class*='language-']:has(.ew-code-title) > .lang { top: 8px; }
 .vp-doc div[class*='language-']:has(.ew-code-title) > .copy { top: 44px; }
+
+/* 宽屏版式:默认主题把整站居中收在 1440px 里(--vp-layout-max-width),
+   正文列只有 688px——2K 以上的屏幕左边空出一大块、正文挤在中间。
+   放开到全宽(侧栏贴左),正文列放宽到 960px;窄屏不受影响。 */
+:root { --vp-layout-max-width: 100vw; }
+.VPDoc.has-aside .content-container { max-width: 960px !important; }
+/* 正文 + 右侧目录整体靠左跟着侧栏走(不再在剩余空间里居中),
+   上限 1440px:正文 960 + 内边距 64 + 目录 256 + 间距,余下的留在右边。 */
+.VPDoc.has-sidebar .container { max-width: 1440px; margin: 0; }
