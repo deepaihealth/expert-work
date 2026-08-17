@@ -87,6 +87,7 @@ from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore, DuplicateAgentSpecError
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
@@ -98,9 +99,9 @@ from expert_work.protocol import (
     Principal,
     Provider,
     TenantPlan,
+    parse_upload_id,
     tier_satisfies,
 )
-from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunEventStore, RunIdempotencyConflict, RunInfo, RunStore
 from expert_work.runtime.stream_bridge import StreamBridge
@@ -525,17 +526,16 @@ class BindSessionRequest(BaseModel):
 
 
 class ExternalFileRef(BaseModel):
-    """一条附件引用。``upload_id`` 是 ``POST /v1/agents/{code}/uploads`` 的返回值。
-
-    ``transfer_method`` 目前只有 ``local_file``。字段现在就存在是为了日后加
-    ``remote_url`` 时只是扩枚举(向后兼容),而不是改形状(破坏性)。
+    """一条附件引用。``upload_id`` 是 ``POST /v1/agents/{code}/uploads`` 返回的
+    ``upl_<uuid>`` id(``expert_work.protocol.user_upload``)—— 对外附件模型
+    统一(spec 2026-08-17):``kind``(image / document)与存储位置现在都记在
+    ``user_upload`` 登记表里,由 ``run_agent_for_user`` 按该 id 查表分流,不
+    再要求调用方自己回传 ``type`` / ``transfer_method``。
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    type: Literal["image", "document"]
-    transfer_method: Literal["local_file"] = "local_file"
-    upload_id: str = Field(min_length=1, max_length=1024)
+    upload_id: str = Field(min_length=1, max_length=64)
 
 
 class ExternalRunRequest(BaseModel):
@@ -548,7 +548,6 @@ class ExternalRunRequest(BaseModel):
     session_id: UUID | None = None
     input: str | None = Field(default=None, max_length=MAX_RUN_INPUT_CHARS)
     mode: Literal["stream", "queue"] = "stream"
-    image_refs: list[str] = Field(default_factory=list, max_length=64)
     #: 单块长度上限(``MAX_UNTRUSTED_CONTENT_BLOCK_CHARS``,与内部
     #: ``RunRequest._bound_untrusted_blocks`` 同值)未在这个字段声明里体现
     #: ——同 ``inputs`` 一样,必须在 ``run_agent_for_user`` 里手工预检(P2-a
@@ -564,12 +563,15 @@ class ExternalRunRequest(BaseModel):
     #: 预检——见下方 ``run_agent_for_user`` 里 ``RunRequest`` 手工构造前的
     #: 检查,原因同 ``TOO_MANY_IMAGE_REFS``。
     inputs: dict[str, Any] = Field(default_factory=dict)
-    #: P2 块 1 —— 统一附件引用。``type == "image"`` 的条目合并进
-    #: ``image_refs`` 交给 ``spawn_run`` 里现成的 ``_validate_image_refs``
-    #: 做 thread 绑定 / 条数上限 / ``supports_vision`` 三重校验(见
-    #: ``run_agent_for_user``)。``type == "document"`` 的条目在同一处过
-    #: ``_safe_document_name_or_422`` 净化后并入 ``RunRequest.document_names``
-    #: (Task 11)。
+    #: 对外附件模型统一(spec 2026-08-17,Task 3)—— 每条只带一个
+    #: ``upload_id``,由 ``run_agent_for_user`` 里的解析块按
+    #: ``UserUploadStore.get`` 查出的行分流:``kind == "image"`` 的 ``ref``
+    #: 并入内部 ``image_refs``(交给 ``spawn_run`` 里现成的
+    #: ``_validate_image_refs`` 做 thread 绑定 / 条数上限 /
+    #: ``supports_vision`` 三重校验),``kind == "document"`` 的 ``ref`` 过
+    #: ``_safe_document_name_or_422`` 净化(防御纵深)后并入内部
+    #: ``RunRequest.document_names``。未知 / 不属于本次调用的 ``end_user_id``
+    #: / 图片行绑错 session 的行一律 404 ``UPLOAD_NOT_FOUND``(不透露存在与否)。
     files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
 
     # External-API-v1 P2-b NUL-byte hardening — ``input`` lands in
@@ -1225,37 +1227,61 @@ def build_agents_router() -> APIRouter:
         except AgentFactoryError as exc:
             return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
 
-        # P2 块 1 —— files[] 的 image 条目并进 image_refs;_validate_image_refs
-        # (spawn_run 内部)对合并后的完整列表做 thread 绑定 / 条数上限 /
-        # supports_vision 三重校验,files[] 与既有 image_refs 都过同一道闸。
-        image_refs = [
-            *payload.image_refs,
-            *(f.upload_id for f in payload.files if f.type == "image"),
-        ]
-        # RunRequest is hand-constructed below (not the FastAPI request body),
-        # so a merged list past its own image_refs max_length never reaches
-        # the RequestValidationError → 422 path — it would raise an uncaught
-        # pydantic ValidationError (500) instead. Pre-check explicitly.
-        if len(image_refs) > MAX_RUN_IMAGE_REFS:
+        # 对外附件模型统一(spec 2026-08-17,Task 3)—— files[] 的每一条只带
+        # 一个 upload_id,按 UserUploadStore 查表分流成内部 image_refs /
+        # document_names。格式不对 → 422 INVALID_UPLOAD_ID;查不到 / 不属于
+        # 这个 end_user_id / 已软删 → 统一 404 UPLOAD_NOT_FOUND(不透露存在
+        # 与否,与既有 SESSION_NOT_FOUND / RUN_NOT_FOUND 同一模式);image 行
+        # 还必须绑定本次会话的 thread_id(既有 ADR-0004 规则,原来由
+        # _validate_image_refs 在 spawn_run 内部对 URI 里编码的 thread 做,
+        # 这里对登记表里的 thread_id 提前做同一件事,给出更精确的错误码)。
+        # document 行的 ref 经 _safe_document_name_or_422 净化(防御纵深 ——
+        # 上传时已净化过一次,run 是独立请求,不信任登记表之外的输入路径)。
+        uploads_store: UserUploadStore = request.app.state.user_upload_store
+        image_refs: list[str] = []
+        document_names: list[str] = []
+        try:
+            for item in payload.files:
+                uid = parse_upload_id(item.upload_id)
+                if uid is None:
+                    raise ExternalScopeError(
+                        "INVALID_UPLOAD_ID",
+                        "upload_id must be the value returned by POST "
+                        "/v1/agents/{agent_code}/uploads",
+                        422,
+                    )
+                row = await uploads_store.get(upload_id=uid, tenant_id=tenant_id)
+                if row is None or row.user_id != end_user_id or row.deleted_at is not None:
+                    raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+                if row.kind == "image":
+                    if row.thread_id != thread_id:
+                        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+                    image_refs.append(row.ref)
+                else:
+                    document_names.append(_safe_document_name_or_422(row.ref))
+            # RunRequest is hand-constructed below (not the FastAPI request
+            # body), so a count past its own image_refs max_length never
+            # reaches the RequestValidationError → 422 path — it would raise
+            # an uncaught pydantic ValidationError (500) instead. files[]'s
+            # own max_length already ties to MAX_RUN_IMAGE_REFS today, but
+            # this pre-check is the defense-in-depth backstop if that ever
+            # drifts (same root cause as the untrusted_content / inputs
+            # pre-checks below).
+            if len(image_refs) > MAX_RUN_IMAGE_REFS:
+                raise ExternalScopeError(
+                    "TOO_MANY_IMAGE_REFS",
+                    f"files[] 里的图片不能超过 {MAX_RUN_IMAGE_REFS} 张",
+                    422,
+                )
+        except ExternalScopeError as exc:
+            return _envelope_error(exc.code, exc.message, exc.status_code)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
             return _envelope_error(
-                "TOO_MANY_IMAGE_REFS",
-                f"files[] 与 image_refs 合计不能超过 {MAX_RUN_IMAGE_REFS} 张图片",
-                422,
+                detail.get("code", "INVALID_FILE_REF"),
+                detail.get("message", "invalid file reference"),
+                exc.status_code,
             )
-        # P2-a 安全修复(Critical)—— 同样是"RunRequest 手工构造绕过了 FastAPI
-        # 请求体校验路径"这条根因:内部 ``RunRequest._parse_image_refs``
-        # (runs.py)会对每条 ref 调 ``parse_image_ref``,格式不对就 raise
-        # ValueError —— 但那是一个 pydantic field_validator,手工构造时它仍
-        # 会跑,只是 raise 出来的是裸 ``pydantic.ValidationError``(500),不
-        # 会被下方 ``RunRequest(...)`` 调用点前的任何一道闸拦住。合并后的
-        # image_refs 同时来自两个入口(顶层 ``image_refs`` 字段 + ``files[]``
-        # 里 ``type == "image"`` 的条目,见上面的合并),两个入口都要覆盖 ——
-        # 这里在合并之后统一校验,天然覆盖两者。
-        for _ref in image_refs:
-            try:
-                parse_image_ref(_ref)
-            except ValueError as exc:
-                return _envelope_error("INVALID_IMAGE_REF", str(exc), 422)
 
         # P2-a 安全修复(Critical)—— 同一根因:内部 ``RunRequest.
         # _bound_untrusted_blocks``(runs.py)对每块查 <= 8192 字符,超了同样
@@ -1269,26 +1295,6 @@ def build_agents_router() -> APIRouter:
                     f"untrusted_content[{_idx}] 超过 {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} 字符",
                     422,
                 )
-
-        # P2 块 1(Task 11)—— files[] 的 document 条目逐个过路径净化闸,再并
-        # 进 RunRequest.document_names。客户端给的是字符串,上传时走过的
-        # _safe_workspace_name 净化只保证了上传路径,run 这一侧必须独立
-        # 重新校验(否则 ../ 就能读到工作区外)。_safe_document_name_or_422
-        # 抛的是结构化 HTTPException(与 spawn_run 内部沿用的裸 detail 风格
-        # 不同),这里就地转译成对外信封,不让裸 {"detail": ...} 逃逸。
-        try:
-            document_names = [
-                _safe_document_name_or_422(f.upload_id)
-                for f in payload.files
-                if f.type == "document"
-            ]
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
-            return _envelope_error(
-                detail.get("code", "INVALID_FILE_REF"),
-                detail.get("message", "invalid file reference"),
-                exc.status_code,
-            )
 
         # RunRequest is hand-constructed below (not the FastAPI request
         # body), so ``inputs`` past ``RunRequest._bound_inputs``'s own
