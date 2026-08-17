@@ -45,7 +45,7 @@ Content-Type: application/json
 
 `{agent_code}` 是租户下已发布、状态为 ACTIVE 的 Agent 名称。同一个名称同时只有一个 ACTIVE 版本生效；该名称下没有 ACTIVE 版本时返回 404（`AGENT_NOT_FOUND`）。
 
-可用的 `agent_code` 通过 [5.1 Agent 目录](./query#_5-1-agent-目录) 查询。
+可用的 `agent_code` 通过 [5.1 Agent 目录](./query#_5-1-agent-目录) 查询。示例里的 `https://<your-domain>` 按对接的环境替换，接口地址见 [7.1 环境地址](./conventions#_7-1-环境地址)。
 
 ```bash [请求]
 curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
@@ -56,7 +56,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 ## 2.3 请求参数详解
 
-请求体只有 `user_id` 必填，其余字段均可省略。
+请求体只有 `user_id` 必填，其余字段均可省略（不带 `input` 也是合法请求）。请求体不接受下表以外的字段。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -70,9 +70,19 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 ### `user_id` 的作用
 
-首次出现的 `user_id` 会自动创建一个对应的终端用户。长期记忆、工作区文件、按用户维度统计的用量都归属于这个终端用户，不归属于 API Key 所属的服务账号。
+首次出现的 `user_id` 会自动创建一个对应的终端用户。长期记忆、工作区文件（Agent 在这个终端用户名下读写的文件，见 [5.6 工作区文件](./query#_5-6-工作区文件)）、按用户维度统计的用量都归属于这个终端用户，不归属于 API Key 所属的服务账号。
 
 同一个 `user_id` 在后续调用中复用同一个终端用户，不会重复创建。取值要求见 [9.2 user_id 的取值要求](./best-practices#_9-2-user-id-的取值要求)。
+
+### 发起对话的常见错误
+
+| 状态码 | `error.code` | 触发条件 |
+|---|---|---|
+| 403 | `AGENT_DISABLED` | 这个 Agent 已被管理员下线 |
+| 404 | `AGENT_NOT_FOUND` | `{agent_code}` 在该租户下没有已发布版本 |
+| 422 | `INVALID_REQUEST` | 请求体未通过基础校验：缺少 `user_id`、`user_id` 超过 255 字符、带了未声明的字段、`input` 超过 65536 字符 |
+
+发起对话的完整失败清单见 [8 错误码总表](./errors)。
 
 ## 2.4 stream 还是 queue
 
@@ -111,7 +121,7 @@ run 仍在执行时，这条连接实时推送后续事件；run 已经结束时
 - 需要 `read` 权限；`write` 权限包含读，可以直接使用。
 - run 未结束时这是一条长连接，会保持到 run 进入最终状态才返回，服务端不设时长上限。
 - **客户端需要自行设置读超时**，超时后重连。
-- 重连时带上 `since_seq={max_seq}`，`{max_seq}` 是客户端已收到的最大 `seq`，服务端只发送这个序号之后的事件。这一过程称为续传，完整步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
+- 重连时带上 `since_seq={max_seq}`，`{max_seq}` 是客户端已收到的最大 `seq`。`seq` 是事件的序号，取自事件 `id:` 行连字符后面的那一段。服务端只发送这个序号之后的事件，这一过程称为续传，完整步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
 - 不带 `since_seq` 不会报错，但服务端会从 `seq` 为 `0` 的那个事件起把整个 run 重新发送一遍。
 - 一次响应装不下全部事件时，这一页以 `truncated` 事件结束，不发 `end`；翻页要带上 `truncated` 给出的 `next_seq` 再请求一次。事件的完整说明见 [3 读懂 SSE 流](./sse-events)。
 
@@ -333,13 +343,15 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   }'
 ```
 
-请求体里的 `session_id` 用的是上一步上传响应返回的那个值，原因见下文「图片与 run 必须属于同一段会话」。
+请求体里的 `session_id` 用的是上一步上传响应返回的那个值，原因见下文 [图片与 run 必须属于同一段会话](#图片与-run-必须属于同一段会话)。
 
-`files` 最多 64 项是请求体字段层面的合计上限，图片和文档一起计算。图片另有一条更严的限制：单次 run 处理的图片数量上限默认为 8 张，超出时返回只有 `detail` 字段的 422 响应，读不到 `error.code`，完整规则见 [8.10](./errors#_8-10-422-——-请求参数不合法)。
+列在 `files[]` 里的文档，平台会把它的文件名附在本轮消息里告知 Agent；文档内容本身在这个终端用户的工作区里，Agent 按文件名读取。
+
+`files` 最多 64 项是请求体字段层面的合计上限，图片和文档一起计算。图片另有一条更严的限制：单次 run 处理的图片数量上限默认为 8 张，超出时返回只有 `detail` 字段的 422 响应，读不到 `error.code`，完整规则见 [8.10](./errors#_8-10-422-——-请求参数不合法)。需要处理更多图片时，拆成多次对话。
 
 ### 第三步 下载与回显
 
-需要把附件内容取回来时（例如在调用方界面上预览终端用户刚上传的图片），用同一个 `upload_id` 调用下载接口。`user_id` 是必填查询参数，取值与上传这份附件时使用的值相同。
+需要把附件内容取回来时（例如在调用方界面上预览终端用户刚上传的图片），用同一个 `upload_id` 调用下载接口。`user_id` 是必填查询参数，取值与上传这份附件时使用的值相同；路径里的 `{agent_code}` 不参与附件归属判定，填上传时用的那个即可。
 
 ```bash [请求]
 # 需要 read 权限，write 权限包含读
@@ -354,7 +366,7 @@ Content-Disposition: attachment; filename="report.pdf"; filename*=UTF-8''report.
 X-Content-Type-Options: nosniff
 ```
 
-成功响应是文件字节，不套 `{success, data, error}` 信封。`Content-Type` 是上传时记录的 MIME。这条接口不计入配额。
+成功响应是文件字节，不套 `{success, data, error}` 信封。`Content-Type` 是上传时记录的 MIME。这条接口不计入配额（配额的含义见 [7.6 限流与配额](./conventions#_7-6-限流与配额)）。
 
 `Content-Disposition` 只由文件扩展名决定，与响应里的 `type` 无关。附件只可能是下表里的扩展名：
 

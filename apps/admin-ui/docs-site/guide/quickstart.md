@@ -40,6 +40,8 @@ Authorization: Bearer aforge_pat_xxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## 1.2 发起第一次对话
 
+示例里的 `https://<your-domain>` 按对接的环境替换，接口地址见 [7.1 环境地址](./conventions#_7-1-环境地址)。
+
 ```bash [请求]
 curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
   -H "Authorization: Bearer <key>" \
@@ -88,7 +90,7 @@ data: {"status":"success","run_id":"..."}
 
 这张表只是摘要。每个取值下客户端具体该做什么，见 [3.4 的 `end` 事件](./sse-events#end)。
 
-run 本身发生的事件还多一行 `id:`，格式是「毫秒时间戳-序号」，`end`、`token` 这类事件没有这一行。断线重连时把已收到的最大 `seq` 传回服务端，服务端只补发这个序号之后的事件，这一过程称为续传。
+run 本身发生的事件还多一行 `id:`，格式是「毫秒时间戳-序号」，`end`、`token` 这类事件没有这一行。连字符后面的那一段序号就是这个事件的 `seq`：断线重连时把已收到的最大 `seq` 传回服务端，服务端只补发这个序号之后的事件，这一过程称为续传。
 
 完整的事件类型、字段含义与断线重连见 [3 读懂 SSE 流](./sse-events)。
 
@@ -118,4 +120,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | 解析 SSE 事件、断线重连 | [3 读懂 SSE 流](./sse-events) |
 | 取消正在执行的 run、处理人工审批 | [4 对话过程中的控制](./run-control) |
 | 查历史会话、查执行记录、下载产出文件 | [5 查询与管理](./query) |
+| 创建 key、选权限档位、轮换与吊销 | [6 认证与 Key](./auth) |
+| 接口地址、公共请求头与响应头、统一响应格式、限流与配额 | [7 通用约定](./conventions) |
+| 按状态码查错误、按 `error.code` 查含义 | [8 错误码总表](./errors) |
 | 各语言完整可运行示例 | [10 多语言示例](./examples) |
