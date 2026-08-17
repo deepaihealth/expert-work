@@ -21,11 +21,11 @@
 
 ``` [事件流片段]
 event: metadata      ← run 开始了。记下 run_id 和会话 id
-event: token         ← 模型正在逐字生成。几十到上千个,只有实时连接才有
-event: token
-event: token
 event: updates       ← 一个节点跑完了(记忆召回)。这一步的权威结果
 event: updates       ← 又一个节点跑完了(工作区读入)
+event: token         ← agent 节点开始了,模型正在逐字生成。几十到上千个
+event: token
+event: token
 event: updates       ← agent 节点跑完:模型这一步要调一个工具
 event: updates       ← tools 节点跑完:工具的执行结果
 event: token         ← 下一步又开始生成了
@@ -34,6 +34,8 @@ event: updates       ← agent 节点跑完:这次是最终答案
 event: updates       ← 最后一个节点跑完(记忆回写)
 event: end           ← 流结束。data 里带这次 run 的最终状态
 ```
+
+注意 `token` 出现的位置:它只在 `agent` 节点跑的时候产生。`agent` 之前的准备节点(记忆召回、工作区读入)只发 `updates`，**所以流的开头一定是 `metadata` 加若干个 `updates`，第一个 `token` 在它们之后。**
 
 整条流是三段:
 
@@ -80,10 +82,17 @@ data: {"run_id":"67262572-5470-41a4-800d-592762ec679d","thread_id":"9f2c1a44-6d3
 | 这一类 | 有 `id:` | 断线重连能拿回来吗 | 有哪些 |
 |---|---|---|---|
 | run 的事件 | 有 | 能 | `metadata` / `updates` / `worker` / `guard` / `compaction` / `approval` / `retry` / `error` |
-| 一次性预览 | 无 | **不能** | `token` |
-| 这条连接的状况 | 无 | — | `gap` / `truncated` / `end` |
+| 一次性预览 | 无 | **不能**——断连期间那些补不回来 | `token` |
+| 流的终止标记 | 无 | 每条流各自重新发一个 | `end` |
+| 这条连接的状况 | 无 | — | `gap` / `truncated` |
 
-三类没有 `id:` 的原因各不相同:`token` 是一次性预览(不落库、不占序号);`gap` / `truncated` 描述的是**这条连接**的状况，不是 run 身上发生的事;`end` 是流的终止标记。**这三类都不参与断线重连的游标计算。**
+后三类没有 `id:` 的原因各不相同:
+
+- `token` 是一次性预览，不落库、不占序号。
+- `end` 是流的终止标记，每条流(包括每次重连、每一页回放)自己生成一个，不是 run 身上某个被记录下来的事件。
+- `gap` / `truncated` 描述的是**这条连接**的状况，不是 run 身上发生的事。
+
+**这三类都不参与断线重连的游标计算。**
 
 ### 从 `id:` 里取 `seq`
 
@@ -294,7 +303,7 @@ function onToken(data) {
 
 #### `data` 字段
 
-`data` 的最外层是 `{节点名: 节点写入}`，**一个事件通常只有一个节点键**。
+`data` 的最外层是一个对象:键是**节点名**，值是这个节点这一步的**写入**。**一个事件通常只有一个节点键。**
 
 ```js [data 的骨架]
 { "agent": { "messages": [ … ], "step_count": 1, "_duration_ms": 2140 } }
@@ -307,9 +316,13 @@ function onToken(data) {
 |---|---|---|
 | `messages` | array | 这一步新产出的消息，可能是空数组。形状见下面「`messages[]` 里的两种消息」 |
 | `step_count` | int | 这一步的编号，**从 `1` 开始**。只出现在 `agent` 节点的写入里，`tools` 节点没有 |
-| `_duration_ms` | int | 距上一个事件过去了多少毫秒。平台注入，每个**非 `null`** 的节点写入都有 |
+| `_duration_ms` | int | 距**上一个 `updates`** 过去了多少毫秒(第一个 `updates` 是距 run 开始)。**`token` 和其它事件不会重置这个计时。** 平台注入，每个**非 `null`** 的节点写入都有 |
 
-其余通道是内部调度用的，不保证稳定——列在这里只是免得你以为自己漏读了:`agent` 节点还有 `escalate_next` / `last_plan_goal` / `no_progress_streak` / `step_count_refund_pending` / `tool_failures`;`tools` 节点还有 `step_count_refund_pending`;`memory_recall` 节点还有 `recalled_memories`。
+节点写入里还有别的通道，都是内部调度用的、不保证稳定。列在这里只是免得你以为自己漏读了:
+
+- `agent` 节点——`escalate_next`、`last_plan_goal`、`no_progress_streak`、`step_count_refund_pending`、`tool_failures`
+- `tools` 节点——`step_count_refund_pending`
+- `memory_recall` 节点——`recalled_memories`
 
 ::: danger 节点写入可能整个是 `null`——这是第一天就会踩到的坑
 真栈实测三个场景全部出现过:
@@ -322,7 +335,7 @@ event: updates
 data: {"memory_writeback":null}
 ```
 
-客户端**不能**无条件写 `data[节点名].messages`——先判断整个节点写入是不是 `null`，再取 `messages`。真栈三个场景里，`workspace_ingest` 和 `memory_writeback` 每次都是整体 `null`。
+客户端**不能**拿到节点名就直接往下取 `.messages`——先判断整个节点写入是不是 `null`，再取 `messages`。真栈三个场景里，`workspace_ingest` 和 `memory_writeback` 每次都是整体 `null`。
 :::
 
 ::: warning 节点名不是固定枚举
@@ -387,7 +400,7 @@ data: {"memory_writeback":null}
 
 ```json [updates 里 tools 节点的第一条消息]
 {
-  "content": "«UNTRUSTED nonce=<每次 run 随机>»\nWrote▁ 11▁ bytes▁ to▁ probe_note.txt\n«/UNTRUSTED nonce=<每次 run 随机>»",
+  "content": "«UNTRUSTED nonce={random}»\nWrote▁ 11▁ bytes▁ to▁ probe_note.txt\n«/UNTRUSTED nonce={random}»",
   "additional_kwargs": {"duration_ms": 1848},
   "response_metadata": {},
   "type": "tool",
@@ -410,9 +423,9 @@ data: {"memory_writeback":null}
 `tool` 消息的 `content` 是防注入包装过的，直接显示，用户看到的就是夹着围栏和奇怪字形的乱码:
 
 ``` [工具结果的原文]
-«UNTRUSTED nonce=<每次 run 随机>»
+«UNTRUSTED nonce={random}»
 Wrote▁ 11▁ bytes▁ to▁ probe_note.txt
-«/UNTRUSTED nonce=<每次 run 随机>»
+«/UNTRUSTED nonce={random}»
 ```
 
 包装分两部分:
@@ -989,13 +1002,23 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const runId = first.headers.get("X-Expert-Work-Run-Id");
-  let r = await consume(first);
+  let r;
+  try {
+    r = await consume(first);            // 第一条流也要兜:它同样会读超时 / 断
+  } catch {
+    r = { finished: false, since: maxSeq };
+  }
+  // 跨源调用时这个响应头可能读不到(服务端没 expose),兜底用 metadata 存下的那个
+  const runId = first.headers.get("X-Expert-Work-Run-Id") ?? store.runId;
 
   for (let round = 0; !r.finished; round++) {
+    if (!runId) throw new Error("拿不到 run_id,无法重连");
     if (round > 200) throw new Error("重连/翻页次数超上限,停下来报警");
+    // maxSeq 还是 -1 说明一个带 id 的事件都没收到 —— 此时必须不带 since_seq,
+    // 传 -1 会被服务端判 422,然后这个循环会空转到上限
+    const cursor = r.since >= 0 ? `&since_seq=${r.since}` : "";
     const url = `${base}/v1/agents/${agentCode}/runs/${runId}/events`
-      + `?user_id=${encodeURIComponent(userId)}&since_seq=${r.since}`;
+      + `?user_id=${encodeURIComponent(userId)}${cursor}`;
     try {
       // 重连打的是这条 GET,不是重新 POST /runs —— 那会开启新的一轮 run
       r = await consume(await fetch(url, { headers: { Authorization: `Bearer ${key}` } }));
@@ -1015,7 +1038,7 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 
 三种情况:
 
-1. **`mode: "queue"` 的 run**——`POST` 直接返回 `202`，没有流。要看事件就得来这条接口。
+1. **`mode: "queue"` 的 run**——`POST` 直接返回 `202`，没有流(两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue))。要看事件就得来这条接口。
 2. **流式连接中途断了**——网络抖动、代理超时、客户端自己的读超时。
 3. **run 已经跑完，想把事件重新过一遍**——比如归档、审计、页面刷新后恢复现场。
 
@@ -1085,7 +1108,7 @@ sequenceDiagram
 | 遇到落库空洞 | 补得上的晚一点补发给你(所以事件会乱序到达);补不上的发一个 `gap` | **静默跳过，不发 `gap`** |
 | 分页 | 不分页，一直流到 run 结束 | 一页装不下时以 `truncated` 收尾 |
 | 收尾 | `end` | `end`，或者 `truncated`(还有下一页) |
-| 会不会有 `token` | 不会——`token` 从不回放 | 不会 |
+| 会不会有 `token` | **会**——但只有你接上之后新产生的那些;断连期间那些不会补给你 | 不会 |
 
 重连后的界面状态应该以最近一个 `updates` / `metadata` 为准，**不要试图拼回断连前的逐字预览**。
 
