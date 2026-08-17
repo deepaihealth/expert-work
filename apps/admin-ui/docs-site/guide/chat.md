@@ -33,7 +33,7 @@ sequenceDiagram
     end
 ```
 
-执行结束时 run 会落到一个最终状态：`success` / `error` / `timeout` / `interrupted` / `paused`。其中 `paused` 表示停在人工审批节点等待决策，需要你调审批接口推进，见 [4 对话过程中的控制](./run-control)。
+执行结束时 run 会落到一个最终状态：`success` / `error` / `interrupted` / `paused`(还有一个保留值 `timeout`，今天不会出现)。其中 `paused` 表示停在人工审批节点等待决策，需要你调审批接口推进，见 [4 对话过程中的控制](./run-control);八个状态值的完整含义见 [5.4 run 列表](./query#_5-4-run-列表)。
 
 ## 2.2 发起对话
 

@@ -50,13 +50,15 @@ curl "https://<your-domain>/v1/agent-catalog?limit=50&offset=0" \
 
 ### 响应字段
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `agent_code` | string | 发起对话时填进 `POST /v1/agents/{agent_code}/runs` 路径的那个值。 |
-| `display_name` | string | 展示名。**永远非空**——没配置显示名的 Agent 这里回退成 `agent_code` 本身，不用自己做空值判断。 |
-| `description` | string | Agent 描述，租户内员工在管理控制台自己填的自由文本。 |
-| `available` | boolean | 现在能不能对它发起对话。 |
-| `total` | number | 去重后的 Agent 总数，不是版本记录数，也不是当前页条目数。 |
+| 字段 | 类型 | 含义 | 取值 |
+|---|---|---|---|
+| `agent_code` | string | 发起对话时填进 `POST /v1/agents/{agent_code}/runs` 路径的那个值 | 租户内唯一的标识串 |
+| `display_name` | string | 展示名。**永远非空**——没配置显示名的 Agent 这里回退成 `agent_code` 本身，不用自己做空值判断 | 非空字符串 |
+| `description` | string | Agent 描述，租户内员工在管理控制台自己填的自由文本 | 可能是空串 `""` |
+| `available` | boolean | 管理员有没有把这个 Agent **下线**。**只反映这一件事**——配额打满、租户被暂停、Agent 配置构建失败都不会让它变 `false`，但都会让发起对话失败(各有自己的错误码，见 [8 错误码总表](./errors)) | `true`(没下线)/ `false`(已下线，发起对话会得到 403 `AGENT_DISABLED`) |
+| `total` | number | 去重后的 Agent 总数，不是版本记录数，也不是当前页条目数 | 非负整数 |
+
+条目里**没有** `status` / `mode` / 版本号这类字段：「已上线」是靠「出现在列表里」表达的——一个 Agent 只要有一个已发布版本就会出现，全部版本都被废弃或删除时整条不出现(见下文)。想知道「能不能用」只看 `available`。
 
 ### `available` 与实际可用性有最长约 5 秒的偏差
 
@@ -548,11 +550,13 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 | 字段 | 说明 |
 |---|---|
 | `name` | 产物名，在同一个终端用户下唯一。下载和删除都用它 |
-| `kind` | `document` / `code` / `data` / `other`，由 Agent 保存时声明 |
+| `kind` | 产物类别，由 Agent 保存时声明:`document`(文稿 / 报表类)/ `code`(源码)/ `data`(数据文件)/ `other`(其它)。服务端**不校验**这个值，也不提供对外改它的接口——解析时遇到这四个之外的值按 `other` 处理 |
 | `latest_version` | 版本号。Agent 每次用同名保存一次就 +1 |
 | `created_at` / `updated_at` | 首次创建 / 最近一次更新时间 |
 
 **列表里没有文件大小。** 大小和校验和是**首次下载时才记录**的，列表里给出来大部分是 `null`，反而误导。
+
+**列表里也没有状态字段。** 产物没有「草稿 / 已发布」这类状态:出现在列表里就是存活的，被删除的不再出现(见下文「删除产物」)。
 
 #### 注意
 
