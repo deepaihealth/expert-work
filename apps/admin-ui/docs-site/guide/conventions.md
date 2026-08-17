@@ -93,16 +93,14 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 
 ## 7.6 限流与配额
 
-两者都返回 429，但含义和处理方式不同：
+限流按时间窗口限制调用频率；配额按资源用量设上限，例如图片上传的次数与存储字节数、产物下载的次数、文档所在工作区的容量。两者超限时都返回 429。
 
-| 对比维度 | 限流 | 配额 |
-|---|---|---|
-| 限制什么 | 调用频率，按时间窗口计算 | 资源用量，按资源维度计算，例如工作区存储 |
-| `error.code` | `RATE_LIMIT_EXCEEDED` | `QUOTA_EXCEEDED` |
-| `Retry-After` 响应头 | 带 | 不带 |
-| 处理方式 | 退避后重试 | 退避重试无效，先清理占用的资源 |
+429 的错误码只有两个：
 
-拿到 429 时先读 `error.code` 判断属于哪一种。`dimension` 字段的含义、两种响应的样例，以及产物下载这个例外（它的配额也返回 `RATE_LIMIT_EXCEEDED`、也带 `Retry-After`，但短退避重试对它无效），都在 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)，那一节是这件事的完整说明。
+- `RATE_LIMIT_EXCEEDED`：调用频率超限，或者按次数、按字节计的配额用尽。响应带 `Retry-After` 头，`error.dimension` 说明是哪一项限制被触发。
+- `QUOTA_EXCEEDED`：只出现在上传文档时终端用户的工作区容量已满。响应不带 `Retry-After` 头，也没有 `dimension` 字段。
+
+拿到 429 时的处理顺序：先读 `error.code`；是 `RATE_LIMIT_EXCEEDED` 时再读 `error.dimension`，按它决定是退避后重试，还是按「配额已用尽」处理。`dimension` 的取值、每个取值对应的处理方式，以及两种响应的样例，都在 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)。
 
 ## 7.7 幂等性
 

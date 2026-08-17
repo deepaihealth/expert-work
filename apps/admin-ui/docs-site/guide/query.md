@@ -661,7 +661,7 @@ GET /v1/agents/{agent_code}/artifacts/download
 
 成功响应的正文是文件字节流本身，不套 `{success, data, error}` 信封，这个信封只用于错误响应。`Content-Disposition` 的判定规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致，响应同样固定带 `X-Content-Type-Options: nosniff`。
 
-这个接口计入 `artifact_download` 配额（30 天滑动窗口），超限时返回 429 `RATE_LIMIT_EXCEEDED`，完整说明见 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)。
+这个接口计入产物下载配额（30 天内的下载次数），用尽时返回 429 `RATE_LIMIT_EXCEEDED`，`error.dimension` 为 `artifact_download_count_30d`；短退避重试无效，完整说明见 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)。
 
 #### 示例
 
@@ -677,7 +677,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 |---|---|---|
 | 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除，或者不属于这个 `user_id`，三种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
-| 429 | `RATE_LIMIT_EXCEEDED` | `artifact_download` 配额耗尽，对应的配额维度是 `ARTIFACT_DOWNLOAD_COUNT_30D` |
+| 429 | `RATE_LIMIT_EXCEEDED` | 产物下载配额用尽（`error.dimension` 为 `artifact_download_count_30d`），或调用频率超限 |
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录存在，服务端读不到它的内容。重试无效，请联系租户管理员 |
 | 503 | `ARTIFACT_CONTENT_UNAVAILABLE` | 服务端没有配置工作区存储通路，产物内容整体不可读。重试无效，请联系租户管理员 |
 
