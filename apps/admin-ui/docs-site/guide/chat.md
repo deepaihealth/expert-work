@@ -121,7 +121,7 @@ run 仍在执行时，这条连接实时推送后续事件；run 已经结束时
 - 需要 `read` 权限；`write` 权限包含读，可以直接使用。
 - run 未结束时这是一条长连接，会保持到 run 进入最终状态才返回，服务端不设时长上限。
 - **客户端需要自行设置读超时**，超时后重连。
-- 重连时带上 `since_seq={max_seq}`，`{max_seq}` 是客户端已收到的最大 `seq`。`seq` 是事件的序号，取自事件 `id:` 行连字符后面的那一段。服务端只发送这个序号之后的事件，这一过程称为续传，完整步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
+- 重连时带上 `since_seq={max_seq}`，`{max_seq}` 是客户端已收到的最大 `seq`。`seq` 是事件的序号，取自事件 `id:` 行连字符后面的那一段。服务端只发送这个序号之后的事件，这一过程称为续传，完整步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传)。
 - 不带 `since_seq` 不会报错，但服务端会从 `seq` 为 `0` 的那个事件起把整个 run 重新发送一遍。
 - 一次响应装不下全部事件时，这一页以 `truncated` 事件结束，不发 `end`；翻页要带上 `truncated` 给出的 `next_seq` 再请求一次。事件的完整说明见 [3 读懂 SSE 流](./sse-events)。
 
@@ -257,7 +257,7 @@ Content-Type: multipart/form-data
 | 文档 | `application/pdf`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（.docx）、`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（.xlsx）、`application/vnd.openxmlformats-officedocument.presentationml.presentation`（.pptx）、`text/plain`、`text/markdown`、`text/csv` | 25 MiB |
 | 图片 | `image/png`、`image/jpeg`、`image/webp`、`image/gif` | 10 MiB |
 
-两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-——-文档-图片超限)。
+两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-附件超过大小上限)。
 
 #### 上传文档
 
@@ -347,7 +347,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 列在 `files[]` 里的文档，平台会把它的文件名附在本轮消息里告知 Agent；文档内容本身在这个终端用户的工作区里，Agent 按文件名读取。
 
-`files` 最多 64 项是请求体字段层面的合计上限，图片和文档一起计算。图片另有一条更严的限制：单次 run 处理的图片数量上限默认为 8 张，超出时返回只有 `detail` 字段的 422 响应，读不到 `error.code`，完整规则见 [8.10](./errors#_8-10-422-——-请求参数不合法)。需要处理更多图片时，拆成多次对话。
+`files` 最多 64 项是请求体字段层面的合计上限，图片和文档一起计算。图片另有一条更严的限制：单次 run 处理的图片数量上限默认为 8 张，超出时返回只有 `detail` 字段的 422 响应，读不到 `error.code`，完整规则见 [8.10](./errors#_8-10-422-请求参数不合法)。需要处理更多图片时，拆成多次对话。
 
 ### 第三步 下载与回显
 

@@ -59,7 +59,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 先说明三个词：
 
 - 「事件接口」指按 `run_id` 拉取事件的接口（`GET /v1/agents/{agent_code}/runs/{run_id}/events`）。
-- 「续传」指断线重连或 run 结束之后，服务端把客户端未收到的那一段事件重新发送，操作步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)。
+- 「续传」指断线重连或 run 结束之后，服务端把客户端未收到的那一段事件重新发送，操作步骤见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传)。
 - 「幂等重放」指用同一个 `Idempotency-Key` 重复发起对话时，服务端直接返回上一次的结果，规则见 [7.7 幂等性](#_7-7-幂等性)。
 
 `X-Expert-Work-Trace-Id` 是唯一一个每个响应都带的头，**其余四个按端点和模式出现，不要假设它们成套出现**：
@@ -70,7 +70,7 @@ POST https://expert-work-test.deepaihealth.com/v1/agents/{agent_code}/runs
 | `X-Expert-Work-Run-Id` | 发起对话的 `stream` 模式（含幂等重放）、事件接口、审批决策的两种模式 | 这次响应对应的 `run_id`。发起对话的 `queue` 模式不带这个头，`run_id` 只在响应体 `data.run_id` 里；审批决策返回的是继续执行时新产生的 run id |
 | `X-Expert-Work-Session-Id` | 发起对话的 `stream` 模式（含幂等重放）、事件接口 | 这次绑定或续接到的 `session_id`。审批决策的两种响应都不带，因为继续执行用的就是原会话，没有变化 |
 | `X-Expert-Work-Stream-Mode` | 事件接口；以及发起对话在 `stream` 模式下命中幂等重放时 | 取值 `live`（run 还在执行，接的是实时流）或 `replay`（run 已结束，按服务端记录的顺序重新发送事件）。首次发起的 `stream` 响应不带，审批决策的两种响应也不带 |
-| `X-Expert-Work-Next-Seq` | 只在续传被分页截断时 | 下一页应当传回的 `since_seq`。同一个值也在流末尾的 `truncated` 事件里，以事件为准更可靠，因为中间代理可能剥掉它不认识的响应头。见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页) |
+| `X-Expert-Work-Next-Seq` | 只在续传被分页截断时 | 下一页应当传回的 `since_seq`。同一个值也在流末尾的 `truncated` 事件里，以事件为准更可靠，因为中间代理可能剥掉它不认识的响应头。见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传) |
 
 ## 7.5 统一响应格式
 

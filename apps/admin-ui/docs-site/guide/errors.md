@@ -11,7 +11,7 @@
 - 提前获取 session_id：`POST /v1/agents/{agent_code}/sessions`
 - 会话列表：`GET /v1/agents/{agent_code}/sessions`
 - 历史消息：`GET /v1/agents/{agent_code}/sessions/{session_id}/messages`
-- 事件接口：`GET /v1/agents/{agent_code}/runs/{run_id}/events`，断线后的续传也走它，见 [3.6 断线重连](./sse-events#_3-6-断线重连与回放分页)
+- 事件接口：`GET /v1/agents/{agent_code}/runs/{run_id}/events`，断线后的续传也走它，见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传)
 - 产物删除：`DELETE /v1/agents/{agent_code}/artifacts`
 
 | 错误码 | HTTP 状态 | 端点 | 含义与处理 |
@@ -114,7 +114,7 @@
 
 另一种 400 只出现在上传附件（`POST /v1/agents/{agent_code}/uploads`），错误码为 `INVALID_UPLOAD`，同样是标准格式，三种触发方式：
 
-- 声明的 `Content-Type` 不在允许列表内。判断依据是 `Content-Type` 而不是文件名后缀，完整清单见 [2.6 能传哪些文件类型](./chat#能传哪些文件类型)。
+- 声明的 `Content-Type` 不在允许列表内。判断依据是 `Content-Type` 而不是文件名后缀，完整清单见 [2.6 允许的文件类型](./chat#允许的文件类型)。
 - 文件内容为空。
 - 没有文件名。
 

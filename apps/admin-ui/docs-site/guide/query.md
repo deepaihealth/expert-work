@@ -661,7 +661,7 @@ GET /v1/agents/{agent_code}/artifacts/download
 
 成功响应的正文是文件字节流本身，不套 `{success, data, error}` 信封，这个信封只用于错误响应。`Content-Disposition` 的判定规则与 [5.6 工作区文件](#_5-6-工作区文件) 完全一致，响应同样固定带 `X-Content-Type-Options: nosniff`。
 
-这个接口计入 `artifact_download` 配额（30 天滑动窗口），超限时返回 429 `RATE_LIMIT_EXCEEDED`，完整说明见 [8.11 429](./errors#_8-11-429-——-两种情况-含义不同)。
+这个接口计入 `artifact_download` 配额（30 天滑动窗口），超限时返回 429 `RATE_LIMIT_EXCEEDED`，完整说明见 [8.11 429](./errors#_8-11-429-请求过于频繁或配额用尽)。
 
 #### 示例
 
