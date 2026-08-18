@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import type { TrajectoryRow } from "../../api/trajectory_rows";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
+import { firstSentence } from "./text_summary";
 import "./trajectory_rows.css";
 
 export interface TrajectoryRowsProps {
@@ -32,14 +33,6 @@ export interface TrajectoryRowsProps {
 function firstLine(text: string): string {
   const idx = text.indexOf("\n");
   return idx === -1 ? text : text.slice(0, idx);
-}
-
-/** Text up to (not including) the first sentence terminator (`。` / `.` /
- *  newline), trimmed — Task 10's `<reason 首句>` rule, reused here for the
- *  `update_plan` row's reason suffix so the two projections read the same. */
-function firstSentence(text: string): string {
-  const idx = text.search(/[。.\n]/);
-  return (idx === -1 ? text : text.slice(0, idx)).trim();
 }
 
 /** One-line summary for a trajectory row — shared with Task 17's RowDetail

@@ -165,6 +165,33 @@ describe("CompactRow", () => {
     expect(screen.getByTestId("console-row-plan")).toHaveTextContent("Plan drafted · 3 steps");
   });
 
+  it("plan row reason: a decimal point is not a sentence terminator (M1 shared firstSentence)", () => {
+    const row: PlanRow = {
+      id: "plan:0:1",
+      kind: "plan",
+      seq: 0,
+      step: 1,
+      status: "ok",
+      durationMs: null,
+      eventIndexes: [0],
+      serverMs: null,
+      source: "update_plan",
+      callId: "c1",
+      plannerSeq: 1,
+      stepsTotal: 2,
+      goal: "ship feature",
+      reason: "置信度 0.8 不够。再查一遍",
+      plan: null,
+    };
+    render(
+      <App>
+        <CompactRow row={row} expanded={false} onToggle={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("console-row-plan")).toHaveTextContent("置信度 0.8 不够");
+    expect(screen.getByTestId("console-row-plan")).not.toHaveTextContent("再查一遍");
+  });
+
   it("marker rows (error/compaction) are not expandable and carry the status colour", () => {
     const row: MarkerRow = {
       id: "error:5",

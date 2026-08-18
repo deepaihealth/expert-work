@@ -17,6 +17,7 @@ import type { ToolCallEntry } from "../../api/tool_timeline";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { ToolCallCard } from "../ToolTimeline";
+import { firstSentence } from "./text_summary";
 
 type TFn = ReturnType<typeof useTranslation>["t"];
 
@@ -47,14 +48,6 @@ const STATUS_COLOR: Record<CompactRowT["status"], string> = {
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-/** The first sentence of a (possibly multi-sentence) note — cuts before the
- *  first sentence-ending punctuation (Chinese or Western), else the whole
- *  (trimmed) string. */
-function firstSentence(text: string): string {
-  const match = /^[^。.!?！？\n]*/.exec(text);
-  return (match ? match[0] : text).trim();
 }
 
 function toolResultText(entry: ToolCallEntry, t: TFn): string {

@@ -143,4 +143,15 @@ describe("TrajectoryRows", () => {
     expect(rowSummary(updatePlanRow, t)).toBe("计划 · 更新为 3 步 · 档案查完了,细化后两步");
     expect(rowSummary(plannerRow, t)).toBe("制定计划 · 3 步");
   });
+
+  it("plan row summary: same first-sentence rule as the middle column (M1) — `!` cuts, a decimal point doesn't", () => {
+    const t = i18n.getFixedT("zh-CN");
+    const row: PlanRow = {
+      id: "plan:3", kind: "plan", seq: 3, step: 1, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null,
+      source: "update_plan", callId: "p3", plannerSeq: null,
+      stepsTotal: 3, goal: "出建议", reason: "置信度 0.8 不够!再查一遍", plan: null,
+    };
+    expect(rowSummary(row, t)).toBe("计划 · 更新为 3 步 · 置信度 0.8 不够");
+  });
 });
