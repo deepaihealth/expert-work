@@ -21,11 +21,11 @@ const LABEL_MIN_SHARE = 0.06;
 // as the same colour) — and, unlike a flat opaque fill, it composites with
 // whatever surface sits behind it instead of imposing one fixed background.
 // A solid `--ew-trace-entry` fill paired with hardcoded white text failed
-// dark-theme contrast (indigo-300 is light — 1.99:1 against white, WCAG AA
+// dark-theme contrast (the light 300 step of that scale sits ~2:1 against white, WCAG AA
 // wants ≥3:1 for UI text). Pairing the translucent fill with
 // `--ew-text-primary` (also theme-aware) fixes it in both directions instead
 // of just swapping which theme breaks.
-const ENTRY_BG = "color-mix(in srgb, var(--ew-trace-entry, #7c8cff) 62%, transparent)";
+const ENTRY_BG = "color-mix(in srgb, var(--ew-trace-entry, #7ADBCF) 62%, transparent)";
 
 interface EntryBreakdownProps {
   spans: readonly TraceSpan[];
