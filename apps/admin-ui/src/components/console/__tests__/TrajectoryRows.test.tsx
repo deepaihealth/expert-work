@@ -6,7 +6,7 @@
  */
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import i18n from "../../../i18n";
 
@@ -36,14 +36,27 @@ function rowsOf(): TrajectoryRow[] {
   return trajectoryRowsOf(EVENTS, INPUT, "答", "done");
 }
 
+/** Fills the props Task 6 made required (hover / range) with neutral values. */
+function fullProps(over: Partial<TrajectoryRowsProps> & { rows: readonly TrajectoryRow[] }): TrajectoryRowsProps {
+  return {
+    selectedRowId: null,
+    hoveredRowId: null,
+    onHoverRow: vi.fn(),
+    onSelectRow: vi.fn(),
+    running: false,
+    range: null,
+    onClearRange: vi.fn(),
+    ...over,
+  };
+}
+
 function Wrapper(props: Partial<TrajectoryRowsProps> & { rows: readonly TrajectoryRow[] }) {
   const [selectedRowId, setSelectedRowId] = useState<string | null>(props.selectedRowId ?? null);
   return (
     <TrajectoryRows
-      rows={props.rows}
+      {...fullProps(props)}
       selectedRowId={selectedRowId}
       onSelectRow={props.onSelectRow ?? setSelectedRowId}
-      running={props.running ?? false}
     />
   );
 }
@@ -60,7 +73,7 @@ describe("TrajectoryRows", () => {
 
   it("renders one row per trajectory row with kind label, summary and duration; llm-call summary for empty think", () => {
     const rows = rowsOf();
-    render(<TrajectoryRows rows={rows} selectedRowId={null} onSelectRow={vi.fn()} running={false} />);
+    render(<TrajectoryRows {...fullProps({ rows })} />);
 
     const rendered = screen.getAllByTestId("console-traj-row");
     expect(rendered).toHaveLength(rows.length);
@@ -79,7 +92,7 @@ describe("TrajectoryRows", () => {
   it("clicking a row calls onSelectRow(id); the selected row is aria-selected", async () => {
     const rows = rowsOf();
     const onSelectRow = vi.fn();
-    render(<TrajectoryRows rows={rows} selectedRowId={rows[0].id} onSelectRow={onSelectRow} running={false} />);
+    render(<TrajectoryRows {...fullProps({ rows, selectedRowId: rows[0].id, onSelectRow })} />);
 
     const rendered = screen.getAllByTestId("console-traj-row");
     expect(rendered[0]).toHaveAttribute("aria-selected", "true");
@@ -115,7 +128,7 @@ describe("TrajectoryRows", () => {
       ] }),
     ];
     const rows = trajectoryRowsOf(events, INPUT, null, "running");
-    render(<TrajectoryRows rows={rows} selectedRowId={null} onSelectRow={vi.fn()} running />);
+    render(<TrajectoryRows {...fullProps({ rows, running: true })} />);
 
     const rendered = screen.getAllByTestId("console-traj-row");
     const runningRow = rendered.find((el) => el.getAttribute("data-status") === "running");
@@ -153,5 +166,88 @@ describe("TrajectoryRows", () => {
       stepsTotal: 3, goal: "出建议", reason: "置信度 0.8 不够!再查一遍", plan: null,
     };
     expect(rowSummary(row, t)).toBe("计划 · 更新为 3 步 · 置信度 0.8 不够");
+  });
+  it("renders the sticky header row with all seven column labels in order", () => {
+    render(<TrajectoryRows {...fullProps({ rows: rowsOf() })} />);
+
+    const head = screen.getByTestId("console-traj-head");
+    expect(Array.from(head.children).map((c) => c.textContent)).toEqual([
+      "#", "类型", "摘要", "入", "出", "思考", "耗时",
+    ]);
+  });
+
+  it("token columns are filled for think rows only, and data-index counts from 1", () => {
+    const events: SseEvent[] = [
+      upd("agent", { step_count: 1, messages: [{
+        type: "ai", content: "",
+        additional_kwargs: { reasoning_content: "先想想" },
+        usage_metadata: {
+          input_tokens: 16000, output_tokens: 900, total_tokens: 16900,
+          output_token_details: { reasoning: 770 },
+          input_token_details: { cache_read: 14336 },
+        },
+        tool_calls: [{ id: "a", name: "t1", args: {} }],
+      }] }),
+      upd("tools", { messages: [{ type: "tool", tool_call_id: "a", name: "t1", content: "r", status: "success" }] }),
+    ];
+    const rows = trajectoryRowsOf(events, INPUT, null, "done");
+    render(<TrajectoryRows {...fullProps({ rows })} />);
+
+    const rendered = screen.getAllByTestId("console-traj-row");
+    expect(rendered.map((el) => el.getAttribute("data-index"))).toEqual(
+      rows.map((_, i) => String(i + 1)),
+    );
+
+    const tokensOf = (el: HTMLElement) =>
+      Array.from(el.querySelectorAll(".ew-traj-row__tok")).map((n) => n.textContent);
+    const think = rendered.find((el) => el.dataset.kind === "think");
+    const tool = rendered.find((el) => el.dataset.kind === "tool");
+    expect(tokensOf(think as HTMLElement)).toEqual(["16.0k", "900", "770"]);
+    expect(tokensOf(tool as HTMLElement)).toEqual(["", "", ""]);
+  });
+
+  it("range renders only the rows inside the 1-based closed span and shows the filter chip", () => {
+    const rows = rowsOf();
+    expect(rows).toHaveLength(5);
+    render(<TrajectoryRows {...fullProps({ rows, range: { from: 2, to: 4 } })} />);
+
+    const rendered = screen.getAllByTestId("console-traj-row");
+    expect(rendered).toHaveLength(3);
+    expect(rendered.map((el) => el.getAttribute("data-index"))).toEqual(["2", "3", "4"]);
+
+    const chip = screen.getByTestId("console-traj-filter");
+    expect(chip.textContent).toContain("#2–#4");
+    expect(chip.textContent).toContain("3");
+  });
+
+  it("no chip without a range; the chip's ✕ calls onClearRange", async () => {
+    const rows = rowsOf();
+    const onClearRange = vi.fn();
+    const { rerender } = render(<TrajectoryRows {...fullProps({ rows })} />);
+    expect(screen.queryByTestId("console-traj-filter")).not.toBeInTheDocument();
+
+    rerender(<TrajectoryRows {...fullProps({ rows, range: { from: 2, to: 4 }, onClearRange })} />);
+    const chip = screen.getByTestId("console-traj-filter");
+    await userEvent.click(within(chip).getByRole("button"));
+    expect(onClearRange).toHaveBeenCalledTimes(1);
+  });
+
+  it("hovering a row calls onHoverRow(id) then null on leave; hoveredRowId marks the row data-hovered", () => {
+    const rows = rowsOf();
+    const onHoverRow = vi.fn();
+    const { rerender } = render(<TrajectoryRows {...fullProps({ rows, onHoverRow })} />);
+
+    const rendered = screen.getAllByTestId("console-traj-row");
+    expect(rendered[2]).not.toHaveAttribute("data-hovered");
+
+    fireEvent.mouseOver(rendered[2]);
+    expect(onHoverRow).toHaveBeenCalledWith(rows[2].id);
+    fireEvent.mouseOut(rendered[2]);
+    expect(onHoverRow).toHaveBeenLastCalledWith(null);
+
+    rerender(<TrajectoryRows {...fullProps({ rows, hoveredRowId: rows[2].id })} />);
+    const after = screen.getAllByTestId("console-traj-row");
+    expect(after[2]).toHaveAttribute("data-hovered", "true");
+    expect(after[1]).not.toHaveAttribute("data-hovered");
   });
 });

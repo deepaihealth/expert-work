@@ -1250,6 +1250,16 @@ export interface TranslationKeys {
     lane_mode_duration: string;
     lane_tip_hint: string;
     lane_tip_range: string;
+    traj_col_idx: string;
+    traj_col_kind: string;
+    traj_col_summary: string;
+    traj_col_in: string;
+    traj_col_out: string;
+    traj_col_think: string;
+    traj_col_duration: string;
+    traj_filter: string;
+    traj_filter_clear: string;
+    inspect_run_detail: string;
   };
   playground: {
     session_label: string;
@@ -4424,6 +4434,16 @@ const en: TranslationKeys = {
     lane_mode_duration: "Duration",
     lane_tip_hint: "Click to select · drag to filter · double-click to reset",
     lane_tip_range: "{{start}} → {{end}} · {{d}}",
+    traj_col_idx: "#",
+    traj_col_kind: "Kind",
+    traj_col_summary: "Summary",
+    traj_col_in: "In",
+    traj_col_out: "Out",
+    traj_col_think: "Think",
+    traj_col_duration: "Time",
+    traj_filter: "Filtered #{{a}}–#{{b}} ({{n}} rows)",
+    traj_filter_clear: "Clear filter",
+    inspect_run_detail: "Run detail",
   },
   playground: {
     session_label: "Session",

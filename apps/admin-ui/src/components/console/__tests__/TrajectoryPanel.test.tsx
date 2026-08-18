@@ -34,6 +34,24 @@ vi.mock("../../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: () => false,
 }));
 
+// jsdom 25 ships no `PointerEvent` and no `setPointerCapture` — same stand-in
+// as LaneStrip.test.tsx, needed by the drag-to-filter test below.
+class PointerEventPolyfill extends MouseEvent {
+  readonly pointerId: number;
+  constructor(type: string, init: PointerEventInit = {}) {
+    super(type, init);
+    this.pointerId = init.pointerId ?? 1;
+  }
+}
+if (!("PointerEvent" in window)) {
+  (window as unknown as { PointerEvent: unknown }).PointerEvent = PointerEventPolyfill;
+}
+/** 轨道量尺:左 0 / 宽 300px —— 域坐标 = clientX / 300 × total。 */
+const RECT_300 = {
+  x: 0, y: 0, left: 0, top: 0, right: 300, bottom: 14, width: 300, height: 14,
+  toJSON: () => ({}),
+} as DOMRect;
+
 const getRunTraceMock = vi.spyOn(traceFacadeSdk, "getRunTrace");
 const getRunMock = vi.spyOn(runsSdk, "getRun");
 
@@ -158,6 +176,9 @@ function getUserRow(): HTMLElement {
   return row;
 }
 
+/** 与 TrajectoryPanel 的持久化键同源(改一处忘另一处 → 这条测试红)。 */
+const LANE_MODE_KEY = "expert_work.console.lane_mode";
+
 const NO_TRACE: RunTrace = { status: "no_trace" };
 function baseRunDetail(runId: string, traceId: string | null): RunDetail {
   return { run_id: runId, thread_id: THREAD_ID, status: "success", pending_approval: null, trace_id: traceId };
@@ -169,9 +190,16 @@ beforeEach(() => {
   getRunMock.mockReset();
   getRunMock.mockResolvedValue(baseRunDetail("run-1", null));
   setStoredToken(jwt([]));
+  window.localStorage.removeItem(LANE_MODE_KEY);
 });
 
 afterEach(() => {
+  // 不用 `restoreAllMocks` —— 模块级的 getRunTrace / getRun 两个 spy 是整个文件
+  // 共用的,restore 掉后面的用例就打真网络了。jsdom 本来就没有下面两个方法,
+  // `defineProperty` 装上去的桩要手动摘。
+  Reflect.deleteProperty(HTMLElement.prototype, "setPointerCapture");
+  Reflect.deleteProperty(HTMLElement.prototype, "releasePointerCapture");
+  window.localStorage.removeItem(LANE_MODE_KEY);
   vi.clearAllMocks();
   vi.unstubAllEnvs();
   setStoredToken(null);
@@ -390,5 +418,100 @@ describe("TrajectoryPanel", () => {
     await waitFor(() =>
       expect(getRunTraceMock).toHaveBeenCalledWith(THREAD_ID, "run-exact-1", undefined),
     );
+  });
+  it("header links to the run detail page (only when both thread and run id exist)", async () => {
+    const turn = consoleTurnFrom(SAMPLE_EVENTS, "done");
+    const { rerenderWith } = renderPanel({ turn });
+
+    const link = await screen.findByTestId("console-inspect-run-link");
+    expect(link).toHaveAttribute("href", `/runs/${THREAD_ID}/run-1`);
+    expect(link).toHaveTextContent(i18n.t("console.inspect_run_detail"));
+
+    rerenderWith({ threadId: null });
+    expect(screen.queryByTestId("console-inspect-run-link")).not.toBeInTheDocument();
+  });
+
+  it("the lane-mode Segmented switches the strip projection and persists the choice", async () => {
+    const turn = consoleTurnFrom(SAMPLE_EVENTS, "done");
+    renderPanel({ turn });
+
+    expect(await screen.findByTestId("console-lane-strip")).toHaveAttribute("data-mode", "sequence");
+    // 控件本身的 testid 也钉住 —— antd 换版本把 rest props 吞了就该这里红。
+    expect(screen.getByTestId("console-lane-mode")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("console-lane-mode-duration"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("console-lane-strip")).toHaveAttribute("data-mode", "duration"),
+    );
+    expect(window.localStorage.getItem(LANE_MODE_KEY)).toBe("duration");
+
+    // 重挂载(= 下次打开调试台)读回持久化的投影。
+    cleanup();
+    renderPanel({ turn });
+    expect(await screen.findByTestId("console-lane-strip")).toHaveAttribute("data-mode", "duration");
+  });
+
+  it("hovering a lane block highlights the matching row in the table", async () => {
+    const turn = consoleTurnFrom(SAMPLE_EVENTS, "done");
+    renderPanel({ turn });
+
+    await screen.findByTestId("console-lane-strip");
+    const block = screen
+      .getAllByTestId("console-lane-block")
+      .find((b) => b.getAttribute("data-row-id") === TOOL_ROW_ID);
+    expect(block).toBeTruthy();
+
+    fireEvent.mouseOver(block as HTMLElement);
+    await waitFor(() => expect(getToolRow()).toHaveAttribute("data-hovered", "true"));
+
+    fireEvent.mouseOut(block as HTMLElement);
+    await waitFor(() => expect(getToolRow()).not.toHaveAttribute("data-hovered"));
+  });
+
+  it("dragging a span on the lane strip filters the row table; switching turn clears the filter", async () => {
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(RECT_300);
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true, writable: true, value: vi.fn(),
+    });
+    Object.defineProperty(HTMLElement.prototype, "releasePointerCapture", {
+      configurable: true, writable: true, value: vi.fn(),
+    });
+
+    const turn1 = consoleTurnFrom(SAMPLE_EVENTS, "done", "t1");
+    const { rerenderWith } = renderPanel({ turn: turn1 });
+
+    const allRows = screen.getAllByTestId("console-traj-row").length;
+    expect(allRows).toBe(5);
+
+    const track = await screen.findByTestId("console-lane-track");
+    // 域宽 5 行 / 轨道 300px → 100px = 域 5/3、200px = 域 10/3 → 第 2/3/4 行。
+    fireEvent.pointerDown(track, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 200, pointerId: 1 });
+    fireEvent.pointerUp(track, { clientX: 200, pointerId: 1 });
+
+    const chip = await screen.findByTestId("console-traj-filter");
+    expect(chip.textContent).toContain("#2–#4");
+    expect(screen.getAllByTestId("console-traj-row")).toHaveLength(3);
+
+    const otherEvents: SseEvent[] = [
+      ev("metadata", { run_id: "run-other" }),
+      upd("agent", { messages: [{ type: "ai", content: "hi" }] }),
+      ev("end", "ok"),
+    ];
+    rerenderWith({ turn: consoleTurnFrom(otherEvents, "done", "t2") });
+    await waitFor(() => expect(screen.queryByTestId("console-traj-filter")).not.toBeInTheDocument());
+    rectSpy.mockRestore();
+  });
+
+  it("Esc inside the panel closes the row detail", async () => {
+    const turn = consoleTurnFrom(SAMPLE_EVENTS, "done");
+    renderPanel({ turn });
+
+    fireEvent.click(getToolRow());
+    expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByTestId("console-trajectory-panel"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("console-detail-summary")).not.toBeInTheDocument());
   });
 });

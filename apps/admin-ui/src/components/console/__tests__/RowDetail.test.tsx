@@ -118,6 +118,7 @@ function renderDetail(row: TrajectoryRow, over: Partial<RowDetailProps> = {}) {
     <App>
       <RowDetail
         row={row}
+        rowIndex={1}
         turnSeq={0}
         events={EVENTS}
         match={NO_TRACE}
@@ -202,6 +203,7 @@ describe("RowDetail", () => {
       <App>
         <RowDetail
           row={thinkRow}
+          rowIndex={1}
           turnSeq={0}
           events={EVENTS}
           match={NO_TRACE}
@@ -221,6 +223,7 @@ describe("RowDetail", () => {
       <App>
         <RowDetail
           row={toolRow}
+          rowIndex={1}
           turnSeq={0}
           events={EVENTS}
           match={NO_TRACE}
@@ -236,5 +239,20 @@ describe("RowDetail", () => {
 
     fireEvent.click(screen.getByTestId("console-detail-close"));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+  it("header shows #rowIndex + kind (no turn label — the panel header owns it) and the root has its own padding", () => {
+    renderDetail(toolRow, { rowIndex: 4 });
+
+    const header = screen.getByTestId("console-detail-header");
+    expect(header.textContent).toContain("#4");
+    expect(header.textContent).toContain("TOOL");
+    // 「第 N 轮」 moved to the panel header (spec §八.8) — the key itself stays
+    // for SummaryTab, but the detail header must not repeat it.
+    expect(header.textContent).not.toContain("Turn 1");
+
+    const root = header.parentElement as HTMLElement;
+    expect(root.style.padding).toBe("8px 12px");
+    expect(root.style.height).toBe("100%");
+    expect(root.style.overflow).toBe("auto");
   });
 });

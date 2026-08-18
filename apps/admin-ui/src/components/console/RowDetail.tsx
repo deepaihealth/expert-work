@@ -26,10 +26,17 @@ import { RowDetailTiming } from "./RowDetailTiming";
 
 const { Text } = Typography;
 
+/** 自己带内边距 —— 详情面板是 Splitter 的一格,不给 padding 头部会贴着左边被
+ *  裁掉一截(测试环境上报的 bug,spec §八.8)。 */
+const ROOT_STYLE: React.CSSProperties = { padding: "8px 12px", height: "100%", overflow: "auto" };
+
 export type RowDetailTab = "summary" | "payload" | "result" | "timing" | "raw";
 
 export interface RowDetailProps {
   row: TrajectoryRow;
+  /** 该行在**全表**里的 1-based 序号(行表的 `#` 列 / 泳道块的 `#` 同源);
+   *  头部只显示它 —— 「第 N 轮」在右栏面板头部已经有了(spec §八.8)。 */
+  rowIndex: number;
   /** 0-based; displayed as +1. */
   turnSeq: number;
   /** Raw tab resolves `row.eventIndexes` against this full frame list. */
@@ -166,7 +173,7 @@ function RawTab({ row, events }: { row: TrajectoryRow; events: readonly SseEvent
 }
 
 export function RowDetail(props: RowDetailProps) {
-  const { row, turnSeq, events, match, trace, traceLoading, onRefreshTrace, onFireResult, onClose } = props;
+  const { row, rowIndex, turnSeq, events, match, trace, traceLoading, onRefreshTrace, onFireResult, onClose } = props;
   const { t } = useTranslation();
   // Not reset on `row.id` change (no effect keyed off it) — the user
   // inspecting Timing stays on Timing when they pick a different row.
@@ -198,13 +205,13 @@ export function RowDetail(props: RowDetailProps) {
   }));
 
   return (
-    <div>
+    <div style={ROOT_STYLE}>
       <div
         data-testid="console-detail-header"
         style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
       >
-        <Text strong style={{ fontSize: 12.5 }}>
-          {t("console.detail_level_turn_only", { turn: turnSeq + 1 })}
+        <Text style={{ fontSize: 11, fontFamily: "var(--ew-font-mono)", color: "var(--ew-text-tertiary)" }}>
+          {`#${rowIndex}`}
         </Text>
         <Text type="secondary" style={{ fontSize: 11, fontFamily: "var(--ew-font-mono)" }}>
           {t(`console.traj_kind_${row.kind}`)}
@@ -216,6 +223,11 @@ export function RowDetail(props: RowDetailProps) {
         >
           {headerSummary(row, t)}
         </Text>
+        {row.durationMs !== null && (
+          <Text type="secondary" style={{ fontSize: 11, fontFamily: "var(--ew-font-mono)" }}>
+            {fmtDuration(row.durationMs)}
+          </Text>
+        )}
         <Button
           type="text"
           size="small"

@@ -4,21 +4,82 @@
  * button's own `data-status` attribute rather than JS-computed classes;
  * the pulse honours `prefers-reduced-motion` — same pattern as
  * ./SessionSidebar.css's `.ew-session-running-dot`.
+ *
+ * PR-A.1 Task 6:行改成七列 grid(`# / 类型 / 摘要 / 入 / 出 / 思考 / 耗时`),
+ * 表头行 sticky 在滚动容器顶,筛选芯片挂在滚动容器之外(不随行滚走)。
  */
+.ew-traj-rows-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
 .ew-traj-rows {
+  flex: 1;
+  min-height: 0;
   list-style: none;
   margin: 0;
   padding: 0;
-  height: 100%;
   overflow: auto;
 }
 
-.ew-traj-row {
+.ew-traj-rows__filter {
   display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: var(--ew-surface-raised);
+  border-bottom: 1px solid var(--ew-border-subtle);
+  color: var(--ew-text-secondary);
+  font-size: 11px;
+}
+
+.ew-traj-rows__filter-clear {
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ew-traj-rows__filter-clear:hover {
+  color: var(--ew-text-primary);
+}
+
+/* 表头与行共用同一套列宽 —— 两边分开写迟早对不齐。 */
+.ew-traj-rows__head,
+.ew-traj-row {
+  display: grid;
+  grid-template-columns: 28px 68px 1fr 46px 46px 46px 56px;
   align-items: center;
   gap: 8px;
   width: 100%;
   padding: 4px 8px;
+}
+
+.ew-traj-rows__head {
+  position: sticky;
+  top: 0;
+  z-index: var(--ew-z-sticky, 1);
+  background: var(--ew-surface-base);
+  border-bottom: 1px solid var(--ew-border-subtle);
+  color: var(--ew-text-tertiary);
+  font-family: var(--ew-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.ew-traj-rows__head > span:nth-child(1),
+.ew-traj-rows__head > span:nth-child(n + 4) {
+  text-align: right;
+}
+
+.ew-traj-row {
   border: none;
   background: none;
   color: var(--ew-text-primary);
@@ -28,7 +89,8 @@
   transition: background var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease);
 }
 
-.ew-traj-row:hover {
+.ew-traj-row:hover,
+.ew-traj-row[data-hovered="true"] {
   background: var(--ew-surface-hover);
 }
 
@@ -48,12 +110,19 @@
   color: var(--ew-text-warning);
 }
 
+.ew-traj-row__idx {
+  color: var(--ew-text-tertiary);
+  font-family: var(--ew-font-mono);
+  font-size: 11px;
+  text-align: right;
+}
+
 .ew-traj-row__kind {
   display: inline-flex;
-  flex-shrink: 0;
   align-items: center;
   gap: 4px;
-  width: 76px;
+  min-width: 0;
+  overflow: hidden;
   font-family: var(--ew-font-mono);
   font-size: 10px;
   font-weight: 600;
@@ -61,22 +130,24 @@
 }
 
 .ew-traj-row__summary {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 
+.ew-traj-row__tok,
 .ew-traj-row__duration {
-  flex-shrink: 0;
+  overflow: hidden;
   color: var(--ew-text-secondary);
   font-family: var(--ew-font-mono);
   font-size: 11px;
+  text-align: right;
 }
 
 .ew-traj-row__pulse {
   display: inline-block;
+  flex-shrink: 0;
   width: 5px;
   height: 5px;
   border-radius: 50%;
