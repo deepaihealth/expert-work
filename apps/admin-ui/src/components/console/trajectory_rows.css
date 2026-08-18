@@ -1,0 +1,101 @@
+/*
+ * TrajectoryRows — flat trajectory row list (debug console redesign PR-A
+ * Task 16). Status colour and the running pulse are driven off the row
+ * button's own `data-status` attribute rather than JS-computed classes;
+ * the pulse honours `prefers-reduced-motion` — same pattern as
+ * ./SessionSidebar.css's `.ew-session-running-dot`.
+ */
+.ew-traj-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: auto;
+}
+
+.ew-traj-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border: none;
+  background: none;
+  color: var(--ew-text-primary);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease);
+}
+
+.ew-traj-row:hover {
+  background: var(--ew-surface-hover);
+}
+
+.ew-traj-row--selected {
+  background: var(--ew-surface-selected);
+}
+
+.ew-traj-row[data-status="error"] {
+  color: var(--ew-text-danger);
+}
+
+.ew-traj-row[data-status="pause"] {
+  color: var(--ew-accent-violet);
+}
+
+.ew-traj-row[data-status="warn"] {
+  color: var(--ew-text-warning);
+}
+
+.ew-traj-row__kind {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  width: 76px;
+  font-family: var(--ew-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.ew-traj-row__summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ew-traj-row__duration {
+  flex-shrink: 0;
+  color: var(--ew-text-secondary);
+  font-family: var(--ew-font-mono);
+  font-size: 11px;
+}
+
+.ew-traj-row__pulse {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: ew-traj-row-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes ew-traj-row-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ew-traj-row__pulse {
+    animation: none;
+  }
+}
