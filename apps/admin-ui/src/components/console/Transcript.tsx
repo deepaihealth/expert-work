@@ -120,6 +120,11 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     <div
       ref={containerRef}
       data-testid="playground-transcript"
+      // 可滚动区域必须能被键盘聚焦(axe scrollable-region-focusable):三栏壳把
+      // 高度钉死后这一列在空态也会溢出,而空态里没有任何可聚焦子元素。
+      role="region"
+      aria-label={t("playground.transcript_label")}
+      tabIndex={0}
       style={{
         flex: 1,
         minHeight: 0,

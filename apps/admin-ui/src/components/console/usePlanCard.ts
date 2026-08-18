@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getThreadPlan, updateThreadPlan, type ThreadPlan } from "../../api/plan";
-import { foldPlan, type PlanFold } from "../../api/plan_reducer";
+import { foldPlan, isPlan, type PlanFold } from "../../api/plan_reducer";
 import type { SseEvent } from "../../api/sessions";
 
 export interface UsePlanCardArgs {
@@ -60,7 +60,12 @@ export function usePlanCard({
     let cancelled = false;
     (async () => {
       try {
-        const result = await fetchPlan(threadId);
+        const fetched = await fetchPlan(threadId);
+        // Shape-guard the baseline: ``getThreadPlan`` hands back the raw
+        // body, and a wrong-shaped one (mis-routed envelope, proxy page)
+        // must degrade to "no plan" instead of crashing the whole page on
+        // ``plan.steps``.
+        const result = isPlan(fetched) ? fetched : null;
         // A live snapshot may have already arrived while this was in
         // flight (or the thread may have changed — `cancelled` guards
         // that); either way the baseline is stale, so skip it.

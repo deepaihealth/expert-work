@@ -55,6 +55,20 @@ describe("usePlanCard", () => {
     expect(fetchPlan).toHaveBeenCalledWith("t2");
   });
 
+  it("treats a wrong-shaped baseline body as no plan instead of surfacing it", async () => {
+    // getThreadPlan hands back the raw body; a mis-routed envelope must not
+    // reach PlanCard (which reads plan.steps) — it degrades to null.
+    const fetchPlan = vi
+      .fn()
+      .mockResolvedValue({ success: true, data: { items: [], total: 0 } } as never);
+    const savePlan = vi.fn();
+    const { result } = renderHook(() =>
+      usePlanCard({ threadId: "t1", liveEvents: [], fetchPlan, savePlan }),
+    );
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    expect(result.current.plan).toBeNull();
+  });
+
   it("applies the newest live plan snapshot once, and does not re-apply it after a PUT", async () => {
     const fetchPlan = vi.fn().mockResolvedValue(PLAN_A);
     const savePlan = vi.fn().mockResolvedValue(PLAN_EDITED);

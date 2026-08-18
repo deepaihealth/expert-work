@@ -98,13 +98,15 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await expectNoA11yViolations(page, "/agents/playground");
 
   await page.getByTestId("playground-run").click();
-  // The event panel defaults to the tool-call timeline; this run has no tool
-  // calls, so switch to the raw-events view to assert the individual frames.
-  await page
-    .getByTestId("playground-event-view-toggle")
-    .getByText(/原始|raw/i)
-    .click();
-  await expect(page.getByTestId("event-card-end")).toBeVisible();
+  // The turn lands in the transcript and settles as soon as the stub's ``end``
+  // frame arrives (the raw event view is gone; per-frame detail now lives in
+  // the right rail's Raw tab).
+  const turn = page.getByTestId("console-turn");
+  await expect(turn).toBeVisible();
+  await expect(turn.getByText("describe this image")).toBeVisible();
+  await expect(turn.getByTestId("console-turn-status")).toHaveText(
+    /done|完成/i,
+  );
 
   expect(runBody).toEqual({
     input: "describe this image",
