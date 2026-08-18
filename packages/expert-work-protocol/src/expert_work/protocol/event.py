@@ -31,9 +31,10 @@ class EventType(StrEnum):
     #: (see ``orchestrator.sse.run_agent``); this taxonomy member keeps the
     #: canonical event-type name aligned with that wire value.
     COMPACTION = "compaction"
-    #: 调试台重设计 PR1(spec 2026-08-17 D6)—— 计划(任务列表)整份快照。
-    #: 与 ``COMPACTION`` 同款:自由字符串 ``"plan"`` SSE 帧 + RunEventStore 落库,
-    #: 枚举成员只为把规范事件名钉在一处(``orchestrator.sse.run_agent`` 引用它)。
+    #: Debug-console redesign PR1 (spec 2026-08-17 D6) — whole-snapshot plan
+    #: (task list). Same shape as COMPACTION: free-string "plan" SSE frame +
+    #: RunEventStore mirror; this member only pins the canonical event name
+    #: (orchestrator.sse.run_agent references it).
     PLAN = "plan"
 
 

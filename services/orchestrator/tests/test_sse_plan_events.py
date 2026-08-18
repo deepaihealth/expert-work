@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from expert_work.protocol import EventType
+from expert_work.protocol import EventType, Plan, PlanStep
 from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord, RunStatus
 from expert_work.runtime.runs.event_store import InMemoryRunEventStore
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
@@ -154,8 +154,8 @@ async def test_each_plan_change_derives_its_own_frame() -> None:
 
 @pytest.mark.asyncio
 async def test_parallel_nodes_last_plan_wins() -> None:
-    """同一 chunk 多个节点都写 plan(并行分支)→ 只派生一条,取最后一个节点的(与
-    tools 节点 accumulated_state「后写赢」同语义)。"""
+    """同一 chunk 多个节点值都带 plan(LangGraph 默认覆盖通道下图里产生不了,这里只钉一个
+    确定性的平局解)→ 只派生一条,取迭代顺序最后一个。"""
     events, _, _ = await _run(
         _Graph(chunks=[{"tools": {"plan": _PLAN_V1}, "planner": {"plan": _PLAN_V2}}])
     )
@@ -193,6 +193,33 @@ async def test_existing_plan_is_replayed_right_after_metadata() -> None:
     events, _, _ = await _run(graph)
     assert [e.event for e in events] == ["metadata", "plan", "updates"]
     assert events[1].data == _PLAN_V1
+
+
+@pytest.mark.asyncio
+async def test_real_plan_model_serializes_to_documented_shape() -> None:
+    """真 Plan 模型(非手写 dict)过 aget_state → _to_jsonable,payload 与文档形状逐字相等。"""
+    graph = _Graph(
+        chunks=[{"agent": {"step_count": 1}}],
+        initial_state={
+            "plan": Plan(
+                goal="给客户出续约建议",
+                steps=(
+                    PlanStep(id="1", description="查档案", status="completed"),
+                    PlanStep(id="2", description="分析工单"),
+                ),
+            )
+        },
+    )
+    events, _, _ = await _run(graph)
+    plan_frame = next(e for e in events if e.event == "plan")
+    assert plan_frame.data == {
+        "goal": "给客户出续约建议",
+        "steps": [
+            {"id": "1", "description": "查档案", "status": "completed"},
+            {"id": "2", "description": "分析工单", "status": "pending"},
+        ],
+    }
+    assert isinstance(plan_frame.data["steps"], list)
 
 
 @pytest.mark.asyncio

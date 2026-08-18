@@ -514,6 +514,13 @@ async def run_agent(
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
         await _publish_frame("metadata", metadata_payload)
 
+        # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
+        # The metadata frame above is server-synthesised, not LLM output,
+        # so we measure from this point to the first ``updates`` chunk.
+        # 调试台重设计 PR1:开跑前那次 checkpoint 读(plan 补发)也算在 TTFT 里 ——
+        # 它在 run 的关键路径上,spec §七 要用本指标量它。
+        ttft_started = time.monotonic()
+
         # 调试台重设计 PR1(D6)—— 冷启动补发:会话已有计划(上一 run 留下 / 空闲时
         # PUT 改的)就在第一条业务帧之前先发一份快照,第三方打开页面不用等计划变化
         # 才看得到任务卡。一次 checkpoint 读;读失败只记日志(与 J.8 pause 检查、
@@ -528,10 +535,6 @@ async def run_agent(
         if initial_plan is not None:
             await _publish_plan(initial_plan)
 
-        # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
-        # The metadata frame above is server-synthesised, not LLM output,
-        # so we measure from this point to the first ``updates`` chunk.
-        ttft_started = time.monotonic()
         first_chunk_seen = False
         # Batch 4a — per-superstep wall-clock. Each ``updates`` chunk is one
         # node execution; the gap between successive chunk arrivals is that
@@ -1521,8 +1524,8 @@ def _plan_in_chunk(chunk: Any) -> Any | None:
 
     调试台重设计 PR1 —— ``tools`` 节点把 ``update_plan`` 写回的快照展进节点值,
     ``planner`` 节点在自己的通道上带 ``plan``;两者都从这里派生一条顶层 ``plan``
-    帧。并行分支里多个节点同时写时取最后一个 —— 与 ``tools`` 节点
-    ``accumulated_state`` 的「后写赢」同语义(``builder.py`` K.K8)。
+    帧。一个 chunk 里若多个节点值都带 plan(默认覆盖通道下正常图产生不了),取迭代
+    顺序最后一个,只为有一个确定性的解。
     """
     if not isinstance(chunk, dict):
         return None
