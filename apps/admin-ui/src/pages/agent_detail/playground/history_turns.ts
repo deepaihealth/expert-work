@@ -22,7 +22,7 @@
  * the answer.
  */
 import type { HistoryMessage } from "../../../api/sessions";
-import type { ThreadRunSummary } from "../../../api/runs";
+import type { RunTokens, ThreadRunSummary } from "../../../api/runs";
 
 export interface FallbackLine {
   text: string;
@@ -35,6 +35,7 @@ export interface HistoryTurn {
   fallbackLines: FallbackLine[];
   runId: string;
   status: string;
+  tokens: RunTokens | null;
 }
 
 export function buildHistoryTurns(
@@ -58,5 +59,6 @@ export function buildHistoryTurns(
     fallbackLines: p.answers,
     runId: runs[i].runId,
     status: runs[i].status,
+    tokens: runs[i].tokens,
   }));
 }

@@ -157,6 +157,9 @@ export async function listSessions(
     /** Stream N — the endpoint is scope-aware ("*" aggregates every
      *  tenant), so the raw scope passes through unmapped. */
     tenantScope?: TenantScope;
+    /** PR-A — sort order; default (omitted) is the backend's
+     *  ``created_at`` default, so only ``"last_activity"`` is sent. */
+    orderBy?: "created" | "last_activity";
   } = {},
 ): Promise<ThreadMeta[]> {
   const query: Record<string, string | number | boolean> = {
@@ -167,6 +170,7 @@ export async function listSessions(
   if (params.agentName) query.agent_name = params.agentName;
   if (params.status) query.status = params.status;
   if (params.includeArchived) query.include_archived = true;
+  if (params.orderBy === "last_activity") query.order_by = "last_activity";
   const response = await apiClient.get<ApiEnvelope<{ items: ThreadMeta[] }>>(
     "/v1/sessions",
     { params: withTenantScope(query, params.tenantScope) },

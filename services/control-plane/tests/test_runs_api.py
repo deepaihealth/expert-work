@@ -1450,6 +1450,116 @@ async def test_thread_runs_lists_oldest_first(runs_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_thread_runs_carry_per_run_tokens(runs_client: AsyncClient) -> None:
+    """Debug-console redesign PR-A — the thread's run list carries each run's
+    token rollup (joined by trace_id, same source as ``GET .../runs/{run_id}``);
+    a run without usage carries ``tokens: null``."""
+    from datetime import UTC, datetime, timedelta
+    from uuid import uuid4
+
+    from expert_work.persistence.token_usage_store import TokenUsageRecord
+    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+
+    thread_id = await _create_session(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    with_usage, without_usage = uuid4(), uuid4()
+    trace = "feedfacefeedfacefeedfacefeedface"
+    for rid, created, tid in (
+        (with_usage, now, trace),
+        (without_usage, now + timedelta(seconds=5), None),
+    ):
+        await app.state.run_store.create(
+            RunInfo(
+                run_id=rid,
+                tenant_id=DEFAULT_DEV_TENANT_ID,
+                thread_id=UUID(thread_id),
+                user_id=None,
+                status=RunStatus.SUCCESS,
+                on_disconnect=DisconnectMode.CANCEL,
+                is_resume=False,
+                error=None,
+                created_at=created,
+                updated_at=created,
+                finished_at=created,
+                trace_id=tid,
+            )
+        )
+    await app.state.token_usage_store.insert(
+        TokenUsageRecord(
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            agent_name="code-reviewer",
+            agent_version="1.0.0",
+            model="claude-sonnet-4-6",
+            trace_id=trace,
+            input_tokens=120,
+            output_tokens=30,
+        )
+    )
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert resp.status_code == 200
+    runs = resp.json()["data"]["runs"]
+    assert [r["run_id"] for r in runs] == [str(with_usage), str(without_usage)]
+    assert runs[0]["tokens"] == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 150,
+        "llm_calls": 1,
+        "models": ["claude-sonnet-4-6"],
+    }
+    assert runs[1]["tokens"] is None
+
+
+@pytest.mark.asyncio
+async def test_thread_runs_token_lookup_failure_degrades_tokens_only(
+    runs_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Debug-console redesign PR-A fix round 1 — a ``token_usage`` lookup
+    failure must not empty the whole run list (only the run-store failing
+    should do that, per ``test_thread_runs_store_failure_degrades_to_empty``).
+    The console's history reconstruction pairs message count to run count;
+    silently collapsing to ``[]`` here would wrongly degrade a resumed
+    thread to flat text instead of merely losing the token badge."""
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+
+    thread_id = await _create_session(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    run_id = uuid4()
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+            trace_id="deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+    )
+
+    async def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app.state.token_usage_store, "totals_by_trace_ids", _boom)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert resp.status_code == 200
+    runs = resp.json()["data"]["runs"]
+    assert len(runs) == 1
+    assert runs[0]["run_id"] == str(run_id)
+    assert runs[0]["tokens"] is None
+
+
+@pytest.mark.asyncio
 async def test_thread_runs_foreign_tenant_forbidden(runs_client: AsyncClient) -> None:
     """A plain tenant admin asking for another tenant's runs is rejected by
     the scope gate (only a system_admin may cross) — same as

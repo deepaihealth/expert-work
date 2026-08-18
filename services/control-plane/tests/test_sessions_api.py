@@ -926,6 +926,40 @@ async def test_list_filters_by_agent_name(session_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_order_by_passes_through_to_store(
+    session_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``?order_by=last_activity`` reaches the store as ``order_by="last_activity"``
+    (the in-memory store ignores it — the SQL sort is covered in the
+    persistence package — so assert the pass-through, not the order)."""
+    await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    repo = app.state.thread_meta_repo
+    seen: list[str] = []
+    real = repo.list_by_tenant
+
+    async def spy(*args: object, **kwargs: object) -> object:
+        seen.append(str(kwargs.get("order_by")))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "list_by_tenant", spy)
+    resp = await session_client.get("/v1/sessions?order_by=last_activity")
+    assert resp.status_code == 200
+    assert seen == ["last_activity"]
+
+    seen.clear()
+    resp = await session_client.get("/v1/sessions")
+    assert resp.status_code == 200
+    assert seen == ["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_list_order_by_rejects_unknown_value(session_client: AsyncClient) -> None:
+    resp = await session_client.get("/v1/sessions?order_by=title")
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_archive_hides_from_list_but_stays_reachable(
     session_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:

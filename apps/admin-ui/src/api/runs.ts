@@ -252,6 +252,9 @@ export interface ThreadRunSummary {
   status: RunStatus;
   isResume: boolean;
   createdAt: string;
+  /** PR-A — persisted per-run token rollup (``null`` when the run has no
+   *  recorded usage; absent on old backends → treated as null). */
+  tokens: RunTokens | null;
 }
 
 interface ThreadRunRow {
@@ -259,6 +262,7 @@ interface ThreadRunRow {
   status: RunStatus;
   is_resume: boolean;
   created_at: string;
+  tokens?: RunTokens | null;
 }
 
 /** List a thread's runs oldest-first. ``tenantId`` (a system_admin drilling
@@ -276,5 +280,6 @@ export async function listThreadRuns(
     status: r.status,
     isResume: r.is_resume,
     createdAt: r.created_at,
+    tokens: r.tokens ?? null,
   }));
 }

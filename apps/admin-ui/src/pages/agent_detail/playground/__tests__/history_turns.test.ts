@@ -5,7 +5,7 @@ import type { ThreadRunSummary } from "../../../../api/runs";
 import { buildHistoryTurns } from "../history_turns";
 
 function run(runId: string): ThreadRunSummary {
-  return { runId, status: "success", isResume: false, createdAt: "2026-01-01" };
+  return { runId, status: "success", isResume: false, createdAt: "2026-01-01", tokens: null };
 }
 
 const U = (content: string): HistoryMessage => ({ role: "user", content });
@@ -27,6 +27,7 @@ describe("buildHistoryTurns", () => {
         fallbackLines: [{ text: "a1", channel: null }],
         runId: "r1",
         status: "success",
+        tokens: null,
       },
       {
         key: "r2",
@@ -34,6 +35,7 @@ describe("buildHistoryTurns", () => {
         fallbackLines: [{ text: "a2", channel: null }],
         runId: "r2",
         status: "success",
+        tokens: null,
       },
     ]);
   });
@@ -53,6 +55,7 @@ describe("buildHistoryTurns", () => {
         ],
         runId: "r1",
         status: "success",
+        tokens: null,
       },
     ]);
   });
@@ -72,6 +75,7 @@ describe("buildHistoryTurns", () => {
       fallbackLines: [],
       runId: "r2",
       status: "success",
+      tokens: null,
     });
   });
 
@@ -97,6 +101,7 @@ describe("buildHistoryTurns", () => {
         ],
         runId: "r1",
         status: "success",
+        tokens: null,
       },
       {
         key: "r2",
@@ -104,7 +109,23 @@ describe("buildHistoryTurns", () => {
         fallbackLines: [{ text: "b1", channel: null }],
         runId: "r2",
         status: "success",
+        tokens: null,
       },
     ]);
+  });
+
+  it("carries each run's persisted token rollup onto the paired turn", () => {
+    const messages: HistoryMessage[] = [
+      { role: "user", content: "q", channel: null },
+      { role: "assistant", content: "a", channel: "final" },
+    ];
+    const tokens = {
+      input_tokens: 10, output_tokens: 5, cache_creation_tokens: 0,
+      cache_read_tokens: 0, total_tokens: 15, llm_calls: 1, models: ["m"],
+    };
+    const turns = buildHistoryTurns(messages, [
+      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", tokens },
+    ]);
+    expect(turns?.[0]?.tokens).toEqual(tokens);
   });
 });

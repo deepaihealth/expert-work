@@ -131,8 +131,20 @@ const TWO_TURNS: sessionsSdk.HistoryMessage[] = [
 ];
 
 const TWO_RUNS = [
-  { runId: RUN_1, status: "success" as const, isResume: false, createdAt: "2026-06-30T12:00:00Z" },
-  { runId: RUN_2, status: "success" as const, isResume: true, createdAt: "2026-06-30T12:05:00Z" },
+  {
+    runId: RUN_1,
+    status: "success" as const,
+    isResume: false,
+    createdAt: "2026-06-30T12:00:00Z",
+    tokens: null,
+  },
+  {
+    runId: RUN_2,
+    status: "success" as const,
+    isResume: true,
+    createdAt: "2026-06-30T12:05:00Z",
+    tokens: null,
+  },
 ];
 
 const CONVO: ConversationDetailModel = {
@@ -555,9 +567,27 @@ describe("ConversationDetail", () => {
         { role: "assistant", content: "third answer" },
       ]);
       vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
-        { runId: RUN_1, status: "timeout", isResume: false, createdAt: "2026-06-30T12:00:00Z" },
-        { runId: RUN_2, status: "interrupted", isResume: true, createdAt: "2026-06-30T12:05:00Z" },
-        { runId: RUN_3, status: "error", isResume: true, createdAt: "2026-06-30T12:10:00Z" },
+        {
+          runId: RUN_1,
+          status: "timeout",
+          isResume: false,
+          createdAt: "2026-06-30T12:00:00Z",
+          tokens: null,
+        },
+        {
+          runId: RUN_2,
+          status: "interrupted",
+          isResume: true,
+          createdAt: "2026-06-30T12:05:00Z",
+          tokens: null,
+        },
+        {
+          runId: RUN_3,
+          status: "error",
+          isResume: true,
+          createdAt: "2026-06-30T12:10:00Z",
+          tokens: null,
+        },
       ]);
       vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() =>
         makeStream(replayEvents),
