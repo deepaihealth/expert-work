@@ -1245,6 +1245,11 @@ export interface TranslationKeys {
     footer_tokens: string;
     footer_steps: string;
     footer_export: string;
+    lane_user: string;
+    lane_mode_sequence: string;
+    lane_mode_duration: string;
+    lane_tip_hint: string;
+    lane_tip_range: string;
   };
   playground: {
     session_label: string;
@@ -4414,6 +4419,11 @@ const en: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
     footer_export: "Export",
+    lane_user: "User",
+    lane_mode_sequence: "Sequence",
+    lane_mode_duration: "Duration",
+    lane_tip_hint: "Click to select · drag to filter · double-click to reset",
+    lane_tip_range: "{{start}} → {{end}} · {{d}}",
   },
   playground: {
     session_label: "Session",

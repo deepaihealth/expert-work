@@ -1,66 +1,85 @@
 /*
- * LaneStrip — component-scoped styles for the debug console's compact
- * three-lane time strip (input / model / tools). Mirrors GanttTimeline.css's
- * conventions: `--ew-*` design tokens end to end, a growing-bar pulse guarded
- * by `prefers-reduced-motion`, and a hatched fill for interrupted (truncated)
- * blocks. Lane colors match TraceView's semantic palette (input=trace-entry,
- * model=info, tools=accent-violet); error blocks override to the danger
- * token regardless of lane.
+ * LaneStrip v2 —— 调试台右栏三条细泳道的组件级样式(spec §八.7)。全程 `--ew-*`
+ * 设计令牌:用户道 brand-300、模型道 brand-500、工具道 accent-violet,失败块
+ * 一律 danger-500;块之间用 `box-shadow` 描一圈底色造 1px 缝,避免并排的块糊成
+ * 一条。运行中的块呼吸,`prefers-reduced-motion` 下关掉。
  */
 
-.ew-lane-strip__body {
+.ew-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
+  user-select: none;
+}
+
+.ew-lanes__body {
   position: relative;
+  touch-action: none;
+  cursor: crosshair;
 }
 
-.ew-lane-strip__row {
-  display: flex;
-  align-items: stretch;
-  height: 22px;
-}
-
-.ew-lane-strip__head {
-  flex: 0 0 40px;
-  display: flex;
+.ew-lane {
+  display: grid;
+  grid-template-columns: 34px 1fr;
   align-items: center;
+  height: 14px;
+}
+
+.ew-lane__label {
   color: var(--ew-text-tertiary);
   font-size: 10px;
+  line-height: 14px;
 }
 
-.ew-lane-strip__track {
+.ew-lane__track {
   position: relative;
-  flex: 1;
+  height: 8px;
 }
 
 .ew-lane__block {
   position: absolute;
-  top: 4px;
-  height: 14px;
-  min-width: 3px;
+  top: 0;
+  height: 8px;
+  min-width: 2px;
   padding: 0;
   border: none;
-  border-radius: 3px;
+  border-radius: 2px;
   cursor: pointer;
+  /* 相邻块之间的 1px 缝 —— 用底色描边而不是 margin,免得影响百分比几何。 */
+  box-shadow: 0 0 0 1px var(--ew-surface-base);
 }
 
-span.ew-lane__block {
-  cursor: default;
-}
-
-.ew-lane__block[data-lane="input"] {
-  background: var(--ew-trace-entry);
+.ew-lane__block[data-lane="user"] {
+  background: var(--ew-color-brand-300);
 }
 .ew-lane__block[data-lane="model"] {
-  background: var(--ew-text-info);
+  background: var(--ew-color-brand-500);
 }
 .ew-lane__block[data-lane="tools"] {
   background: var(--ew-accent-violet);
 }
-
-.ew-lane__block--error {
-  background: var(--ew-text-danger);
+.ew-lane__block[data-error="true"] {
+  background: var(--ew-color-danger-500);
 }
 
-.ew-lane__block--live {
+.ew-lane__block[data-dimmed="true"] {
+  opacity: 0.35;
+}
+/* 描边叠在 1px 底色缝**之外**,不能整条 box-shadow 覆盖掉缝 —— 否则悬停 /
+   选中的块会跟邻块糊在一起。 */
+.ew-lane__block[data-hovered="true"] {
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 2px #fff;
+}
+.ew-lane__block[data-selected="true"] {
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 3px #fff;
+}
+
+.ew-lane__block[data-live="true"] {
   animation: ew-lane-pulse 1.4s ease-in-out infinite;
 }
 
@@ -70,46 +89,55 @@ span.ew-lane__block {
     opacity: 0.5;
   }
   50% {
-    opacity: 0.9;
+    opacity: 1;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ew-lane__block--live {
+  .ew-lane__block[data-live="true"] {
     animation: none;
   }
 }
 
-.ew-lane__block--interrupted {
-  background-image: repeating-linear-gradient(
-    45deg,
-    transparent,
-    transparent 3px,
-    rgba(0, 0, 0, 0.18) 3px,
-    rgba(0, 0, 0, 0.18) 6px
-  );
-}
-
-.ew-lane-strip__markers {
+/* 量尺 —— 与轨道区同左同宽,拖选遮罩挂在它里面;本身不吃指针事件。 */
+.ew-lanes__gauge {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 40px;
+  left: 34px;
   right: 0;
   pointer-events: none;
 }
 
-.ew-lane__marker {
+.ew-lanes__range,
+.ew-lanes__draft {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 0;
-  border-left: 1px dashed var(--ew-text-tertiary);
+  border-radius: 2px;
+}
+.ew-lanes__range {
+  background: color-mix(in srgb, var(--ew-color-brand-300) 14%, transparent);
+  border-left: 1px solid var(--ew-color-brand-300);
+  border-right: 1px solid var(--ew-color-brand-300);
+}
+.ew-lanes__draft {
+  background: color-mix(in srgb, var(--ew-color-brand-300) 22%, transparent);
 }
 
-.ew-lane-strip__degraded {
-  margin-top: 4px;
-  padding-left: 40px;
+.ew-lanes__ticks {
+  position: relative;
+  height: 12px;
+  margin-left: 34px;
+}
+
+.ew-lanes__tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
   color: var(--ew-text-tertiary);
-  font-size: 10px;
+  font-family: var(--ew-font-mono);
+  font-size: 9.5px;
+  line-height: 12px;
+  white-space: nowrap;
 }

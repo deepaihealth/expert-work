@@ -1307,6 +1307,11 @@ const zhCN: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} 步",
     footer_export: "导出",
+    lane_user: "用户",
+    lane_mode_sequence: "顺序",
+    lane_mode_duration: "时长",
+    lane_tip_hint: "点击选中 · 拖选过滤 · 双击复位",
+    lane_tip_range: "{{start}} → {{end}} · {{d}}",
   },
   playground: {
     session_label: "会话",
