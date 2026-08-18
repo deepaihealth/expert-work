@@ -86,9 +86,9 @@ class ManifestLoader:
 
     # ----- internals --------------------------------------------------
 
-    def _parse_yaml(self, rendered: str) -> dict[str, Any]:
+    def _parse_yaml(self, source: str) -> dict[str, Any]:
         try:
-            doc = yaml.safe_load(rendered)
+            doc = yaml.safe_load(source)
         except yaml.YAMLError as exc:
             raise ManifestSyntaxError(f"manifest is not valid YAML: {exc}") from None
         if not isinstance(doc, dict):

@@ -1,4 +1,6 @@
-"""Manifest loader tests — YAML + Jinja2 + Pydantic lint pipeline."""
+"""Manifest loader tests — YAML + Pydantic lint pipeline (no template stage:
+``{{ }}`` is stored verbatim).
+"""
 
 from __future__ import annotations
 

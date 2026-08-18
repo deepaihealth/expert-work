@@ -25,11 +25,11 @@ POST /v1/sessions/{thread_id}/runs
 ## 2. 现状(已查实)
 
 - `SystemPromptSpec.template`(`agent_spec.py:176`)schema 层是**纯字符串**,无占位符语义。
-- 已有沙箱 Jinja 渲染器 `control_plane/manifest/loader.py:94`(`SandboxedEnvironment` + `StrictUndefined` + autoescape-off),挡 SSTI/RCE —— **但只在「建/改 agent」时渲染**(`template_vars` 烧死进存库 AgentSpec),run 期无变量。
+- 已有沙箱 Jinja 渲染器 `control_plane/manifest/loader.py:94`(`SandboxedEnvironment` + `StrictUndefined` + autoescape-off),挡 SSTI/RCE —— **但只在「建/改 agent」时渲染**(`template_vars` 烧死进存库 AgentSpec),run 期无变量。(**已下线**,见本节末勘误)
 - `RunRequest`(`runs.py:87`,`extra="forbid"`)字段:input / mode / image_refs / untrusted_content。**无 inputs dict**。run 动态数据全进 HumanMessage,从不碰 SystemMessage。
 - jinja2 已是 control-plane 依赖(`pyproject.toml:28`),orchestrator 未引。
 - `protocol` 有 `DynamicContextSpec` / `CustomReminderSpec.template`(`agent_spec.py:182`)占位字段,但 **orchestrator 零消费者**(不复用,避免混淆)。
-- **勘误(2026-08-17,调试台重设计 PR0)**:上面那条「已有沙箱 Jinja 渲染器只在建/改 agent 时渲染」
+- **勘误(2026-08-18,调试台重设计 PR0)**:上面那条「已有沙箱 Jinja 渲染器只在建/改 agent 时渲染」
   的老功能与本设计**撞车**——它把整份 YAML(含 `system_prompt.template`)当 Jinja 用 `StrictUndefined`
   渲染,jinja 动态 prompt 里合法的 `{{ var }}` 在保存时被当未定义变量,控制台一律 400
   `MANIFEST_TEMPLATE`;M2 前端又把 `record.spec` 多包了一层壳,调试台的变量框从未渲染。两条合起来,

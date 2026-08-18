@@ -204,7 +204,7 @@ expert-work/
 
 | 路径 | 作用 |
 |------|------|
-| `services/control-plane/src/control_plane/manifest/loader.py` | YAML 加载/Jinja2/Pydantic 校验入口 |
+| `services/control-plane/src/control_plane/manifest/loader.py` | YAML 加载/Pydantic 校验入口(无模板阶段) |
 | `services/orchestrator/src/orchestrator/graph_builder/builder.py` | AgentSpec → LangGraph StateGraph 编译核心 |
 | `services/sandbox-supervisor/src/sandbox_supervisor/pool/supervisor.py` | Sandbox 池化、Docker+gVisor 调度 |
 | `services/credential-proxy/src/credential_proxy/proxy.py` | 凭证注入代理（M0 自研版）|

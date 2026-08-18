@@ -8,7 +8,9 @@ class ManifestError(Exception):
 
 
 class ManifestSyntaxError(ManifestError):
-    """YAML failed to parse, or the parsed root is not a mapping."""
+    """YAML failed to parse, the parsed root is not a mapping, or the
+    document exceeds the size cap.
+    """
 
 
 class ManifestValidationError(ManifestError):
