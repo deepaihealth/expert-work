@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, resolveGanttKey, trajectoryRowsOf } from "../trajectory_rows";
+import { compactRowsOf, resolveGanttKey, trajectoryRowsOf, type ThinkRow } from "../trajectory_rows";
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
@@ -188,6 +188,30 @@ describe("trajectoryRowsOf", () => {
   it("assistant row omitted while answer is null; status follows turnStatus", () => {
     expect(trajectoryRowsOf(EVENTS, INPUT, null, "running").some((r) => r.kind === "assistant")).toBe(false);
     expect(trajectoryRowsOf(EVENTS, INPUT, "x", "error").at(-1)).toMatchObject({ kind: "assistant", status: "error" });
+  });
+
+  it("think row carries the step's reasoning / cache-read token details (undefined when absent)", () => {
+    const rows = trajectoryRowsOf([
+      upd("agent", { step_count: 1, messages: [{
+        type: "ai", content: "答",
+        additional_kwargs: { reasoning_content: "先想想" },
+        usage_metadata: {
+          input_tokens: 16000, output_tokens: 900, total_tokens: 16900,
+          output_token_details: { reasoning: 770 },
+          input_token_details: { cache_read: 14336 },
+        },
+      }] }),
+      upd("agent", { step_count: 2, messages: [{
+        type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 },
+      }] }),
+    ], INPUT, null, "running");
+    // 谓词过滤而不是 `if (x.kind === "think")` —— 后者一旦投影变了会**静默
+    // 跳过**整段断言,看起来照样绿。
+    const thinks = rows.filter((r): r is ThinkRow => r.kind === "think");
+    expect(thinks).toHaveLength(2);
+    expect(thinks[0]).toMatchObject({ inputTokens: 16000, outputTokens: 900, reasoningTokens: 770, cacheReadTokens: 14336 });
+    expect(thinks[1].reasoningTokens).toBeUndefined();
+    expect(thinks[1].cacheReadTokens).toBeUndefined();
   });
 
   it("serverMs: item.serverMs for agent/marker rows, entry.serverMs for tool rows, null for user/assistant/subagent", () => {

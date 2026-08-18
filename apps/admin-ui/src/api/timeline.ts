@@ -29,6 +29,11 @@ export interface AgentStep {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** ``usage_metadata.output_token_details.reasoning`` —— 厂商没报就是
+   *  ``undefined``(≠ 0:0 是「报了、确实没有思考 token」)。行表「思考」列用。 */
+  reasoningTokens?: number;
+  /** ``usage_metadata.input_token_details.cache_read`` —— 同上,没报是 ``undefined``。 */
+  cacheReadTokens?: number;
   tools: ToolCallEntry[];
   hasError: boolean;
   durationMs: number | null;
@@ -95,6 +100,10 @@ function textOf(v: unknown): string | null {
     return joined.trim() === "" ? null : joined;
   }
   return null;
+}
+/** 可选计数:没报 / 不是有限数字 → ``undefined``(``int`` 那套会把缺省抹成 0)。 */
+function optInt(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 function durationOf(ch: Record<string, unknown>): number | null {
   const v = ch._duration_ms;
@@ -209,6 +218,8 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
           inputTokens: int(um.input_tokens),
           outputTokens: int(um.output_tokens),
           totalTokens: int(um.total_tokens),
+          reasoningTokens: optInt(obj(um.output_token_details).reasoning),
+          cacheReadTokens: optInt(obj(um.input_token_details).cache_read),
           tools,
           hasError: tools.some((t) => t.status === "error"),
           durationMs: durationOf(ch),

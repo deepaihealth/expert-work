@@ -28,7 +28,7 @@ interface RowBase {
   /** 帧 id 里的服务端毫秒(≈ 该单元结束时刻;Timing tab SSE 列用):agent / aux / marker 行取 `item.serverMs`,tool / plan(update_plan)行取 `entry.serverMs`;subagent / user / assistant 为 null。 */
   serverMs: number | null;
 }
-export type ThinkRow = RowBase & { kind: "think"; text: string; content: string | null; model: string | null; inputTokens: number; outputTokens: number; finishReason: string | null };
+export type ThinkRow = RowBase & { kind: "think"; text: string; content: string | null; model: string | null; inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens?: number; finishReason: string | null };
 export type ToolRow = RowBase & { kind: "tool"; entry: ToolCallEntry };
 export type SubagentRow = RowBase & { kind: "subagent"; worker: WorkerTimeline; parentEntryId: string };
 export type PlanRow = RowBase & {
@@ -135,7 +135,9 @@ function rowsOf(events: readonly SseEvent[], opts: { everyStepThinks: boolean })
           rows.push({
             id: `think:${item.seq}`, kind: "think", seq: item.seq, step: item.stepCount,
             text: item.reasoning ?? "", content: item.content, model: item.model,
-            inputTokens: item.inputTokens, outputTokens: item.outputTokens, finishReason: item.finishReason,
+            inputTokens: item.inputTokens, outputTokens: item.outputTokens,
+            reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
+            finishReason: item.finishReason,
             status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
             eventIndexes: idx(item), serverMs: item.serverMs ?? null,
           });
