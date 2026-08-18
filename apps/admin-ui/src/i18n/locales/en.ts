@@ -1128,7 +1128,6 @@ export interface TranslationKeys {
     sidebar_search: string;
     sidebar_filter_active: string;
     sidebar_filter_archived: string;
-    sidebar_open: string;
     sidebar_running_dot: string;
     thread_id_label: string;
     turn_count: string;
@@ -1144,10 +1143,7 @@ export interface TranslationKeys {
     row_subagent: string;
     row_tool_pending: string;
     row_tool_error: string;
-    row_expand: string;
-    row_collapse: string;
     row_inspect: string;
-    answer_streaming: string;
     footer_inspect: string;
     footer_status_running: string;
     footer_status_done: string;
@@ -4287,7 +4283,6 @@ const en: TranslationKeys = {
     sidebar_search: "Search sessions…",
     sidebar_filter_active: "Active",
     sidebar_filter_archived: "Archived",
-    sidebar_open: "Open session list",
     sidebar_running_dot: "Running",
     thread_id_label: "Session",
     turn_count: "{{n}} turns",
@@ -4303,10 +4298,7 @@ const en: TranslationKeys = {
     row_subagent: "Sub-agent · {{name}}",
     row_tool_pending: "running",
     row_tool_error: "failed",
-    row_expand: "Expand",
-    row_collapse: "Collapse",
     row_inspect: "Inspect",
-    answer_streaming: "Generating…",
     footer_inspect: "Inspect",
     footer_status_running: "Running",
     footer_status_done: "Done",
