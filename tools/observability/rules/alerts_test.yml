@@ -28,7 +28,7 @@ tests:
             exp_annotations:
               summary: "Sandbox egress rejected with 407 (blocked_auth)"
               description: "15 sandbox egress attempt(s) were rejected by the credential proxy with 407 in the last 15m — most likely an egress token that outlived its sandbox (or a warm session past its token TTL before the age cap kicked in)."
-              runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+              runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
   # Only non-auth verdicts (blocked_ssrf) present — the blocked_auth series
   # doesn't exist, so increase() is the empty vector (not 0) — no alert,

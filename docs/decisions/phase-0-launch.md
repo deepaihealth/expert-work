@@ -74,7 +74,7 @@
 **与现状对齐**：
 | 名称位置 | 现状 | 处理 |
 |---------|------|------|
-| GitHub repo | `joneqian/expert-work` | ✅ 已对齐 |
+| GitHub repo | `deepaihealth/expert-work` | ✅ 已对齐 |
 | Python 包 | `expert_work`（`src/expert_work/__init__.py`） | ✅ 已对齐 |
 | docs/README.md 标题 | "Expert Work — 自研..." | 🔄 后续 docs/branding-cleanup PR 统一为 "Expert Work" |
 | 各 docs 内提及 | "Expert Work" | 🔄 同上 |
