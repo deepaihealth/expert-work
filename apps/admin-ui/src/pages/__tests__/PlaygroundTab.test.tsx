@@ -835,7 +835,13 @@ describe("PlaygroundTab", () => {
     const costDetail: AgentDetailResponse = {
       record: {
         ...sampleDetail.record,
-        spec: { model: { provider: "anthropic", name: "claude-x" } },
+        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec(见 :660 的守形状用例)。
+        spec: {
+          apiVersion: "expert_work.io/v1",
+          kind: "Agent",
+          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+          spec: { model: { provider: "anthropic", name: "claude-x" } },
+        },
       },
     };
     renderPg(costDetail);
@@ -848,7 +854,13 @@ describe("PlaygroundTab", () => {
     const costDetail: AgentDetailResponse = {
       record: {
         ...sampleDetail.record,
-        spec: { model: { provider: "anthropic", name: "claude-x" } },
+        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec(见 :660 的守形状用例)。
+        spec: {
+          apiVersion: "expert_work.io/v1",
+          kind: "Agent",
+          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+          spec: { model: { provider: "anthropic", name: "claude-x" } },
+        },
       },
     };
     createSessionMock.mockResolvedValue(sampleThread);

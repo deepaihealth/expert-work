@@ -57,8 +57,10 @@ export interface AgentDisableRecord {
 
 export interface AgentDetailResponse {
   record: AgentRecord & {
-    /** Full spec — same shape as POST /v1/agents accepts. Used by
-     *  the Manifest preview / edit tab in :ref:`AgentDetail`. */
+    /** The full manifest ({apiVersion, kind, metadata, spec}) — same
+     *  document POST /v1/agents accepts. NOT the inner ``spec`` block: pass
+     *  it to the form_model readers as-is (``readPromptJinja(record.spec)``),
+     *  never wrapped in another ``{ spec }`` shell. */
     spec: Record<string, unknown>;
   };
   /** Stream RT-4 — whether the agent name is currently kill-switched. */

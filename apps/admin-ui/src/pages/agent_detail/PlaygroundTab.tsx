@@ -210,7 +210,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // (否则每次进调试台吃一发静默 403),成本区随现有"无数据"态自然隐藏。
   useEffect(() => {
     if (!isSystemAdmin) return;
-    const model = readModel({ spec: r.spec });
+    // ``r.spec`` is already the full manifest ({apiVersion, kind, metadata,
+    // spec}) — same "record.spec 多包一层壳" bug as :138, twin fix.
+    const model = readModel(r.spec);
     if (!model.provider || !model.name) return;
     let cancelled = false;
     void listRateCards({ provider: model.provider, model: model.name })
