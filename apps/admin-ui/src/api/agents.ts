@@ -89,9 +89,9 @@ export async function getAgent(
   );
 }
 
-/** Server-side ``ManifestPayload`` accepts raw YAML + optional template
- *  vars; the backend re-loads it through :class:`ManifestLoader` so the
- *  spec is validated end-to-end (Pydantic + ManifestError) on save. */
+/** Server-side ``ManifestPayload`` accepts the manifest YAML text; ``{{ … }}``
+ *  inside it is run-time Jinja, stored verbatim. The backend validates it
+ *  end-to-end (Pydantic + ManifestError) on save. */
 export interface ManifestPayload {
   manifest_yaml: string;
 }
