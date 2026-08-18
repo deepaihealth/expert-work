@@ -1,6 +1,7 @@
 /**
- * Session-history drawer e2e — browse / search / resume / rename / archive /
- * purge over the Playground's session list, against mocked routes. Also axe.
+ * Session sidebar e2e — browse / search / resume / rename / archive / purge
+ * over the Playground's left-rail session list (the drawer was retired by the
+ * three-column console), against mocked routes. Also axe.
  */
 import { test, expect, expectNoA11yViolations, SAMPLE_JWT } from "./fixtures";
 
@@ -78,6 +79,11 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
       });
     } else if (method === "GET" && url.includes("/messages")) {
       await route.fulfill({ json: { success: true, data: { messages: [] } } });
+    } else if (method === "GET" && url.includes("/runs")) {
+      await route.fulfill({ json: { success: true, data: { runs: [] } } });
+    } else if (method === "GET" && url.includes("/plan")) {
+      // No persisted plan for this thread (204, raw body — not enveloped).
+      await route.fulfill({ status: 204, body: "" });
     } else if (method === "GET" && /\/v1\/sessions\/[^/?]+(\?|$)/.test(url)) {
       // GET /v1/sessions/{id} — single session meta.
       await route.fulfill({
@@ -109,8 +115,9 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
   await login(page);
   await page.goto("/agents/demo-agent/1.0.0/playground");
 
-  // Open the drawer → the list loads with human titles.
-  await page.getByTestId("playground-history-open").click();
+  // The sidebar is always mounted on a desktop viewport → the list loads on
+  // page load with human titles; no drawer to open.
+  await expect(page.getByTestId("console-session-sidebar")).toBeVisible();
   await expect(page.getByText("Quarterly report")).toBeVisible();
   await expect(page.getByText("今天天气")).toBeVisible();
   await expectNoA11yViolations(page, "/agents/playground/history");
@@ -119,31 +126,36 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
   const listReq = page.waitForRequest(
     (r) => r.url().includes("/v1/sessions") && r.url().includes("q=report"),
   );
-  await page.getByTestId("session-history-search").fill("report");
+  await page.getByTestId("console-session-search").fill("report");
   await listReq;
-  await page.getByTestId("session-history-search").fill("");
+  await page.getByTestId("console-session-search").fill("");
 
-  // Status filter → ?status=. Pick "archived" (how soft-deleted threads become
-  // visible again).
+  // Status filter is a two-value Segmented (Active / Archived) → ?status=.
+  // Pick "archived" (how soft-deleted threads become visible again), then
+  // switch back so the rows below are the active ones.
   const statusReq = page.waitForRequest(
     (r) =>
       r.url().includes("/v1/sessions") && r.url().includes("status=archived"),
   );
-  await page.getByTestId("session-history-status-filter").click();
   await page
-    .locator(".ant-select-item-option-content", { hasText: /archived|已归档/i })
+    .getByTestId("console-session-filter")
+    .getByText(/archived|已归档/i)
     .click();
   await statusReq;
+  await page
+    .getByTestId("console-session-filter")
+    .getByText(/^(active|活跃)$/i)
+    .click();
 
   // Rename → PATCH with the new title.
-  await page.getByTestId(`session-history-rename-${A_ID}`).click();
-  await page.getByTestId("session-history-rename-input").fill("Renamed thread");
+  await page.getByTestId(`console-session-rename-${A_ID}`).click();
+  await page.getByTestId("console-session-rename-input").fill("Renamed thread");
   await page.getByRole("button", { name: /save|保存/i }).click();
   await expect.poll(() => calls.patch).toEqual({ title: "Renamed thread" });
 
   // Archive → DELETE after confirmation. Scope the OK to the open popconfirm
   // (its label collides with the rows' archive icon-button aria-labels).
-  await page.getByTestId(`session-history-archive-${A_ID}`).click();
+  await page.getByTestId(`console-session-archive-${A_ID}`).click();
   await page
     .locator(".ant-popconfirm-buttons")
     .getByRole("button", { name: /^(archive|归档)$/i })
@@ -151,15 +163,20 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
   await expect.poll(() => calls.deleted).toContain(`/v1/sessions/${A_ID}`);
 
   // Purge → POST :purge after the danger confirmation (same scoping).
-  await page.getByTestId(`session-history-purge-${A_ID}`).click();
+  await page.getByTestId(`console-session-purge-${A_ID}`).click();
   await page
     .locator(".ant-popconfirm-buttons")
     .getByRole("button", { name: /delete forever|彻底删除/i })
     .click();
   await expect.poll(() => calls.purged).toContain(`${A_ID}:purge`);
 
-  // Resume → click a row → drawer closes + the thread id shows in the header.
-  await page.getByTestId(`session-history-item-${B_ID}`).click();
-  await expect(page.getByTestId("session-history-drawer")).toBeHidden();
-  await expect(page.getByTestId("playground-resumed-notice")).toBeVisible();
+  // Resume → click a row → the thread id shows in the header (the old
+  // "resumed" banner is gone; the highlighted sidebar row carries that state).
+  // Click the title, not the row's geometric centre — in the narrow rail the
+  // action icons wrap under the title and the centre lands on "Rename".
+  await page
+    .getByTestId(`console-session-item-${B_ID}`)
+    .getByText("今天天气")
+    .click();
+  await expect(page.getByTestId("console-thread-id")).toContainText(B_ID);
 });

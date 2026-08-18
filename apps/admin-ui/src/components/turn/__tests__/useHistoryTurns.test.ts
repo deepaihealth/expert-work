@@ -75,6 +75,7 @@ const oneRun = [
     status: "success" as const,
     isResume: false,
     createdAt: "2026-05-25T00:00:00Z",
+    tokens: null,
   },
 ];
 
@@ -117,6 +118,7 @@ describe("useHistoryTurns", () => {
         fallbackLines: [{ text: "a1", channel: null }],
         runId: "r1",
         status: "success",
+        tokens: null,
       },
     ]);
     expect(result.current.loads).toEqual({

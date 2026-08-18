@@ -192,4 +192,31 @@ describe("useTokenStream", () => {
     expect(result.current.finalized).toBe(true);
     expect(result.current.liveByStep.get(0)?.content).toBe("partial");
   });
+
+  it("records firstTokenAt / lastTokenAt (epoch ms) across channels and keeps them after finalize", () => {
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValue(1_000);
+    const { result } = renderHook(() => useTokenStream());
+    act(() => result.current.reset());
+    now.mockReturnValue(1_250);
+    act(() => result.current.push(reasoningFrame(1, "…")));
+    now.mockReturnValue(2_000);
+    act(() => result.current.push(contentFrame(1, "hi")));
+    act(() => flushRaf());
+    expect(result.current.firstTokenAt).toBe(1_250);
+    expect(result.current.lastTokenAt).toBe(2_000);
+    act(() => result.current.finalize());
+    expect(result.current.firstTokenAt).toBe(1_250);
+    expect(result.current.lastTokenAt).toBe(2_000);
+    now.mockRestore();
+  });
+
+  it("reset clears firstTokenAt / lastTokenAt", () => {
+    const { result } = renderHook(() => useTokenStream());
+    act(() => result.current.reset());
+    act(() => result.current.push(contentFrame(1, "a")));
+    act(() => result.current.reset());
+    expect(result.current.firstTokenAt).toBeNull();
+    expect(result.current.lastTokenAt).toBeNull();
+  });
 });

@@ -12,18 +12,13 @@
  * a tooltip explains why instead of a dead button.
  */
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from "react";
-import { App, Button, Card, Empty, Input, Select, Space, Tooltip, Typography } from "antd";
-import { Check, CircleDashed, ListChecks, LoaderCircle, Pencil, Plus, Trash2, X } from "lucide-react";
+import { App, Button, Card, Empty, Space, Tooltip, Typography } from "antd";
+import { Check, CircleDashed, ListChecks, LoaderCircle, Pencil, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api/client";
-import {
-  getThreadPlan,
-  updateThreadPlan,
-  type PlanStep,
-  type PlanStepStatus,
-  type ThreadPlan,
-} from "../../api/plan";
+import { getThreadPlan, updateThreadPlan, type PlanStepStatus, type ThreadPlan } from "../../api/plan";
+import { PlanEditForm, planDraftValid } from "../../components/console/PlanEditForm";
 
 const { Text } = Typography;
 
@@ -96,14 +91,8 @@ export function PlanPanel({
     setEditing(false);
   }, []);
 
-  const draftValid =
-    draft !== null &&
-    draft.goal.trim().length > 0 &&
-    draft.steps.length > 0 &&
-    draft.steps.every((s) => s.description.trim().length > 0);
-
   const save = useCallback(async () => {
-    if (draft === null || !draftValid) return;
+    if (draft === null || !planDraftValid(draft)) return;
     setSubmitting(true);
     try {
       const stored = await savePlan(threadId, {
@@ -124,15 +113,7 @@ export function PlanPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [draft, draftValid, threadId, savePlan, message, t]);
-
-  const patchStep = useCallback((idx: number, patch: Partial<PlanStep>) => {
-    setDraft((d) =>
-      d === null
-        ? d
-        : { ...d, steps: d.steps.map((s, i) => (i === idx ? { ...s, ...patch } : s)) },
-    );
-  }, []);
+  }, [draft, threadId, savePlan, message, t]);
 
   const editButton = (
     <Button
@@ -179,7 +160,7 @@ export function PlanPanel({
               type="primary"
               icon={<Check size={12} strokeWidth={1.75} />}
               loading={submitting}
-              disabled={!draftValid}
+              disabled={!planDraftValid(draft)}
               onClick={() => void save()}
               data-testid="plan-save"
             >
@@ -196,66 +177,7 @@ export function PlanPanel({
       }
     >
       {editing && draft !== null ? (
-        <div data-testid="plan-edit-form">
-          <Input
-            value={draft.goal}
-            onChange={(e) => setDraft((d) => (d === null ? d : { ...d, goal: e.target.value }))}
-            placeholder={t("plan_panel.goal_placeholder")}
-            style={{ marginBottom: 12 }}
-            data-testid="plan-goal-input"
-          />
-          {draft.steps.map((step, idx) => (
-            <Space.Compact key={idx} block style={{ marginBottom: 8 }}>
-              <Input
-                value={step.description}
-                onChange={(e) => patchStep(idx, { description: e.target.value })}
-                placeholder={t("plan_panel.step_placeholder")}
-                data-testid={`plan-step-input-${idx}`}
-              />
-              <Select<PlanStepStatus>
-                value={step.status}
-                onChange={(status) => patchStep(idx, { status })}
-                style={{ width: 150 }}
-                options={[
-                  { value: "pending", label: t("plan_panel.status_pending") },
-                  { value: "in_progress", label: t("plan_panel.status_in_progress") },
-                  { value: "completed", label: t("plan_panel.status_completed") },
-                ]}
-                data-testid={`plan-step-status-${idx}`}
-              />
-              <Button
-                icon={<Trash2 size={13} strokeWidth={1.75} />}
-                onClick={() =>
-                  setDraft((d) =>
-                    d === null ? d : { ...d, steps: d.steps.filter((_, i) => i !== idx) },
-                  )
-                }
-                aria-label={t("plan_panel.remove_step")}
-                data-testid={`plan-step-remove-${idx}`}
-              />
-            </Space.Compact>
-          ))}
-          <Button
-            size="small"
-            icon={<Plus size={12} strokeWidth={1.75} />}
-            onClick={() =>
-              setDraft((d) =>
-                d === null
-                  ? d
-                  : {
-                      ...d,
-                      steps: [
-                        ...d.steps,
-                        { id: String(d.steps.length + 1), description: "", status: "pending" },
-                      ],
-                    },
-              )
-            }
-            data-testid="plan-add-step"
-          >
-            {t("plan_panel.add_step")}
-          </Button>
-        </div>
+        <PlanEditForm draft={draft} onChange={setDraft} />
       ) : plan === null ? (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}

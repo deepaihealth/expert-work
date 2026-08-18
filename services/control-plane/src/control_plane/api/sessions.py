@@ -59,6 +59,7 @@ from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.persistence.thread_meta.base import ThreadOrder
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import (
     AgentSpecStatus,
@@ -768,6 +769,7 @@ def build_sessions_router() -> APIRouter:
         include_archived: Annotated[bool, Query()] = False,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
         offset: Annotated[int, Query(ge=0)] = 0,
+        order_by: Annotated[ThreadOrder, Query()] = "created_at",
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,  # Stream N
     ) -> JSONResponse:
         # Stream N — resolve ``?tenant_id=`` against the caller's scope.
@@ -790,6 +792,7 @@ def build_sessions_router() -> APIRouter:
                     nonempty=True,
                     q=q,
                     include_archived=include_archived,
+                    order_by=order_by,
                     limit=limit,
                     offset=offset,
                 )
@@ -806,6 +809,7 @@ def build_sessions_router() -> APIRouter:
                     nonempty=True,
                     q=q,
                     include_archived=include_archived,
+                    order_by=order_by,
                     limit=limit,
                     offset=offset,
                 )

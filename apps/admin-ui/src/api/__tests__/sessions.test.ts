@@ -5,9 +5,11 @@
  * ``PlaygroundTab`` component test, but the SSE frame parser is purely
  * functional and worth covering directly.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { InternalAxiosRequestConfig } from "axios";
 
-import { parseSseStream } from "../sessions";
+import { apiClient } from "../client";
+import { listSessions, parseSseStream } from "../sessions";
 
 function streamOf(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -68,5 +70,46 @@ describe("parseSseStream", () => {
     const frames = await collect(parseSseStream(body));
     expect(frames).toHaveLength(1);
     expect(frames[0].event).toBe("metadata");
+  });
+});
+
+// M9 — the `orderBy` union has to name the values the backend actually knows
+// (`created_at`, not `created`). capture-adapter 写法照 sdks.test.ts /
+// tenant_scope_passthrough.test.ts。
+function captureAdapter(): { params: Record<string, unknown> | undefined }[] {
+  const calls: { params: Record<string, unknown> | undefined }[] = [];
+  apiClient.defaults.adapter = (config: InternalAxiosRequestConfig) => {
+    calls.push({ params: config.params as Record<string, unknown> | undefined });
+    return Promise.resolve({
+      data: { success: true, data: { items: [] }, error: null },
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+      request: {},
+    });
+  };
+  return calls;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("listSessions order_by", () => {
+  it("sends order_by=last_activity, and omits it for the backend default created_at", async () => {
+    let calls = captureAdapter();
+    await listSessions({ orderBy: "last_activity" });
+    expect(calls[0].params?.order_by).toBe("last_activity");
+
+    // `created_at` is the backend's own default — naming it must not change
+    // the request, but it must be a legal value of the union.
+    calls = captureAdapter();
+    await listSessions({ orderBy: "created_at" });
+    expect(calls[0].params?.order_by).toBeUndefined();
+
+    calls = captureAdapter();
+    await listSessions();
+    expect(calls[0].params?.order_by).toBeUndefined();
   });
 });

@@ -34,6 +34,10 @@ export interface TokenStreamState {
   liveByStep: ReadonlyMap<number, LiveStep>;
   /** ms from run start to the first token (any channel); null until the first token. */
   ttftMs: number | null;
+  /** epoch ms (`Date.now()`) of the first token seen on any channel; null until then; cleared by `reset`, kept by `finalize`. */
+  firstTokenAt: number | null;
+  /** epoch ms (`Date.now()`) of the most recent token seen on any channel; null until the first token; cleared by `reset`, kept by `finalize`. */
+  lastTokenAt: number | null;
   /** true once the run ended; live steps without an authoritative card are interrupted. */
   finalized: boolean;
 }
@@ -82,10 +86,14 @@ export function useTokenStream(): TokenStreamController {
   const contentStartRef = useRef<Map<number, number>>(new Map());
   const startRef = useRef<number | null>(null);
   const ttftRef = useRef<number | null>(null);
+  const firstTokenAtRef = useRef<number | null>(null);
+  const lastTokenAtRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const [snapshot, setSnapshot] = useState<TokenStreamState>({
     liveByStep: EMPTY,
     ttftMs: null,
+    firstTokenAt: null,
+    lastTokenAt: null,
     finalized: false,
   });
 
@@ -116,6 +124,8 @@ export function useTokenStream(): TokenStreamController {
     setSnapshot((prev) => ({
       liveByStep: build(null),
       ttftMs: ttftRef.current,
+      firstTokenAt: firstTokenAtRef.current,
+      lastTokenAt: lastTokenAtRef.current,
       finalized: prev.finalized,
     }));
   }, [build]);
@@ -135,8 +145,11 @@ export function useTokenStream(): TokenStreamController {
     (frame: SseEvent) => {
       const tok = parseToken(frame);
       if (tok === null) return;
+      const now = Date.now();
+      if (firstTokenAtRef.current === null) firstTokenAtRef.current = now;
+      lastTokenAtRef.current = now;
       if (ttftRef.current === null && startRef.current !== null) {
-        ttftRef.current = Date.now() - startRef.current;
+        ttftRef.current = now - startRef.current;
       }
       let b = bufRef.current.get(tok.step);
       if (b === undefined) {
@@ -164,12 +177,20 @@ export function useTokenStream(): TokenStreamController {
     contentStartRef.current = new Map();
     startRef.current = Date.now();
     ttftRef.current = null;
-    setSnapshot({ liveByStep: EMPTY, ttftMs: null, finalized: false });
+    firstTokenAtRef.current = null;
+    lastTokenAtRef.current = null;
+    setSnapshot({ liveByStep: EMPTY, ttftMs: null, firstTokenAt: null, lastTokenAt: null, finalized: false });
   }, [cancel]);
 
   const finalize = useCallback(() => {
     cancel();
-    setSnapshot({ liveByStep: build(Date.now()), ttftMs: ttftRef.current, finalized: true });
+    setSnapshot({
+      liveByStep: build(Date.now()),
+      ttftMs: ttftRef.current,
+      firstTokenAt: firstTokenAtRef.current,
+      lastTokenAt: lastTokenAtRef.current,
+      finalized: true,
+    });
   }, [cancel, build]);
 
   useEffect(() => cancel, [cancel]);

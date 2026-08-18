@@ -1,19 +1,29 @@
 /**
- * PlaygroundTab tests — Stream H.2 PR 3.
+ * PlaygroundTab tests — the debug console's assembly-level behaviour.
  *
  * Both async paths are mocked: ``createSession`` returns a stubbed
  * thread, ``streamRun`` is an async generator we drive frame-by-frame
  * from the test body. This keeps the network layer out of jsdom.
+ *
+ * 调试台重设计 PR-A Task 19 — this file used to hold 54 ``it``s covering the
+ * whole (single-component) Playground. The console shell split it into
+ * ``components/console/*``, so 13 of those moved to their new owner's test
+ * (``WorkspacePanel`` / ``Composer`` / ``AttachmentChips`` / ``TrajectoryPanel``
+ * / ``useRunTrace`` / ``RowDetailTiming`` / ``trace_match``) and the remaining
+ * 41 stayed here, rewritten against the new DOM. The plan's
+ * 「行为清单迁移表」 is the row-by-row ledger.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { App } from "antd";
 import { MemoryRouter } from "react-router-dom";
 import "../../i18n";
 import i18n from "../../i18n";
 
 import * as approvalsSdk from "../../api/approvals";
 import { ApiError, setStoredToken } from "../../api/client";
+import * as planSdk from "../../api/plan";
 import * as rateCardSdk from "../../api/rate_card";
 import * as runsSdk from "../../api/runs";
 import * as sessionsSdk from "../../api/sessions";
@@ -36,7 +46,6 @@ vi.mock("../../tenant/useIsTenantSwitched", () => ({
 import type { AgentDetailResponse } from "../../api/agents";
 import type { ApprovalItem } from "../../api/approvals";
 import type { SseEvent, ThreadMeta } from "../../api/sessions";
-import type { RunTrace } from "../../api/trace_facade";
 import type { FireNowResult } from "../../api/triggers";
 
 const sampleDetail: AgentDetailResponse = {
@@ -51,6 +60,28 @@ const sampleDetail: AgentDetailResponse = {
     created_at: "2026-05-25T00:00:00Z",
     updated_at: "2026-05-25T00:00:00Z",
     spec: {},
+  },
+};
+
+/** A jinja agent declaring one required prompt variable (``persona``). */
+const jinjaDetail: AgentDetailResponse = {
+  record: {
+    ...sampleDetail.record,
+    // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec
+    // (后端 record.spec.metadata.labels 直接取用;#824 的 fixture 造错了形状,
+    // 把 PlaygroundTab 多包一层壳的 bug 盖住了整整一版)。
+    spec: {
+      apiVersion: "expert_work.io/v1",
+      kind: "Agent",
+      metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+      spec: {
+        system_prompt: {
+          template: "你是 {{ persona }}",
+          jinja: true,
+          variables: [{ name: "persona", trusted: true, required: true }],
+        },
+      },
+    },
   },
 };
 
@@ -73,7 +104,6 @@ const uploadImageMock = vi.spyOn(uploadsSdk, "uploadImage");
 const uploadDocumentMock = vi.spyOn(uploadsSdk, "uploadDocument");
 const getWorkspaceMock = vi.spyOn(workspaceSdk, "getUserWorkspace");
 const getWorkspaceFilesMock = vi.spyOn(workspaceSdk, "getUserWorkspaceFiles");
-const downloadFileMock = vi.spyOn(workspaceSdk, "downloadUserWorkspaceFile");
 const downloadArtifactMock = vi.spyOn(artifactsSdk, "downloadArtifact");
 const listSessionsMock = vi.spyOn(sessionsSdk, "listSessions");
 const getMessagesMock = vi.spyOn(sessionsSdk, "getSessionMessages");
@@ -85,6 +115,7 @@ const getRunMock = vi.spyOn(runsSdk, "getRun");
 const getRunTraceMock = vi.spyOn(traceFacadeSdk, "getRunTrace");
 const listThreadRunsMock = vi.spyOn(runsSdk, "listThreadRuns");
 const fireTriggerNowMock = vi.spyOn(triggersSdk, "fireTriggerNow");
+const getThreadPlanMock = vi.spyOn(planSdk, "getThreadPlan");
 
 // jsdom has no IntersectionObserver — stub one that treats every observed
 // element as immediately visible (fires its callback synchronously from
@@ -111,9 +142,8 @@ class IOStub {
 
 beforeEach(() => {
   vi.unstubAllEnvs();
-  // The event-view toggle persists to localStorage (shared across turns);
-  // clear it so a prior test's "Exact" selection doesn't leak into the next
-  // test's initial render.
+  // PlanCard persists its collapsed state to localStorage; clear it so a
+  // prior test's toggle doesn't leak into the next test's initial render.
   window.localStorage.clear();
   createSessionMock.mockReset();
   streamRunMock.mockReset();
@@ -123,8 +153,6 @@ beforeEach(() => {
   getWorkspaceMock.mockResolvedValue({ workspace: null, artifacts: [] });
   getWorkspaceFilesMock.mockReset();
   getWorkspaceFilesMock.mockResolvedValue([]);
-  downloadFileMock.mockReset();
-  downloadFileMock.mockResolvedValue(undefined);
   downloadArtifactMock.mockReset();
   downloadArtifactMock.mockResolvedValue("report.md");
   listSessionsMock.mockReset();
@@ -144,8 +172,21 @@ beforeEach(() => {
   decideApprovalsMock.mockResolvedValue({ results: [], succeeded: 0 });
   streamRunEventsMock.mockReset();
   streamRunEventsMock.mockReturnValue(makeStream([]));
+  // The right rail's trajectory panel fetches every shown turn's trace
+  // (R16) — default to "no trace", so no test needs to care unless it does.
   getRunMock.mockReset();
+  getRunMock.mockResolvedValue({
+    run_id: "run-default",
+    thread_id: sampleThread.thread_id,
+    status: "success",
+    pending_approval: null,
+    trace_id: null,
+  });
   getRunTraceMock.mockReset();
+  getRunTraceMock.mockResolvedValue({ status: "no_trace" });
+  // The task card's baseline GET (usePlanCard) — no plan by default.
+  getThreadPlanMock.mockReset();
+  getThreadPlanMock.mockResolvedValue(null);
   // Default: no runs for a resumed thread — a mismatch against any non-empty
   // ``history`` (the common case in the existing resume tests below), so
   // ``buildHistoryTurns`` returns null and those tests keep exercising the
@@ -196,6 +237,22 @@ function jwt(roles: string[] = []): string {
   return `${header}.${body}.`;
 }
 
+function tree(detail: AgentDetailResponse) {
+  return (
+    <MemoryRouter>
+      <AuthProvider>
+        <TenantScopeProvider>
+          {/* antd App — SessionSidebar / PlanCard / ToolCallCard all take
+              ``message`` from ``App.useApp()``. */}
+          <App>
+            <PlaygroundTab detail={detail} />
+          </App>
+        </TenantScopeProvider>
+      </AuthProvider>
+    </MemoryRouter>
+  );
+}
+
 // The per-turn run-detail link uses react-router <Link>, so every render needs
 // a Router context. Batch 4b item 15's Langfuse deep link is system_admin
 // gated (useAuth()), so every render also needs an AuthProvider — default to
@@ -205,21 +262,12 @@ function renderPg(
   { admin = false }: { admin?: boolean } = {},
 ) {
   setStoredToken(jwt(admin ? ["system_admin"] : []));
-  return render(
-    <MemoryRouter>
-      <AuthProvider>
-        <TenantScopeProvider>
-          <PlaygroundTab detail={detail} />
-        </TenantScopeProvider>
-      </AuthProvider>
-    </MemoryRouter>,
-  );
+  return render(tree(detail));
 }
 
 // Lazy thread creation — no backend session exists until the first action.
 // Tests that need a live thread (a run in the transcript, the session header
-// id) establish one by sending a throwaway message. The workspace panel is
-// user-scoped, so it loads on mount without a thread (see its own test).
+// id) establish one by sending a throwaway message.
 async function establishThread(user: ReturnType<typeof userEvent.setup>) {
   streamRunMock.mockReturnValue(
     makeStream([
@@ -228,7 +276,23 @@ async function establishThread(user: ReturnType<typeof userEvent.setup>) {
   );
   await user.type(await screen.findByTestId("playground-input"), "hi");
   await user.click(screen.getByTestId("playground-run"));
-  await screen.findByText(/33333333-3333-3333/);
+  await screen.findByTestId("console-thread-id");
+}
+
+/** Find text inside the MIDDLE column only. The right rail renders the same
+ *  turn's trajectory (its ``assistant`` row carries the same answer text), so
+ *  a bare ``screen.findByText`` on an answer is ambiguous by design now. */
+function findInTranscript(text: string): Promise<HTMLElement> {
+  return within(screen.getByTestId("playground-transcript")).findByText(text);
+}
+
+/** Resume a past session from the left rail — the retired session drawer's
+ *  open-then-pick is one click now. */
+async function resumeFromSidebar(
+  user: ReturnType<typeof userEvent.setup>,
+  threadId: string,
+) {
+  await user.click(await screen.findByTestId(`console-session-item-${threadId}`));
 }
 
 describe("PlaygroundTab", () => {
@@ -258,7 +322,7 @@ describe("PlaygroundTab", () => {
     });
   });
 
-  it("streams events from streamRun and renders them in the log", async () => {
+  it("streams events from streamRun and renders the answer in the turn block", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
     streamRunMock.mockReturnValue(
@@ -273,7 +337,7 @@ describe("PlaygroundTab", () => {
         {
           id: "2",
           event: "updates",
-          data: { agent: { messages: ["hi"] } },
+          data: { agent: { messages: [{ type: "ai", content: "hi" }] } },
           rawData: "",
           receivedAt: "2026-05-25T00:00:02Z",
         },
@@ -290,12 +354,11 @@ describe("PlaygroundTab", () => {
     await screen.findByTestId("playground-input");
     await user.type(screen.getByTestId("playground-input"), "hello");
     await user.click(screen.getByTestId("playground-run"));
-    // The per-turn events view defaults to the tool-call timeline; switch this
-    // turn to raw events to assert the individual frames.
-    await user.click(await screen.findByText(i18n.t("event_stream.view_raw")));
-    await screen.findByTestId("event-card-metadata");
-    await screen.findByTestId("event-card-updates");
-    await screen.findByTestId("event-card-end");
+
+    const turn = await screen.findByTestId("console-turn");
+    expect(within(turn).getByTestId("playground-turn-answer")).toHaveTextContent(
+      "hi",
+    );
     expect(screen.queryByTestId("playground-stop")).not.toBeInTheDocument();
   });
 
@@ -429,57 +492,25 @@ describe("PlaygroundTab", () => {
     clickSpy.mockRestore();
   });
 
-  it("lists artifacts with download/delete and hides dotfiles from files", async () => {
+  // 迁移表 432 的留守条:工作区内容本身归 WorkspacePanel.test,这里只钉
+  // 「右栏能切到工作区 tab」这条组装接线。
+  it("switches the right rail to the workspace tab", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
-    getWorkspaceMock.mockResolvedValue({
-      workspace: {
-        id: "w1",
-        tenant_id: "t1",
-        user_id: "u1",
-        volume_name: "vol-1",
-        size_bytes: 1024,
-        size_limit_bytes: 1_048_576,
-        created_at: null,
-        last_accessed_at: null,
-        deleted_at: null,
-        archived_object_key: null,
-      },
-      artifacts: [
-        {
-          name: "report.pdf",
-          kind: "document",
-          latest_version: 1,
-          created_at: null,
-          updated_at: null,
-        },
-      ],
-    });
-    getWorkspaceFilesMock.mockResolvedValue([
-      { path: "agent_report.md", size: 2048 },
-      { path: ".npm/_cacache/index", size: 99 },
-      { path: ".mplconfig/matplotlibrc", size: 10 },
-    ]);
+    getWorkspaceFilesMock.mockResolvedValue([{ path: "report.pdf", size: 2048 }]);
     renderPg();
-    await establishThread(user);
+    await screen.findByTestId("playground-input");
+    // Default tab = trajectory; the workspace panel isn't mounted yet.
+    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("playground-workspace")).not.toBeInTheDocument();
 
-    // Artifact renders as a list row with download + delete affordances.
-    expect(
-      await screen.findByTestId("playground-workspace-artifact-download"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByTestId("playground-workspace-artifact-delete"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    await user.click(screen.getByTestId("console-inspect-tab-workspace"));
 
-    // Only the agent's own file shows; the dotfiles (.npm/.mplconfig) are hidden.
-    const fileRows = screen.getAllByTestId("playground-workspace-file");
-    expect(fileRows).toHaveLength(1);
-    expect(screen.getByText("agent_report.md")).toBeInTheDocument();
-    expect(screen.queryByText(".npm/_cacache/index")).not.toBeInTheDocument();
+    const panel = await screen.findByTestId("playground-workspace");
+    expect(panel).toHaveTextContent("report.pdf");
     expect(
-      screen.getByTestId("playground-workspace-file-delete"),
-    ).toBeInTheDocument();
+      screen.queryByTestId("console-trajectory-panel"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows a stream-failure alert when streamRun throws", async () => {
@@ -608,26 +639,6 @@ describe("PlaygroundTab", () => {
 
   it("renders declared prompt variables and sends their values as inputs", async () => {
     const user = userEvent.setup();
-    const jinjaDetail: AgentDetailResponse = {
-      record: {
-        ...sampleDetail.record,
-        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec
-        // (后端 record.spec.metadata.labels 直接取用;#824 的 fixture 造错了形状,
-        // 把 PlaygroundTab 多包一层壳的 bug 盖住了整整一版)。
-        spec: {
-          apiVersion: "expert_work.io/v1",
-          kind: "Agent",
-          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
-          spec: {
-            system_prompt: {
-              template: "你是 {{ persona }}",
-              jinja: true,
-              variables: [{ name: "persona", trusted: true, required: true }],
-            },
-          },
-        },
-      },
-    };
     createSessionMock.mockResolvedValue(sampleThread);
     streamRunMock.mockReturnValue(
       makeStream([
@@ -654,6 +665,50 @@ describe("PlaygroundTab", () => {
       sampleThread.thread_id,
       { input: "go", inputs: { persona: "顾问" } },
       expect.objectContaining({ signal: expect.anything() }),
+    );
+  });
+
+  // NEW (Task 19 ①) — R5/R7 的输入闸:必填变量没填,发送按钮就是灰的。
+  it("keeps Run disabled while a required prompt variable is empty", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        { id: "1", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
+      ]),
+    );
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+
+    await user.type(screen.getByTestId("playground-input"), "go");
+    // Text present, but ``persona`` is still empty → still disabled.
+    expect(screen.getByTestId("playground-run")).toBeDisabled();
+
+    await user.type(screen.getByTestId("playground-var-persona"), "顾问");
+    expect(screen.getByTestId("playground-run")).toBeEnabled();
+
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() => expect(streamRunMock).toHaveBeenCalled());
+  });
+
+  // NEW (Task 19 ②) — R11:变量值随会话,切会话必须清空。
+  it("clears prompt-variable values when switching to another session", async () => {
+    const user = userEvent.setup();
+    const past: ThreadMeta = {
+      ...sampleThread,
+      thread_id: "aaaaaaaa-0000-0000-0000-0000000000v1",
+    };
+    listSessionsMock.mockResolvedValue([past]);
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+
+    await user.type(screen.getByTestId("playground-var-persona"), "顾问");
+    expect(screen.getByTestId("playground-var-persona")).toHaveValue("顾问");
+
+    await resumeFromSidebar(user, past.thread_id);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("playground-var-persona")).toHaveValue(""),
     );
   });
 
@@ -771,14 +826,14 @@ describe("PlaygroundTab", () => {
 
     await user.type(screen.getByTestId("playground-input"), "q1");
     await user.click(screen.getByTestId("playground-run"));
-    await screen.findByText("first answer");
+    await findInTranscript("first answer");
 
     await user.type(screen.getByTestId("playground-input"), "q2");
     await user.click(screen.getByTestId("playground-run"));
-    await screen.findByText("second answer");
+    await findInTranscript("second answer");
 
     // Both turns persist (not wiped) + usage chips render per turn.
-    expect(screen.getAllByTestId("playground-turn")).toHaveLength(2);
+    expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
     expect(screen.getAllByTestId("playground-usage")).toHaveLength(2);
     // The thread is reused across turns (multi-turn continuation).
     expect(
@@ -814,10 +869,10 @@ describe("PlaygroundTab", () => {
     await screen.findByTestId("playground-input");
     await user.type(screen.getByTestId("playground-input"), "q1");
     await user.click(screen.getByTestId("playground-run"));
-    await screen.findByText("first answer");
+    await findInTranscript("first answer");
 
     await user.click(screen.getByTestId("playground-turn-retry"));
-    await screen.findByText("retried answer");
+    await findInTranscript("retried answer");
 
     // Re-dispatched to the same thread with the exact same request body.
     expect(streamRunMock).toHaveBeenCalledTimes(2);
@@ -826,7 +881,7 @@ describe("PlaygroundTab", () => {
       streamRunMock.mock.calls[0][1],
     );
     // The retry appended a new turn — the original stays in the transcript.
-    expect(screen.getAllByTestId("playground-turn")).toHaveLength(2);
+    expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
   });
 
   // Cross-tenant W4(D2)— rate_card 是 system_admin-only:非 admin 挂载
@@ -835,7 +890,7 @@ describe("PlaygroundTab", () => {
     const costDetail: AgentDetailResponse = {
       record: {
         ...sampleDetail.record,
-        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec(见 :660 的守形状用例)。
+        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec。
         spec: {
           apiVersion: "expert_work.io/v1",
           kind: "Agent",
@@ -854,7 +909,6 @@ describe("PlaygroundTab", () => {
     const costDetail: AgentDetailResponse = {
       record: {
         ...sampleDetail.record,
-        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec(见 :660 的守形状用例)。
         spec: {
           apiVersion: "expert_work.io/v1",
           kind: "Agent",
@@ -921,9 +975,9 @@ describe("PlaygroundTab", () => {
     await screen.findByTestId("playground-input");
     await user.type(screen.getByTestId("playground-input"), "q");
     await user.click(screen.getByTestId("playground-run"));
-    await screen.findByText("hi");
+    await screen.findByTestId("console-turn");
 
-    expect(screen.getByTestId("playground-turn-cost")).toBeInTheDocument();
+    expect(await screen.findByTestId("playground-turn-cost")).toBeInTheDocument();
     expect(screen.getByTestId("playground-turn-meta")).toHaveTextContent("2");
     expect(screen.getByTestId("playground-turn-run-link")).toHaveAttribute(
       "href",
@@ -931,7 +985,9 @@ describe("PlaygroundTab", () => {
     );
   });
 
-  it("lists past sessions for resume and shows a resumed banner", async () => {
+  // R7 — 「已恢复」提示条退役(左栏选中态已表达「你在哪个会话」);这条改钉
+  // 「左栏直接列出会话,点一下就拉历史」。
+  it("lists past sessions in the left rail and loads one on click", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
     const past: ThreadMeta = {
@@ -947,13 +1003,8 @@ describe("PlaygroundTab", () => {
     renderPg();
     await screen.findByTestId("playground-input");
 
-    await user.click(screen.getByTestId("playground-history-open"));
-    await user.click(
-      await screen.findByTestId(`session-history-item-${past.thread_id}`),
-    );
-    expect(
-      await screen.findByTestId("playground-resumed-notice"),
-    ).toBeInTheDocument();
+    await resumeFromSidebar(user, past.thread_id);
+
     // Prior conversation loaded from the checkpoint and rendered read-only.
     const hist = await screen.findByTestId("playground-history");
     expect(hist).toHaveTextContent("earlier question");
@@ -962,73 +1013,13 @@ describe("PlaygroundTab", () => {
     expect(getMessagesMock).toHaveBeenCalledWith(past.thread_id, undefined);
   });
 
-  it("shows the workspace inspector with the volume + artifacts", async () => {
-    const user = userEvent.setup();
-    createSessionMock.mockResolvedValue(sampleThread);
-    getWorkspaceMock.mockResolvedValue({
-      workspace: {
-        id: "w1",
-        tenant_id: sampleThread.tenant_id,
-        user_id: "u-1",
-        volume_name: "expert-work-ws-t-u",
-        size_bytes: 2048,
-        size_limit_bytes: 1000000,
-        created_at: null,
-        last_accessed_at: null,
-        deleted_at: null,
-        archived_object_key: null,
-      },
-      artifacts: [
-        {
-          name: "report.md",
-          kind: "document",
-          latest_version: 2,
-          created_at: null,
-          updated_at: null,
-        },
-      ],
-    });
-    renderPg();
-    await establishThread(user);
-    const panel = await screen.findByTestId("playground-workspace");
-    expect(panel).toHaveTextContent("expert-work-ws-t-u");
-    expect(panel).toHaveTextContent("2.0 KB");
-    expect(panel).toHaveTextContent("report.md");
-  });
-
-  it("shows 'no workspace' when the user has none (read-only null)", async () => {
-    const user = userEvent.setup();
-    createSessionMock.mockResolvedValue(sampleThread);
-    renderPg();
-    await establishThread(user);
-    expect(
-      await screen.findByTestId("playground-workspace-none"),
-    ).toBeInTheDocument();
-  });
-
-  it("lists workspace files and downloads one on click", async () => {
-    const user = userEvent.setup();
-    createSessionMock.mockResolvedValue(sampleThread);
-    getWorkspaceFilesMock.mockResolvedValue([
-      { path: "report.pdf", size: 2048 },
-    ]);
-    renderPg();
-    await establishThread(user);
-    const files = await screen.findByTestId("playground-workspace-files");
-    expect(files).toHaveTextContent("report.pdf");
-    await user.click(
-      await screen.findByTestId("playground-workspace-file-download"),
-    );
-    await waitFor(() =>
-      // W3 — trailing (userId, tenantScope) both undefined in the home state.
-      expect(downloadFileMock).toHaveBeenCalledWith("report.pdf", undefined, undefined),
-    );
-  });
-
   it("loads the workspace inspector without a thread (user-scoped)", async () => {
     // The whole point of the user-scoped route: the panel shows the current
-    // user's workspace on mount, before (and after) any session exists — so it
-    // survives session deletion. No establishThread() here.
+    // user's workspace with no session bound — so it survives session
+    // deletion. No establishThread() here. (The panel only mounts on its own
+    // tab — InspectPanel keeps the inactive tab unmounted — so the switch is
+    // the trigger, not the page mount.)
+    const user = userEvent.setup();
     getWorkspaceMock.mockResolvedValue({
       workspace: {
         id: "w1",
@@ -1046,12 +1037,16 @@ describe("PlaygroundTab", () => {
     });
     getWorkspaceFilesMock.mockResolvedValue([{ path: "out.txt", size: 11 }]);
     renderPg();
+    await screen.findByTestId("playground-input");
+    await user.click(screen.getByTestId("console-inspect-tab-workspace"));
+
     const panel = await screen.findByTestId("playground-workspace");
     expect(panel).toHaveTextContent("expert-work-ws-t-u");
     expect(panel).toHaveTextContent("out.txt");
-    // ...and the load was keyed on the caller, not a thread id. W3 —
-    // trailing (userId, tenantScope) both undefined in the home state.
+    // ...and the load was keyed on the caller, not a thread. W3 — trailing
+    // (userId, tenantScope) both undefined in the home state.
     expect(getWorkspaceMock).toHaveBeenCalledWith(undefined, undefined);
+    expect(createSessionMock).not.toHaveBeenCalled();
   });
 
   it("surfaces an approval gate, approves, and streams the continuation", async () => {
@@ -1163,7 +1158,7 @@ describe("PlaygroundTab", () => {
     expect(card).toHaveTextContent("rm -rf /");
 
     await user.click(screen.getByTestId("playground-approval-approve"));
-    await screen.findByText("done after approval");
+    await findInTranscript("done after approval");
     expect(decideApprovalsMock).toHaveBeenCalledWith([
       {
         thread_id: sampleThread.thread_id,
@@ -1274,507 +1269,150 @@ describe("PlaygroundTab", () => {
     expect(screen.getByTestId("playground-feedback-up")).toBeEnabled();
   });
 
-  // Task 11 — timeline view's RunStatusBanner, derived from this turn's own
-  // SSE-parsed items (not Langfuse level, unlike the exact view's banner).
-  describe("timeline view RunStatusBanner", () => {
-    it("shows the ok banner (default timeline view) when no step/marker errored", async () => {
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          { id: "1", event: "metadata", data: { run_id: "run-tl-ok" }, rawData: "", receivedAt: "" },
-          {
-            id: "2",
-            event: "updates",
-            data: { agent: { messages: [{ type: "ai", content: "hi" }] } },
-            rawData: "",
-            receivedAt: "",
-          },
-          { id: "3", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
-        ]),
-      );
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      const banner = await screen.findByTestId("run-status-banner");
-      expect(banner).toHaveTextContent(i18n.t("playground.rb_ok"));
-      expect(screen.queryByTestId("run-status-jump")).not.toBeInTheDocument();
-    });
-
-    it("shows the error banner when a tool call failed, and 'jump' scrolls the failing Gantt row into view", async () => {
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          { id: "1", event: "metadata", data: { run_id: "run-tl-err" }, rawData: "", receivedAt: "" },
-          {
-            id: "2",
-            event: "updates",
-            data: {
-              agent: {
-                step_count: 3,
-                messages: [
-                  {
-                    type: "ai",
-                    content: "",
-                    tool_calls: [
-                      { id: "c1", name: "exec_python", args: { code: "1/0" }, type: "tool_call" },
-                    ],
-                  },
+  // Task 19 ③④ — 中栏 ↔ 右栏的两个入口(R9 / R18)。
+  describe("inspect wiring (middle column → right rail)", () => {
+    const TWO_STEP_EVENTS: SseEvent[] = [
+      {
+        id: "m",
+        event: "metadata",
+        data: { run_id: "run-inspect" },
+        rawData: "",
+        receivedAt: "t1",
+      },
+      {
+        id: "u1",
+        event: "updates",
+        data: {
+          agent: {
+            step_count: 1,
+            messages: [
+              {
+                type: "ai",
+                content: "",
+                tool_calls: [
+                  { id: "c1", name: "query_crm", args: { id: "C-1" }, type: "tool_call" },
                 ],
               },
-            },
-            rawData: "",
-            receivedAt: "",
+            ],
           },
-          {
-            id: "3",
-            event: "updates",
-            data: {
-              tools: {
-                messages: [
-                  {
-                    type: "tool",
-                    tool_call_id: "c1",
-                    name: null,
-                    content: "ZeroDivisionError",
-                    status: "error",
-                  },
-                ],
+        },
+        rawData: "",
+        receivedAt: "t2",
+      },
+      {
+        id: "u2",
+        event: "updates",
+        data: {
+          tools: {
+            messages: [
+              {
+                type: "tool",
+                tool_call_id: "c1",
+                name: "query_crm",
+                content: "3 条记录",
+                status: "success",
               },
-            },
-            rawData: "",
-            receivedAt: "",
+            ],
           },
-          { id: "4", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
-        ]),
-      );
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
+        },
+        rawData: "",
+        receivedAt: "t3",
+      },
+      {
+        id: "u3",
+        event: "updates",
+        data: { agent: { step_count: 2, messages: [{ type: "ai", content: "已完成查询。" }] } },
+        rawData: "",
+        receivedAt: "t4",
+      },
+      { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t5" },
+    ];
 
-      const banner = await screen.findByTestId("run-status-banner");
-      expect(banner).toHaveTextContent(i18n.t("playground.tl_step", { n: 3 }));
-
-      // I1 — restored: `GanttTimeline` rows now carry `data-error` (see
-      // gantt_timeline.ts's `hasError`), so the "jump to error" button
-      // renders again and targets the first errored row (same pattern as
-      // the "exact" view's trace-row jump test below).
-      const errorRow = screen
-        .getAllByTestId(/^gantt-row-/)
-        .find((row) => row.getAttribute("data-error") === "true");
-      expect(errorRow).toBeTruthy();
-      const scrollSpy = vi.fn();
-      if (errorRow) errorRow.scrollIntoView = scrollSpy;
-
-      await user.click(screen.getByTestId("run-status-jump"));
-      expect(scrollSpy).toHaveBeenCalledTimes(1);
-    });
-
-    it("shows a top-level error event's message once (not duplicated) when no failing tool step owns the label", async () => {
-      // Marker-only failure path: an SSE `error` event with no failed tool
-      // call → timelineBannerModel has errorText but errorStepCount === null,
-      // so errorText owns the label. It must NOT also render as the message.
-      const user = userEvent.setup();
+    async function runTwoTurns(user: ReturnType<typeof userEvent.setup>) {
       createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
+      streamRunMock.mockReturnValueOnce(makeStream(TWO_STEP_EVENTS));
+      streamRunMock.mockReturnValueOnce(
         makeStream([
-          { id: "1", event: "metadata", data: { run_id: "run-tl-marker" }, rawData: "", receivedAt: "" },
-          { id: "2", event: "error", data: { message: "运行崩溃了" }, rawData: "", receivedAt: "" },
-          { id: "3", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
-        ]),
-      );
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      const banner = await screen.findByTestId("run-status-banner");
-      const occurrences = (banner.textContent?.match(/运行崩溃了/g) ?? []).length;
-      expect(occurrences).toBe(1);
-    });
-
-    // Task 3 dropped this test: the timeline eventView's type/query filter
-    // (`TimelineFilterBar`) went away with the `StepTimeline` → `GanttTimeline`
-    // swap (Gantt has no equivalent row filter), so there is no longer a
-    // filter that could hide the failing step out from under the banner. The
-    // banner's derivation from the unfiltered `timeline` (not a filtered
-    // view) is still pinned by "shows the error banner when a tool call
-    // failed" above — this test's premise (a filter to bypass) no longer
-    // exists.
-  });
-
-  // Batch 4b Task 5 — third "Exact" event-view tier (item 14) + purpose
-  // labelling (A') + system_admin-gated Langfuse deep link (item 15).
-  describe("exact trace view + Langfuse link", () => {
-    it("does not fetch the trace until 'Exact' is selected, then labels the sole llm span primary reasoning (1:1 with agent steps)", async () => {
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-exact-1" },
-            rawData: "",
-            receivedAt: "t1",
-          },
+          { id: "m2", event: "metadata", data: { run_id: "run-2" }, rawData: "", receivedAt: "t1" },
           {
             id: "u",
             event: "updates",
-            data: { agent: { messages: [{ type: "ai", content: "hi" }] } },
+            data: { agent: { messages: [{ type: "ai", content: "第二轮答案" }] } },
             rawData: "",
             receivedAt: "t2",
           },
           { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t3" },
         ]),
       );
-      getRunTraceMock.mockResolvedValue({
-        status: "ok",
-        trace: { name: "trace-1", latencyMs: 1000, totalCostUsd: null, spanCount: 1 },
-        spans: [
-          {
-            id: "s1",
-            parentId: null,
-            kind: "llm",
-            label: "LLM call",
-            detail: null,
-            startMs: 0,
-            latencyMs: 500,
-            model: "glm-4.6",
-            inputTokens: 10,
-            outputTokens: 20,
-            costUsd: null,
-            input: null,
-            output: null,
-            level: "default",
-            statusMessage: null,
-            purpose: "",
-            group: null,
-          },
-        ],
-      });
-
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
+      await user.type(screen.getByTestId("playground-input"), "q1");
       await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
+      await findInTranscript("已完成查询。");
+      await user.type(screen.getByTestId("playground-input"), "q2");
+      await user.click(screen.getByTestId("playground-run"));
+      await findInTranscript("第二轮答案");
+    }
 
-      // Segmented now has three tiers; still defaults to the tool-call
-      // timeline, and the trace endpoint isn't hit before "Exact" is picked.
-      const toggle = screen.getByTestId("playground-event-view-toggle");
-      expect(within(toggle).getByText(i18n.t("event_stream.view_exact"))).toBeInTheDocument();
-      expect(getRunTraceMock).not.toHaveBeenCalled();
+    // NEW ③ — 脚注「检查」把右栏切到该轮(默认跟随最新一轮)。
+    it("the footer's 检查 button points the right rail at that turn", async () => {
+      const user = userEvent.setup();
+      await runTwoTurns(user);
 
-      await user.click(within(toggle).getByText(i18n.t("event_stream.view_exact")));
-
+      // Default: follows the newest turn (第 2 轮).
       await waitFor(() =>
-        expect(getRunTraceMock).toHaveBeenCalledWith(
-          sampleThread.thread_id,
-          "run-exact-1",
-          undefined,
+        expect(screen.getByTestId("console-inspect-turn-header")).toHaveTextContent(
+          i18n.t("console.inspect_turn_header", {
+            n: 2,
+            status: i18n.t("console.footer_status_done"),
+          }),
         ),
       );
-      await screen.findByTestId("trace-view");
-      expect(screen.getByText(/Primary reasoning/)).toBeInTheDocument();
-      // Task 10 — RunStatusBanner renders above the trace, ok state.
-      expect(screen.getByTestId("run-status-banner")).toBeInTheDocument();
-      expect(screen.queryByTestId("run-status-jump")).not.toBeInTheDocument();
-    });
 
-    // Task 10 — RunStatusBanner error state + jump-to-error scroll.
-    it("shows the RunStatusBanner in error state when a span errored, and 'jump' scrolls the red-marked row into view", async () => {
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-exact-err" },
-            rawData: "",
-            receivedAt: "t1",
-          },
-          {
-            id: "u",
-            event: "updates",
-            data: { agent: { messages: [{ type: "ai", content: "hi" }] } },
-            rawData: "",
-            receivedAt: "t2",
-          },
-          { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t3" },
-        ]),
-      );
-      getRunTraceMock.mockResolvedValue({
-        status: "ok",
-        trace: { name: "trace-1", latencyMs: 1000, totalCostUsd: 0.0021, spanCount: 2 },
-        spans: [
-          {
-            id: "s1",
-            parentId: null,
-            kind: "session",
-            label: "Session run",
-            detail: null,
-            startMs: 0,
-            latencyMs: 1000,
-            model: null,
-            inputTokens: null,
-            outputTokens: null,
-            costUsd: null,
-            input: null,
-            output: null,
-            level: "default",
-            statusMessage: null,
-            purpose: "",
-            group: null,
-          },
-          {
-            id: "s2",
-            parentId: "s1",
-            kind: "tool",
-            label: "Tool call",
-            detail: "exec_python",
-            startMs: 100,
-            latencyMs: 500,
-            model: null,
-            inputTokens: null,
-            outputTokens: null,
-            costUsd: null,
-            input: null,
-            output: null,
-            level: "error",
-            statusMessage: "SandboxTimeout",
-            purpose: "",
-            group: null,
-          },
-        ],
-      });
+      const firstTurn = screen.getAllByTestId("console-turn")[0];
+      await user.click(within(firstTurn).getByTestId("console-turn-inspect"));
 
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      const toggle = screen.getByTestId("playground-event-view-toggle");
-      await user.click(within(toggle).getByText(i18n.t("event_stream.view_exact")));
-
-      await screen.findByTestId("trace-view");
-      const banner = screen.getByTestId("run-status-banner");
-      expect(banner).toHaveTextContent("Failed at Tool call · exec_python");
-      expect(screen.getByText("SandboxTimeout")).toBeInTheDocument();
-
-      const errorRow = screen
-        .getAllByTestId("trace-row")
-        .find((row) => row.getAttribute("data-error") === "true");
-      expect(errorRow).toBeTruthy();
-      const scrollSpy = vi.fn();
-      if (errorRow) errorRow.scrollIntoView = scrollSpy;
-
-      await user.click(screen.getByTestId("run-status-jump"));
-      expect(scrollSpy).toHaveBeenCalledTimes(1);
-    });
-
-    it("auto-polls a not_ready trace until it resolves, without a manual refresh", async () => {
-      // Real timers: the poll uses a 1500ms setTimeout; fake timers deadlock
-      // with userEvent + RTL's waitFor here. A ~2s real wait is reliable.
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-poll-1" },
-            rawData: "",
-            receivedAt: "t1",
-          },
-          {
-            id: "u",
-            event: "updates",
-            data: { agent: { messages: [{ type: "ai", content: "hi" }] } },
-            rawData: "",
-            receivedAt: "t2",
-          },
-          { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t3" },
-        ]),
-      );
-      // Ingestion window: first fetch is still not_ready, the retry resolves.
-      getRunTraceMock.mockResolvedValueOnce({ status: "not_ready" });
-      getRunTraceMock.mockResolvedValue({
-        status: "ok",
-        trace: { name: "trace-1", latencyMs: 1000, totalCostUsd: null, spanCount: 1 },
-        spans: [
-          {
-            id: "s1",
-            parentId: null,
-            kind: "llm",
-            label: "LLM call",
-            detail: null,
-            startMs: 0,
-            latencyMs: 500,
-            model: "glm-4.6",
-            inputTokens: 10,
-            outputTokens: 20,
-            costUsd: null,
-            input: null,
-            output: null,
-            level: "default",
-            statusMessage: null,
-            purpose: "",
-            group: null,
-          },
-        ],
-      });
-
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      const toggle = screen.getByTestId("playground-event-view-toggle");
-      await user.click(within(toggle).getByText(i18n.t("event_stream.view_exact")));
-
-      // First fetch → not_ready card (refreshable), no waterfall yet.
-      await waitFor(() => expect(getRunTraceMock).toHaveBeenCalledTimes(1));
-      expect(screen.getByTestId("trace-refresh")).toBeInTheDocument();
-      expect(screen.queryAllByTestId("trace-row")).toHaveLength(0);
-
-      // The 1500ms poll auto-refetches — no user action — and the waterfall
-      // renders once the retry returns spans.
-      await waitFor(() => expect(getRunTraceMock).toHaveBeenCalledTimes(2), {
-        timeout: 3000,
-      });
       await waitFor(() =>
-        expect(screen.getAllByTestId("trace-row").length).toBeGreaterThan(0),
-      );
-    }, 10000);
-
-    it("shows a loading state while the exact trace fetch is in flight", async () => {
-      const user = userEvent.setup();
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-loading" },
-            rawData: "",
-            receivedAt: "t1",
-          },
-          { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
-        ]),
-      );
-      let resolveTrace: (value: RunTrace) => void = () => {};
-      getRunTraceMock.mockReturnValue(
-        new Promise((resolve) => {
-          resolveTrace = resolve;
-        }),
-      );
-
-      renderPg();
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      await user.click(
-        within(screen.getByTestId("playground-event-view-toggle")).getByText(
-          i18n.t("event_stream.view_exact"),
+        expect(screen.getByTestId("console-inspect-turn-header")).toHaveTextContent(
+          i18n.t("console.inspect_turn_header", {
+            n: 1,
+            status: i18n.t("console.footer_status_done"),
+          }),
         ),
       );
-      expect(
-        await screen.findByTestId("playground-trace-loading"),
-      ).toBeInTheDocument();
+    });
 
-      resolveTrace({ status: "no_trace" });
-      await screen.findByTestId("trace-view");
+    // NEW ④ — 紧凑行「检查」→ 右栏选中同 id 的轨迹行并开详情;关掉再点同一行
+    // 还能重开(focusRowId 只对「值变化」有反应,父级必须让它先落回 null)。
+    it("the compact row's 检查 selects the matching trajectory row and opens its detail", async () => {
+      const user = userEvent.setup();
+      await runTwoTurns(user);
+
+      const firstTurn = screen.getAllByTestId("console-turn")[0];
+      await user.click(within(firstTurn).getByTestId("console-row-inspect"));
+
+      expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
+      const selected = screen
+        .getAllByTestId("console-traj-row")
+        .find((el) => el.getAttribute("aria-selected") === "true");
+      expect(selected?.dataset.kind).toBe("tool");
+
+      // Close the detail, then click the SAME 「检查」 again — it must reopen.
+      await user.click(screen.getByTestId("console-detail-close"));
       expect(
-        screen.queryByTestId("playground-trace-loading"),
+        screen.queryByTestId("console-detail-summary"),
       ).not.toBeInTheDocument();
-    });
 
-    it("hides the Langfuse link for a non-admin turn even when the run has a trace_id and the base url is configured", async () => {
-      const user = userEvent.setup();
-      vi.stubEnv("VITE_LANGFUSE_BASE_URL", "https://langfuse.example.com/");
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-nolink" },
-            rawData: "",
-            receivedAt: "t1",
-          },
-          { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
-        ]),
-      );
-
-      renderPg(sampleDetail, { admin: false });
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      // Give any (incorrect) fetch a tick to land before asserting absence.
-      await waitFor(() => expect(screen.getByTestId("playground-turn")).toBeInTheDocument());
-      expect(screen.queryByTestId("playground-turn-langfuse")).not.toBeInTheDocument();
-      expect(getRunMock).not.toHaveBeenCalled();
-    });
-
-    it("shows a direct Langfuse link for a system_admin when the run has a trace_id", async () => {
-      const user = userEvent.setup();
-      vi.stubEnv("VITE_LANGFUSE_BASE_URL", "https://langfuse.example.com/");
-      createSessionMock.mockResolvedValue(sampleThread);
-      streamRunMock.mockReturnValue(
-        makeStream([
-          {
-            id: "m",
-            event: "metadata",
-            data: { run_id: "run-link" },
-            rawData: "",
-            receivedAt: "t1",
-          },
-          { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
-        ]),
-      );
-      getRunMock.mockResolvedValue({
-        run_id: "run-link",
-        thread_id: sampleThread.thread_id,
-        status: "success",
-        pending_approval: null,
-        trace_id: "tr-xyz",
-      });
-
-      renderPg(sampleDetail, { admin: true });
-      await screen.findByTestId("playground-input");
-      await user.type(screen.getByTestId("playground-input"), "hello");
-      await user.click(screen.getByTestId("playground-run"));
-      await screen.findByTestId("playground-turn");
-
-      const link = await screen.findByTestId("playground-turn-langfuse");
-      expect(link).toHaveAttribute(
-        "href",
-        "https://langfuse.example.com/trace/tr-xyz",
-      );
-      expect(getRunMock).toHaveBeenCalledWith(sampleThread.thread_id, "run-link", undefined);
+      await user.click(within(firstTurn).getByTestId("console-row-inspect"));
+      expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
     });
   });
 
-  // Task 5 — resume reconstructs history as lazy read-only TurnCards when the
-  // message/run counts line up (buildHistoryTurns pairs 1:1); a mismatch or a
-  // failed lookup/replay must degrade — never a crash, never lost content.
+  // Task 5 — resume reconstructs history as lazy read-only turn blocks when
+  // the message/run counts line up (buildHistoryTurns pairs 1:1); a mismatch
+  // or a failed lookup/replay must degrade — never a crash, never lost content.
   describe("history lazy rebuild on resume", () => {
-    it("replays a count-matched history run into a full TurnCard when its row scrolls into view", async () => {
+    it("replays a count-matched history run into a full turn block when its row scrolls into view", async () => {
       const user = userEvent.setup();
       createSessionMock.mockResolvedValue(sampleThread);
       const past: ThreadMeta = {
@@ -1787,29 +1425,65 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z" },
+        { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", tokens: null },
       ]);
       streamRunEventsMock.mockReturnValue(
         makeStream([
           {
+            id: "u0",
+            event: "updates",
+            data: {
+              agent: {
+                step_count: 1,
+                messages: [
+                  {
+                    type: "ai",
+                    content: "",
+                    tool_calls: [
+                      { id: "c1", name: "query_crm", args: { id: "C-1" }, type: "tool_call" },
+                    ],
+                  },
+                ],
+              },
+            },
+            rawData: "",
+            receivedAt: "t0",
+          },
+          {
             id: "u1",
+            event: "updates",
+            data: {
+              tools: {
+                messages: [
+                  {
+                    type: "tool",
+                    tool_call_id: "c1",
+                    name: "query_crm",
+                    content: "3 条记录",
+                    status: "success",
+                  },
+                ],
+              },
+            },
+            rawData: "",
+            receivedAt: "t1",
+          },
+          {
+            id: "u2",
             event: "updates",
             data: {
               agent: { messages: [{ type: "ai", content: "replayed answer" }] },
             },
             rawData: "",
-            receivedAt: "t1",
+            receivedAt: "t2",
           },
-          { id: "e1", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
+          { id: "e1", event: "end", data: "ok", rawData: "ok", receivedAt: "t3" },
         ]),
       );
 
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
 
       await waitFor(() =>
         expect(streamRunEventsMock).toHaveBeenCalledWith(
@@ -1819,13 +1493,15 @@ describe("PlaygroundTab", () => {
         ),
       );
 
-      // The replayed answer renders (not just the flat fallback text) — the
-      // debug panels filled in from the replayed events.
-      await screen.findByText("replayed answer");
+      // The replayed answer renders (not just the flat fallback text) — and
+      // the turn block's compact step rows filled in from the replayed events.
+      await findInTranscript("replayed answer");
+      const turn = await screen.findByTestId("console-turn");
+      expect(within(turn).getByTestId("console-row-tool")).toBeInTheDocument();
       expect(
         screen.queryByText(i18n.t("playground.history_loading")),
       ).not.toBeInTheDocument();
-      // Read-only: no mutating control on a finished historical run.
+      // No approval control on a finished historical run.
       expect(screen.queryByTestId("playground-approval")).not.toBeInTheDocument();
     });
 
@@ -1845,7 +1521,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
       ]);
       streamRunEventsMock.mockReturnValue(
         makeStream([
@@ -1864,12 +1540,9 @@ describe("PlaygroundTab", () => {
 
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
       // The retry button only appears once the row's replay settles.
-      await screen.findByText("replayed answer");
+      await findInTranscript("replayed answer");
 
       await user.click(screen.getByTestId("playground-turn-retry"));
 
@@ -1895,17 +1568,14 @@ describe("PlaygroundTab", () => {
       // 2 turns worth of messages, 3 runs — buildHistoryTurns' count guard
       // rejects the pairing (e.g. an approval split one turn across 2 runs).
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
-        { runId: "r2", status: "success", isResume: true, createdAt: "t2" },
-        { runId: "r3", status: "success", isResume: true, createdAt: "t3" },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
+        { runId: "r2", status: "success", isResume: true, createdAt: "t2", tokens: null },
+        { runId: "r3", status: "success", isResume: true, createdAt: "t3", tokens: null },
       ]);
 
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
 
       // Existing flat degradation block renders the raw text turns.
       const hist = await screen.findByTestId("playground-history");
@@ -1931,7 +1601,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
       ]);
       streamRunEventsMock.mockImplementation(() => {
         return (async function* () {
@@ -1941,10 +1611,7 @@ describe("PlaygroundTab", () => {
 
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
 
       // Fallback answer (from ``/messages``) still shows; no crash, no
       // approval control on a failed historical replay.
@@ -1966,7 +1633,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
       ]);
       // The terminal-replay endpoint always appends an ``end`` frame, so an
       // empty run replays as a lone end frame — no renderable content.
@@ -1978,10 +1645,7 @@ describe("PlaygroundTab", () => {
 
       renderPg();
       await screen.findByTestId("playground-input");
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
 
       await waitFor(() =>
         expect(streamRunEventsMock).toHaveBeenCalledWith(
@@ -2029,8 +1693,8 @@ describe("PlaygroundTab", () => {
       listThreadRunsMock.mockImplementation((tid: string) =>
         Promise.resolve(
           tid === threadA.thread_id
-            ? [{ runId: "rA", status: "success" as const, isResume: false, createdAt: "t1" }]
-            : [{ runId: "rB", status: "success" as const, isResume: false, createdAt: "t1" }],
+            ? [{ runId: "rA", status: "success" as const, isResume: false, createdAt: "t1", tokens: null }]
+            : [{ runId: "rB", status: "success" as const, isResume: false, createdAt: "t1", tokens: null }],
         ),
       );
       // Each run's replay yields a distinct answer so we can tell whose turns
@@ -2057,17 +1721,10 @@ describe("PlaygroundTab", () => {
       renderPg();
       await screen.findByTestId("playground-input");
 
-      // Resume A (its message fetch stays pending).
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${threadA.thread_id}`),
-      );
-
-      // Resume B before A resolved — B supersedes A (new AbortController).
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${threadB.thread_id}`),
-      );
+      // Resume A (its message fetch stays pending), then B before A resolved —
+      // B supersedes A (new AbortController).
+      await resumeFromSidebar(user, threadA.thread_id);
+      await resumeFromSidebar(user, threadB.thread_id);
 
       // Resolve B first → its history builds + its run replays.
       await act(async () => {
@@ -2076,7 +1733,7 @@ describe("PlaygroundTab", () => {
           { role: "assistant", content: "aB" },
         ]);
       });
-      await screen.findByText("answer-B");
+      await findInTranscript("answer-B");
 
       // Now resolve the stale A LAST — the guard must drop its write.
       await act(async () => {
@@ -2089,7 +1746,9 @@ describe("PlaygroundTab", () => {
       await waitFor(() => expect(getMessagesMock).toHaveBeenCalledTimes(2));
 
       // B's history survives; A's content never clobbers it.
-      expect(screen.getByText("answer-B")).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId("playground-transcript")).getByText("answer-B"),
+      ).toBeInTheDocument();
       expect(screen.queryByText("answer-A")).not.toBeInTheDocument();
       expect(screen.queryByText("qA")).not.toBeInTheDocument();
       // Only B's own run was replayed — no wrong-thread replay of A's runId
@@ -2108,9 +1767,9 @@ describe("PlaygroundTab", () => {
   });
 
   // Task 5 — fire-now result card: onFireResult wired from PlaygroundTab into
-  // StepTimeline → AgentStepCard → ToolCallCard's 「立即触发」 button, and the
-  // delivered/pending result rendered inline as a 「任务结果」 card with
-  // created/fired/completed lifecycle chips (Spec 1 PR4).
+  // Transcript → TurnBlock → CompactRow → ToolCallCard's 「立即触发」 button,
+  // and the delivered/pending result rendered inline as a 「任务结果」 card
+  // with created/fired/completed lifecycle chips (Spec 1 PR4).
   describe("fire-now result card", () => {
     function manageTaskEvents(): SseEvent[] {
       return [
@@ -2181,12 +1840,9 @@ describe("PlaygroundTab", () => {
         "每天早上3点搜AI新闻",
       );
       await user.click(screen.getByTestId("playground-run"));
-      // Task 3 — the timeline eventView renders `GanttTimeline`; open the
-      // row for this step (its detail reuses `StepTimeline`, which starts
-      // collapsed — no error — so a further click reaches the nested
-      // ToolCallCard's 「立即触发」 button).
-      await user.click(await screen.findByTestId("gantt-row-item-0"));
-      await user.click(await screen.findByTestId("step-head"));
+      // Task 19 — the middle column's compact tool row expands straight to
+      // the ToolCallCard (no more Gantt row → step head → card chain).
+      await user.click(await screen.findByTestId("console-row-tool"));
       await user.click(await screen.findByTestId("tool-fire-now"));
     }
 
@@ -2292,10 +1948,7 @@ describe("PlaygroundTab", () => {
       );
       await screen.findByTestId("playground-task-result");
 
-      await user.click(screen.getByTestId("playground-history-open"));
-      await user.click(
-        await screen.findByTestId(`session-history-item-${past.thread_id}`),
-      );
+      await resumeFromSidebar(user, past.thread_id);
 
       expect(
         screen.queryByTestId("playground-task-result"),
@@ -2390,15 +2043,7 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
   // fix-review Minor#2 — 重试按钮切入态用「不渲染」实现(onRetry={undefined}),
   // 两渲染点(live 轮 + resume 历史轮)各补两态断言。切入态在 home 态跑出
   // transcript 后翻 mock + rerender 模拟(顶栏切换器实时可达该状态)。
-  const pgTree = (
-    <MemoryRouter>
-      <AuthProvider>
-        <TenantScopeProvider>
-          <PlaygroundTab detail={sampleDetail} />
-        </TenantScopeProvider>
-      </AuthProvider>
-    </MemoryRouter>
-  );
+  const pgTree = tree(sampleDetail);
 
   it("live 轮:归属态渲染重试按钮,切入态不渲染", async () => {
     const user = userEvent.setup();
@@ -2420,7 +2065,7 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
     await screen.findByTestId("playground-input");
     await user.type(screen.getByTestId("playground-input"), "q1");
     await user.click(screen.getByTestId("playground-run"));
-    await screen.findByText("an answer");
+    await findInTranscript("an answer");
     expect(screen.getByTestId("playground-turn-retry")).toBeInTheDocument();
 
     isTenantSwitchedMock.mockReturnValue(true);
@@ -2443,7 +2088,7 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
       { role: "assistant", content: "a1" },
     ]);
     listThreadRunsMock.mockResolvedValue([
-      { runId: "r1", status: "success", isResume: false, createdAt: "t1" },
+      { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
     ]);
     streamRunEventsMock.mockReturnValue(
       makeStream([
@@ -2462,11 +2107,8 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
 
     const view = renderPg();
     await screen.findByTestId("playground-input");
-    await user.click(screen.getByTestId("playground-history-open"));
-    await user.click(
-      await screen.findByTestId(`session-history-item-${past.thread_id}`),
-    );
-    await screen.findByText("replayed answer");
+    await resumeFromSidebar(user, past.thread_id);
+    await findInTranscript("replayed answer");
     expect(screen.getByTestId("playground-turn-retry")).toBeInTheDocument();
 
     isTenantSwitchedMock.mockReturnValue(true);
