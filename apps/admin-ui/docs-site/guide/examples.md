@@ -15,7 +15,7 @@
 
 ## 10.1 发起 stream 模式的 run 并解析事件流
 
-发起一次 `mode: "stream"` 的 run，响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `approval` / `retry` / `error` 这几类事件，示例中直接原样打印 `data` 字段，不做进一步解析，字段含义见 [SSE 事件格式](./sse-events)。
+发起一次 `mode: "stream"` 的 run，响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `plan` / `approval` / `retry` / `error` 这几类事件，示例中直接原样打印 `data` 字段，不做进一步解析，字段含义见 [SSE 事件格式](./sse-events)。
 
 ::: code-group
 
