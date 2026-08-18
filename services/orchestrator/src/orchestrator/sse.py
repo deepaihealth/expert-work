@@ -522,7 +522,7 @@ async def run_agent(
             initial_snapshot = await graph.aget_state(effective_config)
             initial_values = getattr(initial_snapshot, "values", None) or {}
             initial_plan = _to_jsonable(initial_values.get("plan"))
-        except Exception:  # noqa: BLE001 — 降级路径,任何读失败都不能拖垮 run
+        except Exception:
             logger.warning("run_agent.initial_plan_read_failed run_id=%s", run_id, exc_info=True)
             initial_plan = None
         if initial_plan is not None:
