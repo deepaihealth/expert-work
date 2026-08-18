@@ -17,7 +17,7 @@
 - 前端 `record.spec` 是**完整 manifest**(`{apiVersion, kind, metadata, spec}`),`readPromptJinja(m)` 读的是 `m.spec.system_prompt`;测试 fixture 必须按这个形状造。
 - 每条新断言按 break → red → restore → green 自证(先在未修代码上跑红)。
 - 仓库无 CHANGELOG 文件,变更记 PR 说明 + `docs/design/jinja-dynamic-prompt.md` 勘误段。
-- 命令:python 一律 `uv run …`(仓库根);admin-ui 在 `apps/admin-ui` 下 `pnpm test -- <file>` / `pnpm typecheck`(裸 `tsc --noEmit` 恒绿,不算数)。
+- 命令:python 一律 `uv run …`(仓库根);admin-ui 在 `apps/admin-ui` 下 `pnpm exec vitest run <file>` / `pnpm typecheck`(裸 `tsc --noEmit` 恒绿,不算数)。
 - 变异 / 自证时不要用 `git checkout --` 还原,先把文件复制到 scratchpad。
 
 ---
@@ -79,7 +79,7 @@
 
 - [ ] **Step 2: 跑,确认红**
 
-Run: `cd apps/admin-ui && pnpm test -- src/pages/__tests__/PlaygroundTab.test.tsx -t "renders declared prompt variables"`
+Run: `cd apps/admin-ui && pnpm exec vitest run src/pages/__tests__/PlaygroundTab.test.tsx -t "renders declared prompt variables"`
 Expected: FAIL —— `Unable to find an element by: [data-testid="playground-var-persona"]`。
 
 - [ ] **Step 3: 修 `PlaygroundTab.tsx:133-140`**
@@ -115,7 +115,7 @@ Expected: FAIL —— `Unable to find an element by: [data-testid="playground-va
 
 - [ ] **Step 4: 跑,确认绿;再跑全文件**
 
-Run: `cd apps/admin-ui && pnpm test -- src/pages/__tests__/PlaygroundTab.test.tsx`
+Run: `cd apps/admin-ui && pnpm exec vitest run src/pages/__tests__/PlaygroundTab.test.tsx`
 Expected: 全绿(该文件所有用例)。
 
 - [ ] **Step 5: 加一条守形状的用例:内层 spec 形状(旧 fixture 那种)不再被当成 jinja agent**
@@ -146,7 +146,7 @@ Expected: 全绿(该文件所有用例)。
 
 - [ ] **Step 6: 跑,确认绿;typecheck**
 
-Run: `cd apps/admin-ui && pnpm test -- src/pages/__tests__/PlaygroundTab.test.tsx && pnpm typecheck`
+Run: `cd apps/admin-ui && pnpm exec vitest run src/pages/__tests__/PlaygroundTab.test.tsx && pnpm typecheck`
 Expected: PASS / 无类型错误。
 
 - [ ] **Step 7: Commit**
