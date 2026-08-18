@@ -147,7 +147,9 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
     .getByText(/^(active|活跃)$/i)
     .click();
 
-  // Rename → PATCH with the new title.
+  // Rename → PATCH with the new title. §八.1 —— 行内三个图标从常驻改成 hover
+  // 才浮出来(``display:none`` 起步),所以每次点之前先把指针放到行上。
+  await page.getByTestId(`console-session-item-${A_ID}`).hover();
   await page.getByTestId(`console-session-rename-${A_ID}`).click();
   await page.getByTestId("console-session-rename-input").fill("Renamed thread");
   await page.getByRole("button", { name: /save|保存/i }).click();
@@ -155,6 +157,7 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
 
   // Archive → DELETE after confirmation. Scope the OK to the open popconfirm
   // (its label collides with the rows' archive icon-button aria-labels).
+  await page.getByTestId(`console-session-item-${A_ID}`).hover();
   await page.getByTestId(`console-session-archive-${A_ID}`).click();
   await page
     .locator(".ant-popconfirm-buttons")
@@ -163,6 +166,7 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
   await expect.poll(() => calls.deleted).toContain(`/v1/sessions/${A_ID}`);
 
   // Purge → POST :purge after the danger confirmation (same scoping).
+  await page.getByTestId(`console-session-item-${A_ID}`).hover();
   await page.getByTestId(`console-session-purge-${A_ID}`).click();
   await page
     .locator(".ant-popconfirm-buttons")
