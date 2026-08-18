@@ -152,8 +152,12 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
   // 所以这条把「隐藏用 opacity、别用 display」钉死。
   await page.getByTestId("console-session-search").focus();
   const renameA = page.getByTestId(`console-session-rename-${A_ID}`);
-  const focusedTestId = () =>
-    page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? null);
+  // e2e 走 tsconfig.node.json(`lib: ["ES2023"]`,没有 DOM),所以别用
+  // `page.evaluate(() => document…)` —— 用 `:focus` 选择器读当前焦点。
+  const focusedTestId = async (): Promise<string | null> => {
+    const focused = page.locator(":focus");
+    return (await focused.count()) === 1 ? await focused.getAttribute("data-testid") : null;
+  };
   for (let i = 0; i < 10; i += 1) {
     if ((await focusedTestId()) === `console-session-rename-${A_ID}`) break;
     await page.keyboard.press("Tab");
