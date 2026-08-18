@@ -83,4 +83,20 @@ describe("Composer", () => {
     expect(onAttachImage).toHaveBeenCalledTimes(1);
     expect(onAttachDocument).toHaveBeenCalledTimes(1);
   });
+
+  it("while running the run button is replaced by a stop button in the same slot", async () => {
+    const onStop = vi.fn();
+    render(<Composer {...base} value="hi" running onStop={onStop} />);
+    expect(screen.getByTestId("playground-stop")).toBeInTheDocument();
+    expect(screen.queryByTestId("playground-run")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("playground-stop"));
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the counter and hint on the toolbar row", () => {
+    render(<Composer {...base} value="" />);
+    expect(screen.getByTestId("console-composer-hint").textContent).toMatch(
+      /^0 \/ 65536 · /,
+    );
+  });
 });
