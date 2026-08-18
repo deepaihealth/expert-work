@@ -178,17 +178,17 @@ PageHeader → `ApprovalCard` → 元数据卡 → `RunSummaryPanel` → `PlanPa
 **对外文档**(`apps/admin-ui/docs-site/guide/`,按 `2026-08-17-external-docs-style-guide.md`):
 
 - 第 3 章新增 `### plan` 一节,四段:什么时候发(计划创建 / 更新时;run 开始时会话已有计划先发一条)/ `data` 字段(`goal` string、`steps` 数组:`id` string、`description` string、`status` 取值三个及含义)/ 示例 / 客户端怎么处理(**收到即整段覆盖本地那份,以最新一条为准;不要按 `id` 做增量合并;断线续传会重放**)。3.x「哪些事件有 id」表加一行;`updates` 节的「请忽略其他键」措辞不变。
-- 第 10 章示例加「渲染任务列表」一段(reducer 三行)。
+- 第 10 章:10.1 导语的事件列表加 `plan`(四种语言的示例对未列举事件都是原样打印,代码不用改);渲染示例(`onPlan` reducer)放在第 3 章 `plan` 节的「客户端怎么处理」里,与其它事件同款。
 - 第 8 章不涉及。侧栏同步。
 
 ### 5. PR0 —— 两条 bug
 
 - **Bug A**:`PlaygroundTab.tsx:134-140` 改为 `readPromptJinja(r.spec)` / `readPromptVariables(r.spec)`;测试 fixture 改成真实形状(`record.spec = { apiVersion, kind, metadata, spec: { system_prompt: … } }`);新增回归测试(先按现行代码跑红,再修绿)。
 - **Bug B(D1 = 拆干净)**:
-  - control-plane:`ManifestPayload` 删 `template_vars` 字段(带该字段的请求 → 422,零使用者,变更记 CHANGELOG);`ManifestLoader.load_from_string / load_from_path / load_manifest` 删 `template_vars` 参数与 `_render` 步骤,YAML 直接 `_parse_yaml → _validate`;`ManifestTemplateError`(`manifest/errors.py:15`,随之不可达)连同 `api/agents.py:685` 的 `MANIFEST_TEMPLATE` 400 映射、`manifest/__init__.py` 导出一并删(前端与文档零引用,已 grep);**`build_sandboxed_environment` 保留**(`prompt_render.py` 在用)。
+  - control-plane:`ManifestPayload` 删 `template_vars` 字段(带该字段的请求 → 422,零使用者;仓库无 CHANGELOG,变更记 PR 说明与设计文档勘误);`ManifestLoader.load_from_string / load_from_path / load_manifest` 删 `template_vars` 参数与 `_render` 步骤,YAML 直接 `_parse_yaml → _validate`;`ManifestTemplateError`(`manifest/errors.py:15`,随之不可达)连同 `api/agents.py:685` 的 `MANIFEST_TEMPLATE` 400 映射、`manifest/__init__.py` 导出一并删(前端与文档零引用,已 grep);**`build_sandboxed_environment` 保留**(`prompt_render.py` 在用)。
   - admin-ui:`api/agents.ts:97` 删字段。
   - `docs/design/jinja-dynamic-prompt.md` §2 补一段勘误(保存时填空已下线,原因)。
-  - 测试:loader 测试里的渲染用例改为「`{{ }}` 原样入库」;端到端一条:API 保存 `jinja:true` + `{{ customer_code }}` 的 agent → GET 回读 prompt 原样 → 发 run 带 `inputs` → 渲染后的 system prompt 含替换值(`test_external_run_inputs.py` 旁加)。
+  - 测试:loader 测试里的渲染用例改为「`{{ }}` 原样入库」;API 层一条:POST 保存 `jinja:true` + `{{ persona }}` 的 agent → GET 回读 prompt 原样;它与既有 `test_external_run_inputs.py::test_inputs_reaches_prompt_render`、`test_prompt_render.py` 一起构成「保存原样 → run 期渲染」的证据链(中间的 `runtime.get_agent` 构建路径 PR0 不碰)。
 - 修完的用户侧后果:双花括号能存;单花括号不再需要(它本来也不替换)—— 用户现有配置要改回 `{{ customer_code }}`。
 
 ---
@@ -230,7 +230,7 @@ i18n:新增 `console.*` 命名空间(zh-CN + en 两份),旧 `playground.*` 键�
 | protocol `event.py` `EventType` | 加 `PLAN = "plan"`(照 `COMPACTION` 先例:枚举成员与 wire 值对齐) | PR1 |
 | docs-site 第 3 章 / 第 10 章 / 侧栏 | `plan` 事件 | PR1 |
 | `docs/design/jinja-dynamic-prompt.md` | 勘误段 | PR0 |
-| CHANGELOG | `template_vars` 下线;`plan` 事件新增 | PR0 / PR1 |
+| PR 说明 + `docs/design/jinja-dynamic-prompt.md` 勘误 | `template_vars` 下线;`plan` 事件新增(仓库无 CHANGELOG) | PR0 / PR1 |
 
 ---
 
@@ -241,7 +241,7 @@ i18n:新增 `console.*` 命名空间(zh-CN + en 两份),旧 `playground.*` 键�
 | PR | 内容 | 验收(全部要有测试或真栈证据) | 量级 |
 |---|---|---|---|
 | **PR0** `fix(playground+manifest)` | Bug A + Bug B(拆层)+ 端到端测试 + 设计文档勘误 | 真实形状 fixture 下变量框渲染并随 `inputs` 发出;API 保存 `{{ }}` 成功且回读原样;run 渲染替换;带 `template_vars` 的请求 422 | S |
-| **PR1** `feat(sse+docs)` | `plan` 事件(派生 + 开跑补发)+ 对外文档 | 单测:`update_plan` 后流里出现 `plan` 帧且与 `updates` 快照相等;开跑前有计划 → 第一条业务帧前有 `plan`;replay 端点重放它;文档站 build + 死链 0;真栈探针(pod 内 key,不出集群)收到 `plan` | M |
+| **PR1** `feat(sse+docs)` | `plan` 事件(派生 + 开跑补发)+ 对外文档 + 死链脚本入仓 | 单测:`update_plan` 后流里出现 `plan` 帧且与 `updates` 快照相等;开跑前有计划 → 第一条业务帧前有 `plan`;帧落库(replay 可重放);文档站 build + 死链 0;真栈探针(pod 内 key,不出集群)三项 PASS | M |
 | **PR2** `feat(console)` | 三栏壳 + 左栏会话 + 对话流紧凑行 + 任务卡 + 变量表单 + 状态栏 + 工作区 tab;右栏「轨迹」tab **先原样装现有三档视图**(`TurnCard` 的事件面板抽出来放进去) | 现有 `PlaygroundTab.test.tsx` 覆盖的行为(创建会话 / 发送 / 附件 / 变量 / 审批 / 重试 / 导出 / 只读态)全部迁移到新组件测试并绿;状态栏公式单测;真栈冒烟一轮 | L |
 | **PR3** `feat(trajectory)` | 轨迹合一:`LaneStrip` + 行 + `RowDetail` 五 tab(Timing 双来源);退役 `TraceView / GanttTimeline / StepTimeline / EventCard-as-view` | 行投影单测(与 `parseTimeline` 一一对应,含 `update_plan` 合并成一行);Timing 两来源都有的样例;Langfuse `not_ready` 轮询保留;真栈冒烟 | L |
 | **PR4** `feat(conversation-detail)` | 对话记录页切到共用组件(只读)+ Runs 表去 + 「立即触发」gate | 现有 `ConversationDetail.test.tsx` 行为迁移;只读态下无任何写按钮可点(含立即触发);跨租户读透传照旧 | M |

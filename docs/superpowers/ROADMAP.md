@@ -18,7 +18,8 @@
   `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`(八条决策已拍板);六个 PR:
   PR0 两条 bug(调试台 Jinja 变量框不显示 / `{{ }}` 保存报错——拆掉「保存时填空」`template_vars` 整层)→
   PR1 对外 `plan` SSE 事件 + 文档 → PR2 调试台三栏壳 → PR3 轨迹合一 → PR4 对话记录页 → PR5 Run 详情页。
-  每个 PR 出实施计划时再拆任务。
+  每个 PR 出实施计划时再拆任务;已出:PR0 `docs/superpowers/plans/2026-08-17-debug-console-pr0-jinja-bugs.md`、
+  PR1 `docs/superpowers/plans/2026-08-17-debug-console-pr1-plan-event.md`(均未开工)。
 
 ---
 
