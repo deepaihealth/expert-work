@@ -18,6 +18,8 @@ export interface AgentStep {
    *  frame's ``id`` is missing/malformed. Gantt data layer's absolute-time
    *  anchor; never derive wall-clock position from ``receivedAt``. */
   serverMs?: number | null;
+  /** 来源帧在 events 里的下标(Raw tab / 轨迹行用);老调用方不依赖。 */
+  eventIndex?: number;
   stepCount: number | null;
   node: string;
   model: string | null;
@@ -36,6 +38,8 @@ export interface AuxNodeItem {
   seq: number;
   receivedAt: string;
   serverMs?: number | null;
+  /** 来源帧在 events 里的下标(Raw tab / 轨迹行用);老调用方不依赖。 */
+  eventIndex?: number;
   node: string;
   summary: string;
   detail: Record<string, unknown>;
@@ -49,6 +53,8 @@ export interface MarkerItem {
   seq: number;
   receivedAt: string;
   serverMs?: number | null;
+  /** 来源帧在 events 里的下标(Raw tab / 轨迹行用);老调用方不依赖。 */
+  eventIndex?: number;
   text: string;
   tone: "warn" | "bad" | "good" | "pause";
 }
@@ -105,11 +111,13 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
   // to every push() call made while processing that evt (single-threaded,
   // no concurrent iterations).
   let evtServerMs: number | null = null;
+  let evtIndex = 0;
   const push = (it: Record<string, unknown>): void => {
-    items.push({ ...it, seq: seq++, serverMs: evtServerMs } as TimelineItem);
+    items.push({ ...it, seq: seq++, serverMs: evtServerMs, eventIndex: evtIndex } as TimelineItem);
   };
 
-  for (const evt of events) {
+  for (const [i, evt] of events.entries()) {
+    evtIndex = i;
     const at = evt.receivedAt;
     evtServerMs = serverMsOf(evt.id);
     if (evt.event === "compaction") {

@@ -178,4 +178,12 @@ describe("parseTimeline", () => {
     const items = parseTimeline([ev("end", null, "t1")]);
     expect(items[0]).toMatchObject({ kind: "end", text: "运行完成", tone: "good" });
   });
+
+  it("items carry the index of the frame they came from (two items from one updates frame share it)", () => {
+    const items = parseTimeline([
+      ev("compaction", { passes: 1, tokens_before: 1, tokens_after: 1, summary_chars: 0 }, "t1"),
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", additional_kwargs: { reasoning_content: "r" } }], recalled_memories: [{ id: "m" }] }, "t2"),
+    ]);
+    expect(items.map((it) => it.eventIndex)).toEqual([0, 1, 1]);
+  });
 });
