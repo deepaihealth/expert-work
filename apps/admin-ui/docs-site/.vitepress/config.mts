@@ -7,7 +7,10 @@ export default withMermaid(
     title: "Expert-Work 开放 API",
     description: "第三方对接文档",
     base: "/docs/",
+    head: [["link", { rel: "icon", type: "image/svg+xml", href: "/docs/favicon.svg" }]],
     themeConfig: {
+      logo: "/logo.svg",
+      siteTitle: "Expert-Work 开放 API",
       nav: [
         { text: "快速开始", link: "/guide/quickstart" },
         { text: "跟 Agent 对话", link: "/guide/chat" },
@@ -163,8 +166,7 @@ export default withMermaid(
       search: { provider: "local" },
       outline: { label: "本页目录", level: [2, 3] },
       footer: {
-        message: "对外 API 版本 v1",
-        copyright: "文档更新于 2026-08-17",
+        copyright: "© 2026 Expert-Work · 对外 API v1 · 文档更新于 2026-08-18",
       },
     },
     markdown: {

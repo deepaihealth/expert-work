@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Expert-Work 标记:圆角底板 + EW 连笔(E 的顶横直接接成 W 的第一笔),线宽 4.6,墨青蓝底白字 -->
+  <rect x="1" y="1" width="46" height="46" rx="11" fill="#2C56C4"/>
+  <g transform="translate(6 7) scale(.75)">
+    <path d="M7 36V12h17l4 24 5-14 5 14 4-24M7 24h10M7 36h10" fill="none" stroke="#fff" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
