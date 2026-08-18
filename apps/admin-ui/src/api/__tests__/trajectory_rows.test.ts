@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, resolveGanttKey, trajectoryRowsOf } from "../trajectory_rows";
+import { compactRowsOf, resolveGanttKey, trajectoryRowsOf, type ThinkRow } from "../trajectory_rows";
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
@@ -205,13 +205,13 @@ describe("trajectoryRowsOf", () => {
         type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 },
       }] }),
     ], INPUT, null, "running");
-    const thinks = rows.filter((r) => r.kind === "think");
+    // 谓词过滤而不是 `if (x.kind === "think")` —— 后者一旦投影变了会**静默
+    // 跳过**整段断言,看起来照样绿。
+    const thinks = rows.filter((r): r is ThinkRow => r.kind === "think");
     expect(thinks).toHaveLength(2);
     expect(thinks[0]).toMatchObject({ inputTokens: 16000, outputTokens: 900, reasoningTokens: 770, cacheReadTokens: 14336 });
-    if (thinks[1].kind === "think") {
-      expect(thinks[1].reasoningTokens).toBeUndefined();
-      expect(thinks[1].cacheReadTokens).toBeUndefined();
-    }
+    expect(thinks[1].reasoningTokens).toBeUndefined();
+    expect(thinks[1].cacheReadTokens).toBeUndefined();
   });
 
   it("serverMs: item.serverMs for agent/marker rows, entry.serverMs for tool rows, null for user/assistant/subagent", () => {

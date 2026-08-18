@@ -242,7 +242,15 @@ export function TrajectoryPanel(props: TrajectoryPanelProps): JSX.Element {
           }
           onJump={
             banner.status === "error"
-              ? () => setSelectedRowId(rows.find((r) => r.status === "error")?.id ?? null)
+              ? () =>
+                  setSelectedRowId(
+                    // think 行的 error 是**继承**自本步失败的工具(见 Task 3
+                    // 裁决),而且排在工具行之前 —— 直接 find 第一条 error 会
+                    // 永远停在 think 上,读者点「跳转」是想看那个炸掉的工具。
+                    // 找不到非 think 的错误行(例如顶层 error 帧)才退回原判据。
+                    (rows.find((r) => r.kind !== "think" && r.status === "error") ??
+                      rows.find((r) => r.status === "error"))?.id ?? null,
+                  )
               : undefined
           }
         />

@@ -263,14 +263,19 @@ describe("TrajectoryPanel", () => {
     const banner = await screen.findByTestId("run-status-banner");
     expect(banner).toHaveTextContent(i18n.t("playground.tl_step", { n: 3 }));
 
-    const errorRow = screen.getAllByTestId("console-traj-row").find((el) => el.dataset.status === "error");
-    expect(errorRow).toBeTruthy();
+    // 失败步的 think 行**继承**工具的错误状态,而且排在工具行之前 —— 所以
+    // 「DOM 里第一条 data-status=error」这个判据对 think / tool 都成立,拿它
+    // 当期望值等于什么都没验。这里改成钉死「跳到真正炸掉的工具行」。
+    const errorRows = screen.getAllByTestId("console-traj-row").filter((el) => el.dataset.status === "error");
+    expect(errorRows.map((el) => el.dataset.kind)).toEqual(["think", "tool"]);
+    const toolErrorRow = errorRows.find((el) => el.dataset.kind === "tool");
 
     fireEvent.click(screen.getByTestId("run-status-jump"));
 
     expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
     const selected = screen.getAllByTestId("console-traj-row").find((el) => el.getAttribute("aria-selected") === "true");
-    expect(selected?.dataset.rowId).toBe(errorRow?.dataset.rowId);
+    expect(selected?.dataset.kind).toBe("tool");
+    expect(selected?.dataset.rowId).toBe(toolErrorRow?.dataset.rowId);
   });
 
   it("a top-level error frame yields exactly one error row and one banner — 1379", async () => {
@@ -491,7 +496,7 @@ describe("TrajectoryPanel", () => {
     fireEvent.pointerUp(track, { clientX: 200, pointerId: 1 });
 
     const chip = await screen.findByTestId("console-traj-filter");
-    expect(chip.textContent).toContain("#2–#4");
+    expect(chip.textContent).toContain(i18n.t("console.traj_filter", { a: 2, b: 4, n: 3 }));
     expect(screen.getAllByTestId("console-traj-row")).toHaveLength(3);
 
     const otherEvents: SseEvent[] = [

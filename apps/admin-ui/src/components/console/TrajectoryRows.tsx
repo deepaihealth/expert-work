@@ -100,7 +100,7 @@ function tokenCell(n: number | undefined): string {
 export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
   const { rows, selectedRowId, hoveredRowId, onHoverRow, onSelectRow, running, range, onClearRange } = props;
   const { t } = useTranslation();
-  const listRef = useRef<HTMLUListElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLButtonElement>(null);
   const prevRowCountRef = useRef(rows.length);
 
@@ -116,7 +116,7 @@ export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
     const grew = rows.length > prevRowCountRef.current;
     prevRowCountRef.current = rows.length;
     if (!running || !grew) return;
-    const el = listRef.current;
+    const el = scrollRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= AUTO_SCROLL_SLACK_PX;
     if (nearBottom) el.scrollTop = el.scrollHeight;
@@ -159,57 +159,61 @@ export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
           </button>
         </div>
       )}
-      <ul
-        ref={listRef}
-        data-testid="console-traj-rows"
-        role="listbox"
-        tabIndex={0}
-        className="ew-traj-rows"
-        onKeyDown={handleKeyDown}
-      >
-        <li className="ew-traj-rows__head" role="presentation" data-testid="console-traj-head">
+      {/* 滚动的是这一层,不是 `<ul>`:表头因此能既在 listbox **外面**(listbox
+          只该拥有 option),又跟行处在同一个滚动盒里 —— 滚动条占掉的宽度对表头
+          和行是同一份,列自然对齐,不用去猜滚动条几像素。 */}
+      <div ref={scrollRef} className="ew-traj-rows__scroll">
+        <div className="ew-traj-rows__head" data-testid="console-traj-head">
           {COLUMN_KEYS.map((key) => (
             <span key={key}>{t(`console.traj_col_${key}`)}</span>
           ))}
-        </li>
-        {visible.map(({ row, index }) => {
-          const selected = row.id === selectedRowId;
-          const think = row.kind === "think" ? row : null;
-          return (
-            <li key={row.id} className="ew-traj-rows__item">
-              <button
-                type="button"
-                ref={selected ? selectedRef : undefined}
-                data-testid="console-traj-row"
-                data-kind={row.kind}
-                data-row-id={row.id}
-                data-status={row.status}
-                data-index={index}
-                data-hovered={row.id === hoveredRowId ? "true" : undefined}
-                role="option"
-                aria-selected={selected}
-                className={`ew-traj-row${selected ? " ew-traj-row--selected" : ""}`}
-                onClick={() => onSelectRow(row.id)}
-                onMouseEnter={() => onHoverRow(row.id)}
-                onMouseLeave={() => onHoverRow(null)}
-              >
-                <span className="ew-traj-row__idx">{index}</span>
-                <span className="ew-traj-row__kind">
-                  {t(`console.traj_kind_${row.kind}`)}
-                  {row.status === "running" && <span className="ew-traj-row__pulse" aria-hidden="true" />}
-                </span>
-                <span className="ew-traj-row__summary">{rowSummary(row, t)}</span>
-                <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.inputTokens)}</span>
-                <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.outputTokens)}</span>
-                <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.reasoningTokens)}</span>
-                <span className="ew-traj-row__duration">
-                  {row.durationMs === null ? "" : fmtDuration(row.durationMs)}
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
+        </div>
+        <ul
+          data-testid="console-traj-rows"
+          role="listbox"
+          tabIndex={0}
+          className="ew-traj-rows"
+          onKeyDown={handleKeyDown}
+        >
+          {visible.map(({ row, index }) => {
+            const selected = row.id === selectedRowId;
+            const think = row.kind === "think" ? row : null;
+            return (
+              <li key={row.id} className="ew-traj-rows__item">
+                <button
+                  type="button"
+                  ref={selected ? selectedRef : undefined}
+                  data-testid="console-traj-row"
+                  data-kind={row.kind}
+                  data-row-id={row.id}
+                  data-status={row.status}
+                  data-index={index}
+                  data-hovered={row.id === hoveredRowId ? "true" : undefined}
+                  role="option"
+                  aria-selected={selected}
+                  className={`ew-traj-row${selected ? " ew-traj-row--selected" : ""}`}
+                  onClick={() => onSelectRow(row.id)}
+                  onMouseEnter={() => onHoverRow(row.id)}
+                  onMouseLeave={() => onHoverRow(null)}
+                >
+                  <span className="ew-traj-row__idx">{index}</span>
+                  <span className="ew-traj-row__kind">
+                    {t(`console.traj_kind_${row.kind}`)}
+                    {row.status === "running" && <span className="ew-traj-row__pulse" aria-hidden="true" />}
+                  </span>
+                  <span className="ew-traj-row__summary">{rowSummary(row, t)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.inputTokens)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.outputTokens)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.reasoningTokens)}</span>
+                  <span className="ew-traj-row__duration">
+                    {row.durationMs === null ? "" : fmtDuration(row.durationMs)}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
     </div>
   );
 }

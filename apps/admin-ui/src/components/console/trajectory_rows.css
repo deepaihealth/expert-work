@@ -5,8 +5,10 @@
  * the pulse honours `prefers-reduced-motion` — same pattern as
  * ./SessionSidebar.css's `.ew-session-running-dot`.
  *
- * PR-A.1 Task 6:行改成七列 grid(`# / 类型 / 摘要 / 入 / 出 / 思考 / 耗时`),
- * 表头行 sticky 在滚动容器顶,筛选芯片挂在滚动容器之外(不随行滚走)。
+ * PR-A.1 Task 6:行改成七列 grid(`# / 类型 / 摘要 / 入 / 出 / 思考 / 耗时`)。
+ * 滚动容器是 `.ew-traj-rows__scroll` 而不是 `<ul>` 自己:表头因此能既在
+ * listbox **外面**(listbox 只拥有 option),又与行同处一个滚动盒 —— sticky
+ * 吸顶、列宽自动对齐。筛选芯片在滚动盒之外,不随行滚走。
  */
 .ew-traj-rows-wrap {
   display: flex;
@@ -15,13 +17,16 @@
   min-height: 0;
 }
 
-.ew-traj-rows {
+.ew-traj-rows__scroll {
   flex: 1;
   min-height: 0;
+  overflow: auto;
+}
+
+.ew-traj-rows {
   list-style: none;
   margin: 0;
   padding: 0;
-  overflow: auto;
 }
 
 .ew-traj-rows__filter {

@@ -216,8 +216,7 @@ describe("TrajectoryRows", () => {
     expect(rendered.map((el) => el.getAttribute("data-index"))).toEqual(["2", "3", "4"]);
 
     const chip = screen.getByTestId("console-traj-filter");
-    expect(chip.textContent).toContain("#2–#4");
-    expect(chip.textContent).toContain("3");
+    expect(chip.textContent).toContain("已筛选 #2–#4（3 条）");
   });
 
   it("no chip without a range; the chip's ✕ calls onClearRange", async () => {
@@ -230,6 +229,32 @@ describe("TrajectoryRows", () => {
     const chip = screen.getByTestId("console-traj-filter");
     await userEvent.click(within(chip).getByRole("button"));
     expect(onClearRange).toHaveBeenCalledTimes(1);
+  });
+
+  it("with a range, ArrowDown/ArrowUp never leave the visible span", () => {
+    const rows = rowsOf();
+    expect(rows).toHaveLength(5);
+    // 可见 = 第 2/3/4 行;第 1 行(user)与第 5 行(assistant)在区间外。
+    render(<Wrapper rows={rows} selectedRowId={rows[3].id} range={{ from: 2, to: 4 }} />);
+
+    const list = screen.getByTestId("console-traj-rows");
+    const selectedIndex = (): string | null | undefined =>
+      screen
+        .getAllByTestId("console-traj-row")
+        .find((el) => el.getAttribute("aria-selected") === "true")
+        ?.getAttribute("data-index");
+
+    expect(selectedIndex()).toBe("4");
+    // 越过下边界:第 5 行没渲染出来,选中它等于「选中一条看不见的行」→ 表里
+    // 一条 aria-selected 都不剩,焦点凭空消失。
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    expect(selectedIndex()).toBe("4");
+
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(selectedIndex()).toBe("2");
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(selectedIndex()).toBe("2");
   });
 
   it("hovering a row calls onHoverRow(id) then null on leave; hoveredRowId marks the row data-hovered", () => {
