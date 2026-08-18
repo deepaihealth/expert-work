@@ -54,93 +54,75 @@ export function SessionSidebarItem({
         background: isCurrent ? "var(--ew-surface-selected)" : undefined,
       }}
       onClick={() => onResume(session)}
-      actions={[
-        <span key="rename" onClick={(e) => e.stopPropagation()}>
-          <ReadonlyTooltip on={readOnly}>
+    >
+      <div className="ew-session-item__body">
+        <div className="ew-session-item__title" title={title}>
+          {showDot && (
+            <span
+              className="ew-session-running-dot"
+              data-testid="console-session-running-dot"
+              aria-label={t("console.sidebar_running_dot")}
+            />
+          )}
+          {title}
+        </div>
+        <div className="ew-session-item__meta">
+          {relativeTime(session.updated_at, t)}
+        </div>
+      </div>
+      <div className="ew-session-item__acts" onClick={(e) => e.stopPropagation()}>
+        <ReadonlyTooltip on={readOnly}>
+          <Button
+            type="text"
+            size="small"
+            icon={<Pencil size={13} strokeWidth={1.75} />}
+            aria-label={`${t("session_history.rename")}：${title}`}
+            loading={busy}
+            disabled={readOnly}
+            onClick={() => onRenameStart(session)}
+            data-testid={`console-session-rename-${session.thread_id}`}
+          />
+        </ReadonlyTooltip>
+        <ReadonlyTooltip on={readOnly}>
+          <Popconfirm
+            title={t("session_history.archive_confirm")}
+            okText={t("session_history.archive")}
+            cancelText={t("session_history.cancel")}
+            onConfirm={() => onArchive(session.thread_id)}
+            disabled={readOnly}
+          >
             <Button
               type="text"
               size="small"
-              icon={<Pencil size={13} strokeWidth={1.75} />}
-              aria-label={`${t("session_history.rename")}：${title}`}
-              loading={busy}
+              icon={<X size={13} strokeWidth={1.75} />}
+              aria-label={`${t("session_history.archive")}：${title}`}
               disabled={readOnly}
-              onClick={() => onRenameStart(session)}
-              data-testid={`console-session-rename-${session.thread_id}`}
+              data-testid={`console-session-archive-${session.thread_id}`}
             />
-          </ReadonlyTooltip>
-        </span>,
-        <span key="archive" onClick={(e) => e.stopPropagation()}>
-          <ReadonlyTooltip on={readOnly}>
-            <Popconfirm
-              title={t("session_history.archive_confirm")}
-              okText={t("session_history.archive")}
-              cancelText={t("session_history.cancel")}
-              onConfirm={() => onArchive(session.thread_id)}
-              disabled={readOnly}
-            >
-              <Button
-                type="text"
-                size="small"
-                icon={<X size={13} strokeWidth={1.75} />}
-                aria-label={`${t("session_history.archive")}：${title}`}
-                disabled={readOnly}
-                data-testid={`console-session-archive-${session.thread_id}`}
-              />
-            </Popconfirm>
-          </ReadonlyTooltip>
-        </span>,
-        <span key="purge" onClick={(e) => e.stopPropagation()}>
-          <ReadonlyTooltip on={readOnly}>
-            <Popconfirm
-              title={t("session_history.purge_confirm")}
-              description={t("session_history.purge_warning")}
-              okText={t("session_history.purge")}
-              okButtonProps={{ danger: true }}
-              cancelText={t("session_history.cancel")}
-              onConfirm={() => onPurge(session.thread_id)}
-              disabled={readOnly}
-            >
-              <Button
-                type="text"
-                size="small"
-                danger
-                icon={<Trash2 size={13} strokeWidth={1.75} />}
-                aria-label={`${t("session_history.purge")}：${title}`}
-                disabled={readOnly}
-                data-testid={`console-session-purge-${session.thread_id}`}
-              />
-            </Popconfirm>
-          </ReadonlyTooltip>
-        </span>,
-      ]}
-    >
-      <List.Item.Meta
-        title={
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              fontSize: 13,
-              fontWeight: 500,
-            }}
+          </Popconfirm>
+        </ReadonlyTooltip>
+        <ReadonlyTooltip on={readOnly}>
+          <Popconfirm
+            title={t("session_history.purge_confirm")}
+            description={t("session_history.purge_warning")}
+            okText={t("session_history.purge")}
+            okButtonProps={{ danger: true }}
+            cancelText={t("session_history.cancel")}
+            onConfirm={() => onPurge(session.thread_id)}
+            disabled={readOnly}
           >
-            {showDot && (
-              <span
-                className="ew-session-running-dot"
-                data-testid="console-session-running-dot"
-                aria-label={t("console.sidebar_running_dot")}
-              />
-            )}
-            {title}
-          </span>
-        }
-        description={
-          <span style={{ fontSize: 11, color: "var(--ew-text-tertiary)" }}>
-            {relativeTime(session.updated_at, t)}
-          </span>
-        }
-      />
+            <Button
+              type="text"
+              size="small"
+              danger
+              icon={<Trash2 size={13} strokeWidth={1.75} />}
+              aria-label={`${t("session_history.purge")}：${title}`}
+              disabled={readOnly}
+              data-testid={`console-session-purge-${session.thread_id}`}
+            />
+          </Popconfirm>
+        </ReadonlyTooltip>
+      </div>
     </List.Item>
   );
 }

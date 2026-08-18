@@ -242,7 +242,7 @@ export function SessionSidebar({
         </ReadonlyTooltip>
       </div>
 
-      <div style={{ display: "flex", gap: 8, padding: "0 8px 8px" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "8px 10px 0" }}>
         <Input.Search
           placeholder={t("console.sidebar_search")}
           aria-label={t("console.sidebar_search")}
@@ -250,10 +250,11 @@ export function SessionSidebar({
           onChange={(e) => setQuery(e.target.value)}
           allowClear
           loading={loading}
-          style={{ flex: 1 }}
+          style={{ width: "100%" }}
           data-testid="console-session-search"
         />
         <Segmented
+          block
           value={statusFilter}
           onChange={(value) => setStatusFilter(value as "" | "archived")}
           options={[

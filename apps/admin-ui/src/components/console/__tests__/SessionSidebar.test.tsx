@@ -320,4 +320,16 @@ describe("SessionSidebar", () => {
     expect(screen.queryByTestId("console-session-rename-input")).toBeNull();
     expect(renameMock).not.toHaveBeenCalled();
   });
+
+  it("keeps the row actions out of layout flow (hover-reveal container, not an antd actions sibling)", async () => {
+    renderSidebar();
+    const renameBtn = await screen.findByTestId(
+      `console-session-rename-${A.thread_id}`,
+    );
+    expect(renameBtn.closest(".ew-session-item__acts")).toBeInTheDocument();
+    const item = screen.getByTestId(`console-session-item-${A.thread_id}`);
+    expect(
+      within(item).getByText("Quarterly report").closest(".ew-session-item__title"),
+    ).toBeInTheDocument();
+  });
 });
