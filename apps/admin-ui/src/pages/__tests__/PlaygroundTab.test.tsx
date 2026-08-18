@@ -611,11 +611,19 @@ describe("PlaygroundTab", () => {
     const jinjaDetail: AgentDetailResponse = {
       record: {
         ...sampleDetail.record,
+        // 真实 API 形状:record.spec 是完整 manifest,不是内层 spec
+        // (后端 record.spec.metadata.labels 直接取用;#824 的 fixture 造错了形状,
+        // 把 PlaygroundTab 多包一层壳的 bug 盖住了整整一版)。
         spec: {
-          system_prompt: {
-            template: "你是 {{ persona }}",
-            jinja: true,
-            variables: [{ name: "persona", trusted: true, required: true }],
+          apiVersion: "expert_work.io/v1",
+          kind: "Agent",
+          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+          spec: {
+            system_prompt: {
+              template: "你是 {{ persona }}",
+              jinja: true,
+              variables: [{ name: "persona", trusted: true, required: true }],
+            },
           },
         },
       },
@@ -647,6 +655,26 @@ describe("PlaygroundTab", () => {
       { input: "go", inputs: { persona: "顾问" } },
       expect.objectContaining({ signal: expect.anything() }),
     );
+  });
+
+  it("does not treat a bare inner spec as a jinja agent (record.spec is the full manifest)", async () => {
+    // 如果有人把 record.spec 造成内层 spec(旧 fixture 的形状),变量框不能出现——
+    // 这条守住「readers 读的是 manifest.spec.system_prompt」这个约定。
+    const innerShape: AgentDetailResponse = {
+      record: {
+        ...sampleDetail.record,
+        spec: {
+          system_prompt: {
+            template: "你是 {{ persona }}",
+            jinja: true,
+            variables: [{ name: "persona" }],
+          },
+        },
+      },
+    };
+    renderPg(innerShape);
+    await screen.findByTestId("playground-input");
+    expect(screen.queryByTestId("playground-vars")).not.toBeInTheDocument();
   });
 
   it("shows an upload-error alert and keeps Run usable when upload fails", async () => {

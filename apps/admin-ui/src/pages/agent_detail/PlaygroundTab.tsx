@@ -131,10 +131,13 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const isTenantSwitched = useIsTenantSwitched();
 
   // Dynamic-Prompt — the agent's declared run-time variables (jinja agents only).
-  const manifestLike = { spec: r.spec };
-  const promptJinja = readPromptJinja(manifestLike);
+  // ``record.spec`` IS the full manifest ({apiVersion, kind, metadata, spec}), so it
+  // is passed to the form_model readers as-is — wrapping it in another ``{ spec }``
+  // shell made ``readPromptJinja`` look at ``manifest.system_prompt`` (undefined) and
+  // hid the variable inputs for every jinja agent (#824 → PR0 of the console redesign).
+  const promptJinja = readPromptJinja(r.spec);
   const promptVariables = promptJinja
-    ? readPromptVariables(manifestLike).filter(
+    ? readPromptVariables(r.spec).filter(
         (v): v is { name: string } & typeof v => Boolean(v.name),
       )
     : [];
