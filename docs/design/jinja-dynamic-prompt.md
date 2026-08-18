@@ -29,6 +29,14 @@ POST /v1/sessions/{thread_id}/runs
 - `RunRequest`(`runs.py:87`,`extra="forbid"`)字段:input / mode / image_refs / untrusted_content。**无 inputs dict**。run 动态数据全进 HumanMessage,从不碰 SystemMessage。
 - jinja2 已是 control-plane 依赖(`pyproject.toml:28`),orchestrator 未引。
 - `protocol` 有 `DynamicContextSpec` / `CustomReminderSpec.template`(`agent_spec.py:182`)占位字段,但 **orchestrator 零消费者**(不复用,避免混淆)。
+- **勘误(2026-08-17,调试台重设计 PR0)**:上面那条「已有沙箱 Jinja 渲染器只在建/改 agent 时渲染」
+  的老功能与本设计**撞车**——它把整份 YAML(含 `system_prompt.template`)当 Jinja 用 `StrictUndefined`
+  渲染,jinja 动态 prompt 里合法的 `{{ var }}` 在保存时被当未定义变量,控制台一律 400
+  `MANIFEST_TEMPLATE`;M2 前端又把 `record.spec` 多包了一层壳,调试台的变量框从未渲染。两条合起来,
+  本功能在 PR #824 之后从未端到端可用。PR0 的处理:**保存时填空整层下线**(`template_vars` 字段 /
+  `ManifestLoader._render` / `ManifestTemplateError` 全删,YAML 直接解析入库),`{{ }}` 从此只有一个
+  含义 = run 期变量;调试台读 manifest 的壳去掉。单花括号 `{var}` 从来不是变量,已这样写的 agent 要改回
+  `{{ var }}`。
 
 **核心 gap**:现有 Jinja 是「建 agent 期」注入点;本设计新增「run 期」注入点。两者独立。
 

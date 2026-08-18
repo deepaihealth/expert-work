@@ -94,7 +94,6 @@ export async function getAgent(
  *  spec is validated end-to-end (Pydantic + ManifestError) on save. */
 export interface ManifestPayload {
   manifest_yaml: string;
-  template_vars?: Record<string, unknown> | null;
 }
 
 /** PUT /v1/agents/{name}/{version} — in-place spec update. The
