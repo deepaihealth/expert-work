@@ -101,6 +101,9 @@ describe("PlanCard", () => {
     await userEvent.click(screen.getByTestId("plan-save"));
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    // The failure actually surfaces to the user via antd's message holder —
+    // not just "didn't throw" (String(new Error("boom")) => "Error: boom").
+    expect(await screen.findByText(/boom/)).toBeInTheDocument();
     // Edit mode stays open — the draft isn't discarded on failure.
     expect(screen.getByTestId("plan-edit-form")).toBeInTheDocument();
   });
