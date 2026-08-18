@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
@@ -285,5 +285,39 @@ describe("SessionSidebar", () => {
       await screen.findByTestId(`console-session-item-${A.thread_id}`),
     );
     expect(onResume).toHaveBeenCalledWith(A);
+  });
+
+  it("read-only: rename/archive/purge are disabled and inert (no popup, no mutation)", async () => {
+    renderSidebar({ readOnly: true });
+    await screen.findByTestId(`console-session-item-${A.thread_id}`);
+
+    const renameBtn = screen.getByTestId(`console-session-rename-${A.thread_id}`);
+    const archiveBtn = screen.getByTestId(`console-session-archive-${A.thread_id}`);
+    const purgeBtn = screen.getByTestId(`console-session-purge-${A.thread_id}`);
+    expect(renameBtn).toBeDisabled();
+    expect(archiveBtn).toBeDisabled();
+    expect(purgeBtn).toBeDisabled();
+
+    // ``userEvent.click`` correctly *throws* here — the ReadonlyTooltip
+    // wrapper sets ``pointer-events: none`` on an ancestor, and user-event's
+    // realistic pointer simulation refuses to click through that (same as a
+    // real mouse in a real browser; see ../../turn/__tests__/TurnCard.test.tsx,
+    // which only ever *hovers* this wrapper, never clicks the control inside
+    // it). ``fireEvent.click`` bypasses that hit-testing simulation and
+    // dispatches the click straight at the button/Popconfirm's own React
+    // handlers — proving the *application-level* gate (Button's native
+    // ``disabled`` + Popconfirm's own ``disabled`` prop) independently holds,
+    // not just the outer pointer-events cosmetic layer.
+    fireEvent.click(archiveBtn);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(archiveMock).not.toHaveBeenCalled();
+
+    fireEvent.click(purgeBtn);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(purgeMock).not.toHaveBeenCalled();
+
+    fireEvent.click(renameBtn);
+    expect(screen.queryByTestId("console-session-rename-input")).toBeNull();
+    expect(renameMock).not.toHaveBeenCalled();
   });
 });
