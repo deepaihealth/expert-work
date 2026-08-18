@@ -5,11 +5,21 @@
  * Extracted from ``PlaygroundTab.tsx`` (Playground-Uplift D4) — the five
  * ``useState`` groups + ``loadWorkspace`` / ``handleDownloadFile`` /
  * ``handleDownloadArtifact`` / ``handleDeleteFile`` / ``handleDeleteArtifact``
- * + the ``useEffect([running])`` refresh, unified behind one hook. The two
- * separate in-flight trackers (``downloadingPath`` for file downloads,
- * ``busyWorkspaceKey`` for artifact download/delete + file delete) collapse
- * into a single ``busyKey`` per the hook's public contract — at most one
- * workspace mutation is ever in flight at a time, so one tracker is enough.
+ * + the ``useEffect([running])`` refresh, unified behind one hook.
+ *
+ * Fix round 1 (review finding): the original had *two* independent in-flight
+ * trackers (``downloadingPath`` for file downloads only, ``busyWorkspaceKey``
+ * for artifact download/delete + file delete), so a file's own download and
+ * delete buttons never both lit up for the same in-flight action. Collapsing
+ * both into one bare ``busyKey`` (path or ``artifact:<name>``) lost that —
+ * a delete would make the download button spin too (identical key, no way to
+ * tell the actions apart). ``busyKey`` now encodes **which** action is in
+ * flight as a prefix — ``download:<key>`` / ``delete:<key>`` (``<key>`` is
+ * the file path or ``artifact:<name>``, same as before) — so each button's
+ * ``loading`` reads only its own action+key. Whole-panel mutual exclusion
+ * (``busyKey !== null`` disables every other button) is intentional and
+ * unchanged — the controller ruling accepted it (prevents deleting a file
+ * mid-download of that same file).
  */
 import { useCallback, useEffect, useState } from "react";
 
@@ -35,7 +45,8 @@ export interface UseUserWorkspace {
   deleteFile: (path: string) => Promise<void>;
   downloadArtifact: (name: string) => Promise<void>;
   deleteArtifact: (name: string) => Promise<void>;
-  /** The path or `artifact:<name>` currently being downloaded/deleted. */
+  /** ``download:<key>`` / ``delete:<key>`` for the action + path/`artifact:<name>`
+   *  currently in flight, or ``null`` when idle. */
   busyKey: string | null;
 }
 
@@ -76,7 +87,7 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
 
   const downloadFile = useCallback(
     async (path: string) => {
-      setBusyKey(path);
+      setBusyKey(`download:${path}`);
       try {
         await downloadUserWorkspaceFile(path, undefined, concreteTenantScope(apiTenantScope));
       } catch {
@@ -91,7 +102,7 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
 
   const deleteFile = useCallback(
     async (path: string) => {
-      setBusyKey(path);
+      setBusyKey(`delete:${path}`);
       try {
         await deleteUserWorkspaceFile(path);
         await reload();
@@ -106,7 +117,7 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
 
   const downloadArtifact = useCallback(
     async (name: string) => {
-      setBusyKey(`artifact:${name}`);
+      setBusyKey(`download:artifact:${name}`);
       try {
         await downloadArtifactApi(name, undefined, concreteTenantScope(apiTenantScope));
       } catch {
@@ -120,7 +131,7 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
 
   const deleteArtifact = useCallback(
     async (name: string) => {
-      setBusyKey(`artifact:${name}`);
+      setBusyKey(`delete:artifact:${name}`);
       try {
         await deleteArtifactApi(name);
         await reload();

@@ -55,6 +55,16 @@ function jwt(): string {
   return `${header}.${body}.`;
 }
 
+/** An externally-resolvable promise — lets a test hold an SDK call open to
+ *  inspect the in-flight loading/disabled state before letting it resolve. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function renderPanel(props: Partial<WorkspacePanelProps> = {}) {
   setStoredToken(jwt());
   return render(
@@ -222,5 +232,39 @@ describe("WorkspacePanel", () => {
     expect(fileDelete).toBeDisabled();
     expect(artifactDownload).not.toBeDisabled();
     expect(fileDownload).not.toBeDisabled();
+  });
+
+  // Fix round 1 (review finding) — the original PlaygroundTab kept a file's
+  // download spinner (``downloadingPath``) and delete spinner
+  // (``busyWorkspaceKey``) on independent trackers. Collapsing both into one
+  // bare ``busyKey`` made a delete-in-flight ALSO light up the download
+  // button's spinner (and vice versa) for the same file — a misleading
+  // affordance. ``busyKey`` now encodes the action (``download:<key>`` /
+  // ``delete:<key>``), so each button only spins for its own action.
+  it("keeps a file's download and delete spinners independent while one is in flight", async () => {
+    const user = userEvent.setup();
+    getWorkspaceFilesMock.mockResolvedValue([{ path: "report.pdf", size: 2048 }]);
+    const { promise, resolve } = deferred<void>();
+    downloadFileMock.mockReturnValue(promise);
+    renderPanel();
+
+    await screen.findByTestId("playground-workspace-files");
+    const downloadBtn = screen.getByTestId("playground-workspace-file-download");
+    const deleteBtn = screen.getByTestId("playground-workspace-file-delete");
+
+    await user.click(downloadBtn);
+
+    // Download in flight: its own button spins; the SAME file's delete
+    // button is disabled (whole-panel mutual exclusion, per the controller
+    // ruling) but must NOT show a loading spinner of its own.
+    await waitFor(() => expect(downloadBtn).toHaveClass("ant-btn-loading"));
+    expect(deleteBtn).toBeDisabled();
+    expect(deleteBtn).not.toHaveClass("ant-btn-loading");
+
+    resolve(undefined);
+    await waitFor(() => expect(downloadBtn).not.toHaveClass("ant-btn-loading"));
+    expect(downloadBtn).not.toBeDisabled();
+    expect(deleteBtn).not.toBeDisabled();
+    expect(deleteBtn).not.toHaveClass("ant-btn-loading");
   });
 });

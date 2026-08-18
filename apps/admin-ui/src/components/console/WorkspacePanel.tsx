@@ -135,7 +135,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                   size="small"
                   type="text"
                   icon={<Download size={11} strokeWidth={1.75} />}
-                  loading={busyKey === `artifact:${a.name}`}
+                  loading={busyKey === `download:artifact:${a.name}`}
                   disabled={busyKey !== null}
                   onClick={() => void downloadArtifact(a.name)}
                   aria-label={t("playground.artifact_download", { name: a.name })}
@@ -155,7 +155,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                       type="text"
                       danger
                       icon={<Trash2 size={11} strokeWidth={1.75} />}
-                      loading={busyKey === `artifact:${a.name}`}
+                      loading={busyKey === `delete:artifact:${a.name}`}
                       disabled={busyKey !== null || readOnly}
                       aria-label={t("playground.artifact_delete", { name: a.name })}
                       data-testid="playground-workspace-artifact-delete"
@@ -214,7 +214,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                     size="small"
                     type="text"
                     icon={<Download size={11} strokeWidth={1.75} />}
-                    loading={busyKey === f.path}
+                    loading={busyKey === `download:${f.path}`}
                     disabled={busyKey !== null}
                     onClick={() => void downloadFile(f.path)}
                     aria-label={t("playground.workspace_file_download", { name: f.path })}
@@ -234,7 +234,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                         type="text"
                         danger
                         icon={<Trash2 size={11} strokeWidth={1.75} />}
-                        loading={busyKey === f.path}
+                        loading={busyKey === `delete:${f.path}`}
                         disabled={busyKey !== null || readOnly}
                         aria-label={t("playground.file_delete", { name: f.path })}
                         data-testid="playground-workspace-file-delete"
