@@ -140,7 +140,7 @@ export function EvalEvidencePanel({ skillId, readScope }: EvalEvidencePanelProps
                     width={Math.round(skill * BAR_W)}
                     height={BAR_H}
                     rx={2}
-                    fill="var(--ew-color-brand-500, #06b6d4)"
+                    fill="var(--ew-color-brand-500, #2C56C4)"
                   />
                 </svg>
                 <div style={{ display: "flex", gap: 12 }}>

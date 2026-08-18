@@ -81,13 +81,13 @@ export function LineagePanel({ skillId, readScope }: LineagePanelProps) {
                 <text x={66} y={28} textAnchor="middle" fontSize={11} fill="var(--ew-text-secondary, #aaa)">
                   {source.name.slice(0, 16)}
                 </text>
-                <line x1={131} y1={24} x2={188} y2={24} stroke="var(--ew-color-brand-500, #06b6d4)" strokeWidth={1.5} markerEnd="url(#arrow)" />
+                <line x1={131} y1={24} x2={188} y2={24} stroke="var(--ew-color-brand-500, #2C56C4)" strokeWidth={1.5} markerEnd="url(#arrow)" />
                 <defs>
                   <marker id="arrow" markerWidth={8} markerHeight={8} refX={6} refY={3} orient="auto">
-                    <path d="M0,0 L6,3 L0,6 Z" fill="var(--ew-color-brand-500, #06b6d4)" />
+                    <path d="M0,0 L6,3 L0,6 Z" fill="var(--ew-color-brand-500, #2C56C4)" />
                   </marker>
                 </defs>
-                <rect x={189} y={10} width={130} height={28} rx={4} fill="none" stroke="var(--ew-color-brand-500, #06b6d4)" />
+                <rect x={189} y={10} width={130} height={28} rx={4} fill="none" stroke="var(--ew-color-brand-500, #2C56C4)" />
                 <text x={254} y={28} textAnchor="middle" fontSize={11} fill="var(--ew-text-primary, #eee)">
                   {skillName.slice(0, 16)}
                 </text>

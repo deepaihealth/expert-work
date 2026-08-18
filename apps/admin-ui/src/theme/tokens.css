@@ -33,18 +33,19 @@
   --ew-color-neutral-950:  #0a0b0f;
   --ew-color-neutral-1000: #000000;
 
-  /* Brand cyan(primary brand,12 阶) */
-  --ew-color-brand-50:  #ecfeff;
-  --ew-color-brand-100: #cffafe;
-  --ew-color-brand-200: #a5f3fc;
-  --ew-color-brand-300: #67e8f9;
-  --ew-color-brand-400: #22d3ee;
-  --ew-color-brand-500: #06b6d4; /* primary */
-  --ew-color-brand-600: #0891b2;
-  --ew-color-brand-700: #0e7490;
-  --ew-color-brand-800: #155e75;
-  --ew-color-brand-900: #164e63;
-  --ew-color-brand-950: #0e2e3a;
+  /* Brand ink blue(primary brand,12 阶)—— 2026-08-18 品牌重定:墨青蓝,
+     与对外文档站同一套刻度(docs-site custom.css)。浅色主色 500,深色主色 300。 */
+  --ew-color-brand-50:  #EEF2FB;
+  --ew-color-brand-100: #D9E2F7;
+  --ew-color-brand-200: #B4C4EE;
+  --ew-color-brand-300: #8FA9E6;
+  --ew-color-brand-400: #4E74D2;
+  --ew-color-brand-500: #2C56C4; /* primary */
+  --ew-color-brand-600: #2146A6;
+  --ew-color-brand-700: #1A3785;
+  --ew-color-brand-800: #142A64;
+  --ew-color-brand-900: #0E1D45;
+  --ew-color-brand-950: #08122B;
 
   /* Accent violet(secondary brand,12 阶 — 用于强调 / hover / progress) */
   --ew-color-accent-50:  #faf5ff;
@@ -78,13 +79,14 @@
   --ew-color-danger-700: #b91c1c;
   --ew-color-danger-900: #7f1d1d;
 
-  /* Indigo — 调试台 trace 入口链标记(memory_recall / workspace_ingest /
-     context_gates)专用,跟 brand cyan(llm)、accent violet(tool)都要拉得开。 */
-  --ew-color-indigo-100: #e0e7ff;
-  --ew-color-indigo-300: #a5b4fc;
-  --ew-color-indigo-500: #6366f1;
-  --ew-color-indigo-700: #4338ca;
-  --ew-color-indigo-900: #312e81;
+  /* Teal — 调试台 trace 入口链标记(memory_recall / workspace_ingest /
+     context_gates)专用,跟 brand ink blue(llm)、accent violet(tool)都要拉得开。
+     (品牌换成蓝之前这一档是 indigo,与新品牌撞色,2026-08-18 改 teal。) */
+  --ew-color-teal-100: #CCF3EE;
+  --ew-color-teal-300: #7ADBCF;
+  --ew-color-teal-500: #14B8A6;
+  --ew-color-teal-700: #0F766E;
+  --ew-color-teal-900: #134E4A;
 
   /* Info = brand-500 同色族(避免引入第 5 个色相) */
   --ew-color-info-100: var(--ew-color-brand-100);
@@ -227,8 +229,8 @@ html[data-theme="dark"] {
   --ew-text-tertiary:  var(--ew-color-neutral-500);
   --ew-text-disabled:  var(--ew-color-neutral-700);
   --ew-text-inverse:   var(--ew-color-neutral-900);
-  --ew-text-link:      var(--ew-color-brand-400);
-  --ew-text-link-hover: var(--ew-color-brand-300);
+  --ew-text-link:      var(--ew-color-brand-300);
+  --ew-text-link-hover: var(--ew-color-brand-200);
   /* Semantic text colours — theme-aware; used by the playground debug console
      (StepTimeline / TraceView / TimelineFilterBar). Previously referenced only
      via hex fallbacks, so they did not switch with the theme; now aliased to
@@ -238,13 +240,13 @@ html[data-theme="dark"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-400);
-  /* TraceView's entry-chain span marker (Task 6) — lighter indigo step for
+  /* TraceView's entry-chain span marker (Task 6) — lighter teal step for
      dark backgrounds, same rationale as the block above. */
-  --ew-trace-entry:    var(--ew-color-indigo-300);
+  --ew-trace-entry:    var(--ew-color-teal-300);
 
   --ew-action-primary-bg:       var(--ew-color-brand-500);
   --ew-action-primary-bg-hover: var(--ew-color-brand-400);
-  --ew-action-primary-fg:       var(--ew-color-neutral-950);
+  --ew-action-primary-fg:       var(--ew-color-neutral-0);
 
   --ew-action-secondary-bg:       transparent;
   --ew-action-secondary-bg-hover: var(--ew-surface-hover);
@@ -261,7 +263,7 @@ html[data-theme="dark"] {
   --ew-status-warning-fg:   var(--ew-color-warning-300);
   --ew-status-danger-bg:    rgba(239, 68, 68, 0.12);
   --ew-status-danger-fg:    var(--ew-color-danger-300);
-  --ew-status-info-bg:      rgba(6, 182, 212, 0.12);
+  --ew-status-info-bg:      rgba(44, 86, 196, 0.16);
   --ew-status-info-fg:      var(--ew-color-info-300);
 
   /* dark 下阴影弱化,以 border 替代立体感 */
@@ -300,9 +302,9 @@ html[data-theme="light"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-600);
-  /* TraceView's entry-chain span marker (Task 6) — darker indigo step for
+  /* TraceView's entry-chain span marker (Task 6) — darker teal step for
      light backgrounds, same rationale as the block above. */
-  --ew-trace-entry:    var(--ew-color-indigo-700);
+  --ew-trace-entry:    var(--ew-color-teal-700);
 
   --ew-action-primary-bg:       var(--ew-color-brand-600);
   --ew-action-primary-bg-hover: var(--ew-color-brand-700);

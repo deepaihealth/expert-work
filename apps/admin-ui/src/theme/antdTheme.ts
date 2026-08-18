@@ -10,11 +10,13 @@ import { theme as antdTheme, type ThemeConfig } from "antd";
 // 与 tokens.css 1:1 对齐(brand / accent / semantic)
 export const EXPERT_WORK_COLORS = {
   brand: {
-    50: "#ecfeff",
-    400: "#22d3ee",
-    500: "#06b6d4", // primary
-    600: "#0891b2",
-    700: "#0e7490",
+    50: "#EEF2FB",
+    200: "#B4C4EE",
+    300: "#8FA9E6",
+    400: "#4E74D2",
+    500: "#2C56C4", // primary(ink blue,2026-08-18 品牌重定)
+    600: "#2146A6",
+    700: "#1A3785",
   },
   accent: {
     400: "#c084fc",
@@ -69,8 +71,8 @@ export const darkTheme: ThemeConfig = {
     colorTextSecondary: "#a0a4ae",
     colorTextTertiary: "#74798a",
     colorTextQuaternary: "#5a5f70",
-    colorLink: EXPERT_WORK_COLORS.brand[400],
-    colorLinkHover: EXPERT_WORK_COLORS.brand[400],
+    colorLink: EXPERT_WORK_COLORS.brand[300],
+    colorLinkHover: EXPERT_WORK_COLORS.brand[200],
   },
   components: {
     Layout: {
@@ -109,7 +111,7 @@ export const lightTheme: ThemeConfig = {
   algorithm: antdTheme.defaultAlgorithm,
   token: {
     ...BASE_TOKEN,
-    colorPrimary: EXPERT_WORK_COLORS.brand[600],
+    colorPrimary: EXPERT_WORK_COLORS.brand[500],
     colorBgBase: "#fafbfc",
     colorBgContainer: "#ffffff",
     colorBgElevated: "#ffffff",
@@ -145,7 +147,7 @@ export const lightTheme: ThemeConfig = {
     },
     Tabs: {
       itemSelectedColor: "#161921",
-      inkBarColor: EXPERT_WORK_COLORS.brand[600],
+      inkBarColor: EXPERT_WORK_COLORS.brand[500],
     },
     Button: {
       fontWeight: 500,

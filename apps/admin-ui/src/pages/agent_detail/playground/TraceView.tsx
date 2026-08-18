@@ -53,11 +53,11 @@ const DANGER = "var(--ew-text-danger, #f0616d)";
 const PURPLE = "var(--ew-accent-violet, #b18cff)";
 const MUTED = "var(--ew-text-tertiary)";
 // Entry-chain spans (memory_recall / workspace_ingest / context_gates) get
-// their own indigo tint — distinct from both the llm blue and tool violet
+// their own teal tint — distinct from both the llm (brand blue) and tool violet
 // families so the pre-first-token stretch reads apart from the rest of the
 // waterfall at a glance. Same var + fallback as EntryBreakdown.tsx's bar so
 // the breakdown and the waterfall agree on the colour.
-const ENTRY = "var(--ew-trace-entry, #7c8cff)";
+const ENTRY = "var(--ew-trace-entry, #7ADBCF)";
 // Auxiliary LLM calls render in a muted LLM tint — still the LLM (blue) family
 // so the kind reads at a glance, but dimmed so a background sub-call never
 // competes with the main conversation for attention.

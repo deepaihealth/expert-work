@@ -168,7 +168,7 @@ export function Sidebar() {
           letterSpacing: "-0.02em",
         }}
       >
-        <BrandGlyph size={20} style={{ color: "var(--ew-color-brand-500)" }} />
+        <BrandGlyph size={22} />
         <span>Expert Work</span>
       </div>
       <Menu
