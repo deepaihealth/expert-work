@@ -1,0 +1,50 @@
+/*
+ * ConsoleShell — component-scoped styles for the debug console's
+ * three-column grid (调试台重设计 PR-A Task 13). Colors are `--ew-*`
+ * design tokens end to end (see GanttTimeline.css for the same
+ * convention); the <1200px breakpoint collapses the left column to a
+ * 48px icon rail (the sidebar's real content moves into a Drawer,
+ * ConsoleShell.tsx wires that up — this file only hides/shows the two
+ * candidate renderings).
+ */
+
+.ew-console {
+  display: grid;
+  grid-template-columns: 264px 1fr minmax(400px, 38%);
+  height: calc(100vh - 360px);
+  min-height: 480px;
+  gap: 0;
+}
+
+.ew-console__sidebar,
+.ew-console__main,
+.ew-console__inspect {
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ew-console__sidebar {
+  border-right: 1px solid var(--ew-border-subtle);
+}
+
+.ew-console__inspect {
+  border-left: 1px solid var(--ew-border-subtle);
+}
+
+.ew-console__rail {
+  display: none;
+}
+
+@media (max-width: 1199px) {
+  .ew-console {
+    grid-template-columns: 48px 1fr minmax(360px, 40%);
+  }
+  .ew-console__sidebar > .ew-console__sidebar-body {
+    display: none;
+  }
+  .ew-console__rail {
+    display: flex;
+  }
+}
