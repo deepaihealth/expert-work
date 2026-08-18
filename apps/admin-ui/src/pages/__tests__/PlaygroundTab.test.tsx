@@ -832,9 +832,12 @@ describe("PlaygroundTab", () => {
     await user.click(screen.getByTestId("playground-run"));
     await findInTranscript("second answer");
 
-    // Both turns persist (not wiped) + usage chips render per turn.
+    // Both turns persist (not wiped) + the one-line footer meta (§八.4)
+    // renders per turn with the token total.
     expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
-    expect(screen.getAllByTestId("playground-usage")).toHaveLength(2);
+    const metas = screen.getAllByTestId("console-footer-meta");
+    expect(metas).toHaveLength(2);
+    for (const m of metas) expect(m).toHaveTextContent(/tok/);
     // The thread is reused across turns (multi-turn continuation).
     expect(
       streamRunMock.mock.calls.every(([tid]) => tid === sampleThread.thread_id),
@@ -904,7 +907,10 @@ describe("PlaygroundTab", () => {
     expect(listRateCardsMock).not.toHaveBeenCalled();
   });
 
-  it("shows per-turn cost + step + a run-detail link", async () => {
+  // §八.4 — 脚注一行式:cost lives in the meta tooltip, the run-detail link
+  // moved to the right rail header (asserted via console-inspect-run-link
+  // once Task 6 lands — Task 7 re-adds that assertion here).
+  it("shows per-turn cost (tooltip) + step count in the one-line footer", async () => {
     const user = userEvent.setup();
     const costDetail: AgentDetailResponse = {
       record: {
@@ -977,12 +983,11 @@ describe("PlaygroundTab", () => {
     await user.click(screen.getByTestId("playground-run"));
     await screen.findByTestId("console-turn");
 
-    expect(await screen.findByTestId("playground-turn-cost")).toBeInTheDocument();
-    expect(screen.getByTestId("playground-turn-meta")).toHaveTextContent("2");
-    expect(screen.getByTestId("playground-turn-run-link")).toHaveAttribute(
-      "href",
-      `/runs/${sampleThread.thread_id}/run-77`,
-    );
+    const meta = await screen.findByTestId("console-footer-meta");
+    expect(meta).toHaveTextContent(/2 步|2 steps/);
+    await user.hover(meta);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent(/≈ ¥/);
   });
 
   // R7 — 「已恢复」提示条退役(左栏选中态已表达「你在哪个会话」);这条改钉
