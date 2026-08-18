@@ -1122,6 +1122,118 @@ export interface TranslationKeys {
     inject_date_hint: string;
     dynamic_context_note: string;
   };
+  console: {
+    sidebar_title: string;
+    sidebar_new: string;
+    sidebar_search: string;
+    sidebar_filter_active: string;
+    sidebar_filter_archived: string;
+    sidebar_open: string;
+    sidebar_running_dot: string;
+    thread_id_label: string;
+    turn_count: string;
+    no_turns: string;
+    row_think: string;
+    row_think_live: string;
+    row_plan_update: string;
+    row_plan_create: string;
+    row_memory_recall: string;
+    row_memory_writeback: string;
+    row_reflect_pass: string;
+    row_reflect_revise: string;
+    row_subagent: string;
+    row_tool_pending: string;
+    row_tool_error: string;
+    row_expand: string;
+    row_collapse: string;
+    row_inspect: string;
+    answer_streaming: string;
+    footer_inspect: string;
+    footer_status_running: string;
+    footer_status_done: string;
+    footer_status_error: string;
+    plan_title: string;
+    plan_progress: string;
+    plan_toggle: string;
+    vars_required_missing: string;
+    vars_required_mark: string;
+    composer_hint: string;
+    stats_turns: string;
+    stats_llm_tools: string;
+    stats_ttft: string;
+    stats_tps: string;
+    stats_cache: string;
+    stats_tokens: string;
+    stats_cost: string;
+    stats_partial: string;
+    inspect_trajectory: string;
+    inspect_workspace: string;
+    inspect_turn_header: string;
+    inspect_no_turn: string;
+    traj_kind_user: string;
+    traj_kind_think: string;
+    traj_kind_plan: string;
+    traj_kind_memory: string;
+    traj_kind_tool: string;
+    traj_kind_subagent: string;
+    traj_kind_reflect: string;
+    traj_kind_compaction: string;
+    traj_kind_assistant: string;
+    traj_kind_error: string;
+    traj_kind_retry: string;
+    traj_kind_approval: string;
+    traj_kind_guard: string;
+    traj_kind_gap: string;
+    traj_llm_call: string;
+    traj_status_running: string;
+    traj_status_ok: string;
+    traj_status_error: string;
+    traj_status_warn: string;
+    traj_status_pause: string;
+    lane_input: string;
+    lane_model: string;
+    lane_tools: string;
+    detail_tab_summary: string;
+    detail_tab_payload: string;
+    detail_tab_result: string;
+    detail_tab_timing: string;
+    detail_tab_raw: string;
+    detail_close: string;
+    detail_level: string;
+    detail_level_turn_only: string;
+    detail_status: string;
+    detail_duration: string;
+    detail_model: string;
+    detail_tokens: string;
+    detail_finish_reason: string;
+    detail_tool: string;
+    detail_server: string;
+    detail_steps_total: string;
+    detail_goal: string;
+    detail_count: string;
+    detail_attachments: string;
+    detail_variables: string;
+    detail_chars: string;
+    detail_worker: string;
+    detail_worker_steps: string;
+    detail_need_langfuse: string;
+    detail_no_frames: string;
+    detail_none: string;
+    timing_col_sse: string;
+    timing_col_langfuse: string;
+    timing_row_end: string;
+    timing_row_start: string;
+    timing_row_latency: string;
+    timing_row_model: string;
+    timing_row_tokens: string;
+    timing_row_cost: string;
+    timing_loading: string;
+    timing_not_ready: string;
+    timing_unavailable: string;
+    timing_no_trace: string;
+    timing_mismatch: string;
+    timing_unsupported: string;
+  };
   playground: {
     session_label: string;
     new_session: string;
@@ -4166,6 +4278,118 @@ const en: TranslationKeys = {
       "Writes today's date into the system prompt at build time (on by default, cache-stable per calendar day). When off, the agent doesn't know today's date - only suitable for agents whose behavior doesn't depend on the date.",
     dynamic_context_note:
       "Advanced items like custom reminders (dynamic_context.custom_reminders) need the YAML view.",
+  },
+  console: {
+    sidebar_title: "Sessions",
+    sidebar_new: "New",
+    sidebar_search: "Search sessions…",
+    sidebar_filter_active: "Active",
+    sidebar_filter_archived: "Archived",
+    sidebar_open: "Open session list",
+    sidebar_running_dot: "Running",
+    thread_id_label: "Session",
+    turn_count: "{{n}} turns",
+    no_turns: "No conversation yet — type below, or open a session on the left.",
+    row_think: "Thinking",
+    row_think_live: "Thinking…",
+    row_plan_update: "Plan · updated to {{n}} steps",
+    row_plan_create: "Plan drafted · {{n}} steps",
+    row_memory_recall: "Memory recall · {{n}}",
+    row_memory_writeback: "Memory written · {{n}}",
+    row_reflect_pass: "Reflection · pass",
+    row_reflect_revise: "Reflection · revise",
+    row_subagent: "Sub-agent · {{name}}",
+    row_tool_pending: "running",
+    row_tool_error: "failed",
+    row_expand: "Expand",
+    row_collapse: "Collapse",
+    row_inspect: "Inspect",
+    answer_streaming: "Generating…",
+    footer_inspect: "Inspect",
+    footer_status_running: "Running",
+    footer_status_done: "Done",
+    footer_status_error: "Failed",
+    plan_title: "Tasks",
+    plan_progress: "{{done}} done · {{doing}} in progress · {{todo}} pending",
+    plan_toggle: "Toggle tasks",
+    vars_required_missing: "Required variables missing: {{names}}",
+    vars_required_mark: "required",
+    composer_hint: "Enter to send, Shift+Enter for a new line",
+    stats_turns: "{{turns}} turns · {{steps}} steps",
+    stats_llm_tools: "LLM {{llm}} · tools {{tools}}",
+    stats_ttft: "First token {{v}}",
+    stats_tps: "≈ {{v}} tok/s",
+    stats_cache: "Cache {{v}}%",
+    stats_tokens: "In {{in}} · out {{out}}",
+    stats_cost: "≈ ¥{{v}}",
+    stats_partial: "(loaded turns only)",
+    inspect_trajectory: "Trajectory",
+    inspect_workspace: "Workspace",
+    inspect_turn_header: "Turn {{n}} · {{status}}",
+    inspect_no_turn: "Pick a turn to inspect",
+    traj_kind_user: "USER",
+    traj_kind_think: "THINK",
+    traj_kind_plan: "PLAN",
+    traj_kind_memory: "MEMORY",
+    traj_kind_tool: "TOOL",
+    traj_kind_subagent: "SUBAGENT",
+    traj_kind_reflect: "REFLECT",
+    traj_kind_compaction: "COMPACTION",
+    traj_kind_assistant: "ASSISTANT",
+    traj_kind_error: "ERROR",
+    traj_kind_retry: "RETRY",
+    traj_kind_approval: "APPROVAL",
+    traj_kind_guard: "GUARD",
+    traj_kind_gap: "GAP",
+    traj_llm_call: "LLM call · {{model}}",
+    traj_status_running: "running",
+    traj_status_ok: "done",
+    traj_status_error: "failed",
+    traj_status_warn: "warning",
+    traj_status_pause: "awaiting approval",
+    lane_input: "Input",
+    lane_model: "Model",
+    lane_tools: "Tools",
+    detail_tab_summary: "Summary",
+    detail_tab_payload: "Payload",
+    detail_tab_result: "Result",
+    detail_tab_timing: "Timing",
+    detail_tab_raw: "Raw",
+    detail_close: "Close detail",
+    detail_level: "Turn {{turn}} · step {{step}}",
+    detail_level_turn_only: "Turn {{turn}}",
+    detail_status: "Status",
+    detail_duration: "Duration",
+    detail_model: "Model",
+    detail_tokens: "In {{in}} · out {{out}}",
+    detail_finish_reason: "Finish reason",
+    detail_tool: "Tool",
+    detail_server: "MCP server",
+    detail_steps_total: "Steps",
+    detail_goal: "Goal",
+    detail_count: "Count",
+    detail_attachments: "Attachments",
+    detail_variables: "Variables",
+    detail_chars: "Characters",
+    detail_worker: "Sub-agent",
+    detail_worker_steps: "Sub-agent steps",
+    detail_need_langfuse: "LLM input is only available from the Langfuse trace; no span matched this row yet.",
+    detail_no_frames: "No raw frames for this row.",
+    detail_none: "—",
+    timing_col_sse: "SSE timestamps",
+    timing_col_langfuse: "Langfuse (exact)",
+    timing_row_end: "Ended at",
+    timing_row_start: "Start (from trace start)",
+    timing_row_latency: "Latency",
+    timing_row_model: "Model",
+    timing_row_tokens: "tokens",
+    timing_row_cost: "Cost",
+    timing_loading: "Loading…",
+    timing_not_ready: "Langfuse still ingesting — retrying shortly",
+    timing_unavailable: "Trace unavailable",
+    timing_no_trace: "No trace for this run",
+    timing_mismatch: "Could not align with a span",
+    timing_unsupported: "No span for this row",
   },
   playground: {
     session_label: "Session",
