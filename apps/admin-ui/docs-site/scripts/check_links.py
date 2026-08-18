@@ -5,6 +5,7 @@ AND relative ./x.html#anchor links. Run from the docs-site dir after ``pnpm buil
 
 Exit 1 when any link is dead.
 """
+
 import os
 import re
 import sys
@@ -19,11 +20,15 @@ for root, _, names in os.walk(DIST):
         if not n.endswith(".html"):
             continue
         fp = os.path.join(root, n)
-        html = open(fp, encoding="utf-8").read()
+        with open(fp, encoding="utf-8") as f:
+            html = f.read()
         rel = os.path.relpath(fp, DIST)  # e.g. guide/chat.html
         url = "/docs/" + rel
         pages[url] = {urllib.parse.unquote(i) for i in re.findall(r'\sid="([^"]+)"', html)}
         files[url] = html
+
+if not pages:
+    sys.exit(f"{DIST} 里没有 HTML —— 先在 docs-site 目录下跑 pnpm build")
 
 
 def canon(path: str) -> str:
@@ -35,7 +40,9 @@ def canon(path: str) -> str:
     return normpath(path)
 
 
-SKIP = re.compile(r"^(https?:|mailto:|javascript:)|^/docs/assets/|\.(css|js|woff2?|png|svg|ico|json)$")
+SKIP = re.compile(
+    r"^(https?:|mailto:|javascript:)|^/docs/assets/|\.(css|js|woff2?|png|svg|ico|json)$"
+)
 bad: list[tuple[str, str, str]] = []
 total = 0
 for url, html in files.items():
@@ -43,7 +50,12 @@ for url, html in files.items():
     for href in re.findall(r'href="([^"]*)"', html):
         if SKIP.search(href.split("#")[0]) and not href.startswith("#"):
             continue
-        if not (href.startswith("/docs/") or href.startswith("#") or href.startswith("./") or href.startswith("../")):
+        if not (
+            href.startswith("/docs/")
+            or href.startswith("#")
+            or href.startswith("./")
+            or href.startswith("../")
+        ):
             continue
         total += 1
         path, _, frag = href.partition("#")
