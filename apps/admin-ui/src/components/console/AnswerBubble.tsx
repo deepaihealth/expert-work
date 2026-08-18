@@ -44,20 +44,28 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
   const status = turn.turn.status;
   const segments = summary.segments;
   const hasText = segments.length > 0;
+  // Fix round 1 (Important 1) — the turn's first LLM message has no settled
+  // segment yet (no `updates` frame has landed), so `liveText` alone must be
+  // enough to show the scroll container instead of the generic "running"
+  // placeholder; the placeholder is reserved for running-with-nothing-to-show.
+  const isLiveStreaming = status === "running" && Boolean(liveText);
+  const showAnswerBlock = hasText || isLiveStreaming;
   const answerFullText = segments.map((s) => s.text).join("\n\n");
   const historyNotLoaded = turn.loadState !== "done" && turn.turn.events.length === 0;
 
   const [fullText, setFullText] = useState<FullTextState | null>(null);
 
   // I2 — while streaming, keep the capped answer box pinned to the newest
-  // text (same as TurnCard).
+  // text (same as TurnCard). Fix round 1 (Important 2) — `liveText` is in the
+  // dep array too: a liveText-only update (new characters landing without a
+  // new settled segment) must still re-pin the scroll.
   const answerScrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const node = answerScrollRef.current;
     if (status === "running" && node) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [segments, status]);
+  }, [segments, status, liveText]);
 
   const turnArtifacts = useMemo(
     () => artifactsFromTools(turn.turn.events),
@@ -89,7 +97,7 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
         />
       )}
 
-      {hasText ? (
+      {showAnswerBlock ? (
         <>
           <div
             ref={answerScrollRef}
@@ -117,7 +125,7 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
                 <MarkdownView key={i}>{seg.text}</MarkdownView>
               );
             })}
-            {status === "running" && liveText && (
+            {isLiveStreaming && (
               <Text
                 style={{ whiteSpace: "pre-wrap", fontSize: 13 }}
                 data-testid="console-answer-live"

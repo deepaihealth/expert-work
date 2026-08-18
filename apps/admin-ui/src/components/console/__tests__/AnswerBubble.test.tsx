@@ -119,6 +119,74 @@ describe("AnswerBubble", () => {
     expect(screen.getByTestId("console-answer-live")).toHaveTextContent("streaming now");
   });
 
+  // Important 1 (fix round 1) — the very first LLM message of a running turn
+  // has no settled segment yet (no `updates` frame has landed), so the old
+  // `hasText ? … : status === "running" ? placeholder …` branch discarded
+  // `liveText` entirely and showed only the generic "Running…" placeholder.
+  it("running turn with no settled segments still types out liveText; placeholder only shows without liveText", () => {
+    const turn = makeConsoleTurn({ events: [], status: "running" });
+    const summary = summarizeTurn([]);
+
+    const { rerender } = render(
+      <App>
+        <AnswerBubble turn={turn} summary={summary} liveText="partial" onDownloadArtifact={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("console-answer-live")).toHaveTextContent("partial");
+    expect(screen.queryByText("Running…")).not.toBeInTheDocument();
+
+    rerender(
+      <App>
+        <AnswerBubble turn={turn} summary={summary} onDownloadArtifact={vi.fn()} />
+      </App>,
+    );
+    expect(screen.queryByTestId("console-answer-live")).not.toBeInTheDocument();
+    expect(screen.getByText("Running…")).toBeInTheDocument();
+  });
+
+  // Important 2 (fix round 1) — the scroll-pin effect's dep array was
+  // `[segments, status]`; a liveText-only update (the common case — new
+  // characters land without a new `updates` frame settling) never re-ran it,
+  // so the capped answer box stopped following the newest text mid-stream.
+  it("auto-scrolls to bottom when liveText grows without a new segment landing", () => {
+    const turn = makeConsoleTurn({ events: [], status: "running" });
+    const summary = summarizeTurn([]);
+
+    const { rerender } = render(
+      <App>
+        <AnswerBubble turn={turn} summary={summary} liveText="partial" onDownloadArtifact={vi.fn()} />
+      </App>,
+    );
+    const scrollEl = screen.getByTestId("playground-turn-answer-scroll");
+
+    // jsdom never lays out content, so `scrollHeight` is always 0 — stub both
+    // it and `scrollTop` on the real DOM node so the effect's
+    // `node.scrollTop = node.scrollHeight` assignment is observable.
+    let height = 100;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, "scrollHeight", { configurable: true, get: () => height });
+    Object.defineProperty(scrollEl, "scrollTop", {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (v: number) => {
+        scrollTopValue = v;
+      },
+    });
+
+    height = 250; // the live text grew, pushing the container taller
+    rerender(
+      <App>
+        <AnswerBubble
+          turn={turn}
+          summary={summary}
+          liveText="partial partial partial"
+          onDownloadArtifact={vi.fn()}
+        />
+      </App>,
+    );
+    expect(scrollEl.scrollTop).toBe(250);
+  });
+
   it("history turn not yet loaded: fallback lines + loading spinner; error load: fallback without spinner", () => {
     const summary = summarizeTurn([]);
     const loadingTurn = makeConsoleTurn(
