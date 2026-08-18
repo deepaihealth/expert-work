@@ -1389,6 +1389,10 @@ describe("PlaygroundTab", () => {
       await runTwoTurns(user);
 
       const firstTurn = screen.getAllByTestId("console-turn")[0];
+      // §八.3 — 完成后的过程条默认折叠,先展开才点得到行尾「轨迹」。
+      if (!within(firstTurn).queryByTestId("console-process-steps")) {
+        await user.click(within(firstTurn).getByTestId("console-process-head"));
+      }
       await user.click(within(firstTurn).getByTestId("console-row-inspect"));
 
       expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
@@ -1497,6 +1501,10 @@ describe("PlaygroundTab", () => {
       // the turn block's compact step rows filled in from the replayed events.
       await findInTranscript("replayed answer");
       const turn = await screen.findByTestId("console-turn");
+      // §八.3 — 完成后的过程条默认折叠,展开才看得到紧凑行。
+      if (!within(turn).queryByTestId("console-process-steps")) {
+        await user.click(within(turn).getByTestId("console-process-head"));
+      }
       expect(within(turn).getByTestId("console-row-tool")).toBeInTheDocument();
       expect(
         screen.queryByText(i18n.t("playground.history_loading")),
@@ -1842,6 +1850,10 @@ describe("PlaygroundTab", () => {
       await user.click(screen.getByTestId("playground-run"));
       // Task 19 — the middle column's compact tool row expands straight to
       // the ToolCallCard (no more Gantt row → step head → card chain).
+      // §八.3 — 运行中过程条自动展开,完成后折叠;折叠时先点头部展开。
+      if (!screen.queryByTestId("console-process-steps")) {
+        await user.click(await screen.findByTestId("console-process-head"));
+      }
       await user.click(await screen.findByTestId("console-row-tool"));
       await user.click(await screen.findByTestId("tool-fire-now"));
     }

@@ -127,11 +127,15 @@ const settledEvents: SseEvent[] = [
 ];
 
 describe("TurnBlock", () => {
-  it("① settled turn: user bubble + think row + tool row + answer + footer", () => {
+  it("① settled turn: user bubble + think row + tool row + answer + footer", async () => {
     const turn = makeConsoleTurn(settledEvents, { status: "done" });
     renderTurnBlock(makeBaseProps(turn));
 
     expect(screen.getByText("帮我查一下客户")).toBeInTheDocument();
+    // §八.3 — a settled turn's process strip starts collapsed; the compact
+    // rows only exist once it is opened.
+    expect(screen.queryByTestId("console-row-think")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("console-process-head"));
     expect(screen.getByTestId("console-row-think")).toHaveTextContent("先查客户资料");
     expect(screen.getByTestId("console-row-tool")).toHaveTextContent("query_crm");
     expect(screen.getByText(/已查完,客户共 3 条记录/)).toBeInTheDocument();
@@ -194,7 +198,7 @@ describe("TurnBlock", () => {
     expect(thinkRow).not.toHaveTextContent("第一行");
   });
 
-  it("③\" a settled think row keeps the first line and the settled label (liveText is live-rows-only)", () => {
+  it("③\" a settled think row keeps the first line and the settled label (liveText is live-rows-only)", async () => {
     // Same multi-line reasoning, but landed as an authoritative `updates`
     // frame — a blanket `liveText={row.text}` would flip this one too.
     const events: SseEvent[] = [
@@ -211,6 +215,8 @@ describe("TurnBlock", () => {
     ];
     const turn = makeConsoleTurn(events, { status: "done" });
     renderTurnBlock(makeBaseProps(turn));
+    // §八.3 — settled turn ⇒ collapsed process strip; open it to read the row.
+    await userEvent.click(screen.getByTestId("console-process-head"));
 
     const thinkRow = screen.getByTestId("console-row-think");
     expect(thinkRow).toHaveTextContent("第一行");
@@ -282,6 +288,8 @@ describe("TurnBlock", () => {
     const onSelect = vi.fn();
     renderTurnBlock({ ...makeBaseProps(turn), onInspectRow, onSelect });
 
+    // §八.3 — settled turn ⇒ collapsed process strip; open it to reach the row.
+    await userEvent.click(screen.getByTestId("console-process-head"));
     await userEvent.click(screen.getByTestId("console-row-inspect"));
     expect(onInspectRow).toHaveBeenCalledWith("t1", "tool:0:0");
     expect(onSelect).not.toHaveBeenCalled();

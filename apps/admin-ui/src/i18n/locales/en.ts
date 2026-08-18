@@ -1234,6 +1234,14 @@ export interface TranslationKeys {
     stats_chip_in: string;
     stats_chip_out: string;
     stats_chip_cost: string;
+    process_think: string;
+    process_tools: string;
+    process_other: string;
+    process_failed: string;
+    process_empty: string;
+    process_more: string;
+    process_expand: string;
+    process_collapse: string;
   };
   playground: {
     session_label: string;
@@ -4301,7 +4309,7 @@ const en: TranslationKeys = {
     row_subagent: "Sub-agent · {{name}}",
     row_tool_pending: "running",
     row_tool_error: "failed",
-    row_inspect: "Inspect",
+    row_inspect: "Trajectory",
     footer_inspect: "Inspect",
     footer_status_running: "Running",
     footer_status_done: "Done",
@@ -4392,6 +4400,14 @@ const en: TranslationKeys = {
     stats_chip_in: "In",
     stats_chip_out: "Out",
     stats_chip_cost: "Cost",
+    process_think: "Thinking ×{{n}}",
+    process_tools: "Tools ×{{n}}",
+    process_other: "{{n}} other steps",
+    process_failed: "{{n}} failed",
+    process_empty: "No steps",
+    process_more: "{{n}} more steps…",
+    process_expand: "Expand steps",
+    process_collapse: "Collapse steps",
   },
   playground: {
     session_label: "Session",

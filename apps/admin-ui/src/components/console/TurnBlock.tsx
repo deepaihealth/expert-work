@@ -3,7 +3,8 @@
  * user bubble, its compact step-row list (settled rows from
  * ``compactRowsOf`` plus, for the currently-streaming live turn, the
  * still-unsettled synthetic rows from ``live_rows.ts``'s
- * ``liveSyntheticRows``), the approval gate, the answer bubble, and the
+ * ``liveSyntheticRows``) folded into the ``ProcessStrip`` 过程条 (spec
+ * §八.3), the approval gate, the answer bubble, and the
  * turn's status/metric/action footer. Composes Task 10's leaves
  * (``UserBubble`` / ``CompactRow`` / ``AnswerBubble`` / ``TurnFooter``) plus
  * ``ApprovalGate`` (imported from ``components/turn/TurnCard.tsx`` per the
@@ -24,8 +25,8 @@ import { ReadonlyTooltip } from "../ReadonlyTooltip";
 import { ApprovalGate } from "../turn/TurnCard";
 import type { Turn } from "../turn/types";
 import { AnswerBubble } from "./AnswerBubble";
-import { CompactRow } from "./CompactRow";
 import { liveSyntheticRows, settledStepsOf } from "./live_rows";
+import { ProcessStrip } from "./ProcessStrip";
 import { TurnFooter } from "./TurnFooter";
 import type { ConsoleTurn } from "./types";
 import { UserBubble } from "./UserBubble";
@@ -180,19 +181,14 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         inputs={turn.turn.inputs}
       />
 
-      <div style={{ display: "flex", flexDirection: "column" }}>
-        {rows.map(({ row, liveText: rowLiveText }) => (
-          <CompactRow
-            key={row.id}
-            row={row}
-            expanded={expandedIds.has(row.id)}
-            onToggle={() => toggleRow(row.id)}
-            liveText={rowLiveText}
-            onInspect={() => onInspectRow(turn.key, row.id)}
-            onFireResult={onFireResult}
-          />
-        ))}
-      </div>
+      <ProcessStrip
+        rows={rows}
+        running={turn.turn.status === "running"}
+        expandedRowIds={expandedIds}
+        onToggleRow={toggleRow}
+        onInspectRow={(rowId) => onInspectRow(turn.key, rowId)}
+        onFireResult={onFireResult}
+      />
 
       {!readOnly && approval && threadId && (
         <ReadonlyTooltip on={isTenantSwitched} block>
