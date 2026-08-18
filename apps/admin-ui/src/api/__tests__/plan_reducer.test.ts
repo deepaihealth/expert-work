@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { planFromEvent, reducePlan } from "../plan_reducer";
+import { foldPlan, planFromEvent, reducePlan } from "../plan_reducer";
 import type { SseEvent } from "../sessions";
 
 const PLAN_A = {
@@ -47,5 +47,59 @@ describe("reducePlan", () => {
   });
   it("returns null for a stream with no plan", () => {
     expect(reducePlan([evt("metadata", { run_id: "r" }), evt("end", "ok")])).toBeNull();
+  });
+});
+
+// I2 — the live event array is rebuilt (append-only) on every SSE frame, so a
+// full rescan per frame is O(session). ``foldPlan`` resumes from the previous
+// fold when the prefix is byte-for-byte the same objects, and must stay
+// snapshot-identical to a full ``reducePlan`` — including the id-less
+// `${index}` sourceKey fallback, which is an ABSOLUTE index.
+describe("foldPlan", () => {
+  // Deliberately id-less: sourceKey then falls back to the absolute index, so
+  // an incremental fold that mis-numbered the tail would be caught.
+  const noise = (n: number): SseEvent[] =>
+    Array.from({ length: n }, () => evt("updates", { agent: { messages: [] } }));
+
+  it("scans everything with no previous fold, and matches reducePlan", () => {
+    const events = [...noise(3), evt("plan", PLAN_A), ...noise(2)];
+    const fold = foldPlan(events, null);
+    expect(fold.scanned).toBe(6);
+    expect(fold.snapshot).toEqual({ plan: PLAN_A, sourceKey: "3" });
+    expect(fold.snapshot).toEqual(reducePlan(events));
+  });
+
+  it("scans only the appended tail when the prefix objects are unchanged", () => {
+    const events = [...noise(3), evt("plan", PLAN_A), ...noise(2)];
+    const prev = foldPlan(events, null);
+
+    const appended = [...events, evt("updates", { agent: { messages: [] } })];
+    const carried = foldPlan(appended, prev);
+    expect(carried.scanned).toBe(1);
+    // The carried-over snapshot survives a tail with no plan in it.
+    expect(carried.snapshot).toEqual(reducePlan(appended));
+
+    // A plan frame in the tail lands with its ABSOLUTE index as sourceKey.
+    const withPlan = [...appended, evt("plan", PLAN_B)];
+    const next = foldPlan(withPlan, carried);
+    expect(next.scanned).toBe(1);
+    expect(next.snapshot).toEqual({ plan: PLAN_B, sourceKey: "7" });
+    expect(next.snapshot).toEqual(reducePlan(withPlan));
+  });
+
+  it("re-scans in full when the prefix is not the same objects (rebuild) or the array shrank (reset)", () => {
+    const events = [...noise(3), evt("plan", PLAN_A)];
+    const prev = foldPlan(events, null);
+
+    // Same content, different objects — e.g. a history rebuild.
+    const rebuilt = events.map((e) => ({ ...e }));
+    const reFold = foldPlan(rebuilt, prev);
+    expect(reFold.scanned).toBe(4);
+    expect(reFold.snapshot).toEqual(reducePlan(rebuilt));
+
+    // Shorter array (run reset / thread switch) — nothing to carry over.
+    const cleared = foldPlan([], prev);
+    expect(cleared.scanned).toBe(0);
+    expect(cleared.snapshot).toBeNull();
   });
 });

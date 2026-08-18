@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getThreadPlan, updateThreadPlan, type ThreadPlan } from "../../api/plan";
-import { reducePlan } from "../../api/plan_reducer";
+import { foldPlan, type PlanFold } from "../../api/plan_reducer";
 import type { SseEvent } from "../../api/sessions";
 
 export interface UsePlanCardArgs {
@@ -46,11 +46,16 @@ export function usePlanCard({
   // as "a live snapshot has spoken" so a slow baseline fetch that resolves
   // afterwards knows not to overwrite it.
   const appliedRef = useRef<string | null>(null);
+  // I2 — `liveEvents` 每帧重建,整段重扫就是每帧 O(全会话事件数)。留住上
+  // 一次的折叠点,前缀原样时只扫新追加的尾部(语义与整段 `reducePlan`
+  // 等同,见 plan_reducer.ts 的 foldPlan)。
+  const foldRef = useRef<PlanFold | null>(null);
 
   useEffect(() => {
     setPlan(null);
     setLoaded(false);
     appliedRef.current = null;
+    foldRef.current = null;
     if (threadId === null) return;
     let cancelled = false;
     (async () => {
@@ -72,7 +77,9 @@ export function usePlanCard({
   }, [threadId, fetchPlan]);
 
   useEffect(() => {
-    const s = reducePlan(liveEvents);
+    const fold = foldPlan(liveEvents, foldRef.current);
+    foldRef.current = fold;
+    const s = fold.snapshot;
     if (s !== null && s.sourceKey !== appliedRef.current) {
       appliedRef.current = s.sourceKey;
       setPlan(s.plan);

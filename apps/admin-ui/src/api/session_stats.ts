@@ -65,6 +65,41 @@ function nodeDurations(events: readonly SseEvent[]): { llmMs: number; toolMs: nu
   return { llmMs, toolMs };
 }
 
+/** 一轮已加载事件对总计的贡献 —— 缓存单元(见下面的 WeakMap)。 */
+interface TurnContribution {
+  stepCount: number;
+  llmMs: number;
+  toolMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+// PlaygroundTab 每收一帧就整表重算(consoleTurns 每帧换新引用),而
+// summarizeTurn + nodeDurations 是按整轮事件扫的 —— 不缓存就是每帧
+// O(全会话事件数)。按 events 数组的**引用**缓存:已完成轮的数组引用逐帧
+// 不变(``console_turns.ts`` 原样透传 ``turn.events``)所以命中;流式那轮
+// 每帧是 ``[...tn.events, frame]`` 的新数组(``useRunEngine``),自然未命中
+// 并重算。数组只追加不原地改,所以命中的那份一定还是当初算的那份。
+const CONTRIBUTION_CACHE = new WeakMap<readonly SseEvent[], TurnContribution>();
+
+function contributionOf(events: readonly SseEvent[]): TurnContribution {
+  const cached = CONTRIBUTION_CACHE.get(events);
+  if (cached !== undefined) return cached;
+  const summary = summarizeTurn(events);
+  const { llmMs, toolMs } = nodeDurations(events);
+  const contribution: TurnContribution = {
+    stepCount: summary.stepCount ?? 0,
+    llmMs,
+    toolMs,
+    inputTokens: summary.usage?.inputTokens ?? 0,
+    outputTokens: summary.usage?.outputTokens ?? 0,
+    cacheReadTokens: summary.usage?.cacheReadTokens ?? 0,
+  };
+  CONTRIBUTION_CACHE.set(events, contribution);
+  return contribution;
+}
+
 export function computeSessionStats(
   turns: readonly StatsTurnInput[],
   rate: RateCardRecord | null,
@@ -87,18 +122,14 @@ export function computeSessionStats(
     let turnCacheRead = 0;
 
     if (t.loaded) {
-      const summary = summarizeTurn(t.events);
-      const stepCount = summary.stepCount ?? 0;
-      const { llmMs: lm, toolMs: tm } = nodeDurations(t.events);
-      llmMs += lm;
-      toolMs += tm;
-      steps += stepCount;
-      if (summary.usage) {
-        turnInput = summary.usage.inputTokens;
-        turnOutput = summary.usage.outputTokens;
-        turnCacheRead = summary.usage.cacheReadTokens;
-      }
-      if (stepCount >= 1 || t.status === "running") turnsCount += 1;
+      const c = contributionOf(t.events);
+      llmMs += c.llmMs;
+      toolMs += c.toolMs;
+      steps += c.stepCount;
+      turnInput = c.inputTokens;
+      turnOutput = c.outputTokens;
+      turnCacheRead = c.cacheReadTokens;
+      if (c.stepCount >= 1 || t.status === "running") turnsCount += 1;
     } else {
       if (t.tokens) {
         turnInput = t.tokens.input_tokens;

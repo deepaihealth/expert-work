@@ -39,12 +39,49 @@ export function planFromEvent(evt: SseEvent, index: number): PlanSnapshot | null
   return last === null ? null : { plan: last, sourceKey: key };
 }
 
+/** 一次增量归约的结果,也是下一次的续跑点。 */
+export interface PlanFold {
+  /** 已归约到的事件条数。 */
+  count: number;
+  /** 已归约前缀的最后一个事件对象 —— 「前缀原样没动」的哨兵。 */
+  lastEvent: SseEvent | null;
+  /** 到 `count` 为止的最后一份快照(等同 `reducePlan(events.slice(0, count))`)。 */
+  snapshot: PlanSnapshot | null;
+  /** 本次真正扫过的条数 —— 增量是否生效的可断言证据。 */
+  scanned: number;
+}
+
+/** 增量归约。live 事件数组每帧重建但只追加(`useRunEngine` 的
+ *  `events: [...tn.events, frame]`),所以上一次的前缀对象原样还在 → 只扫
+ *  尾部;前缀对不上(历史重建)或数组变短(重置/换会话)则整段重扫。
+ *
+ *  `planFromEvent` 拿到的始终是**整段的绝对下标**,所以无 id 帧的
+ *  `${index}` 兜底 sourceKey 与整段 `reducePlan` 逐字一致 —— 归约本身是
+ *  「最后非 null 者胜」的左折叠,续跑与整扫同义。 */
+export function foldPlan(
+  events: readonly SseEvent[],
+  prev: PlanFold | null,
+): PlanFold {
+  const resumable =
+    prev !== null &&
+    prev.count > 0 &&
+    events.length >= prev.count &&
+    events[prev.count - 1] === prev.lastEvent;
+  const from = resumable ? prev.count : 0;
+  let last = resumable ? prev.snapshot : null;
+  for (let i = from; i < events.length; i += 1) {
+    const s = planFromEvent(events[i], i);
+    if (s !== null) last = s;
+  }
+  return {
+    count: events.length,
+    lastEvent: events.length > 0 ? events[events.length - 1] : null,
+    snapshot: last,
+    scanned: events.length - from,
+  };
+}
+
 /** 一段帧 → 最后一份计划快照(按数组顺序,最后非 null 者胜);没有 → null。 */
 export function reducePlan(events: readonly SseEvent[]): PlanSnapshot | null {
-  let last: PlanSnapshot | null = null;
-  events.forEach((e, i) => {
-    const s = planFromEvent(e, i);
-    if (s !== null) last = s;
-  });
-  return last;
+  return foldPlan(events, null).snapshot;
 }

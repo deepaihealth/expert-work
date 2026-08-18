@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { computeSessionStats, type StatsTurnInput } from "../session_stats";
 import type { SseEvent } from "../sessions";
+import * as turnSummarySdk from "../turn_summary";
 
 function upd(node: string, channels: Record<string, unknown>): SseEvent {
   return { id: null, event: "updates", data: { [node]: channels }, rawData: "", receivedAt: "" };
@@ -72,5 +73,33 @@ describe("computeSessionStats", () => {
     const s = computeSessionStats([live([aiStep(1, 1, { in: 100, out: 0, cacheRead: 900 })])], rate);
     // (max(0,100-900)*3e6 + 900*3e5 + 0)/1e12 = (0 + 2.7e8)/1e12
     expect(s.costCny).toBeCloseTo(0.00027, 10);
+  });
+
+  // I2 — PlaygroundTab recomputes this over the WHOLE session on every SSE
+  // frame (``consoleTurns`` is a fresh array each frame), so a settled turn
+  // must not be re-summarised every time. The cache is keyed on the events
+  // array identity: a live turn gets a brand-new array per frame (see
+  // ``useRunEngine`` `events: [...tn.events, frame]`) and correctly misses.
+  it("re-uses a turn's contribution when its events array identity is unchanged, and recomputes on a new array", () => {
+    const spy = vi.spyOn(turnSummarySdk, "summarizeTurn");
+    try {
+      const settledEvents = [aiStep(1, 800, { in: 1000, out: 100, cacheRead: 900 }), toolsStep(300)];
+
+      const first = computeSessionStats([live(settledEvents)], null);
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      // Same array reference (a settled turn across frames) → cache hit.
+      const second = computeSessionStats([live(settledEvents)], null);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(second).toEqual(first);
+
+      // A structurally-equal but freshly-allocated array (the streaming turn
+      // every frame) must miss — the cache must not key on content.
+      const third = computeSessionStats([live([...settledEvents])], null);
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(third).toEqual(first);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
