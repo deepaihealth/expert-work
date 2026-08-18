@@ -52,6 +52,15 @@ spec:
       writable: ["/workspace"]
 """
 
+_JINJA_YAML = _VALID_YAML.replace(
+    'template: "you are a reviewer"',
+    'template: "you are {{ persona }}"\n'
+    "    jinja: true\n"
+    "    variables:\n"
+    "      - name: persona\n"
+    "        required: true",
+)
+
 
 @pytest.fixture
 def audit_store() -> InMemoryAuditLogStore:
@@ -136,6 +145,30 @@ async def test_yaml_syntax_error_returns_400(b5_client: AsyncClient) -> None:
     response = await b5_client.post("/v1/agents", json={"manifest_yaml": "this: is: broken"})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "MANIFEST_SYNTAX"
+
+
+@pytest.mark.asyncio
+async def test_post_keeps_jinja_braces_verbatim(b5_client: AsyncClient) -> None:
+    """Jinja 动态 prompt 的 {{ }} 属于 run 期(prompt_render),保存时必须原样入库。
+    控制台保存带 {{ }} 的 prompt 曾一律 400 MANIFEST_TEMPLATE(调试台重设计 PR0 Bug B)。"""
+    response = await b5_client.post("/v1/agents", json={"manifest_yaml": _JINJA_YAML})
+    assert response.status_code == 201, response.text
+    detail = await b5_client.get("/v1/agents/code-reviewer/1.0.0")
+    assert detail.status_code == 200
+    prompt = detail.json()["data"]["record"]["spec"]["spec"]["system_prompt"]
+    assert prompt["template"] == "you are {{ persona }}"
+    assert prompt["jinja"] is True
+    assert [v["name"] for v in prompt["variables"]] == ["persona"]
+
+
+@pytest.mark.asyncio
+async def test_post_rejects_removed_template_vars_field(b5_client: AsyncClient) -> None:
+    """``template_vars`` 已下线;ManifestPayload 是 extra=forbid,带它的请求 422。"""
+    response = await b5_client.post(
+        "/v1/agents",
+        json={"manifest_yaml": _VALID_YAML, "template_vars": {"name": "x"}},
+    )
+    assert response.status_code == 422
 
 
 # ---------------------------------------------------------------------------

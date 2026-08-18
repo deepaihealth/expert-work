@@ -1,35 +1,33 @@
-"""YAML + Jinja2 → :class:`AgentSpec`.
+"""YAML → :class:`AgentSpec`.
 
 Stages:
 
 1. **Size guard** — refuse documents larger than ``max_size_bytes`` (DoS
    protection per STREAM-B-DESIGN § 6).
-2. **Jinja2 render** — substitute caller-supplied template variables.
-   Uses ``StrictUndefined`` so a typo in the manifest surfaces here, not
-   silently as an empty string.
-3. **YAML parse** — ``yaml.safe_load``, never ``yaml.load``.
-4. **Pydantic validation** — :class:`AgentSpec` carries the lint rules
+2. **YAML parse** — ``yaml.safe_load``, never ``yaml.load``.
+3. **Pydantic validation** — :class:`AgentSpec` carries the lint rules
    (network allowlist + fallback-chain cycles) as ``model_validator``\\s.
 
-The loader is **state-free**: every call constructs a fresh Jinja2
-``Environment`` so multi-tenant workers don't leak templates across
-tenants. The cost is negligible compared to the LLM call that follows.
+There is deliberately **no** template-rendering stage: ``{{ … }}`` in a
+manifest is run-time Jinja (``system_prompt.jinja`` + request ``inputs``,
+rendered by :mod:`control_plane.prompt_render`), never a save-time
+substitution. The former save-time ``template_vars`` pass was removed in
+the 2026-08-17 console-redesign PR0 (zero callers; it swallowed every
+``{{ }}`` a jinja agent's prompt legitimately carries).
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
-from jinja2 import StrictUndefined, TemplateError, select_autoescape
+from jinja2 import StrictUndefined, select_autoescape
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
 
 from control_plane.manifest.errors import (
     ManifestSyntaxError,
-    ManifestTemplateError,
     ManifestValidationError,
 )
 from expert_work.protocol import AgentSpec
@@ -39,8 +37,8 @@ DEFAULT_MAX_SIZE_BYTES = 64 * 1024
 
 
 def build_sandboxed_environment() -> SandboxedEnvironment:
-    """The one SSTI-safe Jinja2 environment used for all user-supplied
-    templates (manifest load + run-time system_prompt render).
+    """The one SSTI-safe Jinja2 environment used for the run-time
+    ``system_prompt`` render (:mod:`control_plane.prompt_render`).
 
     ``SandboxedEnvironment`` blocks the ``__class__.__mro__`` /
     ``__subclasses__`` introspection chain that turns ordinary Jinja2
@@ -74,46 +72,19 @@ class ManifestLoader:
     def max_size_bytes(self) -> int:
         return self._max_size_bytes
 
-    def load_from_string(
-        self,
-        source: str,
-        *,
-        template_vars: Mapping[str, Any] | None = None,
-    ) -> AgentSpec:
+    def load_from_string(self, source: str) -> AgentSpec:
         encoded = source.encode("utf-8")
         if len(encoded) > self._max_size_bytes:
             msg = f"manifest exceeds size cap {len(encoded)} > {self._max_size_bytes} bytes"
             raise ManifestSyntaxError(msg)
 
-        rendered = self._render(source, template_vars or {})
-        document = self._parse_yaml(rendered)
+        document = self._parse_yaml(source)
         return self._validate(document)
 
-    def load_from_path(
-        self,
-        path: str | Path,
-        *,
-        template_vars: Mapping[str, Any] | None = None,
-    ) -> AgentSpec:
-        return self.load_from_string(
-            Path(path).read_text(encoding="utf-8"),
-            template_vars=template_vars,
-        )
+    def load_from_path(self, path: str | Path) -> AgentSpec:
+        return self.load_from_string(Path(path).read_text(encoding="utf-8"))
 
     # ----- internals --------------------------------------------------
-
-    def _render(self, source: str, vars_: Mapping[str, Any]) -> str:
-        env = build_sandboxed_environment()
-        try:
-            template = env.from_string(source)
-            return template.render(**vars_)
-        except TemplateError as exc:
-            # Deliberately do NOT chain via ``from exc``: the API layer
-            # logs the cause server-side and CodeQL's py/stack-trace-
-            # exposure flags the chained __cause__ as leaking exception
-            # info to the response if it's accessible there.
-            message = f"manifest template render failed: {exc}"
-            raise ManifestTemplateError(message) from None
 
     def _parse_yaml(self, rendered: str) -> dict[str, Any]:
         try:
@@ -153,11 +124,10 @@ class ManifestLoader:
 def load_manifest(
     source: str | Path,
     *,
-    template_vars: Mapping[str, Any] | None = None,
     max_size_bytes: int = DEFAULT_MAX_SIZE_BYTES,
 ) -> AgentSpec:
     """Convenience wrapper for one-off loads (tests, CLI lint)."""
     loader = ManifestLoader(max_size_bytes=max_size_bytes)
     if isinstance(source, Path):
-        return loader.load_from_path(source, template_vars=template_vars)
-    return loader.load_from_string(source, template_vars=template_vars)
+        return loader.load_from_path(source)
+    return loader.load_from_string(source)

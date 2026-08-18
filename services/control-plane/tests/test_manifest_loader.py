@@ -9,16 +9,15 @@ import pytest
 from control_plane.manifest import (
     ManifestLoader,
     ManifestSyntaxError,
-    ManifestTemplateError,
     ManifestValidationError,
     load_manifest,
 )
 
-_MINIMAL_TEMPLATE = """\
+_MINIMAL_YAML = """\
 apiVersion: expert_work.io/v1
 kind: Agent
 metadata:
-  name: "{{ name }}"
+  name: code-reviewer
   version: "1.0.0"
   tenant: platform-eng
 spec:
@@ -39,29 +38,40 @@ spec:
 """
 
 
-def _rendered_minimal() -> str:
-    return _MINIMAL_TEMPLATE.replace("{{ name }}", "code-reviewer")
-
-
 # ---------------------------------------------------------------------------
 # happy paths
 # ---------------------------------------------------------------------------
 
 
 def test_load_minimal_yaml() -> None:
-    spec = load_manifest(_rendered_minimal())
+    spec = load_manifest(_MINIMAL_YAML)
     assert spec.metadata.name == "code-reviewer"
     assert spec.spec.model.provider == "anthropic"
 
 
-def test_template_variable_substituted() -> None:
-    spec = load_manifest(_MINIMAL_TEMPLATE, template_vars={"name": "router-agent"})
-    assert spec.metadata.name == "router-agent"
+def test_double_braces_in_system_prompt_survive_verbatim() -> None:
+    """Jinja 动态 prompt 的 {{ }} 是 run 期语义:保存时必须原样入库,不能被当成
+    manifest 变量求值(调试台重设计 PR0 Bug B —— 「保存时填空」整层已拆掉)。"""
+    yaml_text = _MINIMAL_YAML.replace(
+        'template: "you are a reviewer"',
+        'template: "you are {{ persona }}"\n    jinja: true\n    variables: [{name: persona}]',
+    )
+    spec = load_manifest(yaml_text)
+    assert spec.spec.system_prompt.template == "you are {{ persona }}"
+    assert spec.spec.system_prompt.jinja is True
+    assert [v.name for v in spec.spec.system_prompt.variables] == ["persona"]
+
+
+def test_double_braces_survive_even_when_jinja_is_off() -> None:
+    """jinja 关着时 {{ }} 也只是普通文本,同样原样入库(以前会 ManifestTemplateError)。"""
+    yaml_text = _MINIMAL_YAML.replace('"you are a reviewer"', '"literal {{ not_a_var }}"')
+    spec = load_manifest(yaml_text)
+    assert spec.spec.system_prompt.template == "literal {{ not_a_var }}"
 
 
 def test_load_from_path(tmp_path: Path) -> None:
     f = tmp_path / "manifest.yaml"
-    f.write_text(_rendered_minimal(), encoding="utf-8")
+    f.write_text(_MINIMAL_YAML, encoding="utf-8")
     spec = load_manifest(f)
     assert spec.metadata.name == "code-reviewer"
 
@@ -79,11 +89,6 @@ def test_size_cap_enforced() -> None:
     assert "size cap" in str(exc_info.value)
 
 
-def test_undefined_template_var_raises() -> None:
-    with pytest.raises(ManifestTemplateError):
-        load_manifest(_MINIMAL_TEMPLATE)
-
-
 def test_broken_yaml_raises_syntax() -> None:
     with pytest.raises(ManifestSyntaxError):
         load_manifest("apiVersion: expert_work.io/v1\nkind: Agent\nthis: is: broken: yaml")
@@ -97,7 +102,7 @@ def test_non_mapping_root_raises_syntax() -> None:
 def test_pydantic_validation_error_surfaces() -> None:
     """Missing required ``kind`` → ManifestValidationError with the
     underlying pydantic errors attached."""
-    broken = _rendered_minimal().replace("kind: Agent\n", "")
+    broken = _MINIMAL_YAML.replace("kind: Agent\n", "")
     with pytest.raises(ManifestValidationError) as exc_info:
         load_manifest(broken)
     assert exc_info.value.errors  # non-empty list of pydantic errors
@@ -105,7 +110,7 @@ def test_pydantic_validation_error_surfaces() -> None:
 
 
 def test_lint_wildcard_allowlist_rejected() -> None:
-    broken = _rendered_minimal().replace(
+    broken = _MINIMAL_YAML.replace(
         'allowlist: ["api.anthropic.com"]',
         'allowlist: ["*"]',
     )
@@ -123,7 +128,7 @@ def test_lint_fallback_cycle_rejected() -> None:
         "    fallback:\n"
         "      - { provider: anthropic, name: claude-sonnet-4-5 }"
     )
-    broken = _rendered_minimal().replace("name: claude-sonnet-4-5", cycle_fragment)
+    broken = _MINIMAL_YAML.replace("name: claude-sonnet-4-5", cycle_fragment)
     with pytest.raises(ManifestValidationError) as exc_info:
         load_manifest(broken)
     assert any("cycle" in str(err["msg"]).lower() for err in exc_info.value.errors)

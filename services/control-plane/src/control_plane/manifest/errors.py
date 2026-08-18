@@ -8,13 +8,7 @@ class ManifestError(Exception):
 
 
 class ManifestSyntaxError(ManifestError):
-    """YAML failed to parse before Jinja2 rendering, or after rendering
-    the rendered document was not valid YAML."""
-
-
-class ManifestTemplateError(ManifestError):
-    """Jinja2 rendering blew up (undefined variable, syntax error,
-    template extension not enabled, ...)."""
+    """YAML failed to parse, or the parsed root is not a mapping."""
 
 
 class ManifestValidationError(ManifestError):
