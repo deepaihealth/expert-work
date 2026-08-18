@@ -147,8 +147,22 @@ test("browse, rename, archive, purge, resume + axe", async ({ page }) => {
     .getByText(/^(active|活跃)$/i)
     .click();
 
+  // §八.1 —— 行内动作必须**键盘**可达:从搜索框起连按 Tab,重命名按钮要能拿到
+  // 焦点。`display:none` 的元素聚焦不了(`:focus-within` 因此永远触发不了),
+  // 所以这条把「隐藏用 opacity、别用 display」钉死。
+  await page.getByTestId("console-session-search").focus();
+  const renameA = page.getByTestId(`console-session-rename-${A_ID}`);
+  const focusedTestId = () =>
+    page.evaluate(() => document.activeElement?.getAttribute("data-testid") ?? null);
+  for (let i = 0; i < 10; i += 1) {
+    if ((await focusedTestId()) === `console-session-rename-${A_ID}`) break;
+    await page.keyboard.press("Tab");
+  }
+  await expect(renameA).toBeFocused();
+
   // Rename → PATCH with the new title. §八.1 —— 行内三个图标从常驻改成 hover
-  // 才浮出来(``display:none`` 起步),所以每次点之前先把指针放到行上。
+  // 才浮出来(``opacity:0`` 起步,键盘聚焦时同样浮出),所以每次点之前先把
+  // 指针放到行上。
   await page.getByTestId(`console-session-item-${A_ID}`).hover();
   await page.getByTestId(`console-session-rename-${A_ID}`).click();
   await page.getByTestId("console-session-rename-input").fill("Renamed thread");

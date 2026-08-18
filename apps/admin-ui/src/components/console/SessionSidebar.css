@@ -26,20 +26,27 @@
   color: var(--ew-text-tertiary);
 }
 
+/* 藏起来用 `opacity` 而不是 `display:none`:`display:none` 的元素**聚焦不了**,
+   `:focus-within` 因此永远触发不了,键盘用户拿不到这三个动作。绝对定位保住
+   「不占标题宽度」。 */
 .ew-session-item__acts {
   position: absolute;
   right: 6px;
   top: 6px;
-  display: none;
+  display: inline-flex;
   gap: 2px;
   padding: 1px 3px;
   border-radius: 6px;
   background: var(--ew-surface-raised);
   border: 1px solid var(--ew-border-default);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-in-out;
 }
 .ew-session-item:hover .ew-session-item__acts,
 .ew-session-item:focus-within .ew-session-item__acts {
-  display: inline-flex;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .ew-session-running-dot {
@@ -64,5 +71,8 @@
 @media (prefers-reduced-motion: reduce) {
   .ew-session-running-dot {
     animation: none;
+  }
+  .ew-session-item__acts {
+    transition: none;
   }
 }
