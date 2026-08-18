@@ -489,6 +489,12 @@ async def run_agent(
     async def _publish_guard(frame: dict[str, Any]) -> None:
         await _publish_frame("guard", frame)
 
+    # 调试台重设计 PR1(spec 2026-08-17 D6)—— 计划快照帧。走 _publish_frame:
+    # 落库、带 seq、可续传,对外流(sse_consumer / _run_event_stream 无过滤转发)
+    # 自动可见。payload 与 protocol Plan 同形,整份快照不是增量。
+    async def _publish_plan(plan: Any) -> None:
+        await _publish_frame(EventType.PLAN.value, plan)
+
     # ``configurable`` was populated in the effective_config literal above.
     effective_config["configurable"][COMPACTION_SINK_KEY] = _publish_compaction
     effective_config["configurable"][TOKEN_SINK_KEY] = _publish_token
@@ -511,7 +517,24 @@ async def run_agent(
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,
         # so we measure from this point to the first ``updates`` chunk.
+        # 调试台重设计 PR1:开跑前那次 checkpoint 读(plan 补发)也算在 TTFT 里 ——
+        # 它在 run 的关键路径上,spec §七 要用本指标量它。
         ttft_started = time.monotonic()
+
+        # 调试台重设计 PR1(D6)—— 冷启动补发:会话已有计划(上一 run 留下 / 空闲时
+        # PUT 改的)就在第一条业务帧之前先发一份快照,第三方打开页面不用等计划变化
+        # 才看得到任务卡。一次 checkpoint 读;读失败只记日志(与 J.8 pause 检查、
+        # L.L7 trajectory 同款降级),绝不影响 run。
+        try:
+            initial_snapshot = await graph.aget_state(effective_config)
+            initial_values = getattr(initial_snapshot, "values", None) or {}
+            initial_plan = _to_jsonable(initial_values.get("plan"))
+        except Exception:
+            logger.warning("run_agent.initial_plan_read_failed run_id=%s", run_id, exc_info=True)
+            initial_plan = None
+        if initial_plan is not None:
+            await _publish_plan(initial_plan)
+
         first_chunk_seen = False
         # Batch 4a — per-superstep wall-clock. Each ``updates`` chunk is one
         # node execution; the gap between successive chunk arrivals is that
@@ -569,6 +592,9 @@ async def run_agent(
                                 if isinstance(node_val, dict):
                                     node_val["_duration_ms"] = duration_ms
                         await _publish_frame(stream_mode, jsonable_chunk)
+                        plan_snapshot = _plan_in_chunk(jsonable_chunk)
+                        if plan_snapshot is not None:
+                            await _publish_plan(plan_snapshot)
                 except Exception as exc:
                     if (
                         retry_attempts >= MAX_RUN_RETRIES
@@ -1491,6 +1517,23 @@ def format_sse(event: str, data: Any, *, event_id: str | None = None) -> bytes:
 # ---------------------------------------------------------------------------
 # Chunk serialisation
 # ---------------------------------------------------------------------------
+
+
+def _plan_in_chunk(chunk: Any) -> Any | None:
+    """一个 ``updates`` chunk(已 ``_to_jsonable``)里最后一个非空 ``plan``。
+
+    调试台重设计 PR1 —— ``tools`` 节点把 ``update_plan`` 写回的快照展进节点值,
+    ``planner`` 节点在自己的通道上带 ``plan``;两者都从这里派生一条顶层 ``plan``
+    帧。一个 chunk 里若多个节点值都带 plan(默认覆盖通道下正常图产生不了),取迭代
+    顺序最后一个,只为有一个确定性的解。
+    """
+    if not isinstance(chunk, dict):
+        return None
+    found: Any | None = None
+    for node_val in chunk.values():
+        if isinstance(node_val, dict) and node_val.get("plan") is not None:
+            found = node_val["plan"]
+    return found
 
 
 def _to_jsonable(value: Any) -> Any:

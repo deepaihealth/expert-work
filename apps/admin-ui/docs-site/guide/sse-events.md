@@ -41,7 +41,7 @@ event: end           ← 流结束,事件里带这次 run 的最终状态
 整条流分三段：
 
 1. 开场——一个 `metadata`，给出这次 run 的两个 id。
-2. 中间——`token` 与 `updates` 交替出现，轮数取决于这次 run 走了几步；其间还可能出现 `worker`、`guard`、`compaction`、`approval`、`retry`、`error`。
+2. 中间——`token` 与 `updates` 交替出现，轮数取决于这次 run 走了几步；其间还可能出现 `plan`、`worker`、`guard`、`compaction`、`approval`、`retry`、`error`。
 3. 收尾——一个 `end`，给出这次 run 的最终状态。
 
 这三段里每次都会出现的只有 `metadata` 和 `end` 两个事件，`end` 的唯一例外是续传被分页截断，见 [3.6 断线重连与续传](#_3-6-断线重连与续传)。其余事件取决于这次 run 实际发生了什么：没有调用工具就没有工具那一步的 `updates`，没有触及限制就没有 `guard`。**客户端不要把「某个事件一定会到达」写进代码。**
@@ -92,7 +92,7 @@ data: {"run_id":"67262572-5470-41a4-800d-592762ec679d","thread_id":"9f2c1a44-6d3
 
 | 类别 | 事件 | 断线后会续传 |
 |---|---|---|
-| 带 `id:` | `metadata`、`updates`、`worker`、`guard`、`compaction`、`approval`、`retry`、`error` | 会 |
+| 带 `id:` | `metadata`、`updates`、`plan`、`worker`、`guard`、`compaction`、`approval`、`retry`、`error` | 会 |
 | 不带 `id:` | `token`、`end`、`gap`、`truncated` | 不会 |
 
 不带 `id:` 的四个事件，各自的原因：
@@ -142,6 +142,7 @@ function seqOf(id) {
 | [`metadata`](#metadata) | run 开始时，一次 | 保存 `run_id` 和会话 id，重连和下一轮对话都要用 |
 | [`token`](#token) | 模型逐字生成时，多次 | 作为打字机预览显示，不作为状态依据 |
 | [`updates`](#updates) | 每个步骤完成时，一次 | 用它重建对话内容与工具调用的显示 |
+| [`plan`](#plan) | Agent 创建或修改计划时；run 开始时会话已有计划也发一次 | 用它整个替换本地保存的计划，渲染任务列表 |
 | [`worker`](#worker) | Agent 委托子任务时，开始 / 每步 / 结束各一次 | 在对应的工具调用下方展示子任务进度 |
 | [`guard`](#guard) | 平台的限制预警或触发时 | 显示「已到上限」的提示，不按错误显示 |
 | [`compaction`](#compaction) | 上下文过长被自动压缩时 | 显示一句「已自动整理历史」的提示 |
@@ -153,12 +154,12 @@ function seqOf(id) {
 | [`truncated`](#truncated) | 续传的一页装不下时 | 用它给出的 `next_seq` 拉下一页，流尚未结束 |
 
 ::: warning 收到不认识的事件名时忽略它
-上表列出的是当前会遇到的 12 个事件，事件名是开放取值，平台后续可能新增。把未知事件写成异常分支的客户端，会在平台新增事件的那一天失败。正确做法是查不到处理函数就跳过这一个事件，继续读流。
+上表列出的是当前会遇到的 13 个事件，事件名是开放取值，平台后续可能新增。把未知事件写成异常分支的客户端，会在平台新增事件的那一天失败。正确做法是查不到处理函数就跳过这一个事件，继续读流。
 :::
 
 ## 3.4 每个事件怎么处理
 
-下面十个小节的顺序与 3.3 的表一致，`gap` 与 `truncated` 放在 3.6。每个小节按同一顺序展开：什么时候发 → `data` 字段 → 示例 → 客户端怎么处理。
+下面十一个小节的顺序与 3.3 的表一致，`gap` 与 `truncated` 放在 3.6。每个小节按同一顺序展开：什么时候发 → `data` 字段 → 示例 → 客户端怎么处理。
 
 `updates` 与 `worker` 两节多几个小节：`updates` 多出「messages 里的两种消息」「工具调用与结果的配对」「工具结果文本的还原」三节，`worker` 的 `data` 随 `kind` 变化，三种 `kind` 各占一节。
 
@@ -171,6 +172,7 @@ const esc = (s) => String(s).replace(/[<&]/g, (c) => (c === "<" ? "&lt;" : "&amp
 // 客户端自己的界面状态,每个示例只使用其中一部分
 const store = {
   runId: null, sessionId: null,
+  plan: null,              // 当前计划,收到 plan 事件整段覆盖
   steps: new Map(),        // 步骤编号 → 这一步的预览文本
   toolCalls: new Map(),    // tool_call_id → 这次工具调用的显示区块
   workers: new Map(),      // worker_id → 这个子任务的事件列表
@@ -525,6 +527,53 @@ function onUpdates(data) {
       }
     }
   }
+}
+```
+
+### plan
+
+#### 什么时候发
+
+Agent 在这次 run 里创建或修改了计划时，服务端通过当前这条连接发一次，内容是修改后的整份计划。另外，run 开始时如果这段会话已经有计划（上一轮对话留下的），服务端会在 `metadata` 之后、第一个步骤之前先发一次，内容是当前这份计划。
+
+计划是会话级的：同一段会话里后续的 run 沿用它并继续修改。是否使用计划由 Agent 自行决定，简单任务通常没有这个事件。
+
+#### data 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `goal` | string | 计划要达成的目标，一句话 |
+| `steps` | array | 有序的步骤列表，每一项的字段见下表 |
+
+`steps` 的每一项：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 步骤标识，同一份计划内唯一 |
+| `description` | string | 这一步做什么 |
+| `status` | string | 执行状态。取值：`pending`（未开始）/ `in_progress`（进行中）/ `completed`（已完成） |
+
+#### 示例
+
+``` [事件流片段]
+id: 1755229384902-9
+event: plan
+data: {"goal":"给客户 C-1024 出一份续约建议","steps":[{"id":"1","description":"查客户档案","status":"completed"},{"id":"2","description":"分析近半年工单","status":"in_progress"},{"id":"3","description":"出建议","status":"pending"}]}
+```
+
+#### 客户端怎么处理
+
+每一条 `plan` 都是完整的计划，不是增量。收到就用它整个替换本地保存的那份，以最新一条为准；不要按 `id` 做合并，也不要把多条事件的 `steps` 拼接。断线续传会把这些事件重新发送，按上面的规则处理天然幂等。
+
+```js [示例代码]
+function onPlan(data) {
+  store.plan = data;                      // 整段覆盖,以最新一条为准
+  const done = data.steps.filter((s) => s.status === "completed").length;
+  $("#plan").innerHTML =
+    `<div class="plan">
+       <div class="plan-title">${esc(data.goal)}(${done}/${data.steps.length})</div>
+       ${data.steps.map((s) => `<div class="step ${s.status}">${esc(s.description)}</div>`).join("")}
+     </div>`;
 }
 ```
 
@@ -1086,8 +1135,8 @@ async function* parseSse(res, readTimeoutMs) {
 
 ```js [接收器骨架]
 const HANDLERS = {                       // 每个处理函数见 3.4
-  metadata: onMetadata, token: onToken, updates: onUpdates, worker: onWorker,
-  guard: onGuard, compaction: onCompaction, approval: onApproval,
+  metadata: onMetadata, token: onToken, updates: onUpdates, plan: onPlan,
+  worker: onWorker, guard: onGuard, compaction: onCompaction, approval: onApproval,
   retry: onRetry, error: onError, gap: onGap,
 };
 

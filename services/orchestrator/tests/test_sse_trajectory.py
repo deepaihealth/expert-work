@@ -127,7 +127,8 @@ async def test_run_agent_records_success_outcome_on_clean_finish() -> None:
     assert len(success_keys) == 1
     assert str(record.thread_id) in success_keys[0]
     # Two reads: the J.8 pause-check + the L.L7 trajectory recorder.
-    assert graph.aget_state_calls == 2
+    # +1: run_agent 开跑前读一次 checkpoint 补发 plan 快照(调试台重设计 PR1)
+    assert graph.aget_state_calls == 3
 
 
 @pytest.mark.asyncio
@@ -159,7 +160,8 @@ async def test_run_agent_manifest_optout_skips_recording() -> None:
 
     assert await store.list_prefix(f"trajectories/{record.tenant_id}/") == []
     # Only the J.8 pause-check read — no trajectory read happened.
-    assert graph.aget_state_calls == 1
+    # +1: run_agent 开跑前读一次 checkpoint 补发 plan 快照(调试台重设计 PR1)
+    assert graph.aget_state_calls == 2
 
 
 @pytest.mark.asyncio
@@ -289,7 +291,8 @@ async def test_run_agent_with_no_recorder_does_not_break() -> None:
     await _drain(bridge, record.run_id)
     # With no recorder the trajectory read is skipped, but the J.8
     # pause-check still consults final state once.
-    assert graph.aget_state_calls == 1
+    # +1: run_agent 开跑前读一次 checkpoint 补发 plan 快照(调试台重设计 PR1)
+    assert graph.aget_state_calls == 2
 
 
 # ---------------------------------------------------------------------------
