@@ -108,6 +108,50 @@ function withStubs(Story: ComponentType) {
         request: {},
       });
     }
+    // Left rail — ``listSessions`` (GET /v1/sessions) vs ``createSession``
+    // (POST /v1/sessions): only the list method returns an ``items`` page.
+    if (url.endsWith("/v1/sessions") && (config.method ?? "get") === "get") {
+      return Promise.resolve({
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                thread_id: "33333333-3333-3333-3333-333333333333",
+                tenant_id: "22222222-2222-2222-2222-222222222222",
+                agent_name: "demo-agent",
+                agent_version: "1.0.0",
+                user_id: null,
+                status: "active",
+                title: "上周的销售复盘",
+                created_by: "u",
+                created_at: "2026-05-24T00:00:00Z",
+                updated_at: "2026-05-25T00:00:00Z",
+              },
+              {
+                thread_id: "44444444-4444-4444-4444-444444444444",
+                tenant_id: "22222222-2222-2222-2222-222222222222",
+                agent_name: "demo-agent",
+                agent_version: "1.0.0",
+                user_id: null,
+                status: "active",
+                title: null,
+                created_by: "u",
+                created_at: "2026-05-20T00:00:00Z",
+                updated_at: "2026-05-20T00:00:00Z",
+              },
+            ],
+            total: 2,
+          },
+          error: null,
+        },
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    }
     if (url.endsWith("/uploads")) {
       return Promise.resolve({
         data: { image_ref: "expert_work://image/demo.png" },
