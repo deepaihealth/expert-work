@@ -1295,6 +1295,8 @@ const zhCN: TranslationKeys = {
     timing_no_trace: "本次运行没有 trace",
     timing_mismatch: "无法与 span 对齐",
     timing_unsupported: "该行没有对应 span",
+    detail_action: "动作",
+    detail_worker_summary: "{{calls}} 次模型调用 · {{duration}}",
   },
   playground: {
     session_label: "会话",

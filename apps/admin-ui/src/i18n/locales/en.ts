@@ -1233,6 +1233,8 @@ export interface TranslationKeys {
     timing_no_trace: string;
     timing_mismatch: string;
     timing_unsupported: string;
+    detail_action: string;
+    detail_worker_summary: string;
   };
   playground: {
     session_label: string;
@@ -4390,6 +4392,8 @@ const en: TranslationKeys = {
     timing_no_trace: "No trace for this run",
     timing_mismatch: "Could not align with a span",
     timing_unsupported: "No span for this row",
+    detail_action: "Action",
+    detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
   },
   playground: {
     session_label: "Session",
