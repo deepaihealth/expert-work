@@ -1596,6 +1596,7 @@ def build_runs_router() -> APIRouter:
         threads: Annotated[object, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         runs: Annotated[RunStore, Depends(_get_run_store)],
+        token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> JSONResponse:
@@ -1605,8 +1606,9 @@ def build_runs_router() -> APIRouter:
         (``GET .../runs/{run_id}/events``) to rebuild a full historical turn.
         Ownership-gated identically to ``get_thread_messages``; a concrete
         ``tenant_id`` lets a system_admin read a foreign tenant's runs.
-        Returns ``run_id`` / ``status`` / ``is_resume`` / ``created_at`` only —
-        the debug payload lives in the per-run event replay, not here.
+        Returns ``run_id`` / ``status`` / ``is_resume`` / ``created_at`` /
+        ``tokens`` only — the debug payload lives in the per-run event
+        replay, not here.
         """
         scope = await ensure_tenant_scope(
             request.state.principal,
@@ -1636,12 +1638,21 @@ def build_runs_router() -> APIRouter:
         # this try — a non-owned thread must still 404, not degrade to empty.
         try:
             rows = await runs.list_by_thread(thread_id=thread_id, tenant_id=target_tenant)
+            # PR-A — per-run token rollup, same source as ``get_run`` (token_usage
+            # joined by trace_id; one batched read for the whole list). Scoped
+            # so RLS applies exactly as in ``get_conversation``.
+            trace_ids = sorted({r.trace_id for r in rows if r.trace_id is not None})
+            async with applied_scope(scope):
+                by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
             out = [
                 {
                     "run_id": str(r.run_id),
                     "status": r.status.value,
                     "is_resume": r.is_resume,
                     "created_at": r.created_at.isoformat(),
+                    "tokens": _tokens_to_dict(
+                        by_trace.get(r.trace_id) if r.trace_id is not None else None
+                    ),
                 }
                 for r in rows
             ]

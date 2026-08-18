@@ -29,8 +29,20 @@ describe("listThreadRuns", () => {
       params: undefined,
     });
     expect(runs).toEqual([
-      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z" },
-      { runId: "r2", status: "paused", isResume: true, createdAt: "2026-01-01T00:01:00Z" },
+      {
+        runId: "r1",
+        status: "success",
+        isResume: false,
+        createdAt: "2026-01-01T00:00:00Z",
+        tokens: null,
+      },
+      {
+        runId: "r2",
+        status: "paused",
+        isResume: true,
+        createdAt: "2026-01-01T00:01:00Z",
+        tokens: null,
+      },
     ]);
   });
 
