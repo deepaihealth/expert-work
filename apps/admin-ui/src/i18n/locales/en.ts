@@ -1144,7 +1144,6 @@ export interface TranslationKeys {
     row_tool_pending: string;
     row_tool_error: string;
     row_inspect: string;
-    footer_inspect: string;
     footer_status_running: string;
     footer_status_done: string;
     footer_status_error: string;
@@ -1231,6 +1230,10 @@ export interface TranslationKeys {
     timing_unsupported: string;
     detail_action: string;
     detail_worker_summary: string;
+    footer_view_trajectory: string;
+    footer_tokens: string;
+    footer_steps: string;
+    footer_export: string;
   };
   playground: {
     session_label: string;
@@ -4299,7 +4302,6 @@ const en: TranslationKeys = {
     row_tool_pending: "running",
     row_tool_error: "failed",
     row_inspect: "Inspect",
-    footer_inspect: "Inspect",
     footer_status_running: "Running",
     footer_status_done: "Done",
     footer_status_error: "Failed",
@@ -4386,14 +4388,17 @@ const en: TranslationKeys = {
     timing_unsupported: "No span for this row",
     detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
+    footer_view_trajectory: "View trajectory",
+    footer_tokens: "{{n}} tok",
+    footer_steps: "{{n}} steps",
+    footer_export: "Export",
   },
   playground: {
     session_label: "Session",
     new_session: "New session",
     session_failed: "Failed to create session",
     thread_id: "thread",
-    input_placeholder:
-      "Type a prompt to send to the agent. The full SSE event stream lands on the right.",
+    input_placeholder: "Type a prompt for the agent…",
     run: "Run",
     running: "Running…",
     stop: "Stop",

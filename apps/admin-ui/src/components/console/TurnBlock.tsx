@@ -223,7 +223,6 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         onExport={onExport}
         exporting={exporting}
         onInspect={() => onSelect(turn.key)}
-        selected={selected}
       />
     </div>
   );
