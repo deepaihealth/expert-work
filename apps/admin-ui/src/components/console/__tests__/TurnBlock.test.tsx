@@ -175,6 +175,49 @@ describe("TurnBlock", () => {
     expect(thinkRows[0]).toHaveTextContent("LIVE STEP2 REASONING");
   });
 
+  it("③' the live think row follows the newest reasoning line (`思考中 · <最新一行>`), not the first", () => {
+    // The synthetic think row's `text` is the whole growing reasoning buffer;
+    // without `liveText` CompactRow falls into the settled branch and pins the
+    // row to line 1 forever. spec §二.1: 思考 · <首行/流式时最新一行>.
+    const events: SseEvent[] = [upd("agent", { step_count: 1, messages: [{ type: "ai", content: "a1" }] })];
+    const turn = makeConsoleTurn(events, { status: "running" });
+    const liveByStep = new Map<number, LiveStep>([
+      [2, liveStep({ reasoning: "第一行\n第二行\n最新一行" })],
+    ]);
+    renderTurnBlock({ ...makeBaseProps(turn), liveByStep });
+
+    const thinkRow = screen.getByTestId("console-row-think");
+    // `console.row_think_live` (zh-CN 思考中 / en Thinking…) — the live label,
+    // not the settled `console.row_think`.
+    expect(thinkRow).toHaveTextContent("Thinking…");
+    expect(thinkRow).toHaveTextContent("最新一行");
+    expect(thinkRow).not.toHaveTextContent("第一行");
+  });
+
+  it("③\" a settled think row keeps the first line and the settled label (liveText is live-rows-only)", () => {
+    // Same multi-line reasoning, but landed as an authoritative `updates`
+    // frame — a blanket `liveText={row.text}` would flip this one too.
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            additional_kwargs: { reasoning_content: "第一行\n第二行\n最新一行" },
+          },
+        ],
+      }),
+    ];
+    const turn = makeConsoleTurn(events, { status: "done" });
+    renderTurnBlock(makeBaseProps(turn));
+
+    const thinkRow = screen.getByTestId("console-row-think");
+    expect(thinkRow).toHaveTextContent("第一行");
+    expect(thinkRow).not.toHaveTextContent("最新一行");
+    expect(thinkRow).not.toHaveTextContent("Thinking…");
+  });
+
   it("④ a pending approval (not read-only) renders the gate; approving calls onDecide(turnId, approval, \"approve\")", async () => {
     const approval: ApprovalItem = {
       id: "ap1",

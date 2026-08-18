@@ -122,8 +122,17 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     () => liveSyntheticRows(events, liveByStep),
     [events, liveByStep],
   );
+  // 合成行的 think `text` 是整段还在增长的 reasoning buffer,要走 CompactRow
+  // 的 `liveText` 分支(标签换成 `console.row_think_live`、取最新一行);已落
+  // `updates` 帧的 settled 行仍取首行,所以只给合成 think 行带 liveText。
   const rows = useMemo(
-    () => [...settledRows, ...syntheticRows],
+    () => [
+      ...settledRows.map((row) => ({ row, liveText: undefined as string | undefined })),
+      ...syntheticRows.map((row) => ({
+        row,
+        liveText: row.kind === "think" ? row.text : undefined,
+      })),
+    ],
     [settledRows, syntheticRows],
   );
 
@@ -172,12 +181,13 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
       />
 
       <div style={{ display: "flex", flexDirection: "column" }}>
-        {rows.map((row) => (
+        {rows.map(({ row, liveText: rowLiveText }) => (
           <CompactRow
             key={row.id}
             row={row}
             expanded={expandedIds.has(row.id)}
             onToggle={() => toggleRow(row.id)}
+            liveText={rowLiveText}
             onInspect={() => onInspectRow(turn.key, row.id)}
             onFireResult={onFireResult}
           />
