@@ -71,12 +71,12 @@
 .ew-lane__block[data-hovered="true"] {
   box-shadow:
     0 0 0 1px var(--ew-surface-base),
-    0 0 0 2px #fff;
+    0 0 0 2px var(--ew-text-primary);
 }
 .ew-lane__block[data-selected="true"] {
   box-shadow:
     0 0 0 1px var(--ew-surface-base),
-    0 0 0 3px #fff;
+    0 0 0 3px var(--ew-text-primary);
 }
 
 .ew-lane__block[data-live="true"] {
