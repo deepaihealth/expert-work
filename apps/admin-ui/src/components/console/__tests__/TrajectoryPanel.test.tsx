@@ -145,6 +145,19 @@ function getToolRow(): HTMLElement {
   return row;
 }
 
+/** The `"user"` row's id is the same literal for every turn (trajectoryRowsOf
+ *  always emits it) — unlike a `tool:…`/`think:…` id, it still exists after
+ *  switching to an unrelated turn, so selecting it before a turn switch
+ *  actually exercises the `useEffect(() => setSelectedRowId(null), [turn?.key])`
+ *  reset (a `tool` row's id would already be absent from the new turn's rows,
+ *  which closes the detail via the plain `rows.find(...) ?? null` derivation
+ *  even if the reset effect were deleted). */
+function getUserRow(): HTMLElement {
+  const row = screen.getAllByTestId("console-traj-row").find((el) => el.dataset.rowId === "user");
+  if (!row) throw new Error("expected the user row in the DOM");
+  return row;
+}
+
 const NO_TRACE: RunTrace = { status: "no_trace" };
 function baseRunDetail(runId: string, traceId: string | null): RunDetail {
   return { run_id: runId, thread_id: THREAD_ID, status: "success", pending_approval: null, trace_id: traceId };
@@ -260,8 +273,18 @@ describe("TrajectoryPanel", () => {
     fireEvent.click(screen.getByTestId("console-detail-close"));
     expect(screen.queryByTestId("console-detail-summary")).not.toBeInTheDocument();
 
-    fireEvent.click(getToolRow());
+    // Select the "user" row (not the tool row) before switching turns — its
+    // id (the literal `"user"`) exists in every turn's rows, so this pins
+    // the `useEffect(() => setSelectedRowId(null), [turn?.key])` reset
+    // itself: a tool/think row's id would already be absent from turn2's
+    // rows, closing the detail via the plain `rows.find(...) ?? null`
+    // derivation even without the reset effect.
+    fireEvent.click(getUserRow());
     expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
+    const selectedBeforeSwitch = screen
+      .getAllByTestId("console-traj-row")
+      .find((el) => el.getAttribute("aria-selected") === "true");
+    expect(selectedBeforeSwitch?.dataset.rowId).toBe("user");
 
     const otherEvents: SseEvent[] = [
       ev("metadata", { run_id: "run-other" }),
@@ -272,6 +295,9 @@ describe("TrajectoryPanel", () => {
     rerenderWith({ turn: turn2 });
 
     await waitFor(() => expect(screen.queryByTestId("console-detail-summary")).not.toBeInTheDocument());
+    expect(
+      screen.getAllByTestId("console-traj-row").some((el) => el.getAttribute("aria-selected") === "true"),
+    ).toBe(false);
   });
 
   it("focusRowId selects that row when it changes", async () => {
