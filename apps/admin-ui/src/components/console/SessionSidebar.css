@@ -4,13 +4,42 @@
  * @media aren't expressible via inline style objects) — same pattern as
  * ../turn/GanttTimeline.css.
  */
-.ew-session-item .ant-list-item-action {
-  opacity: 0;
-  transition: opacity 0.15s ease-in-out;
+.ew-session-item {
+  position: relative;
 }
-.ew-session-item:hover .ant-list-item-action,
-.ew-session-item:focus-within .ant-list-item-action {
-  opacity: 1;
+
+.ew-session-item__title {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 运行点与标题之间留 6px(老版本靠 inline-flex gap,现在标题是块级省略容器)。 */
+.ew-session-item__title .ew-session-running-dot {
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+.ew-session-item__meta {
+  font-size: 11px;
+  color: var(--ew-text-tertiary);
+}
+
+.ew-session-item__acts {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  display: none;
+  gap: 2px;
+  padding: 1px 3px;
+  border-radius: 6px;
+  background: var(--ew-surface-raised);
+  border: 1px solid var(--ew-border-default);
+}
+.ew-session-item:hover .ew-session-item__acts,
+.ew-session-item:focus-within .ew-session-item__acts {
+  display: inline-flex;
 }
 
 .ew-session-running-dot {
