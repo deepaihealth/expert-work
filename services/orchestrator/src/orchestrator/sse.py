@@ -514,6 +514,20 @@ async def run_agent(
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
         await _publish_frame("metadata", metadata_payload)
 
+        # 调试台重设计 PR1(D6)—— 冷启动补发:会话已有计划(上一 run 留下 / 空闲时
+        # PUT 改的)就在第一条业务帧之前先发一份快照,第三方打开页面不用等计划变化
+        # 才看得到任务卡。一次 checkpoint 读;读失败只记日志(与 J.8 pause 检查、
+        # L.L7 trajectory 同款降级),绝不影响 run。
+        try:
+            initial_snapshot = await graph.aget_state(effective_config)
+            initial_values = getattr(initial_snapshot, "values", None) or {}
+            initial_plan = _to_jsonable(initial_values.get("plan"))
+        except Exception:  # noqa: BLE001 — 降级路径,任何读失败都不能拖垮 run
+            logger.warning("run_agent.initial_plan_read_failed run_id=%s", run_id, exc_info=True)
+            initial_plan = None
+        if initial_plan is not None:
+            await _publish_plan(initial_plan)
+
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,
         # so we measure from this point to the first ``updates`` chunk.

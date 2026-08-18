@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from expert_work.protocol import EventType
-from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord
+from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord, RunStatus
 from expert_work.runtime.runs.event_store import InMemoryRunEventStore
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator.sse import run_agent
@@ -183,3 +183,40 @@ async def test_plan_frame_is_persisted_for_replay() -> None:
     assert plan_rows[0].data == _PLAN_V1
     live_seq = int(next(e for e in events if e.event == "plan").id.split("-")[1])
     assert plan_rows[0].seq == live_seq  # 实时 id 与落库 seq 同源
+
+
+@pytest.mark.asyncio
+async def test_existing_plan_is_replayed_right_after_metadata() -> None:
+    """会话已有计划(上一 run 留下 / 空闲时 PUT 改的)→ metadata 之后、第一条业务帧之前
+    先补发一条 plan,第三方冷启动打开页面就能画任务卡。"""
+    graph = _Graph(chunks=[{"agent": {"step_count": 1}}], initial_state={"plan": _PLAN_V1})
+    events, _, _ = await _run(graph)
+    assert [e.event for e in events] == ["metadata", "plan", "updates"]
+    assert events[1].data == _PLAN_V1
+
+
+@pytest.mark.asyncio
+async def test_no_existing_plan_no_extra_frame() -> None:
+    """新会话 / 没用过计划 → 不补发。"""
+    events, _, _ = await _run(_Graph(chunks=[{"agent": {"step_count": 1}}]))
+    assert [e.event for e in events] == ["metadata", "updates"]
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_read_failure_does_not_fail_run() -> None:
+    """checkpoint 读失败只记日志:run 照常跑完,序列与没有计划时一样。"""
+    graph = _Graph(chunks=[{"agent": {"step_count": 1}}], aget_state_raises=True)
+    events, record, rm = await _run(graph)
+    assert [e.event for e in events] == ["metadata", "updates"]
+    assert rm.get(record.run_id).status is RunStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_then_change_gives_two_frames() -> None:
+    """开跑补发 v1,run 里 update_plan 改成 v2 → 两条 plan,依次是 v1、v2。"""
+    graph = _Graph(
+        chunks=[{"agent": {"step_count": 1}}, {"tools": {"plan": _PLAN_V2}}],
+        initial_state={"plan": _PLAN_V1},
+    )
+    events, _, _ = await _run(graph)
+    assert [e.data for e in events if e.event == "plan"] == [_PLAN_V1, _PLAN_V2]
