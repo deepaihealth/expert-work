@@ -9,6 +9,12 @@ function ev(event: string, data: unknown, at = "t"): SseEvent {
 function upd(node: string, channels: Record<string, unknown>, at = "t"): SseEvent {
   return ev("updates", { [node]: channels }, at);
 }
+// Real SSE frame id (`"{server_ms}-{seq}"`, see sse_id.ts) — the `ev`/`upd`
+// helpers above hardcode `id: null`, which makes `serverMsOf` return `null`
+// for every row; this variant is for the serverMs-sourcing test only.
+function wire(event: string, data: unknown, id: string): SseEvent {
+  return { id, event, data, rawData: "", receivedAt: "t" };
+}
 const PLAN = { goal: "出建议", steps: [
   { id: "1", description: "查档案", status: "completed" },
   { id: "2", description: "分析", status: "in_progress" },
@@ -63,11 +69,13 @@ describe("compactRowsOf", () => {
     expect(rows.map((r) => r.kind)).toEqual(["tool"]);
   });
 
-  it("tool statuses map: no result yet→running, error→error; approval marker → pause row", () => {
+  it("tool statuses map: no result yet→running, error→error; approval marker → pause row; a failed tool flips its step's think row to error", () => {
     const rows = compactRowsOf([
-      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", tool_calls: [
-        { id: "a", name: "t1", args: {} }, { id: "b", name: "t2", args: {} },
-      ] }] }),
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "",
+        additional_kwargs: { reasoning_content: "先查 a 再查 b" },
+        tool_calls: [
+          { id: "a", name: "t1", args: {} }, { id: "b", name: "t2", args: {} },
+        ] }] }),
       upd("tools", { messages: [
         { type: "tool", tool_call_id: "b", name: "t2", content: "boom", status: "error" },
       ] }),
@@ -76,6 +84,8 @@ describe("compactRowsOf", () => {
     const tools = rows.filter((r) => r.kind === "tool");
     expect(tools.map((r) => r.status)).toEqual(["running", "error"]);
     expect(rows.at(-1)).toMatchObject({ kind: "approval", status: "pause", text: "等待人工审批", eventIndexes: [2] });
+    const think = rows.find((r) => r.kind === "think");
+    expect(think).toMatchObject({ status: "error" });
   });
 
   it("update_plan call + the tools node's plan snapshot merge into ONE plan row (callId / plannerSeq / both frames)", () => {
@@ -178,6 +188,44 @@ describe("trajectoryRowsOf", () => {
   it("assistant row omitted while answer is null; status follows turnStatus", () => {
     expect(trajectoryRowsOf(EVENTS, INPUT, null, "running").some((r) => r.kind === "assistant")).toBe(false);
     expect(trajectoryRowsOf(EVENTS, INPUT, "x", "error").at(-1)).toMatchObject({ kind: "assistant", status: "error" });
+  });
+
+  it("serverMs: item.serverMs for agent/marker rows, entry.serverMs for tool rows, null for user/assistant/subagent", () => {
+    const rows = trajectoryRowsOf([
+      wire("updates", { agent: { step_count: 1, messages: [{
+        type: "ai", content: "", tool_calls: [{ id: "call-9", name: "spawn_worker", args: { task: "x" } }],
+      }] } }, "1700000000000-1"),
+      wire("worker", {
+        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
+        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "start", wseq: 0,
+        data: { task_excerpt: "x", role: null, max_steps: 8 },
+      }, "1700000000100-2"),
+      wire("updates", { tools: { messages: [
+        { type: "tool", tool_call_id: "call-9", name: "spawn_worker", content: "ok", status: "success" },
+      ] } }, "1700000000400-3"),
+      wire("worker", {
+        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
+        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "end", wseq: 1,
+        data: { outcome: "success", iteration_used: 1, llm_call_count: 1, wall_clock_ms: 42 },
+      }, "1700000000500-4"),
+      wire("approval", { tool_call_id: "call-9" }, "1700000000900-5"),
+    ], INPUT, "done", "done");
+    const user = rows.find((r) => r.kind === "user");
+    const think = rows.find((r) => r.kind === "think");
+    const tool = rows.find((r) => r.kind === "tool");
+    const subagent = rows.find((r) => r.kind === "subagent");
+    const approval = rows.find((r) => r.kind === "approval");
+    const assistant = rows.find((r) => r.kind === "assistant");
+    // think/marker rows take the AgentStep/MarkerItem's own frame's ms.
+    expect(think?.serverMs).toBe(1700000000000);
+    expect(approval?.serverMs).toBe(1700000000900);
+    // the tool row takes the RESULT frame's ms via entry.serverMs, not the
+    // CALL frame's ms (item.serverMs would be 1700000000000, the wrong one).
+    expect(tool?.serverMs).toBe(1700000000400);
+    // no serverMs concept for these kinds.
+    expect(user?.serverMs).toBeNull();
+    expect(assistant?.serverMs).toBeNull();
+    expect(subagent?.serverMs).toBeNull();
   });
 });
 
