@@ -217,10 +217,15 @@ describe("LaneStrip", () => {
   it("selected block gets data-selected", () => {
     const { rerender } = render(<LaneStrip {...props()} />);
     expect(blockOf("think:1").getAttribute("data-selected")).toBeNull();
+    // 块是个开关按钮:选中态对屏幕阅读器只能靠 `aria-pressed`(`data-*` 它读
+    // 不到)。基线版本有这条,v2 重写时丢了。
+    expect(blockOf("think:1")).toHaveAttribute("aria-pressed", "false");
 
     rerender(<LaneStrip {...props({ selectedRowId: "think:1" })} />);
     expect(blockOf("think:1").getAttribute("data-selected")).toBe("true");
+    expect(blockOf("think:1")).toHaveAttribute("aria-pressed", "true");
     expect(blockOf("think:0").getAttribute("data-selected")).toBeNull();
+    expect(blockOf("think:0")).toHaveAttribute("aria-pressed", "false");
   });
 
   it("blocks outside `range` are dimmed", () => {

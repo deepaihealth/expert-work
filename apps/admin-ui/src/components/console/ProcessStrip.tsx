@@ -67,7 +67,6 @@ export function ProcessStrip({
         className="ew-process__head"
         data-testid="console-process-head"
         aria-expanded={isOpen}
-        aria-label={t(isOpen ? "console.process_collapse" : "console.process_expand")}
         onClick={() => setOpen(!isOpen)}
       >
         <span className="ew-process__caret" aria-hidden>

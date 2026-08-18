@@ -1301,8 +1301,6 @@ const zhCN: TranslationKeys = {
     process_failed: "{{n}} 次失败",
     process_empty: "无过程",
     process_more: "还有 {{n}} 步…",
-    process_expand: "展开过程",
-    process_collapse: "收起过程",
     footer_view_trajectory: "查看轨迹",
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} 步",

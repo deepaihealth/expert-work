@@ -1239,8 +1239,6 @@ export interface TranslationKeys {
     process_failed: string;
     process_empty: string;
     process_more: string;
-    process_expand: string;
-    process_collapse: string;
     footer_view_trajectory: string;
     footer_tokens: string;
     footer_steps: string;
@@ -4424,8 +4422,6 @@ const en: TranslationKeys = {
     process_failed: "{{n}} failed",
     process_empty: "No steps",
     process_more: "{{n}} more steps…",
-    process_expand: "Expand steps",
-    process_collapse: "Collapse steps",
     footer_view_trajectory: "View trajectory",
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",

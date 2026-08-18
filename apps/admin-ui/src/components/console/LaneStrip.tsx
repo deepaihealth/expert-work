@@ -215,6 +215,7 @@ export function LaneStrip(props: LaneStripProps): JSX.Element | null {
                       data-hovered={block.rowId === hoveredRowId ? "true" : undefined}
                       data-dimmed={dimmed ? "true" : undefined}
                       aria-label={head}
+                      aria-pressed={block.rowId === selectedRowId}
                       style={{
                         left: `${pct(block.start)}%`,
                         width: `${Math.max(pct(block.end - block.start), MIN_BLOCK_PCT)}%`,

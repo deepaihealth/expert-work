@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
 import type { SpanMatch } from "../../../api/trace_match";
@@ -247,8 +247,12 @@ describe("RowDetail", () => {
     expect(header.textContent).toContain("#4");
     expect(header.textContent).toContain("TOOL");
     // 「第 N 轮」 moved to the panel header (spec §八.8) — the key itself stays
-    // for SummaryTab, but the detail header must not repeat it.
-    expect(header.textContent).not.toContain("Turn 1");
+    // for SummaryTab, but the detail header must not repeat it. 取真实译文,
+    // 别写死英文串:这个文件不钉语言,zh-CN 下「Turn 1」本来就不会出现,断言
+    // 会变成恒真。
+    expect(header.textContent).not.toContain(
+      i18n.t("console.detail_level_turn_only", { turn: 1 }),
+    );
 
     const root = header.parentElement as HTMLElement;
     expect(root.style.padding).toBe("8px 12px");

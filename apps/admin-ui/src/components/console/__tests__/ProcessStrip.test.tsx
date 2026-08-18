@@ -96,6 +96,18 @@ describe("ProcessStrip", () => {
     expect(screen.queryByTestId("console-process-spinner")).not.toBeInTheDocument();
   });
 
+  it("the head button's accessible name is the headline itself — no aria-label masking it", () => {
+    renderStrip(makeProps({ rows: stripRows(compactRowsOf(stepEvents(3))) }));
+
+    // 头部原来挂着 `aria-label="展开过程"`,它把摘要整段盖掉了 —— 屏幕阅读器
+    // 只听得到「展开过程」,听不到「思考 3 次 · 工具 3 次…」。名字必须来自
+    // 可见文本,开合状态交给 `aria-expanded`。
+    const head = screen.getByRole("button", { name: /思考 3 次/ });
+    expect(head).toBe(screen.getByTestId("console-process-head"));
+    expect(head).not.toHaveAttribute("aria-label");
+    expect(head).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("expands automatically while running and shows the last 3 rows + a 'more' button", async () => {
     renderStrip(makeProps({ rows: stripRows(compactRowsOf(stepEvents(4))), running: true }));
 
