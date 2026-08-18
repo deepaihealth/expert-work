@@ -105,7 +105,8 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await expect(page.getByText(/33333333-3333-3333/)).toBeVisible();
 
   await page.getByTestId("playground-input").fill("describe this image");
-  await expectNoA11yViolations(page, "/agents/playground");
+  // 空态(还没跑)的一次扫描 —— 过程条 / 泳道 / 行表 / 详情都还不在 DOM 里。
+  await expectNoA11yViolations(page, "/agents/playground (empty)");
 
   await page.getByTestId("playground-run").click();
   // The turn lands in the transcript and settles as soon as the stub's ``end``
@@ -130,6 +131,10 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
     "href",
     "/runs/33333333-3333-3333-3333-333333333333/44444444-4444-4444-4444-444444444444",
   );
+
+  // 真正扫得到新 UI 的那一次:run 结束 + 点过泳道块之后,过程条、轮次脚注、
+  // 泳道、行表(listbox)、右栏详情全在 DOM 里。空态那次一个新组件都覆盖不到。
+  await expectNoA11yViolations(page, "/agents/playground (after run)");
 
   expect(runBody).toEqual({
     input: "describe this image",

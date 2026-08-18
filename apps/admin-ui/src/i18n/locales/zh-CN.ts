@@ -1322,6 +1322,7 @@ const zhCN: TranslationKeys = {
     traj_filter: "已筛选 #{{a}}–#{{b}}（{{n}} 条）",
     traj_filter_clear: "清除筛选",
     inspect_run_detail: "Run 详情",
+    traj_list_label: "轨迹行",
   },
   playground: {
     session_label: "会话",

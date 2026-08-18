@@ -102,6 +102,20 @@ describe("TrajectoryRows", () => {
     expect(onSelectRow).toHaveBeenCalledWith(rows[2].id);
   });
 
+  it("the listbox has an accessible name and its `li` shells are presentational", () => {
+    const rows = rowsOf();
+    render(<TrajectoryRows {...fullProps({ rows })} />);
+
+    // axe `aria-input-field-name`:listbox 必须有名字。
+    expect(screen.getByRole("listbox", { name: "轨迹行" })).toBe(
+      screen.getByTestId("console-traj-rows"),
+    );
+    // axe `aria-required-children` / `aria-required-parent` / `listitem`:
+    // 行的 `<li>` 只是布局壳,listbox 的直接子节点必须就是 option。
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.getAllByRole("option")).toHaveLength(rows.length);
+  });
+
   it("ArrowDown/ArrowUp move the selection to the neighbouring row", () => {
     const rows = rowsOf();
     render(<Wrapper rows={rows} selectedRowId={rows[1].id} />);

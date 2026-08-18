@@ -1260,6 +1260,7 @@ export interface TranslationKeys {
     traj_filter: string;
     traj_filter_clear: string;
     inspect_run_detail: string;
+    traj_list_label: string;
   };
   playground: {
     session_label: string;
@@ -4444,6 +4445,7 @@ const en: TranslationKeys = {
     traj_filter: "Filtered #{{a}}–#{{b}} ({{n}} rows)",
     traj_filter_clear: "Clear filter",
     inspect_run_detail: "Run detail",
+    traj_list_label: "Trajectory rows",
   },
   playground: {
     session_label: "Session",

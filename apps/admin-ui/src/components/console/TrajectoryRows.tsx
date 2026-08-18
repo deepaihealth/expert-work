@@ -171,6 +171,7 @@ export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
         <ul
           data-testid="console-traj-rows"
           role="listbox"
+          aria-label={t("console.traj_list_label")}
           tabIndex={0}
           className="ew-traj-rows"
           onKeyDown={handleKeyDown}
@@ -179,7 +180,7 @@ export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
             const selected = row.id === selectedRowId;
             const think = row.kind === "think" ? row : null;
             return (
-              <li key={row.id} className="ew-traj-rows__item">
+              <li key={row.id} role="presentation" className="ew-traj-rows__item">
                 <button
                   type="button"
                   ref={selected ? selectedRef : undefined}
