@@ -1,7 +1,9 @@
 /**
  * StatsBar — the debug console's session-level status bar (调试台重设计
- * PR-A Task 12). Pure presentational: renders a ``SessionStats`` (Task 5,
- * ``src/api/session_stats.ts``) as one ``|``-joined line, using the same
+ * PR-A Task 12, revised 调试台 PR-A.1 反馈修订 Task 2 / spec §八.2). Pure
+ * presentational: renders a ``SessionStats`` (Task 5,
+ * ``src/api/session_stats.ts``) as a wrapping row of small
+ * label/value chips — never truncated, no tooltip — using the same
  * ``fmtDuration`` / ``formatCompact`` formatters the rest of the console
  * already standardizes on.
  */
@@ -45,52 +47,46 @@ describe("StatsBar", () => {
     await i18n.changeLanguage(priorLang);
   });
 
-  it("renders every item (admin) with the spec order and a tooltip title", () => {
+  it("renders every chip (admin) in the spec order", () => {
     const s = stats();
     render(<StatsBar stats={s} isSystemAdmin />);
 
     const bar = screen.getByTestId("console-stats-bar");
-    expect(screen.getByTestId("console-stat-turns")).toHaveTextContent(
-      `${s.turns} 轮 · ${s.steps} 步`,
-    );
-    expect(screen.getByTestId("console-stat-durations")).toHaveTextContent(
-      `LLM ${fmtDuration(s.llmMs)} · 工具 ${fmtDuration(s.toolMs)}`,
-    );
+    expect(screen.getByTestId("console-stat-turns")).toHaveTextContent(String(s.turns));
+    expect(screen.getByTestId("console-stat-steps")).toHaveTextContent(String(s.steps));
+    expect(screen.getByTestId("console-stat-llm")).toHaveTextContent(fmtDuration(s.llmMs));
+    expect(screen.getByTestId("console-stat-tools")).toHaveTextContent(fmtDuration(s.toolMs));
     expect(screen.getByTestId("console-stat-ttft")).toHaveTextContent(
-      `首 token ${fmtDuration(s.ttftAvgMs as number)}`,
+      fmtDuration(s.ttftAvgMs as number),
     );
-    expect(screen.getByTestId("console-stat-tps")).toHaveTextContent(
-      `≈ ${s.tokPerSec} tok/s`,
+    expect(screen.getByTestId("console-stat-tps")).toHaveTextContent(`≈ ${s.tokPerSec} tok/s`);
+    expect(screen.getByTestId("console-stat-cache")).toHaveTextContent(`${s.cacheHitPct}%`);
+    expect(screen.getByTestId("console-stat-in")).toHaveTextContent(
+      formatCompact(s.inputTokens),
     );
-    expect(screen.getByTestId("console-stat-cache")).toHaveTextContent(
-      `缓存 ${s.cacheHitPct}%`,
-    );
-    expect(screen.getByTestId("console-stat-tokens")).toHaveTextContent(
-      `入 ${formatCompact(s.inputTokens)} · 出 ${formatCompact(s.outputTokens)}`,
+    expect(screen.getByTestId("console-stat-out")).toHaveTextContent(
+      formatCompact(s.outputTokens),
     );
     expect(screen.getByTestId("console-stat-cost")).toHaveTextContent(
-      `≈ ¥${(s.costCny as number).toFixed(2)}`,
+      `¥${(s.costCny as number).toFixed(2)}`,
     );
 
-    // spec order: turns / durations / ttft / tps / cache / tokens / cost
+    // spec order: turns / steps / llm / tools / ttft / tps / cache / in / out / cost
     const names = Array.from(
       bar.querySelectorAll<HTMLElement>("[data-testid^='console-stat-']"),
     ).map((el) => el.dataset.testid);
     expect(names).toEqual([
       "console-stat-turns",
-      "console-stat-durations",
+      "console-stat-steps",
+      "console-stat-llm",
+      "console-stat-tools",
       "console-stat-ttft",
       "console-stat-tps",
       "console-stat-cache",
-      "console-stat-tokens",
+      "console-stat-in",
+      "console-stat-out",
       "console-stat-cost",
     ]);
-
-    // title = full text tooltip, includes every rendered item
-    expect(bar).toHaveAttribute("title");
-    const title = bar.getAttribute("title") ?? "";
-    expect(title).toContain(`${s.turns} 轮 · ${s.steps} 步`);
-    expect(title).toContain(`≈ ¥${(s.costCny as number).toFixed(2)}`);
   });
 
   it("omits ttft / tps / cache when their inputs are null", () => {
@@ -104,8 +100,9 @@ describe("StatsBar", () => {
     expect(screen.queryByTestId("console-stat-ttft")).not.toBeInTheDocument();
     expect(screen.queryByTestId("console-stat-tps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("console-stat-cache")).not.toBeInTheDocument();
-    // tokens item (never null in SessionStats) still renders
-    expect(screen.getByTestId("console-stat-tokens")).toBeInTheDocument();
+    // in/out chips (never null in SessionStats) still render
+    expect(screen.getByTestId("console-stat-in")).toBeInTheDocument();
+    expect(screen.getByTestId("console-stat-out")).toBeInTheDocument();
   });
 
   it("never renders cost for a non-admin, even when costCny is set", () => {
@@ -137,5 +134,12 @@ describe("StatsBar", () => {
     expect(screen.getByTestId("console-stats-bar")).not.toHaveTextContent(
       "(仅已加载轮)",
     );
+  });
+
+  it("has no title attribute and wraps via flex-wrap, never truncating", () => {
+    render(<StatsBar stats={stats()} isSystemAdmin />);
+    const bar = screen.getByTestId("console-stats-bar");
+    expect(bar).not.toHaveAttribute("title");
+    expect(bar).toHaveStyle({ flexWrap: "wrap" });
   });
 });

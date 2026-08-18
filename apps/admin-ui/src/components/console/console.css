@@ -48,3 +48,21 @@
     display: flex;
   }
 }
+
+.ew-stat-chip {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--ew-text-tertiary);
+  background: var(--ew-surface-raised);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ew-stat-chip__v {
+  color: var(--ew-text-secondary);
+  font-weight: 500;
+}

@@ -1154,13 +1154,6 @@ export interface TranslationKeys {
     vars_required_missing: string;
     vars_required_mark: string;
     composer_hint: string;
-    stats_turns: string;
-    stats_llm_tools: string;
-    stats_ttft: string;
-    stats_tps: string;
-    stats_cache: string;
-    stats_tokens: string;
-    stats_cost: string;
     stats_partial: string;
     inspect_trajectory: string;
     inspect_workspace: string;
@@ -1231,6 +1224,16 @@ export interface TranslationKeys {
     timing_unsupported: string;
     detail_action: string;
     detail_worker_summary: string;
+    stats_chip_turns: string;
+    stats_chip_steps: string;
+    stats_chip_llm: string;
+    stats_chip_tools: string;
+    stats_chip_ttft: string;
+    stats_chip_tps: string;
+    stats_chip_cache: string;
+    stats_chip_in: string;
+    stats_chip_out: string;
+    stats_chip_cost: string;
   };
   playground: {
     session_label: string;
@@ -4309,13 +4312,6 @@ const en: TranslationKeys = {
     vars_required_missing: "Required variables missing: {{names}}",
     vars_required_mark: "required",
     composer_hint: "Enter to send, Shift+Enter for a new line",
-    stats_turns: "{{turns}} turns · {{steps}} steps",
-    stats_llm_tools: "LLM {{llm}} · tools {{tools}}",
-    stats_ttft: "First token {{v}}",
-    stats_tps: "≈ {{v}} tok/s",
-    stats_cache: "Cache {{v}}%",
-    stats_tokens: "In {{in}} · out {{out}}",
-    stats_cost: "≈ ¥{{v}}",
     stats_partial: "(loaded turns only)",
     inspect_trajectory: "Trajectory",
     inspect_workspace: "Workspace",
@@ -4386,6 +4382,16 @@ const en: TranslationKeys = {
     timing_unsupported: "No span for this row",
     detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
+    stats_chip_turns: "Turns",
+    stats_chip_steps: "Steps",
+    stats_chip_llm: "LLM",
+    stats_chip_tools: "Tools",
+    stats_chip_ttft: "First token",
+    stats_chip_tps: "Speed",
+    stats_chip_cache: "Cache hit",
+    stats_chip_in: "In",
+    stats_chip_out: "Out",
+    stats_chip_cost: "Cost",
   },
   playground: {
     session_label: "Session",
