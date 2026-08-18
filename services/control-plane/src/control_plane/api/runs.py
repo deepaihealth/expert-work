@@ -1640,10 +1640,17 @@ def build_runs_router() -> APIRouter:
             rows = await runs.list_by_thread(thread_id=thread_id, tenant_id=target_tenant)
             # PR-A — per-run token rollup, same source as ``get_run`` (token_usage
             # joined by trace_id; one batched read for the whole list). Scoped
-            # so RLS applies exactly as in ``get_conversation``.
+            # so RLS applies exactly as in ``get_conversation``. Isolated in its
+            # own try/except: a token_usage failure must only blank out the
+            # ``tokens`` field, never the run list itself (that's what the
+            # outer except is for — a run-store failure).
             trace_ids = sorted({r.trace_id for r in rows if r.trace_id is not None})
-            async with applied_scope(scope):
-                by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
+            try:
+                async with applied_scope(scope):
+                    by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
+            except Exception:
+                logger.warning("thread_runs.tokens_failed", exc_info=True)
+                by_trace = {}
             out = [
                 {
                     "run_id": str(r.run_id),

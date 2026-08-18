@@ -1513,6 +1513,53 @@ async def test_thread_runs_carry_per_run_tokens(runs_client: AsyncClient) -> Non
 
 
 @pytest.mark.asyncio
+async def test_thread_runs_token_lookup_failure_degrades_tokens_only(
+    runs_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Debug-console redesign PR-A fix round 1 — a ``token_usage`` lookup
+    failure must not empty the whole run list (only the run-store failing
+    should do that, per ``test_thread_runs_store_failure_degrades_to_empty``).
+    The console's history reconstruction pairs message count to run count;
+    silently collapsing to ``[]`` here would wrongly degrade a resumed
+    thread to flat text instead of merely losing the token badge."""
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+
+    thread_id = await _create_session(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    run_id = uuid4()
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+            trace_id="deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+    )
+
+    async def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app.state.token_usage_store, "totals_by_trace_ids", _boom)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert resp.status_code == 200
+    runs = resp.json()["data"]["runs"]
+    assert len(runs) == 1
+    assert runs[0]["run_id"] == str(run_id)
+    assert runs[0]["tokens"] is None
+
+
+@pytest.mark.asyncio
 async def test_thread_runs_foreign_tenant_forbidden(runs_client: AsyncClient) -> None:
     """A plain tenant admin asking for another tenant's runs is rejected by
     the scope gate (only a system_admin may cross) — same as
