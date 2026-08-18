@@ -128,5 +128,7 @@ export function useRunTrace(args: {
     setTrace(null);
   }, []);
 
-  return { trace, loading: enabled && trace === null, refresh, traceId };
+  // `runId === null`(metadata 帧还没到)时上面的 fetch effect 直接返回,
+  // 不加这一项 loading 就永真,Timing tab 一直挂在 `console.timing_loading`。
+  return { trace, loading: enabled && runId !== null && trace === null, refresh, traceId };
 }

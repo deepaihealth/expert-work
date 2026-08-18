@@ -231,4 +231,33 @@ describe("useRunTrace", () => {
     expect(getRunMock).toHaveBeenCalledTimes(2);
     expect(result.current.traceId).toBe("tr-2");
   });
+
+  it("M5 — a null runId is not 'loading': the fetch effect never runs, so the Timing tab must not spin forever", async () => {
+    getRunTraceMock.mockResolvedValue(okEmpty);
+
+    const { result, rerender } = renderHook(
+      (props: { runId: string | null }) =>
+        useRunTrace({
+          threadId: "th-1",
+          runId: props.runId,
+          enabled: true,
+          turnStatus: "running",
+          wantTraceId: false,
+        }),
+      { initialProps: { runId: null as string | null } },
+    );
+
+    await flushMicrotasks();
+    expect(getRunTraceMock).not.toHaveBeenCalled();
+    expect(result.current.trace).toBeNull();
+    expect(result.current.loading).toBe(false);
+
+    // Once the metadata frame lands the run id, loading is true again until
+    // the fetch resolves.
+    rerender({ runId: "r1" });
+    expect(result.current.loading).toBe(true);
+    await flushMicrotasks();
+    expect(result.current.trace).toEqual(okEmpty);
+    expect(result.current.loading).toBe(false);
+  });
 });
