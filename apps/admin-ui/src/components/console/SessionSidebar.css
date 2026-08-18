@@ -15,6 +15,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 运行点与标题之间留 6px(老版本靠 inline-flex gap,现在标题是块级省略容器)。 */
+.ew-session-item__title .ew-session-running-dot {
+  margin-right: 6px;
+  vertical-align: 1px;
+}
 
 .ew-session-item__meta {
   font-size: 11px;
