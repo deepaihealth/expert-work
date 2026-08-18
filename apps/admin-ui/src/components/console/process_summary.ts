@@ -15,6 +15,7 @@ export interface ProcessSummary {
   think: number;
   tools: number;
   other: number;
+  /** 出错的**非 think** 行数(think 行的 error 是从同步的工具继承来的,不另记一次)。 */
   failed: number;
   /** "web_search ×4 · http ×1",按次数降序(同次数按名字);空串表示无工具。 */
   toolBreakdown: string;
@@ -36,7 +37,10 @@ export function summarizeProcess(rows: readonly CompactRow[]): ProcessSummary {
       tools += 1;
       byTool.set(r.entry.toolName, (byTool.get(r.entry.toolName) ?? 0) + 1);
     } else other += 1;
-    if (r.status === "error") failed += 1;
+    // A think row's `error` status is inherited from its step's failing tool
+    // (`trajectory_rows.ts:139` ← `timeline.ts`'s `hasError = tools.some(…)`),
+    // so counting it too would report 「2 次失败」 for one failing call.
+    if (r.status === "error" && r.kind !== "think") failed += 1;
     if (r.durationMs !== null) {
       dur += r.durationMs;
       any = true;

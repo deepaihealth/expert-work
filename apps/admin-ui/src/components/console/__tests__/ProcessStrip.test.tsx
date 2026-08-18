@@ -148,6 +148,43 @@ describe("ProcessStrip", () => {
     expect(onInspectRow).toHaveBeenCalledWith("tool:0:0");
   });
 
+  it("puts the failure count in its own red tail, and omits it when nothing failed", () => {
+    // One step, one failing tool — the think row inherits that error status,
+    // so the tail must still read 「1 次失败」.
+    const failing: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            additional_kwargs: { reasoning_content: "想第 1 步" },
+            tool_calls: [{ id: "c1", name: "http", args: { q: "q1" } }],
+          },
+        ],
+      }),
+      upd("tools", {
+        messages: [
+          { type: "tool", tool_call_id: "c1", name: "http", content: "boom", status: "error" },
+        ],
+      }),
+    ];
+    const { container, unmount } = renderStrip(
+      makeProps({ rows: stripRows(compactRowsOf(failing)) }),
+    );
+    const tail = container.querySelector(".ew-process__failed");
+    expect(tail).not.toBeNull();
+    expect(tail).toHaveTextContent("1 次失败");
+    expect(screen.getByTestId("console-process-head")).toHaveTextContent(
+      "思考 1 次 · 工具 1 次(http ×1) · 1 次失败",
+    );
+    unmount();
+
+    // Same shape, nothing failed → no tail at all.
+    const clean = renderStrip(makeProps());
+    expect(clean.container.querySelector(".ew-process__failed")).toBeNull();
+  });
+
   it("renders nothing for a turn without process rows", () => {
     renderStrip(makeProps({ rows: [] }));
     expect(screen.queryByTestId("console-process-head")).not.toBeInTheDocument();

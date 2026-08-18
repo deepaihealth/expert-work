@@ -100,6 +100,21 @@ describe("summarizeProcess", () => {
     });
   });
 
+  it("counts a step's failing tool once — its think row's inherited error status does not add a second failure", () => {
+    // `parseTimeline` sets an agent item's `hasError` from its tools
+    // (timeline.ts:213), so `trajectory_rows.ts:139` paints this step's think
+    // row red as well. That is one failure the user can point at (the tool),
+    // not two — 「2 次失败」 for a single failing call is a lie.
+    const events: SseEvent[] = [
+      agentStep(1, "先查客户资料", [{ id: "c1", name: "http" }]),
+      toolResults([{ id: "c1", name: "http", ok: false }]),
+    ];
+    const rows = compactRowsOf(events);
+    // Guard the premise: the think row really is `error` here.
+    expect(rows.filter((r) => r.status === "error")).toHaveLength(2);
+    expect(summarizeProcess(rows)).toMatchObject({ think: 1, tools: 1, failed: 1 });
+  });
+
   it("sums row durations treating null as 0, and reports null when no row carries one", () => {
     const events: SseEvent[] = [
       agentStep(1, "想一下", [{ id: "c1", name: "web_search" }], 1000),
