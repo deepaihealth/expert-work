@@ -92,6 +92,12 @@ function nineRowEvents(): SseEvent[] {
   ];
 }
 
+/** 轨道量尺:左 0 / 宽 300px —— 域坐标 = clientX / 300 × total。 */
+const RECT_300 = {
+  x: 0, y: 0, left: 0, top: 0, right: 300, bottom: 14, width: 300, height: 14,
+  toJSON: () => ({}),
+} as DOMRect;
+
 const summaryOf = (row: TrajectoryRow): string => `摘要-${row.id}`;
 
 function props(overrides: Partial<LaneStripProps> = {}): LaneStripProps {
@@ -129,6 +135,10 @@ describe("LaneStrip", () => {
   });
   afterEach(async () => {
     vi.restoreAllMocks();
+    // jsdom 原本就没有这两个方法,`restoreAllMocks` 管不到 defineProperty
+    // 装上去的桩,手动摘掉免得漏给下一条用例。
+    Reflect.deleteProperty(HTMLElement.prototype, "setPointerCapture");
+    Reflect.deleteProperty(HTMLElement.prototype, "releasePointerCapture");
     await i18n.changeLanguage(priorLang);
   });
 
@@ -226,10 +236,7 @@ describe("LaneStrip", () => {
   });
 
   it("drag on the track calls onRangeChange with the row span; a <4px move does not", () => {
-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
-      x: 0, y: 0, left: 0, top: 0, right: 300, bottom: 14, width: 300, height: 14,
-      toJSON: () => ({}),
-    } as DOMRect);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(RECT_300);
 
     const p = props();
     render(<LaneStrip {...p} />);
@@ -259,6 +266,79 @@ describe("LaneStrip", () => {
       .map((b) => b.getAttribute("data-row-id"));
     // 末行 = 还没回结果的工具调用。
     expect(live).toEqual([rows[rows.length - 1].id]);
+  });
+
+  it("a sub-threshold press never captures the pointer, so the block's own click still selects", () => {
+    // 复评 Critical:pointerdown 就 setPointerCapture 会把随后的 pointerup /
+    // click 重定向到捕获容器,真实浏览器里块按钮的 onClick 永远不触发。
+    const captured = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true, writable: true, value: captured,
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(RECT_300);
+
+    const p = props();
+    render(<LaneStrip {...p} />);
+    const block = blockOf("think:0");
+
+    fireEvent.pointerDown(block, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerUp(block, { clientX: 102, pointerId: 1 });
+    fireEvent.click(block);
+
+    expect(captured).not.toHaveBeenCalled();
+    expect(p.onSelectRow).toHaveBeenCalledWith("think:0");
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+  });
+
+  it("a real drag captures the pointer once (on crossing the threshold) and ends with a range", () => {
+    const captured = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true, writable: true, value: captured,
+    });
+    Object.defineProperty(HTMLElement.prototype, "releasePointerCapture", {
+      configurable: true, writable: true, value: vi.fn(),
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(RECT_300);
+
+    const p = props();
+    render(<LaneStrip {...p} />);
+    const track = screen.getByTestId("console-lane-track");
+
+    fireEvent.pointerDown(track, { clientX: 100, pointerId: 1 });
+    expect(captured).not.toHaveBeenCalled();
+    fireEvent.pointerMove(track, { clientX: 150, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 200, pointerId: 1 });
+    expect(captured).toHaveBeenCalledTimes(1);
+    expect(captured).toHaveBeenCalledWith(1);
+    fireEvent.pointerUp(track, { clientX: 200, pointerId: 1 });
+
+    expect(p.onRangeChange).toHaveBeenCalledWith({ from: 4, to: 6 });
+  });
+
+  it("pointercancel mid-drag aborts: no range, no draft mask left behind", () => {
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true, writable: true, value: vi.fn(),
+    });
+    Object.defineProperty(HTMLElement.prototype, "releasePointerCapture", {
+      configurable: true, writable: true, value: vi.fn(),
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(RECT_300);
+
+    const p = props();
+    render(<LaneStrip {...p} />);
+    const track = screen.getByTestId("console-lane-track");
+
+    fireEvent.pointerDown(track, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 200, pointerId: 1 });
+    expect(screen.getByTestId("console-lane-draft")).toBeInTheDocument();
+
+    fireEvent.pointerCancel(track, { clientX: 200, pointerId: 1 });
+    expect(screen.queryByTestId("console-lane-draft")).not.toBeInTheDocument();
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+
+    // 拖选状态已清空 —— 之后单独一次抬起不该补出区间。
+    fireEvent.pointerUp(track, { clientX: 260, pointerId: 1 });
+    expect(p.onRangeChange).not.toHaveBeenCalled();
   });
 
   it("double-click clears the range", () => {

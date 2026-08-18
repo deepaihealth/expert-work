@@ -66,11 +66,17 @@
 .ew-lane__block[data-dimmed="true"] {
   opacity: 0.35;
 }
+/* 描边叠在 1px 底色缝**之外**,不能整条 box-shadow 覆盖掉缝 —— 否则悬停 /
+   选中的块会跟邻块糊在一起。 */
 .ew-lane__block[data-hovered="true"] {
-  box-shadow: 0 0 0 1px #fff;
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 2px #fff;
 }
 .ew-lane__block[data-selected="true"] {
-  box-shadow: 0 0 0 2px #fff;
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 3px #fff;
 }
 
 .ew-lane__block[data-live="true"] {

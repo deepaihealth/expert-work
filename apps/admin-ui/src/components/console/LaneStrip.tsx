@@ -70,7 +70,7 @@ export function LaneStrip(props: LaneStripProps): JSX.Element | null {
 
   // 轨道量尺:与三条泳道的轨道区严格同宽同左,拖选的域坐标由它换算。
   const gaugeRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ x0: number; from: number } | null>(null);
+  const dragRef = useRef<{ x0: number; from: number; captured: boolean } | null>(null);
   const [draft, setDraft] = useState<{ from: number; to: number } | null>(null);
 
   if (rows.length === 0) return null;
@@ -86,24 +86,49 @@ export function LaneStrip(props: LaneStripProps): JSX.Element | null {
     return Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1) * total;
   };
 
+  // 指针捕获**只在真的开始拖(位移过阈值)之后**才拿。按下就捕获的话,后续
+  // pointerup / click 会被重定向到捕获容器上,块按钮的 onClick 在真实浏览器里
+  // 永远不触发(spec §八.7「点击块 = 选中行 + 打开详情」直接失效);jsdom 没有
+  // setPointerCapture,这个坑测试是照不出来的,所以这里靠 spy 断言把它钉住。
   const handlePointerDown = (e: PointerEvent<HTMLDivElement>): void => {
-    dragRef.current = { x0: e.clientX, from: domainAt(e.clientX) };
+    dragRef.current = { x0: e.clientX, from: domainAt(e.clientX), captured: false };
     setDraft(null);
-    e.currentTarget.setPointerCapture?.(e.pointerId);
   };
   const handlePointerMove = (e: PointerEvent<HTMLDivElement>): void => {
     const drag = dragRef.current;
-    if (drag === null || Math.abs(e.clientX - drag.x0) < DRAG_THRESHOLD_PX) return;
+    if (drag === null) return;
+    if (Math.abs(e.clientX - drag.x0) < DRAG_THRESHOLD_PX) {
+      // 还在阈值内 = 仍可能是点击:不捕获、不画草稿(回退到阈值内也要擦掉)。
+      setDraft(null);
+      return;
+    }
+    if (!drag.captured) {
+      dragRef.current = { ...drag, captured: true };
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    }
     setDraft(rangeToRowSpan(projection, drag.from, domainAt(e.clientX)));
   };
-  const handlePointerUp = (e: PointerEvent<HTMLDivElement>): void => {
+  /** 收尾:清拖选状态与草稿遮罩,捕获过才释放。返回收尾前的拖选状态。 */
+  const endDrag = (e: PointerEvent<HTMLDivElement>): { x0: number; from: number; captured: boolean } | null => {
     const drag = dragRef.current;
     dragRef.current = null;
     setDraft(null);
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    if (drag !== null && drag.captured) e.currentTarget.releasePointerCapture?.(e.pointerId);
+    return drag;
+  };
+  const handlePointerUp = (e: PointerEvent<HTMLDivElement>): void => {
+    const drag = endDrag(e);
     // 位移不足阈值 = 点击(块自己的 onClick 已经处理选中),不当拖选。
     if (drag === null || Math.abs(e.clientX - drag.x0) < DRAG_THRESHOLD_PX) return;
     onRangeChange(rangeToRowSpan(projection, drag.from, domainAt(e.clientX)));
+  };
+  const handlePointerCancel = (e: PointerEvent<HTMLDivElement>): void => {
+    endDrag(e);
+  };
+  const handlePointerLeave = (e: PointerEvent<HTMLDivElement>): void => {
+    // 捕获生效时指针离开元素照样送事件到这里,不该中断;没捕获(还在阈值内)
+    // 就等于跟丢了,清掉。
+    if (dragRef.current?.captured !== true) endDrag(e);
   };
 
   /** 行序号闭区间 → 遮罩几何(取区间内所有块的域并集)。 */
@@ -146,6 +171,8 @@ export function LaneStrip(props: LaneStripProps): JSX.Element | null {
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        onPointerLeave={handlePointerLeave}
         onDoubleClick={() => onRangeChange(null)}
       >
         {LANES.map((lane) => (
@@ -206,7 +233,9 @@ export function LaneStrip(props: LaneStripProps): JSX.Element | null {
           {rangeStyle !== null && (
             <div className="ew-lanes__range" data-testid="console-lane-range" style={rangeStyle} />
           )}
-          {draftStyle !== null && <div className="ew-lanes__draft" style={draftStyle} />}
+          {draftStyle !== null && (
+            <div className="ew-lanes__draft" data-testid="console-lane-draft" style={draftStyle} />
+          )}
         </div>
       </div>
       <div className="ew-lanes__ticks">
