@@ -1231,6 +1231,11 @@ export interface TranslationKeys {
     timing_unsupported: string;
     detail_action: string;
     detail_worker_summary: string;
+    lane_user: string;
+    lane_mode_sequence: string;
+    lane_mode_duration: string;
+    lane_tip_hint: string;
+    lane_tip_range: string;
   };
   playground: {
     session_label: string;
@@ -4386,6 +4391,11 @@ const en: TranslationKeys = {
     timing_unsupported: "No span for this row",
     detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
+    lane_user: "User",
+    lane_mode_sequence: "Sequence",
+    lane_mode_duration: "Duration",
+    lane_tip_hint: "Click to select · drag to filter · double-click to reset",
+    lane_tip_range: "{{start}} → {{end}} · {{d}}",
   },
   playground: {
     session_label: "Session",

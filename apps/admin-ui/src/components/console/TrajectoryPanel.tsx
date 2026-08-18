@@ -176,12 +176,21 @@ export function TrajectoryPanel(props: TrajectoryPanelProps): JSX.Element {
         />
       )}
 
+      {/* PR-A.1 Task 5 占位接线 —— `mode` / hover 联动 / 拖选筛选的真正状态由
+          Task 6 在本组件里接;这里先给必填 props 喂中性值,保证类型与既有行为
+          (顺序泳道 + 点击选行)不变。 */}
       <LaneStrip
         events={events}
         rows={rows}
         running={running}
+        mode="sequence"
         selectedRowId={selectedRowId}
+        hoveredRowId={null}
+        onHoverRow={() => {}}
         onSelectRow={setSelectedRowId}
+        range={null}
+        onRangeChange={() => {}}
+        summaryOf={() => ""}
       />
 
       {selectedRow === null ? (

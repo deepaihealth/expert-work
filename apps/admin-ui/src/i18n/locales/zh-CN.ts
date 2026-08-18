@@ -1293,6 +1293,11 @@ const zhCN: TranslationKeys = {
     timing_unsupported: "该行没有对应 span",
     detail_action: "动作",
     detail_worker_summary: "{{calls}} 次模型调用 · {{duration}}",
+    lane_user: "用户",
+    lane_mode_sequence: "顺序",
+    lane_mode_duration: "时长",
+    lane_tip_hint: "点击选中 · 拖选过滤 · 双击复位",
+    lane_tip_range: "{{start}} → {{end}} · {{d}}",
   },
   playground: {
     session_label: "会话",
