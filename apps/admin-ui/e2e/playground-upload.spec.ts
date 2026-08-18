@@ -44,7 +44,17 @@ const THREAD = {
   error: null,
 };
 
-const SSE_BODY = ["event: end", 'data: "ok"', "", ""].join("\n");
+// 一帧 metadata(带 run_id)+ 一帧 end —— run_id 是右栏头部「Run 详情」链接
+// (§八.6)的前提。
+const SSE_BODY = [
+  "event: metadata",
+  'data: {"run_id":"44444444-4444-4444-4444-444444444444"}',
+  "",
+  "event: end",
+  'data: "ok"',
+  "",
+  "",
+].join("\n");
 
 async function login(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/login");
@@ -106,6 +116,19 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await expect(turn.getByText("describe this image")).toBeVisible();
   await expect(turn.getByTestId("console-turn-status")).toHaveText(
     /done|完成/i,
+  );
+
+  // §八.7 —— 泳道块可点:真浏览器里验证「块点击没被横向拖选的指针捕获吃
+  // 掉」(jsdom 没有 pointer capture,只有这里能证)。哪怕这个桩 run 只有一
+  // 帧,USER 行也一定有一个块。
+  const block = page.getByTestId("console-lane-block").first();
+  await expect(block).toBeVisible();
+  await block.click();
+  await expect(page.getByTestId("console-detail-header")).toBeVisible();
+  // §八.6 —— 「查看运行」的新家:右栏头部的 Run 详情链接。
+  await expect(page.getByTestId("console-inspect-run-link")).toHaveAttribute(
+    "href",
+    "/runs/33333333-3333-3333-3333-333333333333/44444444-4444-4444-4444-444444444444",
   );
 
   expect(runBody).toEqual({

@@ -362,6 +362,72 @@ describe("PlaygroundTab", () => {
     expect(screen.queryByTestId("playground-stop")).not.toBeInTheDocument();
   });
 
+  // §八.2 —— 会话级状态栏搬到中栏头部下方一条细行(底部输入区那份取消);
+  // 一轮都没有 / 有轮次但一步都没跑成时整行不渲染(否则留一条空描边行)。
+  it("puts the session stats chips in a row under the main header, not in the composer", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    const frames = (stepCount: number | null) => [
+      {
+        id: "1",
+        event: "metadata",
+        data: { run_id: "r-1" },
+        rawData: "",
+        receivedAt: "2026-05-25T00:00:01Z",
+      },
+      {
+        id: "2",
+        event: "updates",
+        data: {
+          agent: {
+            messages: [{ type: "ai", content: "hi" }],
+            ...(stepCount === null ? {} : { step_count: stepCount }),
+          },
+        },
+        rawData: "",
+        receivedAt: "2026-05-25T00:00:02Z",
+      },
+      {
+        id: "3",
+        event: "end",
+        data: "ok",
+        rawData: "ok",
+        receivedAt: "2026-05-25T00:00:03Z",
+      },
+    ];
+    streamRunMock
+      .mockReturnValueOnce(makeStream(frames(null)))
+      .mockReturnValueOnce(makeStream(frames(1)));
+    renderPg();
+    await screen.findByTestId("playground-input");
+    // 一轮都没有 —— 整条行不渲染。
+    expect(screen.queryByTestId("console-stats-row")).not.toBeInTheDocument();
+
+    // 第一轮没跑出任何一步(computeSessionStats 不计这种轮):有轮块,但状态
+    // 栏仍是 null —— 容器也不能渲染,不然是条空白描边行。
+    await user.type(screen.getByTestId("playground-input"), "hello");
+    await user.click(screen.getByTestId("playground-run"));
+    await screen.findByTestId("console-turn");
+    expect(screen.queryByTestId("console-stats-row")).not.toBeInTheDocument();
+
+    // 第二轮真跑了一步 —— 这条行出现在转录区**之前**(即头部下方);输入区
+    // 在转录区之后,所以这同时钉死了「底部那份没了」。
+    await user.type(screen.getByTestId("playground-input"), "again");
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
+    });
+
+    const row = await screen.findByTestId("console-stats-row");
+    expect(within(row).getByTestId("console-stats-bar")).toBeInTheDocument();
+    expect(within(row).getByTestId("console-stat-turns")).toHaveTextContent("1");
+    expect(
+      row.compareDocumentPosition(screen.getAllByTestId("console-turn")[0]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getAllByTestId("console-stats-bar")).toHaveLength(1);
+  });
+
   it("renders an inline download for an artifact the turn registered", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
@@ -907,9 +973,8 @@ describe("PlaygroundTab", () => {
     expect(listRateCardsMock).not.toHaveBeenCalled();
   });
 
-  // §八.4 — 脚注一行式:cost lives in the meta tooltip, the run-detail link
-  // moved to the right rail header (asserted via console-inspect-run-link
-  // once Task 6 lands — Task 7 re-adds that assertion here).
+  // §八.4 — 脚注一行式:cost lives in the meta tooltip;§八.6 — 「查看运行」
+  // 搬到右栏头部,这里连同断言(console-inspect-run-link)。
   it("shows per-turn cost (tooltip) + step count in the one-line footer", async () => {
     const user = userEvent.setup();
     const costDetail: AgentDetailResponse = {
@@ -988,6 +1053,10 @@ describe("PlaygroundTab", () => {
     await user.hover(meta);
     const tip = await screen.findByRole("tooltip");
     expect(tip).toHaveTextContent(/≈ ¥/);
+
+    // §八.6 — 「查看运行」的新家:右栏头部(默认跟最新一轮)的 Run 详情链接。
+    const runLink = await screen.findByTestId("console-inspect-run-link");
+    expect(runLink).toHaveAttribute("href", `/runs/${sampleThread.thread_id}/run-77`);
   });
 
   // R7 — 「已恢复」提示条退役(左栏选中态已表达「你在哪个会话」);这条改钉
