@@ -10,8 +10,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import i18n from "../../../i18n";
 
-import { TrajectoryRows, type TrajectoryRowsProps } from "../TrajectoryRows";
-import { trajectoryRowsOf, type TrajectoryInput, type TrajectoryRow } from "../../../api/trajectory_rows";
+import { TrajectoryRows, rowSummary, type TrajectoryRowsProps } from "../TrajectoryRows";
+import { trajectoryRowsOf, type PlanRow, type TrajectoryInput, type TrajectoryRow } from "../../../api/trajectory_rows";
 import type { SseEvent } from "../../../api/sessions";
 
 function ev(event: string, data: unknown): SseEvent {
@@ -124,5 +124,23 @@ describe("TrajectoryRows", () => {
     const errorRow = rendered.find((el) => el.getAttribute("data-status") === "error");
     expect(errorRow).toBeTruthy();
     expect(errorRow?.querySelector(".ew-traj-row__pulse")).not.toBeInTheDocument();
+  });
+
+  it("plan row summary: update_plan appends the reason's first sentence; planner has no suffix", () => {
+    const t = i18n.getFixedT("zh-CN");
+    const updatePlanRow: PlanRow = {
+      id: "plan:1", kind: "plan", seq: 1, step: 1, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null,
+      source: "update_plan", callId: "p1", plannerSeq: null,
+      stepsTotal: 3, goal: "出建议", reason: "档案查完了,细化后两步。再看工单", plan: null,
+    };
+    const plannerRow: PlanRow = {
+      id: "plan:2", kind: "plan", seq: 2, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null,
+      source: "planner", callId: null, plannerSeq: null,
+      stepsTotal: 3, goal: "出建议", reason: null, plan: null,
+    };
+    expect(rowSummary(updatePlanRow, t)).toBe("计划 · 更新为 3 步 · 档案查完了,细化后两步");
+    expect(rowSummary(plannerRow, t)).toBe("制定计划 · 3 步");
   });
 });

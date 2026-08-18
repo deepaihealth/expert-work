@@ -34,6 +34,14 @@ function firstLine(text: string): string {
   return idx === -1 ? text : text.slice(0, idx);
 }
 
+/** Text up to (not including) the first sentence terminator (`。` / `.` /
+ *  newline), trimmed — Task 10's `<reason 首句>` rule, reused here for the
+ *  `update_plan` row's reason suffix so the two projections read the same. */
+function firstSentence(text: string): string {
+  const idx = text.search(/[。.\n]/);
+  return (idx === -1 ? text : text.slice(0, idx)).trim();
+}
+
 /** One-line summary for a trajectory row — shared with Task 17's RowDetail
  *  header (`t` is react-i18next's `TFunction`, so this stays pure/testable
  *  outside of React). */
@@ -54,10 +62,11 @@ export function rowSummary(row: TrajectoryRow, t: TFunction): string {
             : firstLine(row.entry.resultPreview ?? "");
       return `${row.entry.toolName} · ${args} → ${result}`;
     }
-    case "plan":
-      return row.source === "update_plan"
-        ? t("console.row_plan_update", { n: row.stepsTotal })
-        : t("console.row_plan_create", { n: row.stepsTotal });
+    case "plan": {
+      if (row.source !== "update_plan") return t("console.row_plan_create", { n: row.stepsTotal });
+      const base = t("console.row_plan_update", { n: row.stepsTotal });
+      return row.reason ? `${base} · ${firstSentence(row.reason)}` : base;
+    }
     case "memory":
       return row.direction === "recall"
         ? t("console.row_memory_recall", { n: row.count })
