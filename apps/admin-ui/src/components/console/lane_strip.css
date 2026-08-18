@@ -1,0 +1,115 @@
+/*
+ * LaneStrip — component-scoped styles for the debug console's compact
+ * three-lane time strip (input / model / tools). Mirrors GanttTimeline.css's
+ * conventions: `--ew-*` design tokens end to end, a growing-bar pulse guarded
+ * by `prefers-reduced-motion`, and a hatched fill for interrupted (truncated)
+ * blocks. Lane colors match TraceView's semantic palette (input=trace-entry,
+ * model=info, tools=accent-violet); error blocks override to the danger
+ * token regardless of lane.
+ */
+
+.ew-lane-strip__body {
+  position: relative;
+}
+
+.ew-lane-strip__row {
+  display: flex;
+  align-items: stretch;
+  height: 22px;
+}
+
+.ew-lane-strip__head {
+  flex: 0 0 40px;
+  display: flex;
+  align-items: center;
+  color: var(--ew-text-tertiary);
+  font-size: 10px;
+}
+
+.ew-lane-strip__track {
+  position: relative;
+  flex: 1;
+}
+
+.ew-lane__block {
+  position: absolute;
+  top: 4px;
+  height: 14px;
+  min-width: 3px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+span.ew-lane__block {
+  cursor: default;
+}
+
+.ew-lane__block[data-lane="input"] {
+  background: var(--ew-trace-entry);
+}
+.ew-lane__block[data-lane="model"] {
+  background: var(--ew-text-info);
+}
+.ew-lane__block[data-lane="tools"] {
+  background: var(--ew-accent-violet);
+}
+
+.ew-lane__block--error {
+  background: var(--ew-text-danger);
+}
+
+.ew-lane__block--live {
+  animation: ew-lane-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ew-lane-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ew-lane__block--live {
+    animation: none;
+  }
+}
+
+.ew-lane__block--interrupted {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 3px,
+    rgba(0, 0, 0, 0.18) 3px,
+    rgba(0, 0, 0, 0.18) 6px
+  );
+}
+
+.ew-lane-strip__markers {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 40px;
+  right: 0;
+  pointer-events: none;
+}
+
+.ew-lane__marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed var(--ew-text-tertiary);
+}
+
+.ew-lane-strip__degraded {
+  margin-top: 4px;
+  padding-left: 40px;
+  color: var(--ew-text-tertiary);
+  font-size: 10px;
+}
