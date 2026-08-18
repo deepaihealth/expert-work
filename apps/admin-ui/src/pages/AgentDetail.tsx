@@ -38,6 +38,7 @@ import { useTranslation } from "react-i18next";
 import { disableAgent, enableAgent, getAgent, type AgentDetailResponse } from "../api/agents";
 import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
+import { readSecurity } from "../components/manifest-editor/form_model";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
@@ -361,24 +362,17 @@ export function AgentDetail() {
   );
 }
 
-/** Read ``sandbox.network`` out of the loosely-typed manifest spec
- *  (sandbox-egress §3.3). Egress defaults to ``"proxy"`` (manifest default). */
-function readEgress(spec: Record<string, unknown>): { egress: string; allowlist: string[] } {
-  const sandbox = spec.sandbox as Record<string, unknown> | undefined;
-  const network = sandbox?.network as Record<string, unknown> | undefined;
-  const egressRaw = network?.egress;
-  const egress = typeof egressRaw === "string" ? egressRaw : "proxy";
-  const allowlistRaw = network?.allowlist;
-  const allowlist = Array.isArray(allowlistRaw)
-    ? allowlistRaw.filter((h): h is string => typeof h === "string")
-    : [];
-  return { egress, allowlist };
-}
-
 function OverviewTab({ detail }: { detail: AgentDetailResponse }) {
   const { t } = useTranslation();
   const r = detail.record;
-  const egress = readEgress(r.spec);
+  // ``r.spec`` is the full manifest ({apiVersion, kind, metadata, spec}) —
+  // same「多包一层壳」bug family as PlaygroundTab.tsx:138/:213. ``readSecurity``
+  // (form_model.ts) already reads ``specOf(m).sandbox?.network`` correctly for
+  // a full manifest; a hand-rolled ``readEgress(spec.sandbox)`` here read
+  // ``spec.sandbox`` directly (undefined on a full manifest) and silently
+  // always showed the "proxy, no allowlist" default.
+  const sec = readSecurity(r.spec);
+  const egress = { egress: sec.egress ?? "proxy", allowlist: sec.allowlist ?? [] };
   return (
     <Row gutter={16}>
       <Col span={24}>

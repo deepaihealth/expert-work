@@ -57,8 +57,10 @@ export interface AgentDisableRecord {
 
 export interface AgentDetailResponse {
   record: AgentRecord & {
-    /** Full spec — same shape as POST /v1/agents accepts. Used by
-     *  the Manifest preview / edit tab in :ref:`AgentDetail`. */
+    /** The full manifest ({apiVersion, kind, metadata, spec}) — same
+     *  document POST /v1/agents accepts. NOT the inner ``spec`` block: pass
+     *  it to the form_model readers as-is (``readPromptJinja(record.spec)``),
+     *  never wrapped in another ``{ spec }`` shell. */
     spec: Record<string, unknown>;
   };
   /** Stream RT-4 — whether the agent name is currently kill-switched. */
@@ -89,12 +91,11 @@ export async function getAgent(
   );
 }
 
-/** Server-side ``ManifestPayload`` accepts raw YAML + optional template
- *  vars; the backend re-loads it through :class:`ManifestLoader` so the
- *  spec is validated end-to-end (Pydantic + ManifestError) on save. */
+/** Server-side ``ManifestPayload`` accepts the manifest YAML text; ``{{ … }}``
+ *  inside it is run-time Jinja, stored verbatim. The backend validates it
+ *  end-to-end (Pydantic + ManifestError) on save. */
 export interface ManifestPayload {
   manifest_yaml: string;
-  template_vars?: Record<string, unknown> | null;
 }
 
 /** PUT /v1/agents/{name}/{version} — in-place spec update. The

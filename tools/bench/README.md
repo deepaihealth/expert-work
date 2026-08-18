@@ -134,7 +134,7 @@ module (`-m`) — `tools/bench` isn't a package.
    Body key 是 **`manifest_yaml`**(不是 `{"manifest": ...}` —— 那个拼法
    只在计划文档里出现过)。定论来源:`POST /v1/agents` 的请求模型
    `ManifestPayload`(`services/control-plane/src/control_plane/api/agents.py`)
-   只收 `{"manifest_yaml": "...", "template_vars": {...}}`,发 `{"manifest":
+   只收 `{"manifest_yaml": "..."}`,发 `{"manifest":
    ...}` 会因缺字段 422。manifest 本身有解析守卫
    (`test_bench_entry_manifest_parses_against_protocol_schema`):schema
    漂移在 CI 先红,不会等到注册时才 422。

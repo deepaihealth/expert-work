@@ -169,6 +169,8 @@ Session 表已在 A.7 `thread_meta` 落地，B 仅消费。
 
 ### ADR B-3 — Manifest 校验：B 只做 Pydantic schema + Jinja2 渲染
 
+> **Superseded(2026-08-18)**:保存期 Jinja 渲染整层已下线(调试台重设计 PR0),`{{ }}` 只作 run 期动态 prompt 语义,见 `docs/design/jinja-dynamic-prompt.md` §2 勘误。
+
 **问题**：02-AGENT-MANIFEST 列出 8 条 lint 规则；全部塞进 B.4 会膨胀。
 
 **决策**：B.4 仅落实

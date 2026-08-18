@@ -131,10 +131,13 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const isTenantSwitched = useIsTenantSwitched();
 
   // Dynamic-Prompt — the agent's declared run-time variables (jinja agents only).
-  const manifestLike = { spec: r.spec };
-  const promptJinja = readPromptJinja(manifestLike);
+  // ``record.spec`` IS the full manifest ({apiVersion, kind, metadata, spec}), so it
+  // is passed to the form_model readers as-is — wrapping it in another ``{ spec }``
+  // shell made ``readPromptJinja`` look at ``manifest.system_prompt`` (undefined) and
+  // hid the variable inputs for every jinja agent (#824 → PR0 of the console redesign).
+  const promptJinja = readPromptJinja(r.spec);
   const promptVariables = promptJinja
-    ? readPromptVariables(manifestLike).filter(
+    ? readPromptVariables(r.spec).filter(
         (v): v is { name: string } & typeof v => Boolean(v.name),
       )
     : [];
@@ -207,7 +210,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // (否则每次进调试台吃一发静默 403),成本区随现有"无数据"态自然隐藏。
   useEffect(() => {
     if (!isSystemAdmin) return;
-    const model = readModel({ spec: r.spec });
+    // ``r.spec`` is already the full manifest ({apiVersion, kind, metadata,
+    // spec}) — same "record.spec 多包一层壳" bug as :138, twin fix.
+    const model = readModel(r.spec);
     if (!model.provider || !model.name) return;
     let cancelled = false;
     void listRateCards({ provider: model.provider, model: model.name })

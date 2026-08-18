@@ -5,9 +5,8 @@ emits ``manifest:{read,write,delete}`` audit records on every mutation
 via the per-request :class:`AuditLogger`.
 
 Body shape: the create / update endpoints accept ``{"manifest_yaml":
-"...", "template_vars": {...}}``. The control-plane never accepts a
-pre-parsed AgentSpec — round-tripping YAML keeps lint enforcement at
-the boundary.
+"..."}``. The control-plane never accepts a pre-parsed AgentSpec —
+round-tripping YAML keeps lint enforcement at the boundary.
 """
 
 from __future__ import annotations
@@ -65,7 +64,6 @@ from control_plane.manifest import (
     ManifestError,
     ManifestLoader,
     ManifestSyntaxError,
-    ManifestTemplateError,
     ManifestValidationError,
 )
 from control_plane.quota.base import QuotaService
@@ -111,10 +109,16 @@ logger = logging.getLogger("expert_work.control_plane.agents")
 
 
 class ManifestPayload(BaseModel):
+    """``POST/PUT /v1/agents`` body — the manifest YAML text, nothing else.
+
+    ``{{ … }}`` inside the YAML is run-time Jinja for jinja agents (rendered
+    per run from ``inputs``); the loader stores it verbatim. The former
+    save-time ``template_vars`` field was removed (console-redesign PR0).
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     manifest_yaml: str = Field(min_length=1)
-    template_vars: dict[str, Any] | None = None
 
 
 def _record_attrs(record: AgentSpecRecord) -> ResourceAttrs:
@@ -639,10 +643,7 @@ async def _load_manifest(
     loader: ManifestLoader,
 ) -> tuple[Any, str]:
     """Parse the request body into an ``AgentSpec`` + canonical sha256."""
-    spec = loader.load_from_string(
-        payload.manifest_yaml,
-        template_vars=payload.template_vars,
-    )
+    spec = loader.load_from_string(payload.manifest_yaml)
     spec_json = spec.model_dump(by_alias=True, mode="json")
     return spec, _spec_sha256(spec_json)
 
@@ -681,12 +682,6 @@ def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
                     "errors": sanitized_errors,
                 },
             },
-        )
-    if isinstance(exc, ManifestTemplateError):
-        return _envelope_error(
-            "MANIFEST_TEMPLATE",
-            "manifest template rendering failed",
-            400,
         )
     if isinstance(exc, ManifestSyntaxError):
         return _envelope_error("MANIFEST_SYNTAX", "manifest is not valid YAML", 400)
