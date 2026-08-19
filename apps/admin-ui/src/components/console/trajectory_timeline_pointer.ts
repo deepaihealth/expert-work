@@ -14,6 +14,8 @@ import { fmtDuration } from "../../pages/agent_detail/playground/duration_format
 
 /** 小于这个位移的按下-抬起算点击,不产生选区。 */
 export const DRAG_THRESHOLD_PX = 3;
+/** 悬停多久才弹提示(秒)—— spec §九「悬停:块 → 500ms 后提示」。 */
+export const TOOLTIP_DELAY_S = 0.5;
 /** 缩放态下拖到轨道两端这个比例内就自动平移。 */
 const EDGE_PAN_ZONE = 0.08;
 const EDGE_PAN_STEP = 0.025;

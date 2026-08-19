@@ -11,7 +11,7 @@
  *
  * See .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-7-brief.md.
  */
-import { useEffect, useRef, useState, type CSSProperties, type JSX, type KeyboardEvent, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type JSX, type KeyboardEvent, type PointerEvent } from "react";
 import { Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -20,9 +20,10 @@ import {
   type TimelineModel, type TimeRange,
 } from "./ledger_timeline";
 import type { LedgerRecord } from "./ledger_types";
+import { TrajectoryTimelineBlocks } from "./TrajectoryTimelineBlocks";
 import {
   blockIndexAt, commitSelection, domainProjection, edgePanTarget, rectOf, selectionFractions,
-  tooltipLines, DRAG_THRESHOLD_PX, type Gesture,
+  DRAG_THRESHOLD_PX, TOOLTIP_DELAY_S, type Gesture,
 } from "./trajectory_timeline_pointer";
 import "./trajectory_timeline.css";
 
@@ -45,7 +46,6 @@ export interface TrajectoryTimelineProps {
   onLoadEarlier: () => void;
 }
 
-const TOOLTIP_DELAY_S = 0.5;
 const LANE_LABEL_KEYS = ["console.lane_input", "console.lane_model", "console.lane_tools"] as const;
 
 export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element {
@@ -60,28 +60,38 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
   const panRef = useRef<Gesture | null>(null);
   /** 上一次回抛给父层的悬停记录 —— 只在真的变了才回调。 */
   const hoverSentRef = useRef<number | null>(null);
+  /** 给「挪视口」effect 读最新模型,又不让它随模型引用变化重跑。 */
+  const modelRef = useRef<TimelineModel | null>(model);
+  const prevSelectedRef = useRef<number | null>(selectedIndex);
   const [viewport, setViewport] = useState<TimeRange | null>(null);
   const [animate, setAnimate] = useState(false);
   const [draft, setDraft] = useState<TimeRange | null>(null);
-  const [hover, setHover] = useState<{ fraction: number; index: number | null } | null>(null);
+  /** 空白处悬停竖线的位置;指针停在块上时为 null(那时靠块自己的描边表达)。 */
+  const [hoverFraction, setHoverFraction] = useState<number | null>(null);
   const [panning, setPanning] = useState(false);
 
   // 账本换了一批记录(加载更早 / 切会话)后旧视口可能整段落在域外,回全景。
   useEffect(() => {
+    modelRef.current = model;
     if (model === null) return;
     setAnimate(false);
     setViewport((cur) => (cur !== null && (cur.end < model.start || cur.start > model.end) ? null : cur));
   }, [model]);
 
-  // 选中账本里视口外的记录 → 180ms 平滑挪过去(全景态不用挪)。
+  // 选中账本里视口外的记录 → 180ms 平滑挪过去(全景态不用挪)。**只认
+  // `selectedIndex` 真的变化**:运行中每来一帧 `model` 就换引用,跟着跑会把用户
+  // 刚缩放 / 平移到的位置一次次拽回选中块;挂载时也不该先亮起动画。
   useEffect(() => {
-    if (model === null || selectedIndex === null) return;
+    if (prevSelectedRef.current === selectedIndex) return;
+    prevSelectedRef.current = selectedIndex;
+    const current = modelRef.current;
+    if (current === null || selectedIndex === null) return;
     setAnimate(true);
-    setViewport((cur) => revealInViewport(model, cur, selectedIndex));
-  }, [model, selectedIndex]);
+    setViewport((cur) => revealInViewport(current, cur, selectedIndex));
+  }, [selectedIndex]);
 
-  const { fullDuration, domainDuration, domainStart, domainEnd, style: domainStyle } =
-    domainProjection(model, viewport);
+  const projection = useMemo(() => domainProjection(model, viewport), [model, viewport]);
+  const { fullDuration, domainDuration, domainStart, domainEnd, style: domainStyle } = projection;
 
   // 滚轮缩放要 `preventDefault`(否则整页跟着滚),React 的 onWheel 是 passive
   // 的,只能自己挂原生监听。
@@ -116,7 +126,10 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     if (model === null) return;
     const base = { pointerId: e.pointerId, clientX0: e.clientX, captured: false, moved: false };
     if (e.button === 2) {
+      // 全景态下右键按下不进平移态、也不拿捕获(没得可平移);手势照样记着,
+      // 好让抬手时的「右键单击 = 清选区」照旧生效。
       panRef.current = { ...base, anchorTime: domainStart, viewport0: viewport, index: null };
+      if (viewport === null) return;
       setAnimate(false);
       setPanning(true);
       return;
@@ -125,7 +138,7 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     const { fraction, time } = timeAt(e.clientX, e.currentTarget);
     const index = blockIndexAt(e.target);
     dragRef.current = { ...base, anchorTime: time, viewport0: viewport, index };
-    setHover({ fraction, index });
+    setHoverFraction(index === null ? fraction : null);
     reportHover(index);
     setDraft({ start: time, end: time });
   };
@@ -145,9 +158,9 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     if (model === null) return;
     const pan = panRef.current;
     if (pan !== null && pan.pointerId === e.pointerId) {
-      if (Math.abs(e.clientX - pan.clientX0) >= DRAG_THRESHOLD_PX && !pan.captured) {
-        panRef.current = { ...pan, captured: true, moved: true };
-        e.currentTarget.setPointerCapture?.(e.pointerId);
+      if (Math.abs(e.clientX - pan.clientX0) >= DRAG_THRESHOLD_PX && !pan.moved) {
+        panRef.current = { ...pan, captured: pan.viewport0 !== null, moved: true };
+        if (pan.viewport0 !== null) e.currentTarget.setPointerCapture?.(e.pointerId);
       }
       if (pan.viewport0 === null) return;
       const { width } = rectOf(e.currentTarget);
@@ -157,7 +170,7 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     }
     const { fraction } = timeAt(e.clientX, e.currentTarget);
     const index = blockIndexAt(e.target);
-    setHover({ fraction, index });
+    setHoverFraction(index === null ? fraction : null);
     reportHover(index);
     const drag = dragRef.current;
     if (drag === null || drag.pointerId !== e.pointerId) return;
@@ -207,14 +220,23 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     dragRef.current = null;
     panRef.current = null;
     setDraft(null);
-    setHover(null);
+    setHoverFraction(null);
     setPanning(false);
     reportHover(null);
   };
 
   const handlePointerLeave = (): void => {
-    if (dragRef.current !== null || panRef.current !== null) return;
-    setHover(null);
+    // 捕获中的手势即使指针离开轨道也照样收事件,不能中断。**还没过阈值(没
+    // 捕获)的按下**一旦离开,`pointerup` 就再也回不到轨道了 —— 当场收尾,否则
+    // 零宽草稿会卡住把所有块压成 `data-selected="false"`,点击也丢了。
+    if (dragRef.current?.captured === true || panRef.current?.captured === true) return;
+    if (dragRef.current !== null || panRef.current !== null) {
+      dragRef.current = null;
+      panRef.current = null;
+      setDraft(null);
+      setPanning(false);
+    }
+    setHoverFraction(null);
     reportHover(null);
   };
 
@@ -249,7 +271,10 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     : null;
 
   const activeRange = draft ?? range;
-  const focused = model === null || activeRange === null ? null : focusIndexes(model, activeRange);
+  const focused = useMemo(
+    () => (model === null || activeRange === null ? null : focusIndexes(model, activeRange)),
+    [model, activeRange],
+  );
   const visible = selectionFractions(model, activeRange, domainStart, domainDuration);
   const selectionStyle = visible === null
     ? undefined
@@ -290,12 +315,12 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
           {model === null && (
             <span className="ew-traj-tl__empty" data-testid="console-lane-empty">{t("console.timeline_empty")}</span>
           )}
-          {hover !== null && hover.index === null && draft === null && (
+          {hoverFraction !== null && draft === null && (
             <div
               className="ew-traj-tl__hover-line"
               data-testid="console-lane-hover-line"
               aria-hidden="true"
-              style={{ "--traj-hover-left": `${hover.fraction * 100}%` } as CSSProperties}
+              style={{ "--traj-hover-left": `${hoverFraction * 100}%` } as CSSProperties}
             />
           )}
           {visible !== null && selectionStyle !== undefined && (
@@ -348,46 +373,16 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
                     />
                   ))}
               </div>
-              <div
-                className="ew-traj-tl__lanes"
-                data-animate-viewport={animate ? "true" : undefined}
-                style={domainStyle}
-              >
-                {model.spans
-                  .filter((span) => span.index === selectedIndex || (span.end >= domainStart && span.start <= domainEnd))
-                  .map((span) => {
-                    const left = (span.start - model.start) / fullDuration;
-                    const width = (span.end - span.start) / fullDuration;
-                    return (
-                      <Tooltip
-                        key={span.index}
-                        title={tooltipLines(span, records[span.index], model, t).map((line) => <div key={line}>{line}</div>)}
-                        mouseEnterDelay={TOOLTIP_DELAY_S}
-                      >
-                        <span
-                          aria-hidden="true"
-                          className="ew-traj-tl__block"
-                          data-testid="console-lane-block"
-                          data-index={span.index}
-                          data-lane={span.lane}
-                          data-kind={span.kind}
-                          data-error={span.isError ? "true" : undefined}
-                          data-live={span.running ? "true" : undefined}
-                          data-current={span.index === selectedIndex ? "true" : undefined}
-                          data-hovered={span.index === hoveredIndex ? "true" : undefined}
-                          data-search-match={searchMatches === null ? undefined : String(searchMatches.has(span.index))}
-                          data-selected={focused === null ? undefined : String(focused.has(span.index))}
-                          style={{
-                            "--traj-span-left": `${left * 100}%`,
-                            "--traj-span-width": `${width * 100}%`,
-                            "--traj-span-gap": `min(${width * 8}%, 1px)`,
-                            "--traj-span-lane": span.lane,
-                          } as CSSProperties}
-                        />
-                      </Tooltip>
-                    );
-                  })}
-              </div>
+              <TrajectoryTimelineBlocks
+                model={model}
+                records={records}
+                projection={projection}
+                selectedIndex={selectedIndex}
+                hoveredIndex={hoveredIndex}
+                searchMatches={searchMatches}
+                focused={focused}
+                animate={animate}
+              />
             </>
           )}
         </div>

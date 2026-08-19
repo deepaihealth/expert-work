@@ -3,7 +3,7 @@
  * 清除)、缩放平移、搜索淡出、悬停联动、「加载更早」与空态、提示气泡。
  * 几何靠 mock 掉的 `getBoundingClientRect`(轨道 = 左 0 宽 1000px)。
  */
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import i18n from "../../../i18n";
 
@@ -95,6 +95,10 @@ function blockAt(index: number): HTMLElement {
   if (found === undefined) throw new Error(`no block for index ${index}`);
   return found;
 }
+/** 块所在的域投影容器 —— `--traj-domain-*` 挂在它上面,块继承。 */
+function lanes(): HTMLElement {
+  return blocks()[0].parentElement as HTMLElement;
+}
 function track(): HTMLElement {
   return screen.getByTestId("console-lane-track");
 }
@@ -104,6 +108,15 @@ function pct(el: HTMLElement, prop: string): number {
 
 beforeAll(async () => {
   await i18n.changeLanguage("zh-CN");
+  // jsdom 没有 pointer capture。先补两个空实现,测试里就能用**可恢复的**
+  // `vi.spyOn` 盯它们(`afterEach` 的 restoreAllMocks 会还原),不必手改原型。
+  HTMLElement.prototype.setPointerCapture = () => undefined;
+  HTMLElement.prototype.releasePointerCapture = () => undefined;
+});
+
+afterAll(() => {
+  Reflect.deleteProperty(HTMLElement.prototype, "setPointerCapture");
+  Reflect.deleteProperty(HTMLElement.prototype, "releasePointerCapture");
 });
 
 afterEach(() => {
@@ -235,10 +248,8 @@ describe("TrajectoryTimeline · 选区", () => {
   it("指针捕获只在位移过 3px 阈值之后才拿", () => {
     // PR-A.1 Task 5 的坑:按下就捕获会把随后的 pointerup 重定向到轨道,
     // 真实浏览器里「点块 = 选中记录」直接失效;jsdom 照不出来,靠 spy 钉住。
-    const captured = vi.fn();
-    const released = vi.fn();
-    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", { configurable: true, writable: true, value: captured });
-    Object.defineProperty(HTMLElement.prototype, "releasePointerCapture", { configurable: true, writable: true, value: released });
+    const captured = vi.spyOn(HTMLElement.prototype, "setPointerCapture");
+    const released = vi.spyOn(HTMLElement.prototype, "releasePointerCapture");
     mockTrack();
 
     render(<TrajectoryTimeline {...props()} />);
@@ -312,6 +323,8 @@ describe("TrajectoryTimeline · 选区", () => {
     render(<TrajectoryTimeline {...p} />);
 
     fireEvent.pointerDown(track(), { clientX: 300, pointerId: 1, button: 2 });
+    // 全景态没什么可平移的:不进平移态(光标不变 grabbing)。
+    expect(track()).not.toHaveAttribute("data-panning");
     fireEvent.pointerUp(track(), { clientX: 300, pointerId: 1, button: 2 });
     expect(p.onRangeChange).toHaveBeenCalledWith(null);
 
@@ -320,18 +333,71 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(menu).toBe(false);
   });
 
+  it("拖得比一条记录还窄:提交的选区按中点补足到最小宽度", () => {
+    mockTrack();
+    const p = props();
+    render(<TrajectoryTimeline {...p} />);
+
+    // 域 [0,6) / 6 条 → 最小选区宽 1;拖出的 [3.0, 3.12] 太窄,按中点 3.06 补足。
+    fireEvent.pointerDown(track(), { clientX: 500, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(track(), { clientX: 520, pointerId: 1 });
+    fireEvent.pointerUp(track(), { clientX: 520, pointerId: 1, button: 0 });
+
+    const committed = (p.onRangeChange as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(committed.end - committed.start).toBeCloseTo(1, 6);
+    expect(committed.start).toBeCloseTo(2.56, 6);
+    // 不是点击 → 不滚账本。
+    expect(p.onFocusRecord).not.toHaveBeenCalled();
+  });
+
+  it("阈值内的按下后指针离开轨道:草稿当场清掉,落单的抬起不回调", () => {
+    // 没过阈值就没拿捕获,指针离开后 `pointerup` 再也回不到轨道 —— 不当场收尾
+    // 的话零宽草稿会卡住,把所有块压成 data-selected="false"。
+    mockTrack();
+    const p = props();
+    render(<TrajectoryTimeline {...p} />);
+
+    fireEvent.pointerDown(track(), { clientX: 500, pointerId: 1, button: 0 });
+    fireEvent.pointerLeave(track(), { clientX: 500, pointerId: 1 });
+
+    expect(screen.queryByTestId("console-lane-range")).not.toBeInTheDocument();
+    expect(blocks().every((b) => !b.hasAttribute("data-selected"))).toBe(true);
+
+    fireEvent.pointerUp(track(), { clientX: 500, pointerId: 1, button: 0 });
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+    expect(p.onSelectRecord).not.toHaveBeenCalled();
+    expect(p.onFocusRecord).not.toHaveBeenCalled();
+  });
+
+  it("全景态下右键拖动:不平移、不拿捕获,也不当右键单击清选区", () => {
+    mockTrack();
+    const captured = vi.spyOn(HTMLElement.prototype, "setPointerCapture");
+    const p = props({ range: { start: 1, end: 2 } });
+    render(<TrajectoryTimeline {...p} />);
+
+    fireEvent.pointerDown(track(), { clientX: 300, pointerId: 1, button: 2 });
+    fireEvent.pointerMove(track(), { clientX: 420, pointerId: 1 });
+    expect(captured).not.toHaveBeenCalled();
+    expect(track()).not.toHaveAttribute("data-panning");
+
+    fireEvent.pointerUp(track(), { clientX: 420, pointerId: 1, button: 2 });
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+  });
+
   it("pointercancel 中止拖选:不提交区间,草稿选区也擦掉", () => {
     mockTrack();
     const p = props();
     render(<TrajectoryTimeline {...p} />);
 
     fireEvent.pointerDown(track(), { clientX: 100, pointerId: 1, button: 0 });
-    fireEvent.pointerMove(track(), { clientX: 400, pointerId: 1 });
+    fireEvent.pointerMove(blockAt(2), { clientX: 400, pointerId: 1 });
+    expect(p.onHoverIndex).toHaveBeenLastCalledWith(2);
     expect(screen.getByTestId("console-lane-range")).toHaveAttribute("data-dragging", "true");
     expect(screen.getByTestId("console-lane-range-edges")).toHaveAttribute("data-dragging", "true");
 
     fireEvent.pointerCancel(track(), { clientX: 400, pointerId: 1 });
     expect(screen.queryByTestId("console-lane-range")).not.toBeInTheDocument();
+    expect(p.onHoverIndex).toHaveBeenLastCalledWith(null);
     expect(p.onRangeChange).not.toHaveBeenCalled();
 
     // 状态已清空 —— 之后落单的一次抬起不该补出区间。
@@ -411,6 +477,39 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     fireEvent.pointerMove(track(), { clientX: 990, pointerId: 1 });
     expect(pct(blockAt(0).parentElement as HTMLElement, "--traj-domain-left")).toBeLessThan(left1);
     fireEvent.pointerUp(track(), { clientX: 990, pointerId: 1, button: 0 });
+  });
+
+  it("model 换引用(内容没变)不动视口 —— 挪视口只认 selectedIndex 变化", () => {
+    // 运行中每来一帧 model 就换引用,跟着跑会把用户刚缩放到的位置一次次拽回
+    // 选中块;挂载时也不该先亮起 180ms 动画。
+    mockTrack();
+    const records = sixRecords();
+    const model = (): ReturnType<typeof deriveTimeline> => deriveTimeline(records, "sequence");
+    const { rerender } = render(<TrajectoryTimeline {...props({ records, model: model(), selectedIndex: 5 })} />);
+    expect(lanes()).not.toHaveAttribute("data-animate-viewport");
+
+    // 用户自己滚到左边:选中的第 5 条这时落在视口外。
+    fireEvent.wheel(screen.getByTestId("console-lane-strip"), { deltaY: -200, clientX: 100 });
+    const left = pct(lanes(), "--traj-domain-left");
+    expect(left).toBeLessThan(0);
+
+    rerender(<TrajectoryTimeline {...props({ records, model: model(), selectedIndex: 5 })} />);
+    expect(pct(lanes(), "--traj-domain-left")).toBeCloseTo(left, 6);
+    expect(lanes()).not.toHaveAttribute("data-animate-viewport");
+  });
+
+  it("selectedIndex 变到视口外的记录 → 视口挪过去并打上动画标记", () => {
+    mockTrack();
+    const records = sixRecords();
+    const model = (): ReturnType<typeof deriveTimeline> => deriveTimeline(records, "sequence");
+    const { rerender } = render(<TrajectoryTimeline {...props({ records, model: model(), selectedIndex: null })} />);
+
+    fireEvent.wheel(screen.getByTestId("console-lane-strip"), { deltaY: -200, clientX: 100 });
+    const left = pct(lanes(), "--traj-domain-left");
+
+    rerender(<TrajectoryTimeline {...props({ records, model: model(), selectedIndex: 5 })} />);
+    expect(pct(lanes(), "--traj-domain-left")).toBeLessThan(left);
+    expect(lanes()).toHaveAttribute("data-animate-viewport", "true");
   });
 
   it("hasEarlier 出「…」按钮,点击触发加载;loadingEarlier 时 aria-disabled 且不再回调", () => {
