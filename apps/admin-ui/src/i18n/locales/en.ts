@@ -1272,6 +1272,20 @@ export interface TranslationKeys {
     toolbar_search: string;
     toolbar_search_count: string;
     toolbar_aria: string;
+    ledger_aria: string;
+    ledger_turn_label: string;
+    ledger_turn_compact: string;
+    ledger_request_label: string;
+    ledger_tool_call_only: string;
+    ledger_no_output: string;
+    ledger_calls_collapsed: string;
+    ledger_load_earlier: string;
+    ledger_loading_earlier: string;
+    ledger_loading: string;
+    ledger_placeholder_loading: string;
+    ledger_placeholder_error: string;
+    ledger_kind_subtool: string;
+    ledger_kind_compacted: string;
   };
   playground: {
     session_label: string;
@@ -4468,6 +4482,20 @@ const en: TranslationKeys = {
     toolbar_search: "Search",
     toolbar_search_count: "{{n}} matches",
     toolbar_aria: "Trajectory toolbar",
+    ledger_aria: "Trajectory ledger",
+    ledger_turn_label: "Turn {{n}}",
+    ledger_turn_compact: "#{{n}}",
+    ledger_request_label: "Request #{{n}} · Turn {{turn}} · Step {{step}}",
+    ledger_tool_call_only: "(tool call only)",
+    ledger_no_output: "(no output)",
+    ledger_calls_collapsed: "(calls collapsed, click to expand)",
+    ledger_load_earlier: "Load earlier history ({{n}} more turns)",
+    ledger_loading_earlier: "Loading earlier history…",
+    ledger_loading: "Loading trajectory…",
+    ledger_placeholder_loading: "Replaying…",
+    ledger_placeholder_error: "Replay failed; text fallback",
+    ledger_kind_subtool: "SUBTOOL",
+    ledger_kind_compacted: "COMPACTED",
   },
   playground: {
     session_label: "Session",
