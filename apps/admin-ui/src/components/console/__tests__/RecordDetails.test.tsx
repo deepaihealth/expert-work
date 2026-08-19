@@ -531,6 +531,78 @@ describe("Schema tab (PR-A.3 §十.2)", () => {
     expect(panel).toHaveTextContent('"command"');
   });
 
+  // 终审 C1 —— 账本 `entry.toolName` 是剥了 `mcp__server__` 前缀的显示名
+  // ("create_issue"),catalog key 是注册名("mcp__gh__create_issue",
+  // `rawName`)。`schemaToolNameOf` 必须用 `rawName` 查,否则每一条 MCP 工具
+  // 记录都稳定 miss、渲染成看似正常的空态。
+  it("MCP 工具记录用 rawName(注册名)查 catalog,不用剥了前缀的 toolName", () => {
+    const item: AgentToolSchema = {
+      name: "mcp__gh__create_issue",
+      description: "Create a GitHub issue",
+      parameters: { type: "object", properties: {} },
+      source: "mcp:gh",
+      from_skill: null,
+      deferred: false,
+    };
+    const mcpRow = toolRow({
+      entry: {
+        id: "c10",
+        rawName: "mcp__gh__create_issue",
+        isMcp: true,
+        server: "gh",
+        toolName: "create_issue",
+        args: {},
+        status: "success",
+        resultPreview: "",
+        durationMs: 40,
+      },
+    });
+    renderRecord({ record: rec(mcpRow), toolSchemas: ready([item]), activeTab: "schema" });
+    expect(screen.queryByTestId("console-detail-schema-missing")).toBeNull();
+    expect(screen.getByTestId("console-detail-schema")).toHaveTextContent("Create a GitHub issue");
+  });
+
+  it("rawName 为空的 tool 记录不出 Schema tab", () => {
+    const emptyNameRow = toolRow({
+      entry: {
+        id: "c11",
+        rawName: "",
+        isMcp: false,
+        server: null,
+        toolName: "",
+        args: {},
+        status: "success",
+        resultPreview: "",
+        durationMs: 10,
+      },
+    });
+    expect(schemaToolNameOf(emptyNameRow)).toBeNull();
+    expect(recordTabsOf(rec(emptyNameRow))).not.toContain("schema");
+  });
+
+  // Minor 1 —— skill 工具的「来源」应显示 `skill:<name>`,不是 registry 落的
+  // 默认 `source: "builtin"`。
+  it("skill 工具的来源显示 skill:<name>,不是 builtin", () => {
+    const item: AgentToolSchema = {
+      name: "summarize_doc",
+      description: "Summarize a document",
+      parameters: { type: "object", properties: {} },
+      source: "builtin",
+      from_skill: "doc_tools",
+      deferred: false,
+    };
+    const skillRow = toolRow({
+      entry: {
+        id: "c12", rawName: "summarize_doc", isMcp: false, server: null, toolName: "summarize_doc",
+        args: {}, status: "success", resultPreview: "", durationMs: 20,
+      },
+    });
+    renderRecord({ record: rec(skillRow), toolSchemas: ready([item]), activeTab: "schema" });
+    const panel = screen.getByTestId("console-detail-schema");
+    expect(panel).toHaveTextContent("skill:doc_tools");
+    expect(panel).not.toHaveTextContent("builtin");
+  });
+
   it("三态:loading / error(带重试)/ missing(未命中当前工具集)", async () => {
     const reload = vi.fn();
     const loading = renderRecord({

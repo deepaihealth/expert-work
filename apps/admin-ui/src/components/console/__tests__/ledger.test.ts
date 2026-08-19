@@ -320,6 +320,21 @@ describe("SYSTEM row (PR-A.3 §十.1)", () => {
     ]);
   });
 
+  // 终审 I1 —— USER 的时长钉点曾把 SYSTEM 行也算进 `spans`(它是「非 user 且
+  // 有 serverMs」的一行),USER 因此被钉到 SYSTEM 帧的同一毫秒、两块在时长
+  // 模式下同泳道同 x 完全重叠(SYSTEM 点不到 / 悬停不到)。USER 应回到本轮
+  // 首条「步」的起点(与 assistant 首步同一时刻),SYSTEM 严格更早。
+  it("SYSTEM's absolute span does not pull USER onto the same instant as SYSTEM", () => {
+    const ledger = buildLedger({ turns: [turnWithSystem("t1", "你是评审员")], streamTurnKey: null, nowMs: NOW });
+    const system = ledger.records.find((r) => r.kind === "system")!;
+    const user = ledger.records.find((r) => r.kind === "user")!;
+    const assistant = ledger.records.find((r) => r.kind === "assistant")!;
+    expect(system.startedAt).not.toBeNull();
+    expect(user.startedAt).not.toBeNull();
+    expect(system.startedAt! < user.startedAt!).toBe(true);
+    expect(user.startedAt).toBe(assistant.startedAt);
+  });
+
   it("consecutive turns with the same prompt fold it; a changed prompt shows again", () => {
     const ledger = buildLedger({
       turns: [turnWithSystem("t1", "A"), turnWithSystem("t2", "A"), turnWithSystem("t3", "B"), turnWithSystem("t4", "B")],
@@ -356,7 +371,11 @@ describe("SYSTEM row (PR-A.3 §十.1)", () => {
     expect(assistants[0].firstTokenAt).toBe(assistants[0].startedAt! + 500);
     expect(assistants[1].firstTokenAt).toBe(assistants[1].endedAt);
     expect(assistants[2].firstTokenAt).toBeNull();
-    expect(ledger.requests.map((r) => r.firstTokenMs)).toEqual([500, 9999, null]);
+    // Minor 2 —— `LedgerRequest.firstTokenMs` 现在与 `firstTokenAt` 同口径
+    // 夹取:第二步 9999 偏移已被夹到 `endedAt`(见上一条断言),这里的
+    // 100 = 夹后差值(该步 `_duration_ms: 100`),不是原始 9999,否则悬停
+    // 提示与「请求 #N · 首 token」会报出两个不同的数(终审 Minor 2)。
+    expect(ledger.requests.map((r) => r.firstTokenMs)).toEqual([500, 100, null]);
   });
 });
 

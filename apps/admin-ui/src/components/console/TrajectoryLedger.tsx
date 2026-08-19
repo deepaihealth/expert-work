@@ -58,11 +58,11 @@ export interface TrajectoryLedgerProps {
 function foldContextOf(rows: readonly DisplayRow[]): {
   collapsedTurns: ReadonlySet<string>;
   ownersWithChildren: ReadonlySet<string>;
-  nonUserByTurn: ReadonlyMap<string, number>;
+  nonContextByTurn: ReadonlyMap<string, number>;
 } {
   const collapsedTurns = new Set<string>();
   const ownersWithChildren = new Set<string>();
-  const nonUserByTurn = new Map<string, number>();
+  const nonContextByTurn = new Map<string, number>();
   for (const row of rows) {
     if (row.kind === "turn-summary") {
       collapsedTurns.add(row.turnKey);
@@ -81,10 +81,10 @@ function foldContextOf(rows: readonly DisplayRow[]): {
       ownersWithChildren.add(record.parentId);
     }
     if (!CONTEXT_KINDS.has(record.kind)) {
-      nonUserByTurn.set(record.turnKey, (nonUserByTurn.get(record.turnKey) ?? 0) + 1);
+      nonContextByTurn.set(record.turnKey, (nonContextByTurn.get(record.turnKey) ?? 0) + 1);
     }
   }
-  return { collapsedTurns, ownersWithChildren, nonUserByTurn };
+  return { collapsedTurns, ownersWithChildren, nonContextByTurn };
 }
 
 /** 请求号 → 开启它的那条 assistant 记录 id(`requestsByRecordId` 反查)。 */
@@ -212,7 +212,7 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
 
   const handleDoubleClick = useCallback(
     (record: LedgerRecord): void => {
-      const { collapsedTurns, ownersWithChildren, nonUserByTurn } = foldContext;
+      const { collapsedTurns, ownersWithChildren, nonContextByTurn } = foldContext;
       if (collapsedTurns.has(record.turnKey)) {
         onToggleTurn(record.turnKey);
         return;
@@ -223,7 +223,7 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
       }
       // 不限轮首行 —— 双击账本里这一轮的**任意**一行都该折得动它;只有非 USER
       // 记录不到 2 条的轮不值得折(折了也省不出一行)。
-      if ((nonUserByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
+      if ((nonContextByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
     },
     [foldContext, onToggleTurn, onToggleOwner],
   );

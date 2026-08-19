@@ -167,6 +167,11 @@
 }
 
 .ew-traj-tl__block[data-error="true"] { background: var(--ew-color-danger-500); }
+/* CSS 层兜底(终审 M7):失败块不糊掉双色渐变本应只靠
+   `TrajectoryTimelineBlocks.tsx` 的 `!span.isError` 闸,这条规则把
+   `[data-error="true"][data-ttft="true"]` 的组合也钉成纯 danger,免得特异度
+   算错时露出渐变。 */
+.ew-traj-tl__block[data-error="true"][data-ttft="true"] { background: var(--ew-color-danger-500); }
 
 .ew-traj-tl__block[data-selected="false"] { opacity: 0.2; }
 .ew-traj-tl__block[data-search-match="false"] { opacity: 0.14; }

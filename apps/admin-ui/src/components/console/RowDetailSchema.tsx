@@ -15,13 +15,16 @@ import type { ToolSchemaState } from "./useAgentTools";
 
 const { Text } = Typography;
 
-/** TOOL row → its `entry.toolName`; PLAN row whose `source` is
- *  `"update_plan"` → the synthetic tool name `"update_plan"` (it's a real
- *  tool call under the hood, just not a `ToolRow` projection); everything
- *  else (planner-node PLAN rows included) → null, meaning "no tool schema
- *  to show for this record". */
+/** TOOL row → its `entry.rawName`(catalog key = registered name = the
+ *  un-stripped wire name;`entry.toolName` is the display name with any
+ *  `mcp__server__` prefix already stripped — using it here would make every
+ *  MCP tool record miss the catalog, see 终审 C1)、空字符串(两帧都没带
+ *  name)则 null;PLAN row whose `source` is `"update_plan"` → the synthetic
+ *  tool name `"update_plan"` (it's a real tool call under the hood, just not
+ *  a `ToolRow` projection); everything else (planner-node PLAN rows
+ *  included) → null, meaning "no tool schema to show for this record". */
 export function schemaToolNameOf(row: TrajectoryRow): string | null {
-  if (row.kind === "tool") return row.entry.toolName;
+  if (row.kind === "tool") return row.entry.rawName !== "" ? row.entry.rawName : null;
   if (row.kind === "plan" && row.source === "update_plan") return "update_plan";
   return null;
 }
@@ -70,8 +73,7 @@ export function SchemaPanel({
       <dl className="ew-detail__ov">
         <DetailRow label="">{item.description}</DetailRow>
         <DetailRow label={t("console.detail_schema_source")}>
-          {item.source}
-          {item.from_skill !== null && ` · skill:${item.from_skill}`}
+          {item.from_skill !== null ? `skill:${item.from_skill}` : item.source}
         </DetailRow>
         {item.deferred && <DetailRow label="">{t("console.detail_schema_deferred")}</DetailRow>}
       </dl>
