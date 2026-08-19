@@ -29,7 +29,7 @@
 .ew-kt--user { --ew-kt-color: var(--ew-color-brand-300); }
 .ew-kt--memory { --ew-kt-color: var(--ew-color-success-500); }
 .ew-kt--assistant { --ew-kt-color: var(--ew-accent-violet); }
-.ew-kt--reflect { --ew-kt-color: var(--ew-color-accent-600); }
+.ew-kt--reflect { --ew-kt-color: var(--ew-accent-violet-dim); }
 .ew-kt--tool { --ew-kt-color: var(--ew-color-warning-500); }
 .ew-kt--subagent { --ew-kt-color: var(--ew-color-warning-700); }
 .ew-kt--plan { --ew-kt-color: var(--ew-color-teal-500); }
@@ -37,5 +37,10 @@
 /* compaction / retry / error / approval / guard / gap 用默认的 secondary。 */
 
 .ew-ledger__row[data-error="true"] .ew-kt {
+  --ew-kt-color: var(--ew-color-danger-500);
+}
+
+/* 详情头部的标签自己带状态(账本行那条选择器够不到它)。 */
+.ew-kt[data-error="true"] {
   --ew-kt-color: var(--ew-color-danger-500);
 }

@@ -151,7 +151,7 @@
 .ew-traj-tl__block[data-kind="user"] { background: var(--ew-color-brand-300); }
 .ew-traj-tl__block[data-kind="memory"] { background: var(--ew-color-success-500); }
 .ew-traj-tl__block[data-kind="assistant"] { background: var(--ew-accent-violet); }
-.ew-traj-tl__block[data-kind="reflect"] { background: var(--ew-color-accent-400); }
+.ew-traj-tl__block[data-kind="reflect"] { background: var(--ew-accent-violet-dim); }
 .ew-traj-tl__block[data-kind="tool"] { background: var(--ew-color-warning-500); }
 .ew-traj-tl__block[data-kind="subagent"] { background: var(--ew-color-warning-700); }
 .ew-traj-tl__block[data-kind="plan"] { background: var(--ew-color-teal-500); }

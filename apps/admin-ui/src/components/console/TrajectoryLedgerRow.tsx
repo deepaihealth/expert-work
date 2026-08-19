@@ -11,21 +11,18 @@ import type { TFunction } from "i18next";
 
 import type { TrajectoryRow } from "../../api/trajectory_rows";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
+import { kindLabel } from "./kind_label";
 import type { DisplayRow } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { processHeadline } from "./process_summary";
 
+// 标签文案搬去了共享的 `kind_label.ts`(详情头部、时间轴提示同一份);从这里
+// 再导出一次,老调用方与既有测试照旧按行文件引。
+export { kindLabel };
+
 /** 内容列写成「名字 参数JSON」的类型(spec §九「内容」)—— 也是唯一会在没有
  *  结果时补「(无输出)」的几类。 */
 const NAMED_KINDS: ReadonlySet<TrajectoryRow["kind"]> = new Set(["tool", "subagent", "plan"]);
-
-/** 类型标签文案:多数直接复用中栏的 `console.traj_kind_*`,两个例外由 spec §九
- *  的标签列点名(subagent → SUBTOOL、compaction → COMPACTED)。 */
-export function kindLabel(kind: TrajectoryRow["kind"], t: TFunction): string {
-  if (kind === "subagent") return t("console.ledger_kind_subtool");
-  if (kind === "compaction") return t("console.ledger_kind_compacted");
-  return t(`console.traj_kind_${kind}`);
-}
 
 interface ContentParts {
   /** 未回放的轮的状态前缀(`正在回放…` / `回放失败…`);正常记录 null。 */

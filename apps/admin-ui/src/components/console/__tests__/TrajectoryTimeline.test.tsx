@@ -4,7 +4,7 @@
  * 几何靠 mock 掉的 `getBoundingClientRect`(轨道 = 左 0 宽 1000px)。
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import i18n from "../../../i18n";
 
 import type { TrajectoryRow } from "../../../api/trajectory_rows";
@@ -544,6 +544,23 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(tip).toHaveTextContent("总计 400ms");
     // 顺序模式里块的横向位置跟真实时刻无关,报钟点会误导。
     expect(tip.textContent).not.toContain("→");
+  });
+
+  // 终审 I3 —— 提示的类型标签与账本行、详情头部同一份(`kind_label.ts`),
+  // spec §九 的两个例外(subagent → SUBTOOL、compaction → COMPACTED)在这里
+  // 也得照办。
+  it("提示的类型标签走共享的 kindLabel:SUBTOOL / COMPACTED", async () => {
+    const records = [rec(0, 2, "subagent", 1000, 1200), rec(1, 1, "compaction", 1200, 1200)];
+    render(<TrajectoryTimeline {...props({ records })} />);
+
+    fireEvent.mouseOver(blockAt(0));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("SUBTOOL");
+    fireEvent.mouseOut(blockAt(0));
+
+    fireEvent.mouseOver(blockAt(1));
+    await waitFor(() => {
+      expect(screen.getByRole("tooltip")).toHaveTextContent("COMPACTED");
+    });
   });
 
   it("时长模式的提示多一行「起点 → 终点」钟点", async () => {

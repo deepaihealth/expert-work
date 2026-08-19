@@ -26,6 +26,7 @@ import { fmtDuration } from "../../pages/agent_detail/playground/duration_format
 import { EventCard } from "../EventCard";
 import { FullTextModal, type FullTextState } from "../turn/FullTextModal";
 import { DetailRow, DetailsFrame, HierLink } from "./DetailsFrame";
+import { kindLabel } from "./kind_label";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import {
   AssistantPreview,
@@ -286,8 +287,10 @@ export function RecordDetails(props: RecordDetailsProps) {
       }))}
       header={
         <>
-          <span className={`ew-kt ew-kt--${record.kind}`}>
-            {t(`console.traj_kind_${record.kind}`)}
+          {/* 标签文案与账本行、时间轴提示同一份(`kind_label.ts`);失败态靠
+              `data-error` 交给样式表染红,与账本行那条选择器同一个变量。 */}
+          <span className={`ew-kt ew-kt--${record.kind}`} data-error={record.isError ? "true" : undefined}>
+            {kindLabel(record.kind, t)}
           </span>
           <span className="ew-detail__loc">
             {row.step === null
