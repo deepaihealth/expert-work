@@ -212,4 +212,15 @@ describe("parseTimeline", () => {
     expect(steps[1].reasoningTokens).toBeUndefined();
     expect(steps[1].cacheReadTokens).toBeUndefined();
   });
+
+  it("reads additional_kwargs.first_token_ms into AgentStep.firstTokenMs (undefined when absent)", () => {
+    const withTtft = parseTimeline([
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "a", additional_kwargs: { first_token_ms: 812 }, usage_metadata: {} }] }, "t1"),
+    ]);
+    expect(withTtft[0]).toMatchObject({ kind: "agent", firstTokenMs: 812 });
+    const without = parseTimeline([
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "a", usage_metadata: {} }] }, "t1"),
+    ]);
+    expect((without[0] as AgentStep).firstTokenMs).toBeUndefined();
+  });
 });

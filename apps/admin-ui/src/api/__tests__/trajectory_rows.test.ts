@@ -320,3 +320,32 @@ describe("ledgerRowsOf", () => {
     expect(subagent?.serverMs).toBeNull();
   });
 });
+
+describe("ledgerRowsOf — SYSTEM row (PR-A.3 §十.1)", () => {
+  const input = { text: "hi", attachmentNames: [], inputs: {} };
+  it("prepends a system row when the run carries a system_prompt frame", () => {
+    // 帧 id 须满足 serverMsOf 的 `\d{10,}-\d+` 格式(真实 SSE id 是 epoch 毫秒,
+    // 至少 10 位)才能被解析出 serverMs —— 用 10 位定长 id,而非仅作示意的短数字。
+    const events: SseEvent[] = [
+      wire("metadata", { run_id: "r", thread_id: "t" }, "1000000000-1"),
+      wire("system_prompt", { text: "你是评审员\n第二行" }, "1000000001-2"),
+      wire("updates", { agent: { step_count: 1, messages: [{ type: "ai", content: "ok", usage_metadata: {} }] } }, "1000000002-3"),
+    ];
+    const rows = ledgerRowsOf(events, input);
+    expect(rows.map((r) => r.kind)).toEqual(["system", "user", "assistant"]);
+    expect(rows[0]).toMatchObject({ id: "system", kind: "system", text: "你是评审员\n第二行", seq: -1, eventIndexes: [1], serverMs: 1000000001 });
+  });
+  it("no frame / empty text → no system row; compact projection never sees it", () => {
+    const events: SseEvent[] = [wire("system_prompt", { text: "" }, "1000000001-2")];
+    expect(ledgerRowsOf(events, input).map((r) => r.kind)).toEqual(["user"]);
+    expect(ledgerRowsOf([], input).map((r) => r.kind)).toEqual(["user"]);
+    expect(compactRowsOf([wire("system_prompt", { text: "x" }, "1000000001-2")]).map((r) => r.kind)).not.toContain("system");
+  });
+  it("assistant row carries firstTokenMs from the step", () => {
+    const events: SseEvent[] = [
+      wire("updates", { agent: { step_count: 1, messages: [{ type: "ai", content: "ok", additional_kwargs: { first_token_ms: 640 }, usage_metadata: {} }] } }, "1000000002-3"),
+    ];
+    const assistant = ledgerRowsOf(events, input).find((r) => r.kind === "assistant");
+    expect(assistant).toMatchObject({ kind: "assistant", firstTokenMs: 640 });
+  });
+});

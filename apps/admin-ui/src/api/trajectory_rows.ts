@@ -12,6 +12,7 @@
  */
 import type { PlanStep, PlanStepStatus, ThreadPlan } from "./plan";
 import type { SseEvent } from "./sessions";
+import { serverMsOf } from "./sse_id";
 import { parseTimeline } from "./timeline";
 import { messagesOf, type ToolCallEntry } from "./tool_timeline";
 import type { WorkerTimeline } from "./worker_timeline";
@@ -49,6 +50,8 @@ export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "ap
 export type CompactRow = ThinkRow | ToolRow | SubagentRow | PlanRow | MemoryRow | ReflectRow | MarkerRow;
 
 export type UserRow = RowBase & { kind: "user"; text: string; attachmentNames: string[]; inputs: Record<string, string> };
+/** run 开头那帧 `system_prompt` 投影成的账本首行(PR-A.3 §十.1)。 */
+export type SystemRow = RowBase & { kind: "system"; text: string };
 export type AssistantRow = RowBase & {
   kind: "assistant";
   /** 该步正文;没有 ""。 */
@@ -58,11 +61,13 @@ export type AssistantRow = RowBase & {
   model: string | null;
   inputTokens: number; outputTokens: number;
   reasoningTokens?: number; cacheReadTokens?: number;
+  /** 该步首 token 毫秒(`AgentStep.firstTokenMs`);没有就是 undefined。 */
+  firstTokenMs?: number;
   finishReason: string | null;
   /** 该步发起的工具调用数(含 update_plan)。 */
   toolCallCount: number;
 };
-export type TrajectoryRow = UserRow | CompactRow | AssistantRow;
+export type TrajectoryRow = UserRow | SystemRow | CompactRow | AssistantRow;
 
 export interface TrajectoryInput { text: string; attachmentNames: string[]; inputs: Record<string, string> }
 
@@ -156,6 +161,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
             text: item.content ?? "", reasoning: item.reasoning ?? "", model: item.model,
             inputTokens: item.inputTokens, outputTokens: item.outputTokens,
             reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
+            firstTokenMs: item.firstTokenMs,
             finishReason: item.finishReason, toolCallCount: item.tools.length,
             status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
             eventIndexes: idx(item), serverMs: item.serverMs ?? null,
@@ -280,12 +286,30 @@ function userRowOf(input: TrajectoryInput): UserRow {
   };
 }
 
-/** 账本投影(spec §九 D2):`user` + 每个 agent 步一条 `assistant`(id
- *  `assistant:${seq}`,正文 / 思考 / 用量 / finishReason / 工具调用数都在行上)
- *  + 其余紧凑行(tool / plan / subagent / memory / reflect / marker,与
- *  `compactRowsOf` 同源同 id)。**不再有** think 行,也没有末尾合成 assistant 行。 */
+/** PR-A.3 §十.1 —— run 开头那帧 `system_prompt` → 账本里轮首的 SYSTEM 行。
+ *  只认第一帧;`data.text` 空就当没有。中栏投影(`compactRowsOf`)永远不出它。 */
+function systemRowOf(events: readonly SseEvent[]): SystemRow | null {
+  const i = events.findIndex((e) => e.event === "system_prompt");
+  if (i === -1) return null;
+  const data = events[i].data;
+  const text = data !== null && typeof data === "object" && typeof (data as { text?: unknown }).text === "string"
+    ? (data as { text: string }).text
+    : "";
+  if (text === "") return null;
+  return {
+    id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+    eventIndexes: [i], serverMs: serverMsOf(events[i].id), text,
+  };
+}
+
+/** 账本投影(spec §九 D2):(有 `system_prompt` 帧才有的)`system` 行 + `user` +
+ *  每个 agent 步一条 `assistant`(id `assistant:${seq}`,正文 / 思考 / 用量 /
+ *  finishReason / 工具调用数都在行上)+ 其余紧凑行(tool / plan / subagent /
+ *  memory / reflect / marker,与 `compactRowsOf` 同源同 id)。**不再有** think
+ *  行,也没有末尾合成 assistant 行。 */
 export function ledgerRowsOf(events: readonly SseEvent[], input: TrajectoryInput): TrajectoryRow[] {
-  return [userRowOf(input), ...rowsOf(events, { projection: "ledger" })];
+  const system = systemRowOf(events);
+  return [...(system === null ? [] : [system]), userRowOf(input), ...rowsOf(events, { projection: "ledger" })];
 }
 
 /** `GanttRow.key` → 轨迹行 id(泳道块点击定位用);找不到 → null。 */
