@@ -203,7 +203,10 @@ export function zoomViewport(
 /** 平移:视口整体挪 `deltaDomain`,夹在 `[model.start, model.end]`。 */
 export function panViewport(model: TimelineModel, viewport: TimeRange, deltaDomain: number): TimeRange {
   const width = viewport.end - viewport.start;
-  const start = Math.min(Math.max(viewport.start + deltaDomain, model.start), model.end - width);
+  const start = Math.min(
+    Math.max(viewport.start + deltaDomain, model.start),
+    Math.max(model.start, model.end - width),
+  );
   return { start, end: start + width };
 }
 

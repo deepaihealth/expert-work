@@ -190,6 +190,19 @@ describe("zoomViewport", () => {
     expect((anchorTime - viewport!.start) / duration).toBeCloseTo(anchorFraction, 6);
   });
 
+  it("wheel-in zooms toward an off-center anchor (0.2), not toward the domain center", () => {
+    // anchorFraction 0.5(上一条用例)与「以视口中心为轴缩放」的公式恰好重合,
+    // 区分不出「按 anchor 缩放」还是「居中缩放」;这里换 0.2 打破对称。
+    const model = deriveTimeline(nineRecords(), "duration") as TimelineModel; // bounds [1000,2800]
+    const viewport = { start: 1200, end: 2200 }; // 宽 1000,不触发夹取
+    const anchorFraction = 0.2;
+    const result = zoomViewport(model, viewport, anchorFraction, -300);
+    expect(result).not.toBeNull();
+    const anchorTime = viewport.start + anchorFraction * (viewport.end - viewport.start); // 1400
+    const duration = result!.end - result!.start;
+    expect((anchorTime - result!.start) / duration).toBeCloseTo(anchorFraction, 6);
+  });
+
   it("zooming in past the minimum width clamps to it (4 for sequence mode)", () => {
     const model = deriveTimeline(nineRecords(), "sequence") as TimelineModel;
     const viewport = zoomViewport(model, null, 0.5, -100_000);
