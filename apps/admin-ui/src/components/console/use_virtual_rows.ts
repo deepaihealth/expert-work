@@ -59,6 +59,22 @@ export function useVirtualRows(args: {
   // differs from what it was on the last render.
   const el = scrollRef.current;
 
+  // Refs attach during commit — strictly *after* this render's function
+  // body already read `scrollRef.current` above — so on a completely
+  // ordinary first mount `el` is still `null` here even though the real
+  // element is already there by the time any effect runs. Nothing else
+  // would otherwise cause a second render to pick that up (a purely
+  // historical, non-streaming session never re-renders on its own), so
+  // the listener effect below — keyed on `el` — would stay stuck on its
+  // stale `null` forever. This effect has no dependency array so it runs
+  // after *every* commit; it compares the live `scrollRef.current` to
+  // what this render captured and, on a mismatch, forces one more render
+  // via `setTick` so `el` (and the effect below) catch up. Converges in
+  // at most one extra render — once they match, it's a no-op.
+  useEffect(() => {
+    if (scrollRef.current !== el) setTick((n) => n + 1);
+  });
+
   useEffect(() => {
     if (!el) return undefined;
     const onChange = () => setTick((n) => n + 1);

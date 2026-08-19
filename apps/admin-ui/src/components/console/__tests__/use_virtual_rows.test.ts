@@ -4,8 +4,9 @@
  * here since jsdom never lays anything out).
  */
 import { describe, expect, it, vi } from "vitest";
-import { act, renderHook } from "@testing-library/react";
-import type { RefObject } from "react";
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { createElement, useRef } from "react";
+import type { ReactElement, RefObject } from "react";
 
 import { useVirtualRows } from "../use_virtual_rows";
 
@@ -18,6 +19,18 @@ function mockEl(clientHeight: number, scrollTop = 0): HTMLElement {
 
 function refOf(el: HTMLElement | null): RefObject<HTMLElement | null> {
   return { current: el };
+}
+
+// A real mounted component — as opposed to every other test in this file,
+// which hands `useVirtualRows` a ref object whose `.current` is already
+// populated *before* the hook ever runs. Refs actually attach during
+// commit, strictly after render, so this is the only fixture that
+// exercises the ordinary "first mount" ordering (`scrollRef.current` is
+// still `null` on the render that first calls the hook).
+function Probe(): ReactElement {
+  const ref = useRef<HTMLDivElement>(null);
+  const w = useVirtualRows({ scrollRef: ref, count: 1000, rowHeight: 20 });
+  return createElement("div", { ref, "data-testid": "scroller" }, `${w.start}-${w.end}`);
 }
 
 describe("useVirtualRows", () => {
@@ -137,5 +150,24 @@ describe("useVirtualRows", () => {
 
     expect(removeSpy).toHaveBeenCalledTimes(1);
     expect(disconnectSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("real mount path: the ref attaches during commit (after render), not before — listeners still get attached on a plain first mount", () => {
+    render(createElement(Probe));
+    const scroller = screen.getByTestId("scroller");
+
+    // clientHeight is jsdom's default (0) until mocked → windowOf's
+    // "whole range" branch, same as every unmocked element elsewhere in
+    // this file.
+    expect(scroller.textContent).toBe("0-1000");
+
+    Object.defineProperty(scroller, "clientHeight", { value: 200, configurable: true });
+    fireEvent.scroll(scroller, { target: { scrollTop: 4000 } });
+
+    // start = floor(4000/20) - 12 = 188; end = ceil(4200/20) + 12 = 222
+    // (default overscan). If the hook were still stuck on the render-time
+    // `null` it read before the ref attached, the scroll listener would
+    // never have been registered and the text would stay "0-1000".
+    expect(scroller.textContent).toBe("188-222");
   });
 });
