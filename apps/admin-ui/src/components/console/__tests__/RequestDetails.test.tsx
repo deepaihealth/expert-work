@@ -189,6 +189,19 @@ describe("RequestDetails", () => {
     ).toBe("—");
   });
 
+  // Task 11 —— 概要新增「首 token」一行,紧跟在「耗时」之后。
+  it("概要:有「首 token」一行;没有首 token 时写 —", () => {
+    const first = renderRequest({ request: request({ firstTokenMs: 640 }) });
+    const summary = screen.getByTestId("console-detail-summary");
+    expect(within(summary).getByText("First token").nextSibling?.textContent).toBe("640ms");
+    first.unmount();
+
+    renderRequest();
+    expect(
+      within(screen.getByTestId("console-detail-summary")).getByText("First token").nextSibling?.textContent,
+    ).toBe("—");
+  });
+
   it("概要:结果按钮抛 onOpenRecord(该请求的 assistant 记录)", async () => {
     const { props } = renderRequest();
     const button = screen.getByTestId("console-detail-hier-assistant");

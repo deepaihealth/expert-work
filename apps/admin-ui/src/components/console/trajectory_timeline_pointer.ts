@@ -147,5 +147,9 @@ export function tooltipLines(
   if (startedAt !== null && endedAt !== null && endedAt >= startedAt) {
     lines.push(t("console.timeline_tip_total", { d: fmtDuration(Math.round(endedAt - startedAt)) }));
   }
+  const firstTokenAt = record?.firstTokenAt ?? null;
+  if (startedAt !== null && firstTokenAt !== null && firstTokenAt >= startedAt) {
+    lines.push(t("console.timeline_tip_ttft", { d: fmtDuration(Math.round(firstTokenAt - startedAt)) }));
+  }
   return lines;
 }

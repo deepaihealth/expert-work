@@ -1297,6 +1297,8 @@ export interface TranslationKeys {
     detail_schema_source: string;
     detail_schema_deferred: string;
     detail_schema_parameters: string;
+    timeline_tip_ttft: string;
+    detail_first_token: string;
   };
   playground: {
     session_label: string;
@@ -4518,6 +4520,8 @@ const en: TranslationKeys = {
     detail_schema_source: "Source",
     detail_schema_deferred: "deferred — promoted on demand",
     detail_schema_parameters: "Parameters (JSON Schema)",
+    timeline_tip_ttft: "first token {{d}}",
+    detail_first_token: "First token",
   },
   playground: {
     session_label: "Session",
