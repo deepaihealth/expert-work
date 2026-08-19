@@ -32,11 +32,14 @@ export function useAgentTools(args: {
   const [byName, setByName] = useState<ReadonlyMap<string, AgentToolSchema>>(new Map());
   const [nonce, setNonce] = useState(0);
 
-  // A new agent identity invalidates whatever's cached — tracked via ref
-  // (not state) so the single effect below can both detect the change and
-  // fetch for the new identity in the same pass, instead of waiting for a
-  // second render that no dependency would actually trigger.
-  const identity = `${agentName}@${agentVersion}`;
+  // A new agent identity — including tenant scope, since a system_admin's
+  // ``apiTenantScope`` flipping (home → "*" → a specific tenant UUID) is
+  // also "different data" (fix round 1, Important #2; TenantScopeContext.tsx
+  // :122-133) — invalidates whatever's cached. Tracked via ref (not state)
+  // so the single effect below can both detect the change and fetch for the
+  // new identity in the same pass, instead of waiting for a second render
+  // that no dependency would actually trigger.
+  const identity = `${agentName}@${agentVersion}@${String(apiTenantScope)}`;
   const identityRef = useRef(identity);
 
   useEffect(() => {
@@ -46,7 +49,14 @@ export function useAgentTools(args: {
     if (identityChanged) setByName(new Map());
     const idle = identityChanged || status === "idle";
     if (!enabled || !idle) {
-      if (identityChanged) setStatus("idle");
+      // Reset to idle when: identity changed (stale data), or a fetch that
+      // was still in flight is now being abandoned because `enabled`
+      // flipped off mid-`"loading"` — otherwise `status` gets stuck on
+      // `"loading"` forever (no further `enabled` toggle can re-arm it,
+      // since the `idle` check above would keep reading the stale
+      // `"loading"` value) with no retry affordance on that tab (fix round
+      // 1, Critical #1).
+      if (identityChanged || (!enabled && status === "loading")) setStatus("idle");
       return () => {
         cancelled = true;
       };
@@ -66,7 +76,7 @@ export function useAgentTools(args: {
     return () => {
       cancelled = true;
     };
-  }, [agentName, agentVersion, enabled, nonce]);
+  }, [agentName, agentVersion, enabled, nonce, apiTenantScope]);
 
   const reload = useCallback(() => {
     setStatus("idle");
