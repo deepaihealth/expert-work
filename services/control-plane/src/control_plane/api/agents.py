@@ -180,6 +180,26 @@ class RevisionDetail(BaseModel):
     record: AgentSpecRevisionRecord
 
 
+class AgentToolItem(BaseModel):
+    """PR-A.3 §十.2 — one row of the built agent's tool registry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    source: str
+    from_skill: str | None
+    deferred: bool
+
+
+class AgentToolList(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AgentToolItem]
+    total: int
+
+
 # ---------------------------------------------------------------------------
 # Dependency injection — pulls everything from request.app.state
 # ---------------------------------------------------------------------------
@@ -1581,6 +1601,73 @@ def build_agents_router() -> APIRouter:
         return JSONResponse(
             {"success": True, "data": AgentDetail(record=result.record).model_dump(mode="json")}
         )
+
+    @router.get("/{name}/{version}/tools", dependencies=_CONSOLE_ONLY)
+    async def list_agent_tools(
+        name: str,
+        version: str,
+        request: Request,
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+    ) -> JSONResponse:
+        """PR-A.3 §十.2 — the agent's full tool registry (JSON Schema included).
+
+        Builds the agent exactly like a run would (``runtime.get_agent`` is
+        LRU-cached, so after the first run this is a dict read) and projects
+        ``BuiltAgent.tool_catalog``. Read-only; no run is started.
+        """
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/agents/{name}/{version}/tools",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
+        if record is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await ensure_resource_access(
+            request, resource="manifest", action="read", attrs=_record_attrs(record)
+        )
+        try:
+            built = await runtime.get_agent(
+                tenant_id=target_tenant,
+                name=name,
+                version=version,
+                spec=record.spec,
+                user_id=request.state.principal.subject_id,
+            )
+        except AgentFactoryError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"agent manifest cannot be built: {exc}"
+            ) from exc
+        await emit(
+            audit,
+            tenant_id=target_tenant,
+            actor_id=request.state.actor_id,
+            action=AuditAction.MANIFEST_READ,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}/tools",
+            trace_id=current_trace_id_hex(),
+        )
+        items = [
+            AgentToolItem(
+                name=t.name,
+                description=t.description,
+                parameters=dict(t.parameters),
+                source=t.source,
+                from_skill=t.from_skill,
+                deferred=t.deferred,
+            )
+            for t in built.tool_catalog
+        ]
+        payload = AgentToolList(items=items, total=len(items))
+        return JSONResponse({"success": True, "data": payload.model_dump(mode="json")})
 
     @router.get("/{name}/{version}/revisions", dependencies=_CONSOLE_ONLY)
     async def list_revisions(
