@@ -1,0 +1,129 @@
+/*
+ * TrajectoryToolbar — component-scoped styles (PR-A.2 Task 5). `--ew-*`
+ * design tokens end to end, dimensions mirrored from deepseek-harness's
+ * ui-trajectory Toolbar: 28px bar, 20px buttons, 164px search box.
+ */
+.ew-tbar {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  gap: 8px;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  background: var(--ew-surface-base);
+}
+
+.ew-tbar__actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.ew-tbar__toggle,
+.ew-tbar__action {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 20px;
+  padding: 0 7px;
+  gap: 4px;
+  border: 0;
+  border-radius: var(--ew-radius-sm);
+  color: var(--ew-text-tertiary);
+  background: transparent;
+  cursor: pointer;
+  font-size: var(--ew-font-size-xs);
+}
+
+.ew-tbar__toggle:hover,
+.ew-tbar__action:hover:not(:disabled) {
+  color: var(--ew-text-secondary);
+  background: var(--ew-surface-hover);
+}
+
+.ew-tbar__toggle[aria-pressed="true"],
+.ew-tbar__action[aria-pressed="true"] {
+  color: var(--ew-text-secondary);
+  background: var(--ew-surface-hover);
+}
+
+.ew-tbar__toggle:focus-visible,
+.ew-tbar__action:focus-visible {
+  outline: 1px solid var(--ew-border-focus);
+  outline-offset: 1px;
+}
+
+.ew-tbar__action:disabled {
+  color: var(--ew-text-disabled);
+  cursor: not-allowed;
+}
+
+.ew-tbar__toggle-icon {
+  flex: none;
+}
+
+.ew-tbar__icon {
+  font-family: var(--ew-font-mono);
+  font-size: 14px;
+  line-height: 14px;
+  color: inherit;
+}
+
+.ew-tbar__degraded {
+  flex: none;
+  padding: 0 4px;
+  color: var(--ew-text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.ew-tbar__search {
+  display: flex;
+  flex: 0 1 164px;
+  align-items: center;
+  min-width: 84px;
+  height: 22px;
+  margin-left: auto;
+  padding: 0 6px;
+  gap: 4px;
+  border: 1px solid var(--ew-border-subtle);
+  border-radius: var(--ew-radius-sm);
+  color: var(--ew-text-tertiary);
+  background: var(--ew-surface-raised);
+}
+
+.ew-tbar__search:focus-within {
+  border-color: var(--ew-border-focus);
+  background: var(--ew-surface-base);
+}
+
+.ew-tbar__search-icon {
+  flex: none;
+  color: inherit;
+}
+
+.ew-tbar__search-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ew-text-primary);
+  background: transparent;
+  font-size: var(--ew-font-size-xs);
+}
+
+.ew-tbar__search-input::placeholder {
+  color: var(--ew-text-tertiary);
+}
+
+.ew-tbar__search-count {
+  flex: none;
+  color: var(--ew-text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}

@@ -1259,6 +1259,19 @@ export interface TranslationKeys {
     traj_filter_clear: string;
     inspect_run_detail: string;
     traj_list_label: string;
+    toolbar_duration: string;
+    toolbar_duration_title_on: string;
+    toolbar_duration_title_off: string;
+    toolbar_degraded: string;
+    toolbar_turns: string;
+    toolbar_collapse_turns: string;
+    toolbar_expand_turns: string;
+    toolbar_calls: string;
+    toolbar_collapse_calls: string;
+    toolbar_expand_calls: string;
+    toolbar_search: string;
+    toolbar_search_count: string;
+    toolbar_aria: string;
   };
   playground: {
     session_label: string;
@@ -4442,6 +4455,19 @@ const en: TranslationKeys = {
     traj_filter_clear: "Clear filter",
     inspect_run_detail: "Run detail",
     traj_list_label: "Trajectory rows",
+    toolbar_duration: "Duration",
+    toolbar_duration_title_on: "Use equal widths",
+    toolbar_duration_title_off: "Use recorded durations",
+    toolbar_degraded: "No timing",
+    toolbar_turns: "Turns",
+    toolbar_collapse_turns: "Collapse all turns",
+    toolbar_expand_turns: "Expand all turns",
+    toolbar_calls: "Calls",
+    toolbar_collapse_calls: "Collapse all tool calls",
+    toolbar_expand_calls: "Expand all tool calls",
+    toolbar_search: "Search",
+    toolbar_search_count: "{{n}} matches",
+    toolbar_aria: "Trajectory toolbar",
   },
   playground: {
     session_label: "Session",
