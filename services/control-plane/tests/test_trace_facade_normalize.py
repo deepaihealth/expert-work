@@ -8,7 +8,7 @@ normalized DTO the debug console's trace view consumes.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -509,3 +509,58 @@ def test_normalize_tool_span_detail_from_attributes_tool() -> None:
     spans = normalize_trace(_trace(obs))["spans"]
     tool = next(s for s in spans if s["kind"] == "tool")
     assert tool["detail"] == "mcp__amap-maps__maps_weather"
+
+
+def test_latency_prefers_end_minus_start_over_langfuse_latency_field() -> None:
+    """真栈 2026-08-19:测试集群这版 Langfuse 的 ``latency`` 是毫秒,旧代码当秒 x1000
+    → 计时 tab「121m5s」。有 start/end 就用差值;``latency`` 只兜底。"""
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    obs = [
+        _obs(
+            "root",
+            "SPAN",
+            "expert_work.session.run",
+            None,
+            46268.0,
+            0,
+            end_time=t0 + timedelta(milliseconds=46268),
+        ),
+        _obs(
+            "llm",
+            "GENERATION",
+            "expert_work.orchestrator.llm_call",
+            "root",
+            29786.0,
+            1,
+            end_time=t0 + timedelta(seconds=1, milliseconds=29786),
+        ),
+    ]
+    out = normalize_trace(_trace(obs))
+    by_id = {s["id"]: s for s in out["spans"]}
+    assert by_id["root"]["latencyMs"] == 46268
+    assert by_id["llm"]["latencyMs"] == 29786
+    # max(end) = root.end (t0+46268ms, later than llm.end at t0+30786ms);
+    # min(start) = trace_start = root.start (t0). NOT 46268+1000: llm starts
+    # 1s after t0 but ends BEFORE root, so it doesn't push the trace-level max.
+    assert out["trace"]["latencyMs"] == 46268
+
+
+def test_latency_falls_back_to_langfuse_field_when_end_time_missing() -> None:
+    obs = [_obs("root", "SPAN", "expert_work.session.run", None, 1.5, 0)]  # 无 end_time attribute
+    out = normalize_trace(_trace(obs))
+    assert out["spans"][0]["latencyMs"] == 1500
+
+
+def test_spans_are_sorted_by_start_ms_stably() -> None:
+    """Langfuse 按创建倒序回 observations;前端 Rule 2 按数组序配对,必须先排。"""
+    obs = [
+        _obs("root", "SPAN", "expert_work.session.run", None, 40.0, 0),
+        _obs("llm2", "GENERATION", "expert_work.orchestrator.llm_call", "root", 7.0, 33),
+        _obs("tool", "SPAN", "expert_work.orchestrator.tool_call", "root", 1.5, 30),
+        _obs("llm1", "GENERATION", "expert_work.orchestrator.llm_call", "root", 29.0, 1),
+    ]
+    out = normalize_trace(_trace(obs))
+    starts = [s["startMs"] for s in out["spans"]]
+    assert starts == sorted(starts)
+    llm_ids = [s["id"] for s in out["spans"] if s["kind"] == "llm"]
+    assert llm_ids == ["llm1", "llm2"]
