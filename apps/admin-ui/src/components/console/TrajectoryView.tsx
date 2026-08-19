@@ -202,6 +202,9 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
         matchCount={state.matches?.size ?? null}
       />
       <TrajectoryTimeline
+        // 视口(缩放 / 平移)是时间轴自己的 state —— 换会话时和账本一样重挂,
+        // 否则读者会停在上一个会话缩放到的那一小段上。
+        key={threadId ?? "none"}
         model={timeline}
         records={ledger.records}
         range={state.range}

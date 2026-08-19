@@ -563,18 +563,27 @@ describe("TrajectoryView · 组合", () => {
     expect(screen.getByTestId("console-traj-ledger")).not.toBe(before);
   });
 
-  it("换 threadId → 选中 / 选区 / 搜索 / 折叠全部复位", () => {
+  it("换 threadId → 选中 / 选区 / 搜索 / 折叠 / 时间轴视口全部复位", () => {
     const view = renderView();
+    // 时间轴的缩放 / 平移是组件内部 state,不跟着上面那批 state 一起复位 ——
+    // 终审 I2:换会话后读者会停在上一个会话缩放到的那一小段上(域宽 > 100%)。
+    const domainWidth = (): number => {
+      const lanes = blocks()[0].parentElement as HTMLElement;
+      return Number.parseFloat(lanes.style.getPropertyValue("--traj-domain-width"));
+    };
     fireEvent.click(rowOf("A/tool:0:0"));
     drag(100, 400);
     fireEvent.change(screen.getByTestId("console-traj-search"), { target: { value: "query_crm" } });
+    fireEvent.wheel(screen.getByTestId("console-lane-strip"), { deltaY: -200, clientX: 500 });
     expect(screen.getByTestId("console-detail-aside")).toBeInTheDocument();
+    expect(domainWidth()).toBeGreaterThan(100);
 
     view.rerender({ threadId: "th-2" });
     expect(screen.queryByTestId("console-detail-aside")).not.toBeInTheDocument();
     expect(screen.getByTestId("console-traj-search")).toHaveValue("");
     expect(rows()).toHaveLength(9);
     expect(rowOf("A/user")).not.toHaveAttribute("data-focus");
+    expect(domainWidth()).toBeCloseTo(100, 3);
   });
 
   it("运行中每秒把「现在」往前推,时长投影里的尾块跟着长", () => {
@@ -642,6 +651,26 @@ describe("TrajectoryView · 组合", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // 终审 I1 —— 秒针只是其中一个源头:`useTokenStream` 每次 rAF flush 都换一份
+  // `liveByStep` 引用,视图看不见时照样会把整本账 + gantt 重算一遍。看不见就
+  // 冻结在最后一次可见时的那一份,重新可见的那一次渲染立刻取回最新的。
+  it("visible=false 期间 liveByStep 换引用不重建账本,切回可见立刻补上", () => {
+    const turns = fixture();
+    const view = renderView({ running: true, visible: false, turns: [turns[0], turns[2]] });
+    const ids = (): string[] => rows().map((r) => r.dataset.recordId ?? "");
+    expect(ids()).not.toContain("C/live-assistant:2");
+    const frozen = ids();
+
+    const live = new Map<number, LiveStep>([
+      [2, { content: "正在写", reasoning: "", toolNames: new Map(), reasoningMs: null }],
+    ]);
+    view.rerender({ liveByStep: live });
+    expect(ids()).toEqual(frozen);
+
+    view.rerender({ liveByStep: live, visible: true });
+    expect(ids()).toContain("C/live-assistant:2");
   });
 
   it("nowMs 用帧的服务端时钟校准,不是裸 Date.now()", () => {

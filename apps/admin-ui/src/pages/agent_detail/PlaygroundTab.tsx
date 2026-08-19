@@ -602,8 +602,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 },
               ]}
             />
+            {/* 轮数只跟在切换器右边:再来一个 `marginLeft: "auto"` 会把弹性
+                余量分成两段,Segmented 自己也被推走,不再居中偏右。 */}
             {consoleTurns.length > 0 && (
-              <Text type="secondary" style={{ fontSize: 12, marginLeft: "auto" }}>
+              <Text type="secondary" style={{ fontSize: 12, marginLeft: 12 }}>
                 {t("console.turn_count", { n: consoleTurns.length })}
               </Text>
             )}

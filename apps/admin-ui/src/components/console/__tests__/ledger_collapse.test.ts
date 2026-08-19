@@ -210,6 +210,31 @@ describe("turnSummaryOf", () => {
     expect(turnSummaryOf(records)).toMatchObject({ think: 2, tools: 1, failed: 1 });
   });
 
+  // 终审 M9 —— 原先是逐条时长相加,并行发出的工具会被重复计一遍,折叠行报出
+  // 的「这一轮花了多久」比真实墙钟长出一截。
+  it("并行调用不重复计时:该轮时长 = max(endedAt) - min(startedAt)", () => {
+    const tool = (id: string, name: string, startedAt: number, endedAt: number): LedgerRecord =>
+      rec({
+        id, index: 0, kind: "tool", startedAt, endedAt,
+        row: { kind: "tool", entry: { toolName: name, server: null } } as LedgerRecord["row"],
+      });
+    const records = [
+      rec({ id: "a1", index: 0, kind: "assistant", startedAt: 1000, endedAt: 1200 }),
+      tool("t1", "alpha", 1200, 1900),
+      tool("t2", "bravo", 1210, 1800),
+    ];
+
+    // 逐条相加 = 200 + 700 + 590 = 1490,而这一轮真实的墙钟只有 900。
+    expect(turnSummaryOf(records).durationMs).toBe(900);
+  });
+
+  it("一条带时序的记录都没有 → durationMs 为 null", () => {
+    expect(turnSummaryOf([rec({ id: "a1", index: 0, kind: "assistant" })]).durationMs).toBeNull();
+    // 只有起点没有终点(跑到一半)也算不出这一轮多久。
+    expect(turnSummaryOf([rec({ id: "a1", index: 0, kind: "assistant", startedAt: 1000 })]).durationMs)
+      .toBeNull();
+  });
+
   it("toolBreakdown ties (equal counts) sort alphabetically by name", () => {
     const records = [
       rec({ id: "t1", index: 0, kind: "tool", row: { kind: "tool", entry: { toolName: "bravo", server: null } } as LedgerRecord["row"] }),
@@ -239,5 +264,39 @@ describe("collapsibleTurnKeys / collapsibleOwnerIds", () => {
     expect(collapsibleTurnKeys(ledger)).toEqual(["t2"]);
     // a1 owns no children; a2 owns the tool call.
     expect(collapsibleOwnerIds(ledger)).toEqual(["a2"]);
+  });
+
+  // 终审 M13 让 reflect / memory 写回也带 parentId(详情层级链接用);它们不是
+  // 调用,不能因此变成可折叠的子记录,折叠调用时也必须留在外面。
+  it("reflect / memory-writeback carrying a parentId are not collapse children", () => {
+    const user = rec({ id: "u1", index: 0, turnKey: "t1", kind: "user" });
+    const assistant = rec({ id: "a1", index: 1, turnKey: "t1", kind: "assistant" });
+    const reflect = rec({ id: "rf1", index: 2, turnKey: "t1", kind: "reflect", parentId: "a1" });
+    const memory = rec({ id: "m1", index: 3, turnKey: "t1", kind: "memory", parentId: "a1" });
+    const assistant2 = rec({ id: "a2", index: 4, turnKey: "t1", kind: "assistant" });
+    const tool = rec({
+      id: "tool1", index: 5, turnKey: "t1", kind: "tool", parentId: "a2",
+      row: { kind: "tool", entry: { toolName: "bash", server: null } } as LedgerRecord["row"],
+    });
+    const reflect2 = rec({ id: "rf2", index: 6, turnKey: "t1", kind: "reflect", parentId: "a2" });
+    const ledger = ledgerOf(
+      [user, assistant, reflect, memory, assistant2, tool, reflect2],
+      [turn({ key: "t1", lastIndex: 6 })],
+    );
+
+    // a1 only has after-products → not collapsible; a2 has a real tool call.
+    expect(collapsibleOwnerIds(ledger)).toEqual(["a2"]);
+
+    const rows = displayRowsOf(ledger, {
+      collapsedTurns: new Set(),
+      collapsedOwners: new Set(["a2"]),
+      matches: null,
+    });
+    // The tool folds into a2's calls-summary; both reflects and the memory row stay visible.
+    expect(rows.map((r) => (r.kind === "record" ? r.record.id : r.kind))).toEqual([
+      "u1", "a1", "rf1", "m1", "a2", "calls-summary", "rf2",
+    ]);
+    const summary = rows.find((r) => r.kind === "calls-summary");
+    expect(summary).toMatchObject({ count: 1, toolBreakdown: "bash ×1" });
   });
 });

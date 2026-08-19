@@ -4,7 +4,7 @@
  * 几何靠 mock 掉的 `getBoundingClientRect`(轨道 = 左 0 宽 1000px)。
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import i18n from "../../../i18n";
 
 import type { TrajectoryRow } from "../../../api/trajectory_rows";
@@ -296,6 +296,28 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onSelectRecord).not.toHaveBeenCalled();
   });
 
+  // 终审 M12 —— 一轮里所有记录都落在同一时刻(时长投影域退化成 start === end)
+  // 时「一条记录宽」是 0:点空白提交出来的是一条零宽选区,账本每一行都被判
+  // outside、时间轴整片压暗,读者什么也没选却像选了个空。
+  it("时长域退化(所有记录同一时刻)时点空白只滚视口,不提交零宽选区", () => {
+    mockTrack();
+    const records = [
+      rec(0, 0, "user", 1000, 1000),
+      rec(1, 1, "assistant", 1000, 1000),
+      rec(2, 2, "tool", 1000, 1000),
+    ];
+    const p = props({ records, model: deriveTimeline(records, "duration") }, "duration");
+    expect(p.model?.start).toBe(p.model?.end);
+    render(<TrajectoryTimeline {...p} />);
+
+    fireEvent.pointerDown(track(), { clientX: 550, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(track(), { clientX: 550, pointerId: 1, button: 0 });
+
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+    expect(p.onFocusRecord).toHaveBeenCalled();
+    expect(p.onSelectRecord).not.toHaveBeenCalled();
+  });
+
   it("双击清选区", () => {
     const p = props({ range: { start: 1, end: 2 } });
     render(<TrajectoryTimeline {...p} />);
@@ -544,6 +566,23 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(tip).toHaveTextContent("总计 400ms");
     // 顺序模式里块的横向位置跟真实时刻无关,报钟点会误导。
     expect(tip.textContent).not.toContain("→");
+  });
+
+  // 终审 I3 —— 提示的类型标签与账本行、详情头部同一份(`kind_label.ts`),
+  // spec §九 的两个例外(subagent → SUBTOOL、compaction → COMPACTED)在这里
+  // 也得照办。
+  it("提示的类型标签走共享的 kindLabel:SUBTOOL / COMPACTED", async () => {
+    const records = [rec(0, 2, "subagent", 1000, 1200), rec(1, 1, "compaction", 1200, 1200)];
+    render(<TrajectoryTimeline {...props({ records })} />);
+
+    fireEvent.mouseOver(blockAt(0));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("SUBTOOL");
+    fireEvent.mouseOut(blockAt(0));
+
+    fireEvent.mouseOver(blockAt(1));
+    await waitFor(() => {
+      expect(screen.getByRole("tooltip")).toHaveTextContent("COMPACTED");
+    });
   });
 
   it("时长模式的提示多一行「起点 → 终点」钟点", async () => {

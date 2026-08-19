@@ -1186,17 +1186,9 @@ export interface TranslationKeys {
     detail_status: string;
     detail_duration: string;
     detail_model: string;
-    detail_tokens: string;
     detail_finish_reason: string;
-    detail_tool: string;
-    detail_server: string;
-    detail_steps_total: string;
-    detail_goal: string;
-    detail_count: string;
     detail_attachments: string;
     detail_variables: string;
-    detail_chars: string;
-    detail_worker: string;
     detail_worker_steps: string;
     detail_need_langfuse: string;
     detail_no_frames: string;
@@ -1215,7 +1207,6 @@ export interface TranslationKeys {
     timing_no_trace: string;
     timing_mismatch: string;
     timing_unsupported: string;
-    detail_action: string;
     detail_worker_summary: string;
     stats_chip_turns: string;
     stats_chip_steps: string;
@@ -1237,7 +1228,6 @@ export interface TranslationKeys {
     footer_tokens: string;
     footer_steps: string;
     footer_export: string;
-    inspect_run_detail: string;
     toolbar_duration: string;
     toolbar_duration_title_on: string;
     toolbar_duration_title_off: string;
@@ -4408,17 +4398,9 @@ const en: TranslationKeys = {
     detail_status: "Status",
     detail_duration: "Duration",
     detail_model: "Model",
-    detail_tokens: "In {{in}} · out {{out}}",
     detail_finish_reason: "Finish reason",
-    detail_tool: "Tool",
-    detail_server: "MCP server",
-    detail_steps_total: "Steps",
-    detail_goal: "Goal",
-    detail_count: "Count",
     detail_attachments: "Attachments",
     detail_variables: "Variables",
-    detail_chars: "Characters",
-    detail_worker: "Sub-agent",
     detail_worker_steps: "Sub-agent steps",
     detail_need_langfuse: "LLM input is only available from the Langfuse trace; no span matched this row yet.",
     detail_no_frames: "No raw frames for this row.",
@@ -4437,7 +4419,6 @@ const en: TranslationKeys = {
     timing_no_trace: "No trace for this run",
     timing_mismatch: "Could not align with a span",
     timing_unsupported: "No span for this row",
-    detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
     stats_chip_turns: "Turns",
     stats_chip_steps: "Steps",
@@ -4459,7 +4440,6 @@ const en: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
     footer_export: "Export",
-    inspect_run_detail: "Run detail",
     toolbar_duration: "Duration",
     toolbar_duration_title_on: "Use equal widths",
     toolbar_duration_title_off: "Use recorded durations",

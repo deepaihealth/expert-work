@@ -44,9 +44,14 @@ function childLabel(record: LedgerRecord): string | null {
 
 /** ``owner``'s tool/plan children (``parentId === owner.id``) plus any
  *  subagent whose parent tool belongs to ``owner`` (one hop through the
- *  tool's own ``parentId``). */
+ *  tool's own ``parentId``). Only those kinds — reflect / memory-writeback
+ *  records also carry a ``parentId`` (details-panel hierarchy link), but they
+ *  are the step's after-products, not calls, and stay visible when the owner's
+ *  calls are collapsed. */
 function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRecord[] {
-  const direct = records.filter((r) => r.parentId === ownerId);
+  const direct = records.filter(
+    (r) => r.parentId === ownerId && (r.kind === "tool" || r.kind === "plan"),
+  );
   if (direct.length === 0) return direct;
   const directIds = new Set(direct.map((r) => r.id));
   const transitive = records.filter(
@@ -59,16 +64,17 @@ function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRe
  *  — one ASSISTANT record per step replaces the compact THINK row), tool
  *  records count as "tools" (and feed ``toolBreakdown``), every other
  *  non-user kind counts as "other". ``failed`` is the non-assistant
- *  ``isError`` count; ``durationMs`` sums each record's own
- *  ``endedAt - startedAt`` (records missing either timestamp contribute
- *  nothing; ``null`` only when none have both). */
+ *  ``isError`` count; ``durationMs`` is the turn's wall clock —
+ *  ``max(endedAt) - min(startedAt)`` over the records that have both
+ *  timestamps (``null`` when none do). Summing each record's own span
+ *  instead would count parallel tool calls twice over. */
 export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary {
   let think = 0;
   let tools = 0;
   let other = 0;
   let failed = 0;
-  let dur = 0;
-  let any = false;
+  let first: number | null = null;
+  let last: number | null = null;
   const toolLabels: string[] = [];
 
   for (const r of records) {
@@ -80,12 +86,19 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
 
     if (r.kind !== "assistant" && r.isError) failed += 1;
     if (r.startedAt !== null && r.endedAt !== null) {
-      dur += r.endedAt - r.startedAt;
-      any = true;
+      first = first === null ? r.startedAt : Math.min(first, r.startedAt);
+      last = last === null ? r.endedAt : Math.max(last, r.endedAt);
     }
   }
 
-  return { think, tools, other, failed, toolBreakdown: breakdownOf(toolLabels), durationMs: any ? dur : null };
+  return {
+    think,
+    tools,
+    other,
+    failed,
+    toolBreakdown: breakdownOf(toolLabels),
+    durationMs: first === null || last === null ? null : last - first,
+  };
 }
 
 /** Turns with ≥ 2 non-user records — the only ones worth collapsing. */

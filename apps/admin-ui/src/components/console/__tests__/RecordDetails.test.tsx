@@ -15,6 +15,7 @@ import "../../../i18n";
 import type { SseEvent } from "../../../api/sessions";
 import type {
   AssistantRow,
+  MarkerRow,
   MemoryRow,
   SubagentRow,
   ToolRow,
@@ -123,6 +124,10 @@ function subagentRow(over: Partial<SubagentRow> = {}): SubagentRow {
     },
     ...over,
   };
+}
+
+function markerRow(over: Partial<MarkerRow> = {}): MarkerRow {
+  return { ...ROW_BASE, id: "compaction:9", kind: "compaction", step: null, text: "压缩了 12 条消息", ...over };
 }
 
 function rec(row: TrajectoryRow, over: Partial<LedgerRecord> = {}): LedgerRecord {
@@ -252,6 +257,61 @@ describe("RecordDetails", () => {
     const header2 = screen.getByTestId("console-detail-header");
     expect(header2.textContent).toContain("Turn 3");
     expect(header2.textContent).not.toContain("step");
+  });
+
+  // 终审 I3 —— 头部标签曾直接拼 `console.traj_kind_<kind>`,于是账本行写
+  // SUBTOOL / COMPACTED、详情头部却写 SUBAGENT / COMPACTION(spec §九 标签列
+  // 只认前者)。三处现在共用 `kind_label.ts`。
+  it("头部类型标签与账本同一套:subagent → SUBTOOL、compaction → COMPACTED", () => {
+    const first = renderRecord({ record: rec(subagentRow()) });
+    expect(within(screen.getByTestId("console-detail-header")).getByText("SUBTOOL"))
+      .toHaveClass("ew-kt", "ew-kt--subagent");
+    first.unmount();
+
+    renderRecord({ record: rec(markerRow()) });
+    expect(within(screen.getByTestId("console-detail-header")).getByText("COMPACTED"))
+      .toHaveClass("ew-kt", "ew-kt--compaction");
+  });
+
+  // 终审 M5 —— 失败态原先只有账本行那条选择器会把标签染红,详情头部的同一枚
+  // 标签留在中性色上。
+  it("失败记录:头部标签带 data-error,样式表按它染红", () => {
+    renderRecord({ record: rec(toolRow({ status: "error" }), { isError: true }) });
+    const tag = within(screen.getByTestId("console-detail-header")).getByText("TOOL");
+    expect(tag).toHaveAttribute("data-error", "true");
+    // vitest 配了 `css: false`,样式表不进 jsdom —— 规则本身在这里断言。
+    const css = readFileSync("src/components/console/kind_tag.css", "utf8");
+    const rule = /\.ew-kt\[data-error="true"\] \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(rule).toContain("--ew-kt-color: var(--ew-color-danger-500)");
+  });
+
+  it("正常记录的头部标签不带 data-error", () => {
+    renderRecord({ record: rec(toolRow()) });
+    expect(within(screen.getByTestId("console-detail-header")).getByText("TOOL"))
+      .not.toHaveAttribute("data-error");
+  });
+
+  // 终审 I4 —— REFLECT 标签是文字色,钉死的 `--ew-color-accent-600`(#9333ea)
+  // 在深色底上对比度不够;换成随主题走的语义令牌。同一令牌也铺时间轴的
+  // REFLECT 块,所以它在两个主题里都必须与 ASSISTANT 的 `--ew-accent-violet`
+  // 错开一档,否则同泳道的两类块分不出来。
+  it("REFLECT 用随主题走的 --ew-accent-reflect,两个主题里都与 --ew-accent-violet 错开", () => {
+    const tags = readFileSync("src/components/console/kind_tag.css", "utf8");
+    expect(/\.ew-kt--reflect \{([^}]*)\}/.exec(tags)?.[1] ?? "")
+      .toContain("var(--ew-accent-reflect)");
+    const timeline = readFileSync("src/components/console/trajectory_timeline.css", "utf8");
+    expect(/\.ew-traj-tl__block\[data-kind="reflect"\] \{([^}]*)\}/.exec(timeline)?.[1] ?? "")
+      .toContain("var(--ew-accent-reflect)");
+
+    const tokens = readFileSync("src/theme/tokens.css", "utf8");
+    const dark = /html\[data-theme="dark"\] \{([\s\S]*?)\n\}/.exec(tokens)?.[1] ?? "";
+    const light = /html\[data-theme="light"\] \{([\s\S]*?)\n\}/.exec(tokens)?.[1] ?? "";
+    const valueOf = (block: string, name: string): string =>
+      new RegExp(`${name}:\\s*var\\((--ew-color-accent-\\d+)\\)`).exec(block)?.[1] ?? "";
+    expect(valueOf(dark, "--ew-accent-reflect")).toBe("--ew-color-accent-300");
+    expect(valueOf(light, "--ew-accent-reflect")).toBe("--ew-color-accent-700");
+    expect(valueOf(dark, "--ew-accent-reflect")).not.toBe(valueOf(dark, "--ew-accent-violet"));
+    expect(valueOf(light, "--ew-accent-reflect")).not.toBe(valueOf(light, "--ew-accent-violet"));
   });
 
   it("层级:assistant + ownerRequest → 「请求 #N ›」抛 onOpenRequest", async () => {

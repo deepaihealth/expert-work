@@ -110,4 +110,12 @@ describe("DetailsFrame", () => {
     renderFrame({ width: 505 });
     expect(screen.getByTestId("console-detail-aside")).toHaveStyle({ width: "505px" });
   });
+
+  // 终审 M4 —— 夹取原先只发生在手柄事件里:窗口缩窄(splitWidth 变小)时
+  // 没人再动手柄,详情就按上一次那个宽度渲染,把账本挤到 280 以下。
+  it("容器缩窄后渲染宽度也按 splitWidth 夹(不等下一次拖手柄)", () => {
+    renderFrame({ width: 600, splitWidth: 700 });
+    // 上限 min(720, 700-280) = 420。
+    expect(screen.getByTestId("console-detail-aside")).toHaveStyle({ width: "420px" });
+  });
 });

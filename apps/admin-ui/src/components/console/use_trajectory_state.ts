@@ -180,11 +180,21 @@ export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latestEvents, nowTick]);
 
+  // 看不见时冻结 live 缓冲:`useTokenStream` 每次 rAF flush 都换一份
+  // `liveByStep` 引用,账本 memo 挂着它 —— 视图常驻(只是被 hidden 起来)时
+  // 照样每帧把整本账 + 每轮 gantt 重算一遍。停在最后一次可见时的那一份,重新
+  // 可见的**那一次渲染**就取回最新的,所以切回来不会先闪一帧旧内容。
+  // render 期写 ref 与 `PlaygroundTab` 的 `ViewPane` 同一条理由:这个值必须在
+  // 本次渲染就生效,放进 effect 要晚一帧。
+  const liveByStepRef = useRef(liveByStep);
+  if (visible) liveByStepRef.current = liveByStep;
+  const effectiveLive = liveByStepRef.current;
+
   // 账本一次构建就把 gantt 跑一轮(`absoluteSpans` 每轮一次),所以这层 memo 是
   // 性能命门,不是锦上添花。
   const ledger = useMemo(
-    () => buildLedger({ turns: windowTurns, streamTurnKey, liveByStep, nowMs }),
-    [windowTurns, streamTurnKey, liveByStep, nowMs],
+    () => buildLedger({ turns: windowTurns, streamTurnKey, liveByStep: effectiveLive, nowMs }),
+    [windowTurns, streamTurnKey, effectiveLive, nowMs],
   );
   const timeline = useMemo(() => deriveTimeline(ledger.records, mode), [ledger.records, mode]);
   const matches = useMemo(() => searchLedger(ledger.records, query), [ledger.records, query]);

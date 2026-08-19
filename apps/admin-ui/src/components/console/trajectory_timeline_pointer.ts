@@ -8,6 +8,7 @@
  */
 import type { CSSProperties } from "react";
 
+import { kindLabel } from "./kind_label";
 import { centeredRange, clampFraction, formatClock, minimumSelection, orderedRange, panViewport, type TimelineModel, type TimelineSpan, type TimeRange } from "./ledger_timeline";
 import type { LedgerRecord } from "./ledger_types";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
@@ -136,14 +137,8 @@ export function tooltipLines(
 ): string[] {
   const startedAt = record?.startedAt ?? null;
   const endedAt = record?.endedAt ?? null;
-  // 标签与账本同一套(spec §九:subagent → SUBTOOL、compaction → COMPACTED)。
-  const kindKey =
-    span.kind === "subagent"
-      ? "console.ledger_kind_subtool"
-      : span.kind === "compaction"
-        ? "console.ledger_kind_compacted"
-        : `console.traj_kind_${span.kind}`;
-  const lines = [t(kindKey)];
+  // 标签与账本行、详情头部同一份(`kind_label.ts`)。
+  const lines = [kindLabel(span.kind, t)];
   if (model.mode === "duration" && !model.degraded && startedAt !== null) {
     lines.push(endedAt === null
       ? t("console.timeline_tip_started", { t: formatClock(startedAt) })

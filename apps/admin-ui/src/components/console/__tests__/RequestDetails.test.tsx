@@ -173,6 +173,20 @@ describe("RequestDetails", () => {
     expect(within(summary).getByText("Tool calls").nextSibling?.textContent).toBe("2");
   });
 
+  // 终审 M6 —— 记录详情的概要有「耗时」,请求详情没有;而「这次调用花了多久」
+  // 正是读者点开一次请求最先要的数。
+  it("概要:有「耗时」一行;没有时长时写 —", () => {
+    const first = renderRequest();
+    const summary = screen.getByTestId("console-detail-summary");
+    expect(within(summary).getByText("Duration").nextSibling?.textContent).toBe("1.2s");
+    first.unmount();
+
+    renderRequest({ request: request({ durationMs: null }) });
+    expect(
+      within(screen.getByTestId("console-detail-summary")).getByText("Duration").nextSibling?.textContent,
+    ).toBe("—");
+  });
+
   it("概要:结果按钮抛 onOpenRecord(该请求的 assistant 记录)", async () => {
     const { props } = renderRequest();
     const button = screen.getByTestId("console-detail-hier-assistant");
