@@ -119,6 +119,7 @@ describe("useHistoryTurns", () => {
         runId: "r1",
         status: "success",
         tokens: null,
+        createdAt: "2026-05-25T00:00:00Z",
       },
     ]);
     expect(result.current.loads).toEqual({
@@ -235,6 +236,124 @@ describe("useHistoryTurns", () => {
     });
 
     expect(observeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("loadRuns caps concurrent replays at 4 across a page of runs", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const gate = deferred<void>();
+    streamRunEventsMock.mockImplementation(() =>
+      (async function* () {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await gate.promise;
+        inFlight -= 1;
+        yield {
+          id: "1",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "replayed" }] } },
+          rawData: "",
+          receivedAt: "",
+        } as SseEvent;
+        yield { id: "2", event: "end", data: {}, rawData: "", receivedAt: "" } as SseEvent;
+      })(),
+    );
+
+    const runIds = Array.from({ length: 8 }, (_, i) => `r${i}`);
+    const { result } = renderHook(() => useHistoryTurns());
+
+    let done!: Promise<void>;
+    act(() => {
+      done = result.current.loadRuns(runIds, "th-1");
+    });
+
+    // Only the first 4 workers should have reached the gate — the rest are
+    // queued behind them, not fired concurrently.
+    await waitFor(() => expect(inFlight).toBe(4));
+    expect(peak).toBe(4);
+
+    await act(async () => {
+      gate.resolve();
+      await done;
+    });
+
+    for (const runId of runIds) {
+      expect(result.current.loads[runId]?.state).toBe("done");
+    }
+    expect(peak).toBe(4);
+  });
+
+  it("loadRuns skips a run whose replay already started and does not replay it twice on a repeat call", async () => {
+    streamRunEventsMock.mockImplementation(() =>
+      makeStream([
+        {
+          id: "1",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "replayed" }] } },
+          rawData: "",
+          receivedAt: "",
+        },
+        { id: "2", event: "end", data: {}, rawData: "", receivedAt: "" },
+      ]),
+    );
+
+    const { result } = renderHook(() => useHistoryTurns());
+
+    // r-started's replay was already triggered by scrolling its row into view.
+    const row = document.createElement("div");
+    await act(async () => {
+      result.current.registerRow("r-started", "th-1")(row);
+    });
+    await waitFor(() => expect(result.current.loads["r-started"]?.state).toBe("done"));
+    streamRunEventsMock.mockClear();
+
+    await act(async () => {
+      await result.current.loadRuns(["r-started", "r-new"], "th-1");
+    });
+    expect(streamRunEventsMock).toHaveBeenCalledTimes(1);
+    expect(streamRunEventsMock).toHaveBeenCalledWith(
+      "th-1",
+      "r-new",
+      expect.anything(),
+    );
+    expect(result.current.loads["r-new"]?.state).toBe("done");
+
+    // A second loadRuns call for the same runs must not replay either again.
+    await act(async () => {
+      await result.current.loadRuns(["r-started", "r-new"], "th-1");
+    });
+    expect(streamRunEventsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("loadRuns marks a failing run's load as error, leaves the rest done, and resolves without throwing", async () => {
+    streamRunEventsMock.mockImplementation((_threadId: string, runId: string) => {
+      if (runId === "r-fail") {
+        return (async function* () {
+          throw new Error("boom");
+        })();
+      }
+      return makeStream([
+        {
+          id: "1",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "replayed" }] } },
+          rawData: "",
+          receivedAt: "",
+        },
+        { id: "2", event: "end", data: {}, rawData: "", receivedAt: "" },
+      ]);
+    });
+
+    const { result } = renderHook(() => useHistoryTurns());
+
+    await expect(
+      act(async () => {
+        await result.current.loadRuns(["r-ok", "r-fail"], "th-1");
+      }),
+    ).resolves.not.toThrow();
+
+    expect(result.current.loads["r-ok"]?.state).toBe("done");
+    expect(result.current.loads["r-fail"]?.state).toBe("error");
   });
 
   it("drops a stale load's result when a newer load superseded it", async () => {
