@@ -19,7 +19,7 @@ import { useTranslation } from "react-i18next";
 import type { SseEvent } from "../../api/sessions";
 import type { RunTraceIo } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
-import type { TrajectoryRow } from "../../api/trajectory_rows";
+import type { AssistantRow, TrajectoryRow, UserRow } from "../../api/trajectory_rows";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { CopyButton } from "../CopyButton";
@@ -117,7 +117,7 @@ function JsonBlock({ value, copyTestId }: { value: unknown; copyTestId?: string 
   );
 }
 
-function RenderedIo({ io }: { io: RunTraceIo }) {
+export function RenderedIo({ io }: { io: RunTraceIo }) {
   if (io.kind === "text") return <Pre>{io.text}</Pre>;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -129,6 +129,58 @@ function RenderedIo({ io }: { io: RunTraceIo }) {
           <Pre>{m.content}</Pre>
         </div>
       ))}
+    </div>
+  );
+}
+
+// ---- Assistant / User 正文两视图(PR-A.2 Task 9,spec §九「详情」)----
+
+/** 账本的 ASSISTANT 记录一条顶一整步:正文 + 思考。USER 记录复用同一组件
+ *  (它没有 `reasoning`,折叠段自然不出)。 */
+export type TextRow = UserRow | AssistantRow;
+
+/** 「预览」= Markdown 正文,上方一段可折叠的思考。 */
+export function AssistantPreview({ row }: { row: TextRow }) {
+  const { t } = useTranslation();
+  const reasoning = row.kind === "assistant" ? row.reasoning : "";
+  const n = (row.kind === "assistant" ? row.reasoningTokens : undefined) ?? reasoning.length;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {reasoning !== "" && (
+        <details data-testid="console-detail-thinking">
+          <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--ew-text-tertiary)" }}>
+            {n === 0 ? t("console.detail_thinking_none") : t("console.detail_thinking", { n })}
+          </summary>
+          <Pre>{reasoning}</Pre>
+        </details>
+      )}
+      <MarkdownView>{row.text}</MarkdownView>
+    </div>
+  );
+}
+
+/** 「原文」= 思考与正文各一段 `<pre>`,超长给「查看全文」。 */
+export function AssistantRawText({
+  row,
+  onOpenFullText,
+}: {
+  row: TextRow;
+  onOpenFullText: (state: FullTextState) => void;
+}) {
+  const { t } = useTranslation();
+  const reasoning = row.kind === "assistant" ? row.reasoning : "";
+  const block = (text: string, title: string): ReactNode => (
+    <div>
+      <Pre>{text}</Pre>
+      {text.length > FULL_TEXT_CHARS && (
+        <FullTextTrigger onClick={() => onOpenFullText({ title, text })} />
+      )}
+    </div>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {reasoning !== "" && block(reasoning, t("console.detail_thinking_none"))}
+      {block(row.text, t("console.detail_tab_rawtext"))}
     </div>
   );
 }
@@ -332,7 +384,8 @@ export function RowDetailResult({ row, onFireResult, onOpenFullText }: RowDetail
       );
       break;
     case "assistant":
-      body = <MarkdownView>{row.text}</MarkdownView>;
+      // PR-A.2 Task 9(spec §九):正文 Markdown + 前置「思考」折叠段。
+      body = <AssistantPreview row={row} />;
       break;
     case "user":
       body = <Text type="secondary">{t("console.detail_none")}</Text>;
