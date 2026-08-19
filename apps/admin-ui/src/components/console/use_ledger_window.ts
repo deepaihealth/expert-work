@@ -20,6 +20,9 @@ export interface LedgerWindow {
   windowTurns: readonly ConsoleTurn[];
   hasEarlier: boolean;
   earlierCount: number;
+  /** 窗口内还有历史轮在回放(首批自动回放也算)。 */
+  loading: boolean;
+  /** 只管「加载更早」那个按钮。 */
   loadingEarlier: boolean;
   loadEarlier: () => void;
   /** 把窗口起点降到 `at`(已经更早就不动)—— 跨栏跳转指向窗口外的轮时用。 */
@@ -39,10 +42,15 @@ export function useLedgerWindow(args: {
     Math.max(0, turns.length - TRAJECTORY_PAGE_TURNS));
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
+  // 起点夹到 `[0, turns.length - 20]`:同一会话里历史被重载(轮变少)、或换会话
+  // 的过渡帧上,旧起点会大过新的轮数,不夹就把窗口滑成空的。
+  const maxStart = Math.max(0, turns.length - TRAJECTORY_PAGE_TURNS);
+  const start = Math.min(Math.max(windowStart, 0), maxStart);
+
   const turnsRef = useRef(turns);
   turnsRef.current = turns;
-  const windowStartRef = useRef(windowStart);
-  windowStartRef.current = windowStart;
+  const windowStartRef = useRef(start);
+  windowStartRef.current = start;
   /** 已经发过回放请求的 runId —— 同一个不重复发。 */
   const requestedRef = useRef<Set<string>>(new Set());
   /** 本会话的窗口是否已经对齐过尾部(turns 异步到货时才需要补一次)。 */
@@ -64,7 +72,11 @@ export function useLedgerWindow(args: {
     setWindowStart(Math.max(0, turns.length - TRAJECTORY_PAGE_TURNS));
   }, [turns.length]);
 
-  const windowTurns = useMemo(() => turns.slice(windowStart), [turns, windowStart]);
+  const windowTurns = useMemo(() => turns.slice(start), [turns, start]);
+  const loading = useMemo(
+    () => windowTurns.some((t) => t.loadState === "pending" || t.loadState === "loading"),
+    [windowTurns],
+  );
 
   // 窗口内还没回放的历史轮 → 请父级回放(去重,进行中不重复发)。
   useEffect(() => {
@@ -107,10 +119,11 @@ export function useLedgerWindow(args: {
   }, [onEnsureLoaded]);
 
   return {
-    windowStart,
+    windowStart: start,
     windowTurns,
-    hasEarlier: windowStart > 0,
-    earlierCount: windowStart,
+    hasEarlier: start > 0,
+    earlierCount: start,
+    loading,
     loadingEarlier,
     loadEarlier,
     expandTo,

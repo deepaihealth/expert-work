@@ -51,18 +51,19 @@ const RECT_1000 = {
 } as DOMRect;
 
 let seqCounter = 0;
-function ev(event: string, data: unknown, ms: number): SseEvent {
+/** `skewMs` = 客户端收到这一帧的时刻比帧自己的服务端毫秒晚多少(时钟差)。 */
+function ev(event: string, data: unknown, ms: number, skewMs = 0): SseEvent {
   seqCounter += 1;
   return {
     id: `${BASE + ms}-${seqCounter}`,
     event,
     data,
     rawData: "",
-    receivedAt: new Date(BASE + ms).toISOString(),
+    receivedAt: new Date(BASE + ms + skewMs).toISOString(),
   };
 }
-function upd(node: string, channels: Record<string, unknown>, ms: number): SseEvent {
-  return ev("updates", { [node]: channels }, ms);
+function upd(node: string, channels: Record<string, unknown>, ms: number, skewMs = 0): SseEvent {
+  return ev("updates", { [node]: channels }, ms, skewMs);
 }
 function call(id: string, name: string, args: Record<string, unknown> = {}) {
   return { id, name, args };
@@ -109,18 +110,18 @@ function turnAEvents(): SseEvent[] {
   ];
 }
 /** 轮 C(live · running):step1 已落帧,工具 `search` 还挂着。 */
-function turnCEvents(): SseEvent[] {
+function turnCEvents(skewMs = 0): SseEvent[] {
   return [
     upd("agent", { step_count: 1, _duration_ms: 300, messages: [{
       type: "ai", content: "先搜一下",
       usage_metadata: { input_tokens: 50, output_tokens: 10 },
       tool_calls: [call("c9", "search")],
-    }] }, 5000),
+    }] }, 5000, skewMs),
   ];
 }
 
 /** 9 条记录:A(user/assistant:0/tool/assistant:1)· B(user/占位)· C(user/assistant:0/tool)。 */
-function fixture(): ConsoleTurn[] {
+function fixture(skewMs = 0): ConsoleTurn[] {
   return [
     turnOf({ key: "A", seq: 0, turn: {
       id: "A", input: "问题 A", attachments: [], inputs: {}, events: turnAEvents(),
@@ -129,7 +130,7 @@ function fixture(): ConsoleTurn[] {
     turnOf({ key: "B", seq: 1, loadState: "pending",
       fallbackLines: [{ text: "历史回答", channel: "final" }] }),
     turnOf({ key: "C", seq: 2, source: "live", turn: {
-      id: "C", input: "问题 C", attachments: [], inputs: {}, events: turnCEvents(),
+      id: "C", input: "问题 C", attachments: [], inputs: {}, events: turnCEvents(skewMs),
       status: "running", error: null, approval: null,
     } }),
   ];
@@ -331,6 +332,21 @@ describe("TrajectoryView · 组合", () => {
     expect(rowOf("A/user")).not.toHaveAttribute("data-focus");
   });
 
+  it("焦点在时间轴轨道上按 Escape:只清选区,详情不跟着一起关", () => {
+    renderView();
+    fireEvent.click(rowOf("A/tool:0:0"));
+    drag(100, 400);
+    expect(rowOf("A/user")).toHaveAttribute("data-focus", "inside");
+
+    // 轨道自己吃掉这一下(清选区并 preventDefault),根节点必须让位。
+    fireEvent.keyDown(track(), { key: "Escape" });
+    expect(rowOf("A/user")).not.toHaveAttribute("data-focus");
+    expect(screen.getByTestId("console-detail-aside")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByTestId("console-trajectory-panel"), { key: "Escape" });
+    expect(screen.queryByTestId("console-detail-aside")).not.toBeInTheDocument();
+  });
+
   it("时间轴拖选 → 账本行分 inside / outside", () => {
     renderView();
     // 轨道 1000px / 顺序域 [0,9):x=100 → 0.9,x=400 → 3.6 → 命中 0..3。
@@ -483,6 +499,50 @@ describe("TrajectoryView · 组合", () => {
     expect(screen.queryByTestId("console-traj-load-earlier")).not.toBeInTheDocument();
   });
 
+  it("账本加载覆盖层看的是「窗口内还有轮在回放」,不是「加载更早」按钮", () => {
+    // 默认 fixture 里 B 还没回放 → 覆盖层在。
+    const view = renderView();
+    expect(screen.getByTestId("console-traj-loading")).toBeInTheDocument();
+
+    const turns = fixture();
+    view.rerender({ turns: [turns[0], { ...turns[1], loadState: "done" as const }, turns[2]] });
+    expect(screen.queryByTestId("console-traj-loading")).not.toBeInTheDocument();
+  });
+
+  it("focusRequest 的目标轮还没进 turns → 不烧掉 nonce,轮到货后照样受理", () => {
+    const view = renderView();
+    view.rerender({ focusRequest: { turnKey: "D", rowId: null, nonce: 9 } });
+    expect(rows().every((r) => r.dataset.selected === undefined)).toBe(true);
+
+    const turnD = turnOf({ key: "D", seq: 3, turn: {
+      id: "D", input: "问题 D", attachments: [], inputs: {}, events: turnAEvents(),
+      status: "done", error: null, approval: null,
+    } });
+    view.rerender({ turns: [...fixture(), turnD], focusRequest: { turnKey: "D", rowId: null, nonce: 9 } });
+    expect(rowOf("D/assistant:1")).toHaveAttribute("data-selected", "true");
+  });
+
+  it("轮数缩水(历史重载)→ 窗口起点夹回去,不把窗口滑空", () => {
+    const view = renderView({ turns: manyTurns(25), threadId: "th-many" });
+    expect(screen.getAllByTestId("console-traj-turn-label")).toHaveLength(20);
+    expect(screen.getByTestId("console-traj-load-earlier")).toBeInTheDocument();
+
+    view.rerender({ turns: manyTurns(3) });
+    expect(screen.getAllByTestId("console-traj-turn-label")).toHaveLength(3);
+    expect(screen.queryByTestId("console-traj-load-earlier")).not.toBeInTheDocument();
+  });
+
+  it("focusRequest 指向同一条记录的新 nonce 会再滚一次", () => {
+    const view = renderView();
+    view.rerender({ focusRequest: { turnKey: "A", rowId: "think:0", nonce: 1 } });
+    expect(rowOf("A/assistant:0")).toHaveAttribute("data-selected", "true");
+    const first = scrollIntoView.mock.calls.length;
+
+    // 选中没变(还是同一条),只有 scrollTo 的 nonce 变了 —— 账本必须再滚一次。
+    view.rerender({ focusRequest: { turnKey: "A", rowId: "think:0", nonce: 2 } });
+    expect(scrollIntoView.mock.calls.length).toBeGreaterThan(first);
+  });
+
   it("窗口内 pending 的历史轮自动回放一次(去重,不重复发)", () => {
     const view = renderView();
     const onEnsureLoaded = view.props.onEnsureLoaded as ReturnType<typeof vi.fn>;
@@ -547,6 +607,36 @@ describe("TrajectoryView · 组合", () => {
         vi.advanceTimersByTime(2000);
       });
       expect(liveWidth()).toBeGreaterThan(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("nowMs 用帧的服务端时钟校准,不是裸 Date.now()", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(BASE + 20_000);
+    window.localStorage.setItem(LANE_MODE_KEY, "duration");
+    try {
+      // 同一个系统时刻、同一批帧,只有「客户端收到帧的时刻」差一个 5s 的钟差。
+      // 校准过的「现在」= serverMs + (Date.now() - receivedAt),会跟着钟差往回
+      // 挪;裸 `Date.now()` 完全无视 receivedAt,两次渲染只能一样宽。
+      const liveWidthWithSkew = (skewMs: number): number => {
+        const turns = fixture(skewMs);
+        renderView({
+          running: true,
+          turns: [turns[0], turns[2]],
+          liveByStep: new Map<number, LiveStep>([
+            [2, { content: "正在写", reasoning: "", toolNames: new Map(), reasoningMs: null }],
+          ]),
+        });
+        const index = rowOf("C/live-assistant:2").dataset.index;
+        const el = blocks().find((b) => b.getAttribute("data-index") === index);
+        if (el === undefined) throw new Error(`no timeline block for index ${index}`);
+        const width = Number.parseFloat(el.style.getPropertyValue("--traj-span-width"));
+        cleanup();
+        return width;
+      };
+      expect(liveWidthWithSkew(5000)).toBeLessThan(liveWidthWithSkew(0));
     } finally {
       vi.useRealTimers();
     }

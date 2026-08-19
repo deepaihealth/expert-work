@@ -113,6 +113,9 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key !== "Escape") return;
+    // 时间轴轨道自己也吃 Escape(清选区)并 `preventDefault` —— 焦点在轨道上时
+    // 不让位,一次 Escape 会既清选区又关详情,读者按一下丢两样东西。
+    if (event.defaultPrevented) return;
     event.preventDefault();
     state.onEscape();
   };
@@ -231,7 +234,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
           loadingEarlier={state.loadingEarlier}
           onLoadEarlier={state.loadEarlier}
           scrollTo={state.scrollTo}
-          loading={state.loadingEarlier}
+          loading={state.loading}
         />
         {details}
       </div>

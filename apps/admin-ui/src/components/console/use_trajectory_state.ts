@@ -100,6 +100,8 @@ export interface TrajectoryState {
   toggleOwner: (ownerId: string) => void;
   hasEarlier: boolean;
   earlierCount: number;
+  /** 窗口内还有历史轮在回放(账本的加载覆盖层)。 */
+  loading: boolean;
   loadingEarlier: boolean;
   loadEarlier: () => void;
   scrollTo: { id: string; nonce: number } | null;
@@ -213,14 +215,15 @@ export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
   // 真正落到哪条记录交给下面那条 effect。
   useEffect(() => {
     if (focusRequest === null || handledNonceRef.current === focusRequest.nonce) return;
-    handledNonceRef.current = focusRequest.nonce;
+    // 目标轮还没进 `turns`(父级正在拉这一页)—— **不要**先把 nonce 烧掉,
+    // 否则下一帧轮到货了这次请求也永远不会再被受理。
     const at = turns.findIndex((turn) => turn.key === focusRequest.turnKey);
     if (at === -1) return;
+    handledNonceRef.current = focusRequest.nonce;
     expandTo(at);
     ensureTurnLoaded(turns[at]);
     setPendingFocus({ turnKey: focusRequest.turnKey, rowId: focusRequest.rowId });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusRequest]);
+  }, [focusRequest, turns, expandTo, ensureTurnLoaded]);
 
   useEffect(() => {
     if (pendingFocus === null) return;
@@ -364,6 +367,7 @@ export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
     toggleOwner,
     hasEarlier: paging.hasEarlier,
     earlierCount: paging.earlierCount,
+    loading: paging.loading,
     loadingEarlier: paging.loadingEarlier,
     loadEarlier: paging.loadEarlier,
     scrollTo,
