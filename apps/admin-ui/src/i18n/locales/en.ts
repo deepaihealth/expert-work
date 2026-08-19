@@ -4402,7 +4402,7 @@ const en: TranslationKeys = {
     detail_tab_payload: "Payload",
     detail_tab_result: "Result",
     detail_tab_timing: "Timing",
-    detail_tab_raw: "Raw",
+    detail_tab_raw: "Frames",
     detail_close: "Close detail",
     detail_level: "Turn {{turn}} · step {{step}}",
     detail_level_turn_only: "Turn {{turn}}",
