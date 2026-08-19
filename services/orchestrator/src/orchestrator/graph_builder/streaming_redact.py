@@ -184,7 +184,7 @@ class TokenSink:
         self.first_delta_at: float | None = None
 
     async def __call__(self, delta: LLMDelta) -> None:
-        if self.first_delta_at is None and (delta.content or delta.reasoning or delta.tool_calls):
+        if self.first_delta_at is None and delta.has_progress:
             self.first_delta_at = time.monotonic()
         safe = self._content.feed(delta.content)
         if safe:
