@@ -9,7 +9,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 
 import i18n from "../../../i18n";
 import type {
-  AssistantRow, MemoryRow, SubagentRow, ToolRow, TrajectoryRow, UserRow,
+  AssistantRow, MemoryRow, ReflectRow, SubagentRow, ToolRow, TrajectoryRow, UserRow,
 } from "../../../api/trajectory_rows";
 import type { DisplayRow } from "../ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
@@ -244,6 +244,30 @@ describe("TrajectoryLedger", () => {
     fireEvent.doubleClick(rows[5]);
     expect(onToggleTurn).not.toHaveBeenCalled();
     expect(onToggleOwner).not.toHaveBeenCalled();
+  });
+
+  // 终审 M13 收口:reflect / memory 写回带 parentId 只供详情层级链接,双击落点
+  // 不能把它们当子调用 —— 否则这类 assistant 会被判成「有调用可折」而
+  // collapsibleOwnerIds 又不认,双击就被静默吃掉。
+  it("双击只挂着 reflect 子记录的 assistant 折所在轮,而不是折它的调用", () => {
+    const onToggleTurn = vi.fn();
+    const onToggleOwner = vi.fn();
+    const records = fixtureRecords();
+    const reflect: ReflectRow = {
+      id: "reflect:9", kind: "reflect", seq: 9, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, verdict: "pass", detail: {},
+    };
+    const rows = recordRows([
+      ...records,
+      rec({
+        id: "t2/reflect:9", index: 6, kind: "reflect", row: reflect, turnKey: "t2", turnSeq: 1,
+        parentId: "t2/assistant:1", text: "复盘",
+      }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn, onToggleOwner })} />);
+    fireEvent.doubleClick(screen.getAllByTestId("console-traj-row")[5]);
+    expect(onToggleOwner).not.toHaveBeenCalled();
+    expect(onToggleTurn).toHaveBeenCalledWith("t2");
   });
 
   it("双击已折叠那一轮里剩下的行会把它展开", () => {

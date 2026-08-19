@@ -73,7 +73,12 @@ function foldContextOf(rows: readonly DisplayRow[]): {
       continue;
     }
     const { record } = row;
-    if (record.parentId !== null) ownersWithChildren.add(record.parentId);
+    // 与 `ledger_collapse.childrenOf` 同一口径:只有 tool / plan 算主人的子调用;
+    // reflect / memory 写回也带 parentId(详情层级链接),但不是调用,不能让
+    // 「唯一子记录是 reflect」的 assistant 被判成有调用可折 —— 那会把双击吃掉。
+    if (record.parentId !== null && (record.kind === "tool" || record.kind === "plan")) {
+      ownersWithChildren.add(record.parentId);
+    }
     if (record.kind !== "user") {
       nonUserByTurn.set(record.turnKey, (nonUserByTurn.get(record.turnKey) ?? 0) + 1);
     }
