@@ -529,6 +529,10 @@ describe("Schema tab (PR-A.3 §十.2)", () => {
     expect(panel).toHaveTextContent("mcp:gh");
     expect(panel).toHaveTextContent("promoted on demand");
     expect(panel).toHaveTextContent('"command"');
+    // 终审 Minor 6 —— 描述 / 延迟标记不再各占一行空 <dt>:dl 里只有「来源」一项,
+    // 且每个 <dt> 都有文本。
+    const dts = [...panel.querySelectorAll("dt")].map((d) => d.textContent ?? "");
+    expect(dts).toEqual(["Source"]);
   });
 
   // 终审 C1 —— 账本 `entry.toolName` 是剥了 `mcp__server__` 前缀的显示名

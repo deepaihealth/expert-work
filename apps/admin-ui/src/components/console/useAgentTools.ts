@@ -3,10 +3,11 @@
  * (PR-A.3 §十.2 Schema tab). `enabled` flips on the moment a tool /
  * `update_plan` record is selected in the trajectory view; once the fetch
  * lands (`"ready"`) it's never refetched for the same `(agentName,
- * agentVersion)` pair — only an identity change or an explicit `reload()`
- * re-arms it. Tenant scope taken the same way as `useRunTrace.ts:60`.
+ * agentVersion, tenant scope)` identity — only an identity change or an
+ * explicit `reload()` re-arms it. Tenant scope taken the same way as
+ * `useRunTrace.ts:60`.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { getAgentTools, type AgentToolSchema } from "../../api/agents";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
@@ -20,6 +21,17 @@ export interface ToolSchemaState {
   reload: () => void;
 }
 
+const EMPTY: ReadonlyMap<string, AgentToolSchema> = new Map();
+
+/** Everything the hook knows is keyed by the identity it was fetched for —
+ *  one state object, so status and data can never disagree about *which*
+ *  agent they describe. */
+interface Cached {
+  identity: string;
+  status: ToolSchemaStatus;
+  byName: ReadonlyMap<string, AgentToolSchema>;
+}
+
 export function useAgentTools(args: {
   agentName: string;
   agentVersion: string;
@@ -28,60 +40,64 @@ export function useAgentTools(args: {
   const { agentName, agentVersion, enabled } = args;
   const { apiTenantScope } = useTenantScope();
 
-  const [status, setStatus] = useState<ToolSchemaStatus>("idle");
-  const [byName, setByName] = useState<ReadonlyMap<string, AgentToolSchema>>(new Map());
+  // Identity includes tenant scope: a system_admin's ``apiTenantScope``
+  // flipping (home → "*" → a specific tenant UUID) is also "different data"
+  // (TenantScopeContext.tsx:122-133).
+  const identity = `${agentName}@${agentVersion}@${String(apiTenantScope)}`;
+  const [cache, setCache] = useState<Cached>({ identity, status: "idle", byName: EMPTY });
   const [nonce, setNonce] = useState(0);
 
-  // A new agent identity — including tenant scope, since a system_admin's
-  // ``apiTenantScope`` flipping (home → "*" → a specific tenant UUID) is
-  // also "different data" (fix round 1, Important #2; TenantScopeContext.tsx
-  // :122-133) — invalidates whatever's cached. Tracked via ref (not state)
-  // so the single effect below can both detect the change and fetch for the
-  // new identity in the same pass, instead of waiting for a second render
-  // that no dependency would actually trigger.
-  const identity = `${agentName}@${agentVersion}@${String(apiTenantScope)}`;
-  const identityRef = useRef(identity);
+  // Derived at render, not in an effect: the frame in which the identity
+  // changes already reads as idle + empty, so the previous agent's map is
+  // never shown (not even for one commit) against the new agent's rows
+  // (PR-A.3 final review, Minor 5).
+  const current: Cached =
+    cache.identity === identity ? cache : { identity, status: "idle", byName: EMPTY };
 
   useEffect(() => {
     let cancelled = false;
-    const identityChanged = identityRef.current !== identity;
-    identityRef.current = identity;
-    if (identityChanged) setByName(new Map());
-    const idle = identityChanged || status === "idle";
-    if (!enabled || !idle) {
-      // Reset to idle when: identity changed (stale data), or a fetch that
-      // was still in flight is now being abandoned because `enabled`
-      // flipped off mid-`"loading"` — otherwise `status` gets stuck on
-      // `"loading"` forever (no further `enabled` toggle can re-arm it,
-      // since the `idle` check above would keep reading the stale
-      // `"loading"` value) with no retry affordance on that tab (fix round
-      // 1, Critical #1).
-      if (identityChanged || (!enabled && status === "loading")) setStatus("idle");
+    if (!enabled || current.status !== "idle") {
+      // Two ways a stale `"loading"` could otherwise survive in `cache` with
+      // no request behind it, and pin the tab on the spinner (no retry
+      // affordance there — fix round 1, Critical #1): (1) `enabled` flipped
+      // off mid-`"loading"`; (2) identity and `enabled` flipped together
+      // (thread switch), leaving the OLD identity's `"loading"` entry in
+      // place for when that identity comes back. Reset to idle for the
+      // current identity in both cases.
+      if (cache.identity !== identity || (!enabled && current.status === "loading")) {
+        setCache({ identity, status: "idle", byName: EMPTY });
+      }
       return () => {
         cancelled = true;
       };
     }
-    setStatus("loading");
+    setCache({ identity, status: "loading", byName: EMPTY });
     void getAgentTools(agentName, agentVersion, concreteTenantScope(apiTenantScope))
       .then((data) => {
         if (cancelled) return;
-        setByName(new Map(data.items.map((item) => [item.name, item])));
-        setStatus("ready");
+        setCache({
+          identity,
+          status: "ready",
+          byName: new Map(data.items.map((item) => [item.name, item])),
+        });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         console.warn("useAgentTools: getAgentTools failed", err);
-        setStatus("error");
+        setCache({ identity, status: "error", byName: EMPTY });
       });
     return () => {
       cancelled = true;
     };
+    // `current.status` is read from this render's closure on purpose: the
+    // effect re-arms only on identity / enabled / nonce changes, never on
+    // its own status transitions.
   }, [agentName, agentVersion, enabled, nonce, apiTenantScope]);
 
   const reload = useCallback(() => {
-    setStatus("idle");
+    setCache({ identity, status: "idle", byName: EMPTY });
     setNonce((n) => n + 1);
-  }, []);
+  }, [identity]);
 
-  return { status, byName, reload };
+  return { status: current.status, byName: current.byName, reload };
 }

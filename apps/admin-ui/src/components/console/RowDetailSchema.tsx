@@ -68,14 +68,27 @@ export function SchemaPanel({
     );
   }
 
+  // Description is prose, not a term/definition pair — keep it out of the
+  // `<dl>` so no empty `<dt>` lands in the accessibility tree (PR-A.3 final
+  // review, Minor 6); the deferred flag rides on the source row for the
+  // same reason.
   return (
     <div data-testid="console-detail-schema">
+      {item.description !== "" && (
+        <p className="ew-detail__desc" data-testid="console-detail-schema-desc">
+          {item.description}
+        </p>
+      )}
       <dl className="ew-detail__ov">
-        <DetailRow label="">{item.description}</DetailRow>
         <DetailRow label={t("console.detail_schema_source")}>
           {item.from_skill !== null ? `skill:${item.from_skill}` : item.source}
+          {item.deferred && (
+            <>
+              {" · "}
+              <Text type="secondary">{t("console.detail_schema_deferred")}</Text>
+            </>
+          )}
         </DetailRow>
-        {item.deferred && <DetailRow label="">{t("console.detail_schema_deferred")}</DetailRow>}
       </dl>
       <h4>{t("console.detail_schema_parameters")}</h4>
       <JsonBlock value={item.parameters} copyTestId="console-detail-schema-copy" />

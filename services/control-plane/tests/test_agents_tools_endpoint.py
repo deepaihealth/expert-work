@@ -8,8 +8,11 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
+from control_plane.audit import build_default_audit_logger
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
+from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import AuditAction, AuditQuery
 from expert_work.runtime.runs import InMemoryRunStore, RunManager
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from orchestrator import AgentFactoryError
@@ -60,7 +63,9 @@ def _runtime(*, fail: bool = False) -> AgentRuntime:
 
 @pytest.fixture
 async def client_factory():
-    async def make(runtime: AgentRuntime) -> AsyncClient:
+    async def make(
+        runtime: AgentRuntime, *, audit_store: InMemoryAuditLogStore | None = None
+    ) -> AsyncClient:
         settings = Settings(
             env="dev",
             auth_mode="dev",
@@ -70,7 +75,11 @@ async def client_factory():
             oidc_audience=[TEST_AUDIENCE],
         )
         app = create_app(
-            settings=settings, jwt_verifier=build_test_jwt_verifier(), agent_runtime=runtime
+            settings=settings,
+            jwt_verifier=build_test_jwt_verifier(),
+            agent_runtime=runtime,
+            # 传了 audit_store 的测试能回查审计行(照 test_agents_api.b5_client)。
+            audit_logger=build_default_audit_logger(audit_store) if audit_store else None,
         )
         headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=uuid4())}"}
         return AsyncClient(
@@ -116,6 +125,28 @@ async def test_tools_endpoint_404_unknown_and_422_when_build_fails(client_factor
         r = await client.get("/v1/agents/code-reviewer/1.0.0/tools")
         assert r.status_code == 422
         assert "cannot be built" in r.text
+
+
+@pytest.mark.asyncio
+async def test_tools_endpoint_audits_manifest_read_even_when_build_fails(client_factory) -> None:
+    """PR-A.3 follow-up(终审 Minor 4)—— 审计在 build 之前落,跟兄弟端点
+    ``GET /{name}/{version}`` 同一时机:manifest 在 RBAC 闸过了那一刻就被读了,
+    build 失败(422)不能把这件事从审计里抹掉。"""
+    audit_store = InMemoryAuditLogStore()
+    async with await client_factory(_runtime(fail=True), audit_store=audit_store) as client:
+        assert (
+            await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+        ).status_code == 201
+        r = await client.get("/v1/agents/code-reviewer/1.0.0/tools")
+        assert r.status_code == 422
+    # client_factory 每次造一个新 tenant uuid,拿不到;"*" 在 in-memory store 上是全量。
+    page = await audit_store.query(AuditQuery(tenant_id="*", limit=1000))
+    reads = [
+        e
+        for e in page.entries
+        if e.action is AuditAction.MANIFEST_READ and e.resource_id == "code-reviewer/1.0.0/tools"
+    ]
+    assert len(reads) == 1, [(e.action, e.resource_id) for e in page.entries]
 
 
 @pytest.mark.asyncio

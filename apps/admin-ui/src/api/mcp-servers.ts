@@ -75,6 +75,10 @@ export interface UpdateMcpServerBody {
 export interface McpTool {
   name: string;
   description: string;
+  /** JSON Schema for the tool's arguments — ``GET /v1/mcp-servers/{name}/tools``
+   *  returns it since PR-A.3 (Task 7). Optional like `McpCatalogTool.input_schema`:
+   *  `McpToolPicker` builds the same shape from catalog probes, which may omit it. */
+  input_schema?: Record<string, unknown>;
 }
 
 export interface AvailableMcpServer {

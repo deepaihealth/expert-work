@@ -15,6 +15,7 @@ reasons about retry / different args / final answer.
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -444,7 +445,9 @@ class ToolRegistry:
             ToolCatalogEntry(
                 name=name,
                 description=tool.spec.description,
-                parameters=dict(tool.spec.parameters),
+                # 深拷贝:投影是给控制面序列化的,嵌套对象不能与喂给 LLM 的
+                # 真 spec 共享(frozen entry 指向可变 dict 等于没 frozen)。
+                parameters=copy.deepcopy(dict(tool.spec.parameters)),
                 source=self.source_of(name),
                 from_skill=tool.spec.from_skill,
                 deferred=name in self._deferred,

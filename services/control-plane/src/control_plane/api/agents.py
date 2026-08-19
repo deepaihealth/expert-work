@@ -1638,6 +1638,18 @@ def build_agents_router() -> APIRouter:
         await ensure_resource_access(
             request, resource="manifest", action="read", attrs=_record_attrs(record)
         )
+        # Audit BEFORE the build, like the sibling ``GET /{name}/{version}``
+        # above: the manifest was read the moment the RBAC gate passed, and a
+        # build failure (422 below) must not erase that fact from the log.
+        await emit(
+            audit,
+            tenant_id=target_tenant,
+            actor_id=request.state.actor_id,
+            action=AuditAction.MANIFEST_READ,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}/tools",
+            trace_id=current_trace_id_hex(),
+        )
         try:
             built = await runtime.get_agent(
                 tenant_id=target_tenant,
@@ -1650,15 +1662,6 @@ def build_agents_router() -> APIRouter:
             raise HTTPException(
                 status_code=422, detail=f"agent manifest cannot be built: {exc}"
             ) from exc
-        await emit(
-            audit,
-            tenant_id=target_tenant,
-            actor_id=request.state.actor_id,
-            action=AuditAction.MANIFEST_READ,
-            resource_type="manifest",
-            resource_id=f"{name}/{version}/tools",
-            trace_id=current_trace_id_hex(),
-        )
         items = [
             AgentToolItem(
                 name=t.name,

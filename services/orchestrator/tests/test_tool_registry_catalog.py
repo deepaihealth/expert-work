@@ -55,3 +55,22 @@ def test_catalog_lists_every_tool_in_registration_order_with_source_and_deferred
     assert {c.name for c in cat if c.deferred} == {c.name for c in cat} - {
         s.name for s in reg.specs()
     }
+
+
+def test_catalog_parameters_do_not_share_nested_objects_with_the_live_spec() -> None:
+    """PR-A.3 follow-up(终审 Minor 8)—— ``ToolCatalogEntry`` 是 frozen,但
+    ``parameters`` 只是浅拷贝时嵌套 dict 仍与喂给 LLM 的 ``ToolSpec`` 同一对象:
+    消费者改一下投影(比如序列化前加注解)就会污染真 schema。锁成深拷贝。"""
+    reg = ToolRegistry()
+    tool = _T("bash")
+    reg.register(tool)
+    entry = reg.catalog()[0]
+
+    assert entry.parameters == tool.spec.parameters
+    assert entry.parameters is not tool.spec.parameters
+    assert entry.parameters["properties"] is not tool.spec.parameters["properties"]
+    # 改投影,真 spec 不动。
+    props = entry.parameters["properties"]
+    assert isinstance(props, dict)
+    props["q"] = {"type": "integer"}
+    assert tool.spec.parameters["properties"]["q"] == {"type": "string"}

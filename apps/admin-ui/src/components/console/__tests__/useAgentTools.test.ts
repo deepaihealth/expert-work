@@ -138,6 +138,80 @@ describe("useAgentTools", () => {
     expect(result.current.byName.get("bash")).toEqual(ITEM);
   });
 
+  // PR-A.3 follow-up(终审 Minor 5)—— identity 翻转的同一帧里,上一个 agent
+  // 的工具集不能还挂在 `byName` 上(旧实现靠 effect 里两个 setState 同批,
+  // 且「清空」没有任何测试锁住 —— 摘掉也全绿)。第二次 fetch 故意悬着,
+  // 断言翻转后立刻是 loading + 空 map,不是 ready + 旧 map。
+  it("identity 翻转后在新数据落地前 byName 立即为空、status 为 loading(不露上一个 agent 的工具集)", async () => {
+    let resolveSecond!: (v: { items: agentsSdk.AgentToolSchema[]; total: number }) => void;
+    const second = new Promise<{ items: agentsSdk.AgentToolSchema[]; total: number }>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const OTHER: agentsSdk.AgentToolSchema = { ...ITEM, name: "http_request" };
+    const spy = getAgentToolsMock
+      .mockResolvedValueOnce({ items: [ITEM], total: 1 })
+      .mockReturnValueOnce(second);
+    // 抓每一次 render 的 [status, byName.size] —— `result.current` 只露最后一帧,
+    // 而要锁的恰恰是「翻转后的第一帧」(effect 跑之前)就已经是空的。
+    const frames: Array<[string, number]> = [];
+    const { result, rerender } = renderHook(
+      (p: { v: string }) => {
+        const s = useAgentTools({ agentName: "a", agentVersion: p.v, enabled: true });
+        frames.push([s.status, s.byName.size]);
+        return s;
+      },
+      { initialProps: { v: "1" } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.byName.get("bash")).toEqual(ITEM);
+
+    frames.length = 0;
+    rerender({ v: "2" });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(frames[0]).toEqual(["idle", 0]); // 翻转的那一帧就已是空的,不等 effect
+    expect(frames).not.toContainEqual(["ready", 1]);
+    expect(result.current.status).toBe("loading");
+    expect(result.current.byName.size).toBe(0);
+
+    await act(async () => {
+      resolveSecond({ items: [OTHER], total: 1 });
+      await Promise.resolve();
+    });
+    expect(result.current.status).toBe("ready");
+    expect([...result.current.byName.keys()]).toEqual(["http_request"]);
+  });
+
+  // 评审(follow-up round 1)—— identity 与 enabled 同一帧一起翻(切线程:agent
+  // 是 props、选中记录随新账本一起变)时,旧 identity 的 "loading" 条目不能留在
+  // cache 里等它回来 —— 回来那帧 enabled=true 会直接读到 "loading" 早退,钉死在
+  // 没有重试按钮的 loading 态。
+  it("identity 与 enabled 同帧一起翻走再翻回来:不会卡在无请求的 loading,而是重新发请求", async () => {
+    let resolveFirst!: (v: { items: agentsSdk.AgentToolSchema[]; total: number }) => void;
+    const first = new Promise<{ items: agentsSdk.AgentToolSchema[]; total: number }>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const spy = getAgentToolsMock
+      .mockReturnValueOnce(first)
+      .mockResolvedValueOnce({ items: [ITEM], total: 1 });
+    const { result, rerender } = renderHook(
+      (p: { v: string; enabled: boolean }) =>
+        useAgentTools({ agentName: "a", agentVersion: p.v, enabled: p.enabled }),
+      { initialProps: { v: "1", enabled: true } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("loading"));
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    rerender({ v: "2", enabled: false }); // 切走:新 agent,且当前选中记录没有工具
+    expect(result.current.status).toBe("idle");
+    rerender({ v: "1", enabled: true }); // 切回来,选中一条工具记录
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.byName.get("bash")).toEqual(ITEM);
+    resolveFirst({ items: [], total: 0 }); // 被放弃的第一次晚到,不覆盖
+    await Promise.resolve();
+    expect(result.current.status).toBe("ready");
+  });
+
   // Fix round 1, Important #2 —— system_admin 切换跨租户视角时
   // `apiTenantScope` 会从 `undefined` 翻成 `"*"` / 具体租户 UUID
   // (TenantScopeContext.tsx:122-133);这应该跟 agent identity 变化一样重置
