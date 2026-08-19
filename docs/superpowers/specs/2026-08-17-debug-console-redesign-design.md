@@ -284,3 +284,73 @@ PR-A(#1207)上线后用户在测试环境过了一遍,六条反馈全部采纳,�
 8. **行表加列 + 详情修边**:行列表改成表格列 `# / 类型 / 摘要 / 入 / 出 / 思考 / 耗时`(think 行填三列 token,其它行留空;`思考` = `usage_metadata.output_token_details.reasoning`,`parseTimeline` 加可选字段透传);选中行高亮并与泳道块联动;`↑ ↓` 移动、`Esc` 关详情。行详情面板加内边距(修掉左侧被裁一截的 bug),头部改成「#序号 · 类型 · 摘要 · 耗时」。
 
 **明确不做**:滚轮缩放 / 平移;对话记录页 / Run 详情页(PR-B);`playground.*` → `console.*` 改名。
+
+## 九、修订 2026-08-19(轨迹视图对齐 deepseek-harness `ui-trajectory`)
+
+PR-A.1(#1214)上测试环境后,用户看了泳道后的反馈是「没有实现这种划定指定区域的效果」,继而拍板:「其实我就想把我们的轨迹跟 deepseek-harness 做成一样」。设计稿(整屏 + 六个交互样例 + 逐项对照 + 六条拍板)已确认。**与 §二.1「右栏 · 检查面板」及 §八.6–8 冲突处以本节为准。** 实施 = PR-A.2,计划 `docs/superpowers/plans/2026-08-19-debug-console-pr-a2-trajectory.md`;PR-B(对话记录页 / Run 详情页)顺延到它之后。
+
+参照物:`/Users/mac/src/github/deepseek-harness/packages/client/ui-trajectory/src/client/`(`TrajectoryView.tsx` / `TrajectoryToolbar.tsx` / `TrajectoryTimeline.tsx` + `timeline.ts` / `TrajectoryTable.tsx` + `*.module.css`)。**只抄交互与观感,不抄实现**;它 7900 行、虚拟化 + 分页 + 插件槽位,我们按自己的数据层重写。
+
+### 1. 拍板六条(用户 2026-08-19 逐条同意)
+
+- **D1 放哪**:轨迹从右栏搬到中栏,中栏头部三个视图 tab「对话 | 轨迹 | 工作区」;右栏「检查面板」(`InspectPanel`,轨迹 | 工作区 Segmented)**整个退役**,壳变两栏(会话侧栏 | 主区)。左栏照旧。
+- **D2 一步一条 ASSISTANT**:轨迹里每个 agent 步一条 `ASSISTANT` 记录(文字 + 思考 + 它发起的工具调用),原「每步一条 THINK 行 + 最后一条 ASSISTANT 行」退役;思考进详情「预览」的折叠段。中栏过程条的 THINK 紧凑行**不变**(那是另一个投影)。
+- **D3 账本去四列**:账本只有「事件槽 + 内容」两列(与 deepseek 一致);`入 / 出 / 思考 / 耗时` 四列删除,数字进「请求 #N」详情与悬停提示。
+- **D4 滚轮缩放 + 右键平移**:做(撤销 §八「明确不做」那条)。
+- **D5 三处缺数据本期不做**:`Schema` tab(控制面没有工具 JSON schema 接口)、`SYSTEM` 行(系统提示词只在 Langfuse span 输入里)、模型块 TTFT / Decoding 双色(后端没有每步首 token 时刻)。后端补了再加。
+- **D6 顺序**:PR-A.2 先于 PR-B。
+
+### 2. 形态
+
+**壳**:`ConsoleShell` 两栏 `264px | 1fr`(<1200px 左栏折图标条照旧),`inspect` 列取消。主区头部一行:会话 id · 视图 tab(`console-view-tab-chat / -trajectory / -workspace`,antd `Segmented`)· 轮数;下方 §八.2 芯片行不动;再下方按 tab 渲染「对话」(现 `Transcript`)/「轨迹」(新 `TrajectoryView`)/「工作区」(现 `WorkspacePanel`)之一;输入区(计划卡 / 变量 / 附件 / `Composer`)**三个 tab 下都钉在底部**——轨迹 tab 里照样能发送 / 停止,账本与时间轴实时长。每会话记住上次 tab(内存态,切会话回「对话」)。
+
+**轨迹视图 = 工具条 + 概览时间轴 + 账本(左)+ 详情(右,可拖宽)**,整个会话、按轮分段、账本行序即事件序。
+
+**工具条**(sticky,28px):左「◷ 时长」(`aria-pressed`,记 `localStorage["expert_work.console.lane_mode"]`,沿用)· 「⊟ 轮次」(全部折叠 / 展开轮;全折时图标 ⊞)· 「⊟ 调用」(折叠 / 展开每条 ASSISTANT 下的工具调用);右搜索框(实时,大小写不敏感子串,匹配「类型标签 + 内容 + 结果 + 工具名」;**有查询时账本只剩匹配行**,时间轴不匹配块 0.14 透明)。
+
+**概览时间轴**(50px;44px 标签列「输入 / 模型 / 工具」+ 轨道):
+- 记录 → 块:8px 高、泳道纵向 14px 步进、`min-width 2px`、块间 `min(8%, 1px)` 缝;泳道分配:输入 = USER / MEMORY(召回);模型 = ASSISTANT / REFLECT / COMPACTED;工具 = TOOL / SUBTOOL / PLAN / MEMORY(写回)/ 标记行。颜色按类型(下表),失败一律 danger;运行中的尾块呼吸(`prefers-reduced-motion` 关)。
+- 投影:**顺序**(默认)每条记录等宽 `[i, i+1)`;**时长**按绝对起止毫秒(每轮 `buildGanttRows` 的绝对时序:新增 `GanttModel.originMs`,`absStart = originMs + startMs`;USER 记录钉本轮首条有时序记录之前;记录之间的空档压掉——deepseek `compressIdle`),运行中的尾块长到「现在」;任何一轮拿不到时序 → 整条时间轴退化成顺序排布并在工具条「时长」旁标「时长不可用」。
+- 轮边界:每轮首条记录处一条 1px 竖线。
+- 悬停:块 → 500ms 后提示「类型 / 起止钟点(时长模式)/ 总时长」+ 账本对应行同步高亮(反向:悬停账本行 → 块描边);轨道空白处 → 一条 2px 竖线跟随鼠标。
+- 选区:左键按下拖动 → 草稿选区(18% 底 + 两端 2px 竖条);松手位移 ≥ 3px → 定格(12% 底 + 3px 竖条 + **选区外整片压暗 58%**);选区含义 = 与区间有交集的全部记录,段外块 0.2 透明、账本段外行 0.24 透明(不隐藏)并把段内首行滚进视口;点空白处 = 以点击位置为中心开「一条记录宽」的最小选区并把最近记录滚进视口;点块 = 选中记录 + 打开详情 + 清选区;`Esc` / 双击 / 右键单击 = 清选区;缩放态下拖到轨道边缘 8% 内自动平移。
+- 缩放 / 平移:滚轮 = 以鼠标位置为锚缩放(顺序模式最小 4 条记录宽,时长模式最小 20ms;缩到 ≥ 99.9% 全景自动回全景);右键按住拖 = 平移(仅缩放态);选中账本里视口外的记录时视口 180ms 平滑挪过去。
+- 历史未加载完:轨道左端「…」按钮(渐变底)= 加载上一页。
+
+**账本**(表格,两列 `122px | 1fr`,行高 27px 固定,虚拟化只挂视口 + overscan 12 行):
+- 事件槽(左列,`padding-left 36px`):轮起点一枚「第 N 轮」标签(左上角,mono 8px;当前轮高亮);当前轮 2px 竖轨、选中行 3px 竖轨(失败红);每次 LLM 请求一枚圆点(`top:-8px` 跨在请求首行上方;失败红、当前蓝、悬停放大 + 提示「请求 #N · 第 N 轮 · 第 M 步」;点开请求详情);类型标签(76px 槽右对齐,10px 粗体,颜色见下表)。
+- 内容(右列,单行省略):USER = 输入首行;ASSISTANT = 该步文字首行,没文字写「(仅工具调用)」;TOOL / SUBTOOL / PLAN = `名字 参数JSON` mono + ` → ` + 结果首行(失败红,「(无输出)」灰);MEMORY = 「召回 N 条 → 首条摘要」;REFLECT = 「pass / revise → 评语首行」;COMPACTED = 压缩摘要;标记行 = 文案。
+- 轮起点 2px 粗分隔线;折叠轮 = 一行「… 思考 N 次 · 工具 N 次(…)· 时长 · N 次失败」(复用 `process_summary`);折叠调用 = ASSISTANT 行下一行「… bash ×3 · read_file ×2」;双击行 = 折叠所在轮 / 折叠该 ASSISTANT 的调用;`Enter/Space` 同单击,`↑ ↓` 在可见行间移动,`Esc` 关详情;选中行底色 + 竖轨,悬停行底色。
+- 尾随:初始与运行中跟到最新;上滚离底 > 80px 暂停跟随。首行「加载更早的历史(还有 N 轮)」按钮,一页 20 轮(`useHistoryTurns.loadRuns`),加载中禁用带转圈。
+- 未回放的轮(`loadState !== "done"`)只出 USER + 一条占位 ASSISTANT(内容取 fallbackLines 首行,状态「加载中 / 回放失败」)。
+
+**类型 → 标签 / 颜色 / 泳道**
+
+| 记录 | 标签 | 颜色 token | 泳道 |
+|---|---|---|---|
+| user | USER | `--ew-color-brand-300` | 输入 |
+| memory(recall) | MEMORY | `--ew-color-success-500` | 输入 |
+| assistant | ASSISTANT | `--ew-accent-violet` | 模型 |
+| reflect | REFLECT | `--ew-color-accent-400` | 模型 |
+| compaction | COMPACTED | `--ew-text-secondary` | 模型 |
+| tool | TOOL | `--ew-color-warning-500` | 工具 |
+| subagent | SUBTOOL | `--ew-color-warning-700` | 工具 |
+| plan | PLAN | `--ew-color-teal-500` | 工具 |
+| memory(writeback) | MEMORY | `--ew-color-success-500` | 工具 |
+| retry / error / approval / guard / gap | RETRY / ERROR / APPROVAL / GUARD / GAP | `--ew-text-secondary` | 工具 |
+| 任一失败 | — | `--ew-color-danger-500` | — |
+
+**详情**(右侧 `aside`,默认 420px,可拖 320–720,双击手柄复位,`← →` 步进 16px;头部 = 类型标签 + 「第 N 轮 · 第 M 步」+ ✕):
+- TOOL / SUBTOOL / PLAN / MEMORY / REFLECT / 标记:`概要 / 载荷 / 结果 / 计时 / 原始`。
+- ASSISTANT:`概要 / 预览 / 原文 / 计时 / 原始`(预览 = Markdown 正文,上方「▸ 思考(N tokens)」折叠段;原文 = 思考 + 正文的 `<pre>`)。
+- USER:`概要 / 预览 / 原文 / 原始`。
+- 请求 #N(点圆点):`概要 / 输入 / 用量 / 计时`(输入 = 该步 Langfuse span 的渲染消息,没配到 span 显示现有「只在 Langfuse 精确轨迹里有」文案;用量 = 本次 输入 / 输出 / 思考 / 缓存读 + 累计至此 输入 / 输出;计时 = 现有 `RowDetailTiming` 两列)。
+- 「概要」= 顶部 `dl`(层级链接:ASSISTANT →「请求 #N ›」;TOOL / PLAN / MEMORY 写回 →「Assistant Message ›」;SUBTOOL →「Tool Call ›」;+ 状态 + 耗时 + ASSISTANT 的 模型 / 输入 / 输出 / 思考 / 缓存读 + 「Run <id> ↗」链接(`console-inspect-run-link`,原右栏头部的新家)+ Langfuse ↗(admin))+ 分节预览(载荷 / 结果 / 计时 各一段,标题带「›」跳对应 tab,预览区 120px 封顶渐隐)。
+- 计时 tab 沿用现有 `RowDetailTiming`(会话时间戳 vs Langfuse 精确两列、入库中轮询、成本);原始 tab 沿用 `EventCard`。
+- 换记录不重置当前 tab(该记录没有这个 tab 时回「概要」)。
+
+**联动**:中栏脚注「查看轨迹」→ 切轨迹 tab + 选中该轮最后一条 ASSISTANT 记录 + 滚到位;过程条每行「轨迹」→ 切轨迹 tab + 选中对应记录(`think:<seq>` 映射到 `assistant:<seq>`,其它 id 同名);目标轮在加载窗口之外时先扩窗口再选。
+
+**退役**:`InspectPanel` / `TrajectoryPanel` / `LaneStrip` + `lane_strip_model` + `lane_strip.css` / `TrajectoryRows` + `trajectory_rows.css` / `RowDetail`(拆成新的 `RecordDetails` / `RequestDetails`,`RowDetailPayloadResult` / `RowDetailTiming` 保留复用)/ `RunStatusBanner` 在轨迹里的用法(错误已经是红行红块;该组件随后由 PR-B 连 TurnCard 一起清)。`api/trajectory_rows.ts` 的旧 `trajectoryRowsOf(events, input, answer, status)` 与 `resolveGanttKey` 的 think 分支随之删除。
+
+**明确不做(本节)**:Schema tab / SYSTEM 行 / TTFT 双色(D5);Composer 浮层(钉底部即可);对话记录页 / Run 详情页迁移(PR-B);`playground.*` → `console.*` 改名。
