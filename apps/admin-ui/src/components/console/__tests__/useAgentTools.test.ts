@@ -138,6 +138,39 @@ describe("useAgentTools", () => {
     expect(result.current.byName.get("bash")).toEqual(ITEM);
   });
 
+  // PR-A.3 follow-up(终审 Minor 5)—— identity 翻转的同一帧里,上一个 agent
+  // 的工具集不能还挂在 `byName` 上(旧实现靠 effect 里两个 setState 同批,
+  // 且「清空」没有任何测试锁住 —— 摘掉也全绿)。第二次 fetch 故意悬着,
+  // 断言翻转后立刻是 loading + 空 map,不是 ready + 旧 map。
+  it("identity 翻转后在新数据落地前 byName 立即为空、status 为 loading(不露上一个 agent 的工具集)", async () => {
+    let resolveSecond!: (v: { items: agentsSdk.AgentToolSchema[]; total: number }) => void;
+    const second = new Promise<{ items: agentsSdk.AgentToolSchema[]; total: number }>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const OTHER: agentsSdk.AgentToolSchema = { ...ITEM, name: "http_request" };
+    const spy = getAgentToolsMock
+      .mockResolvedValueOnce({ items: [ITEM], total: 1 })
+      .mockReturnValueOnce(second);
+    const { result, rerender } = renderHook(
+      (p: { v: string }) => useAgentTools({ agentName: "a", agentVersion: p.v, enabled: true }),
+      { initialProps: { v: "1" } },
+    );
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(result.current.byName.get("bash")).toEqual(ITEM);
+
+    rerender({ v: "2" });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(result.current.status).toBe("loading");
+    expect(result.current.byName.size).toBe(0);
+
+    await act(async () => {
+      resolveSecond({ items: [OTHER], total: 1 });
+      await Promise.resolve();
+    });
+    expect(result.current.status).toBe("ready");
+    expect([...result.current.byName.keys()]).toEqual(["http_request"]);
+  });
+
   // Fix round 1, Important #2 —— system_admin 切换跨租户视角时
   // `apiTenantScope` 会从 `undefined` 翻成 `"*"` / 具体租户 UUID
   // (TenantScopeContext.tsx:122-133);这应该跟 agent identity 变化一样重置

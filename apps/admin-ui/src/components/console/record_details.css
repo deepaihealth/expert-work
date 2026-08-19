@@ -177,6 +177,16 @@
   min-height: 0;
 }
 
+/* Schema tab 的工具描述 —— 散文段,不进概要 dl(避免空 dt) */
+.ew-detail__desc {
+  margin: 0;
+  padding: 8px 14px 0;
+  font-size: var(--ew-font-size-xs);
+  color: var(--ew-text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* 概要 dl —— 94px 标签列 + 值 */
 .ew-detail__ov {
   margin: 0;

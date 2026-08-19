@@ -346,6 +346,23 @@ describe("SYSTEM row (PR-A.3 §十.1)", () => {
     expect(ledger.records.find((r) => r.turnKey === "t2")).toMatchObject({ kind: "user", turnStart: true });
   });
 
+  // PR-A.3 follow-up(T9 deferred minor)—— 夹在中间的未回放轮(一帧都没有,
+  // 提示词未知)不打断折叠:它不碰「上一条 SYSTEM 文本」,后一轮同提示词照折;
+  // 等它回放完 buildLedger 会整个重算,届时再按真实提示词定。
+  it("an unreplayed turn between two same-prompt turns does not break the fold", () => {
+    const middle = turnOf({
+      key: "mid", seq: 50, loadState: "loading", createdAt: CREATED_B,
+      turn: { id: "mid", input: "问", attachments: [], inputs: {}, events: [], status: "done", error: null, approval: null },
+    });
+    const ledger = buildLedger({
+      turns: [turnWithSystem("s1", "A"), middle, turnWithSystem("s3", "A"), turnWithSystem("s4", "B")],
+      streamTurnKey: null, nowMs: NOW,
+    });
+    const systems = ledger.records.filter((r) => r.kind === "system").map((r) => [r.turnKey, r.text]);
+    expect(systems).toEqual([["s1", "A"], ["s4", "B"]]);
+    expect(ledger.records.filter((r) => r.turnKey === "mid").map((r) => r.kind)).toEqual(["user", "assistant"]);
+  });
+
   it("firstTokenAt = startedAt + firstTokenMs (clamped to endedAt) and LedgerRequest.firstTokenMs", () => {
     const events: SseEvent[] = [
       upd("agent", { step_count: 1, _duration_ms: 2000, messages: [{
