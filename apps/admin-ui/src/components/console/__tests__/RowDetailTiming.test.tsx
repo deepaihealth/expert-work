@@ -9,7 +9,7 @@ import "../../../i18n";
 
 import type { RunTrace, TraceSpan } from "../../../api/trace_facade";
 import type { SpanMatch } from "../../../api/trace_match";
-import type { ThinkRow } from "../../../api/trajectory_rows";
+import type { AssistantRow, ThinkRow } from "../../../api/trajectory_rows";
 import { RowDetailTiming } from "../RowDetailTiming";
 
 function thinkRow(over: Partial<ThinkRow> = {}): ThinkRow {
@@ -28,6 +28,29 @@ function thinkRow(over: Partial<ThinkRow> = {}): ThinkRow {
     inputTokens: 100,
     outputTokens: 50,
     finishReason: null,
+    ...over,
+  };
+}
+
+/** 账本投影(spec §九 D2)一步一条 assistant 行 —— 模型 / tokens 从 think 行
+ *  搬到了它身上,SSE 列必须照样取到值。 */
+function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
+  return {
+    id: "assistant:1",
+    kind: "assistant",
+    seq: 1,
+    step: 1,
+    status: "ok",
+    durationMs: 1500,
+    eventIndexes: [0],
+    serverMs: 1_700_000_000_123,
+    text: "结论",
+    reasoning: "想一想",
+    model: "gpt-a",
+    inputTokens: 200,
+    outputTokens: 60,
+    finishReason: "stop",
+    toolCallCount: 1,
     ...over,
   };
 }
@@ -160,5 +183,20 @@ describe("RowDetailTiming", () => {
       />,
     );
     expect(screen.getByTestId("console-detail-timing").textContent).toContain("No span for this row");
+  });
+
+  it("assistant 行(账本一步一条)也在 SSE 列显示模型与 tokens", () => {
+    render(
+      <RowDetailTiming
+        row={assistantRow()}
+        match={{ span: null, reason: "no_trace" }}
+        trace={null}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+      />,
+    );
+    const table = screen.getByTestId("console-detail-timing");
+    expect(table.textContent).toContain("gpt-a");
+    expect(table.textContent).toContain("200 / 60");
   });
 });

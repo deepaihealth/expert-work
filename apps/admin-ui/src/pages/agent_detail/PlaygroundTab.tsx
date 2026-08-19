@@ -5,14 +5,18 @@
  * 调试台重设计 PR-A Task 19 — this file used to be the whole surface (1476
  * lines of state + JSX). It is now the **session state + assembly layer**:
  * thread / draft / attachment / variable state, the export + artifact
- * requests, and the wiring of ``components/console/*`` into the three-column
- * ``ConsoleShell`` (left: sessions, middle: transcript + composer, right:
- * trajectory / workspace inspector). The run kernel (live turns, SSE
- * consumption, approvals) moved to ``playground/useRunEngine.ts``; everything
- * visual lives in ``components/console/*`` — see the plan's 「文件结构」 table.
+ * requests, and the wiring of ``components/console/*`` into the two-column
+ * ``ConsoleShell`` (left: sessions, middle: 对话 / 轨迹 / 工作区 三视图 +
+ * 钉底的输入区). The run kernel (live turns, SSE consumption, approvals)
+ * moved to ``playground/useRunEngine.ts``; everything visual lives in
+ * ``components/console/*`` — see the plan's 「文件结构」 table.
+ *
+ * PR-A.2 Task 11(spec §九「壳」)—— 右栏检查面板整个退役:轨迹搬进中栏的
+ * 「轨迹」tab(``TrajectoryView``),工作区搬进「工作区」tab,``ConsoleShell``
+ * 不再传 ``inspect``。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Typography } from "antd";
+import { Alert, Segmented, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { downloadArtifact } from "../../api/artifacts";
@@ -27,13 +31,13 @@ import { AttachmentChips } from "../../components/console/AttachmentChips";
 import { Composer } from "../../components/console/Composer";
 import { ConsoleShell } from "../../components/console/ConsoleShell";
 import { buildConsoleTurns, runIdOf, statsInputOf } from "../../components/console/console_turns";
-import { InspectPanel, type InspectTab } from "../../components/console/InspectPanel";
 import { PlanCard } from "../../components/console/PlanCard";
 import { SessionSidebar, type SessionChange } from "../../components/console/SessionSidebar";
 import { StatsBar } from "../../components/console/StatsBar";
 import { Transcript } from "../../components/console/Transcript";
-import { TrajectoryPanel } from "../../components/console/TrajectoryPanel";
+import { TrajectoryView } from "../../components/console/TrajectoryView";
 import type { TurnTiming } from "../../components/console/types";
+import type { FocusRequest } from "../../components/console/use_trajectory_state";
 import { usePlanCard } from "../../components/console/usePlanCard";
 import { missingRequired, VariablesForm, type PromptVariable } from "../../components/console/VariablesForm";
 import { WorkspacePanel } from "../../components/console/WorkspacePanel";
@@ -61,6 +65,68 @@ const MAIN_HEAD_STYLE: React.CSSProperties = {
   borderBottom: "1px solid var(--ew-border-subtle)",
   flexShrink: 0,
 };
+
+/** 视图体:占满头部与输入区之间的剩余高度。`Transcript` / `TrajectoryView`
+ *  自己就是 `flex:1` 且自带内滚,所以这层只开最小尺寸;工作区没有内滚容器,
+ *  单独多一个 `overflow:auto`(见 `VIEW_PANE_SCROLL_STYLE`)。 */
+const VIEW_PANE_STYLE: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  flex: 1,
+  minHeight: 0,
+};
+const VIEW_PANE_SCROLL_STYLE: React.CSSProperties = {
+  ...VIEW_PANE_STYLE,
+  overflow: "auto",
+};
+/** 非当前视图:`hidden` 属性只是 UA 的 `display:none`,**任何**行内 display
+ *  都能盖过它 —— 上面两个常量恰好都带 `display:flex`,所以隐藏态必须显式写
+ *  行内 `display:none`,不能只挂属性。 */
+const VIEW_PANE_HIDDEN_STYLE: React.CSSProperties = { display: "none" };
+
+/** 中栏三视图。会话级内存态:切会话 / 换 agent 回「对话」(spec §九「壳」)。 */
+type ConsoleView = "chat" | "trajectory" | "workspace";
+
+/** 视图容器:**首次激活才挂载,之后常驻**(只切显隐)。
+ *
+ *  - 为什么激活过就不卸载:卸载会丢掉 React 状态 —— 轨迹的选中记录 / 时间轴
+ *    选区 / 搜索词 / 折叠集 / 缩放视口,还会让常驻的 `focusRequest` 在重挂时
+ *    重新受理一遍,把读者弹回当初那条记录。(**注意**:`display:none` 保不住
+ *    滚动偏移 —— 浏览器在元素不可见时会把 `scrollTop` 归零,所以「回到原处
+ *    接着看」这件事这里并不成立,能保住的是上面那些 React 状态。)
+ *  - 为什么不一上来就全挂:`WorkspacePanel` 一挂就打 `GET /workspace`,
+ *    `TrajectoryView` 一挂就把加载窗口内的 pending 历史 run 全部回放(最多
+ *    20 轮)—— 读者可能整场都待在对话视图,这些都是白发的请求(修复轮 2)。 */
+function ViewPane({
+  view,
+  active,
+  scroll = false,
+  children,
+}: {
+  view: ConsoleView;
+  active: boolean;
+  scroll?: boolean;
+  children: React.ReactNode;
+}): React.ReactElement {
+  // 单调闩:`active` 翻 true 本身就是一次重渲染,所以这里读到的一定是最新值,
+  // 不需要额外的 state / effect(重复置 true 幂等,StrictMode 双跑也无副作用)。
+  const seen = useRef(active);
+  if (active) seen.current = true;
+
+  return (
+    <div
+      data-testid={`console-view-pane-${view}`}
+      data-active={active ? "true" : undefined}
+      hidden={!active}
+      aria-hidden={active ? undefined : "true"}
+      style={
+        active ? (scroll ? VIEW_PANE_SCROLL_STYLE : VIEW_PANE_STYLE) : VIEW_PANE_HIDDEN_STYLE
+      }
+    >
+      {seen.current ? children : null}
+    </div>
+  );
+}
 
 const COMPOSER_STYLE: React.CSSProperties = {
   display: "flex",
@@ -107,11 +173,14 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [varValues, setVarValues] = useState<Record<string, string>>({});
   const [rate, setRate] = useState<RateCardRecord | null>(null);
-  // R9 — 右栏跟随:``null`` = 跟最新一轮;点轮块 / 脚注「检查」置为该轮。
+  // R9 — 中栏轮高亮:``null`` = 跟最新一轮;点轮块 / 脚注「查看轨迹」置为该轮。
   const [selectedTurnKey, setSelectedTurnKey] = useState<string | null>(null);
-  const [inspectTab, setInspectTab] = useState<InspectTab>("trajectory");
-  // R18 — 中栏紧凑行「检查」发起的一次性定位请求(轮 + 行 id)。
-  const [inspectRow, setInspectRow] = useState<{ turnKey: string; rowId: string } | null>(null);
+  const [view, setView] = useState<ConsoleView>("chat");
+  // §九「联动」—— 中栏脚注 / 过程条发起的一次性跨视图定位请求。``nonce`` 是
+  // 唯一的「这是一次新请求」信号:同一轮 / 同一行连点两次,turnKey + rowId 都
+  // 没变,只有它变了 —— 少了它,关掉详情再点同一处就是空操作。
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
+  const focusNonceRef = useRef(0);
   // 每轮的流式计时(ttft / 首末 token 时刻)—— 状态栏的 ttft / tok-per-s 用。
   const [timings, setTimings] = useState<Record<string, TurnTiming>>({});
   // 左栏列表刷新触发器 —— 新建会话 / 一轮跑完(标题、最近活动会变)。
@@ -131,6 +200,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     turns: historyTurns,
     loads: historyLoads,
     registerRow: registerHistoryRow,
+    loadRuns: loadHistoryRuns,
     load: loadHistory,
     reset: resetHistory,
   } = useHistoryTurns();
@@ -180,8 +250,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     () => buildConsoleTurns({ historyTurns, historyLoads, liveTurns: turns, timings }),
     [historyTurns, historyLoads, turns, timings],
   );
-  const selectedTurn =
-    consoleTurns.find((tn) => tn.key === selectedTurnKey) ?? consoleTurns.at(-1) ?? null;
   const liveEvents = useMemo(() => turns.flatMap((tn) => tn.events), [turns]);
   const {
     plan,
@@ -233,15 +301,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     streamTurnId,
   ]);
 
-  // ``TrajectoryPanel.focusRowId`` only reacts to a CHANGED value, so this
-  // one-shot request must fall back to ``null`` once the panel consumed it —
-  // otherwise closing the detail and clicking the SAME row's 「检查」 again
-  // would be a no-op. Child effects run before parent effects, so the panel
-  // has already selected the row by the time this clears the request.
-  useEffect(() => {
-    if (inspectRow !== null) setInspectRow(null);
-  }, [inspectRow]);
-
   // Reset to a fresh draft — no backend session is created here (see
   // ``ensureThread``). R11: 变量值随会话,新会话清空(旧实现跨会话残留)。
   const resetDraft = useCallback(() => {
@@ -254,8 +313,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     setThread(null);
     setVarValues({});
     setSelectedTurnKey(null);
-    setInspectRow(null);
-    setInspectTab("trajectory");
+    setFocusRequest(null);
+    setView("chat");
   }, [resetHistory, resetRun]);
 
   // #6 — resume an existing thread: switch to it + keep chatting (the backend
@@ -270,8 +329,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
       setThreadError(null);
       setVarValues({});
       setSelectedTurnKey(null);
-      setInspectRow(null);
-      setInspectTab("trajectory");
+      setFocusRequest(null);
+      setView("chat");
       setThread(picked);
       void loadHistory(picked.thread_id);
     },
@@ -438,19 +497,33 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     setTaskResults((prev) => [...prev, result]);
   }, []);
 
-  // R9 — 点轮块 / 脚注「检查」:右栏钉在该轮,并回到轨迹 tab。
-  const handleSelectTurn = useCallback((key: string) => {
+  // §九「联动」—— 脚注「查看轨迹」:切「轨迹」tab + 选中该轮**最后一条**
+  // ASSISTANT 记录(``rowId: null`` 就是这个约定,由 ``use_trajectory_state``
+  // 落到具体记录上)。``selectedTurnKey`` 照旧给中栏的轮高亮用。
+  // **只接脚注按钮**:点轮卡片空白处走 ``setSelectedTurnKey``(纯高亮),
+  // 否则误点一下就被传送到另一个视图(修复轮 2)。
+  const handleInspectTurn = useCallback((key: string) => {
+    focusNonceRef.current += 1;
     setSelectedTurnKey(key);
-    setInspectRow(null);
-    setInspectTab("trajectory");
+    setView("trajectory");
+    setFocusRequest({ turnKey: key, rowId: null, nonce: focusNonceRef.current });
   }, []);
 
-  // R18 — 紧凑行「检查」:切轮 + 让右栏选中同 id 的轨迹行。
+  // §九「联动」—— 过程条每行「轨迹」:同上,但带上该行的 id(``think:<seq>``
+  // 由账本侧映射成 ``assistant:<seq>``,其它 id 同名)。
   const handleInspectRow = useCallback((turnKey: string, rowId: string) => {
+    focusNonceRef.current += 1;
     setSelectedTurnKey(turnKey);
-    setInspectRow({ turnKey, rowId });
-    setInspectTab("trajectory");
+    setView("trajectory");
+    setFocusRequest({ turnKey, rowId, nonce: focusNonceRef.current });
   }, []);
+
+  // 轨迹账本翻页 / 扩窗时主动回放这批历史 run(没有会话就没有历史可放)。
+  const handleEnsureLoaded = useCallback(
+    (runIds: readonly string[]): Promise<void> =>
+      thread ? loadHistoryRuns(runIds, thread.thread_id) : Promise.resolve(),
+    [thread, loadHistoryRuns],
+  );
 
   // 左栏改名 / 归档 / 清除的回声:只有动到当前会话才影响本页。
   const handleSidebarChanged = useCallback(
@@ -499,8 +572,40 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 {`${t("console.thread_id_label")}: ${thread.thread_id}`}
               </Text>
             ) : null}
+            <Segmented
+              value={view}
+              onChange={(value) => setView(value as ConsoleView)}
+              size="small"
+              aria-label={t("console.view_aria")}
+              data-testid="console-view-tabs"
+              style={{ marginLeft: "auto" }}
+              options={[
+                {
+                  value: "chat",
+                  label: <span data-testid="console-view-tab-chat">{t("console.view_chat")}</span>,
+                },
+                {
+                  value: "trajectory",
+                  label: (
+                    <span data-testid="console-view-tab-trajectory">
+                      {t("console.view_trajectory")}
+                    </span>
+                  ),
+                },
+                {
+                  value: "workspace",
+                  label: (
+                    <span data-testid="console-view-tab-workspace">
+                      {t("console.view_workspace")}
+                    </span>
+                  ),
+                },
+              ]}
+            />
+            {/* 轮数只跟在切换器右边:再来一个 `marginLeft: "auto"` 会把弹性
+                余量分成两段,Segmented 自己也被推走,不再居中偏右。 */}
             {consoleTurns.length > 0 && (
-              <Text type="secondary" style={{ fontSize: 12, marginLeft: "auto" }}>
+              <Text type="secondary" style={{ fontSize: 12, marginLeft: 12 }}>
                 {t("console.turn_count", { n: consoleTurns.length })}
               </Text>
             )}
@@ -520,31 +625,57 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             </div>
           )}
 
-          <Transcript
-            turns={consoleTurns}
-            flatHistory={historyTurns === null ? history : []}
-            taskResults={taskResults}
-            threadId={thread?.thread_id ?? null}
-            selectedKey={selectedTurnKey}
-            onSelectTurn={handleSelectTurn}
-            onInspectRow={handleInspectRow}
-            streamTurnKey={streamTurnId}
-            liveByStep={tokenStream.liveByStep}
-            registerHistoryRow={registerHistoryRow}
-            rate={rate}
-            isSystemAdmin={isSystemAdmin}
-            readOnly={false}
-            isTenantSwitched={isTenantSwitched}
-            onDecide={engine.decideApproval}
-            deciding={running}
-            onExport={handleExport}
-            exportingKey={exportingId}
-            // Track C W2 — 切入态只读:重试是写操作,不传 handler 按钮就不渲染。
-            onRetryLive={isTenantSwitched ? undefined : handleRetry}
-            onRetryHistory={isTenantSwitched ? undefined : handleHistoryRetry}
-            onDownloadArtifact={handleDownloadArtifact}
-            onFireResult={handleFireResult}
-          />
+          <ViewPane view="chat" active={view === "chat"}>
+            <Transcript
+              turns={consoleTurns}
+              flatHistory={historyTurns === null ? history : []}
+              taskResults={taskResults}
+              threadId={thread?.thread_id ?? null}
+              selectedKey={selectedTurnKey}
+              onSelectTurn={setSelectedTurnKey}
+              onInspectTurn={handleInspectTurn}
+              onInspectRow={handleInspectRow}
+              streamTurnKey={streamTurnId}
+              liveByStep={tokenStream.liveByStep}
+              registerHistoryRow={registerHistoryRow}
+              rate={rate}
+              isSystemAdmin={isSystemAdmin}
+              readOnly={false}
+              isTenantSwitched={isTenantSwitched}
+              onDecide={engine.decideApproval}
+              deciding={running}
+              onExport={handleExport}
+              exportingKey={exportingId}
+              // Track C W2 — 切入态只读:重试是写操作,不传 handler 按钮就不渲染。
+              onRetryLive={isTenantSwitched ? undefined : handleRetry}
+              onRetryHistory={isTenantSwitched ? undefined : handleHistoryRetry}
+              onDownloadArtifact={handleDownloadArtifact}
+              onFireResult={handleFireResult}
+            />
+          </ViewPane>
+
+          <ViewPane view="trajectory" active={view === "trajectory"}>
+            <TrajectoryView
+              turns={consoleTurns}
+              threadId={thread?.thread_id ?? null}
+              streamTurnKey={streamTurnId}
+              // 稳定引用:``tokenStream.liveByStep`` 自己是 state,只在流更新
+              // 时换。这里包一层 ``new Map`` 就是每帧重建账本 / 时间轴。
+              liveByStep={tokenStream.liveByStep}
+              running={running}
+              // 藏起来的时候不跑秒针(不改 running 的语义,只省每秒一次的
+              // 账本 / 时间轴重建)。
+              visible={view === "trajectory"}
+              isSystemAdmin={isSystemAdmin}
+              focusRequest={focusRequest}
+              onEnsureLoaded={handleEnsureLoaded}
+              onFireResult={handleFireResult}
+            />
+          </ViewPane>
+
+          <ViewPane view="workspace" active={view === "workspace"} scroll>
+            <WorkspacePanel running={running} readOnly={isTenantSwitched} />
+          </ViewPane>
 
           <div style={COMPOSER_STYLE}>
             <PlanCard
@@ -601,29 +732,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             data-testid="playground-doc-input"
           />
         </>
-      }
-      inspect={
-        <InspectPanel
-          tab={inspectTab}
-          onTabChange={setInspectTab}
-          trajectory={
-            <TrajectoryPanel
-              turn={selectedTurn}
-              threadId={thread?.thread_id ?? null}
-              isSystemAdmin={isSystemAdmin}
-              liveByStep={
-                selectedTurn?.key === streamTurnId ? tokenStream.liveByStep : undefined
-              }
-              focusRowId={
-                inspectRow !== null && inspectRow.turnKey === selectedTurn?.key
-                  ? inspectRow.rowId
-                  : null
-              }
-              onFireResult={handleFireResult}
-            />
-          }
-          workspace={<WorkspacePanel running={running} readOnly={isTenantSwitched} />}
-        />
       }
     />
   );

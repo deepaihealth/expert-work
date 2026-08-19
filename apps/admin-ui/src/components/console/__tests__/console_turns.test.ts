@@ -8,8 +8,8 @@ describe("buildConsoleTurns", () => {
   it("orders history before live, numbers seq from 0, maps history status/error like the old TurnCard call site", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null },
-        { key: "h2", input: "q2", fallbackLines: [{ text: "partial", channel: "final" }], runId: "r2", status: "timeout", tokens: null },
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+        { key: "h2", input: "q2", fallbackLines: [{ text: "partial", channel: "final" }], runId: "r2", status: "timeout", tokens: null, createdAt: null },
       ],
       historyLoads: { r1: { state: "done", events: [meta("r1")] } },
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
@@ -22,15 +22,28 @@ describe("buildConsoleTurns", () => {
   });
   it("passes the persisted rollup through and returns [] for null history + no live turns", () => {
     const tokens = { input_tokens: 1, output_tokens: 1, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2, llm_calls: 1, models: [] };
-    expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);
+    expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens, createdAt: null }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);
     expect(buildConsoleTurns({ historyTurns: null, historyLoads: {}, liveTurns: [], timings: {} })).toEqual([]);
+  });
+});
+
+describe("createdAt", () => {
+  it("history turns carry the run's createdAt, live turns null", () => {
+    const [history, live] = buildConsoleTurns({
+      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z" }],
+      historyLoads: {},
+      liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
+      timings: {},
+    });
+    expect(history.createdAt).toBe("2026-01-01T00:00:00Z");
+    expect(live.createdAt).toBeNull();
   });
 });
 
 describe("statsInputOf", () => {
   it("maps loaded from loadState==='done' (not source) and carries events/status/tokens/timing through", () => {
     const [history, live] = buildConsoleTurns({
-      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null }],
+      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z" }],
       historyLoads: {}, // no r1 entry → loadState stays "pending", not "done"
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
       timings: { L1: { ttftMs: 500, firstTokenAt: 1, lastTokenAt: 2 } },

@@ -1154,12 +1154,7 @@ export interface TranslationKeys {
     vars_required_mark: string;
     composer_hint: string;
     stats_partial: string;
-    inspect_trajectory: string;
-    inspect_workspace: string;
-    inspect_turn_header: string;
-    inspect_no_turn: string;
     traj_kind_user: string;
-    traj_kind_think: string;
     traj_kind_plan: string;
     traj_kind_memory: string;
     traj_kind_tool: string;
@@ -1172,7 +1167,6 @@ export interface TranslationKeys {
     traj_kind_approval: string;
     traj_kind_guard: string;
     traj_kind_gap: string;
-    traj_llm_call: string;
     traj_status_running: string;
     traj_status_ok: string;
     traj_status_error: string;
@@ -1192,17 +1186,9 @@ export interface TranslationKeys {
     detail_status: string;
     detail_duration: string;
     detail_model: string;
-    detail_tokens: string;
     detail_finish_reason: string;
-    detail_tool: string;
-    detail_server: string;
-    detail_steps_total: string;
-    detail_goal: string;
-    detail_count: string;
     detail_attachments: string;
     detail_variables: string;
-    detail_chars: string;
-    detail_worker: string;
     detail_worker_steps: string;
     detail_need_langfuse: string;
     detail_no_frames: string;
@@ -1221,7 +1207,6 @@ export interface TranslationKeys {
     timing_no_trace: string;
     timing_mismatch: string;
     timing_unsupported: string;
-    detail_action: string;
     detail_worker_summary: string;
     stats_chip_turns: string;
     stats_chip_steps: string;
@@ -1243,22 +1228,66 @@ export interface TranslationKeys {
     footer_tokens: string;
     footer_steps: string;
     footer_export: string;
-    lane_user: string;
-    lane_mode_sequence: string;
-    lane_mode_duration: string;
-    lane_tip_hint: string;
-    lane_tip_range: string;
-    traj_col_idx: string;
-    traj_col_kind: string;
-    traj_col_summary: string;
-    traj_col_in: string;
-    traj_col_out: string;
-    traj_col_think: string;
-    traj_col_duration: string;
-    traj_filter: string;
-    traj_filter_clear: string;
-    inspect_run_detail: string;
-    traj_list_label: string;
+    toolbar_duration: string;
+    toolbar_duration_title_on: string;
+    toolbar_duration_title_off: string;
+    toolbar_degraded: string;
+    toolbar_turns: string;
+    toolbar_collapse_turns: string;
+    toolbar_expand_turns: string;
+    toolbar_calls: string;
+    toolbar_collapse_calls: string;
+    toolbar_expand_calls: string;
+    toolbar_search: string;
+    toolbar_search_count: string;
+    toolbar_aria: string;
+    timeline_aria: string;
+    timeline_track_aria: string;
+    timeline_empty: string;
+    timeline_load_earlier: string;
+    timeline_loading_earlier: string;
+    timeline_tip_total: string;
+    timeline_tip_started: string;
+    ledger_aria: string;
+    ledger_turn_label: string;
+    ledger_turn_compact: string;
+    ledger_request_label: string;
+    ledger_tool_call_only: string;
+    ledger_no_output: string;
+    ledger_calls_collapsed: string;
+    ledger_load_earlier: string;
+    ledger_loading_earlier: string;
+    ledger_loading: string;
+    ledger_placeholder_loading: string;
+    ledger_placeholder_error: string;
+    ledger_kind_subtool: string;
+    ledger_kind_compacted: string;
+    detail_tab_preview: string;
+    detail_tab_rawtext: string;
+    detail_tab_input: string;
+    detail_tab_usage: string;
+    detail_hierarchy: string;
+    detail_hier_request: string;
+    detail_hier_assistant: string;
+    detail_hier_tool: string;
+    detail_run: string;
+    detail_open_tab: string;
+    detail_thinking: string;
+    detail_thinking_none: string;
+    detail_usage_input: string;
+    detail_usage_output: string;
+    detail_usage_reasoning: string;
+    detail_usage_cache_read: string;
+    detail_usage_cumulative: string;
+    detail_tool_calls: string;
+    detail_request_title: string;
+    detail_resize: string;
+    detail_placeholder: string;
+    trajectory_empty: string;
+    view_chat: string;
+    view_trajectory: string;
+    view_workspace: string;
+    view_aria: string;
   };
   playground: {
     session_label: string;
@@ -4337,12 +4366,7 @@ const en: TranslationKeys = {
     vars_required_mark: "required",
     composer_hint: "Enter to send, Shift+Enter for a new line",
     stats_partial: "(loaded turns only)",
-    inspect_trajectory: "Trajectory",
-    inspect_workspace: "Workspace",
-    inspect_turn_header: "Turn {{n}} · {{status}}",
-    inspect_no_turn: "Pick a turn to inspect",
     traj_kind_user: "USER",
-    traj_kind_think: "THINK",
     traj_kind_plan: "PLAN",
     traj_kind_memory: "MEMORY",
     traj_kind_tool: "TOOL",
@@ -4355,7 +4379,6 @@ const en: TranslationKeys = {
     traj_kind_approval: "APPROVAL",
     traj_kind_guard: "GUARD",
     traj_kind_gap: "GAP",
-    traj_llm_call: "LLM call · {{model}}",
     traj_status_running: "running",
     traj_status_ok: "done",
     traj_status_error: "failed",
@@ -4368,24 +4391,16 @@ const en: TranslationKeys = {
     detail_tab_payload: "Payload",
     detail_tab_result: "Result",
     detail_tab_timing: "Timing",
-    detail_tab_raw: "Raw",
+    detail_tab_raw: "Frames",
     detail_close: "Close detail",
     detail_level: "Turn {{turn}} · step {{step}}",
     detail_level_turn_only: "Turn {{turn}}",
     detail_status: "Status",
     detail_duration: "Duration",
     detail_model: "Model",
-    detail_tokens: "In {{in}} · out {{out}}",
     detail_finish_reason: "Finish reason",
-    detail_tool: "Tool",
-    detail_server: "MCP server",
-    detail_steps_total: "Steps",
-    detail_goal: "Goal",
-    detail_count: "Count",
     detail_attachments: "Attachments",
     detail_variables: "Variables",
-    detail_chars: "Characters",
-    detail_worker: "Sub-agent",
     detail_worker_steps: "Sub-agent steps",
     detail_need_langfuse: "LLM input is only available from the Langfuse trace; no span matched this row yet.",
     detail_no_frames: "No raw frames for this row.",
@@ -4404,7 +4419,6 @@ const en: TranslationKeys = {
     timing_no_trace: "No trace for this run",
     timing_mismatch: "Could not align with a span",
     timing_unsupported: "No span for this row",
-    detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
     stats_chip_turns: "Turns",
     stats_chip_steps: "Steps",
@@ -4426,22 +4440,66 @@ const en: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
     footer_export: "Export",
-    lane_user: "User",
-    lane_mode_sequence: "Sequence",
-    lane_mode_duration: "Duration",
-    lane_tip_hint: "Click to select · drag to filter · double-click to reset",
-    lane_tip_range: "{{start}} → {{end}} · {{d}}",
-    traj_col_idx: "#",
-    traj_col_kind: "Kind",
-    traj_col_summary: "Summary",
-    traj_col_in: "In",
-    traj_col_out: "Out",
-    traj_col_think: "Think",
-    traj_col_duration: "Time",
-    traj_filter: "Filtered #{{a}}–#{{b}} ({{n}} rows)",
-    traj_filter_clear: "Clear filter",
-    inspect_run_detail: "Run detail",
-    traj_list_label: "Trajectory rows",
+    toolbar_duration: "Duration",
+    toolbar_duration_title_on: "Use equal widths",
+    toolbar_duration_title_off: "Use recorded durations",
+    toolbar_degraded: "No timing",
+    toolbar_turns: "Turns",
+    toolbar_collapse_turns: "Collapse all turns",
+    toolbar_expand_turns: "Expand all turns",
+    toolbar_calls: "Calls",
+    toolbar_collapse_calls: "Collapse all tool calls",
+    toolbar_expand_calls: "Expand all tool calls",
+    toolbar_search: "Search",
+    toolbar_search_count: "{{n}} matches",
+    toolbar_aria: "Trajectory toolbar",
+    timeline_aria: "Trajectory timeline",
+    timeline_track_aria: "Timeline overview; drag horizontally to focus events",
+    timeline_empty: "No timing data",
+    timeline_load_earlier: "Load earlier history",
+    timeline_loading_earlier: "Loading earlier history…",
+    timeline_tip_total: "Total {{d}}",
+    timeline_tip_started: "Started {{t}}",
+    ledger_aria: "Trajectory ledger",
+    ledger_turn_label: "Turn {{n}}",
+    ledger_turn_compact: "#{{n}}",
+    ledger_request_label: "Request #{{n}} · Turn {{turn}} · Step {{step}}",
+    ledger_tool_call_only: "(tool call only)",
+    ledger_no_output: "(no output)",
+    ledger_calls_collapsed: "(calls collapsed, click to expand)",
+    ledger_load_earlier: "Load earlier history ({{n}} more turns)",
+    ledger_loading_earlier: "Loading earlier history…",
+    ledger_loading: "Loading trajectory…",
+    ledger_placeholder_loading: "Replaying…",
+    ledger_placeholder_error: "Replay failed; text fallback",
+    ledger_kind_subtool: "SUBTOOL",
+    ledger_kind_compacted: "COMPACTED",
+    detail_tab_preview: "Preview",
+    detail_tab_rawtext: "Raw",
+    detail_tab_input: "Input",
+    detail_tab_usage: "Usage",
+    detail_hierarchy: "Hierarchy",
+    detail_hier_request: "Request #{{n}}",
+    detail_hier_assistant: "Assistant Message",
+    detail_hier_tool: "Tool Call",
+    detail_run: "Run",
+    detail_open_tab: "Open {{tab}}",
+    detail_thinking: "Thinking ({{n}} tokens)",
+    detail_thinking_none: "Thinking",
+    detail_usage_input: "Input",
+    detail_usage_output: "Output",
+    detail_usage_reasoning: "Reasoning",
+    detail_usage_cache_read: "Cache read",
+    detail_usage_cumulative: "Cumulative",
+    detail_tool_calls: "Tool calls",
+    detail_request_title: "Request #{{n}}",
+    detail_resize: "Drag to resize; double-click to reset",
+    detail_placeholder: "Turn not replayed yet; text fallback only",
+    trajectory_empty: "No trajectory yet",
+    view_chat: "Chat",
+    view_trajectory: "Trajectory",
+    view_workspace: "Workspace",
+    view_aria: "View",
   },
   playground: {
     session_label: "Session",

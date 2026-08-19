@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { liveSyntheticRows, settledStepsOf } from "../live_rows";
+import { liveLedgerRows, liveSyntheticRows, settledStepsOf } from "../live_rows";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 
@@ -63,5 +63,37 @@ describe("liveSyntheticRows", () => {
   it("skips a step with empty reasoning and no tool names (nothing to synthesize)", () => {
     const liveByStep = new Map<number, LiveStep>([[1, liveStep()]]);
     expect(liveSyntheticRows([], liveByStep)).toEqual([]);
+  });
+});
+
+describe("liveLedgerRows", () => {
+  it("emits one assistant row per unsettled step even with empty reasoning, plus one tool row per named call", () => {
+    const liveByStep = new Map<number, LiveStep>([
+      [2, liveStep({ content: "写到一半", reasoning: "", toolNames: new Map([[0, "query_crm"], [1, "search"]]) })],
+      [3, liveStep()], // 既没文字也没思考也没工具 —— 账本投影照样出一条 assistant
+    ]);
+    const rows = liveLedgerRows([], liveByStep);
+    expect(rows.map((r) => r.id)).toEqual([
+      "live-assistant:2", "live-tool:2:0", "live-tool:2:1", "live-assistant:3",
+    ]);
+    expect(rows[0]).toMatchObject({
+      kind: "assistant", seq: -1, step: 2, status: "running", text: "写到一半", reasoning: "",
+      model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 2,
+      durationMs: null, eventIndexes: [], serverMs: null,
+    });
+    expect(rows[3]).toMatchObject({ kind: "assistant", step: 3, text: "", reasoning: "", toolCallCount: 0 });
+    expect(rows[1]).toMatchObject({
+      kind: "tool", seq: -1, step: 2, status: "running",
+      entry: { id: "live-2-0", toolName: "query_crm", status: "pending" },
+    });
+  });
+
+  it("skips a step that already landed an authoritative frame, and returns [] without a live buffer", () => {
+    const liveByStep = new Map<number, LiveStep>([
+      [1, liveStep({ content: "settled leftover", reasoning: "stale", toolNames: new Map([[0, "t"]]) })],
+      [2, liveStep({ content: "still going" })],
+    ]);
+    expect(liveLedgerRows([agentUpdate(1)], liveByStep).map((r) => r.id)).toEqual(["live-assistant:2"]);
+    expect(liveLedgerRows([], undefined)).toEqual([]);
   });
 });

@@ -240,6 +240,10 @@ html[data-theme="dark"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-400);
+  /* REFLECT(账本类型标签的文字色 + 时间轴块底色):与 ASSISTANT 同色相、
+     朝对比度更高的方向错一档 —— 深色底提亮到 accent-300,既让标签读得清,
+     也让同一泳道上的 REFLECT 块与 ASSISTANT 块(accent-400)分得开。 */
+  --ew-accent-reflect: var(--ew-color-accent-300);
   /* TraceView's entry-chain span marker (Task 6) — lighter teal step for
      dark backgrounds, same rationale as the block above. */
   --ew-trace-entry:    var(--ew-color-teal-300);
@@ -302,6 +306,9 @@ html[data-theme="light"] {
   --ew-text-warning:   var(--ew-status-warning-fg);
   --ew-text-info:      var(--ew-status-info-fg);
   --ew-accent-violet:  var(--ew-color-accent-600);
+  /* REFLECT(见 dark 块的说明):浅色底压深到 accent-700,与 ASSISTANT 的
+     accent-600 错开一档。 */
+  --ew-accent-reflect: var(--ew-color-accent-700);
   /* TraceView's entry-chain span marker (Task 6) — darker teal step for
      light backgrounds, same rationale as the block above. */
   --ew-trace-entry:    var(--ew-color-teal-700);

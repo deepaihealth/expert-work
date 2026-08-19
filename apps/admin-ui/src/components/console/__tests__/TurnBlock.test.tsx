@@ -50,6 +50,7 @@ function makeConsoleTurn(
     fallbackLines: [],
     tokens: null,
     timing: null,
+    createdAt: null,
   };
 }
 
@@ -69,6 +70,7 @@ function makeBaseProps(turn: ConsoleTurn): TurnBlockProps {
     threadId: "th-1",
     selected: false,
     onSelect: vi.fn(),
+    onInspect: vi.fn(),
     onInspectRow: vi.fn(),
     rate: null,
     isSystemAdmin: false,
@@ -267,16 +269,20 @@ describe("TurnBlock", () => {
     expect(screen.getByTestId("console-turn-inputs")).toHaveTextContent("city=上海");
   });
 
-  it("⑥ clicking the container background selects the turn", async () => {
+  // 修复轮 2 —— 卡片空白是个大靶子,只许换高亮轮:`onSelect` 响,`onInspect`
+  // (切视图那条)一定不响。
+  it("⑥ clicking the container background selects the turn and does NOT inspect it", async () => {
     const turn = makeConsoleTurn([]);
     const onSelect = vi.fn();
-    renderTurnBlock({ ...makeBaseProps(turn), onSelect });
+    const onInspect = vi.fn();
+    renderTurnBlock({ ...makeBaseProps(turn), onSelect, onInspect });
 
     await userEvent.click(screen.getByTestId("console-turn"));
     expect(onSelect).toHaveBeenCalledWith("t1");
+    expect(onInspect).not.toHaveBeenCalled();
   });
 
-  it("⑦ a row's inspect button calls onInspectRow(turnKey, rowId); the footer's inspect button calls onSelect(key)", async () => {
+  it("⑦ a row's inspect button calls onInspectRow(turnKey, rowId); the footer's inspect button calls onInspect(key), not onSelect", async () => {
     const events: SseEvent[] = [
       upd("agent", {
         step_count: 1,
@@ -286,15 +292,18 @@ describe("TurnBlock", () => {
     const turn = makeConsoleTurn(events);
     const onInspectRow = vi.fn();
     const onSelect = vi.fn();
-    renderTurnBlock({ ...makeBaseProps(turn), onInspectRow, onSelect });
+    const onInspect = vi.fn();
+    renderTurnBlock({ ...makeBaseProps(turn), onInspectRow, onSelect, onInspect });
 
     // §八.3 — settled turn ⇒ collapsed process strip; open it to reach the row.
     await userEvent.click(screen.getByTestId("console-process-head"));
     await userEvent.click(screen.getByTestId("console-row-inspect"));
     expect(onInspectRow).toHaveBeenCalledWith("t1", "tool:0:0");
     expect(onSelect).not.toHaveBeenCalled();
+    expect(onInspect).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByTestId("console-turn-inspect"));
-    expect(onSelect).toHaveBeenCalledWith("t1");
+    expect(onInspect).toHaveBeenCalledWith("t1");
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

@@ -1,11 +1,12 @@
 /*
- * ConsoleShell — component-scoped styles for the debug console's
- * three-column grid (调试台重设计 PR-A Task 13). Colors are `--ew-*`
- * design tokens end to end (see GanttTimeline.css for the same
- * convention); the <1200px breakpoint collapses the left column to a
- * 48px icon rail (the sidebar's real content moves into a Drawer,
+ * ConsoleShell — component-scoped styles for the debug console's grid
+ * (调试台重设计 PR-A Task 13; PR-A.2 Task 6 added the two-column form).
+ * Colors are `--ew-*` design tokens end to end (see GanttTimeline.css for
+ * the same convention); the <1200px breakpoint collapses the left column to
+ * a 48px icon rail (the sidebar's real content moves into a Drawer,
  * ConsoleShell.tsx wires that up — this file only hides/shows the two
- * candidate renderings).
+ * candidate renderings). `.ew-console--two` is the two-column form used
+ * when `inspect` is omitted (no trajectory panel).
  */
 
 .ew-console {
@@ -14,6 +15,10 @@
   height: calc(100dvh - var(--ew-console-top, 0px) - 24px);
   min-height: 480px;
   gap: 0;
+}
+
+.ew-console--two {
+  grid-template-columns: 264px 1fr;
 }
 
 .ew-console__sidebar,
@@ -40,6 +45,9 @@
 @media (max-width: 1199px) {
   .ew-console {
     grid-template-columns: 48px 1fr minmax(360px, 40%);
+  }
+  .ew-console--two {
+    grid-template-columns: 48px 1fr;
   }
   .ew-console__sidebar > .ew-console__sidebar-body {
     display: none;

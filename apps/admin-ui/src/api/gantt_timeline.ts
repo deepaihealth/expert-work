@@ -57,6 +57,10 @@ export interface GanttModel {
   markers: GanttMarker[];
   /** Axis length, `max(end) - t0`. */
   totalMs: number;
+  /** `t0` itself — the earliest row start as an absolute server-clock ms
+   *  (`0` when there are no rows), so `originMs + rows[i].startMs` is that
+   *  row's absolute start. */
+  originMs: number;
   /** `true` if any row's frame id was missing/malformed and had to fall
    *  back to sequential placement. */
   degraded: boolean;
@@ -287,5 +291,5 @@ export function buildGanttRows(
 
   const markers: GanttMarker[] = absMarkers.map((m) => ({ atMs: m.atMs - t0, kind: m.kind, text: m.text }));
 
-  return { rows, markers, totalMs, degraded };
+  return { rows, markers, totalMs, degraded, originMs: t0 };
 }

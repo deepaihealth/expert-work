@@ -182,6 +182,15 @@ describe("buildGanttRows", () => {
     expect(Math.abs(a.startMs - b.startMs)).toBe(700);
   });
 
+  it("originMs 是绝对 t0:originMs + rows[i].startMs 还原每行的绝对起点;无行时 0", () => {
+    const m = buildGanttRows(fx.settledRun);
+    // step 1 ends at BASE+1000 with 500ms → starts at BASE+500 (= t0);
+    // step 2 ends at BASE+2000 with 700ms → starts at BASE+1300.
+    expect(m.originMs).toBe(BASE_MS + 500);
+    expect(m.originMs + m.rows[1].startMs).toBe(BASE_MS + 1300);
+    expect(buildGanttRows([]).originMs).toBe(0);
+  });
+
   it("id 缺失 → 退化顺序拼接且 degraded=true", () => {
     const m = buildGanttRows(fx.noIds);
     expect(m.degraded).toBe(true);

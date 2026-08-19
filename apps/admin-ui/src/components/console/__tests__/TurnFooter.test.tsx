@@ -33,6 +33,7 @@ function makeConsoleTurn(turnOver: Partial<Turn> = {}): ConsoleTurn {
     fallbackLines: [],
     tokens: null,
     timing: null,
+    createdAt: null,
   };
 }
 
