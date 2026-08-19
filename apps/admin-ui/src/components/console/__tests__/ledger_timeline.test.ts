@@ -20,16 +20,26 @@ import {
  */
 function nineRecords(): TimelineSpanInput[] {
   return [
-    { index: 0, lane: 0, kind: "user", isError: false, running: false, turnSeq: 0, turnStart: true, startedAt: 1000, endedAt: 1000 },
-    { index: 1, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 0, turnStart: false, startedAt: 1000, endedAt: 1400 },
-    { index: 2, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 0, turnStart: false, startedAt: 1450, endedAt: 1650 },
-    { index: 3, lane: 2, kind: "tool", isError: true, running: false, turnSeq: 0, turnStart: false, startedAt: 1400, endedAt: 1700 },
-    { index: 4, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 1, turnStart: true, startedAt: 3000, endedAt: 3200 },
-    { index: 5, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 1, turnStart: false, startedAt: 3200, endedAt: 3500 },
-    { index: 6, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 2, turnStart: true, startedAt: 4000, endedAt: 4300 },
-    { index: 7, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 2, turnStart: false, startedAt: 4300, endedAt: 4600 },
-    { index: 8, lane: 1, kind: "assistant", isError: false, running: true, turnSeq: 2, turnStart: false, startedAt: 4600, endedAt: null },
+    { index: 0, lane: 0, kind: "user", isError: false, running: false, turnSeq: 0, turnStart: true, startedAt: 1000, endedAt: 1000, firstTokenAt: null },
+    { index: 1, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 0, turnStart: false, startedAt: 1000, endedAt: 1400, firstTokenAt: null },
+    { index: 2, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 0, turnStart: false, startedAt: 1450, endedAt: 1650, firstTokenAt: null },
+    { index: 3, lane: 2, kind: "tool", isError: true, running: false, turnSeq: 0, turnStart: false, startedAt: 1400, endedAt: 1700, firstTokenAt: null },
+    { index: 4, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 1, turnStart: true, startedAt: 3000, endedAt: 3200, firstTokenAt: null },
+    { index: 5, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 1, turnStart: false, startedAt: 3200, endedAt: 3500, firstTokenAt: null },
+    { index: 6, lane: 1, kind: "assistant", isError: false, running: false, turnSeq: 2, turnStart: true, startedAt: 4000, endedAt: 4300, firstTokenAt: null },
+    { index: 7, lane: 2, kind: "tool", isError: false, running: false, turnSeq: 2, turnStart: false, startedAt: 4300, endedAt: 4600, firstTokenAt: null },
+    { index: 8, lane: 1, kind: "assistant", isError: false, running: true, turnSeq: 2, turnStart: false, startedAt: 4600, endedAt: null, firstTokenAt: null },
   ];
+}
+
+/** 最小 `TimelineSpanInput` 构造器,只用于 `TimelineSpan.ttft` 测试 —— 上面的
+ *  `nineRecords` 是共享 fixture,不额外承担 ttft 的场景组合。 */
+function spanInput(over: Partial<TimelineSpanInput> & Pick<TimelineSpanInput, "index" | "kind">): TimelineSpanInput {
+  return {
+    lane: 1, isError: false, running: false, turnSeq: 0, turnStart: false,
+    startedAt: null, endedAt: null, firstTokenAt: null,
+    ...over,
+  };
 }
 
 describe("deriveTimeline · sequence", () => {
@@ -107,6 +117,20 @@ describe("deriveTimeline · duration", () => {
     expect(model?.turnBoundaries).toEqual([
       { turnSeq: 0, time: 0 }, { turnSeq: 1, time: 4 }, { turnSeq: 2, time: 6 },
     ]);
+  });
+});
+
+describe("TimelineSpan.ttft (PR-A.3 §十.1)", () => {
+  it("is the first-token fraction in both modes; null when data missing", () => {
+    const recs = [
+      spanInput({ index: 0, kind: "assistant", startedAt: 1000, endedAt: 3000, firstTokenAt: 1500 }),
+      spanInput({ index: 1, kind: "tool", startedAt: 3000, endedAt: 3100, firstTokenAt: null }),
+      spanInput({ index: 2, kind: "assistant", startedAt: 3100, endedAt: 3100, firstTokenAt: 3100 }),
+    ];
+    for (const mode of ["sequence", "duration"] as const) {
+      const model = deriveTimeline(recs, mode)!;
+      expect(model.spans.map((s) => s.ttft)).toEqual([0.25, null, null]);
+    }
   });
 });
 

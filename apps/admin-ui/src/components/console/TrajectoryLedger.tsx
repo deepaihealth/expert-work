@@ -12,7 +12,7 @@ import type { JSX, KeyboardEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { DisplayRow } from "./ledger_collapse";
+import { CONTEXT_KINDS, type DisplayRow } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { LedgerRow } from "./TrajectoryLedgerRow";
 import { useVirtualRows } from "./use_virtual_rows";
@@ -53,7 +53,8 @@ export interface TrajectoryLedgerProps {
 }
 
 /** 双击落点要知道:哪几轮此刻是折叠的、哪几条 assistant 名下有子记录、每轮有
- *  几条非 USER 记录(只有 ≥ 2 条的轮才值得折)。一趟扫完 `rows` 全拿到。 */
+ *  几条非上下文记录(`CONTEXT_KINDS` —— 不算 USER / SYSTEM,只有 ≥ 2 条的轮
+ *  才值得折)。一趟扫完 `rows` 全拿到。 */
 function foldContextOf(rows: readonly DisplayRow[]): {
   collapsedTurns: ReadonlySet<string>;
   ownersWithChildren: ReadonlySet<string>;
@@ -79,7 +80,7 @@ function foldContextOf(rows: readonly DisplayRow[]): {
     if (record.parentId !== null && (record.kind === "tool" || record.kind === "plan")) {
       ownersWithChildren.add(record.parentId);
     }
-    if (record.kind !== "user") {
+    if (!CONTEXT_KINDS.has(record.kind)) {
       nonUserByTurn.set(record.turnKey, (nonUserByTurn.get(record.turnKey) ?? 0) + 1);
     }
   }

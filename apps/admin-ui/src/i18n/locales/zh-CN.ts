@@ -1350,6 +1350,7 @@ const zhCN: TranslationKeys = {
     view_trajectory: "轨迹",
     view_workspace: "工作区",
     view_aria: "视图",
+    traj_kind_system: "SYSTEM",
   },
   playground: {
     session_label: "会话",

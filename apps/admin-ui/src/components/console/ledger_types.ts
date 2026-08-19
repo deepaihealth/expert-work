@@ -40,6 +40,9 @@ export interface LedgerRecord {
   /** 绝对服务端毫秒起止;拿不到 null。 */
   startedAt: number | null;
   endedAt: number | null;
+  /** ASSISTANT 记录的首 token 绝对时刻(`startedAt + row.firstTokenMs`,夹到
+   *  ≤ endedAt);其它 kind / 缺数据 null。 */
+  firstTokenAt: number | null;
   /** 内容列正文(工具 = `名字 参数JSON`,截 400 字符);assistant 没文字时 ""。 */
   text: string;
   /** 「→ 结果」预览首行;无 null。 */
@@ -68,6 +71,8 @@ export interface LedgerRequest {
   startedAt: number | null;
   endedAt: number | null;
   durationMs: number | null;
+  /** 该请求的 assistant 步首 token 毫秒(`AssistantRow.firstTokenMs`);没有 null。 */
+  firstTokenMs: number | null;
 }
 
 export interface LedgerTurn {

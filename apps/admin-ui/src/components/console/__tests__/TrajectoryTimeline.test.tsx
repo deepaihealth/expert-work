@@ -48,7 +48,7 @@ function rec(
     id: `t/${kind}:${index}`, index, turnKey: "t", turnSeq: 0, runId: null,
     turnStart: index === 0, turnEnd: false, requestNo: null, ownerRequestNo: null,
     parentId: null, kind, lane, isError: false, running: false, startedAt, endedAt,
-    text: "", resultText: null, row, events: [], placeholder: null, ...extra,
+    text: "", resultText: null, row, events: [], placeholder: null, firstTokenAt: null, ...extra,
   };
 }
 

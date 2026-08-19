@@ -92,6 +92,26 @@ function build(): ReturnType<typeof buildLedger> {
   return buildLedger({ turns: fixture(), streamTurnKey: "C", liveByStep: LIVE_BY_STEP, nowMs: NOW });
 }
 
+/** PR-A.3 §十.1 —— 一条带 system_prompt 帧的轮:metadata + system_prompt{text} +
+ *  一个终答步(供折叠 / turnStart 测试复用)。`seq` 每次调用自增,调用方按数组
+ *  顺序传给 `buildLedger` 就行。 */
+let systemTurnSeq = 0;
+function turnWithSystem(key: string, text: string): ConsoleTurn {
+  const seq = systemTurnSeq;
+  systemTurnSeq += 1;
+  const events: SseEvent[] = [
+    ev("metadata", { run_id: `run-${key}`, thread_id: "t" }, 0),
+    ev("system_prompt", { text }, 100),
+    upd("agent", { step_count: 1, _duration_ms: 200, messages: [{
+      type: "ai", content: "答", usage_metadata: { input_tokens: 10, output_tokens: 2 },
+    }] }, 500),
+  ];
+  return turnOf({
+    key, seq,
+    turn: { id: key, input: "问", attachments: [], inputs: {}, events, status: "done", error: null, approval: null },
+  });
+}
+
 describe("buildLedger", () => {
   it("records are in turn order with turnStart/turnEnd and 0-based index", () => {
     const ledger = build();
@@ -289,6 +309,54 @@ describe("buildLedger", () => {
     // 不是流式那一轮就不拼 live 行。
     const other = buildLedger({ turns: fixture(), streamTurnKey: "A", liveByStep: LIVE_BY_STEP, nowMs: NOW });
     expect(other.records.some((r) => r.id.startsWith("C/live-"))).toBe(false);
+  });
+});
+
+describe("SYSTEM row (PR-A.3 §十.1)", () => {
+  it("lane 0, content = first line, turnStart on the SYSTEM record, USER right after", () => {
+    const ledger = buildLedger({ turns: [turnWithSystem("t1", "你是评审员\n只说重点")], streamTurnKey: null, nowMs: NOW });
+    expect(ledger.records.slice(0, 2).map((r) => [r.kind, r.lane, r.turnStart, r.text])).toEqual([
+      ["system", 0, true, "你是评审员"], ["user", 0, false, expect.any(String)],
+    ]);
+  });
+
+  it("consecutive turns with the same prompt fold it; a changed prompt shows again", () => {
+    const ledger = buildLedger({
+      turns: [turnWithSystem("t1", "A"), turnWithSystem("t2", "A"), turnWithSystem("t3", "B"), turnWithSystem("t4", "B")],
+      streamTurnKey: null, nowMs: NOW,
+    });
+    const systems = ledger.records.filter((r) => r.kind === "system").map((r) => [r.turnKey, r.text]);
+    expect(systems).toEqual([["t1", "A"], ["t3", "B"]]);
+    // 折掉的轮,USER 仍是 turnStart。
+    expect(ledger.records.find((r) => r.turnKey === "t2")).toMatchObject({ kind: "user", turnStart: true });
+  });
+
+  it("firstTokenAt = startedAt + firstTokenMs (clamped to endedAt) and LedgerRequest.firstTokenMs", () => {
+    const events: SseEvent[] = [
+      upd("agent", { step_count: 1, _duration_ms: 2000, messages: [{
+        type: "ai", content: "答案",
+        additional_kwargs: { first_token_ms: 500 },
+        usage_metadata: { input_tokens: 10, output_tokens: 2 },
+      }] }, 3000),
+      // 首 token 偏移比这一步自身跨度还大 —— 必须夹到 endedAt,不能算出超出块外的时刻。
+      upd("agent", { step_count: 2, _duration_ms: 100, messages: [{
+        type: "ai", content: "结论",
+        additional_kwargs: { first_token_ms: 9999 },
+        usage_metadata: { input_tokens: 5, output_tokens: 1 },
+      }] }, 3200),
+      // 没带 first_token_ms 的步 → null。
+      upd("agent", { step_count: 3, _duration_ms: 50, messages: [{
+        type: "ai", content: "追加",
+        usage_metadata: { input_tokens: 1, output_tokens: 1 },
+      }] }, 3300),
+    ];
+    const turns = [turnOf({ key: "F", seq: 0, turn: { id: "F", input: "问", attachments: [], inputs: {}, events, status: "done", error: null, approval: null } })];
+    const ledger = buildLedger({ turns, streamTurnKey: null, nowMs: NOW });
+    const assistants = ledger.records.filter((r) => r.kind === "assistant");
+    expect(assistants[0].firstTokenAt).toBe(assistants[0].startedAt! + 500);
+    expect(assistants[1].firstTokenAt).toBe(assistants[1].endedAt);
+    expect(assistants[2].firstTokenAt).toBeNull();
+    expect(ledger.requests.map((r) => r.firstTokenMs)).toEqual([500, 9999, null]);
   });
 });
 

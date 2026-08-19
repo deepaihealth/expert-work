@@ -9,6 +9,12 @@
 import type { Ledger, LedgerRecord } from "./ledger_types";
 import type { ProcessSummary } from "./process_summary";
 
+/** 「上下文行」谓词的唯一来源(PR-A.3 §十.1)—— USER 与 SYSTEM 都是上下文,
+ *  不是 agent 迈出的一步:折叠轮时保留、`turnSummaryOf` 不计进 other、
+ *  `collapsibleTurnKeys` 的「≥2 条」门槛不数它们。别在别处再写裸
+ *  `=== "user"` / `!== "user"` 判断。 */
+export const CONTEXT_KINDS: ReadonlySet<LedgerRecord["kind"]> = new Set(["user", "system"]);
+
 export type DisplayRow =
   | { kind: "record"; record: LedgerRecord }
   | {
@@ -63,7 +69,8 @@ function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRe
 /** A turn's process summary: assistant records count as "think" (spec §九
  *  — one ASSISTANT record per step replaces the compact THINK row), tool
  *  records count as "tools" (and feed ``toolBreakdown``), every other
- *  non-user kind counts as "other". ``failed`` is the non-assistant
+ *  non-context kind (``CONTEXT_KINDS`` — not user, not the PR-A.3 SYSTEM
+ *  row) counts as "other". ``failed`` is the non-assistant
  *  ``isError`` count; ``durationMs`` is the turn's wall clock —
  *  ``max(endedAt) - min(startedAt)`` over the records that have both
  *  timestamps (``null`` when none do). Summing each record's own span
@@ -82,7 +89,7 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
     else if (r.kind === "tool") {
       tools += 1;
       if (r.row.kind === "tool") toolLabels.push(r.row.entry.toolName);
-    } else if (r.kind !== "user") other += 1;
+    } else if (!CONTEXT_KINDS.has(r.kind)) other += 1;
 
     if (r.kind !== "assistant" && r.isError) failed += 1;
     if (r.startedAt !== null && r.endedAt !== null) {
@@ -101,11 +108,12 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
   };
 }
 
-/** Turns with ≥ 2 non-user records — the only ones worth collapsing. */
+/** Turns with ≥ 2 non-context (``CONTEXT_KINDS``) records — the only ones
+ *  worth collapsing. */
 export function collapsibleTurnKeys(ledger: Ledger): string[] {
   const nonUserCounts = new Map<string, number>();
   for (const r of ledger.records) {
-    if (r.kind === "user") continue;
+    if (CONTEXT_KINDS.has(r.kind)) continue;
     nonUserCounts.set(r.turnKey, (nonUserCounts.get(r.turnKey) ?? 0) + 1);
   }
   return ledger.turns.filter((t) => (nonUserCounts.get(t.key) ?? 0) >= 2).map((t) => t.key);
@@ -124,9 +132,10 @@ export function collapsibleOwnerIds(ledger: Ledger): string[] {
 
 /** Flattens the ledger into display rows. A search filter (``matches``
  *  non-null) wins outright: only matching records show, uncollapsed. Else
- *  a collapsed turn becomes its USER record(s) + one ``turn-summary``; a
- *  collapsed owner's tool/plan/subagent children are hidden behind one
- *  ``calls-summary`` row right after the owner's own record. */
+ *  a collapsed turn becomes its context record(s) (USER / SYSTEM,
+ *  ``CONTEXT_KINDS``) + one ``turn-summary``; a collapsed owner's
+ *  tool/plan/subagent children are hidden behind one ``calls-summary`` row
+ *  right after the owner's own record. */
 export function displayRowsOf(
   ledger: Ledger,
   opts: {
@@ -167,7 +176,7 @@ export function displayRowsOf(
 
     if (collapsedTurns.has(turn.key)) {
       for (const r of turnRecords) {
-        if (r.kind === "user") rows.push({ kind: "record", record: r });
+        if (CONTEXT_KINDS.has(r.kind)) rows.push({ kind: "record", record: r });
       }
       rows.push({
         kind: "turn-summary",

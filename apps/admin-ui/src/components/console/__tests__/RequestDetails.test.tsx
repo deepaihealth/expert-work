@@ -64,6 +64,7 @@ function record(over: Partial<LedgerRecord> = {}): LedgerRecord {
     row,
     events: [],
     placeholder: null,
+    firstTokenAt: null,
     ...over,
   };
 }
@@ -84,6 +85,7 @@ function request(over: Partial<LedgerRequest> = {}): LedgerRequest {
     startedAt: BASE,
     endedAt: BASE + 1200,
     durationMs: 1200,
+    firstTokenMs: null,
     ...over,
   };
 }
