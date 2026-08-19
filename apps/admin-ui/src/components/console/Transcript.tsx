@@ -37,7 +37,10 @@ export interface TranscriptProps {
   threadId: string | null;
   /** null = 跟随最新。 */
   selectedKey: string | null;
+  /** 点轮卡片空白处:只换高亮轮(透传 `TurnBlock.onSelect`)。 */
   onSelectTurn: (key: string) => void;
+  /** 脚注「查看轨迹」:切轨迹视图 + 定位(透传 `TurnBlock.onInspect`)。 */
+  onInspectTurn: (key: string) => void;
   /** 透传 TurnBlock。 */
   onInspectRow: (turnKey: string, rowId: string) => void;
   streamTurnKey: string | null;
@@ -77,6 +80,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     threadId,
     selectedKey,
     onSelectTurn,
+    onInspectTurn,
     onInspectRow,
     streamTurnKey,
     liveByStep,
@@ -193,6 +197,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           threadId={threadId}
           selected={turn.key === selected}
           onSelect={onSelectTurn}
+          onInspect={onInspectTurn}
           onInspectRow={onInspectRow}
           rate={rate}
           isSystemAdmin={isSystemAdmin}
@@ -221,6 +226,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           threadId={threadId}
           selected={turn.key === selected}
           onSelect={onSelectTurn}
+          onInspect={onInspectTurn}
           onInspectRow={onInspectRow}
           liveByStep={turn.key === streamTurnKey ? liveByStep : undefined}
           rate={rate}

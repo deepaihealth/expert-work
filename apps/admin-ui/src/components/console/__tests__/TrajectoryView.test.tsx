@@ -612,6 +612,38 @@ describe("TrajectoryView · 组合", () => {
     }
   });
 
+  // 修复轮 2 —— 调试台把轨迹藏起来(不卸载),这时秒针不该继续跑:同样的
+  // 2 秒推进,`visible: false` 下尾块一动不动。
+  it("visible=false 时秒针不跑,尾块不再长", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(BASE + 6000);
+    window.localStorage.setItem(LANE_MODE_KEY, "duration");
+    try {
+      const turns = fixture();
+      renderView({
+        running: true,
+        visible: false,
+        turns: [turns[0], turns[2]],
+        liveByStep: new Map<number, LiveStep>([
+          [2, { content: "正在写", reasoning: "", toolNames: new Map(), reasoningMs: null }],
+        ]),
+      });
+      const liveWidth = (): number => {
+        const index = rowOf("C/live-assistant:2").dataset.index;
+        const el = blocks().find((b) => b.getAttribute("data-index") === index);
+        if (el === undefined) throw new Error(`no timeline block for index ${index}`);
+        return Number.parseFloat(el.style.getPropertyValue("--traj-span-width"));
+      };
+      const before = liveWidth();
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(liveWidth()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("nowMs 用帧的服务端时钟校准,不是裸 Date.now()", () => {
     vi.useFakeTimers();
     vi.setSystemTime(BASE + 20_000);

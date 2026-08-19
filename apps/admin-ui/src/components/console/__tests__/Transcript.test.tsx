@@ -53,6 +53,7 @@ function makeBaseProps(overrides: Partial<TranscriptProps> = {}): TranscriptProp
     threadId: "th-1",
     selectedKey: null,
     onSelectTurn: vi.fn(),
+    onInspectTurn: vi.fn(),
     onInspectRow: vi.fn(),
     streamTurnKey: null,
     liveByStep: new Map(),

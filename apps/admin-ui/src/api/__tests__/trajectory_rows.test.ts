@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, ledgerRowsOf, resolveGanttKey, trajectoryRowsOf, type AssistantRow, type ThinkRow } from "../trajectory_rows";
+import { compactRowsOf, ledgerRowsOf, resolveGanttKey, type AssistantRow } from "../trajectory_rows";
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
@@ -168,109 +168,26 @@ describe("compactRowsOf", () => {
   });
 });
 
-describe("trajectoryRowsOf", () => {
-  const EVENTS = [
-    upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", tool_calls: [{ id: "a", name: "t1", args: {} }] }] }),
-    upd("tools", { messages: [{ type: "tool", tool_call_id: "a", name: "t1", content: "r", status: "success" }] }),
-    upd("agent", { step_count: 2, _duration_ms: 400, messages: [{ type: "ai", content: "最终答案", response_metadata: { model_name: "gpt-x" } }] }),
-    ev("end", { status: "success" }),
-  ];
-  it("user first, one think per agent step even without reasoning, assistant last; ids shared with the compact projection", () => {
-    const rows = trajectoryRowsOf(EVENTS, INPUT, "最终答案", "done");
-    expect(rows.map((r) => r.kind)).toEqual(["user", "think", "tool", "think", "assistant"]);
-    expect(rows[0]).toMatchObject({ id: "user", text: "帮我看看这个客户", seq: -1 });
-    expect(rows[1]).toMatchObject({ kind: "think", text: "", step: 1 });
-    expect(rows[3]).toMatchObject({ kind: "think", text: "", step: 2, model: "gpt-x", durationMs: 400 });
-    expect(rows.at(-1)).toMatchObject({ id: "assistant", kind: "assistant", text: "最终答案", status: "ok", eventIndexes: [2] });
-    const compactIds = new Set(compactRowsOf(EVENTS).map((r) => r.id));
-    for (const id of compactIds) expect(rows.some((r) => r.id === id)).toBe(true);
-  });
-  it("assistant row omitted while answer is null; status follows turnStatus", () => {
-    expect(trajectoryRowsOf(EVENTS, INPUT, null, "running").some((r) => r.kind === "assistant")).toBe(false);
-    expect(trajectoryRowsOf(EVENTS, INPUT, "x", "error").at(-1)).toMatchObject({ kind: "assistant", status: "error" });
-  });
-
-  it("think row carries the step's reasoning / cache-read token details (undefined when absent)", () => {
-    const rows = trajectoryRowsOf([
-      upd("agent", { step_count: 1, messages: [{
-        type: "ai", content: "答",
-        additional_kwargs: { reasoning_content: "先想想" },
-        usage_metadata: {
-          input_tokens: 16000, output_tokens: 900, total_tokens: 16900,
-          output_token_details: { reasoning: 770 },
-          input_token_details: { cache_read: 14336 },
-        },
-      }] }),
-      upd("agent", { step_count: 2, messages: [{
-        type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 },
-      }] }),
-    ], INPUT, null, "running");
-    // 谓词过滤而不是 `if (x.kind === "think")` —— 后者一旦投影变了会**静默
-    // 跳过**整段断言,看起来照样绿。
-    const thinks = rows.filter((r): r is ThinkRow => r.kind === "think");
-    expect(thinks).toHaveLength(2);
-    expect(thinks[0]).toMatchObject({ inputTokens: 16000, outputTokens: 900, reasoningTokens: 770, cacheReadTokens: 14336 });
-    expect(thinks[1].reasoningTokens).toBeUndefined();
-    expect(thinks[1].cacheReadTokens).toBeUndefined();
-  });
-
-  it("serverMs: item.serverMs for agent/marker rows, entry.serverMs for tool rows, null for user/assistant/subagent", () => {
-    const rows = trajectoryRowsOf([
-      wire("updates", { agent: { step_count: 1, messages: [{
-        type: "ai", content: "", tool_calls: [{ id: "call-9", name: "spawn_worker", args: { task: "x" } }],
-      }] } }, "1700000000000-1"),
-      wire("worker", {
-        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
-        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "start", wseq: 0,
-        data: { task_excerpt: "x", role: null, max_steps: 8 },
-      }, "1700000000100-2"),
-      wire("updates", { tools: { messages: [
-        { type: "tool", tool_call_id: "call-9", name: "spawn_worker", content: "ok", status: "success" },
-      ] } }, "1700000000400-3"),
-      wire("worker", {
-        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
-        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "end", wseq: 1,
-        data: { outcome: "success", iteration_used: 1, llm_call_count: 1, wall_clock_ms: 42 },
-      }, "1700000000500-4"),
-      wire("approval", { tool_call_id: "call-9" }, "1700000000900-5"),
-    ], INPUT, "done", "done");
-    const user = rows.find((r) => r.kind === "user");
-    const think = rows.find((r) => r.kind === "think");
-    const tool = rows.find((r) => r.kind === "tool");
-    const subagent = rows.find((r) => r.kind === "subagent");
-    const approval = rows.find((r) => r.kind === "approval");
-    const assistant = rows.find((r) => r.kind === "assistant");
-    // think/marker rows take the AgentStep/MarkerItem's own frame's ms.
-    expect(think?.serverMs).toBe(1700000000000);
-    expect(approval?.serverMs).toBe(1700000000900);
-    // the tool row takes the RESULT frame's ms via entry.serverMs, not the
-    // CALL frame's ms (item.serverMs would be 1700000000000, the wrong one).
-    expect(tool?.serverMs).toBe(1700000000400);
-    // no serverMs concept for these kinds.
-    expect(user?.serverMs).toBeNull();
-    expect(assistant?.serverMs).toBeNull();
-    expect(subagent?.serverMs).toBeNull();
-  });
-});
-
 describe("resolveGanttKey", () => {
   it("maps item-/tool-/worker- keys to row ids (planner merged into update_plan resolves through plannerSeq)", () => {
-    const rows = trajectoryRowsOf([
+    const rows = ledgerRowsOf([
       upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", tool_calls: [{ id: "p1", name: "update_plan", args: { goal: "g", steps: PLAN.steps } }] }] }),
       upd("tools", { messages: [{ type: "tool", tool_call_id: "p1", name: "update_plan", content: "ok", status: "success" }], plan: PLAN }),
       upd("memory_recall", { recalled_memories: [{ id: "m1", kind: "fact", content: "x", importance: 0.5, confidence: 0.5 }] }),
-    ], INPUT, null, "running");
-    const think = rows.find((r) => r.kind === "think");
+    ], INPUT);
+    // Task 11 起只剩账本投影:agent 步是 `assistant:<seq>` 行(旧 think 行退役),
+    // `item-<seq>` 照旧要落到同一步上。
+    const assistant = rows.find((r) => r.kind === "assistant");
     const plan = rows.find((r) => r.kind === "plan");
     const memory = rows.find((r) => r.kind === "memory");
-    expect(resolveGanttKey(rows, `item-${think!.seq}`)).toBe(think!.id);
+    expect(resolveGanttKey(rows, `item-${assistant!.seq}`)).toBe(assistant!.id);
     expect(resolveGanttKey(rows, "tool-p1")).toBe(plan!.id);
     expect(resolveGanttKey(rows, `item-${(plan as { plannerSeq: number }).plannerSeq}`)).toBe(plan!.id);
     expect(resolveGanttKey(rows, `item-${memory!.seq}`)).toBe(memory!.id);
     expect(resolveGanttKey(rows, "tool-nope")).toBeNull();
 
     // worker: 沿用 subagent 那条测试的 fixture,断言 `worker-<workerId>-0` → 那条 subagent 行 id
-    const workerRows = trajectoryRowsOf(workerFixtureEvents(), INPUT, null, "running");
+    const workerRows = ledgerRowsOf(workerFixtureEvents(), INPUT);
     const sub = workerRows.find((r) => r.kind === "subagent");
     expect(resolveGanttKey(workerRows, "worker-w-9-0")).toBe(sub!.id);
   });
@@ -365,14 +282,41 @@ describe("ledgerRowsOf", () => {
     expect(rows.find((r) => r.kind === "tool")).toMatchObject({ status: "error" });
   });
 
-  it("trajectoryRowsOf (legacy) still returns the trailing assistant with the new fields zeroed", () => {
-    const rows = trajectoryRowsOf(LEDGER_EVENTS, INPUT, "最终答案", "done");
-    const tail = rows.at(-1) as AssistantRow;
-    expect(tail).toMatchObject({
-      id: "assistant", kind: "assistant", seq: -1, step: null, text: "最终答案", status: "ok",
-      reasoning: "", model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 0,
-    });
-    // 旧投影照旧出 think 行(Task 11 才删)。
-    expect(rows.some((r) => r.kind === "think")).toBe(true);
+  // 迁自退役的 `describe("trajectoryRowsOf")` —— serverMs 的取值规则是
+  // `rowsOf` 共有的,只是承载它的投影换成了账本。
+  it("serverMs: item.serverMs for assistant/marker rows, entry.serverMs for tool rows, null for user/subagent", () => {
+    const rows = ledgerRowsOf([
+      wire("updates", { agent: { step_count: 1, messages: [{
+        type: "ai", content: "", tool_calls: [{ id: "call-9", name: "spawn_worker", args: { task: "x" } }],
+      }] } }, "1700000000000-1"),
+      wire("worker", {
+        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
+        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "start", wseq: 0,
+        data: { task_excerpt: "x", role: null, max_steps: 8 },
+      }, "1700000000100-2"),
+      wire("updates", { tools: { messages: [
+        { type: "tool", tool_call_id: "call-9", name: "spawn_worker", content: "ok", status: "success" },
+      ] } }, "1700000000400-3"),
+      wire("worker", {
+        worker_id: "w-9", parent_worker_id: null, parent_tool_call_id: "call-9",
+        label: "spawn_worker", agent_ref: "dynamic:general", depth: 1, kind: "end", wseq: 1,
+        data: { outcome: "success", iteration_used: 1, llm_call_count: 1, wall_clock_ms: 42 },
+      }, "1700000000500-4"),
+      wire("approval", { tool_call_id: "call-9" }, "1700000000900-5"),
+    ], INPUT);
+    const user = rows.find((r) => r.kind === "user");
+    const assistant = rows.find((r) => r.kind === "assistant");
+    const tool = rows.find((r) => r.kind === "tool");
+    const subagent = rows.find((r) => r.kind === "subagent");
+    const approval = rows.find((r) => r.kind === "approval");
+    // assistant/marker rows take the AgentStep/MarkerItem's own frame's ms.
+    expect(assistant?.serverMs).toBe(1700000000000);
+    expect(approval?.serverMs).toBe(1700000000900);
+    // the tool row takes the RESULT frame's ms via entry.serverMs, not the
+    // CALL frame's ms (item.serverMs would be 1700000000000, the wrong one).
+    expect(tool?.serverMs).toBe(1700000000400);
+    // no serverMs concept for these kinds.
+    expect(user?.serverMs).toBeNull();
+    expect(subagent?.serverMs).toBeNull();
   });
 });

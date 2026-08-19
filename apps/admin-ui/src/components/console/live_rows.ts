@@ -3,8 +3,8 @@
  * turn's ``useTokenStream`` buffer holds that haven't landed as an
  * authoritative ``updates`` frame yet, projected into the same
  * ``CompactRow`` shape ``api/trajectory_rows.ts`` (Task 4) produces so
- * Task 11's TurnBlock and Task 18's TrajectoryPanel can render one list
- * instead of each splicing the live buffer in separately. See
+ * PR-A Task 11's TurnBlock and PR-A.2 的账本(`ledger.ts`)can render one
+ * list instead of each splicing the live buffer in separately. See
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-5-brief.md.
  */
 import { parseTimeline } from "../../api/timeline";

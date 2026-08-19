@@ -44,8 +44,8 @@ const THREAD = {
   error: null,
 };
 
-// 一帧 metadata(带 run_id)+ 一帧 end —— run_id 是右栏头部「Run 详情」链接
-// (§八.6)的前提。
+// 一帧 metadata(带 run_id)+ 一帧 end —— run_id 是详情概要里「Run 详情」
+// 链接(§九「详情 · 概要」)的前提。
 const SSE_BODY = [
   "event: metadata",
   'data: {"run_id":"44444444-4444-4444-4444-444444444444"}',
@@ -111,7 +111,7 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await page.getByTestId("playground-run").click();
   // The turn lands in the transcript and settles as soon as the stub's ``end``
   // frame arrives (the raw event view is gone; per-frame detail now lives in
-  // the right rail's Raw tab).
+  // the trajectory view's 原始 tab).
   const turn = page.getByTestId("console-turn");
   await expect(turn).toBeVisible();
   await expect(turn.getByText("describe this image")).toBeVisible();
@@ -119,22 +119,25 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
     /done|完成/i,
   );
 
-  // §八.7 —— 泳道块可点:真浏览器里验证「块点击没被横向拖选的指针捕获吃
-  // 掉」(jsdom 没有 pointer capture,只有这里能证)。哪怕这个桩 run 只有一
-  // 帧,USER 行也一定有一个块。
+  // §九「壳」—— 轨迹搬到中栏的第二个视图 tab(右栏检查面板退役)。
+  await page.getByTestId("console-view-tab-trajectory").click();
+
+  // §九「概览时间轴」—— 块可点:真浏览器里验证「块点击没被横向拖选的指针
+  // 捕获吃掉」(jsdom 没有 pointer capture,只有这里能证)。哪怕这个桩 run
+  // 只有一帧,USER 记录也一定有一个块。
   const block = page.getByTestId("console-lane-block").first();
   await expect(block).toBeVisible();
   await block.click();
   await expect(page.getByTestId("console-detail-header")).toBeVisible();
-  // §八.6 —— 「查看运行」的新家:右栏头部的 Run 详情链接。
+  // §九「详情 · 概要」—— 「查看运行」的新家:详情概要里的 Run 链接。
   await expect(page.getByTestId("console-inspect-run-link")).toHaveAttribute(
     "href",
     "/runs/33333333-3333-3333-3333-333333333333/44444444-4444-4444-4444-444444444444",
   );
 
-  // 真正扫得到新 UI 的那一次:run 结束 + 点过泳道块之后,过程条、轮次脚注、
-  // 泳道、行表(listbox)、右栏详情全在 DOM 里。空态那次一个新组件都覆盖不到。
-  await expectNoA11yViolations(page, "/agents/playground (after run)");
+  // 真正扫得到新 UI 的那一次:run 结束 + 切到轨迹 + 点过时间轴块之后,工具条、
+  // 时间轴、账本(grid)、详情侧栏全在 DOM 里。空态那次一个新组件都覆盖不到。
+  await expectNoA11yViolations(page, "/agents/playground (trajectory)");
 
   expect(runBody).toEqual({
     input: "describe this image",

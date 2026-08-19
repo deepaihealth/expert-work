@@ -45,6 +45,9 @@ export interface TrajectoryViewProps {
   streamTurnKey: string | null;
   liveByStep: ReadonlyMap<number, LiveStep>;
   running: boolean;
+  /** 视图当前是否可见(调试台把它藏起来而不是卸载)。只用来在看不见时停掉
+   *  「运行中每秒推一次『现在』」的定时器,不改任何显示语义;缺省 true。 */
+  visible?: boolean;
   isSystemAdmin: boolean;
   /** 中栏「查看轨迹」/ 过程条「轨迹」:rowId null = 该轮最后一条 assistant;
    *  nonce 变才处理。 */
@@ -88,6 +91,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
     streamTurnKey: props.streamTurnKey,
     liveByStep: props.liveByStep,
     running: props.running,
+    visible: props.visible ?? true,
     focusRequest: props.focusRequest,
     onEnsureLoaded: props.onEnsureLoaded,
   });
