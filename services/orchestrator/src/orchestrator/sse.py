@@ -177,6 +177,30 @@ _run_event_persist_total = expert_work_counter(
 #: per agent / tools node completion).
 DEFAULT_STREAM_MODE = "updates"
 
+#: PR-A.3 §十.1 — the run's final system prompt, one frame right after
+#: ``metadata``. Console-plane only: external producers pass it in
+#: ``hide_events`` (see ``sse_consumer``).
+SYSTEM_PROMPT_EVENT = "system_prompt"
+
+
+def _system_prompt_of(graph_input: Any) -> str | None:
+    """The ``SystemMessage`` text at the head of a fresh run's input, else None.
+
+    Resume (``graph_input=None``) and approval continuation (``Command``) carry
+    no fresh prompt — nothing to report (the earlier run's frame is in the store).
+    """
+    if not isinstance(graph_input, Mapping):
+        return None
+    messages = graph_input.get("messages")
+    if not isinstance(messages, Sequence) or not messages:
+        return None
+    first = messages[0]
+    if getattr(first, "type", None) != "system":
+        return None
+    content = getattr(first, "content", None)
+    return content if isinstance(content, str) and content else None
+
+
 #: Seconds to keep a finished run's events in the bridge before cleanup,
 #: giving late / reconnecting consumers time to drain.
 _CLEANUP_DELAY_S = 60.0
@@ -513,6 +537,12 @@ async def run_agent(
         )
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
         await _publish_frame("metadata", metadata_payload)
+
+        # PR-A.3 §十.1 — the prompt the model actually got, before the TTFT
+        # clock starts (server-synthesised, not LLM output).
+        system_prompt = _system_prompt_of(graph_input)
+        if system_prompt is not None:
+            await _publish_frame(SYSTEM_PROMPT_EVENT, {"text": system_prompt})
 
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,
@@ -1426,6 +1456,7 @@ async def sse_consumer(
     is_disconnected: Callable[[], Awaitable[bool]],
     last_event_id: str | None = None,
     heartbeat_interval: float = 15.0,
+    hide_events: frozenset[str] = frozenset(),
 ) -> AsyncIterator[bytes]:
     """Yield SSE wire frames for ``record``'s run.
 
@@ -1437,6 +1468,11 @@ async def sse_consumer(
     ``is_disconnected`` is an injected coroutine (FastAPI's
     ``request.is_disconnected`` in production) — checked before each
     yield so a vanished client stops the stream promptly.
+
+    ``hide_events`` lets the external plane filter out console-only frames
+    (e.g. ``system_prompt``) from the wire; the filtered frame's id is
+    still skipped over (the bridge already assigned it a ``seq``), so a
+    client resuming from ``since_seq`` never re-sees or misparses it.
 
     The ``finally`` block enforces ``on_disconnect``: if the run is
     still in flight and its mode is :data:`DisconnectMode.CANCEL`, the
@@ -1464,6 +1500,9 @@ async def sse_consumer(
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
                 yield format_sse("end", end_frame_data(run_id=record.run_id, status=status))
                 return
+
+            if entry.event in hide_events:
+                continue
 
             yield format_sse(entry.event, entry.data, event_id=entry.id or None)
     finally:
