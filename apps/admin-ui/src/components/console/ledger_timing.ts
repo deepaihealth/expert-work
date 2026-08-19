@@ -88,8 +88,8 @@ function computeSpans(
 
 /** 最后一条带合法 id 的帧的 `(serverMs, receivedAtMs)` —— 调用方拿它把客户端
  *  的「现在」校准到服务端时钟(客户端与服务端有时钟差,直接拿
- *  `Date.now()` 当轴末端会让运行中的尾块跳)。原样搬自
- *  `lane_strip_model.ts`(该文件 Task 11 删),再往上源头是
+ *  `Date.now()` 当轴末端会让运行中的尾块跳)。原样搬自当时的
+ *  `lane_strip_model.ts`(该文件已随 PR-A.2 Task 11 退役),再往上源头是
  *  `components/turn/TurnCard.tsx` 的生长条锚点。 */
 export function lastKnownFrame(
   events: readonly SseEvent[],

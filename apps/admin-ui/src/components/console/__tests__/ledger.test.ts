@@ -196,6 +196,25 @@ describe("buildLedger", () => {
     expect(byId.get("L/user")?.text).toBe("问");
   });
 
+  // 终审 M13 —— 记忆写回 / 反思是某一步 agent 之后发生的事,详情里那条
+  // 「Assistant Message ›」靠 `parentId` 出;原先一律 null,链接永远不出现。
+  it("memory 写回与 reflect 挂在同轮之前最近的 assistant 上(它之前没有 → null)", () => {
+    const events: SseEvent[] = [
+      upd("memory_recall", { recalled_memories: [{ id: "m1", content: "老客户 A" }] }, 100),
+      upd("agent", { step_count: 1, _duration_ms: 100, messages: [{ type: "ai", content: "做点事" }] }, 300),
+      upd("reflect", { reflections: [{ verdict: "revise", critique: "漏了夜间" }] }, 700),
+      upd("memory_writeback", { written_memories: [{ id: "w1", content: "写回内容" }] }, 800),
+    ];
+    const turns = [turnOf({ key: "L", seq: 0, turn: { id: "L", input: "问", attachments: [], inputs: {}, events, status: "done", error: null, approval: null } })];
+    const byId = new Map(buildLedger({ turns, streamTurnKey: null, nowMs: NOW }).records.map((r) => [r.id, r]));
+
+    expect(byId.get("L/assistant:1")).toBeDefined();
+    expect(byId.get("L/reflect:2")?.parentId).toBe("L/assistant:1");
+    expect(byId.get("L/memory:3")?.parentId).toBe("L/assistant:1");
+    // 召回发生在第一步之前 —— 没有可挂的 assistant。
+    expect(byId.get("L/memory:0")?.parentId).toBeNull();
+  });
+
   it("tool text is `name argsJSON` (≤400 chars) and resultText the first result line; error rows are isError", () => {
     const bigArg = "x".repeat(600);
     const events: SseEvent[] = [

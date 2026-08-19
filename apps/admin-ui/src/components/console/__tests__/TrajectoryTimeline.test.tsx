@@ -296,6 +296,28 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onSelectRecord).not.toHaveBeenCalled();
   });
 
+  // 终审 M12 —— 一轮里所有记录都落在同一时刻(时长投影域退化成 start === end)
+  // 时「一条记录宽」是 0:点空白提交出来的是一条零宽选区,账本每一行都被判
+  // outside、时间轴整片压暗,读者什么也没选却像选了个空。
+  it("时长域退化(所有记录同一时刻)时点空白只滚视口,不提交零宽选区", () => {
+    mockTrack();
+    const records = [
+      rec(0, 0, "user", 1000, 1000),
+      rec(1, 1, "assistant", 1000, 1000),
+      rec(2, 2, "tool", 1000, 1000),
+    ];
+    const p = props({ records, model: deriveTimeline(records, "duration") }, "duration");
+    expect(p.model?.start).toBe(p.model?.end);
+    render(<TrajectoryTimeline {...p} />);
+
+    fireEvent.pointerDown(track(), { clientX: 550, pointerId: 1, button: 0 });
+    fireEvent.pointerUp(track(), { clientX: 550, pointerId: 1, button: 0 });
+
+    expect(p.onRangeChange).not.toHaveBeenCalled();
+    expect(p.onFocusRecord).toHaveBeenCalled();
+    expect(p.onSelectRecord).not.toHaveBeenCalled();
+  });
+
   it("双击清选区", () => {
     const p = props({ range: { start: 1, end: 2 } });
     render(<TrajectoryTimeline {...p} />);

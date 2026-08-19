@@ -1,10 +1,12 @@
 /**
  * text_summary — the console's shared one-line summary helpers. The middle
  * column's compact rows (``CompactRow.tsx``) and the right rail's trajectory
- * rows (``TrajectoryRows.tsx``) project the same underlying row, so they must
- * cut a multi-sentence note at the same place — before this module the two
- * carried private copies with different terminator sets and disagreed on the
- * very same plan row.
+ * rows projected the same underlying row, so they had to cut a multi-sentence
+ * note at the same place — before this module the two carried private copies
+ * with different terminator sets and disagreed on the very same plan row.
+ * (PR-A.2 Task 11 retired the right rail's ``TrajectoryRows.tsx``; the
+ * console's ledger now folds its own text in ``ledger.ts``, so ``CompactRow``
+ * is the remaining caller.)
  */
 
 /** 句子终止符:全角 。！？、半角 ! ?,外加换行。

@@ -16,8 +16,8 @@ import { Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import {
-  clampFraction, focusIndexes, nearestSpan, orderedRange, panViewport, revealInViewport, zoomViewport,
-  type TimelineModel, type TimeRange,
+  clampFraction, focusIndexes, minimumSelection, nearestSpan, orderedRange, panViewport,
+  revealInViewport, zoomViewport, type TimelineModel, type TimeRange,
 } from "./ledger_timeline";
 import type { LedgerRecord } from "./ledger_types";
 import { TrajectoryTimelineBlocks } from "./TrajectoryTimelineBlocks";
@@ -205,6 +205,14 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
     if (click && drag.index !== null) {
       onRangeChange(null);
       onSelectRecord(drag.index);
+      return;
+    }
+    // 域退化(整轮记录都落在同一时刻,`model.start === model.end`)时「一条记录
+    // 宽」是 0 —— 点空白定案出来的会是一条零宽选区:每一行都判 outside、整片块
+    // 压暗,读者什么也没选却像选了个空。只把最近的记录带进视口。
+    if (click && minimumSelection(model, domainDuration) === 0) {
+      const nearestAt = nearestSpan(model, selected.start);
+      if (nearestAt !== null) onFocusRecord(nearestAt.index);
       return;
     }
     onRangeChange(commitSelection(model, drag.anchorTime, time, domainDuration, click));

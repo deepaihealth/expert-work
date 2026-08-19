@@ -1,7 +1,9 @@
 /*
  * ProcessStrip — component-scoped styles for the console's per-turn 过程条
  * (spec §八.3). `--ew-*` design tokens end to end and a spinner guarded by
- * `prefers-reduced-motion`, same conventions as ./trajectory_rows.css.
+ * `prefers-reduced-motion`, same conventions as the other console stylesheets
+ * (./trajectory_ledger.css and friends; ./trajectory_rows.css, the original
+ * reference, was retired with PR-A.2 Task 11).
  */
 .ew-process__head {
   display: flex;

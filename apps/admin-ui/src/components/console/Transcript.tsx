@@ -6,7 +6,9 @@
  * verbatim), the history/live divider, the empty state, and the trailing
  * fire-now task-result cards. Auto-scrolls to the bottom as turns or live
  * frames arrive, unless the reader has scrolled up to read earlier history
- * (``TrajectoryRows.tsx``'s same 80px-slack rule).
+ * (the same 80px-slack rule the trajectory ledger uses —
+ * ``TrajectoryLedger.tsx``; PR-A.2 Task 11 retired ``TrajectoryRows.tsx``,
+ * where the rule originally lived).
  *
  * See .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-11-brief.md.
  */
@@ -69,7 +71,8 @@ export interface TranscriptProps {
 }
 
 /** How close to the bottom (px) still counts as "hasn't scrolled up" —
- *  same rule as ``TrajectoryRows.tsx``'s ``AUTO_SCROLL_SLACK_PX``. */
+ *  same rule (and same value) as ``TrajectoryLedger.tsx``'s
+ *  ``AUTO_SCROLL_SLACK_PX``. */
 const AUTO_SCROLL_SLACK_PX = 80;
 
 export function Transcript(props: TranscriptProps): JSX.Element {

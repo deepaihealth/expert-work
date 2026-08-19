@@ -154,6 +154,9 @@ function turnRecordsOf(args: {
   const ownerBySeq = new Map<number, RequestOwner>();
   const ownerByStep = new Map<number, RequestOwner>();
   const toolRecordByEntryId = new Map<string, string>();
+  /** 同轮里在当前行之前最近的一条 assistant 记录 —— 记忆写回 / 反思都发生在
+   *  某一步之后,但它们不带 seq / step,认不了 `ownerBySeq`。 */
+  let lastAssistantId: string | null = null;
   const records: LedgerRecord[] = [];
 
   rows.forEach((row, i) => {
@@ -170,6 +173,11 @@ function turnRecordsOf(args: {
       const own: RequestOwner = { no: requestNo, recordId: id };
       if (row.seq >= 0) ownerBySeq.set(row.seq, own);
       if (row.step !== null) ownerByStep.set(row.step, own);
+      lastAssistantId = id;
+    } else if (row.kind === "reflect" || (row.kind === "memory" && row.direction === "writeback")) {
+      // 详情里那条「Assistant Message ›」靠 `parentId` 出;这两类记录是某一步
+      // 之后发生的事,挂在它之前最近的那条 assistant 上(它之前没有 → null)。
+      parentId = lastAssistantId;
     } else if (row.kind === "tool" || row.kind === "plan") {
       ownerRequestNo = owner?.no ?? null;
       parentId = owner?.recordId ?? null;

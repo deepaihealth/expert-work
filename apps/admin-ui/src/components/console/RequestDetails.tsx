@@ -16,6 +16,7 @@ import { Link } from "react-router-dom";
 
 import type { RunTrace } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
+import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { DetailRow, DetailsFrame, HierLink } from "./DetailsFrame";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { RenderedIo } from "./RowDetailPayloadResult";
@@ -81,6 +82,9 @@ export function RequestDetails(props: RequestDetailsProps) {
       <dl className="ew-detail__ov">
         <DetailRow label={t("console.detail_status")}>
           {t(`console.traj_status_${request.status}`)}
+        </DetailRow>
+        <DetailRow label={t("console.detail_duration")}>
+          {request.durationMs === null ? dash : fmtDuration(request.durationMs)}
         </DetailRow>
         <DetailRow label={t("console.detail_model")}>{request.model ?? dash}</DetailRow>
         <DetailRow label={t("console.detail_finish_reason")}>

@@ -81,6 +81,18 @@ function foldContextOf(rows: readonly DisplayRow[]): {
   return { collapsedTurns, ownersWithChildren, nonUserByTurn };
 }
 
+/** 请求号 → 开启它的那条 assistant 记录 id(`requestsByRecordId` 反查)。 */
+function requestRecordId(
+  requestsByRecordId: ReadonlyMap<string, LedgerRequest>,
+  no: number | null,
+): string | null {
+  if (no === null) return null;
+  for (const [recordId, request] of requestsByRecordId) {
+    if (request.no === no) return recordId;
+  }
+  return null;
+}
+
 export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
   const {
     rows, requestsByRecordId, selectedId, onSelect, selectedRequestNo, onSelectRequest,
@@ -214,8 +226,10 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     event.preventDefault();
     // 只在**看得见的**记录行之间走:折叠掉的记录不在 `recordIds` 里,跳过去
-    // 等于把选中扔进一个没有行的坐标。
-    const at = selectedId === null ? -1 : recordIds.indexOf(selectedId);
+    // 等于把选中扔进一个没有行的坐标。只点了请求圆点时 `selectedId` 是 null,
+    // 但读者眼里的落点不是首行 —— 是那次请求的 assistant 记录。
+    const anchorId = selectedId ?? requestRecordId(requestsByRecordId, selectedRequestNo);
+    const at = anchorId === null ? -1 : recordIds.indexOf(anchorId);
     const delta = event.key === "ArrowDown" ? 1 : -1;
     const next = at === -1 ? 0 : Math.min(Math.max(at + delta, 0), recordIds.length - 1);
     const id = recordIds[next];

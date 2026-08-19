@@ -85,7 +85,13 @@ export function DetailsFrame(props: DetailsFrameProps) {
   };
 
   return (
-    <aside className="ew-detail" data-testid="console-detail-aside" style={{ width }}>
+    // 渲染时也夹一次:窗口缩窄(`splitWidth` 变小)时没人再碰手柄,只夹手柄
+    // 事件会让详情按上一次那个宽度渲染,把账本挤到 280 以下。
+    <aside
+      className="ew-detail"
+      data-testid="console-detail-aside"
+      style={{ width: clampDetailsWidth(width, splitWidth) }}
+    >
       <div
         className="ew-detail__resize"
         role="separator"

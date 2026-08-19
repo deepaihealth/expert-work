@@ -283,6 +283,24 @@ describe("TrajectoryLedger", () => {
     expect(onSelect).toHaveBeenCalledWith("t1/user");
   });
 
+  // 终审 M10 —— 只点了请求圆点时 `selectedId` 是 null,↑ ↓ 原先一律跳回首行,
+  // 读者从「请求 #2」按一下就被扔到第 0 行。请求也有落点:它的 assistant 记录。
+  it("只选中了请求时,↑ ↓ 从该请求的 assistant 记录起算", () => {
+    const onSelect = vi.fn();
+    render(
+      <TrajectoryLedger {...baseProps({ onSelect, selectedId: null, selectedRequestNo: 2 })} />,
+    );
+    const container = screen.getByTestId("console-traj-ledger");
+
+    // 请求 #2 的记录是 `t1/assistant:2`(下标 3),↓ → `t2/user`。
+    fireEvent.keyDown(container, { key: "ArrowDown" });
+    expect(onSelect).toHaveBeenCalledWith("t2/user");
+
+    onSelect.mockClear();
+    fireEvent.keyDown(container, { key: "ArrowUp" });
+    expect(onSelect).toHaveBeenCalledWith("t1/tool:1:0");
+  });
+
   it("focusIndexes 把段内 / 段外行分别标 inside / outside(无选区时不标)", () => {
     const props = baseProps();
     const { rerender } = render(<TrajectoryLedger {...props} />);
