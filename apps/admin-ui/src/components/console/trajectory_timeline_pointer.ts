@@ -126,8 +126,9 @@ export function commitSelection(
 }
 
 /**
- * 提示三行:类型标签 / 起止钟点(只有时长模式拿到真实时序才报 —— 顺序模式里块
- * 的横向位置跟真实时刻无关,报钟点会误导)/ 总计。
+ * 提示最多四行:类型标签 / 起止钟点(只有时长模式拿到真实时序才报 —— 顺序模式
+ * 里块的横向位置跟真实时刻无关,报钟点会误导)/ 总计 / 首 token(assistant 且
+ * 不早于起点时)。
  */
 export function tooltipLines(
   span: TimelineSpan,

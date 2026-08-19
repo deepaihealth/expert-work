@@ -41,8 +41,12 @@ describe("tooltipLines · 首 token 行", () => {
     expect(lines).toContain("首 token 1.2s");
   });
 
-  it("firstTokenAt 为 null 时不出该行", () => {
-    const rec = record(1000, 1600, null);
+  // 评审 Important:startedAt=1000 时 `null >= 1000` 本来就是 false,摘掉实现
+  // 里的 `firstTokenAt !== null` 判断照样绿,测不出这道门。startedAt=0(duration
+  // 模式下合法的绝对时刻)让 `null >= 0` 为 true,漏了空值判断就会多算出一行
+  // 「首 token 0ms」,断言才能真正逮住它。
+  it("firstTokenAt 为 null 时不出该行(startedAt=0,故意撞 null >= 0 的坑)", () => {
+    const rec = record(0, 600, null);
     const lines = tooltipLines(span(), rec, model(), t);
     expect(lines.some((line) => line.startsWith("首 token"))).toBe(false);
   });
