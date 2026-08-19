@@ -16,7 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
@@ -1233,3 +1233,87 @@ async def test_sse_consumer_end_frame_carries_status_on_cancelled_run() -> None:
     text = b"".join(frames).decode()
     payload = json.loads(text.rstrip().rsplit("data: ", 1)[1])
     assert payload == {"status": "interrupted", "run_id": str(record.run_id)}
+
+
+# ---------------------------------------------------------------------------
+# PR-A.3 §十.1 —— system_prompt 帧 + sse_consumer(hide_events)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_agent_emits_system_prompt_frame_right_after_metadata() -> None:
+    """PR-A.3 §十.1 —— graph_input 首条是 SystemMessage 时,metadata 之后紧跟一帧
+    system_prompt(落库、占 seq),再才是 updates。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": [SystemMessage(content="你是评审员"), HumanMessage(content="hi")]},
+        config={},
+    )
+
+    events = await _drain(bridge, record.run_id)
+    assert [e.event for e in events] == ["metadata", "system_prompt", "updates"]
+    assert events[1].data == {"text": "你是评审员"}
+    seqs = [int(e.id.split("-")[1]) for e in events]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_skips_system_prompt_frame_without_system_message() -> None:
+    """resume(graph_input=None)/ 审批续跑(Command)/ 没有 SystemMessage 首条 —— 不发。"""
+    for graph_input in (None, {"messages": [HumanMessage(content="hi")]}, {"messages": []}):
+        bridge = InMemoryStreamBridge()
+        rm = RunManager()
+        record = await _new_record(rm)
+        await run_agent(
+            bridge=bridge,
+            run_manager=rm,
+            record=record,
+            graph=_ScriptedGraph(chunks=[{"agent": {"step_count": 1}}]),
+            graph_input=graph_input,
+            config={},
+        )
+        events = await _drain(bridge, record.run_id)
+        assert "system_prompt" not in [e.event for e in events], graph_input
+
+
+@pytest.mark.asyncio
+async def test_sse_consumer_hide_events_filters_frames_but_keeps_ids_monotonic() -> None:
+    """对外平面用 hide_events 滤掉 system_prompt;其余帧原样(id 不重排)。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_ScriptedGraph(chunks=[{"agent": {"step_count": 1}}]),
+        graph_input={"messages": [SystemMessage(content="secret"), HumanMessage(content="hi")]},
+        config={},
+    )
+
+    async def never_disconnected() -> bool:
+        return False
+
+    wire = b"".join(
+        [
+            chunk
+            async for chunk in sse_consumer(
+                bridge=bridge,
+                record=record,
+                run_manager=rm,
+                is_disconnected=never_disconnected,
+                hide_events=frozenset({"system_prompt"}),
+            )
+        ]
+    )
+    assert b"event: system_prompt" not in wire
+    assert b"secret" not in wire
+    assert b"event: metadata" in wire and b"event: updates" in wire and b"event: end" in wire

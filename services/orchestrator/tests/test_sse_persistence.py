@@ -15,6 +15,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from expert_work.runtime.runs import (
     DisconnectMode,
@@ -735,3 +736,34 @@ async def test_persist_writer_flushes_immediately_when_queue_goes_empty() -> Non
 
     elapsed = flushed_at[0] - started
     assert elapsed < _PERSIST_FLUSH_INTERVAL_S / 2  # 无 idle-poll 尾税
+
+
+# ---------------------------------------------------------------------------
+# PR-A.3 §十.1 —— system_prompt 帧落库
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_frame_is_persisted_with_its_seq() -> None:
+    """帧落库 —— 回放(控制台历史轮)才看得到 SYSTEM 行。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    event_store = InMemoryRunEventStore()
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": [SystemMessage(content="sp"), HumanMessage(content="hi")]},
+        config={},
+        event_store=event_store,
+    )
+    await _await_writers()
+
+    rows = await event_store.list(run_id=record.run_id, since_seq=None, limit=50)
+    names = [r.event_name for r in rows]
+    assert names[:2] == ["metadata", "system_prompt"]
+    assert rows[1].data == {"text": "sp"}

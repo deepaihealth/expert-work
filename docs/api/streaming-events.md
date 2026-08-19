@@ -14,6 +14,7 @@ the set of persisted frames replayed by the events endpoint.
 | `event:` | When | Persisted (replayed on reconnect) |
 |---|---|---|
 | `metadata` | Once at run start (`run_id`, `thread_id`, trace id) | yes |
+| `system_prompt` | Once, right after `metadata`, when the run starts fresh (console plane only — external producers filter it) | yes |
 | `updates`  | Once per agent/tool step — the **authoritative** step result | yes |
 | `token`    | Fine-grained token preview during an LLM step (see below) | **no (live-only)** |
 | `approval` | Run paused at a human-approval gate | yes |
