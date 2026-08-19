@@ -4,8 +4,9 @@
  * `.details / .detailsResizeHandle / .detailsHeader / .detailTab* / .overview*`
  * (MIT,重写不复制),颜色一律走 `--ew-*` 令牌,浅 / 深主题都可见。
  *
- * `.ew-kt`(类型标签)与账本共用一套类名 —— 账本那份定义在
- * `trajectory_ledger.css`(Task 8),两边内容相同,合并时去重留一份即可。
+ * `.ew-kt`(类型标签)这一段与 `trajectory_ledger.css`(Task 8)里的**同一份**
+ * (逐字相同,含 `--ew-kt-color` 间接层与账本的失败态覆盖),合并时由控制器抽成
+ * 一个共享文件,别在这里单独改。
  */
 
 .ew-detail {
@@ -279,11 +280,14 @@
   color: var(--ew-text-primary);
 }
 
+/* 只读预览:被 120px 裁掉一半的载荷 / 结果里还带着 CopyButton、ToolCallCard 的
+   按钮,关掉指针事件免得点到看不见的东西(分节标题按钮在预览区外,不受影响)。 */
 .ew-detail__preview {
   position: relative;
   max-height: 120px;
   padding: 0 14px;
   overflow: hidden;
+  pointer-events: none;
 }
 
 .ew-detail__preview::after {
@@ -297,9 +301,11 @@
   pointer-events: none;
 }
 
-/* ---- 类型标签(spec §九 类型表;底色 = 同色 14%)---- */
+/* ---- 类型标签(§九 类型 → 标签 / 颜色表) ---------------------------- */
 
 .ew-kt {
+  --ew-kt-color: var(--ew-text-secondary);
+
   display: inline-flex;
   flex: none;
   align-items: center;
@@ -307,46 +313,25 @@
   height: 19px;
   padding: 0 5px;
   border-radius: 4px;
-  color: var(--ew-text-secondary);
-  background: color-mix(in srgb, var(--ew-text-secondary) 14%, transparent);
+  color: var(--ew-kt-color);
+  background: color-mix(in srgb, var(--ew-kt-color) 14%, transparent);
   font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.035em;
+  font-weight: 600;
   line-height: 16px;
+  letter-spacing: 0.035em;
   user-select: none;
 }
 
-.ew-kt--user {
-  color: var(--ew-color-brand-300);
-  background: color-mix(in srgb, var(--ew-color-brand-300) 14%, transparent);
-}
+.ew-kt--user { --ew-kt-color: var(--ew-color-brand-300); }
+.ew-kt--memory { --ew-kt-color: var(--ew-color-success-500); }
+.ew-kt--assistant { --ew-kt-color: var(--ew-accent-violet); }
+.ew-kt--reflect { --ew-kt-color: var(--ew-color-accent-400); }
+.ew-kt--tool { --ew-kt-color: var(--ew-color-warning-500); }
+.ew-kt--subagent { --ew-kt-color: var(--ew-color-warning-700); }
+.ew-kt--plan { --ew-kt-color: var(--ew-color-teal-500); }
 
-.ew-kt--memory {
-  color: var(--ew-color-success-500);
-  background: color-mix(in srgb, var(--ew-color-success-500) 14%, transparent);
-}
+/* compaction / retry / error / approval / guard / gap 用默认的 secondary。 */
 
-.ew-kt--assistant {
-  color: var(--ew-accent-violet);
-  background: color-mix(in srgb, var(--ew-accent-violet) 14%, transparent);
-}
-
-.ew-kt--reflect {
-  color: var(--ew-color-accent-400);
-  background: color-mix(in srgb, var(--ew-color-accent-400) 14%, transparent);
-}
-
-.ew-kt--tool {
-  color: var(--ew-color-warning-500);
-  background: color-mix(in srgb, var(--ew-color-warning-500) 14%, transparent);
-}
-
-.ew-kt--subagent {
-  color: var(--ew-color-warning-700);
-  background: color-mix(in srgb, var(--ew-color-warning-700) 14%, transparent);
-}
-
-.ew-kt--plan {
-  color: var(--ew-color-teal-500);
-  background: color-mix(in srgb, var(--ew-color-teal-500) 14%, transparent);
+.ew-ledger__row[data-error="true"] .ew-kt {
+  --ew-kt-color: var(--ew-color-danger-500);
 }

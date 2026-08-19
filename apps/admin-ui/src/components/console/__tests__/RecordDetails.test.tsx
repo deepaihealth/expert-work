@@ -3,6 +3,8 @@
  * 状态 / 耗时 / assistant 用量 / Run / Langfuse)、分节预览跳 tab、预览与原文、
  * 占位记录、非法 activeTab 兜底。fixture 手造 `LedgerRecord`(不跑 `buildLedger`)。
  */
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { render, screen, within } from "@testing-library/react";
@@ -317,6 +319,21 @@ describe("RecordDetails", () => {
     const section = screen.getByTestId("console-detail-section-payload");
     await userEvent.click(within(section).getByRole("button", { name: "Open Payload" }));
     expect(props.onTabChange).toHaveBeenCalledWith("payload");
+  });
+
+  it("分节预览区不可点:被 120px 裁一半的复制 / 工具按钮关掉指针事件", () => {
+    renderRecord({ record: rec(toolRow()) });
+    const preview = screen
+      .getByTestId("console-detail-section-payload")
+      .querySelector<HTMLElement>(".ew-detail__preview");
+    expect(preview).not.toBeNull();
+    // 预览区里确实有会被裁掉一半的按钮(载荷自带的复制按钮),不是空谈。
+    expect(within(preview!).getAllByRole("button").length).toBeGreaterThan(0);
+    // vitest 配了 `css: false`,样式表根本不进 jsdom —— 规则本身在这里断言。
+    // (vitest 的 root 是 apps/admin-ui;`css: false` 让 `?raw` 也拿不到内容,只能读盘)
+    const css = readFileSync("src/components/console/record_details.css", "utf8");
+    const rule = /\.ew-detail__preview \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(rule).toContain("pointer-events: none");
   });
 
   it("assistant 预览:「思考」折叠段 + Markdown 正文", () => {
