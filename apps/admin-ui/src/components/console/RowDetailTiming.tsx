@@ -46,8 +46,11 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
   const dash = t("console.detail_none");
   const sseEnd = row.serverMs !== null ? fmtClock(row.serverMs) : dash;
   const sseDuration = row.durationMs !== null ? fmtDuration(row.durationMs) : dash;
-  const sseModel = row.kind === "think" ? (row.model ?? dash) : dash;
-  const sseTokens = row.kind === "think" ? `${row.inputTokens} / ${row.outputTokens}` : dash;
+  // 账本投影(spec §九 D2)把模型 / tokens 从 think 行挪到了一步一条的
+  // assistant 行,SSE 列两种行都要取到值。
+  const metered = row.kind === "think" || row.kind === "assistant";
+  const sseModel = metered ? (row.model ?? dash) : dash;
+  const sseTokens = metered ? `${row.inputTokens} / ${row.outputTokens}` : dash;
 
   const span = match.reason === "matched" ? match.span : null;
   const isError = span !== null && span.level === "error";

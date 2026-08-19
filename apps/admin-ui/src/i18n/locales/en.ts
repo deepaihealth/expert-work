@@ -1272,6 +1272,27 @@ export interface TranslationKeys {
     toolbar_search: string;
     toolbar_search_count: string;
     toolbar_aria: string;
+    detail_tab_preview: string;
+    detail_tab_rawtext: string;
+    detail_tab_input: string;
+    detail_tab_usage: string;
+    detail_hierarchy: string;
+    detail_hier_request: string;
+    detail_hier_assistant: string;
+    detail_hier_tool: string;
+    detail_run: string;
+    detail_open_tab: string;
+    detail_thinking: string;
+    detail_thinking_none: string;
+    detail_usage_input: string;
+    detail_usage_output: string;
+    detail_usage_reasoning: string;
+    detail_usage_cache_read: string;
+    detail_usage_cumulative: string;
+    detail_tool_calls: string;
+    detail_request_title: string;
+    detail_resize: string;
+    detail_placeholder: string;
   };
   playground: {
     session_label: string;
@@ -4468,6 +4489,27 @@ const en: TranslationKeys = {
     toolbar_search: "Search",
     toolbar_search_count: "{{n}} matches",
     toolbar_aria: "Trajectory toolbar",
+    detail_tab_preview: "Preview",
+    detail_tab_rawtext: "Raw",
+    detail_tab_input: "Input",
+    detail_tab_usage: "Usage",
+    detail_hierarchy: "Hierarchy",
+    detail_hier_request: "Request #{{n}}",
+    detail_hier_assistant: "Assistant Message",
+    detail_hier_tool: "Tool Call",
+    detail_run: "Run",
+    detail_open_tab: "Open {{tab}}",
+    detail_thinking: "Thinking ({{n}} tokens)",
+    detail_thinking_none: "Thinking",
+    detail_usage_input: "Input",
+    detail_usage_output: "Output",
+    detail_usage_reasoning: "Reasoning",
+    detail_usage_cache_read: "Cache read",
+    detail_usage_cumulative: "Cumulative",
+    detail_tool_calls: "Tool calls",
+    detail_request_title: "Request #{{n}}",
+    detail_resize: "Drag to resize; double-click to reset",
+    detail_placeholder: "Turn not replayed yet; text fallback only",
   },
   playground: {
     session_label: "Session",
