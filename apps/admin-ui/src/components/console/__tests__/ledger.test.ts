@@ -278,8 +278,15 @@ describe("ledgerRecordId", () => {
     expect(ledgerRecordId("run-1", "think:3")).toBe("run-1/assistant:3");
     expect(ledgerRecordId("run-1", "tool:3:0")).toBe("run-1/tool:3:0");
     expect(ledgerRecordId("run-1", "user")).toBe("run-1/user");
-    // `live-think:` 不是 `think:` 开头,原样带过。
-    expect(ledgerRecordId("run-1", "live-think:2")).toBe("run-1/live-think:2");
+  });
+
+  it("ledgerRecordId maps live-think:<step> to live-assistant:<step>", () => {
+    // 运行中那一步:中栏过程条的紧凑行是 `live-think:<step>`,账本里同一步是
+    // `live-assistant:<step>`(`liveLedgerRows`)—— 不映射的话运行中点「轨迹」
+    // 定位不到记录。
+    expect(ledgerRecordId("run-1", "live-think:2")).toBe("run-1/live-assistant:2");
+    expect(ledgerRecordId("run-1", "live-tool:2:0")).toBe("run-1/live-tool:2:0");
+    expect(ledgerRecordId("run-1", "live-assistant:2")).toBe("run-1/live-assistant:2");
   });
 });
 

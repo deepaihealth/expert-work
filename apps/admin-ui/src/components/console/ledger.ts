@@ -16,10 +16,18 @@ import type { ConsoleTurn } from "./types";
 
 export { absoluteSpans, lastKnownFrame } from "./ledger_timing";
 
-/** 中栏过程条的行 id → 账本记录 id。过程条投影里每步是一条 `think:<seq>` 行,
- *  账本里同一步是 `assistant:<seq>`(spec §九「联动」);其余 id 两边同名。 */
+/** 中栏过程条的行 id → 账本记录 id(spec §九「联动」)。过程条投影里一个
+ *  agent 步是一条 `think:` 行,账本里同一步是 `assistant:` 行 —— 已落帧的步
+ *  `think:<seq>` → `assistant:<seq>`,运行中还没落帧的步 `live-think:<step>`
+ *  → `live-assistant:<step>`(`liveLedgerRows` 造的那条)。其余 id 两边同名。 */
+const THINK_PREFIXES: ReadonlyArray<[string, string]> = [
+  ["live-think:", "live-assistant:"],
+  ["think:", "assistant:"],
+];
+
 export function ledgerRecordId(turnKey: string, rowId: string): string {
-  const id = rowId.startsWith("think:") ? `assistant:${rowId.slice("think:".length)}` : rowId;
+  const hit = THINK_PREFIXES.find(([from]) => rowId.startsWith(from));
+  const id = hit === undefined ? rowId : `${hit[1]}${rowId.slice(hit[0].length)}`;
   return `${turnKey}/${id}`;
 }
 
