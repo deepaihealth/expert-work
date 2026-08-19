@@ -262,6 +262,46 @@ async def test_external_replay_hides_system_prompt_frame_but_keeps_seq_cursor(ct
 
 
 @pytest.mark.asyncio
+async def test_live_attach_hides_ephemeral_system_prompt_frame_but_keeps_token(
+    ctx: _Ctx,
+) -> None:
+    """终审 I2 —— `_encode` 不是过滤的唯一出口:live 接合里 ephemeral
+    (``seq is None``)分支曾原样 ``format_sse`` 放行,绕过 ``hide_events``。
+    今天唯一的 ephemeral 帧是 ``token``(本就该对外可见,历史上没有真泄漏),
+    这条测试直接造一条 ephemeral ``system_prompt`` 帧钉死"两条对外路径
+    (POST /runs 的 stream 模式 vs 这条 GET 的 live 接合)同语义"这条不变式,
+    并顺带确认 ``token`` 帧的行为零变化(仍然上 wire)。
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = UUID(started.json()["data"]["run_id"])
+    assert started.json()["data"]["status"] == "queued"
+    # 没有 worker 去跑这个 run —— 它留在 QUEUED(非终态),GET /events 因此走
+    # live 接合分支,不是回放(_encode 的另一个已过滤出口,测了也测不出这条)。
+    bridge = ctx.app.state.agent_runtime.stream_bridge
+    await bridge.publish_ephemeral(run_id, "system_prompt", {"text": "leaked prompt"})
+    await bridge.publish_ephemeral(run_id, "token", {"text": "hi"})
+    await bridge.publish_end(run_id, status="success")
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Expert-Work-Stream-Mode"] == "live"
+    body = resp.text
+    assert "event: system_prompt" not in body
+    assert "leaked prompt" not in body
+    assert "event: token" in body
+    assert "event: end" in body
+
+
+@pytest.mark.asyncio
 async def test_events_404_for_another_user(ctx: _Ctx) -> None:
     await ctx.seed_agent()
     started = await ctx.client.post(

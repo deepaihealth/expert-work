@@ -111,12 +111,12 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
 /** Turns with ≥ 2 non-context (``CONTEXT_KINDS``) records — the only ones
  *  worth collapsing. */
 export function collapsibleTurnKeys(ledger: Ledger): string[] {
-  const nonUserCounts = new Map<string, number>();
+  const nonContextCounts = new Map<string, number>();
   for (const r of ledger.records) {
     if (CONTEXT_KINDS.has(r.kind)) continue;
-    nonUserCounts.set(r.turnKey, (nonUserCounts.get(r.turnKey) ?? 0) + 1);
+    nonContextCounts.set(r.turnKey, (nonContextCounts.get(r.turnKey) ?? 0) + 1);
   }
-  return ledger.turns.filter((t) => (nonUserCounts.get(t.key) ?? 0) >= 2).map((t) => t.key);
+  return ledger.turns.filter((t) => (nonContextCounts.get(t.key) ?? 0) >= 2).map((t) => t.key);
 }
 
 /** Assistant records that own ≥ 1 child (direct tool/plan, or a subagent

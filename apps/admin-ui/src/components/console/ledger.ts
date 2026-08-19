@@ -246,7 +246,13 @@ function requestsOf(records: readonly LedgerRecord[]): LedgerRequest[] {
       toolCalls: toolCallsByRequest.get(record.requestNo) ?? 0,
       startedAt, endedAt,
       durationMs: row.durationMs ?? (startedAt !== null && endedAt !== null ? endedAt - startedAt : null),
-      firstTokenMs: row.firstTokenMs ?? null,
+      // 与 `record.firstTokenAt` 同口径(Minor 2)—— 有时序(span 存在、
+      // `firstTokenAt` 非 null)时用夹后差值,免得悬停提示与「请求 #N」报出
+      // 两个不同的首 token 数;无时序 / 没带 `firstTokenMs` 时退回原值。
+      firstTokenMs:
+        record.firstTokenAt !== null && startedAt !== null
+          ? record.firstTokenAt - startedAt
+          : row.firstTokenMs ?? null,
     });
   }
   return requests;

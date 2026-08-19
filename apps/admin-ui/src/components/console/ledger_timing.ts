@@ -79,7 +79,13 @@ function computeSpans(
 
   const userRow = rows.find((r) => r.kind === "user");
   if (userRow !== undefined) {
-    const starts = Array.from(spans.values(), (s) => s.start);
+    // SYSTEM 行(标记行,`serverMs` = system_prompt 帧落库时刻)排除在 USER
+    // 的钉点计算外 —— 否则 USER 会被钉到 SYSTEM 的同一毫秒(终审 I1),两块
+    // 在时长模式下同泳道同 x 完全重叠。
+    const systemId = rows.find((r) => r.kind === "system")?.id ?? null;
+    const starts = Array.from(spans.entries())
+      .filter(([id]) => id !== systemId)
+      .map(([, s]) => s.start);
     const at = starts.length > 0 ? Math.min(...starts) : fallbackStart;
     if (at !== null) spans.set(userRow.id, { start: at, end: at });
   }

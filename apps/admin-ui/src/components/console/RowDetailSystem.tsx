@@ -1,7 +1,7 @@
 /**
  * RowDetailSystem — the SYSTEM row's 「原文」panel(PR-A.3 §十.1 Task 12):
  * the run's `system_prompt` frame text, verbatim, with a copy button.
- * `<pre>` styling copied from `RowDetailPayloadResult.tsx:89-103`'s private
+ * `<pre>` styling copied from `RowDetailPayloadResult.tsx:89-104`'s private
  * `Pre` (not imported — that component isn't exported).
  */
 import { CopyButton } from "../CopyButton";
