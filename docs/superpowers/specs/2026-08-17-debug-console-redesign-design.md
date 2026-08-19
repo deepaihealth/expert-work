@@ -354,3 +354,41 @@ PR-A.1(#1214)上测试环境后,用户看了泳道后的反馈是「没有实现
 **退役**:`InspectPanel` / `TrajectoryPanel` / `LaneStrip` + `lane_strip_model` + `lane_strip.css` / `TrajectoryRows` + `trajectory_rows.css` / `RowDetail`(拆成新的 `RecordDetails` / `RequestDetails`,`RowDetailPayloadResult` / `RowDetailTiming` 保留复用)/ `RunStatusBanner` 在轨迹里的用法(错误已经是红行红块;该组件随后由 PR-B 连 TurnCard 一起清)。`api/trajectory_rows.ts` 的旧 `trajectoryRowsOf(events, input, answer, status)` 与 `resolveGanttKey` 的 think 分支随之删除。
 
 **明确不做(本节)**:Composer 浮层(钉底部即可);对话记录页 / Run 详情页迁移(PR-B);`playground.*` → `console.*` 改名。Schema tab / SYSTEM 行 / TTFT 双色 → PR-A.3(见 D5)。
+
+## 十、PR-A.3 轨迹补数据(2026-08-19 追加;D5 的兑现 + 两条真栈发现)
+
+PR-A.2(#1216)上测试环境后,§九 D5 留下的三处「缺后端数据」用户拍板「要做的」;同一次真栈冒烟又逮到两条既有后端 bug(Langfuse 计时 ×1000、span 乱序配对)。五件事合成 PR-A.3,排在 PR-B 之前。**§九 的形态不变,这一节只加数据与三块 UI。**
+
+### 10.1 SYSTEM 行(系统提示词帧)
+
+- **数据**:orchestrator `run_agent` 在 `metadata` 帧之后、TTFT 计时起点之前,发一帧 `event: system_prompt`,`data = {"text": <最终喂给模型的 system prompt 全文>}`。只在 `graph_input` 带 `SystemMessage` 首条时发(新 run);resume / 审批续跑(`graph_input=None` / `Command`)不发。帧照常落库(回放可见)。
+- **平面**:**只给控制台平面**。对外 API(第三方 API key)的实时流与回放都把 `system_prompt` 帧滤掉 —— 系统提示词属于管理面产物,对外平面只给「跑 agent」的能力(见 `external-api-third-party-scope`)。对外文档站不改(它们看不到这帧)。
+- **账本**:每轮若有该帧,轮首多一条 `SYSTEM` 记录(在 USER 之前,`id = system`,泳道「输入」,标签 `SYSTEM`,颜色 `--ew-text-secondary`);内容列 = 提示词首行。**相邻轮系统提示词相同就折掉**:同一加载窗口内只在第一轮、以及提示词**变化**的轮出现 —— 跟 deepseek-harness「一条轨迹开头一个 SYSTEM」的观感一致,又不把 50 轮同样的提示词刷 50 遍。
+- **折叠 / 计数**:SYSTEM 与 USER 同属「上下文行」:轮折叠时仍显示、不计入「其它 N 步」、不计入「值得折叠」的非 USER 记录数、双击落点同 USER。这个谓词只写一处(`ledger_collapse.CONTEXT_KINDS`),账本 / 折叠 / 双击都引它。
+- **详情**:`概要(字数 + Run 链接)/ 原文(全文 <pre> + 复制)/ 原始`。
+- 中栏对话视图、过程条、Gantt **不变**(`parseTimeline` 不认这帧)。
+
+### 10.2 Schema tab(工具 JSON Schema)
+
+- **数据**:新端点 `GET /v1/agents/{name}/{version}/tools`(控制台平面,`manifest:read`,与 `GET /{name}/{version}` 同闸同审计)。用与跑 run 完全相同的 `runtime.get_agent(...)`(有 LRU 缓存)拿到 `BuiltAgent`,返回它**整个工具注册表**(含延迟挂载的):`{"items": [{name, description, parameters, source, from_skill, deferred}], "total": N}`;`parameters` 就是喂给模型的 JSON Schema(`ToolSpec.parameters`)。构建失败 → 422(与 `run_agent` 同码)。**不起 run**。
+- 为此 `BuiltAgent` 新增 `tool_catalog: tuple[ToolCatalogEntry, ...]`(零行为改动)。顺手把租户侧 `GET /v1/mcp-servers/{name}/tools` 补回丢掉的 `input_schema`,与平台侧 `mcp_catalog` 对齐。
+- **UI**:TOOL 记录与 PLAN(`update_plan`)记录的详情多一个 `Schema` tab(在「结果」与「计时」之间):描述 + 来源(builtin / mcp:<server> / skill:<name>)+ 「延迟挂载」标记 + JSON Schema `<pre>`(可复制)。**懒加载**:第一次打开需要它的记录才请求一次,之后整个会话复用;加载中 / 失败(可重试)/ 当前工具集里没有这个名字,三态各一句。
+- 不做:ASSISTANT 记录展示「本步喂给模型的工具清单」(那是另一件事)。
+
+### 10.3 模型块 TTFT / Decoding 双色
+
+- **数据**:`agent_node` 每次 LLM 调用记起点,`TokenSink` 记第一个**非空** delta(content / reasoning / tool_calls 任一)的时刻,调用返回后把差值写进 `AIMessage.additional_kwargs["first_token_ms"]`(与工具那一路 `ToolMessage.additional_kwargs["duration_ms"]` 同款信道)→ 随 `updates` 帧落库、回放可见。没 sink(judge 开着 / 无 publish)或厂商不流式 → 不写。
+- **UI**:时长 / 顺序两种模式下,ASSISTANT 块都按 `first_token_ms / 步时长` 的比例分两段:前段(首 token 前)同色 40% 透明,后段(解码)实色;失败块仍整块红。悬停提示多一行「首 token 1.2s」;「请求 #N」概要多一行「首 token」。
+- 不做:会话级状态栏的「首 token」芯片仍走客户端计时(它量的是「点发送到看见第一个字」,与每步 LLM 首 token 不是一个量)。
+
+### 10.4 Langfuse 计时两处修正(既有 bug)
+
+- `trace_facade.py` 把 Langfuse `observation.latency` 当秒 ×1000,测试集群这版 Langfuse 返回毫秒 → 计时 tab「121m5s」。改成有 `start_time`/`end_time` 就用差值,`latency` 只作兜底。
+- 返回的 spans 按 Langfuse 原序(非时间序),前端 Rule 2 按数组顺序配对 → 第 1 步 ASSISTANT 配到第 2 步 LLM span。后端按 `startMs` 稳定排序再返回;前端 Rule 2 配对前也排一遍(防御)。
+
+### 10.5 类型表增补
+
+| 记录 | 标签 | 颜色 token | 泳道 | 详情 tab |
+|---|---|---|---|---|
+| system | SYSTEM | `--ew-text-secondary` | 输入 | 概要 / 原文 / 原始 |
+| tool / plan(update_plan) | —(不变) | —(不变) | —(不变) | 概要 / 载荷 / 结果 / **Schema** / 计时 / 原始 |
