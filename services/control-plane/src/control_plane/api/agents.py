@@ -44,6 +44,7 @@ from control_plane.api._idempotency import (
     request_digest,
 )
 from control_plane.api._quota_admission import check_admission
+from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (
@@ -1354,6 +1355,9 @@ def build_agents_router() -> APIRouter:
                 idempotency_key=key,
                 request_digest=digest,
                 envelope=True,
+                # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt(服务端合成的
+                # 系统提示词全文)是控制台调试专用帧,第三方 API key 不可见。
+                hide_events=EXTERNAL_HIDDEN_EVENTS,
             )
         except RunIdempotencyConflict:
             # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single

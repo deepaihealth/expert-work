@@ -173,6 +173,60 @@ async def test_events_replays_a_terminal_run(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_external_replay_hides_system_prompt_frame_but_keeps_seq_cursor(ctx: _Ctx) -> None:
+    """对外回放滤掉 system_prompt;帧 seq 不重排,next_seq / end 语义不变 ——
+    被滤帧是页里最后一帧时也要能正常收尾(游标用的是过滤前的记录)。"""
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = started.json()["data"]["run_id"]
+    await ctx.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=1, event_name="metadata", data={"step": 1})
+    )
+    # The would-be-last frame in the page is the hidden one — the page-
+    # truncation / end-vs-truncated decision must be computed against the
+    # unfiltered rows, not the ones actually written to the wire.
+    await ctx.run_event_store.append(
+        make_event_record(
+            run_id=UUID(run_id),
+            seq=2,
+            event_name="system_prompt",
+            data={"text": "secret prompt"},
+        )
+    )
+    await ctx.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=3, event_name="updates", data={"step": 3})
+    )
+    await ctx.run_store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.text
+    assert "event: system_prompt" not in body
+    assert "secret prompt" not in body
+    assert "event: metadata" in body
+    assert "event: updates" in body
+    assert "event: end" in body
+    # The visible frame after the hidden one keeps its real seq (3) —
+    # the gap left by the filtered frame is never renumbered.
+    assert re.search(r"id: \d+-1\n", body)
+    assert re.search(r"id: \d+-3\n", body)
+    assert not re.search(r"id: \d+-2\n", body)
+
+
+@pytest.mark.asyncio
 async def test_events_404_for_another_user(ctx: _Ctx) -> None:
     await ctx.seed_agent()
     started = await ctx.client.post(
