@@ -130,7 +130,7 @@ from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
-from orchestrator.tools.registry import ToolContext, ToolRegistry
+from orchestrator.tools.registry import ToolCatalogEntry, ToolContext, ToolRegistry
 from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_agent_key, bind_egress
 from orchestrator.tools.skill_authoring import (
     SKILL_AUTHORING_BUILTINS,
@@ -256,6 +256,10 @@ class BuiltAgent:
     #: pass it to ``sse.run_agent(token_budget=...)``; 0 disables (no budget
     #: object is created, zero behaviour change).
     token_budget: int = 0
+    #: PR-A.3 — the build's full tool registry projection
+    #: (``ToolRegistry.catalog()``) for the console's Schema tab. Read-only
+    #: metadata; nothing on the run path consumes it.
+    tool_catalog: tuple[ToolCatalogEntry, ...] = ()
 
 
 def _tool_replay_safe(registry: ToolRegistry) -> Callable[[str], bool]:
@@ -1115,6 +1119,8 @@ async def build_agent(
             loaded_skills.resolved_versions, agent_name=spec.metadata.name
         ),
         tool_replay_safe=_tool_replay_safe(registry),
+        # PR-A.3 — full registry projection for the console's Schema tab.
+        tool_catalog=registry.catalog(),
         # Stream PI-1c — expose the build nonce so the control-plane seed
         # assembler can fence structured untrusted_content with it.
         spotlight_nonce=spotlight_nonce,
