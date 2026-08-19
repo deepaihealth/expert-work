@@ -297,7 +297,7 @@ PR-A.1(#1214)上测试环境后,用户看了泳道后的反馈是「没有实现
 - **D2 一步一条 ASSISTANT**:轨迹里每个 agent 步一条 `ASSISTANT` 记录(文字 + 思考 + 它发起的工具调用),原「每步一条 THINK 行 + 最后一条 ASSISTANT 行」退役;思考进详情「预览」的折叠段。中栏过程条的 THINK 紧凑行**不变**(那是另一个投影)。
 - **D3 账本去四列**:账本只有「事件槽 + 内容」两列(与 deepseek 一致);`入 / 出 / 思考 / 耗时` 四列删除,数字进「请求 #N」详情与悬停提示。
 - **D4 滚轮缩放 + 右键平移**:做(撤销 §八「明确不做」那条)。
-- **D5 三处缺数据本期不做**:`Schema` tab(控制面没有工具 JSON schema 接口)、`SYSTEM` 行(系统提示词只在 Langfuse span 输入里)、模型块 TTFT / Decoding 双色(后端没有每步首 token 时刻)。后端补了再加。
+- **D5 三处缺数据本期不做,另开 PR-A.3 补齐**(用户 2026-08-19 追加拍板「要做的」):`Schema` tab(控制面没有工具 JSON schema 接口 → 加 `GET /v1/agents/{name}/{version}/tools`)、`SYSTEM` 行(系统提示词只在 Langfuse span 输入里 → orchestrator 每 run 开头发一帧 `system_prompt`)、模型块 TTFT / Decoding 双色(后端没有每步首 token 时刻 → `updates` 帧带 `_first_token_ms`)。PR-A.3 = 后端三帧 / 接口 + 前端三块 UI,排在 PR-A.2 之后、PR-B 之前。
 - **D6 顺序**:PR-A.2 先于 PR-B。
 
 ### 2. 形态
@@ -353,4 +353,4 @@ PR-A.1(#1214)上测试环境后,用户看了泳道后的反馈是「没有实现
 
 **退役**:`InspectPanel` / `TrajectoryPanel` / `LaneStrip` + `lane_strip_model` + `lane_strip.css` / `TrajectoryRows` + `trajectory_rows.css` / `RowDetail`(拆成新的 `RecordDetails` / `RequestDetails`,`RowDetailPayloadResult` / `RowDetailTiming` 保留复用)/ `RunStatusBanner` 在轨迹里的用法(错误已经是红行红块;该组件随后由 PR-B 连 TurnCard 一起清)。`api/trajectory_rows.ts` 的旧 `trajectoryRowsOf(events, input, answer, status)` 与 `resolveGanttKey` 的 think 分支随之删除。
 
-**明确不做(本节)**:Schema tab / SYSTEM 行 / TTFT 双色(D5);Composer 浮层(钉底部即可);对话记录页 / Run 详情页迁移(PR-B);`playground.*` → `console.*` 改名。
+**明确不做(本节)**:Composer 浮层(钉底部即可);对话记录页 / Run 详情页迁移(PR-B);`playground.*` → `console.*` 改名。Schema tab / SYSTEM 行 / TTFT 双色 → PR-A.3(见 D5)。
