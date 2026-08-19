@@ -20,13 +20,13 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from control_plane.api._run_event_seq import _merge_ranges, _seq_of
 from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     HEARTBEAT_SENTINEL,
     StreamBridge,
-    StreamEvent,
     is_end,
 )
 from orchestrator.sse import SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
@@ -69,33 +69,6 @@ _MAX_TRACKED_HOLES = 4096
 #:
 #: 日志注入的前提是把换行塞进日志行伪造条目;上述取值里没有任何一个能承载换行。
 #: 若将来这三条日志新增了**字符串**参数,必须重新评估并删掉对应的抑制注释。
-
-
-def _merge_ranges(seqs: set[int]) -> list[tuple[int, int]]:
-    """把一组 seq 合并成连续闭区间 —— 一个洞段只发一帧 ``gap``。"""
-    merged: list[tuple[int, int]] = []
-    for seq in sorted(seqs):
-        if merged and seq == merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], seq)
-        else:
-            merged.append((seq, seq))
-    return merged
-
-
-def _seq_of(entry: StreamEvent) -> int | None:
-    """从帧 id 里解析落库 ``seq``;``None`` 表示这帧不参与接合。
-
-    ``entry.id is None`` 是一次性帧 —— 不可回放、不占号(今天只有 ``token``,
-    见 :meth:`StreamBridge.publish_ephemeral`)。
-    id 形状不认识时同样返回 ``None``:放行总比把它当成某个号去参与去重安全。
-    """
-    if entry.id is None:
-        return None
-    try:
-        return int(entry.id.rsplit("-", 1)[1])
-    except (IndexError, ValueError):
-        logger.warning("live_stream.unparsable_frame_id id=%s", entry.id)
-        return None
 
 
 @dataclass(frozen=True)
