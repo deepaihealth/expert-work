@@ -12,14 +12,8 @@ import type { JSX } from "react";
 import { Clock, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import type { TimelineMode } from "./ledger_timeline";
 import "./trajectory_toolbar.css";
-
-/**
- * Timeline block layout mode. Local declaration — Task 3 owns the real
- * definition in `./ledger_timeline.ts`; once that lands, the controller
- * should import `TimelineMode` from there instead of from this file.
- */
-export type TimelineMode = "sequence" | "duration";
 
 export interface TrajectoryToolbarProps {
   mode: TimelineMode;
