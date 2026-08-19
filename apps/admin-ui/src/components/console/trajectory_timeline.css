@@ -1,0 +1,250 @@
+/*
+ * TrajectoryTimeline —— 概览时间轴的组件级样式(spec §九「概览时间轴」)。
+ * 几何:50px 高的 plot = 44px 标签列 + 轨道;三条泳道 top 7 / 21 / 35px,块高
+ * 8px、最小宽 2px、块间 `min(8%, 1px)` 缝;缩放态下块与轮边界整体由
+ * `--traj-domain-left/-width` 两个变量投影(挪一个容器,不逐块重排)。
+ * 颜色全程 `--ew-*` 令牌,按 §九 的「类型 → 颜色」表;失败一律 danger。
+ * 交互观感参照 deepseek-harness ui-trajectory(MIT)重写。
+ */
+
+.ew-traj-tl {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  isolation: isolate;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  user-select: none;
+}
+
+.ew-traj-tl__plot {
+  display: grid;
+  height: 50px;
+  grid-template-columns: 44px minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--ew-surface-base);
+}
+
+.ew-traj-tl__labels {
+  position: relative;
+  border-right: 1px solid var(--ew-border-subtle);
+  color: var(--ew-text-tertiary);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.ew-traj-tl__labels span {
+  position: absolute;
+  right: 4px;
+  display: flex;
+  height: 8px;
+  align-items: center;
+}
+
+.ew-traj-tl__labels span:nth-child(1) { top: 7px; }
+.ew-traj-tl__labels span:nth-child(2) { top: 21px; }
+.ew-traj-tl__labels span:nth-child(3) { top: 35px; }
+
+.ew-traj-tl__track {
+  position: relative;
+  overflow: hidden;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.ew-traj-tl__track[data-panning="true"] {
+  cursor: grabbing;
+}
+
+.ew-traj-tl__track:focus-visible {
+  outline: 1px solid var(--ew-border-focus);
+  outline-offset: -1px;
+}
+
+.ew-traj-tl__empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--ew-text-tertiary);
+  font-size: 11px;
+}
+
+/* 「…」加载更早的历史 —— 钉在轨道左端,右侧渐隐让出块的位置。 */
+.ew-traj-tl__earlier {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  width: 28px;
+  box-sizing: border-box;
+  align-items: center;
+  padding: 0 0 0 3px;
+  border: none;
+  background: linear-gradient(
+    to right,
+    var(--ew-surface-base) 0,
+    var(--ew-surface-base) 38%,
+    transparent 100%
+  );
+  color: var(--ew-text-secondary);
+  cursor: pointer;
+  line-height: 1;
+  opacity: 0.72;
+}
+
+.ew-traj-tl__earlier:hover { opacity: 1; }
+.ew-traj-tl__earlier[aria-disabled="true"] { cursor: default; }
+.ew-traj-tl__earlier:focus-visible { box-shadow: inset 0 0 0 1px var(--ew-border-focus); }
+
+/* 域投影层 —— 全景时 left 0 / width 100%,缩放态被两个变量拉宽并左移。 */
+.ew-traj-tl__lanes,
+.ew-traj-tl__boundaries {
+  position: absolute;
+  left: var(--traj-domain-left);
+  width: var(--traj-domain-width);
+}
+
+.ew-traj-tl__lanes {
+  z-index: 2;
+  top: 7px;
+  bottom: 7px;
+}
+
+.ew-traj-tl__boundaries {
+  z-index: 3;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ew-traj-tl__lanes[data-animate-viewport="true"],
+  .ew-traj-tl__boundaries[data-animate-viewport="true"] {
+    transition: left 180ms ease-out;
+  }
+}
+
+.ew-traj-tl__boundary {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--traj-turn-left);
+  width: 1px;
+  background: var(--ew-border-default);
+}
+
+.ew-traj-tl__block {
+  position: absolute;
+  top: calc(var(--traj-span-lane) * 14px);
+  left: calc(var(--traj-span-left) + var(--traj-span-gap));
+  width: max(2px, calc(var(--traj-span-width) - var(--traj-span-gap) - var(--traj-span-gap)));
+  height: 8px;
+  min-width: 2px;
+  border-radius: 1px;
+  background: var(--ew-text-secondary);
+  cursor: pointer;
+}
+
+/* §九 类型 → 颜色表。think 不会出现在账本里。 */
+.ew-traj-tl__block[data-kind="user"] { background: var(--ew-color-brand-300); }
+.ew-traj-tl__block[data-kind="memory"] { background: var(--ew-color-success-500); }
+.ew-traj-tl__block[data-kind="assistant"] { background: var(--ew-accent-violet); }
+.ew-traj-tl__block[data-kind="reflect"] { background: var(--ew-color-accent-400); }
+.ew-traj-tl__block[data-kind="tool"] { background: var(--ew-color-warning-500); }
+.ew-traj-tl__block[data-kind="subagent"] { background: var(--ew-color-warning-700); }
+.ew-traj-tl__block[data-kind="plan"] { background: var(--ew-color-teal-500); }
+.ew-traj-tl__block[data-error="true"] { background: var(--ew-color-danger-500); }
+
+.ew-traj-tl__block[data-selected="false"] { opacity: 0.2; }
+.ew-traj-tl__block[data-search-match="false"] { opacity: 0.14; }
+
+/* 描边留出 1px 底色环,免得高亮块跟邻块糊在一起;深浅两主题都不用纯白。 */
+.ew-traj-tl__block[data-hovered="true"]:not([data-current="true"]) {
+  z-index: 1;
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 2px color-mix(in srgb, var(--ew-color-brand-500) 80%, transparent);
+  opacity: 1;
+}
+
+.ew-traj-tl__block[data-current="true"] {
+  z-index: 1;
+  box-shadow:
+    0 0 0 1px var(--ew-surface-base),
+    0 0 0 2px var(--ew-color-brand-500);
+  opacity: 1;
+}
+
+.ew-traj-tl__block[data-live="true"] {
+  animation: ew-traj-tl-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ew-traj-tl-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ew-traj-tl__block[data-live="true"] { animation: none; }
+}
+
+/* 选区:定格 12% 底 + 3px 竖条,拖拽中 18% 底 + 2px 竖条;选区外整片压暗 58%。 */
+.ew-traj-tl__range,
+.ew-traj-tl__edges,
+.ew-traj-tl__dim {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+.ew-traj-tl__range {
+  z-index: 1;
+  min-width: 1px;
+  background: color-mix(in srgb, var(--ew-color-brand-500) 12%, transparent);
+}
+
+.ew-traj-tl__range[data-dragging="true"] {
+  background: color-mix(in srgb, var(--ew-color-brand-500) 18%, transparent);
+}
+
+.ew-traj-tl__dim {
+  z-index: 1;
+  background: color-mix(in srgb, var(--ew-surface-bg) 58%, transparent);
+}
+
+.ew-traj-tl__edges {
+  z-index: 4;
+  min-width: 1px;
+}
+
+.ew-traj-tl__edges::before,
+.ew-traj-tl__edges::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--ew-color-brand-500);
+  content: "";
+}
+
+.ew-traj-tl__edges::before { left: 0; }
+.ew-traj-tl__edges::after { right: 0; }
+
+.ew-traj-tl__edges[data-dragging="true"]::before,
+.ew-traj-tl__edges[data-dragging="true"]::after {
+  width: 2px;
+}
+
+.ew-traj-tl__hover-line {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  bottom: 0;
+  left: clamp(0px, calc(var(--traj-hover-left) - 1px), calc(100% - 2px));
+  width: 2px;
+  background: var(--ew-color-brand-500);
+  pointer-events: none;
+}
