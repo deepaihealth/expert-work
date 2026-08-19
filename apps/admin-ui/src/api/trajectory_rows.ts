@@ -1,11 +1,12 @@
 /**
  * Trajectory-row projections — turns a turn's SSE events (via
  * ``parseTimeline``) into flat row lists that share one id scheme:
- * ``compactRowsOf`` (中栏紧凑行, no forced think rows), ``ledgerRowsOf``
- * (账本行: user + one **assistant** per agent step, spec §九 D2) and the
- * legacy ``trajectoryRowsOf`` (右栏轨迹行: user + one think per step +
- * trailing assistant; retired in PR-A.2 Task 11). All pure; no rendering,
- * no state. 投影模型参照 deepseek-harness ui-trajectory(MIT)重写。See
+ * ``compactRowsOf`` (中栏紧凑行, no forced think rows) and ``ledgerRowsOf``
+ * (账本行: user + one **assistant** per agent step, spec §九 D2). The old
+ * right-rail ``trajectoryRowsOf`` (user + one think per step + a trailing
+ * synthetic assistant) retired with the inspect panel in PR-A.2 Task 11.
+ * All pure; no rendering, no state. 投影模型参照 deepseek-harness
+ * ui-trajectory(MIT)重写。See
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-4-brief.md
  * 与 .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-2-brief.md.
  */
@@ -130,14 +131,13 @@ function asThreadPlan(v: unknown): ThreadPlan | null {
   return { goal: o.goal, steps };
 }
 
-/** 每个 agent 步投影成什么行 —— 三个投影唯一的行为旋钮:
+/** 每个 agent 步投影成什么行 —— 两个投影唯一的行为旋钮:
  *  - `compact`(中栏紧凑行):`reasoning` 非空才出一条 think 行(Rule 1);
- *  - `trajectory`(旧右栏轨迹行,Task 11 删):每步一条 think 行(Rule 5);
  *  - `ledger`(账本,spec §九 D2):每步一条 assistant 行,不出 think 行。 */
-type Projection = "compact" | "trajectory" | "ledger";
+type Projection = "compact" | "ledger";
 
-/** Shared builder behind the three projections. Aux / tool / marker rows are
- *  identical across all of them (同 id 同顺序);只有 agent 步的投影不同。 */
+/** Shared builder behind the two projections. Aux / tool / marker rows are
+ *  identical across both of them (同 id 同顺序);只有 agent 步的投影不同。 */
 function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): TrajectoryRow[] {
   const rows: TrajectoryRow[] = [];
   for (const item of parseTimeline(events)) {
@@ -160,7 +160,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
             status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
             eventIndexes: idx(item), serverMs: item.serverMs ?? null,
           });
-        } else if (item.reasoning !== null || opts.projection === "trajectory") {
+        } else if (item.reasoning !== null) {
           rows.push({
             id: `think:${item.seq}`, kind: "think", seq: item.seq, step: item.stepCount,
             text: item.reasoning ?? "", content: item.content, model: item.model,
@@ -260,8 +260,8 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
   return rows;
 }
 
-/** `TrajectoryRow` → `CompactRow` 的收窄谓词 —— `compact` / `trajectory`
- *  投影不会产出 user / assistant 行,靠它把类型收回去(而不是断言)。 */
+/** `TrajectoryRow` → `CompactRow` 的收窄谓词 —— `compact` 投影不会产出
+ *  user / assistant 行,靠它把类型收回去(而不是断言)。 */
 function isCompactRow(row: TrajectoryRow): row is CompactRow {
   return row.kind !== "user" && row.kind !== "assistant";
 }
@@ -286,32 +286,6 @@ function userRowOf(input: TrajectoryInput): UserRow {
  *  `compactRowsOf` 同源同 id)。**不再有** think 行,也没有末尾合成 assistant 行。 */
 export function ledgerRowsOf(events: readonly SseEvent[], input: TrajectoryInput): TrajectoryRow[] {
   return [userRowOf(input), ...rowsOf(events, { projection: "ledger" })];
-}
-
-/** 右栏轨迹行:`user` + 每个 agent 步一条 think(reasoning 为空也出,`text: ""`,UI 显示「模型调用 · <model>」)+ 其余同紧凑行 + `assistant`(`answer` 非空时;`status` = turnStatus running→running / error→error / done→ok)。 */
-export function trajectoryRowsOf(
-  events: readonly SseEvent[],
-  input: TrajectoryInput,
-  answer: string | null,
-  turnStatus: "running" | "done" | "error",
-): TrajectoryRow[] {
-  const rows: TrajectoryRow[] = [userRowOf(input), ...rowsOf(events, { projection: "trajectory" })];
-  if (answer !== null) {
-    let lastIdx: number[] = [];
-    for (const item of parseTimeline(events)) {
-      if (item.kind === "agent" && item.content !== null) lastIdx = idx(item);
-    }
-    const assistantRow: AssistantRow = {
-      id: "assistant", kind: "assistant", seq: -1, step: null,
-      status: turnStatus === "running" ? "running" : turnStatus === "error" ? "error" : "ok",
-      durationMs: null, eventIndexes: lastIdx, serverMs: null, text: answer,
-      // 按步投影才有的字段:这条是整轮的合成行,没有对应的单次模型调用。
-      reasoning: "", model: null, inputTokens: 0, outputTokens: 0,
-      finishReason: null, toolCallCount: 0,
-    };
-    rows.push(assistantRow);
-  }
-  return rows;
 }
 
 /** `GanttRow.key` → 轨迹行 id(泳道块点击定位用);找不到 → null。 */

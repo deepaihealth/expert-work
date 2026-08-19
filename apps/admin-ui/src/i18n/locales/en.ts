@@ -1154,12 +1154,7 @@ export interface TranslationKeys {
     vars_required_mark: string;
     composer_hint: string;
     stats_partial: string;
-    inspect_trajectory: string;
-    inspect_workspace: string;
-    inspect_turn_header: string;
-    inspect_no_turn: string;
     traj_kind_user: string;
-    traj_kind_think: string;
     traj_kind_plan: string;
     traj_kind_memory: string;
     traj_kind_tool: string;
@@ -1172,7 +1167,6 @@ export interface TranslationKeys {
     traj_kind_approval: string;
     traj_kind_guard: string;
     traj_kind_gap: string;
-    traj_llm_call: string;
     traj_status_running: string;
     traj_status_ok: string;
     traj_status_error: string;
@@ -1243,22 +1237,7 @@ export interface TranslationKeys {
     footer_tokens: string;
     footer_steps: string;
     footer_export: string;
-    lane_user: string;
-    lane_mode_sequence: string;
-    lane_mode_duration: string;
-    lane_tip_hint: string;
-    lane_tip_range: string;
-    traj_col_idx: string;
-    traj_col_kind: string;
-    traj_col_summary: string;
-    traj_col_in: string;
-    traj_col_out: string;
-    traj_col_think: string;
-    traj_col_duration: string;
-    traj_filter: string;
-    traj_filter_clear: string;
     inspect_run_detail: string;
-    traj_list_label: string;
     toolbar_duration: string;
     toolbar_duration_title_on: string;
     toolbar_duration_title_off: string;
@@ -1315,6 +1294,10 @@ export interface TranslationKeys {
     detail_resize: string;
     detail_placeholder: string;
     trajectory_empty: string;
+    view_chat: string;
+    view_trajectory: string;
+    view_workspace: string;
+    view_aria: string;
   };
   playground: {
     session_label: string;
@@ -4393,12 +4376,7 @@ const en: TranslationKeys = {
     vars_required_mark: "required",
     composer_hint: "Enter to send, Shift+Enter for a new line",
     stats_partial: "(loaded turns only)",
-    inspect_trajectory: "Trajectory",
-    inspect_workspace: "Workspace",
-    inspect_turn_header: "Turn {{n}} · {{status}}",
-    inspect_no_turn: "Pick a turn to inspect",
     traj_kind_user: "USER",
-    traj_kind_think: "THINK",
     traj_kind_plan: "PLAN",
     traj_kind_memory: "MEMORY",
     traj_kind_tool: "TOOL",
@@ -4411,7 +4389,6 @@ const en: TranslationKeys = {
     traj_kind_approval: "APPROVAL",
     traj_kind_guard: "GUARD",
     traj_kind_gap: "GAP",
-    traj_llm_call: "LLM call · {{model}}",
     traj_status_running: "running",
     traj_status_ok: "done",
     traj_status_error: "failed",
@@ -4482,22 +4459,7 @@ const en: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
     footer_export: "Export",
-    lane_user: "User",
-    lane_mode_sequence: "Sequence",
-    lane_mode_duration: "Duration",
-    lane_tip_hint: "Click to select · drag to filter · double-click to reset",
-    lane_tip_range: "{{start}} → {{end}} · {{d}}",
-    traj_col_idx: "#",
-    traj_col_kind: "Kind",
-    traj_col_summary: "Summary",
-    traj_col_in: "In",
-    traj_col_out: "Out",
-    traj_col_think: "Think",
-    traj_col_duration: "Time",
-    traj_filter: "Filtered #{{a}}–#{{b}} ({{n}} rows)",
-    traj_filter_clear: "Clear filter",
     inspect_run_detail: "Run detail",
-    traj_list_label: "Trajectory rows",
     toolbar_duration: "Duration",
     toolbar_duration_title_on: "Use equal widths",
     toolbar_duration_title_off: "Use recorded durations",
@@ -4554,6 +4516,10 @@ const en: TranslationKeys = {
     detail_resize: "Drag to resize; double-click to reset",
     detail_placeholder: "Turn not replayed yet; text fallback only",
     trajectory_empty: "No trajectory yet",
+    view_chat: "Chat",
+    view_trajectory: "Trajectory",
+    view_workspace: "Workspace",
+    view_aria: "View",
   },
   playground: {
     session_label: "Session",
