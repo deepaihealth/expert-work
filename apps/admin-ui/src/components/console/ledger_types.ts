@@ -28,7 +28,9 @@ export interface LedgerRecord {
   requestNo: number | null;
   /** 所属请求号:assistant 自己;同步的 tool / plan / subagent 取父 assistant 的;其余 null。 */
   ownerRequestNo: number | null;
-  /** tool / plan → 同步 assistant 记录 id;subagent → 父 tool 记录 id;其余 null。 */
+  /** tool / plan → 同步 assistant 记录 id;subagent → 父 tool 记录 id;
+   *  reflect / memory 写回 → 同轮之前最近的 assistant 记录 id(仅供详情层级
+   *  链接,折叠不把它们当子调用);其余 null。 */
   parentId: string | null;
   /** = `row.kind`(方便时间轴 / 搜索 / 样式直接读;think 永不出现)。 */
   kind: TrajectoryRow["kind"];

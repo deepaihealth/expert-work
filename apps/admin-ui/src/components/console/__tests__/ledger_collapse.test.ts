@@ -265,4 +265,38 @@ describe("collapsibleTurnKeys / collapsibleOwnerIds", () => {
     // a1 owns no children; a2 owns the tool call.
     expect(collapsibleOwnerIds(ledger)).toEqual(["a2"]);
   });
+
+  // 终审 M13 让 reflect / memory 写回也带 parentId(详情层级链接用);它们不是
+  // 调用,不能因此变成可折叠的子记录,折叠调用时也必须留在外面。
+  it("reflect / memory-writeback carrying a parentId are not collapse children", () => {
+    const user = rec({ id: "u1", index: 0, turnKey: "t1", kind: "user" });
+    const assistant = rec({ id: "a1", index: 1, turnKey: "t1", kind: "assistant" });
+    const reflect = rec({ id: "rf1", index: 2, turnKey: "t1", kind: "reflect", parentId: "a1" });
+    const memory = rec({ id: "m1", index: 3, turnKey: "t1", kind: "memory", parentId: "a1" });
+    const assistant2 = rec({ id: "a2", index: 4, turnKey: "t1", kind: "assistant" });
+    const tool = rec({
+      id: "tool1", index: 5, turnKey: "t1", kind: "tool", parentId: "a2",
+      row: { kind: "tool", entry: { toolName: "bash", server: null } } as LedgerRecord["row"],
+    });
+    const reflect2 = rec({ id: "rf2", index: 6, turnKey: "t1", kind: "reflect", parentId: "a2" });
+    const ledger = ledgerOf(
+      [user, assistant, reflect, memory, assistant2, tool, reflect2],
+      [turn({ key: "t1", lastIndex: 6 })],
+    );
+
+    // a1 only has after-products → not collapsible; a2 has a real tool call.
+    expect(collapsibleOwnerIds(ledger)).toEqual(["a2"]);
+
+    const rows = displayRowsOf(ledger, {
+      collapsedTurns: new Set(),
+      collapsedOwners: new Set(["a2"]),
+      matches: null,
+    });
+    // The tool folds into a2's calls-summary; both reflects and the memory row stay visible.
+    expect(rows.map((r) => (r.kind === "record" ? r.record.id : r.kind))).toEqual([
+      "u1", "a1", "rf1", "m1", "a2", "calls-summary", "rf2",
+    ]);
+    const summary = rows.find((r) => r.kind === "calls-summary");
+    expect(summary).toMatchObject({ count: 1, toolBreakdown: "bash ×1" });
+  });
 });

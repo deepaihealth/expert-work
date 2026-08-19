@@ -292,17 +292,26 @@ describe("RecordDetails", () => {
   });
 
   // 终审 I4 —— REFLECT 标签是文字色,钉死的 `--ew-color-accent-600`(#9333ea)
-  // 在深色底上对比度不够;换成随主题走的语义令牌。
-  it("REFLECT 用随主题走的 --ew-accent-violet-dim,两个主题块都定义了它", () => {
+  // 在深色底上对比度不够;换成随主题走的语义令牌。同一令牌也铺时间轴的
+  // REFLECT 块,所以它在两个主题里都必须与 ASSISTANT 的 `--ew-accent-violet`
+  // 错开一档,否则同泳道的两类块分不出来。
+  it("REFLECT 用随主题走的 --ew-accent-reflect,两个主题里都与 --ew-accent-violet 错开", () => {
     const tags = readFileSync("src/components/console/kind_tag.css", "utf8");
     expect(/\.ew-kt--reflect \{([^}]*)\}/.exec(tags)?.[1] ?? "")
-      .toContain("var(--ew-accent-violet-dim)");
+      .toContain("var(--ew-accent-reflect)");
+    const timeline = readFileSync("src/components/console/trajectory_timeline.css", "utf8");
+    expect(/\.ew-traj-tl__block\[data-kind="reflect"\] \{([^}]*)\}/.exec(timeline)?.[1] ?? "")
+      .toContain("var(--ew-accent-reflect)");
 
     const tokens = readFileSync("src/theme/tokens.css", "utf8");
     const dark = /html\[data-theme="dark"\] \{([\s\S]*?)\n\}/.exec(tokens)?.[1] ?? "";
     const light = /html\[data-theme="light"\] \{([\s\S]*?)\n\}/.exec(tokens)?.[1] ?? "";
-    expect(dark).toContain("--ew-accent-violet-dim: var(--ew-color-accent-300)");
-    expect(light).toContain("--ew-accent-violet-dim: var(--ew-color-accent-600)");
+    const valueOf = (block: string, name: string): string =>
+      new RegExp(`${name}:\\s*var\\((--ew-color-accent-\\d+)\\)`).exec(block)?.[1] ?? "";
+    expect(valueOf(dark, "--ew-accent-reflect")).toBe("--ew-color-accent-300");
+    expect(valueOf(light, "--ew-accent-reflect")).toBe("--ew-color-accent-700");
+    expect(valueOf(dark, "--ew-accent-reflect")).not.toBe(valueOf(dark, "--ew-accent-violet"));
+    expect(valueOf(light, "--ew-accent-reflect")).not.toBe(valueOf(light, "--ew-accent-violet"));
   });
 
   it("层级:assistant + ownerRequest → 「请求 #N ›」抛 onOpenRequest", async () => {

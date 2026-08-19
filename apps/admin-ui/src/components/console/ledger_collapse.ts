@@ -44,9 +44,14 @@ function childLabel(record: LedgerRecord): string | null {
 
 /** ``owner``'s tool/plan children (``parentId === owner.id``) plus any
  *  subagent whose parent tool belongs to ``owner`` (one hop through the
- *  tool's own ``parentId``). */
+ *  tool's own ``parentId``). Only those kinds — reflect / memory-writeback
+ *  records also carry a ``parentId`` (details-panel hierarchy link), but they
+ *  are the step's after-products, not calls, and stay visible when the owner's
+ *  calls are collapsed. */
 function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRecord[] {
-  const direct = records.filter((r) => r.parentId === ownerId);
+  const direct = records.filter(
+    (r) => r.parentId === ownerId && (r.kind === "tool" || r.kind === "plan"),
+  );
   if (direct.length === 0) return direct;
   const directIds = new Set(direct.map((r) => r.id));
   const transitive = records.filter(
