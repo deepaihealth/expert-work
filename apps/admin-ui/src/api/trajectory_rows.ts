@@ -20,7 +20,7 @@ import type { WorkerTimeline } from "./worker_timeline";
 export type RowStatus = "running" | "ok" | "error" | "warn" | "pause";
 
 interface RowBase {
-  /** 轮内稳定 id:`${kind}:${seq}[:${toolIdx}[:${workerIdx}]]`;中栏与右栏同一套,右栏行集 ⊇ 中栏(中栏「检查」按 id 定位右栏行)。user / assistant 行 id 固定 `"user"` / `"assistant"`。 */
+  /** 轮内稳定 id:`${kind}:${seq}[:${toolIdx}[:${workerIdx}]]`;中栏与右栏同一套,右栏行集 ⊇ 中栏(中栏「检查」按 id 定位右栏行)。user / assistant / system 行 id 固定 `"user"` / `"assistant"` / `"system"`。 */
   id: string;
   /** 来源 `TimelineItem.seq`;user / assistant 行为 -1。 */
   seq: number;

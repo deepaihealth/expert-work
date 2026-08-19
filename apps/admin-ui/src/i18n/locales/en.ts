@@ -1288,6 +1288,7 @@ export interface TranslationKeys {
     view_trajectory: string;
     view_workspace: string;
     view_aria: string;
+    traj_kind_system: string;
   };
   playground: {
     session_label: string;
@@ -4500,6 +4501,7 @@ const en: TranslationKeys = {
     view_trajectory: "Trajectory",
     view_workspace: "Workspace",
     view_aria: "View",
+    traj_kind_system: "SYSTEM",
   },
   playground: {
     session_label: "Session",

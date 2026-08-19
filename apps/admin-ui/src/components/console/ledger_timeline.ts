@@ -24,6 +24,9 @@ export interface TimelineSpanInput {
   turnStart: boolean;
   startedAt: number | null;
   endedAt: number | null;
+  /** ASSISTANT 记录的首 token 绝对时刻(`LedgerRecord.firstTokenAt`);其它 /
+   *  缺数据 null。 */
+  firstTokenAt: number | null;
 }
 
 export interface TimelineSpan extends TimeRange {
@@ -32,6 +35,8 @@ export interface TimelineSpan extends TimeRange {
   kind: TrajectoryRow["kind"];
   isError: boolean;
   running: boolean;
+  /** 首 token 在块内的比例 0–1;缺数据 / 零时长 null。 */
+  ttft: number | null;
 }
 
 export interface TimelineModel extends TimeRange {
@@ -48,8 +53,21 @@ const MINIMUM_ZOOM_DURATION = 20;
 const WHEEL_ZOOM_FACTOR = 0.0015;
 const FULL_VIEW_THRESHOLD = 0.999;
 
+/** 首 token 在原始(未压缩)绝对时长里的比例 —— 与顺序 / 时长两种布局无关,
+ *  用的是记录自己的 `startedAt`/`endedAt`/`firstTokenAt`,不是 `spanOf` 传入的
+ *  布局坐标。 */
+function ttftOf(r: TimelineSpanInput): number | null {
+  if (r.firstTokenAt === null || r.startedAt === null || r.endedAt === null) return null;
+  const d = r.endedAt - r.startedAt;
+  if (d <= 0) return null;
+  return Math.min(1, Math.max(0, (r.firstTokenAt - r.startedAt) / d));
+}
+
 function spanOf(record: TimelineSpanInput, start: number, end: number): TimelineSpan {
-  return { index: record.index, lane: record.lane, kind: record.kind, isError: record.isError, running: record.running, start, end };
+  return {
+    index: record.index, lane: record.lane, kind: record.kind, isError: record.isError, running: record.running,
+    start, end, ttft: ttftOf(record),
+  };
 }
 
 /** 顺序排布:`spans[i] = [i, i+1)`;边界取每个 `turnStart` 记录的位置 i。 */

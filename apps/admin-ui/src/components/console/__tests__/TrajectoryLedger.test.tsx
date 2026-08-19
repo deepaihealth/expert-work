@@ -9,7 +9,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 
 import i18n from "../../../i18n";
 import type {
-  AssistantRow, MemoryRow, ReflectRow, SubagentRow, ToolRow, TrajectoryRow, UserRow,
+  AssistantRow, MemoryRow, ReflectRow, SubagentRow, SystemRow, ToolRow, TrajectoryRow, UserRow,
 } from "../../../api/trajectory_rows";
 import type { DisplayRow } from "../ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
@@ -40,7 +40,7 @@ function rec(over: Partial<LedgerRecord> & Pick<LedgerRecord, "id" | "index" | "
     turnKey: "t1", turnSeq: 0, runId: "run-1", turnStart: false, turnEnd: false,
     requestNo: null, ownerRequestNo: null, parentId: null, lane: 1, isError: false,
     running: false, startedAt: null, endedAt: null, text: "", resultText: null,
-    events: [], placeholder: null, ...over,
+    events: [], placeholder: null, firstTokenAt: null, ...over,
   };
 }
 function request(over: Partial<LedgerRequest> & Pick<LedgerRequest, "no" | "recordId">): LedgerRequest {
@@ -48,7 +48,7 @@ function request(over: Partial<LedgerRequest> & Pick<LedgerRequest, "no" | "reco
     turnKey: "t1", turnSeq: 0, step: 1, status: "ok", model: "glm-5.2", finishReason: "stop",
     usage: { input: 10, output: 4, reasoning: 0, cacheRead: 0 },
     cumulative: { input: 10, output: 4 }, toolCalls: 1,
-    startedAt: null, endedAt: null, durationMs: 120, ...over,
+    startedAt: null, endedAt: null, durationMs: 120, firstTokenMs: null, ...over,
   };
 }
 
@@ -242,6 +242,31 @@ describe("TrajectoryLedger", () => {
     onToggleTurn.mockClear();
     onToggleOwner.mockClear();
     fireEvent.doubleClick(rows[5]);
+    expect(onToggleTurn).not.toHaveBeenCalled();
+    expect(onToggleOwner).not.toHaveBeenCalled();
+  });
+
+  // PR-A.3 §十.1 —— SYSTEM 行是上下文行(与 USER 同档),不算进「这一轮有几条
+  // 值得折的记录」。轮里只有 SYSTEM + USER + 一条 assistant(唯一的非上下文
+  // 记录只有 1 条,不到 2 条门槛)—— 双击 SYSTEM 行不该折;若 SYSTEM 被错当成
+  // 非上下文记录计数,门槛会被凑到 2 而误折。
+  it("双击 SYSTEM 行落点同 USER —— SYSTEM 不计入非上下文记录数,不够 2 条就不折", () => {
+    const onToggleTurn = vi.fn();
+    const onToggleOwner = vi.fn();
+    const systemRow: SystemRow = {
+      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, text: "你是评审员",
+    };
+    const rows = recordRows([
+      rec({ id: "t3/system", index: 0, turnKey: "t3", turnSeq: 2, kind: "system", row: systemRow, lane: 0, turnStart: true, text: "你是评审员" }),
+      rec({ id: "t3/user", index: 1, turnKey: "t3", turnSeq: 2, kind: "user", row: userRow, lane: 0, text: "帮我看看目录" }),
+      rec({
+        id: "t3/assistant:1", index: 2, turnKey: "t3", turnSeq: 2, kind: "assistant",
+        row: assistantRow({ id: "assistant:1", seq: 1, step: 1 }), requestNo: 1, ownerRequestNo: 1, text: "我来查一下",
+      }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn, onToggleOwner })} />);
+    fireEvent.doubleClick(screen.getAllByTestId("console-traj-row")[0]);
     expect(onToggleTurn).not.toHaveBeenCalled();
     expect(onToggleOwner).not.toHaveBeenCalled();
   });
