@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import i18n from "../../../i18n";
-import type { AssistantRow, ToolRow, TrajectoryRow, UserRow } from "../../../api/trajectory_rows";
+import type { AssistantRow, MemoryRow, ToolRow, TrajectoryRow, UserRow } from "../../../api/trajectory_rows";
 import type { DisplayRow } from "../ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
 import { TrajectoryLedger, type TrajectoryLedgerProps } from "../TrajectoryLedger";
@@ -334,6 +334,33 @@ describe("TrajectoryLedger", () => {
     expect(cells[0]).toHaveTextContent("(仅工具调用)");
     expect(cells[0]).toHaveAttribute("title", "(仅工具调用)");
     expect(cells[1]).toHaveTextContent("我来查一下");
+  });
+
+  it("MEMORY 行正文写「召回 / 写回 N 条」,后面照常接结果", () => {
+    // 账本数据层不碰 i18n(`ledger.ts:contentOf` 给 memory 的 text 是空串),
+    // §九 要的「召回 N 条 → 首条摘要」只能在这一层拼出来。
+    const recall: MemoryRow = {
+      id: "memory:3", kind: "memory", seq: 3, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, direction: "recall", count: 3, detail: {},
+    };
+    const writeback: MemoryRow = { ...recall, id: "memory:4", seq: 4, direction: "writeback", count: 1 };
+    const rows = recordRows([
+      rec({
+        id: "t1/memory:3", index: 0, kind: "memory", row: recall, lane: 0,
+        text: "", resultText: "上次说过要订周五的票",
+      }),
+      rec({ id: "t1/memory:4", index: 1, kind: "memory", row: writeback, lane: 2, text: "", resultText: null }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows })} />);
+    const cells = screen.getAllByTestId("console-traj-content");
+
+    expect(cells[0]).toHaveTextContent("记忆召回 · 3 条");
+    expect(cells[0].querySelector(".ew-ledger__res")).toHaveTextContent("上次说过要订周五的票");
+    expect(cells[0]).toHaveAttribute("title", "记忆召回 · 3 条 → 上次说过要订周五的票");
+
+    expect(cells[1]).toHaveTextContent("记忆写回 · 1 条");
+    // MEMORY 不是工具类 —— 没结果也不该补「(无输出)」。
+    expect(cells[1].querySelector(".ew-ledger__res")).toBeNull();
   });
 
   it("未回放的轮:占位 assistant 带 data-placeholder 与状态前缀", () => {

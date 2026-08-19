@@ -41,7 +41,9 @@ interface ContentParts {
 }
 
 /** 一条记录 → 内容列的几块。正文取 `record.text`(账本层已按 spec §九 折好),
- *  工具类再按第一个空格拆成 名字 / 参数。 */
+ *  工具类再按第一个空格拆成 名字 / 参数。两处例外在这里补文案 —— 账本数据层
+ *  是纯的、不碰 i18n,所以「没文字的 ASSISTANT」和「MEMORY 的召回 / 写回 N 条」
+ *  这两句 §九 要求的正文只能在渲染层拼。 */
 export function contentPartsOf(record: LedgerRecord, t: TFunction): ContentParts {
   const prefix = record.placeholder === null
     ? null
@@ -50,11 +52,16 @@ export function contentPartsOf(record: LedgerRecord, t: TFunction): ContentParts
   const cut = named ? record.text.indexOf(" ") : -1;
   const name = !named ? null : cut === -1 ? record.text : record.text.slice(0, cut);
   const toolCallOnly = record.kind === "assistant" && record.text === "" && prefix === null;
+  // `LedgerRecord.kind` 按构造就是 `row.kind`(见 ledger_types),窄化到 `row`
+  // 上就不用 as 断言了。MEMORY 的 `text` 在账本层是空串,正文全靠这两个既有键。
+  const memory = record.row.kind === "memory" ? record.row : null;
   const body = toolCallOnly
     ? t("console.ledger_tool_call_only")
-    : named
-      ? cut === -1 ? "" : record.text.slice(cut + 1)
-      : record.text;
+    : memory !== null
+      ? t(memory.direction === "recall" ? "console.row_memory_recall" : "console.row_memory_writeback", { n: memory.count })
+      : named
+        ? cut === -1 ? "" : record.text.slice(cut + 1)
+        : record.text;
   // 结果没到:已结束的工具类写「(无输出)」,还在跑的留空 —— 跑到一半的调用
   // 本来就还没有输出,写「无输出」是在报一个假结论。
   const result = record.resultText !== null
