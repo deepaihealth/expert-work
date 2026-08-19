@@ -35,7 +35,12 @@ export interface TurnBlockProps {
   turn: ConsoleTurn;
   threadId: string | null;
   selected: boolean;
+  /** 点卡片空白处:**只**把这一轮设成高亮轮,不换视图、不开详情。 */
   onSelect: (key: string) => void;
+  /** 脚注「查看轨迹」→ 父级切到「轨迹」视图并选中该轮最后一条 ASSISTANT 记录。
+   *  与 `onSelect` 分开的理由:点卡片空白是个极容易误触的大靶子,不该把读者
+   *  传送到另一个视图去(PR-A.2 Task 11 修复轮 2)。 */
+  onInspect: (key: string) => void;
   /** 紧凑行「轨迹」→ 父级切到「轨迹」视图并选中该行对应的账本记录
    *  (PR-A.2 Task 11 接 `TrajectoryView.focusRequest`)。 */
   onInspectRow: (turnKey: string, rowId: string) => void;
@@ -101,6 +106,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     threadId,
     selected,
     onSelect,
+    onInspect,
     onInspectRow,
     liveByStep,
     rate,
@@ -218,7 +224,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         onRetry={onRetry}
         onExport={onExport}
         exporting={exporting}
-        onInspect={() => onSelect(turn.key)}
+        onInspect={() => onInspect(turn.key)}
       />
     </div>
   );

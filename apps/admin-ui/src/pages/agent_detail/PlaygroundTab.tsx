@@ -87,9 +87,16 @@ const VIEW_PANE_HIDDEN_STYLE: React.CSSProperties = { display: "none" };
 /** 中栏三视图。会话级内存态:切会话 / 换 agent 回「对话」(spec §九「壳」)。 */
 type ConsoleView = "chat" | "trajectory" | "workspace";
 
-/** 三个视图**常驻挂载**,切 tab 只切显隐 —— 卸载会丢掉轨迹的选中 / 选区 /
- *  搜索 / 折叠与账本视口,也会丢掉对话的滚动位置与历史行的 IntersectionObserver
- *  注册(还会让常驻的 `focusRequest` 在重挂时把读者弹回旧记录)。 */
+/** 视图容器:**首次激活才挂载,之后常驻**(只切显隐)。
+ *
+ *  - 为什么激活过就不卸载:卸载会丢掉 React 状态 —— 轨迹的选中记录 / 时间轴
+ *    选区 / 搜索词 / 折叠集 / 缩放视口,还会让常驻的 `focusRequest` 在重挂时
+ *    重新受理一遍,把读者弹回当初那条记录。(**注意**:`display:none` 保不住
+ *    滚动偏移 —— 浏览器在元素不可见时会把 `scrollTop` 归零,所以「回到原处
+ *    接着看」这件事这里并不成立,能保住的是上面那些 React 状态。)
+ *  - 为什么不一上来就全挂:`WorkspacePanel` 一挂就打 `GET /workspace`,
+ *    `TrajectoryView` 一挂就把加载窗口内的 pending 历史 run 全部回放(最多
+ *    20 轮)—— 读者可能整场都待在对话视图,这些都是白发的请求(修复轮 2)。 */
 function ViewPane({
   view,
   active,
@@ -101,6 +108,11 @@ function ViewPane({
   scroll?: boolean;
   children: React.ReactNode;
 }): React.ReactElement {
+  // 单调闩:`active` 翻 true 本身就是一次重渲染,所以这里读到的一定是最新值,
+  // 不需要额外的 state / effect(重复置 true 幂等,StrictMode 双跑也无副作用)。
+  const seen = useRef(active);
+  if (active) seen.current = true;
+
   return (
     <div
       data-testid={`console-view-pane-${view}`}
@@ -111,7 +123,7 @@ function ViewPane({
         active ? (scroll ? VIEW_PANE_SCROLL_STYLE : VIEW_PANE_STYLE) : VIEW_PANE_HIDDEN_STYLE
       }
     >
-      {children}
+      {seen.current ? children : null}
     </div>
   );
 }
@@ -488,7 +500,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // §九「联动」—— 脚注「查看轨迹」:切「轨迹」tab + 选中该轮**最后一条**
   // ASSISTANT 记录(``rowId: null`` 就是这个约定,由 ``use_trajectory_state``
   // 落到具体记录上)。``selectedTurnKey`` 照旧给中栏的轮高亮用。
-  const handleSelectTurn = useCallback((key: string) => {
+  // **只接脚注按钮**:点轮卡片空白处走 ``setSelectedTurnKey``(纯高亮),
+  // 否则误点一下就被传送到另一个视图(修复轮 2)。
+  const handleInspectTurn = useCallback((key: string) => {
     focusNonceRef.current += 1;
     setSelectedTurnKey(key);
     setView("trajectory");
@@ -616,7 +630,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               taskResults={taskResults}
               threadId={thread?.thread_id ?? null}
               selectedKey={selectedTurnKey}
-              onSelectTurn={handleSelectTurn}
+              onSelectTurn={setSelectedTurnKey}
+              onInspectTurn={handleInspectTurn}
               onInspectRow={handleInspectRow}
               streamTurnKey={streamTurnId}
               liveByStep={tokenStream.liveByStep}
@@ -646,6 +661,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               // 时换。这里包一层 ``new Map`` 就是每帧重建账本 / 时间轴。
               liveByStep={tokenStream.liveByStep}
               running={running}
+              // 藏起来的时候不跑秒针(不改 running 的语义,只省每秒一次的
+              // 账本 / 时间轴重建)。
+              visible={view === "trajectory"}
               isSystemAdmin={isSystemAdmin}
               focusRequest={focusRequest}
               onEnsureLoaded={handleEnsureLoaded}

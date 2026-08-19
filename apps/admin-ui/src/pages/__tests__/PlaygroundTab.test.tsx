@@ -626,27 +626,77 @@ describe("PlaygroundTab", () => {
     expect(screen.getByTestId("playground-input")).toBeInTheDocument();
   });
 
-  // 控制器修复轮 1 —— 切走的视图**留在 DOM 里**,只是 `hidden` + `aria-hidden`
-  // (卸载会丢掉轨迹的选中 / 选区 / 搜索 / 折叠和对话的滚动位置)。
-  it("switching tabs hides the other views instead of unmounting them", async () => {
+  // 修复轮 1 + 2 —— pane 的两条规矩:**首次激活才挂内容**(修复轮 2 的懒闩,
+  // 别一进页面就替读者拉工作区 / 回放历史),激活过之后**切走也不卸载**,只
+  // 是 `hidden` + `aria-hidden` + 行内 `display:none`。
+  it("mounts a view on first activation and then keeps it mounted (hidden) when switching away", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
     renderPg();
     await screen.findByTestId("playground-input");
 
-    // 对话态:三个视图的内容节点全在 DOM 里。
+    // 初始:只有对话 pane 有内容;另外两个是空壳。
     expect(screen.getByTestId("playground-transcript")).toBeInTheDocument();
-    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
-    expect(screen.getByTestId("console-view-pane-trajectory")).toHaveAttribute("hidden");
-    expect(screen.getByTestId("console-view-pane-chat")).not.toHaveAttribute("hidden");
+    expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("console-view-pane-trajectory")).toBeEmptyDOMElement();
+    expect(screen.getByTestId("console-view-pane-workspace")).toBeEmptyDOMElement();
+    expect(getWorkspaceMock).not.toHaveBeenCalled();
 
     await user.click(screen.getByTestId("console-view-tab-trajectory"));
-    // 切走的是对话,轨迹成了当前 pane —— 两边都还在 DOM 里。
-    expect(screen.getByTestId("console-view-pane-trajectory")).not.toHaveAttribute("hidden");
-    expect(screen.getByTestId("console-view-pane-chat")).toHaveAttribute("hidden");
+    // 首次激活 → 挂上;对话切走了但没卸载。
+    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
     expect(screen.getByTestId("playground-transcript")).toBeInTheDocument();
+    expect(screen.getByTestId("console-view-pane-chat")).toHaveAttribute("hidden");
     // `hidden` 属性会被行内 `display:flex` 盖掉,所以隐藏态必须显式写 display:none。
     expect(screen.getByTestId("console-view-pane-chat")).toHaveStyle({ display: "none" });
+    // 工作区还是没碰过 —— 懒闩是**每个 pane 各自**的。
+    expect(screen.getByTestId("console-view-pane-workspace")).toBeEmptyDOMElement();
+    expect(getWorkspaceMock).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTestId("console-view-tab-chat"));
+    // 切回对话:轨迹留在 DOM 里(hidden),不是卸载重挂。
+    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("console-view-pane-trajectory")).toHaveAttribute("hidden");
+    expect(screen.getByTestId("console-view-pane-trajectory")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+  });
+
+  // 修复轮 2 —— 轮卡片空白处是个大靶子:只换高亮轮,**不**把读者传送到轨迹视图
+  // (`onSelect` 与脚注的 `onInspect` 已经拆开)。
+  it("clicking a turn card's background only highlights it; the footer's 查看轨迹 switches views", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        { id: "m", event: "metadata", data: { run_id: "run-hi" }, rawData: "", receivedAt: "t1" },
+        {
+          id: "u",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "答案" }] } },
+          rawData: "",
+          receivedAt: "t2",
+        },
+        { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "t3" },
+      ]),
+    );
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "q");
+    await user.click(screen.getByTestId("playground-run"));
+    await findInTranscript("答案");
+
+    const card = screen.getAllByTestId("console-turn")[0];
+    await user.click(card);
+    // 还在对话视图,只是这一轮高亮了。
+    expectActiveView("chat");
+    expect(card).toHaveAttribute("data-selected", "true");
+    expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
+
+    await user.click(within(card).getByTestId("console-turn-inspect"));
+    expectActiveView("trajectory");
+    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
   });
 
   it("shows a stream-failure alert when streamRun throws", async () => {
@@ -1163,9 +1213,9 @@ describe("PlaygroundTab", () => {
   it("loads the workspace inspector without a thread (user-scoped)", async () => {
     // The whole point of the user-scoped route: the panel shows the current
     // user's workspace with no session bound — so it survives session
-    // deletion. No establishThread() here. (The panel only mounts on its own
-    // tab — the middle column keeps the inactive views unmounted — so the
-    // switch is the trigger, not the page mount.)
+    // deletion. No establishThread() here. (工作区 pane 有懒闩:首次激活前
+    // 一个子节点都不渲染 —— 所以**切 tab 才是触发点**,不是页面挂载。
+    // 修复轮 2 让这条重新成立,并在点击前显式钉一句「还没发过请求」。)
     const user = userEvent.setup();
     getWorkspaceMock.mockResolvedValue({
       workspace: {
@@ -1185,6 +1235,8 @@ describe("PlaygroundTab", () => {
     getWorkspaceFilesMock.mockResolvedValue([{ path: "out.txt", size: 11 }]);
     renderPg();
     await screen.findByTestId("playground-input");
+    // 页面挂载本身不碰工作区。
+    expect(getWorkspaceMock).not.toHaveBeenCalled();
     await user.click(screen.getByTestId("console-view-tab-workspace"));
 
     const panel = await screen.findByTestId("playground-workspace");
@@ -1540,8 +1592,10 @@ describe("PlaygroundTab", () => {
       await waitFor(() => expect(selectedLedgerRow()).toHaveTextContent("第二轮答案"));
     });
 
-    // 控制器修复轮 1 —— 视图常驻的意义:切到对话再切回轨迹,之前点选的记录
-    // 还选着(卸载重挂会既丢选中,又因为常驻的 focusRequest 把读者弹回旧记录)。
+    // 修复轮 1 —— 激活过的视图不卸载,保住的是**React 状态**:选中记录 / 时间轴
+    // 选区 / 搜索词 / 折叠集 / 缩放视口。(保不住滚动偏移 —— `display:none` 期间
+    // 浏览器会把 `scrollTop` 归零,这条测试也不去断言滚动位置。)卸载重挂则
+    // 既丢选中,又会让常驻的 focusRequest 被重新受理,把读者弹回当初那条记录。
     it("keeps the trajectory's selection when switching to 对话 and back", async () => {
       const user = userEvent.setup();
       await runTwoTurns(user);
@@ -1554,7 +1608,7 @@ describe("PlaygroundTab", () => {
       expect(picked).toBeDefined();
 
       await user.click(screen.getByTestId("console-view-tab-chat"));
-      // 轨迹整棵树留在 DOM 里(只是 hidden),选中态跟着留下。
+      // 轨迹整棵树留在 DOM 里(只是 hidden),选中这个 React 状态跟着留下。
       expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
       expect(screen.getByTestId("console-view-pane-trajectory")).toHaveAttribute("hidden");
       expect(selectedLedgerRow().dataset.recordId).toBe(picked);

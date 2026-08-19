@@ -51,6 +51,10 @@ export interface TrajectoryStateArgs {
   streamTurnKey: string | null;
   liveByStep: ReadonlyMap<number, LiveStep>;
   running: boolean;
+  /** 视图当前是否可见。**只**门控「运行中每秒推一次『现在』」那个 `setInterval`
+   *  —— `running` 的语义一个字不动(尾块该不该长、账本该不该跟随都还看它),
+   *  隐藏时纯粹省掉那份每秒重建账本 / 时间轴的开销;重新可见时下一拍就补上。 */
+  visible: boolean;
   focusRequest: FocusRequest | null;
   onEnsureLoaded: (runIds: readonly string[]) => Promise<void>;
 }
@@ -115,7 +119,9 @@ function toggled(set: ReadonlySet<string>, key: string): ReadonlySet<string> {
 }
 
 export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
-  const { turns, threadId, streamTurnKey, liveByStep, running, focusRequest, onEnsureLoaded } = args;
+  const {
+    turns, threadId, streamTurnKey, liveByStep, running, visible, focusRequest, onEnsureLoaded,
+  } = args;
 
   const [mode, setMode] = useState<TimelineMode>(storedLaneMode);
   const [range, setRange] = useState<TimeRange | null>(null);
@@ -157,12 +163,12 @@ export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
     handledNonceRef.current = null;
   }, [threadId]);
 
-  // 运行中每秒推一次「现在」,让尾块跟着长。
+  // 运行中每秒推一次「现在」,让尾块跟着长;视图看不见时不跑(见 `visible`)。
   useEffect(() => {
-    if (!running) return;
+    if (!running || !visible) return;
     const timer = setInterval(() => setNowTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
-  }, [running]);
+  }, [running, visible]);
 
   const latestEvents = turns.length > 0 ? turns[turns.length - 1].turn.events : EMPTY_EVENTS;
   // 服务端时钟校准过的「现在」:客户端与服务端有时钟差,直接拿 `Date.now()`
