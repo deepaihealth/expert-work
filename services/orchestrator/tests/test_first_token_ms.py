@@ -41,8 +41,8 @@ class _SlowFirstTokenLLM:
 
 
 async def _first_ai_additional_kwargs(llm: Any, *, with_sink: bool) -> dict[str, Any]:
-    async def capture(frame: dict[str, Any]) -> None:
-        del frame
+    async def capture(_frame: dict[str, Any]) -> None:
+        return None
 
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
