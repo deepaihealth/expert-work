@@ -1334,6 +1334,13 @@ const zhCN: TranslationKeys = {
     toolbar_search: "搜索",
     toolbar_search_count: "{{n}} 条匹配",
     toolbar_aria: "轨迹工具条",
+    timeline_aria: "轨迹时间轴",
+    timeline_track_aria: "时间轴总览;横向拖动聚焦记录",
+    timeline_empty: "没有时序数据",
+    timeline_load_earlier: "加载更早的历史",
+    timeline_loading_earlier: "正在加载更早的历史…",
+    timeline_tip_total: "总计 {{d}}",
+    timeline_tip_started: "开始于 {{t}}",
   },
   playground: {
     session_label: "会话",

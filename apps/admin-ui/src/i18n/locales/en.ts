@@ -1272,6 +1272,13 @@ export interface TranslationKeys {
     toolbar_search: string;
     toolbar_search_count: string;
     toolbar_aria: string;
+    timeline_aria: string;
+    timeline_track_aria: string;
+    timeline_empty: string;
+    timeline_load_earlier: string;
+    timeline_loading_earlier: string;
+    timeline_tip_total: string;
+    timeline_tip_started: string;
   };
   playground: {
     session_label: string;
@@ -4468,6 +4475,13 @@ const en: TranslationKeys = {
     toolbar_search: "Search",
     toolbar_search_count: "{{n}} matches",
     toolbar_aria: "Trajectory toolbar",
+    timeline_aria: "Trajectory timeline",
+    timeline_track_aria: "Timeline overview; drag horizontally to focus events",
+    timeline_empty: "No timing data",
+    timeline_load_earlier: "Load earlier history",
+    timeline_loading_earlier: "Loading earlier history…",
+    timeline_tip_total: "Total {{d}}",
+    timeline_tip_started: "Started {{t}}",
   },
   playground: {
     session_label: "Session",
