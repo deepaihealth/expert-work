@@ -1,20 +1,24 @@
 /**
- * Composer — the input box + send/attach/stop controls, lifted verbatim out
+ * Composer — the input box + run/attach/stop controls, lifted verbatim out
  * of ``PlaygroundTab.tsx`` (调试台重设计 PR-A Task 7; see ``playground-input``
  * / ``playground-run`` / ``playground-attach`` / ``playground-attach-doc`` /
  * ``playground-stop`` testids there).
  *
- * NEW behaviour (ruling R5): Enter sends, Shift+Enter inserts a newline
- * (default textarea behaviour — left alone), and Enter during IME
- * composition (``nativeEvent.isComposing``) is ignored so committing a CJK
- * candidate with Enter doesn't fire a send.
+ * NEW (ruling R5): Enter sends, Shift+Enter inserts a newline (default
+ * textarea behaviour — left alone), and Enter during IME composition
+ * (``nativeEvent.isComposing``) is ignored so committing a CJK candidate
+ * with Enter doesn't fire a send.
+ *
+ * NEW (spec §八.5, PR-A.1 Task 4): the run button is replaced in place by a
+ * danger stop button while running — same toolbar slot, never both at once
+ * — and the char-count + hint text moves onto that toolbar row's right end.
  *
  * ``readOnly`` is a plain prop from the parent — this component does not
  * read ``useIsTenantSwitched`` itself.
  */
 import type { JSX, KeyboardEvent } from "react";
-import { Button, Input, Space, Tooltip, Typography } from "antd";
-import { FileText, ImagePlus, Play, Send, Square } from "lucide-react";
+import { Button, Input, Tooltip, Typography } from "antd";
+import { FileText, ImagePlus, Send, Square } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ReadonlyTooltip } from "../ReadonlyTooltip";
@@ -68,19 +72,12 @@ export function Composer({
   const sendButton = (
     <Button
       type="primary"
-      icon={
-        running ? (
-          <Play size={14} strokeWidth={1.75} />
-        ) : (
-          <Send size={14} strokeWidth={1.75} />
-        )
-      }
+      icon={<Send size={14} strokeWidth={1.75} />}
       onClick={onSend}
-      loading={running}
       disabled={sendDisabled}
       data-testid="playground-run"
     >
-      {running ? t("playground.running") : t("playground.run")}
+      {t("playground.run")}
     </Button>
   );
 
@@ -97,6 +94,21 @@ export function Composer({
       sendButton
     );
 
+  // §八.5 — same toolbar slot renders either the run button or, while
+  // running, a danger stop button; never both.
+  const runSlot = running ? (
+    <Button
+      danger
+      icon={<Square size={14} strokeWidth={1.75} />}
+      onClick={onStop}
+      data-testid="playground-stop"
+    >
+      {t("playground.stop")}
+    </Button>
+  ) : (
+    <ReadonlyTooltip on={readOnly}>{sendButtonWithMissingTooltip}</ReadonlyTooltip>
+  );
+
   return (
     <>
       <TextArea
@@ -104,17 +116,13 @@ export function Composer({
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder={t("playground.input_placeholder")}
-        autoSize={{ minRows: 3, maxRows: 12 }}
+        autoSize={{ minRows: 2, maxRows: 8 }}
         disabled={running || readOnly}
         maxLength={maxLength}
-        showCount
         data-testid="playground-input"
       />
-      <Text type="secondary" style={{ fontSize: 12 }}>
-        {t("console.composer_hint")}
-      </Text>
-      <Space size={8}>
-        <ReadonlyTooltip on={readOnly}>{sendButtonWithMissingTooltip}</ReadonlyTooltip>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {runSlot}
         <ReadonlyTooltip on={readOnly}>
           <Button
             icon={<ImagePlus size={14} strokeWidth={1.75} />}
@@ -137,17 +145,14 @@ export function Composer({
             {uploading ? t("playground.uploading") : t("playground.attach_document")}
           </Button>
         </ReadonlyTooltip>
-        {running && (
-          <Button
-            danger
-            icon={<Square size={14} strokeWidth={1.75} />}
-            onClick={onStop}
-            data-testid="playground-stop"
-          >
-            {t("playground.stop")}
-          </Button>
-        )}
-      </Space>
+        <Text
+          type="secondary"
+          style={{ marginLeft: "auto", fontSize: 12 }}
+          data-testid="console-composer-hint"
+        >
+          {value.length} / {maxLength} · {t("console.composer_hint")}
+        </Text>
+      </div>
     </>
   );
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { parseTimeline } from "../timeline";
+import { parseTimeline, type AgentStep } from "../timeline";
 
 function ev(event: string, data: unknown, receivedAt: string): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt };
@@ -185,5 +185,31 @@ describe("parseTimeline", () => {
       upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", additional_kwargs: { reasoning_content: "r" } }], recalled_memories: [{ id: "m" }] }, "t2"),
     ]);
     expect(items.map((it) => it.eventIndex)).toEqual([0, 1, 1]);
+  });
+
+  it("agent step carries reasoning / cache-read token details (undefined when the vendor omits them)", () => {
+    const items = parseTimeline([
+      upd("agent", {
+        step_count: 1,
+        messages: [{
+          type: "ai", content: "答",
+          usage_metadata: {
+            input_tokens: 16000, output_tokens: 900, total_tokens: 16900,
+            output_token_details: { reasoning: 770 },
+            input_token_details: { cache_read: 14336 },
+          },
+        }],
+      }, "t1"),
+      upd("agent", {
+        step_count: 2,
+        messages: [{ type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 } }],
+      }, "t2"),
+    ]);
+    const steps = items.filter((i): i is AgentStep => i.kind === "agent");
+    expect(steps).toHaveLength(2);
+    expect(steps[0].reasoningTokens).toBe(770);
+    expect(steps[0].cacheReadTokens).toBe(14336);
+    expect(steps[1].reasoningTokens).toBeUndefined();
+    expect(steps[1].cacheReadTokens).toBeUndefined();
   });
 });

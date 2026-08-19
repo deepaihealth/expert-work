@@ -362,6 +362,72 @@ describe("PlaygroundTab", () => {
     expect(screen.queryByTestId("playground-stop")).not.toBeInTheDocument();
   });
 
+  // §八.2 —— 会话级状态栏搬到中栏头部下方一条细行(底部输入区那份取消);
+  // 一轮都没有 / 有轮次但一步都没跑成时整行不渲染(否则留一条空描边行)。
+  it("puts the session stats chips in a row under the main header, not in the composer", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    const frames = (stepCount: number | null) => [
+      {
+        id: "1",
+        event: "metadata",
+        data: { run_id: "r-1" },
+        rawData: "",
+        receivedAt: "2026-05-25T00:00:01Z",
+      },
+      {
+        id: "2",
+        event: "updates",
+        data: {
+          agent: {
+            messages: [{ type: "ai", content: "hi" }],
+            ...(stepCount === null ? {} : { step_count: stepCount }),
+          },
+        },
+        rawData: "",
+        receivedAt: "2026-05-25T00:00:02Z",
+      },
+      {
+        id: "3",
+        event: "end",
+        data: "ok",
+        rawData: "ok",
+        receivedAt: "2026-05-25T00:00:03Z",
+      },
+    ];
+    streamRunMock
+      .mockReturnValueOnce(makeStream(frames(null)))
+      .mockReturnValueOnce(makeStream(frames(1)));
+    renderPg();
+    await screen.findByTestId("playground-input");
+    // 一轮都没有 —— 整条行不渲染。
+    expect(screen.queryByTestId("console-stats-row")).not.toBeInTheDocument();
+
+    // 第一轮没跑出任何一步(computeSessionStats 不计这种轮):有轮块,但状态
+    // 栏仍是 null —— 容器也不能渲染,不然是条空白描边行。
+    await user.type(screen.getByTestId("playground-input"), "hello");
+    await user.click(screen.getByTestId("playground-run"));
+    await screen.findByTestId("console-turn");
+    expect(screen.queryByTestId("console-stats-row")).not.toBeInTheDocument();
+
+    // 第二轮真跑了一步 —— 这条行出现在转录区**之前**(即头部下方);输入区
+    // 在转录区之后,所以这同时钉死了「底部那份没了」。
+    await user.type(screen.getByTestId("playground-input"), "again");
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
+    });
+
+    const row = await screen.findByTestId("console-stats-row");
+    expect(within(row).getByTestId("console-stats-bar")).toBeInTheDocument();
+    expect(within(row).getByTestId("console-stat-turns")).toHaveTextContent("1");
+    expect(
+      row.compareDocumentPosition(screen.getAllByTestId("console-turn")[0]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getAllByTestId("console-stats-bar")).toHaveLength(1);
+  });
+
   it("renders an inline download for an artifact the turn registered", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
@@ -832,9 +898,12 @@ describe("PlaygroundTab", () => {
     await user.click(screen.getByTestId("playground-run"));
     await findInTranscript("second answer");
 
-    // Both turns persist (not wiped) + usage chips render per turn.
+    // Both turns persist (not wiped) + the one-line footer meta (§八.4)
+    // renders per turn with the token total.
     expect(screen.getAllByTestId("console-turn")).toHaveLength(2);
-    expect(screen.getAllByTestId("playground-usage")).toHaveLength(2);
+    const metas = screen.getAllByTestId("console-footer-meta");
+    expect(metas).toHaveLength(2);
+    for (const m of metas) expect(m).toHaveTextContent(/tok/);
     // The thread is reused across turns (multi-turn continuation).
     expect(
       streamRunMock.mock.calls.every(([tid]) => tid === sampleThread.thread_id),
@@ -904,7 +973,9 @@ describe("PlaygroundTab", () => {
     expect(listRateCardsMock).not.toHaveBeenCalled();
   });
 
-  it("shows per-turn cost + step + a run-detail link", async () => {
+  // §八.4 — 脚注一行式:cost lives in the meta tooltip;§八.6 — 「查看运行」
+  // 搬到右栏头部,这里连同断言(console-inspect-run-link)。
+  it("shows per-turn cost (tooltip) + step count in the one-line footer", async () => {
     const user = userEvent.setup();
     const costDetail: AgentDetailResponse = {
       record: {
@@ -977,12 +1048,15 @@ describe("PlaygroundTab", () => {
     await user.click(screen.getByTestId("playground-run"));
     await screen.findByTestId("console-turn");
 
-    expect(await screen.findByTestId("playground-turn-cost")).toBeInTheDocument();
-    expect(screen.getByTestId("playground-turn-meta")).toHaveTextContent("2");
-    expect(screen.getByTestId("playground-turn-run-link")).toHaveAttribute(
-      "href",
-      `/runs/${sampleThread.thread_id}/run-77`,
-    );
+    const meta = await screen.findByTestId("console-footer-meta");
+    expect(meta).toHaveTextContent(/2 步|2 steps/);
+    await user.hover(meta);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent(/≈ ¥/);
+
+    // §八.6 — 「查看运行」的新家:右栏头部(默认跟最新一轮)的 Run 详情链接。
+    const runLink = await screen.findByTestId("console-inspect-run-link");
+    expect(runLink).toHaveAttribute("href", `/runs/${sampleThread.thread_id}/run-77`);
   });
 
   // R7 — 「已恢复」提示条退役(左栏选中态已表达「你在哪个会话」);这条改钉
@@ -1389,6 +1463,10 @@ describe("PlaygroundTab", () => {
       await runTwoTurns(user);
 
       const firstTurn = screen.getAllByTestId("console-turn")[0];
+      // §八.3 — 完成后的过程条默认折叠,先展开才点得到行尾「轨迹」。
+      if (!within(firstTurn).queryByTestId("console-process-steps")) {
+        await user.click(within(firstTurn).getByTestId("console-process-head"));
+      }
       await user.click(within(firstTurn).getByTestId("console-row-inspect"));
 
       expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
@@ -1497,6 +1575,10 @@ describe("PlaygroundTab", () => {
       // the turn block's compact step rows filled in from the replayed events.
       await findInTranscript("replayed answer");
       const turn = await screen.findByTestId("console-turn");
+      // §八.3 — 完成后的过程条默认折叠,展开才看得到紧凑行。
+      if (!within(turn).queryByTestId("console-process-steps")) {
+        await user.click(within(turn).getByTestId("console-process-head"));
+      }
       expect(within(turn).getByTestId("console-row-tool")).toBeInTheDocument();
       expect(
         screen.queryByText(i18n.t("playground.history_loading")),
@@ -1842,6 +1924,10 @@ describe("PlaygroundTab", () => {
       await user.click(screen.getByTestId("playground-run"));
       // Task 19 — the middle column's compact tool row expands straight to
       // the ToolCallCard (no more Gantt row → step head → card chain).
+      // §八.3 — 运行中过程条自动展开,完成后折叠;折叠时先点头部展开。
+      if (!screen.queryByTestId("console-process-steps")) {
+        await user.click(await screen.findByTestId("console-process-head"));
+      }
       await user.click(await screen.findByTestId("console-row-tool"));
       await user.click(await screen.findByTestId("tool-fire-now"));
     }

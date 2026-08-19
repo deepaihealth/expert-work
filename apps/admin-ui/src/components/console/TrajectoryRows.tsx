@@ -8,15 +8,21 @@
  *
  * `rowSummary` is exported standalone (no React) so Task 17's RowDetail can
  * reuse the exact same one-line text for its header.
- * See .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-16-brief.md.
+ *
+ * PR-A.1 Task 6(spec §八.8):行改成七列表格(`# / 类型 / 摘要 / 入 / 出 /
+ * 思考 / 耗时`,token 三列只有 think 行填),表头 sticky,泳道拖出来的
+ * `range` 只留区间内的行并在表头上方挂一枚可清除的筛选芯片,hover 与泳道
+ * 双向联动。见
+ * .superpowers/sdd/2026-08-18-debug-console-pr-a1-feedback/task-6-brief.md。
  */
 import type { JSX, KeyboardEvent } from "react";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 
 import type { TrajectoryRow } from "../../api/trajectory_rows";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
+import { formatCompact } from "../../utils/runFormat";
 import { firstSentence } from "./text_summary";
 import "./trajectory_rows.css";
 
@@ -24,9 +30,14 @@ export interface TrajectoryRowsProps {
   /** 已含 live 合成行(父级拼)。 */
   rows: readonly TrajectoryRow[];
   selectedRowId: string | null;
+  hoveredRowId: string | null;
+  onHoverRow: (rowId: string | null) => void;
   onSelectRow: (rowId: string) => void;
   /** 该轮进行中 → 行列表自动滚到底(用户没上滚时)。 */
   running: boolean;
+  /** 泳道拖出来的行序号 **1-based 闭区间**;null = 不筛选。 */
+  range: { from: number; to: number } | null;
+  onClearRange: () => void;
 }
 
 /** Text up to (not including) the first newline. */
@@ -77,9 +88,19 @@ export function rowSummary(row: TrajectoryRow, t: TFunction): string {
 /** How close to the bottom (px) still counts as "hasn't scrolled up". */
 const AUTO_SCROLL_SLACK_PX = 80;
 
-export function TrajectoryRows({ rows, selectedRowId, onSelectRow, running }: TrajectoryRowsProps): JSX.Element {
+/** 七列(顺序即渲染顺序);列宽在 trajectory_rows.css 的 grid-template-columns。 */
+const COLUMN_KEYS = ["idx", "kind", "summary", "in", "out", "think", "duration"] as const;
+
+/** token 列:没报(`undefined`)和报了 0 都留空 —— 三列填一片 `0` 只是噪声,
+ *  「这一步没花 token」本来也不是读者要在行表里找的信息。 */
+function tokenCell(n: number | undefined): string {
+  return n === undefined || n === 0 ? "" : formatCompact(n);
+}
+
+export function TrajectoryRows(props: TrajectoryRowsProps): JSX.Element {
+  const { rows, selectedRowId, hoveredRowId, onHoverRow, onSelectRow, running, range, onClearRange } = props;
   const { t } = useTranslation();
-  const listRef = useRef<HTMLUListElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLButtonElement>(null);
   const prevRowCountRef = useRef(rows.length);
 
@@ -95,57 +116,105 @@ export function TrajectoryRows({ rows, selectedRowId, onSelectRow, running }: Tr
     const grew = rows.length > prevRowCountRef.current;
     prevRowCountRef.current = rows.length;
     if (!running || !grew) return;
-    const el = listRef.current;
+    const el = scrollRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= AUTO_SCROLL_SLACK_PX;
     if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [rows.length, running]);
 
+  // 行的 `#` 与 `data-index` 永远是**全表**里的 1-based 序号(泳道块的
+  // `rowIndex` 同源),筛选只决定哪几行渲染出来。
+  const visible = useMemo(
+    () =>
+      rows
+        .map((row, i) => ({ row, index: i + 1 }))
+        .filter(({ index }) => range === null || (index >= range.from && index <= range.to)),
+    [rows, range],
+  );
+
   const handleKeyDown = (e: KeyboardEvent<HTMLUListElement>): void => {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
-    const idx = rows.findIndex((r) => r.id === selectedRowId);
+    // 上下键只在**看得见的**行之间走 —— 筛选中跳到被隐藏的行等于卡死。
+    const idx = visible.findIndex(({ row }) => row.id === selectedRowId);
     const delta = e.key === "ArrowDown" ? 1 : -1;
-    const nextIdx = idx === -1 ? 0 : Math.min(Math.max(idx + delta, 0), rows.length - 1);
-    const next = rows[nextIdx];
-    if (next) onSelectRow(next.id);
+    const nextIdx = idx === -1 ? 0 : Math.min(Math.max(idx + delta, 0), visible.length - 1);
+    const next = visible[nextIdx];
+    if (next) onSelectRow(next.row.id);
   };
 
   return (
-    <ul
-      ref={listRef}
-      data-testid="console-traj-rows"
-      role="listbox"
-      tabIndex={0}
-      className="ew-traj-rows"
-      onKeyDown={handleKeyDown}
-    >
-      {rows.map((row) => {
-        const selected = row.id === selectedRowId;
-        return (
-          <li key={row.id} className="ew-traj-rows__item">
-            <button
-              type="button"
-              ref={selected ? selectedRef : undefined}
-              data-testid="console-traj-row"
-              data-kind={row.kind}
-              data-row-id={row.id}
-              data-status={row.status}
-              role="option"
-              aria-selected={selected}
-              className={`ew-traj-row${selected ? " ew-traj-row--selected" : ""}`}
-              onClick={() => onSelectRow(row.id)}
-            >
-              <span className="ew-traj-row__kind">
-                {t(`console.traj_kind_${row.kind}`)}
-                {row.status === "running" && <span className="ew-traj-row__pulse" aria-hidden="true" />}
-              </span>
-              <span className="ew-traj-row__summary">{rowSummary(row, t)}</span>
-              {row.durationMs !== null && <span className="ew-traj-row__duration">{fmtDuration(row.durationMs)}</span>}
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+    <div className="ew-traj-rows-wrap">
+      {range !== null && (
+        <div className="ew-traj-rows__filter" data-testid="console-traj-filter">
+          <span>{t("console.traj_filter", { a: range.from, b: range.to, n: visible.length })}</span>
+          <button
+            type="button"
+            className="ew-traj-rows__filter-clear"
+            aria-label={t("console.traj_filter_clear")}
+            data-testid="console-traj-filter-clear"
+            onClick={onClearRange}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {/* 滚动的是这一层,不是 `<ul>`:表头因此能既在 listbox **外面**(listbox
+          只该拥有 option),又跟行处在同一个滚动盒里 —— 滚动条占掉的宽度对表头
+          和行是同一份,列自然对齐,不用去猜滚动条几像素。 */}
+      <div ref={scrollRef} className="ew-traj-rows__scroll">
+        <div className="ew-traj-rows__head" data-testid="console-traj-head">
+          {COLUMN_KEYS.map((key) => (
+            <span key={key}>{t(`console.traj_col_${key}`)}</span>
+          ))}
+        </div>
+        <ul
+          data-testid="console-traj-rows"
+          role="listbox"
+          aria-label={t("console.traj_list_label")}
+          tabIndex={0}
+          className="ew-traj-rows"
+          onKeyDown={handleKeyDown}
+        >
+          {visible.map(({ row, index }) => {
+            const selected = row.id === selectedRowId;
+            const think = row.kind === "think" ? row : null;
+            return (
+              <li key={row.id} role="presentation" className="ew-traj-rows__item">
+                <button
+                  type="button"
+                  ref={selected ? selectedRef : undefined}
+                  data-testid="console-traj-row"
+                  data-kind={row.kind}
+                  data-row-id={row.id}
+                  data-status={row.status}
+                  data-index={index}
+                  data-hovered={row.id === hoveredRowId ? "true" : undefined}
+                  role="option"
+                  aria-selected={selected}
+                  className={`ew-traj-row${selected ? " ew-traj-row--selected" : ""}`}
+                  onClick={() => onSelectRow(row.id)}
+                  onMouseEnter={() => onHoverRow(row.id)}
+                  onMouseLeave={() => onHoverRow(null)}
+                >
+                  <span className="ew-traj-row__idx">{index}</span>
+                  <span className="ew-traj-row__kind">
+                    {t(`console.traj_kind_${row.kind}`)}
+                    {row.status === "running" && <span className="ew-traj-row__pulse" aria-hidden="true" />}
+                  </span>
+                  <span className="ew-traj-row__summary">{rowSummary(row, t)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.inputTokens)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.outputTokens)}</span>
+                  <span className="ew-traj-row__tok">{think === null ? "" : tokenCell(think.reasoningTokens)}</span>
+                  <span className="ew-traj-row__duration">
+                    {row.durationMs === null ? "" : fmtDuration(row.durationMs)}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </div>
   );
 }

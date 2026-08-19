@@ -11,7 +11,7 @@
 .ew-console {
   display: grid;
   grid-template-columns: 264px 1fr minmax(400px, 38%);
-  height: calc(100vh - 360px);
+  height: calc(100dvh - var(--ew-console-top, 0px) - 24px);
   min-height: 480px;
   gap: 0;
 }
@@ -47,4 +47,22 @@
   .ew-console__rail {
     display: flex;
   }
+}
+
+.ew-stat-chip {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--ew-text-tertiary);
+  background: var(--ew-surface-raised);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ew-stat-chip__v {
+  color: var(--ew-text-secondary);
+  font-weight: 500;
 }

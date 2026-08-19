@@ -46,4 +46,19 @@ describe("ConsoleShell", () => {
     // The Drawer renders the same `sidebar` node a second time.
     expect(screen.getAllByTestId("probe")).toHaveLength(2);
   });
+
+  it("writes its own top offset into --ew-console-top so the CSS can fill to the viewport bottom", () => {
+    render(
+      <ConsoleShell
+        sidebarLabel="会话"
+        sidebar={<div>s</div>}
+        main={<div>m</div>}
+        inspect={<div>i</div>}
+      />,
+    );
+    const root = screen.getByTestId("playground-tab");
+    // jsdom: getBoundingClientRect().top === 0 → "0px"; the point is that the
+    // variable is set at all (the CSS reads it), not its value.
+    expect(root.style.getPropertyValue("--ew-console-top")).toBe("0px");
+  });
 });

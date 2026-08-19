@@ -1144,7 +1144,6 @@ export interface TranslationKeys {
     row_tool_pending: string;
     row_tool_error: string;
     row_inspect: string;
-    footer_inspect: string;
     footer_status_running: string;
     footer_status_done: string;
     footer_status_error: string;
@@ -1154,13 +1153,6 @@ export interface TranslationKeys {
     vars_required_missing: string;
     vars_required_mark: string;
     composer_hint: string;
-    stats_turns: string;
-    stats_llm_tools: string;
-    stats_ttft: string;
-    stats_tps: string;
-    stats_cache: string;
-    stats_tokens: string;
-    stats_cost: string;
     stats_partial: string;
     inspect_trajectory: string;
     inspect_workspace: string;
@@ -1231,6 +1223,42 @@ export interface TranslationKeys {
     timing_unsupported: string;
     detail_action: string;
     detail_worker_summary: string;
+    stats_chip_turns: string;
+    stats_chip_steps: string;
+    stats_chip_llm: string;
+    stats_chip_tools: string;
+    stats_chip_ttft: string;
+    stats_chip_tps: string;
+    stats_chip_cache: string;
+    stats_chip_in: string;
+    stats_chip_out: string;
+    stats_chip_cost: string;
+    process_think: string;
+    process_tools: string;
+    process_other: string;
+    process_failed: string;
+    process_empty: string;
+    process_more: string;
+    footer_view_trajectory: string;
+    footer_tokens: string;
+    footer_steps: string;
+    footer_export: string;
+    lane_user: string;
+    lane_mode_sequence: string;
+    lane_mode_duration: string;
+    lane_tip_hint: string;
+    lane_tip_range: string;
+    traj_col_idx: string;
+    traj_col_kind: string;
+    traj_col_summary: string;
+    traj_col_in: string;
+    traj_col_out: string;
+    traj_col_think: string;
+    traj_col_duration: string;
+    traj_filter: string;
+    traj_filter_clear: string;
+    inspect_run_detail: string;
+    traj_list_label: string;
   };
   playground: {
     session_label: string;
@@ -4298,8 +4326,7 @@ const en: TranslationKeys = {
     row_subagent: "Sub-agent · {{name}}",
     row_tool_pending: "running",
     row_tool_error: "failed",
-    row_inspect: "Inspect",
-    footer_inspect: "Inspect",
+    row_inspect: "Trajectory",
     footer_status_running: "Running",
     footer_status_done: "Done",
     footer_status_error: "Failed",
@@ -4309,13 +4336,6 @@ const en: TranslationKeys = {
     vars_required_missing: "Required variables missing: {{names}}",
     vars_required_mark: "required",
     composer_hint: "Enter to send, Shift+Enter for a new line",
-    stats_turns: "{{turns}} turns · {{steps}} steps",
-    stats_llm_tools: "LLM {{llm}} · tools {{tools}}",
-    stats_ttft: "First token {{v}}",
-    stats_tps: "≈ {{v}} tok/s",
-    stats_cache: "Cache {{v}}%",
-    stats_tokens: "In {{in}} · out {{out}}",
-    stats_cost: "≈ ¥{{v}}",
     stats_partial: "(loaded turns only)",
     inspect_trajectory: "Trajectory",
     inspect_workspace: "Workspace",
@@ -4386,14 +4406,49 @@ const en: TranslationKeys = {
     timing_unsupported: "No span for this row",
     detail_action: "Action",
     detail_worker_summary: "{{calls}} LLM calls · {{duration}}",
+    stats_chip_turns: "Turns",
+    stats_chip_steps: "Steps",
+    stats_chip_llm: "LLM",
+    stats_chip_tools: "Tools",
+    stats_chip_ttft: "First token",
+    stats_chip_tps: "Speed",
+    stats_chip_cache: "Cache hit",
+    stats_chip_in: "In",
+    stats_chip_out: "Out",
+    stats_chip_cost: "Cost",
+    process_think: "Thinking ×{{n}}",
+    process_tools: "Tools ×{{n}}",
+    process_other: "{{n}} other steps",
+    process_failed: "{{n}} failed",
+    process_empty: "No steps",
+    process_more: "{{n}} more steps…",
+    footer_view_trajectory: "View trajectory",
+    footer_tokens: "{{n}} tok",
+    footer_steps: "{{n}} steps",
+    footer_export: "Export",
+    lane_user: "User",
+    lane_mode_sequence: "Sequence",
+    lane_mode_duration: "Duration",
+    lane_tip_hint: "Click to select · drag to filter · double-click to reset",
+    lane_tip_range: "{{start}} → {{end}} · {{d}}",
+    traj_col_idx: "#",
+    traj_col_kind: "Kind",
+    traj_col_summary: "Summary",
+    traj_col_in: "In",
+    traj_col_out: "Out",
+    traj_col_think: "Think",
+    traj_col_duration: "Time",
+    traj_filter: "Filtered #{{a}}–#{{b}} ({{n}} rows)",
+    traj_filter_clear: "Clear filter",
+    inspect_run_detail: "Run detail",
+    traj_list_label: "Trajectory rows",
   },
   playground: {
     session_label: "Session",
     new_session: "New session",
     session_failed: "Failed to create session",
     thread_id: "thread",
-    input_placeholder:
-      "Type a prompt to send to the agent. The full SSE event stream lands on the right.",
+    input_placeholder: "Type a prompt for the agent…",
     run: "Run",
     running: "Running…",
     stop: "Stop",

@@ -506,6 +506,20 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             )}
           </div>
 
+          {/* §八.2 —— 会话级状态栏那条细行。守卫用 ``stats.turns`` 而不是
+              ``consoleTurns.length``:StatsBar 自己在 ``stats.turns === 0``
+              时返回 null,而一轮跑到 agent 步之前就失败时是「有轮次但不计
+              数」的 —— 拿 ``consoleTurns.length`` 守会留下一条只有描边的空
+              行。 */}
+          {stats.turns > 0 && (
+            <div
+              style={{ padding: "6px 16px", borderBottom: "1px solid var(--ew-border-subtle)" }}
+              data-testid="console-stats-row"
+            >
+              <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
+            </div>
+          )}
+
           <Transcript
             turns={consoleTurns}
             flatHistory={historyTurns === null ? history : []}
@@ -568,7 +582,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               onAttachImage={() => fileInputRef.current?.click()}
               onAttachDocument={() => docInputRef.current?.click()}
             />
-            <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
           </div>
 
           <input

@@ -44,7 +44,17 @@ const THREAD = {
   error: null,
 };
 
-const SSE_BODY = ["event: end", 'data: "ok"', "", ""].join("\n");
+// 一帧 metadata(带 run_id)+ 一帧 end —— run_id 是右栏头部「Run 详情」链接
+// (§八.6)的前提。
+const SSE_BODY = [
+  "event: metadata",
+  'data: {"run_id":"44444444-4444-4444-4444-444444444444"}',
+  "",
+  "event: end",
+  'data: "ok"',
+  "",
+  "",
+].join("\n");
 
 async function login(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/login");
@@ -95,7 +105,8 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await expect(page.getByText(/33333333-3333-3333/)).toBeVisible();
 
   await page.getByTestId("playground-input").fill("describe this image");
-  await expectNoA11yViolations(page, "/agents/playground");
+  // 空态(还没跑)的一次扫描 —— 过程条 / 泳道 / 行表 / 详情都还不在 DOM 里。
+  await expectNoA11yViolations(page, "/agents/playground (empty)");
 
   await page.getByTestId("playground-run").click();
   // The turn lands in the transcript and settles as soon as the stub's ``end``
@@ -107,6 +118,23 @@ test("attach image, run, and send image_refs + pass axe", async ({ page }) => {
   await expect(turn.getByTestId("console-turn-status")).toHaveText(
     /done|完成/i,
   );
+
+  // §八.7 —— 泳道块可点:真浏览器里验证「块点击没被横向拖选的指针捕获吃
+  // 掉」(jsdom 没有 pointer capture,只有这里能证)。哪怕这个桩 run 只有一
+  // 帧,USER 行也一定有一个块。
+  const block = page.getByTestId("console-lane-block").first();
+  await expect(block).toBeVisible();
+  await block.click();
+  await expect(page.getByTestId("console-detail-header")).toBeVisible();
+  // §八.6 —— 「查看运行」的新家:右栏头部的 Run 详情链接。
+  await expect(page.getByTestId("console-inspect-run-link")).toHaveAttribute(
+    "href",
+    "/runs/33333333-3333-3333-3333-333333333333/44444444-4444-4444-4444-444444444444",
+  );
+
+  // 真正扫得到新 UI 的那一次:run 结束 + 点过泳道块之后,过程条、轮次脚注、
+  // 泳道、行表(listbox)、右栏详情全在 DOM 里。空态那次一个新组件都覆盖不到。
+  await expectNoA11yViolations(page, "/agents/playground (after run)");
 
   expect(runBody).toEqual({
     input: "describe this image",

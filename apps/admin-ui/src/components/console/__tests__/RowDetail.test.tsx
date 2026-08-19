@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
 import type { SpanMatch } from "../../../api/trace_match";
@@ -118,6 +118,7 @@ function renderDetail(row: TrajectoryRow, over: Partial<RowDetailProps> = {}) {
     <App>
       <RowDetail
         row={row}
+        rowIndex={1}
         turnSeq={0}
         events={EVENTS}
         match={NO_TRACE}
@@ -202,6 +203,7 @@ describe("RowDetail", () => {
       <App>
         <RowDetail
           row={thinkRow}
+          rowIndex={1}
           turnSeq={0}
           events={EVENTS}
           match={NO_TRACE}
@@ -221,6 +223,7 @@ describe("RowDetail", () => {
       <App>
         <RowDetail
           row={toolRow}
+          rowIndex={1}
           turnSeq={0}
           events={EVENTS}
           match={NO_TRACE}
@@ -236,5 +239,24 @@ describe("RowDetail", () => {
 
     fireEvent.click(screen.getByTestId("console-detail-close"));
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+  it("header shows #rowIndex + kind (no turn label — the panel header owns it) and the root has its own padding", () => {
+    renderDetail(toolRow, { rowIndex: 4 });
+
+    const header = screen.getByTestId("console-detail-header");
+    expect(header.textContent).toContain("#4");
+    expect(header.textContent).toContain("TOOL");
+    // 「第 N 轮」 moved to the panel header (spec §八.8) — the key itself stays
+    // for SummaryTab, but the detail header must not repeat it. 取真实译文,
+    // 别写死英文串:这个文件不钉语言,zh-CN 下「Turn 1」本来就不会出现,断言
+    // 会变成恒真。
+    expect(header.textContent).not.toContain(
+      i18n.t("console.detail_level_turn_only", { turn: 1 }),
+    );
+
+    const root = header.parentElement as HTMLElement;
+    expect(root.style.padding).toBe("8px 12px");
+    expect(root.style.height).toBe("100%");
+    expect(root.style.overflow).toBe("auto");
   });
 });

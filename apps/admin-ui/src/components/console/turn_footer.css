@@ -1,0 +1,27 @@
+/*
+ * TurnFooter — component-scoped styles for the debug console's one-row
+ * turn footer (status tag + compact meta on the left, feedback / retry /
+ * export / view-trajectory on the right). Spec §八.4, PR-A.1 Task 4.
+ */
+
+.ew-turn-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ew-text-tertiary);
+  border-top: 1px dashed var(--ew-border-subtle);
+  padding-top: 6px;
+}
+
+.ew-turn-footer__meta {
+  font-variant-numeric: tabular-nums;
+}
+
+.ew-turn-footer__acts {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}

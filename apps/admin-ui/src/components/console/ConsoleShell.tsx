@@ -6,18 +6,18 @@
  * always-mounted ``sidebar`` node in that column is hidden, replaced by
  * the same node re-rendered inside a Drawer the rail button opens.
  *
- * ``CONSOLE_HEIGHT_OFFSET_PX`` mirrors the ``calc(100vh - 360px)`` this
- * replaces from ``PlaygroundTab.tsx`` — exported so other height math in
- * this feature stays in sync with the one number instead of repeating
- * the literal.
+ * The root element measures its own distance from the viewport top (mount +
+ * window resize) and writes it into the ``--ew-console-top`` CSS variable,
+ * so ``console.css`` can size the grid to fill exactly to the viewport
+ * bottom instead of a hard-coded ``calc(100vh - 360px)`` offset that goes
+ * stale whenever the chrome above the console changes height (调试台重设计
+ * §八.1).
  */
-import { type JSX, type ReactNode, useState } from "react";
+import { type JSX, type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { Drawer } from "antd";
 import { PanelLeftOpen } from "lucide-react";
 
 import "./console.css";
-
-export const CONSOLE_HEIGHT_OFFSET_PX = 360;
 
 export interface ConsoleShellProps {
   sidebar: ReactNode;
@@ -33,9 +33,24 @@ export function ConsoleShell({
   sidebarLabel,
 }: ConsoleShellProps): JSX.Element {
   const [railOpen, setRailOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const apply = () => {
+      el.style.setProperty(
+        "--ew-console-top",
+        `${Math.max(0, Math.round(el.getBoundingClientRect().top))}px`,
+      );
+    };
+    apply();
+    window.addEventListener("resize", apply);
+    return () => window.removeEventListener("resize", apply);
+  }, []);
 
   return (
-    <div className="ew-console" data-testid="playground-tab">
+    <div ref={rootRef} className="ew-console" data-testid="playground-tab">
       <div className="ew-console__sidebar">
         <button
           type="button"
