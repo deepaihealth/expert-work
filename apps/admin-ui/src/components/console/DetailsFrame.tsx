@@ -90,6 +90,11 @@ export function DetailsFrame(props: DetailsFrameProps) {
         className="ew-detail__resize"
         role="separator"
         aria-orientation="vertical"
+        // 可聚焦的 separator = window splitter,`aria-valuenow` 是必填
+        // (axe `aria-required-attr`,PR-A.2 Task 11 的 e2e 扫描逮到)。
+        aria-valuenow={Math.round(width)}
+        aria-valuemin={DETAILS_MIN_WIDTH}
+        aria-valuemax={Math.max(DETAILS_MIN_WIDTH, Math.min(DETAILS_MAX_WIDTH, splitWidth - LEDGER_MIN_WIDTH))}
         aria-label={t("console.detail_resize")}
         title={t("console.detail_resize")}
         tabIndex={0}

@@ -8,10 +8,14 @@
  * 调试台重设计 PR-A Task 19 — this file used to hold 54 ``it``s covering the
  * whole (single-component) Playground. The console shell split it into
  * ``components/console/*``, so 13 of those moved to their new owner's test
- * (``WorkspacePanel`` / ``Composer`` / ``AttachmentChips`` / ``TrajectoryPanel``
- * / ``useRunTrace`` / ``RowDetailTiming`` / ``trace_match``) and the remaining
- * 41 stayed here, rewritten against the new DOM. The plan's
+ * (``WorkspacePanel`` / ``Composer`` / ``AttachmentChips`` / the right rail's
+ * panel / ``useRunTrace`` / ``RowDetailTiming`` / ``trace_match``) and the
+ * remaining 41 stayed here, rewritten against the new DOM. The plan's
  * 「行为清单迁移表」 is the row-by-row ledger.
+ *
+ * PR-A.2 Task 11(spec §九)—— 右栏退役、轨迹进中栏第二个视图 tab:引用右栏
+ * 的三条改打 ``console-view-tab-*`` / 账本行 / 详情,联动两条重写,另加一条
+ * 「三 tab 互斥 + 输入区三处都在」。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
@@ -559,24 +563,51 @@ describe("PlaygroundTab", () => {
   });
 
   // 迁移表 432 的留守条:工作区内容本身归 WorkspacePanel.test,这里只钉
-  // 「右栏能切到工作区 tab」这条组装接线。
-  it("switches the right rail to the workspace tab", async () => {
+  // 「中栏能切到工作区视图」这条组装接线(§九「壳」:右栏退役,工作区成了
+  // 中栏第三个 tab)。
+  it("switches the middle column to the workspace view", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);
     getWorkspaceFilesMock.mockResolvedValue([{ path: "report.pdf", size: 2048 }]);
     renderPg();
     await screen.findByTestId("playground-input");
-    // Default tab = trajectory; the workspace panel isn't mounted yet.
-    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
+    // 初值 = 「对话」:轨迹与工作区都还没挂。
+    expect(screen.getByTestId("playground-transcript")).toBeInTheDocument();
+    expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
     expect(screen.queryByTestId("playground-workspace")).not.toBeInTheDocument();
 
-    await user.click(screen.getByTestId("console-inspect-tab-workspace"));
+    await user.click(screen.getByTestId("console-view-tab-workspace"));
 
     const panel = await screen.findByTestId("playground-workspace");
     expect(panel).toHaveTextContent("report.pdf");
-    expect(
-      screen.queryByTestId("console-trajectory-panel"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("playground-transcript")).not.toBeInTheDocument();
+  });
+
+  // §九「壳」—— 三个视图两两互斥,`console-view-tabs` 是唯一的开关;输入区
+  // (Composer / 附件 / 变量)在三个 tab 下都钉在底部。
+  it("the three view tabs swap the main body and keep the composer pinned in all of them", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("console-view-tabs")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("console-view-tab-trajectory"));
+    expect(screen.getByTestId("console-trajectory-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("playground-transcript")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("playground-workspace")).not.toBeInTheDocument();
+    // 轨迹 tab 下照样能发送 / 停止 —— 输入区没跟着 Transcript 一起消失。
+    expect(screen.getByTestId("playground-input")).toBeInTheDocument();
+    expect(screen.getByTestId("playground-run")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("console-view-tab-workspace"));
+    expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("playground-input")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("console-view-tab-chat"));
+    expect(screen.getByTestId("playground-transcript")).toBeInTheDocument();
+    expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("playground-input")).toBeInTheDocument();
   });
 
   it("shows a stream-failure alert when streamRun throws", async () => {
@@ -1054,7 +1085,10 @@ describe("PlaygroundTab", () => {
     const tip = await screen.findByRole("tooltip");
     expect(tip).toHaveTextContent(/≈ ¥/);
 
-    // §八.6 — 「查看运行」的新家:右栏头部(默认跟最新一轮)的 Run 详情链接。
+    // §九「详情」— 「查看运行」的新家:轨迹 tab 里点开一条记录,详情「概要」
+    // 里的 Run 链接(右栏头部退役,链接跟着那条记录的 runId 走)。
+    await user.click(screen.getByTestId("console-view-tab-trajectory"));
+    await user.click(screen.getAllByTestId("console-traj-row")[0]);
     const runLink = await screen.findByTestId("console-inspect-run-link");
     expect(runLink).toHaveAttribute("href", `/runs/${sampleThread.thread_id}/run-77`);
   });
@@ -1091,8 +1125,8 @@ describe("PlaygroundTab", () => {
     // The whole point of the user-scoped route: the panel shows the current
     // user's workspace with no session bound — so it survives session
     // deletion. No establishThread() here. (The panel only mounts on its own
-    // tab — InspectPanel keeps the inactive tab unmounted — so the switch is
-    // the trigger, not the page mount.)
+    // tab — the middle column keeps the inactive views unmounted — so the
+    // switch is the trigger, not the page mount.)
     const user = userEvent.setup();
     getWorkspaceMock.mockResolvedValue({
       workspace: {
@@ -1112,7 +1146,7 @@ describe("PlaygroundTab", () => {
     getWorkspaceFilesMock.mockResolvedValue([{ path: "out.txt", size: 11 }]);
     renderPg();
     await screen.findByTestId("playground-input");
-    await user.click(screen.getByTestId("console-inspect-tab-workspace"));
+    await user.click(screen.getByTestId("console-view-tab-workspace"));
 
     const panel = await screen.findByTestId("playground-workspace");
     expect(panel).toHaveTextContent("expert-work-ws-t-u");
@@ -1344,7 +1378,7 @@ describe("PlaygroundTab", () => {
   });
 
   // Task 19 ③④ — 中栏 ↔ 右栏的两个入口(R9 / R18)。
-  describe("inspect wiring (middle column → right rail)", () => {
+  describe("视图联动(中栏 → 轨迹 tab)", () => {
     const TWO_STEP_EVENTS: SseEvent[] = [
       {
         id: "m",
@@ -1363,6 +1397,9 @@ describe("PlaygroundTab", () => {
               {
                 type: "ai",
                 content: "",
+                // 有 reasoning 过程条才出 think 紧凑行 —— 「轨迹」按钮的
+                // `think:<seq>` → `assistant:<seq>` 映射靠它才测得到。
+                additional_kwargs: { reasoning_content: "先查一下 CRM" },
                 tool_calls: [
                   { id: "c1", name: "query_crm", args: { id: "C-1" }, type: "tool_call" },
                 ],
@@ -1428,37 +1465,46 @@ describe("PlaygroundTab", () => {
       await findInTranscript("第二轮答案");
     }
 
-    // NEW ③ — 脚注「检查」把右栏切到该轮(默认跟随最新一轮)。
-    it("the footer's 检查 button points the right rail at that turn", async () => {
+    /** 账本里当前选中的那一行(时间轴块与账本行共用一个选中态)。 */
+    function selectedLedgerRow(): HTMLElement {
+      const row = screen
+        .getAllByTestId("console-traj-row")
+        .find((el) => el.getAttribute("aria-selected") === "true");
+      expect(row).toBeDefined();
+      return row as HTMLElement;
+    }
+
+    // §九「联动」— 脚注「查看轨迹」:切到轨迹 tab + 选中该轮**最后一条**
+    // ASSISTANT 记录 + 打开它的详情。
+    it("the footer's 查看轨迹 switches to the trajectory view and selects that turn's last ASSISTANT record", async () => {
       const user = userEvent.setup();
       await runTwoTurns(user);
-
-      // Default: follows the newest turn (第 2 轮).
-      await waitFor(() =>
-        expect(screen.getByTestId("console-inspect-turn-header")).toHaveTextContent(
-          i18n.t("console.inspect_turn_header", {
-            n: 2,
-            status: i18n.t("console.footer_status_done"),
-          }),
-        ),
-      );
+      // 起手在「对话」视图:轨迹还没挂。
+      expect(screen.queryByTestId("console-trajectory-panel")).not.toBeInTheDocument();
 
       const firstTurn = screen.getAllByTestId("console-turn")[0];
       await user.click(within(firstTurn).getByTestId("console-turn-inspect"));
 
-      await waitFor(() =>
-        expect(screen.getByTestId("console-inspect-turn-header")).toHaveTextContent(
-          i18n.t("console.inspect_turn_header", {
-            n: 1,
-            status: i18n.t("console.footer_status_done"),
-          }),
-        ),
-      );
+      expect(await screen.findByTestId("console-trajectory-panel")).toBeInTheDocument();
+      expect(screen.queryByTestId("playground-transcript")).not.toBeInTheDocument();
+      await waitFor(() => {
+        const row = selectedLedgerRow();
+        expect(row.dataset.kind).toBe("assistant");
+        // 第 1 轮的最后一条 assistant —— 不是第 2 轮的,也不是第 1 轮第一步的。
+        expect(row).toHaveTextContent("已完成查询。");
+      });
+      expect(await screen.findByTestId("console-detail-header")).toBeInTheDocument();
+
+      // 回到「对话」再点第 2 轮的脚注 —— 选中跟着换轮。
+      await user.click(screen.getByTestId("console-view-tab-chat"));
+      const secondTurn = screen.getAllByTestId("console-turn")[1];
+      await user.click(within(secondTurn).getByTestId("console-turn-inspect"));
+      await waitFor(() => expect(selectedLedgerRow()).toHaveTextContent("第二轮答案"));
     });
 
-    // NEW ④ — 紧凑行「检查」→ 右栏选中同 id 的轨迹行并开详情;关掉再点同一行
-    // 还能重开(focusRowId 只对「值变化」有反应,父级必须让它先落回 null)。
-    it("the compact row's 检查 selects the matching trajectory row and opens its detail", async () => {
+    // §九「联动」— 过程条每行「轨迹」:切 tab + 选中**对应那条**记录;紧凑行的
+    // `think:<seq>` 要落到账本的 `assistant:<seq>` 上(不是该轮最后一条)。
+    it("the process strip's 轨迹 maps think:<seq> onto the ledger's assistant:<seq> record", async () => {
       const user = userEvent.setup();
       await runTwoTurns(user);
 
@@ -1467,22 +1513,34 @@ describe("PlaygroundTab", () => {
       if (!within(firstTurn).queryByTestId("console-process-steps")) {
         await user.click(within(firstTurn).getByTestId("console-process-head"));
       }
-      await user.click(within(firstTurn).getByTestId("console-row-inspect"));
+      // 第一条紧凑行 = 第 1 步的 think 行(第二条是它发起的 tool 行)。
+      expect(within(firstTurn).getByTestId("console-row-think")).toBeInTheDocument();
+      await user.click(within(firstTurn).getAllByTestId("console-row-inspect")[0]);
 
-      expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
-      const selected = screen
-        .getAllByTestId("console-traj-row")
-        .find((el) => el.getAttribute("aria-selected") === "true");
-      expect(selected?.dataset.kind).toBe("tool");
+      expect(await screen.findByTestId("console-trajectory-panel")).toBeInTheDocument();
+      await waitFor(() => {
+        const row = selectedLedgerRow();
+        // 账本记录 id = `<turnKey>/<rowId>`,尾巴就是映射后的行 id。
+        expect(row.dataset.recordId).toMatch(/\/assistant:\d+$/);
+        // 第 1 步没有正文(只发了工具调用)—— 落到第 2 步的 assistant 上就会
+        // 写「已完成查询。」,这条断言是两者的分水岭。
+        expect(row).toHaveTextContent(i18n.t("console.ledger_tool_call_only"));
+      });
+      expect(await screen.findByTestId("console-detail-header")).toBeInTheDocument();
 
-      // Close the detail, then click the SAME 「检查」 again — it must reopen.
+      // 关掉详情、回「对话」、再点同一处:照样重开(切 tab 会把轨迹视图整个
+      // 卸掉,所以这条钉的是「往返一趟还好使」;`nonce` 自增本身在视图不卸载
+      // 的前提下才有意义,由 TrajectoryView.test「focusRequest 指向同一条记录
+      // 的新 nonce 会再滚一次」钉住)。
       await user.click(screen.getByTestId("console-detail-close"));
-      expect(
-        screen.queryByTestId("console-detail-summary"),
-      ).not.toBeInTheDocument();
-
-      await user.click(within(firstTurn).getByTestId("console-row-inspect"));
-      expect(await screen.findByTestId("console-detail-summary")).toBeInTheDocument();
+      expect(screen.queryByTestId("console-detail-header")).not.toBeInTheDocument();
+      await user.click(screen.getByTestId("console-view-tab-chat"));
+      const turnAgain = screen.getAllByTestId("console-turn")[0];
+      if (!within(turnAgain).queryByTestId("console-process-steps")) {
+        await user.click(within(turnAgain).getByTestId("console-process-head"));
+      }
+      await user.click(within(turnAgain).getAllByTestId("console-row-inspect")[0]);
+      expect(await screen.findByTestId("console-detail-header")).toBeInTheDocument();
     });
   });
 

@@ -36,8 +36,8 @@ export interface TurnBlockProps {
   threadId: string | null;
   selected: boolean;
   onSelect: (key: string) => void;
-  /** 紧凑行「检查」→ 父级切到该轮并让右栏选中该行(Task 19 接
-   *  TrajectoryPanel.focusRowId)。 */
+  /** 紧凑行「轨迹」→ 父级切到「轨迹」视图并选中该行对应的账本记录
+   *  (PR-A.2 Task 11 接 `TrajectoryView.focusRequest`)。 */
   onInspectRow: (turnKey: string, rowId: string) => void;
   /** 仅当前流式 live 轮传;其它 undefined。 */
   liveByStep?: ReadonlyMap<number, LiveStep>;

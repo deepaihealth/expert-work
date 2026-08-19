@@ -297,6 +297,9 @@ export function TrajectoryTimeline(props: TrajectoryTimelineProps): JSX.Element 
           className="ew-traj-tl__track"
           data-testid="console-lane-track"
           data-panning={panning ? "true" : undefined}
+          // 裸 `div` 上不许挂 `aria-label`(axe `aria-prohibited-attr`,
+          // PR-A.2 Task 11 的 e2e 扫描逮到)—— 给它一个容器角色,标签才合法。
+          role="group"
           tabIndex={0}
           aria-label={t("console.timeline_track_aria")}
           onKeyDown={handleKeyDown}
