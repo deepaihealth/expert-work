@@ -1299,6 +1299,8 @@ export interface TranslationKeys {
     detail_schema_parameters: string;
     timeline_tip_ttft: string;
     detail_first_token: string;
+    detail_system_prompt: string;
+    detail_system_chars: string;
   };
   playground: {
     session_label: string;
@@ -4522,6 +4524,8 @@ const en: TranslationKeys = {
     detail_schema_parameters: "Parameters (JSON Schema)",
     timeline_tip_ttft: "first token {{d}}",
     detail_first_token: "First token",
+    detail_system_prompt: "System prompt",
+    detail_system_chars: "{{n}} chars",
   },
   playground: {
     session_label: "Session",

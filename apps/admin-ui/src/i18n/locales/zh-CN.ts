@@ -1361,6 +1361,8 @@ const zhCN: TranslationKeys = {
     detail_schema_parameters: "参数 (JSON Schema)",
     timeline_tip_ttft: "首 token {{d}}",
     detail_first_token: "首 token",
+    detail_system_prompt: "系统提示词",
+    detail_system_chars: "{{n}} 字",
   },
   playground: {
     session_label: "会话",
