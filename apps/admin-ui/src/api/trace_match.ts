@@ -91,9 +91,11 @@ export function matchTraceSpans(
   const stepRows = rows.filter(
     (row) => row.kind === "think" || (row.kind === "assistant" && row.step !== null),
   );
-  const mainLlmSpans = spans.filter(
-    (span) => span.kind === "llm" && (span.purpose === "" || span.purpose === "main"),
-  );
+  const mainLlmSpans = spans
+    .filter((span) => span.kind === "llm" && (span.purpose === "" || span.purpose === "main"))
+    // 后端现在按 startMs 排了(PR-A.3),但配对的正确性不该依赖上游顺序。
+    .slice()
+    .sort((a, b) => a.startMs - b.startMs);
   if (stepRows.length === mainLlmSpans.length) {
     stepRows.forEach((row, i) => result.set(row.id, { span: mainLlmSpans[i], reason: "matched" }));
   } else {
