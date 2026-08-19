@@ -1376,6 +1376,7 @@ const zhCN: TranslationKeys = {
     detail_request_title: "请求 #{{n}}",
     detail_resize: "拖动调整详情宽度，双击复位",
     detail_placeholder: "该轮尚未回放，只有文本降级",
+    trajectory_empty: "还没有轨迹",
   },
   playground: {
     session_label: "会话",
