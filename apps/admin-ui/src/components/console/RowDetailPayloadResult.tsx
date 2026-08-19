@@ -103,7 +103,7 @@ function Pre({ children }: { children: string }) {
   );
 }
 
-function JsonBlock({ value, copyTestId }: { value: unknown; copyTestId?: string }) {
+export function JsonBlock({ value, copyTestId }: { value: unknown; copyTestId?: string }) {
   const json = JSON.stringify(value, null, 2);
   return (
     <div style={{ position: "relative" }}>

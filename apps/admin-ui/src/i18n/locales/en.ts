@@ -1288,6 +1288,14 @@ export interface TranslationKeys {
     view_trajectory: string;
     view_workspace: string;
     view_aria: string;
+    detail_tab_schema: string;
+    detail_schema_loading: string;
+    detail_schema_error: string;
+    detail_schema_retry: string;
+    detail_schema_missing: string;
+    detail_schema_source: string;
+    detail_schema_deferred: string;
+    detail_schema_parameters: string;
   };
   playground: {
     session_label: string;
@@ -4500,6 +4508,14 @@ const en: TranslationKeys = {
     view_trajectory: "Trajectory",
     view_workspace: "Workspace",
     view_aria: "View",
+    detail_tab_schema: "Schema",
+    detail_schema_loading: "Loading tool schemas…",
+    detail_schema_error: "Tool schemas unavailable",
+    detail_schema_retry: "Retry",
+    detail_schema_missing: "This tool is not in the agent's current tool set",
+    detail_schema_source: "Source",
+    detail_schema_deferred: "deferred — promoted on demand",
+    detail_schema_parameters: "Parameters (JSON Schema)",
   },
   playground: {
     session_label: "Session",

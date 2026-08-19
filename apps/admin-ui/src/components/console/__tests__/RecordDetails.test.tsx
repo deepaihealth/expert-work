@@ -12,11 +12,13 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
+import type { AgentToolSchema } from "../../../api/agents";
 import type { SseEvent } from "../../../api/sessions";
 import type {
   AssistantRow,
   MarkerRow,
   MemoryRow,
+  PlanRow,
   SubagentRow,
   ToolRow,
   TrajectoryRow,
@@ -24,6 +26,8 @@ import type {
 } from "../../../api/trajectory_rows";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
 import { RecordDetails, recordTabsOf, type RecordDetailsProps } from "../RecordDetails";
+import { schemaToolNameOf } from "../RowDetailSchema";
+import type { ToolSchemaState } from "../useAgentTools";
 
 // ToolCallCard 的「立即触发」按钮读 useIsTenantSwitched(这里没挂 Auth /
 // TenantScope provider)—— 同 RowDetail.test.tsx 的桩。
@@ -130,6 +134,22 @@ function markerRow(over: Partial<MarkerRow> = {}): MarkerRow {
   return { ...ROW_BASE, id: "compaction:9", kind: "compaction", step: null, text: "压缩了 12 条消息", ...over };
 }
 
+function planRow(over: Partial<PlanRow> = {}): PlanRow {
+  return {
+    ...ROW_BASE,
+    id: "plan:1:0",
+    kind: "plan",
+    source: "update_plan",
+    callId: "c2",
+    plannerSeq: null,
+    stepsTotal: 2,
+    goal: "先查档案再报价",
+    reason: null,
+    plan: null,
+    ...over,
+  };
+}
+
 function rec(row: TrajectoryRow, over: Partial<LedgerRecord> = {}): LedgerRecord {
   return {
     id: `t1/${row.id}`,
@@ -191,6 +211,7 @@ function propsOf(over: Partial<RecordDetailsProps> = {}): RecordDetailsProps {
     onRefreshTrace: vi.fn(),
     onOpenRecord: vi.fn(),
     onOpenRequest: vi.fn(),
+    toolSchemas: { status: "idle", byName: new Map(), reload: vi.fn() },
     activeTab: "summary",
     onTabChange: vi.fn(),
     onClose: vi.fn(),
@@ -216,10 +237,20 @@ function renderRecord(
 }
 
 describe("RecordDetails", () => {
-  it("tool 记录:概要 / 载荷 / 结果 / 计时 / 原始 五个 tab", () => {
-    expect(recordTabsOf(rec(toolRow()))).toEqual(["summary", "payload", "result", "timing", "raw"]);
+  // PR-A.3 Task 10 —— `toolRow()` 的 fixture 一直带真实 `toolName`
+  // ("query_crm"),`schemaToolNameOf` 现在对它非 null,所以这条记录现在
+  // 多出一个 Schema tab(概要 / 载荷 / 结果 / Schema / 计时 / 原始 六个)。
+  it("tool 记录:概要 / 载荷 / 结果 / Schema / 计时 / 原始 六个 tab", () => {
+    expect(recordTabsOf(rec(toolRow()))).toEqual([
+      "summary",
+      "payload",
+      "result",
+      "schema",
+      "timing",
+      "raw",
+    ]);
     renderRecord({ record: rec(toolRow()) });
-    for (const key of ["summary", "payload", "result", "timing", "raw"]) {
+    for (const key of ["summary", "payload", "result", "schema", "timing", "raw"]) {
       expect(screen.getByTestId(`console-detail-tab-${key}`)).toBeInTheDocument();
     }
     expect(screen.queryByTestId("console-detail-tab-preview")).not.toBeInTheDocument();
@@ -441,5 +472,82 @@ describe("RecordDetails", () => {
     const raw = screen.getByTestId("console-detail-raw");
     expect(within(raw).getByTestId("event-card-updates")).toBeInTheDocument();
     expect(within(raw).getByTestId("event-card-end")).toBeInTheDocument();
+  });
+});
+
+// PR-A.3 Task 10 —— Schema tab:tool / update_plan 记录懒加载出的工具契约。
+describe("Schema tab (PR-A.3 §十.2)", () => {
+  const ready = (items: AgentToolSchema[]): ToolSchemaState => ({
+    status: "ready",
+    byName: new Map(items.map((i) => [i.name, i])),
+    reload: vi.fn(),
+  });
+
+  it("tool 记录的 Schema tab 排在结果与计时之间;user / assistant 记录没有", () => {
+    const tool = renderRecord({ record: rec(toolRow()), toolSchemas: ready([]) });
+    expect(screen.getAllByRole("tab").map((el) => el.getAttribute("data-testid"))).toEqual([
+      "console-detail-tab-summary",
+      "console-detail-tab-payload",
+      "console-detail-tab-result",
+      "console-detail-tab-schema",
+      "console-detail-tab-timing",
+      "console-detail-tab-raw",
+    ]);
+    tool.unmount();
+    renderRecord({ record: rec(assistantRow()) });
+    expect(screen.queryByTestId("console-detail-tab-schema")).toBeNull();
+  });
+
+  it("渲染命中工具的描述 / 来源 / 延迟挂载标记 / 参数 JSON Schema", () => {
+    const item: AgentToolSchema = {
+      name: "bash",
+      description: "Run a shell command",
+      parameters: { type: "object", properties: { command: { type: "string" } } },
+      source: "mcp:gh",
+      from_skill: null,
+      deferred: true,
+    };
+    const bashRow = toolRow({
+      entry: {
+        id: "c9", rawName: "bash", isMcp: false, server: null, toolName: "bash",
+        args: { command: "ls" }, status: "success", resultPreview: "", durationMs: 50,
+      },
+    });
+    renderRecord({ record: rec(bashRow), toolSchemas: ready([item]), activeTab: "schema" });
+    const panel = screen.getByTestId("console-detail-schema");
+    expect(panel).toHaveTextContent("Run a shell command");
+    expect(panel).toHaveTextContent("mcp:gh");
+    expect(panel).toHaveTextContent("promoted on demand");
+    expect(panel).toHaveTextContent('"command"');
+  });
+
+  it("三态:loading / error(带重试)/ missing(未命中当前工具集)", async () => {
+    const reload = vi.fn();
+    const loading = renderRecord({
+      record: rec(toolRow()),
+      toolSchemas: { status: "loading", byName: new Map(), reload },
+      activeTab: "schema",
+    });
+    expect(screen.getByTestId("console-detail-schema")).toHaveTextContent("Loading tool schemas");
+    loading.unmount();
+
+    const errored = renderRecord({
+      record: rec(toolRow()),
+      toolSchemas: { status: "error", byName: new Map(), reload },
+      activeTab: "schema",
+    });
+    await userEvent.click(screen.getByTestId("console-detail-schema-retry"));
+    expect(reload).toHaveBeenCalledTimes(1);
+    errored.unmount();
+
+    renderRecord({ record: rec(toolRow()), toolSchemas: ready([]), activeTab: "schema" });
+    expect(screen.getByTestId("console-detail-schema-missing")).toBeInTheDocument();
+  });
+
+  it("plan(update_plan) 记录的工具名解析成 'update_plan';planner 节点的 plan 记录不解析", () => {
+    expect(schemaToolNameOf(planRow({ source: "update_plan" }))).toBe("update_plan");
+    expect(schemaToolNameOf(planRow({ source: "planner" }))).toBeNull();
+    expect(recordTabsOf(rec(planRow({ source: "update_plan" })))).toContain("schema");
+    expect(recordTabsOf(rec(planRow({ source: "planner" })))).not.toContain("schema");
   });
 });

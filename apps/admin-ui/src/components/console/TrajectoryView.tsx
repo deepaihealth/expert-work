@@ -24,10 +24,12 @@ import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStrea
 import { DETAILS_DEFAULT_WIDTH } from "./DetailsFrame";
 import { RecordDetails, type RecordTab } from "./RecordDetails";
 import { RequestDetails, type RequestTab } from "./RequestDetails";
+import { schemaToolNameOf } from "./RowDetailSchema";
 import { TrajectoryLedger } from "./TrajectoryLedger";
 import { TrajectoryTimeline } from "./TrajectoryTimeline";
 import { TrajectoryToolbar } from "./TrajectoryToolbar";
 import type { ConsoleTurn } from "./types";
+import { useAgentTools } from "./useAgentTools";
 import { useRunTrace } from "./useRunTrace";
 import { useTrajectoryState, type FocusRequest } from "./use_trajectory_state";
 import "./trajectory_view.css";
@@ -42,6 +44,10 @@ const FALLBACK_SPLIT_WIDTH = 1200;
 export interface TrajectoryViewProps {
   turns: readonly ConsoleTurn[];
   threadId: string | null;
+  /** The agent this thread runs — the Schema tab's `useAgentTools` fetch
+   *  key (PR-A.3 §十.2). */
+  agentName: string;
+  agentVersion: string;
   streamTurnKey: string | null;
   liveByStep: ReadonlyMap<number, LiveStep>;
   running: boolean;
@@ -78,7 +84,7 @@ function useSplitWidth(ref: React.RefObject<HTMLDivElement | null>, enabled: boo
 }
 
 export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
-  const { turns, threadId, isSystemAdmin, onFireResult } = props;
+  const { turns, threadId, agentName, agentVersion, isSystemAdmin, onFireResult } = props;
   const { t } = useTranslation();
   const splitRef = useRef<HTMLDivElement>(null);
   const [detailsWidth, setDetailsWidth] = useState(DETAILS_DEFAULT_WIDTH);
@@ -114,6 +120,16 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
     [state.detailTurnRecords, trace],
   );
   const langfuseUrl = isSystemAdmin ? buildLangfuseTraceUrl(traceId) : null;
+
+  // PR-A.3 §十.2 — the Schema tab's lazy tool-schema fetch, keyed on the
+  // agent this thread runs. `enabled` only once the selected record
+  // resolves to a tool name (TOOL row, or PLAN row for `update_plan`);
+  // once "ready" the hook itself never refetches for switching records.
+  const toolSchemas = useAgentTools({
+    agentName,
+    agentVersion,
+    enabled: selectedRecord !== null && schemaToolNameOf(selectedRecord.row) !== null,
+  });
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key !== "Escape") return;
@@ -173,6 +189,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
         onOpenRecord={state.selectRecord}
         onOpenRequest={state.selectRequest}
         onFireResult={onFireResult}
+        toolSchemas={toolSchemas}
         activeTab={recordTab}
         onTabChange={setRecordTab}
         onClose={state.closeDetails}
