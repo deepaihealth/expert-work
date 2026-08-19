@@ -564,3 +564,18 @@ def test_spans_are_sorted_by_start_ms_stably() -> None:
     assert starts == sorted(starts)
     llm_ids = [s["id"] for s in out["spans"] if s["kind"] == "llm"]
     assert llm_ids == ["llm1", "llm2"]
+
+
+def test_spans_with_equal_start_ms_tie_break_on_id() -> None:
+    """PR-A.3 follow-up(T4 deferred minor)—— 同一毫秒起的两个 span 按 ``id``
+    定序,与输入顺序无关:前端 Rule 2 按数组序配对,这个 tie-break 必须是稳定的。"""
+    same = [
+        _obs("root", "SPAN", "expert_work.session.run", None, 40.0, 0),
+        _obs("llm-b", "GENERATION", "expert_work.orchestrator.llm_call", "root", 1.0, 5),
+        _obs("llm-a", "GENERATION", "expert_work.orchestrator.llm_call", "root", 1.0, 5),
+    ]
+    out = normalize_trace(_trace(same))
+    assert [s["id"] for s in out["spans"] if s["kind"] == "llm"] == ["llm-a", "llm-b"]
+    # 反过来喂,结果不变。
+    out2 = normalize_trace(_trace([same[0], same[2], same[1]]))
+    assert [s["id"] for s in out2["spans"]] == [s["id"] for s in out["spans"]]

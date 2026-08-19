@@ -355,6 +355,40 @@ async def test_decide_default_mode_streams_the_continuation(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_decide_stream_passes_external_hidden_events_to_sse_consumer(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-A.3 follow-up(T8 deferred minor)—— 审批续跑的 SSE 流是第三方 API key
+    直接消费的第四条对外出帧路径,必须和 POST /runs 一样把
+    ``EXTERNAL_HIDDEN_EVENTS`` 传给 ``sse_consumer``。续跑 run 本身不发
+    ``system_prompt``(``graph_input=None``),所以这里钉的是接线,不是帧内容:
+    包一层真 ``sse_consumer`` 抓 kwargs,流照常 drain 到底。
+    """
+    import control_plane.api.external_approvals as mod
+    from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+
+    real = mod.sse_consumer
+    seen: list[object] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("hide_events"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "sse_consumer", spy)
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert "event: end" in resp.text
+    assert seen == [EXTERNAL_HIDDEN_EVENTS]
+    assert "system_prompt" in EXTERNAL_HIDDEN_EVENTS
+
+
+@pytest.mark.asyncio
 async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ctx) -> None:
     """Fix-round review: the kill-switch 403 must surface the SAME code the
     public error-code contract documents and the run-creation endpoint
