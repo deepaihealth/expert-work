@@ -159,6 +159,26 @@ describe("TrajectoryTimeline · 投影", () => {
     expect(blockAt(1).hasAttribute("data-error")).toBe(false);
   });
 
+  // Task 11 —— 模型块 TTFT / Decoding 双色:只有 assistant 且非失败且有 ttft
+  // 的块才标 data-ttft,比例走 --traj-span-ttft;tool 块 / isError 块 / 无首
+  // token 数据的块都不标(即使 ttft 本身算得出来)。
+  it("assistant 有首 token 的块标 data-ttft 与 --traj-span-ttft 比例;isError / 非 assistant / 无数据不标", () => {
+    const records = [
+      rec(0, 0, "user", 1000, 1000),
+      rec(1, 1, "assistant", 1000, 1400, { firstTokenAt: 1100 }),
+      rec(2, 2, "tool", 1400, 1600, { firstTokenAt: 1500 }),
+      rec(3, 1, "assistant", 1600, 1800, { isError: true, firstTokenAt: 1650 }),
+      rec(4, 1, "assistant", 1800, 2000),
+    ];
+    render(<TrajectoryTimeline {...props({ records })} />);
+
+    expect(blockAt(1)).toHaveAttribute("data-ttft", "true");
+    expect(pct(blockAt(1), "--traj-span-ttft")).toBeCloseTo(25, 3);
+    expect(blockAt(2).hasAttribute("data-ttft")).toBe(false);
+    expect(blockAt(3).hasAttribute("data-ttft")).toBe(false);
+    expect(blockAt(4).hasAttribute("data-ttft")).toBe(false);
+  });
+
   it("运行中的记录标 data-live", () => {
     render(<TrajectoryTimeline {...props()} />);
 

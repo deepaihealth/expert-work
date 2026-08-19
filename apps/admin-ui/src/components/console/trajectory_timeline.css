@@ -155,6 +155,16 @@
 .ew-traj-tl__block[data-kind="tool"] { background: var(--ew-color-warning-500); }
 .ew-traj-tl__block[data-kind="subagent"] { background: var(--ew-color-warning-700); }
 .ew-traj-tl__block[data-kind="plan"] { background: var(--ew-color-teal-500); }
+
+/* §十.3 模型块 TTFT / Decoding 双色:首 token 前同色 40%,之后实色;失败块不分段(仍整块 danger)。 */
+.ew-traj-tl__block[data-kind="assistant"][data-ttft="true"] {
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--ew-accent-violet) 40%, transparent) 0 var(--traj-span-ttft),
+    var(--ew-accent-violet) var(--traj-span-ttft) 100%
+  );
+}
+
 .ew-traj-tl__block[data-error="true"] { background: var(--ew-color-danger-500); }
 
 .ew-traj-tl__block[data-selected="false"] { opacity: 0.2; }

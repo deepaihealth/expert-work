@@ -86,6 +86,9 @@ export function RequestDetails(props: RequestDetailsProps) {
         <DetailRow label={t("console.detail_duration")}>
           {request.durationMs === null ? dash : fmtDuration(request.durationMs)}
         </DetailRow>
+        <DetailRow label={t("console.detail_first_token")}>
+          {request.firstTokenMs === null ? dash : fmtDuration(request.firstTokenMs)}
+        </DetailRow>
         <DetailRow label={t("console.detail_model")}>{request.model ?? dash}</DetailRow>
         <DetailRow label={t("console.detail_finish_reason")}>
           {request.finishReason ?? dash}
