@@ -14,6 +14,7 @@ import { useRef, type PointerEvent as ReactPointerEvent, type ReactNode } from "
 import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import "./kind_tag.css";
 import "./record_details.css";
 
 /** 默认 420、可拖 320–720;账本那侧至少留 280(spec §九「详情」)。 */

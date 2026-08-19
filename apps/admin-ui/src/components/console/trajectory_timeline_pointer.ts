@@ -136,7 +136,14 @@ export function tooltipLines(
 ): string[] {
   const startedAt = record?.startedAt ?? null;
   const endedAt = record?.endedAt ?? null;
-  const lines = [t(`console.traj_kind_${span.kind}`)];
+  // 标签与账本同一套(spec §九:subagent → SUBTOOL、compaction → COMPACTED)。
+  const kindKey =
+    span.kind === "subagent"
+      ? "console.ledger_kind_subtool"
+      : span.kind === "compaction"
+        ? "console.ledger_kind_compacted"
+        : `console.traj_kind_${span.kind}`;
+  const lines = [t(kindKey)];
   if (model.mode === "duration" && !model.degraded && startedAt !== null) {
     lines.push(endedAt === null
       ? t("console.timeline_tip_started", { t: formatClock(startedAt) })

@@ -21,6 +21,7 @@ import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { RenderedIo } from "./RowDetailPayloadResult";
 import { RowDetailTiming } from "./RowDetailTiming";
 
+import "./kind_tag.css";
 import "./record_details.css";
 
 const { Text } = Typography;

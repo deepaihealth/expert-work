@@ -16,6 +16,7 @@ import type { DisplayRow } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { LedgerRow } from "./TrajectoryLedgerRow";
 import { useVirtualRows } from "./use_virtual_rows";
+import "./kind_tag.css";
 import "./trajectory_ledger.css";
 
 /** 固定行高(CSS 里的 `--ew-ledger-row` 同值)—— 虚拟化按它算窗口与 spacer。 */
