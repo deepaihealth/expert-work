@@ -17,6 +17,7 @@ backstop for that case.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -178,8 +179,13 @@ class TokenSink:
         self._content = StreamingRedactor(dlp=dlp, screen=screen)
         self._reasoning = StreamingRedactor(dlp=dlp, screen=screen)
         self._tool_names: dict[int, str] = {}
+        #: ``time.monotonic()`` of the first non-empty delta; agent_node uses
+        #: it to compute ``first_token_ms``.
+        self.first_delta_at: float | None = None
 
     async def __call__(self, delta: LLMDelta) -> None:
+        if self.first_delta_at is None and (delta.content or delta.reasoning or delta.tool_calls):
+            self.first_delta_at = time.monotonic()
         safe = self._content.feed(delta.content)
         if safe:
             await self._publish({"step": self._step, "channel": "content", "text": safe})
