@@ -152,6 +152,24 @@ class ToolSpec:
 
 
 @dataclass(frozen=True)
+class ToolCatalogEntry:
+    """One row of the registry's "everything registered" projection (PR-A.3).
+
+    The console's Schema tab wants the JSON Schema the model was handed
+    (``parameters``) plus provenance — including tools that are deferred
+    (not in ``specs()``) so a promoted-on-demand call still resolves.
+    """
+
+    name: str
+    description: str
+    parameters: Mapping[str, Any]
+    #: ``source_of(name)`` — ``"builtin"`` / ``"mcp:<server>"`` / ...
+    source: str
+    from_skill: str | None
+    deferred: bool
+
+
+@dataclass(frozen=True)
 class ToolContext:
     """Per-invocation context threaded from the ReAct ``tools`` node.
 
@@ -419,6 +437,20 @@ class ToolRegistry:
         deferred tools this equals :meth:`specs`.
         """
         return [tool.spec for tool in self._tools.values()]
+
+    def catalog(self) -> tuple[ToolCatalogEntry, ...]:
+        """Every registered tool — active and deferred — in registration order."""
+        return tuple(
+            ToolCatalogEntry(
+                name=name,
+                description=tool.spec.description,
+                parameters=dict(tool.spec.parameters),
+                source=self.source_of(name),
+                from_skill=tool.spec.from_skill,
+                deferred=name in self._deferred,
+            )
+            for name, tool in self._tools.items()
+        )
 
     def deferred_specs(self, names: Iterable[str]) -> list[ToolSpec]:
         """Specs for the given ``names`` that are actually deferred.
