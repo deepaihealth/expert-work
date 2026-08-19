@@ -289,7 +289,7 @@ groups:
         annotations:
           summary: "Threat scanner block rate spike"
           description: "Block rate is {{ $value }} blocks/sec sustained 15m — check audit log + pattern-set tuning."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
 
       # P1 — any fire-time WARN is suspicious in a steady state (creates
       # are already strict-scanned). Treat as latent drift signal.
@@ -301,7 +301,7 @@ groups:
         annotations:
           summary: "Trigger fire-time prompt scan warned"
           description: "Fire-time warn rate is {{ $value }} / hr — possible DB drift or new pattern matching historical triggers."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
 
       # Capability Uplift Sprint #2 (Mini-ADR U-4) — drift on memory
       # rows means the DB row has been mutated past the strict-scan
@@ -315,7 +315,7 @@ groups:
         annotations:
           summary: "Memory content drift detected"
           description: "Memory drift rate is {{ $value }} / hr — DB rows mutated past the strict-scan gate. See runbook § 8 for SQL-injection / internal-actor triage."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
 
       # P1 — sustained recall-time redactions usually indicate either
       # (a) a recent pattern-set update is catching memories that landed
@@ -330,7 +330,7 @@ groups:
         annotations:
           summary: "Memory recall redaction rate elevated"
           description: "Recall redact rate is {{ $value }} / hr sustained 30m — either a noisy pattern update or a write-time scan miss."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/threat-scanner-tuning.md"
 
       # Capability Uplift Sprint #5 (Mini-ADR U-13) — an MCP server
       # that the circuit breaker has opened in the last 30 minutes
@@ -347,7 +347,7 @@ groups:
         annotations:
           summary: "MCP server circuit open ≥ 10m"
           description: "Server {{ $labels.server }} is unreachable; agents lose access to its tools. See runbook § 5 to triage."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
 
       # P2 — sustained MCP call failure rate spike. Differs from
       # ExpertWorkUpliftMCPServerUnhealthy in that the breaker may not yet
@@ -361,7 +361,7 @@ groups:
         annotations:
           summary: "MCP call failure rate spike on {{ $labels.server }}"
           description: "{{ $labels.transport }} server {{ $labels.server }} failure rate is {{ $value }} sustained 15m. See runbook § 2."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/mcp-client-tuning.md"
 
       # Capability Uplift Sprint #3 (Mini-ADR U-21) — drift on skill_version
       # rows is the same P0 attack signature as memory drift: the stored
@@ -377,7 +377,7 @@ groups:
         annotations:
           summary: "Skill content drift detected"
           description: "Skill drift rate is {{ $value }} / hr — DB row mutated past write-time strict scan, almost certainly SQL injection or internal actor. See runbook § 8."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-8"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-8"
 
       # Capability Uplift Sprint #3 (Mini-ADR U-21) — sustained ZIP
       # import strict-scan blocks point at either (a) a noisy pattern
@@ -392,7 +392,7 @@ groups:
         annotations:
           summary: "Skill ZIP threat-scan blocks elevated"
           description: "ZIP import strict scan blocked {{ $value }} / sec sustained 30m (~6/hr) — pattern tuning or attack probing. See runbook § 7."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-7"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-7"
 
       # Capability Uplift Sprint #3 (Mini-ADR U-21) — ZIP reject rate
       # is a softer signal than blocked-scan: rejects happen before
@@ -408,7 +408,7 @@ groups:
         annotations:
           summary: "Skill ZIP reject rate elevated"
           description: "User upload ZIPs being rejected {{ $value }} / sec sustained 30m (~6/hr) — check audit log for attack pattern or doc gap."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-packaging.md"
 
       # Capability Uplift Sprint #3 (Mini-ADR U-24) — surge in non-admin
       # activation attempts on high-risk skills. M0 reality: this is
@@ -423,7 +423,7 @@ groups:
         annotations:
           summary: "High-risk skill activation attempts elevated"
           description: "Non-admin actors trying to activate high-risk skills {{ $value }} / sec sustained 30m (~30/hr) — investigate skill author + intent. See runbook § 11."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-11"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-packaging.md#section-11"
 
       # Sprint #4 (Mini-ADR U-31) — Curator alerts.
       # P2 — > 50 active→stale transitions in one day is unusually high
@@ -438,7 +438,7 @@ groups:
         annotations:
           summary: "Curator marked > 50 skills stale in last day"
           description: "{{ $value }} active→stale transitions in 24h — verify activity tracking is firing and tenant_config.skill_stale_days isn't mis-set. See runbook § 3."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-curator.md#section-3"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-curator.md#section-3"
 
       # P2 — any non-trivial rate of agents trying to read archived
       # skills means an active manifest references a skill the Curator
@@ -451,7 +451,7 @@ groups:
         annotations:
           summary: "Agents trying to read archived skills > 6/hr"
           description: "{{ $value }} archived-skill read attempts/sec sustained 30m — an agent's manifest probably references an auto-archived skill. See runbook § 4."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/skill-curator.md#section-4"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/skill-curator.md#section-4"
 
       # Capability Uplift Sprint #7 (Mini-ADR U-41) — MemoryConsolidator.
       # P2 — 0 consolidations across all tenants for 3 days means either
@@ -465,7 +465,7 @@ groups:
         annotations:
           summary: "MemoryConsolidator produced 0 consolidations in 3 days"
           description: "Zero consolidations sustained 3d — verify aux_model is wired (Sprint #7 ships a no-op default), tenant_config thresholds aren't disabling, embedding pipeline is healthy. See runbook § 4."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-4"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-4"
 
       # P2 — > 100 noise-purges in one day is well above the expected
       # trickle and points at either upstream memory_writeback emitting
@@ -479,7 +479,7 @@ groups:
         annotations:
           summary: "MemoryConsolidator purged > 100 items in last day"
           description: "{{ $value }} purges in 24h — investigate whether memory_writeback is leaking noise or anti-mislearn prompt regressed. See runbook § 5."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-5"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-5"
 
       # P3 — anti-mislearn rejection rate > 50% of all cluster decisions
       # is a soft warning that either (a) writeback is generating too
@@ -500,7 +500,7 @@ groups:
         annotations:
           summary: "MemoryConsolidator anti-mislearn rejection > 50% of decisions"
           description: "Rejection ratio is {{ $value }} sustained 1d — either upstream writeback is leaking noise (good catch) or anti-mislearn prompt regressed. See runbook § 6."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-6"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/memory-consolidator.md#section-6"
 
       # Stream O — Credentials.
       # P1 — sustained 401 fail-fast rate. Either tenant mode + missing
@@ -515,7 +515,7 @@ groups:
         annotations:
           summary: "Credentials resolve failures sustained on {{ $labels.role }}/{{ $labels.key }}"
           description: "{{ $value }} missing-cred lookups/sec sustained 10m for {{ $labels.role }}={{ $labels.key }} in mode={{ $labels.mode }}. See runbook § 3."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/credentials.md#section-3"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/credentials.md#section-3"
 
       # P3 — Stream O transition-period signal. After PR 2 wires the
       # remaining callers (embedder / reranker / web_search) the legacy
@@ -529,4 +529,4 @@ groups:
         annotations:
           summary: "Stream O legacy credential fallback still triggering for {{ $labels.role }}"
           description: "Migrate {{ $labels.role }} caller to CredentialsResolver and remove legacy settings env. See runbook § 4."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/credentials.md#section-4"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/credentials.md#section-4"

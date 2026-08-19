@@ -20,7 +20,7 @@ groups:
         annotations:
           summary: "Control-plane is down"
           description: "Prometheus has failed to scrape expert-work-control-plane for 2m."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
       # P1 — availability SLI (G.1 recording rule) below 95% over 5m.
       - alert: ExpertWorkControlPlaneHigh5xxRate
@@ -31,7 +31,7 @@ groups:
         annotations:
           summary: "Control-plane 5xx rate elevated"
           description: "5m success ratio is {{ $value | humanizePercentage }} (SLO target 99.9%)."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
       # P2 — P99 latency SLI (G.1 recording rule) far above the 200ms SLO.
       - alert: ExpertWorkControlPlaneHighLatency
@@ -42,7 +42,7 @@ groups:
         annotations:
           summary: "Control-plane P99 latency degraded"
           description: "P99 request latency is {{ $value }}s (SLO target < 0.2s)."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
       # P2 — the quota reaper background loop is erroring.
       - alert: ExpertWorkQuotaReaperErrors
@@ -53,7 +53,7 @@ groups:
         annotations:
           summary: "Quota reaper cycle errors"
           description: "The quota reaper logged {{ $value }} cycle error(s) in the last 15m."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
       # P2 — sandbox egress rejected with 407 (sandbox-egress-age-quota Task 3).
       - alert: ExpertWorkSandboxEgressAuthBlocked
@@ -64,7 +64,7 @@ groups:
         annotations:
           summary: "Sandbox egress rejected with 407 (blocked_auth)"
           description: "{{ $value }} sandbox egress attempt(s) were rejected by the credential proxy with 407 in the last 15m — most likely an egress token that outlived its sandbox (or a warm session past its token TTL before the age cap kicked in)."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/control-plane.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
   # Stream M — M0→M1 Gate-watch group.
   #
@@ -91,7 +91,7 @@ groups:
         annotations:
           summary: "Control-plane success ratio below Gate target"
           description: "5m success ratio is {{ $value | humanizePercentage }} — Gate target 99.9%."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       - alert: ExpertWorkGateFirstNodeOverBudget
         expr: |
@@ -105,7 +105,7 @@ groups:
         annotations:
           summary: "First graph-node P95 above Gate budget (2.0s)"
           description: "1h P95 time-to-first-graph-node is {{ $value }}s — Gate budget 2.0s."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       - alert: ExpertWorkGateSandboxColdStartOverBudget
         expr: |
@@ -119,7 +119,7 @@ groups:
         annotations:
           summary: "Sandbox cold-start P95 above Gate budget (5.0s)"
           description: "1h P95 cold-start is {{ $value }}s — Gate budget 5.0s."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       - alert: ExpertWorkGateDurableResumeOverBudget
         expr: |
@@ -133,7 +133,7 @@ groups:
         annotations:
           summary: "Durable resume P95 above Gate budget (1.0s)"
           description: "1h P95 durable resume is {{ $value }}s — Gate budget 1.0s."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       # End-to-end P95 for successful runs — Gate target < 30s. Filtered
       # to outcome="success" so user-facing latency isn't biased by
@@ -150,7 +150,7 @@ groups:
         annotations:
           summary: "End-to-end session P95 above Gate budget (30s)"
           description: "1h P95 successful session duration is {{ $value }}s — Gate budget 30s."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       # Stream-stale spike — Gate target is < 0.05% in 30d. The denominator
       # uses expert_work_llm_token_usage_total as a proxy for active LLM
@@ -169,7 +169,7 @@ groups:
         annotations:
           summary: "LLM stream stale rate above Gate target (0.05%)"
           description: "1h stream-stale ratio is {{ $value | humanizePercentage }} — Gate target 0.05%."
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       # 委托闸(二期 PR3)可观测性追加。基线未知,先保守观察级
       # (severity: gate-watch,随组内既有条目走同一路由)——阈值
@@ -182,7 +182,7 @@ groups:
         annotations:
           summary: "委托闸出现饱和拒绝"
           description: "过去 15m 有 {{ $value }} 次委托被并发闸拒绝（acquire 超时）。"
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
 
       - alert: ExpertWorkGateDelegationFailOpen
         expr: increase(expert_work_delegation_gate_fail_open_total[15m]) > 0
@@ -192,4 +192,4 @@ groups:
         annotations:
           summary: "闸容量配置读取失败，fail-open 中"
           description: "过去 15m 有 {{ $value }} 次 DelegationGate 容量 provider 读取失败，已 fail-open（不限流）。"
-          runbook_url: "https://github.com/joneqian/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/m0-m1-gate.md"
