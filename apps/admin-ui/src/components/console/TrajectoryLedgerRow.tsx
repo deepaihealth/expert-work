@@ -49,8 +49,13 @@ export function contentPartsOf(record: LedgerRecord, t: TFunction): ContentParts
     ? null
     : t(`console.ledger_placeholder_${record.placeholder}`);
   const named = NAMED_KINDS.has(record.kind);
-  const cut = named ? record.text.indexOf(" ") : -1;
-  const name = !named ? null : cut === -1 ? record.text : record.text.slice(0, cut);
+  // 子代理的名字是 worker 的 label,可以带空格(「research worker」)——
+  // 按第一个空格拆会把它劈成半个名字加半句任务,所以直接读结构化字段。
+  const subagent = record.row.kind === "subagent" ? record.row : null;
+  const cut = named && subagent === null ? record.text.indexOf(" ") : -1;
+  const name = subagent !== null
+    ? subagent.worker.label
+    : !named ? null : cut === -1 ? record.text : record.text.slice(0, cut);
   const toolCallOnly = record.kind === "assistant" && record.text === "" && prefix === null;
   // `LedgerRecord.kind` 按构造就是 `row.kind`(见 ledger_types),窄化到 `row`
   // 上就不用 as 断言了。MEMORY 的 `text` 在账本层是空串,正文全靠这两个既有键。
@@ -59,9 +64,11 @@ export function contentPartsOf(record: LedgerRecord, t: TFunction): ContentParts
     ? t("console.ledger_tool_call_only")
     : memory !== null
       ? t(memory.direction === "recall" ? "console.row_memory_recall" : "console.row_memory_writeback", { n: memory.count })
-      : named
-        ? cut === -1 ? "" : record.text.slice(cut + 1)
-        : record.text;
+      : subagent !== null
+        ? subagent.worker.taskExcerpt
+        : named
+          ? cut === -1 ? "" : record.text.slice(cut + 1)
+          : record.text;
   // 结果没到:已结束的工具类写「(无输出)」,还在跑的留空 —— 跑到一半的调用
   // 本来就还没有输出,写「无输出」是在报一个假结论。
   const result = record.resultText !== null

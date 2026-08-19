@@ -5,10 +5,12 @@
  * jsdom 里都不存在,逐个 mock。见 task-8-brief.md。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 import i18n from "../../../i18n";
-import type { AssistantRow, MemoryRow, ToolRow, TrajectoryRow, UserRow } from "../../../api/trajectory_rows";
+import type {
+  AssistantRow, MemoryRow, SubagentRow, ToolRow, TrajectoryRow, UserRow,
+} from "../../../api/trajectory_rows";
 import type { DisplayRow } from "../ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
 import { TrajectoryLedger, type TrajectoryLedgerProps } from "../TrajectoryLedger";
@@ -225,11 +227,23 @@ describe("TrajectoryLedger", () => {
     expect(onToggleOwner).toHaveBeenCalledWith("t1/assistant:1");
     expect(onToggleTurn).not.toHaveBeenCalled();
 
-    // 无子记录的 assistant 双击不折叠任何东西。
+    // 无子记录的 assistant 落到第三档:折所在轮(t1 有 3 条非 USER 记录)。
     onToggleOwner.mockClear();
     fireEvent.doubleClick(rows[3]);
     expect(onToggleOwner).not.toHaveBeenCalled();
+    expect(onToggleTurn).toHaveBeenCalledWith("t1");
+
+    // 工具行同理 —— 双击账本任意一行都该折得动所在轮,不只轮首行。
+    onToggleTurn.mockClear();
+    fireEvent.doubleClick(rows[2]);
+    expect(onToggleTurn).toHaveBeenCalledWith("t1");
+
+    // 但只有一条非 USER 记录的轮不值得折,双击它什么都不做。
+    onToggleTurn.mockClear();
+    onToggleOwner.mockClear();
+    fireEvent.doubleClick(rows[5]);
     expect(onToggleTurn).not.toHaveBeenCalled();
+    expect(onToggleOwner).not.toHaveBeenCalled();
   });
 
   it("双击已折叠那一轮里剩下的行会把它展开", () => {
@@ -490,6 +504,98 @@ describe("TrajectoryLedger", () => {
     scrollIntoView.mockClear();
     rerender(<TrajectoryLedger {...props} scrollTo={{ id: "t1/tool:1:0", nonce: 1 }} hoveredId="t2/user" />);
     expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("目标行在虚拟窗口外时改用 scrollTop 兜底(scrollIntoView 无从谈起)", () => {
+    const many = Array.from({ length: 100 }, (_, i) =>
+      rec({ id: `t1/row-${i}`, index: i, kind: "tool", row: toolRow, text: `bash {"i":${i}}`, resultText: "ok" }),
+    );
+    const props = baseProps({ rows: recordRows(many) });
+    const { rerender } = render(<TrajectoryLedger {...props} />);
+    const container = screen.getByTestId("console-traj-ledger");
+    mockGeometry(container, { clientHeight: 500, scrollTop: 0 });
+    fireEvent.scroll(container);
+    const rendered = screen.getAllByTestId("console-traj-row").map((r) => r.dataset.recordId);
+    expect(rendered).not.toContain("t1/row-80");
+    scrollIntoView.mockClear();
+
+    rerender(<TrajectoryLedger {...props} scrollTo={{ id: "t1/row-80", nonce: 1 }} />);
+    // DOM 里没有这一行 —— 只能自己算:80 × 27 − 500 / 2 = 1910(center)。
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    expect(container.scrollTop).toBe(1910);
+  });
+
+  it("窗口外的选中行兜底时把「加载更早」那一行算进偏移", () => {
+    const many = Array.from({ length: 100 }, (_, i) =>
+      rec({ id: `t1/row-${i}`, index: i, kind: "tool", row: toolRow, text: "bash {}", resultText: "ok" }),
+    );
+    const props = baseProps({ rows: recordRows(many), hasEarlier: true, earlierCount: 4 });
+    const { rerender } = render(<TrajectoryLedger {...props} />);
+    const container = screen.getByTestId("console-traj-ledger");
+    mockGeometry(container, { clientHeight: 500, scrollTop: 0 });
+    fireEvent.scroll(container);
+    scrollIntoView.mockClear();
+
+    rerender(<TrajectoryLedger {...props} selectedId="t1/row-80" />);
+    // nearest 顶对齐,前面还压着一行「加载更早」:(1 + 80) × 27 = 2187。
+    expect(container.scrollTop).toBe(2187);
+  });
+
+  it("首批行到达时跟到最新,且只做一次", () => {
+    const props = baseProps({ rows: [] });
+    const { rerender } = render(<TrajectoryLedger {...props} />);
+    const container = screen.getByTestId("console-traj-ledger");
+    mockGeometry(container, { clientHeight: 100, scrollHeight: 200, scrollTop: 0 });
+
+    rerender(<TrajectoryLedger {...props} rows={recordRows(fixtureRecords())} />);
+    expect(container.scrollTop).toBe(200);
+
+    // 第二次长行不再自动跟(没在 running) —— 初始尾随是一次性的。
+    mockGeometry(container, { scrollTop: 0, scrollHeight: 300 });
+    const grown = [...fixtureRecords(), { ...fixtureRecords()[0], id: "t3/user", index: 6 }];
+    rerender(<TrajectoryLedger {...props} rows={recordRows(grown)} />);
+    expect(container.scrollTop).toBe(0);
+  });
+
+  it("初始尾随让位给 scrollTo 与已选中行", () => {
+    const withTarget = baseProps({ rows: [], scrollTo: { id: "t1/user", nonce: 1 } });
+    const { rerender } = render(<TrajectoryLedger {...withTarget} />);
+    const container = screen.getByTestId("console-traj-ledger");
+    mockGeometry(container, { clientHeight: 100, scrollHeight: 200, scrollTop: 0 });
+    rerender(<TrajectoryLedger {...withTarget} rows={recordRows(fixtureRecords())} />);
+    expect(container.scrollTop).toBe(0);
+
+    // 换第二组 props 前先卸载 —— 两棵树同时挂着的话 testid 会撞。
+    cleanup();
+    const withSelection = baseProps({ rows: [], selectedId: "t1/user" });
+    const second = render(<TrajectoryLedger {...withSelection} />);
+    const el = second.getByTestId("console-traj-ledger");
+    mockGeometry(el, { clientHeight: 100, scrollHeight: 200, scrollTop: 0 });
+    second.rerender(<TrajectoryLedger {...withSelection} rows={recordRows(fixtureRecords())} />);
+    expect(el.scrollTop).toBe(0);
+  });
+
+  it("子代理行名字取 worker.label(两个词也不拆),参数取 taskExcerpt", () => {
+    const worker: SubagentRow["worker"] = {
+      workerId: "w-1", parentWorkerId: null, parentToolCallId: "call_1", label: "research worker",
+      agentRef: "researcher", depth: 1, role: null, taskExcerpt: "查一下 2026 年的票价",
+      maxSteps: null, status: "success", steps: [], children: [], summary: null,
+    };
+    const subRow: SubagentRow = {
+      id: "subagent:1:0:0", kind: "subagent", seq: 1, step: 1, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, parentEntryId: "call_1", worker,
+    };
+    const rows = recordRows([
+      rec({
+        id: "t1/subagent:1:0:0", index: 0, kind: "subagent", row: subRow, lane: 2,
+        text: "research worker 查一下 2026 年的票价", resultText: "3 次模型调用 · 900ms",
+      }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows })} />);
+    const cell = screen.getByTestId("console-traj-content");
+    expect(cell.querySelector(".ew-ledger__nm")).toHaveTextContent("research worker");
+    expect(cell.querySelector(".ew-ledger__args")).toHaveTextContent("查一下 2026 年的票价");
+    expect(cell).toHaveAttribute("title", "research worker 查一下 2026 年的票价 → 3 次模型调用 · 900ms");
   });
 
   it("选中行变化时把它滚进视口", () => {

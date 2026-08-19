@@ -24,6 +24,14 @@
   position: sticky;
   top: 0;
   z-index: 6;
+  height: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* sticky 元素照样占流内空间,所以真正的条子挂在高度 0 的壳里溢出来画 ——
+   不然表格会被整体推下去 30px,行号和 spacer 全对不上。 */
+.ew-ledger__loading-bar {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -33,7 +41,6 @@
   background: var(--ew-surface-raised);
   color: var(--ew-text-secondary);
   font-size: 12px;
-  pointer-events: none;
 }
 
 .ew-ledger__spinner {
@@ -80,8 +87,9 @@
   border: 0;
 }
 
+/* 三种行(记录 / 摘要 / 加载更早)一律 `--ew-ledger-row` —— 虚拟化的 spacer
+   是按这一个数算出来的,任何一种行矮一点,全折叠时视口底部就露白。 */
 .ew-ledger__earlier td {
-  height: 30px;
   padding: 0;
 }
 
@@ -91,7 +99,7 @@
   justify-content: center;
   gap: 6px;
   width: 100%;
-  height: 29px;
+  height: 26px;
   border: none;
   background: var(--ew-surface-raised);
   color: var(--ew-text-secondary);
@@ -379,7 +387,6 @@
 }
 
 .ew-ledger__summary td {
-  height: 20px;
   color: var(--ew-text-secondary);
 }
 

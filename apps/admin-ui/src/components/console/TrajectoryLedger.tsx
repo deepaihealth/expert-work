@@ -33,7 +33,9 @@ export interface TrajectoryLedgerProps {
   onSelectRequest: (no: number) => void;
   hoveredId: string | null;
   onHover: (id: string | null) => void;
-  /** 时间轴选区求交的记录 index 集;null = 无选区。 */
+  /** 时间轴选区求交的记录 index 集;null = 无选区。**引用必须稳定**(调用方
+   *  `useMemo`):选区一变账本就把段内首行拽进视口,每渲染一次换一个新 Set
+   *  等于每帧都把读者的视口抢走。 */
   focusIndexes: ReadonlySet<number> | null;
   /** 当前轮(选中记录所在轮,或最新轮)。 */
   activeTurnKey: string | null;
@@ -87,6 +89,7 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevRowCountRef = useRef(rows.length);
+  const initialTailDoneRef = useRef(false);
 
   const { start, end, topPad, bottomPad } = useVirtualRows({
     scrollRef, count: rows.length, rowHeight: ROW_HEIGHT_PX, overscan: OVERSCAN_ROWS,
@@ -96,6 +99,15 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
     () => rows.flatMap((row) => (row.kind === "record" ? [row.record.id] : [])),
     [rows],
   );
+  /** 记录 id → 它在 `rows` 里的下标(不是 `record.index`:折叠会让两者分家)。
+   *  虚拟窗口外的行没有 DOM 节点,只能靠这个下标算滚动位置。 */
+  const rowIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    rows.forEach((row, at) => {
+      if (row.kind === "record") map.set(row.record.id, at);
+    });
+    return map;
+  }, [rows]);
   const foldContext = useMemo(() => foldContextOf(rows), [rows]);
 
   /** 按 `data-record-id` 找已渲染的那一行 —— 记录 id 里有 `/` 和 `:`,直接塞进
@@ -107,18 +119,43 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
     return nodes.find((node) => node.dataset.recordId === id) ?? null;
   }, []);
 
-  // 选中行滚进视口(jsdom 没有 `scrollIntoView`,一律可选调用)。
+  /** 把某一行带到眼前。行渲染出来了就用 `scrollIntoView`(jsdom 没有它,一律
+   *  可选调用);**没渲染出来**就自己算 —— 虚拟化只挂视口 + overscan,窗口外
+   *  的目标在 DOM 里根本不存在,只扫已渲染的行会静默什么都不做、且永远不会
+   *  收敛(滚动没发生 → 窗口不变 → 行还是不在)。设 `scrollTop` 之后
+   *  `useVirtualRows` 会因 scroll 事件重算窗口,目标行随即挂上。 */
+  const scrollToRow = useCallback(
+    (id: string, block: "nearest" | "center"): void => {
+      const el = rowElement(id);
+      if (el !== null) {
+        el.scrollIntoView?.({ block });
+        return;
+      }
+      const node = scrollRef.current;
+      const at = rowIndexById.get(id);
+      if (node === null || at === undefined) return;
+      // 「加载更早」那一行也占一行高,算偏移时不能漏。
+      const top = (at + (hasEarlier ? 1 : 0)) * ROW_HEIGHT_PX;
+      node.scrollTop = Math.max(block === "center" ? top - node.clientHeight / 2 : top, 0);
+    },
+    [rowElement, rowIndexById, hasEarlier],
+  );
+
+  // 选中行滚进视口。依赖只留 `selectedId`:effect 的回调每次渲染都会被 React
+  // 换成最新的一份,所以真跑起来时闭包里的 `scrollToRow` 就是当前这次渲染的,
+  // 把它写进依赖只会让「`rows` 变了」也去抢视口。
   useEffect(() => {
     if (selectedId === null) return;
-    rowElement(selectedId)?.scrollIntoView?.({ block: "nearest" });
-  }, [selectedId, rowElement]);
+    scrollToRow(selectedId, "nearest");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
 
   // 时间轴刚定格一个选区 → 把段内第一行带到眼前。
   useEffect(() => {
     if (focusIndexes === null || focusIndexes.size === 0) return;
     const first = rows.find((row) => row.kind === "record" && focusIndexes.has(row.record.index));
     if (first === undefined || first.kind !== "record") return;
-    rowElement(first.record.id)?.scrollIntoView?.({ block: "nearest" });
+    scrollToRow(first.record.id, "nearest");
     // `rows` 每次实时刷新都换新数组,跟着它跑会把「选区变了」变成「每帧滚一次」;
     // 这个效果只该由选区本身触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -127,9 +164,21 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
   // 一次性滚动请求:只认 nonce,同一个 nonce 重渲染不重复滚。
   useEffect(() => {
     if (scrollTo === null) return;
-    rowElement(scrollTo.id)?.scrollIntoView?.({ block: "center" });
+    scrollToRow(scrollTo.id, "center");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollTo?.nonce]);
+
+  // §九「尾随:**初始**与运行中跟到最新」—— 首批行落地时对齐到最新一条,只做
+  // 一次。有人明确指了要看哪一行(`scrollTo` / 选区 / 已选中)时让位:那几条
+  // 请求带着读者的意图,尾随只是默认落点。
+  useEffect(() => {
+    if (initialTailDoneRef.current || rows.length === 0) return;
+    initialTailDoneRef.current = true;
+    if (scrollTo !== null || focusIndexes !== null || selectedId !== null) return;
+    const node = scrollRef.current;
+    if (node !== null) node.scrollTop = node.scrollHeight;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows.length]);
 
   // 运行中长出新行时跟到底,除非读者已经上滚去看历史了。
   useEffect(() => {
@@ -153,7 +202,9 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
         onToggleOwner(record.id);
         return;
       }
-      if (record.turnStart && (nonUserByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
+      // 不限轮首行 —— 双击账本里这一轮的**任意**一行都该折得动它;只有非 USER
+      // 记录不到 2 条的轮不值得折(折了也省不出一行)。
+      if ((nonUserByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
     },
     [foldContext, onToggleTurn, onToggleOwner],
   );
@@ -179,8 +230,10 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
     <div ref={scrollRef} className="ew-ledger" data-testid="console-traj-ledger" tabIndex={0} onKeyDown={handleKeyDown}>
       {loading && (
         <div className="ew-ledger__loading" data-testid="console-traj-loading" role="status" aria-live="polite">
-          <span className="ew-ledger__spinner" aria-hidden="true" />
-          {t("console.ledger_loading")}
+          <span className="ew-ledger__loading-bar">
+            <span className="ew-ledger__spinner" aria-hidden="true" />
+            {t("console.ledger_loading")}
+          </span>
         </div>
       )}
       <table
