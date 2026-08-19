@@ -329,7 +329,7 @@ describe("ledgerRowsOf", () => {
   it("ledgerRowsOf: no think rows and no trailing synthetic assistant", () => {
     const rows = ledgerRowsOf(LEDGER_EVENTS, INPUT);
     expect(rows.some((r) => r.kind === "think")).toBe(false);
-    // 末行是最后一个 agent 步的 assistant(seq 4),不是旧的 `id: "assistant"` 合成行。
+    // 末行是最后一个 agent 步的 assistant(该步的 item.seq 是 5),不是旧的 `id: "assistant"` 合成行。
     expect(rows.at(-1)).toMatchObject({ id: "assistant:5" });
     expect(rows.some((r) => r.id === "assistant")).toBe(false);
   });

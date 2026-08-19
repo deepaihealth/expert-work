@@ -273,6 +273,97 @@ describe("buildLedger", () => {
   });
 });
 
+/** 被中止的轮:工具调用发出去了,ToolMessage 永远没到 —— 回放之后这条 tool 行
+ *  始终是 running。窗口里躺着这么一条历史记录,是「最后一条 running 拉到现在」
+ *  那条规则最容易踩的坑。 */
+function abortedEvents(atMs: number | null): SseEvent[] {
+  return [
+    upd("agent", { step_count: 1, _duration_ms: 200, messages: [{
+      type: "ai", content: "查一下",
+      usage_metadata: { input_tokens: 10, output_tokens: 2 },
+      tool_calls: [call("c7", "query_crm")],
+    }] }, atMs),
+  ];
+}
+function abortedTurn(key: string, seq: number, atMs: number | null, over: Partial<ConsoleTurn> = {}): ConsoleTurn {
+  return turnOf({
+    key, seq,
+    turn: { id: key, input: "问", attachments: [], inputs: {}, events: abortedEvents(atMs), status: "error", error: null, approval: null },
+    ...over,
+  });
+}
+
+describe("buildLedger · 运行中尾块", () => {
+  it("a history turn's still-running record is NOT stretched to nowMs", () => {
+    const ledger = buildLedger({ turns: [abortedTurn("H", 0, 2000)], streamTurnKey: null, nowMs: NOW });
+    const byId = new Map(ledger.records.map((r) => [r.id, r]));
+    expect(byId.get("H/tool:0:0")).toMatchObject({ running: true, startedAt: BASE + 2000, endedAt: BASE + 2000 });
+    expect(ledger.records.some((r) => r.endedAt === NOW)).toBe(false);
+
+    // 另一半:正在流的那轮自己**没有** running 记录时,窗口里最后一条 running
+    // 仍然是历史轮那条 —— 它照样不许被顶到「现在」。
+    const settledStream = turnOf({ key: "S", seq: 1, source: "live",
+      turn: { id: "S", input: "问", attachments: [], inputs: {}, events: turnAEvents(), status: "running", error: null, approval: null } });
+    const withStream = buildLedger({ turns: [abortedTurn("H", 0, 2000), settledStream], streamTurnKey: "S", nowMs: NOW });
+    expect(withStream.records.some((r) => r.running && r.turnKey === "S")).toBe(false);
+    expect(withStream.records.find((r) => r.id === "H/tool:0:0")).toMatchObject({ running: true, endedAt: BASE + 2000 });
+    expect(withStream.records.some((r) => r.endedAt === NOW)).toBe(false);
+  });
+
+  it("only the stream turn's last running record is stretched to nowMs", () => {
+    const turns = [
+      abortedTurn("H", 0, 2000),
+      abortedTurn("S", 1, 6000, { source: "live", turn: { id: "S", input: "问", attachments: [], inputs: {}, events: abortedEvents(6000), status: "running", error: null, approval: null } }),
+    ];
+    const byId = new Map(buildLedger({ turns, streamTurnKey: "S", nowMs: NOW }).records.map((r) => [r.id, r]));
+    expect(byId.get("H/tool:0:0")).toMatchObject({ running: true, endedAt: BASE + 2000 });
+    expect(byId.get("S/tool:0:0")).toMatchObject({ running: true, startedAt: BASE + 6000, endedAt: NOW });
+  });
+
+  it("a stream turn with no usable times is not stretched — both ends stay null", () => {
+    const turns = [abortedTurn("S", 0, null, { source: "live", turn: { id: "S", input: "问", attachments: [], inputs: {}, events: abortedEvents(null), status: "running", error: null, approval: null } })];
+    const ledger = buildLedger({ turns, streamTurnKey: "S", nowMs: NOW });
+    const rec = ledger.records.find((r) => r.id === "S/tool:0:0");
+    expect(rec).toMatchObject({ running: true, startedAt: null, endedAt: null });
+    expect(ledger.timed).toBe(false);
+  });
+
+  it("live rows start at the turn's latest known end (not the last row in order), clamped to nowMs", () => {
+    // 两个并行工具:c1 的结果 1400 才回来,c2 的 1300 就回来了 —— 按行序的最后
+    // 一条(c2)结束得更早,所以起点必须取「最大的已知结束时刻」。
+    const events: SseEvent[] = [
+      upd("agent", { step_count: 1, _duration_ms: 400, messages: [{ type: "ai", content: "", tool_calls: [call("c1", "a"), call("c2", "b")] }] }, 1000),
+      upd("tools", { messages: [result("c1", "a", 300)] }, 1400),
+      upd("tools", { messages: [result("c2", "b", 200)] }, 1300),
+    ];
+    const turns = [turnOf({ key: "P", seq: 0, source: "live", turn: { id: "P", input: "问", attachments: [], inputs: {}, events, status: "running", error: null, approval: null } })];
+    const live: ReadonlyMap<number, LiveStep> = new Map<number, LiveStep>([
+      [2, { content: "写", reasoning: "", toolNames: new Map(), reasoningMs: null }],
+    ]);
+    const byId = new Map(buildLedger({ turns, streamTurnKey: "P", liveByStep: live, nowMs: NOW }).records.map((r) => [r.id, r]));
+    expect(byId.get("P/tool:0:1")).toMatchObject({ endedAt: BASE + 1300 });
+    expect(byId.get("P/live-assistant:2")).toMatchObject({ startedAt: BASE + 1400, endedAt: NOW });
+
+    // 调用方没校准过时钟(传进来的 now 落在已知结束时刻之前)→ 起点夹到 now,
+    // 不能出现 start > end 的倒挂块。
+    const skewed = buildLedger({ turns, streamTurnKey: "P", liveByStep: live, nowMs: BASE + 1200 });
+    expect(skewed.records.find((r) => r.id === "P/live-assistant:2")).toMatchObject({
+      startedAt: BASE + 1200, endedAt: BASE + 1200,
+    });
+  });
+
+  it("an unreplayed turn without a parseable createdAt has null times and flips ledger.timed", () => {
+    for (const createdAt of [null, "不是时间"]) {
+      const turns = [turnOf({ key: "B", seq: 0, loadState: "pending", createdAt,
+        fallbackLines: [{ text: "答", channel: "final" }],
+        turn: { id: "B", input: "问", attachments: [], inputs: {}, events: [], status: "done", error: null, approval: null } })];
+      const ledger = buildLedger({ turns, streamTurnKey: null, nowMs: NOW });
+      expect(ledger.records.map((r) => [r.startedAt, r.endedAt])).toEqual([[null, null], [null, null]]);
+      expect(ledger.timed).toBe(false);
+    }
+  });
+});
+
 describe("ledgerRecordId", () => {
   it("ledgerRecordId maps think:<seq> to assistant:<seq>", () => {
     expect(ledgerRecordId("run-1", "think:3")).toBe("run-1/assistant:3");

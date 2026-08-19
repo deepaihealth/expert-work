@@ -20,6 +20,8 @@ export { absoluteSpans, lastKnownFrame } from "./ledger_timing";
  *  agent 步是一条 `think:` 行,账本里同一步是 `assistant:` 行 —— 已落帧的步
  *  `think:<seq>` → `assistant:<seq>`,运行中还没落帧的步 `live-think:<step>`
  *  → `live-assistant:<step>`(`liveLedgerRows` 造的那条)。其余 id 两边同名。 */
+// 两条前缀互不包含(`"live-think:2".startsWith("think:")` 为 false),所以顺序
+// 不影响结果;`find` 取首个命中的即可。
 const THINK_PREFIXES: ReadonlyArray<[string, string]> = [
   ["live-think:", "live-assistant:"],
   ["think:", "assistant:"],
@@ -275,16 +277,20 @@ export function buildLedger(args: {
       const rows = [...base, ...live];
       const liveFrom = base.length;
       const spans = absoluteSpans(rows, turn.turn.events, createdMs);
-      // live 合成行没有自己的时序:从本轮最后一条有时序的记录接着长到「现在」。
-      let lastEnd: number | null = null;
+      // live 合成行没有自己的时序:从本轮**已知的最晚结束时刻**接着长到「现在」
+      // —— 取 max 而不是「行序上的最后一条」,并行工具里后发的那条可能先回结果
+      // (行序末尾那条结束得更早),按行序取会让 live 块往回缩。
+      let latestEnd: number | null = null;
       for (let i = 0; i < liveFrom; i += 1) {
         const end = spans?.get(rows[i].id)?.end;
-        if (end !== undefined) lastEnd = end;
+        if (end !== undefined) latestEnd = latestEnd === null ? end : Math.max(latestEnd, end);
       }
       turnRecords = turnRecordsOf({
         turn, rows, liveFrom,
         spanOf: (row) => spans?.get(row.id) ?? null,
-        liveSpan: lastEnd === null ? null : { start: lastEnd, end: args.nowMs },
+        // 起点夹到 `nowMs`:调用方没校准过时钟时 now 可能落在已知结束之前,
+        // 不夹就会出现 start > end 的倒挂块。
+        liveSpan: latestEnd === null ? null : { start: Math.min(latestEnd, args.nowMs), end: args.nowMs },
         startIndex: records.length, nextRequestNo, placeholder: null,
       });
     }
@@ -297,10 +303,16 @@ export function buildLedger(args: {
     records.push(...turnRecords);
   }
 
-  // 运行中的尾记录一直长到「现在」(呼吸块);只认最后一条,前面那些运行中的
-  // 单元各有自己的时序。
-  const lastRunning = records.reduce((acc, r, i) => (r.running ? i : acc), -1);
-  const settled = lastRunning === -1
+  // 运行中的尾记录一直长到「现在」(呼吸块)—— **只认正在流的那一轮的最后一条**。
+  // 历史轮里也会躺着 running 记录(轮被中止、工具没等到 ToolMessage,回放后那条
+  // tool 行永远是 pending),把它拉到「现在」会让时长模式整条轴被它撑爆;它们各
+  // 留各的时序。`startedAt` 为 null(该轮时序不可用)时也不拉 —— 只改 endedAt 会
+  // 造出一条半截时序的记录。
+  const streamKey = args.streamTurnKey;
+  const lastRunning = streamKey === null
+    ? -1
+    : records.reduce((acc, r, i) => (r.running && r.turnKey === streamKey ? i : acc), -1);
+  const settled = lastRunning === -1 || records[lastRunning].startedAt === null
     ? records
     : records.map((r, i) => (i === lastRunning ? { ...r, endedAt: args.nowMs } : r));
 
