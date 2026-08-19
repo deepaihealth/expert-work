@@ -57,11 +57,14 @@ export function useAgentTools(args: {
   useEffect(() => {
     let cancelled = false;
     if (!enabled || current.status !== "idle") {
-      // A fetch still in flight is being abandoned because `enabled` flipped
-      // off mid-`"loading"` — reset to idle, otherwise `status` gets stuck on
-      // `"loading"` forever (no further `enabled` toggle can re-arm it) with
-      // no retry affordance on that tab (fix round 1, Critical #1).
-      if (!enabled && current.status === "loading") {
+      // Two ways a stale `"loading"` could otherwise survive in `cache` with
+      // no request behind it, and pin the tab on the spinner (no retry
+      // affordance there — fix round 1, Critical #1): (1) `enabled` flipped
+      // off mid-`"loading"`; (2) identity and `enabled` flipped together
+      // (thread switch), leaving the OLD identity's `"loading"` entry in
+      // place for when that identity comes back. Reset to idle for the
+      // current identity in both cases.
+      if (cache.identity !== identity || (!enabled && current.status === "loading")) {
         setCache({ identity, status: "idle", byName: EMPTY });
       }
       return () => {
