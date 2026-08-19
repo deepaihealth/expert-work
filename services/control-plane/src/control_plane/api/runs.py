@@ -915,6 +915,7 @@ async def spawn_run(
     idempotency_key: str | None = None,
     request_digest: str | None = None,
     envelope: bool = False,
+    hide_events: frozenset[str] = frozenset(),
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -945,7 +946,14 @@ async def spawn_run(
     status}`` body — admin-ui consumes that shape directly. Only the
     external ``run_agent_for_user`` endpoint (``agents.py``) passes
     ``True``. Stream mode is unaffected: it returns a ``StreamingResponse``,
-    not a JSON body, so there is nothing to envelope."""
+    not a JSON body, so there is nothing to envelope.
+
+    ``hide_events`` (PR-A.3 Task 8) is forwarded to ``sse_consumer`` for the
+    stream-mode branch — it lets the external plane filter console-only
+    frames (e.g. ``system_prompt``, the server-synthesised system prompt
+    text) off the wire. Defaults to an empty set so the console
+    ``trigger_run`` caller is unaffected; only ``run_agent_for_user``
+    (``agents.py``) passes ``EXTERNAL_HIDDEN_EVENTS``."""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -1094,6 +1102,7 @@ async def spawn_run(
             run_manager=runtime.run_manager,
             is_disconnected=request.is_disconnected,
             last_event_id=request.headers.get("Last-Event-ID"),
+            hide_events=hide_events,
         ),
         media_type="text/event-stream",
         headers=headers,

@@ -26,7 +26,7 @@ from control_plane.api._external import (
     load_owned_run,
     reject_nul_path_params,
 )
-from control_plane.api._run_event_stream import build_event_producer
+from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, build_event_producer
 from control_plane.api._user_scope import get_user_repo
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -107,6 +107,9 @@ async def build_events_response(
         stream_bridge=stream_bridge,
         since_seq=since_seq,
         scope=None,
+        # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt 对第三方 API key
+        # 的回放 / live 接合都不可见。
+        hide_events=EXTERNAL_HIDDEN_EVENTS,
     )
     headers = {
         "Cache-Control": "no-cache",

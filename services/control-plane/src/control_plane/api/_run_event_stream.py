@@ -17,20 +17,28 @@ import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
+from control_plane.api._run_event_seq import _merge_ranges, _seq_of
 from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     HEARTBEAT_SENTINEL,
     StreamBridge,
-    StreamEvent,
     is_end,
 )
-from orchestrator.sse import end_frame_data, format_sse
+from orchestrator.sse import SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
 
 logger = logging.getLogger(__name__)
+
+#: 对外平面(API key)恒不可见的帧集合 —— 目前只有 ``system_prompt``
+#: (PR-A.3 §十.1 服务端合成的系统提示词全文,是控制台调试专用的可观测性
+#: 帧,不是产品输出)。与 ``orchestrator.sse.sse_consumer`` 的同名参数同源
+#: 常量,两条对外调用路径(这个模块的回放/live-接合 + 那个模块的
+#: stream-mode SSE consumer)因此共享同一份"对外隐藏什么"的定义,不会分叉。
+EXTERNAL_HIDDEN_EVENTS: frozenset[str] = frozenset({SYSTEM_PROMPT_EVENT})
 
 #: ``RunStatus`` → 对外 ``end`` 帧的 status。词表与 ``sse.py`` 的
 #: ``_EXTERNAL_END_STATUS`` 同源(见 ``EXTERNAL_END_STATUSES``):
@@ -63,33 +71,6 @@ _MAX_TRACKED_HOLES = 4096
 #: 若将来这三条日志新增了**字符串**参数,必须重新评估并删掉对应的抑制注释。
 
 
-def _merge_ranges(seqs: set[int]) -> list[tuple[int, int]]:
-    """把一组 seq 合并成连续闭区间 —— 一个洞段只发一帧 ``gap``。"""
-    merged: list[tuple[int, int]] = []
-    for seq in sorted(seqs):
-        if merged and seq == merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], seq)
-        else:
-            merged.append((seq, seq))
-    return merged
-
-
-def _seq_of(entry: StreamEvent) -> int | None:
-    """从帧 id 里解析落库 ``seq``;``None`` 表示这帧不参与接合。
-
-    ``entry.id is None`` 是一次性帧 —— 不可回放、不占号(今天只有 ``token``,
-    见 :meth:`StreamBridge.publish_ephemeral`)。
-    id 形状不认识时同样返回 ``None``:放行总比把它当成某个号去参与去重安全。
-    """
-    if entry.id is None:
-        return None
-    try:
-        return int(entry.id.rsplit("-", 1)[1])
-    except (IndexError, ValueError):
-        logger.warning("live_stream.unparsable_frame_id id=%s", entry.id)
-        return None
-
-
 @dataclass(frozen=True)
 class EventStreamPlan:
     """一次 SSE 响应的构造结果 —— 字节生成器 + 回放游标。
@@ -117,12 +98,23 @@ async def build_event_producer(
     stream_bridge: StreamBridge,
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
+    hide_events: frozenset[str] = frozenset(),
 ) -> EventStreamPlan:
     """Return the SSE byte producer for one run, plus the replay cursor.
 
     收的是 ``run_status`` 而不是 ``is_terminal``:终态与否**在函数内部推导**,
     所以只有一处可能弄错;而回放分支的 ``end`` 帧还需要这个状态本身
     (P3 PR-1 Task 5 —— 取消与答完必须可区分)。
+
+    ``hide_events``(PR-A.3 Task 8)—— 对外平面传 :data:`EXTERNAL_HIDDEN_EVENTS`
+    过滤掉 console-only 帧(如 ``system_prompt``)。过滤**只**发生在
+    ``_encode``(把一条落库记录 / 一帧实时事件编码成 SSE 字节的唯一一点)——
+    分页游标(``next_seq``)、``truncated`` 判定、``_stream_live`` 的去重
+    (``last``)与缺口回填(``holes``)全部继续用未过滤的记录计算,被过滤帧
+    因此不会打乱这些不变式:即便它是页里最后一条记录,``next_seq`` /
+    ``truncated`` / ``end`` 的判定依旧基于真实的原始行,只是这一条本身不会
+    被写进 wire。控制台调用方(``runs.py`` 的 console 回放 / live)不传这个
+    参数,继续拿到未过滤的全量帧。
 
     * Terminal run → :meth:`RunEventStore.list`,**一页**(``MAX_LIST_LIMIT``),
       按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
@@ -159,16 +151,26 @@ async def build_event_producer(
                 return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
         return await event_store.list(run_id=run_id, since_seq=after, limit=limit)
 
+    def _encode(event_name: str, data: Any, *, event_id: str | None) -> list[bytes]:
+        """编码一条记录 / 一帧实时事件成 SSE 字节 —— 对外过滤在**这一点且只
+        在这一点**发生:``event_name in hide_events`` 时不产出字节,调用方的
+        seq 游标(``last`` / ``next_seq`` / ``holes``)照旧照真实记录推进,
+        不受影响。"""
+        if event_name in hide_events:
+            return []
+        return [format_sse(event_name, data, event_id=event_id)]
+
     async def _stream_replay(
         rows: Sequence[RunEventRecord], next_seq: int | None
     ) -> AsyncIterator[bytes]:
         """把已经读好的一页帧吐出去;截断时以 ``truncated`` 收尾。"""
         for row in rows:
-            yield format_sse(
+            for chunk in _encode(
                 row.event_name,
                 row.data,
                 event_id=f"{row.created_at_ms}-{row.seq}",
-            )
+            ):
+                yield chunk
         if next_seq is not None:
             # 截断 —— **不发 end**。以前这里补一个 end,客户端会以为流正常结束,
             # 把后面的帧静默丢掉。``truncated`` 帧与 ``X-Expert-Work-Next-Seq``
@@ -291,9 +293,10 @@ async def build_event_producer(
             for row in rows:
                 for chunk in _record_holes(row.seq):
                     yield chunk
-                yield format_sse(
+                for chunk in _encode(
                     row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
-                )
+                ):
+                    yield chunk
                 last = row.seq
             if len(rows) < MAX_LIST_LIMIT:
                 break
@@ -326,7 +329,8 @@ async def build_event_producer(
             if seq in holes:
                 # 落库没有它,但 bridge 缓冲区里还留着 —— 补发。
                 holes.discard(seq)
-                yield format_sse(entry.event, entry.data, event_id=entry.id)
+                for chunk in _encode(entry.event, entry.data, event_id=entry.id):
+                    yield chunk
                 continue
             if seq <= last:
                 continue  # 补库阶段已经发过
@@ -341,9 +345,10 @@ async def build_event_producer(
                             break
                         for chunk in _record_holes(row.seq):
                             yield chunk
-                        yield format_sse(
+                        for chunk in _encode(
                             row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
-                        )
+                        ):
+                            yield chunk
                         last = row.seq
                     if len(rows) < MAX_LIST_LIMIT:
                         break
@@ -357,7 +362,8 @@ async def build_event_producer(
                     )
                     yield format_sse("gap", {"from": last + 1, "to": seq - 1})
 
-            yield format_sse(entry.event, entry.data, event_id=entry.id)
+            for chunk in _encode(entry.event, entry.data, event_id=entry.id):
+                yield chunk
             last = seq
 
     if run_status not in TERMINAL_RUN_STATUSES:
