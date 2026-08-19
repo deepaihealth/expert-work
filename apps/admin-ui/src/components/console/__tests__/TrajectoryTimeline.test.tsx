@@ -394,6 +394,25 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(p.onRangeChange).not.toHaveBeenCalled();
   });
 
+  it("缩放态下把选区拖到轨道边缘 8% 内 → 视口自动往前平移", () => {
+    mockTrack();
+    render(<TrajectoryTimeline {...props()} />);
+
+    fireEvent.wheel(screen.getByTestId("console-lane-strip"), { deltaY: -200, clientX: 500 });
+    const left0 = pct(blockAt(0).parentElement as HTMLElement, "--traj-domain-left");
+
+    // 1000px 轨道的右侧触发带 = min(32px, 8%) = 32px → x > 968 就开始自动平移。
+    fireEvent.pointerDown(track(), { clientX: 500, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(track(), { clientX: 990, pointerId: 1 });
+    const left1 = pct(blockAt(0).parentElement as HTMLElement, "--traj-domain-left");
+    expect(left1).toBeLessThan(left0);
+
+    // 停在边缘不再挪鼠标也继续往前走。
+    fireEvent.pointerMove(track(), { clientX: 990, pointerId: 1 });
+    expect(pct(blockAt(0).parentElement as HTMLElement, "--traj-domain-left")).toBeLessThan(left1);
+    fireEvent.pointerUp(track(), { clientX: 990, pointerId: 1, button: 0 });
+  });
+
   it("hasEarlier 出「…」按钮,点击触发加载;loadingEarlier 时 aria-disabled 且不再回调", () => {
     const p = props({ hasEarlier: true });
     const { rerender } = render(<TrajectoryTimeline {...p} />);
