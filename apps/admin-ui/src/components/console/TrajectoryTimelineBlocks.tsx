@@ -53,6 +53,7 @@ export const TrajectoryTimelineBlocks = memo(function TrajectoryTimelineBlocks({
                 data-lane={span.lane}
                 data-kind={span.kind}
                 data-error={span.isError ? "true" : undefined}
+                data-ttft={span.kind === "assistant" && !span.isError && span.ttft !== null ? "true" : undefined}
                 data-live={span.running ? "true" : undefined}
                 data-current={span.index === selectedIndex ? "true" : undefined}
                 data-hovered={span.index === hoveredIndex ? "true" : undefined}
@@ -63,6 +64,7 @@ export const TrajectoryTimelineBlocks = memo(function TrajectoryTimelineBlocks({
                   "--traj-span-width": `${width * 100}%`,
                   "--traj-span-gap": `min(${width * 8}%, 1px)`,
                   "--traj-span-lane": span.lane,
+                  "--traj-span-ttft": span.ttft === null ? undefined : `${span.ttft * 100}%`,
                 } as CSSProperties}
               />
             </Tooltip>

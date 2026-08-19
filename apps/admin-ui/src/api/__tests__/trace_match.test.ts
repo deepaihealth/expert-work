@@ -122,4 +122,12 @@ describe("matchTraceSpans", () => {
     expect(matchTraceSpans([assistant("assistant", -1, null)], okTrace([l1])).get("assistant"))
       .toEqual({ span: null, reason: "unsupported" });
   });
+  it("Rule 2 pairs step rows with main llm spans in startMs order, not payload order (PR-A.3 §十.4)", () => {
+    const rows = [assistant("assistant:1", 1, 1), assistant("assistant:3", 3, 2)];
+    const late = span({ id: "llm-late", kind: "llm", label: "llm", purpose: "main", startMs: 32903, latencyMs: 7265 });
+    const early = span({ id: "llm-early", kind: "llm", label: "llm", purpose: "main", startMs: 960, latencyMs: 29786 });
+    const m = matchTraceSpans(rows, okTrace([late, early]));
+    expect(m.get("assistant:1")?.span?.id).toBe("llm-early");
+    expect(m.get("assistant:3")?.span?.id).toBe("llm-late");
+  });
 });

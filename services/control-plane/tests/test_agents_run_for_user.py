@@ -186,6 +186,24 @@ async def test_stream_run_sets_session_header(ctx: _Ctx) -> None:
         await resp.aclose()
 
 
+@pytest.mark.asyncio
+async def test_stream_run_hides_system_prompt_frame(ctx: _Ctx) -> None:
+    """对外平面(API key)实时流不可见 system_prompt —— 只有控制台看得到。
+
+    ``build_run_graph_input`` 恒把 ``SystemMessage`` 放在首位,stub runtime
+    的 ``run_agent`` 因此每次都会发一帧 ``system_prompt``;这条帧本身是
+    server 合成的系统提示词全文,对第三方 API key 调用方必须不可见。
+    """
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "u", "input": "hi"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: system_prompt" not in resp.text
+
+
 def test_external_run_request_input_cap_matches_run_request() -> None:
     # ExternalRunRequest.input shares the same free-text cap as RunRequest.
     from pydantic import ValidationError

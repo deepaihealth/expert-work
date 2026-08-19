@@ -5,6 +5,7 @@
  * - TOOL / SUBTOOL / PLAN / MEMORY / REFLECT / 标记:概要 / 载荷 / 结果 / 计时 / 原始
  * - ASSISTANT:概要 / 预览 / 原文 / 计时 / 原始
  * - USER:概要 / 预览 / 原文 / 原始
+ * - SYSTEM:概要 / 原文 / 原始(PR-A.3 §十.1)
  *
  * 「概要」= 顶部 `dl`(层级跳转 + 状态 + 耗时 + ASSISTANT 用量 + Run / Langfuse)
  * 加若干分节预览,分节标题点一下就跳到对应 tab。换记录不重置 tab —— 新记录没有
@@ -34,22 +35,39 @@ import {
   RowDetailPayload,
   RowDetailResult,
 } from "./RowDetailPayloadResult";
+import { schemaToolNameOf, SchemaPanel } from "./RowDetailSchema";
+import { SystemPromptPanel } from "./RowDetailSystem";
 import { RowDetailTiming } from "./RowDetailTiming";
+import type { ToolSchemaState } from "./useAgentTools";
 
 import "./kind_tag.css";
 import "./record_details.css";
 
 const { Text } = Typography;
 
-export type RecordTab = "summary" | "payload" | "result" | "preview" | "rawtext" | "timing" | "raw";
+export type RecordTab =
+  | "summary"
+  | "payload"
+  | "result"
+  | "schema"
+  | "preview"
+  | "rawtext"
+  | "timing"
+  | "raw";
 
 const USER_TABS: RecordTab[] = ["summary", "preview", "rawtext", "raw"];
 const ASSISTANT_TABS: RecordTab[] = ["summary", "preview", "rawtext", "timing", "raw"];
+const SYSTEM_TABS: RecordTab[] = ["summary", "rawtext", "raw"];
 const OTHER_TABS: RecordTab[] = ["summary", "payload", "result", "timing", "raw"];
+/** TOOL rows, and PLAN rows for `update_plan` — the ones a tool schema
+ *  resolves for (`schemaToolNameOf(record.row) !== null`). */
+const TOOLISH_TABS: RecordTab[] = ["summary", "payload", "result", "schema", "timing", "raw"];
 
 export function recordTabsOf(record: LedgerRecord): RecordTab[] {
   if (record.kind === "user") return USER_TABS;
   if (record.kind === "assistant") return ASSISTANT_TABS;
+  if (record.kind === "system") return SYSTEM_TABS;
+  if (schemaToolNameOf(record.row) !== null) return TOOLISH_TABS;
   return OTHER_TABS;
 }
 
@@ -58,6 +76,7 @@ function sectionsOf(record: LedgerRecord): RecordTab[] {
   if (record.placeholder !== null) return [];
   if (record.kind === "user") return ["preview"];
   if (record.kind === "assistant") return ["preview", "timing"];
+  if (record.kind === "system") return ["rawtext"];
   return ["payload", "result", "timing"];
 }
 
@@ -78,6 +97,9 @@ export interface RecordDetailsProps {
   onOpenRecord: (id: string) => void;
   onOpenRequest: (no: number) => void;
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-A.3 §十.2 — the Schema tab's lazy fetch state; the parent owns the
+   *  `useAgentTools` hook so it survives switching between records. */
+  toolSchemas: ToolSchemaState;
   activeTab: RecordTab;
   onTabChange: (t: RecordTab) => void;
   onClose: () => void;
@@ -125,7 +147,7 @@ function DetailSection({
 export function RecordDetails(props: RecordDetailsProps) {
   const { record, ownerRequest, parent, threadId, isSystemAdmin, langfuseUrl } = props;
   const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, onOpenRequest } = props;
-  const { activeTab, onTabChange, onFireResult } = props;
+  const { activeTab, onTabChange, onFireResult, toolSchemas } = props;
   const { t } = useTranslation();
   const [fullText, setFullText] = useState<FullTextState | null>(null);
 
@@ -147,12 +169,18 @@ export function RecordDetails(props: RecordDetailsProps) {
         return <RowDetailPayload row={row} match={match} events={record.events} />;
       case "result":
         return <RowDetailResult row={row} onFireResult={onFireResult} onOpenFullText={setFullText} />;
+      case "schema": {
+        const toolName = schemaToolNameOf(row);
+        return toolName === null ? null : <SchemaPanel toolName={toolName} state={toolSchemas} />;
+      }
       case "preview":
         return textRow === null ? null : <AssistantPreview row={textRow} />;
       case "rawtext":
-        return textRow === null ? null : (
+        return textRow !== null ? (
           <AssistantRawText row={textRow} onOpenFullText={setFullText} />
-        );
+        ) : row.kind === "system" ? (
+          <SystemPromptPanel text={row.text} />
+        ) : null;
       case "timing":
         return (
           <RowDetailTiming
@@ -241,6 +269,11 @@ export function RecordDetails(props: RecordDetailsProps) {
               </DetailRow>
             )}
           </>
+        )}
+        {row.kind === "system" && (
+          <DetailRow label={t("console.detail_system_prompt")}>
+            {t("console.detail_system_chars", { n: row.text.length })}
+          </DetailRow>
         )}
         {threadId !== null && record.runId !== null && (
           <DetailRow label={t("console.detail_run")}>

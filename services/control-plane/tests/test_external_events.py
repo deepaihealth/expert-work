@@ -30,6 +30,7 @@ from expert_work.runtime.runs import (
     RunStatus,
     make_event_record,
 )
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -170,6 +171,134 @@ async def test_events_replays_a_terminal_run(ctx: _Ctx) -> None:
     # replayed rows (seq 1 and 2), not just "some end frame showed up".
     assert re.search(r"id: \d+-1\n", resp.text)
     assert re.search(r"id: \d+-2\n", resp.text)
+
+
+@pytest.mark.asyncio
+async def test_external_replay_hides_system_prompt_frame_but_keeps_seq_cursor(ctx: _Ctx) -> None:
+    """对外回放滤掉 system_prompt;分页游标(next_seq / truncated)按**过滤前**
+    的落库记录计算,不是按实际写上 wire 的可见帧计算。
+
+    真跨 ``MAX_LIST_LIMIT``(500)页边界构造:被滤帧(``system_prompt``)是
+    第一页里 seq 最大的那一条(``rows[-1]``,``next_seq`` 探测就是从它算起的)。
+    如果实现错误地在算 ``next_seq`` 之前就先把过滤后的行拿去做「页是否满」
+    的判断,这一页就会少一条(499 < 500),``next_seq`` 会误判成 ``None``,
+    第 501 条(``updates``)与 ``end`` 永远拿不到 —— 这条测试就是钉这个不变式。
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = started.json()["data"]["run_id"]
+    await ctx.run_event_store.append(
+        make_event_record(run_id=UUID(run_id), seq=1, event_name="metadata", data={"step": 1})
+    )
+    # Filler so the hidden frame lands exactly on the MAX_LIST_LIMIT-th row —
+    # the raw last row of the first page (seq 2..MAX_LIST_LIMIT-1).
+    for seq in range(2, MAX_LIST_LIMIT):
+        await ctx.run_event_store.append(
+            make_event_record(
+                run_id=UUID(run_id), seq=seq, event_name="updates", data={"step": seq}
+            )
+        )
+    await ctx.run_event_store.append(
+        make_event_record(
+            run_id=UUID(run_id),
+            seq=MAX_LIST_LIMIT,
+            event_name="system_prompt",
+            data={"text": "secret prompt"},
+        )
+    )
+    # Second page — only reachable if next_seq correctly resolves to
+    # MAX_LIST_LIMIT (the hidden frame's own seq).
+    await ctx.run_event_store.append(
+        make_event_record(
+            run_id=UUID(run_id),
+            seq=MAX_LIST_LIMIT + 1,
+            event_name="updates",
+            data={"step": "last"},
+        )
+    )
+    await ctx.run_store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.text
+    assert "event: system_prompt" not in body
+    assert "secret prompt" not in body
+    assert "event: metadata" in body
+    assert "event: updates" in body
+    # Truncated at the real page boundary, not a synthesized "end" — the
+    # stream hasn't actually finished, there's a 501st frame still to come.
+    assert "event: truncated" in body
+    assert "event: end" not in body
+    assert f'"next_seq":{MAX_LIST_LIMIT}' in body
+    assert resp.headers["X-Expert-Work-Next-Seq"] == str(MAX_LIST_LIMIT)
+
+    # Resuming from that cursor reaches the 501st frame and the real end —
+    # proves next_seq pointed at the hidden frame's true seq, not an earlier
+    # visible frame's.
+    resp2 = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77", "since_seq": MAX_LIST_LIMIT},
+        headers=ctx.headers,
+    )
+    assert resp2.status_code == 200, resp2.text
+    body2 = resp2.text
+    assert "event: system_prompt" not in body2
+    assert "event: updates" in body2
+    assert "event: end" in body2
+
+
+@pytest.mark.asyncio
+async def test_live_attach_hides_ephemeral_system_prompt_frame_but_keeps_token(
+    ctx: _Ctx,
+) -> None:
+    """终审 I2 —— `_encode` 不是过滤的唯一出口:live 接合里 ephemeral
+    (``seq is None``)分支曾原样 ``format_sse`` 放行,绕过 ``hide_events``。
+    今天唯一的 ephemeral 帧是 ``token``(本就该对外可见,历史上没有真泄漏),
+    这条测试直接造一条 ephemeral ``system_prompt`` 帧钉死"两条对外路径
+    (POST /runs 的 stream 模式 vs 这条 GET 的 live 接合)同语义"这条不变式,
+    并顺带确认 ``token`` 帧的行为零变化(仍然上 wire)。
+    """
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = UUID(started.json()["data"]["run_id"])
+    assert started.json()["data"]["status"] == "queued"
+    # 没有 worker 去跑这个 run —— 它留在 QUEUED(非终态),GET /events 因此走
+    # live 接合分支,不是回放(_encode 的另一个已过滤出口,测了也测不出这条)。
+    bridge = ctx.app.state.agent_runtime.stream_bridge
+    await bridge.publish_ephemeral(run_id, "system_prompt", {"text": "leaked prompt"})
+    await bridge.publish_ephemeral(run_id, "token", {"text": "hi"})
+    await bridge.publish_end(run_id, status="success")
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Expert-Work-Stream-Mode"] == "live"
+    body = resp.text
+    assert "event: system_prompt" not in body
+    assert "leaked prompt" not in body
+    assert "event: token" in body
+    assert "event: end" in body
 
 
 @pytest.mark.asyncio

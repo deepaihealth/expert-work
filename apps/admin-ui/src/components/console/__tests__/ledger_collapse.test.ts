@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CONTEXT_KINDS,
   collapsibleOwnerIds,
   collapsibleTurnKeys,
   displayRowsOf,
@@ -298,5 +299,20 @@ describe("collapsibleTurnKeys / collapsibleOwnerIds", () => {
     ]);
     const summary = rows.find((r) => r.kind === "calls-summary");
     expect(summary).toMatchObject({ count: 1, toolBreakdown: "bash ×1" });
+  });
+});
+
+describe("CONTEXT_KINDS (PR-A.3 §十.1)", () => {
+  it("system rows are context rows: kept when the turn is collapsed, not counted as steps", () => {
+    const system = rec({ id: "s1", index: 0, turnKey: "t1", kind: "system" });
+    const user = rec({ id: "u1", index: 1, turnKey: "t1", kind: "user" });
+    const a1 = rec({ id: "a1", index: 2, turnKey: "t1", kind: "assistant" });
+    const ledger = ledgerOf([system, user, a1], [turn({ key: "t1", lastIndex: 2 })]);
+    expect(CONTEXT_KINDS.has("system") && CONTEXT_KINDS.has("user")).toBe(true);
+    // 只有一条非上下文记录(a1),不值得折。
+    expect(collapsibleTurnKeys(ledger)).toEqual([]);
+    expect(turnSummaryOf([system, user, a1]).other).toBe(0);
+    const rows = displayRowsOf(ledger, { collapsedTurns: new Set(["t1"]), collapsedOwners: new Set(), matches: null });
+    expect(rows.map((r) => (r.kind === "record" ? r.record.id : r.kind))).toEqual(["s1", "u1", "turn-summary"]);
   });
 });

@@ -108,6 +108,9 @@ def normalize_trace(trace: object) -> dict[str, object]:
     raw_observations: list[Any] = list(t.observations or [])
 
     trace_name = str(t.name)
+    # 兜底单位存疑(终审 Minor 3)——这版 Langfuse 实测回的是 ms,这里却按秒
+    # x1000;只在 observations 为空 / 全无 end_time(下面的 `end-start` 覆盖
+    # 不到)时才会真的走到这条兜底,今天没有已知触发场景。
     trace_latency_ms = round((t.latency or 0) * 1000)
     trace_total_cost_usd = t.total_cost or None
 
@@ -125,6 +128,14 @@ def normalize_trace(trace: object) -> dict[str, object]:
 
     start_times = [o.start_time for o in raw_observations if o.start_time is not None]
     trace_start = min(start_times) if start_times else None
+
+    end_times = [
+        getattr(o, "end_time", None)
+        for o in raw_observations
+        if getattr(o, "end_time", None) is not None
+    ]
+    if trace_start is not None and end_times:
+        trace_latency_ms = max(0, round((max(end_times) - trace_start).total_seconds() * 1000))
 
     parsed_by_id: dict[str, _ParsedObs] = {}
     children_by_parent: dict[str | None, list[str]] = {}
@@ -169,7 +180,7 @@ def normalize_trace(trace: object) -> dict[str, object]:
             purpose=purpose_override.get(parsed.id, parsed.purpose),
             group=parsed.group,
         )
-        for parsed in parsed_by_id.values()
+        for parsed in sorted(parsed_by_id.values(), key=lambda p: (p.start_ms, p.id))
         if parsed.id not in omitted
     ]
 
@@ -292,7 +303,11 @@ def _parse_observation(o: Any, *, trace_start: Any) -> _ParsedObs:
         start_ms = 0
     else:
         start_ms = round((o.start_time - trace_start).total_seconds() * 1000)
-    latency_ms = round((o.latency or 0) * 1000)
+    end_time = getattr(o, "end_time", None)
+    if o.start_time is not None and end_time is not None:
+        latency_ms = max(0, round((end_time - o.start_time).total_seconds() * 1000))
+    else:
+        latency_ms = round((o.latency or 0) * 1000)
     kind, label, group = _classify(obs_type, name)
     detail = _tool_detail(o) if kind == "tool" else None
     return _ParsedObs(

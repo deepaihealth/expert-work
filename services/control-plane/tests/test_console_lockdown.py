@@ -217,6 +217,9 @@ _CONSOLE_PREFIXES: tuple[str, ...] = (
 _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/v1/agents"),
+        # PR-A.3 Task 7 — 调试台 Schema 面板读工具注册表(含 deferred),管理
+        # 面产物,同 revisions/users 一样只对雇员 JWT 开放。
+        ("GET", "/v1/agents/{name}/{version}/tools"),
         ("GET", "/v1/agents/{name}/{version}/revisions"),
         ("GET", "/v1/agents/{name}/{version}/revisions/{revision}"),
         ("POST", "/v1/agents/{name}/{version}/revisions/{revision}/rollback"),

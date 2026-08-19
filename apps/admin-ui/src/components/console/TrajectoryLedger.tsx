@@ -12,7 +12,7 @@ import type { JSX, KeyboardEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { DisplayRow } from "./ledger_collapse";
+import { CONTEXT_KINDS, type DisplayRow } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import { LedgerRow } from "./TrajectoryLedgerRow";
 import { useVirtualRows } from "./use_virtual_rows";
@@ -53,15 +53,16 @@ export interface TrajectoryLedgerProps {
 }
 
 /** 双击落点要知道:哪几轮此刻是折叠的、哪几条 assistant 名下有子记录、每轮有
- *  几条非 USER 记录(只有 ≥ 2 条的轮才值得折)。一趟扫完 `rows` 全拿到。 */
+ *  几条非上下文记录(`CONTEXT_KINDS` —— 不算 USER / SYSTEM,只有 ≥ 2 条的轮
+ *  才值得折)。一趟扫完 `rows` 全拿到。 */
 function foldContextOf(rows: readonly DisplayRow[]): {
   collapsedTurns: ReadonlySet<string>;
   ownersWithChildren: ReadonlySet<string>;
-  nonUserByTurn: ReadonlyMap<string, number>;
+  nonContextByTurn: ReadonlyMap<string, number>;
 } {
   const collapsedTurns = new Set<string>();
   const ownersWithChildren = new Set<string>();
-  const nonUserByTurn = new Map<string, number>();
+  const nonContextByTurn = new Map<string, number>();
   for (const row of rows) {
     if (row.kind === "turn-summary") {
       collapsedTurns.add(row.turnKey);
@@ -79,11 +80,11 @@ function foldContextOf(rows: readonly DisplayRow[]): {
     if (record.parentId !== null && (record.kind === "tool" || record.kind === "plan")) {
       ownersWithChildren.add(record.parentId);
     }
-    if (record.kind !== "user") {
-      nonUserByTurn.set(record.turnKey, (nonUserByTurn.get(record.turnKey) ?? 0) + 1);
+    if (!CONTEXT_KINDS.has(record.kind)) {
+      nonContextByTurn.set(record.turnKey, (nonContextByTurn.get(record.turnKey) ?? 0) + 1);
     }
   }
-  return { collapsedTurns, ownersWithChildren, nonUserByTurn };
+  return { collapsedTurns, ownersWithChildren, nonContextByTurn };
 }
 
 /** 请求号 → 开启它的那条 assistant 记录 id(`requestsByRecordId` 反查)。 */
@@ -211,7 +212,7 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
 
   const handleDoubleClick = useCallback(
     (record: LedgerRecord): void => {
-      const { collapsedTurns, ownersWithChildren, nonUserByTurn } = foldContext;
+      const { collapsedTurns, ownersWithChildren, nonContextByTurn } = foldContext;
       if (collapsedTurns.has(record.turnKey)) {
         onToggleTurn(record.turnKey);
         return;
@@ -222,7 +223,7 @@ export function TrajectoryLedger(props: TrajectoryLedgerProps): JSX.Element {
       }
       // 不限轮首行 —— 双击账本里这一轮的**任意**一行都该折得动它;只有非 USER
       // 记录不到 2 条的轮不值得折(折了也省不出一行)。
-      if ((nonUserByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
+      if ((nonContextByTurn.get(record.turnKey) ?? 0) >= 2) onToggleTurn(record.turnKey);
     },
     [foldContext, onToggleTurn, onToggleOwner],
   );

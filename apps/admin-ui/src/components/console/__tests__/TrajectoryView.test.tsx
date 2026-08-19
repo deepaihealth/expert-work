@@ -13,6 +13,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter } from "react-router-dom";
 
 import i18n from "../../../i18n";
+import * as agentsSdk from "../../../api/agents";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 import { LANE_MODE_KEY, TrajectoryView, type TrajectoryViewProps } from "../TrajectoryView";
@@ -31,6 +32,13 @@ vi.mock("../useRunTrace", () => ({
 // ToolCallCard 的「立即触发」按钮读 useIsTenantSwitched(这里没挂 Auth /
 // TenantScope provider)—— 同 RecordDetails.test.tsx 的桩。
 vi.mock("../../../tenant/useIsTenantSwitched", () => ({ useIsTenantSwitched: () => false }));
+// PR-A.3 Task 10 —— `useAgentTools` 也直取 tenant scope(`TrajectoryView` 真跑
+// 这个 hook,不像 `useRunTrace` 整个被桩掉),同样没挂 TenantScopeProvider,
+// mock 成 home 态。照 useRunTrace.test.ts / useAgentTools.test.ts。
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({ scope: "home", setScope: () => {}, apiTenantScope: undefined }),
+}));
 
 // jsdom 25 没有 `PointerEvent`,testing-library 会退回基类 `Event`(静默丢掉
 // `clientX`)—— 用 `MouseEvent` 派生的替身补上坐标(同 TrajectoryTimeline.test)。
@@ -145,6 +153,8 @@ function baseProps(over: Partial<TrajectoryViewProps> = {}): TrajectoryViewProps
   return {
     turns: fixture(),
     threadId: "th-1",
+    agentName: "a",
+    agentVersion: "1",
     streamTurnKey: "C",
     liveByStep: new Map<number, LiveStep>(),
     running: false,
@@ -195,6 +205,14 @@ function drag(x0: number, x1: number): void {
   fireEvent.pointerUp(track(), { clientX: x1, pointerId: 1, button: 0 });
 }
 
+// PR-A.3 Task 10 —— 选中一条 TOOL / PLAN(update_plan)记录就会真的触发
+// `useAgentTools` 的懒加载。多数既有用例点的是 TOOL 行(如
+// `rowOf("A/tool:0:0")`),不给默认桩就会打真实 stub adapter(测试环境里恒
+// `success:false`),徒增噪音。既有 `afterEach` 已 `vi.restoreAllMocks()`
+// (给 `getBoundingClientRect` 用的),所以这个 spy 必须跟它一样每条测试在
+// `beforeEach` 里重新建,不能模块级声明一次。
+let getAgentToolsMock: ReturnType<typeof vi.spyOn>;
+
 let scrollIntoView: ReturnType<typeof vi.fn>;
 let priorLang: string;
 
@@ -212,6 +230,9 @@ afterAll(async () => {
 beforeEach(() => {
   window.localStorage.clear();
   hoisted.runTraceArgs.mockClear();
+  getAgentToolsMock = vi
+    .spyOn(agentsSdk, "getAgentTools")
+    .mockResolvedValue({ items: [], total: 0 });
   scrollIntoView = vi.fn();
   // jsdom 没有 scrollIntoView;组件按可选调用写,这里给它一个 spy。
   (Element.prototype as unknown as { scrollIntoView?: unknown }).scrollIntoView = scrollIntoView;
@@ -712,5 +733,23 @@ describe("TrajectoryView · 组合", () => {
     });
     expect(rows().some((r) => r.dataset.running === "true")).toBe(true);
     expect(blocks().some((b) => b.getAttribute("data-live") === "true")).toBe(true);
+  });
+
+  // PR-A.3 Task 10 —— Schema tab 的懒加载接线:`useAgentTools` 拿的是
+  // TrajectoryView 自己的 `agentName` / `agentVersion` props,只在选中记录
+  // 解出工具名(TOOL 行 / PLAN(update_plan)行)时才 enabled。
+  it("选中 tool 记录 → 懒加载一次 getAgentTools(agentName, agentVersion)", async () => {
+    renderView({ agentName: "a", agentVersion: "1" });
+    fireEvent.click(rowOf("A/tool:0:0"));
+    expect(screen.getByTestId("console-detail-tab-schema")).toBeInTheDocument();
+    await waitFor(() => expect(getAgentToolsMock).toHaveBeenCalledTimes(1));
+    expect(getAgentToolsMock).toHaveBeenCalledWith("a", "1", undefined);
+  });
+
+  it("选中 assistant 记录 → 没有可解析的工具名,不懒加载工具 schema", () => {
+    renderView({ agentName: "a", agentVersion: "1" });
+    fireEvent.click(rowOf("A/assistant:0"));
+    expect(screen.queryByTestId("console-detail-tab-schema")).not.toBeInTheDocument();
+    expect(getAgentToolsMock).not.toHaveBeenCalled();
   });
 });

@@ -658,6 +658,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             <TrajectoryView
               turns={consoleTurns}
               threadId={thread?.thread_id ?? null}
+              agentName={r.name}
+              agentVersion={r.version}
               streamTurnKey={streamTurnId}
               // 稳定引用:``tokenStream.liveByStep`` 自己是 state,只在流更新
               // 时换。这里包一层 ``new Map`` 就是每帧重建账本 / 时间轴。

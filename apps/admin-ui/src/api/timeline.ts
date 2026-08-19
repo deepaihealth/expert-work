@@ -34,6 +34,8 @@ export interface AgentStep {
   reasoningTokens?: number;
   /** ``usage_metadata.input_token_details.cache_read`` —— 同上,没报是 ``undefined``。 */
   cacheReadTokens?: number;
+  /** ``additional_kwargs.first_token_ms`` —— LLM 调用起点到第一个非空 delta 的毫秒;后端没写(无流式 / judge 开着)就是 undefined。 */
+  firstTokenMs?: number;
   tools: ToolCallEntry[];
   hasError: boolean;
   durationMs: number | null;
@@ -220,6 +222,7 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
           totalTokens: int(um.total_tokens),
           reasoningTokens: optInt(obj(um.output_token_details).reasoning),
           cacheReadTokens: optInt(obj(um.input_token_details).cache_read),
+          firstTokenMs: optInt(ak.first_token_ms),
           tools,
           hasError: tools.some((t) => t.status === "error"),
           durationMs: durationOf(ch),

@@ -915,6 +915,9 @@ async def test_server_tools_lists_live_tools(monkeypatch: pytest.MonkeyPatch) ->
         r = await client.get("/v1/mcp-servers/github/tools", headers=admin_headers)
         assert r.status_code == 200
         assert r.json()["data"][0]["name"] == "create_issue"
+        # PR-A.3 Task 7 — 调试台 Schema 面板要渲染工具入参 JSON Schema;
+        # ``_fake_probe_ok`` 给的 ``MCPToolDef(input_schema={})`` 原样透传。
+        assert r.json()["data"][0]["input_schema"] == {}
 
 
 @pytest.mark.asyncio

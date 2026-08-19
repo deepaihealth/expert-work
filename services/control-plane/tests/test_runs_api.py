@@ -381,6 +381,17 @@ async def test_run_streams_the_agent_reply(runs_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_stream_keeps_system_prompt_frame(runs_client: AsyncClient) -> None:
+    """PR-A.3 Task 8 — the ``system_prompt`` frame is console-only filtering,
+    not a global one: ``spawn_run`` doesn't pass ``hide_events`` for the
+    console session-run endpoint, so it must still show up here."""
+    thread_id = await _create_session(runs_client)
+    response = await runs_client.post(f"/v1/sessions/{thread_id}/runs", json={"input": "hello"})
+    assert response.status_code == 200
+    assert "event: system_prompt" in response.text
+
+
+@pytest.mark.asyncio
 async def test_run_emits_session_write_audit(
     runs_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:

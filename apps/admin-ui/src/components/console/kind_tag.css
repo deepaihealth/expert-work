@@ -33,6 +33,7 @@
 .ew-kt--tool { --ew-kt-color: var(--ew-color-warning-500); }
 .ew-kt--subagent { --ew-kt-color: var(--ew-color-warning-700); }
 .ew-kt--plan { --ew-kt-color: var(--ew-color-teal-500); }
+.ew-kt--system { --ew-kt-color: var(--ew-text-secondary); }
 
 /* compaction / retry / error / approval / guard / gap 用默认的 secondary。 */
 

@@ -91,6 +91,35 @@ export async function getAgent(
   );
 }
 
+/** GET /v1/agents/{name}/{version}/tools — the agent's live tool contract
+ *  (PR-A.3 §十.2 Schema tab): one entry per tool currently registered on
+ *  this agent version, including MCP / skill-sourced and deferred (lazily
+ *  promoted) tools. */
+export interface AgentToolSchema {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  source: string;
+  from_skill: string | null;
+  deferred: boolean;
+}
+
+export interface AgentToolList {
+  items: AgentToolSchema[];
+  total: number;
+}
+
+export async function getAgentTools(
+  name: string,
+  version: string,
+  tenantScope?: TenantScope,
+): Promise<AgentToolList> {
+  return getJson<AgentToolList>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/tools`,
+    { params: withTenantScope({}, tenantScope) },
+  );
+}
+
 /** Server-side ``ManifestPayload`` accepts the manifest YAML text; ``{{ … }}``
  *  inside it is run-time Jinja, stored verbatim. The backend validates it
  *  end-to-end (Pydantic + ManifestError) on save. */

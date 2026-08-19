@@ -4,12 +4,14 @@
  * `clientHeight` / `scrollHeight` / `scrollTop`)与 `scrollIntoView` 在
  * jsdom 里都不存在,逐个 mock。见 task-8-brief.md。
  */
+import { readFileSync } from "node:fs";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 import i18n from "../../../i18n";
 import type {
-  AssistantRow, MemoryRow, ReflectRow, SubagentRow, ToolRow, TrajectoryRow, UserRow,
+  AssistantRow, MemoryRow, ReflectRow, SubagentRow, SystemRow, ToolRow, TrajectoryRow, UserRow,
 } from "../../../api/trajectory_rows";
 import type { DisplayRow } from "../ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
@@ -40,7 +42,7 @@ function rec(over: Partial<LedgerRecord> & Pick<LedgerRecord, "id" | "index" | "
     turnKey: "t1", turnSeq: 0, runId: "run-1", turnStart: false, turnEnd: false,
     requestNo: null, ownerRequestNo: null, parentId: null, lane: 1, isError: false,
     running: false, startedAt: null, endedAt: null, text: "", resultText: null,
-    events: [], placeholder: null, ...over,
+    events: [], placeholder: null, firstTokenAt: null, ...over,
   };
 }
 function request(over: Partial<LedgerRequest> & Pick<LedgerRequest, "no" | "recordId">): LedgerRequest {
@@ -48,7 +50,7 @@ function request(over: Partial<LedgerRequest> & Pick<LedgerRequest, "no" | "reco
     turnKey: "t1", turnSeq: 0, step: 1, status: "ok", model: "glm-5.2", finishReason: "stop",
     usage: { input: 10, output: 4, reasoning: 0, cacheRead: 0 },
     cumulative: { input: 10, output: 4 }, toolCalls: 1,
-    startedAt: null, endedAt: null, durationMs: 120, ...over,
+    startedAt: null, endedAt: null, durationMs: 120, firstTokenMs: null, ...over,
   };
 }
 
@@ -242,6 +244,31 @@ describe("TrajectoryLedger", () => {
     onToggleTurn.mockClear();
     onToggleOwner.mockClear();
     fireEvent.doubleClick(rows[5]);
+    expect(onToggleTurn).not.toHaveBeenCalled();
+    expect(onToggleOwner).not.toHaveBeenCalled();
+  });
+
+  // PR-A.3 §十.1 —— SYSTEM 行是上下文行(与 USER 同档),不算进「这一轮有几条
+  // 值得折的记录」。轮里只有 SYSTEM + USER + 一条 assistant(唯一的非上下文
+  // 记录只有 1 条,不到 2 条门槛)—— 双击 SYSTEM 行不该折;若 SYSTEM 被错当成
+  // 非上下文记录计数,门槛会被凑到 2 而误折。
+  it("双击 SYSTEM 行落点同 USER —— SYSTEM 不计入非上下文记录数,不够 2 条就不折", () => {
+    const onToggleTurn = vi.fn();
+    const onToggleOwner = vi.fn();
+    const systemRow: SystemRow = {
+      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, text: "你是评审员",
+    };
+    const rows = recordRows([
+      rec({ id: "t3/system", index: 0, turnKey: "t3", turnSeq: 2, kind: "system", row: systemRow, lane: 0, turnStart: true, text: "你是评审员" }),
+      rec({ id: "t3/user", index: 1, turnKey: "t3", turnSeq: 2, kind: "user", row: userRow, lane: 0, text: "帮我看看目录" }),
+      rec({
+        id: "t3/assistant:1", index: 2, turnKey: "t3", turnSeq: 2, kind: "assistant",
+        row: assistantRow({ id: "assistant:1", seq: 1, step: 1 }), requestNo: 1, ownerRequestNo: 1, text: "我来查一下",
+      }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn, onToggleOwner })} />);
+    fireEvent.doubleClick(screen.getAllByTestId("console-traj-row")[0]);
     expect(onToggleTurn).not.toHaveBeenCalled();
     expect(onToggleOwner).not.toHaveBeenCalled();
   });
@@ -692,5 +719,31 @@ describe("TrajectoryLedger", () => {
     expect(tags.map((tag) => tag.textContent)).toEqual(["SUBTOOL", "COMPACTED", "USER"]);
     expect(tags[0].className).toContain("ew-kt--subagent");
     expect(tags[2].className).toContain("ew-kt--user");
+  });
+
+  // PR-A.3 §十.1 Task 12 —— SYSTEM 行:kind 标签走同一套 kindLabel(t) →
+  // "SYSTEM",内容列取账本层已经折好的首行,data-kind 落 "system"。颜色
+  // 显式写在 trajectory_timeline.css 里,不靠 .ew-traj-tl__block 的默认兜底
+  // (那条默认值恰好也是 --ew-text-secondary,不显式写就测不出这条规则是否
+  // 真的存在)。
+  it("SYSTEM 行:kind 标签 SYSTEM,内容列 = 首行,data-kind=\"system\"", () => {
+    const sysRow: SystemRow = {
+      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+      eventIndexes: [], serverMs: null, text: "你是评审员",
+    };
+    const rows = recordRows([
+      rec({ id: "t1/system", index: 0, kind: "system", row: sysRow, lane: 0, turnStart: true, text: "你是评审员" }),
+    ]);
+    render(<TrajectoryLedger {...baseProps({ rows })} />);
+
+    const tag = screen.getByTestId("console-traj-kind");
+    expect(tag).toHaveTextContent("SYSTEM");
+    expect(tag.className).toContain("ew-kt--system");
+    expect(screen.getByTestId("console-traj-row")).toHaveAttribute("data-kind", "system");
+    expect(screen.getByTestId("console-traj-content")).toHaveTextContent("你是评审员");
+
+    const timeline = readFileSync("src/components/console/trajectory_timeline.css", "utf8");
+    const rule = /\.ew-traj-tl__block\[data-kind="system"\] \{([^}]*)\}/.exec(timeline)?.[1] ?? "";
+    expect(rule).toContain("background: var(--ew-text-secondary)");
   });
 });

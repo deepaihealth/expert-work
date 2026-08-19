@@ -38,7 +38,7 @@ export function ledgerRecordId(turnKey: string, rowId: string): string {
  *  `memory` 这一格是占位 —— 真正的分道在 `laneOf` 里按 `direction` 走
  *  (召回进「输入」、写回进「工具」),永远走不到表里这一格。 */
 const LANE_OF_KIND: Record<Exclude<TrajectoryRow["kind"], "think">, LedgerLane> = {
-  user: 0, memory: 0,
+  user: 0, system: 0, memory: 0,
   assistant: 1, reflect: 1, compaction: 1,
   tool: 2, subagent: 2, plan: 2,
   retry: 2, error: 2, approval: 2, guard: 2, gap: 2,
@@ -79,6 +79,8 @@ function contentOf(row: TrajectoryRow): { text: string; resultText: string | nul
       throw new Error(`ledger: think row ${row.id} must not reach the ledger projection`);
     case "user":
     case "assistant":
+      return { text: firstLine(row.text), resultText: null };
+    case "system":
       return { text: firstLine(row.text), resultText: null };
     case "tool":
       return {
@@ -189,6 +191,11 @@ function turnRecordsOf(args: {
 
     const span = i >= liveFrom ? liveSpan : spanOf(row);
     const { text, resultText } = contentOf(row);
+    // 首 token 绝对时刻(PR-A.3 §十.1)—— 只有 assistant 步带 `firstTokenMs`,
+    // 且这一步要有可用的 span;夹到 `span.end` 防止偏移量比该步跨度还大。
+    const firstTokenAt = row.kind === "assistant" && row.firstTokenMs !== undefined && span !== null
+      ? Math.min(span.start + row.firstTokenMs, span.end)
+      : null;
     records.push({
       id, index: startIndex + i, turnKey: turn.key, turnSeq: turn.seq, runId: turn.runId,
       turnStart: i === 0, turnEnd: i === rows.length - 1,
@@ -197,6 +204,7 @@ function turnRecordsOf(args: {
       isError: row.status === "error", running: row.status === "running",
       startedAt: span === null ? null : span.start,
       endedAt: span === null ? null : span.end,
+      firstTokenAt,
       text, resultText, row, events: turn.turn.events,
       placeholder: row.kind === "assistant" ? placeholder : null,
     });
@@ -238,6 +246,13 @@ function requestsOf(records: readonly LedgerRecord[]): LedgerRequest[] {
       toolCalls: toolCallsByRequest.get(record.requestNo) ?? 0,
       startedAt, endedAt,
       durationMs: row.durationMs ?? (startedAt !== null && endedAt !== null ? endedAt - startedAt : null),
+      // 与 `record.firstTokenAt` 同口径(Minor 2)—— 有时序(span 存在、
+      // `firstTokenAt` 非 null)时用夹后差值,免得悬停提示与「请求 #N」报出
+      // 两个不同的首 token 数;无时序 / 没带 `firstTokenMs` 时退回原值。
+      firstTokenMs:
+        record.firstTokenAt !== null && startedAt !== null
+          ? record.firstTokenAt - startedAt
+          : row.firstTokenMs ?? null,
     });
   }
   return requests;
@@ -259,6 +274,8 @@ export function buildLedger(args: {
     requestCounter += 1;
     return requestCounter;
   };
+  // §十.1 —— 相邻轮系统提示词相同就折掉,跨轮记住前一条留下的 SYSTEM 文本。
+  let lastSystemText: string | null = null;
 
   for (const turn of args.turns) {
     const createdMs = parseCreatedAt(turn.createdAt);
@@ -280,7 +297,14 @@ export function buildLedger(args: {
         placeholder: turn.loadState === "error" ? "error" : "loading",
       });
     } else {
-      const base = ledgerRowsOf(turn.turn.events, input);
+      let base = ledgerRowsOf(turn.turn.events, input);
+      // §十.1 —— 与上一条留下来的系统提示词相同就折掉这一轮的 SYSTEM 行(只留
+      // 第一次出现与文本变化的那一轮);不同就更新「上一条」。
+      const firstRow = base[0];
+      if (firstRow?.kind === "system") {
+        if (firstRow.text === lastSystemText) base = base.slice(1);
+        else lastSystemText = firstRow.text;
+      }
       const live = turn.key === args.streamTurnKey ? liveLedgerRows(turn.turn.events, args.liveByStep) : [];
       const rows = [...base, ...live];
       const liveFrom = base.length;

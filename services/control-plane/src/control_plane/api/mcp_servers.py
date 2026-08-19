@@ -962,7 +962,10 @@ def build_mcp_servers_router() -> APIRouter:
                 await _record_health(store, tenant_id=target_tenant, name=name, status="ok")
         return {
             "success": True,
-            "data": [{"name": t.name, "description": t.description or ""} for t in tools],
+            "data": [
+                {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
+                for t in tools
+            ],
             "error": None,
         }
 

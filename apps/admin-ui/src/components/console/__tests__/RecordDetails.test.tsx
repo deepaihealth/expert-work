@@ -12,18 +12,23 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
+import type { AgentToolSchema } from "../../../api/agents";
 import type { SseEvent } from "../../../api/sessions";
 import type {
   AssistantRow,
   MarkerRow,
   MemoryRow,
+  PlanRow,
   SubagentRow,
+  SystemRow,
   ToolRow,
   TrajectoryRow,
   UserRow,
 } from "../../../api/trajectory_rows";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
 import { RecordDetails, recordTabsOf, type RecordDetailsProps } from "../RecordDetails";
+import { schemaToolNameOf } from "../RowDetailSchema";
+import type { ToolSchemaState } from "../useAgentTools";
 
 // ToolCallCard 的「立即触发」按钮读 useIsTenantSwitched(这里没挂 Auth /
 // TenantScope provider)—— 同 RowDetail.test.tsx 的桩。
@@ -126,8 +131,31 @@ function subagentRow(over: Partial<SubagentRow> = {}): SubagentRow {
   };
 }
 
+function systemRow(text: string): SystemRow {
+  return {
+    id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+    eventIndexes: [1], serverMs: 1001, text,
+  };
+}
+
 function markerRow(over: Partial<MarkerRow> = {}): MarkerRow {
   return { ...ROW_BASE, id: "compaction:9", kind: "compaction", step: null, text: "压缩了 12 条消息", ...over };
+}
+
+function planRow(over: Partial<PlanRow> = {}): PlanRow {
+  return {
+    ...ROW_BASE,
+    id: "plan:1:0",
+    kind: "plan",
+    source: "update_plan",
+    callId: "c2",
+    plannerSeq: null,
+    stepsTotal: 2,
+    goal: "先查档案再报价",
+    reason: null,
+    plan: null,
+    ...over,
+  };
 }
 
 function rec(row: TrajectoryRow, over: Partial<LedgerRecord> = {}): LedgerRecord {
@@ -153,6 +181,7 @@ function rec(row: TrajectoryRow, over: Partial<LedgerRecord> = {}): LedgerRecord
     row,
     events: [],
     placeholder: null,
+    firstTokenAt: null,
     ...over,
   };
 }
@@ -173,6 +202,7 @@ function request(over: Partial<LedgerRequest> = {}): LedgerRequest {
     startedAt: BASE,
     endedAt: BASE + 1200,
     durationMs: 1200,
+    firstTokenMs: null,
     ...over,
   };
 }
@@ -191,6 +221,7 @@ function propsOf(over: Partial<RecordDetailsProps> = {}): RecordDetailsProps {
     onRefreshTrace: vi.fn(),
     onOpenRecord: vi.fn(),
     onOpenRequest: vi.fn(),
+    toolSchemas: { status: "idle", byName: new Map(), reload: vi.fn() },
     activeTab: "summary",
     onTabChange: vi.fn(),
     onClose: vi.fn(),
@@ -216,10 +247,20 @@ function renderRecord(
 }
 
 describe("RecordDetails", () => {
-  it("tool 记录:概要 / 载荷 / 结果 / 计时 / 原始 五个 tab", () => {
-    expect(recordTabsOf(rec(toolRow()))).toEqual(["summary", "payload", "result", "timing", "raw"]);
+  // PR-A.3 Task 10 —— `toolRow()` 的 fixture 一直带真实 `toolName`
+  // ("query_crm"),`schemaToolNameOf` 现在对它非 null,所以这条记录现在
+  // 多出一个 Schema tab(概要 / 载荷 / 结果 / Schema / 计时 / 原始 六个)。
+  it("tool 记录:概要 / 载荷 / 结果 / Schema / 计时 / 原始 六个 tab", () => {
+    expect(recordTabsOf(rec(toolRow()))).toEqual([
+      "summary",
+      "payload",
+      "result",
+      "schema",
+      "timing",
+      "raw",
+    ]);
     renderRecord({ record: rec(toolRow()) });
-    for (const key of ["summary", "payload", "result", "timing", "raw"]) {
+    for (const key of ["summary", "payload", "result", "schema", "timing", "raw"]) {
       expect(screen.getByTestId(`console-detail-tab-${key}`)).toBeInTheDocument();
     }
     expect(screen.queryByTestId("console-detail-tab-preview")).not.toBeInTheDocument();
@@ -441,5 +482,185 @@ describe("RecordDetails", () => {
     const raw = screen.getByTestId("console-detail-raw");
     expect(within(raw).getByTestId("event-card-updates")).toBeInTheDocument();
     expect(within(raw).getByTestId("event-card-end")).toBeInTheDocument();
+  });
+});
+
+// PR-A.3 Task 10 —— Schema tab:tool / update_plan 记录懒加载出的工具契约。
+describe("Schema tab (PR-A.3 §十.2)", () => {
+  const ready = (items: AgentToolSchema[]): ToolSchemaState => ({
+    status: "ready",
+    byName: new Map(items.map((i) => [i.name, i])),
+    reload: vi.fn(),
+  });
+
+  it("tool 记录的 Schema tab 排在结果与计时之间;user / assistant 记录没有", () => {
+    const tool = renderRecord({ record: rec(toolRow()), toolSchemas: ready([]) });
+    expect(screen.getAllByRole("tab").map((el) => el.getAttribute("data-testid"))).toEqual([
+      "console-detail-tab-summary",
+      "console-detail-tab-payload",
+      "console-detail-tab-result",
+      "console-detail-tab-schema",
+      "console-detail-tab-timing",
+      "console-detail-tab-raw",
+    ]);
+    tool.unmount();
+    renderRecord({ record: rec(assistantRow()) });
+    expect(screen.queryByTestId("console-detail-tab-schema")).toBeNull();
+  });
+
+  it("渲染命中工具的描述 / 来源 / 延迟挂载标记 / 参数 JSON Schema", () => {
+    const item: AgentToolSchema = {
+      name: "bash",
+      description: "Run a shell command",
+      parameters: { type: "object", properties: { command: { type: "string" } } },
+      source: "mcp:gh",
+      from_skill: null,
+      deferred: true,
+    };
+    const bashRow = toolRow({
+      entry: {
+        id: "c9", rawName: "bash", isMcp: false, server: null, toolName: "bash",
+        args: { command: "ls" }, status: "success", resultPreview: "", durationMs: 50,
+      },
+    });
+    renderRecord({ record: rec(bashRow), toolSchemas: ready([item]), activeTab: "schema" });
+    const panel = screen.getByTestId("console-detail-schema");
+    expect(panel).toHaveTextContent("Run a shell command");
+    expect(panel).toHaveTextContent("mcp:gh");
+    expect(panel).toHaveTextContent("promoted on demand");
+    expect(panel).toHaveTextContent('"command"');
+  });
+
+  // 终审 C1 —— 账本 `entry.toolName` 是剥了 `mcp__server__` 前缀的显示名
+  // ("create_issue"),catalog key 是注册名("mcp__gh__create_issue",
+  // `rawName`)。`schemaToolNameOf` 必须用 `rawName` 查,否则每一条 MCP 工具
+  // 记录都稳定 miss、渲染成看似正常的空态。
+  it("MCP 工具记录用 rawName(注册名)查 catalog,不用剥了前缀的 toolName", () => {
+    const item: AgentToolSchema = {
+      name: "mcp__gh__create_issue",
+      description: "Create a GitHub issue",
+      parameters: { type: "object", properties: {} },
+      source: "mcp:gh",
+      from_skill: null,
+      deferred: false,
+    };
+    const mcpRow = toolRow({
+      entry: {
+        id: "c10",
+        rawName: "mcp__gh__create_issue",
+        isMcp: true,
+        server: "gh",
+        toolName: "create_issue",
+        args: {},
+        status: "success",
+        resultPreview: "",
+        durationMs: 40,
+      },
+    });
+    renderRecord({ record: rec(mcpRow), toolSchemas: ready([item]), activeTab: "schema" });
+    expect(screen.queryByTestId("console-detail-schema-missing")).toBeNull();
+    expect(screen.getByTestId("console-detail-schema")).toHaveTextContent("Create a GitHub issue");
+  });
+
+  it("rawName 为空的 tool 记录不出 Schema tab", () => {
+    const emptyNameRow = toolRow({
+      entry: {
+        id: "c11",
+        rawName: "",
+        isMcp: false,
+        server: null,
+        toolName: "",
+        args: {},
+        status: "success",
+        resultPreview: "",
+        durationMs: 10,
+      },
+    });
+    expect(schemaToolNameOf(emptyNameRow)).toBeNull();
+    expect(recordTabsOf(rec(emptyNameRow))).not.toContain("schema");
+  });
+
+  // Minor 1 —— skill 工具的「来源」应显示 `skill:<name>`,不是 registry 落的
+  // 默认 `source: "builtin"`。
+  it("skill 工具的来源显示 skill:<name>,不是 builtin", () => {
+    const item: AgentToolSchema = {
+      name: "summarize_doc",
+      description: "Summarize a document",
+      parameters: { type: "object", properties: {} },
+      source: "builtin",
+      from_skill: "doc_tools",
+      deferred: false,
+    };
+    const skillRow = toolRow({
+      entry: {
+        id: "c12", rawName: "summarize_doc", isMcp: false, server: null, toolName: "summarize_doc",
+        args: {}, status: "success", resultPreview: "", durationMs: 20,
+      },
+    });
+    renderRecord({ record: rec(skillRow), toolSchemas: ready([item]), activeTab: "schema" });
+    const panel = screen.getByTestId("console-detail-schema");
+    expect(panel).toHaveTextContent("skill:doc_tools");
+    expect(panel).not.toHaveTextContent("builtin");
+  });
+
+  it("三态:loading / error(带重试)/ missing(未命中当前工具集)", async () => {
+    const reload = vi.fn();
+    const loading = renderRecord({
+      record: rec(toolRow()),
+      toolSchemas: { status: "loading", byName: new Map(), reload },
+      activeTab: "schema",
+    });
+    expect(screen.getByTestId("console-detail-schema")).toHaveTextContent("Loading tool schemas");
+    loading.unmount();
+
+    const errored = renderRecord({
+      record: rec(toolRow()),
+      toolSchemas: { status: "error", byName: new Map(), reload },
+      activeTab: "schema",
+    });
+    await userEvent.click(screen.getByTestId("console-detail-schema-retry"));
+    expect(reload).toHaveBeenCalledTimes(1);
+    errored.unmount();
+
+    renderRecord({ record: rec(toolRow()), toolSchemas: ready([]), activeTab: "schema" });
+    expect(screen.getByTestId("console-detail-schema-missing")).toBeInTheDocument();
+  });
+
+  it("plan(update_plan) 记录的工具名解析成 'update_plan';planner 节点的 plan 记录不解析", () => {
+    expect(schemaToolNameOf(planRow({ source: "update_plan" }))).toBe("update_plan");
+    expect(schemaToolNameOf(planRow({ source: "planner" }))).toBeNull();
+    expect(recordTabsOf(rec(planRow({ source: "update_plan" })))).toContain("schema");
+    expect(recordTabsOf(rec(planRow({ source: "planner" })))).not.toContain("schema");
+  });
+});
+
+// PR-A.3 §十.1 Task 12 —— SYSTEM 记录:概要 / 原文 / 原始 三个 tab,概要多一行
+// 字数,原文 = SystemPromptPanel 全文 + 复制按钮。这个套件的默认语言是英文
+// (jsdom navigator.language → i18next-browser-languagedetector 探测出
+// "en",不是 zh-CN;别的既有用例同样断言英文文案,如 "Turn not replayed yet"),
+// 所以 tab 文案与 brief 示例的中文不同,这里按本文件实际渲染的英文断言。
+describe("SYSTEM record (PR-A.3 §十.1)", () => {
+  it("tabs 概要 / 原文 / 原始;summary shows char count;原文 shows the full prompt", async () => {
+    renderRecord({ record: rec(systemRow("你是评审员\n只说重点")) });
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([
+      "Summary",
+      "Raw",
+      "Frames",
+    ]);
+    // "你是评审员\n只说重点".length === 10(5 + 1 换行 + 4)。
+    expect(screen.getByTestId("console-detail-summary")).toHaveTextContent("10 chars");
+    await userEvent.click(screen.getByTestId("console-detail-tab-rawtext"));
+    expect(screen.getByTestId("console-detail-system-prompt")).toHaveTextContent("只说重点");
+  });
+
+  it("原文面板带复制按钮", () => {
+    renderRecord({ record: rec(systemRow("你是评审员")), activeTab: "rawtext" });
+    expect(screen.getByTestId("console-detail-system-copy")).toBeInTheDocument();
+  });
+
+  it("SYSTEM 的类型标签显式定色(kind_tag.css 不靠默认的 .ew-kt 兜底)", () => {
+    const css = readFileSync("src/components/console/kind_tag.css", "utf8");
+    const rule = /\.ew-kt--system \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(rule).toContain("--ew-kt-color: var(--ew-text-secondary)");
   });
 });

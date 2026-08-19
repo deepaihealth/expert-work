@@ -51,6 +51,7 @@ from control_plane.api._external import (
     reject_nul_deep,
     reject_nul_path_params,
 )
+from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import resolve_approval_decision
 from control_plane.runtime import AgentRuntime
@@ -314,6 +315,9 @@ def build_external_approvals_router() -> APIRouter:
                 run_manager=runtime.run_manager,
                 is_disconnected=request.is_disconnected,
                 last_event_id=request.headers.get("Last-Event-ID"),
+                # PR-A.3 Task 8 — 对外平面零新暴露:approval 续跑的 SSE 流
+                # 同样是第三方 API key 直接消费,system_prompt 不可见。
+                hide_events=EXTERNAL_HIDDEN_EVENTS,
             ),
             media_type="text/event-stream",
             headers={
