@@ -1,0 +1,391 @@
+/*
+ * TrajectoryLedger —— 账本表格样式(spec §九「账本」)。行高钉死在
+ * `--ew-ledger-row`(组件里的虚拟化按同一个数算窗口与 spacer,两处必须同值)。
+ * 事件槽是唯一 `overflow: visible` 的格子:轮标签、竖轨、跨到行上方 8px 的请求
+ * 圆点都靠它做定位上下文。颜色一律走 `--ew-*` 令牌,类型标签的底色由同一个色
+ * 令牌 `color-mix` 出 14%,浅深主题各自成立。观感参照 deepseek-harness
+ * ui-trajectory(MIT)重写。
+ */
+.ew-ledger {
+  --ew-ledger-row: 27px;
+
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  outline: none;
+  /* 窄栏换紧凑轮标签靠容器查询,容器得先声明出来。 */
+  container-type: inline-size;
+}
+
+/* 粘性覆盖层 —— 不占位、不吃指针,滚动容器因此不用换掉。 */
+.ew-ledger__loading {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  background: var(--ew-surface-raised);
+  color: var(--ew-text-secondary);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.ew-ledger__spinner {
+  display: inline-block;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  border: 1.5px solid var(--ew-border-default);
+  border-top-color: var(--ew-text-link);
+  border-radius: 50%;
+  animation: ew-ledger-spin 700ms linear infinite;
+}
+
+@keyframes ew-ledger-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) { .ew-ledger__spinner { animation: none; } }
+
+.ew-ledger__table {
+  width: 100%;
+  min-width: 0;
+  border-spacing: 0;
+  table-layout: fixed;
+  color: var(--ew-text-primary);
+  font-size: 12px;
+}
+
+.ew-ledger__col-event {
+  width: 122px;
+}
+
+.ew-ledger__table td {
+  box-sizing: border-box;
+  height: var(--ew-ledger-row);
+  padding: 0 8px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ew-ledger__spacer td {
+  padding: 0;
+  border: 0;
+}
+
+.ew-ledger__earlier td {
+  height: 30px;
+  padding: 0;
+}
+
+.ew-ledger__earlier-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 29px;
+  border: none;
+  background: var(--ew-surface-raised);
+  color: var(--ew-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ew-ledger__earlier-btn:hover:not(:disabled) {
+  background: var(--ew-surface-hover);
+  color: var(--ew-text-primary);
+}
+
+/* ---- 行状态 ---------------------------------------------------------- */
+
+.ew-ledger__row,
+.ew-ledger__summary {
+  outline: none;
+  transition:
+    background-color var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease),
+    opacity var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease);
+}
+
+.ew-ledger__summary { cursor: pointer; }
+
+.ew-ledger__row:hover,
+.ew-ledger__row[data-hovered="true"],
+.ew-ledger__summary:hover {
+  background: var(--ew-surface-hover);
+}
+
+.ew-ledger__row[data-selected="true"],
+.ew-ledger__row[data-selected="true"]:hover {
+  background: var(--ew-surface-selected);
+}
+
+/* 选区外的行压暗但不隐藏 —— 读者要看得见自己框掉了什么。 */
+.ew-ledger__row[data-focus="outside"] {
+  opacity: 0.24;
+}
+
+.ew-ledger__row:focus-visible,
+.ew-ledger__summary:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--ew-border-strong);
+}
+
+/* 轮起点一条 2px 粗分隔线(压在上一行的下边框上)。 */
+.ew-ledger__row[data-turn-start="true"] td::before {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 1;
+  height: 2px;
+  background: var(--ew-border-default);
+  content: "";
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.ew-ledger__row[data-turn-start="true"] td {
+  position: relative;
+}
+
+/* ---- 事件槽 ---------------------------------------------------------- */
+
+.ew-ledger__event {
+  position: relative;
+  overflow: visible !important;
+  padding-right: 4px !important;
+  padding-left: 36px !important;
+}
+
+.ew-ledger__turn-rail,
+.ew-ledger__sel-rail {
+  position: absolute;
+  left: 0;
+  pointer-events: none;
+}
+
+.ew-ledger__turn-rail {
+  inset-block: -1px;
+  z-index: 4;
+  width: 2px;
+  background: color-mix(in srgb, var(--ew-color-brand-300) 40%, transparent);
+}
+
+.ew-ledger__row[data-turn-end="true"] .ew-ledger__turn-rail { bottom: 0; }
+
+.ew-ledger__sel-rail {
+  inset-block: 0;
+  z-index: 5;
+  width: 3px;
+  background: var(--ew-color-brand-300);
+}
+
+.ew-ledger__row[data-error="true"] .ew-ledger__sel-rail {
+  background: var(--ew-color-danger-500);
+}
+
+.ew-ledger__row[data-error="true"] .ew-ledger__turn-rail {
+  background: color-mix(in srgb, var(--ew-color-danger-500) 40%, transparent);
+}
+
+.ew-ledger__turn-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  display: inline-grid;
+  box-sizing: border-box;
+  width: max-content;
+  padding: 1px 5px;
+  border-radius: 0 0 2px;
+  color: var(--ew-text-tertiary);
+  background: var(--ew-surface-raised);
+  font-family: var(--ew-font-mono);
+  font-size: 8px;
+  line-height: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ew-ledger__turn-label[data-active="true"] {
+  color: var(--ew-text-link);
+  background: color-mix(in srgb, var(--ew-color-brand-300) 22%, transparent);
+}
+
+/* 全文 / 紧凑两份叠在同一格里,窄栏时靠 max-width 换人。 */
+.ew-ledger__turn-label-full,
+.ew-ledger__turn-label-compact {
+  grid-area: 1 / 1;
+  max-width: 64px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.ew-ledger__turn-label-compact {
+  max-width: 0;
+  opacity: 0;
+}
+
+@container (max-width: 520px) {
+  .ew-ledger__turn-label-full {
+    max-width: 0;
+    opacity: 0;
+  }
+
+  .ew-ledger__turn-label-compact {
+    max-width: 64px;
+    opacity: 1;
+  }
+}
+
+/* 请求圆点跨在这一行上方 8px —— 它标的是「这里开始一次新的 LLM 请求」。 */
+.ew-ledger__dot {
+  position: absolute;
+  top: -8px;
+  left: 12px;
+  z-index: 6;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.ew-ledger__dot::before {
+  position: absolute;
+  top: 5.5px;
+  left: 5.5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ew-text-tertiary);
+  content: "";
+  transition:
+    background var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease),
+    transform var(--ew-duration-fast, 0.1s) var(--ew-ease-standard, ease);
+}
+
+.ew-ledger__dot:hover::before,
+.ew-ledger__dot:focus-visible::before {
+  background: var(--ew-color-brand-300);
+  transform: scale(1.5);
+}
+
+.ew-ledger__dot[data-active="true"]::before {
+  background: var(--ew-color-brand-300);
+  box-shadow: 0 0 0 1.5px var(--ew-color-brand-300);
+}
+
+.ew-ledger__dot[data-status="error"]::before,
+.ew-ledger__dot[data-status="error"]:hover::before {
+  background: var(--ew-color-danger-500);
+}
+
+.ew-ledger__dot[data-status="running"]::before {
+  background: var(--ew-color-success-500);
+}
+
+.ew-ledger__kind-slot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 76px;
+  height: 100%;
+}
+
+/* ---- 类型标签(§九 类型 → 标签 / 颜色表) ---------------------------- */
+
+.ew-kt {
+  --ew-kt-color: var(--ew-text-secondary);
+
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  box-sizing: border-box;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--ew-kt-color);
+  background: color-mix(in srgb, var(--ew-kt-color) 14%, transparent);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  letter-spacing: 0.035em;
+  user-select: none;
+}
+
+.ew-kt--user { --ew-kt-color: var(--ew-color-brand-300); }
+.ew-kt--memory { --ew-kt-color: var(--ew-color-success-500); }
+.ew-kt--assistant { --ew-kt-color: var(--ew-accent-violet); }
+.ew-kt--reflect { --ew-kt-color: var(--ew-color-accent-400); }
+.ew-kt--tool { --ew-kt-color: var(--ew-color-warning-500); }
+.ew-kt--subagent { --ew-kt-color: var(--ew-color-warning-700); }
+.ew-kt--plan { --ew-kt-color: var(--ew-color-teal-500); }
+
+/* compaction / retry / error / approval / guard / gap 用默认的 secondary。 */
+
+.ew-ledger__row[data-error="true"] .ew-kt {
+  --ew-kt-color: var(--ew-color-danger-500);
+}
+
+/* ---- 内容列 ---------------------------------------------------------- */
+
+.ew-ledger__content {
+  padding-left: 4px !important;
+  color: var(--ew-text-primary);
+}
+
+.ew-ledger__nm,
+.ew-ledger__args {
+  font-family: var(--ew-font-mono);
+}
+
+.ew-ledger__nm {
+  margin-right: 6px;
+  color: var(--ew-text-primary);
+}
+
+.ew-ledger__args {
+  color: var(--ew-text-secondary);
+}
+
+.ew-ledger__ph,
+.ew-ledger__muted {
+  color: var(--ew-text-tertiary);
+}
+
+.ew-ledger__ph {
+  margin-right: 6px;
+}
+
+.ew-ledger__arr {
+  margin: 0 8px;
+  color: var(--ew-text-tertiary);
+}
+
+.ew-ledger__res {
+  color: var(--ew-text-secondary);
+}
+
+.ew-ledger__res[data-error="true"] {
+  color: var(--ew-text-danger);
+}
+
+.ew-ledger__summary td {
+  height: 20px;
+  color: var(--ew-text-secondary);
+}
+
+.ew-ledger__ellipsis {
+  margin-right: 6px;
+  color: var(--ew-text-tertiary);
+  font-weight: 600;
+  user-select: none;
+}
