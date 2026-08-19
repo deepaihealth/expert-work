@@ -1,4 +1,5 @@
 import random
+from typing import Any
 
 import pytest
 
@@ -359,3 +360,21 @@ def test_feed_still_holds_when_dlp_on() -> None:
     r = StreamingRedactor(dlp=True, screen=False)
     out = r.feed("A" * 100)
     assert len(out) == 100 - HOLD_CHARS
+
+
+@pytest.mark.asyncio
+async def test_token_sink_records_first_non_empty_delta_time_once() -> None:
+    published: list[dict[str, Any]] = []
+
+    async def publish(frame: dict[str, Any]) -> None:
+        published.append(frame)
+
+    sink = TokenSink(step=1, publish=publish, dlp=False, screen=False)
+    assert sink.first_delta_at is None
+    await sink(LLMDelta())  # 空 delta(只有 role 之类)不算首 token
+    assert sink.first_delta_at is None
+    await sink(LLMDelta(reasoning="thinking"))
+    first = sink.first_delta_at
+    assert first is not None
+    await sink(LLMDelta(content="answer"))
+    assert sink.first_delta_at == first  # 只记第一次

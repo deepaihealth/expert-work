@@ -899,6 +899,7 @@ def build_react_graph(
         if cache_hit_response is not None:
             response: AIMessage = cache_hit_response
         else:
+            llm_started = time.monotonic()
             _token_sink = make_token_sink(
                 step=step_count + 1,
                 publish=token_sink_from_config(config),
@@ -926,6 +927,14 @@ def build_react_graph(
                     )
             if _token_sink is not None:
                 await _token_sink.flush()
+
+            # PR-A.3 §十.3 — per-step TTFT, same channel as the tool path's
+            # ``ToolMessage.additional_kwargs["duration_ms"]``: rides the
+            # ``updates`` frame into the store, so history replays keep it.
+            if _token_sink is not None and _token_sink.first_delta_at is not None:
+                response.additional_kwargs["first_token_ms"] = round(
+                    (_token_sink.first_delta_at - llm_started) * 1000
+                )
 
         # B3 — count the INITIAL response's real spend right where it
         # resolves (cache hit or fresh call), before screen/judge below can
