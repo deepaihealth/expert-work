@@ -1,10 +1,13 @@
 /**
  * Trajectory-row projections — turns a turn's SSE events (via
- * ``parseTimeline``) into two flat row lists that share one id scheme:
- * ``compactRowsOf`` (中栏紧凑行, no forced think rows) and
- * ``trajectoryRowsOf`` (右栏轨迹行: user + one think per step + assistant).
- * Both are pure; no rendering, no state. See
- * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-4-brief.md.
+ * ``parseTimeline``) into flat row lists that share one id scheme:
+ * ``compactRowsOf`` (中栏紧凑行, no forced think rows), ``ledgerRowsOf``
+ * (账本行: user + one **assistant** per agent step, spec §九 D2) and the
+ * legacy ``trajectoryRowsOf`` (右栏轨迹行: user + one think per step +
+ * trailing assistant; retired in PR-A.2 Task 11). All pure; no rendering,
+ * no state. 投影模型参照 deepseek-harness ui-trajectory(MIT)重写。See
+ * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-4-brief.md
+ * 与 .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-2-brief.md.
  */
 import type { PlanStep, PlanStepStatus, ThreadPlan } from "./plan";
 import type { SseEvent } from "./sessions";
@@ -45,7 +48,19 @@ export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "ap
 export type CompactRow = ThinkRow | ToolRow | SubagentRow | PlanRow | MemoryRow | ReflectRow | MarkerRow;
 
 export type UserRow = RowBase & { kind: "user"; text: string; attachmentNames: string[]; inputs: Record<string, string> };
-export type AssistantRow = RowBase & { kind: "assistant"; text: string };
+export type AssistantRow = RowBase & {
+  kind: "assistant";
+  /** 该步正文;没有 ""。 */
+  text: string;
+  /** 该步思考;没有 ""。 */
+  reasoning: string;
+  model: string | null;
+  inputTokens: number; outputTokens: number;
+  reasoningTokens?: number; cacheReadTokens?: number;
+  finishReason: string | null;
+  /** 该步发起的工具调用数(含 update_plan)。 */
+  toolCallCount: number;
+};
 export type TrajectoryRow = UserRow | CompactRow | AssistantRow;
 
 export interface TrajectoryInput { text: string; attachmentNames: string[]; inputs: Record<string, string> }
@@ -115,12 +130,16 @@ function asThreadPlan(v: unknown): ThreadPlan | null {
   return { goal: o.goal, steps };
 }
 
-/** Shared builder behind both projections — `everyStepThinks` is the only
- *  behavioural knob (Rule 5 forces a think row per agent step for the
- *  trajectory projection; the compact projection only emits one when
- *  `reasoning` is non-null, Rule 1). */
-function rowsOf(events: readonly SseEvent[], opts: { everyStepThinks: boolean }): CompactRow[] {
-  const rows: CompactRow[] = [];
+/** 每个 agent 步投影成什么行 —— 三个投影唯一的行为旋钮:
+ *  - `compact`(中栏紧凑行):`reasoning` 非空才出一条 think 行(Rule 1);
+ *  - `trajectory`(旧右栏轨迹行,Task 11 删):每步一条 think 行(Rule 5);
+ *  - `ledger`(账本,spec §九 D2):每步一条 assistant 行,不出 think 行。 */
+type Projection = "compact" | "trajectory" | "ledger";
+
+/** Shared builder behind the three projections. Aux / tool / marker rows are
+ *  identical across all of them (同 id 同顺序);只有 agent 步的投影不同。 */
+function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): TrajectoryRow[] {
+  const rows: TrajectoryRow[] = [];
   for (const item of parseTimeline(events)) {
     // A `switch` over the discriminant (rather than sequential `if (item.kind
     // === ...) { …; continue; }`) is required here — TS's control-flow
@@ -131,7 +150,17 @@ function rowsOf(events: readonly SseEvent[], opts: { everyStepThinks: boolean })
     // before relying on it here.
     switch (item.kind) {
       case "agent": {
-        if (item.reasoning !== null || opts.everyStepThinks) {
+        if (opts.projection === "ledger") {
+          rows.push({
+            id: `assistant:${item.seq}`, kind: "assistant", seq: item.seq, step: item.stepCount,
+            text: item.content ?? "", reasoning: item.reasoning ?? "", model: item.model,
+            inputTokens: item.inputTokens, outputTokens: item.outputTokens,
+            reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
+            finishReason: item.finishReason, toolCallCount: item.tools.length,
+            status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
+            eventIndexes: idx(item), serverMs: item.serverMs ?? null,
+          });
+        } else if (item.reasoning !== null || opts.projection === "trajectory") {
           rows.push({
             id: `think:${item.seq}`, kind: "think", seq: item.seq, step: item.stepCount,
             text: item.reasoning ?? "", content: item.content, model: item.model,
@@ -231,9 +260,32 @@ function rowsOf(events: readonly SseEvent[], opts: { everyStepThinks: boolean })
   return rows;
 }
 
+/** `TrajectoryRow` → `CompactRow` 的收窄谓词 —— `compact` / `trajectory`
+ *  投影不会产出 user / assistant 行,靠它把类型收回去(而不是断言)。 */
+function isCompactRow(row: TrajectoryRow): row is CompactRow {
+  return row.kind !== "user" && row.kind !== "assistant";
+}
+
 /** 中栏紧凑行:顺序 = parseTimeline 顺序;`end` 不出行(脚注表达状态);think 只在 reasoning 非空时出。 */
 export function compactRowsOf(events: readonly SseEvent[]): CompactRow[] {
-  return rowsOf(events, { everyStepThinks: false });
+  return rowsOf(events, { projection: "compact" }).filter(isCompactRow);
+}
+
+/** 一行 user 行 —— 三个投影共用。 */
+function userRowOf(input: TrajectoryInput): UserRow {
+  return {
+    id: "user", kind: "user", seq: -1, step: null, status: "ok", durationMs: null,
+    eventIndexes: [], serverMs: null,
+    text: input.text, attachmentNames: input.attachmentNames, inputs: input.inputs,
+  };
+}
+
+/** 账本投影(spec §九 D2):`user` + 每个 agent 步一条 `assistant`(id
+ *  `assistant:${seq}`,正文 / 思考 / 用量 / finishReason / 工具调用数都在行上)
+ *  + 其余紧凑行(tool / plan / subagent / memory / reflect / marker,与
+ *  `compactRowsOf` 同源同 id)。**不再有** think 行,也没有末尾合成 assistant 行。 */
+export function ledgerRowsOf(events: readonly SseEvent[], input: TrajectoryInput): TrajectoryRow[] {
+  return [userRowOf(input), ...rowsOf(events, { projection: "ledger" })];
 }
 
 /** 右栏轨迹行:`user` + 每个 agent 步一条 think(reasoning 为空也出,`text: ""`,UI 显示「模型调用 · <model>」)+ 其余同紧凑行 + `assistant`(`answer` 非空时;`status` = turnStatus running→running / error→error / done→ok)。 */
@@ -243,12 +295,7 @@ export function trajectoryRowsOf(
   answer: string | null,
   turnStatus: "running" | "done" | "error",
 ): TrajectoryRow[] {
-  const userRow: UserRow = {
-    id: "user", kind: "user", seq: -1, step: null, status: "ok", durationMs: null,
-    eventIndexes: [], serverMs: null,
-    text: input.text, attachmentNames: input.attachmentNames, inputs: input.inputs,
-  };
-  const rows: TrajectoryRow[] = [userRow, ...rowsOf(events, { everyStepThinks: true })];
+  const rows: TrajectoryRow[] = [userRowOf(input), ...rowsOf(events, { projection: "trajectory" })];
   if (answer !== null) {
     let lastIdx: number[] = [];
     for (const item of parseTimeline(events)) {
@@ -258,6 +305,9 @@ export function trajectoryRowsOf(
       id: "assistant", kind: "assistant", seq: -1, step: null,
       status: turnStatus === "running" ? "running" : turnStatus === "error" ? "error" : "ok",
       durationMs: null, eventIndexes: lastIdx, serverMs: null, text: answer,
+      // 按步投影才有的字段:这条是整轮的合成行,没有对应的单次模型调用。
+      reasoning: "", model: null, inputTokens: 0, outputTokens: 0,
+      finishReason: null, toolCallCount: 0,
     };
     rows.push(assistantRow);
   }

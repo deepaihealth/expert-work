@@ -15,6 +15,7 @@ function span(p: Partial<TraceSpan> & Pick<TraceSpan, "id" | "kind" | "label">):
 const okTrace = (spans: TraceSpan[]): RunTrace => ({ status: "ok", trace: { name: "run", latencyMs: 100, totalCostUsd: 0.01, spanCount: spans.length }, spans });
 const think = (id: string, seq: number): TrajectoryRow => ({ ...base, id, seq, kind: "think", text: "", content: null, model: null, inputTokens: 0, outputTokens: 0, finishReason: null });
 const tool = (id: string, name: string): TrajectoryRow => ({ ...base, id, kind: "tool", entry: { id, rawName: name, isMcp: false, server: null, toolName: name, args: {}, status: "success", resultPreview: null, durationMs: 1 } });
+const assistant = (id: string, seq: number, step: number | null): TrajectoryRow => ({ ...base, id, seq, step, kind: "assistant", text: "", reasoning: "", model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 0 });
 
 describe("matchTraceSpans", () => {
   it("no trace / not ok → every row no_trace", () => {
@@ -96,7 +97,7 @@ describe("matchTraceSpans", () => {
 
   it("assistant / subagent / retry / approval / guard / gap rows are all unsupported", () => {
     const rows: TrajectoryRow[] = [
-      { ...base, id: "assistant", seq: -1, kind: "assistant", text: "answer" },
+      assistant("assistant", -1, null),
       { ...base, id: "sub:0", seq: 0, kind: "subagent", worker: {} as unknown as WorkerTimeline, parentEntryId: "tool:0:0" },
       { ...base, id: "retry:1", seq: 1, kind: "retry", text: "retry" },
       { ...base, id: "approval:2", seq: 2, kind: "approval", text: "approval" },
@@ -107,5 +108,18 @@ describe("matchTraceSpans", () => {
     for (const row of rows) {
       expect(m.get(row.id)).toEqual({ span: null, reason: "unsupported" });
     }
+  });
+  it("per-step assistant rows pair with main llm spans in order; unequal counts mark them all count_mismatch", () => {
+    const rows = [assistant("assistant:0", 0, 1), assistant("assistant:2", 2, 2)];
+    const l1 = span({ id: "l1", kind: "llm", label: "llm" });
+    const l2 = span({ id: "l2", kind: "llm", label: "llm", purpose: "main" });
+    const aux = span({ id: "a", kind: "llm", label: "llm", purpose: "memory" });
+    const m = matchTraceSpans(rows, okTrace([aux, l1, l2]));
+    expect(m.get("assistant:0")?.span?.id).toBe("l1");
+    expect(m.get("assistant:2")?.span?.id).toBe("l2");
+    expect(matchTraceSpans(rows, okTrace([l1])).get("assistant:0")).toEqual({ span: null, reason: "count_mismatch" });
+    // 旧投影末尾那条合成 assistant(step 为 null)不进 rule 2,仍旧 unsupported。
+    expect(matchTraceSpans([assistant("assistant", -1, null)], okTrace([l1])).get("assistant"))
+      .toEqual({ span: null, reason: "unsupported" });
   });
 });

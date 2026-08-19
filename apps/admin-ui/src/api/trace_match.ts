@@ -8,10 +8,13 @@
  *
  * 1. No usable trace (``null`` / not ``"ok"`` / no ``spans``) → every row
  *    is ``no_trace``.
- * 2. ``think`` rows ↔ main-conversation llm spans (``kind === "llm" &&
- *    (purpose === "" || purpose === "main")``), paired in order of
- *    appearance — same criterion as ``labelPurpose`` — but only when the
- *    counts are equal; otherwise every think row is ``count_mismatch``.
+ * 2. Per-step model rows — ``think`` rows (中栏紧凑投影) **or**
+ *    ``assistant`` rows whose ``step`` is non-null (账本按步投影, spec §九
+ *    D2) — ↔ main-conversation llm spans (``kind === "llm" && (purpose ===
+ *    "" || purpose === "main")``), paired in order of appearance — same
+ *    criterion as ``labelPurpose`` — but only when the counts are equal;
+ *    otherwise every such row is ``count_mismatch``. 旧投影末尾那条整轮合成
+ *    的 ``assistant`` 行 ``step`` 为 ``null``,不参与,落到 rule 5。
  * 3. ``tool`` rows and ``update_plan`` plan rows ↔ ``kind === "tool"``
  *    spans, matched by name (tool name / ``"update_plan"``), nth
  *    occurrence to nth occurrence; a name with fewer spans than rows
@@ -19,9 +22,9 @@
  * 4. Aux rows (memory recall/writeback, planner, reflect, compaction) ↔
  *    ``kind === "llm"`` spans sharing the same ``purpose``, same
  *    nth-of-purpose pairing as rule 3.
- * 5. Everything else (user / assistant / subagent / retry / error /
- *    approval / guard / gap) is ``unsupported`` — there is no Langfuse
- *    span shape to pair it with.
+ * 5. Everything else (user / step-less assistant / subagent / retry /
+ *    error / approval / guard / gap) is ``unsupported`` — there is no
+ *    Langfuse span shape to pair it with.
  */
 import type { RunTrace, TraceSpan } from "./trace_facade";
 import type { TrajectoryRow } from "./trajectory_rows";
@@ -84,15 +87,17 @@ export function matchTraceSpans(
   const spans = trace.spans;
   const result = new Map<string, SpanMatch>();
 
-  // Rule 2 — think rows ↔ main llm spans, order-paired, count-gated.
-  const thinkRows = rows.filter((row) => row.kind === "think");
+  // Rule 2 — per-step model rows ↔ main llm spans, order-paired, count-gated.
+  const stepRows = rows.filter(
+    (row) => row.kind === "think" || (row.kind === "assistant" && row.step !== null),
+  );
   const mainLlmSpans = spans.filter(
     (span) => span.kind === "llm" && (span.purpose === "" || span.purpose === "main"),
   );
-  if (thinkRows.length === mainLlmSpans.length) {
-    thinkRows.forEach((row, i) => result.set(row.id, { span: mainLlmSpans[i], reason: "matched" }));
+  if (stepRows.length === mainLlmSpans.length) {
+    stepRows.forEach((row, i) => result.set(row.id, { span: mainLlmSpans[i], reason: "matched" }));
   } else {
-    thinkRows.forEach((row) => result.set(row.id, { span: null, reason: "count_mismatch" }));
+    stepRows.forEach((row) => result.set(row.id, { span: null, reason: "count_mismatch" }));
   }
 
   // Rule 3 — tool rows + update_plan plan rows ↔ tool spans, nth-of-name.

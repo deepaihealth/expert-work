@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, resolveGanttKey, trajectoryRowsOf, type ThinkRow } from "../trajectory_rows";
+import { compactRowsOf, ledgerRowsOf, resolveGanttKey, trajectoryRowsOf, type AssistantRow, type ThinkRow } from "../trajectory_rows";
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
@@ -273,5 +273,106 @@ describe("resolveGanttKey", () => {
     const workerRows = trajectoryRowsOf(workerFixtureEvents(), INPUT, null, "running");
     const sub = workerRows.find((r) => r.kind === "subagent");
     expect(resolveGanttKey(workerRows, "worker-w-9-0")).toBe(sub!.id);
+  });
+});
+
+describe("ledgerRowsOf", () => {
+  const LEDGER_EVENTS: SseEvent[] = [
+    upd("agent", { step_count: 1, _duration_ms: 900, messages: [{
+      type: "ai", content: "先看一眼档案",
+      response_metadata: { model_name: "gpt-x", finish_reason: "tool_calls" },
+      usage_metadata: {
+        input_tokens: 120, output_tokens: 30,
+        output_token_details: { reasoning: 12 }, input_token_details: { cache_read: 64 },
+      },
+      additional_kwargs: { reasoning_content: "先查客户档案\n再看工单" },
+      tool_calls: [
+        { id: "c1", name: "query_crm", args: { id: "C-1" } },
+        { id: "p1", name: "update_plan", args: { goal: "出建议", steps: PLAN.steps } },
+      ],
+    }] }),
+    upd("tools", {
+      messages: [
+        { type: "tool", tool_call_id: "c1", name: "query_crm", content: "3 条记录", status: "success" },
+        { type: "tool", tool_call_id: "p1", name: "update_plan", content: "ok", status: "success" },
+      ],
+      plan: PLAN,
+    }),
+    upd("memory_recall", { recalled_memories: [{ id: "m1", kind: "fact", content: "老客户", importance: 0.5, confidence: 0.5 }] }),
+    upd("reflect", { reflections: [{ verdict: "pass", critique: "够了" }] }),
+    ev("retry", { attempt: 1, error_class: "TimeoutError", backoff_s: 2 }),
+    upd("agent", { step_count: 2, _duration_ms: 400, messages: [{
+      type: "ai", content: "最终答案", response_metadata: { model_name: "gpt-x", finish_reason: "stop" },
+      usage_metadata: { input_tokens: 200, output_tokens: 40 },
+    }] }),
+    ev("end", { status: "success" }),
+  ];
+
+  it("ledgerRowsOf: user first, then one assistant per agent step (id assistant:<seq>, step, text=content, reasoning, tokens, finishReason, toolCallCount)", () => {
+    const rows = ledgerRowsOf(LEDGER_EVENTS, INPUT);
+    expect(rows[0]).toMatchObject({ id: "user", kind: "user", text: "帮我看看这个客户", seq: -1 });
+    const assistants = rows.filter((r): r is AssistantRow => r.kind === "assistant");
+    expect(assistants.map((r) => r.id)).toEqual(["assistant:0", "assistant:5"]);
+    expect(assistants[0]).toMatchObject({
+      seq: 0, step: 1, text: "先看一眼档案", reasoning: "先查客户档案\n再看工单",
+      model: "gpt-x", inputTokens: 120, outputTokens: 30, reasoningTokens: 12, cacheReadTokens: 64,
+      finishReason: "tool_calls", toolCallCount: 2, status: "ok", durationMs: 900, eventIndexes: [0],
+    });
+    expect(assistants[1]).toMatchObject({
+      seq: 5, step: 2, text: "最终答案", reasoning: "", model: "gpt-x",
+      inputTokens: 200, outputTokens: 40, finishReason: "stop", toolCallCount: 0, durationMs: 400,
+    });
+    expect(assistants[1].reasoningTokens).toBeUndefined();
+    expect(assistants[1].cacheReadTokens).toBeUndefined();
+  });
+
+  it("ledgerRowsOf: no think rows and no trailing synthetic assistant", () => {
+    const rows = ledgerRowsOf(LEDGER_EVENTS, INPUT);
+    expect(rows.some((r) => r.kind === "think")).toBe(false);
+    // 末行是最后一个 agent 步的 assistant(该步的 item.seq 是 5),不是旧的 `id: "assistant"` 合成行。
+    expect(rows.at(-1)).toMatchObject({ id: "assistant:5" });
+    expect(rows.some((r) => r.id === "assistant")).toBe(false);
+  });
+
+  it("ledgerRowsOf: tools / plan / subagent / memory / reflect / marker rows keep the same ids as compactRowsOf", () => {
+    const withWorker = [...LEDGER_EVENTS, ...workerFixtureEvents()];
+    const ledger = ledgerRowsOf(withWorker, INPUT);
+    const compact = compactRowsOf(withWorker);
+    const nonAgent = (id: string): boolean => !id.startsWith("think:") && !id.startsWith("assistant:");
+    const compactIds = compact.map((r) => r.id).filter(nonAgent);
+    const ledgerIds = ledger.map((r) => r.id).filter(nonAgent).filter((id) => id !== "user");
+    expect(compactIds).toEqual(ledgerIds);
+    expect(compactIds).toEqual([
+      "tool:0:0", "plan:0:1", "memory:2", "reflect:3", "retry:4", "tool:7:0", "subagent:7:0:0",
+    ]);
+  });
+
+  it("ledgerRowsOf: a step with no content yields text '' (caller renders tool-call-only)", () => {
+    const rows = ledgerRowsOf([
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", tool_calls: [{ id: "a", name: "t1", args: {} }] }] }),
+    ], INPUT);
+    const assistant = rows.find((r): r is AssistantRow => r.kind === "assistant");
+    expect(assistant).toMatchObject({ id: "assistant:0", text: "", reasoning: "", toolCallCount: 1 });
+  });
+
+  it("ledgerRowsOf: step error → assistant status error", () => {
+    const rows = ledgerRowsOf([
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "试试", tool_calls: [{ id: "a", name: "t1", args: {} }] }] }),
+      upd("tools", { messages: [{ type: "tool", tool_call_id: "a", name: "t1", content: "boom", status: "error" }] }),
+    ], INPUT);
+    const assistant = rows.find((r): r is AssistantRow => r.kind === "assistant");
+    expect(assistant).toMatchObject({ status: "error" });
+    expect(rows.find((r) => r.kind === "tool")).toMatchObject({ status: "error" });
+  });
+
+  it("trajectoryRowsOf (legacy) still returns the trailing assistant with the new fields zeroed", () => {
+    const rows = trajectoryRowsOf(LEDGER_EVENTS, INPUT, "最终答案", "done");
+    const tail = rows.at(-1) as AssistantRow;
+    expect(tail).toMatchObject({
+      id: "assistant", kind: "assistant", seq: -1, step: null, text: "最终答案", status: "ok",
+      reasoning: "", model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 0,
+    });
+    // 旧投影照旧出 think 行(Task 11 才删)。
+    expect(rows.some((r) => r.kind === "think")).toBe(true);
   });
 });
