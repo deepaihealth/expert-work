@@ -1359,6 +1359,8 @@ const zhCN: TranslationKeys = {
     detail_schema_source: "来源",
     detail_schema_deferred: "延迟挂载, 按需提升",
     detail_schema_parameters: "参数 (JSON Schema)",
+    detail_system_prompt: "系统提示词",
+    detail_system_chars: "{{n}} 字",
   },
   playground: {
     session_label: "会话",

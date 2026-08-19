@@ -20,6 +20,7 @@ import type {
   MemoryRow,
   PlanRow,
   SubagentRow,
+  SystemRow,
   ToolRow,
   TrajectoryRow,
   UserRow,
@@ -127,6 +128,13 @@ function subagentRow(over: Partial<SubagentRow> = {}): SubagentRow {
       summary: null,
     },
     ...over,
+  };
+}
+
+function systemRow(text: string): SystemRow {
+  return {
+    id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+    eventIndexes: [1], serverMs: 1001, text,
   };
 }
 
@@ -551,5 +559,36 @@ describe("Schema tab (PR-A.3 §十.2)", () => {
     expect(schemaToolNameOf(planRow({ source: "planner" }))).toBeNull();
     expect(recordTabsOf(rec(planRow({ source: "update_plan" })))).toContain("schema");
     expect(recordTabsOf(rec(planRow({ source: "planner" })))).not.toContain("schema");
+  });
+});
+
+// PR-A.3 §十.1 Task 12 —— SYSTEM 记录:概要 / 原文 / 原始 三个 tab,概要多一行
+// 字数,原文 = SystemPromptPanel 全文 + 复制按钮。这个套件的默认语言是英文
+// (jsdom navigator.language → i18next-browser-languagedetector 探测出
+// "en",不是 zh-CN;别的既有用例同样断言英文文案,如 "Turn not replayed yet"),
+// 所以 tab 文案与 brief 示例的中文不同,这里按本文件实际渲染的英文断言。
+describe("SYSTEM record (PR-A.3 §十.1)", () => {
+  it("tabs 概要 / 原文 / 原始;summary shows char count;原文 shows the full prompt", async () => {
+    renderRecord({ record: rec(systemRow("你是评审员\n只说重点")) });
+    expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([
+      "Summary",
+      "Raw",
+      "Frames",
+    ]);
+    // "你是评审员\n只说重点".length === 10(5 + 1 换行 + 4)。
+    expect(screen.getByTestId("console-detail-summary")).toHaveTextContent("10 chars");
+    await userEvent.click(screen.getByTestId("console-detail-tab-rawtext"));
+    expect(screen.getByTestId("console-detail-system-prompt")).toHaveTextContent("只说重点");
+  });
+
+  it("原文面板带复制按钮", () => {
+    renderRecord({ record: rec(systemRow("你是评审员")), activeTab: "rawtext" });
+    expect(screen.getByTestId("console-detail-system-copy")).toBeInTheDocument();
+  });
+
+  it("SYSTEM 的类型标签显式定色(kind_tag.css 不靠默认的 .ew-kt 兜底)", () => {
+    const css = readFileSync("src/components/console/kind_tag.css", "utf8");
+    const rule = /\.ew-kt--system \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(rule).toContain("--ew-kt-color: var(--ew-text-secondary)");
   });
 });

@@ -1297,6 +1297,8 @@ export interface TranslationKeys {
     detail_schema_source: string;
     detail_schema_deferred: string;
     detail_schema_parameters: string;
+    detail_system_prompt: string;
+    detail_system_chars: string;
   };
   playground: {
     session_label: string;
@@ -4518,6 +4520,8 @@ const en: TranslationKeys = {
     detail_schema_source: "Source",
     detail_schema_deferred: "deferred — promoted on demand",
     detail_schema_parameters: "Parameters (JSON Schema)",
+    detail_system_prompt: "System prompt",
+    detail_system_chars: "{{n}} chars",
   },
   playground: {
     session_label: "Session",

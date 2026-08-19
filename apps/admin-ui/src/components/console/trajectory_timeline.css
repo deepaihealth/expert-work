@@ -149,6 +149,7 @@
 
 /* §九 类型 → 颜色表。think 不会出现在账本里。 */
 .ew-traj-tl__block[data-kind="user"] { background: var(--ew-color-brand-300); }
+.ew-traj-tl__block[data-kind="system"] { background: var(--ew-text-secondary); }
 .ew-traj-tl__block[data-kind="memory"] { background: var(--ew-color-success-500); }
 .ew-traj-tl__block[data-kind="assistant"] { background: var(--ew-accent-violet); }
 .ew-traj-tl__block[data-kind="reflect"] { background: var(--ew-accent-reflect); }
