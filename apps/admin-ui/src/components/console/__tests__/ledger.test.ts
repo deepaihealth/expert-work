@@ -404,6 +404,30 @@ describe("absoluteSpans", () => {
     expect(absoluteSpans(rows, [], BASE + 42)?.get("user")).toEqual({ start: BASE + 42, end: BASE + 42 });
     expect(absoluteSpans(rows, [], null)?.get("user")).toBeUndefined();
   });
+
+  // 终审 I1 —— 运行中账本每 rAF 重建一次,历史轮的 `events` 引用整个会话不变,
+  // 所以每轮的 gantt 只该跑第一次。
+  it("同一份 events 引用重复调用命中缓存;换引用 / 换 fallbackStart 都重算", () => {
+    const events: SseEvent[] = [
+      upd("agent", { step_count: 1, _duration_ms: 400, messages: [{ type: "ai", content: "答" }] }, 1000),
+    ];
+    const input = { text: "问", attachmentNames: [], inputs: {} };
+    const rows = ledgerRowsOf(events, input);
+    const first = absoluteSpans(rows, events, null);
+    expect(first).not.toBeNull();
+    // 同一引用 + 同一 fallbackStart → 原样给回上次那个 Map。
+    expect(absoluteSpans(ledgerRowsOf(events, input), events, null)).toBe(first);
+    // 内容相同但换了数组引用 → 另一轮的账,不共用。
+    expect(absoluteSpans(rows, [...events], null)).not.toBe(first);
+    // `fallbackStart` 是唯一不由 events 决定的入参(USER 行的兜底起点),
+    // 它变了必须重算,否则共用一个空 events 的两轮会互相串起点。
+    const emptyEvents: SseEvent[] = [];
+    const emptyRows = ledgerRowsOf(emptyEvents, input);
+    expect(absoluteSpans(emptyRows, emptyEvents, BASE + 42)?.get("user"))
+      .toEqual({ start: BASE + 42, end: BASE + 42 });
+    expect(absoluteSpans(emptyRows, emptyEvents, BASE + 99)?.get("user"))
+      .toEqual({ start: BASE + 99, end: BASE + 99 });
+  });
 });
 
 describe("lastKnownFrame", () => {

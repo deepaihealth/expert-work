@@ -16,7 +16,21 @@ import { resolveGanttKey, type TrajectoryRow } from "../../api/trajectory_rows";
 
 export interface AbsoluteSpan { start: number; end: number }
 
-/** 一轮的行 → 绝对起止(服务端 ms)。
+/** 每轮的结果按 `events` 数组引用缓存(PR-A.2 终审 I1)。运行中账本每一次 rAF
+ *  flush 都重建一遍(`liveByStep` 换引用),而历史轮的 `events` 引用一整个会话
+ *  都不变 —— 没有这层缓存,窗口里 20 轮历史每帧要白跑 20 次 gantt。
+ *
+ *  只认 `events` 引用是安全的:同一份 events 下 `rows` 唯一的变数是尾部追加的
+ *  live 合成行,而它们的 `seq` 恒 -1、`serverMs` 恒 null、工具 entry id 带
+ *  `live-` 前缀 —— `resolveGanttKey` 与点块那一轮都收不下,对结果没有贡献。
+ *  `fallbackStart` 是唯一不由 events 决定的入参(USER 行兜底起点),所以它
+ *  一并进键:两轮共用一个空 `events` 时才不会互相串起点。 */
+const SPAN_CACHE = new WeakMap<
+  readonly SseEvent[],
+  { fallbackStart: number | null; spans: ReadonlyMap<string, AbsoluteSpan> | null }
+>();
+
+/** 一轮的行 → 绝对起止(服务端 ms)。**返回的 Map 是缓存实例,调用方只读。**
  *
  *  - gantt `degraded`(有帧 id 缺失 / 畸形,整轮时序不可信)→ 整个返回 `null`;
  *  - 有 gantt 时序的行取 `originMs + startMs` 起、`+ durationMs` 止(一行可能
@@ -26,6 +40,18 @@ export interface AbsoluteSpan { start: number; end: number }
  *  - `user` 行 → 本轮最早起点;一条有时序的行都没有时退到 `fallbackStart`
  *    (它也是 `null` 就不给 user 行落时序)。 */
 export function absoluteSpans(
+  rows: readonly TrajectoryRow[],
+  events: readonly SseEvent[],
+  fallbackStart: number | null,
+): ReadonlyMap<string, AbsoluteSpan> | null {
+  const cached = SPAN_CACHE.get(events);
+  if (cached !== undefined && cached.fallbackStart === fallbackStart) return cached.spans;
+  const spans = computeSpans(rows, events, fallbackStart);
+  SPAN_CACHE.set(events, { fallbackStart, spans });
+  return spans;
+}
+
+function computeSpans(
   rows: readonly TrajectoryRow[],
   events: readonly SseEvent[],
   fallbackStart: number | null,
