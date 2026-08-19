@@ -47,6 +47,33 @@ describe("ConsoleShell", () => {
     expect(screen.getAllByTestId("probe")).toHaveLength(2);
   });
 
+  it("omits the inspect column and adds the two-column modifier class when inspect is not provided", () => {
+    render(
+      <ConsoleShell
+        sidebar={<div>sidebar</div>}
+        main={<div>main</div>}
+        sidebarLabel="会话"
+      />,
+    );
+    const root = screen.getByTestId("playground-tab");
+    expect(root.className.split(" ")).toContain("ew-console--two");
+    expect(root.querySelector(".ew-console__inspect")).not.toBeInTheDocument();
+  });
+
+  it("keeps the three-column layout (no modifier class) and renders inspect when it is provided", () => {
+    render(
+      <ConsoleShell
+        sidebar={<div>sidebar</div>}
+        main={<div>main</div>}
+        inspect={<div data-testid="t-inspect-2">inspect</div>}
+        sidebarLabel="会话"
+      />,
+    );
+    const root = screen.getByTestId("playground-tab");
+    expect(root.className.split(" ")).not.toContain("ew-console--two");
+    expect(screen.getByTestId("t-inspect-2")).toBeInTheDocument();
+  });
+
   it("writes its own top offset into --ew-console-top so the CSS can fill to the viewport bottom", () => {
     render(
       <ConsoleShell

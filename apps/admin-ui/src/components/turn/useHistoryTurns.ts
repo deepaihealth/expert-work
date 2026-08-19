@@ -37,6 +37,9 @@ export interface UseHistoryTurns {
   /** Curried ``ref`` callback for a history row — registers it with the shared
    *  IntersectionObserver so scrolling it into view replays its run. */
   registerRow: (runId: string, threadId: string) => (el: HTMLElement | null) => void;
+  /** 主动回放一批 run(轨迹视图按页用):跳过已开始的,最多 4 路并发,全部
+   *  结束(成败都算)才 resolve;不抛。 */
+  loadRuns: (runIds: readonly string[], threadId: string) => Promise<void>;
   /** Fetch + pair a thread's history. Never rejects (degrades internally).
    *  ``tenantId`` is the thread's own tenant (authoritative — correct even
    *  from the "*" aggregate); omitted, the ambient tenant scope applies. */
@@ -196,6 +199,30 @@ export function useHistoryTurns(): UseHistoryTurns {
     }
   }, []);
 
+  // 轨迹视图按页主动回放(非滚动触发):一个 worker 池,worker 数
+  // = min(4, 待回放数),每个 worker 顺序从队列取下一个 runId 调用
+  // ``replayHistoryRun``(一次性守卫 + 内部降级都复用,不再重复);跳过
+  // ``startedHistoryRunsRef`` 里已经开始过的 run。``replayHistoryRun``
+  // 本身不抛(失败落 ``error`` 状态),所以这里不需要额外 try/catch。
+  const loadRuns = useCallback(
+    async (runIds: readonly string[], threadId: string) => {
+      const pending = runIds.filter(
+        (runId) => !startedHistoryRunsRef.current.has(runId),
+      );
+      let next = 0;
+      const worker = async () => {
+        while (next < pending.length) {
+          const runId = pending[next];
+          next += 1;
+          await replayHistoryRun(runId, threadId);
+        }
+      };
+      const workerCount = Math.min(4, pending.length);
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    },
+    [replayHistoryRun],
+  );
+
   // Each history row's ref registers itself with a shared IntersectionObserver
   // (created lazily on first row); a row scrolling into view triggers its
   // replay. The observer's callback closure is bound to one ``threadId``, so
@@ -245,6 +272,7 @@ export function useHistoryTurns(): UseHistoryTurns {
     turns: historyTurns,
     loads: historyLoads,
     registerRow,
+    loadRuns,
     load,
     reset,
   };
