@@ -41,6 +41,7 @@ function makeTurn(
     fallbackLines: [],
     tokens: null,
     timing: null,
+    createdAt: null,
   };
 }
 

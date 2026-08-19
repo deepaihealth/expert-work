@@ -49,7 +49,7 @@ function row(overrides: Partial<GanttRow> & Pick<GanttRow, "key" | "label">): Ga
 }
 
 function buildModel(rows: GanttRow[], markers: GanttMarker[] = [], totalMs = 10_000): GanttModel {
-  return { rows, markers, totalMs, degraded: false };
+  return { rows, markers, totalMs, degraded: false, originMs: 0 };
 }
 
 describe("GanttTimeline", () => {

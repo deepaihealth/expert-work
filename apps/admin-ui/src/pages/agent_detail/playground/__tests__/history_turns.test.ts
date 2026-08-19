@@ -28,6 +28,7 @@ describe("buildHistoryTurns", () => {
         runId: "r1",
         status: "success",
         tokens: null,
+        createdAt: "2026-01-01",
       },
       {
         key: "r2",
@@ -36,6 +37,7 @@ describe("buildHistoryTurns", () => {
         runId: "r2",
         status: "success",
         tokens: null,
+        createdAt: "2026-01-01",
       },
     ]);
   });
@@ -56,6 +58,7 @@ describe("buildHistoryTurns", () => {
         runId: "r1",
         status: "success",
         tokens: null,
+        createdAt: "2026-01-01",
       },
     ]);
   });
@@ -76,6 +79,7 @@ describe("buildHistoryTurns", () => {
       runId: "r2",
       status: "success",
       tokens: null,
+      createdAt: "2026-01-01",
     });
   });
 
@@ -102,6 +106,7 @@ describe("buildHistoryTurns", () => {
         runId: "r1",
         status: "success",
         tokens: null,
+        createdAt: "2026-01-01",
       },
       {
         key: "r2",
@@ -110,6 +115,7 @@ describe("buildHistoryTurns", () => {
         runId: "r2",
         status: "success",
         tokens: null,
+        createdAt: "2026-01-01",
       },
     ]);
   });
@@ -127,5 +133,19 @@ describe("buildHistoryTurns", () => {
       { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", tokens },
     ]);
     expect(turns?.[0]?.tokens).toEqual(tokens);
+  });
+  it("carries each run's createdAt onto the paired turn (null when the summary lacks it)", () => {
+    const messages: HistoryMessage[] = [
+      { role: "user", content: "q", channel: null },
+      { role: "assistant", content: "a", channel: "final" },
+    ];
+    const turns = buildHistoryTurns(messages, [
+      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", tokens: null },
+    ]);
+    expect(turns?.[0]?.createdAt).toBe("2026-01-01T00:00:00Z");
+    const bare = buildHistoryTurns(messages, [
+      { runId: "r1", status: "success", isResume: false, tokens: null } as unknown as Parameters<typeof buildHistoryTurns>[1][number],
+    ]);
+    expect(bare?.[0]?.createdAt).toBeNull();
   });
 });

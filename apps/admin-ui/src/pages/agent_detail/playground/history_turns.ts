@@ -36,6 +36,8 @@ export interface HistoryTurn {
   runId: string;
   status: string;
   tokens: RunTokens | null;
+  /** ``ThreadRunSummary.createdAt``(ISO);账本时长投影里未回放 / 无时序轮的兜底起点。 */
+  createdAt: string | null;
 }
 
 export function buildHistoryTurns(
@@ -60,5 +62,6 @@ export function buildHistoryTurns(
     runId: runs[i].runId,
     status: runs[i].status,
     tokens: runs[i].tokens,
+    createdAt: runs[i].createdAt ?? null,
   }));
 }

@@ -50,6 +50,7 @@ function makeConsoleTurn(
     fallbackLines: [],
     tokens: null,
     timing: null,
+    createdAt: null,
   };
 }
 

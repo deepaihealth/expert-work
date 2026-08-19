@@ -62,6 +62,7 @@ export function buildConsoleTurns(args: {
       fallbackLines: h.fallbackLines,
       tokens: h.tokens,
       timing: null,
+      createdAt: h.createdAt,
     });
     seq += 1;
   }
@@ -77,6 +78,7 @@ export function buildConsoleTurns(args: {
       fallbackLines: [],
       tokens: null,
       timing: args.timings[turn.id] ?? null,
+      createdAt: null,
     });
     seq += 1;
   }

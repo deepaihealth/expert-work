@@ -41,4 +41,6 @@ export interface ConsoleTurn {
   tokens: RunTokens | null;
   /** Set only for turns this session actually streamed live. */
   timing: TurnTiming | null;
+  /** History turns' ``ThreadRunSummary.createdAt``(ISO);live turns ``null``。 */
+  createdAt: string | null;
 }
