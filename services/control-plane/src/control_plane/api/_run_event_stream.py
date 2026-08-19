@@ -319,8 +319,12 @@ async def build_event_producer(
 
             seq = _seq_of(entry)
             if seq is None:
-                # token 帧:一次性预览,重复或缺失都无害 —— 原样放行。
-                yield format_sse(entry.event, entry.data, event_id=None)
+                # ephemeral 帧(今天只有 token:一次性预览,重复或缺失都无害)
+                # —— 走 `_encode` 而不是裸 `format_sse`,让「过滤只发生在
+                # `_encode` 这一点」这句话对 live 接合也成立(终审 I2);
+                # `_encode` 对 `token` 恒返回一帧字节,行为零变化。
+                for chunk in _encode(entry.event, entry.data, event_id=None):
+                    yield chunk
                 continue
 
             # 帧顺序恒等于 seq 顺序 ⇒ 看到 seq 之后,比它小的洞判死刑。

@@ -108,6 +108,9 @@ def normalize_trace(trace: object) -> dict[str, object]:
     raw_observations: list[Any] = list(t.observations or [])
 
     trace_name = str(t.name)
+    # 兜底单位存疑(终审 Minor 3)——这版 Langfuse 实测回的是 ms,这里却按秒
+    # x1000;只在 observations 为空 / 全无 end_time(下面的 `end-start` 覆盖
+    # 不到)时才会真的走到这条兜底,今天没有已知触发场景。
     trace_latency_ms = round((t.latency or 0) * 1000)
     trace_total_cost_usd = t.total_cost or None
 
