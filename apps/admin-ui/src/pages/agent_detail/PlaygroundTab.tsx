@@ -66,17 +66,55 @@ const MAIN_HEAD_STYLE: React.CSSProperties = {
   flexShrink: 0,
 };
 
-/** 「轨迹」/「工作区」视图体:占满头部与输入区之间的剩余高度,自己开滚动
- *  (旧 `InspectPanel` 的同款包裹;工作区没有内滚容器,长列表在这里滚)。 */
-const VIEW_BODY_STYLE: React.CSSProperties = {
+/** 视图体:占满头部与输入区之间的剩余高度。`Transcript` / `TrajectoryView`
+ *  自己就是 `flex:1` 且自带内滚,所以这层只开最小尺寸;工作区没有内滚容器,
+ *  单独多一个 `overflow:auto`(见 `VIEW_PANE_SCROLL_STYLE`)。 */
+const VIEW_PANE_STYLE: React.CSSProperties = {
   display: "flex",
+  flexDirection: "column",
   flex: 1,
   minHeight: 0,
+};
+const VIEW_PANE_SCROLL_STYLE: React.CSSProperties = {
+  ...VIEW_PANE_STYLE,
   overflow: "auto",
 };
+/** 非当前视图:`hidden` 属性只是 UA 的 `display:none`,**任何**行内 display
+ *  都能盖过它 —— 上面两个常量恰好都带 `display:flex`,所以隐藏态必须显式写
+ *  行内 `display:none`,不能只挂属性。 */
+const VIEW_PANE_HIDDEN_STYLE: React.CSSProperties = { display: "none" };
 
 /** 中栏三视图。会话级内存态:切会话 / 换 agent 回「对话」(spec §九「壳」)。 */
 type ConsoleView = "chat" | "trajectory" | "workspace";
+
+/** 三个视图**常驻挂载**,切 tab 只切显隐 —— 卸载会丢掉轨迹的选中 / 选区 /
+ *  搜索 / 折叠与账本视口,也会丢掉对话的滚动位置与历史行的 IntersectionObserver
+ *  注册(还会让常驻的 `focusRequest` 在重挂时把读者弹回旧记录)。 */
+function ViewPane({
+  view,
+  active,
+  scroll = false,
+  children,
+}: {
+  view: ConsoleView;
+  active: boolean;
+  scroll?: boolean;
+  children: React.ReactNode;
+}): React.ReactElement {
+  return (
+    <div
+      data-testid={`console-view-pane-${view}`}
+      data-active={active ? "true" : undefined}
+      hidden={!active}
+      aria-hidden={active ? undefined : "true"}
+      style={
+        active ? (scroll ? VIEW_PANE_SCROLL_STYLE : VIEW_PANE_STYLE) : VIEW_PANE_HIDDEN_STYLE
+      }
+    >
+      {children}
+    </div>
+  );
+}
 
 const COMPOSER_STYLE: React.CSSProperties = {
   display: "flex",
@@ -571,31 +609,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             </div>
           )}
 
-          {view === "trajectory" && (
-            <div style={VIEW_BODY_STYLE}>
-              <TrajectoryView
-                turns={consoleTurns}
-                threadId={thread?.thread_id ?? null}
-                streamTurnKey={streamTurnId}
-                // 稳定引用:``tokenStream.liveByStep`` 自己是 state,只在流更新
-                // 时换。这里包一层 ``new Map`` 就是每帧重建账本 / 时间轴。
-                liveByStep={tokenStream.liveByStep}
-                running={running}
-                isSystemAdmin={isSystemAdmin}
-                focusRequest={focusRequest}
-                onEnsureLoaded={handleEnsureLoaded}
-                onFireResult={handleFireResult}
-              />
-            </div>
-          )}
-
-          {view === "workspace" && (
-            <div style={VIEW_BODY_STYLE}>
-              <WorkspacePanel running={running} readOnly={isTenantSwitched} />
-            </div>
-          )}
-
-          {view === "chat" && (
+          <ViewPane view="chat" active={view === "chat"}>
             <Transcript
               turns={consoleTurns}
               flatHistory={historyTurns === null ? history : []}
@@ -621,7 +635,27 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               onDownloadArtifact={handleDownloadArtifact}
               onFireResult={handleFireResult}
             />
-          )}
+          </ViewPane>
+
+          <ViewPane view="trajectory" active={view === "trajectory"}>
+            <TrajectoryView
+              turns={consoleTurns}
+              threadId={thread?.thread_id ?? null}
+              streamTurnKey={streamTurnId}
+              // 稳定引用:``tokenStream.liveByStep`` 自己是 state,只在流更新
+              // 时换。这里包一层 ``new Map`` 就是每帧重建账本 / 时间轴。
+              liveByStep={tokenStream.liveByStep}
+              running={running}
+              isSystemAdmin={isSystemAdmin}
+              focusRequest={focusRequest}
+              onEnsureLoaded={handleEnsureLoaded}
+              onFireResult={handleFireResult}
+            />
+          </ViewPane>
+
+          <ViewPane view="workspace" active={view === "workspace"} scroll>
+            <WorkspacePanel running={running} readOnly={isTenantSwitched} />
+          </ViewPane>
 
           <div style={COMPOSER_STYLE}>
             <PlanCard
