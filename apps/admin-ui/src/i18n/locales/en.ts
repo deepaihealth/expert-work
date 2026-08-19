@@ -1314,6 +1314,7 @@ export interface TranslationKeys {
     detail_request_title: string;
     detail_resize: string;
     detail_placeholder: string;
+    trajectory_empty: string;
   };
   playground: {
     session_label: string;
@@ -4552,6 +4553,7 @@ const en: TranslationKeys = {
     detail_request_title: "Request #{{n}}",
     detail_resize: "Drag to resize; double-click to reset",
     detail_placeholder: "Turn not replayed yet; text fallback only",
+    trajectory_empty: "No trajectory yet",
   },
   playground: {
     session_label: "Session",

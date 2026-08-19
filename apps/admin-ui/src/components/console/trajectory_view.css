@@ -1,0 +1,32 @@
+/*
+ * TrajectoryView —— 轨迹视图的骨架(PR-A.2 Task 10,spec §九)。纵向三段:
+ * 工具条(定高)/ 概览时间轴(定高)/ 账本 + 详情(占满剩余)。账本自己
+ * (`.ew-ledger`)已经是 `flex: 1; min-height: 0; overflow: auto`,详情
+ * (`.ew-detail`)是 `flex: none` + 受控宽度,所以这里只负责把两段的最小尺寸
+ * 打开 —— 少一个 `min-height: 0` 就是账本撑破容器、整页跟着滚。
+ * 版式参照 deepseek-harness ui-trajectory(MIT)重写。
+ */
+
+.ew-traj {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.ew-traj__split {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.ew-traj__empty {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 12px;
+}
