@@ -3,7 +3,7 @@
  * container's live geometry (``scrollTop`` / ``clientHeight``, both mocked
  * here since jsdom never lays anything out).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import type { RefObject } from "react";
 
@@ -88,5 +88,54 @@ describe("useVirtualRows", () => {
 
     // start = floor(200/20) = 10; end = ceil(300/20) = 15.
     expect(result.current).toEqual({ start: 10, end: 15, topPad: 200, bottomPad: 1700 });
+  });
+
+  it("scrollRef.current attaching after a rerender (e.g. the container mounts behind a loading state) still gets scroll listeners", async () => {
+    // One stable ref object — never replaced, only `.current` mutates —
+    // matching a real `useRef` passed down as a prop. The container starts
+    // unattached (`current: null`, as it would behind a loading state).
+    const ref = refOf(null);
+    const { result, rerender } = renderHook(() =>
+      useVirtualRows({ scrollRef: ref, count: 100, rowHeight: 20, overscan: 0 }),
+    );
+    expect(result.current).toEqual({ start: 0, end: 100, topPad: 0, bottomPad: 0 });
+
+    // The container mounts a frame later: same ref object, `.current` now
+    // points at the element. A prior version of this hook depended on the
+    // `RefObject` itself (stable, so the effect never re-ran) and so never
+    // noticed this — the scroll listener was simply never attached.
+    const el = mockEl(100, 0);
+    ref.current = el;
+    rerender();
+
+    // The render itself already reflects the newly attached element's
+    // geometry (computed straight from `scrollRef.current`, not cached
+    // state) …
+    expect(result.current).toEqual({ start: 0, end: 5, topPad: 0, bottomPad: 1900 });
+
+    // … and, the real regression check, its `scroll` events are now heard.
+    el.scrollTop = 200;
+    await act(async () => {
+      el.dispatchEvent(new Event("scroll"));
+    });
+    // start = floor(200/20) = 10; end = ceil(300/20) = 15.
+    expect(result.current).toEqual({ start: 10, end: 15, topPad: 200, bottomPad: 1700 });
+  });
+
+  it("unmount removes the scroll listener and disconnects the observer exactly once", () => {
+    const el = mockEl(100, 0);
+    const removeSpy = vi.spyOn(el, "removeEventListener");
+    const disconnectSpy = vi.spyOn(ResizeObserver.prototype, "disconnect");
+
+    const { unmount } = renderHook(() =>
+      useVirtualRows({ scrollRef: refOf(el), count: 100, rowHeight: 20 }),
+    );
+    expect(removeSpy).not.toHaveBeenCalled();
+    expect(disconnectSpy).not.toHaveBeenCalled();
+
+    unmount();
+
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(disconnectSpy).toHaveBeenCalledTimes(1);
   });
 });

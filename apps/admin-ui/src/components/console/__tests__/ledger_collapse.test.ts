@@ -209,6 +209,19 @@ describe("turnSummaryOf", () => {
 
     expect(turnSummaryOf(records)).toMatchObject({ think: 2, tools: 1, failed: 1 });
   });
+
+  it("toolBreakdown ties (equal counts) sort alphabetically by name", () => {
+    const records = [
+      rec({ id: "t1", index: 0, kind: "tool", row: { kind: "tool", entry: { toolName: "bravo", server: null } } as LedgerRecord["row"] }),
+      rec({ id: "t2", index: 1, kind: "tool", row: { kind: "tool", entry: { toolName: "alpha", server: null } } as LedgerRecord["row"] }),
+      rec({ id: "t3", index: 2, kind: "tool", row: { kind: "tool", entry: { toolName: "bravo", server: null } } as LedgerRecord["row"] }),
+      rec({ id: "t4", index: 3, kind: "tool", row: { kind: "tool", entry: { toolName: "alpha", server: null } } as LedgerRecord["row"] }),
+    ];
+
+    // Both names appear twice — count alone can't order them, so the
+    // localeCompare tie-break must kick in ("alpha" before "bravo").
+    expect(turnSummaryOf(records).toolBreakdown).toBe("alpha ×2 · bravo ×2");
+  });
 });
 
 describe("collapsibleTurnKeys / collapsibleOwnerIds", () => {

@@ -46,8 +46,20 @@ export function useVirtualRows(args: {
   // no separate "geometry state" to keep in sync with `count`.
   const [, setTick] = useState(0);
 
+  // Read *now*, at render time — not inside the effect. `scrollRef` (the
+  // RefObject itself) never changes identity, so depending on it (as an
+  // earlier version of this hook did) attaches listeners once at mount and
+  // never again: a container that mounts a frame late (e.g. behind a
+  // loading state) is never noticed, and the hook silently stops updating
+  // except when some unrelated prop happens to change. `el` captured here
+  // and used as the effect's dependency instead makes React's own
+  // dependency comparison do the "did the attached element change"
+  // bookkeeping — the effect (re)runs, tearing down the previous
+  // listeners and attaching fresh ones, exactly when `scrollRef.current`
+  // differs from what it was on the last render.
+  const el = scrollRef.current;
+
   useEffect(() => {
-    const el = scrollRef.current;
     if (!el) return undefined;
     const onChange = () => setTick((n) => n + 1);
     el.addEventListener("scroll", onChange, { passive: true });
@@ -63,9 +75,8 @@ export function useVirtualRows(args: {
       if (observer) observer.disconnect();
       else window.removeEventListener("resize", onChange);
     };
-  }, [scrollRef]);
+  }, [el]);
 
-  const el = scrollRef.current;
   const { start, end } = windowOf(el?.scrollTop ?? 0, el?.clientHeight ?? 0, count, rowHeight, overscan);
 
   return useMemo(
