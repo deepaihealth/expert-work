@@ -180,8 +180,11 @@ export function zoomViewport(
     viewport === null ? fullDuration : Math.min(fullDuration, Math.max(1, viewport.end - viewport.start));
   const domainStart =
     viewport === null ? model.start : Math.min(Math.max(viewport.start, model.start), model.end - domainDuration);
+  // 退化态(`degraded`)布局已经是等宽顺序块,域单位是记录数不是毫秒 ——
+  // 最小宽度要按有效模式(sequence)算,不能沿用 `mode` 字面上仍报的 duration。
+  const effectiveMode = model.degraded ? "sequence" : model.mode;
   const minimumWidth = Math.min(
-    model.mode === "sequence" ? MINIMUM_ZOOM_SEQUENCE : MINIMUM_ZOOM_DURATION,
+    effectiveMode === "sequence" ? MINIMUM_ZOOM_SEQUENCE : MINIMUM_ZOOM_DURATION,
     fullDuration,
   );
   const nextDuration = Math.min(

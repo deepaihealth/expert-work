@@ -204,6 +204,17 @@ describe("zoomViewport", () => {
     expect(viewport!.end - viewport!.start).toBe(20);
   });
 
+  it("a degraded duration model's minimum width is 4 (its domain is record positions, not ms)", () => {
+    const records = nineRecords();
+    records[5] = { ...records[5], startedAt: null };
+    const model = deriveTimeline(records, "duration") as TimelineModel;
+    expect(model.degraded).toBe(true);
+    expect(model.mode).toBe("duration"); // mode 仍报 duration,但要求用有效模式(sequence)算最小宽度
+    const viewport = zoomViewport(model, null, 0.5, -100_000);
+    expect(viewport).not.toBeNull();
+    expect(viewport!.end - viewport!.start).toBe(4);
+  });
+
   it("zooming out past 99.9% of the full domain returns null (back to overview)", () => {
     const model = deriveTimeline(nineRecords(), "sequence") as TimelineModel;
     const viewport = zoomViewport(model, { start: 2, end: 6 }, 0.5, 100_000);
