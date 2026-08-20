@@ -404,7 +404,7 @@ export function RunDetail() {
 
       <div style={{ marginTop: 16 }}>
         {!historyLoaded ? null : historyTurns === null ? (
-          <Card size="small">
+          <Card size="small" data-testid="run-detail-pairing-failed">
             <Empty description={t("run_detail.trajectory_pairing_failed")} />
           </Card>
         ) : (

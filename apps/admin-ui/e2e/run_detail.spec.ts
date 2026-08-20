@@ -327,13 +327,10 @@ test("real paired trajectory renders this run's ledger rows", async ({ page }) =
   await expect(
     page.getByTestId("console-traj-row").filter({ hasText: "run one's answer" }),
   ).toBeVisible();
-  // And the pairing-failed state (RunDetail's own bare <Empty>, no testid —
-  // TrajectoryView isn't even mounted on that path) is absent.
-  await expect(
-    page.getByText(
-      "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
-    ),
-  ).toHaveCount(0);
+  // And the pairing-failed state (TrajectoryView isn't even mounted on that
+  // path) is absent. Pinned by testid, not copy — a copy edit must not turn
+  // this negative assertion into an always-true one.
+  await expect(page.getByTestId("run-detail-pairing-failed")).toHaveCount(0);
 });
 
 test("run detail with approval + plan passes axe (serious + critical)", async ({ page }) => {

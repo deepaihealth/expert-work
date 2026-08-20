@@ -402,12 +402,14 @@ describe("RunDetail", () => {
     renderPage();
 
     await waitFor(() =>
-      expect(
-        screen.getByText(
-          "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
-        ),
-      ).toBeInTheDocument(),
+      expect(screen.getByTestId("run-detail-pairing-failed")).toBeInTheDocument(),
     );
+    // The copy itself renders inside the pinned container.
+    expect(
+      screen.getByText(
+        "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByTestId("console-traj-ledger")).not.toBeInTheDocument();
   });
 
