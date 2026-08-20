@@ -34,6 +34,37 @@ if (typeof window !== "undefined" && !window.matchMedia) {
   });
 }
 
+// jsdom 29 ships the AnimationEvent/TransitionEvent constructors AND
+// cssstyle now recognizes the (Webkit-prefixed) transition/animation style
+// properties — jsdom 25 had neither. rc-motion feature-detects motion
+// support at module load (``'TransitionEvent' in window`` for the
+// unprefixed event, ``'WebkitTransition' in style`` for the prefixed
+// fallback); with either present it waits for transition/animation end
+// events that jsdom never fires, so every antd motion hangs: Tree expand
+// locks (rc-tree ignores further expands while a motion is pending, and
+// antd's collapse motion has no deadline), stale tooltips pile up in the
+// DOM. Strip both detection surfaces to restore the jsdom-25 behavior:
+// motion unsupported → completes synchronously.
+delete (window as { AnimationEvent?: unknown }).AnimationEvent;
+delete (window as { TransitionEvent?: unknown }).TransitionEvent;
+{
+  const styleProto = Object.getPrototypeOf(
+    document.createElement("div").style,
+  ) as Record<string, unknown>;
+  for (const prop of [
+    "WebkitTransition",
+    "MozTransition",
+    "msTransition",
+    "OTransition",
+    "WebkitAnimation",
+    "MozAnimation",
+    "msAnimation",
+    "OAnimation",
+  ]) {
+    delete styleProto[prop];
+  }
+}
+
 if (typeof globalThis.ResizeObserver === "undefined") {
   class ResizeObserverPolyfill {
     observe(): void {}
