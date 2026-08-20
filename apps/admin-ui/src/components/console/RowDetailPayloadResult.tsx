@@ -4,13 +4,9 @@
  * plan) to keep that file under its 400-line budget. See
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-17-brief.md.
  *
- * `asMemories` / `planGoal` / `planSteps` / `reflectCritique` below are
- * copied verbatim from `StepTimeline.tsx:555-602` (not imported — PR-B
- * retires that file, so this is the only surviving copy). `planGoal` /
- * `planSteps` aren't consumed by this file today (a `PlanRow` already
- * carries typed `goal` / `plan.steps`, richer than the generic `detail`
- * shape those two read from) — they stay exported so a later dedupe pass
- * can still reach them instead of losing them a second time.
+ * `asMemories` / `reflectCritique` below are copied verbatim from
+ * `StepTimeline.tsx:555-602` (not imported — PR-B retires that file, so
+ * this is the only surviving copy).
  */
 import type { ReactNode } from "react";
 import { Tag, Typography } from "antd";
@@ -60,23 +56,6 @@ export function asMemories(detail: Record<string, unknown>): MemoryDetailItem[] 
       importance: typeof o.importance === "number" ? o.importance : undefined,
       confidence: typeof o.confidence === "number" ? o.confidence : undefined,
     };
-  });
-}
-
-export function planGoal(detail: Record<string, unknown>): string | null {
-  const p = record(detail.plan);
-  const goal = p.goal ?? p.objective;
-  return typeof goal === "string" && goal.trim() !== "" ? goal : null;
-}
-
-export function planSteps(detail: Record<string, unknown>): string[] {
-  const p = record(detail.plan);
-  const steps = Array.isArray(p.steps) ? p.steps : [];
-  return steps.map((s) => {
-    if (typeof s === "string") return s;
-    const so = record(s);
-    const text = so.description ?? so.text ?? so.title;
-    return typeof text === "string" ? text : JSON.stringify(s);
   });
 }
 
@@ -290,15 +269,23 @@ export interface RowDetailResultProps {
   row: TrajectoryRow;
   onFireResult?: (result: FireNowResult) => void;
   onOpenFullText: (state: FullTextState) => void;
+  /** PR-B Task 1 — 对话记录只读链路:透传给 ToolCallCard,``true`` 时
+   *  「立即触发」整卡不渲染。Default false。 */
+  readOnly?: boolean;
 }
 
-export function RowDetailResult({ row, onFireResult, onOpenFullText }: RowDetailResultProps) {
+export function RowDetailResult({
+  row,
+  onFireResult,
+  onOpenFullText,
+  readOnly = false,
+}: RowDetailResultProps) {
   const { t } = useTranslation();
 
   let body: ReactNode;
   switch (row.kind) {
     case "tool":
-      body = <ToolCallCard entry={row.entry} onFireResult={onFireResult} />;
+      body = <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} />;
       break;
     case "think":
       body = (

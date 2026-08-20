@@ -71,10 +71,14 @@ export function ToolTimeline({ events, awaitingApproval = false, onFireResult }:
 export function ToolCallCard({
   entry,
   onFireResult,
+  readOnly = false,
 }: {
   entry: ToolCallEntry;
   /** See ``ToolTimelineProps.onFireResult``. */
   onFireResult?: (result: FireNowResult) => void;
+  /** PR-B Task 1 — 对话记录只读链路:「立即触发」是写操作,``true`` 时整卡
+   *  不渲染(不是 disable)。Default false — RunDetail 等既有写页面零改动。 */
+  readOnly?: boolean;
 }) {
   const { t } = useTranslation();
   const statusLabel = t(`tool_timeline.status_${entry.status}`);
@@ -206,7 +210,8 @@ export function ToolCallCard({
         <Tag color={STATUS_COLOR[entry.status]} bordered={false} style={{ margin: 0 }}>
           {statusLabel}
         </Tag>
-        {entry.toolName === "manage_task" &&
+        {!readOnly &&
+        entry.toolName === "manage_task" &&
         entry.status === "success" &&
         entry.action === "create" &&
         entry.triggerId ? (

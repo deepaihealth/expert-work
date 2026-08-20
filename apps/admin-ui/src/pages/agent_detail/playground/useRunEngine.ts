@@ -26,7 +26,7 @@ import {
 } from "../../../api/sessions";
 import { summarizeTurn } from "../../../api/turn_summary";
 import { runIdOf } from "../../../components/console/console_turns";
-import { approvalItemFromEvent } from "../../../components/turn/TurnCard";
+import { approvalItemFromEvent } from "../../../components/turn/ApprovalGate";
 import type { Attachment, Turn } from "../../../components/turn/types";
 import { useTokenStream, type TokenStreamController } from "./useTokenStream";
 
