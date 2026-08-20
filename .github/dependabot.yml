@@ -15,6 +15,15 @@ updates:
       python-deps:
         patterns:
           - "*"
+    ignore:
+      # mcp 2.x 是真迁移不是升级:SDK 换 httpx2(httpx 2.0 的改名分发包),
+      # streamable_http_client 签名从 2 元组变 3 元组、要 httpx2.AsyncClient
+      # (orchestrator/tools/mcp.py:606-609)。混进周更组会让整组 4 个 CI job
+      # 全红(#1229,import 链炸掉 → 路由发现全空 → 分区自审雪崩)。
+      # 单独立项做(ROADMAP X-11),做完连同这条 ignore 一起删。
+      - dependency-name: "mcp"
+        update-types:
+          - "version-update:semver-major"
 
   # apps/admin-ui(pnpm-lock.yaml 归 npm 生态)与 infra/sandbox-image 此前都
   # 不在本文件里,意味着只有 Dependabot **security updates** 会碰它们——那条
