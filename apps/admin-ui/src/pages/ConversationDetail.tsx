@@ -3,42 +3,50 @@
  * (``docs/design/conversation-centric-ia.md``).
  *
  * Shows the conversation summary (agent / user / status / token rollup /
- * last active), the transcript, and its run list; each run drills into the
- * existing per-run detail (``/runs/{thread}/{run}``) with its event stream,
- * approval card, and Langfuse deep link.
- *
- * The transcript is the debug console's own read-only turn timeline
- * (``components/turn``): ``useHistoryTurns`` pairs the checkpoint's
- * user/assistant text (``GET /v1/sessions/{id}/messages``) 1:1 with the
- * thread's runs and replays each run's persisted event stream when its row
- * scrolls into view, so every LLM step, tool call, timing and token rollup is
- * visible here — not just the two endpoints of a turn. Whenever that pairing
- * is unavailable (count mismatch, failed lookup, cross-tenant drill-in) the
- * page degrades to the flat M1.5 message block it has always rendered.
+ * last active) and the transcript — the debug console's own read-only turn
+ * timeline (``components/console/*``, PR-B Task 3): ``useHistoryTurns``
+ * pairs the checkpoint's user/assistant text (``GET /v1/sessions/{id}/
+ * messages``) 1:1 with the thread's runs and replays each run's persisted
+ * event stream when its row scrolls into view, so every LLM step, tool
+ * call, timing and token rollup is visible here — not just the two
+ * endpoints of a turn. A per-turn footer link ("查看运行") drills into the
+ * existing per-run detail (``/runs/{thread}/{run}``) with its raw event
+ * stream, approval history, and Langfuse deep link; there is no separate
+ * runs table any more. Whenever the pairing is unavailable (count
+ * mismatch, failed lookup, cross-tenant drill-in) the page degrades to the
+ * flat M1.5 message block it has always rendered.
  */
-import { useCallback, useEffect, useState } from "react";
-import { Alert, Card, Empty, Skeleton, Space, Table, Tag, Tooltip, Typography } from "antd";
-import type { TableColumnsType } from "antd";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Alert, Card, Empty, Segmented, Skeleton, Space, Tag, Typography } from "antd";
+import { useLocation, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
+import type { ApprovalItem } from "../api/approvals";
 import { downloadArtifact } from "../api/artifacts";
 import { ApiError } from "../api/client";
-import {
-  getConversation,
-  type ConversationDetail as ConversationDetailModel,
-  type ConversationRun,
-} from "../api/conversations";
+import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { streamRunEvents } from "../api/runs";
+import { computeSessionStats } from "../api/session_stats";
 import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/sessions";
+import type { FireNowResult } from "../api/triggers";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
+import { buildConsoleTurns, runIdOf, statsInputOf } from "../components/console/console_turns";
+import { PlanCard } from "../components/console/PlanCard";
+import { StatsBar } from "../components/console/StatsBar";
+import { Transcript } from "../components/console/Transcript";
+import { TrajectoryView } from "../components/console/TrajectoryView";
+import type { ConsoleTurn, TurnTiming } from "../components/console/types";
+import { usePlanCard } from "../components/console/usePlanCard";
+import type { FocusRequest } from "../components/console/use_trajectory_state";
+import { ViewPane, type ConsoleView } from "../components/console/ViewPane";
+import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine";
 import { downloadJson } from "../components/turn/download_json";
-import { CommentarySegmentLine, runIdOf, TurnCard } from "../components/turn/TurnCard";
 import type { Turn } from "../components/turn/types";
 import { useHistoryTurns } from "../components/turn/useHistoryTurns";
+import type { LiveStep } from "./agent_detail/playground/useTokenStream";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
-import { formatCompact, formatDuration } from "../utils/runFormat";
+import { formatCompact } from "../utils/runFormat";
 
 const { Text } = Typography;
 
@@ -50,19 +58,28 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: "default",
   archived: "default",
   pending: "default",
-  running: "processing",
-  success: "success",
-  error: "error",
-  timeout: "error",
-  interrupted: "default",
 };
+
+// PR-B Task 3 — this page never streams a live turn: stable module-level
+// constants so ``Transcript``/``TrajectoryView`` never see a fresh
+// reference every render (PR-A.2 teaching — a fresh ``Map``/array each
+// render is exactly "a live frame landed" to their internal effects).
+const EMPTY_LIVE_BY_STEP: ReadonlyMap<number, LiveStep> = new Map();
+const EMPTY_TASK_RESULTS: readonly FireNowResult[] = [];
+const EMPTY_FLAT_HISTORY: readonly HistoryMessage[] = [];
+const EMPTY_LIVE_TURNS: readonly Turn[] = [];
+const EMPTY_TIMINGS: Readonly<Record<string, TurnTiming>> = {};
+/** The read-only page never dispatches an approval decision — ``Transcript``
+ *  requires the callback regardless (no turn ever carries a pending
+ *  ``approval`` here, since history turns are always synthesised with
+ *  ``approval: null``). */
+function noopOnDecide(_turnId: string, _approval: ApprovalItem, _decision: "approve" | "reject"): void {}
 
 export function ConversationDetail() {
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const location = useLocation();
   const { threadId } = useParams<{ threadId: string }>();
-  // Langfuse has no per-tenant isolation, so TurnCard's per-turn deep link is
+  // Langfuse has no per-tenant isolation, so the per-turn deep link is
   // platform-ops only — same gate as the playground.
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
@@ -81,20 +98,22 @@ export function ConversationDetail() {
   // than erroring the page. ``[]`` renders an explicit empty state.
   const [messages, setMessages] = useState<HistoryMessage[] | null>(null);
 
-  // 只读调试台 — count-paired lazy turn cards + each one's replay state.
+  // 只读调试台 — count-paired lazy console turns + each one's replay state.
   const {
     turns: historyTurns,
     loads: historyLoads,
     registerRow: registerHistoryRow,
+    loadRuns: loadHistoryRuns,
     load: loadHistory,
     reset: resetHistory,
   } = useHistoryTurns();
-  // Per-page seed for each turn's event view (the playground persists its own
-  // default under a playground-scoped key; this page just starts on timeline).
-  const [eventView, setEventView] = useState<"timeline" | "raw" | "exact">(
-    "timeline",
-  );
   const [exportingId, setExportingId] = useState<string | null>(null);
+  // R9 — 中栏轮高亮:``null`` = 跟随最新一轮;点轮块 / 脚注「查看轨迹」置为该轮。
+  const [selectedTurnKey, setSelectedTurnKey] = useState<string | null>(null);
+  const [view, setView] = useState<ConsoleView>("chat");
+  // §九「联动」—— 脚注 / 过程条发起的一次性跨视图定位请求(见 PlaygroundTab)。
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
+  const focusNonceRef = useRef(0);
 
   const refresh = useCallback(async () => {
     if (!threadId) return;
@@ -153,6 +172,54 @@ export function ConversationDetail() {
     void loadHistory(threadId, viewedConvo.tenant_id);
   }, [threadId, viewedConvo, loadHistory, resetHistory]);
 
+  // One ordered timeline over the lazily-rebuilt history turns (Task 5 view
+  // model, shared with the playground) — this page never has live turns.
+  const convoRuns = convo?.runs;
+  const consoleTurns = useMemo(() => {
+    const built = buildConsoleTurns({
+      historyTurns,
+      historyLoads,
+      liveTurns: EMPTY_LIVE_TURNS,
+      timings: EMPTY_TIMINGS,
+    });
+    // C1 — ``buildConsoleTurns`` falls back to the raw terminal status
+    // string for a failed history turn's error text; this page has a
+    // richer source (the run list's own ``error`` field) that PlaygroundTab
+    // has no equivalent of, so prefer it here the same way the pre-Task-3
+    // page did.
+    return built.map((turn) =>
+      turn.turn.status === "error" && turn.runId
+        ? {
+            ...turn,
+            turn: {
+              ...turn.turn,
+              error: convoRuns?.find((r) => r.run_id === turn.runId)?.error ?? turn.turn.error,
+            },
+          }
+        : turn,
+    );
+  }, [historyTurns, historyLoads, convoRuns]);
+  const stats = useMemo(
+    () => computeSessionStats(consoleTurns.map(statsInputOf), null),
+    [consoleTurns],
+  );
+  // usePlanCard's live overlay expects this-session streamed events; this
+  // page has none, so feed it the events of turns that have actually
+  // replayed (loadState "done") instead — the GET baseline already covers
+  // the persisted plan, this only catches a plan frame inside a just-loaded
+  // run's own stream.
+  const loadedEvents = useMemo(
+    () =>
+      consoleTurns
+        .filter((turn) => turn.loadState === "done")
+        .flatMap((turn) => turn.turn.events),
+    [consoleTurns],
+  );
+  const { plan, loaded: planLoaded } = usePlanCard({
+    threadId: threadId ?? null,
+    liveEvents: loadedEvents,
+  });
+
   // Export a turn's full event stream as JSON — same contract as the
   // playground's toolbar button (prefer the authoritative persisted replay,
   // fall back to the frames already in the card, always download something).
@@ -207,96 +274,39 @@ export function ConversationDetail() {
     [conversationUserId, apiTenantScope],
   );
 
-  const columns: TableColumnsType<ConversationRun> = [
-    {
-      title: t("runs_page.column_run_id"),
-      dataIndex: "run_id",
-      key: "run_id",
-      width: 180,
-      render: (id: string) => (
-        <Tooltip title={id}>
-          <Text code style={{ fontSize: 12 }}>
-            {id.slice(0, 8)}…
-          </Text>
-        </Tooltip>
-      ),
-    },
-    {
-      title: t("runs_page.column_status"),
-      dataIndex: "status",
-      key: "status",
-      width: 120,
-      render: (status: string, record) => {
-        const tag = <Tag color={STATUS_COLOR[status] ?? "default"}>{status}</Tag>;
-        if (!record.error) return tag;
-        return (
-          <Tooltip title={record.error}>
-            <span data-testid={`conversation-run-error-${record.run_id}`}>{tag}</span>
-          </Tooltip>
-        );
-      },
-    },
-    {
-      title: t("runs_page.column_duration"),
-      key: "duration",
-      width: 100,
-      render: (_: unknown, record) => (
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          {formatDuration(t, record.created_at, record.finished_at)}
-        </Text>
-      ),
-    },
-    {
-      title: t("runs_page.column_tokens"),
-      key: "tokens",
-      width: 90,
-      render: (_: unknown, record) => {
-        const tk = record.tokens;
-        if (!tk || tk.total_tokens === 0) return <Text type="secondary">—</Text>;
-        return <Text style={{ fontSize: 12 }}>{formatCompact(tk.total_tokens)}</Text>;
-      },
-    },
-    {
-      title: t("conversations_detail.column_started"),
-      dataIndex: "created_at",
-      key: "created_at",
-      width: 190,
-      render: (iso: string) => (
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          {new Date(iso).toLocaleString()}
-        </Text>
-      ),
-    },
-    {
-      // The whole row has been clickable since M2, but nothing said so. The
-      // explicit link makes the drill-in discoverable (and keyboard reachable).
-      // M-6 — title stays visually blank (matches every other action-only
-      // column in this codebase, e.g. SettingsApiKeys/KnowledgeAdmin), but an
-      // empty <th> still reads as unnamed to a screen reader; ``onHeaderCell``
-      // is antd's own escape hatch for attaching attributes straight to the
-      // header cell without rendering anything visible.
-      title: "",
-      key: "open",
-      width: 96,
-      onHeaderCell: () => ({ "aria-label": t("conversations_detail.view_run") }),
-      render: (_: unknown, record) => (
-        <Link
-          to={`/runs/${encodeURIComponent(record.thread_id)}/${encodeURIComponent(
-            record.run_id,
-          )}`}
-          data-testid={`conversation-run-open-${record.run_id}`}
-          // I-1 — the link sits inside a clickable <tr> (``onRow.onClick``
-          // below navigates to the same URL). Without stopping propagation,
-          // one click fires both: the Link's own navigation AND the row's
-          // ``navigate()``, pushing the same URL twice — one "back" from the
-          // run page then lands on the run page again, not here.
-          onClick={(e) => e.stopPropagation()}
-        >
-          {t("conversations_detail.view_run")}
-        </Link>
-      ),
-    },
-  ];
+  // §九「联动」—— 脚注「查看轨迹」:切「轨迹」tab + 选中该轮最后一条 ASSISTANT
+  // 记录(``rowId: null``,由 ``use_trajectory_state`` 落到具体记录上)。
+  const handleInspectTurn = useCallback((key: string) => {
+    focusNonceRef.current += 1;
+    setSelectedTurnKey(key);
+    setView("trajectory");
+    setFocusRequest({ turnKey: key, rowId: null, nonce: focusNonceRef.current });
+  }, []);
+
+  // §九「联动」—— 过程条每行「检查」:同上,但带上该行的 id。
+  const handleInspectRow = useCallback((turnKey: string, rowId: string) => {
+    focusNonceRef.current += 1;
+    setSelectedTurnKey(turnKey);
+    setView("trajectory");
+    setFocusRequest({ turnKey, rowId, nonce: focusNonceRef.current });
+  }, []);
+
+  // 轨迹账本翻页 / 扩窗时主动回放这批历史 run。
+  const handleEnsureLoaded = useCallback(
+    (runIds: readonly string[]): Promise<void> =>
+      threadId ? loadHistoryRuns(runIds, threadId) : Promise.resolve(),
+    [threadId, loadHistoryRuns],
+  );
+
+  // 每轮脚注「查看运行」深链 —— 钻入既有的单 run 详情页(原始事件流 / 审批
+  // 历史 / Langfuse 深链),该页仍是可写的(拍板 R2:仅本页全链只读)。
+  const runHrefOf = useCallback(
+    (turn: ConsoleTurn): string | null =>
+      threadId && turn.runId
+        ? `/runs/${encodeURIComponent(threadId)}/${encodeURIComponent(turn.runId)}`
+        : null,
+    [threadId],
+  );
 
   if (!threadId) {
     return <Empty description="Missing :threadId" style={{ marginTop: 80 }} />;
@@ -437,70 +447,82 @@ export function ConversationDetail() {
           data-testid="conversation-messages"
         >
           {historyTurns !== null ? (
-            /* 只读调试台 — one lazy TurnCard per paired run; the row's ref
-               registers with the shared IntersectionObserver so its event
-               stream replays only once it scrolls into view. */
-            <div
-              data-testid="conversation-turns"
-              // No list-level height cap: each TurnCard's answer block caps
-              // itself (#11), and an outer 480px cap only produced nested
-              // scrollbars fighting over the wheel (I1).
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 12,
-              }}
-            >
-              {historyTurns.map((h, idx) => {
-                const load = historyLoads[h.runId] ?? {
-                  state: "pending" as const,
-                  events: [],
-                };
-                return (
-                  <div key={h.key} ref={registerHistoryRow(h.runId, threadId)}>
-                    <TurnCard
-                      turn={{
-                        id: h.key,
-                        input: h.input,
-                        attachments: [],
-                        events: load.events,
-                        // #10 — surface the run's real terminal state instead
-                        // of a hardcoded "done"; other statuses (interrupted/
-                        // paused/…) keep the normal rendering. No onRetry
-                        // here — the read-only page never dispatches runs.
-                        status:
-                          h.status === "error" || h.status === "timeout"
-                            ? "error"
-                            : "done",
-                        // C1 — feed the failure banner: prefer the run list's
-                        // real error text, fall back to the raw status string
-                        // so the Alert never renders an empty frame.
-                        error:
-                          h.status === "error" || h.status === "timeout"
-                            ? (convo.runs.find((r) => r.run_id === h.runId)
-                                ?.error ?? h.status)
-                            : null,
-                        approval: null,
-                      }}
-                      turnSeq={idx}
-                      initialEventView={eventView}
-                      onViewChange={setEventView}
-                      threadId={threadId}
-                      onDownloadArtifact={handleDownloadArtifact}
-                      rate={null}
-                      onDecide={() => {}}
-                      deciding={false}
-                      onExport={handleExport}
-                      exporting={exportingId === h.key}
-                      isSystemAdmin={isSystemAdmin}
-                      readOnly
-                      loadState={load.state}
-                      fallbackLines={h.fallbackLines}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+            // 只读调试台 — the same Transcript/TrajectoryView/StatsBar/PlanCard
+            // family the playground uses (PR-B Task 3), all wired ``readOnly``.
+            <>
+              {stats.turns > 0 && (
+                <div style={{ marginBottom: 8 }} data-testid="console-stats-row">
+                  <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
+                </div>
+              )}
+              <Segmented
+                value={view}
+                onChange={(value) => setView(value as ConsoleView)}
+                size="small"
+                aria-label={t("console.view_aria")}
+                data-testid="console-view-tabs"
+                options={[
+                  {
+                    value: "chat",
+                    label: <span data-testid="console-view-tab-chat">{t("console.view_chat")}</span>,
+                  },
+                  {
+                    value: "trajectory",
+                    label: (
+                      <span data-testid="console-view-tab-trajectory">
+                        {t("console.view_trajectory")}
+                      </span>
+                    ),
+                  },
+                ]}
+              />
+              <div style={{ marginTop: 8 }}>
+                <ViewPane view="chat" active={view === "chat"}>
+                  <Transcript
+                    turns={consoleTurns}
+                    flatHistory={EMPTY_FLAT_HISTORY}
+                    taskResults={EMPTY_TASK_RESULTS}
+                    threadId={threadId}
+                    selectedKey={selectedTurnKey}
+                    onSelectTurn={setSelectedTurnKey}
+                    onInspectTurn={handleInspectTurn}
+                    onInspectRow={handleInspectRow}
+                    streamTurnKey={null}
+                    liveByStep={EMPTY_LIVE_BY_STEP}
+                    registerHistoryRow={registerHistoryRow}
+                    rate={null}
+                    isSystemAdmin={isSystemAdmin}
+                    readOnly
+                    isTenantSwitched={false}
+                    onDecide={noopOnDecide}
+                    deciding={false}
+                    onExport={handleExport}
+                    exportingKey={exportingId}
+                    onDownloadArtifact={handleDownloadArtifact}
+                    runHrefOf={runHrefOf}
+                  />
+                </ViewPane>
+                <ViewPane view="trajectory" active={view === "trajectory"}>
+                  <TrajectoryView
+                    turns={consoleTurns}
+                    threadId={threadId}
+                    agentName={convo.agent_name ?? ""}
+                    agentVersion={convo.agent_version ?? ""}
+                    readOnly
+                    streamTurnKey={null}
+                    liveByStep={EMPTY_LIVE_BY_STEP}
+                    running={false}
+                    visible={view === "trajectory"}
+                    isSystemAdmin={isSystemAdmin}
+                    focusRequest={focusRequest}
+                    onEnsureLoaded={handleEnsureLoaded}
+                  />
+                </ViewPane>
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <PlanCard plan={plan} loaded={planLoaded} running={false} readOnly />
+              </div>
+            </>
           ) : messages === null || messages.length === 0 ? (
             <Empty description={t("conversations_detail.messages_empty")} />
           ) : (
@@ -545,30 +567,6 @@ export function ConversationDetail() {
           )}
         </Card>
       )}
-
-      <Card
-        size="small"
-        title={t("conversations_detail.runs_title")}
-        style={{ marginTop: 16 }}
-        data-testid="conversation-runs"
-      >
-        <Table<ConversationRun>
-          size="small"
-          columns={columns}
-          dataSource={convo.runs}
-          rowKey={(record) => record.run_id}
-          pagination={false}
-          onRow={(record) => ({
-            onClick: () =>
-              navigate(
-                `/runs/${encodeURIComponent(record.thread_id)}/${encodeURIComponent(record.run_id)}`,
-              ),
-            style: { cursor: "pointer" },
-          })}
-          locale={{ emptyText: <Empty description={t("conversations_detail.runs_empty")} /> }}
-          data-testid="conversation-runs-table"
-        />
-      </Card>
     </div>
   );
 }

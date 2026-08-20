@@ -16,6 +16,7 @@
 import { Button, Tag, Tooltip } from "antd";
 import { Download, Route, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 
 import type { TurnSummary } from "../../api/turn_summary";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
@@ -38,6 +39,10 @@ export interface TurnFooterProps {
   onExport: (turn: Turn) => void;
   exporting: boolean;
   onInspect: () => void;
+  /** PR-B Task 3 — ConversationDetail's per-turn "查看运行" deep link to
+   *  ``/runs/{threadId}/{runId}``. Omitted → the link doesn't render (the
+   *  playground has no run-detail page to link to). */
+  runHref?: string;
 }
 
 const STATUS_TAG_COLOR: Record<Turn["status"], string> = {
@@ -57,6 +62,7 @@ export function TurnFooter({
   onExport,
   exporting,
   onInspect,
+  runHref,
 }: TurnFooterProps) {
   const { t } = useTranslation();
   const status = turn.turn.status;
@@ -147,6 +153,11 @@ export function TurnFooter({
         >
           {t("console.footer_view_trajectory")}
         </Button>
+        {runHref !== undefined && (
+          <Link to={runHref} data-testid="console-turn-run-link">
+            {t("console.turn_view_run")}
+          </Link>
+        )}
       </span>
     </div>
   );

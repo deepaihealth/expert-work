@@ -3,13 +3,14 @@
  *
  * ``getConversation`` is stubbed; the page renders under a routed
  * MemoryRouter so ``useParams`` resolves ``:threadId``. Asserts the
- * summary rollup + the run list drill-down target, plus the read-only
- * debug-console transcript (轮次卡时间线) that replaces the flat message
- * block whenever ``/messages`` pairs 1:1 with the thread's runs.
+ * summary rollup + each turn's "查看运行" drill-down link, plus the
+ * read-only debug console (``components/console/*``, PR-B Task 3) that
+ * replaces the flat message block whenever ``/messages`` pairs 1:1 with
+ * the thread's runs — there is no separate runs table any more.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router-dom";
 import "../../i18n";
 
@@ -262,6 +263,8 @@ describe("ConversationDetail", () => {
 
   it("renders the conversation summary + its run list", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
 
     renderPage();
 
@@ -271,11 +274,14 @@ describe("ConversationDetail", () => {
     // Summary token rollup.
     expect(screen.getByTestId("conversation-tokens")).toBeInTheDocument();
     expect(screen.getByText("claude-sonnet-4-5")).toBeInTheDocument();
-    // Run list with the failed run's error surfaced.
-    expect(screen.getByTestId("conversation-runs-table")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("conversation-run-error-33333333-3333-3333-3333-333333333334"),
-    ).toBeInTheDocument();
+    // Task 3 — the run list is now each turn's footer "查看运行" link, not
+    // a separate Runs table (retired).
+    await waitFor(() =>
+      expect(screen.getAllByTestId("console-turn-run-link")).toHaveLength(2),
+    );
+    const links = screen.getAllByTestId("console-turn-run-link");
+    expect(links[0]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_1}`);
+    expect(links[1]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_2}`);
   });
 
   it("surfaces SDK errors in an alert", async () => {
@@ -445,13 +451,23 @@ describe("ConversationDetail", () => {
       renderPage();
 
       await waitFor(() =>
-        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(2),
       );
       // Each card carries its own user input + the stored answer as fallback.
       expect(screen.getByText("I was charged twice")).toBeInTheDocument();
       expect(screen.getByText("Refund case opened")).toBeInTheDocument();
       // …and the flat bubble rendering is gone.
       expect(screen.queryByTestId("conversation-message-0")).not.toBeInTheDocument();
+      // Task 3 — the console tabs replace the old flat block, and every
+      // write affordance stays gone (readOnly all the way down): no
+      // fire-now button, no plan editor, no approval decision buttons, no
+      // feedback bar.
+      expect(screen.getByTestId("console-view-tabs")).toBeInTheDocument();
+      expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("plan-edit")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("playground-approval-approve")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("playground-approval-reject")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
     });
 
     it("replays a run when its row scrolls into view and renders the tool call", async () => {
@@ -472,16 +488,12 @@ describe("ConversationDetail", () => {
       );
       // The replayed content renders — not just the stored fallback text.
       expect(await screen.findByText("replayed answer")).toBeInTheDocument();
-      // Task 3 — the timeline eventView renders `GanttTimeline`, not
-      // `StepTimeline` directly; its row detail reuses the existing step
-      // card (single-item `StepTimeline`, collapsed by default).
-      expect(screen.getByTestId("gantt-timeline")).toBeInTheDocument();
-      expect(screen.getByTestId("playground-tool-count")).toHaveTextContent("1");
-      fireEvent.click(screen.getByTestId("gantt-row-item-0"));
-      fireEvent.click(screen.getByTestId("step-head"));
-      const toolCards = screen.getAllByTestId("tool-call-card");
-      expect(toolCards).toHaveLength(1);
-      expect(within(toolCards[0]).getByText("search")).toBeInTheDocument();
+      // PR-B Task 3 — the console's own process strip replaces the old
+      // TurnCard/GanttTimeline: a settled turn's compact rows only exist
+      // once its head is opened, and the tool row's collapsed label
+      // carries the tool name.
+      fireEvent.click(screen.getByTestId("console-process-head"));
+      expect(screen.getByTestId("console-row-tool")).toHaveTextContent("search");
     });
 
     it("exports a replayed turn's event stream for real (the button is not a no-op)", async () => {
@@ -540,7 +552,7 @@ describe("ConversationDetail", () => {
       renderPage();
 
       await waitFor(() =>
-        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(2),
       );
       // Both cards replayed → both keep their assistant body …
       await waitFor(() =>
@@ -552,8 +564,9 @@ describe("ConversationDetail", () => {
       expect(banners).toHaveLength(1);
       expect(banners[0]).toHaveTextContent("This turn's run failed");
       expect(banners[0]).toHaveTextContent("boom");
-      // I1 — the turns list itself is no longer a capped nested scroller.
-      expect(screen.getByTestId("conversation-turns").style.maxHeight).toBe("");
+      // I1 — Task 3 retired the old `conversation-turns` wrapper; the same
+      // invariant now lives on `Transcript`'s own scroll container.
+      expect(screen.getByTestId("playground-transcript").style.maxHeight).toBe("");
     });
 
     // #10 — run status → turn status mapping: error/timeout fail the card,
@@ -596,7 +609,7 @@ describe("ConversationDetail", () => {
       renderPage();
 
       await waitFor(() =>
-        expect(screen.getAllByTestId("playground-turn")).toHaveLength(3),
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(3),
       );
       await waitFor(() =>
         expect(screen.getAllByTestId("playground-turn-error")).toHaveLength(2),
@@ -620,7 +633,7 @@ describe("ConversationDetail", () => {
         expect(screen.getByTestId("conversation-message-0")).toBeInTheDocument(),
       );
       expect(screen.getByText("I was charged twice")).toBeInTheDocument();
-      expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("console-turn")).not.toBeInTheDocument();
     });
 
     it("clears a previous thread's paired turn cards when the route param switches to a cross-tenant thread without remounting (H-1; also guards M-3's per-render staleness check)", async () => {
@@ -667,7 +680,7 @@ describe("ConversationDetail", () => {
       );
 
       await waitFor(() =>
-        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(2),
       );
       expect(screen.getByText("I was charged twice")).toBeInTheDocument();
 
@@ -681,7 +694,7 @@ describe("ConversationDetail", () => {
       );
       expect(screen.getByText("B-ONLY cross tenant question")).toBeInTheDocument();
       // A's turn cards (and its input text) must not linger.
-      expect(screen.queryByTestId("playground-turn")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("console-turn")).not.toBeInTheDocument();
       expect(screen.queryByText("I was charged twice")).not.toBeInTheDocument();
       // Thread B's rebuild ran under B's own tenant (D3 lifted); with no
       // runs it degraded to the flat block, so nothing replayed.
@@ -711,7 +724,7 @@ describe("ConversationDetail", () => {
       renderPage();
 
       await waitFor(() =>
-        expect(screen.getAllByTestId("playground-turn")).toHaveLength(2),
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(2),
       );
       expect(runsSpy).toHaveBeenCalledWith(THREAD_ID, TENANT_ID);
       await waitFor(() => expect(streamSpy).toHaveBeenCalled());
@@ -723,14 +736,18 @@ describe("ConversationDetail", () => {
     });
   });
 
-  it("every run row carries an explicit drill-in link to its run detail, and clicking it navigates exactly once (I-1: one 'back' returns to the conversation page)", async () => {
+  // PR-B Task 3 — every turn's footer carries an explicit "查看运行" link to
+  // its run detail (the retired Runs table's drill-in, now per-turn).
+  it("every turn's footer carries an explicit drill-in link to its run detail, and clicking it navigates exactly once (I-1: one 'back' returns to the conversation page)", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
 
-    // The link sits inside a row that is *also* clickable (``onRow.onClick``
-    // navigates to the same run). A ``MemoryRouter``+``Routes`` render can't
-    // observe the push *count* — only a data router's ``router.state``/
-    // ``router.navigate(-1)`` can distinguish "navigated once" from
-    // "navigated twice to the same URL" (I-1).
+    // The link is not nested inside any other clickable element on this
+    // read-only page (unlike the old Runs table row), but I-1's underlying
+    // concern — "does clicking navigate exactly once" — still needs a data
+    // router's ``router.state``/``router.navigate(-1)`` to observe, since a
+    // ``MemoryRouter``+``Routes`` render can't count pushes.
     const router = createMemoryRouter(
       [
         { path: "/conversations/:threadId", element: <ConversationDetail /> },
@@ -747,18 +764,13 @@ describe("ConversationDetail", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByTestId("conversation-runs-table")).toBeInTheDocument(),
+      expect(screen.getAllByTestId("console-turn-run-link")).toHaveLength(2),
     );
-    expect(screen.getByTestId(`conversation-run-open-${RUN_1}`)).toHaveAttribute(
-      "href",
-      `/runs/${THREAD_ID}/${RUN_1}`,
-    );
-    expect(screen.getByTestId(`conversation-run-open-${RUN_2}`)).toHaveAttribute(
-      "href",
-      `/runs/${THREAD_ID}/${RUN_2}`,
-    );
+    const links = screen.getAllByTestId("console-turn-run-link");
+    expect(links[0]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_1}`);
+    expect(links[1]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_2}`);
 
-    fireEvent.click(screen.getByTestId(`conversation-run-open-${RUN_1}`));
+    fireEvent.click(links[0]);
 
     await waitFor(() =>
       expect(screen.getByTestId("run-detail-stub")).toBeInTheDocument(),
