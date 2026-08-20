@@ -15,7 +15,12 @@ dependencies = [
     # SandboxRuntimeProvider (F.3) + AuditLogger live in expert-work-runtime.
     "expert-work-runtime",
     # Internal HTTP API — FastAPI + Pydantic v2 + uvicorn, as the control-plane.
-    "fastapi>=0.115,<1",
+    # <0.137:fastapi 0.137 起 include_router 变懒挂载(app.routes 里是
+    # _IncludedRouter,APIRoute 不再摊平;实测 0.136.3 摊平 / 0.137.2 起不摊),
+    # 控制面整族路由自审(console lockdown / external gate / NUL guard /
+    # reachability)会集体失明。迁移(改用 iter_route_contexts 并重组依赖
+    # 合成)单独立项:ROADMAP X-12;届时连同这条上界一起放开。
+    "fastapi>=0.115,<0.137",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",

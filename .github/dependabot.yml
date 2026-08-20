@@ -24,6 +24,14 @@ updates:
       - dependency-name: "mcp"
         update-types:
           - "version-update:semver-major"
+      # fastapi 0.137 起 include_router 懒挂载,app.routes 不再摊平出
+      # APIRoute,控制面整族路由自审失明(#1233;实测边界 0.136.3 好 /
+      # 0.137.2 坏)。两个 service 的 pyproject 已钉 <0.137,这条防
+      # dependabot 把上界改回去。迁移立项 ROADMAP X-12,做完一起删。
+      - dependency-name: "fastapi"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
 
   # apps/admin-ui(pnpm-lock.yaml 归 npm 生态)与 infra/sandbox-image 此前都
   # 不在本文件里,意味着只有 Dependabot **security updates** 会碰它们——那条
