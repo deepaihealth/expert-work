@@ -1228,6 +1228,7 @@ export interface TranslationKeys {
     footer_tokens: string;
     footer_steps: string;
     footer_export: string;
+    turn_view_run: string;
     toolbar_duration: string;
     toolbar_duration_title_on: string;
     toolbar_duration_title_off: string;
@@ -4453,6 +4454,7 @@ const en: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
     footer_export: "Export",
+    turn_view_run: "View run",
     toolbar_duration: "Duration",
     toolbar_duration_title_on: "Use equal widths",
     toolbar_duration_title_off: "Use recorded durations",

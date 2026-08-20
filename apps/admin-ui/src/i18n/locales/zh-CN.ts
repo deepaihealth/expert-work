@@ -1290,6 +1290,7 @@ const zhCN: TranslationKeys = {
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} 步",
     footer_export: "导出",
+    turn_view_run: "查看运行",
     toolbar_duration: "时长",
     toolbar_duration_title_on: "改回等宽",
     toolbar_duration_title_off: "按真实时长",

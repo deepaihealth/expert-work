@@ -64,6 +64,9 @@ export interface TurnBlockProps {
   /** 历史轮懒加载 ref(``useHistoryTurns.registerRow(runId, threadId)`` 的
    *  返回);live 轮不传。 */
   rowRef?: (el: HTMLElement | null) => void;
+  /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
+   *  ``TurnFooter``。Omitted → 零变化(链接不渲染)。 */
+  runHrefOf?: (turn: ConsoleTurn) => string | null;
 }
 
 /** #4 cost — same formula as ``TurnCard.tsx:643-653``: non-cached input +
@@ -120,6 +123,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     onDownloadArtifact,
     onFireResult,
     rowRef,
+    runHrefOf,
   } = props;
 
   const events = turn.turn.events;
@@ -226,6 +230,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         onExport={onExport}
         exporting={exporting}
         onInspect={() => onInspect(turn.key)}
+        runHref={runHrefOf?.(turn) ?? undefined}
       />
     </div>
   );
