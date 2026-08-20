@@ -71,15 +71,22 @@ const transcript = [
   { role: "assistant", content: "Done — the confirmation for case #4821 was sent to your registered email." },
 ];
 
-/** Both endpoints are envelope-shaped — route by URL so the transcript
- *  panel (``GET /v1/sessions/{id}/messages``) gets its own payload. */
+/** All three endpoints are envelope-shaped — route by URL suffix: the
+ *  transcript panel's ``GET /v1/sessions/{id}/messages`` gets ``transcript``,
+ *  ``useHistoryTurns``' pairing fetch (``GET /v1/sessions/{id}/runs``) gets
+ *  ``convo.runs`` (2 runs, matching ``transcript``'s 2 user turns, so the
+ *  page's own count-pairing guard succeeds and renders the debug console's
+ *  turn timeline instead of degrading to the flat message list), and
+ *  everything else (``GET /v1/conversations/{id}``) gets ``convo`` itself. */
 function withStub() {
   return (Story: ComponentType) => {
     apiClient.defaults.adapter = (config) =>
       Promise.resolve({
         data: config.url?.endsWith("/messages")
           ? { success: true, data: { messages: transcript }, error: null }
-          : { success: true, data: convo, error: null },
+          : config.url?.endsWith("/runs")
+            ? { success: true, data: { runs: convo.runs }, error: null }
+            : { success: true, data: convo, error: null },
         status: 200,
         statusText: "OK",
         headers: {},

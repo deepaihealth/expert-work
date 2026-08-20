@@ -30,6 +30,9 @@ export interface ProcessStripProps {
   onToggleRow: (id: string) => void;
   onInspectRow: (rowId: string) => void;
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-B Task 1 — 对话记录只读链路:透传给 CompactRow → ToolCallCard,
+   *  ``true`` 时「立即触发」整卡不渲染。Default false。 */
+  readOnly?: boolean;
 }
 
 /** 运行中自动展开时只留最近 3 步(spec §八.3),更早的折进「还有 N 步…」。 */
@@ -42,6 +45,7 @@ export function ProcessStrip({
   onToggleRow,
   onInspectRow,
   onFireResult,
+  readOnly = false,
 }: ProcessStripProps): JSX.Element | null {
   const { t } = useTranslation();
   /** `null` = 跟随 `running` 自动;点过头部之后固定成用户选的那个。 */
@@ -117,6 +121,7 @@ export function ProcessStrip({
               liveText={liveText}
               onInspect={() => onInspectRow(row.id)}
               onFireResult={onFireResult}
+              readOnly={readOnly}
             />
           ))}
         </div>

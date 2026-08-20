@@ -19,7 +19,7 @@ import { useTranslation } from "react-i18next";
 import { artifactsFromTools } from "../../api/tool_timeline";
 import type { TurnSummary } from "../../api/turn_summary";
 import { MarkdownView } from "../MarkdownView";
-import { CommentarySegmentLine } from "../turn/TurnCard";
+import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
 import {
   FullTextModal,
   FullTextTrigger,

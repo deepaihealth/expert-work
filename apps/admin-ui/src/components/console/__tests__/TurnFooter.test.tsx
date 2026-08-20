@@ -238,6 +238,50 @@ describe("TurnFooter", () => {
     expect(screen.getByTestId("playground-feedback-up")).toBeDisabled();
   });
 
+  // PR-B Task 3 — ConversationDetail's per-turn "查看运行" deep link: an
+  // explicit ``runHref`` prop (not derived from the turn's own events, unlike
+  // the old TurnMeta chip the test above guards against resurrecting).
+  it("renders a 查看运行 link to runHref when given", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          runHref="/runs/th-1/run-1"
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    const link = screen.getByTestId("console-turn-run-link");
+    expect(link).toHaveAttribute("href", "/runs/th-1/run-1");
+    expect(link).toHaveTextContent("查看运行");
+  });
+
+  it("omits the 查看运行 link when runHref is not given", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("console-turn-run-link")).not.toBeInTheDocument();
+  });
+
   it("retry button is danger-styled for a failed turn; export + inspect render regardless of onRetry", () => {
     const failedTurn = makeConsoleTurn({ status: "error", error: "boom" });
     const onRetry = vi.fn();

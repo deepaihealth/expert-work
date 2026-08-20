@@ -18,8 +18,9 @@ function readEnv(key: string): string | undefined {
 }
 
 /** Langfuse base URL — e.g. ``https://langfuse.internal``. When unset,
- *  the TraceToolbar shows the trace_id chip + copy button but hides
- *  the external "Open in Langfuse" link. */
+ *  ``buildLangfuseTraceUrl`` returns ``null`` and the debug console's
+ *  ``RecordDetails`` hides the "Open in Langfuse" link entirely
+ *  (system_admin only). */
 export function readLangfuseBaseUrl(): string | undefined {
   const raw = readEnv("VITE_LANGFUSE_BASE_URL");
   if (raw === undefined) return undefined;

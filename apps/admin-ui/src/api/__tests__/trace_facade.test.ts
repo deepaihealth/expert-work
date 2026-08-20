@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
 import { apiClient } from "../client";
-import { fetchRunTraceRaw, getRunTrace, type RunTrace } from "../trace_facade";
+import { getRunTrace, type RunTrace } from "../trace_facade";
 
 // Keep the real ``withTenantScope`` (getRunTrace threads it into ``params``);
 // only the axios instance is mocked.
@@ -145,33 +145,5 @@ describe("getRunTrace", () => {
     expect(result.status).toBe("no_trace");
     expect(result.trace).toBeUndefined();
     expect(result.spans).toBeUndefined();
-  });
-});
-
-describe("fetchRunTraceRaw", () => {
-  it("hits the raw endpoint and returns content", async () => {
-    (apiClient.get as Mock).mockResolvedValue({
-      data: { spanId: "o1", field: "input", content: "FULL" },
-    });
-
-    const result = await fetchRunTraceRaw("t1", "r1", "o1", "input");
-
-    expect(apiClient.get).toHaveBeenCalledWith(
-      "/v1/sessions/t1/runs/r1/trace/raw?span=o1&field=input",
-    );
-    expect(result).toBe("FULL");
-  });
-
-  it("URL-encodes the span id", async () => {
-    (apiClient.get as Mock).mockResolvedValue({
-      data: { spanId: "a/b c", field: "output", content: "RAW" },
-    });
-
-    const result = await fetchRunTraceRaw("t1", "r1", "a/b c", "output");
-
-    expect(apiClient.get).toHaveBeenCalledWith(
-      "/v1/sessions/t1/runs/r1/trace/raw?span=a%2Fb%20c&field=output",
-    );
-    expect(result).toBe("RAW");
   });
 });

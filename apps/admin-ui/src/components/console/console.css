@@ -1,8 +1,8 @@
 /*
  * ConsoleShell — component-scoped styles for the debug console's grid
  * (调试台重设计 PR-A Task 13; PR-A.2 Task 6 added the two-column form).
- * Colors are `--ew-*` design tokens end to end (see GanttTimeline.css for
- * the same convention); the <1200px breakpoint collapses the left column to
+ * Colors are `--ew-*` design tokens end to end (see trajectory_timeline.css
+ * for the same convention); the <1200px breakpoint collapses the left column to
  * a 48px icon rail (the sidebar's real content moves into a Drawer,
  * ConsoleShell.tsx wires that up — this file only hides/shows the two
  * candidate renderings). `.ew-console--two` is the two-column form used

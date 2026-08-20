@@ -139,74 +139,6 @@ export function messagesOf(data: unknown): Array<Record<string, unknown>> {
   return out;
 }
 
-/** One COMPACTION event (RT-2 PR-4) — a context-compression pass landed,
- *  summarising the middle of the transcript. Numeric-only per the backend
- *  payload (no conversation content). */
-export interface CompactionSummary {
-  /** Client receive order — de-dupes replayed frames, orders the cards. */
-  receivedAt: string;
-  passes: number;
-  tokensBefore: number;
-  tokensAfter: number;
-  summaryChars: number;
-}
-
-function numberField(data: Record<string, unknown>, key: string): number | null {
-  const v = data[key];
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-
-/**
- * Extract the ordered COMPACTION summaries from a run's SSE frames. A frame is
- * ``event: "compaction"`` with ``data: {passes, tokens_before, tokens_after,
- * summary_chars}`` (see ``sse._publish_compaction``). Malformed / partial
- * frames are skipped rather than rendered half-blank.
- */
-export function parseCompactionEvents(events: readonly SseEvent[]): CompactionSummary[] {
-  const out: CompactionSummary[] = [];
-  for (const evt of events) {
-    if (evt.event !== "compaction") continue;
-    if (evt.data === null || typeof evt.data !== "object") continue;
-    const data = evt.data as Record<string, unknown>;
-    const passes = numberField(data, "passes");
-    const tokensBefore = numberField(data, "tokens_before");
-    const tokensAfter = numberField(data, "tokens_after");
-    const summaryChars = numberField(data, "summary_chars");
-    if (passes === null || tokensBefore === null || tokensAfter === null || summaryChars === null) {
-      continue;
-    }
-    out.push({ receivedAt: evt.receivedAt, passes, tokensBefore, tokensAfter, summaryChars });
-  }
-  return out;
-}
-
-/** One transient-retry event (sse.py retry publish): the run hit a retryable
- *  error and backed off before re-attempting the astream loop. */
-export interface RetryEntry {
-  receivedAt: string;
-  attempt: number;
-  errorClass: string;
-  backoffS: number;
-}
-
-/** Extract ordered retry events (``event: "retry"`` with
- *  ``{attempt, error_class, backoff_s}``). Malformed frames are skipped. */
-export function parseRetryEvents(events: readonly SseEvent[]): RetryEntry[] {
-  const out: RetryEntry[] = [];
-  for (const evt of events) {
-    if (evt.event !== "retry" || evt.data === null || typeof evt.data !== "object") continue;
-    const d = evt.data as Record<string, unknown>;
-    if (typeof d.attempt !== "number" || typeof d.error_class !== "string") continue;
-    out.push({
-      receivedAt: evt.receivedAt,
-      attempt: d.attempt,
-      errorClass: d.error_class,
-      backoffS: typeof d.backoff_s === "number" ? d.backoff_s : 0,
-    });
-  }
-  return out;
-}
-
 /**
  * Reconstruct the ordered tool-call timeline from a run's SSE frames.
  *
@@ -387,14 +319,4 @@ export function artifactsFromTools(events: readonly SseEvent[]): TurnArtifact[] 
     byName.set(name, { name, kind });
   }
   return [...byName.values()];
-}
-
-/** Aggregate a turn's tool activity for an at-a-glance header: how many calls,
- *  how many failed. ``pending`` / ``pending_approval`` are not failures. */
-export function toolStatusSummary(
-  events: readonly SseEvent[],
-): { total: number; failed: number } {
-  const entries = parseToolCalls(events);
-  const failed = entries.filter((e) => e.status === "error").length;
-  return { total: entries.length, failed };
 }

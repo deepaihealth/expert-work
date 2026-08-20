@@ -11,8 +11,8 @@
  *
  * Decision (PR 6): tab-aware polling — when the operator hides the
  * tab we pause the timer to avoid burning quota on a stale signal,
- * resuming on visibilitychange. This mirrors the EventStreamPanel's
- * SSE handling (decision E).
+ * resuming on visibilitychange (the same page-visibility awareness
+ * ``useStatusPolling`` applies to its own poll timer).
  */
 import { useEffect, useRef, useState } from "react";
 import { Badge, Tooltip } from "antd";

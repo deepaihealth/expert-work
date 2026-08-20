@@ -4,9 +4,8 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../i18n";
 
-import { ToolCallCard, ToolTimeline } from "../ToolTimeline";
+import { ToolCallCard } from "../ToolTimeline";
 import { ApiError } from "../../api/client";
-import type { SseEvent } from "../../api/sessions";
 import type { ToolCallEntry } from "../../api/tool_timeline";
 import * as triggersSdk from "../../api/triggers";
 import type { FireNowResult } from "../../api/triggers";
@@ -19,10 +18,6 @@ const { isTenantSwitchedMock } = vi.hoisted(() => ({
 vi.mock("../../tenant/useIsTenantSwitched", () => ({
   useIsTenantSwitched: isTenantSwitchedMock,
 }));
-
-function updates(node: string, messages: unknown[]): SseEvent {
-  return { id: null, event: "updates", data: { [node]: { messages } }, rawData: "", receivedAt: "" };
-}
 
 function baseEntry(over: Partial<ToolCallEntry> = {}): ToolCallEntry {
   return {
@@ -56,63 +51,7 @@ function renderFireCard(entry: ToolCallEntry, onFireResult?: (result: FireNowRes
   );
 }
 
-describe("ToolTimeline", () => {
-  it("shows an empty state when there are no tool calls", () => {
-    render(<ToolTimeline events={[]} />);
-    expect(screen.getByTestId("tool-timeline-empty")).toBeInTheDocument();
-  });
-
-  it("renders an MCP call with its server + tool name and a success status", () => {
-    const events = [
-      updates("agent", [
-        {
-          type: "ai",
-          content: "",
-          tool_calls: [
-            {
-              id: "c1",
-              name: "mcp__amap-maps__maps_direction_driving",
-              args: { origin: "a" },
-              type: "tool_call",
-            },
-          ],
-        },
-      ]),
-      updates("tools", [
-        { type: "tool", tool_call_id: "c1", name: null, content: "{\"d\":1}", status: "success" },
-      ]),
-    ];
-    render(<ToolTimeline events={events} />);
-    expect(screen.getByTestId("tool-timeline")).toBeInTheDocument();
-    expect(screen.getByTestId("tool-call-card")).toBeInTheDocument();
-    // MCP badge carries the server name.
-    expect(screen.getByText(/amap-maps/)).toBeInTheDocument();
-    expect(screen.getByText("maps_direction_driving")).toBeInTheDocument();
-  });
-
-  it("renders a structured exec_python result with an exit-code chip", () => {
-    const events = [
-      updates("agent", [
-        {
-          type: "ai",
-          content: "",
-          tool_calls: [
-            { id: "c1", name: "exec_python", args: { code: "print(1)" }, type: "tool_call" },
-          ],
-        },
-      ]),
-      updates("tools", [
-        { type: "tool", tool_call_id: "c1", name: null, content: "stdout:\n1\n\nexit_code: 0", status: "success" },
-      ]),
-    ];
-    render(<ToolTimeline events={events} />);
-    // The result panel is collapsed by default — open it to reveal the
-    // structured exec-result content.
-    fireEvent.click(screen.getByText(/^(Result|结果)$/));
-    expect(screen.getByTestId("tool-exec-result")).toBeInTheDocument();
-    expect(screen.getByTestId("tool-exit-code")).toHaveTextContent("0");
-  });
-
+describe("ToolCallCard", () => {
   it("cleans an untrusted resultPreview (fence + ▁ glyph) and shows the badge", () => {
     const dirty = "«UNTRUSTED nonce=abc»\n搜索结果▁ 有效\n«/UNTRUSTED nonce=abc»";
     render(<ToolCallCard entry={baseEntry({ resultPreview: dirty })} />);
@@ -195,32 +134,6 @@ describe("ToolTimeline", () => {
     fireEvent.click(screen.getByText(/^(Arguments|参数)$/));
     expect(screen.getByText(/▁contains-glyph/)).toBeInTheDocument();
   });
-
-  it("shows the badge end-to-end via the real SSE→parseToolCalls pipeline (fence already stripped upstream, ▁ glyph remains)", () => {
-    const events = [
-      updates("agent", [
-        {
-          type: "ai",
-          content: "",
-          tool_calls: [{ id: "c1", name: "search", args: { q: "test" }, type: "tool_call" }],
-        },
-      ]),
-      updates("tools", [
-        {
-          type: "tool",
-          tool_call_id: "c1",
-          name: null,
-          content: "«UNTRUSTED nonce=xyz»\n结果▁ 内容\n«/UNTRUSTED nonce=xyz»",
-          status: "success",
-        },
-      ]),
-    ];
-    render(<ToolTimeline events={events} />);
-    expect(screen.getByTestId("tool-untrusted")).toBeInTheDocument();
-    openResultPanel();
-    const pre = screen.getByText(/结果 内容/);
-    expect(pre.textContent).not.toContain("▁");
-  });
 });
 
 describe("ToolCallCard 立即触发 / run-now button (Spec 1 PR4 Task 4)", () => {
@@ -261,6 +174,27 @@ describe("ToolCallCard 立即触发 / run-now button (Spec 1 PR4 Task 4)", () =>
   it("hides the button for a non-manage_task tool even if it somehow carried a triggerId", () => {
     renderFireCard(baseEntry({ toolName: "search", triggerId: "trig-1", action: "create" }));
     expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+  });
+
+  // PR-B Task 1 — 对话记录只读链路:readOnly 整卡隐藏「立即触发」(不是
+  // disable,照 R6 拍板 —— 不传 handler 就不渲染的惯例)。
+  it("hides the button when readOnly, even for an otherwise-eligible card", () => {
+    const entry = baseEntry({ toolName: "manage_task", triggerId: "trig-1", action: "create" });
+    const { rerender } = render(
+      <App>
+        <ToolCallCard entry={entry} readOnly />
+      </App>,
+    );
+    expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+
+    // Guards the assertion above against becoming vacuous — the same entry
+    // WITHOUT readOnly does render the button (see the test above this one).
+    rerender(
+      <App>
+        <ToolCallCard entry={entry} />
+      </App>,
+    );
+    expect(screen.getByTestId("tool-fire-now")).toBeInTheDocument();
   });
 
   it("hides the button while the call has not yet succeeded", () => {

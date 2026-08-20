@@ -266,6 +266,34 @@ describe("RecordDetails", () => {
     expect(screen.queryByTestId("console-detail-tab-preview")).not.toBeInTheDocument();
   });
 
+  // PR-B Task 1 — readOnly(对话记录只读链路)穿透到结果 tab 的
+  // ToolCallCard,「立即触发」整卡不渲染。
+  it("readOnly 下结果 tab 的 ToolCallCard 不渲染「立即触发」", () => {
+    const manageTaskRow = toolRow({
+      entry: {
+        id: "c1",
+        rawName: "manage_task",
+        isMcp: false,
+        server: null,
+        toolName: "manage_task",
+        args: {},
+        status: "success",
+        action: "create",
+        triggerId: "trig-1",
+        resultPreview: "created",
+        durationMs: 100,
+      },
+    });
+    renderRecord({ record: rec(manageTaskRow), activeTab: "result", readOnly: true });
+    expect(screen.getByTestId("console-detail-result")).toBeInTheDocument();
+    expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+
+    // Guards the assertion above against becoming vacuous — the same
+    // fixture WITHOUT readOnly does render the button.
+    renderRecord({ record: rec(manageTaskRow), activeTab: "result" });
+    expect(screen.getByTestId("tool-fire-now")).toBeInTheDocument();
+  });
+
   it("assistant 记录:概要 / 预览 / 原文 / 计时 / 原始 五个 tab", () => {
     expect(recordTabsOf(rec(assistantRow()))).toEqual([
       "summary",

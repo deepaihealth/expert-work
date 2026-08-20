@@ -1,9 +1,10 @@
 /**
- * EventCard — shared raw-SSE-frame renderer for RunDetail's EventStreamPanel
- * and the agent Playground (Batch 1 left these as two near-duplicate copies;
- * this is the merge). Shows the event tag, the received-at timestamp (when
- * present) and the frame's ``id`` (when non-null), plus the raw payload with
- * a copy affordance.
+ * EventCard — shared raw-SSE-frame renderer, used by the debug console's
+ * ``RecordDetails`` "原始" tab (one card per frame). Originally a Batch 1
+ * merge of two near-duplicate copies in RunDetail's EventStreamPanel and
+ * the agent Playground (both retired by PR-B). Shows the event tag, the
+ * received-at timestamp (when present) and the frame's ``id`` (when
+ * non-null), plus the raw payload with a copy affordance.
  */
 import { Tag, Typography } from "antd";
 

@@ -116,15 +116,17 @@ const PRE_STYLE = {
 function RowDetail({
   row,
   onFireResult,
+  readOnly,
 }: {
   row: CompactRowT;
   onFireResult?: (r: FireNowResult) => void;
+  readOnly: boolean;
 }): ReactNode {
   switch (row.kind) {
     case "think":
       return <pre style={PRE_STYLE}>{row.text}</pre>;
     case "tool":
-      return <ToolCallCard entry={row.entry} onFireResult={onFireResult} />;
+      return <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} />;
     case "plan":
       if (row.plan !== null) {
         return (
@@ -170,6 +172,9 @@ export interface CompactRowProps {
   onInspect?: () => void;
   /** 透传给 ToolCallCard(见 ToolTimeline.tsx 的「立即触发」按钮)。 */
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-B Task 1 — 对话记录只读链路:透传给 ToolCallCard,``true`` 时
+   *  「立即触发」整卡不渲染。Default false。 */
+  readOnly?: boolean;
 }
 
 export function CompactRow({
@@ -179,6 +184,7 @@ export function CompactRow({
   liveText,
   onInspect,
   onFireResult,
+  readOnly = false,
 }: CompactRowProps) {
   const { t } = useTranslation();
   const expandable = rowIsExpandable(row);
@@ -276,7 +282,7 @@ export function CompactRow({
       )}
       {expandable && expanded && (
         <div data-testid="console-row-detail" style={{ padding: "4px 6px 6px 18px" }}>
-          <RowDetail row={row} onFireResult={onFireResult} />
+          <RowDetail row={row} onFireResult={onFireResult} readOnly={readOnly} />
         </div>
       )}
     </div>

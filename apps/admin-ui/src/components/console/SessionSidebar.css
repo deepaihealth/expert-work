@@ -1,8 +1,7 @@
 /*
  * SessionSidebar — hover-reveal row actions + the running-dot breathing
  * animation. Split out of the .tsx (pseudo-class hover / @keyframes /
- * @media aren't expressible via inline style objects) — same pattern as
- * ../turn/GanttTimeline.css.
+ * @media aren't expressible via inline style objects).
  */
 .ew-session-item {
   position: relative;

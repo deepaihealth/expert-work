@@ -22,7 +22,7 @@ import type { HistoryMessage } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { MarkdownView } from "../MarkdownView";
-import { CommentarySegmentLine } from "../turn/TurnCard";
+import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
 import { HistoryDivider } from "../turn/HistoryDivider";
 import { TaskResultCard } from "../turn/TaskResultCard";
 import type { Turn } from "../turn/types";
@@ -68,6 +68,9 @@ export interface TranscriptProps {
   onRetryHistory?: (turn: Turn) => void;
   onDownloadArtifact: (name: string) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
+   *  ``TurnBlock``。Omitted → 零变化(链接不渲染)。 */
+  runHrefOf?: (turn: ConsoleTurn) => string | null;
 }
 
 /** How close to the bottom (px) still counts as "hasn't scrolled up" —
@@ -100,6 +103,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     onRetryHistory,
     onDownloadArtifact,
     onFireResult,
+    runHrefOf,
   } = props;
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -213,6 +217,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onRetry={onRetryHistory}
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
+          runHrefOf={runHrefOf}
           rowRef={
             turn.runId !== null
               ? registerHistoryRow(turn.runId, threadId ?? "")
@@ -243,6 +248,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onRetry={onRetryLive}
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
+          runHrefOf={runHrefOf}
         />
       ))}
 

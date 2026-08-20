@@ -61,6 +61,10 @@ export interface TrajectoryViewProps {
   /** 让父级回放这些 run(未回放的);resolve 表示都结束了。 */
   onEnsureLoaded: (runIds: readonly string[]) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-B Task 1 — 对话记录只读链路:透传给 ``RecordDetails`` 结果 tab 的
+   *  ToolCallCard,``true`` 时「立即触发」整卡不渲染。Default false —
+   *  PlaygroundTab 不传即旧行为。 */
+  readOnly?: boolean;
 }
 
 /** 详情侧栏的可用宽:`ResizeObserver` 量 `.ew-traj__split`,jsdom 没有它就退到
@@ -85,6 +89,7 @@ function useSplitWidth(ref: React.RefObject<HTMLDivElement | null>, enabled: boo
 
 export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
   const { turns, threadId, agentName, agentVersion, isSystemAdmin, onFireResult } = props;
+  const readOnly = props.readOnly ?? false;
   const { t } = useTranslation();
   const splitRef = useRef<HTMLDivElement>(null);
   const [detailsWidth, setDetailsWidth] = useState(DETAILS_DEFAULT_WIDTH);
@@ -189,6 +194,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
         onOpenRecord={state.selectRecord}
         onOpenRequest={state.selectRequest}
         onFireResult={onFireResult}
+        readOnly={readOnly}
         toolSchemas={toolSchemas}
         activeTab={recordTab}
         onTabChange={setRecordTab}
