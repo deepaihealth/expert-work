@@ -805,3 +805,49 @@ async def test_document_upload_no_service_behaves_as_today() -> None:
     body = resp.json()
     assert body["kind"] == "document"
     assert len(store.workspace_writes) == 1
+
+
+# ---------------------------------------------------------------------------
+# _safe_workspace_name / is_safe_document_upload_id — unicode stem support
+# ---------------------------------------------------------------------------
+
+
+class TestSafeWorkspaceNameUnicode:
+    """CJK filenames survive sanitisation; dangerous characters still cannot."""
+
+    def test_chinese_stem_preserved(self) -> None:
+        from control_plane.api.uploads import _safe_workspace_name
+
+        assert (
+            _safe_workspace_name("体检报告_20260718.jpg", ".jpg") == "uploads/体检报告_20260718.jpg"
+        )
+
+    def test_space_emoji_and_separator_collapse(self) -> None:
+        from control_plane.api.uploads import _safe_workspace_name
+
+        # path separator cut (basename); space/emoji collapse to "_", trailing "_" stripped
+        assert _safe_workspace_name("evil/面聊 记录😀.m4a", ".txt") == "uploads/面聊_记录.txt"
+
+    def test_traversal_and_controls_cannot_survive(self) -> None:
+        from control_plane.api.uploads import _safe_workspace_name
+
+        # ".." stem strips to empty -> uuid fallback stays inside uploads/
+        got = _safe_workspace_name("...pdf", ".pdf")
+        assert got.startswith("uploads/") and "/.." not in got
+        # NUL and RTL-override (format char, not \w) are replaced
+        assert "\x00" not in _safe_workspace_name("a\x00b.pdf", ".pdf")
+        assert "‮" not in _safe_workspace_name("a‮b.pdf", ".pdf")
+
+    def test_validator_accepts_chinese_and_legacy_ascii(self) -> None:
+        from control_plane.api.uploads import is_safe_document_upload_id
+
+        assert is_safe_document_upload_id("uploads/体检报告_20260718.pdf")
+        assert is_safe_document_upload_id("uploads/report_v2.pdf")  # 历史 ASCII id 兼容
+
+    def test_validator_still_rejects_dangerous_shapes(self) -> None:
+        from control_plane.api.uploads import is_safe_document_upload_id
+
+        assert not is_safe_document_upload_id("uploads/../etc/passwd")
+        assert not is_safe_document_upload_id("uploads/a/b.pdf")
+        assert not is_safe_document_upload_id("uploads/a\x00.pdf")
+        assert not is_safe_document_upload_id("体检报告.pdf")
