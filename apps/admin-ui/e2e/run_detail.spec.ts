@@ -18,6 +18,13 @@
  * (none of these tests assert on the trajectory area itself) — none of
  * that reaches the assertions below, but it keeps the page from making
  * real network calls CI can't reach.
+ *
+ * M-5 — every fixture in this file goes through that same pairing-failed
+ * empty state (empty ``messages``/``runs``); none of them exercise a real
+ * paired trajectory. ``TrajectoryView``'s own axe/interaction coverage
+ * lives on the debug console side (``ConversationDetail``'s e2e specs +
+ * component tests), not here. A real-pairing case for this page is a
+ * follow-up, not covered by this file today.
  */
 import { test, expect, expectNoA11yViolations, SAMPLE_JWT } from "./fixtures";
 import type { Page, Route } from "@playwright/test";

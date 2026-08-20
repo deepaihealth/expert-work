@@ -4,17 +4,17 @@
  * timeline the console renders/measures uniformly (Task 5 view model). See
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-5-brief.md.
  *
- * ``runIdOf`` is COPIED (not imported) from ``components/turn/TurnCard.tsx``
- * per controller ruling — TurnCard is retired in the next PR, so this
- * module must not depend on it.
+ * ``runIdOf`` was copied (not imported) from ``components/turn/TurnCard.tsx``
+ * per controller ruling; TurnCard has since been retired (PR-B Task 5), so
+ * this module is its only surviving implementation.
  */
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
 import type { HistoryLoad, HistoryTurn, Turn } from "../turn/types";
 import type { ConsoleTurn, TurnTiming } from "./types";
 
-/** Copied from ``components/turn/TurnCard.tsx`` (see module docstring) —
- *  the first ``run_id`` carried by a ``metadata`` frame. */
+/** Copied from the now-retired ``components/turn/TurnCard.tsx`` (see module
+ *  docstring) — the first ``run_id`` carried by a ``metadata`` frame. */
 export function runIdOf(events: readonly SseEvent[]): string | null {
   for (const e of events) {
     if (

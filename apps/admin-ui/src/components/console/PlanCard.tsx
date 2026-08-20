@@ -3,13 +3,15 @@
  *
  * Presentation only: the caller (``usePlanCard``) owns the plan's
  * three-source precedence; this renders whatever ``plan`` it is given,
- * plus a local edit-mode draft built on ``PlanEditForm`` (shared with
- * PlanPanel.tsx, Task 8). No plan yet → render nothing, so the shell
- * doesn't reserve space for an empty card.
+ * plus a local edit-mode draft built on ``PlanEditForm`` (originally
+ * shared with ``PlanPanel.tsx``; PR-B retired that file, so this is now
+ * ``PlanEditForm``'s only consumer). No plan yet → render nothing, so the
+ * shell doesn't reserve space for an empty card.
  *
  * The collapse toggle persists per-browser under
- * ``expert_work.console.planCollapsed`` ("1" / "0"), same convention as
- * EventStreamPanel.tsx's expand toggle.
+ * ``expert_work.console.planCollapsed`` ("1" / "0") — the same
+ * per-browser localStorage convention the console's other panel toggles
+ * use.
  */
 import { useCallback, useState, type ReactElement } from "react";
 import { App, Button, Card, Space, Tooltip, Typography } from "antd";

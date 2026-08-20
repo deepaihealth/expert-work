@@ -114,7 +114,8 @@ function durationOf(ch: Record<string, unknown>): number | null {
 
 // events 数组在 console 全链只替换不变异(PR-A.2 已依赖此不变式),按引用缓存
 // 是安全的;照 session_stats.ts 的 CONTRIBUTION_CACHE / ledger_timing.ts 的
-// SPAN_CACHE 先例。
+// SPAN_CACHE 先例。返回的 TimelineItem 对象跨调用方共享,消费者不得改写
+// (与 events 只替换不变异同级不变式)。
 const _cache = new WeakMap<readonly SseEvent[], TimelineItem[]>();
 
 export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {

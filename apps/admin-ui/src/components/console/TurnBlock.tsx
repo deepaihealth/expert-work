@@ -9,7 +9,7 @@
  * (``UserBubble`` / ``CompactRow`` / ``AnswerBubble`` / ``TurnFooter``) plus
  * ``ApprovalGate`` (imported from ``components/turn/ApprovalGate.tsx`` —
  * PR-B Task 1 split it out of ``TurnCard.tsx``, the module this file's
- * docstring used to point at; that module is retired in a later PR).
+ * docstring used to point at; that module was retired in PR-B Task 5).
  *
  * See .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-11-brief.md.
  */

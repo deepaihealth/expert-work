@@ -3,7 +3,7 @@
  * system_admin `trace_id` lookup, lifted verbatim out of
  * ``components/turn/TurnCard.tsx:121-126`` (retry constants) and ``:555-640``
  * (the five effects below) so the redesigned console can drive the same
- * "exact" trace view without importing TurnCard (retired in the next PR).
+ * "exact" trace view without importing TurnCard (retired in PR-B).
  *
  * Unlike TurnCard — where each mounted instance owns a single, immutable
  * `runId` for its lifetime — this hook is shared across turns switching in

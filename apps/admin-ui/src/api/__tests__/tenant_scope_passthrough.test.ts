@@ -12,7 +12,7 @@ import { apiClient } from "../client";
 import { getAgent, getRevision, listRevisions } from "../agents";
 import { downloadArtifact, listArtifactVersions } from "../artifacts";
 import { getRun, streamRunEvents } from "../runs";
-import { fetchRunTraceRaw, getRunTrace } from "../trace_facade";
+import { getRunTrace } from "../trace_facade";
 import { getBase, listBases, listChunks, listDocuments, testRetrieval } from "../knowledge";
 import {
   exportSkillVersion,
@@ -144,18 +144,6 @@ describe("trace facade SDK — tenantScope passthrough", () => {
     await getRunTrace("t1", "r1", TENANT);
     expect(calls[0].url).toBe("/v1/sessions/t1/runs/r1/trace");
     expect(calls[0].params?.tenant_id).toBe(TENANT);
-  });
-
-  it("fetchRunTraceRaw appends tenant_id to the hand-built query string", async () => {
-    let calls = captureAdapter({ spanId: "s1", field: "input", content: "X" });
-    await fetchRunTraceRaw("t1", "r1", "s1", "input", TENANT);
-    expect(calls[0].url).toBe(
-      `/v1/sessions/t1/runs/r1/trace/raw?span=s1&field=input&tenant_id=${TENANT}`,
-    );
-
-    calls = captureAdapter({ spanId: "s1", field: "input", content: "X" });
-    await fetchRunTraceRaw("t1", "r1", "s1", "input");
-    expect(calls[0].url).toBe("/v1/sessions/t1/runs/r1/trace/raw?span=s1&field=input");
   });
 });
 

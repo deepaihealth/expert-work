@@ -5,7 +5,7 @@
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-17-brief.md.
  *
  * `asMemories` / `reflectCritique` below are copied verbatim from
- * `StepTimeline.tsx:555-602` (not imported — PR-B retires that file, so
+ * `StepTimeline.tsx:555-602` (not imported — PR-B retired that file, so
  * this is the only surviving copy).
  */
 import type { ReactNode } from "react";

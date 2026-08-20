@@ -78,25 +78,3 @@ export async function getRunTrace(
   );
   return response.data;
 }
-
-/** Fetch the untruncated raw content for one span's input or output field.
- *
- * Consumes ``GET /v1/sessions/{thread_id}/runs/{run_id}/trace/raw`` (raw
- * payload, no envelope — matching :func:`getRunTrace`).
- */
-export async function fetchRunTraceRaw(
-  threadId: string,
-  runId: string,
-  spanId: string,
-  field: "input" | "output",
-  tenantScope?: TenantScope,
-): Promise<string> {
-  // Hand-built query string — append tenant_id manually (Track C W2);
-  // ``undefined`` omits it so existing callers see an identical URL.
-  const tenantQs =
-    tenantScope !== undefined ? `&tenant_id=${encodeURIComponent(tenantScope)}` : "";
-  const response = await apiClient.get<{ spanId: string; field: string; content: string }>(
-    `/v1/sessions/${threadId}/runs/${runId}/trace/raw?span=${encodeURIComponent(spanId)}&field=${field}${tenantQs}`,
-  );
-  return response.data.content;
-}
