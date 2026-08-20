@@ -223,4 +223,13 @@ describe("parseTimeline", () => {
     ]);
     expect((without[0] as AgentStep).firstTokenMs).toBeUndefined();
   });
+
+  it("caches by events array reference; a fresh array reference recomputes", () => {
+    const events = [
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "hi" }] }, "t1"),
+    ];
+    const a = parseTimeline(events);
+    expect(parseTimeline(events)).toBe(a); // 同引用 → 同对象
+    expect(parseTimeline([...events])).not.toBe(a); // 新引用 → 重算
+  });
 });

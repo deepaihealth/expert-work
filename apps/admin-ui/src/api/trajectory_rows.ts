@@ -10,7 +10,8 @@
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-4-brief.md
  * 与 .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-2-brief.md.
  */
-import type { PlanStep, PlanStepStatus, ThreadPlan } from "./plan";
+import type { ThreadPlan } from "./plan";
+import { isPlan } from "./plan_reducer";
 import type { SseEvent } from "./sessions";
 import { serverMsOf } from "./sse_id";
 import { parseTimeline } from "./timeline";
@@ -113,29 +114,6 @@ function workerIdx(events: readonly SseEvent[], workerId: string): number[] {
   return out;
 }
 
-/** Controller ruling — `plan_reducer.ts` (Task 3) isn't available in this
- *  worktree; a private narrowing guard stands in for its `isPlan`. Accepts a
- *  non-null object whose `steps` is an array and whose `goal` is a string
- *  (missing/invalid `goal` → the whole plan is rejected, `null`); each step
- *  is coerced to `{ id, description, status }` with string coercion and an
- *  unrecognised `status` falling back to `"pending"`. */
-function asThreadPlan(v: unknown): ThreadPlan | null {
-  if (v === null || typeof v !== "object") return null;
-  const o = v as Record<string, unknown>;
-  if (!Array.isArray(o.steps)) return null;
-  if (typeof o.goal !== "string") return null;
-  const steps: PlanStep[] = o.steps.map((s: unknown) => {
-    const so = s !== null && typeof s === "object" ? (s as Record<string, unknown>) : {};
-    const status: PlanStepStatus = so.status === "in_progress" || so.status === "completed" ? so.status : "pending";
-    return {
-      id: typeof so.id === "string" ? so.id : String(so.id ?? ""),
-      description: typeof so.description === "string" ? so.description : String(so.description ?? ""),
-      status,
-    };
-  });
-  return { goal: o.goal, steps };
-}
-
 /** 每个 agent 步投影成什么行 —— 两个投影唯一的行为旋钮:
  *  - `compact`(中栏紧凑行):`reasoning` 非空才出一条 think 行(Rule 1);
  *  - `ledger`(账本,spec §九 D2):每步一条 assistant 行,不出 think 行。 */
@@ -230,7 +208,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
         continue;
       }
       case "planner": {
-        const plan = asThreadPlan(item.detail.plan);
+        const plan = isPlan(item.detail.plan) ? item.detail.plan : null;
         const stepsTotal = plan ? plan.steps.length : 0;
         const goal = plan ? plan.goal : null;
         let merged = false;
