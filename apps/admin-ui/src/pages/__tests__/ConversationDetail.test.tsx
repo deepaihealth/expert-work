@@ -16,6 +16,8 @@ import "../../i18n";
 
 import { setStoredToken } from "../../api/client";
 import * as convoSdk from "../../api/conversations";
+import * as planSdk from "../../api/plan";
+import type { ThreadPlan } from "../../api/plan";
 import * as runsSdk from "../../api/runs";
 import * as sessionsSdk from "../../api/sessions";
 import type { SseEvent } from "../../api/sessions";
@@ -123,6 +125,65 @@ const replayEvents: SseEvent[] = [
   },
   { id: "5", event: "end", data: {}, rawData: "", receivedAt: "" },
 ];
+
+// Fix round 1 — a manage_task/create/success call with a triggerId: the only
+// fixture shape that reaches ToolCallCard's FireNowButton branch (borrowed
+// from PlaygroundTab.test.tsx's fireFromManageTaskCard fixture).
+const manageTaskEvents: SseEvent[] = [
+  { id: "1", event: "metadata", data: { run_id: RUN_1 }, rawData: "", receivedAt: "" },
+  {
+    id: "2",
+    event: "updates",
+    data: {
+      agent: {
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [
+              { id: "c1", name: "manage_task", args: { action: "create" }, type: "tool_call" },
+            ],
+          },
+        ],
+      },
+    },
+    rawData: "",
+    receivedAt: "",
+  },
+  {
+    id: "3",
+    event: "updates",
+    data: {
+      tools: {
+        messages: [
+          {
+            type: "tool",
+            tool_call_id: "c1",
+            name: "manage_task",
+            content: "Created trigger trig-1",
+            status: "success",
+            artifact: { trigger_id: "trig-1", action: "create" },
+          },
+        ],
+      },
+    },
+    rawData: "",
+    receivedAt: "",
+  },
+  {
+    id: "4",
+    event: "updates",
+    data: { agent: { messages: [{ type: "ai", content: "task scheduled" }] } },
+    rawData: "",
+    receivedAt: "",
+  },
+  { id: "5", event: "end", data: {}, rawData: "", receivedAt: "" },
+];
+
+const PLAN: ThreadPlan = {
+  goal: "ship the refund",
+  steps: [{ id: "1", description: "open the case", status: "completed" }],
+};
 
 const TWO_TURNS: sessionsSdk.HistoryMessage[] = [
   { role: "user", content: "I was charged twice" },
@@ -458,16 +519,66 @@ describe("ConversationDetail", () => {
       expect(screen.getByText("Refund case opened")).toBeInTheDocument();
       // …and the flat bubble rendering is gone.
       expect(screen.queryByTestId("conversation-message-0")).not.toBeInTheDocument();
-      // Task 3 — the console tabs replace the old flat block, and every
-      // write affordance stays gone (readOnly all the way down): no
-      // fire-now button, no plan editor, no approval decision buttons, no
-      // feedback bar.
+      // Task 3 — the console tabs replace the old flat block.
       expect(screen.getByTestId("console-view-tabs")).toBeInTheDocument();
-      expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("plan-edit")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("playground-approval-approve")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("playground-approval-reject")).not.toBeInTheDocument();
+      // Fix round 1 — a settled, non-tenant-switched turn is the one case
+      // FeedbackBar *would* render for if `readOnly` weren't threaded down
+      // (TurnFooter.tsx: `!readOnly && status === "done" && threadId`); this
+      // fixture actually reaches that branch, so this queryBy is a real gate.
       expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+      // Approval buttons are asserted in dedicated tests below (fire-now,
+      // plan editor) — `console-turn`'s approval gate isn't checked here:
+      // history turns are always synthesised with `approval: null`
+      // (console_turns.ts buildConsoleTurns), so `playground-approval-*`
+      // can never render off this page's own data regardless of readOnly;
+      // ApprovalGate's own readOnly gating is TurnBlock.test.tsx's job.
+    });
+
+    // Fix round 1 — a manage_task/create/success/triggerId call is the only
+    // fixture shape that reaches ToolCallCard's FireNowButton branch; the
+    // default empty replay (beforeEach) never expands a tool row at all, so
+    // the old queryBy here never had a chance to go red.
+    it("hides the fire-now button on a manage_task tool call even though the row itself renders", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([
+        { role: "user", content: "I was charged twice" },
+        { role: "assistant", content: "Refund case opened" },
+      ]);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([TWO_RUNS[0]]);
+      vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() =>
+        makeStream(manageTaskEvents),
+      );
+
+      renderPage();
+
+      await waitFor(() =>
+        expect(screen.getAllByTestId("console-turn")).toHaveLength(1),
+      );
+      await waitFor(() => expect(screen.getByText("task scheduled")).toBeInTheDocument());
+      fireEvent.click(screen.getByTestId("console-process-head"));
+      // The row itself renders (proves the replay reached this render layer,
+      // not just an empty/collapsed strip) …
+      expect(screen.getByTestId("console-row-tool")).toHaveTextContent("manage_task");
+      fireEvent.click(screen.getByTestId("console-row-tool"));
+      // … but its expanded detail never grows the fire-now shortcut.
+      expect(await screen.findByTestId("console-row-detail")).toBeInTheDocument();
+      expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+    });
+
+    // Fix round 1 — without a mocked plan, `usePlanCard`'s baseline GET
+    // never resolves to a real ``ThreadPlan`` and PlanCard returns null
+    // outright, so the old queryBy never reached the readOnly branch.
+    it("renders the plan card read-only — no edit button — when a plan exists", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+      vi.spyOn(planSdk, "getThreadPlan").mockResolvedValue(PLAN);
+
+      renderPage();
+
+      expect(await screen.findByTestId("plan-read-view")).toBeInTheDocument();
+      expect(screen.getByText("ship the refund")).toBeInTheDocument();
+      expect(screen.queryByTestId("plan-edit")).not.toBeInTheDocument();
     });
 
     it("replays a run when its row scrolls into view and renders the tool call", async () => {
