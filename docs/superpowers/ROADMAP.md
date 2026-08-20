@@ -22,7 +22,7 @@
   设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
 - **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 与 X-3~X-10、
   「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)、
-  「调试台 follow-up」D-1~D-4。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
+  ~~「调试台 follow-up」D-1~D-4~~(✅ 2026-08-20 全清)。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
   **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点)。
 
 ---
@@ -383,14 +383,14 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 ---
 
-## D · 调试台 program follow-up(2026-08-20 收官时留)
+## D · 调试台 program follow-up —— ✅ **全清(2026-08-20 收官当天一波做掉)**
 
-| # | 事项 |
-|---|---|
-| D-1 | Run 详情页轨迹「真配对」e2e 用例(现覆盖=单测 + 真栈冒烟探针,Playwright e2e 没有) |
-| D-2 | RunDetail 切线程竞态守卫(PR-B Ruling 4 park:loadHistory 在已挂载状态下切 thread 会带旧 tenant;现全部入口跨 Route 重挂载,不可达;**加任何「同页跳线程」入口前必须先修**) |
-| D-3 | `runs_page.summary_resume` 死 i18n 键(pre-existing,死键脚本确认) |
-| D-4 | `RecordDetails.tsx:241` 既有占位行空 `<dt>`(PR-A.3 follow-up 复审记 backlog) |
+| # | 事项 | 结果 |
+|---|---|---|
+| D-1 | Run 详情页轨迹「真配对」e2e 用例 | ✅ `e2e/run_detail.spec.ts` 增真配对用例(配对 messages/runs + 真 SSE 回放体 → 账本行断言)。**顺带逮到既有假象**:该文件的 messages/runs 桩用裸 glob,匹配不到带 `?tenant_id=` 的真请求,页面一直靠「穿透→报错→降级空态」活着 —— 改 URL 谓词匹配(exact pathname),桩第一次真正生效 |
+| D-2 | RunDetail 切线程竞态守卫(Ruling 4) | ✅ `convoTenant` 状态改为 `{threadId, tenantId}` 打上来源线程标签,history 效果拒绝错线程的 tenant;单测用 `useNavigate` 同页切线程驱动潜伏帧,变异自证(拆守卫→红) |
+| D-3 | `runs_page.summary_resume` 死 i18n 键 | ✅ 三处(en 类型/en 值/zh-CN)全删,全仓零残留 |
+| D-4 | `RecordDetails.tsx:241` 既有占位行空 `<dt>` | ✅ **已被 PR-B 顺手修掉**(占位行已是 `<dl>` 外的散文 `<p>`,注释明写避免空 `<dt>`),本波仅核实 |
 
 ---
 
@@ -399,7 +399,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 1. **B-19**(配额 check 不按 resource_kind 过滤维度)—— 直接影响对外 429 行为,工程可直接开工
 2. **P-1~P-5 拍板** —— 产品题,不拍板工程动不了;P-4(api_keys 凭据横向扩散)风险最高建议先议
 3. **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一开
-4. 其余 X / B / D 项零散,可捎带或攒波做;X-3 的「投递无 CAS/幂等」在动多副本(X-10)前必修
+4. 其余 X / B 项零散,可捎带或攒波做;X-3 的「投递无 CAS/幂等」在动多副本(X-10)前必修
 
 ## 这一轮攒下的教训(派发时带上)
 

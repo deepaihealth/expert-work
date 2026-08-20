@@ -2948,7 +2948,6 @@ const zhCN: TranslationKeys = {
     summary_cache: "缓存",
     summary_llm_calls: "LLM 调用",
     summary_models: "模型",
-    summary_resume: "续跑",
     summary_no_tokens: "本次运行没有记录 token 用量。",
   },
   eval_runs_page: {

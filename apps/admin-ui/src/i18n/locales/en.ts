@@ -2789,7 +2789,6 @@ export interface TranslationKeys {
     summary_cache: string;
     summary_llm_calls: string;
     summary_models: string;
-    summary_resume: string;
     summary_no_tokens: string;
   };
   eval_runs_page: {
@@ -6033,7 +6032,6 @@ const en: TranslationKeys = {
     summary_cache: "cache",
     summary_llm_calls: "LLM calls",
     summary_models: "Models",
-    summary_resume: "resumed",
     summary_no_tokens: "No token usage recorded for this run.",
   },
   eval_runs_page: {
