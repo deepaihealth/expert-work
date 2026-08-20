@@ -22,7 +22,7 @@ import type { HistoryMessage } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { MarkdownView } from "../MarkdownView";
-import { CommentarySegmentLine } from "../turn/TurnCard";
+import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
 import { HistoryDivider } from "../turn/HistoryDivider";
 import { TaskResultCard } from "../turn/TaskResultCard";
 import type { Turn } from "../turn/types";

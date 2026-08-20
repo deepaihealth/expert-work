@@ -20,6 +20,13 @@ import type {
   ToolRow,
 } from "../../../api/trajectory_rows";
 
+// PR-B Task 1 — a manage_task/create/success row's ToolCallCard renders
+// FireNowButton, which reads useIsTenantSwitched (no Provider mounted here) —
+// same stub as ToolTimeline.test.tsx / RecordDetails.test.tsx.
+vi.mock("../../../tenant/useIsTenantSwitched", () => ({
+  useIsTenantSwitched: () => false,
+}));
+
 describe("CompactRow", () => {
   it("tool row: name · args → result first line; click expands the ToolCallCard", async () => {
     const row: ToolRow = {
@@ -63,6 +70,59 @@ describe("CompactRow", () => {
     expect(
       within(screen.getByTestId("console-row-detail")).getByTestId("tool-call-card"),
     ).toBeInTheDocument();
+  });
+
+  // PR-B Task 1 — readOnly (对话记录只读链路)整卡隐藏「立即触发」,照
+  // ToolTimeline.test.tsx 的 manage_task create 用例造 fixture。
+  it("readOnly 下工具行不渲染「立即触发」按钮(收起与展开两个分支)", () => {
+    const row: ToolRow = {
+      id: "tool:0:0",
+      kind: "tool",
+      seq: 0,
+      step: 1,
+      status: "ok",
+      durationMs: 100,
+      eventIndexes: [0, 1],
+      serverMs: null,
+      entry: {
+        id: "c1",
+        rawName: "manage_task",
+        isMcp: false,
+        server: null,
+        toolName: "manage_task",
+        args: {},
+        status: "success",
+        action: "create",
+        triggerId: "trig-1",
+        resultPreview: "created",
+        durationMs: 100,
+      },
+    };
+    const onToggle = vi.fn();
+    const { rerender } = render(
+      <App>
+        <CompactRow row={row} expanded={false} onToggle={onToggle} readOnly />
+      </App>,
+    );
+    expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+
+    rerender(
+      <App>
+        <CompactRow row={row} expanded onToggle={onToggle} readOnly />
+      </App>,
+    );
+    expect(
+      within(screen.getByTestId("console-row-detail")).queryByTestId("tool-fire-now"),
+    ).not.toBeInTheDocument();
+
+    // Guards the two assertions above against becoming vacuous — the same
+    // fixture WITHOUT readOnly does render the button.
+    rerender(
+      <App>
+        <CompactRow row={row} expanded onToggle={onToggle} />
+      </App>,
+    );
+    expect(screen.getByTestId("tool-fire-now")).toBeInTheDocument();
   });
 
   it("think row shows the first line settled and the latest line while live", () => {

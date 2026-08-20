@@ -7,9 +7,9 @@
  * §八.3), the approval gate, the answer bubble, and the
  * turn's status/metric/action footer. Composes Task 10's leaves
  * (``UserBubble`` / ``CompactRow`` / ``AnswerBubble`` / ``TurnFooter``) plus
- * ``ApprovalGate`` (imported from ``components/turn/TurnCard.tsx`` per the
- * controller ruling — that module is retired in the next PR, this one just
- * borrows the still-live export).
+ * ``ApprovalGate`` (imported from ``components/turn/ApprovalGate.tsx`` —
+ * PR-B Task 1 split it out of ``TurnCard.tsx``, the module this file's
+ * docstring used to point at; that module is retired in a later PR).
  *
  * See .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-11-brief.md.
  */
@@ -22,7 +22,7 @@ import { compactRowsOf } from "../../api/trajectory_rows";
 import { summarizeTurn } from "../../api/turn_summary";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { ReadonlyTooltip } from "../ReadonlyTooltip";
-import { ApprovalGate } from "../turn/TurnCard";
+import { ApprovalGate } from "../turn/ApprovalGate";
 import type { Turn } from "../turn/types";
 import { AnswerBubble } from "./AnswerBubble";
 import { liveSyntheticRows, settledStepsOf } from "./live_rows";
@@ -194,6 +194,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         onToggleRow={toggleRow}
         onInspectRow={(rowId) => onInspectRow(turn.key, rowId)}
         onFireResult={onFireResult}
+        readOnly={readOnly}
       />
 
       {!readOnly && approval && threadId && (

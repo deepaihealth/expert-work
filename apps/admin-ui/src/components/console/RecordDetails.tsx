@@ -97,6 +97,9 @@ export interface RecordDetailsProps {
   onOpenRecord: (id: string) => void;
   onOpenRequest: (no: number) => void;
   onFireResult?: (r: FireNowResult) => void;
+  /** PR-B Task 1 — 对话记录只读链路:透传给结果 tab 的 ToolCallCard,
+   *  ``true`` 时「立即触发」整卡不渲染。Default false。 */
+  readOnly?: boolean;
   /** PR-A.3 §十.2 — the Schema tab's lazy fetch state; the parent owns the
    *  `useAgentTools` hook so it survives switching between records. */
   toolSchemas: ToolSchemaState;
@@ -147,7 +150,7 @@ function DetailSection({
 export function RecordDetails(props: RecordDetailsProps) {
   const { record, ownerRequest, parent, threadId, isSystemAdmin, langfuseUrl } = props;
   const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, onOpenRequest } = props;
-  const { activeTab, onTabChange, onFireResult, toolSchemas } = props;
+  const { activeTab, onTabChange, onFireResult, toolSchemas, readOnly = false } = props;
   const { t } = useTranslation();
   const [fullText, setFullText] = useState<FullTextState | null>(null);
 
@@ -168,7 +171,14 @@ export function RecordDetails(props: RecordDetailsProps) {
       case "payload":
         return <RowDetailPayload row={row} match={match} events={record.events} />;
       case "result":
-        return <RowDetailResult row={row} onFireResult={onFireResult} onOpenFullText={setFullText} />;
+        return (
+          <RowDetailResult
+            row={row}
+            onFireResult={onFireResult}
+            onOpenFullText={setFullText}
+            readOnly={readOnly}
+          />
+        );
       case "schema": {
         const toolName = schemaToolNameOf(row);
         return toolName === null ? null : <SchemaPanel toolName={toolName} state={toolSchemas} />;
@@ -236,12 +246,12 @@ export function RecordDetails(props: RecordDetailsProps) {
 
   const summary = (
     <div data-testid="console-detail-summary" className="ew-detail__summary">
+      {/* 占位行是散文,不进 `<dl>`(避免空 `<dt>`)—— 同 RowDetailSchema.tsx
+          的工具描述用同一个类。 */}
+      {record.placeholder !== null && (
+        <p className="ew-detail__desc">{t("console.detail_placeholder")}</p>
+      )}
       <dl className="ew-detail__ov">
-        {record.placeholder !== null && (
-          <DetailRow label="">
-            <Text type="secondary">{t("console.detail_placeholder")}</Text>
-          </DetailRow>
-        )}
         {hierarchy.length > 0 && (
           <DetailRow label={t("console.detail_hierarchy")}>
             <span className="ew-detail__hier-list">{hierarchy}</span>

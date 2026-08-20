@@ -263,6 +263,27 @@ describe("ToolCallCard 立即触发 / run-now button (Spec 1 PR4 Task 4)", () =>
     expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
   });
 
+  // PR-B Task 1 — 对话记录只读链路:readOnly 整卡隐藏「立即触发」(不是
+  // disable,照 R6 拍板 —— 不传 handler 就不渲染的惯例)。
+  it("hides the button when readOnly, even for an otherwise-eligible card", () => {
+    const entry = baseEntry({ toolName: "manage_task", triggerId: "trig-1", action: "create" });
+    const { rerender } = render(
+      <App>
+        <ToolCallCard entry={entry} readOnly />
+      </App>,
+    );
+    expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
+
+    // Guards the assertion above against becoming vacuous — the same entry
+    // WITHOUT readOnly does render the button (see the test above this one).
+    rerender(
+      <App>
+        <ToolCallCard entry={entry} />
+      </App>,
+    );
+    expect(screen.getByTestId("tool-fire-now")).toBeInTheDocument();
+  });
+
   it("hides the button while the call has not yet succeeded", () => {
     renderFireCard(
       baseEntry({
