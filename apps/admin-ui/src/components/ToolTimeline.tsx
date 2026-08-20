@@ -1,20 +1,18 @@
 /**
- * ToolTimeline — a readable view of an agent run's tool activity.
- *
- * Parses the raw SSE ``updates`` frames into an ordered list of tool calls
- * (see ``parseToolCalls``) and renders each as a timeline entry: tool name
- * (with an MCP server badge for ``mcp__server__tool`` calls), status, the
- * call arguments, and a preview of the result. Answers "did the agent call
- * tool/MCP X, with what, and did it work?" at a glance — which the raw
- * event dump does not.
+ * ToolTimeline — ``ToolCallCard``, a single tool call rendered as a readable
+ * card: tool name (with an MCP server badge for ``mcp__server__tool``
+ * calls), status, the call arguments, and a preview of the result. Answers
+ * "did the agent call tool/MCP X, with what, and did it work?" at a glance —
+ * which the raw event dump does not. Callers assemble their own list of
+ * cards from parsed tool-call entries (see ``parseToolCalls`` in
+ * ``api/tool_timeline``).
  */
-import { useCallback, useMemo, useState, type ReactNode } from "react";
-import { App, Button, Collapse, Empty, Tag, Typography } from "antd";
+import { useCallback, useState, type ReactNode } from "react";
+import { App, Button, Collapse, Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../api/client";
-import type { SseEvent } from "../api/sessions";
-import { parseToolCalls, type ToolCallEntry, type ToolCallStatus } from "../api/tool_timeline";
+import type { ToolCallEntry, ToolCallStatus } from "../api/tool_timeline";
 import { fireTriggerNow, type FireNowResult } from "../api/triggers";
 import { cleanUntrusted } from "../pages/agent_detail/playground/untrusted_clean";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
@@ -35,37 +33,6 @@ function pretty(value: unknown): string {
   } catch {
     return String(value);
   }
-}
-
-interface ToolTimelineProps {
-  events: readonly SseEvent[];
-  /** The run paused at an approval gate — render blocked tools as 待审批. */
-  awaitingApproval?: boolean;
-  /** Spec 1 PR4 Task 4 — fired when the 「立即触发」 button on a
-   *  ``manage_task`` card completes a fire-now call. Optional: Task 5 wires
-   *  a real handler to render the delivered result; omitted here, the card
-   *  still fires and shows its own inline delivery status. */
-  onFireResult?: (result: FireNowResult) => void;
-}
-
-export function ToolTimeline({ events, awaitingApproval = false, onFireResult }: ToolTimelineProps) {
-  const { t } = useTranslation();
-  const entries = useMemo(
-    () => parseToolCalls(events, awaitingApproval),
-    [events, awaitingApproval],
-  );
-
-  if (entries.length === 0) {
-    return <Empty description={t("tool_timeline.empty")} data-testid="tool-timeline-empty" />;
-  }
-
-  return (
-    <div data-testid="tool-timeline" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {entries.map((entry, idx) => (
-        <ToolCallCard key={`${entry.id}-${idx}`} entry={entry} onFireResult={onFireResult} />
-      ))}
-    </div>
-  );
 }
 
 export function ToolCallCard({
