@@ -1,10 +1,10 @@
-# 剩余工作总清单(第三方对接 API program 及相关挂起项)
+# 剩余工作总清单(全项目待办唯一入口)
 
 > 原为本机 git-ignored 文件 `.superpowers/sdd/ROADMAP-2026-08-13.md`,2026-08-17 搬进仓库,此后以本文件为唯一入口。
 > 各 program 的完整执行历史仍在各自的(本机)`.superpowers/sdd/<plan>/progress.md`;入仓的设计与计划在
 > `docs/superpowers/specs/` 与 `docs/superpowers/plans/`。
 
-## 状态(2026-08-17)
+## 状态(2026-08-20)
 
 - **阶段 0/1/2/3 全部交付并上线**(见下文各节的 ✅ 标记)。
 - **收官后的文档反馈波全部交付并上线**:
@@ -13,13 +13,17 @@
   - #1193 线 A 附件模型统一(`upl_` 统一 id、`files:[{upload_id}]`、附件下载端点;设计 `docs/superpowers/specs/2026-08-17-external-upload-unification-design.md`)
   - #1195 第三轮可读性(审计驱动,枚举值取代码真值;审计 `docs/superpowers/specs/2026-08-17-external-docs-readability-w3-audit.md`)
   - #1197 第四轮整站重写(第三方工程师视角 + 企业级语气;**写作规范 `docs/superpowers/specs/2026-08-17-external-docs-style-guide.md`,以后改对外文档先按它自检**)
-- **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1、「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)。
-- **新 program(2026-08-17 立项,先于上面剩余项):调试台 / 对话记录 / Run 详情交互重设计**,设计
-  `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`(八条决策已拍板);六个 PR:
-  PR0 两条 bug(调试台 Jinja 变量框不显示 / `{{ }}` 保存报错——拆掉「保存时填空」`template_vars` 整层)→
-  PR1 对外 `plan` SSE 事件 + 文档 → PR2 调试台三栏壳 → PR3 轨迹合一 → PR4 对话记录页 → PR5 Run 详情页。
-  每个 PR 出实施计划时再拆任务;已出:PR0 `docs/superpowers/plans/2026-08-17-debug-console-pr0-jinja-bugs.md`、
-  PR1 `docs/superpowers/plans/2026-08-17-debug-console-pr1-plan-event.md`(均未开工)。
+- **调试台 / 对话记录 / Run 详情交互重设计 program(2026-08-17 立项)—— ✅ 全收官(2026-08-20)**:
+  PR0 #1200(Jinja 两 bug)→ PR1 #1202(对外 `plan` SSE 事件 + 文档)→ PR-A #1207(三栏壳 + 轨迹合一)→
+  PR-A.1 #1214(六条界面反馈)→ PR-A.2 #1216(轨迹对标 deepseek-harness 重写)→
+  PR-A.3 #1218 + follow-up #1219(Schema tab / SYSTEM 行 / TTFT 补数据)→
+  **PR-B #1221(对话记录页 + Run 详情页切 console 组件,退役 TurnCard 集群 −9.6k 行)**。
+  测试环境 `afe00ebb`,两页真栈验收 15/15,记录 PR #1222 已合并(`72a5421b`)。
+  设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
+- **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 与 X-3~X-10、
+  「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)、
+  「调试台 follow-up」D-1~D-4。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
+  **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点)。
 
 ---
 
@@ -339,8 +343,16 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 | # | 事项 | 备注 |
 |---|---|---|
-| X-1 | **沙箱迁移波 4(收尾波)** | W1/W2/W3 全交付,波 4 因第三方对接插队而挂起。内容:**死字段裁决**(`sandbox_instance.node` + `spec.sandbox` 13 个死字段,15 个里只有 network 三键 + `persistent_workspace` 是活的)、沙箱指标接 Prometheus+Grafana、契约测试补全、文档(本地开发 / 发布 runbook / supervisor 冻结声明) |
+| X-1 | **沙箱迁移波 4(收尾波)** | W1/W2/W3 全交付,波 4 因第三方对接插队而挂起。内容:**死字段裁决**(`sandbox_instance.node` + `spec.sandbox` 13 个死字段,15 个里只有 network 三键 + `persistent_workspace` 是活的)、沙箱指标接 Prometheus+Grafana、契约测试补全、文档(本地开发 / 发布 runbook / supervisor 冻结声明)。**另含 W1 遗留清单**(头号=egress token 24h 到期后出网全挂且全仓无 407 日志/指标/告警;`pip install` 装进 user site 而 `python -I` 读不到;调试台不显示沙箱 stdout/退出码;明文 HTTP 走 proxy 恒 407 —— 空密码不发认证头) |
 | ~~X-2~~ | ~~CI pytest-xdist `-n auto`~~ | ✅ **已交付 PR #1159**(main `edbd8c96`)。实测 **29m17s → 11m32s(2.5x)**。三条教训:①「需先审 fixture 并行安全性」**是个不存在的前置** —— 零个 fixture 要改;真正挡路的是两个模块把 `uuid4()` 插进 parametrize id,导致各 worker 收集集不同。②**别拿本地数外推** —— 本地 `-n 4` 是 3.7x,runner 只有 2.5x(每 worker 都要 import 整个 app,固定开销被本地掩盖)。③基线自己在涨:P2 合入后 main 已经 **29m17s**,不是记录里的 18min |
+| X-3 | **触发器 program Spec2/Spec3**(来源:triggers-user-dimension program) | Spec1「对话核心」四 PR + 加固已全交付(#1039~#1043)。剩:**Spec2 通知**(2a webhook / 2b 长连接)、**Spec3 后台管理面 A + manifest triggers 弃用 C**。DEFER 池头号=**投递无 CAS/幂等**(多副本下双 reconcile 会重复投递,迁移多副本前必须按 `expert_work_source_run_id` 去重或 CAS claim;单副本今日无风险);次=TranscriptMirrorSweep 纯注入不重扫(投递消息不即入全文搜索)/ DEAD_LETTER→TRIGGER_FAILED 无专测 |
+| X-4 | **用户维度运维页 BACKLOG**(用户 2026-07-15 定暂缓) | ① 成员页员工清除 —— 唯一未做的删除入口,需新后端端点(绕 member 闸 + 删 Keycloak 账号)+ 前端;② Phase 3b 90 天物理硬删(`UserWorkspaceStore.hard_delete` + retention-job 扫 `deleted_at`+`archived_object_key` + `WORKSPACE_HARD_DELETE` 审计) |
+| X-5 | **MCP allowlist 残留名不可移出**(来源:MCP 界面重设计 2026-07) | 目录条目被删后,租户 allowlist 残留名在 UI 无法移出,后端缺 **disable-by-name** 端点;现降级为「禁用 + 提示」的诚实态 |
+| X-6 | **平台技能导出/同步收尾**(来源:skill-export-sync) | ① 52 个导出包待推测试环境(`POST /v1/platform/skills/import` 幂等可重跑,PLATFORM_ADMIN 凭证在金库);② admin-ui 技能导出按钮(platform + tenant);③ tenant export 丢 `supporting_files` bug(`skills.py:1390` 没传,platform 侧 `platform_skills.py:1333` 是无损姿势可照抄) |
+| X-7 | **观测栈残留**(来源:W2-PR3 observability) | ① alertmanager receivers 仍 placeholder(P0 告警投递到空气);② compose 侧 prometheus 同源坑(promtool 单测文件混进 rules 整目录挂载,`--profile observability` 起不来;修法=单测挪 tests/ 子目录 + 改两处文档 promtool 路径);③ Langfuse org/project 显示名(只设 INIT_*_ID 没设 NAME,界面显示 "Provisioned Org/Project");④ 探针 trace 噪音(middleware 对 `/healthz*` 也开 span,2K 条/天淹没真 run) |
+| X-8 | **node:22-alpine mirror 进 ACR**(来源:测试环境镜像逃生舱) | 照 keycloak/searxng 先例一劳永逸,消掉 Docker Hub KB/s 拉取坑 |
+| X-9 | **Agent 延迟 perf follow-up 池**(来源:perf 一期+二期;明细在本机 perf program 台账 progress.md) | oauth put 半成功窄漏清窗口(pre-existing)/ 双键空间 × per-tenant 键 LRU 有效容量随租户数下滑 / first_output SLI 缺面板 / resolve_embedder+resolve_reranker 死代码 / admin-ui 分解条 total 并行后夸大 |
+| X-10 | **生产多副本整体实施方案**(来源:production-distributed-premise,2026-07-28 拍板) | 五道选型题已收口(ACS 双集群杭州 / AgentSandbox+E2B / OSS+NAS 工作区 / RDS PG16 / Redis 社区版 7.0 noeviction),四波行动清单在 `docs/research/2026-07-28-multi-replica-readiness-audit.md`;**整体实施方案还没出**。期间新特性默认按多副本语义设计 |
 
 ---
 
@@ -370,21 +382,23 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 ---
 
-## 建议顺序
+## D · 调试台 program follow-up(2026-08-20 收官时留)
 
-```
-阶段 0(收尾开 PR)
-   └─→ 阶段 1.1(owner 维度,风险最高)  ┐
-       阶段 1.3(分区自审,当施工清单)  ├─ 同一波,新分支
-       阶段 1.2(API key 轴剩余)        ┘
-           └─→ 阶段 1.4(平台闸重构,要自审兜底)
-阶段 2(P3)、阶段 3(补能力)—— 与阶段 1 无代码耦合,可并行开分支
-```
-
-**为什么 1.1 排在 1.2 前面**:`curation` 能读**任意终端用户的完整对话原文**,
-风险等级明显高于"零 scope key 能读租户审计流水"。
+| # | 事项 |
+|---|---|
+| D-1 | Run 详情页轨迹「真配对」e2e 用例(现覆盖=单测 + 真栈冒烟探针,Playwright e2e 没有) |
+| D-2 | RunDetail 切线程竞态守卫(PR-B Ruling 4 park:loadHistory 在已挂载状态下切 thread 会带旧 tenant;现全部入口跨 Route 重挂载,不可达;**加任何「同页跳线程」入口前必须先修**) |
+| D-3 | `runs_page.summary_resume` 死 i18n 键(pre-existing,死键脚本确认) |
+| D-4 | `RecordDetails.tsx:241` 既有占位行空 `<dt>`(PR-A.3 follow-up 复审记 backlog) |
 
 ---
+
+## 建议顺序(2026-08-20 更新;原阶段 0→1→2→3 顺序已全部走完)
+
+1. **B-19**(配额 check 不按 resource_kind 过滤维度)—— 直接影响对外 429 行为,工程可直接开工
+2. **P-1~P-5 拍板** —— 产品题,不拍板工程动不了;P-4(api_keys 凭据横向扩散)风险最高建议先议
+3. **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一开
+4. 其余 X / B / D 项零散,可捎带或攒波做;X-3 的「投递无 CAS/幂等」在动多副本(X-10)前必修
 
 ## 这一轮攒下的教训(派发时带上)
 
