@@ -112,7 +112,14 @@ function durationOf(ch: Record<string, unknown>): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+// events 数组在 console 全链只替换不变异(PR-A.2 已依赖此不变式),按引用缓存
+// 是安全的;照 session_stats.ts 的 CONTRIBUTION_CACHE / ledger_timing.ts 的
+// SPAN_CACHE 先例。
+const _cache = new WeakMap<readonly SseEvent[], TimelineItem[]>();
+
 export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
+  const cached = _cache.get(events);
+  if (cached !== undefined) return cached;
   const items: TimelineItem[] = [];
   const byId = new Map<string, ToolCallEntry>();
   for (const e of parseToolCalls(events)) byId.set(e.id, e);
@@ -259,5 +266,6 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
       }
     }
   }
+  _cache.set(events, items);
   return items;
 }
