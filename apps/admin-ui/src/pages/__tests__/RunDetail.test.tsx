@@ -11,9 +11,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import type { NavigateFunction } from "react-router-dom";
 import "../../i18n";
 
 import { setStoredToken } from "../../api/client";
@@ -408,6 +409,66 @@ describe("RunDetail", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("console-traj-ledger")).not.toBeInTheDocument();
+  });
+
+  // Ruling 4 (PR-B follow-up) — a same-page thread switch must never fire
+  // the history load with the previous thread's tenant. The params flip a
+  // render before the tenant state resets, so an untagged tenant fired
+  // ``loadHistory(newThread, oldThreadsTenant)`` in that flip frame; the
+  // state is now tagged with the thread it was resolved for. Today every
+  // entry point remounts the page, so this drives the switch in-place via
+  // ``useNavigate`` to reach the latent frame at all.
+  it("never fires the history load with the previous thread's tenant on a same-page thread switch (Ruling 4)", async () => {
+    const THREAD_B = "66666666-6666-6666-6666-666666666666";
+    const RUN_B = "44444444-4444-4444-4444-444444444446";
+    const TENANT_B = "33333333-3333-3333-3333-333333333333";
+    vi.spyOn(runsSdk, "getRun").mockResolvedValue(runDetail());
+    // Thread A's conversation settles immediately; thread B's stays pending
+    // until the test resolves it — the whole race window.
+    let resolveB: (c: convoSdk.ConversationDetail) => void = () => {};
+    vi.spyOn(convoSdk, "getConversation").mockImplementation((threadId: string) =>
+      threadId === THREAD_ID
+        ? Promise.resolve(CONVO)
+        : new Promise<convoSdk.ConversationDetail>((resolve) => {
+            resolveB = resolve;
+          }),
+    );
+    const messagesSpy = vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([]);
+
+    const navRef: { current: NavigateFunction | null } = { current: null };
+    function NavCapture() {
+      navRef.current = useNavigate();
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={[`/runs/${THREAD_ID}/${RUN_1}`]}>
+        <AuthProvider>
+          <App>
+            <NavCapture />
+            <Routes>
+              <Route path="/runs/:threadId/:runId" element={<RunDetail />} />
+            </Routes>
+          </App>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+
+    // Thread A settles: history loads under A's own tenant.
+    await waitFor(() => expect(messagesSpy).toHaveBeenCalledWith(THREAD_ID, TENANT_ID));
+
+    // Switch threads in place while B's tenant is still unknown.
+    await act(async () => {
+      navRef.current?.(`/runs/${THREAD_B}/${RUN_B}`);
+    });
+    // The flip frame: without the thread tag this had already fired.
+    expect(messagesSpy).not.toHaveBeenCalledWith(THREAD_B, TENANT_ID);
+
+    // B's lookup settles → history loads under B's tenant, and never under A's.
+    await act(async () => {
+      resolveB({ ...CONVO, thread_id: THREAD_B, tenant_id: TENANT_B });
+    });
+    await waitFor(() => expect(messagesSpy).toHaveBeenCalledWith(THREAD_B, TENANT_B));
+    expect(messagesSpy).not.toHaveBeenCalledWith(THREAD_B, TENANT_ID);
   });
 });
 

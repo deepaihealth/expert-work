@@ -19,12 +19,13 @@
  * that reaches the assertions below, but it keeps the page from making
  * real network calls CI can't reach.
  *
- * M-5 — every fixture in this file goes through that same pairing-failed
- * empty state (empty ``messages``/``runs``); none of them exercise a real
- * paired trajectory. ``TrajectoryView``'s own axe/interaction coverage
- * lives on the debug console side (``ConversationDetail``'s e2e specs +
- * component tests), not here. A real-pairing case for this page is a
- * follow-up, not covered by this file today.
+ * M-5 (closed by the PR-B follow-up wave) — the approval/plan fixtures
+ * still go through the pairing-failed empty state (empty ``messages``/
+ * ``runs``; none of those tests assert on the trajectory area), and the
+ * dedicated real-pairing test at the bottom drives the full pipeline —
+ * paired ``messages``+``runs`` → per-run SSE replay → ledger rows — end
+ * to end through the browser. ``TrajectoryView``'s deeper axe/interaction
+ * coverage still lives on the debug console side (component tests).
  */
 import { test, expect, expectNoA11yViolations, SAMPLE_JWT } from "./fixtures";
 import type { Page, Route } from "@playwright/test";
@@ -60,9 +61,30 @@ function runDetail(status: string, withApproval: boolean) {
   };
 }
 
+/** A real paired history for the thread: wire-shaped ``/messages`` +
+ *  ``/runs`` rows and the SSE replay body for this page's run. */
+interface PairingFixture {
+  messages: Array<{ role: string; content: string }>;
+  runs: Array<Record<string, unknown>>;
+  sse: string;
+}
+
+function sseBody(frames: Array<{ id: string; event: string; data: unknown }>): string {
+  return (
+    frames
+      .map((f) => `id: ${f.id}\nevent: ${f.event}\ndata: ${JSON.stringify(f.data)}\n`)
+      .join("\n") + "\n"
+  );
+}
+
 async function openRunDetail(
   page: Page,
-  { status, withApproval, plan }: { status: string; withApproval: boolean; plan: object | null },
+  {
+    status,
+    withApproval,
+    plan,
+    pairing,
+  }: { status: string; withApproval: boolean; plan: object | null; pairing?: PairingFixture },
 ): Promise<{ resumes: unknown[]; planPuts: unknown[] }> {
   const resumes: unknown[] = [];
   const planPuts: unknown[] = [];
@@ -114,15 +136,46 @@ async function openRunDetail(
       },
     });
   });
-  // useHistoryTurns' pairing fetch — an empty thread (no runs beyond the
-  // one under test) degrades to the trajectory's "no trajectory" empty
-  // state; none of these tests assert on that area.
-  await page.route(`**/v1/sessions/${THREAD}/messages`, async (route: Route) => {
-    await route.fulfill({ json: { success: true, error: null, data: { messages: [] } } });
-  });
-  await page.route(`**/v1/sessions/${THREAD}/runs`, async (route: Route) => {
-    await route.fulfill({ json: { success: true, error: null, data: { runs: [] } } });
-  });
+  // useHistoryTurns' pairing fetch. Without ``pairing`` an empty thread
+  // (no runs beyond the one under test) degrades to the trajectory's "no
+  // trajectory" empty state — the approval/plan tests don't assert on that
+  // area. With ``pairing`` the real pipeline runs: paired messages/runs,
+  // then the per-run SSE replay below.
+  // URL-predicate matchers, not globs: these requests carry a
+  // ``?tenant_id=`` query (M-8 threads the conversation's tenant through),
+  // and a glob has to match the query string too — the old bare-glob
+  // registrations silently never matched, and the page "worked" only
+  // because the unmatched request failed into the pairing-failed empty
+  // state. Exact-pathname predicates also can't swallow ``/runs/{id}`` or
+  // ``/runs/{id}/events`` the way a trailing ``runs**`` glob would.
+  await page.route(
+    (url) => url.pathname === `/v1/sessions/${THREAD}/messages`,
+    async (route: Route) => {
+      await route.fulfill({
+        json: { success: true, error: null, data: { messages: pairing?.messages ?? [] } },
+      });
+    },
+  );
+  await page.route(
+    (url) => url.pathname === `/v1/sessions/${THREAD}/runs`,
+    async (route: Route) => {
+      await route.fulfill({
+        json: { success: true, error: null, data: { runs: pairing?.runs ?? [] } },
+      });
+    },
+  );
+  if (pairing) {
+    await page.route(
+      (url) => url.pathname === `/v1/sessions/${THREAD}/runs/${RUN}/events`,
+      async (route: Route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "text/event-stream",
+          body: pairing.sse,
+        });
+      },
+    );
+  }
 
   await page.goto("/login");
   // The login card's own render race (pre-existing — same fix as
@@ -190,6 +243,92 @@ test("plan edit is locked while the run is live", async ({ page }) => {
   await openRunDetail(page, { status: "running", withApproval: false, plan: PLAN });
   await expect(page.getByTestId("console-plan-card")).toBeVisible();
   await expect(page.getByTestId("plan-edit")).toBeDisabled();
+});
+
+// D-1 (PR-B follow-up) — the real-pairing case the M-5 note used to defer:
+// a thread whose /messages pair 1:1 with its /runs, whose run replays a
+// real SSE body (metadata → tool call → tool result → answer → end), and
+// whose ledger therefore renders actual rows instead of the pairing-failed
+// empty state every other fixture in this file goes through.
+test("real paired trajectory renders this run's ledger rows", async ({ page }) => {
+  await openRunDetail(page, {
+    status: "success",
+    withApproval: false,
+    plan: null,
+    pairing: {
+      messages: [
+        { role: "user", content: "first question" },
+        { role: "assistant", content: "run one's answer" },
+      ],
+      runs: [
+        {
+          run_id: RUN,
+          status: "success",
+          is_resume: false,
+          created_at: "2026-06-10T08:00:00Z",
+          tokens: null,
+        },
+      ],
+      sse: sseBody([
+        { id: "1", event: "metadata", data: { run_id: RUN } },
+        {
+          id: "2",
+          event: "updates",
+          data: {
+            agent: {
+              messages: [
+                {
+                  type: "ai",
+                  content: "",
+                  tool_calls: [
+                    { id: "c1", name: "search", args: { q: "expert-work" }, type: "tool_call" },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+        {
+          id: "3",
+          event: "updates",
+          data: {
+            tools: {
+              messages: [
+                {
+                  type: "tool",
+                  tool_call_id: "c1",
+                  name: "search",
+                  content: "3 hits",
+                  status: "success",
+                },
+              ],
+            },
+          },
+        },
+        {
+          id: "4",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "run one's answer" }] } },
+        },
+        { id: "5", event: "end", data: {} },
+      ]),
+    },
+  });
+
+  const ledger = page.getByTestId("console-traj-ledger");
+  await expect(ledger).toBeVisible();
+  // The paired USER turn, the replayed tool call and the final answer all
+  // materialise as ledger rows — none of which exist on the empty-state
+  // path the other tests take.
+  await expect(
+    page.getByTestId("console-traj-row").filter({ hasText: "first question" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("console-traj-row").filter({ hasText: "search" })).toBeVisible();
+  await expect(
+    page.getByTestId("console-traj-row").filter({ hasText: "run one's answer" }),
+  ).toBeVisible();
+  // And the pairing-failed empty state is absent.
+  await expect(page.getByTestId("console-trajectory-empty")).not.toBeVisible();
 });
 
 test("run detail with approval + plan passes axe (serious + critical)", async ({ page }) => {

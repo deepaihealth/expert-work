@@ -142,12 +142,23 @@ export function RunDetail() {
   // M-8 — the conversation's own ``tenant_id``, authoritative for a
   // system_admin's cross-tenant drill-in the same way ConversationDetail
   // .tsx's ``viewedConvo.tenant_id`` is (the ambient scope resolves to the
-  // caller's home tenant, not necessarily the thread's). Three states:
-  // ``null`` = the lookup below hasn't settled yet, ``undefined`` =
-  // settled but failed (history then falls back to the ambient scope,
-  // same as before this fix — this lookup stays best-effort for the page
-  // as a whole), a string = the thread's real tenant.
-  const [convoTenantId, setConvoTenantId] = useState<string | undefined | null>(null);
+  // caller's home tenant, not necessarily the thread's). ``null`` = the
+  // lookup below hasn't settled yet; once settled, ``tenantId`` is the
+  // thread's real tenant, or ``undefined`` when the lookup failed (history
+  // then falls back to the ambient scope, same as before this fix — this
+  // lookup stays best-effort for the page as a whole).
+  //
+  // Ruling 4 (PR-B follow-up) — the tenant is tagged with the ``threadId``
+  // it was resolved for. On a same-page thread switch the params flip a
+  // render before this state resets, and an untagged value would let the
+  // history effect below fire ``loadHistory(newThread, oldThreadsTenant)``
+  // — a cross-tenant read under the wrong scope. Today every entry point
+  // remounts the page (new Route key), so the race is latent; the tag makes
+  // it impossible rather than merely unexercised.
+  const [convoTenant, setConvoTenant] = useState<{
+    threadId: string;
+    tenantId: string | undefined;
+  } | null>(null);
 
   /** Silent refresh — polled by ``useStatusPolling`` so the Skeleton
    *  flicker only happens on the initial fetch and explicit user
@@ -205,20 +216,20 @@ export function RunDetail() {
   useEffect(() => {
     if (!threadId) return;
     let cancelled = false;
-    setConvoTenantId(null);
+    setConvoTenant(null);
     getConversation(threadId, concreteTenantScope(apiTenantScope))
       .then((convo) => {
         if (cancelled) return;
         setAgentName(convo.agent_name ?? "");
         setAgentVersion(convo.agent_version ?? "");
-        setConvoTenantId(convo.tenant_id);
+        setConvoTenant({ threadId, tenantId: convo.tenant_id });
       })
       .catch(() => {
         if (cancelled) return;
         // Schema tab just renders its own "not in the tool catalog" empty
         // state with agentName/agentVersion === ""; history (M-8) falls
         // back to the ambient scope.
-        setConvoTenantId(undefined);
+        setConvoTenant({ threadId, tenantId: undefined });
       });
     return () => {
       cancelled = true;
@@ -237,10 +248,19 @@ export function RunDetail() {
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
   useEffect(() => {
-    if (!threadId || convoTenantId === null) return;
+    // Ruling 4 — ``convoTenant.threadId !== threadId`` is the race guard:
+    // a tenant resolved for a previous thread never scopes this thread's
+    // history load (see the state's own comment above).
+    if (!threadId || convoTenant === null || convoTenant.threadId !== threadId) return;
     setHistoryLoaded(false);
-    void loadHistory(threadId, convoTenantId).then(() => setHistoryLoaded(true));
-  }, [threadId, convoTenantId, loadHistory]);
+    let cancelled = false;
+    void loadHistory(threadId, convoTenant.tenantId).then(() => {
+      if (!cancelled) setHistoryLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [threadId, convoTenant, loadHistory]);
 
   useEffect(() => {
     if (!threadId || !runId || historyTurns === null) return;
