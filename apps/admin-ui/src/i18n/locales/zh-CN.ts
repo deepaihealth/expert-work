@@ -1653,6 +1653,7 @@ const zhCN: TranslationKeys = {
     run_id: "运行 ID",
     thread_id: "会话线程 ID",
     status: "状态",
+    trajectory_pairing_failed: "无法把这次运行与会话的消息记录配对——两边对不上。",
   },
   trace_toolbar: {
     title: "Trace",

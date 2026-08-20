@@ -1,10 +1,23 @@
 /**
- * Run detail E2E — Stream CM-8 PR4.
+ * Run detail E2E — Stream CM-8 PR4, updated by 调试台重设计 PR-B Task 4.
  *
  * Closes the PR 7e debt (approval flow was never driven end-to-end) and
- * covers the new PlanPanel. Spec-level ``page.route`` registrations
- * stack on top of ``mockControlPlane`` (later routes win), so each test
- * shapes the run/plan payloads it needs and captures the writes.
+ * covers the console shell's ``PlanCard``. Spec-level ``page.route``
+ * registrations stack on top of ``mockControlPlane`` (later routes win),
+ * so each test shapes the run/plan payloads it needs and captures the
+ * writes.
+ *
+ * The page now also drives ``useHistoryTurns`` (single-run trajectory —
+ * ``TrajectoryView``) and fetches the conversation for the Schema tab's
+ * agent/version key; ``mockControlPlane``'s default conversations-list glob
+ * only matches ``GET /v1/conversations`` itself (a bare ``*`` never crosses
+ * a ``/``), not the ``/{thread_id}`` sub-path this page reads — so
+ * ``openRunDetail`` adds its own stubs for that sub-path + the thread's
+ * messages/runs/events. This thread has no other history beyond the run
+ * under test, so pairing degrades to the "no trajectory" empty state
+ * (none of these tests assert on the trajectory area itself) — none of
+ * that reaches the assertions below, but it keeps the page from making
+ * real network calls CI can't reach.
  */
 import { test, expect, expectNoA11yViolations, SAMPLE_JWT } from "./fixtures";
 import type { Page, Route } from "@playwright/test";
@@ -66,8 +79,51 @@ async function openRunDetail(
     }
     await route.fulfill({ json: plan });
   });
+  // getConversation — the Schema tab's agent/version key. A sub-path, so
+  // ``mockControlPlane``'s ``**/v1/conversations*`` (list only) doesn't
+  // match it (a bare ``*`` never crosses a ``/``).
+  await page.route(`**/v1/conversations/${THREAD}`, async (route: Route) => {
+    await route.fulfill({
+      json: {
+        success: true,
+        error: null,
+        data: {
+          thread_id: THREAD,
+          tenant_id: "22222222-2222-2222-2222-222222222222",
+          user_id: null,
+          agent_name: "demo-agent",
+          agent_version: "1.0.0",
+          title: null,
+          status: "active",
+          created_at: "2026-06-10T08:00:00Z",
+          updated_at: "2026-06-10T08:00:00Z",
+          run_count: 1,
+          error_count: 0,
+          pending_count: 0,
+          last_run_at: "2026-06-10T08:00:00Z",
+          tokens: null,
+          runs: [],
+        },
+      },
+    });
+  });
+  // useHistoryTurns' pairing fetch — an empty thread (no runs beyond the
+  // one under test) degrades to the trajectory's "no trajectory" empty
+  // state; none of these tests assert on that area.
+  await page.route(`**/v1/sessions/${THREAD}/messages`, async (route: Route) => {
+    await route.fulfill({ json: { success: true, error: null, data: { messages: [] } } });
+  });
+  await page.route(`**/v1/sessions/${THREAD}/runs`, async (route: Route) => {
+    await route.fulfill({ json: { success: true, error: null, data: { runs: [] } } });
+  });
 
   await page.goto("/login");
+  // The login card's own render race (pre-existing — same fix as
+  // usage.spec.ts/knowledge.spec.ts etc.): without this wait,
+  // ``tokenField.isVisible()`` below can fire before React paints the
+  // form at all, always reading false and hanging on a dev-toggle that
+  // was never actually needed.
+  await expect(page.getByTestId("login-card")).toBeVisible();
   // Local dev servers may have VITE_OIDC_* set — the token field then
   // hides behind the dev-login toggle (CI shows it directly).
   const tokenField = page.getByTestId("login-token");
@@ -111,7 +167,7 @@ test("plan panel shows the goal and steps, and edits flow through PUT", async ({
     withApproval: false,
     plan: PLAN,
   });
-  await expect(page.getByTestId("plan-panel")).toBeVisible();
+  await expect(page.getByTestId("console-plan-card")).toBeVisible();
   await expect(page.getByText("ship the feature")).toBeVisible();
   await expect(page.getByText("write tests")).toBeVisible();
 
@@ -125,13 +181,13 @@ test("plan panel shows the goal and steps, and edits flow through PUT", async ({
 
 test("plan edit is locked while the run is live", async ({ page }) => {
   await openRunDetail(page, { status: "running", withApproval: false, plan: PLAN });
-  await expect(page.getByTestId("plan-panel")).toBeVisible();
+  await expect(page.getByTestId("console-plan-card")).toBeVisible();
   await expect(page.getByTestId("plan-edit")).toBeDisabled();
 });
 
 test("run detail with approval + plan passes axe (serious + critical)", async ({ page }) => {
   await openRunDetail(page, { status: "paused", withApproval: true, plan: PLAN });
   await expect(page.getByTestId("approval-card")).toBeVisible();
-  await expect(page.getByTestId("plan-panel")).toBeVisible();
+  await expect(page.getByTestId("console-plan-card")).toBeVisible();
   await expectNoA11yViolations(page, `/runs/${THREAD}/${RUN}`);
 });
