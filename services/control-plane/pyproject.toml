@@ -39,7 +39,7 @@ dependencies = [
     # Stream C.5 — Redis client for the quota / rate-limit engine
     # (subsystems/16 § 3.2). ``redis-py>=5.0`` ships asyncio support
     # natively under ``redis.asyncio``.
-    "redis>=5.0,<7",
+    "redis>=5.0,<9",
     # Stream J.5 — knowledge-base document parsing. pymupdf4llm gives
     # high-quality Markdown (with headings) for PDFs; MarkItDown is the
     # fallback + handles office formats (docx / pptx / xlsx).
