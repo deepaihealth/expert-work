@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import "../../i18n";
 
@@ -250,6 +251,86 @@ describe("RunDetail", () => {
 
     await waitFor(() => expect(screen.getByTestId("console-plan-card")).toBeInTheDocument());
     expect(screen.getByTestId("plan-edit")).not.toBeDisabled();
+  });
+
+  // I-1 — a paused run (e.g. sitting at an approval gate) must not lock
+  // plan editing: the backend's write guard (control_plane/api/plan.py's
+  // ``_WRITE_BLOCKED_STATUSES = {PENDING, RUNNING}``) only blocks those two
+  // statuses, and the pre-PR-B PlanPanel matched that; this page's PR-B
+  // rewrite over-widened the lock to every ``ACTIVE_RUN_STATUSES`` member
+  // (which includes ``paused``), a functional regression this test guards.
+  it("leaves the plan card editable while the run is paused (I-1)", async () => {
+    vi.spyOn(runsSdk, "getRun").mockResolvedValue(
+      runDetail({
+        status: "paused",
+        pending_approval: {
+          request_id: "req-1",
+          node: "deploy",
+          reason_kind: "irreversible",
+          action_summary: "Deploy build 42 to production",
+          proposed_args: { target: "prod" },
+          requested_at: "2026-06-10T08:00:00Z",
+          timeout_at: "2026-06-11T08:00:00Z",
+        },
+      }),
+    );
+    vi.spyOn(planSdk, "getThreadPlan").mockResolvedValue({
+      goal: "ship the feature",
+      steps: [{ id: "1", description: "write tests", status: "completed" }],
+    });
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId("console-plan-card")).toBeInTheDocument());
+    expect(screen.getByTestId("plan-edit")).not.toBeDisabled();
+  });
+
+  // Ruling 3 / I-2 — a terminal run's already-replayed plan frame is a
+  // historical snapshot of what the plan looked like mid-run, not the
+  // thread's current plan; the GET baseline (the thread's current plan) is
+  // the one editable/savable object, so a terminal run's own event stream
+  // must not let a stale plan frame override that baseline (or a Save
+  // silently round-trip the stale snapshot instead of the real plan).
+  it("shows the thread's current plan baseline, not a terminal run's stale replayed plan frame, and saves against it (Ruling 3 / I-2)", async () => {
+    vi.spyOn(runsSdk, "getRun").mockResolvedValue(runDetail({ status: "success" }));
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([
+      { role: "user", content: "first question" },
+      { role: "assistant", content: "run one's answer" },
+    ]);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([TWO_RUNS[0]]);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() =>
+      makeStream([
+        ...RUN_1_EVENTS.slice(0, -1),
+        {
+          id: "plan-1",
+          event: "plan",
+          data: {
+            goal: "stale plan v1",
+            steps: [{ id: "1", description: "old step", status: "pending" }],
+          },
+          rawData: "",
+          receivedAt: "",
+        },
+        RUN_1_EVENTS[RUN_1_EVENTS.length - 1],
+      ]),
+    );
+    const currentPlan = {
+      goal: "current plan v2",
+      steps: [{ id: "1", description: "write tests", status: "completed" as const }],
+    };
+    vi.spyOn(planSdk, "getThreadPlan").mockResolvedValue(currentPlan);
+    const putSpy = vi.spyOn(planSdk, "updateThreadPlan").mockResolvedValue(currentPlan);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId("console-plan-card")).toBeInTheDocument());
+    expect(await screen.findByText("current plan v2")).toBeInTheDocument();
+    expect(screen.queryByText("stale plan v1")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("plan-edit"));
+    await userEvent.click(screen.getByTestId("plan-save"));
+    await waitFor(() => expect(putSpy).toHaveBeenCalled());
+    expect(putSpy.mock.calls[0]?.[1]?.goal).toBe("current plan v2");
   });
 
   // ④ 轨迹区渲染该 run 的工具行

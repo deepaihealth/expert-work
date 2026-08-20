@@ -57,7 +57,6 @@ const STATUS_COLOR: Record<string, string> = {
   failed: "error",
   cancelled: "default",
   archived: "default",
-  pending: "default",
 };
 
 // PR-B Task 3 — this page never streams a live turn: stable module-level
