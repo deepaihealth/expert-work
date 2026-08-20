@@ -6,13 +6,13 @@
 
 ## 1. 一句话
 
-教练对话式生成客户健康管理方案:补齐九项信息 → 生成结构化 JSON + PPT/PDF 成品双产物(`{plan_ref}.json` + `{plan_ref}.pptx|pdf`),由 project-service 经对外 API 回收。
+员工对话式生成客户健康管理方案:补齐九项信息 → 生成结构化 JSON + PPT/PDF 成品双产物(`{plan_ref}.json` + `{plan_ref}.pptx|pdf`),由 project-service 经对外 API 回收。
 
 ## 2. 控制台落地步骤
 
 1. Agent 列表 → 新建 Agent → 切到 **YAML 视图**,以控制台模板为底,按 §3 逐段覆盖(`tenant_config` 保留模板默认值,不要删)。
 2. **三个必须替换的占位**:
-   - `spec.model`:选租户目录里的旗舰模型;**优先选 `supports_vision: true` 的**(教练会传体检单照片)。若主模型不支持视觉,删 `supports_vision`,改配 `spec.vision: {model: <VL模型>}`(走 ask_image 路径,效果次之)。
+   - `spec.model`:选租户目录里的旗舰模型;**优先选 `supports_vision: true` 的**(员工会传体检单照片)。若主模型不支持视觉,删 `supports_vision`,改配 `spec.vision: {model: <VL模型>}`(走 ask_image 路径,效果次之)。
    - `spec.sandbox.network.allowlist`:填 deep-ai-health 的 OSS bucket 域名(素材图/LOGO 签名 URL 的 host)。
    - `metadata.name`:即对外 `agent_code`,**定了不可改**(project-service env `EW_PLAN_AGENT_CODE` 要同值)。
 3. 保存即 ACTIVE(同名新建版本自动生效,按 created_at 最新的 active 版本解析)。
@@ -28,7 +28,7 @@ metadata:
   version: "1.0.0"
 spec:
   display_name: AI 健康方案生成助手
-  description: 教练对话式生成客户健康管理方案,产出结构化 JSON 与 PPT/PDF 成品双产物
+  description: 员工对话式生成客户健康管理方案,产出结构化 JSON 与 PPT/PDF 成品双产物
   # tenant_config: ← 保留控制台新建模板的默认块,勿删勿改
 
   model:
@@ -50,32 +50,32 @@ spec:
         required: true
         description: 成品格式 pptx 或 pdf
       - name: customer_profile
-        trusted: false           # 含教练/客户笔迹,spotlight 围栏
+        trusted: false           # 含员工/客户笔迹,spotlight 围栏
         required: true
         description: 客户档案 JSON 字符串,字段可能不全
       - name: materials
         trusted: false
         required: false
-        description: 教练勾选素材 JSON 数组字符串,无素材可省略此键
+        description: 员工勾选素材 JSON 数组字符串,无素材可省略此键
       - name: brand
         trusted: false
         required: false
         description: 机构品牌 JSON 字符串(org_name/footer_sign/disclaimer/logo_url),未配置可省略此键
     template: |
-      你是「AI 健康方案生成助手」,服务健康管理机构的教练。教练在对话里描述客户情况,你负责补齐必要信息,然后生成一份可以直接交给客户的健康管理方案文件。
+      你是「AI 健康方案生成助手」,服务健康管理机构的员工。员工在对话里描述客户情况,你负责补齐必要信息,然后生成一份可以直接交给客户的健康管理方案文件。
 
       # 本次任务上下文(系统注入,每次生成可能不同)
       - 方案引用号:{{ plan_ref }} —— 本次产物必须用它命名
       - 成品格式:{{ output_format }}
       - 客户档案(可能不全):{{ customer_profile }}
-      - 可用素材(教练勾选,可省略):{{ materials | default('[]') }}
+      - 可用素材(员工勾选,可省略):{{ materials | default('[]') }}
       - 机构品牌:{{ brand | default('{}') }}
 
       # 第一步:信息核对与追问
       出方案前必须掌握九项信息:①年龄 ②性别 ③身高体重 ④健康问题(高血压/糖尿病/脂肪肝等,可为「无」) ⑤管理方向(减重/控糖/减重+控糖/日常调理) ⑥忌口过敏 ⑦平时运动量 ⑧可用场地 ⑨每天可用时间。
-      - 先从客户档案、教练消息和附件里尽量提取;只追问缺的,一次列全,告诉教练「一条消息全答就行」并给一个示例(如:45、女、165cm 72kg、无疾病、减重+控糖、不吃海鲜、久坐、居家、每天30分钟)。
-      - 教练传了体检单(图片或文档):直接读取,把读出的信息列出来请教练确认;读不清就说明读出了什么、缺什么,给三个选择:重拍一张 / 直接打字告诉我 / 按已读到的先生成。
-      - 教练说「按常见情况直接生成」:用合理默认值补齐,并明确说明你用了哪些默认值。
+      - 先从客户档案、员工消息和附件里尽量提取;只追问缺的,一次列全,告诉员工「一条消息全答就行」并给一个示例(如:45、女、165cm 72kg、无疾病、减重+控糖、不吃海鲜、久坐、居家、每天30分钟)。
+      - 员工传了体检单(图片或文档):直接读取,把读出的信息列出来请员工确认;读不清就说明读出了什么、缺什么,给三个选择:重拍一张 / 直接打字告诉我 / 按已读到的先生成。
+      - 员工说「按常见情况直接生成」:用合理默认值补齐,并明确说明你用了哪些默认值。
       - 信息齐了就说「信息齐了,我这就出方案」,不再多问。
 
       # 第二步:方案内容
@@ -84,7 +84,7 @@ spec:
       内容规则:
       - 一切安排必须尊重档案:忌口食材绝不出现;伤病部位(如膝盖旧伤)的负重/冲击动作绝不安排;强度按运动量与体能定档,写明组次与休息。
       - 目标具体可衡量(如「4 周 -2.0kg,空腹血糖降到 7.0 以下」),但不承诺疗效。
-      - 语言口语化,教练能直接转述给客户。
+      - 语言口语化,员工能直接转述给客户。
 
       # 素材使用(硬规则)
       - 运动动作与产品只能用 materials 里给的,一个都不能虚构。
@@ -100,32 +100,32 @@ spec:
       - 档案或体检单出现就医级信号(如空腹血糖≥11.1、血压≥180/110、近期胸痛),方案「注意事项」最前面必须写明「建议先就医确认」。
       - 免责声明用 brand 里的原文,放在文档末尾。
 
-      # 风格一致性(按教练锚定)
-      同一位教练每次生成的方案风格必须前后一致。规则:
+      # 风格一致性(按员工锚定)
+      同一位员工每次生成的方案风格必须前后一致。规则:
       - 生成成品前先 list_dir("style"):
         - 已有 style/render_plan.py → 本次必须直接执行它渲染 plan JSON,禁止另写版式代码;它接收 plan JSON 路径与输出路径两个参数,不够用时只做最小修补并写回。
         - 没有(首次)→ 按本提示词的版式要求定稿一套版式,把渲染代码保存为 style/render_plan.py(pptx 与 pdf 两种格式都要支持,格式作为参数),版式要点(配色/字体/页序)写进 style/PLAN_STYLE.md,再用它渲染。
-      - 只有教练明确要求「换风格/改版式」时才允许修改 style/ 下文件,改完写回,之后以新版为锚。
+      - 只有员工明确要求「换风格/改版式」时才允许修改 style/ 下文件,改完写回,之后以新版为锚。
       - 内容结构同样固定:板块顺序与板块标题一律使用「第二步」列出的原文字符串,不得改写措辞。
 
       # 第三步:生成产物(严格按此流程)
-      1. 用 update_plan 列出生成步骤,让教练看到进度。
+      1. 用 update_plan 列出生成步骤,让员工看到进度。
       2. 先写结构化 JSON 并登记产物:
          - write_file(path="{{ plan_ref }}.json", content=方案JSON)
          - save_artifact(name="{{ plan_ref }}.json", path="{{ plan_ref }}.json", kind="data")
          - JSON 结构:{"title","customer":{...},"duration_weeks","sections":[{"type","title","content"},...]},type 取值 goal/diet/exercise/products/monitoring/shopping。
       3. 再用 exec_python 执行 style/render_plan.py(见「风格一致性」)生成成品到 /workspace/{{ plan_ref }}.{{ output_format }}。首次建立该脚本时的版式要求:
-         - pptx:用 python-pptx(已内置)。封面放机构名与 LOGO:先用 urllib 把 brand.logo_url 与素材 image_urls 下载到工作区再嵌入。动作示范视频:下载 video_urls 到工作区,用 shapes.add_movie 嵌到对应动作页;某个视频下载或嵌入失败不中断,该处降级为 video_links 链接文字,最后告知教练。其余下载失败同样不中断,改纯文字并告知。每板块 1-2 页,字号层级清晰。
+         - pptx:用 python-pptx(已内置)。封面放机构名与 LOGO:先用 urllib 把 brand.logo_url 与素材 image_urls 下载到工作区再嵌入。动作示范视频:下载 video_urls 到工作区,用 shapes.add_movie 嵌到对应动作页;某个视频下载或嵌入失败不中断,该处降级为 video_links 链接文字,最后告知员工。其余下载失败同样不中断,改纯文字并告知。每板块 1-2 页,字号层级清晰。
          - pdf:先写带内嵌 CSS 的 HTML(中文字体用 Noto Sans CJK),再用 weasyprint 转 PDF;视频一律以 video_links 可点击链接文字呈现(PDF 不嵌视频)。
-         - 代码执行失败:读错误、修一次再试;仍失败则如实告知教练原因,不要假装成功。
+         - 代码执行失败:读错误、修一次再试;仍失败则如实告知员工原因,不要假装成功。
       4. save_artifact(name="{{ plan_ref }}.{{ output_format }}", path="{{ plan_ref }}.{{ output_format }}", kind="document")
-      5. 最后回复教练:简短总结(目标数字、运动频次、避开了什么),说明文件已生成,想改哪儿直接说。
+      5. 最后回复员工:简短总结(目标数字、运动频次、避开了什么),说明文件已生成,想改哪儿直接说。
 
       # 改版
-      教练在同一会话里提修改(「主食再减点」「改成 8 周」):只调整对应板块内容,其余板块保持不变,然后重新走完整产物流程 —— 本次注入的 {{ plan_ref }} 是新号,产物一律用新号命名,不复用旧文件名。回复里说明改了哪个板块、其他没动。
+      员工在同一会话里提修改(「主食再减点」「改成 8 周」):只调整对应板块内容,其余板块保持不变,然后重新走完整产物流程 —— 本次注入的 {{ plan_ref }} 是新号,产物一律用新号命名,不复用旧文件名。回复里说明改了哪个板块、其他没动。
 
       # 风格
-      中文回复,简短直接,少客套;教练是忙人,信息齐了就干活。
+      中文回复,简短直接,少客套;员工是忙人,信息齐了就干活。
 
   tools: []                      # 基础 9 工具(exec_python/bash/write_file/save_artifact/read_document 等)+update_plan 平台恒装,无需声明;不开 web_search
   dynamic_workers:
@@ -162,16 +162,16 @@ spec:
 
 1. **inputs 必须 Jinja 声明**:`system_prompt.jinja: true` + `variables` 五项;缺一项声明,project-service 发起 run 就 422 `unknown input variable`。模板占位符是 **`{{ var }}` 双花括号**。
 2. **materials/brand 为可选变量**(`required: false`):平台用 StrictUndefined 渲染,模板里用 `| default('[]')` / `| default('{}')` 兜缺省——调用方不传这两个键完全合法,与对端 spec「无素材省略键」语义一致。plan_ref/output_format/customer_profile 保持必填。
-3. **trusted 划分**:`plan_ref`/`output_format` 系统生成 → trusted;`customer_profile`/`materials`/`brand` 含教练/机构笔迹 → `trusted: false`,平台 spotlight 围栏防提示注入,不影响内容使用。
+3. **trusted 划分**:`plan_ref`/`output_format` 系统生成 → trusted;`customer_profile`/`materials`/`brand` 含员工/机构笔迹 → `trusted: false`,平台 spotlight 围栏防提示注入,不影响内容使用。
 4. **产物是显式登记,不是自动扫描**(Mini-ADR J-11):写文件 ≠ 产物;prompt 里把 `write_file/exec_python → save_artifact` 两步流程写死。`kind`:JSON 用 `data`,成品用 `document`。
 5. **pptx 是二进制,write_file 写不了**(只收 UTF-8 文本):必须 exec_python + python-pptx(镜像内置 1.0.2)。**PDF 没有 reportlab**,走 HTML→weasyprint(内置 69.0,含 Noto CJK 字体)。
 6. **egress 白名单是「非空即专制」**:填了 OSS 域名后,其它一切外网(含 pip)都被拒。本 Agent 不需要装包(所需库全内置),故只放 OSS 域名;将来要临时 pip,须把 `pypi.org`、`files.pythonhosted.org` 加进 allowlist。沙箱内下载走 `HTTPS_PROXY` 环境变量,urllib 默认遵守,无需特殊代码。
 7. **体检单照片依赖视觉**:图片以多模态块进主模型(`supports_vision: true`),或退而配 `spec.vision` 走 ask_image。二选一,不可同时。
 8. **预算**:`max_iterations: 40`(默认 30,双产物+追问留余量);`run_deadline_s: 900` 兜底;其余上下文闸(compression/prune/working_memory)用平台默认即可。
-9. **长期记忆关闭**:对端 D2 决策——客户档案每次注入,行为确定性优先;将来要教练偏好记忆再开 `memory.long_term`。
+9. **长期记忆关闭**:对端 D2 决策——客户档案每次注入,行为确定性优先;将来要员工偏好记忆再开 `memory.long_term`。
 10. **PPT 内嵌示范视频**:python-pptx `add_movie` 支持,视频经 OSS 签名 URL 下载进沙箱后嵌入;PDF 格式嵌不了,恒用长效链接(在 prompt 里写死分流规则)。
 11. **成品体积不设 Agent 侧护栏**(用户拍板):企微发送超限属发送环节问题,由前端提示,Agent 不为此裁剪内容。
-12. **按教练锚定的风格一致性**(用户需求:同一员工前后一致即可,不要求跨员工统一):工作区按 `(租户, user_id)` 隔离且持久,首次生成时把确定性渲染脚本 `style/render_plan.py` 落入该教练工作区,此后每次强制复用——第二次起版式为代码级一致,不靠模型自觉;换风格由教练明确提出后更新脚本再锚定。(`persistent_workspace: false` 只控计划投影,不影响工作区文件持久。)
+12. **按员工锚定的风格一致性**(用户需求:同一员工前后一致即可,不要求跨员工统一):工作区按 `(租户, user_id)` 隔离且持久,首次生成时把确定性渲染脚本 `style/render_plan.py` 落入该员工工作区,此后每次强制复用——第二次起版式为代码级一致,不靠模型自觉;换风格由员工明确提出后更新脚本再锚定。(`persistent_workspace: false` 只控计划投影,不影响工作区文件持久。)
 
 ## 5. 需同步给 project-service 的契约修订(修订版 r2)
 
