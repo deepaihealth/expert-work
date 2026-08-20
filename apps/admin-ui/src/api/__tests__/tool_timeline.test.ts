@@ -463,4 +463,3 @@ describe("parseToolCalls exec attribution", () => {
     expect(entry.execResult).toEqual({ stdout: "", stderr: "", exitCode: -1, timedOut: true });
   });
 });
-
