@@ -45,6 +45,21 @@ updates:
         update-types:
           - "version-update:semver-major"
 
+  # 文档站(独立 pnpm 包,自己的 pnpm-lock.yaml)。2026-08-20 之前不在本文件里,
+  # 攒出 vite 三条(1 high)+ esbuild 一条告警才发现——与上面 admin-ui 同一课。
+  # vite/esbuild 是 vitepress 的传递依赖,修复靠 package.json 里的 pnpm.overrides
+  # (vite ^6.4.3 / esbuild ^0.25.0);升 vitepress 大版本时连同 overrides 一起复核。
+  - package-ecosystem: "npm"
+    directory: "/apps/admin-ui/docs-site"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      docs-site-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
   # 沙箱镜像的 Python 依赖。注意合并这类 PR 只改仓库:镜像要重建推 ACR、
   # SandboxSet 换 tag,测试/生产集群才吃到新版本。
   - package-ecosystem: "pip"
