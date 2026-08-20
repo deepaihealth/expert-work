@@ -977,7 +977,7 @@ async def _persist_writer(
     batch: list[RunEventRecord] = []
     stopping = False
     while not stopping:
-        item: RunEventRecord | None | object
+        item: RunEventRecord | object | None
         try:
             item = await asyncio.wait_for(queue.get(), timeout=_PERSIST_FLUSH_INTERVAL_S)
         except TimeoutError:

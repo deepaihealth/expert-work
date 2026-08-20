@@ -1,6 +1,8 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.6
+    # 与 pyproject 的 ruff 依赖同步升级(0.16.3);两套版本并存会在格式器
+    # 行为变化时互相打架(2026-08-20 差点发生)。
+    rev: v0.16.3
     hooks:
       - id: ruff
         args: [--fix]

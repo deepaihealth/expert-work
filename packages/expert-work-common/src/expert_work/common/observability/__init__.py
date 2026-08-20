@@ -101,7 +101,6 @@ __all__ = [
     "init_tracing",
     "inject_context",
     "metrics_text",
-    "metrics_text",
     "validate_label_names",
     "validate_metric_name",
 ]
