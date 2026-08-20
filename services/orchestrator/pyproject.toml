@@ -39,7 +39,7 @@ dependencies = [
     # 波 1 —— ACS Agent Sandbox 接入。官方配方钉 <2.25.0(2.25 起的
     # breaking change 与 Agent Sandbox 的组件版本矩阵不兼容),见
     # docs/superpowers/specs/2026-08-03-sandbox-migration-design.md § 八.5
-    "e2b==2.24.0",
+    "e2b==2.39.1",
     "e2b-code-interpreter==2.7.0",
     # 私有协议扩展(见 orchestrator/tools/agent_sandbox.py 模块 docstring)。
     # 供应链风险:无 PyPI 发布,只能从 GitHub 装;[tool.uv.sources] 钉死到

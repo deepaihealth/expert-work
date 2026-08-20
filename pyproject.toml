@@ -88,7 +88,9 @@ expert-work-sandbox-supervisor = { workspace = true }
 line-length = 100
 target-version = "py312"
 src = ["packages/*/src", "services/*/src", "tools/*/src", "tests"]
-extend-exclude = [".venv", "dist", "build"]
+# *.md:ruff 0.16 起会格式化 Markdown 里的 Python 代码块。文档(尤其对外
+# docs-site 的示例)的排版是给读者的,不归格式器管 —— 全局排除。
+extend-exclude = [".venv", "dist", "build", "*.md"]
 
 [tool.ruff.lint]
 select = [

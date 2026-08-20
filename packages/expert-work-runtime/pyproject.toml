@@ -26,7 +26,7 @@ dependencies = [
     # Stream HX-7 — Langfuse SDK adapter behind the E.5 LangfuseClient
     # protocol (ADR-0005). v3 is OTel-based, sharing the existing
     # TracerProvider so trace ids line up across Langfuse and Tempo.
-    "langfuse>=3,<4",
+    "langfuse>=3,<5",
 ]
 
 [build-system]

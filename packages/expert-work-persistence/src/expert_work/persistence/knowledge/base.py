@@ -109,11 +109,11 @@ class KnowledgeStore(abc.ABC):
         *,
         tenant_id: UUID,
         kb_id: UUID,
-        description: str | None | _Unset = UNSET,
+        description: str | _Unset | None = UNSET,
         chunk_max_tokens: int | None = None,
         chunk_overlap_tokens: int | None = None,
         retrieval_top_k: int | None = None,
-        retrieval_score_threshold: float | None | _Unset = UNSET,
+        retrieval_score_threshold: float | _Unset | None = UNSET,
         retrieval_method: RetrievalMethod | None = None,
         rerank_enabled: bool | None = None,
     ) -> KnowledgeBase | None:

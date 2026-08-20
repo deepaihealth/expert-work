@@ -18,7 +18,12 @@ dependencies = [
     # asyncio tasks in this process, not a separate service.
     "expert-work-orchestrator",
     # Stream B.1 — FastAPI + Pydantic v2 + uvicorn.
-    "fastapi>=0.115,<1",
+    # <0.137:fastapi 0.137 起 include_router 变懒挂载(app.routes 里是
+    # _IncludedRouter,APIRoute 不再摊平;实测 0.136.3 摊平 / 0.137.2 起不摊),
+    # 控制面整族路由自审(console lockdown / external gate / NUL guard /
+    # reachability)会集体失明。迁移(改用 iter_route_contexts 并重组依赖
+    # 合成)单独立项:ROADMAP X-12;届时连同这条上界一起放开。
+    "fastapi>=0.115,<0.137",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",
@@ -39,7 +44,7 @@ dependencies = [
     # Stream C.5 — Redis client for the quota / rate-limit engine
     # (subsystems/16 § 3.2). ``redis-py>=5.0`` ships asyncio support
     # natively under ``redis.asyncio``.
-    "redis>=5.0,<7",
+    "redis>=5.0,<9",
     # Stream J.5 — knowledge-base document parsing. pymupdf4llm gives
     # high-quality Markdown (with headings) for PDFs; MarkItDown is the
     # fallback + handles office formats (docx / pptx / xlsx).
