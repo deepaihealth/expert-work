@@ -1588,6 +1588,7 @@ export interface TranslationKeys {
     run_id: string;
     thread_id: string;
     status: string;
+    trajectory_pairing_failed: string;
   };
   trace_toolbar: {
     title: string;
@@ -4822,6 +4823,8 @@ const en: TranslationKeys = {
     run_id: "Run ID",
     thread_id: "Thread ID",
     status: "Status",
+    trajectory_pairing_failed:
+      "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
   },
   trace_toolbar: {
     title: "Trace",
