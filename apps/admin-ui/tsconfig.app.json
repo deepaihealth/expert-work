@@ -15,7 +15,11 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+    // TS 6 起 ``node:*`` 内建模块要求 @types/node 进 program(TS2591)——
+    // 此前 5.9 靠解析回退带进来。仅两个测试文件用 node:fs 读 CSS fixture;
+    // ``?raw`` 走不通(vitest 的 CSS 处理把 .css?raw 变空串),故全局挂上。
+    "types": ["node"]
   },
   "include": ["src"]
 }
