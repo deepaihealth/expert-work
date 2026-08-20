@@ -83,14 +83,20 @@ _MAX_ZIP_UNCOMPRESSED_BYTES: Final[int] = 200 * 1024 * 1024
 #: hidden from the "agent products" browse — shared source of truth in
 #: :mod:`expert_work.persistence.workspace.layout`).
 _UPLOAD_DIR: Final[str] = WORKSPACE_UPLOADS_DIR
-_SAFE_STEM_RE: Final[re.Pattern[str]] = re.compile(r"[^A-Za-z0-9._-]+")
+#: Allowed stem characters: unicode word chars (letters of any script — CJK
+#: included — digits, underscore) plus ``.`` and ``-``. Path separators, NUL,
+#: whitespace, control/format chars (e.g. RTL override), and emoji are all
+#: outside ``\w`` and collapse to ``_``. The previous ASCII-only set is a
+#: strict subset, so every historically issued ``upload_id`` still validates.
+_SAFE_STEM_RE: Final[re.Pattern[str]] = re.compile(r"[^\w.-]+")
 
 
 def _safe_workspace_name(filename: str, ext: str) -> str:
     """Build a safe ``uploads/<stem><ext>`` workspace path from a user filename.
 
-    The stem is sanitised to ``[A-Za-z0-9._-]`` (path separators / NUL / ``..``
-    cannot survive); the extension comes from the trusted content type, not the
+    The stem is sanitised to unicode word chars plus ``.-`` (see
+    ``_SAFE_STEM_RE``) so Chinese filenames survive; path separators / NUL /
+    ``..`` cannot. The extension comes from the trusted content type, not the
     filename. Falls back to a uuid stem when nothing usable remains."""
     stem = _SAFE_STEM_RE.sub("_", filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]).strip("._")
     if not stem:
