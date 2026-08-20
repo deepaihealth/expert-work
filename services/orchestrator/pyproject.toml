@@ -21,7 +21,7 @@ dependencies = [
     # E.7 web_search Tavily HTTP client (also reused by future E.8 HTTP tool).
     "httpx>=0.27,<1",
     # E.9 MCP stdio adapter — Anthropic official Python SDK.
-    "mcp>=1.28.1,<2",
+    "mcp>=1.28.1,<3",
     # E.12 per-provider-key token bucket — wraps LLMProvider with an
     # async leaky bucket so over-limit calls await instead of bursting
     # into 429s and tripping the E.4 breaker.
