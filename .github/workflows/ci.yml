@@ -126,10 +126,14 @@ jobs:
     runs-on: ubuntu-latest
     # Image pulls on shared runners are bursty; allow this job to fail
     # without gating the PR (until self-hosted runners with warm Docker
-    # caches land). 2026-08-20: the suite's green runtime reached 24:36 —
-    # the old 25-min budget was killing fully green runs during teardown
-    # (pytest summary printed, then "operation was canceled"). 40 matches
-    # the unit job's budget; revisit if the suite keeps growing.
+    # caches land). 2026-08-20: main-branch baseline is 7-15 min, but a
+    # burst of ~8 concurrent runs hit Docker Hub throttling on the shared
+    # runner IPs and testcontainers pulls (inside pytest's clock) pushed
+    # runs to 24:36+ — the 25-min budget then killed fully green runs
+    # ("567 passed" printed, then "operation was canceled"). 40 buys
+    # burst headroom and matches the unit job; the structural fix is
+    # mirroring the testcontainers images (postgres/minio/pgbouncer) off
+    # Docker Hub.
     timeout-minutes: 40
     continue-on-error: true
     steps:
