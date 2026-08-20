@@ -327,8 +327,13 @@ test("real paired trajectory renders this run's ledger rows", async ({ page }) =
   await expect(
     page.getByTestId("console-traj-row").filter({ hasText: "run one's answer" }),
   ).toBeVisible();
-  // And the pairing-failed empty state is absent.
-  await expect(page.getByTestId("console-trajectory-empty")).not.toBeVisible();
+  // And the pairing-failed state (RunDetail's own bare <Empty>, no testid —
+  // TrajectoryView isn't even mounted on that path) is absent.
+  await expect(
+    page.getByText(
+      "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
+    ),
+  ).toHaveCount(0);
 });
 
 test("run detail with approval + plan passes axe (serious + critical)", async ({ page }) => {

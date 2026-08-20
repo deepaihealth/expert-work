@@ -217,6 +217,10 @@ export function RunDetail() {
     if (!threadId) return;
     let cancelled = false;
     setConvoTenant(null);
+    // Same-page thread switch: don't let the Schema tab keep fetching the
+    // previous thread's agent catalog while the new lookup is pending.
+    setAgentName("");
+    setAgentVersion("");
     getConversation(threadId, concreteTenantScope(apiTenantScope))
       .then((convo) => {
         if (cancelled) return;
@@ -248,11 +252,15 @@ export function RunDetail() {
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
   useEffect(() => {
+    // Reset BEFORE the guard: on a same-page thread switch the guard
+    // rejects the stale tenant below, and leaving ``historyLoaded`` true
+    // would flash the previous thread's (filtered-empty) trajectory as a
+    // misleading "no trajectory" state while the new lookup is pending.
+    setHistoryLoaded(false);
     // Ruling 4 — ``convoTenant.threadId !== threadId`` is the race guard:
     // a tenant resolved for a previous thread never scopes this thread's
     // history load (see the state's own comment above).
     if (!threadId || convoTenant === null || convoTenant.threadId !== threadId) return;
-    setHistoryLoaded(false);
     let cancelled = false;
     void loadHistory(threadId, convoTenant.tenantId).then(() => {
       if (!cancelled) setHistoryLoaded(true);
