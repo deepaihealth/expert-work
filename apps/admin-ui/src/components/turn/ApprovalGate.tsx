@@ -4,8 +4,8 @@
  * frame, without waiting for the terminal ``end`` frame + a poll.
  *
  * Lifted verbatim out of ``components/turn/TurnCard.tsx`` (调试台重设计 PR-B
- * Task 1) — TurnCard.tsx keeps re-exporting both names so existing importers
- * don't need to change until they migrate. No logic changed by the move.
+ * Task 1) — TurnCard.tsx itself was retired in PR-B Task 5. No logic changed
+ * by the move.
  */
 import { Button, Space, Typography } from "antd";
 import { AlertTriangle, Check, X } from "lucide-react";

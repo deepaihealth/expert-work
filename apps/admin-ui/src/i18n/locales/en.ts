@@ -393,10 +393,6 @@ export interface TranslationKeys {
     messages_empty: string;
     role_user: string;
     role_assistant: string;
-    runs_title: string;
-    runs_empty: string;
-    column_started: string;
-    view_run: string;
   };
   skills_tab: {
     title: string;
@@ -1304,18 +1300,11 @@ export interface TranslationKeys {
     detail_system_chars: string;
   };
   playground: {
-    session_label: string;
-    new_session: string;
     session_failed: string;
-    thread_id: string;
     input_placeholder: string;
     run: string;
     running: string;
     stop: string;
-    event_log: string;
-    event_count: string;
-    stream_failed: string;
-    empty_log: string;
     attach_image: string;
     attach_document: string;
     uploaded_docs_note: string;
@@ -1326,27 +1315,19 @@ export interface TranslationKeys {
     workspace_full: string;
     uploading: string;
     transcript_label: string;
-    turn_count: string;
     turn_running: string;
     turn_no_text: string;
     segment_commentary: string;
     turn_failed: string;
     usage_in: string;
     usage_out: string;
-    usage_total: string;
     usage_cache: string;
     usage_reasoning: string;
-    usage_cache_write: string;
     meta_finish: string;
-    meta_model: string;
-    reasoning_label: string;
     view_full_text: string;
     copy_all: string;
     copy_done: string;
     copy_failed: string;
-    events_label: string;
-    export_json: string;
-    export_json_tip: string;
     retry: string;
     workspace_label: string;
     workspace_refresh: string;
@@ -1364,11 +1345,8 @@ export interface TranslationKeys {
     file_delete_confirm: string;
     delete_ok: string;
     delete_cancel: string;
-    resumed_notice: string;
     history_divider: string;
     history_loading: string;
-    meta_steps: string;
-    meta_latency: string;
     view_run: string;
     feedback_up: string;
     feedback_down: string;
@@ -1380,98 +1358,16 @@ export interface TranslationKeys {
     approval_approve: string;
     approval_reject: string;
     approval_modify_hint: string;
-    history_button: string;
-    tool_count_one: string;
-    tool_count_other: string;
-    tool_failed_count: string;
-    state_memories: string;
-    state_failures: string;
-    state_reflections: string;
-    state_subagents: string;
-    state_signals: string;
-    state_retries: string;
-    state_per_step: string;
-    signal_no_progress: string;
-    signal_escalate: string;
-    retry_attempt: string;
-    state_section: string;
-    tl_step: string;
-    streaming_badge: string;
-    interrupted_badge: string;
-    ttft: string;
-    streaming_reasoning_label: string;
-    reasoning_summary: string;
-    tl_finish: string;
-    tl_tool_failed: string;
-    tl_final_answer: string;
-    tl_step_output: string;
-    tl_reasoning: string;
-    tl_expand: string;
-    tl_critique: string;
-    tl_legend_agent: string;
-    tl_legend_mem: string;
-    tl_legend_plan: string;
-    tl_legend_reflect: string;
-    tl_legend_marker: string;
-    tl_legend_approval: string;
     tl_importance: string;
-    tl_confidence: string;
-    tl_goal: string;
-    tl_duration: string;
-    tr_col_action: string;
-    tr_state_not_ready_title: string;
-    tr_state_not_ready_msg: string;
-    tr_state_unavailable_title: string;
-    tr_state_unavailable_msg: string;
-    tr_state_no_trace_title: string;
-    tr_state_no_trace_msg: string;
-    tr_detail_close: string;
-    rb_ok: string;
-    rb_failed_at: string;
-    rb_jump: string;
-    tr_detail_latency: string;
-    tr_detail_model: string;
-    tr_detail_tokens: string;
-    tr_detail_cost: string;
-    tr_io_llm_msgs: string;
-    tr_io_llm_msgs_hint: string;
-    tr_io_llm_out: string;
-    tr_io_llm_out_hint: string;
-    tr_io_tool_args: string;
-    tr_io_tool_args_hint: string;
-    tr_io_tool_result: string;
-    tr_io_tool_result_hint: string;
-    tr_io_in: string;
-    tr_io_out: string;
-    tr_msg_truncated: string;
-    tr_msg_copy: string;
-    tr_msg_raw: string;
     tr_msg_untrusted: string;
-    tr_msg_toolcall: string;
-    tr_msg_chars: string;
-    tr_purpose_primary: string;
-    tr_aux_llm: string;
-    tr_raw_error: string;
-    tl_worker_running: string;
-    tl_worker_success: string;
-    tl_worker_max_steps: string;
-    tl_worker_cancelled: string;
     tl_worker_task: string;
-    tl_worker_summary: string; // "{{steps}} steps · {{calls}} LLM calls · {{duration}}"
-    tl_worker_children: string;
     task_result: string;
     lifecycle_created: string;
     lifecycle_fired: string;
     lifecycle_completed: string;
     fire_pending: string;
-    gantt_expand: string;
-    gantt_degraded: string;
   };
   session_history: {
-    title: string;
-    search_placeholder: string;
-    filter_status: string;
-    filter_all: string;
     empty: string;
     empty_search: string;
     load_more: string;
@@ -1492,29 +1388,8 @@ export interface TranslationKeys {
     time_minutes: string;
     time_hours: string;
     time_days: string;
-    status_active: string;
-    status_paused: string;
-    status_completed: string;
-    status_failed: string;
-    status_cancelled: string;
-    status_archived: string;
-  };
-  event_stream: {
-    title: string;
-    connecting: string;
-    event_count: string;
-    stream_failed: string;
-    empty: string;
-    view_timeline: string;
-    view_raw: string;
-    view_exact: string;
-    compaction_label: string;
-    compaction_passes: string;
-    compaction_reduction: string;
-    compaction_summary_chars: string;
   };
   tool_timeline: {
-    empty: string;
     mcp_badge: string;
     builtin_badge: string;
     status_pending: string;
@@ -1556,18 +1431,14 @@ export interface TranslationKeys {
     workspace_drift_body: string;
   };
   plan_panel: {
-    title: string;
-    progress: string;
     edit: string;
     cancel: string;
     save: string;
-    saved: string;
     locked_while_running: string;
     goal_placeholder: string;
     step_placeholder: string;
     add_step: string;
     remove_step: string;
-    no_plan: string;
     status_pending: string;
     status_in_progress: string;
     status_completed: string;
@@ -1576,15 +1447,6 @@ export interface TranslationKeys {
     failed_to_load: string;
     back_to_conversation: string;
     thread_label: string;
-    awaiting_approval: string;
-    reason_kind: string;
-    requested_at: string;
-    timeout_at: string;
-    proposed_args: string;
-    approve: string;
-    reject: string;
-    approved: string;
-    rejected: string;
     run_metadata: string;
     run_id: string;
     thread_id: string;
@@ -1592,15 +1454,7 @@ export interface TranslationKeys {
     trajectory_pairing_failed: string;
   };
   trace_toolbar: {
-    title: string;
-    no_trace: string;
-    copy_aria: string;
-    copied: string;
     open_in_langfuse: string;
-    langfuse_unconfigured_hint: string;
-  };
-  trace: {
-    breakdown_title: string;
   };
   approval_badge: {
     aria_label: string;
@@ -2925,10 +2779,6 @@ export interface TranslationKeys {
     modify_hint: string;
   };
   runs_page: {
-    column_run_id: string;
-    column_status: string;
-    column_duration: string;
-    column_tokens: string;
     tokens_tip: string;
     duration_running: string;
     summary_title: string;
@@ -3536,10 +3386,6 @@ const en: TranslationKeys = {
     messages_empty: "No messages recorded for this conversation.",
     role_user: "User",
     role_assistant: "Agent",
-    runs_title: "Runs",
-    runs_empty: "No runs in this conversation.",
-    column_started: "Started",
-    view_run: "View run",
   },
   skills_tab: {
     title: "Skills authored by this agent",
@@ -4531,18 +4377,11 @@ const en: TranslationKeys = {
     detail_system_chars: "{{n}} chars",
   },
   playground: {
-    session_label: "Session",
-    new_session: "New session",
     session_failed: "Failed to create session",
-    thread_id: "thread",
     input_placeholder: "Type a prompt for the agent…",
     run: "Run",
     running: "Running…",
     stop: "Stop",
-    event_log: "Event log",
-    event_count: "{{n}} events",
-    stream_failed: "Stream failed",
-    empty_log: "No events yet — click Run to start.",
     attach_image: "Attach image",
     attach_document: "Attach document",
     uploaded_docs_note: "[Uploaded documents — read them with read_document]",
@@ -4553,28 +4392,19 @@ const en: TranslationKeys = {
     workspace_full: "Workspace is full — delete some files and retry",
     uploading: "Uploading…",
     transcript_label: "Conversation",
-    turn_count: "{{n}} turns",
     turn_running: "Running…",
     turn_no_text: "(no text answer)",
     segment_commentary: "Progress note",
     turn_failed: "This turn's run failed",
     usage_in: "in",
     usage_out: "out",
-    usage_total: "total",
     usage_cache: "cached",
     usage_reasoning: "reasoning",
-    usage_cache_write: "Cache write",
     meta_finish: "Finish",
-    meta_model: "Model",
-    reasoning_label: "Reasoning",
     view_full_text: "View full text",
     copy_all: "Copy all",
     copy_done: "Copied to clipboard",
     copy_failed: "Copy failed — select the text manually",
-    events_label: "Events",
-    export_json: "Export JSON",
-    export_json_tip:
-      "Export this turn's full event stream (authoritative backend record) as JSON",
     retry: "Retry",
     workspace_label: "Workspace",
     workspace_refresh: "Refresh workspace",
@@ -4593,12 +4423,8 @@ const en: TranslationKeys = {
     file_delete_confirm: "Permanently delete this file? This cannot be undone.",
     delete_ok: "Delete",
     delete_cancel: "Cancel",
-    resumed_notice:
-      "Continuing an existing thread — prior conversation loaded below.",
     history_divider: "— new messages below —",
     history_loading: "Loading debug data…",
-    meta_steps: "steps",
-    meta_latency: "latency",
     view_run: "View run",
     feedback_up: "Good answer",
     feedback_down: "Bad answer",
@@ -4610,102 +4436,17 @@ const en: TranslationKeys = {
     approval_approve: "Approve",
     approval_reject: "Reject",
     approval_modify_hint: "Edit arguments on the run-detail page.",
-    history_button: "History",
-    tool_count_one: "{{count}} tool",
-    tool_count_other: "{{count}} tools",
-    tool_failed_count: "{{count}} failed",
-    state_memories: "Recalled memory",
-    state_failures: "Tool failures",
-    state_reflections: "Reflections",
-    state_subagents: "Subagent calls",
-    state_signals: "Run signals",
-    state_retries: "Retries",
-    state_per_step: "Per-step tokens",
-    signal_no_progress: "No-progress streak",
-    signal_escalate: "Escalate next",
-    retry_attempt: "attempt {{n}} · {{cls}} · backoff {{s}}s",
-    state_section: "Run state",
-    tl_step: "Step {{n}}",
-    streaming_badge: "streaming…",
-    interrupted_badge: "interrupted",
-    ttft: "TTFT {{d}}",
-    streaming_reasoning_label: "Thinking…",
-    reasoning_summary: "Thought for {{d}}",
-    tl_finish: "finish: {{reason}}",
-    tl_tool_failed: "Tool failed → retry",
-    tl_final_answer: "Final answer",
-    tl_step_output: "Step output",
-    tl_reasoning: "Reasoning (this LLM call)",
-    tl_expand: "Expand",
-    tl_critique: "critique",
-    tl_legend_agent: "agent (LLM step: reasoning + tool / answer)",
-    tl_legend_mem: "memory_recall / writeback",
-    tl_legend_plan: "planner",
-    tl_legend_reflect: "reflect (accept/revise)",
-    tl_legend_marker: "compaction / retry / error",
-    tl_legend_approval: "approval (paused for review)",
     tl_importance: "importance {{v}}",
-    tl_confidence: "confidence {{v}}",
-    tl_goal: "Goal: {{text}}",
-    tl_duration: "step duration",
-    tr_col_action: "Action",
-    tr_state_not_ready_title: "Processing",
-    tr_state_not_ready_msg:
-      "The run just finished — the trace is still being ingested (about 1 second). Refresh shortly to see exact timings.",
-    tr_state_unavailable_title: "Unavailable",
-    tr_state_unavailable_msg:
-      "The trace service is temporarily unreachable. Try again later for exact timings — the rest of this run's debug data is unaffected.",
-    tr_state_no_trace_title: "No trace",
-    tr_state_no_trace_msg:
-      "This run has no associated trace (Langfuse wasn't enabled, or it's an older run).",
-    tr_detail_close: "Close",
-    rb_ok: "Succeeded",
-    rb_failed_at: "Failed at {{label}}",
-    rb_jump: "Jump to error ↓",
-    tr_detail_latency: "duration",
-    tr_detail_model: "model",
-    tr_detail_tokens: "tokens",
-    tr_detail_cost: "cost",
-    tr_io_llm_msgs: "Messages",
-    tr_io_llm_msgs_hint: "The full context sent to the model",
-    tr_io_llm_out: "Reply",
-    tr_io_llm_out_hint: "The model's output",
-    tr_io_tool_args: "Arguments",
-    tr_io_tool_args_hint: "The input passed to the tool",
-    tr_io_tool_result: "Result",
-    tr_io_tool_result_hint: "What the tool returned",
-    tr_io_in: "Input",
-    tr_io_out: "Output",
-    tr_msg_truncated: "Truncated {{n}} chars",
-    tr_msg_copy: "Copy",
-    tr_msg_raw: "View raw",
     tr_msg_untrusted: "contains untrusted content",
-    tr_msg_toolcall: "→ called {{name}}",
-    tr_msg_chars: "{{n}} chars",
-    tr_purpose_primary: "Primary reasoning",
-    tr_aux_llm: "Auxiliary LLM call",
-    tr_raw_error: "Failed to load raw content",
-    tl_worker_running: "running",
-    tl_worker_success: "done",
-    tl_worker_max_steps: "step limit",
-    tl_worker_cancelled: "cancelled",
     tl_worker_task: "Task",
-    tl_worker_summary: "{{steps}} steps · {{calls}} LLM calls · {{duration}}",
-    tl_worker_children: "child workers",
     task_result: "Task result",
     lifecycle_created: "Created",
     lifecycle_fired: "Fired",
     lifecycle_completed: "Completed",
     fire_pending:
       "The result hasn't landed yet — the run is still going. Reopen this conversation later to see it.",
-    gantt_expand: "Expand",
-    gantt_degraded: "Timeline approximated by event order (server timestamps unavailable)",
   },
   session_history: {
-    title: "Session history",
-    search_placeholder: "Search title…",
-    filter_status: "Filter by status",
-    filter_all: "All",
     empty: "No sessions yet — send a message to start.",
     empty_search: "No matching sessions.",
     load_more: "Load more",
@@ -4726,29 +4467,8 @@ const en: TranslationKeys = {
     time_minutes: "{{n}}m ago",
     time_hours: "{{n}}h ago",
     time_days: "{{n}}d ago",
-    status_active: "Active",
-    status_paused: "Paused",
-    status_completed: "Completed",
-    status_failed: "Failed",
-    status_cancelled: "Cancelled",
-    status_archived: "Archived",
-  },
-  event_stream: {
-    title: "Event stream",
-    connecting: "Connecting…",
-    event_count: "{{n}} events",
-    stream_failed: "Stream failed",
-    empty: "No events yet.",
-    view_timeline: "Tool calls",
-    view_raw: "Raw events",
-    view_exact: "Execution trace",
-    compaction_label: "Context compacted",
-    compaction_passes: "{{n}} pass(es)",
-    compaction_reduction: "{{before}} → {{after}} tokens (−{{pct}}%)",
-    compaction_summary_chars: "summary {{n}} chars",
   },
   tool_timeline: {
-    empty: "No tool calls yet.",
     mcp_badge: "MCP",
     builtin_badge: "builtin",
     status_pending: "running",
@@ -4792,18 +4512,14 @@ const en: TranslationKeys = {
       "A write-capable tool (write_file / edit_file / bash) ran in this user's workspace after the approval was requested. Any files the approved command reads may differ from what you're reviewing. This is a forensic signal and does not block execution.",
   },
   plan_panel: {
-    title: "Plan",
-    progress: "{{done}}/{{total}} completed",
     edit: "Edit plan",
     cancel: "Cancel",
     save: "Save plan",
-    saved: "Plan saved — the workspace PLAN.md syncs on the next turn.",
     locked_while_running: "The agent owns the plan while a run is live.",
     goal_placeholder: "Goal — one sentence",
     step_placeholder: "Step description",
     add_step: "Add step",
     remove_step: "Remove step",
-    no_plan: "The agent has not made a plan yet.",
     status_pending: "pending",
     status_in_progress: "in progress",
     status_completed: "completed",
@@ -4812,15 +4528,6 @@ const en: TranslationKeys = {
     failed_to_load: "Failed to load run",
     back_to_conversation: "Conversation",
     thread_label: "Thread",
-    awaiting_approval: "awaiting approval",
-    reason_kind: "Reason",
-    requested_at: "Requested",
-    timeout_at: "Timeout",
-    proposed_args: "Proposed arguments",
-    approve: "Approve",
-    reject: "Reject",
-    approved: "Approved — run resuming.",
-    rejected: "Rejected — run cancelled.",
     run_metadata: "Run metadata",
     run_id: "Run ID",
     thread_id: "Thread ID",
@@ -4829,16 +4536,7 @@ const en: TranslationKeys = {
       "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
   },
   trace_toolbar: {
-    title: "Trace",
-    no_trace: "No trace recorded for this run.",
-    copy_aria: "Copy trace ID",
-    copied: "Trace ID copied",
     open_in_langfuse: "Open in Langfuse",
-    langfuse_unconfigured_hint:
-      "Set VITE_LANGFUSE_BASE_URL to enable the deep link.",
-  },
-  trace: {
-    breakdown_title: "Entry chain + first generation {{d}}",
   },
   approval_badge: {
     aria_label: "Pending approvals",
@@ -6325,10 +6023,6 @@ const en: TranslationKeys = {
       "To approve with edited arguments, open the run and use the approval card there.",
   },
   runs_page: {
-    column_run_id: "Run ID",
-    column_status: "Status",
-    column_duration: "Duration",
-    column_tokens: "Tokens",
     tokens_tip: "{{input}} in / {{output}} out · {{calls}} LLM call(s)",
     duration_running: "running",
     summary_title: "This run",

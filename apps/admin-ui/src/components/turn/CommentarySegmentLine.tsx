@@ -6,8 +6,8 @@
  * instead of hand-copied).
  *
  * Lifted verbatim out of ``components/turn/TurnCard.tsx`` (调试台重设计 PR-B
- * Task 1) — TurnCard.tsx keeps re-exporting this name so existing importers
- * don't need to change until they migrate. No logic changed by the move.
+ * Task 1) — TurnCard.tsx itself was retired in PR-B Task 5. No logic changed
+ * by the move.
  */
 import { Typography } from "antd";
 import { MessageSquareText } from "lucide-react";
