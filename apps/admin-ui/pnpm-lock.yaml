@@ -26,7 +26,7 @@ importers:
         version: 4.7.0(monaco-editor@0.55.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@rjsf/antd':
         specifier: ^5.24.13
-        version: 5.24.13(@ant-design/icons@5.6.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@rjsf/core@5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8))(@rjsf/utils@5.24.13(react@19.2.8))(antd@5.29.3(date-fns@2.30.0)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(dayjs@1.11.21)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+        version: 5.24.13(@ant-design/icons@5.6.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@rjsf/core@5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8))(@rjsf/utils@5.24.13(react@19.2.8))(antd@5.29.3(date-fns@2.30.0)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(dayjs@1.11.22)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@rjsf/core':
         specifier: ^5.24.13
         version: 5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8)
@@ -43,8 +43,8 @@ importers:
         specifier: ^1.19.0
         version: 1.19.0
       dayjs:
-        specifier: ^1.11.21
-        version: 1.11.21
+        specifier: ^1.11.22
+        version: 1.11.22
       i18next:
         specifier: ^26.3.6
         version: 26.3.6(typescript@5.9.3)
@@ -1325,8 +1325,8 @@ packages:
     resolution: {integrity: sha512-fnULvOpxnC5/Vg3NCiWelDsLiUc9bRwAPs/+LfTLNvetFCtCTN+yQz15C/fs4AwX1R9K5GLtLfn8QW+dWisaAw==}
     engines: {node: '>=0.11'}
 
-  dayjs@1.11.21:
-    resolution: {integrity: sha512-98IT+HOahAisibz/yjKbzuOBwYcjJ7BCLPzARyHiyEBmRz4fatF+KPJszEHXsGYjUG234aH/cOjW1wwTbKUZlA==}
+  dayjs@1.11.22:
+    resolution: {integrity: sha512-1YRnxzt/AabP3GHxnaB9/b+ZScCKu5TeF+co+BWG+lnWVIwEcTFc1FVE0WLNmNO3sA6GGXL40i5qkHfbLzpwrg==}
 
   debug@4.4.3:
     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
@@ -1373,8 +1373,8 @@ packages:
   dom-align@1.12.4:
     resolution: {integrity: sha512-R8LUSEay/68zE5c8/3BDxiTEvgb4xZTF0RKmAHfiEVN3klfIpXfi2/QCoiWPccVQ0J/ZGdz9OjzL4uJEP/MRAw==}
 
-  dompurify@3.4.13:
-    resolution: {integrity: sha512-2vmYIoqjze2d+kakP8S/nS5shfsl587kzwEjcGlTdiksUVgFHnFCsLYDVj/JNqJVOQZGSYBTmuycv0PodwmnMQ==}
+  dompurify@3.4.14:
+    resolution: {integrity: sha512-dVoH9z+MY+C9IilgGCk3YfFqjLi3fChm2OiKJMzh6axrJ5qwxqWaZamgmHrpv22CN/KdbZJuGEGgfQoL00LTdg==}
 
   dunder-proto@1.0.1:
     resolution: {integrity: sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==}
@@ -3117,14 +3117,14 @@ snapshots:
       react-dom: 19.2.8(react@19.2.8)
       react-is: 19.2.8
 
-  '@rjsf/antd@5.24.13(@ant-design/icons@5.6.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@rjsf/core@5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8))(@rjsf/utils@5.24.13(react@19.2.8))(antd@5.29.3(date-fns@2.30.0)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(dayjs@1.11.21)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+  '@rjsf/antd@5.24.13(@ant-design/icons@5.6.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(@rjsf/core@5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8))(@rjsf/utils@5.24.13(react@19.2.8))(antd@5.29.3(date-fns@2.30.0)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8))(dayjs@1.11.22)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
     dependencies:
       '@ant-design/icons': 5.6.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@rjsf/core': 5.24.13(@rjsf/utils@5.24.13(react@19.2.8))(react@19.2.8)
       '@rjsf/utils': 5.24.13(react@19.2.8)
       antd: 5.29.3(date-fns@2.30.0)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       classnames: 2.5.1
-      dayjs: 1.11.21
+      dayjs: 1.11.22
       lodash: 4.18.1
       lodash-es: 4.18.1
       rc-picker: 2.7.6(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -3715,7 +3715,7 @@ snapshots:
       '@rc-component/trigger': 2.3.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       classnames: 2.5.1
       copy-to-clipboard: 3.3.3
-      dayjs: 1.11.21
+      dayjs: 1.11.22
       rc-cascader: 3.34.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-checkbox: 3.5.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-collapse: 3.9.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -3731,7 +3731,7 @@ snapshots:
       rc-motion: 2.9.5(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-notification: 5.6.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-pagination: 5.1.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
-      rc-picker: 4.11.3(date-fns@2.30.0)(dayjs@1.11.21)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      rc-picker: 4.11.3(date-fns@2.30.0)(dayjs@1.11.22)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-progress: 4.0.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-rate: 2.13.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-resize-observer: 1.4.3(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -3915,7 +3915,7 @@ snapshots:
     dependencies:
       '@babel/runtime': 7.29.7
 
-  dayjs@1.11.21: {}
+  dayjs@1.11.22: {}
 
   debug@4.4.3:
     dependencies:
@@ -3947,7 +3947,7 @@ snapshots:
 
   dom-align@1.12.4: {}
 
-  dompurify@3.4.13:
+  dompurify@3.4.14:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
@@ -4348,7 +4348,7 @@ snapshots:
 
   monaco-editor@0.55.1:
     dependencies:
-      dompurify: 3.4.13
+      dompurify: 3.4.14
       marked: 14.0.0
 
   ms@2.1.3: {}
@@ -4609,7 +4609,7 @@ snapshots:
       '@babel/runtime': 7.29.7
       classnames: 2.5.1
       date-fns: 2.30.0
-      dayjs: 1.11.21
+      dayjs: 1.11.22
       moment: 2.30.1
       rc-trigger: 5.3.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       rc-util: 5.44.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -4617,7 +4617,7 @@ snapshots:
       react-dom: 19.2.8(react@19.2.8)
       shallowequal: 1.1.0
 
-  rc-picker@4.11.3(date-fns@2.30.0)(dayjs@1.11.21)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
+  rc-picker@4.11.3(date-fns@2.30.0)(dayjs@1.11.22)(moment@2.30.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
     dependencies:
       '@babel/runtime': 7.29.2
       '@rc-component/trigger': 2.3.1(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -4629,7 +4629,7 @@ snapshots:
       react-dom: 19.2.8(react@19.2.8)
     optionalDependencies:
       date-fns: 2.30.0
-      dayjs: 1.11.21
+      dayjs: 1.11.22
       moment: 2.30.1
 
   rc-progress@4.0.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
