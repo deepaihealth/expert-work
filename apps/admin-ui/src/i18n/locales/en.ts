@@ -1361,7 +1361,6 @@ export interface TranslationKeys {
     tl_importance: string;
     tr_msg_untrusted: string;
     tl_worker_task: string;
-    tl_worker_summary: string; // "{{steps}} steps · {{calls}} LLM calls · {{duration}}"
     task_result: string;
     lifecycle_created: string;
     lifecycle_fired: string;
@@ -4440,7 +4439,6 @@ const en: TranslationKeys = {
     tl_importance: "importance {{v}}",
     tr_msg_untrusted: "contains untrusted content",
     tl_worker_task: "Task",
-    tl_worker_summary: "{{steps}} steps · {{calls}} LLM calls · {{duration}}",
     task_result: "Task result",
     lifecycle_created: "Created",
     lifecycle_fired: "Fired",

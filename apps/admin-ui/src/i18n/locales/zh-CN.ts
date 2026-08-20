@@ -1423,7 +1423,6 @@ const zhCN: TranslationKeys = {
     tl_importance: "重要性 {{v}}",
     tr_msg_untrusted: "含不可信内容",
     tl_worker_task: "任务",
-    tl_worker_summary: "{{steps}} 步 · {{calls}} 次 LLM · {{duration}}",
     task_result: "任务结果",
     lifecycle_created: "已创建",
     lifecycle_fired: "已触发",
