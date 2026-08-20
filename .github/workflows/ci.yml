@@ -124,10 +124,13 @@ jobs:
   test-integration:
     name: Test (integration)
     runs-on: ubuntu-latest
-    # Image pulls on shared runners are bursty; budget 25 min and allow
-    # this job to fail without gating the PR (until self-hosted runners
-    # with warm Docker caches land).
-    timeout-minutes: 25
+    # Image pulls on shared runners are bursty; allow this job to fail
+    # without gating the PR (until self-hosted runners with warm Docker
+    # caches land). 2026-08-20: the suite's green runtime reached 24:36 —
+    # the old 25-min budget was killing fully green runs during teardown
+    # (pytest summary printed, then "operation was canceled"). 40 matches
+    # the unit job's budget; revisit if the suite keeps growing.
+    timeout-minutes: 40
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
