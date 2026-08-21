@@ -16,6 +16,10 @@ updates:
         patterns:
           - "*"
     ignore:
+      # e2b 2.25+ 客户端强制 e2b_ 前缀 key 校验,与 ACS Agent Sandbox 私有协议
+      # 不兼容(2026-08-21 真栈事故);升级走 ROADMAP X-13(需重跑沙箱契约探针)。
+      - dependency-name: "e2b"
+      - dependency-name: "e2b-code-interpreter"
       # mcp 2.x 是真迁移不是升级:SDK 换 httpx2(httpx 2.0 的改名分发包),
       # streamable_http_client 签名从 2 元组变 3 元组、要 httpx2.AsyncClient
       # (orchestrator/tools/mcp.py:606-609)。混进周更组会让整组 4 个 CI job

@@ -39,8 +39,8 @@ dependencies = [
     # 波 1 —— ACS Agent Sandbox 接入。官方配方钉 <2.25.0(2.25 起的
     # breaking change 与 Agent Sandbox 的组件版本矩阵不兼容),见
     # docs/superpowers/specs/2026-08-03-sandbox-migration-design.md § 八.5
-    "e2b==2.39.1",
-    "e2b-code-interpreter==2.9.1",
+    "e2b==2.24.0",  # ⚠️ 2.25+ 客户端强制校验 key 必须 e2b_ 前缀,ACS 私有协议 key 过不了(2026-08-21 真栈事故);升级走 ROADMAP X-13,需重跑沙箱契约探针
+    "e2b-code-interpreter==2.7.0",  # 与 e2b==2.24.0 配套的已验证矩阵,同受 X-13 管
     # 私有协议扩展(见 orchestrator/tools/agent_sandbox.py 模块 docstring)。
     # 供应链风险:无 PyPI 发布,只能从 GitHub 装;[tool.uv.sources] 钉死到
     # 探针实测过的确切 commit(ce3b859c,2026-08-04),不跟随上游分支头移动 ——
