@@ -1,5 +1,7 @@
 # 剩余工作总清单(全项目待办唯一入口)
 
+> 📦 2026-08-21 清理:已收官 program 的历史 plans/specs(163 个文件)已从工作树移除,需要时从 git 历史找(该日期前的任意 commit);`.superpowers/` 执行台账归档在 `~/expert-work-superpowers-archive-20260821.tar.gz`。本文件引用的留存文档不受影响。
+
 > 原为本机 git-ignored 文件 `.superpowers/sdd/ROADMAP-2026-08-13.md`,2026-08-17 搬进仓库,此后以本文件为唯一入口。
 > 各 program 的完整执行历史仍在各自的(本机)`.superpowers/sdd/<plan>/progress.md`;入仓的设计与计划在
 > `docs/superpowers/specs/` 与 `docs/superpowers/plans/`。
