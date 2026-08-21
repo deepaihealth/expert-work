@@ -13,7 +13,7 @@
 1. Agent 列表 → 新建 Agent → 切到 **YAML 视图**,以控制台模板为底,按 §3 逐段覆盖(`tenant_config` 保留模板默认值,不要删)。
 2. **四个必须替换的占位**:
    - `spec.model`:选租户目录里的旗舰模型;**优先选 `supports_vision: true` 的**(员工会传体检单照片)。若主模型不支持视觉,删 `supports_vision`,改配 `spec.vision: {model: <VL模型>}`。
-   - `spec.sandbox.network.allowlist`:填 deep-ai-health 的 OSS bucket 域名(`org_logo` 与素材视频下载都走它)。
+   - `spec.sandbox.network.allowlist`:**留空数组 = 全公网放行**(内网/SSRF 仍被平台强制拦截,每笔出网都有审计;用户拍板先开放,后续要收紧再填域名白名单即可,改 manifest 存新版本即生效)。
    - `spec.tools` 里的 MCP 块:填**深护智康 MCP** 在本租户 MCP 注册表里的 server 名(前置依赖:先在控制台 MCP 注册表登记该 server 并启用);`allow_tools` 已写死为只读七件套,勿加入任何写操作类工具。
    - `metadata.name`:即对外 `agent_code`,**定了不可改**(project-service env `EW_PLAN_AGENT_CODE` 要同值)。
 3. 保存即 ACTIVE(同名新建版本自动生效,按 created_at 最新的 active 版本解析)。
@@ -216,8 +216,7 @@ spec:
     resources: { cpu: "1.0", memory: "1Gi", pids: 256, timeout_s: 600 }
     network:
       egress: proxy
-      allowlist:
-        - <your-bucket>.oss-cn-hangzhou.aliyuncs.com   # ← 占位:org_logo/素材视频下载的域名
+      allowlist: []               # 空=全公网放行(SSRF 仍拦、全量审计);用户拍板先开放,收紧时再填域名
       denylist: []
     filesystem:
       readonly_root: true
