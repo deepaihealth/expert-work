@@ -24,7 +24,7 @@
   设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
 - **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 与 X-3~X-10、
   「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)、
-  ~~「调试台 follow-up」D-1~D-4~~(✅ 2026-08-20 全清)。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
+  ~~「调试台 follow-up」D-1~D-4~~(✅ 2026-08-20 全清);D-5/D-6(对话页 live 视图+操作面)2026-08-21 立项。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
   **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点)。
 
 ---
@@ -387,7 +387,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 ---
 
-## D · 调试台 program follow-up —— ✅ **全清(2026-08-20 收官当天一波做掉)**
+## D · 调试台 program follow-up —— D-1~D-4 ✅ 全清(2026-08-20);D-5/D-6 待做(2026-08-21 立项)
 
 | # | 事项 | 结果 |
 |---|---|---|
@@ -395,6 +395,8 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | D-2 | RunDetail 切线程竞态守卫(Ruling 4) | ✅ `convoTenant` 状态改为 `{threadId, tenantId}` 打上来源线程标签,history 效果拒绝错线程的 tenant;单测用 `useNavigate` 同页切线程驱动潜伏帧,变异自证(拆守卫→红) |
 | D-3 | `runs_page.summary_resume` 死 i18n 键 | ✅ 三处(en 类型/en 值/zh-CN)全删,全仓零残留 |
 | D-4 | `RecordDetails.tsx:241` 既有占位行空 `<dt>` | ✅ **已被 PR-B 顺手修掉**(占位行已是 `<dl>` 外的散文 `<p>`,注释明写避免空 `<dt>`),本波仅核实 |
+| D-5 | **对话详情页:按轮重建 + 尾轮 live**(源头:running/paused 线程整页降级平铺,可观测性全瞎;2026-08-21 真栈截图对比确认) | 现状=重建 all-or-nothing,线程内任一 run 未终局整页降级(终局历史轮陪葬)。改法:①按轮重建——终局 run 照常富卡,未终局尾轮先给状态卡(徽标+已收步数/耗时+跳 RunDetail/去审批入口);②尾轮接 `GET /runs/{id}/events?since_seq=` replay+live SSE,轮次卡实时增量填充(= playground 只读版)。坑:usePlanCard 只可喂严格递增帧;token 帧不落库,live 为步骤级非逐字。约 1-2 PR |
+| D-6 | **对话详情页操作面:批/拒/取消**(依赖 D-5) | paused 轮就地审批(approve/reject)+ running 轮取消,三个都有才算「看到即可处置」。主要工作量=按角色 gate(对话页现为只读定位,操作按钮按权限显隐,防只读用户误触);按钮与后端端点全现成。约 1 PR |
 
 ---
 
