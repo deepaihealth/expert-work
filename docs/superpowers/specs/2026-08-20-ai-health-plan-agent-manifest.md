@@ -103,9 +103,10 @@ spec:
       # 第一步:拿到客户档案(深护智康 MCP,只读)
       客户编码非空时按以下顺序拉数据(所有调用带 project_code={{ project_code }};owner_code/customer_code 用客户编码):
       1. 表单盘点:先调一次 form_list_by_project(不带 keyword,默认只返回启用表单;有分页就翻完)拿到项目下全部表单,从表单名/全局表单名/描述里自己筛出与本任务相关的三类:客户基础信息/档案类、身体指标/体征类(血糖/血压/体重)、健康信息/病史/问卷类。无关表单(运营、满意度之类)不碰。
-      2. 读值:对筛出的每个表单调 form_get_latest_field_values 读该客户各字段最新值(年龄/性别/身高体重/病史/忌口过敏/最新体征等);需要趋势才用 form_list_owner_submissions,且只取近 30 天,不翻全部历史。
-      3. 在管方案:health_plan_get_customer_plan 查客户已有健康方案(参数保持默认,不拉完整文档表格);有生效方案时,新方案在「客户信息与目标」里说明与它的衔接;确需某张表格明细,再用 health_plan_get_doc_table 按 doc_table_code 单张拉。
-      4. 在用药:medication_query_plans(status=active)查当前用药;有用药时,饮食运动安排避开冲突(如降糖药下警惕空腹运动低血糖),并在「注意事项」写明:当前用药仅作参考,任何调整遵医嘱。
+      2. 字段含义:对筛出的每个表单先调 form_get_field_detail,弄清每个字段是什么、单位、取值含义;遇到选择题/编码值需要选项字典才能解读时,再带 include_extra=true 重取该表单。不理解字段含义就去读值,容易把编码当数值、把选项值张冠李戴。
+      3. 读值:对筛出的每个表单调 form_get_latest_field_values 读该客户各字段最新值(年龄/性别/身高体重/病史/忌口过敏/最新体征等),按上一步的字段含义解读;需要趋势才用 form_list_owner_submissions,且只取近 30 天,不翻全部历史。
+      4. 在管方案:health_plan_get_customer_plan 查客户已有健康方案(参数保持默认,不拉完整文档表格);有生效方案时,新方案在「客户信息与目标」里说明与它的衔接;确需某张表格明细,再用 health_plan_get_doc_table 按 doc_table_code 单张拉。
+      5. 在用药:medication_query_plans(status=active)查当前用药;有用药时,饮食运动安排避开冲突(如降糖药下警惕空腹运动低血糖),并在「注意事项」写明:当前用药仅作参考,任何调整遵医嘱。
       拉数纪律:
       - **只读**:绝不调用任何新增/修改类工具。
       - 省着拉:能用最新值就不翻历史;扩展 JSON/完整表格类参数一律保持默认关闭;筛不出相关表单、或读出来字段为空,直接问员工,不要反复重试。
@@ -223,7 +224,7 @@ spec:
 9. **按员工锚定的风格一致性**:首次生成把确定性渲染脚本 `style/render_plan.py` 落该员工工作区(per-user 持久),之后强制复用;换风格明确要求才更新。(`persistent_workspace: false` 只控计划投影,不影响工作区文件持久。)
 10. **成品体积不设 Agent 侧护栏**(用户拍板):企微发送超限由前端提示。
 11. **体检单照片依赖视觉**:`supports_vision: true` 或 `spec.vision` 二选一。
-12. **MCP 拉数三纪律**(按七工具契约写进 prompt):①工具白名单只放只读七件套,写操作类工具在 allow_tools 层面就不可见;②token 卫生——doc_tables/extended 类参数保持默认关闭、先目录后明细(health_plan doc_tables 单客户可达 1MB+)、趋势只取近 30 天;③表单驱动的档案读取是两步式:form_list_by_project 一次拉全量表单列表(不带 keyword),由模型按表单名/描述自筛出基础信息/身体指标/健康信息三类,再逐表 form_get_latest_field_values 读值;筛不出或值为空就问员工。
+12. **MCP 拉数三纪律**(按七工具契约写进 prompt):①工具白名单只放只读七件套,写操作类工具在 allow_tools 层面就不可见;②token 卫生——doc_tables/extended 类参数保持默认关闭、先目录后明细(health_plan doc_tables 单客户可达 1MB+)、趋势只取近 30 天;③表单驱动的档案读取是三步式:form_list_by_project 一次拉全量表单列表(不带 keyword)→ 模型按表单名/描述自筛出基础信息/身体指标/健康信息三类 → 逐表 form_get_field_detail 弄清字段含义(选项字典需 include_extra=true)→ form_get_latest_field_values 读值并按含义解读;筛不出或值为空就问员工。
 13. **inputs 必须 Jinja 声明**:`{{ var }}` 双花括号;多传未知键 422;单值 ≤8192 字符、总 ≤64KB。
 
 ## 5. 需同步给 project-service 的契约修订(r4,整体替换此前各版)
@@ -236,7 +237,7 @@ spec:
 
 ## 6. 冒烟清单(playground,创建后逐条过)
 
-1. 老客户:inputs 给 project_code+身份四字段 → Agent 先 form_list_by_project 全量盘表并自筛相关表单,再逐表 form_get_latest_field_values 读值,继而 health_plan_get_customer_plan(默认参数)、medication_query_plans(active),汇总列出确认 → 生成 → list_artifacts 见 `客户名_时间戳.json` + `.pptx` 成对。
+1. 老客户:inputs 给 project_code+身份四字段 → Agent 先 form_list_by_project 全量盘表并自筛相关表单,逐表 form_get_field_detail 取字段含义、form_get_latest_field_values 读值,继而 health_plan_get_customer_plan(默认参数)、medication_query_plans(active),汇总列出确认 → 生成 → list_artifacts 见 `客户名_时间戳.json` + `.pptx` 成对。
 2. 新客户:不传 customer_code/customer_name,对话描述 → 不调 MCP 档案拉取,追问缺项 → 文件名用对话中的称呼。
 3. 品牌:传 org_name/footer_sign/disclaimer/org_logo → 封面左上 LOGO+机构名,每页页脚「机构名 | 署名」+免责声明,页脚无 LOGO;不传品牌键 → 对应元素省略。
 4. 素材:materials 给 1 条视频素材(url=allowlist 域名的 mp4)+1 条产品素材 → pptx 动作页内嵌可播视频、产品处为可点击链接、说明原话;不传 materials → 无「专属产品」板块。
