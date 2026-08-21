@@ -48,7 +48,7 @@ dependencies = [
     # Stream J.5 — knowledge-base document parsing. pymupdf4llm gives
     # high-quality Markdown (with headings) for PDFs; MarkItDown is the
     # fallback + handles office formats (docx / pptx / xlsx).
-    "pymupdf4llm>=0.0.17,<1",
+    "pymupdf4llm>=0.0.17,<2",
     "pymupdf>=1.24,<2",
     "markitdown[docx,pptx,xlsx,pdf]>=0.1,<1",
     # Stream J.5 — knowledge chunking: markdown-it parses the Markdown
