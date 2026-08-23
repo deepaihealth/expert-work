@@ -846,9 +846,9 @@ run 走到人工审批点、停下等待人决策时，服务端发一次到当�
 2. 在 `timeout_at` 之前调用 [4.2 审批决策](./run-control#_4-2-审批决策) 提交决策。
 3. 不要按错误显示。批准或拒绝之后，这一轮对话还会继续。
 
-决策窗口是 `timeout_at` 减 `requested_at`。这个窗口由 Agent 配置决定，默认 24 小时，可配范围是 60 秒到 7 天（604800 秒）。**不要把 24 小时写死在代码里**，按事件里的 `timeout_at` 计算。
+决策窗口是 `timeout_at` 减 `requested_at`。这个窗口由 Agent 配置决定，且按 `reason_kind` 分两档：`policy_gate` 和 `risk_confirmation` 默认 24 小时；`missing_info`、`ambiguous_requirement`、`approach_choice`（Agent 向人提问的三类）默认 1 小时。两档都可配，范围是 60 秒到 7 天（604800 秒）。**不要把任何默认值写死在代码里**，按事件里的 `timeout_at` 计算。
 
-超过 `timeout_at` 之后，后台会把这条审批按「拒绝」处理，之后 run 按被拒绝的方式续跑或终止，两种后果见 [4.2 审批决策](./run-control#_4-2-审批决策)。平台不会为超时再发一个事件，客户端只能主动发现：
+超过 `timeout_at` 之后，后台会把这条审批按「拒绝」处理。对 `policy_gate`，run 随之终止；对其余四类（Agent 主动发起的），run 会继续跑——Agent 收到拒绝信息后按自己的保守默认推进。两种后果见 [4.2 审批决策](./run-control#_4-2-审批决策)。平台不会为超时再发一个事件，客户端只能主动发现：
 
 - 用 [5.4 run 列表](./query#_5-4-run-列表) 查看那个 run 的最终状态；
 - 或者照常提交一次决策，拿到 `409 APPROVAL_CONFLICT` 即说明它已经被决定过。

@@ -239,6 +239,17 @@ async def test_list_filters_by_reason_kinds(
         assert safety_total == 1
         assert safety[0].run_id == gate.run_id
 
+        # I-5 (B-20 终审) — 跨租户平台面走的是 list_all_tenants,它的
+        # reason_kinds 谓词必须与 list_for_tenant 同义,单独覆盖。
+        clar_all, clar_all_total = await store.list_all_tenants(
+            status=ApprovalStatus.PENDING,
+            reason_kinds=("approach_choice", "ambiguous_requirement", "missing_info"),
+        )
+        clar_ids = {r.run_id for r in clar_all}
+        assert {question.run_id, fork.run_id} <= clar_ids
+        assert gate.run_id not in clar_ids
+        assert clar_all_total >= 2
+
         _all_rows, all_total = await store.list_all_tenants(status=ApprovalStatus.PENDING)
         assert all_total >= 3
     finally:
