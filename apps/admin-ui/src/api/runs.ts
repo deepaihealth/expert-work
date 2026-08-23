@@ -305,4 +305,3 @@ export async function cancelRun(threadId: string, runId: string): Promise<void> 
   );
   unwrap(response.data);
 }
-
