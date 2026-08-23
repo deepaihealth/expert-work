@@ -1902,7 +1902,10 @@ def build_runs_router() -> APIRouter:
         if not stopped:
             raise HTTPException(
                 status_code=409,
-                detail="run is not cancellable (already terminal, or paused — decide the approval instead)",
+                detail=(
+                    "run is not cancellable (already terminal, or paused — "
+                    "decide the approval instead)"
+                ),
             )
         await emit(
             audit,
@@ -1915,9 +1918,7 @@ def build_runs_router() -> APIRouter:
             trace_id=current_trace_id_hex(),
             details={"thread_id": str(thread_id)},
         )
-        return JSONResponse(
-            content={"success": True, "data": {"cancelled": True}, "error": None}
-        )
+        return JSONResponse(content={"success": True, "data": {"cancelled": True}, "error": None})
 
     return router
 
