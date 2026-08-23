@@ -11,10 +11,13 @@
  * gate is the backstop).
  *
  * config-page redesign v2 Task 5 — ``tools`` seeds a "default all-on"
- * profile: the base-9 essentials + exec_python/bash (already the case) PLUS
+ * profile: the 8 hidden essentials + exec_python/bash (already the case) PLUS
  * web_search/http and every opt-in-7 builtin (manage_task/author_skill/
  * refine_skill/fork_skill/propose_skill_to_tenant/note_behavior_patch/
- * clarify_tool_usage), 20 tools total. This only changes what a brand-new
+ * clarify_tool_usage), 19 tools total. ``ask_for_approval`` is deliberately
+ * NOT seeded (default OFF since 2026-08-23): in a live conversation the agent
+ * should ask in chat; the tool is for unattended runs / audited sign-offs and
+ * has its own FormView toggle. This only changes what a brand-new
  * template starts with — the ``tools`` FormView checkboxes turn any of them
  * back off, and an EXISTING agent's manifest is never touched by this file.
  * The web_search/http entry shapes exactly mirror what ``form_model.ts``'s
@@ -54,7 +57,6 @@ spec:
     - { type: builtin, name: read_document }
     - { type: builtin, name: save_artifact }
     - { type: builtin, name: list_artifacts }
-    - { type: builtin, name: ask_for_approval }
     - { type: builtin, name: remember }
     - { type: builtin, name: exec_python }
     - { type: builtin, name: bash }

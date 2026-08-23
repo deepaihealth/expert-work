@@ -1053,6 +1053,8 @@ export interface TranslationKeys {
     tool_note_behavior_patch_help: string;
     tool_clarify_tool_usage: string;
     tool_clarify_tool_usage_help: string;
+    tool_ask_for_approval: string;
+    tool_ask_for_approval_help: string;
     tools_config_note: string;
     section_approval: string;
     section_approval_help: string;
@@ -4123,8 +4125,11 @@ const en: TranslationKeys = {
     tool_clarify_tool_usage: "Clarify tool usage",
     tool_clarify_tool_usage_help:
       "Let the agent record the correct way to use a tool after misusing it, so it doesn't repeat the mistake.",
+    tool_ask_for_approval: "Ask for human approval",
+    tool_ask_for_approval_help:
+      "Let the agent pause mid-run and file an approval request when it wants a human decision — the run resumes once someone approves in the approvals list.\nFor agents people chat with live, leave this off: the agent should just ask in the conversation. Turn it on for unattended runs (scheduled tasks, API-driven runs) or actions that need an audited sign-off.",
     tools_config_note:
-      "File read/write, saving artifacts, and asking for human approval are on by default and not listed here — edit the YAML view to change them. Web search works out of the box (the platform's own free search service).",
+      "File read/write and saving artifacts are on by default and not listed here — edit the YAML view to change them. Web search works out of the box (the platform's own free search service).",
     section_approval: "Human approval",
     section_approval_help:
       "For the tools you check, execution pauses every time and waits for a human to approve — whether it's a base capability that's always on, or one you turned on yourself above in Tools.\nExample: add approval for exec_python, http",

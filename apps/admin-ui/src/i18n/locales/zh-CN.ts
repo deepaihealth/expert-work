@@ -1102,8 +1102,11 @@ const zhCN: TranslationKeys = {
       "让 Agent 能记下「以后遇到这种情况该怎么做」的小修正,慢慢把自己做得更好。",
     tool_clarify_tool_usage: "澄清工具用法",
     tool_clarify_tool_usage_help: "让 Agent 在用错工具时记下正确用法,下次不再犯。",
+    tool_ask_for_approval: "请求人工审批",
+    tool_ask_for_approval_help:
+      "让 Agent 在运行中主动暂停、提交一张审批单等人裁决,有人在审批列表里批准后原地续跑。\n有人在场的对话场景请保持关闭:Agent 直接在对话里文字追问即可。适合开启的场景:无人值守的运行(定时任务、API 调用发起)或需要留痕放行的高危动作。",
     tools_config_note:
-      "文件读写、产物保存、请求人工确认这些基础能力默认开启,不在此列出;要调整请到 YAML 视图。网页搜索开箱可用(平台自带免费搜索服务)。",
+      "文件读写、产物保存这些基础能力默认开启,不在此列出;要调整请到 YAML 视图。网页搜索开箱可用(平台自带免费搜索服务)。",
     section_approval: "人工审批",
     section_approval_help:
       "勾选的工具,每次执行前都会暂停,等人工批准后才继续——不管这个工具是一直开着的基础能力,还是你在上面「工具」里手动打开的。\n示例:给 exec_python、http 加一道审批",
