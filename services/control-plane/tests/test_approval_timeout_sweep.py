@@ -88,7 +88,13 @@ class _FakeAgentRepo:
         return SimpleNamespace(spec=SimpleNamespace(), status=AgentSpecStatus.ACTIVE)
 
 
-def _approval(run_id: object, thread_id: object, *, timeout_at: datetime) -> ApprovalRecord:
+def _approval(
+    run_id: object,
+    thread_id: object,
+    *,
+    timeout_at: datetime,
+    reason_kind: str = "policy_gate",
+) -> ApprovalRecord:
     now = datetime.now(UTC)
     return ApprovalRecord(
         id=uuid4(),
@@ -97,7 +103,7 @@ def _approval(run_id: object, thread_id: object, *, timeout_at: datetime) -> App
         thread_id=thread_id,  # type: ignore[arg-type]
         request_id="approval:sweep",
         node="tools",
-        reason_kind="policy_gate",
+        reason_kind=reason_kind,  # type: ignore[arg-type]  # test seeds valid values
         action_summary="approval-gated tool 'http'",
         proposed_args={},
         requested_at=now,
@@ -218,3 +224,54 @@ async def test_two_instances_time_out_exactly_once() -> None:
     row = await approvals.get_by_run(run_id=run_id, tenant_id=_TENANT)
     assert row is not None
     assert row.status is ApprovalStatus.TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# B-20 approval triage — per-class timeout reason
+# ---------------------------------------------------------------------------
+
+
+async def _run_sweep_capturing_reason(monkeypatch: pytest.MonkeyPatch, *, reason_kind: str) -> str:
+    """Seed one expired row of ``reason_kind``; return the reject reason used."""
+    captured: dict[str, object] = {}
+
+    async def _fake_resolve(**kw: object) -> tuple[object, object, bool]:
+        captured.update(kw)
+        return SimpleNamespace(), uuid4(), False
+
+    monkeypatch.setattr(
+        "control_plane.approval_timeout_sweep.resolve_approval_decision", _fake_resolve
+    )
+    approvals = InMemoryApprovalStore()
+    run_id, thread_id = uuid4(), uuid4()
+    past = datetime.now(UTC) - timedelta(minutes=1)
+    await approvals.create(_approval(run_id, thread_id, timeout_at=past, reason_kind=reason_kind))
+    swept = await _sweep(approvals, _FakeRuntime()).run_once()
+    assert swept == 1
+    return str(captured["reason"])
+
+
+@pytest.mark.asyncio
+async def test_clarification_timeout_tells_agent_to_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out clarification resumes with 'proceed on your own default'."""
+    reason = await _run_sweep_capturing_reason(monkeypatch, reason_kind="missing_info")
+    assert "conservative default" in reason
+    assert "approval timed out" not in reason
+
+
+@pytest.mark.asyncio
+async def test_safety_timeout_keeps_plain_reject_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = await _run_sweep_capturing_reason(monkeypatch, reason_kind="risk_confirmation")
+    assert reason == "approval timed out"
+
+
+@pytest.mark.asyncio
+async def test_policy_gate_timeout_keeps_plain_reject_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = await _run_sweep_capturing_reason(monkeypatch, reason_kind="policy_gate")
+    assert reason == "approval timed out"

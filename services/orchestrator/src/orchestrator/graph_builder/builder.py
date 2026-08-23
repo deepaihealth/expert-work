@@ -430,6 +430,10 @@ def build_react_graph(
     workspace_writer_factory: Callable[[ToolContext], WorkspaceFileWriter] | None = None,
     approval_required_tools: frozenset[str] = frozenset(),
     approval_timeout_s: int = 86400,
+    # B-20 approval triage — clarification-class ``ask_for_approval`` rows
+    # (missing_info / ambiguous_requirement / approach_choice) time out on
+    # this shorter horizon; safety rows keep ``approval_timeout_s``.
+    clarification_timeout_s: int = 3600,
     # Stream HX-13 — vendor-native tool-disclosure tier from the model
     # catalog (``ModelEntry.tool_disclosure``). ``None`` (default) keeps the
     # HX-12 application tier byte-identical; "native_search" hands the
@@ -1263,6 +1267,7 @@ def build_react_graph(
                         target,
                         thread_id=thread_id,
                         timeout_s=approval_timeout_s,
+                        clarification_timeout_s=clarification_timeout_s,
                     )
                 }
 

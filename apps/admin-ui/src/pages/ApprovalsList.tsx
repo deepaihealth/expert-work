@@ -11,15 +11,17 @@
  * cross-tenant banner). Batch actions are disabled outside the home
  * tenant scope — ``:decide`` operates on the caller's tenant only.
  */
-import { useCallback, useEffect, useMemo, useState, type Key } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Key } from "react";
 import {
   Alert,
+  Badge,
   Button,
   Empty,
   Popconfirm,
   Select,
   Space,
   Table,
+  Tabs,
   Tag,
   Tooltip,
   Typography,
@@ -34,6 +36,7 @@ import {
   decideApprovals,
   listApprovals,
   type ApprovalItem,
+  type ApprovalKindClass,
   type ApprovalList,
   type ApprovalStatus,
 } from "../api/approvals";
@@ -103,17 +106,42 @@ export function ApprovalsList() {
   const [deciding, setDeciding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<ApprovalStatus>("pending");
+  // B-20 approval triage — safety sign-offs and agent clarification
+  // questions are different audiences; the queue splits into two tabs.
+  const [kindClass, setKindClass] = useState<ApprovalKindClass>("safety");
+  // Pending count of the *other* tab (same status filter), so a waiting
+  // safety sign-off stays visible while triaging clarifications and vice
+  // versa. ``null`` until its probe resolves (badge hidden).
+  const [otherCount, setOtherCount] = useState<number | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([]);
 
   const isCrossTenant = scope === "*";
   const canDecide = statusFilter === "pending" && !isCrossTenant;
 
+  // I-4 (B-20 终审) — 竞态守卫:快速切 tab / 改筛选时,只让最新一次
+  // refresh 的结果落地,防止旧 tab 的行渲染在新 tab 名下(而「批准本页
+  // 全部」是活的,看到的类别必须等于实际决策的对象)。
+  const refreshNonceRef = useRef(0);
+
   const refresh = useCallback(async () => {
+    const nonce = ++refreshNonceRef.current;
     setLoading(true);
     setError(null);
     try {
-      const result = await listApprovals({ tenantScope: apiTenantScope, status: statusFilter });
+      const other: ApprovalKindClass = kindClass === "safety" ? "clarification" : "safety";
+      const [result, otherProbe] = await Promise.all([
+        listApprovals({ tenantScope: apiTenantScope, status: statusFilter, kindClass }),
+        // Badge probe for the inactive tab — total only, one row of payload.
+        listApprovals({
+          tenantScope: apiTenantScope,
+          status: statusFilter,
+          kindClass: other,
+          limit: 1,
+        }),
+      ]);
+      if (nonce !== refreshNonceRef.current) return; // superseded
       setData(result);
+      setOtherCount(otherProbe.total);
       setSelectedKeys([]);
     } catch (err) {
       const text =
@@ -122,11 +150,12 @@ export function ApprovalsList() {
           : err instanceof Error
             ? err.message
             : "unknown error";
+      if (nonce !== refreshNonceRef.current) return; // superseded
       setError(text);
     } finally {
-      setLoading(false);
+      if (nonce === refreshNonceRef.current) setLoading(false);
     }
-  }, [apiTenantScope, statusFilter]);
+  }, [apiTenantScope, statusFilter, kindClass]);
 
   useEffect(() => {
     refresh();
@@ -362,6 +391,36 @@ export function ApprovalsList() {
             </button>
           </>
         }
+      />
+
+      <Tabs
+        activeKey={kindClass}
+        onChange={(k) => setKindClass(k as ApprovalKindClass)}
+        data-testid="approvals-kind-tabs"
+        items={[
+          {
+            key: "safety",
+            label: (
+              <span data-testid="approvals-tab-safety">
+                {t("approvals_page.tab_safety")}
+                {kindClass !== "safety" && (otherCount ?? 0) > 0 && (
+                  <Badge count={otherCount ?? 0} size="small" style={{ marginLeft: 6 }} />
+                )}
+              </span>
+            ),
+          },
+          {
+            key: "clarification",
+            label: (
+              <span data-testid="approvals-tab-clarification">
+                {t("approvals_page.tab_clarification")}
+                {kindClass !== "clarification" && (otherCount ?? 0) > 0 && (
+                  <Badge count={otherCount ?? 0} size="small" style={{ marginLeft: 6 }} />
+                )}
+              </span>
+            ),
+          },
+        ]}
       />
 
       {error !== null && (

@@ -57,7 +57,9 @@ import {
   setAbstainThreshold,
   setRecallMode,
   readApprovalTimeout,
+  readClarificationTimeout,
   setApprovalTimeout,
+  setClarificationTimeout,
   readFallback,
   setFallback,
   normalizeForSubmit,
@@ -321,6 +323,13 @@ describe("form_model writers preserve siblings", () => {
     expect(withTimeout.spec?.policies?.approval_required_tools).toEqual([
       "exec_python",
     ]);
+
+    // B-20 — clarification timeout shares the same policies block.
+    expect(readClarificationTimeout(seed)).toBe(3600);
+    const withClarification = setClarificationTimeout(withTimeout, 600);
+    expect(withClarification.spec?.policies?.clarification_timeout_s).toBe(600);
+    expect(withClarification.spec?.policies?.approval_timeout_s).toBe(3600);
+    expect(readClarificationTimeout(withClarification)).toBe(600);
   });
 
   it("setTool adds/removes builtin and http tools independently", () => {

@@ -125,6 +125,7 @@ export interface AgentManifest {
       approval_required_tools?: string[];
       // Seconds a pending approval may sit before auto-reject (default 24h).
       approval_timeout_s?: number;
+      clarification_timeout_s?: number;
       // Wall-clock cap on the whole run incl. sub-agent recursion (0 = off).
       run_deadline_s?: number;
       // No-progress stop — consecutive loop-detection trips after which the
@@ -837,6 +838,12 @@ export const readApprovalTimeout = (m: unknown): number =>
   specOf(m).policies?.approval_timeout_s ?? 86400;
 export const setApprovalTimeout = (m: unknown, s: number): AgentManifest =>
   patchPolicies(m, { approval_timeout_s: s });
+// B-20 — clarification-class ``ask_for_approval`` questions time out on their
+// own (shorter) horizon; safety rows keep ``approval_timeout_s``.
+export const readClarificationTimeout = (m: unknown): number =>
+  specOf(m).policies?.clarification_timeout_s ?? 3600;
+export const setClarificationTimeout = (m: unknown, s: number): AgentManifest =>
+  patchPolicies(m, { clarification_timeout_s: s });
 
 // ---- run budget (Group 6 试点: workflow.max_iterations + workflow.type
 // + policies.max_no_progress + policies.run_deadline_s + top-level

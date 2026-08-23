@@ -48,11 +48,15 @@ from expert_work.protocol.agent_template_resolve import (
     resolve_extends,
 )
 from expert_work.protocol.approval import (
+    CLARIFICATION_REASON_KINDS,
+    SAFETY_REASON_KINDS,
     ApprovalDecision,
+    ApprovalKindClass,
     ApprovalReasonKind,
     ApprovalRecord,
     ApprovalRequest,
     ApprovalStatus,
+    approval_kind_class,
     canonical_args_digest,
 )
 from expert_work.protocol.artifact import Artifact, ArtifactKind, ArtifactVersion
@@ -274,6 +278,7 @@ from expert_work.protocol.webhook import (
 __all__ = [
     "ALL_TENANTS",
     "API_KEY_STORED_PREFIX_LEN",
+    "CLARIFICATION_REASON_KINDS",
     "DEFAULT_CHUNK_MAX_TOKENS",
     "DEFAULT_CHUNK_OVERLAP_TOKENS",
     "DEFAULT_RETRIEVAL_TOP_K",
@@ -284,6 +289,7 @@ __all__ = [
     "MODEL_CATALOG",
     "PLATFORM_SCOPE_ROLES",
     "PROVIDER_CATALOG",
+    "SAFETY_REASON_KINDS",
     "SKILL_REF_PATTERN",
     "TENANT_SCOPE_ROLES",
     "TIER_ORDER",
@@ -301,6 +307,7 @@ __all__ = [
     "ApiKeyCreated",
     "ApiKeyScope",
     "ApprovalDecision",
+    "ApprovalKindClass",
     "ApprovalReasonKind",
     "ApprovalRecord",
     "ApprovalRequest",
@@ -479,6 +486,7 @@ __all__ = [
     "WebhookPayloadFormat",
     "WorkflowSpec",
     "apply_markup",
+    "approval_kind_class",
     "canonical_args_digest",
     "catalog_entry",
     "enforce_security_floor",

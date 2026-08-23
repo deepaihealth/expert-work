@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._authz import console_only, require_key_scope
+from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import (
     _get_agent_repo,
@@ -45,7 +45,13 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import ApprovalStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.tenant_user import TenantUserStore
-from expert_work.protocol import ApprovalRecord, ApprovalStatus
+from expert_work.protocol import (
+    CLARIFICATION_REASON_KINDS,
+    SAFETY_REASON_KINDS,
+    ApprovalKindClass,
+    ApprovalRecord,
+    ApprovalStatus,
+)
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.approvals")
@@ -113,7 +119,15 @@ def build_approvals_router() -> APIRouter:
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
         offset: Annotated[int, Query(ge=0)] = 0,
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+        kind_class: Annotated[ApprovalKindClass | None, Query()] = None,
     ) -> JSONResponse:
+        # B-20 approval triage — the two-tab split (safety sign-offs vs
+        # agent clarification questions). ``None`` keeps the untabbed view.
+        reason_kinds: tuple[str, ...] | None = None
+        if kind_class == "safety":
+            reason_kinds = tuple(sorted(SAFETY_REASON_KINDS))
+        elif kind_class == "clarification":
+            reason_kinds = tuple(sorted(CLARIFICATION_REASON_KINDS))
         trace_id = current_trace_id_hex()
         scope = await ensure_tenant_scope(
             request.state.principal,
@@ -126,11 +140,15 @@ def build_approvals_router() -> APIRouter:
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
                 items, total = await approvals.list_all_tenants(
-                    status=status, limit=limit, offset=offset
+                    status=status, limit=limit, offset=offset, reason_kinds=reason_kinds
                 )
             else:
                 items, total = await approvals.list_for_tenant(
-                    tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
+                    tenant_id=scope.tenant_id,
+                    status=status,
+                    limit=limit,
+                    offset=offset,
+                    reason_kinds=reason_kinds,
                 )
         return JSONResponse(
             content={
@@ -148,7 +166,14 @@ def build_approvals_router() -> APIRouter:
     @router.post(
         ":decide",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        # B-20 ④ — deciding an approval is an operator+ action. Human JWTs
+        # previously passed with any role (require_key_scope only gates API
+        # keys), so a viewer could decide safety sign-offs.
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def decide_batch(
         payload: DecideBatchRequest,

@@ -49,8 +49,15 @@ class InMemoryApprovalStore(ApprovalStore):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
-        rows = [r for r in self._rows.values() if r.tenant_id == tenant_id and r.status == status]
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.status == status
+            and (reason_kinds is None or r.reason_kind in reason_kinds)
+        ]
         rows.sort(key=lambda r: r.requested_at)
         return rows[offset : offset + limit], len(rows)
 
@@ -60,8 +67,13 @@ class InMemoryApprovalStore(ApprovalStore):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
-        rows = [r for r in self._rows.values() if r.status == status]
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.status == status and (reason_kinds is None or r.reason_kind in reason_kinds)
+        ]
         rows.sort(key=lambda r: r.requested_at)
         return rows[offset : offset + limit], len(rows)
 

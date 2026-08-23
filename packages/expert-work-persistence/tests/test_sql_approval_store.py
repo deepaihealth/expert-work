@@ -202,3 +202,55 @@ async def test_delete_for_threads_scopes_by_tenant_and_thread(
         assert await store.get_by_run(run_id=run_b1, tenant_id=tenant_b) is not None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_reason_kinds(
+    approval_store: ApprovalStoreFixture,
+) -> None:
+    """B-20 — the SQL ``reason_kinds`` predicate matches the in-memory one."""
+    store, engine = approval_store
+    tenant = uuid4()
+    base = datetime(2026, 6, 12, 9, 0, 0, tzinfo=UTC)
+    gate = _record(tenant_id=tenant, run_id=uuid4()).model_copy(update={"requested_at": base})
+    question = _record(tenant_id=tenant, run_id=uuid4()).model_copy(
+        update={"reason_kind": "missing_info", "requested_at": base + timedelta(minutes=1)}
+    )
+    fork = _record(tenant_id=tenant, run_id=uuid4()).model_copy(
+        update={"reason_kind": "approach_choice", "requested_at": base + timedelta(minutes=2)}
+    )
+    try:
+        for row in (gate, question, fork):
+            await store.create(row)
+
+        clar, clar_total = await store.list_for_tenant(
+            tenant_id=tenant,
+            status=ApprovalStatus.PENDING,
+            reason_kinds=("approach_choice", "ambiguous_requirement", "missing_info"),
+        )
+        assert clar_total == 2
+        assert [r.run_id for r in clar] == [question.run_id, fork.run_id]
+
+        safety, safety_total = await store.list_for_tenant(
+            tenant_id=tenant,
+            status=ApprovalStatus.PENDING,
+            reason_kinds=("policy_gate", "risk_confirmation"),
+        )
+        assert safety_total == 1
+        assert safety[0].run_id == gate.run_id
+
+        # I-5 (B-20 终审) — 跨租户平台面走的是 list_all_tenants,它的
+        # reason_kinds 谓词必须与 list_for_tenant 同义,单独覆盖。
+        clar_all, clar_all_total = await store.list_all_tenants(
+            status=ApprovalStatus.PENDING,
+            reason_kinds=("approach_choice", "ambiguous_requirement", "missing_info"),
+        )
+        clar_ids = {r.run_id for r in clar_all}
+        assert {question.run_id, fork.run_id} <= clar_ids
+        assert gate.run_id not in clar_ids
+        assert clar_all_total >= 2
+
+        _all_rows, all_total = await store.list_all_tenants(status=ApprovalStatus.PENDING)
+        assert all_total >= 3
+    finally:
+        await engine.dispose()

@@ -30,7 +30,12 @@ from typing import Any
 
 from langchain_core.messages import ToolMessage
 
-from expert_work.protocol import ApprovalReasonKind, ApprovalRequest, canonical_args_digest
+from expert_work.protocol import (
+    ApprovalReasonKind,
+    ApprovalRequest,
+    approval_kind_class,
+    canonical_args_digest,
+)
 from orchestrator.tools.approval import ASK_FOR_APPROVAL_TOOL
 
 __all__ = [
@@ -126,6 +131,7 @@ def build_approval_request(
     *,
     thread_id: str,
     timeout_s: int,
+    clarification_timeout_s: int | None = None,
     now: datetime | None = None,
     bind: bool = True,
 ) -> ApprovalRequest:
@@ -157,6 +163,13 @@ def build_approval_request(
         tool_name = str(call.get("name") or "tool")
         action_summary = f"approval-gated tool '{tool_name}'"
         proposed_args = dict(args)
+    # B-20 approval triage — a clarification question (missing_info /
+    # ambiguous_requirement / approach_choice) gets its own, typically much
+    # shorter, deadline; safety rows (policy_gate / risk_confirmation) keep
+    # ``policies.approval_timeout_s``.
+    effective_timeout_s = timeout_s
+    if clarification_timeout_s is not None and approval_kind_class(reason_kind) == "clarification":
+        effective_timeout_s = clarification_timeout_s
     return ApprovalRequest(
         request_id=_stable_request_id(thread_id, "tools", action_summary),
         node="tools",
@@ -164,7 +177,7 @@ def build_approval_request(
         action_summary=action_summary,
         proposed_args=proposed_args,
         requested_at=moment,
-        timeout_at=moment + timedelta(seconds=timeout_s),
+        timeout_at=moment + timedelta(seconds=effective_timeout_s),
         # RT-6 Tier A (RT-ADR-19) — bind the args at mint (declarative gate);
         # ``bind=False`` (action-screen) leaves it unbound. Agent-initiated
         # ``ask_for_approval`` gets a digest but verification skips it (no

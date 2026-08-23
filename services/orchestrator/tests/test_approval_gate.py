@@ -226,6 +226,60 @@ def test_build_approval_request_agent_initiated() -> None:
     assert req.proposed_args == {"path": "workdir/scratch"}
 
 
+def test_build_approval_request_clarification_uses_short_timeout() -> None:
+    """B-20 — a clarification kind deadlines on clarification_timeout_s."""
+    calls = [
+        _tool_call(
+            ASK_FOR_APPROVAL_TOOL,
+            {"reason_kind": "missing_info", "action_summary": "which quarter?"},
+            "tc-1",
+        )
+    ]
+    target = find_approval_target(calls, frozenset())
+    assert target is not None
+    req = build_approval_request(
+        target, thread_id="r-1", timeout_s=86400, clarification_timeout_s=300
+    )
+    assert req.reason_kind == "missing_info"
+    assert (req.timeout_at - req.requested_at).total_seconds() == 300
+
+
+def test_build_approval_request_risk_confirmation_keeps_safety_timeout() -> None:
+    """B-20 — risk_confirmation is safety-class: clarification timeout ignored."""
+    calls = [
+        _tool_call(
+            ASK_FOR_APPROVAL_TOOL,
+            {"reason_kind": "risk_confirmation", "action_summary": "delete all?"},
+            "tc-1",
+        )
+    ]
+    target = find_approval_target(calls, frozenset())
+    assert target is not None
+    req = build_approval_request(
+        target, thread_id="r-1", timeout_s=86400, clarification_timeout_s=300
+    )
+    assert (req.timeout_at - req.requested_at).total_seconds() == 86400
+
+
+def test_build_approval_request_policy_gate_keeps_safety_timeout() -> None:
+    calls = [_tool_call("send_email", {"to": "x"}, "tc-1")]
+    target = find_approval_target(calls, frozenset({"send_email"}))
+    assert target is not None
+    req = build_approval_request(
+        target, thread_id="r-1", timeout_s=7200, clarification_timeout_s=300
+    )
+    assert (req.timeout_at - req.requested_at).total_seconds() == 7200
+
+
+def test_build_approval_request_clarification_without_override_keeps_timeout() -> None:
+    """Callers that don't pass clarification_timeout_s keep the old behavior."""
+    calls = [_tool_call(ASK_FOR_APPROVAL_TOOL, {"reason_kind": "approach_choice"}, "tc-1")]
+    target = find_approval_target(calls, frozenset())
+    assert target is not None
+    req = build_approval_request(target, thread_id="r-1", timeout_s=86400)
+    assert (req.timeout_at - req.requested_at).total_seconds() == 86400
+
+
 def test_build_approval_request_unknown_reason_kind_falls_back() -> None:
     """A bogus agent-supplied reason_kind degrades to risk_confirmation."""
     calls = [_tool_call(ASK_FOR_APPROVAL_TOOL, {"reason_kind": "bogus"}, "tc-1")]

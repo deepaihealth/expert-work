@@ -22,11 +22,15 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    "CLARIFICATION_REASON_KINDS",
+    "SAFETY_REASON_KINDS",
     "ApprovalDecision",
+    "ApprovalKindClass",
     "ApprovalReasonKind",
     "ApprovalRecord",
     "ApprovalRequest",
     "ApprovalStatus",
+    "approval_kind_class",
     "canonical_args_digest",
 ]
 
@@ -72,6 +76,33 @@ ApprovalReasonKind = Literal[
     "approach_choice",
     "risk_confirmation",
 ]
+
+#: B-20 approval triage — the five reason kinds split into two classes with
+#: different audiences and different timeout semantics. *Safety* rows are
+#: platform / risk sign-offs (an approver role decides; timeout = plain
+#: reject). *Clarification* rows are the agent asking a person a question
+#: (missing input, ambiguous ask, fork between approaches; timeout = tell the
+#: agent to proceed on its own conservative default). Single source for the
+#: orchestrator mint (per-class timeout), the timeout sweep (per-class reject
+#: reason) and the ``GET /v1/approvals`` ``kind_class`` filter — keep the two
+#: sets an exact partition of :data:`ApprovalReasonKind`.
+SAFETY_REASON_KINDS: frozenset[str] = frozenset({"policy_gate", "risk_confirmation"})
+CLARIFICATION_REASON_KINDS: frozenset[str] = frozenset(
+    {"missing_info", "ambiguous_requirement", "approach_choice"}
+)
+
+#: The two triage classes — wire value of the ``kind_class`` query filter.
+ApprovalKindClass = Literal["safety", "clarification"]
+
+
+def approval_kind_class(reason_kind: str) -> ApprovalKindClass:
+    """Map a reason kind onto its triage class (unknown values → safety).
+
+    Unknowns fail *closed*: a reason kind this build does not recognise is
+    treated as a safety row (human sign-off semantics), never as a
+    clarification that could auto-continue on timeout.
+    """
+    return "clarification" if reason_kind in CLARIFICATION_REASON_KINDS else "safety"
 
 
 class ApprovalRequest(BaseModel):

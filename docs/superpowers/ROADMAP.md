@@ -385,7 +385,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-17 | **(线 B 文档可读性 #1189 顺带发现的代码侧小项)** ① `external_agent_catalog.py:95` 注释写 30s,真实 TTL 是 `settings.kill_switch_cache_ttl_s`(5s)② `_run_event_stream.py:24` 从 run store 借 `MAX_LIST_LIMIT`,语义上应有自己的常量 ③ `approval` 事件把 `binding_digest` 原样放到对外线路上,对接方用不上、且暴露内部摘要形态,考虑从对外投影里剥掉 |
 | B-18 | **(附件统一真栈验收顺带发现,pre-existing,全 app)** `/v1/agents/...` 前缀下**匹配不到路由**的请求(例:路径参数里带 `%2F`/`%3A`,Starlette 解码后 `{upload_id}` 段吃不下 `/`)返回框架裸 404 `{"detail":"Not Found"}`,不套第三方信封;对外信封处理器只接 `RequestValidationError`。conventions.md 已泛泛写「不是所有错误都有 error.code」,可加一句「路径拼错是裸 404」;或给对外前缀加 404 信封 |
 | B-19 | **(第四轮文档终审 C-1 核代码顺带发现,pre-existing)** `check_admission` → `QuotaService.check` 对租户配置的**全部** bucket 维度逐个扣费,不按 `resource_kind` 过滤:发起对话 / 产物下载各扣 `image_upload_count_30d` 1 次、`image_storage_bytes` 1 字节(如配置了这两行);图片存储写满后发起对话也会 429 `dimension=image_storage_bytes`。另:redis Lua 对 `refill_rate=0` 的黏性维度算 `retry_ms = need*1000/0`(除零 → inf → 整数化不可控),`Retry-After` 值无意义;in-memory 用 `max(rate,1e-9)` 得到天文数字。文档已按「按字节配额重试无效、先读 dimension」措辞绕开;代码侧应按 resource_kind 选维度 + 黏性维度不给 Retry-After |
-| B-20 | **审批列表分流:安全审批 vs 业务澄清混排**(2026-08-21 立项,源头 ask_for_approval 机制讨论)。现状 `ApprovalsList.tsx` 单平铺表,`reason_kind` 仅作展示列,筛选只有 status;安全单(policy_gate/risk_confirmation/强制审批闸)与澄清单(missing_info/ambiguous_requirement/approach_choice)同池 → 审批疲劳淹没安全单 + 权限错配(员工的澄清单跑进管理员视野)。改法:①列表按 reason_kind 分「安全审批/待确认」两 tab(纯前端,字段现成);②通知路由分开——安全单→管理员/告警,澄清单→发起 run 的员工(对话内横幅);③超时策略按类配(安全单超时拒;澄清单支持超时按保守默认继续/取消,别一刀切 24h);④权限:澄清单发起人自决,安全单须审批角色。①③小,②中。**开触发器/定时生成场景前必做** |
+| B-20 | ~~**审批列表分流:安全审批 vs 业务澄清混排**~~ **✅ 主体已交付(2026-08-23)**:①两 tab(协议单源分类 `SAFETY/CLARIFICATION_REASON_KINDS` + `GET /v1/approvals?kind_class=` + 前端「安全审批/待确认」tab 带对侧徽章)✅;③超时按类配(`policies.clarification_timeout_s` 默认 1h,mint 按类选,sweep 对澄清单的超时理由改为「按保守默认继续并说明假设」——ask_for_approval reject 非终局,agent 收到即续跑)✅;④ decide/resume 三端点补 `require("session","write")`,堵 viewer 可裁任意单的洞 ✅(「澄清单发起人自决」推迟:run 上没记发起员工身份,随 D-6 一起做)。**剩余**:② 通知路由——澄清单对话内横幅归 D-6,安全单 alertmanager 告警归 X-7 |
 
 ---
 
@@ -402,13 +402,13 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 ---
 
-## 建议顺序(2026-08-21 更新)
+## 建议顺序(2026-08-23 更新)
 
-> 第 1~4 条为 2026-08-21 立项,用户指示**优先级最高**;但**一律等用户口令再开工,勿自行开始**。
+> 2026-08-23 用户口令:先做「ask_for_approval 默认关+配置开关」(✅ #1252)→ B-20(✅ 主体交付)→ D-6 剩余(含 D-5 依赖)。其余仍**等用户口令再开工**。
 
-1. **X-14 P1+P2**(发布稳定性:金丝雀 run 进 release.sh + 受保护钉版 CI 卫兵)—— e2b 事故复盘产物,~1.5 天
-2. **D-5**(对话详情页按轮重建+尾轮 live)→ **D-6**(就地批/拒/取消,依赖 D-5)
-3. **B-20**(审批列表分流)—— 开触发器/定时生成场景前必做
+1. ~~**B-20**(审批列表分流)~~ ✅ 主体已交付(2026-08-23);② 通知路由拆给 D-6(对话内横幅)与 X-7(告警)
+2. **D-5**(对话详情页按轮重建+尾轮 live)→ **D-6**(就地批/拒/取消,依赖 D-5;含 B-20 遗留「澄清单发起人自决」)—— **用户已下口令,进行中**
+3. **X-14 P1+P2**(发布稳定性:金丝雀 run 进 release.sh + 受保护钉版 CI 卫兵)—— e2b 事故复盘产物,~1.5 天
 4. **X-13**(e2b SDK 升级迁移)—— 与 X-11/X-12 同为钉版迁移池,择机
 5. **B-19**(配额 check 不按 resource_kind 过滤维度)—— 直接影响对外 429 行为,工程可直接开工
 6. **P-1~P-5 拍板** —— 产品题,不拍板工程动不了;P-4(api_keys 凭据横向扩散)风险最高建议先议

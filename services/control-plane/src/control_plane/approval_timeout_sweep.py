@@ -45,7 +45,7 @@ from expert_work.persistence.rls import (
     current_tenant_id_var,
     current_user_id_var,
 )
-from expert_work.protocol import ApprovalStatus
+from expert_work.protocol import ApprovalStatus, approval_kind_class
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.approval_timeout_sweep")
@@ -170,16 +170,37 @@ class ApprovalTimeoutSweep:
         for appr in expired:
             with _tenant_scope(appr.tenant_id, appr.user_id):
                 won = await self._resolve_one(
-                    appr.tenant_id, appr.thread_id, appr.run_id, appr.user_id
+                    appr.tenant_id,
+                    appr.thread_id,
+                    appr.run_id,
+                    appr.user_id,
+                    reason_kind=appr.reason_kind,
                 )
                 if won:
                     swept += 1
         return swept
 
     async def _resolve_one(
-        self, tenant_id: UUID, thread_id: UUID, run_id: UUID, user_id: UUID | None
+        self,
+        tenant_id: UUID,
+        thread_id: UUID,
+        run_id: UUID,
+        user_id: UUID | None,
+        *,
+        reason_kind: str = "policy_gate",
     ) -> bool:
         """Auto-reject one expired approval; ``True`` iff this call won the CAS."""
+        # B-20 approval triage — a timed-out *clarification* (agent question,
+        # non-terminal reject) tells the agent to continue on its own
+        # conservative default; a safety row keeps the plain timeout reason
+        # (terminal for the declarative gate).
+        if approval_kind_class(reason_kind) == "clarification":
+            timeout_reason = (
+                "no human response before the clarification deadline — proceed "
+                "with your own conservative default and state the assumptions you made"
+            )
+        else:
+            timeout_reason = "approval timed out"
         try:
             run_record, _continuation, replayed = await resolve_approval_decision(
                 tenant_id=tenant_id,
@@ -194,7 +215,7 @@ class ApprovalTimeoutSweep:
                 graph_decision="reject",
                 db_status=ApprovalStatus.TIMEOUT,
                 modified_args=None,
-                reason="approval timed out",
+                reason=timeout_reason,
                 threads=self._threads,
                 audit=self._audit,
                 agent_repo=self._agents,
