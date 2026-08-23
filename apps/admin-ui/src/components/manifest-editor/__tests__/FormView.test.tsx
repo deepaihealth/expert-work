@@ -249,6 +249,7 @@ describe("FormView", () => {
     renderSection("tools");
     expect(screen.getByTestId("af-tool-exec_python")).toBeInTheDocument();
     expect(screen.getByTestId("af-tool-bash")).toBeInTheDocument();
+    expect(screen.getByTestId("af-tool-ask_for_approval")).toBeInTheDocument();
     expect(screen.getByTestId("af-tool-manage_task")).toBeInTheDocument();
     expect(screen.getByTestId("af-tool-author_skill")).toBeInTheDocument();
     expect(screen.getByTestId("af-tool-refine_skill")).toBeInTheDocument();
@@ -277,9 +278,24 @@ describe("FormView", () => {
     );
   });
 
+  it("checking ask_for_approval (opt-in, default OFF) adds its builtin tool entry", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSection("tools", SEED, onChange);
+    await user.click(screen.getByTestId("af-tool-ask_for_approval"));
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "builtin", name: "ask_for_approval" }),
+      ]),
+    );
+  });
+
   it("new-agent default seed: every toggleable tool (incl. web_search/http/opt-in-7) checked on", () => {
     const seeded = parseYaml(BASE_MANIFEST_YAML) as AgentManifest;
     renderSection("tools", seeded);
+    // default OFF since 2026-08-23 — not seeded, toggle present but unchecked
+    expect(screen.getByTestId("af-tool-ask_for_approval")).not.toBeChecked();
     expect(screen.getByTestId("af-tool-web_search")).toBeChecked();
     expect(screen.getByTestId("af-tool-http")).toBeChecked();
     expect(screen.getByTestId("af-tool-exec_python")).toBeChecked();

@@ -100,12 +100,15 @@ const FIELD: React.CSSProperties = { marginBottom: 16 };
 const LABEL: React.CSSProperties = { display: "block", marginBottom: 4 };
 
 // Builtin tools that get a form toggle. exec_python/bash are seeded default-ON
-// (removable); the rest are opt-in default-OFF. The essential file/artifact/
+// (removable); the rest are opt-in default-OFF (ask_for_approval since
+// 2026-08-23 — chat agents should just ask in conversation; the tool is for
+// unattended runs / audited sign-offs). The essential file/artifact/
 // read/remember builtins are seeded but intentionally have NO toggle (edit YAML
 // to change) — they are NOT in this list.
 const BUILTIN_TOGGLES = [
   { name: "exec_python", key: "tool_exec_python" },
   { name: "bash", key: "tool_bash" },
+  { name: "ask_for_approval", key: "tool_ask_for_approval" },
   { name: "manage_task", key: "tool_manage_task" },
   { name: "author_skill", key: "tool_author_skill" },
   { name: "refine_skill", key: "tool_refine_skill" },
