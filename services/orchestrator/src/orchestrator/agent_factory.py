@@ -1080,6 +1080,7 @@ async def build_agent(
         # Stream J.8 (Mini-ADR J-24) — declarative approval gate.
         approval_required_tools=frozenset(spec.spec.policies.approval_required_tools),
         approval_timeout_s=spec.spec.policies.approval_timeout_s,
+        clarification_timeout_s=spec.spec.policies.clarification_timeout_s,
         memory_recall_mode=memory_recall_mode,
         # Stream RT-2 PR-2 (RT-ADR-10) — memory injection budget, riding the
         # same shared estimator the compressor uses (HX-A1 single truth source).

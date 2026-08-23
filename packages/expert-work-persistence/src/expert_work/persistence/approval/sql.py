@@ -114,12 +114,15 @@ class SqlApprovalStore(ApprovalStore):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
         async with self._sf() as session:
             base = select(AgentApprovalRow).where(
                 AgentApprovalRow.tenant_id == tenant_id,
                 AgentApprovalRow.status == status.value,
             )
+            if reason_kinds is not None:
+                base = base.where(AgentApprovalRow.reason_kind.in_(tuple(reason_kinds)))
             total = int(
                 (
                     await session.execute(select(func.count()).select_from(base.subquery()))
@@ -144,9 +147,12 @@ class SqlApprovalStore(ApprovalStore):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
         async with self._sf() as session:
             base = select(AgentApprovalRow).where(AgentApprovalRow.status == status.value)
+            if reason_kinds is not None:
+                base = base.where(AgentApprovalRow.reason_kind.in_(tuple(reason_kinds)))
             total = int(
                 (
                     await session.execute(select(func.count()).select_from(base.subquery()))

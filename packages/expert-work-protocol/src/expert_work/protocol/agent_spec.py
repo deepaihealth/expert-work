@@ -946,7 +946,24 @@ class PolicySpec(BaseModel):
             "Stream J.8 (Mini-ADR J-24) — seconds a pending approval "
             "may sit before the timeout job auto-rejects it. Default "
             "24h; an un-actioned approval otherwise pins a checkpointer "
-            "slot forever (resource leak)."
+            "slot forever (resource leak). B-20: applies to the *safety* "
+            "class (policy_gate / risk_confirmation); clarification "
+            "requests use ``clarification_timeout_s``."
+        ),
+    )
+    clarification_timeout_s: int = Field(
+        default=3600,
+        ge=60,
+        le=604800,
+        description=(
+            "B-20 approval triage — seconds a *clarification* approval "
+            "(missing_info / ambiguous_requirement / approach_choice, "
+            "raised via ``ask_for_approval``) waits for a human before "
+            "the timeout sweep resumes the run with a 'proceed on your "
+            "own conservative default' reject. Default 1h — a question "
+            "nobody answers should not park a run for a day; the reject "
+            "is non-terminal for agent-initiated approvals, so the "
+            "agent continues and states its assumptions."
         ),
     )
     tool_use_enforcement: Literal["auto", "on", "off"] = Field(

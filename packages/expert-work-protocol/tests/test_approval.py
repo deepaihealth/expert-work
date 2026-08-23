@@ -7,7 +7,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from expert_work.protocol import ApprovalDecision, ApprovalRequest, canonical_args_digest
+from expert_work.protocol import (
+    CLARIFICATION_REASON_KINDS,
+    SAFETY_REASON_KINDS,
+    ApprovalDecision,
+    ApprovalReasonKind,
+    ApprovalRequest,
+    approval_kind_class,
+    canonical_args_digest,
+)
 
 
 def _now() -> datetime:
@@ -162,3 +170,31 @@ def test_approval_request_carries_binding_digest() -> None:
         binding_digest=canonical_args_digest({"command": "ls"}),
     )
     assert req.binding_digest == canonical_args_digest({"command": "ls"})
+
+
+# ---------------------------------------------------------------------------
+# B-20 approval triage — the safety / clarification partition
+# ---------------------------------------------------------------------------
+
+
+def test_kind_class_sets_partition_all_reason_kinds() -> None:
+    """SAFETY ∪ CLARIFICATION covers every reason kind, with no overlap."""
+    from typing import get_args
+
+    all_kinds = set(get_args(ApprovalReasonKind))
+    assert SAFETY_REASON_KINDS | CLARIFICATION_REASON_KINDS == all_kinds
+    assert not (SAFETY_REASON_KINDS & CLARIFICATION_REASON_KINDS)
+
+
+def test_approval_kind_class_mapping() -> None:
+    assert approval_kind_class("policy_gate") == "safety"
+    assert approval_kind_class("risk_confirmation") == "safety"
+    assert approval_kind_class("missing_info") == "clarification"
+    assert approval_kind_class("ambiguous_requirement") == "clarification"
+    assert approval_kind_class("approach_choice") == "clarification"
+
+
+def test_approval_kind_class_unknown_fails_closed_to_safety() -> None:
+    """A reason kind this build does not know must get sign-off semantics."""
+    assert approval_kind_class("some_future_kind") == "safety"
+    assert approval_kind_class("") == "safety"

@@ -48,11 +48,15 @@ from expert_work.protocol.agent_template_resolve import (
     resolve_extends,
 )
 from expert_work.protocol.approval import (
+    CLARIFICATION_REASON_KINDS,
+    SAFETY_REASON_KINDS,
     ApprovalDecision,
+    ApprovalKindClass,
     ApprovalReasonKind,
     ApprovalRecord,
     ApprovalRequest,
     ApprovalStatus,
+    approval_kind_class,
     canonical_args_digest,
 )
 from expert_work.protocol.artifact import Artifact, ArtifactKind, ArtifactVersion
@@ -300,7 +304,10 @@ __all__ = [
     "ApiKey",
     "ApiKeyCreated",
     "ApiKeyScope",
+    "CLARIFICATION_REASON_KINDS",
+    "SAFETY_REASON_KINDS",
     "ApprovalDecision",
+    "ApprovalKindClass",
     "ApprovalReasonKind",
     "ApprovalRecord",
     "ApprovalRequest",
@@ -479,6 +486,7 @@ __all__ = [
     "WebhookPayloadFormat",
     "WorkflowSpec",
     "apply_markup",
+    "approval_kind_class",
     "canonical_args_digest",
     "catalog_entry",
     "enforce_security_floor",

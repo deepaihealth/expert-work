@@ -105,6 +105,7 @@ async def _seed_approval(
     status: str = "pending",
     requested_at: datetime | None = None,
     summary: str = "approval-gated tool 'send_email'",
+    reason_kind: str = "policy_gate",
 ) -> UUID:
     run_id = uuid4()
     app = client._transport.app  # type: ignore[attr-defined,union-attr]
@@ -117,7 +118,7 @@ async def _seed_approval(
             thread_id=UUID(thread_id),
             request_id=f"approval:{run_id}",
             node="tools",
-            reason_kind="policy_gate",
+            reason_kind=reason_kind,  # type: ignore[arg-type]  # tests seed valid values
             action_summary=summary,
             proposed_args={"to": "ops@example.com"},
             requested_at=now,
@@ -292,3 +293,99 @@ async def test_decide_cross_tenant_run_is_404_item(approvals_client: AsyncClient
     item = resp.json()["data"]["results"][0]
     assert item["ok"] is False
     assert item["status_code"] == 404
+
+
+# ---------------------------------------------------------------------------
+# B-20 approval triage — kind_class filter + operator-only decide
+# ---------------------------------------------------------------------------
+
+
+async def test_list_filters_by_kind_class(approvals_client: AsyncClient) -> None:
+    thread_id = await _create_session(approvals_client)
+    now = datetime.now(UTC)
+    gate = await _seed_approval(
+        approvals_client, thread_id, requested_at=now, reason_kind="policy_gate"
+    )
+    risk = await _seed_approval(
+        approvals_client,
+        thread_id,
+        requested_at=now + timedelta(minutes=1),
+        reason_kind="risk_confirmation",
+    )
+    question = await _seed_approval(
+        approvals_client,
+        thread_id,
+        requested_at=now + timedelta(minutes=2),
+        reason_kind="missing_info",
+    )
+    fork = await _seed_approval(
+        approvals_client,
+        thread_id,
+        requested_at=now + timedelta(minutes=3),
+        reason_kind="approach_choice",
+    )
+
+    resp = await approvals_client.get("/v1/approvals", params={"kind_class": "safety"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["total"] == 2
+    assert {item["run_id"] for item in data["items"]} == {str(gate), str(risk)}
+
+    resp = await approvals_client.get("/v1/approvals", params={"kind_class": "clarification"})
+    data = resp.json()["data"]
+    assert data["total"] == 2
+    assert {item["run_id"] for item in data["items"]} == {str(question), str(fork)}
+
+    # No filter — the untabbed view still returns everything.
+    resp = await approvals_client.get("/v1/approvals")
+    assert resp.json()["data"]["total"] == 4
+
+
+async def test_list_rejects_unknown_kind_class(approvals_client: AsyncClient) -> None:
+    resp = await approvals_client.get("/v1/approvals", params={"kind_class": "bogus"})
+    assert resp.status_code == 422
+
+
+async def test_decide_requires_operator_role(approvals_client: AsyncClient) -> None:
+    """B-20 ④ — a viewer JWT must not decide approvals (403, any payload)."""
+    viewer = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"}
+    resp = await approvals_client.post(
+        "/v1/approvals:decide",
+        headers=viewer,
+        json={
+            "decisions": [
+                {"thread_id": str(uuid4()), "run_id": str(uuid4()), "decision": "approve"}
+            ]
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_resume_requires_operator_role(approvals_client: AsyncClient) -> None:
+    """B-20 ④ — the single-run resume endpoint carries the same gate."""
+    viewer = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"}
+    resp = await approvals_client.post(
+        f"/v1/sessions/{uuid4()}/runs/{uuid4()}/resume",
+        headers=viewer,
+        json={"decision": "approve"},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_decide_passes_operator_role(approvals_client: AsyncClient) -> None:
+    """Operator clears the gate — a bogus run lands a per-item error, not 403."""
+    operator = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('operator',))}"
+    }
+    resp = await approvals_client.post(
+        "/v1/approvals:decide",
+        headers=operator,
+        json={
+            "decisions": [
+                {"thread_id": str(uuid4()), "run_id": str(uuid4()), "decision": "approve"}
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["data"]["results"]
+    assert len(results) == 1 and results[0]["ok"] is False

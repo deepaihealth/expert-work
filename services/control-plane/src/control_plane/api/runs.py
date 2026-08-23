@@ -38,7 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import console_only, require_key_scope
+from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer
 from control_plane.api._session_title import title_from_text
@@ -1770,7 +1770,13 @@ def build_runs_router() -> APIRouter:
     @router.post(
         "/{thread_id}/runs/{run_id}/resume",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        # B-20 ④ — a resume applies a human approval verdict; operator+ only
+        # (viewer JWTs previously passed — require_key_scope gates keys only).
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def resume_run(
         thread_id: UUID,

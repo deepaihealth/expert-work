@@ -63,12 +63,14 @@ class ApprovalStore(abc.ABC):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
         """One tenant's approval rows in ``status`` + the total count.
 
         Stream HX-7 — backs ``GET /v1/approvals`` (the admin queue
         page). Ordered ``requested_at ASC`` — queue semantics, oldest
-        waiting first.
+        waiting first. ``reason_kinds`` (B-20) narrows to rows whose
+        ``reason_kind`` is in the set; ``None`` = no filter.
         """
 
     @abc.abstractmethod
@@ -78,6 +80,7 @@ class ApprovalStore(abc.ABC):
         status: ApprovalStatus,
         limit: int = 100,
         offset: int = 0,
+        reason_kinds: Sequence[str] | None = None,
     ) -> tuple[list[ApprovalRecord], int]:
         """Cross-tenant rows in ``status`` + total (Stream HX-7).
 
