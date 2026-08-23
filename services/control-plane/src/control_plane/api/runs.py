@@ -1895,11 +1895,30 @@ def build_runs_router() -> APIRouter:
             persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
         if persisted is None or persisted.thread_id != thread_id:
             raise HTTPException(status_code=404, detail="run not found")
+        # 终审 C-1 — pre-filter BEFORE touching either cancel primitive:
+        # ``RunManager.cancel()`` returns True iff an in-memory record exists
+        # — regardless of its status — so an unconditional call would report
+        # an already-finished (or paused) run as freshly stopped, 200 the
+        # caller and leave an untrue SESSION_CANCEL audit row. Same guard as
+        # the kernel's other call sites (``external_runs.py:206`` spells out
+        # the trap). PAUSED is in TERMINAL_RUN_STATUSES, so the "decide the
+        # approval instead" branch rides the same check.
+        if persisted.status in TERMINAL_RUN_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "run is not cancellable (already terminal, or paused — "
+                    "decide the approval instead)"
+                ),
+            )
 
-        stopped = await runtime.run_manager.cancel(run_id) or await runs.request_cancel(
-            run_id=run_id, tenant_id=target_tenant, updated_at=datetime.now(UTC)
-        )
+        async with applied_scope(scope):
+            stopped = await runtime.run_manager.cancel(run_id) or await runs.request_cancel(
+                run_id=run_id, tenant_id=target_tenant, updated_at=datetime.now(UTC)
+            )
         if not stopped:
+            # The status flipped terminal between our read and the CAS — the
+            # run finished (or a peer cancelled it) first.
             raise HTTPException(
                 status_code=409,
                 detail=(

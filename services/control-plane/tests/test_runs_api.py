@@ -1870,6 +1870,58 @@ async def test_cancel_run_terminal_row_is_409(runs_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_run_terminal_with_local_manager_record_is_409(
+    runs_client: AsyncClient,
+) -> None:
+    """终审 C-1/I-7 — the 409 must hold even when THIS instance still holds
+    the run's in-memory RunManager record: ``RunManager.cancel()`` returns
+    True for any known record regardless of status, so without the terminal
+    pre-filter this would 200 + set the record's abort_event."""
+    from datetime import UTC, datetime
+    from uuid import uuid4 as _uuid4
+
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = _uuid4()
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    runtime = app.state.agent_runtime
+    record = await runtime.run_manager.create(
+        run_id=run_id,
+        thread_id=UUID(thread_id),
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        user_id=None,
+    )
+    await app.state.run_store.set_status(
+        run_id=run_id,
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+    )
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 409, resp.text
+    # The in-memory record was never touched — no phantom abort.
+    assert not record.abort_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_paused_row_is_409_decide_instead(runs_client: AsyncClient) -> None:
+    """A paused run is decided through the approval path, never cancelled."""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.PAUSED)
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 409, resp.text
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
+    assert row is not None
+    assert row.status is RunStatus.PAUSED
+
+
+@pytest.mark.asyncio
 async def test_cancel_run_wrong_thread_is_404(runs_client: AsyncClient) -> None:
     from expert_work.runtime.runs import RunStatus
 
