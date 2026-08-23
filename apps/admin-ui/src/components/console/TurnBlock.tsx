@@ -49,6 +49,10 @@ export interface TurnBlockProps {
   rate: RateCardRecord | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
+  /** D-6 — let the approval gate render (and decide) even on a read-only
+   *  page: the conversation page keeps every other affordance read-only but
+   *  gives operator+ the in-place approve/reject. Default off. */
+  allowDecide?: boolean;
   isTenantSwitched: boolean;
   onDecide: (
     turnId: string,
@@ -114,6 +118,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     liveByStep,
     rate,
     readOnly,
+    allowDecide = false,
     isTenantSwitched,
     onDecide,
     deciding,
@@ -201,7 +206,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         readOnly={readOnly}
       />
 
-      {!readOnly && approval && threadId && (
+      {(!readOnly || allowDecide) && approval && threadId && (
         <ReadonlyTooltip on={isTenantSwitched} block>
           <ApprovalGate
             approval={approval}

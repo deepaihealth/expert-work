@@ -55,6 +55,8 @@ export interface TranscriptProps {
   rate: RateCardRecord | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
+  /** D-6 — 透传 ``TurnBlock.allowDecide``:只读页上单独放行审批卡。 */
+  allowDecide?: boolean;
   isTenantSwitched: boolean;
   onDecide: (
     turnId: string,
@@ -94,6 +96,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     rate,
     isSystemAdmin,
     readOnly,
+    allowDecide = false,
     isTenantSwitched,
     onDecide,
     deciding,
@@ -209,6 +212,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           rate={rate}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
+          allowDecide={allowDecide}
           isTenantSwitched={isTenantSwitched}
           onDecide={onDecide}
           deciding={deciding}
@@ -240,6 +244,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           rate={rate}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
+          allowDecide={allowDecide}
           isTenantSwitched={isTenantSwitched}
           onDecide={onDecide}
           deciding={deciding}

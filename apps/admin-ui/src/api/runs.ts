@@ -267,6 +267,17 @@ interface ThreadRunRow {
 
 /** List a thread's runs oldest-first. ``tenantId`` (a system_admin drilling
  *  into a foreign tenant) is a no-op for a caller's own tenant. */
+/** POST /v1/sessions/{thread}/runs/{run}:cancel — D-6, cancel one in-flight
+ *  run (running / pending / queued). 409 when the run is already terminal or
+ *  paused (a paused run is decided through the approval path instead). */
+export async function cancelRun(threadId: string, runId: string): Promise<void> {
+  const response = await apiClient.post<ApiEnvelope<{ cancelled: boolean }>>(
+    `/v1/sessions/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}:cancel`,
+    {},
+  );
+  unwrap(response.data);
+}
+
 export async function listThreadRuns(
   threadId: string,
   tenantId?: string,

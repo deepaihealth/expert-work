@@ -16,7 +16,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { listThreadRuns, streamRunEvents } from "../../api/runs";
+import { listThreadRuns, streamRunEvents, type RunTokens } from "../../api/runs";
 import {
   getSessionMessages,
   type HistoryMessage,
@@ -51,6 +51,13 @@ export interface UseHistoryTurns {
    *  switch). Deliberately does NOT abort the in-flight fetch — same as the
    *  original ``resetDraft``. */
   reset: () => void;
+  /** D-5 — patch already-built turns' status/tokens from a fresh run-list
+   *  read WITHOUT re-pairing (re-pairing a thread whose paused run's
+   *  continuation has finished would flatten the whole page — ROADMAP D-7).
+   *  Identity-stable: returns the same ``turns`` array when nothing changed. */
+  patchRuns: (
+    runs: readonly { runId: string; status: string; tokens: RunTokens | null }[],
+  ) => void;
 }
 
 export interface UseHistoryTurnsOptions {
@@ -329,6 +336,32 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
     };
   }, []);
 
+  const patchRuns = useCallback(
+    (runs: readonly { runId: string; status: string; tokens: RunTokens | null }[]) => {
+      const byId = new Map(runs.map((r) => [r.runId, r]));
+      for (const r of runs) {
+        if (runStatusRef.current.has(r.runId)) runStatusRef.current.set(r.runId, r.status);
+      }
+      setHistoryTurns((prev) => {
+        if (prev === null) return prev;
+        let changed = false;
+        const next = prev.map((h) => {
+          const r = byId.get(h.runId);
+          if (r === undefined) return h;
+          // Only in-flight turns take the patch: a terminal status never
+          // changes again, and the pairing source (``listThreadRuns``) stays
+          // authoritative for turns it already settled.
+          if (!NON_TERMINAL_RUN_STATUSES.has(h.status)) return h;
+          if (r.status === h.status && r.tokens === h.tokens) return h;
+          changed = true;
+          return { ...h, status: r.status, tokens: r.tokens };
+        });
+        return changed ? next : prev;
+      });
+    },
+    [],
+  );
+
   return {
     messages: history,
     turns: historyTurns,
@@ -337,5 +370,6 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
     loadRuns,
     load,
     reset,
+    patchRuns,
   };
 }

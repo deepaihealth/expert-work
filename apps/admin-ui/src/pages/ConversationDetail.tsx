@@ -17,15 +17,27 @@
  * flat M1.5 message block it has always rendered.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Card, Empty, Segmented, Skeleton, Space, Tag, Typography } from "antd";
+import {
+  Alert,
+  Button,
+  Card,
+  Empty,
+  Popconfirm,
+  Segmented,
+  Skeleton,
+  Space,
+  Tag,
+  Typography,
+  message,
+} from "antd";
 import { useLocation, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
-import type { ApprovalItem } from "../api/approvals";
+import { decideApprovals, type ApprovalItem } from "../api/approvals";
 import { downloadArtifact } from "../api/artifacts";
 import { ApiError } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
-import { streamRunEvents } from "../api/runs";
+import { cancelRun, streamRunEvents } from "../api/runs";
 import { computeSessionStats } from "../api/session_stats";
 import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/sessions";
 import type { FireNowResult } from "../api/triggers";
@@ -44,6 +56,7 @@ import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine"
 import { downloadJson } from "../components/turn/download_json";
 import type { Turn } from "../components/turn/types";
 import { useHistoryTurns } from "../components/turn/useHistoryTurns";
+import { NON_TERMINAL_RUN_STATUSES } from "./agent_detail/playground/history_turns";
 import type { LiveStep } from "./agent_detail/playground/useTokenStream";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { formatCompact } from "../utils/runFormat";
@@ -68,12 +81,6 @@ const EMPTY_TASK_RESULTS: readonly FireNowResult[] = [];
 const EMPTY_FLAT_HISTORY: readonly HistoryMessage[] = [];
 const EMPTY_LIVE_TURNS: readonly Turn[] = [];
 const EMPTY_TIMINGS: Readonly<Record<string, TurnTiming>> = {};
-/** The read-only page never dispatches an approval decision — ``Transcript``
- *  requires the callback regardless (no turn ever carries a pending
- *  ``approval`` here, since history turns are always synthesised with
- *  ``approval: null``). */
-function noopOnDecide(_turnId: string, _approval: ApprovalItem, _decision: "approve" | "reject"): void {}
-
 export function ConversationDetail() {
   const { t } = useTranslation();
   const location = useLocation();
@@ -97,7 +104,19 @@ export function ConversationDetail() {
   // than erroring the page. ``[]`` renders an explicit empty state.
   const [messages, setMessages] = useState<HistoryMessage[] | null>(null);
 
-  // 只读调试台 — count-paired lazy console turns + each one's replay state.
+  // D-5 — a live-attached tail run just went terminal: silently re-read the
+  // summary + run list (statuses/tokens patch in below; a NEW run — someone
+  // sent another message, or an approval decide spawned a continuation —
+  // grows the run list and triggers a full re-pair).
+  const refreshRef = useRef<(opts?: { silent?: boolean }) => Promise<void>>(
+    async () => {},
+  );
+  const handleRunTerminal = useCallback(() => {
+    void refreshRef.current({ silent: true });
+  }, []);
+
+  // 调试台组件族 — count-paired lazy console turns + each one's replay state;
+  // D-5 adds the live attach for non-terminal tail runs.
   const {
     turns: historyTurns,
     loads: historyLoads,
@@ -105,7 +124,10 @@ export function ConversationDetail() {
     loadRuns: loadHistoryRuns,
     load: loadHistory,
     reset: resetHistory,
-  } = useHistoryTurns();
+    patchRuns: patchHistoryRuns,
+  } = useHistoryTurns({ onRunTerminal: handleRunTerminal });
+  const [deciding, setDeciding] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [exportingId, setExportingId] = useState<string | null>(null);
   // R9 — 中栏轮高亮:``null`` = 跟随最新一轮;点轮块 / 脚注「查看轨迹」置为该轮。
   const [selectedTurnKey, setSelectedTurnKey] = useState<string | null>(null);
@@ -114,9 +136,12 @@ export function ConversationDetail() {
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
   const focusNonceRef = useRef(0);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts: { silent?: boolean } = {}) => {
     if (!threadId) return;
-    setLoading(true);
+    // D-5 — ``silent`` skips the loading flip: a background status refresh
+    // (run just finished / approval decided) must not unmount the whole
+    // page into a skeleton while live turns are on screen.
+    if (!opts.silent) setLoading(true);
     setError(null);
     let loaded: ConversationDetailModel | null = null;
     try {
@@ -131,7 +156,7 @@ export function ConversationDetail() {
             : "unknown error",
       );
     } finally {
-      setLoading(false);
+      if (!opts.silent) setLoading(false);
     }
     // Best-effort, independent of the summary fetch — a transcript
     // failure must never take down the operational view. The thread's
@@ -148,6 +173,7 @@ export function ConversationDetail() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  refreshRef.current = refresh;
 
   // D3 (lifted, W2) — the replay/runs endpoints are scope-aware now, so the
   // rich transcript rebuilds for any tenant's thread; the thread's own
@@ -157,23 +183,66 @@ export function ConversationDetail() {
   // the rebuild to the thread actually being viewed rather than whatever
   // the last fetch resolved.
   const viewedConvo = convo !== null && convo.thread_id === threadId ? convo : null;
+  // D-5 — key the rebuild on (thread, tenant), NOT on the ``convo`` object:
+  // every silent refresh produces a fresh object, and re-pairing on each one
+  // would flatten a thread whose paused run's continuation just finished
+  // (mid-thread paused → honest degradation; ROADMAP D-7). Growth-triggered
+  // re-pairs are handled explicitly below.
+  const viewedReady = viewedConvo !== null;
+  const viewedTenantId = viewedConvo?.tenant_id;
+
+  // D-5 — one growth-triggered re-pair per run count: without this, a
+  // (possibly transient) disagreement between ``convo.runs`` and
+  // ``listThreadRuns`` would re-pair in a loop.
+  const repairAttemptRef = useRef(0);
 
   useEffect(() => {
-    if (!threadId || viewedConvo === null) {
+    if (!threadId || !viewedReady) {
       // H-1 — the route's param can change without remounting this
       // component (react-router keys by route id, not ``:threadId``), so a
       // thread switch must explicitly clear whatever turn cards the
       // previous thread built here; otherwise they linger over the new
       // thread's own content indefinitely.
       resetHistory();
+      repairAttemptRef.current = 0;
       return;
     }
-    void loadHistory(threadId, viewedConvo.tenant_id);
-  }, [threadId, viewedConvo, loadHistory, resetHistory]);
+    void loadHistory(threadId, viewedTenantId);
+  }, [threadId, viewedReady, viewedTenantId, loadHistory, resetHistory]);
+
+  const convoRuns = convo?.runs;
+
+  // D-5 — a fresh run-list read after the initial pairing: a NEW run
+  // (another user message, or an approval decide's continuation) re-pairs
+  // the whole thread; otherwise just patch status/tokens onto the existing
+  // turns (identity-stable when nothing changed).
+  useEffect(() => {
+    if (!threadId || !convoRuns || historyTurns === null) return;
+    if (convoRuns.length > historyTurns.length) {
+      if (repairAttemptRef.current !== convoRuns.length) {
+        repairAttemptRef.current = convoRuns.length;
+        void loadHistory(threadId, viewedTenantId);
+      }
+      return;
+    }
+    patchHistoryRuns(
+      convoRuns.map((r) => ({ runId: r.run_id, status: r.status, tokens: r.tokens })),
+    );
+  }, [threadId, convoRuns, historyTurns, viewedTenantId, loadHistory, patchHistoryRuns]);
+
+  // D-5 — non-terminal tail runs attach eagerly (live view should not wait
+  // for the row to scroll into the viewport). ``loadHistoryRuns`` skips
+  // already-started replays, so this is idempotent across re-renders.
+  useEffect(() => {
+    if (!threadId || historyTurns === null) return;
+    const tail = historyTurns
+      .filter((h) => NON_TERMINAL_RUN_STATUSES.has(h.status))
+      .map((h) => h.runId);
+    if (tail.length > 0) void loadHistoryRuns(tail, threadId);
+  }, [threadId, historyTurns, loadHistoryRuns]);
 
   // One ordered timeline over the lazily-rebuilt history turns (Task 5 view
-  // model, shared with the playground) — this page never has live turns.
-  const convoRuns = convo?.runs;
+  // model, shared with the playground); D-5 — the tail may be live.
   const consoleTurns = useMemo(() => {
     const built = buildConsoleTurns({
       historyTurns,
@@ -218,6 +287,76 @@ export function ConversationDetail() {
     threadId: threadId ?? null,
     liveEvents: loadedEvents,
   });
+
+  // D-6 — operations gate: operator/admin (session:write, mirrored by the
+  // backend's require("session","write")) and only in the home tenant (the
+  // decide/cancel endpoints act on the caller's own tenant).
+  const canOperate =
+    concreteTenantScope(apiTenantScope) === undefined &&
+    ((identity?.roles ?? []).some((r) => r === "admin" || r === "operator") ||
+      isSystemAdmin);
+
+  // D-5 — the tail live turn (running/pending/paused maps to a running
+  // console turn); drives auto-scroll + the header's cancel affordance.
+  const liveTurnKey = useMemo(() => {
+    const last = consoleTurns[consoleTurns.length - 1];
+    return last !== undefined && last.turn.status === "running" ? last.key : null;
+  }, [consoleTurns]);
+  const cancellableRun = useMemo(() => {
+    const last = convoRuns?.[convoRuns.length - 1];
+    return last !== undefined && (last.status === "running" || last.status === "pending")
+      ? last
+      : null;
+  }, [convoRuns]);
+
+  // D-6 — decide a paused turn's approval in place, then silently refresh:
+  // the continuation run shows up in the run list, the growth effect
+  // re-pairs, and the new tail live-attaches.
+  const handleDecide = useCallback(
+    (_turnId: string, approval: ApprovalItem, decision: "approve" | "reject") => {
+      void (async () => {
+        setDeciding(true);
+        try {
+          const result = await decideApprovals([
+            { thread_id: approval.thread_id, run_id: approval.run_id, decision },
+          ]);
+          const item = result.results[0];
+          if (item?.ok) {
+            message.success(t("conversations_detail.decide_ok"));
+          } else {
+            message.error(item?.error ?? t("conversations_detail.decide_failed"));
+          }
+        } catch (err) {
+          message.error(
+            err instanceof Error ? err.message : t("conversations_detail.decide_failed"),
+          );
+        } finally {
+          setDeciding(false);
+          void refresh({ silent: true });
+        }
+      })();
+    },
+    [refresh, t],
+  );
+
+  const handleCancelRun = useCallback(() => {
+    const target = cancellableRun;
+    if (!threadId || target === null) return;
+    void (async () => {
+      setCancelling(true);
+      try {
+        await cancelRun(threadId, target.run_id);
+        message.success(t("conversations_detail.cancel_done"));
+      } catch (err) {
+        message.error(
+          err instanceof Error ? err.message : t("conversations_detail.cancel_failed"),
+        );
+      } finally {
+        setCancelling(false);
+        void refresh({ silent: true });
+      }
+    })();
+  }, [threadId, cancellableRun, refresh, t]);
 
   // Export a turn's full event stream as JSON — same contract as the
   // playground's toolbar button (prefer the authoritative persisted replay,
@@ -364,6 +503,26 @@ export function ConversationDetail() {
       <PageHeader
         title={convo.title ?? t("conversations_page.untitled")}
         backTo={backTo}
+        actions={
+          canOperate && cancellableRun !== null ? (
+            <Popconfirm
+              title={t("conversations_detail.cancel_run_confirm")}
+              onConfirm={handleCancelRun}
+              okText={t("conversations_detail.cancel_run")}
+              okButtonProps={{ danger: true }}
+              cancelText={t("common.cancel")}
+            >
+              <Button
+                size="small"
+                danger
+                loading={cancelling}
+                data-testid="conversation-cancel-run"
+              >
+                {t("conversations_detail.cancel_run")}
+              </Button>
+            </Popconfirm>
+          ) : undefined
+        }
         subtitle={
           <Space size={8} align="center" wrap>
             <Tag color={STATUS_COLOR[convo.status] ?? "default"} bordered={false}>
@@ -486,15 +645,16 @@ export function ConversationDetail() {
                     onSelectTurn={setSelectedTurnKey}
                     onInspectTurn={handleInspectTurn}
                     onInspectRow={handleInspectRow}
-                    streamTurnKey={null}
+                    streamTurnKey={liveTurnKey}
                     liveByStep={EMPTY_LIVE_BY_STEP}
                     registerHistoryRow={registerHistoryRow}
                     rate={null}
                     isSystemAdmin={isSystemAdmin}
                     readOnly
+                    allowDecide={canOperate}
                     isTenantSwitched={false}
-                    onDecide={noopOnDecide}
-                    deciding={false}
+                    onDecide={handleDecide}
+                    deciding={deciding}
                     onExport={handleExport}
                     exportingKey={exportingId}
                     onDownloadArtifact={handleDownloadArtifact}
@@ -508,9 +668,9 @@ export function ConversationDetail() {
                     agentName={convo.agent_name ?? ""}
                     agentVersion={convo.agent_version ?? ""}
                     readOnly
-                    streamTurnKey={null}
+                    streamTurnKey={liveTurnKey}
                     liveByStep={EMPTY_LIVE_BY_STEP}
-                    running={false}
+                    running={liveTurnKey !== null}
                     visible={view === "trajectory"}
                     isSystemAdmin={isSystemAdmin}
                     focusRequest={focusRequest}
@@ -519,7 +679,7 @@ export function ConversationDetail() {
                 </ViewPane>
               </div>
               <div style={{ marginTop: 12 }}>
-                <PlanCard plan={plan} loaded={planLoaded} running={false} readOnly />
+                <PlanCard plan={plan} loaded={planLoaded} running={liveTurnKey !== null} readOnly />
               </div>
             </>
           ) : messages === null || messages.length === 0 ? (

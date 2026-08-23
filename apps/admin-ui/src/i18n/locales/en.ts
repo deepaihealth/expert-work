@@ -391,6 +391,12 @@ export interface TranslationKeys {
     models: string;
     messages_title: string;
     messages_empty: string;
+    decide_ok: string;
+    decide_failed: string;
+    cancel_run: string;
+    cancel_run_confirm: string;
+    cancel_done: string;
+    cancel_failed: string;
     role_user: string;
     role_assistant: string;
   };
@@ -3383,6 +3389,12 @@ const en: TranslationKeys = {
     models: "Models",
     messages_title: "Messages",
     messages_empty: "No messages recorded for this conversation.",
+    decide_ok: "Decision applied — the run is resuming.",
+    decide_failed: "Could not apply the decision.",
+    cancel_run: "Cancel run",
+    cancel_run_confirm: "Cancel the run in progress? Work it has already finished is kept.",
+    cancel_done: "Run cancelled.",
+    cancel_failed: "Could not cancel the run.",
     role_user: "User",
     role_assistant: "Agent",
   },
