@@ -22,11 +22,15 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    "CLARIFICATION_REASON_KINDS",
+    "SAFETY_REASON_KINDS",
     "ApprovalDecision",
+    "ApprovalKindClass",
     "ApprovalReasonKind",
     "ApprovalRecord",
     "ApprovalRequest",
     "ApprovalStatus",
+    "approval_kind_class",
     "canonical_args_digest",
 ]
 

@@ -233,15 +233,15 @@ async def test_two_instances_time_out_exactly_once() -> None:
 
 async def _run_sweep_capturing_reason(monkeypatch: pytest.MonkeyPatch, *, reason_kind: str) -> str:
     """Seed one expired row of ``reason_kind``; return the reject reason used."""
-    import control_plane.approval_timeout_sweep as sweep_module
-
     captured: dict[str, object] = {}
 
     async def _fake_resolve(**kw: object) -> tuple[object, object, bool]:
         captured.update(kw)
         return SimpleNamespace(), uuid4(), False
 
-    monkeypatch.setattr(sweep_module, "resolve_approval_decision", _fake_resolve)
+    monkeypatch.setattr(
+        "control_plane.approval_timeout_sweep.resolve_approval_decision", _fake_resolve
+    )
     approvals = InMemoryApprovalStore()
     run_id, thread_id = uuid4(), uuid4()
     past = datetime.now(UTC) - timedelta(minutes=1)
