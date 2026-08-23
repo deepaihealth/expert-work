@@ -8,8 +8,11 @@
  * per controller ruling; TurnCard has since been retired (PR-B Task 5), so
  * this module is its only surviving implementation.
  */
+import type { ApprovalItem } from "../../api/approvals";
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
+import { NON_TERMINAL_RUN_STATUSES } from "../../pages/agent_detail/playground/history_turns";
+import { approvalItemFromEvent } from "../turn/ApprovalGate";
 import type { HistoryLoad, HistoryTurn, Turn } from "../turn/types";
 import type { ConsoleTurn, TurnTiming } from "./types";
 
@@ -29,6 +32,16 @@ export function runIdOf(events: readonly SseEvent[]): string | null {
   return null;
 }
 
+/** D-5/D-6 — the last ``approval`` frame in a replayed stream, as the
+ *  ``ApprovalItem`` the in-place approve/reject card needs. ``null`` when
+ *  the stream carries none (or the frame doesn't parse). */
+function lastApprovalFrom(events: readonly SseEvent[]): ApprovalItem | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i].event === "approval") return approvalItemFromEvent(events[i].data);
+  }
+  return null;
+}
+
 export function buildConsoleTurns(args: {
   historyTurns: HistoryTurn[] | null;
   historyLoads: Record<string, HistoryLoad>;
@@ -38,12 +51,25 @@ export function buildConsoleTurns(args: {
   const out: ConsoleTurn[] = [];
   let seq = 0;
 
-  for (const h of args.historyTurns ?? []) {
+  const history = args.historyTurns ?? [];
+  for (let i = 0; i < history.length; i += 1) {
+    const h = history[i];
     const load = args.historyLoads[h.runId] ?? { state: "pending" as const, events: [] };
     // Same status/error mapping as the old TurnCard call site
     // (PlaygroundTab.tsx:1337-1360) — only "error"/"timeout" map to a
     // failed turn; every other terminal ThreadRunSummary.status is "done".
+    // D-5 — a non-terminal run renders as a running turn; its hook-internal
+    // "live" load state maps to "done" (the same convention the playground's
+    // live turns use: partial events render, status carries the in-flight
+    // affordances).
     const failed = h.status === "error" || h.status === "timeout";
+    const inFlight = NON_TERMINAL_RUN_STATUSES.has(h.status);
+    // D-6 — surface the pending approval on a paused LAST turn only: a
+    // paused run followed by another run already has a continuation (its
+    // approval was decided), so live approve/reject there would 409.
+    const isLastTurn = i === history.length - 1 && args.liveTurns.length === 0;
+    const approval =
+      h.status === "paused" && isLastTurn ? lastApprovalFrom(load.events) : null;
     out.push({
       key: h.key,
       seq,
@@ -53,12 +79,12 @@ export function buildConsoleTurns(args: {
         input: h.input,
         attachments: [],
         events: load.events,
-        status: failed ? "error" : "done",
+        status: failed ? "error" : inFlight ? "running" : "done",
         error: failed ? h.status : null,
-        approval: null,
+        approval,
       },
       runId: h.runId,
-      loadState: load.state,
+      loadState: load.state === "live" ? "done" : load.state,
       fallbackLines: h.fallbackLines,
       tokens: h.tokens,
       timing: null,

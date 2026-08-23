@@ -4,7 +4,10 @@ import type { HistoryMessage } from "../../../../api/sessions";
 import type { ThreadRunSummary } from "../../../../api/runs";
 import { buildHistoryTurns } from "../history_turns";
 
-function run(runId: string, status = "success"): ThreadRunSummary {
+function run(
+  runId: string,
+  status: ThreadRunSummary["status"] = "success",
+): ThreadRunSummary {
   return { runId, status, isResume: false, createdAt: "2026-01-01", tokens: null };
 }
 

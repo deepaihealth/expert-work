@@ -22,7 +22,10 @@ import {
   type HistoryMessage,
   type SseEvent,
 } from "../../api/sessions";
-import { buildHistoryTurns } from "../../pages/agent_detail/playground/history_turns";
+import {
+  buildHistoryTurns,
+  NON_TERMINAL_RUN_STATUSES,
+} from "../../pages/agent_detail/playground/history_turns";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import type { HistoryLoad, HistoryTurn } from "./types";
 
@@ -50,7 +53,15 @@ export interface UseHistoryTurns {
   reset: () => void;
 }
 
-export function useHistoryTurns(): UseHistoryTurns {
+export interface UseHistoryTurnsOptions {
+  /** D-5 — called once when a live-attached (non-terminal) run's stream
+   *  delivers its ``end`` frame, i.e. the run just reached a terminal
+   *  status. The conversation page uses it to refresh run statuses /
+   *  the summary header without re-pairing. */
+  onRunTerminal?: (runId: string) => void;
+}
+
+export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistoryTurns {
   // Track C W2 — 切入态读透传:replay 的事件流要带 ?tenant_id=
   // (组件内直取,不穿 prop)。
   const { apiTenantScope } = useTenantScope();
@@ -79,6 +90,12 @@ export function useHistoryTurns(): UseHistoryTurns {
   // unlike state) makes ``replayHistoryRun`` a true one-shot regardless of how
   // many times its trigger fires.
   const startedHistoryRunsRef = useRef<Set<string>>(new Set());
+  // D-5 — each run's status at pairing time, so ``replayHistoryRun`` knows
+  // whether to collect-then-commit (terminal) or live-flush (non-terminal).
+  const runStatusRef = useRef<Map<string, string>>(new Map());
+  // Latest ``onRunTerminal`` without re-creating the replay callback.
+  const onRunTerminalRef = useRef<UseHistoryTurnsOptions["onRunTerminal"]>(undefined);
+  onRunTerminalRef.current = options.onRunTerminal;
 
   const reset = useCallback(() => {
     setHistory([]);
@@ -133,6 +150,7 @@ export function useHistoryTurns(): UseHistoryTurns {
         // 计数守卫失败(null)或空 thread(0 轮)→ 保持扁平文本(null 分支
         // 什么都不渲,不会漏出「以下为本次新消息」分隔线)。
         if (!built || built.length === 0) return;
+        runStatusRef.current = new Map(built.map((h) => [h.runId, h.status]));
         setHistoryTurns(built);
         setHistoryLoads(
           Object.fromEntries(
@@ -162,8 +180,32 @@ export function useHistoryTurns(): UseHistoryTurns {
       ...prev,
       [runId]: { state: "loading", events: [] },
     }));
+    // D-5 — a non-terminal run's attach is LIVE: the backend replays the
+    // stored rows then keeps the stream open on the bridge, so frames must
+    // flush incrementally (rAF-batched) instead of waiting for ``end`` (a
+    // paused run's stream never ends until someone decides its approval).
+    const isLive = NON_TERMINAL_RUN_STATUSES.has(runStatusRef.current.get(runId) ?? "");
     try {
       const collected: SseEvent[] = [];
+      let flushScheduled = false;
+      // A flush scheduled just before the ``end`` frame would otherwise fire
+      // AFTER the final commit and stamp the turn back to "live".
+      let committed = false;
+      const flushLive = () => {
+        flushScheduled = false;
+        if (committed) return;
+        const snapshot = collected.slice();
+        setHistoryLoads((prev) => ({
+          ...prev,
+          [runId]: { state: "live", events: snapshot },
+        }));
+      };
+      const scheduleFlush = () => {
+        if (flushScheduled) return;
+        flushScheduled = true;
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(flushLive);
+        else setTimeout(flushLive, 16);
+      };
       for await (const frame of streamRunEvents(threadId, runId, {
         signal: historyAbortRef.current?.signal,
         // Pinned by ``load`` — a replay must read the same tenant its
@@ -172,6 +214,7 @@ export function useHistoryTurns(): UseHistoryTurns {
       })) {
         collected.push(frame);
         if (frame.event === "end") break;
+        if (isLive) scheduleFlush();
       }
       // The terminal-replay endpoint appends an ``end`` frame after the stored
       // rows (``_run_event_stream.py`` ``_stream_replay``), so an empty run
@@ -185,8 +228,23 @@ export function useHistoryTurns(): UseHistoryTurns {
       // ``error`` — which keeps the placeholder showing ``fallbackLines``
       // (the /messages text we already have) instead of the full render's
       // "no text" empty state. 不丢已有内容。
+      committed = true;
       const sawEnd = collected.some((f) => f.event === "end");
       const hasContent = collected.some((f) => f.event !== "end");
+      if (isLive) {
+        // Live attach: ``end`` means the run just went terminal — commit and
+        // tell the page. A close WITHOUT ``end`` (abort / network drop) keeps
+        // whatever streamed so far, still marked live (the run itself is
+        // still in flight; a page refresh re-attaches).
+        setHistoryLoads((prev) => ({
+          ...prev,
+          [runId]: sawEnd
+            ? { state: "done", events: collected }
+            : { state: "live", events: collected },
+        }));
+        if (sawEnd) onRunTerminalRef.current?.(runId);
+        return;
+      }
       setHistoryLoads((prev) => ({
         ...prev,
         [runId]:
@@ -260,6 +318,10 @@ export function useHistoryTurns(): UseHistoryTurns {
   // just-created observer and racing a duplicate replay.)
   useEffect(() => {
     return () => {
+      // D-5 — a live attach holds its SSE open indefinitely; leaving the
+      // page must tear it down (terminal replays end on their own, but the
+      // abort is harmless for them too).
+      historyAbortRef.current?.abort();
       observerRef.current?.disconnect();
       observerRef.current = null;
       runIdByEl.current.clear();

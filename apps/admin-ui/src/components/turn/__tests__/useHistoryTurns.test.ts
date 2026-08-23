@@ -385,3 +385,131 @@ describe("useHistoryTurns", () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// D-5 — non-terminal (live) replay
+// ---------------------------------------------------------------------------
+
+const liveThread = {
+  messages: [
+    { role: "user", content: "q1" },
+    { role: "assistant", content: "a1" },
+    { role: "user", content: "q2" },
+  ] as HistoryMessage[],
+  runs: [
+    { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", tokens: null },
+    { runId: "r2", status: "running", isResume: true, createdAt: "2026-05-25T00:01:00Z", tokens: null },
+  ],
+};
+
+const rafFlush = () =>
+  act(async () => {
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+  });
+
+describe("useHistoryTurns live attach (D-5)", () => {
+  it("flushes a non-terminal run's frames incrementally as state 'live'", async () => {
+    getMessagesMock.mockResolvedValue(liveThread.messages);
+    listThreadRunsMock.mockResolvedValue(liveThread.runs as never);
+    const gate = deferred<void>();
+    streamRunEventsMock.mockImplementation((_t, runId) =>
+      runId === "r2"
+        ? (async function* () {
+            yield { id: "1", event: "metadata", data: { run_id: "r2" } } as SseEvent;
+            await gate.promise; // stream stays open — no end frame yet
+          })()
+        : makeStream([]),
+    );
+
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+    expect(result.current.turns).toHaveLength(2);
+
+    act(() => {
+      void result.current.loadRuns(["r2"], "th-1");
+    });
+    await rafFlush();
+    expect(result.current.loads.r2).toEqual({
+      state: "live",
+      events: [{ id: "1", event: "metadata", data: { run_id: "r2" } }],
+    });
+    gate.resolve();
+  });
+
+  it("commits 'done' + fires onRunTerminal when the live stream delivers end", async () => {
+    getMessagesMock.mockResolvedValue(liveThread.messages);
+    listThreadRunsMock.mockResolvedValue(liveThread.runs as never);
+    streamRunEventsMock.mockImplementation((_t, runId) =>
+      runId === "r2"
+        ? makeStream([
+            { id: "1", event: "updates", data: { step: 1 } } as SseEvent,
+            { id: "2", event: "end", data: { status: "success" } } as SseEvent,
+          ])
+        : makeStream([]),
+    );
+    const onRunTerminal = vi.fn();
+
+    const { result } = renderHook(() => useHistoryTurns({ onRunTerminal }));
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+    await act(async () => {
+      await result.current.loadRuns(["r2"], "th-1");
+    });
+
+    expect(result.current.loads.r2.state).toBe("done");
+    expect(result.current.loads.r2.events).toHaveLength(2);
+    expect(onRunTerminal).toHaveBeenCalledExactlyOnceWith("r2");
+    // A flush queued just before the end frame must not stamp it back to
+    // "live" after the commit.
+    await rafFlush();
+    expect(result.current.loads.r2.state).toBe("done");
+  });
+
+  it("keeps a closed-without-end live stream as 'live' with the collected frames", async () => {
+    getMessagesMock.mockResolvedValue(liveThread.messages);
+    listThreadRunsMock.mockResolvedValue(liveThread.runs as never);
+    streamRunEventsMock.mockImplementation((_t, runId) =>
+      runId === "r2"
+        ? makeStream([{ id: "1", event: "updates", data: { step: 1 } } as SseEvent])
+        : makeStream([]),
+    );
+    const onRunTerminal = vi.fn();
+
+    const { result } = renderHook(() => useHistoryTurns({ onRunTerminal }));
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+    await act(async () => {
+      await result.current.loadRuns(["r2"], "th-1");
+    });
+
+    // The run is still in flight server-side — no terminal signal, no wipe.
+    expect(result.current.loads.r2.state).toBe("live");
+    expect(result.current.loads.r2.events).toHaveLength(1);
+    expect(onRunTerminal).not.toHaveBeenCalled();
+    await rafFlush();
+    expect(result.current.loads.r2.state).toBe("live");
+  });
+
+  it("terminal runs keep the collect-then-commit path (no live state ever)", async () => {
+    getMessagesMock.mockResolvedValue(oneTurnOfMessages);
+    listThreadRunsMock.mockResolvedValue(oneRun);
+    streamRunEventsMock.mockImplementation(() =>
+      makeStream([
+        { id: "1", event: "updates", data: {} } as SseEvent,
+        { id: "2", event: "end", data: {} } as SseEvent,
+      ]),
+    );
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+    await act(async () => {
+      await result.current.loadRuns(["r1"], "th-1");
+    });
+    expect(result.current.loads.r1.state).toBe("done");
+  });
+});
