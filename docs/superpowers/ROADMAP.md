@@ -29,6 +29,41 @@
 
 ---
 
+## 🚀 生产发布前置(2026-08-23 立项;目标:下周发生产,次日开工)
+
+> 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
+> **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
+
+### A · 必须完成(不做 = 生产事故或安全洞)
+
+| # | 项 | 内容 | 量级 |
+|---|---|---|---|
+| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
+| PROD-2 | **alertmanager receivers**(X-7 ①) | `infra/k8s/base/observability/alertmanager.yml` 第一行注释自认 placeholder——生产 P0 告警投递到空气。P0/P1/P2 路由已在,只缺真 receivers(webhook/钉钉/邮件) | 小,半天 |
+| PROD-3 | **RLS 闸 1 拍板**(rls Phase 0 挂起的既定恢复点) | 当年拍板「恢复点=近上线走闸 1」,就是现在。现状:租户隔离**只有 ORM WHERE 一层**,RLS 完全惰性(app 以 superuser+bypassrls 连,FORCE-RLS 全被绕)。生产 RDS 建应用账号(必须非 superuser)时拍板:启用 FORCE RLS(把挂起的 PR B 捞回),或**书面接受**单层隔离上线 | 拍板半天;启用另计 |
+| PROD-4 | **retention-cleanup-job 第二套审批超时**(= X-15 ①拉前) | `retention_cleanup_job/job.py:207` 直接 `mark_decided(TIMEOUT)` 不走 `resolve_approval_decision`,与 sweep 抢同一 CAS——生产若部署该 job(审计第 0 波把它列进部署集),B-20 的「超时保守继续」被静默破坏、run 永卡 checkpoint。删该路径或改走同一内核 | 小,半天 |
+| PROD-5 | **发布工程收尾** | prod overlay 占位符(OSS endpoint/bucket/region、镜像 tag、secrets.env)、`release.sh` 的 prod 路径 + smoke 适配、发布/回滚 runbook(X-1 波 4 的文档项拉前) | 1-2 天 |
+| PROD-6 | **在途三 PR 合并 + 测试环境验证** | #1252 / #1253 / #1254(含 viewer 可裁任意审批单的洞修复);#1253 CodeQL 两条已修,等 CI | 等 CI |
+
+### B · 强烈建议(不做需书面接受风险)
+
+| # | 项 | 触发条件 / 理由 |
+|---|---|---|
+| PROD-7 | **X-14 P2 钉版卫兵 + P1 金丝雀适配 prod** | e2b 事故复盘产物(评审漏钉版/CI 假件全绿/smoke 只探 HTTP 三层全漏);生产发布尤其需要。P2 半天先行 |
+| PROD-8 | **egress token 24h 到期出网全挂 —— 先真栈核实**(X-1 W1 遗留头号) | ACS 沙箱时代是否仍成立**未核实**;若成立 = 长活沙箱生产 24h 后静默断网 + 全仓零 407 日志/指标/告警,**升 A 级** |
+| PROD-9 | **X-3 触发器投递 CAS** | **启用触发器功能上生产则必做**:现有 source_run_id 去重是读-查-写,双副本 reconcile 有窄窗重复投递;不启用可缓 |
+| PROD-10 | **B-19 配额维度混扣** | **给第三方配配额则必做**(发对话会扣 image 桶、429 维度错乱、黏性维度 Retry-After 除零);不配可缓 |
+| PROD-11 | **P-4 拍板**(api_keys 凭据横向扩散) | 发 key 给第三方前至少把「只发 write key、永不发 admin」写成硬流程;修 rbac 映射另议 |
+| PROD-12 | **X-10 波 2-2 供应商 RPM 全局化** | 进程内限流 = 上游压力 × 副本数;2 副本首发可缓,**扩容前必须** |
+
+### C · 明确不阻塞发布
+
+X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
+
+**建议开工顺序**:PROD-2 → PROD-4 → PROD-5(期间并行 PROD-3 拍板 + PROD-8 核实)→ PROD-1 → PROD-7。PROD-1 是唯一的中型工程,越早启动越稳。
+
+---
+
 ## 阶段 0 · 当前分支收尾(阻塞后面一切)
 
 ### 0.1 真栈验收 —— ✅ **全过(2026-08-14)**
