@@ -53,7 +53,7 @@ dependencies = [
     "markitdown[docx,pptx,xlsx,pdf]>=0.1,<1",
     # Stream J.5 — knowledge chunking: markdown-it parses the Markdown
     # block structure; tiktoken counts tokens for the size cap.
-    "markdown-it-py>=3.0,<4",
+    "markdown-it-py>=3.0,<5",
     "tiktoken>=0.8,<1",
     # Stream J.6.补强-4 (Mini-ADR J-34) — Pillow strips EXIF from
     # uploaded images on the way to the object store. Metadata exfil
