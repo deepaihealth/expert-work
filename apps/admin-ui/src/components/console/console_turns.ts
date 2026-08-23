@@ -11,8 +11,8 @@
 import type { ApprovalItem } from "../../api/approvals";
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
-import { NON_TERMINAL_RUN_STATUSES } from "../../pages/agent_detail/playground/history_turns";
-import { approvalItemFromEvent } from "../turn/ApprovalGate";
+import { NON_TERMINAL_RUN_STATUSES } from "../../api/runs";
+import { approvalItemFromEvent } from "../turn/approval_item";
 import type { HistoryLoad, HistoryTurn, Turn } from "../turn/types";
 import type { ConsoleTurn, TurnTiming } from "./types";
 
@@ -47,6 +47,12 @@ export function buildConsoleTurns(args: {
   historyLoads: Record<string, HistoryLoad>;
   liveTurns: readonly Turn[];
   timings: Readonly<Record<string, TurnTiming>>;
+  /** D-6 (终审 C-2) — synthesise the in-place ApprovalItem on a paused last
+   *  turn. STRICTLY opt-in: only the conversation page (whose ``onDecide``
+   *  targets history turns) passes true. The playground's ``onDecide``
+   *  dispatches by LIVE turn id — a synthesised approval there would decide
+   *  on the backend while the UI silently no-ops. */
+  synthesizeApprovals?: boolean;
 }): ConsoleTurn[] {
   const out: ConsoleTurn[] = [];
   let seq = 0;
@@ -69,7 +75,9 @@ export function buildConsoleTurns(args: {
     // approval was decided), so live approve/reject there would 409.
     const isLastTurn = i === history.length - 1 && args.liveTurns.length === 0;
     const approval =
-      h.status === "paused" && isLastTurn ? lastApprovalFrom(load.events) : null;
+      (args.synthesizeApprovals ?? false) && h.status === "paused" && isLastTurn
+        ? lastApprovalFrom(load.events)
+        : null;
     out.push({
       key: h.key,
       seq,

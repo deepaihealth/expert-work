@@ -190,11 +190,18 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         background: selected ? "var(--ew-surface-selected)" : undefined,
       }}
     >
-      <UserBubble
-        input={turn.turn.input}
-        attachments={turn.turn.attachments}
-        inputs={turn.turn.inputs}
-      />
+      {/* D-5 (终审 M-6) — a continuation run (or a running run whose user
+          message isn't checkpointed yet) owns no input; skip the empty
+          bubble instead of rendering a blank one. */}
+      {(turn.turn.input !== "" ||
+        turn.turn.attachments.length > 0 ||
+        Object.keys(turn.turn.inputs ?? {}).length > 0) && (
+        <UserBubble
+          input={turn.turn.input}
+          attachments={turn.turn.attachments}
+          inputs={turn.turn.inputs}
+        />
+      )}
 
       <ProcessStrip
         rows={rows}

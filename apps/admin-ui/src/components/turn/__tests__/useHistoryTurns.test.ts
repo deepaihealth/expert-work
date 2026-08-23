@@ -513,3 +513,35 @@ describe("useHistoryTurns live attach (D-5)", () => {
     expect(result.current.loads.r1.state).toBe("done");
   });
 });
+
+describe("patchRuns (D-5)", () => {
+  it("flips an in-flight turn terminal but never rewrites an already-terminal one", async () => {
+    getMessagesMock.mockResolvedValue(liveThread.messages);
+    listThreadRunsMock.mockResolvedValue(liveThread.runs as never);
+
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+
+    act(() => {
+      result.current.patchRuns([
+        // r1 is terminal (success) — a disagreeing summary must NOT win.
+        { runId: "r1", status: "error", tokens: null },
+        // r2 is in flight — the patch flips it terminal.
+        { runId: "r2", status: "success", tokens: null },
+      ]);
+    });
+    expect(result.current.turns?.map((h) => [h.runId, h.status])).toEqual([
+      ["r1", "success"],
+      ["r2", "success"],
+    ]);
+
+    // Identity-stable when nothing changes.
+    const before = result.current.turns;
+    act(() => {
+      result.current.patchRuns([{ runId: "r2", status: "success", tokens: null }]);
+    });
+    expect(result.current.turns).toBe(before);
+  });
+});

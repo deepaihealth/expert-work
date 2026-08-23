@@ -1065,6 +1065,18 @@ describe("D-5/D-6 live tail + operations", () => {
     );
   });
 
+  it("terminal conversation renders no cancel button even for admins", async () => {
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO); // both runs terminal
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getAllByTestId("console-turn").length).toBeGreaterThan(0),
+    );
+    expect(screen.queryByTestId("conversation-cancel-run")).not.toBeInTheDocument();
+  });
+
   it("viewer sees no cancel button", async () => {
     setStoredToken(jwt({ sub: "v", tenant_id: TENANT_ID, roles: ["viewer"] }));
     const fx = pausedFixture();

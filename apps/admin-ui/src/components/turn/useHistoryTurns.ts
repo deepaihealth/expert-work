@@ -16,16 +16,18 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { listThreadRuns, streamRunEvents, type RunTokens } from "../../api/runs";
+import {
+  listThreadRuns,
+  NON_TERMINAL_RUN_STATUSES,
+  streamRunEvents,
+  type RunTokens,
+} from "../../api/runs";
 import {
   getSessionMessages,
   type HistoryMessage,
   type SseEvent,
 } from "../../api/sessions";
-import {
-  buildHistoryTurns,
-  NON_TERMINAL_RUN_STATUSES,
-} from "../../pages/agent_detail/playground/history_turns";
+import { buildHistoryTurns } from "../../pages/agent_detail/playground/history_turns";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import type { HistoryLoad, HistoryTurn } from "./types";
 
@@ -67,6 +69,9 @@ export interface UseHistoryTurnsOptions {
    *  the summary header without re-pairing. */
   onRunTerminal?: (runId: string) => void;
 }
+
+/** I-5 — delay before re-attaching a dropped live stream. */
+const LIVE_RETRY_DELAY_MS = 5000;
 
 export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistoryTurns {
   // Track C W2 — 切入态读透传:replay 的事件流要带 ?tenant_id=
@@ -180,6 +185,22 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
   // below; a replay failure leaves the turn on its fallback (degradation).
   // ``startedHistoryRunsRef`` makes this idempotent — a row's viewport
   // trigger can fire more than once (see ``registerRow``).
+  // I-5 (终审) — a live attach that drops (idle proxy cut, network blip)
+  // must re-attach, or the turn card sits on "running" forever. The retry
+  // clears the one-shot guard and re-enters ``replayHistoryRun`` (via ref —
+  // the two callbacks are mutually recursive) unless the thread was切走
+  // (abort) or the run has since been patched terminal.
+  const replayRef = useRef<((runId: string, threadId: string) => Promise<void>) | null>(null);
+  const scheduleLiveRetry = useCallback((runId: string, threadId: string) => {
+    const signal = historyAbortRef.current?.signal;
+    setTimeout(() => {
+      if (signal?.aborted) return;
+      if (!NON_TERMINAL_RUN_STATUSES.has(runStatusRef.current.get(runId) ?? "")) return;
+      startedHistoryRunsRef.current.delete(runId);
+      void replayRef.current?.(runId, threadId);
+    }, LIVE_RETRY_DELAY_MS);
+  }, []);
+
   const replayHistoryRun = useCallback(async (runId: string, threadId: string) => {
     if (startedHistoryRunsRef.current.has(runId)) return;
     startedHistoryRunsRef.current.add(runId);
@@ -187,13 +208,14 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
       ...prev,
       [runId]: { state: "loading", events: [] },
     }));
-    // D-5 — a non-terminal run's attach is LIVE: the backend replays the
-    // stored rows then keeps the stream open on the bridge, so frames must
-    // flush incrementally (rAF-batched) instead of waiting for ``end`` (a
-    // paused run's stream never ends until someone decides its approval).
+    // D-5 — a non-terminal run's attach is LIVE: frames flush incrementally
+    // (rAF-batched) instead of waiting for ``end``. Note the backend treats
+    // PAUSED as replay-able (PAUSED ∈ TERMINAL_RUN_STATUSES server-side), so
+    // a paused run's attach replays its stored frames, gets ``end`` and
+    // commits — the live path here mainly serves running/pending/queued.
     const isLive = NON_TERMINAL_RUN_STATUSES.has(runStatusRef.current.get(runId) ?? "");
+    const collected: SseEvent[] = [];
     try {
-      const collected: SseEvent[] = [];
       let flushScheduled = false;
       // A flush scheduled just before the ``end`` frame would otherwise fire
       // AFTER the final commit and stamp the turn back to "live".
@@ -240,9 +262,8 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
       const hasContent = collected.some((f) => f.event !== "end");
       if (isLive) {
         // Live attach: ``end`` means the run just went terminal — commit and
-        // tell the page. A close WITHOUT ``end`` (abort / network drop) keeps
-        // whatever streamed so far, still marked live (the run itself is
-        // still in flight; a page refresh re-attaches).
+        // tell the page. A close WITHOUT ``end`` (idle drop) keeps whatever
+        // streamed so far, still marked live, and schedules a re-attach.
         setHistoryLoads((prev) => ({
           ...prev,
           [runId]: sawEnd
@@ -250,6 +271,7 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
             : { state: "live", events: collected },
         }));
         if (sawEnd) onRunTerminalRef.current?.(runId);
+        else scheduleLiveRetry(runId, threadId);
         return;
       }
       setHistoryLoads((prev) => ({
@@ -260,9 +282,19 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
             : { state: "error", events: [] },
       }));
     } catch {
+      if (isLive) {
+        // I-5 — a hard break on a live attach keeps the frames already on
+        // screen and re-attaches; blanking to "error" would throw away live
+        // content for a run that is still executing.
+        setHistoryLoads((prev) => ({ ...prev, [runId]: { state: "live", events: collected } }));
+        scheduleLiveRetry(runId, threadId);
+        return;
+      }
       setHistoryLoads((prev) => ({ ...prev, [runId]: { state: "error", events: [] } }));
     }
-  }, []);
+  }, [scheduleLiveRetry]);
+
+  replayRef.current = replayHistoryRun;
 
   // 轨迹视图按页主动回放(非滚动触发):一个 worker 池,worker 数
   // = min(4, 待回放数),每个 worker 顺序从队列取下一个 runId 调用

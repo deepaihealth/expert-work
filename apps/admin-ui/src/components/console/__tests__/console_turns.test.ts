@@ -104,6 +104,7 @@ describe("non-terminal history turns (D-5/D-6)", () => {
       historyLoads: { "r-paused": { state: "live", events: [meta("r-paused"), approvalFrame] } },
       liveTurns: [],
       timings: {},
+      synthesizeApprovals: true,
     });
     expect(withApproval[1].turn.status).toBe("running");
     expect(withApproval[1].turn.approval).toMatchObject({
@@ -123,6 +124,7 @@ describe("non-terminal history turns (D-5/D-6)", () => {
       historyLoads: { "r-paused": { state: "live", events: [approvalFrame] } },
       liveTurns: [],
       timings: {},
+      synthesizeApprovals: true,
     });
     expect(withContinuation[0].turn.approval).toBeNull();
   });
@@ -134,6 +136,21 @@ describe("non-terminal history turns (D-5/D-6)", () => {
       ],
       historyLoads: { "r-paused": { state: "done", events: [approvalFrame] } },
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [], status: "running", error: null, approval: null }],
+      timings: {},
+      synthesizeApprovals: true,
+    });
+    expect(out[0].turn.approval).toBeNull();
+  });
+});
+
+describe("approval synthesis opt-in (终审 C-2)", () => {
+  it("does NOT synthesise approval without the opt-in — the playground path", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null },
+      ],
+      historyLoads: { "r-paused": { state: "done", events: [approvalFrame] } },
+      liveTurns: [],
       timings: {},
     });
     expect(out[0].turn.approval).toBeNull();

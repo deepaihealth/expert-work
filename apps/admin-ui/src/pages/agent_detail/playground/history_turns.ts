@@ -22,6 +22,7 @@
  * the answer.
  */
 import type { HistoryMessage } from "../../../api/sessions";
+import { NON_TERMINAL_RUN_STATUSES } from "../../../api/runs";
 import type { RunTokens, ThreadRunSummary } from "../../../api/runs";
 
 export interface FallbackLine {
@@ -39,14 +40,6 @@ export interface HistoryTurn {
   /** ``ThreadRunSummary.createdAt``(ISO);账本时长投影里未回放 / 无时序轮的兜底起点。 */
   createdAt: string | null;
 }
-
-/** Run statuses that mean "still in flight" — D-5 tail tolerance. Shared
- *  with ``useHistoryTurns`` (live attach mode) and the conversation page. */
-export const NON_TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
-  "pending",
-  "running",
-  "paused",
-]);
 
 export function buildHistoryTurns(
   messages: readonly HistoryMessage[],
