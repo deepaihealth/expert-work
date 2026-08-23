@@ -1110,6 +1110,10 @@ const zhCN: TranslationKeys = {
     approval_timeout_brief: "审批超时没人处理就自动拒绝",
     approval_timeout_help:
       "一个待审批的请求最多等多久(秒),超时自动拒绝,免得一直占着资源。\n默认 24 小时(86400)。\n示例:86400",
+    clarification_timeout: "澄清等待上限(秒)",
+    clarification_timeout_brief: "澄清问题超时没人回答,Agent 按保守默认继续",
+    clarification_timeout_help:
+      "Agent 自己提出的澄清问题(缺信息、需求含糊、方案二选一)最多等人多久(秒)。超时后 run 会继续跑:Agent 按自己的保守默认推进并说明所做假设,不会被杀掉。\n默认 1 小时(3600)。安全类审批用上面的「审批等待上限」。\n示例:3600",
     section_knowledge: "知识库(RAG)",
     section_knowledge_help:
       "Agent 可以检索的知识库,用来给回答找依据。\n选已有的库,或输入名称。\n示例:hr-policies、eng-handbook",
@@ -2928,6 +2932,8 @@ const zhCN: TranslationKeys = {
     decide_failed: "决策请求失败:{{error}}",
     select_row: "选择审批项:{{summary}}",
     select_all: "全选本页审批项",
+    tab_safety: "安全审批",
+    tab_clarification: "待确认",
     waiting_minutes: "{{count}} 分钟",
     waiting_hours: "{{count}} 小时",
     time_left_hours: "剩 {{count}} 小时",

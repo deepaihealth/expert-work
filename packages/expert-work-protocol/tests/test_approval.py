@@ -178,7 +178,7 @@ def test_approval_request_carries_binding_digest() -> None:
 
 
 def test_kind_class_sets_partition_all_reason_kinds() -> None:
-    """SAFETY ∪ CLARIFICATION covers every reason kind, with no overlap."""
+    """SAFETY union CLARIFICATION covers every reason kind, with no overlap."""
     from typing import get_args
 
     all_kinds = set(get_args(ApprovalReasonKind))

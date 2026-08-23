@@ -212,9 +212,7 @@ async def test_list_filters_by_reason_kinds(
     store, engine = approval_store
     tenant = uuid4()
     base = datetime(2026, 6, 12, 9, 0, 0, tzinfo=UTC)
-    gate = _record(tenant_id=tenant, run_id=uuid4()).model_copy(
-        update={"requested_at": base}
-    )
+    gate = _record(tenant_id=tenant, run_id=uuid4()).model_copy(update={"requested_at": base})
     question = _record(tenant_id=tenant, run_id=uuid4()).model_copy(
         update={"reason_kind": "missing_info", "requested_at": base + timedelta(minutes=1)}
     )
@@ -241,7 +239,7 @@ async def test_list_filters_by_reason_kinds(
         assert safety_total == 1
         assert safety[0].run_id == gate.run_id
 
-        all_rows, all_total = await store.list_all_tenants(status=ApprovalStatus.PENDING)
+        _all_rows, all_total = await store.list_all_tenants(status=ApprovalStatus.PENDING)
         assert all_total >= 3
     finally:
         await engine.dispose()

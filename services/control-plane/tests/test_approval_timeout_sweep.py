@@ -231,9 +231,7 @@ async def test_two_instances_time_out_exactly_once() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _run_sweep_capturing_reason(
-    monkeypatch: pytest.MonkeyPatch, *, reason_kind: str
-) -> str:
+async def _run_sweep_capturing_reason(monkeypatch: pytest.MonkeyPatch, *, reason_kind: str) -> str:
     """Seed one expired row of ``reason_kind``; return the reject reason used."""
     import control_plane.approval_timeout_sweep as sweep_module
 

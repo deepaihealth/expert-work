@@ -11,6 +11,11 @@ import { getJson, postJson, withTenantScope, type TenantScope } from "./client";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "modified" | "timeout";
 
+/** B-20 approval triage — safety sign-offs (policy_gate / risk_confirmation)
+ *  vs agent clarification questions (missing_info / ambiguous_requirement /
+ *  approach_choice). Wire value of the ``kind_class`` query filter. */
+export type ApprovalKindClass = "safety" | "clarification";
+
 export interface ApprovalItem {
   id: string;
   tenant_id: string;
@@ -41,12 +46,13 @@ export interface ListApprovalsParams {
   status?: ApprovalStatus;
   limit?: number;
   offset?: number;
+  kindClass?: ApprovalKindClass;
 }
 
 /** GET /v1/approvals — the cross-run queue (default ``status=pending``). */
 export async function listApprovals(params: ListApprovalsParams = {}): Promise<ApprovalList> {
-  const { tenantScope, status, limit, offset } = params;
-  const query = withTenantScope({ status, limit, offset }, tenantScope);
+  const { tenantScope, status, limit, offset, kindClass } = params;
+  const query = withTenantScope({ status, limit, offset, kind_class: kindClass }, tenantScope);
   return getJson<ApprovalList>("/v1/approvals", { params: query });
 }
 

@@ -348,7 +348,9 @@ async def test_list_rejects_unknown_kind_class(approvals_client: AsyncClient) ->
 
 async def test_decide_requires_operator_role(approvals_client: AsyncClient) -> None:
     """B-20 ④ — a viewer JWT must not decide approvals (403, any payload)."""
-    viewer = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"}
+    viewer = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"
+    }
     resp = await approvals_client.post(
         "/v1/approvals:decide",
         headers=viewer,
@@ -363,7 +365,9 @@ async def test_decide_requires_operator_role(approvals_client: AsyncClient) -> N
 
 async def test_resume_requires_operator_role(approvals_client: AsyncClient) -> None:
     """B-20 ④ — the single-run resume endpoint carries the same gate."""
-    viewer = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"}
+    viewer = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"
+    }
     resp = await approvals_client.post(
         f"/v1/sessions/{uuid4()}/runs/{uuid4()}/resume",
         headers=viewer,

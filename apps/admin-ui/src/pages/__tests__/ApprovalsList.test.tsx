@@ -103,7 +103,13 @@ describe("ApprovalsList", () => {
         { thread_id: row.thread_id, run_id: row.run_id, decision: "reject" },
       ]),
     );
-    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2)); // initial + refresh
+    // initial + post-decide refresh — each refresh also fires one badge
+    // probe for the inactive tab (limit: 1), so count main-list calls only.
+    await waitFor(() =>
+      expect(
+        listMock.mock.calls.filter(([p]) => p?.limit === undefined),
+      ).toHaveLength(2),
+    );
   });
 
   it("multi-select batch approve sends every selected row", async () => {
@@ -194,5 +200,67 @@ describe("ApprovalsList", () => {
     await waitFor(() =>
       expect(screen.getByText(/timing out|即将超时/i)).toBeInTheDocument(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-20 approval triage — safety / clarification tabs
+// ---------------------------------------------------------------------------
+
+describe("ApprovalsList kind tabs", () => {
+  it("defaults to the safety tab: main list kindClass=safety, badge probe clarification limit=1", async () => {
+    const listMock = vi.spyOn(approvalsSdk, "listApprovals").mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+    });
+    renderPage();
+    await waitFor(() =>
+      expect(listMock).toHaveBeenCalledWith(
+        expect.objectContaining({ kindClass: "safety", status: "pending" }),
+      ),
+    );
+    expect(listMock).toHaveBeenCalledWith(
+      expect.objectContaining({ kindClass: "clarification", limit: 1 }),
+    );
+  });
+
+  it("switching to the clarification tab refetches with kindClass=clarification", async () => {
+    const listMock = vi.spyOn(approvalsSdk, "listApprovals").mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+    });
+    renderPage();
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    listMock.mockClear();
+
+    await userEvent.click(screen.getByTestId("approvals-tab-clarification"));
+    await waitFor(() =>
+      expect(
+        listMock.mock.calls.some(
+          ([params]) => params?.kindClass === "clarification" && params?.limit === undefined,
+        ),
+      ).toBe(true),
+    );
+    // The badge probe now targets the inactive safety tab.
+    expect(
+      listMock.mock.calls.some(
+        ([params]) => params?.kindClass === "safety" && params?.limit === 1,
+      ),
+    ).toBe(true);
+  });
+
+  it("shows the inactive tab's pending count as a badge", async () => {
+    vi.spyOn(approvalsSdk, "listApprovals").mockImplementation(async (params) =>
+      params?.limit === 1
+        ? { items: [item()], total: 7, limit: 1, offset: 0 }
+        : { items: [], total: 0, limit: 100, offset: 0 },
+    );
+    renderPage();
+    const clarTab = await screen.findByTestId("approvals-tab-clarification");
+    await waitFor(() => expect(clarTab.textContent).toContain("7"));
   });
 });

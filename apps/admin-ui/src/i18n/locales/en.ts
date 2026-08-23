@@ -1057,6 +1057,9 @@ export interface TranslationKeys {
     approval_timeout: string;
     approval_timeout_brief: string;
     approval_timeout_help: string;
+    clarification_timeout: string;
+    clarification_timeout_brief: string;
+    clarification_timeout_help: string;
     section_knowledge: string;
     section_knowledge_help: string;
     knowledge_hint: string;
@@ -2769,6 +2772,8 @@ export interface TranslationKeys {
     decide_failed: string;
     select_row: string;
     select_all: string;
+    tab_safety: string;
+    tab_clarification: string;
     waiting_minutes: string;
     waiting_hours: string;
     time_left_hours: string;
@@ -4121,6 +4126,11 @@ const en: TranslationKeys = {
     approval_timeout_brief: "Auto-rejects if no one responds in time",
     approval_timeout_help:
       "How long a pending approval may wait (seconds) before it is auto-rejected, so it doesn't tie up resources.\nDefault 24h (86400).\nExample: 86400",
+    clarification_timeout: "Clarification wait limit (seconds)",
+    clarification_timeout_brief:
+      "Unanswered agent questions resume on a conservative default",
+    clarification_timeout_help:
+      "How long the agent's own clarification questions (missing info, ambiguous ask, approach choice) wait for a human. On timeout the run resumes and the agent proceeds with its own conservative default, stating its assumptions — it is not killed.\nDefault 1h (3600). Safety sign-offs use the approval wait limit above.\nExample: 3600",
     section_knowledge: "Knowledge bases (RAG)",
     section_knowledge_help:
       "Knowledge bases the agent can search to back up its answers.\nPick existing bases, or type a name.\nExample: hr-policies, eng-handbook",
@@ -6011,6 +6021,8 @@ const en: TranslationKeys = {
     decide_failed: "Decision request failed: {{error}}",
     select_row: "Select approval: {{summary}}",
     select_all: "Select all approvals on this page",
+    tab_safety: "Safety approvals",
+    tab_clarification: "Clarifications",
     waiting_minutes: "{{count}} min",
     waiting_hours: "{{count}} h",
     time_left_hours: "{{count}}h left",

@@ -393,7 +393,7 @@ async def test_list_filters_by_reason_kinds() -> None:
     assert safety_total == 1
     assert safety[0].run_id == gate.run_id
 
-    unfiltered, unfiltered_total = await store.list_for_tenant(
+    _unfiltered, unfiltered_total = await store.list_for_tenant(
         tenant_id=tenant, status=ApprovalStatus.PENDING
     )
     assert unfiltered_total == 3

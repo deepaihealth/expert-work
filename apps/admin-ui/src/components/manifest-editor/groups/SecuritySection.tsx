@@ -47,6 +47,7 @@ import {
   readActionScreen,
   readActionScreenOnError,
   readApprovalTimeout,
+  readClarificationTimeout,
   readApprovalTools,
   readDynamicWorkersOn,
   readExtends,
@@ -59,6 +60,7 @@ import {
   setActionScreen,
   setActionScreenOnError,
   setApprovalTimeout,
+  setClarificationTimeout,
   setApprovalTools,
   setDynamicWorkersOn,
   setOutputDlp,
@@ -178,6 +180,7 @@ export function SecuritySection({
 
   const approvalTools = readApprovalTools(formData);
   const approvalTimeout = readApprovalTimeout(formData);
+  const clarificationTimeout = readClarificationTimeout(formData);
   const dynamicWorkersOn = readDynamicWorkersOn(formData);
 
   const toggleApproval = (name: string, on: boolean): void => {
@@ -491,6 +494,25 @@ export function SecuritySection({
                     aria-label={t("agent_form.approval_timeout")}
                     onChange={(v) =>
                       onChange(setApprovalTimeout(formData, v ?? 86400))
+                    }
+                  />
+                </FieldRow>
+                <FieldRow
+                  fieldId="policies.clarification_timeout_s"
+                  label={t("agent_form.clarification_timeout")}
+                  brief={t("agent_form.clarification_timeout_brief")}
+                  help={t("agent_form.clarification_timeout_help")}
+                  isDefault={clarificationTimeout === 3600}
+                  onReset={() => onChange(setClarificationTimeout(formData, 3600))}
+                  resetHint="3600"
+                >
+                  <InputNumber
+                    min={60}
+                    max={604800}
+                    value={clarificationTimeout}
+                    aria-label={t("agent_form.clarification_timeout")}
+                    onChange={(v) =>
+                      onChange(setClarificationTimeout(formData, v ?? 3600))
                     }
                   />
                 </FieldRow>

@@ -218,6 +218,23 @@ describe("SecuritySection", () => {
     expect(last.spec?.policies?.approval_timeout_s).toBe(3600);
   });
 
+  it("approval tab: clarification_timeout defaults to 3600 and editing it writes clarification_timeout_s", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSection({}, onChange);
+    await openTab(user, "Human approval");
+    const input = within(rowFor("policies.clarification_timeout_s")).getByRole(
+      "spinbutton",
+    );
+    expect(input).toHaveValue("3600");
+    await user.clear(input);
+    await user.type(input, "600");
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.policies?.clarification_timeout_s).toBe(600);
+    // Sibling knob untouched — same policies block, different key.
+    expect(last.spec?.policies?.approval_timeout_s).toBeUndefined();
+  });
+
   it("network tab: renders all 5 FieldRows once its tab is active", async () => {
     const user = userEvent.setup();
     renderSection();
