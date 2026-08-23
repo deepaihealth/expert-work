@@ -4,8 +4,8 @@ import type { HistoryMessage } from "../../../../api/sessions";
 import type { ThreadRunSummary } from "../../../../api/runs";
 import { buildHistoryTurns } from "../history_turns";
 
-function run(runId: string): ThreadRunSummary {
-  return { runId, status: "success", isResume: false, createdAt: "2026-01-01", tokens: null };
+function run(runId: string, status = "success"): ThreadRunSummary {
+  return { runId, status, isResume: false, createdAt: "2026-01-01", tokens: null };
 }
 
 const U = (content: string): HistoryMessage => ({ role: "user", content });
@@ -147,5 +147,69 @@ describe("buildHistoryTurns", () => {
       { runId: "r1", status: "success", isResume: false, tokens: null } as unknown as Parameters<typeof buildHistoryTurns>[1][number],
     ]);
     expect(bare?.[0]?.createdAt).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-5 — trailing non-terminal tolerance
+// ---------------------------------------------------------------------------
+
+describe("buildHistoryTurns non-terminal tail", () => {
+  it("builds a turn for a trailing running run whose user message is checkpointed", () => {
+    const built = buildHistoryTurns(
+      [U("q1"), A("a1"), U("q2")],
+      [run("r1"), run("r2", "running")],
+    );
+    expect(built).not.toBeNull();
+    expect(built).toHaveLength(2);
+    expect(built![1]).toMatchObject({ runId: "r2", status: "running", input: "q2" });
+  });
+
+  it("builds a turn for a trailing running run whose user message is NOT yet checkpointed", () => {
+    const built = buildHistoryTurns([U("q1"), A("a1")], [run("r1"), run("r2", "running")]);
+    expect(built).not.toBeNull();
+    expect(built).toHaveLength(2);
+    expect(built![1]).toMatchObject({ runId: "r2", status: "running", input: "" });
+    expect(built![1].fallbackLines).toEqual([]);
+  });
+
+  it("tolerates paused + just-spawned continuation as one trailing block", () => {
+    // 2 user turns, 3 runs: r2 paused (owns q2), r3 = its continuation (no
+    // user message of its own, still running).
+    const built = buildHistoryTurns(
+      [U("q1"), A("a1"), U("q2")],
+      [run("r1"), run("r2", "paused"), run("r3", "running")],
+    );
+    expect(built).not.toBeNull();
+    expect(built).toHaveLength(3);
+    expect(built![1]).toMatchObject({ runId: "r2", status: "paused", input: "q2" });
+    expect(built![2]).toMatchObject({ runId: "r3", status: "running", input: "" });
+  });
+
+  it("still degrades when a non-terminal run sits BEFORE the trailing block", () => {
+    // paused mid-thread (its continuation already finished) — order-pairing
+    // is ambiguous, keep the honest flat fallback (ROADMAP D-7).
+    expect(
+      buildHistoryTurns(
+        [U("q1"), A("a1"), U("q2"), A("a2")],
+        [run("r1"), run("r2", "paused"), run("r3")],
+      ),
+    ).toBeNull();
+  });
+
+  it("still degrades when even the tolerant window cannot explain the counts", () => {
+    // 3 user turns but only 1 terminal + 1 running run — more pairs than runs.
+    expect(
+      buildHistoryTurns(
+        [U("q1"), A("a1"), U("q2"), A("a2"), U("q3")],
+        [run("r1"), run("r2", "running")],
+      ),
+    ).toBeNull();
+  });
+
+  it("all-terminal threads keep the strict D1 equality (no tolerance window)", () => {
+    expect(
+      buildHistoryTurns([U("q1"), A("a1")], [run("r1"), run("r2")]),
+    ).toBeNull();
   });
 });
