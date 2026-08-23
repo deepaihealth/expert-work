@@ -29,6 +29,17 @@ export type RunStatus =
   | "cancelled"
   | "unknown";
 
+/** Run statuses that mean "still in flight" — D-5's tail tolerance, the
+ *  live-attach mode switch and the conversation page's cancel affordance all
+ *  key off this one set. ``queued`` is real (queue-mode runs) and cancellable
+ *  (``RunStore.request_cancel`` supports it explicitly). */
+export const NON_TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "pending",
+  "queued",
+  "running",
+  "paused",
+]);
+
 export interface PendingApproval {
   request_id: string;
   node: string;
@@ -282,4 +293,15 @@ export async function listThreadRuns(
     createdAt: r.created_at,
     tokens: r.tokens ?? null,
   }));
+}
+
+/** POST /v1/sessions/{thread}/runs/{run}:cancel — D-6, cancel one in-flight
+ *  run (running / pending / queued). 409 when the run is already terminal or
+ *  paused (a paused run is decided through the approval path instead). */
+export async function cancelRun(threadId: string, runId: string): Promise<void> {
+  const response = await apiClient.post<ApiEnvelope<{ cancelled: boolean }>>(
+    `/v1/sessions/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}:cancel`,
+    {},
+  );
+  unwrap(response.data);
 }

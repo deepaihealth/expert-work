@@ -1847,6 +1847,104 @@ def build_runs_router() -> APIRouter:
             },
         )
 
+    @router.post(
+        "/{thread_id}/runs/{run_id}:cancel",
+        response_model=None,
+        # D-6 — cancelling someone's in-flight run is an operator+ action,
+        # same gate as starting/resuming one.
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
+    )
+    async def cancel_run(
+        thread_id: UUID,
+        run_id: UUID,
+        request: Request,
+        threads: Annotated[object, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
+        runtime: Annotated[AgentRuntime, Depends(_get_agent_runtime)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> JSONResponse:
+        """D-6 — cancel one in-flight run from the conversation page.
+
+        Reuses the tenant-suspend bulk-cancel kernel (``tenants.py``):
+        a run this instance owns aborts immediately via
+        ``RunManager.cancel``; a peer-owned (or still-queued) run falls
+        back to the ``RunStore.request_cancel`` CAS (running/pending/
+        queued → interrupted) so its next lease heartbeat stops it.
+        409 when neither path finds a cancellable run — already
+        terminal, or paused (a paused run is decided through the
+        approval reject path, not cancelled).
+        """
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            None,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="POST /v1/sessions/{thread_id}/runs/{run_id}:cancel",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        target_tenant = scope.tenant_id
+        async with applied_scope(scope):
+            meta = await threads.get(thread_id, tenant_id=target_tenant)  # type: ignore[attr-defined]
+        if meta is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        caller_user_id = await resolve_caller_user_id(request, users)
+        if not caller_owns_thread(
+            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
+        ):
+            raise HTTPException(status_code=404, detail="session not found")
+        async with applied_scope(scope):
+            persisted = await runs.get(run_id=run_id, tenant_id=target_tenant)
+        if persisted is None or persisted.thread_id != thread_id:
+            raise HTTPException(status_code=404, detail="run not found")
+        # 终审 C-1 — pre-filter BEFORE touching either cancel primitive:
+        # ``RunManager.cancel()`` returns True iff an in-memory record exists
+        # — regardless of its status — so an unconditional call would report
+        # an already-finished (or paused) run as freshly stopped, 200 the
+        # caller and leave an untrue SESSION_CANCEL audit row. Same guard as
+        # the kernel's other call sites (``external_runs.py:206`` spells out
+        # the trap). PAUSED is in TERMINAL_RUN_STATUSES, so the "decide the
+        # approval instead" branch rides the same check.
+        if persisted.status in TERMINAL_RUN_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "run is not cancellable (already terminal, or paused — "
+                    "decide the approval instead)"
+                ),
+            )
+
+        async with applied_scope(scope):
+            stopped = await runtime.run_manager.cancel(run_id) or await runs.request_cancel(
+                run_id=run_id, tenant_id=target_tenant, updated_at=datetime.now(UTC)
+            )
+        if not stopped:
+            # The status flipped terminal between our read and the CAS — the
+            # run finished (or a peer cancelled it) first.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "run is not cancellable (already terminal, or paused — "
+                    "decide the approval instead)"
+                ),
+            )
+        await emit(
+            audit,
+            tenant_id=target_tenant,
+            actor_id=request.state.actor_id,
+            action=AuditAction.SESSION_CANCEL,
+            resource_type="run",
+            resource_id=str(run_id),
+            result=AuditResult.SUCCESS,
+            trace_id=current_trace_id_hex(),
+            details={"thread_id": str(thread_id)},
+        )
+        return JSONResponse(content={"success": True, "data": {"cancelled": True}, "error": None})
+
     return router
 
 

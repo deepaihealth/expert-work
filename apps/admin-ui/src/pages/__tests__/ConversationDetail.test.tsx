@@ -15,6 +15,7 @@ import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from 
 import "../../i18n";
 
 import { setStoredToken } from "../../api/client";
+import * as approvalsSdk from "../../api/approvals";
 import * as convoSdk from "../../api/conversations";
 import * as planSdk from "../../api/plan";
 import type { ThreadPlan } from "../../api/plan";
@@ -898,5 +899,202 @@ describe("ConversationDetail", () => {
     await waitFor(() =>
       expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-5/D-6 — live tail + in-place operations
+// ---------------------------------------------------------------------------
+
+const PAUSED_RUN = "33333333-3333-3333-3333-333333333399";
+
+const pausedFixture = () => {
+  const convo: ConversationDetailModel = {
+    ...CONVO,
+    runs: [
+      CONVO.runs[0],
+      {
+        ...CONVO.runs[1],
+        run_id: PAUSED_RUN,
+        status: "paused",
+        error: null,
+        finished_at: null,
+      },
+    ],
+  };
+  const messages: sessionsSdk.HistoryMessage[] = [
+    ...TWO_TURNS.slice(0, 2),
+    { role: "user", content: "second question" },
+  ];
+  const runs = [
+    {
+      runId: RUN_1,
+      status: "success" as const,
+      isResume: false,
+      createdAt: "2026-06-30T12:00:00Z",
+      tokens: null,
+    },
+    {
+      runId: PAUSED_RUN,
+      status: "paused" as const,
+      isResume: true,
+      createdAt: "2026-06-30T12:05:00Z",
+      tokens: null,
+    },
+  ];
+  const approvalFrame: SseEvent = {
+    id: "3",
+    event: "approval",
+    data: {
+      run_id: PAUSED_RUN,
+      thread_id: THREAD_ID,
+      request_id: "approval:abc",
+      reason_kind: "missing_info",
+      action_summary: "which quarter?",
+      requested_at: "2026-08-23T00:00:00Z",
+      timeout_at: "2026-08-23T01:00:00Z",
+    },
+    rawData: "",
+    receivedAt: "",
+  } as SseEvent;
+  return { convo, messages, runs, approvalFrame };
+};
+
+describe("D-5/D-6 live tail + operations", () => {
+  it("operator sees the in-place approval gate on a paused tail turn — everything else stays read-only", async () => {
+    const fx = pausedFixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation((_t, runId) =>
+      runId === PAUSED_RUN
+        ? makeStream([
+            { id: "1", event: "metadata", data: { run_id: PAUSED_RUN } } as SseEvent,
+            fx.approvalFrame,
+          ])
+        : makeStream([]),
+    );
+
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("playground-approval")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("playground-approval-approve")).toBeInTheDocument();
+    // R2 still holds for everything but the gate: no feedback bar.
+    expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+  });
+
+  it("viewer gets no approval buttons on the same paused turn", async () => {
+    setStoredToken(jwt({ sub: "v", tenant_id: TENANT_ID, roles: ["viewer"] }));
+    const fx = pausedFixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation((_t, runId) =>
+      runId === PAUSED_RUN
+        ? makeStream([
+            { id: "1", event: "metadata", data: { run_id: PAUSED_RUN } } as SseEvent,
+            fx.approvalFrame,
+          ])
+        : makeStream([]),
+    );
+
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getAllByTestId("console-turn").length).toBeGreaterThan(0),
+    );
+    // The turn renders; the gate does not (allowDecide gated on operator+).
+    await waitFor(() =>
+      expect(screen.queryByTestId("playground-approval")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("deciding the gate posts to :decide and silently refreshes", async () => {
+    const fx = pausedFixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation((_t, runId) =>
+      runId === PAUSED_RUN
+        ? makeStream([fx.approvalFrame])
+        : makeStream([]),
+    );
+    const decideMock = vi
+      .spyOn(approvalsSdk, "decideApprovals")
+      .mockResolvedValue({
+        results: [
+          { run_id: PAUSED_RUN, ok: true, continuation_run_id: crypto.randomUUID() },
+        ],
+        succeeded: 1,
+      });
+
+    renderPage();
+    const approve = await screen.findByTestId("playground-approval-approve");
+    fireEvent.click(approve);
+    await waitFor(() =>
+      expect(decideMock).toHaveBeenCalledWith([
+        { thread_id: THREAD_ID, run_id: PAUSED_RUN, decision: "approve" },
+      ]),
+    );
+  });
+
+  it("operator can cancel a running tail run from the header", async () => {
+    const fx = pausedFixture();
+    const running: ConversationDetailModel = {
+      ...fx.convo,
+      runs: [
+        fx.convo.runs[0],
+        { ...fx.convo.runs[1], status: "running" },
+      ],
+    };
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(running);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
+      fx.runs[0],
+      { ...fx.runs[1], status: "running" as const },
+    ]);
+    const cancelMock = vi.spyOn(runsSdk, "cancelRun").mockResolvedValue(undefined);
+
+    renderPage();
+    const btn = await screen.findByTestId("conversation-cancel-run");
+    fireEvent.click(btn);
+    const confirm = await screen.findAllByRole("button", { name: /取消运行|Cancel run/i });
+    fireEvent.click(confirm[confirm.length - 1]);
+    await waitFor(() =>
+      expect(cancelMock).toHaveBeenCalledWith(THREAD_ID, PAUSED_RUN),
+    );
+  });
+
+  it("terminal conversation renders no cancel button even for admins", async () => {
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO); // both runs terminal
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getAllByTestId("console-turn").length).toBeGreaterThan(0),
+    );
+    expect(screen.queryByTestId("conversation-cancel-run")).not.toBeInTheDocument();
+  });
+
+  it("viewer sees no cancel button", async () => {
+    setStoredToken(jwt({ sub: "v", tenant_id: TENANT_ID, roles: ["viewer"] }));
+    const fx = pausedFixture();
+    const running: ConversationDetailModel = {
+      ...fx.convo,
+      runs: [fx.convo.runs[0], { ...fx.convo.runs[1], status: "running" }],
+    };
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(running);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
+      fx.runs[0],
+      { ...fx.runs[1], status: "running" as const },
+    ]);
+
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("conversation-cancel-run")).not.toBeInTheDocument();
   });
 });

@@ -42,7 +42,9 @@ export interface Turn {
 /** Historical-turn lazy replay state (one per resumed run). ``pending`` = not
  *  yet scrolled into view; ``loading`` = replay in flight; ``done`` = replayed
  *  events collected (TurnCard renders the full debug panels); ``error`` =
- *  replay failed (TurnCard keeps showing the flat fallback answer). */
+ *  replay failed (TurnCard keeps showing the flat fallback answer);
+ *  ``live`` (D-5) = a non-terminal run's attach is open and ``events`` is
+ *  still growing — render what's there, streaming-style. */
 export type HistoryLoad =
   | { state: "pending" | "loading" | "error"; events: SseEvent[] }
-  | { state: "done"; events: SseEvent[] };
+  | { state: "done" | "live"; events: SseEvent[] };

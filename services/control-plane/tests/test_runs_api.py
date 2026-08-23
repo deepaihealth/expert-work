@@ -1801,3 +1801,155 @@ async def test_run_detail_tenant_id_star_400(
     )
     assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+# ---------------------------------------------------------------------------
+# D-6 — POST /v1/sessions/{thread_id}/runs/{run_id}:cancel
+# ---------------------------------------------------------------------------
+
+
+async def _seed_run_row(client: AsyncClient, thread_id: str, *, status: object) -> UUID:
+    from datetime import UTC, datetime
+    from uuid import uuid4 as _uuid4
+
+    from expert_work.runtime.runs import DisconnectMode, RunInfo
+
+    run_id = _uuid4()
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=status,  # type: ignore[arg-type]
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=None,
+        )
+    )
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_interrupts_a_running_row(runs_client: AsyncClient) -> None:
+    """A peer-owned running run cancels via the store CAS → interrupted."""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.RUNNING)
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {"cancelled": True}
+
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
+    assert row is not None
+    assert row.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_terminal_row_is_409(runs_client: AsyncClient) -> None:
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.SUCCESS)
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 409, resp.text
+    # The row is untouched — a finished run is never clobbered.
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
+    assert row is not None
+    assert row.status is RunStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_terminal_with_local_manager_record_is_409(
+    runs_client: AsyncClient,
+) -> None:
+    """终审 C-1/I-7 — the 409 must hold even when THIS instance still holds
+    the run's in-memory RunManager record: ``RunManager.cancel()`` returns
+    True for any known record regardless of status, so without the terminal
+    pre-filter this would 200 + set the record's abort_event."""
+    from datetime import UTC, datetime
+    from uuid import uuid4 as _uuid4
+
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = _uuid4()
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    runtime = app.state.agent_runtime
+    record = await runtime.run_manager.create(
+        run_id=run_id,
+        thread_id=UUID(thread_id),
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        user_id=None,
+    )
+    await app.state.run_store.set_status(
+        run_id=run_id,
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+    )
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 409, resp.text
+    # The in-memory record was never touched — no phantom abort.
+    assert not record.abort_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_paused_row_is_409_decide_instead(runs_client: AsyncClient) -> None:
+    """A paused run is decided through the approval path, never cancelled."""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.PAUSED)
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 409, resp.text
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
+    assert row is not None
+    assert row.status is RunStatus.PAUSED
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_wrong_thread_is_404(runs_client: AsyncClient) -> None:
+    from expert_work.runtime.runs import RunStatus
+
+    thread_a = await _create_session(runs_client)
+    thread_b = await _create_session(runs_client)
+    run_in_b = await _seed_run_row(runs_client, thread_b, status=RunStatus.RUNNING)
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_a}/runs/{run_in_b}:cancel", json={})
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_requires_operator_role(runs_client: AsyncClient) -> None:
+    """D-6 role gate — a viewer JWT cannot cancel runs (403)."""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.RUNNING)
+
+    viewer = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"
+    }
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={}, headers=viewer
+    )
+    assert resp.status_code == 403, resp.text
+    # Untouched — the gate fired before the CAS.
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING

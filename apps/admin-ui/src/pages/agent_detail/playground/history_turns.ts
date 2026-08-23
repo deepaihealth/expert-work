@@ -22,6 +22,7 @@
  * the answer.
  */
 import type { HistoryMessage } from "../../../api/sessions";
+import { NON_TERMINAL_RUN_STATUSES } from "../../../api/runs";
 import type { RunTokens, ThreadRunSummary } from "../../../api/runs";
 
 export interface FallbackLine {
@@ -54,14 +55,30 @@ export function buildHistoryTurns(
     }
     pairs.push({ input: m.content, answers });
   }
-  if (pairs.length !== runs.length) return null;
-  return pairs.map((p, i) => ({
-    key: runs[i].runId,
-    input: p.input,
-    fallbackLines: p.answers,
-    runId: runs[i].runId,
-    status: runs[i].status,
-    tokens: runs[i].tokens,
-    createdAt: runs[i].createdAt ?? null,
+  // D-5 — tolerate a TRAILING contiguous block of non-terminal runs (a
+  // running new turn, a paused approval, or paused + its just-spawned
+  // continuation). Such runs may not have their user message checkpointed
+  // yet (running) or may own no user message at all (a continuation run
+  // resumes the paused turn's checkpoint), so strict count equality would
+  // needlessly flatten the whole page. A non-terminal run BEFORE the
+  // trailing block (e.g. a paused run whose continuation already finished)
+  // still degrades to flat — order-pairing is genuinely ambiguous there
+  // (one user message ↔ two runs; folding continuation chains is a
+  // follow-up, ROADMAP D-7).
+  const n = runs.length;
+  let tail = 0;
+  while (tail < n && NON_TERMINAL_RUN_STATUSES.has(runs[n - 1 - tail].status)) tail += 1;
+  for (let i = 0; i < n - tail; i += 1) {
+    if (NON_TERMINAL_RUN_STATUSES.has(runs[i].status)) return null;
+  }
+  if (pairs.length < n - tail || pairs.length > n) return null;
+  return runs.map((r, i) => ({
+    key: r.runId,
+    input: i < pairs.length ? pairs[i].input : "",
+    fallbackLines: i < pairs.length ? pairs[i].answers : [],
+    runId: r.runId,
+    status: r.status,
+    tokens: r.tokens,
+    createdAt: r.createdAt ?? null,
   }));
 }

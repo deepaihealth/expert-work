@@ -90,6 +90,7 @@ READ_ENDPOINTS: list[tuple[str, str, dict[str, object]]] = [
 WRITE_ENDPOINTS: list[tuple[str, str, dict[str, object]]] = [
     ("POST", f"/v1/sessions/{_TID}/runs", {"json": {"input": "hi"}}),
     ("POST", f"/v1/sessions/{_TID}/runs/{_RID}/resume", {"json": {"decision": "approve"}}),
+    ("POST", f"/v1/sessions/{_TID}/runs/{_RID}:cancel", {"json": {}}),
     ("POST", "/v1/sessions", {"json": {}}),
     ("PATCH", f"/v1/sessions/{_TID}", {"json": {"title": "t"}}),
     ("POST", f"/v1/sessions/{_TID}:pause", {"json": {}}),
