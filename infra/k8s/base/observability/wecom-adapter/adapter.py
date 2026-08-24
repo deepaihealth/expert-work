@@ -173,6 +173,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, b"log-only")
             return
 
+        dropped = False
         for index, message in enumerate(messages):
             try:
                 _post_wecom(url, message)
@@ -180,6 +181,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if exc.errcode == WECOM_RATE_LIMITED:
                     # 限流:重投只会加剧,按已投递处置(丢这条,日志留痕)。
                     log.warning("wecom rate-limited (45009), dropping channel=%s", channel)
+                    dropped = True
                     continue
                 if index > 0:
                     # 附加消息(p0 @all):主 markdown 已达,降级为日志,
@@ -196,7 +198,7 @@ class _Handler(BaseHTTPRequestHandler):
                 log.exception("wecom delivery failed for channel=%s", channel)
                 self._reply(502, b"wecom delivery failed")
                 return
-        self._reply(200, b"delivered")
+        self._reply(200, b"rate-limited" if dropped else b"delivered")
 
 
 def main() -> None:

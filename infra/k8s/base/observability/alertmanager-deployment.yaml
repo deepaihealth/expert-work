@@ -10,6 +10,10 @@ metadata:
     app.kubernetes.io/name: alertmanager
 spec:
   replicas: 1
+  # RWO 云盘 + 默认 RollingUpdate = 新旧 pod 争同一块盘死锁整次 rollout
+  # (复审 NEW-1)—— 与 grafana/prometheus/tempo 三个兄弟同款 Recreate。
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: alertmanager
