@@ -247,6 +247,9 @@ export function SettingsApiKeys() {
         text: t(`api_keys.status_${s}`),
         value: s,
       })),
+      // BUG-8:撤销的历史密钥很快淹没生效中的那一条 —— 默认只看还能用的
+      // (active + 轮换宽限窗口内的旧钥);撤销/过期走筛选查。
+      defaultFilteredValue: ["active", "grace"],
       onFilter: (value, r) => classifyKey(r) === value,
       render: (_v, r) => {
         const cls = classifyKey(r);
@@ -375,7 +378,12 @@ export function SettingsApiKeys() {
         columns={columns}
         dataSource={keys}
         loading={loading}
-        pagination={false}
+        // BUG-8:同 SkillsList BUG-3 口径 —— 客户端分页 20/页,单页自动隐藏。
+        pagination={{
+          pageSize: 20,
+          showSizeChanger: false,
+          hideOnSinglePage: true,
+        }}
         locale={{
           emptyText: (
             <Empty description={t("api_keys.empty")} />
