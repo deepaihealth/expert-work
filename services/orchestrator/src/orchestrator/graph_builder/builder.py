@@ -129,6 +129,7 @@ from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
     compaction_sink_from_config,
+    configurable_uuid,
     current_run_id,
     token_sink_from_config,
 )
@@ -1439,8 +1440,14 @@ def build_react_graph(
             state,
             ctx_obj,
             audit_logger,
-            prefix=safe_thread_projection_prefix(
-                (config.get("configurable") or {}).get("thread_id")
+            # 终审 F8 — ``configurable_uuid`` is the repo's thread-id lift
+            # (structurally a UUID, so path safety is guaranteed); 终审 F3 —
+            # delegated child runs skip (throwaway sub-threads, see
+            # ``_child_config``).
+            prefix=(
+                None
+                if (config.get("configurable") or {}).get("child_run")
+                else safe_thread_projection_prefix(configurable_uuid(config, "thread_id"))
             ),
         )
         if projection is not None and not projection.skipped:
@@ -2689,7 +2696,13 @@ async def _project_workspace_state(
     from ``factory``), skipping when content is unchanged since
     ``last_projection_hash``. Never raises — projection must not break a run
     (Mini-ADR CM-A8) — returning ``None`` when disabled or on error."""
-    if factory is None or prefix is None:
+    if factory is None:
+        return None
+    if prefix is None:
+        # 终审 F5 — a missing/non-UUID thread (or a delegated child run)
+        # disables projection; leave a signal instead of vanishing silently.
+        logger.info("workspace_projection.no_thread_scope")
+        _cm_projection_total.labels(outcome="skipped_no_thread").inc()
         return None
     try:
         result = await WorkspaceProjector(writer=factory(ctx)).project(

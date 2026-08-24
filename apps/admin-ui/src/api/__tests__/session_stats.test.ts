@@ -103,3 +103,10 @@ describe("computeSessionStats", () => {
     }
   });
 });
+
+
+it("counts a loaded interrupted turn with zero completed steps (终审 F6 — no 轮数 flicker on lazy load)", () => {
+  expect(
+    computeSessionStats([live([], { status: "interrupted" })], null).turns,
+  ).toBe(1);
+});

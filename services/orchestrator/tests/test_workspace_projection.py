@@ -257,10 +257,14 @@ async def test_project_prefixes_rels_with_thread_dir() -> None:
     result = await WorkspaceProjector(writer=writer).project(
         plan=_plan(), memories=_memories(), last_digest=None, prefix="threads/t-1/"
     )
+    # First projection (no cursor) also rewrites the legacy roots (终审 F2).
     assert set(writer.writes) == {
         "threads/t-1/PLAN.md",
         "threads/t-1/TODO.md",
         "threads/t-1/MEMORY.md",
+        "PLAN.md",
+        "TODO.md",
+        "MEMORY.md",
     }
     assert set(result.written) == set(writer.writes)
 
@@ -277,3 +281,45 @@ async def test_same_content_different_thread_is_not_skipped() -> None:
     )
     assert second.skipped is False
     assert "threads/b/PLAN.md" in writer_b.writes
+
+
+async def test_first_thread_projection_rewrites_legacy_root_files() -> None:
+    writer = _RecordingWriter()
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
+    )
+    # 终审 F2 — the one-shot legacy redirect lands at the root...
+    assert "no longer read" in writer.writes["PLAN.md"]
+    assert "no longer read" in writer.writes["TODO.md"]
+    assert "no longer read" in writer.writes["MEMORY.md"]
+    # ...while the digest still covers only the thread-scoped items: a second
+    # unchanged projection must skip (no per-turn root rewrites).
+    writer2 = _RecordingWriter()
+    second = await WorkspaceProjector(writer=writer2).project(
+        plan=_plan(), memories=[], last_digest=result.digest, prefix="threads/t-1/"
+    )
+    assert second.skipped is True
+    assert writer2.writes == {}
+
+
+async def test_changed_second_projection_does_not_rewrite_legacy_roots() -> None:
+    writer = _RecordingWriter()
+    first = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
+    )
+    changed = Plan(goal="new goal", steps=_plan().steps)
+    writer2 = _RecordingWriter()
+    await WorkspaceProjector(writer=writer2).project(
+        plan=changed, memories=[], last_digest=first.digest, prefix="threads/t-1/"
+    )
+    # Cursor exists → repair already ran; only thread files rewritten.
+    assert set(writer2.writes) == {"threads/t-1/PLAN.md", "threads/t-1/TODO.md"}
+
+
+async def test_legacy_root_write_failure_does_not_pin_digest() -> None:
+    # A failing ROOT repair write must not hold the projection cursor back.
+    writer = _RecordingWriter(fail_on=frozenset({"PLAN.md"}))
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
+    )
+    assert result.digest is not None

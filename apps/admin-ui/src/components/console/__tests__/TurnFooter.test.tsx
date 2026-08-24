@@ -327,3 +327,24 @@ describe("TurnFooter", () => {
     expect(retryBtn.className).toContain("dangerous"); // failed turn → danger styling
   });
 });
+
+
+it("interrupted turn: 已中断 tag and the feedback bar stays (终审 F4)", () => {
+  render(
+    <MemoryRouter>
+      <TurnFooter
+        turn={makeConsoleTurn({ status: "interrupted" })}
+        threadId="th-1"
+        summary={EMPTY_SUMMARY}
+        costCny={null}
+        readOnly={false}
+        isTenantSwitched={false}
+        onExport={() => {}}
+        exporting={false}
+        onInspect={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  expect(screen.getByTestId("console-turn-status").textContent).toMatch(/已中断|Interrupted/);
+  expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+});

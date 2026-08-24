@@ -78,6 +78,19 @@ _READONLY_NOTE = (
     "here are NOT ingested — edit PLAN.md to steer the agent. -->"
 )
 
+#: BUG-10 终审 F2 — pre-方案-a workspaces carry root-level PLAN.md/TODO.md/
+#: MEMORY.md whose embedded note still claims edits are ingested; that stopped
+#: being true the moment projection moved under ``threads/``. Overwrite them
+#: once (first thread-scoped projection) with this redirect so neither a human
+#: editor nor the agent's own ``read_file`` keeps consuming stale cross-thread
+#: state.
+LEGACY_REDIRECT_NOTE = (
+    "<!-- Moved: this workspace's plan/state files now live under "
+    "threads/<thread_id>/ (one directory per conversation). This root file "
+    "is no longer read or updated — edit threads/<thread_id>/PLAN.md to "
+    "steer that conversation. -->\n"
+)
+
 #: Status ↔ checkbox marker. PLAN.md round-trips through these (render ↔ parse).
 _STATUS_BOX: dict[PlanStepStatus, str] = {"pending": " ", "in_progress": "~", "completed": "x"}
 _BOX_STATUS: dict[str, PlanStepStatus] = {" ": "pending", "~": "in_progress", "x": "completed"}
@@ -230,15 +243,29 @@ class WorkspaceProjector:
             logger.debug("workspace_projection.unchanged")
             return ProjectionResult(written=(), skipped=True, digest=digest)
 
+        # 终审 F2 — on the thread's FIRST projection (no cursor yet), also
+        # overwrite the legacy root files with the redirect note. Deliberately
+        # OUTSIDE the digest (a one-shot repair, not projected state — putting
+        # it in the digest would make turn 2's digest never match turn 1's)
+        # and fully best-effort: a failure here neither blocks the thread
+        # files nor pins the cursor.
+        to_write: list[tuple[str, str]] = list(items)
+        if prefix and last_digest is None:
+            to_write.extend(
+                (name, LEGACY_REDIRECT_NOTE) for name in (PLAN_FILE, TODO_FILE, MEMORY_FILE)
+            )
+
         written: list[str] = []
         all_ok = True
-        for rel, content in items:
+        for rel, content in to_write:
             try:
                 await self.writer.write(rel=rel, content=content)
             # Best-effort (CM-A8): projection must never break a run. ``Exception``
             # (not ``BaseException``) so ``asyncio.CancelledError`` still propagates.
             except Exception:
-                all_ok = False
+                # 遗留根文件改写失败不影响 digest 前进(不是投影状态)。
+                if (rel, content) in items:
+                    all_ok = False
                 logger.warning(
                     "workspace_projection.write_failed", extra={"rel": rel}, exc_info=True
                 )

@@ -448,6 +448,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         "thread_id": str(sub_thread_id),
         "run_id": str(sub_run_id),
         "tenant_id": str(ctx.tenant_id),
+        # BUG-10 终审 F3 — mark delegated children: every delegation mints a
+        # fresh sub_thread_id nobody ever steers or revisits, so the
+        # thread-scoped PLAN.md projection/ingest skips child runs entirely
+        # (otherwise each delegation leaves an orphan threads/<uuid>/ dir).
+        "child_run": True,
     }
     if ctx.user_id is not None:
         configurable["user_id"] = str(ctx.user_id)

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getRun } from "../../api/runs";
 import { getRunTrace, type RunTrace } from "../../api/trace_facade";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import type { TurnStatus } from "../turn/types";
 
 // A just-finished run's Langfuse trace lands as `not_ready` for a moment
 // (ingestion isn't atomic — the root closes before its child observations
@@ -40,7 +41,7 @@ export function useRunTrace(args: {
   runId: string | null;
   /** The panel showing this turn is actually displayed — the fetch is lazy. */
   enabled: boolean;
-  turnStatus: "running" | "done" | "error" | "interrupted";
+  turnStatus: TurnStatus;
   /** system_admin — Langfuse has no per-tenant isolation, so the deep link
    *  (and the `trace_id` lookup behind it) is admin-only. */
   wantTraceId: boolean;

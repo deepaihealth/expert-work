@@ -14,6 +14,7 @@ import * as runsSdk from "../../../api/runs";
 import type { RunDetail } from "../../../api/runs";
 import * as traceFacadeSdk from "../../../api/trace_facade";
 import type { RunTrace } from "../../../api/trace_facade";
+import type { TurnStatus } from "../../turn/types";
 import {
   TRACE_NOT_READY_MAX_RETRIES,
   TRACE_NOT_READY_RETRY_MS,
@@ -135,7 +136,7 @@ describe("useRunTrace", () => {
     getRunTraceMock.mockResolvedValue(notReady);
 
     const { rerender } = renderHook(
-      (props: { turnStatus: "running" | "done" | "error" }) =>
+      (props: { turnStatus: TurnStatus }) =>
         useRunTrace({
           threadId: "th-1",
           runId: "r1",
@@ -143,7 +144,7 @@ describe("useRunTrace", () => {
           turnStatus: props.turnStatus,
           wantTraceId: false,
         }),
-      { initialProps: { turnStatus: "running" as "running" | "done" | "error" } },
+      { initialProps: { turnStatus: "running" as TurnStatus } },
     );
 
     // Burn the whole not_ready retry budget while the turn is still running.

@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -64,6 +65,9 @@ class _NoopTool:
         return ToolResult(content="ok")
 
 
+T1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0001"
+
+
 def _plan() -> Plan:
     return Plan(
         goal="do the thing",
@@ -76,7 +80,11 @@ def _tc(call_id: str) -> dict[str, Any]:
 
 
 async def _run_one_turn(
-    *, writer: WorkspaceFileWriter | None, plan: Plan | None, thread_id: str
+    *,
+    writer: WorkspaceFileWriter | None,
+    plan: Plan | None,
+    thread_id: str,
+    child_run: bool = False,
 ) -> AgentState:
     """One agent→tools→agent loop with a recording projection writer."""
     llm = _ScriptedLLM(
@@ -96,7 +104,10 @@ async def _run_one_turn(
                 workspace_writer_factory=factory,
             )
         )
-        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        configurable: dict[str, Any] = {"thread_id": thread_id}
+        if child_run:
+            configurable["child_run"] = True
+        cfg: RunnableConfig = {"configurable": configurable}
         initial: dict[str, Any] = {
             "messages": [HumanMessage(content="start")],
             "step_count": 0,
@@ -109,12 +120,20 @@ async def _run_one_turn(
 
 async def test_turn_end_projection_writes_plan_files() -> None:
     writer = _RecordingWriter()
-    state = await _run_one_turn(writer=writer, plan=_plan(), thread_id="proj-1")
+    state = await _run_one_turn(writer=writer, plan=_plan(), thread_id=T1)
     # BUG-10 (方案 a) — PLAN.md + TODO.md land under the THREAD's projection
     # dir, never the user-scoped workspace root.
-    assert set(writer.writes) == {"threads/proj-1/PLAN.md", "threads/proj-1/TODO.md"}
-    assert "do the thing" in writer.writes["threads/proj-1/PLAN.md"]
-    assert "[x]" in writer.writes["threads/proj-1/TODO.md"]
+    assert set(writer.writes) == {
+        f"threads/{T1}/PLAN.md",
+        f"threads/{T1}/TODO.md",
+        "PLAN.md",
+        "TODO.md",
+        "MEMORY.md",
+    }
+    assert "do the thing" in writer.writes[f"threads/{T1}/PLAN.md"]
+    assert "[x]" in writer.writes[f"threads/{T1}/TODO.md"]
+    # 终审 F2 — first projection rewrites the legacy root files as redirects.
+    assert "no longer read" in writer.writes["PLAN.md"]
     # The projection cursor is persisted on the checkpointed state.
     assert state.get("last_projection_hash")
 
@@ -128,13 +147,22 @@ async def test_traversal_bearing_thread_id_projects_nothing() -> None:
 
 
 async def test_no_factory_means_no_projection() -> None:
-    state = await _run_one_turn(writer=None, plan=_plan(), thread_id="proj-2")
+    state = await _run_one_turn(writer=None, plan=_plan(), thread_id=str(uuid4()))
     # Nothing wired → the channel stays untouched.
     assert state.get("last_projection_hash") is None
 
 
 async def test_react_run_without_plan_projects_nothing() -> None:
     writer = _RecordingWriter()
-    state = await _run_one_turn(writer=writer, plan=None, thread_id="proj-3")
+    state = await _run_one_turn(writer=writer, plan=None, thread_id=str(uuid4()))
+    assert writer.writes == {}
+    assert state.get("last_projection_hash") is None
+
+
+async def test_child_run_projects_nothing() -> None:
+    # 终审 F3 — delegated children mint throwaway sub-threads; projecting
+    # there would leave one orphan threads/<uuid>/ dir per delegation.
+    writer = _RecordingWriter()
+    state = await _run_one_turn(writer=writer, plan=_plan(), thread_id=str(uuid4()), child_run=True)
     assert writer.writes == {}
     assert state.get("last_projection_hash") is None

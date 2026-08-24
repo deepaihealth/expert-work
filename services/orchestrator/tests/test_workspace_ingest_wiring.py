@@ -49,6 +49,9 @@ def _plan() -> Plan:
     )
 
 
+_THREAD = "11111111-2222-3333-4444-555555555555"
+
+
 def _read_envelope(content: str) -> SandboxOutcome:
     return SandboxOutcome(
         stdout=json.dumps(
@@ -77,7 +80,9 @@ async def _run_with_plan_md(
         )
         cfg: RunnableConfig = {
             "configurable": {
-                "thread_id": "ingest-wire",
+                # 终审 F8 — thread ids are structurally UUIDs now
+                # (configurable_uuid); a non-UUID would skip the ingest.
+                "thread_id": _THREAD,
                 "tenant_id": str(uuid4()),
                 "user_id": str(uuid4()),
                 "run_id": str(uuid4()),
@@ -100,7 +105,7 @@ async def test_run_start_ingest_applies_human_edit() -> None:
     edited = render_plan_md(plan).replace("- [ ] 3. review", "- [x] 3. review")
     state, client = await _run_with_plan_md(plan_md=edited, db_plan=plan)
     # BUG-10 (方案 a) — the read targets the THREAD dir, not the root file.
-    assert client.execs and "threads/ingest-wire/PLAN.md" in client.execs[0][1]
+    assert client.execs and f"threads/{_THREAD}/PLAN.md" in client.execs[0][1]
     # The human's checkbox flip landed on AgentState.plan.
     assert state["plan"] is not None
     assert state["plan"].steps[2].status == "completed"
@@ -119,3 +124,21 @@ async def test_injection_in_plan_md_is_rejected() -> None:
     state, _client = await _run_with_plan_md(plan_md=poisoned, db_plan=plan)
     # Strict scan blocks the edit; the DB plan stays authoritative.
     assert state["plan"] == plan
+
+
+async def test_child_run_skips_ingest() -> None:
+    # 终审 F3 — delegated children never read thread plan files.
+    client = RecordingSandboxRuntime(outcome=_read_envelope(render_plan_md(_plan())))
+    node = make_workspace_ingest_node(client=client)
+    out = await node(  # type: ignore[arg-type]
+        {"messages": [], "step_count": 0, "max_steps": 5, "plan": None},
+        {
+            "configurable": {
+                "tenant_id": "11111111-1111-1111-1111-111111111111",
+                "thread_id": _THREAD,
+                "child_run": True,
+            }
+        },
+    )
+    assert out == {}
+    assert client.execs == []

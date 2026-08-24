@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { SseEvent } from "../../api/sessions";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
+import type { TurnStatus } from "../turn/types";
 import { buildLedger, lastKnownFrame, ledgerRecordId } from "./ledger";
 import {
   collapsibleOwnerIds, collapsibleTurnKeys, displayRowsOf, type DisplayRow,
@@ -76,7 +77,7 @@ export interface TrajectoryState {
   selectedRequest: LedgerRequest | null;
   /** 详情面板落在哪条记录上(选中记录,或选中请求的 assistant 记录)。 */
   detailRecord: LedgerRecord | null;
-  detailTurnStatus: "running" | "done" | "error" | "interrupted";
+  detailTurnStatus: TurnStatus;
   /** 详情那条记录所在轮的全部记录 —— `matchTraceSpans` 按轮配 span。 */
   detailTurnRecords: readonly LedgerRecord[];
   selectedId: string | null;
