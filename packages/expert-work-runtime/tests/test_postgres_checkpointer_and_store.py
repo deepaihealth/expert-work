@@ -70,6 +70,31 @@ async def test_postgres_checkpointer_concurrent_setup_no_race(
 
 
 @pytest.mark.asyncio
+async def test_postgres_checkpointer_pool_put_get_round_trip(
+    postgres_container: PostgresContainer,
+) -> None:
+    """BUG-18 — the pool-backed saver must actually read/write checkpoints.
+
+    The factory now hands ``AsyncPostgresSaver`` a psycopg
+    ``AsyncConnectionPool`` instead of the single connection
+    ``from_conn_string`` held; prove a put/get round-trip works through
+    the pool against a real Postgres.
+    """
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.base import empty_checkpoint
+
+    dsn = _sync_dsn(postgres_container)
+    config: RunnableConfig = {"configurable": {"thread_id": "bug18-pool", "checkpoint_ns": ""}}
+
+    async with make_checkpointer("postgres", dsn) as cp:
+        checkpoint = empty_checkpoint()
+        await cp.aput(config, checkpoint, {"source": "input", "step": -1, "parents": {}}, {})
+        tup = await cp.aget_tuple(config)
+        assert tup is not None
+        assert tup.checkpoint["id"] == checkpoint["id"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_store_put_get_round_trip(
     postgres_container: PostgresContainer,
 ) -> None:
