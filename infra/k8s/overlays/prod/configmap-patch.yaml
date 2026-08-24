@@ -20,10 +20,26 @@ data:
   EXPERT_WORK_KEYCLOAK_BASE_URL: "http://keycloak:8080/kc"
   EXPERT_WORK_OIDC_ISSUER: "https://PROD_PLACEHOLDER_DOMAIN/kc/realms/expert-work"
   EXPERT_WORK_OIDC_JWKS_URI: "https://PROD_PLACEHOLDER_DOMAIN/kc/realms/expert-work/protocol/openid-connect/certs"
+  # 与 test 一致(#1145 第三方对接拍板):成员开通走 password 模式。
+  EXPERT_WORK_MEMBER_PROVISIONING_MODE: "password"
+  # 首个平台管理员:该邮箱用户首次以已验证 JWT 登录且系统零 platform admin
+  # 时自动升 system_admin(bootstrap-admin runbook 的生产推荐路径)。
+  EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL: "PROD_PLACEHOLDER_ADMIN_EMAIL"
   # EXPERT_WORK_QUOTA_REDIS_URL carries the Redis AUTH password — it
   # lives in the Secret (secrets.env.example), deliberately not here.
   EXPERT_WORK_OBJECT_STORE_ENDPOINT_URL: "https://PROD_PLACEHOLDER_OSS_ENDPOINT"
   EXPERT_WORK_OBJECT_STORE_BUCKET: "PROD_PLACEHOLDER_OSS_BUCKET"
   EXPERT_WORK_OBJECT_STORE_REGION: "PROD_PLACEHOLDER_OSS_REGION"
   EXPERT_WORK_SANDBOX_SUPERVISOR_URL: ""
+  # 沙箱迁移 W1/W2 六键 —— PROD-5(2026-08-24)从 test 补齐(此前骨架停在
+  # 迁移前)。语义与坑见 overlays/test/configmap-patch.yaml 对应注释;
+  # E2B_DOMAIN = prod 集群 ack-sandbox-manager 网关域名(不带 `*.` 前缀),
+  # TEMPLATE = prod 集群自己的 SandboxSet(infra/k8s/sandbox/ 需在 prod
+  # 集群 by hand apply,见 production-release.md)。
+  EXPERT_WORK_SANDBOX_BACKEND: "agent_sandbox"
+  EXPERT_WORK_SANDBOX_E2B_DOMAIN: "PROD_PLACEHOLDER_SANDBOX_DOMAIN"
+  EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
+  EXPERT_WORK_WORKSPACE_NAS_ROOT: "/mnt/workspaces"
+  EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME: "workspace-nas"
+  EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX: ""
   EXPERT_WORK_WEB_SEARCH_SEARXNG_BASE_URL: "http://searxng:8080"

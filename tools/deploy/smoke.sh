@@ -11,7 +11,7 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <env>   (env: test)" >&2
+    echo "Usage: $0 <env>   (env: test | prod)" >&2
     exit 2
 }
 
@@ -23,8 +23,24 @@ case "$1" in
         LANGFUSE_BASE="https://langfuse-test.deepaihealth.com"
         ;;
     prod)
-        echo "prod is not provisioned yet (W4) — refusing." >&2
-        exit 1
+        # Domains come from the params file — same rationale as release.sh:
+        # git stays free of prod real values.
+        KUBECONFIG_PATH="${HOME}/.kube/expert-work-prod.yaml"
+        PARAMS_FILE="${HOME}/.kube/expert-work-prod-params.env"
+        if [[ ! -f "${KUBECONFIG_PATH}" || ! -f "${PARAMS_FILE}" ]]; then
+            echo "prod prerequisites missing — see docs/runbooks/production-release.md:" >&2
+            echo "  ${KUBECONFIG_PATH}" >&2
+            echo "  ${PARAMS_FILE}  (PROD_DOMAIN= / PROD_LANGFUSE_DOMAIN=)" >&2
+            exit 1
+        fi
+        # shellcheck disable=SC1090
+        source "${PARAMS_FILE}"
+        if [[ -z "${PROD_DOMAIN:-}" || -z "${PROD_LANGFUSE_DOMAIN:-}" ]]; then
+            echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
+            exit 1
+        fi
+        PUBLIC_BASE="https://${PROD_DOMAIN}"
+        LANGFUSE_BASE="https://${PROD_LANGFUSE_DOMAIN}"
         ;;
     *) usage ;;
 esac

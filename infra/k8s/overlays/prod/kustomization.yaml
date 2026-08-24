@@ -1,22 +1,75 @@
-# W2-PR1 Task 4 — production overlay. Same structure as overlays/test/,
-# every environment-specific value is a PROD_PLACEHOLDER_* stand-in (spec
-# 拍板 — real values are a future PR once prod is actually provisioned).
+# Production overlay — PROD-5(2026-08-24)把 W2-PR1 的占位骨架补成与
+# overlays/test/ 同构的完整 overlay:镜像 mirror 全表、Langfuse 两 patch、
+# searxng CN settings、单副本 patch。环境专属真值(域名/OSS/tag)仍是
+# PROD_PLACEHOLDER_* —— 开荒日按 docs/runbooks/production-release.md 填,
+# release.sh prod 在 apply 前会拒绝任何残留 placeholder。
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
   - ../../base
 
+# Deployed image tags — same release conventions as overlays/test/
+# (fresh tag every release, `-rN` for same-source rebuilds, ACS caches
+# tag-level; see that file's header for the full stories). admin-ui is
+# env-specific: `<sha>-prod` with prod OIDC build args baked in.
+  # The prod cluster VPC cannot reach docker.io / quay.io either — same
+  # constraint as test; every upstream image is remapped to the SAME ACR
+  # mirror copies (mirror once, both clusters pull the same bits).
 images:
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newTag: PROD_PLACEHOLDER_TAG
+  - name: clickhouse/clickhouse-server
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
+    newTag: 24.12-alpine-r1
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
     newTag: PROD_PLACEHOLDER_TAG
+  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+    newTag: PROD_PLACEHOLDER_TAG
+  # credential-proxy 变更频率低,tag 跨环境同源 —— 与 test overlay 同步钉,
+  # 它升级时两个 overlay 一起改。
+  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
+    newTag: 94f1a371
+  - name: grafana/grafana
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
+  - name: grafana/tempo
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
+  - name: langfuse/langfuse
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
+  - name: langfuse/langfuse-worker
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
+  - name: otel/opentelemetry-collector
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
+    newTag: 0.119.0-r1
+  - name: prom/alertmanager
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
+  - name: prom/prometheus
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
+  - name: quay.io/keycloak/keycloak
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
+    newTag: "25.0"
+  - name: searxng/searxng
+    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
+    newTag: "2026-07-29"
+
+# Same VPC constraint as test: upstream default engines unreachable —
+# mainland-engine-only settings(见 searxng-settings-cn.yml 头注)。
+configMapGenerator:
+  - behavior: replace
+    files:
+      - settings.yml=searxng-settings-cn.yml
+    name: searxng-settings
 
 patches:
   - path: configmap-patch.yaml
   - path: ingress-patch.yaml
   - path: keycloak-patch.yaml
+  - path: langfuse-configmap-patch.yaml
+  - path: langfuse-ingress-patch.yaml
+  - path: replicas-patch.yaml
+  - path: workspace-nas-patch.yaml
 
-# Secrets (control-plane-secrets / keycloak-secrets) are NOT built by
-# kustomize here — see secrets.env.example.
+# Secrets (control-plane-secrets / keycloak-secrets / langfuse-secrets /
+# wecom-alert-webhook) are NOT built by kustomize here — see
+# secrets.env.example and infra/k8s/base/secrets.example.yaml.

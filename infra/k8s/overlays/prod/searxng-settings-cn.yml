@@ -1,0 +1,44 @@
+# SearXNG settings for the test cluster — mainland-reachable engines only.
+#
+# The cluster VPC cannot reach google/duckduckgo/wikipedia/wikidata et al.
+# (same egress reality as docker.io — verified live: wikidata engine INIT
+# times out, searches return nothing). This overlay file REPLACES base's
+# vendored infra/searxng settings (kustomization.yaml configMapGenerator
+# behavior: replace) with a keep_only list of engines reachable from the
+# Hangzhou VPC. Local compose keeps the upstream default engine set — a
+# dev machine's network is not the cluster's.
+#
+# server: block mirrors infra/searxng/settings.yml — see that file's
+# comments for why the limiter is off (internal-only instance) and why
+# the JSON format is enabled (web_search calls /search?format=json).
+use_default_settings:
+  engines:
+    keep_only:
+      - baidu
+      - bing
+      - sogou
+      - quark
+      - 360search
+
+server:
+  secret_key: "expert-work-test-searxng-not-a-real-secret"
+  limiter: false
+  public_instance: false
+  bind_address: "0.0.0.0:8080"
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: baidu
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: sogou
+    disabled: false
+  - name: quark
+    disabled: false
+  - name: 360search
+    disabled: false

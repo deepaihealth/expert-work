@@ -1,0 +1,14 @@
+# base 的 workspace-nas PV 硬编码的是 TEST 集群的 NAS 挂载点(base/
+# control-plane/workspace-nas.yaml)—— prod 用自己的通用型 NAS 实例,
+# 挂载点在开荒日填(PROD-5,2026-08-24)。path=/workspaces 与 test 同构;
+# NAS 侧要先建好该目录(mount 后 mkdir,见 production-release.md)。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workspace-nas
+spec:
+  csi:
+    volumeAttributes:
+      server: PROD_PLACEHOLDER_NAS_MOUNT_TARGET
+      path: /workspaces
+      vers: "3"
