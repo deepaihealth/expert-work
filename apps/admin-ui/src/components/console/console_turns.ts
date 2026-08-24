@@ -87,7 +87,16 @@ export function buildConsoleTurns(args: {
         input: h.input,
         attachments: [],
         events: load.events,
-        status: failed ? "error" : inFlight ? "running" : "done",
+        // BUG-9 — ``interrupted`` (user cancel / stream break) must keep its
+        // identity: mapping it to "done" rendered a cancelled run as
+        // 「已完成 (无文本回复)」.
+        status: failed
+          ? "error"
+          : inFlight
+            ? "running"
+            : h.status === "interrupted"
+              ? "interrupted"
+              : "done",
         error: failed ? h.status : null,
         approval,
       },

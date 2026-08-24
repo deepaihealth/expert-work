@@ -18,7 +18,7 @@ export interface StatsTurnInput {
   /** ``events`` is complete (live turns are always ``true``; history turns
    *  only once ``loadState === "done"``). */
   loaded: boolean;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "interrupted";
   /** Used only when ``!loaded`` (unloaded history turn's persisted rollup). */
   tokens: RunTokens | null;
   timing: TurnTiming | null;

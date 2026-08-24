@@ -20,6 +20,18 @@ describe("buildConsoleTurns", () => {
     expect(out[1]).toMatchObject({ runId: "r2", loadState: "pending", turn: { status: "error", error: "timeout", events: [] }, fallbackLines: [{ text: "partial", channel: "final" }] });
     expect(out[2]).toMatchObject({ runId: "r3", loadState: "done", timing: { ttftMs: 500 }, tokens: null });
   });
+  it("maps an interrupted history run to an interrupted turn (BUG-9 — not 'done')", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "interrupted", tokens: null, createdAt: null },
+      ],
+      historyLoads: { r1: { state: "done", events: [meta("r1")] } },
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out[0].turn.status).toBe("interrupted");
+    expect(out[0].turn.error).toBeNull();
+  });
   it("passes the persisted rollup through and returns [] for null history + no live turns", () => {
     const tokens = { input_tokens: 1, output_tokens: 1, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2, llm_calls: 1, models: [] };
     expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens, createdAt: null }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);

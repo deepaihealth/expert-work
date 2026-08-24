@@ -1157,6 +1157,7 @@ export interface TranslationKeys {
     row_inspect: string;
     footer_status_running: string;
     footer_status_done: string;
+    footer_status_interrupted: string;
     footer_status_error: string;
     plan_title: string;
     plan_progress: string;
@@ -4259,6 +4260,7 @@ const en: TranslationKeys = {
     row_inspect: "Trajectory",
     footer_status_running: "Running",
     footer_status_done: "Done",
+    footer_status_interrupted: "Interrupted",
     footer_status_error: "Failed",
     plan_title: "Tasks",
     plan_progress: "{{done}} done · {{doing}} in progress · {{todo}} pending",

@@ -1221,6 +1221,7 @@ const zhCN: TranslationKeys = {
     row_inspect: "轨迹",
     footer_status_running: "进行中",
     footer_status_done: "已完成",
+    footer_status_interrupted: "已中断",
     footer_status_error: "失败",
     plan_title: "任务",
     plan_progress: "{{done}} 已完成 · {{doing}} 进行中 · {{todo}} 待处理",

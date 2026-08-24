@@ -21,6 +21,11 @@ export interface Attachment {
   value: string;
 }
 
+/** BUG-9 — the console turn's terminal vocabulary, one source. ``interrupted``
+ *  = user cancel / stream break (``RunStatus.INTERRUPTED``); rendering it as
+ *  ``done`` made a cancelled run read as「已完成 (无文本回复)」. */
+export type TurnStatus = "running" | "done" | "error" | "interrupted";
+
 /** One round of the conversation — the user input plus the agent's streamed
  *  frames for that turn (the thread is reused, so the backend continues the
  *  context across turns). */
@@ -33,7 +38,7 @@ export interface Turn {
    *  Absent on turns that predate the field (history/replayed turns). */
   inputs?: Record<string, string>;
   events: SseEvent[];
-  status: "running" | "done" | "error";
+  status: TurnStatus;
   error: string | null;
   /** #5 — set when the run paused at an approval gate; cleared on decision. */
   approval: ApprovalItem | null;

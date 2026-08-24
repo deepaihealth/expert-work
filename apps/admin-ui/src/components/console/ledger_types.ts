@@ -79,7 +79,7 @@ export interface LedgerTurn {
   key: string;
   seq: number;
   runId: string | null;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "interrupted";
   firstIndex: number;
   lastIndex: number;
   requestNos: number[];

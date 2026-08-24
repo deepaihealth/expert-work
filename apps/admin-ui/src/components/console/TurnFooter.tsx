@@ -49,6 +49,8 @@ const STATUS_TAG_COLOR: Record<Turn["status"], string> = {
   running: "processing",
   done: "success",
   error: "error",
+  // BUG-9 — a cancelled/broken-off run is neither success nor failure.
+  interrupted: "warning",
 };
 
 export function TurnFooter({

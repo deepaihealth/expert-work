@@ -76,7 +76,7 @@ export interface TrajectoryState {
   selectedRequest: LedgerRequest | null;
   /** 详情面板落在哪条记录上(选中记录,或选中请求的 assistant 记录)。 */
   detailRecord: LedgerRecord | null;
-  detailTurnStatus: "running" | "done" | "error";
+  detailTurnStatus: "running" | "done" | "error" | "interrupted";
   /** 详情那条记录所在轮的全部记录 —— `matchTraceSpans` 按轮配 span。 */
   detailTurnRecords: readonly LedgerRecord[];
   selectedId: string | null;
