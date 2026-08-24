@@ -109,9 +109,12 @@ case "${env_name}" in
             echo "see docs/runbooks/production-release.md (开荒清单)." >&2
             exit 1
         fi
-        # shellcheck disable=SC1090
-        source "${PARAMS_FILE}"
-        if [[ -z "${PROD_DOMAIN:-}" || -z "${PROD_LANGFUSE_DOMAIN:-}" ]]; then
+        # Extract only the two keys instead of sourcing — a stray
+        # OVERLAY=/KUBECONFIG_PATH= line in the params file must not be
+        # able to silently repoint the release (review M-9).
+        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        if [[ -z "${PROD_DOMAIN}" || -z "${PROD_LANGFUSE_DOMAIN}" ]]; then
             echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
             exit 1
         fi
@@ -130,17 +133,23 @@ readonly KUBECONFIG_PATH OVERLAY
 
 # ------------------------------------------------------- prod-only guards
 if [[ "${env_name}" == "prod" ]]; then
-    # Placeholder scan BEFORE the (10-minute) image builds. newTag
-    # placeholders are exempt — step 2 (kustomize edit) replaces them on
-    # the first release; everything else must have been filled by hand
-    # per the runbook.
-    leftover="$(grep -rn "PROD_PLACEHOLDER" "${OVERLAY}" | grep -v "newTag: PROD_PLACEHOLDER_TAG" || true)"
+    # Placeholder scan BEFORE the (10-minute) image builds. Scan the
+    # RENDERED manifests, not the raw directory — raw text would hit
+    # comments and the secrets.env.example template, refusing forever
+    # (and its "fill these" output would push real secrets toward git).
+    # PROD_PLACEHOLDER_TAG is exempt: step 2 (kustomize edit) replaces
+    # it on the first release.
+    leftover="$(kustomize build "${OVERLAY}" | grep -n "PROD_PLACEHOLDER" | grep -v "PROD_PLACEHOLDER_TAG" || true)"
     if [[ -n "${leftover}" ]]; then
-        echo "prod overlay still has PROD_PLACEHOLDER_* values — fill them first:" >&2
+        echo "prod overlay still renders PROD_PLACEHOLDER_* values — fill them first:" >&2
         echo "${leftover}" >&2
         exit 1
     fi
     if [[ "${dry_run}" -eq 0 && "${assume_yes}" -eq 0 ]]; then
+        if [[ ! -t 0 ]]; then
+            echo "non-interactive stdin: pass --yes to release to prod." >&2
+            exit 1
+        fi
         echo "About to release to PRODUCTION (${PROD_DOMAIN})."
         read -r -p "Type 'prod' to continue: " reply
         if [[ "${reply}" != "prod" ]]; then

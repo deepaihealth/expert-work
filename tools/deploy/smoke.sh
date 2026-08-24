@@ -33,9 +33,11 @@ case "$1" in
             echo "  ${PARAMS_FILE}  (PROD_DOMAIN= / PROD_LANGFUSE_DOMAIN=)" >&2
             exit 1
         fi
-        # shellcheck disable=SC1090
-        source "${PARAMS_FILE}"
-        if [[ -z "${PROD_DOMAIN:-}" || -z "${PROD_LANGFUSE_DOMAIN:-}" ]]; then
+        # Extract only the two keys instead of sourcing (same rationale as
+        # release.sh — a stray assignment must not repoint anything).
+        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        if [[ -z "${PROD_DOMAIN}" || -z "${PROD_LANGFUSE_DOMAIN}" ]]; then
             echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
             exit 1
         fi

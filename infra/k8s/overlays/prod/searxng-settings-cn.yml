@@ -1,4 +1,6 @@
-# SearXNG settings for the test cluster — mainland-reachable engines only.
+# SearXNG settings for the PROD cluster — mainland-reachable engines only.
+# Copied from overlays/test/ (same VPC egress reality); secret_key is
+# prod-specific — never reuse the test value (production-release.md 拍板).
 #
 # The cluster VPC cannot reach google/duckduckgo/wikipedia/wikidata et al.
 # (same egress reality as docker.io — verified live: wikidata engine INIT
@@ -21,7 +23,7 @@ use_default_settings:
       - 360search
 
 server:
-  secret_key: "expert-work-test-searxng-not-a-real-secret"
+  secret_key: "prod-c9f980b17a27cafbc88c44dd03856185c6be645e7d333a3f"
   limiter: false
   public_instance: false
   bind_address: "0.0.0.0:8080"

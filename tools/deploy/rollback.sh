@@ -109,7 +109,10 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
+# smoke failure must not read as rollback failure — by this point the
+# image switch has already been applied (review M-11).
+run "${SCRIPT_DIR}/smoke.sh" "${env_name}" \
+    || echo "WARNING: smoke failed/skipped — the rollback image switch itself is already applied." >&2
 
 echo
 echo "Rolled back to ${tag}. Now make the record match reality:"
