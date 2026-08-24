@@ -323,6 +323,9 @@ class RunQueueWorker:
                     # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
                     delegation_gate=self._runtime.delegation_gate(),
                     tool_replay_safe=built.tool_replay_safe,
+                    # BUG-16 — persist the raw Jinja k/v on the system_prompt
+                    # frame; same source as ``build_run_graph_input`` above.
+                    prompt_inputs=payload.get("inputs") or {},
                 )
             )
             await self._runtime.run_manager.attach_task(run.run_id, worker)

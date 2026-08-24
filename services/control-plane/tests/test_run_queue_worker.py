@@ -217,6 +217,42 @@ async def test_claimed_run_carries_document_names_into_graph_input(
 
 
 @pytest.mark.asyncio
+async def test_claimed_run_passes_prompt_inputs_to_run_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUG-16 —— ``enqueued_input`` 里的 Jinja ``inputs`` 要原样穿给
+    ``run_agent(prompt_inputs=...)``,queue 路径的 system_prompt 帧才带原始 k/v。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "hi",
+            "image_refs": [],
+            "untrusted_content": [],
+            "inputs": {"project_code": "P1", "employee_code": "E9"},
+        },
+    )
+
+    started = await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)  # let the spawned task body run
+
+    assert started == 1
+    assert len(spawns) == 1
+    assert spawns[0]["prompt_inputs"] == {"project_code": "P1", "employee_code": "E9"}
+
+
+@pytest.mark.asyncio
 async def test_exactly_one_worker_claims(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _fake_run_agent(**kw):
         return None
