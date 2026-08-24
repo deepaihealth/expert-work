@@ -10,7 +10,8 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-07 against each provider's official API docs.
+Last verified: 2026-08 (glm/qwen additions) against each provider's official
+API docs; other providers 2026-07.
 """
 
 from __future__ import annotations
@@ -203,13 +204,22 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="moonshot-v1-128k", vision=False, context_window=128_000, deprecated=True),
         ModelEntry(name="moonshot-v1-32k", vision=False, context_window=32_000, deprecated=True),
     ),
-    # Zhipu GLM — open.bigmodel.cn (2026-07)
-    # glm-5.2 (1M ctx per the bigmodel platform's own model list — plain model
-    # id, no [1m] suffix; deep-thinking) is the current text flagship. glm-5.1
-    # (200K), glm-4.7 (355B MoE, 200K) and glm-4.6 (200K) are current text
-    # models. Vision goes through glm-4.6v (128K) and glm-4.5v. The older
+    # Zhipu GLM — open.bigmodel.cn (2026-08)
+    # glm-5.3 (released 2026-08-14; same base as 5.2 with extended long-horizon
+    # post-training; 1M ctx per the bigmodel pricing page) is the current text
+    # flagship; glm-5.2 (1M) stays. glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
+    # and glm-4.6 (200K) are current text models. Vision goes through
+    # glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type toggle
+    # per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The older
     # glm-4*-plus line is kept deprecated so existing manifests resolve.
     "glm": (
+        ModelEntry(
+            name="glm-5.3",
+            vision=False,
+            context_window=1_000_000,
+            thinking="toggle",
+            thinking_default=True,
+        ),
         ModelEntry(
             name="glm-5.2",
             vision=False,
@@ -238,6 +248,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="toggle",
             thinking_default=True,
         ),
+        ModelEntry(
+            name="glm-5v-turbo",
+            vision=True,
+            context_window=200_000,
+            thinking="toggle",
+            thinking_default=True,
+        ),
         ModelEntry(name="glm-4.6v", vision=True, context_window=128_000),
         ModelEntry(name="glm-4.5v", vision=True),
         # Platform embedding model (Stream T, user-specified).
@@ -246,13 +263,23 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="glm-4v-plus", vision=True, context_window=8_000, deprecated=True),
         ModelEntry(name="glm-4.1v-thinking", vision=True, context_window=32_000, deprecated=True),
     ),
-    # Alibaba Qwen / DashScope (Model Studio / 百炼) — help.aliyun.com/zh/model-studio (2026-06)
-    # qwen3.7-max (2026 flagship) is text-only with a ~1M context; qwen3.6-plus
-    # is multimodal (vision: OCR, object localisation, chart/diagram understanding)
-    # also at ~1M. qwen3.5-plus is the prior multimodal tier; qwen3-vl-* are the
-    # vision tiers. Context windows left unset where not confirmed against the
-    # 百炼 console. Legacy qwen-max / qwen-vl-max kept deprecated.
+    # Alibaba Qwen / DashScope (Model Studio / 百炼) — help.aliyun.com/zh/model-studio (2026-08)
+    # qwen3.8-max (released 2026-08; 2.4T MoE) is the current flagship — natively
+    # multimodal (image/video/text input per the Model Studio product page) with
+    # a 1M context; thinking stays the enable_thinking + thinking_budget shape
+    # (Model Studio deep-thinking docs list it as supported). qwen3.7-max (text,
+    # ~1M) and qwen3.6-plus (multimodal, ~1M) stay. qwen3.5-plus is the prior
+    # multimodal tier; qwen3-vl-* are the vision tiers. Context windows left
+    # unset where not confirmed against the 百炼 console. Legacy qwen-max /
+    # qwen-vl-max kept deprecated.
     "qwen": (
+        ModelEntry(
+            name="qwen3.8-max",
+            vision=True,
+            context_window=1_000_000,
+            thinking="budget",
+            thinking_default=True,
+        ),
         ModelEntry(
             name="qwen3.7-max",
             vision=False,
