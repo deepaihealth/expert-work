@@ -43,7 +43,7 @@ def _truncate_utf8(text: str, cap: int) -> str:
     raw = text.encode("utf-8")
     if len(raw) <= cap:
         return text
-    return raw[: cap - len("…".encode("utf-8"))].decode("utf-8", errors="ignore") + "…"
+    return raw[: cap - len("…".encode())].decode("utf-8", errors="ignore") + "…"
 
 
 def build_messages(channel: str, payload: dict) -> list[dict]:
@@ -92,13 +92,15 @@ def build_messages(channel: str, payload: dict) -> list[dict]:
 
 def _post_wecom(url: str, message: dict) -> None:
     """单条投递;企微侧 HTTP 非 200 或 errcode != 0 时抛异常。"""
-    request = urllib.request.Request(
+    if not url.startswith("https://"):
+        raise ValueError("WECOM_WEBHOOK_URL must be https://")
+    request = urllib.request.Request(  # noqa: S310 — scheme 已在上一行钉死 https
         url,
         data=json.dumps(message, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
         body = json.loads(response.read().decode("utf-8"))
     if body.get("errcode") != 0:
         raise RuntimeError(f"wecom errcode={body.get('errcode')} errmsg={body.get('errmsg')}")
@@ -163,7 +165,7 @@ def main() -> None:
     port = int(os.environ.get("PORT", "8080"))
     if not os.environ.get("WECOM_WEBHOOK_URL", "").strip():
         log.warning("WECOM_WEBHOOK_URL unset — starting in log-only mode")
-    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)  # noqa: S104 — 容器内监听
     log.info("wecom-adapter listening on :%d", port)
     server.serve_forever()
 

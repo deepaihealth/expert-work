@@ -1,0 +1,70 @@
+# wecom-adapter — Alertmanager webhook → 企业微信群机器人转换层(PROD-2)。
+#
+# 为什么长这样(三个非显然点):
+# - 镜像复用 control-plane:集群 VPC 够不着 docker.io,control-plane 镜像已在
+#   ACR 且节点有缓存,adapter 只要它里面的 python;kustomize 的 images 段会把
+#   tag 钉到每次发布的 control-plane tag,adapter 随发布一起滚。
+# - 代码走 ConfigMap(wecom-adapter-script):改脚本 = 改 ConfigMap + apply,
+#   不用出新镜像。command 覆盖镜像的 uvicorn ENTRYPOINT。
+# - 企微 webhook URL(含 key)在 Secret ``wecom-alert-webhook``(optional:
+#   Secret 没建时 adapter 起 log-only 模式,不 crashloop —— 见 adapter.py
+#   docstring 与 secrets.example.yaml 的开通步骤)。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wecom-adapter
+  labels:
+    app.kubernetes.io/name: wecom-adapter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wecom-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wecom-adapter
+    spec:
+      containers:
+        - name: wecom-adapter
+          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
+          command: ["python", "/etc/wecom-adapter/adapter.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: WECOM_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wecom-alert-webhook
+                  key: WECOM_WEBHOOK_URL
+                  optional: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: script
+              mountPath: /etc/wecom-adapter
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: script
+          configMap:
+            name: wecom-adapter-script
+            items:
+              - key: adapter.py
+                path: adapter.py
