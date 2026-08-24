@@ -32,6 +32,30 @@ describe("buildConsoleTurns", () => {
     expect(out[0].turn.status).toBe("interrupted");
     expect(out[0].turn.error).toBeNull();
   });
+  it("restores jinja inputs from the replayed system_prompt frame (BUG-16)", () => {
+    const sp = { id: "1", event: "system_prompt", data: { text: "p", inputs: { a: "1", b: "2" } }, rawData: "", receivedAt: "" };
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+      ],
+      historyLoads: { r1: { state: "done", events: [sp, meta("r1")] } },
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out[0].turn.inputs).toEqual({ a: "1", b: "2" });
+  });
+  it("old frames without inputs leave turn.inputs undefined (BUG-16 回归)", () => {
+    const sp = { id: "1", event: "system_prompt", data: { text: "p" }, rawData: "", receivedAt: "" };
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+      ],
+      historyLoads: { r1: { state: "done", events: [sp] } },
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out[0].turn.inputs).toBeUndefined();
+  });
   it("passes the persisted rollup through and returns [] for null history + no live turns", () => {
     const tokens = { input_tokens: 1, output_tokens: 1, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2, llm_calls: 1, models: [] };
     expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens, createdAt: null }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);

@@ -618,3 +618,40 @@ async def test_stdio_call_tool_times_out() -> None:
     client._session = _SlowSession()  # type: ignore[attr-defined]
     with pytest.raises(MCPCallTimeoutError):
         await client.call_tool("t", {})
+
+
+# ---------------------------------------------------------------------------
+# BUG-12 — bypass the SDK's output-schema validation (真栈事故 2026-08-24)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lenient_session_neuters_output_schema_validation() -> None:
+    """BUG-12 (终审 F5 重构) — every transport constructs
+    ``LenientClientSession``: the SDK's canonical send path is kept, and the
+    single private validation hook ``_validate_tool_result`` is a no-op, so a
+    server that declares ``outputSchema`` but returns only text content no
+    longer kills the call. The class-construction assert also pins the hook's
+    existence against an X-11 SDK bump."""
+    from mcp import ClientSession
+    from mcp import types as mcp_types
+
+    from orchestrator.tools.mcp import _lenient_client_session_cls
+
+    lenient_cls = _lenient_client_session_cls()
+    assert issubclass(lenient_cls, ClientSession)
+
+    # The SDK's own hook raises on this result; the lenient override must not.
+    result = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text="plain text ok")],
+        isError=False,
+    )
+    # Unbound-call the two hooks on a bare instance — the override reads no
+    # session state, and the SDK original consults _tool_output_schemas which
+    # we seed to force the "schema declared, no structured content" branch.
+    bare = object.__new__(lenient_cls)
+    bare._tool_output_schemas = {"t": {"type": "object"}}
+    await lenient_cls._validate_tool_result(bare, "t", result)  # no raise
+
+    with pytest.raises(RuntimeError, match="did not return structured content"):
+        await ClientSession._validate_tool_result(bare, "t", result)

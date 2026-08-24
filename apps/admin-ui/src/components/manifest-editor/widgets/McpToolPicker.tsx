@@ -426,19 +426,38 @@ export function McpToolPicker({
             </Text>
           ) : (
             shown.map((tool) => (
-              <Tooltip
+              // BUG-15 — 描述从 hover Tooltip 改为行内单行截断:窄弹窗里
+              // Tooltip 会翻转盖住相邻工具名;hover title 仍可看全文。
+              <Checkbox
                 key={tool.name}
-                title={tool.description || undefined}
-                placement="right"
+                data-testid={`af-mcp-tool-${tool.name}`}
+                checked={allowTools.includes(tool.name)}
+                onChange={(e) => toggleTool(tool.name, e.target.checked)}
+                style={{ display: "flex", alignItems: "flex-start" }}
               >
-                <Checkbox
-                  data-testid={`af-mcp-tool-${tool.name}`}
-                  checked={allowTools.includes(tool.name)}
-                  onChange={(e) => toggleTool(tool.name, e.target.checked)}
-                >
+                <span style={{ minWidth: 0, display: "block" }}>
                   <Text style={{ fontSize: 13 }}>{tool.name}</Text>
-                </Checkbox>
-              </Tooltip>
+                  {tool.description && (
+                    <Text
+                      type="secondary"
+                      title={tool.description}
+                      // 两行 clamp(SkillPicker BUG-6 同款):比单行截断少
+                      // 依赖 hover;title 兜长文。不用 antd ellipsis prop——
+                      // 它的多行形态要 tooltip 配置,正是 BUG-15 摘掉的遮挡层。
+                      style={{
+                        display: "-webkit-box",
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: "vertical",
+                        fontSize: 12,
+                        maxWidth: 480,
+                        overflow: "hidden",
+                      }}
+                    >
+                      {tool.description}
+                    </Text>
+                  )}
+                </span>
+              </Checkbox>
             ))
           )}
         </div>

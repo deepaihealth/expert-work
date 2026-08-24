@@ -12,7 +12,22 @@ import type { ApprovalItem } from "../../api/approvals";
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
 import { NON_TERMINAL_RUN_STATUSES } from "../../api/runs";
+import { promptInputsOf } from "../../api/trajectory_rows";
 import { approvalItemFromEvent } from "../turn/approval_item";
+
+// 终审 F8 — buildConsoleTurns 在直播期间每个非 token 帧都整表重建,无帧的
+// 老 run(resume/审批续跑/pre-BUG-16)会全量扫几千条事件找 system_prompt。
+// 按事件数组**引用**缓存(session_stats.ts 同款理由):已完成轮的数组引用
+// 逐帧不变所以命中;数组只追加不原地改,命中的那份就是当初算的那份。
+const PROMPT_INPUTS_CACHE = new WeakMap<readonly SseEvent[], Record<string, string> | null>();
+
+function cachedPromptInputsOf(events: readonly SseEvent[]): Record<string, string> | null {
+  const hit = PROMPT_INPUTS_CACHE.get(events);
+  if (hit !== undefined) return hit;
+  const value = promptInputsOf(events.find((e) => e.event === "system_prompt")?.data);
+  PROMPT_INPUTS_CACHE.set(events, value);
+  return value;
+}
 import type { HistoryLoad, HistoryTurn, Turn } from "../turn/types";
 import type { ConsoleTurn, TurnTiming } from "./types";
 
@@ -86,6 +101,9 @@ export function buildConsoleTurns(args: {
         id: h.key,
         input: h.input,
         attachments: [],
+        // BUG-16 — 历史轮的 jinja 入参从回放的 system_prompt 帧还原
+        // (live 轮在 useRunEngine 派发时就带;老 run 无帧数据 → undefined)。
+        inputs: cachedPromptInputsOf(load.events) ?? undefined,
         events: load.events,
         // BUG-9 — ``interrupted`` (user cancel / stream break) must keep its
         // identity: mapping it to "done" rendered a cancelled run as

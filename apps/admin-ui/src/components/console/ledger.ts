@@ -299,11 +299,14 @@ export function buildLedger(args: {
     } else {
       let base = ledgerRowsOf(turn.turn.events, input);
       // §十.1 —— 与上一条留下来的系统提示词相同就折掉这一轮的 SYSTEM 行(只留
-      // 第一次出现与文本变化的那一轮);不同就更新「上一条」。
+      // 第一次出现与变化的那一轮);不同就更新「上一条」。终审 F4:比较必须
+      // 连同派发入参 —— 缺省可选变量与显式空串渲染出同一份文本,但两轮的
+      // inputs 不同,折掉会把第二轮的入参从账本里藏掉。
       const firstRow = base[0];
       if (firstRow?.kind === "system") {
-        if (firstRow.text === lastSystemText) base = base.slice(1);
-        else lastSystemText = firstRow.text;
+        const key = firstRow.text + "\u0000" + JSON.stringify(firstRow.inputs ?? null);
+        if (key === lastSystemText) base = base.slice(1);
+        else lastSystemText = key;
       }
       const live = turn.key === args.streamTurnKey ? liveLedgerRows(turn.turn.events, args.liveByStep) : [];
       const rows = [...base, ...live];

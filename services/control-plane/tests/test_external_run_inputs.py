@@ -16,6 +16,7 @@ prompt.jinja`` / ``.variables`` onto the built agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from copy import deepcopy
@@ -43,6 +44,7 @@ from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunManager
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from orchestrator import BuiltAgent, GraphRunner, ToolRegistry, ToolSpec, build_react_graph
+from orchestrator.sse import _BACKGROUND_PERSIST_WRITERS
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
 _SPEC: dict[str, Any] = {
@@ -125,6 +127,10 @@ def _jinja_aware_agent_runtime(
             max_steps=5,
             prompt_jinja=sp.jinja,
             prompt_variables=tuple(sp.variables),
+            # BUG-16 — the stream-mode test below really renders (queue-mode
+            # tests never reach ``render_system_prompt``), so forward the
+            # template as the jinja base like the real ``agent_factory`` does.
+            prompt_base=sp.template,
         )
 
     return AgentRuntime(
@@ -233,6 +239,42 @@ async def test_inputs_reaches_prompt_render(
     assert run is not None
     assert run.enqueued_input is not None
     assert run.enqueued_input["inputs"] == {"lang": "zh"}
+
+
+@pytest.mark.asyncio
+async def test_stream_run_persists_inputs_on_system_prompt_frame(
+    external_client: AsyncClient, jinja_agent: _JinjaAgent, _external_ctx: _ExternalCtx
+) -> None:
+    """BUG-16 —— stream 模式的原始 Jinja ``inputs`` 穿到 ``run_agent(prompt_inputs=
+    ...)``,落库的 ``system_prompt`` 帧带原始 k/v(对话记录 / 轨迹可回放);
+    同时对外 SSE 面(``EXTERNAL_HIDDEN_EVENTS``)照旧不吐这帧。"""
+    resp = await external_client.post(
+        f"/v1/agents/{jinja_agent.code}/runs",
+        json={"user_id": "u1", "input": "hi", "inputs": {"lang": "zh"}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: end" in resp.text
+    # 对外面:system_prompt 是 console-only 帧,外部 SSE 一个字节都不能带。
+    assert "system_prompt" not in resp.text
+
+    # run_id 取自对外可见的 metadata 帧。
+    run_id: UUID | None = None
+    for block in resp.text.split("\n\n"):
+        if "event: metadata" in block:
+            run_id = UUID(json.loads(block.rsplit("data: ", 1)[1])["run_id"])
+            break
+    assert run_id is not None
+
+    # 落库走后台攒批 writer;断言库内容前先等它冲干净。
+    if _BACKGROUND_PERSIST_WRITERS:
+        await asyncio.gather(*_BACKGROUND_PERSIST_WRITERS, return_exceptions=True)
+    store = _external_ctx.app.state.run_event_store
+    rows = await store.list(run_id=run_id)
+    frame = next(r for r in rows if r.event_name == "system_prompt")
+    assert frame.data == {
+        "text": "you are a zh speaking support agent",
+        "inputs": {"lang": "zh"},
+    }
 
 
 @pytest.mark.asyncio

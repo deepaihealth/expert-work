@@ -51,8 +51,14 @@ export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "ap
 export type CompactRow = ThinkRow | ToolRow | SubagentRow | PlanRow | MemoryRow | ReflectRow | MarkerRow;
 
 export type UserRow = RowBase & { kind: "user"; text: string; attachmentNames: string[]; inputs: Record<string, string> };
-/** run 开头那帧 `system_prompt` 投影成的账本首行(PR-A.3 §十.1)。 */
-export type SystemRow = RowBase & { kind: "system"; text: string };
+/** run 开头那帧 `system_prompt` 投影成的账本首行(PR-A.3 §十.1)。
+ *  ``inputs`` — BUG-16:该 run 派发时的动态 Prompt(Jinja)原始入参 k/v,
+ *  后端把它捎带在 system_prompt 帧 data 里;老帧没有 → null。 */
+export type SystemRow = RowBase & {
+  kind: "system";
+  text: string;
+  inputs: Record<string, string> | null;
+};
 export type AssistantRow = RowBase & {
   kind: "assistant";
   /** 该步正文;没有 ""。 */
@@ -277,7 +283,28 @@ function systemRowOf(events: readonly SseEvent[]): SystemRow | null {
   return {
     id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
     eventIndexes: [i], serverMs: serverMsOf(events[i].id), text,
+    inputs: promptInputsOf(data),
   };
+}
+
+/** BUG-16 — the jinja prompt-variable k/v the backend rides on the
+ *  ``system_prompt`` frame (``data.inputs``). The backend contract admits
+ *  non-string values (``RunRequest.inputs: dict[str, Any]``, 终审 F1), so
+ *  primitives are coerced to their display string per entry — one odd value
+ *  must not hide the whole map. Non-primitive values (objects/arrays) skip
+ *  just their own entry. */
+export function promptInputsOf(data: unknown): Record<string, string> | null {
+  if (data === null || typeof data !== "object") return null;
+  const raw = (data as { inputs?: unknown }).inputs;
+  if (raw === null || raw === undefined || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k] = v;
+    else if (typeof v === "number" || typeof v === "boolean") out[k] = String(v);
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 /** 账本投影(spec §九 D2):(有 `system_prompt` 帧才有的)`system` 行 + `user` +

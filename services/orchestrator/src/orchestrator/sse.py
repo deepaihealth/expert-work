@@ -323,6 +323,7 @@ async def run_agent(
     worker_spawn_budget: WorkerSpawnBudget | None = None,
     delegation_gate: DelegationGate | None = None,
     token_budget: int = 0,
+    prompt_inputs: Mapping[str, Any] | None = None,
 ) -> None:
     """Drive ``graph`` to completion, publishing events to ``bridge``.
 
@@ -348,6 +349,12 @@ async def run_agent(
     ``trajectory_enabled`` is the per-agent manifest opt-out
     (``policies.trajectory_recording`` via ``BuiltAgent``): ``False``
     drops the recorder for this run even when the deployment has one.
+
+    BUG-16 — ``prompt_inputs`` is the run's raw Dynamic-Prompt (Jinja)
+    variables (``RunRequest.inputs``). Non-empty → carried on the
+    ``system_prompt`` frame's data (``inputs`` key) so replay shows the
+    original k/v, not just the rendered prompt. Empty / ``None`` keeps
+    the frame's legacy shape (no ``inputs`` key).
     """
     if not trajectory_enabled:
         trajectory_recorder = None
@@ -542,7 +549,12 @@ async def run_agent(
         # clock starts (server-synthesised, not LLM output).
         system_prompt = _system_prompt_of(graph_input)
         if system_prompt is not None:
-            await _publish_frame(SYSTEM_PROMPT_EVENT, {"text": system_prompt})
+            prompt_frame: dict[str, Any] = {"text": system_prompt}
+            # BUG-16 — piggyback the raw Jinja k/v on the frame; empty/None
+            # keeps the legacy shape (no ``inputs`` key at all).
+            if prompt_inputs:
+                prompt_frame["inputs"] = dict(prompt_inputs)
+            await _publish_frame(SYSTEM_PROMPT_EVENT, prompt_frame)
 
         # Stream K.K10 — start the TTFT / durable-resume timer at RUNNING.
         # The metadata frame above is server-synthesised, not LLM output,

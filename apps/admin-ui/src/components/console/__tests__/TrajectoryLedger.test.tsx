@@ -256,7 +256,7 @@ describe("TrajectoryLedger", () => {
     const onToggleTurn = vi.fn();
     const onToggleOwner = vi.fn();
     const systemRow: SystemRow = {
-      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null, inputs: null,
       eventIndexes: [], serverMs: null, text: "你是评审员",
     };
     const rows = recordRows([
@@ -728,7 +728,7 @@ describe("TrajectoryLedger", () => {
   // 真的存在)。
   it("SYSTEM 行:kind 标签 SYSTEM,内容列 = 首行,data-kind=\"system\"", () => {
     const sysRow: SystemRow = {
-      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+      id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null, inputs: null,
       eventIndexes: [], serverMs: null, text: "你是评审员",
     };
     const rows = recordRows([

@@ -352,6 +352,52 @@ class RecordingMCPClient:
         self.closed = True
 
 
+def _lenient_client_session_cls() -> Any:
+    """The :class:`mcp.ClientSession` subclass every transport constructs —
+    identical wire behavior, with the output-schema validation neutered.
+
+    BUG-12 (真栈事故 2026-08-24): the deep-ai-health MCP server declares an
+    ``outputSchema`` on its tools but only returns text ``content`` (no
+    ``structuredContent``). mcp SDK 1.x's ``ClientSession.call_tool`` runs
+    ``_validate_tool_result`` on every non-error result and raises
+    ``RuntimeError: Tool xxx has an output schema but did not return
+    structured content`` — killing every tool call against that server.
+
+    Overriding the single private validation hook (rather than hand-copying
+    the send half of ``call_tool``, 终审 F5) keeps the SDK's canonical send
+    path AND makes the bypass the default for every present and future call
+    site — nothing can reintroduce the incident by calling
+    ``session.call_tool`` directly.
+
+    - **Why skipping validation is lossless**: the platform only consumes
+      ``result.content`` text blocks (:func:`_render_content_blocks`);
+      ``structuredContent`` has no consumer anywhere, so the check has only
+      blast radius and zero benefit here.
+    - **X-11 (mcp 2.x migration)**: the ``assert`` below fails loudly at
+      construction if the SDK renames/removes the private hook — re-verify
+      the override point before bumping.
+    """
+    # Lazy import — module top must stay SDK-free (existing convention:
+    # orchestrator imports fine in contexts without the mcp SDK).
+    from mcp import ClientSession
+    from mcp import types as mcp_types
+
+    if not hasattr(ClientSession, "_validate_tool_result"):
+        msg = (
+            "mcp SDK no longer has ClientSession._validate_tool_result — the "
+            "BUG-12 lenient bypass must be re-verified against this SDK "
+            "version (X-11)."
+        )
+        raise RuntimeError(msg)
+
+    class LenientClientSession(ClientSession):
+        async def _validate_tool_result(self, name: str, result: mcp_types.CallToolResult) -> None:
+            """BUG-12 — deliberate no-op: never raise on missing/invalid
+            structuredContent (see factory docstring)."""
+
+    return LenientClientSession
+
+
 @dataclass
 class StdioMCPClient:
     """Production :class:`MCPClient` — wraps the mcp SDK stdio transport.
@@ -375,8 +421,10 @@ class StdioMCPClient:
         # Imports kept local so the orchestrator can be imported in
         # contexts where the mcp SDK isn't available (e.g. middleware-
         # only unit tests with no MCP wiring).
-        from mcp import ClientSession, StdioServerParameters
+        from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client
+
+        session_cls = _lenient_client_session_cls()
 
         if self._stack is not None:
             msg = f"StdioMCPClient {self.config.name!r} already started"
@@ -398,7 +446,7 @@ class StdioMCPClient:
         await stack.__aenter__()
         try:
             read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
+            session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
         except BaseException:
             await stack.__aexit__(None, None, None)
@@ -479,7 +527,7 @@ class _RemoteMCPClientBase:
         # Imports kept local so orchestrator can be imported in contexts
         # that don't have the mcp SDK on the path (e.g. middleware-only
         # unit tests with no MCP wiring).
-        from mcp import ClientSession
+        session_cls = _lenient_client_session_cls()
 
         if self._stack is not None:
             msg = f"{type(self).__name__} {self.config.name!r} already started"
@@ -488,7 +536,7 @@ class _RemoteMCPClientBase:
         await stack.__aenter__()
         try:
             read, write = await self._open_streams(stack)
-            session = await stack.enter_async_context(ClientSession(read, write))
+            session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
         except BaseException:
             await stack.__aexit__(None, None, None)

@@ -1314,6 +1314,7 @@ export interface TranslationKeys {
     timeline_tip_ttft: string;
     detail_first_token: string;
     detail_system_prompt: string;
+    detail_prompt_inputs: string;
     detail_system_chars: string;
   };
   playground: {
@@ -4417,6 +4418,7 @@ const en: TranslationKeys = {
     timeline_tip_ttft: "first token {{d}}",
     detail_first_token: "First token",
     detail_system_prompt: "System prompt",
+    detail_prompt_inputs: "Prompt inputs",
     detail_system_chars: "{{n}} chars",
   },
   playground: {

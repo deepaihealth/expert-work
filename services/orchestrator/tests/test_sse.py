@@ -1266,6 +1266,46 @@ async def test_run_agent_emits_system_prompt_frame_right_after_metadata() -> Non
 
 
 @pytest.mark.asyncio
+async def test_run_agent_system_prompt_frame_carries_prompt_inputs() -> None:
+    """BUG-16 —— ``prompt_inputs`` 非空时原始 Jinja k/v 捎带进 system_prompt 帧;
+    不传 / 空 dict 保持老帧形状(连 ``inputs`` 键都没有)。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_ScriptedGraph(chunks=[{"agent": {"step_count": 1}}]),
+        graph_input={"messages": [SystemMessage(content="你是评审员"), HumanMessage(content="hi")]},
+        config={},
+        prompt_inputs={"a": "1"},
+    )
+    events = await _drain(bridge, record.run_id)
+    frame = next(e for e in events if e.event == "system_prompt")
+    assert frame.data == {"text": "你是评审员", "inputs": {"a": "1"}}
+
+    for empty in (None, {}):
+        bridge = InMemoryStreamBridge()
+        rm = RunManager()
+        record = await _new_record(rm)
+        await run_agent(
+            bridge=bridge,
+            run_manager=rm,
+            record=record,
+            graph=_ScriptedGraph(chunks=[{"agent": {"step_count": 1}}]),
+            graph_input={
+                "messages": [SystemMessage(content="你是评审员"), HumanMessage(content="hi")]
+            },
+            config={},
+            prompt_inputs=empty,
+        )
+        events = await _drain(bridge, record.run_id)
+        frame = next(e for e in events if e.event == "system_prompt")
+        assert "inputs" not in frame.data, empty
+
+
+@pytest.mark.asyncio
 async def test_run_agent_skips_system_prompt_frame_without_system_message() -> None:
     """resume(graph_input=None)/ 审批续跑(Command)/ 没有 SystemMessage 首条 —— 不发。"""
     for graph_input in (None, {"messages": [HumanMessage(content="hi")]}, {"messages": []}):
