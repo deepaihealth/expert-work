@@ -29,7 +29,7 @@
 
 ---
 
-## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-26 周三**;三道拍板 2026-08-24 已收:单副本首发 / 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
+## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-30 周六**(2026-08-24 由 08-26 周三改期);三道拍板 2026-08-24 已收:单副本首发 / 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
 
 > 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
 > **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
@@ -38,7 +38,7 @@
 
 | # | 项 | 内容 | 量级 |
 |---|---|---|---|
-| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1)——**2026-08-24 拍板单副本首发,降为「扩容到 2 副本前必做」,不再阻塞周三发布**(prod overlay replicas-patch 写明恢复点) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
+| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1)——**2026-08-24 拍板单副本首发,降为「扩容到 2 副本前必做」,不阻塞首发**(prod overlay replicas-patch 写明恢复点) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
 | PROD-2 | ~~**alertmanager receivers**(X-7 ①)~~ **✅ 已交付(2026-08-24,PR #1257)**:企微群机器人方案 —— 集群内 wecom-adapter(ConfigMap 脚本 + 复用 control-plane 镜像)converts Alertmanager JSON→企微 markdown,p0 追加 @all;URL 走 Secret `wecom-alert-webhook`(未建则 log-only 降级);**剩用户侧一步:建群机器人 + create secret(步骤在 base/secrets.example.yaml)** | ✅ |
 | PROD-3 | ~~**RLS 闸 1 拍板**~~ **✅ 已拍板(2026-08-24):书面接受单层 ORM 隔离首发**(记录在 production-release.md 拍板记录节);硬要求=生产应用账号建成非 superuser、无 bypassrls(secrets.env.example 已写明);FORCE RLS(捞回 PR B)= 发布后第一波 | ✅ |
 | PROD-4 | ~~**retention-cleanup-job 第二套审批超时**~~ **✅ 已定案(2026-08-24):核实 infra/k8s 零 CronJob manifest** —— 该 job(连同 billing-rollup / event-log-archive / audit-backup)只有代码没有部署物,test/prod 都不跑,风险不进生产;代码修回归 X-15①,**该 job 部署前必须先修**(production-release.md §4 已钉) | ✅ |
@@ -60,7 +60,12 @@
 
 X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
 
-**进度(2026-08-24 周一收账)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置 —— **代码侧已就绪,周三发布只剩:①资源开通+开荒(production-release.md §0-§1,用户侧为主)②测试环境交互面人工点验 ③PROD-7 P2 钉版卫兵(可选,半天)**。
+**进度(2026-08-24 周一收账,当晚改期周六)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置;主流程 BUG-1~5(#1259-#1261)+ 第二轮 BUG-6~8(#1265)全修,测试环境 `31e203a0` smoke 双发全过,平台技能 category 用户补录 51/52。**代码侧已就绪,改期到周六多出的三天排期**:
+
+- 周二~周三:①测试环境交互面 + 三页 bug 修复人工点验(用户)②平台技能 category 补最后一条 sop-scoring-pipeline(用户)③ PROD-7 从「可选」转「做」——P2 钉版卫兵半天 + P1 金丝雀适配 prod 评估(我侧,时间富余不再省)
+- 周四~周五:④资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)⑤开荒完成后跑一轮 prod overlay 渲染预检(placeholder 扫描)提前暴露缺口,不留到发布日
+- 周六:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
+- 发布后第一波顺延不变:RLS PR B / PROD-1 + PROD-12(扩容前置)/ 按需 PROD-9/10/11
 
 ---
 
