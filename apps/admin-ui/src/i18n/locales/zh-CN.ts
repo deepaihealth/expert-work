@@ -1227,6 +1227,8 @@ const zhCN: TranslationKeys = {
     plan_toggle: "展开 / 收起任务",
     vars_required_missing: "必填变量未填:{{names}}",
     vars_required_mark: "必填",
+    vars_missing_count: "{{count}} 项必填未填",
+    vars_toggle: "展开 / 收起 Prompt 变量",
     composer_hint: "Enter 发送,Shift+Enter 换行",
     stats_partial: "(仅已加载轮)",
     traj_kind_user: "USER",

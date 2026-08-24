@@ -1163,6 +1163,8 @@ export interface TranslationKeys {
     plan_toggle: string;
     vars_required_missing: string;
     vars_required_mark: string;
+    vars_missing_count: string;
+    vars_toggle: string;
     composer_hint: string;
     stats_partial: string;
     traj_kind_user: string;
@@ -4263,6 +4265,8 @@ const en: TranslationKeys = {
     plan_toggle: "Toggle tasks",
     vars_required_missing: "Required variables missing: {{names}}",
     vars_required_mark: "required",
+    vars_missing_count: "{{count}} required missing",
+    vars_toggle: "Expand / collapse prompt variables",
     composer_hint: "Enter to send, Shift+Enter for a new line",
     stats_partial: "(loaded turns only)",
     traj_kind_user: "USER",
