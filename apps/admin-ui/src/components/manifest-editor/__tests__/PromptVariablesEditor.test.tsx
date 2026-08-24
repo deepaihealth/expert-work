@@ -88,3 +88,23 @@ describe("PromptVariablesEditor", () => {
     expect(last.spec?.system_prompt?.variables?.[0].trusted).toBe(false);
   });
 });
+
+describe("PromptVariablesEditor capacity (BUG-4)", () => {
+  it("wraps variable rows in an internal scroll container with a count", () => {
+    const variables: PromptVariableFields[] = Array.from(
+      { length: 12 },
+      (_, i) => ({ name: `v${i}` }),
+    );
+    render(
+      <PromptVariablesEditor formData={jinjaSeed(variables)} onChange={vi.fn()} />,
+    );
+    const scroll = screen.getByTestId("af-prompt-vars-scroll");
+    expect(scroll.style.overflowY).toBe("auto");
+    expect(scroll.style.maxHeight).toBe("40vh");
+    // 12 行都在滚动容器内,添加按钮在容器外恒可见。
+    expect(scroll.querySelectorAll("[data-testid^='af-prompt-var-row-']")).toHaveLength(12);
+    expect(screen.getByTestId("af-prompt-vars-count").textContent).toContain("12");
+    const add = screen.getByTestId("af-prompt-var-add");
+    expect(scroll.contains(add)).toBe(false);
+  });
+});

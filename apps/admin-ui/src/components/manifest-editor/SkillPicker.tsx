@@ -230,7 +230,12 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
 
       <div
         data-testid="af-skills-scroll"
-        style={{ maxHeight: 480, overflowY: "auto" }}
+        // BUG-5:写死 480 让大屏在半屏留白下面透小窗看长列表 —— 上限跟随
+        // 视口(减去页头/筛选行开销),480 仍是小屏地板。
+        style={{
+          maxHeight: "max(480px, calc(100vh - 420px))",
+          overflowY: "auto",
+        }}
       >
         <div data-testid="af-skills-list">
           {filtered.length === 0 ? (

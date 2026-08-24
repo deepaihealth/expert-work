@@ -92,6 +92,21 @@ export function PromptVariablesEditor({
 
       {jinja && (
         <>
+          {variables.length > 0 && (
+            <Text
+              type="secondary"
+              data-testid="af-prompt-vars-count"
+              style={{ display: "block", marginBottom: 6, fontSize: 12 }}
+            >
+              {t("agent_form.prompt_vars_count", { n: variables.length })}
+            </Text>
+          )}
+          {/* BUG-4:变量一多把整页撑成一面墙 —— 列表内滚,添加按钮留在
+              容器外恒可见。 */}
+          <div
+            data-testid="af-prompt-vars-scroll"
+            style={{ maxHeight: "40vh", overflowY: "auto", marginBottom: 8 }}
+          >
           {variables.map((row, i) => (
             <div
               key={i}
@@ -155,6 +170,7 @@ export function PromptVariablesEditor({
               </Button>
             </div>
           ))}
+          </div>
           <Button
             type="dashed"
             size="small"

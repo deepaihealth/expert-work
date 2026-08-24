@@ -369,7 +369,16 @@ export function ManifestEditor({
 
   return (
     <div data-testid={`manifest-editor-${mode}`}>
-      <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
+      {/* BUG-5:内容按需收高时卡片停在半屏,底部整片留白 —— 编辑器主体
+          拉到接近视口底,少内容分组也占满版心。 */}
+      <div
+        style={{
+          display: "flex",
+          gap: 24,
+          alignItems: "flex-start",
+          minHeight: "calc(100vh - 320px)",
+        }}
+      >
         <div data-testid="cfg-nav" style={{ flex: "0 0 200px", width: 200 }}>
           <GroupNav
             active={group}

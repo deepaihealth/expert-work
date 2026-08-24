@@ -107,3 +107,25 @@ describe("PromptTemplateEditor", () => {
     expect(result?.suggestions[0]?.detail).toBe("the user");
   });
 });
+
+describe("PromptTemplateEditor fullscreen (BUG-4)", () => {
+  it("opens the expand modal with a second live editor bound to the same value", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <PromptTemplateEditor
+        value="Hello {{ name }}"
+        variables={[]}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getAllByTestId("monaco-stub")).toHaveLength(1);
+    await user.click(screen.getByTestId("af-prompt-expand"));
+    const stubs = screen.getAllByTestId("monaco-stub") as HTMLTextAreaElement[];
+    expect(stubs).toHaveLength(2);
+    expect(stubs[1].value).toBe("Hello {{ name }}");
+    await user.type(stubs[1], "!");
+    expect(onChange).toHaveBeenCalled();
+  });
+});
