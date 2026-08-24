@@ -95,6 +95,10 @@ def test_current_context_windows() -> None:
         ("openai", "gpt-5.4-mini"): 400_000,
         ("deepseek", "deepseek-v4-pro"): 1_000_000,
         ("deepseek", "deepseek-v4-flash"): 1_000_000,
+        # GLM-5.3: 1M per the bigmodel pricing page (2026-08). GLM-5V-Turbo:
+        # 200K per the bigmodel VLM docs (2026-08).
+        ("glm", "glm-5.3"): 1_000_000,
+        ("glm", "glm-5v-turbo"): 200_000,
         ("glm", "glm-5.2"): 1_000_000,
         ("glm", "glm-5.1"): 200_000,
         ("glm", "glm-4.7"): 200_000,
@@ -102,6 +106,8 @@ def test_current_context_windows() -> None:
         ("kimi", "kimi-k3"): 1_000_000,
         ("kimi", "kimi-k2.6"): 256_000,
         ("kimi", "kimi-k2.5"): 256_000,
+        # Qwen3.8-Max: 1M (2.4T MoE, 2026-08 launch — Model Studio).
+        ("qwen", "qwen3.8-max"): 1_000_000,
         ("qwen", "qwen3.7-max"): 1_000_000,
         ("qwen", "qwen3.6-plus"): 1_000_000,
         ("doubao", "doubao-seed-2-1-pro-260628"): 256_000,
@@ -128,6 +134,24 @@ def test_kimi_k3_capability_bits() -> None:
     assert k3.deprecated is False
     # It is the current flagship — selectable in the dropdown.
     assert "kimi-k3" in {e.name for e in models_for_provider("kimi")}
+
+
+def test_2026_08_additions_capability_bits() -> None:
+    """2026-08 additions verified against vendor docs: glm-5.3 (text, 1M,
+    thinking.type toggle), glm-5v-turbo (vision Agent base, 200K, toggle),
+    qwen3.8-max (natively multimodal, 1M, enable_thinking budget)."""
+    glm53 = catalog_entry("glm", "glm-5.3")
+    assert glm53 is not None
+    assert glm53.vision is False and glm53.thinking == "toggle"
+    glm5v = catalog_entry("glm", "glm-5v-turbo")
+    assert glm5v is not None
+    assert glm5v.vision is True and glm5v.thinking == "toggle"
+    q38 = catalog_entry("qwen", "qwen3.8-max")
+    assert q38 is not None
+    assert q38.vision is True and q38.thinking == "budget"
+    # All three are current — selectable in the dropdown.
+    assert {"glm-5.3", "glm-5v-turbo"} <= {e.name for e in models_for_provider("glm")}
+    assert "qwen3.8-max" in {e.name for e in models_for_provider("qwen")}
 
 
 def test_cross_vendor_thinking_shapes() -> None:
