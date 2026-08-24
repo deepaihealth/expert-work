@@ -2322,6 +2322,10 @@ export interface TranslationKeys {
     filter_status: string;
     filter_status_all: string;
     filter_category: string;
+    filter_name: string;
+    empty_filtered: string;
+    clear_filter: string;
+    filter_partial_hint: string;
     load_more: string;
     create: string;
     create_modal_title: string;
@@ -5534,6 +5538,10 @@ const en: TranslationKeys = {
     filter_status: "Status filter",
     filter_status_all: "All statuses",
     filter_category: "Category",
+    filter_name: "Search name/description",
+    empty_filtered: 'No skills match "{{q}}"',
+    clear_filter: "Clear search",
+    filter_partial_hint: "Search covers loaded skills only — Load more below fetches the rest.",
     load_more: "Load more",
     create: "Create",
     create_modal_title: "Create skill (empty draft)",
