@@ -111,9 +111,15 @@ case "${env_name}" in
         fi
         # Extract only the two keys instead of sourcing — a stray
         # OVERLAY=/KUBECONFIG_PATH= line in the params file must not be
-        # able to silently repoint the release (review M-9).
-        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
-        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        # able to silently repoint the release (review M-9). `|| true`
+        # keeps the missing-key case on the friendly error below instead
+        # of dying in set -e (review NEW-3); quotes are stripped so a
+        # dotenv-style quoted value doesn't get baked into the image URL
+        # (review NEW-4).
+        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_DOMAIN="${PROD_DOMAIN%\"}"; PROD_DOMAIN="${PROD_DOMAIN#\"}"
+        PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN%\"}"; PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN#\"}"
         if [[ -z "${PROD_DOMAIN}" || -z "${PROD_LANGFUSE_DOMAIN}" ]]; then
             echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
             exit 1
@@ -139,7 +145,10 @@ if [[ "${env_name}" == "prod" ]]; then
     # (and its "fill these" output would push real secrets toward git).
     # PROD_PLACEHOLDER_TAG is exempt: step 2 (kustomize edit) replaces
     # it on the first release.
-    leftover="$(kustomize build "${OVERLAY}" | grep -n "PROD_PLACEHOLDER" | grep -v "PROD_PLACEHOLDER_TAG" || true)"
+    # Two steps so a kustomize failure trips set -e instead of the
+    # `|| true` silently blanking the guard (review NEW-7).
+    rendered="$(kustomize build "${OVERLAY}")"
+    leftover="$(printf '%s\n' "${rendered}" | grep -n "PROD_PLACEHOLDER" | grep -v "PROD_PLACEHOLDER_TAG" || true)"
     if [[ -n "${leftover}" ]]; then
         echo "prod overlay still renders PROD_PLACEHOLDER_* values — fill them first:" >&2
         echo "${leftover}" >&2

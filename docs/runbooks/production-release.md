@@ -36,6 +36,7 @@ cat > ~/.kube/expert-work-prod-params.env <<'EOF'
 PROD_DOMAIN=<主域名>
 PROD_LANGFUSE_DOMAIN=<langfuse 子域名>
 EOF
+# 值不要加引号(脚本按键提取不走 shell 解析;带引号会被烤进 admin-ui 镜像 URL)
 ```
 
 ### 1.2 填 overlay 占位符
@@ -111,9 +112,14 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
 `kubectl -n expert-work rollout restart deploy/control-plane`)转绿。smoke 的
 公网检查在 DNS 生效前也会红,先看 `/healthz/ready` 与 pods 两项。
 
-### 1.6 应用层 seed(顺序敏感)
+### 1.6 应用层 seed(顺序敏感,按编号执行)
 
-1. **金库 seed**(先做——control-plane 转绿的前提)。pod 起不来,用一次性
+1. **Keycloak realm 三件**(漏了登录/首装直接失败,见 deployment.md §6.7):
+   - kcadm 给 `expert-work-admin-ui` client 加 `https://<主域名>/*` redirectUris + webOrigins(realm 文件 seed 的是 localhost);
+   - kcadm `update users/profile -r expert-work -s unmanagedAttributePolicy=ENABLED`;
+   - **轮换 realm 内嵌的 dev 秘密**(base realm 文件带 dev client secret 与 dev 用户密码,base/kustomization.yaml 头注的硬警告):重置 `expert-work-api-internal` client secret(**记下新值,下一步进金库**)、删 dev 用户。
+
+2. **金库 seed 三条**(control-plane 转绿的前提)。pod 起不来,用一次性
    seed pod(同镜像同 env,不跑 uvicorn):
 
    ```sh
@@ -121,18 +127,21 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
    kubectl -n expert-work run vault-seed --restart=Never \
      --image=crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:$TAG \
      --overrides='{"spec":{"containers":[{"name":"vault-seed","image":"crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:'$TAG'","command":["sleep","3600"],"envFrom":[{"configMapRef":{"name":"control-plane-config"}},{"secretRef":{"name":"control-plane-secrets"}}]}]}}'
-   # KC admin-client secret(值 = §1.6.2 里重置出的 expert-work-api-internal client secret):
+   kubectl -n expert-work wait --for=condition=Ready pod/vault-seed --timeout=180s
+   # ① KC admin-client secret(值 = 步骤 1 重置出的 expert-work-api-internal client secret):
    kubectl -n expert-work exec vault-seed -- \
      python -m control_plane.seed_keycloak_secret --value '<client secret>'
-   # OSS AK/SK 两条:照 overlays/test/secrets.env.example 金库节的
-   # SqlEncryptedSecretStore.put() 配方(键名 EXPERT_WORK_OBJECT_STORE_*_REF 所指)。
+   # ②③ OSS AK/SK(configmap 的 EXPERT_WORK_OBJECT_STORE_*_REF 两个 secret:// ref
+   # 所指;--name 走同一 CLI,PROD-5 加的通用模式):
+   kubectl -n expert-work exec vault-seed -- \
+     python -m control_plane.seed_keycloak_secret \
+       --name expert-work/platform/oss/access-key --value '<OSS AK>'
+   kubectl -n expert-work exec vault-seed -- \
+     python -m control_plane.seed_keycloak_secret \
+       --name expert-work/platform/oss/secret-key --value '<OSS SK>'
    kubectl -n expert-work delete pod vault-seed
    ```
 
-2. **Keycloak realm 三件**(漏了登录/首装直接失败,见 deployment.md §6.7):
-   - kcadm 给 `expert-work-admin-ui` client 加 `https://<主域名>/*` redirectUris + webOrigins(realm 文件 seed 的是 localhost);
-   - kcadm `update users/profile -r expert-work -s unmanagedAttributePolicy=ENABLED`;
-   - **轮换 realm 内嵌的 dev 秘密**(base realm 文件带 dev client secret 与 dev 用户密码,base/kustomization.yaml 头注的硬警告):重置 `expert-work-api-internal` client secret(该值随后进金库,见上一步)、删 dev 用户。
 3. **control-plane 转绿**:重跑 §1.5 第二跑,smoke 全绿为准。
 4. **首个平台管理员**:configmap 已设 `EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL`,
    该邮箱首登自动升(兜底走 bootstrap-admin.md break-glass)。

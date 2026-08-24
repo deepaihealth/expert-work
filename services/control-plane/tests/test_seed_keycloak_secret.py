@@ -11,6 +11,7 @@ import pytest
 
 from control_plane.seed_keycloak_secret import (
     SeedValueMissingError,
+    resolve_secret_name,
     resolve_secret_value,
     seed_keycloak_admin_secret,
 )
@@ -55,3 +56,18 @@ async def test_seed_writes_under_configured_name() -> None:
         value="sekret",
     )
     assert store.puts == [("expert-work/platform/keycloak/admin-client-secret", "sekret")]
+
+
+def test_resolve_name_prefers_arg() -> None:
+    assert (
+        resolve_secret_name("expert-work/platform/oss/access-key", "kc-default")
+        == "expert-work/platform/oss/access-key"
+    )
+
+
+def test_resolve_name_defaults_to_settings() -> None:
+    assert resolve_secret_name(None, "kc-default") == "kc-default"
+
+
+def test_resolve_name_treats_empty_as_absent() -> None:
+    assert resolve_secret_name("", "kc-default") == "kc-default"

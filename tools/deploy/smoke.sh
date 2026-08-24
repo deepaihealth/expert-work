@@ -35,8 +35,10 @@ case "$1" in
         fi
         # Extract only the two keys instead of sourcing (same rationale as
         # release.sh — a stray assignment must not repoint anything).
-        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
-        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2-)"
+        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_DOMAIN="${PROD_DOMAIN%\"}"; PROD_DOMAIN="${PROD_DOMAIN#\"}"
+        PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN%\"}"; PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN#\"}"
         if [[ -z "${PROD_DOMAIN}" || -z "${PROD_LANGFUSE_DOMAIN}" ]]; then
             echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
             exit 1
