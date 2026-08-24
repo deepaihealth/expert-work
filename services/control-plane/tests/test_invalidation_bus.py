@@ -14,6 +14,7 @@ from prometheus_client import REGISTRY
 
 from control_plane.invalidation_bus import (
     CHANNEL,
+    KINDS,
     InvalidationBus,
     InvalidationEvent,
     NoopInvalidationBus,
@@ -417,6 +418,14 @@ async def test_agent_build_kind_handlers_hit_runtime() -> None:
     assert runtime.tenant_calls == [tid]
     assert runtime.all_calls == 1
     assert runtime.user_calls == [(tid, "emp-2")]
+
+
+def test_kinds_constant_matches_the_wired_handlers() -> None:
+    """``KINDS`` is the documented event vocabulary; the handler table is what
+    the subscriber actually dispatches. A kind added to one and not the other
+    is a silently-dropped event (``invalidation_bus.unknown_kind``), so the two
+    are pinned to each other here."""
+    assert set(build_invalidation_handlers(SimpleNamespace())) == KINDS
 
 
 @pytest.mark.asyncio
