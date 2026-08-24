@@ -52,6 +52,7 @@ import { tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
+import { TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../utils/pagination";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
@@ -175,7 +176,7 @@ export function SkillsList() {
       const prevShown = dataSource.length;
       setAccumulated((prev) => [...prev, ...result.items]);
       if (result.items.length > 0) {
-        setPage(Math.floor(prevShown / 20) + 1);
+        setPage(Math.floor(prevShown / TABLE_PAGE_SIZE) + 1);
       }
     } catch (err) {
       message.error(err instanceof Error ? err.message : "failed");
@@ -512,11 +513,9 @@ export function SkillsList() {
         // 20/页(单页时自动隐藏,小库无感);「加载更多」继续供服务端游标
         // 追加租户自有技能。
         pagination={{
+          ...TABLE_PAGINATION,
           current: page,
           onChange: setPage,
-          pageSize: 20,
-          showSizeChanger: false,
-          hideOnSinglePage: true,
         }}
         onRow={(record) =>
           // Platform rows are read-only in the tenant scope — a tenant

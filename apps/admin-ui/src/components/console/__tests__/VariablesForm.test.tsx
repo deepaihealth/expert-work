@@ -62,9 +62,60 @@ describe("VariablesForm", () => {
   it("renders one input per variable with the required mark and forwards edits", async () => {
     const onChange = vi.fn();
     render(<ControlledHarness onChange={onChange} />);
-    expect(screen.getAllByText("必填")).toHaveLength(1);
+    // BUG-7 redesign — the mark is a red asterisk carrying the localized
+    // label as its hover title (one per required variable).
+    expect(screen.getAllByTitle("必填")).toHaveLength(1);
     await userEvent.type(screen.getByTestId("playground-var-customer_code"), "C-1");
     expect(onChange).toHaveBeenLastCalledWith("customer_code", "C-1");
+  });
+
+  it("header shows the variable count and the missing-required count", async () => {
+    render(<ControlledHarness onChange={vi.fn()} />);
+    expect(screen.getByText(/Prompt 变量 \(2\)/)).toBeInTheDocument();
+    expect(screen.getByTestId("playground-vars-missing")).toHaveTextContent(
+      "1 项必填未填",
+    );
+    await userEvent.type(screen.getByTestId("playground-var-customer_code"), "C-1");
+    expect(screen.queryByTestId("playground-vars-missing")).not.toBeInTheDocument();
+  });
+
+  it("starts open while required values are missing and does not fold on fill", async () => {
+    render(<ControlledHarness onChange={vi.fn()} />);
+    const input = screen.getByTestId("playground-var-customer_code");
+    await userEvent.type(input, "C-1");
+    // Filling the last required value must NOT yank the section shut.
+    expect(screen.getByTestId("playground-var-customer_code")).toBeInTheDocument();
+  });
+
+  it("re-opens when values are reset in place (新建会话 without remount)", async () => {
+    const vars: readonly PromptVariable[] = [{ name: "code", required: true }];
+    const { rerender } = render(
+      <VariablesForm variables={vars} values={{ code: "C-1" }} onChange={vi.fn()} disabled={false} />,
+    );
+    // Satisfied → starts folded.
+    expect(screen.queryByTestId("playground-var-code")).not.toBeInTheDocument();
+    // Parent resets values without remounting — required is missing again,
+    // the section must re-open (inputs off-screen while send is blocked).
+    rerender(
+      <VariablesForm variables={vars} values={{}} onChange={vi.fn()} disabled={false} />,
+    );
+    expect(screen.getByTestId("playground-var-code")).toBeInTheDocument();
+  });
+
+  it("starts folded when nothing required is missing and the header toggles it", async () => {
+    render(
+      <VariablesForm
+        variables={[{ name: "tone", required: false }]}
+        values={{}}
+        onChange={vi.fn()}
+        disabled={false}
+      />,
+    );
+    expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("playground-vars-toggle"));
+    expect(screen.getByTestId("playground-var-tone")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("playground-vars-toggle"));
+    expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
   });
 
   it("renders nothing when there are no variables", () => {

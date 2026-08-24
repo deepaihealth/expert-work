@@ -95,6 +95,12 @@ interface FormViewProps {
   bare?: boolean;
 }
 
+// Width policy, single altitude (BUG-6): list-type sections need the full
+// viewport — a 760 cap wastes half a wide screen while truncating their own
+// rows. Everything else keeps the readable-form cap. Stacked (multi-section)
+// panes share one container, so they stay capped regardless.
+const WIDE_SECTIONS: ReadonlySet<FormSection> = new Set(["skills"]);
+
 const SECTION: React.CSSProperties = { marginBottom: 24 };
 const FIELD: React.CSSProperties = { marginBottom: 16 };
 const LABEL: React.CSSProperties = { display: "block", marginBottom: 4 };
@@ -487,7 +493,12 @@ export function FormView({
   };
 
   return (
-    <div data-testid="manifest-form-view" style={{ maxWidth: 760 }}>
+    <div
+      data-testid="manifest-form-view"
+      style={{
+        maxWidth: !stacked && WIDE_SECTIONS.has(section) ? undefined : 760,
+      }}
+    >
       {sections
         ? sections.map((s) => (
             <div key={s} data-section-id={s}>

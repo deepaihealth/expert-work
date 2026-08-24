@@ -1163,6 +1163,7 @@ export interface TranslationKeys {
     plan_toggle: string;
     vars_required_missing: string;
     vars_required_mark: string;
+    vars_missing_count: string;
     composer_hint: string;
     stats_partial: string;
     traj_kind_user: string;
@@ -2663,6 +2664,7 @@ export interface TranslationKeys {
     create: string;
     failed_to_load: string;
     empty: string;
+    empty_filtered: string;
     never: string;
     rotation_banner: string;
     rotation_help: string;
@@ -4263,6 +4265,7 @@ const en: TranslationKeys = {
     plan_toggle: "Toggle tasks",
     vars_required_missing: "Required variables missing: {{names}}",
     vars_required_mark: "required",
+    vars_missing_count: "{{count}} required missing",
     composer_hint: "Enter to send, Shift+Enter for a new line",
     stats_partial: "(loaded turns only)",
     traj_kind_user: "USER",
@@ -5919,6 +5922,8 @@ const en: TranslationKeys = {
     create: "Create API Key",
     failed_to_load: "Failed to load API keys",
     empty: "No API keys yet. Create one bound to a service account to start.",
+    empty_filtered:
+      "No live keys — revoked / expired keys are hidden; use the Status column filter to view them.",
     never: "never",
     rotation_banner: "{{count}} keys in rotation grace window",
     rotation_help:

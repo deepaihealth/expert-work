@@ -197,12 +197,59 @@ describe("SettingsApiKeys", () => {
     expect(screen.queryByTestId("api-key-view-modal")).toBeNull();
   });
 
+  // BUG-8 — dead keys are noise: the status column defaults to
+  // active + grace, so revoked/expired rows need an explicit filter pick.
+  it("hides revoked and expired rows by default (status filter default)", async () => {
+    const revoked = {
+      ...activeKey,
+      id: "key-revoked",
+      prefix: "ewk_revok1",
+      revoked_at: "2026-06-01T00:00:00Z",
+    };
+    const expired = {
+      ...activeKey,
+      id: "key-expired",
+      prefix: "ewk_expir1",
+      expires_at: "2020-01-01T00:00:00Z",
+    };
+    installAdapter([keyListHandler([activeKey, revoked, expired]), saListHandler()]);
+    renderPage();
+    await screen.findByText("ewk_ab12cd");
+    expect(screen.queryByText("ewk_revok1")).toBeNull();
+    expect(screen.queryByText("ewk_expir1")).toBeNull();
+  });
+
   it("hides the view button for revoked and expired rows", async () => {
-    const revoked = { ...activeKey, id: "key-revoked", revoked_at: "2026-06-01T00:00:00Z" };
-    const expired = { ...activeKey, id: "key-expired", expires_at: "2020-01-01T00:00:00Z" };
+    const revoked = {
+      ...activeKey,
+      id: "key-revoked",
+      prefix: "ewk_revok1",
+      revoked_at: "2026-06-01T00:00:00Z",
+    };
+    const expired = {
+      ...activeKey,
+      id: "key-expired",
+      prefix: "ewk_expir1",
+      expires_at: "2020-01-01T00:00:00Z",
+    };
     installAdapter([keyListHandler([activeKey, revoked, expired]), saListHandler()]);
     renderPage();
     await waitFor(() => expect(screen.getByTestId("api-key-view-key-1")).toBeInTheDocument());
+
+    // Widen the default active+grace filter so the dead rows render at all.
+    const trigger = document.querySelector(".ant-table-filter-trigger");
+    await userEvent.click(trigger as HTMLElement);
+    const dropdown = await waitFor(() => {
+      const el = document.querySelector(".ant-table-filter-dropdown");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    await userEvent.click(within(dropdown).getByText(/已撤销|revoked/i));
+    await userEvent.click(within(dropdown).getByText(/已过期|expired/i));
+    await userEvent.click(within(dropdown).getByText(/^OK$|^确\s?定$/));
+
+    await screen.findByText("ewk_revok1");
+    expect(screen.getByText("ewk_expir1")).toBeInTheDocument();
     expect(screen.queryByTestId("api-key-view-key-revoked")).toBeNull();
     expect(screen.queryByTestId("api-key-view-key-expired")).toBeNull();
   });
@@ -242,10 +289,45 @@ describe("SettingsApiKeys", () => {
       expect(el).not.toBeNull();
       return el as HTMLElement;
     });
+    // Default state pre-checks 生效中 + 轮换宽限 — swap to 已撤销 only.
+    await userEvent.click(within(dropdown).getByText(/生效中|^active$/i));
+    await userEvent.click(within(dropdown).getByText(/轮换宽限|grace/i));
     await userEvent.click(within(dropdown).getByText(/已撤销|revoked/i));
     await userEvent.click(within(dropdown).getByText(/^OK$|^确\s?定$/));
 
     await waitFor(() => expect(screen.queryByText("ewk_ab12cd")).toBeNull());
     expect(screen.getByText("ewk_zz99yy")).toBeInTheDocument();
+  });
+
+  it("shows the filtered-empty hint, not the create-one empty state, when all keys are dead", async () => {
+    const revoked = {
+      ...activeKey,
+      id: "key-revoked",
+      prefix: "ewk_revok1",
+      revoked_at: "2026-06-01T00:00:00Z",
+    };
+    installAdapter([saListHandler(), keyListHandler([revoked])]);
+    renderPage();
+    await screen.findByText(/没有生效中的密钥|No live keys/);
+    expect(screen.queryByText(/还没有 API 密钥|No API keys yet/)).toBeNull();
+  });
+
+  // BUG-8 — client-side pagination at 20/page (hidden when it all fits).
+  it("pages the table at 20 rows", async () => {
+    const many = Array.from({ length: 25 }, (_v, i) => ({
+      ...activeKey,
+      id: `key-${i + 1}`,
+      prefix: `ewk_pg${String(i + 1).padStart(2, "0")}xx`,
+    }));
+    installAdapter([saListHandler(), keyListHandler(many)]);
+    renderPage();
+    await screen.findByText("ewk_pg01xx");
+    expect(screen.getByText("ewk_pg20xx")).toBeInTheDocument();
+    expect(screen.queryByText("ewk_pg21xx")).toBeNull();
+
+    await userEvent.click(screen.getByTitle("2"));
+
+    expect(await screen.findByText("ewk_pg21xx")).toBeInTheDocument();
+    expect(screen.queryByText("ewk_pg01xx")).toBeNull();
   });
 });
