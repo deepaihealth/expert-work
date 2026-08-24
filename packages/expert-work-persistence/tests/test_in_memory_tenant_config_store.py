@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -201,7 +201,7 @@ async def test_memory_predictive_review_enabled_defaults_and_round_trips() -> No
 # 「缓存读→改→整表覆盖写」在多副本下互相抹名字;原子操作把合并下放到 store。
 
 
-async def _seeded_store(tenant_id) -> InMemoryTenantConfigStore:
+async def _seeded_store(tenant_id: UUID) -> InMemoryTenantConfigStore:
     store = InMemoryTenantConfigStore()
     await store.create(tenant_id=tenant_id, display_name="Acme", actor_id="bootstrap")
     return store
@@ -218,7 +218,8 @@ async def test_add_mcp_allowlist_name_appends_and_reports_changed() -> None:
     assert changed is True
     assert record.mcp_allowlist == ["amap-maps"]
     assert record.updated_by == "op"
-    assert (await store.get(tenant_id=tenant_id)).mcp_allowlist == ["amap-maps"]
+    fetched = await store.get(tenant_id=tenant_id)
+    assert fetched is not None and fetched.mcp_allowlist == ["amap-maps"]
 
 
 @pytest.mark.asyncio
@@ -241,9 +242,7 @@ async def test_add_preserves_existing_names() -> None:
     store = await _seeded_store(tenant_id)
     await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="deep", actor_id="op")
 
-    record, _ = await store.add_mcp_allowlist_name(
-        tenant_id=tenant_id, name="amap", actor_id="op"
-    )
+    record, _ = await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="amap", actor_id="op")
     assert record.mcp_allowlist == ["deep", "amap"]
 
 
