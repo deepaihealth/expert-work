@@ -386,12 +386,19 @@ async def test_add_mcp_allowlist_missing_tenant_raises(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_adds_both_survive(
+async def test_add_blocks_on_row_lock_then_merges(
     tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
 ) -> None:
-    """两个并发 add(模拟两副本同时启用不同 server)——FOR UPDATE 行锁串行,
-    谁都不抹谁。旧实现(读快照整表覆盖写)在此必然二选一丢失。"""
+    """确定性行锁证明(终审第二轮:gather 版是重言式,删 FOR UPDATE 照样绿)。
+
+    旁路会话先 FOR UPDATE 持锁并写入 "deep"(不提交),此时 store 的 add
+    必须阻塞 —— 没有 FOR UPDATE 它会立刻读到旧快照写回,wait_for 就不会
+    超时,第一道断言先红;提交放锁后 add 继续,合并结果两个名字都在。"""
     import asyncio
+
+    from sqlalchemy import select
+
+    from expert_work.persistence.models import TenantConfigRow
 
     store, engine = tenant_config_store
     try:
@@ -402,10 +409,26 @@ async def test_concurrent_adds_both_survive(
             patch=TenantConfigPatch(display_name="ACME"),
             actor_id="admin",
         )
-        await asyncio.gather(
-            store.add_mcp_allowlist_name(tenant_id=tenant, name="deep", actor_id="a"),
-            store.add_mcp_allowlist_name(tenant_id=tenant, name="amap", actor_id="b"),
-        )
+        sf = build_rls_sessionmaker(create_async_session_factory(engine))
+        async with sf() as blocker:
+            row = (
+                await blocker.execute(
+                    select(TenantConfigRow)
+                    .where(TenantConfigRow.tenant_id == tenant)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            row.mcp_allowlist = ["deep"]
+            await blocker.flush()  # 持锁未提交
+            task = asyncio.create_task(
+                store.add_mcp_allowlist_name(tenant_id=tenant, name="amap", actor_id="b")
+            )
+            with pytest.raises(TimeoutError):
+                # 没有行锁时 add 不会阻塞 → 这里先红(杀掉删 FOR UPDATE 的变异)。
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            await blocker.commit()
+            _, changed = await task
+            assert changed is True
         fetched = await store.get(tenant_id=tenant)
         assert fetched is not None
         assert sorted(fetched.mcp_allowlist) == ["amap", "deep"]

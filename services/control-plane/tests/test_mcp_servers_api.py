@@ -1686,7 +1686,7 @@ async def test_enable_with_stale_cache_does_not_wipe_prior_enable() -> None:
     """
     app, headers, tenant_id = await _make_app_with_admin()
     await _configure_tenant(app, tenant_id)
-    deep_id = await _seed_platform_none(app, name="deep")
+    await _seed_platform_none(app, name="deep")
     amap_id = await _seed_platform_none(app, name="amap")
 
     svc = app.state.tenant_config_service
@@ -1706,4 +1706,28 @@ async def test_enable_with_stale_cache_does_not_wipe_prior_enable() -> None:
     # 5) 本进程缓存也已被原子写回填,list 立刻见到两者。
     fresh = await svc.get(tenant_id=tenant_id)
     assert sorted(fresh.mcp_allowlist) == ["amap", "deep"]
-    del deep_id
+
+
+@pytest.mark.asyncio
+async def test_disable_with_stale_cache_still_removes() -> None:
+    """BUG-1 disable 侧回归(终审第二轮):旧实现读缓存判「名字不在表里」
+    直接 no-op —— 管理员以为已停用,实际一行没写(安全相关的静默失败)。
+    原子 remove 必须绕过陈旧缓存把名字真删掉,并触发 MCP 池失效。"""
+    app, headers, tenant_id = await _make_app_with_admin()
+    await _configure_tenant(app, tenant_id)
+    cat_id = await _seed_platform_none(app, name="deep")
+
+    svc = app.state.tenant_config_service
+    # 1) 本进程缓存装入「空 allowlist」旧快照。
+    await svc.get(tenant_id=tenant_id)
+    # 2) 「别的副本」直写 store 启用 deep(本进程缓存不知情)。
+    await svc.store.add_mcp_allowlist_name(tenant_id=tenant_id, name="deep", actor_id="replica-b")
+    # 3) 本进程 disable —— 缓存里 allowlist 是 [],旧实现在此 no-op。
+    #    (测试 app 未接 MCP 池服务,失效路径由 enable 侧共享的
+    #    _invalidate_tenant_mcp None 兜底覆盖,这里只钉 store 真相。)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        resp = await client.delete(f"/v1/mcp-servers/catalog/{cat_id}/enable", headers=headers)
+        assert resp.status_code == 200, resp.text
+    record = await svc.store.get(tenant_id=tenant_id)
+    assert record is not None and record.mcp_allowlist == []

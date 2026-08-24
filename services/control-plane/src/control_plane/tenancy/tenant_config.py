@@ -240,6 +240,11 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
     ``get`` 把 service 的 :class:`TenantConfigNotConfiguredError` 转回
     store 接口约定的 ``None``(recall 节点靠 None 走默认 hybrid);
     ``actor_id=None`` 使 service 不发读审计 —— 热路径零审计噪音。
+
+    委托分两档(照抄前先看这行):**过 service**(``upsert`` 与
+    mcp_allowlist 的 add/remove)—— 它们要缓存回填 + 写审计;**绕到
+    ``_service.store``**(``create``/``set_status``/``list_all``)——
+    纯管理面直写,``set_status`` 自己补缓存失效。
     """
 
     def __init__(self, *, service: TenantConfigService) -> None:

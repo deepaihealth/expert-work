@@ -65,7 +65,9 @@ function recordToPatchJson(record: TenantConfigRecord): string {
     display_name: record.display_name,
     plan: record.plan,
     model_credentials_ref: record.model_credentials_ref,
-    mcp_allowlist: record.mcp_allowlist,
+    // mcp_allowlist 刻意不进种子 patch(BUG-1):它由 MCP 页面的原子
+    // enable/disable 独占管理;这里整表回传会把页面加载之后别处的启用/
+    // 停用一并回滚(patch 语义 = 缺席即不动,这正是我们要的)。
     rate_limit_override: record.rate_limit_override,
     pii_fields: record.pii_fields,
     http_tool_allowlist: record.http_tool_allowlist,
