@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from uuid import UUID
 
@@ -31,6 +32,11 @@ logger = logging.getLogger("expert_work.control_plane.tenant_mcp_pool")
 
 # Bounded rebuild attempts when invalidation keeps landing mid-build (audit #2).
 _MAX_BUILD_ATTEMPTS = 5
+
+# TTL backstop for missed invalidation-bus events (PR-E3a) — matches the
+# built-agent cache TTL (AgentRuntime.cache_ttl_s = 1800s). Without it the
+# pool lives forever, so one lost bus event would be permanent staleness.
+_POOL_TTL_S = 1800.0
 
 # Provider handed to the agent builder: tenant_id -> that tenant's remote pool.
 TenantMcpPoolProvider = Callable[[UUID], Awaitable[MCPServerPool]]
@@ -72,11 +78,14 @@ class TenantMcpPoolService:
         store: TenantMcpServerStore,
         secret_store: SecretStore | None,
         client_factory: McpClientFactory,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._secret_store = secret_store
         self._client_factory = client_factory
-        self._pools: dict[UUID, MCPServerPool] = {}
+        self._clock = clock  # injectable monotonic time (tests)
+        # tenant_id -> (pool, built_at monotonic stamp for the TTL backstop)
+        self._pools: dict[UUID, tuple[MCPServerPool, float]] = {}
         self._locks_guard = asyncio.Lock()  # guards _pools + _tenant_locks + _generation
         self._tenant_locks: dict[UUID, asyncio.Lock] = {}
         self._generation: dict[UUID, int] = {}
@@ -116,7 +125,19 @@ class TenantMcpPoolService:
             async with lock:
                 cached = self._pools.get(tenant_id)
                 if cached is not None:
-                    return cached
+                    cached_pool, built_at = cached
+                    if self._clock() - built_at < _POOL_TTL_S:
+                        return cached_pool
+                    # TTL backstop (PR-E3a): expired — close + drop exactly
+                    # like ``invalidate`` (the generation bump keeps any
+                    # concurrent build from caching stale data), then rebuild.
+                    async with self._locks_guard:
+                        self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
+                        self._pools.pop(tenant_id, None)
+                    try:
+                        await cached_pool.close_all()
+                    except Exception:
+                        logger.warning("tenant_mcp_pool.expired_close_failed")
                 async with self._locks_guard:
                     gen = self._generation.get(tenant_id, 0)
                 pool = MCPServerPool()
@@ -141,7 +162,7 @@ class TenantMcpPoolService:
                         logger.warning("tenant_mcp_pool.server_build_failed")
                 async with self._locks_guard:
                     if self._generation.get(tenant_id, 0) == gen:
-                        self._pools[tenant_id] = pool
+                        self._pools[tenant_id] = (pool, self._clock())
                         return pool
                     if last_attempt:
                         # Give up retrying — serve this fresh pool uncached
@@ -159,17 +180,17 @@ class TenantMcpPoolService:
         """Close + drop the tenant's cached pool (next build rebuilds it)."""
         async with self._locks_guard:
             self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
-            pool = self._pools.pop(tenant_id, None)
-        if pool is not None:
+            entry = self._pools.pop(tenant_id, None)
+        if entry is not None:
             try:
-                await pool.close_all()
+                await entry[0].close_all()
             except Exception:
                 logger.warning("tenant_mcp_pool.invalidate_close_failed")
 
     async def close_all(self) -> None:
         """Close every cached pool (app shutdown)."""
         async with self._locks_guard:
-            pools = list(self._pools.values())
+            pools = [entry[0] for entry in self._pools.values()]
             self._pools.clear()
             # Bump every known tenant's generation so any in-flight build won't
             # cache a stale pool after shutdown clears the store.

@@ -162,7 +162,8 @@ async def test_invalidation_during_build_is_not_lost() -> None:
     # pool (not a closed, empty one), and that fresh pool IS cached.
     assert served is not None
     assert served.names() == ["github"]  # usable, not an empty closed pool
-    assert svc._pools.get(tid) is served  # rebuilt fresh and cached
+    cached_entry = svc._pools.get(tid)
+    assert cached_entry is not None and cached_entry[0] is served  # rebuilt fresh and cached
 
 
 @pytest.mark.asyncio
@@ -192,3 +193,29 @@ async def test_servers_beyond_cap_are_closed_not_leaked() -> None:
     pool = await svc.get_or_build(tid)
     assert len(pool.names()) == 5  # cap enforced
     assert len(closed) >= 1  # the over-cap client was closed, not leaked
+
+
+@pytest.mark.asyncio
+async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None:
+    """PR-E3a: entries older than 1800s rebuild (old pool closed); younger reuse."""
+    store = InMemoryTenantMcpServerStore()
+    tid = uuid4()
+    await _seed(store, tid, "github")
+    calls: list[str] = []
+    now = {"t": 0.0}
+    svc = TenantMcpPoolService(
+        store=store,
+        secret_store=None,
+        client_factory=_client_factory_spy(calls),
+        clock=lambda: now["t"],
+    )
+    p1 = await svc.get_or_build(tid)
+    now["t"] = 1799.0
+    assert await svc.get_or_build(tid) is p1  # younger than TTL → reused
+    assert calls == ["github"]
+    now["t"] = 1801.0
+    p2 = await svc.get_or_build(tid)
+    assert p2 is not p1  # older than TTL → rebuilt
+    assert calls == ["github", "github"]
+    assert p1.names() == []  # the expired pool was closed (close_all clears clients)
+    assert p2.names() == ["github"]

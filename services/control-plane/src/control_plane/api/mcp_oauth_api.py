@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._authz import console_only, require
 from control_plane.audit import emit as audit_emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.mcp_oauth import (
     McpOAuthError,
     build_authorize_url,
@@ -165,13 +166,21 @@ def _public(record: McpOAuthConnectionRecord) -> dict[str, object]:
 async def _invalidate_user_caches(request: Request, tenant_id: UUID, user_id: str) -> None:
     """Drop the user's OAuth pool + per-user agents so the next run rebuilds.
 
-    Both services are optional (tests may not wire them)."""
+    Both services are optional (tests may not wire them).
+
+    PR-E3a — the eviction is also broadcast on the invalidation bus so peer
+    replicas drop their (tenant, user) pool + build copies too."""
     pool_svc = getattr(request.app.state, "user_mcp_oauth_pool_service", None)
     if pool_svc is not None:
         await pool_svc.invalidate(tenant_id, user_id)
     agent_runtime = getattr(request.app.state, "agent_runtime", None)
     if agent_runtime is not None:
         agent_runtime.invalidate_user(tenant_id, user_id)
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        await bus.publish(
+            InvalidationEvent(kind="user_mcp_oauth", tenant_id=str(tenant_id), user_id=user_id)
+        )
 
 
 def build_mcp_oauth_router() -> APIRouter:

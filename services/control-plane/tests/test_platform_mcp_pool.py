@@ -172,3 +172,25 @@ async def test_close_all_drops_cache() -> None:
     # After close, a fresh build still works (rebuilds from the catalog).
     pool = await svc.get_or_build()
     assert pool.names() == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None:
+    """PR-E3a: entries older than 1800s rebuild (old pool closed); younger reuse."""
+    store = InMemoryMcpConnectorCatalogStore()
+    await _add(store, name="maps")
+    configs: list[MCPServerConfig] = []
+    now = {"t": 0.0}
+    svc = PlatformMcpPoolService(
+        store=store, client_factory=_factory_spy(configs), clock=lambda: now["t"]
+    )
+    p1 = await svc.get_or_build()
+    now["t"] = 1799.0
+    assert await svc.get_or_build() is p1  # younger than TTL → reused
+    assert len(configs) == 1
+    now["t"] = 1801.0
+    p2 = await svc.get_or_build()
+    assert p2 is not p1  # older than TTL → rebuilt
+    assert len(configs) == 2
+    assert p1.names() == []  # the expired pool was closed (close_all clears clients)
+    assert p2.names() == ["maps"]
