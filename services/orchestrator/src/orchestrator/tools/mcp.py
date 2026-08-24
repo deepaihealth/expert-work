@@ -392,9 +392,8 @@ def _lenient_client_session_cls() -> Any:
 
     class LenientClientSession(ClientSession):
         async def _validate_tool_result(self, name: str, result: mcp_types.CallToolResult) -> None:
-            # BUG-12 — deliberate no-op: never raise on missing/invalid
-            # structuredContent (see factory docstring).
-            del name, result
+            """BUG-12 — deliberate no-op: never raise on missing/invalid
+            structuredContent (see factory docstring)."""
 
     return LenientClientSession
 
