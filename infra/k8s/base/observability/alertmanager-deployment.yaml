@@ -1,7 +1,7 @@
-# Alertmanager — P0/P1/P2 routing (receivers are still the placeholder
-# webhooks from the vendored config; real PagerDuty/飞书 endpoints are a
-# deploy-time follow-up). Stateless here: silences/nflog live in the
-# container and reset on restart — acceptable at test-env scale.
+# Alertmanager — P0/P1/P2 routing to the wecom-adapter relay (PROD-2;
+# see alertmanager.yml + wecom-adapter-deployment.yaml). nflog/silences
+# persist on a cloud-disk PVC (alertmanager-pvc.yaml) so a pod restart
+# neither re-fires every active alert into the group nor drops silences.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -21,7 +21,9 @@ spec:
       containers:
         - name: alertmanager
           image: prom/alertmanager:v0.28.0
-          args: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
           ports:
             - name: http
               containerPort: 9093
@@ -35,6 +37,8 @@ spec:
             - name: config
               mountPath: /etc/alertmanager
               readOnly: true
+            - name: data
+              mountPath: /alertmanager
           readinessProbe:
             httpGet:
               path: /-/ready
@@ -54,3 +58,6 @@ spec:
             items:
               - key: alertmanager.yml
                 path: alertmanager.yml
+        - name: data
+          persistentVolumeClaim:
+            claimName: alertmanager-data

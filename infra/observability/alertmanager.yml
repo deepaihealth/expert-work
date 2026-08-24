@@ -24,6 +24,11 @@ route:
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    # P3 / gate-watch(rules 里共 10 条,含 >0 即发的 gate-watch)刻意静音:
+    # 接通 default 之前它们落在空 receiver 里,群里从没见过;直通生产群会
+    # 淹掉 P0-P2(终审 I-1)。要看它们去 Prometheus/Grafana;升级投递另议。
+    - matchers: ['severity=~"P3|gate-watch"']
+      receiver: muted
     - matchers: ['severity="P0"']
       receiver: p0
       group_wait: 0s
@@ -35,8 +40,12 @@ route:
       receiver: p2
 
 receivers:
-  # Catch-all for alerts with no severity label — still delivered (a missing
-  # label is itself a bug worth seeing), tagged "default" by the adapter.
+  # P3 / gate-watch sink — deliberately no webhook_configs.
+  - name: muted
+
+  # True catch-all: alerts with NO severity label — still delivered (a
+  # missing label is itself a bug worth seeing), tagged "default" by the
+  # adapter.
   - name: default
     webhook_configs:
       - url: http://wecom-adapter:8080/alert?channel=default

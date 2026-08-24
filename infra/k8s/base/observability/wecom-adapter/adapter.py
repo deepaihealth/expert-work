@@ -8,11 +8,13 @@ env var、企微 webhook URL(含 key)不能进 git —— 所以中间垫这个 
     adapter → POST $WECOM_WEBHOOK_URL(k8s Secret ``wecom-alert-webhook``)
 
 行为:
-- 每个 channel 一条 markdown 消息(FIRING/RESOLVED 逐条列出);
+- 每个 channel 一条 markdown 消息(FIRING/RESOLVED 逐条列出,带 runbook);
 - p0 且含 firing 时额外发一条 text + @all(企微 markdown 不支持 @);
 - ``WECOM_WEBHOOK_URL`` 未配置 → log-only 降级返 200(集群不红,便于
   企微群建好前先部署;secrets.example.yaml 记了开通步骤);
-- 企微侧失败 → 502,让 Alertmanager 按自身重试语义重投。
+- **首条(markdown)失败 → 502** 让 Alertmanager 重投;**附加消息(@all)失败
+  → 记日志仍 200**(主信息已达,重投只会翻倍);**企微限流 45009 → 记日志
+  返 200**(重投只会加剧限流,丢一条好过雪崩)——终审 M-5/M-6。
 
 部署形态:ConfigMap 脚本 + control-plane 镜像(集群 VPC 够不着 docker.io,
 复用已镜像的 python 运行时,零新镜像)。改这个文件就是改 ConfigMap,随
@@ -71,6 +73,9 @@ def build_messages(channel: str, payload: dict) -> list[dict]:
         starts = alert.get("startsAt")
         if starts:
             line += f"(since {starts})"
+        runbook = annotations.get("runbook_url")
+        if runbook:
+            line += f" [runbook]({runbook})"
         lines.append(line)
     if len(alerts) > MAX_ALERTS_RENDERED:
         lines.append(f"> …另 {len(alerts) - MAX_ALERTS_RENDERED} 条未展开")
@@ -90,8 +95,24 @@ def build_messages(channel: str, payload: dict) -> list[dict]:
     return messages
 
 
+#: 企微群机器人限流(20 条/分)的 errcode——重投只会加剧,按已投递处置。
+WECOM_RATE_LIMITED = 45009
+
+#: 单条 HTTP 超时。Alertmanager 通知预算最低 10s(p0 group_wait 0s 时就是
+#: 10s),两条消息串行必须都塞得进去(终审 M-3)。
+POST_TIMEOUT_S = 4
+
+
+class WecomDeliveryError(RuntimeError):
+    """企微侧拒收(errcode != 0)。"""
+
+    def __init__(self, errcode: int, errmsg: str) -> None:
+        super().__init__(f"wecom errcode={errcode} errmsg={errmsg}")
+        self.errcode = errcode
+
+
 def _post_wecom(url: str, message: dict) -> None:
-    """单条投递;企微侧 HTTP 非 200 或 errcode != 0 时抛异常。"""
+    """单条投递;HTTP 层失败抛原始异常,企微拒收抛 WecomDeliveryError。"""
     if not url.startswith("https://"):
         raise ValueError("WECOM_WEBHOOK_URL must be https://")
     request = urllib.request.Request(  # noqa: S310 — scheme 已在上一行钉死 https
@@ -100,10 +121,11 @@ def _post_wecom(url: str, message: dict) -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+    with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S) as response:  # noqa: S310
         body = json.loads(response.read().decode("utf-8"))
-    if body.get("errcode") != 0:
-        raise RuntimeError(f"wecom errcode={body.get('errcode')} errmsg={body.get('errmsg')}")
+    errcode = body.get("errcode")
+    if errcode != 0:
+        raise WecomDeliveryError(int(errcode or -1), str(body.get("errmsg")))
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -143,21 +165,37 @@ class _Handler(BaseHTTPRequestHandler):
         url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
         if not url:
             log.warning(
-                "WECOM_WEBHOOK_URL unset — log-only mode, dropping %d message(s) for %s: %s",
+                "WECOM_WEBHOOK_URL unset — log-only mode, dropping %d message(s) for %s: %.200s",
                 len(messages),
                 channel,
-                messages[0]["markdown"]["content"][:200],
+                str(messages[0]),
             )
             self._reply(200, b"log-only")
             return
 
-        try:
-            for message in messages:
+        for index, message in enumerate(messages):
+            try:
                 _post_wecom(url, message)
-        except Exception:
-            log.exception("wecom delivery failed for channel=%s", channel)
-            self._reply(502, b"wecom delivery failed")
-            return
+            except WecomDeliveryError as exc:
+                if exc.errcode == WECOM_RATE_LIMITED:
+                    # 限流:重投只会加剧,按已投递处置(丢这条,日志留痕)。
+                    log.warning("wecom rate-limited (45009), dropping channel=%s", channel)
+                    continue
+                if index > 0:
+                    # 附加消息(p0 @all):主 markdown 已达,降级为日志,
+                    # 否则 502 重投会把主消息发两遍。
+                    log.exception("wecom follow-up message failed, channel=%s", channel)
+                    continue
+                log.exception("wecom delivery failed for channel=%s", channel)
+                self._reply(502, b"wecom delivery failed")
+                return
+            except Exception:
+                if index > 0:
+                    log.exception("wecom follow-up message failed, channel=%s", channel)
+                    continue
+                log.exception("wecom delivery failed for channel=%s", channel)
+                self._reply(502, b"wecom delivery failed")
+                return
         self._reply(200, b"delivered")
 
 

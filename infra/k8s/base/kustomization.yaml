@@ -64,6 +64,7 @@ resources:
   - observability/grafana-pvc.yaml
   - observability/alertmanager-deployment.yaml
   - observability/alertmanager-service.yaml
+  - observability/alertmanager-pvc.yaml
   - observability/wecom-adapter-deployment.yaml
   - observability/wecom-adapter-service.yaml
   # W2-PR3 — Langfuse (web/worker + in-cluster ClickHouse; PG/Redis/OSS
