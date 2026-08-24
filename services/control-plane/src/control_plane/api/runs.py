@@ -1083,6 +1083,8 @@ async def spawn_run(
             # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
             delegation_gate=runtime.delegation_gate(),
             tool_replay_safe=built.tool_replay_safe,
+            # BUG-16 — persist the raw Jinja k/v on the system_prompt frame.
+            prompt_inputs=payload.inputs,
         )
     )
     await runtime.run_manager.attach_task(run_id, worker)
