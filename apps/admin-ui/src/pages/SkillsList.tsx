@@ -109,6 +109,9 @@ export function SkillsList() {
   const [statusFilter, setStatusFilter] = useState<SkillStatus | undefined>(undefined);
   const [visibilityFilter, setVisibilityFilter] = useState<SkillVisibility | undefined>(undefined);
   const [categoryFilter, setCategoryFilter] = useState("");
+  // BUG-3:平台技能全激活后列表 50+ 行,靠肉眼扫不现实 —— 名称/描述客户端
+  // 过滤(status/category 走服务端,这个纯前端,零请求)。
+  const [nameFilter, setNameFilter] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -225,10 +228,16 @@ export function SkillsList() {
 
   // Stream X-6 — platform skills render first, then the tenant's own
   // (paginated) skills. Platform rows are read-only in the tenant view.
-  const dataSource = useMemo(
-    () => [...platformItems, ...accumulated],
-    [platformItems, accumulated],
-  );
+  const dataSource = useMemo(() => {
+    const merged = [...platformItems, ...accumulated];
+    const q = nameFilter.trim().toLowerCase();
+    if (q.length === 0) return merged;
+    return merged.filter(
+      (r) =>
+        r.name.toLowerCase().includes(q) ||
+        (r.description ?? "").toLowerCase().includes(q),
+    );
+  }, [platformItems, accumulated, nameFilter]);
 
   const columns: TableColumnsType<SkillRecord> = useMemo(() => [
     {
@@ -405,6 +414,15 @@ export function SkillsList() {
                 {t("skills.cross_tenant_banner")}
               </Tag>
             )}
+            <Input
+              allowClear
+              placeholder={t("skills.filter_name")}
+              value={nameFilter}
+              onChange={(e) => setNameFilter(e.target.value)}
+              style={{ width: 180 }}
+              aria-label={t("skills.filter_name")}
+              data-testid="skills-name-filter"
+            />
             <Select<SkillStatus | "all">
               value={statusFilter ?? "all"}
               onChange={(v) => setStatusFilter(v === "all" ? undefined : (v as SkillStatus))}
@@ -477,7 +495,10 @@ export function SkillsList() {
         dataSource={dataSource}
         rowKey={(r) => `${r.source ?? "tenant"}:${r.id}`}
         loading={loading}
-        pagination={false}
+        // BUG-3:此前 pagination={false} 让 50+ 行平铺成墙 —— 客户端分页
+        // 20/页(单页时自动隐藏,小库无感);「加载更多」继续供服务端游标
+        // 追加租户自有技能。
+        pagination={{ pageSize: 20, showSizeChanger: false, hideOnSinglePage: true }}
         onRow={(record) =>
           // Platform rows are read-only in the tenant scope — a tenant
           // ``getSkill(id)`` would 404, so don't navigate. Bind via the

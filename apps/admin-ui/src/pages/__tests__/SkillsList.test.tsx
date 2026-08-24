@@ -821,3 +821,66 @@ describe("SkillDetail (PR C)", () => {
     expect(pin).toBeDisabled();
   });
 });
+
+// ─── BUG-3(2026-08-24)分页 + 名称过滤 ───────────────────────────────
+
+describe("SkillsList pagination & name filter (BUG-3)", () => {
+  it("paginates the merged list at 20 rows per page", async () => {
+    const platformItems = Array.from({ length: 25 }, (_, i) => ({
+      ...skillRow,
+      id: `p${i}`,
+      name: `platform-skill-${i}`,
+      source: "platform",
+      entitled: true,
+      subscribed: false,
+    }));
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({
+          items: [],
+          platform_items: platformItems,
+          next_cursor: null,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    renderSkillsRouter();
+    await screen.findByTestId("skills-table");
+    await waitFor(() => {
+      expect(screen.getByText("platform-skill-0")).toBeInTheDocument();
+    });
+    // 第 21 条不在第一页。
+    expect(screen.queryByText("platform-skill-20")).not.toBeInTheDocument();
+    // antd 分页器出现(>1 页才渲染,hideOnSinglePage)。
+    expect(document.querySelector(".ant-pagination")).not.toBeNull();
+  });
+
+  it("filters rows by name client-side", async () => {
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({
+          items: [
+            skillRow,
+            { ...skillRow, id: "sk2", name: "pdf_export", description: "Export PDF files." },
+          ],
+          next_cursor: null,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderSkillsRouter();
+    await screen.findByText("web_search");
+    expect(screen.getByText("pdf_export")).toBeInTheDocument();
+
+    await user.type(screen.getByTestId("skills-name-filter"), "pdf");
+    await waitFor(() => {
+      expect(screen.queryByText("web_search")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("pdf_export")).toBeInTheDocument();
+  });
+});

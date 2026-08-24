@@ -2451,6 +2451,7 @@ const zhCN: TranslationKeys = {
     filter_status: "状态筛选",
     filter_status_all: "全部状态",
     filter_category: "分类",
+    filter_name: "搜索名称/描述",
     load_more: "加载更多",
     create: "新建",
     create_modal_title: "新建技能(空草稿)",
