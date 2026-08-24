@@ -441,13 +441,16 @@ export function McpToolPicker({
                     <Text
                       type="secondary"
                       title={tool.description}
+                      // 两行 clamp(SkillPicker BUG-6 同款):比单行截断少
+                      // 依赖 hover;title 兜长文。不用 antd ellipsis prop——
+                      // 它的多行形态要 tooltip 配置,正是 BUG-15 摘掉的遮挡层。
                       style={{
-                        display: "block",
+                        display: "-webkit-box",
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: "vertical",
                         fontSize: 12,
                         maxWidth: 480,
-                        whiteSpace: "nowrap",
                         overflow: "hidden",
-                        textOverflow: "ellipsis",
                       }}
                     >
                       {tool.description}

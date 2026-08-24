@@ -288,8 +288,11 @@ function systemRowOf(events: readonly SseEvent[]): SystemRow | null {
 }
 
 /** BUG-16 — the jinja prompt-variable k/v the backend rides on the
- *  ``system_prompt`` frame (``data.inputs``). Strict shape check: anything
- *  but a flat string→string object (old frames, hostile data) → null. */
+ *  ``system_prompt`` frame (``data.inputs``). The backend contract admits
+ *  non-string values (``RunRequest.inputs: dict[str, Any]``, 终审 F1), so
+ *  primitives are coerced to their display string per entry — one odd value
+ *  must not hide the whole map. Non-primitive values (objects/arrays) skip
+ *  just their own entry. */
 export function promptInputsOf(data: unknown): Record<string, string> | null {
   if (data === null || typeof data !== "object") return null;
   const raw = (data as { inputs?: unknown }).inputs;
@@ -298,8 +301,8 @@ export function promptInputsOf(data: unknown): Record<string, string> | null {
   }
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof v !== "string") return null;
-    out[k] = v;
+    if (typeof v === "string") out[k] = v;
+    else if (typeof v === "number" || typeof v === "boolean") out[k] = String(v);
   }
   return Object.keys(out).length > 0 ? out : null;
 }

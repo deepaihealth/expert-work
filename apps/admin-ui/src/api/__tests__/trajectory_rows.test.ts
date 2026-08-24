@@ -356,7 +356,8 @@ describe("promptInputsOf (BUG-16)", () => {
     expect(promptInputsOf({ text: "p", inputs: { a: "1" } })).toEqual({ a: "1" });
     expect(promptInputsOf({ text: "p" })).toBeNull();
     expect(promptInputsOf({ inputs: {} })).toBeNull();
-    expect(promptInputsOf({ inputs: { a: 1 } })).toBeNull();
+    expect(promptInputsOf({ inputs: { a: 1 } })).toEqual({ a: "1" });
+    expect(promptInputsOf({ inputs: { a: "x", n: 3, b: true, o: { x: 1 } } })).toEqual({ a: "x", n: "3", b: "true" });
     expect(promptInputsOf({ inputs: ["a"] })).toBeNull();
     expect(promptInputsOf(null)).toBeNull();
   });

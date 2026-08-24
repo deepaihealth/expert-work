@@ -352,8 +352,9 @@ class RecordingMCPClient:
         self.closed = True
 
 
-async def _call_tool_unvalidated(session: Any, name: str, args: dict[str, Any]) -> Any:
-    """Send a ``tools/call`` request, bypassing the SDK's output-schema check.
+def _lenient_client_session_cls() -> Any:
+    """The :class:`mcp.ClientSession` subclass every transport constructs —
+    identical wire behavior, with the output-schema validation neutered.
 
     BUG-12 (真栈事故 2026-08-24): the deep-ai-health MCP server declares an
     ``outputSchema`` on its tools but only returns text ``content`` (no
@@ -362,33 +363,40 @@ async def _call_tool_unvalidated(session: Any, name: str, args: dict[str, Any]) 
     ``RuntimeError: Tool xxx has an output schema but did not return
     structured content`` — killing every tool call against that server.
 
-    This helper replicates only the *send* half of the SDK's ``call_tool``
-    (see ``mcp/client/session.py``) and skips the validation:
+    Overriding the single private validation hook (rather than hand-copying
+    the send half of ``call_tool``, 终审 F5) keeps the SDK's canonical send
+    path AND makes the bypass the default for every present and future call
+    site — nothing can reintroduce the incident by calling
+    ``session.call_tool`` directly.
 
-    - **Why not "catch the RuntimeError and resend"**: the validation fires
-      *after* the server has already executed the tool. Re-sending the
-      request would execute a non-idempotent tool twice (e.g. create a
-      record, send a message).
     - **Why skipping validation is lossless**: the platform only consumes
       ``result.content`` text blocks (:func:`_render_content_blocks`);
-      ``structuredContent`` has no consumer anywhere, so the check has
-      only blast radius and zero benefit here.
-    - **X-11 (mcp 2.x migration)**: re-verify the ``send_request`` /
-      ``ClientRequest`` / ``CallToolRequest`` shapes against the new SDK
-      before bumping — this helper is coupled to the 1.x wire API.
+      ``structuredContent`` has no consumer anywhere, so the check has only
+      blast radius and zero benefit here.
+    - **X-11 (mcp 2.x migration)**: the ``assert`` below fails loudly at
+      construction if the SDK renames/removes the private hook — re-verify
+      the override point before bumping.
     """
     # Lazy import — module top must stay SDK-free (existing convention:
     # orchestrator imports fine in contexts without the mcp SDK).
+    from mcp import ClientSession
     from mcp import types as mcp_types
 
-    return await session.send_request(
-        mcp_types.ClientRequest(
-            mcp_types.CallToolRequest(
-                params=mcp_types.CallToolRequestParams(name=name, arguments=args),
-            )
-        ),
-        mcp_types.CallToolResult,
-    )
+    if not hasattr(ClientSession, "_validate_tool_result"):
+        msg = (
+            "mcp SDK no longer has ClientSession._validate_tool_result — the "
+            "BUG-12 lenient bypass must be re-verified against this SDK "
+            "version (X-11)."
+        )
+        raise RuntimeError(msg)
+
+    class LenientClientSession(ClientSession):
+        async def _validate_tool_result(self, name: str, result: mcp_types.CallToolResult) -> None:
+            # BUG-12 — deliberate no-op: never raise on missing/invalid
+            # structuredContent (see factory docstring).
+            del name, result
+
+    return LenientClientSession
 
 
 @dataclass
@@ -414,8 +422,10 @@ class StdioMCPClient:
         # Imports kept local so the orchestrator can be imported in
         # contexts where the mcp SDK isn't available (e.g. middleware-
         # only unit tests with no MCP wiring).
-        from mcp import ClientSession, StdioServerParameters
+        from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client
+
+        session_cls = _lenient_client_session_cls()
 
         if self._stack is not None:
             msg = f"StdioMCPClient {self.config.name!r} already started"
@@ -437,7 +447,7 @@ class StdioMCPClient:
         await stack.__aenter__()
         try:
             read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
+            session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
         except BaseException:
             await stack.__aexit__(None, None, None)
@@ -465,7 +475,7 @@ class StdioMCPClient:
         # subprocess must not hang the agent run indefinitely (audit #7).
         try:
             result = await asyncio.wait_for(
-                _call_tool_unvalidated(self._session, name, dict(args)),
+                self._session.call_tool(name, dict(args)),
                 timeout=self.config.timeout_s,
             )
         except TimeoutError as exc:
@@ -518,7 +528,7 @@ class _RemoteMCPClientBase:
         # Imports kept local so orchestrator can be imported in contexts
         # that don't have the mcp SDK on the path (e.g. middleware-only
         # unit tests with no MCP wiring).
-        from mcp import ClientSession
+        session_cls = _lenient_client_session_cls()
 
         if self._stack is not None:
             msg = f"{type(self).__name__} {self.config.name!r} already started"
@@ -527,7 +537,7 @@ class _RemoteMCPClientBase:
         await stack.__aenter__()
         try:
             read, write = await self._open_streams(stack)
-            session = await stack.enter_async_context(ClientSession(read, write))
+            session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
         except BaseException:
             await stack.__aexit__(None, None, None)
@@ -561,7 +571,7 @@ class _RemoteMCPClientBase:
             raise MCPServerUnhealthyError(msg)
         try:
             result = await asyncio.wait_for(
-                _call_tool_unvalidated(self._session, name, dict(args)),
+                self._session.call_tool(name, dict(args)),
                 timeout=self.config.timeout_s,
             )
         except TimeoutError as exc:

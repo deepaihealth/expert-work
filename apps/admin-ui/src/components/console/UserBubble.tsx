@@ -45,7 +45,17 @@ export function UserBubble({ input, attachments, inputs }: UserBubbleProps) {
         {attachments.length > 0 && (
           <div style={{ marginTop: 4 }}>
             {attachments.map((a) => (
-              <Tag key={a.id} bordered={false} style={{ fontSize: 11 }}>
+              // 终审 F2 — antd Tag 默认近黑文字在品牌深蓝底上 ~2.8:1,半透明
+              // 白底白字两主题都可读。
+              <Tag
+                key={a.id}
+                bordered={false}
+                style={{
+                  fontSize: 11,
+                  background: "rgba(255,255,255,0.22)",
+                  color: "#fff",
+                }}
+              >
                 {a.name}
               </Tag>
             ))}

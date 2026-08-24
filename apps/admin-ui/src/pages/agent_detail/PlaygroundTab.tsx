@@ -375,8 +375,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     (turn: Turn) => {
       if (running) return;
       setInput(turn.input);
+      // 终审 F3 — 整表替换而非合并:重试要复现「当年那次」的变量组合,
+      // 当前面板里多出来的键不能捎带进去;老 run 无帧数据则不动现值。
       if (turn.inputs && Object.keys(turn.inputs).length > 0) {
-        setVarValues((prev) => ({ ...prev, ...turn.inputs }));
+        setVarValues({ ...turn.inputs });
       }
     },
     [running],

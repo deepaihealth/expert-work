@@ -323,7 +323,7 @@ async def run_agent(
     worker_spawn_budget: WorkerSpawnBudget | None = None,
     delegation_gate: DelegationGate | None = None,
     token_budget: int = 0,
-    prompt_inputs: Mapping[str, str] | None = None,
+    prompt_inputs: Mapping[str, Any] | None = None,
 ) -> None:
     """Drive ``graph`` to completion, publishing events to ``bridge``.
 

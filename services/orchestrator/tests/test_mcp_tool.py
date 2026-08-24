@@ -533,7 +533,7 @@ class _RaisingSession:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
+    async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
         self.calls += 1
         raise ConnectionError("server down")
 
@@ -587,7 +587,7 @@ async def test_remote_client_circuit_half_open_recovers() -> None:
     import types
 
     class _OkSession:
-        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
+        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
             return types.SimpleNamespace(content=[], isError=False)
 
     client._session = _OkSession()  # type: ignore[attr-defined]
@@ -612,7 +612,7 @@ async def test_stdio_call_tool_times_out() -> None:
     )
 
     class _SlowSession:
-        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
+        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
             await asyncio.sleep(1.0)
 
     client._session = _SlowSession()  # type: ignore[attr-defined]
@@ -626,33 +626,32 @@ async def test_stdio_call_tool_times_out() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_bypasses_sdk_validation() -> None:
-    """Both production clients must send via ``send_request`` directly and
-    never route through ``session.call_tool`` — the SDK's built-in
-    ``_validate_tool_result`` kills every call against a server that
-    declares ``outputSchema`` but returns only text content."""
+async def test_lenient_session_neuters_output_schema_validation() -> None:
+    """BUG-12 (终审 F5 重构) — every transport constructs
+    ``LenientClientSession``: the SDK's canonical send path is kept, and the
+    single private validation hook ``_validate_tool_result`` is a no-op, so a
+    server that declares ``outputSchema`` but returns only text content no
+    longer kills the call. The class-construction assert also pins the hook's
+    existence against an X-11 SDK bump."""
+    from mcp import ClientSession
     from mcp import types as mcp_types
 
-    from orchestrator.tools.mcp import SseMCPClient, StdioMCPClient
+    from orchestrator.tools.mcp import _lenient_client_session_cls
 
-    class _ValidatingSession:
-        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
-            raise RuntimeError("Tool t has an output schema but did not return structured content")
+    lenient_cls = _lenient_client_session_cls()
+    assert issubclass(lenient_cls, ClientSession)
 
-        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
-            return mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(type="text", text="plain text ok")],
-                isError=False,
-            )
+    # The SDK's own hook raises on this result; the lenient override must not.
+    result = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text="plain text ok")],
+        isError=False,
+    )
+    # Unbound-call the two hooks on a bare instance — the override reads no
+    # session state, and the SDK original consults _tool_output_schemas which
+    # we seed to force the "schema declared, no structured content" branch.
+    bare = object.__new__(lenient_cls)
+    bare._tool_output_schemas = {"t": {"type": "object"}}
+    await lenient_cls._validate_tool_result(bare, "t", result)  # no raise
 
-    remote = SseMCPClient(config=MCPServerConfig(name="b", transport="sse", url="https://x/y"))
-    remote._session = _ValidatingSession()  # type: ignore[attr-defined]
-    result = await remote.call_tool("t", {"k": "v"})
-    assert result.is_error is False
-    assert result.content == "plain text ok"
-
-    stdio = StdioMCPClient(config=MCPServerConfig(name="b2", transport="stdio", command=["echo"]))
-    stdio._session = _ValidatingSession()  # type: ignore[attr-defined]
-    result = await stdio.call_tool("t", {"k": "v"})
-    assert result.is_error is False
-    assert result.content == "plain text ok"
+    with pytest.raises(RuntimeError, match="did not return structured content"):
+        await ClientSession._validate_tool_result(bare, "t", result)
