@@ -580,6 +580,12 @@ describe("ConversationDetail", () => {
       expect(await screen.findByTestId("plan-read-view")).toBeInTheDocument();
       expect(screen.getByText("ship the refund")).toBeInTheDocument();
       expect(screen.queryByTestId("plan-edit")).not.toBeInTheDocument();
+      // BUG-13 — 计划卡置顶:必须渲染在视图切换(消息区)之前,不再吊在尾部。
+      const planCard = screen.getByTestId("plan-read-view");
+      const viewTabs = screen.getByTestId("console-view-tabs");
+      expect(
+        planCard.compareDocumentPosition(viewTabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
     });
 
     it("replays a run when its row scrolls into view and renders the tool call", async () => {

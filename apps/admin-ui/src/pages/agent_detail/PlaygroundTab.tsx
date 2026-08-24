@@ -367,12 +367,17 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     [startRun],
   );
 
-  // #10 — history-turn retry: a past run's enqueued inputs live in the
-  // checkpoint (not exposed yet), so retry only backfills the input box.
+  // #10 — history-turn retry backfills the input box; BUG-16 — the jinja
+  // inputs now replay from the run's system_prompt frame (console_turns
+  // extracts them onto ``turn.inputs``), so backfill the variables too.
+  // Old runs without frame data leave the current values untouched.
   const handleHistoryRetry = useCallback(
     (turn: Turn) => {
       if (running) return;
       setInput(turn.input);
+      if (turn.inputs && Object.keys(turn.inputs).length > 0) {
+        setVarValues((prev) => ({ ...prev, ...turn.inputs }));
+      }
     },
     [running],
   );

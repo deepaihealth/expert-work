@@ -426,19 +426,35 @@ export function McpToolPicker({
             </Text>
           ) : (
             shown.map((tool) => (
-              <Tooltip
+              // BUG-15 — 描述从 hover Tooltip 改为行内单行截断:窄弹窗里
+              // Tooltip 会翻转盖住相邻工具名;hover title 仍可看全文。
+              <Checkbox
                 key={tool.name}
-                title={tool.description || undefined}
-                placement="right"
+                data-testid={`af-mcp-tool-${tool.name}`}
+                checked={allowTools.includes(tool.name)}
+                onChange={(e) => toggleTool(tool.name, e.target.checked)}
+                style={{ display: "flex", alignItems: "flex-start" }}
               >
-                <Checkbox
-                  data-testid={`af-mcp-tool-${tool.name}`}
-                  checked={allowTools.includes(tool.name)}
-                  onChange={(e) => toggleTool(tool.name, e.target.checked)}
-                >
+                <span style={{ minWidth: 0, display: "block" }}>
                   <Text style={{ fontSize: 13 }}>{tool.name}</Text>
-                </Checkbox>
-              </Tooltip>
+                  {tool.description && (
+                    <Text
+                      type="secondary"
+                      title={tool.description}
+                      style={{
+                        display: "block",
+                        fontSize: 12,
+                        maxWidth: 480,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {tool.description}
+                    </Text>
+                  )}
+                </span>
+              </Checkbox>
             ))
           )}
         </div>

@@ -285,6 +285,22 @@ export function RecordDetails(props: RecordDetailsProps) {
             {t("console.detail_system_chars", { n: row.text.length })}
           </DetailRow>
         )}
+        {/* BUG-16 — 该 run 派发时的动态 Prompt 入参(后端捎带在
+            system_prompt 帧;老 run 无此数据则不渲染)。 */}
+        {row.kind === "system" && row.inputs != null && (
+          <DetailRow label={t("console.detail_prompt_inputs")}>
+            <div
+              data-testid="console-system-inputs"
+              style={{ fontFamily: "var(--ew-font-mono)", fontSize: 12 }}
+            >
+              {Object.entries(row.inputs).map(([k, v]) => (
+                <div key={k} style={{ overflowWrap: "anywhere" }}>
+                  {k}={v}
+                </div>
+              ))}
+            </div>
+          </DetailRow>
+        )}
         {threadId !== null && record.runId !== null && (
           <DetailRow label={t("console.detail_run")}>
             <Link data-testid="console-inspect-run-link" to={`/runs/${threadId}/${record.runId}`}>

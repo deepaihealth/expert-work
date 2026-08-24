@@ -172,6 +172,21 @@ describe("McpToolPicker", () => {
     ).toBeInTheDocument();
   });
 
+  it("tool rows show the description inline instead of a hover tooltip (BUG-15)", async () => {
+    const user = userEvent.setup();
+    availableMock.mockResolvedValue([{ name: "amap-maps", source: "platform" }]);
+    toolsMock.mockResolvedValue([
+      { name: "maps_geo", description: "把地址解析成经纬度坐标" },
+    ]);
+    render(
+      <McpToolPicker servers={["amap-maps"]} allowTools={[]} onChange={vi.fn()} />,
+    );
+    await user.click(await screen.findByTestId("af-mcp-choose-amap-maps"));
+    await screen.findByTestId("af-mcp-tool-maps_geo");
+    // 描述直接可见(不再依赖 hover Tooltip 的悬浮层遮挡列表)。
+    expect(screen.getByText("把地址解析成经纬度坐标")).toBeInTheDocument();
+  });
+
   it("select-all adds every tool of the server to allow_tools", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

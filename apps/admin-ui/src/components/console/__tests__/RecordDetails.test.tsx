@@ -133,7 +133,7 @@ function subagentRow(over: Partial<SubagentRow> = {}): SubagentRow {
 
 function systemRow(text: string): SystemRow {
   return {
-    id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null,
+    id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null, inputs: null,
     eventIndexes: [1], serverMs: 1001, text,
   };
 }
@@ -672,6 +672,20 @@ describe("Schema tab (PR-A.3 §十.2)", () => {
 // "en",不是 zh-CN;别的既有用例同样断言英文文案,如 "Turn not replayed yet"),
 // 所以 tab 文案与 brief 示例的中文不同,这里按本文件实际渲染的英文断言。
 describe("SYSTEM record (PR-A.3 §十.1)", () => {
+  it("summary lists the jinja prompt inputs when the frame carried them (BUG-16)", () => {
+    renderRecord({
+      record: rec({ ...systemRow("你是评审员"), inputs: { project_code: "p1", employee_name: "王" } }),
+    });
+    const box = screen.getByTestId("console-system-inputs");
+    expect(box.textContent).toContain("project_code=p1");
+    expect(box.textContent).toContain("employee_name=王");
+  });
+
+  it("no inputs on the frame → no inputs row (old runs)", () => {
+    renderRecord({ record: rec(systemRow("你是评审员")) });
+    expect(screen.queryByTestId("console-system-inputs")).not.toBeInTheDocument();
+  });
+
   it("tabs 概要 / 原文 / 原始;summary shows char count;原文 shows the full prompt", async () => {
     renderRecord({ record: rec(systemRow("你是评审员\n只说重点")) });
     expect(screen.getAllByRole("tab").map((t) => t.textContent)).toEqual([

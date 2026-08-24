@@ -12,6 +12,7 @@ import type { ApprovalItem } from "../../api/approvals";
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
 import { NON_TERMINAL_RUN_STATUSES } from "../../api/runs";
+import { promptInputsOf } from "../../api/trajectory_rows";
 import { approvalItemFromEvent } from "../turn/approval_item";
 import type { HistoryLoad, HistoryTurn, Turn } from "../turn/types";
 import type { ConsoleTurn, TurnTiming } from "./types";
@@ -86,6 +87,12 @@ export function buildConsoleTurns(args: {
         id: h.key,
         input: h.input,
         attachments: [],
+        // BUG-16 — 历史轮的 jinja 入参从回放的 system_prompt 帧还原
+        // (live 轮在 useRunEngine 派发时就带;老 run 无帧数据 → undefined)。
+        inputs:
+          promptInputsOf(
+            load.events.find((e) => e.event === "system_prompt")?.data ?? null,
+          ) ?? undefined,
         events: load.events,
         // BUG-9 — ``interrupted`` (user cancel / stream break) must keep its
         // identity: mapping it to "done" rendered a cancelled run as

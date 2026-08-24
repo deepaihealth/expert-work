@@ -643,6 +643,11 @@ export function ConversationDetail() {
                   <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
                 </div>
               )}
+              {/* BUG-13 — 计划卡置顶:原来吊在消息区尾部像孤儿(调试台里它
+                  贴着输入框所以在底部合理,本页没有输入框)。 */}
+              <div style={{ marginBottom: 8 }}>
+                <PlanCard plan={plan} loaded={planLoaded} running={runInFlight} readOnly />
+              </div>
               <Segmented
                 value={view}
                 onChange={(value) => setView(value as ConsoleView)}
@@ -707,9 +712,6 @@ export function ConversationDetail() {
                     onEnsureLoaded={handleEnsureLoaded}
                   />
                 </ViewPane>
-              </div>
-              <div style={{ marginTop: 12 }}>
-                <PlanCard plan={plan} loaded={planLoaded} running={runInFlight} readOnly />
               </div>
             </>
           ) : messages === null || messages.length === 0 ? (

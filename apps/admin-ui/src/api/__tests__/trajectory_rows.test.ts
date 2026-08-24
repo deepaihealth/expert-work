@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, ledgerRowsOf, resolveGanttKey, type AssistantRow } from "../trajectory_rows";
+import { compactRowsOf, ledgerRowsOf, promptInputsOf, resolveGanttKey, type AssistantRow } from "../trajectory_rows";
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
@@ -347,5 +347,17 @@ describe("ledgerRowsOf — SYSTEM row (PR-A.3 §十.1)", () => {
     ];
     const assistant = ledgerRowsOf(events, input).find((r) => r.kind === "assistant");
     expect(assistant).toMatchObject({ kind: "assistant", firstTokenMs: 640 });
+  });
+});
+
+
+describe("promptInputsOf (BUG-16)", () => {
+  it("accepts a flat string map and rejects everything else", () => {
+    expect(promptInputsOf({ text: "p", inputs: { a: "1" } })).toEqual({ a: "1" });
+    expect(promptInputsOf({ text: "p" })).toBeNull();
+    expect(promptInputsOf({ inputs: {} })).toBeNull();
+    expect(promptInputsOf({ inputs: { a: 1 } })).toBeNull();
+    expect(promptInputsOf({ inputs: ["a"] })).toBeNull();
+    expect(promptInputsOf(null)).toBeNull();
   });
 });

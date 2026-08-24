@@ -1378,6 +1378,7 @@ const zhCN: TranslationKeys = {
     timeline_tip_ttft: "首 token {{d}}",
     detail_first_token: "首 token",
     detail_system_prompt: "系统提示词",
+    detail_prompt_inputs: "动态入参",
     detail_system_chars: "{{n}} 字",
   },
   playground: {

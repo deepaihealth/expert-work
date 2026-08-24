@@ -29,17 +29,19 @@ export function UserBubble({ input, attachments, inputs }: UserBubbleProps) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
       <div
+        // BUG-14 — 用户气泡上品牌色:原来与 AI 内容同底色,左右对齐是唯一
+        // 区分,扫一眼分不出谁说的。brand-500 深底白字在明暗两主题都成立。
         style={{
           maxWidth: "85%",
           padding: "6px 10px",
           borderRadius: 8,
           fontSize: 13,
           whiteSpace: "pre-wrap",
-          background: "var(--ew-surface-raised)",
-          border: "1px solid var(--ew-border-subtle)",
+          background: "var(--ew-color-brand-500)",
+          color: "#fff",
         }}
       >
-        <Text style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{input}</Text>
+        <Text style={{ whiteSpace: "pre-wrap", fontSize: 13, color: "inherit" }}>{input}</Text>
         {attachments.length > 0 && (
           <div style={{ marginTop: 4 }}>
             {attachments.map((a) => (
