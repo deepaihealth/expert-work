@@ -206,8 +206,10 @@ class InvalidationBus:
         self._pending.clear()
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+            # ``gather`` rather than a bare ``await self._task``: it swallows
+            # the CancelledError the cancel just raised, and reads as an
+            # effectful call (CodeQL flags bare-name awaits as no-op statements).
+            await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
 
 

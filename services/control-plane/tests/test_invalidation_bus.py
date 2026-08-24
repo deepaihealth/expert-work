@@ -427,6 +427,21 @@ async def test_agent_build_kind_handlers_hit_runtime() -> None:
     assert runtime.user_calls == [(tid, "emp-2")]
 
 
+@pytest.mark.asyncio
+async def test_stop_awaits_the_subscriber_before_returning() -> None:
+    """``stop`` must not return while the subscriber is still unwinding: the
+    app's exit stack closes the Redis client immediately after, and a detached
+    task would then keep reading from a closed connection."""
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    bus.start({})
+    await asyncio.sleep(0)  # let the subscriber task reach its first await
+    task = bus._task
+    assert task is not None
+    await bus.stop()
+    assert task.done()
+
+
 def test_kinds_constant_matches_the_wired_handlers() -> None:
     """``KINDS`` is the documented event vocabulary; the handler table is what
     the subscriber actually dispatches. A kind added to one and not the other
