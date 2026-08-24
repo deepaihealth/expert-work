@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenancy.tenant_config import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
@@ -190,6 +191,10 @@ def _get_mcp_probe_limiter(request: Request) -> object:  # type: ignore[no-untyp
     return getattr(request.app.state, "mcp_probe_limiter", None)
 
 
+def _get_invalidation_bus(request: Request) -> object:  # type: ignore[no-untyped-def]
+    return getattr(request.app.state, "invalidation_bus", None)
+
+
 async def _enforce_probe_rate_limit(limiter: object, tenant_id: UUID) -> None:
     """Charge the dedicated MCP-probe bucket (audit #6); 429 on exhaustion.
 
@@ -215,18 +220,25 @@ async def _enforce_probe_rate_limit(limiter: object, tenant_id: UUID) -> None:
 
 
 async def _invalidate_tenant_mcp(
-    pool_service: object, agent_runtime: object, tenant_id: UUID
+    pool_service: object, agent_runtime: object, tenant_id: UUID, bus: object = None
 ) -> None:
     """Invalidate the tenant's MCP pool cache + any cached built-agents (Stream V-D).
 
     Called after each successful registry mutation (POST/PATCH/DELETE) so the
     next agent build picks up the changed server list. Both services are optional
     so existing tests that don't wire them continue to pass.
+
+    PR-E3a — the local eviction is also broadcast on the invalidation bus so
+    peer replicas drop their pool + built-agent copies (``None`` when unwired).
     """
     if pool_service is not None:
         await pool_service.invalidate(tenant_id)  # type: ignore[attr-defined]
     if agent_runtime is not None:
         agent_runtime.invalidate_tenant(tenant_id)  # type: ignore[attr-defined]
+    if bus is not None:
+        await bus.publish(  # type: ignore[attr-defined]
+            InvalidationEvent(kind="tenant_mcp", tenant_id=str(tenant_id))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +420,7 @@ def build_mcp_servers_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
         tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
         probe_limiter: Annotated[object, Depends(_get_mcp_probe_limiter)],
     ) -> dict[str, object]:
@@ -542,7 +555,7 @@ def build_mcp_servers_router() -> APIRouter:
                 "tool_count": len(tools),
             },  # NEVER include the token
         )
-        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
         return {
             "success": True,
             "data": {**_public(record), "tool_count": len(tools)},
@@ -591,6 +604,7 @@ def build_mcp_servers_router() -> APIRouter:
         tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         """Tenant opts into a platform shared server (adds it to mcp_allowlist).
@@ -640,7 +654,16 @@ def build_mcp_servers_router() -> APIRouter:
                 },
             ) from exc
         if changed:
-            await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+            await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
+            # PR-E3a — the allowlist lives on tenant_config, a BUILD-TIME
+            # input: peer replicas must also drop their 60s config cache, or
+            # their freshly-evicted agent rebuild bakes the stale allowlist
+            # for another 1800s (the "run 2s after enable lacked the tool"
+            # incident). The tenant_config handler drops config + builds.
+            if bus is not None:
+                await bus.publish(  # type: ignore[attr-defined]
+                    InvalidationEvent(kind="tenant_config", tenant_id=str(tenant_id))
+                )
             await emit(
                 audit,
                 tenant_id=tenant_id,
@@ -665,6 +688,7 @@ def build_mcp_servers_router() -> APIRouter:
         tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         """Tenant opts out of a platform shared server (removes it from
@@ -691,7 +715,13 @@ def build_mcp_servers_router() -> APIRouter:
         except TenantConfigNotConfiguredError:
             changed = False
         if changed:
-            await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+            await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
+            # PR-E3a — same as the enable side: the allowlist is tenant_config,
+            # so peers must drop config cache + builds together.
+            if bus is not None:
+                await bus.publish(  # type: ignore[attr-defined]
+                    InvalidationEvent(kind="tenant_config", tenant_id=str(tenant_id))
+                )
             await emit(
                 audit,
                 tenant_id=tenant_id,
@@ -978,6 +1008,7 @@ def build_mcp_servers_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
     ) -> dict[str, object]:
         tenant_id = principal.tenant_id
         existing = await store.get(tenant_id=tenant_id, name=name)
@@ -1095,7 +1126,7 @@ def build_mcp_servers_router() -> APIRouter:
             trace_id=current_trace_id_hex(),
             details={"name": record.name, "url": record.url, "enabled": record.enabled},
         )
-        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.delete("/{name}", status_code=200)
@@ -1107,6 +1138,7 @@ def build_mcp_servers_router() -> APIRouter:
         agent_spec_store: Annotated[object, Depends(_get_agent_spec_store)],
         pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
     ) -> dict[str, object]:
         tenant_id = principal.tenant_id
@@ -1195,7 +1227,7 @@ def build_mcp_servers_router() -> APIRouter:
             trace_id=current_trace_id_hex(),
             details={"name": name, "implicit_all_agents": implicit_all},
         )
-        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
+        await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
         return {
             "success": True,
             "data": {"implicit_all_agents": implicit_all},

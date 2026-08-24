@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
 from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
@@ -85,18 +86,29 @@ def _get_agent_runtime(request: Request) -> object:  # type: ignore[no-untyped-d
     return getattr(request.app.state, "agent_runtime", None)
 
 
-async def _invalidate_platform_mcp(pool_service: object, agent_runtime: object) -> None:
+def _get_invalidation_bus(request: Request) -> object:  # type: ignore[no-untyped-def]
+    return getattr(request.app.state, "invalidation_bus", None)
+
+
+async def _invalidate_platform_mcp(
+    pool_service: object, agent_runtime: object, bus: object = None
+) -> None:
     """Rebuild the platform shared pool + evict every cached agent (P1b).
 
     A catalog create / update / delete changes the process-global platform
     shared MCP pool, which feeds every tenant's build — so the pool is dropped
     (next build rebuilds from the catalog) and every cached built-agent is
     invalidated across all tenants.
+
+    PR-E3a — the local eviction is also broadcast on the invalidation bus so
+    peer replicas drop their pool + built-agent copies (``None`` when unwired).
     """
     if pool_service is not None:
         await pool_service.invalidate()  # type: ignore[attr-defined]
     if agent_runtime is not None:
         agent_runtime.invalidate_all()  # type: ignore[attr-defined]
+    if bus is not None:
+        await bus.publish(InvalidationEvent(kind="platform_mcp"))  # type: ignore[attr-defined]
 
 
 def _bearer_secret_name(name: str) -> str:
@@ -152,6 +164,7 @@ def build_mcp_catalog_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
     ) -> dict[str, object]:
         upsert = payload
         # Validate connectivity BEFORE persisting (parity with custom-server
@@ -207,7 +220,7 @@ def build_mcp_catalog_router() -> APIRouter:
                 "transport": record.transport,
             },  # NEVER include any secret value
         )
-        await _invalidate_platform_mcp(pool_service, agent_runtime)
+        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.get("")
@@ -322,6 +335,7 @@ def build_mcp_catalog_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
     ) -> dict[str, object]:
         patch = payload
         # Load the existing row when the URL or token changes — needed to re-probe
@@ -402,7 +416,7 @@ def build_mcp_catalog_router() -> APIRouter:
                 "enabled": record.enabled,
             },
         )
-        await _invalidate_platform_mcp(pool_service, agent_runtime)
+        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.delete("/{catalog_id}", status_code=204)
@@ -418,6 +432,7 @@ def build_mcp_catalog_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
         force: Annotated[bool, Query()] = False,
     ) -> None:
         # Resolve the row first so the audit record carries the stable name.
@@ -531,6 +546,6 @@ def build_mcp_catalog_router() -> APIRouter:
                 "secrets_failed": secrets_failed,
             },
         )
-        await _invalidate_platform_mcp(pool_service, agent_runtime)
+        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
 
     return router

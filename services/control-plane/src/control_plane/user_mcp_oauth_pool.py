@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -47,6 +48,11 @@ Clock = Callable[[], datetime]
 
 _MAX_BUILD_ATTEMPTS = 5
 
+# TTL backstop for missed invalidation-bus events (PR-E3a) — matches the
+# built-agent cache TTL (AgentRuntime.cache_ttl_s = 1800s). Without it the
+# pool lives forever, so one lost bus event would be permanent staleness.
+_POOL_TTL_S = 1800.0
+
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
@@ -63,13 +69,18 @@ class UserMcpOAuthPoolService:
         client_factory: McpClientFactory,
         refresher: McpOAuthRefresher | None = None,
         clock: Clock = _utc_now,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._oauth_store = oauth_store
         self._catalog_store = catalog_store
         self._client_factory = client_factory
         self._refresher = refresher
         self._clock = clock
-        self._pools: dict[tuple[UUID, str], MCPServerPool] = {}
+        # ``clock`` is wall-time for token expiry; the TTL backstop needs a
+        # monotonic source (injectable in tests), hence the separate knob.
+        self._monotonic_clock = monotonic_clock
+        # key -> (pool, built_at monotonic stamp for the TTL backstop)
+        self._pools: dict[tuple[UUID, str], tuple[MCPServerPool, float]] = {}
         self._locks_guard = asyncio.Lock()
         self._key_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
         self._generation: dict[tuple[UUID, str], int] = {}
@@ -125,7 +136,19 @@ class UserMcpOAuthPoolService:
             async with lock:
                 cached = self._pools.get(key)
                 if cached is not None:
-                    return cached
+                    cached_pool, built_at = cached
+                    if self._monotonic_clock() - built_at < _POOL_TTL_S:
+                        return cached_pool
+                    # TTL backstop (PR-E3a): expired — close + drop exactly
+                    # like ``invalidate`` (the generation bump keeps any
+                    # concurrent build from caching stale data), then rebuild.
+                    async with self._locks_guard:
+                        self._generation[key] = self._generation.get(key, 0) + 1
+                        self._pools.pop(key, None)
+                    try:
+                        await cached_pool.close_all()
+                    except Exception:
+                        logger.warning("user_mcp_oauth_pool.expired_close_failed")
                 async with self._locks_guard:
                     gen = self._generation.get(key, 0)
                 pool = MCPServerPool()
@@ -158,7 +181,7 @@ class UserMcpOAuthPoolService:
                         logger.warning("user_mcp_oauth_pool.server_build_failed")
                 async with self._locks_guard:
                     if self._generation.get(key, 0) == gen:
-                        self._pools[key] = pool
+                        self._pools[key] = (pool, self._monotonic_clock())
                         return pool
                     if last_attempt:
                         return pool
@@ -173,17 +196,17 @@ class UserMcpOAuthPoolService:
         key = (tenant_id, user_id)
         async with self._locks_guard:
             self._generation[key] = self._generation.get(key, 0) + 1
-            pool = self._pools.pop(key, None)
-        if pool is not None:
+            entry = self._pools.pop(key, None)
+        if entry is not None:
             try:
-                await pool.close_all()
+                await entry[0].close_all()
             except Exception:
                 logger.warning("user_mcp_oauth_pool.invalidate_close_failed")
 
     async def close_all(self) -> None:
         """Close every cached pool (app shutdown)."""
         async with self._locks_guard:
-            pools = list(self._pools.values())
+            pools = [entry[0] for entry in self._pools.values()]
             self._pools.clear()
             for key in list(self._key_locks):
                 self._generation[key] = self._generation.get(key, 0) + 1

@@ -292,3 +292,38 @@ async def test_users_isolated() -> None:
     p2 = await svc.get_or_build(tid, "user-2")
     assert p1.names() == ["linear"]
     assert p2.names() == []  # user-2 has no connections
+
+
+@pytest.mark.asyncio
+async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None:
+    """PR-E3a: entries older than 1800s rebuild (old pool closed); younger reuse."""
+    cat_store = InMemoryMcpConnectorCatalogStore()
+    oauth_store = InMemoryMcpOAuthConnectionStore()
+    tid, uid = uuid4(), "user-1"
+    cat_id = await _seed_catalog(cat_store)
+    await _seed_connection(
+        oauth_store,
+        tenant_id=tid,
+        user_id=uid,
+        catalog_id=cat_id,
+        expires_at=_NOW + timedelta(hours=1),
+    )
+    calls: list[str] = []
+    now = {"t": 0.0}
+    svc = UserMcpOAuthPoolService(
+        oauth_store=oauth_store,
+        catalog_store=cat_store,
+        client_factory=_factory_spy(calls),
+        clock=lambda: _NOW,
+        monotonic_clock=lambda: now["t"],
+    )
+    p1 = await svc.get_or_build(tid, uid)
+    now["t"] = 1799.0
+    assert await svc.get_or_build(tid, uid) is p1  # younger than TTL → reused
+    assert calls == ["linear"]
+    now["t"] = 1801.0
+    p2 = await svc.get_or_build(tid, uid)
+    assert p2 is not p1  # older than TTL → rebuilt
+    assert calls == ["linear", "linear"]
+    assert p1.names() == []  # the expired pool was closed (close_all clears clients)
+    assert p2.names() == ["linear"]

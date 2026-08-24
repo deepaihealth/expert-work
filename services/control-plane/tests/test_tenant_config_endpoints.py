@@ -340,3 +340,66 @@ async def test_put_emits_tenant_config_write_audit(
     fields = page.entries[0].details.get("fields", [])
     assert "display_name" in fields
     assert "plan" in fields
+
+
+# ---------------------------------------------------------------------------
+# PR-E3a — PUT must drop the tenant's built agents (locally + via the bus)
+# ---------------------------------------------------------------------------
+
+
+class _SpyRuntime:
+    def __init__(self) -> None:
+        self.tenant_calls: list[UUID] = []
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        self.tenant_calls.append(tenant_id)
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_put_invalidates_agent_builds_locally_and_broadcasts(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """tenant_config fields (e.g. mcp_allowlist) are BUILD-TIME inputs; the
+    PUT write path must evict this pod's built agents AND broadcast a
+    ``tenant_config`` event so peer replicas drop config cache + builds."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        tenant_rate_limit_capacity=10_000,
+        tenant_rate_limit_refill_per_sec=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    spy_runtime = _SpyRuntime()
+    spy_bus = _SpyBus()
+    app.state.agent_runtime = spy_runtime
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            f"/v1/tenants/{_TENANT}/config",
+            headers={"Authorization": f"Bearer {_admin_token()}"},
+            json={"display_name": "ACME", "mcp_allowlist": ["github-mcp"]},
+        )
+    assert put.status_code == 200
+    assert spy_runtime.tenant_calls == [_TENANT]
+    assert len(spy_bus.events) == 1
+    event = spy_bus.events[0]
+    assert event.kind == "tenant_config"
+    assert event.tenant_id == str(_TENANT)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.cookiejar
 import logging
 import os
+import socket
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
@@ -142,6 +143,12 @@ from control_plane.eval_engine_live import (
 )
 from control_plane.eval_worker import EvalWorker
 from control_plane.feedback_consumer import FeedbackConsumerWorker
+from control_plane.invalidation_bus import (
+    InvalidationBus,
+    InvalidationEvent,
+    NoopInvalidationBus,
+    build_invalidation_handlers,
+)
 from control_plane.keycloak import (
     FakeKeycloakAdminClient,
     HttpKeycloakAdminClient,
@@ -1295,6 +1302,40 @@ def create_app(
             # 换 key 生效链。跨副本陈旧度由 TTL 兜底(本仓立场)。
             credential_value_cache = CredentialValueCache()
             _app.state.credential_value_cache = credential_value_cache
+            # PR-E3a — cross-replica cache-invalidation bus. Real Redis-backed
+            # bus whenever the quota/rate-limit Redis is configured (same
+            # selection as ``_build_default_quota_service``:
+            # ``Settings.quota_redis_url``); in-memory dev / unit tests get the
+            # inert Noop bus. Own client (pub/sub holds a connection open, so
+            # it must not share the limiter/quota clients' pooled connections);
+            # the exit stack closes it after the subscriber task stops (LIFO).
+            invalidation_bus: InvalidationBus | NoopInvalidationBus
+            if resolved_settings.quota_redis_url:
+                import redis.asyncio as redis_async
+
+                bus_redis = redis_async.from_url(
+                    resolved_settings.quota_redis_url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                )
+                stack.push_async_callback(bus_redis.aclose)
+                invalidation_bus = InvalidationBus(
+                    redis_client=bus_redis,
+                    origin=socket.gethostname(),
+                )
+            else:
+                invalidation_bus = NoopInvalidationBus()
+            _app.state.invalidation_bus = invalidation_bus
+
+            def _invalidate_tenant_and_broadcast(tenant_id: UUID) -> None:
+                """Local built-agent evict + bus broadcast, for the SYNC
+                funnels that hold a plain ``Callable[[UUID], None]`` (skill
+                promotion / rollback gates)."""
+                resolved_agent_runtime.invalidate_tenant(tenant_id)
+                invalidation_bus.publish_soon(
+                    InvalidationEvent(kind="agent_build", tenant_id=str(tenant_id))
+                )
+
             # Stream MCP-OAUTH (OA-5) — env-seed the connector catalog before
             # serving: oauth2 connectors whose ${VAR} client_id placeholders
             # resolve from the environment are created idempotently.
@@ -1446,6 +1487,20 @@ def create_app(
 
                 # Stream MCP-OAUTH (OA-3b) — per-(tenant,user) OAuth MCP pool;
                 # OA-6 refresher lazily renews near-expiry access tokens at build.
+                def _invalidate_user_and_broadcast(tenant_id: UUID, user_id: str) -> None:
+                    """PR-E3a — the refresh rewrote the token secret IN PLACE:
+                    peer replicas' OAuth pools + per-user builds still hold the
+                    old resolved value, so broadcast alongside the local evict
+                    (sync funnel → fire-and-forget publish)."""
+                    resolved_agent_runtime.invalidate_user(tenant_id, user_id)
+                    invalidation_bus.publish_soon(
+                        InvalidationEvent(
+                            kind="user_mcp_oauth",
+                            tenant_id=str(tenant_id),
+                            user_id=user_id,
+                        )
+                    )
+
                 mcp_oauth_refresher = McpOAuthRefresher(
                     oauth_store=resolved_mcp_oauth_connection_store,
                     catalog_store=resolved_mcp_connector_catalog_store,
@@ -1463,7 +1518,8 @@ def create_app(
                     # place; evict that user's cached built agents (top-level +
                     # delegated via the registered user hook) so the next build
                     # resolves the fresh token instead of the baked-in old one.
-                    invalidate_user=resolved_agent_runtime.invalidate_user,
+                    # PR-E3a: the wrapper also broadcasts to peer replicas.
+                    invalidate_user=_invalidate_user_and_broadcast,
                 )
                 user_mcp_oauth_pool_service = UserMcpOAuthPoolService(
                     oauth_store=resolved_mcp_oauth_connection_store,
@@ -2020,7 +2076,8 @@ def create_app(
                     # Live pilot finding #8 — promotion / dedup-revision flips
                     # change the auto-attach set without a spec-version bump;
                     # the BuiltAgent cache must drop the tenant's entries.
-                    cache_invalidator=resolved_agent_runtime.invalidate_tenant,
+                    # PR-E3a: the wrapper also broadcasts to peer replicas.
+                    cache_invalidator=_invalidate_tenant_and_broadcast,
                 )
                 skill_evolution_worker.start()
                 _app.state.skill_evolution_worker = skill_evolution_worker
@@ -2042,7 +2099,8 @@ def create_app(
                         feedback_store=resolved_feedback,
                         # Live pilot finding #8 — archive must drop the
                         # tenant's BuiltAgent cache entries.
-                        cache_invalidator=resolved_agent_runtime.invalidate_tenant,
+                        # PR-E3a: the wrapper also broadcasts to peer replicas.
+                        cache_invalidator=_invalidate_tenant_and_broadcast,
                     ),
                     config=RollbackMonitorConfig(
                         window=timedelta(days=resolved_settings.skill_rollback_window_days)
@@ -2150,6 +2208,12 @@ def create_app(
             approval_gauge_worker = ApprovalGaugeWorker(approval_store=resolved_approval_store)
             approval_gauge_worker.start()
             _app.state.approval_gauge_worker = approval_gauge_worker
+            # PR-E3a — start the invalidation-bus subscriber (Noop bus: inert).
+            # Handlers late-bind through ``app.state`` so whatever runtime /
+            # pools this process wired (or not — injected-runtime tests) are
+            # looked up at event time, and each handler that touches an inner
+            # layer (pool / tenant config) also drops the agent-build layer.
+            invalidation_bus.start(build_invalidation_handlers(_app.state))
             # 波 1 全分支终审 Important-1 — the idle-sandbox sweep. Only for
             # the cloud backend: ``sandbox_backend="supervisor"`` already has
             # its own in-process reaper inside the supervisor service, and
@@ -2178,6 +2242,9 @@ def create_app(
             try:
                 yield
             finally:
+                # PR-E3a — stop the subscriber before its Redis client is
+                # closed by the exit stack (LIFO callbacks run after this).
+                await invalidation_bus.stop()
                 if memory_consolidator is not None:
                     await memory_consolidator.stop()
                 if memory_dlq_worker is not None:
@@ -2364,6 +2431,10 @@ def create_app(
     app.state.tenant_billing_ledger_store = resolved_tenant_billing_ledger_store
     app.state.tenant_mcp_pool_service = None
     app.state.platform_mcp_pool_service = None
+    # PR-E3a — the cross-replica invalidation bus; the lifespan sets it
+    # (real or Noop). ``None`` pre-lifespan / in router-only tests, and every
+    # funnel treats that as "don't broadcast".
+    app.state.invalidation_bus = None
     app.state.platform_secret_store = resolved_platform_secret_store
     app.state.platform_secrets_service = resolved_platform_secrets_service
     # Stream S (Mini-ADR S-4) — model catalog reads only usable providers

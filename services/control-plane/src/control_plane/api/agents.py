@@ -61,6 +61,7 @@ from control_plane.api.runs import (
 from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.manifest import (
     ManifestError,
     ManifestLoader,
@@ -372,7 +373,7 @@ def _get_runtime(request: Request) -> AgentRuntime:
     return request.app.state.agent_runtime  # type: ignore[no-any-return]
 
 
-def _invalidate_agent_build_cache(request: Request, tenant_id: UUID) -> None:
+async def _invalidate_agent_build_cache(request: Request, tenant_id: UUID) -> None:
     """Evict the tenant's built-agent cache after a manifest write.
 
     :class:`AgentRuntime` keys built agents on ``(tenant, name, version)`` and
@@ -381,10 +382,16 @@ def _invalidate_agent_build_cache(request: Request, tenant_id: UUID) -> None:
     invisible to new runs until the stale build is dropped. Every manifest
     write path (PUT / rollback / delete) funnels through here. ``getattr``
     guards the handful of test setups that build routers without a runtime.
+
+    PR-E3a — the eviction is also broadcast on the invalidation bus so peer
+    replicas drop their copies too (handlers rerun locally; harmless).
     """
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is not None:
         runtime.invalidate_tenant(tenant_id)
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        await bus.publish(InvalidationEvent(kind="agent_build", tenant_id=str(tenant_id)))
 
 
 def _get_approvals(request: Request) -> ApprovalStore:
@@ -1585,7 +1592,7 @@ def build_agents_router() -> APIRouter:
         if result is None:
             raise HTTPException(status_code=404, detail="agent not found")
         # The edited spec must reach new runs without a restart.
-        _invalidate_agent_build_cache(request, tenant_id)
+        await _invalidate_agent_build_cache(request, tenant_id)
         await emit(
             audit,
             tenant_id=tenant_id,
@@ -1809,7 +1816,7 @@ def build_agents_router() -> APIRouter:
         if result is None:
             raise HTTPException(status_code=404, detail="agent not found")
         # Rolled-back content must reach new runs without a restart.
-        _invalidate_agent_build_cache(request, tenant_id)
+        await _invalidate_agent_build_cache(request, tenant_id)
         await emit(
             audit,
             tenant_id=tenant_id,
@@ -1866,7 +1873,7 @@ def build_agents_router() -> APIRouter:
         if record is None:
             raise HTTPException(status_code=404, detail="agent not found")
         # Drop the deleted build so a re-register at the same version rebuilds.
-        _invalidate_agent_build_cache(request, tenant_id)
+        await _invalidate_agent_build_cache(request, tenant_id)
 
         # Deletion hygiene PR4 — cascade, best-effort with audit-visible
         # failures. Cancel the agent's in-flight runs (same RT-ADR-17 loop as

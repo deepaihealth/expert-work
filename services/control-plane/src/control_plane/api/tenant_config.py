@@ -21,6 +21,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from control_plane.api._authz import console_only, require
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.ratelimit import parse_rate_limit_override
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_scope import (
@@ -243,6 +244,19 @@ def build_tenant_config_router() -> APIRouter:
                     "message": str(exc),
                 },
             ) from exc
+        # PR-E3a — tenant_config fields (mcp_allowlist above all) are
+        # BUILD-TIME inputs baked into BuiltAgent: this write must drop the
+        # tenant's built agents locally (the pre-existing gap) AND broadcast
+        # a tenant_config event so peer replicas drop their 60s config cache
+        # + builds together (two-layer invariant, encoded in the bus handler).
+        runtime = getattr(request.app.state, "agent_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_tenant(scope.tenant_id)
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(
+                InvalidationEvent(kind="tenant_config", tenant_id=str(scope.tenant_id))
+            )
         return {"success": True, "data": record.model_dump(mode="json"), "error": None}
 
     @router.get("/{tenant_id}/config/credentials")
