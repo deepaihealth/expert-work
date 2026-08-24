@@ -93,6 +93,9 @@ interface FormViewProps {
    *  tab (e.g. "basic" merged into a template's "basic info") so there's no
    *  redundant sub-heading. */
   bare?: boolean;
+  /** Drop the 760px width cap — list-type sections (BUG-6: skills) waste
+   *  half a wide screen under it while truncating their own rows. */
+  wide?: boolean;
 }
 
 const SECTION: React.CSSProperties = { marginBottom: 24 };
@@ -129,6 +132,7 @@ export function FormView({
   sections,
   mcpSource = "available",
   bare = false,
+  wide = false,
 }: FormViewProps) {
   const { t } = useTranslation();
   const [catalog, setCatalog] = useState<ModelCatalog | undefined>(undefined);
@@ -487,7 +491,10 @@ export function FormView({
   };
 
   return (
-    <div data-testid="manifest-form-view" style={{ maxWidth: 760 }}>
+    <div
+      data-testid="manifest-form-view"
+      style={{ maxWidth: wide ? undefined : 760 }}
+    >
       {sections
         ? sections.map((s) => (
             <div key={s} data-section-id={s}>

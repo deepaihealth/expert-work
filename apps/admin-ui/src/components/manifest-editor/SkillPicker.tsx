@@ -21,6 +21,7 @@ import {
   Checkbox,
   Empty,
   Input,
+  Pagination,
   Select,
   Switch,
   Tag,
@@ -42,6 +43,10 @@ import {
 const { Text } = Typography;
 
 const SECTION: CSSProperties = { marginBottom: 24 };
+
+// BUG-6:70+ 行全量平铺只靠内滚不可用 —— 客户端分页,同 SkillsList 的
+// BUG-3 口径(20/页,单页自动隐藏)。
+const PAGE_SIZE = 20;
 
 function Heading({ children }: { children: ReactNode }) {
   return <h3 style={{ fontSize: 15, margin: "0 0 12px" }}>{children}</h3>;
@@ -87,6 +92,7 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
   const [sourceFilter, setSourceFilter] = useState<
     "platform" | "tenant" | undefined
   >(undefined);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     let alive = true;
@@ -138,6 +144,16 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
       return true;
     });
   }, [options, query, categoryFilter, sourceFilter]);
+
+  // Clamp rather than reset-on-change: a stale page > last page can only
+  // happen when a filter shrank the list, and clamping keeps the "type a
+  // query character" path from yanking the user off page 1 needlessly.
+  const lastPage = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, lastPage);
+  const paged = filtered.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
 
   const toggle = (name: string, on: boolean): void => {
     const next = on ? [...selected, name] : selected.filter((s) => s !== name);
@@ -244,7 +260,7 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
               description={t("agent_form.skills_empty")}
             />
           ) : (
-            filtered.map((o) => {
+            paged.map((o) => {
               const checked = selected.includes(o.name);
               const row = (
                 <div
@@ -298,12 +314,14 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
                       <Text
                         type="secondary"
                         title={o.description}
+                        // BUG-6:单行截断在窄列下几乎读不到内容 —— 两行
+                        // clamp,悬停 title 看全文。
                         style={{
-                          display: "block",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
                           fontSize: 13,
-                          whiteSpace: "nowrap",
                           overflow: "hidden",
-                          textOverflow: "ellipsis",
                         }}
                       >
                         {o.description}
@@ -328,6 +346,17 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
           )}
         </div>
       </div>
+      <Pagination
+        size="small"
+        current={currentPage}
+        pageSize={PAGE_SIZE}
+        total={filtered.length}
+        onChange={setPage}
+        showSizeChanger={false}
+        hideOnSinglePage
+        style={{ marginTop: 12, justifyContent: "flex-end", display: "flex" }}
+        data-testid="af-skills-pagination"
+      />
     </section>
   );
 }

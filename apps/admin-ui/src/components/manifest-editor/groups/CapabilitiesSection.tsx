@@ -50,7 +50,9 @@ export function CapabilitiesSection({
   };
 
   return (
-    <div data-testid="capabilities-section" style={{ maxWidth: 760 }}>
+    // BUG-6:此处不再设 760 上限 —— 非 skills 子 tab 仍由各自 FormView 的
+    // 760 cap 约束,只有 skills(wide)真正铺满宽屏。
+    <div data-testid="capabilities-section">
       <Tabs
         size="small"
         activeKey={subTab}
@@ -98,6 +100,7 @@ export function CapabilitiesSection({
                 formData={formData}
                 onChange={onChange}
                 section="skills"
+                wide
               />
             ),
           },

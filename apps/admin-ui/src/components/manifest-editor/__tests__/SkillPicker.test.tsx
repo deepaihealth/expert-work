@@ -266,6 +266,65 @@ describe("SkillPicker", () => {
     ).not.toBeInTheDocument();
   });
 
+  // BUG-6 — client-side pagination (20/page, hidden when single page).
+  const BULK = {
+    items: [
+      rec({
+        name: "t-office",
+        description: "tenant office",
+        category: "office",
+        source: "tenant",
+      }),
+    ],
+    platform_items: Array.from({ length: 24 }, (_v, i) =>
+      rec({
+        name: `p-bulk-${String(i + 1).padStart(2, "0")}`,
+        description: `bulk ${i + 1}`,
+        category: "bulk",
+        source: "platform",
+        entitled: true,
+      }),
+    ),
+    next_cursor: null,
+    cross_tenant: false,
+  };
+
+  it("pages the list at 20 rows and navigates to page 2", async () => {
+    const user = userEvent.setup();
+    vi.mocked(listSkills).mockResolvedValueOnce(BULK);
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    expect(await screen.findByTestId("af-skill-row-t-office")).toBeInTheDocument();
+    // 25 rows total → page 1 ends at p-bulk-19, p-bulk-24 lives on page 2.
+    expect(screen.getByTestId("af-skill-row-p-bulk-19")).toBeInTheDocument();
+    expect(screen.queryByTestId("af-skill-row-p-bulk-24")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTitle("2"));
+
+    expect(screen.getByTestId("af-skill-row-p-bulk-24")).toBeInTheDocument();
+    expect(screen.queryByTestId("af-skill-row-t-office")).not.toBeInTheDocument();
+  });
+
+  it("clamps the page when a filter shrinks the list below it", async () => {
+    const user = userEvent.setup();
+    vi.mocked(listSkills).mockResolvedValueOnce(BULK);
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    await screen.findByTestId("af-skill-row-t-office");
+    await user.click(screen.getByTitle("2"));
+    expect(screen.getByTestId("af-skill-row-p-bulk-24")).toBeInTheDocument();
+
+    await pickOption(user, screen.getByTestId("af-skills-category"), "office");
+
+    // One match → single page; the stale page 2 must clamp back to 1.
+    expect(screen.getByTestId("af-skill-row-t-office")).toBeInTheDocument();
+    expect(screen.queryByTestId("af-skill-row-p-bulk-24")).not.toBeInTheDocument();
+  });
+
+  it("hides the pager when everything fits on one page", async () => {
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    await screen.findByTestId("af-skill-row-pptx");
+    expect(screen.queryByTestId("af-skills-pagination")).not.toBeInTheDocument();
+  });
+
   it("wraps the list in a capped-height scroll area", async () => {
     render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
     const scroll = await screen.findByTestId("af-skills-scroll");
