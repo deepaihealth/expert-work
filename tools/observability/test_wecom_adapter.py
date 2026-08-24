@@ -126,6 +126,7 @@ class TestPostWecom:
 
     def test_raises_typed_error_on_errcode(self, monkeypatch) -> None:
         import io
+
         import pytest
 
         class _Resp(io.BytesIO):
@@ -180,9 +181,8 @@ class TestHandler:
         import urllib.request
 
         try:
-            return urllib.request.urlopen(
-                urllib.request.Request(base + path, data=body, method="POST"), timeout=5
-            ).status
+            request = urllib.request.Request(base + path, data=body, method="POST")  # noqa: S310
+            return urllib.request.urlopen(request, timeout=5).status  # noqa: S310 — 本地测试服务器
         except urllib.error.HTTPError as e:
             return e.code
 
@@ -192,9 +192,9 @@ class TestHandler:
 
         server, base = self._serve()
         try:
-            assert urllib.request.urlopen(base + "/healthz", timeout=5).status == 200
+            assert urllib.request.urlopen(base + "/healthz", timeout=5).status == 200  # noqa: S310
             try:
-                urllib.request.urlopen(base + "/nope", timeout=5)
+                urllib.request.urlopen(base + "/nope", timeout=5)  # noqa: S310
                 raise AssertionError("expected 404")
             except urllib.error.HTTPError as e:
                 assert e.code == 404
