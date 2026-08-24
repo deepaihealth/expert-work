@@ -249,3 +249,22 @@ class TestHandler:
             assert calls == ["markdown", "text"]
         finally:
             server.shutdown()
+
+
+class TestChannelSanitize:
+    def test_hostile_channel_is_stripped_in_delivery_path(self, monkeypatch) -> None:
+        """channel 走白名单清洗:换行/控制字符进不了日志与消息(CodeQL log-injection)。"""
+        monkeypatch.delenv("WECOM_WEBHOOK_URL", raising=False)
+        server, base = TestHandler._serve()
+        try:
+            good = json.dumps(_payload(_alert())).encode()
+            from urllib.parse import quote
+
+            hostile = quote("p2\nFAKE-LOG-LINE injected")
+            assert TestHandler._post(base, f"/alert?channel={hostile}", good) == 200
+        finally:
+            server.shutdown()
+
+    def test_sanitized_channel_keeps_p0_semantics(self) -> None:
+        msgs = adapter.build_messages("p0", _payload(_alert()))
+        assert len(msgs) == 2  # 清洗不影响合法 channel 的 @all 语义

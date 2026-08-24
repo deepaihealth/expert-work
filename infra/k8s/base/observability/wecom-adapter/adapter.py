@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -150,6 +151,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(404)
             return
         channel = (parse_qs(parsed.query).get("channel") or ["default"])[0]
+        # 白名单清洗:channel 会进日志与消息文案,掐掉注入面(CodeQL log-injection)。
+        channel = re.sub(r"[^a-zA-Z0-9_-]", "", channel)[:32] or "default"
         try:
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
