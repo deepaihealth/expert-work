@@ -64,6 +64,9 @@ resources:
   - observability/grafana-pvc.yaml
   - observability/alertmanager-deployment.yaml
   - observability/alertmanager-service.yaml
+  - observability/alertmanager-pvc.yaml
+  - observability/wecom-adapter-deployment.yaml
+  - observability/wecom-adapter-service.yaml
   # W2-PR3 — Langfuse (web/worker + in-cluster ClickHouse; PG/Redis/OSS
   # are external managed services, see langfuse/ headers).
   - langfuse/clickhouse-statefulset.yaml
@@ -131,6 +134,11 @@ configMapGenerator:
   - name: alertmanager-config
     files:
       - observability/alertmanager.yml
+  # PROD-2 — Alertmanager→企微转换层脚本(部署形态见 wecom-adapter-deployment.yaml
+  # 头注;单测 tools/observability/test_wecom_adapter.py)。
+  - name: wecom-adapter-script
+    files:
+      - observability/wecom-adapter/adapter.py
   - name: grafana-datasources
     files:
       - observability/grafana-datasources.yaml

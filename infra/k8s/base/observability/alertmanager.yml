@@ -5,14 +5,15 @@
 # P0/P1/P2 severity routing (subsystems/20 § 5.7). Alerts carry a
 # `severity` label set by tools/observability/rules/alerts.yml.
 #
-#   P0 → PagerDuty + 飞书 oncall   (5 min SLA)
-#   P1 → PagerDuty                 (30 min SLA)
-#   P2 → 飞书 alert group          (24 h SLA)
+#   P0 → 企微群 + @all(5 min SLA)
+#   P1 → 企微群(30 min SLA)
+#   P2 → 企微群(24 h SLA)
 #
-# The receiver webhook URLs are PLACEHOLDERS — Alertmanager does not
-# expand env vars in its config, so the real PagerDuty / 飞书 endpoints
-# are wired at deploy time (M1-H; Mini-ADR G-1 keeps M0 receivers as
-# placeholders). ``amtool check-config`` validates this file as-is.
+# PROD-2(2026-08-24):receivers 从 placeholder 换成真投递 —— 全部走集群内
+# wecom-adapter(Alertmanager 不展开 env var,企微 webhook URL 含 key 不能进
+# git;adapter 从 Secret ``wecom-alert-webhook`` 读 URL 并把 Alertmanager JSON
+# 转成企微消息,p0 额外 @all。见 observability/wecom-adapter/adapter.py)。
+# 原设计的 PagerDuty/飞书通道未开通即被企微方案取代(2026-08-24 拍板)。
 
 route:
   receiver: default
@@ -21,6 +22,11 @@ route:
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    # P3 / gate-watch(rules 里共 10 条,含 >0 即发的 gate-watch)刻意静音:
+    # 接通 default 之前它们落在空 receiver 里,群里从没见过;直通生产群会
+    # 淹掉 P0-P2(终审 I-1)。要看它们去 Prometheus/Grafana;升级投递另议。
+    - matchers: ['severity=~"P3|gate-watch"']
+      receiver: muted
     - matchers: ['severity="P0"']
       receiver: p0
       group_wait: 0s
@@ -32,25 +38,31 @@ route:
       receiver: p2
 
 receivers:
-  # Catch-all for alerts with no severity label.
-  - name: default
+  # P3 / gate-watch sink — deliberately no webhook_configs.
+  - name: muted
 
-  # P0 — paged + 飞书 oncall.
+  # True catch-all: alerts with NO severity label — still delivered (a
+  # missing label is itself a bug worth seeing), tagged "default" by the
+  # adapter.
+  - name: default
+    webhook_configs:
+      - url: http://wecom-adapter:8080/alert?channel=default
+        send_resolved: true
+
+  # P0 — 企微群 + @all(adapter 对 p0 的 firing 附加 text @all 消息)。
   - name: p0
     webhook_configs:
-      - url: http://placeholder.invalid/pagerduty
-        send_resolved: true
-      - url: http://placeholder.invalid/feishu
+      - url: http://wecom-adapter:8080/alert?channel=p0
         send_resolved: true
 
-  # P1 — paged.
+  # P1 — 企微群。
   - name: p1
     webhook_configs:
-      - url: http://placeholder.invalid/pagerduty
+      - url: http://wecom-adapter:8080/alert?channel=p1
         send_resolved: true
 
-  # P2 — 飞书 alert group.
+  # P2 — 企微群。
   - name: p2
     webhook_configs:
-      - url: http://placeholder.invalid/feishu
+      - url: http://wecom-adapter:8080/alert?channel=p2
         send_resolved: true

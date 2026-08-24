@@ -1,0 +1,16 @@
+# Alertmanager state (nflog + silences) — PROD-2 终审 I-4:接通真投递后
+# 无持久化 = 每次 pod 重启把所有 firing 告警(含 P0 @all)重发一遍,且
+# silence 不跨重启(值班压制不了噪音)。cloud disk,SC 显式钉(集群无默认
+# SC),阿里云 20Gi 起步 —— 照 grafana-pvc.yaml 先例。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-data
+  labels:
+    app.kubernetes.io/name: alertmanager
+spec:
+  storageClassName: alicloud-disk-topology-alltype
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
