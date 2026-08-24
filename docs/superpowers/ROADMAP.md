@@ -29,7 +29,7 @@
 
 ---
 
-## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-26 周三**;三道拍板 2026-08-24 已收:单副本首发 / 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
+## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-30 周六**(2026-08-24 由 08-26 周三改期);三道拍板 2026-08-24 已收:单副本首发 / 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
 
 > 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
 > **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
@@ -38,7 +38,7 @@
 
 | # | 项 | 内容 | 量级 |
 |---|---|---|---|
-| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1)——**2026-08-24 拍板单副本首发,降为「扩容到 2 副本前必做」,不再阻塞周三发布**(prod overlay replicas-patch 写明恢复点) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
+| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1)——**2026-08-24 拍板单副本首发,降为「扩容到 2 副本前必做」,不阻塞首发**(prod overlay replicas-patch 写明恢复点) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
 | PROD-2 | ~~**alertmanager receivers**(X-7 ①)~~ **✅ 已交付(2026-08-24,PR #1257)**:企微群机器人方案 —— 集群内 wecom-adapter(ConfigMap 脚本 + 复用 control-plane 镜像)converts Alertmanager JSON→企微 markdown,p0 追加 @all;URL 走 Secret `wecom-alert-webhook`(未建则 log-only 降级);**剩用户侧一步:建群机器人 + create secret(步骤在 base/secrets.example.yaml)** | ✅ |
 | PROD-3 | ~~**RLS 闸 1 拍板**~~ **✅ 已拍板(2026-08-24):书面接受单层 ORM 隔离首发**(记录在 production-release.md 拍板记录节);硬要求=生产应用账号建成非 superuser、无 bypassrls(secrets.env.example 已写明);FORCE RLS(捞回 PR B)= 发布后第一波 | ✅ |
 | PROD-4 | ~~**retention-cleanup-job 第二套审批超时**~~ **✅ 已定案(2026-08-24):核实 infra/k8s 零 CronJob manifest** —— 该 job(连同 billing-rollup / event-log-archive / audit-backup)只有代码没有部署物,test/prod 都不跑,风险不进生产;代码修回归 X-15①,**该 job 部署前必须先修**(production-release.md §4 已钉) | ✅ |
@@ -60,7 +60,12 @@
 
 X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
 
-**进度(2026-08-24 周一收账)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置 —— **代码侧已就绪,周三发布只剩:①资源开通+开荒(production-release.md §0-§1,用户侧为主)②测试环境交互面人工点验 ③PROD-7 P2 钉版卫兵(可选,半天)**。
+**进度(2026-08-24 周一收账,当晚改期周六)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置;主流程 BUG-1~5(#1259-#1261)+ 第二轮 BUG-6~8(#1265)全修,测试环境 `31e203a0` smoke 双发全过,平台技能 category 用户补录 51/52。**代码侧已就绪,改期到周六多出的三天排期**:
+
+- 周二~周三:①测试环境交互面 + 三页 bug 修复人工点验(用户)②平台技能 category 补最后一条 sop-scoring-pipeline(用户)③ PROD-7 从「可选」转「做」——P2 钉版卫兵半天 + P1 金丝雀适配 prod 评估(我侧,时间富余不再省)
+- 周四~周五:④资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)⑤开荒完成后跑一轮 prod overlay 渲染预检(placeholder 扫描)提前暴露缺口,不留到发布日
+- 周六:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
+- 发布后第一波顺延不变:RLS PR B / PROD-1 + PROD-12(扩容前置)/ 按需 PROD-9/10/11
 
 ---
 
@@ -422,6 +427,10 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-18 | **(附件统一真栈验收顺带发现,pre-existing,全 app)** `/v1/agents/...` 前缀下**匹配不到路由**的请求(例:路径参数里带 `%2F`/`%3A`,Starlette 解码后 `{upload_id}` 段吃不下 `/`)返回框架裸 404 `{"detail":"Not Found"}`,不套第三方信封;对外信封处理器只接 `RequestValidationError`。conventions.md 已泛泛写「不是所有错误都有 error.code」,可加一句「路径拼错是裸 404」;或给对外前缀加 404 信封 |
 | B-19 | **(第四轮文档终审 C-1 核代码顺带发现,pre-existing)** `check_admission` → `QuotaService.check` 对租户配置的**全部** bucket 维度逐个扣费,不按 `resource_kind` 过滤:发起对话 / 产物下载各扣 `image_upload_count_30d` 1 次、`image_storage_bytes` 1 字节(如配置了这两行);图片存储写满后发起对话也会 429 `dimension=image_storage_bytes`。另:redis Lua 对 `refill_rate=0` 的黏性维度算 `retry_ms = need*1000/0`(除零 → inf → 整数化不可控),`Retry-After` 值无意义;in-memory 用 `max(rate,1e-9)` 得到天文数字。文档已按「按字节配额重试无效、先读 dimension」措辞绕开;代码侧应按 resource_kind 选维度 + 黏性维度不给 Retry-After |
 | B-20 | ~~**审批列表分流:安全审批 vs 业务澄清混排**~~ **✅ 主体已交付(2026-08-23)**:①两 tab(协议单源分类 `SAFETY/CLARIFICATION_REASON_KINDS` + `GET /v1/approvals?kind_class=` + 前端「安全审批/待确认」tab 带对侧徽章)✅;③超时按类配(`policies.clarification_timeout_s` 默认 1h,mint 按类选,sweep 对澄清单的超时理由改为「按保守默认继续并说明假设」——ask_for_approval reject 非终局,agent 收到即续跑)✅;④ decide/resume 三端点补 `require("session","write")`,堵 viewer 可裁任意单的洞 ✅(「澄清单发起人自决」推迟:run 上没记发起员工身份,随 D-6 一起做)。**剩余**:② 通知路由——澄清单对话内横幅归 D-6,安全单 alertmanager 告警归 X-7 |
+| B-21 | **(#1265 终审 follow-up,2026-08-24)** 折叠头(chevron + 计数标题按钮)三处重复实现:`PlanCard`/`ProcessStrip`/`FileTree` 与新加的 `VariablesForm` 各写一份展开/收起头,样式与 aria 语义略有分歧;抽共享 `CollapsibleHeader` 组件统一 |
+| B-22 | **(2026-08-24 记账,两周内咬了两个 PR)** `ConversationDetail` 导出相关 e2e spec flake:偶发超时/竞态假红,复现率低但反复出现在无关 PR 的 CI 上;需定位竞态源(疑似导出触发与页面 ready 的时序)并加确定性等待或隔离 |
+| B-23 | **(BUG-3 修复时记账,2026-08-24)** 后端 `GET /v1/skills` 的 `platform_items` 单次拼装上限 200(`list_platform_skills(limit=200)`)静默截断:平台库超 200 条 ACTIVE 时租户侧少看到技能且无任何提示;前端 SkillPicker 已走 cursor 拉全 tenant items(#1265),platform_items 这半边要么后端跟 cursor,要么至少响应里带 truncated 标记 |
+| B-24 | **(2026-08-24 记账)** CI `pip-audit` 偶发网络超时假红;给该 step 加 retry(或本地 advisory DB 缓存),别再靠手动 re-run |
 
 ---
 
