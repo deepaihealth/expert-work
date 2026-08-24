@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -12,6 +11,7 @@ from uuid import uuid4
 import pytest
 from prometheus_client import REGISTRY
 
+from control_plane import invalidation_bus
 from control_plane.invalidation_bus import (
     CHANNEL,
     KINDS,
@@ -337,15 +337,22 @@ async def test_subscriber_retries_when_subscribe_itself_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_noop_bus_is_inert_and_logs_once(caplog: pytest.LogCaptureFixture) -> None:
+async def test_noop_bus_is_inert_and_logs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Spy the module logger rather than ``caplog``: the full-suite run
+    # reconfigures logging (propagation / handlers), so a caplog assertion here
+    # passes file-scope and fails suite-scope.
+    lines: list[str] = []
+    monkeypatch.setattr(
+        invalidation_bus.logger,
+        "info",
+        lambda msg, *args, **kwargs: lines.append(str(msg)),
+    )
     bus = NoopInvalidationBus()
-    with caplog.at_level(logging.INFO, logger="expert_work.control_plane.invalidation_bus"):
-        await bus.publish(InvalidationEvent(kind="agent_build", tenant_id=str(uuid4())))
-        bus.publish_soon(InvalidationEvent(kind="agent_build", tenant_id=str(uuid4())))
-        bus.start({})
-        await bus.stop()
-    noop_lines = [r for r in caplog.records if "invalidation_bus.noop" in r.getMessage()]
-    assert len(noop_lines) == 1
+    await bus.publish(InvalidationEvent(kind="agent_build", tenant_id=str(uuid4())))
+    bus.publish_soon(InvalidationEvent(kind="agent_build", tenant_id=str(uuid4())))
+    bus.start({})
+    await bus.stop()
+    assert len([line for line in lines if "invalidation_bus.noop" in line]) == 1
 
 
 # ---------------------------------------------------------------------------
