@@ -117,7 +117,9 @@ async def _amain(args: argparse.Namespace) -> int:
     finally:
         await engine.dispose()
 
-    print(f"OK: seeded '{name}' into the vault")
+    # 静态文案:插值 name 会触发 CodeQL clear-text-logging(name 派生自
+    # keycloak_admin_secret_name,敏感名启发式误报;ref 名本身非机密)。
+    print("OK: seeded the secret ref into the vault")
     return 0
 
 
