@@ -47,6 +47,8 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
+import anyio
+
 from expert_work.common.uplift_metrics import (
     record_mcp_call,
     record_mcp_circuit_state,
@@ -415,9 +417,19 @@ class StdioMCPClient:
     config: MCPServerConfig
     _stack: contextlib.AsyncExitStack | None = field(default=None, init=False, repr=False)
     _session: Any = field(default=None, init=False, repr=False)
+    #: BUG-17 — serialises :meth:`_restart` so N concurrent callers hitting
+    #: one dead session reconnect exactly once.
+    _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     async def start(self) -> None:
         """Launch the subprocess and complete the MCP handshake."""
+        if self._stack is not None or self._session is not None:
+            msg = f"StdioMCPClient {self.config.name!r} already started"
+            raise RuntimeError(msg)
+        self._stack, self._session = await self._open_session()
+
+    async def _open_session(self) -> tuple[contextlib.AsyncExitStack, Any]:
+        """Launch the subprocess + handshake; return ``(stack, session)``."""
         # Imports kept local so the orchestrator can be imported in
         # contexts where the mcp SDK isn't available (e.g. middleware-
         # only unit tests with no MCP wiring).
@@ -425,10 +437,6 @@ class StdioMCPClient:
         from mcp.client.stdio import stdio_client
 
         session_cls = _lenient_client_session_cls()
-
-        if self._stack is not None:
-            msg = f"StdioMCPClient {self.config.name!r} already started"
-            raise RuntimeError(msg)
 
         command = self.config.command
         if command is None:  # pragma: no cover — guarded by post_init
@@ -451,15 +459,54 @@ class StdioMCPClient:
         except BaseException:
             await stack.__aexit__(None, None, None)
             raise
+        return stack, session
 
-        self._stack = stack
-        self._session = session
-
-    async def list_tools(self) -> Sequence[MCPToolDef]:
+    def _require_session(self) -> Any:
         if self._session is None:
             msg = f"StdioMCPClient {self.config.name!r} not started"
             raise RuntimeError(msg)
-        result = await self._session.list_tools()
+        return self._session
+
+    async def _restart(self, failed_session: Any) -> None:
+        """BUG-17 — tear down the dead transport and reconnect in place.
+
+        The client object is the pool-stable handle (:class:`MCPTool` holds
+        the client, not the session), so swapping ``_stack``/``_session``
+        heals every existing tool binding. The identity check makes
+        concurrent callers of one dead session reconnect exactly once —
+        late lock waiters no-op onto the fresh session. ``_session`` keeps
+        pointing at the dead session until the new one is live, so a failed
+        reconnect leaves the client restartable by the next caller instead
+        of poisoned as "not started".
+        """
+        async with self._restart_lock:
+            if self._session is not failed_session:
+                return  # another caller already restarted (or close() ran)
+            stack = self._stack
+            self._stack = None
+            if stack is not None:
+                try:
+                    await stack.__aexit__(None, None, None)
+                except Exception as exc:
+                    # The transport is already dead — teardown noise must
+                    # not mask the reconnect.
+                    logger.debug("mcp.restart_close_error server=%s err=%s", self.config.name, exc)
+            self._stack, self._session = await self._open_session()
+            logger.warning(
+                "mcp.session_restarted server=%s transport=%s",
+                self.config.name,
+                self.config.transport,
+            )
+
+    async def list_tools(self) -> Sequence[MCPToolDef]:
+        session = self._require_session()
+        try:
+            result = await session.list_tools()
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # list_tools is read-only and idempotent — safe to retry after
+            # send- OR receive-side stream death (BUG-17).
+            await self._restart(session)
+            result = await self._require_session().list_tools()
         return _materialize_tool_defs(result.tools, server=self.config.name)
 
     async def call_tool(
@@ -467,14 +514,29 @@ class StdioMCPClient:
         name: str,
         args: Mapping[str, Any],
     ) -> MCPCallResult:
-        if self._session is None:
-            msg = f"StdioMCPClient {self.config.name!r} not started"
-            raise RuntimeError(msg)
+        session = self._require_session()
+        try:
+            result = await self._call_raw(session, name, args)
+        except anyio.ClosedResourceError:
+            # BUG-17 — retry ONLY on send-phase death: ClosedResourceError is
+            # raised by the write stream before the request reaches the
+            # server, so a resend cannot double-execute a non-idempotent
+            # tool. BrokenResourceError / McpError / timeouts can occur AFTER
+            # the server accepted the request — the tool may already have
+            # run, so those are never resent.
+            await self._restart(session)
+            result = await self._call_raw(self._require_session(), name, args)
+        return MCPCallResult(
+            content=_render_content_blocks(result.content),
+            is_error=bool(getattr(result, "isError", False)),
+        )
+
+    async def _call_raw(self, session: Any, name: str, args: Mapping[str, Any]) -> Any:
         # Honor timeout_s like the remote transports do — a wedged stdio
         # subprocess must not hang the agent run indefinitely (audit #7).
         try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(args)),
+            return await asyncio.wait_for(
+                session.call_tool(name, dict(args)),
                 timeout=self.config.timeout_s,
             )
         except TimeoutError as exc:
@@ -483,17 +545,17 @@ class StdioMCPClient:
                 f"on {self.config.name!r}:{name!r}"
             )
             raise MCPCallTimeoutError(msg) from exc
-        return MCPCallResult(
-            content=_render_content_blocks(result.content),
-            is_error=bool(getattr(result, "isError", False)),
-        )
 
     async def close(self) -> None:
-        if self._stack is None:
-            return
-        await self._stack.__aexit__(None, None, None)
-        self._stack = None
-        self._session = None
+        # Under the restart lock, refs cleared first: an in-flight
+        # ``_restart`` must not resurrect a client the pool just closed.
+        async with self._restart_lock:
+            stack = self._stack
+            self._stack = None
+            self._session = None
+            if stack is None:
+                return
+            await stack.__aexit__(None, None, None)
 
 
 @dataclass
@@ -515,6 +577,9 @@ class _RemoteMCPClientBase:
     #: Mini-ADR U-13 — per-server breaker so a down remote server short-circuits
     #: instead of eating the full ``timeout_s`` on every call (audit #3).
     _breaker: MCPCircuitBreaker = field(init=False, repr=False)
+    #: BUG-17 — serialises :meth:`_restart` so N concurrent callers hitting
+    #: one dead session reconnect exactly once.
+    _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._breaker = MCPCircuitBreaker(server=self.config.name)
@@ -524,14 +589,18 @@ class _RemoteMCPClientBase:
         raise NotImplementedError(msg)
 
     async def start(self) -> None:
+        if self._stack is not None or self._session is not None:
+            msg = f"{type(self).__name__} {self.config.name!r} already started"
+            raise RuntimeError(msg)
+        self._stack, self._session = await self._open_session()
+
+    async def _open_session(self) -> tuple[contextlib.AsyncExitStack, Any]:
+        """Open the transport streams + handshake; return ``(stack, session)``."""
         # Imports kept local so orchestrator can be imported in contexts
         # that don't have the mcp SDK on the path (e.g. middleware-only
         # unit tests with no MCP wiring).
         session_cls = _lenient_client_session_cls()
 
-        if self._stack is not None:
-            msg = f"{type(self).__name__} {self.config.name!r} already started"
-            raise RuntimeError(msg)
         stack = contextlib.AsyncExitStack()
         await stack.__aenter__()
         try:
@@ -541,14 +610,54 @@ class _RemoteMCPClientBase:
         except BaseException:
             await stack.__aexit__(None, None, None)
             raise
-        self._stack = stack
-        self._session = session
+        return stack, session
 
-    async def list_tools(self) -> Sequence[MCPToolDef]:
+    def _require_session(self) -> Any:
         if self._session is None:
             msg = f"{type(self).__name__} {self.config.name!r} not started"
             raise RuntimeError(msg)
-        result = await self._session.list_tools()
+        return self._session
+
+    async def _restart(self, failed_session: Any) -> None:
+        """BUG-17 — tear down the dead transport and reconnect in place.
+
+        The client object is the pool-stable handle (:class:`MCPTool` holds
+        the client, not the session), so swapping ``_stack``/``_session``
+        heals every existing tool binding. The identity check makes
+        concurrent callers of one dead session reconnect exactly once —
+        late lock waiters no-op onto the fresh session. ``_session`` keeps
+        pointing at the dead session until the new one is live, so a failed
+        reconnect leaves the client restartable by the next caller instead
+        of poisoned as "not started".
+        """
+        async with self._restart_lock:
+            if self._session is not failed_session:
+                return  # another caller already restarted (or close() ran)
+            stack = self._stack
+            self._stack = None
+            if stack is not None:
+                try:
+                    await stack.__aexit__(None, None, None)
+                except Exception as exc:
+                    # The transport is already dead — teardown noise must
+                    # not mask the reconnect.
+                    logger.debug("mcp.restart_close_error server=%s err=%s", self.config.name, exc)
+            self._stack, self._session = await self._open_session()
+            logger.warning(
+                "mcp.session_restarted server=%s transport=%s",
+                self.config.name,
+                self.config.transport,
+            )
+
+    async def list_tools(self) -> Sequence[MCPToolDef]:
+        session = self._require_session()
+        try:
+            result = await session.list_tools()
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # list_tools is read-only and idempotent — safe to retry after
+            # send- OR receive-side stream death (BUG-17).
+            await self._restart(session)
+            result = await self._require_session().list_tools()
         return _materialize_tool_defs(result.tools, server=self.config.name)
 
     async def call_tool(
@@ -556,9 +665,7 @@ class _RemoteMCPClientBase:
         name: str,
         args: Mapping[str, Any],
     ) -> MCPCallResult:
-        if self._session is None:
-            msg = f"{type(self).__name__} {self.config.name!r} not started"
-            raise RuntimeError(msg)
+        session = self._require_session()
         transport = self.config.transport
         server = self.config.name
         # Circuit breaker (audit #3): a server that has tripped open is
@@ -569,10 +676,26 @@ class _RemoteMCPClientBase:
             msg = f"mcp server {server!r} circuit open — skipping call to {name!r}"
             raise MCPServerUnhealthyError(msg)
         try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(args)),
-                timeout=self.config.timeout_s,
-            )
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool(name, dict(args)),
+                    timeout=self.config.timeout_s,
+                )
+            except anyio.ClosedResourceError:
+                # BUG-17 — retry ONLY on send-phase death: ClosedResourceError
+                # is raised by the write stream before the request reaches the
+                # server, so a resend cannot double-execute a non-idempotent
+                # tool. BrokenResourceError / McpError / timeouts can occur
+                # AFTER the server accepted the request — the tool may already
+                # have run, so those are never resent. The restarted attempt
+                # resolves this call's breaker outcome: heal-and-succeed
+                # records success below; a failed restart or failed retry
+                # falls through to the failure handlers like any other error.
+                await self._restart(session)
+                result = await asyncio.wait_for(
+                    self._require_session().call_tool(name, dict(args)),
+                    timeout=self.config.timeout_s,
+                )
         except TimeoutError as exc:
             self._breaker.record_failure()
             record_mcp_call(transport=transport, server=server, result="timeout")
@@ -590,11 +713,15 @@ class _RemoteMCPClientBase:
         )
 
     async def close(self) -> None:
-        if self._stack is None:
-            return
-        await self._stack.__aexit__(None, None, None)
-        self._stack = None
-        self._session = None
+        # Under the restart lock, refs cleared first: an in-flight
+        # ``_restart`` must not resurrect a client the pool just closed.
+        async with self._restart_lock:
+            stack = self._stack
+            self._stack = None
+            self._session = None
+            if stack is None:
+                return
+            await stack.__aexit__(None, None, None)
 
 
 @dataclass
