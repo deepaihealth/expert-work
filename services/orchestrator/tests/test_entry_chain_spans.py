@@ -204,6 +204,9 @@ async def test_workspace_ingest_emits_named_span(exporter: InMemorySpanExporter)
                 "tenant_id": str(uuid4()),
                 "user_id": str(uuid4()),
                 "run_id": str(uuid4()),
+                # BUG-10 — the node skips before the span without a thread
+                # (nothing thread-scoped to read).
+                "thread_id": str(uuid4()),
             }
         },
     )

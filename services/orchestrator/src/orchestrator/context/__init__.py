@@ -77,6 +77,12 @@ from orchestrator.context.workspace_projection import (
 from orchestrator.context.workspace_projection import (
     render_todo_md as render_todo_md,
 )
+from orchestrator.context.workspace_projection import (
+    safe_thread_projection_prefix as safe_thread_projection_prefix,
+)
+from orchestrator.context.workspace_projection import (
+    thread_projection_prefix as thread_projection_prefix,
+)
 
 __all__ = [
     "CompactionStats",
@@ -100,5 +106,7 @@ __all__ = [
     "render_memory_md",
     "render_plan_md",
     "render_todo_md",
+    "safe_thread_projection_prefix",
+    "thread_projection_prefix",
     "trim_to_recent_turns",
 ]

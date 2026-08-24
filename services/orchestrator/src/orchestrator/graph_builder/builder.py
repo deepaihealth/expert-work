@@ -117,6 +117,7 @@ from orchestrator.context import (
     WorkingWindow,
     WorkspaceFileWriter,
     WorkspaceProjector,
+    safe_thread_projection_prefix,
 )
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
@@ -1434,7 +1435,13 @@ def build_react_graph(
         # Only-if-changed: an unchanged turn skips the sandbox round-trip and
         # leaves ``last_projection_hash`` untouched.
         projection = await _project_workspace_state(
-            workspace_writer_factory, state, ctx_obj, audit_logger
+            workspace_writer_factory,
+            state,
+            ctx_obj,
+            audit_logger,
+            prefix=safe_thread_projection_prefix(
+                (config.get("configurable") or {}).get("thread_id")
+            ),
         )
         if projection is not None and not projection.skipped:
             result_dict["last_projection_hash"] = projection.digest
@@ -2669,21 +2676,27 @@ async def _project_workspace_state(
     state: AgentState,
     ctx: ToolContext,
     audit_logger: AuditLogger | None,
+    *,
+    prefix: str | None,
 ) -> ProjectionResult | None:
     """Best-effort turn-end ``DB→/workspace`` projection (Stream CM-0).
 
     Renders ``AgentState.plan`` + recalled memories into PLAN.md / TODO.md /
-    MEMORY.md and writes them through a per-turn :class:`WorkspaceFileWriter`
-    (built from ``factory``), skipping when content is unchanged since
+    MEMORY.md under the thread's projection dir (``prefix`` — BUG-10 方案 a:
+    the user-scoped workspace root is cross-thread shared state, so a
+    ``None`` prefix means there is nowhere thread-safe to project → skip)
+    and writes them through a per-turn :class:`WorkspaceFileWriter` (built
+    from ``factory``), skipping when content is unchanged since
     ``last_projection_hash``. Never raises — projection must not break a run
     (Mini-ADR CM-A8) — returning ``None`` when disabled or on error."""
-    if factory is None:
+    if factory is None or prefix is None:
         return None
     try:
         result = await WorkspaceProjector(writer=factory(ctx)).project(
             plan=state.get("plan"),
             memories=state.get("recalled_memories") or [],
             last_digest=state.get("last_projection_hash"),
+            prefix=prefix,
         )
     except Exception:
         logger.exception("workspace_projection.turn_failed")

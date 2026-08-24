@@ -24,7 +24,7 @@ from expert_work.common.observability import (
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, Plan
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.context import WorkspaceIngester
+from orchestrator.context import WorkspaceIngester, safe_thread_projection_prefix
 from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
@@ -94,6 +94,12 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
         tenant_id = configurable_uuid(config, "tenant_id")
         if tenant_id is None:
             return {}
+        # BUG-10 (方案 a) — PLAN.md lives under the thread's own projection
+        # dir; the workspace root is user-scoped cross-thread state and must
+        # never be read here. No thread id → nothing thread-scoped to read.
+        prefix = safe_thread_projection_prefix((config.get("configurable") or {}).get("thread_id"))
+        if prefix is None:
+            return {}
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "workspace_ingest"):
             ctx = ToolContext(
                 tenant_id=tenant_id,
@@ -105,7 +111,7 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
             current = state.get("plan")
             try:
                 candidate = await token.run_cancellable(
-                    WorkspaceIngester(reader=reader).ingest_plan(current=current)
+                    WorkspaceIngester(reader=reader).ingest_plan(current=current, prefix=prefix)
                 )
             except Exception:
                 logger.warning("workspace_ingest.failed", exc_info=True)

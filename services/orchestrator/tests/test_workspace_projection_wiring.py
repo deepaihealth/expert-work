@@ -110,12 +110,21 @@ async def _run_one_turn(
 async def test_turn_end_projection_writes_plan_files() -> None:
     writer = _RecordingWriter()
     state = await _run_one_turn(writer=writer, plan=_plan(), thread_id="proj-1")
-    # PLAN.md + TODO.md projected through the writer during tools_node.
-    assert set(writer.writes) == {"PLAN.md", "TODO.md"}
-    assert "do the thing" in writer.writes["PLAN.md"]
-    assert "[x]" in writer.writes["TODO.md"]
+    # BUG-10 (方案 a) — PLAN.md + TODO.md land under the THREAD's projection
+    # dir, never the user-scoped workspace root.
+    assert set(writer.writes) == {"threads/proj-1/PLAN.md", "threads/proj-1/TODO.md"}
+    assert "do the thing" in writer.writes["threads/proj-1/PLAN.md"]
+    assert "[x]" in writer.writes["threads/proj-1/TODO.md"]
     # The projection cursor is persisted on the checkpointed state.
     assert state.get("last_projection_hash")
+
+
+async def test_traversal_bearing_thread_id_projects_nothing() -> None:
+    # A thread id that can't form a safe path (BUG-10 guard) → skip, not root.
+    writer = _RecordingWriter()
+    state = await _run_one_turn(writer=writer, plan=_plan(), thread_id="../evil")
+    assert writer.writes == {}
+    assert state.get("last_projection_hash") is None
 
 
 async def test_no_factory_means_no_projection() -> None:
