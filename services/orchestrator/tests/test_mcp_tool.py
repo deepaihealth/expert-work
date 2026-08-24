@@ -533,7 +533,7 @@ class _RaisingSession:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+    async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
         self.calls += 1
         raise ConnectionError("server down")
 
@@ -587,7 +587,7 @@ async def test_remote_client_circuit_half_open_recovers() -> None:
     import types
 
     class _OkSession:
-        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
             return types.SimpleNamespace(content=[], isError=False)
 
     client._session = _OkSession()  # type: ignore[attr-defined]
@@ -612,9 +612,47 @@ async def test_stdio_call_tool_times_out() -> None:
     )
 
     class _SlowSession:
-        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
             await asyncio.sleep(1.0)
 
     client._session = _SlowSession()  # type: ignore[attr-defined]
     with pytest.raises(MCPCallTimeoutError):
         await client.call_tool("t", {})
+
+
+# ---------------------------------------------------------------------------
+# BUG-12 — bypass the SDK's output-schema validation (真栈事故 2026-08-24)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_bypasses_sdk_validation() -> None:
+    """Both production clients must send via ``send_request`` directly and
+    never route through ``session.call_tool`` — the SDK's built-in
+    ``_validate_tool_result`` kills every call against a server that
+    declares ``outputSchema`` but returns only text content."""
+    from mcp import types as mcp_types
+
+    from orchestrator.tools.mcp import SseMCPClient, StdioMCPClient
+
+    class _ValidatingSession:
+        async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+            raise RuntimeError("Tool t has an output schema but did not return structured content")
+
+        async def send_request(self, req, result_type, **kw):  # type: ignore[no-untyped-def]
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="plain text ok")],
+                isError=False,
+            )
+
+    remote = SseMCPClient(config=MCPServerConfig(name="b", transport="sse", url="https://x/y"))
+    remote._session = _ValidatingSession()  # type: ignore[attr-defined]
+    result = await remote.call_tool("t", {"k": "v"})
+    assert result.is_error is False
+    assert result.content == "plain text ok"
+
+    stdio = StdioMCPClient(config=MCPServerConfig(name="b2", transport="stdio", command=["echo"]))
+    stdio._session = _ValidatingSession()  # type: ignore[attr-defined]
+    result = await stdio.call_tool("t", {"k": "v"})
+    assert result.is_error is False
+    assert result.content == "plain text ok"

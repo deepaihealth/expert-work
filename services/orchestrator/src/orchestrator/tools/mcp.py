@@ -352,6 +352,45 @@ class RecordingMCPClient:
         self.closed = True
 
 
+async def _call_tool_unvalidated(session: Any, name: str, args: dict[str, Any]) -> Any:
+    """Send a ``tools/call`` request, bypassing the SDK's output-schema check.
+
+    BUG-12 (真栈事故 2026-08-24): the deep-ai-health MCP server declares an
+    ``outputSchema`` on its tools but only returns text ``content`` (no
+    ``structuredContent``). mcp SDK 1.x's ``ClientSession.call_tool`` runs
+    ``_validate_tool_result`` on every non-error result and raises
+    ``RuntimeError: Tool xxx has an output schema but did not return
+    structured content`` — killing every tool call against that server.
+
+    This helper replicates only the *send* half of the SDK's ``call_tool``
+    (see ``mcp/client/session.py``) and skips the validation:
+
+    - **Why not "catch the RuntimeError and resend"**: the validation fires
+      *after* the server has already executed the tool. Re-sending the
+      request would execute a non-idempotent tool twice (e.g. create a
+      record, send a message).
+    - **Why skipping validation is lossless**: the platform only consumes
+      ``result.content`` text blocks (:func:`_render_content_blocks`);
+      ``structuredContent`` has no consumer anywhere, so the check has
+      only blast radius and zero benefit here.
+    - **X-11 (mcp 2.x migration)**: re-verify the ``send_request`` /
+      ``ClientRequest`` / ``CallToolRequest`` shapes against the new SDK
+      before bumping — this helper is coupled to the 1.x wire API.
+    """
+    # Lazy import — module top must stay SDK-free (existing convention:
+    # orchestrator imports fine in contexts without the mcp SDK).
+    from mcp import types as mcp_types
+
+    return await session.send_request(
+        mcp_types.ClientRequest(
+            mcp_types.CallToolRequest(
+                params=mcp_types.CallToolRequestParams(name=name, arguments=args),
+            )
+        ),
+        mcp_types.CallToolResult,
+    )
+
+
 @dataclass
 class StdioMCPClient:
     """Production :class:`MCPClient` — wraps the mcp SDK stdio transport.
@@ -426,7 +465,7 @@ class StdioMCPClient:
         # subprocess must not hang the agent run indefinitely (audit #7).
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(args)),
+                _call_tool_unvalidated(self._session, name, dict(args)),
                 timeout=self.config.timeout_s,
             )
         except TimeoutError as exc:
@@ -522,7 +561,7 @@ class _RemoteMCPClientBase:
             raise MCPServerUnhealthyError(msg)
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(name, dict(args)),
+                _call_tool_unvalidated(self._session, name, dict(args)),
                 timeout=self.config.timeout_s,
             )
         except TimeoutError as exc:
