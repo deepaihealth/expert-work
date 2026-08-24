@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import types
+from typing import Any
+
+import anyio
 import pytest
 
 from orchestrator import Tool, ToolContext
@@ -655,3 +661,274 @@ async def test_lenient_session_neuters_output_schema_validation() -> None:
 
     with pytest.raises(RuntimeError, match="did not return structured content"):
         await ClientSession._validate_tool_result(bare, "t", result)
+
+
+# ---------------------------------------------------------------------------
+# BUG-17 — pooled clients self-heal when the underlying session dies
+# ---------------------------------------------------------------------------
+
+
+class _DeadSession:
+    """Raises ``exc`` from every call — a session whose transport died."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    async def list_tools(self):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        raise self.exc
+
+    async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        raise self.exc
+
+
+class _HealthySession:
+    """Always-working session the fake restart swaps in."""
+
+    def __init__(self, tools: list[Any] | None = None) -> None:
+        self.tools = tools or []
+        self.calls = 0
+
+    async def list_tools(self):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return types.SimpleNamespace(tools=self.tools)
+
+    async def call_tool(self, name, args):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        return types.SimpleNamespace(
+            content=[types.SimpleNamespace(type="text", text="healed")],
+            isError=False,
+        )
+
+
+def _install_restart(
+    client: Any,
+    fresh_session: Any,
+    connect_exc: Exception | None = None,
+) -> dict[str, int]:
+    """Fake ``_open_session`` on ``client``: counts attempts, yields once (so
+    concurrent callers overlap inside the restart lock), then swaps in
+    ``fresh_session`` or raises ``connect_exc``."""
+    counter = {"restarts": 0}
+
+    async def fake_open() -> tuple[Any, Any]:
+        counter["restarts"] += 1
+        await asyncio.sleep(0)
+        if connect_exc is not None:
+            raise connect_exc
+        return contextlib.AsyncExitStack(), fresh_session
+
+    client._open_session = fake_open
+    return counter
+
+
+def _stdio_client() -> Any:
+    from orchestrator.tools.mcp import StdioMCPClient
+
+    return StdioMCPClient(config=MCPServerConfig(name="fs", command=["echo"]))
+
+
+def _sse_client() -> Any:
+    from orchestrator.tools.mcp import SseMCPClient
+
+    return SseMCPClient(config=MCPServerConfig(name="r", transport="sse", url="https://x/y"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_client", [_stdio_client, _sse_client])
+@pytest.mark.parametrize(
+    "exc", [anyio.ClosedResourceError(), anyio.BrokenResourceError()], ids=["closed", "broken"]
+)
+async def test_list_tools_restarts_once_on_stream_death(make_client, exc) -> None:
+    """list_tools is idempotent — send- OR receive-side stream death triggers
+    one in-place restart and the retry returns the fresh session's tools."""
+    client = make_client()
+    dead = _DeadSession(exc)
+    client._session = dead
+    fresh = _HealthySession(tools=[_RawTool("read_file")])
+    counter = _install_restart(client, fresh)
+
+    tools = await client.list_tools()
+
+    assert [t.name for t in tools] == ["read_file"]
+    assert counter["restarts"] == 1
+    assert dead.calls == 1
+    assert fresh.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_client", [_stdio_client, _sse_client])
+async def test_list_tools_concurrent_callers_share_one_restart(make_client) -> None:
+    """N concurrent agent builds hitting one dead client reconnect exactly
+    once — late arrivals wait on the lock, then reuse the fresh session."""
+    client = make_client()
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    fresh = _HealthySession(tools=[_RawTool("t")])
+    counter = _install_restart(client, fresh)
+
+    results = await asyncio.gather(*(client.list_tools() for _ in range(8)))
+
+    assert all([t.name for t in r] == ["t"] for r in results)
+    assert counter["restarts"] == 1
+    assert dead.calls == 8  # every caller saw the dead session first
+    assert fresh.calls == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_client", [_stdio_client, _sse_client])
+async def test_call_tool_restarts_once_on_send_side_death(make_client) -> None:
+    """ClosedResourceError = the request never left the client — safe to
+    restart and resend exactly once."""
+    client = make_client()
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    fresh = _HealthySession()
+    counter = _install_restart(client, fresh)
+
+    result = await client.call_tool("t", {})
+
+    assert result.content == "healed"
+    assert result.is_error is False
+    assert counter["restarts"] == 1
+    assert dead.calls == 1
+    assert fresh.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_client", [_stdio_client, _sse_client])
+async def test_call_tool_retry_failure_propagates_without_second_restart(make_client) -> None:
+    """The retry is ONCE: a second send-side death propagates (no loop)."""
+    client = make_client()
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    still_dead = _DeadSession(anyio.ClosedResourceError())
+    counter = _install_restart(client, still_dead)
+
+    with pytest.raises(anyio.ClosedResourceError):
+        await client.call_tool("t", {})
+
+    assert counter["restarts"] == 1
+    assert dead.calls == 1
+    assert still_dead.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_client", [_stdio_client, _sse_client])
+@pytest.mark.parametrize(
+    "exc", [anyio.BrokenResourceError(), RuntimeError("mid-call death")], ids=["broken", "generic"]
+)
+async def test_call_tool_receive_side_failure_never_restarts(make_client, exc) -> None:
+    """After the request may have reached the server a non-idempotent tool
+    could have executed — receive-side/other failures must NOT be resent."""
+    client = make_client()
+    dead = _DeadSession(exc)
+    client._session = dead
+    fresh = _HealthySession()
+    counter = _install_restart(client, fresh)
+
+    with pytest.raises(type(exc)):
+        await client.call_tool("t", {})
+
+    assert counter["restarts"] == 0
+    assert dead.calls == 1
+    assert fresh.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stdio_failed_restart_leaves_client_restartable() -> None:
+    """A failed reconnect (server still redeploying) must not poison the
+    client — the next caller re-attempts the restart and heals."""
+    client = _stdio_client()
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    fresh = _HealthySession(tools=[_RawTool("t")])
+    state = {"fail": True}
+    counter = {"restarts": 0}
+
+    async def fake_open() -> tuple[Any, Any]:
+        counter["restarts"] += 1
+        await asyncio.sleep(0)
+        if state["fail"]:
+            raise ConnectionError("redeploy in progress")
+        return contextlib.AsyncExitStack(), fresh
+
+    client._open_session = fake_open
+
+    with pytest.raises(ConnectionError):
+        await client.list_tools()
+
+    state["fail"] = False  # server back up
+    tools = await client.list_tools()
+    assert [t.name for t in tools] == ["t"]
+    assert counter["restarts"] == 2
+
+
+class _SpyBreaker:
+    """Duck-typed breaker capturing the exact record_* sequence — a final
+    ``state`` assertion is tautological (record_success at the end masks a
+    spurious mid-call record_failure), the event list is not."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def allow_call(self) -> bool:
+        return True
+
+    def record_success(self) -> None:
+        self.events.append("success")
+
+    def record_failure(self) -> None:
+        self.events.append("failure")
+
+
+@pytest.mark.asyncio
+async def test_remote_healed_call_counts_as_breaker_success() -> None:
+    """A send-side death healed by restart is ONE successful logical call —
+    exactly one record_success, no record_failure anywhere in the path."""
+    client = _sse_client()
+    spy = _SpyBreaker()
+    client._breaker = spy
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    counter = _install_restart(client, _HealthySession())
+
+    result = await client.call_tool("t", {})
+
+    assert result.content == "healed"
+    assert counter["restarts"] == 1
+    assert spy.events == ["success"]
+
+
+@pytest.mark.asyncio
+async def test_remote_failed_restart_counts_as_breaker_failure() -> None:
+    client = _sse_client()
+    spy = _SpyBreaker()
+    client._breaker = spy
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    counter = _install_restart(client, _HealthySession(), connect_exc=ConnectionError("still down"))
+
+    with pytest.raises(ConnectionError):
+        await client.call_tool("t", {})
+
+    assert counter["restarts"] == 1  # attempted once
+    assert spy.events == ["failure"]  # exactly one — no double-count
+
+
+@pytest.mark.asyncio
+async def test_remote_failed_retry_counts_as_breaker_failure() -> None:
+    client = _sse_client()
+    spy = _SpyBreaker()
+    client._breaker = spy
+    dead = _DeadSession(anyio.ClosedResourceError())
+    client._session = dead
+    counter = _install_restart(client, _DeadSession(ConnectionError("server down")))
+
+    with pytest.raises(ConnectionError):
+        await client.call_tool("t", {})
+
+    assert counter["restarts"] == 1
+    assert spy.events == ["failure"]  # exactly one — no double-count
