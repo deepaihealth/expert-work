@@ -1,0 +1,25 @@
+# Langfuse UI on the prod ALB — PROD_PLACEHOLDER_LANGFUSE_DOMAIN until
+# prod is provisioned. Mirrors overlays/test/langfuse-ingress-patch.yaml
+# (full-replacement caveat: IngressRule is an unkeyed list). External
+# prerequisites at fill-in time: DNS CNAME to the prod ALB + a cert
+# covering the subdomain on the prod AlbConfig 443 listener.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: langfuse
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # 301 cleartext to 443 — the Langfuse session cookie must never ride HTTP.
+    alb.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  rules:
+    - host: PROD_PLACEHOLDER_LANGFUSE_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: langfuse-web
+                port:
+                  number: 3000

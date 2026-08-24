@@ -66,6 +66,17 @@ def resolve_secret_value(arg_value: str | None, env: dict[str, str] | None = Non
     return value
 
 
+def resolve_secret_name(arg_name: str | None, settings_name: str) -> str:
+    """``--name`` wins; empty/absent falls back to the Keycloak default.
+
+    PROD-5 generalization: the vault bootstrap needs three refs on a fresh
+    stack (KC admin-client secret + the two OSS keys the ``secret://`` refs in
+    configmap.yaml point at), and this CLI already assembles the store — one
+    optional flag beats a second seeding path.
+    """
+    return arg_name or settings_name
+
+
 async def seed_keycloak_admin_secret(store: SecretStore, *, name: str, value: str) -> None:
     """Write the Keycloak admin client secret to the vault under ``name``."""
     await store.put(name, value)
@@ -101,13 +112,14 @@ async def _amain(args: argparse.Namespace) -> int:
         session_factory = build_rls_sessionmaker(create_async_session_factory(engine))
         kek = build_kek_from_b64(settings.secret_encryption_key.get_secret_value())
         store = SqlEncryptedSecretStore(session_factory, kek=kek)
-        await seed_keycloak_admin_secret(
-            store, name=settings.keycloak_admin_secret_name, value=value
-        )
+        name = resolve_secret_name(args.name, settings.keycloak_admin_secret_name)
+        await seed_keycloak_admin_secret(store, name=name, value=value)
     finally:
         await engine.dispose()
 
-    print("OK: seeded the keycloak admin client secret into the vault")
+    # 静态文案:插值 name 会触发 CodeQL clear-text-logging(name 派生自
+    # keycloak_admin_secret_name,敏感名启发式误报;ref 名本身非机密)。
+    print("OK: seeded the secret ref into the vault")
     return 0
 
 
@@ -126,6 +138,14 @@ def main() -> None:
         "--dsn",
         default=None,
         help="Override the DB DSN (default: Settings.db_dsn / EXPERT_WORK_DB_DSN).",
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help=(
+            "Vault ref name to seed (default: settings.keycloak_admin_secret_name). "
+            "E.g. expert-work/platform/oss/access-key for the object-store refs."
+        ),
     )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(_amain(args)))

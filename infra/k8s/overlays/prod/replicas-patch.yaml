@@ -1,0 +1,12 @@
+# 单副本首发(2026-08-24 拍板,ROADMAP PROD-1):live SSE 的 StreamBridge 是
+# 进程内实现,2 副本下非属主副本的 /events attach 只有一次性补库无实时帧。
+# 首发收敛到 1 副本换周三上线;PROD-1(跨副本兜底,b1 轮询 run_event)做完
+# 后删掉本 patch 回到 base 的 2 副本再扩容。
+# 注意:分布式语义(postgres checkpointer / redis quota / sql_encrypted)
+# 保持开启 —— 单副本只是数量,不是退回 SINGLE_INSTANCE 模式,扩容时零配置变更。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+spec:
+  replicas: 1

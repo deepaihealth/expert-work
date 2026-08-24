@@ -1,0 +1,13 @@
+# Production values for base/langfuse/config.yaml's neutral blanks —
+# PROD_PLACEHOLDER_* until prod is provisioned. Mirrors
+# overlays/test/langfuse-configmap-patch.yaml(同一平台 bucket 的
+# `langfuse/` 前缀,decision 2026-07-31)。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langfuse-config
+data:
+  NEXTAUTH_URL: "https://PROD_PLACEHOLDER_LANGFUSE_DOMAIN"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "PROD_PLACEHOLDER_OSS_BUCKET"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "https://PROD_PLACEHOLDER_OSS_ENDPOINT"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "PROD_PLACEHOLDER_OSS_REGION"

@@ -21,7 +21,8 @@
 # the `chore(deploy): ... newTag ...` record PR after the release checks
 # out (repo convention, see e.g. #1074/#1075).
 #
-# prod is wired as a refusal until W4 provisions it.
+# prod prerequisites live OUTSIDE git (kubeconfig + params file) —
+# see docs/runbooks/production-release.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,12 +31,18 @@ readonly SCRIPT_DIR REPO_ROOT
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 <env> [--tag <sha>] [--images control-plane,admin-ui] [--dry-run]
+Usage: $0 <env> [--tag <sha>] [--images control-plane,admin-ui] [--dry-run] [--yes]
 
-  env         target environment: test (prod refuses until W4)
+  env         target environment: test | prod
   --tag       image tag basis (default: current git short HEAD)
   --images    subset to build/deploy (default: both)
   --dry-run   print every step without executing anything
+  --yes       skip the interactive prod confirmation (CI / scripted use)
+
+prod prerequisites (docs/runbooks/production-release.md):
+  ~/.kube/expert-work-prod.yaml          cluster kubeconfig
+  ~/.kube/expert-work-prod-params.env    PROD_DOMAIN= / PROD_LANGFUSE_DOMAIN=
+  overlay free of PROD_PLACEHOLDER_*     (checked before anything builds)
 EOF
     exit 2
 }
@@ -47,6 +54,7 @@ shift
 tag=""
 images="control-plane,admin-ui"
 dry_run=0
+assume_yes=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tag)
@@ -61,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             dry_run=1
+            shift
+            ;;
+        --yes)
+            assume_yes=1
             shift
             ;;
         -h | --help) usage ;;
@@ -83,8 +95,40 @@ case "${env_name}" in
         ADMIN_UI_TAG_SUFFIX="-test"
         ;;
     prod)
-        echo "prod is not provisioned yet (W4) — refusing." >&2
-        exit 1
+        # PROD-5(2026-08-24)— prod path. Domains are NOT hardcoded here:
+        # they live in ~/.kube/expert-work-prod-params.env (same home as the
+        # test cluster's params file), so git stays free of prod real values
+        # and this script is final before the domain even exists.
+        KUBECONFIG_PATH="${HOME}/.kube/expert-work-prod.yaml"
+        OVERLAY="${REPO_ROOT}/infra/k8s/overlays/prod"
+        PARAMS_FILE="${HOME}/.kube/expert-work-prod-params.env"
+        if [[ ! -f "${KUBECONFIG_PATH}" || ! -f "${PARAMS_FILE}" ]]; then
+            echo "prod prerequisites missing (kubeconfig and/or params file):" >&2
+            echo "  ${KUBECONFIG_PATH}" >&2
+            echo "  ${PARAMS_FILE}  (PROD_DOMAIN= / PROD_LANGFUSE_DOMAIN=)" >&2
+            echo "see docs/runbooks/production-release.md (开荒清单)." >&2
+            exit 1
+        fi
+        # Extract only the two keys instead of sourcing — a stray
+        # OVERLAY=/KUBECONFIG_PATH= line in the params file must not be
+        # able to silently repoint the release (review M-9). `|| true`
+        # keeps the missing-key case on the friendly error below instead
+        # of dying in set -e (review NEW-3); quotes are stripped so a
+        # dotenv-style quoted value doesn't get baked into the image URL
+        # (review NEW-4).
+        PROD_DOMAIN="$(grep -E '^PROD_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_LANGFUSE_DOMAIN="$(grep -E '^PROD_LANGFUSE_DOMAIN=' "${PARAMS_FILE}" | tail -1 | cut -d= -f2- || true)"
+        PROD_DOMAIN="${PROD_DOMAIN%\"}"; PROD_DOMAIN="${PROD_DOMAIN#\"}"
+        PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN%\"}"; PROD_LANGFUSE_DOMAIN="${PROD_LANGFUSE_DOMAIN#\"}"
+        if [[ -z "${PROD_DOMAIN}" || -z "${PROD_LANGFUSE_DOMAIN}" ]]; then
+            echo "PROD_DOMAIN / PROD_LANGFUSE_DOMAIN not set in ${PARAMS_FILE}." >&2
+            exit 1
+        fi
+        OIDC_ISSUER="https://${PROD_DOMAIN}/kc/realms/expert-work"
+        OIDC_CLIENT_ID="expert-work-admin-ui"
+        OIDC_AUDIENCE="expert-work-api-internal"
+        LANGFUSE_BASE_URL="https://${PROD_LANGFUSE_DOMAIN}"
+        ADMIN_UI_TAG_SUFFIX="-prod"
         ;;
     *)
         echo "Unknown env: ${env_name}" >&2
@@ -92,6 +136,37 @@ case "${env_name}" in
         ;;
 esac
 readonly KUBECONFIG_PATH OVERLAY
+
+# ------------------------------------------------------- prod-only guards
+if [[ "${env_name}" == "prod" ]]; then
+    # Placeholder scan BEFORE the (10-minute) image builds. Scan the
+    # RENDERED manifests, not the raw directory — raw text would hit
+    # comments and the secrets.env.example template, refusing forever
+    # (and its "fill these" output would push real secrets toward git).
+    # PROD_PLACEHOLDER_TAG is exempt: step 2 (kustomize edit) replaces
+    # it on the first release.
+    # Two steps so a kustomize failure trips set -e instead of the
+    # `|| true` silently blanking the guard (review NEW-7).
+    rendered="$(kustomize build "${OVERLAY}")"
+    leftover="$(printf '%s\n' "${rendered}" | grep -n "PROD_PLACEHOLDER" | grep -v "PROD_PLACEHOLDER_TAG" || true)"
+    if [[ -n "${leftover}" ]]; then
+        echo "prod overlay still renders PROD_PLACEHOLDER_* values — fill them first:" >&2
+        echo "${leftover}" >&2
+        exit 1
+    fi
+    if [[ "${dry_run}" -eq 0 && "${assume_yes}" -eq 0 ]]; then
+        if [[ ! -t 0 ]]; then
+            echo "non-interactive stdin: pass --yes to release to prod." >&2
+            exit 1
+        fi
+        echo "About to release to PRODUCTION (${PROD_DOMAIN})."
+        read -r -p "Type 'prod' to continue: " reply
+        if [[ "${reply}" != "prod" ]]; then
+            echo "aborted." >&2
+            exit 1
+        fi
+    fi
+fi
 
 if [[ -z "${tag}" ]]; then
     tag="$(git -C "${REPO_ROOT}" rev-parse --short HEAD)"

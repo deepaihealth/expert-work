@@ -3,7 +3,7 @@
 # (W2 spec §3.3). Image tags live in ACR forever, so rollback is a
 # seconds-level image switch — no rebuild.
 #
-#   tools/deploy/rollback.sh test <tag> [--images control-plane,admin-ui] [--dry-run]
+#   tools/deploy/rollback.sh <env> <tag> [--images control-plane,admin-ui] [--dry-run]
 #
 # <tag> is the CONTROL-PLANE tag of the release to return to (the bare
 # main sha); admin-ui is switched to <tag><env-suffix> in lockstep, the
@@ -22,7 +22,7 @@ usage() {
     cat >&2 <<EOF
 Usage: $0 <env> <tag> [--images control-plane,admin-ui] [--dry-run]
 
-  env         target environment: test (prod refuses until W4)
+  env         target environment: test | prod
   tag         control-plane tag to roll back to (bare main sha);
               admin-ui switches to <tag><env-suffix> in lockstep
   --images    subset to roll back (default: both)
@@ -63,8 +63,14 @@ case "${env_name}" in
         ADMIN_UI_TAG_SUFFIX="-test"
         ;;
     prod)
-        echo "prod is not provisioned yet (W4) — refusing." >&2
-        exit 1
+        # Deliberately NO confirmation gate here (release.sh has one):
+        # rollback is the firefighting path — seconds matter.
+        KUBECONFIG_PATH="${HOME}/.kube/expert-work-prod.yaml"
+        ADMIN_UI_TAG_SUFFIX="-prod"
+        if [[ ! -f "${KUBECONFIG_PATH}" ]]; then
+            echo "missing ${KUBECONFIG_PATH} — see docs/runbooks/production-release.md." >&2
+            exit 1
+        fi
         ;;
     *)
         echo "Unknown env: ${env_name}" >&2
@@ -103,7 +109,10 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
+# smoke failure must not read as rollback failure — by this point the
+# image switch has already been applied (review M-11).
+run "${SCRIPT_DIR}/smoke.sh" "${env_name}" \
+    || echo "WARNING: smoke failed/skipped — the rollback image switch itself is already applied." >&2
 
 echo
 echo "Rolled back to ${tag}. Now make the record match reality:"

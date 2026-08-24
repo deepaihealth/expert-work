@@ -1,0 +1,193 @@
+# 生产发布 runbook —— 开荒 + 发布 + 回滚
+
+> PROD-5(2026-08-24)。读者:执行生产首发的运维/负责人。测试环境的既有惯例
+> (fresh tag / 记录 PR / smoke)原样沿用,本文只写生产差异与一次性开荒。
+> K8s 侧唯一事实源是 `infra/k8s/overlays/prod/`;本文是操作顺序,不是配置副本。
+
+## 拍板记录(2026-08-24)
+
+| 决策 | 内容 | 恢复点 |
+|---|---|---|
+| 单副本首发 | control-plane `replicas: 1`(`overlays/prod/replicas-patch.yaml`),分布式语义(postgres checkpointer / redis quota / sql_encrypted)保持开启 | ROADMAP PROD-1(live SSE 跨副本兜底)做完 → 删该 patch 回 base 2 副本 |
+| 书面接受单层租户隔离 | 生产库只有 ORM WHERE 一层;RLS 完全惰性。**应用账号必须建成非 superuser、无 bypassrls**,给日后 FORCE RLS 留门 | 发布后第一波捞回 RLS PR B(ROADMAP PROD-3) |
+| 告警走企微群机器人 | P0(+@all)/P1/P2 全进「生产告警」群,经 wecom-adapter(PROD-2) | 通道扩展(邮件/电话)按需另议 |
+
+## 0. 资源开通清单(全部齐了才能进 §1)
+
+| 资源 | 要求 | 产出物 |
+|---|---|---|
+| ACS prod 集群(杭州) | 装 ack-sandbox-manager 组件(记下 adminApiKey)+ ALB Ingress controller | kubeconfig → `~/.kube/expert-work-prod.yaml` |
+| RDS PG16 | 三库三账号:应用库 + `keycloak` + `langfuse`,**全部非 superuser** | host + 三组账号密码 |
+| Redis 社区版 7.0 | **实例级 `maxmemory-policy=noeviction`**(部署时 `CONFIG GET` 验证);DB 0=平台 / DB 1=Langfuse | host + 密码 |
+| OSS bucket | 平台文档/产物 + `langfuse/` 前缀共 bucket;RAM AK/SK | endpoint / bucket / region / AK/SK |
+| 通用型 NAS | 挂载点 + 手工建 `/workspaces` 目录(mount 后 mkdir;回收站开 7 天,照 test 勘误 #1144) | 挂载点域名 |
+| 域名 ×3 + 证书 | 主域名 / Langfuse 子域名 / 沙箱网关域名;泛域名证书或逐张 | DNS CNAME → prod ALB;证书上传阿里云 |
+| 企微「生产告警」群 | 群机器人 webhook URL | 进 `wecom-alert-webhook` Secret(§1.6) |
+
+## 1. 开荒(一次性,建议发布前一天完成)
+
+### 1.1 本机接线(不进 git)
+
+```sh
+# kubeconfig
+cp <下载的凭据> ~/.kube/expert-work-prod.yaml
+# 域名参数(release.sh / smoke.sh prod 都从这读)
+cat > ~/.kube/expert-work-prod-params.env <<'EOF'
+PROD_DOMAIN=<主域名>
+PROD_LANGFUSE_DOMAIN=<langfuse 子域名>
+EOF
+# 值不要加引号(脚本按键提取不走 shell 解析;带引号会被烤进 admin-ui 镜像 URL)
+```
+
+### 1.2 填 overlay 占位符
+
+`infra/k8s/overlays/prod/` 里 grep `PROD_PLACEHOLDER` 逐个替换(域名 / OSS 三
+元组 / NAS 挂载点 / 沙箱网关域名 / 管理员邮箱)。`newTag: PROD_PLACEHOLDER_TAG`
+**不用手填** —— 首次 `release.sh prod` 自动钉。填完提交 PR(占位符替换是配置
+变更,走评审)。`release.sh prod` 在构建前会拒绝任何残留占位符。
+
+### 1.3 集群侧一次性对象
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
+# namespace 先行 —— §1.4 的 create secret 都指定 -n expert-work,
+# namespace 要到 apply -k 才会出现,所以单独提前建:
+kubectl apply -f infra/k8s/base/namespace.yaml
+# AlbConfig 监听(prod 变体):照 infra/k8s/cluster/albconfig-listeners-patch.yaml
+# 的头注新建 prod 文件(prod 有自己的 ALB 实例与证书 id,勿复用 test 的),
+# kubectl patch albconfig alb --type merge --patch-file <prod 文件>
+# SandboxSet(namespace 语义见文件头注,by hand,不进 kustomize):
+kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
+```
+
+### 1.4 Secrets(六个 + 企微)
+
+按 `infra/k8s/overlays/prod/secrets.env.example` 填一份本地副本(**绝不提交**),
+切五个 dotenv Secret:
+
+```sh
+grep -E '^EXPERT_WORK_' secrets.env | grep -v '^EXPERT_WORK_CRED_PROXY_' > /tmp/cp.env
+kubectl create secret generic control-plane-secrets    -n expert-work --from-env-file=/tmp/cp.env
+grep -E '^(KEYCLOAK_|KC_DB_)' secrets.env > /tmp/kc.env
+kubectl create secret generic keycloak-secrets         -n expert-work --from-env-file=/tmp/kc.env
+grep -E '^GRAFANA_' secrets.env > /tmp/obs.env
+kubectl create secret generic observability-secrets    -n expert-work --from-env-file=/tmp/obs.env
+grep -E '^(DATABASE_URL|SALT|ENCRYPTION_KEY|CLICKHOUSE_|REDIS_CONNECTION_STRING|LANGFUSE_|NEXTAUTH_SECRET)' secrets.env > /tmp/lf.env
+kubectl create secret generic langfuse-secrets         -n expert-work --from-env-file=/tmp/lf.env
+grep -E '^EXPERT_WORK_CRED_PROXY_' secrets.env > /tmp/cred.env
+kubectl create secret generic credential-proxy-secrets -n expert-work --from-env-file=/tmp/cred.env
+rm -f /tmp/cp.env /tmp/kc.env /tmp/obs.env /tmp/lf.env /tmp/cred.env
+```
+
+第六个是 **`control-plane-secret-files`**(deployment 的文件挂载,`optional:
+false` —— 不建则 pod 卡 FailedMount 起不来;sql_encrypted 后端不读它,内容可为
+空,但 Secret 对象必须存在):
+
+```sh
+: > /tmp/secret-store.env
+kubectl create secret generic control-plane-secret-files -n expert-work \
+  --from-file=secret-store.env=/tmp/secret-store.env && rm /tmp/secret-store.env
+```
+
+企微告警 URL 单独:
+
+```sh
+kubectl create secret generic wecom-alert-webhook -n expert-work \
+  --from-literal=WECOM_WEBHOOK_URL='<群机器人 URL>'
+```
+
+所有随机密钥(`SECRET_ENCRYPTION_KEY` 等)生产**新铸**,绝不复用 test 值。
+
+### 1.5 首次发布(两跑,第一跑预期红)
+
+```sh
+tools/deploy/release.sh prod        # 交互确认输入 'prod'
+```
+
+= build 双镜像(admin-ui 烤 prod OIDC)→ 钉 newTag → migrate(空库全量)→
+apply → rollout → smoke。**第一跑预期在 control-plane rollout 卡住**:prod 直上
+`sql_encrypted` 后端,lifespan 启动即解析 OSS `secret://` ref,金库还是空的 →
+CrashLoopBackOff。这不是故障,是鸡生蛋:表结构(migrate)已就位,先去 §1.6
+seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
+`kubectl -n expert-work rollout restart deploy/control-plane`)转绿。smoke 的
+公网检查在 DNS 生效前也会红,先看 `/healthz/ready` 与 pods 两项。
+
+### 1.6 应用层 seed(顺序敏感,按编号执行)
+
+1. **Keycloak realm 三件**(漏了登录/首装直接失败,见 deployment.md §6.7):
+   - kcadm 给 `expert-work-admin-ui` client 加 `https://<主域名>/*` redirectUris + webOrigins(realm 文件 seed 的是 localhost);
+   - kcadm `update users/profile -r expert-work -s unmanagedAttributePolicy=ENABLED`;
+   - **轮换 realm 内嵌的 dev 秘密**(base realm 文件带 dev client secret 与 dev 用户密码,base/kustomization.yaml 头注的硬警告):重置 `expert-work-api-internal` client secret(**记下新值,下一步进金库**)、删 dev 用户。
+
+2. **金库 seed 三条**(control-plane 转绿的前提)。pod 起不来,用一次性
+   seed pod(同镜像同 env,不跑 uvicorn):
+
+   ```sh
+   TAG=<刚发布的 control-plane tag>
+   kubectl -n expert-work run vault-seed --restart=Never \
+     --image=crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:$TAG \
+     --overrides='{"spec":{"containers":[{"name":"vault-seed","image":"crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:'$TAG'","command":["sleep","3600"],"envFrom":[{"configMapRef":{"name":"control-plane-config"}},{"secretRef":{"name":"control-plane-secrets"}}]}]}}'
+   kubectl -n expert-work wait --for=condition=Ready pod/vault-seed --timeout=180s
+   # ① KC admin-client secret(值 = 步骤 1 重置出的 expert-work-api-internal client secret):
+   kubectl -n expert-work exec vault-seed -- \
+     python -m control_plane.seed_keycloak_secret --value '<client secret>'
+   # ②③ OSS AK/SK(configmap 的 EXPERT_WORK_OBJECT_STORE_*_REF 两个 secret:// ref
+   # 所指;--name 走同一 CLI,PROD-5 加的通用模式):
+   kubectl -n expert-work exec vault-seed -- \
+     python -m control_plane.seed_keycloak_secret \
+       --name expert-work/platform/oss/access-key --value '<OSS AK>'
+   kubectl -n expert-work exec vault-seed -- \
+     python -m control_plane.seed_keycloak_secret \
+       --name expert-work/platform/oss/secret-key --value '<OSS SK>'
+   kubectl -n expert-work delete pod vault-seed
+   ```
+
+3. **control-plane 转绿**:重跑 §1.5 第二跑,smoke 全绿为准。
+4. **首个平台管理员**:configmap 已设 `EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL`,
+   该邮箱首登自动升(兜底走 bootstrap-admin.md break-glass)。
+5. **租户开通 + LLM key**:admin-ui 建租户 → 金库粘贴 LLM provider key。
+6. **平台技能导入(可选,可发布后补)**:`POST /v1/platform/skills/import`
+   (幂等;见 skill-packaging.md)。注意:X-6 的 52 个导出包**尚未推过任何
+   环境**,物料在导出会话的产出目录,导入前先定位物料并在 test 环境演练一遍;
+   不阻塞发布。
+
+### 1.7 金丝雀(发布合格判据)
+
+手动跑一条真 run(来源 ROADMAP X-14 P1 的判据,自动化进 release.sh 未做,
+首发手动;canonical-agent-e2e-test.md 是全量 SOP,以下是首发最小闭环):
+
+1. 用 §1.6.5 的租户建一个带沙箱工具的 Agent(或导入 test 环境验证过的配置);
+2. 调试台发一条要求「用 exec_python 算个结果,write_file 写 /workspace,
+   save_artifact 产出文件」的消息;
+3. 断言:run 终态 success、工具卡三个全绿、产物在会话附件里**能下载**;
+4. Langfuse 里能看到该 run 的 trace(观测链路活着)。
+
+**任何一步红 = 不对外开放**,rollback.sh 待命。
+
+## 2. 日常发布
+
+```sh
+tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
+```
+
+与 test 同惯例:fresh tag、newTag 变更提交 `chore(deploy)` 记录 PR(**记录里
+写上一版 tag** —— X-14 P5,回滚一键可查)、smoke 全绿 + §1.7 金丝雀后才算完。
+发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
+
+## 3. 回滚
+
+```sh
+tools/deploy/rollback.sh prod <上一版 tag>     # 秒级 set image,无确认门
+```
+
+带破坏性迁移的版本回滚需要人(rollback.sh 头注);回滚后同样补记录 PR。
+
+## 4. 已接受风险与延后项(首发)
+
+- 单副本:pod 挂 = 分钟级中断到重新调度;live SSE 跨副本兜底(PROD-1)做完才扩。
+- 单层租户隔离(RLS 惰性):发布后第一波。
+- 金丝雀未自动化(PROD-7)、触发器投递 CAS(X-3,单副本无风险)、配额维度混扣
+  (B-19,给第三方配配额前必修)、供应商 RPM 进程内限流(扩容前必须全局化,PROD-12)。
+- retention-cleanup-job / billing-rollup-job / event-log-archive-job /
+  audit-backup-worker:**只有代码没有部署物**(infra/k8s 零 CronJob),test 也
+  没跑,首发保持一致;retention job 部署前必须先修 X-15①(第二套审批超时)。
