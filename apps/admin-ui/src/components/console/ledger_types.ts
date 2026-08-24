@@ -9,6 +9,7 @@
  */
 import type { SseEvent } from "../../api/sessions";
 import type { TrajectoryRow } from "../../api/trajectory_rows";
+import type { TurnStatus } from "../turn/types";
 
 /** 0 输入 / 1 模型 / 2 工具(泳道纵向顺序)。 */
 export type LedgerLane = 0 | 1 | 2;
@@ -79,7 +80,7 @@ export interface LedgerTurn {
   key: string;
   seq: number;
   runId: string | null;
-  status: "running" | "done" | "error";
+  status: TurnStatus;
   firstIndex: number;
   lastIndex: number;
   requestNos: number[];

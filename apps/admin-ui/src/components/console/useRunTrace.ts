@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getRun } from "../../api/runs";
 import { getRunTrace, type RunTrace } from "../../api/trace_facade";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import type { TurnStatus } from "../turn/types";
 
 // A just-finished run's Langfuse trace lands as `not_ready` for a moment
 // (ingestion isn't atomic — the root closes before its child observations
@@ -40,7 +41,7 @@ export function useRunTrace(args: {
   runId: string | null;
   /** The panel showing this turn is actually displayed — the fetch is lazy. */
   enabled: boolean;
-  turnStatus: "running" | "done" | "error";
+  turnStatus: TurnStatus;
   /** system_admin — Langfuse has no per-tenant isolation, so the deep link
    *  (and the `trace_id` lookup behind it) is admin-only. */
   wantTraceId: boolean;
@@ -103,7 +104,9 @@ export function useRunTrace(args: {
   // moment this turn completes, so the exact view auto-refreshes instead of
   // needing a manual click.
   useEffect(() => {
-    if (turnStatus === "done") setTrace(null);
+    // BUG-9 — interrupted is terminal too: its partial trace has closed in
+    // Langfuse, so re-arm the fetch the same way a completed turn does.
+    if (turnStatus === "done" || turnStatus === "interrupted") setTrace(null);
   }, [turnStatus]);
 
   // system_admin only — Langfuse has no per-tenant isolation. Best-effort:

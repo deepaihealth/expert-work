@@ -24,7 +24,7 @@ from expert_work.common.observability import (
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, Plan
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.context import WorkspaceIngester
+from orchestrator.context import WorkspaceIngester, safe_thread_projection_prefix
 from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
@@ -94,6 +94,29 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
         tenant_id = configurable_uuid(config, "tenant_id")
         if tenant_id is None:
             return {}
+        configurable = config.get("configurable") or {}
+        # BUG-10 终审 F3 — delegated child runs mint throwaway sub-threads
+        # nobody steers; skip so each delegation doesn't grow an orphan
+        # threads/<uuid>/ dir in the user workspace.
+        if configurable.get("child_run"):
+            return {}
+        # BUG-10 (方案 a) — PLAN.md lives under the thread's own projection
+        # dir; the workspace root is user-scoped cross-thread state and must
+        # never be read here. ``configurable_uuid`` structurally guarantees a
+        # UUID (终审 F8 — same helper the memory nodes use), which also means
+        # non-UUID threads (e.g. skill-evolution replays) skip, matching how
+        # those paths already bypass the memory nodes. No/invalid thread id →
+        # nothing thread-scoped to read — but say so (终审 F5): silent skip
+        # here means "PLAN.md steering stopped working" with nothing to grep.
+        thread_id = configurable_uuid(config, "thread_id")
+        prefix = safe_thread_projection_prefix(thread_id)
+        if prefix is None:
+            logger.warning(
+                "workspace_ingest.no_thread_scope",
+                extra={"thread_id": str(configurable.get("thread_id"))},
+            )
+            _cm_ingest_total.labels(outcome="skipped_no_thread").inc()
+            return {}
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "workspace_ingest"):
             ctx = ToolContext(
                 tenant_id=tenant_id,
@@ -105,7 +128,7 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
             current = state.get("plan")
             try:
                 candidate = await token.run_cancellable(
-                    WorkspaceIngester(reader=reader).ingest_plan(current=current)
+                    WorkspaceIngester(reader=reader).ingest_plan(current=current, prefix=prefix)
                 )
             except Exception:
                 logger.warning("workspace_ingest.failed", exc_info=True)

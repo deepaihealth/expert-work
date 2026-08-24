@@ -1157,6 +1157,7 @@ export interface TranslationKeys {
     row_inspect: string;
     footer_status_running: string;
     footer_status_done: string;
+    footer_status_interrupted: string;
     footer_status_error: string;
     plan_title: string;
     plan_progress: string;
@@ -3837,7 +3838,7 @@ const en: TranslationKeys = {
     pw_label: "Project plan to workspace",
     pw_brief: "Syncs plan/progress files into the workspace",
     pw_impact:
-      "At the end of each turn, write PLAN.md / TODO.md / MEMORY.md into the user's workspace, and read them back when the next run starts — so progress is visible both inside and outside the sandbox. It also needs the deployment to have the sandbox supervisor wired up to actually take effect.\nThis switch only controls whether that file sync happens — it has nothing to do with whether files stick around. A run tied to a user identity already keeps its workspace files regardless (restored automatically next time, even after an idle cleanup); a system run with no user identity always gets a throwaway workspace — neither case depends on this switch.\nExample: a long research task gets interrupted midway — with this on, the next run can pick up right where PLAN.md left off; with this off, the agent still knows the plan, it just doesn't write these files to sync it.",
+      "At the end of each turn, write PLAN.md / TODO.md / MEMORY.md into the conversation's own threads/<thread_id>/ directory in the user's workspace, and read them back when the next run starts — so progress is visible both inside and outside the sandbox (one directory per conversation, no cross-thread bleed). It also needs the deployment to have the sandbox supervisor wired up to actually take effect.\nThis switch only controls whether that file sync happens — it has nothing to do with whether files stick around. A run tied to a user identity already keeps its workspace files regardless (restored automatically next time, even after an idle cleanup); a system run with no user identity always gets a throwaway workspace — neither case depends on this switch.\nExample: a long research task gets interrupted midway — with this on, the next run can pick up right where PLAN.md left off; with this off, the agent still knows the plan, it just doesn't write these files to sync it.",
     platform_note_title: "Platform-effective values",
     platform_note_intro:
       "The following are decided by the platform deployment — the manifest has no say:",
@@ -4259,6 +4260,7 @@ const en: TranslationKeys = {
     row_inspect: "Trajectory",
     footer_status_running: "Running",
     footer_status_done: "Done",
+    footer_status_interrupted: "Interrupted",
     footer_status_error: "Failed",
     plan_title: "Tasks",
     plan_progress: "{{done}} done · {{doing}} in progress · {{todo}} pending",

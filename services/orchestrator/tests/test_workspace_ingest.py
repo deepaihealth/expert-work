@@ -104,14 +104,14 @@ async def test_ingest_returns_none_when_unchanged() -> None:
     plan = _plan()
     reader = _StubReader(contents={"PLAN.md": render_plan_md(plan)})
     # The projected file matches the DB plan → no edit → no-op.
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=plan) is None
+    assert await WorkspaceIngester(reader=reader).ingest_plan(current=plan, prefix="") is None
 
 
 async def test_ingest_returns_candidate_on_edit() -> None:
     plan = _plan()
     edited = render_plan_md(plan).replace("- [ ] 3. review", "- [x] 3. review")
     reader = _StubReader(contents={"PLAN.md": edited})
-    candidate = await WorkspaceIngester(reader=reader).ingest_plan(current=plan)
+    candidate = await WorkspaceIngester(reader=reader).ingest_plan(current=plan, prefix="")
     assert candidate is not None
     assert candidate.steps[2].status == "completed"
     assert candidate != plan
@@ -119,18 +119,18 @@ async def test_ingest_returns_candidate_on_edit() -> None:
 
 async def test_ingest_returns_none_when_file_absent() -> None:
     reader = _StubReader(contents={})
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan()) is None
+    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
 
 
 async def test_ingest_returns_none_on_unparseable_file() -> None:
     reader = _StubReader(contents={"PLAN.md": "garbage that is not a plan"})
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan()) is None
+    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
 
 
 async def test_ingest_swallows_reader_failure() -> None:
     reader = _StubReader(contents={}, raise_on_read=True)
     # A read failure must not raise — projection/ingest never breaks a run.
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan()) is None
+    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
 
 
 # ---------------------------------------------------------------------------
@@ -185,3 +185,37 @@ async def test_sandbox_reader_raises_on_io_error() -> None:
     reader = SandboxWorkspaceReader(client=client, ctx=_reader_ctx())
     with pytest.raises(FileOpError):
         await reader.read("PLAN.md")
+
+
+# ---------------------------------------------------------------------------
+# BUG-10 (方案 a) — thread-scoped ingest path
+# ---------------------------------------------------------------------------
+
+
+async def test_ingest_reads_only_the_thread_scoped_plan() -> None:
+    plan = _plan()
+    edited = render_plan_md(plan).replace("- [ ] 3. review", "- [x] 3. review")
+    # A stale legacy root PLAN.md sits next to the thread's own file — only
+    # the thread-scoped path may be read (BUG-10: user-scoped workspaces made
+    # the root file cross-thread shared state).
+    reader = _StubReader(
+        contents={
+            "PLAN.md": "**Goal:** stale cross-thread plan\n\n- [ ] 1. old step",
+            "threads/t-1/PLAN.md": edited,
+        }
+    )
+    candidate = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=plan, prefix="threads/t-1/"
+    )
+    assert candidate is not None
+    assert candidate.steps[2].status == "completed"
+
+
+async def test_ingest_ignores_legacy_root_plan_for_a_fresh_thread() -> None:
+    # Fresh thread: no thread-dir PLAN.md. The legacy root file (another
+    # thread's plan) must NOT seed this thread's state.
+    reader = _StubReader(contents={"PLAN.md": render_plan_md(_plan())})
+    assert (
+        await WorkspaceIngester(reader=reader).ingest_plan(current=None, prefix="threads/t-2/")
+        is None
+    )

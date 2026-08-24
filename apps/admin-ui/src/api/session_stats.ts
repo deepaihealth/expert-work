@@ -8,6 +8,7 @@
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-5-brief.md.
  */
 import type { TurnTiming } from "../components/console/types";
+import type { TurnStatus } from "../components/turn/types";
 import type { RateCardRecord } from "./rate_card";
 import type { RunTokens } from "./runs";
 import type { SseEvent } from "./sessions";
@@ -18,7 +19,7 @@ export interface StatsTurnInput {
   /** ``events`` is complete (live turns are always ``true``; history turns
    *  only once ``loadState === "done"``). */
   loaded: boolean;
-  status: "running" | "done" | "error";
+  status: TurnStatus;
   /** Used only when ``!loaded`` (unloaded history turn's persisted rollup). */
   tokens: RunTokens | null;
   timing: TurnTiming | null;
@@ -129,7 +130,12 @@ export function computeSessionStats(
       turnInput = c.inputTokens;
       turnOutput = c.outputTokens;
       turnCacheRead = c.cacheReadTokens;
-      if (c.stepCount >= 1 || t.status === "running") turnsCount += 1;
+      // 终审 F6 — a cancelled-before-first-step turn has stepCount 0 but is
+      // still a turn: without this the 轮数 visibly drops by 1 the moment the
+      // interrupted turn's lazy load lands (unloaded turns count at line
+      // below unconditionally).
+      if (c.stepCount >= 1 || t.status === "running" || t.status === "interrupted")
+        turnsCount += 1;
     } else {
       if (t.tokens) {
         turnInput = t.tokens.input_tokens;

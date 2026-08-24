@@ -49,6 +49,8 @@ const STATUS_TAG_COLOR: Record<Turn["status"], string> = {
   running: "processing",
   done: "success",
   error: "error",
+  // BUG-9 — a cancelled/broken-off run is neither success nor failure.
+  interrupted: "warning",
 };
 
 export function TurnFooter({
@@ -117,7 +119,9 @@ export function TurnFooter({
       <span className="ew-turn-footer__acts">
         {/* SE-16 — per-turn 👍/👎 quality signal. Settled, non-read-only turns
             only. Track C W2: 切入态只读——反馈是写操作,置灰 + Tooltip。 */}
-        {!readOnly && status === "done" && threadId && (
+        {/* 终审 F4 — interrupted turns keep the feedback bar: a run that
+            broke off midway is exactly the turn worth a 👎. */}
+        {!readOnly && (status === "done" || status === "interrupted") && threadId && (
           <ReadonlyTooltip on={isTenantSwitched}>
             <FeedbackBar threadId={threadId} turnSeq={turn.seq} disabled={isTenantSwitched} />
           </ReadonlyTooltip>

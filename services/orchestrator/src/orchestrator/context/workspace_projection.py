@@ -33,10 +33,36 @@ from expert_work.protocol.plan import PlanStepStatus
 
 logger = logging.getLogger(__name__)
 
-#: Projected file names at the workspace root.
+#: Projected file names — since BUG-10 (方案 a) they live under a per-thread
+#: directory, never at the workspace root: the workspace is **user**-scoped
+#: and persistent (#989), so a root-level ``PLAN.md`` was cross-thread shared
+#: state — every new thread ingested the previous thread's plan at run start.
 PLAN_FILE = "PLAN.md"
 TODO_FILE = "TODO.md"
 MEMORY_FILE = "MEMORY.md"
+
+#: Workspace dir holding one subdirectory per thread's projected state.
+THREADS_DIR = "threads"
+
+
+def thread_projection_prefix(thread_id: object) -> str:
+    """The workspace-relative directory prefix (with trailing ``/``) for one
+    thread's projected state files, e.g. ``threads/<thread_id>/``."""
+    return f"{THREADS_DIR}/{thread_id}/"
+
+
+def safe_thread_projection_prefix(thread_id: object) -> str | None:
+    """:func:`thread_projection_prefix` with validation: ``None`` for a
+    missing/empty id or one carrying path separators / traversal (the id is
+    spliced into a sandbox path — a hostile value must never escape the
+    thread's own directory). Callers skip projection/ingest on ``None``."""
+    if thread_id is None:
+        return None
+    raw = str(thread_id)
+    if not raw or "/" in raw or "\\" in raw or ".." in raw:
+        return None
+    return thread_projection_prefix(raw)
+
 
 #: PLAN.md is the single canonical, round-trippable ingest source (Mini-ADR
 #: CM-A5b): edit it to steer the agent. TODO.md / MEMORY.md are read-only
@@ -50,6 +76,19 @@ _PLAN_NOTE = (
 _READONLY_NOTE = (
     "<!-- Read-only projection (the database is the source of truth). Edits "
     "here are NOT ingested — edit PLAN.md to steer the agent. -->"
+)
+
+#: BUG-10 终审 F2 — pre-方案-a workspaces carry root-level PLAN.md/TODO.md/
+#: MEMORY.md whose embedded note still claims edits are ingested; that stopped
+#: being true the moment projection moved under ``threads/``. Overwrite them
+#: once (first thread-scoped projection) with this redirect so neither a human
+#: editor nor the agent's own ``read_file`` keeps consuming stale cross-thread
+#: state.
+LEGACY_REDIRECT_NOTE = (
+    "<!-- Moved: this workspace's plan/state files now live under "
+    "threads/<thread_id>/ (one directory per conversation). This root file "
+    "is no longer read or updated — edit threads/<thread_id>/PLAN.md to "
+    "steer that conversation. -->\n"
 )
 
 #: Status ↔ checkbox marker. PLAN.md round-trips through these (render ↔ parse).
@@ -176,36 +215,57 @@ class WorkspaceProjector:
         plan: Plan | None,
         memories: Sequence[MemoryItem],
         last_digest: str | None,
+        prefix: str,
     ) -> ProjectionResult:
         """Render the projected files, and — only when their content changed
         since ``last_digest`` — write each through the seam. Best-effort: a
         failing write is logged, excluded from ``written``, and prevents the
-        digest from advancing (so the next turn retries) but never raises."""
+        digest from advancing (so the next turn retries) but never raises.
+
+        ``prefix`` is the thread-scoped directory (BUG-10 方案 a, see
+        :func:`thread_projection_prefix`) — required, no root default, so a
+        call site can never silently fall back to the shared workspace root.
+        The digest covers the prefixed rel, so identical content under a new
+        thread still projects."""
         items: list[tuple[str, str]] = []
         plan_md = render_plan_md(plan)
         if plan_md:
-            items.append((PLAN_FILE, plan_md))
+            items.append((prefix + PLAN_FILE, plan_md))
         todo_md = render_todo_md(plan)
         if todo_md:
-            items.append((TODO_FILE, todo_md))
+            items.append((prefix + TODO_FILE, todo_md))
         memory_md = render_memory_md(memories)
         if memory_md:
-            items.append((MEMORY_FILE, memory_md))
+            items.append((prefix + MEMORY_FILE, memory_md))
 
         digest = _digest(items)
         if digest == last_digest:
             logger.debug("workspace_projection.unchanged")
             return ProjectionResult(written=(), skipped=True, digest=digest)
 
+        # 终审 F2 — on the thread's FIRST projection (no cursor yet), also
+        # overwrite the legacy root files with the redirect note. Deliberately
+        # OUTSIDE the digest (a one-shot repair, not projected state — putting
+        # it in the digest would make turn 2's digest never match turn 1's)
+        # and fully best-effort: a failure here neither blocks the thread
+        # files nor pins the cursor.
+        to_write: list[tuple[str, str]] = list(items)
+        if prefix and last_digest is None:
+            to_write.extend(
+                (name, LEGACY_REDIRECT_NOTE) for name in (PLAN_FILE, TODO_FILE, MEMORY_FILE)
+            )
+
         written: list[str] = []
         all_ok = True
-        for rel, content in items:
+        for rel, content in to_write:
             try:
                 await self.writer.write(rel=rel, content=content)
             # Best-effort (CM-A8): projection must never break a run. ``Exception``
             # (not ``BaseException``) so ``asyncio.CancelledError`` still propagates.
             except Exception:
-                all_ok = False
+                # 遗留根文件改写失败不影响 digest 前进(不是投影状态)。
+                if (rel, content) in items:
+                    all_ok = False
                 logger.warning(
                     "workspace_projection.write_failed", extra={"rel": rel}, exc_info=True
                 )
@@ -243,14 +303,16 @@ class WorkspaceIngester:
 
     reader: WorkspaceFileReader
 
-    async def ingest_plan(self, *, current: Plan | None) -> Plan | None:
-        """Read + parse ``PLAN.md``. Returns the parsed plan **only** when it
-        differs from ``current`` (a genuine edit); returns ``None`` when the
-        file is absent, unparseable, or unchanged. Never raises — projection /
-        ingest must not break a run (Mini-ADR CM-A8); a read failure is logged
-        and treated as "no edit"."""
+    async def ingest_plan(self, *, current: Plan | None, prefix: str) -> Plan | None:
+        """Read + parse the thread's ``PLAN.md`` (under ``prefix`` — BUG-10
+        方案 a: never the workspace root, which is user-scoped cross-thread
+        state). Returns the parsed plan **only** when it differs from
+        ``current`` (a genuine edit); returns ``None`` when the file is
+        absent, unparseable, or unchanged. Never raises — projection / ingest
+        must not break a run (Mini-ADR CM-A8); a read failure is logged and
+        treated as "no edit"."""
         try:
-            text = await self.reader.read(PLAN_FILE)
+            text = await self.reader.read(prefix + PLAN_FILE)
         except Exception:
             logger.warning("workspace_ingest.read_failed", exc_info=True)
             return None

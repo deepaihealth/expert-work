@@ -27,8 +27,28 @@ import {
 import { summarizeTurn } from "../../../api/turn_summary";
 import { runIdOf } from "../../../components/console/console_turns";
 import { approvalItemFromEvent } from "../../../components/turn/ApprovalGate";
-import type { Attachment, Turn } from "../../../components/turn/types";
+import type { Attachment, Turn, TurnStatus } from "../../../components/turn/types";
 import { useTokenStream, type TokenStreamController } from "./useTokenStream";
+
+/** BUG-9 (live path) — the LIVE turn's terminal status from its own frames:
+ *  the backend ``end`` frame carries ``status`` (success/paused/interrupted/
+ *  error), and a cancelled run must not finalize as「已完成」in the very
+ *  session where the cancel happened (the replayed history view already
+ *  maps it honestly — the two views must agree). Anything else keeps the
+ *  pre-existing "done" mapping (paused rides the approval affordance). */
+export function terminalTurnStatus(frames: readonly SseEvent[]): TurnStatus {
+  for (let i = frames.length - 1; i >= 0; i -= 1) {
+    const f = frames[i];
+    if (f.event === "end") {
+      const status =
+        f.data !== null && typeof f.data === "object"
+          ? (f.data as Record<string, unknown>).status
+          : null;
+      return status === "interrupted" ? "interrupted" : "done";
+    }
+  }
+  return "done";
+}
 
 /** One dispatch's raw request — the shared kernel re-derives the doc note and
  *  the effective prompt from it (never a pre-baked body). */
@@ -184,10 +204,12 @@ export function useRunEngine(args: {
           );
           if (frame.event === "end") break;
         }
-        updateTurn({ status: "done" });
+        updateTurn({ status: terminalTurnStatus(frames) });
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
-          updateTurn({ status: "done" });
+          // User pressed Stop (or the page tore the stream down) — the
+          // backend lands the run as INTERRUPTED; mirror it, not "done".
+          updateTurn({ status: "interrupted" });
         } else {
           const message = err instanceof Error ? err.message : "stream failed";
           updateTurn({ status: "error", error: message });
@@ -262,13 +284,13 @@ export function useRunEngine(args: {
           );
           if (frame.event === "end") break;
         }
-        patchTurn(turnId, { status: "done" });
+        patchTurn(turnId, { status: terminalTurnStatus(frames) });
       } catch (err) {
         if (!(err instanceof Error && err.name === "AbortError")) {
           const message = err instanceof Error ? err.message : "stream failed";
           patchTurn(turnId, { status: "error", error: message });
         } else {
-          patchTurn(turnId, { status: "done" });
+          patchTurn(turnId, { status: "interrupted" });
         }
       } finally {
         tokenStream.finalize();

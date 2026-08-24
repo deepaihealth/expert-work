@@ -117,6 +117,7 @@ from orchestrator.context import (
     WorkingWindow,
     WorkspaceFileWriter,
     WorkspaceProjector,
+    safe_thread_projection_prefix,
 )
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
@@ -128,6 +129,7 @@ from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
     compaction_sink_from_config,
+    configurable_uuid,
     current_run_id,
     token_sink_from_config,
 )
@@ -1434,7 +1436,19 @@ def build_react_graph(
         # Only-if-changed: an unchanged turn skips the sandbox round-trip and
         # leaves ``last_projection_hash`` untouched.
         projection = await _project_workspace_state(
-            workspace_writer_factory, state, ctx_obj, audit_logger
+            workspace_writer_factory,
+            state,
+            ctx_obj,
+            audit_logger,
+            # 终审 F8 — ``configurable_uuid`` is the repo's thread-id lift
+            # (structurally a UUID, so path safety is guaranteed); 终审 F3 —
+            # delegated child runs skip (throwaway sub-threads, see
+            # ``_child_config``).
+            prefix=(
+                None
+                if (config.get("configurable") or {}).get("child_run")
+                else safe_thread_projection_prefix(configurable_uuid(config, "thread_id"))
+            ),
         )
         if projection is not None and not projection.skipped:
             result_dict["last_projection_hash"] = projection.digest
@@ -2669,21 +2683,33 @@ async def _project_workspace_state(
     state: AgentState,
     ctx: ToolContext,
     audit_logger: AuditLogger | None,
+    *,
+    prefix: str | None,
 ) -> ProjectionResult | None:
     """Best-effort turn-end ``DB→/workspace`` projection (Stream CM-0).
 
     Renders ``AgentState.plan`` + recalled memories into PLAN.md / TODO.md /
-    MEMORY.md and writes them through a per-turn :class:`WorkspaceFileWriter`
-    (built from ``factory``), skipping when content is unchanged since
+    MEMORY.md under the thread's projection dir (``prefix`` — BUG-10 方案 a:
+    the user-scoped workspace root is cross-thread shared state, so a
+    ``None`` prefix means there is nowhere thread-safe to project → skip)
+    and writes them through a per-turn :class:`WorkspaceFileWriter` (built
+    from ``factory``), skipping when content is unchanged since
     ``last_projection_hash``. Never raises — projection must not break a run
     (Mini-ADR CM-A8) — returning ``None`` when disabled or on error."""
     if factory is None:
+        return None
+    if prefix is None:
+        # 终审 F5 — a missing/non-UUID thread (or a delegated child run)
+        # disables projection; leave a signal instead of vanishing silently.
+        logger.info("workspace_projection.no_thread_scope")
+        _cm_projection_total.labels(outcome="skipped_no_thread").inc()
         return None
     try:
         result = await WorkspaceProjector(writer=factory(ctx)).project(
             plan=state.get("plan"),
             memories=state.get("recalled_memories") or [],
             last_digest=state.get("last_projection_hash"),
+            prefix=prefix,
         )
     except Exception:
         logger.exception("workspace_projection.turn_failed")
