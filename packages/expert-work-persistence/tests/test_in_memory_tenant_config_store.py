@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -194,3 +194,82 @@ async def test_memory_predictive_review_enabled_defaults_and_round_trips() -> No
     assert updated.memory_predictive_review_enabled is True
     got = await store.get(tenant_id=tid)
     assert got is not None and got.memory_predictive_review_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# BUG-1(2026-08-24)mcp_allowlist 原子 add/remove —— enable/disable 端点原先
+# 「缓存读→改→整表覆盖写」在多副本下互相抹名字;原子操作把合并下放到 store。
+
+
+async def _seeded_store(tenant_id: UUID) -> InMemoryTenantConfigStore:
+    store = InMemoryTenantConfigStore()
+    await store.create(tenant_id=tenant_id, display_name="Acme", actor_id="bootstrap")
+    return store
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_allowlist_name_appends_and_reports_changed() -> None:
+    tenant_id = uuid4()
+    store = await _seeded_store(tenant_id)
+
+    record, changed = await store.add_mcp_allowlist_name(
+        tenant_id=tenant_id, name="amap-maps", actor_id="op"
+    )
+    assert changed is True
+    assert record.mcp_allowlist == ["amap-maps"]
+    assert record.updated_by == "op"
+    fetched = await store.get(tenant_id=tenant_id)
+    assert fetched is not None and fetched.mcp_allowlist == ["amap-maps"]
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_allowlist_name_is_idempotent() -> None:
+    tenant_id = uuid4()
+    store = await _seeded_store(tenant_id)
+    await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="a", actor_id="op")
+
+    record, changed = await store.add_mcp_allowlist_name(
+        tenant_id=tenant_id, name="a", actor_id="op2"
+    )
+    assert changed is False
+    assert record.mcp_allowlist == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_add_preserves_existing_names() -> None:
+    """丢失更新回归:后一个 add 不得抹掉先前的名字。"""
+    tenant_id = uuid4()
+    store = await _seeded_store(tenant_id)
+    await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="deep", actor_id="op")
+
+    record, _ = await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="amap", actor_id="op")
+    assert record.mcp_allowlist == ["deep", "amap"]
+
+
+@pytest.mark.asyncio
+async def test_remove_mcp_allowlist_name_removes_and_is_idempotent() -> None:
+    tenant_id = uuid4()
+    store = await _seeded_store(tenant_id)
+    await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="a", actor_id="op")
+    await store.add_mcp_allowlist_name(tenant_id=tenant_id, name="b", actor_id="op")
+
+    record, changed = await store.remove_mcp_allowlist_name(
+        tenant_id=tenant_id, name="a", actor_id="op"
+    )
+    assert changed is True
+    assert record.mcp_allowlist == ["b"]
+
+    record, changed = await store.remove_mcp_allowlist_name(
+        tenant_id=tenant_id, name="a", actor_id="op"
+    )
+    assert changed is False
+    assert record.mcp_allowlist == ["b"]
+
+
+@pytest.mark.asyncio
+async def test_add_on_missing_tenant_raises_not_found() -> None:
+    store = InMemoryTenantConfigStore()
+    with pytest.raises(TenantConfigNotFoundError):
+        await store.add_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")
+    with pytest.raises(TenantConfigNotFoundError):
+        await store.remove_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")

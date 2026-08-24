@@ -313,3 +313,124 @@ async def test_memory_predictive_review_enabled_default_and_patch(
         assert fetched is not None and fetched.memory_predictive_review_enabled is True
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# BUG-1(2026-08-24)mcp_allowlist 原子 add/remove(语义见 base.py;in-memory
+# 对应用例在 test_in_memory_tenant_config_store.py,两后端行为必须同义)。
+
+
+@pytest.mark.asyncio
+async def test_add_remove_mcp_allowlist_name_atomic_semantics(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(display_name="ACME"),
+            actor_id="admin",
+        )
+
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["deep"])
+
+        # 后一个 add 不得抹掉先前的名字(丢失更新回归)。
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="amap", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["deep", "amap"])
+        assert record.updated_by == "op"
+
+        # 幂等:重复 add 不变。
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="amap", actor_id="op2"
+        )
+        assert (changed, record.mcp_allowlist) == (False, ["deep", "amap"])
+
+        # remove + 幂等。
+        record, changed = await store.remove_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["amap"])
+        record, changed = await store.remove_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (False, ["amap"])
+
+        # 落库为准。
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.mcp_allowlist == ["amap"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_allowlist_missing_tenant_raises(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    from expert_work.persistence.tenant_config.base import TenantConfigNotFoundError
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        with pytest.raises(TenantConfigNotFoundError):
+            await store.add_mcp_allowlist_name(tenant_id=tenant, name="x", actor_id="op")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_blocks_on_row_lock_then_merges(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """确定性行锁证明(终审第二轮:gather 版是重言式,删 FOR UPDATE 照样绿)。
+
+    旁路会话先 FOR UPDATE 持锁并写入 "deep"(不提交),此时 store 的 add
+    必须阻塞 —— 没有 FOR UPDATE 它会立刻读到旧快照写回,wait_for 就不会
+    超时,第一道断言先红;提交放锁后 add 继续,合并结果两个名字都在。"""
+    import asyncio
+
+    from sqlalchemy import select
+
+    from expert_work.persistence.models import TenantConfigRow
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(display_name="ACME"),
+            actor_id="admin",
+        )
+        sf = build_rls_sessionmaker(create_async_session_factory(engine))
+        async with sf() as blocker:
+            row = (
+                await blocker.execute(
+                    select(TenantConfigRow)
+                    .where(TenantConfigRow.tenant_id == tenant)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            row.mcp_allowlist = ["deep"]
+            await blocker.flush()  # 持锁未提交
+            task = asyncio.create_task(
+                store.add_mcp_allowlist_name(tenant_id=tenant, name="amap", actor_id="b")
+            )
+            with pytest.raises(TimeoutError):
+                # 没有行锁时 add 不会阻塞 → 这里先红(杀掉删 FOR UPDATE 的变异)。
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+            await blocker.commit()
+            _, changed = await task
+            assert changed is True
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None
+        assert sorted(fetched.mcp_allowlist) == ["amap", "deep"]
+    finally:
+        await engine.dispose()
