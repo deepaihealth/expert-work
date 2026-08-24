@@ -345,7 +345,7 @@ export function FormView({
               />
             ) : (
               <Input.TextArea
-                rows={6}
+                autoSize={{ minRows: 10, maxRows: 28 }}
                 value={readSystemPrompt(formData)}
                 placeholder={t("agent_form.field_prompt_placeholder")}
                 aria-label={t("agent_form.section_prompt")}

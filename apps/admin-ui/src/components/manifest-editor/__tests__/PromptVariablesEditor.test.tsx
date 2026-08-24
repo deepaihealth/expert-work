@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -86,5 +87,43 @@ describe("PromptVariablesEditor", () => {
     await user.click(screen.getByTestId("af-prompt-var-trusted-0"));
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(last.spec?.system_prompt?.variables?.[0].trusted).toBe(false);
+  });
+});
+
+describe("PromptVariablesEditor capacity (BUG-4)", () => {
+  it("wraps variable rows in an internal scroll container with a count", () => {
+    const variables: PromptVariableFields[] = Array.from(
+      { length: 12 },
+      (_, i) => ({ name: `v${i}` }),
+    );
+    render(
+      <PromptVariablesEditor formData={jinjaSeed(variables)} onChange={vi.fn()} />,
+    );
+    const scroll = screen.getByTestId("af-prompt-vars-scroll");
+    expect(scroll.style.overflowY).toBe("auto");
+    expect(scroll.style.maxHeight).toBe("40vh");
+    // 12 行都在滚动容器内,添加按钮在容器外恒可见。
+    expect(scroll.querySelectorAll("[data-testid^='af-prompt-var-row-']")).toHaveLength(12);
+    expect(screen.getByTestId("af-prompt-vars-count").textContent).toContain("12");
+    const add = screen.getByTestId("af-prompt-var-add");
+    expect(scroll.contains(add)).toBe(false);
+  });
+});
+
+describe("PromptVariablesEditor add-in-scroll (终审第二轮)", () => {
+  it("focuses the new row's name input after add (visible feedback)", async () => {
+    const user = userEvent.setup();
+    // 受控回环:onChange 后重渲染出新行,才轮到 rAF 聚焦。
+    function Harness() {
+      const [data, setData] = useState<unknown>(
+        jinjaSeed([{ name: "a" }, { name: "b" }]),
+      );
+      return <PromptVariablesEditor formData={data} onChange={setData} />;
+    }
+    render(<Harness />);
+    await user.click(screen.getByTestId("af-prompt-var-add"));
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+    const newInput = screen.getByTestId("af-prompt-var-name-2");
+    expect(document.activeElement).toBe(newInput);
   });
 });

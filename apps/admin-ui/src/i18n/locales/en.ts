@@ -1104,6 +1104,10 @@ export interface TranslationKeys {
     prompt_var_description: string;
     prompt_var_remove: string;
     prompt_var_add: string;
+    prompt_expand: string;
+    prompt_expand_title: string;
+    prompt_vars_count_one: string;
+    prompt_vars_count_other: string;
     section_output_schema: string;
     output_schema: {
       on_label: string;
@@ -4192,6 +4196,10 @@ const en: TranslationKeys = {
     prompt_var_description: "Description",
     prompt_var_remove: "Remove",
     prompt_var_add: "Add variable",
+    prompt_expand: "Expand",
+    prompt_expand_title: "System prompt — fullscreen editor",
+    prompt_vars_count_one: "1 variable declared",
+    prompt_vars_count_other: "{{count}} variables declared",
     section_output_schema: "Structured output",
     output_schema: {
       on_label: "Reply using a template",
