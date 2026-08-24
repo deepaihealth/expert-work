@@ -43,7 +43,6 @@ from expert_work.protocol import (
     McpServerProbeStatus,
     McpServerTransport,
     Principal,
-    TenantConfigPatch,
     TenantMcpServerPatch,
     TenantMcpServerRecord,
     TenantPlan,
@@ -622,9 +621,13 @@ def build_mcp_servers_router() -> APIRouter:
                     "message": f"requires the {entry.required_tier.value} plan",
                 },
             )
+        # BUG-1(2026-08-24):此前是「读(60s per-pod 缓存)→改→整表覆盖写」,
+        # 多副本下两次启用互相抹掉对方刚写的名字(丢失更新)。改走 store 层
+        # 原子 add(行锁内合并,幂等,返回是否真变更),写路径不再依赖任何
+        # 一侧读到的旧列表。
         try:
-            cfg = await tenant_config_service.get(  # type: ignore[attr-defined]
-                tenant_id=tenant_id, actor_id=principal.subject_id
+            _, changed = await tenant_config_service.add_mcp_allowlist_name(  # type: ignore[attr-defined]
+                tenant_id=tenant_id, name=entry.name, actor_id=principal.subject_id
             )
         except TenantConfigNotConfiguredError as exc:
             # The allowlist lives on tenant_config, whose first write needs a
@@ -636,13 +639,7 @@ def build_mcp_servers_router() -> APIRouter:
                     "message": "configure the tenant before enabling MCP servers",
                 },
             ) from exc
-        allowlist = list(cfg.mcp_allowlist)
-        if entry.name not in allowlist:
-            await tenant_config_service.upsert(  # type: ignore[attr-defined]
-                tenant_id=tenant_id,
-                patch=TenantConfigPatch(mcp_allowlist=[*allowlist, entry.name]),
-                actor_id=principal.subject_id,
-            )
+        if changed:
             await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
             await emit(
                 audit,
@@ -685,13 +682,15 @@ def build_mcp_servers_router() -> APIRouter:
                 status_code=404,
                 detail={"code": "MCP_CATALOG_NOT_FOUND", "message": "not found"},
             )
-        allowlist = await _tenant_allowlist(tenant_config_service, tenant_id)
-        if entry.name in allowlist:
-            await tenant_config_service.upsert(  # type: ignore[attr-defined]
-                tenant_id=tenant_id,
-                patch=TenantConfigPatch(mcp_allowlist=[n for n in allowlist if n != entry.name]),
-                actor_id=principal.subject_id,
+        # BUG-1 同款原子化(见 enable 侧注释)。未配置的租户本来就没有任何
+        # 启用项 → 与旧行为一致按 no-op 处理。
+        try:
+            _, changed = await tenant_config_service.remove_mcp_allowlist_name(  # type: ignore[attr-defined]
+                tenant_id=tenant_id, name=entry.name, actor_id=principal.subject_id
             )
+        except TenantConfigNotConfiguredError:
+            changed = False
+        if changed:
             await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id)
             await emit(
                 audit,

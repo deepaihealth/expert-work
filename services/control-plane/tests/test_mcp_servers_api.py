@@ -1673,3 +1673,37 @@ async def test_mcp_tools_cross_tenant_probe_does_not_stamp_health(
         assert after.last_probe_status == before.last_probe_status
         assert after.last_probe_error == before.last_probe_error
         assert after.last_probe_at == before.last_probe_at
+
+
+@pytest.mark.asyncio
+async def test_enable_with_stale_cache_does_not_wipe_prior_enable() -> None:
+    """BUG-1(2026-08-24)丢失更新回归:另一副本先启用了 deep(本进程缓存
+    没见过),本进程再启用 amap 时不得把 deep 抹掉。
+
+    复现旧病根的方法:先让本进程缓存装入「空 allowlist」的旧快照,再绕过
+    本进程缓存直写 store(= 别的副本的写),然后走本进程的 enable。旧实现
+    (读缓存→整表覆盖写)在此必丢 deep;原子 add 则两个都活。
+    """
+    app, headers, tenant_id = await _make_app_with_admin()
+    await _configure_tenant(app, tenant_id)
+    deep_id = await _seed_platform_none(app, name="deep")
+    amap_id = await _seed_platform_none(app, name="amap")
+
+    svc = app.state.tenant_config_service
+    # 1) 本进程缓存装入旧快照(allowlist=[])。
+    await svc.get(tenant_id=tenant_id)
+    # 2) 「别的副本」直写 store:启用 deep(不经过本进程缓存)。
+    await svc.store.add_mcp_allowlist_name(tenant_id=tenant_id, name="deep", actor_id="replica-b")
+    # 3) 本进程 enable amap —— 缓存里 allowlist 仍是 []。
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        resp = await client.post(f"/v1/mcp-servers/catalog/{amap_id}/enable", headers=headers)
+        assert resp.status_code == 200, resp.text
+    # 4) store 真相:两个都在。
+    record = await svc.store.get(tenant_id=tenant_id)
+    assert record is not None
+    assert sorted(record.mcp_allowlist) == ["amap", "deep"]
+    # 5) 本进程缓存也已被原子写回填,list 立刻见到两者。
+    fresh = await svc.get(tenant_id=tenant_id)
+    assert sorted(fresh.mcp_allowlist) == ["amap", "deep"]
+    del deep_id

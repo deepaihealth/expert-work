@@ -313,3 +313,101 @@ async def test_memory_predictive_review_enabled_default_and_patch(
         assert fetched is not None and fetched.memory_predictive_review_enabled is True
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# BUG-1(2026-08-24)mcp_allowlist 原子 add/remove(语义见 base.py;in-memory
+# 对应用例在 test_in_memory_tenant_config_store.py,两后端行为必须同义)。
+
+
+@pytest.mark.asyncio
+async def test_add_remove_mcp_allowlist_name_atomic_semantics(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(display_name="ACME"),
+            actor_id="admin",
+        )
+
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["deep"])
+
+        # 后一个 add 不得抹掉先前的名字(丢失更新回归)。
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="amap", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["deep", "amap"])
+        assert record.updated_by == "op"
+
+        # 幂等:重复 add 不变。
+        record, changed = await store.add_mcp_allowlist_name(
+            tenant_id=tenant, name="amap", actor_id="op2"
+        )
+        assert (changed, record.mcp_allowlist) == (False, ["deep", "amap"])
+
+        # remove + 幂等。
+        record, changed = await store.remove_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (True, ["amap"])
+        record, changed = await store.remove_mcp_allowlist_name(
+            tenant_id=tenant, name="deep", actor_id="op"
+        )
+        assert (changed, record.mcp_allowlist) == (False, ["amap"])
+
+        # 落库为准。
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.mcp_allowlist == ["amap"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_mcp_allowlist_missing_tenant_raises(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    from expert_work.persistence.tenant_config.base import TenantConfigNotFoundError
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        with pytest.raises(TenantConfigNotFoundError):
+            await store.add_mcp_allowlist_name(tenant_id=tenant, name="x", actor_id="op")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_adds_both_survive(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """两个并发 add(模拟两副本同时启用不同 server)——FOR UPDATE 行锁串行,
+    谁都不抹谁。旧实现(读快照整表覆盖写)在此必然二选一丢失。"""
+    import asyncio
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(display_name="ACME"),
+            actor_id="admin",
+        )
+        await asyncio.gather(
+            store.add_mcp_allowlist_name(tenant_id=tenant, name="deep", actor_id="a"),
+            store.add_mcp_allowlist_name(tenant_id=tenant, name="amap", actor_id="b"),
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None
+        assert sorted(fetched.mcp_allowlist) == ["amap", "deep"]
+    finally:
+        await engine.dispose()

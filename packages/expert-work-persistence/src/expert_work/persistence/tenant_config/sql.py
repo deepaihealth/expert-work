@@ -304,6 +304,55 @@ class SqlTenantConfigStore(TenantConfigStore):
             await session.refresh(existing)
             return _row_to_record(existing)
 
+    async def _mutate_mcp_allowlist(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        actor_id: str,
+        add: bool,
+    ) -> tuple[TenantConfigRecord, bool]:
+        # BUG-1(2026-08-24,见 base.py):同一事务内 SELECT ... FOR UPDATE 行锁
+        # 后合并——并发/跨副本的 add/remove 在行锁上串行,谁都抹不掉谁。
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(TenantConfigRow)
+                    .where(TenantConfigRow.tenant_id == tenant_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise TenantConfigNotFoundError(tenant_id=tenant_id)
+            current = list(row.mcp_allowlist or [])
+            if add:
+                if name in current:
+                    return _row_to_record(row), False
+                row.mcp_allowlist = [*current, name]
+            else:
+                if name not in current:
+                    return _row_to_record(row), False
+                row.mcp_allowlist = [n for n in current if n != name]
+            row.updated_at = _utc_now()
+            row.updated_by = actor_id
+            await session.commit()
+            await session.refresh(row)
+            return _row_to_record(row), True
+
+    async def add_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        return await self._mutate_mcp_allowlist(
+            tenant_id=tenant_id, name=name, actor_id=actor_id, add=True
+        )
+
+    async def remove_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        return await self._mutate_mcp_allowlist(
+            tenant_id=tenant_id, name=name, actor_id=actor_id, add=False
+        )
+
     async def set_status(
         self, *, tenant_id: UUID, status: str, actor_id: str
     ) -> TenantConfigRecord:

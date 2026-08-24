@@ -68,6 +68,32 @@ class TenantConfigStore(abc.ABC):
         """Insert-or-merge the patch. ``display_name`` is required for first insert."""
 
     @abc.abstractmethod
+    async def add_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        """Atomically append ``name`` to ``mcp_allowlist`` (idempotent).
+
+        BUG-1(2026-08-24):enable/disable 端点原先「读(可能是 60s 陈旧缓存)
+        →改→整表覆盖写」,多副本下互相抹掉对方刚加的名字。合并语义必须在
+        store 内原子完成(SQL 走行锁事务,in-memory 走 store 锁),调用方
+        永远不携带自己读到的旧列表。
+
+        Returns ``(record, changed)`` — ``changed`` is False when the name
+        was already present. Raises :class:`TenantConfigNotFoundError` if the
+        tenant has no config row.
+        """
+
+    @abc.abstractmethod
+    async def remove_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        """Atomically remove ``name`` from ``mcp_allowlist`` (idempotent).
+
+        Mirror of :meth:`add_mcp_allowlist_name` — same atomicity contract,
+        ``changed`` is False when the name was already absent.
+        """
+
+    @abc.abstractmethod
     async def set_status(
         self, *, tenant_id: UUID, status: str, actor_id: str
     ) -> TenantConfigRecord:

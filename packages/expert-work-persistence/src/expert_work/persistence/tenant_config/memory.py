@@ -200,6 +200,46 @@ class InMemoryTenantConfigStore(TenantConfigStore):
             self._rows[tenant_id] = row
             return row
 
+    async def add_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        # 与 SQL 后端同义:读-判-写在同一把 store 锁内完成(见 base.py 的
+        # BUG-1 说明)。
+        async with self._lock:
+            existing = self._rows.get(tenant_id)
+            if existing is None:
+                raise TenantConfigNotFoundError(tenant_id=tenant_id)
+            if name in existing.mcp_allowlist:
+                return existing, False
+            updated = existing.model_copy(
+                update={
+                    "mcp_allowlist": [*existing.mcp_allowlist, name],
+                    "updated_by": actor_id,
+                    "updated_at": _now(),
+                }
+            )
+            self._rows[tenant_id] = updated
+            return updated, True
+
+    async def remove_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        async with self._lock:
+            existing = self._rows.get(tenant_id)
+            if existing is None:
+                raise TenantConfigNotFoundError(tenant_id=tenant_id)
+            if name not in existing.mcp_allowlist:
+                return existing, False
+            updated = existing.model_copy(
+                update={
+                    "mcp_allowlist": [n for n in existing.mcp_allowlist if n != name],
+                    "updated_by": actor_id,
+                    "updated_at": _now(),
+                }
+            )
+            self._rows[tenant_id] = updated
+            return updated, True
+
     async def set_status(
         self, *, tenant_id: UUID, status: str, actor_id: str
     ) -> TenantConfigRecord:

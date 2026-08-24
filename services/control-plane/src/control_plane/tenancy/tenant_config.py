@@ -29,7 +29,7 @@ from uuid import UUID
 
 from control_plane.audit import emit
 from expert_work.common.observability import current_trace_id_hex
-from expert_work.persistence.tenant_config import TenantConfigStore
+from expert_work.persistence.tenant_config import TenantConfigNotFoundError, TenantConfigStore
 from expert_work.protocol import (
     AuditAction,
     TenantConfigPatch,
@@ -152,6 +152,70 @@ class TenantConfigService:
             logger.exception("tenant_config.write.audit_emit_failed")
         return record
 
+    async def _mutate_mcp_allowlist(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        actor_id: str,
+        add: bool,
+    ) -> tuple[TenantConfigRecord, bool]:
+        """Atomic allowlist add/remove — cache-blind by design (BUG-1).
+
+        绝不把本进程缓存里的列表喂给写路径:合并在 store 原子完成,这里只
+        负责回填缓存 + 审计(仅真变更时)。
+        Raises :class:`TenantConfigNotConfiguredError` when the row is absent
+        (mirrors :meth:`get` so callers keep one error surface).
+        """
+        try:
+            if add:
+                record, changed = await self._store.add_mcp_allowlist_name(
+                    tenant_id=tenant_id, name=name, actor_id=actor_id
+                )
+            else:
+                record, changed = await self._store.remove_mcp_allowlist_name(
+                    tenant_id=tenant_id, name=name, actor_id=actor_id
+                )
+        except TenantConfigNotFoundError as exc:
+            raise TenantConfigNotConfiguredError(tenant_id=tenant_id) from exc
+        self._cache[tenant_id] = _CacheEntry(
+            record=record,
+            expires_at_monotonic=time.monotonic() + self._ttl_s,
+        )
+        if changed:
+            try:
+                await emit(
+                    self._audit,
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    action=AuditAction.TENANT_CONFIG_WRITE,
+                    resource_type="tenant_config",
+                    resource_id=str(tenant_id),
+                    trace_id=current_trace_id_hex(),
+                    details={
+                        "fields": ["mcp_allowlist"],
+                        "name": name,
+                        "op": "add" if add else "remove",
+                    },
+                )
+            except Exception:
+                logger.exception("tenant_config.write.audit_emit_failed")
+        return record, changed
+
+    async def add_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        return await self._mutate_mcp_allowlist(
+            tenant_id=tenant_id, name=name, actor_id=actor_id, add=True
+        )
+
+    async def remove_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        return await self._mutate_mcp_allowlist(
+            tenant_id=tenant_id, name=name, actor_id=actor_id, add=False
+        )
+
     def invalidate(self, tenant_id: UUID) -> None:
         """Drop the cached entry. Useful for tests + admin-driven flushes."""
         self._cache.pop(tenant_id, None)
@@ -208,6 +272,28 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
         return await self._service.store.create(
             tenant_id=tenant_id, display_name=display_name, plan=plan, actor_id=actor_id
         )
+
+    async def add_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        # 委托 service(它已处理原子写 + 缓存回填 + 审计,BUG-1);service 的
+        # NotConfigured 转回 store 接口约定的 NotFound。
+        try:
+            return await self._service.add_mcp_allowlist_name(
+                tenant_id=tenant_id, name=name, actor_id=actor_id
+            )
+        except TenantConfigNotConfiguredError as exc:
+            raise TenantConfigNotFoundError(tenant_id=tenant_id) from exc
+
+    async def remove_mcp_allowlist_name(
+        self, *, tenant_id: UUID, name: str, actor_id: str
+    ) -> tuple[TenantConfigRecord, bool]:
+        try:
+            return await self._service.remove_mcp_allowlist_name(
+                tenant_id=tenant_id, name=name, actor_id=actor_id
+            )
+        except TenantConfigNotConfiguredError as exc:
+            raise TenantConfigNotFoundError(tenant_id=tenant_id) from exc
 
     async def set_status(
         self, *, tenant_id: UUID, status: str, actor_id: str
