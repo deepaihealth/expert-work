@@ -1167,7 +1167,8 @@ const zhCN: TranslationKeys = {
     prompt_var_add: "添加变量",
     prompt_expand: "全屏编辑",
     prompt_expand_title: "系统提示词 —— 全屏编辑",
-    prompt_vars_count: "已声明 {{n}} 个变量",
+    prompt_vars_count_one: "已声明 1 个变量",
+    prompt_vars_count_other: "已声明 {{count}} 个变量",
     section_output_schema: "结构化输出",
     output_schema: {
       on_label: "按模板回复",

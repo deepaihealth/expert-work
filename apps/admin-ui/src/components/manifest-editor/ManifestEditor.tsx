@@ -117,6 +117,12 @@ interface ManifestEditorProps {
   onActiveGroupChange?: (id: string) => void;
 }
 
+/** BUG-5 —— 编辑器主体 min-height 扣除的宿主 chrome 估算(agent 详情页
+ * 页头+tabs+Card padding 一档)。三个宿主(详情页 / 模板表单 /
+ * CreateAgentModal)chrome 不同,取最深的一档 —— Modal 宿主(top:100+
+ * header+footer)按 768px 视口实算仍不截断;真截断时再开 fillViewport 开关。 */
+const VIEWPORT_CHROME_PX = 320;
+
 function safeSeed(initialYaml: string): unknown {
   try {
     const parsed = parseYaml(initialYaml);
@@ -376,7 +382,7 @@ export function ManifestEditor({
           display: "flex",
           gap: 24,
           alignItems: "flex-start",
-          minHeight: "calc(100vh - 320px)",
+          minHeight: `calc(100vh - ${VIEWPORT_CHROME_PX}px)`,
         }}
       >
         <div data-testid="cfg-nav" style={{ flex: "0 0 200px", width: 200 }}>

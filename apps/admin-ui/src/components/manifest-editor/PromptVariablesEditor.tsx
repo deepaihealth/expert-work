@@ -6,7 +6,7 @@
  * or is spotlight-fenced as DATA (default trusted — an owner-set posture).
  * Every control emits the FULL merged manifest via the form_model writers.
  */
-import { type CSSProperties, type ReactNode } from "react";
+import { useRef, type CSSProperties, type ReactNode } from "react";
 import { Button, Input, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -37,6 +37,7 @@ export function PromptVariablesEditor({
   onChange,
 }: PromptVariablesEditorProps) {
   const { t } = useTranslation();
+  const scrollRef = useRef<HTMLDivElement>(null);
   const jinja = readPromptJinja(formData);
   const variables = readPromptVariables(formData);
 
@@ -46,13 +47,26 @@ export function PromptVariablesEditor({
     );
     onChange(setPromptVariables(formData, next));
   };
-  const addVar = (): void =>
+  const addVar = (): void => {
+    const nextIndex = variables.length;
     onChange(
       setPromptVariables(formData, [
         ...variables,
         { name: "", trusted: true, required: true, description: "" },
       ]),
     );
+    // 新行落在滚动容器底部,不滚过去的话点击看起来毫无反应(终审第二轮)——
+    // 滚到底 + 聚焦新行 name 输入框(顺带键盘可达)。
+    requestAnimationFrame(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+      document
+        .querySelector<HTMLInputElement>(
+          `[data-testid="af-prompt-var-name-${nextIndex}"]`,
+        )
+        ?.focus();
+    });
+  };
   const removeVar = (i: number): void =>
     onChange(
       setPromptVariables(
@@ -98,12 +112,13 @@ export function PromptVariablesEditor({
               data-testid="af-prompt-vars-count"
               style={{ display: "block", marginBottom: 6, fontSize: 12 }}
             >
-              {t("agent_form.prompt_vars_count", { n: variables.length })}
+              {t("agent_form.prompt_vars_count", { count: variables.length })}
             </Text>
           )}
           {/* BUG-4:变量一多把整页撑成一面墙 —— 列表内滚,添加按钮留在
               容器外恒可见。 */}
           <div
+            ref={scrollRef}
             data-testid="af-prompt-vars-scroll"
             style={{ maxHeight: "40vh", overflowY: "auto", marginBottom: 8 }}
           >

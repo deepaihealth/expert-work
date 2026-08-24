@@ -186,6 +186,8 @@ export function PromptTemplateEditor({
           overflow: "hidden",
           border: "1px solid var(--ew-border, rgba(255,255,255,0.1))",
           borderRadius: 6,
+          // 给右下角原生 resizer 留出命中区,别被 Monaco 的 DOM 盖满。
+          paddingBottom: 8,
         }}
       >
         {editor}
@@ -197,10 +199,14 @@ export function PromptTemplateEditor({
         width="92vw"
         style={{ top: 24 }}
         title={t("agent_form.prompt_expand_title")}
-        data-testid="af-prompt-expand-modal"
       >
-        {/* 同一受控 value/onChange —— Modal 里的编辑实时回写,关掉即所得。 */}
-        <div style={{ height: "76vh" }}>{expanded ? editor : null}</div>
+        {/* 同一受控 value/onChange —— Modal 里的编辑实时回写,关掉即所得。
+            testid 放内层:antd 会把 Modal 的 data-testid 转发到
+            .ant-modal-root,Playwright 视之为 hidden(照 CreateAgentModal
+            先例)。 */}
+        <div data-testid="af-prompt-expand-modal" style={{ height: "76vh" }}>
+          {expanded ? editor : null}
+        </div>
       </Modal>
     </div>
   );
