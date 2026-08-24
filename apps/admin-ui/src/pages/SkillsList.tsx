@@ -112,6 +112,9 @@ export function SkillsList() {
   // BUG-3:平台技能全激活后列表 50+ 行,靠肉眼扫不现实 —— 名称/描述客户端
   // 过滤(status/category 走服务端,这个纯前端,零请求)。
   const [nameFilter, setNameFilter] = useState("");
+  // 客户端分页页码受控:过滤变化回第 1 页;「加载更多」跳到首个新页
+  // (否则追加发生在后面的页,可见区一动不动,按钮看着像坏了——终审)。
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -143,6 +146,20 @@ export function SkillsList() {
     }
   }, [apiTenantScope, statusFilter, visibilityFilter, categoryFilter]);
 
+  // Stream X-6 — platform skills render first, then the tenant's own
+  // (paginated) skills. Platform rows are read-only in the tenant view.
+  const filtering = nameFilter.trim().length > 0;
+  const dataSource = useMemo(() => {
+    const merged = [...platformItems, ...accumulated];
+    const q = nameFilter.trim().toLowerCase();
+    if (q.length === 0) return merged;
+    return merged.filter(
+      (r) =>
+        r.name.toLowerCase().includes(q) ||
+        (r.description ?? "").toLowerCase().includes(q),
+    );
+  }, [platformItems, accumulated, nameFilter]);
+
   const loadMore = useCallback(async () => {
     if (data?.next_cursor === undefined || data?.next_cursor === null) return;
     setLoadingMore(true);
@@ -155,13 +172,17 @@ export function SkillsList() {
         cursor: data.next_cursor,
       });
       setData(result);
+      const prevShown = dataSource.length;
       setAccumulated((prev) => [...prev, ...result.items]);
+      if (result.items.length > 0) {
+        setPage(Math.floor(prevShown / 20) + 1);
+      }
     } catch (err) {
       message.error(err instanceof Error ? err.message : "failed");
     } finally {
       setLoadingMore(false);
     }
-  }, [apiTenantScope, statusFilter, visibilityFilter, categoryFilter, data, message]);
+  }, [apiTenantScope, statusFilter, visibilityFilter, categoryFilter, data, message, dataSource.length]);
 
   useEffect(() => {
     refresh();
@@ -223,21 +244,13 @@ export function SkillsList() {
     [apiTenantScope, identity, message],
   );
 
+  useEffect(() => {
+    setPage(1);
+  }, [nameFilter, statusFilter, visibilityFilter, categoryFilter]);
+
   const isCrossTenant = data?.cross_tenant ?? false;
   const hasMore = data?.next_cursor !== null && data?.next_cursor !== undefined;
 
-  // Stream X-6 — platform skills render first, then the tenant's own
-  // (paginated) skills. Platform rows are read-only in the tenant view.
-  const dataSource = useMemo(() => {
-    const merged = [...platformItems, ...accumulated];
-    const q = nameFilter.trim().toLowerCase();
-    if (q.length === 0) return merged;
-    return merged.filter(
-      (r) =>
-        r.name.toLowerCase().includes(q) ||
-        (r.description ?? "").toLowerCase().includes(q),
-    );
-  }, [platformItems, accumulated, nameFilter]);
 
   const columns: TableColumnsType<SkillRecord> = useMemo(() => [
     {
@@ -498,7 +511,13 @@ export function SkillsList() {
         // BUG-3:此前 pagination={false} 让 50+ 行平铺成墙 —— 客户端分页
         // 20/页(单页时自动隐藏,小库无感);「加载更多」继续供服务端游标
         // 追加租户自有技能。
-        pagination={{ pageSize: 20, showSizeChanger: false, hideOnSinglePage: true }}
+        pagination={{
+          current: page,
+          onChange: setPage,
+          pageSize: 20,
+          showSizeChanger: false,
+          hideOnSinglePage: true,
+        }}
         onRow={(record) =>
           // Platform rows are read-only in the tenant scope — a tenant
           // ``getSkill(id)`` would 404, so don't navigate. Bind via the
@@ -523,7 +542,20 @@ export function SkillsList() {
               }
         }
         locale={{
-          emptyText: (
+          emptyText: filtering ? (
+            // 过滤没命中 ≠ 没有技能 —— 原空态的「你还没有技能 + 导入」在
+            // 这里是事实错误且诱导误操作(终审)。
+            <Empty
+              description={t("skills.empty_filtered", { q: nameFilter.trim() })}
+            >
+              <Button
+                onClick={() => setNameFilter("")}
+                data-testid="skills-clear-filter"
+              >
+                {t("skills.clear_filter")}
+              </Button>
+            </Empty>
+          ) : (
             <Empty
               description={scope === "*" ? t("skills.empty_cross") : t("skills.empty_home")}
             >
@@ -547,7 +579,22 @@ export function SkillsList() {
       />
 
       {hasMore && (
-        <div style={{ display: "flex", justifyContent: "center", marginTop: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 6,
+            marginTop: 16,
+          }}
+        >
+          {filtering && (
+            // 搜索只覆盖已加载的行(租户自有技能是游标分页):不提示的话
+            // 「搜真实存在但在下一页的技能 → 空结果」是假阴性(终审)。
+            <Text type="secondary" data-testid="skills-filter-partial-hint">
+              {t("skills.filter_partial_hint")}
+            </Text>
+          )}
           <Button onClick={loadMore} loading={loadingMore} data-testid="skills-load-more">
             {t("skills.load_more")}
           </Button>

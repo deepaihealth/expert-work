@@ -884,3 +884,64 @@ describe("SkillsList pagination & name filter (BUG-3)", () => {
     expect(screen.getByText("pdf_export")).toBeInTheDocument();
   });
 });
+
+describe("SkillsList filtered empty state (终审第二轮)", () => {
+  it("shows a clear-filter empty state instead of the import CTA", async () => {
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({
+          items: [skillRow],
+          next_cursor: null,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderSkillsRouter();
+    await screen.findByText("web_search");
+
+    await user.type(screen.getByTestId("skills-name-filter"), "nonexistent-zzz");
+    await waitFor(() => {
+      expect(screen.queryByText("web_search")).not.toBeInTheDocument();
+    });
+    // 过滤空态:清除按钮在、导入 CTA 不在(「你没有技能」是事实错误)。
+    expect(screen.getByTestId("skills-clear-filter")).toBeInTheDocument();
+    expect(screen.queryByTestId("skills-empty-import")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("skills-clear-filter"));
+    await screen.findByText("web_search");
+  });
+
+  it("keeps platform rows first while filtering and hides pager on a single page", async () => {
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => ({
+          items: [{ ...skillRow, id: "own1", name: "alpha-own" }],
+          platform_items: [
+            {
+              ...skillRow,
+              id: "plat1",
+              name: "alpha-platform",
+              source: "platform",
+              entitled: true,
+              subscribed: false,
+            },
+          ],
+          next_cursor: null,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderSkillsRouter();
+    await screen.findByText("alpha-platform");
+    await user.type(screen.getByTestId("skills-name-filter"), "alpha");
+    const rows = screen.getAllByText(/^alpha-/).map((n) => n.textContent);
+    expect(rows.indexOf("alpha-platform")).toBeLessThan(rows.indexOf("alpha-own"));
+    // ≤20 行单页:分页器不出现(hideOnSinglePage)。
+    expect(document.querySelector(".ant-pagination")).toBeNull();
+  });
+});
