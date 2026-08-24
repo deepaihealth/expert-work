@@ -87,6 +87,21 @@ describe("VariablesForm", () => {
     expect(screen.getByTestId("playground-var-customer_code")).toBeInTheDocument();
   });
 
+  it("re-opens when values are reset in place (新建会话 without remount)", async () => {
+    const vars: readonly PromptVariable[] = [{ name: "code", required: true }];
+    const { rerender } = render(
+      <VariablesForm variables={vars} values={{ code: "C-1" }} onChange={vi.fn()} disabled={false} />,
+    );
+    // Satisfied → starts folded.
+    expect(screen.queryByTestId("playground-var-code")).not.toBeInTheDocument();
+    // Parent resets values without remounting — required is missing again,
+    // the section must re-open (inputs off-screen while send is blocked).
+    rerender(
+      <VariablesForm variables={vars} values={{}} onChange={vi.fn()} disabled={false} />,
+    );
+    expect(screen.getByTestId("playground-var-code")).toBeInTheDocument();
+  });
+
   it("starts folded when nothing required is missing and the header toggles it", async () => {
     render(
       <VariablesForm

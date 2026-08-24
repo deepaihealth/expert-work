@@ -13,6 +13,7 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type ReactNode,
@@ -32,6 +33,7 @@ import { useTranslation } from "react-i18next";
 
 import { listSkills, type SkillRecord } from "../../api/skills";
 import { useTenantScope } from "../../tenant/TenantScopeContext";
+import { TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../../utils/pagination";
 import { FieldHelp } from "../FieldHelp";
 import {
   readAutoAttachEvolvedSkills,
@@ -43,10 +45,6 @@ import {
 const { Text } = Typography;
 
 const SECTION: CSSProperties = { marginBottom: 24 };
-
-// BUG-6:70+ 行全量平铺只靠内滚不可用 —— 客户端分页,同 SkillsList 的
-// BUG-3 口径(20/页,单页自动隐藏)。
-const PAGE_SIZE = 20;
 
 function Heading({ children }: { children: ReactNode }) {
   return <h3 style={{ fontSize: 15, margin: "0 0 12px" }}>{children}</h3>;
@@ -93,16 +91,39 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
     "platform" | "tenant" | undefined
   >(undefined);
   const [page, setPage] = useState(1);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const changePage = (p: number): void => {
+    setPage(p);
+    // The 20-row page is taller than the scroll floor — without this,
+    // page 2 opens parked at page 1's scroll offset. (scrollTop assignment,
+    // not scrollTo(): jsdom implements only the former.)
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  };
 
   useEffect(() => {
     let alive = true;
-    listSkills({ tenantScope: apiTenantScope }).then(
-      (s) => {
-        if (!alive) return;
-        setSkillRecords([...(s?.items ?? []), ...(s?.platform_items ?? [])]);
-      },
-      () => {},
-    );
+    // The backend caps a page at 200 (default 50) — a single call silently
+    // truncates a 50+ tenant roster, making skills #51+ unselectable here
+    // while SkillsList shows them. Walk next_cursor to exhaustion (bounded);
+    // platform_items ride along complete on every page, take the first.
+    const loadAll = async (): Promise<void> => {
+      const first = await listSkills({ tenantScope: apiTenantScope, limit: 200 });
+      let rows = [...(first?.items ?? [])];
+      let cursor = first?.next_cursor ?? null;
+      for (let i = 0; cursor !== null && i < 20; i += 1) {
+        const page = await listSkills({
+          tenantScope: apiTenantScope,
+          cursor,
+          limit: 200,
+        });
+        rows = [...rows, ...(page?.items ?? [])];
+        cursor = page?.next_cursor ?? null;
+      }
+      if (!alive) return;
+      setSkillRecords([...rows, ...(first?.platform_items ?? [])]);
+    };
+    loadAll().catch(() => {});
     return () => {
       alive = false;
     };
@@ -111,14 +132,16 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
   const selected = readSkills(formData);
 
   // Merge listed skills with any selected name that didn't resolve to one, so
-  // hand-authored refs survive and stay visibly checked.
+  // hand-authored refs survive and stay visibly checked. Unresolved stubs go
+  // FIRST — appended at the end they'd hide on the last page and read as
+  // silently dropped.
   const options = useMemo<SkillOption[]>(() => {
     const byName = new Map<string, SkillOption>();
     for (const rec of skills) byName.set(rec.name, toOption(rec));
-    for (const name of selected) {
-      if (!byName.has(name)) byName.set(name, { name, locked: false });
-    }
-    return [...byName.values()];
+    const stubs = selected
+      .filter((name) => !byName.has(name))
+      .map((name): SkillOption => ({ name, locked: false }));
+    return [...stubs, ...byName.values()];
   }, [skills, selected]);
 
   // Distinct categories from the loaded roster, feeding the category dropdown.
@@ -145,14 +168,14 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
     });
   }, [options, query, categoryFilter, sourceFilter]);
 
-  // Clamp rather than reset-on-change: a stale page > last page can only
-  // happen when a filter shrank the list, and clamping keeps the "type a
-  // query character" path from yanking the user off page 1 needlessly.
-  const lastPage = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  // Filters reset to page 1 (SkillsList BUG-3 idiom — a narrowed result set
+  // read from a stale page looks like missing skills); the clamp below only
+  // guards the roster itself shrinking under a parked page.
+  const lastPage = Math.max(1, Math.ceil(filtered.length / TABLE_PAGE_SIZE));
   const currentPage = Math.min(page, lastPage);
   const paged = filtered.slice(
-    (currentPage - 1) * PAGE_SIZE,
-    currentPage * PAGE_SIZE,
+    (currentPage - 1) * TABLE_PAGE_SIZE,
+    currentPage * TABLE_PAGE_SIZE,
   );
 
   const toggle = (name: string, on: boolean): void => {
@@ -213,7 +236,10 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
             data-testid="af-skills-search"
             aria-label={t("agent_form.skills_search")}
             placeholder={t("agent_form.skills_search")}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setPage(1);
+            }}
           />
           <Select
             allowClear
@@ -222,7 +248,10 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
             data-testid="af-skills-category"
             aria-label={t("agent_form.skills_filter_category")}
             placeholder={t("agent_form.skills_filter_category")}
-            onChange={(v) => setCategoryFilter(v)}
+            onChange={(v) => {
+              setCategoryFilter(v);
+              setPage(1);
+            }}
             options={categories.map((c) => ({ value: c, label: c }))}
           />
           <Select
@@ -232,7 +261,10 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
             data-testid="af-skills-source"
             aria-label={t("agent_form.skills_filter_source")}
             placeholder={t("agent_form.skills_filter_source")}
-            onChange={(v) => setSourceFilter(v)}
+            onChange={(v) => {
+              setSourceFilter(v);
+              setPage(1);
+            }}
             options={[
               {
                 value: "platform",
@@ -245,6 +277,7 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
       )}
 
       <div
+        ref={scrollRef}
         data-testid="af-skills-scroll"
         // BUG-5:写死 480 让大屏在半屏留白下面透小窗看长列表 —— 上限跟随
         // 视口(减去页头/筛选行开销),480 仍是小屏地板。
@@ -347,13 +380,11 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
         </div>
       </div>
       <Pagination
+        {...TABLE_PAGINATION}
         size="small"
         current={currentPage}
-        pageSize={PAGE_SIZE}
         total={filtered.length}
-        onChange={setPage}
-        showSizeChanger={false}
-        hideOnSinglePage
+        onChange={changePage}
         style={{ marginTop: 12, justifyContent: "flex-end", display: "flex" }}
         data-testid="af-skills-pagination"
       />

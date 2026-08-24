@@ -1228,7 +1228,6 @@ const zhCN: TranslationKeys = {
     vars_required_missing: "必填变量未填:{{names}}",
     vars_required_mark: "必填",
     vars_missing_count: "{{count}} 项必填未填",
-    vars_toggle: "展开 / 收起 Prompt 变量",
     composer_hint: "Enter 发送,Shift+Enter 换行",
     stats_partial: "(仅已加载轮)",
     traj_kind_user: "USER",
@@ -2822,6 +2821,7 @@ const zhCN: TranslationKeys = {
     create: "创建 API 密钥",
     failed_to_load: "API 密钥列表加载失败",
     empty: "还没有 API 密钥。创建一个绑定到服务账号的密钥。",
+    empty_filtered: "没有生效中的密钥 —— 已撤销 / 已过期的历史密钥用「状态」列筛选查看。",
     never: "永不过期",
     rotation_banner: "{{count}} 个密钥处于轮换宽限窗口",
     rotation_help:

@@ -63,6 +63,7 @@ import {
   type ServiceAccountRecord,
 } from "../api/api_keys";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { TABLE_PAGINATION } from "../utils/pagination";
 
 const { Text } = Typography;
 
@@ -378,15 +379,19 @@ export function SettingsApiKeys() {
         columns={columns}
         dataSource={keys}
         loading={loading}
-        // BUG-8:同 SkillsList BUG-3 口径 —— 客户端分页 20/页,单页自动隐藏。
-        pagination={{
-          pageSize: 20,
-          showSizeChanger: false,
-          hideOnSinglePage: true,
-        }}
+        // BUG-8:同 SkillsList BUG-3 口径 —— 客户端分页,策略单源。
+        pagination={TABLE_PAGINATION}
         locale={{
+          // BUG-8 终审:默认过滤把整表滤空时,"还没有 API 密钥" 是事实错误
+          // (SkillsList #1261 同类) —— 有行被藏就说清历史密钥在筛选后面。
           emptyText: (
-            <Empty description={t("api_keys.empty")} />
+            <Empty
+              description={
+                keys.length > 0
+                  ? t("api_keys.empty_filtered")
+                  : t("api_keys.empty")
+              }
+            />
           ),
         }}
         data-testid="api-keys-table"

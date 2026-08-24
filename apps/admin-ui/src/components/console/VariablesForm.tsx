@@ -15,7 +15,7 @@
  * ``readOnly``/tenant-switch state is NOT read here — the parent decides
  * whether inputs are ``disabled`` and passes it down as a plain prop.
  */
-import { Fragment, useState, type JSX } from "react";
+import { Fragment, useEffect, useState, type JSX } from "react";
 import { Input, Typography } from "antd";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -53,12 +53,17 @@ export function VariablesForm({
   disabled,
 }: VariablesFormProps): JSX.Element | null {
   const { t } = useTranslation();
-  // Initial-only: open when something required is still blank, folded when
-  // the form is already satisfied. Deliberately NOT re-derived on later
-  // renders — filling the last field must not yank the section shut.
-  const [open, setOpen] = useState(
-    () => missingRequired(variables, values).length > 0,
-  );
+  // Open when something required is still blank, folded when the form is
+  // satisfied. Filling the last field must NOT yank the section shut (no
+  // auto-close), but a 0→missing transition MUST re-open it: the parent
+  // resets ``values`` in place on 新建会话 / resume without remounting, and
+  // a manifest edit can add a required variable — folded-with-missing means
+  // send is disabled for inputs that aren't on screen.
+  const hasMissing = missingRequired(variables, values).length > 0;
+  const [open, setOpen] = useState(hasMissing);
+  useEffect(() => {
+    if (hasMissing) setOpen(true);
+  }, [hasMissing]);
   if (variables.length === 0) return null;
 
   const missing = missingRequired(variables, values).length;
@@ -66,11 +71,13 @@ export function VariablesForm({
 
   return (
     <div data-testid="playground-vars" style={{ marginBottom: 8 }}>
+      {/* No aria-label here — it would override the visible content as the
+          accessible name and mute the count + missing badge for screen
+          readers; the button text is the name, aria-expanded is the state. */}
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
-        aria-label={t("console.vars_toggle")}
         data-testid="playground-vars-toggle"
         style={{
           display: "flex",
@@ -117,7 +124,17 @@ export function VariablesForm({
                   whiteSpace: "nowrap",
                 }}
               >
-                <Text style={{ fontSize: 12 }} className="mono">
+                <Text
+                  className="mono"
+                  // Cap the label column: an author-controlled 50-char
+                  // variable name must ellipsize, not starve the input.
+                  style={{
+                    fontSize: 12,
+                    maxWidth: 220,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
                   {v.name}
                 </Text>
                 {v.required !== false && (

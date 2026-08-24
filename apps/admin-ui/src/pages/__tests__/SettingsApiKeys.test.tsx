@@ -299,6 +299,19 @@ describe("SettingsApiKeys", () => {
     expect(screen.getByText("ewk_zz99yy")).toBeInTheDocument();
   });
 
+  it("shows the filtered-empty hint, not the create-one empty state, when all keys are dead", async () => {
+    const revoked = {
+      ...activeKey,
+      id: "key-revoked",
+      prefix: "ewk_revok1",
+      revoked_at: "2026-06-01T00:00:00Z",
+    };
+    installAdapter([saListHandler(), keyListHandler([revoked])]);
+    renderPage();
+    await screen.findByText(/没有生效中的密钥|No live keys/);
+    expect(screen.queryByText(/还没有 API 密钥|No API keys yet/)).toBeNull();
+  });
+
   // BUG-8 — client-side pagination at 20/page (hidden when it all fits).
   it("pages the table at 20 rows", async () => {
     const many = Array.from({ length: 25 }, (_v, i) => ({

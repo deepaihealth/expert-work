@@ -319,6 +319,47 @@ describe("SkillPicker", () => {
     expect(screen.queryByTestId("af-skill-row-p-bulk-24")).not.toBeInTheDocument();
   });
 
+  it("follows next_cursor so a 50+ tenant roster loads completely", async () => {
+    vi.mocked(listSkills)
+      .mockResolvedValueOnce({
+        items: [rec({ name: "page1-skill", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-1", source: "platform", entitled: true }),
+        ],
+        next_cursor: "cursor-1",
+        cross_tenant: false,
+      })
+      .mockResolvedValueOnce({
+        items: [rec({ name: "page2-skill", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-1", source: "platform", entitled: true }),
+        ],
+        next_cursor: null,
+        cross_tenant: false,
+      });
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    expect(await screen.findByTestId("af-skill-row-page1-skill")).toBeInTheDocument();
+    // The second page's tenant skill made it in, platform items only once.
+    expect(screen.getByTestId("af-skill-row-page2-skill")).toBeInTheDocument();
+    expect(screen.getAllByTestId("af-skill-row-plat-1")).toHaveLength(1);
+    expect(listSkills).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: "cursor-1" }),
+    );
+  });
+
+  it("keeps unresolved selected names on page 1 (stubs sort first)", async () => {
+    vi.mocked(listSkills).mockResolvedValueOnce(BULK);
+    const seeded: AgentManifest = {
+      ...SEED,
+      spec: { skills: ["hand-added-legacy"] },
+    };
+    render(<SkillPicker formData={seeded} onChange={vi.fn()} />);
+    await screen.findByTestId("af-skill-row-t-office");
+    // 26 rows total; the checked stub must NOT hide on the last page.
+    const stub = screen.getByTestId("af-skill-check-hand-added-legacy");
+    expect(stub).toBeChecked();
+  });
+
   it("hides the pager when everything fits on one page", async () => {
     render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
     await screen.findByTestId("af-skill-row-pptx");
@@ -336,7 +377,10 @@ describe("SkillPicker", () => {
     try {
       render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
       await waitFor(() =>
-        expect(listSkills).toHaveBeenCalledWith({ tenantScope: scopeRef.current }),
+        expect(listSkills).toHaveBeenCalledWith({
+          tenantScope: scopeRef.current,
+          limit: 200,
+        }),
       );
     } finally {
       scopeRef.current = undefined;
