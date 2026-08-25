@@ -63,9 +63,9 @@ export function liveSyntheticRows(
  *  与账本投影共用(两处的工具行完全同形,只有 agent 步的投影不同)。 */
 function liveToolRows(step: number, live: LiveStep): ToolRow[] {
   const rows: ToolRow[] = [];
-  for (const [toolIdx, name] of live.toolNames) {
+  for (const [callId, name] of live.toolNames) {
     rows.push({
-      id: `live-tool:${step}:${toolIdx}`,
+      id: `live-tool:${step}:${callId}`,
       kind: "tool",
       seq: -1,
       step,
@@ -74,7 +74,7 @@ function liveToolRows(step: number, live: LiveStep): ToolRow[] {
       eventIndexes: [],
       serverMs: null,
       entry: {
-        id: `live-${step}-${toolIdx}`,
+        id: `live-${step}-${callId}`,
         rawName: name,
         isMcp: false,
         server: null,

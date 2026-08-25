@@ -22,8 +22,14 @@ export interface LiveStep {
   content: string;
   /** Accumulated (already server-redacted) reasoning text. */
   reasoning: string;
-  /** tool-call index → tool name (name-only; args arrive via the authoritative card). */
-  toolNames: ReadonlyMap<number, string>;
+  /** ``call_id`` → 工具名(只有名字;参数随后由权威帧那张卡带来)。
+   *
+   *  键是 ``call_id`` 而**不是** ``tool_index``:后者不是 `tool_calls[]` 的
+   *  数组下标(Anthropic 路径上它是内容块下标,文字块与思考块也占号),而且
+   *  厂商不发 index 时服务端会把它兜成 `0` —— 同一步里两次调用因此共用一个
+   *  键,后到的把先到的顶掉,预览里少一张卡。`call_id` 与
+   *  `AIMessage.tool_calls[].id` 同值,是唯一能配对的键。 */
+  toolNames: ReadonlyMap<string, string>;
   /** Reasoning duration in ms once known (reasoning-start → content-start, or
    *  → finalize for a step that never produced content); null while still
    *  reasoning (not yet collapsible). */
@@ -54,12 +60,12 @@ export interface TokenStreamController extends TokenStreamState {
 interface StepBuf {
   content: string;
   reasoning: string;
-  toolNames: Map<number, string>;
+  toolNames: Map<string, string>;
 }
 
 type ParsedToken =
   | { kind: "text"; channel: "content" | "reasoning"; step: number; text: string }
-  | { kind: "tool"; step: number; toolIndex: number; name: string };
+  | { kind: "tool"; step: number; callId: string; name: string };
 
 function parseToken(frame: SseEvent): ParsedToken | null {
   if (frame.event !== "token") return null;
@@ -72,8 +78,20 @@ function parseToken(frame: SseEvent): ParsedToken | null {
     return { kind: "text", channel: rec.channel, step: rec.step, text: rec.text };
   }
   if (rec.channel === "tool_args") {
-    if (typeof rec.tool_index !== "number" || typeof rec.name !== "string") return null;
-    return { kind: "tool", step: rec.step, toolIndex: rec.tool_index, name: rec.name };
+    if (typeof rec.name !== "string") return null;
+    // ``call_id`` 是配对键。空串时退回 ``tool_index``:服务端写的是
+    // ``tc.id or ""``,而协议保证带 name 的分片必带 id(Anthropic 的
+    // ``content_block_start`` 与 OpenAI 某个 index 的首个 fragment 都是两者
+    // 同帧),所以这条退路实际走不到 —— 留着只是不想让一条缺 id 的帧把整个
+    // 预览吞掉。
+    const callId =
+      typeof rec.call_id === "string" && rec.call_id !== ""
+        ? rec.call_id
+        : typeof rec.tool_index === "number"
+          ? `idx:${rec.tool_index}`
+          : null;
+    if (callId === null) return null;
+    return { kind: "tool", step: rec.step, callId, name: rec.name };
   }
   return null;
 }
@@ -157,7 +175,7 @@ export function useTokenStream(): TokenStreamController {
         bufRef.current.set(tok.step, b);
       }
       if (tok.kind === "tool") {
-        b.toolNames.set(tok.toolIndex, tok.name);
+        b.toolNames.set(tok.callId, tok.name);
       } else if (tok.channel === "content") {
         if (!contentStartRef.current.has(tok.step)) contentStartRef.current.set(tok.step, Date.now());
         b.content += tok.text;

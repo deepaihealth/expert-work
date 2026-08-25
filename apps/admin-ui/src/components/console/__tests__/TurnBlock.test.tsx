@@ -150,7 +150,7 @@ describe("TurnBlock", () => {
     const events: SseEvent[] = [upd("agent", { step_count: 1, messages: [{ type: "ai", content: "" }] })];
     const turn = makeConsoleTurn(events, { status: "running" });
     const liveByStep = new Map<number, LiveStep>([
-      [2, liveStep({ content: "partial", reasoning: "thinking…", toolNames: new Map([[0, "query_crm"]]) })],
+      [2, liveStep({ content: "partial", reasoning: "thinking…", toolNames: new Map([["call_a", "query_crm"]]) })],
     ]);
     renderTurnBlock({ ...makeBaseProps(turn), liveByStep });
 

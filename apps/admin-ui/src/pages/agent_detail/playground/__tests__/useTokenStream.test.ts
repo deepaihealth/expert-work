@@ -10,11 +10,16 @@ function contentFrame(step: number, text: string): SseEvent {
 function reasoningFrame(step: number, text: string): SseEvent {
   return { id: null, event: "token", data: { step, channel: "reasoning", text }, rawData: "", receivedAt: "t" };
 }
-function toolFrame(step: number, toolIndex: number, name: string): SseEvent {
+/** 真实形状的 ``tool_args`` 帧:``call_id`` 与 ``tool_index`` 都带。
+ *
+ *  两者分开传,是因为它们**不是一回事**:``tool_index`` 在 Anthropic 路径上
+ *  是内容块下标,厂商不发 index 时服务端还会把它兜成 `0` —— 所以同一步里两次
+ *  调用完全可能共用 `tool_index` 而 ``call_id`` 不同。测试要能表达这种形状。 */
+function toolFrame(step: number, callId: string, name: string, toolIndex = 0): SseEvent {
   return {
     id: null,
     event: "token",
-    data: { step, channel: "tool_args", tool_index: toolIndex, name },
+    data: { step, channel: "tool_args", tool_index: toolIndex, call_id: callId, name },
     rawData: "",
     receivedAt: "t",
   };
@@ -62,17 +67,34 @@ describe("useTokenStream", () => {
     expect(result.current.liveByStep.get(0)?.content).toBe("");
   });
 
-  it("records tool names by index", () => {
+  it("records tool names by call_id", () => {
     const { result } = renderHook(() => useTokenStream());
     act(() => result.current.reset());
     act(() => {
-      result.current.push(toolFrame(0, 0, "search_web"));
-      result.current.push(toolFrame(0, 1, "read_file"));
+      result.current.push(toolFrame(0, "call_a", "search_web", 0));
+      result.current.push(toolFrame(0, "call_b", "read_file", 1));
     });
     act(() => flushRaf());
     const names = result.current.liveByStep.get(0)?.toolNames;
-    expect(names?.get(0)).toBe("search_web");
-    expect(names?.get(1)).toBe("read_file");
+    expect(names?.get("call_a")).toBe("search_web");
+    expect(names?.get("call_b")).toBe("read_file");
+  });
+
+  it("keeps both tool cards when the two calls share a tool_index", () => {
+    // 厂商不发 index 时,服务端把 tool_index 兜成 0 —— 同一步里的两次调用
+    // 因此共用一个 tool_index。拿它当键会让后到的顶掉先到的,预览里少一张卡
+    // (这正是 #1283 在服务端两处修掉、这里是第三处)。call_id 不会撞。
+    const { result } = renderHook(() => useTokenStream());
+    act(() => result.current.reset());
+    act(() => {
+      result.current.push(toolFrame(0, "call_a", "search_web", 0));
+      result.current.push(toolFrame(0, "call_b", "read_file", 0));
+    });
+    act(() => flushRaf());
+    const names = result.current.liveByStep.get(0)?.toolNames;
+    expect(names?.size).toBe(2);
+    expect(names?.get("call_a")).toBe("search_web");
+    expect(names?.get("call_b")).toBe("read_file");
   });
 
   it("coalesces many pushes into a single flush (one rAF scheduled)", () => {
@@ -81,7 +103,7 @@ describe("useTokenStream", () => {
     act(() => {
       result.current.push(contentFrame(0, "a"));
       result.current.push(reasoningFrame(0, "b"));
-      result.current.push(toolFrame(0, 0, "t"));
+      result.current.push(toolFrame(0, "call_a", "t"));
     });
     expect(rafCbs.length).toBe(1); // batched, not 3
     act(() => flushRaf());
