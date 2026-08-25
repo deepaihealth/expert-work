@@ -184,6 +184,4 @@ def test_converter_handles_every_converted_event() -> None:
     conv = ItemStreamConverter(run_id=uuid4())
     for name in sorted(CONVERTED_EVENTS):
         out = conv.convert(name, {}, event_id="1700000000000-1")
-        assert all(emitted in ITEM_EVENTS for emitted, _ in out), (
-            f"{name} 落进了透传分支:{out}"
-        )
+        assert all(emitted in ITEM_EVENTS for emitted, _ in out), f"{name} 落进了透传分支:{out}"

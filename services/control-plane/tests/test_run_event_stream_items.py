@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+
 from control_plane.api._run_event_stream import build_event_producer
 from expert_work.runtime.runs import InMemoryRunEventStore, RunStatus, make_event_record
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
@@ -22,7 +23,6 @@ from orchestrator.stream_items import (
     STREAM_FORMAT_ITEMS,
     STREAM_FORMAT_LEGACY,
 )
-
 from tests.test_run_event_stream import _parse_sse, _ScriptedBridge
 
 MS = 1700000000000
@@ -41,9 +41,7 @@ async def _seed(
 ) -> None:
     for seq, name, data in rows:
         await store.append(
-            make_event_record(
-                run_id=run_id, seq=seq, event_name=name, data=data, created_at_ms=MS
-            )
+            make_event_record(run_id=run_id, seq=seq, event_name=name, data=data, created_at_ms=MS)
         )
 
 
@@ -203,9 +201,13 @@ async def test_live_attach_drops_stale_tokens_for_settled_steps() -> None:
     bridge = _ScriptedBridge(
         [
             # 缓冲区里还留着第 1 步的 token —— 无位置号,去重挡不住。
-            StreamEvent(id=None, event="token", data={"step": 1, "channel": "content", "text": "第一"}),
+            StreamEvent(
+                id=None, event="token", data={"step": 1, "channel": "content", "text": "第一"}
+            ),
             # 正在跑的第 2 步的 token —— 这个必须照常流。
-            StreamEvent(id=None, event="token", data={"step": 2, "channel": "content", "text": "第二"}),
+            StreamEvent(
+                id=None, event="token", data={"step": 2, "channel": "content", "text": "第二"}
+            ),
             StreamEvent(id=f"{MS}-1", event="updates", data=_agent_chunk(2, [_ai("第二步答案")])),
         ]
     )
@@ -236,8 +238,12 @@ async def test_live_attach_keeps_streaming_when_nothing_settled_yet() -> None:
     run_id = uuid4()
     bridge = _ScriptedBridge(
         [
-            StreamEvent(id=None, event="token", data={"step": 1, "channel": "content", "text": "开"}),
-            StreamEvent(id=None, event="token", data={"step": 1, "channel": "content", "text": "头"}),
+            StreamEvent(
+                id=None, event="token", data={"step": 1, "channel": "content", "text": "开"}
+            ),
+            StreamEvent(
+                id=None, event="token", data={"step": 1, "channel": "content", "text": "头"}
+            ),
         ]
     )
 

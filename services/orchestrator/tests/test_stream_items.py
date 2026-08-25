@@ -21,6 +21,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+
 from expert_work.runtime.runs import RunManager, RunRecord
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from orchestrator.sse import format_sse, sse_consumer
@@ -93,7 +94,9 @@ def test_updates_becomes_item_done_per_message() -> None:
     conv = _conv()
     frames = conv.convert(
         "updates",
-        _agent_updates(1, [_ai("先查一下", calls=[{"id": "c1", "name": "search", "args": {"q": "x"}}])]),
+        _agent_updates(
+            1, [_ai("先查一下", calls=[{"id": "c1", "name": "search", "args": {"q": "x"}}])]
+        ),
         event_id="1700000000000-4",
     )
 
@@ -134,7 +137,12 @@ def test_plan_approval_error_become_single_item_done() -> None:
     )
     approval = conv.convert(
         "approval",
-        {"request_id": "req-7", "node": "tools", "reason_kind": "policy_gate", "action_summary": "调用 X"},
+        {
+            "request_id": "req-7",
+            "node": "tools",
+            "reason_kind": "policy_gate",
+            "action_summary": "调用 X",
+        },
         event_id="1700000000000-3",
     )
     error = conv.convert(
@@ -223,8 +231,8 @@ def test_token_preview_and_authoritative_item_share_one_id() -> None:
     preview = conv.convert("token", {"step": 2, "channel": "content", "text": "答"}, event_id=None)
     settled = conv.convert("updates", _agent_updates(2, [_ai("答案")]), event_id="1700000000000-7")
 
-    added = [p for n, p in preview if n == ITEM_ADDED][0]
-    delta = [p for n, p in preview if n == ITEM_DELTA][0]
+    added = next(p for n, p in preview if n == ITEM_ADDED)
+    delta = next(p for n, p in preview if n == ITEM_DELTA)
     done = _of_type(settled, "assistant_message")[0]
     assert added["id"] == delta["id"] == done["id"] == f"{RUN}:step:2"
 
@@ -244,7 +252,9 @@ def test_tool_preview_pairs_by_call_id_not_tool_index() -> None:
     )
     settled = conv.convert(
         "updates",
-        _agent_updates(5, [_ai("前言", calls=[{"id": "cx", "name": "search", "args": {"q": "1"}}])]),
+        _agent_updates(
+            5, [_ai("前言", calls=[{"id": "cx", "name": "search", "args": {"q": "1"}}])]
+        ),
         event_id="1700000000000-8",
     )
 
@@ -304,12 +314,12 @@ async def test_fanout_puts_the_frame_id_on_the_last_event_only() -> None:
     await bridge.publish_end(record.run_id, status="success")
 
     events = await _collect(bridge, record, rm)
-    dones = [(fid, d) for fid, name, d in events if name == ITEM_DONE and "channel" not in d]
     fanout = [(fid, d) for fid, name, d in events if name == ITEM_DONE][:2]
+    # 先证扇出真的发生了 —— 一条消息 + 一次工具调用 = 两个条目。
     assert len(fanout) == 2, f"扇出没发生,断言会空转:{events}"
+    assert {d["type"] for _fid, d in fanout} == {"assistant_message", "tool_call"}
     assert fanout[0][0] is None
     assert fanout[1][0] is not None
-    assert dones or True  # 形状检查见上;这行只为让 dones 的意图留痕
 
 
 # ---------------------------------------------------------------------------

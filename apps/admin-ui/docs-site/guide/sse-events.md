@@ -101,6 +101,8 @@ data: {"run_id":"67262572-5470-41a4-800d-592762ec679d","thread_id":"9f2c1a44-6d3
 - `end` 是一条流自己的结束标记。重连之后会收到新的一个。
 - `gap` 与 `truncated` 描述的是这条连接的状况，不是 run 的事件。
 
+条目模式（`stream_format=items`）下事件名不同，哪些带 `id:` 见 [3.7](#_3-7-条目模式)。`id:` 本身的格式两种形态一致。
+
 ### 从 id 里取 seq
 
 `id:` 由两段组成，中间用一个 `-` 连接：前半段是服务端的毫秒时间戳，后半段是 `seq`。
@@ -156,6 +158,8 @@ function seqOf(id) {
 ::: warning 收到不认识的事件名时忽略它
 上表列出的是当前会遇到的 13 个事件，事件名是开放取值，平台后续可能新增。把未知事件写成异常分支的客户端，会在平台新增事件的那一天失败。正确做法是查不到处理函数就跳过这一个事件，继续读流。
 :::
+
+这 13 个事件是默认形态（`stream_format` 不传或传 `legacy`）的全集。另有一种条目模式，把上表中间几个内容类事件换成三个统一的条目事件，见 [3.7 条目模式](#_3-7-条目模式)。
 
 ## 3.4 每个事件怎么处理
 
@@ -1247,6 +1251,7 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 |---|---|---|
 | `user_id` | 是 | 发起这次 run 的那个终端用户 id。传成别的值返回 `404` |
 | `since_seq` | 否 | 续传位置，服务端只发 seq 严格大于它的事件。取值必须大于等于 `0`，负数返回 `422`；不带它的后果见下面的提示 |
+| `stream_format` | 否 | 事件流的形态，取值：`legacy`（默认）/ `items`。要与首次发起这次 run 时用的取值一致，见 [3.7 条目模式](#_3-7-条目模式) |
 
 响应头两个：`X-Expert-Work-Stream-Mode` 说明这次是实时还是续传，取值见下文「续传的两种情形」；`X-Expert-Work-Next-Seq` 只在续传被分页截断时出现，取值与 `truncated` 事件的 `next_seq` 相同。
 
@@ -1458,3 +1463,158 @@ if (ev.event === "truncated") {
 :::
 
 带同一个 `Idempotency-Key` 重试 `POST .../runs`（`mode: "stream"`）时，拿到的是同一份续传输出，同样会截断。但 `POST .../runs` 的请求体和查询参数里都没有 `since_seq`，原样重发这个 `POST` 只会一直拿回同一个第一页。这种情况下翻页必须换成 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}&since_seq={next_seq}`，其中 `run_id` 从响应头 `X-Expert-Work-Run-Id` 取。
+
+## 3.7 条目模式
+
+前面六节描述的是默认形态。**条目模式**是同一条流的另一种形态：把「模型说了什么、调用了哪个工具、拿到什么结果」这类内容整理成**对话条目**，用三个统一的事件推送。
+
+默认形态推送的是每个步骤的执行结果，客户端要自己从中还原一次工具调用的发起与结果、自己判断哪一段是正文；条目模式把这些整理放在服务端，客户端收到的直接就是可以渲染的一条条内容。
+
+适用场景是：客户端要把一段已有会话和正在进行的对话放进**同一个列表**渲染。两种形态在同一条流上不会混用，一条流从头到尾只有一种。
+
+已经在使用默认形态的客户端不需要改动，`stream_format` 不传就是默认形态。
+
+### 怎么开启
+
+`stream_format` 取值 `legacy`（默认）或 `items`。四个会返回事件流的接口都接受它：
+
+| 接口 | 传参位置 |
+|---|---|
+| `POST /v1/agents/{agent_code}/runs` | 请求体字段 |
+| `POST /v1/agents/{agent_code}/runs/{run_id}:decide` | 请求体字段 |
+| `GET /v1/agents/{agent_code}/runs/{run_id}/events` | 查询参数 |
+| 带 `Idempotency-Key` 命中重放的 `POST /v1/agents/{agent_code}/runs` | 请求体字段，与首次请求相同 |
+
+取值只有这两个，写错返回 422，不会退回默认形态。
+
+一段对话的四个接口要传一致的取值。其中一处漏传，客户端的列表里就会出现一段形状不同的内容。
+
+::: warning 同一个 Idempotency-Key 不能改 stream_format
+幂等键的判定依据是整个请求体。同一个 `Idempotency-Key` 只改 `stream_format`、其余不变，会返回 422 `IDEMPOTENCY_KEY_REUSED`——服务端把它视为「同一个键用于了两个不同的请求」。要换形态就换一个新的 `Idempotency-Key`。
+:::
+
+```bash [请求]
+curl -N "https://<your-domain>/v1/agents/{agent_code}/runs" \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "input": "你好", "stream_format": "items"}'
+```
+
+### 三个条目事件
+
+| 事件 | 出现时机 | 客户端处理 |
+|---|---|---|
+| `item.added` | 一条内容开始产出，此时字段可能还是空的 | 按 `id` 插入一条占位内容 |
+| `item.delta` | 正文逐字产出 | 把 `text` 追加到 `id` 对应的那条内容上 |
+| `item.done` | 一条内容已经完整 | 按 `id` 插入或更新，整条替换 |
+
+`item.added` 与 `item.done` 的 `data` 是一条完整的条目对象（字段见下文「条目的字段」）。`item.delta` 的 `data` 只有三个键：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 这段文字属于哪一条内容，与 `item.added` 的 `id` 相同 |
+| `field` | string | 取值：`content`（正文）/ `reasoning`（模型的思考过程） |
+| `text` | string | 追加的文字片段 |
+
+`field` 为 `reasoning` 的片段只在流式过程中出现，不会进入最终的 `assistant_message` 条目——思考过程不属于对话正文。要展示它的客户端需要自己保存这些片段。
+
+::: danger item.done 必须按插入或更新处理
+不能假设每条内容都先有 `item.added`。**允许对一个从未出现过的 `id` 直接收到 `item.done`**，这是正常情况，不是异常。
+
+原因见下文「三条路径上的序列不同」：续传时服务端不重发逐字预览，那条路径上一条内容只会有一个 `item.done`。按「先 `added` 再 `done`」严格配对实现的客户端，会在续传时丢掉全部内容。
+:::
+
+### 条目模式下的事件全集
+
+条目模式下不再出现 `updates`、`token`、`plan`、`approval`、`error` 这五个事件，它们的内容改由条目事件承载。其余事件原样保留，含义与 3.4 完全一致。
+
+| 类别 | 事件 |
+|---|---|
+| 内容 | `item.added`、`item.delta`、`item.done` |
+| 流程 | `metadata`、`end`、`gap`、`truncated` |
+| 过程提示 | `guard`、`compaction`、`retry`、`worker` |
+
+3.3 那条「收到不认识的事件名时忽略它」同样适用：这里列出的是当前会遇到的 11 个事件，事件名是开放取值。
+
+### 条目的字段
+
+每条条目都有这四个公共字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 这条内容的标识。同一条流内唯一，续传时同一条内容拿到的是同一个 `id`；**不保证在不同接口之间一致** |
+| `type` | string | 开放取值，当前会遇到下表六种；遇到未知取值时跳过这一条，继续读流 |
+| `run_id` | string | 产生这条内容的那次 run |
+| `created_at` | string \| null | ISO 8601 时刻。服务端取不到时给 `null`，不会用当前时间顶替 |
+
+六种 `type` 及其专有字段：
+
+| type | 专有字段 |
+|---|---|
+| `assistant_message` | `content`、`channel` |
+| `tool_call` | `call_id`、`name`、`args` |
+| `tool_result` | `call_id`、`name`、`status`、`content`、`artifact`、`duration_ms` |
+| `plan` | `goal`、`steps` |
+| `approval` | `request_id`、`node`、`reason_kind`、`action_summary`、`proposed_args`、`requested_at`、`timeout_at` |
+| `error` | `message`、`name` |
+
+取不到值的专有字段**整个键都不出现**，不会给一个 `null`。客户端按「这一项没有」处理。四个公共字段任何时候都在，其中 `created_at` 可能是 `null`。
+
+终端用户自己说的那句话不在这条流上：它是这次 run 的输入，调用方在发起对话时就已经有了。要把它一并渲染进列表，直接用发起时的请求体。
+
+#### assistant_message
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `content` | string | 这一段正文。工具结果的防注入包装已由服务端还原 |
+| `channel` | string | 取值：`final`（这一轮给终端用户的答复）/ `commentary`（中间说明，例如动手之前的一句交代） |
+
+`channel` 在流式过程中一律先给 `commentary`：判断一段话是不是最终答复，要看它后面还有没有内容，而流式时后面的内容尚未产生。**run 收尾时，服务端会对最后一段符合条件的正文补发一个 `item.done`，把 `channel` 改成 `final`**，`id` 与之前那条相同。这正是上面要求按插入或更新处理的直接原因。
+
+#### tool_call 与 tool_result
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `call_id` | string | 配对键。`tool_result` 用它找到对应的 `tool_call`，不要靠列表里的相邻位置——工具可以并行，中间会插入别的内容 |
+| `name` | string | 工具名 |
+| `args` | object | 调用参数。`item.added` 阶段是空对象，参数不逐字推送 |
+| `status` | string | 仅 `tool_result`。取值：`success` / `error` |
+| `content` | string | 仅 `tool_result`。结果文本，防注入包装已由服务端还原，可以直接显示 |
+| `artifact` | any | 仅 `tool_result`。工具产出的结构化数据，结构随工具而定，可能不出现 |
+| `duration_ms` | integer | 仅 `tool_result`。这次调用耗时，可能不出现 |
+
+`content` 已经还原这一点与默认形态不同：默认形态下 `updates` 里的工具结果带 `«UNTRUSTED nonce=…»` 包装，需要客户端自己拆（见 3.4 的「工具结果文本的还原」）。条目模式下服务端已经拆好。还原不是完全可逆的——包装时连续空白被压成一个空格，换行无法恢复。
+
+#### plan 与 approval 与 error
+
+`plan` 的 `goal` / `steps`、`approval` 的七个字段、`error` 的 `message` / `name`，含义与 3.4 里同名事件的 `data` 字段逐一对应，不再重复。
+
+一次 run 只有一条 `plan` 条目：计划变化时服务端发出的 `item.done` 用的是同一个 `id`，整条替换。
+
+`approval` 条目里没有 `binding_digest`。这个字段在默认形态下也是要求客户端原样忽略的，条目模式直接不给。
+
+### 三条路径上的序列不同
+
+| 路径 | 一条正文的事件序列 |
+|---|---|
+| 正在进行的对话 | `item.added` → 若干 `item.delta` → `item.done` |
+| 续传已结束的 run | 只有 `item.done` |
+| 续传正在进行的 run | 已经发生的部分只有 `item.done`，接上实时之后才有完整三段 |
+
+逐字预览是即时的，服务端不记录，所以续传时不重发（默认形态下的 `token` 同理，见 3.2）。这是必须按插入或更新处理 `item.done` 的原因。
+
+### worker 仍是独立事件
+
+条目模式下 `worker` 不转成条目，仍按 3.4 的 `worker` 一节处理，靠 `parent_tool_call_id` 挂到对应的 `tool_call` 条目下方（它与 `tool_call` 的 `call_id` 同值）。
+
+这样安排是为了时机：把子任务进度并进工具卡，就必须等子任务结束才能发出这张卡的 `item.done`，工具调用在界面上会迟迟不出现。
+
+### 续传位置的取法不变
+
+`id:` 行的规则与 3.2 完全一致：`item.added` 与 `item.done` 带 `id:`，`item.delta` 不带。续传位置仍然只从带 `id:` 的事件里取 `seq`，3.6 的整套做法原样适用。
+
+一个执行步骤会展开成多条内容。这种情况下 `id:` 只挂在这一批的**最后一个**事件上，前面几个不带。这是有意的：客户端在这一批中途断线时，它记住的续传位置还停在上一个步骤，重连后这一批会完整重发一遍，而条目按 `id` 插入或更新，重复收到不会产生重复内容。
+
+::: warning 续传会重复收到已有的内容
+重连之后收到一个 `id` 已经在列表里的 `item.done` 是正常的，按更新处理即可。把它当成新内容追加，界面上会出现重复的气泡。
+:::
