@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -905,6 +906,79 @@ async def test_items_hangs_deeper_workers_by_parent_worker_id(ctx: _Ctx) -> None
     # 根还没收到 ``end``,停在 ``running`` —— 不编一个结局。
     assert root["status"] == "running"
     assert root["summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_orphan_worker_is_dropped_not_promoted_to_a_root(ctx: _Ctx) -> None:
+    """父不在场的子任务**整棵丢弃**,绝不落下去按 ``parent_tool_call_id`` 挂。
+
+    这是分层规则的另一半(前一条测的是「有父时挂父」)。丢弃看着像是在浪费
+    数据,但替代方案更坏:孙子任务的 ``parent_tool_call_id`` 指向的是**子 run
+    内部**那次工具调用,把它提成根就等于挂到一个与它毫无关系的工具卡上。
+    **错挂比不显示坏得多 —— 用户看不出它是错的。**
+
+    这个场景是可达的,不是假想:落库队列满时 ``orchestrator/sse.py`` 走
+    ``_put_dropping_oldest``,而 ``asyncio.Queue`` 的 ``get_nowait`` 取的是**最
+    旧**那条。父子任务的 ``start`` 帧在时间上早于它的子帧,所以高压下正好是父
+    帧先被丢、子帧留下,恰好构成孤儿。
+
+    fixture 用「直接不 seed 父帧」构造,不用 ``list`` 的 limit 截断 —— 截断丢
+    的是尾部也就是子帧,反而构不成孤儿。
+
+    孤儿的 ``parent_tool_call_id`` 故意取本轮真实存在的 ``call-plain``:只有撞
+    上父 run 里真有的 id 时,提成根才**看得见**(挂到不相干的工具卡上)。取一
+    个谁也不匹配的内部 id 的话,提成根会退化成静默不显示,与正确行为无法区分,
+    测不出任何东西。
+    """
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            # 一棵完整的树 —— 兄弟证据:回填本身在工作。少了它,下面那条否定
+            # 断言在「回填整体失灵」时同样成立。
+            make_event_record(
+                run_id=run_id,
+                seq=0,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-1",
+                    wseq=0,
+                    parent_tool_call_id="call-worker",
+                    data={"task_excerpt": "查排班", "role": None, "max_steps": 8},
+                ),
+            ),
+            # 孤儿:父 ``w-ghost`` 的帧一条都没有(落库队列把它挤掉了)。
+            make_event_record(
+                run_id=run_id,
+                seq=1,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-orphan",
+                    wseq=0,
+                    parent_worker_id="w-ghost",
+                    parent_tool_call_id="call-plain",
+                    depth=2,
+                    label="孤儿",
+                    data={"task_excerpt": "父帧被挤掉了", "role": None, "max_steps": 4},
+                ),
+            ),
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+
+    # 兄弟先立住:有父的那棵确实挂上了。
+    assert calls["call-worker"]["worker"]["worker_id"] == "w-1"
+    # 孤儿没有被提成根挂到那次不相干的调用上 —— 这条是本测试的靶心。
+    assert "worker" not in calls["call-plain"]
+    # 也没有从别的缝里钻进那棵完整的树。
+    assert calls["call-worker"]["worker"]["children"] == []
+    # 整个响应里不存在它的任何痕迹(不以别的形式泄漏进条目)。
+    assert "w-orphan" not in json.dumps(body, ensure_ascii=False)
 
 
 @pytest.mark.asyncio

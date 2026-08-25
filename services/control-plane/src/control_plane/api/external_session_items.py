@@ -280,9 +280,13 @@ def _worker_trees(records: Sequence[RunEventRecord]) -> dict[str, dict[str, Any]
             parent = nodes.get(parent_id)
             if parent is not None:
                 parent["children"].append(node)
-            # 父不在场(帧被截断 / 帧丢了)→ 丢弃整棵,不把孙子任务提成根:
-            # 提上来会挂到子 run 内部那个 tool_call 上,而那个 id 在父 run 里
-            # 根本不存在,等于挂到不知哪里去。
+            # 父不在场(落库队列把父帧挤掉了 —— ``sse.py`` 满队列时丢最旧那条,
+            # 而父的 start 帧比子帧更早)→ **丢弃整棵**,不把孙子任务提成根:
+            # 提上来会挂到子 run 内部那个 tool_call 上,那个 id 在父 run 里根本
+            # 不存在;万一撞上父 run 里真有的 id,就成了挂到不相干的工具卡上 ——
+            # 错挂比不显示坏得多,用户看不出它是错的。
+            # 这个 ``continue`` 有测试守着:``test_external_session_items.py::
+            # test_orphan_worker_is_dropped_not_promoted_to_a_root``。
             continue
         call_id = parent_call[worker_id]
         if call_id is not None:
