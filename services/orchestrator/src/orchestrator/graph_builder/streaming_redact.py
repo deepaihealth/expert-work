@@ -171,6 +171,21 @@ class TokenSink:
     buffered-release tails after the router returns. Tool *arguments* are NOT
     streamed — they reach the client via the authoritative ``updates`` frame
     (name-only, 子项目 3b decision), so there is no argument-redaction path.
+
+    The ``tool_args`` frame carries BOTH keys, with different jobs:
+
+    * ``call_id`` (``ToolCallChunk.id``) — the vendor's tool-call id, identical
+      to ``AIMessage.tool_calls[].id`` on the authoritative frame. This is the
+      only correct key for pairing a preview card with its final call/result.
+      It is available here because the provider protocols emit id and name on
+      the SAME chunk (Anthropic ``content_block_start`` carries both, and an
+      OpenAI index's first fragment carries both), and this sink emits exactly
+      on "name seen" — so a named chunk always has an id.
+    * ``tool_index`` (``ToolCallChunk.index``) — the per-connection dedup key
+      only. Its meaning is provider-specific: OpenAI's is the assistant
+      message's ``tool_calls[]`` subscript, but Anthropic's is the ``content``
+      block index, which text and thinking blocks also consume. It is NOT an
+      array subscript in general and must never be used to pair.
     """
 
     def __init__(self, *, step: int, publish: TokenPublish, dlp: bool, screen: bool) -> None:
@@ -200,6 +215,7 @@ class TokenSink:
                         "step": self._step,
                         "channel": "tool_args",
                         "tool_index": tc.index,
+                        "call_id": tc.id or "",
                         "name": tc.name,
                     }
                 )

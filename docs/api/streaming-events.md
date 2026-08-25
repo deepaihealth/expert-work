@@ -31,7 +31,7 @@ data: {"step": 0, "channel": "content", "text": "partial answer fragment"}
 event: token
 data: {"step": 0, "channel": "reasoning", "text": "let me think about..."}
 event: token
-data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
+data: {"step": 0, "channel": "tool_args", "tool_index": 0, "call_id": "call_de58e676916d442d925bff27", "name": "search_web"}
 ```
 
 - `step` — the agent step index the fragment belongs to.
@@ -39,10 +39,18 @@ data: {"step": 0, "channel": "tool_args", "tool_index": 0, "name": "search_web"}
   thinking, for reasoning-capable models), or `"tool_args"` (a tool call is
   being made).
 - `content` / `reasoning` frames carry `text` — an already-redacted fragment.
-- `tool_args` frames carry `tool_index` (which parallel tool call) and `name`
-  (the tool being called), emitted once when the name first appears. The tool
+- `tool_args` frames carry `call_id`, `tool_index` and `name` (the tool being
+  called), emitted once when the name first appears. The tool
   **arguments are not streamed**; they arrive complete on the authoritative
   `updates` frame.
+  - `call_id` is the vendor tool-call id — identical to `ai.tool_calls[].id`
+    on the `updates` frame and to the tool result's `tool_call_id`. It is the
+    **only** correct key for pairing a preview card with its final call.
+  - `tool_index` is a per-connection dedup key, **not** an array subscript. Its
+    meaning is provider-specific: on the OpenAI wire it is the assistant
+    message's `tool_calls[]` index, but on the Anthropic wire it is the
+    `content` block index — text and thinking blocks consume numbers too, and a
+    dropped incomplete call shifts the final array. Never pair on it.
 
 **`token` frames are provisional.** Treat them as a live typewriter preview only:
 
