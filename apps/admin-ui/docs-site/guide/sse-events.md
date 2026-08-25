@@ -1235,7 +1235,7 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 三种情况：
 
 1. **`mode: "queue"` 的 run**——`POST` 直接返回 `202`，没有流，两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)。要读取事件需要调用下面这条接口。
-2. **流式连接中途断了**——网络抖动、代理超时，或者客户端自己的读超时。
+2. **流式连接中途断了**——网络抖动、代理超时，或者客户端自己的读超时。**断的如果是 `POST .../runs` 且 `mode: "stream"` 返回的那条流，这一轮已经被取消了**，续传只会读到一个 `interrupted` 收尾。两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)，本节下方的提示里有完整的对照表。本节讲的续传，只对 `mode: "queue"` 的 run 以及 `GET .../events` 这条连接完全成立。
 3. **run 已经结束，需要把事件重新过一遍**——例如归档留存、页面刷新后恢复现场。
 
 三种情况调的是同一条接口：
