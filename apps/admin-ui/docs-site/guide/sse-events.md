@@ -1267,6 +1267,31 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 不要重新调 `POST /v1/agents/{agent_code}/runs`。那不是重连，那会开启新的一轮 run，调用方手上会多出一个 `run_id` 和一份互不相干的回答。
 :::
 
+::: danger 断开 stream 模式的那条连接会取消 run
+
+断开连接的后果取决于断的是哪一条：
+
+| 断开的连接 | 对 run 的影响 |
+|---|---|
+| `POST .../runs` 且 `mode: "stream"` 返回的那条流 | run 还没走到最终状态时，**服务端会取消它** |
+| `POST .../runs` 且 `mode: "queue"`（本来就没有流） | 无影响 |
+| `GET .../runs/{run_id}/events` | 无影响，随时可以断、随时可以带 `since_seq` 再接 |
+
+这个行为没有开关，请求参数里改不了。
+
+因此**页面可能中途切走、而 run 又要跑上几分钟的场景，只能用 `mode: "queue"` 加 `GET .../events`**。用 `mode: "stream"` 时用户切走页面，浏览器关掉那条连接，这一轮就被取消了——不是超时，不是网络问题，是设计如此。
+
+**上一条讲的重连，在 `mode: "stream"` 上同样受这条约束**：读超时之后断开那条流，这一轮就已经被取消了；再用 `GET .../events` 接回去，只会读到一个 `status: "interrupted"` 的收尾，内容不会继续产生。也就是说，`mode: "stream"` 的流**断了就没有第二次机会**。
+
+要让「断线之后能接着往下跑」成立，发起时就得用 `mode: "queue"`：
+
+```json
+{ "user_id": "u-123", "input": "……", "mode": "queue", "stream_format": "items" }
+```
+
+拿到 `202` 里的 `run_id` 之后全程走 `GET .../runs/{run_id}/events`，断多少次都不影响这一轮。
+:::
+
 只需要粗粒度知道 run 是否结束、不想挂着等待时，不必调这条接口：调 `GET /v1/agents/{agent_code}/sessions?user_id={user_id}`，看每一项的 `running` 布尔字段即可。
 
 ### 整体流程
@@ -1535,6 +1560,21 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs" \
 | 过程提示 | `guard`、`compaction`、`retry`、`worker` |
 
 3.3 那条「收到不认识的事件名时忽略它」同样适用：这里列出的是当前会遇到的 11 个事件，事件名是开放取值。
+
+::: warning 从 legacy 换到条目模式时，挂在这五个事件上的处理会静默失效
+
+这五个事件在条目模式下一次都不会到达。原本写在它们的分支里的处理——落库、埋点、告警、错误上报——不会报错，只是永远不执行：日志表一直是空的，错误告警一条都不发，看起来像「最近没有出过错」。
+
+换模式时把这五处逐一改到新的承载位置：
+
+| 原事件 | 条目模式下从哪里拿 |
+|---|---|
+| `updates` | `item.added` / `item.done` |
+| `token` | `item.delta` |
+| `plan` | `type` 为 `plan` 的条目 |
+| `approval` | `type` 为 `approval` 的条目 |
+| `error` | `type` 为 `error` 的条目 |
+:::
 
 ### 条目的字段
 

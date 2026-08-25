@@ -798,6 +798,24 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 
 用 `call_id` 而不是列表位置去配对 `tool_call` 与 `tool_result`：工具是并行执行的，两者之间可能插着别的条目。
 
+### 防注入包装的处理
+
+工具结果的原文带一层 `«UNTRUSTED nonce=…»` 包装，用来防止工具返回的内容被当成指令执行。这个接口里两类字段的处理**不一样**：
+
+| 字段 | 状态 | 客户端要做什么 |
+|---|---|---|
+| `tool_result` 的 `content` | 服务端已经拆掉包装 | 直接显示 |
+| `tool_call.worker` 里所有以 `_excerpt` 结尾的字段 | **保留着包装** | 显示给用户之前自己拆，做法见 [3.4 工具结果文本的还原](./sse-events#工具结果文本的还原) |
+
+::: warning 按字段名去拆必然漏掉
+
+`_excerpt` 字段散落在子任务树的多层里，当前有 `task_excerpt`、`content_excerpt`、`args_excerpt`、`tool_result_excerpt`、`stdout_excerpt`、`stderr_excerpt` 六个，而且会随着子任务的能力增加。
+
+写成「遇到这几个字段名就拆」的实现，会在新增字段时漏掉，界面上直接冒出 `«UNTRUSTED nonce=…»`。正确做法是**递归遍历 `worker`，对每个以 `_excerpt` 结尾的字符串字段做还原**，不要枚举字段名。
+:::
+
+还原不是完全可逆的：包装时连续空白被压成一个空格，换行恢复不回来。
+
 ### 子任务
 
 子任务是 Agent 把一部分工作交给另一个 Agent 去做的机制，由模型自己发起：它调用了一个会派生子任务的工具。这样产生的 `tool_call` 条目带一个 `worker` 字段，内容是这个子任务的执行经过；没有派生子任务的工具调用不带这个字段。
