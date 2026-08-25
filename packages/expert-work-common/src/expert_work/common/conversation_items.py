@@ -15,6 +15,14 @@ import control-plane,所以共享的形状只能落在这里。理由与 ``messa
 稳定** —— 实时产出与历史重建用的是两套推导输入,编号规则不同。这不成问题:
 同一个 run 不会同时出现在历史与实时(历史排除活跃轮),所以两套 id 永远不会
 落进同一个列表。客户端不要拿它跨接口比对。
+
+**``item.delta`` 不带 seq(给 PR3 实现者的硬约束)**:实时的 ``item.delta``
+将由今天的 ``token`` 帧转换而来,而 ``token`` 是 ephemeral 的 —— 它不落库、
+走 ``bridge.publish_ephemeral``,因此**不占序号**(见 ``orchestrator/sse.py``
+的 ``_publish_token``)。这条约束必须原样传进条目模式:一旦让不可回放的帧占
+用 seq,客户端从实时流里解析出的续传位点就会跑到 ``since_seq`` 实际能回放的
+范围之外,断线重连**静默漏事件**。所以 ``item.delta`` 一律无 seq,客户端的
+续传位点只能取自带 seq 的帧(``item.added`` / ``item.done`` 及流控帧)。
 """
 
 from __future__ import annotations
@@ -198,16 +206,51 @@ class ApprovalItem(_ItemBase):
 
     历史里要能渲染出「这一步等过审批、结果是什么」,所以它是对话内容的一部分,
     不是纯执行过程。
+
+    字段与 SSE ``approval`` 帧(``orchestrator/sse.py`` 的 ``approval_payload``
+    = :class:`expert_work.protocol.approval.ApprovalRequest` 的 json dump)保持
+    同名同义,一个都不能少 —— 客户端在**提交决策之前**要靠它们做三件事:
+
+    * ``reason_kind`` —— 判断「拒绝会不会直接终结这次 run」的唯一依据
+      (``policy_gate`` 拒绝即终止,另外四种 agent 自提的会继续跑)。取值是
+      :data:`expert_work.protocol.approval.ApprovalReasonKind` 那五个,平台
+      保证不出现第六个,所以这里按字符串透传、不复制一份词表来漂移。
+    * ``requested_at`` / ``timeout_at`` —— 倒计时窗口的唯一依据。取不到时给
+      ``None``(键直接缺席),**绝不编一个默认值**:客户端把默认值写死正是
+      对外文档明令禁止的做法,服务端更不该替它写死。
+    * ``request_id`` —— 界面上区分与去重多条审批。
+
+    ``binding_digest`` 有意**不进条目**:它是平台内部的参数绑定校验值,对外
+    文档写明客户端原样忽略,提交决策的请求体也不收它。放进来只会让客户端以为
+    自己该校验点什么 —— 而它在客户端侧根本无从校验。
+
+    ``decision`` = 这次审批最终的结果。live 发出时还没有决策,所以**缺席**;
+    历史重建时若拿得到(数据源是 PR2 的事)就填。
     """
 
     TYPE: ClassVar[str] = "approval"
 
-    status: str
-    tool: str
-    args: Mapping[str, Any] = field(default_factory=dict)
+    request_id: str
+    node: str
+    reason_kind: str
+    action_summary: str
+    proposed_args: Mapping[str, Any] = field(default_factory=dict)
+    requested_at: str | None = None
+    timeout_at: str | None = None
+    decision: str | None = None
 
     def _payload(self) -> dict[str, Any]:
-        return {"status": self.status, "tool": self.tool, "args": dict(self.args)}
+        return {
+            "request_id": self.request_id,
+            "node": self.node,
+            "reason_kind": self.reason_kind,
+            "action_summary": self.action_summary,
+            # 空参数列表要给出来(``{}`` 是「这次调用没有参数」的正常答案)。
+            "proposed_args": dict(self.proposed_args),
+            "requested_at": self.requested_at,
+            "timeout_at": self.timeout_at,
+            "decision": self.decision,
+        }
 
 
 @dataclass(frozen=True, slots=True)

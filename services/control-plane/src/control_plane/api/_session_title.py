@@ -15,6 +15,11 @@ from uuid import UUID
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+# 拍平消息正文的定义住在 common —— 会话标题、对外消息列表、对话条目三处读的
+# 必须是同一段文本,否则「标题里有的字」和「气泡里有的字」会对不上。这里保留
+# 转出名,老调用点不受影响。
+from expert_work.common.conversation_channel import message_text as message_text
+
 logger = logging.getLogger("expert_work.control_plane.session_title")
 
 
@@ -26,17 +31,6 @@ def title_from_text(text: str, *, limit: int = 80) -> str:
     """
     single = " ".join(text.split())
     return single[:limit]
-
-
-def message_text(content: Any) -> str:
-    """Flatten a LangChain message ``content`` (str or block list) to text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)
-        )
-    return ""
 
 
 async def first_message_title(
