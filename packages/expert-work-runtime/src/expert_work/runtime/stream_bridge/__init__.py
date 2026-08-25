@@ -8,7 +8,13 @@ from expert_work.runtime.stream_bridge.base import (
     END_SENTINEL as END_SENTINEL,
 )
 from expert_work.runtime.stream_bridge.base import (
+    HEARTBEAT_FRAME as HEARTBEAT_FRAME,
+)
+from expert_work.runtime.stream_bridge.base import (
     HEARTBEAT_SENTINEL as HEARTBEAT_SENTINEL,
+)
+from expert_work.runtime.stream_bridge.base import (
+    OutputHeartbeat as OutputHeartbeat,
 )
 from expert_work.runtime.stream_bridge.base import (
     StreamBridge as StreamBridge,
@@ -31,8 +37,10 @@ from expert_work.runtime.stream_bridge.memory import (
 
 __all__ = [
     "END_SENTINEL",
+    "HEARTBEAT_FRAME",
     "HEARTBEAT_SENTINEL",
     "InMemoryStreamBridge",
+    "OutputHeartbeat",
     "StreamBridge",
     "StreamBridgeBackend",
     "StreamEvent",

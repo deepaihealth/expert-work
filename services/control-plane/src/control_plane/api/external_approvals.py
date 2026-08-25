@@ -61,7 +61,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ApprovalStatus, Principal
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunStore
+from expert_work.runtime.runs import DisconnectMode, RunStore
 from orchestrator import sse_consumer
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
@@ -292,6 +292,9 @@ def build_external_approvals_router() -> APIRouter:
                 agent_disable_service=getattr(request.app.state, "agent_disable_service", None),
                 tenant_status_service=getattr(request.app.state, "tenant_status_service", None),
                 workspace_store=getattr(request.app.state, "user_workspace_store", None),
+                # 与对外发起路径同义:断线是意外而不是「我不要了」。审批续跑
+                # 更经不起取消 —— 调用方已经等过一轮人工审批。
+                on_disconnect=DisconnectMode.CONTINUE,
             )
         except HTTPException as exc:
             return _decision_error_envelope(exc)

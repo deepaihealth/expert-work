@@ -1235,7 +1235,7 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 三种情况：
 
 1. **`mode: "queue"` 的 run**——`POST` 直接返回 `202`，没有流，两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)。要读取事件需要调用下面这条接口。
-2. **流式连接中途断了**——网络抖动、代理超时，或者客户端自己的读超时。
+2. **流式连接中途断了**——网络抖动、代理回收空闲连接、客户端自己的读超时。断的是哪一条流都一样：run 继续执行，续传接得回来。
 3. **run 已经结束，需要把事件重新过一遍**——例如归档留存、页面刷新后恢复现场。
 
 三种情况调的是同一条接口：
@@ -1265,6 +1265,23 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 读超时之后要做的是重新发起同一条 `GET .../runs/{run_id}/events`，并带上续传位置。
 
 不要重新调 `POST /v1/agents/{agent_code}/runs`。那不是重连，那会开启新的一轮 run，调用方手上会多出一个 `run_id` 和一份互不相干的回答。
+:::
+
+::: tip 断开连接不影响这一轮
+
+无论断的是哪一条流，run 都继续执行到底：
+
+| 断开的连接 | 对 run 的影响 |
+|---|---|
+| `POST .../runs` 且 `mode: "stream"` 返回的那条流 | 无影响，run 继续跑 |
+| `POST .../runs` 且 `mode: "queue"`（本来就没有流） | 无影响 |
+| `GET .../runs/{run_id}/events` | 无影响，随时可以断、随时可以带 `since_seq` 再接 |
+
+所以**发起时选 `stream` 还是 `queue`，与「断线之后能不能接回来」无关**。两种模式起的 run，续传都走同一条 `GET .../runs/{run_id}/events`；差别只在发起那一刻要不要立刻拿到流，见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)。
+
+断线期间产生的内容不会丢：服务端照常落库，续传时一并补给你。唯一补不回来的是逐字预览（`token` / `item.delta`）——它不落库、也不占续传位点，所以接回来的是完整的整条内容，只是没有逐字出现的过程。
+
+要主动停掉一轮，用 [4.1 取消 run](./run-control#_4-1-取消-run)，别靠断开连接。
 :::
 
 只需要粗粒度知道 run 是否结束、不想挂着等待时，不必调这条接口：调 `GET /v1/agents/{agent_code}/sessions?user_id={user_id}`，看每一项的 `running` 布尔字段即可。
@@ -1535,6 +1552,21 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs" \
 | 过程提示 | `guard`、`compaction`、`retry`、`worker` |
 
 3.3 那条「收到不认识的事件名时忽略它」同样适用：这里列出的是当前会遇到的 11 个事件，事件名是开放取值。
+
+::: warning 从 legacy 换到条目模式时，挂在这五个事件上的处理会静默失效
+
+这五个事件在条目模式下一次都不会到达。原本写在它们的分支里的处理——落库、埋点、告警、错误上报——不会报错，只是永远不执行：日志表一直是空的，错误告警一条都不发，看起来像「最近没有出过错」。
+
+换模式时把这五处逐一改到新的承载位置：
+
+| 原事件 | 条目模式下从哪里拿 |
+|---|---|
+| `updates` | `item.added` / `item.done` |
+| `token` | `item.delta` |
+| `plan` | `type` 为 `plan` 的条目 |
+| `approval` | `type` 为 `approval` 的条目 |
+| `error` | `type` 为 `error` 的条目 |
+:::
 
 ### 条目的字段
 

@@ -26,6 +26,7 @@ integration test:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -49,11 +50,74 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     END_SENTINEL,
+    HEARTBEAT_FRAME,
     InMemoryStreamBridge,
     StreamBridge,
     StreamEvent,
 )
+from orchestrator.sse import SYSTEM_PROMPT_EVENT
 from tests.test_runs_api import _seed_completed_run, audit_store, runs_client  # noqa: F401
+
+
+@pytest.mark.asyncio
+async def test_live_heartbeats_when_every_frame_is_filtered_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """live 接合下,帧到得了 bridge、却出不了 wire 时,连接上仍要有心跳。
+
+    ``InMemoryStreamBridge`` 的心跳只在**它自己**连续 N 秒收不到帧时触发。这里
+    的投喂间隔远小于心跳周期,所以 bridge 一刻不闲、它那条心跳永远不会响 ——
+    唯一还能让连接不静默的,就是按「对外写出的字节」计时的那道心跳。
+
+    静默为什么危险:客户端的读超时是按文档承诺的心跳周期设的(15s 心跳 →
+    45s 读超时),静默越过那道闸就会被误判成断线;而 ``mode:"stream"`` 下
+    断开等于取消 run,重连即自杀。真栈实测过同一个 agent:legacy 最大静默
+    5.8s、items 28.6s,两边 bridge 心跳都是 0 次。
+    """
+    monkeypatch.setattr("control_plane.api._run_event_stream._LIVE_HEARTBEAT_INTERVAL_S", 0.05)
+
+    run_id = uuid4()
+    bridge = InMemoryStreamBridge()
+    stop = asyncio.Event()
+
+    async def _flood() -> None:
+        while not stop.is_set():
+            # 整帧被 hide_events 滤掉 —— 到得了 bridge,出不了 wire。
+            await bridge.publish(run_id, SYSTEM_PROMPT_EVENT, {"prompt": "secret"})
+            await asyncio.sleep(0.005)
+
+    plan = await build_event_producer(
+        run_id=run_id,
+        run_status=RunStatus.RUNNING,
+        event_store=InMemoryRunEventStore(),
+        stream_bridge=bridge,
+        since_seq=None,
+        scope=None,
+        hide_events=frozenset({SYSTEM_PROMPT_EVENT}),
+    )
+
+    flood = asyncio.create_task(_flood())
+    seen: list[bytes] = []
+    timed_out = False
+    try:
+        # 没有心跳时这个循环不会自己停(投喂不止),靠超时兜住;超时本身不是
+        # 断言,断言在下面看 seen 里有没有心跳。留下这个标志只为让失败信息
+        # 分得清「挂到超时」和「流自己结束了」两种形态。
+        async with asyncio.timeout(2.0):
+            async for chunk in plan.producer:
+                seen.append(chunk)
+                if chunk == HEARTBEAT_FRAME:
+                    break
+    except TimeoutError:
+        timed_out = True
+    finally:
+        stop.set()
+        await flood
+
+    assert HEARTBEAT_FRAME in seen, (
+        f"帧全被过滤时连接静默、无心跳;挂到超时={timed_out},收到 {len(seen)} 帧:{seen[:5]}"
+    )
+    assert b"secret" not in b"".join(seen), "被 hide_events 滤掉的内容不该出现在 wire 上"
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,8 @@ Decouples orchestrator workers (producers) from FastAPI SSE endpoints
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -64,6 +65,53 @@ def is_end(entry: StreamEvent) -> bool:
     status in ``data``.
     """
     return entry.event == END_SENTINEL.event
+
+
+#: 心跳在 wire 上的样子 —— SSE 注释行,客户端解析器一律忽略,只用来证明
+#: 连接还活着。两条 SSE 路径共用这一个字面量。
+HEARTBEAT_FRAME = b": heartbeat\n\n"
+
+
+class OutputHeartbeat:
+    """按「对外真正写出字节」计时的心跳,而不是按「bridge 收到帧」。
+
+    bridge 自己的心跳(:data:`HEARTBEAT_SENTINEL`)只在**它**连续 N 秒收不到
+    帧时触发。但帧到得了 bridge 不等于对外有字节:items 转换器会把一整帧转成
+    零条对外帧(``ItemStreamConverter.convert`` 有十个返回空列表的分支),
+    ``hide_events`` 会整帧滤掉。两者叠加 = bridge 一刻不闲、bridge 心跳永不
+    触发,而**连接上长时间一个字节都没有**。
+
+    客户端的读超时是按文档承诺的心跳周期设的(15s 心跳 → 45s 读超时),这段
+    静默会被误判成断线;而 ``mode:"stream"`` 下断开等于取消 run,重连即自杀。
+    真栈实测过同一个 agent:legacy 最大静默 5.8s、items 28.6s,两边 bridge
+    心跳都是 0 次。
+
+    用法:每次真正 yield 出字节后调 :meth:`wrote`;在「这一帧不产出字节」的
+    分支上调 :meth:`due_frame`,拿到非 ``None`` 就把它 yield 出去。
+    """
+
+    __slots__ = ("_interval", "_last", "_now")
+
+    def __init__(
+        self,
+        interval: float,
+        *,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._interval = interval
+        self._now = now
+        self._last = now()
+
+    def wrote(self) -> None:
+        """记下一次真正的对外输出 —— 心跳从这一刻重新计时。"""
+        self._last = self._now()
+
+    def due_frame(self) -> bytes | None:
+        """到点就返回一行心跳并重新计时;没到点返回 ``None``。"""
+        if self._now() - self._last < self._interval:
+            return None
+        self._last = self._now()
+        return HEARTBEAT_FRAME
 
 
 class StreamBridge(abc.ABC):
