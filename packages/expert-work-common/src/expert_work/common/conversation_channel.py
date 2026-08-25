@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +35,29 @@ CHANNEL_FINAL = "final"
 CHANNEL_COMMENTARY = "commentary"
 
 
+def message_field(msg: Any, name: str, default: Any = None) -> Any:
+    """读一条消息的某个字段,**对象形态与 dict 形态都吃**。
+
+    这是全部消息字段读取的唯一入口,别在别处写 ``getattr(msg, ...)``。
+
+    为什么必须两种都吃:三条产出路径喂进来的形态不同。会话历史读 checkpoint,
+    拿到的是 ``BaseMessage`` 对象;而实时 SSE 与单 run 回放喂的是 ``updates``
+    帧 —— ``orchestrator/sse.py`` 在 publish 之前就把 chunk 过了
+    ``_to_jsonable``,``BaseMessage`` 在那里变成 ``model_dump()`` 的 dict
+    (实时帧与落库行是同一个对象,所以两条路径都是 dict)。
+
+    只用 ``getattr`` 的话 dict 形态取不到任何字段,推导会**静默返回空列表**
+    而不是报错 —— spec §十一 点名的那种失败方式。
+    """
+    if isinstance(msg, Mapping):
+        value = msg.get(name, default)
+    else:
+        value = getattr(msg, name, default)
+    # ``model_dump()`` 会把没设的字段落成显式 ``None``(如 ``name``);调用方
+    # 要的是「缺席」语义,与对象形态对齐。
+    return default if value is None else value
+
+
 def message_text(content: Any) -> str:
     """把 LangChain 消息的 ``content``(字符串或内容块列表)拍平成文本。"""
     if isinstance(content, str):
@@ -47,7 +70,7 @@ def message_text(content: Any) -> str:
 
 
 def _kwargs(msg: Any) -> dict[str, Any]:
-    ak: dict[str, Any] = getattr(msg, "additional_kwargs", None) or {}
+    ak: dict[str, Any] = message_field(msg, "additional_kwargs") or {}
     return ak
 
 
@@ -58,7 +81,7 @@ def is_hidden(msg: Any) -> bool:
 
 def has_tool_calls(msg: Any) -> bool:
     """助手消息是否带工具调用(带 = 它还没说完,必然是 ``commentary``)。"""
-    return getattr(msg, "type", None) == "ai" and bool(getattr(msg, "tool_calls", None))
+    return message_field(msg, "type") == "ai" and bool(message_field(msg, "tool_calls"))
 
 
 def opens_segment(msg: Any) -> bool:
@@ -67,7 +90,7 @@ def opens_segment(msg: Any) -> bool:
     只看这条消息自己的类型与 kwargs,绝不看它在列表里的位置 —— 位置无关
     是段落边界能跨 ``include_hidden`` 稳定的前提。
     """
-    mtype = getattr(msg, "type", None)
+    mtype = message_field(msg, "type")
     if mtype == "human":
         # 隐藏的 human 是脚手架,不是用户开的新一段。
         return not is_hidden(msg)
@@ -105,12 +128,12 @@ def visible_turns(raw_messages: Sequence[Any], *, include_hidden: bool = True) -
     """
     collected: list[tuple[int, str, str, bool, bool]] = []
     for seq, msg in enumerate(raw_messages):
-        mtype = getattr(msg, "type", None)
+        mtype = message_field(msg, "type")
         if mtype not in ("human", "ai"):
             continue
         if not include_hidden and is_hidden(msg):
             continue
-        text = message_text(getattr(msg, "content", ""))
+        text = message_text(message_field(msg, "content", ""))
         if not text.strip():
             continue
         collected.append((seq, mtype, text, has_tool_calls(msg), opens_segment(msg)))
@@ -135,6 +158,7 @@ __all__ = [
     "VisibleTurn",
     "has_tool_calls",
     "is_hidden",
+    "message_field",
     "message_text",
     "opens_segment",
     "visible_turns",

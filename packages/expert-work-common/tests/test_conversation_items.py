@@ -18,6 +18,7 @@ from expert_work.common.conversation_items import (
     TOOL_STATUSES,
     ApprovalItem,
     AssistantMessageItem,
+    AuxFrame,
     ConversationItem,
     ErrorItem,
     PlanItem,
@@ -39,6 +40,18 @@ def test_item_classes_have_no_duplicate_type() -> None:
 def test_conversation_item_union_matches_item_classes() -> None:
     """返回类型的联合必须与 ITEM_CLASSES 同集合 —— 少一个的类端点返回不出来。"""
     assert set(get_args(ConversationItem)) == set(ITEM_CLASSES)
+
+
+def test_aux_frame_is_an_input_shape_not_an_item() -> None:
+    """AuxFrame 是推导函数的输入,不是条目 —— 别让它混进对外词表。"""
+    assert "AuxFrame" not in {cls.__name__ for cls in ITEM_CLASSES}
+    assert not hasattr(AuxFrame, "to_wire")
+    assert not hasattr(AuxFrame, "TYPE")
+
+
+def test_aux_frame_defaults_to_no_timestamp() -> None:
+    """调用方不给时刻就是没有,不是「现在」。"""
+    assert AuxFrame(data={"goal": "g"}).created_at is None
 
 
 def _one_of_each() -> list[ConversationItem]:
@@ -93,6 +106,27 @@ def test_to_wire_drops_absent_optional_fields_but_keeps_empty_collections() -> N
 
     user = UserMessageItem(id="r:1", run_id="r", created_at=None, content="hi").to_wire()
     assert user["attachments"] == []
+
+
+def test_tool_result_duration_is_absent_unless_measured() -> None:
+    common = {
+        "id": "r:0",
+        "run_id": "r",
+        "created_at": None,
+        "call_id": "c1",
+        "name": "t",
+        "status": "success",
+        "content": "结果",
+    }
+    assert "duration_ms" not in ToolResultItem(**common).to_wire()  # type: ignore[arg-type]
+    assert ToolResultItem(**common, duration_ms=842).to_wire()["duration_ms"] == 842  # type: ignore[arg-type]
+
+
+def test_error_name_is_absent_unless_known() -> None:
+    common = {"id": "r:0", "run_id": "r", "created_at": None, "message": "炸了"}
+    assert "name" not in ErrorItem(**common).to_wire()  # type: ignore[arg-type]
+    wire = ErrorItem(**common, name="MaxStepsExceededError").to_wire()  # type: ignore[arg-type]
+    assert wire["name"] == "MaxStepsExceededError"
 
 
 def test_channel_and_tool_status_vocabularies() -> None:

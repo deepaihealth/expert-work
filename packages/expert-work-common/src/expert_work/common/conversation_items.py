@@ -61,6 +61,23 @@ def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @dataclass(frozen=True, slots=True)
+class AuxFrame:
+    """一帧辅助信号 + 它的落库时刻。
+
+    ``plan`` / ``approval`` / ``error`` 三种帧的 ``data`` 里都不含时刻 ——
+    时刻只在 SSE 的 ``id:`` 前缀(``{created_at_ms}-{seq}``)上。调用方从
+    落库记录取出时刻一并传进来,否则这三种条目的 ``created_at`` 只能是
+    ``None``。
+
+    不是条目,所以不进 :data:`ITEM_TYPES` / :data:`ITEM_CLASSES` —— 它是
+    推导函数的**输入**形状。
+    """
+
+    data: Mapping[str, Any]
+    created_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _ItemBase:
     """每种条目都有的三个字段。
 
@@ -171,6 +188,10 @@ class ToolResultItem(_ItemBase):
     content: str
     #: 工具产出的结构化数据,结构随工具而定,可能缺席。
     artifact: Any = None
+    #: 这次工具调用花了多久。来自 ``ToolMessage.additional_kwargs["duration_ms"]``
+    #: (``builder._run_tools`` 在派发处量的墙钟)。缺席 = 这条结果没量到时长
+    #: (老消息、或工具走了不经计时的分支),客户端按「不显示耗时」处理。
+    duration_ms: int | None = None
 
     def _payload(self) -> dict[str, Any]:
         return {
@@ -179,6 +200,7 @@ class ToolResultItem(_ItemBase):
             "status": self.status,
             "content": self.content,
             "artifact": self.artifact,
+            "duration_ms": self.duration_ms,
         }
 
 
@@ -224,8 +246,13 @@ class ApprovalItem(_ItemBase):
     文档写明客户端原样忽略,提交决策的请求体也不收它。放进来只会让客户端以为
     自己该校验点什么 —— 而它在客户端侧根本无从校验。
 
-    ``decision`` = 这次审批最终的结果。live 发出时还没有决策,所以**缺席**;
-    历史重建时若拿得到(数据源是 PR2 的事)就填。
+    ``decision`` = 这次审批最终的结果,取值来自
+    :class:`expert_work.protocol.approval.ApprovalRecord` 的 ``status``:
+    ``approved`` / ``rejected`` / ``modified`` / ``timeout``。选终态语义而不是
+    人提交的那三个动词,是因为 ``timeout``(超时没人管、被后台按拒绝处理)在
+    历史里必须看得出来,而动词那一套表达不了。类型仍是字符串透传 —— common
+    不依赖 protocol,不在这里复制一份词表来漂移。live 发出时还没有决策,所以
+    **缺席**;历史重建时的数据源由 PR2 接。
     """
 
     TYPE: ClassVar[str] = "approval"
@@ -259,14 +286,19 @@ class ErrorItem(_ItemBase):
 
     与 ``runs[].error`` 同源。放进 items 是为了让它出现在时间线的正确位置 ——
     一轮跑了一半才失败时,错误应当排在已产出的内容之后。
+
+    ``name`` 是异常类名,与 SSE ``error`` 帧的同名字段一路同源。对外文档已经
+    就 ``MaxStepsExceededError`` 这个取值给出过语义承诺(撞了步数上限,不是
+    平台故障),只留 ``message`` 会把这份承诺丢掉。取不到时缺席。
     """
 
     TYPE: ClassVar[str] = "error"
 
     message: str
+    name: str | None = None
 
     def _payload(self) -> dict[str, Any]:
-        return {"message": self.message}
+        return {"message": self.message, "name": self.name}
 
 
 #: 全部条目类。与 :data:`ITEM_TYPES` 的一致性由契约测试钉住。
@@ -299,6 +331,7 @@ __all__ = [
     "TOOL_STATUSES",
     "ApprovalItem",
     "AssistantMessageItem",
+    "AuxFrame",
     "ConversationItem",
     "ErrorItem",
     "PlanItem",

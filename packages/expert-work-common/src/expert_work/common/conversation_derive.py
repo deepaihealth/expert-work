@@ -19,12 +19,14 @@ from typing import Any
 
 from expert_work.common.conversation_channel import (
     is_hidden,
+    message_field,
     message_text,
     visible_turns,
 )
 from expert_work.common.conversation_items import (
     ApprovalItem,
     AssistantMessageItem,
+    AuxFrame,
     ConversationItem,
     ErrorItem,
     PlanItem,
@@ -44,8 +46,18 @@ def _created_at(msg: Any) -> str | None:
     不回填、不编造:上线前写入的老消息归不到时刻,给 ``None`` 让客户端按
     「缺席」处理,比给一个假时间好。
     """
-    stamp = (getattr(msg, "additional_kwargs", None) or {}).get(STAMP_CREATED_AT)
+    stamp = (message_field(msg, "additional_kwargs") or {}).get(STAMP_CREATED_AT)
     return stamp if isinstance(stamp, str) else None
+
+
+def _duration_ms(msg: Any) -> int | None:
+    """工具派发处量到的墙钟耗时,没量到就是 ``None``。
+
+    ``bool`` 是 ``int`` 的子类,显式挡掉 —— 一个被写成 ``True`` 的脏值不该
+    渲染成「耗时 1 毫秒」。
+    """
+    value = (message_field(msg, "additional_kwargs") or {}).get("duration_ms")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _attachments(content: Any) -> list[dict[str, Any]]:
@@ -68,16 +80,12 @@ def _tool_call_fields(call: Any) -> tuple[str, str, Mapping[str, Any]]:
     """``AIMessage.tool_calls`` 的一项 → ``(call_id, name, args)``。
 
     LangChain 给的是 dict(``{"id", "name", "args", "type"}``),但回放路径喂进来
-    的可能是别的对象形态,所以两种读法都兜住。
+    的可能是别的对象形态 —— 与消息本身同款,所以走同一个访问器,不在这里另写
+    一份形态分发。
     """
-    if isinstance(call, Mapping):
-        call_id = call.get("id")
-        name = call.get("name")
-        args = call.get("args")
-    else:
-        call_id = getattr(call, "id", None)
-        name = getattr(call, "name", None)
-        args = getattr(call, "args", None)
+    call_id = message_field(call, "id")
+    name = message_field(call, "name")
+    args = message_field(call, "args")
     return (
         call_id if isinstance(call_id, str) else "",
         name if isinstance(name, str) else "",
@@ -95,10 +103,10 @@ def _message_items(run_id: str, messages: Sequence[Any]) -> list[ConversationIte
         # 编排层写进 checkpoint 的脚手架绝不出现在对外条目里。
         if is_hidden(msg):
             continue
-        mtype = getattr(msg, "type", None)
+        mtype = message_field(msg, "type")
         turn = visible.get(seq)
         if mtype == "human":
-            attachments = _attachments(getattr(msg, "content", None))
+            attachments = _attachments(message_field(msg, "content"))
             # 正文空白但带附件的消息照样是一条用户消息 —— 只发了一张图的
             # 那一轮,丢掉它等于丢掉用户说的全部内容。这是本函数与
             # ``extract_turns`` 有意的一处分歧(那边是纯文本记录,空文本
@@ -128,7 +136,7 @@ def _message_items(run_id: str, messages: Sequence[Any]) -> list[ConversationIte
             # 一条 AIMessage 可以带多个 tool_calls,每个各占一条(也各占一个
             # ``id`` 子序号)。它们排在同一条消息的正文之后 —— 模型先说话再
             # 动手。
-            for call in getattr(msg, "tool_calls", None) or []:
+            for call in message_field(msg, "tool_calls") or []:
                 call_id, name, args = _tool_call_fields(call)
                 items.append(
                     ToolCallItem(
@@ -144,62 +152,75 @@ def _message_items(run_id: str, messages: Sequence[Any]) -> list[ConversationIte
                     )
                 )
         elif mtype == "tool":
-            status = getattr(msg, "status", None)
+            status = message_field(msg, "status")
             items.append(
                 ToolResultItem(
                     id="",
                     run_id=run_id,
                     created_at=_created_at(msg),
-                    call_id=getattr(msg, "tool_call_id", "") or "",
-                    name=getattr(msg, "name", "") or "",
+                    call_id=message_field(msg, "tool_call_id", ""),
+                    name=message_field(msg, "name", ""),
                     status=status if isinstance(status, str) else "success",
                     # 还原防注入包装 —— 内部表示翻译成产品表示正是本层的价值,
                     # 不把这一步推给客户端。
-                    content=unspotlight(message_text(getattr(msg, "content", ""))),
-                    artifact=getattr(msg, "artifact", None),
+                    content=unspotlight(message_text(message_field(msg, "content", ""))),
+                    artifact=message_field(msg, "artifact"),
+                    duration_ms=_duration_ms(msg),
                 )
             )
     return items
 
 
-def _plan_item(run_id: str, plan: Mapping[str, Any]) -> PlanItem:
-    steps = plan.get("steps")
+def _text(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _optional_text(data: Mapping[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _plan_item(run_id: str, frame: AuxFrame) -> PlanItem:
+    steps = frame.data.get("steps")
     return PlanItem(
         id="",
         run_id=run_id,
-        # ``plan`` 帧的 data 里没有时刻,不编。
-        created_at=None,
-        goal=str(plan.get("goal") or ""),
+        created_at=frame.created_at,
+        goal=_text(frame.data, "goal"),
         steps=[dict(s) for s in steps if isinstance(s, Mapping)] if isinstance(steps, list) else [],
     )
 
 
-def _approval_item(run_id: str, frame: Mapping[str, Any]) -> ApprovalItem:
-    def text(key: str) -> str:
-        value = frame.get(key)
-        return value if isinstance(value, str) else ""
-
-    def optional_text(key: str) -> str | None:
-        value = frame.get(key)
-        return value if isinstance(value, str) else None
-
-    args = frame.get("proposed_args")
+def _approval_item(run_id: str, frame: AuxFrame) -> ApprovalItem:
+    args = frame.data.get("proposed_args")
     return ApprovalItem(
         id="",
         run_id=run_id,
-        # 审批的产生时刻就是 ``requested_at`` —— 公共字段与专有字段同值,
-        # 客户端按 ``created_at`` 统一排序时不必给审批开特例。
-        created_at=optional_text("requested_at"),
-        request_id=text("request_id"),
-        node=text("node"),
-        reason_kind=text("reason_kind"),
-        action_summary=text("action_summary"),
+        # 帧的落库时刻优先(三种辅助条目一个口径);拿不到就退回帧自带的
+        # ``requested_at`` —— 审批是唯一在 payload 里自带时刻的那一种,白
+        # 白丢掉它没道理。
+        created_at=frame.created_at or _optional_text(frame.data, "requested_at"),
+        request_id=_text(frame.data, "request_id"),
+        node=_text(frame.data, "node"),
+        reason_kind=_text(frame.data, "reason_kind"),
+        action_summary=_text(frame.data, "action_summary"),
         proposed_args=args if isinstance(args, Mapping) else {},
-        requested_at=optional_text("requested_at"),
-        timeout_at=optional_text("timeout_at"),
+        requested_at=_optional_text(frame.data, "requested_at"),
+        timeout_at=_optional_text(frame.data, "timeout_at"),
         # ``decision`` 不从 approval 帧来(帧是「请求」不是「结果」),由上层
         # 按 ``request_id`` 回填。
         decision=None,
+    )
+
+
+def _error_item(run_id: str, frame: AuxFrame) -> ErrorItem:
+    return ErrorItem(
+        id="",
+        run_id=run_id,
+        created_at=frame.created_at,
+        message=_text(frame.data, "message"),
+        name=_optional_text(frame.data, "name"),
     )
 
 
@@ -207,9 +228,9 @@ def derive_run_items(
     *,
     run_id: str,
     messages: Sequence[Any],
-    plan: Mapping[str, Any] | None = None,
-    approvals: Sequence[Mapping[str, Any]] = (),
-    error: str | None = None,
+    plan: AuxFrame | None = None,
+    approvals: Sequence[AuxFrame] = (),
+    error: AuxFrame | None = None,
 ) -> list[ConversationItem]:
     """把一轮的消息 + 辅助信号推导成条目列表。
 
@@ -221,12 +242,16 @@ def derive_run_items(
         这一轮产生的消息,按产生顺序。带 ``expert_work_hide_from_ui`` 的
         脚手架会被排除。
     plan
-        该轮**最后一个** ``plan`` 帧的 data(整份快照,不是增量);``None``
-        = 这一轮没有计划。
+        该轮**最后一个** ``plan`` 帧(整份快照,不是增量);``None`` = 这一轮
+        没有计划。
     approvals
-        该轮 ``approval`` 帧的 data,按发生顺序。
+        该轮的 ``approval`` 帧,按发生顺序。
     error
-        该轮 ``error`` 帧的 ``message``;``None`` = 这一轮没失败。
+        该轮的 ``error`` 帧;``None`` = 这一轮没失败。
+
+    这三个辅助信号都用 :class:`~expert_work.common.conversation_items.AuxFrame`
+    传,因为它们的时刻不在 ``data`` 里(只在 SSE 的 ``id:`` 前缀上)——
+    调用方不带时刻进来,这三种条目的 ``created_at`` 就只能是 ``None``。
 
     顺序
     ----
@@ -263,6 +288,6 @@ def derive_run_items(
     items.extend(_approval_item(run_id, frame) for frame in approvals)
 
     if error is not None:
-        items.append(ErrorItem(id="", run_id=run_id, created_at=None, message=error))
+        items.append(_error_item(run_id, error))
 
     return [replace(item, id=f"{run_id}:{n}") for n, item in enumerate(items)]
