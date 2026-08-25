@@ -1235,7 +1235,7 @@ async function runToEnd({ base, agentCode, userId, key, body }) {
 三种情况：
 
 1. **`mode: "queue"` 的 run**——`POST` 直接返回 `202`，没有流，两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)。要读取事件需要调用下面这条接口。
-2. **流式连接中途断了**——网络抖动、代理超时，或者客户端自己的读超时。**断的如果是 `POST .../runs` 且 `mode: "stream"` 返回的那条流，这一轮已经被取消了**，续传只会读到一个 `interrupted` 收尾。两种模式的差别见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)，本节下方的提示里有完整的对照表。本节讲的续传，只对 `mode: "queue"` 的 run 以及 `GET .../events` 这条连接完全成立。
+2. **流式连接中途断了**——网络抖动、代理回收空闲连接、客户端自己的读超时。断的是哪一条流都一样：run 继续执行，续传接得回来。
 3. **run 已经结束，需要把事件重新过一遍**——例如归档留存、页面刷新后恢复现场。
 
 三种情况调的是同一条接口：
@@ -1267,29 +1267,21 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/events?user_
 不要重新调 `POST /v1/agents/{agent_code}/runs`。那不是重连，那会开启新的一轮 run，调用方手上会多出一个 `run_id` 和一份互不相干的回答。
 :::
 
-::: danger 断开 stream 模式的那条连接会取消 run
+::: tip 断开连接不影响这一轮
 
-断开连接的后果取决于断的是哪一条：
+无论断的是哪一条流，run 都继续执行到底：
 
 | 断开的连接 | 对 run 的影响 |
 |---|---|
-| `POST .../runs` 且 `mode: "stream"` 返回的那条流 | run 还没走到最终状态时，**服务端会取消它** |
+| `POST .../runs` 且 `mode: "stream"` 返回的那条流 | 无影响，run 继续跑 |
 | `POST .../runs` 且 `mode: "queue"`（本来就没有流） | 无影响 |
 | `GET .../runs/{run_id}/events` | 无影响，随时可以断、随时可以带 `since_seq` 再接 |
 
-这个行为没有开关，请求参数里改不了。
+所以**发起时选 `stream` 还是 `queue`，与「断线之后能不能接回来」无关**。两种模式起的 run，续传都走同一条 `GET .../runs/{run_id}/events`；差别只在发起那一刻要不要立刻拿到流，见 [2.4 stream 还是 queue](./chat#_2-4-stream-还是-queue)。
 
-因此**页面可能中途切走、而 run 又要跑上几分钟的场景，只能用 `mode: "queue"` 加 `GET .../events`**。用 `mode: "stream"` 时用户切走页面，浏览器关掉那条连接，这一轮就被取消了——不是超时，不是网络问题，是设计如此。
+断线期间产生的内容不会丢：服务端照常落库，续传时一并补给你。唯一补不回来的是逐字预览（`token` / `item.delta`）——它不落库、也不占续传位点，所以接回来的是完整的整条内容，只是没有逐字出现的过程。
 
-**上一条讲的重连，在 `mode: "stream"` 上同样受这条约束**：读超时之后断开那条流，这一轮就已经被取消了；再用 `GET .../events` 接回去，只会读到一个 `status: "interrupted"` 的收尾，内容不会继续产生。也就是说，`mode: "stream"` 的流**断了就没有第二次机会**。
-
-要让「断线之后能接着往下跑」成立，发起时就得用 `mode: "queue"`：
-
-```json
-{ "user_id": "u-123", "input": "……", "mode": "queue", "stream_format": "items" }
-```
-
-拿到 `202` 里的 `run_id` 之后全程走 `GET .../runs/{run_id}/events`，断多少次都不影响这一轮。
+要主动停掉一轮，用 [4.1 取消 run](./run-control#_4-1-取消-run)，别靠断开连接。
 :::
 
 只需要粗粒度知道 run 是否结束、不想挂着等待时，不必调这条接口：调 `GET /v1/agents/{agent_code}/sessions?user_id={user_id}`，看每一项的 `running` 布尔字段即可。

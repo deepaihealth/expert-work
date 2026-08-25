@@ -94,8 +94,8 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | 响应 | `200`，`Content-Type: text/event-stream`，响应体是 SSE 流 | `202`，立即返回 JSON，Agent 在后台执行 |
 | 响应头 | 带 `X-Expert-Work-Session-Id` 与 `X-Expert-Work-Run-Id` | 不带这两个头；每种响应都有的 `X-Expert-Work-Trace-Id`（见 [7.4 响应头](./conventions#_7-4-响应头)）仍然存在 |
 | 会话 id 的位置 | 响应头 `X-Expert-Work-Session-Id` | 响应体的 `data.thread_id` 字段 |
-| 断开连接的后果 | run 还没结束时**会被取消**，见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传) | 无影响，本来就没有连接 |
-| 适用情形 | 需要实时展示生成过程，且展示期间连接不会断 | 执行时间长、调用方不便维持长连接，或者**界面可能中途切走** |
+| 断开连接的后果 | 无影响，run 继续跑；带 `since_seq` 重连即可接回，见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传) | 无影响，本来就没有连接 |
+| 适用情形 | 想在发起那一刻就拿到流，少一次往返 | 执行时间长、调用方不便维持长连接，或者由后台任务去读结果 |
 
 ```json [响应 202]
 {
