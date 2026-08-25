@@ -512,7 +512,7 @@ async def test_heartbeat_emitted_while_idle() -> None:
     assert any(frame == b": heartbeat\n\n" for frame in seen)
 
 
-async def _beats_while_frames_are_swallowed(**consumer_kwargs: Any) -> list[bytes]:
+async def _beats_while_frames_are_swallowed(**consumer_kwargs: Any) -> tuple[list[bytes], bool]:
     """喂一串「到得了 bridge、出不了 wire」的帧,收集 ``sse_consumer`` 的输出。
 
     投喂间隔远小于心跳间隔,所以 bridge 一刻不闲 —— 这正是本组测试要制造的
@@ -538,9 +538,11 @@ async def _beats_while_frames_are_swallowed(**consumer_kwargs: Any) -> list[byte
         return any(f == b": heartbeat\n\n" for f in seen)
 
     flood = asyncio.create_task(_flood())
+    timed_out = False
     try:
         # 没有心跳时这个循环永远不会自己停(投喂不止),靠超时兜住 —— 超时
-        # 本身不是断言,断言在调用方看 seen 里有没有心跳。
+        # 本身不是断言,断言在调用方看 seen 里有没有心跳。回传这个标志只为
+        # 让失败信息分得清「挂到超时」和「流自己结束了」两种形态。
         async with asyncio.timeout(2.0):
             async for frame in sse_consumer(
                 bridge=bridge,
@@ -552,11 +554,11 @@ async def _beats_while_frames_are_swallowed(**consumer_kwargs: Any) -> list[byte
             ):
                 seen.append(frame)
     except TimeoutError:
-        pass
+        timed_out = True
     finally:
         stop.set()
         await flood
-    return seen
+    return seen, timed_out
 
 
 @pytest.mark.asyncio
@@ -569,18 +571,19 @@ async def test_heartbeat_when_items_converter_swallows_every_frame() -> None:
     闸,客户端判断线重连 —— 而 stream 模式下断开等于取消 run。真栈实测:同一
     个 agent,legacy 最大静默 5.8s,items 28.6s,两边心跳都是 0。
     """
-    seen = await _beats_while_frames_are_swallowed(stream_format=STREAM_FORMAT_ITEMS)
+    seen, timed_out = await _beats_while_frames_are_swallowed(stream_format=STREAM_FORMAT_ITEMS)
     assert any(f == b": heartbeat\n\n" for f in seen), (
-        f"转换器吃掉全部帧时连接静默、无心跳;收到 {len(seen)} 帧:{seen[:5]}"
+        f"转换器吃掉全部帧时连接静默、无心跳;挂到超时={timed_out},收到 {len(seen)} 帧:{seen[:5]}"
     )
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_when_hide_events_swallows_every_frame() -> None:
     """``hide_events`` 滤掉全部帧时同理 —— 这条洞不是 items 模式独有的。"""
-    seen = await _beats_while_frames_are_swallowed(hide_events=frozenset({"updates"}))
+    seen, timed_out = await _beats_while_frames_are_swallowed(hide_events=frozenset({"updates"}))
     assert any(f == b": heartbeat\n\n" for f in seen), (
-        f"hide_events 滤掉全部帧时连接静默、无心跳;收到 {len(seen)} 帧:{seen[:5]}"
+        f"hide_events 滤掉全部帧时连接静默、无心跳;挂到超时={timed_out},"
+        f"收到 {len(seen)} 帧:{seen[:5]}"
     )
 
 

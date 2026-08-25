@@ -38,7 +38,6 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
-import control_plane.api._run_event_stream as event_stream_module
 import control_plane.api.runs as runs_module
 from control_plane.api._run_event_stream import build_event_producer
 from expert_work.runtime.runs import (
@@ -75,7 +74,7 @@ async def test_live_heartbeats_when_every_frame_is_filtered_out(
     断开等于取消 run,重连即自杀。真栈实测过同一个 agent:legacy 最大静默
     5.8s、items 28.6s,两边 bridge 心跳都是 0 次。
     """
-    monkeypatch.setattr(event_stream_module, "_LIVE_HEARTBEAT_INTERVAL_S", 0.05)
+    monkeypatch.setattr("control_plane.api._run_event_stream._LIVE_HEARTBEAT_INTERVAL_S", 0.05)
 
     run_id = uuid4()
     bridge = InMemoryStreamBridge()
@@ -99,21 +98,25 @@ async def test_live_heartbeats_when_every_frame_is_filtered_out(
 
     flood = asyncio.create_task(_flood())
     seen: list[bytes] = []
+    timed_out = False
     try:
         # 没有心跳时这个循环不会自己停(投喂不止),靠超时兜住;超时本身不是
-        # 断言,断言在下面看 seen 里有没有心跳。
+        # 断言,断言在下面看 seen 里有没有心跳。留下这个标志只为让失败信息
+        # 分得清「挂到超时」和「流自己结束了」两种形态。
         async with asyncio.timeout(2.0):
             async for chunk in plan.producer:
                 seen.append(chunk)
                 if chunk == HEARTBEAT_FRAME:
                     break
     except TimeoutError:
-        pass
+        timed_out = True
     finally:
         stop.set()
         await flood
 
-    assert HEARTBEAT_FRAME in seen, f"帧全被过滤时连接静默、无心跳;收到 {len(seen)} 帧:{seen[:5]}"
+    assert HEARTBEAT_FRAME in seen, (
+        f"帧全被过滤时连接静默、无心跳;挂到超时={timed_out},收到 {len(seen)} 帧:{seen[:5]}"
+    )
     assert b"secret" not in b"".join(seen), "被 hide_events 滤掉的内容不该出现在 wire 上"
 
 
