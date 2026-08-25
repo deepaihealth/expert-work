@@ -79,7 +79,9 @@ from expert_work.runtime.runs import (
     make_event_record,
 )
 from expert_work.runtime.stream_bridge import (
+    HEARTBEAT_FRAME,
     HEARTBEAT_SENTINEL,
+    OutputHeartbeat,
     StreamBridge,
     is_end,
 )
@@ -1512,6 +1514,10 @@ async def sse_consumer(
     converter = (
         ItemStreamConverter(run_id=record.run_id) if stream_format == STREAM_FORMAT_ITEMS else None
     )
+    # bridge 的心跳只在**它**收不到帧时触发,而「帧到了 bridge」不等于
+    # 「wire 上有字节」—— 下面两个 continue 分支(hide_events 滤掉、转换器
+    # 扇出为空)都是有帧无字节。这个节流器按真正写出的字节计时,补上那段静默。
+    beat = OutputHeartbeat(heartbeat_interval)
     try:
         async for entry in bridge.subscribe(
             record.run_id,
@@ -1523,7 +1529,8 @@ async def sse_consumer(
                 break
 
             if entry is HEARTBEAT_SENTINEL:
-                yield b": heartbeat\n\n"
+                beat.wrote()
+                yield HEARTBEAT_FRAME
                 continue
 
             if is_end(entry):
@@ -1541,19 +1548,27 @@ async def sse_consumer(
                 return
 
             if entry.event in hide_events:
+                if (tick := beat.due_frame()) is not None:
+                    yield tick
                 continue
 
             if converter is None:
                 yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+                beat.wrote()
                 continue
 
             frames = converter.convert(entry.event, entry.data, event_id=entry.id or None)
+            if not frames:
+                if (tick := beat.due_frame()) is not None:
+                    yield tick
+                continue
             for offset, (name, payload) in enumerate(frames):
                 yield format_sse(
                     name,
                     payload,
                     event_id=(entry.id or None) if offset == len(frames) - 1 else None,
                 )
+            beat.wrote()
     finally:
         from expert_work.runtime.runs import DisconnectMode
 

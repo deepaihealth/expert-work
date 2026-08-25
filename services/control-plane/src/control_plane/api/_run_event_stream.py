@@ -25,7 +25,9 @@ from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
+    HEARTBEAT_FRAME,
     HEARTBEAT_SENTINEL,
+    OutputHeartbeat,
     StreamBridge,
     is_end,
 )
@@ -61,6 +63,10 @@ _RUN_STATUS_END_STATUS: dict[RunStatus, str] = {
 #: live 接合跟踪「落库空洞」的容量上限。超出的部分立刻冲成 ``gap`` 帧、不再跟踪,
 #: 所以这个集合永远有界。
 _MAX_TRACKED_HOLES = 4096
+
+#: live 接合的心跳周期。文档站按这个值给客户端的读超时建议(3 个周期 = 45 秒),
+#: 改它要同步改 `apps/admin-ui/docs-site/guide/sse-events.md` 的「心跳行」一节。
+_LIVE_HEARTBEAT_INTERVAL_S = 15.0
 
 
 #: CodeQL 的 ``py/log-injection`` 会盯上本模块三条 ``logger.warning`` —— 它追踪
@@ -264,6 +270,21 @@ async def build_event_producer(
         """
         last = since_seq if since_seq is not None else -1
         holes: set[int] = set()
+        # bridge 的心跳只在**它**连续收不到帧时触发,而这个循环里有五条
+        # 「帧到了、字节没出去」的路径:``hide_events`` 滤掉整帧、items 转换器
+        # 扇出为空、``seq <= last`` 的重复帧、以及两处 ``_encode`` 结果为空。
+        # 这些路径上 bridge 一刻不闲,连接却长时间一个字节都没有 —— 客户端按
+        # 文档承诺的心跳周期设的读超时会把它误判成断线。``_emit`` 是唯一的
+        # 记账口:有字节就重置计时,没字节就按需补一行心跳。
+        beat = OutputHeartbeat(_LIVE_HEARTBEAT_INTERVAL_S)
+
+        def _emit(chunks: list[bytes]) -> list[bytes]:
+            """把「这一帧产出的字节」过一遍心跳记账后交给调用方 yield。"""
+            if chunks:
+                beat.wrote()
+                return chunks
+            tick = beat.due_frame()
+            return [tick] if tick is not None else []
 
         def _gap_frames(seqs: set[int], *, reason: str) -> list[bytes]:
             """``reason`` 只进日志,不进 wire —— 客户端不需要区分 ``gap`` 的来源
@@ -330,10 +351,10 @@ async def build_event_producer(
         while True:
             rows = await _list_page(last)
             for row in rows:
-                for chunk in _record_holes(row.seq):
+                for chunk in _emit(_record_holes(row.seq)):
                     yield chunk
-                for chunk in _encode(
-                    row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
+                for chunk in _emit(
+                    _encode(row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}")
                 ):
                     yield chunk
                 last = row.seq
@@ -341,9 +362,12 @@ async def build_event_producer(
                 break
 
         # 2. 挂实时流。
-        async for entry in stream_bridge.subscribe(run_id, heartbeat_interval=15.0):
+        async for entry in stream_bridge.subscribe(
+            run_id, heartbeat_interval=_LIVE_HEARTBEAT_INTERVAL_S
+        ):
             if entry is HEARTBEAT_SENTINEL:
-                yield b": heartbeat\n\n"
+                beat.wrote()
+                yield HEARTBEAT_FRAME
                 continue
             if is_end(entry):
                 # 还没决出结果的洞不能跟着流一起消失。
@@ -363,23 +387,26 @@ async def build_event_producer(
             if seq is None:
                 # ephemeral 帧(今天只有 token:一次性预览,重复或缺失都无害)
                 # —— 走 `_encode` 而不是裸 `format_sse`,让「过滤只发生在
-                # `_encode` 这一点」这句话对 live 接合也成立(终审 I2);
-                # `_encode` 对 `token` 恒返回一帧字节,行为零变化。
-                for chunk in _encode(entry.event, entry.data, event_id=None):
+                # `_encode` 这一点」这句话对 live 接合也成立(终审 I2)。
+                # items 模式下转换器会抑制陈旧 token,扇出可以为空。
+                for chunk in _emit(_encode(entry.event, entry.data, event_id=None)):
                     yield chunk
                 continue
 
             # 帧顺序恒等于 seq 顺序 ⇒ 看到 seq 之后,比它小的洞判死刑。
-            for chunk in _flush_holes_below(seq):
+            for chunk in _emit(_flush_holes_below(seq)):
                 yield chunk
             if seq in holes:
                 # 落库没有它,但 bridge 缓冲区里还留着 —— 补发。
                 holes.discard(seq)
-                for chunk in _encode(entry.event, entry.data, event_id=entry.id):
+                for chunk in _emit(_encode(entry.event, entry.data, event_id=entry.id)):
                     yield chunk
                 continue
             if seq <= last:
-                continue  # 补库阶段已经发过
+                # 补库阶段已经发过 —— 这一帧一个字节都不产出,只记账。
+                for chunk in _emit([]):
+                    yield chunk
+                continue
             if seq > last + 1:
                 # 3. 真缺口 —— 先尽量从库里补,**翻页**直到够到 seq 或读完。
                 reached = False
@@ -389,10 +416,12 @@ async def build_event_producer(
                         if row.seq >= seq:
                             reached = True
                             break
-                        for chunk in _record_holes(row.seq):
+                        for chunk in _emit(_record_holes(row.seq)):
                             yield chunk
-                        for chunk in _encode(
-                            row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
+                        for chunk in _emit(
+                            _encode(
+                                row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}"
+                            )
                         ):
                             yield chunk
                         last = row.seq
@@ -408,7 +437,7 @@ async def build_event_producer(
                     )
                     yield format_sse("gap", {"from": last + 1, "to": seq - 1})
 
-            for chunk in _encode(entry.event, entry.data, event_id=entry.id):
+            for chunk in _emit(_encode(entry.event, entry.data, event_id=entry.id)):
                 yield chunk
             last = seq
 

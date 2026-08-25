@@ -32,6 +32,7 @@ from orchestrator.sse import (
     run_agent,
     sse_consumer,
 )
+from orchestrator.stream_items import STREAM_FORMAT_ITEMS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -509,6 +510,78 @@ async def test_heartbeat_emitted_while_idle() -> None:
         seen.append(frame)
 
     assert any(frame == b": heartbeat\n\n" for frame in seen)
+
+
+async def _beats_while_frames_are_swallowed(**consumer_kwargs: Any) -> list[bytes]:
+    """喂一串「到得了 bridge、出不了 wire」的帧,收集 ``sse_consumer`` 的输出。
+
+    投喂间隔远小于心跳间隔,所以 bridge 一刻不闲 —— 这正是本组测试要制造的
+    条件:``InMemoryStreamBridge`` 的心跳只在**它自己**连续 N 秒收不到帧时才
+    触发,而帧到得了 bridge 不等于对外有字节。
+    """
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    await rm.set_status(record.run_id, RunStatus.RUNNING)
+
+    stop = asyncio.Event()
+    seen: list[bytes] = []
+
+    async def _flood() -> None:
+        while not stop.is_set():
+            # ``updates`` 的 data 不是 Mapping —— ItemStreamConverter._on_updates
+            # 的第一个守卫就返回 []。hide_events 变体里它照样进不了 wire。
+            await bridge.publish(record.run_id, "updates", "not-a-mapping")
+            await asyncio.sleep(0.005)
+
+    async def _disconnect_once_beaten() -> bool:
+        return any(f == b": heartbeat\n\n" for f in seen)
+
+    flood = asyncio.create_task(_flood())
+    try:
+        # 没有心跳时这个循环永远不会自己停(投喂不止),靠超时兜住 —— 超时
+        # 本身不是断言,断言在调用方看 seen 里有没有心跳。
+        async with asyncio.timeout(2.0):
+            async for frame in sse_consumer(
+                bridge=bridge,
+                record=record,
+                run_manager=rm,
+                is_disconnected=_disconnect_once_beaten,
+                heartbeat_interval=0.05,
+                **consumer_kwargs,
+            ):
+                seen.append(frame)
+    except TimeoutError:
+        pass
+    finally:
+        stop.set()
+        await flood
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_when_items_converter_swallows_every_frame() -> None:
+    """items 转换器吃掉全部帧时,连接上仍要有心跳。
+
+    ``ItemStreamConverter.convert`` 有十个返回空列表的分支。它们叠加 bridge
+    「有帧就不发心跳」的语义,会让连接**长时间一个字节都没有**,而客户端的
+    读超时按文档承诺的心跳周期设(15s 心跳 → 45s 读超时)。静默一旦越过那道
+    闸,客户端判断线重连 —— 而 stream 模式下断开等于取消 run。真栈实测:同一
+    个 agent,legacy 最大静默 5.8s,items 28.6s,两边心跳都是 0。
+    """
+    seen = await _beats_while_frames_are_swallowed(stream_format=STREAM_FORMAT_ITEMS)
+    assert any(f == b": heartbeat\n\n" for f in seen), (
+        f"转换器吃掉全部帧时连接静默、无心跳;收到 {len(seen)} 帧:{seen[:5]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_when_hide_events_swallows_every_frame() -> None:
+    """``hide_events`` 滤掉全部帧时同理 —— 这条洞不是 items 模式独有的。"""
+    seen = await _beats_while_frames_are_swallowed(hide_events=frozenset({"updates"}))
+    assert any(f == b": heartbeat\n\n" for f in seen), (
+        f"hide_events 滤掉全部帧时连接静默、无心跳;收到 {len(seen)} 帧:{seen[:5]}"
+    )
 
 
 # ---------------------------------------------------------------------------
