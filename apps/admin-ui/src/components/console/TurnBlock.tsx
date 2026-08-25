@@ -16,6 +16,7 @@
 import { useCallback, useMemo, useState, type JSX } from "react";
 
 import type { ApprovalItem } from "../../api/approvals";
+import type { ThreadPlan } from "../../api/plan";
 import type { RateCardRecord } from "../../api/rate_card";
 import type { FireNowResult } from "../../api/triggers";
 import { compactRowsOf } from "../../api/trajectory_rows";
@@ -28,6 +29,7 @@ import { AnswerBubble } from "./AnswerBubble";
 import { liveSyntheticRows, settledStepsOf } from "./live_rows";
 import { ProcessStrip } from "./ProcessStrip";
 import { TurnFooter } from "./TurnFooter";
+import { TurnPlanCard } from "./TurnPlanCard";
 import type { ConsoleTurn } from "./types";
 import { UserBubble } from "./UserBubble";
 
@@ -46,6 +48,9 @@ export interface TurnBlockProps {
   onInspectRow: (turnKey: string, rowId: string) => void;
   /** 仅当前流式 live 轮传;其它 undefined。 */
   liveByStep?: ReadonlyMap<number, LiveStep>;
+  /** BUG-13(修订)— 本轮产出的计划快照。省略 → 不渲染轮内计划卡
+   *  (`runHrefOf` 同款 opt-in:调试台不传,零变化)。 */
+  plan?: ThreadPlan | null;
   rate: RateCardRecord | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
@@ -116,6 +121,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     onInspect,
     onInspectRow,
     liveByStep,
+    plan,
     rate,
     readOnly,
     allowDecide = false,
@@ -230,6 +236,10 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         liveText={liveText}
         onDownloadArtifact={onDownloadArtifact}
       />
+
+      {/* BUG-13(修订)— 本轮产出的计划快照,长在产生它的那一轮里。
+          `plan` 省略 → 零变化(调试台不传:它有贴着输入框的会话级卡)。 */}
+      {plan !== undefined && <TurnPlanCard plan={plan} />}
 
       <TurnFooter
         turn={turn}
