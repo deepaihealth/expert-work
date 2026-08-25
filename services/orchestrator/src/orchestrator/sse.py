@@ -93,6 +93,11 @@ from orchestrator.run_retry import (
     retry_enabled,
     run_retry_total,
 )
+from orchestrator.stream_items import (
+    STREAM_FORMAT_ITEMS,
+    STREAM_FORMAT_LEGACY,
+    ItemStreamConverter,
+)
 from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
@@ -1469,6 +1474,7 @@ async def sse_consumer(
     last_event_id: str | None = None,
     heartbeat_interval: float = 15.0,
     hide_events: frozenset[str] = frozenset(),
+    stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> AsyncIterator[bytes]:
     """Yield SSE wire frames for ``record``'s run.
 
@@ -1486,10 +1492,26 @@ async def sse_consumer(
     still skipped over (the bridge already assigned it a ``seq``), so a
     client resuming from ``since_seq`` never re-sees or misparses it.
 
+    ``stream_format`` —— ``"legacy"``(默认)一字节不改地保持既有 wire;
+    ``"items"`` 让每一帧先过 :class:`~orchestrator.stream_items.ItemStreamConverter`
+    转成对话条目生命周期事件。转换器的状态是**这个 async generator 的局部
+    变量**,生命周期恰好等于一条连接 —— 事件库是所有连接共享的一份,而
+    ``stream_format`` 是每条连接的选择,所以转换只能发生在这里而不是
+    ``_publish_frame``。
+
+    一帧 legacy 可能扇出成多帧 items。帧的 SSE ``id:`` 只挂在扇出的**最后
+    一条**上:客户端在扇出中途断线时,它记住的续传位置就还停在**上一帧**,
+    重连会把这一整帧重新发一遍(条目按 id upsert,重发无害)。若把同一个
+    ``id:`` 挂在每一条上,中途断线的客户端会以为这一帧已经收完,后半截条目
+    **静默丢失**。
+
     The ``finally`` block enforces ``on_disconnect``: if the run is
     still in flight and its mode is :data:`DisconnectMode.CANCEL`, the
     run is cancelled. A run that already finished is left untouched.
     """
+    converter = (
+        ItemStreamConverter(run_id=record.run_id) if stream_format == STREAM_FORMAT_ITEMS else None
+    )
     try:
         async for entry in bridge.subscribe(
             record.run_id,
@@ -1510,13 +1532,28 @@ async def sse_consumer(
                 # stream 模式);只改 ``_run_event_stream.py`` 的话,两条流的
                 # ``end`` 帧字段集合会分叉。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
+                if converter is not None:
+                    # ``channel="final"`` 的改判必须排在 ``end`` 之前 —— 判定要
+                    # 向后看一条消息,只有到这里才知道后面没有了。
+                    for name, payload in converter.finalize():
+                        yield format_sse(name, payload)
                 yield format_sse("end", end_frame_data(run_id=record.run_id, status=status))
                 return
 
             if entry.event in hide_events:
                 continue
 
-            yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+            if converter is None:
+                yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+                continue
+
+            frames = converter.convert(entry.event, entry.data, event_id=entry.id or None)
+            for offset, (name, payload) in enumerate(frames):
+                yield format_sse(
+                    name,
+                    payload,
+                    event_id=(entry.id or None) if offset == len(frames) - 1 else None,
+                )
     finally:
         from expert_work.runtime.runs import DisconnectMode
 

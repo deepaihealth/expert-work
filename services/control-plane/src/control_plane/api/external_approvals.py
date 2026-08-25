@@ -63,6 +63,7 @@ from expert_work.protocol import ApprovalStatus, Principal
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
 from orchestrator import sse_consumer
+from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
 #: Maps a decision to the ``agent_approval`` row's terminal status — mirrors
 #: ``api/runs.py::apply_approval_decision``'s own ``_status_for``.
@@ -123,6 +124,10 @@ class ExternalDecideRequest(BaseModel):
     #: returns the continuation's run_id immediately (202); ``stream``
     #: (default) returns its SSE stream, matching the console endpoint.
     mode: Literal["stream", "queue"] = "stream"
+    #: 对话条目 program PR3 —— 续跑事件流的形态,与发起对话端点同名同义。
+    #: 审批续跑是第三方 API key 直接消费的第三条对外 SSE 流,漏掉它,第三方
+    #: 的列表里就会出现「前面是条目、审批之后退回 legacy」。
+    stream_format: Literal[STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS] = STREAM_FORMAT_LEGACY
 
     @model_validator(mode="after")
     def _check_modified_args(self) -> ExternalDecideRequest:
@@ -318,6 +323,7 @@ def build_external_approvals_router() -> APIRouter:
                 # PR-A.3 Task 8 — 对外平面零新暴露:approval 续跑的 SSE 流
                 # 同样是第三方 API key 直接消费,system_prompt 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
+                stream_format=payload.stream_format,
             ),
             media_type="text/event-stream",
             headers={

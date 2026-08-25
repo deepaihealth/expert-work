@@ -98,6 +98,7 @@ from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
+from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -916,6 +917,7 @@ async def spawn_run(
     request_digest: str | None = None,
     envelope: bool = False,
     hide_events: frozenset[str] = frozenset(),
+    stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -953,7 +955,13 @@ async def spawn_run(
     frames (e.g. ``system_prompt``, the server-synthesised system prompt
     text) off the wire. Defaults to an empty set so the console
     ``trigger_run`` caller is unaffected; only ``run_agent_for_user``
-    (``agents.py``) passes ``EXTERNAL_HIDDEN_EVENTS``."""
+    (``agents.py``) passes ``EXTERNAL_HIDDEN_EVENTS``.
+
+    ``stream_format``(对话条目 program PR3)—— 同样只转发给 ``sse_consumer``
+    的 stream 分支。默认 ``"legacy"``,所以控制台 ``trigger_run`` 这个调用点
+    的 wire 一字节不变;只有外部 ``run_agent_for_user`` 会按请求体里的
+    ``stream_format`` 传 ``"items"``。queue 模式返回 202 JSON,没有事件流可
+    转,这个参数在那一支上无意义。"""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -1105,6 +1113,7 @@ async def spawn_run(
             is_disconnected=request.is_disconnected,
             last_event_id=request.headers.get("Last-Event-ID"),
             hide_events=hide_events,
+            stream_format=stream_format,
         ),
         media_type="text/event-stream",
         headers=headers,

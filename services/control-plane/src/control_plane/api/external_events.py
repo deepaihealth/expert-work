@@ -13,7 +13,7 @@ scheduled for P3 (see docs/superpowers/specs/2026-08-11-external-api-v1-design.m
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -35,6 +35,7 @@ from expert_work.protocol import Principal
 from expert_work.runtime.runs import RunEventStore, RunInfo, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.stream_bridge import StreamBridge
+from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:
@@ -60,6 +61,7 @@ async def build_events_response(
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     since_seq: int | None = None,
+    stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> StreamingResponse:
     """Build the SSE ``StreamingResponse`` for one run — replay or live-attach.
 
@@ -98,6 +100,11 @@ async def build_events_response(
     and the plain ``GET .../runs/{run_id}/events`` reconnect endpoint below,
     so the latter gains the header too — an addition, not a behavior change,
     for a caller that was already free to ignore headers it doesn't know.
+
+    ``stream_format``(对话条目 program PR3)—— 转发给 ``build_event_producer``。
+    这个函数背着**两条**对外路径:这个模块下方的续传端点,以及 ``agents.py``
+    里 ``Idempotency-Key`` 命中时的重放。两条都要能选条目模式,否则第三方的
+    列表里会出现「前面是条目、这段退回 legacy」。
     """
     is_terminal = run.status in TERMINAL_RUN_STATUSES
     plan = await build_event_producer(
@@ -110,6 +117,7 @@ async def build_events_response(
         # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt 对第三方 API key
         # 的回放 / live 接合都不可见。
         hide_events=EXTERNAL_HIDDEN_EVENTS,
+        stream_format=stream_format,
     )
     headers = {
         "Cache-Control": "no-cache",
@@ -153,6 +161,9 @@ def build_external_events_router() -> APIRouter:
         runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         since_seq: Annotated[int | None, Query(ge=0)] = None,
+        stream_format: Annotated[
+            Literal[STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS], Query()
+        ] = STREAM_FORMAT_LEGACY,
     ) -> StreamingResponse | JSONResponse:
         """Replay (terminal run) or live-attach (active run) a run's SSE frames.
 
@@ -181,6 +192,7 @@ def build_external_events_router() -> APIRouter:
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             since_seq=since_seq,
+            stream_format=stream_format,
         )
 
     return router
