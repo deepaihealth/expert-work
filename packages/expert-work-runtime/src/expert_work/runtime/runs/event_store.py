@@ -27,7 +27,7 @@ Tenant scoping rides on the RLS policy walking ``run_event → agent_run
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -104,6 +104,7 @@ class RunEventStore(abc.ABC):
         run_id: UUID,
         since_seq: int | None = None,
         limit: int = 100,
+        event_names: Collection[str] | None = None,
     ) -> Sequence[RunEventRecord]:
         """Return frames for ``run_id``, oldest first; ``limit`` clamped
         to :data:`MAX_LIST_LIMIT`.
@@ -113,6 +114,23 @@ class RunEventStore(abc.ABC):
         * ``since_seq is None`` → from the beginning of the stream.
         * ``since_seq=N`` → events with ``seq > N`` (exclusive — the
           caller has already processed up to seq N).
+
+        ``event_names`` narrows to those ``event_name`` values:
+
+        * ``None`` (default) → every frame, i.e. replay's behaviour.
+        * a non-empty collection → only frames whose name is in it.
+        * an **empty** collection → no rows, never "all rows" — same rule
+          as ``RunStore.list_for_tenant``'s ``thread_ids``. Silently
+          dropping an empty predicate would widen a caller's query to the
+          whole stream.
+
+        The filter is applied BEFORE ``limit``, so a caller asking for a
+        few frame kinds gets that many of *those* frames, not whatever
+        survives a page of everything. The conversation-history endpoint
+        (``external_session_items.py``) needs only ``plan`` / ``approval``
+        / ``error`` per run; without this it would read a whole run's
+        stream (up to :data:`MAX_LIST_LIMIT` rows) per turn just to keep
+        a handful.
 
         Tenant scoping is enforced by RLS on the underlying table (the
         policy joins ``agent_run.tenant_id = current_setting('app.tenant_id')``),
@@ -185,13 +203,22 @@ class InMemoryRunEventStore(RunEventStore):
         run_id: UUID,
         since_seq: int | None = None,
         limit: int = 100,
+        event_names: Collection[str] | None = None,
     ) -> Sequence[RunEventRecord]:
+        # 谓词必须与 :class:`SqlRunEventStore` 逐条同义 —— 本仓库有过
+        # 「SQL 与内存 store 谓词分歧」的教训,两边的顺序也一并对齐:
+        # 空集合短路 → seq 过滤 → 名字过滤 → 按 seq 升序 → 截断。
+        if event_names is not None and not event_names:
+            return []
         clamped = _clamp_limit(limit)
         rows = self._events.get(run_id, [])
         if since_seq is None:
             filtered = list(rows)
         else:
             filtered = [r for r in rows if r.seq > since_seq]
+        if event_names is not None:
+            wanted = set(event_names)
+            filtered = [r for r in filtered if r.event_name in wanted]
         filtered.sort(key=lambda r: r.seq)
         return filtered[:clamped]
 
@@ -258,11 +285,17 @@ class SqlRunEventStore(RunEventStore):
         run_id: UUID,
         since_seq: int | None = None,
         limit: int = 100,
+        event_names: Collection[str] | None = None,
     ) -> Sequence[RunEventRecord]:
+        # 谓词与 :class:`InMemoryRunEventStore.list` 逐条同义 —— 见那边的注释。
+        if event_names is not None and not event_names:
+            return []
         clamped = _clamp_limit(limit)
         stmt = select(RunEventRow).where(RunEventRow.run_id == run_id)
         if since_seq is not None:
             stmt = stmt.where(RunEventRow.seq > since_seq)
+        if event_names is not None:
+            stmt = stmt.where(RunEventRow.event_name.in_(list(event_names)))
         stmt = stmt.order_by(RunEventRow.seq.asc()).limit(clamped)
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()

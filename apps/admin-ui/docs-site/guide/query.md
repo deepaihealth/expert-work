@@ -187,7 +187,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions?user_id=u-123&limit=
 
 读取一段会话里的**文本消息**：终端用户发出的消息，以及 Agent 回复的文本。平台内部使用的消息不包含在内。
 
-这个接口只提供文本。工具调用的过程、附件、产物都不在返回里，需要另外的接口，见 [5.8 渲染对话界面](#_5-8-渲染对话界面)。
+这个接口只提供文本，适合做纯文本记录、内容搜索与导出。工具调用的过程、附件、产物都不在返回里：要把一段会话渲染成对话界面，用 [5.8 对话条目](#_5-8-对话条目)，一次调用就能拿到全部内容。
 
 ### 请求
 
@@ -215,7 +215,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/messages
 | `content` | string | 消息正文 |
 | `channel` | string \| null | 只对 `assistant` 消息有意义。取值：`"final"`（这一轮最终展示给终端用户的回答）/ `"commentary"`（同一轮里 `final` 之前的其它文本，例如阶段性说明）；`role` 为 `"user"` 的消息恒为 `null` |
 | `created_at` | string（ISO 8601） \| null | 这条消息产生的时间。这个字段是后来增加的，更早产生的消息为 `null`，服务端不做历史补齐 |
-| `run_id` | string（UUID） \| null | 产生这条消息的 run。按这个字段分组，可以把消息归到各自的 run 上，见 [5.8](#_5-8-渲染对话界面)。同样是后来增加的字段，更早产生的消息为 `null` |
+| `run_id` | string（UUID） \| null | 产生这条消息的 run。按这个字段分组，可以把消息归到各自的 run 上；渲染对话界面不必自己分组，见 [5.8 对话条目](#_5-8-对话条目)。同样是后来增加的字段，更早产生的消息为 `null` |
 
 ### 示例
 
@@ -261,7 +261,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/message
 
 列出某个终端用户在这个 Agent 上跑过的 run。客户端不需要自己在本地维护一份 `run_id` 清单。
 
-这份清单也是渲染对话界面的骨架，组合方式见 [5.8 渲染对话界面](#_5-8-渲染对话界面)。
+渲染对话界面不需要自己按这份清单拼装内容，见 [5.8 对话条目](#_5-8-对话条目)。
 
 ### 请求
 
@@ -733,37 +733,194 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u
 
 - 产物不存在、已经删除过，或者不属于这个 `user_id` 时，都返回同一个 404 `ARTIFACT_NOT_FOUND`，不区分。
 
-## 5.8 渲染对话界面
+## 5.8 对话条目
 
-把一次完整的对话还原到调用方自己的界面上——包含工具调用的过程、附件与产物，而不只是文字记录——需要组合三个接口。本节说明它们各自提供什么，以及组合的顺序。
+一次取回一段会话的完整对话内容：终端用户发出的消息、Agent 回复的文本、工具调用与结果、计划、审批、失败原因。它们排成同一个数组，按时间从早到晚，是渲染对话界面需要的全部内容。
 
-### 三个接口的分工
+只需要「谁说了什么」的纯文本记录时，用 [5.3 历史消息](#_5-3-历史消息)。
 
-| 接口 | 提供的内容 | 详解 |
+这个接口按**轮**分页。一轮就是一次 run：终端用户说一句话，Agent 干完这一轮该干的事。默认返回最近 5 轮。
+
+### 请求
+
+``` [端点]
+GET /v1/agents/{agent_code}/sessions/{session_id}/items
+```
+
+`agent_code` 与 `session_id` 在路径里，其余参数在查询字符串里。
+
+| 参数 | 必填 | 说明 |
 |---|---|---|
-| 历史消息 | 终端用户发出的文本，以及 Agent 回复的文本 | [5.3](#_5-3-历史消息) |
-| run 列表 | 这段会话跑过哪些 run，以及每个 run 的状态与时间 | [5.4](#_5-4-run-列表) |
-| 事件接口 | 单个 run 内部发生了什么：每一步、工具调用、触及的限制、错误 | [3.6](./sse-events#_3-6-断线重连与续传) |
+| `agent_code` | 是 | 会话所属的 Agent 标识 |
+| `session_id` | 是 | 要查询的会话，UUID |
+| `user_id` | 是 | 必须是这段会话实际归属的终端用户，长度 1–255 字符 |
+| `limit` | 否 | 返回几轮。取 1–20，默认 5。范围外的值返回 422 `INVALID_REQUEST` |
+| `before` | 否 | 往更早翻页用的位置，取上一次响应里的 `first_run_id`，UUID |
 
-::: warning 事件流不包含终端用户发出的消息
-终端用户的输入不在事件流里，只能从历史消息接口取得。只订阅事件接口的客户端拿不到「终端用户说了什么」。
-:::
+### 响应
 
-### 组合的顺序
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `items` | array | 对话条目，按时间从早到晚。字段见下文 |
+| `runs` | array | 这一页每一轮的状态、耗时与失败原因，同样从早到晚。字段见下文 |
+| `has_more` | boolean | 这段会话里还有更早的轮次时为 `true` |
+| `first_run_id` | string（UUID） \| null | 这一页最早那一轮的标识，翻下一页时原样传给 `before`；这一页为空时是 `null` |
+| `active_run_id` | string（UUID） \| null | 这段会话里正在执行的那一轮；没有正在执行的轮次时是 `null` |
 
-1. 调用 run 列表并带上 `session_id`，得到这段会话的 run 清单。清单按时间从早到晚，决定界面上有几轮。
-2. 调用历史消息，按 `run_id` 把消息分到各个 run 上。`role` 为 `user` 的那条是这一轮的输入，其余是这一轮的文本回复。
-3. 对需要展开细节的 run，调用事件接口取回它的完整事件序列。run 已经结束时，这个接口一次性返回全部事件，不会挂起等待。
-4. 产物不在以上三个接口里，需要单独调用，见 [5.7 产物](#_5-7-产物)。
+正在执行的那一轮不出现在 `items` 与 `runs` 里，只出现在 `active_run_id`。它的内容要从事件流实时取，见下文的 [接上正在执行的那一轮](#接上正在执行的那一轮)。
 
-事件接口按 run 取，一次一个。会话很长时，建议只对终端用户展开的那一轮调用它。
+### 条目的公共字段
 
-### 按 run_id 分组
+每个条目都有这四个字段，`type` 决定它还带哪些字段。
 
-`run_id` 是后来增加的字段，更早产生的消息为 `null`。全部消息都带 `run_id` 时按它分组；只要出现一条 `null`，就退回按顺序配对：第 i 条 `user` 消息对应第 i 个 run。
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 条目标识。保证同一次响应里唯一、同一个查询重复调用不变；不同接口之间不保证一致，不要拿它跨接口比对 |
+| `type` | string | 条目类型，七个取值见下表 |
+| `run_id` | string（UUID） | 产生这个条目的那一轮 |
+| `created_at` | string（ISO 8601） \| null | 产生时间。取不到时是 `null`，服务端不会补一个 |
 
-一个 run 可能没有对应的 `user` 消息。审批续跑就是这种情况：一轮对话被拆成暂停与续跑两个 run，终端用户的输入属于前一个。这类 run 的输入按空处理，不是数据缺失。
+条目**专有**字段的缺席规则与公共字段不同：取不到时整个键不出现，而不是给 `null`。客户端按「键不存在」判断，不要读到 `null` 才判断。
 
-### 只需要文字记录时
+### 条目类型
 
-只展示「谁说了什么」时，历史消息一个接口就够，不需要 run 列表与事件接口。用 `channel` 决定怎么显示：`final` 是这一轮要展示给终端用户的回答，`commentary` 是同一轮里的其它文本，通常折叠或者不显示。
+| 类型 | 专有字段 | 说明 |
+|---|---|---|
+| `user_message` | `content`、`attachments` | 终端用户发出的消息。`attachments` 是随消息带上的非文本内容，没有时是空数组 |
+| `assistant_message` | `content`、`channel` | Agent 产出的一段文本。`channel` 取值：`final`（这一轮最终展示给终端用户的回答）/ `commentary`（同一轮里的其它文本，通常折叠或者不显示） |
+| `tool_call` | `call_id`、`name`、`args` | Agent 发起的一次工具调用。一条消息可能发起多次调用，每次一个条目 |
+| `tool_result` | `call_id`、`name`、`status`、`content`、`artifact`、`duration_ms` | 一次工具调用的结果，用 `call_id` 与 `tool_call` 配对。`status` 取值：`success` / `error` |
+| `plan` | `goal`、`steps` | 这一轮的计划快照。一轮里计划改过几次时只保留最后一份 |
+| `approval` | 见下文 [审批条目](#审批条目) | 这一轮等过一次人工审批 |
+| `error` | `message`、`name` | 这一轮失败的原因。`name` 是失败分类，例如 `MaxStepsExceededError`（撞了步数上限，不是平台故障） |
+
+`tool_result` 的两个可选字段：`artifact` 是工具产出的结构化数据，结构随工具而定；`duration_ms` 是这次调用耗时，服务端没有量到时不出现。
+
+用 `call_id` 而不是列表位置去配对 `tool_call` 与 `tool_result`：工具是并行执行的，两者之间可能插着别的条目。
+
+### 审批条目
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `request_id` | string | 这次审批的标识，用于在界面上区分与去重 |
+| `node` | string | 触发审批的执行步骤 |
+| `reason_kind` | string | 触发原因，取值与含义见 [4.2 审批决策](./run-control#_4-2-审批决策) |
+| `action_summary` | string | 这次审批要批准的动作，一句话描述 |
+| `proposed_args` | object | 待批准动作的参数，没有参数时是空对象 |
+| `requested_at` | string（ISO 8601） | 发起审批的时间 |
+| `timeout_at` | string（ISO 8601） | 超过这个时间没有人处理，服务端按拒绝处理 |
+| `decision` | string | 最终裁定，取值：`approved` / `rejected` / `modified` / `timeout` |
+
+`decision` 在还没有人处理时不出现。**倒计时请用 `timeout_at`，不要在客户端写死一个默认时长。**
+
+### 示例
+
+```bash [请求]
+curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?user_id=u-123&limit=5" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json [响应 200]
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7:0",
+        "type": "user_message",
+        "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "created_at": "2026-08-25T09:00:00+00:00",
+        "content": "帮我查一下天气",
+        "attachments": []
+      },
+      {
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7:1",
+        "type": "tool_call",
+        "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "created_at": "2026-08-25T09:00:01+00:00",
+        "call_id": "call-1",
+        "name": "search",
+        "args": { "q": "天气" }
+      },
+      {
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7:2",
+        "type": "tool_result",
+        "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "created_at": null,
+        "call_id": "call-1",
+        "name": "search",
+        "status": "success",
+        "content": "今天晴",
+        "duration_ms": 420
+      },
+      {
+        "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7:3",
+        "type": "assistant_message",
+        "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "created_at": "2026-08-25T09:00:03+00:00",
+        "content": "今天晴，最高 28 度。",
+        "channel": "final"
+      }
+    ],
+    "runs": [
+      {
+        "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "status": "success",
+        "created_at": "2026-08-25T09:00:00+00:00",
+        "duration_ms": 3200,
+        "error": null
+      }
+    ],
+    "has_more": true,
+    "first_run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "active_run_id": null
+  },
+  "error": null
+}
+```
+
+### 轮的信息
+
+`runs` 数组每一项对应 `items` 里带同一个 `run_id` 的那些条目。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `run_id` | string（UUID） | 这一轮的标识 |
+| `status` | string | 这一轮的状态，八个取值见 [5.4 的 status 的取值](#status-的取值) |
+| `created_at` | string（ISO 8601） \| null | 这一轮开始的时间 |
+| `duration_ms` | number \| null | 这一轮从开始到结束用了多少毫秒；还没有结束时是 `null` |
+| `error` | string \| null | 失败诊断文本，只在失败时非空，读法见 [5.4 的 error 字段的读法](#error-字段的读法) |
+
+一轮的内容可能是空的（`runs` 里有这一轮，`items` 里没有它的条目），失败在第一步之前的轮次就是这样。`runs` 仍然给出它的状态与失败原因。
+
+### 往更早翻页
+
+`items` 按时间从早到晚，所以整页内容直接插到界面已有内容的**前面**。
+
+1. 第一次调用不带 `before`，得到最近 5 轮。
+2. `has_more` 为 `true` 时，把这次响应的 `first_run_id` 作为 `before` 再调一次，得到更早的 5 轮。
+3. 重复到 `has_more` 为 `false`。
+
+```bash [请求：再往前 5 轮]
+curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?user_id=u-123&before=7c9e6679-7425-40de-944b-e07fc1f90ae7" \
+  -H "Authorization: Bearer <key>"
+```
+
+翻页期间终端用户又发起了新的一轮时，已经翻过的页不受影响：`before` 定位的是「比这一轮更早」，不是「第几条之后」，新增的轮次不会把后续页面挤得重复或者遗漏。
+
+### 接上正在执行的那一轮
+
+`active_run_id` 非空表示这段会话里有一轮正在执行。它的内容不在 `items` 里，需要接上事件流：
+
+1. 调用本接口，渲染 `items`。
+2. `active_run_id` 非空时，用它调用 [3.6 断线重连与续传](./sse-events#_3-6-断线重连与续传) 的事件接口，带 `since_seq=0`，把这一轮已经产生的内容补齐，之后持续接收。
+3. 终端用户继续说话时，用同一个 `session_id` 发起新的 run，见 [2.2 发起对话](./chat#_2-2-发起对话)。
+
+### 其它规则
+
+- `session_id` 不属于这个 `user_id` 与 `agent_code` 时返回 404 `SESSION_NOT_FOUND`，响应不透露这段会话是否存在。
+- `before` 不是这段会话里的 run 时返回 404 `RUN_NOT_FOUND`，不会退化成返回最近几轮。
+- 平台是先有会话历史、后有 `run_id` 归属记录的。更早产生的消息没有归属，**这个接口不返回它们**；那段历史仍然可以从 [5.3 历史消息](#_5-3-历史消息) 读到。
+- 一段会话很长时，服务端会丢弃中段的对话内容以便继续执行。被丢弃的那几轮在这个接口里只剩 `runs` 里的一行，没有条目。这是正常返回，不是错误。
+- `tool_result` 的 `created_at` 恒为 `null`：工具结果不带产生时间。它的 `run_id` 与发起调用的那一轮一致。
+- 服务端没有配置会话历史存储时，`items` 为空数组，`runs` 仍然正常返回。客户端无法从响应上区分这种情况；大面积出现空对话时，联系租户管理员确认。

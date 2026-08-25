@@ -17,6 +17,7 @@ from control_plane.api.external_approvals import build_external_approvals_router
 from control_plane.api.external_artifacts import build_external_artifacts_router
 from control_plane.api.external_events import build_external_events_router
 from control_plane.api.external_runs import build_external_runs_router
+from control_plane.api.external_session_items import build_external_session_items_router
 from control_plane.api.external_sessions import build_external_sessions_router
 from control_plane.api.external_uploads import build_external_uploads_router
 from control_plane.api.external_workspace import build_external_workspace_router
@@ -95,6 +96,7 @@ __all__ = [
     "build_external_artifacts_router",
     "build_external_events_router",
     "build_external_runs_router",
+    "build_external_session_items_router",
     "build_external_sessions_router",
     "build_external_uploads_router",
     "build_external_workspace_router",

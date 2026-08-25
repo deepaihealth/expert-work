@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -1059,3 +1060,16 @@ async def test_thread_ids_with_runs_only_pending() -> None:
 
     # only="pending" — runs paused at an approval gate ("needs a human").
     assert await store.thread_ids_with_runs(tenant_id=tenant, only="pending") == {waiting}
+
+
+# ---------------------------------------------------------------------------
+# 对话条目 PR2 —— list_for_tenant 的 keyset 游标
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_for_tenant_before_is_keyset_paginated(
+    keyset_before_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """断言体在 ``conftest`` 的契约里,与 SQL 版共用一份。"""
+    await keyset_before_contract(InMemoryRunStore())

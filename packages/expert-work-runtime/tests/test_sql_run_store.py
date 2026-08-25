@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -811,3 +811,32 @@ async def test_agent_name_filter_matches_the_in_memory_store(
         assert {r.run_id for r in sql_rows} == {r.run_id for r in mem_rows}, (
             f"agent_name={probe!r} 两个后端结果不一致"
         )
+
+
+# ---------------------------------------------------------------------------
+# 对话条目 PR2 —— event_names 过滤 / keyset 游标(与内存版共用契约)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_event_names_filter_sql(
+    run_store: SqlRunStore,
+    run_event_store: SqlRunEventStore,
+    event_names_filter_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """SQL 侧的 ``event_names`` 过滤必须与内存侧逐条同义 —— 断言体在
+    ``conftest`` 的契约里,两边喂的是同一份。``run_event`` 是 ``agent_run``
+    的子表,所以先建 run 行。"""
+    run_id = uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=uuid4()))
+    await event_names_filter_contract(run_event_store, run_id=run_id)
+
+
+@pytest.mark.asyncio
+async def test_list_for_tenant_before_is_keyset_paginated_sql(
+    run_store: SqlRunStore,
+    keyset_before_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """SQL 侧的 keyset 游标与内存侧同义,包括 ``created_at`` 并列时按
+    ``run_id`` 定序这一条。"""
+    await keyset_before_contract(run_store)
