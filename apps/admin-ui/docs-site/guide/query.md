@@ -788,7 +788,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 |---|---|---|
 | `user_message` | `content`、`attachments` | 终端用户发出的消息。`attachments` 是随消息带上的非文本内容，没有时是空数组 |
 | `assistant_message` | `content`、`channel` | Agent 产出的一段文本。`channel` 取值：`final`（这一轮最终展示给终端用户的回答）/ `commentary`（同一轮里的其它文本，通常折叠或者不显示） |
-| `tool_call` | `call_id`、`name`、`args` | Agent 发起的一次工具调用。一条消息可能发起多次调用，每次一个条目 |
+| `tool_call` | `call_id`、`name`、`args`、`worker` | Agent 发起的一次工具调用。一条消息可能发起多次调用，每次一个条目 |
 | `tool_result` | `call_id`、`name`、`status`、`content`、`artifact`、`duration_ms` | 一次工具调用的结果，用 `call_id` 与 `tool_call` 配对。`status` 取值：`success` / `error` |
 | `plan` | `goal`、`steps` | 这一轮的计划快照。一轮里计划改过几次时只保留最后一份 |
 | `approval` | 见下文 [审批条目](#审批条目) | 这一轮等过一次人工审批 |
@@ -797,6 +797,38 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 `tool_result` 的两个可选字段：`artifact` 是工具产出的结构化数据，结构随工具而定；`duration_ms` 是这次调用耗时，服务端没有量到时不出现。
 
 用 `call_id` 而不是列表位置去配对 `tool_call` 与 `tool_result`：工具是并行执行的，两者之间可能插着别的条目。
+
+### 子任务
+
+子任务是 Agent 把一部分工作交给另一个 Agent 去做的机制，由模型自己发起：它调用了一个会派生子任务的工具。这样产生的 `tool_call` 条目带一个 `worker` 字段，内容是这个子任务的执行经过；没有派生子任务的工具调用不带这个字段。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string | 这个子任务实例的标识 |
+| `label` | string | 可读标签 |
+| `agent_ref` | string | 这个子任务使用的是哪个 Agent |
+| `depth` | integer | 委托层级。直接由这次工具调用派生的是 `1`，平台硬上限是 `3` |
+| `status` | string | 取值：`success`（正常结束）/ `max_steps`（撞了步数上限）/ `cancelled`（被取消）/ `running`（没有结束记录，见下文） |
+| `task_excerpt` | string | 交给这个子任务的任务描述摘要，上限 500 字符 |
+| `role` | string \| null | 这个子任务的角色，开放取值；没有角色时是 `null` |
+| `max_steps` | integer \| null | 允许执行的最大步数 |
+| `steps` | array | 子任务自己走过的每一步。每项的字段见下表 |
+| `children` | array | 这个子任务再往下派生的子任务，结构与本表相同，按层级嵌套 |
+| `summary` | object \| null | 结束时的统计：`iteration_used`、`llm_call_count`、`wall_clock_ms`。没有结束记录时是 `null` |
+
+`steps` 每一项：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `wseq` | integer | 这一步在这个子任务里的序号，从 `0` 开始。它与条目和事件的 `seq` 无关 |
+| `node` | string | 这一步由谁完成，取值与 [3.4 的 `updates` 的键](./sse-events#updates) 相同 |
+| `step_count` | integer \| null | 到这一步为止的步数 |
+| `duration_ms` | integer | 这一步用了多少毫秒 |
+| `messages` | array | 这一步新产生内容的摘要，正文截到 500 字符、参数截到 200 字符。它不是完整内容，只用于展示进展 |
+
+`status` 为 `running` 表示服务端没有这个子任务的结束记录：它异常终止了，或者这一轮的记录条数超过了服务端单次读取的上限。**界面上按「结果未知」显示，不要显示成仍在执行中**——这个接口只返回已经结束的轮次。
+
+`label`、`agent_ref` 与 `role` 三者的取值随子任务的产生路径成套决定，两条路径各自的取值见 [3.4 的 `worker`](./sse-events#worker)。同一个子任务在事件流里是按发生顺序推送的一串 `worker` 事件，在这里是拼好之后的结果；两种取法的对照见 [3.7 条目模式](./sse-events#_3-7-条目模式)。
 
 ### 审批条目
 

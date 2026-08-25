@@ -188,11 +188,17 @@ ephemeral 的:不落库、不占序号。一旦让不可回放的帧占用 seq,�
 续传位点就会跑到 `since_seq` 实际能回放的范围之外,断线重连**静默漏事件**。客户端的
 续传位点只能取自带 seq 的帧。
 
-items 模式下的事件集(9 个):
+**修正 —— 事件集是 11 个,不是 9 个。** 初稿写的「9 个」既漏了 `worker`(本节下面
+自己拍板它留在 wire 上),列出的另外十个加起来也不是 9。写文档一律以
+`orchestrator.stream_items.ITEMS_WIRE_EVENTS` 这个常量为准去数,别照下面的散文抄 ——
+PR3 已经用显式字面量把 11 个钉进 `tests/test_stream_items_vocabulary.py::
+test_items_wire_vocabulary_is_closed`。
+
+items 模式下的事件集(11 个):
 
 * 内容 —— `item.added` / `item.delta` / `item.done`
 * 流控 —— `metadata` / `end` / `gap` / `truncated`
-* 过程提示(可忽略)—— `guard` / `compaction` / `retry`
+* 过程提示(可忽略)—— `guard` / `compaction` / `retry` / `worker`
 
 不再发 `token` / `updates` / `plan` / `approval` / `error`:前两个被条目生命周期取代,
 后三个变成 item。
@@ -351,7 +357,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | PR2 | 会话历史接口 + `RunEventStore.list` 加 `event_names` 过滤 + 集成测 + `query.md` | PR1 |
 | PR3 | 四处 `stream_format` + 消费端转换 + 事件名词表闸 + `sse-events.md` / `chat.md` / `run-control.md` | PR1 |
 | PR4 | 同源黄金测试 | PR2 + PR3 |
-| PR5 | 文档收敛:`quickstart.md` / `examples.md` / `best-practices.md` / 侧边栏 / 锚点扫尾 | PR2 + PR3 |
+| PR5 | 文档收敛 + `tool_call.worker` 历史回填(PR2 / PR3 之间漏做的一块) | PR2 + PR3 |
 
 波次:PR1 → (PR2 ∥ PR3) → (PR4 ∥ PR5)
 

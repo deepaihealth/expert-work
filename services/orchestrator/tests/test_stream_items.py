@@ -179,6 +179,49 @@ def test_passthrough_events_are_untouched() -> None:
         assert conv.convert(name, payload, event_id="1700000000000-1") == [(name, payload)]
 
 
+def test_tool_call_items_never_carry_a_worker_field() -> None:
+    """转换器产出的 ``tool_call`` **不带** ``worker`` —— 只有会话历史填它。
+
+    这是 spec §五 拍板的唯一不完全同构处:实时把子任务留成独立事件,因为把它
+    并进工具卡就得等子任务的 ``end`` 才能发这张卡的 ``item.done``,工具调用在
+    界面上会迟迟不出现。会话历史接口(``external_session_items.py``)反过来会
+    填,那边所有事件都已经在手上,没有这个时机约束。
+
+    实时与回放共用这一个转换器,所以这条同时钉住两条路径。**正向钉「不填」这
+    一侧是必要的**:只测历史那侧填上了,以后有人顺手在转换器里也填一份,三条
+    路径就真的分叉了,而那时没有任何测试会红。
+    """
+    conv = _conv()
+    worker_frame = {
+        "worker_id": "w-1",
+        "parent_worker_id": None,
+        "parent_tool_call_id": "c1",
+        "label": "调研员",
+        "agent_ref": "dynamic:general",
+        "depth": 1,
+        "kind": "start",
+        "wseq": 0,
+        "data": {"task_excerpt": "查排班", "role": None, "max_steps": 8},
+    }
+    # 子任务事件先到:转换器手上**确实有**这份内容,仍然不该并进工具卡。
+    assert conv.convert("worker", worker_frame, event_id="1700000000000-3") == [
+        ("worker", worker_frame)
+    ]
+
+    frames = conv.convert(
+        "updates",
+        _agent_updates(1, [_ai("", calls=[{"id": "c1", "name": "spawn_worker", "args": {}}])]),
+        event_id="1700000000000-4",
+    )
+
+    call = _of_type(frames, "tool_call")[0]
+    # 先立住条目本身产出了 —— 否则下面那条缺席断言在「一条 tool_call 都没有」
+    # 时同样成立。
+    assert call["call_id"] == "c1"
+    assert call["name"] == "spawn_worker"
+    assert "worker" not in call
+
+
 # ---------------------------------------------------------------------------
 # (a) item id 确定性派生
 # ---------------------------------------------------------------------------

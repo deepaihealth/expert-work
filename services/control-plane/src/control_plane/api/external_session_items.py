@@ -37,7 +37,12 @@ from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_messages
 from expert_work.common.conversation_channel import message_field
 from expert_work.common.conversation_derive import derive_run_items
-from expert_work.common.conversation_items import ApprovalItem, AuxFrame, ConversationItem
+from expert_work.common.conversation_items import (
+    ApprovalItem,
+    AuxFrame,
+    ConversationItem,
+    ToolCallItem,
+)
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -57,6 +62,16 @@ DEFAULT_TURNS_PER_PAGE = 5
 #: 调用点同名:``plan``(计划快照)/ ``approval``(等待审批)/ ``error``
 #: (这一轮失败了)。其余帧不参与条目推导 —— 消息本身在检查点里,不必读事件。
 AUX_EVENT_NAMES: tuple[str, ...] = ("plan", "approval", "error")
+
+#: 子任务帧名。**单列一次查询,不并进** :data:`AUX_EVENT_NAMES` —— ``list``
+#: 的 ``limit`` 在名字过滤**之后**截断,而一轮里 worker 帧可以有几百条(每个
+#: 子任务每一步一条),合并查询会把排在它们后面的 ``plan`` / ``error`` 挤出
+#: 这一页。两次查询各拿满一份预算,谁也挤不掉谁。
+WORKER_EVENT_NAMES: tuple[str, ...] = ("worker",)
+
+#: ``worker`` 帧信封的 ``kind``,以及 ``end`` 帧里非成功的两个 ``outcome``。
+_WORKER_KINDS = frozenset({"start", "update", "end"})
+_WORKER_FAILED_OUTCOMES = frozenset({"max_steps", "cancelled"})
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:
@@ -147,6 +162,152 @@ def _aux_frames(
         elif record.event_name == "error":
             error = frame
     return plan, approvals, error
+
+
+def _str_at(data: Mapping[str, Any], key: str, default: str = "") -> str:
+    value = data.get(key)
+    return value if isinstance(value, str) else default
+
+
+def _opt_str_at(data: Mapping[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _int_at(data: Mapping[str, Any], key: str) -> int | None:
+    """``bool`` 是 ``int`` 的子类,显式挡掉。"""
+    value = data.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _worker_node(frame: Mapping[str, Any], worker_id: str) -> dict[str, Any]:
+    """一个子任务的初始节点 —— 信封字段填好,其余等 start / update / end 补。
+
+    ``parent_worker_id`` / ``parent_tool_call_id`` **不进节点**:它们是拼树用
+    的指引,树拼好之后嵌套关系本身就表达了同一件事,留着只会让客户端以为自己
+    还得再拼一次。
+    """
+    return {
+        "worker_id": worker_id,
+        "label": _str_at(frame, "label"),
+        "agent_ref": _str_at(frame, "agent_ref"),
+        "depth": _int_at(frame, "depth") or 1,
+        # 收不到 ``end`` 帧的子任务停在 ``running``:它异常终止了,或者这一页
+        # 的帧被 ``MAX_LIST_LIMIT`` 截断了。两种都不该编一个结局出来。
+        "status": "running",
+        "task_excerpt": "",
+        "role": None,
+        "max_steps": None,
+        "steps": [],
+        "children": [],
+        "summary": None,
+    }
+
+
+def _worker_step(frame: Mapping[str, Any], data: Mapping[str, Any]) -> dict[str, Any]:
+    """一条 ``kind`` 为 ``update`` 的帧 → 子任务的一步。
+
+    ``messages`` 是**摘要**(正文截 500 字符、参数截 200),不是完整消息 ——
+    原样透传,不拿它推导别的条目。
+    """
+    messages = data.get("messages")
+    return {
+        "wseq": _int_at(frame, "wseq") or 0,
+        "node": _str_at(data, "node", "?"),
+        "step_count": _int_at(data, "step_count"),
+        "duration_ms": _int_at(data, "_duration_ms") or 0,
+        "messages": [dict(m) for m in messages if isinstance(m, Mapping)]
+        if isinstance(messages, list)
+        else [],
+    }
+
+
+def _worker_trees(records: Sequence[RunEventRecord]) -> dict[str, dict[str, Any]]:
+    """一轮的 ``worker`` 帧 → ``{tool_call_id: 子任务树}``。
+
+    分层规则照搬前端那份(``apps/admin-ui/src/api/worker_timeline.ts``),两条
+    不能互换:
+
+    * **深度 1 的子任务按 ``parent_tool_call_id`` 挂**到工具调用上。那个值就是
+      LangChain 的 ``tool_call_id``,与 ``AIMessage.tool_calls[].id`` 同值。
+    * **更深的按 ``parent_worker_id`` 挂树**。孙子任务的 ``parent_tool_call_id``
+      指向的是子 run **内部**的一次工具调用,那个 id 从来不出现在父 run 的消息
+      里 —— 照它挂等于整棵挂丢。
+
+    防御式:帧形状不对就跳过,父不在场的子任务丢弃,一律不抛 —— 这些是从数据
+    库读回来的 JSON,不做形状假设。
+    """
+    nodes: dict[str, dict[str, Any]] = {}
+    parent_worker: dict[str, str | None] = {}
+    parent_call: dict[str, str | None] = {}
+
+    for record in records:
+        frame = record.data
+        if not isinstance(frame, Mapping):
+            continue
+        worker_id = frame.get("worker_id")
+        kind = frame.get("kind")
+        if not isinstance(worker_id, str) or kind not in _WORKER_KINDS:
+            continue
+        node = nodes.get(worker_id)
+        if node is None:
+            node = nodes[worker_id] = _worker_node(frame, worker_id)
+            # 两个父指引只认这个子任务的**第一**帧,与建节点同一时刻定下 ——
+            # 同一个子任务的每一帧都原样携带同一份信封。
+            parent_worker[worker_id] = _opt_str_at(frame, "parent_worker_id")
+            parent_call[worker_id] = _opt_str_at(frame, "parent_tool_call_id")
+        payload = frame.get("data")
+        data: Mapping[str, Any] = payload if isinstance(payload, Mapping) else {}
+        if kind == "start":
+            node["task_excerpt"] = _str_at(data, "task_excerpt")
+            node["role"] = _opt_str_at(data, "role")
+            node["max_steps"] = _int_at(data, "max_steps")
+        elif kind == "update":
+            node["steps"].append(_worker_step(frame, data))
+        else:
+            outcome = data.get("outcome")
+            node["status"] = outcome if outcome in _WORKER_FAILED_OUTCOMES else "success"
+            node["summary"] = {
+                "iteration_used": _int_at(data, "iteration_used") or 0,
+                "llm_call_count": _int_at(data, "llm_call_count") or 0,
+                "wall_clock_ms": _int_at(data, "wall_clock_ms") or 0,
+            }
+
+    roots: dict[str, dict[str, Any]] = {}
+    for worker_id, node in nodes.items():
+        parent_id = parent_worker[worker_id]
+        if parent_id is not None:
+            parent = nodes.get(parent_id)
+            if parent is not None:
+                parent["children"].append(node)
+            # 父不在场(帧被截断 / 帧丢了)→ 丢弃整棵,不把孙子任务提成根:
+            # 提上来会挂到子 run 内部那个 tool_call 上,而那个 id 在父 run 里
+            # 根本不存在,等于挂到不知哪里去。
+            continue
+        call_id = parent_call[worker_id]
+        if call_id is not None:
+            # 一次工具调用结构上只派生一个子任务(``_child_run`` 每次调用建一
+            # 个)。瞬时重试重跑同一次调用会留下第二个,以最后那个为准 ——
+            # 先前那个已经被放弃了。
+            roots[call_id] = node
+    return roots
+
+
+def _with_workers(
+    items: Sequence[ConversationItem], trees: Mapping[str, dict[str, Any]]
+) -> list[ConversationItem]:
+    """给工具调用条目挂上它派生出的子任务树。
+
+    实时路径**不填这个字段**:那边 ``worker`` 仍是独立事件,要等子任务结束才
+    能给出工具调用条目的完成事件,时机语义不对。历史没有这个约束 —— 帧都在,
+    直接拼好给出去。这是两条路径唯一不完全同构处。
+    """
+    return [
+        replace(item, worker=trees[item.call_id])
+        if isinstance(item, ToolCallItem) and item.call_id in trees
+        else item
+        for item in items
+    ]
 
 
 def _duration_ms(run: RunInfo) -> int | None:
@@ -276,6 +437,7 @@ def build_external_session_items_router() -> APIRouter:
             plan_frame: AuxFrame | None = None
             approval_frames: list[AuxFrame] = []
             error_frame: AuxFrame | None = None
+            worker_trees: dict[str, dict[str, Any]] = {}
             if event_store is not None:
                 records = await event_store.list(
                     run_id=run.run_id,
@@ -283,6 +445,13 @@ def build_external_session_items_router() -> APIRouter:
                     event_names=AUX_EVENT_NAMES,
                 )
                 plan_frame, approval_frames, error_frame = _aux_frames(records)
+                worker_trees = _worker_trees(
+                    await event_store.list(
+                        run_id=run.run_id,
+                        limit=MAX_LIST_LIMIT,
+                        event_names=WORKER_EVENT_NAMES,
+                    )
+                )
             derived = derive_run_items(
                 run_id=key,
                 messages=by_run.get(key, []),
@@ -290,6 +459,8 @@ def build_external_session_items_router() -> APIRouter:
                 approvals=approval_frames,
                 error=error_frame,
             )
+            if worker_trees:
+                derived = _with_workers(derived, worker_trees)
             if approval_frames:
                 record = await approvals.get_by_run(run_id=run.run_id, tenant_id=tenant_id)
                 if record is not None and record.status is not ApprovalStatus.PENDING:

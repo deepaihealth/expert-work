@@ -1,6 +1,6 @@
 # 10 多语言示例
 
-本章为七个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
+本章为八个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
 
 - **key 只能从环境变量读取，示例代码中不出现明文 key。** 运行示例前，先设置这个环境变量：
 
@@ -12,10 +12,13 @@
 - **域名统一写成 `https://<your-domain>`**，使用时替换成实际对接的地址，见 [通用约定](./conventions) 的「环境地址」。
 - `{agent_code}` / `{run_id}` / `{session_id}` 这类花括号占位符，使用时替换成实际值。
 - 请求 / 响应字段含义见 [2 跟 Agent 对话](./chat)、[4 对话过程中的控制](./run-control) 与 [5 查询与管理](./query)；SSE 事件含义见 [3 读懂 SSE 流](./sse-events)。
+- 10.1 至 10.7 用的是默认的事件流形态（`stream_format` 不传）。要把历史会话与正在进行的对话渲染进同一个列表时用条目模式，接收器示例见 [10.8](#_10-8-条目模式的接收器)。
 
 ## 10.1 发起 stream 模式的 run 并解析事件流
 
 发起一次 `mode: "stream"` 的 run，响应体本身就是 SSE 流。SSE 事件的拆分是最容易出错的地方——下面示例的注释标出了必须正确处理的四个关键点。`metadata` / `updates` / `plan` / `approval` / `retry` / `error` 这几类事件，示例中直接原样打印 `data` 字段，不做进一步解析，字段含义见 [SSE 事件格式](./sse-events)。
+
+这一节用的是默认形态。条目模式下事件名与处理方式都不同，见 [10.8](#_10-8-条目模式的接收器)；本节把字节流切成事件的那段代码两种形态通用。
 
 ::: code-group
 
@@ -1946,6 +1949,8 @@ public class ContinueSession {
 
 连接中断后不要重新调用 `POST .../runs`（那样会开启一个新的 run）。应改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events`，并把已经收到的最大 `seq` 作为 `since_seq` 参数重新连接。`truncated` 事件走同一条重连路径：把它返回的 `next_seq` 直接作为下一次的 `since_seq`——响应头 `X-Expert-Work-Next-Seq` 携带同一个值，但下面示例统一从事件正文读取这个值（部分代理或网关会丢弃或改写自定义响应头，事件本身是响应体的一部分，不会被丢弃）。示例中同样原样打印未分类事件的 `data` 字段，字段含义见 [SSE 事件格式](./sse-events)。
 
+条目模式下重连要多带一个 `&stream_format=items`，并且要按 [10.8](#_10-8-条目模式的接收器) 的方式把重复到达的 `item.done` 按更新处理——续传会重新发送已经收到过的条目。
+
 ::: code-group
 
 ```bash [curl]
@@ -3035,3 +3040,585 @@ public class ApprovalDecision {
 ```
 
 :::
+
+## 10.8 条目模式的接收器
+
+请求体加一个 `"stream_format": "items"`，事件流就换成条目模式：服务端把内容整理成一条条对话条目，用 `item.added` / `item.delta` / `item.done` 三个事件推送，客户端只需要维护一个列表。字段含义与事件全集见 [3.7 条目模式](./sse-events#_3-7-条目模式)。
+
+把字节流切成事件的做法与 10.1 完全一致，下面的示例只在分发那一步不同。三个条目事件之外的事件（`metadata`、`guard`、`compaction`、`retry`、`worker`）含义不变，示例中跳过不处理。
+
+::: danger item.done 要按插入或更新处理
+不能假设每条内容都先有 `item.added`。**允许对一个从未出现过的 `id` 直接收到 `item.done`**，续传时每条内容也只会有这一个事件。
+
+按「先 `added` 再 `done`」严格配对实现的客户端，会在续传时丢掉全部内容；把重复到达的 `item.done` 当成新内容追加，界面上会出现重复的气泡。下面每份示例里的 `upsert` 就是为这一条写的。
+:::
+
+终端用户自己说的那句话不在这条流上——它是这次 run 的输入，发起时客户端手里就有。要把它一并渲染进列表，在发起请求时自己插一条。
+
+::: code-group
+
+```bash [curl]
+# 与 10.1 的区别只有请求体里多出来的 stream_format
+curl -N -X POST "https://<your-domain>/v1/agents/{agent_code}/runs" \
+  -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u-123",
+    "input": "帮我查一下天气",
+    "mode": "stream",
+    "stream_format": "items"
+  }'
+
+# 返回的事件流形如(item.delta 没有 id: 行,不参与续传位置的计算):
+#
+# event: metadata
+# id: 1755229352138-0
+# data: {"run_id":"...","thread_id":"..."}
+#
+# event: item.added
+# id: 1755229352140-1
+# data: {"id":"...:step:1","type":"assistant_message","run_id":"...","created_at":null,"content":"","channel":"commentary"}
+#
+# event: item.delta
+# data: {"id":"...:step:1","field":"content","text":"今天"}
+#
+# event: item.done
+# id: 1755229352950-2
+# data: {"id":"...:step:1","type":"assistant_message","run_id":"...","created_at":"2026-08-25T09:00:03+00:00","content":"今天晴,最高 28 度。","channel":"final"}
+#
+# event: end
+# data: {"status":"success","run_id":"..."}
+```
+
+```python [Python]
+import json
+import os
+import urllib.request
+
+API_KEY = os.environ["EXPERT_WORK_API_KEY"]
+BASE_URL = "https://<your-domain>"
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
+
+
+def iter_sse_frames(response):
+    """按行读,攒到一个空行才 yield 整条事件——与 10.1 的同名函数完全一致。"""
+    lines = []
+    while True:
+        raw_line = response.readline()
+        if not raw_line:
+            return  # 连接关闭
+        line = raw_line.decode("utf-8").rstrip("\n")
+        if line == "":
+            if lines:
+                yield "\n".join(lines)
+                lines = []
+            continue
+        lines.append(line)
+
+
+def parse_frame(raw_frame):
+    event, seq = None, None
+    data_lines = []
+    for line in raw_frame.split("\n"):
+        if line.startswith(":"):
+            continue  # 心跳注释行
+        if line.startswith("event:"):
+            event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+        elif line.startswith("id:"):
+            seq = int(line[len("id:"):].strip().rsplit("-", 1)[-1])
+    data = json.loads("\n".join(data_lines)) if data_lines else None
+    return event, data, seq
+
+
+class Conversation:
+    """一个列表 + 一张按 id 查的表。历史与实时用同一个实例。"""
+
+    def __init__(self):
+        self.order = []  # 条目 id,按首次出现的顺序
+        self.items = {}  # id -> 条目对象
+
+    def upsert(self, item):
+        """item.added 与 item.done 都走这里。
+
+        只有第一次见到某个 id 才追加进 order,所以续传重复送来的 item.done
+        只是把这条内容整个替换掉,不会在界面上多出一条。
+        """
+        item_id = item["id"]
+        if item_id not in self.items:
+            self.order.append(item_id)
+        self.items[item_id] = item
+
+    def append_delta(self, delta):
+        """逐字预览——只画在界面上,不写回条目。
+
+        item.done 会把完整正文整条送来,以它为准。field 为 "reasoning" 的片段
+        是模型的思考过程,不属于对话正文,不想展示就直接丢掉。
+        """
+        if delta["field"] == "content":
+            print(delta["text"], end="", flush=True)
+
+    def render(self):
+        return [self.items[i] for i in self.order]
+
+
+def run_items(user_id, input_text, conversation):
+    url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs"
+    body = json.dumps(
+        {
+            "user_id": user_id,
+            "input": input_text,
+            "mode": "stream",
+            # 少了这一行拿到的是默认形态,下面的分支一个都不会命中
+            "stream_format": "items",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    max_seq_seen = None  # 续传位置。item.delta 没有 id: 行,不参与计算
+
+    with urllib.request.urlopen(req) as response:
+        run_id = response.headers.get("X-Expert-Work-Run-Id")
+
+        for raw_frame in iter_sse_frames(response):
+            if not raw_frame.strip():
+                continue
+            event, data, seq = parse_frame(raw_frame)
+            if seq is not None:
+                max_seq_seen = seq if max_seq_seen is None else max(max_seq_seen, seq)
+
+            if event in ("item.added", "item.done"):
+                # 两个走同一个分支——见上面 upsert 的注释
+                conversation.upsert(data)
+            elif event == "item.delta":
+                conversation.append_delta(data)
+            elif event == "end":
+                print("\nrun 结束,status =", data["status"])
+                break
+            elif event == "truncated":
+                # 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)
+                print("这一页被截断,next_seq =", data["next_seq"])
+                continue
+            # 其余事件跳过。查不到处理分支就继续读流,不要当成异常
+
+    return run_id, max_seq_seen
+
+
+if __name__ == "__main__":
+    conversation = Conversation()
+    # 终端用户那句话不在事件流里,自己先插进列表
+    conversation.upsert(
+        {"id": "local-input", "type": "user_message", "content": "帮我查一下天气"}
+    )
+    run_items("u-123", "帮我查一下天气", conversation)
+    for item in conversation.render():
+        print(item["type"], item.get("content", ""))
+```
+
+```js [Node.js]
+const API_KEY = process.env.EXPERT_WORK_API_KEY;
+const BASE_URL = "https://<your-domain>";
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+async function* iterSseFrames(body) {
+  // 按空行("\n\n")拆分事件,不是按行也不是按 chunk——与 10.1 的同名函数完全一致
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let sepIndex;
+    while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+      yield buffer.slice(0, sepIndex);
+      buffer = buffer.slice(sepIndex + 2);
+    }
+  }
+}
+
+function parseFrame(rawFrame) {
+  let event = null;
+  let seq = null;
+  const dataLines = [];
+  for (const line of rawFrame.split("\n")) {
+    if (line.startsWith(":")) continue; // 心跳注释行
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trim());
+    } else if (line.startsWith("id:")) {
+      const idValue = line.slice("id:".length).trim();
+      seq = Number(idValue.slice(idValue.lastIndexOf("-") + 1));
+    }
+  }
+  const data = dataLines.length > 0 ? JSON.parse(dataLines.join("\n")) : null;
+  return { event, data, seq };
+}
+
+class Conversation {
+  constructor() {
+    this.order = []; // 条目 id,按首次出现的顺序
+    this.items = new Map(); // id -> 条目对象
+  }
+
+  // item.added 与 item.done 都走这里。只有第一次见到某个 id 才追加进 order,
+  // 所以续传重复送来的 item.done 只是把这条内容整个替换掉,不会多出一条。
+  upsert(item) {
+    if (!this.items.has(item.id)) {
+      this.order.push(item.id);
+    }
+    this.items.set(item.id, item);
+  }
+
+  // 逐字预览——只画在界面上,不写回条目;item.done 会把完整正文整条送来。
+  // field 为 "reasoning" 的片段是模型的思考过程,不属于对话正文。
+  appendDelta(delta) {
+    if (delta.field === "content") {
+      process.stdout.write(delta.text);
+    }
+  }
+
+  render() {
+    return this.order.map((id) => this.items.get(id));
+  }
+}
+
+async function runItems(userId, inputText, conversation) {
+  const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      user_id: userId,
+      input: inputText,
+      mode: "stream",
+      // 少了这一行拿到的是默认形态,下面的分支一个都不会命中
+      stream_format: "items",
+    }),
+  });
+
+  if (!response.ok) {
+    // 错误响应体是普通 JSON(没有 "\n\n"),不查这个会静默退出、零输出
+    throw new Error(`创建 run 失败:${response.status} ${await response.text()}`);
+  }
+
+  const runId = response.headers.get("X-Expert-Work-Run-Id");
+  let maxSeqSeen = null; // 续传位置。item.delta 没有 id: 行,不参与计算
+
+  for await (const rawFrame of iterSseFrames(response.body)) {
+    if (!rawFrame.trim()) continue;
+    const { event, data, seq } = parseFrame(rawFrame);
+    if (seq !== null) {
+      maxSeqSeen = maxSeqSeen === null ? seq : Math.max(maxSeqSeen, seq);
+    }
+
+    if (event === "item.added" || event === "item.done") {
+      conversation.upsert(data);
+    } else if (event === "item.delta") {
+      conversation.appendDelta(data);
+    } else if (event === "end") {
+      console.log("\nrun 结束,status =", data.status);
+      break;
+    } else if (event === "truncated") {
+      // 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)
+      console.log("这一页被截断,next_seq =", data.next_seq);
+    }
+    // 其余事件跳过。查不到处理分支就继续读流,不要当成异常
+  }
+
+  return { runId, maxSeqSeen };
+}
+
+const conversation = new Conversation();
+// 终端用户那句话不在事件流里,自己先插进列表
+conversation.upsert({ id: "local-input", type: "user_message", content: "帮我查一下天气" });
+runItems("u-123", "帮我查一下天气", conversation).then(() => {
+  for (const item of conversation.render()) {
+    console.log(item.type, item.content ?? "");
+  }
+});
+```
+
+```java [Java]
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.Reader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 10.8 条目模式的接收器 —— JDK 8 + HttpURLConnection,零依赖。
+ * 条目对象这里按原始 JSON 文本保存,只用极简取值读出 id / type / 正文;
+ * 生产环境建议使用 Gson / Jackson 等成熟的 JSON 库解析成对象。
+ */
+public class ItemsReceiver {
+
+    static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
+    static final String BASE_URL = "https://<your-domain>";
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+    /** 一条事件的内容:event 名 + 原始 data JSON 文本(未解析) + seq。 */
+    static class Frame {
+        String event;
+        String rawData;
+        Long seq;
+    }
+
+    static Frame parseFrame(String rawFrame) {
+        Frame frame = new Frame();
+        StringBuilder dataBuilder = new StringBuilder();
+        boolean hasData = false;
+        for (String line : rawFrame.split("\n", -1)) {
+            if (line.startsWith(":")) {
+                continue; // 心跳注释行
+            }
+            if (line.startsWith("event:")) {
+                frame.event = line.substring("event:".length()).trim();
+            } else if (line.startsWith("data:")) {
+                if (hasData) {
+                    dataBuilder.append("\n");
+                }
+                dataBuilder.append(line.substring("data:".length()).trim());
+                hasData = true;
+            } else if (line.startsWith("id:")) {
+                String idValue = line.substring("id:".length()).trim();
+                frame.seq = Long.parseLong(idValue.substring(idValue.lastIndexOf('-') + 1));
+            }
+        }
+        frame.rawData = hasData ? dataBuilder.toString() : null;
+        return frame;
+    }
+
+    // 极简 JSON 字符串取值——只读一层里的字符串字段,够拿 id / type / field / text。
+    // 对象与数组字段(args / attachments / steps)要读时请换成成熟的 JSON 库。
+    static String jsonString(String json, String key) {
+        if (json == null) {
+            return null;
+        }
+        int keyIdx = json.indexOf("\"" + key + "\"");
+        if (keyIdx < 0) {
+            return null;
+        }
+        int i = json.indexOf(':', keyIdx) + 1;
+        while (i < json.length() && Character.isWhitespace(json.charAt(i))) {
+            i++;
+        }
+        if (i >= json.length() || json.charAt(i) != '"') {
+            return null; // 值不是字符串(null / 数字 / 对象)
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int j = i + 1; j < json.length() && json.charAt(j) != '"'; j++) {
+            char c = json.charAt(j);
+            if (c != '\\') {
+                sb.append(c);
+                continue;
+            }
+            char esc = json.charAt(++j);
+            if (esc == 'n') {
+                sb.append('\n');
+            } else if (esc == 't') {
+                sb.append('\t');
+            } else if (esc == 'r') {
+                sb.append('\r');
+            } else if (esc == 'u') {
+                sb.append((char) Integer.parseInt(json.substring(j + 1, j + 5), 16));
+                j += 4;
+            } else {
+                sb.append(esc); // \" \\ \/
+            }
+        }
+        return sb.toString();
+    }
+
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 一个列表 + 一张按 id 查的表。历史与实时用同一个实例。 */
+    static class Conversation {
+        final List<String> order = new ArrayList<String>();
+        final Map<String, String> items = new HashMap<String, String>();
+
+        /**
+         * item.added 与 item.done 都走这里。只有第一次见到某个 id 才追加进
+         * order,所以续传重复送来的 item.done 只是把这条内容整个替换掉,
+         * 不会在界面上多出一条。
+         */
+        void upsert(String rawItem) {
+            String itemId = jsonString(rawItem, "id");
+            if (itemId == null) {
+                return;
+            }
+            if (!items.containsKey(itemId)) {
+                order.add(itemId);
+            }
+            items.put(itemId, rawItem);
+        }
+
+        /**
+         * 逐字预览——只打印,不写回条目;item.done 会把完整正文整条送来。
+         * field 为 "reasoning" 的片段是模型的思考过程,不属于对话正文。
+         */
+        void appendDelta(String rawDelta) {
+            if ("content".equals(jsonString(rawDelta, "field"))) {
+                System.out.print(jsonString(rawDelta, "text"));
+            }
+        }
+    }
+
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        if (err == null) {
+            return "";
+        }
+        try (Reader reader = new InputStreamReader(err, StandardCharsets.UTF_8)) {
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[512];
+            int n;
+            while ((n = reader.read(buf)) != -1) {
+                sb.append(buf, 0, n);
+            }
+            return sb.toString();
+        }
+    }
+
+    static String runItems(String userId, String inputText, Conversation conversation)
+            throws IOException {
+        URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs");
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("POST");
+        connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
+        connection.setRequestProperty("Content-Type", "application/json");
+        connection.setDoOutput(true);
+
+        // 少了 stream_format 拿到的是默认形态,下面的分支一个都不会命中
+        String body = "{"
+                + "\"user_id\":\"" + jsonEscape(userId) + "\","
+                + "\"input\":\"" + jsonEscape(inputText) + "\","
+                + "\"mode\":\"stream\","
+                + "\"stream_format\":\"items\""
+                + "}";
+        try (OutputStream out = connection.getOutputStream()) {
+            out.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+
+        try {
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException("创建 run 失败:" + status + " " + readErrorBody(connection));
+            }
+
+            String runId = connection.getHeaderField("X-Expert-Work-Run-Id");
+            Long maxSeqSeen = null; // 续传位置。item.delta 没有 id: 行,不参与计算
+
+            try (InputStream in = connection.getInputStream()) {
+                // 必须显式指定 UTF-8——JDK 8 的默认字符集跟平台走,中文环境下会乱码
+                Reader reader = new InputStreamReader(in, StandardCharsets.UTF_8);
+                char[] chunk = new char[1024];
+                StringBuilder buffer = new StringBuilder();
+                int n;
+                readLoop:
+                while ((n = reader.read(chunk)) != -1) {
+                    buffer.append(chunk, 0, n);
+                    int sep;
+                    while ((sep = buffer.indexOf("\n\n")) != -1) {
+                        String rawFrame = buffer.substring(0, sep);
+                        buffer.delete(0, sep + 2);
+                        if (rawFrame.trim().isEmpty()) {
+                            continue;
+                        }
+                        Frame frame = parseFrame(rawFrame);
+                        if (frame.seq != null) {
+                            maxSeqSeen = (maxSeqSeen == null)
+                                    ? frame.seq : Math.max(maxSeqSeen, frame.seq);
+                        }
+                        if ("item.added".equals(frame.event) || "item.done".equals(frame.event)) {
+                            conversation.upsert(frame.rawData);
+                        } else if ("item.delta".equals(frame.event)) {
+                            conversation.appendDelta(frame.rawData);
+                        } else if ("end".equals(frame.event)) {
+                            System.out.println("\nrun 结束,status = "
+                                    + jsonString(frame.rawData, "status"));
+                            break readLoop;
+                        } else if ("truncated".equals(frame.event)) {
+                            // 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)
+                            System.out.println("这一页被截断");
+                        }
+                        // 其余事件跳过。查不到处理分支就继续读流,不要当成异常
+                    }
+                }
+            }
+
+            return runId;
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Conversation conversation = new Conversation();
+        // 终端用户那句话不在事件流里,自己先插进列表
+        conversation.upsert("{\"id\":\"local-input\",\"type\":\"user_message\","
+                + "\"content\":\"帮我查一下天气\"}");
+        runItems("u-123", "帮我查一下天气", conversation);
+        for (String itemId : conversation.order) {
+            String rawItem = conversation.items.get(itemId);
+            System.out.println(jsonString(rawItem, "type") + " "
+                    + jsonString(rawItem, "content"));
+        }
+    }
+}
+```
+
+:::
+
+### 接上一段已有的会话
+
+上面的示例只处理了实时那一段。要把历史会话渲染进同一个列表，先调 [5.8 对话条目](./query#_5-8-对话条目)，把返回的 `items` 逐条喂给同一个 `Conversation`，再按 `active_run_id` 决定要不要接实时流：
+
+``` [调用顺序]
+GET  /v1/agents/{agent_code}/sessions/{session_id}/items?user_id=u-123
+        → 逐条 upsert 到列表里
+
+active_run_id 非空
+  → GET /v1/agents/{agent_code}/runs/{active_run_id}/events
+         ?user_id=u-123&since_seq=0&stream_format=items
+        → 接着 upsert,这一轮已经产生的内容补齐后转入实时
+
+用户继续说话
+  → POST /v1/agents/{agent_code}/runs
+         {"session_id": "…", "stream_format": "items", …}
+        → 新一轮的条目追加到同一个列表末尾
+```
+
+两个接口的条目字段一致，所以 `upsert` 一个函数从头用到尾。历史接口的 `id` 与事件流的 `id` 不保证一致，但同一个 run 不会同时出现在两边（历史不返回正在执行的那一轮），两套编号不会落进同一个列表。

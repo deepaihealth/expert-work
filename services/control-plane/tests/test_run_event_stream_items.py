@@ -111,6 +111,45 @@ async def test_replay_has_only_item_done() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_keeps_worker_a_separate_event_off_the_tool_call() -> None:
+    """回放的 wire 上 ``worker`` 仍是独立事件,``tool_call`` 条目不带 ``worker``。
+
+    与会话历史接口有意不同:那边把子任务拼成树填进 ``tool_call.worker``(帧都
+    在手上),这两条路径不填。这是 spec §五 拍板的唯一不完全同构处,两侧都要
+    钉 —— 只钉历史填上了,以后有人在这条路上也填一份不会有任何测试变红。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed(
+        store,
+        run_id,
+        [
+            (
+                0,
+                "updates",
+                _agent_chunk(1, [_ai("", calls=[{"id": "c1", "name": "spawn", "args": {}}])]),
+            ),
+            (
+                1,
+                "worker",
+                {"worker_id": "w-1", "parent_tool_call_id": "c1", "kind": "start", "wseq": 0},
+            ),
+        ],
+    )
+
+    frames, _next = await _collect(
+        run_id=run_id, store=store, bridge=InMemoryStreamBridge(), status=RunStatus.SUCCESS
+    )
+
+    # ``worker`` 原样出现在 wire 上,没有被吃掉。
+    assert "worker" in _names(frames), frames
+    calls = [d for _fid, name, d in frames if name == ITEM_DONE and d.get("type") == "tool_call"]
+    # 先立住工具调用条目在(否则下面的缺席断言在空列表上恒真)。
+    assert [c["call_id"] for c in calls] == ["c1"], frames
+    assert "worker" not in calls[0]
+
+
+@pytest.mark.asyncio
 async def test_truncated_page_does_not_carry_the_final_correction() -> None:
     """截断的那一页不能补发 ``final`` —— 这条流还没结束,下一页还会来。
 
