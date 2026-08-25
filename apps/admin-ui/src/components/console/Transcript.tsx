@@ -26,6 +26,7 @@ import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
 import { HistoryDivider } from "../turn/HistoryDivider";
 import { TaskResultCard } from "../turn/TaskResultCard";
 import type { Turn } from "../turn/types";
+import type { ThreadPlan } from "../../api/plan";
 import { TurnBlock } from "./TurnBlock";
 import type { ConsoleTurn } from "./types";
 
@@ -73,6 +74,9 @@ export interface TranscriptProps {
   /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
    *  ``TurnBlock``。Omitted → 零变化(链接不渲染)。 */
   runHrefOf?: (turn: ConsoleTurn) => string | null;
+  /** BUG-13(修订)— 每轮取该轮产出的计划快照,透传 ``TurnBlock.plan``。
+   *  Omitted → 零变化(轮内不渲染计划卡)。 */
+  planOf?: (turn: ConsoleTurn) => ThreadPlan | null;
 }
 
 /** How close to the bottom (px) still counts as "hasn't scrolled up" —
@@ -107,6 +111,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     onDownloadArtifact,
     onFireResult,
     runHrefOf,
+    planOf,
   } = props;
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -222,6 +227,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
           runHrefOf={runHrefOf}
+          plan={planOf ? planOf(turn) : undefined}
           rowRef={
             turn.runId !== null
               ? registerHistoryRow(turn.runId, threadId ?? "")
@@ -254,6 +260,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
           runHrefOf={runHrefOf}
+          plan={planOf ? planOf(turn) : undefined}
         />
       ))}
 

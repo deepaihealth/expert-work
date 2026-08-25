@@ -17,7 +17,6 @@ import "../../i18n";
 import { setStoredToken } from "../../api/client";
 import * as approvalsSdk from "../../api/approvals";
 import * as convoSdk from "../../api/conversations";
-import * as planSdk from "../../api/plan";
 import type { ThreadPlan } from "../../api/plan";
 import * as runsSdk from "../../api/runs";
 import * as sessionsSdk from "../../api/sessions";
@@ -566,26 +565,39 @@ describe("ConversationDetail", () => {
       expect(screen.queryByTestId("tool-fire-now")).not.toBeInTheDocument();
     });
 
-    // Fix round 1 — without a mocked plan, `usePlanCard`'s baseline GET
-    // never resolves to a real ``ThreadPlan`` and PlanCard returns null
-    // outright, so the old queryBy never reached the readOnly branch.
-    it("renders the plan card read-only — no edit button — when a plan exists", async () => {
+    // BUG-13(修订)— 计划是轮级产物:只有带 plan 帧的那一轮渲染卡片,
+    // 且卡片必须落在该轮的 ``console-turn`` 里面,而不是整页顶端。
+    it("renders each turn's own plan inside that turn, read-only", async () => {
       vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
       vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
       vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
-      vi.spyOn(planSdk, "getThreadPlan").mockResolvedValue(PLAN);
+      // 只有 RUN_2 的事件流带 plan 帧 —— RUN_1 那轮不该出现计划卡。
+      vi.spyOn(runsSdk, "streamRunEvents").mockImplementation((_thread, runId) =>
+        makeStream(
+          runId === RUN_2
+            ? // plan 帧必须插在 ``end`` 之前:回放收集循环见到 ``end`` 即 break。
+              [
+                ...replayEvents.slice(0, -1),
+                { id: "p1", event: "plan", data: PLAN, rawData: "", receivedAt: "" },
+                replayEvents[replayEvents.length - 1],
+              ]
+            : replayEvents,
+        ),
+      );
 
       renderPage();
 
-      expect(await screen.findByTestId("plan-read-view")).toBeInTheDocument();
+      const card = await screen.findByTestId("turn-plan-card");
       expect(screen.getByText("ship the refund")).toBeInTheDocument();
+      // 只读:没有编辑入口。
       expect(screen.queryByTestId("plan-edit")).not.toBeInTheDocument();
-      // BUG-13 — 计划卡置顶:必须渲染在视图切换(消息区)之前,不再吊在尾部。
-      const planCard = screen.getByTestId("plan-read-view");
-      const viewTabs = screen.getByTestId("console-view-tabs");
-      expect(
-        planCard.compareDocumentPosition(viewTabs) & Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBeTruthy();
+      // 只有一轮有计划(另一轮的事件流没有 plan 帧)。
+      expect(screen.getAllByTestId("turn-plan-card")).toHaveLength(1);
+      // 位置:在某个轮次卡片内部,不是页面顶端的独立卡。
+      const turns = screen.getAllByTestId("console-turn");
+      expect(turns.some((turn) => turn.contains(card))).toBe(true);
+      // 会话级那张卡已退役。
+      expect(screen.queryByTestId("console-plan-card")).not.toBeInTheDocument();
     });
 
     it("replays a run when its row scrolls into view and renders the tool call", async () => {

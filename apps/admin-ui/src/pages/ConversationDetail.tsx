@@ -38,18 +38,17 @@ import { downloadArtifact } from "../api/artifacts";
 import { ApiError } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { cancelRun, streamRunEvents } from "../api/runs";
+import { reducePlan } from "../api/plan_reducer";
 import { computeSessionStats } from "../api/session_stats";
 import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/sessions";
 import type { FireNowResult } from "../api/triggers";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
 import { buildConsoleTurns, runIdOf, statsInputOf } from "../components/console/console_turns";
-import { PlanCard } from "../components/console/PlanCard";
 import { StatsBar } from "../components/console/StatsBar";
 import { Transcript } from "../components/console/Transcript";
 import { TrajectoryView } from "../components/console/TrajectoryView";
 import type { ConsoleTurn, TurnTiming } from "../components/console/types";
-import { usePlanCard } from "../components/console/usePlanCard";
 import type { FocusRequest } from "../components/console/use_trajectory_state";
 import { ViewPane, type ConsoleView } from "../components/console/ViewPane";
 import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine";
@@ -293,22 +292,16 @@ export function ConversationDetail() {
     () => computeSessionStats(consoleTurns.map(statsInputOf), null),
     [consoleTurns],
   );
-  // usePlanCard's live overlay expects this-session streamed events; this
-  // page has none, so feed it the events of turns that have actually
-  // replayed (loadState "done") instead — the GET baseline already covers
-  // the persisted plan, this only catches a plan frame inside a just-loaded
-  // run's own stream.
-  const loadedEvents = useMemo(
-    () =>
-      consoleTurns
-        .filter((turn) => turn.loadState === "done")
-        .flatMap((turn) => turn.turn.events),
-    [consoleTurns],
+  // BUG-13(修订)— 计划按轮呈现,不再有会话级的单张卡。
+  // ``plan`` 是 thread 级的累积状态,一张卡只能显示最后一态:把它吊在
+  // 时间线顶端,等于把会话的终态摆在第一轮之上(读者会以为一开始就有这
+  // 份计划)。每一轮自己的事件流里带着它跑完时的完整快照(``plan`` 帧携
+  // 带整份 ThreadPlan),所以逐轮归约,计划就长在产生它的那一轮里。
+  // 未回放的轮(loadState 非 "done")没有事件可归约 → null,不渲染。
+  const planOf = useCallback(
+    (turn: ConsoleTurn) => reducePlan(turn.turn.events)?.plan ?? null,
+    [],
   );
-  const { plan, loaded: planLoaded } = usePlanCard({
-    threadId: threadId ?? null,
-    liveEvents: loadedEvents,
-  });
 
   // D-6 — operations gate: operator/admin, home tenant only (the
   // decide/cancel endpoints act on the caller's own tenant). Backend
@@ -643,11 +636,6 @@ export function ConversationDetail() {
                   <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
                 </div>
               )}
-              {/* BUG-13 — 计划卡置顶:原来吊在消息区尾部像孤儿(调试台里它
-                  贴着输入框所以在底部合理,本页没有输入框)。 */}
-              <div style={{ marginBottom: 8 }}>
-                <PlanCard plan={plan} loaded={planLoaded} running={runInFlight} readOnly />
-              </div>
               <Segmented
                 value={view}
                 onChange={(value) => setView(value as ConsoleView)}
@@ -694,6 +682,7 @@ export function ConversationDetail() {
                     exportingKey={exportingId}
                     onDownloadArtifact={handleDownloadArtifact}
                     runHrefOf={runHrefOf}
+                    planOf={planOf}
                   />
                 </ViewPane>
                 <ViewPane view="trajectory" active={view === "trajectory"}>

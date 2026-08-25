@@ -15,20 +15,15 @@
  */
 import { useCallback, useState, type ReactElement } from "react";
 import { App, Button, Card, Space, Tooltip, Typography } from "antd";
-import { Check, ChevronDown, ChevronRight, CircleDashed, LoaderCircle, Pencil, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Pencil, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api/client";
-import type { PlanStepStatus, ThreadPlan } from "../../api/plan";
+import type { ThreadPlan } from "../../api/plan";
 import { PlanEditForm, planDraftValid } from "./PlanEditForm";
+import { PlanStepList, planProgress } from "./PlanStepList";
 
 const { Text } = Typography;
-
-const STATUS_ICON: Record<PlanStepStatus, ReactElement> = {
-  pending: <CircleDashed size={14} strokeWidth={1.75} color="var(--ew-text-tertiary)" />,
-  in_progress: <LoaderCircle size={14} strokeWidth={1.75} color="var(--ew-color-brand-500)" />,
-  completed: <Check size={14} strokeWidth={1.75} color="var(--ew-color-success-500)" />,
-};
 
 const COLLAPSED_KEY = "expert_work.console.planCollapsed";
 
@@ -100,9 +95,7 @@ export function PlanCard(props: PlanCardProps): ReactElement | null {
 
   if (plan === null) return null;
 
-  const completed = plan.steps.filter((s) => s.status === "completed").length;
-  const inProgress = plan.steps.filter((s) => s.status === "in_progress").length;
-  const pending = plan.steps.length - completed - inProgress;
+  const { completed, inProgress, pending } = planProgress(plan);
 
   const editButton = (
     <Button
@@ -183,32 +176,7 @@ export function PlanCard(props: PlanCardProps): ReactElement | null {
             <PlanEditForm draft={draft} onChange={setDraft} />
           ) : (
             <div data-testid="plan-read-view">
-              <p style={{ margin: "0 0 10px", color: "var(--ew-text-secondary)" }}>{plan.goal}</p>
-              <ol style={{ margin: 0, paddingLeft: 0, listStyle: "none" }}>
-                {plan.steps.map((step) => (
-                  <li
-                    key={step.id}
-                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}
-                  >
-                    {STATUS_ICON[step.status]}
-                    <span
-                      style={{
-                        color:
-                          step.status === "completed"
-                            ? "var(--ew-text-tertiary)"
-                            : "var(--ew-text-primary)",
-                        textDecoration: step.status === "completed" ? "line-through" : "none",
-                        fontSize: 13,
-                      }}
-                    >
-                      {step.description}
-                    </span>
-                    <Text type="secondary" style={{ fontSize: 11 }}>
-                      {t(`plan_panel.status_${step.status}`)}
-                    </Text>
-                  </li>
-                ))}
-              </ol>
+              <PlanStepList plan={plan} />
             </div>
           )}
         </div>
