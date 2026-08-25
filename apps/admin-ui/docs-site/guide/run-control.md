@@ -82,6 +82,8 @@ key 失效相关的 401 见 [8 错误码总表](./errors)。
 
 Agent 执行到需要人工确认的一步时会暂停，这次 run 停在 `paused` 状态，并在事件流里发出一个 `approval` 事件（见 [3 读懂 SSE 流](./sse-events)）。这个端点用来下达决策：同意、拒绝，或者改掉参数之后继续。
 
+条目模式（`stream_format=items`）下没有 `approval` 事件，同样的内容以 `type` 为 `approval` 的条目送出，字段一一对应，见 [3.7 条目模式](./sse-events#_3-7-条目模式)。本节凡是提到 `approval` 事件某个字段的地方，条目模式下都读同名字段。
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -126,8 +128,11 @@ Content-Type: application/json
 | `reason` | 否 | 拒绝理由，最长 2048 字符。只在 `decision` 为 `reject` 时生效，见下文 |
 | `idempotency_key` | 否 | 这次决策的幂等键，最长 255 字符。它与发起对话用的 `Idempotency-Key` 请求头是两套独立的幂等，按这次决策计算，不按 run 的创建计算 |
 | `mode` | 否 | 取值：`stream`（默认，响应正文直接是续跑的事件流）/ `queue`（响应正文是 202 JSON，不建立事件流连接），两者的差异见下文「响应」 |
+| `stream_format` | 否 | 取值：`legacy`（默认）/ `items`。续跑事件流的形态，与发起对话端点同名参数同义，见 [3.7 条目模式](./sse-events#_3-7-条目模式)。`mode` 为 `queue` 时不产生事件流，这个字段不起作用 |
 
-事件流里 `approval` 事件携带的 `request_id`，只是那次审批请求自身的标识，这个端点不接受它：请求体里带上 `request_id` 同样返回 422 `INVALID_REQUEST`。
+审批之前与审批之后是两条独立的事件流。要让终端用户看到的是一个连续的列表，这两条流以及后续的续传请求都要传同一个 `stream_format`。
+
+事件流里 `approval` 事件携带的 `request_id`，只是那次审批请求自身的标识，这个端点不接受它：请求体里带上 `request_id` 同样返回 422 `INVALID_REQUEST`。条目模式下这个字段在 `approval` 条目上，结论相同。
 
 #### decision 的取值
 
@@ -137,12 +142,12 @@ Content-Type: application/json
 | `modify` | 同意执行，但要先改掉这次调用的参数，例如去掉一个危险选项或纠正一个路径 | 用 `modified_args` 整体替换这次调用的参数后执行，然后继续往下跑 |
 | `reject` | 不同意这次工具调用 | 不执行这次调用；整个 run 是否终止，取决于这次审批的类型 |
 
-`reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源，客户端在下达决策之前就能据此区分两条路径（五个取值见 [3.4 的 `approval`](./sse-events#approval)）：
+`reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源，客户端在下达决策之前就能据此区分两条路径（五个取值见 [3.4 的 `approval`](./sse-events#approval)；条目模式下这个字段在 `approval` 条目上，取值相同）：
 
 - `reason_kind` 为 `policy_gate`：这是 Agent 配置里声明的强制审批点，常见于高风险工具，拒绝会终止整个 run。
 - `reason_kind` 为其余四个取值：这是 Agent 在执行过程中自己发起的确认请求，拒绝只是把一条「审批被拒绝」的结果交回给 Agent，run 会继续往下跑，Agent 可能换一种方式重试或者调整计划。
 
-强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态。**要确认这次工具调用是否被拒绝，看事件流里这次调用对应的结果消息。**
+强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态。**要确认这次工具调用是否被拒绝，看事件流里这次调用对应的结果消息。** 条目模式下看的是同一次调用的 `tool_result` 条目，靠 `call_id` 找到它。
 
 #### modified_args 的形状
 
@@ -165,7 +170,7 @@ Content-Type: application/json
 `reason` 只在 `decision` 为 `reject` 时生效：它的文本会被放进交回给 Agent 的那条工具结果消息里（形如 `[approval rejected] {reason}`），Agent 能看到这句话并据此调整。`decision` 为 `approve` 或 `modify` 时传 `reason` 不会报错，但也不会被使用。省略 `reason` 时，平台使用的默认文案是 `approval rejected by reviewer`。
 
 ::: danger reason 会被终端用户看到
-`reject` 的 `reason` 会出现在续跑事件流的 `updates` 事件里：它是交回给 Agent 的那条工具结果的一部分，而 [3.4 的 `updates`](./sse-events#updates) 正是客户端用来渲染工具结果的事件。这段文字会一路流到界面上；断线重连之后服务端会把客户端未收到的事件重新发送，它还会再出现一次。
+`reject` 的 `reason` 会出现在续跑事件流的 `updates` 事件里：它是交回给 Agent 的那条工具结果的一部分，而 [3.4 的 `updates`](./sse-events#updates) 正是客户端用来渲染工具结果的事件。条目模式下它在同一次调用的 `tool_result` 条目的 `content` 里，同样是要渲染的内容。这段文字会一路流到界面上；断线重连之后服务端会把客户端未收到的事件重新发送，它还会再出现一次。
 
 不要在 `reason` 里写不希望终端用户看到的内容，例如内部工单号或者风控判据。
 :::
@@ -182,9 +187,9 @@ Content-Type: application/json
 | `mode` 为 `queue` | 202 | JSON，形状见下面的示例 |
 | `mode` 为 `stream`，命中幂等重放 | 200 | 与 `queue` 相同的 JSON，此时没有正在执行的续跑可以接流 |
 
-三种情况的响应头都带 `X-Expert-Work-Run-Id`，**它是续跑的新 `run_id`，不是路径里的那个**。拿到之后用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}` 接上它的事件流，其中 `{user_id}` 与发起这次 run 时相同。
+三种情况的响应头都带 `X-Expert-Work-Run-Id`，**它是续跑的新 `run_id`，不是路径里的那个**。拿到之后用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id={user_id}` 接上它的事件流，其中 `{user_id}` 与发起这次 run 时相同。用条目模式时这个请求要一并带上 `&stream_format=items`，否则接回来的是默认形态。
 
-使用 [3.5 的接收器骨架](./sse-events#_3-5-建议的接收器骨架) 时，从它循环里 `consume(await fetch(url))` 那一步进入即可：换成新的 `run_id`，续传位置从头开始计算（`maxSeq` 需要清零）。
+使用 [3.5 的接收器骨架](./sse-events#_3-5-建议的接收器骨架) 时，从它循环里 `consume(await fetch(url))` 那一步进入即可：换成新的 `run_id`，续传位置从头开始计算（`maxSeq` 需要清零）。条目模式下**列表不清零**：新 run 的条目追加到同一个列表里，这正是这种形态存在的意义。
 
 `stream` 模式的幂等重放，与发起对话端点的幂等重放不是一回事：这里重放的是这次决策，不是这次 run。
 

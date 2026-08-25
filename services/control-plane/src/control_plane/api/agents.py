@@ -106,6 +106,7 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunEventStore, RunIdempotencyConflict, RunInfo, RunStore
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError
+from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
 logger = logging.getLogger("expert_work.control_plane.agents")
 
@@ -261,6 +262,7 @@ async def _idempotent_run_response(
     mode: Literal["stream", "queue"],
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
+    stream_format: str,
 ) -> StreamingResponse | JSONResponse:
     """Render an idempotency-hit ``run`` back in the shape its ``mode`` expects.
 
@@ -277,10 +279,17 @@ async def _idempotent_run_response(
     ``envelope=True`` (this helper has no console caller — both call sites
     below sit inside the external ``run_agent_for_user`` endpoint — so unlike
     ``spawn_run`` there is no flat-body branch to preserve).
+
+    ``stream_format`` 无默认值 —— 幂等重放必须与首次响应给出同一种流形态,
+    默认值会让调用方在这里悄悄漏传而拿回 legacy。指纹是整个请求体的哈希,
+    所以能走到这里就说明重放请求的 ``stream_format`` 与首次完全一致。
     """
     if mode == "stream":
         return await build_events_response(
-            run=run, event_store=event_store, stream_bridge=stream_bridge
+            run=run,
+            event_store=event_store,
+            stream_bridge=stream_bridge,
+            stream_format=stream_format,
         )
     return JSONResponse(
         status_code=202,
@@ -580,6 +589,15 @@ class ExternalRunRequest(BaseModel):
     session_id: UUID | None = None
     input: str | None = Field(default=None, max_length=MAX_RUN_INPUT_CHARS)
     mode: Literal["stream", "queue"] = "stream"
+    #: 对话条目 program PR3 —— SSE 流的形态。``legacy``(默认)是既有的 13 个
+    #: 事件;``items`` 把内容类事件换成条目生命周期事件。**必须声明成字段**:
+    #: 本模型是 ``extra="forbid"``,不加这个字段第三方传 ``stream_format`` 会
+    #: 直接 422。
+    #:
+    #: 与 ``Idempotency-Key`` 的相互作用:幂等指纹是整个请求体的哈希,所以同
+    #: 一个 key 只改 ``stream_format`` 会拿到 ``IDEMPOTENCY_KEY_REUSED`` 422。
+    #: 这正是想要的 —— 同一个 key 必须对应同一个请求。
+    stream_format: Literal[STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS] = STREAM_FORMAT_LEGACY
     #: 单块长度上限(``MAX_UNTRUSTED_CONTENT_BLOCK_CHARS``,与内部
     #: ``RunRequest._bound_untrusted_blocks`` 同值)未在这个字段声明里体现
     #: ——同 ``inputs`` 一样,必须在 ``run_agent_for_user`` 里手工预检(P2-a
@@ -1206,6 +1224,7 @@ def build_agents_router() -> APIRouter:
                     mode=payload.mode,
                     event_store=event_store,
                     stream_bridge=runtime.stream_bridge,
+                    stream_format=payload.stream_format,
                 )
 
         try:
@@ -1385,6 +1404,7 @@ def build_agents_router() -> APIRouter:
                 # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt(服务端合成的
                 # 系统提示词全文)是控制台调试专用帧,第三方 API key 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
+                stream_format=payload.stream_format,
             )
         except RunIdempotencyConflict:
             # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single
@@ -1433,6 +1453,7 @@ def build_agents_router() -> APIRouter:
                 mode=payload.mode,
                 event_store=event_store,
                 stream_bridge=runtime.stream_bridge,
+                stream_format=payload.stream_format,
             )
 
     @router.get("", dependencies=_CONSOLE_ONLY)

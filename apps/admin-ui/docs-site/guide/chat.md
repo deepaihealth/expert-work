@@ -64,6 +64,7 @@ curl -N -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | `session_id` | 否 | UUID。续接一段已有会话；省略时新建一段。这段会话不属于该 `user_id` 与 `agent_code` 时返回 404（`SESSION_NOT_FOUND`） |
 | `input` | 否 | string，不超过 65536 字符。这一轮终端用户说的话或任务描述 |
 | `mode` | 否 | string。执行模式，取值：`stream`（默认，同步返回 SSE 流）/ `queue`（后台异步执行）。见 [2.4](#_2-4-stream-还是-queue) |
+| `stream_format` | 否 | string。事件流的形态，取值：`legacy`（默认，按执行步骤推送）/ `items`（按对话条目推送，客户端只需要一个列表）。见 [3.7 条目模式](./sse-events#_3-7-条目模式)。`mode` 为 `queue` 时不产生事件流，这个字段随后由续传接口的同名参数决定 |
 | `untrusted_content` | 否 | string 数组，最多 16 项。来自外部、不可信任的文本内容。见 [2.7](#_2-7-外部内容与模板变量) |
 | `inputs` | 否 | object。提示词模板变量。见 [2.7](#_2-7-外部内容与模板变量) |
 | `files` | 否 | 数组，最多 64 项，每项形如 `{ "upload_id": "…" }`。附件列表。见 [2.6](#_2-6-带图片和文档) |
@@ -491,6 +492,8 @@ Idempotency-Key: order-8899
 | key 本身不合法（去掉首尾空白后为空，或超过 255 字符） | 422，`INVALID_IDEMPOTENCY_KEY` |
 
 **Idempotency-Key 需要按 agent 维度保证唯一**，只在租户维度唯一不够。
+
+`stream_format` 也是请求体的一部分。同一个 key 只改这一个字段、其余都不变，落进上表第二行，返回 422。要换事件流的形态就换一个新的 key。
 
 ```json [响应 422]
 { "success": false, "data": null, "error": { "code": "IDEMPOTENCY_KEY_REUSED", "message": "this Idempotency-Key was already used with a different request" } }

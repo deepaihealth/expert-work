@@ -344,3 +344,96 @@ async def test_events_requires_user_id(ctx: _Ctx) -> None:
     run_id = started.json()["data"]["run_id"]
     resp = await ctx.client.get(f"/v1/agents/support-bot/runs/{run_id}/events", headers=ctx.headers)
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# 对话条目 program PR3 —— stream_format
+# ---------------------------------------------------------------------------
+
+
+async def _terminal_run_with(ctx: _Ctx, rows: list[tuple[int, str, Any]]) -> str:
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = started.json()["data"]["run_id"]
+    for seq, name, data in rows:
+        await ctx.run_event_store.append(
+            make_event_record(run_id=UUID(run_id), seq=seq, event_name=name, data=data)
+        )
+    await ctx.run_store.set_status(
+        run_id=UUID(run_id),
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+    return str(run_id)
+
+
+_AGENT_UPDATE: dict[str, Any] = {
+    "agent": {
+        "step_count": 1,
+        "messages": [{"type": "ai", "content": "你好", "tool_calls": [], "additional_kwargs": {}}],
+    }
+}
+
+
+@pytest.mark.asyncio
+async def test_events_replays_as_items_when_asked(ctx: _Ctx) -> None:
+    """``stream_format=items`` 把内容类事件换成条目生命周期事件(条目 program PR3)。
+
+    这是四个能选流形态的入口之一;漏接线时第三方在这条路径上会拿回 legacy,与它
+    前面已经渲染好的条目列表对不上。
+    """
+    run_id = await _terminal_run_with(
+        ctx, [(1, "metadata", {"step": 1}), (2, "updates", _AGENT_UPDATE)]
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77", "stream_format": "items"},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    # 先证兄弟事件在:流控事件照常透传,下面的否定断言才不是「整条流空了」。
+    assert "event: metadata" in resp.text
+    assert "event: end" in resp.text
+    assert "event: item.done" in resp.text
+    assert '"type":"assistant_message"' in resp.text
+    assert "event: updates" not in resp.text
+    # 位置号照旧按真实记录推进 —— 转换不许打乱续传。
+    assert re.search(r"id: \d+-2\n", resp.text)
+
+
+@pytest.mark.asyncio
+async def test_events_default_stream_format_is_legacy(ctx: _Ctx) -> None:
+    """不传 ``stream_format`` 时形态一字不改 —— 已在对接的第三方零感知。"""
+    run_id = await _terminal_run_with(ctx, [(1, "updates", _AGENT_UPDATE)])
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "event: updates" in resp.text
+    assert "item.done" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_rejects_an_unknown_stream_format(ctx: _Ctx) -> None:
+    """取值只有两个,写错立刻 422 —— 不静默退回 legacy。"""
+    run_id = await _terminal_run_with(ctx, [(1, "updates", _AGENT_UPDATE)])
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/runs/{run_id}/events",
+        params={"user_id": "cust-77", "stream_format": "conversation"},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 422, resp.text

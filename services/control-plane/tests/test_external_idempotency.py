@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api import agents as agents_mod
 from control_plane.api._idempotency import request_digest as compute_request_digest
 from control_plane.api.agents import ExternalRunRequest
 from control_plane.api.external_events import build_events_response
@@ -744,3 +745,125 @@ async def test_build_events_response_is_terminal_reflects_run_status() -> None:
         stream_bridge=InMemoryStreamBridge(),
     )
     assert replay_resp.headers["X-Expert-Work-Stream-Mode"] == "replay"
+
+
+# ---------------------------------------------------------------------------
+# 对话条目 program PR3 —— stream_format 的两个入口
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_format_reaches_spawn_run(
+    external_client: AsyncClient, plain_agent: _Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """发起对话时选的流形态必须一路传到 SSE 出口。
+
+    ``ExternalRunRequest`` 是 ``extra="forbid"``,所以这条测试还顺带证明这个字段
+    真的被声明了 —— 没声明的话请求在到达 ``spawn_run`` 之前就 422 了。
+    """
+    real = agents_mod.spawn_run
+    seen: list[Any] = []
+
+    async def spy(**kwargs: Any) -> Any:
+        seen.append(kwargs.get("stream_format"))
+        return await real(**kwargs)
+
+    monkeypatch.setattr(agents_mod, "spawn_run", spy)
+
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "input": "你好", "mode": "queue", "stream_format": "items"},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert seen == ["items"]
+
+
+@pytest.mark.asyncio
+async def test_stream_format_defaults_to_legacy_on_spawn(
+    external_client: AsyncClient, plain_agent: _Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """不传时是 legacy —— 已在对接的第三方零感知。"""
+    real = agents_mod.spawn_run
+    seen: list[Any] = []
+
+    async def spy(**kwargs: Any) -> Any:
+        seen.append(kwargs.get("stream_format"))
+        return await real(**kwargs)
+
+    monkeypatch.setattr(agents_mod, "spawn_run", spy)
+
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs", json={"user_id": "u1", "mode": "queue"}
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert seen == ["legacy"]
+
+
+@pytest.mark.asyncio
+async def test_stream_format_survives_an_idempotent_replay(
+    external_client: AsyncClient, plain_agent: _Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Idempotency-Key`` 命中时的重放也要给同一种流形态。
+
+    这是四个入口里最容易漏的一个:重放走的是另一个函数,漏接线时同一个客户端的
+    重试会拿回 legacy,而它第一次拿到的是条目。
+    """
+    real = agents_mod._idempotent_run_response
+    seen: list[Any] = []
+
+    async def spy(run: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("stream_format"))
+        return await real(run, **kwargs)
+
+    monkeypatch.setattr(agents_mod, "_idempotent_run_response", spy)
+
+    body = {"user_id": "u1", "input": "你好", "mode": "queue", "stream_format": "items"}
+    headers = {"Idempotency-Key": "items-replay-1"}
+    first = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs", json=body, headers=headers
+    )
+    second = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs", json=body, headers=headers
+    )
+
+    assert first.status_code == 202 and second.status_code == 202, second.text
+    # 先证兄弟事件在:第一次没走重放,第二次才走 —— 所以这条不是空转。
+    assert seen == ["items"]
+
+
+@pytest.mark.asyncio
+async def test_changing_only_stream_format_reuses_the_key(
+    external_client: AsyncClient, plain_agent: _Agent
+) -> None:
+    """幂等指纹是整个请求体的哈希,所以同一个 key 只改流形态会被拒。
+
+    这是要写进文档的一条副作用:同一个 ``Idempotency-Key`` 必须对应同一个请求。
+    """
+    headers = {"Idempotency-Key": "items-switch-1"}
+    first = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "input": "你好", "mode": "queue"},
+        headers=headers,
+    )
+    second = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "input": "你好", "mode": "queue", "stream_format": "items"},
+        headers=headers,
+    )
+
+    assert first.status_code == 202, first.text
+    assert second.status_code == 422, second.text
+    assert second.json()["error"]["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+
+@pytest.mark.asyncio
+async def test_unknown_stream_format_is_422(
+    external_client: AsyncClient, plain_agent: _Agent
+) -> None:
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "mode": "queue", "stream_format": "conversation"},
+    )
+    assert resp.status_code == 422, resp.text

@@ -60,6 +60,7 @@ export default withMermaid(
                 { text: "3.4 每个事件怎么处理", link: "/guide/sse-events#_3-4-每个事件怎么处理" },
                 { text: "3.5 建议的接收器骨架", link: "/guide/sse-events#_3-5-建议的接收器骨架" },
                 { text: "3.6 断线重连与续传", link: "/guide/sse-events#_3-6-断线重连与续传" },
+                { text: "3.7 条目模式", link: "/guide/sse-events#_3-7-条目模式" },
               ],
             },
             {

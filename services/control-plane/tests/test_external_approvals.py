@@ -389,6 +389,59 @@ async def test_decide_stream_passes_external_hidden_events_to_sse_consumer(
 
 
 @pytest.mark.asyncio
+async def test_decide_forwards_stream_format(ctx: _Ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """审批续跑是第三方能选流形态的四个入口之一(条目 program PR3)。
+
+    漏接线时,第三方在审批之前拿的是条目、审批之后退回 legacy —— 同一段对话的
+    列表里出现两种形状,正是这套模型要消灭的症状。
+    """
+    import control_plane.api.external_approvals as mod
+
+    real = mod.sse_consumer
+    seen: list[object] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("stream_format"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "sse_consumer", spy)
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve", "stream_format": "items"},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen == ["items"]
+
+
+@pytest.mark.asyncio
+async def test_decide_stream_format_defaults_to_legacy(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import control_plane.api.external_approvals as mod
+
+    real = mod.sse_consumer
+    seen: list[object] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("stream_format"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "sse_consumer", spy)
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve"},
+        headers=ctx.headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert seen == ["legacy"]
+
+
+@pytest.mark.asyncio
 async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ctx) -> None:
     """Fix-round review: the kill-switch 403 must surface the SAME code the
     public error-code contract documents and the run-creation endpoint

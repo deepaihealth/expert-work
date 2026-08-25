@@ -30,6 +30,11 @@ from expert_work.runtime.stream_bridge import (
     is_end,
 )
 from orchestrator.sse import SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
+from orchestrator.stream_items import (
+    STREAM_FORMAT_ITEMS,
+    STREAM_FORMAT_LEGACY,
+    ItemStreamConverter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +104,7 @@ async def build_event_producer(
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
     hide_events: frozenset[str] = frozenset(),
+    stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> EventStreamPlan:
     """Return the SSE byte producer for one run, plus the replay cursor.
 
@@ -134,7 +140,22 @@ async def build_event_producer(
     home-tenant GUC); the external caller has no cross-tenant concept and
     passes ``None`` explicitly — there is no default, so a caller cannot
     silently forget this and fall back to an unscoped read.
+
+    ``stream_format``(对话条目 program PR3)—— ``"legacy"``(默认)一字节
+    不改;``"items"`` 让 ``_encode`` 把每帧转成对话条目生命周期事件。转换器
+    是本函数的一个局部变量,两个分支的生成器闭包共用,所以它的生命周期恰好
+    等于**一次响应**。
+
+    **上面那段「过滤只在 ``_encode`` 发生所以游标不受影响」的推理不能照抄给
+    转换器背书。** 它成立的前提是 ``_encode`` 无状态;转换器让它有状态了。
+    游标那一半仍然成立(``next_seq`` / ``truncated`` / ``last`` / ``holes``
+    照旧用未编码的原始行算,转换器物理上够不到),但新增的风险在转换器自己的
+    状态上 —— 乱序补洞、跨页重连、live 重放三条路径都会污染它。对策是让条目
+    ``id`` 全部**从帧内容确定性派生**(见 ``orchestrator.stream_items`` 的模块
+    docstring),把这部分状态从编号里消掉:转换器剩下的状态只有「少发一帧」的
+    优化与 ``channel`` 改判,乱序或重放最多让客户端多收一帧 upsert。
     """
+    converter = ItemStreamConverter(run_id=run_id) if stream_format == STREAM_FORMAT_ITEMS else None
 
     async def _list_page(
         after: int | None, *, limit: int = MAX_LIST_LIMIT
@@ -155,10 +176,23 @@ async def build_event_producer(
         """编码一条记录 / 一帧实时事件成 SSE 字节 —— 对外过滤在**这一点且只
         在这一点**发生:``event_name in hide_events`` 时不产出字节,调用方的
         seq 游标(``last`` / ``next_seq`` / ``holes``)照旧照真实记录推进,
-        不受影响。"""
+        不受影响。
+
+        items 模式下一帧可以扇出成多帧。帧的 SSE ``id:`` 只挂在扇出的**最后
+        一条**上:客户端在扇出中途断线时,它记住的续传位置还停在上一帧,重连
+        会把这一整帧重新发一遍(条目按 id upsert,重发无害)。若每一条都挂同
+        一个 ``id:``,中途断线的客户端会以为这一帧已经收完,后半截条目**静默
+        丢失**。扇出为空时这一帧的 id 不上 wire —— 与 ``hide_events`` 过滤掉
+        一帧时完全同款,调用方的游标照旧按真实记录推进。"""
         if event_name in hide_events:
             return []
-        return [format_sse(event_name, data, event_id=event_id)]
+        if converter is None:
+            return [format_sse(event_name, data, event_id=event_id)]
+        frames = converter.convert(event_name, data, event_id=event_id)
+        return [
+            format_sse(name, payload, event_id=event_id if offset == len(frames) - 1 else None)
+            for offset, (name, payload) in enumerate(frames)
+        ]
 
     async def _stream_replay(
         rows: Sequence[RunEventRecord], next_seq: int | None
@@ -181,6 +215,11 @@ async def build_event_producer(
             # 我们并不提供的能力。)
             yield format_sse("truncated", {"next_seq": next_seq})
             return
+        if converter is not None:
+            # items 模式的 ``channel="final"`` 改判 —— 只在真的收尾时补发。
+            # 截断分支**不能**发:那条流并没有结束,下一页还会来。
+            for name, payload in converter.finalize():
+                yield format_sse(name, payload)
         yield format_sse(
             "end",
             end_frame_data(run_id=run_id, status=_RUN_STATUS_END_STATUS.get(run_status)),
@@ -311,6 +350,9 @@ async def build_event_producer(
                 for chunk in _gap_frames(holes, reason="hole_unfilled_at_end"):
                     yield chunk
                 holes.clear()
+                if converter is not None:
+                    for name, payload in converter.finalize():
+                        yield format_sse(name, payload)
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
                 # (``publish_end(status=...)`` 存的)。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
