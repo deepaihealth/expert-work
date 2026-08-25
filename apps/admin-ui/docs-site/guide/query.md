@@ -807,11 +807,20 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | `tool_result` 的 `content` | 服务端已经拆掉包装 | 直接显示 |
 | `tool_call.worker` 里所有以 `_excerpt` 结尾的字段 | **保留着包装** | 显示给用户之前自己拆，做法见 [3.4 工具结果文本的还原](./sse-events#工具结果文本的还原) |
 
-::: warning 按字段名去拆必然漏掉
+::: warning 别按字段名去拆
 
-`_excerpt` 字段散落在子任务树的多层里，当前有 `task_excerpt`、`content_excerpt`、`args_excerpt`、`tool_result_excerpt`、`stdout_excerpt`、`stderr_excerpt` 六个，而且会随着子任务的能力增加。
+`_excerpt` 字段散落在子任务树的多层里，当前有 `task_excerpt`、`content_excerpt`、`args_excerpt`、`tool_result_excerpt`、`stdout_excerpt`、`stderr_excerpt` 六个，而且会随着子任务的能力增加；`children[]` 还会把这套结构递归嵌套下去。
 
-写成「遇到这几个字段名就拆」的实现，会在新增字段时漏掉，界面上直接冒出 `«UNTRUSTED nonce=…»`。正确做法是**递归遍历 `worker`，对每个以 `_excerpt` 结尾的字符串字段做还原**，不要枚举字段名。
+写成「遇到这几个字段名就拆」的实现，会在新增字段时漏掉，界面上直接冒出 `«UNTRUSTED nonce=…»`。两种做法都能避开这一点，代价不同：
+
+| 做法 | 覆盖范围 | 代价 |
+|---|---|---|
+| 把整个响应序列化成字符串，对整段做替换，再解析回来 | 全覆盖：将来新增的字段、递归嵌套的子任务，都自动包含 | 会误伤模型自己答案里恰好出现的同款标记 |
+| 递归遍历，对每个以 `_excerpt` 结尾的字符串字段做还原 | 依赖「带包装的字段都以 `_excerpt` 结尾」这个约定 | 不误伤，但这个约定不是接口保证，新增字段仍可能漏 |
+
+**第二种的约定不是接口保证**：今天所有带包装的字段确实都是这个后缀，但没有任何机制拦住将来出现一个不叫 `*_excerpt` 的。要覆盖得彻底就用第一种；选第二种时，把「新增字段可能漏」当作已知取舍接受下来。
+
+无论哪种，还原都是幂等的：没有包装的文本匹配不到，原样返回。所以对已经拆好的 `tool_result.content` 再拆一次没有副作用，把整个响应统一过一遍是安全的。
 :::
 
 还原不是完全可逆的：包装时连续空白被压成一个空格，换行恢复不回来。
