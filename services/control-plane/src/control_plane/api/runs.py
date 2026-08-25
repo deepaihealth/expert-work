@@ -1593,7 +1593,21 @@ def build_runs_router() -> APIRouter:
         except Exception:
             logger.warning("thread_messages.read_failed", exc_info=True)
             return empty
-        out = [{"role": t.role, "content": t.content, "channel": t.channel} for t in turns]
+        # ``run_id`` 来自写入侧盖的 ``expert_work_run_id``(``message_stamp``),
+        # 与对外端点 ``external_sessions.get_messages`` 同一个投影写法 —— 同一个
+        # ``MessageTurn`` 数据源,两处不该再分叉。调试台历史轮靠它把文本和
+        # ``/runs`` 的 run 精确配对(一次审批会把一轮切成暂停 run + 续跑 run,
+        # 按顺序配就配不上)。盖戳上线前写入的老消息是 ``None``(不回填),
+        # 前端据此整体回退到顺序配对。
+        out = [
+            {
+                "role": t.role,
+                "content": t.content,
+                "channel": t.channel,
+                "run_id": str(t.run_id) if t.run_id else None,
+            }
+            for t in turns
+        ]
         return JSONResponse({"success": True, "data": {"messages": out}})
 
     @router.get(

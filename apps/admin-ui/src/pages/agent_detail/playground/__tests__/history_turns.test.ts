@@ -216,3 +216,199 @@ describe("buildHistoryTurns non-terminal tail", () => {
     ).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// run_id grouping — exact pairing when every message carries its owning run
+// ---------------------------------------------------------------------------
+
+const Ur = (content: string, runId: string): HistoryMessage => ({
+  role: "user",
+  content,
+  channel: null,
+  run_id: runId,
+});
+const Ar = (
+  content: string,
+  runId: string,
+  channel: HistoryMessage["channel"] = null,
+): HistoryMessage => ({ role: "assistant", content, channel, run_id: runId });
+
+describe("buildHistoryTurns run_id grouping", () => {
+  it("groups each run's messages by run_id, not by position", () => {
+    // r2's rows sit BEFORE r1's in the flat list — order pairing would put
+    // "q2" on r1. Only real grouping gets this right.
+    const turns = buildHistoryTurns(
+      [Ur("q2", "r2"), Ar("a2", "r2", "final"), Ur("q1", "r1"), Ar("a1", "r1", "final")],
+      [run("r1"), run("r2")],
+    );
+    expect(turns).toEqual([
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [{ text: "a1", channel: "final" }],
+        runId: "r1",
+        status: "success",
+        tokens: null,
+        createdAt: "2026-01-01",
+      },
+      {
+        key: "r2",
+        input: "q2",
+        fallbackLines: [{ text: "a2", channel: "final" }],
+        runId: "r2",
+        status: "success",
+        tokens: null,
+        createdAt: "2026-01-01",
+      },
+    ]);
+  });
+
+  it("gives a continuation run that owns no user message an empty input instead of degrading", () => {
+    // The approval case order pairing cannot express: r1 paused holding q1,
+    // r2 resumed the SAME checkpoint (no user message of its own) and
+    // answered. Both terminal, so the D-5 trailing window does not apply —
+    // today this whole page falls back to flat text.
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Ar("我先查一下", "r1", "commentary"), Ar("查到了", "r2", "final")],
+      [run("r1"), run("r2")],
+    );
+    expect(turns).not.toBeNull();
+    expect(turns).toEqual([
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [{ text: "我先查一下", channel: "commentary" }],
+        runId: "r1",
+        status: "success",
+        tokens: null,
+        createdAt: "2026-01-01",
+      },
+      {
+        key: "r2",
+        input: "",
+        fallbackLines: [{ text: "查到了", channel: "final" }],
+        runId: "r2",
+        status: "success",
+        tokens: null,
+        createdAt: "2026-01-01",
+      },
+    ]);
+  });
+
+  it("gives a run with no messages at all an empty turn instead of degrading", () => {
+    // A just-spawned run whose messages are not checkpointed yet — the same
+    // shape the D-5 trailing window produces, now without needing the run to
+    // be trailing or non-terminal.
+    const turns = buildHistoryTurns([Ur("q1", "r1"), Ar("a1", "r1")], [run("r1"), run("r2")]);
+    expect(turns?.[1]).toEqual({
+      key: "r2",
+      input: "",
+      fallbackLines: [],
+      runId: "r2",
+      status: "success",
+      tokens: null,
+      createdAt: "2026-01-01",
+    });
+  });
+
+  it("ignores messages whose run is not in ``runs`` (they belong to another page)", () => {
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Ar("a1", "r1"), Ur("其他 run 的", "r9"), Ar("其他 run 的答", "r9")],
+      [run("r1")],
+    );
+    expect(turns).toEqual([
+      {
+        key: "r1",
+        input: "q1",
+        fallbackLines: [{ text: "a1", channel: null }],
+        runId: "r1",
+        status: "success",
+        tokens: null,
+        createdAt: "2026-01-01",
+      },
+    ]);
+  });
+
+  it("carries status / tokens / createdAt from the run, not from the messages", () => {
+    const tokens = {
+      input_tokens: 10, output_tokens: 5, cache_creation_tokens: 0,
+      cache_read_tokens: 0, total_tokens: 15, llm_calls: 1, models: ["m"],
+    };
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Ar("a1", "r1")],
+      [{ runId: "r1", status: "running", isResume: true, createdAt: "2026-02-02", tokens }],
+    );
+    expect(turns?.[0]).toMatchObject({
+      key: "r1", runId: "r1", status: "running", tokens, createdAt: "2026-02-02",
+    });
+  });
+
+  it("collects every non-user message of a run as its own fallback line", () => {
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Ar("a1", "r1"), Ar("a2", "r1"), Ar("a3", "r1")],
+      [run("r1")],
+    );
+    expect(turns?.[0]?.fallbackLines).toEqual([
+      { text: "a1", channel: null },
+      { text: "a2", channel: null },
+      { text: "a3", channel: null },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// run_id grouping — the fallbacks to order pairing
+// ---------------------------------------------------------------------------
+
+describe("buildHistoryTurns falls back to order pairing", () => {
+  it("falls back when ONE message lacks run_id, reproducing the order-paired output", () => {
+    const mixed: HistoryMessage[] = [
+      { role: "user", content: "q1", channel: null }, // 盖戳上线前写入
+      Ar("a1", "r1"),
+      Ur("q2", "r2"),
+      Ar("a2", "r2"),
+    ];
+    const expected = buildHistoryTurns([U("q1"), A("a1"), U("q2"), A("a2")], [run("r1"), run("r2")]);
+    expect(buildHistoryTurns(mixed, [run("r1"), run("r2")])).toEqual(expected);
+    expect(expected?.[0]?.input).toBe("q1");
+  });
+
+  it("falls back when a message carries run_id: null explicitly", () => {
+    const mixed: HistoryMessage[] = [
+      { role: "user", content: "q1", channel: null, run_id: null },
+      Ar("a1", "r1"),
+    ];
+    expect(buildHistoryTurns(mixed, [run("r1")])).toEqual(
+      buildHistoryTurns([U("q1"), A("a1")], [run("r1")]),
+    );
+  });
+
+  it("a mixed thread still degrades to null when order pairing cannot reconcile", () => {
+    // The null-run_id row keeps this on the order path, where 1 user turn vs
+    // 2 terminal runs is the pre-existing degrade case.
+    const mixed: HistoryMessage[] = [
+      { role: "user", content: "q1", channel: null },
+      Ar("a1", "r1"),
+    ];
+    expect(buildHistoryTurns(mixed, [run("r1"), run("r2")])).toBeNull();
+  });
+
+  it("falls back when one run owns two user rows (faithful cross-tenant audit view)", () => {
+    // ``include_hidden=True`` keeps the orchestrator's ``<recovery-advisory>``
+    // HumanMessage, which is stamped with the SAME run as the real input —
+    // "the run's user message" is then ambiguous. Order pairing degrades to
+    // flat text, which shows both rows; grouping would have to drop one.
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Ur("<recovery-advisory>internal</recovery-advisory>", "r1"), Ar("a1", "r1")],
+      [run("r1")],
+    );
+    expect(turns).toBeNull();
+  });
+
+  it("keeps the order path for an empty message list (nothing to group)", () => {
+    // A best-effort transcript read that degraded to [] must not silently
+    // switch strategy and render an empty-input card per run.
+    expect(buildHistoryTurns([], [run("r1")])).toBeNull();
+    expect(buildHistoryTurns([], [])).toEqual([]);
+  });
+});

@@ -33,6 +33,7 @@ from langgraph.graph.message import add_messages
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
+from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditQuery
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
@@ -267,8 +268,74 @@ async def test_thread_messages_reads_durable_checkpoint_directly() -> None:
         response = await client.get(f"/v1/sessions/{thread_id}/messages")
         assert response.status_code == 200
         assert response.json()["data"]["messages"] == [
-            {"role": "user", "content": "今天几号", "channel": None},
-            {"role": "assistant", "content": "今天是 2026年6月30日", "channel": "final"},
+            {"role": "user", "content": "今天几号", "channel": None, "run_id": None},
+            {
+                "role": "assistant",
+                "content": "今天是 2026年6月30日",
+                "channel": "final",
+                "run_id": None,
+            },
+        ]
+
+
+@pytest.mark.asyncio
+async def test_thread_messages_carry_the_owning_run_id() -> None:
+    """控制台 ``/messages`` 要把写入侧盖的 ``expert_work_run_id`` 投影出来。
+
+    调试台历史轮把 ``/messages`` 的文本和 ``/runs`` 的 run 配对成轮次卡。没有
+    ``run_id`` 就只能按顺序配,一次审批把一轮切成两个 run 就配不上、整页退化
+    成扁平文本。两条消息刻意来自**不同** run:恒返回同一个 id(或恒 None)的
+    实现过不了这条。老消息(没盖戳)仍是 ``None`` —— 不回填,前端据此回退顺序
+    配对。
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    run_store = InMemoryRunStore()
+    checkpointer = InMemorySaver()
+    runtime = stub_agent_runtime(run_store=run_store)
+    runtime.durable_checkpointer = checkpointer
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=runtime,
+        run_repo=run_store,
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        thread_id = await _create_session(client)
+
+        run_a, run_b = str(uuid4()), str(uuid4())
+        await _seed_thread_messages(
+            checkpointer,
+            thread_id,
+            [
+                HumanMessage(content="q1", additional_kwargs={STAMP_RUN_ID: run_a}),
+                AIMessage(content="a1", additional_kwargs={STAMP_RUN_ID: run_a}),
+                HumanMessage(content="q2", additional_kwargs={STAMP_RUN_ID: run_b}),
+                AIMessage(content="a2", additional_kwargs={STAMP_RUN_ID: run_b}),
+                HumanMessage(content="老消息"),  # 盖戳上线前写入的
+            ],
+        )
+
+        response = await client.get(f"/v1/sessions/{thread_id}/messages")
+        assert response.status_code == 200
+        assert [(m["content"], m["run_id"]) for m in response.json()["data"]["messages"]] == [
+            ("q1", run_a),
+            ("a1", run_a),
+            ("q2", run_b),
+            ("a2", run_b),
+            ("老消息", None),
         ]
 
 
@@ -325,8 +392,13 @@ async def test_thread_messages_self_read_hides_scaffolding_but_record_keeps_it()
         response = await client.get(f"/v1/sessions/{thread_id}/messages")
         assert response.status_code == 200
         assert response.json()["data"]["messages"] == [
-            {"role": "user", "content": "今天几号", "channel": None},
-            {"role": "assistant", "content": "今天是 2026年6月30日", "channel": "final"},
+            {"role": "user", "content": "今天几号", "channel": None, "run_id": None},
+            {
+                "role": "assistant",
+                "content": "今天是 2026年6月30日",
+                "channel": "final",
+                "run_id": None,
+            },
         ]
 
         # ...but the faithful record still carries it — the mirror/audit read
