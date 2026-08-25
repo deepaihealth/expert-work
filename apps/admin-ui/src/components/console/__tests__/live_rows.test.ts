@@ -34,7 +34,7 @@ describe("liveSyntheticRows", () => {
     const events = [agentUpdate(1)]; // only step 1 has landed
     const liveByStep = new Map<number, LiveStep>([
       [1, liveStep({ content: "settled leftover", reasoning: "stale" })],
-      [2, liveStep({ content: "partial", reasoning: "thinking…", toolNames: new Map([[0, "query_crm"]]) })],
+      [2, liveStep({ content: "partial", reasoning: "thinking…", toolNames: new Map([["call_a", "query_crm"]]) })],
     ]);
     const rows = liveSyntheticRows(events, liveByStep);
     expect(rows).toHaveLength(2);
@@ -44,9 +44,9 @@ describe("liveSyntheticRows", () => {
       durationMs: null, eventIndexes: [], serverMs: null,
     });
     expect(rows[1]).toMatchObject({
-      id: "live-tool:2:0", kind: "tool", seq: -1, step: 2, status: "running",
+      id: "live-tool:2:call_a", kind: "tool", seq: -1, step: 2, status: "running",
       durationMs: null, eventIndexes: [], serverMs: null,
-      entry: { id: "live-2-0", rawName: "query_crm", toolName: "query_crm", isMcp: false, server: null, args: {}, status: "pending", resultPreview: null, durationMs: null },
+      entry: { id: "live-2-call_a", rawName: "query_crm", toolName: "query_crm", isMcp: false, server: null, args: {}, status: "pending", resultPreview: null, durationMs: null },
     });
   });
   it("returns [] when liveByStep is undefined", () => {
@@ -69,12 +69,12 @@ describe("liveSyntheticRows", () => {
 describe("liveLedgerRows", () => {
   it("emits one assistant row per unsettled step even with empty reasoning, plus one tool row per named call", () => {
     const liveByStep = new Map<number, LiveStep>([
-      [2, liveStep({ content: "写到一半", reasoning: "", toolNames: new Map([[0, "query_crm"], [1, "search"]]) })],
+      [2, liveStep({ content: "写到一半", reasoning: "", toolNames: new Map([["call_a", "query_crm"], ["call_b", "search"]]) })],
       [3, liveStep()], // 既没文字也没思考也没工具 —— 账本投影照样出一条 assistant
     ]);
     const rows = liveLedgerRows([], liveByStep);
     expect(rows.map((r) => r.id)).toEqual([
-      "live-assistant:2", "live-tool:2:0", "live-tool:2:1", "live-assistant:3",
+      "live-assistant:2", "live-tool:2:call_a", "live-tool:2:call_b", "live-assistant:3",
     ]);
     expect(rows[0]).toMatchObject({
       kind: "assistant", seq: -1, step: 2, status: "running", text: "写到一半", reasoning: "",
@@ -84,13 +84,13 @@ describe("liveLedgerRows", () => {
     expect(rows[3]).toMatchObject({ kind: "assistant", step: 3, text: "", reasoning: "", toolCallCount: 0 });
     expect(rows[1]).toMatchObject({
       kind: "tool", seq: -1, step: 2, status: "running",
-      entry: { id: "live-2-0", toolName: "query_crm", status: "pending" },
+      entry: { id: "live-2-call_a", toolName: "query_crm", status: "pending" },
     });
   });
 
   it("skips a step that already landed an authoritative frame, and returns [] without a live buffer", () => {
     const liveByStep = new Map<number, LiveStep>([
-      [1, liveStep({ content: "settled leftover", reasoning: "stale", toolNames: new Map([[0, "t"]]) })],
+      [1, liveStep({ content: "settled leftover", reasoning: "stale", toolNames: new Map([["call_a", "t"]]) })],
       [2, liveStep({ content: "still going" })],
     ]);
     expect(liveLedgerRows([agentUpdate(1)], liveByStep).map((r) => r.id)).toEqual(["live-assistant:2"]);

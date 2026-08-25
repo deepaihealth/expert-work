@@ -73,7 +73,7 @@ function turnCEvents(): SseEvent[] {
   ];
 }
 const LIVE_BY_STEP: ReadonlyMap<number, LiveStep> = new Map<number, LiveStep>([
-  [2, { content: "正在写", reasoning: "想想", toolNames: new Map([[0, "calc"]]), reasoningMs: null }],
+  [2, { content: "正在写", reasoning: "想想", toolNames: new Map([["call_a", "calc"]]), reasoningMs: null }],
 ]);
 const CREATED_B = new Date(BASE + 10_000).toISOString();
 
@@ -118,12 +118,12 @@ describe("buildLedger", () => {
     expect(ledger.records.map((r) => r.id)).toEqual([
       "A/user", "A/assistant:0", "A/tool:0:0", "A/assistant:1",
       "B/user", "B/assistant:placeholder",
-      "C/user", "C/assistant:0", "C/tool:0:0", "C/live-assistant:2", "C/live-tool:2:0",
+      "C/user", "C/assistant:0", "C/tool:0:0", "C/live-assistant:2", "C/live-tool:2:call_a",
     ]);
     expect(ledger.records.map((r) => r.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(ledger.records.filter((r) => r.turnStart).map((r) => r.id)).toEqual(["A/user", "B/user", "C/user"]);
     expect(ledger.records.filter((r) => r.turnEnd).map((r) => r.id)).toEqual([
-      "A/assistant:1", "B/assistant:placeholder", "C/live-tool:2:0",
+      "A/assistant:1", "B/assistant:placeholder", "C/live-tool:2:call_a",
     ]);
     expect(ledger.records.map((r) => r.turnSeq)).toEqual([0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 2]);
     expect(ledger.records[0]).toMatchObject({ turnKey: "A", runId: "run-0", kind: "user", placeholder: null });
@@ -150,7 +150,7 @@ describe("buildLedger", () => {
     expect(byId.get("C/assistant:0")).toMatchObject({ requestNo: 3 });
     // live 行按 step 认领主人(seq 都是 -1,认 seq 会串)。
     expect(byId.get("C/live-assistant:2")).toMatchObject({ requestNo: 4 });
-    expect(byId.get("C/live-tool:2:0")).toMatchObject({ ownerRequestNo: 4, parentId: "C/live-assistant:2" });
+    expect(byId.get("C/live-tool:2:call_a")).toMatchObject({ ownerRequestNo: 4, parentId: "C/live-assistant:2" });
     expect(byId.get("C/tool:0:0")).toMatchObject({ ownerRequestNo: 3, parentId: "C/assistant:0" });
   });
 
@@ -305,7 +305,7 @@ describe("buildLedger", () => {
       kind: "assistant", running: true, text: "正在写", lane: 1,
       startedAt: BASE + 5000, endedAt: NOW,
     });
-    expect(byId.get("C/live-tool:2:0")).toMatchObject({ kind: "tool", running: true, startedAt: BASE + 5000, endedAt: NOW });
+    expect(byId.get("C/live-tool:2:call_a")).toMatchObject({ kind: "tool", running: true, startedAt: BASE + 5000, endedAt: NOW });
     // 不是流式那一轮就不拼 live 行。
     const other = buildLedger({ turns: fixture(), streamTurnKey: "A", liveByStep: LIVE_BY_STEP, nowMs: NOW });
     expect(other.records.some((r) => r.id.startsWith("C/live-"))).toBe(false);
