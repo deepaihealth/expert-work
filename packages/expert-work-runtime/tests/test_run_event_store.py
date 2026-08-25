@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 import pytest
@@ -209,3 +210,17 @@ async def test_next_seq_pages_beyond_list_limit() -> None:
     for seq in range(total):
         await store.append(make_event_record(run_id=run_id, seq=seq, event_name="updates", data={}))
     assert await store.next_seq(run_id=run_id) == total
+
+
+# ---------------------------------------------------------------------------
+# 对话条目 PR2 —— event_names 过滤
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_event_names_filter_in_memory(
+    event_names_filter_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """断言体在 ``conftest`` 的契约里,与 SQL 版共用一份 —— 见那个文件的
+    docstring:两边各写各的断言正是谓词分歧漏网的原因。"""
+    await event_names_filter_contract(InMemoryRunEventStore(), run_id=uuid4())

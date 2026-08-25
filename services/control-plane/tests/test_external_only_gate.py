@@ -48,16 +48,28 @@ from tests.auth_fixtures import (
 _TID = uuid4()
 _RID = uuid4()
 
-#: The full third-party surface under ``/v1/agents`` — same fifteen routes as
+#: The full third-party surface under ``/v1/agents`` — the same routes as
 #: ``test_console_lockdown.py``'s ``_EXTERNAL_AGENT_ROUTES``. Kept as an
 #: independent local table (not imported) — each security-gate test file in
 #: this suite owns its own route table so it can't silently start passing
 #: because a SIBLING file's table drifted.
+#:
+#: 条目数**不写进这段注释**:上一版写死了「fifteen」,而表长到 16 条时那个
+#: 数字就成了假的 —— 注释里的可数事实没有任何东西会让它变红。这张表的完备性
+#: 改由 ``test_route_table_covers_every_live_external_agents_route`` 对着真实
+#: 路由断言。
+#:
+#: 加这条断言的直接原因:``GET /v1/agents/{agent_code}/runs`` 曾经只登记在
+#: ``_EXTERNAL_AGENT_ROUTES`` 里、这张表漏了它,于是下面那几个凭据测试从来
+#: 没有覆盖过 run 列表端点 —— 而两张表都号称是同一份对外面。闸本身由
+#: ``external_only()`` 在 router 构造处按构造生效,所以那不是漏洞;漏的是审计。
 _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/v1/agents/{agent_code}/sessions"),
         ("GET", "/v1/agents/{agent_code}/sessions"),
         ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/messages"),
+        ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/items"),
+        ("GET", "/v1/agents/{agent_code}/runs"),
         ("PATCH", "/v1/agents/{agent_code}/sessions/{session_id}"),
         ("DELETE", "/v1/agents/{agent_code}/sessions/{session_id}"),
         ("POST", "/v1/agents/{agent_code}/runs"),
@@ -397,6 +409,41 @@ _EXTERNAL_ONLY_DEP_QUALNAME = f"{external_only.__qualname__}.<locals>._dep"
 def _carries_external_only_guard(route: APIRoute) -> bool:
     return any(
         dep.call.__qualname__ == _EXTERNAL_ONLY_DEP_QUALNAME for dep in route.dependant.dependencies
+    )
+
+
+def test_route_table_covers_every_live_external_agents_route() -> None:
+    """``_EXTERNAL_ROUTES`` 必须等于真实应用里 ``/v1/agents`` 下的对外路由。
+
+    上面那条闸审计是按 live 发现的,新路由自动进;而 ``_EXTERNAL_ROUTES`` 是
+    手工表,只喂给本文件的**凭据**测试(员工 JWT 被拒 / admin scope 能打 /
+    无凭据 401)。手工表漏一条,那条路由就悄悄没有凭据测试 —— 不会红,因为
+    参数化只遍历表里有的东西。
+
+    这正是 ``GET /v1/agents/{agent_code}/runs`` 发生过的事:它登记在
+    ``test_console_lockdown.py`` 的 ``_EXTERNAL_AGENT_ROUTES`` 里,却漏在这张
+    表外,而两张表的注释都说自己是完整的对外面。
+
+    路由发现独立于本表内容(直接走 ``tags=["external"]`` + 路径前缀),所以
+    「应用有而表没有」这一支真的会触发 —— 用表自身去过滤 live 会让这个断言
+    按构造恒真,本仓库在另一处踩过这个坑。
+
+    断的是**包含**而不是相等,原因是标签发现天生看不全:``POST
+    /v1/agents/{agent_code}/runs`` 与 ``POST /v1/agents/{agent_code}/sessions``
+    挂在 ``build_agents_router()`` 上,那个 router 同时承载控制台面与对外面,
+    因此整体不带 ``tags=["external"]``。它们在表里是对的,只是这条断言看不见
+    它们。危险的方向只有一个 —— 应用里有而表里没有,那条路由就悄悄没了凭据
+    测试;表里多一条陈旧项只会让参数化多跑一个 404,不会掩盖任何东西。
+    """
+    live = {
+        (method, route.path)
+        for route in _external_agents_routes(_build_audit_app())
+        if route.path.startswith("/v1/agents/")
+        for method in (route.methods or set())
+        if method not in ("HEAD", "OPTIONS")
+    }
+    assert live <= _EXTERNAL_ROUTES, (
+        f"表缺(应用里有、表里没有,于是这几条没有凭据测试): {sorted(live - _EXTERNAL_ROUTES)}"
     )
 
 

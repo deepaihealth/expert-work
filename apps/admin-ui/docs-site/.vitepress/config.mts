@@ -81,7 +81,7 @@ export default withMermaid(
                 { text: "5.5 重命名与归档", link: "/guide/query#_5-5-重命名与归档" },
                 { text: "5.6 工作区文件", link: "/guide/query#_5-6-工作区文件" },
                 { text: "5.7 产物", link: "/guide/query#_5-7-产物" },
-                { text: "5.8 渲染对话界面", link: "/guide/query#_5-8-渲染对话界面" },
+                { text: "5.8 对话条目", link: "/guide/query#_5-8-对话条目" },
               ],
             },
           ],

@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import String, cast, delete, func, or_, select, update
+from sqlalchemy import String, and_, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -274,8 +274,26 @@ class RunStore(abc.ABC):
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        before: tuple[datetime, UUID] | None = None,
     ) -> list[RunInfo]:
         """Return runs for ``tenant_id``, newest first; paginated.
+
+        ``before`` is a **keyset cursor**: ``(created_at, run_id)`` of the
+        oldest row the caller already has; only strictly-older rows come
+        back. Use it instead of ``offset`` whenever new rows can be
+        created while the caller pages — this list is newest-first, so a
+        run started mid-pagination shifts every offset by one and the
+        client silently re-reads a row it already had. Pass one or the
+        other; combining them applies the offset *within* the keyset
+        window, which is almost never what a caller means.
+
+        The cursor is a pair, not a bare timestamp, because ``created_at``
+        is not unique: two runs submitted on the same thread in the same
+        microsecond would straddle a page boundary and the second one
+        would be skipped forever by a ``created_at``-only cursor. The
+        comparison is SQL row-value ordering, which is what Python's tuple
+        comparison already does — the two backends must stay literally
+        interchangeable here.
 
         Stream H.3 PR 1 — feeds the cross-thread ``GET /v1/runs`` index.
         ``limit`` is clamped to ``MAX_LIST_LIMIT`` (Mini-ADR H-7 D).
@@ -676,8 +694,12 @@ class InMemoryRunStore(RunStore):
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        before: tuple[datetime, UUID] | None = None,
     ) -> list[RunInfo]:
         rows = [r for r in self._rows.values() if r.tenant_id == tenant_id]
+        if before is not None:
+            # 与 SQL 侧的行值比较同义:先比 created_at,相等再比 run_id。
+            rows = [r for r in rows if (r.created_at, r.run_id) < before]
         if status is not None:
             rows = [r for r in rows if r.status is status]
         if user_id is not None:
@@ -699,7 +721,9 @@ class InMemoryRunStore(RunStore):
             rows = [
                 r for r in rows if ql in str(r.run_id).lower() or ql in str(r.thread_id).lower()
             ]
-        rows.sort(key=lambda r: r.created_at, reverse=True)
+        # ``run_id`` 是排序的第二键,与 SQL 侧的 ``ORDER BY created_at DESC, id
+        # DESC`` 同义 —— keyset 游标只有在排序键与游标键一致时才不漏不重。
+        rows.sort(key=lambda r: (r.created_at, r.run_id), reverse=True)
         clamped = _clamp_limit(limit)
         return rows[offset : offset + clamped]
 
@@ -1174,6 +1198,7 @@ class SqlRunStore(RunStore):
         q: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        before: tuple[datetime, UUID] | None = None,
     ) -> list[RunInfo]:
         if thread_ids is not None and not thread_ids:
             return []
@@ -1181,10 +1206,22 @@ class SqlRunStore(RunStore):
         stmt = (
             select(AgentRunRow)
             .where(AgentRunRow.tenant_id == tenant_id)
-            .order_by(AgentRunRow.created_at.desc())
+            .order_by(AgentRunRow.created_at.desc(), AgentRunRow.id.desc())
             .limit(clamped)
             .offset(max(0, offset))
         )
+        if before is not None:
+            # 行值比较 ``(created_at, id) < before``,与内存 store 的元组比较
+            # 同义。展开成 or_/and_ 而不用 ``tuple_``:两种写法在 Postgres 上
+            # 等价,展开式对 ``ix_agent_run_thread_id`` 更友好,也不依赖驱动怎么
+            # 绑定复合字面量。
+            cursor_at, cursor_id = before
+            stmt = stmt.where(
+                or_(
+                    AgentRunRow.created_at < cursor_at,
+                    and_(AgentRunRow.created_at == cursor_at, AgentRunRow.id < cursor_id),
+                )
+            )
         if status is not None:
             stmt = stmt.where(AgentRunRow.status == status.value)
         if user_id is not None:

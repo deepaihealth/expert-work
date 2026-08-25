@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
@@ -300,6 +300,7 @@ async def test_store_append_failure_does_not_block_sse() -> None:
             run_id: UUID,
             since_seq: int | None = None,
             limit: int = 100,
+            event_names: Collection[str] | None = None,
         ) -> Sequence[RunEventRecord]:
             return []
 

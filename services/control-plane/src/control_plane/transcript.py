@@ -90,6 +90,27 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
     return out
 
 
+async def read_messages(
+    checkpointer: BaseCheckpointSaver[Any],
+    thread_id: UUID,
+) -> list[Any]:
+    """读出一段会话检查点里 ``messages`` 通道的原始消息,没有检查点就是空列表。
+
+    :func:`read_turns` 与对话条目接口(``api/external_session_items.py``)都要
+    这份原始消息 —— 前者只取文本轮次,后者还要工具调用与结果。检查点的内部
+    布局(``channel_values.messages``)因此只写在这一个地方。
+
+    与 :func:`read_turns` 一样,checkpointer 出错时直接抛,由调用方选择怎么
+    降级。
+    """
+    config: RunnableConfig = {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
+    tup = await checkpointer.aget_tuple(config)
+    if tup is None:
+        return []
+    raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
+    return list(raw) if raw else []
+
+
 async def read_turns(
     checkpointer: BaseCheckpointSaver[Any],
     thread_id: UUID,
@@ -115,12 +136,9 @@ async def read_turns(
     mirrors deer-flow, which reads the checkpoint faithfully and applies the
     ``hide_from_ui`` visibility filter only at its UI-serving router.
     """
-    config: RunnableConfig = {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
-    tup = await checkpointer.aget_tuple(config)
-    if tup is None:
-        return []
-    raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
-    return extract_turns(raw, include_hidden=include_hidden)
+    return extract_turns(
+        await read_messages(checkpointer, thread_id), include_hidden=include_hidden
+    )
 
 
-__all__ = ["extract_turns", "read_turns"]
+__all__ = ["extract_turns", "read_messages", "read_turns"]
