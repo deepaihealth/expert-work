@@ -353,6 +353,98 @@ async def test_token_sink_emits_tool_name_once_per_index() -> None:
     ]
 
 
+# --------------------------------------------------------------------------
+# tool_args 的去重键:call_id 优先,厂商 index 兜底
+#
+# 去重键原本是 tc.index。厂商不发 index 时解析器把它兜底成 0,于是同一步里两个
+# 不同的调用共用键 0,第二个工具的 tool_args 帧被去重掉 —— 客户端在流式阶段
+# 永远看不到第二次调用。#1278 已经把 call_id 放进帧里,这里改成拿它做键。
+# --------------------------------------------------------------------------
+
+
+def _oa(entry: dict[str, Any]) -> dict[str, Any]:
+    """一个只带 ``tool_calls`` 的 OpenAI SSE chunk。"""
+    return {"choices": [{"delta": {"tool_calls": [entry]}}]}
+
+
+async def _tool_frames_from_openai_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把原始 chunk 走**真实解析器**喂进 TokenSink,收 tool_args 帧。
+
+    刻意不直接构造 ``ToolCallChunk``:index 的 0 兜底就发生在解析器里,绕过
+    它等于绕过被测的那一半。
+    """
+    from orchestrator.llm.providers._streaming import delta_from_openai_chunk
+
+    frames: list[dict[str, Any]] = []
+
+    async def publish(frame: dict[str, Any]) -> None:
+        frames.append(frame)
+
+    sink = TokenSink(step=1, publish=publish, dlp=False, screen=False)
+    for chunk in chunks:
+        await sink(delta_from_openai_chunk(chunk))
+    await sink.flush()
+    return [f for f in frames if f["channel"] == "tool_args"]
+
+
+@pytest.mark.asyncio
+async def test_tool_args_unindexed_calls_are_both_announced() -> None:
+    frames = await _tool_frames_from_openai_chunks(
+        [
+            _oa({"id": "c0", "function": {"name": "search"}}),
+            _oa({"id": "c1", "function": {"name": "calc"}}),
+        ]
+    )
+    # 数量先钉死:「两帧没被合并」对一个一帧都不发的 sink 同样成立。
+    assert len(frames) == 2
+    assert [f["call_id"] for f in frames] == ["c0", "c1"]
+    assert [f["name"] for f in frames] == ["search", "calc"]
+
+
+@pytest.mark.asyncio
+async def test_tool_args_same_call_id_announced_once_even_across_indexes() -> None:
+    # 主键是 call_id 而不是 index:同一个 id 即便换了 index 也只发一帧。
+    frames = await _tool_frames_from_openai_chunks(
+        [
+            _oa({"index": 0, "id": "c0", "function": {"name": "search"}}),
+            _oa({"index": 1, "id": "c0", "function": {"name": "search"}}),
+        ]
+    )
+    assert len(frames) == 1
+    assert frames[0]["call_id"] == "c0"
+
+
+@pytest.mark.asyncio
+async def test_tool_args_empty_call_id_falls_back_to_vendor_index() -> None:
+    # call_id 为空时(协议说不该发生,但 #1278 落的是 ``tc.id or ""``)退回按
+    # **厂商给的** index 去重 —— 也就是这次改动之前的那个键。
+    frames = await _tool_frames_from_openai_chunks(
+        [
+            _oa({"index": 0, "function": {"name": "search"}}),
+            _oa({"index": 0, "function": {"name": "search"}}),  # 同一次调用,重复宣告
+            _oa({"index": 1, "function": {"name": "calc"}}),
+        ]
+    )
+    assert len(frames) == 2
+    assert [f["tool_index"] for f in frames] == [0, 1]
+    assert [f["call_id"] for f in frames] == ["", ""]
+
+
+@pytest.mark.asyncio
+async def test_tool_args_without_call_id_or_index_is_announced_not_swallowed() -> None:
+    # 既没 call_id 又没厂商 index —— 没有任何身份可言,于是没有东西可去重:
+    # 照发。重复的预览卡客户端看得见(updates 帧才是权威,它会纠正),被吞掉
+    # 的调用客户端永远看不见,正是本 PR 要杀的那一类。
+    frames = await _tool_frames_from_openai_chunks(
+        [
+            _oa({"function": {"name": "search"}}),
+            _oa({"function": {"name": "calc"}}),
+        ]
+    )
+    assert len(frames) == 2
+    assert [f["name"] for f in frames] == ["search", "calc"]
+
+
 def test_feed_passthrough_when_both_guards_off() -> None:
     """P3 —— dlp/screen 双关时无 64 字符 hold:feed 立即全量返回。"""
     r = StreamingRedactor(dlp=False, screen=False)
