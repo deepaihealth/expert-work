@@ -130,7 +130,7 @@ export default withMermaid(
                 { text: "8.9 413 附件超过大小上限", link: "/guide/errors#_8-9-413-附件超过大小上限" },
                 { text: "8.10 422 请求参数不合法", link: "/guide/errors#_8-10-422-请求参数不合法" },
                 { text: "8.11 429 请求过于频繁或配额用尽", link: "/guide/errors#_8-11-429-请求过于频繁或配额用尽" },
-                { text: "8.12 500 服务端存储配置问题", link: "/guide/errors#_8-12-500-服务端存储配置问题" },
+                { text: "8.12 500 服务端内部错误", link: "/guide/errors#_8-12-500-服务端内部错误" },
                 { text: "8.13 502 上传文件时遇到上游错误", link: "/guide/errors#_8-13-502-上传文件时遇到上游错误" },
                 { text: "8.14 503 服务不可用", link: "/guide/errors#_8-14-503-服务不可用" },
                 { text: "8.15 504 请求超过截止时间", link: "/guide/errors#_8-15-504-请求超过截止时间" },
