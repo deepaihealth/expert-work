@@ -29,7 +29,7 @@ from uuid import UUID
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from control_plane.api._session_title import message_text
+from expert_work.common.conversation_channel import visible_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import MessageTurn
 
@@ -66,60 +66,25 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
     从 :func:`read_turns` 拆出的纯函数(P2)。拆的目的是让「对外消息列表」
     与「会话 message_count」共用同一个定义 —— 镜像表那摊语义债的根因正是
     两套定义各写各的然后漂了。任何一侧改口径,另一侧自动跟随。
+
+    轮次抽取 + ``channel`` 判定本体在
+    :func:`expert_work.common.conversation_channel.visible_turns` —— 对话条目
+    (``conversation_derive``)要给出同一个 ``channel``,而 orchestrator 不能
+    import control-plane,所以那条规则住在 common。本函数只负责把可见轮次映射
+    成 :class:`MessageTurn` 并补上写入侧盖的时间戳 / run 归属(它们是
+    control-plane 的 ``datetime`` / ``UUID`` 形态,不进 common 的纯结构层)。
     """
-    # Each row records whether IT opens a new segment, decided purely from its
-    # own kwargs — never from list position. That keeps "channel" independent
-    # of ``include_hidden`` (a hidden feedback row filtered out of the UI view
-    # must not silently move a segment boundary relative to the faithful audit
-    # view, which would report a different set of "final" rows for the same
-    # thread) and lets a scheduled-delivery ``AIMessage`` (trigger_delivery.py
-    # ``inject_delivery``, tagged ``expert_work_scheduled_delivery``) open its
-    # OWN segment instead of being appended onto — and stealing "final" from —
-    # the user's real answer.
-    collected: list[tuple[int, str, str, bool, bool, datetime | None, UUID | None]] = []
-    for seq, m in enumerate(raw_messages):
-        mtype = getattr(m, "type", None)
-        if mtype not in ("human", "ai"):
-            continue
-        ak = getattr(m, "additional_kwargs", None) or {}
-        hidden = bool(ak.get("expert_work_hide_from_ui"))
-        if not include_hidden and hidden:
-            continue
-        text = message_text(getattr(m, "content", ""))
-        if not text.strip():
-            continue
-        has_tool_calls = mtype == "ai" and bool(getattr(m, "tool_calls", None))
-        starts_segment = (mtype == "human" and not hidden) or (
-            mtype == "ai" and bool(ak.get("expert_work_scheduled_delivery"))
-        )
-        created_at = _parse_stamp_created_at(ak)
-        run_id = _parse_stamp_run_id(ak)
-        collected.append((seq, mtype, text, has_tool_calls, starts_segment, created_at, run_id))
     out: list[MessageTurn] = []
-    for i, (seq, mtype, text, has_tool_calls, _starts_segment, created_at, run_id) in enumerate(
-        collected
-    ):
-        if mtype == "human":
-            out.append(
-                MessageTurn(
-                    seq=seq, role="user", content=text, created_at=created_at, run_id=run_id
-                )
-            )
-            continue
-        # Channel is structural (spec): an assistant turn is "final" iff it is
-        # the last visible turn of its user-delimited segment AND carries no
-        # tool_calls; every other assistant turn is "commentary".
-        nxt = collected[i + 1] if i + 1 < len(collected) else None
-        last_in_segment = nxt is None or nxt[4]
-        channel = "final" if last_in_segment and not has_tool_calls else "commentary"
+    for turn in visible_turns(raw_messages, include_hidden=include_hidden):
+        ak = getattr(raw_messages[turn.seq], "additional_kwargs", None) or {}
         out.append(
             MessageTurn(
-                seq=seq,
-                role="assistant",
-                content=text,
-                channel=channel,
-                created_at=created_at,
-                run_id=run_id,
+                seq=turn.seq,
+                role=turn.role,
+                content=turn.text,
+                channel=turn.channel,
+                created_at=_parse_stamp_created_at(ak),
+                run_id=_parse_stamp_run_id(ak),
             )
         )
     return out

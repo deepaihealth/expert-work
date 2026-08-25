@@ -36,6 +36,27 @@ DATAMARK_GLYPH = "▁"  # ▁ LOWER ONE EIGHTH BLOCK
 
 _WS = re.compile(r"\s+")
 
+#: The fence's two halves, split so the wrapper and :func:`unspotlight` are
+#: built from ONE definition of the marker syntax — a fence format that only
+#: the wrapper knows would leave the un-wrapper silently passing markers
+#: through to the product surface the day either side is edited.
+_FENCE_OPEN_PREFIX = "«UNTRUSTED nonce="
+_FENCE_CLOSE_PREFIX = "«/UNTRUSTED nonce="
+_FENCE_END = "»"
+
+# The trailing / leading newline in each pattern is the one the wrapper itself
+# inserted, so stripping it restores the content's own line structure instead
+# of leaving a blank line where the fence stood. ``[^»]*`` for the nonce: the
+# marker syntax forbids ``»`` inside it, and matching any nonce (not just one
+# known value) is what lets a reader un-wrap content whose per-run nonce it
+# never saw.
+_FENCE_OPEN_RE = re.compile(
+    re.escape(_FENCE_OPEN_PREFIX) + r"[^»]*" + re.escape(_FENCE_END) + "\n?"
+)
+_FENCE_CLOSE_RE = re.compile(
+    "\n?" + re.escape(_FENCE_CLOSE_PREFIX) + r"[^»]*" + re.escape(_FENCE_END)
+)
+
 #: Appended to the system prompt when spotlighting is on. Explains the
 #: markers + datamarking and draws the hard line: delimited content is data,
 #: never instructions.
@@ -76,7 +97,35 @@ def spotlight_untrusted(content: str, *, nonce: str) -> str:
         msg = "nonce must be a non-empty unguessable string"
         raise ValueError(msg)
     marked = datamark(content)
-    return f"«UNTRUSTED nonce={nonce}»\n{marked}\n«/UNTRUSTED nonce={nonce}»"
+    open_marker = f"{_FENCE_OPEN_PREFIX}{nonce}{_FENCE_END}"
+    close_marker = f"{_FENCE_CLOSE_PREFIX}{nonce}{_FENCE_END}"
+    return f"{open_marker}\n{marked}\n{close_marker}"
+
+
+def unspotlight(text: str) -> str:
+    """Strip the spotlight wrapping — the product-facing inverse of
+    :func:`spotlight_untrusted`.
+
+    The wrapping exists for the *model*; showing it to a person (or to a
+    third-party client rendering a tool result) is showing them the internal
+    representation. This is the one place that translates back, so the
+    conversation-item layer, the debug console and any future reader agree on
+    what "the tool said" means.
+
+    **Not a bijection.** :func:`datamark` collapses every whitespace run to
+    ``▁`` + one space, so the original newlines and indentation are gone
+    before this function ever sees the text — it recovers the words, not the
+    layout. That loss is inherent to datamarking, not something a smarter
+    un-wrapper could undo.
+
+    Safe on text that was never wrapped (nothing matches → returned
+    unchanged) and on text where the fence is only part of the value — e.g.
+    a tool result whose expert-work-owned overflow footer was appended
+    *outside* the fence (``builder._invoke_tool``): the footer is trusted
+    text and survives verbatim.
+    """
+    stripped = _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", text))
+    return stripped.replace(DATAMARK_GLYPH, "")
 
 
 __all__ = [
@@ -84,4 +133,5 @@ __all__ = [
     "SPOTLIGHT_SYSTEM_CLAUSE",
     "datamark",
     "spotlight_untrusted",
+    "unspotlight",
 ]
