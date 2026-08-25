@@ -125,6 +125,11 @@ export interface HistoryMessage {
   /** Structural output channel (backend read_turns): assistant rows carry
    *  "commentary" | "final"; user rows are null. Absent on old payloads. */
   channel?: "commentary" | "final" | null;
+  /** The run that produced this message (backend ``expert_work_run_id``
+   *  stamp). ``null`` on messages written before the stamp shipped — never
+   *  backfilled — so ``buildHistoryTurns`` treats a single null as "this
+   *  thread can't be grouped by run" and falls back to order pairing. */
+  run_id?: string | null;
 }
 
 export async function getSessionMessages(

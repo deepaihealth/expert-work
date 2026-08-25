@@ -2,14 +2,26 @@
  * Pair a resumed thread's flat message history with its runs so each past
  * turn can be rebuilt as a full (lazy) TurnCard. The run event stream does
  * NOT carry the user input (it's the graph input, kept in the checkpoint),
- * so the input text comes from ``/messages`` here, paired to the run that
- * produced it by ORDER — user turn ``i`` ↔ ``runs[i]`` (runs oldest-first).
+ * so the input text comes from ``/messages`` here.
+ *
+ * Two pairing strategies, picked by what the data supports:
+ *
+ * 1. BY ``run_id`` — every message carries the run that produced it (the
+ *    backend's ``expert_work_run_id`` stamp), so grouping is exact and none
+ *    of the order-pairing guards below apply. This is what stops an approval
+ *    from flattening the page: the paused run and its continuation own their
+ *    own messages, and a continuation legitimately owns no user message at
+ *    all (it resumes the paused turn's checkpoint) — an empty ``input``, not
+ *    a reason to degrade.
+ * 2. BY ORDER — user turn ``i`` ↔ ``runs[i]`` (runs oldest-first). The
+ *    fallback for messages written before the stamp shipped; they are never
+ *    backfilled, so this path has to keep working forever.
  *
  * ``is_resume`` is deliberately ignored: it means "not the thread's first
- * run", not "approval continuation", so it can't delimit turns. A count
- * mismatch (an approval that split one turn across 2 runs, an auto-triggered
- * or errored run) is the honest signal that order-pairing is unsafe — we
- * return ``null`` and the caller falls back to flat text.
+ * run", not "approval continuation", so it can't delimit turns. On the ORDER
+ * path a count mismatch (an approval that split one turn across 2 runs, an
+ * auto-triggered or errored run) is the honest signal that pairing is
+ * unsafe — we return ``null`` and the caller falls back to flat text.
  *
  * A single run can emit several assistant messages (multi-step turns), so
  * ``fallbackLines`` collects every assistant message between a user turn
@@ -41,10 +53,71 @@ export interface HistoryTurn {
   createdAt: string | null;
 }
 
+/** Group the messages by their owning run, or ``null`` if grouping them is
+ *  not unambiguous — in which case the caller must stay on the ORDER path.
+ *
+ *  Two things make it ambiguous, and mixing strategies is worse than either:
+ *
+ *  - ANY message without a ``run_id`` (written before the stamp shipped, never
+ *    backfilled): it cannot be placed in a group at all, while order pairing
+ *    does have a place for it. One such row disqualifies the whole thread.
+ *  - A run owning MORE THAN ONE user row: the faithful cross-tenant audit view
+ *    (``include_hidden=true``) keeps the orchestrator's ``<recovery-advisory>``
+ *    HumanMessage, which is stamped with the same run as the real input, so
+ *    "the run's user message" no longer has one answer. Order pairing degrades
+ *    to flat text there, which at least shows both rows; grouping would have
+ *    to silently drop one — in the view whose whole point is faithfulness.
+ *
+ *  An empty message list is NOT grouped either: there is nothing to group, so
+ *  it is no evidence that this thread is stamped. It happens for real — the
+ *  backend's transcript read is best-effort and degrades to ``[]`` — and
+ *  switching strategy there would turn a "no history" page into one empty
+ *  input card per run. */
+function groupMessagesByRun(
+  messages: readonly HistoryMessage[],
+): Map<string, HistoryMessage[]> | null {
+  if (messages.length === 0) return null;
+  const byRun = new Map<string, HistoryMessage[]>();
+  for (const m of messages) {
+    const runId = m.run_id;
+    if (!runId) return null;
+    const own = byRun.get(runId);
+    if (own) {
+      if (m.role === "user" && own.some((o) => o.role === "user")) return null;
+      own.push(m);
+    } else {
+      byRun.set(runId, [m]);
+    }
+  }
+  return byRun;
+}
+
 export function buildHistoryTurns(
   messages: readonly HistoryMessage[],
   runs: readonly ThreadRunSummary[],
 ): HistoryTurn[] | null {
+  const byRun = groupMessagesByRun(messages);
+  if (byRun) {
+    // ``runs`` drives the rendered timeline, so it — not the message list —
+    // decides which turns exist. Messages whose run is absent from it belong
+    // to runs outside this page and are ignored on purpose; no run of this
+    // page can lose content that way.
+    return runs.map((r) => {
+      const own = byRun.get(r.runId) ?? [];
+      return {
+        key: r.runId,
+        input: own.find((m) => m.role === "user")?.content ?? "",
+        fallbackLines: own
+          .filter((m) => m.role !== "user")
+          .map((m) => ({ text: m.content, channel: m.channel ?? null })),
+        runId: r.runId,
+        status: r.status,
+        tokens: r.tokens,
+        createdAt: r.createdAt ?? null,
+      };
+    });
+  }
+
   const pairs: { input: string; answers: FallbackLine[] }[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
