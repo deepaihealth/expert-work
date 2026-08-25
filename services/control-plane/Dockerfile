@@ -40,6 +40,16 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 COPY pyproject.toml uv.lock ./
 COPY packages/ packages/
 COPY services/ services/
+# uv 默认并发下载 50 个包。从这个网络出去,几十条连接同时拉
+# files.pythonhosted.org 会集体撞上默认 30 秒超时 —— 2026-08-25 一次发布
+# 连挂四次,全停在这一行,报的都是 `operation timed out`。
+#
+# 判据是「单连接好、并发坏」:同一时刻在容器里单独拉那个报错的 wheel
+# (certifi)3.1 秒就完整下来了,所以不是连不上、不是 DNS、也不是墙。
+# 换 PyPI 镜像源治不了这个 —— uv.lock 把每个 wheel 的完整 URL 和哈希都
+# 钉死了,`--frozen` 直接照那个 URL 拉,index 配置在下载阶段根本不参与。
+ENV UV_CONCURRENT_DOWNLOADS=8 \
+    UV_HTTP_TIMEOUT=120
 RUN uv sync --frozen --no-dev --no-editable --package expert-work-control-plane
 
 
