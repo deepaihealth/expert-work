@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from control_plane.api import agents as agents_mod
 from control_plane.api._idempotency import request_digest as compute_request_digest
 from control_plane.api.agents import ExternalRunRequest
 from control_plane.api.external_events import build_events_response
@@ -760,16 +761,14 @@ async def test_stream_format_reaches_spawn_run(
     ``ExternalRunRequest`` 是 ``extra="forbid"``,所以这条测试还顺带证明这个字段
     真的被声明了 —— 没声明的话请求在到达 ``spawn_run`` 之前就 422 了。
     """
-    import control_plane.api.agents as mod
-
-    real = mod.spawn_run
+    real = agents_mod.spawn_run
     seen: list[Any] = []
 
     async def spy(**kwargs: Any) -> Any:
         seen.append(kwargs.get("stream_format"))
         return await real(**kwargs)
 
-    monkeypatch.setattr(mod, "spawn_run", spy)
+    monkeypatch.setattr(agents_mod, "spawn_run", spy)
 
     resp = await external_client.post(
         f"/v1/agents/{plain_agent.code}/runs",
@@ -785,16 +784,14 @@ async def test_stream_format_defaults_to_legacy_on_spawn(
     external_client: AsyncClient, plain_agent: _Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """不传时是 legacy —— 已在对接的第三方零感知。"""
-    import control_plane.api.agents as mod
-
-    real = mod.spawn_run
+    real = agents_mod.spawn_run
     seen: list[Any] = []
 
     async def spy(**kwargs: Any) -> Any:
         seen.append(kwargs.get("stream_format"))
         return await real(**kwargs)
 
-    monkeypatch.setattr(mod, "spawn_run", spy)
+    monkeypatch.setattr(agents_mod, "spawn_run", spy)
 
     resp = await external_client.post(
         f"/v1/agents/{plain_agent.code}/runs", json={"user_id": "u1", "mode": "queue"}
@@ -813,16 +810,14 @@ async def test_stream_format_survives_an_idempotent_replay(
     这是四个入口里最容易漏的一个:重放走的是另一个函数,漏接线时同一个客户端的
     重试会拿回 legacy,而它第一次拿到的是条目。
     """
-    import control_plane.api.agents as mod
-
-    real = mod._idempotent_run_response
+    real = agents_mod._idempotent_run_response
     seen: list[Any] = []
 
     async def spy(run: Any, **kwargs: Any) -> Any:
         seen.append(kwargs.get("stream_format"))
         return await real(run, **kwargs)
 
-    monkeypatch.setattr(mod, "_idempotent_run_response", spy)
+    monkeypatch.setattr(agents_mod, "_idempotent_run_response", spy)
 
     body = {"user_id": "u1", "input": "你好", "mode": "queue", "stream_format": "items"}
     headers = {"Idempotency-Key": "items-replay-1"}
