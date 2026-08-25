@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from orchestrator.llm.providers._streaming import (
@@ -16,6 +17,42 @@ from orchestrator.llm.providers.openai import _from_openai_response
 
 def _chunk(delta: dict[str, Any], *, finish: str | None = None, **top: Any) -> dict[str, Any]:
     return {"choices": [{"delta": delta, "finish_reason": finish}], **top}
+
+
+def _tc(
+    *,
+    index: int | None = None,
+    id: str | None = None,
+    name: str | None = None,
+    args: str = "",
+) -> dict[str, Any]:
+    """One vendor ``delta.tool_calls[]`` entry.
+
+    ``index=None`` OMITS the key entirely — the shape a vendor would put on
+    the wire if it did not number its tool-call fragments. We have never
+    captured such traffic; these are the defensive-path fixtures.
+    """
+    entry: dict[str, Any] = {}
+    if index is not None:
+        entry["index"] = index
+    if id is not None:
+        entry["id"] = id
+    fn: dict[str, Any] = {}
+    if name is not None:
+        fn["name"] = name
+    if args:
+        fn["arguments"] = args
+    entry["function"] = fn
+    return entry
+
+
+def _feed(asm: OpenAIStreamAssembler, *entries: dict[str, Any], finish: str | None = None) -> None:
+    """Push ONE SSE chunk carrying ``entries`` into the assembler."""
+    asm.add(delta_from_openai_chunk(_chunk({"tool_calls": list(entries)}, finish=finish)))
+
+
+def _summary(msg: AIMessage) -> list[tuple[str, str, dict[str, Any]]]:
+    return [(tc["id"], tc["name"], tc["args"]) for tc in msg.tool_calls]
 
 
 def test_delta_content_and_progress() -> None:
@@ -192,6 +229,145 @@ def test_assembler_interrupted_drops_incomplete_tool_call() -> None:
     assert got.content == "partial answer"
     assert got.tool_calls == []
     assert got.response_metadata.get("finish_reason") == "stream_idle_timeout"
+
+
+# --- missing ``index`` on tool-call fragments -------------------------------
+# A vendor that omits ``delta.tool_calls[].index`` used to have every fragment
+# folded onto slot 0, silently MERGING distinct calls into one (the first call
+# disappeared and the concatenated arguments usually failed to parse). The
+# assembler now opens a new slot instead. No user-visible error was ever
+# raised for this, so these are the only guards.
+
+
+def test_assembler_unindexed_tool_calls_do_not_collapse() -> None:
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(id="c0", name="search", args='{"q": "hi"}'))
+    _feed(asm, _tc(id="c1", name="calc", args='{"n": 2}'), finish="tool_calls")
+    got = asm.build()
+
+    # Count first: "the two did not merge" is also true of an assembler that
+    # dropped both, so the count has to be pinned before the contents.
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+def test_assembler_unindexed_tool_calls_in_one_chunk_do_not_collapse() -> None:
+    # Same wire fact, batched shape: both calls in a single chunk.
+    asm = OpenAIStreamAssembler()
+    _feed(
+        asm,
+        _tc(id="c0", name="search", args='{"q": "hi"}'),
+        _tc(id="c1", name="calc", args='{"n": 2}'),
+        finish="tool_calls",
+    )
+    got = asm.build()
+
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+def test_assembler_unindexed_arg_fragments_continue_the_open_call() -> None:
+    # Arguments-only fragments carry no id/name, so they must CONTINUE the
+    # call opened by the last fragment — not open a call of their own.
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(id="c0", name="search", args='{"q": '))
+    _feed(asm, _tc(args='"hi"'))
+    _feed(asm, _tc(args="}"), finish="tool_calls")
+    got = asm.build()
+
+    assert len(got.tool_calls) == 1
+    assert _summary(got) == [("c0", "search", {"q": "hi"})]
+
+
+def test_assembler_mixed_indexed_then_unindexed_tool_calls() -> None:
+    # An indexed slot and an unindexed one must never share a slot key.
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(index=0, id="c0", name="search", args='{"q": "hi"}'))
+    _feed(asm, _tc(id="c1", name="calc", args='{"n": 2}'), finish="tool_calls")
+    got = asm.build()
+
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+def test_assembler_index_on_head_fragment_only() -> None:
+    # A vendor that numbers only the fragment carrying id/name: the untagged
+    # tails must land on their own call, not on slot 0 or on a fresh slot.
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(index=0, id="c0", name="search", args='{"q": '))
+    _feed(asm, _tc(args='"hi"}'))
+    _feed(asm, _tc(index=1, id="c1", name="calc", args='{"n": '))
+    _feed(asm, _tc(args="2}"), finish="tool_calls")
+    got = asm.build()
+
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+# --- regression net: the indexed path (the shape the wire spec mandates) ----
+
+
+@pytest.mark.parametrize(
+    ("first_index", "second_index"),
+    [
+        (0, 1),  # ascending — the ordinary shape
+        (1, 0),  # non-ascending — emission order is first-seen, not sorted
+        (0, 7),  # sparse — gaps are not slots
+    ],
+    ids=["ascending", "non-ascending", "sparse"],
+)
+def test_assembler_indexed_tool_calls_unchanged(first_index: int, second_index: int) -> None:
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(index=first_index, id="c0", name="search", args='{"q": "hi"}'))
+    _feed(asm, _tc(index=second_index, id="c1", name="calc", args='{"n": 2}'), finish="tool_calls")
+    got = asm.build()
+
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+def test_assembler_indexed_fragments_interleave_by_index() -> None:
+    # The load-bearing property of the indexed path: fragments route by index
+    # even when two calls stream interleaved.
+    asm = OpenAIStreamAssembler()
+    _feed(asm, _tc(index=0, id="c0", name="search", args='{"q": '))
+    _feed(asm, _tc(index=1, id="c1", name="calc", args='{"n": '))
+    _feed(asm, _tc(index=0, args='"hi"}'))
+    _feed(asm, _tc(index=1, args="2}"), finish="tool_calls")
+    got = asm.build()
+
+    assert len(got.tool_calls) == 2
+    assert _summary(got) == [
+        ("c0", "search", {"q": "hi"}),
+        ("c1", "calc", {"n": 2}),
+    ]
+
+
+def test_delta_tool_call_index_presence_is_recorded() -> None:
+    with_index = delta_from_openai_chunk(_chunk({"tool_calls": [_tc(index=0, id="c0")]}))
+    assert with_index.tool_calls == (ToolCallChunk(index=0, id="c0"),)
+    assert with_index.tool_calls[0].index_missing is False
+
+    without = delta_from_openai_chunk(_chunk({"tool_calls": [_tc(id="c0")]}))
+    assert without.tool_calls[0].index_missing is True
+    # ``index`` keeps its 0 fallback — TokenSink keys a dedup map on it and is
+    # deliberately outside this fix.
+    assert without.tool_calls[0].index == 0
 
 
 def test_supports_streaming_true_for_streaming_provider() -> None:

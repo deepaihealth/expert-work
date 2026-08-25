@@ -28,12 +28,19 @@ class ToolCallChunk:
     ``id`` and ``name`` arrive once (first fragment for that index);
     ``args_fragment`` accumulates across fragments into the full JSON
     argument string.
+
+    ``index_missing`` records that the vendor sent NO ``index`` on this
+    fragment — ``index`` then holds the 0 fallback, which is a usable
+    dedup key but NOT a slot identity (two unindexed calls would share
+    it). :class:`OpenAIStreamAssembler` consults the flag rather than
+    ``index`` when deciding which call a fragment belongs to.
     """
 
     index: int
     id: str | None = None
     name: str | None = None
     args_fragment: str = ""
+    index_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,13 +91,15 @@ def delta_from_openai_chunk(chunk: Mapping[str, Any]) -> LLMDelta:
                 continue
             fn_raw = tc.get("function")
             fn: Mapping[str, Any] = fn_raw if isinstance(fn_raw, Mapping) else {}
-            idx = tc.get("index")
+            raw_index = tc.get("index")
+            idx: int | None = raw_index if isinstance(raw_index, int) else None
             tool_calls.append(
                 ToolCallChunk(
-                    index=idx if isinstance(idx, int) else 0,
+                    index=idx if idx is not None else 0,
                     id=str(tc["id"]) if tc.get("id") else None,
                     name=str(fn["name"]) if fn.get("name") else None,
                     args_fragment=str(fn.get("arguments") or ""),
+                    index_missing=idx is None,
                 )
             )
 
@@ -117,6 +126,13 @@ class _ToolAcc:
         self.args: list[str] = []
 
 
+#: One accumulator slot in :class:`OpenAIStreamAssembler`. Vendor-supplied
+#: ``index`` values live in the ``"i"`` namespace, slots synthesized for
+#: fragments that arrived WITHOUT an ``index`` live in ``"s"`` — the two can
+#: never collide, so an unindexed call cannot land on an indexed one's slot.
+_SlotKey = tuple[str, int]
+
+
 class OpenAIStreamAssembler:
     """Accumulate :class:`LLMDelta` chunks into a synthetic non-streaming
     body, then decode with the shared
@@ -126,12 +142,40 @@ class OpenAIStreamAssembler:
     def __init__(self) -> None:
         self._content: list[str] = []
         self._reasoning: list[str] = []
-        self._tools: dict[int, _ToolAcc] = {}
-        self._tool_order: list[int] = []
+        self._tools: dict[_SlotKey, _ToolAcc] = {}
+        self._tool_order: list[_SlotKey] = []
+        self._last_slot: _SlotKey | None = None
+        self._next_synthetic = 0
         self._usage: Mapping[str, Any] | None = None
         self._model: str | None = None
         self._fingerprint: str | None = None
         self._finish: str | None = None
+
+    def _slot_for(self, tc: ToolCallChunk) -> _SlotKey:
+        """Which accumulator this fragment belongs to.
+
+        A fragment carrying ``index`` — what the OpenAI Chat Completions
+        wire defines, so the overwhelmingly common case — takes the first
+        branch: one slot per index, byte-for-byte the behavior that
+        existed before this method, so interleaved fragments still route
+        by index.
+
+        ``index`` is spec-mandated, but we have never captured vendor SSE
+        to confirm that every compat vendor actually sends it, so its
+        absence is handled defensively. Arrival order on the wire is then
+        the only signal left: a fragment carrying ``id``/``name`` OPENS a
+        call, and an arguments-only fragment CONTINUES the one most
+        recently touched. Folding them all onto index 0 instead merged
+        distinct calls into one — silently, since the concatenated
+        arguments then fail to parse and decode to ``{}``.
+        """
+        if not tc.index_missing:
+            return ("i", tc.index)
+        if self._last_slot is None or tc.id is not None or tc.name is not None:
+            slot = ("s", self._next_synthetic)
+            self._next_synthetic += 1
+            return slot
+        return self._last_slot
 
     def add(self, delta: LLMDelta) -> None:
         if delta.content:
@@ -139,11 +183,13 @@ class OpenAIStreamAssembler:
         if delta.reasoning:
             self._reasoning.append(delta.reasoning)
         for tc in delta.tool_calls:
-            acc = self._tools.get(tc.index)
+            slot = self._slot_for(tc)
+            self._last_slot = slot
+            acc = self._tools.get(slot)
             if acc is None:
                 acc = _ToolAcc()
-                self._tools[tc.index] = acc
-                self._tool_order.append(tc.index)
+                self._tools[slot] = acc
+                self._tool_order.append(slot)
             if tc.id is not None:
                 acc.id = tc.id
             if tc.name is not None:
@@ -165,8 +211,8 @@ class OpenAIStreamAssembler:
 
         content = "".join(self._content)
         tool_calls: list[dict[str, Any]] = []
-        for idx in self._tool_order:
-            acc = self._tools[idx]
+        for slot in self._tool_order:
+            acc = self._tools[slot]
             args_str = "".join(acc.args)
             if interrupted and not _is_valid_json_object(args_str):
                 # A tool call whose arguments never completed cannot be

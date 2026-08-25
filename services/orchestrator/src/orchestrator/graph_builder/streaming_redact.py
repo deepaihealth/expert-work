@@ -25,7 +25,7 @@ from expert_work.common.dlp import scan_and_redact
 from expert_work.common.output_screen import screen_output
 
 if TYPE_CHECKING:
-    from orchestrator.llm.providers._streaming import LLMDelta
+    from orchestrator.llm.providers._streaming import LLMDelta, ToolCallChunk
 
 #: Characters held back from the tail of the (redacted) buffer on each feed.
 #: Two-sided invariant — HOLD_CHARS must be:
@@ -160,14 +160,39 @@ class StreamingRedactor:
 #: run_agent via ``TOKEN_SINK_KEY``; see graph_builder/_config.py).
 TokenPublish = Callable[[dict[str, Any]], Awaitable[None]]
 
+#: Identity of one announced tool call, namespaced so an id can never collide
+#: with an index. ``None`` means "this fragment has no identity at all".
+_AnnounceKey = tuple[str, str | int]
+
+
+def _announce_key(tc: ToolCallChunk) -> _AnnounceKey | None:
+    """Dedup identity for one named ``tool_args`` fragment.
+
+    ``call_id`` is the real identity — it is what the client pairs on, and it
+    is stable whatever the vendor does with ``index``. ``index`` is only a
+    fallback for the ``tc.id or ""`` hole, and only when the VENDOR actually
+    supplied it: a missing ``index`` is parsed as 0, so keying on it made two
+    different calls share one key and deduped the second tool's frame away.
+
+    Neither key available means no identity, so there is nothing to dedup by —
+    emit. A duplicate preview card is visible and the authoritative ``updates``
+    frame corrects it; a swallowed one is invisible.
+    """
+    if tc.id:
+        return ("id", tc.id)
+    if not tc.index_missing:
+        return ("idx", tc.index)
+    return None
+
 
 class TokenSink:
     """Per-run multi-channel token emitter (子项目 2 content + 3b reasoning/tool_args).
 
     One :class:`StreamingRedactor` per *text* channel (content, reasoning —
     independent buffered-release streams); tool-call *names* are emitted once
-    per ``index`` when first seen. Each streamed ``LLMDelta`` publishes the
-    newly-stable redacted text of each text channel; ``flush`` releases the
+    per call when first seen (see :func:`_announce_key`). Each streamed
+    ``LLMDelta`` publishes the newly-stable redacted text of each text
+    channel; ``flush`` releases the
     buffered-release tails after the router returns. Tool *arguments* are NOT
     streamed — they reach the client via the authoritative ``updates`` frame
     (name-only, 子项目 3b decision), so there is no argument-redaction path.
@@ -182,10 +207,13 @@ class TokenSink:
       OpenAI index's first fragment carries both), and this sink emits exactly
       on "name seen" — so a named chunk always has an id.
     * ``tool_index`` (``ToolCallChunk.index``) — the per-connection dedup key
-      only. Its meaning is provider-specific: OpenAI's is the assistant
-      message's ``tool_calls[]`` subscript, but Anthropic's is the ``content``
-      block index, which text and thinking blocks also consume. It is NOT an
-      array subscript in general and must never be used to pair.
+      only, and the CLIENT's: this sink dedups on ``call_id``
+      (:func:`_announce_key`), because a vendor that omits ``index`` has it
+      parsed as 0 and two calls would share it. Its meaning is
+      provider-specific: OpenAI's is the assistant message's ``tool_calls[]``
+      subscript, but Anthropic's is the ``content`` block index, which text and
+      thinking blocks also consume. It is NOT an array subscript in general and
+      must never be used to pair.
     """
 
     def __init__(self, *, step: int, publish: TokenPublish, dlp: bool, screen: bool) -> None:
@@ -193,7 +221,7 @@ class TokenSink:
         self._publish = publish
         self._content = StreamingRedactor(dlp=dlp, screen=screen)
         self._reasoning = StreamingRedactor(dlp=dlp, screen=screen)
-        self._tool_names: dict[int, str] = {}
+        self._announced: set[_AnnounceKey] = set()
         #: ``time.monotonic()`` of the first non-empty delta; agent_node uses
         #: it to compute ``first_token_ms``.
         self.first_delta_at: float | None = None
@@ -208,17 +236,22 @@ class TokenSink:
         if rsafe:
             await self._publish({"step": self._step, "channel": "reasoning", "text": rsafe})
         for tc in delta.tool_calls:
-            if tc.name and tc.index not in self._tool_names:
-                self._tool_names[tc.index] = tc.name
-                await self._publish(
-                    {
-                        "step": self._step,
-                        "channel": "tool_args",
-                        "tool_index": tc.index,
-                        "call_id": tc.id or "",
-                        "name": tc.name,
-                    }
-                )
+            if not tc.name:
+                continue
+            key = _announce_key(tc)
+            if key is not None:
+                if key in self._announced:
+                    continue
+                self._announced.add(key)
+            await self._publish(
+                {
+                    "step": self._step,
+                    "channel": "tool_args",
+                    "tool_index": tc.index,
+                    "call_id": tc.id or "",
+                    "name": tc.name,
+                }
+            )
 
     async def flush(self) -> None:
         tail = self._content.flush()
