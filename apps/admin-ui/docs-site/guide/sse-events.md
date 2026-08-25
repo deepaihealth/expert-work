@@ -601,7 +601,7 @@ function onPlan(data) {
 三条需要知道的事实：
 
 - 「每一步」是子任务自己的步。子任务每完成一个步骤发一条 `kind` 为 `update` 的事件，与父 run 走到第几步无关。
-- 配对依靠 `parent_tool_call_id`。子任务就是那一次工具调用的执行体，所以这个值与 `updates` 里 `ai.tool_calls[].id` 相同，客户端据此把子时间线（工具卡下方展示子任务进展的那一段）挂到对应的工具卡下面。
+- 配对依靠 `parent_tool_call_id`。子任务就是那一次工具调用的执行体，所以这个值与 `updates` 里 `ai.tool_calls[].id` 相同，客户端据此把子时间线（工具卡下方展示子任务进展的那一段）挂到对应的工具卡下面。**只有 `depth` 为 `1` 的子任务这样挂**：`depth` 大于 `1` 的按 `parent_worker_id` 挂到上一级子任务下面，它们的 `parent_tool_call_id` 指向的是上一级子任务内部的一次工具调用，那个 id 不会出现在这条流的 `updates` 里。
 - 委托层级是 1 到 3 层，平台的硬上限是 3 层。
 
 `worker` 不是与 `updates` 并列的另一套结果通道，而是把 Agent 的内部动作展示出来。**一个步骤的最终结果仍然只以 `updates` 为准。**
@@ -1605,9 +1605,15 @@ curl -N "https://<your-domain>/v1/agents/{agent_code}/runs" \
 
 ### worker 仍是独立事件
 
-条目模式下 `worker` 不转成条目，仍按 3.4 的 `worker` 一节处理，靠 `parent_tool_call_id` 挂到对应的 `tool_call` 条目下方（它与 `tool_call` 的 `call_id` 同值）。
+条目模式下 `worker` 不转成条目，仍按 3.4 的 `worker` 一节处理，靠 `parent_tool_call_id` 挂到对应的 `tool_call` 条目下方（它与 `tool_call` 的 `call_id` 同值）。`depth` 大于 `1` 的子任务按 `parent_worker_id` 挂到上一级子任务下面，规则与 3.4 一致。
 
 这样安排是为了时机：把子任务进度并进工具卡，就必须等子任务结束才能发出这张卡的 `item.done`，工具调用在界面上会迟迟不出现。
+
+::: warning 这是两种取法唯一形态不同的地方
+子任务是唯一在事件流与历史接口之间形态不同的内容。事件流按发生顺序推送 `worker` 事件，客户端自己挂到工具卡下面；[5.8 对话条目](./query#_5-8-对话条目) 直接把拼好的结果放在 `tool_call` 条目的 `worker` 字段里，客户端不必再挂一次。
+
+要同时渲染历史与实时的客户端，这两条路径都要处理。其余每一种内容在两边都是同一个形状。
+:::
 
 ### 续传位置的取法不变
 

@@ -160,6 +160,7 @@ export default withMermaid(
                 { text: "10.5 断线重连与 since_seq", link: "/guide/examples#_10-5-断线重连与-since-seq" },
                 { text: "10.6 取消 run", link: "/guide/examples#_10-6-取消-run" },
                 { text: "10.7 审批决策", link: "/guide/examples#_10-7-审批决策" },
+                { text: "10.8 条目模式的接收器", link: "/guide/examples#_10-8-条目模式的接收器" },
               ],
             },
           ],

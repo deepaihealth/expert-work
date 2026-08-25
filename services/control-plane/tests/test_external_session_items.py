@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -674,3 +675,351 @@ async def test_items_returns_run_level_info_when_the_checkpoint_is_gone(ctx: _Ct
         (str(run1), "boom", 3000),
         (str(run2), None, 2000),
     ]
+
+
+def _worker_frame(
+    kind: str,
+    *,
+    worker_id: str,
+    wseq: int,
+    data: dict[str, Any],
+    parent_worker_id: str | None = None,
+    parent_tool_call_id: str | None = None,
+    label: str = "调研员",
+    agent_ref: str = "dynamic:general",
+    depth: int = 1,
+) -> dict[str, Any]:
+    """一帧 ``worker`` —— 信封字段与 ``_worker_events.build_*_frame`` 逐一同名。"""
+    return {
+        "worker_id": worker_id,
+        "parent_worker_id": parent_worker_id,
+        "parent_tool_call_id": parent_tool_call_id,
+        "label": label,
+        "agent_ref": agent_ref,
+        "depth": depth,
+        "kind": kind,
+        "wseq": wseq,
+        "data": data,
+    }
+
+
+async def _seed_one_tool_call_turn(ctx: _Ctx, session_id: UUID, run_id: UUID) -> None:
+    """一轮:用户消息 → 一条带两次工具调用的助手消息。
+
+    两次调用是有意的 —— 只种一次的话「没派生子任务的工具调用不带 ``worker``
+    键」那条断言在回填整体失灵时同样成立。
+    """
+    await _seed_thread_messages(
+        ctx.checkpointer,
+        str(session_id),
+        [
+            HumanMessage(content="查一下夜间排班", additional_kwargs=_stamp(run_id, _BASE)),
+            AIMessage(
+                content="这就去",
+                additional_kwargs=_stamp(run_id, _BASE + timedelta(seconds=1)),
+                tool_calls=[
+                    {
+                        "id": "call-worker",
+                        "name": "spawn_worker",
+                        "args": {"task": "查排班"},
+                        "type": "tool_call",
+                    },
+                    {"id": "call-plain", "name": "search", "args": {}, "type": "tool_call"},
+                ],
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_items_backfills_the_worker_tree_onto_its_tool_call(ctx: _Ctx) -> None:
+    """深度 1 的子任务按 ``parent_tool_call_id`` 挂到发起它的工具调用上。
+
+    那个值就是 ``AIMessage.tool_calls[].id``,所以这一条不含任何猜测式配对。
+    """
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            make_event_record(
+                run_id=run_id,
+                seq=0,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-1",
+                    wseq=0,
+                    parent_tool_call_id="call-worker",
+                    data={"task_excerpt": "查排班", "role": "排班助手", "max_steps": 8},
+                ),
+            ),
+            make_event_record(
+                run_id=run_id,
+                seq=1,
+                event_name="worker",
+                data=_worker_frame(
+                    "update",
+                    worker_id="w-1",
+                    wseq=1,
+                    parent_tool_call_id="call-worker",
+                    data={
+                        "node": "agent",
+                        "_duration_ms": 120,
+                        "step_count": 1,
+                        "messages": [{"type": "ai", "content_excerpt": "在查了"}],
+                    },
+                ),
+            ),
+            make_event_record(
+                run_id=run_id,
+                seq=2,
+                event_name="worker",
+                data=_worker_frame(
+                    "end",
+                    worker_id="w-1",
+                    wseq=2,
+                    parent_tool_call_id="call-worker",
+                    data={
+                        "outcome": "success",
+                        "iteration_used": 1,
+                        "llm_call_count": 3,
+                        "wall_clock_ms": 420,
+                    },
+                ),
+            ),
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+    assert set(calls) == {"call-worker", "call-plain"}
+
+    worker = calls["call-worker"]["worker"]
+    assert worker["worker_id"] == "w-1"
+    assert worker["label"] == "调研员"
+    assert worker["agent_ref"] == "dynamic:general"
+    assert worker["depth"] == 1
+    assert worker["task_excerpt"] == "查排班"
+    assert worker["role"] == "排班助手"
+    assert worker["max_steps"] == 8
+    assert worker["status"] == "success"
+    assert worker["summary"] == {
+        "iteration_used": 1,
+        "llm_call_count": 3,
+        "wall_clock_ms": 420,
+    }
+    assert worker["steps"] == [
+        {
+            "wseq": 1,
+            "node": "agent",
+            "step_count": 1,
+            "duration_ms": 120,
+            "messages": [{"type": "ai", "content_excerpt": "在查了"}],
+        }
+    ]
+    assert worker["children"] == []
+    # 拼树用的两个父指引不进条目 —— 嵌套关系本身已经表达了同一件事。
+    assert "parent_worker_id" not in worker
+    assert "parent_tool_call_id" not in worker
+    # 没派生子任务的那次调用整个键缺席(上面几条证明这不是「回填全失灵」)。
+    assert "worker" not in calls["call-plain"]
+
+
+@pytest.mark.asyncio
+async def test_items_hangs_deeper_workers_by_parent_worker_id(ctx: _Ctx) -> None:
+    """孙子任务按 ``parent_worker_id`` 挂树,不按 ``parent_tool_call_id``。
+
+    孙子任务的 ``parent_tool_call_id`` 指向子 run **内部**那次工具调用,那个 id
+    在父 run 的消息里根本不存在 —— 照它挂等于整棵挂丢。
+    """
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            make_event_record(
+                run_id=run_id,
+                seq=0,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-1",
+                    wseq=0,
+                    parent_tool_call_id="call-worker",
+                    data={"task_excerpt": "查排班", "role": None, "max_steps": 8},
+                ),
+            ),
+            make_event_record(
+                run_id=run_id,
+                seq=1,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-2",
+                    wseq=0,
+                    parent_worker_id="w-1",
+                    # 子 run 内部的 tool_call id —— 父 run 的消息里没有这个 id。
+                    parent_tool_call_id="inner-call",
+                    depth=2,
+                    label="核对员",
+                    data={"task_excerpt": "核对一遍", "role": None, "max_steps": 4},
+                ),
+            ),
+            make_event_record(
+                run_id=run_id,
+                seq=2,
+                event_name="worker",
+                data=_worker_frame(
+                    "end",
+                    worker_id="w-2",
+                    wseq=1,
+                    parent_worker_id="w-1",
+                    parent_tool_call_id="inner-call",
+                    depth=2,
+                    label="核对员",
+                    data={
+                        "outcome": "max_steps",
+                        "iteration_used": 4,
+                        "llm_call_count": 4,
+                        "wall_clock_ms": 900,
+                    },
+                ),
+            ),
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+    # 根先立住 —— 下面「孙子任务没挂成根」才不是空集合上的恒真。
+    root = calls["call-worker"]["worker"]
+    assert root["worker_id"] == "w-1"
+    # 孙子任务挂进根的 children,状态与摘要照给。
+    assert [c["worker_id"] for c in root["children"]] == ["w-2"]
+    assert root["children"][0]["depth"] == 2
+    assert root["children"][0]["label"] == "核对员"
+    assert root["children"][0]["status"] == "max_steps"
+    assert root["children"][0]["task_excerpt"] == "核对一遍"
+    # 子 run 内部那个 id 没有变成任何一次工具调用的挂载键。
+    assert "inner-call" not in calls
+    assert all(i["worker"]["worker_id"] != "w-2" for i in calls.values() if "worker" in i)
+    # 根还没收到 ``end``,停在 ``running`` —— 不编一个结局。
+    assert root["status"] == "running"
+    assert root["summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_orphan_worker_is_dropped_not_promoted_to_a_root(ctx: _Ctx) -> None:
+    """父不在场的子任务**整棵丢弃**,绝不落下去按 ``parent_tool_call_id`` 挂。
+
+    这是分层规则的另一半(前一条测的是「有父时挂父」)。丢弃看着像是在浪费
+    数据,但替代方案更坏:孙子任务的 ``parent_tool_call_id`` 指向的是**子 run
+    内部**那次工具调用,把它提成根就等于挂到一个与它毫无关系的工具卡上。
+    **错挂比不显示坏得多 —— 用户看不出它是错的。**
+
+    这个场景是可达的,不是假想:落库队列满时 ``orchestrator/sse.py`` 走
+    ``_put_dropping_oldest``,而 ``asyncio.Queue`` 的 ``get_nowait`` 取的是**最
+    旧**那条。父子任务的 ``start`` 帧在时间上早于它的子帧,所以高压下正好是父
+    帧先被丢、子帧留下,恰好构成孤儿。
+
+    fixture 用「直接不 seed 父帧」构造,不用 ``list`` 的 limit 截断 —— 截断丢
+    的是尾部也就是子帧,反而构不成孤儿。
+
+    孤儿的 ``parent_tool_call_id`` 故意取本轮真实存在的 ``call-plain``:只有撞
+    上父 run 里真有的 id 时,提成根才**看得见**(挂到不相干的工具卡上)。取一
+    个谁也不匹配的内部 id 的话,提成根会退化成静默不显示,与正确行为无法区分,
+    测不出任何东西。
+    """
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            # 一棵完整的树 —— 兄弟证据:回填本身在工作。少了它,下面那条否定
+            # 断言在「回填整体失灵」时同样成立。
+            make_event_record(
+                run_id=run_id,
+                seq=0,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-1",
+                    wseq=0,
+                    parent_tool_call_id="call-worker",
+                    data={"task_excerpt": "查排班", "role": None, "max_steps": 8},
+                ),
+            ),
+            # 孤儿:父 ``w-ghost`` 的帧一条都没有(落库队列把它挤掉了)。
+            make_event_record(
+                run_id=run_id,
+                seq=1,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-orphan",
+                    wseq=0,
+                    parent_worker_id="w-ghost",
+                    parent_tool_call_id="call-plain",
+                    depth=2,
+                    label="孤儿",
+                    data={"task_excerpt": "父帧被挤掉了", "role": None, "max_steps": 4},
+                ),
+            ),
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+
+    # 兄弟先立住:有父的那棵确实挂上了。
+    assert calls["call-worker"]["worker"]["worker_id"] == "w-1"
+    # 孤儿没有被提成根挂到那次不相干的调用上 —— 这条是本测试的靶心。
+    assert "worker" not in calls["call-plain"]
+    # 也没有从别的缝里钻进那棵完整的树。
+    assert calls["call-worker"]["worker"]["children"] == []
+    # 整个响应里不存在它的任何痕迹(不以别的形式泄漏进条目)。
+    assert "w-orphan" not in json.dumps(body, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_worker_frames_do_not_crowd_out_the_plan_frame(ctx: _Ctx) -> None:
+    """子任务帧单列一次查询 —— 否则它们会把 ``plan`` 挤出这一页。
+
+    ``RunEventStore.list`` 的 ``limit`` 在名字过滤**之后**截断,上限 500。把
+    ``worker`` 并进 ``plan`` / ``approval`` / ``error`` 那次查询,一轮里排在
+    500 条子任务帧后面的计划就再也读不到了。
+    """
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            make_event_record(
+                run_id=run_id,
+                seq=seq,
+                event_name="worker",
+                data=_worker_frame(
+                    "update",
+                    worker_id="w-1",
+                    wseq=seq,
+                    parent_tool_call_id="call-worker",
+                    data={"node": "agent", "_duration_ms": 1, "messages": []},
+                ),
+            )
+            for seq in range(500)
+        ]
+        + [
+            make_event_record(
+                run_id=run_id,
+                seq=500,
+                event_name="plan",
+                data={"goal": "排到最后也要读得到", "steps": []},
+            )
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    assert [i["goal"] for i in body["items"] if i["type"] == "plan"] == ["排到最后也要读得到"]
+    # 子任务这一路同样没被计划挤掉。
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+    assert calls["call-worker"]["worker"]["worker_id"] == "w-1"

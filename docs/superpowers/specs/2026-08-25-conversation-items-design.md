@@ -5,6 +5,11 @@
 > 修订记录:初稿之后经过一轮对实时链路的侦察与 PR1 实现反馈,§三 / §四 / §五 /
 > §六 / §八 / §十 / §十一 都有实质修正。凡标注「**修正**」的段落都是初稿写错、
 > 照初稿实现会出真 bug 的地方。
+>
+> PR5 收尾时又对着**已合入的实现**扫了一遍,把所有悬置段落落成结论:标「**已定**」
+> 的是「当初写着待验证 / 待补,现在有答案了」。这份 spec 是本 program 的单一事实源,
+> 已经发生过「照它写任务书,把一个错数字传给下一个人」——**引用它的数字与结论之前,
+> 先跟代码里的常量对一次。**
 
 ## 一、要解决的问题
 
@@ -166,11 +171,41 @@ messages。
 ### 黄金测试
 
 跑一个真 run,收集实时产出的 items,再从单 run 回放与会话历史两条路径分别重建,
-断言三者相等(`id` 除外)。没有这个测试,同源只是口头承诺。
+断言三者相等。没有这个测试,同源只是口头承诺。
 
-**这个 run 必须是多步的、带工具调用、带多条 assistant_message。** 只跑一问一答时,
-实时的局部判定(无 tool_calls ⟹ final)恰好与历史一致,测试会全绿而 bug 仍在 —— 那
-正是「修复自带的测试给坏版本发合格证」那一类。
+**修正 —— 排除项是四样,不是只有 `id`。** 初稿写「`id` 除外」,照字面实现会得到一个
+**永远红**的测试,然后下一个人就开始删断言。四样各有正当理由,而且**排除不等于不测**:
+每一样都要另配一条正面断言钉住那个不对称,否则设计允许的差异与真漂移就分不开了。
+参考实现 `services/control-plane/tests/test_conversation_items_parity.py`(PR4),四样
+都是显式常量。
+
+| 排除项 | 为什么 | 另配的正面断言 |
+| --- | --- | --- |
+| `id` | 本来就不承诺跨路径一致(§五 那张公式表) | 同一路径内唯一、同一查询可重复 |
+| `user_message` 整条 | 它是 graph 的**输入**,从没进过事件流,实时与回放**物理上产不出来** —— 这恰恰是整个 program 存在的理由 | 历史侧有、另两条一条都没有 |
+| `tool_call.worker` | §五 拍板的唯一不完全同构处(PR5 实现) | 历史侧确实填了(`test_external_session_items.py`);实时与回放确实没填(`test_stream_items.py` / `test_run_event_stream_items.py`) |
+| `plan` / `approval` / `error` 三种辅助条目的 `created_at` | 回放与历史同源(都从落库的 `created_at_ms` 派生),实时没有落库时刻、用的是 bridge 的发布时钟,是另一次 `time.time()` 采样 | 回放 vs 历史**零容差**逐字节相等;实时另立一道闸,见下 |
+
+最后一样只放宽这三种。**消息类条目的 `created_at` 不在放宽范围** —— 它来自消息上盖的
+`expert_work_created_at` 戳,三条路径读的是同一个值,仍然逐字节断言。
+
+### 容差本身就是个洞
+
+**凡是用容差放宽一个字段,必须再加一道与容差正交的闸。** 容差对「在转发那一刻现采一个
+`now`」是**看不见的**:PR4 实测过,把 `_frame_created_at` 变异成 `datetime.now(UTC)`,
+容差断言**照样全绿**。
+
+补法:fixture 在所有 run 跑完之后先记一个 `settled_at`,睡一下,**再**去消费实时流,
+断言实时的 `created_at ≤ settled_at`。同一个变异下这道闸当场红。
+
+这条比 `created_at` 本身的处置值钱 —— 下次有人想「这里差一点点,放宽一下就好」时,
+该先看到它。
+
+### 这个 run 的形状
+
+**必须是多步的、带工具调用、带多条 assistant_message。** 只跑一问一答时,实时的局部
+判定(无 tool_calls ⟹ final)恰好与历史一致,测试会全绿而 bug 仍在 —— 那正是「修复
+自带的测试给坏版本发合格证」那一类。
 
 ## 五、实时:条目生命周期事件
 
@@ -188,11 +223,17 @@ ephemeral 的:不落库、不占序号。一旦让不可回放的帧占用 seq,�
 续传位点就会跑到 `since_seq` 实际能回放的范围之外,断线重连**静默漏事件**。客户端的
 续传位点只能取自带 seq 的帧。
 
-items 模式下的事件集(9 个):
+**修正 —— 事件集是 11 个,不是 9 个。** 初稿写的「9 个」既漏了 `worker`(本节下面
+自己拍板它留在 wire 上),列出的另外十个加起来也不是 9。写文档一律以
+`orchestrator.stream_items.ITEMS_WIRE_EVENTS` 这个常量为准去数,别照下面的散文抄 ——
+PR3 已经用显式字面量把 11 个钉进 `tests/test_stream_items_vocabulary.py::
+test_items_wire_vocabulary_is_closed`。
+
+items 模式下的事件集(11 个):
 
 * 内容 —— `item.added` / `item.delta` / `item.done`
 * 流控 —— `metadata` / `end` / `gap` / `truncated`
-* 过程提示(可忽略)—— `guard` / `compaction` / `retry`
+* 过程提示(可忽略)—— `guard` / `compaction` / `retry` / `worker`
 
 不再发 `token` / `updates` / `plan` / `approval` / `error`:前两个被条目生命周期取代,
 后三个变成 item。
@@ -224,20 +265,29 @@ items 模式下 `worker` **仍作为独立事件发,不转换**;`tool_call.worke
 `parent_worker_id` 挂树 —— 孙 worker 的 `parent_tool_call_id` 指向子 run 内部的
 tool_call,那个 id 从来不出现在父 run 的 `updates` 里。
 
-### 待验证 —— `tool_call` 的 `item.added` 时机
+### 已定 —— `tool_call` 的 `item.added` 用 `call_id` 配对
 
-`tool_args` token 帧带的是流式下标 `tool_index`(来自 `delta.tool_calls[].index`),
-不是 `call_id`,所以 `item.added` 时拿不到客户端配对用的键。
+> **本节原为「待验证」,PR3 已落定,两个候选分支一个都没走。** 初稿的前提
+> ——「`tool_args` 帧只有 `tool_index`,拿不到配对键」—— 在 PR #1278 之后就不
+> 成立了:那个 PR 把 `call_id` 放进了 `tool_args` 帧。下面是实现的实际做法。
 
-**PR3 第一步先验证** `delta.tool_calls[].index` 与最终 `AIMessage.tool_calls[]` 的
-数组下标是否恒等(要读各 provider 的流式聚合实现):
+`item.added` 照发,键用 **`call_id`**(`stream_items.py` 的 `_tool_preview`)。
+`call_id` 与 `AIMessage.tool_calls[].id` 同值,而权威 `updates` 帧那一侧用的是同
+一个公式,所以预览卡与随后的 `item.done` **天然同号**,不需要任何连接级配对状态。
 
-* 恒等 → live 路径的 tool_call item id 用 `(step, tool_index)`,added 与 done 对得上
-* 不恒等 → **不发 tool_call 的 `item.added`**,只在 `updates` 到达时发 `item.done`,
-  文档说明工具卡在该步完成时出现
+**绝不能用 `tool_index`。** 它不是 `tool_calls[]` 的数组下标:Anthropic 路径上它
+是**内容块**下标(text / thinking 块也占号),而厂商不发 index 时它还会塌成 0
+(#1283)。拿它配对会配到错的那个工具,或者让两次调用撞同一个 id。
 
-跨路径 id 本来就不承诺一致,所以 live 用 `(step, tool_index)`、历史用
-`(seq, msg, call)` 没有问题。
+两条路径的 `id` 公式(实现为准):
+
+| 路径 | `id` |
+| --- | --- |
+| 实时 / 单 run 回放(`ItemStreamConverter`) | 助手消息 `{run}:step:{step_count}` · 工具调用 `{run}:call:{call_id}` · 工具结果 `{run}:result:{call_id}` · 计划 `{run}:plan` · 审批 `{run}:approval:{request_id}`;键取不到时退回位置号 `{run}:{seq}:{消息下标}[:{调用下标}]` |
+| 会话历史(`derive_run_items` 直接给) | `{run_id}:{n}`,`n` 是条目在**这一轮推导结果**里的 0 基下标 |
+
+跨路径 `id` 不承诺一致,上表正是它的样子。这不成问题:历史不返回活跃的那一轮,
+同一个 run 不会同时出现在两边,两套编号永远不落进同一个列表。
 
 ### 已知会咬人的两条
 
@@ -246,8 +296,14 @@ tool_call,那个 id 从来不出现在父 run 的 `updates` 里。
 * **live 接合会重放陈旧 token** —— 订阅时不传 `last_event_id`,bridge 从缓冲区最早
   一条开始重放;带 seq 的帧被去重挡掉,但 token 帧 `seq is None`,无条件放行(仓库
   里有测试正面确认这个行为)。legacy 下只是多看到几段陈旧打字机文本,items 下会给
-  一个**已经 done 的条目重开 `item.added`**。转换器必须对此做幂等抑制,PR3 要有专门
-  的测试 —— 这条单测几乎撞不到,只有真栈「对话进行中刷新页面」才现形。
+  一个**已经 done 的条目重开 `item.added`**。
+
+**已定 —— 两条用同一个机制挡住(PR3)。** `ItemStreamConverter._done_steps` 记下
+「权威 `updates` 帧已经到过的 step」,该 step 之后再来的 token 一律丢弃:陈旧重放
+与重试撞号的判据是同一句话。重试那次的权威帧仍会在新的 seq 上到达,以同一个 `id`
+upsert 出最终文本,内容不会丢。测试:`test_run_event_stream_items.py::
+test_live_attach_drops_stale_tokens_for_settled_steps`(摆的是真实接合形态 —— 补库
+先发完权威帧,再挂实时流重放缓冲区)。
 
 ## 六、接口
 
@@ -351,7 +407,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | PR2 | 会话历史接口 + `RunEventStore.list` 加 `event_names` 过滤 + 集成测 + `query.md` | PR1 |
 | PR3 | 四处 `stream_format` + 消费端转换 + 事件名词表闸 + `sse-events.md` / `chat.md` / `run-control.md` | PR1 |
 | PR4 | 同源黄金测试 | PR2 + PR3 |
-| PR5 | 文档收敛:`quickstart.md` / `examples.md` / `best-practices.md` / 侧边栏 / 锚点扫尾 | PR2 + PR3 |
+| PR5 | 文档收敛 + `tool_call.worker` 历史回填(PR2 / PR3 之间漏做的一块) | PR2 + PR3 |
 
 波次:PR1 → (PR2 ∥ PR3) → (PR4 ∥ PR5)
 
@@ -363,6 +419,12 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
   `guide/run-control.md`
 * PR5 —— `guide/quickstart.md`、`guide/examples.md`、`guide/best-practices.md`、
   `.vitepress/config.mts`、`docs/api/streaming-events.md`
+
+**PR5 实际还动了四处**(PR2 / PR3 收工后才发现的缺口,与它们已合入 main 不冲突):
+`api/external_session_items.py`(worker 回填)、`common/conversation_derive.py`(一句
+错的 docstring)、`guide/query.md`(补 `tool_call.worker` 字段)、`guide/sse-events.md`
+(3.4 补深度大于 1 的挂载规则 —— 原先只写了 `parent_tool_call_id`,客户端照着写会把
+孙子任务挂丢)。
 
 **修正 —— `run-control.md` 归 PR3**。整个审批流程建立在 `approval` 事件上,共六处
 依赖 legacy 帧,与 approval item 强相关,不能留到收尾 PR。
@@ -391,6 +453,10 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 一条 SSE 断言(`"event: end" in body`),不校验事件名集合。而 items 模式下有六个事件
 要原样透传,写漏一个 = 静默丢帧且不会红。PR3 必须补一个词表闸,照 end-status 词表
 那条现成套路(AST 扫 `sse.py` 里的字面量事件名 → 对齐常量表)。
+
+**已补(PR3)**:`services/orchestrator/tests/test_stream_items_vocabulary.py`。扫描器
+解析不了的表达式一律当场报错、不静默跳过 —— 「扫不到就当没有」的扫描器会让整道闸
+空转。写对外文档时以那里的 `ITEMS_WIRE_EVENTS` 断言(11 个字面量)为准去数。
 
 **修正 —— `_encode` 从无状态变有状态。** 现有 docstring 论证的是「无状态过滤不打乱
 游标」,那段推理照抄不能用来给转换器背书:新增风险不在游标上,而在转换器自己的状态

@@ -209,7 +209,10 @@ def _approval_item(run_id: str, frame: AuxFrame) -> ApprovalItem:
         requested_at=_optional_text(frame.data, "requested_at"),
         timeout_at=_optional_text(frame.data, "timeout_at"),
         # ``decision`` 不从 approval 帧来(帧是「请求」不是「结果」),由上层
-        # 按 ``request_id`` 回填。
+        # 回填:**按 run 取回那一轮的审批记录**,再用 ``request_id`` 认出是这
+        # 一条。拿 ``request_id`` 当查询键是做不到的 —— 它是同一会话内的去重
+        # 摘要(``sha256(thread_id, node, action_summary)``),重复的同名审批
+        # 会撞在一起。
         decision=None,
     )
 
