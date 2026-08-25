@@ -93,7 +93,7 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunEventStore, RunStore
+from expert_work.runtime.runs import DisconnectMode, RunEventStore, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
@@ -663,6 +663,7 @@ async def resolve_approval_decision(
     agent_disable_service: AgentDisableService | None = None,
     tenant_status_service: TenantStatusService | None = None,
     workspace_store: UserWorkspaceStore | None = None,
+    on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
 ) -> tuple[Any, UUID, bool]:
     """Request-free core of a J.8 approval verdict — CAS + checkpoint + spawn.
 
@@ -673,6 +674,14 @@ async def resolve_approval_decision(
     system actor); this core does the ``mark_decided`` CAS (exactly-once across
     instances), the ``APPROVAL_DECIDED`` audit, the checkpoint ``aupdate_state``,
     and the detached continuation worker.
+
+    ``on_disconnect`` 与 :func:`spawn_run` 的同名参数同义、同默认值(``CANCEL``
+    留给控制台),对外审批端点(``external_approvals.py``)传 ``CONTINUE``。
+    **这是第二个入口** —— 审批续跑不走 ``spawn_run``,给那边改默认值改不到
+    这里,而这条流一样由第三方 API key 直接消费。审批续跑其实更经不起取消:
+    调用方已经等过一轮人工审批,续跑被一次网络抖动清零,前面的等待全部作废。
+    ``ApprovalTimeoutSweep`` 那个系统调用方不传,保持 ``CANCEL``:它压根不开
+    SSE 流,这个值对它没有可观察效果。
 
     ``graph_decision`` is what the graph applies (a timeout maps to ``reject``);
     ``db_status`` is the row's terminal status (``TIMEOUT`` for the sweep) — they
@@ -846,6 +855,7 @@ async def resolve_approval_decision(
         thread_id=thread_id,
         tenant_id=tenant_id,
         user_id=caller_user_id,
+        on_disconnect=on_disconnect,
         is_resume=True,
         trace_id=trace_id,  # Mini-ADR H-9.5
     )
@@ -918,6 +928,7 @@ async def spawn_run(
     envelope: bool = False,
     hide_events: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
+    on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -961,7 +972,22 @@ async def spawn_run(
     的 stream 分支。默认 ``"legacy"``,所以控制台 ``trigger_run`` 这个调用点
     的 wire 一字节不变;只有外部 ``run_agent_for_user`` 会按请求体里的
     ``stream_format`` 传 ``"items"``。queue 模式返回 202 JSON,没有事件流可
-    转,这个参数在那一支上无意义。"""
+    转,这个参数在那一支上无意义。
+
+    ``on_disconnect`` —— **两个平面在这里分道**,默认 ``CANCEL`` 留给控制台。
+
+    * 控制台:人坐在调试台前看着 run 跑,关掉页面是明确的「我不要了」;
+      误启动一次昂贵的 run,关页面就是那个退路。
+    * 对外(``run_agent_for_user``)传 ``CONTINUE``:那边断线是**意外** ——
+      代理回收空闲连接、笔记本休眠、运营商 NAT 老化、负载均衡滚动重启,
+      列不完。取消语义把任意一次抖动放大成整轮工作作废,而调用方连这个
+      开关都摸不到(对外请求体里没有这个字段,也不打算加 —— 开出旋钮等于
+      把我们的设计选择变成对接方的功课)。真实事故:第三方联调时开发机上
+      的 TUN 代理在 179 秒回收了空闲连接,一份跑了三分钟的方案就此作废。
+
+    queue 模式不走这里 —— ``RunManager.enqueue`` 自己写死 ``CONTINUE``。
+    两个平面各自的断言见 ``test_runs_api.py`` 与 ``test_external_idempotency.py``
+    里那对 ``*_when_the_connection_drops`` 测试。"""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -1040,6 +1066,7 @@ async def spawn_run(
         thread_id=thread_id,
         tenant_id=tenant_id,
         user_id=effective_user_id,
+        on_disconnect=on_disconnect,
         is_resume=bool(prior_runs),
         trace_id=trace_id,
         idempotency_key=idempotency_key,

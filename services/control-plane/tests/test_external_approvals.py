@@ -25,7 +25,7 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec, ApprovalRecord, ApprovalStatus
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs import DisconnectMode, InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -472,3 +472,36 @@ async def test_decide_403s_with_the_documented_code_when_agent_disabled(ctx: _Ct
     )
     assert still_pending is not None
     assert still_pending.status is ApprovalStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_external_approval_continuation_is_not_cancelled_when_the_connection_drops(
+    ctx: _Ctx,
+) -> None:
+    """审批续跑建的 run 同样恒为 ``CONTINUE`` —— 断流不取消。
+
+    这是**第二个入口**:审批续跑不走 ``spawn_run``,它自己调
+    ``RunManager.create``(``resolve_approval_decision``)。所以给对外发起路径
+    改默认值,改不到这里 —— 而这条流一样是第三方 API key 直接消费的
+    (``external_approvals.py`` 把它交给 ``sse_consumer``)。
+
+    断线理由与发起路径完全相同,见
+    ``test_external_idempotency.py::test_external_stream_run_is_not_cancelled_when_the_connection_drops``。
+    审批续跑反而更经不起取消:调用方已经等过一轮人工审批,这一段被一次网络
+    抖动清零,前面的等待全部作废。
+
+    控制台的审批续跑保持 ``CANCEL``,与控制台发起路径一致。
+    """
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 202, resp.text
+    new_run_id = UUID(resp.json()["data"]["run_id"])
+
+    continuation = await ctx.run_store.get(run_id=new_run_id, tenant_id=ctx.tenant_id)
+    assert continuation is not None
+    assert continuation.on_disconnect is DisconnectMode.CONTINUE

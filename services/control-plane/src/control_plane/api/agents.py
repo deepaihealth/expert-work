@@ -103,7 +103,13 @@ from expert_work.protocol import (
     tier_satisfies,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunEventStore, RunIdempotencyConflict, RunInfo, RunStore
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    RunEventStore,
+    RunIdempotencyConflict,
+    RunInfo,
+    RunStore,
+)
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
@@ -1405,6 +1411,10 @@ def build_agents_router() -> APIRouter:
                 # 系统提示词全文)是控制台调试专用帧,第三方 API key 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
                 stream_format=payload.stream_format,
+                # 断线在对外场景是意外而不是「我不要了」,取消会把一次网络
+                # 抖动放大成整轮工作作废;控制台那边关页面才是明确意图,所以
+                # 默认值留给它。完整理由见 ``spawn_run`` 的 docstring。
+                on_disconnect=DisconnectMode.CONTINUE,
             )
         except RunIdempotencyConflict:
             # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single

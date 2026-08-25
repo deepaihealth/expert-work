@@ -36,7 +36,7 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditQuery
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs import DisconnectMode, InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -464,6 +464,56 @@ async def test_run_stream_keeps_system_prompt_frame(runs_client: AsyncClient) ->
 
 
 @pytest.mark.asyncio
+async def test_console_stream_run_is_cancelled_when_the_connection_drops() -> None:
+    """控制台平面建的 run 保持 ``CANCEL`` —— 关掉页面就停。
+
+    控制台是人坐在调试台前看着 run 跑,关掉页面是**明确的**「我不要了」:
+    误启动一次昂贵的 run,关页面就是那个退路。这与对外平面正相反,那边断线
+    是意外(代理回收、休眠、滚动重启),取消会把一次抖动放大成整轮工作作废。
+
+    两个平面共用 ``spawn_run``,一个默认值管两边。所以这条测试与
+    ``test_external_idempotency.py::test_external_stream_run_is_not_cancelled_when_the_connection_drops``
+    必须成对存在:少了任何一条,把另一个平面的语义改掉都不会有测试变红。
+
+    自建 app 而不用 ``runs_client`` fixture:``on_disconnect`` 在 HTTP 响应上
+    观察不到(没有任何端点回显它),只能读 ``RunStore`` 里的记录,而那个
+    fixture 不暴露它的 store。
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    run_store = InMemoryRunStore()
+    run_event_store = InMemoryRunEventStore()
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        thread_id = await _create_session(client)
+        response = await client.post(f"/v1/sessions/{thread_id}/runs", json={"input": "hello"})
+        assert response.status_code == 200, response.text
+        run_id = UUID(response.headers["x-expert-work-run-id"])
+
+    info = await run_store.get(run_id=run_id, tenant_id=_DEFAULT_TENANT)
+    assert info is not None
+    assert info.on_disconnect is DisconnectMode.CANCEL
+
+
+@pytest.mark.asyncio
 async def test_run_emits_session_write_audit(
     runs_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:
@@ -777,7 +827,7 @@ async def test_get_run_falls_back_to_durable_run_store(runs_client: AsyncClient)
     from datetime import UTC, datetime
     from uuid import uuid4
 
-    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+    from expert_work.runtime.runs import RunInfo, RunStatus
 
     thread_id = await _create_session(runs_client)
     run_id = uuid4()

@@ -867,3 +867,40 @@ async def test_unknown_stream_format_is_422(
         json={"user_id": "u1", "mode": "queue", "stream_format": "conversation"},
     )
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# 断流语义 —— 对外平面的 stream run 不因断线被取消
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_external_stream_run_is_not_cancelled_when_the_connection_drops(
+    _external_ctx: _ExternalCtx, plain_agent: _Agent
+) -> None:
+    """对外平面建的 run 恒为 ``CONTINUE`` —— 断流不取消。
+
+    断线在对外场景里是**意外**,不是「我不要了」:代理回收空闲连接、笔记本
+    休眠、运营商 NAT 老化、负载均衡滚动重启,一条都列不完。取消语义把任意
+    一次网络抖动放大成整轮工作作废,而调用方连这个开关都摸不到 —— 对外请求
+    体里没有 ``on_disconnect`` 字段。
+
+    真实事故:第三方联调时,开发机上的 TUN 代理在 179 秒回收了空闲连接,
+    服务端的 ``finally`` 随即把 run 取消,一份跑了三分钟的健康方案作废;
+    客户端按文档指引重连,只读到一个 ``interrupted`` 收尾。
+
+    控制台平面**保持** ``CANCEL``,理由与断言见
+    ``test_runs_api.py::test_console_stream_run_is_cancelled_when_the_connection_drops``。
+    两个平面共用 ``spawn_run``,所以这两条测试必须成对存在:少了任何一条,
+    把另一个平面的默认值改掉都不会有测试变红。
+    """
+    resp = await _external_ctx.client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={"user_id": "u1", "input": "你好", "mode": "stream"},
+    )
+    assert resp.status_code == 200, resp.text
+    run_id = UUID(resp.headers["X-Expert-Work-Run-Id"])
+
+    info = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert info is not None
+    assert info.on_disconnect is DisconnectMode.CONTINUE
