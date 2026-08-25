@@ -249,6 +249,7 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{agent_code}/sessions"),
         ("POST", "/v1/agents/{agent_code}/sessions"),
         ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/messages"),
+        ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/items"),
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:decide"),
         # P2-b — session rename / archive (external_sessions.py) and the
