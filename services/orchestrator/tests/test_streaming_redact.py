@@ -336,8 +336,20 @@ async def test_token_sink_emits_tool_name_once_per_index() -> None:
     await sink.flush()
     tool_frames = [f for f in frames if f["channel"] == "tool_args"]
     assert tool_frames == [
-        {"step": 1, "channel": "tool_args", "tool_index": 0, "name": "search_web"},
-        {"step": 1, "channel": "tool_args", "tool_index": 1, "name": "read_file"},
+        {
+            "step": 1,
+            "channel": "tool_args",
+            "tool_index": 0,
+            "call_id": "c0",
+            "name": "search_web",
+        },
+        {
+            "step": 1,
+            "channel": "tool_args",
+            "tool_index": 1,
+            "call_id": "c1",
+            "name": "read_file",
+        },
     ]
 
 
@@ -378,3 +390,248 @@ async def test_token_sink_records_first_non_empty_delta_time_once() -> None:
     assert first is not None
     await sink(LLMDelta(content="answer"))
     assert sink.first_delta_at == first  # 只记第一次
+
+
+# --------------------------------------------------------------------------
+# tool_args 帧的 call_id ↔ 最终 AIMessage.tool_calls[].id
+#
+# 对外契约:客户端只能靠 call_id 把流式阶段画出的工具卡与权威 updates 帧里的
+# 那次调用配起来。tool_index 做不到 —— 它的含义随厂商而变(OpenAI 是助手消息
+# tool_calls[] 的下标,Anthropic 是 content 内容块下标,text / thinking 块也
+# 占号),所以下面一律**按 call_id 配对**,绝不按位置。
+# --------------------------------------------------------------------------
+
+_ANTHROPIC_TEXT_THEN_TWO_TOOLS: list[dict[str, Any]] = [
+    {"type": "message_start", "message": {"model": "claude-x", "usage": {"input_tokens": 5}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "我先查一下,再算一下。"},
+    },
+    {"type": "content_block_stop", "index": 0},
+    {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "tool_use", "id": "toolu_search", "name": "search"},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": '{"q": "hi"}'},
+    },
+    {"type": "content_block_stop", "index": 1},
+    {
+        "type": "content_block_start",
+        "index": 2,
+        "content_block": {"type": "tool_use", "id": "toolu_calc", "name": "calc"},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 2,
+        "delta": {"type": "input_json_delta", "partial_json": '{"x": 1}'},
+    },
+    {"type": "content_block_stop", "index": 2},
+    {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 20}},
+    {"type": "message_stop"},
+]
+
+_ANTHROPIC_THINKING_TEXT_TWO_TOOLS: list[dict[str, Any]] = [
+    {"type": "message_start", "message": {"model": "claude-x", "usage": {"input_tokens": 5}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}},
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "先检索再计算"},
+    },
+    {"type": "content_block_stop", "index": 0},
+    {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "好的。"}},
+    {"type": "content_block_stop", "index": 1},
+    {
+        "type": "content_block_start",
+        "index": 2,
+        "content_block": {"type": "tool_use", "id": "toolu_search", "name": "search"},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 2,
+        "delta": {"type": "input_json_delta", "partial_json": '{"q": "hi"}'},
+    },
+    {"type": "content_block_stop", "index": 2},
+    {
+        "type": "content_block_start",
+        "index": 3,
+        "content_block": {"type": "tool_use", "id": "toolu_calc", "name": "calc"},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 3,
+        "delta": {"type": "input_json_delta", "partial_json": '{"x": 1}'},
+    },
+    {"type": "content_block_stop", "index": 3},
+    {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 20}},
+    {"type": "message_stop"},
+]
+
+#: 首个工具的 arguments 被截断 —— build(interrupted=True) 丢弃它,后一个工具
+#: 因此从数组位置 1 前移到位置 0,而它的帧仍报 tool_index=1。
+_OPENAI_INTERRUPTED_FIRST_TOOL_TRUNCATED: list[dict[str, Any]] = [
+    {"choices": [{"delta": {"role": "assistant"}}]},
+    {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_search",
+                            "function": {"name": "search", "arguments": ""},
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+    {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"q": '}}]}}]},
+    {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 1,
+                            "id": "call_calc",
+                            "function": {"name": "calc", "arguments": '{"x": 1}'},
+                        }
+                    ]
+                }
+            }
+        ]
+    },
+]
+
+
+def _anthropic_case(events: list[dict[str, Any]]) -> tuple[Any, Any, list[dict[str, Any]]]:
+    from orchestrator.llm.providers._streaming import (
+        AnthropicStreamAssembler,
+        delta_from_anthropic_event,
+    )
+
+    return delta_from_anthropic_event, AnthropicStreamAssembler(), events
+
+
+def _openai_case(events: list[dict[str, Any]]) -> tuple[Any, Any, list[dict[str, Any]]]:
+    from orchestrator.llm.providers._streaming import (
+        OpenAIStreamAssembler,
+        delta_from_openai_chunk,
+    )
+
+    return delta_from_openai_chunk, OpenAIStreamAssembler(), events
+
+
+def _pair_by_call_id(
+    tool_frames: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """把每个最终工具调用与宣告过它的 ``tool_args`` 帧配起来。
+
+    唯一正确的键是 ``call_id``;位置(拿 ``tool_index`` 当下标)不是。
+    """
+    by_call_id = {f["call_id"]: f for f in tool_frames}
+    return [(by_call_id[c["id"]], c) for c in tool_calls]
+
+
+async def _drive(
+    to_delta: Any, assembler: Any, events: list[dict[str, Any]], *, interrupted: bool
+) -> tuple[list[dict[str, Any]], Any]:
+    """按 router._drive_stream 的顺序把同一个 delta 先喂装配器再喂 sink。"""
+    frames: list[dict[str, Any]] = []
+
+    async def publish(frame: dict[str, Any]) -> None:
+        frames.append(frame)
+
+    sink = TokenSink(step=1, publish=publish, dlp=False, screen=False)
+    for event in events:
+        delta = to_delta(event)
+        assembler.add(delta)
+        await sink(delta)
+    await sink.flush()
+    tool_frames = [f for f in frames if f["channel"] == "tool_args"]
+    return tool_frames, assembler.build(interrupted=interrupted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "events", "interrupted", "complete"),
+    [
+        pytest.param(
+            _anthropic_case,
+            _ANTHROPIC_TEXT_THEN_TWO_TOOLS,
+            False,
+            True,
+            id="anthropic-text-then-two-tools",
+        ),
+        pytest.param(
+            _anthropic_case,
+            _ANTHROPIC_THINKING_TEXT_TWO_TOOLS,
+            False,
+            True,
+            id="anthropic-thinking-text-two-tools",
+        ),
+        pytest.param(
+            _openai_case,
+            _OPENAI_INTERRUPTED_FIRST_TOOL_TRUNCATED,
+            True,
+            False,
+            id="openai-interrupted-first-tool-truncated",
+        ),
+    ],
+)
+async def test_tool_args_call_id_matches_final_tool_calls(
+    case: Any, events: list[dict[str, Any]], interrupted: bool, complete: bool
+) -> None:
+    to_delta, assembler, evs = case(events)
+    tool_frames, message = await _drive(to_delta, assembler, evs, interrupted=interrupted)
+
+    call_ids = [f["call_id"] for f in tool_frames]
+    assert all(call_ids), f"tool_args 帧缺 call_id: {tool_frames}"
+    assert len(set(call_ids)) == len(call_ids), f"call_id 在一步内重复: {call_ids}"
+
+    final_ids = [c["id"] for c in message.tool_calls]
+    assert final_ids, "fixture 至少要留下一个最终工具调用"
+    assert set(final_ids) <= set(call_ids), (
+        f"最终 tool_calls 出现了没被 tool_args 帧宣告过的 id: {final_ids} vs {call_ids}"
+    )
+    if complete:
+        assert set(final_ids) == set(call_ids)
+
+    for frame, call in _pair_by_call_id(tool_frames, list(message.tool_calls)):
+        assert frame["name"] == call["name"], (
+            f"call_id={call['id']} 的帧报了 {frame['name']!r},最终却是 {call['name']!r}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "events"),
+    [
+        pytest.param(_anthropic_case, _ANTHROPIC_TEXT_THEN_TWO_TOOLS, id="anthropic-text"),
+        pytest.param(_anthropic_case, _ANTHROPIC_THINKING_TEXT_TWO_TOOLS, id="anthropic-thinking"),
+        pytest.param(
+            _openai_case, _OPENAI_INTERRUPTED_FIRST_TOOL_TRUNCATED, id="openai-interrupted"
+        ),
+    ],
+)
+def test_named_tool_call_chunk_always_carries_id(case: Any, events: list[dict[str, Any]]) -> None:
+    """生产侧前提:带 name 的 tool-call chunk 必然同时带 id。
+
+    ``TokenSink`` 正是在「首次看到 name」时发帧的,所以这条共现是 ``call_id``
+    永不为空的唯一依据 —— 单独钉死,不让它藏在上面那条断言里。
+    """
+    to_delta, _assembler, evs = case(events)
+    named = 0
+    for event in evs:
+        for tc in to_delta(event).tool_calls:
+            if tc.name:
+                named += 1
+                assert tc.id, f"chunk 带 name={tc.name!r} 却没有 id: {tc}"
+    assert named >= 1, "fixture 里必须至少出现一个带 name 的 tool-call chunk"

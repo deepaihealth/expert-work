@@ -245,10 +245,13 @@ function onMetadata(data) {
 | `step` | integer | 这一小段属于第几步，与 `updates` 里 `agent` 这一键的 `step_count` 是同一个编号。取值从 `1` 开始。三种 `channel` 都有 |
 | `channel` | string | 这一小段属于哪条内容通道。取值：`content`（答案正文）/ `reasoning`（模型的思考过程，只有推理类模型有，走独立的一路）/ `tool_args`（模型开始发起一次工具调用）。只有这三个取值 |
 | `text` | string | 已经过内容安全脱敏的文本片段，可能是空串。只有 `content` 和 `reasoning` 带此字段 |
-| `tool_index` | integer | 这是本步里第几个并行的工具调用，从 `0` 开始。只有 `tool_args` 带此字段 |
-| `name` | string | 工具名。同一个 `tool_index` 只发一次，即第一次出现这个调用的时候。只有 `tool_args` 带此字段 |
+| `call_id` | string | 这次工具调用的 id，与这一步 `updates` 里 `ai.tool_calls[].id`、以及工具结果消息的 `tool_call_id` 同值。只有 `tool_args` 带此字段 |
+| `tool_index` | integer | 这次调用在模型输出里的位置编号，同一步之内不重复，含义随模型而不同，用法见表后说明。只有 `tool_args` 带此字段 |
+| `name` | string | 工具名。同一次调用只发一次，即第一次出现这次调用的时候。只有 `tool_args` 带此字段 |
 
-`tool_args` 只给出这次调用的序号和工具名，没有参数内容，完整参数出现在这一步的 `updates` 里。客户端可以先显示工具卡，也就是界面上代表这次工具调用的那张卡片，先只放工具名和一个等待指示，参数等 `updates` 到达后再填入。
+`tool_args` 只给出这次调用的 id 和工具名，没有参数内容，完整参数出现在这一步的 `updates` 里。客户端可以先显示工具卡，也就是界面上代表这次工具调用的那张卡片，先只放工具名和一个等待指示，等 `updates` 到达后按 `call_id` 找到同一张卡再把参数填入。
+
+`call_id` 是把流式预览与最终结果连起来的唯一正确的键，它在 `updates` 里以 `ai.tool_calls[].id` 出现，在工具结果消息里以 `tool_call_id` 出现，三处同值。`tool_index` 不是：它的取值含义随模型而不同，有的模型只对工具调用编号，有的模型把答案正文与思考内容也算进同一套编号，因此同一次调用的 `tool_index` 未必等于它在 `updates` 里 `tool_calls` 数组中的位置。**`tool_index` 只能用于在一条连接内区分同一步的多次调用，不要拿它作数组下标，也不要拿它配对。**
 
 #### 示例
 
@@ -260,7 +263,7 @@ event: token
 data: {"step":1,"channel":"reasoning","text":"用户要我先写文件再读回来"}
 
 event: token
-data: {"step":1,"channel":"tool_args","tool_index":0,"name":"write_file"}
+data: {"step":1,"channel":"tool_args","tool_index":0,"call_id":"call_de58e676916d442d925bff27","name":"write_file"}
 ```
 
 #### 客户端怎么处理
@@ -270,11 +273,14 @@ data: {"step":1,"channel":"tool_args","tool_index":0,"name":"write_file"}
 ```js [示例代码]
 function onToken(data) {
   if (data.channel === "tool_args") {
-    // 先显示工具卡的外壳,参数等 updates 到达后再填入
-    $("#timeline").insertAdjacentHTML("beforeend",
-      `<div class="tool-card pending" data-idx="${data.tool_index}">
-         调用 ${esc(data.name)}<span class="spinner"></span>
-       </div>`);
+    // 先显示工具卡的外壳,卡片的键用 call_id,参数等 updates 到达后再填入
+    if (!store.toolCalls.has(data.call_id)) {
+      $("#timeline").insertAdjacentHTML("beforeend",
+        `<div class="tool-card pending" id="tc-${data.call_id}">
+           调用 ${esc(data.name)}<span class="spinner"></span>
+         </div>`);
+      store.toolCalls.set(data.call_id, $(`#tc-${data.call_id}`));
+    }
     return;
   }
   // content 与 reasoning 分别累积,按 step 分组
@@ -506,15 +512,20 @@ function onUpdates(data) {
         const step = produced.step_count;
         const box = $(`#step-${step}-content`);
         if (box) box.textContent = msg.content;
-        // 每个工具调用先占一张卡,用 id 作为键
+        // 每个工具调用一张卡,用 id 作为键;token 阶段已经占位的那张直接补全
         for (const call of msg.tool_calls ?? []) {
-          $("#timeline").insertAdjacentHTML("beforeend",
-            `<div class="tool-card" id="tc-${call.id}">
-               <b>${esc(call.name)}</b>
-               <pre>${esc(JSON.stringify(call.args, null, 2))}</pre>
-               <div class="result">执行中…</div>
-             </div>`);
-          store.toolCalls.set(call.id, $(`#tc-${call.id}`));
+          let card = store.toolCalls.get(call.id);
+          if (!card) {
+            $("#timeline").insertAdjacentHTML("beforeend",
+              `<div id="tc-${call.id}"></div>`);
+            card = $(`#tc-${call.id}`);
+            store.toolCalls.set(call.id, card);
+          }
+          card.className = "tool-card";        // 去掉等待指示
+          card.innerHTML =
+            `<b>${esc(call.name)}</b>
+             <pre>${esc(JSON.stringify(call.args, null, 2))}</pre>
+             <div class="result">执行中…</div>`;
         }
       } else if (msg.type === "tool") {
         // 结果填回同 id 的那张卡,不要按数组下标配对
