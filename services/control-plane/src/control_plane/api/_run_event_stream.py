@@ -117,7 +117,12 @@ def make_run_probe(
         else:
             row = await runs.get(run_id=run_id, tenant_id=tenant_id)
         if row is None:
-            logger.warning("run_probe.row_vanished run_id=%s", run_id)
+            # 模块头的 log-injection 抑制论证同样覆盖这一条:``run_id`` 是
+            # FastAPI 解析出的 ``UUID`` 对象,承载不了换行。
+            logger.warning(  # codeql[py/log-injection]
+                "run_probe.row_vanished run_id=%s",
+                run_id,  # codeql[py/log-injection]
+            )
             return (RunStatus.INTERRUPTED, None)
         return (row.status, row.artifacts)
 

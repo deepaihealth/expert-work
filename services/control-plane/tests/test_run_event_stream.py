@@ -1037,9 +1037,8 @@ class _ScriptedProbe:
 
 @pytest.fixture
 def _fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
-    import control_plane.api._run_event_stream as mod
-
-    monkeypatch.setattr(mod, "_STORE_POLL_INTERVAL_S", 0.0)
+    # 字符串路径形态(本文件 heartbeat 测试同款)—— 避免 import/import-from 混用。
+    monkeypatch.setattr("control_plane.api._run_event_stream._STORE_POLL_INTERVAL_S", 0.0)
 
 
 async def _collect_poll(
