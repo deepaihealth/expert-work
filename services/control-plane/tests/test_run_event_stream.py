@@ -743,6 +743,9 @@ async def test_both_sse_paths_emit_the_same_end_shape() -> None:
         == {
             "status": "interrupted",
             "run_id": str(record.run_id),
+            # 产物清单契约:终态 set_status 快照被两条路径同源携带 ——
+            # 本 run 没登记任何产物,显式 [](零交付),不是缺字段。
+            "artifacts": [],
         }
     )
 
