@@ -546,3 +546,76 @@ async def test_worker_build_fn_forwards_skill_store_to_build_agent(
     await build_fn(_spec("parent"), tenant_id=uuid4(), role="probe", depth=1)
 
     assert build_calls[0]["skill_store"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_child_builder_strips_manage_task_from_the_spec(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """BUG-19b —— 「子 Agent 不排任务」的正确表达是 spec 层剥工具。
+
+    此前的表达是「不给 trigger_store」,而 build_agent 对「声明 manage_task
+    无 TriggerStore」是硬闸——父/目标 Agent 带 manage_task 时整个委派构建
+    直接炸。旧代码把 spec 原样传给 build_agent,本断言必红。
+    """
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    doc = _spec("researcher").model_dump(by_alias=True, exclude_none=True)
+    doc["spec"]["tools"] = [
+        {"type": "builtin", "name": "web_search", "config": {}},
+        {"type": "builtin", "name": "manage_task", "config": {}},
+    ]
+    spec = AgentSpec.model_validate(doc)
+    await store.create(tenant_id=tenant, spec=spec, spec_sha256=_SHA, created_by="test")
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    built_spec = build_calls[0]["spec"]
+    names = {getattr(t, "name", None) for t in built_spec.spec.tools}
+    assert "manage_task" not in names
+    assert "web_search" in names
+
+
+@pytest.mark.asyncio
+async def test_child_builder_forwards_audit_logger(build_calls: list[dict[str, Any]]) -> None:
+    """BUG-19b —— 子代的技能创作工具要挂审计(#1302 起可构建,不能裸奔)。"""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    sentinel = object()
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        audit_logger=sentinel,  # type: ignore[arg-type]
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    assert build_calls[0]["audit_logger"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_worker_build_fn_forwards_audit_logger(build_calls: list[dict[str, Any]]) -> None:
+    sentinel = object()
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+        audit_logger=sentinel,  # type: ignore[arg-type]
+    )
+
+    await build_fn(_spec("parent"), tenant_id=uuid4(), role="probe", depth=1)
+
+    assert build_calls[0]["audit_logger"] is sentinel
