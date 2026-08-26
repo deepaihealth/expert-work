@@ -113,6 +113,7 @@ from orchestrator.llm import (
     OpenAIProvider,
     ProviderHandle,
     RateLimitedProvider,
+    effective_rpm,
     make_azure_client,
     make_deepseek_client,
     make_doubao_client,
@@ -2058,8 +2059,9 @@ async def build_llm_router(
                 timeout_s=provider_timeout_s,
                 http_client=http_client,
             )
+            # PROD-12(多副本)—— 每副本吃 ceil(rpm/副本数),总量上界=配置值。
             rate_limited = RateLimitedProvider.with_rpm(
-                provider, rate_limit_rpm=entry.rate_limit_rpm
+                provider, rate_limit_rpm=effective_rpm(entry.rate_limit_rpm)
             )
             key = f"{group}#{idx}" if multikey else group
             handles.append(ProviderHandle(provider=rate_limited, key=key, group=group))

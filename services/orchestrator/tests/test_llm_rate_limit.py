@@ -29,6 +29,7 @@ from orchestrator.llm import (
     DEFAULT_TIME_PERIOD_S,
     LLMProvider,
     RateLimitedProvider,
+    effective_rpm,
 )
 from orchestrator.tools.registry import ToolSpec
 
@@ -250,3 +251,30 @@ def test_direct_construction_with_custom_limiter_works() -> None:
     custom = AsyncLimiter(max_rate=5, time_period=10)
     wrapped = RateLimitedProvider(inner=inner, limiter=custom)
     assert wrapped.limiter is custom
+
+
+# ---------------------------------------------------------------------------
+# PROD-12(多副本)—— 每副本 RPM 份额
+# ---------------------------------------------------------------------------
+
+
+def test_effective_rpm_defaults_to_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EXPERT_WORK_REPLICA_COUNT", raising=False)
+    assert effective_rpm(60) == 60
+
+
+def test_effective_rpm_divides_by_replica_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXPERT_WORK_REPLICA_COUNT", "2")
+    assert effective_rpm(60) == 30
+    # ceil —— 宁可各副本多 1,不把总量削到配置值以下太多;下限 1。
+    monkeypatch.setenv("EXPERT_WORK_REPLICA_COUNT", "3")
+    assert effective_rpm(10) == 4
+    assert effective_rpm(1) == 1
+
+
+def test_effective_rpm_survives_bad_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 限流配置错不该让 Agent 构建失败 —— 按单副本处理。
+    monkeypatch.setenv("EXPERT_WORK_REPLICA_COUNT", "two")
+    assert effective_rpm(60) == 60
+    monkeypatch.setenv("EXPERT_WORK_REPLICA_COUNT", "0")
+    assert effective_rpm(60) == 60

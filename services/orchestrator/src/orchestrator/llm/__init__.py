@@ -104,6 +104,9 @@ from orchestrator.llm.rate_limit import (
 from orchestrator.llm.rate_limit import (
     RateLimitedProvider as RateLimitedProvider,
 )
+from orchestrator.llm.rate_limit import (
+    effective_rpm as effective_rpm,
+)
 from orchestrator.llm.rerank import (
     DASHSCOPE_RERANK_URL as DASHSCOPE_RERANK_URL,
 )
@@ -167,6 +170,7 @@ __all__ = [
     "RecordingAnthropicClient",
     "RecordingOpenAIClient",
     "RerankClient",
+    "effective_rpm",
     "make_azure_client",
     "make_deepseek_client",
     "make_doubao_client",
