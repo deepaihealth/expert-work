@@ -72,6 +72,73 @@ describe("CompactRow", () => {
     ).toBeInTheDocument();
   });
 
+  it("skill_view row: 技能 · 名称/路径 → 结果,不再是裸 args JSON", () => {
+    const row: ToolRow = {
+      id: "tool:0:0",
+      kind: "tool",
+      seq: 0,
+      step: 1,
+      status: "ok",
+      durationMs: 80,
+      eventIndexes: [0, 1],
+      serverMs: null,
+      entry: {
+        id: "c1",
+        rawName: "skill_view",
+        isMcp: false,
+        server: null,
+        toolName: "skill_view",
+        args: { skill_name: "seo", path: "reference/a.md" },
+        status: "success",
+        resultPreview: "# checklist",
+        durationMs: 80,
+      },
+    };
+    render(
+      <App>
+        <CompactRow row={row} expanded={false} onToggle={vi.fn()} />
+      </App>,
+    );
+    const label = screen.getByTestId("console-row-tool");
+    // 前缀吃 locale(技能/Skill),锚在技能名/路径上;主 SKILL.md 读取只显技能名。
+    expect(label).toHaveTextContent(/seo\/reference\/a\.md.*# checklist/);
+    // 老渲染是 `skill_view · {"skill_name":…}` —— 这两个断言在旧代码下必红。
+    expect(label).not.toHaveTextContent("skill_view");
+    expect(label).not.toHaveTextContent('"skill_name"');
+  });
+
+  it("skill_view row reading SKILL.md shows the bare skill name", () => {
+    const row: ToolRow = {
+      id: "tool:0:0",
+      kind: "tool",
+      seq: 0,
+      step: 1,
+      status: "ok",
+      durationMs: null,
+      eventIndexes: [],
+      serverMs: null,
+      entry: {
+        id: "c1",
+        rawName: "skill_view",
+        isMcp: false,
+        server: null,
+        toolName: "skill_view",
+        args: { skill_name: "pptx-generation", path: "SKILL.md" },
+        status: "success",
+        resultPreview: "body",
+        durationMs: null,
+      },
+    };
+    render(
+      <App>
+        <CompactRow row={row} expanded={false} onToggle={vi.fn()} />
+      </App>,
+    );
+    const label = screen.getByTestId("console-row-tool");
+    expect(label).toHaveTextContent(/pptx-generation.*body/);
+    expect(label).not.toHaveTextContent("pptx-generation/SKILL.md");
+  });
+
   // PR-B Task 1 — readOnly (对话记录只读链路)整卡隐藏「立即触发」,照
   // ToolTimeline.test.tsx 的 manage_task create 用例造 fixture。
   it("readOnly 下工具行不渲染「立即触发」按钮(收起与展开两个分支)", () => {

@@ -4,6 +4,8 @@ import {
   artifactsFromTools,
   parseExecResult,
   parseToolCalls,
+  skillNameOf,
+  skillsFromTools,
 } from "../tool_timeline";
 import type { SseEvent } from "../sessions";
 
@@ -319,6 +321,66 @@ describe("artifactsFromTools", () => {
       updates("tools", [toolResult("c1", "results")]),
     ];
     expect(artifactsFromTools(events)).toEqual([]);
+  });
+});
+
+describe("skillNameOf", () => {
+  it("returns args.skill_name for a skill_view call", () => {
+    const [entry] = parseToolCalls([
+      updates("agent", [aiCall("c1", "skill_view", { skill_name: "pptx-generation", path: "SKILL.md" })]),
+    ]);
+    expect(skillNameOf(entry)).toBe("pptx-generation");
+  });
+
+  it("returns null for any other tool", () => {
+    const [entry] = parseToolCalls([
+      updates("agent", [aiCall("c1", "web_search", { skill_name: "not-a-skill" })]),
+    ]);
+    expect(skillNameOf(entry)).toBeNull();
+  });
+
+  it("returns null when skill_name is missing or blank", () => {
+    const entries = parseToolCalls([
+      updates("agent", [
+        aiCall("c1", "skill_view", { path: "SKILL.md" }),
+        { type: "ai", content: "", tool_calls: [{ id: "c2", name: "skill_view", args: { skill_name: "  " }, type: "tool_call" }] },
+      ]),
+    ]);
+    expect(entries.map(skillNameOf)).toEqual([null, null]);
+  });
+});
+
+describe("skillsFromTools", () => {
+  it("folds multiple reads of one skill into a single entry with a read count", () => {
+    const events = [
+      updates("agent", [aiCall("c1", "skill_view", { skill_name: "seo", path: "SKILL.md" })]),
+      updates("tools", [toolResult("c1", "# seo skill body")]),
+      updates("agent", [aiCall("c2", "skill_view", { skill_name: "seo", path: "reference/checklist.md" })]),
+      updates("tools", [toolResult("c2", "checklist")]),
+    ];
+    expect(skillsFromTools(events)).toEqual([{ name: "seo", reads: 2 }]);
+  });
+
+  it("keeps first-read order across distinct skills", () => {
+    const events = [
+      updates("agent", [aiCall("c1", "skill_view", { skill_name: "b-skill", path: "SKILL.md" })]),
+      updates("tools", [toolResult("c1", "b")]),
+      updates("agent", [aiCall("c2", "skill_view", { skill_name: "a-skill", path: "SKILL.md" })]),
+      updates("tools", [toolResult("c2", "a")]),
+    ];
+    expect(skillsFromTools(events)).toEqual([
+      { name: "b-skill", reads: 1 },
+      { name: "a-skill", reads: 1 },
+    ]);
+  });
+
+  it("excludes failed lookups and calls still pending", () => {
+    const events = [
+      updates("agent", [aiCall("c1", "skill_view", { skill_name: "gone", path: "SKILL.md" })]),
+      updates("tools", [toolResult("c1", "skill not found", "error")]),
+      updates("agent", [aiCall("c2", "skill_view", { skill_name: "loading", path: "SKILL.md" })]),
+    ];
+    expect(skillsFromTools(events)).toEqual([]);
   });
 });
 

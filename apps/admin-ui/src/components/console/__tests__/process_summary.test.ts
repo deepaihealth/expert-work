@@ -115,6 +115,52 @@ describe("summarizeProcess", () => {
     expect(summarizeProcess(rows)).toMatchObject({ think: 1, tools: 1, failed: 1 });
   });
 
+  it("books a skill_view call as skill:<name> in the breakdown and lists the skill", () => {
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [
+              { id: "s1", name: "skill_view", args: { skill_name: "pptx", path: "SKILL.md" } },
+              { id: "s2", name: "skill_view", args: { skill_name: "pptx", path: "ref/a.md" } },
+              { id: "c1", name: "web_search", args: { q: "x" } },
+            ],
+          },
+        ],
+      }),
+      toolResults([
+        { id: "s1", name: "skill_view", ok: true },
+        { id: "s2", name: "skill_view", ok: true },
+        { id: "c1", name: "web_search", ok: true },
+      ]),
+    ];
+    const s = summarizeProcess(compactRowsOf(events));
+    expect(s.toolBreakdown).toBe("skill:pptx ×2 · web_search ×1");
+    expect(s.skills).toEqual([{ name: "pptx", reads: 2 }]);
+  });
+
+  it("a failed skill lookup stays in the breakdown but not in the skills list", () => {
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [{ id: "s1", name: "skill_view", args: { skill_name: "gone", path: "SKILL.md" } }],
+          },
+        ],
+      }),
+      toolResults([{ id: "s1", name: "skill_view", ok: false }]),
+    ];
+    const s = summarizeProcess(compactRowsOf(events));
+    expect(s.toolBreakdown).toBe("skill:gone ×1");
+    expect(s.skills).toEqual([]);
+  });
+
   it("sums row durations treating null as 0, and reports null when no row carries one", () => {
     const events: SseEvent[] = [
       agentStep(1, "想一下", [{ id: "c1", name: "web_search" }], 1000),
@@ -152,13 +198,13 @@ describe("processHeadline", () => {
   it("headline omits the tool parenthesis without tools and the failed tail without failures", () => {
     expect(
       processHeadline(
-        { think: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", durationMs: 1200 },
+        { think: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: 1200 },
         t,
       ),
     ).toBe("思考 2 次");
     expect(
       processHeadline(
-        { think: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", durationMs: null },
+        { think: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
         t,
       ),
     ).toBe("无过程");
@@ -167,7 +213,7 @@ describe("processHeadline", () => {
   it("counts every non-think / non-tool row (plan / memory / marker …) as 其它 N 步", () => {
     expect(
       processHeadline(
-        { think: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", durationMs: null },
+        { think: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
         t,
       ),
     ).toBe("其它 3 步");

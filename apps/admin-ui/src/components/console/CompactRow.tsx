@@ -13,7 +13,7 @@ import { useTranslation } from "react-i18next";
 
 import type { CompactRow as CompactRowT } from "../../api/trajectory_rows";
 import type { PlanStepStatus } from "../../api/plan";
-import type { ToolCallEntry } from "../../api/tool_timeline";
+import { skillNameOf, type ToolCallEntry } from "../../api/tool_timeline";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { ToolCallCard } from "../ToolTimeline";
@@ -72,6 +72,14 @@ function rowLabel(row: CompactRowT, liveText: string | undefined, t: TFn): strin
       return `${t("console.row_think")} · ${firstLine}`;
     }
     case "tool": {
+      // skill_view 是「LLM 读取技能」的唯一 run 期信号 —— 展示成技能行
+      // (技能名 + 文件路径)而不是一坨 args JSON。
+      const skill = skillNameOf(row.entry);
+      if (skill !== null) {
+        const path = typeof row.entry.args.path === "string" ? row.entry.args.path : "";
+        const target = path === "" || path === "SKILL.md" ? skill : `${skill}/${path}`;
+        return `${t("console.row_skill")} · ${target} → ${toolResultText(row.entry, t)}`;
+      }
       const argsStr = truncate(JSON.stringify(row.entry.args), 80);
       return `${row.entry.toolName} · ${argsStr} → ${toolResultText(row.entry, t)}`;
     }

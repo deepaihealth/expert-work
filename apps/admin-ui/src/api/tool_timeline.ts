@@ -299,6 +299,51 @@ export function parseToolCalls(
   return entries;
 }
 
+/** The lazy-skill loader tool (orchestrator ``skill_view.py``) — the only
+ *  run-time signal of "the LLM read skill X". Eagerly-injected skill bodies
+ *  leave no per-run trace at all, so every skill-usage surface keys off this
+ *  one tool name. */
+export const SKILL_VIEW_TOOL = "skill_view";
+
+/** The skill a ``skill_view`` call read (``args.skill_name``), or ``null``
+ *  for any other tool / a malformed call. */
+export function skillNameOf(entry: ToolCallEntry): string | null {
+  if (entry.toolName !== SKILL_VIEW_TOOL) return null;
+  const name = entry.args.skill_name;
+  return typeof name === "string" && name.trim() !== "" ? name.trim() : null;
+}
+
+/** Breakdown / summary label for a call — ``skill:<name>`` for a skill_view
+ *  read, the bare tool name otherwise. Single source for every "N ×tool"
+ *  aggregation line (process strip headline, ledger turn/calls summaries). */
+export function toolSummaryLabel(entry: ToolCallEntry): string {
+  const skill = skillNameOf(entry);
+  return skill === null ? entry.toolName : `skill:${skill}`;
+}
+
+/** One skill the agent read this turn, with how many files it pulled. */
+export interface TurnSkill {
+  name: string;
+  reads: number;
+}
+
+/** Skills read via successful ``skill_view`` calls in this turn's events —
+ *  first-read order, one entry per skill (multiple file reads of the same
+ *  skill fold into ``reads``). Failed lookups (skill/path not found) don't
+ *  count as "read". */
+export function skillsFromTools(events: readonly SseEvent[]): TurnSkill[] {
+  const byName = new Map<string, TurnSkill>();
+  for (const entry of parseToolCalls(events)) {
+    if (entry.status !== "success") continue;
+    const name = skillNameOf(entry);
+    if (name === null) continue;
+    const existing = byName.get(name);
+    if (existing) existing.reads += 1;
+    else byName.set(name, { name, reads: 1 });
+  }
+  return [...byName.values()];
+}
+
 /** An artifact the agent registered this turn — drives the inline per-message
  *  download row (the agent can't emit a download URL itself; the UI renders it
  *  from the artifact name, the same way deer-flow surfaces ``present_files``). */
