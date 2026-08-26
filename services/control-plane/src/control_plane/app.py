@@ -1762,6 +1762,8 @@ def create_app(
                     user_mcp_oauth_pool_provider=_user_mcp_oauth_pool_provider,
                     # Stream X (Mini-ADR X-4) — sub-agents resolve skills too.
                     skill_store=resolved_skill_store,
+                    # BUG-19b — 子代的技能创作工具此前在无审计状态下构建。
+                    audit_logger=resolved_audit,
                     skill_activity_recorder=skill_activity_recorder,
                     tenant_config_service=resolved_tenant_config_service,
                     skill_asset_store=skill_asset_store,
@@ -1796,6 +1798,8 @@ def create_app(
                         # MCP-OAUTH (OA-3b-后续) — workers inherit caller OAuth pool.
                         user_mcp_oauth_pool_provider=_user_mcp_oauth_pool_provider,
                         skill_store=resolved_skill_store,
+                        # BUG-19b — worker 的技能创作工具同样要挂审计。
+                        audit_logger=resolved_audit,
                         skill_activity_recorder=skill_activity_recorder,
                         tenant_config_service=resolved_tenant_config_service,
                         skill_asset_store=skill_asset_store,

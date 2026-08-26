@@ -218,7 +218,12 @@ export function ConversationDetail() {
     void loadHistory(threadId, viewedTenantId);
   }, [threadId, viewedReady, viewedTenantId, loadHistory, resetHistory]);
 
-  const convoRuns = convo?.runs;
+  // Deflake/H-1 修订 —— 必须取 **viewed** 行的 runs,不是裸 ``convo``:切换
+  // 线程后的一两个 render 里 ``convo`` 还是旧线程的行,拿旧 runs 触发下面的
+  // 成长复配会给**新** threadId 发一次 ``loadHistory(B, undefined)``(错
+  // 租户的垃圾请求;跨租户线程在测试里表现为 listThreadRuns(B, undefined)
+  // 时序性抢跑 = 那个咬了三个 PR 的 flake 的病根)。
+  const convoRuns = viewedConvo?.runs;
 
   // D-5 — a fresh run-list read after the initial pairing: a NEW run
   // (another user message, or an approval decide's continuation) re-pairs

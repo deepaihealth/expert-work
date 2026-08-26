@@ -80,3 +80,26 @@ def test_tools_narrowed_by_allowlist() -> None:
 def test_dynamic_workers_stays_enabled_for_recursion() -> None:
     w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
     assert w.spec.dynamic_workers.enabled is True
+
+
+def test_manage_task_stripped_even_when_allowlist_keeps_it() -> None:
+    """BUG-19b —— worker 无 TriggerStore,manage_task 留在合成 spec 里必撞
+    build_agent 硬闸(真栈 run 8829abdf 三次 spawn_worker 全败于此)。与剥
+    ``triggers:`` 块同一意图:worker 不排任务。空 allowlist(全继承)与显式
+    allowlist 点名放行两种路径都必须剥——过滤器放行不等于构建可行。"""
+    parent = _parent(
+        tools=[
+            {"type": "builtin", "name": "web_search", "config": {}},
+            {"type": "builtin", "name": "manage_task", "config": {}},
+        ]
+    )
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    names = {getattr(t, "name", None) for t in w.spec.tools}
+    assert "manage_task" not in names
+    assert "web_search" in names
+
+    w2 = synthesize_worker_spec(
+        parent, role=None, max_iterations=8, allowed_toolsets=["web_search", "manage_task"]
+    )
+    names2 = {getattr(t, "name", None) for t in w2.spec.tools}
+    assert "manage_task" not in names2
