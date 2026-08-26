@@ -292,7 +292,7 @@ async def test_has_live_stream_is_publisher_fed_only() -> None:
     sub = bridge.subscribe(run_id, heartbeat_interval=0.01)
     first = await anext(sub)
     assert first is HEARTBEAT_SENTINEL
-    await sub.aclose()
+    await sub.aclose()  # type: ignore[attr-defined]  # 协议声明是 AsyncIterator,实现是生成器
     assert bridge.has_live_stream(run_id) is False
 
     # 四条发布者路径逐一置 fed。
