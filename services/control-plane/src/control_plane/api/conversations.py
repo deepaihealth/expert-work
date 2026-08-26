@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from control_plane.api._authz import console_only, require
+from control_plane.api._session_title import backfill_titles
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -279,6 +280,14 @@ def build_conversations_router() -> APIRouter:
                     order_by="last_activity",
                     limit=clamped,
                     offset=offset,
+                )
+                # NULL title 兜底(照 sessions 列表同款,搬进 _session_title
+                # 共享):对外平面早期建的会话没有标题,对话页整页「未命名
+                # 对话」(2026-08-26 反馈)。只处理本页、best-effort、落库
+                # 一次;跨租户分支不做 —— 不替外租户写行。
+                runtime = request.app.state.agent_runtime
+                metas = await backfill_titles(
+                    metas, threads=threads, checkpointer=runtime.durable_checkpointer
                 )
                 total = await threads.count_by_tenant(
                     scope.tenant_id,

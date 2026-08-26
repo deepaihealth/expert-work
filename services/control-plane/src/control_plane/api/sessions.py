@@ -23,18 +23,17 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only, require_key_scope
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._session_title import first_message_title
+from control_plane.api._session_title import backfill_titles
 from control_plane.api._user_scope import (
     caller_owns_thread,
     get_user_repo,
@@ -162,34 +161,6 @@ def _get_workspace_file_client(request: Request) -> WorkspaceStore | None:
     # Named distinctly from ``_get_workspace_store`` above (that one serves
     # the ``UserWorkspaceStore`` volume-metadata row, not file bytes).
     return request.app.state.workspace_store  # type: ignore[no-any-return]
-
-
-async def _backfill_titles(
-    items: list[ThreadMeta],
-    *,
-    threads: ThreadMetaStore,
-    checkpointer: BaseCheckpointSaver[Any] | None,
-) -> list[ThreadMeta]:
-    """Fill in a title for any listed thread that has none.
-
-    Threads created before auto-titling carry a NULL title and render as a
-    ``thread_id`` hash. Derive the title from the thread's checkpoint (its first
-    user message) and persist it, so the fix is one-time per thread. Bounded to
-    the listed page. Best-effort — a missing checkpoint / read error leaves the
-    hash fallback. Callers run this inside the tenant scope so the persist
-    respects RLS.
-    """
-    if checkpointer is None:
-        return items
-    out: list[ThreadMeta] = []
-    for m in items:
-        if m.title is None:
-            title = await first_message_title(checkpointer, m.thread_id)
-            if title:
-                await threads.update_title(m.thread_id, title, tenant_id=m.tenant_id)
-                m = m.model_copy(update={"title": title})
-        out.append(m)
-    return out
 
 
 async def _resolve_agent_selection(
@@ -837,7 +808,7 @@ def build_sessions_router() -> APIRouter:
                 # checkpoint's first user message and persist (one-time per
                 # thread; only the listed page, so bounded). Best-effort: a
                 # read failure just leaves the hash fallback.
-                items = await _backfill_titles(
+                items = await backfill_titles(
                     items, threads=threads, checkpointer=runtime.durable_checkpointer
                 )
         audit_tenant = (

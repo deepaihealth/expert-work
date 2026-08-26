@@ -44,6 +44,7 @@ from control_plane.api._idempotency import (
     request_digest,
 )
 from control_plane.api._quota_admission import check_admission
+from control_plane.api._session_title import title_from_text
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
@@ -465,12 +466,18 @@ async def _resolve_session(
     users: TenantUserStore,
     instances: AgentInstanceStore,
     disable_service: AgentDisableService,
+    first_input: str | None = None,
 ) -> tuple[AgentSpecRecord, UUID, UUID]:
     """Resolve agent_code → active record, mint the end-user, create / continue
     the session thread, and touch the per-user instance binding. Returns
     ``(record, thread_id, end_user_id)``. Raises :class:`_SessionError`.
 
-    Shared by the external session-bind and run endpoints (M1-5b)."""
+    Shared by the external session-bind and run endpoints (M1-5b).
+
+    ``first_input`` — run 端点传本轮用户输入,给还没有标题的会话截一个
+    auto-title(照控制台 run 入口 ``runs.py`` 的同款先例)。此前对外平面
+    从不写 title,project-service 建的会话在对话页全显示「未命名对话」
+    (2026-08-26 用户反馈)。best-effort:标题失败不挡 run。"""
     # Stream RT-4 (RT-ADR-16) — kill switch gate: a disabled agent accepts no
     # new sessions / runs. Checked before resolving the record so a disabled
     # agent is opaque regardless of which version is active.
@@ -538,11 +545,13 @@ async def _resolve_session(
     except ExternalScopeError as exc:
         raise _SessionError(exc.code, exc.message, exc.status_code) from exc
 
+    needs_title = False
     if session_id is not None:
         meta = await threads.get(session_id, tenant_id=tenant_id)
         if meta is None or meta.user_id != end_user_id or meta.agent_name != agent_code:
             raise _SessionError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
         thread_id = session_id
+        needs_title = meta.title is None
     else:
         thread_id = uuid4()
         await threads.create(
@@ -553,6 +562,15 @@ async def _resolve_session(
             agent_name=agent_code,
             agent_version=record.version,
         )
+        needs_title = True
+
+    if needs_title and first_input:
+        auto_title = title_from_text(first_input)
+        if auto_title:
+            try:
+                await threads.update_title(thread_id, auto_title, tenant_id=tenant_id)
+            except Exception:
+                logger.warning("external_session.auto_title_failed", exc_info=True)
 
     await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
     return record, thread_id, end_user_id
@@ -1246,6 +1264,7 @@ def build_agents_router() -> APIRouter:
                 users=users,
                 instances=instances,
                 disable_service=disable_service,
+                first_input=payload.input,
             )
         except _SessionError as exc:
             return _envelope_error(exc.code, exc.message, exc.status_code)

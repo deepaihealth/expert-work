@@ -181,6 +181,48 @@ async def client_and_threads() -> AsyncIterator[tuple[AsyncClient, dict[str, UUI
 
 
 @pytest.mark.asyncio
+async def test_list_backfills_null_titles_from_the_checkpoint(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """NULL title 的会话在对话页兜底成 checkpoint 首条用户消息(并落库)。
+
+    对外平面早期建的会话没有标题,对话页整页「未命名对话」(2026-08-26
+    用户反馈)。sessions 列表早有这层兜底,对话页此前直接吐 ``meta.title``。
+    """
+    from langchain_core.messages import BaseMessage, HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import START, StateGraph
+    from langgraph.graph.message import add_messages
+    from typing_extensions import Annotated as _Ann, TypedDict as _TD
+
+    client, ids = client_and_threads
+
+    class _SeedState(_TD):
+        messages: _Ann[list[BaseMessage], add_messages]
+
+    checkpointer = InMemorySaver()
+    graph = StateGraph(_SeedState)
+    graph.add_node("n", lambda _state: {"messages": []})
+    graph.add_edge(START, "n")
+    seeded = graph.compile(checkpointer=checkpointer)
+    await seeded.ainvoke(
+        {"messages": [HumanMessage("退款流程是什么样的,需要几天?")]},
+        config={"configurable": {"thread_id": str(ids["other_user"]), "checkpoint_ns": ""}},
+    )
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.agent_runtime.durable_checkpointer = checkpointer
+
+    resp = await client.get("/v1/conversations")
+    assert resp.status_code == 200
+    items = {i["thread_id"]: i for i in resp.json()["data"]["items"]}
+    assert items[str(ids["other_user"])]["title"] == "退款流程是什么样的,需要几天?"
+
+    # 落库了 —— 再列一次不再依赖 checkpoint(store 直读同值)。
+    meta = await app.state.thread_meta_repo.get(ids["other_user"], tenant_id=_TENANT)
+    assert meta is not None and meta.title == "退款流程是什么样的,需要几天?"
+
+
+@pytest.mark.asyncio
 async def test_list_rolls_up_runs_and_tokens(
     client_and_threads: tuple[AsyncClient, dict[str, UUID]],
 ) -> None:

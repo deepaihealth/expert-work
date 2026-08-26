@@ -178,6 +178,50 @@ async def test_sessions_list_only_returns_this_users_sessions(ctx: _Ctx) -> None
 
 
 @pytest.mark.asyncio
+async def test_first_external_run_auto_titles_the_session(ctx: _Ctx) -> None:
+    """对外首条 run 的 input 截成会话标题(照控制台 ``runs.py`` 同款先例)。
+
+    此前对外平面从不写 title,project-service 建的会话在对话页整页
+    「未命名对话」(2026-08-26 用户反馈)。第二条 run 不覆盖已有标题。
+    """
+    await ctx.seed_agent()
+    a = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "帮我生成一份 7 天的康复训练方案", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert a.status_code == 202, a.text
+    session_id = a.json()["data"]["thread_id"]
+
+    listed = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    sessions = {s["session_id"]: s for s in listed.json()["data"]["sessions"]}
+    assert sessions[session_id]["title"] == "帮我生成一份 7 天的康复训练方案"
+
+    # 第二条 run 不覆盖。
+    await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={
+            "user_id": "cust-77",
+            "session_id": session_id,
+            "input": "换个说法再来一份",
+            "mode": "queue",
+        },
+        headers=ctx.headers,
+    )
+    again = await ctx.client.get(
+        "/v1/agents/support-bot/sessions",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    still = {s["session_id"]: s for s in again.json()["data"]["sessions"]}
+    assert still[session_id]["title"] == "帮我生成一份 7 天的康复训练方案"
+
+
+@pytest.mark.asyncio
 async def test_sessions_running_reflects_persistent_run_status(ctx: _Ctx) -> None:
     """``running`` must come from the durable ``RunStore`` — not
     ``RunManager.has_inflight``, a per-process in-memory registry (its own
