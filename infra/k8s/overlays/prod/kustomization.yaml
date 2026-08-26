@@ -1,8 +1,13 @@
 # Production overlay — PROD-5(2026-08-24)把 W2-PR1 的占位骨架补成与
 # overlays/test/ 同构的完整 overlay:镜像 mirror 全表、Langfuse 两 patch、
-# searxng CN settings、单副本 patch。环境专属真值(域名/OSS/tag)仍是
+# searxng CN settings。环境专属真值(域名/OSS/tag)仍是
 # PROD_PLACEHOLDER_* —— 开荒日按 docs/runbooks/production-release.md 填,
 # release.sh prod 在 apply 前会拒绝任何残留 placeholder。
+#
+# 2026-08-26 起回到 base 的 2 副本首发:PROD-1(#1312 跨副本 SSE 兜底)+
+# PROD-12(#1315 RPM 副本除法)落地后,单副本 patch(2026-08-24 拍板的
+# 权宜)已删。副本数与 configmap-patch.yaml 的 EXPERT_WORK_REPLICA_COUNT
+# 必须一起改 —— smoke.sh 会校验两者一致。
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -67,7 +72,6 @@ patches:
   - path: keycloak-patch.yaml
   - path: langfuse-configmap-patch.yaml
   - path: langfuse-ingress-patch.yaml
-  - path: replicas-patch.yaml
   - path: workspace-nas-patch.yaml
 
 # Secrets (control-plane-secrets / keycloak-secrets / langfuse-secrets /

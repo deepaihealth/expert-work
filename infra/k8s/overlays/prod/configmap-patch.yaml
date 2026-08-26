@@ -22,6 +22,10 @@ data:
   EXPERT_WORK_OIDC_JWKS_URI: "https://PROD_PLACEHOLDER_DOMAIN/kc/realms/expert-work/protocol/openid-connect/certs"
   # 与 test 一致(#1145 第三方对接拍板):成员开通走 password 模式。
   EXPERT_WORK_MEMBER_PROVISIONING_MODE: "password"
+  # PROD-12(#1315):每副本的模型 RPM = 配置值 / 本值(向上取整),让
+  # N 副本的总出量不超过厂商额度。必须与 control-plane Deployment 的
+  # spec.replicas(base 为 2)同步改 —— smoke.sh 校验两者一致。
+  EXPERT_WORK_REPLICA_COUNT: "2"
   # 首个平台管理员:该邮箱用户首次以已验证 JWT 登录且系统零 platform admin
   # 时自动升 system_admin(bootstrap-admin runbook 的生产推荐路径)。
   EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL: "PROD_PLACEHOLDER_ADMIN_EMAIL"
