@@ -230,6 +230,11 @@ class _ScriptedBridge(StreamBridge):
     async def publish_end(self, run_id: UUID, *, status: str) -> None:
         raise AssertionError("消费侧的测试不应该往 bridge 里发帧")
 
+    def has_live_stream(self, run_id: UUID) -> bool:
+        # 本 fake 的既有测试全是「属主本地」形态 —— 恒 True 保持它们走订阅
+        # 分支;PROD-1 轮询分支的测试用专门的 unfed fake。
+        return True
+
     async def subscribe(
         self,
         run_id: UUID,
@@ -992,3 +997,186 @@ async def test_hole_tracking_overflow_evicts_across_already_tracked_holes(
     # 一帧不许吞:1..9 要么交付要么落在某个 gap 区间里。
     delivered = set(_seqs(frames))
     assert all(s in delivered or s in covered for s in range(1, 10)), f"{delivered} / {gaps}"
+
+
+# ---------------------------------------------------------------------------
+# PROD-1 —— 跨副本兜底:本进程 bridge 无属主状态时,live attach 轮询 durable 表
+# tail-follow,终态与产物清单从 run 行探针取。
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedProbe:
+    """按调用轮次执行副作用并给出 run 行状态的 ``run_probe``。
+
+    每轮一个 ``(action, status, artifacts)``:``action`` 是零参协程函数
+    (模拟属主副本在这一轮之前又落了几行库),脚本耗尽后停在最后一轮的
+    返回值上(轮询分支的终态静默轮会多问几次)。
+    """
+
+    def __init__(
+        self,
+        rounds: Sequence[
+            tuple[
+                Callable[[], Awaitable[None]] | None,
+                RunStatus,
+                list[dict[str, Any]] | None,
+            ]
+        ],
+    ) -> None:
+        self._rounds = list(rounds)
+        self.calls = 0
+
+    async def __call__(self) -> tuple[RunStatus, list[dict[str, Any]] | None]:
+        index = min(self.calls, len(self._rounds) - 1)
+        self.calls += 1
+        action, status, artifacts = self._rounds[index]
+        if action is not None and self.calls - 1 == index:
+            await action()
+        return (status, artifacts)
+
+
+@pytest.fixture
+def _fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    import control_plane.api._run_event_stream as mod
+
+    monkeypatch.setattr(mod, "_STORE_POLL_INTERVAL_S", 0.0)
+
+
+async def _collect_poll(
+    *,
+    run_id: UUID,
+    event_store: InMemoryRunEventStore,
+    bridge: StreamBridge,
+    probe: _ScriptedProbe,
+    since_seq: int | None = None,
+) -> list[tuple[str | None, str, Any]]:
+    plan = await build_event_producer(
+        run_id=run_id,
+        run_status=RunStatus.RUNNING,
+        event_store=event_store,
+        stream_bridge=bridge,
+        run_probe=probe,
+        since_seq=since_seq,
+        scope=None,
+    )
+    assert plan.next_seq is None
+    chunks = await asyncio.wait_for(_aiter_to_list(plan.producer), 10)
+    return _parse_sse(chunks)
+
+
+async def _aiter_to_list(it: AsyncIterator[bytes]) -> list[bytes]:
+    return [chunk async for chunk in it]
+
+
+@pytest.mark.asyncio
+async def test_poll_fallback_tails_store_and_ends_from_run_row(_fast_poll: None) -> None:
+    """非属主副本(bridge unfed)attach:落库帧持续跟上,run 行翻终态后 end
+    帧带真实终态 + 产物清单 —— 与 replay 分支同源构造。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 1])
+    manifest = [{"name": "a.pptx", "kind": "document", "version": 2, "created_at": "t"}]
+
+    probe = _ScriptedProbe(
+        [
+            (None, RunStatus.RUNNING, None),
+            # 属主这一轮又落了一行 —— 轮询必须把它跟上。
+            (lambda: _seed_rows(store, run_id, [2]), RunStatus.RUNNING, None),
+            (None, RunStatus.SUCCESS, manifest),
+        ]
+    )
+    frames = await _collect_poll(
+        run_id=run_id, event_store=store, bridge=InMemoryStreamBridge(), probe=probe
+    )
+    assert _seqs(frames) == [0, 1, 2]
+    _end_id, end_name, end_data = frames[-1]
+    assert end_name == "end"
+    assert end_data == {"status": "success", "run_id": str(run_id), "artifacts": manifest}
+
+
+@pytest.mark.asyncio
+async def test_poll_fallback_not_taken_when_bridge_is_fed(_fast_poll: None) -> None:
+    """属主副本上 attach(bridge 有发布者状态):照旧走订阅分支,探针一次都
+    不该被问 —— 实时路径的延迟不能被轮询拖慢。"""
+    run_id = uuid4()
+    bridge = InMemoryStreamBridge()
+    await bridge.publish(run_id, "updates", {"n": 0})
+    await bridge.publish_end(run_id, status="success")
+
+    probe = _ScriptedProbe([(None, RunStatus.RUNNING, None)])
+    frames = await _collect_poll(
+        run_id=run_id, event_store=InMemoryRunEventStore(), bridge=bridge, probe=probe
+    )
+    assert frames[-1][1] == "end"
+    assert probe.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_fallback_flushes_store_holes_as_gap(_fast_poll: None) -> None:
+    """落库空洞(H-7 吞批 / drop-oldest)在轮询分支同样以 ``gap`` 帧显式告知,
+    不静默跳号 —— 与订阅分支的洞记账语义同源(共用 ``_drain_store``)。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0, 1, 4])
+
+    probe = _ScriptedProbe([(None, RunStatus.SUCCESS, None)])
+    frames = await _collect_poll(
+        run_id=run_id, event_store=store, bridge=InMemoryStreamBridge(), probe=probe
+    )
+    assert _seqs(frames) == [0, 1, 4]
+    gaps = [data for _id, name, data in frames if name == "gap"]
+    assert gaps == [{"from": 2, "to": 3}]
+    assert frames[-1][1] == "end"
+
+
+@pytest.mark.asyncio
+async def test_poll_terminal_grace_picks_up_late_flushed_rows(_fast_poll: None) -> None:
+    """终态先于最后几行落库可见(属主批写异步):看到终态后仍要把迟到的行
+    追完,连续静默两轮才收流 —— 否则尾部帧被 end 截掉。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0])
+
+    probe = _ScriptedProbe(
+        [
+            (None, RunStatus.SUCCESS, None),
+            # 终态已见,但这一轮才有一行迟到的库 —— 必须被跟上。
+            (lambda: _seed_rows(store, run_id, [1]), RunStatus.SUCCESS, None),
+        ]
+    )
+    frames = await _collect_poll(
+        run_id=run_id, event_store=store, bridge=InMemoryStreamBridge(), probe=probe
+    )
+    assert _seqs(frames) == [0, 1]
+    assert frames[-1][1] == "end"
+
+
+class _FakeRunStore:
+    """``make_run_probe`` 只用 ``get(run_id=..., tenant_id=...)`` 这一个口。"""
+
+    def __init__(self, row: Any) -> None:
+        self.row = row
+        self.calls: list[tuple[UUID, UUID]] = []
+
+    async def get(self, *, run_id: UUID, tenant_id: UUID) -> Any:
+        self.calls.append((run_id, tenant_id))
+        return self.row
+
+
+@pytest.mark.asyncio
+async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
+    from types import SimpleNamespace
+
+    from control_plane.api._run_event_stream import make_run_probe
+
+    run_id, tenant_id = uuid4(), uuid4()
+    manifest = [{"name": "a.json", "kind": "data", "version": 1, "created_at": "t"}]
+    store = _FakeRunStore(SimpleNamespace(status=RunStatus.SUCCESS, artifacts=manifest))
+    probe = make_run_probe(runs=store, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
+    assert await probe() == (RunStatus.SUCCESS, manifest)
+    assert store.calls == [(run_id, tenant_id)]
+
+    # run 行中途消失(purge 极端路径)—— 按 interrupted 收流,轮询不挂死。
+    vanished = _FakeRunStore(None)
+    probe2 = make_run_probe(runs=vanished, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
+    assert await probe2() == (RunStatus.INTERRUPTED, None)

@@ -44,7 +44,7 @@ from control_plane.api._idempotency import (
     request_digest,
 )
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run_probe
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
@@ -270,6 +270,8 @@ async def _idempotent_run_response(
     mode: Literal["stream", "queue"],
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
+    run_store: RunStore,
+    tenant_id: UUID,
     stream_format: str,
 ) -> StreamingResponse | JSONResponse:
     """Render an idempotency-hit ``run`` back in the shape its ``mode`` expects.
@@ -297,6 +299,9 @@ async def _idempotent_run_response(
             run=run,
             event_store=event_store,
             stream_bridge=stream_bridge,
+            # PROD-1 —— 幂等重放的 stream 分支就是「重连」:原 run 可能正在别的
+            # 副本上执行(重试请求落到非首发副本),live attach 需要轮询兜底。
+            run_probe=make_run_probe(runs=run_store, run_id=run.run_id, tenant_id=tenant_id),
             stream_format=stream_format,
         )
     return JSONResponse(
@@ -1249,6 +1254,8 @@ def build_agents_router() -> APIRouter:
                     mode=payload.mode,
                     event_store=event_store,
                     stream_bridge=runtime.stream_bridge,
+                    run_store=run_store,
+                    tenant_id=tenant_id,
                     stream_format=payload.stream_format,
                 )
 
@@ -1483,6 +1490,8 @@ def build_agents_router() -> APIRouter:
                 mode=payload.mode,
                 event_store=event_store,
                 stream_bridge=runtime.stream_bridge,
+                run_store=run_store,
+                tenant_id=tenant_id,
                 stream_format=payload.stream_format,
             )
 

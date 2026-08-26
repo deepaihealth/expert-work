@@ -275,3 +275,42 @@ async def test_publish_end_artifacts_ride_the_end_frame() -> None:
     await bridge2.publish_end(run2, status="success")
     events2 = await _drain(bridge2.subscribe(run2))
     assert events2[-1].data == {"status": "success"}
+
+
+@pytest.mark.asyncio
+async def test_has_live_stream_is_publisher_fed_only() -> None:
+    """PROD-1 —— 属主判别:只有发布者路径喂过的流才算「本进程有实时流」。
+
+    订阅自动建的空流**不算** —— 否则先 attach 的连接会把后续 attach 全骗进
+    一条永远没有帧的订阅(多副本下正是非属主副本的形态)。
+    """
+    bridge = InMemoryStreamBridge()
+    run_id = uuid4()
+    assert bridge.has_live_stream(run_id) is False
+
+    # 订阅一次(拉到心跳为止)—— 流被自动创建,但仍是 unfed。
+    sub = bridge.subscribe(run_id, heartbeat_interval=0.01)
+    first = await anext(sub)
+    assert first is HEARTBEAT_SENTINEL
+    await sub.aclose()
+    assert bridge.has_live_stream(run_id) is False
+
+    # 四条发布者路径逐一置 fed。
+    await bridge.publish(run_id, "updates", {"n": 0})
+    assert bridge.has_live_stream(run_id) is True
+
+    run_ephemeral = uuid4()
+    await bridge.publish_ephemeral(run_ephemeral, "token", {"text": "hi"})
+    assert bridge.has_live_stream(run_ephemeral) is True
+
+    run_end = uuid4()
+    await bridge.publish_end(run_end, status="success")
+    assert bridge.has_live_stream(run_end) is True
+
+    run_seeded = uuid4()
+    await bridge.seed_seq(run_seeded, next_seq=7)
+    assert bridge.has_live_stream(run_seeded) is True
+
+    # cleanup 之后回到「本进程无此 run」。
+    await bridge.cleanup(run_id)
+    assert bridge.has_live_stream(run_id) is False

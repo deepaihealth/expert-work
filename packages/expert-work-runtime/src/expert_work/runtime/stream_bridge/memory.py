@@ -50,6 +50,10 @@ class _RunStream:
     #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
     #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
     next_seq: int = 0
+    #: PROD-1 —— 发布者喂过没有。``subscribe`` 自动建的空流恒 False;只有
+    #: publish / publish_ephemeral / publish_end / seed_seq(属主路径)置 True。
+    #: :meth:`InMemoryStreamBridge.has_live_stream` 的判据。
+    fed: bool = False
 
 
 class InMemoryStreamBridge(StreamBridge):
@@ -90,6 +94,10 @@ class InMemoryStreamBridge(StreamBridge):
             )
         return stream.start_offset
 
+    def has_live_stream(self, run_id: UUID) -> bool:
+        stream = self._streams.get(run_id)
+        return stream is not None and stream.fed
+
     # -- StreamBridge API ------------------------------------------------------
 
     def _append_locked(self, stream: _RunStream, entry: StreamEvent) -> None:
@@ -107,6 +115,7 @@ class InMemoryStreamBridge(StreamBridge):
             # 发号必须在锁内,与入队原子完成 —— 把这两步拆开(哪怕只隔一个
             # await)就会让「先拿到号的帧后进缓冲区」成为可能,消费侧就得为乱序
             # 建一整套重排机制。这一行的位置就是那整套机制的替代品。
+            stream.fed = True
             seq = stream.next_seq
             stream.next_seq = seq + 1
             entry = StreamEvent(id=f"{int(time.time() * 1000)}-{seq}", event=event, data=data)
@@ -116,12 +125,14 @@ class InMemoryStreamBridge(StreamBridge):
     async def publish_ephemeral(self, run_id: UUID, event: str, data: Any) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
+            stream.fed = True
             self._append_locked(stream, StreamEvent(id=None, event=event, data=data))
 
     async def seed_seq(self, run_id: UUID, *, next_seq: int) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             # ``max`` —— 迟到的播种不能把发号器往回拨(回拨 = 撞 (run_id, seq) 主键)。
+            stream.fed = True
             stream.next_seq = max(stream.next_seq, next_seq)
 
     async def publish_end(
@@ -133,6 +144,7 @@ class InMemoryStreamBridge(StreamBridge):
     ) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
+            stream.fed = True
             stream.ended = True
             stream.end_status = status
             stream.end_artifacts = artifacts
