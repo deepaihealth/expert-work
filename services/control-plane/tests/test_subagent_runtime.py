@@ -8,7 +8,11 @@ from uuid import uuid4
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from control_plane.subagent_runtime import SubAgentNotFoundError, make_child_agent_builder
+from control_plane.subagent_runtime import (
+    SubAgentNotFoundError,
+    make_child_agent_builder,
+    make_worker_build_fn,
+)
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.protocol import AgentSpec, AgentSpecStatus
 from expert_work.testing import InMemorySecretStore
@@ -489,3 +493,56 @@ async def test_child_builder_no_oauth_id_shares_cache(
 
     assert len(build_calls) == 1  # cached, shared
     assert build_calls[0]["tool_env"].user_mcp_oauth_pool is None
+
+
+@pytest.mark.asyncio
+async def test_child_builder_forwards_skill_store_to_build_agent(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """skill_store 必须转发进 build_agent(2026-08-26 真栈事故)。
+
+    此前只喂了 skill_resolver、漏了 skill_store 本体——而 build_agent 对
+    「spec 声明技能创作 builtin(remember/author_skill 系)」有硬闸:无
+    skill_store 直接 AgentFactoryError。现网 Agent 全带这类工具,等于静态
+    子 Agent 委派全数在构建期炸掉。kwargs 里根本没有这个键,所以本断言在
+    旧代码下必红(KeyError),不是恒真。
+    """
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    sentinel = object()
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        skill_store=sentinel,  # type: ignore[arg-type]
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    assert build_calls[0]["skill_store"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_worker_build_fn_forwards_skill_store_to_build_agent(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """spawn_worker 的 worker 构建同病同修:worker 继承父 spec,父带技能
+    创作 builtin 时 worker 构建撞同一道闸(真栈 run 90163f46 四次委派全
+    败于此,主 Agent 只能自己扛完子任务)。"""
+    sentinel = object()
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+        skill_store=sentinel,  # type: ignore[arg-type]
+    )
+
+    await build_fn(_spec("parent"), tenant_id=uuid4(), role="probe", depth=1)
+
+    assert build_calls[0]["skill_store"] is sentinel
