@@ -1759,6 +1759,15 @@ _THINKING_BUDGET_RATIO: dict[str, float] = {
 _THINKING_BUDGET_MIN = 1024
 _THINKING_BUDGET_MAX = 81_920
 
+#: GLM 5.2+ ``reasoning_effort`` scale is max/high/low — no "medium", so the
+#: manifest's medium rounds up to high (bigmodel core-params page, 2026-08).
+_GLM_EFFORT_LEVEL: dict[str, str] = {
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "max": "max",
+}
+
 
 def _thinking_budget(effort: str, max_tokens: int) -> int:
     ratio = _THINKING_BUDGET_RATIO[effort]
@@ -1808,6 +1817,15 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
     dynamic thinking (CM-L7), so "on at default depth" means sending nothing.
     """
     if entry.thinking == "effort":
+        if model.provider == "glm":
+            # GLM 5.2+ — ``reasoning_effort`` on a max/high/low scale; the
+            # ``thinking`` object stays the explicit on/off channel.
+            if model.effort is None:
+                return {"thinking": {"type": "enabled"}}
+            return {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": _GLM_EFFORT_LEVEL[model.effort],
+            }
         # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
         # manifest's level names.
         return {"reasoning_effort": model.effort} if model.effort is not None else None
@@ -1828,7 +1846,7 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
             "enable_thinking": True,
             "thinking_budget": _thinking_budget(model.effort, model.max_tokens),
         }
-    # "toggle" — GLM / Kimi: on/off only; any level means "on".
+    # "toggle" — Kimi / GLM ≤5.1: on/off only; any level means "on".
     return {"thinking": {"type": "enabled"}}
 
 
@@ -1841,10 +1859,13 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
     (owner decision: "降最低档"); the UI flags this as not-fully-off.
     """
     if entry.thinking == "effort":
+        # GLM 5.2+ keeps its real off switch — no "minimal" on the GLM scale.
+        if model.provider == "glm":
+            return {"thinking": {"type": "disabled"}}
         return {"reasoning_effort": "minimal"}
     if entry.thinking == "budget" and model.provider == "qwen":
         return {"enable_thinking": False}
-    # doubao (budget) + GLM/Kimi (toggle) share the disabled shape.
+    # doubao (budget) + toggle vendors (Kimi / GLM ≤5.1) share the disabled shape.
     return {"thinking": {"type": "disabled"}}
 
 
@@ -1889,7 +1910,7 @@ def _escalated_model(model: ModelSpec) -> ModelSpec | None:
       into a token budget at the adapter layer). Escalation still
       requires the manifest to have touched a compute control —
       conservative default-off, unchanged from CM-9.
-    - **toggle** vendors (GLM / Kimi) degrade to one hop: thinking off →
+    - **toggle** vendors (Kimi / GLM ≤5.1) degrade to one hop: thinking off →
       "high" (= turn it on; the level itself collapses at translation).
       A manifest that already enabled thinking has nowhere to go. This
       is the one shape where an untouched manifest DOES escalate — for
@@ -2289,7 +2310,7 @@ def _build_provider(
             "remove model.thinking_enabled from the manifest"
         )
     if compat_entry is not None and compat_entry.thinking == "toggle" and model.effort is not None:
-        # GLM / Kimi have no depth — every level collapses to "enabled".
+        # Toggle entries (Kimi / GLM ≤5.1) have no depth — every level collapses to "enabled".
         logger.debug(
             "agent_factory.thinking_toggle model=%s effort=%s collapses to enabled",
             model.name,

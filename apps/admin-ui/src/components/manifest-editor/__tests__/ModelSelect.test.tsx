@@ -99,6 +99,15 @@ const CATALOG: ModelCatalog = {
           thinking: "toggle",
           thinking_default: true,
         },
+        {
+          name: "glm-5.3",
+          vision: false,
+          embeddings: false,
+          context_window: 1000000,
+          deprecated: false,
+          thinking: "effort",
+          thinking_default: true,
+        },
       ],
     },
   ],
@@ -397,6 +406,18 @@ describe("ModelSelect", () => {
     rerender(
       <ModelSelect
         value={{ provider: "glm", name: "glm-5.1" }}
+        catalog={CATALOG}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByTestId("model-select-thinking-hint"),
+    ).not.toBeInTheDocument();
+    // glm 5.2+ is shape "effort" but keeps a REAL off
+    // (thinking.type=disabled) — still no hint.
+    rerender(
+      <ModelSelect
+        value={{ provider: "glm", name: "glm-5.3" }}
         catalog={CATALOG}
         onChange={vi.fn()}
       />,

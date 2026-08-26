@@ -1271,6 +1271,41 @@ def test_thinking_payload_toggle_vendors_ignore_level() -> None:
     assert _thinking_payload(_vendor_model("kimi", "kimi-k2.6", adaptive_thinking=True)) == on
 
 
+def test_thinking_payload_glm_52_plus_effort_levels() -> None:
+    # GLM 5.2+ supports ``reasoning_effort`` (vendor docs 2026-08) on a
+    # max/high/low scale — no "medium", so the manifest's medium rounds up
+    # to high. The thinking object stays the on/off channel alongside it.
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", effort="low")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", effort="medium")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", effort="max")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+
+
+def test_thinking_payload_glm_52_plus_toggle_semantics_kept() -> None:
+    from orchestrator.agent_factory import _thinking_payload
+
+    # Force-on with no effort keeps the bare toggle; force-off is a REAL
+    # off — GLM has no "minimal", it must not degrade like other effort
+    # vendors. Untouched manifests still send nothing (vendor default).
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=True)) == {
+        "thinking": {"type": "enabled"}
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+        "thinking": {"type": "disabled"}
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3")) is None
+
+
 def test_thinking_payload_off_catalog_compat_sends_nothing() -> None:
     # CM-L5 — thinking wire formats differ per vendor, so off-catalog
     # OpenAI-compatible models never get a blind payload.

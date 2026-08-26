@@ -76,8 +76,11 @@ export function ModelSelect({
       : undefined;
   const hasThinkingKnob = !!currentEntry?.thinking;
   // reasoning_effort vendors have no off level — off degrades to "minimal".
+  // GLM (5.2+, shape "effort") keeps a real off via thinking.type=disabled.
   const cannotFullyDisable =
-    currentEntry?.thinking === "effort" && value.provider !== "anthropic";
+    currentEntry?.thinking === "effort" &&
+    value.provider !== "anthropic" &&
+    value.provider !== "glm";
   const thinkingOn = value.thinking_enabled ?? currentEntry?.thinking_default ?? false;
 
   const temperature = value.temperature ?? 0.2;

@@ -207,24 +207,27 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # Zhipu GLM — open.bigmodel.cn (2026-08)
     # glm-5.3 (released 2026-08-14; same base as 5.2 with extended long-horizon
     # post-training; 1M ctx per the bigmodel pricing page) is the current text
-    # flagship; glm-5.2 (1M) stays. glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
-    # and glm-4.6 (200K) are current text models. Vision goes through
-    # glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type toggle
-    # per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The older
-    # glm-4*-plus line is kept deprecated so existing manifests resolve.
+    # flagship; glm-5.2 (1M) stays. GLM-5.2 及以上 support ``reasoning_effort``
+    # (max/high/low per the bigmodel core-params page) → shape "effort"; the
+    # adapter keeps ``thinking.type`` as the on/off channel and maps the
+    # levels (no "medium" on GLM). glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
+    # and glm-4.6 (200K) are current text models, on/off only. Vision goes
+    # through glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type
+    # toggle per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The
+    # older glm-4*-plus line is kept deprecated so existing manifests resolve.
     "glm": (
         ModelEntry(
             name="glm-5.3",
             vision=False,
             context_window=1_000_000,
-            thinking="toggle",
+            thinking="effort",
             thinking_default=True,
         ),
         ModelEntry(
             name="glm-5.2",
             vision=False,
             context_window=1_000_000,
-            thinking="toggle",
+            thinking="effort",
             thinking_default=True,
         ),
         ModelEntry(
