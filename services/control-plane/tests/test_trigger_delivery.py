@@ -14,7 +14,12 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from control_plane.transcript import read_turns
-from control_plane.trigger_delivery import DeliveryOutcome, deliver_run_result, inject_delivery
+from control_plane.trigger_delivery import (
+    DeliveryOutcome,
+    deliver_run_result,
+    delivery_thread_lock,
+    inject_delivery,
+)
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import InMemoryThreadMessageStore, MessageTurn
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
@@ -436,8 +441,6 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
     """``deliver_run_result`` 必须把 ``inject_delivery``(整段读-查-写)包进
     ``delivery_thread_lock``,锁键 = originating thread、session_factory 原样
     透传 —— 锁包在写之外或漏传工厂,双副本窄窗双投就回来了。"""
-    import control_plane.trigger_delivery as td
-
     tenant, orig, scratch, run_id = uuid4(), uuid4(), uuid4(), uuid4()
     async with make_checkpointer("memory") as cp:
         spec = _spec()
@@ -464,8 +467,8 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
 
         order: list[str] = []
         factory_sentinel = object()
-        real_lock = td.delivery_thread_lock
-        real_inject = td.inject_delivery
+        real_lock = delivery_thread_lock
+        real_inject = inject_delivery
 
         @asynccontextmanager
         async def _spy_lock(session_factory: Any, thread_id: Any) -> AsyncIterator[None]:
@@ -480,8 +483,8 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
             order.append("inject")
             await real_inject(*args, **kwargs)
 
-        monkeypatch.setattr(td, "delivery_thread_lock", _spy_lock)
-        monkeypatch.setattr(td, "inject_delivery", _spy_inject)
+        monkeypatch.setattr("control_plane.trigger_delivery.delivery_thread_lock", _spy_lock)
+        monkeypatch.setattr("control_plane.trigger_delivery.inject_delivery", _spy_inject)
 
         trigger = TriggerRecord(
             id=uuid4(),
@@ -512,7 +515,7 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
             finished_at=_NOW,
         )
 
-        outcome = await td.deliver_run_result(
+        outcome = await deliver_run_result(
             trigger=trigger,
             run=run,
             runtime=runtime,
