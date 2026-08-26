@@ -618,9 +618,7 @@ async def test_permission_error_is_500_not_404(
 
 
 @pytest.mark.asyncio
-async def test_too_large_is_413_not_404(
-    external_client, seed_artifact_with_content, _ctx
-) -> None:
+async def test_too_large_is_413_not_404(external_client, seed_artifact_with_content, _ctx) -> None:
     """超下载闸 → 413 ARTIFACT_TOO_LARGE,不能和「不存在」合并成 404。
 
     2026-08-26 的教训:内嵌视频的 pptx 超过读闸,报 404 让对接方以为产物
@@ -630,9 +628,7 @@ async def test_too_large_is_413_not_404(
     """
     from orchestrator.tools import WorkspaceFileTooLargeError
 
-    await seed_artifact_with_content(
-        user_id="u-1", name="huge.pptx", kind="document", content=b"x"
-    )
+    await seed_artifact_with_content(user_id="u-1", name="huge.pptx", kind="document", content=b"x")
     _ctx.workspace_store.workspace_file_error = WorkspaceFileTooLargeError(
         "workspace file 'huge.pptx' exceeds the 67108864-byte download cap"
     )
