@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Annotated, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -178,6 +183,45 @@ async def client_and_threads() -> AsyncIterator[tuple[AsyncClient, dict[str, UUI
         # Content-search tests seed the transcript mirror directly.
         client.app_state = app.state  # type: ignore[attr-defined]
         yield client, ids
+
+
+@pytest.mark.asyncio
+async def test_list_backfills_null_titles_from_the_checkpoint(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """NULL title 的会话在对话页兜底成 checkpoint 首条用户消息(并落库)。
+
+    对外平面早期建的会话没有标题,对话页整页「未命名对话」(2026-08-26
+    用户反馈)。sessions 列表早有这层兜底,对话页此前直接吐 ``meta.title``。
+    """
+    client, ids = client_and_threads
+
+    # _SeedState 的注解名(Annotated/BaseMessage/add_messages)必须可在模块
+    # globals 解析 —— ``from __future__ import annotations`` 下 LangGraph 用
+    # get_type_hints 按模块命名空间求值注解,函数内 import 会 NameError。
+    class _SeedState(TypedDict):
+        messages: Annotated[list[BaseMessage], add_messages]
+
+    checkpointer = InMemorySaver()
+    graph = StateGraph(_SeedState)
+    graph.add_node("n", lambda _state: {"messages": []})
+    graph.add_edge(START, "n")
+    seeded = graph.compile(checkpointer=checkpointer)
+    await seeded.ainvoke(
+        {"messages": [HumanMessage("退款流程是什么样的,需要几天?")]},
+        config={"configurable": {"thread_id": str(ids["other_user"]), "checkpoint_ns": ""}},
+    )
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.agent_runtime.durable_checkpointer = checkpointer
+
+    resp = await client.get("/v1/conversations")
+    assert resp.status_code == 200
+    items = {i["thread_id"]: i for i in resp.json()["data"]["items"]}
+    assert items[str(ids["other_user"])]["title"] == "退款流程是什么样的,需要几天?"
+
+    # 落库了 —— 再列一次不再依赖 checkpoint(store 直读同值)。
+    meta = await app.state.thread_meta_repo.get(ids["other_user"], tenant_id=_TENANT)
+    assert meta is not None and meta.title == "退款流程是什么样的,需要几天?"
 
 
 @pytest.mark.asyncio
