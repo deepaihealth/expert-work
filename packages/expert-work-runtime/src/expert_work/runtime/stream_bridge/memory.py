@@ -44,6 +44,9 @@ class _RunStream:
     #: rather than stored on the module-level ``END_SENTINEL`` singleton,
     #: which would leak one run's status into every other run's stream.
     end_status: str | None = None
+    #: 产物清单契约 —— publish_end 捎带的产物登记快照;end 帧 data 与
+    #: ``end_status`` 同源同临界区,None 时帧上不出现该字段。
+    end_artifacts: list[dict[str, Any]] | None = None
     #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
     #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
     next_seq: int = 0
@@ -121,11 +124,18 @@ class InMemoryStreamBridge(StreamBridge):
             # ``max`` —— 迟到的播种不能把发号器往回拨(回拨 = 撞 (run_id, seq) 主键)。
             stream.next_seq = max(stream.next_seq, next_seq)
 
-    async def publish_end(self, run_id: UUID, *, status: str) -> None:
+    async def publish_end(
+        self,
+        run_id: UUID,
+        *,
+        status: str,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             stream.ended = True
             stream.end_status = status
+            stream.end_artifacts = artifacts
             stream.condition.notify_all()
 
     async def subscribe(
@@ -159,7 +169,14 @@ class InMemoryStreamBridge(StreamBridge):
                     entry = StreamEvent(
                         id=None,
                         event=END_SENTINEL.event,
-                        data={"status": stream.end_status},
+                        data=(
+                            {"status": stream.end_status}
+                            if stream.end_artifacts is None
+                            else {
+                                "status": stream.end_status,
+                                "artifacts": stream.end_artifacts,
+                            }
+                        ),
                     )
                 else:
                     try:

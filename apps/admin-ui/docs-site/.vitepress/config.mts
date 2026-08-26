@@ -126,7 +126,7 @@ export default withMermaid(
                 { text: "8.4 401 认证失败", link: "/guide/errors#_8-4-401-认证失败" },
                 { text: "8.5 403 权限不足或被阻断", link: "/guide/errors#_8-5-403-权限不足或被阻断" },
                 { text: "8.6 404 目标不存在", link: "/guide/errors#_8-6-404-目标不存在" },
-                { text: "8.7 409 审批冲突", link: "/guide/errors#_8-7-409-审批冲突" },
+                { text: "8.7 409 冲突", link: "/guide/errors#_8-7-409-冲突" },
                 { text: "8.8 410 Agent 已被删除", link: "/guide/errors#_8-8-410-agent-已被删除" },
                 { text: "8.9 413 超过大小上限", link: "/guide/errors#_8-9-413-超过大小上限" },
                 { text: "8.10 422 请求参数不合法", link: "/guide/errors#_8-10-422-请求参数不合法" },

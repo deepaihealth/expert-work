@@ -105,6 +105,10 @@ async def build_event_producer(
     *,
     run_id: UUID,
     run_status: RunStatus,
+    # 产物清单契约 —— run 行上固化的清单快照;replay 分支的 end 帧带它,
+    # None(历史 run 无记录)= 帧上字段缺席。live-join 分支不用它 ——
+    # 那条 end 的清单从 bridge end 帧 data 透传(与 sse_consumer 同源)。
+    run_artifacts: list[dict[str, Any]] | None = None,
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     since_seq: int | None,
@@ -228,7 +232,11 @@ async def build_event_producer(
                 yield format_sse(name, payload)
         yield format_sse(
             "end",
-            end_frame_data(run_id=run_id, status=_RUN_STATUS_END_STATUS.get(run_status)),
+            end_frame_data(
+                run_id=run_id,
+                status=_RUN_STATUS_END_STATUS.get(run_status),
+                artifacts=run_artifacts,
+            ),
         )
 
     async def _stream_live() -> AsyncIterator[bytes]:
@@ -380,7 +388,10 @@ async def build_event_producer(
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
                 # (``publish_end(status=...)`` 存的)。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
-                yield format_sse("end", end_frame_data(run_id=run_id, status=status))
+                arts = entry.data.get("artifacts") if isinstance(entry.data, dict) else None
+                yield format_sse(
+                    "end", end_frame_data(run_id=run_id, status=status, artifacts=arts)
+                )
                 return
 
             seq = _seq_of(entry)

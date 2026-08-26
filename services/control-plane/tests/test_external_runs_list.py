@@ -364,6 +364,7 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "status",
             "created_at",
             "finished_at",
+            "artifacts",
             "error",
         }
 
@@ -435,3 +436,36 @@ async def test_read_scope_key_is_allowed(ctx_read: _Ctx) -> None:
     )
 
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_run_summary_carries_the_artifact_manifest(ctx: _Ctx) -> None:
+    """产物清单契约 —— listRuns 的 run 摘要带清单快照,覆盖「没消费到 end
+    就终局」的重连收尾重建路径;未固化过的 run(此处 queue 建的行)= null。"""
+    await ctx.seed_agent()
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert created.status_code == 202, created.text
+    run_id = UUID(created.json()["data"]["run_id"])
+
+    manifest = [
+        {"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "2026-08-26T00:00:00"}
+    ]
+    await ctx.run_store.set_status(
+        run_id=run_id,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        artifacts=manifest,
+    )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/runs", params={"user_id": "cust-77"}, headers=ctx.headers
+    )
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["data"]["runs"]
+    assert runs[0]["artifacts"] == manifest

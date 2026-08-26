@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any, get_args
 from uuid import UUID
@@ -33,6 +34,13 @@ _ARTIFACT_KINDS: tuple[str, ...] = get_args(ArtifactKind)
 _DEFAULT_KIND: ArtifactKind = "other"
 #: Thread label for the ``created_in_thread`` column when a run has no id.
 _FALLBACK_THREAD_ID = "save-artifact"
+
+#: 产物清单契约 —— per-run 产物记录器的 ``config["configurable"]`` 键。
+#: ``sse.run_agent`` 每 run 注入一个同步 append 回调(镜像
+#: ``WORKER_EVENT_SINK_KEY`` 的注入/读取惯例);``save_artifact`` 每次成功
+#: 登记喂一条清单项。键定义在 tools 层与 sink keys 同理由:builder 与
+#: sse 都要 import,而 tools 不 import 它们。
+ARTIFACT_RECORDER_KEY = "artifact_manifest_recorder"
 
 
 def _require_user_scope(ctx: ToolContext, tool: str) -> tuple[UUID, UUID]:
@@ -136,6 +144,18 @@ class SaveArtifactTool:
             path_in_workspace=path_in_workspace,
             created_in_thread=thread_id,
         )
+        # 产物清单契约 —— 登记成功即计入本 run 的清单;created_at 优先取
+        # 版本行的落库时间(server_default 场景可能缺席,退回登记时刻)。
+        if ctx.artifact_recorder is not None:
+            created = version.created_at or datetime.now(UTC)
+            ctx.artifact_recorder(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "version": version.version,
+                    "created_at": created.isoformat(),
+                }
+            )
         return ToolResult(
             content=(
                 f"Saved artifact {name!r} (kind={kind}) as version {version.version}. "

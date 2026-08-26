@@ -1097,3 +1097,46 @@ async def test_list_for_tenant_before_is_keyset_paginated(
 ) -> None:
     """断言体在 ``conftest`` 的契约里,与 SQL 版共用一份。"""
     await keyset_before_contract(InMemoryRunStore())
+
+
+@pytest.mark.asyncio
+async def test_set_status_writes_artifacts_and_none_keeps_existing() -> None:
+    """产物清单契约 —— 终局写清单;None(非终局转换)不碰既有清单。
+
+    谓词须与 SQL 店 byte-同义(error/finished_at 同款规则)。
+    """
+    store = InMemoryRunStore()
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id))
+
+    manifest = [{"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "t"}]
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=5),
+        artifacts=manifest,
+    )
+    fetched = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None and fetched.artifacts == manifest
+
+    # None 不清空 —— 一次后续的非终局写不得抹掉终局清单。
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=6),
+    )
+    fetched2 = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched2 is not None and fetched2.artifacts == manifest
+
+    # 显式空清单是可写的(追问轮零交付),与「没传」语义不同。
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=7),
+        artifacts=[],
+    )
+    fetched3 = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched3 is not None and fetched3.artifacts == []

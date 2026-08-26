@@ -182,6 +182,7 @@ def build_external_artifacts_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         name: Annotated[str, Query(min_length=1, max_length=512)],
+        version: Annotated[int | None, Query(ge=1)] = None,
     ) -> Response:
         """Download the latest version of one artifact.
 
@@ -205,11 +206,21 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        version = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=end_user_id, name=name
-        )
-        if version is None:
+        latest = await store.get_latest_version(tenant_id=tenant_id, user_id=end_user_id, name=name)
+        if latest is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        # 产物清单契约 —— 可选 ``version`` 是**校验闸**不是取历史:旧版本
+        # 字节被同名重登记覆盖后物理上已不存在(版本行只是元数据),所以这里
+        # 不提供按版本取内容;传了 version 且 ≠ 最新版 → 409 显式冲突,
+        # 保证「拿着旧清单迟到收割」永远不会静默拿到别的内容。
+        if version is not None and version != latest.version:
+            return _artifact_error(
+                "ARTIFACT_VERSION_MISMATCH",
+                f"artifact {name!r} is at version {latest.version}, not {version}; "
+                "content of superseded versions is not retained",
+                409,
+            )
+        version = latest
         artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=end_user_id)
         artifact = next((a for a in artifacts if a.name == name), None)
         if artifact is None:

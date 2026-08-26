@@ -1805,6 +1805,7 @@ def build_runs_router() -> APIRouter:
         plan = await build_event_producer(
             run_id=run_id,
             run_status=persisted.status,
+            run_artifacts=persisted.artifacts,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             since_seq=since_seq,

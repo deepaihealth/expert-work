@@ -973,3 +973,48 @@ async def test_delete_name_with_nul_is_422_enveloped(external_client) -> None:
     assert body["data"] is None
     assert body["error"]["code"] == "INVALID_ARTIFACT_NAME"
     assert body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_download_with_matching_version_serves_content(
+    external_client, seed_artifact_with_content
+) -> None:
+    """产物清单契约 —— 带 version 且与最新版一致时正常下发。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="plan.txt", kind="document", content=b"v1-bytes"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "plan.txt", "version": 1},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"v1-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_with_stale_version_is_409_mismatch(
+    external_client, seed_artifact_with_content
+) -> None:
+    """version 是校验闸不是取历史:旧字节已被覆盖,不一致必须显式 409,
+    永远不能静默下发别的版本的内容(停删世界的迟到收割保护)。"""
+    await seed_artifact_with_content(
+        user_id="u-1", name="plan.txt", kind="document", content=b"v1-bytes"
+    )
+    await seed_artifact_with_content(
+        user_id="u-1", name="plan.txt", kind="document", content=b"v2-bytes"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "plan.txt", "version": 1},
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["success"] is False
+    assert body["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"
+    # 新版照常可取(带对的 version 或不带都行)。
+    ok = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "plan.txt", "version": 2},
+    )
+    assert ok.status_code == 200
+    assert ok.content == b"v2-bytes"

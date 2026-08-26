@@ -292,6 +292,7 @@ GET /v1/agents/{agent_code}/runs
 | `created_at` | string（ISO 8601） | 创建时间 |
 | `finished_at` | string（ISO 8601） \| null | 进入最终状态的时间；还没有进入最终状态时为 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见下文 |
+| `artifacts` | array \| null | 这次 run 登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同：`{name, kind, version, created_at}`。`[]` 表示这轮明确零交付；`null` 表示没有记录——平台升级前的历史 run，以及还没跑到终局的 run，都没有清单。**没消费到 `end` 事件就发现 run 已终局的重连场景，从这里拿清单重建，不要用工作区文件状态倒推** |
 
 ### 示例
 
@@ -311,7 +312,15 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
         "status": "success",
         "created_at": "2026-08-12T10:00:00+00:00",
         "finished_at": "2026-08-12T10:00:08+00:00",
-        "error": null
+        "error": null,
+        "artifacts": [
+          {
+            "name": "续约建议_20260812.docx",
+            "kind": "document",
+            "version": 1,
+            "created_at": "2026-08-12T10:00:07+00:00"
+          }
+        ]
       }
     ],
     "limit": 20,
@@ -654,12 +663,13 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 GET /v1/agents/{agent_code}/artifacts/download
 ```
 
-`agent_code` 在路径里，其余参数在查询字符串里。下载的永远是最新版本，当前不提供按版本号下载。
+`agent_code` 在路径里，其余参数在查询字符串里。下载的永远是最新版本的内容；`version` 参数是**校验**，不是按版本取历史——被同名新版本覆盖过的旧版本内容不再保留。
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
 | `user_id` | 是 | 产物所属的终端用户，长度 1–255 字符 |
 | `name` | 是 | 要下载的产物名，最长 512 字符。原样回传列出产物接口给出的 `name`；含 NUL 字节时返回 422 `INVALID_ARTIFACT_NAME` |
+| `version` | 否 | 期望的版本号（从产物清单的 `version` 字段抄来，见 [3.4 的 `end`](./sse-events#end)）。传了且与服务端最新版本不一致时返回 409 `ARTIFACT_VERSION_MISMATCH`，**而不是**把新版本的内容发给你——防止拿着旧清单迟到下载时静默拿错文件。收到 409 说明这个名字在你的清单之后又被登记过新版本，由你决定是改用最新版还是按业务异常处理 |
 
 #### 响应
 
@@ -680,6 +690,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 | 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除，或者不属于这个 `user_id`，三种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
+| 409 | `ARTIFACT_VERSION_MISMATCH` | 请求带了 `version` 且与服务端最新版本不一致。`message` 里给出服务端当前的版本号。重试无效——要么改用最新版重新下载，要么按业务异常处理 |
 | 413 | `ARTIFACT_TOO_LARGE` | 产物文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了。重试无效 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
 | 429 | `RATE_LIMIT_EXCEEDED` | 产物下载配额用尽（`error.dimension` 为 `artifact_download_count_30d`），或调用频率超限 |
@@ -942,7 +953,8 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
         "status": "success",
         "created_at": "2026-08-25T09:00:00+00:00",
         "duration_ms": 3200,
-        "error": null
+        "error": null,
+        "artifacts": []
       }
     ],
     "has_more": true,
@@ -964,6 +976,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | `created_at` | string（ISO 8601） \| null | 这一轮开始的时间 |
 | `duration_ms` | number \| null | 这一轮从开始到结束用了多少毫秒；还没有结束时是 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见 [5.4 的 error 字段的读法](#error-字段的读法) |
+| `artifacts` | array \| null | 这一轮登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同。`[]` = 明确零交付；`null` = 无记录（平台升级前的历史轮，或还没终局的轮） |
 
 一轮的内容可能是空的（`runs` 里有这一轮，`items` 里没有它的条目），失败在第一步之前的轮次就是这样。`runs` 仍然给出它的状态与失败原因。
 

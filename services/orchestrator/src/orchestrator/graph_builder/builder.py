@@ -151,6 +151,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
     classified_invalid_arguments,
@@ -2776,6 +2777,9 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
     # B3 — token 池 + guard sink(镜像同一读取惯例)。
     tb_raw = configurable.get(TOKEN_BUDGET_KEY)
     guard_raw = configurable.get(GUARD_SINK_KEY)
+    # 产物清单契约 —— per-run 产物记录器(镜像同一读取惯例)。
+    rec_raw = configurable.get(ARTIFACT_RECORDER_KEY)
+    artifact_recorder = rec_raw if callable(rec_raw) else None
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -2791,6 +2795,7 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
         worker_event_sink=worker_event_sink,
         token_budget=tb_raw if isinstance(tb_raw, TokenBudget) else None,
         guard_sink=guard_raw if callable(guard_raw) else None,
+        artifact_recorder=artifact_recorder,
     )
 
 

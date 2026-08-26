@@ -48,6 +48,7 @@ from orchestrator.tools._worker_events import (
     build_worker_start_frame,
     build_worker_update_frame,
 )
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.registry import ToolContext, ToolResult
 from orchestrator.trajectory import (
     TrajectoryOutcome,
@@ -470,6 +471,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         configurable[TOKEN_BUDGET_KEY] = ctx.token_budget
     if ctx.guard_sink is not None:
         configurable[GUARD_SINK_KEY] = ctx.guard_sink
+    # 产物清单契约 —— 记录器下传:子代(worker/静态子 Agent)登记的产物
+    # 同属本 run 的交付物,漏传会让「委派干活」的 run 清单缺项。真栈第三跑
+    # (run 02ab4cfc)实证 worker 确实会 save_artifact。
+    if ctx.artifact_recorder is not None:
+        configurable[ARTIFACT_RECORDER_KEY] = ctx.artifact_recorder
     # 二期 PR3(spec P4)— the delegation gate is process-wide (one singleton
     # per process, not per-run like worker_spawn_budget): forward the SAME
     # object so a depth-2 delegation from within this child contends for the

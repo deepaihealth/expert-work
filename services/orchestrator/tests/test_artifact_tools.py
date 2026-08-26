@@ -151,3 +151,33 @@ async def test_artifact_builtins_assembled_when_store_present() -> None:
 async def test_artifact_builtin_missing_store_raises() -> None:
     with pytest.raises(AgentFactoryError, match="artifact store"):
         await build_tool_registry([BuiltinToolSpec(name="save_artifact")], tool_env=ToolEnv())
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_feeds_the_manifest_recorder() -> None:
+    """产物清单契约 —— 登记成功即喂 ctx.artifact_recorder 一条清单项。"""
+    store = InMemoryArtifactStore()
+    tool = SaveArtifactTool(store=store)
+    recorded: list[dict[str, object]] = []
+    base = _ctx()
+    from dataclasses import replace as _replace
+
+    ctx = _replace(base, artifact_recorder=recorded.append)
+
+    await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
+    await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
+
+    assert [(e["name"], e["kind"], e["version"]) for e in recorded] == [
+        ("report.md", "document", 1),
+        ("report.md", "document", 2),
+    ]
+    assert all(isinstance(e["created_at"], str) and e["created_at"] for e in recorded)
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_without_recorder_is_unchanged() -> None:
+    """未接线(单测/eval)时零行为变化 —— 登记照常,无清单记录。"""
+    result = await SaveArtifactTool(store=InMemoryArtifactStore()).call(
+        {"name": "a.md"}, ctx=_ctx()
+    )
+    assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other"}

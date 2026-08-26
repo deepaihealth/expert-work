@@ -305,13 +305,22 @@ class RunManager:
         return await self._store.delete_by_thread(thread_id=thread_id, tenant_id=tenant_id)
 
     async def set_status(
-        self, run_id: UUID, status: RunStatus, *, error: str | None = None
+        self,
+        run_id: UUID,
+        status: RunStatus,
+        *,
+        error: str | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Update a run's status. Returns ``True`` iff the run exists.
 
         ``error`` carries the failure detail for ERROR / TIMEOUT
         transitions; it lands in the durable ``agent_run`` row. A
         transition into a terminal status also stamps ``finished_at``.
+        ``artifacts``(产物清单契约)— the run's registration snapshot,
+        written with the terminal status in the same store UPDATE so any
+        reader that sees the terminal status also sees the manifest;
+        ``None`` leaves the stored value untouched.
         """
         async with self._lock:
             record = self._runs.get(run_id)
@@ -329,6 +338,7 @@ class RunManager:
                     updated_at=now,
                     error=error,
                     finished_at=finished_at,
+                    artifacts=artifacts,
                 )
                 # Stream 9.4 — claim the ownership lease when execution begins.
                 # No explicit release at terminal status: the sweep + index both
@@ -344,6 +354,20 @@ class RunManager:
                     )
             logger.info("run.status_change id=%s status=%s", run_id, status)
             return True
+
+    async def persisted_artifacts(
+        self, run_id: UUID, *, tenant_id: UUID
+    ) -> list[dict[str, Any]] | None:
+        """durable 行上已固化的产物清单(产物清单契约)。
+
+        resume(审批续跑)的 ``run_agent`` 用它把 PAUSED 时写入的清单读回
+        累积器,续跑段的登记接着记而不是整表覆盖。无 store(单测)或行
+        不存在时 ``None``。
+        """
+        if self._store is None:
+            return None
+        info = await self._store.get(run_id=run_id, tenant_id=tenant_id)
+        return info.artifacts if info is not None else None
 
     async def adopt(
         self,

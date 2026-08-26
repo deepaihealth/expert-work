@@ -151,7 +151,13 @@ class StreamBridge(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def publish_end(self, run_id: UUID, *, status: str) -> None:
+    async def publish_end(
+        self,
+        run_id: UUID,
+        *,
+        status: str,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Signal that no more events will be produced for ``run_id``.
 
         ``status`` is this run's terminal status as the client should see it;
@@ -159,6 +165,11 @@ class StreamBridge(abc.ABC):
         a consumer can tell "answered" from "cancelled" without a second REST
         call. Required — a caller that has finished a run always knows how it
         finished.
+
+        ``artifacts``(产物清单契约)— the run's artifact-registration
+        snapshot, riding the same end-frame ``data`` so the live stream's
+        ``end`` carries the manifest without a store read. ``None`` keeps
+        the frame field absent (a caller that predates the contract).
         """
 
     @abc.abstractmethod

@@ -845,3 +845,41 @@ async def test_list_for_tenant_before_is_keyset_paginated_sql(
     """SQL 侧的 keyset 游标与内存侧同义,包括 ``created_at`` 并列时按
     ``run_id`` 定序这一条。"""
     await keyset_before_contract(run_store)
+
+
+@pytest.mark.asyncio
+async def test_set_status_artifacts_round_trip_and_none_keeps(run_store: SqlRunStore) -> None:
+    """产物清单契约 —— SQL 店与 in-memory 店谓词 byte-同义(见
+    test_run_store.py 同名场景):终局写清单、None 不碰既有、[] 可写。"""
+    run_id, tenant_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant_id))
+
+    manifest = [{"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "t"}]
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=5),
+        artifacts=manifest,
+    )
+    fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None and fetched.artifacts == manifest
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=6),
+    )
+    fetched2 = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched2 is not None and fetched2.artifacts == manifest
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=7),
+        artifacts=[],
+    )
+    fetched3 = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched3 is not None and fetched3.artifacts == []

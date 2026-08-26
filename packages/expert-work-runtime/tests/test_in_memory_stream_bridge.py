@@ -253,3 +253,25 @@ async def test_factory_unknown_backend() -> None:
     with pytest.raises(ValueError, match="unknown stream_bridge backend"):
         async with make_stream_bridge("kafka"):  # type: ignore[arg-type]
             pass
+
+
+@pytest.mark.asyncio
+async def test_publish_end_artifacts_ride_the_end_frame() -> None:
+    """产物清单契约 —— publish_end 捎带的清单在 end 帧 data 上;不传则字段缺席
+    (老调用方零变化)。"""
+    bridge = InMemoryStreamBridge()
+    run_id = uuid4()
+    manifest = [{"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "t"}]
+    await bridge.publish(run_id, "metadata", {})
+    await bridge.publish_end(run_id, status="success", artifacts=manifest)
+
+    events = await _drain(bridge.subscribe(run_id))
+    assert is_end(events[-1])
+    assert events[-1].data == {"status": "success", "artifacts": manifest}
+
+    bridge2 = InMemoryStreamBridge()
+    run2 = uuid4()
+    await bridge2.publish(run2, "metadata", {})
+    await bridge2.publish_end(run2, status="success")
+    events2 = await _drain(bridge2.subscribe(run2))
+    assert events2[-1].data == {"status": "success"}

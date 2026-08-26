@@ -61,6 +61,10 @@ class AgentRunRow(Base):
     # and execute it. NULL for synchronous (SSE) runs and once a queued run is
     # claimed (the input then lives in the checkpoint / event log).
     enqueued_input: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # 产物清单契约(migration 0147)—— run 终局时固化的本 run 产物登记快照
+    # ``[{name, kind, version, created_at}]``。NULL = 历史 run / 异常终局无
+    # 记录;``[]`` = 零登记(追问轮);产物事后被删不回写(快照语义)。
+    artifacts: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
     # External-API-v1 P2 block 1-C (migration 0145) — third-party retry
     # dedup. ``idempotency_key`` is the caller's ``Idempotency-Key`` header;
     # ``request_digest`` is a hash of the request body so a *reused* key with
