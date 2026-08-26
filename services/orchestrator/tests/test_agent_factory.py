@@ -1315,14 +1315,28 @@ def test_thinking_payload_off_catalog_compat_sends_nothing() -> None:
     assert _thinking_payload(_vendor_model("deepseek", "deepseek-reasoner", effort="high")) is None
 
 
-def test_thinking_payload_kimi_k3_always_thinking_sends_nothing() -> None:
-    # kimi-k3 is on-catalog with thinking=None (always thinking; only accepts
-    # reasoning_effort=max today). No thinking field is sent — in particular it
-    # must NOT emit the K2.x ``thinking.type`` toggle that the other kimi models
-    # use (the K3 docs forbid it).
+def test_thinking_payload_kimi_k3_effort_levels() -> None:
+    # kimi-k3 is ALWAYS thinking with a top-level ``reasoning_effort`` on the
+    # max/high/low scale, default max (platform.kimi.com thinking docs
+    # 2026-08). No "medium" → rounds up to high. It must NOT emit the K2.x
+    # ``thinking.type`` toggle (the K3 docs forbid it) — untouched manifests
+    # still send nothing (vendor default is already max).
     from orchestrator.agent_factory import _thinking_payload
 
     assert _thinking_payload(_vendor_model("kimi", "kimi-k3")) is None
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="low")) == {
+        "reasoning_effort": "low"
+    }
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="medium")) == {
+        "reasoning_effort": "high"
+    }
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="max")) == {
+        "reasoning_effort": "max"
+    }
+    # No off switch on an always-thinking model — the lowest tier is the floor.
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", thinking_enabled=False)) == {
+        "reasoning_effort": "low"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1384,9 +1398,11 @@ def test_thinking_payload_force_off_per_vendor() -> None:
     assert _thinking_payload(_vendor_model("openai", "gpt-5.5", thinking_enabled=False)) == {
         "reasoning_effort": "minimal"
     }
+    # deepseek exposes a REAL off via the OpenAI-format thinking object
+    # (thinking-mode docs 2026-08) — "minimal" is not on its effort scale.
     assert _thinking_payload(
         _vendor_model("deepseek", "deepseek-v4-pro", thinking_enabled=False)
-    ) == {"reasoning_effort": "minimal"}
+    ) == {"thinking": {"type": "disabled"}}
     # qwen budget -> enable_thinking false.
     assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", thinking_enabled=False)) == {
         "enable_thinking": False

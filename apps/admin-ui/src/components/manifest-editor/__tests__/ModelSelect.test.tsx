@@ -88,6 +88,20 @@ const CATALOG: ModelCatalog = {
       ],
     },
     {
+      provider: "kimi",
+      models: [
+        {
+          name: "kimi-k3",
+          vision: true,
+          embeddings: false,
+          context_window: 1000000,
+          deprecated: false,
+          thinking: "effort",
+          thinking_default: true,
+        },
+      ],
+    },
+    {
       provider: "glm",
       models: [
         {
@@ -425,6 +439,28 @@ describe("ModelSelect", () => {
     expect(
       screen.queryByTestId("model-select-thinking-hint"),
     ).not.toBeInTheDocument();
+    // deepseek also has a real off (thinking.type=disabled) — no hint.
+    rerender(
+      <ModelSelect
+        value={{ provider: "deepseek", name: "deepseek-v4-pro" }}
+        catalog={CATALOG}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByTestId("model-select-thinking-hint"),
+    ).not.toBeInTheDocument();
+    // kimi-k3 is always-thinking (off floors at reasoning_effort=low) — hint shown.
+    rerender(
+      <ModelSelect
+        value={{ provider: "kimi", name: "kimi-k3" }}
+        catalog={CATALOG}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByTestId("model-select-thinking-hint"),
+    ).toBeInTheDocument();
   });
 
   it("visionOnly shows only vision-capable models for a provider", async () => {

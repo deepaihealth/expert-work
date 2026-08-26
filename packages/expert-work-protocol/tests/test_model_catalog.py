@@ -121,16 +121,16 @@ def test_current_context_windows() -> None:
 
 
 def test_kimi_k3_capability_bits() -> None:
-    # kimi-k3: native vision, 1M context, and thinking is None — K3 is always
-    # thinking and only accepts reasoning_effort=max today, so no thinking field
-    # is sent (always-thinking → None; the compat build gate then rejects a
-    # manifest that sets effort / thinking_enabled). See the catalog comment.
+    # kimi-k3: native vision, 1M context. thinking is "effort" — K3 is always
+    # thinking with a top-level reasoning_effort on the max/high/low scale
+    # (default max, platform.kimi.com thinking docs 2026-08); the adapter maps
+    # the unified levels and floors "off" at low (no off switch on K3).
     k3 = catalog_entry("kimi", "kimi-k3")
     assert k3 is not None
     assert k3.vision is True
     assert k3.context_window == 1_000_000
-    assert k3.thinking is None
-    assert k3.thinking_default is False
+    assert k3.thinking == "effort"
+    assert k3.thinking_default is True
     assert k3.deprecated is False
     # It is the current flagship — selectable in the dropdown.
     assert "kimi-k3" in {e.name for e in models_for_provider("kimi")}

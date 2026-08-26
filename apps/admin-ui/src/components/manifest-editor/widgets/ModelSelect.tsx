@@ -75,12 +75,14 @@ export function ModelSelect({
       ? lookupModel(catalog, value.provider, value.name)
       : undefined;
   const hasThinkingKnob = !!currentEntry?.thinking;
-  // reasoning_effort vendors have no off level — off degrades to "minimal".
-  // GLM (5.2+, shape "effort") keeps a real off via thinking.type=disabled.
+  // reasoning_effort vendors without a real off — off degrades to the lowest
+  // level (OpenAI/Azure "minimal", kimi-k3 "low"). GLM 5.2+ and DeepSeek keep
+  // a real off via thinking.type=disabled, so no hint there.
   const cannotFullyDisable =
     currentEntry?.thinking === "effort" &&
     value.provider !== "anthropic" &&
-    value.provider !== "glm";
+    value.provider !== "glm" &&
+    value.provider !== "deepseek";
   const thinkingOn = value.thinking_enabled ?? currentEntry?.thinking_default ?? false;
 
   const temperature = value.temperature ?? 0.2;

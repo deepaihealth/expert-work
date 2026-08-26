@@ -1759,9 +1759,10 @@ _THINKING_BUDGET_RATIO: dict[str, float] = {
 _THINKING_BUDGET_MIN = 1024
 _THINKING_BUDGET_MAX = 81_920
 
-#: GLM 5.2+ ``reasoning_effort`` scale is max/high/low — no "medium", so the
-#: manifest's medium rounds up to high (bigmodel core-params page, 2026-08).
-_GLM_EFFORT_LEVEL: dict[str, str] = {
+#: GLM 5.2+ and kimi-k3 share a max/high/low ``reasoning_effort`` scale —
+#: no "medium", so the manifest's medium rounds up to high (bigmodel
+#: core-params page / platform.kimi.com thinking docs, 2026-08).
+_MAX_HIGH_LOW_EFFORT: dict[str, str] = {
     "low": "low",
     "medium": "high",
     "high": "high",
@@ -1824,10 +1825,17 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
                 return {"thinking": {"type": "enabled"}}
             return {
                 "thinking": {"type": "enabled"},
-                "reasoning_effort": _GLM_EFFORT_LEVEL[model.effort],
+                "reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort],
             }
+        if model.provider == "kimi":
+            # kimi-k3 — ALWAYS thinking; top-level ``reasoning_effort`` on
+            # the same max/high/low scale (default max). Must not send the
+            # K2.x ``thinking.type`` param (the K3 docs forbid it).
+            if model.effort is None:
+                return None
+            return {"reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort]}
         # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
-        # manifest's level names.
+        # manifest's level names (DeepSeek maps medium→high vendor-side).
         return {"reasoning_effort": model.effort} if model.effort is not None else None
     if entry.thinking == "budget":
         if model.provider == "doubao":
@@ -1855,13 +1863,19 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
 
     Pre-condition: ``entry.thinking is not None`` and ``provider != anthropic``
     (anthropic disables via the provider's own ``thinking: {type: disabled}``).
-    ``reasoning_effort`` vendors have no off level → degrade to ``minimal``
-    (owner decision: "降最低档"); the UI flags this as not-fully-off.
+    ``reasoning_effort`` vendors without a real off degrade to the lowest
+    level (owner decision: "降最低档" — OpenAI/Azure ``minimal``, kimi-k3
+    ``low``); the UI flags this as not-fully-off. GLM 5.2+ / DeepSeek DO have
+    a real off (``thinking.type=disabled``) and use it.
     """
     if entry.thinking == "effort":
-        # GLM 5.2+ keeps its real off switch — no "minimal" on the GLM scale.
-        if model.provider == "glm":
+        # GLM 5.2+ / DeepSeek keep a REAL off via the OpenAI-format thinking
+        # object — "minimal" is not on either vendor's effort scale.
+        if model.provider in ("glm", "deepseek"):
             return {"thinking": {"type": "disabled"}}
+        # kimi-k3 is always-thinking — no off switch; lowest tier is the floor.
+        if model.provider == "kimi":
+            return {"reasoning_effort": "low"}
         return {"reasoning_effort": "minimal"}
     if entry.thinking == "budget" and model.provider == "qwen":
         return {"enable_thinking": False}
