@@ -96,6 +96,43 @@ describe("ProcessStrip", () => {
     expect(screen.queryByTestId("console-process-spinner")).not.toBeInTheDocument();
   });
 
+  it("renders the turn's skill chips even while collapsed", () => {
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [
+              { id: "s1", name: "skill_view", args: { skill_name: "pptx", path: "SKILL.md" } },
+              { id: "s2", name: "skill_view", args: { skill_name: "pptx", path: "ref/a.md" } },
+            ],
+          },
+        ],
+      }),
+      upd("tools", {
+        messages: [
+          { type: "tool", tool_call_id: "s1", name: "skill_view", content: "body", status: "success" },
+          { type: "tool", tool_call_id: "s2", name: "skill_view", content: "ref", status: "success" },
+        ],
+      }),
+    ];
+    renderStrip(makeProps({ rows: stripRows(compactRowsOf(events)) }));
+
+    // 折叠态(settled 默认收起)chips 仍在 —— 「用了哪些技能」不该要求展开。
+    expect(screen.queryByTestId("console-process-steps")).not.toBeInTheDocument();
+    const chips = screen.getAllByTestId("console-skill-chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent("pptx");
+    expect(chips[0]).toHaveTextContent("×2");
+  });
+
+  it("renders no skill chip row when the turn read no skill", () => {
+    renderStrip(makeProps());
+    expect(screen.queryByTestId("console-process-skills")).not.toBeInTheDocument();
+  });
+
   it("the head button's accessible name is the headline itself — no aria-label masking it", () => {
     renderStrip(makeProps({ rows: stripRows(compactRowsOf(stepEvents(3))) }));
 

@@ -7,6 +7,7 @@
  *
  * See .superpowers/sdd/2026-08-18-debug-console-pr-a1-feedback/task-3-brief.md.
  */
+import { skillNameOf, toolSummaryLabel, type TurnSkill } from "../../api/tool_timeline";
 import type { CompactRow } from "../../api/trajectory_rows";
 
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -17,8 +18,11 @@ export interface ProcessSummary {
   other: number;
   /** 出错的**非 think** 行数(think 行的 error 是从同步的工具继承来的,不另记一次)。 */
   failed: number;
-  /** "web_search ×4 · http ×1",按次数降序(同次数按名字);空串表示无工具。 */
+  /** "web_search ×4 · http ×1",按次数降序(同次数按名字);空串表示无工具。
+   *  `skill_view` 调用以 `skill:<技能名>` 入账,而不是裸工具名。 */
   toolBreakdown: string;
+  /** 本轮成功读取过的技能(`skill_view`),首读顺序;没有 → []。 */
+  skills: TurnSkill[];
   /** 全部行的 durationMs 之和(null 一律按 0);无行 → null。 */
   durationMs: number | null;
 }
@@ -31,11 +35,19 @@ export function summarizeProcess(rows: readonly CompactRow[]): ProcessSummary {
   let dur = 0;
   let any = false;
   const byTool = new Map<string, number>();
+  const skillsByName = new Map<string, TurnSkill>();
   for (const r of rows) {
     if (r.kind === "think") think += 1;
     else if (r.kind === "tool") {
       tools += 1;
-      byTool.set(r.entry.toolName, (byTool.get(r.entry.toolName) ?? 0) + 1);
+      const skill = skillNameOf(r.entry);
+      const key = toolSummaryLabel(r.entry);
+      byTool.set(key, (byTool.get(key) ?? 0) + 1);
+      if (skill !== null && r.entry.status === "success") {
+        const existing = skillsByName.get(skill);
+        if (existing) existing.reads += 1;
+        else skillsByName.set(skill, { name: skill, reads: 1 });
+      }
     } else other += 1;
     // A think row's `error` status is inherited from its step's failing tool
     // (`trajectory_rows.ts:139` ← `timeline.ts`'s `hasError = tools.some(…)`),
@@ -50,7 +62,15 @@ export function summarizeProcess(rows: readonly CompactRow[]): ProcessSummary {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([name, count]) => `${name} ×${count}`)
     .join(" · ");
-  return { think, tools, other, failed, toolBreakdown, durationMs: any ? dur : null };
+  return {
+    think,
+    tools,
+    other,
+    failed,
+    toolBreakdown,
+    skills: [...skillsByName.values()],
+    durationMs: any ? dur : null,
+  };
 }
 
 /** 「思考 3 次 · 工具 5 次(web_search ×4 · http ×1) · 1 次失败」——无工具省略

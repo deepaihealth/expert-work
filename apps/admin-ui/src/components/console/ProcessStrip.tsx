@@ -102,6 +102,20 @@ export function ProcessStrip({
         )}
       </button>
 
+      {/* 本轮成功读取过的技能 —— 折叠态也可见(「LLM 用了哪些技能」这个
+          问题不该要求展开步骤才有答案,2026-08-26 用户反馈)。 */}
+      {summary.skills.length > 0 && (
+        <div className="ew-process__skills" data-testid="console-process-skills">
+          <span className="ew-process__skills-label">{t("console.process_skills")}</span>
+          {summary.skills.map((s) => (
+            <span key={s.name} className="ew-process__skill-chip" data-testid="console-skill-chip">
+              {s.name}
+              {s.reads > 1 && <span className="ew-process__skill-reads">×{s.reads}</span>}
+            </span>
+          ))}
+        </div>
+      )}
+
       {isOpen && (
         <div className="ew-process__steps" data-testid="console-process-steps">
           {tailOnly && (

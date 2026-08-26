@@ -103,7 +103,7 @@ describe("displayRowsOf", () => {
         turnKey: "t1",
         turnSeq: 0,
         runId: "run-1",
-        summary: { think: 2, tools: 1, other: 0, failed: 1, toolBreakdown: "bash ×1", durationMs: 400 },
+        summary: { think: 2, tools: 1, other: 0, failed: 1, toolBreakdown: "bash ×1", skills: [], durationMs: 400 },
         hasError: true,
         anchorIndex: 0,
       },

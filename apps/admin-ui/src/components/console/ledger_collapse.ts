@@ -6,6 +6,7 @@
  * no state. 折叠模型参照 deepseek-harness ui-trajectory(MIT)重写. See
  * .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-4-brief.md.
  */
+import { skillNameOf, toolSummaryLabel, type TurnSkill } from "../../api/tool_timeline";
 import type { Ledger, LedgerRecord } from "./ledger_types";
 import type { ProcessSummary } from "./process_summary";
 
@@ -42,7 +43,7 @@ function breakdownOf(labels: readonly string[]): string {
 /** A tool/plan/subagent child's breakdown label ("bash", "update_plan", the
  *  subagent's worker label) — ``null`` for kinds that never own children. */
 function childLabel(record: LedgerRecord): string | null {
-  if (record.row.kind === "tool") return record.row.entry.toolName;
+  if (record.row.kind === "tool") return toolSummaryLabel(record.row.entry);
   if (record.row.kind === "plan") return "update_plan";
   if (record.row.kind === "subagent") return record.row.worker.label;
   return null;
@@ -83,12 +84,21 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
   let first: number | null = null;
   let last: number | null = null;
   const toolLabels: string[] = [];
+  const skillsByName = new Map<string, TurnSkill>();
 
   for (const r of records) {
     if (r.kind === "assistant") think += 1;
     else if (r.kind === "tool") {
       tools += 1;
-      if (r.row.kind === "tool") toolLabels.push(r.row.entry.toolName);
+      if (r.row.kind === "tool") {
+        toolLabels.push(toolSummaryLabel(r.row.entry));
+        const skill = skillNameOf(r.row.entry);
+        if (skill !== null && r.row.entry.status === "success") {
+          const existing = skillsByName.get(skill);
+          if (existing) existing.reads += 1;
+          else skillsByName.set(skill, { name: skill, reads: 1 });
+        }
+      }
     } else if (!CONTEXT_KINDS.has(r.kind)) other += 1;
 
     if (r.kind !== "assistant" && r.isError) failed += 1;
@@ -104,6 +114,7 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
     other,
     failed,
     toolBreakdown: breakdownOf(toolLabels),
+    skills: [...skillsByName.values()],
     durationMs: first === null || last === null ? null : last - first,
   };
 }

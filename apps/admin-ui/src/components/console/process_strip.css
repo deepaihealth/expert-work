@@ -78,6 +78,36 @@
   }
 }
 
+/* 本轮读取的技能 chips —— 折叠态也可见,所以放在 head 之下、steps 之外。 */
+.ew-process__skills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px 3px;
+  font-size: 11px;
+}
+
+.ew-process__skills-label {
+  color: var(--ew-text-tertiary);
+}
+
+.ew-process__skill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 6px;
+  border: 1px solid var(--ew-border-subtle);
+  border-radius: 9px;
+  background: var(--ew-surface-base);
+  color: var(--ew-text-secondary);
+  font-family: var(--ew-font-mono);
+}
+
+.ew-process__skill-reads {
+  color: var(--ew-text-tertiary);
+}
+
 .ew-process__steps {
   display: flex;
   flex-direction: column;
