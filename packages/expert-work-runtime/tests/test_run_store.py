@@ -28,6 +28,7 @@ def _info(
     user_id: UUID | None = None,
     status: RunStatus = RunStatus.PENDING,
     created_at: datetime | None = None,
+    error: str | None = None,
 ) -> RunInfo:
     return RunInfo(
         run_id=run_id,
@@ -37,7 +38,7 @@ def _info(
         status=status,
         on_disconnect=DisconnectMode.CANCEL,
         is_resume=False,
-        error=None,
+        error=error,
         created_at=created_at or _BASE,
         updated_at=created_at or _BASE,
         finished_at=None,
@@ -110,13 +111,36 @@ async def test_request_cancel_interrupts_a_running_run() -> None:
     await store.create(_info(run_id=run_id, tenant_id=tenant_id, status=RunStatus.RUNNING))
 
     hit = await store.request_cancel(
-        run_id=run_id, tenant_id=tenant_id, updated_at=_BASE + timedelta(seconds=9)
+        run_id=run_id,
+        tenant_id=tenant_id,
+        updated_at=_BASE + timedelta(seconds=9),
+        reason="tenant_suspended",
     )
     assert hit is True
     fetched = await store.get(run_id=run_id, tenant_id=tenant_id)
     assert fetched is not None
     assert fetched.status is RunStatus.INTERRUPTED
     assert fetched.finished_at == _BASE + timedelta(seconds=9)
+    # 中断原因入账(InterruptReason 词表)—— 没写就分不出「谁杀的」。
+    assert fetched.error == "tenant_suspended"
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_without_reason_keeps_existing_error() -> None:
+    # reason=None 不清既有 error(与 set_status 的「error 非 None 才写」同一
+    # 谓词,SQL 店 byte-同义)。
+    store = InMemoryRunStore()
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(
+        _info(run_id=run_id, tenant_id=tenant_id, status=RunStatus.RUNNING, error="prior")
+    )
+
+    hit = await store.request_cancel(
+        run_id=run_id, tenant_id=tenant_id, updated_at=_BASE + timedelta(seconds=9)
+    )
+    assert hit is True
+    fetched = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None and fetched.error == "prior"
 
 
 @pytest.mark.asyncio

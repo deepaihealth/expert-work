@@ -45,7 +45,7 @@ from expert_work.persistence.tenant_config.base import (
 from expert_work.persistence.tenant_member import TenantMemberStore
 from expert_work.protocol import AuditAction, Principal, TenantPlan
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import RunStatus, RunStore
+from expert_work.runtime.runs import InterruptReason, RunStatus, RunStore
 
 logger = logging.getLogger("expert_work.control_plane.api.tenants")
 
@@ -175,8 +175,13 @@ async def _bulk_cancel_tenant_runs(
     for run_id in run_ids:
         # Local run: aborts immediately. Peer-owned run: guarded store CAS
         # (running/pending → interrupted) so its next heartbeat fails and it stops.
-        stopped = await runtime.run_manager.cancel(run_id) or await run_store.request_cancel(
-            run_id=run_id, tenant_id=tenant_id, updated_at=now
+        stopped = await runtime.run_manager.cancel(
+            run_id, reason=InterruptReason.TENANT_SUSPENDED
+        ) or await run_store.request_cancel(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            updated_at=now,
+            reason=InterruptReason.TENANT_SUSPENDED,
         )
         if stopped:
             cancelled += 1

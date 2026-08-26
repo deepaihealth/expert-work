@@ -217,11 +217,14 @@ async def test_cancel_mirrors_interrupted_to_store() -> None:
     run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
     await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
 
-    await mgr.cancel(run_id)
+    await mgr.cancel(run_id, reason="client_disconnect")
     persisted = await store.get(run_id=run_id, tenant_id=tenant_id)
     assert persisted is not None
     assert persisted.status is RunStatus.INTERRUPTED
     assert persisted.finished_at is not None
+    # 中断原因(InterruptReason 词表)随状态一起入账 —— 界面靠它把「断流被杀」
+    # 与「用户主动取消」分开(2026-08-26 用户反馈)。
+    assert persisted.error == "client_disconnect"
 
 
 @pytest.mark.asyncio

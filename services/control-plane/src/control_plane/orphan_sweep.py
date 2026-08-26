@@ -294,6 +294,9 @@ class OrphanSweep:
                     run_id=orphan.run_id,
                     tenant_id=orphan.tenant_id,
                     updated_at=now,
+                    # kill_switch 的 blocked 值与 InterruptReason 同词表
+                    # (tenant_suspended / agent_disabled),原样透传。
+                    reason=blocked,
                 )
                 if not won:
                     # A peer replica's kill-switch branch (or some other
