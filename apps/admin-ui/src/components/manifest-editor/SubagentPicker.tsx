@@ -1,16 +1,30 @@
 /**
- * Static sub-agent delegation picker — Tier 2 capability, its own form tab.
- * Each named row binds a tool name → a deployed agent ref the parent may
- * delegate sub-tasks to (the parent's LLM sees each as a tool). Emits the FULL
- * merged manifest via the form_model writers.
+ * Sub-agent tab — both delegation tracks in one place (2026-08-26 用户反馈:
+ * 动态开关原先藏在安全分区的 network 子 tab,界面上找不到):
+ *
+ * - **动态子 Agent** (``dynamic_workers.enabled``, default-on): whether the
+ *   parent's LLM gets ``spawn_worker`` to create ephemeral sub-agents at
+ *   run time; concurrency/count bounds are platform-global settings.
+ * - **静态名册** (``subagents``): each named row binds a tool name → a
+ *   deployed agent ref the parent may delegate sub-tasks to (the parent's
+ *   LLM sees each as a tool).
+ *
+ * Emits the FULL merged manifest via the form_model writers.
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { Button, Input, Select, Typography } from "antd";
+import { Button, Input, Select, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listAgents } from "../../api/agents";
 import { FieldHelp } from "../FieldHelp";
-import { readSubagents, setSubagents, type SubAgentFields } from "./form_model";
+import { FieldRow } from "./FieldRow";
+import {
+  readDynamicWorkersOn,
+  readSubagents,
+  setDynamicWorkersOn,
+  setSubagents,
+  type SubAgentFields,
+} from "./form_model";
 
 const { Text } = Typography;
 
@@ -66,8 +80,28 @@ export function SubagentPicker({ formData, onChange }: SubagentPickerProps) {
       ),
     );
 
+  const dynamicWorkersOn = readDynamicWorkersOn(formData);
+
   return (
     <section data-testid="af-subagents" style={SECTION}>
+      {/* 动态轨 —— spawn_worker 开关。和静态名册同屏,一屏答完「预置了谁 +
+          能不能临时造」;原先藏在安全分区 network 子 tab(2026-08-26 反馈)。 */}
+      <FieldRow
+        fieldId="dynamic_workers.enabled"
+        label={t("agent_form.section_dynamic_workers")}
+        brief={t("agent_form.dynamic_workers_hint")}
+        help={t("agent_form.section_dynamic_workers_help")}
+        isDefault={dynamicWorkersOn === true}
+        onReset={() => onChange(setDynamicWorkersOn(formData, true))}
+        resetHint="true"
+      >
+        <Switch
+          checked={dynamicWorkersOn}
+          aria-label={t("agent_form.section_dynamic_workers")}
+          onChange={(on) => onChange(setDynamicWorkersOn(formData, on))}
+        />
+      </FieldRow>
+
       <Heading>
         {t("agent_form.section_subagents")}
         <FieldHelp

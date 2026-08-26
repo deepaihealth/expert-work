@@ -3811,7 +3811,7 @@ const en: TranslationKeys = {
   security_gates: {
     tab_defenses: "Defenses",
     tab_approval: "Human approval",
-    tab_network: "Subtasks & network",
+    tab_network: "Network & tool enforcement",
     panel_network: "① Network egress",
     panel_enforce: "② Tool-use enforcement",
     egress_label: "Egress mode",
@@ -4154,11 +4154,11 @@ const en: TranslationKeys = {
     section_approval_help:
       "For the tools you check, execution pauses every time and waits for a human to approve — whether it's a base capability that's always on, or one you turned on yourself above in Tools.\nExample: add approval for exec_python, http",
     approval_hint: "Check the tools that need a human sign-off before running.",
-    section_dynamic_workers: "Temporary helpers",
+    section_dynamic_workers: "Dynamic subagents",
     section_dynamic_workers_help:
-      "When on (the default), the agent can pull in a few temporary helpers mid-task to handle subtasks in parallel.\nTurn off when you need strictly one worker.\nExample: on for a research agent, off for a simple FAQ bot",
+      "When on (the default), the agent can create ephemeral subagents at run time (the spawn_worker tool) to handle subtasks in parallel; count and concurrency are bounded by the platform-wide dynamic-subagent guardrails.\nTurn off when you need strictly one executor.\nExample: on for a research agent, off for a simple FAQ bot.\nVs the delegation roster below: the roster is a preset list of named delegates, this is a general-purpose subagent created on demand.",
     dynamic_workers_hint:
-      "Let the agent create temporary helpers at run time to share the load (on by default).",
+      "Let the agent create ephemeral subagents at run time to share subtasks (on by default).",
     approval_timeout: "Approval wait limit (seconds)",
     approval_timeout_brief: "Auto-rejects if no one responds in time",
     approval_timeout_help:
@@ -5206,19 +5206,19 @@ const en: TranslationKeys = {
     tool_budget_toggle_label: "Platform tool-output budget",
     tool_budget_saved: "Tool-output budget setting saved.",
     tool_budget_save_failed: "Failed to save tool-output budget setting",
-    dynamic_worker_heading: "Dynamic worker guardrails",
-    dynamic_worker_help_title: "What are dynamic worker guardrails?",
+    dynamic_worker_heading: "Dynamic subagent guardrails",
+    dynamic_worker_help_title: "What are dynamic subagent guardrails?",
     dynamic_worker_help_body:
-      "Limits on the spawn_worker tool: how many temporary sub-agent workers a run may spawn at once, how many it may spawn cumulatively in one run, and how many steps each worker may take. Unset falls back to the process env-default settings.",
-    dynamic_worker_max_concurrent_label: "Max concurrent workers per run",
-    dynamic_worker_max_per_run_label: "Max cumulative workers per run",
-    dynamic_worker_max_iterations_label: "Max steps per worker",
+      "Limits on the spawn_worker tool: how many dynamic subagents a run may spawn at once, how many it may spawn cumulatively in one run, and how many steps each subagent may take. Unset falls back to the process env-default settings.",
+    dynamic_worker_max_concurrent_label: "Max concurrent subagents per run",
+    dynamic_worker_max_per_run_label: "Max cumulative subagents per run",
+    dynamic_worker_max_iterations_label: "Max steps per subagent",
     dynamic_worker_env_default: "env default",
     dynamic_worker_hint:
       "Changes take effect on the next run/build — no restart needed. When unset, the env-default values are used.",
     dynamic_worker_save: "Save",
-    dynamic_worker_saved: "Dynamic worker guardrails saved.",
-    dynamic_worker_save_failed: "Failed to save dynamic worker guardrails",
+    dynamic_worker_saved: "Dynamic subagent guardrails saved.",
+    dynamic_worker_save_failed: "Failed to save dynamic subagent guardrails",
     delegation_heading: "Delegation-gate capacity",
     delegation_help_title: "What is the delegation-gate capacity?",
     delegation_help_body:

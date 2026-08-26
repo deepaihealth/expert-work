@@ -23,12 +23,12 @@
  *   (``GATEABLE_TOOLS``, migrated from FormView) plus ``approval_timeout_s``
  *   (previously buried in governance's collapsed "Advanced" panel, now a
  *   first-class ``FieldRow``).
- * - **network** — ``dynamic_workers`` (also previously in "governance",
- *   default-on presence switch) plus the two curated ``PolicyFieldList``
- *   panels this component already had (sandbox egress / tool-use
- *   enforcement) — pulled out of their Collapse wrappers and laid flat in
- *   the tab, since they're no longer competing for space with an embedded
- *   FormView above them.
+ * - **network** — the two curated ``PolicyFieldList`` panels this component
+ *   already had (sandbox egress / tool-use enforcement) — pulled out of
+ *   their Collapse wrappers and laid flat in the tab. ``dynamic_workers``
+ *   lived here too until 2026-08-26 — it is an orchestration capability,
+ *   not a network policy, and users couldn't find it; it now renders in
+ *   the capabilities group's 子 Agent tab (``SubagentPicker``).
  *
  * Trajectory recording (``policies.trajectory_recording``) — previously the
  * other half of governance's "Advanced" panel — is NOT migrated here: Task 4
@@ -49,7 +49,6 @@ import {
   readApprovalTimeout,
   readClarificationTimeout,
   readApprovalTools,
-  readDynamicWorkersOn,
   readExtends,
   readOutputDlp,
   readOutputJudge,
@@ -62,7 +61,6 @@ import {
   setApprovalTimeout,
   setClarificationTimeout,
   setApprovalTools,
-  setDynamicWorkersOn,
   setOutputDlp,
   setOutputJudge,
   setOutputJudgeOnError,
@@ -181,7 +179,6 @@ export function SecuritySection({
   const approvalTools = readApprovalTools(formData);
   const approvalTimeout = readApprovalTimeout(formData);
   const clarificationTimeout = readClarificationTimeout(formData);
-  const dynamicWorkersOn = readDynamicWorkersOn(formData);
 
   const toggleApproval = (name: string, on: boolean): void => {
     const next = on
@@ -524,24 +521,9 @@ export function SecuritySection({
             label: t("security_gates.tab_network"),
             children: (
               <div data-testid="security-tab-network">
-                <FieldRow
-                  fieldId="dynamic_workers.enabled"
-                  label={t("agent_form.section_dynamic_workers")}
-                  brief={t("agent_form.dynamic_workers_hint")}
-                  help={t("agent_form.section_dynamic_workers_help")}
-                  isDefault={dynamicWorkersOn === true}
-                  onReset={() => onChange(setDynamicWorkersOn(formData, true))}
-                  resetHint="true"
-                >
-                  <Switch
-                    checked={dynamicWorkersOn}
-                    aria-label={t("agent_form.section_dynamic_workers")}
-                    onChange={(on) =>
-                      onChange(setDynamicWorkersOn(formData, on))
-                    }
-                  />
-                </FieldRow>
-
+                {/* dynamic_workers.enabled 原先在这里 —— 它是编排能力不是
+                    网络策略,已挪进能力分区的「子 Agent」tab(SubagentPicker,
+                    2026-08-26 用户反馈「界面上找不到」)。 */}
                 <Text
                   type="secondary"
                   style={{ display: "block", margin: "16px 0 8px" }}
