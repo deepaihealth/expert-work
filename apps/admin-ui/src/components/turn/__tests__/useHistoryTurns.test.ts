@@ -122,6 +122,8 @@ describe("useHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-05-25T00:00:00Z",
+        finishedAt: null,
+        runError: null,
       },
     ]);
     expect(result.current.loads).toEqual({

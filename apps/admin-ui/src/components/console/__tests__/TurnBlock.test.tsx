@@ -283,7 +283,8 @@ describe("TurnBlock", () => {
     renderTurnBlock(makeBaseProps(turn));
     const box = screen.getByTestId("console-turn-inputs");
     expect(box.querySelector("details")).not.toBeNull();
-    expect(box.querySelector("summary")).toHaveTextContent("入参 2 项");
+    // 本文件跑 en(同 ③' 的 "Thinking…" 断言)。
+    expect(box.querySelector("summary")).toHaveTextContent("2 inputs");
   });
 
   // 修复轮 2 —— 卡片空白是个大靶子,只许换高亮轮:`onSelect` 响,`onInspect`

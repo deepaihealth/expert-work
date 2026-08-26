@@ -32,6 +32,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -41,6 +43,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -62,6 +66,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -83,6 +89,8 @@ describe("buildHistoryTurns", () => {
       status: "success",
       tokens: null,
       createdAt: "2026-01-01",
+      finishedAt: null,
+      runError: null,
     });
   });
 
@@ -110,6 +118,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -119,6 +129,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -250,6 +262,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -259,6 +273,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -282,6 +298,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -291,6 +309,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -308,6 +328,8 @@ describe("buildHistoryTurns run_id grouping", () => {
       status: "success",
       tokens: null,
       createdAt: "2026-01-01",
+      finishedAt: null,
+      runError: null,
     });
   });
 
@@ -325,6 +347,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -340,6 +364,8 @@ describe("buildHistoryTurns run_id grouping", () => {
     );
     expect(turns?.[0]).toMatchObject({
       key: "r1", runId: "r1", status: "running", tokens, createdAt: "2026-02-02",
+ finishedAt: null,
+ runError: null,
     });
   });
 
