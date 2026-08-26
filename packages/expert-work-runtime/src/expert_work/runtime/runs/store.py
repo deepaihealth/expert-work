@@ -19,7 +19,7 @@ Implementations:
 from __future__ import annotations
 
 import abc
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Literal
@@ -164,14 +164,29 @@ class RunStore(abc.ABC):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        expected_statuses: Sequence[RunStatus] | None = None,
+        guard_claimed_by: str | None = None,
     ) -> bool:
-        """Update a run's status; return ``True`` iff the row exists.
+        """Update a run's status; return ``True`` iff the row exists
+        (and, when a guard is given, the guard held).
 
         ``error`` / ``finished_at`` / ``artifacts`` are written only when
         not ``None`` so a non-terminal transition (e.g. → RUNNING) never
         clears a verdict an earlier terminal write recorded. ``artifacts``
         (产物清单契约) is the run's registration snapshot — terminal calls
         pass ``[]`` for a zero-delivery run, never ``None``.
+
+        多副本 CAS 守卫(两个都是可选,``None`` = 旧无守卫语义):
+
+        * ``expected_statuses`` —— 仅当行当前 status 在集合内才写。
+          → RUNNING 转换传 ``(PENDING, QUEUED, RUNNING)``:PENDING 窗口里被
+          跨副本 ``request_cancel`` 改成 INTERRUPTED 的 run **不得**被属主
+          无条件写回 running 复活。
+        * ``guard_claimed_by`` —— 仅当行的 ``claimed_by`` 为 NULL **或**
+          等于该值才写。终局写传属主自己的 instance_id:被 orphan sweep
+          reclaim 走的 run,旧属主迟到的终局写必须 no-op,不然会把新属主
+          刚 reclaim 成的 running 盖掉、两边全停。NULL 分支保住从未
+          claim 过的 run(如 PENDING 直接失败)的终局写。
         """
 
     @abc.abstractmethod
@@ -605,9 +620,16 @@ class InMemoryRunStore(RunStore):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        expected_statuses: Sequence[RunStatus] | None = None,
+        guard_claimed_by: str | None = None,
     ) -> bool:
         row = self._rows.get(run_id)
         if row is None or row.tenant_id != tenant_id:
+            return False
+        # 守卫谓词与 SQL 店 byte-同义(见 Protocol docstring)。
+        if expected_statuses is not None and row.status not in expected_statuses:
+            return False
+        if guard_claimed_by is not None and row.claimed_by not in (None, guard_claimed_by):
             return False
         self._rows[run_id] = replace(
             row,
@@ -1061,6 +1083,8 @@ class SqlRunStore(RunStore):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        expected_statuses: Sequence[RunStatus] | None = None,
+        guard_claimed_by: str | None = None,
     ) -> bool:
         values: dict[str, Any] = {"status": status.value, "updated_at": updated_at}
         if error is not None:
@@ -1070,12 +1094,19 @@ class SqlRunStore(RunStore):
         # 谓词与 in-memory 店 byte-同义:None 不碰既有清单(非终局转换)。
         if artifacts is not None:
             values["artifacts"] = artifacts
-        async with self._sf() as session:
-            result = await session.execute(
-                update(AgentRunRow)
-                .where(AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id)
-                .values(values)
+        conditions = [AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id]
+        # 守卫谓词与 in-memory 店 byte-同义(见 Protocol docstring)。
+        if expected_statuses is not None:
+            conditions.append(AgentRunRow.status.in_(tuple(s.value for s in expected_statuses)))
+        if guard_claimed_by is not None:
+            conditions.append(
+                or_(
+                    AgentRunRow.claimed_by.is_(None),
+                    AgentRunRow.claimed_by == guard_claimed_by,
+                )
             )
+        async with self._sf() as session:
+            result = await session.execute(update(AgentRunRow).where(*conditions).values(values))
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 

@@ -407,7 +407,13 @@ async def run_agent(
     # 固化的清单读回来接着记,否则续跑段会把暂停前的登记整表覆盖掉。
     artifact_manifest: dict[str, dict[str, Any]] = {}
     if getattr(record, "is_resume", False):
-        for e in await run_manager.persisted_artifacts(run_id, tenant_id=record.tenant_id) or []:
+        # 续跑清单来源两级:审批 continuation 是**新** run_id,父 run 的清单
+        # 由 decide 端点挂在 ``record.seed_artifacts``;fallback 读自己的行,
+        # 兜同 run_id 重入(respawn/重试)的形态。
+        seeded = getattr(record, "seed_artifacts", None)
+        if seeded is None:
+            seeded = await run_manager.persisted_artifacts(run_id, tenant_id=record.tenant_id)
+        for e in seeded or []:
             if isinstance(e, dict) and e.get("name"):
                 artifact_manifest[str(e["name"])] = dict(e)
 
@@ -562,7 +568,15 @@ async def run_agent(
     # after the → RUNNING claim; cancelled in ``finally``.
     heartbeat_task: asyncio.Task[None] | None = None
     try:
-        await run_manager.set_status(run_id, RunStatus.RUNNING)
+        started = await run_manager.set_status(run_id, RunStatus.RUNNING)
+        if not started:
+            # 多副本洞 A —— PENDING 窗口里已被跨副本 ``request_cancel``:durable
+            # 行已是 interrupted,守卫拒绝复活(RunManager 已把 record 镜像成
+            # INTERRUPTED 并置位 abort_event)。一步图都不能跑;``finally`` 会
+            # 以 interrupted 收 end 帧。
+            logger.warning("run_agent.start_refused_already_cancelled run_id=%s", run_id)
+            session_outcome = "interrupted"
+            return
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(run_manager, run_id, record), name=f"run-heartbeat-{run_id}"
         )
