@@ -600,6 +600,9 @@ def build_triggers_router() -> APIRouter:
         thread_messages: Annotated[ThreadMessageStore, Depends(_get_thread_message_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         settings: Annotated[Settings, Depends(_get_settings)],
+        session_factory: Annotated[
+            async_sessionmaker[AsyncSession] | None, Depends(_get_session_factory)
+        ] = None,
     ) -> _FireNowResponse:
         """调试台「立即触发」:发射一次 + 有界轮询到终态 + 成功则投递回原对话。"""
         tenant_id: UUID = request.state.tenant_id
@@ -692,6 +695,8 @@ def build_triggers_router() -> APIRouter:
                 agent_spec_store=agents,
                 thread_message_store=thread_messages,
                 now=datetime.now(UTC),
+                # PROD-9 —— 与 scheduler reconcile 抢同一 thread 的投递,同一把锁。
+                session_factory=session_factory,
             )
             won = await trigger_runs.claim_reconcile(
                 fired.model_copy(update={"status": TriggerRunStatus.SUCCEEDED})
