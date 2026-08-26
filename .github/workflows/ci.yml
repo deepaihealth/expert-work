@@ -52,6 +52,9 @@ jobs:
       - name: harness compliance lint (STREAM-SE-DESIGN § SE-F)
         run: uv run python tools/harness/check_harness_compliance.py
 
+      - name: protected pins guard (PROD-7 / X-14 P2)
+        run: uv run python tools/ci/check_protected_pins.py
+
   typecheck:
     name: Typecheck (mypy)
     runs-on: ubuntu-latest

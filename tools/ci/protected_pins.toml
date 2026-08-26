@@ -1,0 +1,50 @@
+# 受保护钉版清单 —— PROD-7 / X-14 P2(e2b 事故复盘产物)。
+#
+# 这里登记的每一行钉版都带着一条真实的兼容性理由(多数对应一次真栈事故或一个
+# ROADMAP 迁移项)。CI 卫兵(tools/ci/check_protected_pins.py)断言 `match`
+# 子串仍逐字出现在 `file` 里:谁改了钉版(dependabot 或人手滑)而没同步改
+# 本清单,CI 立刻红,并把 reason/roadmap 打在失败信息里。
+#
+# 合法地升级一个钉版 = 同一个 PR 里改依赖 + 改(或删)这里对应的条目,
+# 评审因此必然看见理由与迁移项。
+#
+# 【教训来源】2026-08-21 e2b 事故:dependabot #1233 把 e2b 抬到 2.39.1,钉版
+# 注释里写明的兼容性理由(ACS 私有协议 key 过不了新版客户端校验)没有拦住
+# 合并,测试环境沙箱工具全灭,真栈才炸。评审可能漏、CI 假件全绿、smoke 只探
+# HTTP —— 这道卫兵补的是第二层。
+
+[[pin]]
+file = "services/orchestrator/pyproject.toml"
+match = '"e2b==2.24.0"'
+reason = "e2b 2.25+ 客户端强制校验 key 必须 e2b_ 前缀,ACS Agent Sandbox 私有协议 key 过不了(2026-08-21 真栈事故)"
+roadmap = "X-13(升级需重跑沙箱运行时契约探针 + 真栈 exec_python 冒烟)"
+
+[[pin]]
+file = "services/orchestrator/pyproject.toml"
+match = '"e2b-code-interpreter==2.7.0"'
+reason = "与 e2b==2.24.0 配套的已验证矩阵"
+roadmap = "X-13"
+
+[[pin]]
+file = "services/orchestrator/pyproject.toml"
+match = '"mcp>=1.28.1,<2"'
+reason = "mcp 2.x 换 httpx2 依赖、streamable_http_client 签名变更(3 元组),整条 MCP 客户端层要迁"
+roadmap = "X-11(迁移要真栈测 streamable-http + OAuth 路径)"
+
+[[pin]]
+file = "services/control-plane/pyproject.toml"
+match = '"fastapi>=0.115,<0.137"'
+reason = "fastapi 0.137 起 include_router 懒挂载,app.routes 不再摊平 APIRoute —— 路由自审(安全闸族)集体失明"
+roadmap = "X-12(迁移改用 iter_route_contexts 并变异自证)"
+
+[[pin]]
+file = "services/sandbox-supervisor/pyproject.toml"
+match = '"fastapi>=0.115,<0.137"'
+reason = "同 control-plane:0.137 懒挂载破坏路由自审"
+roadmap = "X-12"
+
+[[pin]]
+file = "services/orchestrator/pyproject.toml"
+match = 'rev = "ce3b859c54d00eaa58395a3905d880fb3c5573fe"'
+reason = "kruise-agents 是未发布的 GitHub-only 包,rev 钉死 = 供应链面收窄;patch_e2b 对该 rev 验证过"
+roadmap = "X-13(动沙箱链路依赖必跑 deployment.md contract-run)"
