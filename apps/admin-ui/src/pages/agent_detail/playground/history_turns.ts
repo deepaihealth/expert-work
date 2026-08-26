@@ -51,6 +51,10 @@ export interface HistoryTurn {
   tokens: RunTokens | null;
   /** ``ThreadRunSummary.createdAt``(ISO);账本时长投影里未回放 / 无时序轮的兜底起点。 */
   createdAt: string | null;
+  /** ``ThreadRunSummary.finishedAt``(ISO)—— 总耗时的墙钟终点;老后端 null。 */
+  finishedAt: string | null;
+  /** ``ThreadRunSummary.error`` —— INTERRUPTED 的中断原因短码 / ERROR 的异常文本。 */
+  runError: string | null;
 }
 
 /** Group the messages by their owning run, or ``null`` if grouping them is
@@ -114,6 +118,8 @@ export function buildHistoryTurns(
         status: r.status,
         tokens: r.tokens,
         createdAt: r.createdAt ?? null,
+        finishedAt: r.finishedAt ?? null,
+        runError: r.error ?? null,
       };
     });
   }
@@ -153,5 +159,7 @@ export function buildHistoryTurns(
     status: r.status,
     tokens: r.tokens,
     createdAt: r.createdAt ?? null,
+    finishedAt: r.finishedAt ?? null,
+    runError: r.error ?? null,
   }));
 }

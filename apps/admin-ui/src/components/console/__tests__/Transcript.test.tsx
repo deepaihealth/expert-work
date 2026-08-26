@@ -42,6 +42,8 @@ function makeTurn(
     tokens: null,
     timing: null,
     createdAt: null,
+    finishedAt: null,
+    runError: null,
   };
 }
 

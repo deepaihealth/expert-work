@@ -76,7 +76,9 @@ export function ProcessStrip({
         <span className="ew-process__caret" aria-hidden>
           {isOpen ? "▾" : "▸"}
         </span>
-        <span className="ew-process__headline">
+        {/* 截断成省略号后 hover 有全文 —— 「工具 17 次(…)」被拦腰截断时
+            不用展开也能看清工具分布(2026-08-26 用户反馈)。 */}
+        <span className="ew-process__headline" title={headline}>
           {headline}
           {summary.failed > 0 && (
             <>

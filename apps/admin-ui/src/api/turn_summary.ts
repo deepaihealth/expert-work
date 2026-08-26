@@ -10,6 +10,7 @@
  * never by inspecting the text itself.
  */
 import type { SseEvent } from "./sessions";
+import { serverMsOf } from "./sse_id";
 import { messagesOf } from "./tool_timeline";
 
 export interface TurnUsage {
@@ -179,8 +180,22 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
     }
   }
 
+  // 时长优先取帧 id 的服务端毫秒段(`{server_ms}-{seq}`)—— 回放安全。
+  // ``receivedAt`` 是客户端收帧时刻,历史轮回放时全挤在一瞬间,曾把一轮
+  // 9 分钟的 run 显示成「8ms」(ledger_timing.ts 的同一条规矩)。只有整轮
+  // 一个合法 id 都没有的老 run 才退回 receivedAt。
   let latencyMs: number | null = null;
-  if (events.length >= 2) {
+  let earliest = Number.POSITIVE_INFINITY;
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const evt of events) {
+    const ms = serverMsOf(evt.id);
+    if (ms === null) continue;
+    if (ms < earliest) earliest = ms;
+    if (ms > latest) latest = ms;
+  }
+  if (latest > earliest) {
+    latencyMs = latest - earliest;
+  } else if (events.length >= 2) {
     const first = Date.parse(events[0].receivedAt);
     const last = Date.parse(events[events.length - 1].receivedAt);
     if (!Number.isNaN(first) && !Number.isNaN(last) && last >= first) {

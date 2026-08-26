@@ -131,6 +131,28 @@ describe("summarizeTurn", () => {
     expect(summary.latencyMs).toBe(2500);
   });
 
+  it("prefers the frame ids' server-ms span over receivedAt (replay-safe)", () => {
+    // 回放轮的 receivedAt 全挤在回放一瞬间(这里两帧只差 1ms)——时长必须
+    // 来自帧 id 的服务端毫秒段,否则 9 分钟的 run 显示成 8ms。
+    const events: SseEvent[] = [
+      {
+        id: "1756170000000-1",
+        event: "updates",
+        data: { agent: { messages: [{ type: "ai", content: "" }] } },
+        rawData: "",
+        receivedAt: "2026-08-26T10:00:00.000Z",
+      },
+      {
+        id: "1756170540000-9",
+        event: "updates",
+        data: { agent: { messages: [{ type: "ai", content: "done" }] } },
+        rawData: "",
+        receivedAt: "2026-08-26T10:00:00.001Z",
+      },
+    ];
+    expect(summarizeTurn(events).latencyMs).toBe(540_000);
+  });
+
   it("ignores non-updates frames and tool messages", () => {
     const events: SseEvent[] = [
       { id: "m", event: "metadata", data: { run_id: "r" }, rawData: "", receivedAt: "t" },

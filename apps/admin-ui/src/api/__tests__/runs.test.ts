@@ -17,7 +17,16 @@ describe("listThreadRuns", () => {
         success: true,
         data: {
           runs: [
-            { run_id: "r1", status: "success", is_resume: false, created_at: "2026-01-01T00:00:00Z" },
+            // r1 = 新后端行(带 finished_at + error);r2 = 老后端行(缺
+            // 两字段)→ 必须映射成 null 而不是 undefined。
+            {
+              run_id: "r1",
+              status: "interrupted",
+              is_resume: false,
+              created_at: "2026-01-01T00:00:00Z",
+              finished_at: "2026-01-01T00:00:30Z",
+              error: "user_cancel",
+            },
             { run_id: "r2", status: "paused", is_resume: true, created_at: "2026-01-01T00:01:00Z" },
           ],
         },
@@ -31,9 +40,11 @@ describe("listThreadRuns", () => {
     expect(runs).toEqual([
       {
         runId: "r1",
-        status: "success",
+        status: "interrupted",
         isResume: false,
         createdAt: "2026-01-01T00:00:00Z",
+        finishedAt: "2026-01-01T00:00:30Z",
+        error: "user_cancel",
         tokens: null,
       },
       {
@@ -41,6 +52,8 @@ describe("listThreadRuns", () => {
         status: "paused",
         isResume: true,
         createdAt: "2026-01-01T00:01:00Z",
+        finishedAt: null,
+        error: null,
         tokens: null,
       },
     ]);

@@ -49,6 +49,15 @@ export class ApiError extends Error {
   }
 }
 
+/** 错误 → 一句可展示的话:``ApiError`` 带上错误码(它的 ``message`` 就是
+ *  后端 ``detail``),普通 ``Error`` 取 message,其余 String()。给 toast 用
+ *  —— 静默吞错让「下载 404」表现成「点了没反应」(2026-08-26 用户反馈)。 */
+export function errMessage(err: unknown): string {
+  if (err instanceof ApiError) return `${err.code}: ${err.message}`;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 export function getStoredToken(): string | null {
   if (typeof window === "undefined") return null;
   return window.localStorage.getItem(TOKEN_STORAGE_KEY);

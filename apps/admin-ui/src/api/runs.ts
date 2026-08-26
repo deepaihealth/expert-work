@@ -263,6 +263,12 @@ export interface ThreadRunSummary {
   status: RunStatus;
   isResume: boolean;
   createdAt: string;
+  /** 终态墙钟(ISO)。「总耗时」= finishedAt − createdAt —— 回放帧的
+   *  ``receivedAt`` 全挤在回放一瞬间,不能当耗时。老后端无此字段 → null。 */
+  finishedAt: string | null;
+  /** INTERRUPTED 放 InterruptReason 短码(user_cancel / client_disconnect /
+   *  tenant_suspended / agent_disabled),ERROR 放异常文本;其余 null。 */
+  error: string | null;
   /** PR-A — persisted per-run token rollup (``null`` when the run has no
    *  recorded usage; absent on old backends → treated as null). */
   tokens: RunTokens | null;
@@ -273,6 +279,8 @@ interface ThreadRunRow {
   status: RunStatus;
   is_resume: boolean;
   created_at: string;
+  finished_at?: string | null;
+  error?: string | null;
   tokens?: RunTokens | null;
 }
 
@@ -291,6 +299,8 @@ export async function listThreadRuns(
     status: r.status,
     isResume: r.is_resume,
     createdAt: r.created_at,
+    finishedAt: r.finished_at ?? null,
+    error: r.error ?? null,
     tokens: r.tokens ?? null,
   }));
 }

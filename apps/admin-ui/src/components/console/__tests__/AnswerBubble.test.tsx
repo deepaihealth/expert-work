@@ -66,6 +66,8 @@ function makeConsoleTurn(
     tokens: null,
     timing: null,
     createdAt: null,
+    finishedAt: null,
+    runError: null,
     ...over,
   };
 }

@@ -8,8 +8,8 @@ describe("buildConsoleTurns", () => {
   it("orders history before live, numbers seq from 0, maps history status/error like the old TurnCard call site", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
-        { key: "h2", input: "q2", fallbackLines: [{ text: "partial", channel: "final" }], runId: "r2", status: "timeout", tokens: null, createdAt: null },
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null },
+        { key: "h2", input: "q2", fallbackLines: [{ text: "partial", channel: "final" }], runId: "r2", status: "timeout", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { r1: { state: "done", events: [meta("r1")] } },
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
@@ -23,7 +23,7 @@ describe("buildConsoleTurns", () => {
   it("maps an interrupted history run to an interrupted turn (BUG-9 — not 'done')", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "interrupted", tokens: null, createdAt: null },
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "interrupted", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { r1: { state: "done", events: [meta("r1")] } },
       liveTurns: [],
@@ -36,7 +36,7 @@ describe("buildConsoleTurns", () => {
     const sp = { id: "1", event: "system_prompt", data: { text: "p", inputs: { a: "1", b: "2" } }, rawData: "", receivedAt: "" };
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { r1: { state: "done", events: [sp, meta("r1")] } },
       liveTurns: [],
@@ -48,7 +48,7 @@ describe("buildConsoleTurns", () => {
     const sp = { id: "1", event: "system_prompt", data: { text: "p" }, rawData: "", receivedAt: "" };
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+        { key: "h1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { r1: { state: "done", events: [sp] } },
       liveTurns: [],
@@ -58,7 +58,7 @@ describe("buildConsoleTurns", () => {
   });
   it("passes the persisted rollup through and returns [] for null history + no live turns", () => {
     const tokens = { input_tokens: 1, output_tokens: 1, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2, llm_calls: 1, models: [] };
-    expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens, createdAt: null }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);
+    expect(buildConsoleTurns({ historyTurns: [{ key: "h", input: "", fallbackLines: [], runId: "r", status: "success", tokens, createdAt: null, finishedAt: null, runError: null }], historyLoads: {}, liveTurns: [], timings: {} })[0].tokens).toEqual(tokens);
     expect(buildConsoleTurns({ historyTurns: null, historyLoads: {}, liveTurns: [], timings: {} })).toEqual([]);
   });
 });
@@ -66,7 +66,7 @@ describe("buildConsoleTurns", () => {
 describe("createdAt", () => {
   it("history turns carry the run's createdAt, live turns null", () => {
     const [history, live] = buildConsoleTurns({
-      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z" }],
+      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z", finishedAt: null, runError: null }],
       historyLoads: {},
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
       timings: {},
@@ -79,7 +79,7 @@ describe("createdAt", () => {
 describe("statsInputOf", () => {
   it("maps loaded from loadState==='done' (not source) and carries events/status/tokens/timing through", () => {
     const [history, live] = buildConsoleTurns({
-      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z" }],
+      historyTurns: [{ key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: "2026-01-01T00:00:00Z", finishedAt: null, runError: null }],
       historyLoads: {}, // no r1 entry → loadState stays "pending", not "done"
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [meta("r3")], status: "running", error: null, approval: null }],
       timings: { L1: { ttftMs: 500, firstTokenAt: 1, lastTokenAt: 2 } },
@@ -113,8 +113,8 @@ describe("non-terminal history turns (D-5/D-6)", () => {
   it("maps a running run to a running turn and hook-internal 'live' load to 'done'", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
-        { key: "h2", input: "q2", fallbackLines: [], runId: "r2", status: "running", tokens: null, createdAt: null },
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null },
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r2", status: "running", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: {
         r1: { state: "done", events: [meta("r1")] },
@@ -131,10 +131,10 @@ describe("non-terminal history turns (D-5/D-6)", () => {
   });
 
   it("surfaces the pending approval on a paused LAST turn only", () => {
-    const paused = { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null };
+    const paused = { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null, finishedAt: null, runError: null };
     const withApproval = buildConsoleTurns({
       historyTurns: [
-        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null },
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null },
         paused,
       ],
       historyLoads: { "r-paused": { state: "live", events: [meta("r-paused"), approvalFrame] } },
@@ -155,7 +155,7 @@ describe("non-terminal history turns (D-5/D-6)", () => {
     const withContinuation = buildConsoleTurns({
       historyTurns: [
         paused,
-        { key: "h3", input: "", fallbackLines: [], runId: "r3", status: "running", tokens: null, createdAt: null },
+        { key: "h3", input: "", fallbackLines: [], runId: "r3", status: "running", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { "r-paused": { state: "live", events: [approvalFrame] } },
       liveTurns: [],
@@ -168,7 +168,7 @@ describe("non-terminal history turns (D-5/D-6)", () => {
   it("does not surface approval on a paused turn when a live turn follows", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null },
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { "r-paused": { state: "done", events: [approvalFrame] } },
       liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [], status: "running", error: null, approval: null }],
@@ -183,7 +183,7 @@ describe("approval synthesis opt-in (终审 C-2)", () => {
   it("does NOT synthesise approval without the opt-in — the playground path", () => {
     const out = buildConsoleTurns({
       historyTurns: [
-        { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null },
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r-paused", status: "paused", tokens: null, createdAt: null, finishedAt: null, runError: null },
       ],
       historyLoads: { "r-paused": { state: "done", events: [approvalFrame] } },
       liveTurns: [],

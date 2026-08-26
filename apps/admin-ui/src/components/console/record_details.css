@@ -292,7 +292,9 @@
    按钮,关掉指针事件免得点到看不见的东西(分节标题按钮在预览区外,不受影响)。 */
 .ew-detail__preview {
   position: relative;
-  max-height: 120px;
+  /* 180px(原 120px)—— 概要预览拦腰切得太狠,常常一行正文都露不全
+     (2026-08-26 用户反馈);全文仍在对应 tab 里。 */
+  max-height: 180px;
   padding: 0 14px;
   overflow: hidden;
   pointer-events: none;

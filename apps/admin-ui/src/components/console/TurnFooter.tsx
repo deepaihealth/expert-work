@@ -73,6 +73,17 @@ export function TurnFooter({
   // this footer has no Gantt/StepTimeline parse of its own).
   const failed = status === "error" || turn.turn.events.some((e) => e.event === "error");
 
+  // 「总耗时」优先取 run 行的墙钟(finished_at − created_at,含建 run 到
+  // 第一帧的时间);老后端 / live 轮退回帧时序推出的 latencyMs。带标签渲染
+  // —— 裸时长和步耗时并排时分不出哪个是整轮的(2026-08-26 用户反馈)。
+  let wallMs: number | null = null;
+  if (turn.createdAt !== null && turn.finishedAt !== null) {
+    const start = Date.parse(turn.createdAt);
+    const end = Date.parse(turn.finishedAt);
+    if (!Number.isNaN(start) && !Number.isNaN(end) && end >= start) wallMs = end - start;
+  }
+  if (wallMs === null) wallMs = summary.latencyMs;
+
   const meta: string[] = [];
   if (summary.usage) {
     meta.push(
@@ -82,7 +93,9 @@ export function TurnFooter({
   if (summary.stepCount !== null) {
     meta.push(t("console.footer_steps", { n: summary.stepCount }));
   }
-  if (summary.latencyMs !== null) meta.push(fmtDuration(summary.latencyMs));
+  if (wallMs !== null) {
+    meta.push(t("console.footer_total_duration", { d: fmtDuration(wallMs) }));
+  }
   if (summary.modelName) meta.push(summary.modelName);
 
   const breakdown: string[] = summary.usage
@@ -98,10 +111,28 @@ export function TurnFooter({
       ]
     : [];
 
+  // 中断原因(InterruptReason 短码,来自 run 行的 error)—— 「主动取消」和
+  // 「断流被杀 / 连带取消」必须分得开;词表外的值 / 老 run 的 null 落回
+  // 通用「已中断」。
+  const INTERRUPT_REASONS = new Set([
+    "user_cancel",
+    "client_disconnect",
+    "tenant_suspended",
+    "agent_disabled",
+  ]);
+  const interruptReason =
+    status === "interrupted" && turn.runError !== null && INTERRUPT_REASONS.has(turn.runError)
+      ? turn.runError
+      : null;
+  const statusLabel =
+    interruptReason !== null
+      ? t(`console.interrupt_reason_${interruptReason}`)
+      : t(`console.footer_status_${status}`);
+
   return (
     <div className="ew-turn-footer">
       <Tag color={STATUS_TAG_COLOR[status]} bordered={false} data-testid="console-turn-status">
-        {t(`console.footer_status_${status}`)}
+        {statusLabel}
       </Tag>
       {meta.length > 0 && (
         <Tooltip

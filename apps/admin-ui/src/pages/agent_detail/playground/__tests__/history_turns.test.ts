@@ -8,7 +8,7 @@ function run(
   runId: string,
   status: ThreadRunSummary["status"] = "success",
 ): ThreadRunSummary {
-  return { runId, status, isResume: false, createdAt: "2026-01-01", tokens: null };
+  return { runId, status, isResume: false, createdAt: "2026-01-01", finishedAt: null, error: null, tokens: null };
 }
 
 const U = (content: string): HistoryMessage => ({ role: "user", content });
@@ -32,6 +32,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -41,6 +43,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -62,6 +66,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -83,6 +89,8 @@ describe("buildHistoryTurns", () => {
       status: "success",
       tokens: null,
       createdAt: "2026-01-01",
+      finishedAt: null,
+      runError: null,
     });
   });
 
@@ -110,6 +118,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -119,6 +129,8 @@ describe("buildHistoryTurns", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -133,7 +145,7 @@ describe("buildHistoryTurns", () => {
       cache_read_tokens: 0, total_tokens: 15, llm_calls: 1, models: ["m"],
     };
     const turns = buildHistoryTurns(messages, [
-      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", tokens },
+      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", finishedAt: null, error: null, tokens },
     ]);
     expect(turns?.[0]?.tokens).toEqual(tokens);
   });
@@ -143,7 +155,7 @@ describe("buildHistoryTurns", () => {
       { role: "assistant", content: "a", channel: "final" },
     ];
     const turns = buildHistoryTurns(messages, [
-      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", tokens: null },
+      { runId: "r1", status: "success", isResume: false, createdAt: "2026-01-01T00:00:00Z", finishedAt: null, error: null, tokens: null },
     ]);
     expect(turns?.[0]?.createdAt).toBe("2026-01-01T00:00:00Z");
     const bare = buildHistoryTurns(messages, [
@@ -250,6 +262,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -259,6 +273,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -282,6 +298,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
       {
         key: "r2",
@@ -291,6 +309,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -308,6 +328,8 @@ describe("buildHistoryTurns run_id grouping", () => {
       status: "success",
       tokens: null,
       createdAt: "2026-01-01",
+      finishedAt: null,
+      runError: null,
     });
   });
 
@@ -325,6 +347,8 @@ describe("buildHistoryTurns run_id grouping", () => {
         status: "success",
         tokens: null,
         createdAt: "2026-01-01",
+        finishedAt: null,
+        runError: null,
       },
     ]);
   });
@@ -336,10 +360,12 @@ describe("buildHistoryTurns run_id grouping", () => {
     };
     const turns = buildHistoryTurns(
       [Ur("q1", "r1"), Ar("a1", "r1")],
-      [{ runId: "r1", status: "running", isResume: true, createdAt: "2026-02-02", tokens }],
+      [{ runId: "r1", status: "running", isResume: true, createdAt: "2026-02-02", finishedAt: null, error: null, tokens }],
     );
     expect(turns?.[0]).toMatchObject({
       key: "r1", runId: "r1", status: "running", tokens, createdAt: "2026-02-02",
+ finishedAt: null,
+ runError: null,
     });
   });
 

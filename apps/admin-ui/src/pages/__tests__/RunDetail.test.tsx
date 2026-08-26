@@ -131,8 +131,8 @@ const TWO_TURNS: sessionsSdk.HistoryMessage[] = [
 ];
 
 const TWO_RUNS = [
-  { runId: RUN_1, status: "success" as const, isResume: false, createdAt: "2026-06-30T12:00:00Z", tokens: null },
-  { runId: RUN_2, status: "success" as const, isResume: true, createdAt: "2026-06-30T12:05:00Z", tokens: null },
+  { runId: RUN_1, status: "success" as const, isResume: false, createdAt: "2026-06-30T12:00:00Z", finishedAt: null, error: null, tokens: null },
+  { runId: RUN_2, status: "success" as const, isResume: true, createdAt: "2026-06-30T12:05:00Z", finishedAt: null, error: null, tokens: null },
 ];
 
 const CONVO: convoSdk.ConversationDetail = {

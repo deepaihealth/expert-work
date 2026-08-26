@@ -115,7 +115,9 @@ export function buildConsoleTurns(args: {
             : h.status === "interrupted"
               ? "interrupted"
               : "done",
-        error: failed ? h.status : null,
+        // 失败轮优先展示 run 行的真实异常文本(ThreadRunSummary.error);
+        // 老后端没有该字段时保持原样退回状态字符串。
+        error: failed ? (h.runError ?? h.status) : null,
         approval,
       },
       runId: h.runId,
@@ -124,6 +126,8 @@ export function buildConsoleTurns(args: {
       tokens: h.tokens,
       timing: null,
       createdAt: h.createdAt,
+      finishedAt: h.finishedAt,
+      runError: h.runError,
     });
     seq += 1;
   }
@@ -140,6 +144,8 @@ export function buildConsoleTurns(args: {
       tokens: null,
       timing: args.timings[turn.id] ?? null,
       createdAt: null,
+      finishedAt: null,
+      runError: null,
     });
     seq += 1;
   }

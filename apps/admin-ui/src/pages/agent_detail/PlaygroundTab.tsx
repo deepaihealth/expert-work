@@ -16,11 +16,11 @@
  * 不再传 ``inspect``。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Segmented, Typography } from "antd";
+import { Alert, App, Segmented, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { downloadArtifact } from "../../api/artifacts";
-import { ApiError } from "../../api/client";
+import { ApiError, errMessage } from "../../api/client";
 import { listRateCards, type RateCardRecord } from "../../api/rate_card";
 import { streamRunEvents } from "../../api/runs";
 import { computeSessionStats } from "../../api/session_stats";
@@ -78,6 +78,7 @@ const COMPOSER_STYLE: React.CSSProperties = {
 
 export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const { t } = useTranslation();
+  const { message } = App.useApp();
   const r = detail.record;
   // Langfuse has no per-tenant isolation (single ClickHouse, all tenants
   // mixed), so the per-turn deep link is platform-ops only — TraceToolbar
@@ -431,12 +432,12 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     async (name: string) => {
       try {
         await downloadArtifact(name, undefined, concreteTenantScope(apiTenantScope));
-      } catch {
-        // Swallow — the artifact may be gone between render and click; the
-        // workspace panel's refresh re-syncs.
+      } catch (err) {
+        // 静默吞错让「下载失败」表现成「点了没反应」(2026-08-26 用户反馈)。
+        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       }
     },
-    [apiTenantScope],
+    [apiTenantScope, message, t],
   );
 
   const handleFireResult = useCallback((result: FireNowResult) => {
