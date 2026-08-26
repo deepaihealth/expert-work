@@ -1543,34 +1543,30 @@ async def test_registered_artifacts_land_on_end_and_persist_with_terminal_status
 
 
 @pytest.mark.asyncio
-async def test_resume_seeds_manifest_from_persisted_artifacts() -> None:
-    """审批续跑不丢暂停前的登记 —— 续跑段的清单在旧清单上接着记。
+async def test_resume_seeds_manifest_from_seed_artifacts() -> None:
+    """审批续跑不丢暂停前的登记 —— **生产真形态**:continuation 是新 run_id、
+    新 durable 行,父 run 的清单由 decide 端点挂在 ``record.seed_artifacts``。
 
-    旧行为(无 seeding)会把 PAUSED 时固化的清单整表覆盖成续跑段新登记,
-    第一条断言必红。
+    (此前这条测试用「同 run_id 的行上有清单」摆场景 —— 那不是审批续跑的
+    真形态,并因此掩盖了 seeding 读自己空行恒 no-op 的潜伏 bug;CAS 守卫
+    落地时被 → RUNNING 的 expected_statuses 撞出来。)
     """
-    from datetime import UTC, datetime
-
     from expert_work.runtime.runs.store import InMemoryRunStore
 
     store = InMemoryRunStore()
     bridge = InMemoryStreamBridge()
     rm = RunManager(store)
+    thread_id, tenant_id = uuid4(), uuid4()
+    pre_pause = {"name": "draft.md", "kind": "document", "version": 1, "created_at": "x"}
+    # continuation:新 run_id、fresh PENDING 行;父行清单走 seed_artifacts。
     record = await rm.create(
         run_id=uuid4(),
-        thread_id=uuid4(),
-        tenant_id=uuid4(),
+        thread_id=thread_id,
+        tenant_id=tenant_id,
         on_disconnect=DisconnectMode.CANCEL,
         is_resume=True,
     )
-    pre_pause = {"name": "draft.md", "kind": "document", "version": 1, "created_at": "x"}
-    await store.set_status(
-        run_id=record.run_id,
-        tenant_id=record.tenant_id,
-        status=RunStatus.PAUSED,
-        updated_at=datetime.now(UTC),
-        artifacts=[pre_pause],
-    )
+    record.seed_artifacts = [pre_pause]
     post = {"name": "final.pptx", "kind": "document", "version": 1, "created_at": "y"}
     graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[post])
 
@@ -1586,3 +1582,114 @@ async def test_resume_seeds_manifest_from_persisted_artifacts() -> None:
     end = await _end_entry(bridge, record.run_id)
     assert pre_pause in end.data["artifacts"]
     assert post in end.data["artifacts"]
+    # 终局固化也带上继承的清单 —— continuation 行成为完整快照。
+    row = await store.get(run_id=record.run_id, tenant_id=tenant_id)
+    assert row is not None and row.artifacts is not None
+    assert pre_pause in row.artifacts and post in row.artifacts
+
+
+@pytest.mark.asyncio
+async def test_resume_falls_back_to_own_row_manifest() -> None:
+    """fallback:``seed_artifacts`` 缺席时读自己的行 —— 兜同 run_id 重入
+    (respawn / 重试)的形态。行造成 RUNNING(reclaim 后的真实状态),不撞
+    → RUNNING 的 expected_statuses 守卫。"""
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs.store import InMemoryRunStore
+
+    store = InMemoryRunStore()
+    bridge = InMemoryStreamBridge()
+    rm = RunManager(store)
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=True,
+    )
+    prior = {"name": "draft.md", "kind": "document", "version": 1, "created_at": "x"}
+    await store.set_status(
+        run_id=record.run_id,
+        tenant_id=record.tenant_id,
+        status=RunStatus.RUNNING,
+        updated_at=datetime.now(UTC),
+        artifacts=[prior],
+    )
+    graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    end = await _end_entry(bridge, record.run_id)
+    assert prior in end.data["artifacts"]
+
+
+# ---------------------------------------------------------------------------
+# 多副本 CAS 守卫 —— 洞 A 的执行面(sse.py)与心跳丢租约(缺口 C)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_agent_refuses_to_start_a_cross_replica_cancelled_run() -> None:
+    """PENDING 窗口里被跨副本取消的 run:→ RUNNING 被守卫拒绝后,一步图都
+    不能跑,end 帧以 interrupted 收 —— 「取消静默丢失、run 照跑完」是洞 A
+    的原始形态,这条测试钉住修后的行为。"""
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs import InMemoryRunStore
+
+    store = InMemoryRunStore()
+    rm = RunManager(store=store)
+    bridge = InMemoryStreamBridge()
+    record = await rm.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4())
+    # 另一副本的取消赢在 PENDING 窗口里。
+    assert await store.request_cancel(
+        run_id=record.run_id,
+        tenant_id=record.tenant_id,
+        updated_at=datetime.now(UTC),
+        reason="user_cancel",
+    )
+
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}])
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    assert not graph.started.is_set(), "被取消的 run 跑了图 —— 取消静默丢失(洞 A)"
+    entry = await _end_entry(bridge, record.run_id)
+    assert entry.data.get("status") == "interrupted"
+    row = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert row is not None and row.status is RunStatus.INTERRUPTED
+    assert row.error == "user_cancel"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_aborts_when_lease_is_lost() -> None:
+    """缺口 C —— 跨副本取消唯一的落地环节:``RunManager.heartbeat`` 返回
+    ``False``(行被 request_cancel 改走 / 被 reclaim)时,``_heartbeat_loop``
+    必须置位 ``abort_event`` 让属主停下。此前该环节零测试。"""
+    from orchestrator.sse import _heartbeat_loop
+
+    class _LostLeaseManager:
+        lease_ttl_s = 3.0  # interval = max(1.0, 1.0) = 1s,测试 ~1s
+
+        async def heartbeat(self, run_id: Any) -> bool:
+            return False
+
+    record = SimpleNamespace(abort_event=asyncio.Event())
+    await asyncio.wait_for(
+        _heartbeat_loop(_LostLeaseManager(), uuid4(), record),  # type: ignore[arg-type]
+        timeout=5.0,
+    )
+    assert record.abort_event.is_set(), "丢租约后没有置位 abort_event —— 双执行防线失效"

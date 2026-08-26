@@ -861,6 +861,12 @@ async def resolve_approval_decision(
     )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.
     run_record.bound_distilled_skills = built.bound_distilled_skills
+    # 产物清单契约 —— continuation 是新 run_id、新行:父 run PAUSED 时固化的
+    # 清单挂到 record 上,续跑段在它之上接着记(否则 seeding 读自己的空行,
+    # 暂停前的登记会被整表覆盖)。
+    run_record.seed_artifacts = await runtime.run_manager.persisted_artifacts(
+        run_id, tenant_id=tenant_id
+    )
     config: RunnableConfig = {
         "configurable": {
             "thread_id": str(thread_id),

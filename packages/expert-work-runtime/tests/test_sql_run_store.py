@@ -883,3 +883,98 @@ async def test_set_status_artifacts_round_trip_and_none_keeps(run_store: SqlRunS
     )
     fetched3 = await run_store.get(run_id=run_id, tenant_id=tenant_id)
     assert fetched3 is not None and fetched3.artifacts == []
+
+
+# ---------------------------------------------------------------------------
+# 多副本 CAS 守卫 —— 与 in-memory 店谓词 byte-同义(test_run_store 有镜像用例)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_status_expected_statuses_guard(run_store: SqlRunStore) -> None:
+    """→ RUNNING 带 ``expected_statuses``:行已被跨副本取消(interrupted)时
+    写被拒绝、行原样;pending 行照常放行。"""
+    store = run_store
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id))
+    await store.request_cancel(
+        run_id=run_id, tenant_id=tenant_id, updated_at=_BASE, reason="user_cancel"
+    )
+
+    guard = (RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING)
+    hit = await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.RUNNING,
+        updated_at=_BASE,
+        expected_statuses=guard,
+    )
+    assert hit is False
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None and row.status is RunStatus.INTERRUPTED
+    assert row.error == "user_cancel"
+
+    fresh = uuid4()
+    await store.create(_info(run_id=fresh, tenant_id=tenant_id))
+    assert (
+        await store.set_status(
+            run_id=fresh,
+            tenant_id=tenant_id,
+            status=RunStatus.RUNNING,
+            updated_at=_BASE,
+            expected_statuses=guard,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_status_guard_claimed_by(run_store: SqlRunStore) -> None:
+    """终局写带 ``guard_claimed_by``:行归别的副本时拒绝;NULL 或本副本放行。"""
+    store = run_store
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id, status=RunStatus.RUNNING))
+    await store.claim(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        claimed_by="pod-b",
+        lease_until=_BASE + timedelta(seconds=30),
+        heartbeat_at=_BASE,
+    )
+
+    hit = await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.INTERRUPTED,
+        updated_at=_BASE,
+        finished_at=_BASE,
+        guard_claimed_by="pod-a",
+    )
+    assert hit is False
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None and row.status is RunStatus.RUNNING
+
+    # 本副本 / 从未 claim 过 —— 都放行。
+    assert (
+        await store.set_status(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.SUCCESS,
+            updated_at=_BASE,
+            finished_at=_BASE,
+            guard_claimed_by="pod-b",
+        )
+        is True
+    )
+    unclaimed = uuid4()
+    await store.create(_info(run_id=unclaimed, tenant_id=tenant_id))
+    assert (
+        await store.set_status(
+            run_id=unclaimed,
+            tenant_id=tenant_id,
+            status=RunStatus.ERROR,
+            updated_at=_BASE,
+            guard_claimed_by="pod-a",
+        )
+        is True
+    )

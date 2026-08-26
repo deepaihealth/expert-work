@@ -293,3 +293,78 @@ def test_instance_id_is_stable_and_unique() -> None:
     a, b = RunManager(), RunManager()
     assert a.instance_id and b.instance_id
     assert a.instance_id != b.instance_id  # random suffix disambiguates
+
+
+# ---------------------------------------------------------------------------
+# 多副本 CAS 守卫 —— 洞 A(取消复活)与洞 B(reclaim 后终局互踩)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_running_transition_refused_after_cross_replica_cancel() -> None:
+    """洞 A:PENDING 窗口里被跨副本 ``request_cancel`` 的 run,属主随后的
+    → RUNNING 写必须被守卫拒绝 —— 不复活、不 claim、record 镜像真实终态并
+    置位 abort_event,让执行方一步图都不跑。"""
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store)
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    record = await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+
+    # 另一副本的取消赢了(guarded CAS 命中 pending)。
+    assert await store.request_cancel(
+        run_id=run_id, tenant_id=tenant_id, updated_at=datetime.now(UTC), reason="user_cancel"
+    )
+
+    assert await mgr.set_status(run_id, RunStatus.RUNNING) is False
+    assert record.status is RunStatus.INTERRUPTED
+    assert record.abort_event.is_set()
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.INTERRUPTED, "durable 行被复活成 running 了"
+    assert row.error == "user_cancel", "取消原因被 → RUNNING 写抹掉了"
+    assert row.claimed_by is None, "被取消的 run 不该被 claim"
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_after_peer_reclaim_is_dropped() -> None:
+    """洞 B:租约被 orphan sweep 判死、run 被别的副本 reclaim 之后,旧属主
+    迟到的终局写必须 no-op —— 不把新属主的 running 盖掉(否则两边全停,
+    failover 白做)。"""
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store, instance_id="pod-a")
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+    assert await mgr.set_status(run_id, RunStatus.RUNNING) is True
+
+    # 新属主 reclaim(orphan sweep 的效果:行归 pod-b)。
+    now = datetime.now(UTC)
+    await store.claim(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        claimed_by="pod-b",
+        lease_until=now + timedelta(seconds=30),
+        heartbeat_at=now,
+    )
+
+    assert await mgr.set_status(run_id, RunStatus.INTERRUPTED) is False
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING, "旧属主的终局写盖掉了新属主的 running"
+    assert row.claimed_by == "pod-b"
+    # 本进程的镜像照旧终局 —— 本副本的执行确实结束了。
+    rec = mgr.get(run_id)
+    assert rec is not None and rec.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_terminal_write_on_never_claimed_run_still_lands() -> None:
+    """守卫的 NULL 分支:从未 claim 过的 run(如 PENDING 直接失败)的终局写
+    是合法的,不能被 claimed_by 守卫误伤。"""
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store)
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+
+    assert await mgr.set_status(run_id, RunStatus.ERROR, error="boom") is True
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None and row.status is RunStatus.ERROR

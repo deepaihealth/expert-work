@@ -90,9 +90,15 @@ class _FakeRunManager:
         self.created: list[object] = []
 
     async def create(self, **kw: object) -> SimpleNamespace:
-        rec = SimpleNamespace(**kw, bound_distilled_skills=())
+        rec = SimpleNamespace(**kw, bound_distilled_skills=(), seed_artifacts=None)
         self.created.append(rec)
         return rec
+
+    async def persisted_artifacts(self, run_id: object, *, tenant_id: object) -> None:
+        # 产物清单契约 —— decide 端点给 continuation 播父 run 清单;本 fake
+        # 的场景不涉产物,恒 None(= 无记录)。
+        del run_id, tenant_id
+        return None
 
     async def attach_task(self, _run_id: object, _task: object) -> bool:
         return True

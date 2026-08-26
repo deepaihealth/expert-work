@@ -71,6 +71,11 @@ class RunRecord:
     #: worker emits one ``skill_run_usage`` row per entry at the run's terminal
     #: hook so the rollback monitor can attribute the outcome. Not serialized.
     bound_distilled_skills: tuple[BoundDistilledSkill, ...] = ()
+    #: 产物清单契约 —— 审批续跑(continuation)是**新** run_id、新 durable 行,
+    #: 父 run PAUSED 时固化的清单不在自己行上;decide 端点把父行清单挂在这里,
+    #: ``run_agent`` 的 resume seeding 优先读它(fallback 仍读自己的行,兜住
+    #: 同 run_id 重入的形态)。Not serialized。
+    seed_artifacts: list[dict[str, Any]] | None = None
     #: External-API-v1 P2-a Task 14 — the caller's ``Idempotency-Key`` /
     #: request-fingerprint, write-once at creation (mirrors ``trace_id``
     #: above: read only by :func:`_record_to_info`, never mutated after
@@ -312,7 +317,8 @@ class RunManager:
         error: str | None = None,
         artifacts: list[dict[str, Any]] | None = None,
     ) -> bool:
-        """Update a run's status. Returns ``True`` iff the run exists.
+        """Update a run's status. Returns ``True`` iff the run exists
+        **and the durable transition landed**.
 
         ``error`` carries the failure detail for ERROR / TIMEOUT
         transitions; it lands in the durable ``agent_run`` row. A
@@ -321,25 +327,62 @@ class RunManager:
         written with the terminal status in the same store UPDATE so any
         reader that sees the terminal status also sees the manifest;
         ``None`` leaves the stored value untouched.
+
+        多副本 CAS 守卫(两个洞,一处修):
+
+        * → RUNNING 带 ``expected_statuses=(PENDING, QUEUED, RUNNING)``。
+          守卫失败 = PENDING 窗口里已被跨副本 ``request_cancel`` 改成
+          INTERRUPTED —— 本进程 record 镜像成 INTERRUPTED、``abort_event``
+          置位、**不 claim**,返回 ``False``,调用方(``sse.py``)据此不跑图。
+        * 终局写带 ``guard_claimed_by=self._instance_id``(NULL 也放行 ——
+          从未 claim 过的 run 的终局写是合法的)。守卫失败 = 本副本的租约
+          已被 orphan sweep 判死、run 被别的副本 reclaim 续跑 —— 迟到的
+          终局写 no-op,不把新属主刚写的 running 盖掉;本进程 record 照旧
+          镜像终局(本副本的执行确实结束了),返回 ``False``。
         """
         async with self._lock:
             record = self._runs.get(run_id)
             if record is None:
                 return False
             now = datetime.now(UTC)
-            record.status = status
-            record.updated_at = now
             if self._store is not None:
-                finished_at = now if status in TERMINAL_RUN_STATUSES else None
-                await self._store.set_status(
+                is_terminal = status in TERMINAL_RUN_STATUSES
+                landed = await self._store.set_status(
                     run_id=run_id,
                     tenant_id=record.tenant_id,
                     status=status,
                     updated_at=now,
                     error=error,
-                    finished_at=finished_at,
+                    finished_at=now if is_terminal else None,
                     artifacts=artifacts,
+                    expected_statuses=(
+                        (RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING)
+                        if status is RunStatus.RUNNING
+                        else None
+                    ),
+                    guard_claimed_by=self._instance_id if is_terminal else None,
                 )
+                if not landed and status is RunStatus.RUNNING:
+                    # 洞 A —— 取消已经赢了,复活被守卫挡下。镜像真实终态并
+                    # 让执行方停下;不 claim(行不属于任何执行)。
+                    logger.warning(
+                        "run.start_lost_to_cancel id=%s durable_row_no_longer_startable", run_id
+                    )
+                    record.status = RunStatus.INTERRUPTED
+                    record.updated_at = now
+                    record.abort_event.set()
+                    return False
+                if not landed:
+                    # 洞 B —— 终局写迟到,run 已被别的副本 reclaim。本进程的
+                    # 执行确实结束了:record 照旧镜像终局,durable 行归新属主。
+                    logger.warning(
+                        "run.terminal_write_after_reclaim id=%s status=%s dropped",
+                        run_id,
+                        status,
+                    )
+                    record.status = status
+                    record.updated_at = now
+                    return False
                 # Stream 9.4 — claim the ownership lease when execution begins.
                 # No explicit release at terminal status: the sweep + index both
                 # gate on ``status='running'``, so a finished run is never an
@@ -352,6 +395,8 @@ class RunManager:
                         lease_until=now + timedelta(seconds=self._lease_ttl_s),
                         heartbeat_at=now,
                     )
+            record.status = status
+            record.updated_at = now
             logger.info("run.status_change id=%s status=%s", run_id, status)
             return True
 
