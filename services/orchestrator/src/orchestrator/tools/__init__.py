@@ -184,6 +184,9 @@ from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
 )
 from orchestrator.tools.sandbox import (
+    WorkspaceFileTooLargeError as WorkspaceFileTooLargeError,
+)
+from orchestrator.tools.sandbox import (
     WorkspacePermissionError as WorkspacePermissionError,
 )
 from orchestrator.tools.sandbox_image_contract import (
@@ -302,6 +305,7 @@ __all__ = [
     "ToolSpec",
     "WebSearchTool",
     "WorkspaceFileEntry",
+    "WorkspaceFileTooLargeError",
     "WorkspaceLock",
     "WorkspacePermissionError",
     "WorkspaceStore",

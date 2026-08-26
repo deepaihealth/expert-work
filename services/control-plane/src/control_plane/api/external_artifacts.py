@@ -52,7 +52,12 @@ from expert_work.persistence import ArtifactStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+from orchestrator.tools import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    WorkspacePermissionError,
+    WorkspaceStore,
+)
 
 logger = logging.getLogger("expert_work.control_plane.external_artifacts")
 
@@ -243,6 +248,14 @@ def build_external_artifacts_router() -> APIRouter:
             )
             return _artifact_error(
                 "ARTIFACT_CONTENT_UNAVAILABLE", "artifact content unavailable", 500
+            )
+        except WorkspaceFileTooLargeError as exc:
+            # 「太大」≠「不存在」—— 产物列在 GET /artifacts 里,只是超过单文件
+            # 下载闸;折进 404 会让对接方以为产物丢了。子类,必须排在宽
+            # except 之前。
+            logger.warning("external_artifact.too_large version=%s reason=%s", version.id, exc)
+            return _artifact_error(
+                "ARTIFACT_TOO_LARGE", "artifact exceeds the download size limit", 413
             )
         except SandboxSupervisorError as exc:
             logger.warning(

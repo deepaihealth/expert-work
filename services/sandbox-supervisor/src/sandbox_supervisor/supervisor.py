@@ -90,10 +90,13 @@ class AuditSink(Protocol):
 _container_name = container_name
 
 
-#: Per-file download cap for the J.9 workspace-file read. Artifacts are
-#: documents / code / data — small; the cap bounds the supervisor's
-#: in-memory buffer against a pathological file.
-_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+#: Per-file download cap for the J.9 workspace-file read. 64 MiB(原
+#: 10 MiB):agent 在沙箱里直写工作区没有大小限制,内嵌视频的 pptx 一类
+#: 产物轻松越过 10 MiB,而下载是这类文件离开工作区的唯一通道。上限仍然
+#: 存在是为了兜住 supervisor 的一次性内存缓冲;镜像常量
+#: ``nas_workspace_store._MAX_READ_BYTES`` 必须同步改
+#: (``test_workspace_cap_constants_match_the_supervisor`` 钉着)。
+_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 
 #: skill-runtime §5.1 — caps on ``seed_files`` (mirror the .skill package caps,
 #: asset-store tier: 64 MiB total / 16384 entries — asset-library skills like

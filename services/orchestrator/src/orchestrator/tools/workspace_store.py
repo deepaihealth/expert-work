@@ -31,7 +31,11 @@ from uuid import UUID
 import httpx
 
 from orchestrator.llm.providers._http import client_for
-from orchestrator.tools.sandbox import SandboxSupervisorError, _traced_headers
+from orchestrator.tools.sandbox import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    _traced_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +129,12 @@ class SupervisorWorkspaceStore:
             msg = (
                 f"sandbox supervisor workspace read failed: {response.status_code} {response.text}"
             )
+            if response.status_code == 413:
+                # supervisor 侧的 WorkspaceFileTooLargeError 映射成 413(见
+                # sandbox_supervisor/app.py 的 exception handler)—— 在这里
+                # 还原成同名窄类型,和 NasWorkspaceStore 的行为保持一致,
+                # 下载端点才能把「太大」与「不存在」分开回 413。
+                raise WorkspaceFileTooLargeError(msg)
             raise SandboxSupervisorError(msg)
         return response.content
 

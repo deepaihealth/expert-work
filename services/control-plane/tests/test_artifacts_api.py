@@ -239,6 +239,29 @@ async def test_download_reports_permission_denied_as_server_error(
 
 
 @pytest.mark.asyncio
+async def test_download_reports_too_large_as_413(
+    setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
+) -> None:
+    """store 抛 WorkspaceFileTooLargeError → 413,不是 404。
+
+    2026-08-26 的教训:内嵌视频的 pptx 超过下载闸被谎报成「artifact content
+    not found」,用户以为产物丢了(它明明列在产物列表里)。同时锁住 except
+    顺序 —— WorkspaceFileTooLargeError 是 SandboxSupervisorError 的子类,
+    写在宽 except 之后就永远走不到,这个断言会红。
+    """
+    from orchestrator.tools import WorkspaceFileTooLargeError
+
+    client, _, _ = setup
+    store = client._transport.app.state.workspace_store  # type: ignore[attr-defined,union-attr]
+    store.workspace_file_error = WorkspaceFileTooLargeError(
+        "workspace file 'report.md' exceeds the 67108864-byte download cap"
+    )
+    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    assert resp.status_code == 413, resp.text
+    assert "size limit" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_download_still_404s_on_a_generic_supervisor_error(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:

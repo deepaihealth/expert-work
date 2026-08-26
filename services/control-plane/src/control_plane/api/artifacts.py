@@ -50,7 +50,12 @@ from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import ArtifactKind, AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+from orchestrator.tools import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    WorkspacePermissionError,
+    WorkspaceStore,
+)
 
 logger = logging.getLogger("expert_work.control_plane.artifacts")
 
@@ -229,6 +234,14 @@ def build_artifacts_router() -> APIRouter:
             # (同其它八处权限归因站点的既有手法),不进响应体;detail 是固定文案。
             logger.warning("artifact.permission_denied version=%s", version.id, exc_info=True)
             raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
+        except WorkspaceFileTooLargeError as exc:
+            # 「太大」≠「不存在」—— 文件在、列表里看得见,只是超过单文件下载
+            # 闸。折进 404 会让用户以为产物丢了(2026-08-26 的 pptx 内嵌视频
+            # 正是这样)。同样必须排在 SandboxSupervisorError 之前(子类)。
+            logger.warning("artifact.too_large version=%s reason=%s", version.id, exc)
+            raise HTTPException(
+                status_code=413, detail="artifact exceeds the download size limit"
+            ) from exc
         except SandboxSupervisorError as exc:
             # The metadata row exists but the file is gone / unreadable —
             # log the supervisor detail, keep the client response opaque.

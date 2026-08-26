@@ -618,6 +618,33 @@ async def test_permission_error_is_500_not_404(
 
 
 @pytest.mark.asyncio
+async def test_too_large_is_413_not_404(
+    external_client, seed_artifact_with_content, _ctx
+) -> None:
+    """超下载闸 → 413 ARTIFACT_TOO_LARGE,不能和「不存在」合并成 404。
+
+    2026-08-26 的教训:内嵌视频的 pptx 超过读闸,报 404 让对接方以为产物
+    丢了(它明明列在 GET /artifacts 里)。同时锁住 except 顺序 ——
+    WorkspaceFileTooLargeError 是 SandboxSupervisorError 的子类,写在宽
+    except 之后就永远走不到,这个断言会红。
+    """
+    from orchestrator.tools import WorkspaceFileTooLargeError
+
+    await seed_artifact_with_content(
+        user_id="u-1", name="huge.pptx", kind="document", content=b"x"
+    )
+    _ctx.workspace_store.workspace_file_error = WorkspaceFileTooLargeError(
+        "workspace file 'huge.pptx' exceeds the 67108864-byte download cap"
+    )
+    resp = await external_client.get(
+        "/v1/agents/test-agent/artifacts/download",
+        params={"user_id": "u-1", "name": "huge.pptx"},
+    )
+    assert resp.status_code == 413, resp.text
+    assert resp.json()["error"]["code"] == "ARTIFACT_TOO_LARGE"
+
+
+@pytest.mark.asyncio
 async def test_download_backfills_digest_on_first_read(
     external_client, seed_artifact_with_content, get_latest_version
 ) -> None:

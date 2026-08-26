@@ -128,7 +128,7 @@ export default withMermaid(
                 { text: "8.6 404 目标不存在", link: "/guide/errors#_8-6-404-目标不存在" },
                 { text: "8.7 409 审批冲突", link: "/guide/errors#_8-7-409-审批冲突" },
                 { text: "8.8 410 Agent 已被删除", link: "/guide/errors#_8-8-410-agent-已被删除" },
-                { text: "8.9 413 附件超过大小上限", link: "/guide/errors#_8-9-413-附件超过大小上限" },
+                { text: "8.9 413 超过大小上限", link: "/guide/errors#_8-9-413-超过大小上限" },
                 { text: "8.10 422 请求参数不合法", link: "/guide/errors#_8-10-422-请求参数不合法" },
                 { text: "8.11 429 请求过于频繁或配额用尽", link: "/guide/errors#_8-11-429-请求过于频繁或配额用尽" },
                 { text: "8.12 500 服务端内部错误", link: "/guide/errors#_8-12-500-服务端内部错误" },

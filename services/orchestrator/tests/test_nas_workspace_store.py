@@ -31,6 +31,7 @@ from orchestrator.tools.nas_workspace_store import (
 from orchestrator.tools.sandbox import (
     RecordingSandboxRuntime,
     SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
     WorkspacePermissionError,
 )
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
@@ -1108,16 +1109,19 @@ async def test_dir_fd_pinning_holds_at_a_deep_intermediate_component(
 
 
 async def test_read_file_rejects_over_cap(tmp_path: Path) -> None:
+    from orchestrator.tools.nas_workspace_store import _MAX_READ_BYTES
+
     tenant_id, user_id = uuid4(), uuid4()
     user_root = tmp_path / str(tenant_id) / str(user_id)
     user_root.mkdir(parents=True)
     big = user_root / "big.bin"
     with big.open("wb") as f:
-        f.seek(10 * 1024 * 1024)  # 10MiB + 1 字节,seek 造稀疏文件不真占磁盘
+        f.seek(_MAX_READ_BYTES)  # cap + 1 字节,seek 造稀疏文件不真占磁盘
         f.write(b"\x00")
 
     store = _store(tmp_path)
-    with pytest.raises(SandboxSupervisorError):
+    # 窄类型 —— 「太大」必须与「不存在」分开(下载端点据此回 413 而不是 404)。
+    with pytest.raises(WorkspaceFileTooLargeError):
         await store.read_file(tenant_id=tenant_id, user_id=user_id, path="big.bin")
 
 

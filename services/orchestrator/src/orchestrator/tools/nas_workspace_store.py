@@ -159,7 +159,11 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from expert_work.persistence import is_reserved_workspace_path
-from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePermissionError
+from orchestrator.tools.sandbox import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    WorkspacePermissionError,
+)
 from orchestrator.tools.workspace_store import WorkspaceFileEntry
 
 if TYPE_CHECKING:
@@ -184,8 +188,12 @@ logger = logging.getLogger(__name__)
 DELETED_DIR = ".deleted"
 
 #: Per-file download cap — mirrors
-#: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES``.
-_MAX_READ_BYTES = 10 * 1024 * 1024
+#: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES``. 64 MiB(原 10 MiB):
+#: 沙箱经 NFS 直写工作区没有大小限制,内嵌视频的 pptx 一类产物轻松越过
+#: 10 MiB,而下载是这类文件离开工作区的唯一通道 —— 闸必须容得下 agent 实际
+#: 会产出的东西。64 MiB 对齐 W3 归档链 put_stream 的单段上限;整个文件仍是
+#: 一次性读进内存再回给客户端,再往上调之前先把这条路径改成流式。
+_MAX_READ_BYTES = 64 * 1024 * 1024
 
 #: Document-upload write cap — mirrors
 #: ``sandbox_supervisor.supervisor._MAX_WORKSPACE_WRITE_BYTES``.
@@ -590,8 +598,11 @@ class NasWorkspaceStore:
                 except OSError as exc:
                     raise SandboxSupervisorError(f"workspace file not found: {path!r}") from exc
                 if size > _MAX_READ_BYTES:
+                    # 「太大」≠「不存在」—— 窄类型让下载端点能回 413 而不是把
+                    # 一个明明列在产物列表里的文件谎报成 404(同
+                    # WorkspacePermissionError 的拆分理由)。
                     msg = f"workspace file {path!r} exceeds the {_MAX_READ_BYTES}-byte download cap"
-                    raise SandboxSupervisorError(msg)
+                    raise WorkspaceFileTooLargeError(msg)
                 try:
                     return handle.read()
                 except OSError as exc:
