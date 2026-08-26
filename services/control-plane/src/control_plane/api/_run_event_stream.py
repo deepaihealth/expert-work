@@ -13,15 +13,16 @@ point.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from control_plane.api._run_event_seq import _merge_ranges, _seq_of
-from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus
+from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
@@ -68,6 +69,16 @@ _MAX_TRACKED_HOLES = 4096
 #: 改它要同步改 `apps/admin-ui/docs-site/guide/sse-events.md` 的「心跳行」一节。
 _LIVE_HEARTBEAT_INTERVAL_S = 15.0
 
+#: PROD-1 跨副本兜底 —— 非属主副本轮询 durable ``run_event`` 表的间隔。实时性
+#: 与 DB 压力的折中:1s 意味着跨副本 attach 的帧延迟上界约 1s(属主副本本来
+#: 就是批写落库,这里不是唯一的延迟源)。测试里 monkeypatch 成毫秒级。
+_STORE_POLL_INTERVAL_S = 1.0
+
+#: 看到 run 终态后再空转多少轮才收流 —— 属主的 ``_flush_batch`` 是异步批写,
+#: 终态行(``agent_run``)与最后几条事件行(``run_event``)不在一个事务里,
+#: 事件行可能晚于终态可见。连续两轮没有新行才宣布"都到齐了"。
+_POLL_TERMINAL_GRACE_ROUNDS = 2
+
 
 #: CodeQL 的 ``py/log-injection`` 会盯上本模块三条 ``logger.warning`` —— 它追踪
 #: ``since_seq`` 这个 query 参数流进日志。**判定为误报,理由逐项可核**:
@@ -80,6 +91,42 @@ _LIVE_HEARTBEAT_INTERVAL_S = 15.0
 #:
 #: 日志注入的前提是把换行塞进日志行伪造条目;上述取值里没有任何一个能承载换行。
 #: 若将来这三条日志新增了**字符串**参数,必须重新评估并删掉对应的抑制注释。
+
+
+def make_run_probe(
+    *,
+    runs: RunStore,
+    run_id: UUID,
+    tenant_id: UUID,
+    scope: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+) -> Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]]:
+    """PROD-1 —— 轮询分支的 run 行探针,三个调用方(console / external 续传 /
+    幂等重放)共用这一份,别各自手搓三个语义略有分歧的闭包。
+
+    ``scope`` 与 ``build_event_producer`` 的同名参数同款:工厂、单次可用、
+    每次探测重开(console 的跨租户读要钉在目标租户的 GUC 上)。
+
+    run 行中途消失(purge 等极端路径)按 ``INTERRUPTED`` 收流 —— 非属主副本的
+    轮询循环没有别的终止信号,挂死比错报一个「已中断」更坏。
+    """
+
+    async def _probe() -> tuple[RunStatus, list[dict[str, Any]] | None]:
+        if scope is not None:
+            async with scope():
+                row = await runs.get(run_id=run_id, tenant_id=tenant_id)
+        else:
+            row = await runs.get(run_id=run_id, tenant_id=tenant_id)
+        if row is None:
+            # 模块头的 log-injection 抑制论证同样覆盖这一条:``run_id`` 是
+            # FastAPI 解析出的 ``UUID`` 对象,承载不了换行。
+            logger.warning(  # codeql[py/log-injection]
+                "run_probe.row_vanished run_id=%s",
+                run_id,  # codeql[py/log-injection]
+            )
+            return (RunStatus.INTERRUPTED, None)
+        return (row.status, row.artifacts)
+
+    return _probe
 
 
 @dataclass(frozen=True)
@@ -111,6 +158,12 @@ async def build_event_producer(
     run_artifacts: list[dict[str, Any]] | None = None,
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
+    # PROD-1 跨副本兜底 —— 重读 run 行的探针,返回 ``(status, artifacts)``。
+    # live 分支在本进程 bridge 没有该 run 的发布者状态时(queue run 被别的副本
+    # 认领 / 断线重连落到非属主副本),不订阅 bridge 而轮询 durable 表,终态与
+    # 产物清单从这个探针取。``None`` = 保持旧行为(恒订阅 bridge),兼容未接线
+    # 的调用方;两个真实调用方(console / external)都必须传。
+    run_probe: Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]] | None = None,
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
     hide_events: frozenset[str] = frozenset(),
@@ -355,19 +408,72 @@ async def build_event_producer(
                 frames.extend(_gap_frames(evicted, reason="holes_overflow"))
             return frames
 
-        # 1. 补库 —— 跳号不能让 last 无声推过去。
-        while True:
-            rows = await _list_page(last)
-            for row in rows:
-                for chunk in _emit(_record_holes(row.seq)):
+        drained_any = False
+
+        async def _drain_store() -> AsyncIterator[bytes]:
+            """把落库帧追到当前尾部 —— 跳号不能让 ``last`` 无声推过去。
+
+            步骤 1 的补库与 2' 轮询分支的每一轮共用这一份;``last`` / ``holes``
+            经闭包共享,所以两条路径的洞记账语义 byte-identical。"""
+            nonlocal last, drained_any
+            while True:
+                rows = await _list_page(last)
+                for row in rows:
+                    drained_any = True
+                    for chunk in _emit(_record_holes(row.seq)):
+                        yield chunk
+                    for chunk in _emit(
+                        _encode(row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}")
+                    ):
+                        yield chunk
+                    last = row.seq
+                if len(rows) < MAX_LIST_LIMIT:
+                    break
+
+        # 1. 补库。
+        async for chunk in _drain_store():
+            yield chunk
+
+        # 2'. 跨副本兜底(PROD-1 b1)—— 本进程 bridge 没有这个 run 的发布者
+        # 状态(queue run 被别的副本认领,或断线重连落到非属主副本):实时帧在
+        # 这个进程里物理不存在,订阅本地 bridge 只会永远吐心跳。改为轮询
+        # durable ``run_event`` 表 tail-follow;终态与产物清单从 run 行
+        # (``run_probe``)取,end 帧构造与 replay 分支同源。
+        #
+        # 探针在 drain **之前**读:先看到终态、再把库追到尾,配合
+        # ``_POLL_TERMINAL_GRACE_ROUNDS`` 轮静默,"终态之后还在路上的批写行"
+        # 才不会被收流截掉。属主中途换人(orphan reclaim)对本分支透明 ——
+        # 它只认 durable 表。
+        if run_probe is not None and not stream_bridge.has_live_stream(run_id):
+            quiet_terminal_rounds = 0
+            while True:
+                status, live_artifacts = await run_probe()
+                drained_any = False
+                async for chunk in _drain_store():
                     yield chunk
-                for chunk in _emit(
-                    _encode(row.event_name, row.data, event_id=f"{row.created_at_ms}-{row.seq}")
-                ):
+                if status in TERMINAL_RUN_STATUSES:
+                    quiet_terminal_rounds = 0 if drained_any else quiet_terminal_rounds + 1
+                    if quiet_terminal_rounds >= _POLL_TERMINAL_GRACE_ROUNDS:
+                        # 收流与 bridge 分支的 end 处理同构:洞冲成 gap、
+                        # items 转换器收尾、end 带终态+清单。
+                        for chunk in _gap_frames(holes, reason="hole_unfilled_at_end"):
+                            yield chunk
+                        holes.clear()
+                        if converter is not None:
+                            for name, payload in converter.finalize():
+                                yield format_sse(name, payload)
+                        yield format_sse(
+                            "end",
+                            end_frame_data(
+                                run_id=run_id,
+                                status=_RUN_STATUS_END_STATUS.get(status),
+                                artifacts=live_artifacts,
+                            ),
+                        )
+                        return
+                for chunk in _emit([]):
                     yield chunk
-                last = row.seq
-            if len(rows) < MAX_LIST_LIMIT:
-                break
+                await asyncio.sleep(_STORE_POLL_INTERVAL_S)
 
         # 2. 挂实时流。
         async for entry in stream_bridge.subscribe(

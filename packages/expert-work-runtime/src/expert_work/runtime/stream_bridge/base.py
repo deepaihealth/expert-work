@@ -173,6 +173,20 @@ class StreamBridge(abc.ABC):
         """
 
     @abc.abstractmethod
+    def has_live_stream(self, run_id: UUID) -> bool:
+        """True iff **this process** holds publisher-fed state for ``run_id``.
+
+        PROD-1(跨副本兜底)的判别口:多副本部署下,一个 run 的实时帧只存在
+        于属主副本的 bridge 里。消费侧(``/events`` attach)用它决定走
+        :meth:`subscribe` 的实时流,还是退到轮询 durable ``run_event`` 表。
+
+        「publisher-fed」是判据的关键:``subscribe`` 为迟到订阅者自动建的
+        **空**流不算 —— 否则先 attach 后开跑的场景会把后续 attach 全骗进一条
+        永远没有帧的订阅。只有 ``publish`` / ``publish_ephemeral`` /
+        ``publish_end`` / ``seed_seq``(全部只有属主执行路径会调)标记它。
+        """
+
+    @abc.abstractmethod
     def subscribe(
         self,
         run_id: UUID,

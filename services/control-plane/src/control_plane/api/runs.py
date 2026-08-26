@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._run_event_stream import build_event_producer
+from control_plane.api._run_event_stream import build_event_producer, make_run_probe
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
     caller_owns_thread,
@@ -1808,6 +1808,14 @@ def build_runs_router() -> APIRouter:
             run_artifacts=persisted.artifacts,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
+            # PROD-1 —— 对话页/调试台 live attach 落到非属主副本时轮询兜底;
+            # 探针的读与 ``scope`` 参数同款钉在目标租户。
+            run_probe=make_run_probe(
+                runs=runs,
+                run_id=run_id,
+                tenant_id=target_tenant,
+                scope=lambda: applied_scope(scope),
+            ),
             since_seq=since_seq,
             scope=lambda: applied_scope(scope),
         )
