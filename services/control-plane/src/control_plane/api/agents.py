@@ -44,8 +44,8 @@ from control_plane.api._idempotency import (
     request_digest,
 )
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._session_title import title_from_text
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (

@@ -189,16 +189,17 @@ async def test_list_backfills_null_titles_from_the_checkpoint(
     对外平面早期建的会话没有标题,对话页整页「未命名对话」(2026-08-26
     用户反馈)。sessions 列表早有这层兜底,对话页此前直接吐 ``meta.title``。
     """
+    from typing import Annotated, TypedDict
+
     from langchain_core.messages import BaseMessage, HumanMessage
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.graph import START, StateGraph
     from langgraph.graph.message import add_messages
-    from typing_extensions import Annotated as _Ann, TypedDict as _TD
 
     client, ids = client_and_threads
 
-    class _SeedState(_TD):
-        messages: _Ann[list[BaseMessage], add_messages]
+    class _SeedState(TypedDict):
+        messages: Annotated[list[BaseMessage], add_messages]
 
     checkpointer = InMemorySaver()
     graph = StateGraph(_SeedState)
