@@ -96,6 +96,8 @@ function turnOf(over: Partial<ConsoleTurn> & Pick<ConsoleTurn, "key" | "seq">): 
     tokens: null,
     timing: null,
     createdAt: new Date(BASE + over.seq * 10_000).toISOString(),
+    finishedAt: null,
+    runError: null,
     ...over,
   };
 }

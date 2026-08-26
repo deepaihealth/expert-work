@@ -41,6 +41,8 @@ function turnOf(over: Partial<ConsoleTurn> & Pick<ConsoleTurn, "key" | "seq">): 
     tokens: null,
     timing: null,
     createdAt: null,
+    finishedAt: null,
+    runError: null,
     ...over,
   };
 }
