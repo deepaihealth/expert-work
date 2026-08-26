@@ -796,9 +796,7 @@ async def run_agent(
         # normal interrupted finish, not a failure.
         session_outcome = "interrupted"
         await _drain_persist_queue()
-        await run_manager.set_status(
-            run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot()
-        )
+        await run_manager.set_status(run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot())
         logger.info("run_agent.cancelled_cooperatively run_id=%s", run_id)
         await _emit_run_end_audit(
             audit_logger,
@@ -825,9 +823,7 @@ async def run_agent(
         # loop teardown is unreliable (same reason
         # ``_emit_run_end_audit`` is skipped on this path).
         session_outcome = "cancelled"
-        await run_manager.set_status(
-            run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot()
-        )
+        await run_manager.set_status(run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot())
         logger.info("run_agent.cancelled run_id=%s", run_id)
         raise
     except MaxStepsExceededError as exc:

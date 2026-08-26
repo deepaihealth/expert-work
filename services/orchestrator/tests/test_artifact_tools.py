@@ -167,9 +167,10 @@ async def test_save_artifact_feeds_the_manifest_recorder() -> None:
     await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
     await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
 
-    assert [
-        (e["name"], e["kind"], e["version"]) for e in recorded
-    ] == [("report.md", "document", 1), ("report.md", "document", 2)]
+    assert [(e["name"], e["kind"], e["version"]) for e in recorded] == [
+        ("report.md", "document", 1),
+        ("report.md", "document", 2),
+    ]
     assert all(isinstance(e["created_at"], str) and e["created_at"] for e in recorded)
 
 

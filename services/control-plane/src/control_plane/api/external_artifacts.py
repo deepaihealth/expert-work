@@ -206,9 +206,7 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        latest = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=end_user_id, name=name
-        )
+        latest = await store.get_latest_version(tenant_id=tenant_id, user_id=end_user_id, name=name)
         if latest is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
         # 产物清单契约 —— 可选 ``version`` 是**校验闸**不是取历史:旧版本

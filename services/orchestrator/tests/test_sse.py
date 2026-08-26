@@ -1514,11 +1514,9 @@ async def test_registered_artifacts_land_on_end_and_persist_with_terminal_status
     rm = RunManager(store)
     record = await _new_record(rm)
     e1 = {"name": "plan.json", "kind": "data", "version": 1, "created_at": "2026-08-26T00:00:00"}
-    e1_v2 = {"name": "plan.json", "kind": "data", "version": 2, "created_at": "2026-08-26T00:01:00"}
-    e2 = {"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "2026-08-26T00:02:00"}
-    graph = _RecordingGraph(
-        chunks=[{"agent": {"step_count": 1}}], manifest_entries=[e1, e1_v2, e2]
-    )
+    e1_v2 = {"name": "plan.json", "kind": "data", "version": 2, "created_at": "t2"}
+    e2 = {"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "t3"}
+    graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[e1, e1_v2, e2])
 
     await run_agent(
         bridge=bridge,
@@ -1553,13 +1551,19 @@ async def test_resume_seeds_manifest_from_persisted_artifacts() -> None:
     bridge = InMemoryStreamBridge()
     rm = RunManager(store)
     record = await rm.create(
-        run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4(),
-        on_disconnect=DisconnectMode.CANCEL, is_resume=True,
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=True,
     )
     pre_pause = {"name": "draft.md", "kind": "document", "version": 1, "created_at": "x"}
     await store.set_status(
-        run_id=record.run_id, tenant_id=record.tenant_id, status=RunStatus.PAUSED,
-        updated_at=datetime.now(UTC), artifacts=[pre_pause],
+        run_id=record.run_id,
+        tenant_id=record.tenant_id,
+        status=RunStatus.PAUSED,
+        updated_at=datetime.now(UTC),
+        artifacts=[pre_pause],
     )
     post = {"name": "final.pptx", "kind": "document", "version": 1, "created_at": "y"}
     graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[post])

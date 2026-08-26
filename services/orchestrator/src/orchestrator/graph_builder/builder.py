@@ -151,6 +151,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
     classified_invalid_arguments,
