@@ -24,6 +24,19 @@ const SEED: AgentManifest = {
 };
 
 describe("SubagentPicker", () => {
+  it("renders the dynamic-subagent toggle (moved from the security/network tab) and writes dynamic_workers.enabled", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<SubagentPicker formData={SEED} onChange={onChange} />);
+    const toggle = screen.getByRole("switch");
+    expect(toggle).toBeChecked(); // default-on
+    await user.click(toggle);
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(
+      (last.spec as { dynamic_workers?: { enabled?: boolean } }).dynamic_workers,
+    ).toEqual({ enabled: false });
+  });
+
   it("loads the deployed-agent option list", async () => {
     const { listAgents } = await import("../../../api/agents");
     render(<SubagentPicker formData={SEED} onChange={vi.fn()} />);

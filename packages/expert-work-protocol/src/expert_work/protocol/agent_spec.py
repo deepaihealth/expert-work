@@ -1058,6 +1058,23 @@ ToolSpecEntry = Annotated[
 #: Snake_case identifier — same shape the parent LLM expects for a tool name.
 _SUBAGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
+#: Tool names the orchestrator registers *implicitly* — they never appear in
+#: the manifest's ``tools:`` list, so ``_check_subagents``'s declared-builtin
+#: collision check cannot see them. A roster entry reusing one of these
+#: silently shadows / is shadowed at ``ToolRegistry.register`` (re-register
+#: replaces, winner decided by assembly order) — turn that trap into a
+#: manifest validation error instead.
+_IMPLICIT_TOOL_NAMES = frozenset(
+    {
+        "spawn_worker",  # dynamic workers (DynamicWorkersSpec, default-on)
+        "update_plan",  # P3 planning-as-a-tool, registered for every agent
+        "skill_view",  # lazy skill loader (any skill bound)
+        "find_tools",  # TE-6 deferred-pool promoter
+        "knowledge_search",  # activated by a ``knowledge:`` block
+        "ask_image",  # activated by a ``vision:`` block
+    }
+)
+
 
 def parse_agent_ref(ref: str) -> tuple[str, str]:
     """Split a ``name@version`` agent reference into ``(name, version)``.
@@ -1327,11 +1344,14 @@ class AgentSpec(BaseModel):
     def _check_subagents(self) -> AgentSpec:
         """J.4 — validate the ``spec.subagents`` block.
 
-        Rejects three manifest-local errors: (1) self-delegation — a
+        Rejects four manifest-local errors: (1) self-delegation — a
         subagent whose ``agent_ref`` points back at this agent;
         (2) two subagents sharing a tool name; (3) a subagent tool name
-        colliding with a declared ``builtin`` tool. Cross-manifest cycles
-        (A→B→A) are not caught here — the orchestrator bounds them
+        colliding with a declared ``builtin`` tool; (4) a subagent tool
+        name colliding with an implicitly-registered platform tool
+        (``_IMPLICIT_TOOL_NAMES`` — e.g. ``spawn_worker``), which would
+        otherwise be silently shadowed at registration. Cross-manifest
+        cycles (A→B→A) are not caught here — the orchestrator bounds them
         structurally via the build-time depth limit (Mini-ADR J-12).
         """
         builtin_names = {t.name for t in self.spec.tools if isinstance(t, BuiltinToolSpec)}
@@ -1343,6 +1363,12 @@ class AgentSpec(BaseModel):
             seen.add(sub.name)
             if sub.name in builtin_names:
                 msg = f"subagent tool name {sub.name!r} collides with a declared builtin tool."
+                raise ValueError(msg)
+            if sub.name in _IMPLICIT_TOOL_NAMES:
+                msg = (
+                    f"subagent tool name {sub.name!r} is reserved — the platform "
+                    "registers a tool of this name implicitly."
+                )
                 raise ValueError(msg)
             ref_name, _ = parse_agent_ref(sub.agent_ref)
             if ref_name == self.metadata.name:

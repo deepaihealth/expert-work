@@ -477,6 +477,25 @@ def test_subagent_name_colliding_with_builtin_tool_rejected() -> None:
         AgentSpec.model_validate(doc)
 
 
+@pytest.mark.parametrize(
+    "reserved",
+    ["spawn_worker", "update_plan", "skill_view", "find_tools", "knowledge_search", "ask_image"],
+)
+def test_subagent_name_colliding_with_implicit_tool_rejected(reserved: str) -> None:
+    """隐式注册的平台工具名(manifest 里从不声明)是保留字。
+
+    没有这道闸,名册条目会在 ToolRegistry.register(重复注册即替换)被
+    静默顶掉或顶掉平台工具,赢家取决于装配顺序 —— 例如叫 ``spawn_worker``
+    的名册条目会被随后注册的动态 worker 工具无声覆盖。
+    """
+    doc = _doc()
+    doc["spec"]["subagents"] = [
+        {"name": reserved, "agent_ref": "helper@1.0.0", "description": "x"},
+    ]
+    with pytest.raises(ValidationError, match="is reserved"):
+        AgentSpec.model_validate(doc)
+
+
 # ---------------------------------------------------------------------------
 # knowledge block — RAG (Stream J.5)
 # ---------------------------------------------------------------------------

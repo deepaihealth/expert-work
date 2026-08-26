@@ -15,7 +15,6 @@ const DEFENSES_FIELD_IDS = [
 ];
 
 const NETWORK_FIELD_IDS = [
-  "dynamic_workers.enabled",
   "sandbox.network.egress",
   "sandbox.network.allowlist",
   "sandbox.network.denylist",
@@ -76,7 +75,7 @@ describe("SecuritySection", () => {
     expect(screen.getByTestId("security-tab-defenses")).toBeInTheDocument();
     const approvalTab = screen.getByRole("tab", { name: "Human approval" });
     const networkTab = screen.getByRole("tab", {
-      name: "Subtasks & network",
+      name: "Network & tool enforcement",
     });
     expect(approvalTab).toBeInTheDocument();
     expect(networkTab).toBeInTheDocument();
@@ -235,32 +234,33 @@ describe("SecuritySection", () => {
     expect(last.spec?.policies?.approval_timeout_s).toBeUndefined();
   });
 
-  it("network tab: renders all 5 FieldRows once its tab is active", async () => {
+  it("network tab: renders all 4 FieldRows once its tab is active", async () => {
     const user = userEvent.setup();
     renderSection();
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
     for (const id of NETWORK_FIELD_IDS) {
       expect(rowFor(id)).toBeInTheDocument();
     }
   });
 
-  it("network tab: turning dynamic workers off writes dynamic_workers.enabled=false", async () => {
+  it("network tab no longer renders the dynamic-workers toggle (moved to the subagents tab)", async () => {
+    // 2026-08-26 用户反馈「界面上找不到」—— 开关是编排能力不是网络策略,
+    // 已挪进能力分区的子 Agent tab(SubagentPicker.test.tsx 盯正向行为)。
     const user = userEvent.setup();
-    const onChange = vi.fn();
-    renderSection({}, onChange);
-    await openTab(user, "Subtasks & network");
-    const sw = within(rowFor("dynamic_workers.enabled")).getByRole("switch");
-    expect(sw).toBeChecked(); // default on
-    await user.click(sw);
-    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
-    expect(last.spec?.dynamic_workers?.enabled).toBe(false);
+    renderSection();
+    await openTab(user, "Network & tool enforcement");
+    // 与 rowFor() 同一定位方式 —— FieldRow 挂 data-field-id 而非 testid,
+    // 用错误的 testid 选择器这条断言会空转恒绿。
+    expect(
+      document.querySelector('[data-field-id="dynamic_workers.enabled"]'),
+    ).toBeNull();
   });
 
   it("network tab: choosing egress=none writes spec.sandbox.network.egress", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     renderSection({}, onChange);
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
 
     const combobox = within(rowFor("sandbox.network.egress")).getByRole(
       "combobox",
@@ -278,7 +278,7 @@ describe("SecuritySection", () => {
       spec: { sandbox: { network: { egress: "none" } } },
     };
     renderSection(seed, onChange);
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
 
     const combobox = within(rowFor("sandbox.network.egress")).getByRole(
       "combobox",
@@ -293,7 +293,7 @@ describe("SecuritySection", () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     const { rerender } = renderSection({}, onChange);
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
 
     const combobox = within(rowFor("sandbox.network.allowlist")).getByRole(
       "combobox",
@@ -326,7 +326,7 @@ describe("SecuritySection", () => {
       spec: { sandbox: { network: { denylist: ["bad.example.com"] } } },
     };
     renderSection(seed, onChange);
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
 
     const combobox = within(rowFor("sandbox.network.denylist")).getByRole(
       "combobox",
@@ -342,7 +342,7 @@ describe("SecuritySection", () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     renderSection({}, onChange);
-    await openTab(user, "Subtasks & network");
+    await openTab(user, "Network & tool enforcement");
 
     const combobox = within(
       rowFor("policies.tool_use_enforcement"),
