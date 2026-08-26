@@ -187,8 +187,12 @@ export function Users() {
       },
       {
         title: t("users_page.col_last_active"),
-        dataIndex: "last_active_at",
-        key: "last_active_at",
+        // last_run_at 而非 last_active_at:后者是「任何触达」——员工 admin
+        // 登录控制台看页面每个请求都 bump 它,列表显示 8/26 而详情页对话
+        // 的末次活跃(跑 run)是 8/24,两页对不上(2026-08-26 用户反馈)。
+        // 本页口号是「观察交互」,统一用真正跑 run 的时间,与详情页同源。
+        dataIndex: "last_run_at",
+        key: "last_run_at",
         width: 190,
         render: (iso: string | null) =>
           iso ? (

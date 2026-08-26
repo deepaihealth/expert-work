@@ -4,7 +4,7 @@
  * files — each downloadable / deletable via the ``?user_id=`` governance
  * target. Mirrors the playground workspace inspector, simplified.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, App, Button, Empty, Popconfirm, Space, Table, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { Download, HardDrive, Trash2 } from "lucide-react";
@@ -45,6 +45,64 @@ function formatBytes(bytes: number): string {
 /** Hide dotfiles/dotdirs — runtime scaffolding, not authored files. */
 function isHiddenWorkspacePath(path: string): boolean {
   return path.split("/").some((seg) => seg.startsWith("."));
+}
+
+/** 文件表的树节点 —— 目录行(children)+ 文件行(可下载/删除)。 */
+interface WsFileNode {
+  /** rowKey:目录用 `dir:<prefix>`(与同名文件不撞),文件用完整 path。 */
+  key: string;
+  /** 本级显示名:目录名 / 文件 basename。 */
+  name: string;
+  /** 文件的完整工作区路径;目录行为其前缀(仅作展示辅助)。 */
+  path: string;
+  isDir: boolean;
+  /** 文件自身大小;目录为子树合计。 */
+  size: number;
+  children?: WsFileNode[];
+}
+
+/** 平铺的 `qa/a.pdf` 列表 → 嵌套目录树,目录在前、同级按名排序。
+ *  2026-08-26 用户反馈:全路径平铺一行一条,同目录文件视觉上完全散开。 */
+export function buildFileTree(files: readonly WorkspaceFile[]): WsFileNode[] {
+  const root: WsFileNode[] = [];
+  for (const f of files) {
+    const segs = f.path.split("/");
+    let siblings = root;
+    let prefix = "";
+    for (let i = 0; i < segs.length - 1; i += 1) {
+      prefix = prefix === "" ? segs[i] : `${prefix}/${segs[i]}`;
+      let dir = siblings.find((n) => n.isDir && n.name === segs[i]);
+      if (dir === undefined) {
+        dir = { key: `dir:${prefix}`, name: segs[i], path: prefix, isDir: true, size: 0, children: [] };
+        siblings.push(dir);
+      }
+      dir.size += f.size;
+      siblings = dir.children!;
+    }
+    siblings.push({
+      key: f.path,
+      name: segs[segs.length - 1],
+      path: f.path,
+      isDir: false,
+      size: f.size,
+    });
+  }
+  const sortLevel = (nodes: WsFileNode[]): void => {
+    nodes.sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name));
+    for (const n of nodes) if (n.children) sortLevel(n.children);
+  };
+  sortLevel(root);
+  return root;
+}
+
+function collectDirKeys(nodes: readonly WsFileNode[], out: string[] = []): string[] {
+  for (const n of nodes) {
+    if (n.isDir) {
+      out.push(n.key);
+      if (n.children) collectDirKeys(n.children, out);
+    }
+  }
+  return out;
 }
 
 export function WorkspacePane({ userId }: { userId: string }) {
@@ -201,60 +259,79 @@ export function WorkspacePane({ userId }: { userId: string }) {
     },
   ];
 
-  const visibleFiles = files.filter((f) => !isHiddenWorkspacePath(f.path));
+  const fileTree = useMemo(
+    () => buildFileTree(files.filter((f) => !isHiddenWorkspacePath(f.path))),
+    [files],
+  );
+  // 目录默认全展开。antd 的 defaultExpandAllRows 只在首挂载时生效,而
+  // files 是异步落地的 —— 必须受控,数据到达时重置成全部目录 key。
+  const [expandedKeys, setExpandedKeys] = useState<readonly string[]>([]);
+  useEffect(() => {
+    setExpandedKeys(collectDirKeys(fileTree));
+  }, [fileTree]);
 
-  const fileColumns: TableColumnsType<WorkspaceFile> = [
+  const fileColumns: TableColumnsType<WsFileNode> = [
     {
       title: t("user_profile.workspace_files"),
-      dataIndex: "path",
-      key: "path",
+      dataIndex: "name",
+      key: "name",
       ellipsis: true,
-      render: (path: string) => (
-        <Text code style={{ fontSize: 12 }}>
-          {path}
-        </Text>
-      ),
+      render: (_: unknown, record) =>
+        record.isDir ? (
+          <Text strong style={{ fontSize: 12 }}>
+            {record.name}/
+          </Text>
+        ) : (
+          <Text code style={{ fontSize: 12 }}>
+            {record.name}
+          </Text>
+        ),
     },
     {
       title: t("user_profile.workspace_size"),
       dataIndex: "size",
       key: "size",
       width: 110,
-      render: (size: number) => <Text className="mono">{formatBytes(size)}</Text>,
+      render: (size: number, record) => (
+        <Text className="mono" type={record.isDir ? "secondary" : undefined}>
+          {formatBytes(size)}
+        </Text>
+      ),
     },
     {
       title: "",
       key: "actions",
       width: 130,
-      render: (_: unknown, record) => (
-        <Space size={6}>
-          <Button
-            size="small"
-            icon={<Download size={13} strokeWidth={1.5} />}
-            loading={busyKey === `file:${record.path}`}
-            onClick={() => void handleDownloadFile(record.path)}
-            data-testid={`ws-file-download-${record.path}`}
-          />
-          <ReadonlyTooltip on={isTenantSwitched}>
-            <Popconfirm
-              title={t("user_profile.delete_confirm", { name: record.path })}
-              onConfirm={() => void handleDeleteFile(record.path)}
-              okText={t("user_profile.delete")}
-              okButtonProps={{ danger: true }}
-              disabled={isTenantSwitched}
-            >
-              <Button
-                size="small"
-                danger
+      render: (_: unknown, record) =>
+        record.isDir ? null : (
+          <Space size={6}>
+            <Button
+              size="small"
+              icon={<Download size={13} strokeWidth={1.5} />}
+              loading={busyKey === `file:${record.path}`}
+              onClick={() => void handleDownloadFile(record.path)}
+              data-testid={`ws-file-download-${record.path}`}
+            />
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("user_profile.delete_confirm", { name: record.path })}
+                onConfirm={() => void handleDeleteFile(record.path)}
+                okText={t("user_profile.delete")}
+                okButtonProps={{ danger: true }}
                 disabled={isTenantSwitched}
-                icon={<Trash2 size={13} strokeWidth={1.5} />}
-                loading={busyKey === `file:${record.path}`}
-                data-testid={`ws-file-delete-${record.path}`}
-              />
-            </Popconfirm>
-          </ReadonlyTooltip>
-        </Space>
-      ),
+              >
+                <Button
+                  size="small"
+                  danger
+                  disabled={isTenantSwitched}
+                  icon={<Trash2 size={13} strokeWidth={1.5} />}
+                  loading={busyKey === `file:${record.path}`}
+                  data-testid={`ws-file-delete-${record.path}`}
+                />
+              </Popconfirm>
+            </ReadonlyTooltip>
+          </Space>
+        ),
     },
   ];
 
@@ -334,13 +411,17 @@ export function WorkspacePane({ userId }: { userId: string }) {
           {t("user_profile.workspace_files")}
         </Text>
       </div>
-      <Table<WorkspaceFile>
+      <Table<WsFileNode>
         size="small"
         columns={fileColumns}
-        dataSource={visibleFiles}
-        rowKey="path"
+        dataSource={fileTree}
+        rowKey="key"
         loading={loading}
         pagination={false}
+        expandable={{
+          expandedRowKeys: expandedKeys as string[],
+          onExpandedRowsChange: (keys) => setExpandedKeys(keys.map(String)),
+        }}
         locale={{ emptyText: <Empty description={t("user_profile.workspace_files_empty")} /> }}
         data-testid="user-workspace-files-table"
       />
