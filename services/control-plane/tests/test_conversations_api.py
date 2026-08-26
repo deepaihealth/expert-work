@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Annotated, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -189,15 +194,11 @@ async def test_list_backfills_null_titles_from_the_checkpoint(
     对外平面早期建的会话没有标题,对话页整页「未命名对话」(2026-08-26
     用户反馈)。sessions 列表早有这层兜底,对话页此前直接吐 ``meta.title``。
     """
-    from typing import Annotated, TypedDict
-
-    from langchain_core.messages import BaseMessage, HumanMessage
-    from langgraph.checkpoint.memory import InMemorySaver
-    from langgraph.graph import START, StateGraph
-    from langgraph.graph.message import add_messages
-
     client, ids = client_and_threads
 
+    # _SeedState 的注解名(Annotated/BaseMessage/add_messages)必须可在模块
+    # globals 解析 —— ``from __future__ import annotations`` 下 LangGraph 用
+    # get_type_hints 按模块命名空间求值注解,函数内 import 会 NameError。
     class _SeedState(TypedDict):
         messages: Annotated[list[BaseMessage], add_messages]
 
