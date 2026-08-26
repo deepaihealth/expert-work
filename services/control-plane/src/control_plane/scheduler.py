@@ -50,6 +50,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from dateutil.rrule import rrulestr
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import emit
@@ -200,6 +201,8 @@ class TriggerScheduler:
         # content search after a successful delivery. ``None`` (e.g. tests
         # that don't pass it) just skips the mirror-sync branch.
         thread_message_store: ThreadMessageStore | None = None,
+        # PROD-9(多副本)—— 投递关窗锁用的 DB 会话工厂;None = 单进程语义。
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -218,6 +221,7 @@ class TriggerScheduler:
         self._agent_disable_service = agent_disable_service
         self._tenant_status_service = tenant_status_service
         self._thread_messages = thread_message_store
+        self._session_factory = session_factory
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -428,6 +432,7 @@ class TriggerScheduler:
             agent_spec_store=self._agents,
             thread_message_store=self._thread_messages,
             now=datetime.now(UTC),
+            session_factory=self._session_factory,
         )
         return outcome.status
 

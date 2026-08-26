@@ -1073,6 +1073,8 @@ def create_app(
             # Spec 1 PR4 Task 2 — FU2: mirror-sync the originating thread into
             # content search after a successful delivery.
             thread_message_store=resolved_thread_messages,
+            # PROD-9(多副本)—— 投递读-查-写的跨副本关窗锁。
+            session_factory=sql_stores.session_factory if sql_stores else None,
         )
         if enable_scheduler
         else None

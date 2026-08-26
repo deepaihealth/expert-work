@@ -23,6 +23,8 @@ the thread.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +33,8 @@ from uuid import UUID
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_turns
@@ -43,6 +47,44 @@ from expert_work.runtime.runs import RunInfo
 from orchestrator.sse import ThreadStatsRecorder
 
 logger = logging.getLogger(__name__)
+
+#: PROD-9(多副本)—— 投递关窗锁的 advisory classid。既有取值:workspace_lock 1、
+#: mcp_oauth_refresh_lock 2、quality_drift 8615、memory_consolidator 8616、
+#: skill_curator 8617、tenant_resource_lock 8618 —— 本模块取新的 8619,永不共键。
+_DELIVERY_LOCK_CLASSID = 8619
+
+
+@asynccontextmanager
+async def delivery_thread_lock(
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    thread_id: UUID,
+) -> AsyncIterator[None]:
+    """PROD-9 —— 把「读 checkpoint → 按 source_run_id 查重 → aupdate_state 追加」
+    这段读-查-写按 originating thread 串行化到全副本。
+
+    没有它,双副本 reconcile(或 reconcile 与 fire-now 跨进程)在窄窗里两边的
+    ``aget_state`` 都早于对方的 ``aupdate_state``:去重扫描全部落空,同一结果
+    投递两次;更糟的形态是两个 ``aupdate_state`` 写同一 parent checkpoint 的
+    兄弟版本 —— lost-update,取决于 checkpoint_id 排序,重复与丢失都可能。
+
+    用**阻塞**的 ``pg_advisory_xact_lock``(不是 try 版):投递是后台/管理路径,
+    等一小段比 429 语义正确;临界区就一读一写,短。``session_factory=None``
+    (单进程 / 内存栈)= no-op —— 单进程下 reconcile 与 fire-now 共享事件循环,
+    原有的顺序去重已足够(既有测试的形态)。
+    """
+    if session_factory is None:
+        yield
+        return
+    async with session_factory() as lock_session:
+        await lock_session.execute(
+            text("SELECT pg_advisory_xact_lock(:cid, hashtext(:k))"),
+            {"cid": _DELIVERY_LOCK_CLASSID, "k": str(thread_id)},
+        )
+        try:
+            yield
+        finally:
+            # rollback 结束事务 → 释放 xact advisory lock。
+            await lock_session.rollback()
 
 
 async def inject_delivery(
@@ -136,6 +178,9 @@ async def deliver_run_result(
     agent_spec_store: AgentSpecStore,
     thread_message_store: ThreadMessageStore | None,
     now: datetime,
+    # PROD-9 —— 投递读-查-写的跨副本关窗(见 delivery_thread_lock)。None =
+    # 单进程语义不变;两个真实调用方(scheduler / fire-now 端点)都必须传。
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> DeliveryOutcome:
     """Deliver a successful run's result into ``trigger``'s originating
     conversation and refresh its content-search mirror (FU2).
@@ -174,15 +219,18 @@ async def deliver_run_result(
             version=trigger.agent_version,
             spec=spec_record.spec,
         )
-        await inject_delivery(
-            built.graph,
-            thread_id=trigger.originating_thread_id,
-            tenant_id=trigger.tenant_id,
-            result_text=result,
-            source_run_id=run.run_id,
-            trigger_id=trigger.id,
-            thread_stats_recorder=runtime.thread_stats_recorder,
-        )
+        # PROD-9 —— 读-查-写整段进锁:aget_state 的快照与 aupdate_state 的追加
+        # 之间不允许别的副本插进同一 thread 的投递。
+        async with delivery_thread_lock(session_factory, trigger.originating_thread_id):
+            await inject_delivery(
+                built.graph,
+                thread_id=trigger.originating_thread_id,
+                tenant_id=trigger.tenant_id,
+                result_text=result,
+                source_run_id=run.run_id,
+                trigger_id=trigger.id,
+                thread_stats_recorder=runtime.thread_stats_recorder,
+            )
         # FU2 — mirror the originating thread into content search. Its own
         # try/except: a mirror-sync failure must NOT downgrade an
         # already-succeeded delivery (the message is durably in the checkpoint).

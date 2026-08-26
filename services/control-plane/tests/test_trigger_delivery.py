@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -421,3 +422,105 @@ async def test_deliver_run_result_survives_mirror_sync_failure(
         # checkpoint carries the result regardless of the mirror-sync outcome
         turns = await read_turns(cp, orig, include_hidden=False)
         assert any(t.role == "assistant" and t.content == outcome.text for t in turns)
+
+
+# ---------------------------------------------------------------------------
+# PROD-9(多副本)—— 投递读-查-写的跨副本关窗锁接线
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deliver_run_result_wraps_inject_in_delivery_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``deliver_run_result`` 必须把 ``inject_delivery``(整段读-查-写)包进
+    ``delivery_thread_lock``,锁键 = originating thread、session_factory 原样
+    透传 —— 锁包在写之外或漏传工厂,双副本窄窗双投就回来了。"""
+    import control_plane.trigger_delivery as td
+
+    tenant, orig, scratch, run_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with make_checkpointer("memory") as cp:
+        spec = _spec()
+        built = await build_agent(
+            spec,
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            provider_key_resolver=_platform_resolver,
+        )
+        await built.graph.aupdate_state(
+            {"configurable": {"thread_id": str(scratch), "tenant_id": str(tenant)}},
+            {"messages": [HumanMessage(content="go"), AIMessage(content="result!")]},
+            as_node="agent",
+        )
+        agents = InMemoryAgentSpecStore()
+        await agents.create(tenant_id=tenant, spec=spec, spec_sha256="a" * 64, created_by="test")
+        runtime = stub_agent_runtime()
+        runtime.durable_checkpointer = cp
+
+        async def _get_agent(**_kwargs: Any) -> Any:
+            return built
+
+        monkeypatch.setattr(runtime, "get_agent", _get_agent)
+
+        order: list[str] = []
+        factory_sentinel = object()
+        real_lock = td.delivery_thread_lock
+        real_inject = td.inject_delivery
+
+        @asynccontextmanager
+        async def _spy_lock(session_factory: Any, thread_id: Any) -> AsyncIterator[None]:
+            assert session_factory is factory_sentinel, "session_factory 没有透传给锁"
+            assert thread_id == orig, "锁键必须是 originating thread"
+            order.append("lock_enter")
+            async with real_lock(None, thread_id):
+                yield
+            order.append("lock_exit")
+
+        async def _spy_inject(*args: Any, **kwargs: Any) -> None:
+            order.append("inject")
+            await real_inject(*args, **kwargs)
+
+        monkeypatch.setattr(td, "delivery_thread_lock", _spy_lock)
+        monkeypatch.setattr(td, "inject_delivery", _spy_inject)
+
+        trigger = TriggerRecord(
+            id=uuid4(),
+            tenant_id=tenant,
+            agent_name="test-agent",
+            agent_version="1.0.0",
+            name="nightly",
+            kind="cron",
+            config={"expr": "0 9 * * *"},
+            enabled=True,
+            source="api",
+            originating_thread_id=orig,
+            context_mode="reuse_thread",
+            created_at=_NOW,
+            updated_at=_NOW,
+        )
+        run = RunInfo(
+            run_id=run_id,
+            tenant_id=tenant,
+            thread_id=scratch,
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=_NOW,
+            updated_at=_NOW,
+            finished_at=_NOW,
+        )
+
+        outcome = await td.deliver_run_result(
+            trigger=trigger,
+            run=run,
+            runtime=runtime,
+            agent_spec_store=agents,
+            thread_message_store=None,
+            now=_NOW,
+            session_factory=factory_sentinel,  # type: ignore[arg-type]
+        )
+
+        assert outcome.status == "delivered"
+        assert order == ["lock_enter", "inject", "lock_exit"], f"读-查-写没有整段进锁:{order}"
