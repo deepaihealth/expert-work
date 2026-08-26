@@ -1677,7 +1677,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", tokens: null },
+        { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", finishedAt: null, error: null, tokens: null },
       ]);
       streamRunEventsMock.mockReturnValue(
         makeStream([
@@ -1777,7 +1777,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null },
       ]);
       streamRunEventsMock.mockReturnValue(
         makeStream([
@@ -1824,9 +1824,9 @@ describe("PlaygroundTab", () => {
       // 2 turns worth of messages, 3 runs — buildHistoryTurns' count guard
       // rejects the pairing (e.g. an approval split one turn across 2 runs).
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
-        { runId: "r2", status: "success", isResume: true, createdAt: "t2", tokens: null },
-        { runId: "r3", status: "success", isResume: true, createdAt: "t3", tokens: null },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null },
+        { runId: "r2", status: "success", isResume: true, createdAt: "t2", finishedAt: null, error: null, tokens: null },
+        { runId: "r3", status: "success", isResume: true, createdAt: "t3", finishedAt: null, error: null, tokens: null },
       ]);
 
       renderPg();
@@ -1857,7 +1857,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null },
       ]);
       streamRunEventsMock.mockImplementation(() => {
         return (async function* () {
@@ -1890,7 +1890,7 @@ describe("PlaygroundTab", () => {
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
-        { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
+        { runId: "r1", status: "success", isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null },
       ]);
       // The terminal-replay endpoint always appends an ``end`` frame, so an
       // empty run replays as a lone end frame — no renderable content.
@@ -1951,8 +1951,8 @@ describe("PlaygroundTab", () => {
       listThreadRunsMock.mockImplementation((tid: string) =>
         Promise.resolve(
           tid === threadA.thread_id
-            ? [{ runId: "rA", status: "success" as const, isResume: false, createdAt: "t1", tokens: null }]
-            : [{ runId: "rB", status: "success" as const, isResume: false, createdAt: "t1", tokens: null }],
+            ? [{ runId: "rA", status: "success" as const, isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null }]
+            : [{ runId: "rB", status: "success" as const, isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null }],
         ),
       );
       // Each run's replay yields a distinct answer so we can tell whose turns
@@ -2350,7 +2350,7 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
       { role: "assistant", content: "a1" },
     ]);
     listThreadRunsMock.mockResolvedValue([
-      { runId: "r1", status: "success", isResume: false, createdAt: "t1", tokens: null },
+      { runId: "r1", status: "success", isResume: false, createdAt: "t1", finishedAt: null, error: null, tokens: null },
     ]);
     streamRunEventsMock.mockReturnValue(
       makeStream([

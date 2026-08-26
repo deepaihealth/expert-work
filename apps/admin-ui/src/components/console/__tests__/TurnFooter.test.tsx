@@ -34,6 +34,8 @@ function makeConsoleTurn(turnOver: Partial<Turn> = {}): ConsoleTurn {
     tokens: null,
     timing: null,
     createdAt: null,
+    finishedAt: null,
+    runError: null,
   };
 }
 
@@ -126,6 +128,75 @@ describe("TurnFooter", () => {
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip.textContent).toContain("输入");
     expect(tooltip.textContent).toContain("34408");
+  });
+
+  it("总耗时 = run 行墙钟(finishedAt − createdAt),带「总耗时」标签", () => {
+    // 回放帧的 receivedAt 全挤在回放一瞬间(曾把 9 分钟的 run 显示成 8ms),
+    // 权威时长来自 run 行的 created_at / finished_at。
+    const turn = {
+      ...makeConsoleTurn({ status: "done" }),
+      createdAt: "2026-08-26T00:00:00Z",
+      finishedAt: "2026-08-26T00:01:44Z",
+    };
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={turn}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("console-footer-meta").textContent).toContain("总耗时 1m44s");
+  });
+
+  it("interrupted turn: the status tag names the InterruptReason", () => {
+    // 「已取消」(user_cancel)和「已中断(连接断开)」必须能分开;词表外的
+    // 值落回通用「已中断」。
+    const cancelled = {
+      ...makeConsoleTurn({ status: "interrupted" }),
+      runError: "user_cancel",
+    };
+    const { rerender } = render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={cancelled}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("console-turn-status")).toHaveTextContent("已取消");
+
+    const legacy = { ...makeConsoleTurn({ status: "interrupted" }), runError: null };
+    rerender(
+      <MemoryRouter>
+        <TurnFooter
+          turn={legacy}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("console-turn-status")).toHaveTextContent("已中断");
   });
 
   it("does not render a view-run link any more", () => {

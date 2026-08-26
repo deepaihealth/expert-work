@@ -35,7 +35,7 @@ import { useTranslation } from "react-i18next";
 
 import { decideApprovals, type ApprovalItem } from "../api/approvals";
 import { downloadArtifact } from "../api/artifacts";
-import { ApiError } from "../api/client";
+import { ApiError, errMessage } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { cancelRun, streamRunEvents } from "../api/runs";
 import { reducePlan } from "../api/plan_reducer";
@@ -427,12 +427,13 @@ export function ConversationDetail() {
     async (name: string) => {
       try {
         await downloadArtifact(name, conversationUserId ?? undefined, concreteTenantScope(apiTenantScope));
-      } catch {
-        // Swallow — same rationale as the playground: the artifact may have
-        // been deleted, and a toast here would need the App message API.
+      } catch (err) {
+        // 静默吞错让「下载 404 / 413」表现成「点了没反应」,用户以为产物丢了
+        // (2026-08-26 反馈)。toast 带后端 detail(如「太大」「不存在」)。
+        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       }
     },
-    [conversationUserId, apiTenantScope],
+    [conversationUserId, apiTenantScope, t],
   );
 
   // §九「联动」—— 脚注「查看轨迹」:切「轨迹」tab + 选中该轮最后一条 ASSISTANT

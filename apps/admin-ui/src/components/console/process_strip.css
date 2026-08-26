@@ -5,6 +5,16 @@
  * (./trajectory_ledger.css and friends; ./trajectory_rows.css, the original
  * reference, was retired with PR-A.2 Task 11).
  */
+/* 2026-08-26 用户反馈「思考过程样式不明显」—— 参照 Claude 桌面版思考块:
+ * 整条过程带左竖线 + 微弱底色,和正文答案在视觉上分成两层,而不是同底色
+ * 靠缩进硬分。 */
+.ew-process {
+  padding: 2px 0 2px 8px;
+  border-left: 2px solid var(--ew-border-default);
+  border-radius: 2px;
+  background: var(--ew-surface-raised);
+}
+
 .ew-process__head {
   display: flex;
   align-items: center;
@@ -14,14 +24,16 @@
   border: none;
   border-radius: 4px;
   background: none;
-  color: var(--ew-text-secondary);
+  color: var(--ew-text-tertiary);
   font-size: 12px;
+  font-style: italic;
   text-align: left;
   cursor: pointer;
 }
 
 .ew-process__head:hover {
   background: var(--ew-surface-hover);
+  color: var(--ew-text-secondary);
 }
 
 .ew-process__caret {

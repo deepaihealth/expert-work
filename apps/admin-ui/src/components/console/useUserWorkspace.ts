@@ -22,11 +22,14 @@
  * mid-download of that same file).
  */
 import { useCallback, useEffect, useState } from "react";
+import { App } from "antd";
+import { useTranslation } from "react-i18next";
 
 import {
   deleteArtifact as deleteArtifactApi,
   downloadArtifact as downloadArtifactApi,
 } from "../../api/artifacts";
+import { errMessage } from "../../api/client";
 import type { SessionWorkspace, WorkspaceFile } from "../../api/sessions";
 import {
   deleteUserWorkspaceFile,
@@ -54,6 +57,8 @@ export interface UseUserWorkspace {
  *  reload 一次(effect 首跑即按当前 `running` 值判断)。 */
 export function useUserWorkspace({ running }: { running: boolean }): UseUserWorkspace {
   const { apiTenantScope } = useTenantScope();
+  const { message } = App.useApp();
+  const { t } = useTranslation();
   const [workspace, setWorkspace] = useState<SessionWorkspace | null>(null);
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [loading, setLoading] = useState(false);
@@ -90,14 +95,14 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
       setBusyKey(`download:${path}`);
       try {
         await downloadUserWorkspaceFile(path, undefined, concreteTenantScope(apiTenantScope));
-      } catch {
-        // Swallow — the file may have been removed between list + click; the
-        // refresh button re-syncs. A toast here would need the App message API.
+      } catch (err) {
+        // 静默吞错让「下载失败」表现成「点了没反应」(2026-08-26 用户反馈)。
+        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       } finally {
         setBusyKey(null);
       }
     },
-    [apiTenantScope],
+    [apiTenantScope, message, t],
   );
 
   const deleteFile = useCallback(
@@ -120,13 +125,14 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
       setBusyKey(`download:artifact:${name}`);
       try {
         await downloadArtifactApi(name, undefined, concreteTenantScope(apiTenantScope));
-      } catch {
-        // Swallow — same rationale as the file download.
+      } catch (err) {
+        // 同 downloadFile —— 失败要说出来,带后端 detail(不存在 / 太大)。
+        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       } finally {
         setBusyKey(null);
       }
     },
-    [apiTenantScope],
+    [apiTenantScope, message, t],
   );
 
   const deleteArtifact = useCallback(

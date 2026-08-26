@@ -198,6 +198,8 @@ const TWO_RUNS = [
     status: "success" as const,
     isResume: false,
     createdAt: "2026-06-30T12:00:00Z",
+    finishedAt: null,
+    error: null,
     tokens: null,
   },
   {
@@ -205,6 +207,8 @@ const TWO_RUNS = [
     status: "success" as const,
     isResume: true,
     createdAt: "2026-06-30T12:05:00Z",
+    finishedAt: null,
+    error: null,
     tokens: null,
   },
 ];
@@ -715,6 +719,8 @@ describe("ConversationDetail", () => {
           status: "timeout",
           isResume: false,
           createdAt: "2026-06-30T12:00:00Z",
+          finishedAt: null,
+          error: null,
           tokens: null,
         },
         {
@@ -722,6 +728,8 @@ describe("ConversationDetail", () => {
           status: "interrupted",
           isResume: true,
           createdAt: "2026-06-30T12:05:00Z",
+          finishedAt: null,
+          error: null,
           tokens: null,
         },
         {
@@ -729,6 +737,8 @@ describe("ConversationDetail", () => {
           status: "error",
           isResume: true,
           createdAt: "2026-06-30T12:10:00Z",
+          finishedAt: null,
+          error: null,
           tokens: null,
         },
       ]);
@@ -950,6 +960,8 @@ const pausedFixture = () => {
       status: "success" as const,
       isResume: false,
       createdAt: "2026-06-30T12:00:00Z",
+      finishedAt: null,
+      error: null,
       tokens: null,
     },
     {
@@ -957,6 +969,8 @@ const pausedFixture = () => {
       status: "paused" as const,
       isResume: true,
       createdAt: "2026-06-30T12:05:00Z",
+      finishedAt: null,
+      error: null,
       tokens: null,
     },
   ];

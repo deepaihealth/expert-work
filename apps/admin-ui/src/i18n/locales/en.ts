@@ -1240,6 +1240,12 @@ export interface TranslationKeys {
     footer_view_trajectory: string;
     footer_tokens: string;
     footer_steps: string;
+    footer_total_duration: string;
+    turn_inputs_fold: string;
+    interrupt_reason_user_cancel: string;
+    interrupt_reason_client_disconnect: string;
+    interrupt_reason_tenant_suspended: string;
+    interrupt_reason_agent_disabled: string;
     footer_export: string;
     turn_view_run: string;
     toolbar_duration: string;
@@ -4344,6 +4350,12 @@ const en: TranslationKeys = {
     footer_view_trajectory: "View trajectory",
     footer_tokens: "{{n}} tok",
     footer_steps: "{{n}} steps",
+    footer_total_duration: "Total {{d}}",
+    turn_inputs_fold: "{{n}} inputs",
+    interrupt_reason_user_cancel: "Cancelled",
+    interrupt_reason_client_disconnect: "Interrupted (connection lost)",
+    interrupt_reason_tenant_suspended: "Interrupted (tenant suspended)",
+    interrupt_reason_agent_disabled: "Interrupted (agent disabled)",
     footer_export: "Export",
     turn_view_run: "View run",
     toolbar_duration: "Duration",

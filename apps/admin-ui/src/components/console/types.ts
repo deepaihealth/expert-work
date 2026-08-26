@@ -43,4 +43,10 @@ export interface ConsoleTurn {
   timing: TurnTiming | null;
   /** History turns' ``ThreadRunSummary.createdAt``(ISO);live turns ``null``。 */
   createdAt: string | null;
+  /** History turns' ``ThreadRunSummary.finishedAt``(ISO);live turns ``null``。
+   *  「总耗时」= finishedAt − createdAt(墙钟)。 */
+  finishedAt: string | null;
+  /** History turns' ``ThreadRunSummary.error`` —— INTERRUPTED 的原因短码
+   *  (InterruptReason 词表)/ ERROR 的异常文本;live turns ``null``。 */
+  runError: string | null;
 }

@@ -71,13 +71,18 @@ export function recordTabsOf(record: LedgerRecord): RecordTab[] {
   return OTHER_TABS;
 }
 
-/** 概要里带预览的分节;占位记录一节都不出(没内容可预览)。 */
+/** 概要里带预览的分节;占位记录一节都不出(没内容可预览)。
+ *
+ *  「计时」不再作分节内嵌(2026-08-26 用户反馈):概要顶部的 `<dl>` 已经
+ *  列了状态 / 时长 / 模型 / tokens,分节再塞一张带刷新按钮的双列表纯属
+ *  重复,还被预览区的高度上限拦腰裁断;完整计时(含 Langfuse 精确列)在
+ *  「计时」tab 一键可达。 */
 function sectionsOf(record: LedgerRecord): RecordTab[] {
   if (record.placeholder !== null) return [];
   if (record.kind === "user") return ["preview"];
-  if (record.kind === "assistant") return ["preview", "timing"];
+  if (record.kind === "assistant") return ["preview"];
   if (record.kind === "system") return ["rawtext"];
-  return ["payload", "result", "timing"];
+  return ["payload", "result"];
 }
 
 export interface RecordDetailsProps {

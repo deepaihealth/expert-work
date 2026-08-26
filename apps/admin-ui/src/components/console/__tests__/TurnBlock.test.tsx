@@ -51,6 +51,8 @@ function makeConsoleTurn(
     tokens: null,
     timing: null,
     createdAt: null,
+    finishedAt: null,
+    runError: null,
   };
 }
 
@@ -267,6 +269,21 @@ describe("TurnBlock", () => {
     const turn = makeConsoleTurn([], { inputs: { city: "上海" } });
     renderTurnBlock(makeBaseProps(turn));
     expect(screen.getByTestId("console-turn-inputs")).toHaveTextContent("city=上海");
+  });
+
+  it("⑤b long inputs fold behind a 「入参 N 项」 summary instead of a wall of text", () => {
+    // 对外派发的入参常带整段 OSS URL / 免责声明,摊开会溢出气泡区
+    // (2026-08-26 用户反馈)。超过内联阈值 → <details> 折叠,摘要报项数。
+    const turn = makeConsoleTurn([], {
+      inputs: {
+        org_logo: `https://example.oss-cn-hangzhou.aliyuncs.com/${"x".repeat(120)}.png`,
+        org_name: "沫沫健康管理中心",
+      },
+    });
+    renderTurnBlock(makeBaseProps(turn));
+    const box = screen.getByTestId("console-turn-inputs");
+    expect(box.querySelector("details")).not.toBeNull();
+    expect(box.querySelector("summary")).toHaveTextContent("入参 2 项");
   });
 
   // 修复轮 2 —— 卡片空白是个大靶子,只许换高亮轮:`onSelect` 响,`onInspect`

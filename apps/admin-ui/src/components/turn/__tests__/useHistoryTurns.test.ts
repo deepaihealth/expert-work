@@ -75,6 +75,8 @@ const oneRun = [
     status: "success" as const,
     isResume: false,
     createdAt: "2026-05-25T00:00:00Z",
+    finishedAt: null,
+    error: null,
     tokens: null,
   },
 ];
@@ -397,8 +399,8 @@ const liveThread = {
     { role: "user", content: "q2" },
   ] as HistoryMessage[],
   runs: [
-    { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", tokens: null },
-    { runId: "r2", status: "running", isResume: true, createdAt: "2026-05-25T00:01:00Z", tokens: null },
+    { runId: "r1", status: "success", isResume: false, createdAt: "2026-05-25T00:00:00Z", finishedAt: null, error: null, tokens: null },
+    { runId: "r2", status: "running", isResume: true, createdAt: "2026-05-25T00:01:00Z", finishedAt: null, error: null, tokens: null },
   ],
 };
 

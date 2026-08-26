@@ -439,11 +439,15 @@ describe("RecordDetails", () => {
     expect(link).toHaveAttribute("target", "_blank");
   });
 
-  it("概要分节:tool 有载荷 / 结果 / 计时三节,标题按钮跳对应 tab", async () => {
+  it("概要分节:tool 有载荷 / 结果两节(计时不再内嵌),标题按钮跳对应 tab", async () => {
+    // 2026-08-26 用户反馈 —— 概要顶部 `<dl>` 已列状态/时长/模型/tokens,
+    // 「计时」分节再嵌整张双列表(还带刷新按钮)纯属重复且被预览高度裁断;
+    // 完整计时在「计时」tab。
     const { props } = renderRecord({ record: rec(toolRow()) });
-    for (const key of ["payload", "result", "timing"]) {
+    for (const key of ["payload", "result"]) {
       expect(screen.getByTestId(`console-detail-section-${key}`)).toBeInTheDocument();
     }
+    expect(screen.queryByTestId("console-detail-section-timing")).not.toBeInTheDocument();
     // 分节里还有载荷自带的复制按钮,按可访问名字点标题那颗。
     const section = screen.getByTestId("console-detail-section-payload");
     await userEvent.click(within(section).getByRole("button", { name: "Open Payload" }));
@@ -472,6 +476,15 @@ describe("RecordDetails", () => {
     expect(thinking.textContent).toContain("先查客户档案");
     // Markdown 正文:`## 结论` 渲染成标题而不是原样文本。
     expect(screen.getByRole("heading", { name: "结论" })).toBeInTheDocument();
+  });
+
+  it("assistant 原文:思考折叠(同预览),不与正文裸拼", () => {
+    // 2026-08-26 用户反馈 —— 原文 tab 里英文思考直接顶在正文上方,分不出
+    // 哪段是模型思考、哪段是真正的回复。
+    renderRecord({ record: rec(assistantRow()), activeTab: "rawtext" });
+    const thinking = screen.getByTestId("console-detail-rawtext-thinking");
+    expect(thinking.tagName).toBe("DETAILS");
+    expect(thinking.textContent).toContain("先查客户档案");
   });
 
   it("user 预览:没有思考折叠段", () => {

@@ -148,6 +148,7 @@ export function AssistantRawText({
 }) {
   const { t } = useTranslation();
   const reasoning = row.kind === "assistant" ? row.reasoning : "";
+  const n = (row.kind === "assistant" ? row.reasoningTokens : undefined) ?? reasoning.length;
   const block = (text: string, title: string): ReactNode => (
     <div>
       <Pre>{text}</Pre>
@@ -158,7 +159,16 @@ export function AssistantRawText({
   );
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {reasoning !== "" && block(reasoning, t("console.detail_thinking_none"))}
+      {/* 思考段折叠(同「预览」tab)—— 原来与正文裸拼在一起,分不出哪段
+          是模型的思考、哪段是真正的回复(2026-08-26 用户反馈)。 */}
+      {reasoning !== "" && (
+        <details data-testid="console-detail-rawtext-thinking">
+          <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--ew-text-tertiary)" }}>
+            {t("console.detail_thinking", { n })}
+          </summary>
+          {block(reasoning, t("console.detail_thinking", { n }))}
+        </details>
+      )}
       {block(row.text, t("console.detail_tab_rawtext"))}
     </div>
   );
