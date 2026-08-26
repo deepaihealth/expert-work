@@ -364,6 +364,7 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "status",
             "created_at",
             "finished_at",
+            "artifacts",
             "error",
         }
 

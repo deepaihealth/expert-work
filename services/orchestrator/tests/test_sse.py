@@ -333,7 +333,9 @@ async def test_sse_consumer_frames_in_order_end_terminates() -> None:
     assert "event: updates" in text
     # P3 PR-1 Task 5 —— end 帧不再是 ``data: null``,带终局状态 + run_id。
     assert text.rstrip().endswith(
-        'event: end\ndata: {"status":"success","run_id":"' + str(record.run_id) + '"}'
+        'event: end\ndata: {"status":"success","run_id":"'
+        + str(record.run_id)
+        + '","artifacts":[]}'
     )
 
 
@@ -1316,7 +1318,11 @@ async def test_sse_consumer_end_frame_carries_status_on_cancelled_run() -> None:
 
     text = b"".join(frames).decode()
     payload = json.loads(text.rstrip().rsplit("data: ", 1)[1])
-    assert payload == {"status": "interrupted", "run_id": str(record.run_id)}
+    assert payload == {
+        "status": "interrupted",
+        "run_id": str(record.run_id),
+        "artifacts": [],
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -452,10 +452,12 @@ async def _collect_replay(
     store: InMemoryRunEventStore,
     since_seq: int | None = None,
     run_status: RunStatus = RunStatus.SUCCESS,
+    run_artifacts: list[dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[str | None, str, Any]], int | None]:
     plan = await build_event_producer(
         run_id=run_id,
         run_status=run_status,
+        run_artifacts=run_artifacts,
         event_store=store,
         stream_bridge=InMemoryStreamBridge(),
         since_seq=since_seq,
@@ -716,8 +718,11 @@ async def test_both_sse_paths_emit_the_same_end_shape() -> None:
             )
         ]
     )
+    # 产物清单契约 —— 生产调用方把同一 run 行的 status 与 artifacts 一起传
+    # (runs.py / external_events.py);run_agent 终局把清单固化成 []。测试
+    # 帮手镜像同一契约,否则两条路径会被测试自己人为掰开。
     events_frames, _ = await _collect_replay(
-        run_id=record.run_id, store=store, run_status=RunStatus.INTERRUPTED
+        run_id=record.run_id, store=store, run_status=RunStatus.INTERRUPTED, run_artifacts=[]
     )
 
     consumer_end = consumer_frames[-1]
