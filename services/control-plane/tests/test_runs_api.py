@@ -1973,6 +1973,17 @@ async def test_cancel_run_interrupts_a_running_row(runs_client: AsyncClient) -> 
     row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
     assert row is not None
     assert row.status is RunStatus.INTERRUPTED
+    # 中断原因入账:主动取消要能和「断流被杀 / 连带取消」区分开,不然界面上
+    # 全是一个「已中断」,异常中断查不到病根(2026-08-26 用户反馈)。
+    assert row.error == "user_cancel"
+
+    # 会话 run 列表把原因 + 墙钟终点一并吐出来 —— 前端的「总耗时」和中断
+    # 归因都吃这两个字段。
+    listing = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert listing.status_code == 200, listing.text
+    listed = {r["run_id"]: r for r in listing.json()["data"]["runs"]}
+    assert listed[str(run_id)]["error"] == "user_cancel"
+    assert listed[str(run_id)]["finished_at"] is not None
 
 
 @pytest.mark.asyncio

@@ -373,8 +373,11 @@ async def test_backpressure_drop_oldest() -> None:
 async def test_client_disconnect_cancels_inflight_run() -> None:
     """sse_consumer's finally cancels a still-running run when the
     client disconnects and on_disconnect is CANCEL."""
+    from expert_work.runtime.runs import InMemoryRunStore
+
     bridge = InMemoryStreamBridge()
-    rm = RunManager()
+    store = InMemoryRunStore()
+    rm = RunManager(store=store)
     record = await _new_record(rm, on_disconnect=DisconnectMode.CANCEL)
     await rm.set_status(record.run_id, RunStatus.RUNNING)
 
@@ -391,6 +394,11 @@ async def test_client_disconnect_cancels_inflight_run() -> None:
 
     assert record.abort_event.is_set()
     assert rm.get(record.run_id).status is RunStatus.INTERRUPTED
+    # 断流取消要把原因入账 —— 界面上「client_disconnect」和「user_cancel」
+    # 必须能分开(2026-08-26 用户反馈:显示中断但看不到为什么)。
+    persisted = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert persisted is not None
+    assert persisted.error == "client_disconnect"
 
 
 @pytest.mark.asyncio

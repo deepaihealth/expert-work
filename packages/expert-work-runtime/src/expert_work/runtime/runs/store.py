@@ -172,9 +172,15 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def request_cancel(self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime) -> bool:
+    async def request_cancel(
+        self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime, reason: str | None = None
+    ) -> bool:
         """Stream RT-4 (RT-ADR-17) — cross-replica cancel: guarded transition of a
         still-executing OR still-queued run to INTERRUPTED.
+
+        ``reason``(:class:`InterruptReason` 的值)写进 ``error`` 列 —— 与
+        :meth:`RunManager.cancel` 同一份词表,让界面能区分「用户主动取消」
+        与「断流 / 连带取消」。
 
         Updates ``status → interrupted`` ONLY when the row is currently
         ``running`` / ``pending`` / ``queued`` (so a run that just finished
@@ -608,7 +614,9 @@ class InMemoryRunStore(RunStore):
         )
         return True
 
-    async def request_cancel(self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime) -> bool:
+    async def request_cancel(
+        self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime, reason: str | None = None
+    ) -> bool:
         row = self._rows.get(run_id)
         if (
             row is None
@@ -620,6 +628,8 @@ class InMemoryRunStore(RunStore):
             row,
             status=RunStatus.INTERRUPTED,
             updated_at=updated_at,
+            # 谓词与 SQL 店 byte-同义:reason 为 None 时保留既有 error。
+            error=reason if reason is not None else row.error,
             finished_at=updated_at,
         )
         return True
@@ -1057,7 +1067,17 @@ class SqlRunStore(RunStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
-    async def request_cancel(self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime) -> bool:
+    async def request_cancel(
+        self, *, run_id: UUID, tenant_id: UUID, updated_at: datetime, reason: str | None = None
+    ) -> bool:
+        values: dict[str, Any] = {
+            "status": RunStatus.INTERRUPTED.value,
+            "updated_at": updated_at,
+            "finished_at": updated_at,
+        }
+        # 谓词与 in-memory 店 byte-同义:reason 为 None 时不碰既有 error。
+        if reason is not None:
+            values["error"] = reason
         async with self._sf() as session:
             result = await session.execute(
                 update(AgentRunRow)
@@ -1072,11 +1092,7 @@ class SqlRunStore(RunStore):
                         )
                     ),
                 )
-                .values(
-                    status=RunStatus.INTERRUPTED.value,
-                    updated_at=updated_at,
-                    finished_at=updated_at,
-                )
+                .values(values)
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0

@@ -17,6 +17,7 @@ from expert_work.runtime.runs.event_store import make_event_record as make_event
 from expert_work.runtime.runs.manager import RunManager as RunManager
 from expert_work.runtime.runs.manager import RunRecord as RunRecord
 from expert_work.runtime.runs.schemas import DisconnectMode as DisconnectMode
+from expert_work.runtime.runs.schemas import InterruptReason as InterruptReason
 from expert_work.runtime.runs.schemas import RunInfo as RunInfo
 from expert_work.runtime.runs.schemas import RunStatus as RunStatus
 from expert_work.runtime.runs.store import InMemoryRunStore as InMemoryRunStore
@@ -28,6 +29,7 @@ __all__ = [
     "DisconnectMode",
     "InMemoryRunEventStore",
     "InMemoryRunStore",
+    "InterruptReason",
     "RunEventRecord",
     "RunEventStore",
     "RunIdempotencyConflict",

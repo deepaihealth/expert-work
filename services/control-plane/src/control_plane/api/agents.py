@@ -105,6 +105,7 @@ from expert_work.protocol import (
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import (
     DisconnectMode,
+    InterruptReason,
     RunEventStore,
     RunIdempotencyConflict,
     RunInfo,
@@ -1921,9 +1922,12 @@ def build_agents_router() -> APIRouter:
             now = datetime.now(UTC)
             for run in running:
                 stopped = await runtime.run_manager.cancel(
-                    run.run_id
+                    run.run_id, reason=InterruptReason.AGENT_DISABLED
                 ) or await run_store.request_cancel(
-                    run_id=run.run_id, tenant_id=tenant_id, updated_at=now
+                    run_id=run.run_id,
+                    tenant_id=tenant_id,
+                    updated_at=now,
+                    reason=InterruptReason.AGENT_DISABLED,
                 )
                 if stopped:
                     cancelled += 1
@@ -2018,9 +2022,12 @@ def build_agents_router() -> APIRouter:
         now = datetime.now(UTC)
         for run in running:
             stopped = await runtime.run_manager.cancel(
-                run.run_id
+                run.run_id, reason=InterruptReason.AGENT_DISABLED
             ) or await run_store.request_cancel(
-                run_id=run.run_id, tenant_id=tenant_id, updated_at=now
+                run_id=run.run_id,
+                tenant_id=tenant_id,
+                updated_at=now,
+                reason=InterruptReason.AGENT_DISABLED,
             )
             if stopped:
                 cancelled += 1

@@ -408,12 +408,14 @@ class RunManager:
             record.task = task
             return True
 
-    async def cancel(self, run_id: UUID) -> bool:
+    async def cancel(self, run_id: UUID, *, reason: str | None = None) -> bool:
         """Signal an in-flight run to abort.
 
         Sets ``abort_event`` (orchestrator polls this) and transitions status
         to INTERRUPTED if currently RUNNING/PENDING. Returns ``True`` iff
-        the run exists.
+        the run exists. ``reason``(:class:`InterruptReason` 的值)写进
+        ``error`` 列 —— 不带原因的 INTERRUPTED 在界面上分不出「用户主动取消」
+        与「断流 / 连带取消」。
         """
         async with self._lock:
             record = self._runs.get(run_id)
@@ -430,9 +432,10 @@ class RunManager:
                         tenant_id=record.tenant_id,
                         status=RunStatus.INTERRUPTED,
                         updated_at=now,
+                        error=reason,
                         finished_at=now,
                     )
-            logger.info("run.cancel id=%s prev_status=%s", run_id, record.status)
+            logger.info("run.cancel id=%s prev_status=%s reason=%s", run_id, record.status, reason)
             return True
 
     async def has_inflight(self, thread_id: UUID, *, tenant_id: UUID) -> bool:

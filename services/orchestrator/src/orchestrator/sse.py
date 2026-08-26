@@ -1576,7 +1576,9 @@ async def sse_consumer(
             record.status in (RunStatus.PENDING, RunStatus.RUNNING)
             and record.on_disconnect is DisconnectMode.CANCEL
         ):
-            await run_manager.cancel(record.run_id)
+            from expert_work.runtime.runs import InterruptReason
+
+            await run_manager.cancel(record.run_id, reason=InterruptReason.CLIENT_DISCONNECT)
 
 
 #: 对外 ``end`` 帧允许出现的 status 四值。``_EXTERNAL_END_STATUS``(内部

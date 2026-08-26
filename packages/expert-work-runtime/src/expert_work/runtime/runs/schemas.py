@@ -49,6 +49,25 @@ class DisconnectMode(StrEnum):
     CONTINUE = "continue"  # keep running; results still go to event_log
 
 
+class InterruptReason(StrEnum):
+    """为什么这个 run 被打成 ``INTERRUPTED`` —— 写进 ``RunInfo.error``。
+
+    六个取消入口共用一个终态,不记原因的话「用户点了取消」和「断流被杀」
+    「租户被停用」在界面上长得一模一样,异常中断查不到病根(2026-08-26
+    用户反馈)。取值是机器可读短码,前端翻译成人话;``ERROR`` 状态的
+    ``error`` 字段仍放异常文本,两者不冲突(状态不同)。
+
+    ``TENANT_SUSPENDED`` / ``AGENT_DISABLED`` 的字面值与
+    ``control_plane.kill_switch.run_block_reason`` 的返回值一致 ——
+    orphan sweep 把 ``blocked`` 原样透传,不做翻译。
+    """
+
+    USER_CANCEL = "user_cancel"  # 控制台 / 对外取消端点,人主动点的
+    CLIENT_DISCONNECT = "client_disconnect"  # SSE 消费者断线 + on_disconnect=CANCEL
+    TENANT_SUSPENDED = "tenant_suspended"  # 租户被停用,连带取消
+    AGENT_DISABLED = "agent_disabled"  # Agent 被停用 / 删除,连带取消
+
+
 #: Run statuses that mark a run as finished — ``RunManager`` stamps
 #: ``finished_at`` when a run transitions into one of these.
 TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(

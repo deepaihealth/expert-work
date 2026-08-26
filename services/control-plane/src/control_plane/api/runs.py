@@ -93,7 +93,7 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import DisconnectMode, RunEventStore, RunStore
+from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventStore, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
@@ -1668,8 +1668,8 @@ def build_runs_router() -> APIRouter:
         Ownership-gated identically to ``get_thread_messages``; a concrete
         ``tenant_id`` lets a system_admin read a foreign tenant's runs.
         Returns ``run_id`` / ``status`` / ``is_resume`` / ``created_at`` /
-        ``tokens`` only — the debug payload lives in the per-run event
-        replay, not here.
+        ``finished_at`` / ``error`` / ``tokens`` only — the debug payload
+        lives in the per-run event replay, not here.
         """
         scope = await ensure_tenant_scope(
             request.state.principal,
@@ -1718,6 +1718,13 @@ def build_runs_router() -> APIRouter:
                     "status": r.status.value,
                     "is_resume": r.is_resume,
                     "created_at": r.created_at.isoformat(),
+                    # 会话页的「总耗时」用 finished_at - created_at(墙钟)——
+                    # 回放帧的 receivedAt 全挤在回放那一瞬间,不能当耗时用。
+                    "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                    # INTERRUPTED 的 error 放 InterruptReason 短码(user_cancel /
+                    # client_disconnect / ...),ERROR 的放异常文本;前端按状态
+                    # 分别翻译。老 run 两者都可能是 null。
+                    "error": r.error,
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),
@@ -1971,8 +1978,13 @@ def build_runs_router() -> APIRouter:
             )
 
         async with applied_scope(scope):
-            stopped = await runtime.run_manager.cancel(run_id) or await runs.request_cancel(
-                run_id=run_id, tenant_id=target_tenant, updated_at=datetime.now(UTC)
+            stopped = await runtime.run_manager.cancel(
+                run_id, reason=InterruptReason.USER_CANCEL
+            ) or await runs.request_cancel(
+                run_id=run_id,
+                tenant_id=target_tenant,
+                updated_at=datetime.now(UTC),
+                reason=InterruptReason.USER_CANCEL,
             )
         if not stopped:
             # The status flipped terminal between our read and the CAS — the

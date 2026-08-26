@@ -673,13 +673,18 @@ async def test_request_cancel_interrupts_a_queued_run(run_store: SqlRunStore) ->
     await run_store.create(replace(info, enqueued_input={"input": "hi", "image_refs": []}))
 
     hit = await run_store.request_cancel(
-        run_id=run_id, tenant_id=tenant_id, updated_at=_BASE + timedelta(seconds=9)
+        run_id=run_id,
+        tenant_id=tenant_id,
+        updated_at=_BASE + timedelta(seconds=9),
+        reason="user_cancel",
     )
     assert hit is True
     fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
     assert fetched is not None
     assert fetched.status is RunStatus.INTERRUPTED
     assert fetched.finished_at == _BASE + timedelta(seconds=9)
+    # 中断原因写进 error 列(InterruptReason 词表)—— in-memory 店同款谓词。
+    assert fetched.error == "user_cancel"
 
     # A worker racing to claim the same run after the cancel must lose — the
     # CAS's own ``status = queued`` predicate no longer matches.
