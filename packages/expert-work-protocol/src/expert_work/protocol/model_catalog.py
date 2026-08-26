@@ -165,17 +165,15 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="deepseek-chat", vision=False, context_window=64_000, deprecated=True),
         ModelEntry(name="deepseek-reasoner", vision=False, context_window=64_000, deprecated=True),
     ),
-    # Kimi (Moonshot AI) — platform.kimi.com/docs (2026-07)
-    # kimi-k3 (2.8T MoE, weights due 2026-07-27) is the new flagship: natively
-    # multimodal with a 1M context. thinking is None on purpose — K3 is ALWAYS
-    # thinking (no off switch) and today only accepts reasoning_effort=max (its
-    # default), so we send no thinking field (the always-thinking → None
-    # convention, cf. deepseek-reasoner). None also makes the compat build gate
-    # reject a manifest that sets effort / thinking_enabled on K3 — which both
-    # avoids the K2.x ``thinking.type`` param the K3 docs forbid and the non-max
-    # reasoning_effort levels K3 rejects. Revisit to "effort" once K3 exposes
-    # multiple reasoning_effort tiers. (K3's sampling params are fixed; the
-    # openai-compat build path does not honor ``sampling=False`` today — only the
+    # Kimi (Moonshot AI) — platform.kimi.com/docs (2026-08)
+    # kimi-k3 (2.8T MoE) is the flagship: natively multimodal, 1M context.
+    # thinking is "effort" — K3 is ALWAYS thinking (no off switch) with a
+    # top-level ``reasoning_effort`` on the max/high/low scale, default max
+    # (thinking docs 2026-08; the earlier max-only restriction is lifted).
+    # The adapter maps the unified levels (no "medium" on K3), floors "off"
+    # at low, and must NOT send the K2.x ``thinking.type`` param (the K3
+    # docs forbid it). (K3's sampling params are fixed; the openai-compat
+    # build path does not honor ``sampling=False`` today — only the
     # anthropic path does — so temperature is still sent and K3 ignores it.)
     # kimi-k2.6 (2026-04-20) is natively multimodal — text + image + video via
     # the MoonViT encoder — with a 256K context; k2.5 also accepts images and is
@@ -186,6 +184,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             name="kimi-k3",
             vision=True,
             context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
         ),
         ModelEntry(
             name="kimi-k2.6",
@@ -207,24 +207,27 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # Zhipu GLM — open.bigmodel.cn (2026-08)
     # glm-5.3 (released 2026-08-14; same base as 5.2 with extended long-horizon
     # post-training; 1M ctx per the bigmodel pricing page) is the current text
-    # flagship; glm-5.2 (1M) stays. glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
-    # and glm-4.6 (200K) are current text models. Vision goes through
-    # glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type toggle
-    # per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The older
-    # glm-4*-plus line is kept deprecated so existing manifests resolve.
+    # flagship; glm-5.2 (1M) stays. GLM-5.2 及以上 support ``reasoning_effort``
+    # (max/high/low per the bigmodel core-params page) → shape "effort"; the
+    # adapter keeps ``thinking.type`` as the on/off channel and maps the
+    # levels (no "medium" on GLM). glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
+    # and glm-4.6 (200K) are current text models, on/off only. Vision goes
+    # through glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type
+    # toggle per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The
+    # older glm-4*-plus line is kept deprecated so existing manifests resolve.
     "glm": (
         ModelEntry(
             name="glm-5.3",
             vision=False,
             context_window=1_000_000,
-            thinking="toggle",
+            thinking="effort",
             thinking_default=True,
         ),
         ModelEntry(
             name="glm-5.2",
             vision=False,
             context_window=1_000_000,
-            thinking="toggle",
+            thinking="effort",
             thinking_default=True,
         ),
         ModelEntry(

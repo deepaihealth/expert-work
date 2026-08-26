@@ -1271,6 +1271,41 @@ def test_thinking_payload_toggle_vendors_ignore_level() -> None:
     assert _thinking_payload(_vendor_model("kimi", "kimi-k2.6", adaptive_thinking=True)) == on
 
 
+def test_thinking_payload_glm_52_plus_effort_levels() -> None:
+    # GLM 5.2+ supports ``reasoning_effort`` (vendor docs 2026-08) on a
+    # max/high/low scale — no "medium", so the manifest's medium rounds up
+    # to high. The thinking object stays the on/off channel alongside it.
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", effort="low")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", effort="medium")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", effort="max")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+
+
+def test_thinking_payload_glm_52_plus_toggle_semantics_kept() -> None:
+    from orchestrator.agent_factory import _thinking_payload
+
+    # Force-on with no effort keeps the bare toggle; force-off is a REAL
+    # off — GLM has no "minimal", it must not degrade like other effort
+    # vendors. Untouched manifests still send nothing (vendor default).
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=True)) == {
+        "thinking": {"type": "enabled"}
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+        "thinking": {"type": "disabled"}
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3")) is None
+
+
 def test_thinking_payload_off_catalog_compat_sends_nothing() -> None:
     # CM-L5 — thinking wire formats differ per vendor, so off-catalog
     # OpenAI-compatible models never get a blind payload.
@@ -1280,14 +1315,28 @@ def test_thinking_payload_off_catalog_compat_sends_nothing() -> None:
     assert _thinking_payload(_vendor_model("deepseek", "deepseek-reasoner", effort="high")) is None
 
 
-def test_thinking_payload_kimi_k3_always_thinking_sends_nothing() -> None:
-    # kimi-k3 is on-catalog with thinking=None (always thinking; only accepts
-    # reasoning_effort=max today). No thinking field is sent — in particular it
-    # must NOT emit the K2.x ``thinking.type`` toggle that the other kimi models
-    # use (the K3 docs forbid it).
+def test_thinking_payload_kimi_k3_effort_levels() -> None:
+    # kimi-k3 is ALWAYS thinking with a top-level ``reasoning_effort`` on the
+    # max/high/low scale, default max (platform.kimi.com thinking docs
+    # 2026-08). No "medium" → rounds up to high. It must NOT emit the K2.x
+    # ``thinking.type`` toggle (the K3 docs forbid it) — untouched manifests
+    # still send nothing (vendor default is already max).
     from orchestrator.agent_factory import _thinking_payload
 
     assert _thinking_payload(_vendor_model("kimi", "kimi-k3")) is None
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="low")) == {
+        "reasoning_effort": "low"
+    }
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="medium")) == {
+        "reasoning_effort": "high"
+    }
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", effort="max")) == {
+        "reasoning_effort": "max"
+    }
+    # No off switch on an always-thinking model — the lowest tier is the floor.
+    assert _thinking_payload(_vendor_model("kimi", "kimi-k3", thinking_enabled=False)) == {
+        "reasoning_effort": "low"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1349,9 +1398,11 @@ def test_thinking_payload_force_off_per_vendor() -> None:
     assert _thinking_payload(_vendor_model("openai", "gpt-5.5", thinking_enabled=False)) == {
         "reasoning_effort": "minimal"
     }
+    # deepseek exposes a REAL off via the OpenAI-format thinking object
+    # (thinking-mode docs 2026-08) — "minimal" is not on its effort scale.
     assert _thinking_payload(
         _vendor_model("deepseek", "deepseek-v4-pro", thinking_enabled=False)
-    ) == {"reasoning_effort": "minimal"}
+    ) == {"thinking": {"type": "disabled"}}
     # qwen budget -> enable_thinking false.
     assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", thinking_enabled=False)) == {
         "enable_thinking": False

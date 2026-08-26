@@ -121,16 +121,16 @@ def test_current_context_windows() -> None:
 
 
 def test_kimi_k3_capability_bits() -> None:
-    # kimi-k3: native vision, 1M context, and thinking is None — K3 is always
-    # thinking and only accepts reasoning_effort=max today, so no thinking field
-    # is sent (always-thinking → None; the compat build gate then rejects a
-    # manifest that sets effort / thinking_enabled). See the catalog comment.
+    # kimi-k3: native vision, 1M context. thinking is "effort" — K3 is always
+    # thinking with a top-level reasoning_effort on the max/high/low scale
+    # (default max, platform.kimi.com thinking docs 2026-08); the adapter maps
+    # the unified levels and floors "off" at low (no off switch on K3).
     k3 = catalog_entry("kimi", "kimi-k3")
     assert k3 is not None
     assert k3.vision is True
     assert k3.context_window == 1_000_000
-    assert k3.thinking is None
-    assert k3.thinking_default is False
+    assert k3.thinking == "effort"
+    assert k3.thinking_default is True
     assert k3.deprecated is False
     # It is the current flagship — selectable in the dropdown.
     assert "kimi-k3" in {e.name for e in models_for_provider("kimi")}
@@ -138,11 +138,19 @@ def test_kimi_k3_capability_bits() -> None:
 
 def test_2026_08_additions_capability_bits() -> None:
     """2026-08 additions verified against vendor docs: glm-5.3 (text, 1M,
-    thinking.type toggle), glm-5v-turbo (vision Agent base, 200K, toggle),
-    qwen3.8-max (natively multimodal, 1M, enable_thinking budget)."""
+    reasoning_effort per the bigmodel core-params page — GLM-5.2 及以上),
+    glm-5v-turbo (vision Agent base, 200K, toggle), qwen3.8-max (natively
+    multimodal, 1M, enable_thinking budget)."""
     glm53 = catalog_entry("glm", "glm-5.3")
     assert glm53 is not None
-    assert glm53.vision is False and glm53.thinking == "toggle"
+    assert glm53.vision is False and glm53.thinking == "effort"
+    glm52 = catalog_entry("glm", "glm-5.2")
+    assert glm52 is not None
+    assert glm52.thinking == "effort"
+    # GLM ≤5.1 stays on/off only — the effort scale is 5.2+.
+    glm51 = catalog_entry("glm", "glm-5.1")
+    assert glm51 is not None
+    assert glm51.thinking == "toggle"
     glm5v = catalog_entry("glm", "glm-5v-turbo")
     assert glm5v is not None
     assert glm5v.vision is True and glm5v.thinking == "toggle"
