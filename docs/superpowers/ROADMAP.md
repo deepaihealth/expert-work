@@ -428,9 +428,15 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-19 | **(第四轮文档终审 C-1 核代码顺带发现,pre-existing)** `check_admission` → `QuotaService.check` 对租户配置的**全部** bucket 维度逐个扣费,不按 `resource_kind` 过滤:发起对话 / 产物下载各扣 `image_upload_count_30d` 1 次、`image_storage_bytes` 1 字节(如配置了这两行);图片存储写满后发起对话也会 429 `dimension=image_storage_bytes`。另:redis Lua 对 `refill_rate=0` 的黏性维度算 `retry_ms = need*1000/0`(除零 → inf → 整数化不可控),`Retry-After` 值无意义;in-memory 用 `max(rate,1e-9)` 得到天文数字。文档已按「按字节配额重试无效、先读 dimension」措辞绕开;代码侧应按 resource_kind 选维度 + 黏性维度不给 Retry-After |
 | B-20 | ~~**审批列表分流:安全审批 vs 业务澄清混排**~~ **✅ 主体已交付(2026-08-23)**:①两 tab(协议单源分类 `SAFETY/CLARIFICATION_REASON_KINDS` + `GET /v1/approvals?kind_class=` + 前端「安全审批/待确认」tab 带对侧徽章)✅;③超时按类配(`policies.clarification_timeout_s` 默认 1h,mint 按类选,sweep 对澄清单的超时理由改为「按保守默认继续并说明假设」——ask_for_approval reject 非终局,agent 收到即续跑)✅;④ decide/resume 三端点补 `require("session","write")`,堵 viewer 可裁任意单的洞 ✅(「澄清单发起人自决」推迟:run 上没记发起员工身份,随 D-6 一起做)。**剩余**:② 通知路由——澄清单对话内横幅归 D-6,安全单 alertmanager 告警归 X-7 |
 | B-21 | **(#1265 终审 follow-up,2026-08-24)** 折叠头(chevron + 计数标题按钮)三处重复实现:`PlanCard`/`ProcessStrip`/`FileTree` 与新加的 `VariablesForm` 各写一份展开/收起头,样式与 aria 语义略有分歧;抽共享 `CollapsibleHeader` 组件统一 |
-| B-22 | **(2026-08-24 记账,两周内咬了两个 PR)** `ConversationDetail` 导出相关 e2e spec flake:偶发超时/竞态假红,复现率低但反复出现在无关 PR 的 CI 上;需定位竞态源(疑似导出触发与页面 ready 的时序)并加确定性等待或隔离 |
+| B-22 | ~~`ConversationDetail` 导出相关 e2e spec flake~~ **✅ 已根治(2026-08-26,#1307)**:根因=growth-repair effect 读未 gate 的 `convo?.runs`(stale 线程)→ 每次切线程发 `loadHistory(newThreadId, undefined)` 错租户垃圾请求;修=改读 `viewedConvo?.runs`(与主重建 effect 同 gate),两只 flake(导出/跨租户)同源同灭 |
 | B-23 | **(BUG-3 修复时记账,2026-08-24)** 后端 `GET /v1/skills` 的 `platform_items` 单次拼装上限 200(`list_platform_skills(limit=200)`)静默截断:平台库超 200 条 ACTIVE 时租户侧少看到技能且无任何提示;前端 SkillPicker 已走 cursor 拉全 tenant items(#1265),platform_items 这半边要么后端跟 cursor,要么至少响应里带 truncated 标记 |
 | B-24 | **(2026-08-24 记账)** CI `pip-audit` 偶发网络超时假红;给该 step 加 retry(或本地 advisory DB 缓存),别再靠手动 re-run |
+| B-25 | **(BUG-19 真栈首证,2026-08-26)** worker 帧的 `tool_result_excerpt` **裸透传完整 spotlighting 围栏**(`«UNTRUSTED nonce»` + `▁` 替换)不做 unspotlight —— run 02ab4cfc 实证;对接方(deep-ai-health)已自带剥离器兜住,但这是平台该做的:excerpt 生成处(worker 帧组装)统一还原或剥围栏,别把内部防注入形态漏到对外线路 |
+| B-26 | **(BUG-19b 硬闸清点顺带发现,2026-08-26)** 子 Agent/worker 构建路径的**静默防御降级**:`judges`/`tool_budget`/`deadline` 等依赖在 `build_agent` 无硬闸、child 路径不传就静默缺失 —— 主 Agent 有的防御,子代默默没有。要么补传对齐,要么至少构建时 log warning + 指标,把「降级」变成可观测事实 |
+| B-27 | **(批 D #1268 终审 follow-up,2026-08-24 记账未入册)** `threads/` 工作区子目录**删除生命周期缺失**:会话 purge 不清对应 threads/ 目录、无 janitor GC,长期用户工作区只增不减;挂会话 purge 钩子 + janitor 扫描双路 |
+| B-28 | **(产物清单契约 #1305 停删后果,2026-08-26)** 对接方停删后**平台侧产物生命周期归平台管**:artifact/artifact_version 表与工作区文件只增不减(原靠对方收割后删除兜着)。要定留存策略(按租户/按 kind TTL?对齐 X-4② 90 天硬删?)并接 retention 机制;`archived_object_key` 字段仍是预留未接 |
+| B-29 | **(SSE 心跳 program 三条遗留,2026-08 记账未入册;共性=「该有信号处无信号」)** ① 对外 `/items` 续传 `limit` 触顶静默截断无 truncated 标记;② replay 中段 seq gap 静默跳过不发 gap 信号;③ `release.sh` 个别失败分支 exit 0 假成功 |
+| B-30 | **(三厂商档位对齐 #1308 顺带,2026-08-26)** `kimi-k2.7-code` 上架与否待拍板:官方文档新型号(思考不可关、`thinking.keep` 固定 `"all"` 传其他值报错);上架需 catalog entry + `thinking.keep` 适配层支持(现在不发 keep,K2.6 默认 null 无碍) |
 
 ---
 
