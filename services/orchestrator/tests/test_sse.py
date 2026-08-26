@@ -1441,3 +1441,138 @@ async def test_sse_consumer_hide_events_filters_frames_but_keeps_ids_monotonic()
     assert b"event: system_prompt" not in wire
     assert b"secret" not in wire
     assert b"event: metadata" in wire and b"event: updates" in wire and b"event: end" in wire
+
+
+# ---------------------------------------------------------------------------
+# 产物清单契约 —— end 帧 / 终局固化 / resume 续记
+# ---------------------------------------------------------------------------
+
+
+async def _end_entry(bridge: InMemoryStreamBridge, run_id: Any) -> Any:
+    """Subscribe until the end frame and return it (counterpart of _drain)."""
+    async for entry in bridge.subscribe(run_id, heartbeat_interval=5.0):
+        if is_end(entry):
+            return entry
+    raise AssertionError("stream ended without an end frame")
+
+
+@pytest.mark.asyncio
+async def test_end_frame_carries_explicit_empty_artifacts() -> None:
+    """零登记的 run(追问轮形态)end 帧带显式 ``artifacts: []``。
+
+    旧代码 end data 只有 {status} —— 本断言必红。「零交付是明说的,不是
+    靠没看到推断的」正是本契约的核心语义。
+    """
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    graph = _ScriptedGraph(chunks=[{"agent": {"step_count": 1}}])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    end = await _end_entry(bridge, record.run_id)
+    assert end.data["status"] == "success"
+    assert end.data["artifacts"] == []
+
+
+@dataclass
+class _RecordingGraph(_ScriptedGraph):
+    """把 config 里的产物记录器在流式期间调起来 —— 模拟 save_artifact 登记。"""
+
+    manifest_entries: list[dict[str, Any]] = field(default_factory=list)
+
+    async def astream(
+        self,
+        input: Any,
+        config: Any = None,
+        *,
+        stream_mode: Any = None,
+    ) -> AsyncIterator[Any]:
+        from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
+
+        recorder = (config or {}).get("configurable", {}).get(ARTIFACT_RECORDER_KEY)
+        assert callable(recorder), "run_agent must inject the artifact recorder"
+        for e in self.manifest_entries:
+            recorder(e)
+        async for chunk in super().astream(input, config, stream_mode=stream_mode):
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_registered_artifacts_land_on_end_and_persist_with_terminal_status() -> None:
+    from expert_work.runtime.runs.store import InMemoryRunStore
+
+    store = InMemoryRunStore()
+    bridge = InMemoryStreamBridge()
+    rm = RunManager(store)
+    record = await _new_record(rm)
+    e1 = {"name": "plan.json", "kind": "data", "version": 1, "created_at": "2026-08-26T00:00:00"}
+    e1_v2 = {"name": "plan.json", "kind": "data", "version": 2, "created_at": "2026-08-26T00:01:00"}
+    e2 = {"name": "plan.pptx", "kind": "document", "version": 1, "created_at": "2026-08-26T00:02:00"}
+    graph = _RecordingGraph(
+        chunks=[{"agent": {"step_count": 1}}], manifest_entries=[e1, e1_v2, e2]
+    )
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    # 同名重登记 newest-wins(与前端产物 chips 同义),不同名并列。
+    end = await _end_entry(bridge, record.run_id)
+    assert end.data["artifacts"] == [e1_v2, e2]
+    # 与终态同一次写落库 —— 任何读到终态的消费者必然读到清单。
+    row = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert row is not None and row.status is RunStatus.SUCCESS
+    assert row.artifacts == [e1_v2, e2]
+
+
+@pytest.mark.asyncio
+async def test_resume_seeds_manifest_from_persisted_artifacts() -> None:
+    """审批续跑不丢暂停前的登记 —— 续跑段的清单在旧清单上接着记。
+
+    旧行为(无 seeding)会把 PAUSED 时固化的清单整表覆盖成续跑段新登记,
+    第一条断言必红。
+    """
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs.store import InMemoryRunStore
+
+    store = InMemoryRunStore()
+    bridge = InMemoryStreamBridge()
+    rm = RunManager(store)
+    record = await rm.create(
+        run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL, is_resume=True,
+    )
+    pre_pause = {"name": "draft.md", "kind": "document", "version": 1, "created_at": "x"}
+    await store.set_status(
+        run_id=record.run_id, tenant_id=record.tenant_id, status=RunStatus.PAUSED,
+        updated_at=datetime.now(UTC), artifacts=[pre_pause],
+    )
+    post = {"name": "final.pptx", "kind": "document", "version": 1, "created_at": "y"}
+    graph = _RecordingGraph(chunks=[{"agent": {"step_count": 1}}], manifest_entries=[post])
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    end = await _end_entry(bridge, record.run_id)
+    assert pre_pause in end.data["artifacts"]
+    assert post in end.data["artifacts"]

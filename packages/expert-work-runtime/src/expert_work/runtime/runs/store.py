@@ -163,12 +163,15 @@ class RunStore(abc.ABC):
         updated_at: datetime,
         error: str | None = None,
         finished_at: datetime | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Update a run's status; return ``True`` iff the row exists.
 
-        ``error`` / ``finished_at`` are written only when not ``None``
-        so a non-terminal transition (e.g. → RUNNING) never clears a
-        verdict an earlier terminal write recorded.
+        ``error`` / ``finished_at`` / ``artifacts`` are written only when
+        not ``None`` so a non-terminal transition (e.g. → RUNNING) never
+        clears a verdict an earlier terminal write recorded. ``artifacts``
+        (产物清单契约) is the run's registration snapshot — terminal calls
+        pass ``[]`` for a zero-delivery run, never ``None``.
         """
 
     @abc.abstractmethod
@@ -601,6 +604,7 @@ class InMemoryRunStore(RunStore):
         updated_at: datetime,
         error: str | None = None,
         finished_at: datetime | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> bool:
         row = self._rows.get(run_id)
         if row is None or row.tenant_id != tenant_id:
@@ -611,6 +615,8 @@ class InMemoryRunStore(RunStore):
             updated_at=updated_at,
             error=error if error is not None else row.error,
             finished_at=finished_at if finished_at is not None else row.finished_at,
+            # 谓词与 SQL 店 byte-同义:None 不碰既有清单(非终局转换)。
+            artifacts=artifacts if artifacts is not None else row.artifacts,
         )
         return True
 
@@ -997,6 +1003,7 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         enqueued_input=row.enqueued_input,
         idempotency_key=row.idempotency_key,
         request_digest=row.request_digest,
+        artifacts=row.artifacts,
     )
 
 
@@ -1029,6 +1036,7 @@ class SqlRunStore(RunStore):
                     enqueued_input=info.enqueued_input,
                     idempotency_key=info.idempotency_key,
                     request_digest=info.request_digest,
+                    artifacts=info.artifacts,
                 )
             )
             try:
@@ -1052,12 +1060,16 @@ class SqlRunStore(RunStore):
         updated_at: datetime,
         error: str | None = None,
         finished_at: datetime | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> bool:
         values: dict[str, Any] = {"status": status.value, "updated_at": updated_at}
         if error is not None:
             values["error"] = error
         if finished_at is not None:
             values["finished_at"] = finished_at
+        # 谓词与 in-memory 店 byte-同义:None 不碰既有清单(非终局转换)。
+        if artifacts is not None:
+            values["artifacts"] = artifacts
         async with self._sf() as session:
             result = await session.execute(
                 update(AgentRunRow)

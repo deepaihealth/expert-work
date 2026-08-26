@@ -133,6 +133,11 @@ class RunInfo:
     #: a *different* body can be distinguished from a genuine retry.
     #: ``None`` whenever ``idempotency_key`` is ``None``.
     request_digest: str | None = None
+    #: 产物清单契约 —— run 终局时固化的产物登记快照
+    #: ``[{name, kind, version, created_at}]``。``None`` = 历史 run /
+    #: 异常终局无记录;``[]`` = 零登记(追问轮);快照不随产物后续删除
+    #: 回写。终局 ``set_status`` 与状态同一次写入。
+    artifacts: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, slots=True)

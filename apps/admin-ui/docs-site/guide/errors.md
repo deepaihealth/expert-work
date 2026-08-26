@@ -34,6 +34,7 @@
 | [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物下载 / 产物删除 | 产物不存在、已删除，或不属于这个 `user_id`。核对 `user_id` 与产物 `name` |
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
 | [`SESSION_NOT_BOUND`](./run-control#_4-2-审批决策) | 409 | 审批决策 | run 所在会话没有绑定 Agent。联系租户管理员 |
+| [`ARTIFACT_VERSION_MISMATCH`](#_8-7-409-冲突) | 409 | 产物下载 | 请求带的 `version` 与最新版本不一致。改用最新版或按业务异常处理 |
 | [`AGENT_DELETED`](./run-control#_4-2-审批决策) | 410 | 审批决策 | 会话绑定的 Agent 已被删除，不可恢复。改用其它 `agent_code` |
 | [`UPLOAD_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 上传附件 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
 | [`ARTIFACT_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 产物下载 | 产物文件超过单文件下载上限（64 MiB）。重试无效 |
@@ -186,11 +187,13 @@
 
 `RUN_NOT_FOUND` 与 `APPROVAL_NOT_FOUND`：取消 run（`:cancel`）与审批决策（`:decide`）两个端点的归属校验与审批查找失败。这两个端点还有各自特有的 409 / 403 / 410 / 422，完整说明见 [4 对话过程中的控制](./run-control)。
 
-## 8.7 409 审批冲突
+## 8.7 409 冲突
 
-只有审批决策端点（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`）会返回 409，标准格式，两个错误码：`APPROVAL_CONFLICT` 表示这条审批已经被决定过，包括重复提交和并发提交中落败的一方；`SESSION_NOT_BOUND` 表示这个 run 所在的会话没有绑定 Agent。
+两个端点会返回 409，都是标准格式。
 
-处理方式：`APPROVAL_CONFLICT` 不要重复提交决策，`SESSION_NOT_BOUND` 联系租户管理员。两个错误码的完整触发条件见 [4.2 审批决策](./run-control#_4-2-审批决策)。
+**审批决策**（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`）：`APPROVAL_CONFLICT` 表示这条审批已经被决定过，包括重复提交和并发提交中落败的一方，不要重复提交决策；`SESSION_NOT_BOUND` 表示这个 run 所在的会话没有绑定 Agent，联系租户管理员。两个错误码的完整触发条件见 [4.2 审批决策](./run-control#_4-2-审批决策)。
+
+**产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 与服务端最新版本不一致——这个名字在你的清单之后又被登记过新版本，被覆盖的旧版本内容不再保留。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
 
 ## 8.8 410 Agent 已被删除
 

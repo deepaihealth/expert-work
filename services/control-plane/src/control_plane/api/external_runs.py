@@ -153,6 +153,9 @@ def build_external_runs_router() -> APIRouter:
                             "created_at": r.created_at.isoformat() if r.created_at else None,
                             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                             "error": r.error,
+                            # 产物清单契约 —— 覆盖「没消费到 end 就终局」的
+                            # 重连收尾重建;null = 历史 run 无记录。
+                            "artifacts": r.artifacts,
                         }
                         for r in rows
                     ],

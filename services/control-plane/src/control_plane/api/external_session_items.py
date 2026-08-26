@@ -485,6 +485,9 @@ def build_external_session_items_router() -> APIRouter:
                             "created_at": run.created_at.isoformat() if run.created_at else None,
                             "duration_ms": _duration_ms(run),
                             "error": run.error,
+                            # 产物清单契约 —— run 行固化的登记快照;null =
+                            # 历史 run 无记录(≠ 零交付,零交付是 [])。
+                            "artifacts": run.artifacts,
                         }
                         for run in turns
                     ],

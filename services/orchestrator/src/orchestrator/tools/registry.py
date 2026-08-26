@@ -244,6 +244,12 @@ class ToolContext:
     #: ``None`` when unwired (tests / eval / no config service) — delegations
     #: run ungated, same as before this gate existed.
     delegation_gate: DelegationGate | None = None
+    #: 产物清单契约 —— per-run artifact-registration recorder. ``save_artifact``
+    #: 每次成功登记调用一次(同步,append 语义);run 终局时 ``sse.run_agent``
+    #: 把累积清单随终态一并固化并放上 ``end`` 帧。Injected per-run via
+    #: ``ARTIFACT_RECORDER_KEY``;``None`` when unwired (tests / eval) —
+    #: 登记照常发生,只是本 run 无清单记录。
+    artifact_recorder: Callable[[dict[str, Any]], None] | None = None
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

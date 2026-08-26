@@ -110,6 +110,7 @@ async def build_events_response(
     plan = await build_event_producer(
         run_id=run.run_id,
         run_status=run.status,
+        run_artifacts=run.artifacts,
         event_store=event_store,
         stream_bridge=stream_bridge,
         since_seq=since_seq,

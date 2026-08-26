@@ -103,6 +103,7 @@ from orchestrator.stream_items import (
 from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
 from orchestrator.trajectory import (
     TrajectoryOutcome,
@@ -401,6 +402,21 @@ async def run_agent(
     # branch sets it). Each terminal branch below updates ``session_outcome``
     # before its ``await`` chain so ``_session_duration_seconds`` carries
     # the correct label even if a later step in that branch raises.
+    # 产物清单契约 —— 本 run 的产物登记累积器(name 去重、后登记覆盖,与
+    # 前端产物 chips 的 newest-wins 同义)。resume(审批续跑)先把 PAUSED 时
+    # 固化的清单读回来接着记,否则续跑段会把暂停前的登记整表覆盖掉。
+    artifact_manifest: dict[str, dict[str, Any]] = {}
+    if getattr(record, "is_resume", False):
+        for e in await run_manager.persisted_artifacts(run_id, tenant_id=record.tenant_id) or []:
+            if isinstance(e, dict) and e.get("name"):
+                artifact_manifest[str(e["name"])] = dict(e)
+
+    def _record_artifact(entry: dict[str, Any]) -> None:
+        artifact_manifest[str(entry.get("name"))] = entry
+
+    def _manifest_snapshot() -> list[dict[str, Any]]:
+        return list(artifact_manifest.values())
+
     session_started = time.monotonic()
     session_outcome = "error"
     # Stream HX-3 — count of in-worker transient retries this run took.
@@ -538,6 +554,7 @@ async def run_agent(
     effective_config["configurable"][TOKEN_SINK_KEY] = _publish_token
     effective_config["configurable"][WORKER_EVENT_SINK_KEY] = _publish_worker
     effective_config["configurable"][GUARD_SINK_KEY] = _publish_guard
+    effective_config["configurable"][ARTIFACT_RECORDER_KEY] = _record_artifact
     if token_budget > 0:
         effective_config["configurable"][TOKEN_BUDGET_KEY] = TokenBudget(limit=token_budget)
     # Stream 9.4 (HA failover) — renew the ownership lease while executing so a
@@ -720,7 +737,7 @@ async def run_agent(
         # status write lands, so a client polling right after ``set_status``
         # sees a fully-persisted replay (bounded by _PERSIST_DRAIN_TIMEOUT_S).
         await _drain_persist_queue()
-        await run_manager.set_status(run_id, final)
+        await run_manager.set_status(run_id, final, artifacts=_manifest_snapshot())
         if final is RunStatus.PAUSED and pending_request is not None:
             # Register the paused run in the durable ``agent_approval``
             # table + emit APPROVAL_REQUESTED. The table — not the
@@ -779,7 +796,9 @@ async def run_agent(
         # normal interrupted finish, not a failure.
         session_outcome = "interrupted"
         await _drain_persist_queue()
-        await run_manager.set_status(run_id, RunStatus.INTERRUPTED)
+        await run_manager.set_status(
+            run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot()
+        )
         logger.info("run_agent.cancelled_cooperatively run_id=%s", run_id)
         await _emit_run_end_audit(
             audit_logger,
@@ -806,7 +825,9 @@ async def run_agent(
         # loop teardown is unreliable (same reason
         # ``_emit_run_end_audit`` is skipped on this path).
         session_outcome = "cancelled"
-        await run_manager.set_status(run_id, RunStatus.INTERRUPTED)
+        await run_manager.set_status(
+            run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot()
+        )
         logger.info("run_agent.cancelled run_id=%s", run_id)
         raise
     except MaxStepsExceededError as exc:
@@ -817,7 +838,9 @@ async def run_agent(
         session_outcome = "max_steps"
         if retry_attempts:
             run_retry_total.labels(outcome="failed_again").inc()
-        await run_manager.set_status(run_id, RunStatus.ERROR, error=str(exc))
+        await run_manager.set_status(
+            run_id, RunStatus.ERROR, error=str(exc), artifacts=_manifest_snapshot()
+        )
         logger.warning(
             "run_agent.max_steps_exceeded run_id=%s step_count=%d max_steps=%d",
             run_id,
@@ -851,7 +874,9 @@ async def run_agent(
         session_outcome = "error"
         if retry_attempts:
             run_retry_total.labels(outcome="failed_again").inc()
-        await run_manager.set_status(run_id, RunStatus.ERROR, error=str(exc))
+        await run_manager.set_status(
+            run_id, RunStatus.ERROR, error=str(exc), artifacts=_manifest_snapshot()
+        )
         logger.exception("run_agent.failed run_id=%s", run_id)
         error_payload = {"message": str(exc), "name": type(exc).__name__}
         await _publish_frame("error", error_payload)
@@ -901,7 +926,11 @@ async def run_agent(
         _session_duration_seconds.labels(outcome=session_outcome).observe(
             time.monotonic() - session_started
         )
-        await bridge.publish_end(run_id, status=_external_end_status(session_outcome))
+        await bridge.publish_end(
+            run_id,
+            status=_external_end_status(session_outcome),
+            artifacts=_manifest_snapshot(),
+        )
         # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
         # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
         # 分支(正常结束 / RunCancelledError / CancelledError / MaxSteps /
@@ -1539,12 +1568,16 @@ async def sse_consumer(
                 # stream 模式);只改 ``_run_event_stream.py`` 的话,两条流的
                 # ``end`` 帧字段集合会分叉。
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
+                arts = entry.data.get("artifacts") if isinstance(entry.data, dict) else None
                 if converter is not None:
                     # ``channel="final"`` 的改判必须排在 ``end`` 之前 —— 判定要
                     # 向后看一条消息,只有到这里才知道后面没有了。
                     for name, payload in converter.finalize():
                         yield format_sse(name, payload)
-                yield format_sse("end", end_frame_data(run_id=record.run_id, status=status))
+                yield format_sse(
+                    "end",
+                    end_frame_data(run_id=record.run_id, status=status, artifacts=arts),
+                )
                 return
 
             if entry.event in hide_events:
@@ -1587,7 +1620,12 @@ async def sse_consumer(
 EXTERNAL_END_STATUSES: frozenset[str] = frozenset({"success", "paused", "interrupted", "error"})
 
 
-def end_frame_data(*, run_id: UUID, status: str | None) -> dict[str, Any]:
+def end_frame_data(
+    *,
+    run_id: UUID,
+    status: str | None,
+    artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """``end`` 帧的 ``data`` —— **两条 SSE 路径共用的唯一构造口**。
 
     路径一是 ``sse_consumer``(``POST /v1/agents/{code}/runs`` 的 ``mode:
@@ -1598,11 +1636,18 @@ def end_frame_data(*, run_id: UUID, status: str | None) -> dict[str, Any]:
 
     ``status`` 认不出来时归 ``error``:调用方总该知道 run 是怎么结束的,认不
     出来本身就说明出了问题,而对外契约只允许四值。
+
+    ``artifacts``(产物清单契约)—— 本 run 的产物登记快照,列表本身可为空
+    (追问轮显式零交付);``None``(迁移前的历史 run 无记录)时**字段缺席**
+    而不是放 null,文档口径:缺席 = 老 run 无记录,别当零交付。
     """
-    return {
+    data: dict[str, Any] = {
         "status": status if status in EXTERNAL_END_STATUSES else "error",
         "run_id": str(run_id),
     }
+    if artifacts is not None:
+        data["artifacts"] = artifacts
+    return data
 
 
 def format_sse(event: str, data: Any, *, event_id: str | None = None) -> bytes:

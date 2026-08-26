@@ -37,7 +37,7 @@ Three more frames are minted by the API layer, not by `sse.py` — they describe
 
 | `event:` | When |
 |---|---|
-| `end` | Terminal marker for this connection; a reconnect gets a fresh one |
+| `end` | Terminal marker for this connection; a reconnect gets a fresh one. `data` = `{status, run_id, artifacts}` — `artifacts` is the run's artifact-registration snapshot (产物清单契约): `[]` means an explicit zero-delivery turn; the key is absent only for pre-migration historical runs (no record ≠ zero delivery). The same snapshot is readable from `agent_run.artifacts` via listRuns and the `/items` `runs[]` metadata |
 | `gap` | Replay found a hole in the persisted seq range |
 | `truncated` | Replay hit the page limit; carries `next_seq` |
 

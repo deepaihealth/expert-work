@@ -368,6 +368,8 @@ async def test_items_renders_one_turn_end_to_end(ctx: _Ctx) -> None:
             "created_at": body["runs"][0]["created_at"],
             "duration_ms": 5000,
             "error": None,
+            # 产物清单契约 —— 迁移前建的行无记录 = null(≠ 零交付 [])。
+            "artifacts": None,
         }
     ]
     assert body["runs"][0]["created_at"] is not None
