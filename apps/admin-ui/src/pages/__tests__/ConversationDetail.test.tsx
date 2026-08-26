@@ -658,6 +658,10 @@ describe("ConversationDetail", () => {
 
       renderPage();
 
+      // Deflake —— 导出读的是「已回放进 state 的事件」,回放没落完就点会
+      // 导出半截流(events 数/来源断言时序性失败,咬过 #1305 等多个 PR)。
+      // 与兄弟用例同款:等回放正文可见 = 回放已完成。
+      expect(await screen.findByText("replayed answer")).toBeInTheDocument();
       fireEvent.click(await screen.findByTestId("playground-export-json"));
 
       await waitFor(() => expect(downloaded).toEqual([`expert-work-events-${RUN_1}.json`]));
@@ -839,6 +843,10 @@ describe("ConversationDetail", () => {
       // Thread B's rebuild ran under B's own tenant (D3 lifted); with no
       // runs it degraded to the flat block, so nothing replayed.
       expect(runsSpy).toHaveBeenCalledWith(THREAD_B, CROSS_TENANT);
+      // Deflake 负钉 —— 修复前,切线程瞬间会拿**旧线程**的 runs 触发成长
+      // 复配,给新 threadId 发一次 undefined 租户的垃圾加载(本断言在旧
+      // 代码下必红);错租户请求从此不该存在,而不只是"最终有对的那次"。
+      expect(runsSpy).not.toHaveBeenCalledWith(THREAD_B, undefined);
       expect(streamSpy).not.toHaveBeenCalled();
     });
 
