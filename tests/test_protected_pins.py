@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "ci"))
 
-from check_protected_pins import check  # noqa: E402
+from check_protected_pins import check
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
