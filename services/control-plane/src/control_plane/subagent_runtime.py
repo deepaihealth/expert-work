@@ -273,6 +273,12 @@ def make_child_agent_builder(
             tenant_id=tenant_id,
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
+            # skill_store 此前漏传(只喂了 skill_resolver)——凡 spec 声明技能
+            # 创作 builtin(remember/author_skill 系,现网 Agent 全带)的委派
+            # 构建一律死在 agent_factory 的 skill_store 硬闸,全平台委派从未
+            # 真正跑通过(2026-08-26 首次真栈触发即撞上)。与主构建路径
+            # (runtime.make_agent_builder)对齐。
+            skill_store=skill_store,
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
             http_client=http_client,
@@ -436,6 +442,10 @@ def make_worker_build_fn(
             tenant_id=tenant_id,
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
+            # 同 make_child_agent_builder 的修注:skill_store 漏传把带技能创作
+            # builtin 的父 Agent 的 spawn_worker 全数变成构建期 AgentFactoryError
+            # (worker 继承父 spec,闸在 worker 构建时同样触发)。
+            skill_store=skill_store,
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
             http_client=http_client,
