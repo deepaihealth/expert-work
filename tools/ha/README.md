@@ -1,10 +1,14 @@
-# Stream 9.4 / 9.5 — HA live E2E
+# Stream 9.4 / 9.5 + 多副本 CAS 守卫 — HA live E2E
 
-Two live-proof harnesses share this dir:
+Three live-proof harnesses share this dir:
 
 - **`verify_failover.py`** (Stream 9.4) — orphaned-run automatic hot-handoff.
 - **`verify_queue.py`** (Stream 9.5) — distributed run-queue cross-instance drain
   (see [§ Stream 9.5](#stream-95--distributed-run-queue-live-e2e) below).
+- **`verify_cancel.py`**(多副本 CAS 守卫执行面)— cross-replica cancel:
+  非属主副本发 cancel → durable CAS → 属主心跳 CAS 失败 → abort。四断言:
+  行立即 interrupted+user_cancel / blue 在心跳检测上界内停(end 帧)/ 属主
+  心跳冻结 / 不复活。用法与两个姊妹脚本一致(`EXPERT_WORK_API_TOKEN` + 双色栈)。
 
 ---
 
