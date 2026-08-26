@@ -31,7 +31,8 @@ from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.skill import SkillStore
-from expert_work.protocol import AgentSpec, SystemPromptSpec, ToolSpecEntry
+from expert_work.protocol import AgentSpec, BuiltinToolSpec, SystemPromptSpec, ToolSpecEntry
+from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.secret_store import SecretStore
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
 from orchestrator import BuiltAgent, MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
@@ -58,6 +59,30 @@ def _worker_system_prompt(role: str | None) -> str:
         "result as your final message — it is reported straight back to the "
         "orchestrator, which sees none of your intermediate work."
     )
+
+
+def _without_manage_task(spec: AgentSpec) -> AgentSpec:
+    """Strip the ``manage_task`` builtin from a delegated build's spec.
+
+    「子 Agent / worker 不排任务」是既定设计意图(app.py 主构建器注释:
+    trigger_store *only the main builder*)。此前的实现方式是「不给子构建器
+    trigger_store」—— 但 build_agent 对「spec 声明 manage_task 而无
+    TriggerStore」是硬闸,于是父 Agent 带 manage_task 时**整个委派构建**
+    直接炸(BUG-19b,真栈 run 8829abdf 三次 spawn_worker 全败于此)。
+    意图的正确表达是「子代 spec 里没有这个工具」:LLM 看不到它,构建也
+    不再撞闸。spec 未声明 manage_task 时原样返回(缓存/模型身份零扰动)。
+    """
+    has_it = any(
+        isinstance(e, BuiltinToolSpec) and e.name == "manage_task" for e in spec.spec.tools
+    )
+    if not has_it:
+        return spec
+    kept = [
+        e
+        for e in spec.spec.tools
+        if not (isinstance(e, BuiltinToolSpec) and e.name == "manage_task")
+    ]
+    return spec.model_copy(update={"spec": spec.spec.model_copy(update={"tools": kept})})
 
 
 def _filter_worker_tools(tools: list[ToolSpecEntry], allowed: list[str]) -> list[ToolSpecEntry]:
@@ -97,7 +122,13 @@ def synthesize_worker_spec(
     worker_body = body.model_copy(
         update={
             "system_prompt": SystemPromptSpec(template=_worker_system_prompt(role)),
-            "tools": _filter_worker_tools(body.tools, allowed_toolsets),
+            # BUG-19b —— 与下面剥 triggers **块**同理由,连 manage_task **工具**
+            # 一起剥:worker 无 TriggerStore,留着必撞 build_agent 硬闸。
+            "tools": [
+                t
+                for t in _filter_worker_tools(body.tools, allowed_toolsets)
+                if not (isinstance(t, BuiltinToolSpec) and t.name == "manage_task")
+            ],
             "subagents": [],
             "memory": None,
             "triggers": [],
@@ -154,6 +185,8 @@ def make_child_agent_builder(
     platform_mcp_pool_provider: PlatformMcpPoolProvider | None = None,
     user_mcp_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None,
     skill_store: SkillStore | None = None,
+    # BUG-19b —— 子代的技能创作工具(#1302 起可构建)此前在无审计状态下跑。
+    audit_logger: AuditLogger | None = None,
     # skill-asset-store — dual-read for externalized skill supporting files.
     skill_asset_store: SkillAssetStore | None = None,
     skill_activity_recorder: SkillActivityRecorder | None = None,
@@ -263,7 +296,9 @@ def make_child_agent_builder(
         if user_pool is not None:
             call_tool_env = replace(call_tool_env, user_mcp_oauth_pool=user_pool)
         built = await build_agent(
-            record.spec,
+            # BUG-19b —— 子 Agent 不排任务(既定意图):spec 层剥 manage_task,
+            # 而不是让缺席的 TriggerStore 炸掉整个委派构建。
+            _without_manage_task(record.spec),
             secret_store=secret_store,
             checkpointer=checkpointer,
             tool_env=call_tool_env,
@@ -273,6 +308,7 @@ def make_child_agent_builder(
             tenant_id=tenant_id,
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
+            audit_logger=audit_logger,
             # skill_store 此前漏传(只喂了 skill_resolver)——凡 spec 声明技能
             # 创作 builtin(remember/author_skill 系,现网 Agent 全带)的委派
             # 构建一律死在 agent_factory 的 skill_store 硬闸,全平台委派从未
@@ -361,6 +397,8 @@ def make_worker_build_fn(
     platform_mcp_pool_provider: PlatformMcpPoolProvider | None = None,
     user_mcp_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None,
     skill_store: SkillStore | None = None,
+    # BUG-19b —— 子代的技能创作工具(#1302 起可构建)此前在无审计状态下跑。
+    audit_logger: AuditLogger | None = None,
     # skill-asset-store — dual-read for externalized skill supporting files.
     skill_asset_store: SkillAssetStore | None = None,
     skill_activity_recorder: SkillActivityRecorder | None = None,
@@ -442,6 +480,7 @@ def make_worker_build_fn(
             tenant_id=tenant_id,
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
+            audit_logger=audit_logger,
             # 同 make_child_agent_builder 的修注:skill_store 漏传把带技能创作
             # builtin 的父 Agent 的 spawn_worker 全数变成构建期 AgentFactoryError
             # (worker 继承父 spec,闸在 worker 构建时同样触发)。
