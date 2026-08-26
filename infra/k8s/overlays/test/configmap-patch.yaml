@@ -38,6 +38,10 @@ data:
   EXPERT_WORK_OIDC_ISSUER: "https://expert-work-test.deepaihealth.com/kc/realms/expert-work"
   EXPERT_WORK_OIDC_JWKS_URI: "https://expert-work-test.deepaihealth.com/kc/realms/expert-work/protocol/openid-connect/certs"
   EXPERT_WORK_MEMBER_PROVISIONING_MODE: "password"
+  # PROD-12(#1315):每副本的模型 RPM = 配置值 / 本值(向上取整)。test
+  # 一直跑 base 的 2 副本,与 prod 语义对齐;与 spec.replicas 同步改,
+  # smoke.sh 校验两者一致。
+  EXPERT_WORK_REPLICA_COUNT: "2"
   # EXPERT_WORK_QUOTA_REDIS_URL carries the Redis AUTH password — it
   # lives in the Secret (secrets.env.example), deliberately not here.
   EXPERT_WORK_OBJECT_STORE_ENDPOINT_URL: "https://s3.oss-cn-hangzhou-internal.aliyuncs.com"

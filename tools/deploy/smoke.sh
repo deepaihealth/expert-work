@@ -121,6 +121,51 @@ if [[ -z "${POD}" ]]; then
     exit 1
 fi
 
+# 多副本首发一致性(PROD-1 #1312 / PROD-12 #1315)。三个硬约束:
+#   1. spec.replicas >= 2 —— 有人把副本调回 1(或把删掉的单副本 patch 加
+#      回来)时 smoke 变红,而不是静默退化;
+#   2. ready == spec —— 两个副本都真的在服;
+#   3. EXPERT_WORK_REPLICA_COUNT == spec.replicas —— RPM 除法的分母跟真实
+#      副本数漂移时,总出量会超厂商额度(env 偏小)或每副本被饿(偏大)。
+# 真正的跨副本 /events attach(非属主副本轮询 run_event 兜底)需要带凭据
+# 建 run,超出本脚本"只读、无凭据"的边界 —— 归发布后的验收探针;这里的
+# per-replica 探活证明每个副本都能独立服 HTTP,是 attach 落到任一副本都
+# 不 404 的 smoke 层前提。
+echo "== replicas =="
+spec_replicas="$(kubectl -n expert-work get deploy control-plane -o jsonpath='{.spec.replicas}')"
+ready_replicas="$(kubectl -n expert-work get deploy control-plane -o jsonpath='{.status.readyReplicas}')"
+if [[ "${spec_replicas}" =~ ^[0-9]+$ ]] && ((spec_replicas >= 2)); then
+    echo "OK   control-plane spec.replicas >= 2 (${spec_replicas})"
+else
+    echo "FAIL control-plane spec.replicas: got '${spec_replicas}', want >= 2"
+    fail=1
+fi
+check "control-plane ready replicas" "${ready_replicas}" "${spec_replicas}"
+env_replicas="$(kubectl -n expert-work exec "${POD}" -- printenv EXPERT_WORK_REPLICA_COUNT \
+    || echo MISSING)"
+check "EXPERT_WORK_REPLICA_COUNT matches spec.replicas" "${env_replicas}" "${spec_replicas}"
+
+# Same Ready+not-Terminating filter as the POD pick above — probing a
+# Terminating pod's IP is a phantom failure, not a finding.
+POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}|{.metadata.deletionTimestamp}|{.metadata.name}|{.status.podIP}{"\n"}{end}' \
+    | awk -F'|' '$1 == "True" && $2 == "" {print $3"|"$4}')"
+for row in ${POD_ROWS}; do
+    replica_name="${row%%|*}"
+    replica_ip="${row##*|}"
+    got="$(kubectl -n expert-work exec "${POD}" -- python -c "
+import urllib.request, urllib.error
+try:
+    print(urllib.request.urlopen('http://${replica_ip}:8000/healthz/ready', timeout=10).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception as e:
+    print(type(e).__name__)
+")"
+    check "replica ${replica_name} /healthz/ready" "${got}" "200"
+done
+
 echo "== http (via ${POD}) =="
 # One python invocation, one line per probe: "<name> <status-or-error>".
 run_probes() { kubectl -n expert-work exec "${POD}" -- python -c "
