@@ -956,3 +956,32 @@ def test_detect_subagent_cycle_tolerates_shared_subagents() -> None:
         "delta": _make_spec_with_subagents("delta"),
     }
     detect_subagent_cycle(specs["alpha"], resolve=lambda n, v: specs.get(n))
+
+
+@pytest.mark.asyncio
+async def test_child_config_forwards_the_artifact_recorder() -> None:
+    """产物清单契约 —— 记录器下传子代:worker/子 Agent 登记的产物同属本
+    run 的交付物,不下传清单会缺项(真栈 run 02ab4cfc 实证 worker 会
+    save_artifact)。旧代码 configurable 里无此键,断言必红。"""
+    from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
+
+    graph = _FakeGraph(result={"messages": [AIMessage(content="ok")], "step_count": 1})
+    tool = SubAgentTool(
+        subagent=_SUB, builder=_RecordingBuilder(built=_built(graph)), child_depth=1
+    )
+    recorded: list[dict[str, object]] = []
+    # 绑定一次 —— ``recorded.append`` 每次取属性都是新的 bound method,
+    # 直接在两处取再 ``is`` 比较恒 False。
+    recorder = recorded.append
+
+    await tool.call(
+        {"task": "x"},
+        ctx=ToolContext(
+            tenant_id=uuid4(),
+            cancellation_token=CancellationToken(),
+            artifact_recorder=recorder,
+        ),
+    )
+
+    _state, child_config = graph.calls[0]
+    assert child_config["configurable"][ARTIFACT_RECORDER_KEY] is recorder
