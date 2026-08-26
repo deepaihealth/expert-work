@@ -680,6 +680,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 | 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除，或者不属于这个 `user_id`，三种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
+| 413 | `ARTIFACT_TOO_LARGE` | 产物文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了。重试无效 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
 | 429 | `RATE_LIMIT_EXCEEDED` | 产物下载配额用尽（`error.dimension` 为 `artifact_download_count_30d`），或调用频率超限 |
 | 500 | `ARTIFACT_CONTENT_UNAVAILABLE` | 产物记录存在，服务端读不到它的内容。重试无效，请联系租户管理员 |

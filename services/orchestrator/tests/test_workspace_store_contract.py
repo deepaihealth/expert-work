@@ -232,14 +232,26 @@ async def test_write_file_rejects_over_cap(store: WorkspaceStore) -> None:
 
 
 @pytest.mark.integration
-async def test_read_file_rejects_over_cap(store: WorkspaceStore) -> None:
+async def test_read_file_rejects_over_cap(tmp_path: Path) -> None:
+    """读闸(64 MiB)现在高于写闸(25 MiB)—— 超读闸的文件不可能经
+    ``write_file`` 造出来,只有沙箱 NFS 直写这条带外路径会产生它。只在
+    nas 档跑(照 2000 条 list 上限的同一份纪律,见模块 docstring):直接
+    落盘造稀疏文件模拟带外写入;supervisor 档没有等价的带外手段(要对
+    docker 卷起容器写),两侧的上限值本身由
+    ``test_workspace_cap_constants_match_the_supervisor`` 钉住相等,
+    supervisor 真会拒绝超闸读由该服务自己的单测覆盖。"""
     from orchestrator.tools.nas_workspace_store import _MAX_READ_BYTES
+    from orchestrator.tools.sandbox import WorkspaceFileTooLargeError
 
     tenant_id, user_id = uuid4(), uuid4()
-    data = b"\x00" * (_MAX_READ_BYTES + 1)
-    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="big.bin", data=data)
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    user_root.mkdir(parents=True)
+    with (user_root / "big.bin").open("wb") as f:
+        f.seek(_MAX_READ_BYTES)  # cap + 1 字节,稀疏文件不真占磁盘
+        f.write(b"\x00")
 
-    with pytest.raises(SandboxSupervisorError):
+    store = NasWorkspaceStore(root=str(tmp_path))
+    with pytest.raises(WorkspaceFileTooLargeError):
         await store.read_file(tenant_id=tenant_id, user_id=user_id, path="big.bin")
 
 

@@ -144,6 +144,20 @@ class WorkspacePermissionError(SandboxSupervisorError):
     """
 
 
+class WorkspaceFileTooLargeError(SandboxSupervisorError):
+    """工作区文件存在,但超出单文件下载上限。
+
+    与"不存在"必须分开(同 :class:`WorkspacePermissionError` 的理由):
+    沙箱经 NFS 直写工作区没有大小限制,agent 完全可以产出一个超过下载闸的
+    产物 —— 用户在产物列表里看得见它,点下载却被告知"artifact content not
+    found",只能靠翻服务端日志才诊断得出来(2026-08-26 的 pptx 内嵌视频
+    正是这样)。分开之后下载端点回 413,把"太大"如实说出来。
+
+    仍是 :class:`SandboxSupervisorError` 的子类,既有的宽 ``except`` 一律
+    不受影响;只有想区分的调用方(下载端点)才需要单独接它。
+    """
+
+
 class WorkspaceQuotaExceededError(SandboxSupervisorError):
     """用户工作区已到配额上限(沙箱迁移波 3 spec § 3.3 闸 A/B)。
 

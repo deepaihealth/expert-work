@@ -259,7 +259,7 @@ Content-Type: multipart/form-data
 | 文档 | `application/pdf`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（.docx）、`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（.xlsx）、`application/vnd.openxmlformats-officedocument.presentationml.presentation`（.pptx）、`text/plain`、`text/markdown`、`text/csv` | 25 MiB |
 | 图片 | `image/png`、`image/jpeg`、`image/webp`、`image/gif` | 10 MiB |
 
-两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-附件超过大小上限)。
+两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-超过大小上限)。
 
 #### 上传文档
 

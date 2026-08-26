@@ -37,7 +37,12 @@ from fastapi import HTTPException
 from fastapi.responses import Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
-from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+from orchestrator.tools import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    WorkspacePermissionError,
+    WorkspaceStore,
+)
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
 
@@ -135,6 +140,11 @@ async def _workspace_file_response(
         # 前——它是那个类的子类,顺序反了这一分支永远走不到。
         logger.warning("workspace.read_permission_denied", exc_info=True)
         raise HTTPException(status_code=500, detail="workspace file unavailable") from exc
+    except WorkspaceFileTooLargeError as exc:
+        # 「太大」≠「不存在」—— 文件列在浏览列表里,只是超过单文件下载闸;
+        # 折进 404 会让用户以为文件丢了。子类,必须排在宽 except 之前。
+        logger.warning("workspace.file_too_large reason=%s", exc)
+        raise HTTPException(status_code=413, detail="file exceeds the download size limit") from exc
     except SandboxSupervisorError as exc:
         logger.warning("workspace.read_failed", exc_info=True)
         raise HTTPException(status_code=404, detail="file not found") from exc

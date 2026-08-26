@@ -35,7 +35,8 @@
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
 | [`SESSION_NOT_BOUND`](./run-control#_4-2-审批决策) | 409 | 审批决策 | run 所在会话没有绑定 Agent。联系租户管理员 |
 | [`AGENT_DELETED`](./run-control#_4-2-审批决策) | 410 | 审批决策 | 会话绑定的 Agent 已被删除，不可恢复。改用其它 `agent_code` |
-| [`UPLOAD_TOO_LARGE`](#_8-9-413-附件超过大小上限) | 413 | 上传附件 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
+| [`UPLOAD_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 上传附件 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
+| [`ARTIFACT_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 产物下载 | 产物文件超过单文件下载上限（64 MiB）。重试无效 |
 | [`INVALID_REQUEST`](#_8-10-422-请求参数不合法) | 422 | 全部端点 | 请求体字段或查询参数未通过基础校验。检查字段的类型、长度与取值范围 |
 | [`INVALID_USER_ID`](#_8-10-422-请求参数不合法) | 422 | 要求 `user_id` 的端点 | `user_id` 去掉首尾空白后是空字符串。传一个非空白的 `user_id` |
 | [`INVALID_UPLOAD_ID`](#_8-10-422-请求参数不合法) | 422 | 发起对话 / 附件下载 | `upload_id` 不是 `upl_<uuid>` 这个形式。原样回传上传接口返回的 `data.upload_id` |
@@ -197,17 +198,25 @@
 
 处理方式：该 run 无法继续，改用其它 `agent_code` 重新发起对话。详情见 [4.2 审批决策](./run-control#_4-2-审批决策)。
 
-## 8.9 413 附件超过大小上限
+## 8.9 413 超过大小上限
 
-只有上传附件（`POST /v1/agents/{agent_code}/uploads`）会返回 413，标准格式。发起对话接口不会返回 413，因为它收到的是 `files[]` 里的 `upload_id` 引用，不是文件本身。
+两个端点会返回 413，都是标准格式。
+
+上传附件（`POST /v1/agents/{agent_code}/uploads`）——你交给服务端的文件太大。发起对话接口不会返回这个 413，因为它收到的是 `files[]` 里的 `upload_id` 引用，不是文件本身：
 
 ```json [响应 413]
 { "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }
 ```
 
-默认上限：文档 25 MiB，图片 10 MiB，实际取值以部署配置为准。
+默认上限：文档 25 MiB，图片 10 MiB，实际取值以部署配置为准。处理方式：压缩或裁剪后重传，大文档也可以拆分成多份分别上传。
 
-处理方式：压缩或裁剪后重传，大文档也可以拆分成多份分别上传。
+产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）——Agent 产出的文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了：
+
+```json [响应 413]
+{ "success": false, "data": null, "error": { "code": "ARTIFACT_TOO_LARGE", "message": "artifact exceeds the download size limit" } }
+```
+
+处理方式：重试无效。如果业务上确实需要这么大的产物文件，联系租户管理员另行取回。
 
 ## 8.10 422 请求参数不合法
 

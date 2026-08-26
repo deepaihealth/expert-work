@@ -69,7 +69,12 @@ from expert_work.protocol import (
     ThreadStatus,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
+from orchestrator.tools import (
+    SandboxSupervisorError,
+    WorkspaceFileTooLargeError,
+    WorkspacePermissionError,
+    WorkspaceStore,
+)
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
 
@@ -571,6 +576,13 @@ def build_sessions_router() -> APIRouter:
             # 前——它是那个类的子类,顺序反了这一分支永远走不到。
             logger.warning("session_workspace.read_permission_denied", exc_info=True)
             raise HTTPException(status_code=500, detail="workspace file unavailable") from exc
+        except WorkspaceFileTooLargeError as exc:
+            # 「太大」≠「不存在」—— 文件列在浏览列表里,只是超过单文件下载闸;
+            # 折进 404 会让用户以为文件丢了。子类,必须排在宽 except 之前。
+            logger.warning("session_workspace.file_too_large reason=%s", exc)
+            raise HTTPException(
+                status_code=413, detail="file exceeds the download size limit"
+            ) from exc
         except SandboxSupervisorError as exc:
             logger.warning("session_workspace.read_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc
@@ -691,6 +703,13 @@ def build_sessions_router() -> APIRouter:
             # SandboxSupervisorError 之前(它的子类,顺序反了永远走不到)。
             logger.warning("session_artifact.permission_denied", exc_info=True)
             raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
+        except WorkspaceFileTooLargeError as exc:
+            # 「太大」≠「不存在」—— 产物列表里看得见,只是超过单文件下载闸;
+            # 折进 404 会让用户以为产物丢了。子类,必须排在宽 except 之前。
+            logger.warning("session_artifact.too_large reason=%s", exc)
+            raise HTTPException(
+                status_code=413, detail="artifact exceeds the download size limit"
+            ) from exc
         except SandboxSupervisorError as exc:
             logger.warning("session_artifact.content_unavailable", exc_info=True)
             raise HTTPException(status_code=404, detail="artifact content not found") from exc
