@@ -53,6 +53,31 @@ logger = logging.getLogger(__name__)
 #: ``time_period_s`` to :meth:`RateLimitedProvider.with_rpm`.
 DEFAULT_TIME_PERIOD_S = 60.0
 
+#: PROD-12(多副本)—— 进程内令牌桶乘 N 副本 = 对上游的真实压力放大 N 倍。
+#: 全局令牌桶(Redis)前的除法版:每副本配额 = ceil(rpm / 副本数),总量上界
+#: 恒等于配置值(单副本空闲时另一副本吃不到它的份额 —— 保守但正确)。
+#: 副本数走 env(prod overlay 与 replicas patch 同处维护);缺省 1 = 单副本
+#: 语义 byte-identical。
+_REPLICA_COUNT_ENV = "EXPERT_WORK_REPLICA_COUNT"
+
+
+def effective_rpm(rate_limit_rpm: int) -> int:
+    """Per-replica RPM share: ``ceil(rpm / replicas)``, floor 1.
+
+    读环境变量而不是构造期快照:测试可 monkeypatch;错误值(非整数 / <1)
+    按 1 处理并不抛 —— 限流配置错不该让 Agent 构建失败。
+    """
+    import math
+    import os
+
+    raw = os.environ.get(_REPLICA_COUNT_ENV, "1")
+    try:
+        replicas = max(1, int(raw))
+    except ValueError:
+        logger.warning("rate_limit.bad_replica_count value=%r treated_as=1", raw)
+        replicas = 1
+    return max(1, math.ceil(rate_limit_rpm / replicas))
+
 
 @dataclass
 class RateLimitedProvider:
