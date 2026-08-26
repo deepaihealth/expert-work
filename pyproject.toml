@@ -127,6 +127,11 @@ ignore = []
 # posture: shells out to docker/psql (S603/S607) and reads the agent_run row
 # with a UUID-interpolated query against the dev DB (S608).
 "tools/ha/verify_queue.py" = ["S603", "S607", "S608"]
+# Live cross-replica cancel verify script(多副本 CAS 守卫执行面)— same
+# ops-harness posture as its two siblings: docker/psql shell-outs (S603/S607),
+# UUID-interpolated dev-DB reads (S608), an unbounded SSE stream (S113), and a
+# deliberately swallowed transport teardown (S110).
+"tools/ha/verify_cancel.py" = ["S110", "S113", "S603", "S607", "S608"]
 # Sandbox-image smoke payload runs INSIDE the sandbox: it shells out to the
 # bundled `soffice` / `node` binaries (S603/S607) to prove the conversion + JS
 # paths. The pinned ruff version narrows S603 to tainted input, but the older
