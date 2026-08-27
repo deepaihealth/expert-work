@@ -6,11 +6,16 @@
  * BUG-7 redesign: the original single flex row squeezed name + required
  * mark + description + input together — long descriptions crushed the
  * "必填" mark into a vertical wrap and inputs never lined up. Now a
- * two-column grid (label | input) with the required mark as a red ``*``
- * and the description living in the input's placeholder + a hover title
- * on the label. The whole section folds behind a header (count + missing
- * count) so a long variable list doesn't bury the composer; it starts
- * open when a required value is still missing.
+ * two-column grid (label | input) with the required mark as a red ``*``.
+ * The whole section folds behind a header (count + missing count) so a
+ * long variable list doesn't bury the composer; it starts open when a
+ * required value is still missing.
+ *
+ * 侧栏重设计(规格 C)—— the form now lives in the 380px 运行设置侧栏:
+ * 必填组渲染在前,选填收进「更多 N 项(选填)」折叠(默认收起;有值时
+ * 打开,预填/恢复带回的值不能被藏住);变量说明从 placeholder(输入后
+ * 就看不见)挪到 label 行尾的 ``FieldHelp`` 问号 tooltip,placeholder 留空
+ * (变量 spec 没有示例字段)。多列 grid 样式保留 —— 380px 下自然回单列。
  *
  * ``readOnly``/tenant-switch state is NOT read here — the parent decides
  * whether inputs are ``disabled`` and passes it down as a plain prop.
@@ -19,6 +24,8 @@ import { useEffect, useState, type JSX } from "react";
 import { Input, Typography } from "antd";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
+
+import { FieldHelp } from "../FieldHelp";
 
 const { Text } = Typography;
 
@@ -46,6 +53,29 @@ export interface VariablesFormProps {
   disabled: boolean;
 }
 
+/** ④ 反馈 — 多列自适应 grid(宽容器两三列,380px 侧栏自然回单列)+ 40vh
+ *  封顶内滚(同 PromptVariablesEditor 变量列表的内滚形态)。 */
+const GRID_STYLE: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
+  columnGap: 16,
+  rowGap: 6,
+  maxHeight: "40vh",
+  overflowY: "auto",
+};
+
+const FOLD_BUTTON_STYLE: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  width: "100%",
+  padding: "2px 0",
+  background: "none",
+  border: "none",
+  cursor: "pointer",
+  textAlign: "left",
+};
+
 export function VariablesForm({
   variables,
   values,
@@ -64,10 +94,84 @@ export function VariablesForm({
   useEffect(() => {
     if (hasMissing) setOpen(true);
   }, [hasMissing]);
+  // 规格 C — 选填组默认收起;某个选填项**有值**时打开(同上,只在
+  // 无值→有值的转变时强制,手动收起后不反复弹开)。草稿预填 / 恢复会话
+  // 带回的值都不能被折叠藏住。
+  const optionalVars = variables.filter((v) => v.required === false);
+  const hasOptionalValue = optionalVars.some(
+    (v) => (values[v.name] ?? "").trim() !== "",
+  );
+  const [optionalOpen, setOptionalOpen] = useState(hasOptionalValue);
+  useEffect(() => {
+    if (hasOptionalValue) setOptionalOpen(true);
+  }, [hasOptionalValue]);
   if (variables.length === 0) return null;
 
+  const requiredVars = variables.filter((v) => v.required !== false);
   const missing = missingRequired(variables, values).length;
   const Chevron = open ? ChevronDown : ChevronRight;
+  const OptionalChevron = optionalOpen ? ChevronDown : ChevronRight;
+
+  const renderCell = (v: PromptVariable): JSX.Element => (
+    <div
+      key={v.name}
+      data-testid={`playground-var-cell-${v.name}`}
+      style={{
+        display: "grid",
+        gridTemplateColumns: "max-content minmax(0, 1fr)",
+        columnGap: 12,
+        alignItems: "center",
+      }}
+    >
+      <label
+        htmlFor={`playground-var-${v.name}`}
+        title={v.name}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          whiteSpace: "nowrap",
+        }}
+      >
+        <Text
+          className="mono"
+          // Cap the label column: an author-controlled 50-char
+          // variable name must ellipsize, not starve the input.
+          style={{
+            fontSize: 12,
+            maxWidth: 220,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {v.name}
+        </Text>
+        {v.required !== false && (
+          <Text
+            type="danger"
+            aria-hidden
+            title={t("console.vars_required_mark")}
+            style={{ fontSize: 12, lineHeight: 1 }}
+          >
+            *
+          </Text>
+        )}
+        {(v.description ?? "") !== "" && (
+          <FieldHelp text={v.description ?? ""} testId={`playground-var-${v.name}`} />
+        )}
+      </label>
+      <Input
+        id={`playground-var-${v.name}`}
+        size="small"
+        value={values[v.name] ?? ""}
+        aria-label={`${t("playground.prompt_vars_label")}: ${v.name}`}
+        aria-required={v.required !== false}
+        data-testid={`playground-var-${v.name}`}
+        disabled={disabled}
+        onChange={(e) => onChange(v.name, e.target.value)}
+      />
+    </div>
+  );
 
   return (
     <div data-testid="playground-vars" style={{ marginBottom: 8 }}>
@@ -79,18 +183,7 @@ export function VariablesForm({
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         data-testid="playground-vars-toggle"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          width: "100%",
-          padding: "2px 0",
-          marginBottom: open ? 8 : 0,
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          textAlign: "left",
-        }}
+        style={{ ...FOLD_BUTTON_STYLE, marginBottom: open ? 8 : 0 }}
       >
         <Chevron size={14} strokeWidth={1.5} style={{ color: "var(--ew-text-secondary)" }} />
         <Text type="secondary" style={{ fontSize: 12 }}>
@@ -102,81 +195,43 @@ export function VariablesForm({
           </Text>
         )}
       </button>
-      {/* ④ 反馈 — 11 个变量全宽竖排吃掉大半屏:外层多列自适应 grid(宽屏
-          两三列,窄屏 auto-fill 自动回单列)+ 40vh 封顶内滚(同
-          PromptVariablesEditor 变量列表的内滚形态);每个变量一格,格内
-          仍是 label 在左、输入在右的原对齐。 */}
       {open && (
-        <div
-          data-testid="playground-vars-grid"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
-            columnGap: 16,
-            rowGap: 6,
-            maxHeight: "40vh",
-            overflowY: "auto",
-          }}
-        >
-          {variables.map((v) => (
-            <div
-              key={v.name}
-              data-testid={`playground-var-cell-${v.name}`}
-              style={{
-                display: "grid",
-                gridTemplateColumns: "max-content minmax(0, 1fr)",
-                columnGap: 12,
-                alignItems: "center",
-              }}
-            >
-              <label
-                htmlFor={`playground-var-${v.name}`}
-                title={v.description ?? v.name}
+        <>
+          {requiredVars.length > 0 && (
+            <div data-testid="playground-vars-grid" style={GRID_STYLE}>
+              {requiredVars.map(renderCell)}
+            </div>
+          )}
+          {optionalVars.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => setOptionalOpen((o) => !o)}
+                aria-expanded={optionalOpen}
+                data-testid="playground-vars-optional-toggle"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 4,
-                  whiteSpace: "nowrap",
+                  ...FOLD_BUTTON_STYLE,
+                  marginTop: requiredVars.length > 0 ? 4 : 0,
+                  marginBottom: optionalOpen ? 6 : 0,
                 }}
               >
-                <Text
-                  className="mono"
-                  // Cap the label column: an author-controlled 50-char
-                  // variable name must ellipsize, not starve the input.
-                  style={{
-                    fontSize: 12,
-                    maxWidth: 220,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {v.name}
+                <OptionalChevron
+                  size={14}
+                  strokeWidth={1.5}
+                  style={{ color: "var(--ew-text-secondary)" }}
+                />
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {t("console.vars_optional_fold", { count: optionalVars.length })}
                 </Text>
-                {v.required !== false && (
-                  <Text
-                    type="danger"
-                    aria-hidden
-                    title={t("console.vars_required_mark")}
-                    style={{ fontSize: 12, lineHeight: 1 }}
-                  >
-                    *
-                  </Text>
-                )}
-              </label>
-              <Input
-                id={`playground-var-${v.name}`}
-                size="small"
-                value={values[v.name] ?? ""}
-                placeholder={v.description ?? v.name}
-                aria-label={`${t("playground.prompt_vars_label")}: ${v.name}`}
-                aria-required={v.required !== false}
-                data-testid={`playground-var-${v.name}`}
-                disabled={disabled}
-                onChange={(e) => onChange(v.name, e.target.value)}
-              />
-            </div>
-          ))}
-        </div>
+              </button>
+              {optionalOpen && (
+                <div data-testid="playground-vars-grid-optional" style={GRID_STYLE}>
+                  {optionalVars.map(renderCell)}
+                </div>
+              )}
+            </>
+          )}
+        </>
       )}
     </div>
   );

@@ -113,9 +113,93 @@ describe("VariablesForm", () => {
     );
     expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
     await userEvent.click(screen.getByTestId("playground-vars-toggle"));
+    // 规格 C(必填前置)—— 选填项住在自己的折叠组里,外层打开后还要再开一层。
+    expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("playground-vars-optional-toggle"));
     expect(screen.getByTestId("playground-var-tone")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("playground-vars-toggle"));
     expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
+  });
+
+  // 规格 C(必填前置)—— 必填组永远排在「更多 N 项(选填)」折叠之前,
+  // 与 manifest 里的声明顺序无关。
+  it("renders the required group before the optional fold even when declared after", () => {
+    render(
+      <VariablesForm
+        variables={[
+          { name: "tone", required: false },
+          { name: "customer_code", required: true },
+        ]}
+        values={{}}
+        onChange={vi.fn()}
+        disabled={false}
+      />,
+    );
+    const requiredCell = screen.getByTestId("playground-var-cell-customer_code");
+    const optionalToggle = screen.getByTestId("playground-vars-optional-toggle");
+    expect(optionalToggle).toHaveTextContent("更多 1 项（选填）");
+    expect(
+      requiredCell.compareDocumentPosition(optionalToggle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // 选填组默认收起。
+    expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
+    expect(screen.getByTestId("playground-vars-optional-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  // 规格 C —— 「有值的选填项所在组打开」:草稿预填 / 恢复会话带回值时,
+  // 选填组不能把已有值藏起来。
+  it("opens the optional fold when an optional variable already has a value", async () => {
+    render(
+      <VariablesForm
+        variables={TEST_VARS}
+        values={{ customer_code: "C-1", tone: "正式" }}
+        onChange={vi.fn()}
+        disabled={false}
+      />,
+    );
+    // 必填已满足 → 外层从折叠开始;打开外层后,选填组因带值直接是展开的
+    // (不需要再点选填折叠)。
+    await userEvent.click(screen.getByTestId("playground-vars-toggle"));
+    expect(screen.getByTestId("playground-var-tone")).toBeInTheDocument();
+  });
+
+  it("opens the optional fold when an optional value arrives after mount (prefill)", async () => {
+    const { rerender } = render(
+      <VariablesForm variables={TEST_VARS} values={{}} onChange={vi.fn()} disabled={false} />,
+    );
+    // 外层因必填未填自动打开,但选填组收起。
+    expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
+    // 草稿预填给选填项带来值(父级 setState,不重挂载)→ 选填组展开。
+    rerender(
+      <VariablesForm
+        variables={TEST_VARS}
+        values={{ tone: "正式" }}
+        onChange={vi.fn()}
+        disabled={false}
+      />,
+    );
+    expect(await screen.findByTestId("playground-var-tone")).toBeInTheDocument();
+  });
+
+  // 规格 C(说明挪位)—— 说明不再当 placeholder(输入后就看不见了),改挂
+  // label 行尾的问号 tooltip;没有说明的变量不出问号。
+  it("shows the description as a help tooltip instead of the placeholder", () => {
+    render(<ControlledHarness onChange={vi.fn()} />);
+    expect(
+      screen.getByTestId("field-help-playground-var-customer_code"),
+    ).toBeInTheDocument();
+    // 变量 spec 没有示例字段 → placeholder 留空。
+    expect(
+      screen.getByTestId("playground-var-customer_code"),
+    ).not.toHaveAttribute("placeholder");
+    // tone 没写说明 → 不渲染问号。
+    expect(
+      screen.queryByTestId("field-help-playground-var-tone"),
+    ).not.toBeInTheDocument();
   });
 
   // ④ 反馈 — 11 个变量全宽竖排吃掉大半屏:多列自适应 grid(宽屏两三列,

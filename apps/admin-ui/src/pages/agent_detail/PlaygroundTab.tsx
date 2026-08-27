@@ -14,9 +14,15 @@
  * PR-A.2 Task 11(spec §九「壳」)—— 右栏检查面板整个退役:轨迹搬进中栏的
  * 「轨迹」tab(``TrajectoryView``),工作区搬进「工作区」tab,``ConsoleShell``
  * 不再传 ``inspect``。
+ *
+ * 侧栏重设计 —— 主区再分「左对话右设置」:对话流 + 输入框满高在左,380px
+ * 「运行设置」侧栏(``RunSettingsPanel``:系统提示词卡 + 变量表单)在右,
+ * 可收起、localStorage 按 agent 记忆、<1200px 走页头 Drawer;变量草稿
+ * (``var_drafts``)按 agent+变量名记最后提交值,进入页面仅对空字段预填。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, App, Segmented, Typography } from "antd";
+import { Alert, App, Badge, Drawer, Segmented, Typography } from "antd";
+import { SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { downloadArtifact } from "../../api/artifacts";
@@ -32,6 +38,11 @@ import { Composer } from "../../components/console/Composer";
 import { ConsoleShell } from "../../components/console/ConsoleShell";
 import { buildConsoleTurns, runIdOf, statsInputOf } from "../../components/console/console_turns";
 import { PlanCard } from "../../components/console/PlanCard";
+import {
+  RunSettingsPanel,
+  SystemPromptCard,
+  useRunSettingsCollapse,
+} from "../../components/console/RunSettingsPanel";
 import { SessionSidebar, type SessionChange } from "../../components/console/SessionSidebar";
 import { StatsBar } from "../../components/console/StatsBar";
 import { Transcript } from "../../components/console/Transcript";
@@ -39,6 +50,11 @@ import { TrajectoryView } from "../../components/console/TrajectoryView";
 import type { TurnTiming } from "../../components/console/types";
 import type { FocusRequest } from "../../components/console/use_trajectory_state";
 import { usePlanCard } from "../../components/console/usePlanCard";
+import {
+  prefillEmptyValues,
+  readVarDrafts,
+  saveVarDrafts,
+} from "../../components/console/var_drafts";
 import { missingRequired, VariablesForm, type PromptVariable } from "../../components/console/VariablesForm";
 import { ViewPane, type ConsoleView } from "../../components/console/ViewPane";
 import { WorkspacePanel } from "../../components/console/WorkspacePanel";
@@ -47,7 +63,12 @@ import type { Attachment, Turn } from "../../components/turn/types";
 import { useHistoryTurns } from "../../components/turn/useHistoryTurns";
 import type { AgentDetailResponse } from "../../api/agents";
 import { useRunEngine, type RunDraft } from "./playground/useRunEngine";
-import { readModel, readPromptJinja, readPromptVariables } from "../../components/manifest-editor/form_model";
+import {
+  readModel,
+  readPromptJinja,
+  readPromptVariables,
+  readSystemPrompt,
+} from "../../components/manifest-editor/form_model";
 import { useAuth } from "../../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
@@ -102,6 +123,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         (v): v is { name: string } & typeof v => Boolean(v.name),
       )
     : [];
+  // 侧栏重设计(规格 B)—— 配置里的系统提示词模板,侧栏折叠卡 + 只读
+  // Drawer 展示。对话流从不渲染它(它只该出现在这里和轨迹的 SYSTEM 行)。
+  const promptTemplate = readSystemPrompt(r.spec);
 
   const [thread, setThread] = useState<ThreadMeta | null>(null);
   const [threadError, setThreadError] = useState<string | null>(null);
@@ -202,6 +226,17 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   );
   const missing = missingRequired(promptVariables, varValues);
 
+  // 侧栏重设计(规格 A)—— 右侧「运行设置」侧栏的收起状态:localStorage 按
+  // agent 记忆;必填未填自动展开;首次 run 发出后自动收起一次。
+  const {
+    collapsed: settingsCollapsed,
+    expand: expandSettings,
+    collapse: collapseSettings,
+    notifyRunDispatched: settingsNotifyRunDispatched,
+  } = useRunSettingsCollapse({ agentCode: r.name, missingCount: missing.length });
+  // <1200px:行内侧栏被 CSS 隐藏,内容走页头按钮触发的 Drawer。
+  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
+
   // #4 cost — the agent model's rate, fetched once per (provider, model).
   // Cross-tenant W4(D2)— rate_card 是 system_admin-only:租户用户不发请求
   // (否则每次进调试台吃一发静默 403),成本区随现有「无数据」态自然隐藏。
@@ -283,6 +318,19 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     return stopRun;
   }, [r.name, r.version, resetDraft, stopRun]);
 
+  // 规格 C — 变量草稿预填:进入页面 / 切换 agent 时,**仅对空字段**填上
+  // 「上次提交值」(localStorage 按 agent+变量名)。必须声明在上面的重置
+  // effect 之后:同一次提交里先清后填,预填永远盖不住已有值。
+  useEffect(() => {
+    if (!readPromptJinja(r.spec)) return;
+    const names = readPromptVariables(r.spec)
+      .map((v) => v.name)
+      .filter((n): n is string => Boolean(n));
+    if (names.length === 0) return;
+    const drafts = readVarDrafts(r.name);
+    setVarValues((prev) => prefillEmptyValues(prev, drafts, names));
+  }, [r.name, r.version, r.spec]);
+
   const handleAttach = useCallback(
     (kind: "image" | "document") =>
       async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -352,8 +400,21 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
       // (a failed ensureThread keeps the draft intact).
       setInput("");
       setAttachments([]);
+      // 规格 C — 草稿:记「最后一次真正发出」的变量值(合并写,空表不写)。
+      saveVarDrafts(r.name, inputs);
+      // 规格 A — 首次 run 成功发出后,运行设置侧栏自动收起一次。
+      settingsNotifyRunDispatched();
     });
-  }, [startRun, input, attachments, promptVariables, varValues, missing]);
+  }, [
+    startRun,
+    input,
+    attachments,
+    promptVariables,
+    varValues,
+    missing,
+    r.name,
+    settingsNotifyRunDispatched,
+  ]);
 
   // #10 — live-turn retry: re-dispatch the turn's original request as a NEW
   // turn (attachments are stored refs — no re-upload).
@@ -482,6 +543,20 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     [thread, resetDraft],
   );
 
+  // 侧栏内容 —— 行内面板与窄屏 Drawer 共用一份描述(两处各自独立挂载):
+  // 系统提示词卡(规格 B)+ 变量表单(规格 C,从底部输入区搬来)。
+  const settingsBody = (
+    <>
+      <SystemPromptCard template={promptTemplate} />
+      <VariablesForm
+        variables={promptVariables}
+        values={varValues}
+        onChange={handleVarChange}
+        disabled={running}
+      />
+    </>
+  );
+
   return (
     <ConsoleShell
       sidebarLabel={t("console.sidebar_title")}
@@ -498,7 +573,10 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         />
       }
       main={
-        <>
+        /* 规格 A — 「左对话右设置」:主区(对话流 + 输入框)满高在左,
+           380px 运行设置侧栏在右(可收起;<1200px 隐藏改走页头 Drawer)。 */
+        <div className="ew-run-split">
+          <div className="ew-run-split__chat">
           <div style={MAIN_HEAD_STYLE}>
             {threadError !== null ? (
               <Alert
@@ -556,6 +634,20 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 {t("console.turn_count", { n: consoleTurns.length })}
               </Text>
             )}
+            {/* 窄屏(<1200px)运行设置入口:行内侧栏被 CSS 隐藏时,这个页头
+                按钮顶上(宽屏下 CSS display:none)。 */}
+            <button
+              type="button"
+              className="ew-run-settings-trigger"
+              aria-label={t("console.settings_title")}
+              title={t("console.settings_title")}
+              data-testid="console-settings-drawer-trigger"
+              onClick={() => setSettingsDrawerOpen(true)}
+            >
+              <Badge count={missing.length} size="small">
+                <SlidersHorizontal size={16} strokeWidth={1.5} />
+              </Badge>
+            </button>
           </div>
 
           {/* §八.2 —— 会话级状态栏那条细行。守卫用 ``stats.turns`` 而不是
@@ -637,12 +729,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               readOnly={isTenantSwitched}
               onSave={savePlan}
             />
-            <VariablesForm
-              variables={promptVariables}
-              values={varValues}
-              onChange={handleVarChange}
-              disabled={running}
-            />
             {uploadError !== null && (
               <Alert
                 type="error"
@@ -683,7 +769,30 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
             onChange={handleAttach("document")}
             data-testid="playground-doc-input"
           />
-        </>
+          </div>
+
+          <RunSettingsPanel
+            collapsed={settingsCollapsed}
+            onExpand={expandSettings}
+            onCollapse={collapseSettings}
+            missingCount={missing.length}
+          >
+            {settingsBody}
+          </RunSettingsPanel>
+
+          {/* 窄屏形态:行内侧栏被 CSS 隐藏,同一份内容走 Drawer
+              (ConsoleShell 左栏 rail→Drawer 同款做法)。 */}
+          <Drawer
+            open={settingsDrawerOpen}
+            onClose={() => setSettingsDrawerOpen(false)}
+            placement="right"
+            width={380}
+            destroyOnHidden
+            title={t("console.settings_title")}
+          >
+            <div data-testid="console-settings-drawer">{settingsBody}</div>
+          </Drawer>
+        </div>
       }
     />
   );
