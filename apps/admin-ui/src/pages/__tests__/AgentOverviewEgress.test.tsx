@@ -108,7 +108,7 @@ describe("AgentDetail overview — egress summary", () => {
     );
     renderPage();
 
-    expect(await screen.findByText("隔离(不出网)")).toBeInTheDocument();
+    expect(await screen.findByText("隔离（不出网）")).toBeInTheDocument();
   });
 
   it("shows the allowlist host when the full manifest's spec.sandbox.network is proxy with an allowlist", async () => {

@@ -125,7 +125,7 @@ afterEach(() => {
 });
 
 describe("TrajectoryTimeline · 投影", () => {
-  it("三条泳道标签 + 每条记录一个块,带 data-lane / data-kind / data-index", () => {
+  it("三条泳道标签 + 每条记录一个块，带 data-lane / data-kind / data-index", () => {
     render(<TrajectoryTimeline {...props()} />);
 
     expect(screen.getByText("输入")).toBeInTheDocument();
@@ -136,7 +136,7 @@ describe("TrajectoryTimeline · 投影", () => {
     expect(strip).toHaveAttribute("data-mode", "sequence");
     expect(strip).toHaveAttribute("aria-label", "轨迹时间轴");
     expect(track()).toHaveAttribute("tabindex", "0");
-    expect(track()).toHaveAttribute("aria-label", "时间轴总览;横向拖动聚焦记录");
+    expect(track()).toHaveAttribute("aria-label", "时间轴总览；横向拖动聚焦记录");
     const all = blocks();
     expect(all).toHaveLength(6);
     expect(all.map((b) => b.getAttribute("data-index"))).toEqual(["0", "1", "2", "3", "4", "5"]);
@@ -162,7 +162,7 @@ describe("TrajectoryTimeline · 投影", () => {
   // Task 11 —— 模型块 TTFT / Decoding 双色:只有 assistant 且非失败且有 ttft
   // 的块才标 data-ttft,比例走 --traj-span-ttft;tool 块 / isError 块 / 无首
   // token 数据的块都不标(即使 ttft 本身算得出来)。
-  it("assistant 有首 token 的块标 data-ttft 与 --traj-span-ttft 比例;isError / 非 assistant / 无数据不标", () => {
+  it("assistant 有首 token 的块标 data-ttft 与 --traj-span-ttft 比例；isError / 非 assistant / 无数据不标", () => {
     const records = [
       rec(0, 0, "user", 1000, 1000),
       rec(1, 1, "assistant", 1000, 1400, { firstTokenAt: 1100 }),
@@ -193,7 +193,7 @@ describe("TrajectoryTimeline · 投影", () => {
       .toEqual(["3"]);
   });
 
-  it("searchMatches 给每块打 data-search-match;无查询(null)时整个属性不出现", () => {
+  it("searchMatches 给每块打 data-search-match；无查询（null）时整个属性不出现", () => {
     const { rerender } = render(<TrajectoryTimeline {...props({ searchMatches: new Set([1, 4]) })} />);
 
     expect(blocks().map((b) => b.getAttribute("data-search-match")))
@@ -214,7 +214,7 @@ describe("TrajectoryTimeline · 投影", () => {
     expect(pct(blockAt(1), "--traj-span-width")).toBeCloseTo(100 / 6, 3);
   });
 
-  it("model 为 null 时出空态,不出块", () => {
+  it("model 为 null 时出空态，不出块", () => {
     render(<TrajectoryTimeline {...props({ model: null, records: [] })} />);
 
     expect(screen.getByTestId("console-lane-empty")).toHaveTextContent("没有时序数据");
@@ -223,7 +223,7 @@ describe("TrajectoryTimeline · 投影", () => {
 });
 
 describe("TrajectoryTimeline · 选区", () => {
-  it("range 内的块 data-selected=true、外面 false,选区与两侧压暗块的几何按域比例", () => {
+  it("range 内的块 data-selected=true、外面 false，选区与两侧压暗块的几何按域比例", () => {
     // 顺序域 [0,6):选区 [2.2, 2.8] 只与第 2 条(span [2,3))相交。
     render(<TrajectoryTimeline {...props({ range: { start: 2.2, end: 2.8 } })} />);
 
@@ -241,7 +241,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(Number.parseFloat(dims[1].style.left)).toBeCloseTo(2.8 / 6 * 100, 3);
   });
 
-  it("拖动 ≥ 3px 提交有序区间(反向拖也归一)", () => {
+  it("拖动 ≥ 3px 提交有序区间（反向拖也归一）", () => {
     mockTrack();
     const p = props();
     const { rerender } = render(<TrajectoryTimeline {...p} />);
@@ -285,7 +285,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(released).toHaveBeenCalledWith(1);
   });
 
-  it("点块(位移 < 3px)= 清选区 + 选中该记录,不产生区间", () => {
+  it("点块（位移 < 3px）= 清选区 + 选中该记录，不产生区间", () => {
     mockTrack();
     const p = props({ range: { start: 1, end: 2 } });
     render(<TrajectoryTimeline {...p} />);
@@ -319,7 +319,7 @@ describe("TrajectoryTimeline · 选区", () => {
   // 终审 M12 —— 一轮里所有记录都落在同一时刻(时长投影域退化成 start === end)
   // 时「一条记录宽」是 0:点空白提交出来的是一条零宽选区,账本每一行都被判
   // outside、时间轴整片压暗,读者什么也没选却像选了个空。
-  it("时长域退化(所有记录同一时刻)时点空白只滚视口,不提交零宽选区", () => {
+  it("时长域退化（所有记录同一时刻）时点空白只滚视口，不提交零宽选区", () => {
     mockTrack();
     const records = [
       rec(0, 0, "user", 1000, 1000),
@@ -346,7 +346,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onRangeChange).toHaveBeenCalledWith(null);
   });
 
-  it("轨道聚焦时 Escape 清选区;没有选区时不回调", () => {
+  it("轨道聚焦时 Escape 清选区；没有选区时不回调", () => {
     const p = props({ range: { start: 1, end: 2 } });
     const { rerender } = render(<TrajectoryTimeline {...p} />);
 
@@ -359,7 +359,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(q.onRangeChange).not.toHaveBeenCalled();
   });
 
-  it("右键单击(没有拖动)清选区,并且不弹出浏览器右键菜单", () => {
+  it("右键单击（没有拖动）清选区，并且不弹出浏览器右键菜单", () => {
     mockTrack();
     const p = props({ range: { start: 1, end: 2 } });
     render(<TrajectoryTimeline {...p} />);
@@ -375,7 +375,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(menu).toBe(false);
   });
 
-  it("拖得比一条记录还窄:提交的选区按中点补足到最小宽度", () => {
+  it("拖得比一条记录还窄：提交的选区按中点补足到最小宽度", () => {
     mockTrack();
     const p = props();
     render(<TrajectoryTimeline {...p} />);
@@ -392,7 +392,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onFocusRecord).not.toHaveBeenCalled();
   });
 
-  it("阈值内的按下后指针离开轨道:草稿当场清掉,落单的抬起不回调", () => {
+  it("阈值内的按下后指针离开轨道：草稿当场清掉，落单的抬起不回调", () => {
     // 没过阈值就没拿捕获,指针离开后 `pointerup` 再也回不到轨道 —— 不当场收尾
     // 的话零宽草稿会卡住,把所有块压成 data-selected="false"。
     mockTrack();
@@ -411,7 +411,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onFocusRecord).not.toHaveBeenCalled();
   });
 
-  it("全景态下右键拖动:不平移、不拿捕获,也不当右键单击清选区", () => {
+  it("全景态下右键拖动：不平移、不拿捕获，也不当右键单击清选区", () => {
     mockTrack();
     const captured = vi.spyOn(HTMLElement.prototype, "setPointerCapture");
     const p = props({ range: { start: 1, end: 2 } });
@@ -426,7 +426,7 @@ describe("TrajectoryTimeline · 选区", () => {
     expect(p.onRangeChange).not.toHaveBeenCalled();
   });
 
-  it("pointercancel 中止拖选:不提交区间,草稿选区也擦掉", () => {
+  it("pointercancel 中止拖选：不提交区间，草稿选区也擦掉", () => {
     mockTrack();
     const p = props();
     render(<TrajectoryTimeline {...p} />);
@@ -449,7 +449,7 @@ describe("TrajectoryTimeline · 选区", () => {
 });
 
 describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
-  it("指针移到块上回抛 onHoverIndex,离开轨道回抛 null;hoveredIndex 给块打 data-hovered", () => {
+  it("指针移到块上回抛 onHoverIndex，离开轨道回抛 null;hoveredIndex 给块打 data-hovered", () => {
     mockTrack();
     const p = props({ hoveredIndex: 2 });
     render(<TrajectoryTimeline {...p} />);
@@ -469,7 +469,7 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(p.onHoverIndex).toHaveBeenLastCalledWith(null);
   });
 
-  it("向上滚轮放大:域投影宽度超过 100%,块整体被拉宽", () => {
+  it("向上滚轮放大：域投影宽度超过 100%，块整体被拉宽", () => {
     mockTrack();
     render(<TrajectoryTimeline {...props()} />);
 
@@ -482,7 +482,7 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(pct(zoomed, "--traj-domain-width")).toBeGreaterThan(100);
   });
 
-  it("缩放态下右键按住拖动 = 平移视口(拖过了就不算右键单击)", () => {
+  it("缩放态下右键按住拖动 = 平移视口（拖过了就不算右键单击）", () => {
     mockTrack();
     const p = props();
     render(<TrajectoryTimeline {...p} />);
@@ -521,7 +521,7 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     fireEvent.pointerUp(track(), { clientX: 990, pointerId: 1, button: 0 });
   });
 
-  it("model 换引用(内容没变)不动视口 —— 挪视口只认 selectedIndex 变化", () => {
+  it("model 换引用（内容没变）不动视口 —— 挪视口只认 selectedIndex 变化", () => {
     // 运行中每来一帧 model 就换引用,跟着跑会把用户刚缩放到的位置一次次拽回
     // 选中块;挂载时也不该先亮起 180ms 动画。
     mockTrack();
@@ -554,7 +554,7 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(lanes()).toHaveAttribute("data-animate-viewport", "true");
   });
 
-  it("hasEarlier 出「…」按钮,点击触发加载;loadingEarlier 时 aria-disabled 且不再回调", () => {
+  it("hasEarlier 出「…」按钮，点击触发加载；loadingEarlier 时 aria-disabled 且不再回调", () => {
     const p = props({ hasEarlier: true });
     const { rerender } = render(<TrajectoryTimeline {...p} />);
 
@@ -577,7 +577,7 @@ describe("TrajectoryTimeline · 联动 / 缩放 / 历史", () => {
     expect(screen.getByTestId("console-lane-earlier")).toBeInTheDocument();
   });
 
-  it("悬停块 500ms 后的提示含类型标签与总计;顺序模式不报钟点", async () => {
+  it("悬停块 500ms 后的提示含类型标签与总计；顺序模式不报钟点", async () => {
     render(<TrajectoryTimeline {...props()} />);
 
     fireEvent.mouseOver(blockAt(1));
