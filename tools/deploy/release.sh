@@ -243,6 +243,63 @@ fi
 # ---------------------------------------------------------------- 5. smoke
 run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
 
+# --------------------------------------------------------------- 6. canary
+# X-14 P1 — 发布合格判据:一条真实 Agent run(exec_python + write_file +
+# save_artifact + 产物下载),end 帧 status=success 才算发布成功。smoke 只探
+# HTTP(e2b 事故:九项全绿时沙箱工具可以全挂),canary 补上执行面。凭据来自
+# 集群 Secret canary-credentials(python -m control_plane.seed_canary 预置,
+# 见 docs/runbooks/production-release.md §1.6);未 seed 时打 WARNING 跳过而
+# 不失败 —— 未预置金丝雀的环境发布不能被打断。rollback.sh 不跑 canary
+# (救火路径只复用 smoke,不能被真 run 拖住)。
+echo
+echo "== canary (X-14 P1) =="
+if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN> read Secret canary-credentials (api-key/agent-code); skip+WARN if absent"
+    echo "DRY-RUN> pick a Running+Ready control-plane pod; stream canary.py + key over stdin"
+    echo "DRY-RUN> kubectl exec: python canary.py — end.status=success + artifact download gate"
+elif ! kubectl -n expert-work get secret canary-credentials > /dev/null 2>&1; then
+    echo "WARNING: canary skipped — Secret canary-credentials not found in this cluster." >&2
+    echo "  seed it first (docs/runbooks/production-release.md §1.6.7):" >&2
+    echo "    kubectl -n expert-work exec -it <control-plane-pod> -- \\" >&2
+    echo "      python -m control_plane.seed_canary --tenant-id <tenant uuid>" >&2
+else
+    # 凭据只进变量与 stdin —— 绝不进 argv(节点 ps / exec 审计可见)、绝不
+    # echo。agent-code 非机密,走 argv 便于排障。
+    canary_key="$(kubectl -n expert-work get secret canary-credentials \
+        -o jsonpath='{.data.api-key}' | base64 -d)"
+    canary_agent="$(kubectl -n expert-work get secret canary-credentials \
+        -o jsonpath='{.data.agent-code}' | base64 -d || true)"
+    if [[ -z "${canary_key}" ]]; then
+        echo "canary-credentials Secret exists but key 'api-key' is empty — re-seed it:" >&2
+        echo "  python -m control_plane.seed_canary --rotate-key (runbook §1.6.7)" >&2
+        exit 1
+    fi
+    # Same Running+Ready+not-Terminating pod filter as smoke.sh (see the
+    # comment there for why items[0] alone picks Terminating corpses).
+    CANARY_POD="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}|{.metadata.deletionTimestamp}|{.metadata.name}{"\n"}{end}' \
+        | awk -F'|' '$1 == "True" && $2 == "" {print $3; exit}')"
+    if [[ -z "${CANARY_POD}" ]]; then
+        echo "no Running+Ready control-plane pod to run the canary from." >&2
+        exit 1
+    fi
+    echo "==> canary run via ${CANARY_POD} (agent=${canary_agent:-release-canary})"
+    # canary.py 与 key 一起走 stdin(第一行 key,其余是脚本):单次 exec、
+    # 无临时文件、无 tar 依赖;in-pod 的 python 即 /app/.venv(httpx 可用)。
+    if ! { printf '%s\n' "${canary_key}"; cat "${SCRIPT_DIR}/canary.py"; } \
+        | kubectl -n expert-work exec -i "${CANARY_POD}" -- \
+            env "EXPERT_WORK_CANARY_AGENT_CODE=${canary_agent:-release-canary}" \
+            python -c 'import os, sys
+os.environ["EXPERT_WORK_CANARY_API_KEY"] = sys.stdin.readline().rstrip("\n")
+exec(compile(sys.stdin.read(), "canary.py", "exec"))'; then
+        echo "CANARY FAILED — the release is NOT good. Roll back:" >&2
+        echo "  tools/deploy/rollback.sh ${env_name} <上一版 tag>" >&2
+        echo "  (上一版 tag 在上一个 chore(deploy) 记录 PR 里 —— 记录 PR 按约定写明它)" >&2
+        exit 1
+    fi
+fi
+
 echo
 echo "Release ${tag} done. Overlay newTag edits are uncommitted —"
 echo "commit them as the chore(deploy) record PR:"
