@@ -80,8 +80,9 @@ export function processHeadline(s: ProcessSummary, t: TFn): string {
   if (s.think > 0) parts.push(t("console.process_think", { n: s.think }));
   if (s.tools > 0) {
     parts.push(
-      t("console.process_tools", { n: s.tools }) +
-        (s.toolBreakdown ? `(${s.toolBreakdown})` : ""),
+      s.toolBreakdown
+        ? t("console.process_tools_detailed", { n: s.tools, breakdown: s.toolBreakdown })
+        : t("console.process_tools", { n: s.tools }),
     );
   }
   if (s.other > 0) parts.push(t("console.process_other", { n: s.other }));

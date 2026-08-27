@@ -191,7 +191,7 @@ describe("processHeadline", () => {
   it("renders the spec's full sentence: think · tools(breakdown) · failed tail", () => {
     const s = summarizeProcess(compactRowsOf(EVENTS_3THINK_5TOOLS));
     expect(processHeadline(s, t)).toBe(
-      "思考 3 次 · 工具 5 次(web_search ×4 · http ×1) · 1 次失败",
+      "思考 3 次 · 工具 5 次（web_search ×4 · http ×1） · 1 次失败",
     );
   });
 
@@ -210,12 +210,12 @@ describe("processHeadline", () => {
     ).toBe("无过程");
   });
 
-  it("counts every non-think / non-tool row (plan / memory / marker …) as 其它 N 步", () => {
+  it("counts every non-think / non-tool row （plan / memory / marker …） as 其他 N 步", () => {
     expect(
       processHeadline(
         { think: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
         t,
       ),
-    ).toBe("其它 3 步");
+    ).toBe("其他 3 步");
   });
 });

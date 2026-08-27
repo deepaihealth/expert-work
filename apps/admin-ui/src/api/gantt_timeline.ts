@@ -16,6 +16,7 @@
  * frame yet) is not a degrade — it has no id yet because it hasn't
  * finished, so it is placed the same way as an in-progress agent/aux row.
  */
+import i18n from "../i18n";
 import type { SseEvent } from "./sessions";
 import { parseTimeline, type AuxNodeItem, type MarkerItem, type TimelineItem } from "./timeline";
 import type { WorkerStepSummary, WorkerTimeline } from "./worker_timeline";
@@ -173,7 +174,7 @@ export function buildGanttRows(
       degraded = degraded || stepDegraded;
       absRows.push({
         key: `item-${item.seq}`,
-        label: `步骤 ${item.stepCount ?? item.seq + 1}`,
+        label: i18n.t("console_runtime.gantt_step", { n: item.stepCount ?? item.seq + 1 }),
         model: item.model ?? undefined,
         kind: "agent",
         depth: 0,

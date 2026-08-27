@@ -3,8 +3,9 @@
  * `ledgerRecordId` / `lastKnownFrame`。fixture:两轮 history done + 一轮
  * live running,`ConsoleTurn` 手工造。
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import i18n from "../../../i18n";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 import { absoluteSpans, buildLedger, lastKnownFrame, ledgerRecordId } from "../ledger";
@@ -15,6 +16,16 @@ import type { ConsoleTurn } from "../types";
 // 的约定:小偏移量加在一个真实 epoch 基准上。
 const BASE = 1_700_000_000_000;
 let seqCounter = 0;
+
+// 记录的正文 / 结果文案走语言包,断言按 zh-CN 写 —— 固定语言,别赌检测结果。
+let priorLang: string;
+beforeAll(async () => {
+  priorLang = i18n.language;
+  await i18n.changeLanguage("zh-CN");
+});
+afterAll(async () => {
+  await i18n.changeLanguage(priorLang);
+});
 
 function ev(event: string, data: unknown, ms: number | null): SseEvent {
   seqCounter += 1;

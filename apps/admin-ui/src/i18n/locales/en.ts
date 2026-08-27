@@ -1236,6 +1236,7 @@ export interface TranslationKeys {
     stats_chip_cost: string;
     process_think: string;
     process_tools: string;
+    process_tools_detailed: string;
     process_other: string;
     process_failed: string;
     process_empty: string;
@@ -1327,6 +1328,28 @@ export interface TranslationKeys {
     detail_system_prompt: string;
     detail_prompt_inputs: string;
     detail_system_chars: string;
+  };
+  console_runtime: {
+    status_success: string;
+    status_paused: string;
+    status_interrupted: string;
+    status_error: string;
+    error_generic: string;
+    compaction: string;
+    retry: string;
+    guard_token_budget_warn: string;
+    guard_token_budget_exhausted: string;
+    guard_max_steps: string;
+    guard_no_progress: string;
+    gap_frames: string;
+    memory_recall: string;
+    memory_writeback: string;
+    planner: string;
+    reflect_pass: string;
+    reflect_revise: string;
+    gantt_step: string;
+    plan_steps: string;
+    subagent_result: string;
   };
   playground: {
     session_failed: string;
@@ -4352,6 +4375,7 @@ const en: TranslationKeys = {
     stats_chip_cost: "Cost",
     process_think: "Thinking ×{{n}}",
     process_tools: "Tools ×{{n}}",
+    process_tools_detailed: "Tools ×{{n}} ({{breakdown}})",
     process_other: "{{n}} other steps",
     process_failed: "{{n}} failed",
     process_empty: "No steps",
@@ -4443,6 +4467,28 @@ const en: TranslationKeys = {
     detail_system_prompt: "System prompt",
     detail_prompt_inputs: "Prompt inputs",
     detail_system_chars: "{{n}} chars",
+  },
+  console_runtime: {
+    status_success: "Run completed",
+    status_paused: "Awaiting human approval",
+    status_interrupted: "Run cancelled",
+    status_error: "Run failed",
+    error_generic: "Run error",
+    compaction: "Compaction ×{{n}} · {{before}} → {{after}} tok",
+    retry: "Retry #{{n}} · {{error}} · backing off {{backoff}}s",
+    guard_token_budget_warn: "Token budget {{pct}}% used ({{spent}}/{{limit}})",
+    guard_token_budget_exhausted: "Token budget exhausted ({{spent}}/{{limit}}) → wrap-up turn",
+    guard_max_steps: "Step limit reached ({{steps}}/{{max}}) → wrap-up turn",
+    guard_no_progress: "No progress {{streak}}/{{max}} → wrap-up turn",
+    gap_frames: "Frames {{from}}–{{to}} missing (unrecoverable on this connection; replaying usually restores them)",
+    memory_recall: "Memory recall · {{n}}",
+    memory_writeback: "Memory written · {{n}}",
+    planner: "Plan drafted · goal + {{n}} steps",
+    reflect_pass: "Reflection · pass",
+    reflect_revise: "Reflection · revise",
+    gantt_step: "Step {{n}}",
+    plan_steps: "{{n}} steps",
+    subagent_result: "{{calls}} LLM calls · {{ms}}ms",
   },
   playground: {
     session_failed: "Failed to create session",

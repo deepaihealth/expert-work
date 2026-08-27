@@ -7,6 +7,7 @@
  * 纯函数,不渲染、不持状态。投影模型 / 交互参照 deepseek-harness
  * ui-trajectory(MIT)重写。
  */
+import i18n from "../../i18n";
 import { ledgerRowsOf, type TrajectoryInput, type TrajectoryRow } from "../../api/trajectory_rows";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { absoluteSpans } from "./ledger_timing";
@@ -90,7 +91,10 @@ function contentOf(row: TrajectoryRow): { text: string; resultText: string | nul
     case "plan": {
       const name = row.source === "update_plan" ? "update_plan" : "planner";
       const args = JSON.stringify({ goal: row.goal, steps: row.stepsTotal, reason: row.reason });
-      return { text: `${name} ${args}`.slice(0, TOOL_TEXT_MAX), resultText: row.plan ? `${row.stepsTotal} 步` : null };
+      return {
+        text: `${name} ${args}`.slice(0, TOOL_TEXT_MAX),
+        resultText: row.plan ? i18n.t("console_runtime.plan_steps", { n: row.stepsTotal }) : null,
+      };
     }
     case "memory":
       // 正文留空:类型标签已经写着 MEMORY,内容列只值得放召回 / 写回的第一条。
@@ -104,7 +108,7 @@ function contentOf(row: TrajectoryRow): { text: string; resultText: string | nul
       const s = row.worker.summary;
       return {
         text: `${row.worker.label} ${row.worker.taskExcerpt}`.slice(0, TOOL_TEXT_MAX),
-        resultText: s ? `${s.llmCallCount} 次模型调用 · ${s.wallClockMs}ms` : null,
+        resultText: s ? i18n.t("console_runtime.subagent_result", { calls: s.llmCallCount, ms: s.wallClockMs }) : null,
       };
     }
     default:

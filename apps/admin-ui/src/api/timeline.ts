@@ -5,6 +5,7 @@
  * retry/compaction events); the new work here is *ordering + typing*, not new
  * field parsing. See docs/.../2026-07-10-batch3-wireframe.html for the render.
  */
+import i18n from "../i18n";
 import type { SseEvent } from "./sessions";
 import { serverMsOf } from "./sse_id";
 import { parseToolCalls, type ToolCallEntry } from "./tool_timeline";
@@ -70,11 +71,11 @@ export type TimelineItem = AgentStep | AuxNodeItem | MarkerItem;
 const AI = "ai";
 /** ``end.status`` → 结束标记的文案与色调。**``paused`` 不是失败** —— 等人审批,
  *  对话还会继续,所以用 pause 而不是 bad。 */
-const END_MARKER: Record<string, { text: string; tone: MarkerItem["tone"] }> = {
-  success: { text: "运行完成", tone: "good" },
-  paused: { text: "等待人工审批", tone: "pause" },
-  interrupted: { text: "运行已取消", tone: "warn" },
-  error: { text: "运行失败", tone: "bad" },
+const END_MARKER: Record<string, { key: string; tone: MarkerItem["tone"] }> = {
+  success: { key: "console_runtime.status_success", tone: "good" },
+  paused: { key: "console_runtime.status_paused", tone: "pause" },
+  interrupted: { key: "console_runtime.status_interrupted", tone: "warn" },
+  error: { key: "console_runtime.status_error", tone: "bad" },
 };
 function obj(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {};
@@ -142,22 +143,27 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
     if (evt.event === "compaction") {
       const d = obj(evt.data);
       push({ kind: "compaction", receivedAt: at, tone: "warn",
-        text: `压缩 ${int(d.passes)} 遍 · ${int(d.tokens_before)} → ${int(d.tokens_after)} tok` });
+        text: i18n.t("console_runtime.compaction", {
+          n: int(d.passes), before: int(d.tokens_before), after: int(d.tokens_after),
+        }) });
       continue;
     }
     if (evt.event === "retry") {
       const d = obj(evt.data);
       push({ kind: "retry", receivedAt: at, tone: "warn",
-        text: `重试 #${int(d.attempt)} · ${str(d.error_class)} · 退避 ${int(d.backoff_s)}s` });
+        text: i18n.t("console_runtime.retry", {
+          n: int(d.attempt), error: str(d.error_class), backoff: int(d.backoff_s),
+        }) });
       continue;
     }
     if (evt.event === "error") {
       const d = obj(evt.data);
-      push({ kind: "error", receivedAt: at, tone: "bad", text: str(d.message) || str(d.name) || "运行错误" });
+      push({ kind: "error", receivedAt: at, tone: "bad",
+        text: str(d.message) || str(d.name) || i18n.t("console_runtime.error_generic") });
       continue;
     }
     if (evt.event === "approval") {
-      push({ kind: "approval", receivedAt: at, tone: "pause", text: "等待人工审批" });
+      push({ kind: "approval", receivedAt: at, tone: "pause", text: i18n.t("console_runtime.status_paused") });
       continue;
     }
     if (evt.event === "guard") {
@@ -168,11 +174,16 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
       const text =
         g === "token_budget"
           ? warn
-            ? `token 预算已用 ${Math.round((int(detail.spent) / Math.max(1, int(detail.limit))) * 100)}%(${int(detail.spent)}/${int(detail.limit)})`
-            : `token 预算耗尽(${int(detail.spent)}/${int(detail.limit)})→ 收尾轮`
+            ? i18n.t("console_runtime.guard_token_budget_warn", {
+                pct: Math.round((int(detail.spent) / Math.max(1, int(detail.limit))) * 100),
+                spent: int(detail.spent), limit: int(detail.limit),
+              })
+            : i18n.t("console_runtime.guard_token_budget_exhausted", {
+                spent: int(detail.spent), limit: int(detail.limit),
+              })
           : g === "max_steps"
-            ? `步数耗尽(${int(detail.steps)}/${int(detail.max)})→ 收尾轮`
-            : `无进展 ${int(detail.streak)}/${int(detail.max)} → 收尾轮`;
+            ? i18n.t("console_runtime.guard_max_steps", { steps: int(detail.steps), max: int(detail.max) })
+            : i18n.t("console_runtime.guard_no_progress", { streak: int(detail.streak), max: int(detail.max) });
       push({ kind: "guard", receivedAt: at, tone: warn ? "warn" : "bad", text });
       continue;
     }
@@ -182,14 +193,14 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
       // 红的),但也不能当未知帧丢掉:时间线上真的缺了一段。
       const d = obj(evt.data);
       push({ kind: "gap", receivedAt: at, tone: "warn",
-        text: `缺失第 ${int(d.from)}–${int(d.to)} 帧(本次连接补不到,重新回放通常能拿到)` });
+        text: i18n.t("console_runtime.gap_frames", { from: int(d.from), to: int(d.to) }) });
       continue;
     }
     if (evt.event === "end") {
       // ``end`` 的 data 从 null 变成 {status, run_id}(P3 PR-1)。四值见契约实况
       // 表 F;``timeout`` 后端已归到 ``error``。老流(data 为 null)落回"运行完成"。
       const m = END_MARKER[str(obj(evt.data).status)] ?? END_MARKER.success;
-      push({ kind: "end", receivedAt: at, tone: m.tone, text: m.text });
+      push({ kind: "end", receivedAt: at, tone: m.tone, text: i18n.t(m.key) });
       continue;
     }
     if (evt.event === "worker") continue; // 已由 parseWorkerFrames 预扫,挂在工具卡上
@@ -240,14 +251,14 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
       // aux node channels — positioned where they arrive
       if (Array.isArray(ch.recalled_memories) && ch.recalled_memories.length > 0) {
         push({ kind: "memory_recall", receivedAt: at, node, tone: "normal",
-          summary: `记忆召回 · ${ch.recalled_memories.length} 条`,
+          summary: i18n.t("console_runtime.memory_recall", { n: ch.recalled_memories.length }),
           detail: { memories: ch.recalled_memories }, durationMs: durationOf(ch) });
       }
       if (ch.plan !== undefined && ch.plan !== null) {
         const p = obj(ch.plan);
         const steps = Array.isArray(p.steps) ? p.steps : [];
         push({ kind: "planner", receivedAt: at, node, tone: "normal",
-          summary: `制定计划 · 目标 + ${steps.length} 步`, detail: { plan: p },
+          summary: i18n.t("console_runtime.planner", { n: steps.length }), detail: { plan: p },
           durationMs: durationOf(ch) });
       }
       if (Array.isArray(ch.reflections) && ch.reflections.length > 0) {
@@ -256,13 +267,13 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
           const verdict = str(rr.verdict);
           push({ kind: "reflect", receivedAt: at, node,
             tone: verdict === "revise" ? "warn" : "normal",
-            summary: `反思 · ${verdict === "revise" ? "修订" : "通过"}`,
+            summary: i18n.t(verdict === "revise" ? "console_runtime.reflect_revise" : "console_runtime.reflect_pass"),
             detail: { verdict, critique: str(rr.critique) }, durationMs: durationOf(ch) });
         }
       }
       if (Array.isArray(ch.written_memories) && ch.written_memories.length > 0) {
         push({ kind: "memory_writeback", receivedAt: at, node, tone: "normal",
-          summary: `记忆写回 · ${ch.written_memories.length} 条`,
+          summary: i18n.t("console_runtime.memory_writeback", { n: ch.written_memories.length }),
           detail: { memories: ch.written_memories }, durationMs: durationOf(ch) });
       }
     }
