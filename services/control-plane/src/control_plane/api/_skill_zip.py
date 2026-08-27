@@ -412,13 +412,30 @@ def _open_archive(blob: bytes) -> zipfile.ZipFile:
 
 
 def _is_zip_junk(name: str) -> bool:
-    """macOS packaging junk: Finder's "Compress" injects a ``__MACOSX/``
-    resource tree, AppleDouble ``._*`` shadows and ``.DS_Store`` files. None
-    of it is skill content, and ``._SKILL.md`` is BINARY despite its ``.md``
-    suffix — it would otherwise trip ``binary_in_text_file``."""
+    """OS / toolchain packaging junk — stripped instead of rejecting, because
+    skill authors zip whatever working directory they have and none of this
+    is ever skill content:
+
+    * macOS: Finder's "Compress" injects a ``__MACOSX/`` resource tree,
+      AppleDouble ``._*`` shadows and ``.DS_Store`` files (``._SKILL.md`` is
+      BINARY despite its ``.md`` suffix — it would otherwise trip
+      ``binary_in_text_file``);
+    * Python: running any bundled ``scripts/*.py`` once leaves a
+      ``__pycache__/`` tree of ``.pyc`` bytecode next to it;
+    * Windows: Explorer drops ``Thumbs.db`` / ``desktop.ini``.
+
+    Anything junk-like but ambiguous (``.git/``, ``node_modules/``) stays
+    OUT of this list on purpose — those signal a mis-packaged ZIP worth
+    surfacing, not incidental artifacts."""
     segments = name.split("/")
     basename = segments[-1]
-    return segments[0] == "__MACOSX" or basename == ".DS_Store" or basename.startswith("._")
+    return (
+        segments[0] == "__MACOSX"
+        or "__pycache__" in segments
+        or basename in (".DS_Store", "Thumbs.db", "desktop.ini")
+        or basename.startswith("._")
+        or basename.endswith((".pyc", ".pyo"))
+    )
 
 
 def _common_root_prefix(names: list[str]) -> str:
