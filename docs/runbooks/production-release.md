@@ -146,10 +146,8 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
 4. **首个平台管理员**:configmap 已设 `EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL`,
    该邮箱首登自动升(兜底走 bootstrap-admin.md break-glass)。
 5. **租户开通 + LLM key**:admin-ui 建租户 → 金库粘贴 LLM provider key。
-6. **平台技能导入(可选,可发布后补)**:`POST /v1/platform/skills/import`
-   (幂等;见 skill-packaging.md)。注意:X-6 的 52 个导出包**尚未推过任何
-   环境**,物料在导出会话的产出目录,导入前先定位物料并在 test 环境演练一遍;
-   不阻塞发布。
+6. **平台技能导入(可选,可发布后补)**:走 §1.8 的批量导出/导入(#1344,
+   2026-08-27 起替代旧「52 导出包」手工路径);幂等,不阻塞发布。
 7. **金丝雀 seed(X-14 P1,发布合格判据的前置)**:release.sh 阶段 6 需要
    `canary-credentials` Secret + 金丝雀 Agent;未 seed 时该阶段只打 WARNING
    跳过(发布不被打断),seed 后才真正生效。依赖第 5 步(租户 + LLM key)。
