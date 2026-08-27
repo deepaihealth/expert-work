@@ -2538,6 +2538,13 @@ export interface TranslationKeys {
     add: string;
     import_zip: string;
     import_github: string;
+    export_all: string;
+    import_batch: string;
+    bulk_done: string;
+    bulk_results_title: string;
+    bulk_result_imported: string;
+    bulk_result_skipped: string;
+    bulk_result_failed: string;
     github_modal_title: string;
     github_hint: string;
     github_source_label: string;
@@ -5824,6 +5831,14 @@ const en: TranslationKeys = {
     add: "New skill",
     import_zip: "Import .skill",
     import_github: "Import from GitHub",
+    export_all: "Export all",
+    import_batch: "Bulk import",
+    bulk_done:
+      "Bulk import finished: {{imported}} imported · {{skipped}} skipped · {{failed}} failed",
+    bulk_results_title: "Bulk import results",
+    bulk_result_imported: "Imported",
+    bulk_result_skipped: "Skipped",
+    bulk_result_failed: "Failed",
     github_modal_title: "Import skill from GitHub",
     github_hint:
       "Pull a skill from a public GitHub repo. Accepts owner/repo, a github.com URL, or a skills.sh URL. For a repo with many skills, name which one.",

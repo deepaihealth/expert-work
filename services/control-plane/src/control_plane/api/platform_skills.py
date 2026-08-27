@@ -21,7 +21,10 @@ Every handler:
 from __future__ import annotations
 
 import base64
+import io
+import json
 import re
+import zipfile
 from pathlib import PurePosixPath
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -49,6 +52,7 @@ from control_plane.api._skill_zip import (
     MAX_TOTAL_BYTES_ASSET,
     SkillPackageError,
     SkillZipError,
+    _is_zip_junk,
     build_skill_zip,
     parse_skill_zip,
 )
@@ -80,7 +84,9 @@ from expert_work.protocol import (
     AuditAction,
     AuditResult,
     Principal,
+    Skill,
     SkillStatus,
+    SkillVersion,
     TenantPlan,
 )
 from expert_work.protocol.skill import (
@@ -104,6 +110,14 @@ from expert_work.runtime.skill_assets import (
 #: Hard cap on skills imported in one batch request. Bounds the per-request DB
 #: write fan-out; a repo with more skills than this is imported in chunks.
 _MAX_BATCH_SKILLS = 100
+
+#: Outer-archive guards for ``POST :import-batch`` (zip-bomb defense on the
+#: BULK wrapper — each inner ``.skill`` pack then re-runs the full
+#: ``_skill_zip`` guard set). Entry count bounds parse cost (packs + sidecars
+#: + slack for stray files); the flat total-uncompressed cap bounds request
+#: RAM (per-entry size is capped at the pack tier's total, see the handler).
+_MAX_BATCH_ENTRIES = 4 * _MAX_BATCH_SKILLS
+_MAX_BATCH_TOTAL_BYTES = 256 * 1024 * 1024  # 256 MiB
 
 #: Pre-seeded platform-skill categories. The ``/categories`` endpoint offers
 #: these before any skill is labelled so the picker is never empty on a fresh
@@ -548,6 +562,46 @@ async def _invalidate_platform_skills(request: Request) -> None:
         await bus.publish(InvalidationEvent(kind="platform_skill"))
 
 
+async def _export_version_blob(request: Request, *, skill: Skill, version: SkillVersion) -> bytes:
+    """THE single packing path for a platform-version ``.skill`` ZIP.
+
+    Shared by the per-version export endpoint and ``GET :export-all`` so the
+    bulk archive's inner packs are byte-identical to the single export —
+    never fork this into a second zip builder (the 14-skill byte-loss
+    incident came from exactly that). Inflates external supporting-file
+    entries back to inline bytes so a round-trip stays lossless.
+    """
+    supporting_files = version.supporting_files
+    if any(sf.is_external for sf in supporting_files.values()):
+        try:
+            raw_map = await fetch_supporting_files(
+                supporting_files, object_store=_get_object_store(request)
+            )
+        except SkillAssetError as exc:
+            raise HTTPException(
+                status_code=502, detail="supporting file assets unavailable"
+            ) from exc
+        supporting_files = {
+            path: SkillSupportingFile(
+                content=base64.b64encode(raw_map[path]).decode("ascii"),
+                size=sf.size,
+                mime=sf.mime,
+            )
+            for path, sf in supporting_files.items()
+        }
+    return build_skill_zip(
+        name=skill.name,
+        description=version.description,
+        category=version.category,
+        required_models=version.required_models,
+        prompt_fragment=version.prompt_fragment,
+        tool_names=version.tool_names,
+        supporting_files=supporting_files,
+        lazy=version.lazy_load,
+        version=version.version,
+    )
+
+
 def _http_detail_message(detail: object) -> str:
     """Flatten an ``HTTPException.detail`` (str or structured dict) into a short
     operator-facing reason for a batch result row."""
@@ -740,6 +794,174 @@ def build_platform_skills_router() -> APIRouter:
         if response.status_code == 201:
             await _invalidate_platform_skills(request)
         return response
+
+    def _batch_reject(message: str) -> HTTPException:
+        return HTTPException(
+            status_code=400,
+            detail={"code": "BATCH_PACKAGE_INVALID", "message": message},
+        )
+
+    @router.post(":import-batch", response_model=None)
+    async def import_platform_skills_batch(
+        file: Annotated[UploadFile, File()],
+        request: Request,
+    ) -> JSONResponse:
+        """Bulk import (生产开荒搬运): outer ZIP of ``.skill`` packs — the
+        ``GET :export-all`` layout (``<name>/<name>.skill`` +
+        ``<name>/meta.json``) — imported with per-pack partial success.
+
+        system_admin only. Each pack runs the SAME single-import pipeline
+        (``_ingest_platform_skill_payload``: parse + moderation + strict scan
+        + content-hash idempotency + per-pack audit); one bad pack reports
+        ``failed`` and never aborts the rest. A ``meta.json`` sidecar next to
+        a pack backfills the **skill-row** category after ingest (PATCH
+        re-labels only touch the skill row, so the pack frontmatter may be
+        stale — see :export-all). Returns ``{results: [{name, status:
+        imported|skipped|failed, version?, reason?}]}``; one invalidation for
+        the whole batch when anything actually changed.
+        """
+        principal = _principal(request)
+        store = _get_skill_store(request)
+        audit = _get_audit(request)
+        object_store = _get_object_store(request)
+        blob = await file.read()
+
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile as exc:
+            raise _batch_reject("the upload is not a valid zip archive") from exc
+
+        # Outer zip-bomb guards. Per-entry cap = the pack tier's TOTAL cap (a
+        # compressed .skill can never exceed its own uncompressed content);
+        # inner packs then re-run the full _skill_zip per-file/total guards.
+        max_pack_bytes = MAX_TOTAL_BYTES_ASSET if object_store is not None else MAX_TOTAL_BYTES
+        entries: dict[str, bytes] = {}
+        with archive:
+            infos = [
+                info
+                for info in archive.infolist()
+                if not info.is_dir() and not _is_zip_junk(info.filename)
+            ]
+            if len(infos) > _MAX_BATCH_ENTRIES:
+                raise _batch_reject(
+                    f"the archive has too many entries (limit {_MAX_BATCH_ENTRIES})"
+                )
+            total = 0
+            for info in infos:
+                if info.file_size > max_pack_bytes:
+                    raise _batch_reject(
+                        f"entry {info.filename!r} exceeds the per-package size limit"
+                    )
+                total += info.file_size
+                if total > _MAX_BATCH_TOTAL_BYTES:
+                    raise _batch_reject("the archive exceeds the total size limit")
+                entries[info.filename] = archive.read(info)
+
+        pack_paths = sorted(path for path in entries if path.endswith(".skill"))
+        if not pack_paths:
+            raise _batch_reject("no .skill packages found in the archive")
+        if len(pack_paths) > _MAX_BATCH_SKILLS:
+            raise _batch_reject(f"more than {_MAX_BATCH_SKILLS} .skill packages in one archive")
+
+        def _pack_dir(path: str) -> str:
+            return path.rsplit("/", 1)[0] if "/" in path else ""
+
+        def _sidecar_category(pack_path: str) -> tuple[bool, str | None]:
+            """``(present, value)`` from the pack's directory-level
+            ``meta.json``. Applied only when the directory holds exactly ONE
+            pack (the export-all layout) — a hand-rolled flat zip with several
+            root packs gets no ambiguous backfill. A malformed sidecar is
+            treated as absent (the pack frontmatter category then stands)."""
+            directory = _pack_dir(pack_path)
+            if sum(1 for p in pack_paths if _pack_dir(p) == directory) != 1:
+                return False, None
+            raw = entries.get(f"{directory}/meta.json" if directory else "meta.json")
+            if raw is None:
+                return False, None
+            try:
+                meta = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                return False, None
+            if not isinstance(meta, dict) or "category" not in meta:
+                return False, None
+            value = meta["category"]
+            if value is not None and not isinstance(value, str):
+                return False, None
+            normalized = (value or "").strip()
+            if len(normalized) > 64:
+                return False, None
+            return True, normalized or None
+
+        results: list[dict[str, object]] = []
+        imported_any = False
+        category_changed = False
+        for pack_path in pack_paths:
+            stem = pack_path.rsplit("/", 1)[-1].removesuffix(".skill")
+            try:
+                content, status = await _ingest_platform_skill_payload(
+                    blob=entries[pack_path],
+                    store=store,
+                    audit=audit,
+                    principal=principal,
+                    source="zip_batch_import",
+                    origin=pack_path,
+                    object_store=object_store,
+                )
+            except HTTPException as exc:
+                results.append(
+                    {
+                        "name": stem,
+                        "status": "failed",
+                        "reason": _http_detail_message(exc.detail),
+                    }
+                )
+                continue
+            if status == 201:
+                imported_any = True
+            results.append(
+                {
+                    "name": _result_skill_name(content) or stem,
+                    "status": "imported" if status == 201 else "skipped",
+                    "version": _result_version(content),
+                }
+            )
+
+            # Sidecar category backfill — mirrors the PATCH re-label path
+            # (skill row + SKILL_CATEGORY_CHANGED audit), applied for both
+            # imported AND skipped packs so a re-run converges the labels.
+            present, desired = _sidecar_category(pack_path)
+            skill_body = content.get("skill")
+            if not present or not isinstance(skill_body, dict):
+                continue
+            current = skill_body.get("category")
+            skill_id = skill_body.get("id")
+            if desired == current or not isinstance(skill_id, str):
+                continue
+            async with bypass_rls_session():
+                await store.set_platform_category(skill_id=UUID(skill_id), category=desired)
+            category_changed = True
+            await audit_emit(
+                audit,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.subject_id,
+                action=AuditAction.SKILL_CATEGORY_CHANGED,
+                resource_type="skill",
+                resource_id=skill_id,
+                result=AuditResult.SUCCESS,
+                trace_id=current_trace_id_hex(),
+                details={
+                    "scope": "platform",
+                    "from": current,
+                    "to": desired,
+                    "source": "zip_batch_import",
+                },
+            )
+
+        # One invalidation for the whole batch (never per pack) — and only
+        # when something wrote ("skipped" without a re-label changed nothing).
+        if imported_any or category_changed:
+            await _invalidate_platform_skills(request)
+        return JSONResponse(status_code=200, content={"results": results})
 
     @router.post("/import-from-github", response_model=None)
     async def import_platform_skill_from_github(
@@ -1396,38 +1618,9 @@ def build_platform_skills_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="skill version not found")
         if skill is None:
             raise HTTPException(status_code=404, detail="skill not found")
-        # Dual-read (skill-asset-store): inflate external entries back to the
-        # inline shape so the exported ZIP carries real bytes — a round-trip
-        # (export → import) stays lossless either way.
-        supporting_files = version.supporting_files
-        if any(sf.is_external for sf in supporting_files.values()):
-            try:
-                raw_map = await fetch_supporting_files(
-                    supporting_files, object_store=_get_object_store(request)
-                )
-            except SkillAssetError as exc:
-                raise HTTPException(
-                    status_code=502, detail="supporting file assets unavailable"
-                ) from exc
-            supporting_files = {
-                path: SkillSupportingFile(
-                    content=base64.b64encode(raw_map[path]).decode("ascii"),
-                    size=sf.size,
-                    mime=sf.mime,
-                )
-                for path, sf in supporting_files.items()
-            }
-        blob = build_skill_zip(
-            name=skill.name,
-            description=version.description,
-            category=version.category,
-            required_models=version.required_models,
-            prompt_fragment=version.prompt_fragment,
-            tool_names=version.tool_names,
-            supporting_files=supporting_files,
-            lazy=version.lazy_load,
-            version=version.version,
-        )
+        # Dual-read + packing live in ``_export_version_blob`` — the ONE
+        # packing path shared with ``GET :export-all``.
+        blob = await _export_version_blob(request, skill=skill, version=version)
         return Response(
             content=blob,
             media_type="application/zip",
@@ -1436,6 +1629,57 @@ def build_platform_skills_router() -> APIRouter:
                     f'attachment; filename="{skill.name}-v{version.version}.skill"'
                 )
             },
+        )
+
+    @router.get(":export-all", response_model=None)
+    async def export_all_platform_skills(request: Request) -> Response:
+        """Bulk export (生产开荒搬运): one ZIP holding every platform skill's
+        latest version as ``<name>/<name>.skill`` + ``<name>/meta.json``.
+
+        system_admin only. Inner packs come from ``_export_version_blob`` —
+        the SAME packing path as the per-version export, byte for byte. The
+        ``meta.json`` sidecar carries the **skill-row** category: PATCH /
+        bulk re-labels touch only the skill row (never ``skill_version``), so
+        the version frontmatter may be stale — without the sidecar a
+        hand-fixed category would not survive the transfer. Skills without a
+        version yet have nothing to pack and are skipped. Sync on purpose
+        (~52-pack scale); name uniqueness makes entry paths collision-free.
+        """
+        _principal(request)
+        store = _get_skill_store(request)
+        pairs: list[tuple[Skill, SkillVersion]] = []
+        async with bypass_rls_session():
+            offset = 0
+            while True:
+                rows, total = await store.list_platform_skills(offset=offset, limit=200)
+                for skill in rows:
+                    if skill.latest_version <= 0:
+                        continue
+                    version = await store.get_platform_version_by_number(
+                        skill_id=skill.id, version=skill.latest_version
+                    )
+                    if version is not None:
+                        pairs.append((skill, version))
+                offset += len(rows)
+                if not rows or offset >= total:
+                    break
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for skill, version in pairs:
+                pack = await _export_version_blob(request, skill=skill, version=version)
+                archive.writestr(f"{skill.name}/{skill.name}.skill", pack)
+                archive.writestr(
+                    f"{skill.name}/meta.json",
+                    json.dumps(
+                        {"name": skill.name, "category": skill.category},
+                        ensure_ascii=False,
+                    ),
+                )
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="platform-skills.zip"'},
         )
 
     @router.put("/{skill_id}/versions/{version}/prompt", response_model=None)
