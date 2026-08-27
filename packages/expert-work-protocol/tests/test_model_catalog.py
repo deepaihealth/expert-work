@@ -162,6 +162,25 @@ def test_2026_08_additions_capability_bits() -> None:
     assert "qwen3.8-max" in {e.name for e in models_for_provider("qwen")}
 
 
+def test_glm_53_flash_capability_bits() -> None:
+    """glm-5.3-flash (bigmodel docs 2026-08): text params同 glm-5.3 (1M,
+    effort), natively multimodal input, and thinking.type 仅支持 enabled —
+    the first ``always_thinking`` entry (off floors at the lowest effort
+    tier; clear_thinking deliberately not sent, see catalog comment)."""
+    flash = catalog_entry("glm", "glm-5.3-flash")
+    assert flash is not None
+    assert flash.vision is True
+    assert flash.context_window == 1_000_000
+    assert flash.thinking == "effort"
+    assert flash.thinking_default is True
+    assert flash.always_thinking is True
+    assert "glm-5.3-flash" in {e.name for e in models_for_provider("glm")}
+    # The flag defaults False everywhere else — the provider-level "real off"
+    # derivation stays intact for glm-5.3 and deepseek.
+    assert catalog_entry("glm", "glm-5.3").always_thinking is False  # type: ignore[union-attr]
+    assert catalog_entry("deepseek", "deepseek-v4-pro").always_thinking is False  # type: ignore[union-attr]
+
+
 def test_cross_vendor_thinking_shapes() -> None:
     """CM-10 (Mini-ADR CM-L1) — thinking capability shapes per vendor."""
     assert catalog_entry("openai", "gpt-5.5").thinking == "effort"  # type: ignore[union-attr]

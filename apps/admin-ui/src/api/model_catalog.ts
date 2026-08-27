@@ -17,6 +17,10 @@ export interface CatalogModel {
   // knob → no switch) + the model's default thinking state (seeds the switch).
   thinking?: "effort" | "budget" | "toggle" | null;
   thinking_default?: boolean;
+  // Per-model "cannot turn thinking off at all" flag (glm-5.3-flash) — the
+  // config UI shows the not-fully-off hint even though the provider
+  // otherwise has a real off.
+  always_thinking?: boolean;
 }
 
 export interface ProviderModels {

@@ -55,8 +55,15 @@ class ModelEntry(BaseModel):
     # currently defaults thinking ON; set ``False`` when a default-off model is
     # added. ``can disable`` is NOT a field — it is derived as
     # ``thinking == "effort" and provider != "anthropic"`` (reasoning_effort has
-    # no off level, only ``minimal``).
+    # no off level, only ``minimal``), refined per model by ``always_thinking``.
     thinking_default: bool = False
+    # Per-model override of the provider-level "real off" derivation above:
+    # the model cannot turn thinking off at all (vendor rejects the disable
+    # form) — "off" degrades to the lowest effort tier instead, and the UI
+    # shows the not-fully-off hint. First case: glm-5.3-flash (thinking.type
+    # 仅支持 enabled per bigmodel docs 2026-08); kimi-k3 predates the field
+    # and keeps its provider-branch handling.
+    always_thinking: bool = False
     sampling: bool = True
     # Stream HX-13 (Mini-ADR HX-J5) — vendor-native tool-disclosure tier:
     #   "native_search"  — Anthropic tool-search beta: deferred tools go to
@@ -210,7 +217,14 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # flagship; glm-5.2 (1M) stays. GLM-5.2 及以上 support ``reasoning_effort``
     # (max/high/low per the bigmodel core-params page) → shape "effort"; the
     # adapter keeps ``thinking.type`` as the on/off channel and maps the
-    # levels (no "medium" on GLM). glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
+    # levels (no "medium" on GLM). glm-5.3-flash (2026-08; text params同 5.3,
+    # 1M ctx, natively multimodal image/video/file input) is the cheap tier:
+    # thinking.type 仅支持 enabled — no off at all → ``always_thinking``;
+    # the docs' ``thinking.clear_thinking`` (preserved thinking, GLM 独有
+    # param; Kimi's ``thinking.keep`` is the same concept) is deliberately
+    # NOT sent — enabling it requires replaying prior reasoning content
+    # verbatim, which our multi-turn replay does not do (backlog with B-30).
+    # glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
     # and glm-4.6 (200K) are current text models, on/off only. Vision goes
     # through glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type
     # toggle per the bigmodel VLM docs), glm-4.6v (128K) and glm-4.5v. The
@@ -222,6 +236,14 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+        ),
+        ModelEntry(
+            name="glm-5.3-flash",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            always_thinking=True,
         ),
         ModelEntry(
             name="glm-5.2",
