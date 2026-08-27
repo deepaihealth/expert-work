@@ -379,6 +379,44 @@ async def test_internal_check_allows_under_quota(quota_client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
+async def test_internal_check_resource_kind_filters_dimensions(quota_client: AsyncClient) -> None:
+    """B-19 — a wire caller may pass ``resource_kind`` to route dimensions;
+    omitting it keeps the legacy check-every-dimension behaviour. A sticky
+    (refill=0) denial carries ``retry_after_s: null``."""
+    seed = await quota_client.post(
+        f"/v1/tenants/{_TENANT}/quotas",
+        headers={"Authorization": f"Bearer {_admin_token()}"},
+        json=TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=0,  # ceiling fully consumed
+            burst=None,
+        ).model_dump(mode="json"),
+    )
+    assert seed.status_code == 201
+
+    token = _operator_token()
+    routed = await quota_client.post(
+        "/v1/quota/check",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"tenant_id": str(_TENANT), "cost": 1, "resource_kind": "session"},
+    )
+    assert routed.status_code == 200
+    assert routed.json()["allowed"] is True
+
+    legacy = await quota_client.post(
+        "/v1/quota/check",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"tenant_id": str(_TENANT), "cost": 1},
+    )
+    assert legacy.status_code == 200
+    body = legacy.json()
+    assert body["allowed"] is False
+    assert body["blocked_dimension"] == "image_storage_bytes"
+    assert body["retry_after_s"] is None  # sticky → no retry hint on the wire
+
+
+@pytest.mark.asyncio
 async def test_internal_reserve_and_commit_flow(quota_client: AsyncClient) -> None:
     token = _operator_token()
     thread_id = uuid4()

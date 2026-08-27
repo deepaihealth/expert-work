@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "DEFAULT_WORKSPACE_BYTES_PER_USER",
+    "DIMENSION_RESOURCE_KINDS",
     "CheckRequest",
     "CheckResult",
     "CommitRequest",
@@ -38,6 +39,7 @@ __all__ = [
     "TenantQuotaPatch",
     "TenantQuotaRecord",
     "TokenReservationRecord",
+    "dimension_applies",
 ]
 
 
@@ -87,6 +89,54 @@ class QuotaDimension(StrEnum):
 DEFAULT_WORKSPACE_BYTES_PER_USER: int = 10 * 1024**3
 
 
+# ---------------------------------------------------------------------------
+# B-19 — dimension ↔ resource_kind routing (single source of truth)
+# ---------------------------------------------------------------------------
+
+#: B-19 — which admission surfaces (``CheckRequest.resource_kind``) may
+#: consume each dimension. ``None`` = the dimension applies to every
+#: resource_kind (global throttles). An empty set = no admission surface
+#: consumes the dimension yet (reserved) — only unfiltered checks
+#: (``resource_kind=None``) still touch it. Consumers counted 2026-08-27
+#: across all ``check_admission`` call sites: sessions:create="session";
+#: runs:create + external agents:run="run"; internal/external image
+#: uploads="image_upload"; internal/external artifact
+#: downloads="artifact_download". Both quota engines MUST route through
+#: :func:`dimension_applies` — never reimplement the predicate.
+DIMENSION_RESOURCE_KINDS: dict[QuotaDimension, frozenset[str] | None] = {
+    QuotaDimension.QPS: None,
+    # The next three never resolve into token buckets (not part of the
+    # bucket ladder); ``None`` keeps them behaviour-identical either way.
+    QuotaDimension.TOKENS_PER_DAY: None,
+    QuotaDimension.SANDBOXES: None,
+    QuotaDimension.MONTHLY_TOKEN_BUDGET: None,
+    QuotaDimension.IMAGE_UPLOAD_COUNT_30D: frozenset({"image_upload"}),
+    QuotaDimension.IMAGE_STORAGE_BYTES: frozenset({"image_upload"}),
+    QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D: frozenset({"artifact_download"}),
+    # Reserved — no admission surface deducts artifact storage today
+    # (download endpoints deliberately don't; the future save-artifact
+    # path must register its resource_kind here when it lands).
+    QuotaDimension.ARTIFACT_STORAGE_BYTES: frozenset(),
+    # Storage-type cap read directly by the workspace gate; the bucket
+    # ladder is inert for it (pinned by regression test).
+    QuotaDimension.WORKSPACE_BYTES_PER_USER: None,
+}
+
+
+def dimension_applies(dimension: QuotaDimension, resource_kind: str | None) -> bool:
+    """True when a check made for ``resource_kind`` may consume ``dimension``.
+
+    ``resource_kind=None`` (direct callers predating B-19 routing) keeps
+    the legacy behaviour: every configured dimension applies. Unknown
+    dimensions (future enum members missing from the map) also apply to
+    everything — fail open on routing, the bucket itself still enforces.
+    """
+    if resource_kind is None:
+        return True
+    kinds = DIMENSION_RESOURCE_KINDS.get(dimension)
+    return kinds is None or resource_kind in kinds
+
+
 class QuotaPurpose(StrEnum):
     """Workload purpose attached to ``check`` / ``reserve`` for metric labels.
 
@@ -132,6 +182,13 @@ class CheckRequest(BaseModel):
     # while keeping ``cost=1`` for ``QPS`` / ``IMAGE_UPLOAD_COUNT_30D`` —
     # otherwise a 1 MiB upload would burn a million QPS tokens.
     cost_overrides: dict[QuotaDimension, int] = Field(default_factory=dict)
+    # B-19 — the admission surface making this check ("session" / "run" /
+    # "image_upload" / "artifact_download"). Routes which dimensions apply
+    # via :func:`dimension_applies` so e.g. starting a conversation never
+    # spends from the image buckets. ``None`` (default, wire-compatible
+    # for callers predating the field) skips routing: every configured
+    # dimension applies, exactly the pre-B-19 behaviour.
+    resource_kind: str | None = None
 
 
 class CheckResult(BaseModel):

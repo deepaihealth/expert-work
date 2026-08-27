@@ -42,6 +42,7 @@ from expert_work.protocol import (
     ReserveRequest,
     ReserveResult,
     TenantQuotaRecord,
+    dimension_applies,
 )
 
 # Cache resolved quota rows so repeated checks don't hit the store on
@@ -123,8 +124,14 @@ class InMemoryQuotaService(QuotaService):
                     self._buckets[d.key] = bucket
                 _refill(bucket, now)
                 if bucket.tokens < d.cost:
-                    retry_after_s = math.ceil(
-                        (d.cost - bucket.tokens) / max(bucket.refill_rate_per_s, 1e-9)
+                    # B-19 ② — refill=0 dimensions are sticky ceilings:
+                    # there is no time at which a retry would succeed, so
+                    # no retry hint (``None``) instead of an astronomical
+                    # number from a near-zero divisor.
+                    retry_after_s = (
+                        None
+                        if bucket.refill_rate_per_s <= 0
+                        else math.ceil((d.cost - bucket.tokens) / bucket.refill_rate_per_s)
                     )
                     return CheckResult(
                         allowed=False,
@@ -184,6 +191,10 @@ class InMemoryQuotaService(QuotaService):
         out: list[_ResolvedDimension] = []
         for row in rows:
             if not _scope_matches(row.scope, agent=req.agent, user=req.user):
+                continue
+            if not dimension_applies(row.dimension, req.resource_kind):
+                # B-19 ① — the dimension belongs to a different admission
+                # surface; this check must not spend from its bucket.
                 continue
             if row.dimension is QuotaDimension.QPS:
                 capacity = row.burst or row.limit_value

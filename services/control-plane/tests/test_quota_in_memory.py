@@ -751,3 +751,241 @@ async def test_workspace_bytes_per_user_row_is_inert_in_bucket_engine() -> None:
 
     result = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
     assert result.allowed
+
+
+# ---------------------------------------------------------------------------
+# B-19 — resource_kind dimension routing + sticky Retry-After
+# ---------------------------------------------------------------------------
+
+
+async def _seed_image_dimensions(store: InMemoryTenantQuotaStore, tenant: UUID) -> None:
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_UPLOAD_COUNT_30D,
+            scope={},
+            limit_value=3,
+            burst=3,
+        ),
+    )
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=1024,
+            burst=None,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_check_does_not_touch_image_buckets() -> None:
+    """B-19 ① — a ``resource_kind="session"`` check must not spend from the
+    image dimensions: their balances stay untouched for real uploads."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed_image_dimensions(store, tenant)
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    for _ in range(5):
+        result = await svc.check(CheckRequest(tenant_id=tenant, cost=1, resource_kind="session"))
+        assert result.allowed
+        assert QuotaDimension.IMAGE_UPLOAD_COUNT_30D.value not in result.remaining
+        assert QuotaDimension.IMAGE_STORAGE_BYTES.value not in result.remaining
+
+    # The image buckets are still full: a real upload sees the whole budget.
+    upload = await svc.check(
+        CheckRequest(
+            tenant_id=tenant,
+            cost=1,
+            resource_kind="image_upload",
+            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: 1024},
+        )
+    )
+    assert upload.allowed
+    assert upload.remaining[QuotaDimension.IMAGE_UPLOAD_COUNT_30D.value] == 2
+    assert upload.remaining[QuotaDimension.IMAGE_STORAGE_BYTES.value] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_check_allowed_when_image_storage_exhausted() -> None:
+    """B-19 ① production symptom — image storage full must NOT 429 a
+    conversation (``resource_kind="run"``)."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=0,  # ceiling already fully consumed
+            burst=None,
+        ),
+    )
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    result = await svc.check(CheckRequest(tenant_id=tenant, cost=1, resource_kind="run"))
+    assert result.allowed
+
+
+@pytest.mark.asyncio
+async def test_image_upload_still_deducts_all_its_dimensions() -> None:
+    """B-19 regression guard — ``resource_kind="image_upload"`` keeps
+    deducting QPS + count + bytes exactly as before."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(dimension=QuotaDimension.QPS, scope={}, limit_value=10, burst=10),
+    )
+    await _seed_image_dimensions(store, tenant)
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    result = await svc.check(
+        CheckRequest(
+            tenant_id=tenant,
+            cost=1,
+            resource_kind="image_upload",
+            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: 600},
+        )
+    )
+    assert result.allowed
+    assert result.remaining[QuotaDimension.QPS.value] == 9
+    assert result.remaining[QuotaDimension.IMAGE_UPLOAD_COUNT_30D.value] == 2
+    assert result.remaining[QuotaDimension.IMAGE_STORAGE_BYTES.value] == 424
+
+
+@pytest.mark.asyncio
+async def test_artifact_download_only_deducts_its_dimension() -> None:
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D,
+            scope={},
+            limit_value=2,
+            burst=2,
+        ),
+    )
+    await _seed_image_dimensions(store, tenant)
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    download = await svc.check(
+        CheckRequest(tenant_id=tenant, cost=1, resource_kind="artifact_download")
+    )
+    assert download.allowed
+    assert set(download.remaining) == {QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D.value}
+    assert download.remaining[QuotaDimension.ARTIFACT_DOWNLOAD_COUNT_30D.value] == 1
+
+    # Image count bucket untouched by the download above.
+    upload = await svc.check(CheckRequest(tenant_id=tenant, cost=1, resource_kind="image_upload"))
+    assert upload.allowed
+    assert upload.remaining[QuotaDimension.IMAGE_UPLOAD_COUNT_30D.value] == 2
+
+
+@pytest.mark.asyncio
+async def test_resource_kind_none_checks_all_dimensions() -> None:
+    """Compat — direct callers that don't pass ``resource_kind`` keep the
+    legacy behaviour: every configured dimension applies."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed_image_dimensions(store, tenant)
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    result = await svc.check(
+        CheckRequest(
+            tenant_id=tenant,
+            cost=1,
+            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: 600},
+        )
+    )
+    assert result.allowed
+    assert result.remaining[QuotaDimension.IMAGE_UPLOAD_COUNT_30D.value] == 2
+    assert result.remaining[QuotaDimension.IMAGE_STORAGE_BYTES.value] == 424
+
+
+@pytest.mark.asyncio
+async def test_artifact_storage_bytes_only_reachable_via_unfiltered_check() -> None:
+    """B-19 — no admission surface deducts ``ARTIFACT_STORAGE_BYTES`` today
+    (reserved for the future save-artifact path); only ``resource_kind=None``
+    direct callers still hit it."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.ARTIFACT_STORAGE_BYTES,
+            scope={},
+            limit_value=0,
+            burst=None,
+        ),
+    )
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    filtered = await svc.check(
+        CheckRequest(tenant_id=tenant, cost=1, resource_kind="artifact_download")
+    )
+    assert filtered.allowed
+
+    unfiltered = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
+    assert not unfiltered.allowed
+    assert unfiltered.blocked_dimension is QuotaDimension.ARTIFACT_STORAGE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_sticky_dimension_denial_has_no_retry_hint() -> None:
+    """B-19 ② — refill=0 (sticky) dimensions have no time at which a retry
+    would succeed → ``retry_after_s`` must be ``None``, not an astronomically
+    large number."""
+    tenant = _tenant()
+    store = InMemoryTenantQuotaStore()
+    await _seed(
+        store,
+        tenant,
+        TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=100,
+            burst=None,
+        ),
+    )
+    svc = InMemoryQuotaService(quota_store=store, reservation_store=InMemoryTokenReservationStore())
+
+    denied = await svc.check(
+        CheckRequest(
+            tenant_id=tenant,
+            cost=1,
+            resource_kind="image_upload",
+            cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: 200},
+        )
+    )
+    assert not denied.allowed
+    assert denied.blocked_dimension is QuotaDimension.IMAGE_STORAGE_BYTES
+    assert denied.retry_after_s is None
+
+
+@pytest.mark.asyncio
+async def test_refillable_dimension_denial_keeps_retry_hint() -> None:
+    """B-19 ② non-regression — dimensions with a real refill keep their
+    integer retry hint."""
+    tenant = _tenant()
+    quota_store, patch = _quota_store_with_qps(tenant, limit=1, burst=1)
+    await _seed(quota_store, tenant, patch)
+    svc = InMemoryQuotaService(
+        quota_store=quota_store,
+        reservation_store=InMemoryTokenReservationStore(),
+    )
+
+    assert (await svc.check(CheckRequest(tenant_id=tenant, cost=1))).allowed
+    denied = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
+    assert not denied.allowed
+    assert denied.retry_after_s is not None
+    assert denied.retry_after_s >= 0

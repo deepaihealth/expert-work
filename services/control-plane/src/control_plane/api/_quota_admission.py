@@ -76,9 +76,12 @@ async def check_admission(
     Returns a fully-formed :class:`JSONResponse` when denied — the
     caller just ``return``s it back to the client.
 
-    ``resource_kind`` lands on the audit row as ``resource_type`` so
-    SOC / dashboard pipelines can split rate-limit denials by
-    consuming surface (``session`` vs ``run`` vs ``image_upload``).
+    ``resource_kind`` routes which quota dimensions apply to this check
+    (B-19 — ``dimension_applies``; a ``session`` check must not spend
+    from the image buckets) and lands on the audit row as
+    ``resource_type`` so SOC / dashboard pipelines can split rate-limit
+    denials by consuming surface (``session`` vs ``run`` vs
+    ``image_upload``).
 
     ``cost_overrides`` (Mini-ADR J-30, J.6.补强-1) lets the caller pass
     a per-dimension cost — the upload endpoint uses it to subtract
@@ -90,6 +93,7 @@ async def check_admission(
         agent=agent,
         cost=cost,
         cost_overrides=dict(cost_overrides) if cost_overrides else {},
+        resource_kind=resource_kind,
     )
     result: CheckResult
     async with quota_engine_unavailable_as_503():
@@ -100,7 +104,10 @@ async def check_admission(
     dimension = (
         result.blocked_dimension.value if result.blocked_dimension is not None else "unknown"
     )
-    retry_after = result.retry_after_s if result.retry_after_s is not None else 1
+    # B-19 ② — ``None`` means the blocked dimension is a sticky ceiling
+    # (refill=0): retrying never helps, so no ``Retry-After`` header and a
+    # JSON ``null`` in the body / audit row.
+    retry_after = result.retry_after_s
 
     await emit(
         audit,
@@ -131,5 +138,5 @@ async def check_admission(
                 "retry_after_s": retry_after,
             },
         },
-        headers={"Retry-After": str(retry_after)},
+        headers={} if retry_after is None else {"Retry-After": str(retry_after)},
     )

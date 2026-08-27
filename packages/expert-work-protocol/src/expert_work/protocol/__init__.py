@@ -167,6 +167,7 @@ from expert_work.protocol.quality_drift_alert import QualityDriftAlertRecord
 from expert_work.protocol.quality_score import QualityScoreRecord
 from expert_work.protocol.quota import (
     DEFAULT_WORKSPACE_BYTES_PER_USER,
+    DIMENSION_RESOURCE_KINDS,
     CheckRequest,
     CheckResult,
     CommitRequest,
@@ -179,6 +180,7 @@ from expert_work.protocol.quota import (
     TenantQuotaPatch,
     TenantQuotaRecord,
     TokenReservationRecord,
+    dimension_applies,
 )
 from expert_work.protocol.reflection import Reflection, ReflectionSpec
 from expert_work.protocol.service_account import (
@@ -284,6 +286,7 @@ __all__ = [
     "DEFAULT_RETRIEVAL_TOP_K",
     "DEFAULT_SKILL_LAZY_LOAD",
     "DEFAULT_WORKSPACE_BYTES_PER_USER",
+    "DIMENSION_RESOURCE_KINDS",
     "FIELD_TIERS",
     "MAX_RESULT_EXCERPT_CHARS",
     "MODEL_CATALOG",
@@ -489,6 +492,7 @@ __all__ = [
     "approval_kind_class",
     "canonical_args_digest",
     "catalog_entry",
+    "dimension_applies",
     "enforce_security_floor",
     "models_for_provider",
     "parse_agent_ref",

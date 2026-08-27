@@ -48,6 +48,7 @@ from expert_work.protocol import (
     ReserveRequest,
     ReserveResult,
     TenantQuotaRecord,
+    dimension_applies,
 )
 
 _QUOTA_CACHE_TTL_S: Final[float] = 60.0
@@ -70,8 +71,13 @@ local last_ms = tonumber(b[2]) or now_ms
 local elapsed = math.max(0, now_ms - last_ms)
 tokens = math.min(cap, tokens + elapsed * rate_milli / 1000)
 if tokens < cost then
-  local need = cost - tokens
-  local retry_ms = math.ceil(need * 1000 / rate_milli)
+  -- B-19: rate_milli == 0 marks a sticky ceiling (refill=0) -- no time at
+  -- which a retry would succeed. Return the -1 sentinel instead of
+  -- dividing by zero; the Python side maps it to retry_after_s=None.
+  local retry_ms = -1
+  if rate_milli > 0 then
+    retry_ms = math.ceil((cost - tokens) * 1000 / rate_milli)
+  end
   redis.call('HMSET', KEYS[1], 'tokens', tokens, 'last_ms', now_ms)
   redis.call('PEXPIRE', KEYS[1], ttl_ms)
   return {0, retry_ms, math.floor(tokens)}
@@ -127,7 +133,9 @@ class RedisQuotaService(QuotaService):
                 return CheckResult(
                     allowed=False,
                     blocked_dimension=dim_name,
-                    retry_after_s=math.ceil(retry_ms / 1000),
+                    # B-19 ② — Lua returns retry_ms = -1 for sticky
+                    # (refill=0) dimensions: no meaningful retry → None.
+                    retry_after_s=None if retry_ms < 0 else math.ceil(retry_ms / 1000),
                     remaining=remaining | {dim_name.value: tokens_left},
                 )
             remaining[dim_name.value] = tokens_left
@@ -218,6 +226,10 @@ class RedisQuotaService(QuotaService):
         out: list[tuple[QuotaDimension, str, int, float, int]] = []
         for row in rows:
             if not _scope_matches(row.scope, agent=req.agent, user=req.user):
+                continue
+            if not dimension_applies(row.dimension, req.resource_kind):
+                # B-19 ① — the dimension belongs to a different admission
+                # surface; this check must not spend from its bucket.
                 continue
             if row.dimension is QuotaDimension.QPS:
                 capacity = row.burst or row.limit_value
