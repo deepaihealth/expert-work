@@ -274,3 +274,47 @@ async def test_status_non_admin_allowed(
     resp = await client.get("/v1/platform/embedding-config/status", headers=_headers(uuid4()))
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"] == {"configured": True}
+
+
+# ─── PR-E3b — invalidation-bus broadcast on the write endpoint ─────────────
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_put_broadcasts_platform_embedding(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """``put`` self-invalidates THIS pod's cache; the endpoint must also
+    broadcast ``platform_embedding`` so peer replicas drop theirs."""
+    settings = settings.model_copy(
+        update={
+            "supported_providers": ["qwen"],
+            "platform_provider_credentials": {"qwen": "secret://x"},
+        }
+    )
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    spy_bus = _SpyBus()
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        resp = await client.put(
+            "/v1/platform/embedding-config",
+            headers=_headers(admin),
+            json={"embedding_provider": "qwen", "embedding_model": "text-embedding-v4"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert len(spy_bus.events) == 1
+    assert spy_bus.events[0].kind == "platform_embedding"  # type: ignore[attr-defined]

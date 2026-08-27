@@ -363,6 +363,14 @@ class _SpyBus:
         self.events.append(event)
 
 
+class _SpyCredentialCache:
+    def __init__(self) -> None:
+        self.tenant_calls: list[UUID] = []
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        self.tenant_calls.append(tenant_id)
+
+
 @pytest.mark.asyncio
 async def test_put_invalidates_agent_builds_locally_and_broadcasts(
     audit_store: InMemoryAuditLogStore,
@@ -388,8 +396,10 @@ async def test_put_invalidates_agent_builds_locally_and_broadcasts(
     )
     spy_runtime = _SpyRuntime()
     spy_bus = _SpyBus()
+    spy_cred_cache = _SpyCredentialCache()
     app.state.agent_runtime = spy_runtime
     app.state.invalidation_bus = spy_bus
+    app.state.credential_value_cache = spy_cred_cache
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
         put = await client.put(
@@ -399,6 +409,9 @@ async def test_put_invalidates_agent_builds_locally_and_broadcasts(
         )
     assert put.status_code == 200
     assert spy_runtime.tenant_calls == [_TENANT]
+    # PR-E3b — a config PUT can swap model_credentials_ref: the tenant's
+    # cached plaintext secret values (300s) must drop locally too.
+    assert spy_cred_cache.tenant_calls == [_TENANT]
     assert len(spy_bus.events) == 1
     event = spy_bus.events[0]
     assert event.kind == "tenant_config"

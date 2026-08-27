@@ -2037,8 +2037,12 @@ def build_agents_router() -> APIRouter:
             reason=payload.reason,
             disabled_by=actor_id,
         )
-        # Immediate effect on this instance; peers pick it up within the TTL.
+        # Immediate effect on this instance; PR-E3b broadcasts so peers drop
+        # their TTL cache immediately too (Redis-down degrades to the TTL).
         disable_service.invalidate(tenant_id, name)
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="agent_disable", tenant_id=str(tenant_id)))
 
         # RT-ADR-17 — bulk-cancel the agent's in-flight runs. A run THIS instance
         # owns aborts immediately (abort_event); a run held by another instance is
@@ -2118,6 +2122,9 @@ def build_agents_router() -> APIRouter:
             disabled_by=actor_id,
         )
         disable_service.invalidate(tenant_id, name)
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="agent_disable", tenant_id=str(tenant_id)))
         await emit(
             audit,
             tenant_id=tenant_id,

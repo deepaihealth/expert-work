@@ -53,3 +53,10 @@ class AgentDisableService:
     def invalidate(self, tenant_id: UUID, agent_name: str) -> None:
         """Drop the cached value so the next read reloads from DB."""
         self._cache.pop((tenant_id, agent_name), None)
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        """Drop every cached flag for ``tenant_id`` — the invalidation-bus
+        ``agent_disable`` event carries no agent name, and the cache is small
+        enough that a whole-tenant sweep is the simpler correct move."""
+        for key in [k for k in self._cache if k[0] == tenant_id]:
+            del self._cache[key]

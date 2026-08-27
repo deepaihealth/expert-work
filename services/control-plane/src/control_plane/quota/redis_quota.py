@@ -167,6 +167,11 @@ class RedisQuotaService(QuotaService):
             new_state=ReservationState.RELEASED,
         )
 
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        """Drop the tenant's cached quota rows so the next check reloads
+        from the store (quota-admin writes / invalidation-bus events)."""
+        self._quota_cache.pop(tenant_id, None)
+
     # ------------------------------------------------------------------ Redis helpers
 
     async def _eval_bucket(

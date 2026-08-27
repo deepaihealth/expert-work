@@ -371,3 +371,38 @@ async def test_reenabled_agent_queued_run_is_claimed(ctx: _Ctx) -> None:
     worker = ctx.build_queue_worker()
     started = await worker.run_once()
     assert started == 1  # re-enabled → the queued run is claimed + executed
+
+
+# ─── PR-E3b — invalidation-bus broadcast on disable/enable ─────────────────
+
+
+class _SpyBusE3b:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_disable_and_enable_broadcast_agent_disable(ctx: _Ctx) -> None:
+    """The kill switch's TTL cache is per pod: disable/enable must broadcast
+    an ``agent_disable`` event (tenant-scoped) so peer replicas drop their
+    cached flags immediately instead of serving stale for up to the TTL."""
+    spy_bus = _SpyBusE3b()
+    ctx.app.state.invalidation_bus = spy_bus
+
+    resp = await ctx.client.post("/v1/agents/support-bot/disable", json={"reason": "x"})
+    assert resp.status_code == 200, resp.text
+    assert len(spy_bus.events) == 1
+
+    resp = await ctx.client.post("/v1/agents/support-bot/enable", json={})
+    assert resp.status_code == 200, resp.text
+    assert len(spy_bus.events) == 2
+
+    for event in spy_bus.events:
+        assert event.kind == "agent_disable"  # type: ignore[attr-defined]
+        assert event.tenant_id == str(ctx.tenant_id)  # type: ignore[attr-defined]

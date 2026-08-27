@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._authz import _principal, console_only, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_secrets import PlatformSecretsService
 from expert_work.common.observability import current_trace_id_hex
@@ -153,6 +154,7 @@ def build_platform_embedding_config_router() -> APIRouter:
     @router.put("", dependencies=[Depends(platform_only(_PLATFORM_SCOPE_MESSAGE))])
     async def put_platform_embedding_config(
         payload: PlatformEmbeddingConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         embedding_config_service: Annotated[
             PlatformEmbeddingConfigService, Depends(_get_embedding_config_service)
@@ -241,6 +243,13 @@ def build_platform_embedding_config_router() -> APIRouter:
             rerank_model=payload.rerank_model,
             updated_by=principal.subject_id,
         )
+
+        # PR-E3b — ``put`` already invalidated THIS pod's cache; broadcast so
+        # peer replicas drop theirs too (the embedder re-reads per call, so no
+        # build-layer eviction is needed).
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_embedding"))
 
         await emit(
             audit,

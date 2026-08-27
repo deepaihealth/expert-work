@@ -252,6 +252,12 @@ def build_tenant_config_router() -> APIRouter:
         runtime = getattr(request.app.state, "agent_runtime", None)
         if runtime is not None:
             runtime.invalidate_tenant(scope.tenant_id)
+        # PR-E3b — a ``model_credentials_ref`` swap must also drop the tenant's
+        # cached plaintext secret values (300s CredentialValueCache), or embed/
+        # rerank/judge keep using the OLD key on this pod until the TTL.
+        cache = getattr(request.app.state, "credential_value_cache", None)
+        if cache is not None:
+            cache.invalidate_tenant(scope.tenant_id)
         bus = getattr(request.app.state, "invalidation_bus", None)
         if bus is not None:
             await bus.publish(

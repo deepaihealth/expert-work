@@ -44,7 +44,21 @@ KINDS = frozenset(
         "tenant_mcp",  # tenant MCP pool (+ agent builds, two-layer)
         "platform_mcp",  # platform MCP pool (+ all agent builds)
         "user_mcp_oauth",  # (tenant, user) OAuth pool (+ user builds)
-        "tenant_config",  # tenant config cache (+ agent builds)
+        "tenant_config",  # tenant config cache (+ secret values, + agent builds)
+        # --- PR-E3b-1: platform config plane ---
+        "platform_secrets",  # credential overlay + secret values (+ builds, scoped)
+        "platform_judge",  # judge config cache (+ all builds — baked in at build time)
+        "platform_tool_budget",  # tool-budget cache (+ all builds — baked in at build time)
+        "platform_embedding",  # embedding/rerank config cache (read per call)
+        "platform_dynamic_worker",  # dynamic-worker limits cache (read per run)
+        "platform_delegation",  # delegation-gate capacity cache (read per check)
+        "platform_quality",  # quality sampling/judge config cache (read by workers)
+        "agent_template",  # template catalog change → every tenant's builds
+        "platform_skill",  # platform skill change → every tenant's builds
+        "tenant_status",  # tenant suspended/active TTL cache
+        "agent_disable",  # (tenant, agent) kill-switch TTL cache — whole tenant drops
+        "quota_rules",  # per-tenant quota-rule cache inside the QuotaService
+        "rate_limit_override",  # per-tenant rate-limit override cache (PR-D wires the service)
     }
 )
 
@@ -302,7 +316,77 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         service = getattr(state, "tenant_config_service", None)
         if service is not None:
             service.invalidate(UUID(event.tenant_id))
+        # A config PUT can swap ``model_credentials_ref`` — the resolved
+        # plaintext values (300s CredentialValueCache) must drop with it.
+        cache = getattr(state, "credential_value_cache", None)
+        if cache is not None:
+            cache.invalidate_tenant(UUID(event.tenant_id))
         await _agent_build(event)
+
+    async def _platform_secrets(event: InvalidationEvent) -> None:
+        """Platform credential overlay: resolved-ref cache + plaintext value
+        cache + built agents (keys are baked in at build time). Tenant-scoped
+        events (tenant override endpoints) drop only that tenant's scope."""
+        service = getattr(state, "platform_secrets_service", None)
+        if service is not None:
+            service.invalidate()
+        cache = getattr(state, "credential_value_cache", None)
+        if event.tenant_id is not None:
+            if cache is not None:
+                cache.invalidate_tenant(UUID(event.tenant_id))
+            await _agent_build(event)
+        else:
+            if cache is not None:
+                cache.invalidate_all()
+            await _agent_build_all(event)
+
+    def _platform_config(attr: str, *, rebuild: bool) -> Handler:
+        """Handler over one of the TTL-cached singleton platform config
+        services (sync no-arg ``invalidate``). ``rebuild=True`` for configs
+        baked into ``BuiltAgent`` at build time (judge / tool budget) — those
+        must ALSO drop every build; the rest are re-read at call/run time."""
+
+        async def _handler(event: InvalidationEvent) -> None:
+            service = getattr(state, attr, None)
+            if service is not None:
+                service.invalidate()
+            if rebuild:
+                await _agent_build_all(event)
+
+        return _handler
+
+    async def _tenant_status(event: InvalidationEvent) -> None:
+        if event.tenant_id is None:
+            return
+        service = getattr(state, "tenant_status_service", None)
+        if service is not None:
+            service.invalidate(UUID(event.tenant_id))
+
+    async def _agent_disable(event: InvalidationEvent) -> None:
+        # The event carries no agent name — the cache is small, the whole
+        # tenant's entries drop.
+        if event.tenant_id is None:
+            return
+        service = getattr(state, "agent_disable_service", None)
+        if service is not None:
+            service.invalidate_tenant(UUID(event.tenant_id))
+
+    async def _quota_rules(event: InvalidationEvent) -> None:
+        if event.tenant_id is None:
+            return
+        service = getattr(state, "quota_service", None)
+        if service is not None:
+            service.invalidate_tenant(UUID(event.tenant_id))
+
+    async def _rate_limit_override(event: InvalidationEvent) -> None:
+        # ``app.state.tenant_rate_limit_overrides`` arrives with PR-D (the
+        # limiter-middleware rework); until then the getattr is always None
+        # and this handler is a deliberate no-op.
+        if event.tenant_id is None:
+            return
+        service = getattr(state, "tenant_rate_limit_overrides", None)
+        if service is not None:
+            service.invalidate(UUID(event.tenant_id))
 
     return {
         "agent_build": _agent_build,
@@ -312,4 +396,25 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         "platform_mcp": _platform_mcp,
         "user_mcp_oauth": _user_mcp_oauth,
         "tenant_config": _tenant_config,
+        "platform_secrets": _platform_secrets,
+        "platform_judge": _platform_config("platform_judge_config_service", rebuild=True),
+        "platform_tool_budget": _platform_config(
+            "platform_tool_budget_config_service", rebuild=True
+        ),
+        "platform_embedding": _platform_config("platform_embedding_config_service", rebuild=False),
+        "platform_dynamic_worker": _platform_config(
+            "platform_dynamic_worker_config_service", rebuild=False
+        ),
+        "platform_delegation": _platform_config(
+            "platform_delegation_config_service", rebuild=False
+        ),
+        "platform_quality": _platform_config("quality_config_service", rebuild=False),
+        # No inner cache of their own — the content is read from the store at
+        # build time, so the build layer IS the cache.
+        "agent_template": _agent_build_all,
+        "platform_skill": _agent_build_all,
+        "tenant_status": _tenant_status,
+        "agent_disable": _agent_disable,
+        "quota_rules": _quota_rules,
+        "rate_limit_override": _rate_limit_override,
     }

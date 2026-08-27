@@ -141,3 +141,41 @@ async def test_put_emits_audit(admin_client: tuple[AsyncClient, UUID]) -> None:
     matched = [e for e in entries if e.action.value == "platform_delegation_config:updated"]
     assert matched, "expected a PLATFORM_DELEGATION_UPDATED audit row"
     assert matched[0].details == {"max_concurrent_delegations": 5}
+
+
+# ─── PR-E3b — invalidation-bus broadcast on the write endpoint ─────────────
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_put_broadcasts_platform_delegation(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """``put`` self-invalidates THIS pod's cache; the endpoint must also
+    broadcast ``platform_delegation`` so peer replicas drop theirs."""
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    spy_bus = _SpyBus()
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        resp = await client.put(
+            "/v1/platform/delegation-config",
+            headers=_headers(admin),
+            json={"max_concurrent_delegations": 5},
+        )
+    assert resp.status_code == 200, resp.text
+    assert len(spy_bus.events) == 1
+    assert spy_bus.events[0].kind == "platform_delegation"  # type: ignore[attr-defined]

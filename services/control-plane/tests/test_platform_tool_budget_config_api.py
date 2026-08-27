@@ -127,3 +127,54 @@ async def test_put_emits_audit(admin_client: tuple[AsyncClient, UUID]) -> None:
     entries = list(store._rows.values())
     matched = [e for e in entries if e.action.value == "platform_tool_budget_config:updated"]
     assert matched, "expected a PLATFORM_TOOL_BUDGET_UPDATED audit row"
+
+
+# ─── PR-E3b — local build eviction + invalidation-bus broadcast ────────────
+
+
+class _SpyRuntime:
+    def __init__(self) -> None:
+        self.all_calls = 0
+
+    def invalidate_all(self) -> None:
+        self.all_calls += 1
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_put_drops_built_agents_locally_and_broadcasts(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """PR-E3b bug fix — the tool-budget switch is baked into ``BuiltAgent`` at
+    build time: the PUT must evict THIS pod's built agents (previously it only
+    cleared the 30s config cache, so existing builds kept the old value for up
+    to 1800s even on a single pod) AND broadcast ``platform_tool_budget``."""
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    spy_runtime = _SpyRuntime()
+    spy_bus = _SpyBus()
+    app.state.agent_runtime = spy_runtime
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        resp = await client.put(
+            "/v1/platform/tool-budget-config",
+            headers=_headers(admin),
+            json={"enabled": False},
+        )
+    assert resp.status_code == 200, resp.text
+    assert spy_runtime.all_calls == 1
+    assert len(spy_bus.events) == 1
+    assert spy_bus.events[0].kind == "platform_tool_budget"  # type: ignore[attr-defined]

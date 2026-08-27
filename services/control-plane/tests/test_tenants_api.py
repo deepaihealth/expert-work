@@ -444,3 +444,55 @@ async def test_create_tenant_password_never_in_audit(
     page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
     serialized = "\n".join(entry.model_dump_json() for entry in page.entries)
     assert pw not in serialized
+
+
+# ─── PR-E3b — invalidation-bus broadcast on tenant status flips ────────────
+
+
+class _SpyBusE3b:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_status_flips_broadcast_tenant_status(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """Suspend/reactivate must broadcast ``tenant_status`` so peer replicas
+    drop their TTL cache immediately (a suspended tenant otherwise keeps
+    passing the auth gate on other pods for up to the TTL)."""
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    sys_admin_id = uuid4()
+    await app.state.role_binding_repo.create(
+        subject_type="user",
+        subject_id=sys_admin_id,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        platform_scope=True,
+        granted_by="seed",
+    )
+    spy_bus = _SpyBusE3b()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        tid = await _create_tenant(client, sys_admin_id)
+        app.state.invalidation_bus = spy_bus  # after create: only status flips publish
+
+        deact = await client.post(
+            f"/v1/tenants/{tid}/deactivate", headers=_admin_headers(sys_admin_id)
+        )
+        assert deact.status_code == 200, deact.text
+        act = await client.post(f"/v1/tenants/{tid}/activate", headers=_admin_headers(sys_admin_id))
+        assert act.status_code == 200, act.text
+
+    assert len(spy_bus.events) == 2
+    for event in spy_bus.events:
+        assert event.kind == "tenant_status"  # type: ignore[attr-defined]
+        assert event.tenant_id == tid  # type: ignore[attr-defined]

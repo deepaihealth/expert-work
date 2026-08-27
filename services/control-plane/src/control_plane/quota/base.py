@@ -51,3 +51,7 @@ class QuotaService(Protocol):
 
     async def release_tokens(self, reservation_id: UUID, *, tenant_id: UUID) -> None:
         """Cancel a reservation; refund all reserved tokens."""
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        """Drop the tenant's cached quota rules so the next check reloads
+        from the store (quota-admin writes / invalidation-bus events)."""
