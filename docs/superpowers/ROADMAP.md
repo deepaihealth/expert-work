@@ -29,7 +29,7 @@
 
 ---
 
-## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-30 周六**(2026-08-24 由 08-26 周三改期);三道拍板 2026-08-24 已收:单副本首发 / 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
+## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-30 周六**(2026-08-24 由 08-26 周三改期);三道拍板 2026-08-24 已收:单副本首发(**2026-08-26 推翻改多副本首发,阻塞项七 PR #1312-#1318 已全清**)/ 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
 
 > 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
 > **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
@@ -38,7 +38,7 @@
 
 | # | 项 | 内容 | 量级 |
 |---|---|---|---|
-| PROD-1 | **live SSE 跨副本兜底**(X-10 波 2-1)——**2026-08-24 拍板单副本首发,降为「扩容到 2 副本前必做」,不阻塞首发**(prod overlay replicas-patch 写明恢复点) | 全仓只有 `InMemoryStreamBridge`(redis 后端 factory 里 `NotImplementedError` 占位)。生产 2 副本下,queue 模式 run 的 `/events` attach 落到非执行副本 = 补一次库后**永久挂空只吐心跳**——打的是**对外 API 的 SSE 契约**(文档站承诺的「看得见 agent」),不只控制台。最小解 = b1:非属主副本轮询 durable `run_event` 库(两案已在 `docs/research/2026-06-16-9.4-9.5-ha-failover-design.md:80-83`,P3 的 run_event 批写是现成地基) | 中,2-3 天 |
+| PROD-1 | ~~**live SSE 跨副本兜底**(X-10 波 2-1)~~ **✅ 已交付(2026-08-26,PR #1312;2026-08-26 用户拍板多副本首发,推翻 08-24 单副本拍板)**:b1 方案落地 —— 非属主副本 `/events` attach 轮询 durable `run_event` 表尾随(`has_live_stream` 只认 publisher-fed,防早 attach 毒探针;终态后静默两轮再收尾;end 帧从 run 行取 status+artifacts)。同批 #1313 CAS 守卫(`expected_statuses`+`guard_claimed_by` 堵取消/重宣两洞,顺带修 #1305 审批续跑产物种子 no-op)、#1316 verify_cancel 跨副本取消验收 harness、#1318 收口(prod 摘单副本 patch 回 base 2 副本 + smoke replicas 节)。测试环境 `89c63dc1` smoke 全绿;**真跨副本 attach 带凭据验收待跑** | ✅ |
 | PROD-2 | ~~**alertmanager receivers**(X-7 ①)~~ **✅ 已交付(2026-08-24,PR #1257)**:企微群机器人方案 —— 集群内 wecom-adapter(ConfigMap 脚本 + 复用 control-plane 镜像)converts Alertmanager JSON→企微 markdown,p0 追加 @all;URL 走 Secret `wecom-alert-webhook`(未建则 log-only 降级);**剩用户侧一步:建群机器人 + create secret(步骤在 base/secrets.example.yaml)** | ✅ |
 | PROD-3 | ~~**RLS 闸 1 拍板**~~ **✅ 已拍板(2026-08-24):书面接受单层 ORM 隔离首发**(记录在 production-release.md 拍板记录节);硬要求=生产应用账号建成非 superuser、无 bypassrls(secrets.env.example 已写明);FORCE RLS(捞回 PR B)= 发布后第一波 | ✅ |
 | PROD-4 | ~~**retention-cleanup-job 第二套审批超时**~~ **✅ 已定案(2026-08-24):核实 infra/k8s 零 CronJob manifest** —— 该 job(连同 billing-rollup / event-log-archive / audit-backup)只有代码没有部署物,test/prod 都不跑,风险不进生产;代码修回归 X-15①,**该 job 部署前必须先修**(production-release.md §4 已钉) | ✅ |
@@ -49,23 +49,24 @@
 
 | # | 项 | 触发条件 / 理由 |
 |---|---|---|
-| PROD-7 | **X-14 P2 钉版卫兵 + P1 金丝雀适配 prod** | e2b 事故复盘产物(评审漏钉版/CI 假件全绿/smoke 只探 HTTP 三层全漏);生产发布尤其需要。P2 半天先行 |
+| PROD-7 | **X-14 P2 钉版卫兵 ✅(2026-08-26,PR #1317:tools/ci/protected_pins.toml 清单 + Lint job 卫兵,改钉版不改清单 CI 红)+ P1 金丝雀适配 prod 未做** | e2b 事故复盘产物(评审漏钉版/CI 假件全绿/smoke 只探 HTTP 三层全漏);P1 金丝雀 run 进 release.sh 仍在 backlog(X-14) |
 | PROD-8 | ~~**egress token 24h 到期出网全挂**~~ **✅ 销案(2026-08-24 核实代码,ROADMAP 此条已过时)**:沙箱 PR-B #1b 已修 —— `agent_sandbox.py` 热会话总年龄封顶 `egress_token_ttl_s // 2`(12h)超龄强制重建,会话必死在 token 之前;407 可观测兜底(egress 审计指标)同波落地(PR-B #1a)。X-1 的 W1 遗留清单同步作废该条 |
-| PROD-9 | **X-3 触发器投递 CAS** | **启用触发器功能上生产则必做**:现有 source_run_id 去重是读-查-写,双副本 reconcile 有窄窗重复投递;不启用可缓 |
+| PROD-9 | ~~**X-3 触发器投递 CAS**~~ **✅ 已交付(2026-08-26,PR #1314)**:`deliver_run_result` 的读-查-写整段包进 per-thread `pg_advisory_xact_lock`(classid 8619,key=hashtext(thread_id);无 session_factory 退单进程语义);cron claim/retry/finalize 的 CAS 此前已安全,病灶只在投递段。testcontainers PG 集成测试实证同 thread 串行、异 thread 并行 | ✅ |
 | PROD-10 | **B-19 配额维度混扣** | **给第三方配配额则必做**(发对话会扣 image 桶、429 维度错乱、黏性维度 Retry-After 除零);不配可缓 |
 | PROD-11 | **P-4 拍板**(api_keys 凭据横向扩散) | 发 key 给第三方前至少把「只发 write key、永不发 admin」写成硬流程;修 rbac 映射另议 |
-| PROD-12 | **X-10 波 2-2 供应商 RPM 全局化** | 进程内限流 = 上游压力 × 副本数;2 副本首发可缓,**扩容前必须** |
+| PROD-12 | ~~**X-10 波 2-2 供应商 RPM 全局化**~~ **✅ 已交付(2026-08-26,PR #1315+#1318 静态除法)**:`effective_rpm = max(1, ceil(rpm / EXPERT_WORK_REPLICA_COUNT))`,env 已进 prod+test 两 overlay(=2),smoke 校验 env==spec.replicas 防分母漂移。Redis 全局令牌桶(真·全局化,弹性扩容不用改 env)仍是 backlog | ✅ |
 
 ### C · 明确不阻塞发布
 
 X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
 
-**进度(2026-08-24 周一收账,当晚改期周六)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置;主流程 BUG-1~5(#1259-#1261)+ 第二轮 BUG-6~8(#1265)全修,测试环境 `31e203a0` smoke 双发全过,平台技能 category 用户补录 51/52。**代码侧已就绪,改期到周六多出的三天排期**:
+**进度(2026-08-24 周一收账,当晚改期周六)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置;主流程 BUG-1~5(#1259-#1261)+ 第二轮 BUG-6~8(#1265)全修,测试环境 `31e203a0` smoke 双发全过,平台技能 category 用户补录 51/52。
 
-- 周二~周三:①测试环境交互面 + 三页 bug 修复人工点验(用户)②平台技能 category 补最后一条 sop-scoring-pipeline(用户)③ PROD-7 从「可选」转「做」——P2 钉版卫兵半天 + P1 金丝雀适配 prod 评估(我侧,时间富余不再省)
-- 周四~周五:④资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)⑤开荒完成后跑一轮 prod overlay 渲染预检(placeholder 扫描)提前暴露缺口,不留到发布日
+**进度(2026-08-26 用户拍板多副本首发 → 08-27 夜收账)**:08-24 单副本首发拍板被推翻,按 plan A 一夜清完全部多副本阻塞项 —— 七 PR #1312-#1318 全合(PROD-1 / CAS 守卫 / PROD-9 / PROD-12 / verify_cancel / PROD-7 P2 / 收口),测试环境发 `89c63dc1`(记录 #1319),smoke 含新 replicas 节全绿,prod overlay 回 base 2 副本。**剩余排期**:
+
+- 周四~周五:①资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)② 开荒完成后 prod overlay 渲染预检(placeholder 扫描)③ 测试环境真栈验收:跨副本 /events attach(带凭据)+ `tools/ha/verify_cancel.py` + PPT 内容质量人工抽查(用户)
 - 周六:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
-- 发布后第一波顺延不变:RLS PR B / PROD-1 + PROD-12(扩容前置)/ 按需 PROD-9/10/11
+- 发布后第一波:RLS PR B / X-14 P1 金丝雀 / Redis 全局令牌桶 / 取消亚秒化(invalidation_bus)/ 按需 PROD-10/11
 
 ---
 
@@ -387,7 +388,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 |---|---|---|
 | X-1 | **沙箱迁移波 4(收尾波)** | W1/W2/W3 全交付,波 4 因第三方对接插队而挂起。内容:**死字段裁决**(`sandbox_instance.node` + `spec.sandbox` 13 个死字段,15 个里只有 network 三键 + `persistent_workspace` 是活的)、沙箱指标接 Prometheus+Grafana、契约测试补全、文档(本地开发 / 发布 runbook / supervisor 冻结声明)。**另含 W1 遗留清单**(~~头号 egress token 24h~~ 已在沙箱 PR-B #1a/#1b 修掉——热会话 12h 强制重建+egress 审计指标,2026-08-24 核实销案;`pip install` 装进 user site 而 `python -I` 读不到;调试台不显示沙箱 stdout/退出码;明文 HTTP 走 proxy 恒 407 —— 空密码不发认证头) |
 | ~~X-2~~ | ~~CI pytest-xdist `-n auto`~~ | ✅ **已交付 PR #1159**(main `edbd8c96`)。实测 **29m17s → 11m32s(2.5x)**。三条教训:①「需先审 fixture 并行安全性」**是个不存在的前置** —— 零个 fixture 要改;真正挡路的是两个模块把 `uuid4()` 插进 parametrize id,导致各 worker 收集集不同。②**别拿本地数外推** —— 本地 `-n 4` 是 3.7x,runner 只有 2.5x(每 worker 都要 import 整个 app,固定开销被本地掩盖)。③基线自己在涨:P2 合入后 main 已经 **29m17s**,不是记录里的 18min |
-| X-3 | **触发器 program Spec2/Spec3**(来源:triggers-user-dimension program) | Spec1「对话核心」四 PR + 加固已全交付(#1039~#1043)。剩:**Spec2 通知**(2a webhook / 2b 长连接)、**Spec3 后台管理面 A + manifest triggers 弃用 C**。DEFER 池头号=**投递无 CAS/幂等**(多副本下双 reconcile 会重复投递,迁移多副本前必须按 `expert_work_source_run_id` 去重或 CAS claim;单副本今日无风险);次=TranscriptMirrorSweep 纯注入不重扫(投递消息不即入全文搜索)/ DEAD_LETTER→TRIGGER_FAILED 无专测 |
+| X-3 | **触发器 program Spec2/Spec3**(来源:triggers-user-dimension program) | Spec1「对话核心」四 PR + 加固已全交付(#1039~#1043)。剩:**Spec2 通知**(2a webhook / 2b 长连接)、**Spec3 后台管理面 A + manifest triggers 弃用 C**。DEFER 池头号~~投递无 CAS/幂等~~ **✅ 已修(2026-08-26 PR #1314=PROD-9,per-thread advisory lock 关窗)**;次=TranscriptMirrorSweep 纯注入不重扫(投递消息不即入全文搜索)/ DEAD_LETTER→TRIGGER_FAILED 无专测 |
 | X-4 | **用户维度运维页 BACKLOG**(用户 2026-07-15 定暂缓) | ① 成员页员工清除 —— 唯一未做的删除入口,需新后端端点(绕 member 闸 + 删 Keycloak 账号)+ 前端;② Phase 3b 90 天物理硬删(`UserWorkspaceStore.hard_delete` + retention-job 扫 `deleted_at`+`archived_object_key` + `WORKSPACE_HARD_DELETE` 审计) |
 | X-5 | **MCP allowlist 残留名不可移出**(来源:MCP 界面重设计 2026-07) | 目录条目被删后,租户 allowlist 残留名在 UI 无法移出,后端缺 **disable-by-name** 端点;现降级为「禁用 + 提示」的诚实态 |
 | X-6 | **平台技能导出/同步收尾**(来源:skill-export-sync) | ① 52 个导出包待推测试环境(`POST /v1/platform/skills/import` 幂等可重跑,PLATFORM_ADMIN 凭证在金库);② admin-ui 技能导出按钮(platform + tenant);③ tenant export 丢 `supporting_files` bug(`skills.py:1390` 没传,platform 侧 `platform_skills.py:1333` 是无损姿势可照抄) |
@@ -398,7 +399,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | X-11 | **mcp SDK 1.x→2.x + httpx2 迁移**(2026-08-20 立项,源头 dependabot #1229) | mcp 2.x 换 `httpx2` 依赖,`streamable_http_client` 签名变更(3 元组 + `httpx2.AsyncClient`),`orchestrator/tools/mcp.py:606-609` 起的整条 MCP 客户端层要迁;dependabot 已加 major ignore(做完把 `.github/dependabot.yml` 里那条一起删)。迁移要真栈测 MCP 工具(streamable-http + OAuth 路径) |
 | X-12 | **fastapi ≥0.137 迁移:路由自审适配懒挂载**(2026-08-20 立项,源头 dependabot #1233) | fastapi 0.137 起 `include_router` 懒挂载:`app.routes` 里是 `_IncludedRouter`,APIRoute 不再摊平(实测 0.136.3 摊平 / 0.137.2 起不摊,启动也不展开),控制面整族路由自审(console lockdown / external gate / NUL guard / reachability / app_factory)集体失明。迁移=自审改用 `fastapi.routing.iter_route_contexts` 遍历并核实 router 级依赖的合成语义(**这批是安全闸,依赖合成改错比不改危险,要变异自证**);生产代码零 `app.routes` 枚举已核实。两个 service 的 pyproject 钉了 `<0.137` + dependabot ignore,做完一起放开 |
 | X-13 | **e2b SDK 升级迁移 2.24.0→2.39.1+**(2026-08-21 立项,源头真栈事故) | #1233 曾把 `e2b` 抬到 2.39.1,其客户端 `validate_api_key` 强制 `e2b_`+hex 格式,ACS Agent Sandbox 私有协议 key 被本地拒绝 → 测试环境沙箱工具全挂(list_dir/exec_python/write_file);已回钉 `e2b==2.24.0`+`e2b-code-interpreter==2.7.0` + dependabot ignore。升级路径:确认 kruise patch_e2b 对新版兼容(或在 `_ensure_e2b_patched` 中和 validate_api_key)→ 按 deployment.md contract-run 重跑沙箱运行时契约探针 → 真栈 exec_python 冒烟 → 解 ignore |
-| X-14 | **发布稳定性加固**(2026-08-21 立项,源头 e2b 事故复盘:评审漏钉版/CI 假件全绿/smoke 只探 HTTP,三层防线全漏) | P1 金丝雀 run 进 release.sh(预置 smoke 服务账号+金丝雀 Agent,真 run 走 exec_python+write_file+save_artifact+产物下载,断言 end.status=success,**绿才算发布成功**,红提示 rollback.sh;`canonical-agent-e2e-test` runbook 自动化)/ P2 受保护钉版 CI 卫兵(e2b/fastapi/mcp/kruise rev 等带兼容性注释的钉版入清单文件,pyproject 改了钉版而清单未同步改 → CI 红)/ P3 sandbox create 失败率 alertmanager 告警 / P4 约定:动沙箱链路依赖(e2b/kruise/supervisor/镜像)必跑 deployment.md contract-run / P5 约定:发布记录 PR 写上一版 tag 便于一键回滚。建议 P1+P2 先行(~1.5 天) |
+| X-14 | **发布稳定性加固**(2026-08-21 立项,源头 e2b 事故复盘:评审漏钉版/CI 假件全绿/smoke 只探 HTTP,三层防线全漏)——**P2 ✅ 已交付(2026-08-26,PR #1317=PROD-7):`tools/ci/protected_pins.toml` 6 条钉版清单 + Lint job 子串断言卫兵,合法升级=同 PR 改清单** | P1 金丝雀 run 进 release.sh(预置 smoke 服务账号+金丝雀 Agent,真 run 走 exec_python+write_file+save_artifact+产物下载,断言 end.status=success,**绿才算发布成功**,红提示 rollback.sh;`canonical-agent-e2e-test` runbook 自动化)/ P3 sandbox create 失败率 alertmanager 告警 / P4 约定:动沙箱链路依赖(e2b/kruise/supervisor/镜像)必跑 deployment.md contract-run / P5 约定:发布记录 PR 写上一版 tag 便于一键回滚 |
 | X-15 | **B-20 终审 follow-up 两条**(2026-08-23 立项,#1253 独立终审 I-1/I-2) | ① `retention-cleanup-job/job.py:207` 存在**第二套审批超时实现**:直接 `mark_decided(TIMEOUT)` 不走 `resolve_approval_decision`(不写 checkpoint、不 spawn continuation),与 control-plane sweep 抢同一 CAS,它抢赢则「超时保守继续」静默不发生;**目前未部署**(infra 无该 CronJob),潜伏项——删掉该路径或改走同一内核;② `orchestrator/sse.py:1404` 审批行 `user_id=None` 写死而 `record.user_id` 在手上,sweep 续跑恒 `caller_user_id=None` 丢 per-user OAuth MCP pool key,1h 澄清超时使该路径变常态;修=一行透传 + 存量回填迁移 |
 
 ---
@@ -460,7 +461,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 1. ~~**B-20**(审批列表分流)~~ ✅ 主体已交付(2026-08-23);② 通知路由拆给 D-6(对话内横幅)与 X-7(告警)
 2. **D-5**(对话详情页按轮重建+尾轮 live)→ **D-6**(就地批/拒/取消,依赖 D-5;含 B-20 遗留「澄清单发起人自决」)—— **用户已下口令,进行中**
-3. **X-14 P1+P2**(发布稳定性:金丝雀 run 进 release.sh + 受保护钉版 CI 卫兵)—— e2b 事故复盘产物,~1.5 天
+3. **X-14 P1**(金丝雀 run 进 release.sh;P2 钉版卫兵 ✅ #1317)—— e2b 事故复盘产物,~1 天
 4. **X-13**(e2b SDK 升级迁移)—— 与 X-11/X-12 同为钉版迁移池,择机
 5. **B-19**(配额 check 不按 resource_kind 过滤维度)—— 直接影响对外 429 行为,工程可直接开工
 6. **P-1~P-5 拍板** —— 产品题,不拍板工程动不了;P-4(api_keys 凭据横向扩散)风险最高建议先议

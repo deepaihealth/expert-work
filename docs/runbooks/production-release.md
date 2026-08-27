@@ -8,7 +8,7 @@
 
 | 决策 | 内容 | 恢复点 |
 |---|---|---|
-| 单副本首发 | control-plane `replicas: 1`(`overlays/prod/replicas-patch.yaml`),分布式语义(postgres checkpointer / redis quota / sql_encrypted)保持开启 | ROADMAP PROD-1(live SSE 跨副本兜底)做完 → 删该 patch 回 base 2 副本 |
+| ~~单副本首发~~ **改判:多副本首发(2026-08-26 拍板推翻)** | 阻塞项已全清(#1312 PROD-1 跨副本 SSE / #1313 CAS 守卫 / #1314 PROD-9 投递锁 / #1315+#1318 PROD-12 RPM 除法):`replicas-patch.yaml` 已删,control-plane 回 base `replicas: 2`,`EXPERT_WORK_REPLICA_COUNT="2"` 进 configmap-patch(与 spec.replicas 必须同步改,smoke 校验一致) | —(恢复点已兑现) |
 | 书面接受单层租户隔离 | 生产库只有 ORM WHERE 一层;RLS 完全惰性。**应用账号必须建成非 superuser、无 bypassrls**,给日后 FORCE RLS 留门 | 发布后第一波捞回 RLS PR B(ROADMAP PROD-3) |
 | 告警走企微群机器人 | P0(+@all)/P1/P2 全进「生产告警」群,经 wecom-adapter(PROD-2) | 通道扩展(邮件/电话)按需另议 |
 
@@ -184,10 +184,12 @@ tools/deploy/rollback.sh prod <上一版 tag>     # 秒级 set image,无确认�
 
 ## 4. 已接受风险与延后项(首发)
 
-- 单副本:pod 挂 = 分钟级中断到重新调度;live SSE 跨副本兜底(PROD-1)做完才扩。
+- ~~单副本~~ 2026-08-26 改多副本首发(2 副本),原风险条目作废;取消传播走心跳 CAS
+  最长 ~10s(亚秒化=发布后 invalidation_bus 接线)。
 - 单层租户隔离(RLS 惰性):发布后第一波。
-- 金丝雀未自动化(PROD-7)、触发器投递 CAS(X-3,单副本无风险)、配额维度混扣
-  (B-19,给第三方配配额前必修)、供应商 RPM 进程内限流(扩容前必须全局化,PROD-12)。
+- 金丝雀未自动化(X-14 P1;P2 钉版卫兵已上 #1317)、配额维度混扣
+  (B-19,给第三方配配额前必修)、RPM 静态除法非全局桶(Redis 令牌桶=发布后,
+  弹性扩容需与 `EXPERT_WORK_REPLICA_COUNT` 同步改)。触发器投递 CAS 已修(#1314)。
 - retention-cleanup-job / billing-rollup-job / event-log-archive-job /
   audit-backup-worker:**只有代码没有部署物**(infra/k8s 零 CronJob),test 也
   没跑,首发保持一致;retention job 部署前必须先修 X-15①(第二套审批超时)。
