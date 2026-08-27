@@ -11,6 +11,7 @@ pin the new admission contract.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from uuid import UUID, uuid4
@@ -20,11 +21,16 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from redis.exceptions import RedisError
 
+from control_plane.api._quota_admission import check_admission
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.quota import InMemoryQuotaService
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.persistence.quota import InMemoryTenantQuotaStore
+from expert_work.persistence.quota import (
+    InMemoryTenantQuotaStore,
+    InMemoryTokenReservationStore,
+)
 from expert_work.protocol import (
     AuditAction,
     AuditQuery,
@@ -354,3 +360,133 @@ async def test_quota_buckets_isolated_per_tenant(
             json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
         )
         assert resp.status_code == 201
+
+
+# ---------------------------------------------------------------------------
+# B-19 — resource_kind dimension routing + sticky Retry-After
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_session_not_blocked_by_exhausted_image_storage(
+    app_factory: tuple[FastAPI, InMemoryTenantQuotaStore],
+    admission_client: AsyncClient,
+) -> None:
+    """B-19 ① production symptom — image storage written full must not 429
+    session creation (the admission check is ``resource_kind="session"``)."""
+    _, quota_store = app_factory
+    await quota_store.upsert(
+        tenant_id=_TENANT,
+        patch=TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=0,  # ceiling fully consumed
+            burst=None,
+        ),
+        updated_by="test",
+    )
+
+    resp = await admission_client.post(
+        "/v1/sessions",
+        json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
+    )
+    assert resp.status_code == 201
+
+
+def _in_memory_quota(quota_store: InMemoryTenantQuotaStore) -> InMemoryQuotaService:
+    return InMemoryQuotaService(
+        quota_store=quota_store,
+        reservation_store=InMemoryTokenReservationStore(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sticky_denial_omits_retry_after(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """B-19 ② — a sticky (refill=0) dimension denial carries no ``Retry-After``
+    header, a JSON ``null`` ``retry_after_s``, and a ``None`` on the audit row —
+    retrying can never help."""
+    quota_store = InMemoryTenantQuotaStore()
+    await quota_store.upsert(
+        tenant_id=_TENANT,
+        patch=TenantQuotaPatch(
+            dimension=QuotaDimension.IMAGE_STORAGE_BYTES,
+            scope={},
+            limit_value=100,
+            burst=None,
+        ),
+        updated_by="test",
+    )
+    quota = _in_memory_quota(quota_store)
+
+    denial = await check_admission(
+        quota=quota,
+        audit=build_default_audit_logger(audit_store),
+        tenant_id=_TENANT,
+        actor_id="tester",
+        agent=None,
+        resource_kind="image_upload",
+        cost=1,
+        cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: 200},
+    )
+
+    assert denial is not None
+    assert denial.status_code == 429
+    assert "retry-after" not in denial.headers
+    body = json.loads(bytes(denial.body))
+    assert body["error"]["dimension"] == "image_storage_bytes"
+    assert body["error"]["retry_after_s"] is None
+
+    page = await audit_store.query(
+        AuditQuery(tenant_id=_TENANT, action=AuditAction.QUOTA_RATE_LIMIT_DENIED)
+    )
+    assert len(page.entries) == 1
+    assert page.entries[0].details.get("dimension") == "image_storage_bytes"
+    assert page.entries[0].details.get("retry_after_s") is None
+
+
+@pytest.mark.asyncio
+async def test_refillable_denial_keeps_retry_after(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """B-19 ② non-regression — a refillable (QPS) denial keeps the integer
+    ``Retry-After`` header matching the body."""
+    quota_store = InMemoryTenantQuotaStore()
+    await quota_store.upsert(
+        tenant_id=_TENANT,
+        patch=TenantQuotaPatch(
+            dimension=QuotaDimension.QPS,
+            scope={},
+            limit_value=1,
+            burst=1,
+        ),
+        updated_by="test",
+    )
+    quota = _in_memory_quota(quota_store)
+    audit = build_default_audit_logger(audit_store)
+
+    first = await check_admission(
+        quota=quota,
+        audit=audit,
+        tenant_id=_TENANT,
+        actor_id="tester",
+        agent=None,
+        resource_kind="session",
+    )
+    assert first is None
+
+    denial = await check_admission(
+        quota=quota,
+        audit=audit,
+        tenant_id=_TENANT,
+        actor_id="tester",
+        agent=None,
+        resource_kind="session",
+    )
+    assert denial is not None
+    assert denial.status_code == 429
+    body = json.loads(bytes(denial.body))
+    assert body["error"]["dimension"] == "qps"
+    assert isinstance(body["error"]["retry_after_s"], int)
+    assert denial.headers["Retry-After"] == str(body["error"]["retry_after_s"])
