@@ -686,6 +686,47 @@ async def test_build_agent_nondefault_kind_reaches_worker_build_fn(
     assert wbf.calls[0]["role"] == "researcher"
 
 
+# ---------------------------------------------------------------------------
+# 动态子智能体委派率增强(层 2)— spawn_worker registered ⇔ delegation rubric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_agent_with_spawn_worker_injects_delegation_rubric() -> None:
+    env = ToolEnv(worker_build_fn=_RecordingWorkerBuildFn())
+    async with make_checkpointer("memory") as cp:
+        built = await _build(_spec(), secret_store=_secret_store(), checkpointer=cp, tool_env=env)
+    assert "# Subtask delegation" in built.system_prompt
+    assert "spawn_worker" in built.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_build_agent_dynamic_workers_disabled_injects_nothing() -> None:
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["dynamic_workers"] = {"enabled": False}
+    env = ToolEnv(worker_build_fn=_RecordingWorkerBuildFn())
+    async with make_checkpointer("memory") as cp:
+        built = await _build(
+            AgentSpec.model_validate(doc),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            tool_env=env,
+        )
+    # 一字不注入 — the opted-out agent's prompt never mentions the tool.
+    assert "Subtask delegation" not in built.system_prompt
+    assert "spawn_worker" not in built.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_build_agent_unwired_worker_build_fn_injects_nothing() -> None:
+    # No ``worker_build_fn`` on the env (platform switch off / tests) — the
+    # tool never registers, so the rubric must not appear either.
+    async with make_checkpointer("memory") as cp:
+        built = await _build(_spec(), secret_store=_secret_store(), checkpointer=cp)
+    assert "Subtask delegation" not in built.system_prompt
+    assert "spawn_worker" not in built.system_prompt
+
+
 def _knowledge_spec() -> AgentSpec:
     doc = deepcopy(_MINIMAL_SPEC)
     doc["spec"]["knowledge"] = {"knowledge_base_refs": ["hr-policies"]}

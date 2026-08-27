@@ -153,6 +153,7 @@ from orchestrator.tools.skill_seed import (
     sanitize_agent_key,
     seed_drop_audit_entries,
 )
+from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
@@ -1022,6 +1023,11 @@ async def build_agent(
         current_date=current_date,
         tool_use_enforcement=tool_use_enforcement,
         spotlight=spec.spec.defenses.prompt_injection == "spotlight",
+        # 动态子智能体委派率增强(层 2)— gated on the spawn_worker tool having
+        # actually registered for THIS build: the per-agent dynamic_workers
+        # opt-out, the platform wiring switch, and the depth cap all fold into
+        # that one fact, so an agent without the tool never reads its rubric.
+        worker_delegation=SPAWN_WORKER_TOOL_NAME in registry,
     )
 
     # Capability Uplift Sprint #8 (Mini-ADR U-8) — render mode for the
@@ -1532,6 +1538,24 @@ def _current_date_block(now: datetime) -> str:
 #: knowledge, to act in the same turn rather than promise a future action, and
 #: to never fabricate tool output. Aligns with hermes-agent's
 #: ``TOOL_USE_ENFORCEMENT`` + ``TASK_COMPLETION`` guidance.
+# 动态子智能体委派率增强(层 2)— appended (with its ``# Subtask delegation``
+# heading) as the system prompt's FINAL section whenever this build registered
+# the ``spawn_worker`` tool. Domain-free by design: a scale rubric over work
+# *shapes* only, so it composes with any agent prompt — one that carries its
+# own delegation policy keeps it; this section is the generic floor.
+_WORKER_DELEGATION_BLOCK = (
+    "Before starting a task, judge its scale. Single-point work (one "
+    "question, one document, one step): do it yourself — do not delegate. "
+    "Multi-track work (three or more similar, mutually independent "
+    "sub-items, or several long materials to read in full): hand the "
+    "parallelizable parts to the spawn_worker tool and keep only the "
+    "aggregation and judgment here. Large work: list the subtasks first, "
+    "delegate in batches, and review each batch's results before the next. "
+    "Never delegate writes, design judgment, or the final call on "
+    "deliverables. When delegating, write the task fully self-contained — "
+    "the worker sees none of this conversation."
+)
+
 _TOOL_USE_ENFORCEMENT_BLOCK = (
     "You have tools that fetch real, current information and take real actions "
     "(web search, code execution, file and system access, and more). When the "
@@ -1586,6 +1610,7 @@ def _assemble_system_prompt(
     current_date: str | None = None,
     tool_use_enforcement: str | None = None,
     spotlight: bool = False,
+    worker_delegation: bool = False,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -1612,6 +1637,7 @@ def _assemble_system_prompt(
         or current_date
         or tool_use_enforcement
         or spotlight
+        or worker_delegation
     ):
         return base
 
@@ -1680,6 +1706,12 @@ def _assemble_system_prompt(
             "The following <long-term-memory> blocks are facts/preferences carried "
             "across sessions.\n\n" + "\n\n".join(memory_blocks)
         )
+
+    # 动态子智能体委派率增强(层 2)— scale rubric for when to hand work to
+    # spawn_worker. Appended last, after the advisory blocks, per the
+    # append-a-section convention above.
+    if worker_delegation:
+        pieces.append("\n\n# Subtask delegation\n" + _WORKER_DELEGATION_BLOCK)
 
     return "".join(pieces)
 
