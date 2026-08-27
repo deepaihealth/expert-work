@@ -191,7 +191,13 @@ export interface AgentManifest {
     idle_timeout_s?: number;
     // Orchestrator-Worker — whether the agent may spawn ephemeral workers at
     // run time (spawn_worker). Block absent = enabled (the platform default).
-    dynamic_workers?: { enabled?: boolean; [k: string]: unknown } | null;
+    // ``model`` overrides the workers' LLM (absent = inherit the parent's
+    // model; no fallback chain — the protocol validator rejects one).
+    dynamic_workers?: {
+      enabled?: boolean;
+      model?: ModelFields | null;
+      [k: string]: unknown;
+    } | null;
     // RAG — tenant knowledge bases this agent may search (activates the
     // knowledge_search tool). Block absent = no knowledge access.
     knowledge?: { knowledge_base_refs?: string[]; [k: string]: unknown } | null;
@@ -1064,6 +1070,32 @@ export function setDynamicWorkersOn(m: unknown, on: boolean): AgentManifest {
   return patchSpec(m, {
     dynamic_workers: { ...(specOf(m).dynamic_workers ?? {}), enabled: false },
   });
+}
+
+// Worker model override — ``dynamic_workers.model``. Absent = the workers
+// inherit the parent's model verbatim; set = full ModelFields knob set (no
+// fallback chain — the backend validator rejects one). ``null`` / an empty
+// pick clears back to inherit, dropping the whole block when nothing else
+// (e.g. ``enabled:false``) remains — same shape discipline as
+// ``setVisionModel``/``setDynamicWorkersOn``.
+export const readWorkerModel = (m: unknown): ModelFields | undefined =>
+  specOf(m).dynamic_workers?.model ?? undefined;
+
+export function setWorkerModel(
+  m: unknown,
+  model: ModelFields | null,
+): AgentManifest {
+  const keep =
+    model !== null &&
+    (model.provider !== undefined || model.name !== undefined);
+  const existing = specOf(m).dynamic_workers ?? {};
+  if (!keep) {
+    const { model: _dropped, ...rest } = existing;
+    return patchSpec(m, {
+      dynamic_workers: Object.keys(rest).length > 0 ? rest : undefined,
+    });
+  }
+  return patchSpec(m, { dynamic_workers: { ...existing, model } });
 }
 
 // ---- structured output field editor (config-page redesign v2 Task 7) ----

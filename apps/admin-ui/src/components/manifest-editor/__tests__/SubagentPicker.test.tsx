@@ -79,4 +79,32 @@ describe("SubagentPicker", () => {
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(last.spec?.subagents).toBeUndefined();
   });
+
+  it("shows the worker-model override only while dynamic workers are on", () => {
+    const { rerender } = render(
+      <SubagentPicker formData={SEED} onChange={vi.fn()} />,
+    );
+    expect(screen.getByTestId("af-worker-model")).toBeInTheDocument();
+    const off: AgentManifest = {
+      ...SEED,
+      spec: { dynamic_workers: { enabled: false } },
+    };
+    rerender(<SubagentPicker formData={off} onChange={vi.fn()} />);
+    expect(screen.queryByTestId("af-worker-model")).not.toBeInTheDocument();
+  });
+
+  it("clearing the worker-model override drops dynamic_workers.model", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const seeded: AgentManifest = {
+      ...SEED,
+      spec: {
+        dynamic_workers: { model: { provider: "glm", name: "glm-5.3-flash" } },
+      },
+    };
+    render(<SubagentPicker formData={seeded} onChange={onChange} />);
+    await user.click(screen.getByTestId("af-worker-model-clear"));
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.dynamic_workers).toBeUndefined();
+  });
 });

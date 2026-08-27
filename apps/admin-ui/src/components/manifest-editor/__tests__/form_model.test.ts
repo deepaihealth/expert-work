@@ -7,6 +7,7 @@ import {
   readDescription,
   readDynamicWorkersOn,
   readKnowledgeRefs,
+  readWorkerModel,
   readMemoryOn,
   readSkills,
   readSubagents,
@@ -35,6 +36,7 @@ import {
   setApprovalTools,
   setDynamicWorkersOn,
   setKnowledgeRefs,
+  setWorkerModel,
   setReflectionEvaluator,
   setSkills,
   setSubagents,
@@ -610,6 +612,45 @@ describe("dynamic workers (spawn_worker opt-out)", () => {
 
   it("does not mutate the input manifest", () => {
     setDynamicWorkersOn(seed, false);
+    expect(
+      (seed.spec as { dynamic_workers?: unknown }).dynamic_workers,
+    ).toBeUndefined();
+  });
+});
+
+describe("worker model override (dynamic_workers.model)", () => {
+  const flash = { provider: "glm", name: "glm-5.3-flash", effort: "low" };
+
+  it("reads undefined when absent (workers inherit the parent model)", () => {
+    expect(readWorkerModel(seed)).toBeUndefined();
+  });
+
+  it("set writes dynamic_workers.model with the full knob set", () => {
+    const next = setWorkerModel(seed, flash);
+    expect(next.spec?.dynamic_workers?.model).toEqual(flash);
+    expect(readWorkerModel(next)).toEqual(flash);
+  });
+
+  it("clear (null) drops the whole block when nothing else remains", () => {
+    const next = setWorkerModel(setWorkerModel(seed, flash), null);
+    expect(next.spec?.dynamic_workers).toBeUndefined();
+    expect(readWorkerModel(next)).toBeUndefined();
+  });
+
+  it("clear keeps a sibling enabled:false", () => {
+    const off = setDynamicWorkersOn(seed, false);
+    const withModel = setWorkerModel(off, flash);
+    const cleared = setWorkerModel(withModel, null);
+    expect(cleared.spec?.dynamic_workers).toEqual({ enabled: false });
+  });
+
+  it("an empty pick (no provider/name) clears like null", () => {
+    const next = setWorkerModel(setWorkerModel(seed, flash), {});
+    expect(next.spec?.dynamic_workers).toBeUndefined();
+  });
+
+  it("does not mutate the input manifest", () => {
+    setWorkerModel(seed, flash);
     expect(
       (seed.spec as { dynamic_workers?: unknown }).dynamic_workers,
     ).toBeUndefined();

@@ -103,3 +103,45 @@ def test_manage_task_stripped_even_when_allowlist_keeps_it() -> None:
     )
     names2 = {getattr(t, "name", None) for t in w2.spec.tools}
     assert "manage_task" not in names2
+
+
+def test_worker_model_override_replaces_model() -> None:
+    """``dynamic_workers.model`` 覆盖 worker 的 LLM(全套旋钮),未设则继承
+    父 model 原样 —— 便宜档 fan-out 的入口(2026-08-27 用户拍板)。"""
+    parent = _parent(
+        dynamic_workers={
+            "model": {
+                "provider": "glm",
+                "name": "glm-5.3-flash",
+                "effort": "low",
+                "max_tokens": 2048,
+            }
+        }
+    )
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.model.provider == "glm"
+    assert w.spec.model.name == "glm-5.3-flash"
+    assert w.spec.model.effort == "low"
+    assert w.spec.model.max_tokens == 2048
+    # 父 spec 自身不被变异,override 也随 dynamic_workers 继承给孙 worker
+    assert parent.spec.model.name == "deepseek-v4-pro"
+    assert w.spec.dynamic_workers.model is not None
+    # 未配置 → 继承路径不受影响
+    w2 = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    assert w2.spec.model == _parent().spec.model
+
+
+def test_worker_model_override_rejects_fallback() -> None:
+    """worker 是短命 fan-out,不配备用链(协议校验器拒绝)。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="fallback"):
+        _parent(
+            dynamic_workers={
+                "model": {
+                    "provider": "glm",
+                    "name": "glm-5.3-flash",
+                    "fallback": [{"provider": "deepseek", "name": "deepseek-v4-flash"}],
+                }
+            }
+        )

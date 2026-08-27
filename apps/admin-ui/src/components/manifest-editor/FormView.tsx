@@ -489,7 +489,9 @@ export function FormView({
 
     knowledge: <KnowledgePicker formData={formData} onChange={onChange} />,
     skills: <SkillPicker formData={formData} onChange={onChange} />,
-    subagents: <SubagentPicker formData={formData} onChange={onChange} />,
+    subagents: (
+      <SubagentPicker formData={formData} onChange={onChange} catalog={catalog} />
+    ),
   };
 
   return (
