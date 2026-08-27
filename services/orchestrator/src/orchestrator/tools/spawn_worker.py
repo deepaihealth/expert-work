@@ -136,12 +136,32 @@ class SpawnWorkerTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name=SPAWN_WORKER_TOOL_NAME,
+            # 委派率增强(层 0)— the delegation judgment lives HERE, at the
+            # decision site: domain-free *shape* criteria for when to
+            # delegate, mirrored by the system-prompt scale rubric (层 2).
             description=(
                 "Spawn an ephemeral worker sub-agent to complete a focused subtask "
-                "in isolation, then return its result. Use this to decompose work "
-                "you can parallelize or that benefits from a fresh, focused context. "
-                "The worker runs fresh with only 'task' as its instruction — it sees "
-                "none of this conversation — and is discarded when done."
+                "in isolation, then return its result. Workers are lightweight, "
+                "fast, and cheap; several can run in parallel; each starts with a "
+                "fresh context — it sees none of this conversation, only 'task' — "
+                "and is discarded when done. They excel at reading, extracting, "
+                "and organizing work, keeping bulk material out of this "
+                "conversation's context.\n"
+                "USE this tool proactively — do not wait to be asked — whenever "
+                "the work has one of these shapes, regardless of domain: "
+                "(1) three or more similar, mutually independent sub-items "
+                "(process each one, then aggregate); (2) several long materials "
+                "must be read in full while only the conclusions matter here; "
+                "(3) exploratory search — finding a small amount of relevant "
+                "information in a large body of content.\n"
+                "Do NOT use it for: small work a single step can finish; work "
+                "involving writes or the final decision (those stay here); work "
+                "so dependent on this conversation that the task cannot be "
+                "written self-contained.\n"
+                "Write 'task' fully self-contained: spell out identifiers, "
+                "scope, and the expected output format, and never reference "
+                "'above' or 'earlier'. Treat worker results as raw material — "
+                "verify key conclusions here before relying on them."
             ),
             parameters={
                 "type": "object",

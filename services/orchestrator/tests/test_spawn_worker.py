@@ -102,6 +102,28 @@ def test_spec_name_and_params() -> None:
     assert spec.is_parallel_safe is True
 
 
+def test_spec_description_carries_shape_criteria() -> None:
+    """委派率增强(层 0)— the description carries the domain-free shape rubric,
+    so the delegation judgment lives at the decision site. Pinned phrase by
+    phrase so a future rewrite cannot silently drop a criterion."""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description
+    # Worker profile: fresh context, parallel, cheap.
+    assert "sees none of this conversation" in desc
+    assert "parallel" in desc
+    # Proactive trigger — don't wait for the user to ask for delegation.
+    assert "proactively" in desc
+    # Positive shape criteria (should-delegate).
+    assert "three or more similar, mutually independent sub-items" in desc
+    assert "read in full" in desc
+    assert "exploratory search" in desc
+    # Negative criteria — writes / final decisions stay with the caller.
+    assert "Do NOT use" in desc
+    assert "final decision" in desc
+    # Self-contained task contract + verify-results clause.
+    assert "self-contained" in desc
+    assert "verify" in desc
+
+
 # --- happy path --------------------------------------------------------------
 
 
