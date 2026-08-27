@@ -584,6 +584,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               onInspectRow={handleInspectRow}
               streamTurnKey={streamTurnId}
               liveByStep={tokenStream.liveByStep}
+              // ③ 反馈 — 入参折叠区按 variables 声明序排(manifest 在手,
+              // 直接给声明序;拿不到 manifest 的对话详情页不传 = 现状序)。
+              inputOrder={promptVariables.map((v) => v.name)}
               registerHistoryRow={registerHistoryRow}
               rate={rate}
               isSystemAdmin={isSystemAdmin}

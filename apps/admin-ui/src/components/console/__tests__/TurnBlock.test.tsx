@@ -8,7 +8,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { App } from "antd";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
@@ -285,6 +285,32 @@ describe("TurnBlock", () => {
     expect(box.querySelector("details")).not.toBeNull();
     // 本文件跑 en(同 ③' 的 "Thinking…" 断言)。
     expect(box.querySelector("summary")).toHaveTextContent("2 inputs");
+  });
+
+  // ③ 反馈 — 入参按 Agent 配置的 variables 声明序排:声明的键按声明序在前,
+  // 未声明的键按原相对序拖后;不传 inputOrder 保持后端 JSON 序(现状)。
+  it("⑤c inputOrder puts declared keys first (declaration order), the rest keep original order", () => {
+    const turn = makeConsoleTurn([], {
+      inputs: { zeta: "9", city: "上海", alpha: "1" },
+    });
+    renderTurnBlock({ ...makeBaseProps(turn), inputOrder: ["alpha", "city"] });
+    const rows = screen
+      .getAllByTestId("console-turn-input-row")
+      .map((el) => el.textContent ?? "");
+    expect(rows).toEqual(["alpha=1", "city=上海", "zeta=9"]);
+  });
+
+  // ③ 反馈 — 每行行尾复制按钮,复制的是值本身(不是 k=v)。
+  it("⑤d each input row's copy button copies the value only", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const turn = makeConsoleTurn([], { inputs: { city: "上海" } });
+    renderTurnBlock(makeBaseProps(turn));
+    await userEvent.click(screen.getByTestId("console-turn-input-copy-city"));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("上海"));
   });
 
   // 修复轮 2 —— 卡片空白是个大靶子,只许换高亮轮:`onSelect` 响,`onInspect`

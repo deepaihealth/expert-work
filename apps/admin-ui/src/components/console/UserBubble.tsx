@@ -11,6 +11,7 @@
 import { Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import { CopyButton } from "../CopyButton";
 import type { Attachment } from "../turn/types";
 
 const { Text } = Typography;
@@ -19,6 +20,22 @@ const { Text } = Typography;
  *  OSS URL / 免责声明 / JSON,摊开是一堵墙(2026-08-26 用户反馈)。 */
 const INPUTS_INLINE_CHARS = 120;
 
+/** ③ 反馈 — 排序:``order``(Agent 配置 variables 声明序)命中的键按声明序
+ *  在前,未声明的键按原相对序拖后;不传 ``order`` 原样返回(后端 JSON 序)。 */
+function orderEntries(
+  entries: readonly (readonly [string, string])[],
+  order: readonly string[] | undefined,
+): readonly (readonly [string, string])[] {
+  if (order === undefined || order.length === 0) return entries;
+  const declared = new Set(order);
+  const head: (readonly [string, string])[] = [];
+  for (const key of order) {
+    const hit = entries.find(([k]) => k === key);
+    if (hit !== undefined) head.push(hit);
+  }
+  return [...head, ...entries.filter(([k]) => !declared.has(k))];
+}
+
 export interface UserBubbleProps {
   input: string;
   attachments: readonly Attachment[];
@@ -26,11 +43,14 @@ export interface UserBubbleProps {
    *  (``Turn.inputs``). Rendered below the bubble: short sets inline (one
    *  ``key=value`` per line), long sets folded behind 「入参 N 项」. */
   inputs?: Record<string, string>;
+  /** ③ 反馈 — Agent 配置 variables 的声明序。省略 → 保持后端 JSON 序
+   *  (拿不到 manifest 的页面不传,零变化)。 */
+  inputOrder?: readonly string[];
 }
 
-export function UserBubble({ input, attachments, inputs }: UserBubbleProps) {
+export function UserBubble({ input, attachments, inputs, inputOrder }: UserBubbleProps) {
   const { t } = useTranslation();
-  const inputEntries = inputs ? Object.entries(inputs) : [];
+  const inputEntries = orderEntries(inputs ? Object.entries(inputs) : [], inputOrder);
   const inputsTotalChars = inputEntries.reduce((n, [k, v]) => n + k.length + v.length + 1, 0);
 
   // 一键一行 + `overflowWrap: anywhere`:原来拼成一行且容器无宽度上限,
@@ -44,9 +64,20 @@ export function UserBubble({ input, attachments, inputs }: UserBubbleProps) {
         textAlign: "left",
       }}
     >
+      {/* ③ 反馈 — 行尾复制按钮,复制值本身(入参常是整段 URL / JSON,拿去
+          别处用);flex + 按钮 flexShrink:0,长值换行不挤崩按钮。 */}
       {inputEntries.map(([k, v]) => (
-        <div key={k} style={{ overflowWrap: "anywhere" }}>
-          {k}={v}
+        <div
+          key={k}
+          data-testid="console-turn-input-row"
+          style={{ display: "flex", alignItems: "center", gap: 2 }}
+        >
+          <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>
+            {k}={v}
+          </span>
+          <span style={{ flexShrink: 0 }}>
+            <CopyButton text={v} testId={`console-turn-input-copy-${k}`} />
+          </span>
         </div>
       ))}
     </div>

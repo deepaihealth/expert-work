@@ -118,6 +118,22 @@ describe("VariablesForm", () => {
     expect(screen.queryByTestId("playground-var-tone")).not.toBeInTheDocument();
   });
 
+  // ④ 反馈 — 11 个变量全宽竖排吃掉大半屏:多列自适应 grid(宽屏两三列,
+  // 窄屏回单列)+ 40vh 封顶内滚(同 manifest-editor 变量列表的内滚形态)。
+  it("lays the open form out as an adaptive multi-column grid capped at 40vh with inner scroll", () => {
+    render(<ControlledHarness onChange={vi.fn()} />);
+    const grid = screen.getByTestId("playground-vars-grid");
+    expect(grid.style.display).toBe("grid");
+    expect(grid.style.gridTemplateColumns).toBe("repeat(auto-fill, minmax(320px, 1fr))");
+    expect(grid.style.maxHeight).toBe("40vh");
+    expect(grid.style.overflowY).toBe("auto");
+    // label|input 的行内对齐保持:每个变量一格,格内仍是 label 在左输入在右。
+    const cell = screen.getByTestId("playground-var-customer_code").closest(
+      "[data-testid='playground-var-cell-customer_code']",
+    );
+    expect(cell).not.toBeNull();
+  });
+
   it("renders nothing when there are no variables", () => {
     const { container } = render(
       <VariablesForm variables={[]} values={{}} onChange={vi.fn()} disabled={false} />,

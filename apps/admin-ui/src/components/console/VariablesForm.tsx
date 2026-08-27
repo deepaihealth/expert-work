@@ -15,7 +15,7 @@
  * ``readOnly``/tenant-switch state is NOT read here — the parent decides
  * whether inputs are ``disabled`` and passes it down as a plain prop.
  */
-import { Fragment, useEffect, useState, type JSX } from "react";
+import { useEffect, useState, type JSX } from "react";
 import { Input, Typography } from "antd";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -102,18 +102,33 @@ export function VariablesForm({
           </Text>
         )}
       </button>
+      {/* ④ 反馈 — 11 个变量全宽竖排吃掉大半屏:外层多列自适应 grid(宽屏
+          两三列,窄屏 auto-fill 自动回单列)+ 40vh 封顶内滚(同
+          PromptVariablesEditor 变量列表的内滚形态);每个变量一格,格内
+          仍是 label 在左、输入在右的原对齐。 */}
       {open && (
         <div
+          data-testid="playground-vars-grid"
           style={{
             display: "grid",
-            gridTemplateColumns: "max-content minmax(0, 1fr)",
-            columnGap: 12,
+            gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
+            columnGap: 16,
             rowGap: 6,
-            alignItems: "center",
+            maxHeight: "40vh",
+            overflowY: "auto",
           }}
         >
           {variables.map((v) => (
-            <Fragment key={v.name}>
+            <div
+              key={v.name}
+              data-testid={`playground-var-cell-${v.name}`}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "max-content minmax(0, 1fr)",
+                columnGap: 12,
+                alignItems: "center",
+              }}
+            >
               <label
                 htmlFor={`playground-var-${v.name}`}
                 title={v.description ?? v.name}
@@ -159,7 +174,7 @@ export function VariablesForm({
                 disabled={disabled}
                 onChange={(e) => onChange(v.name, e.target.value)}
               />
-            </Fragment>
+            </div>
           ))}
         </div>
       )}
