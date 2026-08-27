@@ -246,6 +246,35 @@ def test_macos_zip_junk_is_ignored() -> None:
     assert payload.supporting_files == {}
 
 
+def test_python_and_windows_zip_junk_is_ignored() -> None:
+    """``__pycache__/`` bytecode trees, stray ``.pyc``/``.pyo`` and Windows
+    ``Thumbs.db`` / ``desktop.ini`` are packaging junk (2026-08-27,来源=真实
+    导入被 ``.pyc`` 整包拒收):strip them instead of rejecting — authors zip
+    whatever working directory they have. The content hash must not see junk,
+    so a clean re-zip of the same skill stays an idempotency hit."""
+    skill_md = _build_skill_md(name="pyjunk", body="hello")
+    files = {
+        "SKILL.md": skill_md.encode("utf-8"),
+        "scripts/validate.py": b"print('ok')\n",
+        "scripts/__pycache__/validate.cpython-312.pyc": b"\x00\x01\x02",
+        "scripts/stray.pyo": b"\x00\x01",
+        "Thumbs.db": b"\x00",
+        "desktop.ini": b"[.ShellClassInfo]",
+    }
+    payload = parse_skill_zip(_zip_with(files))
+    assert payload.name == "pyjunk"
+    assert set(payload.supporting_files) == {"scripts/validate.py"}
+    clean = parse_skill_zip(
+        _zip_with(
+            {
+                "SKILL.md": skill_md.encode("utf-8"),
+                "scripts/validate.py": b"print('ok')\n",
+            }
+        )
+    )
+    assert payload.content_hash == clean.content_hash
+
+
 def test_missing_skill_md_rejects() -> None:
     """No SKILL.md and not a legacy 3-file layout → reject."""
     files = {"reference/codes.md": b"not enough"}
