@@ -936,7 +936,7 @@ const zhCN: TranslationKeys = {
     context_window_hint: "token 数；决定压缩触发阈值。留空 = 用模型目录默认窗口。",
     thinking_label: "思考模式",
     thinking_cannot_disable: "该模型仅能最小化思考，无法完全关闭。",
-    effort_label: "努力程度",
+    effort_label: "推理深度",
     effort_hint:
       "推理深度档位。留空=提供商默认。仅模型目录标注支持思考的模型可设,否则构建报错。",
     adaptive_label: "自适应思考",
