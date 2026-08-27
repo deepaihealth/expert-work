@@ -185,6 +185,22 @@ canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 **任何一步红 = 不对外开放**,rollback.sh 待命。
 
+### 1.8 平台资产搬运(测试 → 生产;基于 2026-08-27 测试库实测行数)
+
+生产库开局是空的,逐项对照(除技能外全部**手工**——密钥与 MCP 地址本就该逐环境配置,批量搬运是反模式):
+
+| 资产 | 测试现量 | 动作 |
+|---|---|---|
+| 平台技能 | 54(版本 55) | **批量工具**(#1344):测试环境技能页「导出全部」下载 zip → 生产「批量导入」上传 → 弹窗核对逐包结果 + category 抽查。幂等,重跑显示「已跳过」 |
+| 模型目录 / 费率卡 | 代码内置 | 随镜像走,零动作 |
+| 厂商密钥(platform_provider_secret) | 5 | 生产 UI 手工录 **prod 自己的 key**(金丝雀依赖,§1.6 里已有前置);永不从测试导 |
+| MCP 连接器目录 | 2 | 手工建,用 **prod 的 URL/凭据**(deep-ai-health-mcp 生产地址;照搬测试值是错的) |
+| 平台 judge / embedding 配置 | 各 1 | UI 手工录 |
+| tool-budget / quality / delegation / worker 平台配置、模板市场、知识库 | 0 | 空,零动作 |
+| Agent 配置 | 3 | release-canary 走 §1.6.7 seed;**ai-health-plan / sop2-designer 从测试配置页 YAML tab 复制 manifest 手建**,注意把里面引用的 MCP 服务器名对成 prod 注册名,技能引用在批量导入完成后才可解析 |
+
+顺序:技能批量导入 → MCP 连接器 → Agent 手建(依赖前两者)。
+
 ## 2. 日常发布
 
 ```sh
