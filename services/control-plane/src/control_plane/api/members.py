@@ -199,10 +199,32 @@ def build_members_router() -> APIRouter:
                 items = await member_repo.list_for_tenant(
                     tenant_id=scope.tenant_id, status=status, limit=limit, offset=offset
                 )
+            # 最后活跃时间(2026-08-27):activated 行的 subject_id 指向
+            # tenant_user,其 last_active_at 由认证请求路径节流刷新
+            # (MemberActivationMiddleware)。按租户分组批量取,一页最多
+            # 每租户一次 get_many;invited 行(subject_id 为空)显 null。
+            users_repo: TenantUserStore = request.app.state.tenant_user_repo
+            by_tenant: dict[UUID, list[UUID]] = {}
+            for m in items:
+                if m.subject_id is not None:
+                    by_tenant.setdefault(m.tenant_id, []).append(m.subject_id)
+            active_at: dict[UUID, str] = {}
+            for t_id, user_ids in by_tenant.items():
+                for uid, user in (await users_repo.get_many(user_ids, tenant_id=t_id)).items():
+                    if user.last_active_at is not None:
+                        active_at[uid] = user.last_active_at.isoformat()
         return {
             "success": True,
             "data": {
-                "items": [m.model_dump(mode="json") for m in items],
+                "items": [
+                    {
+                        **m.model_dump(mode="json"),
+                        "last_active_at": (
+                            active_at.get(m.subject_id) if m.subject_id is not None else None
+                        ),
+                    }
+                    for m in items
+                ],
                 "total": len(items),
             },
             "error": None,

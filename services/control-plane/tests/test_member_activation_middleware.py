@@ -171,3 +171,48 @@ async def test_store_error_never_blocks_the_request_and_retries() -> None:
 async def test_missing_stores_noop() -> None:
     await _get(_app(member_repo=None, users=None, principal=_user_principal(str(uuid4()), uuid4())))
     await _get(_app(member_repo=None, users=None, principal=None))
+
+
+@pytest.mark.asyncio
+async def test_last_active_bump_throttled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """任何用户 JWT 请求节流刷新 tenant_user.last_active_at(2026-08-27):
+    间隔内只 resolve 一次;间隔归零则每请求都刷。"""
+    users = InMemoryTenantUserStore()
+    tenant, kc_id = uuid4(), str(uuid4())
+
+    resolves = 0
+    orig = users.resolve
+
+    async def _counting(**kwargs: Any) -> Any:
+        nonlocal resolves
+        resolves += 1
+        return await orig(**kwargs)
+
+    users.resolve = _counting  # type: ignore[method-assign]
+
+    # member_repo=None:只走 bump 路径,不掺激活的 resolve 调用
+    app = _app(member_repo=None, users=users, principal=_user_principal(kc_id, tenant))
+    await _get(app)
+    await _get(app)
+    await _get(app)
+    assert resolves == 1  # 15min 节流窗内只刷一次
+
+    monkeypatch.setattr("control_plane.member_activation._ACTIVE_BUMP_INTERVAL_S", 0.0)
+    await _get(app)
+    await _get(app)
+    assert resolves == 3  # 窗口归零后每请求都刷
+
+    user = await users.resolve(tenant_id=tenant, subject_type="user", subject_id=kc_id)
+    assert user.last_active_at is not None
+
+
+@pytest.mark.asyncio
+async def test_bump_error_never_blocks_request() -> None:
+    users = InMemoryTenantUserStore()
+
+    async def _boom(**kwargs: Any) -> Any:
+        raise RuntimeError("db hiccup")
+
+    users.resolve = _boom  # type: ignore[method-assign]
+    app = _app(member_repo=None, users=users, principal=_user_principal(str(uuid4()), uuid4()))
+    await _get(app)  # 200 即通过
