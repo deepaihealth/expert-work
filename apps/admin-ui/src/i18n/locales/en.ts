@@ -3976,7 +3976,7 @@ const en: TranslationKeys = {
     thinking_label: "Thinking mode",
     thinking_cannot_disable:
       "This model can only minimise thinking, not fully disable it.",
-    effort_label: "Effort",
+    effort_label: "Reasoning depth",
     effort_hint:
       "Reasoning depth tier. Empty = the provider default. Only settable when the model catalog marks the model as thinking-capable — otherwise the build fails.",
     adaptive_label: "Adaptive thinking",
