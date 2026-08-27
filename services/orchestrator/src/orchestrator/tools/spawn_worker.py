@@ -52,7 +52,7 @@ __all__ = [
 
 if TYPE_CHECKING:
     from expert_work.protocol import AgentSpec
-    from orchestrator.agent_factory import BuiltAgent
+    from orchestrator.built_agent import BuiltAgent
 
 _workers_spawned = expert_work_counter(
     "expert_work_dynamic_worker_spawned_total",

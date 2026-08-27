@@ -57,7 +57,7 @@ from orchestrator.trajectory import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.agent_factory import BuiltAgent
+    from orchestrator.built_agent import BuiltAgent
 
 logger = logging.getLogger(__name__)
 
