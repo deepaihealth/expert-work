@@ -1169,6 +1169,12 @@ export interface TranslationKeys {
     vars_required_missing: string;
     vars_required_mark: string;
     vars_missing_count: string;
+    vars_optional_fold: string;
+    settings_title: string;
+    settings_collapse: string;
+    settings_expand: string;
+    settings_prompt_card: string;
+    settings_prompt_drawer_title: string;
     composer_hint: string;
     stats_partial: string;
     traj_kind_user: string;
@@ -4310,6 +4316,12 @@ const en: TranslationKeys = {
     vars_required_missing: "Required variables missing: {{names}}",
     vars_required_mark: "required",
     vars_missing_count: "{{count}} required missing",
+    vars_optional_fold: "{{count}} more (optional)",
+    settings_title: "Run settings",
+    settings_collapse: "Collapse run settings",
+    settings_expand: "Expand run settings",
+    settings_prompt_card: "System prompt · {{count}} chars",
+    settings_prompt_drawer_title: "System prompt",
     composer_hint: "Enter to send, Shift+Enter for a new line",
     stats_partial: "(loaded turns only)",
     traj_kind_user: "USER",
@@ -4495,7 +4507,7 @@ const en: TranslationKeys = {
   },
   playground: {
     session_failed: "Failed to create session",
-    input_placeholder: "Type a prompt for the agent…",
+    input_placeholder: "Type a message to chat with the agent…",
     run: "Run",
     running: "Running…",
     stop: "Stop",

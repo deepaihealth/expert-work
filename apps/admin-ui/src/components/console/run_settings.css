@@ -1,0 +1,109 @@
+/*
+ * RunSettingsPanel — 调试台「左对话右设置」分栏与右侧「运行设置」侧栏的
+ * 组件级样式(调试台侧栏重设计,规格 A)。颜色全走 `--ew-*` design token
+ * (console.css 同款约定)。<1200px 断点沿用 ConsoleShell 的 1199px 惯例:
+ * 行内侧栏整个隐藏,内容改走页头 `.ew-run-settings-trigger` 触发的 Drawer。
+ */
+
+.ew-run-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.ew-run-split__chat {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ew-run-settings {
+  width: 380px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--ew-border-subtle);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ew-run-settings--collapsed {
+  width: 44px;
+  align-items: center;
+  padding-top: 8px;
+}
+
+.ew-run-settings__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ew-border-subtle);
+  flex-shrink: 0;
+}
+
+.ew-run-settings__collapse {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--ew-text-secondary);
+}
+
+.ew-run-settings__rail {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--ew-text-secondary);
+}
+
+.ew-run-settings__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ew-run-settings__prompt-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--ew-border-subtle);
+  border-radius: 6px;
+  background: var(--ew-surface-raised);
+  cursor: pointer;
+  text-align: left;
+  flex-shrink: 0;
+}
+
+/* 页头的窄屏触发按钮:宽屏隐藏,<1200px 顶上。 */
+.ew-run-settings-trigger {
+  display: none;
+  align-items: center;
+  padding: 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--ew-text-secondary);
+}
+
+@media (max-width: 1199px) {
+  .ew-run-settings {
+    display: none;
+  }
+  .ew-run-settings-trigger {
+    display: inline-flex;
+  }
+}

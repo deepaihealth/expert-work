@@ -2380,3 +2380,194 @@ describe("PlaygroundTab — 切入态只读 (Track C W2)", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// 调试台侧栏重设计 —— 左对话右「运行设置」侧栏(规格 A)、系统提示词降级
+// 出对话流(规格 B)、变量草稿(规格 C)。
+describe("PlaygroundTab — 运行设置侧栏", () => {
+  const SETTINGS_KEY = "expert_work.console.settingsCollapsed.demo-agent";
+  const DRAFTS_KEY = "expert_work.console.varDrafts.demo-agent";
+
+  it("auto-expands the settings panel (with a red badge) while required variables are missing, overriding the stored collapsed state", async () => {
+    // 上次离开时是收起的 —— 必填未填必须压过这份记忆。
+    window.localStorage.setItem(SETTINGS_KEY, "1");
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "false",
+    );
+    expect(screen.getByTestId("console-settings-badge")).toBeInTheDocument();
+    // 变量表单住在侧栏里,必填未填时可直接填。
+    expect(screen.getByTestId("playground-var-persona")).toBeInTheDocument();
+  });
+
+  it("remembers the collapsed state per agent via localStorage", async () => {
+    const user = userEvent.setup();
+    // 无必填缺失的 agent:默认展开 → 手动收起 → 记忆落盘。
+    const first = renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "false",
+    );
+    await user.click(screen.getByTestId("console-settings-collapse"));
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "true",
+    );
+    expect(window.localStorage.getItem(SETTINGS_KEY)).toBe("1");
+    first.unmount();
+
+    // 重新进入同一 agent 的调试台 —— 从收起态开始;rail 上有展开按钮。
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "true",
+    );
+    await user.click(screen.getByTestId("console-settings-expand"));
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "false",
+    );
+    expect(window.localStorage.getItem(SETTINGS_KEY)).toBe("0");
+  });
+
+  it("auto-collapses once after the first dispatched run; a manual expand afterwards sticks", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    const endOnly = () =>
+      makeStream([{ id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" }]);
+    streamRunMock.mockReturnValueOnce(endOnly()).mockReturnValueOnce(endOnly());
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+
+    await user.type(screen.getByTestId("playground-var-persona"), "顾问");
+    await user.type(screen.getByTestId("playground-input"), "go");
+    await user.click(screen.getByTestId("playground-run"));
+    // 首次发出 → 自动收起一次。
+    await waitFor(() =>
+      expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+        "data-collapsed",
+        "true",
+      ),
+    );
+
+    // 用户手动展开 → 之后的发送不再自动收。
+    await user.click(screen.getByTestId("console-settings-expand"));
+    await user.type(screen.getByTestId("playground-input"), "again");
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() => expect(streamRunMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "false",
+    );
+  });
+
+  it("does not auto-collapse on the first run when the user manually expanded beforehand", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([{ id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" }]),
+    );
+    // 无变量 agent + 记忆是收起 → 从 rail 开始;用户**主动**展开。
+    window.localStorage.setItem(SETTINGS_KEY, "1");
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "true",
+    );
+    await user.click(screen.getByTestId("console-settings-expand"));
+
+    // 首次发出 —— 手动展开过就不自动收(规格 A「用户手动展开后不再自动收」)。
+    await user.type(screen.getByTestId("playground-input"), "hi");
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() => expect(streamRunMock).toHaveBeenCalled());
+    expect(screen.getByTestId("console-settings-panel")).toHaveAttribute(
+      "data-collapsed",
+      "false",
+    );
+  });
+
+  it("prefills empty variables from the last submitted draft and saves drafts on dispatch", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([{ id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" }]),
+    );
+    window.localStorage.setItem(DRAFTS_KEY, JSON.stringify({ persona: "顾问" }));
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+    // 进入页面:空字段预填上次提交值 → 必填即满足。
+    expect(screen.getByTestId("playground-var-persona")).toHaveValue("顾问");
+
+    // 改值后发送 → 草稿更新为本次提交值。
+    await user.clear(screen.getByTestId("playground-var-persona"));
+    await user.type(screen.getByTestId("playground-var-persona"), "医生");
+    await user.type(screen.getByTestId("playground-input"), "go");
+    await user.click(screen.getByTestId("playground-run"));
+    await waitFor(() =>
+      expect(streamRunMock).toHaveBeenCalledWith(
+        sampleThread.thread_id,
+        { input: "go", inputs: { persona: "医生" } },
+        expect.objectContaining({ signal: expect.anything() }),
+      ),
+    );
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(DRAFTS_KEY) ?? "{}")).toEqual({
+        persona: "医生",
+      }),
+    );
+  });
+
+  it("keeps the system prompt out of the transcript; the sidebar card opens a read-only drawer with the full text", async () => {
+    const priorLang = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      const user = userEvent.setup();
+      renderPg(jinjaDetail);
+      await screen.findByTestId("playground-input");
+
+      // 规格 B — 对话流里没有(也从来不该有)系统提示词块。
+      const transcript = screen.getByTestId("playground-transcript");
+      expect(within(transcript).queryByText(/你是/)).not.toBeInTheDocument();
+
+      // 侧栏折叠卡:「系统提示词 · X 字」。
+      const card = screen.getByTestId("console-settings-prompt-card");
+      const template = "你是 {{ persona }}";
+      expect(card).toHaveTextContent(`系统提示词 · ${template.length} 字`);
+
+      // 点开 → 只读 Drawer 全文(等宽 + 保留换行的 SystemPromptPanel 形态)。
+      await user.click(card);
+      const drawer = await screen.findByTestId("console-settings-prompt-drawer");
+      expect(within(drawer).getByText(template)).toBeInTheDocument();
+      expect(
+        within(drawer).getByTestId("console-detail-system-prompt"),
+      ).toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage(priorLang);
+    }
+  });
+
+  it("renders no prompt card for an agent without a system prompt", async () => {
+    renderPg(); // sampleDetail: spec {} → 模板为空。
+    await screen.findByTestId("playground-input");
+    expect(
+      screen.queryByTestId("console-settings-prompt-card"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens the settings drawer from the page-head trigger (narrow-screen form)", async () => {
+    const user = userEvent.setup();
+    renderPg(jinjaDetail);
+    await screen.findByTestId("playground-input");
+    await user.click(screen.getByTestId("console-settings-drawer-trigger"));
+    const drawer = await screen.findByTestId("console-settings-drawer");
+    // 同一份侧栏内容:系统提示词卡 + 变量表单。
+    expect(
+      within(drawer).getByTestId("console-settings-prompt-card"),
+    ).toBeInTheDocument();
+    expect(within(drawer).getByTestId("playground-var-persona")).toBeInTheDocument();
+  });
+});
