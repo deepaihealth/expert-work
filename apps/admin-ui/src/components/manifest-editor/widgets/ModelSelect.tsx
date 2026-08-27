@@ -77,12 +77,15 @@ export function ModelSelect({
   const hasThinkingKnob = !!currentEntry?.thinking;
   // reasoning_effort vendors without a real off — off degrades to the lowest
   // level (OpenAI/Azure "minimal", kimi-k3 "low"). GLM 5.2+ and DeepSeek keep
-  // a real off via thinking.type=disabled, so no hint there.
+  // a real off via thinking.type=disabled, so no hint there — except entries
+  // the catalog marks always_thinking (glm-5.3-flash: thinking.type only
+  // supports enabled, off floors at reasoning_effort=low).
   const cannotFullyDisable =
     currentEntry?.thinking === "effort" &&
-    value.provider !== "anthropic" &&
-    value.provider !== "glm" &&
-    value.provider !== "deepseek";
+    (currentEntry?.always_thinking === true ||
+      (value.provider !== "anthropic" &&
+        value.provider !== "glm" &&
+        value.provider !== "deepseek"));
   const thinkingOn = value.thinking_enabled ?? currentEntry?.thinking_default ?? false;
 
   const temperature = value.temperature ?? 0.2;

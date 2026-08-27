@@ -936,7 +936,7 @@ const zhCN: TranslationKeys = {
     context_window_hint: "token 数；决定压缩触发阈值。留空 = 用模型目录默认窗口。",
     thinking_label: "思考模式",
     thinking_cannot_disable: "该模型仅能最小化思考，无法完全关闭。",
-    effort_label: "努力程度",
+    effort_label: "推理深度",
     effort_hint:
       "推理深度档位。留空=提供商默认。仅模型目录标注支持思考的模型可设，否则构建报错。",
     adaptive_label: "自适应思考",
@@ -1115,6 +1115,10 @@ const zhCN: TranslationKeys = {
     section_dynamic_workers_help:
       "开启（默认）时，智能体运行中可按需创建临时子智能体（spawn_worker 工具），分头并行处理子任务；数量与并发受平台「动态子智能体护栏」统一约束。\n需要严格单线、只用一个执行体时关掉。\n示例：研究型智能体开，简单问答 Bot 关。\n与下方「子智能体委派」的区别：名册是预置的具名委派对象，这里是运行中临时造的通用子智能体。",
     dynamic_workers_hint: "允许智能体运行中按需创建临时子智能体分担子任务（默认开启）。",
+    worker_model_label: "临时子智能体模型",
+    worker_model_hint:
+      "不配置则临时子智能体沿用主模型（含推理深度等全部设置）。配置后临时子智能体改用这里的模型 —— 常用于给分头执行的子任务换便宜档。无备用模型链。",
+    worker_model_clear: "清除（沿用主模型）",
     approval_timeout: "审批等待上限（秒）",
     approval_timeout_brief: "审批超时没人处理就自动拒绝",
     approval_timeout_help:

@@ -16,15 +16,19 @@ import { Button, Input, Select, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listAgents } from "../../api/agents";
+import type { ModelCatalog } from "../../api/model_catalog";
 import { FieldHelp } from "../FieldHelp";
 import { FieldRow } from "./FieldRow";
 import {
   readDynamicWorkersOn,
   readSubagents,
+  readWorkerModel,
   setDynamicWorkersOn,
   setSubagents,
+  setWorkerModel,
   type SubAgentFields,
 } from "./form_model";
+import { ModelSelect } from "./widgets/ModelSelect";
 
 const { Text } = Typography;
 
@@ -37,9 +41,11 @@ function Heading({ children }: { children: ReactNode }) {
 interface SubagentPickerProps {
   formData: unknown;
   onChange: (data: unknown) => void;
+  /** Model catalog for the worker-model override picker. */
+  catalog?: ModelCatalog;
 }
 
-export function SubagentPicker({ formData, onChange }: SubagentPickerProps) {
+export function SubagentPicker({ formData, onChange, catalog }: SubagentPickerProps) {
   const { t } = useTranslation();
   const [agents, setAgents] = useState<string[]>([]);
 
@@ -101,6 +107,41 @@ export function SubagentPicker({ formData, onChange }: SubagentPickerProps) {
           onChange={(on) => onChange(setDynamicWorkersOn(formData, on))}
         />
       </FieldRow>
+
+      {/* Worker-model override — dynamic_workers.model. Unset = workers
+          inherit the parent's model verbatim; set = a cheaper tier for
+          fan-out work (no fallback chain — backend validator rejects one).
+          Mirrors the vision-model picker's set/clear shape. */}
+      {dynamicWorkersOn && (
+        <div data-testid="af-worker-model" style={{ margin: "0 0 24px" }}>
+          <label style={{ display: "block", marginBottom: 4 }}>
+            {t("agent_form.worker_model_label")}
+            <FieldHelp
+              text={t("agent_form.worker_model_hint")}
+              testId="af-worker-model"
+            />
+          </label>
+          <Text type="secondary" style={{ display: "block", marginBottom: 8, fontSize: 12 }}>
+            {t("agent_form.worker_model_hint")}
+          </Text>
+          <ModelSelect
+            value={readWorkerModel(formData) ?? {}}
+            catalog={catalog}
+            onChange={(mdl) => onChange(setWorkerModel(formData, mdl))}
+          />
+          {readWorkerModel(formData) !== undefined && (
+            <Button
+              type="link"
+              size="small"
+              data-testid="af-worker-model-clear"
+              style={{ paddingLeft: 0 }}
+              onClick={() => onChange(setWorkerModel(formData, null))}
+            >
+              {t("agent_form.worker_model_clear")}
+            </Button>
+          )}
+        </div>
+      )}
 
       <Heading>
         {t("agent_form.section_subagents")}

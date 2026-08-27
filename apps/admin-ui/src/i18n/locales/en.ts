@@ -1062,6 +1062,9 @@ export interface TranslationKeys {
     section_dynamic_workers: string;
     section_dynamic_workers_help: string;
     dynamic_workers_hint: string;
+    worker_model_label: string;
+    worker_model_hint: string;
+    worker_model_clear: string;
     approval_timeout: string;
     approval_timeout_brief: string;
     approval_timeout_help: string;
@@ -3996,7 +3999,7 @@ const en: TranslationKeys = {
     thinking_label: "Thinking mode",
     thinking_cannot_disable:
       "This model can only minimise thinking, not fully disable it.",
-    effort_label: "Effort",
+    effort_label: "Reasoning depth",
     effort_hint:
       "Reasoning depth tier. Empty = the provider default. Only settable when the model catalog marks the model as thinking-capable — otherwise the build fails.",
     adaptive_label: "Adaptive thinking",
@@ -4182,6 +4185,10 @@ const en: TranslationKeys = {
       "When on (the default), the agent can create ephemeral subagents at run time (the spawn_worker tool) to handle subtasks in parallel; count and concurrency are bounded by the platform-wide dynamic-subagent guardrails.\nTurn off when you need strictly one executor.\nExample: on for a research agent, off for a simple FAQ bot.\nVs the delegation roster below: the roster is a preset list of named delegates, this is a general-purpose subagent created on demand.",
     dynamic_workers_hint:
       "Let the agent create ephemeral subagents at run time to share subtasks (on by default).",
+    worker_model_label: "Ephemeral subagent model",
+    worker_model_hint:
+      "Unset: ephemeral subagents inherit the main model (including thinking settings). Set: they use this model instead — typically a cheaper tier for fan-out subtasks. No fallback chain.",
+    worker_model_clear: "Clear (inherit the main model)",
     approval_timeout: "Approval wait limit (seconds)",
     approval_timeout_brief: "Auto-rejects if no one responds in time",
     approval_timeout_help:

@@ -110,17 +110,25 @@ def synthesize_worker_spec(
     """Derive an ephemeral worker :class:`AgentSpec` from ``parent`` (1.3).
 
     Inherits the parent's model + sandbox isolation + tenant_config +
-    defenses (the security boundary is NOT relaxed). Replaces the system
-    prompt with a generated worker prompt, narrows tools to the platform
-    allowlist, clamps iterations to the platform cap, and strips stateful /
-    delegation blocks (memory / triggers / skills / static subagents /
-    reflection / routing / knowledge) — the worker is stateless and
-    ephemeral. ``dynamic_workers`` stays default-on so a worker may itself
-    spawn while below the depth cap.
+    defenses (the security boundary is NOT relaxed) — unless the manifest's
+    ``dynamic_workers.model`` overrides the worker LLM (full knob set, no
+    fallback chain; the protocol validator enforces that). Replaces the
+    system prompt with a generated worker prompt, narrows tools to the
+    platform allowlist, clamps iterations to the platform cap, and strips
+    stateful / delegation blocks (memory / triggers / skills / static
+    subagents / reflection / routing / knowledge) — the worker is stateless
+    and ephemeral. ``dynamic_workers`` stays default-on so a worker may
+    itself spawn while below the depth cap (a grand-worker inherits the
+    same override).
     """
     body = parent.spec
     worker_body = body.model_copy(
         update={
+            **(
+                {"model": body.dynamic_workers.model}
+                if body.dynamic_workers.model is not None
+                else {}
+            ),
             "system_prompt": SystemPromptSpec(template=_worker_system_prompt(role)),
             # BUG-19b —— 与下面剥 triggers **块**同理由,连 manage_task **工具**
             # 一起剥:worker 无 TriggerStore,留着必撞 build_agent 硬闸。

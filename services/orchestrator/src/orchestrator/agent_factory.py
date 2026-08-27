@@ -1870,6 +1870,11 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
     a real off (``thinking.type=disabled``) and use it.
     """
     if entry.thinking == "effort":
+        # always_thinking (glm-5.3-flash) — thinking.type 仅支持 enabled;
+        # sending "disabled" is a vendor error, so off floors at the lowest
+        # effort tier (same owner decision as kimi-k3 below).
+        if entry.always_thinking and model.provider == "glm":
+            return {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
         # GLM 5.2+ / DeepSeek keep a REAL off via the OpenAI-format thinking
         # object — "minimal" is not on either vendor's effort scale.
         if model.provider in ("glm", "deepseek"):

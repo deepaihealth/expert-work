@@ -1306,6 +1306,29 @@ def test_thinking_payload_glm_52_plus_toggle_semantics_kept() -> None:
     assert _thinking_payload(_vendor_model("glm", "glm-5.3")) is None
 
 
+def test_thinking_payload_glm_53_flash_always_thinking() -> None:
+    # glm-5.3-flash — thinking.type 仅支持 enabled (bigmodel docs 2026-08):
+    # effort levels ride the normal GLM 5.2+ branch, but force-off must NOT
+    # send thinking.type=disabled (vendor error) — it floors at
+    # reasoning_effort=low via the catalog ``always_thinking`` flag.
+    # ``clear_thinking`` is deliberately never sent (needs verbatim reasoning
+    # replay we don't do — catalog comment / B-30 family).
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3-flash", effort="medium")) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3-flash", thinking_enabled=True)) == {
+        "thinking": {"type": "enabled"}
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3-flash", thinking_enabled=False)) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3-flash")) is None
+
+
 def test_thinking_payload_off_catalog_compat_sends_nothing() -> None:
     # CM-L5 — thinking wire formats differ per vendor, so off-catalog
     # OpenAI-compatible models never get a blind payload.

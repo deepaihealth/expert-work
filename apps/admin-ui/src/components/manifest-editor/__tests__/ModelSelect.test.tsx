@@ -122,6 +122,16 @@ const CATALOG: ModelCatalog = {
           thinking: "effort",
           thinking_default: true,
         },
+        {
+          name: "glm-5.3-flash",
+          vision: true,
+          embeddings: false,
+          context_window: 1000000,
+          deprecated: false,
+          thinking: "effort",
+          thinking_default: true,
+          always_thinking: true,
+        },
       ],
     },
   ],
@@ -454,6 +464,19 @@ describe("ModelSelect", () => {
     rerender(
       <ModelSelect
         value={{ provider: "kimi", name: "kimi-k3" }}
+        catalog={CATALOG}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByTestId("model-select-thinking-hint"),
+    ).toBeInTheDocument();
+    // glm-5.3-flash — provider glm normally has a real off, but the catalog
+    // marks this entry always_thinking (thinking.type only supports enabled)
+    // → hint shown despite the provider.
+    rerender(
+      <ModelSelect
+        value={{ provider: "glm", name: "glm-5.3-flash" }}
         catalog={CATALOG}
         onChange={vi.fn()}
       />,

@@ -499,8 +499,14 @@ class DynamicWorkersSpec(BaseModel):
     worker inherits the parent's model + sandbox isolation, runs to
     completion, and is discarded; the parent synthesizes its result.
 
-    Only an ``enabled`` opt-out lives here. The numeric safety bounds
-    (concurrency / per-run cap / iterations / tool allowlist) are
+    ``enabled`` opts out; ``model`` optionally overrides the worker's LLM
+    (e.g. a cheap tier for fan-out work) — unset inherits the parent's
+    model verbatim. The override carries the full ModelSpec knob set
+    (effort / thinking / temperature / …) EXCEPT a ``fallback`` chain:
+    a worker is ephemeral fan-out work, the parent already owns retry
+    semantics, so a per-worker fallback tree is complexity without a
+    failure mode it fixes (owner decision 2026-08-27). The numeric safety
+    bounds (concurrency / per-run cap / iterations / tool allowlist) are
     **platform-global settings**, not per-agent — a manifest must not be
     able to raise the platform's shared-resource ceiling. Effective
     registration is ``platform enable_dynamic_workers ∧ this.enabled ∧
@@ -516,6 +522,19 @@ class DynamicWorkersSpec(BaseModel):
             "switch = on); set false to opt a simple agent out"
         ),
     )
+    model: ModelSpec | None = Field(
+        default=None,
+        description=(
+            "override the spawned workers' LLM (unset = inherit the "
+            "parent's model); fallback chain not allowed here"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _no_worker_fallback(self) -> DynamicWorkersSpec:
+        if self.model is not None and self.model.fallback:
+            raise ValueError("dynamic_workers.model must not declare a fallback chain")
+        return self
 
 
 class KnowledgeSpec(BaseModel):
