@@ -1,7 +1,7 @@
 """Legal state-machine transitions for ``tenant_member`` — Stream R (Mini-ADR R-6).
 
 ```
-invited ──(W3 first-run)──► active ──(admin DELETE)──► suspended
+invited ──(first login, 2026-08-27; was W3 first-run)──► active ──(admin DELETE)──► suspended
    │                                  (single-direction this iteration)
    └──(admin DELETE on invited)──► revoked
 ```

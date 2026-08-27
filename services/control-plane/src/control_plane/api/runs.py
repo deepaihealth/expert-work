@@ -44,7 +44,6 @@ from control_plane.api._run_event_stream import build_event_producer, make_run_p
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
     caller_owns_thread,
-    ensure_member_active,
     get_user_repo,
     resolve_caller_user_id,
 )
@@ -1212,8 +1211,9 @@ def build_runs_router() -> APIRouter:
             meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
         ):
             raise HTTPException(status_code=404, detail="session not found")
-        # Stream R (R-8) — first run promotes an invited member to active.
-        await ensure_member_active(request, caller_user_id=caller_user_id)
+        # Stream R (R-8) first-run activation retired 2026-08-27 — the
+        # invited→active promotion now rides every authenticated request
+        # (MemberActivationMiddleware, 拍板「登录过就算」).
         if meta.status is not ThreadStatus.ACTIVE:
             raise HTTPException(
                 status_code=409,
