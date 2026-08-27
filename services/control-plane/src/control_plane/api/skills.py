@@ -49,6 +49,7 @@ from control_plane.api._skill_zip import (
 )
 from control_plane.audit import emit as audit_emit
 from control_plane.auth.rbac import _collect_roles, is_admin
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -234,6 +235,26 @@ def _get_object_store(request: Request) -> SkillAssetObjectStore | None:
     return getattr(request.app.state, "skill_asset_store", None)
 
 
+async def _invalidate_tenant_skills(request: Request, tenant_id: UUID) -> None:
+    """Evict the tenant's built agents after a tenant-skill write (PR-E3b).
+
+    Skill content is baked into ``BuiltAgent`` at build time (prompt
+    fragments + seed files), so any write that changes what the build-time
+    resolver returns — new skill (name-shadowing), new version, status flip,
+    visibility flip — must drop the tenant's stale builds, or the edit stays
+    invisible until the build-cache TTL expires. Local eviction first; the
+    ``agent_build`` broadcast makes peer replicas do the same (the
+    publisher's own handler re-running locally is harmless). ``getattr``
+    guards test setups without a runtime/bus.
+    """
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    if runtime is not None:
+        runtime.invalidate_tenant(tenant_id)
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        await bus.publish(InvalidationEvent(kind="agent_build", tenant_id=str(tenant_id)))
+
+
 def _skill_dict(skill: Skill) -> dict[str, Any]:
     return {
         "id": str(skill.id),
@@ -376,6 +397,9 @@ def build_skills_router() -> APIRouter:
                 detail=f"skill {body.name!r} already exists for this tenant",
             ) from exc
 
+        # Even a bare draft changes resolution: a tenant row name-shadows the
+        # platform library (R2), draft included.
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,
@@ -469,6 +493,7 @@ def build_skills_router() -> APIRouter:
         except SkillNotFoundError as exc:
             raise HTTPException(status_code=404, detail="skill not found") from exc
 
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,
@@ -698,6 +723,7 @@ def build_skills_router() -> APIRouter:
             high_risk=new_high_risk,
         )
 
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,
@@ -776,6 +802,7 @@ def build_skills_router() -> APIRouter:
             high_risk=new_high_risk,
         )
 
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,
@@ -878,6 +905,7 @@ def build_skills_router() -> APIRouter:
             high_risk=new_high_risk,
         )
 
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,
@@ -1007,13 +1035,15 @@ def build_skills_router() -> APIRouter:
                 details={"from": prior.status.value, "to": updated.status.value},
             )
             # Live pilot finding #8 — a status flip changes the auto-attach
-            # set (SE-A42) without a spec-version bump, so the BuiltAgent
-            # cache would serve stale builds until a restart. Best-effort:
-            # test apps may not wire a runtime.
+            # set (SE-A42) and the resolver's active-version answer without a
+            # spec-version bump, so the BuiltAgent cache would serve stale
+            # builds until a restart. PR-E3b: unified helper adds the bus
+            # broadcast so peer replicas drop theirs too. The pinned branch
+            # below stays un-wired on purpose — ``pinned`` is consumed only
+            # by the skill Curator (skip list) and the UI, never by
+            # ``make_skill_resolver`` / the agent build.
             if updated.status is not prior.status:
-                runtime = getattr(request.app.state, "agent_runtime", None)
-                if runtime is not None:
-                    runtime.invalidate_tenant(tenant_id)
+                await _invalidate_tenant_skills(request, tenant_id)
 
         # Sprint #4 (Mini-ADR U-30) — pin / unpin. Distinct audit
         # actions so SecOps can filter on either side.
@@ -1504,6 +1534,9 @@ def build_skills_router() -> APIRouter:
             content_hash=payload.content_hash,
             high_risk=payload.high_risk,
         )
+        # The idempotency hit above (identical content_hash) returned before
+        # any write — only this write path invalidates.
+        await _invalidate_tenant_skills(request, tenant_id)
         await audit_emit(
             audit,
             tenant_id=tenant_id,

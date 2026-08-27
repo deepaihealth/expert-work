@@ -34,6 +34,7 @@ from control_plane.api._authz import console_only
 from control_plane.api.skills import (
     _get_audit,
     _get_skill_store,
+    _invalidate_tenant_skills,
     _require_skill_owner_scope,
     _skill_dict,
     _version_dict,
@@ -366,6 +367,11 @@ def build_skill_evolution_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="promote request not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="promote request is not pending") from exc
+        if approve:
+            # PR-E3b — approval flips the skill's visibility ``agent_private``
+            # → ``tenant``, changing the resolution set baked into cached
+            # builds. Reject changes nothing resolver-visible.
+            await _invalidate_tenant_skills(request, scope.tenant_id)
         await audit_emit(
             audit,
             tenant_id=scope.tenant_id,
