@@ -2687,6 +2687,13 @@ const zhCN: TranslationKeys = {
     add: "新建技能",
     import_zip: "导入 .skill",
     import_github: "从 GitHub 导入",
+    export_all: "导出全部",
+    import_batch: "批量导入",
+    bulk_done: "批量导入完成:导入 {{imported}} · 跳过 {{skipped}} · 失败 {{failed}}",
+    bulk_results_title: "批量导入结果",
+    bulk_result_imported: "已导入",
+    bulk_result_skipped: "已跳过",
+    bulk_result_failed: "失败",
     github_modal_title: "从 GitHub 导入技能",
     github_hint:
       "从公开 GitHub 仓库拉取技能。支持 owner/repo、github.com 链接或 skills.sh 链接。一仓多技能时需指定具体技能名。",

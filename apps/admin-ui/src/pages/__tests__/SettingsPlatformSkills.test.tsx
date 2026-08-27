@@ -544,4 +544,97 @@ describe("SettingsPlatformSkills page", () => {
       expect(calls.some((p) => p?.category === "data")).toBe(true),
     );
   });
+
+  it("export-all button downloads the whole library as one zip", async () => {
+    let exportAllCalls = 0;
+    installAdapter([
+      {
+        match: (u, m) => u.endsWith("/platform/skills:export-all") && m === "get",
+        respond: () => {
+          exportAllCalls += 1;
+          return new Blob(["zip"]);
+        },
+      },
+      {
+        match: (u, m) => u.endsWith("/platform/skills") && m === "get",
+        respond: () => raw({ items: [SKILL], total: 1 }),
+      },
+      {
+        match: (u) => u.endsWith("/platform/skills/categories"),
+        respond: () => raw({ categories: [] }),
+      },
+    ]);
+    (URL as unknown as { createObjectURL: () => string }).createObjectURL = vi.fn(
+      () => "blob:mock",
+    );
+    (URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL =
+      vi.fn();
+    const downloads: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download);
+    });
+
+    renderPage(["system_admin"]);
+    await waitFor(() =>
+      expect(screen.getByTestId("ps-export-all-btn")).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByTestId("ps-export-all-btn"));
+    await waitFor(() => expect(exportAllCalls).toBe(1));
+    expect(downloads).toEqual(["platform-skills.zip"]);
+  });
+
+  it("bulk import uploads the outer zip, lists per-pack results, refreshes", async () => {
+    let batchPosted = false;
+    let listCalls = 0;
+    installAdapter([
+      {
+        match: (u, m) => u.endsWith("/platform/skills:import-batch") && m === "post",
+        respond: () => {
+          batchPosted = true;
+          return raw({
+            results: [
+              { name: "alpha", status: "imported", version: 1 },
+              { name: "beta", status: "skipped", version: 3 },
+              { name: "gamma", status: "failed", reason: "not a valid zip" },
+            ],
+          });
+        },
+      },
+      {
+        match: (u, m) => u.endsWith("/platform/skills") && m === "get",
+        respond: () => {
+          listCalls += 1;
+          return raw({ items: batchPosted ? [SKILL] : [], total: batchPosted ? 1 : 0 });
+        },
+      },
+      {
+        match: (u) => u.endsWith("/platform/skills/categories"),
+        respond: () => raw({ categories: [] }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderPage(["system_admin"]);
+    await waitFor(() =>
+      expect(screen.getByTestId("ps-import-batch-btn")).toBeInTheDocument(),
+    );
+
+    const file = new File(["PK"], "platform-skills.zip", { type: "application/zip" });
+    await user.upload(screen.getByTestId<HTMLInputElement>("ps-import-batch-input"), file);
+
+    await waitFor(() => expect(batchPosted).toBe(true));
+    // Per-pack result modal: one row per pack, failure carries its reason.
+    await waitFor(() =>
+      expect(screen.getByTestId("ps-bulk-results-modal")).toBeInTheDocument(),
+    );
+    const rows = screen.getByTestId("ps-bulk-results");
+    expect(rows.children).toHaveLength(3);
+    expect(rows).toHaveTextContent("alpha");
+    expect(rows).toHaveTextContent("beta");
+    expect(rows).toHaveTextContent("gamma");
+    expect(rows).toHaveTextContent("not a valid zip");
+    // The import triggered a list refresh (initial load + post-import).
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+  });
 });

@@ -181,6 +181,35 @@ export async function importPlatformSkill(
   return response.data;
 }
 
+/** One per-pack outcome of the bulk ZIP import (``:import-batch``).
+ *  ``skipped`` = content-hash idempotent no-op (already present). */
+export interface BulkImportResultRow {
+  name: string;
+  status: "imported" | "skipped" | "failed";
+  version?: number;
+  reason?: string;
+}
+
+export interface BulkImportResponse {
+  results: BulkImportResultRow[];
+}
+
+/** ``POST /v1/platform/skills:import-batch`` — outer ZIP of ``.skill`` packs
+ *  (the ``:export-all`` layout: ``<name>/<name>.skill`` + ``<name>/meta.json``
+ *  category sidecar). Partial success: one bad pack never aborts the rest. */
+export async function importPlatformSkillsBatch(
+  file: File | Blob,
+): Promise<BulkImportResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await apiClient.post<BulkImportResponse>(
+    "/v1/platform/skills:import-batch",
+    form,
+    { headers: { "Content-Type": "multipart/form-data" } },
+  );
+  return response.data;
+}
+
 /** ``POST /v1/platform/skills/import-from-github`` request body. ``source`` =
  *  ``owner/repo`` / a ``github.com`` URL / a ``skills.sh`` URL (the latter also
  *  supplies ``skill``). ``skill`` picks one skill in a multi-skill repo;
@@ -404,6 +433,17 @@ export async function exportPlatformSkillVersion(
     `/v1/platform/skills/${encodeURIComponent(id)}/versions/${version}/export`,
     { responseType: "blob" },
   );
+  return response.data;
+}
+
+/** ``GET /v1/platform/skills:export-all`` — one ZIP holding EVERY platform
+ *  skill's latest version (inner packs byte-identical to the per-version
+ *  export; ``meta.json`` sidecars carry the skill-row category). Raw ``Blob``
+ *  for the blob-anchor download. */
+export async function exportAllPlatformSkills(): Promise<Blob> {
+  const response = await apiClient.get<Blob>("/v1/platform/skills:export-all", {
+    responseType: "blob",
+  });
   return response.data;
 }
 

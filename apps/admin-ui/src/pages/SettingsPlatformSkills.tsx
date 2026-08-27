@@ -32,7 +32,7 @@ import {
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
-import { GitBranch, Pin, RefreshCw, Sparkles, Upload } from "lucide-react";
+import { Download, GitBranch, Pin, RefreshCw, Sparkles, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 
@@ -40,15 +40,18 @@ import { PageHeader } from "../components/PageHeader";
 import { FieldHelp } from "../components/FieldHelp";
 import {
   bulkUpdatePlatformSkills,
+  exportAllPlatformSkills,
   exportPlatformSkillVersion,
   importPlatformSkill,
   importPlatformSkillFromGithub,
+  importPlatformSkillsBatch,
   importPlatformSkillsFromGithubBatch,
   listGithubSkills,
   listPlatformSkills,
   listPlatformSkillCategories,
   patchPlatformSkill,
   type BatchImportResult,
+  type BulkImportResultRow,
   type BulkUpdatePlatformSkillsBody,
   type PlatformSkill,
   type PlatformSkillStatus,
@@ -75,6 +78,13 @@ const STATUS_COLOR: Record<PlatformSkillStatus, string> = {
 const GH_RESULT_COLOR: Record<BatchImportResult["status"], string> = {
   created: "success",
   exists: "default",
+  failed: "error",
+};
+
+/** 批量导入结果行的状态色 — 成功绿 / 跳过灰 / 失败红。 */
+const BULK_RESULT_COLOR: Record<BulkImportResultRow["status"], string> = {
+  imported: "success",
+  skipped: "default",
   failed: "error",
 };
 
@@ -228,6 +238,63 @@ export function SettingsPlatformSkills() {
       }
     },
     [errText, message, refresh, t, warnIfNotRunnable],
+  );
+
+  // 生产开荒搬运 — 「导出全部」(一个 zip 装下整库) + 「批量导入」(外层 zip
+  // 逐包导入,部分成功) + 逐包结果弹窗。
+  const batchFileInputRef = useRef<HTMLInputElement>(null);
+  const [exportingAll, setExportingAll] = useState(false);
+  const [bulkImporting, setBulkImporting] = useState(false);
+  const [bulkResults, setBulkResults] = useState<BulkImportResultRow[] | null>(null);
+
+  const onExportAll = useCallback(async () => {
+    setExportingAll(true);
+    try {
+      const blob = await exportAllPlatformSkills();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "platform-skills.zip";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      message.error(errText(err));
+    } finally {
+      setExportingAll(false);
+    }
+  }, [errText, message]);
+
+  const onBulkImportClick = useCallback(() => batchFileInputRef.current?.click(), []);
+
+  const onBulkImportFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      setBulkImporting(true);
+      try {
+        const { results } = await importPlatformSkillsBatch(file);
+        const count = (status: BulkImportResultRow["status"]) =>
+          results.filter((r) => r.status === status).length;
+        message.success(
+          t("platform_skills.bulk_done", {
+            imported: count("imported"),
+            skipped: count("skipped"),
+            failed: count("failed"),
+          }),
+        );
+        setBulkResults(results);
+        void refresh();
+        void loadCategories();
+      } catch (err) {
+        message.error(errText(err));
+      } finally {
+        setBulkImporting(false);
+        if (batchFileInputRef.current) batchFileInputRef.current.value = "";
+      }
+    },
+    [errText, loadCategories, message, refresh, t],
   );
 
   const resetGhForm = useCallback(() => {
@@ -602,6 +669,14 @@ export function SettingsPlatformSkills() {
         onChange={onImportFile}
         data-testid="ps-import-input"
       />
+      <input
+        ref={batchFileInputRef}
+        type="file"
+        accept=".zip,application/zip"
+        style={{ display: "none" }}
+        onChange={onBulkImportFile}
+        data-testid="ps-import-batch-input"
+      />
       <PageHeader
         icon={<Sparkles size={18} strokeWidth={1.5} />}
         title={t("platform_skills.page_title")}
@@ -615,6 +690,22 @@ export function SettingsPlatformSkills() {
                 icon={<RefreshCw size={14} strokeWidth={1.5} />}
               >
                 {t("common.refresh")}
+              </Button>
+              <Button
+                onClick={() => void onExportAll()}
+                loading={exportingAll}
+                icon={<Download size={14} strokeWidth={1.5} />}
+                data-testid="ps-export-all-btn"
+              >
+                {t("platform_skills.export_all")}
+              </Button>
+              <Button
+                onClick={onBulkImportClick}
+                loading={bulkImporting}
+                icon={<Upload size={14} strokeWidth={1.5} />}
+                data-testid="ps-import-batch-btn"
+              >
+                {t("platform_skills.import_batch")}
               </Button>
               <Button
                 onClick={() => setGhOpen(true)}
@@ -784,6 +875,39 @@ export function SettingsPlatformSkills() {
               data-testid="ps-github-ref"
             />
           </label>
+        </div>
+      </Modal>
+
+      <Modal
+        open={bulkResults !== null}
+        title={t("platform_skills.bulk_results_title")}
+        footer={null}
+        onCancel={() => setBulkResults(null)}
+        data-testid="ps-bulk-results-modal"
+      >
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+            maxHeight: 400,
+            overflowY: "auto",
+          }}
+          data-testid="ps-bulk-results"
+        >
+          {(bulkResults ?? []).map((r) => (
+            <div key={r.name} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <Tag color={BULK_RESULT_COLOR[r.status]}>
+                {t(`platform_skills.bulk_result_${r.status}`)}
+              </Tag>
+              <Text style={{ fontFamily: "var(--ew-font-mono)", fontSize: 12 }}>{r.name}</Text>
+              {r.reason && (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {r.reason}
+                </Text>
+              )}
+            </div>
+          ))}
         </div>
       </Modal>
 
