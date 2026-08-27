@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -12,7 +13,13 @@ from redis.exceptions import RedisError
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.middleware.rate_limit import _rate_limit_backend_errors
-from control_plane.ratelimit import InProcessTokenBucketLimiter, RateLimitDecision, RateLimiter
+from control_plane.middleware.tenant_rate_limit import TenantRateLimitOverrideCache
+from control_plane.ratelimit import (
+    InProcessTokenBucketLimiter,
+    RateLimitDecision,
+    RateLimiter,
+    RateLimitOverride,
+)
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditAction, AuditQuery
@@ -252,3 +259,106 @@ async def test_tenant_override_tightens_limit(audit_store: InMemoryAuditLogStore
         r2 = await client.get("/v1/agents", headers=headers)
         assert r1.status_code == 200  # override burst=1 → first allowed
         assert r2.status_code == 429  # ...second drained the 1-token override bucket
+
+
+# ---------------------------------------------------------------------------
+# PR-D (E3b) — TenantRateLimitOverrideCache unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_override_cache_miss_then_hit() -> None:
+    cache = TenantRateLimitOverrideCache()
+    tid = uuid4()
+    assert cache.get(tid) == (False, None)
+    override = RateLimitOverride(requests_per_minute=60, burst=1)
+    cache.set(tid, override)
+    assert cache.get(tid) == (True, override)
+
+
+def test_override_cache_cached_none_is_a_hit() -> None:
+    """``None`` (tenant has no override) is a cacheable value, not a miss —
+    otherwise every request for override-less tenants would hit the DB."""
+    cache = TenantRateLimitOverrideCache()
+    tid = uuid4()
+    cache.set(tid, None)
+    assert cache.get(tid) == (True, None)
+
+
+def test_override_cache_entry_expires_after_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    cache = TenantRateLimitOverrideCache(ttl_s=30.0)
+    tid = uuid4()
+    override = RateLimitOverride(requests_per_minute=60, burst=1)
+    cache.set(tid, override)
+    clock["now"] = 129.9
+    assert cache.get(tid) == (True, override)  # still inside the TTL
+    clock["now"] = 130.1
+    assert cache.get(tid) == (False, None)  # expired → miss
+
+
+def test_override_cache_invalidate_takes_effect_immediately() -> None:
+    cache = TenantRateLimitOverrideCache()
+    tid = uuid4()
+    other = uuid4()
+    cache.set(tid, RateLimitOverride(requests_per_minute=60, burst=1))
+    cache.set(other, None)
+    cache.invalidate(tid)
+    assert cache.get(tid) == (False, None)  # evicted, well before the TTL
+    assert cache.get(other) == (True, None)  # untouched neighbour survives
+    cache.invalidate(uuid4())  # unknown tenant → silent no-op
+
+
+# ---------------------------------------------------------------------------
+# PR-D (E3b) — app.state wiring: invalidate reaches the middleware's cache
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_app_state_invalidate_makes_middleware_reread_override(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """``app.state.tenant_rate_limit_overrides`` must be the SAME object the
+    middleware reads through: after a config write, calling ``invalidate`` on
+    it (what the PUT endpoint and the bus handler do) makes the very next
+    request see the new override instead of waiting out the 30s TTL."""
+    from expert_work.persistence.tenant_config import InMemoryTenantConfigStore
+    from expert_work.protocol.tenant_config import TenantConfigPatch
+
+    repo = InMemoryTenantConfigStore()
+    await repo.upsert(
+        tenant_id=_TENANT,
+        patch=TenantConfigPatch(display_name="T"),
+        actor_id="seed",
+    )
+    limiter = InProcessTokenBucketLimiter(capacity=10_000, refill_per_sec=10_000.0)
+    app = create_app(
+        settings=_settings(),
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        tenant_rate_limiter=limiter,
+        tenant_config_repo=repo,
+        enable_reaper=False,
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT)}"}
+        # No override yet — wide defaults; the middleware caches ``None``.
+        r1 = await client.get("/v1/agents", headers=headers)
+        r2 = await client.get("/v1/agents", headers=headers)
+        assert (r1.status_code, r2.status_code) == (200, 200)
+
+        # Tighten the override in the store. Within the 30s TTL the cached
+        # ``None`` would keep serving wide defaults...
+        await repo.upsert(
+            tenant_id=_TENANT,
+            patch=TenantConfigPatch(rate_limit_override={"requests_per_minute": 60, "burst": 1}),
+            actor_id="seed",
+        )
+        # ...unless the write path evicts (this is the PR-D wiring under test).
+        app.state.tenant_rate_limit_overrides.invalidate(_TENANT)
+
+        r3 = await client.get("/v1/agents", headers=headers)
+        r4 = await client.get("/v1/agents", headers=headers)
+        assert r3.status_code == 200  # re-read override → burst=1 clamps the bucket
+        assert r4.status_code == 429  # ...so the second request is denied

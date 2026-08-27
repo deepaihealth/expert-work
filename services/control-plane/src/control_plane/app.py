@@ -180,6 +180,7 @@ from control_plane.middleware import (
     RateLimitMiddleware,
     RLSContextMiddleware,
     TenantRateLimitMiddleware,
+    TenantRateLimitOverrideCache,
 )
 from control_plane.orphan_sweep import OrphanSweep
 from control_plane.platform_delegation_config import (
@@ -2341,6 +2342,14 @@ def create_app(
     app.state.rate_limiter = resolved_limiter
     app.state.mcp_probe_limiter = resolved_mcp_probe_limiter
     app.state.tenant_rate_limiter = resolved_tenant_limiter
+    # PR-D (E3b) — the per-tenant rate_limit_override TTL cache, shared between
+    # the middleware (reader; injected via add_middleware below) and the write
+    # paths: the tenant-config PUT and the invalidation-bus
+    # ``rate_limit_override`` handler reach it HERE to evict on write instead
+    # of waiting out the 30s TTL. The attr name matches the bus handler's
+    # ``getattr(state, "tenant_rate_limit_overrides", None)``.
+    tenant_rate_limit_override_cache = TenantRateLimitOverrideCache()
+    app.state.tenant_rate_limit_overrides = tenant_rate_limit_override_cache
     app.state.agent_spec_repo = resolved_repo
     app.state.thread_meta_repo = resolved_threads
     app.state.thread_message_store = resolved_thread_messages
@@ -2520,6 +2529,9 @@ def create_app(
         audit_sample_every=resolved_settings.tenant_rate_limit_audit_sample_every,
         # Stream C.6 — per-tenant rate_limit_override (cached, own-tenant RLS read).
         tenant_config_store=resolved_tenant_config_repo,
+        # PR-D (E3b) — same object as app.state.tenant_rate_limit_overrides so
+        # write-path invalidation reaches the middleware's cache.
+        override_cache=tenant_rate_limit_override_cache,
     )
     app.add_middleware(
         AuthMiddleware,
