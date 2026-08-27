@@ -262,9 +262,7 @@ async def test_import_platform_skill_invalidates_once_not_on_idempotent_rerun(
 
 
 @pytest.mark.asyncio
-async def test_import_from_github_invalidates(
-    pctx: _Ctx, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_import_from_github_invalidates(pctx: _Ctx, monkeypatch: pytest.MonkeyPatch) -> None:
     archive = _github_archive({"skills/find-skills/SKILL.md": _skill_md("find-skills")})
 
     async def _fake_download(src: object, *, client: object = None) -> bytes:
