@@ -1201,6 +1201,13 @@ const zhCN: TranslationKeys = {
       "构建时把当天日期写进系统提示词（默认开，按日缓存稳定）。关闭后智能体不知道今天几号——仅适合与日期无关的智能体。",
     dynamic_context_note:
       "自定义提醒（dynamic_context.custom_reminders）等高级项请到 YAML 视图配置。",
+    delegation_policy_generate: "生成委派策略",
+    delegation_policy_title: "委派策略草稿",
+    delegation_policy_hint:
+      "由平台辅助模型基于该智能体已保存的配置（工具、技能、提示词）起草。请人工审阅后插入到系统提示词末尾，可继续编辑，最后照常保存——保存前不会写入任何内容。",
+    delegation_policy_insert: "插入到提示词末尾",
+    delegation_policy_close: "关闭",
+    delegation_policy_failed: "生成委派策略失败",
   },
   console: {
     sidebar_title: "对话",

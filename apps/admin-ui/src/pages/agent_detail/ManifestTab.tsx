@@ -169,6 +169,9 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
         onChange={setBuffer}
         activeGroup={activeGroup}
         onActiveGroupChange={handleGroupChange}
+        // 委派增强层 3 — 已保存 Agent 才有「生成委派策略」(后端读已保存
+        // manifest 起草);创建流/模板表单不传,按钮不渲染。
+        agentRef={{ name: r.name, version: r.version }}
       />
     </Card>
   );

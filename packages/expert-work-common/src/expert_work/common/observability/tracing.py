@@ -79,7 +79,8 @@ def _llm_span_name(component: ExpertWorkComponent, action: str) -> str:
 #: and forwards this ``purpose`` to the admin-ui console, which renders
 #: auxiliary calls (purpose != "main") apart from the main agent turn.
 #: Producers: orchestrator graph_builder/{memory,planner,reflect},
-#: context/compressor, output_judge, tools/{vision,knowledge}. Any new
+#: context/compressor, output_judge, tools/{vision,knowledge}, plus the
+#: control-plane agents API (delegation-policy draft). Any new
 #: purpose-wrapped LLM call MUST be added here — ``test_aux_llm_spans`` asserts
 #: every emitted span name is a key, and the facade tests assert label parity.
 LLM_SPAN_PURPOSES: dict[str, str] = {
@@ -94,6 +95,9 @@ LLM_SPAN_PURPOSES: dict[str, str] = {
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "judge_action"): "judge",
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "vision"): "vision",
     _llm_span_name(ExpertWorkComponent.ORCHESTRATOR, "rerank"): "rerank",
+    # 委派增强层 3 — 配置页「生成委派策略」端点的辅助 LLM 起草调用
+    # (control-plane api/agents.py::generate_delegation_policy)。
+    _llm_span_name(ExpertWorkComponent.CONTROL_PLANE, "delegation_policy"): "delegation_policy",
 }
 
 
