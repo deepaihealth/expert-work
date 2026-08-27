@@ -334,9 +334,12 @@ async def test_users_lists_registry_with_tenant_wide_stats(
     data = resp.json()["data"]
     # Registry-keyed: only registered users appear. ``alice`` is registered;
     # ``bob`` is a bare thread-owner uuid with no tenant_user row, so he is
-    # absent (in production every thread-owner has a registry row).
-    assert data["total"] == 1
-    alice = data["items"][0]
+    # absent (in production every thread-owner has a registry row). The
+    # calling admin ALSO holds a row since 2026-08-27 — the request-path
+    # last-active bump (MemberActivationMiddleware) upserts every
+    # authenticated user, the fixture client included.
+    assert data["total"] == 2
+    alice = next(i for i in data["items"] if i["user_id"] == str(alice_id))
     assert alice["user_id"] == str(alice_id)
     assert alice["subject_id"] == "alice"
     assert alice["subject_type"] == "user"
@@ -379,8 +382,12 @@ async def test_users_excludes_service_accounts(
     await users.resolve(tenant_id=_TENANT, subject_type="service_account", subject_id="svc-1")
     data = (await client.get("/v1/users")).json()["data"]
     # The service account owns a registry row but is not a "person using the
-    # agent" — subject_type="user" filter keeps the roster to humans.
-    assert {i["user_id"] for i in data["items"]} == {str(alice_id)}
+    # agent" — subject_type="user" filter keeps the roster to humans. (The
+    # calling admin's own row also appears — request-path bump, 2026-08-27 —
+    # so assert by content, not exact set equality.)
+    assert str(alice_id) in {i["user_id"] for i in data["items"]}
+    assert all(i["subject_type"] == "user" for i in data["items"])
+    assert all(i["subject_id"] != "svc-1" for i in data["items"])
 
 
 @pytest.mark.asyncio
