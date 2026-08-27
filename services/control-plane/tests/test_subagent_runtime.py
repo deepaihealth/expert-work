@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane.runtime import make_agent_builder
 from control_plane.subagent_runtime import (
     SubAgentNotFoundError,
     make_child_agent_builder,
     make_worker_build_fn,
 )
+from expert_work.common.credentials import CredentialsResolver
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
-from expert_work.protocol import AgentSpec, AgentSpecStatus
+from expert_work.protocol import AgentSpec, AgentSpecStatus, TenantConfigRecord, TenantPlan
+from expert_work.runtime.secret_store import LocalDevSecretStore
 from expert_work.testing import InMemorySecretStore
-from orchestrator import BuiltAgent, ToolEnv
+from orchestrator import BuiltAgent, LLMActionJudge, LLMOutputJudge, ToolEnv
 
 _SHA = "a" * 64
 
@@ -619,3 +623,303 @@ async def test_worker_build_fn_forwards_audit_logger(build_calls: list[dict[str,
     await build_fn(_spec("parent"), tenant_id=uuid4(), role="probe", depth=1)
 
     assert build_calls[0]["audit_logger"] is sentinel
+
+
+# ---------------------------------------------------------------------------
+# B-26 — 委派构建的防御参数与主路径同源决议(judges / tool budget / deadline /
+# token_usage_kind)。此前五参全漏传:judges 恒 None、tool_budget 只剩 env 兜底、
+# deadline 恒 0、计量恒 "conversation" —— 主 Agent 有的防御,子代默默没有。
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_KEY_NAME = "anthropic-test"
+
+
+class _StubTenantConfig:
+    """Minimal tenant-config getter for the credentials resolver."""
+
+    async def get(self, *, tenant_id: UUID, actor_id: str | None = None) -> TenantConfigRecord:
+        now = datetime.now(UTC)
+        return TenantConfigRecord(
+            tenant_id=tenant_id,
+            display_name="t",
+            plan=TenantPlan.FREE,
+            created_at=now,
+            updated_at=now,
+            updated_by="test",
+        )
+
+
+def _anthropic_credentials_resolver() -> CredentialsResolver:
+    return CredentialsResolver(
+        platform_provider_credentials={"anthropic": f"secret://{_ANTHROPIC_KEY_NAME}"},  # type: ignore[arg-type]
+        platform_tool_credentials={},  # type: ignore[arg-type]
+        tenant_config_getter=_StubTenantConfig(),  # type: ignore[arg-type]
+    )
+
+
+def _judge_secret_store() -> LocalDevSecretStore:
+    return LocalDevSecretStore.from_mapping({_ANTHROPIC_KEY_NAME: "sk-ant-test"})
+
+
+def _spec_with_defenses(name: str, version: str = "1.0.0") -> AgentSpec:
+    doc = _spec(name, version).model_dump(by_alias=True, exclude_none=True)
+    doc["spec"]["model"] = {"provider": "anthropic", "name": "claude-haiku-4-5"}
+    doc["spec"]["defenses"] = {"output_judge": "block", "action_screen": "block"}
+    return AgentSpec.model_validate(doc)
+
+
+class _FakeToolBudgetConfig:
+    """Stub PlatformToolBudgetConfigService — fixed effective switch."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+
+    async def effective_enabled(self) -> bool:
+        return self._enabled
+
+
+@pytest.mark.asyncio
+async def test_child_builder_resolves_defense_params_like_main_path(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """B-26 —— 子 Agent 构建必须带上与主路径同源决议的防御参数。
+
+    此前 make_child_agent_builder 对 build_agent 的调用漏传 output_judge /
+    action_judge / platform_tool_budget_enabled / default_run_deadline_s 四参:
+    子代 manifest 声明了 judges 也落 None 被静默关掉、tool_budget 的 DB 配置
+    失效、run deadline 落 0 无墙钟。旧代码 kwargs 里根本没有这些键,断言必红
+    (KeyError),不是恒真。
+    """
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant,
+        spec=_spec_with_defenses("researcher"),
+        spec_sha256=_SHA,
+        created_by="test",
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=_judge_secret_store(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        credentials_resolver=_anthropic_credentials_resolver(),
+        platform_tool_budget_config_service=_FakeToolBudgetConfig(True),  # type: ignore[arg-type]
+        default_run_deadline_s=1800,
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    kw = build_calls[0]
+    assert isinstance(kw["output_judge"], LLMOutputJudge)
+    assert isinstance(kw["action_judge"], LLMActionJudge)
+    assert kw["platform_tool_budget_enabled"] is True
+    assert kw["default_run_deadline_s"] == 1800
+
+
+@pytest.mark.asyncio
+async def test_child_builder_undeclared_defenses_stay_none(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """决议与主路径同语义:子代 spec 没声明 judges 就照样 None(修的是
+    「声明了却无效」,不是强制全开);tool budget 服务缺席时传 None(env 兜底)。"""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=_judge_secret_store(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        credentials_resolver=_anthropic_credentials_resolver(),
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    kw = build_calls[0]
+    assert kw["output_judge"] is None
+    assert kw["action_judge"] is None
+    assert kw["platform_tool_budget_enabled"] is None
+    assert kw["default_run_deadline_s"] == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_build_fn_resolves_defense_params_like_main_path(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """spawn_worker 的 worker 构建同病同修:worker 继承父 spec 的 defenses,
+    五参此前同样全漏。"""
+    build_fn = make_worker_build_fn(
+        secret_store=_judge_secret_store(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+        credentials_resolver=_anthropic_credentials_resolver(),
+        platform_tool_budget_config_service=_FakeToolBudgetConfig(True),  # type: ignore[arg-type]
+        default_run_deadline_s=1800,
+    )
+
+    await build_fn(_spec_with_defenses("parent"), tenant_id=uuid4(), role="probe", depth=1)
+
+    kw = build_calls[0]
+    assert isinstance(kw["output_judge"], LLMOutputJudge)
+    assert isinstance(kw["action_judge"], LLMActionJudge)
+    assert kw["platform_tool_budget_enabled"] is True
+    assert kw["default_run_deadline_s"] == 1800
+
+
+@pytest.mark.asyncio
+async def test_child_builder_forwards_token_usage_kind(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """B-26 —— 委派构建入口接受并转发 token_usage_kind(父 run 是
+    skill_evolution,子代计量也该是,而不是恒落 "conversation")。"""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+    )
+
+    await builder(
+        tenant_id=tenant,
+        name="researcher",
+        version="1.0.0",
+        depth=1,
+        token_usage_kind="skill_evolution",
+    )
+
+    assert build_calls[0]["token_usage_kind"] == "skill_evolution"
+
+
+@pytest.mark.asyncio
+async def test_child_builder_kind_defaults_to_conversation(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    assert build_calls[0]["token_usage_kind"] == "conversation"
+
+
+@pytest.mark.asyncio
+async def test_child_cache_not_shared_across_usage_kinds(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """kind 进缓存键:skill_evolution 回放构建的子代若被 conversation 委派
+    命中(或反之),整个 TTL 窗口内计量都会挂错 —— 必须各建各的。"""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    await builder(
+        tenant_id=tenant,
+        name="researcher",
+        version="1.0.0",
+        depth=1,
+        token_usage_kind="skill_evolution",
+    )
+    # Same-kind repeat still hits the cache.
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    assert len(build_calls) == 2
+    assert [c["token_usage_kind"] for c in build_calls] == ["conversation", "skill_evolution"]
+
+
+@pytest.mark.asyncio
+async def test_worker_build_fn_forwards_token_usage_kind(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+    )
+
+    await build_fn(
+        _spec("parent"),
+        tenant_id=uuid4(),
+        role="probe",
+        depth=1,
+        token_usage_kind="skill_evolution",
+    )
+
+    assert build_calls[0]["token_usage_kind"] == "skill_evolution"
+
+
+@pytest.mark.asyncio
+async def test_child_and_main_path_resolve_defenses_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """对齐断言:同一 spec + 同一平台配置下,主路径与 child 路径交给
+    build_agent 的五个防御参数决议结果一致(同一份决议逻辑,不是两份抄本)。"""
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_build_agent(spec: AgentSpec, **kwargs: Any) -> BuiltAgent:
+        calls.append({"spec": spec, **kwargs})
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("control_plane.runtime.build_agent", _fake_build_agent)
+    monkeypatch.setattr("control_plane.subagent_runtime.build_agent", _fake_build_agent)
+
+    tenant = uuid4()
+    spec = _spec_with_defenses("researcher")
+    store = InMemoryAgentSpecStore()
+    await store.create(tenant_id=tenant, spec=spec, spec_sha256=_SHA, created_by="test")
+
+    main_builder = make_agent_builder(
+        _judge_secret_store(),
+        InMemorySaver(),
+        credentials_resolver=_anthropic_credentials_resolver(),
+        platform_tool_budget_config_service=_FakeToolBudgetConfig(True),  # type: ignore[arg-type]
+        default_run_deadline_s=1800,
+    )
+    child_builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=_judge_secret_store(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        credentials_resolver=_anthropic_credentials_resolver(),
+        platform_tool_budget_config_service=_FakeToolBudgetConfig(True),  # type: ignore[arg-type]
+        default_run_deadline_s=1800,
+    )
+
+    await main_builder(spec, tenant_id=tenant)
+    await child_builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    main_kw, child_kw = calls
+    assert type(main_kw["output_judge"]) is type(child_kw["output_judge"]) is LLMOutputJudge
+    assert type(main_kw["action_judge"]) is type(child_kw["action_judge"]) is LLMActionJudge
+    assert main_kw["platform_tool_budget_enabled"] == child_kw["platform_tool_budget_enabled"]
+    assert main_kw["default_run_deadline_s"] == child_kw["default_run_deadline_s"] == 1800
+    assert main_kw["token_usage_kind"] == child_kw["token_usage_kind"] == "conversation"

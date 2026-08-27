@@ -114,8 +114,13 @@ class WorkerBuildFn(Protocol):
         role: str | None,
         depth: int,
         oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
     ) -> BuiltAgent:
-        """Synthesize a worker spec from ``parent_spec`` + ``role`` and build it."""
+        """Synthesize a worker spec from ``parent_spec`` + ``role`` and build it.
+
+        ``token_usage_kind`` (B-26) labels the worker build's LLM spend in
+        token_usage; ``build_agent`` injects the parent's own kind (see
+        ``_bind_delegation_usage_kind``)."""
 
 
 @dataclass(frozen=True)

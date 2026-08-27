@@ -534,6 +534,160 @@ async def test_build_agent_subagents_without_builder_raises() -> None:
             await _build(_subagent_spec(), secret_store=_secret_store(), checkpointer=cp)
 
 
+# ---------------------------------------------------------------------------
+# B-26 — token_usage_kind penetrates delegated builds (child + worker)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingChildBuilder:
+    """Conforms to ``ChildAgentBuilder``; records delegation-call kwargs."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self,
+        *,
+        tenant_id: Any,
+        name: str,
+        version: str,
+        depth: int,
+        oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+    ) -> Any:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "name": name,
+                "version": version,
+                "depth": depth,
+                "oauth_user_id": oauth_user_id,
+                "token_usage_kind": token_usage_kind,
+            }
+        )
+        return object()
+
+
+class _RecordingWorkerBuildFn:
+    """Conforms to ``WorkerBuildFn``; records delegation-call kwargs."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self,
+        parent_spec: AgentSpec,
+        *,
+        tenant_id: Any,
+        role: str | None,
+        depth: int,
+        oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+    ) -> Any:
+        self.calls.append(
+            {
+                "parent_spec": parent_spec,
+                "tenant_id": tenant_id,
+                "role": role,
+                "depth": depth,
+                "oauth_user_id": oauth_user_id,
+                "token_usage_kind": token_usage_kind,
+            }
+        )
+        return object()
+
+
+def _capture_registry_env(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
+    """Wrap ``build_tool_registry`` to capture the ``tool_env`` build_agent
+    actually assembles the delegation tools with."""
+    import orchestrator.agent_factory as agent_factory_module
+
+    real = agent_factory_module.build_tool_registry
+
+    async def _capture(tool_specs: Any, *, tool_env: Any, **kwargs: Any) -> Any:
+        captured["env"] = tool_env
+        return await real(tool_specs, tool_env=tool_env, **kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory.build_tool_registry", _capture)
+
+
+@pytest.mark.asyncio
+async def test_build_agent_default_kind_keeps_delegation_builders_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认 kind("conversation")不包装 —— 委派入口对象与传入的完全同一,
+    既有行为字节等价(builder 侧的默认值本来就是 "conversation")。"""
+    captured: dict[str, Any] = {}
+    _capture_registry_env(monkeypatch, captured)
+    stub = _RecordingChildBuilder()
+    wbf = _RecordingWorkerBuildFn()
+    env = ToolEnv(child_agent_builder=stub, worker_build_fn=wbf)
+    async with make_checkpointer("memory") as cp:
+        await _build(_subagent_spec(), secret_store=_secret_store(), checkpointer=cp, tool_env=env)
+    assert captured["env"].child_agent_builder is stub
+    assert captured["env"].worker_build_fn is wbf
+
+
+@pytest.mark.asyncio
+async def test_build_agent_nondefault_kind_reaches_child_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-26 —— 非默认 token_usage_kind(skill_evolution 评估回放)必须穿透进
+    委派构建调用,否则子代 LLM 花费全记回 "conversation"。旧代码不包装,
+    stub 收到默认值,断言必红。"""
+    from uuid import uuid4
+
+    captured: dict[str, Any] = {}
+    _capture_registry_env(monkeypatch, captured)
+    stub = _RecordingChildBuilder()
+    env = ToolEnv(child_agent_builder=stub)
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            _subagent_spec(),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            tool_env=env,
+            token_usage_kind="skill_evolution",
+        )
+
+    wrapped = captured["env"].child_agent_builder
+    await wrapped(
+        tenant_id=uuid4(), name="researcher", version="1.0.0", depth=1, oauth_user_id="kc-u"
+    )
+    assert stub.calls[0]["token_usage_kind"] == "skill_evolution"
+    # The other call args pass through untouched.
+    assert stub.calls[0]["name"] == "researcher"
+    assert stub.calls[0]["depth"] == 1
+    assert stub.calls[0]["oauth_user_id"] == "kc-u"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_nondefault_kind_reaches_worker_build_fn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import uuid4
+
+    captured: dict[str, Any] = {}
+    _capture_registry_env(monkeypatch, captured)
+    wbf = _RecordingWorkerBuildFn()
+    env = ToolEnv(worker_build_fn=wbf)
+    spec = _spec()
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            spec,
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            tool_env=env,
+            token_usage_kind="skill_evolution",
+        )
+
+    wrapped = captured["env"].worker_build_fn
+    await wrapped(spec, tenant_id=uuid4(), role="researcher", depth=1)
+    assert wbf.calls[0]["token_usage_kind"] == "skill_evolution"
+    assert wbf.calls[0]["parent_spec"] is spec
+    assert wbf.calls[0]["role"] == "researcher"
+
+
 def _knowledge_spec() -> AgentSpec:
     doc = deepcopy(_MINIMAL_SPEC)
     doc["spec"]["knowledge"] = {"knowledge_base_refs": ["hr-policies"]}

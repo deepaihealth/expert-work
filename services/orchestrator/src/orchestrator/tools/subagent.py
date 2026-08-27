@@ -76,12 +76,18 @@ class ChildAgentBuilder(Protocol):
         version: str,
         depth: int,
         oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
     ) -> BuiltAgent:
         """Build the sub-agent ``name@version`` for ``tenant_id`` at ``depth``.
 
         ``oauth_user_id`` (MCP-OAUTH OA-3b-后续) is the caller's OAuth subject
         so the child inherits the same per-user OAuth pool; ``None`` = no OAuth
-        pool injected (the child still gets the tenant pool)."""
+        pool injected (the child still gets the tenant pool).
+
+        ``token_usage_kind`` (B-26) labels the child build's LLM spend in
+        token_usage. ``build_agent`` injects the parent's own kind here (see
+        ``_bind_delegation_usage_kind``) so e.g. a ``skill_evolution`` replay's
+        delegations are metered as skill_evolution, not "conversation"."""
 
 
 @dataclass(frozen=True)

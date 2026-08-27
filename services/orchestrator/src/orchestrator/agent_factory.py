@@ -142,6 +142,8 @@ from orchestrator.tools.skill_seed import (
     sanitize_agent_key,
     seed_drop_audit_entries,
 )
+from orchestrator.tools.spawn_worker import WorkerBuildFn
+from orchestrator.tools.subagent import ChildAgentBuilder
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
@@ -488,6 +490,76 @@ def _bound_distilled_skills(
     return tuple(bound)
 
 
+def _bind_delegation_usage_kind(env: ToolEnv, token_usage_kind: str) -> ToolEnv:
+    """B-26 — inject this build's ``token_usage_kind`` into the delegation
+    build entrances (static sub-agents + spawned workers).
+
+    The delegation tools (``SubAgentTool`` / ``spawn_worker``) call the
+    env-injected builders without a usage kind, so a non-default kind (e.g.
+    the ``skill_evolution`` evaluation replay) would silently drop back to
+    "conversation" on every delegated build — mis-metering the whole subtree's
+    LLM spend. The wrapped builders force THIS build's kind; the child's own
+    recursive ``build_agent`` call re-wraps for grandchildren, so the kind
+    penetrates the full delegation tree. ``build_agent`` only calls this for a
+    non-default kind — the default path keeps the exact builder objects it was
+    given (byte-identical behaviour).
+    """
+    kind = token_usage_kind
+    child = env.child_agent_builder
+    worker = env.worker_build_fn
+    if child is None and worker is None:
+        return env
+    new_child: ChildAgentBuilder | None = child
+    if child is not None:
+        bound_child = child
+
+        async def _child_with_kind(
+            *,
+            tenant_id: UUID,
+            name: str,
+            version: str,
+            depth: int,
+            oauth_user_id: str | None = None,
+            token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+        ) -> BuiltAgent:
+            # The incoming kind is ignored — the parent's kind labels the tree.
+            return await bound_child(
+                tenant_id=tenant_id,
+                name=name,
+                version=version,
+                depth=depth,
+                oauth_user_id=oauth_user_id,
+                token_usage_kind=kind,
+            )
+
+        new_child = _child_with_kind
+    new_worker: WorkerBuildFn | None = worker
+    if worker is not None:
+        bound_worker = worker
+
+        async def _worker_with_kind(
+            parent_spec: AgentSpec,
+            *,
+            tenant_id: UUID,
+            role: str | None,
+            depth: int,
+            oauth_user_id: str | None = None,
+            token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+        ) -> BuiltAgent:
+            # The incoming kind is ignored — the parent's kind labels the tree.
+            return await bound_worker(
+                parent_spec,
+                tenant_id=tenant_id,
+                role=role,
+                depth=depth,
+                oauth_user_id=oauth_user_id,
+                token_usage_kind=kind,
+            )
+
+        new_worker = _worker_with_kind
+    return replace(env, child_agent_builder=new_child, worker_build_fn=new_worker)
+
+
 def _effective_run_deadline_s(manifest_value: int, platform_default: int) -> int:
     """Resolve the run's wall-clock deadline in seconds.
 
@@ -770,6 +842,14 @@ async def build_agent(
             agent_key,
         )
         env = replace(env, sandbox_runtime=bound_runtime)
+
+    # B-26 — a non-default usage kind (e.g. the skill-evolution replay) must
+    # label the WHOLE delegation tree: wrap the delegation build entrances so
+    # child/worker builds inherit this build's kind. The default kind wraps
+    # nothing — the delegated builders' own default is already "conversation",
+    # keeping that path byte-identical.
+    if token_usage_kind != "conversation":  # noqa: S105 — usage label, not a secret
+        env = _bind_delegation_usage_kind(env, token_usage_kind)
 
     registry = await build_tool_registry(
         spec.spec.tools,

@@ -664,6 +664,78 @@ async def _make_action_judge(
     return LLMActionJudge(caller=caller)
 
 
+@dataclass(frozen=True)
+class ResolvedDefenses:
+    """B-26 — the per-build defense params resolved by :func:`resolve_defenses`."""
+
+    output_judge: OutputJudge | None
+    action_judge: ActionJudge | None
+    platform_tool_budget_enabled: bool | None
+
+
+async def resolve_defenses(
+    spec: AgentSpec,
+    *,
+    tenant_id: UUID | None,
+    credentials_resolver: CredentialsResolver | None,
+    secret_store: SecretStore,
+    platform_judge_config_service: PlatformJudgeConfigService | None = None,
+    platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> ResolvedDefenses:
+    """Resolve the model-backed judges + the platform tool-budget switch for a build.
+
+    B-26 — the ONE resolution shared by the main build path
+    (:func:`make_agent_builder`) and both delegated build paths
+    (``subagent_runtime.make_child_agent_builder`` / ``make_worker_build_fn``),
+    so a sub-agent/worker gets exactly the defenses its own spec + the platform
+    config declare — no more, no less — instead of a silent all-``None``
+    downgrade. Semantics are byte-identical to the main path's previous inline
+    logic:
+
+    * judges (PI-2b-3 / PI-3b-2) build only when the manifest opts in AND the
+      tenant credential path is wired (``credentials_resolver`` + ``tenant_id``);
+      preview / validation builds get no judge, same as before;
+    * ``platform_tool_budget_enabled`` (Phase 3) reads the platform master
+      switch DB-wins-over-env; ``None`` (service unwired) lets ``build_agent``
+      fall back to the env default.
+    """
+    output_judge = (
+        await _make_output_judge(
+            spec,
+            tenant_id=tenant_id,
+            credentials_resolver=credentials_resolver,
+            secret_store=secret_store,
+            judge_config_service=platform_judge_config_service,
+            http_client=http_client,
+        )
+        if credentials_resolver is not None and tenant_id is not None
+        else None
+    )
+    action_judge = (
+        await _make_action_judge(
+            spec,
+            tenant_id=tenant_id,
+            credentials_resolver=credentials_resolver,
+            secret_store=secret_store,
+            judge_config_service=platform_judge_config_service,
+            http_client=http_client,
+        )
+        if credentials_resolver is not None and tenant_id is not None
+        else None
+    )
+    platform_tool_budget_enabled = (
+        await platform_tool_budget_config_service.effective_enabled()
+        if platform_tool_budget_config_service is not None
+        else None
+    )
+    return ResolvedDefenses(
+        output_judge=output_judge,
+        action_judge=action_judge,
+        platform_tool_budget_enabled=platform_tool_budget_enabled,
+    )
+
+
 async def _resolve_template_extends(
     spec: AgentSpec, resolver: PlatformTemplateResolver | None
 ) -> AgentSpec:
@@ -846,41 +918,18 @@ def make_agent_builder(
             and tenant_id is not None
             else None
         )
-        # Stream PI-2b-3 — model-backed output judge, when the manifest opts in
-        # and the tenant credential path is wired (preview/validation builds
-        # without a resolver get no judge, same as the agent's own model).
-        output_judge = (
-            await _make_output_judge(
-                spec,
-                tenant_id=tenant_id,
-                credentials_resolver=credentials_resolver,
-                secret_store=secret_store,
-                judge_config_service=platform_judge_config_service,
-                http_client=http_client,
-            )
-            if credentials_resolver is not None and tenant_id is not None
-            else None
-        )
-        # Stream PI-3b-2 — model-backed action judge, same gating + model source.
-        action_judge = (
-            await _make_action_judge(
-                spec,
-                tenant_id=tenant_id,
-                credentials_resolver=credentials_resolver,
-                secret_store=secret_store,
-                judge_config_service=platform_judge_config_service,
-                http_client=http_client,
-            )
-            if credentials_resolver is not None and tenant_id is not None
-            else None
-        )
-        # Phase 3 — resolve the platform tool-output-budget master switch
-        # (DB-wins over the EXPERT_WORK_TOOL_OUTPUT_BUDGET env default). ``None`` lets
-        # build_agent fall back to the env default.
-        platform_tool_budget_enabled = (
-            await platform_tool_budget_config_service.effective_enabled()
-            if platform_tool_budget_config_service is not None
-            else None
+        # Stream PI-2b-3 / PI-3b-2 / Phase 3 — model-backed judges + the
+        # platform tool-output-budget master switch. B-26: resolved through the
+        # shared :func:`resolve_defenses` (same call the delegated child/worker
+        # build paths make), so the resolution logic has exactly one source.
+        defenses = await resolve_defenses(
+            spec,
+            tenant_id=tenant_id,
+            credentials_resolver=credentials_resolver,
+            secret_store=secret_store,
+            platform_judge_config_service=platform_judge_config_service,
+            platform_tool_budget_config_service=platform_tool_budget_config_service,
+            http_client=http_client,
         )
         return await build_agent(
             spec,
@@ -901,11 +950,11 @@ def make_agent_builder(
             trigger_store=trigger_store,
             audit_logger=audit_logger,
             # Stream PI-2b-3 — gated model-backed output judge.
-            output_judge=output_judge,
+            output_judge=defenses.output_judge,
             # Stream PI-3b-2 — gated model-backed action judge.
-            action_judge=action_judge,
+            action_judge=defenses.action_judge,
             # Phase 3 — platform master switch (effective = platform AND agent).
-            platform_tool_budget_enabled=platform_tool_budget_enabled,
+            platform_tool_budget_enabled=defenses.platform_tool_budget_enabled,
             # skill-asset-store — dual-read for externalized supporting files.
             skill_asset_store=skill_asset_store,
             # 一期 Task 5 — process-level shared HTTP client.

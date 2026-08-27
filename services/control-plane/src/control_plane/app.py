@@ -1771,6 +1771,13 @@ def create_app(
                     skill_activity_recorder=skill_activity_recorder,
                     tenant_config_service=resolved_tenant_config_service,
                     skill_asset_store=skill_asset_store,
+                    # B-26 — 子代防御参数与主构建路径同源:judges / tool-budget
+                    # 决议服务 + 平台墙钟 floor(此前五参全漏,子代防御静默降级)。
+                    platform_judge_config_service=resolved_platform_judge_config_service,
+                    platform_tool_budget_config_service=(
+                        resolved_platform_tool_budget_config_service
+                    ),
+                    default_run_deadline_s=resolved_settings.default_run_deadline_s,
                     # Stream V-D (audit #1) — evict cached sub-agents when a
                     # tenant's MCP registry changes, like the top-level cache.
                     register_invalidation=resolved_agent_runtime.register_invalidation_hook,
@@ -1811,6 +1818,12 @@ def create_app(
                         # service (DB-wins-over-env, live); ``max_iterations=``
                         # above stays its boot-time fallback.
                         dynamic_worker_config_service=resolved_platform_dynamic_worker_config_service,
+                        # B-26 — worker 防御参数与主构建路径同源(同上)。
+                        platform_judge_config_service=resolved_platform_judge_config_service,
+                        platform_tool_budget_config_service=(
+                            resolved_platform_tool_budget_config_service
+                        ),
+                        default_run_deadline_s=resolved_settings.default_run_deadline_s,
                         # 一期 Task 5 — spawned worker builds reuse the shared pool too.
                         http_client=shared_http,
                     )

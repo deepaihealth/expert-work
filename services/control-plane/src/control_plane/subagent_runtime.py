@@ -21,8 +21,10 @@ import httpx
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerConfigService
+from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
-from control_plane.runtime import make_provider_key_resolver, make_skill_resolver
+from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
+from control_plane.runtime import make_provider_key_resolver, make_skill_resolver, resolve_defenses
 from control_plane.tenancy import TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
@@ -41,9 +43,13 @@ from orchestrator.tools.spawn_worker import WorkerBuildFn
 
 logger = logging.getLogger(__name__)
 
-# Child-agent cache key: (tenant, name, version, depth); a 5th OAuth-subject
-# element is appended only for users with a connected OAuth pool (see _build).
-_ChildKey = tuple[UUID, str, str, int] | tuple[UUID, str, str, int, str]
+# Child-agent cache key: (tenant, name, version, depth, token_usage_kind); a
+# 6th OAuth-subject element is appended only for users with a connected OAuth
+# pool (see _build). B-26 — the usage kind is part of the key because the
+# built agent bakes it into its metering middleware: a skill_evolution-built
+# child served to a conversation delegation (or vice versa) would mis-label
+# every LLM call for the whole TTL window.
+_ChildKey = tuple[UUID, str, str, int, str] | tuple[UUID, str, str, int, str, str]
 
 
 def _worker_system_prompt(role: str | None) -> str:
@@ -199,6 +205,13 @@ def make_child_agent_builder(
     skill_asset_store: SkillAssetStore | None = None,
     skill_activity_recorder: SkillActivityRecorder | None = None,
     tenant_config_service: TenantConfigService | None = None,
+    # B-26 —— judges 与 tool-budget 开关走主路径同一份决议
+    # (runtime.resolve_defenses);此前五个防御参数全漏传,子代 manifest 声明
+    # 了 judges 也落 None 被静默关掉。
+    platform_judge_config_service: PlatformJudgeConfigService | None = None,
+    platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
+    # B-26 —— 平台墙钟 floor,与主构建路径同源(settings.default_run_deadline_s)。
+    default_run_deadline_s: int = 0,
     register_invalidation: Callable[[Callable[[UUID], None]], None] | None = None,
     register_invalidation_all: Callable[[Callable[[], None]], None] | None = None,
     register_user_invalidation: Callable[[Callable[[UUID, str], None]], None] | None = None,
@@ -243,7 +256,13 @@ def make_child_agent_builder(
         set_built_agent_cache_entries(scope="subagent", count=len(cache))
 
     async def _build(
-        *, tenant_id: UUID, name: str, version: str, depth: int, oauth_user_id: str | None = None
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        depth: int,
+        oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
     ) -> BuiltAgent:
         # Resolve the caller's OAuth pool up front so the cache key can reflect it.
         user_pool = None
@@ -252,9 +271,9 @@ def make_child_agent_builder(
             if candidate.names():
                 user_pool = candidate
         key: _ChildKey = (
-            (tenant_id, name, version, depth, oauth_user_id)
+            (tenant_id, name, version, depth, token_usage_kind, oauth_user_id)
             if user_pool is not None and oauth_user_id is not None
-            else (tenant_id, name, version, depth)
+            else (tenant_id, name, version, depth, token_usage_kind)
         )
         cached = cache.get(key)
         if cached is not None:
@@ -303,10 +322,23 @@ def make_child_agent_builder(
         # parent (resolved above for the cache key).
         if user_pool is not None:
             call_tool_env = replace(call_tool_env, user_mcp_oauth_pool=user_pool)
+        # BUG-19b —— 子 Agent 不排任务(既定意图):spec 层剥 manage_task,
+        # 而不是让缺席的 TriggerStore 炸掉整个委派构建。
+        child_spec = _without_manage_task(record.spec)
+        # B-26 —— judges / tool-budget 开关按子代自己的 spec + 平台配置,走与
+        # 主路径完全相同的决议(同一个 resolve_defenses,不是抄本):此前这些
+        # 参数全部漏传,子代声明了 judges 也被静默关掉。
+        defenses = await resolve_defenses(
+            child_spec,
+            tenant_id=tenant_id,
+            credentials_resolver=credentials_resolver,
+            secret_store=secret_store,
+            platform_judge_config_service=platform_judge_config_service,
+            platform_tool_budget_config_service=platform_tool_budget_config_service,
+            http_client=http_client,
+        )
         built = await build_agent(
-            # BUG-19b —— 子 Agent 不排任务(既定意图):spec 层剥 manage_task,
-            # 而不是让缺席的 TriggerStore 炸掉整个委派构建。
-            _without_manage_task(record.spec),
+            child_spec,
             secret_store=secret_store,
             checkpointer=checkpointer,
             tool_env=call_tool_env,
@@ -317,6 +349,13 @@ def make_child_agent_builder(
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
             audit_logger=audit_logger,
+            # B-26 —— 平台墙钟 floor + 计量 kind(穿透父 run)+ 三个防御参数,
+            # 与主构建路径(runtime.make_agent_builder)逐参数对齐。
+            default_run_deadline_s=default_run_deadline_s,
+            token_usage_kind=token_usage_kind,
+            output_judge=defenses.output_judge,
+            action_judge=defenses.action_judge,
+            platform_tool_budget_enabled=defenses.platform_tool_budget_enabled,
             # skill_store 此前漏传(只喂了 skill_resolver)——凡 spec 声明技能
             # 创作 builtin(remember/author_skill 系,现网 Agent 全带)的委派
             # 构建一律死在 agent_factory 的 skill_store 硬闸,全平台委派从未
@@ -369,11 +408,11 @@ def make_child_agent_builder(
 
         Registered with the :class:`AgentRuntime` so a user's OAuth token
         refresh / disconnect evicts stale delegated child builds (whose
-        ``ToolEnv`` holds the old per-user OAuth pool). Only 5-tuple keys
-        match — index 4 is the OAuth subject (see ``_ChildKey``); shared
-        4-tuple builds and other users' entries are left intact.
+        ``ToolEnv`` holds the old per-user OAuth pool). Only 6-tuple keys
+        match — index 5 is the OAuth subject (see ``_ChildKey``); shared
+        5-tuple builds and other users' entries are left intact.
         """
-        for key in [k for k in cache if len(k) == 5 and k[0] == tenant_id and k[4] == user_id]:
+        for key in [k for k in cache if len(k) == 6 and k[0] == tenant_id and k[5] == user_id]:
             del cache[key]
         _publish_cache_size()
 
@@ -412,6 +451,13 @@ def make_worker_build_fn(
     skill_activity_recorder: SkillActivityRecorder | None = None,
     tenant_config_service: TenantConfigService | None = None,
     dynamic_worker_config_service: PlatformDynamicWorkerConfigService | None = None,
+    # B-26 —— judges 与 tool-budget 开关走主路径同一份决议
+    # (runtime.resolve_defenses);worker 继承父 spec 的 defenses,此前五个
+    # 防御参数全漏传。
+    platform_judge_config_service: PlatformJudgeConfigService | None = None,
+    platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
+    # B-26 —— 平台墙钟 floor,与主构建路径同源(settings.default_run_deadline_s)。
+    default_run_deadline_s: int = 0,
     # 一期 Task 5 — process-level shared HTTP client, forwarded into every
     # spawned worker's ``build_agent`` call. ``None`` keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
@@ -441,6 +487,7 @@ def make_worker_build_fn(
         role: str | None,
         depth: int,
         oauth_user_id: str | None = None,
+        token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
     ) -> BuiltAgent:
         worker_spec = synthesize_worker_spec(
             parent_spec,
@@ -477,6 +524,17 @@ def make_worker_build_fn(
             user_pool = await user_mcp_oauth_pool_provider(tenant_id, oauth_user_id)
             if user_pool.names():
                 call_tool_env = replace(call_tool_env, user_mcp_oauth_pool=user_pool)
+        # B-26 —— worker 继承父 spec 的 defenses,judges / tool-budget 开关走
+        # 与主路径完全相同的决议(同一个 resolve_defenses,不是抄本)。
+        defenses = await resolve_defenses(
+            worker_spec,
+            tenant_id=tenant_id,
+            credentials_resolver=credentials_resolver,
+            secret_store=secret_store,
+            platform_judge_config_service=platform_judge_config_service,
+            platform_tool_budget_config_service=platform_tool_budget_config_service,
+            http_client=http_client,
+        )
         built = await build_agent(
             worker_spec,
             secret_store=secret_store,
@@ -489,6 +547,13 @@ def make_worker_build_fn(
             provider_key_resolver=provider_key_resolver,
             skill_resolver=skill_resolver,
             audit_logger=audit_logger,
+            # B-26 —— 平台墙钟 floor + 计量 kind(穿透父 run)+ 三个防御参数,
+            # 与主构建路径(runtime.make_agent_builder)逐参数对齐。
+            default_run_deadline_s=default_run_deadline_s,
+            token_usage_kind=token_usage_kind,
+            output_judge=defenses.output_judge,
+            action_judge=defenses.action_judge,
+            platform_tool_budget_enabled=defenses.platform_tool_budget_enabled,
             # 同 make_child_agent_builder 的修注:skill_store 漏传把带技能创作
             # builtin 的父 Agent 的 spawn_worker 全数变成构建期 AgentFactoryError
             # (worker 继承父 spec,闸在 worker 构建时同样触发)。
