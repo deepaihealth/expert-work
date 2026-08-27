@@ -58,7 +58,7 @@
 
 ### C · 明确不阻塞发布
 
-X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
+X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、X-16(批 E E3b,B 类有 TTL 兜底)、D-7、B-20 ②(通知路由)、P-1 / P-2 / P-5、B 系小项。
 
 **进度(2026-08-24 周一收账,当晚改期周六)**:A 级六项中 2/3/4/5/6 全清,PROD-1 拍板降级为扩容前置;主流程 BUG-1~5(#1259-#1261)+ 第二轮 BUG-6~8(#1265)全修,测试环境 `31e203a0` smoke 双发全过,平台技能 category 用户补录 51/52。
 
@@ -67,6 +67,8 @@ X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路
 - 周四~周五:①资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)② 开荒完成后 prod overlay 渲染预检(placeholder 扫描)③ 测试环境真栈验收:跨副本 /events attach(带凭据)+ `tools/ha/verify_cancel.py` + PPT 内容质量人工抽查(用户)
 - 周六:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
 - 发布后第一波:RLS PR B / X-14 P1 金丝雀 / Redis 全局令牌桶 / 取消亚秒化(invalidation_bus)/ 按需 PROD-10/11
+
+**进度(2026-08-27 白天批收账)**:收账 #1320;功能四连 —— #1321 glm-5.3-flash 上架(`ModelEntry.always_thinking` 声明式字段,关思考=降 `reasoning_effort:"low"`;GLM 独有 `clear_thinking` 保留式思考参数刻意不发,与 B-30 `thinking.keep` 同族)、#1322 `dynamic_workers.model` 临时子 Agent 模型覆盖(校验器禁 fallback 链)、#1323 激活语义改「登录过就算」(MemberActivationMiddleware 认证路径激活,首 run 钩子退役)、#1326 成员列表「最后活跃」列(15 分钟节流 bump;CI 逮到副作用=调用者也被自动注册进 tenant_user,测试已适配);文案专业化两连 —— #1324「努力程度→推理深度」+ #1325 全站术语统一(智能体/对话/全角标点/调试台运行时文案迁 i18n,零键误伤)。测试环境发 `e891b918`(双镜像,记录 #1327),smoke 含 replicas 节全绿。存量「已邀请」账号无历史回填,等各自下次登录自然激活(设计语义,用户已接受)。
 
 ---
 
@@ -401,6 +403,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | X-13 | **e2b SDK 升级迁移 2.24.0→2.39.1+**(2026-08-21 立项,源头真栈事故) | #1233 曾把 `e2b` 抬到 2.39.1,其客户端 `validate_api_key` 强制 `e2b_`+hex 格式,ACS Agent Sandbox 私有协议 key 被本地拒绝 → 测试环境沙箱工具全挂(list_dir/exec_python/write_file);已回钉 `e2b==2.24.0`+`e2b-code-interpreter==2.7.0` + dependabot ignore。升级路径:确认 kruise patch_e2b 对新版兼容(或在 `_ensure_e2b_patched` 中和 validate_api_key)→ 按 deployment.md contract-run 重跑沙箱运行时契约探针 → 真栈 exec_python 冒烟 → 解 ignore |
 | X-14 | **发布稳定性加固**(2026-08-21 立项,源头 e2b 事故复盘:评审漏钉版/CI 假件全绿/smoke 只探 HTTP,三层防线全漏)——**P2 ✅ 已交付(2026-08-26,PR #1317=PROD-7):`tools/ci/protected_pins.toml` 6 条钉版清单 + Lint job 子串断言卫兵,合法升级=同 PR 改清单** | P1 金丝雀 run 进 release.sh(预置 smoke 服务账号+金丝雀 Agent,真 run 走 exec_python+write_file+save_artifact+产物下载,断言 end.status=success,**绿才算发布成功**,红提示 rollback.sh;`canonical-agent-e2e-test` runbook 自动化)/ P3 sandbox create 失败率 alertmanager 告警 / P4 约定:动沙箱链路依赖(e2b/kruise/supervisor/镜像)必跑 deployment.md contract-run / P5 约定:发布记录 PR 写上一版 tag 便于一键回滚 |
 | X-15 | **B-20 终审 follow-up 两条**(2026-08-23 立项,#1253 独立终审 I-1/I-2) | ① `retention-cleanup-job/job.py:207` 存在**第二套审批超时实现**:直接 `mark_decided(TIMEOUT)` 不走 `resolve_approval_decision`(不写 checkpoint、不 spawn continuation),与 control-plane sweep 抢同一 CAS,它抢赢则「超时保守继续」静默不发生;**目前未部署**(infra 无该 CronJob),潜伏项——删掉该路径或改走同一内核;② `orchestrator/sse.py:1404` 审批行 `user_id=None` 写死而 `record.user_id` 在手上,sweep 续跑恒 `caller_user_id=None` 丢 per-user OAuth MCP pool key,1h 澄清超时使该路径变常态;修=一行透传 + 存量回填迁移 |
+| X-16 | **批 E 收尾:E3b 失效总线全量接线 + C 类缺口修复**(来源:batch-e 多副本专项 2026-08-24 枚举;E1 #1271 checkpointer 池=BUG-18 / E2 #1272 MCP 死会话自愈=BUG-17 / E3a #1273 Redis 失效总线+事故家族接线已全合) | E3b=①其余 B 类配置面接线(PlatformSecrets/CredentialValueCache 300s——吊销的 key 邻 pod 还能用 5 分钟/judge·tool-budget·embedding·delegation 各 60s/quota 规则/限流 override 等,失效只打本地)②**C 类独立 bug 群**(platform_skills 全部写路径连本地失效都没有,技能改完写 pod 自己都要等 1800s/quota POST·DELETE 不失效自家 60s 缓存/rate-limit override 无任何失效钩子/credential-proxy `/admin/cache/invalidate` 只打 VIP 后一个 pod)③双层复合不变式 handler 层联动(judge/tool-budget/secrets/技能内容烤进 BuiltAgent,打里层不打外层等于没打)。接线点漏斗与安全清单在 memory batch-e-multi-replica-program |
 
 ---
 
