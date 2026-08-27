@@ -1130,3 +1130,46 @@ async def test_password_never_in_audit(
     page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
     serialized = "\n".join(entry.model_dump_json() for entry in page.entries)
     assert pw not in serialized
+
+
+@pytest.mark.asyncio
+async def test_list_carries_last_active_at(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """成员列表带「最后活跃」(2026-08-27):activated 行 join tenant_user.
+    last_active_at,invited 行(subject_id 为空)为 null。"""
+    client, tenant_id, app, _kc = admin_app
+    inv = await client.post(
+        "/v1/members/invite",
+        json={
+            "invitations": [
+                {"email": "a@co.com", "role": "viewer"},
+                {"email": "b@co.com", "role": "viewer"},
+            ]
+        },
+        headers=_admin_headers(tenant_id),
+    )
+    results = inv.json()["data"]["results"]
+    member_a = UUID(results[0]["member_id"])
+
+    # 模拟 a 已激活:tenant_user 行存在(resolve 会 bump last_active_at),
+    # roster 行 transition 到 active 并回填 subject_id。
+    user = await app.state.tenant_user_repo.resolve(  # type: ignore[attr-defined]
+        tenant_id=tenant_id, subject_type="user", subject_id="kc-a"
+    )
+    from datetime import UTC, datetime
+
+    moved = await app.state.tenant_member_repo.transition(  # type: ignore[attr-defined]
+        member_id=member_a,
+        tenant_id=tenant_id,
+        to="active",
+        now=datetime.now(UTC),
+        subject_id=user.id,
+    )
+    assert moved
+
+    resp = await client.get("/v1/members", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 200
+    items = {i["email"]: i for i in resp.json()["data"]["items"]}
+    assert items["a@co.com"]["last_active_at"] is not None
+    assert items["b@co.com"]["last_active_at"] is None

@@ -24,6 +24,7 @@ run-path hook).
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -44,9 +45,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Minimum seconds between ``last_active_at`` bumps per subject per pod —
+#: keeps the members page's "最后活跃" fresh at page-load granularity
+#: without a per-request write. 15 min matches the value's display
+#: precision; tests shrink it via monkeypatch.
+_ACTIVE_BUMP_INTERVAL_S = 900.0
+
 
 class MemberActivationMiddleware(BaseHTTPMiddleware):
-    """Promote an ``invited`` roster member to ``active`` on first login."""
+    """Promote an ``invited`` roster member to ``active`` on first login,
+    and keep ``tenant_user.last_active_at`` fresh (throttled) so the
+    members page can show a truthful "last active" timestamp."""
 
     def __init__(
         self,
@@ -61,6 +70,8 @@ class MemberActivationMiddleware(BaseHTTPMiddleware):
         # Subject ids with a definitive outcome — skip the lookup forever
         # (per pod). Bounded by the real user population.
         self._seen: set[str] = set()
+        # subject id → monotonic time of the last last_active_at bump.
+        self._last_bump: dict[str, float] = {}
 
     async def dispatch(
         self,
@@ -68,19 +79,31 @@ class MemberActivationMiddleware(BaseHTTPMiddleware):
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         principal: Principal | None = getattr(request.state, "principal", None)
-        if (
-            self._member_repo is not None
-            and self._users is not None
-            and principal is not None
-            and principal.subject_type == "user"
-            and principal.subject_id not in self._seen
-        ):
-            try:
-                await self._activate(principal)
-            except Exception:
-                # Never block the request on roster bookkeeping; no memo add,
-                # so the next request retries.
-                logger.warning("member.activation_failed", exc_info=True)
+        if self._users is not None and principal is not None and principal.subject_type == "user":
+            if self._member_repo is not None and principal.subject_id not in self._seen:
+                try:
+                    await self._activate(principal)
+                except Exception:
+                    # Never block the request on roster bookkeeping; no memo
+                    # add, so the next request retries.
+                    logger.warning("member.activation_failed", exc_info=True)
+            now = time.monotonic()
+            if now - self._last_bump.get(principal.subject_id, float("-inf")) >= (
+                _ACTIVE_BUMP_INTERVAL_S
+            ):
+                try:
+                    # ``resolve`` upserts the registry row and bumps
+                    # ``last_active_at`` — before this hook only the per-user
+                    # endpoints (runs/memory/artifacts) did that, so a member
+                    # who merely logged in and browsed read "never active".
+                    await self._users.resolve(
+                        tenant_id=principal.tenant_id,
+                        subject_type=principal.subject_type,
+                        subject_id=principal.subject_id,
+                    )
+                    self._last_bump[principal.subject_id] = now
+                except Exception:
+                    logger.warning("member.active_bump_failed", exc_info=True)
         return await call_next(request)
 
     async def _activate(self, principal: Principal) -> None:

@@ -2293,6 +2293,7 @@ const zhCN: TranslationKeys = {
     col_status: "状态",
     col_tenant: "租户",
     col_invited_at: "邀请时间",
+    col_last_active_at: "最后活跃",
     col_actions: "动作",
     cross_tenant_banner:
       "跨租户视图 — 只读。切换到单个租户即可邀请或管理成员。",
