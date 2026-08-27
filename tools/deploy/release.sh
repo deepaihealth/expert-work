@@ -253,16 +253,32 @@ run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
 # (救火路径只复用 smoke,不能被真 run 拖住)。
 echo
 echo "== canary (X-14 P1) =="
+canary_skipped=0
 if [[ "${dry_run}" -eq 1 ]]; then
     echo "DRY-RUN> read Secret canary-credentials (api-key/agent-code); skip+WARN if absent"
     echo "DRY-RUN> pick a Running+Ready control-plane pod; stream canary.py + key over stdin"
     echo "DRY-RUN> kubectl exec: python canary.py — end.status=success + artifact download gate"
-elif ! kubectl -n expert-work get secret canary-credentials > /dev/null 2>&1; then
-    echo "WARNING: canary skipped — Secret canary-credentials not found in this cluster." >&2
-    echo "  seed it first (docs/runbooks/production-release.md §1.6.7):" >&2
-    echo "    kubectl -n expert-work exec -it <control-plane-pod> -- \\" >&2
-    echo "      python -m control_plane.seed_canary --tenant-id <tenant uuid>" >&2
 else
+    # ``--ignore-not-found`` + emptiness test on a PLAIN assignment, not a
+    # bare ``if ! kubectl get``: NotFound and a transport failure both exit
+    # 1, and only the former may be skipped quietly. As an assignment,
+    # absence prints empty (→ WARNING skip below) while a transport failure
+    # exits non-zero and trips set -e — infra breakage must fail the release
+    # loudly, not masquerade as "not seeded yet". (Inside an if-condition the
+    # substitution's failure would be masked — errexit is suspended there.)
+    canary_secret="$(kubectl -n expert-work get secret canary-credentials \
+        --ignore-not-found -o name)"
+    if [[ -z "${canary_secret}" ]]; then
+        echo "WARNING: canary skipped — Secret canary-credentials not found in this cluster." >&2
+        echo "  seed it first (docs/runbooks/production-release.md §1.6.7):" >&2
+        echo "    kubectl -n expert-work exec -it <control-plane-pod> -- \\" >&2
+        echo "      python -m control_plane.seed_canary --tenant-id <tenant uuid>" >&2
+        canary_skipped=1
+    else
+        canary_skipped=0
+    fi
+fi
+if [[ "${dry_run}" -eq 0 && "${canary_skipped}" -eq 0 ]]; then
     # 凭据只进变量与 stdin —— 绝不进 argv(节点 ps / exec 审计可见)、绝不
     # echo。agent-code 非机密,走 argv 便于排障。
     canary_key="$(kubectl -n expert-work get secret canary-credentials \
