@@ -90,7 +90,7 @@ describe("ProcessStrip", () => {
     renderStrip(makeProps());
 
     const head = screen.getByTestId("console-process-head");
-    expect(head).toHaveTextContent("思考 1 次 · 工具 1 次(web_search ×1)");
+    expect(head).toHaveTextContent("思考 1 次 · 工具 1 次（web_search ×1）");
     expect(head).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("console-process-steps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("console-process-spinner")).not.toBeInTheDocument();
@@ -225,7 +225,7 @@ describe("ProcessStrip", () => {
     expect(tail).not.toBeNull();
     expect(tail).toHaveTextContent("1 次失败");
     expect(screen.getByTestId("console-process-head")).toHaveTextContent(
-      "思考 1 次 · 工具 1 次(http ×1) · 1 次失败",
+      "思考 1 次 · 工具 1 次（http ×1） · 1 次失败",
     );
     unmount();
 

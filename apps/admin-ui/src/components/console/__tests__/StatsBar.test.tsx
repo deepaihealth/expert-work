@@ -125,14 +125,14 @@ describe("StatsBar", () => {
   it("appends the partial marker when stats.partial is true", () => {
     render(<StatsBar stats={stats({ partial: true })} isSystemAdmin />);
     expect(screen.getByTestId("console-stats-bar")).toHaveTextContent(
-      "(仅已加载轮)",
+      "（仅已加载轮）",
     );
   });
 
   it("does not append the partial marker when stats.partial is false", () => {
     render(<StatsBar stats={stats({ partial: false })} isSystemAdmin />);
     expect(screen.getByTestId("console-stats-bar")).not.toHaveTextContent(
-      "(仅已加载轮)",
+      "（仅已加载轮）",
     );
   });
 

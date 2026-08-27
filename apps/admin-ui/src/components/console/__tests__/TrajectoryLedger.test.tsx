@@ -139,7 +139,7 @@ describe("TrajectoryLedger", () => {
     await i18n.changeLanguage(priorLang);
   });
 
-  it("每条记录一行,带 record-id / kind / index / 轮起止 data 属性", () => {
+  it("每条记录一行，带 record-id / kind / index / 轮起止 data 属性", () => {
     render(<TrajectoryLedger {...baseProps()} />);
     const rows = screen.getAllByTestId("console-traj-row");
     expect(rows).toHaveLength(6);
@@ -154,7 +154,7 @@ describe("TrajectoryLedger", () => {
     expect(screen.getByRole("grid", { name: "轨迹账本" })).toHaveAttribute("aria-rowcount", "6");
   });
 
-  it("轮标签只挂在轮首行,当前轮标 data-active", () => {
+  it("轮标签只挂在轮首行，当前轮标 data-active", () => {
     render(<TrajectoryLedger {...baseProps({ activeTurnKey: "t2" })} />);
     const labels = screen.getAllByTestId("console-traj-turn-label");
     expect(labels).toHaveLength(2);
@@ -165,7 +165,7 @@ describe("TrajectoryLedger", () => {
     expect(labels[1]).toHaveAttribute("data-active", "true");
   });
 
-  it("请求圆点只挂在有请求的记录上,带序号 / 状态 / 选中态与提示", () => {
+  it("请求圆点只挂在有请求的记录上，带序号 / 状态 / 选中态与提示", () => {
     render(<TrajectoryLedger {...baseProps({ selectedRequestNo: 2 })} />);
     const dots = screen.getAllByTestId("console-traj-request-dot");
     expect(dots).toHaveLength(3);
@@ -205,7 +205,7 @@ describe("TrajectoryLedger", () => {
     expect(rows[1]).not.toHaveAttribute("data-selected");
   });
 
-  it("点圆点选中请求,且不冒泡成选中行", () => {
+  it("点圆点选中请求，且不冒泡成选中行", () => {
     const onSelect = vi.fn();
     const onSelectRequest = vi.fn();
     render(<TrajectoryLedger {...baseProps({ onSelect, onSelectRequest })} />);
@@ -214,7 +214,7 @@ describe("TrajectoryLedger", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("双击轮首行折叠该轮;双击有子记录的 assistant 折叠它的调用", () => {
+  it("双击轮首行折叠该轮；双击有子记录的 assistant 折叠它的调用", () => {
     const onToggleTurn = vi.fn();
     const onToggleOwner = vi.fn();
     render(<TrajectoryLedger {...baseProps({ onToggleTurn, onToggleOwner })} />);
@@ -252,7 +252,7 @@ describe("TrajectoryLedger", () => {
   // 值得折的记录」。轮里只有 SYSTEM + USER + 一条 assistant(唯一的非上下文
   // 记录只有 1 条,不到 2 条门槛)—— 双击 SYSTEM 行不该折;若 SYSTEM 被错当成
   // 非上下文记录计数,门槛会被凑到 2 而误折。
-  it("双击 SYSTEM 行落点同 USER —— SYSTEM 不计入非上下文记录数,不够 2 条就不折", () => {
+  it("双击 SYSTEM 行落点同 USER —— SYSTEM 不计入非上下文记录数，不够 2 条就不折", () => {
     const onToggleTurn = vi.fn();
     const onToggleOwner = vi.fn();
     const systemRow: SystemRow = {
@@ -276,7 +276,7 @@ describe("TrajectoryLedger", () => {
   // 终审 M13 收口:reflect / memory 写回带 parentId 只供详情层级链接,双击落点
   // 不能把它们当子调用 —— 否则这类 assistant 会被判成「有调用可折」而
   // collapsibleOwnerIds 又不认,双击就被静默吃掉。
-  it("双击只挂着 reflect 子记录的 assistant 折所在轮,而不是折它的调用", () => {
+  it("双击只挂着 reflect 子记录的 assistant 折所在轮，而不是折它的调用", () => {
     const onToggleTurn = vi.fn();
     const onToggleOwner = vi.fn();
     const records = fixtureRecords();
@@ -314,7 +314,7 @@ describe("TrajectoryLedger", () => {
     expect(onToggleTurn).toHaveBeenCalledWith("t1");
   });
 
-  it("↑ ↓ 在记录行之间移动选择,没有选中时从首行起", () => {
+  it("↑ ↓ 在记录行之间移动选择，没有选中时从首行起", () => {
     const onSelect = vi.fn();
     const { rerender } = render(
       <TrajectoryLedger {...baseProps({ onSelect, selectedId: "t1/assistant:1" })} />,
@@ -336,7 +336,7 @@ describe("TrajectoryLedger", () => {
 
   // 终审 M10 —— 只点了请求圆点时 `selectedId` 是 null,↑ ↓ 原先一律跳回首行,
   // 读者从「请求 #2」按一下就被扔到第 0 行。请求也有落点:它的 assistant 记录。
-  it("只选中了请求时,↑ ↓ 从该请求的 assistant 记录起算", () => {
+  it("只选中了请求时，↑ ↓ 从该请求的 assistant 记录起算", () => {
     const onSelect = vi.fn();
     render(
       <TrajectoryLedger {...baseProps({ onSelect, selectedId: null, selectedRequestNo: 2 })} />,
@@ -352,7 +352,7 @@ describe("TrajectoryLedger", () => {
     expect(onSelect).toHaveBeenCalledWith("t1/tool:1:0");
   });
 
-  it("focusIndexes 把段内 / 段外行分别标 inside / outside(无选区时不标)", () => {
+  it("focusIndexes 把段内 / 段外行分别标 inside / outside（无选区时不标）", () => {
     const props = baseProps();
     const { rerender } = render(<TrajectoryLedger {...props} />);
     expect(screen.getAllByTestId("console-traj-row")[1]).not.toHaveAttribute("data-focus");
@@ -368,7 +368,7 @@ describe("TrajectoryLedger", () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
   });
 
-  it("hoveredId 标 data-hovered,进出行回报悬停", () => {
+  it("hoveredId 标 data-hovered，进出行回报悬停", () => {
     const onHover = vi.fn();
     render(<TrajectoryLedger {...baseProps({ onHover, hoveredId: "t1/tool:1:0" })} />);
     const rows = screen.getAllByTestId("console-traj-row");
@@ -381,7 +381,7 @@ describe("TrajectoryLedger", () => {
     expect(onHover).toHaveBeenCalledWith(null);
   });
 
-  it("工具行内容列拆成 名字 / 参数 / → / 结果,失败结果标红", () => {
+  it("工具行内容列拆成 名字 / 参数 / → / 结果，失败结果标红", () => {
     const records = fixtureRecords();
     const failing = { ...records[2], id: "t1/tool:1:1", index: 6, isError: true, resultText: "command not found" };
     render(<TrajectoryLedger {...baseProps({ rows: recordRows([records[2], failing]) })} />);
@@ -398,28 +398,28 @@ describe("TrajectoryLedger", () => {
     expect(cells[1].querySelector(".ew-ledger__res")).toHaveTextContent("command not found");
   });
 
-  it("工具行没结果:已结束写「(无输出)」,进行中留空", () => {
+  it("工具行没结果：已结束写「（无输出）」，进行中留空", () => {
     const records = fixtureRecords();
     const done = { ...records[2], resultText: null };
     const running = { ...records[2], id: "t1/tool:1:1", index: 6, resultText: null, running: true };
     render(<TrajectoryLedger {...baseProps({ rows: recordRows([done, running]) })} />);
     const cells = screen.getAllByTestId("console-traj-content");
-    expect(cells[0].querySelector(".ew-ledger__res")).toHaveTextContent("(无输出)");
+    expect(cells[0].querySelector(".ew-ledger__res")).toHaveTextContent("（无输出）");
     expect(cells[1].querySelector(".ew-ledger__res")).toBeNull();
     expect(cells[1].querySelector(".ew-ledger__arr")).toBeNull();
   });
 
-  it("assistant 没文字时写「(仅工具调用)」", () => {
+  it("assistant 没文字时写「（仅工具调用）」", () => {
     const records = fixtureRecords();
     const silent = { ...records[1], id: "t1/assistant:0", index: 6, text: "" };
     render(<TrajectoryLedger {...baseProps({ rows: recordRows([silent, records[1]]) })} />);
     const cells = screen.getAllByTestId("console-traj-content");
-    expect(cells[0]).toHaveTextContent("(仅工具调用)");
-    expect(cells[0]).toHaveAttribute("title", "(仅工具调用)");
+    expect(cells[0]).toHaveTextContent("（仅工具调用）");
+    expect(cells[0]).toHaveAttribute("title", "（仅工具调用）");
     expect(cells[1]).toHaveTextContent("我来查一下");
   });
 
-  it("MEMORY 行正文写「召回 / 写回 N 条」,后面照常接结果", () => {
+  it("MEMORY 行正文写「召回 / 写回 N 条」，后面照常接结果", () => {
     // 账本数据层不碰 i18n(`ledger.ts:contentOf` 给 memory 的 text 是空串),
     // §九 要的「召回 N 条 → 首条摘要」只能在这一层拼出来。
     const recall: MemoryRow = {
@@ -446,7 +446,7 @@ describe("TrajectoryLedger", () => {
     expect(cells[1].querySelector(".ew-ledger__res")).toBeNull();
   });
 
-  it("未回放的轮:占位 assistant 带 data-placeholder 与状态前缀", () => {
+  it("未回放的轮：占位 assistant 带 data-placeholder 与状态前缀", () => {
     const records = fixtureRecords();
     const loading = { ...records[1], id: "h/assistant", text: "历史答案", placeholder: "loading" as const };
     const failed = { ...records[1], id: "h/assistant2", index: 7, text: "历史答案", placeholder: "error" as const };
@@ -457,10 +457,10 @@ describe("TrajectoryLedger", () => {
     const cells = screen.getAllByTestId("console-traj-content");
     expect(cells[0]).toHaveTextContent("正在回放…");
     expect(cells[0]).toHaveTextContent("历史答案");
-    expect(cells[1]).toHaveTextContent("回放失败,以下为文本降级");
+    expect(cells[1]).toHaveTextContent("回放失败，以下为文本降级");
   });
 
-  it("折叠轮的摘要行:文案 = 过程摘要 + 时长,点击展开该轮", () => {
+  it("折叠轮的摘要行：文案 = 过程摘要 + 时长，点击展开该轮", () => {
     const onToggleTurn = vi.fn();
     const records = fixtureRecords();
     const rows: DisplayRow[] = [
@@ -473,13 +473,13 @@ describe("TrajectoryLedger", () => {
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
     const summary = screen.getByTestId("console-traj-turn-summary");
     expect(summary).toHaveAttribute("data-turn-key", "t1");
-    expect(summary).toHaveTextContent("思考 2 次 · 工具 1 次(bash ×1) · 1.5s");
+    expect(summary).toHaveTextContent("思考 2 次 · 工具 1 次（bash ×1） · 1.5s");
 
     fireEvent.click(summary);
     expect(onToggleTurn).toHaveBeenCalledWith("t1");
   });
 
-  it("折叠调用的摘要行:文案 = 工具明细 + 提示,点击展开该 assistant", () => {
+  it("折叠调用的摘要行：文案 = 工具明细 + 提示，点击展开该 assistant", () => {
     const onToggleOwner = vi.fn();
     const records = fixtureRecords();
     const rows: DisplayRow[] = [
@@ -489,18 +489,18 @@ describe("TrajectoryLedger", () => {
     render(<TrajectoryLedger {...baseProps({ rows, onToggleOwner })} />);
     const summary = screen.getByTestId("console-traj-calls-summary");
     expect(summary).toHaveTextContent("bash ×2 · read_file ×1");
-    expect(summary).toHaveTextContent("(调用已折叠,点击展开)");
+    expect(summary).toHaveTextContent("（调用已折叠，点击展开）");
 
     fireEvent.click(summary);
     expect(onToggleOwner).toHaveBeenCalledWith("t1/assistant:1");
   });
 
-  it("还有更早的历史时首行是加载按钮,加载中禁用并换文案", () => {
+  it("还有更早的历史时首行是加载按钮，加载中禁用并换文案", () => {
     const onLoadEarlier = vi.fn();
     const props = baseProps({ hasEarlier: true, earlierCount: 7, onLoadEarlier });
     const { rerender } = render(<TrajectoryLedger {...props} />);
     const button = screen.getByTestId("console-traj-load-earlier");
-    expect(button).toHaveTextContent("加载更早的历史(还有 7 轮)");
+    expect(button).toHaveTextContent("加载更早的历史（还有 7 轮）");
     expect(button).not.toBeDisabled();
     // 它排在第一条记录行之前。
     const allRows = screen.getByRole("grid").querySelectorAll("tr");
@@ -515,7 +515,7 @@ describe("TrajectoryLedger", () => {
     expect(screen.getByTestId("console-traj-load-earlier")).toHaveTextContent("正在加载更早的历史…");
   });
 
-  it("loading 时挂粘性覆盖层,滚动容器照旧渲染", () => {
+  it("loading 时挂粘性覆盖层，滚动容器照旧渲染", () => {
     const props = baseProps();
     const { rerender } = render(<TrajectoryLedger {...props} />);
     expect(screen.queryByTestId("console-traj-loading")).toBeNull();
@@ -528,7 +528,7 @@ describe("TrajectoryLedger", () => {
     expect(screen.getAllByTestId("console-traj-row")).toHaveLength(6);
   });
 
-  it("100 行时只渲染视口窗口,上下留 spacer 行", () => {
+  it("100 行时只渲染视口窗口，上下留 spacer 行", () => {
     const many = Array.from({ length: 100 }, (_, i) =>
       rec({
         id: `t1/row-${i}`, index: i, kind: "tool", row: toolRow,
@@ -560,7 +560,7 @@ describe("TrajectoryLedger", () => {
     expect((top as HTMLElement).style.height).toBe(`${38 * 27}px`);
   });
 
-  it("scrollTo 的 nonce 变化时把那一行滚到中间,nonce 不变不重复滚", () => {
+  it("scrollTo 的 nonce 变化时把那一行滚到中间，nonce 不变不重复滚", () => {
     const props = baseProps();
     const { rerender } = render(<TrajectoryLedger {...props} />);
     scrollIntoView.mockClear();
@@ -575,7 +575,7 @@ describe("TrajectoryLedger", () => {
     expect(scrollIntoView).not.toHaveBeenCalled();
   });
 
-  it("目标行在虚拟窗口外时改用 scrollTop 兜底(scrollIntoView 无从谈起)", () => {
+  it("目标行在虚拟窗口外时改用 scrollTop 兜底（scrollIntoView 无从谈起）", () => {
     const many = Array.from({ length: 100 }, (_, i) =>
       rec({ id: `t1/row-${i}`, index: i, kind: "tool", row: toolRow, text: `bash {"i":${i}}`, resultText: "ok" }),
     );
@@ -610,7 +610,7 @@ describe("TrajectoryLedger", () => {
     expect(container.scrollTop).toBe(2187);
   });
 
-  it("首批行到达时跟到最新,且只做一次", () => {
+  it("首批行到达时跟到最新，且只做一次", () => {
     const props = baseProps({ rows: [] });
     const { rerender } = render(<TrajectoryLedger {...props} />);
     const container = screen.getByTestId("console-traj-ledger");
@@ -644,7 +644,7 @@ describe("TrajectoryLedger", () => {
     expect(el.scrollTop).toBe(0);
   });
 
-  it("子代理行名字取 worker.label(两个词也不拆),参数取 taskExcerpt", () => {
+  it("子代理行名字取 worker.label（两个词也不拆），参数取 taskExcerpt", () => {
     const worker: SubagentRow["worker"] = {
       workerId: "w-1", parentWorkerId: null, parentToolCallId: "call_1", label: "research worker",
       agentRef: "researcher", depth: 1, role: null, taskExcerpt: "查一下 2026 年的票价",
@@ -677,7 +677,7 @@ describe("TrajectoryLedger", () => {
     expect(scrollIntoView.mock.instances[0]).toBe(screen.getAllByTestId("console-traj-row")[4]);
   });
 
-  it("运行中且贴底时新行到达自动滚到底,上滚超过 80px 则不跟随", () => {
+  it("运行中且贴底时新行到达自动滚到底，上滚超过 80px 则不跟随", () => {
     const records = fixtureRecords();
     const props = baseProps({ running: true, rows: recordRows(records.slice(0, 5)) });
     const { rerender } = render(<TrajectoryLedger {...props} />);
@@ -704,7 +704,7 @@ describe("TrajectoryLedger", () => {
     expect(container.scrollTop).toBe(100);
   });
 
-  it("类型标签按记录类型取文案与样式(subagent → SUBTOOL,compaction → COMPACTED)", () => {
+  it("类型标签按记录类型取文案与样式（subagent → SUBTOOL,compaction → COMPACTED）", () => {
     const marker: TrajectoryRow = {
       id: "compaction:9", kind: "compaction", seq: 9, step: null, status: "ok",
       durationMs: null, eventIndexes: [], serverMs: null, text: "压缩了 12 条消息",
@@ -726,7 +726,7 @@ describe("TrajectoryLedger", () => {
   // 显式写在 trajectory_timeline.css 里,不靠 .ew-traj-tl__block 的默认兜底
   // (那条默认值恰好也是 --ew-text-secondary,不显式写就测不出这条规则是否
   // 真的存在)。
-  it("SYSTEM 行:kind 标签 SYSTEM,内容列 = 首行,data-kind=\"system\"", () => {
+  it("SYSTEM 行：kind 标签 SYSTEM，内容列 = 首行，data-kind=\"system\"", () => {
     const sysRow: SystemRow = {
       id: "system", kind: "system", seq: -1, step: null, status: "ok", durationMs: null, inputs: null,
       eventIndexes: [], serverMs: null, text: "你是评审员",

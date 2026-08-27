@@ -1,7 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import i18n from "../../i18n";
 import type { SseEvent } from "../sessions";
 import { compactRowsOf, ledgerRowsOf, promptInputsOf, resolveGanttKey, type AssistantRow } from "../trajectory_rows";
+
+// 标记行文案走语言包,断言按 zh-CN 写 —— 固定语言,别赌检测结果。
+let priorLang: string;
+beforeAll(async () => {
+  priorLang = i18n.language;
+  await i18n.changeLanguage("zh-CN");
+});
+afterAll(async () => {
+  await i18n.changeLanguage(priorLang);
+});
 
 function ev(event: string, data: unknown, at = "t"): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: at };
