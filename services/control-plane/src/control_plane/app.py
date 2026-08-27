@@ -162,6 +162,7 @@ from control_plane.manifest import ManifestLoader
 from control_plane.mcp_oauth import default_http_client
 from control_plane.mcp_oauth_refresh import McpOAuthRefresher
 from control_plane.mcp_oauth_refresh_lock import PgMcpOAuthRefreshLock
+from control_plane.member_activation import MemberActivationMiddleware
 from control_plane.memory import MemoryDLQWorker
 from control_plane.memory_consolidator import (
     ConsolidatorAuxModel,
@@ -2479,6 +2480,8 @@ def create_app(
     #   2. AuthMiddleware           — verify JWT → request.state.principal (C.1)
     #   3. TenantRateLimitMiddleware — per-tenant bucket (C.6)
     #   4. RLSContextMiddleware     — project principal.tenant_id → RLS ctxvar (C.4)
+    #   4b. MemberActivationMiddleware — first-login invited→active (2026-08-27
+    #       拍板「登录过就算」; inside RLS ctx for the tenant_user upsert)
     #   5. AuditContextMiddleware   — project principal.tenant_id → log ctxvar
     #   6. RateLimitMiddleware      — per-IP / per-API-key bucket (B.2)
     #   7. CancellationMiddleware   — mint CancelToken + disconnect poll
@@ -2501,6 +2504,11 @@ def create_app(
         AuditContextMiddleware,
         default_tenant_id=resolved_settings.default_dev_tenant_id,
         default_actor_id=resolved_settings.default_dev_actor_id,
+    )
+    app.add_middleware(
+        MemberActivationMiddleware,
+        member_repo=resolved_tenant_member_repo,
+        users=resolved_tenant_users,
     )
     app.add_middleware(RLSContextMiddleware)
     app.add_middleware(
