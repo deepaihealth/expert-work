@@ -115,12 +115,32 @@ describe("parseWorkerFrames", () => {
       }),
     ]);
     const [w] = map.get("call-1") ?? [];
+    // B-25 — 历史帧的 excerpt 仍带 datamark;展示层兜底剥离。
+    expect(w.steps[0].messages[0].toolResultExcerpt).toBe("stdout: 1 exit_code: 0");
     expect(w.steps[0].messages[0].exec).toEqual({
       exitCode: 0,
       timedOut: false,
       stdoutExcerpt: "1\n",
       stderrExcerpt: "",
     });
+  });
+
+  it("strips spotlight fence + datamark glyphs off a legacy tool_result_excerpt (B-25)", () => {
+    // 后端修复前入库的历史帧:围栏 + ▁ 原样存着,前端兜底还原。
+    const legacy = "«UNTRUSTED nonce=0ce9b28d»\n搜索结果▁ 有效\n«/UNTRUSTED nonce=0ce9b28d»";
+    const map = parseWorkerFrames([
+      wf("update", { wseq: 1 }, {
+        node: "tools",
+        _duration_ms: 5,
+        messages: [{ type: "tool", name: "http_request", tool_result_excerpt: legacy }],
+      }),
+    ]);
+    const [w] = map.get("call-1") ?? [];
+    const excerpt = w.steps[0].messages[0].toolResultExcerpt ?? "";
+    expect(excerpt).toBe("搜索结果 有效");
+    expect(excerpt).not.toContain("«");
+    expect(excerpt).not.toContain("▁");
+    expect(excerpt).not.toContain("0ce9b28d");
   });
 
   it("multiple workers on one tool call keep arrival order", () => {

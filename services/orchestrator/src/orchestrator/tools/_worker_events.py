@@ -17,6 +17,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+from expert_work.common.spotlight import unspotlight
+
 #: config["configurable"] key —— run_agent 注入的异步 worker 帧 sink
 #: (镜像 COMPACTION_SINK_KEY 的注入模式)。
 WORKER_EVENT_SINK_KEY = "worker_event_sink"
@@ -142,14 +144,22 @@ def _summarize_message(msg: BaseMessage) -> dict[str, Any]:
             summary["tool_calls"] = calls
         return summary
     if isinstance(msg, ToolMessage):
+        # B-25 — tool results arrive spotlighted (datamarked + nonce-fenced,
+        # ``builder._invoke_tool``); the frame crosses the product surface
+        # (debug console + external SSE/items), so restore the words BEFORE
+        # truncating — truncating first would cut the fence in half and the
+        # marker regex would no longer match, leaking the wrapping verbatim.
         summary = {
             "type": "tool",
             "name": msg.name or "",
-            "tool_result_excerpt": _excerpt(_text(msg.content), WORKER_RESULT_EXCERPT),
+            "tool_result_excerpt": _excerpt(unspotlight(_text(msg.content)), WORKER_RESULT_EXCERPT),
         }
         # PR-D — sandbox exec results carry structured streams in ``artifact``
-        # (format_sandbox_outcome.meta); the content excerpt is datamarked and
-        # unparseable. Excerpt them to the same summary budget as the content.
+        # (format_sandbox_outcome.meta); the content excerpt lost its line
+        # structure to datamarking (unspotlight recovers words, not layout).
+        # Excerpt them to the same summary budget as the content; unspotlight
+        # is a no-op on the pre-mark streams and a fix if a marked rendering
+        # ever lands there.
         artifact = getattr(msg, "artifact", None)
         if isinstance(artifact, dict):
             exit_code = artifact.get("exit_code")
@@ -158,10 +168,10 @@ def _summarize_message(msg: BaseMessage) -> dict[str, Any]:
                     "exit_code": exit_code,
                     "timed_out": bool(artifact.get("timed_out", False)),
                     "stdout_excerpt": _excerpt(
-                        str(artifact.get("stdout", "")), WORKER_RESULT_EXCERPT
+                        unspotlight(str(artifact.get("stdout", ""))), WORKER_RESULT_EXCERPT
                     ),
                     "stderr_excerpt": _excerpt(
-                        str(artifact.get("stderr", "")), WORKER_RESULT_EXCERPT
+                        unspotlight(str(artifact.get("stderr", ""))), WORKER_RESULT_EXCERPT
                     ),
                 }
         return summary
