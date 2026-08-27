@@ -20,7 +20,7 @@ import {
   useAuth,
   _identityFromMeForTests,
 } from "../AuthContext";
-import { apiClient, setStoredToken } from "../../api/client";
+import { apiClient, getStoredToken, setStoredToken } from "../../api/client";
 
 afterEach(() => {
   setStoredToken(null);
@@ -131,6 +131,63 @@ describe("AuthContext server-truth resolution", () => {
     // Re-asserts a property of being unauthenticated: act-style noop to
     // keep React happy if any pending effects are scheduled.
     await act(async () => {});
+  });
+
+  // ② 会话过期 — 任意业务端点 401(不只 /v1/me)都要清会话回登录:
+  // AuthProvider 挂载时向 client 注册清会话 handler。
+  it("clears the session when any API call returns 401", async () => {
+    setStoredToken(
+      makeJwt({ sub: "x", sub_type: "user", tenant_id: "t", roles: ["admin"] }),
+    );
+    withMeResponse({
+      success: true,
+      data: {
+        subject_id: "x",
+        subject_type: "user",
+        tenant_id: "t",
+        email: null,
+        auth_method: "jwt",
+        roles: ["admin"],
+        scopes: [],
+        is_system_admin: false,
+        home_is_platform: false,
+        allowed_tenants: ["t"],
+      },
+      error: null,
+    });
+
+    render(
+      <AuthProvider>
+        <Identity />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("server-resolved").textContent).toBe("yes");
+    });
+
+    // Token 服务端过期 — 某个普通业务请求撞 401。
+    apiClient.defaults.adapter = (config) => {
+      const error = new Error("Unauthorized") as Error & {
+        isAxiosError: boolean;
+        response: { status: number; data: unknown };
+        config: typeof config;
+      };
+      error.isAxiosError = true;
+      error.response = {
+        status: 401,
+        data: { detail: { code: "AUTH_INVALID", message: "expired" } },
+      };
+      error.config = config;
+      return Promise.reject(error);
+    };
+    await act(async () => {
+      await apiClient.get("/v1/agents").catch(() => {});
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("anonymous");
+    });
+    expect(getStoredToken()).toBeNull();
   });
 });
 

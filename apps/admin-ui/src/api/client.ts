@@ -72,6 +72,21 @@ export function setStoredToken(token: string | null): void {
   }
 }
 
+/** 会话过期 handler — 任意端点 401 时由响应拦截器调用(AuthContext 挂载时
+ *  注册它的清会话流程,ProtectedRoute 随后带当前路径跳登录)。模块级回调而
+ *  非直接 import context:client 是纯模块,不能吃 React。
+ *
+ *  防重/防循环不在这里做花活:
+ *  - handler 第一件事是清 token,后续并发 401 撞上 ``getStoredToken()===null``
+ *    直接跳过 —— 天然去抖;
+ *  - 登录/刷新不走 apiClient(OIDC 直连 IdP),未登录请求本来就没有 token,
+ *    同样命中上面的空 token 跳过,不可能成环。 */
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
 function readDetail(detail: unknown, key: "code" | "message"): string | undefined {
   if (typeof detail === "object" && detail !== null && key in detail) {
     const value = (detail as Record<string, unknown>)[key];
@@ -95,6 +110,11 @@ export function createClient(baseURL = ""): AxiosInstance {
     (error: unknown) => {
       if (axios.isAxiosError(error)) {
         const status = error.response?.status ?? 0;
+        // 401 = 会话过期(后端 401 只表示认证失败,授权失败是 403)——
+        // 通知注册的清会话流程;只在还有 token 时通知(见 handler 注释)。
+        if (status === 401 && unauthorizedHandler !== null && getStoredToken() !== null) {
+          unauthorizedHandler();
+        }
         const detail = (error.response?.data as { detail?: unknown } | undefined)?.detail;
         const code = readDetail(detail, "code") ?? `HTTP_${status}`;
         const message = readDetail(detail, "message") ?? error.message;

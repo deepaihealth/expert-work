@@ -26,7 +26,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
-import { getStoredToken, setStoredToken, ApiError } from "../api/client";
+import {
+  getStoredToken,
+  setStoredToken,
+  setUnauthorizedHandler,
+  ApiError,
+} from "../api/client";
 import { getMe, ALL_TENANTS, type MeResponse } from "../api/me";
 import { registerEvents, signOut as oidcSignOut } from "./oidc";
 
@@ -186,29 +191,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     token: null,
   });
 
-  const resolveServerIdentity = useCallback(async (token: string) => {
-    try {
-      const me = await getMe();
-      setState((prev) => {
-        // The token may have rotated by the time the fetch returns;
-        // discard the response if it would clobber a newer session.
-        if (prev.token !== token) return prev;
-        return {
-          status: "authenticated",
-          identity: identityFromMe(me, token),
-          token,
-        };
-      });
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        // The token doesn't authenticate — drop it.
-        setStoredToken(null);
-        setState({ status: "anonymous", identity: null, token: null });
-      }
-      // Other errors leave the optimistic identity in place; the user
-      // still re-authenticates on every API call.
-    }
+  // The token doesn't authenticate any more — drop the local session. The
+  // ProtectedRoute redirect to /login then preserves the current path in
+  // ``state.from`` so a re-login lands back where the user was.
+  const clearSession = useCallback(() => {
+    setStoredToken(null);
+    setState({ status: "anonymous", identity: null, token: null });
   }, []);
+
+  const resolveServerIdentity = useCallback(
+    async (token: string) => {
+      try {
+        const me = await getMe();
+        setState((prev) => {
+          // The token may have rotated by the time the fetch returns;
+          // discard the response if it would clobber a newer session.
+          if (prev.token !== token) return prev;
+          return {
+            status: "authenticated",
+            identity: identityFromMe(me, token),
+            token,
+          };
+        });
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          clearSession();
+        }
+        // Other errors leave the optimistic identity in place; the user
+        // still re-authenticates on every API call.
+      }
+    },
+    [clearSession],
+  );
+
+  // ② 会话过期(2026-08 反馈)— 任意业务端点 401 都走同一条清会话流程,
+  // 不再只弹「请求失败」横幅。client 是纯模块吃不了 context,所以在这里
+  // 注册回调;并发 401 的去抖在 client 侧(见 setUnauthorizedHandler 注释)。
+  useEffect(() => {
+    setUnauthorizedHandler(clearSession);
+    return () => setUnauthorizedHandler(null);
+  }, [clearSession]);
 
   useEffect(() => {
     const stored = getStoredToken();

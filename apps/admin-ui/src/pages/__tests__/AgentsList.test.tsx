@@ -15,6 +15,7 @@ import i18n from "../../i18n";
 
 import { ApiError, setStoredToken } from "../../api/client";
 import * as agentsSdk from "../../api/agents";
+import * as membersSdk from "../../api/members";
 import { AuthProvider } from "../../auth/AuthContext";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AgentsList } from "../AgentsList";
@@ -25,6 +26,7 @@ const getAgentMock = vi.spyOn(agentsSdk, "getAgent");
 const deleteAgentMock = vi.spyOn(agentsSdk, "deleteAgent");
 const disableAgentMock = vi.spyOn(agentsSdk, "disableAgent");
 const enableAgentMock = vi.spyOn(agentsSdk, "enableAgent");
+const listMembersMock = vi.spyOn(membersSdk, "listMembers");
 
 function jwt(payload: Record<string, unknown>): string {
   const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }));
@@ -46,6 +48,9 @@ beforeEach(() => {
   deleteAgentMock.mockReset();
   disableAgentMock.mockReset();
   enableAgentMock.mockReset();
+  listMembersMock.mockReset();
+  // ① 所有者列的成员名映射:默认空成员表 = 原样显示,既有断言不受影响。
+  listMembersMock.mockResolvedValue({ items: [], total: 0 });
   // Default: the row-menu's lazy kill-switch fetch resolves "enabled" unless
   // a test overrides it — keeps tests that never care about this state safe
   // from calling .then() on an unmocked (undefined) return value.
@@ -161,6 +166,76 @@ describe("AgentsList", () => {
     renderAgentsList();
     await screen.findByText("customer-support-bot");
     expect(screen.queryByText("retired-bot")).toBeNull();
+  });
+});
+
+// ① 所有者列 UUID → 成员名(display_name,空则 email);未命中(服务账号名 /
+// 查不到)原样显示;成员接口失败静默降级,绝不弹错。
+describe("AgentsList owner column member-name mapping", () => {
+  const ownerUuid = "33333333-3333-3333-3333-333333333333";
+  const member: membersSdk.TenantMember = {
+    id: "44444444-4444-4444-4444-444444444444",
+    tenant_id: sampleRow.tenant_id,
+    email: "ming@acme.com",
+    display_name: "王小明",
+    role: "admin",
+    status: "active",
+    keycloak_user_id: null,
+    subject_id: ownerUuid,
+    invited_by: "seed",
+    invited_at: null,
+    activated_at: null,
+    updated_at: null,
+  };
+
+  it("maps a created_by subject UUID to the member display name, raw id in title", async () => {
+    listAgentsMock.mockResolvedValue({
+      items: [{ ...sampleRow, created_by: ownerUuid }],
+      total: 1,
+      cross_tenant: false,
+    });
+    listMembersMock.mockResolvedValue({ items: [member], total: 1 });
+    renderAgentsList();
+    const name = await screen.findByText("王小明");
+    expect(name.closest("[title]")).toHaveAttribute("title", ownerUuid);
+    expect(screen.queryByText(ownerUuid)).toBeNull();
+  });
+
+  it("falls back to the member email when display_name is empty", async () => {
+    listAgentsMock.mockResolvedValue({
+      items: [{ ...sampleRow, created_by: ownerUuid }],
+      total: 1,
+      cross_tenant: false,
+    });
+    listMembersMock.mockResolvedValue({
+      items: [{ ...member, display_name: null }],
+      total: 1,
+    });
+    renderAgentsList();
+    expect(await screen.findByText("ming@acme.com")).toBeInTheDocument();
+  });
+
+  it("keeps a service-account name (no member match) as-is", async () => {
+    listAgentsMock.mockResolvedValue({
+      items: [{ ...sampleRow, created_by: "seed-canary" }],
+      total: 1,
+      cross_tenant: false,
+    });
+    listMembersMock.mockResolvedValue({ items: [member], total: 1 });
+    renderAgentsList();
+    expect(await screen.findByText("seed-canary")).toBeInTheDocument();
+  });
+
+  it("degrades silently to the raw id when listMembers fails — no error banner", async () => {
+    listAgentsMock.mockResolvedValue({
+      items: [{ ...sampleRow, created_by: ownerUuid }],
+      total: 1,
+      cross_tenant: false,
+    });
+    listMembersMock.mockRejectedValue(new ApiError("nope", "FORBIDDEN", 403));
+    renderAgentsList();
+    expect(await screen.findByText(ownerUuid)).toBeInTheDocument();
+    expect(screen.queryByTestId("agents-error")).toBeNull();
   });
 });
 

@@ -48,6 +48,9 @@ export interface TranscriptProps {
   onInspectRow: (turnKey: string, rowId: string) => void;
   streamTurnKey: string | null;
   liveByStep: ReadonlyMap<number, LiveStep>;
+  /** ③ 反馈 — Agent 配置 variables 的声明序,透传 ``TurnBlock.inputOrder``。
+   *  Omitted → 零变化(入参保持后端 JSON 序)。 */
+  inputOrder?: readonly string[];
   registerHistoryRow: (
     runId: string,
     threadId: string,
@@ -96,6 +99,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     onInspectRow,
     streamTurnKey,
     liveByStep,
+    inputOrder,
     registerHistoryRow,
     rate,
     isSystemAdmin,
@@ -214,6 +218,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onSelect={onSelectTurn}
           onInspect={onInspectTurn}
           onInspectRow={onInspectRow}
+          inputOrder={inputOrder}
           rate={rate}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
@@ -247,6 +252,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onInspect={onInspectTurn}
           onInspectRow={onInspectRow}
           liveByStep={turn.key === streamTurnKey ? liveByStep : undefined}
+          inputOrder={inputOrder}
           rate={rate}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
