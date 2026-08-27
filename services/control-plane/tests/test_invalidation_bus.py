@@ -641,6 +641,25 @@ async def test_rate_limit_override_handler_calls_future_service_when_wired() -> 
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_override_handler_evicts_real_cache() -> None:
+    """PR-D end-to-end: the handler against the REAL cache object — a bus
+    delivery must leave the entry gone so the middleware's next
+    ``_resolve_override`` misses and re-reads the tenant config."""
+    from control_plane.middleware.tenant_rate_limit import TenantRateLimitOverrideCache
+    from control_plane.ratelimit import RateLimitOverride
+
+    tid = uuid4()
+    cache = TenantRateLimitOverrideCache()
+    cache.set(tid, RateLimitOverride(requests_per_minute=60, burst=1))
+    assert cache.get(tid)[0] is True
+    handlers = build_invalidation_handlers(SimpleNamespace(tenant_rate_limit_overrides=cache))
+    await handlers["rate_limit_override"](
+        InvalidationEvent(kind="rate_limit_override", tenant_id=str(tid))
+    )
+    assert cache.get(tid) == (False, None)
+
+
+@pytest.mark.asyncio
 async def test_tenant_scoped_new_handlers_ignore_events_without_tenant() -> None:
     status = _SpyTenantInvalidate()
     disable = _SpyInvalidateTenant()

@@ -263,6 +263,24 @@ def build_tenant_config_router() -> APIRouter:
             await bus.publish(
                 InvalidationEvent(kind="tenant_config", tenant_id=str(scope.tenant_id))
             )
+        # PR-D (E3b) — rate_limit_override is read through the middleware's own
+        # 30s TTL cache (NOT the tenant-config cache the event above drops), so
+        # it needs its own eviction: local + broadcast, one more event on top of
+        # ``tenant_config`` (the established "one write touches several inner
+        # layers → several events" posture, cf. mcp_servers enable/disable).
+        # Trigger = the field APPEARS in this request's body, read off
+        # ``model_fields_set``. That covers ``{}`` (the actual clear-override
+        # value) and explicit null (which the store ignores — evicting anyway
+        # is a harmless DB re-read); deliberately NOT an old-vs-new diff: the
+        # write is authoritative either way and a spurious evict is cheap.
+        if "rate_limit_override" in payload.model_fields_set:
+            overrides = getattr(request.app.state, "tenant_rate_limit_overrides", None)
+            if overrides is not None:
+                overrides.invalidate(scope.tenant_id)
+            if bus is not None:
+                await bus.publish(
+                    InvalidationEvent(kind="rate_limit_override", tenant_id=str(scope.tenant_id))
+                )
         return {"success": True, "data": record.model_dump(mode="json"), "error": None}
 
     @router.get("/{tenant_id}/config/credentials")

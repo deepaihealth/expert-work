@@ -66,6 +66,41 @@ def _retry_after_seconds(retry_after_s: float) -> int:
     return max(1, math.ceil(retry_after_s))
 
 
+class TenantRateLimitOverrideCache:
+    """TTL cache for per-tenant ``rate_limit_override`` values (PR-D, E3b).
+
+    Extracted from :class:`TenantRateLimitMiddleware` so write paths can reach
+    it: the middleware instance is unreachable after ``app.add_middleware``
+    (Starlette keeps no handle), so this object also hangs off
+    ``app.state.tenant_rate_limit_overrides``, where the tenant-config PUT and
+    the invalidation-bus ``rate_limit_override`` handler call
+    :meth:`invalidate` instead of waiting out the TTL.
+
+    A cached ``None`` is a HIT (the tenant has no override) — distinct from a
+    miss/expired entry, hence the ``(hit, value)`` shape of :meth:`get`. Keys
+    are ``str(tenant_id)``, unchanged from the previously inlined dict.
+    """
+
+    def __init__(self, ttl_s: float = 30.0) -> None:
+        self._ttl_s = ttl_s
+        self._cache: dict[str, tuple[float, RateLimitOverride | None]] = {}
+
+    def get(self, tenant_id: UUID) -> tuple[bool, RateLimitOverride | None]:
+        """``(hit, override)`` — ``(False, None)`` on miss or expired entry."""
+        cached = self._cache.get(str(tenant_id))
+        if cached is not None and cached[0] > time.monotonic():
+            return True, cached[1]
+        return False, None
+
+    def set(self, tenant_id: UUID, override: RateLimitOverride | None) -> None:
+        """Cache ``override`` (``None`` = tenant has no override) for ``ttl_s``."""
+        self._cache[str(tenant_id)] = (time.monotonic() + self._ttl_s, override)
+
+    def invalidate(self, tenant_id: UUID) -> None:
+        """Drop one tenant's entry — the next request re-reads the config."""
+        self._cache.pop(str(tenant_id), None)
+
+
 class TenantRateLimitMiddleware(BaseHTTPMiddleware):
     """Charge one token per request to ``("tenant", tenant_id)``."""
 
@@ -79,7 +114,7 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
         exempt_path_prefixes: Iterable[str] = ("/healthz", "/metrics"),
         audit_sample_every: int = 100,
         tenant_config_store: TenantConfigStore | None = None,
-        override_ttl_s: float = 30.0,
+        override_cache: TenantRateLimitOverrideCache | None = None,
     ) -> None:
         super().__init__(app)
         self._limiter = limiter
@@ -91,11 +126,13 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
         self._denial_counter: dict[str, int] = {}
         # Stream C.6 per-tenant rate_limit_override. Resolving it per request
         # would hit the DB on every call, so cache (tenant_id → override) with a
-        # short TTL; a config change takes effect within ``override_ttl_s``.
-        # ``None`` store (dev / tests without config) → no overrides, defaults.
+        # short TTL; a config change takes effect within the TTL — or
+        # immediately when a write path calls ``invalidate`` (PR-D). ``None``
+        # store (dev / tests without config) → no overrides, defaults.
         self._tenant_config_store = tenant_config_store
-        self._override_ttl_s = override_ttl_s
-        self._override_cache: dict[str, tuple[float, RateLimitOverride | None]] = {}
+        self._override_cache = (
+            override_cache if override_cache is not None else TenantRateLimitOverrideCache()
+        )
 
     async def dispatch(
         self,
@@ -172,11 +209,9 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
         any read/parse error falls back to ``None`` (the configured defaults)."""
         if self._tenant_config_store is None:
             return None
-        key = str(tenant_id)
-        now = time.monotonic()
-        cached = self._override_cache.get(key)
-        if cached is not None and cached[0] > now:
-            return cached[1]
+        hit, cached_override = self._override_cache.get(tenant_id)
+        if hit:
+            return cached_override
 
         override: RateLimitOverride | None = None
         ctx_token = current_tenant_id_var.set(tenant_id)
@@ -191,7 +226,7 @@ class TenantRateLimitMiddleware(BaseHTTPMiddleware):
         finally:
             current_tenant_id_var.reset(ctx_token)
 
-        self._override_cache[key] = (now + self._override_ttl_s, override)
+        self._override_cache.set(tenant_id, override)
         return override
 
     def _is_exempt(self, path: str) -> bool:

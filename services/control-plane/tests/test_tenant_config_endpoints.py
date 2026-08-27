@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
@@ -416,3 +417,104 @@ async def test_put_invalidates_agent_builds_locally_and_broadcasts(
     event = spy_bus.events[0]
     assert event.kind == "tenant_config"
     assert event.tenant_id == str(_TENANT)
+
+
+# ---------------------------------------------------------------------------
+# PR-D (E3b) — PUT touching rate_limit_override must evict the middleware's
+# override cache (locally + via the bus); a PUT not touching it must not.
+# ---------------------------------------------------------------------------
+
+
+class _SpyOverrideCache:
+    def __init__(self) -> None:
+        self.calls: list[UUID] = []
+
+    def invalidate(self, tenant_id: UUID) -> None:
+        self.calls.append(tenant_id)
+
+
+def _spy_wired_app(
+    audit_store: InMemoryAuditLogStore,
+) -> tuple[FastAPI, _SpyBus, _SpyOverrideCache]:
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        tenant_rate_limit_capacity=10_000,
+        tenant_rate_limit_refill_per_sec=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    spy_bus = _SpyBus()
+    spy_overrides = _SpyOverrideCache()
+    app.state.invalidation_bus = spy_bus
+    app.state.tenant_rate_limit_overrides = spy_overrides
+    return app, spy_bus, spy_overrides
+
+
+@pytest.mark.asyncio
+async def test_put_with_rate_limit_override_evicts_locally_and_broadcasts(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    app, spy_bus, spy_overrides = _spy_wired_app(audit_store)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            f"/v1/tenants/{_TENANT}/config",
+            headers={"Authorization": f"Bearer {_admin_token()}"},
+            json={
+                "display_name": "ACME",
+                "rate_limit_override": {"requests_per_minute": 60, "burst": 1},
+            },
+        )
+    assert put.status_code == 200
+    assert spy_overrides.calls == [_TENANT]
+    rl_events = [e for e in spy_bus.events if e.kind == "rate_limit_override"]
+    assert len(rl_events) == 1
+    assert rl_events[0].tenant_id == str(_TENANT)
+    # The pre-existing tenant_config event is preserved (one write touching
+    # several inner layers → several events).
+    assert [e.kind for e in spy_bus.events] == ["tenant_config", "rate_limit_override"]
+
+
+@pytest.mark.asyncio
+async def test_put_with_explicit_null_override_still_evicts(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """The trigger is field PRESENCE in the body — explicit null included
+    (the store ignores null, but the spurious evict is harmless)."""
+    app, spy_bus, spy_overrides = _spy_wired_app(audit_store)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            f"/v1/tenants/{_TENANT}/config",
+            headers={"Authorization": f"Bearer {_admin_token()}"},
+            json={"display_name": "ACME", "rate_limit_override": None},
+        )
+    assert put.status_code == 200
+    assert spy_overrides.calls == [_TENANT]
+    assert [e.kind for e in spy_bus.events] == ["tenant_config", "rate_limit_override"]
+
+
+@pytest.mark.asyncio
+async def test_put_without_override_field_publishes_no_rate_limit_event(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    app, spy_bus, spy_overrides = _spy_wired_app(audit_store)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            f"/v1/tenants/{_TENANT}/config",
+            headers={"Authorization": f"Bearer {_admin_token()}"},
+            json={"display_name": "ACME", "mcp_allowlist": ["github-mcp"]},
+        )
+    assert put.status_code == 200
+    assert spy_overrides.calls == []
+    assert [e.kind for e in spy_bus.events] == ["tenant_config"]
