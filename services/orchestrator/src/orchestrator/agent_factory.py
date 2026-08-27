@@ -43,6 +43,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if TYPE_CHECKING:
     from orchestrator.tools.skill_view import SkillResolution
 
+    # B-26 — type-only: these protocols live in modules that themselves import
+    # BuiltAgent from here (under TYPE_CHECKING); a runtime import would close
+    # an import cycle (CodeQL py/cyclic-import). Both names are used purely in
+    # annotations (``from __future__ import annotations`` keeps them strings).
+    from orchestrator.tools.spawn_worker import WorkerBuildFn
+    from orchestrator.tools.subagent import ChildAgentBuilder
+
 import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -142,8 +149,6 @@ from orchestrator.tools.skill_seed import (
     sanitize_agent_key,
     seed_drop_audit_entries,
 )
-from orchestrator.tools.spawn_worker import WorkerBuildFn
-from orchestrator.tools.subagent import ChildAgentBuilder
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")

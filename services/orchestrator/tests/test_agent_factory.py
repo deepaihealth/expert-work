@@ -600,9 +600,7 @@ class _RecordingWorkerBuildFn:
 def _capture_registry_env(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
     """Wrap ``build_tool_registry`` to capture the ``tool_env`` build_agent
     actually assembles the delegation tools with."""
-    import orchestrator.agent_factory as agent_factory_module
-
-    real = agent_factory_module.build_tool_registry
+    from orchestrator.agent_factory import build_tool_registry as real
 
     async def _capture(tool_specs: Any, *, tool_env: Any, **kwargs: Any) -> Any:
         captured["env"] = tool_env
