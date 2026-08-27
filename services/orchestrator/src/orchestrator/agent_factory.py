@@ -43,11 +43,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if TYPE_CHECKING:
     from orchestrator.tools.skill_view import SkillResolution
 
+    # B-26 — type-only: these protocols live in modules that themselves import
+    # BuiltAgent from here (under TYPE_CHECKING); a runtime import would close
+    # an import cycle (CodeQL py/cyclic-import). Both names are used purely in
+    # annotations (``from __future__ import annotations`` keeps them strings).
+    from orchestrator.tools.spawn_worker import WorkerBuildFn
+    from orchestrator.tools.subagent import ChildAgentBuilder
+
 import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.graph.state import CompiledStateGraph
 
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import BoundDistilledSkill
@@ -61,7 +67,6 @@ from expert_work.protocol import (
     AgentSpec,
     BuiltinToolSpec,
     ModelSpec,
-    PromptVariableSpec,
     Skill,
     SkillVersion,
     StructuredOutputSpec,
@@ -75,6 +80,12 @@ from expert_work.runtime.middleware import MiddlewareChain
 from expert_work.runtime.secret_store import SecretStore, parse_secret_ref
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
 from expert_work.runtime.tokens import default_estimator
+
+# B-26 follow-up — BuiltAgent moved to the neutral leaf ``orchestrator.built_agent``
+# (breaks the agent_factory ↔ orchestrator.tools import cycle). Re-exported here
+# so every existing ``from orchestrator.agent_factory import BuiltAgent`` importer
+# (and ``orchestrator.__init__``) keeps working unchanged.
+from orchestrator.built_agent import BuiltAgent as BuiltAgent
 from orchestrator.context import (
     ContextCompressor,
     ToolResultPruner,
@@ -131,7 +142,7 @@ from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
-from orchestrator.tools.registry import ToolCatalogEntry, ToolContext, ToolRegistry
+from orchestrator.tools.registry import ToolContext, ToolRegistry
 from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_agent_key, bind_egress
 from orchestrator.tools.skill_authoring import (
     SKILL_AUTHORING_BUILTINS,
@@ -194,73 +205,6 @@ def _make_workspace_writer_factory(
         return SandboxWorkspaceWriter(client=client, ctx=ctx)
 
     return factory
-
-
-@dataclass(frozen=True)
-class BuiltAgent:
-    """The runnable artefacts the worker / control-plane needs.
-
-    ``graph`` is invoked via ``astream``; ``system_prompt`` and
-    ``max_steps`` seed the initial ``AgentState`` (the factory builds
-    the graph, the caller builds each run's input).
-    """
-
-    graph: CompiledStateGraph[Any, Any, Any, Any]
-    system_prompt: str
-    max_steps: int
-    #: Whether the main model accepts image content blocks (J.6 Path A).
-    #: The control-plane run assembler uses this to decide whether to
-    #: emit a multimodal ``HumanMessage`` or a plain-text one.
-    supports_vision: bool = False
-    #: Mini-ADR J-40 (J.4-补强-2) — wall-clock cap on the whole run
-    #: including sub-agent recursion, in seconds. ``0`` disables the
-    #: deadline. ``sse.run_agent`` reads this to compute
-    #: ``deadline_at = time.monotonic() + run_deadline_s`` once per run.
-    run_deadline_s: int = 0
-    #: No-progress stop — consecutive loop-detection trips after which the
-    #: ReAct loop force-wraps up early (0 = off). Seeds ``max_no_progress``
-    #: in the initial ``AgentState``; mirrors ``max_steps``.
-    max_no_progress: int = 0
-    #: Stream SE (SE-7d-3b-ii) — distilled skill versions bound into this agent
-    #: at build time. The run carries these to its finalization hook so the
-    #: rollback monitor can attribute each run's outcome to the versions it used.
-    #: Only distilled (auto-promotable) versions — human skills never roll back.
-    bound_distilled_skills: tuple[BoundDistilledSkill, ...] = ()
-    #: Stream HX-3 (Mini-ADR HX-C2) — capability resolver for the run-retry
-    #: replay-safety guard: whether re-dispatching the named tool is safe
-    #: (CM-B5 rule: ``read_only`` or ``idempotent``). Closes over this
-    #: build's tool registry; unknown names resolve unsafe (fail-closed).
-    tool_replay_safe: Callable[[str], bool] | None = None
-    #: Stream PI-1c — the per-build spotlight nonce (same value the graph
-    #: uses to fence tool/RAG/memory). ``None`` when spotlighting is off.
-    #: The control-plane run assembler reuses it to fence structured
-    #: ``untrusted_content`` seed input with the matching marker, so inline
-    #: data shares one provenance fence with the model-side channels.
-    spotlight_nonce: str | None = None
-    #: Stream Dynamic-Prompt — opt-in run-time Jinja rendering of the system
-    #: prompt. ``prompt_jinja`` off (default) → the control-plane uses
-    #: ``system_prompt`` verbatim (byte-identical, cache intact). On → it
-    #: renders ``prompt_base`` (the human-authored template) with the run's
-    #: ``inputs`` against ``prompt_variables`` and appends ``prompt_suffix``
-    #: (the platform-computed spotlight/skill/memory blocks) unrendered.
-    prompt_jinja: bool = False
-    prompt_variables: tuple[PromptVariableSpec, ...] = ()
-    prompt_base: str = ""
-    prompt_suffix: str = ""
-    #: Stream L.L7 — per-agent trajectory-recording opt-out
-    #: (``policies.trajectory_recording``). Callers gate
-    #: ``sse.run_agent(trajectory_enabled=...)`` on this; ``False`` means
-    #: the run is never serialised to ObjectStore even when the deployment
-    #: has a recorder configured.
-    trajectory_recording: bool = True
-    #: B3 — per-run token breaker limit (``policies.token_budget``). Callers
-    #: pass it to ``sse.run_agent(token_budget=...)``; 0 disables (no budget
-    #: object is created, zero behaviour change).
-    token_budget: int = 0
-    #: PR-A.3 — the build's full tool registry projection
-    #: (``ToolRegistry.catalog()``) for the console's Schema tab. Read-only
-    #: metadata; nothing on the run path consumes it.
-    tool_catalog: tuple[ToolCatalogEntry, ...] = ()
 
 
 def _tool_replay_safe(registry: ToolRegistry) -> Callable[[str], bool]:
@@ -486,6 +430,76 @@ def _bound_distilled_skills(
     ]
     bound.sort(key=lambda b: (str(b.skill_id), b.skill_version))
     return tuple(bound)
+
+
+def _bind_delegation_usage_kind(env: ToolEnv, token_usage_kind: str) -> ToolEnv:
+    """B-26 — inject this build's ``token_usage_kind`` into the delegation
+    build entrances (static sub-agents + spawned workers).
+
+    The delegation tools (``SubAgentTool`` / ``spawn_worker``) call the
+    env-injected builders without a usage kind, so a non-default kind (e.g.
+    the ``skill_evolution`` evaluation replay) would silently drop back to
+    "conversation" on every delegated build — mis-metering the whole subtree's
+    LLM spend. The wrapped builders force THIS build's kind; the child's own
+    recursive ``build_agent`` call re-wraps for grandchildren, so the kind
+    penetrates the full delegation tree. ``build_agent`` only calls this for a
+    non-default kind — the default path keeps the exact builder objects it was
+    given (byte-identical behaviour).
+    """
+    kind = token_usage_kind
+    child = env.child_agent_builder
+    worker = env.worker_build_fn
+    if child is None and worker is None:
+        return env
+    new_child: ChildAgentBuilder | None = child
+    if child is not None:
+        bound_child = child
+
+        async def _child_with_kind(
+            *,
+            tenant_id: UUID,
+            name: str,
+            version: str,
+            depth: int,
+            oauth_user_id: str | None = None,
+            token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+        ) -> BuiltAgent:
+            # The incoming kind is ignored — the parent's kind labels the tree.
+            return await bound_child(
+                tenant_id=tenant_id,
+                name=name,
+                version=version,
+                depth=depth,
+                oauth_user_id=oauth_user_id,
+                token_usage_kind=kind,
+            )
+
+        new_child = _child_with_kind
+    new_worker: WorkerBuildFn | None = worker
+    if worker is not None:
+        bound_worker = worker
+
+        async def _worker_with_kind(
+            parent_spec: AgentSpec,
+            *,
+            tenant_id: UUID,
+            role: str | None,
+            depth: int,
+            oauth_user_id: str | None = None,
+            token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
+        ) -> BuiltAgent:
+            # The incoming kind is ignored — the parent's kind labels the tree.
+            return await bound_worker(
+                parent_spec,
+                tenant_id=tenant_id,
+                role=role,
+                depth=depth,
+                oauth_user_id=oauth_user_id,
+                token_usage_kind=kind,
+            )
+
+        new_worker = _worker_with_kind
+    return replace(env, child_agent_builder=new_child, worker_build_fn=new_worker)
 
 
 def _effective_run_deadline_s(manifest_value: int, platform_default: int) -> int:
@@ -770,6 +784,14 @@ async def build_agent(
             agent_key,
         )
         env = replace(env, sandbox_runtime=bound_runtime)
+
+    # B-26 — a non-default usage kind (e.g. the skill-evolution replay) must
+    # label the WHOLE delegation tree: wrap the delegation build entrances so
+    # child/worker builds inherit this build's kind. The default kind wraps
+    # nothing — the delegated builders' own default is already "conversation",
+    # keeping that path byte-identical.
+    if token_usage_kind != "conversation":  # noqa: S105 — usage label, not a secret
+        env = _bind_delegation_usage_kind(env, token_usage_kind)
 
     registry = await build_tool_registry(
         spec.spec.tools,

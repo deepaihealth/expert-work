@@ -64,7 +64,7 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     # Imported under TYPE_CHECKING only to avoid an ``llm → tools`` cycle.
-    from orchestrator.agent_factory import BuiltAgent
+    from orchestrator.built_agent import BuiltAgent
     from orchestrator.llm import LLMCaller
 
 logger = logging.getLogger(__name__)
