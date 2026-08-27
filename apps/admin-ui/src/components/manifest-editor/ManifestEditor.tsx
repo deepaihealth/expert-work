@@ -34,6 +34,7 @@ import { ModelRoutingSection } from "./groups/ModelRoutingSection";
 import { SecuritySection } from "./groups/SecuritySection";
 import { SandboxSection } from "./groups/SandboxSection";
 import { ObservabilitySection } from "./groups/ObservabilitySection";
+import type { AgentRef } from "./widgets/DelegationPolicyButton";
 import type { McpPickerSource } from "./widgets/McpToolPicker";
 
 /** Curated group panes — a hand-written component that replaces FormView's
@@ -115,6 +116,9 @@ interface ManifestEditorProps {
    *  ⇒ the editor keeps its own internal selection. */
   activeGroup?: string;
   onActiveGroupChange?: (id: string) => void;
+  /** 委派增强层 3 — 已保存 Agent 的身份(仅编辑页宿主 ManifestTab 传)。
+   *  转发给 FormView,提示词区据此渲染「生成委派策略」按钮。 */
+  agentRef?: AgentRef;
 }
 
 /** BUG-5 —— 编辑器主体 min-height 扣除的宿主 chrome 估算(agent 详情页
@@ -147,6 +151,7 @@ export function ManifestEditor({
   mcpSource,
   activeGroup,
   onActiveGroupChange,
+  agentRef,
 }: ManifestEditorProps) {
   const { t } = useTranslation();
   const seed = useMemo(() => safeSeed(initialYaml), [initialYaml]);
@@ -365,6 +370,7 @@ export function ManifestEditor({
         (s) => !mergedSections.has(s),
       )}
       mcpSource={mcpSource}
+      agentRef={agentRef}
     />
   ) : null;
 

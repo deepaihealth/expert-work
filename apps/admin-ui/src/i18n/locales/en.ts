@@ -1136,6 +1136,12 @@ export interface TranslationKeys {
     inject_date_label: string;
     inject_date_hint: string;
     dynamic_context_note: string;
+    delegation_policy_generate: string;
+    delegation_policy_title: string;
+    delegation_policy_hint: string;
+    delegation_policy_insert: string;
+    delegation_policy_close: string;
+    delegation_policy_failed: string;
   };
   console: {
     sidebar_title: string;
@@ -4290,6 +4296,13 @@ const en: TranslationKeys = {
       "Writes today's date into the system prompt at build time (on by default, cache-stable per calendar day). When off, the agent doesn't know today's date - only suitable for agents whose behavior doesn't depend on the date.",
     dynamic_context_note:
       "Advanced items like custom reminders (dynamic_context.custom_reminders) need the YAML view.",
+    delegation_policy_generate: "Generate delegation policy",
+    delegation_policy_title: "Delegation policy draft",
+    delegation_policy_hint:
+      "Drafted by the platform's auxiliary model from this agent's saved manifest (tools, skills, prompt). Review it, insert it at the end of the system prompt, edit freely, then save as usual — nothing is stored until you save.",
+    delegation_policy_insert: "Append to system prompt",
+    delegation_policy_close: "Close",
+    delegation_policy_failed: "Failed to generate delegation policy",
   },
   console: {
     sidebar_title: "Sessions",

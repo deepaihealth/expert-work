@@ -120,6 +120,24 @@ export async function getAgentTools(
   );
 }
 
+/** POST /v1/agents/{name}/{version}/delegation-policy:generate — 委派增强层 3。
+ *  辅助 LLM 读该 Agent 的已保存 manifest 起草一段领域化「委派策略」。只返回
+ *  草稿,不落库 — 采纳与否由前端把文本并进 prompt 编辑器,走既有保存流程。
+ *  dynamic_workers 关闭的 Agent 400(DYNAMIC_WORKERS_DISABLED)。 */
+export interface DelegationPolicyDraft {
+  draft: string;
+}
+
+export async function generateDelegationPolicy(
+  name: string,
+  version: string,
+): Promise<DelegationPolicyDraft> {
+  return postJson<DelegationPolicyDraft>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/delegation-policy:generate`,
+    {},
+  );
+}
+
 /** Server-side ``ManifestPayload`` accepts the manifest YAML text; ``{{ … }}``
  *  inside it is run-time Jinja, stored verbatim. The backend validates it
  *  end-to-end (Pydantic + ManifestError) on save. */

@@ -62,6 +62,11 @@ from control_plane.api.runs import (
 from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
+from control_plane.delegation_policy import (
+    DelegationPolicyAux,
+    ToolBrief,
+    build_delegation_policy_prompt,
+)
 from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.manifest import (
     ManifestError,
@@ -80,7 +85,11 @@ from control_plane.tenant_scope import (
     ensure_single_tenant_scope,
     ensure_tenant_scope,
 )
-from expert_work.common.observability import current_trace_id_hex
+from expert_work.common.observability import (
+    ExpertWorkComponent,
+    current_trace_id_hex,
+    expert_work_span,
+)
 from expert_work.common.uplift_metrics import record_manifest_provider_rejected
 from expert_work.persistence import ApprovalStore, TriggerStore
 from expert_work.persistence.agent_disable import AgentDisableStore
@@ -393,6 +402,27 @@ def _get_instance_store(request: Request) -> AgentInstanceStore:
 
 def _get_runtime(request: Request) -> AgentRuntime:
     return request.app.state.agent_runtime  # type: ignore[no-any-return]
+
+
+def _get_delegation_policy_aux(request: Request) -> DelegationPolicyAux:
+    """委派增强层 3 — the delegation-policy drafting aux caller.
+
+    Production wiring parks :func:`make_delegation_policy_aux`'s caller on
+    ``app.state.delegation_policy_aux`` (app.py lifespan, next to
+    ``credentials_resolver``); tests inject a fake on the same attribute. A
+    deployment where lifespan never wired it (injected-runtime test apps)
+    answers 503, not a 500 AttributeError.
+    """
+    aux = getattr(request.app.state, "delegation_policy_aux", None)
+    if aux is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "AUX_MODEL_UNAVAILABLE",
+                "message": "auxiliary model is not configured on this deployment",
+            },
+        )
+    return aux  # type: ignore[no-any-return]
 
 
 async def _invalidate_agent_build_cache(request: Request, tenant_id: UUID) -> None:
@@ -1742,6 +1772,98 @@ def build_agents_router() -> APIRouter:
         ]
         payload = AgentToolList(items=items, total=len(items))
         return JSONResponse({"success": True, "data": payload.model_dump(mode="json")})
+
+    @router.post("/{name}/{version}/delegation-policy:generate", dependencies=_CONSOLE_ONLY)
+    async def generate_delegation_policy(
+        name: str,
+        version: str,
+        request: Request,
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
+        aux: Annotated[DelegationPolicyAux, Depends(_get_delegation_policy_aux)],
+    ) -> JSONResponse:
+        """委派增强层 3 — 辅助 LLM 读该 Agent 的 manifest 起草「委派策略」。
+
+        返回 ``{draft}``,**不落库** — 采纳与否由前端把文本并进 prompt 编辑
+        器,走既有 ``PUT /{name}/{version}`` 保存流程。挂载与权限照配置写面
+        (``update_agent``)抄:``_CONSOLE_ONLY`` + 实例级 ``manifest:write``
+        (草稿只对能改这份 manifest 的人有意义)。工具清单走真实构建
+        (``runtime.get_agent``,与 ``/tools`` 端点同路径),所以 MCP /
+        技能来源的工具带 wire 名 + 描述进 prompt。
+        """
+        tenant_id = request.state.tenant_id
+        record = await repo.get(tenant_id=tenant_id, name=name, version=version)
+        if record is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await ensure_resource_access(
+            request, resource="manifest", action="write", attrs=_record_attrs(record)
+        )
+        if not record.spec.spec.dynamic_workers.enabled:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "DYNAMIC_WORKERS_DISABLED",
+                    "message": (
+                        "dynamic_workers is disabled for this agent; a delegation "
+                        "policy only applies to agents that can spawn workers — "
+                        "enable spec.dynamic_workers first"
+                    ),
+                },
+            )
+        # Audit BEFORE the build + LLM call, like the sibling ``/tools``
+        # endpoint: the manifest was read the moment the RBAC gate passed.
+        await emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=request.state.actor_id,
+            action=AuditAction.MANIFEST_READ,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}/delegation-policy",
+            trace_id=current_trace_id_hex(),
+        )
+        try:
+            built = await runtime.get_agent(
+                tenant_id=tenant_id,
+                name=name,
+                version=version,
+                spec=record.spec,
+                user_id=request.state.principal.subject_id,
+            )
+        except AgentFactoryError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"agent manifest cannot be built: {exc}"
+            ) from exc
+        prompt = build_delegation_policy_prompt(
+            spec=record.spec,
+            tools=[ToolBrief(name=t.name, description=t.description) for t in built.tool_catalog],
+        )
+        try:
+            # 用途标记 — 单源契约 LLM_SPAN_PURPOSES 里注册的
+            # ``expert_work.control_plane.delegation_policy``(purpose=
+            # delegation_policy);辅助 LLM 调用一律带 purpose span,别绕开。
+            with expert_work_span(ExpertWorkComponent.CONTROL_PLANE, "delegation_policy"):
+                draft = (await aux(prompt=prompt, tenant_id=tenant_id)).strip()
+        except Exception:
+            # Raw provider / credential errors are logged server-side, never
+            # echoed to the caller (py/stack-trace-exposure discipline).
+            logger.warning("delegation_policy.generate_failed", exc_info=True)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "DELEGATION_POLICY_GENERATION_FAILED",
+                    "message": "auxiliary model call failed; check platform aux credentials",
+                },
+            ) from None
+        if not draft:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "DELEGATION_POLICY_GENERATION_FAILED",
+                    "message": "auxiliary model returned an empty draft",
+                },
+            )
+        return JSONResponse({"success": True, "data": {"draft": draft}})
 
     @router.get("/{name}/{version}/revisions", dependencies=_CONSOLE_ONLY)
     async def list_revisions(

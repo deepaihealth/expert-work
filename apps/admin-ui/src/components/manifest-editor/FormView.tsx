@@ -33,6 +33,7 @@ import {
   hasBuiltinTool,
   readDescription,
   readDisplayName,
+  readDynamicWorkersOn,
   readFallback,
   readInjectCurrentDate,
   readMainSupportsVision,
@@ -56,6 +57,10 @@ import {
   setTool,
   setVisionModel,
 } from "./form_model";
+import {
+  DelegationPolicyButton,
+  type AgentRef,
+} from "./widgets/DelegationPolicyButton";
 import { FallbackChainEditor } from "./widgets/FallbackChainEditor";
 import { McpToolPicker, type McpPickerSource } from "./widgets/McpToolPicker";
 import { OutputSchemaEditor } from "./widgets/OutputSchemaEditor";
@@ -93,6 +98,10 @@ interface FormViewProps {
    *  tab (e.g. "basic" merged into a template's "basic info") so there's no
    *  redundant sub-heading. */
   bare?: boolean;
+  /** 委派增强层 3 — 已保存 Agent 的身份(编辑页才有;创建流/模板表单不
+   *  传)。有它且 dynamic_workers 开启时,提示词区渲染「生成委派策略」
+   *  按钮(后端读已保存 manifest 起草,草稿人审后追加进 prompt)。 */
+  agentRef?: AgentRef;
 }
 
 // Width policy, single altitude (BUG-6): list-type sections need the full
@@ -135,6 +144,7 @@ export function FormView({
   sections,
   mcpSource = "available",
   bare = false,
+  agentRef,
 }: FormViewProps) {
   const { t } = useTranslation();
   const [catalog, setCatalog] = useState<ModelCatalog | undefined>(undefined);
@@ -361,6 +371,25 @@ export function FormView({
               />
             )}
           </div>
+          {/* 委派增强层 3 — 仅编辑页(有 agentRef)且 dynamic_workers 开启
+              时可见。插入 = 把草稿追加到当前 prompt 末尾(空 prompt 直接作
+              为全文);保存仍走既有流程,这里不落库。 */}
+          {agentRef !== undefined && readDynamicWorkersOn(formData) && (
+            <div style={{ marginTop: 8 }}>
+              <DelegationPolicyButton
+                agentRef={agentRef}
+                onInsert={(draft) => {
+                  const current = readSystemPrompt(formData);
+                  onChange(
+                    setSystemPrompt(
+                      formData,
+                      current ? `${current}\n\n${draft}` : draft,
+                    ),
+                  );
+                }}
+              />
+            </div>
+          )}
         </section>
         <PromptVariablesEditor formData={formData} onChange={onChange} />
         {/* Stream RT-1 (RT-ADR-4) — structured final reply. config-page

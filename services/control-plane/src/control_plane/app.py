@@ -129,6 +129,7 @@ from control_plane.aux_model_adapter import make_llm_router_aux_model
 from control_plane.catalog_seed import CatalogSeedError, load_catalog_seed, seed_catalog
 from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.curation_worker import CurationWorker
+from control_plane.delegation_policy import make_delegation_policy_aux
 from control_plane.encrypted_secret_store import (
     SqlEncryptedSecretStore,
     build_kek_from_b64,
@@ -1414,6 +1415,18 @@ def create_app(
                     ),
                 )
                 _app.state.credentials_resolver = credentials_resolver
+                # 委派增强层 3 — 配置页「生成委派策略」端点的辅助模型调用器
+                # (api/agents.py::generate_delegation_policy 经
+                # ``_get_delegation_policy_aux`` 读取)。默认 provider/model
+                # 复用平台辅助模型对(consolidator / skill-evolution 同款);
+                # 凭据仍按调用时的 tenant_id 走 resolver 现场解析。
+                _app.state.delegation_policy_aux = make_delegation_policy_aux(
+                    resolver=credentials_resolver,
+                    secret_store=resolved_secret_store,
+                    default_provider=(resolved_settings.memory_consolidator_default_aux_provider),
+                    default_model=resolved_settings.memory_consolidator_default_aux_model,
+                    secret_cache=credential_value_cache,
+                )
                 web_search_client = resolve_web_search_client(
                     searxng_base_url=resolved_settings.web_search_searxng_base_url,
                     http=shared_http,

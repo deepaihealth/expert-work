@@ -220,6 +220,9 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # PR-A.3 Task 7 — 调试台 Schema 面板读工具注册表(含 deferred),管理
         # 面产物,同 revisions/users 一样只对雇员 JWT 开放。
         ("GET", "/v1/agents/{name}/{version}/tools"),
+        # 委派增强层 3 — 配置页「生成委派策略」草稿(辅助 LLM 读 manifest,
+        # 不落库)。配置写面产物,``_CONSOLE_ONLY`` + 实例级 manifest:write。
+        ("POST", "/v1/agents/{name}/{version}/delegation-policy:generate"),
         ("GET", "/v1/agents/{name}/{version}/revisions"),
         ("GET", "/v1/agents/{name}/{version}/revisions/{revision}"),
         ("POST", "/v1/agents/{name}/{version}/revisions/{revision}/rollback"),

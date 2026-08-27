@@ -353,6 +353,7 @@ _LLM_LABELS: dict[str, str] = {
     "expert_work.orchestrator.judge_action": "行动评审",
     "expert_work.orchestrator.vision": "视觉理解",
     "expert_work.orchestrator.rerank": "文档重排",
+    "expert_work.control_plane.delegation_policy": "委派策略生成",
 }
 
 
