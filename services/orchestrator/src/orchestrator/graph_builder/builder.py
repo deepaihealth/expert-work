@@ -183,8 +183,16 @@ from orchestrator.tools.registry import (
     ToolSpec,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
+from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 
 logger = logging.getLogger(__name__)
+
+#: 动态子智能体委派增强(层 1)— minimum non-completed plan steps before the
+#: post-``update_plan`` delegation nudge fires. Degraded criterion by design:
+#: :class:`~expert_work.protocol.plan.PlanStep` carries no parallel-safe
+#: semantics, so ">= 2 non-completed steps" stands in for "has parallelizable
+#: items" — the nudge text explicitly leaves the independence call to the agent.
+_DELEGATION_NUDGE_MIN_PENDING = 2
 
 #: Stream HX-12 (Mini-ADR HX-I5) — a promoted tool unused for this many
 #: ReAct steps is dropped from the bind when the compressor fires. Constant
@@ -1393,6 +1401,26 @@ def build_react_graph(
                     error_class=failure.error_class, tool=failure.tool_name
                 ).inc()
 
+        # 动态子智能体委派增强(层 1)— plan-driven delegation nudge. When this
+        # batch's ``update_plan`` created or replaced the plan (the only tool
+        # writing the ``plan`` channel), the plan still has >= 2 non-completed
+        # steps, and this build registered ``spawn_worker`` (same judgement as
+        # the 层 0+2 prompt injection in agent_factory), append ONE hidden
+        # ``[system reminder]`` HumanMessage nudging the agent to evaluate
+        # delegation. Advisory only — no execution path changes, and a build
+        # without ``spawn_worker`` never reaches the hash / message code at
+        # all. Dedupe: one nudge per plan identity (``_plan_identity_hash``),
+        # keyed by the checkpointed ``delegation_nudge_plan_hash`` channel.
+        nudged_plan_hash: str | None = None
+        batch_plan = accumulated_state.get("plan")
+        if SPAWN_WORKER_TOOL_NAME in tool_registry and isinstance(batch_plan, Plan):
+            pending_count = sum(1 for s in batch_plan.steps if s.status != "completed")
+            if pending_count >= _DELEGATION_NUDGE_MIN_PENDING:
+                plan_hash = _plan_identity_hash(batch_plan)
+                if plan_hash != state.get("delegation_nudge_plan_hash"):
+                    new_messages.append(_build_delegation_nudge(pending_count))
+                    nudged_plan_hash = plan_hash
+
         # Stream HX-12 — stamp ``promoted_tool_last_used`` for the demotion
         # gate: every already-promoted tool that dispatched in this batch
         # refreshes its stamp; every name freshly promoted in this batch
@@ -1423,6 +1451,11 @@ def build_react_graph(
         }
         if used_stamps:
             result_dict["promoted_tool_last_used"] = used_stamps
+        # 层 1 — persist the nudge dedupe key only when a nudge actually fired;
+        # the absent case leaves the channel (and no-spawn_worker builds'
+        # state shape) untouched.
+        if nudged_plan_hash is not None:
+            result_dict["delegation_nudge_plan_hash"] = nudged_plan_hash
         # Only write the channel when there are failures — the absent
         # case keeps the agent_node's ``state.get("tool_failures", [])``
         # default fast-path active.
@@ -1785,6 +1818,42 @@ def _build_recovery_advisory(failures: list[ClassifiedToolError]) -> HumanMessag
     """
     return HumanMessage(
         content=render_recovery_advisory(failures),
+        additional_kwargs={"expert_work_hide_from_ui": True},
+    )
+
+
+def _plan_identity_hash(plan: Plan) -> str:
+    """动态子智能体委派增强(层 1)— plan identity for the nudge dedupe.
+
+    Goal + ordered step descriptions only; step *statuses* are excluded
+    on purpose: an ``update_plan`` that merely marks progress replaces
+    the ``Plan`` object but is the same plan version — re-nudging on
+    every status flip would spam exactly the "别每轮循环都打" way the
+    dedupe exists to prevent. Only a structurally new plan (different
+    goal or steps) is a new version eligible for another nudge.
+    """
+    payload = "\n".join([plan.goal, *(step.description for step in plan.steps)])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_delegation_nudge(pending_count: int) -> HumanMessage:
+    """动态子智能体委派增强(层 1)— post-``update_plan`` delegation nudge.
+
+    A suggestion, never a directive: the agent keeps the independence
+    call, and no execution path changes. Same RT-ADR-9 form as the
+    recovery advisory / reflect feedback — an orchestrator-authored
+    ``HumanMessage`` persisted into history but marked
+    ``expert_work_hide_from_ui`` so it reaches the model without
+    surfacing as a user bubble.
+    """
+    return HumanMessage(
+        content=(
+            f"[system reminder] The current plan contains {pending_count} pending "
+            'items that look mutually independent. Per the "Subtask delegation" '
+            "guidance, consider dispatching the parallelizable ones via "
+            "spawn_worker; if they are not truly independent, continue "
+            "sequentially."
+        ),
         additional_kwargs={"expert_work_hide_from_ui": True},
     )
 

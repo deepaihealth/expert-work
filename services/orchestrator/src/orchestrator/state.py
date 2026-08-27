@@ -221,3 +221,10 @@ class AgentState(TypedDict):
     #: per-turn bind slims down).
     promoted_tool_last_used: NotRequired[Annotated[dict[str, int], _merge_last_used]]
     last_projection_hash: NotRequired[str | None]
+    #: 动态子智能体委派增强(层 1)— identity hash (goal + step descriptions,
+    #: statuses excluded) of the last plan the ``tools_node`` nudged the agent
+    #: about after an ``update_plan``. Dedupe key: one delegation nudge per
+    #: plan version — a re-issue or a pure progress-marking update never
+    #: re-nudges; a structurally new plan may. Absent until the first nudge;
+    #: only ever written when the registry carries ``spawn_worker``.
+    delegation_nudge_plan_hash: NotRequired[str | None]

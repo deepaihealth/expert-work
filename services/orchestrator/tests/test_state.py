@@ -15,7 +15,8 @@ def test_required_keys_present() -> None:
     J.4-补强-2 ``subagent_invocations``, J.8 ``pending_approval`` /
     ``approval_resume`` / ``approval_outcome``, TE-6 ``promoted_tools``,
     HX-12 ``promoted_tool_last_used``, CM-0 ``last_projection_hash``,
-    CM-11 ``last_plan_goal`` (last thirteen ``NotRequired``)."""
+    CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``
+    (last fourteen ``NotRequired``)."""
     annotations = inspect.get_annotations(AgentState)
     assert set(annotations) == {
         "messages",
@@ -37,6 +38,7 @@ def test_required_keys_present() -> None:
         "promoted_tools",
         "promoted_tool_last_used",
         "last_projection_hash",
+        "delegation_nudge_plan_hash",
     }
 
 
