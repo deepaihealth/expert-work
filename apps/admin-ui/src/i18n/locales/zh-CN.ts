@@ -976,6 +976,7 @@ const zhCN: TranslationKeys = {
     mcp_select_all: "全选",
     mcp_clear: "清空",
     mcp_selected_count: "已选 {{count}}",
+    mcp_only_selected: "只看已选",
     mcp_choose_tools: "选择工具",
     mcp_done: "完成",
     mcp_all_tools: "全部工具",

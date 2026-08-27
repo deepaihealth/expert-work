@@ -246,4 +246,77 @@ describe("McpToolPicker", () => {
     );
     expect(screen.getByTestId("af-mcp-tool-maps_weather")).toBeInTheDocument();
   });
+
+  it("'only selected' hides unselected tools and stacks with the search box", async () => {
+    const user = userEvent.setup();
+    availableMock.mockResolvedValue([
+      { name: "amap-maps", source: "platform" },
+    ]);
+    toolsMock.mockResolvedValue([
+      { name: "maps_geo", description: "" },
+      { name: "maps_weather", description: "" },
+      { name: "maps_direction", description: "" },
+    ]);
+    render(
+      <McpToolPicker
+        servers={["amap-maps"]}
+        allowTools={["maps_geo", "maps_weather"]}
+        onChange={noop}
+      />,
+    );
+    await user.click(await screen.findByTestId("af-mcp-choose-amap-maps"));
+    await screen.findByTestId("af-mcp-tool-maps_direction");
+    await user.click(screen.getByTestId("af-mcp-only-selected-amap-maps"));
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("af-mcp-tool-maps_direction"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("af-mcp-tool-maps_geo")).toBeInTheDocument();
+    expect(screen.getByTestId("af-mcp-tool-maps_weather")).toBeInTheDocument();
+    // 与搜索叠加:两个过滤条件同时生效。
+    await user.type(screen.getByTestId("af-mcp-tool-search-amap-maps"), "geo");
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("af-mcp-tool-maps_weather"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("af-mcp-tool-maps_geo")).toBeInTheDocument();
+    // 取消勾选恢复全量(仍受搜索约束)。
+    await user.click(screen.getByTestId("af-mcp-only-selected-amap-maps"));
+    expect(screen.getByTestId("af-mcp-tool-maps_geo")).toBeInTheDocument();
+  });
+
+  it("reopening the tool modal resets 'only selected' to off", async () => {
+    const user = userEvent.setup();
+    availableMock.mockResolvedValue([
+      { name: "amap-maps", source: "platform" },
+    ]);
+    toolsMock.mockResolvedValue([
+      { name: "maps_geo", description: "" },
+      { name: "maps_weather", description: "" },
+    ]);
+    render(
+      <McpToolPicker
+        servers={["amap-maps"]}
+        allowTools={["maps_geo"]}
+        onChange={noop}
+      />,
+    );
+    await user.click(await screen.findByTestId("af-mcp-choose-amap-maps"));
+    await user.click(
+      await screen.findByTestId("af-mcp-only-selected-amap-maps"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("af-mcp-tool-maps_weather"),
+      ).not.toBeInTheDocument(),
+    );
+    // 关掉再开:过滤复位,未选工具重新可见。
+    await user.click(screen.getByText(/完成|Done/));
+    await user.click(screen.getByTestId("af-mcp-choose-amap-maps"));
+    expect(
+      await screen.findByTestId("af-mcp-tool-maps_weather"),
+    ).toBeInTheDocument();
+  });
 });

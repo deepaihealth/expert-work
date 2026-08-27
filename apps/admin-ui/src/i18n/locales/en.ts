@@ -962,6 +962,7 @@ export interface TranslationKeys {
     mcp_select_all: string;
     mcp_clear: string;
     mcp_selected_count: string;
+    mcp_only_selected: string;
     mcp_choose_tools: string;
     mcp_done: string;
     mcp_all_tools: string;
@@ -4041,6 +4042,7 @@ const en: TranslationKeys = {
     mcp_select_all: "Select all",
     mcp_clear: "Clear",
     mcp_selected_count: "{{count}} selected",
+    mcp_only_selected: "Selected only",
     mcp_choose_tools: "Choose tools",
     mcp_done: "Done",
     mcp_all_tools: "All tools",
