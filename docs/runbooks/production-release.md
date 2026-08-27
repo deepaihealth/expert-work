@@ -156,7 +156,9 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
 
    ```sh
    # 在 control-plane pod 里跑(幂等;--model-provider/--model-name 选一个
-   # 本环境已配置平台 key 的模型,默认 anthropic/claude-sonnet-4-5):
+   # 本环境已配置平台 key 的模型,默认 anthropic/claude-sonnet-4-5;
+   # --fallback-provider/--fallback-name 选另一家也有 key 的备用,默认
+   # deepseek/deepseek-v4-pro —— 备用挡住主模型 429 误红发布闸):
    kubectl -n expert-work exec -it <control-plane-pod> -- \
      python -m control_plane.seed_canary --tenant-id <第 5 步租户的 uuid>
    # CLI 只打印一次 API key 明文,并给出建 Secret 的确切命令(照抄执行):

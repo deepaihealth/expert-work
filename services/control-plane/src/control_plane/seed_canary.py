@@ -24,7 +24,7 @@ It is idempotent:
   key (pass ``--rotate-key`` to mint another after losing the plaintext);
   the plaintext is printed **once** and never stored by this CLI — copy it
   into the ``canary-credentials`` k8s Secret with the printed command;
-* agent ``release-canary@1.0.0`` — registered from the embedded manifest,
+* agent ``release-canary@1.1.0`` — registered from the embedded manifest,
   or left untouched when the ``(name, version)`` already exists.
 
 The model provider/name default to the canonical agent's choice; override
@@ -73,9 +73,15 @@ _SEED_ACTOR = "seed-canary"
 
 SERVICE_ACCOUNT_NAME = "release-canary"
 DEFAULT_AGENT_CODE = "release-canary"
-CANARY_AGENT_VERSION = "1.0.0"
+CANARY_AGENT_VERSION = "1.1.0"
 DEFAULT_MODEL_PROVIDER = "anthropic"
 DEFAULT_MODEL_NAME = "claude-sonnet-4-5"
+#: One fallback so a transient primary-provider 429/outage doesn't red the
+#: release gate: the canary's assertions all ride on deterministic sandbox
+#: output, so WHICH model answered never weakens them (2026-08-27 拍板).
+#: A masked primary failure still shows up in the Langfuse trace.
+DEFAULT_FALLBACK_PROVIDER = "deepseek"
+DEFAULT_FALLBACK_NAME = "deepseek-v4-pro"
 
 #: Embedded rather than a ``manifests/`` file: the pod image ships
 #: ``services/`` but not ``manifests/``, and this CLI runs in-pod. Kept
@@ -104,6 +110,11 @@ spec:
     name: {model_name}
     temperature: 0.0
     max_tokens: 4096
+    fallback:
+      - provider: {fallback_provider}
+        name: {fallback_name}
+        temperature: 0.0
+        max_tokens: 4096
   system_prompt:
     template: |
       You are an automated release canary agent. Follow the user's numbered
@@ -138,13 +149,17 @@ def render_canary_manifest(
     agent_code: str = DEFAULT_AGENT_CODE,
     model_provider: str = DEFAULT_MODEL_PROVIDER,
     model_name: str = DEFAULT_MODEL_NAME,
+    fallback_provider: str = DEFAULT_FALLBACK_PROVIDER,
+    fallback_name: str = DEFAULT_FALLBACK_NAME,
 ) -> str:
-    """The canary manifest YAML with the environment's model filled in."""
+    """The canary manifest YAML with the environment's models filled in."""
     return _CANARY_MANIFEST_TEMPLATE.format(
         agent_code=agent_code,
         version=CANARY_AGENT_VERSION,
         model_provider=model_provider,
         model_name=model_name,
+        fallback_provider=fallback_provider,
+        fallback_name=fallback_name,
     )
 
 
@@ -153,6 +168,8 @@ def load_canary_spec(
     agent_code: str = DEFAULT_AGENT_CODE,
     model_provider: str = DEFAULT_MODEL_PROVIDER,
     model_name: str = DEFAULT_MODEL_NAME,
+    fallback_provider: str = DEFAULT_FALLBACK_PROVIDER,
+    fallback_name: str = DEFAULT_FALLBACK_NAME,
 ) -> AgentSpec:
     """Validate the rendered manifest through the real loader.
 
@@ -160,7 +177,11 @@ def load_canary_spec(
     the loader's field-level error rather than a late run-time surprise.
     """
     yaml_text = render_canary_manifest(
-        agent_code=agent_code, model_provider=model_provider, model_name=model_name
+        agent_code=agent_code,
+        model_provider=model_provider,
+        model_name=model_name,
+        fallback_provider=fallback_provider,
+        fallback_name=fallback_name,
     )
     return ManifestLoader().load_from_string(yaml_text)
 
@@ -188,6 +209,8 @@ async def seed_canary(
     agent_code: str = DEFAULT_AGENT_CODE,
     model_provider: str = DEFAULT_MODEL_PROVIDER,
     model_name: str = DEFAULT_MODEL_NAME,
+    fallback_provider: str = DEFAULT_FALLBACK_PROVIDER,
+    fallback_name: str = DEFAULT_FALLBACK_NAME,
     rotate_key: bool = False,
 ) -> SeedCanaryResult:
     """Create-or-reuse the canary service account, key and agent.
@@ -197,7 +220,11 @@ async def seed_canary(
     (same shape as :func:`control_plane.bootstrap_admin.bootstrap_system_admin`).
     """
     spec = load_canary_spec(
-        agent_code=agent_code, model_provider=model_provider, model_name=model_name
+        agent_code=agent_code,
+        model_provider=model_provider,
+        model_name=model_name,
+        fallback_provider=fallback_provider,
+        fallback_name=fallback_name,
     )
     async with bypass_rls_session():
         if await tenants.get(tenant_id=tenant_id) is None:
@@ -318,6 +345,8 @@ async def _amain(args: argparse.Namespace) -> int:
             agent_code=args.agent_code,
             model_provider=args.model_provider,
             model_name=args.model_name,
+            fallback_provider=args.fallback_provider,
+            fallback_name=args.fallback_name,
             rotate_key=args.rotate_key,
         )
     except SeedCanaryError as exc:
@@ -359,6 +388,20 @@ def main() -> None:
         "--model-name",
         default=DEFAULT_MODEL_NAME,
         help=f"Manifest model.name (default: {DEFAULT_MODEL_NAME}).",
+    )
+    parser.add_argument(
+        "--fallback-provider",
+        default=DEFAULT_FALLBACK_PROVIDER,
+        help=(
+            "Fallback model.provider — a DIFFERENT provider the environment "
+            "also has a platform key for, so a primary 429/outage doesn't red "
+            f"the release gate (default: {DEFAULT_FALLBACK_PROVIDER})."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-name",
+        default=DEFAULT_FALLBACK_NAME,
+        help=f"Fallback model.name (default: {DEFAULT_FALLBACK_NAME}).",
     )
     parser.add_argument(
         "--rotate-key",

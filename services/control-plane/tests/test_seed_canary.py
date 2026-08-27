@@ -60,16 +60,33 @@ def test_canary_manifest_never_pauses() -> None:
 
 def test_canary_manifest_relies_on_platform_key() -> None:
     """Same contract as the canonical agent: no pinned ``api_key_ref`` — the
-    provider key comes from the platform credential."""
+    provider key comes from the platform credential (primary AND fallback)."""
     spec = load_canary_spec()
     assert spec.spec.model.api_key_ref is None
-    assert spec.spec.model.fallback == []
+    assert all(f.api_key_ref is None for f in spec.spec.model.fallback)
+
+
+def test_canary_manifest_declares_one_cross_provider_fallback() -> None:
+    """Exactly one fallback on a DIFFERENT provider (2026-08-27 拍板): a
+    transient primary 429/outage must not red the release gate — the canary's
+    assertions ride on deterministic sandbox output, not on which model
+    answered. Same-provider fallback would share the outage, defeating it."""
+    spec = load_canary_spec()
+    assert len(spec.spec.model.fallback) == 1
+    assert spec.spec.model.fallback[0].provider != spec.spec.model.provider
 
 
 def test_canary_manifest_model_override() -> None:
-    spec = load_canary_spec(model_provider="glm", model_name="glm-4.7")
+    spec = load_canary_spec(
+        model_provider="glm",
+        model_name="glm-4.7",
+        fallback_provider="kimi",
+        fallback_name="kimi-k2.6",
+    )
     assert spec.spec.model.provider == "glm"
     assert spec.spec.model.name == "glm-4.7"
+    assert spec.spec.model.fallback[0].provider == "kimi"
+    assert spec.spec.model.fallback[0].name == "kimi-k2.6"
 
 
 def test_canary_manifest_rejects_unknown_provider() -> None:
