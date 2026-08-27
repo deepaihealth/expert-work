@@ -585,4 +585,18 @@ describe("SettingsMembers — cross-tenant read-only view", () => {
     expect(screen.queryByTestId("members-remove-m-1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("members-purge-m-1")).not.toBeInTheDocument();
   });
+
+  it("renders last_active_at when present and a dash when absent", async () => {
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [
+        { ...activeMember, last_active_at: "2026-08-27T08:00:00Z" },
+        { ...activeMember, id: "m-2", email: "bob@example.com", status: "invited", last_active_at: null },
+      ],
+      total: 2,
+    });
+    renderPage();
+    await screen.findByText("alice@example.com");
+    const expected = new Date("2026-08-27T08:00:00Z").toLocaleString();
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
 });

@@ -2172,6 +2172,7 @@ export interface TranslationKeys {
     col_status: string;
     col_tenant: string;
     col_invited_at: string;
+    col_last_active_at: string;
     col_actions: string;
     cross_tenant_banner: string;
     status_invited: string;
@@ -5405,6 +5406,7 @@ const en: TranslationKeys = {
     col_status: "Status",
     col_tenant: "Tenant",
     col_invited_at: "Invited at",
+    col_last_active_at: "Last active",
     col_actions: "Actions",
     cross_tenant_banner:
       "Cross-tenant view — read-only. Switch to a single tenant to invite or manage members.",

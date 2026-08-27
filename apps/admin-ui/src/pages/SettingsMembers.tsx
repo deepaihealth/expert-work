@@ -342,6 +342,22 @@ export function SettingsMembers() {
             </Text>
           ),
       },
+      {
+        title: t("settings_members.col_last_active_at"),
+        dataIndex: "last_active_at",
+        key: "last_active_at",
+        width: 180,
+        render: (iso: string | null | undefined) =>
+          iso == null ? (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              —
+            </Text>
+          ) : (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {new Date(iso).toLocaleString()}
+            </Text>
+          ),
+      },
       ...(crossTenant
         ? []
         : ([

@@ -25,6 +25,9 @@ export interface TenantMember {
   invited_by: string;
   invited_at: string | null;
   activated_at: string | null;
+  // 最后活跃(2026-08-27)—— 后端 join tenant_user.last_active_at;
+  // invited(未激活)行为 null。
+  last_active_at?: string | null;
   updated_at: string | null;
 }
 
