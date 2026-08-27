@@ -6,6 +6,7 @@ import json
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
+from expert_work.common.spotlight import DATAMARK_GLYPH, spotlight_untrusted, unspotlight
 from orchestrator.tools._worker_events import (
     WORKER_ARGS_EXCERPT,
     WORKER_CONTENT_EXCERPT,
@@ -78,6 +79,83 @@ def test_update_frame_summarizes_ai_and_tool_messages() -> None:
     assert len(tool["tool_result_excerpt"]) == WORKER_RESULT_EXCERPT + 1
 
 
+def test_update_frame_unspotlights_tool_result_excerpt() -> None:
+    # B-25 — a worker's ToolMessage content arrives spotlighted (datamarked +
+    # nonce-fenced, builder._invoke_tool). The frame leaves the platform via
+    # the external SSE/items surface, so the excerpt must carry the tool's
+    # words, not the internal anti-injection wrapping.
+    original = "搜索结果 有效 line-two"
+    msg = ToolMessage(
+        content=spotlight_untrusted(original, nonce="0ce9b28d"),
+        tool_call_id="tc-1",
+        name="http_request",
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    assert tool["tool_result_excerpt"] == original
+    assert "«" not in tool["tool_result_excerpt"]
+    assert DATAMARK_GLYPH not in tool["tool_result_excerpt"]
+    assert "0ce9b28d" not in tool["tool_result_excerpt"]
+
+
+def test_update_frame_unspotlights_before_truncating() -> None:
+    # B-25 — order matters: truncating first would cut the fence in half and
+    # unspotlight's marker regex would no longer match, leaking a partial
+    # fence + every glyph. Long content must be restored, THEN excerpted.
+    original = "w " * 600  # datamark touches every gap; wrapped length ≫ excerpt budget
+    msg = ToolMessage(
+        content=spotlight_untrusted(original, nonce="deadbeef1234"),
+        tool_call_id="tc-1",
+        name="http_request",
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    excerpt = tool["tool_result_excerpt"]
+    assert len(excerpt) == WORKER_RESULT_EXCERPT + 1  # 500 + "…"
+    assert (
+        excerpt
+        == unspotlight(spotlight_untrusted(original, nonce="deadbeef1234"))[:WORKER_RESULT_EXCERPT]
+        + "…"
+    )
+    assert "«" not in excerpt
+    assert "UNTRUSTED" not in excerpt
+    assert DATAMARK_GLYPH not in excerpt
+
+
+def test_update_frame_unspotlights_exec_artifact_streams() -> None:
+    # B-25 — the exec artifact's stdout/stderr also cross the external
+    # surface; if a marked rendering ever lands there, the frame must still
+    # ship clean text (unspotlight is a no-op on already-clean streams).
+    marked_out = spotlight_untrusted("ok done", nonce="n-exec")
+    marked_err = spotlight_untrusted("boom failed", nonce="n-exec")
+    msg = ToolMessage(
+        content=spotlight_untrusted("stdout:\nok done\n\nexit_code: 0", nonce="n-exec"),
+        tool_call_id="tc-1",
+        name="exec_python",
+        artifact={
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "stdout": marked_out,
+            "stderr": marked_err,
+        },
+    )
+    frame = build_worker_update_frame(
+        _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
+    )
+    (tool,) = frame["data"]["messages"]
+    exec_summary = tool["exec"]
+    assert exec_summary["stdout_excerpt"] == "ok done"
+    assert exec_summary["stderr_excerpt"] == "boom failed"
+    assert "«" not in tool["tool_result_excerpt"]
+    assert DATAMARK_GLYPH not in tool["tool_result_excerpt"]
+    assert "n-exec" not in tool["tool_result_excerpt"]
+
+
 def test_update_frame_accepts_single_message_and_generic_type() -> None:
     frame = build_worker_update_frame(
         _IDENT,
@@ -101,8 +179,8 @@ def test_update_frame_no_step_count_key_when_absent() -> None:
 
 def test_update_frame_carries_exec_artifact_summary() -> None:
     # PR-D — a worker's exec_python/bash result keeps its structured fields
-    # (excerpted to the frame's summary budget); the content excerpt alone is
-    # datamark-mangled and unparseable.
+    # (excerpted to the frame's summary budget); the content excerpt loses its
+    # line structure to datamarking (B-25 unspotlight recovers words, not layout).
     msg = ToolMessage(
         content="stdout:▁ 1▁ exit_code:▁ 0",
         tool_call_id="tc-1",
@@ -119,6 +197,8 @@ def test_update_frame_carries_exec_artifact_summary() -> None:
         _IDENT, wseq=1, node="tools", writes={"messages": [msg]}, duration_ms=5
     )
     (tool,) = frame["data"]["messages"]
+    # B-25 — the datamarked content excerpt leaves the frame restored, not raw.
+    assert tool["tool_result_excerpt"] == "stdout: 1 exit_code: 0"
     exec_summary = tool["exec"]
     assert exec_summary["exit_code"] == 0
     assert exec_summary["timed_out"] is False

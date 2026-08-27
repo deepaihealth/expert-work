@@ -2,6 +2,7 @@
 // WorkerTimeline 树。纯函数,防御式:异常帧丢弃不抛。
 // 帧契约见 docs/superpowers/specs/2026-07-19-worker-observability-design.md。
 
+import { cleanUntrusted } from "../pages/agent_detail/playground/untrusted_clean";
 import { serverMsOf } from "./sse_id";
 import type { SseEvent } from "./sessions";
 
@@ -114,7 +115,10 @@ function summarizeMessages(raw: unknown): WorkerMessageSummary[] {
     const msg: WorkerMessageSummary = { type: typeof r.type === "string" ? r.type : "?" };
     if (typeof r.content_excerpt === "string") msg.contentExcerpt = r.content_excerpt;
     if (typeof r.name === "string") msg.name = r.name;
-    if (typeof r.tool_result_excerpt === "string") msg.toolResultExcerpt = r.tool_result_excerpt;
+    // B-25 — 后端已在帧组装处 unspotlight,但已入库的历史帧仍带围栏/▁;
+    // 展示层兜底剥离(cleanUntrusted 对干净文本是 no-op)。
+    if (typeof r.tool_result_excerpt === "string")
+      msg.toolResultExcerpt = cleanUntrusted(r.tool_result_excerpt).text;
     if (Array.isArray(r.tool_calls)) {
       msg.toolCalls = r.tool_calls.flatMap((c) => {
         if (typeof c !== "object" || c === null) return [];
