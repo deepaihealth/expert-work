@@ -83,6 +83,8 @@ export function McpToolPicker({
   const [toolQuery, setToolQuery] = useState<Record<string, string>>({});
   // The server whose tool-selection sub-modal is open (null = closed).
   const [modalServer, setModalServer] = useState<ServerRow | null>(null);
+  // "only selected" filter inside the tool sub-modal; reset on every open.
+  const [onlySelected, setOnlySelected] = useState(false);
 
   // ── Load selectable servers (source-dependent) ───────────────────────────
   useEffect(() => {
@@ -307,6 +309,7 @@ export function McpToolPicker({
                         aria-label={t("agent_form.mcp_choose_tools")}
                         onClick={() => {
                           fetchTools(row);
+                          setOnlySelected(false);
                           setModalServer(row);
                         }}
                       />
@@ -326,6 +329,10 @@ export function McpToolPicker({
 
       <Modal
         open={modalServer !== null}
+        // 反馈(2026-08-27):默认 520 宽读长描述太挤——放宽到 880,窄屏由
+        // maxWidth 兜底;列表相应加高(62vh)。
+        width={880}
+        style={{ maxWidth: "94vw" }}
         title={
           modalServer
             ? `${modalServer.label} · ${t("agent_form.mcp_choose_tools")}`
@@ -372,9 +379,12 @@ export function McpToolPicker({
     }
     const tools = state.tools;
     const tq = (toolQuery[row.name] ?? "").trim().toLowerCase();
-    const shown = tq
+    const byQuery = tq
       ? tools.filter((x) => x.name.toLowerCase().includes(tq))
       : tools;
+    const shown = onlySelected
+      ? byQuery.filter((x) => allowTools.includes(x.name))
+      : byQuery;
     const selectedCount = tools.filter((x) =>
       allowTools.includes(x.name),
     ).length;
@@ -391,7 +401,7 @@ export function McpToolPicker({
             onChange={(e) =>
               setToolQuery((prev) => ({ ...prev, [row.name]: e.target.value }))
             }
-            style={{ width: 180 }}
+            style={{ width: 240 }}
           />
           <Button
             size="small"
@@ -407,13 +417,22 @@ export function McpToolPicker({
           >
             {t("agent_form.mcp_clear")}
           </Button>
+          <Checkbox
+            data-testid={`af-mcp-only-selected-${row.name}`}
+            checked={onlySelected}
+            onChange={(e) => setOnlySelected(e.target.checked)}
+          >
+            <Text style={{ fontSize: 12 }}>
+              {t("agent_form.mcp_only_selected")}
+            </Text>
+          </Checkbox>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("agent_form.mcp_selected_count", { count: selectedCount })}
           </Text>
         </Space>
         <div
           style={{
-            maxHeight: "50vh",
+            maxHeight: "62vh",
             overflowY: "auto",
             display: "flex",
             flexDirection: "column",
@@ -449,7 +468,6 @@ export function McpToolPicker({
                         WebkitLineClamp: 2,
                         WebkitBoxOrient: "vertical",
                         fontSize: 12,
-                        maxWidth: 480,
                         overflow: "hidden",
                       }}
                     >
