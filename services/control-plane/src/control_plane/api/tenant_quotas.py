@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from control_plane.api._authz import console_only, require
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.tenant_scope import (
     applied_scope,
     cross_tenant_query_enabled,
@@ -34,6 +35,21 @@ def _get_repo(request: Request) -> TenantQuotaStore:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+async def _invalidate_quota_rules(request: Request, tenant_id: UUID) -> None:
+    """PR-E3b — a quota-rule write must reach the admission path NOW.
+
+    The QuotaService caches resolved rows for 60s (``_quota_cache``); before
+    this fix neither pod dropped it, so a new/deleted rule took up to 60s to
+    bite even on the writing instance. Local evict + bus broadcast (peers run
+    the same eviction via the ``quota_rules`` handler)."""
+    quota_service = getattr(request.app.state, "quota_service", None)
+    if quota_service is not None:
+        quota_service.invalidate_tenant(tenant_id)
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        await bus.publish(InvalidationEvent(kind="quota_rules", tenant_id=str(tenant_id)))
 
 
 def build_tenant_quotas_router() -> APIRouter:
@@ -101,6 +117,7 @@ def build_tenant_quotas_router() -> APIRouter:
                 patch=payload,
                 updated_by=principal.subject_id,
             )
+        await _invalidate_quota_rules(request, scope.tenant_id)
         await emit(
             audit,
             tenant_id=scope.tenant_id,
@@ -145,6 +162,7 @@ def build_tenant_quotas_router() -> APIRouter:
                     "message": "tenant_quota row not found for this tenant",
                 },
             )
+        await _invalidate_quota_rules(request, scope.tenant_id)
         await emit(
             audit,
             tenant_id=scope.tenant_id,

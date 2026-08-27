@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_quality_config import (
     EffectiveQualityConfig,
     PlatformQualityConfigService,
@@ -119,6 +120,7 @@ def build_platform_quality_config_router() -> APIRouter:
     @router.put("")
     async def put_platform_quality_config(
         payload: PlatformQualityConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         service: Annotated[PlatformQualityConfigService, Depends(_get_service)],
         secrets_service: Annotated[PlatformSecretsService, Depends(_get_secrets_service)],
@@ -174,6 +176,12 @@ def build_platform_quality_config_router() -> APIRouter:
                 updated_by=principal.subject_id,
             )
         )
+
+        # PR-E3b — ``put`` already invalidated THIS pod's cache; broadcast so
+        # peer replicas drop theirs too (the quality workers re-read it).
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_quality"))
 
         await emit(
             audit,

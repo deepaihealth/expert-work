@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_delegation_config import (
     DelegationConfig,
     PlatformDelegationConfigService,
@@ -81,6 +82,7 @@ def build_platform_delegation_config_router() -> APIRouter:
     @router.put("")
     async def put_platform_delegation_config(
         payload: PlatformDelegationConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         service: Annotated[PlatformDelegationConfigService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -90,6 +92,11 @@ def build_platform_delegation_config_router() -> APIRouter:
             max_concurrent_delegations=payload.max_concurrent_delegations,
             updated_by=principal.subject_id,
         )
+        # PR-E3b — ``put`` already invalidated THIS pod's cache; broadcast so
+        # peer replicas drop theirs too (the capacity callable re-reads it).
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_delegation"))
         await emit(
             audit,
             tenant_id=principal.tenant_id,

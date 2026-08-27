@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
 from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import (
@@ -72,11 +73,17 @@ def _get_agent_runtime(request: Request) -> object:
     return getattr(request.app.state, "agent_runtime", None)
 
 
-def _invalidate_agents(agent_runtime: object) -> None:
+def _invalidate_agents(request: Request, agent_runtime: object) -> None:
     """Evict every cached built-agent so inheriting forks re-resolve against the
-    updated template base (and re-apply the security floor) on next build."""
+    updated template base (and re-apply the security floor) on next build.
+
+    PR-E3b — also broadcast an ``agent_template`` event so peer replicas drop
+    their build caches too (self-delivery re-runs the eviction; harmless)."""
     if agent_runtime is not None:
         agent_runtime.invalidate_all()  # type: ignore[attr-defined]
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        bus.publish_soon(InvalidationEvent(kind="agent_template"))
 
 
 def _public(record: PlatformAgentTemplateRecord) -> dict[str, object]:
@@ -162,6 +169,7 @@ def build_agent_templates_router() -> APIRouter:
     @router.post("", status_code=201)
     async def create_template(
         payload: PlatformAgentTemplateUpsert,
+        request: Request,
         principal: Annotated[Principal, Depends(require("agent_template", "write"))],
         store: Annotated[PlatformAgentTemplateStore, Depends(_get_template_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -180,7 +188,7 @@ def build_agent_templates_router() -> APIRouter:
                 },
             ) from exc
         await _emit(audit, principal, AuditAction.AGENT_TEMPLATE_CREATE, record)
-        _invalidate_agents(agent_runtime)
+        _invalidate_agents(request, agent_runtime)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.get("")
@@ -215,6 +223,7 @@ def build_agent_templates_router() -> APIRouter:
         name: Annotated[str, Path()],
         version: Annotated[str, Path()],
         payload: AgentSpec,
+        request: Request,
         principal: Annotated[Principal, Depends(require("agent_template", "write"))],
         store: Annotated[PlatformAgentTemplateStore, Depends(_get_template_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -239,7 +248,7 @@ def build_agent_templates_router() -> APIRouter:
                 detail={"code": "TEMPLATE_NOT_FOUND", "message": "not found"},
             )
         await _emit(audit, principal, AuditAction.AGENT_TEMPLATE_UPDATE, record)
-        _invalidate_agents(agent_runtime)
+        _invalidate_agents(request, agent_runtime)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.patch("/{name}/{version}")
@@ -247,6 +256,7 @@ def build_agent_templates_router() -> APIRouter:
         name: Annotated[str, Path()],
         version: Annotated[str, Path()],
         patch: PlatformAgentTemplatePatch,
+        request: Request,
         principal: Annotated[Principal, Depends(require("agent_template", "write"))],
         store: Annotated[PlatformAgentTemplateStore, Depends(_get_template_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -261,13 +271,14 @@ def build_agent_templates_router() -> APIRouter:
             )
         await _emit(audit, principal, AuditAction.AGENT_TEMPLATE_UPDATE, record)
         # A status flip (publish/unpublish) changes @latest resolution → invalidate.
-        _invalidate_agents(agent_runtime)
+        _invalidate_agents(request, agent_runtime)
         return {"success": True, "data": _public(record), "error": None}
 
     @router.delete("/{name}/{version}", status_code=204)
     async def delete_template(
         name: Annotated[str, Path()],
         version: Annotated[str, Path()],
+        request: Request,
         principal: Annotated[Principal, Depends(require("agent_template", "delete"))],
         store: Annotated[PlatformAgentTemplateStore, Depends(_get_template_store)],
         agent_spec: Annotated[AgentSpecStore, Depends(_get_agent_spec_store)],
@@ -308,7 +319,7 @@ def build_agent_templates_router() -> APIRouter:
             trace_id=current_trace_id_hex(),
             details={"name": name, "version": version, "dependents_checked": True},
         )
-        _invalidate_agents(agent_runtime)
+        _invalidate_agents(request, agent_runtime)
 
     return router
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_secrets import PlatformSecretsService
 from expert_work.common.observability import current_trace_id_hex
@@ -118,6 +119,7 @@ def build_platform_judge_config_router() -> APIRouter:
     @router.put("")
     async def put_platform_judge_config(
         payload: PlatformJudgeConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         judge_config_service: Annotated[
             PlatformJudgeConfigService, Depends(_get_judge_config_service)
@@ -172,6 +174,19 @@ def build_platform_judge_config_router() -> APIRouter:
             judge_model=payload.judge_model,
             updated_by=principal.subject_id,
         )
+
+        # PR-E3b bug fix — the judge is baked into ``BuiltAgent`` at build
+        # time (``_make_output_judge`` / ``_make_action_judge``): clearing the
+        # 30s config cache alone leaves every already-built agent judging with
+        # the OLD model until the 1800s build TTL, even on a single pod. Drop
+        # the build layer locally, then broadcast so peer replicas do both
+        # (the ``platform_judge`` handler encodes the same two layers).
+        runtime = getattr(request.app.state, "agent_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_all()
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_judge"))
 
         await emit(
             audit,

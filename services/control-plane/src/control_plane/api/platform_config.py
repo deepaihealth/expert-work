@@ -34,6 +34,7 @@ from control_plane.api.tenant_config import (
     _tool_usage_counts,
 )
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_secrets import PlatformSecretsService
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import bypass_rls_session
@@ -141,7 +142,10 @@ def _invalidate_built_agents(request: Request, *, tenant_id: UUID | None = None)
     """凭据轮换后清 built-agent 缓存 —— 轮换是同 ref 原地覆写值
     (``_canonical_secret_name`` 对同 (provider,key_id) 恒同 slot),ref 比对
     发现不了,已构建 agent 里烤住的旧明文 key 只能靠显式失效清掉。
-    同时清 secret 值缓存(T3 落地后 ``app.state`` 上才有,getattr 兜底)。"""
+    同时清 secret 值缓存(T3 落地后 ``app.state`` 上才有,getattr 兜底)。
+
+    PR-E3b — 本地失效之外再广播一条 ``platform_secrets`` 事件,让对端副本
+    做同样的清理(总线 handler 内联同样的三层;自投递双打无害)。"""
     runtime = getattr(request.app.state, "agent_runtime", None)
     cache = getattr(request.app.state, "credential_value_cache", None)
     if tenant_id is None:
@@ -154,6 +158,14 @@ def _invalidate_built_agents(request: Request, *, tenant_id: UUID | None = None)
             runtime.invalidate_tenant(tenant_id)
         if cache is not None:
             cache.invalidate_tenant(tenant_id)
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        bus.publish_soon(
+            InvalidationEvent(
+                kind="platform_secrets",
+                tenant_id=str(tenant_id) if tenant_id is not None else None,
+            )
+        )
 
 
 async def _require_tenant(request: Request, tenant_id: UUID) -> None:

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.protocol import AuditAction, Principal
@@ -71,12 +72,25 @@ def build_platform_tool_budget_config_router() -> APIRouter:
     @router.put("")
     async def put_platform_tool_budget_config(
         payload: PlatformToolBudgetConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         service: Annotated[PlatformToolBudgetConfigService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
         """Set the platform tool-budget on/off. system_admin-only."""
         await service.put(enabled=payload.enabled, updated_by=principal.subject_id)
+        # PR-E3b bug fix — the switch is resolved at BUILD time and baked into
+        # ``BuiltAgent`` (``platform_tool_budget_enabled``): without dropping
+        # the build layer the flip only reaches new builds, so existing agents
+        # keep the old value until the 1800s build TTL, even on a single pod.
+        # Local evict + broadcast (the ``platform_tool_budget`` handler
+        # encodes the same two layers for peer replicas).
+        runtime = getattr(request.app.state, "agent_runtime", None)
+        if runtime is not None:
+            runtime.invalidate_all()
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_tool_budget"))
         await emit(
             audit,
             tenant_id=principal.tenant_id,

@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_dynamic_worker_config import (
     DynamicWorkerConfig,
     PlatformDynamicWorkerConfigService,
@@ -87,6 +88,7 @@ def build_platform_dynamic_worker_config_router() -> APIRouter:
     @router.put("")
     async def put_platform_dynamic_worker_config(
         payload: PlatformDynamicWorkerConfigWrite,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         service: Annotated[PlatformDynamicWorkerConfigService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -98,6 +100,11 @@ def build_platform_dynamic_worker_config_router() -> APIRouter:
             max_iterations=payload.max_iterations,
             updated_by=principal.subject_id,
         )
+        # PR-E3b — ``put`` already invalidated THIS pod's cache; broadcast so
+        # peer replicas drop theirs too (limits are re-read per run).
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="platform_dynamic_worker"))
         await emit(
             audit,
             tenant_id=principal.tenant_id,

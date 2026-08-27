@@ -30,6 +30,7 @@ from control_plane.api.first_admin import (
     provision_first_admin,
 )
 from control_plane.audit import emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.keycloak import KeycloakAdminClient
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
@@ -344,6 +345,7 @@ def build_tenants_router() -> APIRouter:
         status: str,
         action: AuditAction,
         *,
+        request: Request,
         principal: Principal,
         repo: TenantConfigStore,
         audit: AuditLogger,
@@ -373,9 +375,13 @@ def build_tenants_router() -> APIRouter:
                 resource_id=str(tenant_id),
                 trace_id=current_trace_id_hex(),
             )
-        # Immediate effect on the writing instance; other replicas pick it up
-        # within the cache TTL.
+        # Immediate effect on the writing instance; PR-E3b broadcasts so peer
+        # replicas drop their TTL cache immediately too (Redis-down degrades
+        # back to the TTL bound).
         status_svc.invalidate(tenant_id)
+        bus = getattr(request.app.state, "invalidation_bus", None)
+        if bus is not None:
+            await bus.publish(InvalidationEvent(kind="tenant_status", tenant_id=str(tenant_id)))
         return {
             "success": True,
             "data": {"tenant_id": str(tenant_id), "status": status},
@@ -388,6 +394,7 @@ def build_tenants_router() -> APIRouter:
     )
     async def deactivate_tenant(
         tenant_id: UUID,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         repo: Annotated[TenantConfigStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -401,6 +408,7 @@ def build_tenants_router() -> APIRouter:
             tenant_id,
             "suspended",
             AuditAction.TENANT_DEACTIVATE,
+            request=request,
             principal=principal,
             repo=repo,
             audit=audit,
@@ -427,6 +435,7 @@ def build_tenants_router() -> APIRouter:
     )
     async def activate_tenant(
         tenant_id: UUID,
+        request: Request,
         principal: Annotated[Principal, Depends(_principal)],
         repo: Annotated[TenantConfigStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -437,6 +446,7 @@ def build_tenants_router() -> APIRouter:
             tenant_id,
             "active",
             AuditAction.TENANT_ACTIVATE,
+            request=request,
             principal=principal,
             repo=repo,
             audit=audit,
