@@ -63,6 +63,7 @@ from control_plane.api.skills import (
     _version_dict,
 )
 from control_plane.audit import emit as audit_emit
+from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.threat_patterns import scan_for_threats
@@ -526,6 +527,27 @@ def _get_object_store(request: Request) -> SkillAssetObjectStore | None:
     return getattr(request.app.state, "skill_asset_store", None)
 
 
+async def _invalidate_platform_skills(request: Request) -> None:
+    """Evict every built agent after a platform-skill write (PR-E3b).
+
+    Platform skills are the all-tenant fallback of the build-time skill
+    resolver (``runtime.make_skill_resolver``), and skill content is baked
+    into ``BuiltAgent`` at build time — without this, an edit is invisible
+    even on the writing pod until the build-cache TTL expires. The rows are
+    tenant-less, so the only safe granularity is ``invalidate_all()``.
+    Local eviction first; the bus broadcast is additive (the publisher's own
+    handler re-running locally is harmless). The cross-replica
+    ``platform_skill`` handler lands with PR-E3b-A; until it merges, peers
+    log ``unknown_kind`` and fall back to the build-cache TTL.
+    """
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    if runtime is not None:
+        runtime.invalidate_all()
+    bus = getattr(request.app.state, "invalidation_bus", None)
+    if bus is not None:
+        await bus.publish(InvalidationEvent(kind="platform_skill"))
+
+
 def _http_detail_message(detail: object) -> str:
     """Flatten an ``HTTPException.detail`` (str or structured dict) into a short
     operator-facing reason for a batch result row."""
@@ -585,6 +607,7 @@ def build_platform_skills_router() -> APIRouter:
                 detail=f"platform skill {body.name!r} already exists",
             ) from exc
 
+        await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -667,6 +690,7 @@ def build_platform_skills_router() -> APIRouter:
         except SkillNotFoundError as exc:
             raise HTTPException(status_code=404, detail="skill not found") from exc
 
+        await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -703,7 +727,7 @@ def build_platform_skills_router() -> APIRouter:
         store = _get_skill_store(request)
         audit = _get_audit(request)
         blob = await file.read()
-        return await _ingest_platform_skill_blob(
+        response = await _ingest_platform_skill_blob(
             blob=blob,
             store=store,
             audit=audit,
@@ -711,6 +735,11 @@ def build_platform_skills_router() -> APIRouter:
             source="zip_import",
             object_store=_get_object_store(request),
         )
+        # 200 = idempotent re-import (identical content_hash, no write) —
+        # nothing changed, so the build cache stays.
+        if response.status_code == 201:
+            await _invalidate_platform_skills(request)
+        return response
 
     @router.post("/import-from-github", response_model=None)
     async def import_platform_skill_from_github(
@@ -746,7 +775,7 @@ def build_platform_skills_router() -> APIRouter:
             raise HTTPException(status_code=exc.status, detail=detail) from exc
 
         origin = f"{src.owner}/{src.repo}@{src.ref}" + (f"#{src.skill}" if src.skill else "")
-        return await _ingest_platform_skill_blob(
+        response = await _ingest_platform_skill_blob(
             blob=blob,
             store=store,
             audit=audit,
@@ -755,6 +784,10 @@ def build_platform_skills_router() -> APIRouter:
             origin=origin,
             object_store=_get_object_store(request),
         )
+        # 200 = idempotent re-import (no write) — see ``import_platform_skill``.
+        if response.status_code == 201:
+            await _invalidate_platform_skills(request)
+        return response
 
     @router.post("/list-github-skills", response_model=None)
     async def list_github_skills(
@@ -856,6 +889,11 @@ def build_platform_skills_router() -> APIRouter:
                 }
             )
 
+        # One invalidation for the whole batch (never per skill), and only
+        # when at least one skill actually wrote a version ("exists" is the
+        # idempotent no-op, "failed" wrote nothing).
+        if any(r["status"] == "created" for r in results):
+            await _invalidate_platform_skills(request)
         return JSONResponse(status_code=200, content={"results": results})
 
     @router.patch("/{skill_id}", response_model=None)
@@ -947,6 +985,9 @@ def build_platform_skills_router() -> APIRouter:
                     },
                 )
 
+        # One invalidation covers whichever of the status/pinned/category
+        # branches ran (the 422 guard above rules out an empty patch).
+        await _invalidate_platform_skills(request)
         return JSONResponse(status_code=200, content=_skill_dict(updated))
 
     @router.get("/categories", response_model=None)
@@ -1023,6 +1064,10 @@ def build_platform_skills_router() -> APIRouter:
                 update_category=update_category,
                 new_category=new_category,
             )
+        # One invalidation for the whole bulk write (never per row); zero
+        # affected rows changed nothing, so the build cache stays.
+        if updated:
+            await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -1238,6 +1283,7 @@ def build_platform_skills_router() -> APIRouter:
                 high_risk=new_high_risk,
             )
 
+        await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -1309,6 +1355,7 @@ def build_platform_skills_router() -> APIRouter:
                 high_risk=new_high_risk,
             )
 
+        await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
@@ -1461,6 +1508,7 @@ def build_platform_skills_router() -> APIRouter:
                 high_risk=new_high_risk,
             )
 
+        await _invalidate_platform_skills(request)
         await audit_emit(
             audit,
             tenant_id=principal.tenant_id,
