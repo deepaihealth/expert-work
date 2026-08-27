@@ -150,11 +150,30 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
    (幂等;见 skill-packaging.md)。注意:X-6 的 52 个导出包**尚未推过任何
    环境**,物料在导出会话的产出目录,导入前先定位物料并在 test 环境演练一遍;
    不阻塞发布。
+7. **金丝雀 seed(X-14 P1,发布合格判据的前置)**:release.sh 阶段 6 需要
+   `canary-credentials` Secret + 金丝雀 Agent;未 seed 时该阶段只打 WARNING
+   跳过(发布不被打断),seed 后才真正生效。依赖第 5 步(租户 + LLM key)。
+
+   ```sh
+   # 在 control-plane pod 里跑(幂等;--model-provider/--model-name 选一个
+   # 本环境已配置平台 key 的模型,默认 anthropic/claude-sonnet-4-5):
+   kubectl -n expert-work exec -it <control-plane-pod> -- \
+     python -m control_plane.seed_canary --tenant-id <第 5 步租户的 uuid>
+   # CLI 只打印一次 API key 明文,并给出建 Secret 的确切命令(照抄执行):
+   #   kubectl -n expert-work create secret generic canary-credentials \
+   #     --from-literal=api-key='<刚打印的 key>' \
+   #     --from-literal=agent-code='release-canary'
+   # key 明文丢了不可恢复:重跑加 --rotate-key 铸新 key,再重建 Secret。
+   ```
 
 ### 1.7 金丝雀(发布合格判据)
 
-手动跑一条真 run(来源 ROADMAP X-14 P1 的判据,自动化进 release.sh 未做,
-首发手动;canonical-agent-e2e-test.md 是全量 SOP,以下是首发最小闭环):
+**已自动化为 release.sh 阶段 6**(X-14 P1):`tools/deploy/canary.py` 在
+control-plane pod 里跑一条真 run(exec_python + write_file + save_artifact +
+产物下载),end 帧 status=success 且产物字节校验通过才算发布成功;红则提示
+rollback.sh。前置是 §1.6.7 的 seed(未 seed 只 WARNING 跳过)。以下手工四步
+**保留为兜底**(canary 红了要定位、或 Secret/seed 链路本身出问题时照做;
+canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 1. 用 §1.6.5 的租户建一个带沙箱工具的 Agent(或导入 test 环境验证过的配置);
 2. 调试台发一条要求「用 exec_python 算个结果,write_file 写 /workspace,
@@ -171,7 +190,8 @@ tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 ```
 
 与 test 同惯例:fresh tag、newTag 变更提交 `chore(deploy)` 记录 PR(**记录里
-写上一版 tag** —— X-14 P5,回滚一键可查)、smoke 全绿 + §1.7 金丝雀后才算完。
+写上一版 tag** —— X-14 P5,回滚一键可查)、smoke 全绿 + 阶段 6 金丝雀绿后才
+算完(金丝雀未 seed 会 WARNING 跳过 —— 先按 §1.6.7 补 seed)。
 发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
 
 ## 3. 回滚
@@ -187,7 +207,8 @@ tools/deploy/rollback.sh prod <上一版 tag>     # 秒级 set image,无确认�
 - ~~单副本~~ 2026-08-26 改多副本首发(2 副本),原风险条目作废;取消传播走心跳 CAS
   最长 ~10s(亚秒化=发布后 invalidation_bus 接线)。
 - 单层租户隔离(RLS 惰性):发布后第一波。
-- 金丝雀未自动化(X-14 P1;P2 钉版卫兵已上 #1317)、配额维度混扣
+- ~~金丝雀未自动化~~(X-14 P1 已自动化为 release.sh 阶段 6;P2 钉版卫兵已上
+  #1317)、配额维度混扣
   (B-19,给第三方配配额前必修)、RPM 静态除法非全局桶(Redis 令牌桶=发布后,
   弹性扩容需与 `EXPERT_WORK_REPLICA_COUNT` 同步改)。触发器投递 CAS 已修(#1314)。
 - retention-cleanup-job / billing-rollup-job / event-log-archive-job /
