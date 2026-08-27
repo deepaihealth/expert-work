@@ -1115,6 +1115,10 @@ const zhCN: TranslationKeys = {
     section_dynamic_workers_help:
       "开启(默认)时,Agent 运行中可按需创建临时子 Agent(spawn_worker 工具),分头并行处理子任务;数量与并发受平台「动态子 Agent 护栏」统一约束。\n需要严格单线、只用一个执行体时关掉。\n示例:研究型 Agent 开,简单问答 Bot 关。\n与下方「子 Agent 委派」的区别:名册是预置的具名委派对象,这里是运行中临时造的通用子 Agent。",
     dynamic_workers_hint: "允许 Agent 运行中按需创建临时子 Agent 分担子任务(默认开启)。",
+    worker_model_label: "临时子 Agent 模型",
+    worker_model_hint:
+      "不配置则临时子 Agent 沿用主模型(含思考档位等全部设置)。配置后临时子 Agent 改用这里的模型 —— 常用于给分头执行的子任务换便宜档。无备用模型链。",
+    worker_model_clear: "清除(沿用主模型)",
     approval_timeout: "审批等待上限(秒)",
     approval_timeout_brief: "审批超时没人处理就自动拒绝",
     approval_timeout_help:
