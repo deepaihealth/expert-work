@@ -83,6 +83,38 @@ async def test_check_with_no_quota_is_unlimited() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalidate_tenant_makes_new_quota_rule_bite_immediately() -> None:
+    # PR-E3b — the resolved quota rows are cached for 60s; a quota-admin write
+    # must call ``invalidate_tenant`` so the new rule bites NOW, not a minute
+    # later (before this PR neither pod dropped the cache).
+    tenant = _tenant()
+    quota_store = InMemoryTenantQuotaStore()
+    svc = InMemoryQuotaService(
+        quota_store=quota_store,
+        reservation_store=InMemoryTokenReservationStore(),
+    )
+    # Cold check with no rules → unlimited, and the empty row set is cached.
+    assert (await svc.check(CheckRequest(tenant_id=tenant, cost=1))).allowed
+    # An admin now adds a burst-1 QPS rule …
+    await _seed(
+        quota_store,
+        tenant,
+        TenantQuotaPatch(dimension=QuotaDimension.QPS, scope={}, limit_value=1, burst=1),
+    )
+    # … which the cached (stale) empty view still ignores (no bucket at all) …
+    stale = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
+    assert stale.allowed
+    assert stale.remaining == {}
+    # … until the cache is dropped: the rule loads, the single burst token is
+    # spent, and the immediate follow-up check is denied.
+    svc.invalidate_tenant(tenant)
+    first = await svc.check(CheckRequest(tenant_id=tenant, cost=1))
+    assert first.allowed
+    assert "qps" in first.remaining
+    assert not (await svc.check(CheckRequest(tenant_id=tenant, cost=1))).allowed
+
+
+@pytest.mark.asyncio
 async def test_check_uses_default_qps_when_configured() -> None:
     tenant = _tenant()
     svc = InMemoryQuotaService(

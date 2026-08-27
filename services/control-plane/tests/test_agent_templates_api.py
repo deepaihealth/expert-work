@@ -354,3 +354,41 @@ async def test_delete_dependents_pagination_and_cap(ctx: _Ctx) -> None:
     detail = resp.json()["detail"]
     assert detail["dependents_total"] == 21
     assert len(detail["dependents"]) == 20
+
+
+# ─── PR-E3b — invalidation-bus broadcast on template writes ────────────────
+
+
+class _SpyRuntimeE3b:
+    def __init__(self) -> None:
+        self.all_calls = 0
+
+    def invalidate_all(self) -> None:
+        self.all_calls += 1
+
+
+class _SpyBusE3b:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_create_template_evicts_locally_and_broadcasts(ctx: _Ctx) -> None:
+    """A template write funnels through ``_invalidate_agents``: local
+    invalidate_all + an ``agent_template`` bus event for peer replicas."""
+    spy_runtime = _SpyRuntimeE3b()
+    spy_bus = _SpyBusE3b()
+    ctx.app.state.agent_runtime = spy_runtime
+    ctx.app.state.invalidation_bus = spy_bus
+    resp = await ctx.client.post(_PREFIX, json=_upsert(), headers=ctx.admin_headers)
+    assert resp.status_code == 201, resp.text
+    assert spy_runtime.all_calls == 1
+    assert len(spy_bus.events) == 1
+    assert spy_bus.events[0].kind == "agent_template"  # type: ignore[attr-defined]
+    assert spy_bus.events[0].tenant_id is None  # type: ignore[attr-defined]

@@ -131,6 +131,52 @@ class _SpyTenantConfig:
         self.calls.append(tenant_id)
 
 
+class _SpySingletonConfig:
+    """Spy for the TTL-cached singleton platform config services
+    (secrets / judge / tool-budget / embedding / dynamic-worker /
+    delegation / quality): sync no-arg ``invalidate``."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invalidate(self) -> None:
+        self.calls += 1
+
+
+class _SpyCredentialCache:
+    def __init__(self) -> None:
+        self.tenant_calls: list[Any] = []
+        self.all_calls = 0
+
+    def invalidate_tenant(self, tenant_id: Any) -> None:
+        self.tenant_calls.append(tenant_id)
+
+    def invalidate_all(self) -> None:
+        self.all_calls += 1
+
+
+class _SpyTenantInvalidate:
+    """Spy for services with sync ``invalidate(tenant_id)`` (tenant_status,
+    the PR-D rate-limit override service)."""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def invalidate(self, tenant_id: Any) -> None:
+        self.calls.append(tenant_id)
+
+
+class _SpyInvalidateTenant:
+    """Spy for services with sync ``invalidate_tenant(tenant_id)``
+    (agent_disable, quota)."""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def invalidate_tenant(self, tenant_id: Any) -> None:
+        self.calls.append(tenant_id)
+
+
 def _metric(name: str, labels: dict[str, str]) -> float:
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
@@ -379,11 +425,20 @@ async def test_tenant_config_handler_hits_config_and_agent_build_layers() -> Non
     tid = uuid4()
     config = _SpyTenantConfig()
     runtime = _SpyRuntime()
-    state = SimpleNamespace(tenant_config_service=config, agent_runtime=runtime)
+    cred_cache = _SpyCredentialCache()
+    state = SimpleNamespace(
+        tenant_config_service=config,
+        agent_runtime=runtime,
+        credential_value_cache=cred_cache,
+    )
     handlers = build_invalidation_handlers(state)
     await handlers["tenant_config"](InvalidationEvent(kind="tenant_config", tenant_id=str(tid)))
     assert config.calls == [tid]
     assert runtime.tenant_calls == [tid]
+    # PR-E3b — a config PUT can swap model_credentials_ref: the tenant's
+    # cached plaintext secret values must drop with the config cache.
+    assert cred_cache.tenant_calls == [tid]
+    assert cred_cache.all_calls == 0
 
 
 @pytest.mark.asyncio
@@ -425,6 +480,185 @@ async def test_agent_build_kind_handlers_hit_runtime() -> None:
     assert runtime.tenant_calls == [tid]
     assert runtime.all_calls == 1
     assert runtime.user_calls == [(tid, "emp-2")]
+
+
+# ---------------------------------------------------------------------------
+# PR-E3b-1 — platform config plane handlers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_platform_secrets_handler_platform_scope_drops_everything() -> None:
+    secrets = _SpySingletonConfig()
+    cred_cache = _SpyCredentialCache()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(
+        platform_secrets_service=secrets,
+        credential_value_cache=cred_cache,
+        agent_runtime=runtime,
+    )
+    handlers = build_invalidation_handlers(state)
+    await handlers["platform_secrets"](InvalidationEvent(kind="platform_secrets"))
+    assert secrets.calls == 1
+    assert cred_cache.all_calls == 1
+    assert cred_cache.tenant_calls == []
+    assert runtime.all_calls == 1
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_platform_secrets_handler_tenant_scope_drops_tenant_only() -> None:
+    tid = uuid4()
+    secrets = _SpySingletonConfig()
+    cred_cache = _SpyCredentialCache()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(
+        platform_secrets_service=secrets,
+        credential_value_cache=cred_cache,
+        agent_runtime=runtime,
+    )
+    handlers = build_invalidation_handlers(state)
+    await handlers["platform_secrets"](
+        InvalidationEvent(kind="platform_secrets", tenant_id=str(tid))
+    )
+    # The resolved-ref cache is a single platform-wide view → always dropped;
+    # the value cache and builds drop only for the overridden tenant.
+    assert secrets.calls == 1
+    assert cred_cache.tenant_calls == [tid]
+    assert cred_cache.all_calls == 0
+    assert runtime.tenant_calls == [tid]
+    assert runtime.all_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "attr"),
+    [
+        ("platform_judge", "platform_judge_config_service"),
+        ("platform_tool_budget", "platform_tool_budget_config_service"),
+    ],
+)
+async def test_build_baked_config_handlers_drop_config_and_all_builds(kind: str, attr: str) -> None:
+    """Judge / tool-budget are resolved at BUILD time and baked into
+    ``BuiltAgent`` — the handler must drop the build layer, not just the 30s
+    config cache (the single-pod bug this PR fixes on the write endpoints)."""
+    config = _SpySingletonConfig()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(**{attr: config, "agent_runtime": runtime})
+    handlers = build_invalidation_handlers(state)
+    await handlers[kind](InvalidationEvent(kind=kind))
+    assert config.calls == 1
+    assert runtime.all_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "attr"),
+    [
+        ("platform_embedding", "platform_embedding_config_service"),
+        ("platform_dynamic_worker", "platform_dynamic_worker_config_service"),
+        ("platform_delegation", "platform_delegation_config_service"),
+        ("platform_quality", "quality_config_service"),
+    ],
+)
+async def test_read_at_use_config_handlers_do_not_touch_builds(kind: str, attr: str) -> None:
+    """These configs are re-read at call/run time — dropping builds for them
+    would be a needless build-cache stampede."""
+    config = _SpySingletonConfig()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(**{attr: config, "agent_runtime": runtime})
+    handlers = build_invalidation_handlers(state)
+    await handlers[kind](InvalidationEvent(kind=kind))
+    assert config.calls == 1
+    assert runtime.all_calls == 0
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["agent_template", "platform_skill"])
+async def test_template_and_skill_kinds_drop_all_builds(kind: str) -> None:
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(agent_runtime=runtime)
+    handlers = build_invalidation_handlers(state)
+    await handlers[kind](InvalidationEvent(kind=kind))
+    assert runtime.all_calls == 1
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_tenant_status_handler_invalidates_tenant_only() -> None:
+    tid = uuid4()
+    status = _SpyTenantInvalidate()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(tenant_status_service=status, agent_runtime=runtime)
+    handlers = build_invalidation_handlers(state)
+    await handlers["tenant_status"](InvalidationEvent(kind="tenant_status", tenant_id=str(tid)))
+    assert status.calls == [tid]
+    # Status is checked per request, not baked into builds — no build eviction.
+    assert runtime.all_calls == 0
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_disable_handler_drops_whole_tenant() -> None:
+    tid = uuid4()
+    disable = _SpyInvalidateTenant()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(agent_disable_service=disable, agent_runtime=runtime)
+    handlers = build_invalidation_handlers(state)
+    await handlers["agent_disable"](InvalidationEvent(kind="agent_disable", tenant_id=str(tid)))
+    assert disable.calls == [tid]
+    assert runtime.all_calls == 0
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_quota_rules_handler_invalidates_quota_service() -> None:
+    tid = uuid4()
+    quota = _SpyInvalidateTenant()
+    runtime = _SpyRuntime()
+    state = SimpleNamespace(quota_service=quota, agent_runtime=runtime)
+    handlers = build_invalidation_handlers(state)
+    await handlers["quota_rules"](InvalidationEvent(kind="quota_rules", tenant_id=str(tid)))
+    assert quota.calls == [tid]
+    assert runtime.all_calls == 0
+    assert runtime.tenant_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_override_handler_calls_future_service_when_wired() -> None:
+    # PR-D introduces ``app.state.tenant_rate_limit_overrides``; the handler
+    # ships now so the vocabulary is complete, and no-ops until it lands
+    # (the unwired case is covered by test_handlers_are_noop_on_unwired_state).
+    tid = uuid4()
+    overrides = _SpyTenantInvalidate()
+    state = SimpleNamespace(tenant_rate_limit_overrides=overrides)
+    handlers = build_invalidation_handlers(state)
+    await handlers["rate_limit_override"](
+        InvalidationEvent(kind="rate_limit_override", tenant_id=str(tid))
+    )
+    assert overrides.calls == [tid]
+
+
+@pytest.mark.asyncio
+async def test_tenant_scoped_new_handlers_ignore_events_without_tenant() -> None:
+    status = _SpyTenantInvalidate()
+    disable = _SpyInvalidateTenant()
+    quota = _SpyInvalidateTenant()
+    overrides = _SpyTenantInvalidate()
+    state = SimpleNamespace(
+        tenant_status_service=status,
+        agent_disable_service=disable,
+        quota_service=quota,
+        tenant_rate_limit_overrides=overrides,
+    )
+    handlers = build_invalidation_handlers(state)
+    for kind in ("tenant_status", "agent_disable", "quota_rules", "rate_limit_override"):
+        await handlers[kind](InvalidationEvent(kind=kind))
+    assert status.calls == []
+    assert disable.calls == []
+    assert quota.calls == []
+    assert overrides.calls == []
 
 
 @pytest.mark.asyncio

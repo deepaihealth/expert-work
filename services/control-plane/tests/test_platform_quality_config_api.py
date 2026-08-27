@@ -172,3 +172,47 @@ async def test_put_emits_audit(admin_client: tuple[AsyncClient, UUID]) -> None:
     entries = list(store._rows.values())
     matched = [e for e in entries if e.action.value == "platform_quality_config:updated"]
     assert matched, "expected a PLATFORM_QUALITY_CONFIG_UPDATED audit row"
+
+
+# ─── PR-E3b — invalidation-bus broadcast on the write endpoint ─────────────
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_put_broadcasts_platform_quality(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """``put`` self-invalidates THIS pod's cache; the endpoint must also
+    broadcast ``platform_quality`` so peer replicas drop theirs."""
+    settings = settings.model_copy(
+        update={
+            "supported_providers": ["qwen"],
+            "platform_provider_credentials": {"qwen": "secret://x"},
+        }
+    )
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    spy_bus = _SpyBus()
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        resp = await client.put(
+            "/v1/platform/quality-config",
+            headers=_headers(admin),
+            json=_valid_payload(),
+        )
+    assert resp.status_code == 200, resp.text
+    assert len(spy_bus.events) == 1
+    assert spy_bus.events[0].kind == "platform_quality"  # type: ignore[attr-defined]

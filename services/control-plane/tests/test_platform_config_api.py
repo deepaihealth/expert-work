@@ -791,3 +791,90 @@ async def test_delete_tenant_tool_ref_mode_leaves_external_secret(
             app, action="platform_credential:tenant_tool_delete", resource_id="web_search"
         )
         assert details["secret_deleted"] is False
+
+
+# ─── PR-E3b — invalidation-bus broadcast on credential writes ──────────────
+
+
+class _SpyRuntime:
+    def __init__(self) -> None:
+        self.tenant_calls: list[UUID] = []
+        self.all_calls = 0
+
+    def invalidate_all(self) -> None:
+        self.all_calls += 1
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        self.tenant_calls.append(tenant_id)
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_platform_put_evicts_locally_and_broadcasts_platform_secrets(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """A platform-level credential write must drop THIS pod's builds and
+    broadcast a tenant-less ``platform_secrets`` event for peer replicas."""
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    spy_runtime = _SpyRuntime()
+    spy_bus = _SpyBus()
+    app.state.agent_runtime = spy_runtime
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            "/v1/platform/credentials/providers/anthropic",
+            json={"secret_ref": "kms://platform/anthropic", "enabled": True},
+            headers=_headers(admin),
+        )
+    assert put.status_code == 200, put.text
+    assert spy_runtime.all_calls == 1
+    assert spy_runtime.tenant_calls == []
+    assert len(spy_bus.events) == 1
+    event = spy_bus.events[0]
+    assert event.kind == "platform_secrets"  # type: ignore[attr-defined]
+    assert event.tenant_id is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_tenant_override_put_broadcasts_platform_secrets_with_tenant(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    tenant_id = await _seed_tenant(app)
+    spy_runtime = _SpyRuntime()
+    spy_bus = _SpyBus()
+    app.state.agent_runtime = spy_runtime
+    app.state.invalidation_bus = spy_bus
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        put = await client.put(
+            f"/v1/platform/credentials/tenants/{tenant_id}/providers/anthropic",
+            json={"value": "sk-ant-TENANT-KEY", "enabled": True},
+            headers=_headers(admin),
+        )
+    assert put.status_code == 200, put.text
+    # Tenant-scoped: only that tenant's builds drop locally …
+    assert spy_runtime.tenant_calls == [tenant_id]
+    assert spy_runtime.all_calls == 0
+    # … and the broadcast carries the tenant so peers do the same.
+    assert len(spy_bus.events) == 1
+    event = spy_bus.events[0]
+    assert event.kind == "platform_secrets"  # type: ignore[attr-defined]
+    assert event.tenant_id == str(tenant_id)  # type: ignore[attr-defined]

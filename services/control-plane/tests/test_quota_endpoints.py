@@ -802,3 +802,82 @@ async def test_release_without_query_param_uses_principal_tenant(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert release.status_code == 204
+
+
+# ─── PR-E3b — quota writes drop the QuotaService cache + broadcast ─────────
+
+
+class _SpyQuotaInvalidate:
+    """Bare spy standing in for the QuotaService on the admin-write path —
+    the quotas router only touches ``invalidate_tenant`` on it."""
+
+    def __init__(self) -> None:
+        self.calls: list[UUID] = []
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        self.calls.append(tenant_id)
+
+
+class _SpyBusE3b:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_quota_upsert_and_delete_invalidate_and_broadcast(
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """PR-E3b bug fix — the QuotaService caches resolved rules for 60s and no
+    write path dropped it (on ANY pod): a new/changed/deleted rule took up to
+    60s to bite. POST and DELETE must both evict locally and broadcast
+    ``quota_rules`` for peer replicas."""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    spy_quota = _SpyQuotaInvalidate()
+    spy_bus = _SpyBusE3b()
+    app.state.quota_service = spy_quota
+    app.state.invalidation_bus = spy_bus
+    token = _admin_token()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        create = await client.post(
+            f"/v1/tenants/{_TENANT}/quotas",
+            headers={"Authorization": f"Bearer {token}"},
+            json=TenantQuotaPatch(
+                dimension=QuotaDimension.QPS, scope={}, limit_value=10, burst=20
+            ).model_dump(mode="json"),
+        )
+        assert create.status_code == 201, create.text
+        assert spy_quota.calls == [_TENANT]
+        assert len(spy_bus.events) == 1
+
+        quota_id = create.json()["data"]["id"]
+        delete = await client.delete(
+            f"/v1/tenants/{_TENANT}/quotas/{quota_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert delete.status_code == 204, delete.text
+        assert spy_quota.calls == [_TENANT, _TENANT]
+        assert len(spy_bus.events) == 2
+
+    for event in spy_bus.events:
+        assert event.kind == "quota_rules"  # type: ignore[attr-defined]
+        assert event.tenant_id == str(_TENANT)  # type: ignore[attr-defined]
