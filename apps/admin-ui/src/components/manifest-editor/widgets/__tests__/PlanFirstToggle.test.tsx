@@ -111,4 +111,26 @@ describe("PlanFirstToggle", () => {
     expect(next.spec?.workflow?.execution_mode).toBeUndefined();
     expect(next.spec?.workflow?.type).toBe("plan_execute");
   });
+
+  it("renders as a FieldRow: help ⓘ present, customized badge only when on", () => {
+    const { rerender } = render(
+      <App><PlanFirstToggle formData={manifest()} onChange={vi.fn()} /></App>,
+    );
+    expect(
+      screen.getByTestId("field-help-workflow.execution_mode"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("field-customized-workflow.execution_mode"),
+    ).not.toBeInTheDocument();
+    const on = manifest({
+      workflow: { type: "plan_execute", execution_mode: "plan_first" },
+    });
+    rerender(
+      <App><PlanFirstToggle formData={on} onChange={vi.fn()} /></App>,
+    );
+    expect(
+      screen.getByTestId("field-customized-workflow.execution_mode"),
+    ).toBeInTheDocument();
+  });
 });
+

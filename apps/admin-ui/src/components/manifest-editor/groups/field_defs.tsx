@@ -145,7 +145,9 @@ export function FieldControl<V extends FieldValue = FieldValue>({
     <Select
       value={stringValue(raw, def.effectiveDefault)}
       aria-label={label}
-      style={{ width: "100%" }}
+      // 定宽而非 100%:FieldRow 一行式布局里 100% 会把右侧「已自定义」徽章
+      // 挤掉行(2026-08-28 用户截图反馈,工作流类型行)。
+      style={{ width: 220 }}
       options={(def.options ?? []).map((opt) => ({
         value: opt,
         label: def.optionLabelKey
@@ -163,7 +165,8 @@ export function FieldControl<V extends FieldValue = FieldValue>({
       mode="tags"
       value={tagsValue(raw, def.effectiveDefault)}
       aria-label={label}
-      style={{ width: "100%" }}
+      style={{ width: "100%", minWidth: 220 }}
+      placeholder={t("manifest_editor.tags_placeholder")}
       onChange={(v: string[]) =>
         onPatch({
           [def.valueKey]: v.length === 0 ? undefined : v,
@@ -203,6 +206,20 @@ export function PolicyFieldList<V extends FieldValue = FieldValue>({
         const impactKey = `${def.i18nKey}_impact`;
         const defaultKey = `${def.i18nKey}_default`;
         const help = i18n.exists(impactKey) ? t(impactKey) : undefined;
+        // select 的说明随所选值变化(2026-08-28 用户反馈,工具调用强制):
+        // 存在 `${i18nKey}_brief_${当前值}` 键则用之,否则回退静态 _brief。
+        const currentValue =
+          typeof raw === "string"
+            ? raw
+            : typeof def.effectiveDefault === "string"
+              ? def.effectiveDefault
+              : undefined;
+        const briefByValueKey =
+          currentValue !== undefined ? `${def.i18nKey}_brief_${currentValue}` : undefined;
+        const brief =
+          briefByValueKey !== undefined && i18n.exists(briefByValueKey)
+            ? t(briefByValueKey)
+            : t(`${def.i18nKey}_brief`);
         const resetHint = i18n.exists(defaultKey)
           ? t(defaultKey)
           : def.effectiveDefault === null
@@ -213,7 +230,7 @@ export function PolicyFieldList<V extends FieldValue = FieldValue>({
             key={def.fieldId}
             fieldId={def.fieldId}
             label={label}
-            brief={t(`${def.i18nKey}_brief`)}
+            brief={brief}
             help={help}
             isDefault={atDefault}
             onReset={() => onPatch({ [def.valueKey]: undefined } as Record<string, V | undefined>)}

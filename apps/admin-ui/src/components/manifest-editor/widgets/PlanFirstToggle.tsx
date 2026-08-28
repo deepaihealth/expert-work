@@ -16,6 +16,7 @@
 import { App, Space, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import { FieldRow } from "../FieldRow";
 import {
   disablePlanFirst,
   enablePlanFirst,
@@ -84,27 +85,25 @@ export function PlanFirstToggle({ formData, onChange }: PlanFirstToggleProps) {
     });
   };
 
+  // FieldRow 同款一行式布局(2026-08-28 用户反馈:原独立块无 ⓘ/无「已
+  // 自定义」/开关孤悬最右,和邻近字段行风格断裂)。「恢复默认」= 关闭。
   return (
-    <div
-      data-testid="plan-first-toggle"
-      data-field-id="workflow.execution_mode"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 12,
-        padding: "8px 0",
-      }}
-    >
-      <div>
-        <Text strong style={{ display: "block" }}>
-          {t("run_budget.plan_first_label")}
-        </Text>
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          {t("run_budget.plan_first_brief")}
-        </Text>
-      </div>
-      <Switch checked={enabled} onChange={handleToggle} />
+    <div data-testid="plan-first-toggle">
+      <FieldRow
+        fieldId="workflow.execution_mode"
+        label={t("run_budget.plan_first_label")}
+        brief={t("run_budget.plan_first_brief")}
+        help={t("run_budget.plan_first_impact")}
+        isDefault={!enabled}
+        onReset={() => handleToggle(false)}
+        resetHint={t("run_budget.plan_first_default")}
+      >
+        <Switch
+          checked={enabled}
+          aria-label={t("run_budget.plan_first_label")}
+          onChange={handleToggle}
+        />
+      </FieldRow>
     </div>
   );
 }

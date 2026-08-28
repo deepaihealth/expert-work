@@ -42,6 +42,7 @@ beforeAll(() => {
         flag_default: "true",
         mode_label: "Mode",
         mode_brief: "How the thing runs",
+        mode_brief_manual: "Manual: you drive every step",
         mode_default: "auto",
         mode_option_auto: "Automatic",
         mode_option_manual: "Manual Mode",
@@ -424,4 +425,24 @@ describe("PolicyFieldList", () => {
 
     expect(onPatch).toHaveBeenLastCalledWith({ labels: undefined });
   });
+
+  it("select brief switches to the per-value key when it exists (fallback to static)", () => {
+    const { rerender } = render(
+      <PolicyFieldList defs={[SELECT_DEF]} values={{ mode: "manual" }} onPatch={vi.fn()} />,
+    );
+    expect(screen.getByText("Manual: you drive every step")).toBeInTheDocument();
+    // 该值无 per-value 键 → 回退静态 _brief
+    rerender(
+      <PolicyFieldList defs={[SELECT_DEF]} values={{ mode: "off" }} onPatch={vi.fn()} />,
+    );
+    expect(screen.getByText("How the thing runs")).toBeInTheDocument();
+  });
+
+  it("tags select carries the shared add-hint placeholder", () => {
+    render(<PolicyFieldList defs={[TAGS_DEF]} values={{}} onPatch={vi.fn()} />);
+    expect(
+      screen.getByText("Type and press Enter to add"),
+    ).toBeInTheDocument();
+  });
 });
+

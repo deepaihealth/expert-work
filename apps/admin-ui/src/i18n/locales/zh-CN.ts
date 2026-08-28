@@ -624,6 +624,7 @@ const zhCN: TranslationKeys = {
     field_impact_label: "影响说明",
     field_customized_badge: "已自定义",
     field_reset: "恢复默认",
+    tags_placeholder: "输入后按回车添加",
     field_reset_hint: "恢复默认：{{value}}",
   },
   run_profile: {
@@ -684,24 +685,25 @@ const zhCN: TranslationKeys = {
     max_no_progress_impact:
       "连续好几步都感觉不到任何实际进展，就提前把这次运行收尾，避免白白浪费步数；设成 0 = 关闭这项检查。\n调大 = 更能容忍正常的重试，不容易误伤；调小 = 更快掐断卡死的循环，但太小容易误伤正常重试，建议设 3-5。\n例：智能体反复调同一个工具却一直拿不到想要的结果，设了这个值就会提前结束运行，而不是持续空转浪费步数。",
     max_no_progress_default: "0（关闭）",
+    subhead_structured: "结构化执行",
     subhead_time: "时间与花费",
-    run_deadline_label: "运行最长耗时",
-    run_deadline_brief: "这次运行最多能跑多久",
+    run_deadline_label: "运行最长耗时（秒）",
+    run_deadline_brief: "最多跑多久（0=平台默认 1 小时）",
     run_deadline_impact:
       "这次运行最多能跑多久（秒），包含它中途叫起的子智能体；超过就会被强制中止，防止某次运行意外超时、造成费用失控。\n注意 0 并不是「不限制」的意思——不设置时会套用平台统一的默认上限（目前 3600 秒，也就是 1 小时，由运维配置）；想跑更久或者想精确控制，请在这里显式填一个具体秒数。\n例：一次带联网检索的任务不小心卡在死循环里，设了这个上限就会被强制中止，不会持续消耗费用。",
     run_deadline_default: "0（平台默认 1 小时）",
-    stream_deadline_label: "首 token 超时",
+    stream_deadline_label: "首 token 超时（秒）",
     stream_deadline_brief: "等待首个 token 的最长秒数",
     stream_deadline_impact:
       "从这次调用模型开始，到它返回首个 token 最多等多少秒。默认 180 秒，够写长报告这类慢任务用。它跟下面的「token 间隔超时」不是一回事——那个是从第一个字出现之后才开始算的。\n设成 0 = 不限制（只建议开发调试或跑慢批任务时这么用）。\n例：模型服务偶发卡住无输出，超过这个秒数系统就自动换一个备用模型接着答，避免整个运行原地等待。",
     stream_deadline_default: "180",
-    idle_timeout_label: "token 间隔超时",
+    idle_timeout_label: "token 间隔超时（秒）",
     idle_timeout_brief: "两个字间隔太久就收尾",
     idle_timeout_impact:
       "模型开始输出之后，如果输出停顿超过这个时长，就认为它中途卡住不动了（比如卡死或没反应）。它跟上面的「首 token 超时」不是一回事——那个管的是「开始答之前」的等待，这个管的是「开始答之后」中途的停顿。\n设成 0 = 不限制（只建议开发调试或跑慢批任务时这么用）；不支持流式输出的模型不受这个设置影响。\n例：客服智能体回答到一半模型突然卡死，超过这个时长没有新输出，系统就把已经生成的部分保留下来、提前结束这一轮，避免用户面对卡住的回答等待。",
     idle_timeout_default: "45",
     token_budget_label: "Token 预算",
-    token_budget_brief: "这次运行总共最多花多少 token",
+    token_budget_brief: "整次运行最多花多少 token（0=不限）",
     token_budget_impact:
       "给这次运行定一个花费上限（按 token 数算，包含它中途调起的所有子任务）。花到 80% 时会提醒模型抓紧收尾；额度用完后，会强制模型只用已有信息给出一个结论，不再继续调用工具。\n0 = 不限制。\n例：预算设 20 万 token，花到 16 万时模型会被提醒抓紧收尾，真花完 20 万就只能拿现有信息给结论。",
     token_budget_default: "0（关闭）",
@@ -803,8 +805,8 @@ const zhCN: TranslationKeys = {
     tab_defenses: "防护开关",
     tab_approval: "人工审批",
     tab_network: "网络与工具强制",
-    panel_network: "①网络出网",
-    panel_enforce: "②工具强制",
+    panel_network: "网络出网",
+    panel_enforce: "工具强制",
     egress_label: "出网模式",
     egress_brief: "沙箱怎么连外网的总开关",
     egress_impact:
@@ -828,6 +830,9 @@ const zhCN: TranslationKeys = {
     enforce_impact:
       "会在系统提示词里加一段强制要求：遇到需要实时信息的问题，必须真的调用工具去查、立刻行动，不能凭空编造工具的返回结果。\nauto（默认）= 除了 Claude、GPT 这类本来就很擅长主动调工具的模型，其他模型都会自动加上这段强制要求；on/off = 不管什么模型，强制打开或强制关闭。\n例：新接入一个不太会用工具的模型，auto 模式下不用改配置就能自动获得这层保障。",
     enforce_default: "auto",
+    enforce_brief_auto: "自动：只给不擅长主动调工具的模型加强制要求",
+    enforce_brief_on: "强制开启：所有模型都会被要求真调工具、禁止编造",
+    enforce_brief_off: "强制关闭：任何模型都不加这段强制要求",
     enforce_opt_auto: "自动（默认）",
     enforce_opt_on: "强制开启",
     enforce_opt_off: "强制关闭",
@@ -896,8 +901,8 @@ const zhCN: TranslationKeys = {
     abstain_threshold_brief: "匹配过弱时不注入记忆",
     abstain_threshold_impact:
       "检索后，若最相关记忆与问题的相似度低于此值，则不注入任何记忆，而非塞一个勉强的匹配——避免把关系不大的记忆拉进回答。\n0 = 从不跳过（默认）；约 0.2–0.3 = 跳过明显偏弱的匹配。\n示例：0",
-    panel_injection: "①注入预算",
-    panel_consolidation: "②后台记忆整理",
+    panel_injection: "注入预算",
+    panel_consolidation: "后台记忆整理",
     inj_budget_label: "记忆注入 token 预算",
     inj_budget_brief: "记忆最多能占多少 token",
     inj_budget_impact:
