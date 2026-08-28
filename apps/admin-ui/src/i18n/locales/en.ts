@@ -1507,6 +1507,9 @@ export interface TranslationKeys {
     status_pending: string;
     status_in_progress: string;
     status_completed: string;
+    execution_inline: string;
+    execution_delegate: string;
+    execution_delegate_badge: string;
   };
   run_detail: {
     failed_to_load: string;
@@ -4672,6 +4675,9 @@ const en: TranslationKeys = {
     status_pending: "pending",
     status_in_progress: "in progress",
     status_completed: "completed",
+    execution_inline: "Main agent does it",
+    execution_delegate: "Delegate to workers",
+    execution_delegate_badge: "delegate",
   },
   run_detail: {
     failed_to_load: "Failed to load run",

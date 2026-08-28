@@ -1575,6 +1575,9 @@ const zhCN: TranslationKeys = {
     status_pending: "待办",
     status_in_progress: "进行中",
     status_completed: "已完成",
+    execution_inline: "主智能体自己做",
+    execution_delegate: "委派给子智能体",
+    execution_delegate_badge: "委派",
   },
   run_detail: {
     failed_to_load: "运行加载失败",

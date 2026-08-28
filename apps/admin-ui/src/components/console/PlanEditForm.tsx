@@ -12,7 +12,12 @@ import { Button, Input, Select, Space } from "antd";
 import { Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import type { PlanStep, PlanStepStatus, ThreadPlan } from "../../api/plan";
+import type {
+  PlanStep,
+  PlanStepExecution,
+  PlanStepStatus,
+  ThreadPlan,
+} from "../../api/plan";
 
 export interface PlanEditFormProps {
   draft: ThreadPlan;
@@ -69,6 +74,17 @@ export function PlanEditForm({ draft, onChange }: PlanEditFormProps) {
               { value: "completed", label: t("plan_panel.status_completed") },
             ]}
             data-testid={`plan-step-status-${idx}`}
+          />
+          {/* B-35 — dispatch marker; legacy steps without the field = inline. */}
+          <Select<PlanStepExecution>
+            value={step.execution ?? "inline"}
+            onChange={(execution) => patchStep(idx, { execution })}
+            style={{ width: 170 }}
+            options={[
+              { value: "inline", label: t("plan_panel.execution_inline") },
+              { value: "delegate", label: t("plan_panel.execution_delegate") },
+            ]}
+            data-testid={`plan-step-execution-${idx}`}
           />
           <Button
             icon={<Trash2 size={13} strokeWidth={1.75} />}
