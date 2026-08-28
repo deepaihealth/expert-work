@@ -447,6 +447,9 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-30 | **(三厂商档位对齐 #1308 顺带,2026-08-26)** `kimi-k2.7-code` 上架与否待拍板:官方文档新型号(思考不可关、`thinking.keep` 固定 `"all"` 传其他值报错);上架需 catalog entry + `thinking.keep` 适配层支持(现在不发 keep,K2.6 默认 null 无碍) |
 | B-31 | **(E3b 侦察发现,2026-08-27)credential-proxy 两件套**:① 失效链断头 —— `/admin/cache/invalidate` 全仓无调用方,cache 只靠 60s TTL;现单副本无跨副本陈旧,**扩容前必须**接失效总线(需新增 redis 依赖 + env 注入)或至少接 HTTP 失效;② **`/admin/*` 三端点裸奔无鉴权**,STREAM-F-DESIGN 声称的 mTLS SAN 限制实际不存在——若走 HTTP 失效方案,此洞先补,否则失效入口=可写入口 |
 | B-32 | **(B-19 修复时真 redis 验证顺带发现,pre-existing)redis Lua 桶回填量纲差 1000 倍**:`tokens += elapsed_ms * rate_milli / 1000`,rate_milli=refill_per_s×1000,净效果=elapsed_ms×refill_per_s,少除一次 1000 → 桶回填快 1000 倍(200 容量/50 每秒的桶 4ms 回满),QPS 类配额在 redis 引擎上形同虚设;retry 公式同偏自洽所以从未暴露。in-memory 引擎无此问题(单测全走它,故测试恒绿)。另:慢滴维度小限额 `int(refill_per_s*1000)` 取整为 0 → redis 上这些桶从不回填。修法=Lua 内除回 1000 + 小数率下限,真 redis 集成测试钉住(#1338 PR「遗留观察」节有完整推导)|
+| B-33 | **(kimi 对照真栈发现,2026-08-28)模型个性参数无 catalog 声明**:kimi-k3 只接受 temperature=1,sop2 换模型后旧值 0.9 原样发出→厂商 400 炸 run(#1321 always_thinking 同族问题)。修法=ModelEntry 声明温度约束(固定值/白名单),构建时钳制或略去并 log,别让厂商 400 当校验器 |
+| B-34 | ~~moonshot 严格校验 tool schema,enum-without-type 400~~ **✅ 已修(2026-08-28,PR #1350)**:update_plan/manage_task 四处补显式 type;守卫测试 test_tool_schema_vendor_strict.py 递归扫内置工具 schema。教训=拼给 LLM 的 schema 必过厂商严格校验,别赌宽松(MCP 工具名 wire-safe 同款纪律) |
+| B-35 | **委派增强层 4:per-agent `execution_mode: plan_first`(规划-执行分离)**——把委派从概率变保证的唯一结构解。**启动条件**:层 0-3 上线后真实流量 `expert_work_dynamic_worker_spawned_total` 跑 1-2 周仍趋零。真栈验证结论(2026-08-28,四探针 glm×3+kimi×1):层 0/1/2 机制全部生效(两模型思考原文引用判据、层 1 提醒精准注入),但模型均权衡后选 inline——业界同现象(Claude 自家栈实测 7 跑 0 委派,prompt 层无强制手段)。**先于层 4 的两个零成本杠杆**:①kimi 20+ 工具选择退化(社区实测),sop2 挂 30+ 工具,收敛 MCP 勾选可能直接抬委派率;②员工提问措辞含「分别/并行处理」类词对 kimi 触发委派影响大,可进层 3 生成的领域策略提示 |
 
 ---
 
