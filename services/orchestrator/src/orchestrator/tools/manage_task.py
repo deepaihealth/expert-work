@@ -51,6 +51,7 @@ _PARAMETERS: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {
+            "type": "string",
             "enum": ["create", "list", "update", "cancel"],
             "description": "Which operation to perform.",
         },
@@ -74,6 +75,7 @@ _PARAMETERS: dict[str, Any] = {
             ),
         },
         "frequency": {
+            "type": "string",
             "enum": ["once", "daily", "weekly", "monthly"],
             "description": "How often the task runs. Required on create.",
         },
@@ -91,7 +93,7 @@ _PARAMETERS: dict[str, Any] = {
         },
         "by_day": {
             "type": "array",
-            "items": {"enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]},
+            "items": {"type": "string", "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]},
             "description": "Days of week, for frequency=weekly (e.g. ['WE']).",
         },
         "by_month_day": {
