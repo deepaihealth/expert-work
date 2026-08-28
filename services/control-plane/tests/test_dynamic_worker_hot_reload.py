@@ -51,9 +51,7 @@ def _service() -> PlatformDynamicWorkerConfigService:
     )
 
 
-def _put_defaults(
-    *, max_concurrent: int, max_per_run: int, max_iterations: int
-) -> dict[str, Any]:
+def _put_defaults(*, max_concurrent: int, max_per_run: int, max_iterations: int) -> dict[str, Any]:
     """put() kwargs that change the default tier, keeping the env caps."""
     return {
         "max_concurrent": max_concurrent,
