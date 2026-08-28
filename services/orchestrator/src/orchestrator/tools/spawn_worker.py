@@ -173,7 +173,7 @@ class SpawnWorkerTool:
                 # workspace so it can read the authoritative file itself.
                 "The worker shares your workspace: when the subtask must follow "
                 "conventions or templates kept in workspace files, reference "
-                "them by path (e.g. 'follow style/PLAN_STYLE.md') instead of "
+                "them by path (name the file) instead of "
                 "copying their content into the task — it reads the current "
                 "version itself, and nothing is lost in the retelling. "
                 # B-37 — the reverse direction: a worker's final message lands

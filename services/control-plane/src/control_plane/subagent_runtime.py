@@ -65,7 +65,7 @@ def _worker_system_prompt(role: str | None) -> str:
         "result as your final message — it is reported straight back to the "
         "orchestrator, which sees none of your intermediate work."
         # B-37 —— worker 与编排者共享 per-(tenant,user) 工作区,但此前提示词
-        # 从未说明,worker 拿到「按 style/PLAN_STYLE.md 办」这类路径也可能因为
+        # 从未说明,worker 拿到「按某个约定文件办」这类路径也可能因为
         # 不确定文件在不在自己这边而跳过。点明后「编排者给路径、worker 自己读」
         # 这条路才走得通 —— 且读到的永远是最新版,而非编排者记忆里的版本。
         " You share a persistent workspace with the orchestrator that spawned you: "
@@ -151,8 +151,9 @@ def synthesize_worker_spec(
     that agent's dispatched self. Stripping them left every worker blank in
     the skill dimension (no summaries, no bodies, and — because ``skill_view``
     registers only when at least one skill activated — not even a lookup
-    tool), which is why sop2's "PPT layout" worker had no ``pptx`` skill and
-    had to be handed hand-copied rules in its task text. Matches Claude Code
+    tool), which is why the ai-health-plan agent's "PPT layout" worker had no
+    ``pptx`` skill and had to work off rules hand-copied into its task text.
+    Matches Claude Code
     ("subagents load the same MCP and skill setup") and CrewAI (crew-level
     skills shared by every agent). Cost stays bounded because skills are
     progressive-disclosure: lazy skills contribute one ``<available-skills>``
