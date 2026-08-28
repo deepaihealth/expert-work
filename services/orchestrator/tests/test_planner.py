@@ -305,3 +305,66 @@ async def test_react_graph_without_planner_has_no_plan() -> None:
             config={"configurable": {"thread_id": "react-t1"}},
         )
     assert result.get("plan") is None
+
+
+# ---------------------------------------------------------------------------
+# B-35 — plan_first planner variant (execution markers)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_plan_object_steps_carry_execution() -> None:
+    plan = parse_plan(
+        '{"goal": "g", "steps": ['
+        '{"description": "fetch A", "execution": "delegate"}, '
+        '"decide and write"]}',
+        fallback_goal="fb",
+    )
+    assert plan.steps[0].execution == "delegate"
+    assert plan.steps[0].description == "fetch A"
+    assert plan.steps[1].execution == "inline"
+
+
+def test_parse_plan_bogus_execution_degrades_to_inline() -> None:
+    plan = parse_plan(
+        '{"goal": "g", "steps": [{"description": "a", "execution": "bogus"}]}',
+        fallback_goal="fb",
+    )
+    assert plan.steps[0].execution == "inline"
+
+
+def test_parse_plan_object_step_without_description_dropped() -> None:
+    plan = parse_plan(
+        '{"goal": "g", "steps": [{"execution": "delegate"}, "real"]}',
+        fallback_goal="fb",
+    )
+    assert [s.description for s in plan.steps] == ["real"]
+
+
+@pytest.mark.asyncio
+async def test_plan_first_planner_prompt_asks_for_execution_markers() -> None:
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(
+                content='{"goal": "g", "steps": [{"description": "a", "execution": "delegate"}]}'
+            )
+        ]
+    )
+    node = make_planner_node(llm, plan_first=True)
+    result = await node(_state("do the thing"), {"configurable": {"thread_id": "pf-1"}})
+    system_text = str(llm.calls[0][0].content)
+    assert "execution" in system_text
+    assert "delegate" in system_text
+    # 层 0 形状判据进 planner prompt。
+    assert "independent" in system_text
+    assert result["plan"].steps[0].execution == "delegate"
+
+
+@pytest.mark.asyncio
+async def test_default_planner_prompt_unchanged_without_plan_first() -> None:
+    """standard 模式 planner prompt 零变化(不提 execution)。"""
+    llm = _RecordingLLM(responses=[AIMessage(content='{"goal": "g", "steps": ["a"]}')])
+    node = make_planner_node(llm)
+    await node(_state("do the thing"), {"configurable": {"thread_id": "pf-2"}})
+    system_text = str(llm.calls[0][0].content)
+    assert "execution" not in system_text
+    assert "delegate" not in system_text
