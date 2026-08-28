@@ -145,3 +145,21 @@ def test_worker_model_override_rejects_fallback() -> None:
                 }
             }
         )
+
+
+def test_plan_first_parent_worker_downgraded_to_standard_react() -> None:
+    """B-35 —— worker 是聚焦执行体:不跑分发轮(execution_mode 归 standard),
+    也不再跑一遍 advisory planner(type 归 react,省一次无意义 LLM 调用)。"""
+    parent = _parent(workflow={"type": "plan_execute", "execution_mode": "plan_first"})
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.workflow.execution_mode == "standard"
+    assert w.spec.workflow.type == "react"
+
+
+def test_standard_parent_workflow_type_unchanged() -> None:
+    """开关关着的父(含存量 plan_execute)workflow.type 原样继承 —— 现状行为钉住。"""
+    parent = _parent(workflow={"type": "plan_execute", "max_iterations": 12})
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.workflow.type == "plan_execute"
+    assert w.spec.workflow.execution_mode == "standard"
+    assert w.spec.workflow.max_iterations == 8

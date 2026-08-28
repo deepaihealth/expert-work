@@ -18,6 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field
 #: so existing planner output (which never set a status) is unaffected.
 PlanStepStatus = Literal["pending", "in_progress", "completed"]
 
+#: B-35 — how a step is meant to be executed under ``plan_first``:
+#: ``delegate`` = dispatched to an ephemeral worker via ``spawn_worker``;
+#: ``inline`` (default, and the only behavior outside plan_first) = the
+#: main loop executes it itself. Defaulting keeps every pre-B-35
+#: checkpoint / SSE payload parsing unchanged.
+PlanStepExecution = Literal["delegate", "inline"]
+
 
 class PlanStep(BaseModel):
     """One concrete step of a :class:`Plan`."""
@@ -29,6 +36,10 @@ class PlanStep(BaseModel):
     status: PlanStepStatus = Field(
         default="pending",
         description="Stream CM-0 — execution state, projected to TODO.md.",
+    )
+    execution: PlanStepExecution = Field(
+        default="inline",
+        description="B-35 — plan_first dispatch marker; inert outside plan_first.",
     )
 
 

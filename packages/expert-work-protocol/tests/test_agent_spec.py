@@ -1055,3 +1055,51 @@ def test_display_name_appears_in_the_generated_json_schema() -> None:
     schema = AgentSpec.model_json_schema(by_alias=True)
     body = schema["$defs"]["AgentSpecBody"]["properties"]
     assert "display_name" in body
+
+
+# ---------------------------------------------------------------------------
+# B-35 — workflow.execution_mode (plan_first)
+# ---------------------------------------------------------------------------
+
+
+def test_execution_mode_defaults_to_standard() -> None:
+    """存量 manifest(没有这个字段)反序列化后拿到 standard,行为不变。"""
+    spec = AgentSpec.model_validate(_doc())
+    assert spec.spec.workflow.execution_mode == "standard"
+
+
+def test_plan_first_requires_plan_execute() -> None:
+    doc = _doc()
+    doc["spec"]["workflow"] = {"type": "react", "execution_mode": "plan_first"}
+    with pytest.raises(ValidationError, match="plan_execute"):
+        AgentSpec.model_validate(doc)
+
+
+def test_plan_first_requires_dynamic_workers_enabled() -> None:
+    doc = _doc()
+    doc["spec"]["workflow"] = {"type": "plan_execute", "execution_mode": "plan_first"}
+    doc["spec"]["dynamic_workers"] = {"enabled": False}
+    with pytest.raises(ValidationError, match="dynamic_workers"):
+        AgentSpec.model_validate(doc)
+
+
+def test_plan_first_valid_combination_accepted() -> None:
+    """plan_execute + dynamic_workers 默认开 → plan_first 合法。"""
+    doc = _doc()
+    doc["spec"]["workflow"] = {"type": "plan_execute", "execution_mode": "plan_first"}
+    spec = AgentSpec.model_validate(doc)
+    assert spec.spec.workflow.execution_mode == "plan_first"
+
+
+def test_execution_mode_unknown_value_rejected() -> None:
+    doc = _doc()
+    doc["spec"]["workflow"] = {"type": "plan_execute", "execution_mode": "bogus"}
+    with pytest.raises(ValidationError):
+        AgentSpec.model_validate(doc)
+
+
+def test_execution_mode_appears_in_the_generated_json_schema() -> None:
+    """manifest 编辑器吃 ``AgentSpec.model_json_schema()``,字段必须可见。"""
+    schema = AgentSpec.model_json_schema(by_alias=True)
+    wf = schema["$defs"]["WorkflowSpec"]["properties"]
+    assert "execution_mode" in wf

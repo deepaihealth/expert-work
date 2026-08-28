@@ -820,9 +820,15 @@ async def build_agent(
         context_window=_resolved_context_window(spec.spec.model),
     )
     # Stream J.1 — a ``plan_execute`` manifest front-loads a planner node
-    # that decomposes the task before the ReAct loop runs.
+    # that decomposes the task before the ReAct loop runs. B-35 — the
+    # ``plan_first`` execution mode asks the planner for per-step
+    # ``execution`` markers and turns delegate-facing agent turns into
+    # structured dispatch turns (see ``build_react_graph(plan_first=...)``).
+    plan_first = spec.spec.workflow.execution_mode == "plan_first"
     planner_node = (
-        make_planner_node(routers.planning) if spec.spec.workflow.type == "plan_execute" else None
+        make_planner_node(routers.planning, plan_first=plan_first)
+        if spec.spec.workflow.type == "plan_execute"
+        else None
     )
     # Stream K.K8 + P3 — the plan tool. Implicit (never declared in the
     # manifest). Registered for EVERY workflow so any agent can self-plan
@@ -1092,6 +1098,7 @@ async def build_agent(
         llm_caller=routers.default,
         escalated_llm_caller=escalated_llm_caller,  # CM-9 — None → no escalation
         tool_registry=registry,
+        plan_first=plan_first,  # B-35 — structured dispatch turns
         planner_node=planner_node,
         reflect_node=reflect_node,
         memory_recall_node=memory_recall_node,

@@ -615,6 +615,13 @@ class WorkflowSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["react", "plan_execute", "custom"] = "react"
+    #: B-35(委派增强层 4)— structured plan-first execution. ``plan_first``
+    #: turns the advisory plan into a dispatch discipline: delegate-marked
+    #: plan steps are executed through ``spawn_worker`` in a narrowed
+    #: dispatch turn. Requires ``type: plan_execute`` plus
+    #: ``dynamic_workers.enabled`` — the AgentSpec validator enforces the
+    #: combination (the admin-ui writes the three fields together).
+    execution_mode: Literal["standard", "plan_first"] = "standard"
     # ReAct loop step budget. 12 was an outlier vs comparable agents (deer-flow
     # lead ≈50 agent turns, hermes-agent 90) and starved multi-step research +
     # document-generation tasks (one search/synthesis/PDF run hit the wall mid-
@@ -1435,6 +1442,34 @@ class AgentSpec(BaseModel):
                 msg = f"duplicate trigger name {trig.name!r} in triggers."
                 raise ValueError(msg)
             seen.add(trig.name)
+        return self
+
+    @model_validator(mode="after")
+    def _check_plan_first(self) -> AgentSpec:
+        """B-35 — ``workflow.execution_mode: plan_first`` cross-field invariants.
+
+        plan_first depends on the planner node (``workflow.type:
+        plan_execute``) and on workers being available
+        (``dynamic_workers.enabled``). The admin-ui writes the three
+        fields together (confirm-modal hard link); a hand-authored
+        manifest violating the combination is rejected loudly here —
+        never silently normalised.
+        """
+        wf = self.spec.workflow
+        if wf.execution_mode != "plan_first":
+            return self
+        if wf.type != "plan_execute":
+            msg = (
+                "workflow.execution_mode 'plan_first' requires workflow.type "
+                f"'plan_execute' (got {wf.type!r})."
+            )
+            raise ValueError(msg)
+        if not self.spec.dynamic_workers.enabled:
+            msg = (
+                "workflow.execution_mode 'plan_first' requires "
+                "dynamic_workers.enabled — workers are its execution arm."
+            )
+            raise ValueError(msg)
         return self
 
 

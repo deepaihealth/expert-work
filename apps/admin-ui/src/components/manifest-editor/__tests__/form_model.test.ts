@@ -82,6 +82,8 @@ import {
   setOutputDlp,
   readRunBudget,
   patchRunBudget,
+  enablePlanFirst,
+  disablePlanFirst,
   readContextGates,
   patchContextGates,
   readSecurity,
@@ -2103,5 +2105,42 @@ describe("observability (spec.cache LLM response cache opt-out + policies.trajec
       responseCacheEnabled: false,
       trajectoryRecording: false,
     });
+  });
+});
+
+describe("plan_first (B-35 — workflow.execution_mode + 三字段联动)", () => {
+  it("readRunBudget surfaces workflow.execution_mode", () => {
+    const m = parse(
+      `spec:\n  workflow:\n    type: plan_execute\n    execution_mode: plan_first\n`,
+    );
+    expect(readRunBudget(m).executionMode).toBe("plan_first");
+    expect(readRunBudget({}).executionMode).toBeUndefined();
+  });
+
+  it("patchRunBudget round-trips execution_mode in the workflow block", () => {
+    const m = parse(`spec:\n  workflow:\n    type: plan_execute\n`);
+    const next = patchRunBudget(m, { executionMode: "plan_first" });
+    expect(next.spec?.workflow?.execution_mode).toBe("plan_first");
+    expect(next.spec?.workflow?.type).toBe("plan_execute"); // 未投影键保留
+  });
+
+  it("enablePlanFirst writes the three linked fields in ONE manifest", () => {
+    const m = parse(
+      `spec:\n  workflow:\n    type: react\n  dynamic_workers:\n    enabled: false\n`,
+    );
+    const next = enablePlanFirst(m);
+    expect(next.spec?.workflow?.execution_mode).toBe("plan_first");
+    expect(next.spec?.workflow?.type).toBe("plan_execute");
+    // enabled 默认 true → 联动开启表达为删掉 enabled:false(块空则整块删)。
+    expect(next.spec?.dynamic_workers?.enabled).toBeUndefined();
+  });
+
+  it("disablePlanFirst removes only execution_mode — type 与 workers 不回退", () => {
+    const m = parse(
+      `spec:\n  workflow:\n    type: plan_execute\n    execution_mode: plan_first\n`,
+    );
+    const next = disablePlanFirst(m);
+    expect(next.spec?.workflow?.execution_mode).toBeUndefined();
+    expect(next.spec?.workflow?.type).toBe("plan_execute");
   });
 });

@@ -96,6 +96,7 @@ from expert_work.protocol import (
     AuditResult,
     MemoryItem,
     Plan,
+    PlanStep,
     StructuredOutputSpec,
 )
 from expert_work.runtime.audit.logger import AuditLogger
@@ -193,6 +194,18 @@ logger = logging.getLogger(__name__)
 #: semantics, so ">= 2 non-completed steps" stands in for "has parallelizable
 #: items" — the nudge text explicitly leaves the independence call to the agent.
 _DELEGATION_NUDGE_MIN_PENDING = 2
+
+#: B-35(plan_first 分发轮)— dispatch turns fired / degraded. A high
+#: degraded share means the structural gate is being talked around —
+#: revisit the dispatch instruction (or the model choice).
+_plan_first_dispatch_total = expert_work_counter(
+    "expert_work_plan_first_dispatch_total",
+    "plan_first dispatch turns entered (one per plan version).",
+)
+_plan_first_dispatch_degraded_total = expert_work_counter(
+    "expert_work_plan_first_dispatch_degraded_total",
+    "plan_first dispatch turns degraded to inline after the retry was refused.",
+)
 
 #: Stream HX-12 (Mini-ADR HX-I5) — a promoted tool unused for this many
 #: ReAct steps is dropped from the bind when the compressor fires. Constant
@@ -405,6 +418,12 @@ def build_react_graph(
     llm_caller: LLMCaller,
     tool_registry: ToolRegistry,
     planner_node: PlannerNode | None = None,
+    # B-35 — manifest ``workflow.execution_mode == "plan_first"``: agent
+    # turns facing undone delegate-marked plan steps become dispatch turns
+    # (tools narrowed to spawn_worker + update_plan, hidden instruction
+    # injected; one retry then degrade). ``False`` (default) keeps every
+    # path — and the three dispatch state channels — byte-identical.
+    plan_first: bool = False,
     reflect_node: ReflectNode | None = None,
     memory_recall_node: MemoryNode | None = None,
     memory_writeback_node: MemoryNode | None = None,
@@ -689,6 +708,47 @@ def build_react_graph(
             advisory_message = _build_recovery_advisory(tool_failures)
             messages = [*messages, advisory_message]
             _cm_recovery_advisory_chars.set(len(str(advisory_message.content)))
+        # B-35(plan_first)— structured dispatch turn. When the plan carries
+        # undone delegate-marked steps whose plan version has not been
+        # dispatched yet, THIS turn narrows the tool bind to
+        # {spawn_worker, update_plan} and injects a hidden dispatch
+        # instruction — delegation is guaranteed structurally while task
+        # authoring stays with the LLM. A tool-less reply gets ONE harder
+        # retry, then the turn degrades (full tools restored) so the run
+        # never dies here. ``budget_exhausted`` wins: the wrap-up turn is
+        # never a dispatch turn. ``plan_first=False`` skips the block and
+        # never writes the three dispatch channels — byte-identical.
+        dispatch_active = False
+        dispatch_retries = int(state.get("plan_first_dispatch_retries") or 0)
+        dispatched_hash: str | None = None
+        dispatch_message: HumanMessage | None = None
+        if plan_first and not budget_exhausted and plan is not None:
+            pending_delegate = [
+                s for s in plan.steps if s.execution == "delegate" and s.status != "completed"
+            ]
+            if pending_delegate:
+                d_hash = _dispatch_plan_hash(plan)
+                prev_active = bool(state.get("plan_first_dispatch_active"))
+                last_msg = state["messages"][-1] if state["messages"] else None
+                refused = isinstance(last_msg, AIMessage) and not _extract_tool_calls(last_msg)
+                if d_hash != state.get("plan_first_dispatch_plan_hash"):
+                    dispatch_active = True
+                    dispatched_hash = d_hash
+                    dispatch_retries = 0
+                    dispatch_message = _build_dispatch_instruction(pending_delegate)
+                    _plan_first_dispatch_total.inc()
+                elif prev_active and refused and dispatch_retries == 0:
+                    dispatch_active = True
+                    dispatch_retries = 1
+                    dispatch_message = _build_dispatch_retry()
+                elif prev_active and refused:
+                    dispatch_message = _build_dispatch_degraded()
+                    _plan_first_dispatch_degraded_total.inc()
+                    logger.warning("agent.plan_first_dispatch_degraded")
+            if dispatch_active:
+                tools = [s for s in tools if s.name in _DISPATCH_TOOL_NAMES]
+            if dispatch_message is not None:
+                messages = [*messages, dispatch_message]
         # Stream L.L2 — token preflight + summarise-the-middle. When
         # the prompt would exceed the model's configured threshold the
         # compressor swaps the conversation's middle for a
@@ -1116,6 +1176,10 @@ def build_react_graph(
             persisted_messages: list[BaseMessage] = list(new_messages)
             if advisory_message is not None and advisory_message not in persisted_messages:
                 persisted_messages = [advisory_message, *persisted_messages]
+            # B-35 — persist the dispatch instruction alongside (hidden from
+            # the UI but part of history, same contract as the advisory).
+            if dispatch_message is not None and dispatch_message not in persisted_messages:
+                persisted_messages = [dispatch_message, *persisted_messages]
             # P2 — stamp last: everything above (DLP / structured resend /
             # judge) may have rebound ``response``; stamping earlier would
             # be silently overwritten on the happy path.
@@ -1142,6 +1206,13 @@ def build_react_graph(
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
+            # B-35 — only a plan_first build ever writes the dispatch
+            # channels (off = state shape untouched).
+            if plan_first:
+                update_mw["plan_first_dispatch_active"] = dispatch_active
+                update_mw["plan_first_dispatch_retries"] = dispatch_retries
+                if dispatched_hash is not None:
+                    update_mw["plan_first_dispatch_plan_hash"] = dispatched_hash
             return update_mw
 
         # Stream CM-1 — persist the advisory in conversation history
@@ -1149,6 +1220,9 @@ def build_react_graph(
         emit_messages: list[BaseMessage] = (
             [advisory_message, response] if advisory_message is not None else [response]
         )
+        # B-35 — same persistence contract as the middleware path above.
+        if dispatch_message is not None:
+            emit_messages = [dispatch_message, *emit_messages]
         # P2 — same rationale as the middleware path above: stamp last.
         emit_messages = _stamp_agent_messages(emit_messages, config)
         update_plain: dict[str, Any] = {
@@ -1162,6 +1236,12 @@ def build_react_graph(
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
+        # B-35 — only a plan_first build ever writes the dispatch channels.
+        if plan_first:
+            update_plain["plan_first_dispatch_active"] = dispatch_active
+            update_plain["plan_first_dispatch_retries"] = dispatch_retries
+            if dispatched_hash is not None:
+                update_plain["plan_first_dispatch_plan_hash"] = dispatched_hash
         return update_plain
 
     async def tools_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1539,10 +1619,14 @@ def build_react_graph(
         # When the agent stops issuing tool_calls, route to ``reflect``
         # instead of ending — it critiques and may send the agent back.
         graph.add_node("reflect", reflect_node)  # type: ignore[arg-type]
-        graph.add_conditional_edges("agent", _should_continue, {"tools": "tools", END: "reflect"})
+        graph.add_conditional_edges(
+            "agent", _should_continue, {"tools": "tools", "agent": "agent", END: "reflect"}
+        )
         graph.add_conditional_edges("reflect", _after_reflect, {"agent": "agent", END: end_target})
     else:
-        graph.add_conditional_edges("agent", _should_continue, {"tools": "tools", END: end_target})
+        graph.add_conditional_edges(
+            "agent", _should_continue, {"tools": "tools", "agent": "agent", END: end_target}
+        )
     # Stream J.8 — after ``tools``, a run with ``pending_approval`` set
     # routes straight to END (RunStatus.PAUSED): the checkpoint persists
     # and ``memory_writeback`` is deliberately skipped (the run is paused,
@@ -1836,6 +1920,64 @@ def _plan_identity_hash(plan: Plan) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+#: B-35 — the narrowed tool set of a dispatch turn.
+_DISPATCH_TOOL_NAMES = frozenset({SPAWN_WORKER_TOOL_NAME, "update_plan"})
+
+
+def _dispatch_plan_hash(plan: Plan) -> str:
+    """B-35 — dispatch-turn dedupe identity: goal + step descriptions +
+    execution markers, statuses excluded (progress marking never re-fires
+    a dispatch turn; re-marking a step inline↔delegate does)."""
+    payload = "\n".join([plan.goal, *(f"{s.description}|{s.execution}" for s in plan.steps)])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_dispatch_instruction(pending: list[PlanStep]) -> HumanMessage:
+    """B-35 — the hidden instruction opening a dispatch turn. Same RT-ADR-9
+    form as the 层 1 nudge: an orchestrator-authored ``HumanMessage``
+    persisted into history but marked ``expert_work_hide_from_ui``."""
+    listed = "\n".join(f"- {s.id}. {s.description}" for s in pending)
+    return HumanMessage(
+        content=(
+            "[structured dispatch] The plan marks these steps as "
+            f"execution=delegate:\n{listed}\n"
+            "For THIS turn your tool set is narrowed to spawn_worker and "
+            "update_plan. Dispatch each step above via spawn_worker — "
+            "several calls in parallel where independent — and write every "
+            "task fully self-contained: spell out identifiers, scope, which "
+            "tools to use, and the expected output format. If a step is "
+            "marked delegate wrongly (it involves writes or the final "
+            "decision), re-mark it inline via update_plan instead. "
+            "Inline-marked steps stay with you for later turns."
+        ),
+        additional_kwargs={"expert_work_hide_from_ui": True},
+    )
+
+
+def _build_dispatch_retry() -> HumanMessage:
+    """B-35 — the single harder retry after a tool-less dispatch reply."""
+    return HumanMessage(
+        content=(
+            "[structured dispatch reminder] This dispatch turn requires tool "
+            "calls: call spawn_worker for the delegate-marked steps, or "
+            "update_plan to re-mark them inline. A plain-text reply does not "
+            "advance the run."
+        ),
+        additional_kwargs={"expert_work_hide_from_ui": True},
+    )
+
+
+def _build_dispatch_degraded() -> HumanMessage:
+    """B-35 — dispatch degraded to inline; the run continues normally."""
+    return HumanMessage(
+        content=(
+            "[structured dispatch skipped] No tool calls after a retry — your "
+            "full tool set is restored. Continue executing the plan yourself."
+        ),
+        additional_kwargs={"expert_work_hide_from_ui": True},
+    )
+
+
 def _build_delegation_nudge(pending_count: int) -> HumanMessage:
     """动态子智能体委派增强(层 1)— post-``update_plan`` delegation nudge.
 
@@ -1858,10 +2000,19 @@ def _build_delegation_nudge(pending_count: int) -> HumanMessage:
     )
 
 
-def _should_continue(state: AgentState) -> Literal["tools", "__end__"]:
+def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     last = state["messages"][-1]
     if _extract_tool_calls(last):
         return "tools"
+    # B-35 — a dispatch turn that produced no tool calls must not end the
+    # run (the plan still has undone work): route back to ``agent``, whose
+    # dispatch block either retries once (harder instruction) or degrades
+    # (full tools restored, channel cleared). Bounded: the channel goes
+    # False after the single retry, so this self-loop runs at most twice
+    # per plan version. Non-plan_first builds never write the channel —
+    # this branch is dead for them.
+    if state.get("plan_first_dispatch_active"):
+        return "agent"
     return "__end__"
 
 

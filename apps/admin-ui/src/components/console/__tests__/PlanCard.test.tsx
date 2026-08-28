@@ -108,3 +108,23 @@ describe("PlanCard", () => {
     expect(screen.getByTestId("plan-edit-form")).toBeInTheDocument();
   });
 });
+
+describe("execution marker (B-35)", () => {
+  it("delegate-marked steps carry a delegate badge; inline/legacy steps do not", () => {
+    const plan: ThreadPlan = {
+      goal: "g",
+      steps: [
+        { id: "1", description: "fetch A", status: "pending", execution: "delegate" },
+        { id: "2", description: "decide", status: "pending", execution: "inline" },
+        { id: "3", description: "legacy", status: "pending" },
+      ],
+    };
+    renderCard({ plan });
+    const badges = screen.getAllByTestId("plan-step-delegate-badge");
+    expect(badges).toHaveLength(1);
+    const items = screen.getByTestId("plan-read-view").querySelectorAll("li");
+    expect(items[0].textContent).toContain("delegate");
+    expect(items[1].textContent).not.toContain("delegate");
+    expect(items[2].textContent).not.toContain("delegate");
+  });
+});

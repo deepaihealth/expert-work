@@ -181,7 +181,14 @@ export interface AgentManifest {
     // Group 6 试点(运行预算与超时) — ReAct loop step budget + free-form knobs
     // (early_stop, builder) authored via YAML. The curated form surfaces
     // max_iterations and type (react/plan_execute/custom).
-    workflow?: { max_iterations?: number; type?: string; [k: string]: unknown };
+    // B-35 — execution_mode: "plan_first" turns delegate-marked plan steps
+    // into structured dispatch turns; absent/"standard" = normal execution.
+    workflow?: {
+      max_iterations?: number;
+      type?: string;
+      execution_mode?: string;
+      [k: string]: unknown;
+    };
     // Stream L (P1) — time-to-first-token budget for a single LLM provider
     // call (0 = disabled). Top-level spec key (sibling of policies), not
     // nested under policies.
@@ -867,6 +874,8 @@ export interface RunBudgetFields {
   // workflow.type (react/plan_execute/custom) — RAW reader, no default
   // substitution (the FieldRow widget shows the effective default itself).
   workflowType?: string;
+  // B-35 — workflow.execution_mode (standard/plan_first); undefined = standard.
+  executionMode?: string;
   maxNoProgress?: number;
   runDeadlineS?: number;
   streamDeadlineS?: number;
@@ -878,6 +887,7 @@ export interface RunBudgetFields {
 export const readRunBudget = (m: unknown): RunBudgetFields => ({
   maxIterations: specOf(m).workflow?.max_iterations,
   workflowType: specOf(m).workflow?.type,
+  executionMode: specOf(m).workflow?.execution_mode,
   maxNoProgress: specOf(m).policies?.max_no_progress,
   runDeadlineS: specOf(m).policies?.run_deadline_s,
   streamDeadlineS: specOf(m).stream_deadline_s,
@@ -909,6 +919,7 @@ export function patchRunBudget(
   const workflowPatch: Record<string, unknown> = {};
   if ("maxIterations" in patch) workflowPatch.max_iterations = patch.maxIterations;
   if ("workflowType" in patch) workflowPatch.type = patch.workflowType;
+  if ("executionMode" in patch) workflowPatch.execution_mode = patch.executionMode;
   if (Object.keys(workflowPatch).length > 0) {
     updates.workflow = mergeBlock(spec.workflow, workflowPatch);
   }
@@ -1070,6 +1081,26 @@ export function setDynamicWorkersOn(m: unknown, on: boolean): AgentManifest {
   return patchSpec(m, {
     dynamic_workers: { ...(specOf(m).dynamic_workers ?? {}), enabled: false },
   });
+}
+
+// ---- B-35 plan_first 开关联动 (spec 2026-08-28-plan-first-execution-design §3) ----
+// ``enablePlanFirst`` writes the three hard-linked fields into ONE manifest
+// (single config-history version, diffable): workflow.execution_mode +
+// workflow.type=plan_execute + dynamic_workers enabled (expressed by
+// deleting ``enabled: false`` — the backend default is true, same shape
+// discipline as ``setDynamicWorkersOn``). ``disablePlanFirst`` removes ONLY
+// execution_mode — no rollback of workflow.type / dynamic_workers (the user
+// may have hand-tuned them after enabling; the toggle shows a notice).
+export function enablePlanFirst(m: unknown): AgentManifest {
+  const next = patchRunBudget(m, {
+    executionMode: "plan_first",
+    workflowType: "plan_execute",
+  });
+  return setDynamicWorkersOn(next, true);
+}
+
+export function disablePlanFirst(m: unknown): AgentManifest {
+  return patchRunBudget(m, { executionMode: undefined });
 }
 
 // Worker model override — ``dynamic_workers.model``. Absent = the workers
