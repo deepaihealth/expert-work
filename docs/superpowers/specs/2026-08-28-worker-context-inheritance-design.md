@@ -8,8 +8,8 @@
 
 ### 1.1 实证
 
-测试环境会话 `abf70030-374e-4a51-9def-7dec47d3d04a`(run `d73fc7e3`,sop2-designer
-生成 14 天秋季养生方案):
+测试环境会话 `abf70030-374e-4a51-9def-7dec47d3d04a`(run `d73fc7e3`,**ai-health-plan** 生成
+14 天秋季养生方案 PPT;权威归属查 `thread_meta.agent_name`):
 
 - 主 Agent `list_dir("style")` → `read_file` 读取 `style/PLAN_STYLE.md` 与
   `style/render_plan.py`,随后 **把风格锚整段手抄进 `spawn_worker` 的 task 文本**
@@ -33,10 +33,11 @@
 (`agent_factory.py:945`),技能列表空 → **连按需查询技能的入口都不注册**。
 worker 在技能维度是完全空白:没有摘要、没有正文、没有查询工具。
 
-sop2-designer 绑定 13 个技能,其中包含 **pptx / docx / pdf / xlsx**。做 PPT 的
-worker 一个都拿不到,只能依赖主 Agent 抄来的规则文本工作。
+ai-health-plan 绑定 **19 个技能**,含 **pptx / docx / pdf**、banner-design、
+ui-ux-pro-max 及整套健康分析技能。做 PPT 的 worker 一个都拿不到,只能依赖主
+Agent 抄来的规则文本工作。
 
-**这不是 sop2 一家的问题**:任何绑定了技能并启用动态子 Agent 的租户,其 worker
+**这不是某一家的问题**:任何绑定了技能并启用动态子 Agent 的租户,其 worker
 都处于同一状态。
 
 ### 1.3 现状对照(哪些继承、哪些不继承)
@@ -102,7 +103,7 @@ Cognition 作者修正后的立场:"multi-agent systems work best today when **w
 stay single-threaded** and the additional agents contribute **intelligence
 rather than actions**."
 
-**sop2 现状(worker 出设计方案、主 Agent 渲染落盘)恰好符合这一最佳实践**,
+**观察到的现状(worker 出设计方案、主 Agent 渲染落盘)恰好符合这一最佳实践**,
 但它是「被迫」(worker 没技能渲染不了)而非「设计」。补上技能后应在文档中
 明确:渲染这类写操作继续留主线,技能是为了让 worker 的**设计判断**专业。
 
@@ -131,7 +132,8 @@ rather than actions**."
 
 **成本可控**:技能是渐进披露的。惰性技能(`lazy_load=True`)在提示词里只产生
 一行 `<available-skills>` 摘要,正文需 worker 主动调 `skill_view` 才加载。
-实测 sop2 那 13 个技能全部惰性:常驻约 1–3K 字符,正文合计 9.7 万字符按需拉取。
+实测 ai-health-plan 那 19 个技能全部惰性:常驻约 1–3K 字符;正文合计约 17 万
+字符按需拉取(最大的 ui-ux-pro-max 单个 4.6 万字符)。
 
 **基础设施已就绪**(无需额外接线):`make_worker_build_fn` 调用 `build_agent`
 时已传 `skill_resolver` / `skill_store` / `skill_asset_store` /
@@ -150,7 +152,7 @@ worker 获得按需查询技能正文的入口。
 构建失败。理由正当:配置者显式声明了,静默忽略比失败更糟。
 
 但 worker 的技能是**继承来的、配置者没有为 worker 声明过**,而 worker 常跑
-不同的模型(`dynamic_workers.model`,如 sop2 用 glm-5.3-flash)。若某技能限定了
+不同的模型(`dynamic_workers.model`;实例:主模型 glm-5.3、worker glm-5.3-flash)。若某技能限定了
 父模型,worker 继承它会让**整个委派构建炸掉**——不是少一个技能,是 spawn_worker
 整体失败。
 
@@ -158,8 +160,8 @@ worker 获得按需查询技能正文的入口。
 模型不匹配 / 工具冲突 → **skip + log**,不 raise(与既有 `evolved` 自动挂载
 技能的软失败语义同源)。`build_agent` 透传该参数,worker 构建路径传 `True`。
 
-现状核查:sop2 那 14 个技能版本 `required_models` **全为空**,`tool_names`
-**全为空**,不受影响;风险仅存在于其他租户将来配置的技能。
+现状核查:ai-health-plan 那 19 个技能版本 `required_models` **全为空**,
+`tool_names` **全为空**,不受影响;风险仅存在于将来配置的技能。
 
 ### 4.3 改动三:worker 提示词点明共享工作区
 
@@ -171,7 +173,7 @@ worker 获得按需查询技能正文的入口。
 而跳过。这一句让「主 Agent 给路径、worker 自己读」这条路走得通——读到的永远是
 最新版锚文件,而非主 Agent 记忆里的版本。
 
-这是用户级偏好(跟人走的工作区文件,如 sop2 的 style 锚)这条腿的通路;
+这是用户级偏好(跟人走的工作区文件,如按员工锚定的风格文件)这条腿的通路;
 与 4.1 的 Agent 级约定(跟 Agent 走的技能)构成两层,对应 Claude Code 的
 用户级 / 项目级 CLAUDE.md 分层。
 
@@ -245,6 +247,6 @@ overhead from copying large outputs through conversation history"。
 5. env 阀为 `False` 时 worker spec 的 skills 为空(现状字节级不变)。
 
 真栈层(测试环境,canary 租户探针,**绝不动对接方在用的 agent**):
-6. 派一个绑了 pptx 技能的 canary agent,任务需要 PPT 排版判断;检查 worker 子 run
+6. 派一个绑了 pptx 技能的 canary agent(**不动对接方在用的 agent**),任务需要 PPT 排版判断;检查 worker 子 run
    的事件流中**出现 `skill_view` 调用**(而非 worker 自称用了技能)。
 7. 对照组:同 agent 关闭 env 阀,worker 事件流中无 `skill_view`。
