@@ -16,7 +16,7 @@ import { Alert, Button, Spin, Typography } from "antd";
 import { Download } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { artifactsFromTools } from "../../api/tool_timeline";
+import { turnArtifacts } from "../../api/tool_timeline";
 import type { TurnSummary } from "../../api/turn_summary";
 import { MarkdownView } from "../MarkdownView";
 import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
@@ -67,10 +67,9 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
     }
   }, [segments, status, liveText]);
 
-  const turnArtifacts = useMemo(
-    () => artifactsFromTools(turn.turn.events),
-    [turn.turn.events],
-  );
+  // Worker-registered artifacts only appear in the end frame's snapshot —
+  // ``turnArtifacts`` merges it over the tool-call derivation.
+  const artifacts = useMemo(() => turnArtifacts(turn.turn.events), [turn.turn.events]);
   const [downloadingArtifact, setDownloadingArtifact] = useState<string | null>(null);
   const downloadArtifact = useCallback(
     async (name: string) => {
@@ -195,7 +194,7 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
         </Text>
       ) : null}
 
-      {turnArtifacts.length > 0 && (
+      {artifacts.length > 0 && (
         <div
           style={{
             marginTop: 8,
@@ -209,7 +208,7 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
           <Text type="secondary" style={{ fontSize: 11 }}>
             {t("playground.workspace_artifacts")}:
           </Text>
-          {turnArtifacts.map((a) => (
+          {artifacts.map((a) => (
             <Button
               key={a.name}
               size="small"
