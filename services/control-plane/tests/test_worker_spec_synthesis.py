@@ -237,3 +237,58 @@ async def test_resolve_no_service_requested_clamped_to_boot_fallback() -> None:
     assert await resolve_worker_max_iterations(None, 32, parent=parent) == 32
     parent2 = _parent(dynamic_workers={"max_iterations": 6})
     assert await resolve_worker_max_iterations(None, 32, parent=parent2) == 6
+
+
+# ---------------------------------------------------------------------------
+# B-37 — 子 Agent 技能继承(零配置默认)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_inherits_parent_skills() -> None:
+    """B-37 —— worker 是父 Agent 派出去干活的分身,父绑的技能它该有。
+
+    配置者绑技能的语义是「这个 Agent 需要这些本事和规矩」;剥空会让 worker
+    在技能维度完全空白(连 skill_view 入口都不注册)。对齐 Claude Code
+    「子 Agent 加载同一套 MCP 和技能配置」与 CrewAI crew 级技能全员共享。
+    """
+    parent = _parent(skills=["pptx", "docx", "writing-plans"])
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.skills == ["pptx", "docx", "writing-plans"]
+
+
+def test_worker_skills_empty_when_parent_has_none() -> None:
+    """不绑技能的 Agent 零行为变化(继承空 = 现状)。"""
+    w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.skills == []
+
+
+def test_worker_skill_inheritance_can_be_disabled_for_rollback() -> None:
+    """运维回滚阀(env,不进 UI):关掉后 worker spec 与改动前字节级一致。"""
+    parent = _parent(skills=["pptx"])
+    w = synthesize_worker_spec(
+        parent, role=None, max_iterations=8, allowed_toolsets=[], inherit_skills=False
+    )
+    assert w.spec.skills == []
+
+
+def test_worker_prompt_states_shared_workspace() -> None:
+    """B-37 —— worker 不知道自己与编排者共用工作区,主 Agent 给了路径也可能不敢读。"""
+    w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    prompt = w.spec.system_prompt.template
+    assert "workspace" in prompt.lower()
+
+
+def test_worker_prompt_tells_it_to_offload_bulk_output_to_a_file() -> None:
+    """B-37 —— Anthropic「子 Agent 把产物写进文件系统,减少传话游戏的失真」。
+
+    worker 的最终答案是**全文**进父上下文的(``_child_run`` 的
+    ``content=answer``;旁边的 result_excerpt 只是帧元数据,不影响模型看到的
+    内容),大块产出原样穿过对话历史 = token 浪费 + 多级转手失真。共享工作区
+    认知是这条引导的前提:worker 得先知道自己写的文件父读得到,「只回路径」
+    才不等于交白卷。锚点取实现独有短语,避免与既有文案重合成重言式。
+    """
+    prompt = synthesize_worker_spec(
+        _parent(), role=None, max_iterations=8, allowed_toolsets=[]
+    ).spec.system_prompt.template.lower()
+    assert "write it to a file" in prompt
+    assert "summary" in prompt

@@ -550,6 +550,14 @@ async def build_agent(
     # (tests + eval CLI commonly leave it unset; activity simply isn't
     # tracked, the Curator works off whatever last_used_at the DB has).
     skill_activity_recorder: SkillActivityRecorder | None = None,
+    # B-37 — this build's ``spec.skills`` were INHERITED from a parent agent
+    # (the dynamic-worker path) rather than declared by the operator for this
+    # agent. Inherited skills degrade softly: a model mismatch or a tool-name
+    # clash skips that skill with a log instead of failing the whole build,
+    # because the operator never declared them here and a hard failure would
+    # kill the entire delegation. Manifest-declared skills (the default,
+    # ``False``) keep the hard failure.
+    skills_inherited: bool = False,
     # Stream SE (SE-3b) — the raw SkillStore + audit logger backing the
     # in-session authoring builtins (author_skill / refine_skill / fork_skill).
     # ``skill_resolver`` (a read-only resolve callable) is not enough — the
@@ -736,6 +744,7 @@ async def build_agent(
         agent_key=agent_key,
         activity_recorder=skill_activity_recorder,
         evolved=evolved_skills,
+        skills_inherited=skills_inherited,
     )
     # skill-runtime §5.1 — activated skills' files (SKILL.md + scripts + reference),
     # U-21 drift/threat-filtered, materialized under /opt/skills/<agent_key>/<name>/
@@ -1188,6 +1197,7 @@ async def _load_skills(
     agent_key: str,
     activity_recorder: SkillActivityRecorder | None = None,
     evolved: Sequence[tuple[Skill, SkillVersion]] = (),
+    skills_inherited: bool = False,
 ) -> _LoadedSkills:
     """Resolve + merge ``spec.skills`` into prompt fragments + tool set.
 
@@ -1248,6 +1258,22 @@ async def _load_skills(
         result = await _resolve_one(skill_resolver, tenant_id, ref.name, ref.version)
         version = _unwrap_skill_lookup(result, name=ref.name, pinned=ref.version is not None)
         if version.required_models and agent_model_name not in version.required_models:
+            # B-37 — inherited skills degrade softly. A worker runs a
+            # different (usually cheaper) model than its parent, so a skill
+            # pinned to the parent's model would otherwise fail the WHOLE
+            # spawn_worker build rather than drop one skill — and the operator
+            # never declared these skills for the worker in the first place.
+            # Manifest-declared skills keep the hard failure: there, silently
+            # ignoring an explicit declaration is worse than failing.
+            if skills_inherited:
+                logger.info(
+                    "agent_factory.inherited_skill_skipped reason=model_mismatch "
+                    "skill=%s version=%s model=%s",
+                    ref.name,
+                    version.version,
+                    agent_model_name,
+                )
+                continue
             raise SkillModelMismatchError(
                 f"skill {ref.name!r}@{version.version} requires model in "
                 f"{sorted(version.required_models)} but agent uses "
@@ -1282,13 +1308,24 @@ async def _load_skills(
         # Conflict reject — manifest validator already rejects same-name
         # twice, but two distinct skills sharing a tool_name is a (c) red
         # line per Mini-ADR J-23.
-        for tool_name in version.tool_names:
-            if tool_name in skill_tools:
-                raise SkillConflictError(
-                    f"skill {ref.name!r} and skill {skill_tools[tool_name]!r} "
-                    f"both declare tool {tool_name!r}; manifest-build refuses "
-                    f"to silently merge them"
+        conflicting = next((t for t in version.tool_names if t in skill_tools), None)
+        if conflicting is not None:
+            # B-37 — same soft-fail rationale as the model mismatch above.
+            if skills_inherited:
+                logger.info(
+                    "agent_factory.inherited_skill_skipped reason=tool_conflict "
+                    "skill=%s tool=%s owner=%s",
+                    ref.name,
+                    conflicting,
+                    skill_tools[conflicting],
                 )
+                continue
+            raise SkillConflictError(
+                f"skill {ref.name!r} and skill {skill_tools[conflicting]!r} "
+                f"both declare tool {conflicting!r}; manifest-build refuses "
+                f"to silently merge them"
+            )
+        for tool_name in version.tool_names:
             skill_tools[tool_name] = ref.name
 
         # Capability Uplift Sprint #3 — every skill gets a summary entry

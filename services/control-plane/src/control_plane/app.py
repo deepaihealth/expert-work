@@ -1816,6 +1816,8 @@ def create_app(
                         base_tool_env=base_tool_env,
                         max_iterations=resolved_settings.dynamic_worker_max_iterations,
                         allowed_toolsets=list(resolved_settings.dynamic_worker_allowed_toolsets),
+                        # B-37 —— 技能继承的运维回滚阀(env,不进 UI)。
+                        inherit_skills=resolved_settings.dynamic_worker_inherit_skills,
                         middleware_env=middleware_env,
                         memory_env=memory_env,
                         credentials_resolver=credentials_resolver,

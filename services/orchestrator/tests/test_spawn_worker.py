@@ -333,3 +333,32 @@ async def test_no_spawn_worker_when_opted_out() -> None:
 async def test_no_spawn_worker_at_depth_cap() -> None:
     reg = await _registry(worker_build_fn=_fake_wbf, depth=MAX_SUBAGENT_DEPTH)
     assert reg.get("spawn_worker") is None
+
+
+def test_spec_description_carries_delegation_contract_four_elements() -> None:
+    """B-37 —— Anthropic 多智能体研究系统的委派四要素:目标 / 输出格式 /
+    工具与数据源 / **任务边界**。原文:"Without detailed task descriptions,
+    agents duplicate work, leave gaps, or fail to find necessary information."
+    MAST 论文的干预实验:只改进角色规格说明,成功率 +9.4%。逐条钉住。"""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description
+    assert "objective" in desc
+    assert "output format" in desc
+    assert "which tools to use" in desc
+    assert "boundaries" in desc
+
+
+def test_spec_description_prefers_path_reference_over_copying() -> None:
+    """B-37 —— worker 与调用方共享工作区。约定文件应**给路径让 worker 自己读**,
+    而不是把文件内容抄进 task:抄写会漏、会用到旧版本(Cognition 的 lossy
+    prompt-copying 论证),而 worker 读到的永远是最新版。"""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description
+    assert "workspace" in desc
+    assert "by path" in desc
+
+
+def test_spec_description_asks_worker_to_offload_bulk_output() -> None:
+    """B-37 —— 大块产出落盘回引用,而非穿过对话历史(Anthropic:"pass
+    lightweight references back to the coordinator... reduces token overhead
+    from copying large outputs through conversation history")。"""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description.lower()
+    assert "write the result to a file" in desc
