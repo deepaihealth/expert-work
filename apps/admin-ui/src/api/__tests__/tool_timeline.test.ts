@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   artifactsFromTools,
+  turnArtifacts,
   parseExecResult,
   parseToolCalls,
   skillNameOf,
@@ -523,5 +524,53 @@ describe("parseToolCalls exec attribution", () => {
     ];
     const [entry] = parseToolCalls(events);
     expect(entry.execResult).toEqual({ stdout: "", stderr: "", exitCode: -1, timedOut: true });
+  });
+});
+
+describe("turnArtifacts (end 帧快照 ∪ 工具推导)", () => {
+  const endFrame = (artifacts: unknown): SseEvent => ({
+    id: "e-9",
+    event: "end",
+    data: { status: "success", run_id: "r1", artifacts },
+    rawData: "",
+    receivedAt: "2026-08-28T00:00:00Z",
+  });
+
+  it("worker 注册的产物只在 end 快照里 —— 快照必须补上工具推导漏掉的", () => {
+    // 主 run 事件流只有 spawn_worker,没有 save_artifact 工具调用。
+    const events = [
+      updates("agent", [aiCall("c1", "spawn_worker", { task: "do it" })]),
+      updates("tools", [toolResult("c1", "worker done")]),
+      endFrame([
+        { name: "套一-payload.json", kind: "data", version: 1 },
+        { name: "《手册》.docx", kind: "document", version: 1 },
+      ]),
+    ];
+    expect(turnArtifacts(events)).toEqual([
+      { name: "套一-payload.json", kind: "data" },
+      { name: "《手册》.docx", kind: "document" },
+    ]);
+  });
+
+  it("同名产物快照优先,与工具推导去重", () => {
+    const events = [
+      updates("agent", [aiCall("c1", "save_artifact", { name: "report.pdf", kind: "other" })]),
+      updates("tools", [toolResult("c1", "Saved …")]),
+      endFrame([{ name: "report.pdf", kind: "document", version: 2 }]),
+    ];
+    expect(turnArtifacts(events)).toEqual([{ name: "report.pdf", kind: "document" }]);
+  });
+
+  it("无 end 帧的老回放退回纯工具推导", () => {
+    const events = [
+      updates("agent", [aiCall("c1", "save_artifact", { name: "report.pdf", kind: "document" })]),
+      updates("tools", [toolResult("c1", "Saved …")]),
+    ];
+    expect(turnArtifacts(events)).toEqual([{ name: "report.pdf", kind: "document" }]);
+  });
+
+  it("end 帧 artifacts 缺失/非数组时容错为空增量", () => {
+    expect(turnArtifacts([endFrame(undefined)])).toEqual([]);
+    expect(turnArtifacts([endFrame("bogus")])).toEqual([]);
   });
 });
