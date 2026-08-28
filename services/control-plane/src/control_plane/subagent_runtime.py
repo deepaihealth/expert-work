@@ -151,9 +151,10 @@ def synthesize_worker_spec(
     that agent's dispatched self. Stripping them left every worker blank in
     the skill dimension (no summaries, no bodies, and — because ``skill_view``
     registers only when at least one skill activated — not even a lookup
-    tool), which is why the ai-health-plan agent's "PPT layout" worker had no
-    ``pptx`` skill and had to work off rules hand-copied into its task text.
-    Matches Claude Code
+    tool). Observed on a live run: an agent with 19 bound skills (``pptx``
+    among them) spawned a worker to design a slide layout — the worker had
+    none of them and worked off rules the parent hand-copied into its task
+    text, while the parent kept the rendering to itself. Matches Claude Code
     ("subagents load the same MCP and skill setup") and CrewAI (crew-level
     skills shared by every agent). Cost stays bounded because skills are
     progressive-disclosure: lazy skills contribute one ``<available-skills>``
