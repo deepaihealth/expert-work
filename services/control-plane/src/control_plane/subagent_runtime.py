@@ -150,8 +150,17 @@ def synthesize_worker_spec(
             "reflection": None,
             "routing": None,
             "knowledge": None,
+            # B-35 — a worker is a focused executor: it never runs the
+            # plan_first dispatch discipline itself, and a plan_first
+            # parent's worker drops back to react (re-running the advisory
+            # planner on an already-decomposed task is a wasted LLM call).
+            # Parents not in plan_first keep their workflow.type unchanged.
             "workflow": body.workflow.model_copy(
-                update={"max_iterations": min(body.workflow.max_iterations, max_iterations)}
+                update={
+                    "max_iterations": min(body.workflow.max_iterations, max_iterations),
+                    "execution_mode": "standard",
+                    **({"type": "react"} if body.workflow.execution_mode == "plan_first" else {}),
+                }
             ),
         }
     )
