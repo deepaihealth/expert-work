@@ -88,3 +88,32 @@ describe("planDraftValid", () => {
     expect(planDraftValid(DRAFT)).toBe(true);
   });
 });
+
+describe("execution marker (B-35)", () => {
+  it("changes a step's execution via the select, replacing only that step", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<PlanEditForm draft={DRAFT} onChange={onChange} />);
+    const select = screen
+      .getByTestId("plan-step-execution-0")
+      .querySelector(".ant-select-selector")!;
+    await user.click(select);
+    const option = await screen.findByText(
+      (_c, el) =>
+        el?.classList.contains("ant-select-item-option-content") === true &&
+        el.textContent === "Delegate to workers",
+    );
+    await user.click(option);
+    expect(onChange).toHaveBeenCalledWith({
+      ...DRAFT,
+      steps: [{ ...DRAFT.steps[0], execution: "delegate" }, DRAFT.steps[1]],
+    });
+  });
+
+  it("a legacy step without execution renders as inline", () => {
+    render(<PlanEditForm draft={DRAFT} onChange={vi.fn()} />);
+    expect(
+      screen.getByTestId("plan-step-execution-0").textContent,
+    ).toContain("Main agent does it");
+  });
+});

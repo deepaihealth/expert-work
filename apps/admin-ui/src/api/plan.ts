@@ -12,10 +12,14 @@ import { apiClient } from "./client";
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";
 
+// B-35 — plan_first dispatch marker; absent on pre-B-35 payloads = inline.
+export type PlanStepExecution = "delegate" | "inline";
+
 export interface PlanStep {
   id: string;
   description: string;
   status: PlanStepStatus;
+  execution?: PlanStepExecution;
 }
 
 export interface ThreadPlan {

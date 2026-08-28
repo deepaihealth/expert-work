@@ -8,7 +8,7 @@
  * the caller).
  */
 import type { ReactElement } from "react";
-import { Typography } from "antd";
+import { Tag, Typography } from "antd";
 import { Check, CircleDashed, LoaderCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -57,6 +57,17 @@ export function PlanStepList({ plan }: { plan: ThreadPlan }): ReactElement {
             >
               {step.description}
             </span>
+            {/* B-35 — delegate-marked steps run through worker sub-agents
+                under plan_first; legacy payloads without the field = inline. */}
+            {step.execution === "delegate" && (
+              <Tag
+                color="blue"
+                style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: "16px" }}
+                data-testid="plan-step-delegate-badge"
+              >
+                {t("plan_panel.execution_delegate_badge")}
+              </Tag>
+            )}
             <Text type="secondary" style={{ fontSize: 11 }}>
               {t(`plan_panel.status_${step.status}`)}
             </Text>
