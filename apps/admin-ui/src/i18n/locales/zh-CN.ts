@@ -2195,10 +2195,17 @@ const zhCN: TranslationKeys = {
     dynamic_worker_heading: "动态子智能体护栏",
     dynamic_worker_help_title: "什么是动态子智能体护栏？",
     dynamic_worker_help_body:
-      "spawn_worker 工具的限额：单次运行可同时创建的动态子智能体数量上限、单次运行累计可创建的数量上限，以及每个子智能体可执行的步数上限。未配置时使用进程的环境变量默认值。",
+      "spawn_worker 工具的限额，分两档。默认档：Agent 配置未自定义预算时生效——单次运行并发上限、单次运行累计生成上限、单个子智能体步数上限。硬顶档：Agent 自定义预算请求会被压到这一档以内。未配置时使用进程的环境变量默认值。",
     dynamic_worker_max_concurrent_label: "单运行并发上限",
     dynamic_worker_max_per_run_label: "单运行累计生成上限",
     dynamic_worker_max_iterations_label: "单个子智能体步数上限",
+    dynamic_worker_default_tier_heading: "默认档（未自定义预算的 Agent）",
+    dynamic_worker_cap_tier_heading: "硬顶档（Agent 自定义预算的上限）",
+    dynamic_worker_cap_max_concurrent_label: "硬顶：单运行并发上限",
+    dynamic_worker_cap_max_per_run_label: "硬顶：单运行累计生成上限",
+    dynamic_worker_cap_max_iterations_label: "硬顶：单个子智能体步数上限",
+    dynamic_worker_default_above_cap:
+      "默认档超过了硬顶档——未自定义预算的 Agent 反而会拿到超顶额度。请调低默认档或调高硬顶档。",
     dynamic_worker_env_default: "环境默认",
     dynamic_worker_hint:
       "改后对下一次运行/构建生效，无需重启；未配置时使用环境变量默认值。",

@@ -2084,6 +2084,12 @@ export interface TranslationKeys {
     dynamic_worker_max_concurrent_label: string;
     dynamic_worker_max_per_run_label: string;
     dynamic_worker_max_iterations_label: string;
+    dynamic_worker_default_tier_heading: string;
+    dynamic_worker_cap_tier_heading: string;
+    dynamic_worker_cap_max_concurrent_label: string;
+    dynamic_worker_cap_max_per_run_label: string;
+    dynamic_worker_cap_max_iterations_label: string;
+    dynamic_worker_default_above_cap: string;
     dynamic_worker_env_default: string;
     dynamic_worker_hint: string;
     dynamic_worker_save: string;
@@ -5345,10 +5351,17 @@ const en: TranslationKeys = {
     dynamic_worker_heading: "Dynamic subagent guardrails",
     dynamic_worker_help_title: "What are dynamic subagent guardrails?",
     dynamic_worker_help_body:
-      "Limits on the spawn_worker tool: how many dynamic subagents a run may spawn at once, how many it may spawn cumulatively in one run, and how many steps each subagent may take. Unset falls back to the process env-default settings.",
+      "Limits on the spawn_worker tool, in two tiers. Default tier: what an agent gets when its configuration doesn't ask — concurrency per run, cumulative spawns per run, and steps per subagent. Hard-cap tier: the ceiling a per-agent budget request is clamped to. Unset falls back to the process env-default settings.",
     dynamic_worker_max_concurrent_label: "Max concurrent subagents per run",
     dynamic_worker_max_per_run_label: "Max cumulative subagents per run",
     dynamic_worker_max_iterations_label: "Max steps per subagent",
+    dynamic_worker_default_tier_heading: "Default tier (agents that don't ask)",
+    dynamic_worker_cap_tier_heading: "Hard-cap tier (ceiling for per-agent requests)",
+    dynamic_worker_cap_max_concurrent_label: "Cap: concurrent subagents per run",
+    dynamic_worker_cap_max_per_run_label: "Cap: cumulative subagents per run",
+    dynamic_worker_cap_max_iterations_label: "Cap: steps per subagent",
+    dynamic_worker_default_above_cap:
+      "A default value exceeds its hard cap — an agent that doesn't ask would get more than one that does. Lower the default or raise the cap.",
     dynamic_worker_env_default: "env default",
     dynamic_worker_hint:
       "Changes take effect on the next run/build — no restart needed. When unset, the env-default values are used.",
