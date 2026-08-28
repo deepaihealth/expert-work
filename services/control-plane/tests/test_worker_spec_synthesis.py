@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from control_plane.subagent_runtime import synthesize_worker_spec
+import pytest
+
+from control_plane.platform_dynamic_worker_config import (
+    DynamicWorkerConfig,
+    PlatformDynamicWorkerConfigService,
+)
+from control_plane.subagent_runtime import (
+    resolve_worker_max_iterations,
+    synthesize_worker_spec,
+)
 from expert_work.protocol import AgentSpec
 
 _SANDBOX = {
@@ -53,14 +62,16 @@ def test_inherits_model_and_sandbox_strips_state() -> None:
     assert w.metadata.name == "boss-worker"
 
 
-def test_iterations_clamped_to_platform_cap() -> None:
+def test_iterations_used_verbatim() -> None:
+    """弹性 worker 预算 — ``max_iterations`` arrives already resolved
+    (:func:`resolve_worker_max_iterations` owns the clamp policy), so the
+    synthesizer applies it verbatim — including above the parent's own cap."""
     parent = _parent(workflow={"type": "react", "max_iterations": 12})
     w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
     assert w.spec.workflow.max_iterations == 8
-    # never raises a lower parent cap
     parent2 = _parent(workflow={"type": "react", "max_iterations": 4})
     w2 = synthesize_worker_spec(parent2, role=None, max_iterations=8, allowed_toolsets=[])
-    assert w2.spec.workflow.max_iterations == 4
+    assert w2.spec.workflow.max_iterations == 8
 
 
 def test_tools_inherited_when_allowlist_empty() -> None:
@@ -163,3 +174,66 @@ def test_standard_parent_workflow_type_unchanged() -> None:
     assert w.spec.workflow.type == "plan_execute"
     assert w.spec.workflow.execution_mode == "standard"
     assert w.spec.workflow.max_iterations == 8
+
+
+# ---------------------------------------------------------------------------
+# 弹性 worker 预算 — resolve_worker_max_iterations(clamp policy)
+# ---------------------------------------------------------------------------
+
+
+def _dw_service(
+    *, default_iterations: int = 32, cap_iterations: int = 128
+) -> PlatformDynamicWorkerConfigService:
+    from expert_work.persistence.platform_dynamic_worker_config import (
+        InMemoryPlatformDynamicWorkerConfigStore,
+    )
+
+    return PlatformDynamicWorkerConfigService(
+        store=InMemoryPlatformDynamicWorkerConfigStore(),
+        env_default=DynamicWorkerConfig(
+            max_concurrent=3,
+            max_per_run=16,
+            max_iterations=default_iterations,
+            cap_max_concurrent=10,
+            cap_max_per_run=64,
+            cap_max_iterations=cap_iterations,
+        ),
+        ttl_seconds=0.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_unrequested_keeps_min_of_parent_and_platform_default() -> None:
+    """manifest 未请求 → 现状语义不变:min(父 workflow, 平台默认档)。"""
+    svc = _dw_service(default_iterations=8)
+    parent = _parent(workflow={"type": "react", "max_iterations": 12})
+    assert await resolve_worker_max_iterations(svc, 32, parent=parent) == 8
+    parent2 = _parent(workflow={"type": "react", "max_iterations": 4})
+    assert await resolve_worker_max_iterations(svc, 32, parent=parent2) == 4
+
+
+@pytest.mark.asyncio
+async def test_resolve_requested_wins_over_parent_workflow() -> None:
+    """显式请求赢过「不超过父」启发式,只被平台 cap 压住。"""
+    svc = _dw_service(default_iterations=32, cap_iterations=128)
+    parent = _parent(
+        workflow={"type": "react", "max_iterations": 12},
+        dynamic_workers={"max_iterations": 48},
+    )
+    assert await resolve_worker_max_iterations(svc, 32, parent=parent) == 48
+
+
+@pytest.mark.asyncio
+async def test_resolve_requested_clamped_to_platform_cap() -> None:
+    svc = _dw_service(cap_iterations=128)
+    parent = _parent(dynamic_workers={"max_iterations": 200})
+    assert await resolve_worker_max_iterations(svc, 32, parent=parent) == 128
+
+
+@pytest.mark.asyncio
+async def test_resolve_no_service_requested_clamped_to_boot_fallback() -> None:
+    """service 未接线(测试/预热)拿不到 cap → 保守用 boot fallback 当 cap。"""
+    parent = _parent(dynamic_workers={"max_iterations": 48})
+    assert await resolve_worker_max_iterations(None, 32, parent=parent) == 32
+    parent2 = _parent(dynamic_workers={"max_iterations": 6})
+    assert await resolve_worker_max_iterations(None, 32, parent=parent2) == 6

@@ -271,7 +271,12 @@ class AgentRuntime:
         default_factory=list, repr=False
     )
 
-    async def new_worker_spawn_budget(self) -> Any:
+    async def new_worker_spawn_budget(
+        self,
+        *,
+        requested_max_concurrent: int | None = None,
+        requested_max_per_run: int | None = None,
+    ) -> Any:
         """A fresh per-run :class:`WorkerSpawnBudget`, or ``None`` when dynamic
         workers are disabled. Created per run (the semaphore + count are
         per-run state), passed into ``run_agent``. Lazy-imports the
@@ -282,6 +287,14 @@ class AgentRuntime:
         platform-settings change is HOT: the very next run picks it up, no
         restart. ``None`` falls back to the ``dynamic_worker_max_*`` attrs,
         which are the lifespan's cold read of settings at boot.
+
+        弹性 worker 预算(2026-08-28)— ``requested_*`` carry the agent's
+        ``dynamic_workers.max_concurrent`` / ``max_per_run`` manifest requests
+        (via the :class:`BuiltAgent` projection): a request wins over the
+        platform default but is clamped to the platform hard cap. ``None``
+        (manifest didn't ask) keeps the platform default. Without the config
+        service there is no cap to read, so the boot attrs conservatively
+        play both roles.
         """
         if not self.dynamic_workers_enabled:
             return None
@@ -289,15 +302,23 @@ class AgentRuntime:
 
         if self.dynamic_worker_config_service is not None:
             cfg = await self.dynamic_worker_config_service.effective()
-            max_per_run = cfg.max_per_run
-            max_concurrent = cfg.max_concurrent
+            default_per_run, cap_per_run = cfg.max_per_run, cfg.cap_max_per_run
+            default_concurrent, cap_concurrent = cfg.max_concurrent, cfg.cap_max_concurrent
         else:
-            max_per_run = self.dynamic_worker_max_per_run
-            max_concurrent = self.dynamic_worker_max_concurrent
+            default_per_run = cap_per_run = self.dynamic_worker_max_per_run
+            default_concurrent = cap_concurrent = self.dynamic_worker_max_concurrent
 
         return WorkerSpawnBudget(
-            max_per_run=max_per_run,
-            max_concurrent=max_concurrent,
+            max_per_run=(
+                min(requested_max_per_run, cap_per_run)
+                if requested_max_per_run is not None
+                else default_per_run
+            ),
+            max_concurrent=(
+                min(requested_max_concurrent, cap_concurrent)
+                if requested_max_concurrent is not None
+                else default_concurrent
+            ),
         )
 
     def delegation_gate(self) -> Any | None:

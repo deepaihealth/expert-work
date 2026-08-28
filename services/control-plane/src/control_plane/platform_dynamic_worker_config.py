@@ -25,11 +25,20 @@ from expert_work.persistence.platform_dynamic_worker_config import (
 
 @dataclass(frozen=True)
 class DynamicWorkerConfig:
-    """The platform's dynamic-worker limits (effective or configured view)."""
+    """The platform's dynamic-worker limits (effective or configured view).
+
+    弹性 worker 预算(2026-08-28)— two tiers: ``max_*`` is the platform
+    *default* an agent gets when its manifest does not ask; ``cap_max_*`` is
+    the hard ceiling a per-agent ``dynamic_workers.max_*`` request is clamped
+    to at run time.
+    """
 
     max_concurrent: int
     max_per_run: int
     max_iterations: int
+    cap_max_concurrent: int
+    cap_max_per_run: int
+    cap_max_iterations: int
 
 
 class PlatformDynamicWorkerConfigService:
@@ -68,13 +77,24 @@ class PlatformDynamicWorkerConfigService:
         return self._configured
 
     async def put(
-        self, *, max_concurrent: int, max_per_run: int, max_iterations: int, updated_by: str | None
+        self,
+        *,
+        max_concurrent: int,
+        max_per_run: int,
+        max_iterations: int,
+        cap_max_concurrent: int,
+        cap_max_per_run: int,
+        cap_max_iterations: int,
+        updated_by: str | None,
     ) -> None:
         """Upsert the singleton config row then invalidate the cache."""
         await self._store.put(
             max_concurrent=max_concurrent,
             max_per_run=max_per_run,
             max_iterations=max_iterations,
+            cap_max_concurrent=cap_max_concurrent,
+            cap_max_per_run=cap_max_per_run,
+            cap_max_iterations=cap_max_iterations,
             updated_by=updated_by,
         )
         self.invalidate()
@@ -101,6 +121,9 @@ class PlatformDynamicWorkerConfigService:
                 max_concurrent=row.max_concurrent,
                 max_per_run=row.max_per_run,
                 max_iterations=row.max_iterations,
+                cap_max_concurrent=row.cap_max_concurrent,
+                cap_max_per_run=row.cap_max_per_run,
+                cap_max_iterations=row.cap_max_iterations,
             )
             self._effective = self._configured
         else:

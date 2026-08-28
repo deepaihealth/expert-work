@@ -107,4 +107,46 @@ describe("SubagentPicker", () => {
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(last.spec?.dynamic_workers).toBeUndefined();
   });
+
+  it("shows the worker-budget inputs only while dynamic workers are on", () => {
+    const { rerender } = render(
+      <SubagentPicker formData={SEED} onChange={vi.fn()} />,
+    );
+    expect(screen.getByTestId("af-worker-budget")).toBeInTheDocument();
+    const off: AgentManifest = {
+      ...SEED,
+      spec: { dynamic_workers: { enabled: false } },
+    };
+    rerender(<SubagentPicker formData={off} onChange={vi.fn()} />);
+    expect(screen.queryByTestId("af-worker-budget")).not.toBeInTheDocument();
+  });
+
+  it("typing a budget value writes dynamic_workers.max_iterations", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(<SubagentPicker formData={SEED} onChange={onChange} />);
+    const input = screen.getByTestId("af-worker-budget-max-iterations");
+    await user.type(input, "48");
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(
+      (last.spec as { dynamic_workers?: { max_iterations?: number } })
+        .dynamic_workers?.max_iterations,
+    ).toBe(48);
+  });
+
+  it("clearing a budget value drops the field (platform default applies)", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const withBudget: AgentManifest = {
+      ...SEED,
+      spec: { dynamic_workers: { max_iterations: 48 } },
+    };
+    render(<SubagentPicker formData={withBudget} onChange={onChange} />);
+    const input = screen.getByTestId("af-worker-budget-max-iterations");
+    await user.clear(input);
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(
+      (last.spec as { dynamic_workers?: unknown }).dynamic_workers,
+    ).toBeUndefined();
+  });
 });

@@ -452,6 +452,26 @@ async def test_build_agent_token_budget_propagates_from_policies() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_agent_worker_budget_requests_default_none() -> None:
+    """弹性 worker 预算 — 存量 manifest 不带请求 ⇒ 投影为 None(平台默认档)。"""
+    async with make_checkpointer("memory") as cp:
+        built = await _build(_spec(), secret_store=_secret_store(), checkpointer=cp)
+    assert built.worker_max_concurrent is None
+    assert built.worker_max_per_run is None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_worker_budget_requests_propagate() -> None:
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["dynamic_workers"] = {"max_concurrent": 5, "max_per_run": 32}
+    spec = AgentSpec.model_validate(doc)
+    async with make_checkpointer("memory") as cp:
+        built = await _build(spec, secret_store=_secret_store(), checkpointer=cp)
+    assert built.worker_max_concurrent == 5
+    assert built.worker_max_per_run == 32
+
+
+@pytest.mark.asyncio
 async def test_build_agent_supports_vision_defaults_to_false() -> None:
     """``ModelSpec.supports_vision`` default → ``BuiltAgent.supports_vision`` False."""
     async with make_checkpointer("memory") as cp:

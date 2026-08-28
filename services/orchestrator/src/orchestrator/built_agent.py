@@ -94,3 +94,10 @@ class BuiltAgent:
     #: (``ToolRegistry.catalog()``) for the console's Schema tab. Read-only
     #: metadata; nothing on the run path consumes it.
     tool_catalog: tuple[ToolCatalogEntry, ...] = ()
+    #: 弹性 worker 预算(2026-08-28)— the manifest's per-agent spawn-budget
+    #: *requests* (``dynamic_workers.max_concurrent`` / ``max_per_run``),
+    #: projected here so the run entry points can hand them to
+    #: ``AgentRuntime.new_worker_spawn_budget``, which clamps each to the
+    #: platform hard cap. ``None`` = manifest didn't ask → platform default.
+    worker_max_concurrent: int | None = None
+    worker_max_per_run: int | None = None

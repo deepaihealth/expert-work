@@ -63,11 +63,13 @@ class _FakeRuntime:
             spotlight_nonce=None,
             trajectory_recording=True,
             token_budget=0,
+            worker_max_concurrent=None,
+            worker_max_per_run=None,
             max_steps=8,
             max_no_progress=0,
         )
 
-    async def new_worker_spawn_budget(self):
+    async def new_worker_spawn_budget(self, **_kw: object):
         return None
 
     def delegation_gate(self):

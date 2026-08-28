@@ -80,9 +80,11 @@ class _FakeRuntime:
             run_deadline_s=0,
             trajectory_recording=True,
             token_budget=0,
+            worker_max_concurrent=None,
+            worker_max_per_run=None,
         )
 
-    async def new_worker_spawn_budget(self):
+    async def new_worker_spawn_budget(self, **_kw: object):
         return None
 
     def delegation_gate(self):

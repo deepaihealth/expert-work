@@ -715,6 +715,14 @@ class Settings(BaseSettings):
     #: (default 30) and the ``le=64`` runaway ceiling; the effective cap remains
     #: ``min(parent's max_iterations, this)``.
     dynamic_worker_max_iterations: int = Field(default=32, gt=0, le=64)
+    #: 弹性 worker 预算(2026-08-28)— hard-cap tier. The three ``max_*``
+    #: values above become the platform *default* (what an agent gets when its
+    #: manifest does not ask); a per-agent ``dynamic_workers.max_*`` request is
+    #: clamped to the caps below. Env values are the bootstrap fallback — the
+    #: DB row (platform admin UI) wins once configured.
+    dynamic_worker_cap_max_concurrent: int = Field(default=10, gt=0, le=64)
+    dynamic_worker_cap_max_per_run: int = Field(default=64, gt=0, le=1024)
+    dynamic_worker_cap_max_iterations: int = Field(default=128, gt=0, le=512)
     #: Tool-name allowlist a spawned worker may inherit from its parent
     #: (intersected with the parent's tools). Empty = inherit the parent's
     #: tools verbatim (still a subset of what the parent itself had).

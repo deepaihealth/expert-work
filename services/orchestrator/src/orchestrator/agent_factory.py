@@ -1172,6 +1172,10 @@ async def build_agent(
         prompt_suffix=final_system_prompt[len(base_prompt) :],
         trajectory_recording=spec.spec.policies.trajectory_recording,
         token_budget=spec.spec.policies.token_budget,
+        # 弹性 worker 预算 — per-agent spawn-budget requests, clamped to the
+        # platform hard cap by ``AgentRuntime.new_worker_spawn_budget``.
+        worker_max_concurrent=spec.spec.dynamic_workers.max_concurrent,
+        worker_max_per_run=spec.spec.dynamic_workers.max_per_run,
     )
 
 

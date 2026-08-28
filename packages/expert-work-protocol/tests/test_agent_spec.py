@@ -1103,3 +1103,54 @@ def test_execution_mode_appears_in_the_generated_json_schema() -> None:
     schema = AgentSpec.model_json_schema(by_alias=True)
     wf = schema["$defs"]["WorkflowSpec"]["properties"]
     assert "execution_mode" in wf
+
+
+# ---------------------------------------------------------------------------
+# 弹性 worker 预算 — dynamic_workers per-agent budget requests
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_workers_budget_fields_default_none() -> None:
+    """存量 manifest(没有这些字段)反序列化后拿到 None → 平台默认,行为不变。"""
+    dw = AgentSpec.model_validate(_doc()).spec.dynamic_workers
+    assert dw.max_iterations is None
+    assert dw.max_concurrent is None
+    assert dw.max_per_run is None
+
+
+def test_dynamic_workers_budget_fields_accepted() -> None:
+    doc = _doc()
+    doc["spec"]["dynamic_workers"] = {
+        "max_iterations": 48,
+        "max_concurrent": 5,
+        "max_per_run": 32,
+    }
+    dw = AgentSpec.model_validate(doc).spec.dynamic_workers
+    assert (dw.max_iterations, dw.max_concurrent, dw.max_per_run) == (48, 5, 32)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("max_iterations", 0),
+        ("max_iterations", 513),
+        ("max_concurrent", 0),
+        ("max_concurrent", 65),
+        ("max_per_run", 0),
+        ("max_per_run", 1025),
+    ],
+)
+def test_dynamic_workers_budget_fields_sanity_bounds(field: str, bad: int) -> None:
+    """协议层只做 sanity 闸(真闸=平台 cap clamp);0 与超 sanity 上限都拒。"""
+    doc = _doc()
+    doc["spec"]["dynamic_workers"] = {field: bad}
+    with pytest.raises(ValidationError, match=field):
+        AgentSpec.model_validate(doc)
+
+
+def test_dynamic_workers_budget_fields_in_json_schema() -> None:
+    """manifest 编辑器吃 ``AgentSpec.model_json_schema()``,字段必须可见。"""
+    schema = AgentSpec.model_json_schema(by_alias=True)
+    dw = schema["$defs"]["DynamicWorkersSpec"]["properties"]
+    for key in ("max_iterations", "max_concurrent", "max_per_run"):
+        assert key in dw

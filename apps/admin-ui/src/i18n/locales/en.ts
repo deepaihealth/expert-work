@@ -610,6 +610,7 @@ export interface TranslationKeys {
     field_impact_label: string;
     field_customized_badge: string;
     field_reset: string;
+    tags_placeholder: string;
     field_reset_hint: string;
   };
   // config-page redesign v2 Task 6 — RunProfileCard, the "basic" group's
@@ -668,6 +669,7 @@ export interface TranslationKeys {
     max_no_progress_brief: string;
     max_no_progress_impact: string;
     max_no_progress_default: string;
+    subhead_structured: string;
     subhead_time: string;
     run_deadline_label: string;
     run_deadline_brief: string;
@@ -796,6 +798,9 @@ export interface TranslationKeys {
     denylist_default: string;
     enforce_label: string;
     enforce_brief: string;
+    enforce_brief_auto: string;
+    enforce_brief_on: string;
+    enforce_brief_off: string;
     enforce_impact: string;
     enforce_default: string;
     enforce_opt_auto: string;
@@ -1082,6 +1087,13 @@ export interface TranslationKeys {
     worker_model_label: string;
     worker_model_hint: string;
     worker_model_clear: string;
+    worker_budget_heading: string;
+    worker_budget_hint: string;
+    worker_budget_max_iterations_label: string;
+    worker_budget_max_concurrent_label: string;
+    worker_budget_max_per_run_label: string;
+    worker_budget_token_hint: string;
+    worker_budget_platform_default: string;
     approval_timeout: string;
     approval_timeout_brief: string;
     approval_timeout_help: string;
@@ -2084,6 +2096,12 @@ export interface TranslationKeys {
     dynamic_worker_max_concurrent_label: string;
     dynamic_worker_max_per_run_label: string;
     dynamic_worker_max_iterations_label: string;
+    dynamic_worker_default_tier_heading: string;
+    dynamic_worker_cap_tier_heading: string;
+    dynamic_worker_cap_max_concurrent_label: string;
+    dynamic_worker_cap_max_per_run_label: string;
+    dynamic_worker_cap_max_iterations_label: string;
+    dynamic_worker_default_above_cap: string;
     dynamic_worker_env_default: string;
     dynamic_worker_hint: string;
     dynamic_worker_save: string;
@@ -3718,6 +3736,7 @@ const en: TranslationKeys = {
     field_impact_label: "Impact",
     field_customized_badge: "Customized",
     field_reset: "Reset to default",
+    tags_placeholder: "Type and press Enter to add",
     field_reset_hint: "Reset to default: {{value}}",
   },
   run_profile: {
@@ -3783,24 +3802,25 @@ const en: TranslationKeys = {
     max_no_progress_impact:
       "Stop early after N consecutive steps with no real progress at all, so the agent doesn't burn through steps for nothing; 0 = turns this check off.\nRaise it to tolerate legitimate retries without cutting them off; lower it to kill a stuck loop faster — but too low may cut off a normal retry, so 3-5 is a reasonable starting point.\nExample: the agent keeps calling the same tool over and over without getting anywhere useful — this setting stops it early instead of letting it spin in place.",
     max_no_progress_default: "0 (off)",
+    subhead_structured: "Structured execution",
     subhead_time: "Time & spend",
-    run_deadline_label: "Max run time",
-    run_deadline_brief: "The longest this run may take",
+    run_deadline_label: "Max run time (seconds)",
+    run_deadline_brief: "The longest this run may take (0 = platform default, 1h)",
     run_deadline_impact:
       "The longest this run may take, in seconds, including any sub-agents it spawns along the way; once exceeded, the run is force-stopped, so a stuck run can't quietly run up the bill.\n0 doesn't mean unlimited — it just falls back to the platform's own default cap (currently 3600 seconds / 1 hour, set by ops). Set an explicit number here for a longer run or tighter control.\nExample: a task doing live web lookups gets stuck in a loop — this cap force-kills it instead of letting it burn on forever.",
     run_deadline_default: "0 (platform default, 1h)",
-    stream_deadline_label: "First-token timeout",
+    stream_deadline_label: "First-token timeout (seconds)",
     stream_deadline_brief: "The longest wait for the model to start replying",
     stream_deadline_impact:
       "How long this may wait, from calling the model, until its first word comes back. Defaults to 180 seconds, enough for slow jobs like long report generation. This is different from the inter-token idle timeout below, which only starts counting after the first word arrives.\n0 = no limit (only recommended for development or long batch jobs).\nExample: the model provider occasionally hangs and never starts replying — once this timeout passes, the system automatically switches to a backup model instead of leaving the whole run hanging.",
     stream_deadline_default: "180",
-    idle_timeout_label: "Inter-token idle timeout",
+    idle_timeout_label: "Inter-token idle timeout (seconds)",
     idle_timeout_brief: "The longest pause allowed mid-answer",
     idle_timeout_impact:
       "Once the model starts answering, if the gap between two words grows longer than this, it's treated as the model going silent mid-answer (stuck, or it just stopped). Different from the first-token timeout above: that one covers the wait before the answer starts, this one covers pauses after it's already started.\n0 = no limit (only recommended for development or long batch jobs); providers that don't stream ignore this.\nExample: a support agent's answer is half-typed when the model hangs — once this gap passes with no new words, the run ends that turn early and keeps whatever was generated so far, instead of leaving the user staring at a frozen answer.",
     idle_timeout_default: "45",
     token_budget_label: "Token budget",
-    token_budget_brief: "The total token spend cap for this run",
+    token_budget_brief: "The total token spend cap for this run (0 = no cap)",
     token_budget_impact:
       "Sets a spending cap for this run, counted in tokens (covers every sub-task it kicks off too). At 80% of the cap, the model gets nudged to wrap up soon; once it's used up, the model is forced to give its best answer from what it already has, without calling any more tools.\n0 = no cap.\nExample: set the cap to 200,000 tokens — at 160,000 the model gets nudged to wrap up, and at 200,000 it must answer from what it already has.",
     token_budget_default: "0 (disabled)",
@@ -3904,8 +3924,8 @@ const en: TranslationKeys = {
     tab_defenses: "Defenses",
     tab_approval: "Human approval",
     tab_network: "Network & tool enforcement",
-    panel_network: "① Network egress",
-    panel_enforce: "② Tool-use enforcement",
+    panel_network: "Network egress",
+    panel_enforce: "Tool-use enforcement",
     egress_label: "Egress mode",
     egress_brief: "The sandbox's master switch for reaching the outside world",
     egress_impact:
@@ -3929,6 +3949,9 @@ const en: TranslationKeys = {
     enforce_impact:
       "Adds a hard requirement to the system prompt: for anything needing real-time facts, actually call a tool, act right away, and never make up a tool result.\nauto (default) = turned on for every model except the families — Claude, GPT, etc. — that are already reliable about calling tools on their own; on/off = force it on or off regardless of which model is in use.\nExample: a newly onboarded weak model gets this safety net for free under auto, no config change needed.",
     enforce_default: "auto",
+    enforce_brief_auto: "Auto: only models bad at proactive tool use get the enforcement block",
+    enforce_brief_on: "Force on: every model is required to actually call tools, no fabrication",
+    enforce_brief_off: "Force off: no model gets the enforcement block",
     enforce_opt_auto: "Auto (default)",
     enforce_opt_on: "Always on",
     enforce_opt_off: "Always off",
@@ -3998,8 +4021,8 @@ const en: TranslationKeys = {
     abstain_threshold_brief: "Skips memories that don't match well enough",
     abstain_threshold_impact:
       "After searching, if the best memory's similarity to the question is below this, inject nothing instead of a weak match — avoids dragging loosely-related memories into the answer.\n0 = never skip (default); ~0.2–0.3 = skip clearly weak matches.\nExample: 0",
-    panel_injection: "① Injection budget",
-    panel_consolidation: "② Background memory consolidation",
+    panel_injection: "Injection budget",
+    panel_consolidation: "Background memory consolidation",
     inj_budget_label: "Memory injection token budget",
     inj_budget_brief: "The most tokens memories may take up in the prompt",
     inj_budget_impact:
@@ -4256,6 +4279,15 @@ const en: TranslationKeys = {
     worker_model_hint:
       "Unset: ephemeral subagents inherit the main model (including thinking settings). Set: they use this model instead — typically a cheaper tier for fan-out subtasks. No fallback chain.",
     worker_model_clear: "Clear (inherit the main model)",
+    worker_budget_heading: "Subagent budget",
+    worker_budget_hint:
+      "Optional per-agent limits for ephemeral subagents. Leave blank to use the platform defaults; values above the platform hard cap are clamped to it at run time. Takes effect on the next run.",
+    worker_budget_max_iterations_label: "Max steps per subagent",
+    worker_budget_max_concurrent_label: "Max concurrent subagents per run",
+    worker_budget_max_per_run_label: "Max cumulative subagents per run",
+    worker_budget_token_hint:
+      "High step limit with no run token budget: consider setting a token budget (Run budget section) so a runaway fan-out is bounded by cost too.",
+    worker_budget_platform_default: "Platform default",
     approval_timeout: "Approval wait limit (seconds)",
     approval_timeout_brief: "Auto-rejects if no one responds in time",
     approval_timeout_help:
@@ -5345,10 +5377,17 @@ const en: TranslationKeys = {
     dynamic_worker_heading: "Dynamic subagent guardrails",
     dynamic_worker_help_title: "What are dynamic subagent guardrails?",
     dynamic_worker_help_body:
-      "Limits on the spawn_worker tool: how many dynamic subagents a run may spawn at once, how many it may spawn cumulatively in one run, and how many steps each subagent may take. Unset falls back to the process env-default settings.",
+      "Limits on the spawn_worker tool, in two tiers. Default tier: what an agent gets when its configuration doesn't ask — concurrency per run, cumulative spawns per run, and steps per subagent. Hard-cap tier: the ceiling a per-agent budget request is clamped to. Unset falls back to the process env-default settings.",
     dynamic_worker_max_concurrent_label: "Max concurrent subagents per run",
     dynamic_worker_max_per_run_label: "Max cumulative subagents per run",
     dynamic_worker_max_iterations_label: "Max steps per subagent",
+    dynamic_worker_default_tier_heading: "Default tier (agents that don't ask)",
+    dynamic_worker_cap_tier_heading: "Hard-cap tier (ceiling for per-agent requests)",
+    dynamic_worker_cap_max_concurrent_label: "Cap: concurrent subagents per run",
+    dynamic_worker_cap_max_per_run_label: "Cap: cumulative subagents per run",
+    dynamic_worker_cap_max_iterations_label: "Cap: steps per subagent",
+    dynamic_worker_default_above_cap:
+      "A default value exceeds its hard cap — an agent that doesn't ask would get more than one that does. Lower the default or raise the cap.",
     dynamic_worker_env_default: "env default",
     dynamic_worker_hint:
       "Changes take effect on the next run/build — no restart needed. When unset, the env-default values are used.",

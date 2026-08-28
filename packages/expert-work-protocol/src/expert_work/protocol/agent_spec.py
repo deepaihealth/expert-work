@@ -505,10 +505,14 @@ class DynamicWorkersSpec(BaseModel):
     (effort / thinking / temperature / …) EXCEPT a ``fallback`` chain:
     a worker is ephemeral fan-out work, the parent already owns retry
     semantics, so a per-worker fallback tree is complexity without a
-    failure mode it fixes (owner decision 2026-08-27). The numeric safety
-    bounds (concurrency / per-run cap / iterations / tool allowlist) are
-    **platform-global settings**, not per-agent — a manifest must not be
-    able to raise the platform's shared-resource ceiling. Effective
+    failure mode it fixes (owner decision 2026-08-27). The numeric budget
+    knobs (``max_iterations`` / ``max_concurrent`` / ``max_per_run``) are
+    per-agent **requests**, not grants: the platform clamps each to its
+    admin-configured hard cap at run time (owner decision 2026-08-28 —
+    elastic worker budgets), so a manifest still cannot raise the
+    platform's shared-resource ceiling. Unset (``None``) falls back to
+    the platform default. The bounds declared here are wide sanity
+    limits only. The tool allowlist stays platform-global. Effective
     registration is ``platform enable_dynamic_workers ∧ this.enabled ∧
     depth < MAX_SUBAGENT_DEPTH ∧ a worker builder is wired``.
     """
@@ -527,6 +531,33 @@ class DynamicWorkersSpec(BaseModel):
         description=(
             "override the spawned workers' LLM (unset = inherit the "
             "parent's model); fallback chain not allowed here"
+        ),
+    )
+    max_iterations: int | None = Field(
+        default=None,
+        ge=1,
+        le=512,
+        description=(
+            "requested per-worker step cap (unset = platform default); "
+            "clamped to the platform hard cap at run time"
+        ),
+    )
+    max_concurrent: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        description=(
+            "requested concurrent-worker cap per run (unset = platform "
+            "default); clamped to the platform hard cap at run time"
+        ),
+    )
+    max_per_run: int | None = Field(
+        default=None,
+        ge=1,
+        le=1024,
+        description=(
+            "requested total-spawn cap per run (unset = platform default); "
+            "clamped to the platform hard cap at run time"
         ),
     )
 

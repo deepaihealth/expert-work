@@ -1129,6 +1129,54 @@ export function setWorkerModel(
   return patchSpec(m, { dynamic_workers: { ...existing, model } });
 }
 
+// 弹性 worker 预算(2026-08-28)— per-agent budget *requests*
+// (``dynamic_workers.max_iterations`` / ``max_concurrent`` / ``max_per_run``).
+// Absent = the platform default tier applies; a set value is clamped to the
+// platform hard cap at run time. ``null`` clears a field back to the platform
+// default, dropping the whole block when nothing else remains — same shape
+// discipline as ``setWorkerModel``.
+export interface WorkerBudgetFields {
+  max_iterations?: number;
+  max_concurrent?: number;
+  max_per_run?: number;
+}
+
+const WORKER_BUDGET_KEYS = [
+  "max_iterations",
+  "max_concurrent",
+  "max_per_run",
+] as const satisfies readonly (keyof WorkerBudgetFields)[];
+
+export const readWorkerBudget = (m: unknown): WorkerBudgetFields => {
+  const dw = specOf(m).dynamic_workers ?? {};
+  const out: WorkerBudgetFields = {};
+  for (const key of WORKER_BUDGET_KEYS) {
+    const v = (dw as Record<string, unknown>)[key];
+    if (typeof v === "number") {
+      out[key] = v;
+    }
+  }
+  return out;
+};
+
+export function setWorkerBudgetField(
+  m: unknown,
+  key: keyof WorkerBudgetFields,
+  value: number | null,
+): AgentManifest {
+  const existing = specOf(m).dynamic_workers ?? {};
+  if (value === null) {
+    const { [key]: _dropped, ...rest } = existing as Record<string, unknown>;
+    return patchSpec(m, {
+      dynamic_workers:
+        Object.keys(rest).length > 0
+          ? (rest as NonNullable<AgentManifest["spec"]>["dynamic_workers"])
+          : undefined,
+    });
+  }
+  return patchSpec(m, { dynamic_workers: { ...existing, [key]: value } });
+}
+
 // ---- structured output field editor (config-page redesign v2 Task 7) ----
 // A flat "field list" visualization over ``spec.output_schema.json_schema``
 // (Stream RT-1 / RT-ADR-4's structured-final-reply JSON Schema — see the
