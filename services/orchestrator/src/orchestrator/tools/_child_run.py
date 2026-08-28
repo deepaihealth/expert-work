@@ -31,6 +31,7 @@ from uuid import UUID, uuid4
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.observability import expert_work_counter
 from expert_work.protocol import MAX_RESULT_EXCERPT_CHARS, SubAgentInvocation, SubagentStatus
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -69,6 +70,14 @@ _BACKGROUND_TRAJECTORY_TASKS: set[asyncio.Task[None]] = set()
 
 #: Wall-clock cap on one child trajectory dispatch.
 _TRAJECTORY_DISPATCH_TIMEOUT_S: float = 5.0
+
+#: B-35 PR-4 — child runs halted at an approval gate and soft-refused back
+#: to the parent (before this counter existed the parent saw a fake
+#: success — the silent-swallow bug this fixes).
+_worker_approval_blocked = expert_work_counter(
+    "expert_work_worker_approval_blocked_total",
+    "Child runs halted at an approval gate and soft-refused to the parent.",
+)
 
 
 async def run_child_to_result(
@@ -215,13 +224,32 @@ async def run_child_to_result(
 
     llm_call_count = sum(1 for msg in messages if isinstance(msg, AIMessage))
 
+    # B-35 PR-4(现状 bug 修复)— fourth exit: the child graph ended with
+    # ``pending_approval`` set (its tools_node hit an approval gate and
+    # routed to END — RunStatus.PAUSED semantics). Before this check the
+    # parent treated that final values chunk as a normal completion: the
+    # approval request was silently swallowed and the worker looked
+    # successful. Approval semantics stay with the main conversation —
+    # surface a structured soft-refusal so the parent LLM takes the
+    # sub-task back inline (spec 2026-08-28-plan-first-execution-design §5).
+    pending_approval = result.get("pending_approval") if isinstance(result, Mapping) else None
+    approval_blocked = pending_approval is not None and not raised_max_steps
+    if approval_blocked:
+        outcome = "failed"
+
     if sink is not None:
         await _emit_worker_frame(
             sink,
             build_worker_end_frame(
                 ident,
                 wseq=wseq,
-                outcome="max_steps" if raised_max_steps else "success",
+                outcome=(
+                    "max_steps"
+                    if raised_max_steps
+                    else "approval_blocked"
+                    if approval_blocked
+                    else "success"
+                ),
                 iteration_used=step_count,
                 llm_call_count=llm_call_count,
                 wall_clock_ms=wall_clock_ms,
@@ -252,6 +280,38 @@ async def run_child_to_result(
         meta.update(extra_meta)
 
     answer = _final_answer(messages)
+    if approval_blocked:
+        summary = getattr(pending_approval, "action_summary", "") or "a gated action"
+        _worker_approval_blocked.inc()
+        meta["worker_approval_blocked"] = True
+        logger.warning(
+            "child_run.approval_blocked label=%s agent_ref=%s summary=%r",
+            label,
+            agent_ref,
+            summary,
+        )
+        return _build_tool_result(
+            content=(
+                f"[worker halted: {summary!r} requires human approval, which is "
+                f"unavailable inside a worker sub-agent; handle this sub-task in "
+                "the main conversation instead]"
+            ),
+            meta=meta,
+            status=SubagentStatus.FAILED,
+            label=label,
+            agent_ref=agent_ref,
+            child_depth=child_depth,
+            sub_thread_id=sub_thread_id,
+            sub_run_id=sub_run_id,
+            result_excerpt="",
+            error=f"approval required inside worker: {summary}",
+            started_at=started_at,
+            finished_at=finished_at,
+            iteration_used=step_count,
+            llm_call_count=llm_call_count,
+            wall_clock_ms=wall_clock_ms,
+        )
+
     if raised_max_steps:
         meta["subagent_max_steps"] = True
         return _build_tool_result(
