@@ -175,6 +175,26 @@ worker 获得按需查询技能正文的入口。
 与 4.1 的 Agent 级约定(跟 Agent 走的技能)构成两层,对应 Claude Code 的
 用户级 / 项目级 CLAUDE.md 分层。
 
+### 4.3b 改动三之二:大块产出落盘回引用
+
+Anthropic 附录条目「Subagent output to a filesystem to minimize the 'game of
+telephone'」:子 Agent 把成果存进外部系统,**只回传轻量引用**,
+"prevents information loss during multi-stage processing and reduces token
+overhead from copying large outputs through conversation history"。
+
+**现状缺口**:`_child_run` 把 worker 的最终答案**全文**作为 ToolResult 的
+`content` 回传父上下文(`content=answer`);旁边的 `result_excerpt` 只是帧元
+数据,不影响模型看到的内容。于是一个三千字报告原样穿过对话历史,派七个 worker
+就是两万多字——这正是要避免的传话游戏与 token 浪费。底座本已具备(共享工作区、
+产物清单合并到父 run、对外帧截断),缺的只是**引导**。
+
+**改动**:worker 提示词增加——结果大块时(长报告 / 数据集 / 生成内容)写进共享
+工作区,最终消息给「短摘要 + 路径」而非粘贴全文;`spawn_worker` 描述反方向同理,
+提示调用方对会产生大输出的子任务明确要求落盘。
+
+**依赖关系**:这条依赖 4.3 的共享工作区认知——worker 必须先知道自己写的文件
+编排者读得到,「只回路径」才不等于交白卷。两者配套,分开做不成立。
+
 ### 4.4 改动四:spawn_worker 工具描述补规格四要素
 
 工具描述是模型做决策的现场(B-35 层 0/2 已实证有效:两个模型的思考原文都直接
@@ -219,7 +239,9 @@ worker 获得按需查询技能正文的入口。
 1. `synthesize_worker_spec` 继承父 skills(父 3 个 → worker 3 个);父无技能时为空。
 2. 继承技能遇模型不匹配 → 跳过而非 raise;manifest 直接声明路径保持 raise(现状钉住)。
 3. worker 构建后 `skill_view` 已注册、提示词含 `<available-skills>` 摘要。
-4. worker 提示词含共享工作区说明;`spawn_worker` 描述含四要素。
+4. worker 提示词含共享工作区说明 + 大块产出落盘引导;`spawn_worker` 描述含四要素
+   + 落盘引导。断言锚点须为实现独有短语(首轮用 `path`/`reference` 撞上既有
+   文案直接绿 = 重言式,已重写并逐条变异自证)。
 5. env 阀为 `False` 时 worker spec 的 skills 为空(现状字节级不变)。
 
 真栈层(测试环境,canary 租户探针,**绝不动对接方在用的 agent**):
