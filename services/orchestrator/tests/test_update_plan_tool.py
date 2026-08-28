@@ -213,3 +213,48 @@ async def test_update_plan_invalid_status_falls_back_to_pending() -> None:
         ctx=_ctx_with_plan(),
     )
     assert result.state_updates["plan"].steps[0].status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# B-35 — per-step execution marker (delegate | inline)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_plan_accepts_execution_marker() -> None:
+    tool = UpdatePlanTool()
+    result = await tool.call(
+        {
+            "steps": [
+                {"description": "fetch template details", "execution": "delegate"},
+                {"description": "decide and write", "execution": "inline"},
+                "aggregate results",
+            ],
+            "reason": "mark dispatch",
+        },
+        ctx=_ctx_with_plan(),
+    )
+    steps = result.state_updates["plan"].steps
+    assert steps[0].execution == "delegate"
+    assert steps[1].execution == "inline"
+    assert steps[2].execution == "inline"
+
+
+@pytest.mark.asyncio
+async def test_update_plan_invalid_execution_falls_back_to_inline() -> None:
+    """与 status 同哲学:坏值降级,不拒掉整次替换。"""
+    tool = UpdatePlanTool()
+    result = await tool.call(
+        {"steps": [{"description": "x", "execution": "bogus"}], "reason": "r"},
+        ctx=_ctx_with_plan(),
+    )
+    assert result.state_updates["plan"].steps[0].execution == "inline"
+
+
+def test_update_plan_schema_execution_enum_declares_type() -> None:
+    """B-34 —— moonshot 严格校验:enum 节点必须显式带 type。"""
+    params = UpdatePlanTool().spec.parameters
+    obj_variant = params["properties"]["steps"]["items"]["anyOf"][1]
+    execution = obj_variant["properties"]["execution"]
+    assert execution["type"] == "string"
+    assert set(execution["enum"]) == {"delegate", "inline"}

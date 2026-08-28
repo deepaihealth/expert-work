@@ -212,11 +212,13 @@ async def test_real_plan_model_serializes_to_documented_shape() -> None:
     )
     events, _, _ = await _run(graph)
     plan_frame = next(e for e in events if e.event == "plan")
+    # B-35 起每步多一个 ``execution`` 字段(默认 inline)——加字段的向后
+    # 兼容演进;消费端(plan_reducer / PUT /plan)都容忍未知/缺省字段。
     assert plan_frame.data == {
         "goal": "给客户出续约建议",
         "steps": [
-            {"id": "1", "description": "查档案", "status": "completed"},
-            {"id": "2", "description": "分析工单", "status": "pending"},
+            {"id": "1", "description": "查档案", "status": "completed", "execution": "inline"},
+            {"id": "2", "description": "分析工单", "status": "pending", "execution": "inline"},
         ],
     }
     assert isinstance(plan_frame.data["steps"], list)

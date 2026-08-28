@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from expert_work.protocol import Plan, PlanStep
-from expert_work.protocol.plan import PlanStepStatus
+from expert_work.protocol.plan import PlanStepExecution, PlanStepStatus
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 #: Stream CM-0 (N1) — valid per-step statuses the agent may set so the plan
 #: recitation reflects progress.
 _VALID_STATUSES: frozenset[str] = frozenset({"pending", "in_progress", "completed"})
+#: B-35 — per-step dispatch marker; inert outside plan_first.
+_VALID_EXECUTIONS: frozenset[str] = frozenset({"delegate", "inline"})
 _STATUS_BOX = {"pending": " ", "in_progress": "~", "completed": "x"}
 
 #: Caps on plan size to keep the rendered system context bounded. The
@@ -89,6 +91,17 @@ class UpdatePlanTool:
                                         "status": {
                                             "type": "string",
                                             "enum": ["pending", "in_progress", "completed"],
+                                        },
+                                        # B-35 — plan_first dispatch marker.
+                                        "execution": {
+                                            "type": "string",
+                                            "enum": ["delegate", "inline"],
+                                            "description": (
+                                                "How the step should be executed: "
+                                                "'delegate' = hand it to an ephemeral "
+                                                "worker (spawn_worker), 'inline' "
+                                                "(default) = do it yourself."
+                                            ),
                                         },
                                     },
                                     "required": ["description"],
@@ -154,17 +167,24 @@ class UpdatePlanTool:
             # the agent can mark progress; an invalid status falls back to
             # pending rather than rejecting the whole replan.
             status: PlanStepStatus = "pending"
+            execution: PlanStepExecution = "inline"
             if isinstance(raw_step, Mapping):
                 description = str(raw_step.get("description", "")).strip()
                 if raw_step.get("status") in _VALID_STATUSES:
                     status = cast(PlanStepStatus, raw_step["status"])
+                # B-35 — same philosophy as status: a bogus value degrades
+                # to the default instead of rejecting the whole replan.
+                if raw_step.get("execution") in _VALID_EXECUTIONS:
+                    execution = cast(PlanStepExecution, raw_step["execution"])
             else:
                 description = str(raw_step).strip()
             if not description:
                 continue
             if len(description) > _MAX_STEP_DESCRIPTION_CHARS:
                 description = description[:_MAX_STEP_DESCRIPTION_CHARS] + "…"
-            cleaned.append(PlanStep(id=str(index), description=description, status=status))
+            cleaned.append(
+                PlanStep(id=str(index), description=description, status=status, execution=execution)
+            )
 
         if not cleaned:
             msg = "update_plan requires at least one non-empty step description"
