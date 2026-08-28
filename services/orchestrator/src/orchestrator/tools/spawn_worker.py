@@ -175,7 +175,16 @@ class SpawnWorkerTool:
                 "conventions or templates kept in workspace files, reference "
                 "them by path (e.g. 'follow style/PLAN_STYLE.md') instead of "
                 "copying their content into the task — it reads the current "
-                "version itself, and nothing is lost in the retelling.\n"
+                "version itself, and nothing is lost in the retelling. "
+                # B-37 — the reverse direction: a worker's final message lands
+                # in this conversation verbatim, so bulk output should be
+                # offloaded to the shared workspace and referenced.
+                "Symmetrically, when a subtask will produce bulk output (a long "
+                "report, a dataset, generated content), tell it to write the "
+                "result to a file there and reply with a short summary plus the "
+                "path — its final message lands in this conversation in full, so "
+                "offloading keeps the bulk out of your context and lets you read "
+                "the untruncated version when you need it.\n"
                 "Treat worker results as raw material — "
                 "verify key conclusions here before relying on them."
             ),

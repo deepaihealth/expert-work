@@ -71,6 +71,15 @@ def _worker_system_prompt(role: str | None) -> str:
         " You share a persistent workspace with the orchestrator that spawned you: "
         "any path it mentions in your task is readable with your file tools, and "
         "files you write there persist after you finish."
+        # B-37 —— Anthropic「子 Agent 把产物写进文件系统,减少传话游戏的失真」。
+        # worker 的最终答案是全文进父上下文的(_child_run 的 content=answer),
+        # 大块产出原样穿过对话历史 = token 浪费 + 多级转手失真。上一句的共享
+        # 工作区认知是这条的前提:worker 知道父读得到,「只回路径」才不等于交白卷。
+        " When your result is bulky — a long report, a dataset, generated content — "
+        "write it to a file in that workspace and make your final message a short "
+        "summary plus the path, instead of pasting the whole thing back: the "
+        "orchestrator can read the file, and nothing is lost or truncated in the "
+        "retelling."
     )
 
 

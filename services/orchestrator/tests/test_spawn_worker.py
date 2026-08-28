@@ -354,3 +354,11 @@ def test_spec_description_prefers_path_reference_over_copying() -> None:
     desc = _tool(_RecordingWorkerBuilder()).spec.description
     assert "workspace" in desc
     assert "by path" in desc
+
+
+def test_spec_description_asks_worker_to_offload_bulk_output() -> None:
+    """B-37 —— 大块产出落盘回引用,而非穿过对话历史(Anthropic:"pass
+    lightweight references back to the coordinator... reduces token overhead
+    from copying large outputs through conversation history")。"""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description.lower()
+    assert "write the result to a file" in desc

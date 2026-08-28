@@ -276,3 +276,19 @@ def test_worker_prompt_states_shared_workspace() -> None:
     w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
     prompt = w.spec.system_prompt.template
     assert "workspace" in prompt.lower()
+
+
+def test_worker_prompt_tells_it_to_offload_bulk_output_to_a_file() -> None:
+    """B-37 —— Anthropic「子 Agent 把产物写进文件系统,减少传话游戏的失真」。
+
+    worker 的最终答案是**全文**进父上下文的(``_child_run`` 的
+    ``content=answer``;旁边的 result_excerpt 只是帧元数据,不影响模型看到的
+    内容),大块产出原样穿过对话历史 = token 浪费 + 多级转手失真。共享工作区
+    认知是这条引导的前提:worker 得先知道自己写的文件父读得到,「只回路径」
+    才不等于交白卷。锚点取实现独有短语,避免与既有文案重合成重言式。
+    """
+    prompt = synthesize_worker_spec(
+        _parent(), role=None, max_iterations=8, allowed_toolsets=[]
+    ).spec.system_prompt.template.lower()
+    assert "write it to a file" in prompt
+    assert "summary" in prompt
