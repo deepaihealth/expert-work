@@ -110,6 +110,11 @@ def test_spec_description_carries_shape_criteria() -> None:
     # Worker profile: fresh context, parallel, cheap.
     assert "sees none of this conversation" in desc
     assert "parallel" in desc
+    # 真栈对照(2026-08-28,run eac902ed)逮到的信息缺口:kimi 思考原文
+    # 「spawn_worker 有工具吗?」——不确定 worker 能不能自己拉数,于是放弃
+    # 委派取数型任务。工具继承必须写明,且钉住短语防止未来改丢。
+    assert "inherit your full tool set" in desc
+    assert "MCP tools" in desc
     # Proactive trigger — don't wait for the user to ask for delegation.
     assert "proactively" in desc
     # Positive shape criteria (should-delegate).
