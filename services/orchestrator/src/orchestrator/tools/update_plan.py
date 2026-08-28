@@ -83,7 +83,13 @@ class UpdatePlanTool:
                                     "type": "object",
                                     "properties": {
                                         "description": {"type": "string"},
-                                        "status": {"enum": ["pending", "in_progress", "completed"]},
+                                        # B-34 — moonshot 严格校验:enum 节点必须显式
+                                        # 声明 type,否则 kimi 400 拒掉整个请求(真栈
+                                        # run 0de32ed5 实证)。
+                                        "status": {
+                                            "type": "string",
+                                            "enum": ["pending", "in_progress", "completed"],
+                                        },
                                     },
                                     "required": ["description"],
                                 },
