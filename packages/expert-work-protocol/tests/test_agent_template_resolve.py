@@ -199,3 +199,15 @@ def test_parse_extends_ref_rejects_malformed(bad: str) -> None:
 def test_output_schema_is_capability_tier() -> None:
     """RT-1 PR-3 (RT-ADR-4) — the structured final-reply contract is tier ②."""
     assert FIELD_TIERS["output_schema"] is FieldTier.CAPABILITY
+
+
+def test_workflow_execution_mode_survives_resolve() -> None:
+    """B-35 —— spec §6 假设钉住:``workflow`` 整块是 CAPABILITY tier,
+    新子键 ``execution_mode`` 随块走,模板解析不得丢它。"""
+    base = _spec()
+    instance = _spec(
+        workflow={"type": "plan_execute", "execution_mode": "plan_first"},
+    )
+    resolved = resolve_extends(base, instance)
+    assert resolved.spec.workflow.execution_mode == "plan_first"
+    assert resolved.spec.workflow.type == "plan_execute"

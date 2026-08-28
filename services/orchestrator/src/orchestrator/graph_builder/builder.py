@@ -726,6 +726,24 @@ def build_react_graph(
             pending_delegate = [
                 s for s in plan.steps if s.execution == "delegate" and s.status != "completed"
             ]
+            # Kimi 真栈发现(2026-08-28)— the update_plan escape hatch can be
+            # abused: a dispatch turn that re-marks every delegate step inline
+            # (zero spawn_worker calls) previously left the degraded counter
+            # at 0, so the metric showed a healthy gate that was in fact
+            # talked around. Count it here: last turn was a dispatch turn,
+            # the delegate set is now empty, and its tool calls carried no
+            # spawn_worker → degraded (observability only, no flow change).
+            if not pending_delegate and bool(state.get("plan_first_dispatch_active")):
+                last_ai = next(
+                    (m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None
+                )
+                called = {
+                    str(c.get("name", ""))
+                    for c in (_extract_tool_calls(last_ai) if last_ai is not None else [])
+                }
+                if SPAWN_WORKER_TOOL_NAME not in called:
+                    _plan_first_dispatch_degraded_total.inc()
+                    logger.warning("agent.plan_first_dispatch_remarked_inline")
             if pending_delegate:
                 d_hash = _dispatch_plan_hash(plan)
                 prev_active = bool(state.get("plan_first_dispatch_active"))
@@ -1945,9 +1963,11 @@ def _build_dispatch_instruction(pending: list[PlanStep]) -> HumanMessage:
             "update_plan. Dispatch each step above via spawn_worker — "
             "several calls in parallel where independent — and write every "
             "task fully self-contained: spell out identifiers, scope, which "
-            "tools to use, and the expected output format. If a step is "
-            "marked delegate wrongly (it involves writes or the final "
-            "decision), re-mark it inline via update_plan instead. "
+            "tools to use, and the expected output format. Re-mark a step "
+            "inline via update_plan ONLY if it involves side-effectful "
+            "writes or the final decision — reading, summarising, "
+            "extracting, or drafting per-item content is exactly what "
+            "workers are for; do not re-mark those. "
             "Inline-marked steps stay with you for later turns."
         ),
         additional_kwargs={"expert_work_hide_from_ui": True},
