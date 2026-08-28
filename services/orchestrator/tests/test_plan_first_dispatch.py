@@ -323,3 +323,80 @@ async def test_budget_exhausted_wins_over_dispatch() -> None:
     assert llm.seen_tools[0] == []
     assert _hidden_with(state, _DISPATCH_MARKER) == []
     assert state.get("plan_first_dispatch_plan_hash") is None
+
+
+# ---------------------------------------------------------------------------
+# Re-mark escape hatch (kimi 真栈发现,2026-08-28) — a dispatch turn that
+# re-marks every delegate step inline via update_plan (no spawn_worker at
+# all) must count as degraded, or the metric shows a healthy gate that was
+# in fact talked around.
+# ---------------------------------------------------------------------------
+
+
+def _counter_value(counter: Any) -> float:
+    return float(counter._value.get())
+
+
+@pytest.mark.asyncio
+async def test_remarking_all_delegates_inline_counts_as_degraded() -> None:
+    from orchestrator.graph_builder.builder import _plan_first_dispatch_degraded_total
+
+    all_inline = [
+        {**s, "execution": "inline"} if s["execution"] == "delegate" else s for s in _DELEGATE_STEPS
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            # Dispatch turn: no spawn_worker — just re-mark everything inline.
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-2", all_inline, "remark")]),
+            AIMessage(content="done"),
+        ]
+    )
+    before = _counter_value(_plan_first_dispatch_degraded_total)
+    state = await _run(llm, thread_id="dispatch-remark-escape")
+    after = _counter_value(_plan_first_dispatch_degraded_total)
+
+    assert after == before + 1
+    # No retry / no second dispatch turn; the run ends normally.
+    assert str(state["messages"][-1].content) == "done"
+    assert not state.get("plan_first_dispatch_active")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_followed_by_spawn_does_not_count_degraded() -> None:
+    """真派发后 worker 干完、步骤标 completed —— 不算绕过。"""
+    from orchestrator.graph_builder.builder import _plan_first_dispatch_degraded_total
+
+    done_steps = [
+        {**s, "status": "completed"} if s["execution"] == "delegate" else s for s in _DELEGATE_STEPS
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _tc(SPAWN_WORKER_TOOL_NAME, "tc-2", {"task": "fetch A"}),
+                    _update_plan_call("tc-3", done_steps, "progress"),
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    before = _counter_value(_plan_first_dispatch_degraded_total)
+    await _run(llm, thread_id="dispatch-spawn-progress")
+    assert _counter_value(_plan_first_dispatch_degraded_total) == before
+
+
+def test_dispatch_instruction_narrows_the_remark_escape() -> None:
+    """措辞收紧:re-mark 只限写操作/最终拍板;读料/总结/提炼类明确不许改标。"""
+    from expert_work.protocol import PlanStep
+    from orchestrator.graph_builder.builder import _build_dispatch_instruction
+
+    text = str(
+        _build_dispatch_instruction(
+            [PlanStep(id="1", description="d", execution="delegate")]
+        ).content
+    )
+    assert "side-effectful writes" in text
+    assert "do not re-mark those" in text

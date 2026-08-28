@@ -365,3 +365,30 @@ export function artifactsFromTools(events: readonly SseEvent[]): TurnArtifact[] 
   }
   return [...byName.values()];
 }
+
+/** This turn's artifact chips — the ``end`` frame's registration snapshot
+ *  (产物清单契约 #1305) merged over the tool-call derivation above.
+ *
+ *  The snapshot is authoritative and the ONLY source that sees artifacts a
+ *  worker sub-run registered: those ``save_artifact`` calls happen inside the
+ *  child run, so the parent's event stream carries no matching tool call and
+ *  ``artifactsFromTools`` alone renders nothing (真栈 run c50b6446 — 9 件
+ *  worker 产物,主流只有 spawn_worker). Tool derivation stays as the
+ *  fallback for replays that predate the snapshot. */
+export function turnArtifacts(events: readonly SseEvent[]): TurnArtifact[] {
+  const byName = new Map<string, TurnArtifact>();
+  for (const a of artifactsFromTools(events)) byName.set(a.name, a);
+  for (const e of events) {
+    if (e.event !== "end") continue;
+    const raw = (e.data as { artifacts?: unknown } | null)?.artifacts;
+    if (!Array.isArray(raw)) continue;
+    for (const entry of raw) {
+      const item = entry as { name?: unknown; kind?: unknown } | null;
+      const name = typeof item?.name === "string" ? item.name.trim() : "";
+      if (name === "") continue;
+      const kind = typeof item?.kind === "string" ? item.kind : "other";
+      byName.set(name, { name, kind });
+    }
+  }
+  return [...byName.values()];
+}

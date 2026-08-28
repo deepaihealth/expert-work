@@ -67,6 +67,65 @@ place the two shapes differ.
 The console replay endpoint (`GET /v1/sessions/{thread_id}/runs/{run_id}/events`)
 does **not** take `stream_format`; it is legacy-only.
 
+## Consuming `worker` frames
+
+Agents with dynamic sub-agents delegate parts of a task to ephemeral child
+runs ("workers"). Agents configured with structured execution
+(`workflow.execution_mode: plan_first`) do this **routinely and in
+parallel** — a single run can carry several concurrent workers and thousands
+of frames, so a consumer that has only ever seen worker-free streams should
+verify each point below.
+
+Every `worker` frame shares one envelope:
+
+| field | value |
+|---|---|
+| `worker_id` | The child run's id — group a worker's frames by it |
+| `parent_worker_id` | Set when a worker itself delegated (nested); `null` at depth 1 |
+| `parent_tool_call_id` | The tool call that spawned this worker |
+| `label` | `"spawn_worker"` for dynamic workers; the sub-agent tool name for statically declared ones |
+| `agent_ref` | `"dynamic:<role>"`, or `name@version` for a declared sub-agent |
+| `depth` | Nesting depth (1 = direct child) |
+| `kind` | `"start"` \| `"update"` \| `"end"` |
+| `wseq` | Monotonic sequence **within this worker** (not global) |
+| `data` | Per-kind payload, below |
+
+Per-kind `data`:
+
+- `start` — `task_excerpt` (the delegated task, truncated to 500 chars),
+  `role` (nullable), `max_steps`.
+- `update` — one per child step: `node` (`"agent"` / `"tools"` / …),
+  `_duration_ms`, `step_count` (when known), and `messages` — an array of
+  summaries: `{type: "ai", content_excerpt, tool_calls?: [{name,
+  args_excerpt}]}` or `{type: "tool", name, tool_result_excerpt, …}`. All
+  excerpts are truncated; they are a progress view, not the full transcript.
+- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`.
+  `outcome` is one of `"success"`, `"max_steps"` (partial result, not a
+  failure), `"cancelled"`, or `"approval_blocked"` (the worker hit a tool
+  that requires human approval, which is unavailable inside a worker — the
+  main agent takes the sub-task back). Treat unknown outcome values as
+  non-success rather than erroring.
+
+Consumer checklist:
+
+1. **Event allowlist** — if you filter the stream by event name, `worker`
+   must be on the list; otherwise sub-tasks silently vanish from your
+   timeline.
+2. **Handle all three kinds**, and skip unknown kinds without aborting the
+   stream.
+3. **Interleaving** — frames from concurrent workers interleave. Group by
+   `worker_id`, order within a group by `wseq`; never assume one worker's
+   frames arrive contiguously.
+4. **Reconnect idempotency** — `worker` frames are persisted and replayed;
+   deduplicate on `(worker_id, wseq)`.
+5. **No token stream inside a worker** — `token` frames always belong to the
+   main agent. A worker's progress is only ever `update`-frame granular.
+6. **Volume** — budget parsing and rendering for runs with thousands of
+   frames.
+
+Frames persisted before 2026-08-27 may carry datamark fencing inside the
+excerpts (since fixed at the source); strip it on historical replays.
+
 ## The `token` event (provisional preview)
 
 For a streaming-capable run, the model's answer text is previewed token-by-token
