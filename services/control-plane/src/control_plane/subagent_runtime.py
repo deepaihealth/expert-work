@@ -64,6 +64,13 @@ def _worker_system_prompt(role: str | None) -> str:
         "in isolation." + focus + " Do the task fully and return a concise, complete "
         "result as your final message — it is reported straight back to the "
         "orchestrator, which sees none of your intermediate work."
+        # B-37 —— worker 与编排者共享 per-(tenant,user) 工作区,但此前提示词
+        # 从未说明,worker 拿到「按 style/PLAN_STYLE.md 办」这类路径也可能因为
+        # 不确定文件在不在自己这边而跳过。点明后「编排者给路径、worker 自己读」
+        # 这条路才走得通 —— 且读到的永远是最新版,而非编排者记忆里的版本。
+        " You share a persistent workspace with the orchestrator that spawned you: "
+        "any path it mentions in your task is readable with your file tools, and "
+        "files you write there persist after you finish."
     )
 
 
@@ -112,6 +119,7 @@ def synthesize_worker_spec(
     role: str | None,
     max_iterations: int,
     allowed_toolsets: list[str],
+    inherit_skills: bool = True,
 ) -> AgentSpec:
     """Derive an ephemeral worker :class:`AgentSpec` from ``parent`` (1.3).
 
@@ -123,11 +131,26 @@ def synthesize_worker_spec(
     platform allowlist, applies the already-resolved ``max_iterations``
     verbatim (:func:`resolve_worker_max_iterations` owns the clamp policy —
     per-agent request vs platform default/cap), and strips
-    stateful / delegation blocks (memory / triggers / skills / static
-    subagents / reflection / routing / knowledge) — the worker is stateless
-    and ephemeral. ``dynamic_workers`` stays default-on so a worker may
-    itself spawn while below the depth cap (a grand-worker inherits the
-    same override).
+    stateful / delegation blocks (memory / triggers / static subagents /
+    reflection / routing / knowledge) — the worker is stateless and
+    ephemeral. ``dynamic_workers`` stays default-on so a worker may itself
+    spawn while below the depth cap (a grand-worker inherits the same
+    override).
+
+    B-37 — ``skills`` are **inherited**, not stripped: binding a skill to an
+    agent means "this agent needs these abilities and rules", and a worker is
+    that agent's dispatched self. Stripping them left every worker blank in
+    the skill dimension (no summaries, no bodies, and — because ``skill_view``
+    registers only when at least one skill activated — not even a lookup
+    tool), which is why sop2's "PPT layout" worker had no ``pptx`` skill and
+    had to be handed hand-copied rules in its task text. Matches Claude Code
+    ("subagents load the same MCP and skill setup") and CrewAI (crew-level
+    skills shared by every agent). Cost stays bounded because skills are
+    progressive-disclosure: lazy skills contribute one ``<available-skills>``
+    summary line each, bodies load only when the worker calls ``skill_view``.
+    ``inherit_skills=False`` is the ops rollback valve (platform env, never a
+    tenant-facing setting) restoring the pre-B-37 stripped shape byte for byte.
+    See ``docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md``.
     """
     body = parent.spec
     worker_body = body.model_copy(
@@ -148,7 +171,8 @@ def synthesize_worker_spec(
             "subagents": [],
             "memory": None,
             "triggers": [],
-            "skills": [],
+            # B-37 —— 继承(见 docstring);回滚阀关掉时退回剥空。
+            "skills": list(body.skills) if inherit_skills else [],
             "reflection": None,
             "routing": None,
             "knowledge": None,
@@ -480,6 +504,9 @@ def make_worker_build_fn(
     skill_activity_recorder: SkillActivityRecorder | None = None,
     tenant_config_service: TenantConfigService | None = None,
     dynamic_worker_config_service: PlatformDynamicWorkerConfigService | None = None,
+    # B-37 —— 技能继承的运维回滚阀(平台 env,不进 UI)。False 让 worker spec
+    # 退回改动前的剥空形态,不发版即可回滚。
+    inherit_skills: bool = True,
     # B-26 —— judges 与 tool-budget 开关走主路径同一份决议
     # (runtime.resolve_defenses);worker 继承父 spec 的 defenses,此前五个
     # 防御参数全漏传。
@@ -525,6 +552,7 @@ def make_worker_build_fn(
                 dynamic_worker_config_service, max_iterations, parent=parent_spec
             ),
             allowed_toolsets=allowed_toolsets,
+            inherit_skills=inherit_skills,
         )
         provider_key_resolver = (
             make_provider_key_resolver(resolver=credentials_resolver, tenant_id=tenant_id)
@@ -589,6 +617,9 @@ def make_worker_build_fn(
             skill_store=skill_store,
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
+            # B-37 —— worker 的技能是继承来的,不是配置者为 worker 声明的:
+            # 模型不匹配 / 工具名冲突软跳过,别让一个技能炸掉整次委派。
+            skills_inherited=True,
             http_client=http_client,
         )
         logger.info("control_plane.worker.built role=%s depth=%d", role or "general", depth)

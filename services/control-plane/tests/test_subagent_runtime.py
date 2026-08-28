@@ -923,3 +923,71 @@ async def test_child_and_main_path_resolve_defenses_identically(
     assert main_kw["platform_tool_budget_enabled"] == child_kw["platform_tool_budget_enabled"]
     assert main_kw["default_run_deadline_s"] == child_kw["default_run_deadline_s"] == 1800
     assert main_kw["token_usage_kind"] == child_kw["token_usage_kind"] == "conversation"
+
+
+# ---------------------------------------------------------------------------
+# B-37 — 技能继承接线(worker 构建路径)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_build_inherits_parent_skills(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """B-37 —— 父绑的技能进 worker spec。此前剥空,导致做 PPT 的 worker
+    没有 pptx 技能(真栈 run d73fc7e3),只能靠主 Agent 抄规则文本。"""
+    doc = _spec("parent").model_dump(by_alias=True, exclude_none=True)
+    doc["spec"]["skills"] = ["pptx", "docx"]
+    parent = AgentSpec.model_validate(doc)
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+    )
+
+    await build_fn(parent, tenant_id=uuid4(), role="probe", depth=1)
+
+    assert build_calls[0]["spec"].spec.skills == ["pptx", "docx"]
+
+
+@pytest.mark.asyncio
+async def test_worker_build_marks_skills_as_inherited(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """继承来的技能必须走软失败:worker 常跑不同(更便宜的)模型,某技能限定
+    父模型时,硬失败会炸掉**整次委派**而不是少一个技能。"""
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+    )
+
+    await build_fn(_spec("parent"), tenant_id=uuid4(), role="probe", depth=1)
+
+    assert build_calls[0]["skills_inherited"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_build_skill_inheritance_rollback_valve(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """运维回滚阀(平台 env,不进 UI):关掉后 worker spec 退回剥空形态。"""
+    doc = _spec("parent").model_dump(by_alias=True, exclude_none=True)
+    doc["spec"]["skills"] = ["pptx"]
+    parent = AgentSpec.model_validate(doc)
+    build_fn = make_worker_build_fn(
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+        max_iterations=8,
+        allowed_toolsets=[],
+        inherit_skills=False,
+    )
+
+    await build_fn(parent, tenant_id=uuid4(), role="probe", depth=1)
+
+    assert build_calls[0]["spec"].spec.skills == []

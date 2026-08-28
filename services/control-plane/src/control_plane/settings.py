@@ -723,6 +723,11 @@ class Settings(BaseSettings):
     dynamic_worker_cap_max_concurrent: int = Field(default=10, gt=0, le=64)
     dynamic_worker_cap_max_per_run: int = Field(default=64, gt=0, le=1024)
     dynamic_worker_cap_max_iterations: int = Field(default=128, gt=0, le=512)
+    #: B-37 —— 动态子 Agent 是否继承父 Agent 绑定的技能(默认继承)。这是**运维
+    #: 回滚阀**,不是面向配置者的开关(不进 UI):技能继承对所有租户生效,需要
+    #: 不发版即可回退的手段。False 让 worker spec 退回 B-37 前的剥空形态。
+    #: 设计见 docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md。
+    dynamic_worker_inherit_skills: bool = Field(default=True)
     #: Tool-name allowlist a spawned worker may inherit from its parent
     #: (intersected with the parent's tools). Empty = inherit the parent's
     #: tools verbatim (still a subset of what the parent itself had).

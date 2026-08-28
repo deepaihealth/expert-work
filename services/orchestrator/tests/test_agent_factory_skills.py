@@ -510,3 +510,97 @@ async def test_auto_attach_tool_conflict_soft_skips(cp: BaseCheckpointSaver[obje
     )
     assert 'name="foo"' in built.system_prompt
     assert "clashing" not in built.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# B-37 — inherited skills degrade softly (worker path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inherited_skill_model_mismatch_skips_instead_of_raising(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """B-37 —— worker 继承来的技能遇模型不匹配必须软跳过。
+
+    worker 常跑不同的(更便宜的)模型;若某技能限定了父模型,硬失败会让
+    **整个 spawn_worker 构建炸掉**,不是少一个技能。配置者从没为 worker 声明
+    过这些技能,失败不该记在他头上。与 evolved 自动挂载技能的软失败同源。
+    """
+    spec = _spec_with_skills(["foo"])
+    version = _make_version(name="foo", required_models=("gpt-4o",))
+    resolver = _make_resolver({("foo", None): _SkillLookupResult.ok(version)})
+    built = await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=resolver,
+        tenant_id=uuid4(),
+        skills_inherited=True,
+    )
+    # 构建成功,且不匹配的技能没进提示词
+    assert "be helpful with X" not in built.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_manifest_declared_skill_mismatch_still_raises(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """现状钉住:配置者显式声明的技能不匹配仍然硬失败(静默忽略比失败更糟)。"""
+    spec = _spec_with_skills(["foo"])
+    version = _make_version(name="foo", required_models=("gpt-4o",))
+    resolver = _make_resolver({("foo", None): _SkillLookupResult.ok(version)})
+    with pytest.raises(SkillModelMismatchError, match="gpt-4o"):
+        await _build(
+            spec,
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            skill_resolver=resolver,
+            tenant_id=uuid4(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_inherited_skill_tool_conflict_skips_instead_of_raising(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """同理:两个继承技能抢同一个工具名,跳过后来者而非炸掉委派构建。"""
+    spec = _spec_with_skills(["foo", "bar"])
+    resolver = _make_resolver(
+        {
+            ("foo", None): _SkillLookupResult.ok(
+                _make_version(name="foo", tool_names=("shared_tool",))
+            ),
+            ("bar", None): _SkillLookupResult.ok(
+                _make_version(name="bar", tool_names=("shared_tool",))
+            ),
+        }
+    )
+    built = await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=resolver,
+        tenant_id=uuid4(),
+        skills_inherited=True,
+    )
+    assert built is not None
+
+
+@pytest.mark.asyncio
+async def test_inherited_matching_skill_still_loads(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """软失败只对「装不下的」生效,能用的技能照常进提示词。"""
+    spec = _spec_with_skills(["foo"])
+    version = _make_version(name="foo", required_models=("claude-sonnet-4-6",))
+    resolver = _make_resolver({("foo", None): _SkillLookupResult.ok(version)})
+    built = await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=resolver,
+        tenant_id=uuid4(),
+        skills_inherited=True,
+    )
+    assert "be helpful with X" in built.system_prompt

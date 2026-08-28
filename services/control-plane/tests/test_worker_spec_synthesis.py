@@ -237,3 +237,42 @@ async def test_resolve_no_service_requested_clamped_to_boot_fallback() -> None:
     assert await resolve_worker_max_iterations(None, 32, parent=parent) == 32
     parent2 = _parent(dynamic_workers={"max_iterations": 6})
     assert await resolve_worker_max_iterations(None, 32, parent=parent2) == 6
+
+
+# ---------------------------------------------------------------------------
+# B-37 — 子 Agent 技能继承(零配置默认)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_inherits_parent_skills() -> None:
+    """B-37 —— worker 是父 Agent 派出去干活的分身,父绑的技能它该有。
+
+    配置者绑技能的语义是「这个 Agent 需要这些本事和规矩」;剥空会让 worker
+    在技能维度完全空白(连 skill_view 入口都不注册)。对齐 Claude Code
+    「子 Agent 加载同一套 MCP 和技能配置」与 CrewAI crew 级技能全员共享。
+    """
+    parent = _parent(skills=["pptx", "docx", "writing-plans"])
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.skills == ["pptx", "docx", "writing-plans"]
+
+
+def test_worker_skills_empty_when_parent_has_none() -> None:
+    """不绑技能的 Agent 零行为变化(继承空 = 现状)。"""
+    w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.skills == []
+
+
+def test_worker_skill_inheritance_can_be_disabled_for_rollback() -> None:
+    """运维回滚阀(env,不进 UI):关掉后 worker spec 与改动前字节级一致。"""
+    parent = _parent(skills=["pptx"])
+    w = synthesize_worker_spec(
+        parent, role=None, max_iterations=8, allowed_toolsets=[], inherit_skills=False
+    )
+    assert w.spec.skills == []
+
+
+def test_worker_prompt_states_shared_workspace() -> None:
+    """B-37 —— worker 不知道自己与编排者共用工作区,主 Agent 给了路径也可能不敢读。"""
+    w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    prompt = w.spec.system_prompt.template
+    assert "workspace" in prompt.lower()
