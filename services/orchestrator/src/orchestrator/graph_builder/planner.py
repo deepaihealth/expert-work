@@ -53,6 +53,27 @@ _PLANNER_SYSTEM = (
     '"steps": ["<step 1>", "<step 2>", ...]}'
 )
 
+#: B-35 — plan_first variant: each step additionally carries an
+#: ``execution`` marker. The delegate criteria mirror the 层 0 shape
+#: criteria in the ``spawn_worker`` tool description (domain-free).
+_PLANNER_SYSTEM_PLAN_FIRST = (
+    "You are a planning module. Break the given task into a short, ordered "
+    "list of concrete steps that an agent will then execute. Keep the plan "
+    "minimal — only the steps genuinely needed, no filler.\n"
+    "Mark each step with how it should be executed:\n"
+    '- "delegate" — the step fits one of these shapes, regardless of domain: '
+    "three or more similar, mutually independent sub-items; reading long "
+    "materials in full where only the conclusions matter; exploratory "
+    "search in a large body of content. Delegate-marked steps are handed "
+    "to parallel worker sub-agents.\n"
+    '- "inline" — everything else, especially small single-step work, '
+    "writes, and final decisions (those stay with the main agent).\n"
+    "Respond with ONLY a JSON object, no prose and no code fences:\n"
+    '{"goal": "<one-sentence restatement of the task>", '
+    '"steps": [{"description": "<step 1>", "execution": "delegate"}, '
+    '{"description": "<step 2>", "execution": "inline"}, ...]}'
+)
+
 _PLANNER_USER = "Task:\n{task}"
 
 
@@ -96,11 +117,12 @@ def parse_plan(text: str, *, fallback_goal: str) -> Plan:
             data = json.loads(raw)
             goal = str(data["goal"]).strip()
             steps = tuple(
-                PlanStep(id=str(index), description=description)
-                for index, description in enumerate(
-                    (str(step).strip() for step in data["steps"]), start=1
+                step
+                for step in (
+                    _parse_step(index, raw_step)
+                    for index, raw_step in enumerate(data["steps"], start=1)
                 )
-                if description
+                if step is not None
             )
             if goal and steps:
                 return Plan(goal=goal, steps=steps)
@@ -111,6 +133,27 @@ def parse_plan(text: str, *, fallback_goal: str) -> Plan:
     return Plan(
         goal=fallback_goal,
         steps=(PlanStep(id="1", description=fallback_goal),),
+    )
+
+
+def _parse_step(index: int, raw_step: Any) -> PlanStep | None:
+    """One planner step — a bare description string, or (B-35 plan_first)
+    a ``{description, execution}`` object. A bogus ``execution`` degrades
+    to ``inline`` (same tolerance philosophy as the rest of the parse);
+    a blank description drops the step."""
+    execution = "inline"
+    if isinstance(raw_step, dict):
+        description = str(raw_step.get("description", "")).strip()
+        if raw_step.get("execution") in ("delegate", "inline"):
+            execution = str(raw_step["execution"])
+    else:
+        description = str(raw_step).strip()
+    if not description:
+        return None
+    return PlanStep(
+        id=str(index),
+        description=description,
+        execution="delegate" if execution == "delegate" else "inline",
     )
 
 
@@ -138,8 +181,13 @@ def render_plan(plan: Plan) -> str:
     return "\n".join(lines)
 
 
-def make_planner_node(llm_caller: LLMCaller) -> PlannerNode:
-    """Build the ``planner`` graph node bound to ``llm_caller``."""
+def make_planner_node(llm_caller: LLMCaller, *, plan_first: bool = False) -> PlannerNode:
+    """Build the ``planner`` graph node bound to ``llm_caller``.
+
+    ``plan_first`` (B-35) switches to the prompt variant that asks for a
+    per-step ``execution`` marker; ``False`` (default) keeps the original
+    prompt byte-identical.
+    """
 
     async def planner_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         token = cancellation_token(config)
@@ -147,7 +195,7 @@ def make_planner_node(llm_caller: LLMCaller) -> PlannerNode:
 
         task = _extract_task(list(state["messages"]))
         plan_messages: list[BaseMessage] = [
-            SystemMessage(content=_PLANNER_SYSTEM),
+            SystemMessage(content=_PLANNER_SYSTEM_PLAN_FIRST if plan_first else _PLANNER_SYSTEM),
             HumanMessage(content=_PLANNER_USER.format(task=task)),
         ]
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "planner"):

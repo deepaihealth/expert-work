@@ -228,3 +228,16 @@ class AgentState(TypedDict):
     #: re-nudges; a structurally new plan may. Absent until the first nudge;
     #: only ever written when the registry carries ``spawn_worker``.
     delegation_nudge_plan_hash: NotRequired[str | None]
+    #: B-35(plan_first 分发轮)— identity hash (goal + step descriptions +
+    #: execution markers, statuses excluded) of the last plan version a
+    #: dispatch turn ran for. Dedupe key: one dispatch turn per plan version;
+    #: a structural replan (new/changed delegate steps) re-fires. All three
+    #: channels are only ever written when the build has ``plan_first`` on.
+    plan_first_dispatch_plan_hash: NotRequired[str | None]
+    #: B-35 — True while the just-finished agent turn was a dispatch turn;
+    #: ``_should_continue`` routes a tool-less reply back to ``agent``
+    #: (retry / degrade) instead of ending the run.
+    plan_first_dispatch_active: NotRequired[bool]
+    #: B-35 — 0 on a fresh dispatch turn, 1 once the single retry was spent;
+    #: the next refusal degrades (full tools restored) instead of looping.
+    plan_first_dispatch_retries: NotRequired[int]
