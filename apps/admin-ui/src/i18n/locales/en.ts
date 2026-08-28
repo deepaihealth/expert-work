@@ -648,6 +648,22 @@ export interface TranslationKeys {
     wf_type_opt_react: string;
     wf_type_opt_plan_execute: string;
     wf_type_opt_custom: string;
+    plan_first_label: string;
+    plan_first_brief: string;
+    plan_first_impact: string;
+    plan_first_default: string;
+    plan_first_modal_title: string;
+    plan_first_modal_will_change: string;
+    plan_first_modal_change_wf: string;
+    plan_first_modal_change_dw: string;
+    plan_first_modal_checklist: string;
+    plan_first_modal_check_token: string;
+    plan_first_modal_check_iterations: string;
+    plan_first_modal_check_deadline: string;
+    plan_first_modal_check_reflection: string;
+    plan_first_modal_check_trigger: string;
+    plan_first_modal_ok: string;
+    plan_first_off_notice: string;
     max_no_progress_label: string;
     max_no_progress_brief: string;
     max_no_progress_impact: string;
@@ -3733,6 +3749,32 @@ const en: TranslationKeys = {
     wf_type_opt_react: "react (think, then act)",
     wf_type_opt_plan_execute: "plan_execute (plan, then execute)",
     wf_type_opt_custom: "custom (deprecated — same as react)",
+    plan_first_label: "Structured execution (plan_first)",
+    plan_first_brief:
+      "Steps the plan marks as delegate are guaranteed to run through worker sub-agents",
+    plan_first_impact:
+      "Off (default): whether the agent delegates to worker sub-agents is left to the model — in practice it almost always does the work itself. On: the planner marks each step delegate or inline; when delegate steps are pending, the agent gets a dispatch turn where its only tools are spawn_worker and update_plan, so delegation is guaranteed by structure. Writes and final decisions always stay with the main agent.",
+    plan_first_default: "off",
+    plan_first_modal_title: "Turn on structured execution (plan_first)?",
+    plan_first_modal_will_change: "Will be changed automatically:",
+    plan_first_modal_change_wf:
+      "Workflow type: {{from}} → plan_execute (plan_first needs the upfront planner)",
+    plan_first_modal_change_dw:
+      "Dynamic worker sub-agents: off → on (workers are the execution arm)",
+    plan_first_modal_checklist: "Worth checking before you confirm:",
+    plan_first_modal_check_token:
+      "Token cost: parallel worker sub-agents can use around 15× the tokens of a single agent — make sure the task value justifies it",
+    plan_first_modal_check_iterations:
+      "Max steps: dispatch and aggregation turns consume iterations — a small max_iterations may run out",
+    plan_first_modal_check_deadline:
+      "Run deadline: parallel workers share the global deadline — a short one cuts them off mid-flight",
+    plan_first_modal_check_reflection:
+      "Reflection: when reflect revises the plan, new delegate steps trigger another dispatch round",
+    plan_first_modal_check_trigger:
+      "Triggers: scheduled runs also execute in plan_first mode — check their cost is acceptable",
+    plan_first_modal_ok: "Turn on",
+    plan_first_off_notice:
+      "Structured execution turned off. Workflow type and dynamic workers keep their current values — adjust them manually if needed.",
     max_no_progress_label: "No-progress stop",
     max_no_progress_brief: "Stop early once it's stuck making no progress",
     max_no_progress_impact:

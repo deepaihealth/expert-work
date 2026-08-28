@@ -655,6 +655,30 @@ const zhCN: TranslationKeys = {
     wf_type_opt_react: "react（边想边做）",
     wf_type_opt_plan_execute: "plan_execute（先规划后执行）",
     wf_type_opt_custom: "custom（已弃用，等同 react）",
+    plan_first_label: "结构化执行（plan_first）",
+    plan_first_brief: "委派步骤保证由子智能体并行执行",
+    plan_first_impact:
+      "关（默认）：要不要把活分给子智能体，由模型自己权衡——实际上它几乎总是自己干。开：规划时给每一步标上「委派/自己做」；有待委派步骤时，智能体会进入一个只能使用 spawn_worker 和 update_plan 的分发轮，委派由结构保证而不再靠模型自觉。写操作和最终拍板始终留在主智能体。",
+    plan_first_default: "关",
+    plan_first_modal_title: "开启结构化执行（plan_first）？",
+    plan_first_modal_will_change: "将自动修改：",
+    plan_first_modal_change_wf:
+      "工作流类型：{{from}} → plan_execute（plan_first 依赖先规划后执行）",
+    plan_first_modal_change_dw: "动态子智能体：关闭 → 开启（子智能体是执行主力）",
+    plan_first_modal_checklist: "建议确认后再开启：",
+    plan_first_modal_check_token:
+      "token 花费：多个子智能体并行干活，总花费可能达到单智能体的 15 倍左右——确认任务价值配得上",
+    plan_first_modal_check_iterations:
+      "最大步数：分发和汇总都要消耗步数，max_iterations 设得太小可能不够用",
+    plan_first_modal_check_deadline:
+      "运行时限：并行子智能体共用全局时限，设得太短会把干到一半的子智能体截断",
+    plan_first_modal_check_reflection:
+      "反思协同：反思修改计划后，新出现的委派步骤会再触发一轮分发",
+    plan_first_modal_check_trigger:
+      "定时触发：定时任务的运行同样按结构化执行跑——确认这部分花费可以接受",
+    plan_first_modal_ok: "确认开启",
+    plan_first_off_notice:
+      "已关闭结构化执行。工作流类型和动态子智能体保持当前值，如需调整请手动修改。",
     max_no_progress_label: "无进展停机",
     max_no_progress_brief: "连续无进展时提前结束运行",
     max_no_progress_impact:
