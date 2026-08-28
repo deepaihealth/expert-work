@@ -40,6 +40,7 @@ import {
   readRunBudget,
   type RunBudgetFields,
 } from "../form_model";
+import { PlanFirstToggle } from "../widgets/PlanFirstToggle";
 
 const { Text } = Typography;
 
@@ -141,6 +142,9 @@ export function RunBudgetSection({ formData, onChange }: RunBudgetSectionProps) 
         {t("run_budget.subhead_steps")}
       </Text>
       <PolicyFieldList defs={STEP_DEFS} values={budget} onPatch={handlePatch} />
+      {/* B-35 — plan_first 开关带联动确认 Modal,不走 FieldDef 表
+          (需要 Modal 交互 + 三字段一次写入,FieldRow 覆盖不了)。 */}
+      <PlanFirstToggle formData={formData} onChange={onChange} />
       <Text strong style={{ display: "block", margin: "16px 0 8px" }}>
         {t("run_budget.subhead_time")}
       </Text>
