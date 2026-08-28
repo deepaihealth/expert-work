@@ -109,7 +109,9 @@ export function PlatformDynamicWorkerSection({
     void load();
   }, [load]);
 
-  const hasEmptyField = Object.values(draft).some((v) => v === null);
+  // ``== null`` 兜 undefined:GET 载荷缺键(老形状/异常)时禁存,而不是
+  // 发出一个缺字段的 PUT 去撞后端 422。
+  const hasEmptyField = Object.values(draft).some((v) => v == null);
   const pairsAboveCap = KNOB_PAIRS.filter(({ defaultKey, capKey }) => {
     const d = draft[defaultKey];
     const c = draft[capKey];

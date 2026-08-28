@@ -37,7 +37,14 @@ const DYNAMIC_WORKER_CONFIG = {
   success: true,
   data: {
     configured: null,
-    effective: { max_concurrent: 3, max_per_run: 16, max_iterations: 32 },
+    effective: {
+      max_concurrent: 3,
+      max_per_run: 16,
+      max_iterations: 32,
+      cap_max_concurrent: 10,
+      cap_max_per_run: 64,
+      cap_max_iterations: 128,
+    },
   },
   error: null,
 };
@@ -45,8 +52,22 @@ const DYNAMIC_WORKER_CONFIG = {
 const DYNAMIC_WORKER_PUT_RESULT = {
   success: true,
   data: {
-    configured: { max_concurrent: 5, max_per_run: 16, max_iterations: 32 },
-    effective: { max_concurrent: 5, max_per_run: 16, max_iterations: 32 },
+    configured: {
+      max_concurrent: 5,
+      max_per_run: 16,
+      max_iterations: 32,
+      cap_max_concurrent: 10,
+      cap_max_per_run: 64,
+      cap_max_iterations: 128,
+    },
+    effective: {
+      max_concurrent: 5,
+      max_per_run: 16,
+      max_iterations: 32,
+      cap_max_concurrent: 10,
+      cap_max_per_run: 64,
+      cap_max_iterations: 128,
+    },
   },
   error: null,
 };
@@ -92,6 +113,10 @@ test("system_admin views + edits the platform dynamic-worker guardrails", async 
   await expect(page.getByTestId("pdw-max-concurrent")).toHaveValue("3");
   await expect(page.getByTestId("pdw-max-per-run")).toHaveValue("16");
   await expect(page.getByTestId("pdw-max-iterations")).toHaveValue("32");
+  // 弹性 worker 预算 — hard-cap tier renders too
+  await expect(page.getByTestId("pdw-cap-max-concurrent")).toHaveValue("10");
+  await expect(page.getByTestId("pdw-cap-max-per-run")).toHaveValue("64");
+  await expect(page.getByTestId("pdw-cap-max-iterations")).toHaveValue("128");
 
   await page.getByTestId("pdw-max-concurrent").fill("5");
 
@@ -107,6 +132,9 @@ test("system_admin views + edits the platform dynamic-worker guardrails", async 
   expect(body.max_concurrent).toBe(5);
   expect(body.max_per_run).toBe(16);
   expect(body.max_iterations).toBe(32);
+  expect(body.cap_max_concurrent).toBe(10);
+  expect(body.cap_max_per_run).toBe(64);
+  expect(body.cap_max_iterations).toBe(128);
 });
 
 test("settings/platform with the dynamic-worker section passes axe", async ({
