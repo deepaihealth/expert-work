@@ -12,7 +12,7 @@
  * Emits the FULL merged manifest via the form_model writers.
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { Button, Input, Select, Switch, Typography } from "antd";
+import { Button, Input, InputNumber, Select, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listAgents } from "../../api/agents";
@@ -21,12 +21,16 @@ import { FieldHelp } from "../FieldHelp";
 import { FieldRow } from "./FieldRow";
 import {
   readDynamicWorkersOn,
+  readRunBudget,
   readSubagents,
+  readWorkerBudget,
   readWorkerModel,
   setDynamicWorkersOn,
   setSubagents,
+  setWorkerBudgetField,
   setWorkerModel,
   type SubAgentFields,
+  type WorkerBudgetFields,
 } from "./form_model";
 import { ModelSelect } from "./widgets/ModelSelect";
 
@@ -43,6 +47,86 @@ interface SubagentPickerProps {
   onChange: (data: unknown) => void;
   /** Model catalog for the worker-model override picker. */
   catalog?: ModelCatalog;
+}
+
+/** 步数上限高到这个值以上、且没设运行 Token 预算时,展示成本兜底软提示。 */
+const TOKEN_HINT_ITERATIONS_THRESHOLD = 40;
+
+const WORKER_BUDGET_ROWS: ReadonlyArray<{
+  key: keyof WorkerBudgetFields;
+  labelKey: string;
+  max: number;
+}> = [
+  {
+    key: "max_iterations",
+    labelKey: "agent_form.worker_budget_max_iterations_label",
+    max: 512,
+  },
+  {
+    key: "max_concurrent",
+    labelKey: "agent_form.worker_budget_max_concurrent_label",
+    max: 64,
+  },
+  {
+    key: "max_per_run",
+    labelKey: "agent_form.worker_budget_max_per_run_label",
+    max: 1024,
+  },
+];
+
+function WorkerBudgetSection({
+  budget,
+  tokenBudget,
+  onFieldChange,
+}: {
+  budget: WorkerBudgetFields;
+  tokenBudget: number | undefined;
+  onFieldChange: (key: keyof WorkerBudgetFields, value: number | null) => void;
+}) {
+  const { t } = useTranslation();
+  const showTokenHint =
+    (budget.max_iterations ?? 0) > TOKEN_HINT_ITERATIONS_THRESHOLD &&
+    !tokenBudget;
+  return (
+    <div data-testid="af-worker-budget" style={{ margin: "0 0 24px" }}>
+      <label style={{ display: "block", marginBottom: 4 }}>
+        {t("agent_form.worker_budget_heading")}
+        <FieldHelp
+          text={t("agent_form.worker_budget_hint")}
+          testId="af-worker-budget"
+        />
+      </label>
+      <Text type="secondary" style={{ display: "block", marginBottom: 8, fontSize: 12 }}>
+        {t("agent_form.worker_budget_hint")}
+      </Text>
+      {WORKER_BUDGET_ROWS.map(({ key, labelKey, max }) => (
+        <div
+          key={key}
+          style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
+        >
+          <span style={{ fontSize: 13 }}>{t(labelKey)}</span>
+          <InputNumber
+            min={1}
+            max={max}
+            value={budget[key] ?? null}
+            placeholder={t("agent_form.worker_budget_platform_default")}
+            aria-label={t(labelKey)}
+            data-testid={`af-worker-budget-${key.replace(/_/g, "-")}`}
+            onChange={(v) => onFieldChange(key, v ?? null)}
+          />
+        </div>
+      ))}
+      {showTokenHint && (
+        <Text
+          type="warning"
+          style={{ display: "block", fontSize: 12 }}
+          data-testid="af-worker-budget-token-hint"
+        >
+          {t("agent_form.worker_budget_token_hint")}
+        </Text>
+      )}
+    </div>
+  );
 }
 
 export function SubagentPicker({ formData, onChange, catalog }: SubagentPickerProps) {
@@ -141,6 +225,20 @@ export function SubagentPicker({ formData, onChange, catalog }: SubagentPickerPr
             </Button>
           )}
         </div>
+      )}
+
+      {/* 弹性 worker 预算 — per-agent budget requests. Blank = the platform
+          default tier; a set value is clamped to the platform hard cap at
+          run time (the backend owns the clamp, so no cap value is shown —
+          tenant admins cannot read the platform config). */}
+      {dynamicWorkersOn && (
+        <WorkerBudgetSection
+          budget={readWorkerBudget(formData)}
+          tokenBudget={readRunBudget(formData).tokenBudget}
+          onFieldChange={(key, value) =>
+            onChange(setWorkerBudgetField(formData, key, value))
+          }
+        />
       )}
 
       <Heading>

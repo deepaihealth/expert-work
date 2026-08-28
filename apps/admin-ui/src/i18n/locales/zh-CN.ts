@@ -1144,6 +1144,15 @@ const zhCN: TranslationKeys = {
     worker_model_hint:
       "不配置则临时子智能体沿用主模型（含推理深度等全部设置）。配置后临时子智能体改用这里的模型 —— 常用于给分头执行的子任务换便宜档。无备用模型链。",
     worker_model_clear: "清除（沿用主模型）",
+    worker_budget_heading: "子智能体预算",
+    worker_budget_hint:
+      "为临时子智能体单独设的额度，留空则使用平台默认值；超过平台硬顶的部分会在运行时被压到硬顶以内。改后下一次运行生效。",
+    worker_budget_max_iterations_label: "单个子智能体步数上限",
+    worker_budget_max_concurrent_label: "单运行并发上限",
+    worker_budget_max_per_run_label: "单运行累计生成上限",
+    worker_budget_token_hint:
+      "步数上限设得较高、但本 Agent 未设运行 Token 预算：建议在「运行预算」里同时设置 Token 预算，让失控的批量子任务也被成本兜底。",
+    worker_budget_platform_default: "平台默认",
     approval_timeout: "审批等待上限（秒）",
     approval_timeout_brief: "审批超时没人处理就自动拒绝",
     approval_timeout_help:

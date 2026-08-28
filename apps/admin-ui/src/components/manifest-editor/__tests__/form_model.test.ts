@@ -37,6 +37,8 @@ import {
   setDynamicWorkersOn,
   setKnowledgeRefs,
   setWorkerModel,
+  readWorkerBudget,
+  setWorkerBudgetField,
   setReflectionEvaluator,
   setSkills,
   setSubagents,
@@ -614,6 +616,40 @@ describe("dynamic workers (spawn_worker opt-out)", () => {
 
   it("does not mutate the input manifest", () => {
     setDynamicWorkersOn(seed, false);
+    expect(
+      (seed.spec as { dynamic_workers?: unknown }).dynamic_workers,
+    ).toBeUndefined();
+  });
+});
+
+describe("worker budget requests (dynamic_workers.max_*)", () => {
+  it("reads {} when absent (platform defaults apply)", () => {
+    expect(readWorkerBudget(seed)).toEqual({});
+  });
+
+  it("set writes a single budget field, keeping siblings", () => {
+    const next = setWorkerBudgetField(seed, "max_iterations", 48);
+    expect(next.spec?.dynamic_workers).toEqual({ max_iterations: 48 });
+    const both = setWorkerBudgetField(next, "max_concurrent", 5);
+    expect(readWorkerBudget(both)).toEqual({ max_iterations: 48, max_concurrent: 5 });
+  });
+
+  it("clear (null) drops the field and the block when nothing else remains", () => {
+    const set = setWorkerBudgetField(seed, "max_per_run", 32);
+    const cleared = setWorkerBudgetField(set, "max_per_run", null);
+    expect(cleared.spec?.dynamic_workers).toBeUndefined();
+    expect(readWorkerBudget(cleared)).toEqual({});
+  });
+
+  it("clear keeps sibling fields (enabled:false / other budget keys)", () => {
+    const off = setDynamicWorkersOn(seed, false);
+    const set = setWorkerBudgetField(off, "max_iterations", 48);
+    const cleared = setWorkerBudgetField(set, "max_iterations", null);
+    expect(cleared.spec?.dynamic_workers).toEqual({ enabled: false });
+  });
+
+  it("does not mutate the input manifest", () => {
+    setWorkerBudgetField(seed, "max_iterations", 48);
     expect(
       (seed.spec as { dynamic_workers?: unknown }).dynamic_workers,
     ).toBeUndefined();

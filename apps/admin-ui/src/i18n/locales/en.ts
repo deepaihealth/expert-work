@@ -1082,6 +1082,13 @@ export interface TranslationKeys {
     worker_model_label: string;
     worker_model_hint: string;
     worker_model_clear: string;
+    worker_budget_heading: string;
+    worker_budget_hint: string;
+    worker_budget_max_iterations_label: string;
+    worker_budget_max_concurrent_label: string;
+    worker_budget_max_per_run_label: string;
+    worker_budget_token_hint: string;
+    worker_budget_platform_default: string;
     approval_timeout: string;
     approval_timeout_brief: string;
     approval_timeout_help: string;
@@ -4262,6 +4269,15 @@ const en: TranslationKeys = {
     worker_model_hint:
       "Unset: ephemeral subagents inherit the main model (including thinking settings). Set: they use this model instead — typically a cheaper tier for fan-out subtasks. No fallback chain.",
     worker_model_clear: "Clear (inherit the main model)",
+    worker_budget_heading: "Subagent budget",
+    worker_budget_hint:
+      "Optional per-agent limits for ephemeral subagents. Leave blank to use the platform defaults; values above the platform hard cap are clamped to it at run time. Takes effect on the next run.",
+    worker_budget_max_iterations_label: "Max steps per subagent",
+    worker_budget_max_concurrent_label: "Max concurrent subagents per run",
+    worker_budget_max_per_run_label: "Max cumulative subagents per run",
+    worker_budget_token_hint:
+      "High step limit with no run token budget: consider setting a token budget (Run budget section) so a runaway fan-out is bounded by cost too.",
+    worker_budget_platform_default: "Platform default",
     approval_timeout: "Approval wait limit (seconds)",
     approval_timeout_brief: "Auto-rejects if no one responds in time",
     approval_timeout_help:
