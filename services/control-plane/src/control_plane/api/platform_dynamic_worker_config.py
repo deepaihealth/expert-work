@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from control_plane.api._authz import _principal, platform_only
 from control_plane.audit import emit
@@ -35,12 +35,27 @@ _PLATFORM_SCOPE_MESSAGE = "only a system admin may manage the platform dynamic-w
 
 
 class PlatformDynamicWorkerConfigWrite(BaseModel):
-    """Write payload — the platform ``dynamic_worker`` limits."""
+    """Write payload — the platform ``dynamic_worker`` limits(弹性 worker
+    预算):default 档(manifest 未请求时生效)+ cap 档(per-agent 请求的硬顶)。
+    Static bounds are wide sanity limits; the meaningful invariant is
+    ``default ≤ cap`` per knob — otherwise an *unconfigured* agent would get
+    more than a configured one can ever request."""
 
     model_config = ConfigDict(extra="forbid")
-    max_concurrent: int = Field(ge=1, le=16)
-    max_per_run: int = Field(ge=1, le=256)
-    max_iterations: int = Field(ge=1, le=64)
+    max_concurrent: int = Field(ge=1, le=64)
+    max_per_run: int = Field(ge=1, le=1024)
+    max_iterations: int = Field(ge=1, le=512)
+    cap_max_concurrent: int = Field(ge=1, le=64)
+    cap_max_per_run: int = Field(ge=1, le=1024)
+    cap_max_iterations: int = Field(ge=1, le=512)
+
+    @model_validator(mode="after")
+    def _default_within_cap(self) -> PlatformDynamicWorkerConfigWrite:
+        for name in ("max_concurrent", "max_per_run", "max_iterations"):
+            default, cap = getattr(self, name), getattr(self, f"cap_{name}")
+            if default > cap:
+                raise ValueError(f"{name} ({default}) must not exceed cap_{name} ({cap})")
+        return self
 
 
 def _get_service(request: Request) -> PlatformDynamicWorkerConfigService:
@@ -56,6 +71,9 @@ def _config_dict(config: DynamicWorkerConfig) -> dict[str, int]:
         "max_concurrent": config.max_concurrent,
         "max_per_run": config.max_per_run,
         "max_iterations": config.max_iterations,
+        "cap_max_concurrent": config.cap_max_concurrent,
+        "cap_max_per_run": config.cap_max_per_run,
+        "cap_max_iterations": config.cap_max_iterations,
     }
 
 
@@ -98,6 +116,9 @@ def build_platform_dynamic_worker_config_router() -> APIRouter:
             max_concurrent=payload.max_concurrent,
             max_per_run=payload.max_per_run,
             max_iterations=payload.max_iterations,
+            cap_max_concurrent=payload.cap_max_concurrent,
+            cap_max_per_run=payload.cap_max_per_run,
+            cap_max_iterations=payload.cap_max_iterations,
             updated_by=principal.subject_id,
         )
         # PR-E3b — ``put`` already invalidated THIS pod's cache; broadcast so
@@ -113,11 +134,7 @@ def build_platform_dynamic_worker_config_router() -> APIRouter:
             resource_type="platform_credential",
             resource_id="dynamic-worker-config",
             trace_id=current_trace_id_hex(),
-            details={
-                "max_concurrent": payload.max_concurrent,
-                "max_per_run": payload.max_per_run,
-                "max_iterations": payload.max_iterations,
-            },
+            details=payload.model_dump(),
         )
         return {"success": True, "data": await _view(service), "error": None}
 

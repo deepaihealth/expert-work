@@ -1014,6 +1014,9 @@ def create_app(
             max_concurrent=resolved_settings.dynamic_worker_max_concurrent,
             max_per_run=resolved_settings.dynamic_worker_max_per_run,
             max_iterations=resolved_settings.dynamic_worker_max_iterations,
+            cap_max_concurrent=resolved_settings.dynamic_worker_cap_max_concurrent,
+            cap_max_per_run=resolved_settings.dynamic_worker_cap_max_per_run,
+            cap_max_iterations=resolved_settings.dynamic_worker_cap_max_iterations,
         ),
         ttl_seconds=float(resolved_settings.tenant_config_cache_ttl_s),
     )

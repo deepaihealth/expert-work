@@ -299,7 +299,10 @@ async def fire_trigger(
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
             token_budget=built.token_budget,
-            worker_spawn_budget=await runtime.new_worker_spawn_budget(),
+            worker_spawn_budget=await runtime.new_worker_spawn_budget(
+                requested_max_concurrent=built.worker_max_concurrent,
+                requested_max_per_run=built.worker_max_per_run,
+            ),
             # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
             delegation_gate=runtime.delegation_gate(),
             # Stream HX-3 — replay-safety resolver for transient retry.

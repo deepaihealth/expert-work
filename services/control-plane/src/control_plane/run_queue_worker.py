@@ -319,7 +319,10 @@ class RunQueueWorker:
                     # P2 块 2 — run 终局重算 thread_meta.message_count。
                     thread_stats_recorder=self._runtime.thread_stats_recorder,
                     token_budget=built.token_budget,
-                    worker_spawn_budget=await self._runtime.new_worker_spawn_budget(),
+                    worker_spawn_budget=await self._runtime.new_worker_spawn_budget(
+                        requested_max_concurrent=built.worker_max_concurrent,
+                        requested_max_per_run=built.worker_max_per_run,
+                    ),
                     # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
                     delegation_gate=self._runtime.delegation_gate(),
                     tool_replay_safe=built.tool_replay_safe,

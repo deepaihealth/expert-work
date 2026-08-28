@@ -120,7 +120,9 @@ def synthesize_worker_spec(
     ``dynamic_workers.model`` overrides the worker LLM (full knob set, no
     fallback chain; the protocol validator enforces that). Replaces the
     system prompt with a generated worker prompt, narrows tools to the
-    platform allowlist, clamps iterations to the platform cap, and strips
+    platform allowlist, applies the already-resolved ``max_iterations``
+    verbatim (:func:`resolve_worker_max_iterations` owns the clamp policy —
+    per-agent request vs platform default/cap), and strips
     stateful / delegation blocks (memory / triggers / skills / static
     subagents / reflection / routing / knowledge) — the worker is stateless
     and ephemeral. ``dynamic_workers`` stays default-on so a worker may
@@ -157,7 +159,7 @@ def synthesize_worker_spec(
             # Parents not in plan_first keep their workflow.type unchanged.
             "workflow": body.workflow.model_copy(
                 update={
-                    "max_iterations": min(body.workflow.max_iterations, max_iterations),
+                    "max_iterations": max_iterations,
                     "execution_mode": "standard",
                     **({"type": "react"} if body.workflow.execution_mode == "plan_first" else {}),
                 }
@@ -168,13 +170,31 @@ def synthesize_worker_spec(
     return parent.model_copy(update={"metadata": worker_meta, "spec": worker_body})
 
 
-async def _resolve_worker_max_iterations(
-    service: PlatformDynamicWorkerConfigService | None, fallback: int
+async def resolve_worker_max_iterations(
+    service: PlatformDynamicWorkerConfigService | None,
+    fallback: int,
+    *,
+    parent: AgentSpec,
 ) -> int:
-    """Per-build effective worker iteration cap — DB-wins-over-env (B3 PR2)."""
+    """Per-build effective worker iteration cap(弹性 worker 预算,2026-08-28).
+
+    The manifest's ``dynamic_workers.max_iterations`` is a per-agent
+    *request*: when set it wins over the "never above the parent workflow"
+    heuristic and is clamped only to the platform hard cap. Unset keeps the
+    pre-existing semantics — ``min(parent workflow, platform default)``,
+    DB-wins-over-env (B3 PR2). ``service`` absent (tests / pre-wiring) has no
+    cap to read, so ``fallback`` (the boot-time settings snapshot)
+    conservatively plays both roles.
+    """
+    requested = parent.spec.dynamic_workers.max_iterations
     if service is None:
-        return fallback
-    return (await service.effective()).max_iterations
+        if requested is not None:
+            return min(requested, fallback)
+        return min(parent.spec.workflow.max_iterations, fallback)
+    cfg = await service.effective()
+    if requested is not None:
+        return min(requested, cfg.cap_max_iterations)
+    return min(parent.spec.workflow.max_iterations, cfg.max_iterations)
 
 
 class SubAgentNotFoundError(Exception):
@@ -484,7 +504,7 @@ def make_worker_build_fn(
 
     ``dynamic_worker_config_service`` (B3 PR2) — when set, ``max_iterations``
     is re-read from the live platform config on EVERY build via
-    :func:`_resolve_worker_max_iterations`, so a config change is hot (the
+    :func:`resolve_worker_max_iterations`, so a config change is hot (the
     ``max_iterations`` param stays the boot-time fallback). ``None`` keeps
     every worker clamped to the ``max_iterations`` param, unchanged.
     """
@@ -501,8 +521,8 @@ def make_worker_build_fn(
         worker_spec = synthesize_worker_spec(
             parent_spec,
             role=role,
-            max_iterations=await _resolve_worker_max_iterations(
-                dynamic_worker_config_service, max_iterations
+            max_iterations=await resolve_worker_max_iterations(
+                dynamic_worker_config_service, max_iterations, parent=parent_spec
             ),
             allowed_toolsets=allowed_toolsets,
         )

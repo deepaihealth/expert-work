@@ -31,6 +31,9 @@ def _record(row: _Model) -> PlatformDynamicWorkerConfigRow:
         max_concurrent=row.max_concurrent,
         max_per_run=row.max_per_run,
         max_iterations=row.max_iterations,
+        cap_max_concurrent=row.cap_max_concurrent,
+        cap_max_per_run=row.cap_max_per_run,
+        cap_max_iterations=row.cap_max_iterations,
         updated_by=row.updated_by,
     )
 
@@ -49,30 +52,32 @@ class SqlPlatformDynamicWorkerConfigStore(PlatformDynamicWorkerConfigStore):
         return _record(row) if row is not None else None
 
     async def put(
-        self, *, max_concurrent: int, max_per_run: int, max_iterations: int, updated_by: str | None
+        self,
+        *,
+        max_concurrent: int,
+        max_per_run: int,
+        max_iterations: int,
+        cap_max_concurrent: int,
+        cap_max_per_run: int,
+        cap_max_iterations: int,
+        updated_by: str | None,
     ) -> None:
         now = _utc_now()
+        values = {
+            "max_concurrent": max_concurrent,
+            "max_per_run": max_per_run,
+            "max_iterations": max_iterations,
+            "cap_max_concurrent": cap_max_concurrent,
+            "cap_max_per_run": cap_max_per_run,
+            "cap_max_iterations": cap_max_iterations,
+            "updated_at": now,
+            "updated_by": updated_by,
+        }
         async with self._sf() as session:
             stmt = (
                 pg_insert(_Model)
-                .values(
-                    id=_SINGLETON_ID,
-                    max_concurrent=max_concurrent,
-                    max_per_run=max_per_run,
-                    max_iterations=max_iterations,
-                    updated_at=now,
-                    updated_by=updated_by,
-                )
-                .on_conflict_do_update(
-                    index_elements=["id"],
-                    set_={
-                        "max_concurrent": max_concurrent,
-                        "max_per_run": max_per_run,
-                        "max_iterations": max_iterations,
-                        "updated_at": now,
-                        "updated_by": updated_by,
-                    },
-                )
+                .values(id=_SINGLETON_ID, **values)
+                .on_conflict_do_update(index_elements=["id"], set_=values)
             )
             await session.execute(stmt)
             await session.commit()

@@ -29,6 +29,11 @@ class PlatformDynamicWorkerConfigRow(Base):
     max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False)
     max_per_run: Mapped[int] = mapped_column(Integer, nullable=False)
     max_iterations: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 弹性 worker 预算(2026-08-28)— 平台硬顶档:per-agent 请求被 clamp 到
+    # 这三个值;上面三列退化为「manifest 未请求时的平台默认档」。
+    cap_max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False)
+    cap_max_per_run: Mapped[int] = mapped_column(Integer, nullable=False)
+    cap_max_iterations: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

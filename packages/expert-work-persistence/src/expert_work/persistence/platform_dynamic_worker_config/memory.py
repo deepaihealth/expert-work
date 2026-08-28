@@ -22,12 +22,23 @@ class InMemoryPlatformDynamicWorkerConfigStore(PlatformDynamicWorkerConfigStore)
             return self._row
 
     async def put(
-        self, *, max_concurrent: int, max_per_run: int, max_iterations: int, updated_by: str | None
+        self,
+        *,
+        max_concurrent: int,
+        max_per_run: int,
+        max_iterations: int,
+        cap_max_concurrent: int,
+        cap_max_per_run: int,
+        cap_max_iterations: int,
+        updated_by: str | None,
     ) -> None:
         async with self._lock:
             self._row = PlatformDynamicWorkerConfigRow(
                 max_concurrent=max_concurrent,
                 max_per_run=max_per_run,
                 max_iterations=max_iterations,
+                cap_max_concurrent=cap_max_concurrent,
+                cap_max_per_run=cap_max_per_run,
+                cap_max_iterations=cap_max_iterations,
                 updated_by=updated_by,
             )
