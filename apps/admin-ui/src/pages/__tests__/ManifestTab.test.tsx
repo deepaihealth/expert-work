@@ -320,6 +320,21 @@ describe("ManifestTab", () => {
     expect(onSaved).toHaveBeenCalledTimes(1);
   });
 
+  it("discards the draft against the draft's own sha", async () => {
+    // 丢弃是破坏性的:If-Match 必须是**编辑器里那一版**(草稿的 sha),否则
+    // 会把别人在你看完之后存的新草稿一起扔掉。
+    const user = userEvent.setup();
+    const detail = withDraft();
+    discardMock.mockResolvedValue({ ...sampleDetail });
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-discard-btn"));
+
+    await waitFor(() => expect(discardMock).toHaveBeenCalled());
+    expect(discardMock.mock.calls[0][2]).toBe("d".repeat(64));
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
   it("surfaces an error alert when the save rejects", async () => {
     const user = userEvent.setup();
     saveDraftMock.mockRejectedValue(new ApiError("name mismatch", "MANIFEST_PATH_MISMATCH", 422));
