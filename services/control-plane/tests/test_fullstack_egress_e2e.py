@@ -107,8 +107,13 @@ _DOCKER_UP_TIMEOUT_S = 420.0
 def _docker(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
     """Run a ``docker`` CLI command — a test-harness helper.
 
-    ``timeout`` 超时不是让它静静挂着,而是 :func:`pytest.fail` 出一条点名到
-    子命令的失败,让 CI 日志直接说清「哪条 docker 命令卡了多久」。
+    ``timeout`` 超时不是让它静静挂着,而是抛一条点名到子命令的
+    ``AssertionError``,让 CI 日志直接说清「哪条 docker 命令卡了多久」。
+
+    这里用 ``raise`` 而不是 :func:`pytest.fail`:两者在 pytest 里都判失败,
+    但 ``pytest.fail`` 的 ``NoReturn`` 语义 CodeQL 读不出来,会把 except 分支
+    当成 fall through(隐式返回 ``None``),报「explicit returns mixed with
+    implicit returns」。显式 ``raise`` 让两条出路都是显式的。
     """
     try:
         return subprocess.run(  # noqa: S603 — fixed argv, no shell, test harness only
@@ -118,11 +123,12 @@ def _docker(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> subprocess.Comple
             check=False,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        pytest.fail(
+    except subprocess.TimeoutExpired as exc:
+        message = (
             f"`docker {' '.join(args)}` 超过 {timeout:.0f}s 未返回 —— "
             "多半是镜像拉取被限流/卡死(Docker Hub 在共享 runner IP 上限流是老问题)。"
         )
+        raise AssertionError(message) from exc
 
 
 def _compose(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> subprocess.CompletedProcess[str]:

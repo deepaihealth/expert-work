@@ -54,6 +54,10 @@ def test_docker_timeout_fails_the_test_naming_the_command(
 
     断言消息里同时出现子命令和超时秒数——没有这两样,CI 上看到的还是
     「不知道卡在哪」。
+
+    用 ``AssertionError`` 而非 ``pytest.fail``:两者在 pytest 里都判失败,
+    但后者的 ``NoReturn`` 语义 CodeQL 读不出来,会把 except 分支当成 fall
+    through 而报「explicit returns mixed with implicit returns」。
     """
 
     def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -61,7 +65,7 @@ def test_docker_timeout_fails_the_test_naming_the_command(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(pytest.fail.Exception) as excinfo:
+    with pytest.raises(AssertionError) as excinfo:
         _docker("build", "-t", "expert-work-sandbox:dev", ".", timeout=7.0)
 
     message = str(excinfo.value)
