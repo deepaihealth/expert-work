@@ -92,7 +92,26 @@ const savedDetail: AgentDetailResponse = {
 const onSaved = vi.fn();
 // Re-installed in beforeEach: afterEach() runs vi.restoreAllMocks(), which would
 // otherwise permanently restore a module-level spy after the first test.
-let updateAgentMock: ReturnType<typeof vi.spyOn>;
+let saveDraftMock: ReturnType<typeof vi.spyOn>;
+let publishMock: ReturnType<typeof vi.spyOn>;
+let discardMock: ReturnType<typeof vi.spyOn>;
+
+/** 带草稿的 detail —— 「发布」「丢弃」只在有草稿时出现。 */
+function withDraft(overrides: Record<string, unknown> = {}): AgentDetailResponse {
+  return {
+    ...sampleDetail,
+    record: {
+      ...sampleDetail.record,
+      draft: {
+        spec: sampleDetail.record.spec,
+        spec_sha256: "d".repeat(64),
+        updated_by: "bob",
+        updated_at: "2026-08-29T10:00:00Z",
+        ...overrides,
+      },
+    },
+  } as AgentDetailResponse;
+}
 
 // ManifestTab persists the active config group in the URL (?group=), so it
 // needs a router context (#2).
@@ -108,7 +127,9 @@ beforeEach(() => {
   onSaved.mockClear();
   // vitest 4 的 restore 不复位 vi.fn 的 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
-  updateAgentMock = vi.spyOn(agentsSdk, "updateAgent");
+  saveDraftMock = vi.spyOn(agentsSdk, "saveAgentDraft");
+  publishMock = vi.spyOn(agentsSdk, "publishAgentDraft");
+  discardMock = vi.spyOn(agentsSdk, "discardAgentDraft");
   __resetSchemaCacheForTest();
   __resetCatalogCacheForTest();
   vi.spyOn(schemaSdk, "fetchAgentSchema").mockResolvedValue({
@@ -153,9 +174,9 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("cfg-yaml-toggle")).toBeInTheDocument();
   });
 
-  it("saves edits via updateAgent and stays on the editor", async () => {
+  it("saves edits as a draft and stays on the editor", async () => {
     const user = userEvent.setup();
-    updateAgentMock.mockResolvedValue(sampleDetail);
+    saveDraftMock.mockResolvedValue(sampleDetail);
     renderTab();
     await screen.findByTestId("manifest-editor-edit");
     // edit via the YAML toggle for a deterministic buffer
@@ -165,7 +186,7 @@ describe("ManifestTab", () => {
     await user.type(ta, "edited: yaml");
     await user.click(screen.getByTestId("manifest-save-btn"));
     await waitFor(() =>
-      expect(updateAgentMock).toHaveBeenCalledWith(
+      expect(saveDraftMock).toHaveBeenCalledWith(
         "demo-agent",
         "1.0.0",
         { manifest_yaml: "edited: yaml" },
@@ -180,7 +201,7 @@ describe("ManifestTab", () => {
     // 后端对「平台没配凭据 / 没配 embedding」不拒绝保存 —— 作者改不了平台
     // 状态。代价是绿灯不再等于能跑,所以这条必须显式说出来。
     const user = userEvent.setup();
-    updateAgentMock.mockResolvedValue({
+    saveDraftMock.mockResolvedValue({
       ...sampleDetail,
       build_warning:
         "model anthropic:claude-sonnet-4-5 has no platform credential configured for provider 'anthropic'",
@@ -199,7 +220,7 @@ describe("ManifestTab", () => {
   it("shows no warning banner when the manifest builds cleanly", async () => {
     // 反向:warning 不能变成每次保存都挂着的装饰,否则它什么也没说。
     const user = userEvent.setup();
-    updateAgentMock.mockResolvedValue(sampleDetail);
+    saveDraftMock.mockResolvedValue(sampleDetail);
     renderTab();
     await screen.findByTestId("manifest-editor-edit");
     await user.click(screen.getByTestId("manifest-save-btn"));
@@ -210,21 +231,21 @@ describe("ManifestTab", () => {
 
   it("sends the loaded sha as If-Match so a concurrent edit cannot be clobbered", async () => {
     const user = userEvent.setup();
-    updateAgentMock.mockResolvedValue(sampleDetail);
+    saveDraftMock.mockResolvedValue(sampleDetail);
     renderTab();
     await screen.findByTestId("manifest-editor-edit");
     await user.click(screen.getByTestId("manifest-save-btn"));
 
-    await waitFor(() => expect(updateAgentMock).toHaveBeenCalled());
+    await waitFor(() => expect(saveDraftMock).toHaveBeenCalled());
     // 第 4 个实参就是编辑时读到的那一版的 sha。
-    expect(updateAgentMock.mock.calls[0][3]).toBe(sampleDetail.record.spec_sha256);
+    expect(saveDraftMock.mock.calls[0][3]).toBe(sampleDetail.record.spec_sha256);
   });
 
   it("explains a concurrent edit instead of dumping the raw error code", async () => {
     // 409 不是「保存失败」那种技术错误,而是一条要人做决定的消息:去看对方
     // 改了什么,再决定怎么合。
     const user = userEvent.setup();
-    updateAgentMock.mockRejectedValue(
+    saveDraftMock.mockRejectedValue(
       new ApiError("this manifest changed since you loaded it", "MANIFEST_STALE_WRITE", 409),
     );
     renderTab();
@@ -237,9 +258,71 @@ describe("ManifestTab", () => {
     expect(onSaved).not.toHaveBeenCalled();
   });
 
-  it("surfaces an error alert when updateAgent rejects", async () => {
+  it("hides Publish and Discard until a draft exists", async () => {
+    // 没有草稿就没有可发布的东西 —— 让人点得到只会换来一个 409。
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    expect(screen.getByTestId("manifest-publish-btn")).toBeDisabled();
+    expect(screen.queryByTestId("manifest-discard-btn")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("manifest-draft-banner")).not.toBeInTheDocument();
+  });
+
+  it("says a draft is pending, who saved it, and that nothing is live yet", async () => {
+    renderTab(withDraft());
+    const banner = await screen.findByTestId("manifest-draft-banner");
+    expect(banner).toHaveTextContent("bob");
+    // 最关键的一句:线上还没变。
+    expect(banner).toHaveTextContent("Live conversations still use the published config");
+    expect(screen.getByTestId("manifest-publish-btn")).not.toBeDisabled();
+    expect(screen.getByTestId("manifest-discard-btn")).toBeInTheDocument();
+  });
+
+  it("edits the draft, not the live spec, once a draft exists", async () => {
+    // 「上次没改完的东西还在」是草稿存在的全部理由 —— 打开页面看到线上版本
+    // 等于草稿白存。If-Match 也必须跟着走草稿那一版。
     const user = userEvent.setup();
-    updateAgentMock.mockRejectedValue(new ApiError("name mismatch", "MANIFEST_PATH_MISMATCH", 422));
+    const detail = withDraft();
+    saveDraftMock.mockResolvedValue(detail);
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    await waitFor(() => expect(saveDraftMock).toHaveBeenCalled());
+    expect(saveDraftMock.mock.calls[0][3]).toBe("d".repeat(64));
+  });
+
+  it("publishes against the LIVE sha, not the draft's", async () => {
+    // 发布要替换的是线上那一版,防的是「你看到的线上版本已经被别人换过了」。
+    const user = userEvent.setup();
+    const detail = withDraft();
+    publishMock.mockResolvedValue({ ...sampleDetail });
+    renderTab(detail);
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-publish-btn"));
+
+    await waitFor(() => expect(publishMock).toHaveBeenCalled());
+    expect(publishMock.mock.calls[0][2]).toBe(sampleDetail.record.spec_sha256);
+  });
+
+  it("warns that a saved draft cannot be published as it stands", async () => {
+    // 草稿保存不被构建失败拦住 —— 但必须说出来,否则人会一路点到发布才发现。
+    const user = userEvent.setup();
+    saveDraftMock.mockResolvedValue({
+      ...sampleDetail,
+      build_error: "manifest is valid but cannot be built: skill 'nope' not found",
+    });
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    const alert = await screen.findByTestId("manifest-build-error");
+    expect(alert).toHaveTextContent("skill 'nope' not found");
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces an error alert when the save rejects", async () => {
+    const user = userEvent.setup();
+    saveDraftMock.mockRejectedValue(new ApiError("name mismatch", "MANIFEST_PATH_MISMATCH", 422));
     renderTab();
     await screen.findByTestId("manifest-editor-edit");
     await user.click(screen.getByTestId("manifest-save-btn"));
@@ -257,14 +340,14 @@ describe("ManifestTab", () => {
     await user.clear(ta);
     await user.type(ta, "edited: yaml");
     await user.click(screen.getByTestId("manifest-reset-btn"));
-    expect(updateAgentMock).not.toHaveBeenCalled();
+    expect(saveDraftMock).not.toHaveBeenCalled();
     // Editor remounts and re-seeds from the server snapshot.
     await screen.findByTestId("manifest-editor-edit");
   });
 
   it("keeps the active group and sub-tab after a save + snapshot refresh (#2)", async () => {
     const user = userEvent.setup();
-    updateAgentMock.mockResolvedValue(sampleDetail);
+    saveDraftMock.mockResolvedValue(sampleDetail);
     const { rerender } = renderTab();
     await screen.findByTestId("manifest-editor-edit");
 

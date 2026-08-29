@@ -21,11 +21,16 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Alert, Button, Card, Space, Typography } from "antd";
 import { dump as yamlDump } from "js-yaml";
-import { RotateCcw, Save } from "lucide-react";
+import { RotateCcw, Save, Trash2, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api/client";
-import { updateAgent, type AgentDetailResponse } from "../../api/agents";
+import {
+  discardAgentDraft,
+  publishAgentDraft,
+  saveAgentDraft,
+  type AgentDetailResponse,
+} from "../../api/agents";
 import { ManifestEditor } from "../../components/manifest-editor";
 import { CONFIG_GROUPS } from "../../components/manifest-editor/groups";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
@@ -46,15 +51,27 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
   // Track C W2 — 切入态只读:保存是写操作,切入目标租户后置灰。
   const isTenantSwitched = useIsTenantSwitched();
 
-  /** Server snapshot serialised as YAML — the editor's seed. */
-  const snapshotYaml = useMemo(() => yamlDump(r.spec, { lineWidth: 120 }), [r.spec]);
+  /** 编辑器从**草稿**起步(有的话),否则从线上那一版。
+   *
+   *  「上次没改完的东西还在」是草稿存在的全部理由 —— 打开页面却看到线上版本,
+   *  等于草稿白存。 */
+  const editingSpec = (r.draft?.spec ?? r.spec) as Record<string, unknown>;
+  const snapshotYaml = useMemo(
+    () => yamlDump(editingSpec, { lineWidth: 120 }),
+    [editingSpec],
+  );
+
+  /** ``If-Match`` 送的值:和编辑器里那一版对应(草稿优先),与后端
+   *  ``_editing_sha`` 是同一条规矩。 */
+  const editingSha = r.draft?.spec_sha256 ?? r.spec_sha256;
 
   const [buffer, setBuffer] = useState<string>(snapshotYaml);
   // Bumped on Reset to remount the editor and re-seed it from the snapshot.
   const [resetNonce, setResetNonce] = useState(0);
-  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState<null | "draft" | "publish" | "discard">(null);
   const [error, setError] = useState<string | null>(null);
   const [buildWarning, setBuildWarning] = useState<string | null>(null);
+  const [buildError, setBuildError] = useState<string | null>(null);
 
   // #2 — the editor is no longer key-remounted when the server snapshot
   // changes; adopt the refreshed snapshot into the buffer instead. In
@@ -94,42 +111,60 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
     setResetNonce((n) => n + 1);
   }, [snapshotYaml]);
 
-  const handleSave = useCallback(async () => {
-    setSaving(true);
-    setError(null);
-    setBuildWarning(null);
-    try {
-      // 传编辑时读到的 sha:这一版在期间被别人改过就 409,不会静默盖掉对方。
-      const saved = await updateAgent(
-        r.name,
-        r.version,
-        { manifest_yaml: buffer },
-        r.spec_sha256,
-      );
-      // 存下来了,但这个部署还跑不了它(缺 provider 凭据 / 缺 embedding)。
-      // 后端不拒这类保存 —— 作者改不了平台状态 —— 所以「绿灯 ≠ 能跑」这件事
-      // 只能靠这里说出来。
-      setBuildWarning(saved.build_warning ?? null);
-      onSaved();
-    } catch (err) {
-      // 409 = 别人在你编辑期间改过这一版。这不是「保存失败」那种技术错误,
-      // 而是一条要人做决定的消息(去看对方改了什么,再决定怎么合),所以给
-      // 它自己的文案而不是抛出后端原文。
-      if (err instanceof ApiError && err.code === "MANIFEST_STALE_WRITE") {
-        setError(t("manifest_tab.stale_write"));
-      } else {
-        const message =
-          err instanceof ApiError
-            ? `${err.code}: ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : "unknown error";
-        setError(message);
+  const hasDraft = r.draft != null;
+  const saving = busy !== null;
+
+  /** 三个动作共用的错误处理 —— 409 是并发,给人话;其余照抛。 */
+  const runAction = useCallback(
+    async (kind: "draft" | "publish" | "discard", fn: () => Promise<AgentDetailResponse>) => {
+      setBusy(kind);
+      setError(null);
+      setBuildWarning(null);
+      setBuildError(null);
+      try {
+        const result = await fn();
+        setBuildWarning(result.build_warning ?? null);
+        setBuildError(result.build_error ?? null);
+        onSaved();
+      } catch (err) {
+        // 409 = 别人在你编辑期间动过这一版。这不是「操作失败」那种技术错误,
+        // 而是一条要人做决定的消息(去看对方改了什么,再决定怎么合)。
+        if (err instanceof ApiError && err.code === "MANIFEST_STALE_WRITE") {
+          setError(t("manifest_tab.stale_write"));
+        } else {
+          const message =
+            err instanceof ApiError
+              ? `${err.code}: ${err.message}`
+              : err instanceof Error
+                ? err.message
+                : "unknown error";
+          setError(message);
+        }
+      } finally {
+        setBusy(null);
       }
-    } finally {
-      setSaving(false);
-    }
-  }, [buffer, r.name, r.version, r.spec_sha256, onSaved, t]);
+    },
+    [onSaved, t],
+  );
+
+  const handleSaveDraft = useCallback(
+    () =>
+      runAction("draft", () =>
+        saveAgentDraft(r.name, r.version, { manifest_yaml: buffer }, editingSha),
+      ),
+    [runAction, r.name, r.version, buffer, editingSha],
+  );
+
+  const handlePublish = useCallback(
+    // 发布匹配的是**线上**那一版(要替换掉的那个),不是草稿。
+    () => runAction("publish", () => publishAgentDraft(r.name, r.version, r.spec_sha256)),
+    [runAction, r.name, r.version, r.spec_sha256],
+  );
+
+  const handleDiscard = useCallback(
+    () => runAction("discard", () => discardAgentDraft(r.name, r.version, editingSha)),
+    [runAction, r.name, r.version, editingSha],
+  );
 
   return (
     <Card data-testid="manifest-tab">
@@ -154,21 +189,75 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
           >
             {t("manifest_tab.reset")}
           </Button>
+          {hasDraft && (
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Button
+                size="small"
+                icon={<Trash2 size={14} strokeWidth={1.75} />}
+                onClick={handleDiscard}
+                loading={busy === "discard"}
+                disabled={saving || isTenantSwitched}
+                data-testid="manifest-discard-btn"
+              >
+                {t("manifest_tab.discard_draft")}
+              </Button>
+            </ReadonlyTooltip>
+          )}
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              size="small"
+              icon={<Save size={14} strokeWidth={1.75} />}
+              onClick={handleSaveDraft}
+              loading={busy === "draft"}
+              disabled={saving || isTenantSwitched}
+              data-testid="manifest-save-btn"
+            >
+              {t("manifest_tab.save_draft")}
+            </Button>
+          </ReadonlyTooltip>
           <ReadonlyTooltip on={isTenantSwitched}>
             <Button
               size="small"
               type="primary"
-              icon={<Save size={14} strokeWidth={1.75} />}
-              onClick={handleSave}
-              loading={saving}
-              disabled={isTenantSwitched}
-              data-testid="manifest-save-btn"
+              icon={<Upload size={14} strokeWidth={1.75} />}
+              onClick={handlePublish}
+              loading={busy === "publish"}
+              // 没有草稿就没有可发布的东西 —— 后端 409,这里不该让人点到那一步。
+              disabled={saving || isTenantSwitched || !hasDraft}
+              data-testid="manifest-publish-btn"
             >
-              {t("manifest_tab.save")}
+              {t("manifest_tab.publish")}
             </Button>
           </ReadonlyTooltip>
         </Space>
       </div>
+
+      {hasDraft && (
+        <Alert
+          type="info"
+          showIcon
+          message={t("manifest_tab.draft_pending")}
+          description={t("manifest_tab.draft_pending_detail", {
+            who: r.draft?.updated_by ?? "",
+            when: r.draft ? new Date(r.draft.updated_at).toLocaleString() : "",
+          })}
+          style={{ marginBottom: 12 }}
+          data-testid="manifest-draft-banner"
+        />
+      )}
+
+      {buildError !== null && (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setBuildError(null)}
+          message={t("manifest_tab.draft_saved_but_unpublishable")}
+          description={buildError}
+          style={{ marginBottom: 12 }}
+          data-testid="manifest-build-error"
+        />
+      )}
 
       {buildWarning !== null && (
         <Alert

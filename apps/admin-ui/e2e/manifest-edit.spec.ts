@@ -110,10 +110,18 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/v1/model-catalog", async (route) => {
     await route.fulfill({ json: CATALOG_ENVELOPE });
   });
-  // Detail GET + Save PUT on the same path — branch on method. The PUT returns
-  // the same detail so the parent's post-save refetch succeeds.
+  // 详情 GET 与草稿保存 PUT 是两条不同的路径 —— 保存打的是 ``.../draft``,
+  // 上面那个 glob 匹配不到它。两条都要 mock:漏掉草稿那条时,保存请求会穿到
+  // 真后端去失败,而下面的断言只等请求发出、不等响应,于是测试照样绿 ——
+  // 一条不可能失败的断言等于没有断言。
   await page.route(
     `**/v1/agents/${AGENT_NAME}/${AGENT_VERSION}`,
+    async (route) => {
+      await route.fulfill({ json: DETAIL_ENVELOPE });
+    },
+  );
+  await page.route(
+    `**/v1/agents/${AGENT_NAME}/${AGENT_VERSION}/draft`,
     async (route) => {
       await route.fulfill({ json: DETAIL_ENVELOPE });
     },
@@ -150,13 +158,16 @@ test("edit a manifest via the form", async ({ page }) => {
   await expect(page.getByTestId("manifest-yaml-view")).toBeVisible();
 
   // Save fires the PUT; the editor stays mounted.
-  const putPromise = page.waitForRequest(
-    (req) =>
-      req.method() === "PUT" &&
-      req.url().includes(`/v1/agents/${AGENT_NAME}/${AGENT_VERSION}`),
+  // 保存 = 存草稿(不生效),所以路径必须是 ``.../draft``。用 endsWith 而不是
+  // includes:includes 对不带 /draft 的旧路径也为真,分不出这两件事。
+  const putPromise = page.waitForResponse(
+    (res) =>
+      res.request().method() === "PUT" &&
+      res.url().endsWith(`/v1/agents/${AGENT_NAME}/${AGENT_VERSION}/draft`),
   );
   await page.getByTestId("manifest-save-btn").click();
-  const put = await putPromise;
+  const put = (await putPromise).request();
+  expect((await putPromise).status()).toBe(200);
   // 并发编辑保护:请求必须真的带上编辑时读到的那一版 sha。单元测试只验到
   // updateAgent 的实参,验不到它有没有变成 HTTP 头(axios config 写错就是这
   // 两层之间的洞)。

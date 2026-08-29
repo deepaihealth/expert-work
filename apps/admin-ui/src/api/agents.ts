@@ -62,11 +62,17 @@ export interface AgentDetailResponse {
      *  it to the form_model readers as-is (``readPromptJinja(record.spec)``),
      *  never wrapped in another ``{ spec }`` shell. */
     spec: Record<string, unknown>;
+    /** 未发布的草稿;``null`` = 没有。**列表接口不带这个字段**(正文太大,
+     *  几十个 Agent 各一份完整 manifest 会把响应撑到几百 KB)。 */
+    draft?: AgentDraft | null;
   };
   /** Stream RT-4 — whether the agent name is currently kill-switched. */
   disabled?: boolean;
   /** The kill-switch record when ``disabled`` is true; ``null`` otherwise. */
   disable?: AgentDisableRecord | null;
+  /** 草稿保存时构建失败的原因。非 null = 草稿存下来了,但这样发布会被拒。
+   *  只出现在草稿保存的响应里。 */
+  build_error?: string | null;
   /** 保存/创建时 dry-run 构建的结果:非 null = **存下来了,但这个部署还跑不了
    *  它**(平台没配这个 provider 的凭据、或声明了长期记忆却没配 embedding)。
    *  这类问题作者改不了,所以后端不拒绝保存 —— 但绿灯不等于能跑,必须显式
@@ -169,6 +175,70 @@ export async function updateAgent(
   return putJson<AgentDetailResponse>(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}`,
     payload,
+    { headers: { "If-Match": ifMatch } },
+  );
+}
+
+/** 未发布的草稿。``null`` = 没有草稿,线上那一版就是全部。
+ *
+ *  草稿**不影响任何 run** —— 运行时永远读线上那一版。它存在只是为了让
+ *  「改配置」和「让改动生效」变成两个动作。 */
+export interface AgentDraft {
+  spec: Record<string, unknown>;
+  spec_sha256: string;
+  updated_by: string;
+  updated_at: string;
+}
+
+/** PUT /v1/agents/{name}/{version}/draft — 存草稿,不生效。
+ *
+ *  构建校验在这里**只提示不拦**:草稿是半成品,拦住一次保存等于逼人把改了
+ *  一半的东西丢掉。建不出来时响应里带 ``build_error``,但草稿照存。
+ *
+ *  ``ifMatch`` = 你载入编辑器的那一版(有草稿就是草稿的 sha,否则是线上的)。 */
+export async function saveAgentDraft(
+  name: string,
+  version: string,
+  payload: ManifestPayload,
+  ifMatch: string,
+): Promise<AgentDetailResponse> {
+  return putJson<AgentDetailResponse>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/draft`,
+    payload,
+    { headers: { "If-Match": ifMatch } },
+  );
+}
+
+/** DELETE /v1/agents/{name}/{version}/draft — 丢弃草稿。
+ *
+ *  ``ifMatch`` 是必须的**因为**这是破坏性的:别人在你看完之后又存了新草稿的
+ *  话,这一下会连它一起扔掉。 */
+export async function discardAgentDraft(
+  name: string,
+  version: string,
+  ifMatch: string,
+): Promise<AgentDetailResponse> {
+  const response = await apiClient.delete<{ data: AgentDetailResponse }>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/draft`,
+    { headers: { "If-Match": ifMatch } },
+  );
+  return response.data.data;
+}
+
+/** POST /v1/agents/{name}/{version}/publish — 发布草稿,这一步才生效。
+ *
+ *  构建校验在这里是**拦**的:建不出来 → 422 ``MANIFEST_UNBUILDABLE``,而且
+ *  草稿留着(扔掉等于替人把改动删了)。
+ *
+ *  ``ifMatch`` = **线上**那一版的 sha(你打算替换掉的那个)。 */
+export async function publishAgentDraft(
+  name: string,
+  version: string,
+  ifMatch: string,
+): Promise<AgentDetailResponse> {
+  return postJson<AgentDetailResponse>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/publish`,
+    {},
     { headers: { "If-Match": ifMatch } },
   );
 }

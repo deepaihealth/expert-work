@@ -581,6 +581,12 @@ export interface TranslationKeys {
     save_failed: string;
     saved_but_not_runnable: string;
     stale_write: string;
+    save_draft: string;
+    publish: string;
+    discard_draft: string;
+    draft_pending: string;
+    draft_pending_detail: string;
+    draft_saved_but_unpublishable: string;
   };
   manifest_editor: {
     tab_basic: string;
@@ -3720,6 +3726,14 @@ const en: TranslationKeys = {
       "Saved — but this deployment cannot run it yet. Nothing is wrong with the config; something it depends on is not set up on the platform side:",
     stale_write:
       "Someone else changed this config while you had it open. Nothing was saved, and their change is intact. Reload to see it, then reapply your edit.",
+    save_draft: "Save draft",
+    publish: "Publish",
+    discard_draft: "Discard draft",
+    draft_pending: "Unpublished draft",
+    draft_pending_detail:
+      "You are editing a draft saved by {{who}} on {{when}}. Live conversations still use the published config — nothing changes until you press Publish.",
+    draft_saved_but_unpublishable:
+      "Draft saved, but it cannot be published as it stands — publishing would be refused for this reason:",
   },
   manifest_editor: {
     tab_basic: "Basics",
