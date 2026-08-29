@@ -77,18 +77,33 @@ def build_worker_end_frame(
     iteration_used: int,
     llm_call_count: int,
     wall_clock_ms: int,
+    usage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return _envelope(
-        ident,
-        kind="end",
-        wseq=wseq,
-        data={
-            "outcome": outcome,
-            "iteration_used": iteration_used,
-            "llm_call_count": llm_call_count,
-            "wall_clock_ms": wall_clock_ms,
-        },
-    )
+    """Worker 终局帧。
+
+    ``usage`` —— 这个 worker 一轮烧掉的 token,形状与 langchain 的
+    ``AIMessage.usage_metadata`` **同构**(``input_tokens`` /
+    ``output_tokens`` / ``total_tokens`` / ``input_token_details`` /
+    ``output_token_details``),消费者因此可以复用现成的解析,不必为
+    worker 另写一套。
+
+    没有它,父侧的每个消费者都只看得到主线消耗:前端 ``turn_summary.ts``
+    第一行就是 ``if (evt.event !== "updates") continue;``,worker 事件整个
+    跳过。线上实例(run f562fa69):对话页显示 175,137 tok,而同一 trace 下
+    worker 另有 69 次调用共 3,317,974 —— 少报 19 倍。
+
+    拿不到就**不写这个键**(``None`` → 缺席),绝不填零:``usage_metadata``
+    是提供商可选字段,零值会让消费者把「未知」当成「免费」。
+    """
+    data: dict[str, Any] = {
+        "outcome": outcome,
+        "iteration_used": iteration_used,
+        "llm_call_count": llm_call_count,
+        "wall_clock_ms": wall_clock_ms,
+    }
+    if usage is not None:
+        data["usage"] = dict(usage)
+    return _envelope(ident, kind="end", wseq=wseq, data=data)
 
 
 def _envelope(
