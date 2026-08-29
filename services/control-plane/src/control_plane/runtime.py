@@ -90,7 +90,7 @@ from orchestrator.agent_factory import (
     _SkillLookupResult,
     detect_subagent_cycle,
 )
-from orchestrator.errors import AgentFactoryError
+from orchestrator.errors import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.llm import (
     DashScopeReranker,
     Embedder,
@@ -531,7 +531,7 @@ def make_provider_key_resolver(
             ]
         except CredentialsResolverError as exc:
             msg = f"no platform credential is configured for provider {provider!r}"
-            raise AgentFactoryError(msg) from exc
+            raise PlatformNotConfiguredError(msg) from exc
 
     return _resolve
 
@@ -899,7 +899,7 @@ def make_agent_builder(
         # effective config rather than ``embedder is None``.
         if platform_embedding_config_service is not None and _declares_long_term(spec):
             if await platform_embedding_config_service.effective_embedding_config() is None:
-                raise AgentFactoryError(
+                raise PlatformNotConfiguredError(
                     "manifest declares memory.long_term but platform embedding is not "
                     "configured — configure it in platform settings"
                 )
@@ -1183,7 +1183,7 @@ class DynamicResolvingEmbedder:
         cfg = await self.config_service.effective_embedding_config()
         t1 = time.monotonic()
         if cfg is None:
-            raise AgentFactoryError(
+            raise PlatformNotConfiguredError(
                 "platform embedding is not configured — configure it in platform settings"
             )
         provider, model = cfg

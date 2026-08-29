@@ -95,6 +95,7 @@ from orchestrator.context import (
 )
 from orchestrator.errors import (
     AgentFactoryError,
+    PlatformNotConfiguredError,
     SkillConflictError,
     SkillModelMismatchError,
     SkillNotActiveError,
@@ -2140,13 +2141,13 @@ async def build_llm_router(
                     entry.name,
                 )
             if provider_key_resolver is None:
-                raise AgentFactoryError(
+                raise PlatformNotConfiguredError(
                     f"model {entry.provider}:{entry.name} has no platform credential "
                     f"configured for provider {entry.provider!r}"
                 )
             secret_refs = await provider_key_resolver(entry.provider)
             if not secret_refs:
-                raise AgentFactoryError(
+                raise PlatformNotConfiguredError(
                     f"model {entry.provider}:{entry.name} resolved no platform "
                     f"credential for provider {entry.provider!r}"
                 )

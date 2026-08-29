@@ -294,7 +294,10 @@ _manifest_build_check_total = expert_work_counter(
     "a runnable agent (missing platform credential, unresolvable skill / "
     "template, memory declared with no embedder, sub-agent cycle) — before "
     "this gate those saved fine and failed on every subsequent run instead. "
-    "``skipped`` means no agent runtime was wired to check against.",
+    "``platform_gap`` is a manifest the deployment cannot run yet (no credential "
+    "for the provider, no embedder for declared long-term memory) — saved with a "
+    "warning, because the author cannot fix platform state. ``skipped`` means no "
+    "agent runtime was wired to check against.",
     label_names=("outcome",),
 )
 
@@ -636,7 +639,7 @@ def record_manifest_provider_rejected(*, provider: str) -> None:
 def record_manifest_build_check(*, outcome: str) -> None:
     """Bump ``expert_work_uplift_manifest_build_check_total{outcome}``.
 
-    ``outcome`` ∈ ``{"ok", "rejected", "skipped"}``."""
+    ``outcome`` ∈ ``{"ok", "rejected", "platform_gap", "skipped"}``."""
     _manifest_build_check_total.labels(outcome=outcome).inc()
 
 

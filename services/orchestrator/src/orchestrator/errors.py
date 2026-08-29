@@ -18,6 +18,26 @@ class AgentFactoryError(OrchestratorError):
     """
 
 
+class PlatformNotConfiguredError(AgentFactoryError):
+    """The manifest is fine; this *deployment* is missing something it needs.
+
+    Split out from plain :class:`AgentFactoryError` because the two have
+    different owners and therefore different handling:
+
+    - plain ``AgentFactoryError`` = the manifest is wrong (a cycle, an
+      unresolvable skill, a model that has no thinking toggle). The person
+      editing it can fix it, so a save-time gate should refuse the write.
+    - ``PlatformNotConfiguredError`` = the platform has no credential for the
+      referenced provider, or no embedder for the declared long-term memory.
+      The manifest author usually cannot change either. Refusing the save
+      would lock them out of authoring until an operator acts — and would make
+      a fresh deployment unable to register any agent before credentials land.
+
+    Callers that only care "can this run?" can keep catching
+    :class:`AgentFactoryError` and get both, unchanged.
+    """
+
+
 class MaxStepsExceededError(OrchestratorError):
     """Raised when the ReAct loop hits ``max_steps`` and the LLM still
     wants to call tools.
