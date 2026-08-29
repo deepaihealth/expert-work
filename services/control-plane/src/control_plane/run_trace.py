@@ -1,4 +1,18 @@
-"""谁执行一个 run,谁把自己的 trace 写回 ``agent_run.trace_id``。
+"""谁执行一个 run,谁把执行事实写回 ``agent_run`` 那一行。
+
+两件事,同一条规矩、同一批调用点:
+
+* :func:`bind_exec_trace` —— 执行那一段的 OTel trace(``trace_id``)
+* :func:`bind_exec_spec` —— 执行时**实际用的 manifest 版本**
+  (``agent_spec_sha256``)
+
+两者的共同点是:建行那一刻的值不等于执行那一刻的值,而只有执行方知道后者。
+所以规矩必须写在这里、由每个执行入口调用 —— 这条规矩只写在一个执行入口里
+正是 #1382 的病因。
+
+---
+
+**trace 部分。**
 
 ``token_usage`` 没有 ``run_id`` 列 —— ``totals_by_trace_ids`` 全靠 trace 把
 ``agent_run`` 和 ``token_usage`` 两张表连起来。所以行里的 ``trace_id`` 必须是
@@ -21,7 +35,29 @@
 2026-08-29 测试环境实测:近 5 天 222 个成功 run 里 32 个「用量写了、挂在另一
 条 trace 上」,全部是上面的后两类。
 
-软失败:回写不成功只记日志。这是可观测性接线,不该拦住一次本来能跑的 run。
+---
+
+**配置版本部分。**
+
+配置页对 manifest 是**原地编辑**:``thread_meta`` 上记的 ``agent_name`` /
+``agent_version`` 编辑前后完全一样。没有 ``agent_spec_sha256``,「这条 run 跑的
+是哪一版配置」只能拿时间戳去 ``agent_spec_revision`` 里比对着猜。
+
+同样必须在**执行时**写,不能在建行时写 —— 排队的 run 建行时还没构建过,
+而 worker 真去执行时读到的可能已经是编辑后的版本。
+
+**不该记的地方**(记了反而是错的):
+
+* ``spawn_run`` 的 ``mode="queue"`` 分支 —— 它只入队、立刻 202 返回,手里那个
+  ``built`` 直接丢掉。真正的构建晚一步发生在 :class:`RunQueueWorker` 里,
+  用的可能是另一版。
+* ``trigger_delivery`` —— 它构建 agent 只为拿 ``built.graph`` 往原会话注入
+  投递消息,不执行任何 run。
+* ``api/plan.py`` / ``api/agents.py`` 的工具清单与详情端点 —— 只读,无 run。
+
+---
+
+软失败:两个回写都只记日志。这是可观测性接线,不该拦住一次本来能跑的 run。
 """
 
 from __future__ import annotations
@@ -29,9 +65,11 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import RunStore
 
-__all__ = ["bind_exec_trace"]
+__all__ = ["bind_exec_spec", "bind_exec_trace"]
 
 
 async def bind_exec_trace(
@@ -65,3 +103,40 @@ async def bind_exec_trace(
         return
     if not ok:
         logger.warning("%s.trace_bind_missed run_id=%s", source, run_id)
+
+
+async def bind_exec_spec(
+    *,
+    runs: RunStore | None,
+    run_id: UUID,
+    tenant_id: UUID,
+    spec: AgentSpec,
+    source: str,
+) -> None:
+    """把这一轮实际构建所用 manifest 的内容哈希写进 ``run_id`` 那行。
+
+    传的是 **spec 本身**而不是算好的哈希:调用方手里必然有它(``get_agent``
+    的必填参数就是它),让这里去算,调用方就没有「记了另一版的哈希」这个错法。
+    哈希与 ``agent_spec.spec_sha256`` 同一种规范化形式,可直接等值 join 回
+    ``agent_spec_revision`` 拿到那一版的 ``spec_json``。
+
+    ``runs`` 为 ``None`` 时直接返回:那是没接持久化的 :class:`RunManager`
+    (纯内存注册表),压根没有一行可以标注 —— 与「有行但写失败」是两回事,
+    后者会记日志。
+
+    ``source`` 只进日志,用来一眼看出是哪个执行入口没绑上。
+    """
+    logger = logging.getLogger(f"expert_work.control_plane.{source}")
+    if runs is None:
+        return
+    try:
+        ok = await runs.set_agent_spec_sha256(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            agent_spec_sha256=compute_spec_sha256(spec),
+        )
+    except Exception:
+        logger.warning("%s.spec_bind_failed run_id=%s", source, run_id, exc_info=True)
+        return
+    if not ok:
+        logger.warning("%s.spec_bind_missed run_id=%s", source, run_id)

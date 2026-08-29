@@ -30,6 +30,7 @@ from langchain_core.runnables import RunnableConfig
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
+from control_plane.run_trace import bind_exec_spec
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
 from control_plane.uplift.threat_metrics import (
@@ -240,6 +241,15 @@ async def fire_trigger(
         # 这条路不走 ``bind_exec_trace``:建行和派任务在同一个 context 里,
         # 建行时就已经知道执行 trace,一次写入即可,不必回写第二遍。
         trace_id=current_trace_id_hex(),
+    )
+    # 触发器是长期存在的定时任务,配置在两次触发之间被改过是常态 —— 每次触发
+    # 记下这一次真正构建出来的那一版。
+    await bind_exec_spec(
+        runs=runtime.run_manager.store,
+        run_id=run_id,
+        tenant_id=trigger.tenant_id,
+        spec=record.spec,
+        source="trigger_firing",
     )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.
     run_record.bound_distilled_skills = built.bound_distilled_skills

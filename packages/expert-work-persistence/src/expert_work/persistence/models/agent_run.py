@@ -89,6 +89,23 @@ class AgentRunRow(Base):
     # unique index below only ever fires on the non-NULL rows.
     idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     request_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 这一轮实际执行时用的 manifest 内容哈希(sha256 十六进制,64 字符;与
+    # ``agent_spec.spec_sha256`` / ``agent_spec_revision.spec_sha256`` 同一种
+    # 规范化形式,可直接等值 join 回那一版的 ``spec_json``)。
+    #
+    # 为什么非有这一列不可:配置页对 manifest 是**原地编辑**,``thread_meta``
+    # 上记的 ``agent_name`` / ``agent_version`` 编辑前后一模一样。没有它,
+    # 「这条 run 跑的是哪一版配置」只能拿 run 的 ``created_at`` 去和
+    # ``agent_spec_revision.created_at`` 比时间戳猜。
+    #
+    # 写入时机是**构建 agent 之后**(``run_trace.bind_exec_spec``),不是建行时:
+    # 排队的 run 建行时还没构建过,而执行时读到的可能已经是编辑后的版本 ——
+    # 记建行时的值就会记错。审批续跑是新 run 行(``is_resume=True``),所以
+    # 一行始终只对应一次构建,不存在一行两版。
+    #
+    # NULL 的两种含义:这一列上线前的历史 run;以及 run 在构建成功之前就结束
+    # (配额拒绝 / Agent 被停用 / 构建失败)。都**不是**「用了空配置」。
+    agent_spec_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(f"status IN {_STATUS_VALUES}", name="agent_run_status_valid"),

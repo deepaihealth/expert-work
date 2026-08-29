@@ -56,6 +56,7 @@ from control_plane.prompt_render import (
     validate_prompt_inputs,
 )
 from control_plane.quota.base import QuotaService
+from control_plane.run_trace import bind_exec_spec
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
@@ -858,6 +859,15 @@ async def resolve_approval_decision(
         is_resume=True,
         trace_id=trace_id,  # Mini-ADR H-9.5
     )
+    # 续跑是**新 run 行**,而且这里刚按**当前**配置重建过 agent(审批期间
+    # 配置可能已被编辑)—— 记的是这一行自己执行时用的那一版。
+    await bind_exec_spec(
+        runs=runtime.run_manager.store,
+        run_id=continuation_run_id,
+        tenant_id=tenant_id,
+        spec=spec_record.spec,
+        source="approval_resume",
+    )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.
     run_record.bound_distilled_skills = built.bound_distilled_skills
     # 产物清单契约 —— continuation 是新 run_id、新行:父 run PAUSED 时固化的
@@ -1079,6 +1089,15 @@ async def spawn_run(
         trace_id=trace_id,
         idempotency_key=idempotency_key,
         request_digest=request_digest,
+    )
+    # 只有 stream 分支记:上面的 queue 分支入队就返回,``built`` 直接丢掉,
+    # 真正的构建晚一步发生在 RunQueueWorker 里(那边自己记)。
+    await bind_exec_spec(
+        runs=runtime.run_manager.store,
+        run_id=run_id,
+        tenant_id=tenant_id,
+        spec=record_spec,
+        source="spawn_run",
     )
     run_record.bound_distilled_skills = built.bound_distilled_skills
     graph_input = build_run_graph_input(

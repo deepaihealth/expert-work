@@ -138,6 +138,16 @@ class RunInfo:
     #: 异常终局无记录;``[]`` = 零登记(追问轮);快照不随产物后续删除
     #: 回写。终局 ``set_status`` 与状态同一次写入。
     artifacts: list[dict[str, Any]] | None = None
+    #: 这一轮**实际执行时**用的 manifest 内容哈希(``agent_spec.spec_sha256``
+    #: 同一种规范化形式)。配置页对 manifest 是原地编辑,``thread_meta`` 上
+    #: 记的 ``agent_name`` / ``agent_version`` 编辑前后完全一样,所以只有这一列
+    #: 能回答「这条 run 跑的是哪一版配置」。写入点是构建 agent 之后
+    #: (``run_trace.bind_exec_spec``),不是建行时:排队的 run 建行时还没有
+    #: 构建过,而执行时读到的可能已经是编辑后的版本。
+    #:
+    #: ``None`` = 这一列上线前的历史 run,或 run 在构建成功之前就结束了
+    #: (配额拒绝 / Agent 被停用 / 构建失败)。**不是**「用了空配置」。
+    agent_spec_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -448,6 +448,22 @@ class RunStore(abc.ABC):
         ``False`` so callers can hide existence.
         """
 
+    @abc.abstractmethod
+    async def set_agent_spec_sha256(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        agent_spec_sha256: str,
+    ) -> bool:
+        """Record which manifest revision this run actually executed.
+
+        Called once per run, right after the agent is built — see
+        ``RunInfo.agent_spec_sha256`` for why creation time is the wrong
+        moment. Returns ``True`` iff the row exists; cross-tenant probes
+        return ``False`` so callers can hide existence.
+        """
+
     # --- Stream 9.4 (HA failover) — ownership lease ------------------------
 
     @abc.abstractmethod
@@ -864,6 +880,19 @@ class InMemoryRunStore(RunStore):
         self._rows[run_id] = replace(row, trace_id=trace_id)
         return True
 
+    async def set_agent_spec_sha256(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        agent_spec_sha256: str,
+    ) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row.tenant_id != tenant_id:
+            return False
+        self._rows[run_id] = replace(row, agent_spec_sha256=agent_spec_sha256)
+        return True
+
     async def claim(
         self,
         *,
@@ -1026,6 +1055,7 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         idempotency_key=row.idempotency_key,
         request_digest=row.request_digest,
         artifacts=row.artifacts,
+        agent_spec_sha256=row.agent_spec_sha256,
     )
 
 
@@ -1059,6 +1089,7 @@ class SqlRunStore(RunStore):
                     idempotency_key=info.idempotency_key,
                     request_digest=info.request_digest,
                     artifacts=info.artifacts,
+                    agent_spec_sha256=info.agent_spec_sha256,
                 )
             )
             try:
@@ -1446,6 +1477,22 @@ class SqlRunStore(RunStore):
                 update(AgentRunRow)
                 .where(AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id)
                 .values({"trace_id": trace_id})
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def set_agent_spec_sha256(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        agent_spec_sha256: str,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentRunRow)
+                .where(AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id)
+                .values({"agent_spec_sha256": agent_spec_sha256})
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0

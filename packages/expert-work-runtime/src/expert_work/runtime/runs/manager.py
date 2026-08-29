@@ -153,6 +153,18 @@ class RunManager:
         self._lease_ttl_s = lease_ttl_s
 
     @property
+    def store(self) -> RunStore | None:
+        """The durable mirror this manager writes through, if any.
+
+        Exposed so a caller that must write a column the manager has no method
+        for (``run_trace.bind_exec_spec``) reaches the store **holding this
+        run's row** rather than guessing at ``app.state.run_store`` — those are
+        the same object in the wired app but not in tests that inject their own
+        runtime. ``None`` for the purely in-memory registry.
+        """
+        return self._store
+
+    @property
     def instance_id(self) -> str:
         return self._instance_id
 

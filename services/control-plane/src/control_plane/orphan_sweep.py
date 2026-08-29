@@ -39,7 +39,7 @@ from langchain_core.runnables import RunnableConfig
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
-from control_plane.run_trace import bind_exec_trace
+from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
 from expert_work.common.observability import (
@@ -369,6 +369,15 @@ class OrphanSweep:
             except AgentFactoryError:
                 await self._fail_orphan(orphan, now=datetime.now(UTC), reason="unbuildable")
                 return
+            # 续跑可能发生在原 run 建行很久之后,配置早被改过 —— 记的必须是
+            # 这次续跑真构建出来的这一版,不是崩掉的那次用的。
+            await bind_exec_spec(
+                runs=self._runs,
+                run_id=orphan.run_id,
+                tenant_id=orphan.tenant_id,
+                spec=record.spec,
+                source="orphan_sweep",
+            )
 
             # Adopt the existing durable run into THIS instance's registry (no
             # new agent_run row — the reclaim CAS already took ownership).
