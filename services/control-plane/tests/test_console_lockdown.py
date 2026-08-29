@@ -233,6 +233,11 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{name}/{version}"),
         ("PUT", "/v1/agents/{name}/{version}"),
         ("DELETE", "/v1/agents/{name}/{version}"),
+        # 草稿 / 发布 —— 配置写面。三条都是 ``_CONSOLE_ONLY`` + 实例级
+        # ``manifest:write``;第三方 key 无论如何都不该改配置,更不该发布。
+        ("PUT", "/v1/agents/{name}/{version}/draft"),
+        ("DELETE", "/v1/agents/{name}/{version}/draft"),
+        ("POST", "/v1/agents/{name}/{version}/publish"),
         ("POST", "/v1/agents/{name}/disable"),
         ("POST", "/v1/agents/{name}/enable"),
         ("GET", "/v1/agents/schema"),
