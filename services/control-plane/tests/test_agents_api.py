@@ -915,9 +915,7 @@ async def test_update_rejects_and_leaves_the_stored_version_untouched(
         AgentFactoryError("sub-agent delegation cycle detected: a -> b -> a")
     )
 
-    resp = await client.put(
-        "/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML}
-    )
+    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
     assert resp.status_code == 422, resp.text
     assert resp.json()["error"]["code"] == "MANIFEST_UNBUILDABLE"
 
