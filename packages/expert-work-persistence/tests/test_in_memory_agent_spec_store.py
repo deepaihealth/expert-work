@@ -358,3 +358,149 @@ async def test_count_distinct_active_by_tenant(store: InMemoryAgentSpecStore) ->
 
     # 两个 name(alpha 两个版本合一),不是三行。
     assert await store.count_distinct_active_by_tenant(tenant_id=_TENANT_A) == 2
+
+
+# ---------------------------------------------------------------------------
+# 未发布草稿:把「改配置」和「让改动生效」分成两个动作
+#
+# 这批断言与 test_sql_agent_spec_store 里的同名用例逐条对应 —— 两个实现的
+# 谓词必须同义,分裂过一次就再也没人查得出来是哪边错了。
+# ---------------------------------------------------------------------------
+
+
+def _drafted(template: str) -> AgentSpec:
+    doc = deepcopy(_BASE_SPEC)
+    doc["spec"]["system_prompt"]["template"] = template
+    return AgentSpec.model_validate(doc)
+
+
+@pytest.mark.asyncio
+async def test_save_draft_leaves_the_live_spec_alone(store: InMemoryAgentSpecStore) -> None:
+    """草稿的全部意义:存了不生效。"""
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    saved = await store.save_draft(
+        tenant_id=_TENANT_A,
+        name="code-reviewer",
+        version="1.0.0",
+        spec=_drafted("drafted prompt"),
+        spec_sha256="d" * 64,
+        updated_by="bob",
+    )
+    assert saved is not None
+    assert saved.draft is not None
+    assert saved.draft.spec.spec.system_prompt.template == "drafted prompt"
+    assert saved.draft.updated_by == "bob"
+    # 线上那一版一个字节都没动。
+    assert saved.spec.spec.system_prompt.template == "you are a reviewer"
+    assert saved.spec_sha256 == _sha()
+    # 也没记历史 —— 存草稿不是一次改动。
+    assert (
+        len(await store.list_revisions(tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0"))
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_draft_promotes_and_clears(store: InMemoryAgentSpecStore) -> None:
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    await store.save_draft(
+        tenant_id=_TENANT_A,
+        name="code-reviewer",
+        version="1.0.0",
+        spec=_drafted("drafted prompt"),
+        spec_sha256="d" * 64,
+        updated_by="bob",
+    )
+    result = await store.publish_draft(
+        tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0", updated_by="bob"
+    )
+    assert result is not None
+    assert result.record.spec.spec.system_prompt.template == "drafted prompt"
+    assert result.record.spec_sha256 == "d" * 64
+    assert result.prev_sha256 == _sha()
+    assert result.revision == 2
+    # 发布之后编辑缓冲区必须是空的,否则页面会一直显示「有未发布草稿」。
+    assert result.record.draft is None
+
+
+@pytest.mark.asyncio
+async def test_publish_identical_draft_records_no_revision(
+    store: InMemoryAgentSpecStore,
+) -> None:
+    """发布一份内容与线上完全相同的草稿不是一次改动,只是把缓冲区清掉。"""
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    await store.save_draft(
+        tenant_id=_TENANT_A,
+        name="code-reviewer",
+        version="1.0.0",
+        spec=_spec(),
+        spec_sha256=_sha(),
+        updated_by="bob",
+    )
+    result = await store.publish_draft(
+        tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0", updated_by="bob"
+    )
+    assert result is not None
+    assert result.revision is None
+    assert result.record.draft is None
+    assert (
+        len(await store.list_revisions(tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0"))
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_without_a_draft_returns_none(store: InMemoryAgentSpecStore) -> None:
+    """「发布什么?」是调用方的错,不是一次静默成功。"""
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    assert (
+        await store.publish_draft(
+            tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0", updated_by="bob"
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_draft_is_idempotent(store: InMemoryAgentSpecStore) -> None:
+    """没有草稿时丢弃不是错误 —— 调用方要的状态(我这儿没有草稿)已经成立。"""
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    first = await store.discard_draft(tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0")
+    assert first is not None and first.draft is None
+    await store.save_draft(
+        tenant_id=_TENANT_A,
+        name="code-reviewer",
+        version="1.0.0",
+        spec=_drafted("x"),
+        spec_sha256="d" * 64,
+        updated_by="bob",
+    )
+    second = await store.discard_draft(tenant_id=_TENANT_A, name="code-reviewer", version="1.0.0")
+    assert second is not None and second.draft is None
+
+
+@pytest.mark.asyncio
+async def test_draft_methods_are_tenant_scoped(store: InMemoryAgentSpecStore) -> None:
+    """跨租户探测返回 None,不泄露这一行存不存在(与其余方法同一契约)。"""
+    await store.create(tenant_id=_TENANT_A, spec=_spec(), spec_sha256=_sha(), created_by="a")
+    assert (
+        await store.save_draft(
+            tenant_id=_TENANT_B,
+            name="code-reviewer",
+            version="1.0.0",
+            spec=_drafted("x"),
+            spec_sha256="d" * 64,
+            updated_by="mallory",
+        )
+        is None
+    )
+    assert (
+        await store.discard_draft(tenant_id=_TENANT_B, name="code-reviewer", version="1.0.0")
+        is None
+    )
+    assert (
+        await store.publish_draft(
+            tenant_id=_TENANT_B, name="code-reviewer", version="1.0.0", updated_by="mallory"
+        )
+        is None
+    )

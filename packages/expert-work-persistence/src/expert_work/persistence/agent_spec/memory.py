@@ -13,6 +13,7 @@ from expert_work.persistence.agent_spec.base import (
 )
 from expert_work.protocol import (
     AgentSpec,
+    AgentSpecDraft,
     AgentSpecRecord,
     AgentSpecRevisionRecord,
     AgentSpecStatus,
@@ -201,6 +202,92 @@ class InMemoryAgentSpecStore(AgentSpecStore):
                 key, spec=spec, spec_sha256=spec_sha256, actor_id=updated_by
             )
             return AgentSpecUpdateResult(record=replaced, revision=revision, prev_sha256=prev_sha)
+
+    def _live(self, key: tuple[UUID, str, str]) -> AgentSpecRecord | None:
+        """非软删的行,谓词与 SQL 侧 ``_live_row`` 逐字同义。"""
+        row = self._rows.get(key)
+        if row is None or row.status is AgentSpecStatus.DELETED:
+            return None
+        return row
+
+    async def save_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        spec: AgentSpec,
+        spec_sha256: str,
+        updated_by: str,
+    ) -> AgentSpecRecord | None:
+        async with self._lock:
+            key = (tenant_id, name, version)
+            existing = self._live(key)
+            if existing is None:
+                return None
+            # 不动 ``updated_at``:那是线上这一版的时间戳(同 SQL 侧)。
+            updated = existing.model_copy(
+                update={
+                    "draft": AgentSpecDraft(
+                        spec=spec,
+                        spec_sha256=spec_sha256,
+                        updated_by=updated_by,
+                        updated_at=_now(),
+                    )
+                }
+            )
+            self._rows[key] = updated
+            return updated
+
+    async def discard_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        async with self._lock:
+            key = (tenant_id, name, version)
+            existing = self._live(key)
+            if existing is None:
+                return None
+            updated = existing.model_copy(update={"draft": None})
+            self._rows[key] = updated
+            return updated
+
+    async def publish_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        updated_by: str,
+    ) -> AgentSpecUpdateResult | None:
+        async with self._lock:
+            key = (tenant_id, name, version)
+            existing = self._live(key)
+            if existing is None or existing.draft is None:
+                return None
+            draft = existing.draft
+            prev_sha = existing.spec_sha256
+            if prev_sha == draft.spec_sha256:
+                # 同 sha 的发布不记历史(与 update_spec 同一条规矩),但草稿照清。
+                cleared = existing.model_copy(update={"draft": None})
+                self._rows[key] = cleared
+                return AgentSpecUpdateResult(record=cleared, revision=None, prev_sha256=prev_sha)
+            published = existing.model_copy(
+                update={
+                    "spec": draft.spec,
+                    "spec_sha256": draft.spec_sha256,
+                    "updated_at": _now(),
+                    "draft": None,
+                }
+            )
+            self._rows[key] = published
+            revision = self._append_revision(
+                key, spec=draft.spec, spec_sha256=draft.spec_sha256, actor_id=updated_by
+            )
+            return AgentSpecUpdateResult(record=published, revision=revision, prev_sha256=prev_sha)
 
     async def list_revisions(
         self,

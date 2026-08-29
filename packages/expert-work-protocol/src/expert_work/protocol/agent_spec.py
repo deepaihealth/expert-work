@@ -1522,6 +1522,22 @@ class AgentSpecStatus(StrEnum):
     DELETED = "deleted"
 
 
+class AgentSpecDraft(BaseModel):
+    """一个 ``agent_spec`` 行上未发布的编辑缓冲区。
+
+    与「某个 Agent 版本」一对一,没有生命周期、没有历史、发布即消失。
+    ``updated_by`` 是**存草稿的人**(不是 Agent 的创建者),因为「这儿有别人
+    的草稿」这句话必须说得出是谁。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    spec: AgentSpec
+    spec_sha256: str = Field(min_length=64, max_length=64)
+    updated_by: str
+    updated_at: datetime
+
+
 class AgentSpecRecord(BaseModel):
     """One row of the ``agent_spec`` registry table."""
 
@@ -1537,6 +1553,12 @@ class AgentSpecRecord(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+    #: 未发布的草稿。``None`` = 没有草稿,线上这一版就是全部。
+    #:
+    #: 草稿**不影响任何 run** —— 运行时永远读 ``spec``。它存在只是为了让
+    #: 「改配置」和「让改动生效」变成两个动作:此前保存即发布,改错了没有
+    #: 回头路,只能事后回滚。
+    draft: AgentSpecDraft | None = None
 
 
 class AgentSpecRevisionRecord(BaseModel):

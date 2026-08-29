@@ -500,3 +500,177 @@ async def test_list_distinct_active_by_tenant_tie_break_matches_on_created_at_co
         assert mem_rows[0].id == id_high and mem_rows[0].version == "1.0.2"
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 未发布草稿 —— 与 test_in_memory_agent_spec_store 里的同名用例逐条对应。
+# 两个实现的谓词必须同义;分裂过一次就再也没人查得出来是哪边错了。
+# ---------------------------------------------------------------------------
+
+
+def _drafted(template: str) -> AgentSpec:
+    doc = deepcopy(_BASE_SPEC)
+    doc["spec"]["system_prompt"]["template"] = template
+    return AgentSpec.model_validate(doc)
+
+
+@pytest.mark.asyncio
+async def test_save_draft_leaves_the_live_spec_alone_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        saved = await store.save_draft(
+            tenant_id=tenant,
+            name="code-reviewer",
+            version="1.0.0",
+            spec=_drafted("drafted prompt"),
+            spec_sha256="d" * 64,
+            updated_by="bob",
+        )
+        assert saved is not None
+        assert saved.draft is not None
+        assert saved.draft.spec.spec.system_prompt.template == "drafted prompt"
+        assert saved.draft.updated_by == "bob"
+        assert saved.spec.spec.system_prompt.template == "you are a reviewer"
+        assert saved.spec_sha256 == _sha()
+        history = await store.list_revisions(
+            tenant_id=tenant, name="code-reviewer", version="1.0.0"
+        )
+        assert len(history) == 1
+
+        # 读回来也带着(``_row_to_draft`` 的往返)。
+        fetched = await store.get(tenant_id=tenant, name="code-reviewer", version="1.0.0")
+        assert fetched is not None and fetched.draft is not None
+        assert fetched.draft.spec_sha256 == "d" * 64
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_publish_draft_promotes_and_clears_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        await store.save_draft(
+            tenant_id=tenant,
+            name="code-reviewer",
+            version="1.0.0",
+            spec=_drafted("drafted prompt"),
+            spec_sha256="d" * 64,
+            updated_by="bob",
+        )
+        result = await store.publish_draft(
+            tenant_id=tenant, name="code-reviewer", version="1.0.0", updated_by="bob"
+        )
+        assert result is not None
+        assert result.record.spec.spec.system_prompt.template == "drafted prompt"
+        assert result.record.spec_sha256 == "d" * 64
+        assert result.prev_sha256 == _sha()
+        assert result.revision == 2
+        assert result.record.draft is None
+
+        fetched = await store.get(tenant_id=tenant, name="code-reviewer", version="1.0.0")
+        assert fetched is not None and fetched.draft is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_publish_identical_draft_records_no_revision_sql(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        await store.save_draft(
+            tenant_id=tenant,
+            name="code-reviewer",
+            version="1.0.0",
+            spec=_spec(),
+            spec_sha256=_sha(),
+            updated_by="bob",
+        )
+        result = await store.publish_draft(
+            tenant_id=tenant, name="code-reviewer", version="1.0.0", updated_by="bob"
+        )
+        assert result is not None
+        assert result.revision is None
+        assert result.record.draft is None
+        history = await store.list_revisions(
+            tenant_id=tenant, name="code-reviewer", version="1.0.0"
+        )
+        assert len(history) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_publish_without_a_draft_returns_none_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        assert (
+            await store.publish_draft(
+                tenant_id=tenant, name="code-reviewer", version="1.0.0", updated_by="bob"
+            )
+            is None
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_discard_draft_is_idempotent_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        first = await store.discard_draft(tenant_id=tenant, name="code-reviewer", version="1.0.0")
+        assert first is not None and first.draft is None
+        await store.save_draft(
+            tenant_id=tenant,
+            name="code-reviewer",
+            version="1.0.0",
+            spec=_drafted("x"),
+            spec_sha256="d" * 64,
+            updated_by="bob",
+        )
+        second = await store.discard_draft(tenant_id=tenant, name="code-reviewer", version="1.0.0")
+        assert second is not None and second.draft is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_draft_methods_are_tenant_scoped_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant, other = uuid4(), uuid4()
+        await store.create(tenant_id=tenant, spec=_spec(), spec_sha256=_sha(), created_by="a")
+        assert (
+            await store.save_draft(
+                tenant_id=other,
+                name="code-reviewer",
+                version="1.0.0",
+                spec=_drafted("x"),
+                spec_sha256="d" * 64,
+                updated_by="mallory",
+            )
+            is None
+        )
+        assert (
+            await store.discard_draft(tenant_id=other, name="code-reviewer", version="1.0.0")
+            is None
+        )
+        assert (
+            await store.publish_draft(
+                tenant_id=other, name="code-reviewer", version="1.0.0", updated_by="mallory"
+            )
+            is None
+        )
+    finally:
+        await engine.dispose()
