@@ -342,3 +342,89 @@ async def test_stop_is_bounded_when_a_sweep_hangs(monkeypatch: pytest.MonkeyPatc
     # 修复前:stop() 永远等下去,这里超时失败。
     await asyncio.wait_for(worker.stop(), timeout=2)
     assert worker._task is None
+
+
+@pytest.mark.asyncio
+async def test_execute_rewrites_trace_id_to_the_executing_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """排队执行的 run 必须把 ``trace_id`` 回写成**执行时**的 trace。
+
+    ``agent_run.trace_id`` 由 API handler 在建行那一刻用
+    ``current_trace_id_hex()`` 写下。``mode: "stream"`` 下那就是 HTTP 请求
+    的 span,而 ``sse.py`` 的 ``expert_work.session.run`` 根 span 挂在它下
+    面,父子同 trace,``token_usage``(LLM 调用时取同一个 current span)
+    自然对得上。
+
+    ``mode: "queue"`` 不是:HTTP 立刻 202 返回,真正执行发生在这个 worker
+    的后台任务里,``session.run`` 在那儿另起一个 trace。于是 ``trace_id``
+    指向一个早已结束的 202 请求,而这一轮所有 token 记在别的 trace 下。
+    ``token_usage`` 没有 ``run_id`` 列——``totals_by_trace_ids`` 全靠 trace
+    连接 ``agent_run ↔ token_usage``,连接一断,Runs 列表/详情的 token 就
+    是空的(测试环境实测:stream 模式的 run 匹配得到,queue 模式 5 个探针
+    run 全部 0 行)。
+
+    ``RunStore.set_trace_id`` 早就存在(abstract + 两个实现 + 自己的测试),
+    docstring 还写着「if the worker observes its own trace_id, the second
+    call wins」——设计意图一直是让执行方回写,只是这条线从没接上。
+    """
+    spawns: list[dict] = []
+
+    # 这条用例必须真的走到 ``asyncio.create_task(run_agent(...))``(回写就在
+    # 那一带),所以 fake 得是真协程——别的用例用同步 lambda 是因为它们在
+    # gate 处就被拦住,走不到这里。
+    async def _fake_run_agent(**kw: object) -> None:
+        spawns.append(dict(kw))
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+    # 测试进程没有 init_tracing,``expert_work_span`` 开出来的是 no-op span,
+    # ``current_trace_id_hex()`` 恒 None(那时不回写是正确行为,见下一条用例)。
+    # 这里要验的是**接线**——拿到 trace 之后有没有真的写下去。
+    monkeypatch.setattr(worker_module, "current_trace_id_hex", lambda: "b2" * 16)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _enqueue(runtime.run_manager)
+    # 建行时的 trace(那个 202 请求的),执行后必须不再是它。
+    await store.set_trace_id(run_id=run_id, tenant_id=tenant, trace_id="a1" * 16)
+
+    worker = _worker(store, runtime)
+    assert await worker.run_once() == 1
+
+    info = await store.get(run_id=run_id, tenant_id=tenant)
+    assert info is not None
+    assert info.trace_id is not None
+    assert info.trace_id != "a1" * 16, (
+        "trace_id 仍是建行时那个 —— queue 模式下它指向已结束的 202 请求,token_usage 关联不上"
+    )
+    # 32 位小写 hex:与 ``current_trace_id_hex()`` 的契约一致。
+    assert len(info.trace_id) == 32
+    assert info.trace_id == info.trace_id.lower()
+
+
+@pytest.mark.asyncio
+async def test_execute_keeps_trace_id_when_no_span_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有活跃 span 时保留原 trace,不能把 ``None`` 写下去。
+
+    OTel 未初始化(测试、部分 job 进程)时 ``current_trace_id_hex()`` 返回
+    ``None``。那时建行时的 trace 是**唯一**已知的关联,擦掉它只会更糟。
+    """
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw: object) -> None:
+        spawns.append(dict(kw))
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+    monkeypatch.setattr(worker_module, "current_trace_id_hex", lambda: None)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _enqueue(runtime.run_manager)
+    await store.set_trace_id(run_id=run_id, tenant_id=tenant, trace_id="c3" * 16)
+
+    worker = _worker(store, runtime)
+    assert await worker.run_once() == 1
+
+    info = await store.get(run_id=run_id, tenant_id=tenant)
+    assert info is not None
+    assert info.trace_id == "c3" * 16
