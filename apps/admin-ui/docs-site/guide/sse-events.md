@@ -677,8 +677,19 @@ function onPlan(data) {
 | `iteration_used` | integer | 实际用掉的步数，非负整数 |
 | `llm_call_count` | integer | 这个子任务内部发起的模型调用次数，非负整数 |
 | `wall_clock_ms` | integer | 这个子任务从开始到结束的墙钟耗时，单位毫秒，非负整数 |
+| `usage` | object | 这个子任务消耗的 token。字段与 `updates` 事件里模型消息的 `usage_metadata` 相同：`input_tokens` / `output_tokens` / `total_tokens`，以及 `input_token_details`（含 `cache_read`、`cache_creation`）与 `output_token_details`（含 `reasoning`）。模型提供商没有上报用量时，这个字段不出现 |
 
 这三个 `outcome` 覆盖的是正常收尾的三种情况。子任务因为未捕获的异常终止时，平台不发这条事件，这个子任务就此没有后续事件；客户端的处置方式见本节「什么时候发」的第二条容错规则。
+
+#### 统计一次 run 的 token 消耗
+
+子任务的模型调用不产生 `updates` 事件，它消耗的 token 只在这里上报。只累加 `updates` 事件得到的是主线消耗，不含派出去的子任务；派出的子任务越多，两者差距越大。
+
+累加规则三条：
+
+- 把每个子任务 `end` 事件的 `usage` 加进本次 run 的总数。
+- 只累加 `kind` 为 `end` 的事件。每个子任务只发一条，因此累加全部 `end` 事件即覆盖整棵子任务树——嵌套的子任务在它自己的 `end` 事件上单独上报，不会重复计入。
+- `usage` 不出现时按「未上报」处理，不要当作 0。把未上报计成 0，展示出来的结果是这个子任务不消耗费用。
 
 #### 示例
 
@@ -695,7 +706,7 @@ data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call
 
 id: 1755229372881-9
 event: worker
-data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call_de58e676916d442d925bff27","label":"spawn_worker","agent_ref":"dynamic:researcher","depth":1,"kind":"end","wseq":2,"data":{"outcome":"success","iteration_used":2,"llm_call_count":2,"wall_clock_ms":14779}}
+data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call_de58e676916d442d925bff27","label":"spawn_worker","agent_ref":"dynamic:researcher","depth":1,"kind":"end","wseq":2,"data":{"outcome":"success","iteration_used":2,"llm_call_count":2,"wall_clock_ms":14779,"usage":{"input_tokens":18432,"output_tokens":626,"total_tokens":19058,"input_token_details":{"cache_read":12288,"cache_creation":0},"output_token_details":{"reasoning":184}}}}
 ```
 
 #### 客户端怎么处理
