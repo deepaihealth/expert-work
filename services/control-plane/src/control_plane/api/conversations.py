@@ -140,6 +140,12 @@ def _run_to_dict(info: RunInfo, tokens: dict[str, Any] | None) -> dict[str, Any]
         "updated_at": info.updated_at.isoformat(),
         "finished_at": info.finished_at.isoformat() if info.finished_at is not None else None,
         "trace_id": info.trace_id,
+        # 这一轮实际执行时用的 manifest 内容哈希。对话页据此标出「这一轮之后
+        # 配置被改过」—— 相邻两轮的哈希不同,就是中间有人改了配置。
+        # ``agent_version`` 回答不了这个问题:配置页是原地编辑,版本号编辑
+        # 前后一样。``null`` = 这一列上线前的历史 run,或 run 在构建成功前就
+        # 结束了 —— **不是**「配置为空」,所以前端只在两侧都有值时才比较。
+        "agent_spec_sha256": info.agent_spec_sha256,
         "tokens": tokens,
     }
 

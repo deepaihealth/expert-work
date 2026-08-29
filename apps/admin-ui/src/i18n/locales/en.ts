@@ -346,6 +346,7 @@ export interface TranslationKeys {
     page_title: string;
     subtitle: string;
     untitled: string;
+    config_changed: string;
     column_conversation: string;
     column_agent: string;
     column_user: string;
@@ -3461,6 +3462,8 @@ const en: TranslationKeys = {
   },
   conversations_page: {
     page_title: "Conversations",
+    config_changed:
+      "The agent's config was edited during this conversation (after turn {{turns}}). Later turns did not run the same config as earlier ones — worth checking before you blame the model.",
     subtitle: "User conversations across agents, grouped by thread.",
     untitled: "Untitled conversation",
     column_conversation: "Conversation",

@@ -295,6 +295,33 @@ async def test_detail_returns_run_list_and_summary(
 
 
 @pytest.mark.asyncio
+async def test_detail_runs_carry_the_config_version(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """对话页要标出「这一轮之后配置被改过」,靠的就是这个字段。
+
+    ``agent_version`` 回答不了 —— 配置页是原地编辑,版本号编辑前后一样。
+    """
+    client, ids = client_and_threads
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    runs = (await client.get(f"/v1/conversations/{ids['convo']}")).json()["data"]["runs"]
+    # 种子 run 没经过执行入口,所以这一列是 null —— 字段**存在**才是这里要验的。
+    assert all("agent_spec_sha256" in r for r in runs)
+    assert all(r["agent_spec_sha256"] is None for r in runs)
+
+    await app.state.run_store.set_agent_spec_sha256(
+        run_id=UUID(runs[0]["run_id"]),
+        tenant_id=_TENANT,
+        agent_spec_sha256="c" * 64,
+    )
+    refreshed = (await client.get(f"/v1/conversations/{ids['convo']}")).json()["data"]["runs"]
+    by_id = {r["run_id"]: r["agent_spec_sha256"] for r in refreshed}
+    assert by_id[runs[0]["run_id"]] == "c" * 64
+    # 另一轮仍然是 null —— 这一列是逐轮的,不是整个会话一个值。
+    assert by_id[runs[1]["run_id"]] is None
+
+
+@pytest.mark.asyncio
 async def test_detail_unknown_thread_is_404(
     client_and_threads: tuple[AsyncClient, dict[str, UUID]],
 ) -> None:

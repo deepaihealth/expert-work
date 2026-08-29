@@ -65,6 +65,11 @@ export interface ConversationRun {
   updated_at: string;
   finished_at: string | null;
   trace_id: string | null;
+  /** 这一轮实际执行时用的 manifest 内容哈希。配置改动立刻对新一轮生效,所以
+   *  同一个会话前后可能跑在两套配置上;``agent_version`` 分不出来(原地编辑,
+   *  版本号不变),只能靠它。``null`` = 没记录(该列上线前的 run,或 run 在
+   *  构建成功前就结束了)—— **不是**「用了另一套配置」。 */
+  agent_spec_sha256: string | null;
   tokens: RunTokens | null;
 }
 

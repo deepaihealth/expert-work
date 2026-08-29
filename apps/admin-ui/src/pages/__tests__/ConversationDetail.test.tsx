@@ -248,6 +248,7 @@ const CONVO: ConversationDetailModel = {
       updated_at: "2026-06-30T12:01:00Z",
       finished_at: "2026-06-30T12:01:00Z",
       trace_id: "tr-1",
+      agent_spec_sha256: null,
       tokens: null,
     },
     {
@@ -261,6 +262,7 @@ const CONVO: ConversationDetailModel = {
       updated_at: "2026-06-30T12:05:30Z",
       finished_at: "2026-06-30T12:05:30Z",
       trace_id: "tr-2",
+      agent_spec_sha256: null,
       tokens: null,
     },
   ],
@@ -347,6 +349,42 @@ describe("ConversationDetail", () => {
     const links = screen.getAllByTestId("console-turn-run-link");
     expect(links[0]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_1}`);
     expect(links[1]).toHaveAttribute("href", `/runs/${THREAD_ID}/${RUN_2}`);
+  });
+
+  it("flags that the config changed mid-conversation, naming the turn", async () => {
+    // 配置改动立刻对新一轮生效,所以同一个会话可能前后跑在两套配置上。复盘
+    // 「第 N 轮起答复不对」时,这是唯一能把「模型的问题」和「有人改了提示词」
+    // 分开的线索 —— 在此之前没有任何东西提示你去看。
+    const withChange = {
+      ...CONVO,
+      runs: [
+        { ...CONVO.runs[0], agent_spec_sha256: "a".repeat(64) },
+        { ...CONVO.runs[1], agent_spec_sha256: "b".repeat(64) },
+      ],
+    };
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(withChange);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+    renderPage();
+
+    const notice = await screen.findByTestId("config-change-notice");
+    expect(notice).toHaveTextContent("after turn 1");
+  });
+
+  it("stays silent when the runs carry no recorded config version", async () => {
+    // 历史 run 这一列全是 null。把 null 当成一个值去比会在全部历史数据上凭空
+    // 报出变更 —— 一个会乱报的标记比没有标记更糟,它把每次复盘引向错误方向。
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("config-change-notice")).not.toBeInTheDocument();
   });
 
   it("surfaces SDK errors in an alert", async () => {
