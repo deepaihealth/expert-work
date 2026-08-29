@@ -346,6 +346,66 @@ describe("PlaygroundTab", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // 发布前试跑:用未发布的草稿跑一轮
+  // -------------------------------------------------------------------------
+
+  const draftDetail: AgentDetailResponse = {
+    ...sampleDetail,
+    record: {
+      ...sampleDetail.record,
+      draft: {
+        spec: {},
+        spec_sha256: "d".repeat(64),
+        updated_by: "bob",
+        updated_at: "2026-08-29T10:00:00Z",
+      },
+    },
+  } as AgentDetailResponse;
+
+  it("offers the draft toggle only when a draft exists", async () => {
+    renderPg();
+    await screen.findByTestId("playground-input");
+    expect(screen.queryByTestId("playground-use-draft")).not.toBeInTheDocument();
+  });
+
+  it("runs against the published spec by default even when a draft exists", async () => {
+    // 「跑一轮」的默认含义必须是「跑线上那一版」—— 默认成草稿会让人以为自己
+    // 在验线上行为,而其实没有。这是这个开关最容易设计错的地方。
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([{ id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" }]),
+    );
+    renderPg(draftDetail);
+    await screen.findByTestId("playground-input");
+    expect(screen.getByTestId("playground-use-draft")).toBeInTheDocument();
+
+    await user.type(screen.getByTestId("playground-input"), "hi");
+    await user.click(screen.getByTestId("playground-run"));
+
+    await waitFor(() => expect(streamRunMock).toHaveBeenCalled());
+    const body = streamRunMock.mock.calls[0][1];
+    expect(body.use_draft).toBeUndefined();
+  });
+
+  it("sends use_draft once the toggle is on", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([{ id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" }]),
+    );
+    renderPg(draftDetail);
+    await screen.findByTestId("playground-input");
+
+    await user.click(screen.getByTestId("playground-use-draft"));
+    await user.type(screen.getByTestId("playground-input"), "hi");
+    await user.click(screen.getByTestId("playground-run"));
+
+    await waitFor(() => expect(streamRunMock).toHaveBeenCalled());
+    expect(streamRunMock.mock.calls[0][1].use_draft).toBe(true);
+  });
+
   it("streams events from streamRun and renders the answer in the turn block", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);

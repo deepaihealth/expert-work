@@ -1483,6 +1483,9 @@ const zhCN: TranslationKeys = {
     subagent_result: "{{calls}} 次模型调用 · {{ms}}ms",
   },
   playground: {
+    use_draft: "用草稿跑",
+    use_draft_hint:
+      "这一轮按未发布的草稿跑,而不是线上那一版。线上的 Agent 一点都不受影响 —— 真实对话仍然用已发布的配置,直到你点「发布」。",
     session_failed: "创建对话失败",
     input_placeholder: "输入消息，与智能体对话…",
     run: "运行",

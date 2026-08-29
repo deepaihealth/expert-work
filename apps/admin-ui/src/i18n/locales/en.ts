@@ -1402,6 +1402,8 @@ export interface TranslationKeys {
     subagent_result: string;
   };
   playground: {
+    use_draft: string;
+    use_draft_hint: string;
     session_failed: string;
     input_placeholder: string;
     run: string;
@@ -4634,6 +4636,9 @@ const en: TranslationKeys = {
     subagent_result: "{{calls}} LLM calls · {{ms}}ms",
   },
   playground: {
+    use_draft: "Use draft",
+    use_draft_hint:
+      "Run this turn against the unpublished draft instead of the published config. Nothing about the live agent changes — real conversations keep using the published version until you press Publish.",
     session_failed: "Failed to create session",
     input_placeholder: "Type a message to chat with the agent…",
     run: "Run",
