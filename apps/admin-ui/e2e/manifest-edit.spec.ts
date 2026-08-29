@@ -156,7 +156,11 @@ test("edit a manifest via the form", async ({ page }) => {
       req.url().includes(`/v1/agents/${AGENT_NAME}/${AGENT_VERSION}`),
   );
   await page.getByTestId("manifest-save-btn").click();
-  await putPromise;
+  const put = await putPromise;
+  // 并发编辑保护:请求必须真的带上编辑时读到的那一版 sha。单元测试只验到
+  // updateAgent 的实参,验不到它有没有变成 HTTP 头(axios config 写错就是这
+  // 两层之间的洞)。
+  expect(put.headers()["if-match"]).toBe("a".repeat(64));
   await expect(page.getByTestId("manifest-editor-edit")).toBeVisible();
 });
 
