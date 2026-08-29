@@ -231,6 +231,15 @@ async def fire_trigger(
         tenant_id=trigger.tenant_id,
         user_id=trigger.user_id,
         is_resume=False,
+        # 这一行以前不传,``trace_id`` 默认 ``None`` —— 理由是「自动触发的 run
+        # 没有用户绑定的 trace」。但 run 照样在某条 trace 下执行(下面的
+        # ``create_task`` 复制当前 OTel context),每次 LLM 调用照样把
+        # ``token_usage`` 记在那条 trace 上;行里是 ``NULL``,这一轮的用量就
+        # 永远查不回来。见 :mod:`control_plane.run_trace`。
+        #
+        # 这条路不走 ``bind_exec_trace``:建行和派任务在同一个 context 里,
+        # 建行时就已经知道执行 trace,一次写入即可,不必回写第二遍。
+        trace_id=current_trace_id_hex(),
     )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.
     run_record.bound_distilled_skills = built.bound_distilled_skills

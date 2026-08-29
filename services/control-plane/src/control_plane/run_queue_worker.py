@@ -33,6 +33,7 @@ from langchain_core.runnables import RunnableConfig
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api.runs import build_run_graph_input
+from control_plane.run_trace import bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
 from expert_work.common.observability import (
@@ -245,44 +246,18 @@ class RunQueueWorker:
     async def _bind_exec_trace(self, run: RunInfo) -> None:
         """把 ``agent_run.trace_id`` 换成**执行时**的 trace。
 
-        建行时 API handler 写下的是那一刻的 ``current_trace_id_hex()``。
-        ``mode: "stream"`` 下那是 HTTP 请求的 span,``sse.py`` 的
-        ``expert_work.session.run`` 根 span 挂在它下面,父子同 trace,
-        ``token_usage``(每次 LLM 调用取同一个 current span)自然对得上。
-
-        ``mode: "queue"`` 不是:HTTP 立刻 202 返回,真正执行在这里的后台
-        任务里,``session.run`` 另起一个 trace。于是 ``trace_id`` 指着一个
-        早已结束的 202 请求,而这一轮的 token 记在别的 trace 下。
-        ``token_usage`` 没有 ``run_id`` 列——``totals_by_trace_ids`` 全靠
-        trace 连接 ``agent_run ↔ token_usage``,连接一断,Runs 列表/详情的
-        token 字段就是空的(2026-08-29 测试环境实测:stream 的 run 匹配得
-        到,queue 的 5 个探针 run 全部 0 行)。
-
-        ``RunStore.set_trace_id`` 早就备好(abstract + 两个实现 + 测试),
-        docstring 也写着「if the worker observes its own trace_id, the
-        second call wins」——设计意图一直是让执行方回写,只是这条线从没
-        接上。被 orphan sweep reclaim 后重跑的 run 会再写一次,``trace_id``
-        因此始终指向**最近一次**执行,这正是点开一个 run 想看的那条 trace。
-
-        软失败:回写不成功只记日志。这是可观测性接线,不该拦住一次本来能
-        跑的 run。
+        为什么非做不可、以及三个执行入口各自的情况,见
+        :mod:`control_plane.run_trace`。``current_trace_id_hex()`` 在本模块
+        取(不下沉到助手里),打桩缝留在这一层。
         """
-        trace_id = current_trace_id_hex()
-        if trace_id is None:
-            return
-        if trace_id == run.trace_id:
-            return
-        try:
-            ok = await self._runs.set_trace_id(
-                run_id=run.run_id, tenant_id=run.tenant_id, trace_id=trace_id
-            )
-        except Exception:
-            logger.warning(
-                "run_queue_worker.trace_bind_failed run_id=%s", run.run_id, exc_info=True
-            )
-            return
-        if not ok:
-            logger.warning("run_queue_worker.trace_bind_missed run_id=%s", run.run_id)
+        await bind_exec_trace(
+            runs=self._runs,
+            run_id=run.run_id,
+            tenant_id=run.tenant_id,
+            known_trace_id=run.trace_id,
+            exec_trace_id=current_trace_id_hex(),
+            source="run_queue_worker",
+        )
 
     async def _execute(self, run: RunInfo) -> None:
         """Rebuild the agent + execute a claimed queued run from its input.

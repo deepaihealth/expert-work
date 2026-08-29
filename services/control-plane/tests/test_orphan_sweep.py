@@ -483,3 +483,76 @@ async def test_stop_is_bounded_when_a_sweep_hangs(monkeypatch: pytest.MonkeyPatc
     # 修复前:stop() 永远等下去,这里超时失败。
     await asyncio.wait_for(sweep.stop(), timeout=2)
     assert sweep._task is None
+
+
+@pytest.mark.asyncio
+async def test_respawn_rewrites_trace_id_to_the_executing_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """被回收重跑的 run 必须把 ``trace_id`` 换成**续跑那一段**的 trace。
+
+    ``agent_run.trace_id`` 记的是上一次执行的 trace。原主实例崩掉后,续跑
+    发生在这里 —— sweep 是个后台轮询循环,``run_agent`` 从它的 context 里
+    ``create_task`` 出来,``expert_work.session.run`` 因此另起一个 trace。
+    续跑段的每次 LLM 调用都把 ``token_usage`` 记在那条新 trace 下,而
+    ``token_usage`` 没有 ``run_id`` 列 —— ``totals_by_trace_ids`` 全靠 trace
+    连接两张表。行里还是旧 trace,续跑段的用量就查不回来。
+
+    这和 ``run_queue_worker`` 那条(#1373)是同一个病:执行入口有三个,
+    ``RunStore.set_trace_id`` 当时只接了排队 worker 一个。
+    """
+    spawns: list[object] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+    # 测试进程没有 init_tracing,``expert_work_span`` 开出来是 no-op span,
+    # ``current_trace_id_hex()`` 恒 None。这里验的是接线 —— 拿到 trace 之后
+    # 有没有真写下去。
+    monkeypatch.setattr(sweep_module, "current_trace_id_hex", lambda: "b2" * 16)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+    # 上一次执行留下的 trace —— 崩溃前那条,续跑后必须不再是它。
+    await store.set_trace_id(run_id=run_id, tenant_id=tenant, trace_id="a1" * 16)
+
+    assert await _sweep(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert len(spawns) == 1
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.trace_id == "b2" * 16, (
+        "trace_id 还是崩溃前那条 —— 续跑段的 token_usage 关联不回这个 run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_respawn_keeps_trace_id_when_no_span_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有活跃 span 时保留原 trace,不能把 ``None`` 写下去。
+
+    OTel 未初始化时 ``current_trace_id_hex()`` 返回 ``None``。那时上一次执行
+    的 trace 是**唯一**已知的关联,擦掉只会更糟。
+    """
+
+    async def _fake_run_agent(**kw):
+        return None
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+    monkeypatch.setattr(sweep_module, "current_trace_id_hex", lambda: None)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+    await store.set_trace_id(run_id=run_id, tenant_id=tenant, trace_id="c3" * 16)
+
+    assert await _sweep(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.trace_id == "c3" * 16

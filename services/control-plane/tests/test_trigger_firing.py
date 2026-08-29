@@ -40,6 +40,7 @@ from expert_work.protocol import (
     TenantConfigPatch,
     TriggerRecord,
 )
+from expert_work.runtime.runs import InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 
 _TENANT = uuid4()
@@ -309,3 +310,46 @@ async def test_fire_block_does_not_advance_last_fired_at() -> None:
     refreshed = await ctx["trigger_store"].get(trigger_id=trigger.id, tenant_id=_TENANT)
     assert refreshed is not None
     assert refreshed.last_fired_at is None
+
+
+# ---------------------------------------------------------------------------
+# 执行 trace 绑定
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fire_binds_the_executing_trace_to_the_run_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """触发器起的 run 必须把执行时的 trace 写进 ``agent_run.trace_id``。
+
+    以前这里传 ``is_resume=False`` 就没了,``trace_id`` 默认 ``None`` ——
+    理由是「自动触发的 run 没有用户绑定的 trace」。但 run 照样在某条 trace
+    下执行,每次 LLM 调用照样把 ``token_usage`` 记在那条 trace 上;而
+    ``token_usage`` 没有 ``run_id`` 列,``totals_by_trace_ids`` 全靠 trace
+    连接两张表。行里是 ``NULL``,这一轮的用量就永远查不回来(测试环境近 30
+    天 8 个这样的 run)。
+
+    与 ``run_queue_worker``(#1373)、``orphan_sweep`` 同一条规矩:谁执行,
+    谁把自己的 trace 写回行里。
+    """
+    from control_plane import trigger_firing as firing_module
+
+    monkeypatch.setattr(firing_module, "current_trace_id_hex", lambda: "d4" * 16)
+
+    run_store = InMemoryRunStore()
+    ctx = await _build_ctx()
+    ctx["runtime"] = stub_agent_runtime(run_store=run_store)
+    trigger = _trigger(seed_input="Summarise last week's open PRs.")
+
+    run_id = await fire_trigger(
+        trigger, now=_NOW, **{k: v for k, v in ctx.items() if k != "audit_store"}
+    )
+    assert run_id is not None
+    await _drain(ctx, run_id)
+
+    row = await run_store.get(run_id=run_id, tenant_id=_TENANT)
+    assert row is not None
+    assert row.trace_id == "d4" * 16, (
+        "触发器 run 的 trace_id 是空的 —— 这一轮的 token_usage 关联不回来"
+    )

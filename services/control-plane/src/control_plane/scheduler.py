@@ -58,7 +58,11 @@ from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
 from control_plane.trigger_delivery import deliver_run_result
 from control_plane.trigger_firing import fire_trigger
-from expert_work.common.observability import expert_work_counter
+from expert_work.common.observability import (
+    ExpertWorkComponent,
+    expert_work_counter,
+    expert_work_span,
+)
 from expert_work.persistence import (
     ApprovalStore,
     ThreadMessageStore,
@@ -319,21 +323,36 @@ class TriggerScheduler:
     async def _fire(
         self, trigger: TriggerRecord, *, now: datetime, stamp_last_fired: bool = True
     ) -> UUID | None:
-        """Spawn a run for ``trigger`` — caller already set the tenant scope."""
-        return await fire_trigger(
-            trigger,
-            now=now,
-            agent_spec_store=self._agents,
-            runtime=self._runtime,
-            thread_store=self._threads,
-            audit_logger=self._audit,
-            approval_store=self._approvals,
-            trigger_store=self._triggers,
-            tenant_config_store=self._tenant_config_store,
-            agent_disable_service=self._agent_disable_service,
-            tenant_status_service=self._tenant_status_service,
-            stamp_last_fired=stamp_last_fired,
-        )
+        """Spawn a run for ``trigger`` — caller already set the tenant scope.
+
+        整个 fire 包在一个 span 里,这样定时起的 run 有一条属于自己的 trace:
+        ``fire_trigger`` 把它写进 ``agent_run.trace_id``,``create_task`` 派出去
+        的 ``run_agent`` 又从同一个 context 继承它,行和 ``token_usage`` 因此
+        连得上(见 :mod:`control_plane.run_trace`)。webhook 那条入口不需要 ——
+        它本来就跑在 HTTP 请求的 span 下面。
+
+        和 ``orphan_sweep`` 同款:span 在 run 结束前就闭合(这里只等派任务,
+        不等 run 跑完),trace id 不受影响。
+        """
+        with expert_work_span(
+            ExpertWorkComponent.CONTROL_PLANE,
+            "trigger_fire",
+            attributes={"trigger_id": str(trigger.id), "trigger_kind": trigger.kind},
+        ):
+            return await fire_trigger(
+                trigger,
+                now=now,
+                agent_spec_store=self._agents,
+                runtime=self._runtime,
+                thread_store=self._threads,
+                audit_logger=self._audit,
+                approval_store=self._approvals,
+                trigger_store=self._triggers,
+                tenant_config_store=self._tenant_config_store,
+                agent_disable_service=self._agent_disable_service,
+                tenant_status_service=self._tenant_status_service,
+                stamp_last_fired=stamp_last_fired,
+            )
 
     # -- pass 2: reconcile fired firings against their run outcome -------
 
