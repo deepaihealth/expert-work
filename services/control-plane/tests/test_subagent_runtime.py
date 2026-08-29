@@ -25,7 +25,7 @@ from orchestrator import BuiltAgent, LLMActionJudge, LLMOutputJudge, ToolEnv
 _SHA = "a" * 64
 
 
-def _spec(name: str, version: str = "1.0.0") -> AgentSpec:
+def _spec(name: str, version: str = "1.0.0", prompt: str = "x") -> AgentSpec:
     return AgentSpec.model_validate(
         {
             "apiVersion": "expert_work.io/v1",
@@ -34,7 +34,7 @@ def _spec(name: str, version: str = "1.0.0") -> AgentSpec:
             "spec": {
                 "tenant_config": {},
                 "model": {"provider": "anthropic", "name": "claude"},
-                "system_prompt": {"template": "x"},
+                "system_prompt": {"template": prompt},
                 "sandbox": {
                     "resources": {"cpu": "1", "memory": "1Gi"},
                     "network": {"egress": "proxy", "allowlist": ["a.com"]},
@@ -216,6 +216,43 @@ async def test_soft_deleted_agent_ref_raises(build_calls: list[dict[str, Any]]) 
     )
     with pytest.raises(SubAgentNotFoundError):
         await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+
+@pytest.mark.asyncio
+async def test_child_rebuilds_when_the_stored_spec_changed(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    """A sub-agent is an ordinary agent row and is edited through the same
+    config page. Its identity ``(tenant, name, version, depth, kind)`` survives
+    an in-place edit unchanged, so without hashing the content the delegated
+    child keeps running the pre-edit manifest for the whole TTL window — on
+    every replica, including the one that served the edit (this cache is only
+    reached through the invalidation hooks, never by the manifest write path)."""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant, spec=_spec("researcher"), spec_sha256=_SHA, created_by="test"
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(),
+    )
+
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    await store.update_spec(
+        tenant_id=tenant,
+        name="researcher",
+        version="1.0.0",
+        spec=_spec("researcher", prompt="edited"),
+        spec_sha256="b" * 64,
+        updated_by="test",
+    )
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    assert len(build_calls) == 2
+    assert build_calls[1]["spec"].spec.system_prompt.template == "edited"
 
 
 # ---------------------------------------------------------------------------

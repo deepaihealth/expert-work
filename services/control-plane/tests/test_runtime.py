@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane.api.agents import _spec_sha256
 from control_plane.runtime import (
     AgentRuntime,
     ResolvingEmbedder,
@@ -24,6 +25,7 @@ from control_plane.runtime import (
 )
 from expert_work.common.credentials import CredentialsResolver, CredentialsResolverError
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.protocol import AgentSpec, SkillStatus, TenantConfigRecord, TenantPlan
 from expert_work.runtime.runs import RunManager
@@ -52,9 +54,10 @@ _MINIMAL_MANIFEST: dict[str, Any] = {
 }
 
 
-def _make_spec(*, name: str = "x", version: str = "1") -> AgentSpec:
+def _make_spec(*, name: str = "x", version: str = "1", prompt: str = "you help") -> AgentSpec:
     manifest = dict(_MINIMAL_MANIFEST)
     manifest["metadata"] = dict(manifest["metadata"], name=name, version=version)
+    manifest["spec"] = dict(manifest["spec"], system_prompt={"template": prompt})
     return AgentSpec.model_validate(manifest)
 
 
@@ -281,6 +284,91 @@ async def test_invalidate_tenant_fans_out_to_registered_hooks() -> None:
     t = uuid4()
     runtime.invalidate_tenant(t)
     assert seen == [t]
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed built-agent cache — an in-place manifest edit keeps
+# ``(tenant, name, version)``, so identity alone cannot tell a stale build
+# from a current one. Keying on the spec's content hash makes "the edit
+# reaches the next run" structural instead of dependent on someone
+# remembering to call ``invalidate_tenant`` (and on the Redis bus that
+# broadcasts it to peer replicas actually being up).
+# ---------------------------------------------------------------------------
+
+
+def _recording_runtime(builds: list[str]) -> AgentRuntime:
+    async def _builder(
+        spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
+    ) -> object:
+        builds.append(spec.spec.system_prompt.template)
+        return object()  # stand-in BuiltAgent
+
+    return AgentRuntime(
+        run_manager=RunManager(store=None),  # type: ignore[arg-type]
+        stream_bridge=InMemoryStreamBridge(),
+        agent_builder=_builder,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_agent_rebuilds_when_the_spec_content_changed() -> None:
+    """Same ``(tenant, name, version)``, edited content → cache MISS.
+
+    This is the in-place edit the config page performs: the caller has already
+    read the current row from the DB, so serving it a build of the previous
+    content is serving a config the operator has replaced."""
+    builds: list[str] = []
+    runtime = _recording_runtime(builds)
+    t = uuid4()
+
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="old"))
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="new"))
+
+    assert builds == ["old", "new"]
+
+
+@pytest.mark.asyncio
+async def test_get_agent_still_caches_identical_spec_content() -> None:
+    """The other direction: content-keying must not degrade into "always
+    rebuild" — an unchanged spec still hits the cache."""
+    builds: list[str] = []
+    runtime = _recording_runtime(builds)
+    t = uuid4()
+
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="same"))
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="same"))
+
+    assert builds == ["same"]
+
+
+@pytest.mark.asyncio
+async def test_get_agent_serves_the_edited_spec_after_a_revert() -> None:
+    """Edit then revert: the pre-edit build may still be cached, and serving it
+    is correct — but only because its content matches again, not because the
+    identity does."""
+    builds: list[str] = []
+    runtime = _recording_runtime(builds)
+    t = uuid4()
+
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="a"))
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="b"))
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec(prompt="a"))
+
+    assert builds == ["a", "b"]
+
+
+def test_cache_key_hash_matches_the_stored_agent_spec_sha() -> None:
+    """The cache key's hash and the ``agent_spec`` row's ``spec_sha256`` must be
+    the same canonical form.
+
+    Nothing breaks functionally if they drift — the cache would still be
+    correct, keyed on its own hash. What breaks is every human use of the pair:
+    the run row records the STORED sha (PR-B), so an operator asking "which
+    config produced this run" compares two numbers that can no longer be
+    compared. Pinning it here fails loudly at the moment either side changes
+    its canonicalisation."""
+    spec = _make_spec(prompt="canonical form check")
+    assert compute_spec_sha256(spec) == _spec_sha256(spec.model_dump(by_alias=True, mode="json"))
 
 
 # ---------------------------------------------------------------------------

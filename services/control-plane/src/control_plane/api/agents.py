@@ -426,17 +426,23 @@ def _get_delegation_policy_aux(request: Request) -> DelegationPolicyAux:
 
 
 async def _invalidate_agent_build_cache(request: Request, tenant_id: UUID) -> None:
-    """Evict the tenant's built-agent cache after a manifest write.
+    """Drop the tenant's now-unreachable built-agent cache entries after a
+    manifest write. Every write path (PUT / rollback / delete) funnels here.
 
-    :class:`AgentRuntime` keys built agents on ``(tenant, name, version)`` and
-    only consults the spec on a miss, so an in-place edit (same version — an
-    approval-gate / tool / model / prompt change from the form editor) is
-    invisible to new runs until the stale build is dropped. Every manifest
-    write path (PUT / rollback / delete) funnels through here. ``getattr``
-    guards the handful of test setups that build routers without a runtime.
+    This is a MEMORY reclaim, not the freshness mechanism. :class:`AgentRuntime`
+    keys built agents on the spec's content hash as well as its identity, so the
+    edited manifest reaches the next run because its key changed — on every
+    replica, whether or not this eviction or its bus broadcast arrived. What is
+    left behind without this call is the pre-edit entry, which nothing can hit
+    again and which would otherwise sit until its TTL.
 
-    PR-E3a — the eviction is also broadcast on the invalidation bus so peer
-    replicas drop their copies too (handlers rerun locally; harmless).
+    It is still load-bearing for its OTHER callers: ``invalidate_tenant`` also
+    drops builds holding a stale tenant MCP pool, and pool membership is not in
+    the manifest (see ``runtime._CacheKey``).
+
+    ``getattr`` guards the handful of test setups that build routers without a
+    runtime. PR-E3a — broadcast on the invalidation bus so peer replicas reclaim
+    too (handlers rerun locally; harmless).
     """
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is not None:
