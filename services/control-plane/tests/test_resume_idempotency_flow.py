@@ -86,6 +86,11 @@ class _CapturingGraph:
 
 
 class _FakeRunManager:
+    #: 与真 ``RunManager.store`` 同义:``None`` = 没接持久化,没有行可标注。
+    #: 这个 fake 不建真行,所以续跑路径上的 ``bind_exec_spec`` 在这里是 no-op
+    #: (它自己那条用例在 ``test_runs_api`` 里,跑的是真 store)。
+    store = None
+
     def __init__(self) -> None:
         self.created: list[object] = []
 

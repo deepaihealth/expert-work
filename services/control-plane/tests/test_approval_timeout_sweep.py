@@ -32,6 +32,9 @@ class _FakeGraph:
 
 
 class _FakeRunManager:
+    #: 与真 ``RunManager.store`` 同义:``None`` = 没接持久化,没有行可标注。
+    store = None
+
     def __init__(self) -> None:
         self.created: list[object] = []
 
