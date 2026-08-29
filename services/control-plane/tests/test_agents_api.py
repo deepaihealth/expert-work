@@ -64,7 +64,6 @@ _JINJA_YAML = _VALID_YAML.replace(
 )
 
 
-
 async def _put_manifest(client, name: str, version: str, manifest_yaml: str):
     """PUT 一版 manifest,带上当前的 ``If-Match``。
 
@@ -1013,9 +1012,7 @@ async def test_update_without_if_match_is_refused(b5_app_client) -> None:
     app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
     await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
 
-    resp = await client.put(
-        "/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML}
-    )
+    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
     assert resp.status_code == 428, resp.text
     assert resp.json()["error"]["code"] == "MANIFEST_IF_MATCH_REQUIRED"
 
@@ -1047,9 +1044,10 @@ async def test_update_with_a_stale_if_match_is_a_conflict(b5_app_client) -> None
 
     # A 的那一版还在,没被 B 盖掉。
     detail = await client.get("/v1/agents/code-reviewer/1.0.0")
-    assert detail.json()["data"]["record"]["spec_sha256"] == first.json()["data"]["record"][
-        "spec_sha256"
-    ]
+    assert (
+        detail.json()["data"]["record"]["spec_sha256"]
+        == first.json()["data"]["record"]["spec_sha256"]
+    )
 
 
 @pytest.mark.asyncio

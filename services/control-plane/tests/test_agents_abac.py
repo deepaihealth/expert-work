@@ -156,9 +156,13 @@ async def test_conditioned_operator_write_scoped_to_listed_agent(
         forbidden = await op.put(
             "/v1/agents/agent-bar/1.0.0", json={"manifest_yaml": _agent_yaml("agent-bar")}
         )
+        # 更新要带 If-Match(并发编辑保护)。注意 ``forbidden`` 那条**不**需要:
+        # 授权在前置条件之前判,所以越权写拿到的是 403 而不是「你没带头」。
+        current = await op.get("/v1/agents/agent-foo/1.0.0")
         allowed = await op.put(
             "/v1/agents/agent-foo/1.0.0",
             json={"manifest_yaml": _agent_yaml("agent-foo", team="支持")},
+            headers={"If-Match": current.json()["data"]["record"]["spec_sha256"]},
         )
     assert forbidden.status_code == 403, forbidden.text
     assert allowed.status_code == 200, allowed.text
