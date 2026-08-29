@@ -58,8 +58,24 @@ class AgentRunRow(Base):
     reclaim_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # Stream 9.5 (distributed run queue) — persisted run input for a ``queued``
     # run, so a ``RunQueueWorker`` on any instance can rebuild ``graph_input``
-    # and execute it. NULL for synchronous (SSE) runs and once a queued run is
-    # claimed (the input then lives in the checkpoint / event log).
+    # and execute it. Synchronous (SSE) runs never write it.
+    #
+    # 两处容易读错(2026-08-29 排查 token 记账时踩到):
+    #
+    # 1. 这一列每次 INSERT 都显式写,SSE 的 run 写进来的 Python ``None`` 落成
+    #    的是 **JSON ``null``**,不是 SQL NULL —— SQLAlchemy JSON 类型的默认
+    #    行为(``none_as_null`` 默认 False)。所以
+    #    ``WHERE enqueued_input IS NOT NULL`` 对 SSE 的 run 也判真,
+    #    **拿它分不出 queue 和 stream**(2026-08-29 测试环境 450 行:SQL NULL
+    #    0 个,JSON null 374 个)。Python 侧没这个坑:JSON ``null`` 解出来就是
+    #    ``None``。下面的 ``artifacts`` **不是**这样 —— 它只在 run 终局
+    #    UPDATE,没写过的行是真 SQL NULL(同一批 450 行:291 个 SQL NULL,
+    #    JSON null 0 个),所以那一列的「NULL vs []」用 SQL 也筛得对。
+    # 2. 领取(``claim_queued``)和 run 终局都**不清空**这一列,全仓没有
+    #    任何地方清。值会一直留着,里面是用户发进来的原始输入。目前没有
+    #    代码依赖它被清空(worker 领取时一次性读走,orphan sweep 续跑走的是
+    #    checkpoint),而同样的内容本来也留在 ``run_event`` 和 checkpoint 里,
+    #    所以只清这一列换不来什么 —— 但做数据留存时别按「跑完就没了」算。
     enqueued_input: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     # 产物清单契约(migration 0147)—— run 终局时固化的本 run 产物登记快照
     # ``[{name, kind, version, created_at}]``。NULL = 历史 run / 异常终局无
