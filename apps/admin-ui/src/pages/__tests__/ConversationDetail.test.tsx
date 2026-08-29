@@ -373,16 +373,27 @@ describe("ConversationDetail", () => {
   });
 
   it("stays silent when the runs carry no recorded config version", async () => {
-    // 历史 run 这一列全是 null。把 null 当成一个值去比会在全部历史数据上凭空
-    // 报出变更 —— 一个会乱报的标记比没有标记更糟,它把每次复盘引向错误方向。
-    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    // 一轮有值、一轮没有 —— 这才是危险形态:两轮都 null 时哪怕规则写错也
+    // 恰好不报,验不出东西。null = 没记录(该列上线前的 run,或 run 在构建
+    // 成功前就结束),不是「用了另一套配置」;把它当成一个值去比会在全部历史
+    // 数据上凭空报出变更,而一个会乱报的标记比没有标记更糟。
+    const halfRecorded = {
+      ...CONVO,
+      runs: [
+        { ...CONVO.runs[0], agent_spec_sha256: null },
+        { ...CONVO.runs[1], agent_spec_sha256: "a".repeat(64) },
+      ],
+    };
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(halfRecorded);
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
     vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
 
     renderPage();
 
+    // 必须先等转录真的渲染出来 —— 横幅和它在同一个分支里,只等页面根节点的话
+    // 这条断言会在横幅还没有机会出现时就通过,规则写错了也照样绿。
     await waitFor(() =>
-      expect(screen.getByTestId("conversation-detail-root")).toBeInTheDocument(),
+      expect(screen.getAllByTestId("console-turn-run-link")).toHaveLength(2),
     );
     expect(screen.queryByTestId("config-change-notice")).not.toBeInTheDocument();
   });
