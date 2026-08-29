@@ -824,6 +824,9 @@ class _BuildCheck:
     """
 
     rejected: JSONResponse | None = None
+    #: ``rejected`` 的人话原文。草稿端点不拦保存但要把原因说出来,拿它比
+    #: 反解一个已经组装好的 JSONResponse 干净。
+    error: str | None = None
     warning: str | None = None
 
 
@@ -907,12 +910,10 @@ async def _check_buildable(
         # The message is ours, not a traceback — it names the offending skill /
         # template / model knob, which is the whole actionable payload. Same
         # shape the ``/tools`` endpoint has always returned for a failed build.
+        message = f"manifest is valid but cannot be built into a runnable agent: {exc}"
         return _BuildCheck(
-            rejected=_envelope_error(
-                "MANIFEST_UNBUILDABLE",
-                f"manifest is valid but cannot be built into a runnable agent: {exc}",
-                422,
-            )
+            rejected=_envelope_error("MANIFEST_UNBUILDABLE", message, 422),
+            error=message,
         )
     record_manifest_build_check(outcome="ok")
     logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
@@ -1771,7 +1772,15 @@ def build_agents_router() -> APIRouter:
         payload = AgentList(
             items=items, total=len(items), cross_tenant=isinstance(scope, CrossTenant)
         )
-        return JSONResponse({"success": True, "data": payload.model_dump(mode="json")})
+        # 列表里剔掉草稿正文:一个租户几十个 Agent,每个都带一份完整 manifest
+        # 会把这个响应撑成几百 KB,而列表页一个字段都用不上它。想知道「哪些
+        # Agent 有未发布草稿」是另一件事,要做时加个布尔位,不是把正文塞进来。
+        return JSONResponse(
+            {
+                "success": True,
+                "data": payload.model_dump(mode="json", exclude={"items": {"__all__": {"draft"}}}),
+            }
+        )
 
     @router.get("/{name}/{version}", dependencies=_CONSOLE_ONLY)
     async def get_agent(
@@ -1931,6 +1940,216 @@ def build_agents_router() -> APIRouter:
             },
         )
         # 见 create 端点:非空 = 存下来了但这个部署还跑不了它。
+        data = AgentDetail(record=result.record).model_dump(mode="json")
+        data["build_warning"] = check.warning
+        return JSONResponse({"success": True, "data": data})
+
+    # --- 未发布草稿:把「改配置」和「让改动生效」分成两个动作 ------------
+    #
+    # ``If-Match`` 在这三个端点上是同一句话:**匹配你载入编辑器的那一版**。
+    # 编辑器有草稿就从草稿起步、没有就从线上起步,所以它手里永远正好是这个
+    # 值,不需要它去判断该送哪个。
+
+    def _editing_sha(record: AgentSpecRecord) -> str:
+        """编辑器此刻应当持有的 sha —— 有草稿就是草稿的,否则是线上的。"""
+        return record.draft.spec_sha256 if record.draft is not None else record.spec_sha256
+
+    @router.put("/{name}/{version}/draft", dependencies=_CONSOLE_ONLY)
+    async def save_draft(
+        name: str,
+        version: str,
+        payload: ManifestPayload,
+        request: Request,
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        loader: Annotated[ManifestLoader, Depends(_get_loader)],
+        if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    ) -> JSONResponse:
+        """存草稿 —— 不影响任何 run。
+
+        构建校验在这里是**只提示不拦**的:草稿就是半成品,拦住一次保存等于
+        逼人把改了一半的东西丢掉。真正的闸在发布那一步。
+        """
+        tenant_id = request.state.tenant_id
+        actor_id = request.state.actor_id
+        trace_id = current_trace_id_hex()
+        try:
+            spec, sha = await _load_manifest(payload, loader)
+        except ManifestError as exc:
+            return _manifest_error_to_response(exc)
+        if spec.metadata.name != name or spec.metadata.version != version:
+            return _envelope_error(
+                "MANIFEST_PATH_MISMATCH",
+                f"path is {name}/{version} but manifest metadata is "
+                f"{spec.metadata.name}/{spec.metadata.version}",
+                422,
+            )
+
+        existing = await repo.get(tenant_id=tenant_id, name=name, version=version)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await ensure_resource_access(
+            request, resource="manifest", action="write", attrs=_record_attrs(existing)
+        )
+        stale = _reject_stale_write(
+            if_match=if_match,
+            current_sha=_editing_sha(existing),
+            resource=f"{name}/{version}/draft",
+        )
+        if stale is not None:
+            return stale
+
+        record = await repo.save_draft(
+            tenant_id=tenant_id,
+            name=name,
+            version=version,
+            spec=spec,
+            spec_sha256=sha,
+            updated_by=actor_id,
+        )
+        if record is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        check = await _check_buildable(request, spec=spec, tenant_id=tenant_id)
+        await emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            action=AuditAction.MANIFEST_WRITE,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}",
+            trace_id=trace_id,
+            details={"draft": True, "draft_sha256": sha},
+        )
+        data = AgentDetail(record=record).model_dump(mode="json")
+        # 草稿建不出来不拦保存,但必须说出来 —— 否则人会一路点到发布才发现。
+        data["build_error"] = check.error
+        data["build_warning"] = check.warning
+        return JSONResponse({"success": True, "data": data})
+
+    @router.delete("/{name}/{version}/draft", dependencies=_CONSOLE_ONLY)
+    async def discard_draft(
+        name: str,
+        version: str,
+        request: Request,
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    ) -> JSONResponse:
+        """丢弃草稿。要求 ``If-Match`` 是**因为**这是破坏性的:别人在你看完
+        之后又存了新草稿的话,这一下会把它一起扔掉。"""
+        tenant_id = request.state.tenant_id
+        actor_id = request.state.actor_id
+        existing = await repo.get(tenant_id=tenant_id, name=name, version=version)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await ensure_resource_access(
+            request, resource="manifest", action="write", attrs=_record_attrs(existing)
+        )
+        stale = _reject_stale_write(
+            if_match=if_match,
+            current_sha=_editing_sha(existing),
+            resource=f"{name}/{version}/draft",
+        )
+        if stale is not None:
+            return stale
+
+        record = await repo.discard_draft(tenant_id=tenant_id, name=name, version=version)
+        if record is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            action=AuditAction.MANIFEST_WRITE,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}",
+            trace_id=current_trace_id_hex(),
+            details={"draft": True, "discarded": True},
+        )
+        return JSONResponse(
+            {"success": True, "data": AgentDetail(record=record).model_dump(mode="json")}
+        )
+
+    @router.post("/{name}/{version}/publish", dependencies=_CONSOLE_ONLY)
+    async def publish_draft(
+        name: str,
+        version: str,
+        request: Request,
+        repo: Annotated[AgentSpecStore, Depends(_get_repo)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    ) -> JSONResponse:
+        """发布草稿 —— 这一步才让改动对新会话生效。
+
+        构建校验在这里是**拦**的(与直接 PUT 同一条规矩):建不出来的东西
+        推上线,受害的是下一个发消息的用户。
+
+        ``If-Match`` 匹配的是**线上那一版**(你打算替换掉的那个),不是草稿:
+        这里要防的是「你看到的线上版本已经被别人换过了」。
+        """
+        tenant_id = request.state.tenant_id
+        actor_id = request.state.actor_id
+        trace_id = current_trace_id_hex()
+        existing = await repo.get(tenant_id=tenant_id, name=name, version=version)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await ensure_resource_access(
+            request, resource="manifest", action="write", attrs=_record_attrs(existing)
+        )
+        if existing.draft is None:
+            return _envelope_error(
+                "MANIFEST_NO_DRAFT",
+                "there is no unpublished draft to publish",
+                409,
+            )
+        stale = _reject_stale_write(
+            if_match=if_match,
+            current_sha=existing.spec_sha256,
+            resource=f"{name}/{version}/publish",
+        )
+        if stale is not None:
+            return stale
+
+        check = await _check_buildable(request, spec=existing.draft.spec, tenant_id=tenant_id)
+        if check.rejected is not None:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action=AuditAction.MANIFEST_PUBLISH,
+                resource_type="manifest",
+                resource_id=f"{name}/{version}",
+                result=AuditResult.DENIED,
+                reason="unbuildable",
+                trace_id=trace_id,
+            )
+            return check.rejected
+
+        # 校验与提升之间理论上仍有窗口(别人此刻换掉草稿)。没有为它加机制:
+        # 这需要两个人同时编辑**同一个** Agent 且在毫秒级交错,而代价是把
+        # 「校验哪一版」也变成一个要传的参数。真出现时它照样过发布那一步的
+        # 构建闸 —— 只是校验的是稍旧的那一份。
+        result = await repo.publish_draft(
+            tenant_id=tenant_id, name=name, version=version, updated_by=actor_id
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        await _invalidate_agent_build_cache(request, tenant_id)
+        await emit(
+            audit,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            action=AuditAction.MANIFEST_PUBLISH,
+            resource_type="manifest",
+            resource_id=f"{name}/{version}",
+            trace_id=trace_id,
+            details={
+                "spec_sha256": result.record.spec_sha256,
+                "prev_sha256": result.prev_sha256,
+                "revision": result.revision,
+                "build_warning": check.warning,
+            },
+        )
         data = AgentDetail(record=result.record).model_dump(mode="json")
         data["build_warning"] = check.warning
         return JSONResponse({"success": True, "data": data})
