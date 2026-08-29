@@ -591,8 +591,8 @@ async def test_respawn_records_the_manifest_version_it_rebuilt_from(
     是当前那一版,记的就必须是它,不是崩掉那次用的。
     """
 
-    async def _fake_run_agent(**kw):
-        del kw
+    async def _fake_run_agent(**_kw):
+        """Swallow the spawn — 这条用例只关心行里记下了什么。"""
 
     monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
     store = InMemoryRunStore()

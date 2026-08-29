@@ -465,8 +465,8 @@ async def test_execute_records_the_manifest_version_it_actually_built(
     建行时写会写错。
     """
 
-    async def _fake_run_agent(**kw: object) -> None:
-        del kw
+    async def _fake_run_agent(**_kw: object) -> None:
+        """Swallow the spawn — 这条用例只关心行里记下了什么。"""
 
     monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
     store = InMemoryRunStore()
