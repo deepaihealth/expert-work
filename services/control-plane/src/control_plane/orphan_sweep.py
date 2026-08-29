@@ -39,9 +39,15 @@ from langchain_core.runnables import RunnableConfig
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
+from control_plane.run_trace import bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
-from expert_work.common.observability import current_trace_id_hex, expert_work_counter
+from expert_work.common.observability import (
+    ExpertWorkComponent,
+    current_trace_id_hex,
+    expert_work_counter,
+    expert_work_span,
+)
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.rls import (
     bypass_rls_var,
@@ -265,8 +271,40 @@ class OrphanSweep:
         await self._emit_audit(orphan, result=AuditResult.ERROR, reason=reason)
 
     async def _respawn(self, orphan: RunInfo) -> None:
-        """Re-spawn a reclaimed run, resuming from its durable checkpoint."""
-        with _tenant_scope(orphan.tenant_id, orphan.user_id):
+        """Re-spawn a reclaimed run, resuming from its durable checkpoint.
+
+        续跑段整个包在一个 ``expert_work.control_plane.reclaimed_run`` span 里,
+        并把它的 trace 回写到 ``agent_run.trace_id`` —— 见
+        :mod:`control_plane.run_trace` 为什么非做不可。``asyncio.create_task``
+        复制当前 OTel context,所以 ``run_agent`` 里的
+        ``expert_work.session.run`` 根 span 挂在这个 span 下面,续跑段的
+        ``token_usage`` 和这一行同 trace。
+
+        和 :class:`RunQueueWorker` 那条的差别:sweep 刻意**不 await** 派出去的
+        任务(轮询循环要立刻回去扫下一个),所以这个 span 会在 run 结束之前就
+        闭合,Tempo 瀑布图上父 span 比子 span 先结束。trace id 不受影响 ——
+        我们要的就是它。
+        """
+        with (
+            expert_work_span(
+                ExpertWorkComponent.CONTROL_PLANE,
+                "reclaimed_run",
+                attributes={
+                    "run_id": str(orphan.run_id),
+                    "thread_id": str(orphan.thread_id),
+                },
+            ),
+            _tenant_scope(orphan.tenant_id, orphan.user_id),
+        ):
+            await bind_exec_trace(
+                runs=self._runs,
+                run_id=orphan.run_id,
+                tenant_id=orphan.tenant_id,
+                known_trace_id=orphan.trace_id,
+                exec_trace_id=current_trace_id_hex(),
+                source="orphan_sweep",
+            )
+
             meta = await self._threads.get(orphan.thread_id, tenant_id=orphan.tenant_id)
             if meta is None or meta.agent_name is None or meta.agent_version is None:
                 await self._fail_orphan(orphan, now=datetime.now(UTC), reason="no_agent")
