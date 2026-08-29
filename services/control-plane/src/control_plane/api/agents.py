@@ -30,6 +30,7 @@ from control_plane.api._authz import (
     console_only,
     ensure_resource_access,
     external_only,
+    manifest_record_attrs,
     require,
 )
 from control_plane.api._external import (
@@ -147,13 +148,11 @@ class ManifestPayload(BaseModel):
     manifest_yaml: str = Field(min_length=1)
 
 
-def _record_attrs(record: AgentSpecRecord) -> ResourceAttrs:
-    """Stream 8.5 — ABAC attributes for a stored manifest instance."""
-    return ResourceAttrs(
-        resource_id=record.name,
-        labels=record.spec.metadata.labels,
-        owner_id=record.created_by,
-    )
+#: Stream 8.5 —— 已存储 manifest 实例的 ABAC 属性。定义挪去了
+#: ``api/_authz``,因为 ``runs.py`` 的「用草稿试跑」也要用它,而 ``agents.py``
+#: 反过来 import 了 ``runs.spawn_run``,放这儿会成环。别名保留,免得本文件里
+#: 十来处调用点全改一遍。
+_record_attrs = manifest_record_attrs
 
 
 def _spec_attrs(spec: AgentSpec, *, owner_id: str) -> ResourceAttrs:

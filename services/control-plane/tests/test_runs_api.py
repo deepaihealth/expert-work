@@ -2195,3 +2195,145 @@ async def test_thread_runs_expose_the_manifest_version(runs_client: AsyncClient)
     assert runs
     expected = await _stored_spec_sha(runs_client, thread_id)
     assert all(r["agent_spec_sha256"] == expected for r in runs)
+
+
+# ---------------------------------------------------------------------------
+# 用草稿试跑 —— 发布前在调试台验一轮
+#
+# 三条约束都是「不这么做就会交回一个假象」:静默退回线上版本、或者让 worker
+# 稍后拿线上版本去跑,都会让人以为自己验过了草稿。
+# ---------------------------------------------------------------------------
+
+
+async def _agent_of(runs_client: AsyncClient, thread_id: str):
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+    return app.state.agent_spec_repo, meta
+
+
+@pytest.mark.asyncio
+async def test_run_with_use_draft_builds_from_the_draft(runs_client: AsyncClient) -> None:
+    thread_id = await _create_session(runs_client)
+    repo, meta = await _agent_of(runs_client, thread_id)
+    live = await repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    drafted = live.spec.model_copy(
+        update={
+            "spec": live.spec.spec.model_copy(
+                update={
+                    "system_prompt": live.spec.spec.system_prompt.model_copy(
+                        update={"template": "drafted prompt"}
+                    )
+                }
+            )
+        }
+    )
+    await repo.save_draft(
+        tenant_id=_DEFAULT_TENANT,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        spec=drafted,
+        spec_sha256="d" * 64,
+        updated_by="tester",
+    )
+
+    async with runs_client.stream(
+        "POST",
+        f"/v1/sessions/{thread_id}/runs",
+        json={"input": "hello", "use_draft": True},
+    ) as response:
+        assert response.status_code == 200, await response.aread()
+        body = await response.aread()
+    events = _parse_sse(body.decode())
+    metadata = next((d for evt, d in events if evt == "metadata"), None)
+    assert isinstance(metadata, dict)
+
+    # 这一轮记下的是**草稿**那一版 —— 事后能看出它跑的不是线上配置。
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(
+        run_id=UUID(str(metadata["run_id"])), tenant_id=_DEFAULT_TENANT
+    )
+    assert row is not None
+    assert row.agent_spec_sha256 == compute_spec_sha256(drafted)
+    assert row.agent_spec_sha256 != live.spec_sha256
+
+    # 线上那一版没被动过。
+    after = await repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    assert after.spec_sha256 == live.spec_sha256
+
+
+@pytest.mark.asyncio
+async def test_use_draft_without_a_draft_is_a_conflict(runs_client: AsyncClient) -> None:
+    """不静默退回线上那一版 —— 那会让人以为自己验过了草稿。"""
+    thread_id = await _create_session(runs_client)
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs", json={"input": "hi", "use_draft": True}
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_NO_DRAFT"
+
+
+@pytest.mark.asyncio
+async def test_use_draft_is_refused_in_queue_mode(runs_client: AsyncClient) -> None:
+    """排队的 run 由 worker 稍后执行,而 worker 读的是线上那一版。
+
+    静默接受这个组合 = 交回一个「验过草稿」的假象,而实际跑的是别的东西。
+    """
+    thread_id = await _create_session(runs_client)
+    repo, meta = await _agent_of(runs_client, thread_id)
+    live = await repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    await repo.save_draft(
+        tenant_id=_DEFAULT_TENANT,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        spec=live.spec,
+        spec_sha256="d" * 64,
+        updated_by="tester",
+    )
+
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs",
+        json={"input": "hi", "use_draft": True, "mode": "queue"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "DRAFT_RUN_REQUIRES_STREAM"
+
+
+@pytest.mark.asyncio
+async def test_a_normal_run_still_uses_the_published_spec(runs_client: AsyncClient) -> None:
+    """反向:有草稿不代表普通的 run 会用它 —— 那才是最坏的结果。"""
+    thread_id = await _create_session(runs_client)
+    repo, meta = await _agent_of(runs_client, thread_id)
+    live = await repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    drafted = live.spec.model_copy(
+        update={
+            "spec": live.spec.spec.model_copy(
+                update={
+                    "system_prompt": live.spec.spec.system_prompt.model_copy(
+                        update={"template": "drafted prompt"}
+                    )
+                }
+            )
+        }
+    )
+    await repo.save_draft(
+        tenant_id=_DEFAULT_TENANT,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        spec=drafted,
+        spec_sha256="d" * 64,
+        updated_by="tester",
+    )
+
+    _, run_id = await _seed_completed_run(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT)
+    assert row is not None
+    assert row.agent_spec_sha256 == live.spec_sha256
