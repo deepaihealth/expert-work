@@ -67,6 +67,13 @@ export interface AgentDetailResponse {
   disabled?: boolean;
   /** The kill-switch record when ``disabled`` is true; ``null`` otherwise. */
   disable?: AgentDisableRecord | null;
+  /** 保存/创建时 dry-run 构建的结果:非 null = **存下来了,但这个部署还跑不了
+   *  它**(平台没配这个 provider 的凭据、或声明了长期记忆却没配 embedding)。
+   *  这类问题作者改不了,所以后端不拒绝保存 —— 但绿灯不等于能跑,必须显式
+   *  告诉人。manifest 本身写错(技能解析不到、子 Agent 成环……)是另一条路:
+   *  后端直接 422 ``MANIFEST_UNBUILDABLE``,根本不落库。
+   *  只在 create / update 的响应里出现,GET 详情没有这个字段。 */
+  build_warning?: string | null;
 }
 
 /** Result of POST /v1/agents/{name}/disable|enable. ``cancelled_runs`` is the
