@@ -535,6 +535,49 @@ async def test_set_trace_id_unknown_run_returns_false() -> None:
     assert ok is False
 
 
+# ---------------------------------------------------------------------------
+# set_agent_spec_sha256 — which manifest revision this run actually executed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_agent_spec_sha256_writes_and_reads_back() -> None:
+    store = InMemoryRunStore()
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id))
+
+    ok = await store.set_agent_spec_sha256(
+        run_id=run_id, tenant_id=tenant_id, agent_spec_sha256="ab" * 32
+    )
+    assert ok is True
+
+    fetched = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None
+    assert fetched.agent_spec_sha256 == "ab" * 32
+
+
+@pytest.mark.asyncio
+async def test_set_agent_spec_sha256_unknown_run_returns_false() -> None:
+    """Cross-tenant probes must not reveal existence — same contract as
+    ``set_trace_id``."""
+    store = InMemoryRunStore()
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id))
+
+    assert (
+        await store.set_agent_spec_sha256(
+            run_id=run_id, tenant_id=uuid4(), agent_spec_sha256="cd" * 32
+        )
+        is False
+    )
+    assert (
+        await store.set_agent_spec_sha256(
+            run_id=uuid4(), tenant_id=tenant_id, agent_spec_sha256="cd" * 32
+        )
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_set_trace_id_cross_tenant_returns_false() -> None:
     """A wrong tenant_id must not let an attacker stamp another tenant's

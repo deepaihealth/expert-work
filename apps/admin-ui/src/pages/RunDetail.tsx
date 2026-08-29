@@ -60,6 +60,7 @@ import { useStatusPolling } from "../hooks/useStatusPolling";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ApprovalCard } from "./run_detail/ApprovalCard";
 import { RunSummaryPanel } from "./run_detail/RunSummaryPanel";
+import { SpecVersionField } from "./run_detail/SpecVersionField";
 
 const { Text } = Typography;
 
@@ -393,6 +394,15 @@ export function RunDetail() {
           <dd className="mono" style={{ margin: 0 }}>{run.thread_id}</dd>
           <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("run_detail.status")}</dt>
           <dd style={{ margin: 0 }}>{run.status}</dd>
+          <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("run_detail.spec_version")}</dt>
+          <dd style={{ margin: 0 }}>
+            <SpecVersionField
+              sha={run.agent_spec_sha256}
+              agentName={agentName}
+              agentVersion={agentVersion}
+              tenantScope={concreteTenantScope(apiTenantScope)}
+            />
+          </dd>
         </dl>
       </Card>
 

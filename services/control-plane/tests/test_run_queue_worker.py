@@ -23,6 +23,8 @@ from control_plane.run_queue_worker import RunQueueWorker
 from control_plane.tenant_status import TenantStatusService
 from expert_work.persistence import InMemoryAgentDisableStore, InMemoryTenantConfigStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
 
 
@@ -37,10 +39,31 @@ class _FakeThreads:
         return SimpleNamespace(agent_name="a", agent_version="1.0.0", user_id=None)
 
 
+_SPEC = AgentSpec.model_validate(
+    {
+        "apiVersion": "expert_work.io/v1",
+        "kind": "Agent",
+        "metadata": {"name": "queued", "version": "1.0.0", "tenant": "t"},
+        "spec": {
+            "tenant_config": {},
+            "model": {"provider": "anthropic", "name": "claude-haiku-4-5"},
+            "system_prompt": {"template": "you help"},
+            "sandbox": {
+                "resources": {"cpu": "1", "memory": "1Gi"},
+                "network": {"egress": "none", "allowlist": []},
+                "filesystem": {"readonly_root": True, "writable": []},
+            },
+        },
+    }
+)
+
+
 class _FakeAgents:
     async def get(self, *, tenant_id, name, version):
         del tenant_id, name, version
-        return SimpleNamespace(spec=SimpleNamespace())
+        # A real AgentSpec, not a stand-in: the worker now hashes what it built
+        # from, and a stand-in would make that hashing untestable here.
+        return SimpleNamespace(spec=_SPEC)
 
 
 class _FakeRuntime:
@@ -428,3 +451,34 @@ async def test_execute_keeps_trace_id_when_no_span_is_active(
     info = await store.get(run_id=run_id, tenant_id=tenant)
     assert info is not None
     assert info.trace_id == "c3" * 16
+
+
+@pytest.mark.asyncio
+async def test_execute_records_the_manifest_version_it_actually_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """排队执行的 run 必须记下**执行时**读到的那一版 manifest。
+
+    配置页对 manifest 是原地编辑,``thread_meta`` 上的 ``agent_name`` /
+    ``agent_version`` 编辑前后一模一样。排队的 run 建行时还没构建过,worker
+    真去执行时读到的可能已经是编辑后的版本 —— 所以这一列只能在这里写,
+    建行时写会写错。
+    """
+
+    async def _fake_run_agent(**_kw: object) -> None:
+        """Swallow the spawn — 这条用例只关心行里记下了什么。"""
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _enqueue(runtime.run_manager)
+    before = await store.get(run_id=run_id, tenant_id=tenant)
+    assert before is not None
+    assert before.agent_spec_sha256 is None, "入队时还没构建过,不该有版本"
+
+    worker = _worker(store, runtime)
+    assert await worker.run_once() == 1
+
+    info = await store.get(run_id=run_id, tenant_id=tenant)
+    assert info is not None
+    assert info.agent_spec_sha256 == compute_spec_sha256(_SPEC)

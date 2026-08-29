@@ -35,6 +35,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import AuditQuery
 from expert_work.runtime.runs import DisconnectMode, InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
@@ -2086,3 +2087,111 @@ async def test_cancel_run_requires_operator_role(runs_client: AsyncClient) -> No
     row = await app.state.run_store.get(run_id=run_id, tenant_id=DEFAULT_DEV_TENANT_ID)
     assert row is not None
     assert row.status is RunStatus.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# agent_run.agent_spec_sha256 —— 这条 run 跑的是哪一版配置
+# ---------------------------------------------------------------------------
+
+
+async def _stored_spec_sha(runs_client: AsyncClient, thread_id: str) -> str:
+    """The content hash of the manifest this thread's agent currently has."""
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+    record = await app.state.agent_spec_repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    return compute_spec_sha256(record.spec)
+
+
+@pytest.mark.asyncio
+async def test_stream_run_records_the_manifest_version_it_built(
+    runs_client: AsyncClient,
+) -> None:
+    """``mode="stream"`` 的 run 记下它构建时用的那一版 manifest。
+
+    配置页对 manifest 是原地编辑,``thread_meta`` 上的 ``agent_name`` /
+    ``agent_version`` 编辑前后一模一样 —— 没有这一列,事后无法判断某条 run
+    跑的是编辑前还是编辑后的配置。
+    """
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+
+    row = await app.state.run_store.get(run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT)
+    assert row is not None
+    assert row.agent_spec_sha256 == await _stored_spec_sha(runs_client, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_queue_run_does_not_record_a_version_at_enqueue_time(
+    runs_client: AsyncClient,
+) -> None:
+    """``mode="queue"`` 入队时**不能**记版本。
+
+    这条分支只入队、立刻 202 返回,handler 手里那个 ``built`` 直接丢掉;
+    真正的构建晚一步发生在 ``RunQueueWorker`` 里,读到的可能已经是编辑后的
+    版本。在这里记 = 记的是一个从未被执行过的版本,正是这一列要消灭的那种
+    错误答案。由 worker 自己写(见 test_run_queue_worker)。
+    """
+    thread_id = await _create_session(runs_client)
+    response = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs",
+        json={"input": "do it async", "mode": "queue"},
+    )
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+
+    row = await app.state.run_store.get(run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT)
+    assert row is not None
+    assert row.agent_spec_sha256 is None
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
+    runs_client: AsyncClient,
+) -> None:
+    """审批续跑是**新 run 行**,而且它按**当前**配置重建 agent —— 审批期间
+    配置被编辑过很常见(「等一下,先把提示词改对再放行」),所以续跑那一行
+    记的必须是它自己执行时用的那一版,不能沿用暂停前那一版。
+    """
+    # 先跑完整一轮,让这个 thread 有真的 checkpoint —— 续跑要在它之上写审批
+    # 结论,空状态过不去(与本用例要验的东西无关,只是前置条件)。
+    thread_id, _ = await _seed_completed_run(runs_client)
+    run_id = await _seed_pending_approval(runs_client, thread_id)
+
+    resp = await runs_client.post(
+        f"/v1/sessions/{thread_id}/runs/{run_id}/resume",
+        json={"decision": "approve"},
+    )
+    assert resp.status_code == 200, resp.text
+    continuation = UUID(resp.headers["X-Expert-Work-Run-Id"])
+
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    row = await app.state.run_store.get(run_id=continuation, tenant_id=_DEFAULT_TENANT)
+    assert row is not None
+    assert row.is_resume is True
+    assert row.agent_spec_sha256 == await _stored_spec_sha(runs_client, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_get_run_exposes_the_manifest_version(runs_client: AsyncClient) -> None:
+    """Run 详情把配置版本露出来 —— ``agent_version`` 回答不了这个问题
+    (原地编辑前后版本号一样),控制台只能靠这个哈希去 revisions 里反查。"""
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
+    assert resp.status_code == 200
+    # 这个端点直接返回扁平对象,不套 {success, data, error}(与 trace_id 同处)。
+    assert resp.json()["agent_spec_sha256"] == await _stored_spec_sha(runs_client, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_thread_runs_expose_the_manifest_version(runs_client: AsyncClient) -> None:
+    """会话页的每轮列表也带上,好标出「第 N 轮之后配置变更过」。"""
+    thread_id, _ = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert resp.status_code == 200
+    runs = resp.json()["data"]["runs"]
+    assert runs
+    expected = await _stored_spec_sha(runs_client, thread_id)
+    assert all(r["agent_spec_sha256"] == expected for r in runs)

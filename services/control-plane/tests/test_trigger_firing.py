@@ -34,6 +34,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import (
     AgentSpec,
     AuditQuery,
@@ -353,3 +354,28 @@ async def test_fire_binds_the_executing_trace_to_the_run_row(
     assert row.trace_id == "d4" * 16, (
         "触发器 run 的 trace_id 是空的 —— 这一轮的 token_usage 关联不回来"
     )
+
+
+@pytest.mark.asyncio
+async def test_fire_records_the_manifest_version_it_built() -> None:
+    """触发器起的 run 必须记下**这次触发**读到的那一版 manifest。
+
+    触发器是长期存在的定时任务,配置在两次触发之间被改过是常态。没有这一列,
+    「上周三那次定时跑用的是哪版提示词」只能拿时间戳去 revision 表比对着猜 ——
+    而 ``thread_meta`` 上的 ``agent_name`` / ``agent_version`` 原地编辑前后
+    一模一样,给不出任何区分。
+    """
+    run_store = InMemoryRunStore()
+    ctx = await _build_ctx()
+    ctx["runtime"] = stub_agent_runtime(run_store=run_store)
+    trigger = _trigger(seed_input="Summarise last week's open PRs.")
+
+    run_id = await fire_trigger(
+        trigger, now=_NOW, **{k: v for k, v in ctx.items() if k != "audit_store"}
+    )
+    assert run_id is not None
+    await _drain(ctx, run_id)
+
+    row = await run_store.get(run_id=run_id, tenant_id=_TENANT)
+    assert row is not None
+    assert row.agent_spec_sha256 == compute_spec_sha256(AgentSpec.model_validate(_MANIFEST))

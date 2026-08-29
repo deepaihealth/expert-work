@@ -33,7 +33,7 @@ from langchain_core.runnables import RunnableConfig
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api.runs import build_run_graph_input
-from control_plane.run_trace import bind_exec_trace
+from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
 from expert_work.common.observability import (
@@ -300,6 +300,15 @@ class RunQueueWorker:
             except AgentFactoryError:
                 await self._fail(run, reason="unbuildable")
                 return
+            # 建行时没有构建过,执行时读到的可能已经是编辑后的版本 —— 记的
+            # 必须是刚刚真构建出来的这一版。
+            await bind_exec_spec(
+                runs=self._runs,
+                run_id=run.run_id,
+                tenant_id=run.tenant_id,
+                spec=record.spec,
+                source="run_queue_worker",
+            )
 
             payload = run.enqueued_input or {}
             graph_input = build_run_graph_input(

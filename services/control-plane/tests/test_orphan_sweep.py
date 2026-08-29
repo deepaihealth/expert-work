@@ -23,6 +23,8 @@ from control_plane.orphan_sweep import OrphanSweep
 from control_plane.tenant_status import TenantStatusService
 from expert_work.persistence import InMemoryAgentDisableStore, InMemoryTenantConfigStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
+from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore, RunInfo, RunManager, RunStatus
 from expert_work.runtime.runs.schemas import DisconnectMode
 
@@ -55,10 +57,31 @@ class _FakeThreads:
         return SimpleNamespace(agent_name="a", agent_version="1.0.0", user_id=None)
 
 
+_SPEC = AgentSpec.model_validate(
+    {
+        "apiVersion": "expert_work.io/v1",
+        "kind": "Agent",
+        "metadata": {"name": "a", "version": "1.0.0", "tenant": "t"},
+        "spec": {
+            "tenant_config": {},
+            "model": {"provider": "anthropic", "name": "claude-haiku-4-5"},
+            "system_prompt": {"template": "you help"},
+            "sandbox": {
+                "resources": {"cpu": "1", "memory": "1Gi"},
+                "network": {"egress": "none", "allowlist": []},
+                "filesystem": {"readonly_root": True, "writable": []},
+            },
+        },
+    }
+)
+
+
 class _FakeAgents:
     async def get(self, *, tenant_id, name, version):
         del tenant_id, name, version
-        return SimpleNamespace(spec=SimpleNamespace())
+        # A real AgentSpec, not a stand-in: the sweep now hashes what it
+        # rebuilt from, and a stand-in would make that hashing untestable here.
+        return SimpleNamespace(spec=_SPEC)
 
 
 class _FakeRuntime:
@@ -556,3 +579,29 @@ async def test_respawn_keeps_trace_id_when_no_span_is_active(
     row = await store.get(run_id=run_id, tenant_id=tenant)
     assert row is not None
     assert row.trace_id == "c3" * 16
+
+
+@pytest.mark.asyncio
+async def test_respawn_records_the_manifest_version_it_rebuilt_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """续跑必须记下**这次续跑**读到的那一版 manifest。
+
+    原 run 可能是几分钟前建的行,期间配置被编辑过很正常;续跑重建 agent 用的
+    是当前那一版,记的就必须是它,不是崩掉那次用的。
+    """
+
+    async def _fake_run_agent(**_kw):
+        """Swallow the spawn — 这条用例只关心行里记下了什么。"""
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+
+    assert await _sweep(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.agent_spec_sha256 == compute_spec_sha256(_SPEC)

@@ -486,6 +486,35 @@ async def test_set_trace_id_unknown_run_returns_false_sql(
 
 
 @pytest.mark.asyncio
+async def test_set_agent_spec_sha256_writes_and_reads_back_sql(run_store: SqlRunStore) -> None:
+    run_id, tenant_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant_id))
+    # A fresh row has never executed, so it carries no manifest revision yet.
+    before = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert before is not None
+    assert before.agent_spec_sha256 is None
+
+    ok = await run_store.set_agent_spec_sha256(
+        run_id=run_id, tenant_id=tenant_id, agent_spec_sha256="9f" * 32
+    )
+    assert ok is True
+
+    fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None
+    assert fetched.agent_spec_sha256 == "9f" * 32
+
+
+@pytest.mark.asyncio
+async def test_set_agent_spec_sha256_unknown_run_returns_false_sql(
+    run_store: SqlRunStore,
+) -> None:
+    ok = await run_store.set_agent_spec_sha256(
+        run_id=uuid4(), tenant_id=uuid4(), agent_spec_sha256="ff" * 32
+    )
+    assert ok is False
+
+
+@pytest.mark.asyncio
 async def test_list_for_tenant_thread_ids_filter_sql(run_store: SqlRunStore) -> None:
     """Stream H.6 (Mini-ADR H-10) — ``WHERE thread_id IN (...)`` + empty fast-path."""
     tenant_id = uuid4()

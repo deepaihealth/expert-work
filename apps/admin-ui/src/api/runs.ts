@@ -82,6 +82,11 @@ export interface RunDetail {
    *  the migration or for auto-triggered runs (scheduler / curation
    *  worker that passes ``None``). */
   trace_id?: string | null;
+  /** 这一轮实际执行时用的 manifest 内容哈希。``agent_version`` 回答不了
+   *  「哪一版配置」—— 配置页是原地编辑,版本号编辑前后一样。拿它去
+   *  ``listAgentRevisions`` 的结果里按 ``spec_sha256`` 反查版本号。
+   *  ``null`` = 这一列上线前的历史 run,或 run 在构建成功前就结束了。 */
+  agent_spec_sha256?: string | null;
   /** Runs-enrichment — per-run token summary (``null`` = no usage). */
   tokens?: RunTokens | null;
   /** Runs-enrichment — durable-row timestamps (``null`` when the run is
