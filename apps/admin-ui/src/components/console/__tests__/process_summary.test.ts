@@ -176,6 +176,37 @@ describe("summarizeProcess", () => {
       summarizeProcess(compactRowsOf([agentStep(1, "只想不干", [])])).durationMs,
     ).toBeNull();
   });
+
+  it("counts a worker's wall clock once — the subagent row repeats its parent tool's span", () => {
+    // ``spawn_worker`` blocks until the worker finishes, so the tool result's
+    // ``duration_ms`` already *is* the worker's wall clock (live run f562fa69:
+    // tool 938_112ms ↔ worker end frame 933_000ms, the delta being framework
+    // overhead). The projection emits both a tool row and a subagent row for
+    // that one call (``trajectory_rows.ts``), so summing every row's duration
+    // billed the same span twice — that run's strip read 44m23s against a
+    // 23m45s wall clock, i.e. "thinking time" exceeding total elapsed.
+    const events: SseEvent[] = [
+      agentStep(1, "先派个 worker", [{ id: "c1", name: "spawn_worker" }], 1_000),
+      ev("worker", {
+        worker_id: "w-1", parent_worker_id: null, parent_tool_call_id: "c1",
+        label: "撰写员", agent_ref: "dynamic:general", depth: 1, kind: "start",
+        wseq: 0, data: { task_excerpt: "写手册", role: null, max_steps: 48 },
+      }),
+      ev("worker", {
+        worker_id: "w-1", parent_worker_id: null, parent_tool_call_id: "c1",
+        label: "撰写员", agent_ref: "dynamic:general", depth: 1, kind: "end",
+        wseq: 1,
+        data: { outcome: "success", iteration_used: 49, llm_call_count: 49, wall_clock_ms: 933_000 },
+      }),
+      toolResults([{ id: "c1", name: "spawn_worker", ok: true, durationMs: 938_112 }]),
+    ];
+    const rows = compactRowsOf(events);
+    // The subagent row is still there (the strip counts it under 其他) and
+    // still carries its own duration for per-row display — only the total
+    // must not add it on top of the parent tool's.
+    expect(rows.some((r) => r.kind === "subagent" && r.durationMs === 933_000)).toBe(true);
+    expect(summarizeProcess(rows).durationMs).toBe(939_112);
+  });
 });
 
 describe("processHeadline", () => {

@@ -23,7 +23,8 @@ export interface ProcessSummary {
   toolBreakdown: string;
   /** 本轮成功读取过的技能(`skill_view`),首读顺序;没有 → []。 */
   skills: TurnSkill[];
-  /** 全部行的 durationMs 之和(null 一律按 0);无行 → null。 */
+  /** 行 durationMs 之和(null 一律按 0);无行 → null。
+   *  **不含 `subagent` 行** —— 见 {@link summarizeProcess}。 */
   durationMs: number | null;
 }
 
@@ -53,7 +54,15 @@ export function summarizeProcess(rows: readonly CompactRow[]): ProcessSummary {
     // (`trajectory_rows.ts:139` ← `timeline.ts`'s `hasError = tools.some(…)`),
     // so counting it too would report 「2 次失败」 for one failing call.
     if (r.status === "error" && r.kind !== "think") failed += 1;
-    if (r.durationMs !== null) {
+    // `subagent` 行的时间已经由它的父 `spawn_worker` 工具行记过一次:该工具
+    // 同步等 worker 跑完,工具结果的 `duration_ms` 就是 worker 的墙钟
+    // (线上 f562fa69:工具 938_112ms ↔ worker end 帧 933_000ms,差值是框架
+    // 开销)。而 `trajectory_rows.ts` 为这一次调用同时投影出工具行与
+    // subagent 行,全加就等于把同一段时间计两遍——那次的过程条因此显示
+    // 44m23s,而整轮墙钟只有 23m45s,「思考」耗时反超总耗时。
+    // 并行派多个 worker 时更明显:工具行是这一批的真实墙钟,而 n 个
+    // subagent 行相加会数倍于它。
+    if (r.durationMs !== null && r.kind !== "subagent") {
       dur += r.durationMs;
       any = true;
     }
