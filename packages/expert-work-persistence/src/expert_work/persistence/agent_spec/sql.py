@@ -286,7 +286,14 @@ class SqlAgentSpecStore(AgentSpecStore):
                 record=_row_to_record(row), revision=next_revision, prev_sha256=prev_sha
             )
 
-    async def _live_row(self, session, *, tenant_id: UUID, name: str, version: str):
+    async def _live_row(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRow | None:
         """The non-deleted row for ``(tenant, name, version)``, locked for update."""
         return (
             await session.execute(
