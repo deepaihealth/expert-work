@@ -32,6 +32,7 @@ from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.skill import SkillStore
 from expert_work.protocol import AgentSpec, BuiltinToolSpec, SystemPromptSpec, ToolSpecEntry
 from expert_work.runtime.audit.logger import AuditLogger
@@ -43,13 +44,21 @@ from orchestrator.tools.spawn_worker import WorkerBuildFn
 
 logger = logging.getLogger(__name__)
 
-# Child-agent cache key: (tenant, name, version, depth, token_usage_kind); a
-# 6th OAuth-subject element is appended only for users with a connected OAuth
-# pool (see _build). B-26 — the usage kind is part of the key because the
-# built agent bakes it into its metering middleware: a skill_evolution-built
-# child served to a conversation delegation (or vice versa) would mis-label
-# every LLM call for the whole TTL window.
-_ChildKey = tuple[UUID, str, str, int, str] | tuple[UUID, str, str, int, str, str]
+# Child-agent cache key: (tenant, name, version, depth, token_usage_kind,
+# spec_sha256, oauth_subject). The subject is ``None`` for the shared build and
+# carries the user only when that user has a connected OAuth pool (see
+# ``_build``). B-26 — the usage kind is part of the key because the built agent
+# bakes it into its metering middleware: a skill_evolution-built child served to
+# a conversation delegation (or vice versa) would mis-label every LLM call for
+# the whole TTL window.
+#
+# ``spec_sha256`` mirrors the top-level ``AgentRuntime._cache`` (see its
+# ``_CacheKey``): a sub-agent is an ordinary agent row edited through the same
+# config page, and its identity is unchanged by an in-place edit. This cache is
+# additionally never touched by the manifest write path — it is only reached
+# through the invalidation hooks — so before content-addressing, a stale child
+# survived the edit even on the replica that served it.
+_ChildKey = tuple[UUID, str, str, int, str, str, str | None]
 
 
 def _worker_system_prompt(role: str | None) -> str:
@@ -334,10 +343,24 @@ def make_child_agent_builder(
             candidate = await user_mcp_oauth_pool_provider(tenant_id, oauth_user_id)
             if candidate.names():
                 user_pool = candidate
+        # The manifest read moved AHEAD of the cache lookup: the key hashes the
+        # spec, so the spec has to be in hand before we can ask the cache
+        # anything. Costs one indexed single-row read per delegation (previously
+        # only on a miss) — cheap next to building or running a child agent, and
+        # it buys the two properties the identity-only key could not have: an
+        # edited manifest cannot be served stale, and a deleted one stops being
+        # served from a warm entry.
+        record = await spec_store.get(tenant_id=tenant_id, name=name, version=version)
+        if record is None:
+            raise SubAgentNotFoundError(tenant_id=tenant_id, name=name, version=version)
         key: _ChildKey = (
-            (tenant_id, name, version, depth, token_usage_kind, oauth_user_id)
-            if user_pool is not None and oauth_user_id is not None
-            else (tenant_id, name, version, depth, token_usage_kind)
+            tenant_id,
+            name,
+            version,
+            depth,
+            token_usage_kind,
+            compute_spec_sha256(record.spec),
+            oauth_user_id if user_pool is not None else None,
         )
         cached = cache.get(key)
         if cached is not None:
@@ -353,9 +376,6 @@ def make_child_agent_builder(
             # config change (二期 PR2 T4).
             del cache[key]
             _publish_cache_size()
-        record = await spec_store.get(tenant_id=tenant_id, name=name, version=version)
-        if record is None:
-            raise SubAgentNotFoundError(tenant_id=tenant_id, name=name, version=version)
         provider_key_resolver = (
             make_provider_key_resolver(resolver=credentials_resolver, tenant_id=tenant_id)
             if credentials_resolver is not None
@@ -472,11 +492,13 @@ def make_child_agent_builder(
 
         Registered with the :class:`AgentRuntime` so a user's OAuth token
         refresh / disconnect evicts stale delegated child builds (whose
-        ``ToolEnv`` holds the old per-user OAuth pool). Only 6-tuple keys
-        match — index 5 is the OAuth subject (see ``_ChildKey``); shared
-        5-tuple builds and other users' entries are left intact.
+        ``ToolEnv`` holds the old per-user OAuth pool — pool membership is not
+        part of the manifest, so content-addressing does not cover it and this
+        eviction stays load-bearing). Index 6 is the OAuth subject (see
+        ``_ChildKey``) and is ``None`` on the shared builds, which therefore
+        never match a real subject.
         """
-        for key in [k for k in cache if len(k) == 6 and k[0] == tenant_id and k[5] == user_id]:
+        for key in [k for k in cache if k[0] == tenant_id and k[6] == user_id]:
             del cache[key]
         _publish_cache_size()
 

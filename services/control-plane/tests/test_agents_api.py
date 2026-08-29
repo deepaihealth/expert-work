@@ -460,11 +460,16 @@ async def b5_app_client(
         yield app, client
 
 
-def _seed_build_cache(app: object) -> tuple[object, str, str]:
+def _seed_build_cache(app: object) -> tuple[object, str, str, str, None]:
     """Stand a sentinel build in the runtime cache for code-reviewer@1.0.0 so a
-    following write can be shown to evict it. Returns the cache key."""
+    following write can be shown to evict it. Returns the cache key.
+
+    The shape must match ``runtime._CacheKey`` — the invalidators match
+    positionally (tenant at ``k[0]``, OAuth subject at ``k[4]``), so a key of the
+    wrong arity would either be dropped for the wrong reason or, once the sha
+    element moved, stop representing anything the runtime can actually hold."""
     runtime = app.state.agent_runtime  # type: ignore[attr-defined]
-    key = (_DEFAULT_TENANT, "code-reviewer", "1.0.0")
+    key = (_DEFAULT_TENANT, "code-reviewer", "1.0.0", "0" * 64, None)
     runtime._cache[key] = object()  # stand-in for a BuiltAgent
     return key
 

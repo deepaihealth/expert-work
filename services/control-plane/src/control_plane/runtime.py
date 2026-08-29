@@ -46,6 +46,7 @@ from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
 from expert_work.persistence import ArtifactStore, KnowledgeStore
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
@@ -159,14 +160,32 @@ class AgentBuilder(Protocol):
 
 logger = logging.getLogger(__name__)
 
-# Built-agent cache key. 3-tuple for the shared (no-OAuth) build; 4-tuple
-# ``(tenant, name, version, user_id)`` when the caller has connected OAuth
-# connectors (Stream MCP-OAUTH, OA-3b). ``k[0]`` is the tenant in both shapes,
-# so ``invalidate_tenant`` works uniformly. The cached value carries its
-# ``expires_at`` (二期 PR2 T4): the TTL only backstops invalidation write
-# paths that were never wired (e.g. a future credential entry point missing
-# the T2 fan-out) — explicit invalidation stays the primary freshness path.
-_CacheKey = tuple[UUID, str, str] | tuple[UUID, str, str, str]
+# Built-agent cache key ``(tenant, name, version, spec_sha256, user_id)``.
+# ``user_id`` is ``None`` for the shared build and carries the subject only
+# when the caller has connected OAuth connectors (Stream MCP-OAUTH, OA-3b), so
+# a no-OAuth agent stays shared across users. ``k[0]`` is always the tenant and
+# ``k[4]`` always the OAuth subject, so ``invalidate_tenant`` / ``invalidate_user``
+# match positionally.
+#
+# ``spec_sha256`` is the content-addressing element: the config page edits a
+# manifest IN PLACE, so ``(tenant, name, version)`` is identical before and
+# after the edit and identity alone cannot distinguish a stale build from a
+# current one. Hashing the spec we are about to build from makes "the edit
+# reaches the next run" a property of the key rather than of someone
+# remembering to call ``invalidate_tenant`` — which matters most on the peer
+# replicas that did not serve the write and only learn about it through the
+# Redis invalidation bus (bus down → they served the pre-edit build until the
+# TTL expired).
+#
+# Content-addressing covers the MANIFEST and nothing else. A build also folds in
+# state that lives outside the spec — the tenant / platform MCP pools, the
+# caller's OAuth pool, platform skills, the platform embedding / judge /
+# tool-budget config, resolved credentials — and none of that moves the hash. The
+# explicit invalidators and their bus broadcast stay load-bearing for those; what
+# the hash removes is the manifest edit's dependence on them.
+#
+# The cached value carries its ``expires_at`` (二期 PR2 T4).
+_CacheKey = tuple[UUID, str, str, str, str | None]
 
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
 # (``version`` may be ``"latest"``) to its base ``AgentSpec``, or ``None`` if the
@@ -355,17 +374,22 @@ class AgentRuntime:
     ) -> BuiltAgent:
         """Return the :class:`BuiltAgent` for a manifest, building on cache miss.
 
-        ``spec`` is only consulted on a miss. The cache key is the manifest
-        identity ``(tenant, name, version)``; it is extended with ``user_id``
-        ONLY when that user has ≥1 connected OAuth connector (Stream MCP-OAUTH,
-        OA-3b) — so the common no-OAuth agent stays shared across users and only
-        OAuth users get a per-user build.
+        The cache key is content-addressed: the manifest identity ``(tenant,
+        name, version)`` PLUS the hash of ``spec`` itself, so an in-place edit
+        misses the cache on its own merit (see ``_CacheKey``). ``user_id`` joins
+        the key ONLY when that user has ≥1 connected OAuth connector (Stream
+        MCP-OAUTH, OA-3b) — the common no-OAuth agent stays shared across users.
+
+        Callers always hold the spec they want built (it is a required
+        argument), so hashing it here needs nothing from the call sites and
+        cannot be forgotten at one of them.
         """
-        key: _CacheKey = (tenant_id, name, version)
+        oauth_subject: str | None = None
         if user_id is not None and self.user_oauth_pool_provider is not None:
             user_pool = await self.user_oauth_pool_provider(tenant_id, user_id)
             if user_pool.names():
-                key = (tenant_id, name, version, user_id)
+                oauth_subject = user_id
+        key: _CacheKey = (tenant_id, name, version, compute_spec_sha256(spec), oauth_subject)
         cached = self._cache.get(key)
         if cached is not None:
             built, expires_at = cached
@@ -440,9 +464,11 @@ class AgentRuntime:
         """Drop every cached built-agent for ``tenant_id``.
 
         Called when the tenant's MCP server registry changes so the next run
-        rebuilds the agent against the refreshed tenant MCP pool (Stream V-D).
-        The cache key is ``(tenant_id, name, version)``. Registered hooks
-        (e.g. the sub-agent builder cache) are fanned out too.
+        rebuilds the agent against the refreshed tenant MCP pool (Stream V-D) —
+        pool membership is NOT part of the spec, so content-addressing does not
+        cover it and this eviction stays load-bearing. The tenant is ``k[0]`` in
+        every key shape. Registered hooks (e.g. the sub-agent builder cache) are
+        fanned out too.
         """
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
@@ -455,13 +481,14 @@ class AgentRuntime:
 
         Called when the user's OAuth connections change (connect / disconnect)
         so the next run rebuilds against the refreshed per-user OAuth pool
-        (Stream MCP-OAUTH, OA-3b). Only 4-tuple (per-user) keys match; the
-        shared no-OAuth builds are left intact. Registered user hooks (the
-        sub-agent builder cache, 二期 PR2 T2) are fanned out too.
+        (Stream MCP-OAUTH, OA-3b) — like the tenant pool, OAuth membership is
+        not in the spec, so content-addressing does not cover it. Only per-user
+        keys match (``k[4]`` is ``None`` on the shared builds, which never
+        equals a real subject), so the shared no-OAuth builds are left intact.
+        Registered user hooks (the sub-agent builder cache, 二期 PR2 T2) are
+        fanned out too.
         """
-        for key in [
-            k for k in self._cache if k[0] == tenant_id and len(k) == 4 and k[3] == user_id
-        ]:
+        for key in [k for k in self._cache if k[0] == tenant_id and k[4] == user_id]:
             del self._cache[key]
         self._publish_cache_size()
         for hook in self._user_invalidation_hooks:
