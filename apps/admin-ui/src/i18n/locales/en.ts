@@ -1548,6 +1548,14 @@ export interface TranslationKeys {
     thread_id: string;
     status: string;
     trajectory_pairing_failed: string;
+    spec_version: string;
+    spec_version_revision: string;
+    spec_version_current: string;
+    spec_version_changed: string;
+    spec_version_changed_hint: string;
+    spec_version_unrecorded: string;
+    spec_version_unrecorded_hint: string;
+    spec_version_hint: string;
   };
   trace_toolbar: {
     open_in_langfuse: string;
@@ -4763,6 +4771,17 @@ const en: TranslationKeys = {
     status: "Status",
     trajectory_pairing_failed:
       "Couldn't pair this run's trajectory with the thread's messages — the two records don't line up.",
+    spec_version: "Config version",
+    spec_version_revision: "Revision {{n}}",
+    spec_version_current: "Live",
+    spec_version_changed: "Superseded",
+    spec_version_changed_hint:
+      "The agent's config was edited after this run. What you see on the config page now is not what this run executed.",
+    spec_version_unrecorded: "Not recorded",
+    spec_version_unrecorded_hint:
+      "Either this run predates config-version recording, or it ended before the agent was built (quota refusal, agent disabled, build failure).",
+    spec_version_hint:
+      "The agent's config is edited in place, so the version number alone cannot tell one edit from another — this is the content hash of the manifest this run actually executed.",
   },
   trace_toolbar: {
     open_in_langfuse: "Open in Langfuse",

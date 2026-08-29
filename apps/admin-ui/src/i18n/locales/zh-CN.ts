@@ -1626,6 +1626,16 @@ const zhCN: TranslationKeys = {
     thread_id: "对话线程 ID",
     status: "状态",
     trajectory_pairing_failed: "无法把这次运行与对话的消息记录配对——数据无法对应。",
+    spec_version: "配置版本",
+    spec_version_revision: "第 {{n}} 版",
+    spec_version_current: "当前生效",
+    spec_version_changed: "已被覆盖",
+    spec_version_changed_hint: "这次运行之后配置被改过。配置页上现在看到的,不是这次运行实际用的那一版。",
+    spec_version_unrecorded: "未记录",
+    spec_version_unrecorded_hint:
+      "要么这次运行早于配置版本记录上线,要么它在 Agent 构建成功之前就结束了(配额拒绝 / Agent 被停用 / 构建失败)。",
+    spec_version_hint:
+      "Agent 配置是原地编辑的,光看版本号分不出改动前后 —— 这是这次运行实际执行的那份配置的内容哈希。",
   },
   trace_toolbar: {
     open_in_langfuse: "在 Langfuse 中打开",

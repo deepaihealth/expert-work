@@ -2172,3 +2172,26 @@ async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
     assert row is not None
     assert row.is_resume is True
     assert row.agent_spec_sha256 == await _stored_spec_sha(runs_client, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_get_run_exposes_the_manifest_version(runs_client: AsyncClient) -> None:
+    """Run 详情把配置版本露出来 —— ``agent_version`` 回答不了这个问题
+    (原地编辑前后版本号一样),控制台只能靠这个哈希去 revisions 里反查。"""
+    thread_id, run_id = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
+    assert resp.status_code == 200
+    # 这个端点直接返回扁平对象,不套 {success, data, error}(与 trace_id 同处)。
+    assert resp.json()["agent_spec_sha256"] == await _stored_spec_sha(runs_client, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_thread_runs_expose_the_manifest_version(runs_client: AsyncClient) -> None:
+    """会话页的每轮列表也带上,好标出「第 N 轮之后配置变更过」。"""
+    thread_id, _ = await _seed_completed_run(runs_client)
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
+    assert resp.status_code == 200
+    runs = resp.json()["data"]["runs"]
+    assert runs
+    expected = await _stored_spec_sha(runs_client, thread_id)
+    assert all(r["agent_spec_sha256"] == expected for r in runs)

@@ -1456,6 +1456,14 @@ def build_runs_router() -> APIRouter:
                 "status": status,
                 "pending_approval": pending,
                 "trace_id": trace_id,
+                # 这一轮实际执行时用的 manifest 内容哈希。``agent_version``
+                # 回答不了「哪一版配置」—— 配置页是原地编辑,版本号编辑前后
+                # 一样。控制台拿它去 ``GET /v1/agents/{name}/{version}/revisions``
+                # 里按 ``spec_sha256`` 反查版本号。``null`` = 这一列上线前的
+                # 历史 run,或 run 在构建成功前就结束了。
+                "agent_spec_sha256": (
+                    persisted.agent_spec_sha256 if persisted is not None else None
+                ),
                 "tokens": tokens,
                 # Timestamps from the durable row (None when the run is only in
                 # the in-memory RunManager) — the detail summary derives duration.
@@ -1756,6 +1764,9 @@ def build_runs_router() -> APIRouter:
                     # client_disconnect / ...),ERROR 的放异常文本;前端按状态
                     # 分别翻译。老 run 两者都可能是 null。
                     "error": r.error,
+                    # 会话页据此标出「第 N 轮之后配置变更过」——同一个会话里
+                    # 相邻两轮的哈希不同,就是中间有人改了配置。
+                    "agent_spec_sha256": r.agent_spec_sha256,
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),
@@ -2137,6 +2148,12 @@ def _run_to_dict(
         "finished_at": info.finished_at.isoformat() if info.finished_at is not None else None,
         # Mini-ADR H-9.5 — OTel trace id persisted on agent_run.
         "trace_id": info.trace_id,
+        # 这一轮实际执行时用的 manifest 内容哈希。``agent_version`` 回答不了
+        # 「哪一版配置」—— 配置页是原地编辑,版本号编辑前后一样。前端拿它去
+        # ``GET /v1/agents/{name}/{version}/revisions`` 里按 ``spec_sha256``
+        # 反查版本号。``null`` = 这一列上线前的历史 run,或 run 在构建成功前
+        # 就结束了(配额拒绝 / Agent 被停用 / 构建失败)。
+        "agent_spec_sha256": info.agent_spec_sha256,
         "tokens": _tokens_to_dict(tokens),
     }
 
