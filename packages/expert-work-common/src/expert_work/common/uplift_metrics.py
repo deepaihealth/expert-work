@@ -287,6 +287,17 @@ _manifest_provider_rejected_total = expert_work_counter(
     label_names=("provider",),
 )
 
+_manifest_build_check_total = expert_work_counter(
+    "expert_work_uplift_manifest_build_check_total",
+    "Save-time dry-run builds of an agent manifest, by outcome. ``rejected`` "
+    "is a manifest that passed schema validation but cannot be assembled into "
+    "a runnable agent (missing platform credential, unresolvable skill / "
+    "template, memory declared with no embedder, sub-agent cycle) — before "
+    "this gate those saved fine and failed on every subsequent run instead. "
+    "``skipped`` means no agent runtime was wired to check against.",
+    label_names=("outcome",),
+)
+
 _legacy_credentials_fallback_total = expert_work_counter(
     "expert_work_uplift_legacy_credentials_fallback_total",
     "Stream O transition-period fallback: callers still reading the "
@@ -622,6 +633,13 @@ def record_manifest_provider_rejected(*, provider: str) -> None:
     _manifest_provider_rejected_total.labels(provider=provider).inc()
 
 
+def record_manifest_build_check(*, outcome: str) -> None:
+    """Bump ``expert_work_uplift_manifest_build_check_total{outcome}``.
+
+    ``outcome`` ∈ ``{"ok", "rejected", "skipped"}``."""
+    _manifest_build_check_total.labels(outcome=outcome).inc()
+
+
 def record_legacy_credentials_fallback(*, role: str) -> None:
     """Bump ``expert_work_uplift_legacy_credentials_fallback_total{role}``.
 
@@ -645,6 +663,7 @@ __all__ = [
     "record_credentials_resolve",
     "record_curator_transition",
     "record_legacy_credentials_fallback",
+    "record_manifest_build_check",
     "record_manifest_provider_rejected",
     "record_mcp_call",
     "record_mcp_circuit_state",
