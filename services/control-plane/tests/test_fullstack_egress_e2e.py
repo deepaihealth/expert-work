@@ -89,19 +89,45 @@ with urllib.request.urlopen(req, timeout=15) as resp:
 """
 
 
-def _docker(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run a ``docker`` CLI command — a test-harness helper."""
-    return subprocess.run(  # noqa: S603 — fixed argv, no shell, test harness only
-        ["docker", *args],  # noqa: S607 — ``docker`` is on PATH in CI and dev
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+#: 单条 ``docker`` 命令的墙钟上限。没有它,一次卡住的拉取会一直等到
+#: GitHub 把整个 job 砍掉(``timeout-minutes: 40``),日志里只留
+#: ``The operation was canceled``——不指向任何一条测试,也没有 stderr。
+#: 2026-08-28 一天烧掉三次 40 分钟就是这么来的(main push run 一次、PR 两
+#: 次),而 integration job 的 pytest 不像 unit job 带 ``--timeout``,
+#: 没有第二道闸。取值按「正常值的数倍」定:本模块整套在 CI 上跑完约 5
+#: 分钟,所以 build 给 600s 已经很宽,超了就是真卡住而不是慢。
+_DOCKER_TIMEOUT_S = 180.0
+#: 镜像构建档——要拉基础镜像 + 装依赖,比其余命令慢一个量级。
+_DOCKER_BUILD_TIMEOUT_S = 600.0
+#: ``compose up`` 档:内层已有 ``--wait-timeout 200``,这是它卡在
+#: 拉镜像(还没进入 wait)时的外层兜底。
+_DOCKER_UP_TIMEOUT_S = 420.0
 
 
-def _compose(*args: str) -> subprocess.CompletedProcess[str]:
+def _docker(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
+    """Run a ``docker`` CLI command — a test-harness helper.
+
+    ``timeout`` 超时不是让它静静挂着,而是 :func:`pytest.fail` 出一条点名到
+    子命令的失败,让 CI 日志直接说清「哪条 docker 命令卡了多久」。
+    """
+    try:
+        return subprocess.run(  # noqa: S603 — fixed argv, no shell, test harness only
+            ["docker", *args],  # noqa: S607 — ``docker`` is on PATH in CI and dev
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"`docker {' '.join(args)}` 超过 {timeout:.0f}s 未返回 —— "
+            "多半是镜像拉取被限流/卡死(Docker Hub 在共享 runner IP 上限流是老问题)。"
+        )
+
+
+def _compose(*args: str, timeout: float = _DOCKER_TIMEOUT_S) -> subprocess.CompletedProcess[str]:
     """Run a ``docker compose`` command against the infra compose file."""
-    return _docker("compose", "-f", str(_COMPOSE_FILE), *args)
+    return _docker("compose", "-f", str(_COMPOSE_FILE), *args, timeout=timeout)
 
 
 def _compose_down() -> None:
@@ -126,15 +152,29 @@ def _egress_stack() -> Iterator[None]:
     if probe.returncode != 0:
         pytest.skip("docker daemon unavailable")
 
-    built = _docker("build", "-t", _SANDBOX_IMAGE, str(_INFRA / "sandbox-image"))
+    built = _docker(
+        "build",
+        "-t",
+        _SANDBOX_IMAGE,
+        str(_INFRA / "sandbox-image"),
+        timeout=_DOCKER_BUILD_TIMEOUT_S,
+    )
     if built.returncode != 0:
         pytest.fail(f"sandbox image build failed:\n{built.stderr[-600:]}")
 
-    images = _compose("build", *_BUILD_SERVICES)
+    images = _compose("build", *_BUILD_SERVICES, timeout=_DOCKER_BUILD_TIMEOUT_S)
     if images.returncode != 0:
         pytest.fail(f"service image build failed:\n{images.stderr[-600:]}")
 
-    up = _compose("up", "-d", "--wait", "--wait-timeout", "200", *_STACK_SERVICES)
+    up = _compose(
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "200",
+        *_STACK_SERVICES,
+        timeout=_DOCKER_UP_TIMEOUT_S,
+    )
     if up.returncode != 0:
         logs = _compose("logs", "--tail", "60").stdout
         _compose_down()
