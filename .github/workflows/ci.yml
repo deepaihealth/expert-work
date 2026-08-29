@@ -155,7 +155,14 @@ jobs:
         run: uv sync --frozen
 
       - name: Run pytest (integration)
-        run: uv run pytest -v -m integration
+        # --timeout: second gate behind the per-command docker timeouts in
+        # test_fullstack_egress_e2e. A hung test names itself and fails fast
+        # instead of burning the full 40-min job budget for a bare "The
+        # operation was canceled" (2026-08-28: three such runs in one day).
+        # 1800s is deliberately loose — this suite's own baseline is 9-15 min
+        # end to end, and the slowest single test (the #60 egress stack, which
+        # builds four images) sits around 5 min on a warm runner.
+        run: uv run pytest -v -m integration --timeout=1800 --timeout-method=thread
 
   security:
     name: Security (pip-audit)
