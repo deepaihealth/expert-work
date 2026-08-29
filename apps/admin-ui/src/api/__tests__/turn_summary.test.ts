@@ -36,6 +36,33 @@ function aiMsg(text: string, opts: AiMsgOpts = {}): Record<string, unknown> {
   return msg;
 }
 
+function workerEnd(usage: Record<string, unknown> | null): SseEvent {
+  const data: Record<string, unknown> = {
+    outcome: "success",
+    iteration_used: 49,
+    llm_call_count: 49,
+    wall_clock_ms: 933_000,
+  };
+  if (usage !== null) data.usage = usage;
+  return {
+    id: "w",
+    event: "worker",
+    data: {
+      worker_id: "w-1",
+      parent_worker_id: null,
+      parent_tool_call_id: "call-1",
+      label: "spawn_worker",
+      agent_ref: "dynamic:general",
+      depth: 1,
+      kind: "end",
+      wseq: 9,
+      data,
+    },
+    rawData: "",
+    receivedAt: "2026-06-29T00:00:00Z",
+  };
+}
+
 describe("summarizeTurn", () => {
   it("sums usage across AI messages and splits cache/reasoning details", () => {
     const events = [
@@ -278,5 +305,97 @@ describe("summarizeTurn", () => {
       { text: "先给出正文,再决定要不要查资料", channel: "commentary" },
     ]);
     expect(s.finalText).toBeNull();
+  });
+});
+
+describe("summarizeTurn — worker token usage", () => {
+  it("counts a worker's tokens into the turn total", () => {
+    // 这个循环的第一行历来是 ``if (evt.event !== "updates") continue;``,
+    // worker 事件整个被跳过 —— 于是一轮的 token 只算主线。线上实例
+    // (run f562fa69):对话页显示 175,137,而同一 trace 下 worker 另有
+    // 69 次调用共 3,317,974,少报 19 倍。而同一行并排显示的「总耗时」
+    // 是含 worker 的,两个数字口径不一致。
+    const events: SseEvent[] = [
+      updates([
+        {
+          type: "ai",
+          content: "派个 worker",
+          usage_metadata: {
+            input_tokens: 170_000,
+            output_tokens: 5_137,
+            total_tokens: 175_137,
+            input_token_details: { cache_read: 1_000, cache_creation: 0 },
+            output_token_details: { reasoning: 500 },
+          },
+        },
+      ]),
+      workerEnd({
+        input_tokens: 3_200_000,
+        output_tokens: 117_974,
+        total_tokens: 3_317_974,
+        input_token_details: { cache_read: 900_000, cache_creation: 7 },
+        output_token_details: { reasoning: 20_000 },
+      }),
+    ];
+
+    const usage = summarizeTurn(events).usage;
+    expect(usage).not.toBeNull();
+    expect(usage?.inputTokens).toBe(3_370_000);
+    expect(usage?.outputTokens).toBe(123_111);
+    expect(usage?.totalTokens).toBe(3_493_111);
+    expect(usage?.cacheReadTokens).toBe(901_000);
+    expect(usage?.reasoningTokens).toBe(20_500);
+  });
+
+  it("ignores a worker end frame that reports no usage", () => {
+    // provider 可选字段:缺席 ≠ 0。少了这条,「没报」会被当成「免费」。
+    const events: SseEvent[] = [
+      updates([
+        {
+          type: "ai",
+          content: "hi",
+          usage_metadata: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+        },
+      ]),
+      workerEnd(null),
+    ];
+    const usage = summarizeTurn(events).usage;
+    expect(usage?.totalTokens).toBe(11);
+  });
+
+  it("counts each worker once across a whole delegation tree", () => {
+    // 每个 worker 只发一个 end 帧,所以累加所有 worker 帧 = 整棵树,不会
+    // 重复。与 duration 那次双计相反(同一段时间既进工具行又进 subagent
+    // 行)—— 那个教训在这里正好用来确认不要重蹈覆辙。
+    const one = { input_tokens: 100, output_tokens: 10, total_tokens: 110 };
+    const events: SseEvent[] = [workerEnd(one), workerEnd(one), workerEnd(one)];
+    expect(summarizeTurn(events).usage?.totalTokens).toBe(330);
+  });
+});
+
+describe("summarizeTurn — worker usage counts the end frame only", () => {
+  it("ignores usage on a non-end worker frame", () => {
+    // 只有 end 帧是这个 worker 的终局结算。若哪天 update 帧也开始带
+    // ``usage``(例如逐步累计),不认 ``kind`` 就会把同一份 token 计很多
+    // 遍 —— 这正是过程条耗时踩过的坑(同一段时间既进工具行又进 subagent
+    // 行,44m23s vs 真实 23m45s)。这条守着别在 token 上重蹈覆辙。
+    const running: SseEvent = {
+      id: "w0",
+      event: "worker",
+      data: {
+        worker_id: "w-1",
+        kind: "update",
+        wseq: 3,
+        data: {
+          node: "agent",
+          usage: { input_tokens: 999_999, output_tokens: 999, total_tokens: 1_000_998 },
+        },
+      },
+      rawData: "",
+      receivedAt: "2026-06-29T00:00:00Z",
+    };
+    const done = workerEnd({ input_tokens: 100, output_tokens: 10, total_tokens: 110 });
+
+    expect(summarizeTurn([running, done]).usage?.totalTokens).toBe(110);
   });
 });

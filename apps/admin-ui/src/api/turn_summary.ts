@@ -100,6 +100,32 @@ function usageFromMetadata(um: Record<string, unknown>): TurnUsage {
   };
 }
 
+/** A ``worker`` end frame's ``usage`` block, or ``null``.
+ *
+ *  Shaped like ``AIMessage.usage_metadata`` on purpose (backend
+ *  ``build_worker_end_frame``), so it goes through the same
+ *  {@link usageFromMetadata} as a main-line message. **Absent ≠ zero** —
+ *  ``usage_metadata`` is a provider-optional field, and填零 would read as
+ *  "this worker was free". */
+function workerEndUsageOf(data: unknown): Record<string, unknown> | null {
+  if (data === null || typeof data !== "object") return null;
+  const frame = data as Record<string, unknown>;
+  if (frame.kind !== "end") return null;
+  const inner = frame.data;
+  if (inner === null || typeof inner !== "object") return null;
+  const um = (inner as Record<string, unknown>).usage;
+  return um !== null && typeof um === "object" ? (um as Record<string, unknown>) : null;
+}
+
+function addUsage(target: TurnUsage, delta: TurnUsage): void {
+  target.inputTokens += delta.inputTokens;
+  target.outputTokens += delta.outputTokens;
+  target.totalTokens += delta.totalTokens;
+  target.cacheReadTokens += delta.cacheReadTokens;
+  target.cacheCreationTokens += delta.cacheCreationTokens;
+  target.reasoningTokens += delta.reasoningTokens;
+}
+
 /** Distill a turn's frames into answer + reasoning + usage. */
 export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
   const pending: Array<{ text: string; hasToolCalls: boolean }> = [];
@@ -119,6 +145,22 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
   };
 
   for (const evt of events) {
+    // 委派出去的那部分账:worker 的 LLM 调用不产生父的 ``updates`` 帧,
+    // 它的消耗只在自己的 ``worker`` end 帧上回传(后端 ``_child_run`` 从
+    // worker 消息求和)。不认这一支,一轮的 token 就只剩主线 —— 线上实例
+    // (run f562fa69)显示 175,137,实际 3,493,111,少报 19 倍;而并排显示
+    // 的「总耗时」是含 worker 的,两个数字口径不一致。
+    //
+    // 每个 worker 只发一个 end 帧,所以累加所有 end 帧 = 整棵委派树(孙
+    // worker 记在它自己的帧上),不会重复计。
+    if (evt.event === "worker") {
+      const um = workerEndUsageOf(evt.data);
+      if (um !== null) {
+        reported = true;
+        addUsage(usage, usageFromMetadata(um));
+      }
+      continue;
+    }
     if (evt.event !== "updates") continue;
     // ``step_count`` lives at the node level (alongside ``messages``), not on a
     // message — take the highest seen across the turn. Also collect a

@@ -210,6 +210,7 @@ async def run_child_to_result(
                     iteration_used=partial_steps,
                     llm_call_count=sum(1 for m in partial_msgs if isinstance(m, AIMessage)),
                     wall_clock_ms=int((time.monotonic() - start_monotonic) * 1000),
+                    usage=_usage_of(partial_msgs),
                 ),
             )
         raise
@@ -253,6 +254,7 @@ async def run_child_to_result(
                 iteration_used=step_count,
                 llm_call_count=llm_call_count,
                 wall_clock_ms=wall_clock_ms,
+                usage=_usage_of(messages),
             ),
         )
 
@@ -411,6 +413,49 @@ def _build_tool_result(
         meta=meta,
         state_updates={"subagent_invocations": [invocation]},
     )
+
+
+def _usage_of(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
+    """Sum a worker 一轮的 token,形状与 ``AIMessage.usage_metadata`` 同构。
+
+    父侧本来看不到这笔账:worker 的 LLM 调用不产生父的 ``updates`` 帧,而
+    前端 ``turn_summary.ts`` 只认 ``updates``。线上实例(run f562fa69)对话
+    页显示 175,137 tok,同一 trace 下 worker 另有 69 次调用共 3,317,974 ——
+    少报 19 倍。(计费不受影响:``token_usage`` 按 ``{parent}-worker``
+    记全了;缺的只是回传给父侧的这条线。)
+
+    一条都没报 → ``None``(键缺席),不是零:``usage_metadata`` 是提供商
+    可选字段,填零会让消费者把「未知」当成「免费」。孙 worker 的账不在这里
+    ——它记在它自己的 end 帧上,消费者累加所有 worker 帧即得整棵树,且因为
+    每个 worker 只发一个 end 帧,不会重复(与 duration 的双计教训相反:
+    那次是同一段时间既进工具行又进 subagent 行)。
+    """
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    cache_read = cache_creation = reasoning = 0
+    seen = False
+    for msg in messages:
+        um = getattr(msg, "usage_metadata", None)
+        if not isinstance(um, Mapping):
+            continue
+        seen = True
+        for key in totals:
+            value = um.get(key)
+            if isinstance(value, int):
+                totals[key] += value
+        itd = um.get("input_token_details")
+        if isinstance(itd, Mapping):
+            cache_read += int(itd.get("cache_read") or 0)
+            cache_creation += int(itd.get("cache_creation") or 0)
+        otd = um.get("output_token_details")
+        if isinstance(otd, Mapping):
+            reasoning += int(otd.get("reasoning") or 0)
+    if not seen:
+        return None
+    return {
+        **totals,
+        "input_token_details": {"cache_read": cache_read, "cache_creation": cache_creation},
+        "output_token_details": {"reasoning": reasoning},
+    }
 
 
 async def _fetch_partial(

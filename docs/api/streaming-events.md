@@ -99,7 +99,35 @@ Per-kind `data`:
   summaries: `{type: "ai", content_excerpt, tool_calls?: [{name,
   args_excerpt}]}` or `{type: "tool", name, tool_result_excerpt, …}`. All
   excerpts are truncated; they are a progress view, not the full transcript.
-- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`.
+- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`, and
+  `usage` (optional, see below).
+
+### A worker's token usage
+
+The `end` frame carries a `usage` block with the tokens that worker spent:
+
+```json
+{
+  "input_tokens": 3200000,
+  "output_tokens": 117974,
+  "total_tokens": 3317974,
+  "input_token_details": {"cache_read": 900000, "cache_creation": 7},
+  "output_token_details": {"reasoning": 20000}
+}
+```
+
+Three things to know when you add up a run's tokens:
+
+- **A worker's tokens appear nowhere else.** A worker's model calls do not
+  produce `updates` frames on the parent stream, so a total built only from
+  `updates` counts the main line and nothing else. Add every worker `end`
+  frame's `usage` to get the run's real total.
+- **Count the `end` frame only.** Each worker emits exactly one, so summing
+  across all of them covers the whole delegation tree — a nested worker
+  reports on its own `end` frame — with nothing counted twice.
+- **`usage` may be absent, and absent is not zero.** Token counts are
+  optional for some providers and some cache paths. A missing block means
+  "not reported", so treat it as unknown rather than free.
   `outcome` is one of `"success"`, `"max_steps"` (partial result, not a
   failure), `"cancelled"`, or `"approval_blocked"` (the worker hit a tool
   that requires human approval, which is unavailable inside a worker — the

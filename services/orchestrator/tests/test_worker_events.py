@@ -294,3 +294,99 @@ def test_frames_are_json_safe() -> None:
         ),
     ):
         json.dumps(frame)  # 不抛 = JSON-safe
+
+
+def test_end_frame_carries_worker_token_usage() -> None:
+    """end 帧必须带 worker 这一轮烧掉的 token。
+
+    没有它,父侧的每个消费者都只能看到主线的消耗:``turn_summary.ts`` 的
+    第一行就是 ``if (evt.event !== "updates") continue;``,worker 事件整个
+    跳过。线上实例(run f562fa69):对话页显示 175,137 tok,而
+    ``token_usage`` 里同一 trace 下 ``sop2-designer-worker`` 另有 69 次调用
+    共 3,317,974 —— 界面少报 19 倍。
+
+    形状与 langchain 的 ``AIMessage.usage_metadata`` 同构,前端因此能直接
+    复用现成的 ``usageFromMetadata`` 解析,不必为 worker 另写一套。
+    """
+    frame = build_worker_end_frame(
+        _IDENT,
+        wseq=9,
+        outcome="success",
+        iteration_used=49,
+        llm_call_count=49,
+        wall_clock_ms=933_000,
+        usage={
+            "input_tokens": 3_200_000,
+            "output_tokens": 117_974,
+            "total_tokens": 3_317_974,
+            "input_token_details": {"cache_read": 1_000, "cache_creation": 2_000},
+            "output_token_details": {"reasoning": 4_000},
+        },
+    )
+    assert frame["kind"] == "end"
+    usage = frame["data"]["usage"]
+    assert usage["input_tokens"] == 3_200_000
+    assert usage["output_tokens"] == 117_974
+    assert usage["total_tokens"] == 3_317_974
+    assert usage["input_token_details"]["cache_read"] == 1_000
+    assert usage["output_token_details"]["reasoning"] == 4_000
+    # 既有四字段不能被挤掉。
+    assert frame["data"]["iteration_used"] == 49
+    assert frame["data"]["wall_clock_ms"] == 933_000
+
+
+def test_end_frame_usage_absent_stays_absent() -> None:
+    """拿不到 usage 时不得编一个 0 —— 「没报」和「真的是 0」必须分得开。
+
+    ``usage_metadata`` 是提供商可选字段(部分 provider / 缓存命中路径不报)。
+    塞一个零值会让消费者把「未知」当成「免费」。
+    """
+    frame = build_worker_end_frame(
+        _IDENT, wseq=1, outcome="success", iteration_used=2, llm_call_count=2, wall_clock_ms=10
+    )
+    assert "usage" not in frame["data"]
+
+
+def test_usage_of_sums_ai_messages_and_reports_none_when_unreported() -> None:
+    """``_usage_of`` 是 end 帧 usage 的来源——从 worker 自己的消息里求和。
+
+    provider 只在部分消息上报 ``usage_metadata`` 是常态(缓存命中、流式尾
+    帧),求和必须跳过没报的那些而不是崩掉;一条都没报要回 ``None``,让
+    「未知」和「真的是 0」分得开。
+    """
+    from orchestrator.tools._child_run import _usage_of
+
+    msgs = [
+        AIMessage(
+            content="a",
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110,
+                "input_token_details": {"cache_read": 40, "cache_creation": 5},
+                "output_token_details": {"reasoning": 3},
+            },
+        ),
+        ToolMessage(content="t", tool_call_id="tc-1"),
+        AIMessage(content="b"),  # provider 没报 usage 的那种
+        AIMessage(
+            content="c",
+            usage_metadata={
+                "input_tokens": 200,
+                "output_tokens": 20,
+                "total_tokens": 220,
+                "input_token_details": {"cache_read": 60, "cache_creation": 0},
+                "output_token_details": {"reasoning": 7},
+            },
+        ),
+    ]
+    usage = _usage_of(msgs)
+    assert usage is not None
+    assert usage["input_tokens"] == 300
+    assert usage["output_tokens"] == 30
+    assert usage["total_tokens"] == 330
+    assert usage["input_token_details"] == {"cache_read": 100, "cache_creation": 5}
+    assert usage["output_token_details"] == {"reasoning": 10}
+
+    assert _usage_of([AIMessage(content="x"), SystemMessage(content="s")]) is None
+    assert _usage_of([]) is None
