@@ -353,6 +353,8 @@ const zhCN: TranslationKeys = {
   },
   conversations_page: {
     page_title: "对话",
+    config_changed:
+      "这个会话进行期间,Agent 配置被改过(在第 {{turns}} 轮之后)。后面几轮跑的不是前面那套配置 —— 归咎于模型之前,先看看这个。",
     subtitle: "跨智能体的用户对话，按线程分组。",
     untitled: "未命名对话",
     column_conversation: "对话",

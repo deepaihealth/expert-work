@@ -38,6 +38,7 @@ import { downloadArtifact } from "../api/artifacts";
 import { ApiError, errMessage } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { cancelRun, streamRunEvents } from "../api/runs";
+import { configChangePoints } from "./conversation_detail/configChanges";
 import { reducePlan } from "../api/plan_reducer";
 import { computeSessionStats } from "../api/session_stats";
 import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/sessions";
@@ -296,6 +297,13 @@ export function ConversationDetail() {
   const stats = useMemo(
     () => computeSessionStats(consoleTurns.map(statsInputOf), null),
     [consoleTurns],
+  );
+  // 配置改动立刻对新一轮生效(含正在进行的会话),所以同一个会话可能前后跑在
+  // 两套配置上。事后看「第 5 轮起答复不对」时,这条是唯一能把「模型的问题」
+  // 和「有人改了提示词」分开的线索 —— 而在此之前没有任何东西提示你去看。
+  const configChanges = useMemo(
+    () => configChangePoints(convoRuns ?? []),
+    [convoRuns],
   );
   // BUG-13(修订)— 计划按轮呈现,不再有会话级的单张卡。
   // ``plan`` 是 thread 级的累积状态,一张卡只能显示最后一态:把它吊在
@@ -641,6 +649,18 @@ export function ConversationDetail() {
                 <div style={{ marginBottom: 8 }} data-testid="console-stats-row">
                   <StatsBar stats={stats} isSystemAdmin={isSystemAdmin} />
                 </div>
+              )}
+              {configChanges.length > 0 && (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 8 }}
+                  data-testid="config-change-notice"
+                  message={t("conversations_page.config_changed", {
+                    count: configChanges.length,
+                    turns: configChanges.join("、"),
+                  })}
+                />
               )}
               <Segmented
                 value={view}
