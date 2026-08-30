@@ -760,7 +760,6 @@ def _reject_stale_write(
     *,
     if_match: str | None,
     current_sha: str,
-    resource: str,
 ) -> JSONResponse | None:
     """Optimistic concurrency for an in-place manifest edit.
 
@@ -779,6 +778,13 @@ def _reject_stale_write(
     lost a race" in this API (duplicate manifest, resume idempotency) is a 409,
     and one consistent vocabulary is worth more here than the finer status
     code. 428 for the missing header is the RFC 6585 case exactly.
+
+    Nothing is logged here on purpose: the caller emits a ``MANIFEST_WRITE``
+    audit record for both refusals, carrying the same resource plus the actor,
+    tenant and trace id. A second copy in the application log would only add a
+    path-derived agent name to a logging sink — ``AgentMetadata.name`` has no
+    character constraint, so that is a log-injection sink (CodeQL
+    ``py/log-injection``) for no information the audit trail lacks.
 
     Returns the ready-to-send error, or ``None`` when the write may proceed.
     """
@@ -799,7 +805,6 @@ def _reject_stale_write(
     candidate = candidate.strip('"')
     if candidate != current_sha:
         record_manifest_stale_write(outcome="conflict")
-        logger.info("manifest.stale_write resource=%s", resource)
         return _envelope_error(
             "MANIFEST_STALE_WRITE",
             "this manifest changed since you loaded it — reload and reapply "
@@ -1864,7 +1869,6 @@ def build_agents_router() -> APIRouter:
         stale = _reject_stale_write(
             if_match=if_match,
             current_sha=existing.spec_sha256,
-            resource=f"{name}/{version}",
         )
         if stale is not None:
             await emit(
