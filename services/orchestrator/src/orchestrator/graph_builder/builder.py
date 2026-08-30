@@ -176,6 +176,7 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
+    TURN_ATTACHMENTS_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
@@ -3020,6 +3021,14 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
     # 产物清单契约 —— per-run 产物记录器(镜像同一读取惯例)。
     rec_raw = configurable.get(ARTIFACT_RECORDER_KEY)
     artifact_recorder = rec_raw if callable(rec_raw) else None
+    # 本轮用户附件的工作区路径 —— 委派时结构性地进子代的种子消息。只收字符串,
+    # 别的类型丢弃:这个值一路从 HTTP 载荷传下来,不是进程内对象。
+    att_raw = configurable.get(TURN_ATTACHMENTS_KEY)
+    turn_attachments = (
+        tuple(x for x in att_raw if isinstance(x, str) and x)
+        if isinstance(att_raw, list | tuple)
+        else ()
+    )
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3036,6 +3045,7 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
         token_budget=tb_raw if isinstance(tb_raw, TokenBudget) else None,
         guard_sink=guard_raw if callable(guard_raw) else None,
         artifact_recorder=artifact_recorder,
+        turn_attachments=turn_attachments,
     )
 
 

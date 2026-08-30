@@ -170,6 +170,15 @@ class ToolCatalogEntry:
     deferred: bool
 
 
+#: ``config["configurable"]`` key carrying this turn's attachment workspace
+#: paths (a ``list[str]``) into the graph, where ``_tool_context`` reads it
+#: onto :attr:`ToolContext.turn_attachments`. Set by the run-spawn entry
+#: points that actually carry a new user turn (the streaming and queued run
+#: paths); absent on the resume / orphan-revival / trigger paths, which have
+#: no new turn of their own.
+TURN_ATTACHMENTS_KEY = "turn_attachments"
+
+
 @dataclass(frozen=True)
 class ToolContext:
     """Per-invocation context threaded from the ReAct ``tools`` node.
@@ -250,6 +259,21 @@ class ToolContext:
     #: ``ARTIFACT_RECORDER_KEY``;``None`` when unwired (tests / eval) —
     #: 登记照常发生,只是本 run 无清单记录。
     artifact_recorder: Callable[[dict[str, Any]], None] | None = None
+    #: 本轮用户附件的工作区路径(``uploads/<name>``),按上传顺序。
+    #:
+    #: 委派出去的子代**不继承本对话**——它只看得见 ``task`` 字符串,所以
+    #: ``[file attached: …]`` 那一行它从来看不到。把本轮附件从这里结构性地
+    #: 带进子代的种子消息(见 ``_child_run.seed_message_text``),而不是指望
+    #: 主 Agent 记得把路径抄进 ``task``:真栈上出现过主 Agent 漏抄、worker 只
+    #: 能按文件名在工作区里猜、结果挑中上一轮的历史文档做了一整轮无效分析。
+    #:
+    #: 只装文档,不装图片:文档在工作区里有稳定路径、子代可直接 ``read_document``;
+    #: 图片对 vision 模型是内联 content block(没有子代能用的 ref),两者不是
+    #: 同一回事,一起塞只会给子代一条它用不上的路径。
+    #:
+    #: 空元组 = 本轮没有附件,或走的是不带新一轮输入的路径(审批续跑 / orphan
+    #: 复活 / 触发器)——那些路径本来就没有"本轮用户附件"。
+    turn_attachments: tuple[str, ...] = ()
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

@@ -362,3 +362,66 @@ def test_spec_description_asks_worker_to_offload_bulk_output() -> None:
     from copying large outputs through conversation history")。"""
     desc = _tool(_RecordingWorkerBuilder()).spec.description.lower()
     assert "write the result to a file" in desc
+
+
+# --- 本轮附件结构性下传 ---------------------------------------------------------
+#
+# 真栈实证(thread 4f236215,2026-08-29):主 Agent 派 worker 时任务文本只写了
+# 「2. 分析资料内容:识别其中的流程步骤…」,一个字没提是哪份文件。worker 不继承
+# 对话,看不到 ``[file attached: …]``,只能在共享工作区里按名字挑 —— 挑中了上一轮
+# 的历史文档,做完一整轮才被主 Agent 发现方向错了,重派一次多花约 8 分钟。
+#
+# 委派契约要求主 Agent 把标识符写进 task,但那是**指令不是保证**。这几条钉的是
+# 「即便主 Agent 忘了写,子代照样知道本轮附件是哪份」。
+
+
+@pytest.mark.asyncio
+async def test_worker_seed_carries_this_turns_attachments() -> None:
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+    ctx = _ctx(turn_attachments=("uploads/糖尿病逆转_SOP.docx",))
+
+    await _tool(builder).call({"task": "分析资料内容"}, ctx=ctx)
+
+    seed = graph.calls[0][0]["messages"][1].content
+    assert "uploads/糖尿病逆转_SOP.docx" in seed
+    # 主 Agent 的原话仍在,且排在附件块之前 —— 附件是补充上下文,不是替换指令。
+    assert seed.index("分析资料内容") < seed.index("uploads/糖尿病逆转_SOP.docx")
+
+
+@pytest.mark.asyncio
+async def test_worker_seed_unchanged_when_the_turn_has_no_attachment() -> None:
+    """没有附件时 seed 必须与 task 逐字节相同 —— 不给子代凭空多一段噪声。"""
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+
+    await _tool(builder).call({"task": "分析资料内容"}, ctx=_ctx())
+
+    assert graph.calls[0][0]["messages"][1].content == "分析资料内容"
+
+
+@pytest.mark.asyncio
+async def test_worker_seed_lists_every_attachment_of_the_turn() -> None:
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+    ctx = _ctx(turn_attachments=("uploads/a.docx", "uploads/b.pptx"))
+
+    await _tool(builder).call({"task": "对比这两份材料"}, ctx=ctx)
+
+    seed = graph.calls[0][0]["messages"][1].content
+    assert "uploads/a.docx" in seed
+    assert "uploads/b.pptx" in seed
+
+
+@pytest.mark.asyncio
+async def test_attachments_reach_a_grandchild_worker() -> None:
+    """worker 再派孙 worker 时,孙代同样不继承对话。断在深一层等于退回原来的猜,
+    所以 ``_child_config`` 必须继续下传。"""
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+    ctx = _ctx(turn_attachments=("uploads/糖尿病逆转_SOP.docx",))
+
+    await _tool(builder).call({"task": "分析"}, ctx=ctx)
+
+    child_config = graph.calls[0][1]
+    assert child_config["configurable"]["turn_attachments"] == ["uploads/糖尿病逆转_SOP.docx"]

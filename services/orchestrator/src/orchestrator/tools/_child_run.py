@@ -50,7 +50,7 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
-from orchestrator.tools.registry import ToolContext, ToolResult
+from orchestrator.tools.registry import TURN_ATTACHMENTS_KEY, ToolContext, ToolResult
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -78,6 +78,40 @@ _worker_approval_blocked = expert_work_counter(
     "expert_work_worker_approval_blocked_total",
     "Child runs halted at an approval gate and soft-refused to the parent.",
 )
+
+_children_seeded_with_attachments = expert_work_counter(
+    "expert_work_child_seeded_with_attachments_total",
+    "Delegated child runs whose seed message carried this turn's attachments.",
+)
+
+
+def seed_message_text(task: str, attachments: Sequence[str]) -> str:
+    """The child's seed ``HumanMessage`` — ``task`` plus this turn's attachments.
+
+    A child sees *only* this string: no conversation history, so not the
+    ``[file attached: …]`` line the platform put on the user's message. The
+    delegation contract tells the parent to spell out identifiers in ``task``,
+    but that is an instruction, not a guarantee — when the parent forgets, the
+    child is left picking a file out of a shared workspace that also holds
+    everything the user uploaded in earlier turns. Appending the paths here
+    makes "the child knows what this turn is about" structural.
+
+    Appended *after* ``task`` and stated as context, not as an override: when
+    the parent did name a file, its instruction still reads first and stays
+    authoritative. The last line only covers the case where the task named
+    nothing at all.
+    """
+    if not attachments:
+        return task
+    listed = "\n".join(f"- {ref}" for ref in attachments)
+    return (
+        f"{task}\n\n"
+        "[attachments] The user attached these files to the current turn — "
+        "workspace paths, readable as-is:\n"
+        f"{listed}\n"
+        "If the task above does not say which file to work on, these are it. "
+        "Do not substitute a different workspace file because its name looks similar."
+    )
 
 
 async def run_child_to_result(
@@ -108,10 +142,13 @@ async def run_child_to_result(
     sub_thread_id = uuid4()
     sub_run_id = uuid4()
     child_config = _child_config(ctx, sub_thread_id=sub_thread_id, sub_run_id=sub_run_id)
+    seed = seed_message_text(task, ctx.turn_attachments)
+    if seed is not task:
+        _children_seeded_with_attachments.inc()
     child_input: dict[str, Any] = {
         "messages": [
             SystemMessage(content=child.system_prompt),
-            HumanMessage(content=task),
+            HumanMessage(content=seed),
         ],
         "step_count": 0,
         "max_steps": child.max_steps,
@@ -588,4 +625,8 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # the 30s acquire timeout exists to resolve without deadlocking.
     if ctx.delegation_gate is not None:
         configurable[DELEGATION_GATE_KEY] = ctx.delegation_gate
+    # 本轮附件继续往下传:一个 worker 再派孙 worker 时,孙代同样看不到本对话,
+    # 而它干的还是同一轮用户交办的活 —— 断在这里等于深一层就退回原来的猜。
+    if ctx.turn_attachments:
+        configurable[TURN_ATTACHMENTS_KEY] = list(ctx.turn_attachments)
     return {"configurable": configurable}
