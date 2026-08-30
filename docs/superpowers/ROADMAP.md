@@ -6,7 +6,17 @@
 > 各 program 的完整执行历史仍在各自的(本机)`.superpowers/sdd/<plan>/progress.md`;入仓的设计与计划在
 > `docs/superpowers/specs/` 与 `docs/superpowers/plans/`。
 
-## 状态(2026-08-20)
+## 状态(2026-08-30)
+
+> 近三日新增(08-28 晚 → 08-30),按 program 归拢;逐 PR 明细见「生产发布前置」节末的进度条目。
+>
+> - **B-36 弹性 worker 预算 ✅(#1368)/ B-37 子 Agent 上下文继承 ✅(#1369)** —— 两条都已合并 + 发测试 + 真栈实证,下文表格已销案。
+> - **可观测性四修(08-29)**:#1370 过程条把子智能体耗时计了两遍、#1373+#1382 三个执行入口的 token 记账 trace 绑定、#1374 子智能体 token 计入本轮总数、#1367 产物行漏 worker 产物。
+> - **「保存 Agent 配置 ≠ 立即上线」program ✅ 全交付(08-29~08-30,五 PR)**:#1387 保存前 dry-run 构建 / #1388 编辑必须带 If-Match / #1389 存草稿 + 显式发布(迁移 `0150_agent_spec_draft`)/ #1391 调试台用草稿试跑 / #1390 对话页标出会话期间配置被改过。地基是 #1385(缓存改内容寻址)+ #1386(run 记下实际执行的配置版本)。
+> - **「委派时子代看得见本轮附件」✅ 全交付(08-30,两 PR)**:#1392 文档 + 图片进子代种子消息(图片按**子代自己**的能力三分)、#1393 改走 `AgentState` 通道所以审批续跑 / orphan 复活不再丢。
+> - **跨团队定位:上传中文文件名乱码** —— 根因在对接方(busboy 解 multipart 头部走 latin1,multer 不设 `defParamCharset`),我方在生产 pod 里三情形对照实测排除;对方已修待发。**我方验收待做**,记 B-40。
+>
+> **未完成的只有真栈复验**:上面两个 program 的行为都只能在发测试环境后验(见 B-39)。
 
 - **阶段 0/1/2/3 全部交付并上线**(见下文各节的 ✅ 标记)。
 - **收官后的文档反馈波全部交付并上线**:
@@ -22,14 +32,15 @@
   **PR-B #1221(对话记录页 + Run 详情页切 console 组件,退役 TurnCard 集群 −9.6k 行)**。
   测试环境 `afe00ebb`,两页真栈验收 15/15,记录 PR #1222 已合并(`72a5421b`)。
   设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
-- **仍然有效的剩余项** = 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 与 X-3~X-10、
-  「小 backlog」B-1~B-7 与 B-9~B-19(B-19 值得先做:直接影响对外 429 行为)、
-  ~~「调试台 follow-up」D-1~D-4~~(✅ 2026-08-20 全清);D-5/D-6(对话页 live 视图+操作面)2026-08-21 立项。X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
-  **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点)。
+- **仍然有效的剩余项**(2026-08-30 复核)= 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 / X-3~X-15、
+  「小 backlog」B-1~B-7、B-9~B-18、B-21、B-23、B-24、B-27~B-33、**B-38~B-41(本次新增)**、
+  「调试台 follow-up」D-7。已销案的:D-1~D-6、B-8、B-19、B-20 主体、B-22、B-25、B-26、B-34、**B-35 / B-36 / B-37**、X-2、X-16。
+  X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
+  **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点;本文件已两次因未核实而误报进度)。
 
 ---
 
-## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-08-30 周六**(2026-08-24 由 08-26 周三改期);三道拍板 2026-08-24 已收:单副本首发(**2026-08-26 推翻改多副本首发,阻塞项七 PR #1312-#1318 已全清**)/ 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
+## 🚀 生产发布前置(2026-08-23 立项;**发布日:原定 2026-08-30 周六,2026-08-29 延期,新日期待用户定**(时间线:08-26 周三 → 08-24 改 08-30 周六 → 08-29 延期);三道拍板 2026-08-24 已收:单副本首发(**2026-08-26 推翻改多副本首发,阻塞项七 PR #1312-#1318 已全清**)/ 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
 
 > 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
 > **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
@@ -73,6 +84,15 @@ X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路
 **进度(2026-08-27 第三批:发布后第一波提前清账 + UI 反馈 + 技能批量 + 委派增强)**:B-19/B-25/B-26 三小修并行 worktree 全合(#1337 围栏 unspotlight / #1338 配额维度路由+黏性 Retry-After / #1339 防御参数单源对齐,CodeQL 循环导入两轮修最终 BuiltAgent 挪中立模块根治);测试环境发 `39b98b6d`(记录 #1341,smoke+金丝雀 24s PASS)。当日用户反馈六连:#1340 MCP 工具弹窗放宽+只看已选、#1342 所有者列显成员名+401 跳登录+入参按配置序可复制+变量区多列内滚、#1343 调试台重设计(左对话右设置侧栏/系统提示词卡+只读抽屉/必填前置+选填折叠/说明挪 tooltip/变量草稿/输入框 placeholder 改「输入消息」——蓝色巨块真相=操作人被旧文案误导粘贴了 prompt)。#1344 平台技能批量导出/导入(生产开荒搬运,category 走 sidecar 防丢,runbook §1.8 配套落账)。**动态子智能体委派增强层 0-3 全交付**(#1345 工具描述形状判据+规模分档注入 / #1346 配置页生成委派策略(辅助 LLM 读 manifest,人审入 prompt)/ #1347 计划≥2 未完成条目时注入委派提醒,去重 hash 刻意不含 status;层 4 per-agent plan_first 执行模式备选,等委派率数据)。sop2-designer 对接双侧收官(key=A 方案租户级通用;对方交付帧统一 harvest/x-harvest)。CI integration 当日四次 Docker Hub 限流 40 分钟假红(egress e2e 在测试内 build 镜像),镜像离库结构修提档进发布后第一波。
 
 **进度(2026-08-27 第二批:E3b 全量接线 + 金丝雀)**:三路侦察(E3a 总线现状/剩余缓存面/金丝雀插入点)后两波四 PR 全合 —— #1331 总线 7→20 kind + 平台配置面接线(顺带修 judge/tool-budget 单 pod 失效 bug)、#1329 技能面接线(原零失效)、#1330 X-14 P1 金丝雀、#1332 限流 override 收官。多副本「改配置立刻生效」目标达成(除 credential-proxy→B-31)。测试环境发 `3fc9350e`(单镜像,记录 #1333),smoke PASS;**金丝雀在测试环境完成 seed(租户乐毅大公司,glm/glm-5.3)+ 真栈首跑 PASS(35s 五项全绿)**,周六 prod 只需照 §1.6.7 再 seed 一次。**跨副本真栈验收同日全过**:T1 双副本 attach(非属主收 end=success)+ T2 非属主取消全链(CAS/interrupted 帧/不复活/心跳停走);探针三轮迭代全是探针侧问题(console cancel 拒 API key→改对外 :cancel、claimed_by 带 worker 后缀要前缀匹配、/events 必带 user_id、GLM 账户限速 429 一次环境噪音),零产品缺陷。剩余验收=PPT 内容质量人工抽查(用户侧)。
+
+**进度(2026-08-28 晚 ~ 08-29:委派收尾 + 可观测性四修 + 依赖批)**:B-35 plan_first 五 PR(#1356-#1360)+ 收尾 #1365、**B-36 弹性 worker 预算 #1368**、**B-37 子 Agent 上下文继承 #1369** 全合,发测试 `a8e4382a`(记录 #1371)。可观测性四修 —— #1370 过程条把子智能体耗时**计了两遍**(父工具行与展开的 subagent 行各带同一份墙钟,相加后「思考 44m23s > 总耗时 23m45s」;441 条测试全绿,规格自己漏了这层;**token / 成本 / 产物计数是否同构双计未查** → B-41)、#1373+#1382 三个执行入口(queue worker / orphan sweep / trigger)的 token 记账 trace 绑定收进 `run_trace.bind_exec_trace`、#1374 子智能体 token 计入本轮总数 + #1375 对外文档同步、#1367 对话页产物行漏 worker 注册的产物、#1366 worker 帧消费指南、#1383 `enqueued_input` 注释与实际行为对不上。CI 侧 #1372 让 integration 卡住时说清卡在哪(此前烧满 40 分钟不报位置)。五批 dependabot(#1377-#1381,含 langchain-core 1.5.6→1.6.0)+ 发测试 `4d035bef`(记录 #1384),smoke + 金丝雀两轮全绿。
+
+**进度(2026-08-29 ~ 08-30:保存 ≠ 上线 + 附件进子代)**:起点是「改完 Agent 配置点保存是否立即生效、有没有风险」的核实,盘出 7 条风险,用户拍板除「平台模板改动波及全租户」外全处理,并定下两个方向 —— **会话语义 = 跟随新配置 + 变更标记**、**保存形态 = 存草稿 + 显式发布**。
+
+- 地基:#1385 built-agent 缓存改**内容寻址**(`spec_sha256` 进 key,「改完下一次 run 就生效」从依赖失效广播变成结构性保证;只覆盖 manifest,MCP 池 / OAuth 池 / 平台技能仍需显式失效)、#1386 run 记下**实际执行时用的配置版本**(配置页是原地编辑,`agent_version` 区分不出编辑前后,只有 `spec_sha256` 能)。
+- 交付:#1387 保存前 dry-run 构建一次(关键设计=把 `AgentFactoryError` 拆出 `PlatformNotConfiguredError`:「你的 manifest 写错了」422 拒,「这套部署没配好」存下来加 warning —— 一刀切拒绝会打挂 17 个既有测试)/ #1388 编辑必须带 `If-Match`(必需不是可选:console-only 且只有控制台一个调用方)/ #1389 存草稿 · 发布 · 丢弃(四列挂 `agent_spec` 同一行,迁移 `0150_agent_spec_draft`)/ #1391 调试台用未发布草稿试跑一轮 / #1390 对话页标出会话期间配置被改过。
+- **委派时子代看得见本轮附件**(起因见下条乱码定位):#1392 文档 + 图片进子代种子消息,注入点选共享的 `_child_run.run_child_to_result` 一处覆盖静态子 Agent 与动态 worker;**图片按子代自己的 `supports_vision` / `tool_catalog` 三分**(原生多模态 → `image_ref` content block;有 `ask_image` → 文本列 URI;都不是 → 不提),顺带堵上「worker 模型被 `dynamic_workers.model` 换成多模态后反而一张图看不了且不报错」的洞。#1393 改走 `AgentState` 通道 —— **审批续跑 / orphan 复活都是 `graph_input=None` 从检查点恢复,附件进 state 就由检查点替我们保住,不用加列不用迁移**;接线从三处收到一处(`build_run_graph_input`)。
+- **跨团队定位:上传中文文件名乱码**。现象是我方库里 29 条上传里 15 条乱码、正常中文 0 条 —— 这个统计**不能**排除自己。在生产 pod 里(starlette 1.3.1 / python-multipart 0.0.32)跑三情形对照才定的性:规范 UTF-8 ✅ / 发送方把 UTF-8 字节塞进 latin-1 头 ✅(我方仍能救回)/ **发送方手里的串本来就是坏的再按 UTF-8 发 ❌**,只有第三种能复现。对方确认根因在 `busboy` 解 multipart **头部参数**一律走 latin1 而 `multer` 不设 `defParamCharset`,已在出口加带无损校验的转码,**待其发版后我方验收(B-40)**。该 bug 不只影响可读性:真栈 thread `4f236215` 里 worker 因所有中文名前缀雷同而误选历史文件做了一整轮无效分析 —— 这正是 #1392/#1393 的起因。
 
 ---
 
@@ -450,12 +470,16 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-33 | **(kimi 对照真栈发现,2026-08-28)模型个性参数无 catalog 声明**:kimi-k3 只接受 temperature=1,sop2 换模型后旧值 0.9 原样发出→厂商 400 炸 run(#1321 always_thinking 同族问题)。修法=ModelEntry 声明温度约束(固定值/白名单),构建时钳制或略去并 log,别让厂商 400 当校验器 |
 | B-34 | ~~moonshot 严格校验 tool schema,enum-without-type 400~~ **✅ 已修(2026-08-28,PR #1350)**:update_plan/manage_task 四处补显式 type;守卫测试 test_tool_schema_vendor_strict.py 递归扫内置工具 schema。教训=拼给 LLM 的 schema 必过厂商严格校验,别赌宽松(MCP 工具名 wire-safe 同款纪律) |
 | B-35 | **委派增强层 4:per-agent `execution_mode: plan_first`(规划-执行分离)**——把委派从概率变保证的唯一结构解。**启动条件**:层 0-3 上线后真实流量 `expert_work_dynamic_worker_spawned_total` 跑 1-2 周仍趋零。真栈验证结论(2026-08-28,四探针 glm×3+kimi×1):层 0/1/2 机制全部生效(两模型思考原文引用判据、层 1 提醒精准注入),但模型均权衡后选 inline——业界同现象(Claude 自家栈实测 7 跑 0 委派,prompt 层无强制手段)。**先于层 4 的两个零成本杠杆**:①kimi 20+ 工具选择退化(社区实测),sop2 挂 30+ 工具,收敛 MCP 勾选可能直接抬委派率;②员工提问措辞含「分别/并行处理」类词对 kimi 触发委派影响大,可进层 3 生成的领域策略提示。**设计已拍板(2026-08-28,完整方案 `docs/superpowers/specs/2026-08-28-plan-first-execution-design.md`)**:manifest `execution_mode: plan_first` per-agent 默认关;**开启硬联动**(确认 Modal 明示后一次写入)= workflow.type react→plan_execute + dynamic_workers.enabled 必 true;Modal 另列建议检查项(token 成本 ~15× 大白话/max_iterations/deadline/reflection 协同/触发器 run 同样生效);**双层防护**=UI 联动写入 + 后端校验不一致 422 硬拒(不静默归一);关闭开关**不回退** workflow.type(提示手动改)。切分 5 PR 约 7-9 人日,PR-4(中断/审批 × 在飞 worker)是历史高危区。**✅ 全交付(2026-08-28,五 PR #1356-#1360 全合,发测试 ca4ae6b9)**:真栈探针(canary 租户 pf-probe/pf-probe-kimi,不动对接方 agent)——**glm-5.3 全链生效**:planner 标 delegate/分发轮触发/3 worker 真派发(`dispatch_total +1`、`spawned_total +3`、零降级),对比层 0-3 四探针 spawned 恒 0 = 结构解实证;**kimi-k3 绕行**:分发轮触发但用 update_plan 逃生门把 delegate 步改标 inline 零派发——follow-up 已修:①逃生门措辞收紧(re-mark 仅限写操作/最终拍板,读料/总结/提炼类明确不许)②re-mark 绕过计入 degraded 计数(原为观测盲区)③模板分层假设测试钉住。**e2e 用例裁掉**(组件级测试已盖渲染面,e2e 增量不抵维护成本;spec §8 相应降级)。PR-4 顺带修的审批黑洞(worker 撞闸静默假完成)为全局 bug 修复,不在开关后 |
-| B-36 | **弹性 worker 预算(per-agent 三值 + 平台默认/硬顶两档)**——sop2 真栈 plan_first 首跑 3 worker 全撞平台 32 步顶(自愈但耗时拖长)引出。方案甲(2026-08-28 拍板):manifest `dynamic_workers.max_iterations/max_concurrent/max_per_run` 三个可选请求字段(None=平台默认,宽 sanity 闸 512/64/1024);平台 `platform_dynamic_worker_config` 扩默认+硬顶两档六值(migration 0148 回填 cap 10/64/128),per-agent 请求 clamp 到 cap,**显式请求赢过「不超过父 workflow」启发式**;API/平台管理卡六值(default≤cap 422/前端同校验);Agent 配置页「子智能体预算」小节+步数>40 无 token 预算软提示(步数-token 不硬联动=拍板);配套七处配置页 UI 整理。**开发完(feat/worker-budget-per-agent),待 CI/合并**。合并后:sop2 worker 步数放宽 ~48 并知会 project-service | 🔄 |
-| B-37 | **子 Agent 上下文继承(技能继承 + 共享工作区认知 + 委派四要素)**——实证起点=会话 abf70030(run d73fc7e3,**ai-health-plan**;权威归属查 `thread_meta.agent_name`,别靠名字模糊匹配猜——本条初稿把主角误记为 sop2):做 PPT 的 worker **没有 pptx 技能**(该 Agent 绑了 19 个技能含 pptx/docx/pdf/banner-design/ui-ux-pro-max,worker `skills` 被剥空,连 `skill_view` 入口都不注册),只能靠主 Agent 把风格锚**手抄进 task 文本**,真正渲染退回主 Agent 自己跑 render_plan.py。**业界六框架调研结论**:子 Agent 提示词独立生成是共识(我们没做错),但人人都有一条「共享约定」通道由框架自动下发(Claude Code CLAUDE.md+`skills:` 预载 / CrewAI crew 级技能 / ADK global_instruction / LangGraph Store+中间件 / OpenAI RunConfig 注入),**我们唯独缺这一档**;且**没有一家能自动识别提示词里哪段该共享**——统一答案是「搬到共享位置」。**设计原则(负责人拍板)=平台缺口先改默认行为,不设计成让配置者去配**(「Claude Code 就没让我做特殊配置」;opt-in 开关有人会忘、忘了静默跑偏)。**本批零新增配置项**:①worker 继承父 manifest 技能(技能=Agent 级共享约定的标准容器;惰性加载常驻仅摘要行)②继承技能软失败(模型不匹配/工具冲突 skip+log,否则 worker 换便宜档模型会炸掉整次委派)③worker 提示词点明共享工作区(用户级偏好那条腿)④spawn_worker 描述补委派四要素+「约定用路径引用别抄内容」。运维回滚阀=env `dynamic_worker_inherit_skills`(不进 UI)。**明确不做**:全量继承父提示词(非标准)/提示词标记块/per-agent 继承配置。spec=`docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md`。**开发完待 CI**;验收必须行为探针(看 worker 事件流有无 `skill_view`,不能问它自己) | 🔄 |
+| B-36 | **弹性 worker 预算(per-agent 三值 + 平台默认/硬顶两档)**——sop2 真栈 plan_first 首跑 3 worker 全撞平台 32 步顶(自愈但耗时拖长)引出。方案甲(2026-08-28 拍板):manifest `dynamic_workers.max_iterations/max_concurrent/max_per_run` 三个可选请求字段(None=平台默认,宽 sanity 闸 512/64/1024);平台 `platform_dynamic_worker_config` 扩默认+硬顶两档六值(migration 0148 回填 cap 10/64/128),per-agent 请求 clamp 到 cap,**显式请求赢过「不超过父 workflow」启发式**;API/平台管理卡六值(default≤cap 422/前端同校验);Agent 配置页「子智能体预算」小节+步数>40 无 token 预算软提示(步数-token 不硬联动=拍板);配套七处配置页 UI 整理。**✅ 已交付(2026-08-28,PR #1368)+ 发测试 `a8e4382a`**;guard 帧实证 max=48 生效,撞顶后 worker 诚实报未完成、主线补派收尾。sop2 worker 步数已放宽并知会 project-service | ✅ |
+| B-37 | **子 Agent 上下文继承(技能继承 + 共享工作区认知 + 委派四要素)**——实证起点=会话 abf70030(run d73fc7e3,**ai-health-plan**;权威归属查 `thread_meta.agent_name`,别靠名字模糊匹配猜——本条初稿把主角误记为 sop2):做 PPT 的 worker **没有 pptx 技能**(该 Agent 绑了 19 个技能含 pptx/docx/pdf/banner-design/ui-ux-pro-max,worker `skills` 被剥空,连 `skill_view` 入口都不注册),只能靠主 Agent 把风格锚**手抄进 task 文本**,真正渲染退回主 Agent 自己跑 render_plan.py。**业界六框架调研结论**:子 Agent 提示词独立生成是共识(我们没做错),但人人都有一条「共享约定」通道由框架自动下发(Claude Code CLAUDE.md+`skills:` 预载 / CrewAI crew 级技能 / ADK global_instruction / LangGraph Store+中间件 / OpenAI RunConfig 注入),**我们唯独缺这一档**;且**没有一家能自动识别提示词里哪段该共享**——统一答案是「搬到共享位置」。**设计原则(负责人拍板)=平台缺口先改默认行为,不设计成让配置者去配**(「Claude Code 就没让我做特殊配置」;opt-in 开关有人会忘、忘了静默跑偏)。**本批零新增配置项**:①worker 继承父 manifest 技能(技能=Agent 级共享约定的标准容器;惰性加载常驻仅摘要行)②继承技能软失败(模型不匹配/工具冲突 skip+log,否则 worker 换便宜档模型会炸掉整次委派)③worker 提示词点明共享工作区(用户级偏好那条腿)④spawn_worker 描述补委派四要素+「约定用路径引用别抄内容」。运维回滚阀=env `dynamic_worker_inherit_skills`(不进 UI)。**明确不做**:全量继承父提示词(非标准)/提示词标记块/per-agent 继承配置。spec=`docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md`。**✅ 已交付(2026-08-28,PR #1369)+ 发测试 + 真栈行为探针 5/5**(worker 真的调了 `skill_view` 拉模板正文——按约定用行为探针验,没问它自己)。**勘误**:技能种子路径用**父** key 不是 worker key;worker 子 run 不落 `agent_run` 表 | ✅ |
+| B-38 | **(#1392/#1393 明写的边界,2026-08-30)委派上下文只覆盖「本轮用户附件」**:文档路径与图片引用已结构性进子代种子消息并活过检查点续跑,但**用户偏好、历史轮的附件、跨轮上下文仍不进子代** —— 与 [[B-37]] 同族(子代不继承对话是刻意设计,缺的是「共享约定」通道)。真栈上翻过的车是主 Agent 漏抄文件名导致 worker 选错文件;同类风险在别的维度上仍在。要不要再开通路、开哪些,等下一次实证 |
+| B-39 | **(2026-08-30 记账)#1392/#1393 的真栈复验未做** —— 本地证不了,只能发测试环境后验:①带附件的一轮触发委派,确认 worker 种子消息里带上了文档路径 / 图片(非视觉子代看 URI 文本,多模态子代看 `image_ref` block);②走一轮「带附件 → 触审批 → 批准续跑 → 委派」,确认续跑后附件还在(这是 #1393 的核心主张,单测用 `interrupt_before` 模型化过,真栈是另一回事) |
+| B-40 | **(2026-08-30 记账)对接方文件名乱码修复的我方验收** —— 根因已定位在对方 `busboy`/`multer`(见进度节),对方修完待发。发版后我方查库里新上传行的 `ref` / `filename` 两列贴给对方。**验收判据是「有没有汉字」,不是「有没有下划线」**:我方 `_safe_workspace_name` 的 `[^\w.-]+` 清洗里 `\w` 是 Unicode 感知的,汉字原样保留,但空格 / 全角括号会变下划线 —— 正确结果长这样 `uploads/糖尿病健康管理AI_SOP_内部试用版_v1.1.docx`。另:`user_upload.filename` 存的是清洗后的叶子名,**原始文件名全平台不留**,对方已明确不需要、不加字段 |
+| B-41 | **(#1370 修复时留的同构问题,2026-08-29)嵌套执行的双计是否只在耗时上** —— 过程条把子智能体墙钟计了两遍(父工具行 + 展开的 subagent 行各带一份),已修;但 **token / 成本 / 产物计数是不是同一个形状的双计,当时没查**。#1374(worker token 计入本轮总数)与 #1367(产物行补 worker 产物)都是「补漏」方向的修,不构成对「有没有重复计」的回答。查法=构造一次带 worker 的 run,把三类计数分别按「父行」「子行」拆开对账 |
 
 ---
 
-## D · 调试台 program follow-up —— D-1~D-4 ✅ 全清(2026-08-20);D-5/D-6 待做(2026-08-21 立项)
+## D · 调试台 program follow-up —— D-1~D-6 ✅ 全清(D-1~D-4 于 2026-08-20,D-5/D-6 于 2026-08-23);**仅剩 D-7**
 
 | # | 事项 | 结果 |
 |---|---|---|
@@ -469,18 +493,30 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 ---
 
-## 建议顺序(2026-08-23 更新)
+## 建议顺序(2026-08-30 更新)
 
-> 2026-08-23 用户口令:先做「ask_for_approval 默认关+配置开关」(✅ #1252)→ B-20(✅ 主体交付)→ D-6 剩余(含 D-5 依赖)。其余仍**等用户口令再开工**。
+> 口令历史:2026-08-23「ask_for_approval 默认关(✅ #1252)→ B-20(✅ 主体)→ D-6(✅)」;
+> 其后 08-26~08-30 数批均由用户当场下口令,已全部交付。**其余仍等用户口令再开工。**
 
-1. ~~**B-20**(审批列表分流)~~ ✅ 主体已交付(2026-08-23);② 通知路由拆给 D-6(对话内横幅)与 X-7(告警)
-2. **D-5**(对话详情页按轮重建+尾轮 live)→ **D-6**(就地批/拒/取消,依赖 D-5;含 B-20 遗留「澄清单发起人自决」)—— **用户已下口令,进行中**
-3. **X-14 P1**(金丝雀 run 进 release.sh;P2 钉版卫兵 ✅ #1317)—— e2b 事故复盘产物,~1 天
-4. **X-13**(e2b SDK 升级迁移)—— 与 X-11/X-12 同为钉版迁移池,择机
-5. **B-19**(配额 check 不按 resource_kind 过滤维度)—— 直接影响对外 429 行为,工程可直接开工
-6. **P-1~P-5 拍板** —— 产品题,不拍板工程动不了;P-4(api_keys 凭据横向扩散)风险最高建议先议
-7. **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一开
-8. 其余 X / B 项零散,可捎带或攒波做;X-3 的「投递无 CAS/幂等」在动多副本(X-10)前必修
+**卡在「等发测试环境」的三条**(工程侧已完成,只差环境):
+
+1. **B-39** #1392/#1393 附件送达的真栈复验(带附件委派 + 审批续跑后附件还在)
+2. **B-40** 对接方文件名乱码修复的我方验收(等对方发版)
+3. **发布本身** —— 原定 08-30 已延期。`0150_agent_spec_draft` 迁移随「保存 ≠ 上线」program 一并上;金丝雀 prod 侧只差开荒时照 runbook §1.6.7 seed 一次
+
+**可直接开工(不依赖环境、不依赖拍板)**:
+
+4. **B-41** 嵌套执行双计的同构核查(token / 成本 / 产物)—— 廉价,且耗时那一路已实证会错到「思考时长 > 总耗时」
+5. **B-31** credential-proxy 两件套(失效链断头 + `/admin/*` 无鉴权)—— **扩容前必接**,且第二条是安全洞
+6. **X-8 / CI 镜像离 Docker Hub** —— 08-27 一天四次、08-29~30 又两次 40 分钟限流假红,已烧掉数小时 CI;属「发布后第一波」但持续在收利息
+7. **B-32** redis Lua 桶回填量纲 1000×(QPS 类配额在 redis 引擎形同虚设)
+
+**需要拍板才动**:
+
+8. **P-1~P-5** 产品题;P-4(api_keys 凭据横向扩散)风险最高,建议先议
+9. **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一
+
+**发布后第一波(已排队)**:RLS PR B / Redis 全局令牌桶 / 取消亚秒化 / B-32 / X-8。
 
 ## 这一轮攒下的教训(派发时带上)
 
