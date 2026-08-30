@@ -985,3 +985,22 @@ async def test_child_config_forwards_the_artifact_recorder() -> None:
 
     _state, child_config = graph.calls[0]
     assert child_config["configurable"][ARTIFACT_RECORDER_KEY] is recorder
+
+
+@pytest.mark.asyncio
+async def test_static_subagent_seed_also_carries_this_turns_attachments() -> None:
+    """注入点放在共享的 ``run_child_to_result`` 而不是 ``spawn_worker``,就是为了
+    静态子 Agent 走同一条路 —— 它同样不继承对话,同样看不到 ``[file attached: …]``。
+    这条钉住"一处覆盖两条委派路径";若哪天有人把注入挪进 spawn_worker,这里会红。"""
+    graph = _FakeGraph(
+        result={"messages": [HumanMessage(content="task"), AIMessage(content="done")]}
+    )
+    tool = SubAgentTool(
+        subagent=_SUB, builder=_RecordingBuilder(built=_built(graph)), child_depth=2
+    )
+
+    await tool.call({"task": "分析资料内容"}, ctx=_ctx(turn_attachments=("uploads/材料.docx",)))
+
+    seed = graph.calls[0][0]["messages"][1].content
+    assert "uploads/材料.docx" in seed
+    assert seed.startswith("分析资料内容")
