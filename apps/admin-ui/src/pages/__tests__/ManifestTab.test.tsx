@@ -171,6 +171,38 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("manifest-editor-edit")).toBeInTheDocument();
   });
 
+  it("warns that a saved manifest still cannot run on this deployment", async () => {
+    // 后端对「平台没配凭据 / 没配 embedding」不拒绝保存 —— 作者改不了平台
+    // 状态。代价是绿灯不再等于能跑,所以这条必须显式说出来。
+    const user = userEvent.setup();
+    updateAgentMock.mockResolvedValue({
+      ...sampleDetail,
+      build_warning:
+        "model anthropic:claude-sonnet-4-5 has no platform credential configured for provider 'anthropic'",
+    });
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    const warn = await screen.findByTestId("manifest-build-warning");
+    expect(warn).toHaveTextContent("no platform credential");
+    // 保存本身是成功的 —— 这不是错误路径。
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("manifest-error")).not.toBeInTheDocument();
+  });
+
+  it("shows no warning banner when the manifest builds cleanly", async () => {
+    // 反向:warning 不能变成每次保存都挂着的装饰,否则它什么也没说。
+    const user = userEvent.setup();
+    updateAgentMock.mockResolvedValue(sampleDetail);
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("manifest-build-warning")).not.toBeInTheDocument();
+  });
+
   it("surfaces an error alert when updateAgent rejects", async () => {
     const user = userEvent.setup();
     updateAgentMock.mockRejectedValue(new ApiError("name mismatch", "MANIFEST_PATH_MISMATCH", 422));

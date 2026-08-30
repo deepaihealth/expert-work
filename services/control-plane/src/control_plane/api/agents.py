@@ -14,7 +14,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -90,7 +92,10 @@ from expert_work.common.observability import (
     current_trace_id_hex,
     expert_work_span,
 )
-from expert_work.common.uplift_metrics import record_manifest_provider_rejected
+from expert_work.common.uplift_metrics import (
+    record_manifest_build_check,
+    record_manifest_provider_rejected,
+)
 from expert_work.persistence import ApprovalStore, TriggerStore
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_instance import AgentInstanceStore
@@ -122,7 +127,7 @@ from expert_work.runtime.runs import (
     RunStore,
 )
 from expert_work.runtime.stream_bridge import StreamBridge
-from orchestrator import AgentFactoryError
+from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -750,6 +755,111 @@ class AgentDisableRequest(BaseModel):
         return value if value is None else reject_nul(value, field="reason")
 
 
+@dataclass(frozen=True)
+class _BuildCheck:
+    """Outcome of the save-time dry-run build.
+
+    ``rejected`` is a ready-to-return 422 (the write must not happen);
+    ``warning`` is text to hand back with a write that DID happen.
+    Both ``None`` = the manifest builds cleanly.
+    """
+
+    rejected: JSONResponse | None = None
+    warning: str | None = None
+
+
+async def _check_buildable(
+    request: Request,
+    *,
+    spec: Any,
+    tenant_id: UUID,
+) -> _BuildCheck:
+    """Dry-run the build before writing, so a manifest that cannot run never
+    saves silently.
+
+    Saving used to validate YAML syntax + the Pydantic schema and nothing else.
+    A manifest can clear both and still be impossible to assemble — and every
+    one of those saved green, then failed on **every subsequent run**. The save
+    looked fine; the next person to send a message was the one who found out.
+
+    The two failure families have different owners, so they get different
+    answers:
+
+    * :class:`PlatformNotConfiguredError` — the platform has no credential for
+      the referenced provider, or no embedder for the declared long-term
+      memory. **Saved, with a warning.** The author usually cannot fix these,
+      and refusing would lock a fresh deployment out of registering any agent
+      before its credentials land. (Verified, not assumed: the API test app has
+      no credentials, so a blanket refusal broke 17 existing tests — every one
+      of them on ``no platform credential configured for provider 'anthropic'``.)
+    * every other :class:`AgentFactoryError` — a sub-agent cycle, an
+      unresolvable / conflicting skill, a missing ``extends`` template, an
+      ``effort`` on a model with no thinking support. **Refused (422).** The
+      person editing can fix it, and a manifest that cannot run is worth
+      nothing saved.
+
+    Note what the refusal does NOT do: it never blocks fixing a broken agent,
+    because it judges the manifest being saved, not the one already stored.
+
+    Builds through the app's own wired builder rather than a reduced one, so
+    what passes here is what a run will construct. That includes attaching the
+    MCP pools — a cost, not a risk: no MCP path raises
+    :class:`AgentFactoryError` (an unreachable server is skipped, never fatal),
+    so a third-party MCP outage cannot reject a save. The pools are TTL-cached
+    and shared with the run path, so a save finds them warm or pays what the
+    next run would have paid.
+
+    ``user_id=None`` on purpose: whether a manifest is valid must not depend on
+    which administrator happens to be saving it, and per-user OAuth pools are
+    exactly the caller-specific state that would make it depend on that.
+
+    NOT wired into rollback. Rollback is the escape hatch — if a platform-side
+    change makes the current manifest unbuildable, the operator must still be
+    able to reach a known-good revision, and a gate there would hold the door
+    shut from the inside.
+    """
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    if runtime is None:
+        # Router built without a runtime (a few test setups). Counted, not
+        # silent: a deployment that lost its runtime shows up here as a gate
+        # that stopped gating, rather than as nothing at all.
+        record_manifest_build_check(outcome="skipped")
+        logger.warning("manifest.build_check_skipped no_agent_runtime")
+        return _BuildCheck()
+    started = time.monotonic()
+    try:
+        await runtime.agent_builder(spec, tenant_id=tenant_id, user_id=None)
+    except PlatformNotConfiguredError as exc:
+        record_manifest_build_check(outcome="platform_gap")
+        logger.warning(
+            "manifest.build_check_platform_gap name=%s version=%s",
+            spec.metadata.name,
+            spec.metadata.version,
+        )
+        return _BuildCheck(warning=str(exc))
+    except AgentFactoryError as exc:
+        record_manifest_build_check(outcome="rejected")
+        logger.info(
+            "manifest.build_check_rejected name=%s version=%s exc_type=%s",
+            spec.metadata.name,
+            spec.metadata.version,
+            type(exc).__name__,
+        )
+        # The message is ours, not a traceback — it names the offending skill /
+        # template / model knob, which is the whole actionable payload. Same
+        # shape the ``/tools`` endpoint has always returned for a failed build.
+        return _BuildCheck(
+            rejected=_envelope_error(
+                "MANIFEST_UNBUILDABLE",
+                f"manifest is valid but cannot be built into a runnable agent: {exc}",
+                422,
+            )
+        )
+    record_manifest_build_check(outcome="ok")
+    logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
+    return _BuildCheck()
+
+
 async def _load_manifest(
     payload: ManifestPayload,
     loader: ManifestLoader,
@@ -936,6 +1046,23 @@ def build_agents_router() -> APIRouter:
                 403,
             )
 
+        # 语法和字段都对,不代表建得出来。建不出来的 manifest 存下来毫无价值
+        # —— 它一个 run 也跑不了,只会让下一个用户来当探雷器。
+        check = await _check_buildable(request, spec=spec, tenant_id=tenant_id)
+        if check.rejected is not None:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action=AuditAction.MANIFEST_WRITE,
+                resource_type="manifest",
+                resource_id=f"{spec.metadata.name}/{spec.metadata.version}",
+                result=AuditResult.DENIED,
+                reason="unbuildable",
+                trace_id=trace_id,
+            )
+            return check.rejected
+
         try:
             record = await repo.create(
                 tenant_id=tenant_id,
@@ -974,12 +1101,13 @@ def build_agents_router() -> APIRouter:
             resource_type="manifest",
             resource_id=f"{record.name}/{record.version}",
             trace_id=trace_id,
-            details={"spec_sha256": sha, "revision": 1},
+            details={"spec_sha256": sha, "revision": 1, "build_warning": check.warning},
         )
-        return JSONResponse(
-            status_code=201,
-            content={"success": True, "data": AgentDetail(record=record).model_dump(mode="json")},
-        )
+        # ``build_warning`` 非空 = 存下来了,但这个部署还跑不了它(缺凭据 /
+        # 缺 embedding)。控制台据此提示,别让人以为绿灯就等于能跑。
+        data = AgentDetail(record=record).model_dump(mode="json")
+        data["build_warning"] = check.warning
+        return JSONResponse(status_code=201, content={"success": True, "data": data})
 
     @router.get("/templates", dependencies=_CONSOLE_ONLY)
     async def list_templates(
@@ -1677,6 +1805,23 @@ def build_agents_router() -> APIRouter:
             request, resource="manifest", action="write", attrs=_record_attrs(existing)
         )
 
+        # 同 create:建不出来就不落库。注意这条**不会**把人锁在门外 —— 判的是
+        # 正在保存的这一版,所以「把坏配置改好」的那次保存照样通过。
+        check = await _check_buildable(request, spec=spec, tenant_id=tenant_id)
+        if check.rejected is not None:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action=AuditAction.MANIFEST_WRITE,
+                resource_type="manifest",
+                resource_id=f"{name}/{version}",
+                result=AuditResult.DENIED,
+                reason="unbuildable",
+                trace_id=trace_id,
+            )
+            return check.rejected
+
         result = await repo.update_spec(
             tenant_id=tenant_id,
             name=name,
@@ -1703,11 +1848,13 @@ def build_agents_router() -> APIRouter:
                 "spec_sha256": sha,
                 "prev_sha256": result.prev_sha256,
                 "revision": result.revision,
+                "build_warning": check.warning,
             },
         )
-        return JSONResponse(
-            {"success": True, "data": AgentDetail(record=result.record).model_dump(mode="json")}
-        )
+        # 见 create 端点:非空 = 存下来了但这个部署还跑不了它。
+        data = AgentDetail(record=result.record).model_dump(mode="json")
+        data["build_warning"] = check.warning
+        return JSONResponse({"success": True, "data": data})
 
     @router.get("/{name}/{version}/tools", dependencies=_CONSOLE_ONLY)
     async def list_agent_tools(

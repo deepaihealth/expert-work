@@ -17,6 +17,8 @@ from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
 from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRecord
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
+from orchestrator import AgentFactoryError
+from orchestrator.errors import SkillNotFoundError
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -862,3 +864,115 @@ async def test_agent_detail_tenant_id_star_400(
     resp = await b5_client.get(path, params={"tenant_id": "*"})
     assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+# ---------------------------------------------------------------------------
+# 保存前的 dry-run 构建闸
+#
+# 两类失败归属不同,答案也不同:manifest 写错了 → 422 拒绝(编辑的人改得了);
+# 部署没配好 → 照存 + warning(作者改不了平台状态,拦下去等于把人锁在门外)。
+#
+# 用注入 builder 的方式而不是造真 manifest:这个测试 app 没配任何凭据,凭据
+# 那一关排在技能/模板解析**之前**,所以走真 manifest 永远只会撞上
+# PlatformNotConfiguredError —— manifest 错误那条分支在这里不可达。
+# ---------------------------------------------------------------------------
+
+
+def _builder_raising(exc: Exception):
+    async def _boom(spec, *, tenant_id=None, user_id=None):
+        raise exc
+
+    return _boom
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_a_manifest_that_cannot_be_built(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """引用不到的技能这类错误:以前存得进去,然后之后每个 run 都 422。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
+        SkillNotFoundError("skill 'no-such-skill' not found for this tenant")
+    )
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_UNBUILDABLE"
+    assert "no-such-skill" in resp.json()["error"]["message"]
+
+    # 关键:没落库。存进去的坏配置才是这条闸要消灭的东西。
+    listed = await client.get("/v1/agents")
+    assert all(i["name"] != "code-reviewer" for i in listed.json()["data"]["items"])
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_and_leaves_the_stored_version_untouched(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    assert (await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})).status_code == 201
+    app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
+        AgentFactoryError("sub-agent delegation cycle detected: a -> b -> a")
+    )
+
+    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_UNBUILDABLE"
+
+    detail = await client.get("/v1/agents/code-reviewer/1.0.0")
+    stored = detail.json()["data"]["record"]["spec"]["spec"]["system_prompt"]["template"]
+    assert stored == "you are a reviewer", "被拒的写入不能改变库里那一版"
+
+
+@pytest.mark.asyncio
+async def test_platform_gap_saves_with_a_warning_instead_of_refusing(
+    b5_client: AsyncClient,
+) -> None:
+    """平台没配 provider 凭据 → **不能**拒绝。
+
+    作者改不了平台状态。拦下去的后果是全新部署在凭据到位之前一个 Agent 都注册
+    不了 —— 而这正是这个测试 app 的状态(它本来就不配凭据)。
+    """
+    resp = await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert warning is not None
+    assert "credential" in warning
+
+
+@pytest.mark.asyncio
+async def test_a_clean_build_carries_no_warning(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """反向:warning 不能是恒有的装饰,否则它什么都没说。"""
+    app, client = b5_app_client
+
+    async def _ok(spec, *, tenant_id=None, user_id=None):
+        return object()
+
+    app.state.agent_runtime.agent_builder = _ok  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["build_warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_rollback_is_not_gated_by_the_build_check(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """回滚是逃生口,不设闸。
+
+    平台侧变动让当前 manifest 建不出来时,操作者必须还能回到已知可用的版本;
+    在这条路上设闸等于从里面把门锁死。所以即使 builder 此刻必然抛错,回滚
+    也要成功。
+    """
+    app, client = b5_app_client
+    await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
+    app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
+        AgentFactoryError("whatever is broken right now")
+    )
+
+    resp = await client.post("/v1/agents/code-reviewer/1.0.0/revisions/1/rollback")
+    assert resp.status_code == 200, resp.text

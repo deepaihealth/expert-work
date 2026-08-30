@@ -54,6 +54,7 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
   const [resetNonce, setResetNonce] = useState(0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [buildWarning, setBuildWarning] = useState<string | null>(null);
 
   // #2 — the editor is no longer key-remounted when the server snapshot
   // changes; adopt the refreshed snapshot into the buffer instead. In
@@ -96,8 +97,13 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
   const handleSave = useCallback(async () => {
     setSaving(true);
     setError(null);
+    setBuildWarning(null);
     try {
-      await updateAgent(r.name, r.version, { manifest_yaml: buffer });
+      const saved = await updateAgent(r.name, r.version, { manifest_yaml: buffer });
+      // 存下来了,但这个部署还跑不了它(缺 provider 凭据 / 缺 embedding)。
+      // 后端不拒这类保存 —— 作者改不了平台状态 —— 所以「绿灯 ≠ 能跑」这件事
+      // 只能靠这里说出来。
+      setBuildWarning(saved.build_warning ?? null);
       onSaved();
     } catch (err) {
       const message =
@@ -150,6 +156,19 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
           </ReadonlyTooltip>
         </Space>
       </div>
+
+      {buildWarning !== null && (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setBuildWarning(null)}
+          message={t("manifest_tab.saved_but_not_runnable")}
+          description={buildWarning}
+          style={{ marginBottom: 12 }}
+          data-testid="manifest-build-warning"
+        />
+      )}
 
       {error !== null && (
         <Alert

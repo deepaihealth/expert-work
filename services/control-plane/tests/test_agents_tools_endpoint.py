@@ -45,13 +45,25 @@ _CATALOG = (
 )
 
 
-def _runtime(*, fail: bool = False) -> AgentRuntime:
+async def _failing_build(
+    spec: object, *, tenant_id: object | None = None, user_id: str | None = None
+) -> BuiltAgent:
+    """构建失败的 builder —— 用来模拟「保存之后平台侧变了」。
+
+    保存时的 dry-run 闸会拒掉当场就建不出来的 manifest,所以「库里存着一个
+    建不出来的 Agent」现在只能这样产生:存进去的时候是好的,之后平台侧变动
+    (凭据被吊销、模板被删)让它建不出来了。这恰恰是 ``/tools`` 的 422 要覆盖
+    的现实场景,比原来「一开始就存了个坏的」更贴近生产。
+    """
+    del spec, tenant_id, user_id
+    raise AgentFactoryError("no model key")
+
+
+def _runtime() -> AgentRuntime:
     async def _build(
         spec: object, *, tenant_id: object | None = None, user_id: str | None = None
     ) -> BuiltAgent:
         del spec, tenant_id, user_id
-        if fail:
-            raise AgentFactoryError("no model key")
         return BuiltAgent(graph=object(), system_prompt="", max_steps=1, tool_catalog=_CATALOG)  # type: ignore[arg-type]
 
     return AgentRuntime(
@@ -118,10 +130,12 @@ async def test_tools_endpoint_returns_full_catalog(client_factory) -> None:
 async def test_tools_endpoint_404_unknown_and_422_when_build_fails(client_factory) -> None:
     async with await client_factory(_runtime()) as client:
         assert (await client.get("/v1/agents/nope/1.0.0/tools")).status_code == 404
-    async with await client_factory(_runtime(fail=True)) as client:
+    rt = _runtime()
+    async with await client_factory(rt) as client:
         assert (
             await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
         ).status_code == 201
+        rt.agent_builder = _failing_build  # 存完之后平台侧变了
         r = await client.get("/v1/agents/code-reviewer/1.0.0/tools")
         assert r.status_code == 422
         assert "cannot be built" in r.text
@@ -133,10 +147,12 @@ async def test_tools_endpoint_audits_manifest_read_even_when_build_fails(client_
     ``GET /{name}/{version}`` 同一时机:manifest 在 RBAC 闸过了那一刻就被读了,
     build 失败(422)不能把这件事从审计里抹掉。"""
     audit_store = InMemoryAuditLogStore()
-    async with await client_factory(_runtime(fail=True), audit_store=audit_store) as client:
+    rt = _runtime()
+    async with await client_factory(rt, audit_store=audit_store) as client:
         assert (
             await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
         ).status_code == 201
+        rt.agent_builder = _failing_build  # 存完之后平台侧变了
         r = await client.get("/v1/agents/code-reviewer/1.0.0/tools")
         assert r.status_code == 422
     # client_factory 每次造一个新 tenant uuid,拿不到;"*" 在 in-memory store 上是全量。

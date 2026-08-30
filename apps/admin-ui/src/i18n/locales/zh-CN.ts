@@ -592,6 +592,8 @@ const zhCN: TranslationKeys = {
     save: "保存",
     reset: "重置",
     save_failed: "配置清单保存失败",
+    saved_but_not_runnable:
+      "已保存 —— 但这个部署还跑不了它。配置本身没问题,是它依赖的东西在平台侧还没配好:",
   },
   manifest_editor: {
     tab_basic: "基础",

@@ -32,6 +32,9 @@ from orchestrator.errors import (
 from orchestrator.errors import (
     OrchestratorError as OrchestratorError,
 )
+from orchestrator.errors import (
+    PlatformNotConfiguredError as PlatformNotConfiguredError,
+)
 from orchestrator.graph_builder import build_react_graph as build_react_graph
 from orchestrator.graph_builder import (
     make_memory_recall_node as make_memory_recall_node,
@@ -175,6 +178,7 @@ __all__ = [
     "OrchestratorError",
     "OutputJudge",
     "OutputJudgeVerdict",
+    "PlatformNotConfiguredError",
     "ProviderHandle",
     "StepRouters",
     "StreamableGraph",
