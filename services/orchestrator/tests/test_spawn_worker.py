@@ -424,8 +424,8 @@ async def test_attachments_reach_a_grandchild_worker() -> None:
 
     await _tool(builder).call({"task": "分析"}, ctx=ctx)
 
-    child_config = graph.calls[0][1]
-    assert child_config["configurable"]["turn_documents"] == ["uploads/糖尿病逆转_SOP.docx"]
+    child_state = graph.calls[0][0]
+    assert child_state["turn_documents"] == ["uploads/糖尿病逆转_SOP.docx"]
 
 
 # --- 图片:按**子代自己**的能力分流 -------------------------------------------
@@ -555,5 +555,4 @@ async def test_image_refs_reach_a_grandchild_worker() -> None:
 
     await _tool(builder).call({"task": "t"}, ctx=ctx)
 
-    cfg = graph.calls[0][1]["configurable"]
-    assert cfg["turn_image_refs"] == ["expert_work://image/x"]
+    assert graph.calls[0][0]["turn_image_refs"] == ["expert_work://image/x"]

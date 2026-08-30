@@ -142,12 +142,6 @@ from orchestrator.tools.read_document import (
     ReadDocumentTool as ReadDocumentTool,
 )
 from orchestrator.tools.registry import (
-    TURN_DOCUMENTS_KEY as TURN_DOCUMENTS_KEY,
-)
-from orchestrator.tools.registry import (
-    TURN_IMAGE_REFS_KEY as TURN_IMAGE_REFS_KEY,
-)
-from orchestrator.tools.registry import (
     Tool as Tool,
 )
 from orchestrator.tools.registry import (
@@ -256,8 +250,6 @@ __all__ = [
     "KNOWN_BUILTINS",
     "MAX_SUBAGENT_DEPTH",
     "SANDBOX_EXEC_USER",
-    "TURN_DOCUMENTS_KEY",
-    "TURN_IMAGE_REFS_KEY",
     "AgentSandboxClient",
     "AllowlistProvider",
     "AskImageTool",

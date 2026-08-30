@@ -183,6 +183,19 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     step_count: int
     max_steps: int
+    #: 本轮用户附件 —— 文档的工作区路径(``uploads/<name>``)与图片的
+    #: ``expert_work://image/...`` 引用。委派时结构性地进子代的种子消息:子代
+    #: 不继承本对话,``[file attached: …]`` 那一行和贴在消息上的图片它都看不到。
+    #:
+    #: 放在 state 而不是 ``config["configurable"]``,是为了让 checkpoint 替我们
+    #: 保住它:审批续跑与 orphan 复活都是 ``graph_input=None`` 从检查点恢复,
+    #: 续的是**同一轮**,附件理应还在。
+    #:
+    #: 因此 ``build_run_graph_input`` 必须**每一轮都设**,哪怕是空列表 ——
+    #: 对话是长线程,省略这个键时 LangGraph 保留检查点里的旧值,上一轮的附件
+    #: 会漏进这一轮的子代。
+    turn_documents: NotRequired[list[str]]
+    turn_image_refs: NotRequired[list[str]]
     plan: NotRequired[Plan | None]
     reflections: NotRequired[Annotated[list[Reflection], add]]
     recalled_memories: NotRequired[list[MemoryItem]]

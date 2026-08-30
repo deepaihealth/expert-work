@@ -52,7 +52,6 @@ from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import AgentFactoryError, run_agent
-from orchestrator.tools import TURN_DOCUMENTS_KEY, TURN_IMAGE_REFS_KEY
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -355,10 +354,6 @@ class RunQueueWorker:
             # 从 enqueued_input 回读。queue 路径的附件此前有过一次静默消失的前科
             # (见上方 build_run_graph_input 处的注释),这一处漏了同样是静默的:
             # 委派出去的子代只是"少知道一件事",不报错。
-            if document_names:
-                configurable[TURN_DOCUMENTS_KEY] = list(document_names)
-            if image_refs:
-                configurable[TURN_IMAGE_REFS_KEY] = list(image_refs)
             config: RunnableConfig = {"configurable": configurable}
 
             worker = asyncio.create_task(
