@@ -221,6 +221,12 @@ export interface RunRequest {
    *  ``system_prompt`` template (when it opts into jinja mode), validated
    *  against the agent's declared ``variables``. Omitted → no substitution. */
   inputs?: Record<string, string>;
+  /** 用**未发布的草稿**跑这一轮,而不是线上那一版 —— 配置页发布前的试跑。
+   *
+   *  没有草稿时后端 409(不会静默退回线上版本 —— 那会让人以为自己验过了
+   *  草稿),与 ``mode=queue`` 组合时 422(排队的 run 由 worker 稍后执行,
+   *  而 worker 读的是线上那一版)。 */
+  use_draft?: boolean;
 }
 
 /** A single SSE frame as parsed from the network stream. ``data`` is

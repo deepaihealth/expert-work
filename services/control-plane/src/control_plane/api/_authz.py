@@ -19,7 +19,13 @@ from control_plane.auth.abac import ResourceAttrs, authorize_resource
 from control_plane.auth.rbac import Action, Resource, collect_roles_for_audit, is_allowed
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.auth import RoleBindingStore
-from expert_work.protocol import AuditAction, AuditResult, Principal, RoleBinding
+from expert_work.protocol import (
+    AgentSpecRecord,
+    AuditAction,
+    AuditResult,
+    Principal,
+    RoleBinding,
+)
 from expert_work.runtime.audit.logger import AuditLogger
 
 logger = logging.getLogger("expert_work.control_plane.api.authz")
@@ -381,4 +387,18 @@ async def ensure_resource_access(
     raise HTTPException(
         status_code=403,
         detail={"code": "FORBIDDEN", "message": "principal lacks access to this resource"},
+    )
+
+
+def manifest_record_attrs(record: AgentSpecRecord) -> ResourceAttrs:
+    """Stream 8.5 —— 一个已存储 manifest 实例的 ABAC 属性。
+
+    住在这里而不是 ``api/agents.py``:``runs.py`` 的「用草稿试跑」也要判
+    ``manifest:write``,而 ``agents.py`` 反过来 import 了 ``runs.spawn_run``
+    —— 放在 agents.py 会成环。
+    """
+    return ResourceAttrs(
+        resource_id=record.name,
+        labels=record.spec.metadata.labels,
+        owner_id=record.created_by,
     )

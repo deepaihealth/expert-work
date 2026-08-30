@@ -56,6 +56,8 @@ export interface RunDraft {
   input: string;
   attachments: Attachment[];
   inputs: Record<string, string>;
+  /** 用未发布的草稿跑这一轮(发布前的试跑),而不是线上那一版。 */
+  useDraft?: boolean;
 }
 
 export interface RunEngine {
@@ -150,6 +152,8 @@ export function useRunEngine(args: {
           : "";
       const inputs = draft.inputs;
       const body: RunRequest = { input: docNote + turnInput };
+      // 发布前试跑:这一轮按草稿构建,线上那一版不受影响。
+      if (draft.useDraft) body.use_draft = true;
       if (imageRefs.length > 0) body.image_refs = imageRefs;
       if (Object.keys(inputs).length > 0) body.inputs = inputs;
 

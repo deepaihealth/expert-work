@@ -38,7 +38,13 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api._authz import console_only, require, require_key_scope
+from control_plane.api._authz import (
+    console_only,
+    ensure_resource_access,
+    manifest_record_attrs,
+    require,
+    require_key_scope,
+)
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer, make_run_probe
 from control_plane.api._session_title import title_from_text
@@ -234,6 +240,17 @@ class RunRequest(BaseModel):
     #: the ``run_id`` immediately; a ``RunQueueWorker`` on any instance executes
     #: it, and the client reads the output over ``GET .../runs/{id}/events``.
     mode: Literal["stream", "queue"] = "stream"
+    #: 用**未发布的草稿**跑这一轮,而不是线上那一版 —— 配置页发布前的试跑。
+    #:
+    #: 三条约束,都在处理器里强制:
+    #:
+    #: * 需要 ``manifest:write``。跑草稿是**编辑配置的一部分**,不是读会话;
+    #:   能读会话的人不该因此就能把未发布的配置用在真实对话里。
+    #: * 没有草稿时 409,不静默退回线上那一版 —— 那会让人以为自己验过了草稿。
+    #: * 与 ``mode="queue"`` **互斥**:排队的 run 由 worker 稍后执行,而 worker
+    #:   读的是线上那一版。允许这个组合等于交回一个「验过草稿」的假象,而实际
+    #:   跑的是别的东西。
+    use_draft: bool = False
     image_refs: list[str] = Field(default_factory=list, max_length=MAX_RUN_IMAGE_REFS)
     #: P2 块 1(Task 11)—— ``files[]`` 里 ``type == "document"`` 的条目,已经
     #: 在调用方(``agents.py`` 的 ``run_agent_for_user``)过了
@@ -1299,12 +1316,54 @@ def build_runs_router() -> APIRouter:
                     "message": f"agent {meta.agent_name}@{meta.agent_version} has been deleted",
                 },
             )
+        # 用草稿跑(配置页发布前的试跑)。三条约束,缺一不可 —— 见
+        # ``RunRequest.use_draft``。
+        run_spec = record.spec
+        if payload.use_draft:
+            if payload.mode == "queue":
+                # 排队的 run 由 worker 稍后执行,而 worker 读的是线上那一版。
+                # 静默接受 = 交回一个「验过草稿」的假象,而实际跑的是别的东西。
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "success": False,
+                        "data": None,
+                        "error": {
+                            "code": "DRAFT_RUN_REQUIRES_STREAM",
+                            "message": (
+                                "use_draft only works with mode=stream — a queued run "
+                                "is executed later by a worker, which reads the "
+                                "published spec"
+                            ),
+                        },
+                    },
+                )
+            if record.draft is None:
+                # 不静默退回线上那一版:那会让人以为自己验过了草稿。
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "success": False,
+                        "data": None,
+                        "error": {
+                            "code": "MANIFEST_NO_DRAFT",
+                            "message": "there is no unpublished draft to run",
+                        },
+                    },
+                )
+            # 跑草稿是编辑配置的一部分,不是读会话 —— 能读会话的人不该因此就
+            # 能把未发布的配置用在真实对话里。
+            await ensure_resource_access(
+                request, resource="manifest", action="write", attrs=manifest_record_attrs(record)
+            )
+            run_spec = record.draft.spec
+
         try:
             built = await runtime.get_agent(
                 tenant_id=tenant_id,
                 name=meta.agent_name,
                 version=meta.agent_version,
-                spec=record.spec,
+                spec=run_spec,
                 # Stream MCP-OAUTH (OA-3b) — subject_id keys the per-user OAuth
                 # MCP pool (= mcp_oauth_connection.user_id).
                 user_id=request.state.principal.subject_id,
@@ -1337,7 +1396,7 @@ def build_runs_router() -> APIRouter:
             request=request,
             settings=settings,
             built=built,
-            record_spec=record.spec,
+            record_spec=run_spec,
             thread_id=thread_id,
             tenant_id=tenant_id,
             actor_id=actor_id,

@@ -21,7 +21,7 @@
  * (``var_drafts``)按 agent+变量名记最后提交值,进入页面仅对空字段预填。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, App, Badge, Drawer, Segmented, Typography } from "antd";
+import { Alert, App, Badge, Checkbox, Drawer, Segmented, Tooltip, Typography } from "antd";
 import { SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -387,6 +387,16 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     [engineStartRun],
   );
 
+  // 发布前试跑:有草稿时才给这个开关。默认**关**——「跑一轮」的默认含义应该
+  // 是「跑线上那一版」,把它默认成草稿会让人以为自己在验线上行为。
+  const hasDraft = r.draft != null;
+  const [useDraft, setUseDraft] = useState(false);
+  useEffect(() => {
+    // 草稿被发布或丢弃之后,开关必须跟着关掉 —— 留在开的状态下一次发送会
+    // 撞 409,而人看到的是一个仍然亮着的「用草稿」。
+    if (!hasDraft) setUseDraft(false);
+  }, [hasDraft]);
+
   const handleRun = useCallback(async () => {
     // 必填变量没填齐就发不出去(Composer 已置灰,这里守住 Enter / 程序化调用)。
     if (missing.length > 0) return;
@@ -395,7 +405,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
       const val = varValues[v.name];
       if (val !== undefined && val !== "") inputs[v.name] = val;
     }
-    await startRun({ input, attachments, inputs }, () => {
+    await startRun({ input, attachments, inputs, useDraft }, () => {
       // Consume the input + attachments only once the turn really dispatched
       // (a failed ensureThread keeps the draft intact).
       setInput("");
@@ -412,6 +422,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     promptVariables,
     varValues,
     missing,
+    useDraft,
     r.name,
     settingsNotifyRunDispatched,
   ]);
@@ -420,13 +431,15 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // turn (attachments are stored refs — no re-upload).
   const handleRetry = useCallback(
     (turn: Turn) => {
+      // 重试沿用这一轮**当时**的目标:开着草稿开关时重试的仍然是草稿。
       void startRun({
         input: turn.input,
         attachments: turn.attachments,
         inputs: turn.inputs ?? {},
+        useDraft,
       });
     },
-    [startRun],
+    [startRun, useDraft],
   );
 
   // #10 — history-turn retry backfills the input box; BUG-16 — the jinja
@@ -597,6 +610,19 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
                 {`${t("console.thread_id_label")}: ${thread.thread_id}`}
               </Text>
             ) : null}
+            {hasDraft && (
+              <Tooltip title={t("playground.use_draft_hint")}>
+                <Checkbox
+                  checked={useDraft}
+                  onChange={(e) => setUseDraft(e.target.checked)}
+                  disabled={running}
+                  data-testid="playground-use-draft"
+                  style={{ fontSize: 12 }}
+                >
+                  {t("playground.use_draft")}
+                </Checkbox>
+              </Tooltip>
+            )}
             <Segmented
               value={view}
               onChange={(value) => setView(value as ConsoleView)}
