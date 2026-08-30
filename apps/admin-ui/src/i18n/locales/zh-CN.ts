@@ -598,6 +598,14 @@ const zhCN: TranslationKeys = {
       "已保存 —— 但这个部署还跑不了它。配置本身没问题,是它依赖的东西在平台侧还没配好:",
     stale_write:
       "你打开这个页面之后,别人改过这份配置。这次没有保存,对方的改动完好。刷新看一下他改了什么,再重新应用你的修改。",
+    save_draft: "保存草稿",
+    publish: "发布",
+    discard_draft: "丢弃草稿",
+    draft_pending: "有未发布的草稿",
+    draft_pending_detail:
+      "你正在编辑 {{who}} 于 {{when}} 保存的草稿。线上的会话用的仍然是已发布那一版 —— 不点「发布」就什么都不会变。",
+    draft_saved_but_unpublishable:
+      "草稿已保存,但照现在这样发布会被拒绝,原因是:",
   },
   manifest_editor: {
     tab_basic: "基础",

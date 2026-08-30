@@ -18,6 +18,7 @@ from expert_work.persistence.agent_spec.base import (
 from expert_work.persistence.models import AgentSpecRevisionRow, AgentSpecRow
 from expert_work.protocol import (
     AgentSpec,
+    AgentSpecDraft,
     AgentSpecRecord,
     AgentSpecRevisionRecord,
     AgentSpecStatus,
@@ -36,6 +37,28 @@ def _row_to_record(row: AgentSpecRow) -> AgentSpecRecord:
         created_by=row.created_by,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        draft=_row_to_draft(row),
+    )
+
+
+def _row_to_draft(row: AgentSpecRow) -> AgentSpecDraft | None:
+    """The row's unpublished draft, or ``None`` when it has none.
+
+    The four draft columns are written and cleared as a unit, so any one of
+    them being NULL means "no draft". Keyed on ``draft_spec_json`` because it
+    is the one that cannot be a meaningful empty value.
+    """
+    if row.draft_spec_json is None:
+        return None
+    # The remaining three are non-NULL whenever the payload is (see the model);
+    # asserting that here would turn a storage inconsistency into a 500 on a
+    # read path, so trust the writers and let Pydantic reject a genuinely
+    # malformed row.
+    return AgentSpecDraft(
+        spec=AgentSpec.model_validate(row.draft_spec_json),
+        spec_sha256=row.draft_sha256 or "",
+        updated_by=row.draft_updated_by or "",
+        updated_at=row.draft_updated_at,  # type: ignore[arg-type]
     )
 
 
@@ -261,6 +284,127 @@ class SqlAgentSpecStore(AgentSpecStore):
             await session.refresh(row)
             return AgentSpecUpdateResult(
                 record=_row_to_record(row), revision=next_revision, prev_sha256=prev_sha
+            )
+
+    async def _live_row(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRow | None:
+        """The non-deleted row for ``(tenant, name, version)``, locked for update."""
+        return (
+            await session.execute(
+                select(AgentSpecRow)
+                .where(
+                    AgentSpecRow.tenant_id == tenant_id,
+                    AgentSpecRow.name == name,
+                    AgentSpecRow.version == version,
+                    AgentSpecRow.status != AgentSpecStatus.DELETED.value,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+
+    async def save_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        spec: AgentSpec,
+        spec_sha256: str,
+        updated_by: str,
+    ) -> AgentSpecRecord | None:
+        async with self._sf() as session:
+            row = await self._live_row(session, tenant_id=tenant_id, name=name, version=version)
+            if row is None:
+                return None
+            row.draft_spec_json = spec.model_dump(by_alias=True, mode="json")
+            row.draft_sha256 = spec_sha256
+            row.draft_updated_at = datetime.now(UTC)
+            row.draft_updated_by = updated_by
+            # 刻意不碰 ``updated_at``:那是**线上这一版**的时间戳,存草稿没有
+            # 改变线上任何东西,让它跟着动会让「上次真正发布是什么时候」失真。
+            await session.commit()
+            await session.refresh(row)
+            return _row_to_record(row)
+
+    async def discard_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        async with self._sf() as session:
+            row = await self._live_row(session, tenant_id=tenant_id, name=name, version=version)
+            if row is None:
+                return None
+            row.draft_spec_json = None
+            row.draft_sha256 = None
+            row.draft_updated_at = None
+            row.draft_updated_by = None
+            await session.commit()
+            await session.refresh(row)
+            return _row_to_record(row)
+
+    async def publish_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        updated_by: str,
+    ) -> AgentSpecUpdateResult | None:
+        async with self._sf() as session:
+            row = await self._live_row(session, tenant_id=tenant_id, name=name, version=version)
+            if row is None or row.draft_spec_json is None:
+                return None
+            now = datetime.now(UTC)
+            spec_json = row.draft_spec_json
+            new_sha = row.draft_sha256 or ""
+            prev_sha = row.spec_sha256
+            revision: int | None = None
+            if prev_sha != new_sha:
+                # 与 update_spec 同一条规矩:同 sha 的发布不记历史。发布一份
+                # 内容与线上完全相同的草稿不是「一次改动」,只是把编辑缓冲区
+                # 清掉。
+                revision = (
+                    await session.execute(
+                        select(func.coalesce(func.max(AgentSpecRevisionRow.revision), 0)).where(
+                            AgentSpecRevisionRow.tenant_id == tenant_id,
+                            AgentSpecRevisionRow.agent_name == name,
+                            AgentSpecRevisionRow.agent_version == version,
+                        )
+                    )
+                ).scalar_one() + 1
+                session.add(
+                    AgentSpecRevisionRow(
+                        tenant_id=tenant_id,
+                        agent_name=name,
+                        agent_version=version,
+                        revision=revision,
+                        spec_json=spec_json,
+                        spec_sha256=new_sha,
+                        actor_id=updated_by,
+                        created_at=now,
+                    )
+                )
+                row.spec_json = spec_json
+                row.spec_sha256 = new_sha
+                row.updated_at = now
+            # 无论内容是否变化,草稿都清掉:发布之后编辑缓冲区就该是空的。
+            row.draft_spec_json = None
+            row.draft_sha256 = None
+            row.draft_updated_at = None
+            row.draft_updated_by = None
+            await session.commit()
+            await session.refresh(row)
+            return AgentSpecUpdateResult(
+                record=_row_to_record(row), revision=revision, prev_sha256=prev_sha
             )
 
     async def list_revisions(

@@ -156,6 +156,57 @@ class AgentSpecStore(abc.ABC):
         revision). Returns the result, or ``None`` if no row matched
         (404)."""
 
+    # --- 未发布草稿:把「改配置」和「让改动生效」分成两个动作 -----------
+
+    @abc.abstractmethod
+    async def save_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        spec: AgentSpec,
+        spec_sha256: str,
+        updated_by: str,
+    ) -> AgentSpecRecord | None:
+        """Write (or overwrite) the row's unpublished draft.
+
+        Touches only the four draft columns — the live ``spec`` and its
+        revision history are untouched, so no run is affected. Returns the
+        refreshed record, or ``None`` if no live row matched (unknown /
+        cross-tenant / soft-deleted).
+        """
+
+    @abc.abstractmethod
+    async def discard_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        """Clear the row's draft. Returns the refreshed record, or ``None``
+        if no live row matched. Discarding when there is no draft is a
+        no-op, not an error — the caller's intent ("leave me with no
+        draft") is already satisfied."""
+
+    @abc.abstractmethod
+    async def publish_draft(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        updated_by: str,
+    ) -> AgentSpecUpdateResult | None:
+        """Promote the draft to live and clear it, in one transaction.
+
+        Same write semantics as :meth:`update_spec` (appends a revision;
+        a same-sha promotion records nothing) plus the draft columns are
+        cleared. Returns ``None`` when there is no live row **or no draft**
+        — "publish what?" is a caller error, not a silent success.
+        """
+
     @abc.abstractmethod
     async def list_revisions(
         self,

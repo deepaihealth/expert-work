@@ -43,6 +43,22 @@ class AgentSpecRow(Base):
         onupdate=func.now(),
     )
 
+    # 未发布的草稿 —— 编辑中的 manifest,**不影响任何 run**。
+    #
+    # 为什么在同一行而不是单独一张表:草稿与「某个 Agent 版本」是一对一的
+    # (一个编辑缓冲区),没有生命周期、没有历史、发布即消失。单独一张表换来
+    # 的只是一次 join 和一份要自己维护的引用完整性。
+    #
+    # 四列同生同灭:要么全是 NULL(没有草稿),要么全非 NULL。
+    # ``draft_updated_by`` 记的是谁存的草稿,好让「别人有个草稿在这儿」这件事
+    # 说得出是谁 —— 与主行的 ``created_by``(创建者,不随编辑变)不是一回事。
+    draft_spec_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    draft_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    draft_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    draft_updated_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     __table_args__ = (
         UniqueConstraint(
             "tenant_id", "name", "version", name="agent_spec_tenant_name_version_uniq"

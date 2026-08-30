@@ -1079,3 +1079,196 @@ async def test_update_accepts_a_quoted_etag(b5_app_client) -> None:
         headers={"If-Match": f'"{sha}"'},
     )
     assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# 草稿 / 发布:把「改配置」和「让改动生效」分成两个动作
+# ---------------------------------------------------------------------------
+
+
+async def _create(client, *, builder=None) -> str:
+    """建一个 Agent,返回它当前的 sha。"""
+    created = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert created.status_code == 201, created.text
+    return created.json()["data"]["record"]["spec_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_saving_a_draft_does_not_touch_the_live_spec(b5_app_client) -> None:
+    """草稿的全部意义:存了不生效。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+
+    saved = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert saved.status_code == 200, saved.text
+
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["spec_sha256"] == live_sha, "线上那一版必须一个字节都没动"
+    assert detail["draft"] is not None
+    assert detail["draft"]["spec"]["spec"]["system_prompt"]["jinja"] is True
+    # 存草稿不是一次改动,不该记历史。
+    history = (await client.get("/v1/agents/code-reviewer/1.0.0/revisions")).json()
+    assert len(history["data"]["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_makes_the_draft_live_and_clears_it(b5_app_client) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+
+    published = await client.post(
+        "/v1/agents/code-reviewer/1.0.0/publish", headers={"If-Match": live_sha}
+    )
+    assert published.status_code == 200, published.text
+    record = published.json()["data"]["record"]
+    assert record["spec_sha256"] != live_sha
+    assert record["draft"] is None, "发布后编辑缓冲区必须空,否则页面会一直提示有草稿"
+
+    history = (await client.get("/v1/agents/code-reviewer/1.0.0/revisions")).json()
+    assert [r["revision"] for r in history["data"]["items"]] == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_draft_save_reports_an_unbuildable_manifest_without_refusing(
+    b5_app_client,
+) -> None:
+    """草稿是半成品 —— 拦住一次保存等于逼人把改了一半的东西丢掉。
+
+    但必须**说出来**,否则人会一路点到发布才发现。
+    """
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
+        SkillNotFoundError("skill 'nope' not found for this tenant")
+    )
+
+    saved = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert saved.status_code == 200, "草稿保存不该被构建失败拦住"
+    assert "nope" in saved.json()["data"]["build_error"]
+    # 确实存下来了。
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["draft"] is not None
+
+
+@pytest.mark.asyncio
+async def test_publish_refuses_an_unbuildable_draft(b5_app_client) -> None:
+    """发布是另一回事:建不出来的东西推上线,受害的是下一个发消息的用户。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
+        AgentFactoryError("sub-agent delegation cycle detected")
+    )
+
+    resp = await client.post(
+        "/v1/agents/code-reviewer/1.0.0/publish", headers={"If-Match": live_sha}
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_UNBUILDABLE"
+
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["spec_sha256"] == live_sha, "被拒的发布不能改变线上那一版"
+    assert detail["draft"] is not None, "草稿也要留着,否则等于替人把改动扔了"
+
+
+@pytest.mark.asyncio
+async def test_publish_without_a_draft_is_a_conflict(b5_app_client) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+
+    resp = await client.post(
+        "/v1/agents/code-reviewer/1.0.0/publish", headers={"If-Match": live_sha}
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_NO_DRAFT"
+
+
+@pytest.mark.asyncio
+async def test_discard_removes_the_draft_and_leaves_live_alone(b5_app_client) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    saved = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+    draft_sha = saved.json()["data"]["record"]["draft"]["spec_sha256"]
+
+    resp = await client.request(
+        "DELETE",
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        headers={"If-Match": draft_sha},
+    )
+    assert resp.status_code == 200, resp.text
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["draft"] is None
+    assert detail["spec_sha256"] == live_sha
+
+
+@pytest.mark.asyncio
+async def test_second_editor_cannot_clobber_an_existing_draft(b5_app_client) -> None:
+    """有草稿之后,``If-Match`` 要匹配的是**草稿**的 sha ——「匹配你载入编辑器
+    的那一版」。拿线上 sha 来写 = 你没看见别人的草稿。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+
+    second = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _VALID_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert second.status_code == 409, second.text
+    assert second.json()["error"]["code"] == "MANIFEST_STALE_WRITE"
+
+
+@pytest.mark.asyncio
+async def test_draft_endpoints_require_if_match(b5_app_client) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+    # publish 先判「有没有草稿」再判前置条件(目标状态比协议合规更值得说,与
+    # update_agent 里 404/越权优先于 If-Match 同一条原则),所以这里得先有草稿
+    # 才验得到 428。
+    await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": live_sha},
+    )
+
+    blind_save = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft", json={"manifest_yaml": _JINJA_YAML}
+    )
+    blind_discard = await client.request("DELETE", "/v1/agents/code-reviewer/1.0.0/draft")
+    blind_publish = await client.post("/v1/agents/code-reviewer/1.0.0/publish")
+    for resp in (blind_save, blind_discard, blind_publish):
+        assert resp.status_code == 428, resp.text
+        assert resp.json()["error"]["code"] == "MANIFEST_IF_MATCH_REQUIRED"
