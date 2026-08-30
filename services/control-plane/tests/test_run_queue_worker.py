@@ -520,7 +520,7 @@ async def test_claimed_run_carries_document_names_into_delegation_context(
     await asyncio.sleep(0)
 
     assert started == 1
-    assert spawns[0]["config"]["configurable"]["turn_attachments"] == ["uploads/report.pdf"]
+    assert spawns[0]["config"]["configurable"]["turn_documents"] == ["uploads/report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -548,4 +548,35 @@ async def test_queued_run_without_attachments_leaves_the_key_out(
     await _worker(store, runtime).run_once()
     await asyncio.sleep(0)
 
-    assert "turn_attachments" not in spawns[0]["config"]["configurable"]
+    assert "turn_documents" not in spawns[0]["config"]["configurable"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_run_carries_image_refs_into_delegation_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """queue 侧图片同理 —— 与 document_names 分属两个 key,各自可能被漏。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    await runtime.run_manager.enqueue(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        enqueued_input={
+            "input": "看看这张图",
+            "image_refs": ["expert_work://image/x"],
+            "untrusted_content": [],
+        },
+    )
+
+    await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert spawns[0]["config"]["configurable"]["turn_image_refs"] == ["expert_work://image/x"]

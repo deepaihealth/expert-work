@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 from uuid import UUID, uuid4
@@ -2371,7 +2372,7 @@ async def test_stream_run_carries_document_names_into_delegation_context(
         await response.aread()
 
     assert len(captured) == 1
-    assert captured[0]["config"]["configurable"]["turn_attachments"] == ["uploads/report.pdf"]
+    assert captured[0]["config"]["configurable"]["turn_documents"] == ["uploads/report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -2392,4 +2393,43 @@ async def test_stream_run_without_attachments_leaves_the_key_out(
     await _seed_completed_run(runs_client)
 
     assert len(captured) == 1
-    assert "turn_attachments" not in captured[0]["config"]["configurable"]
+    assert "turn_documents" not in captured[0]["config"]["configurable"]
+
+
+@pytest.mark.asyncio
+async def test_stream_run_carries_image_refs_into_delegation_context(
+    runs_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图片与文档是两个独立的 key,两处各写一行,漏任何一处都不报错。"""
+    import control_plane.api.runs as runs_module
+
+    captured: list[dict[str, Any]] = []
+    real_run_agent = runs_module.run_agent
+
+    async def _recording_run_agent(**kw: Any) -> Any:
+        captured.append(kw)
+        return await real_run_agent(**kw)
+
+    monkeypatch.setattr(runs_module, "run_agent", _recording_run_agent)
+
+    # 平台只接受"这个 agent 处理得了"的图片(_validate_image_refs);stub agent
+    # 默认是纯文本的,所以先把它换成原生多模态的,否则请求在到达接线之前就 422。
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    real_builder = app.state.agent_runtime.agent_builder
+
+    async def _vision_builder(*a: Any, **kw: Any) -> Any:
+        return replace(await real_builder(*a, **kw), supports_vision=True)
+
+    monkeypatch.setattr(app.state.agent_runtime, "agent_builder", _vision_builder)
+
+    thread_id = await _create_session(runs_client)
+    ref = f"expert_work://image/{_DEFAULT_TENANT}/{thread_id}/{uuid4()}.png"
+    async with runs_client.stream(
+        "POST",
+        f"/v1/sessions/{thread_id}/runs",
+        json={"input": "看看这张图", "image_refs": [ref]},
+    ) as response:
+        assert response.status_code == 200
+        await response.aread()
+
+    assert captured[0]["config"]["configurable"]["turn_image_refs"] == [ref]

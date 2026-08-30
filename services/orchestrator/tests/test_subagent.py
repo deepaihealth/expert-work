@@ -999,7 +999,7 @@ async def test_static_subagent_seed_also_carries_this_turns_attachments() -> Non
         subagent=_SUB, builder=_RecordingBuilder(built=_built(graph)), child_depth=2
     )
 
-    await tool.call({"task": "分析资料内容"}, ctx=_ctx(turn_attachments=("uploads/材料.docx",)))
+    await tool.call({"task": "分析资料内容"}, ctx=_ctx(turn_documents=("uploads/材料.docx",)))
 
     seed = graph.calls[0][0]["messages"][1].content
     assert "uploads/材料.docx" in seed

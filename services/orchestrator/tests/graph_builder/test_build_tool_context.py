@@ -28,30 +28,28 @@ def test_missing_thread_id_is_none() -> None:
     assert ctx.thread_id is None
 
 
-def test_turn_attachments_lifted_from_config() -> None:
+def test_turn_documents_lifted_from_config() -> None:
     ctx = _build_tool_context(
-        {"configurable": {"turn_attachments": ["uploads/a.docx", "uploads/b.pptx"]}}
+        {"configurable": {"turn_documents": ["uploads/a.docx", "uploads/b.pptx"]}}
     )
-    assert ctx.turn_attachments == ("uploads/a.docx", "uploads/b.pptx")
+    assert ctx.turn_documents == ("uploads/a.docx", "uploads/b.pptx")
 
 
-def test_turn_attachments_default_empty() -> None:
-    assert _build_tool_context({"configurable": {}}).turn_attachments == ()
+def test_turn_documents_default_empty() -> None:
+    assert _build_tool_context({"configurable": {}}).turn_documents == ()
 
 
-def test_turn_attachments_drops_non_string_entries() -> None:
+def test_turn_documents_drops_non_string_entries() -> None:
     """这个值一路从 HTTP 载荷传下来,不是进程内对象 —— 非字符串项丢弃,
     免得一条脏数据顺着种子消息喂进子代的 prompt。"""
     ctx = _build_tool_context(
-        {"configurable": {"turn_attachments": ["uploads/a.docx", None, 7, "", {"x": 1}]}}
+        {"configurable": {"turn_documents": ["uploads/a.docx", None, 7, "", {"x": 1}]}}
     )
-    assert ctx.turn_attachments == ("uploads/a.docx",)
+    assert ctx.turn_documents == ("uploads/a.docx",)
 
 
-def test_turn_attachments_ignores_a_non_list_value() -> None:
+def test_turn_documents_ignores_a_non_list_value() -> None:
     assert (
-        _build_tool_context(
-            {"configurable": {"turn_attachments": "uploads/a.docx"}}
-        ).turn_attachments
+        _build_tool_context({"configurable": {"turn_documents": "uploads/a.docx"}}).turn_documents
         == ()
     )

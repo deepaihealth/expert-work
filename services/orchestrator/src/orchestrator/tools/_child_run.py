@@ -39,6 +39,7 @@ from expert_work.runtime.cancellation import (
     RunCancelledError,
 )
 from orchestrator.errors import MaxStepsExceededError
+from orchestrator.multimodal import image_ref_block
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY
 from orchestrator.tools._worker_events import (
@@ -50,7 +51,12 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
-from orchestrator.tools.registry import TURN_ATTACHMENTS_KEY, ToolContext, ToolResult
+from orchestrator.tools.registry import (
+    TURN_DOCUMENTS_KEY,
+    TURN_IMAGE_REFS_KEY,
+    ToolContext,
+    ToolResult,
+)
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -85,33 +91,82 @@ _children_seeded_with_attachments = expert_work_counter(
 )
 
 
-def seed_message_text(task: str, attachments: Sequence[str]) -> str:
-    """The child's seed ``HumanMessage`` — ``task`` plus this turn's attachments.
+#: The ``ask_image`` tool's registered name — a child that has it can be handed
+#: image references as text (J.6 Path B). Kept as a literal rather than imported
+#: from ``tools.vision`` because that module pulls the VL caller machinery in.
+_ASK_IMAGE_TOOL_NAME = "ask_image"
 
-    A child sees *only* this string: no conversation history, so not the
-    ``[file attached: …]`` line the platform put on the user's message. The
-    delegation contract tells the parent to spell out identifiers in ``task``,
-    but that is an instruction, not a guarantee — when the parent forgets, the
-    child is left picking a file out of a shared workspace that also holds
-    everything the user uploaded in earlier turns. Appending the paths here
-    makes "the child knows what this turn is about" structural.
 
-    Appended *after* ``task`` and stated as context, not as an override: when
-    the parent did name a file, its instruction still reads first and stays
-    authoritative. The last line only covers the case where the task named
-    nothing at all.
+def child_can_ask_image(child: BuiltAgent) -> bool:
+    """Does ``child``'s build actually carry the ``ask_image`` tool?
+
+    ``ask_image`` is *implicit* — it never appears in the manifest's ``tools:``
+    list, it is registered from the ``vision:`` block and only when the child's
+    own model is not natively multimodal. A worker's model can be overridden
+    (``dynamic_workers.model``), so the parent's answer to this question is not
+    the child's. Read the child's own registry projection instead.
     """
-    if not attachments:
-        return task
-    listed = "\n".join(f"- {ref}" for ref in attachments)
-    return (
-        f"{task}\n\n"
-        "[attachments] The user attached these files to the current turn — "
-        "workspace paths, readable as-is:\n"
-        f"{listed}\n"
-        "If the task above does not say which file to work on, these are it. "
-        "Do not substitute a different workspace file because its name looks similar."
-    )
+    return any(entry.name == _ASK_IMAGE_TOOL_NAME for entry in child.tool_catalog)
+
+
+def build_seed_content(
+    task: str,
+    *,
+    documents: Sequence[str] = (),
+    image_refs: Sequence[str] = (),
+    supports_vision: bool = False,
+    can_ask_image: bool = False,
+) -> str | list[str | dict[Any, Any]]:
+    """The child's seed ``HumanMessage`` content — ``task`` plus this turn's
+    attachments, delivered by whichever mechanism the *child* can actually use.
+
+    A child sees only this message: no conversation history, so neither the
+    ``[file attached: …]`` line nor the images the platform put on the user's
+    message. The delegation contract tells the parent to spell out identifiers
+    in ``task``, but that is an instruction, not a guarantee — when the parent
+    forgets, the child is left picking a file out of a shared workspace that
+    also holds everything the user uploaded in earlier turns. Putting the
+    attachments here makes "the child knows what this turn is about" structural.
+
+    Attachments come *after* ``task`` and read as context, not as an override:
+    when the parent did name a file, its instruction still comes first and stays
+    authoritative. The closing line only covers a task that named nothing.
+
+    Images are routed on the **child's** capabilities, which need not match the
+    parent's (``dynamic_workers.model`` may swap the worker's model):
+
+    * ``supports_vision`` → emit ``image_ref`` blocks; the provider resolves
+      them to real image content at call time (J.6 Path A). This is the only
+      mechanism such a child has — it has no ``ask_image``, and a bare URI in
+      the text would be a string it cannot act on.
+    * ``can_ask_image`` → list the URIs as text for it to pass to ``ask_image``
+      (J.6 Path B). Cheap: the bytes never enter its context.
+    * neither → say nothing about images. The child can neither see them nor
+      ask about them; naming them would only invite it to invent an answer.
+    """
+    text = task
+    if documents:
+        listed = "\n".join(f"- {ref}" for ref in documents)
+        text += (
+            "\n\n[attachments] The user attached these files to the current turn — "
+            "workspace paths, readable as-is:\n"
+            f"{listed}\n"
+            "If the task above does not say which file to work on, these are it. "
+            "Do not substitute a different workspace file because its name looks similar."
+        )
+    if image_refs and not supports_vision and can_ask_image:
+        listed = "\n".join(f"- {ref}" for ref in image_refs)
+        text += (
+            "\n\n[images] The user attached these images to the current turn. "
+            "You cannot see them directly — pass one of these references to the "
+            "ask_image tool to ask a specific question about it:\n"
+            f"{listed}"
+        )
+    if image_refs and supports_vision:
+        blocks: list[str | dict[Any, Any]] = [{"type": "text", "text": text}]
+        blocks.extend(image_ref_block(ref) for ref in image_refs)
+        return blocks
+    return text
 
 
 async def run_child_to_result(
@@ -142,7 +197,13 @@ async def run_child_to_result(
     sub_thread_id = uuid4()
     sub_run_id = uuid4()
     child_config = _child_config(ctx, sub_thread_id=sub_thread_id, sub_run_id=sub_run_id)
-    seed = seed_message_text(task, ctx.turn_attachments)
+    seed = build_seed_content(
+        task,
+        documents=ctx.turn_documents,
+        image_refs=ctx.turn_image_refs,
+        supports_vision=child.supports_vision,
+        can_ask_image=child_can_ask_image(child),
+    )
     if seed is not task:
         _children_seeded_with_attachments.inc()
     child_input: dict[str, Any] = {
@@ -627,6 +688,8 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         configurable[DELEGATION_GATE_KEY] = ctx.delegation_gate
     # 本轮附件继续往下传:一个 worker 再派孙 worker 时,孙代同样看不到本对话,
     # 而它干的还是同一轮用户交办的活 —— 断在这里等于深一层就退回原来的猜。
-    if ctx.turn_attachments:
-        configurable[TURN_ATTACHMENTS_KEY] = list(ctx.turn_attachments)
+    if ctx.turn_documents:
+        configurable[TURN_DOCUMENTS_KEY] = list(ctx.turn_documents)
+    if ctx.turn_image_refs:
+        configurable[TURN_IMAGE_REFS_KEY] = list(ctx.turn_image_refs)
     return {"configurable": configurable}

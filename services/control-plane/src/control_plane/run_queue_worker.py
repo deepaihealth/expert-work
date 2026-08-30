@@ -52,7 +52,7 @@ from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import AgentFactoryError, run_agent
-from orchestrator.tools import TURN_ATTACHMENTS_KEY
+from orchestrator.tools import TURN_DOCUMENTS_KEY, TURN_IMAGE_REFS_KEY
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -313,10 +313,11 @@ class RunQueueWorker:
 
             payload = run.enqueued_input or {}
             document_names = list(payload.get("document_names") or [])
+            image_refs = list(payload.get("image_refs") or [])
             graph_input = build_run_graph_input(
                 built,
                 input_text=payload.get("input"),
-                image_refs=list(payload.get("image_refs") or []),
+                image_refs=image_refs,
                 untrusted_content=payload.get("untrusted_content"),
                 inputs=payload.get("inputs") or {},
                 run_id=run.run_id,
@@ -355,7 +356,9 @@ class RunQueueWorker:
             # (见上方 build_run_graph_input 处的注释),这一处漏了同样是静默的:
             # 委派出去的子代只是"少知道一件事",不报错。
             if document_names:
-                configurable[TURN_ATTACHMENTS_KEY] = list(document_names)
+                configurable[TURN_DOCUMENTS_KEY] = list(document_names)
+            if image_refs:
+                configurable[TURN_IMAGE_REFS_KEY] = list(image_refs)
             config: RunnableConfig = {"configurable": configurable}
 
             worker = asyncio.create_task(

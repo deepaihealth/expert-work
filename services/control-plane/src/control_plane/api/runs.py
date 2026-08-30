@@ -105,7 +105,7 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
-from orchestrator.tools import TURN_ATTACHMENTS_KEY
+from orchestrator.tools import TURN_DOCUMENTS_KEY, TURN_IMAGE_REFS_KEY
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -1144,7 +1144,9 @@ async def spawn_run(
     # 本轮附件下传:委派出去的子代看不到本对话,``[file attached: …]`` 那行对它
     # 不存在。同一份清单既进用户消息也进子代种子,来源是这一个 payload 字段。
     if payload.document_names:
-        configurable[TURN_ATTACHMENTS_KEY] = list(payload.document_names)
+        configurable[TURN_DOCUMENTS_KEY] = list(payload.document_names)
+    if payload.image_refs:
+        configurable[TURN_IMAGE_REFS_KEY] = list(payload.image_refs)
     config: RunnableConfig = {"configurable": configurable}
     worker = asyncio.create_task(
         run_agent(
