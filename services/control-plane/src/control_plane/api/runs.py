@@ -105,7 +105,6 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
-from orchestrator.tools import TURN_DOCUMENTS_KEY, TURN_IMAGE_REFS_KEY
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -492,6 +491,11 @@ def build_run_graph_input(
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
+        # 本轮附件 —— 委派时子代从这里拿(它看不到上面那条 HumanMessage)。
+        # **每一轮都写,哪怕是空的**:对话是长线程,省略这两个键时 LangGraph
+        # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
+        "turn_documents": list(document_names or []),
+        "turn_image_refs": list(image_refs),
     }
 
 
@@ -1143,10 +1147,6 @@ async def spawn_run(
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     # 本轮附件下传:委派出去的子代看不到本对话,``[file attached: …]`` 那行对它
     # 不存在。同一份清单既进用户消息也进子代种子,来源是这一个 payload 字段。
-    if payload.document_names:
-        configurable[TURN_DOCUMENTS_KEY] = list(payload.document_names)
-    if payload.image_refs:
-        configurable[TURN_IMAGE_REFS_KEY] = list(payload.image_refs)
     config: RunnableConfig = {"configurable": configurable}
     worker = asyncio.create_task(
         run_agent(

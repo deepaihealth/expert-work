@@ -520,7 +520,7 @@ async def test_claimed_run_carries_document_names_into_delegation_context(
     await asyncio.sleep(0)
 
     assert started == 1
-    assert spawns[0]["config"]["configurable"]["turn_documents"] == ["uploads/report.pdf"]
+    assert spawns[0]["graph_input"]["turn_documents"] == ["uploads/report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -548,7 +548,9 @@ async def test_queued_run_without_attachments_leaves_the_key_out(
     await _worker(store, runtime).run_once()
     await asyncio.sleep(0)
 
-    assert "turn_documents" not in spawns[0]["config"]["configurable"]
+    # 空列表而非省略 —— 理由同 streaming 侧那条。
+    assert spawns[0]["graph_input"]["turn_documents"] == []
+    assert spawns[0]["graph_input"]["turn_image_refs"] == []
 
 
 @pytest.mark.asyncio
@@ -579,4 +581,4 @@ async def test_claimed_run_carries_image_refs_into_delegation_context(
     await _worker(store, runtime).run_once()
     await asyncio.sleep(0)
 
-    assert spawns[0]["config"]["configurable"]["turn_image_refs"] == ["expert_work://image/x"]
+    assert spawns[0]["graph_input"]["turn_image_refs"] == ["expert_work://image/x"]

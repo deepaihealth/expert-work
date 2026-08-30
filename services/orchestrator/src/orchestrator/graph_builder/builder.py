@@ -176,8 +176,6 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
-    TURN_DOCUMENTS_KEY,
-    TURN_IMAGE_REFS_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
@@ -1382,7 +1380,12 @@ def build_react_graph(
                     )
                 }
 
-        ctx_obj = _build_tool_context(config, plan=state.get("plan"))
+        ctx_obj = _build_tool_context(
+            config,
+            plan=state.get("plan"),
+            turn_documents=state.get("turn_documents"),
+            turn_image_refs=state.get("turn_image_refs"),
+        )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
         audit_logger = audit_logger_from_config(config)
@@ -2975,7 +2978,13 @@ def _filter_scheduling_tools(tools: list[ToolSpec], *, trigger_origin: bool) -> 
     return [s for s in tools if s.name != "manage_task"]
 
 
-def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> ToolContext:
+def _build_tool_context(
+    config: RunnableConfig,
+    *,
+    plan: Plan | None = None,
+    turn_documents: list[str] | None = None,
+    turn_image_refs: list[str] | None = None,
+) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
     M0 dev / unit tests rarely supply tenant_id, and per-tenant tools
@@ -3022,10 +3031,11 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
     # 产物清单契约 —— per-run 产物记录器(镜像同一读取惯例)。
     rec_raw = configurable.get(ARTIFACT_RECORDER_KEY)
     artifact_recorder = rec_raw if callable(rec_raw) else None
-    # 本轮用户附件 —— 委派时结构性地进子代的种子消息。文档与图片走同一段清洗:
-    # 两个 key 都一路从 HTTP 载荷传下来,不是进程内对象,非字符串项一律丢弃。
-    turn_documents = _string_list(configurable.get(TURN_DOCUMENTS_KEY))
-    turn_image_refs = _string_list(configurable.get(TURN_IMAGE_REFS_KEY))
+    # 本轮用户附件走 ``AgentState`` 通道(见 ``AgentState.turn_documents``),
+    # 所以审批续跑 / orphan 复活这类 ``graph_input=None`` 的续跑靠检查点就带回来了。
+    # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
+    docs = _string_list(turn_documents)
+    images = _string_list(turn_image_refs)
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3042,8 +3052,8 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
         token_budget=tb_raw if isinstance(tb_raw, TokenBudget) else None,
         guard_sink=guard_raw if callable(guard_raw) else None,
         artifact_recorder=artifact_recorder,
-        turn_documents=turn_documents,
-        turn_image_refs=turn_image_refs,
+        turn_documents=docs,
+        turn_image_refs=images,
     )
 
 

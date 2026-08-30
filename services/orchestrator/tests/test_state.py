@@ -17,12 +17,18 @@ def test_required_keys_present() -> None:
     HX-12 ``promoted_tool_last_used``, CM-0 ``last_projection_hash``,
     CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``,
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
-    / ``plan_first_dispatch_retries``(last seventeen ``NotRequired``)."""
+    / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
+    ``turn_image_refs``(last nineteen ``NotRequired``)。
+
+    ``turn_*`` 放在 state 而不是 config,是为了让检查点在
+    ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
     annotations = inspect.get_annotations(AgentState)
     assert set(annotations) == {
         "messages",
         "step_count",
         "max_steps",
+        "turn_documents",
+        "turn_image_refs",
         "plan",
         "reflections",
         "recalled_memories",

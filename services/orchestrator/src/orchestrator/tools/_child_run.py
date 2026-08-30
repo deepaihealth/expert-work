@@ -51,12 +51,7 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
-from orchestrator.tools.registry import (
-    TURN_DOCUMENTS_KEY,
-    TURN_IMAGE_REFS_KEY,
-    ToolContext,
-    ToolResult,
-)
+from orchestrator.tools.registry import ToolContext, ToolResult
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -214,6 +209,10 @@ async def run_child_to_result(
         "step_count": 0,
         "max_steps": child.max_steps,
         "max_no_progress": child.max_no_progress,
+        # 附件继续往下传:孙代同样不继承对话,而它干的还是同一轮用户交办的活 ——
+        # 断在这里等于深一层就退回原来的猜。走 state 通道,与本 run 同一机制。
+        "turn_documents": list(ctx.turn_documents),
+        "turn_image_refs": list(ctx.turn_image_refs),
     }
 
     started_at = datetime.now(UTC)
@@ -688,8 +687,4 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         configurable[DELEGATION_GATE_KEY] = ctx.delegation_gate
     # 本轮附件继续往下传:一个 worker 再派孙 worker 时,孙代同样看不到本对话,
     # 而它干的还是同一轮用户交办的活 —— 断在这里等于深一层就退回原来的猜。
-    if ctx.turn_documents:
-        configurable[TURN_DOCUMENTS_KEY] = list(ctx.turn_documents)
-    if ctx.turn_image_refs:
-        configurable[TURN_IMAGE_REFS_KEY] = list(ctx.turn_image_refs)
     return {"configurable": configurable}

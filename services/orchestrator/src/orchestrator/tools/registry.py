@@ -170,22 +170,6 @@ class ToolCatalogEntry:
     deferred: bool
 
 
-#: ``config["configurable"]`` keys carrying this turn's attachments (each a
-#: ``list[str]``) into the graph, where ``_tool_context`` reads them onto
-#: :attr:`ToolContext.turn_documents` / :attr:`ToolContext.turn_image_refs`.
-#: Set by the run-spawn entry points that actually carry a new user turn (the
-#: streaming and queued run paths); absent on the resume / orphan-revival /
-#: trigger paths, which have no new turn of their own.
-#:
-#: Documents and images stay two keys rather than one bag: they reach a child
-#: through different mechanisms (a workspace path it reads with
-#: ``read_document`` vs. an image the model or ``ask_image`` must be handed),
-#: and the choice of mechanism depends on the child's own model. Merging them
-#: would only force the split again one layer down.
-TURN_DOCUMENTS_KEY = "turn_documents"
-TURN_IMAGE_REFS_KEY = "turn_image_refs"
-
-
 @dataclass(frozen=True)
 class ToolContext:
     """Per-invocation context threaded from the ReAct ``tools`` node.

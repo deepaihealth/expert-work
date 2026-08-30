@@ -2372,7 +2372,7 @@ async def test_stream_run_carries_document_names_into_delegation_context(
         await response.aread()
 
     assert len(captured) == 1
-    assert captured[0]["config"]["configurable"]["turn_documents"] == ["uploads/report.pdf"]
+    assert captured[0]["graph_input"]["turn_documents"] == ["uploads/report.pdf"]
 
 
 @pytest.mark.asyncio
@@ -2393,7 +2393,10 @@ async def test_stream_run_without_attachments_leaves_the_key_out(
     await _seed_completed_run(runs_client)
 
     assert len(captured) == 1
-    assert "turn_documents" not in captured[0]["config"]["configurable"]
+    # 没有附件时写的是**空列表**,不是省略这个键 —— 对话是长线程,省略会让
+    # LangGraph 保留检查点里上一轮的值,把上轮附件漏进这一轮的子代。
+    assert captured[0]["graph_input"]["turn_documents"] == []
+    assert captured[0]["graph_input"]["turn_image_refs"] == []
 
 
 @pytest.mark.asyncio
@@ -2432,4 +2435,4 @@ async def test_stream_run_carries_image_refs_into_delegation_context(
         assert response.status_code == 200
         await response.aread()
 
-    assert captured[0]["config"]["configurable"]["turn_image_refs"] == [ref]
+    assert captured[0]["graph_input"]["turn_image_refs"] == [ref]
