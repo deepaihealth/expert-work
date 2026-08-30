@@ -155,15 +155,21 @@ export interface ManifestPayload {
 /** PUT /v1/agents/{name}/{version} — in-place spec update. The
  *  ``manifest_yaml`` metadata block MUST match the path's ``name`` and
  *  ``version`` or the server rejects with ``MANIFEST_PATH_MISMATCH``
- *  (422). */
+ *  (422).
+ *
+ *  ``ifMatch`` 是**必填**的:传编辑时读到的 ``record.spec_sha256``。它是并发
+ *  编辑保护 —— 不传后端 428,和当前值对不上后端 409 ``MANIFEST_STALE_WRITE``
+ *  (这一版在你编辑期间被别人改过,再写就会盖掉对方)。 */
 export async function updateAgent(
   name: string,
   version: string,
   payload: ManifestPayload,
+  ifMatch: string,
 ): Promise<AgentDetailResponse> {
   return putJson<AgentDetailResponse>(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}`,
     payload,
+    { headers: { "If-Match": ifMatch } },
   );
 }
 

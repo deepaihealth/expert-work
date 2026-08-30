@@ -99,24 +99,37 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
     setError(null);
     setBuildWarning(null);
     try {
-      const saved = await updateAgent(r.name, r.version, { manifest_yaml: buffer });
+      // 传编辑时读到的 sha:这一版在期间被别人改过就 409,不会静默盖掉对方。
+      const saved = await updateAgent(
+        r.name,
+        r.version,
+        { manifest_yaml: buffer },
+        r.spec_sha256,
+      );
       // 存下来了,但这个部署还跑不了它(缺 provider 凭据 / 缺 embedding)。
       // 后端不拒这类保存 —— 作者改不了平台状态 —— 所以「绿灯 ≠ 能跑」这件事
       // 只能靠这里说出来。
       setBuildWarning(saved.build_warning ?? null);
       onSaved();
     } catch (err) {
-      const message =
-        err instanceof ApiError
-          ? `${err.code}: ${err.message}`
-          : err instanceof Error
-            ? err.message
-            : "unknown error";
-      setError(message);
+      // 409 = 别人在你编辑期间改过这一版。这不是「保存失败」那种技术错误,
+      // 而是一条要人做决定的消息(去看对方改了什么,再决定怎么合),所以给
+      // 它自己的文案而不是抛出后端原文。
+      if (err instanceof ApiError && err.code === "MANIFEST_STALE_WRITE") {
+        setError(t("manifest_tab.stale_write"));
+      } else {
+        const message =
+          err instanceof ApiError
+            ? `${err.code}: ${err.message}`
+            : err instanceof Error
+              ? err.message
+              : "unknown error";
+        setError(message);
+      }
     } finally {
       setSaving(false);
     }
-  }, [buffer, r.name, r.version, onSaved]);
+  }, [buffer, r.name, r.version, r.spec_sha256, onSaved, t]);
 
   return (
     <Card data-testid="manifest-tab">

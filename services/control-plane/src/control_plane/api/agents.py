@@ -95,6 +95,7 @@ from expert_work.common.observability import (
 from expert_work.common.uplift_metrics import (
     record_manifest_build_check,
     record_manifest_provider_rejected,
+    record_manifest_stale_write,
 )
 from expert_work.persistence import ApprovalStore, TriggerStore
 from expert_work.persistence.agent_disable import AgentDisableStore
@@ -753,6 +754,64 @@ class AgentDisableRequest(BaseModel):
     @classmethod
     def _no_nul_reason(cls, value: str | None) -> str | None:
         return value if value is None else reject_nul(value, field="reason")
+
+
+def _reject_stale_write(
+    *,
+    if_match: str | None,
+    current_sha: str,
+) -> JSONResponse | None:
+    """Optimistic concurrency for an in-place manifest edit.
+
+    Two people with the config page open both save; the second write silently
+    replaces the first, with no indication to either of them. The revision
+    history keeps the overwritten content, so it is recoverable — but only if
+    someone notices, and nothing tells them to look.
+
+    ``If-Match`` carries the ``spec_sha256`` the editor loaded. It is
+    **required**, not optional: this endpoint is console-only and the console
+    is its only caller, so there is no external contract to break — and an
+    optional safety check is one somebody eventually forgets, which puts the
+    silent overwrite right back.
+
+    409 rather than the RFC's 412 for the mismatch: every other "your write
+    lost a race" in this API (duplicate manifest, resume idempotency) is a 409,
+    and one consistent vocabulary is worth more here than the finer status
+    code. 428 for the missing header is the RFC 6585 case exactly.
+
+    Nothing is logged here on purpose: the caller emits a ``MANIFEST_WRITE``
+    audit record for both refusals, carrying the same resource plus the actor,
+    tenant and trace id. A second copy in the application log would only add a
+    path-derived agent name to a logging sink — ``AgentMetadata.name`` has no
+    character constraint, so that is a log-injection sink (CodeQL
+    ``py/log-injection``) for no information the audit trail lacks.
+
+    Returns the ready-to-send error, or ``None`` when the write may proceed.
+    """
+    if if_match is None:
+        record_manifest_stale_write(outcome="missing_header")
+        return _envelope_error(
+            "MANIFEST_IF_MATCH_REQUIRED",
+            "If-Match is required on a manifest update — send the spec_sha256 "
+            "you loaded, so a concurrent edit cannot be silently overwritten",
+            428,
+        )
+    # HTTP ETag syntax quotes the value (and may weaken it with ``W/``); the
+    # console sends the bare sha. Accept both rather than fail a caller who
+    # followed the spec.
+    candidate = if_match.strip()
+    if candidate.startswith("W/"):
+        candidate = candidate[2:].strip()
+    candidate = candidate.strip('"')
+    if candidate != current_sha:
+        record_manifest_stale_write(outcome="conflict")
+        return _envelope_error(
+            "MANIFEST_STALE_WRITE",
+            "this manifest changed since you loaded it — reload and reapply "
+            "your edit so the other change is not lost",
+            409,
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -1779,6 +1838,7 @@ def build_agents_router() -> APIRouter:
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         loader: Annotated[ManifestLoader, Depends(_get_loader)],
+        if_match: Annotated[str | None, Header(alias="If-Match")] = None,
     ) -> JSONResponse:
         tenant_id = request.state.tenant_id
         actor_id = request.state.actor_id
@@ -1804,6 +1864,25 @@ def build_agents_router() -> APIRouter:
         await ensure_resource_access(
             request, resource="manifest", action="write", attrs=_record_attrs(existing)
         )
+
+        # 乐观并发。放在构建校验**之前**:一次注定要被拒的写入不该先付构建的钱。
+        stale = _reject_stale_write(
+            if_match=if_match,
+            current_sha=existing.spec_sha256,
+        )
+        if stale is not None:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                action=AuditAction.MANIFEST_WRITE,
+                resource_type="manifest",
+                resource_id=f"{name}/{version}",
+                result=AuditResult.DENIED,
+                reason="stale_write" if if_match else "if_match_required",
+                trace_id=trace_id,
+            )
+            return stale
 
         # 同 create:建不出来就不落库。注意这条**不会**把人锁在门外 —— 判的是
         # 正在保存的这一版,所以「把坏配置改好」的那次保存照样通过。

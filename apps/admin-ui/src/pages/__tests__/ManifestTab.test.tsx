@@ -165,7 +165,12 @@ describe("ManifestTab", () => {
     await user.type(ta, "edited: yaml");
     await user.click(screen.getByTestId("manifest-save-btn"));
     await waitFor(() =>
-      expect(updateAgentMock).toHaveBeenCalledWith("demo-agent", "1.0.0", { manifest_yaml: "edited: yaml" }),
+      expect(updateAgentMock).toHaveBeenCalledWith(
+        "demo-agent",
+        "1.0.0",
+        { manifest_yaml: "edited: yaml" },
+        sampleDetail.record.spec_sha256,
+      ),
     );
     expect(onSaved).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("manifest-editor-edit")).toBeInTheDocument();
@@ -201,6 +206,35 @@ describe("ManifestTab", () => {
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId("manifest-build-warning")).not.toBeInTheDocument();
+  });
+
+  it("sends the loaded sha as If-Match so a concurrent edit cannot be clobbered", async () => {
+    const user = userEvent.setup();
+    updateAgentMock.mockResolvedValue(sampleDetail);
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    await waitFor(() => expect(updateAgentMock).toHaveBeenCalled());
+    // 第 4 个实参就是编辑时读到的那一版的 sha。
+    expect(updateAgentMock.mock.calls[0][3]).toBe(sampleDetail.record.spec_sha256);
+  });
+
+  it("explains a concurrent edit instead of dumping the raw error code", async () => {
+    // 409 不是「保存失败」那种技术错误,而是一条要人做决定的消息:去看对方
+    // 改了什么,再决定怎么合。
+    const user = userEvent.setup();
+    updateAgentMock.mockRejectedValue(
+      new ApiError("this manifest changed since you loaded it", "MANIFEST_STALE_WRITE", 409),
+    );
+    renderTab();
+    await screen.findByTestId("manifest-editor-edit");
+    await user.click(screen.getByTestId("manifest-save-btn"));
+
+    const alert = await screen.findByTestId("manifest-error");
+    expect(alert).toHaveTextContent("Someone else changed this config");
+    expect(alert).not.toHaveTextContent("MANIFEST_STALE_WRITE");
+    expect(onSaved).not.toHaveBeenCalled();
   });
 
   it("surfaces an error alert when updateAgent rejects", async () => {

@@ -287,6 +287,15 @@ _manifest_provider_rejected_total = expert_work_counter(
     label_names=("provider",),
 )
 
+_manifest_stale_write_total = expert_work_counter(
+    "expert_work_uplift_manifest_stale_write_total",
+    "Agent-manifest updates refused by the If-Match optimistic-concurrency "
+    "check. ``conflict`` is a genuine concurrent edit the caller would "
+    "otherwise have silently overwritten; ``missing_header`` is a caller that "
+    "did not send the precondition at all.",
+    label_names=("outcome",),
+)
+
 _manifest_build_check_total = expert_work_counter(
     "expert_work_uplift_manifest_build_check_total",
     "Save-time dry-run builds of an agent manifest, by outcome. ``rejected`` "
@@ -636,6 +645,13 @@ def record_manifest_provider_rejected(*, provider: str) -> None:
     _manifest_provider_rejected_total.labels(provider=provider).inc()
 
 
+def record_manifest_stale_write(*, outcome: str) -> None:
+    """Bump ``expert_work_uplift_manifest_stale_write_total{outcome}``.
+
+    ``outcome`` ∈ ``{"missing_header", "conflict"}``."""
+    _manifest_stale_write_total.labels(outcome=outcome).inc()
+
+
 def record_manifest_build_check(*, outcome: str) -> None:
     """Bump ``expert_work_uplift_manifest_build_check_total{outcome}``.
 
@@ -668,6 +684,7 @@ __all__ = [
     "record_legacy_credentials_fallback",
     "record_manifest_build_check",
     "record_manifest_provider_rejected",
+    "record_manifest_stale_write",
     "record_mcp_call",
     "record_mcp_circuit_state",
     "record_memory_blocked",

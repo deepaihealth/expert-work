@@ -64,6 +64,21 @@ _JINJA_YAML = _VALID_YAML.replace(
 )
 
 
+async def _put_manifest(client, name: str, version: str, manifest_yaml: str):
+    """PUT 一版 manifest,带上当前的 ``If-Match``。
+
+    更新是必须带前置条件的(并发编辑保护),而这些用例验的不是并发 —— 所以
+    先读一次当前 sha 再写,正是控制台自己的做法。
+    """
+    current = await client.get(f"/v1/agents/{name}/{version}")
+    sha = current.json()["data"]["record"]["spec_sha256"]
+    return await client.put(
+        f"/v1/agents/{name}/{version}",
+        json={"manifest_yaml": manifest_yaml},
+        headers={"If-Match": sha},
+    )
+
+
 @pytest.fixture
 def audit_store() -> InMemoryAuditLogStore:
     return InMemoryAuditLogStore()
@@ -223,10 +238,7 @@ async def test_put_replaces_spec(b5_client: AsyncClient) -> None:
         'template: "you are a reviewer"',
         'template: "you are a senior reviewer"',
     )
-    response = await b5_client.put(
-        "/v1/agents/code-reviewer/1.0.0",
-        json={"manifest_yaml": updated_yaml},
-    )
+    response = await _put_manifest(b5_client, "code-reviewer", "1.0.0", updated_yaml)
     assert response.status_code == 200
     spec = response.json()["data"]["record"]["spec"]["spec"]["system_prompt"]["template"]
     assert spec == "you are a senior reviewer"
@@ -305,7 +317,7 @@ _UPDATED_YAML = _VALID_YAML.replace("you are a reviewer", "you are a strict revi
 @pytest.mark.asyncio
 async def test_revisions_list_and_get_snapshot(b5_client: AsyncClient) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    await b5_client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _UPDATED_YAML})
+    await _put_manifest(b5_client, "code-reviewer", "1.0.0", _UPDATED_YAML)
 
     listing = await b5_client.get("/v1/agents/code-reviewer/1.0.0/revisions")
     assert listing.status_code == 200
@@ -332,7 +344,7 @@ async def test_rollback_appends_revision_with_old_content(
     b5_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    await b5_client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _UPDATED_YAML})
+    await _put_manifest(b5_client, "code-reviewer", "1.0.0", _UPDATED_YAML)
 
     response = await b5_client.post("/v1/agents/code-reviewer/1.0.0/revisions/1/rollback")
     assert response.status_code == 200
@@ -390,7 +402,7 @@ async def test_rollback_needs_manifest_write_while_the_reads_stay_open(
     both halves; a bare ``console_only()`` on all five would satisfy only one.
     """
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    await b5_client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _UPDATED_YAML})
+    await _put_manifest(b5_client, "code-reviewer", "1.0.0", _UPDATED_YAML)
 
     viewer = {
         "Authorization": "Bearer "
@@ -485,7 +497,7 @@ async def test_put_invalidates_runtime_build_cache(
     key = _seed_build_cache(app)
 
     updated = _VALID_YAML.replace("you are a reviewer", "you are a strict reviewer")
-    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": updated})
+    resp = await _put_manifest(client, "code-reviewer", "1.0.0", updated)
     assert resp.status_code == 200
     # Stale build evicted → the next run rebuilds from the edited spec.
     assert key not in app.state.agent_runtime._cache  # type: ignore[attr-defined]
@@ -497,7 +509,7 @@ async def test_rollback_invalidates_runtime_build_cache(
 ) -> None:
     app, client = b5_app_client
     await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _UPDATED_YAML})
+    await _put_manifest(client, "code-reviewer", "1.0.0", _UPDATED_YAML)
     key = _seed_build_cache(app)
 
     resp = await client.post("/v1/agents/code-reviewer/1.0.0/revisions/1/rollback")
@@ -878,6 +890,11 @@ async def test_agent_detail_tenant_id_star_400(
 # ---------------------------------------------------------------------------
 
 
+async def _ok_builder(spec, *, tenant_id=None, user_id=None):
+    """构建永远成功 —— 这批用例验的是并发,不是构建闸。"""
+    return object()
+
+
 def _builder_raising(exc: Exception):
     async def _boom(spec, *, tenant_id=None, user_id=None):
         raise exc
@@ -915,7 +932,7 @@ async def test_update_rejects_and_leaves_the_stored_version_untouched(
         AgentFactoryError("sub-agent delegation cycle detected: a -> b -> a")
     )
 
-    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
+    resp = await _put_manifest(client, "code-reviewer", "1.0.0", _JINJA_YAML)
     assert resp.status_code == 422, resp.text
     assert resp.json()["error"]["code"] == "MANIFEST_UNBUILDABLE"
 
@@ -969,10 +986,96 @@ async def test_rollback_is_not_gated_by_the_build_check(
     """
     app, client = b5_app_client
     await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
+    await _put_manifest(client, "code-reviewer", "1.0.0", _JINJA_YAML)
     app.state.agent_runtime.agent_builder = _builder_raising(  # type: ignore[attr-defined]
         AgentFactoryError("whatever is broken right now")
     )
 
     resp = await client.post("/v1/agents/code-reviewer/1.0.0/revisions/1/rollback")
+    assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# 并发编辑:If-Match 乐观锁
+#
+# 两个人同时开着配置页,后点保存的会静默盖掉前一个 —— 当场没有任何提示。
+# 历史表里留了档能回滚,但你得先意识到被盖了。
+#
+# 必填而不是选填:这个端点是 console-only,唯一调用方就是控制台,没有对外
+# 契约要破;而选填的安全闸总有人忘,忘了就退回静默覆盖。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_without_if_match_is_refused(b5_app_client) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+
+    resp = await client.put("/v1/agents/code-reviewer/1.0.0", json={"manifest_yaml": _JINJA_YAML})
+    assert resp.status_code == 428, resp.text
+    assert resp.json()["error"]["code"] == "MANIFEST_IF_MATCH_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_update_with_a_stale_if_match_is_a_conflict(b5_app_client) -> None:
+    """B 拿着 A 保存前的版本去写 —— 必须撞墙,不能静默盖掉 A。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    created = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    both_loaded = created.json()["data"]["record"]["spec_sha256"]
+
+    # A 先保存成功。
+    first = await client.put(
+        "/v1/agents/code-reviewer/1.0.0",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": both_loaded},
+    )
+    assert first.status_code == 200, first.text
+
+    # B 手里还是打开页面时那个 sha。
+    second = await client.put(
+        "/v1/agents/code-reviewer/1.0.0",
+        json={"manifest_yaml": _VALID_YAML},
+        headers={"If-Match": both_loaded},
+    )
+    assert second.status_code == 409, second.text
+    assert second.json()["error"]["code"] == "MANIFEST_STALE_WRITE"
+
+    # A 的那一版还在,没被 B 盖掉。
+    detail = await client.get("/v1/agents/code-reviewer/1.0.0")
+    assert (
+        detail.json()["data"]["record"]["spec_sha256"]
+        == first.json()["data"]["record"]["spec_sha256"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_with_a_current_if_match_succeeds(b5_app_client) -> None:
+    """反向:锁不能把正常保存也拦了。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    created = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+
+    resp = await client.put(
+        "/v1/agents/code-reviewer/1.0.0",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": created.json()["data"]["record"]["spec_sha256"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_update_accepts_a_quoted_etag(b5_app_client) -> None:
+    """HTTP 的 ETag 语法带引号。curl 用户照标准写不该被当成不匹配。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    created = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    sha = created.json()["data"]["record"]["spec_sha256"]
+
+    resp = await client.put(
+        "/v1/agents/code-reviewer/1.0.0",
+        json={"manifest_yaml": _JINJA_YAML},
+        headers={"If-Match": f'"{sha}"'},
+    )
     assert resp.status_code == 200, resp.text

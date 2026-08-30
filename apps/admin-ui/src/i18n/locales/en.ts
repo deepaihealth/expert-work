@@ -580,6 +580,7 @@ export interface TranslationKeys {
     reset: string;
     save_failed: string;
     saved_but_not_runnable: string;
+    stale_write: string;
   };
   manifest_editor: {
     tab_basic: string;
@@ -3717,6 +3718,8 @@ const en: TranslationKeys = {
     save_failed: "Failed to save manifest",
     saved_but_not_runnable:
       "Saved — but this deployment cannot run it yet. Nothing is wrong with the config; something it depends on is not set up on the platform side:",
+    stale_write:
+      "Someone else changed this config while you had it open. Nothing was saved, and their change is intact. Reload to see it, then reapply your edit.",
   },
   manifest_editor: {
     tab_basic: "Basics",
