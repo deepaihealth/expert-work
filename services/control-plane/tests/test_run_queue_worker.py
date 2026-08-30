@@ -482,3 +482,101 @@ async def test_execute_records_the_manifest_version_it_actually_built(
     info = await store.get(run_id=run_id, tenant_id=tenant)
     assert info is not None
     assert info.agent_spec_sha256 == compute_spec_sha256(_SPEC)
+
+
+@pytest.mark.asyncio
+async def test_claimed_run_carries_document_names_into_delegation_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """委派出去的子代不继承对话,看不到 ``[file attached: …]``,所以本轮附件必须
+    另走 ``config["configurable"]``。
+
+    与上一条是两件事:上一条证明附件到达了**本 run 的 HumanMessage**,这条证明
+    它也到达了**子代的种子消息**。queue 这一处此前已经漏过一次同源的静默回读
+    (见上),而漏这一处同样不报错 —— 子代只是"少知道一件事"。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "总结这份文件",
+            "image_refs": [],
+            "untrusted_content": [],
+            "document_names": ["uploads/report.pdf"],
+        },
+    )
+
+    started = await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert started == 1
+    assert spawns[0]["config"]["configurable"]["turn_documents"] == ["uploads/report.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_queued_run_without_attachments_leaves_the_key_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有附件就不要往 config 里塞空列表 —— 空值和"这一轮没有附件"是同一件事,
+    多一个键只会让下游多一条要判空的路径。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    await runtime.run_manager.enqueue(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        enqueued_input={"input": "在吗", "image_refs": [], "untrusted_content": []},
+    )
+
+    await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert "turn_documents" not in spawns[0]["config"]["configurable"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_run_carries_image_refs_into_delegation_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """queue 侧图片同理 —— 与 document_names 分属两个 key,各自可能被漏。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    await runtime.run_manager.enqueue(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        enqueued_input={
+            "input": "看看这张图",
+            "image_refs": ["expert_work://image/x"],
+            "untrusted_content": [],
+        },
+    )
+
+    await _worker(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert spawns[0]["config"]["configurable"]["turn_image_refs"] == ["expert_work://image/x"]

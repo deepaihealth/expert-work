@@ -176,6 +176,8 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
+    TURN_DOCUMENTS_KEY,
+    TURN_IMAGE_REFS_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
@@ -3020,6 +3022,10 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
     # 产物清单契约 —— per-run 产物记录器(镜像同一读取惯例)。
     rec_raw = configurable.get(ARTIFACT_RECORDER_KEY)
     artifact_recorder = rec_raw if callable(rec_raw) else None
+    # 本轮用户附件 —— 委派时结构性地进子代的种子消息。文档与图片走同一段清洗:
+    # 两个 key 都一路从 HTTP 载荷传下来,不是进程内对象,非字符串项一律丢弃。
+    turn_documents = _string_list(configurable.get(TURN_DOCUMENTS_KEY))
+    turn_image_refs = _string_list(configurable.get(TURN_IMAGE_REFS_KEY))
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3036,7 +3042,16 @@ def _build_tool_context(config: RunnableConfig, *, plan: Plan | None = None) -> 
         token_budget=tb_raw if isinstance(tb_raw, TokenBudget) else None,
         guard_sink=guard_raw if callable(guard_raw) else None,
         artifact_recorder=artifact_recorder,
+        turn_documents=turn_documents,
+        turn_image_refs=turn_image_refs,
     )
+
+
+def _string_list(raw: object) -> tuple[str, ...]:
+    """Non-empty strings out of an untrusted config value; anything else → ``()``."""
+    if not isinstance(raw, list | tuple):
+        return ()
+    return tuple(x for x in raw if isinstance(x, str) and x)
 
 
 def _parse_uuid(raw: object) -> UUID | None:

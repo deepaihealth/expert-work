@@ -52,6 +52,7 @@ from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools import TURN_DOCUMENTS_KEY, TURN_IMAGE_REFS_KEY
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -311,10 +312,12 @@ class RunQueueWorker:
             )
 
             payload = run.enqueued_input or {}
+            document_names = list(payload.get("document_names") or [])
+            image_refs = list(payload.get("image_refs") or [])
             graph_input = build_run_graph_input(
                 built,
                 input_text=payload.get("input"),
-                image_refs=list(payload.get("image_refs") or []),
+                image_refs=image_refs,
                 untrusted_content=payload.get("untrusted_content"),
                 inputs=payload.get("inputs") or {},
                 run_id=run.run_id,
@@ -322,7 +325,7 @@ class RunQueueWorker:
                 # 但漏了这一处回读:enqueued_input 里存了它,重放时却没读
                 # 回来,queue 模式下的文档附件会静默消失。image_refs / inputs
                 # 都在这儿回读,document_names 补齐同一模式。
-                document_names=list(payload.get("document_names") or []),
+                document_names=document_names,
             )
 
             # Adopt the durable run into THIS instance's registry (no new
@@ -348,6 +351,14 @@ class RunQueueWorker:
                 configurable["user_id"] = str(run.user_id)
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+            # 本轮附件下传 —— 和 ``spawn_run`` 同一份来源(``document_names``),
+            # 从 enqueued_input 回读。queue 路径的附件此前有过一次静默消失的前科
+            # (见上方 build_run_graph_input 处的注释),这一处漏了同样是静默的:
+            # 委派出去的子代只是"少知道一件事",不报错。
+            if document_names:
+                configurable[TURN_DOCUMENTS_KEY] = list(document_names)
+            if image_refs:
+                configurable[TURN_IMAGE_REFS_KEY] = list(image_refs)
             config: RunnableConfig = {"configurable": configurable}
 
             worker = asyncio.create_task(

@@ -605,9 +605,14 @@ class VisionSpec(BaseModel):
     (``model.supports_vision`` is ``false``). Presence activates the
     ``ask_image`` tool, which routes image-understanding questions to
     ``model`` — a separate VL model — leaving the main reasoning loop on
-    the strong text model. A ``vision:`` block on a vision-capable agent
-    is rejected at agent-build time: the two J.6 paths are mutually
-    exclusive (see ``docs/streams/STREAM-J-DESIGN.md`` § 13).
+    the strong text model. The two J.6 paths are mutually exclusive, and
+    Path A wins: a ``vision:`` block on a vision-capable agent is **ignored**
+    at agent-build time (``agent_factory`` logs ``vision_block_ignored`` and
+    proceeds), not rejected — the block is commonly a leftover from a
+    text-only model, and refusing to build would lock the author out over a
+    dead config field. Consequence worth knowing: such an agent has no
+    ``ask_image`` tool, so images reach it only as native content blocks
+    (see ``docs/streams/STREAM-J-DESIGN.md`` § 13).
 
     Mini-ADR J-33 (J.6.补强-4) — ``fallbacks`` is the VL-side mirror of
     E.11 LLM Provider Fallback Chain. VL providers (Qwen-VL / GLM-4V)

@@ -170,6 +170,22 @@ class ToolCatalogEntry:
     deferred: bool
 
 
+#: ``config["configurable"]`` keys carrying this turn's attachments (each a
+#: ``list[str]``) into the graph, where ``_tool_context`` reads them onto
+#: :attr:`ToolContext.turn_documents` / :attr:`ToolContext.turn_image_refs`.
+#: Set by the run-spawn entry points that actually carry a new user turn (the
+#: streaming and queued run paths); absent on the resume / orphan-revival /
+#: trigger paths, which have no new turn of their own.
+#:
+#: Documents and images stay two keys rather than one bag: they reach a child
+#: through different mechanisms (a workspace path it reads with
+#: ``read_document`` vs. an image the model or ``ask_image`` must be handed),
+#: and the choice of mechanism depends on the child's own model. Merging them
+#: would only force the split again one layer down.
+TURN_DOCUMENTS_KEY = "turn_documents"
+TURN_IMAGE_REFS_KEY = "turn_image_refs"
+
+
 @dataclass(frozen=True)
 class ToolContext:
     """Per-invocation context threaded from the ReAct ``tools`` node.
@@ -250,6 +266,29 @@ class ToolContext:
     #: ``ARTIFACT_RECORDER_KEY``;``None`` when unwired (tests / eval) —
     #: 登记照常发生,只是本 run 无清单记录。
     artifact_recorder: Callable[[dict[str, Any]], None] | None = None
+    #: 本轮用户上传文档的工作区路径(``uploads/<name>``),按上传顺序。
+    #:
+    #: 委派出去的子代**不继承本对话**——它只看得见 ``task`` 字符串,所以
+    #: ``[file attached: …]`` 那一行它从来看不到。把本轮附件从这里结构性地
+    #: 带进子代的种子消息(见 ``_child_run.build_seed_content``),而不是指望
+    #: 主 Agent 记得把路径抄进 ``task``:真栈上出现过主 Agent 漏抄、worker 只
+    #: 能按文件名在工作区里猜、结果挑中上一轮的历史文档做了一整轮无效分析。
+    #:
+    #: 空元组 = 本轮没有文档,或走的是不带新一轮输入的路径(审批续跑 / orphan
+    #: 复活 / 触发器)——那些路径本来就没有"本轮用户附件"。
+    turn_documents: tuple[str, ...] = ()
+    #: 本轮用户上传图片的 ``expert_work://image/...`` 引用,按上传顺序。
+    #:
+    #: 与文档分开,因为送达子代的机制由**子代自己的模型**决定,而不是父的
+    #: (``dynamic_workers.model`` 可以把 worker 换成另一个模型):
+    #:
+    #: * 子代模型原生多模态 → 引用变成 ``image_ref`` content block 进种子消息,
+    #:   由 provider 在调用前解析成真图(J.6 Path A);
+    #: * 子代模型不看图但继承了 ``vision:`` 块(于是有 ``ask_image``)→ 引用以
+    #:   文本列出,子代拿它调 ``ask_image``(J.6 Path B);
+    #: * 两者都不是 → 不列。子代既没有原生视觉也没有 ``ask_image``,列出来只是
+    #:   给它一串用不上的字符串。
+    turn_image_refs: tuple[str, ...] = ()
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``
