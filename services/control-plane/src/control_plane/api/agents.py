@@ -779,12 +779,14 @@ def _reject_stale_write(
     and one consistent vocabulary is worth more here than the finer status
     code. 428 for the missing header is the RFC 6585 case exactly.
 
-    Nothing is logged here on purpose: the caller emits a ``MANIFEST_WRITE``
-    audit record for both refusals, carrying the same resource plus the actor,
-    tenant and trace id. A second copy in the application log would only add a
-    path-derived agent name to a logging sink — ``AgentMetadata.name`` has no
-    character constraint, so that is a log-injection sink (CodeQL
-    ``py/log-injection``) for no information the audit trail lacks.
+    Nothing is logged here on purpose. Identifying the manifest would mean
+    putting the path-derived agent name into a logging sink, and
+    ``AgentMetadata.name`` carries no character constraint — a name with a
+    newline passes validation, which is a log-injection sink (CodeQL
+    ``py/log-injection``). Callers that want the refusal recorded emit their
+    own audit row instead (``update_agent`` writes ``MANIFEST_WRITE`` /
+    ``DENIED``), where the same value is a stored column rather than a log
+    line.
 
     Returns the ready-to-send error, or ``None`` when the write may proceed.
     """
@@ -1994,7 +1996,6 @@ def build_agents_router() -> APIRouter:
         stale = _reject_stale_write(
             if_match=if_match,
             current_sha=_editing_sha(existing),
-            resource=f"{name}/{version}/draft",
         )
         if stale is not None:
             return stale
@@ -2048,7 +2049,6 @@ def build_agents_router() -> APIRouter:
         stale = _reject_stale_write(
             if_match=if_match,
             current_sha=_editing_sha(existing),
-            resource=f"{name}/{version}/draft",
         )
         if stale is not None:
             return stale
@@ -2105,7 +2105,6 @@ def build_agents_router() -> APIRouter:
         stale = _reject_stale_write(
             if_match=if_match,
             current_sha=existing.spec_sha256,
-            resource=f"{name}/{version}/publish",
         )
         if stale is not None:
             return stale
