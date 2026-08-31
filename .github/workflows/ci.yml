@@ -15,6 +15,56 @@ env:
   UV_VERSION: "0.9.26"
 
 jobs:
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      # "true" = 本次改动碰了文档以外的东西 → 重活照跑。
+      # 只有在能**确定**全部改动都落在纯文档范围内时才置 false;任何算不出来的
+      # 情况(非 PR 事件、拿不到 base、diff 失败)一律 true —— 这道判断的失败方向
+      # 必须是"多跑一次",不能是"静默跳过测试"。
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "push / 非 PR 事件 —— 无条件跑全套"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
+            echo "拿不到 diff —— 保守跑全套"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$files" ]; then
+            echo "零改动 —— 无需跑重活"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "改动文件:"
+          printf '%s\n' "$files"
+          # 纯文档 = 全部落在 docs/ 下,或是仓库根目录的 .md。
+          # 刻意**不**含 .github/(那是 CI 本身)、infra/、任何包内 .md
+          # (ruff 会伸进 markdown 代码块,包内 .md 改动能真把 lint 弄红)。
+          if printf '%s\n' "$files" | grep -qvE '^(docs/.+|[^/]+\.md)$'; then
+            echo "含非文档改动 —— 跑全套"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "纯文档改动 —— 跳过 pytest / integration"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
@@ -79,6 +129,11 @@ jobs:
 
   test:
     name: Test (pytest)
+    needs: changes
+    # 纯文档改动跳过。被 ``if`` 跳过的 job 上报 skipped,而 required status check
+    # 把 skipped 记作通过 —— 与"因 paths 过滤整个 workflow 不触发"不同,后者
+    # 会让必需 check 永不上报、PR 永久 pending。
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Unit-only path; ``integration`` marker (testcontainers Postgres /
     # MinIO / pgbouncer compose) runs in the separate ``test-integration``
@@ -126,6 +181,8 @@ jobs:
 
   test-integration:
     name: Test (integration)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Image pulls on shared runners are bursty; allow this job to fail
     # without gating the PR (until self-hosted runners with warm Docker
