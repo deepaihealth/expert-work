@@ -15,6 +15,8 @@ in the ``Test`` job (Docker daemon required, matching the existing
 from __future__ import annotations
 
 import os
+import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,7 @@ from expert_work.persistence.database import (
     DatabaseConfig,
     create_async_engine_from_config,
 )
+from expert_work.testing import explain_compose_pull_failure
 
 pytestmark = pytest.mark.integration
 
@@ -34,7 +37,7 @@ _INFRA_DIR = Path(__file__).resolve().parents[3] / "infra"
 
 
 @pytest.fixture(scope="module")
-def compose_stack() -> DockerCompose:
+def compose_stack() -> Iterator[DockerCompose]:
     """Bring up postgres + pgbouncer for the module duration.
 
     Pulls images upfront (saves ~30s of timeouts in CI on first run) and
@@ -47,8 +50,19 @@ def compose_stack() -> DockerCompose:
         pull=True,
         wait=True,
     )
-    with stack:
-        yield stack
+    try:
+        with stack:
+            yield stack
+    except subprocess.CalledProcessError as exc:
+        # X-8 余项:pull 挂了要说清是**哪个镜像**。testcontainers 走 check_call,
+        # CalledProcessError 身上没有 output,原样抛出去只剩一句 exit status 1。
+        cmd = exc.cmd if isinstance(exc.cmd, list) else [str(exc.cmd)]
+        if "pull" not in " ".join(cmd):
+            raise
+        pytest.fail(
+            "compose 起栈失败在 pull 这一步 —— 带输出重跑的结果:\n"
+            + explain_compose_pull_failure(_INFRA_DIR)
+        )
 
 
 def _pgbouncer_dsn(stack: DockerCompose) -> str:
