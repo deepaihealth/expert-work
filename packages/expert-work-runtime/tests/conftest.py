@@ -45,6 +45,13 @@ def compose_stack() -> Iterator[DockerCompose]:
     stack = DockerCompose(
         context=str(_INFRA_DIR),
         compose_file_name="docker-compose.yml",
+        # 只要这几个服务 —— 不写就是整份 compose。``pull=True`` 会把默认
+        # profile 的每个镜像都拉一遍(实测四个),包括这条测试压根用不到的
+        # ``mock-upstream``;2026-08-31 那天 integration 连红三次,日志逐字是
+        # ``mock-upstream Pulling`` → ``toomanyrequests: Rate exceeded``。
+        # 每多拉一个用不到的镜像,就多一次踩限流的机会。
+        # 本 fixture 是 session 级共享:minio 两个模块 + postgres 备份模块。
+        services=["postgres", "minio"],
         pull=True,
         wait=True,
     )
