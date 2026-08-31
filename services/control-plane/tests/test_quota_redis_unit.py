@@ -169,9 +169,11 @@ async def test_redis_sticky_denial_maps_negative_retry_to_none() -> None:
     assert denied.blocked_dimension is QuotaDimension.IMAGE_STORAGE_BYTES
     assert denied.retry_after_s is None
     # The sticky row hands the Lua script a zero refill rate — the guard
-    # in the script keys off exactly this argv.
+    # in the script keys off exactly this argv. Assert the value, not its
+    # formatting: B-32 changed the wire unit from ``int(rate * 1000)`` to
+    # the unscaled float, so the same zero now spells "0.0".
     (_key, argv) = redis.calls[0]
-    assert argv[1] == "0"
+    assert float(argv[1]) == 0.0
 
 
 @pytest.mark.asyncio
