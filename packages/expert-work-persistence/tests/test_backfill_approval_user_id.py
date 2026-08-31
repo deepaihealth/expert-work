@@ -141,12 +141,11 @@ def test_backfill_fills_only_the_ownerless_rows_it_can(fresh_db: str) -> None:
     _upgrade_to_head(fresh_db)
 
     with psycopg.connect(fresh_db) as conn:
-        got = dict(
-            conn.execute(
-                "SELECT id, user_id FROM agent_approval WHERE id = ANY(%s)",
-                ([appr_a, appr_b, appr_c],),
-            ).fetchall()
-        )
+        rows = conn.execute(
+            "SELECT id, user_id FROM agent_approval WHERE id = ANY(%s)",
+            ([appr_a, appr_b, appr_c],),
+        ).fetchall()
+    got: dict[UUID, UUID | None] = {row[0]: row[1] for row in rows}
 
     assert got[appr_a] == owner, "无主审批单没有从它的 run 拿回所有者"
     assert got[appr_b] is None, "run 自己都无主,不该编一个所有者出来"
