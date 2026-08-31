@@ -205,6 +205,15 @@ async def fetch_with_secret(
 | POST | `/admin/cache/invalidate` | 强制清进程内缓存（用于 secret 紧急轮换） |
 | GET | `/admin/health` | liveness + Vault 连接状态 |
 
+前三条要 `Authorization: Bearer $EXPERT_WORK_CRED_PROXY_ADMIN_TOKEN`（B-31 ②）；
+**未配置该 token 时它们答 503，不是放行**。`/admin/health` 不设闸 —— kubelet 的
+startup / liveness / readiness 探针都打它。
+
+写入面必须设闸的理由不止「这是管理 API」:`/admin/allowlist` 写的正是 `/forward`
+唯一校验的那张表，而 `/forward` 会把解析出的密钥当 `Authorization: Bearer` 发往
+**调用方自己指定的 upstream**（该 URL 不做校验）。能写白名单 = 能让代理把任意租户的
+密钥送到任意地址。
+
 ---
 
 ## 5. 算法 / 关键决策

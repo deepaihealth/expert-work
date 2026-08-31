@@ -20,6 +20,12 @@ in dev, Aliyun KMS in production.
 | POST | `/admin/cache/invalidate` | Drop the in-process secret cache |
 | GET | `/admin/health` | Liveness |
 
+The three `/admin` write / invalidate routes require
+`Authorization: Bearer $EXPERT_WORK_CRED_PROXY_ADMIN_TOKEN`. **An unset token
+closes them (503) rather than opening them** — they write the allowlist, and
+an allowlist row is what lets `/forward` inject a secret toward a
+caller-chosen upstream. `/admin/health` stays open for the kubelet probes.
+
 `/forward` request headers: `X-Expert-Work-Tenant`, `X-Expert-Work-Agent`,
 `X-Expert-Work-Agent-Version`, `X-Expert-Work-Session`, `X-Expert-Work-Sandbox`,
 `X-Expert-Work-Secret-Ref`, `X-Expert-Work-Upstream`.

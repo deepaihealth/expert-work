@@ -22,6 +22,14 @@ class CredentialProxySettings(BaseSettings):
     host: str = "0.0.0.0"  # noqa: S104 - internal service, bound inside the cluster
     port: int = Field(default=8080, gt=0, le=65535)
 
+    # --------------------------------------------------------------- admin
+    #: B-31 ② — bearer token the ``/admin`` write surface requires. Unset
+    #: **closes** those routes (503) rather than opening them: the admin API
+    #: registers allowlist rows, and an allowlist row is what lets ``/forward``
+    #: hand a tenant secret to a caller-chosen upstream. Anything that can
+    #: reach this pod could otherwise mint itself one.
+    admin_token: str | None = None
+
     # ------------------------------------------------------------------ db
     db_dsn: str = "postgresql+asyncpg://expert_work:expert_work_dev@localhost:5432/expert_work_dev"
     db_echo: bool = False
