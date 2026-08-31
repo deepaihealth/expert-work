@@ -105,6 +105,9 @@ jobs:
       - name: protected pins guard (PROD-7 / X-14 P2)
         run: uv run python tools/ci/check_protected_pins.py
 
+      - name: image registry guard (X-8)
+        run: uv run python tools/ci/check_image_registry.py
+
   typecheck:
     name: Typecheck (mypy)
     runs-on: ubuntu-latest
@@ -191,9 +194,14 @@ jobs:
     # runner IPs and testcontainers pulls (inside pytest's clock) pushed
     # runs to 24:36+ — the 25-min budget then killed fully green runs
     # ("567 passed" printed, then "operation was canceled"). 40 buys
-    # burst headroom and matches the unit job; the structural fix is
-    # mirroring the testcontainers images (postgres/minio/pgbouncer) off
-    # Docker Hub.
+    # burst headroom and matches the unit job.
+    #
+    # 2026-08-31 (X-8): the structural fix landed for the *official* images —
+    # every ``library/`` reference now pulls from
+    # ``public.ecr.aws/docker/library`` (guard: tools/ci/check_image_registry.py).
+    # ``pgvector/pgvector:pg16`` is the one Docker Hub pull left: it is not an
+    # official image and has no second public source, so keep the generous
+    # budget and ``continue-on-error`` until it too is mirrored.
     timeout-minutes: 40
     continue-on-error: true
     steps:

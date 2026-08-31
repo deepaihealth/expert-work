@@ -254,7 +254,8 @@ def test_hydrate_preserves_non_root_ownership_and_modes() -> None:
         pytest.skip("docker 不可用")
 
     payload = b"restored-bytes"
-    image = "debian:bookworm-slim"  # 见 docstring 末段:同的是 GNU tar,不是属主名解析
+    # 见 docstring 末段:同的是 GNU tar,不是属主名解析
+    image = "public.ecr.aws/docker/library/debian:bookworm-slim"
     built = _docker_binary(
         "run",
         "--rm",
