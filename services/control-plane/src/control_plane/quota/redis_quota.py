@@ -57,26 +57,36 @@ _BUCKET_TTL_MS: Final[int] = 30 * 86_400 * 1_000
 
 # Subsystems/16 § 5.1 — atomic token bucket.
 # KEYS[1] = bucket key
-# ARGV: 1=capacity 2=refill_per_s*1000 3=now_ms 4=cost 5=ttl_ms
+# ARGV: 1=capacity 2=refill_per_s 3=now_ms 4=cost 5=ttl_ms
+#
+# B-32: ``capacity`` / ``tokens`` / ``cost`` are whole tokens, so the rate
+# has to be whole tokens per second too. This script used to take
+# ``refill_per_s * 1000`` (copied from the ratelimit bucket, where *every*
+# quantity is scaled by 1000 and the arithmetic is therefore consistent) —
+# here the mismatched scale refilled buckets 1000x too fast, and the retry
+# formula carried the same factor so the two agreed with each other. The
+# rate now crosses the wire unscaled, which also removes the ``int()``
+# truncation that floored every sub-1/1000-token-per-second rate to the
+# sticky sentinel below.
 _LUA_BUCKET_SOURCE = """\
 -- expert-work quota bucket (subsystems/16 § 5.1)
 local b = redis.call('HMGET', KEYS[1], 'tokens', 'last_ms')
 local cap = tonumber(ARGV[1])
-local rate_milli = tonumber(ARGV[2])
+local refill_per_s = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local cost = tonumber(ARGV[4])
 local ttl_ms = tonumber(ARGV[5])
 local tokens = tonumber(b[1]) or cap
 local last_ms = tonumber(b[2]) or now_ms
 local elapsed = math.max(0, now_ms - last_ms)
-tokens = math.min(cap, tokens + elapsed * rate_milli / 1000)
+tokens = math.min(cap, tokens + elapsed * refill_per_s / 1000)
 if tokens < cost then
-  -- B-19: rate_milli == 0 marks a sticky ceiling (refill=0) -- no time at
-  -- which a retry would succeed. Return the -1 sentinel instead of
-  -- dividing by zero; the Python side maps it to retry_after_s=None.
+  -- B-19: refill_per_s == 0 marks a sticky ceiling -- no time at which a
+  -- retry would succeed. Return the -1 sentinel instead of dividing by
+  -- zero; the Python side maps it to retry_after_s=None.
   local retry_ms = -1
-  if rate_milli > 0 then
-    retry_ms = math.ceil((cost - tokens) * 1000 / rate_milli)
+  if refill_per_s > 0 then
+    retry_ms = math.ceil((cost - tokens) * 1000 / refill_per_s)
   end
   redis.call('HMSET', KEYS[1], 'tokens', tokens, 'last_ms', now_ms)
   redis.call('PEXPIRE', KEYS[1], ttl_ms)
@@ -191,12 +201,15 @@ class RedisQuotaService(QuotaService):
         now_ms: int,
         cost: int,
     ) -> tuple[bool, int, int]:
-        # ``refill_per_s * 1000`` keeps the Lua script working in
-        # integer arithmetic for the common case while preserving
-        # sub-token-per-second rates.
+        # B-32 — the rate goes over unscaled, in the same unit as
+        # ``capacity`` / ``cost``. Redis Lua numbers are doubles, so a
+        # fractional rate (the 30-day slow-drip dimensions sit around
+        # 4e-5 tokens/s) survives the round trip; the old ``int(rate *
+        # 1000)`` floored all of those to 0, which the script reads as
+        # the sticky-ceiling sentinel.
         argv = [
             str(capacity),
-            str(int(refill_per_s * 1000)),
+            repr(float(refill_per_s)),
             str(now_ms),
             str(cost),
             str(_BUCKET_TTL_MS),
