@@ -40,7 +40,7 @@
 
 ---
 
-## 🚀 生产发布前置(2026-08-23 立项;**发布日:原定 2026-08-30 周六,2026-08-29 延期,新日期待用户定**(时间线:08-26 周三 → 08-24 改 08-30 周六 → 08-29 延期);三道拍板 2026-08-24 已收:单副本首发(**2026-08-26 推翻改多副本首发,阻塞项七 PR #1312-#1318 已全清**)/ 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
+## 🚀 生产发布前置(2026-08-23 立项;**发布日 = 2026-09-10 周四**(2026-08-31 用户拍板)(时间线:原定 08-26 → 08-24 改 08-30 → 08-29 延期 → 08-31 定 09-10。**勘误:本文件此前把 08-30 称作「周六」,该日实为周日**——旧条目里的星期标注不可信,以日期为准);三道拍板 2026-08-24 已收:单副本首发(**2026-08-26 推翻改多副本首发,阻塞项七 PR #1312-#1318 已全清**)/ 书面接受单层隔离 / 告警走企微 —— 记录在 docs/runbooks/production-release.md)
 
 > 来源:2026-08-23 生产就绪盘点,对照 `docs/research/2026-07-28-multi-replica-readiness-audit.md` 逐条核实现状。
 > **好消息:审计第 0/1 波大头已落地**(实测核过:webhook 投递有 `claim_ready` + `FOR UPDATE SKIP LOCKED`;多副本启动守卫真存在——`app.py:1188` 未配 quota Redis 直接拒启;文档上传已走对象存储;base configmap 已 `SINGLE_INSTANCE=false` + postgres checkpointer + s3;prod overlay 骨架在,占位符待填)。
@@ -75,8 +75,8 @@ X-13 / X-11 / X-12(钉版迁移池)、X-5 / X-6 / X-9、D-7、B-20 ②(通知路
 
 **进度(2026-08-26 用户拍板多副本首发 → 08-27 夜收账)**:08-24 单副本首发拍板被推翻,按 plan A 一夜清完全部多副本阻塞项 —— 七 PR #1312-#1318 全合(PROD-1 / CAS 守卫 / PROD-9 / PROD-12 / verify_cancel / PROD-7 P2 / 收口),测试环境发 `89c63dc1`(记录 #1319),smoke 含新 replicas 节全绿,prod overlay 回 base 2 副本。**剩余排期**:
 
-- 周四~周五:①资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)② 开荒完成后 prod overlay 渲染预检(placeholder 扫描)③ 测试环境真栈验收:跨副本 /events attach(带凭据)+ `tools/ha/verify_cancel.py` + PPT 内容质量人工抽查(用户)
-- 周六:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
+- ~~周四~周五~~(**排期已随 08-29 延期作废,新日程见本节开头的发布日 2026-09-10;下列内容仍是待办清单本身**):①资源开通+开荒(production-release.md §0-§1,用户侧为主;kubeconfig/params.env/非 superuser 应用账号/企微告警群+Secret)② 开荒完成后 prod overlay 渲染预检(placeholder 扫描)③ 测试环境真栈验收:跨副本 /events attach(带凭据)+ `tools/ha/verify_cancel.py` + PPT 内容质量人工抽查(用户)
+- ~~周六~~ **发布当日(2026-09-10)**:照 runbook §1-§3 开荒 seed → `release.sh prod` → smoke → 回滚待命
 - 发布后第一波:RLS PR B / Redis 全局令牌桶 / 取消亚秒化(invalidation_bus 地基已就位)/ **B-32 redis Lua 回填量纲 1000×**(QPS 配额在 redis 引擎形同虚设)/ **CI integration 基础镜像镜像离 Docker Hub**(08-27 一天四次 40 分钟限流假红,提档)/ 按需 PROD-11(PROD-10=B-19 已于 08-27 修,X-14 P1 与 E3b 已提前交付)
 
 **进度(2026-08-27 白天批收账)**:收账 #1320;功能四连 —— #1321 glm-5.3-flash 上架(`ModelEntry.always_thinking` 声明式字段,关思考=降 `reasoning_effort:"low"`;GLM 独有 `clear_thinking` 保留式思考参数刻意不发,与 B-30 `thinking.keep` 同族)、#1322 `dynamic_workers.model` 临时子 Agent 模型覆盖(校验器禁 fallback 链)、#1323 激活语义改「登录过就算」(MemberActivationMiddleware 认证路径激活,首 run 钩子退役)、#1326 成员列表「最后活跃」列(15 分钟节流 bump;CI 逮到副作用=调用者也被自动注册进 tenant_user,测试已适配);文案专业化两连 —— #1324「努力程度→推理深度」+ #1325 全站术语统一(智能体/对话/全角标点/调试台运行时文案迁 i18n,零键误伤)。测试环境发 `e891b918`(双镜像,记录 #1327),smoke 含 replicas 节全绿。存量「已邀请」账号无历史回填,等各自下次登录自然激活(设计语义,用户已接受)。
@@ -502,7 +502,7 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 
 1. **B-39** #1392/#1393 附件送达的真栈复验(带附件委派 + 审批续跑后附件还在)
 2. **B-40** 对接方文件名乱码修复的我方验收(等对方发版)
-3. **发布本身** —— 原定 08-30 已延期。`0150_agent_spec_draft` 迁移随「保存 ≠ 上线」program 一并上;金丝雀 prod 侧只差开荒时照 runbook §1.6.7 seed 一次
+3. **发布本身 —— 2026-09-10(周四)**。`0150_agent_spec_draft` 迁移随「保存 ≠ 上线」program 一并上;金丝雀 prod 侧只差开荒时照 runbook §1.6.7 seed 一次。多出的十天可用来清「可直接开工」那四条,并把 B-39 的真栈复验做掉
 
 **可直接开工(不依赖环境、不依赖拍板)**:
 
