@@ -1459,7 +1459,13 @@ async def _register_pending_approval(
                 ApprovalRecord(
                     id=uuid4(),
                     tenant_id=record.tenant_id,
-                    user_id=None,
+                    # X-15 ② — the run's owner, not None. The timeout sweep
+                    # feeds this column straight back into
+                    # ``resolve_approval_decision`` as ``caller_user_id`` +
+                    # ``oauth_user_id``; a hardcoded None made every swept
+                    # continuation resolve the *shared* MCP OAuth pool instead
+                    # of the user's.
+                    user_id=record.user_id,
                     run_id=record.run_id,
                     thread_id=record.thread_id,
                     request_id=request.request_id,
