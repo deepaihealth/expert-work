@@ -30,6 +30,11 @@
 | 通用型 NAS | 挂载点 + 手工建 `/workspaces` 目录(mount 后 mkdir;回收站开 7 天,照 test 勘误 #1144) | 挂载点域名 |
 | 域名 ×3 + 证书 | 主域名 / Langfuse 子域名 / 沙箱网关域名;泛域名证书或逐张 | DNS CNAME → prod ALB;证书上传阿里云 |
 | 企微「生产告警」群 | 群机器人 webhook URL | 进 `wecom-alert-webhook` Secret(§1.6) |
+| **LLM 厂商 prod key ×2** | 主 + **跨厂商**备用各一家,两家都要已开通且有余额 | §1.6.5 在 UI 手工录;§1.6.7 金丝雀 seed 依赖它 |
+
+> **上一行 2026-08-31 补** —— 原表漏了它,而 §1.7 的金丝雀是**发布合格判据**:
+> 没有 prod LLM key 就 seed 不了金丝雀,release.sh 阶段 6 只打 WARNING 跳过,
+> 等于这次发布没有合格判据。备用必须是**另一家厂商**(挡住主模型 429 误红发布闸)。
 
 ## 1. 开荒(一次性,建议发布前一天完成)
 
@@ -48,10 +53,25 @@ EOF
 
 ### 1.2 填 overlay 占位符
 
-`infra/k8s/overlays/prod/` 里 grep `PROD_PLACEHOLDER` 逐个替换(域名 / OSS 三
-元组 / NAS 挂载点 / 沙箱网关域名 / 管理员邮箱)。`newTag: PROD_PLACEHOLDER_TAG`
-**不用手填** —— 首次 `release.sh prod` 自动钉。填完提交 PR(占位符替换是配置
-变更,走评审)。`release.sh prod` 在构建前会拒绝任何残留占位符。
+**只改 `.yaml`,不要碰 `secrets.env.example`。** 那份 example 不被 kustomize 引用,
+是给 §1.4 抄的模板;它里面另有 ~32 处占位符,填的是**本地副本**,原文件保持占位符、
+**永不提交**。(2026-08-31 核实并加此警告 —— 原文只写「grep `PROD_PLACEHOLDER` 逐个
+替换」,照字面做会把生产密钥提交进 git。)
+
+要填的就 **8 个值 / 15 处**,全在 yaml 里:
+
+| 占位符 | 落在哪 |
+|---|---|
+| `PROD_PLACEHOLDER_DOMAIN` | ingress / keycloak / configmap 的 OIDC issuer + JWKS(5 处) |
+| `PROD_PLACEHOLDER_LANGFUSE_DOMAIN` | langfuse ingress + `NEXTAUTH_URL`(2 处) |
+| `PROD_PLACEHOLDER_SANDBOX_DOMAIN` | `EXPERT_WORK_SANDBOX_E2B_DOMAIN` |
+| `PROD_PLACEHOLDER_OSS_ENDPOINT` / `_BUCKET` / `_REGION` | 平台 + Langfuse 各一份(共 6 处) |
+| `PROD_PLACEHOLDER_NAS_MOUNT_TARGET` | workspace-nas patch |
+| `PROD_PLACEHOLDER_ADMIN_EMAIL` | `EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL` |
+
+`newTag: PROD_PLACEHOLDER_TAG` **不用手填** —— 首次 `release.sh prod` 自动钉,预检也
+专门放行它。填完提交 PR(占位符替换是配置变更,走评审)。`release.sh prod` 在构建前
+会拒绝任何残留占位符。
 
 ### 1.3 集群侧一次性对象
 

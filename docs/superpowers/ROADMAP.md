@@ -32,9 +32,10 @@
   **PR-B #1221(对话记录页 + Run 详情页切 console 组件,退役 TurnCard 集群 −9.6k 行)**。
   测试环境 `afe00ebb`,两页真栈验收 15/15,记录 PR #1222 已合并(`72a5421b`)。
   设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
-- **仍然有效的剩余项**(2026-08-30 复核)= 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 / X-3~X-15、
-  「小 backlog」B-1~B-7、B-9~B-18、B-21、B-23、B-24、B-27~B-33、B-38、B-40、B-41(B-39 已于 08-31 销案)、
-  「调试台 follow-up」D-7。已销案的:D-1~D-6、B-8、B-19、B-20 主体、B-22、B-25、B-26、B-34、**B-35 / B-36 / B-37**、X-2、X-16。
+- **仍然有效的剩余项**(2026-08-31 复核)= 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 / X-3~X-14 / X-15 ①、
+  「小 backlog」B-1~B-7、B-9~B-18、B-21、B-23、B-24、B-27~B-31 ①、B-33、B-38、B-40、B-41、
+  「调试台 follow-up」D-7。已销案的:D-1~D-6、B-8、B-19、B-20 主体、B-22、B-25、B-26、B-34、
+  **B-35 / B-36 / B-37 / B-39**、**B-31 ② / B-32(08-31 发布前必修批)**、X-2、**X-15 ②**、X-16。
   X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
   **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点;本文件已两次因未核实而误报进度)。
 
@@ -419,14 +420,14 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | X-5 | **MCP allowlist 残留名不可移出**(来源:MCP 界面重设计 2026-07) | 目录条目被删后,租户 allowlist 残留名在 UI 无法移出,后端缺 **disable-by-name** 端点;现降级为「禁用 + 提示」的诚实态 |
 | X-6 | **平台技能导出/同步收尾**(来源:skill-export-sync) | ① 52 个导出包待推测试环境(`POST /v1/platform/skills/import` 幂等可重跑,PLATFORM_ADMIN 凭证在金库);② admin-ui 技能导出按钮(platform + tenant);③ tenant export 丢 `supporting_files` bug(`skills.py:1390` 没传,platform 侧 `platform_skills.py:1333` 是无损姿势可照抄) |
 | X-7 | **观测栈残留**(来源:W2-PR3 observability) | ① alertmanager receivers 仍 placeholder(P0 告警投递到空气);② compose 侧 prometheus 同源坑(promtool 单测文件混进 rules 整目录挂载,`--profile observability` 起不来;修法=单测挪 tests/ 子目录 + 改两处文档 promtool 路径);③ Langfuse org/project 显示名(只设 INIT_*_ID 没设 NAME,界面显示 "Provisioned Org/Project");④ 探针 trace 噪音(middleware 对 `/healthz*` 也开 span,2K 条/天淹没真 run) |
-| X-8 | **Docker Hub 依赖镜像统一 mirror**(来源:测试环境镜像逃生舱 + 2026-08-20 CI 突刺) | ① node:22-alpine 进 ACR(照 keycloak/searxng 先例);② **CI testcontainers 镜像(postgres/minio/pgbouncer)也要脱离 Docker Hub**(mirror 或 GHCR pull-through cache)—— 2026-08-20 一小时 ~8 条并发 run 撞限速,integration 从基线 7-15 分钟被拖到 24:36+ 集体撞 25m 超时假红(#1232 临时把预算提到 40) |
+| X-8 | **Docker Hub 依赖镜像统一 mirror**(来源:测试环境镜像逃生舱 + 2026-08-20 CI 突刺) | ① node:22-alpine 进 ACR(照 keycloak/searxng 先例);② **CI testcontainers 镜像(postgres/minio/pgbouncer)也要脱离 Docker Hub**(mirror 或 GHCR pull-through cache)—— 2026-08-20 一小时 ~8 条并发 run 撞限速,integration 从基线 7-15 分钟被拖到 24:36+ 集体撞 25m 超时假红(#1232 临时把预算提到 40)。**2026-08-31 又收一次利息**:PR #1398 的 integration 跑了 30 分钟,593 passed 里唯一那条 error 是 `test_gate_60_fullstack_egress_injects_and_audits` 的 `docker build` 超 600s,报错文案是仓库自己写的「多半是镜像拉取被限流」。**这条的成本不在「做它要多久」,在于它每周都在收利息** —— 08-27 一天四次、08-29~30 两次、08-31 一次 |
 | X-9 | **Agent 延迟 perf follow-up 池**(来源:perf 一期+二期;明细在本机 perf program 台账 progress.md) | oauth put 半成功窄漏清窗口(pre-existing)/ 双键空间 × per-tenant 键 LRU 有效容量随租户数下滑 / first_output SLI 缺面板 / resolve_embedder+resolve_reranker 死代码 / admin-ui 分解条 total 并行后夸大 |
 | X-10 | **生产多副本整体实施方案**(来源:production-distributed-premise,2026-07-28 拍板) | 五道选型题已收口(ACS 双集群杭州 / AgentSandbox+E2B / OSS+NAS 工作区 / RDS PG16 / Redis 社区版 7.0 noeviction),四波行动清单在 `docs/research/2026-07-28-multi-replica-readiness-audit.md`;**整体实施方案还没出**。期间新特性默认按多副本语义设计 |
 | X-11 | **mcp SDK 1.x→2.x + httpx2 迁移**(2026-08-20 立项,源头 dependabot #1229) | mcp 2.x 换 `httpx2` 依赖,`streamable_http_client` 签名变更(3 元组 + `httpx2.AsyncClient`),`orchestrator/tools/mcp.py:606-609` 起的整条 MCP 客户端层要迁;dependabot 已加 major ignore(做完把 `.github/dependabot.yml` 里那条一起删)。迁移要真栈测 MCP 工具(streamable-http + OAuth 路径) |
 | X-12 | **fastapi ≥0.137 迁移:路由自审适配懒挂载**(2026-08-20 立项,源头 dependabot #1233) | fastapi 0.137 起 `include_router` 懒挂载:`app.routes` 里是 `_IncludedRouter`,APIRoute 不再摊平(实测 0.136.3 摊平 / 0.137.2 起不摊,启动也不展开),控制面整族路由自审(console lockdown / external gate / NUL guard / reachability / app_factory)集体失明。迁移=自审改用 `fastapi.routing.iter_route_contexts` 遍历并核实 router 级依赖的合成语义(**这批是安全闸,依赖合成改错比不改危险,要变异自证**);生产代码零 `app.routes` 枚举已核实。两个 service 的 pyproject 钉了 `<0.137` + dependabot ignore,做完一起放开 |
 | X-13 | **e2b SDK 升级迁移 2.24.0→2.39.1+**(2026-08-21 立项,源头真栈事故) | #1233 曾把 `e2b` 抬到 2.39.1,其客户端 `validate_api_key` 强制 `e2b_`+hex 格式,ACS Agent Sandbox 私有协议 key 被本地拒绝 → 测试环境沙箱工具全挂(list_dir/exec_python/write_file);已回钉 `e2b==2.24.0`+`e2b-code-interpreter==2.7.0` + dependabot ignore。升级路径:确认 kruise patch_e2b 对新版兼容(或在 `_ensure_e2b_patched` 中和 validate_api_key)→ 按 deployment.md contract-run 重跑沙箱运行时契约探针 → 真栈 exec_python 冒烟 → 解 ignore |
 | X-14 | **发布稳定性加固**(2026-08-21 立项,源头 e2b 事故复盘:评审漏钉版/CI 假件全绿/smoke 只探 HTTP,三层防线全漏)——**P2 ✅(2026-08-26,#1317)/ P1 ✅ 已交付(2026-08-27,#1330):`tools/deploy/canary.py` + release.sh 阶段 6(Secret 未 seed WARNING 跳过不阻断;红提示 rollback.sh)+ `python -m control_plane.seed_canary` 幂等 seed + runbook §1.6.7/§1.7;测试环境真栈首跑 PASS(35s,end.status=success + 产物字节校验)** | P3 sandbox create 失败率 alertmanager 告警 / P4 约定:动沙箱链路依赖(e2b/kruise/supervisor/镜像)必跑 deployment.md contract-run / P5 约定:发布记录 PR 写上一版 tag 便于一键回滚 |
-| X-15 | **B-20 终审 follow-up 两条**(2026-08-23 立项,#1253 独立终审 I-1/I-2) | ① `retention-cleanup-job/job.py:207` 存在**第二套审批超时实现**:直接 `mark_decided(TIMEOUT)` 不走 `resolve_approval_decision`(不写 checkpoint、不 spawn continuation),与 control-plane sweep 抢同一 CAS,它抢赢则「超时保守继续」静默不发生;**目前未部署**(infra 无该 CronJob),潜伏项——删掉该路径或改走同一内核;② `orchestrator/sse.py:1404` 审批行 `user_id=None` 写死而 `record.user_id` 在手上,sweep 续跑恒 `caller_user_id=None` 丢 per-user OAuth MCP pool key,1h 澄清超时使该路径变常态;修=一行透传 + 存量回填迁移 |
+| X-15 | **B-20 终审 follow-up 两条**(2026-08-23 立项,#1253 独立终审 I-1/I-2) | ① `retention-cleanup-job/job.py:207` 存在**第二套审批超时实现**:直接 `mark_decided(TIMEOUT)` 不走 `resolve_approval_decision`(不写 checkpoint、不 spawn continuation),与 control-plane sweep 抢同一 CAS,它抢赢则「超时保守继续」静默不发生;**目前未部署**(infra 无该 CronJob),潜伏项——删掉该路径或改走同一内核;~~② 审批行 `user_id=None` 写死~~ **✅ 已修(2026-08-31,PR #1400)**:写入侧一行 `user_id=record.user_id` + 存量回填迁移 `0151`(按 `run_id` 从 `agent_run.user_id` 取,只填 NULL 行,downgrade 是 no-op)。**测试环境实测才是判据**:38 条审批单 `user_id` 非空 **0** 条,而 38 条**全部**能从 `agent_run` 回填 —— 既证明修复不是空转,也证明回填无损。既有那条审批测试建 record 时不传 `user_id`,**两边都绿证明不了任何事**,必须新写。迁移测试在**回填之前**的版本(0150)上灌数据再升 head(在 head 上灌再断言测不出东西,UPDATE 早跑过了),为此在容器里另建一个库;三种行分开(无主+run有主→回填 / 无主+run也无主→保持 NULL / 已有主→不覆盖),变异自证:拿掉 UPDATE 杀第一条、去掉 `AND a.user_id IS NULL` 杀第三条 |
 | X-16 | ~~**批 E 收尾:E3b 失效总线全量接线 + C 类缺口修复**~~ **✅ 全交付(2026-08-27,四 PR)**:#1331 总线 7→20 kind + 平台配置面全接线 + **judge/tool-budget「改配置连写入 pod 都不生效」bug 修复** + quota Protocol invalidate_tenant;#1329 技能面(平台 10 端点/租户 7 端点/promote 审批,原先零失效);#1332 限流 override 缓存提取为可注入对象 + 接线;#1330 里的 handler 占位同批闭环。测试环境 `3fc9350e` 已发,smoke PASS | 遗留单列:credential-proxy 接总线(失效链现无人调用+单副本无跨副本陈旧,真接需加 redis 依赖;顺带发现其 /admin/* 端点无鉴权,一起立项)→ 记 B-31 |
 
 ---
@@ -465,8 +466,8 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-28 | **(产物清单契约 #1305 停删后果,2026-08-26)** 对接方停删后**平台侧产物生命周期归平台管**:artifact/artifact_version 表与工作区文件只增不减(原靠对方收割后删除兜着)。要定留存策略(按租户/按 kind TTL?对齐 X-4② 90 天硬删?)并接 retention 机制;`archived_object_key` 字段仍是预留未接 |
 | B-29 | **(SSE 心跳 program 三条遗留,2026-08 记账未入册;共性=「该有信号处无信号」)** ① 对外 `/items` 续传 `limit` 触顶静默截断无 truncated 标记;② replay 中段 seq gap 静默跳过不发 gap 信号;③ `release.sh` 个别失败分支 exit 0 假成功 |
 | B-30 | **(三厂商档位对齐 #1308 顺带,2026-08-26)** `kimi-k2.7-code` 上架与否待拍板:官方文档新型号(思考不可关、`thinking.keep` 固定 `"all"` 传其他值报错);上架需 catalog entry + `thinking.keep` 适配层支持(现在不发 keep,K2.6 默认 null 无碍) |
-| B-31 | **(E3b 侦察发现,2026-08-27)credential-proxy 两件套**:① 失效链断头 —— `/admin/cache/invalidate` 全仓无调用方,cache 只靠 60s TTL;现单副本无跨副本陈旧,**扩容前必须**接失效总线(需新增 redis 依赖 + env 注入)或至少接 HTTP 失效;② **`/admin/*` 三端点裸奔无鉴权**,STREAM-F-DESIGN 声称的 mTLS SAN 限制实际不存在——若走 HTTP 失效方案,此洞先补,否则失效入口=可写入口 |
-| B-32 | **(B-19 修复时真 redis 验证顺带发现,pre-existing)redis Lua 桶回填量纲差 1000 倍**:`tokens += elapsed_ms * rate_milli / 1000`,rate_milli=refill_per_s×1000,净效果=elapsed_ms×refill_per_s,少除一次 1000 → 桶回填快 1000 倍(200 容量/50 每秒的桶 4ms 回满),QPS 类配额在 redis 引擎上形同虚设;retry 公式同偏自洽所以从未暴露。in-memory 引擎无此问题(单测全走它,故测试恒绿)。另:慢滴维度小限额 `int(refill_per_s*1000)` 取整为 0 → redis 上这些桶从不回填。修法=Lua 内除回 1000 + 小数率下限,真 redis 集成测试钉住(#1338 PR「遗留观察」节有完整推导)|
+| B-31 | **(E3b 侦察发现,2026-08-27)credential-proxy 两件套**:① 失效链断头 —— `/admin/cache/invalidate` 全仓无调用方,cache 只靠 60s TTL;现单副本无跨副本陈旧,**扩容前必须**接失效总线(需新增 redis 依赖 + env 注入)或至少接 HTTP 失效(走 HTTP 方案时 token 已就位,见 ②);~~② `/admin/*` 三端点裸奔无鉴权~~ **✅ 已修(2026-08-31,PR #1399)**。**定级比原记录重**:不只是「管理接口裸奔」—— `/admin/allowlist` 写的正是 `/forward` **唯一校验的那张表**,而 `forward` 会把解析出的密钥当 `Authorization: Bearer` 发往**调用方自己指定的 upstream**(该 URL 完全不校验,只在审计里 urlparse 取 host)。**能写白名单 = 能让代理把任意租户的密钥送到任意地址。** 可达面至少是集群内所有 pod(ClusterIP + 全仓零 NetworkPolicy);沙箱已在打这个 pod 的 8081,同 pod 的 8080 能否开**未实证**,闸不依赖该答案。修法=中间件按前缀拦 `/admin/` + `compare_digest` 比对 `EXPERT_WORK_CRED_PROXY_ADMIN_TOKEN`,**未配置 → 503 而非放行**(「没配就没闸」正是这个 bug 本身的形状),`/admin/health` 留开给 kubelet 三探针。三个被关端点全仓零调用方,关掉不破坏任何链路。**顺带订正三处说谎的文档** —— STREAM-F-DESIGN §4.4 那句「仅 mTLS SAN=control-plane 可达」从未实现,**这句写下的控制正是它坐了这么久没被查的原因**(同 [[description-is-not-the-thing]]) |
+| ~~B-32~~ | ~~redis Lua 桶回填量纲差 1000 倍~~ **✅ 已修(2026-08-31,PR #1398)**。发布前修的理由是实证的:**生产强制走 redis 引擎** —— 多副本没配 quota Redis 直接拒启(`app.py:1204`),有 URL 就选 redis 引擎(`:3127`),所以 QPS 类配额在生产上等于没有。根因是**量纲只抄了一半**:`ratelimit` 那份同款 Lua 是对的(capacity/tokens/cost/rate 全 ×1000 自洽),`quota` 这份只缩放了速率 → 桶回填快 1000 倍;retry 公式带同一个因子,两边互相自洽,所以从 `retry_after_s` 上看不出来。第二半是 `int(rate*1000)` 把低于 1/1000 令牌每秒的速率 floor 成 `0`,而 `0` 是脚本里的**黏性天花板哨兵** —— 30 天慢滴维度既不回填又宣称「重试永远不会成功」。修法=速率按与 capacity/cost 相同的单位原样过线(缩放没了就没有第二处可错),黏性哨兵改判 `refill_per_s > 0`,顺带让两引擎谓词重新同义。**新增真 redis 集成测试 5 条,修复前 4 红 1 绿**(绿的那条是「真黏性保持黏性」的回归网,设计上两侧都绿);两引擎对账那条修复前是 `None` vs `25920`。**为什么此前测不出**:全部 quota 单测走内存引擎,Lua 桶从来没被时钟跑过 | ✅ |
 | B-33 | **(kimi 对照真栈发现,2026-08-28)模型个性参数无 catalog 声明**:kimi-k3 只接受 temperature=1,sop2 换模型后旧值 0.9 原样发出→厂商 400 炸 run(#1321 always_thinking 同族问题)。修法=ModelEntry 声明温度约束(固定值/白名单),构建时钳制或略去并 log,别让厂商 400 当校验器 |
 | B-34 | ~~moonshot 严格校验 tool schema,enum-without-type 400~~ **✅ 已修(2026-08-28,PR #1350)**:update_plan/manage_task 四处补显式 type;守卫测试 test_tool_schema_vendor_strict.py 递归扫内置工具 schema。教训=拼给 LLM 的 schema 必过厂商严格校验,别赌宽松(MCP 工具名 wire-safe 同款纪律) |
 | B-35 | **委派增强层 4:per-agent `execution_mode: plan_first`(规划-执行分离)**——把委派从概率变保证的唯一结构解。**启动条件**:层 0-3 上线后真实流量 `expert_work_dynamic_worker_spawned_total` 跑 1-2 周仍趋零。真栈验证结论(2026-08-28,四探针 glm×3+kimi×1):层 0/1/2 机制全部生效(两模型思考原文引用判据、层 1 提醒精准注入),但模型均权衡后选 inline——业界同现象(Claude 自家栈实测 7 跑 0 委派,prompt 层无强制手段)。**先于层 4 的两个零成本杠杆**:①kimi 20+ 工具选择退化(社区实测),sop2 挂 30+ 工具,收敛 MCP 勾选可能直接抬委派率;②员工提问措辞含「分别/并行处理」类词对 kimi 触发委派影响大,可进层 3 生成的领域策略提示。**设计已拍板(2026-08-28,完整方案 `docs/superpowers/specs/2026-08-28-plan-first-execution-design.md`)**:manifest `execution_mode: plan_first` per-agent 默认关;**开启硬联动**(确认 Modal 明示后一次写入)= workflow.type react→plan_execute + dynamic_workers.enabled 必 true;Modal 另列建议检查项(token 成本 ~15× 大白话/max_iterations/deadline/reflection 协同/触发器 run 同样生效);**双层防护**=UI 联动写入 + 后端校验不一致 422 硬拒(不静默归一);关闭开关**不回退** workflow.type(提示手动改)。切分 5 PR 约 7-9 人日,PR-4(中断/审批 × 在飞 worker)是历史高危区。**✅ 全交付(2026-08-28,五 PR #1356-#1360 全合,发测试 ca4ae6b9)**:真栈探针(canary 租户 pf-probe/pf-probe-kimi,不动对接方 agent)——**glm-5.3 全链生效**:planner 标 delegate/分发轮触发/3 worker 真派发(`dispatch_total +1`、`spawned_total +3`、零降级),对比层 0-3 四探针 spawned 恒 0 = 结构解实证;**kimi-k3 绕行**:分发轮触发但用 update_plan 逃生门把 delegate 步改标 inline 零派发——follow-up 已修:①逃生门措辞收紧(re-mark 仅限写操作/最终拍板,读料/总结/提炼类明确不许)②re-mark 绕过计入 degraded 计数(原为观测盲区)③模板分层假设测试钉住。**e2e 用例裁掉**(组件级测试已盖渲染面,e2e 增量不抵维护成本;spec §8 相应降级)。PR-4 顺带修的审批黑洞(worker 撞闸静默假完成)为全局 bug 修复,不在开关后 |
@@ -498,24 +499,54 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 > 口令历史:2026-08-23「ask_for_approval 默认关(✅ #1252)→ B-20(✅ 主体)→ D-6(✅)」;
 > 其后 08-26~08-30 数批均由用户当场下口令,已全部交付。**其余仍等用户口令再开工。**
 
-**卡在「等发测试环境」的两条**(工程侧已完成,只差环境;~~B-39 附件送达复验~~ ✅ 已随 `7ed71857` 发布当日完成):
+### P0 —— 唯一真正卡住 09-10 的一件
 
-1. **B-40** 对接方文件名乱码修复的我方验收(等对方发版)
-2. **发布本身 —— 2026-09-10(周四)**。`0150_agent_spec_draft` 迁移随「保存 ≠ 上线」program 一并上;金丝雀 prod 侧只差开荒时照 runbook §1.6.7 seed 一次。多出的十天可用来清「可直接开工」那四条,并把 B-39 的真栈复验做掉
+**生产资源开通 + 开荒**(runbook §0-§1)。2026-08-31 核实:prod **零开荒** —— overlay 15 处
+`PROD_PLACEHOLDER_*` 待填、`~/.kube/expert-work-prod-params.env` 与 prod kubeconfig 都不存在。
+阻塞项全在用户侧(阿里云开通),不是代码。**域名 + 证书提前量最长**(备案/签发可能数天),
+它卡住后面全卡。执行视图见开荒调度板 artifact(按「你侧 / 我侧」分道 + 依赖链 + 易错点)。
 
-**可直接开工(不依赖环境、不依赖拍板)**:
+开荒清单核出来的三条,runbook 自己没写清:
 
-3. **B-41** 嵌套执行双计的同构核查(token / 成本 / 产物)—— 廉价,且耗时那一路已实证会错到「思考时长 > 总耗时」
-4. **B-31** credential-proxy 两件套(失效链断头 + `/admin/*` 无鉴权)—— **扩容前必接**,且第二条是安全洞
-5. **X-8 / CI 镜像离 Docker Hub** —— 08-27 一天四次、08-29~30 又两次 40 分钟限流假红,已烧掉数小时 CI;属「发布后第一波」但持续在收利息
-6. **B-32** redis Lua 桶回填量纲 1000×(QPS 类配额在 redis 引擎形同虚设)
+1. **只有 8 个值进 git**(15 处 yaml)。`secrets.env.example` 里另有 32 处是**模板** ——
+   填的是本地副本,**原文件永不提交**。runbook §1.2 写「grep `PROD_PLACEHOLDER` 逐个替换」
+   没分这两类,照字面做会把生产密钥提交进仓库。
+2. **金丝雀要两家厂商的 prod LLM key**(主 + 跨厂商备用)。§0 资源表漏了这条,
+   而金丝雀是**发布合格判据**,没有它发布判不了绿。
+3. `newTag` 不用手填,首次 `release.sh prod` 自动钉,预检也专门放行它。
 
-**需要拍板才动**:
+### 发布前必修 —— ✅ 2026-08-31 三条全清
 
-7. **P-1~P-5** 产品题;P-4(api_keys 凭据横向扩散)风险最高,建议先议
-8. **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一
+原本 B-32 / X-8 排在「发布后第一波」,核实后把 B-32 提前(生产必踩):
 
-**发布后第一波(已排队)**:RLS PR B / Redis 全局令牌桶 / 取消亚秒化 / B-32 / X-8。
+| | 为什么必须在发布前 |
+|---|---|
+| ~~**B-32**~~ ✅ #1398 | 生产**强制**走 redis 配额引擎(多副本无 quota Redis 直接拒启)→ QPS 类配额在生产等于没有 |
+| ~~**B-31 ②**~~ ✅ #1399 | 「能写白名单 = 能让代理把任意租户密钥送到任意地址」,可达面至少集群内所有 pod |
+| ~~**X-15 ②**~~ ✅ #1400 | 澄清超时降到 1h 后,「续跑丢 per-user OAuth 池」从罕见变常态;实测 38/38 条审批单无主 |
+
+### 剩下十天的可直接开工项(不依赖环境、不依赖拍板)
+
+1. **X-8 / CI 镜像离 Docker Hub** —— **提到第一位**。08-27 四次、08-29~30 两次、
+   **08-31 又一次(PR #1398 的 integration 跑满 30 分钟换一条假红)**。
+   这条的成本不在「做它要多久」,在于它每周都在收利息,且发布当天再撞一次会很难受。
+2. **B-41** 嵌套执行双计的同构核查(token / 成本 / 产物)—— 廉价,耗时那一路已实证会错到
+   「思考时长 > 总耗时」。
+3. **B-31 ①** credential-proxy 失效链断头 —— **扩容前必接**;token 已随 ② 就位,
+   走 HTTP 失效方案的前置条件已满足。
+4. **B-33** 模型温度约束进 catalog —— 现在靠厂商 400 当校验器。
+
+### 等外部
+
+- **B-40** 对接方文件名乱码修复的我方验收(等对方发版)。**判据是有没有汉字,不是有没有下划线。**
+- **PPT 内容质量人工抽查** —— 真栈验收只剩这一项,用户侧。
+
+### 需要拍板才动
+
+- **P-1~P-5** 产品题;P-4(api_keys 凭据横向扩散)风险最高,建议先议。
+- **X-1 沙箱波 4** 或 **X-10 多副本整体实施方案** —— 两个大体量项,按业务优先级择一。
+
+**发布后第一波(已排队)**:RLS PR B / Redis 全局令牌桶 / 取消亚秒化 / X-1 / X-10。
 
 ## 这一轮攒下的教训(派发时带上)
 
