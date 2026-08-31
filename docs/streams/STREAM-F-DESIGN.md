@@ -408,7 +408,14 @@ POST /forward
 → 上游响应（X-Expert-Work-Secret-Ref 从响应中剥离）
 ```
 
-管理 API（仅 mTLS SAN=control-plane 可达）：`POST /admin/allowlist` / `DELETE /admin/allowlist/...` / `POST /admin/cache/invalidate` / `GET /admin/health`。
+管理 API：`POST /admin/allowlist` / `DELETE /admin/allowlist/...` / `POST /admin/cache/invalidate` / `GET /admin/health`。
+
+> **勘误（B-31 ②，2026-08-31）**：本行原写「仅 mTLS SAN=control-plane 可达」。
+> 该限制**从未实现** —— Service 是普通 ClusterIP，仓库里也没有任何 NetworkPolicy。
+> 这句声明本身是这个洞坐了这么久没被查出来的原因（写下的控制不等于生效的控制）。
+> 现在三个写入 / 失效路由要 `Authorization: Bearer $EXPERT_WORK_CRED_PROXY_ADMIN_TOKEN`，
+> **未配置该 token 时是 503 而不是放行**；`GET /admin/health` 保持开放供 kubelet 探针使用。
+> mTLS 若要做，是这道 token 闸之上的加固，不是它的替代。
 
 ### 4.5 SecretStore `aliyun_kms` —— 实现既有 Protocol
 

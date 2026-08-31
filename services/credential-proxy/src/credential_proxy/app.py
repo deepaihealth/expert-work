@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from hmac import compare_digest
 from uuid import UUID
 
 from aiohttp import ClientError, web
+from aiohttp.typedefs import Handler
 
 from credential_proxy.allowlist import AllowlistStore, DbAllowlistStore
 from credential_proxy.audit import DbEgressAuditStore, DbProxyAuditStore
@@ -52,6 +54,13 @@ _RESPONSE_DROP_HEADERS = frozenset(
     {"content-length", "content-encoding", "transfer-encoding", "connection"}
 )
 
+_ADMIN_TOKEN_KEY: web.AppKey[str] = web.AppKey("admin_token", str)
+
+#: The one ``/admin`` route that stays open — the kubelet's startup /
+#: liveness / readiness probes all hit it, before the pod is trusted by
+#: anything, and it reveals nothing but "the process answers".
+_ADMIN_OPEN_PATHS = frozenset({"/admin/health"})
+
 
 def create_app(
     settings: CredentialProxySettings | None = None,
@@ -66,7 +75,9 @@ def create_app(
     (tests) — the app then skips all DB / forwarder wiring.
     """
     resolved_settings = settings or CredentialProxySettings()
-    app = web.Application()
+    app = web.Application(middlewares=[_admin_auth])
+    if resolved_settings.admin_token:
+        app[_ADMIN_TOKEN_KEY] = resolved_settings.admin_token
 
     if proxy is not None and allowlist is not None and cache is not None:
         app[PROXY_KEY] = proxy
@@ -134,6 +145,39 @@ async def _cleanup(app: web.Application) -> None:
     engine = app[_ENGINE_KEY]
     await engine.dispose()  # type: ignore[attr-defined]
     logger.info("credential_proxy.stop")
+
+
+@web.middleware
+async def _admin_auth(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """Bearer-token gate on the ``/admin`` write surface (B-31 ②).
+
+    The design doc claims these routes are reachable only over mTLS with
+    ``SAN=control-plane``; no such restriction was ever implemented, the
+    Service is a plain ClusterIP, and there is no NetworkPolicy — so the
+    gate has to live here.
+
+    Why it matters more than "an admin API without auth": ``/admin/allowlist``
+    *writes* the allowlist, and the allowlist is the only thing ``/forward``
+    checks before resolving a secret and injecting it as ``Authorization``
+    on a request to a caller-named upstream. Registering a row is therefore
+    enough to have the proxy deliver a tenant's secret to an address of the
+    caller's choosing.
+
+    Unset token → 503, not "open". A gate that disappears when unconfigured
+    is the bug, not the fallback.
+    """
+    path = request.path
+    if not path.startswith("/admin/") or path in _ADMIN_OPEN_PATHS:
+        return await handler(request)
+
+    expected = request.app.get(_ADMIN_TOKEN_KEY)
+    if not expected:
+        return web.json_response({"detail": "admin API is not configured"}, status=503)
+
+    scheme, _, presented = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not compare_digest(presented, expected):
+        return web.json_response({"detail": "admin API requires a bearer token"}, status=401)
+    return await handler(request)
 
 
 def _register_routes(app: web.Application) -> None:
