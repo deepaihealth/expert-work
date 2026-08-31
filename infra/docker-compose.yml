@@ -304,7 +304,7 @@ services:
     # MinIO S3-compatible object storage (Stream A.5 / ADR-0004).
     # Local dev stand-in for Aliyun OSS — same protocol, zero code changes
     # between environments.
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: expert-work-minio
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -410,7 +410,7 @@ services:
     # One-shot: ensure the ``expert-work`` bucket exists (skill-asset-store +
     # J.6 image uploads land here when the s3-compatible backend is enabled).
     profiles: ["full"]
-    image: minio/mc:RELEASE.2025-04-08T15-39-49Z
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
     container_name: expert-work-minio-init
     depends_on:
       minio:
@@ -802,7 +802,7 @@ services:
   langfuse-minio-init:
     profiles: ["observability"]
     # One-shot: ensure the ``langfuse`` bucket exists in the shared MinIO.
-    image: minio/mc:RELEASE.2025-04-08T15-39-49Z
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
     container_name: expert-work-langfuse-minio-init
     depends_on:
       minio:
