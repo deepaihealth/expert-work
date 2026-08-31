@@ -36,7 +36,17 @@ function aiMsg(text: string, opts: AiMsgOpts = {}): Record<string, unknown> {
   return msg;
 }
 
-function workerEnd(usage: Record<string, unknown> | null): SseEvent {
+/** A ``worker`` end frame.
+ *
+ *  ``ident`` defaults to the single top-level worker ``w-1``. Pass it to build
+ *  a real delegation *tree* — the identity fields (``worker_id`` /
+ *  ``parent_worker_id`` / ``depth``) are what makes one frame a child of
+ *  another, and a fixture that leaves them at their defaults is three copies
+ *  of the same worker, not a tree. */
+function workerEnd(
+  usage: Record<string, unknown> | null,
+  ident: { workerId?: string; parentWorkerId?: string | null; depth?: number } = {},
+): SseEvent {
   const data: Record<string, unknown> = {
     outcome: "success",
     iteration_used: 49,
@@ -44,16 +54,17 @@ function workerEnd(usage: Record<string, unknown> | null): SseEvent {
     wall_clock_ms: 933_000,
   };
   if (usage !== null) data.usage = usage;
+  const workerId = ident.workerId ?? "w-1";
   return {
-    id: "w",
+    id: `w:${workerId}`,
     event: "worker",
     data: {
-      worker_id: "w-1",
-      parent_worker_id: null,
+      worker_id: workerId,
+      parent_worker_id: ident.parentWorkerId ?? null,
       parent_tool_call_id: "call-1",
       label: "spawn_worker",
       agent_ref: "dynamic:general",
-      depth: 1,
+      depth: ident.depth ?? 1,
       kind: "end",
       wseq: 9,
       data,
@@ -363,13 +374,53 @@ describe("summarizeTurn — worker token usage", () => {
     expect(usage?.totalTokens).toBe(11);
   });
 
-  it("counts each worker once across a whole delegation tree", () => {
-    // 每个 worker 只发一个 end 帧,所以累加所有 worker 帧 = 整棵树,不会
-    // 重复。与 duration 那次双计相反(同一段时间既进工具行又进 subagent
-    // 行)—— 那个教训在这里正好用来确认不要重蹈覆辙。
+  it("counts every worker in a flat fan-out once", () => {
+    // 三个**互不相干**的顶层 worker。原先这条写成 workerEnd(one) 三遍,而那个
+    // helper 把 worker_id / parent_worker_id / depth 全写死了 —— 素材其实是
+    // 同一个 w-1 的 end 帧发三次,连兄弟都算不上。
     const one = { input_tokens: 100, output_tokens: 10, total_tokens: 110 };
-    const events: SseEvent[] = [workerEnd(one), workerEnd(one), workerEnd(one)];
+    const events: SseEvent[] = [
+      workerEnd(one, { workerId: "w-1" }),
+      workerEnd(one, { workerId: "w-2" }),
+      workerEnd(one, { workerId: "w-3" }),
+    ];
     expect(summarizeTurn(events).usage?.totalTokens).toBe(330);
+  });
+
+  it("counts a nested worker and its parent once each — B-41", () => {
+    // **真两层**:w-1(depth 1)派出 w-2(depth 2)。孙辈的帧也直达父 run 的
+    // bridge(``_child_run.py`` 向下透传 ``worker_event_sink``,注释原话是
+    // 「孙 worker 帧直达父 run bridge」),所以总数必须正好是两者之和。
+    //
+    // 这条不变式此前在**三处**被声称、**零处**被钉住:``_usage_of`` 的
+    // docstring、``turn_summary.ts`` 的注释,以及一条名叫 "counts each worker
+    // once across a whole delegation tree" 的测试 —— 而那条的素材里没有
+    // depth、没有 parent_worker_id,根本没有树,所以它在任何嵌套相关的回归下
+    // 都不可能变红(同 memory:verify-where-it-can-fail)。
+    //
+    // 另一半(「父 worker 的账不含孙的 token」)是后端属性,前端测不到,
+    // 钉在 ``test_worker_events.py::test_a_workers_account_excludes_what_came_back_from_its_child``。
+    const parent = workerEnd(
+      { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+      { workerId: "w-1", parentWorkerId: null, depth: 1 },
+    );
+    const child = workerEnd(
+      { input_tokens: 300, output_tokens: 30, total_tokens: 330 },
+      { workerId: "w-2", parentWorkerId: "w-1", depth: 2 },
+    );
+
+    expect(summarizeTurn([parent, child]).usage?.totalTokens).toBe(440);
+  });
+
+  it("does not filter a worker out by depth", () => {
+    // 上一条若被「只认 depth === 1」实现,总数会变成 110 —— 那是漏计不是双计,
+    // 但同样是错的。单独钉一条,免得修双计时顺手把嵌套那层砍掉。
+    const child = workerEnd(
+      { input_tokens: 300, output_tokens: 30, total_tokens: 330 },
+      { workerId: "w-2", parentWorkerId: "w-1", depth: 2 },
+    );
+
+    expect(summarizeTurn([child]).usage?.totalTokens).toBe(330);
   });
 });
 
