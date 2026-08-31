@@ -301,6 +301,60 @@ async def test_paused_run_registers_approval_row_and_audits() -> None:
 
 
 @pytest.mark.asyncio
+async def test_paused_run_records_the_owner_on_the_approval_row() -> None:
+    """X-15 ② — the ``agent_approval`` row must carry the run's owner.
+
+    The timeout sweep resumes from that column: it passes ``appr.user_id``
+    into ``resolve_approval_decision`` as both ``caller_user_id`` and
+    ``oauth_user_id`` ("Per-user OAuth MCP pool key — the run's owner", its
+    own comment). Registering the row with a hardcoded ``None`` made every
+    swept continuation run ownerless — so it looked up the *shared* MCP
+    OAuth pool instead of the user's. The 1 h clarification timeout (B-20 ③)
+    turned that from a rare path into a routine one.
+
+    The value was in hand all along: ``RunRecord.user_id``.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from expert_work.persistence import InMemoryApprovalStore
+    from expert_work.protocol import ApprovalRequest
+
+    owner = uuid4()
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await rm.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4(), user_id=owner)
+    now = datetime.now(UTC)
+    request = ApprovalRequest(
+        request_id="approval:owner",
+        node="tools",
+        reason_kind="missing_info",
+        action_summary="which mailbox should I use?",
+        proposed_args={},
+        requested_at=now,
+        timeout_at=now + timedelta(hours=1),
+    )
+    graph = _ScriptedGraph(
+        chunks=[{"tools": {"step_count": 1}}],
+        final_state={"pending_approval": request.model_dump(mode="json")},
+    )
+    approvals = InMemoryApprovalStore()
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+        approval_store=approvals,
+    )
+
+    row = await approvals.get_by_run(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert row is not None
+    assert row.user_id == owner
+
+
+@pytest.mark.asyncio
 async def test_sse_consumer_frames_in_order_end_terminates() -> None:
     """End-to-end: worker fills the bridge, sse_consumer drains it into
     SSE frames, last frame is ``event: end``."""
