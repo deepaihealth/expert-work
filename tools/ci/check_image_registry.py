@@ -10,9 +10,16 @@ Docker Hub 的匿名限流按 IP 算,所以我们的配额被全世界一起花�
 integration 跑满 30 分钟,593 passed 里唯一那条 error 就是 sandbox 镜像
 ``docker build`` 拉基础镜像超 600s)。**每次都是假红,每次都要人去看一眼。**
 
-ECR Public 的 ``docker/library`` 是 AWS 对 Docker 官方镜像的镜像站,同
-digest、匿名可拉、不按共享 IP 掐我们。实测从国内冷拉 ``python:3.12-slim``
-约 1 秒。
+ECR Public 的 ``docker/library`` 是 AWS 对 Docker 官方镜像的镜像站,同 digest、
+匿名可拉。实测从国内冷拉 ``python:3.12-slim`` 约 1 秒(Docker Hub 是 KB/s)——
+**这条规矩真正稳的收益是构建速度,尤其 release.sh 从国内跑的时候。**
+
+**订正(2026-08-31 当天,写下这条规矩几小时后)**:最初这里写的是「不按共享 IP
+掐我们」—— **错的**。ECR Public 的匿名拉取同样按 IP 限流:同一天 CI 日志逐字给出
+``mock-upstream Pulling`` → ``toomanyrequests: Rate exceeded``,而 mock-upstream
+正是本规矩把 ``python:3.12-alpine`` 换过去的那个服务。所以换源**没有**解决 CI 的
+假红,只是把限流方从 Docker Hub 换成了 AWS。CI 的真解是带凭据或自建镜像仓
+(见 ROADMAP X-8 余项),不是换一个匿名公共源。
 
 卫兵扫的是**源码里的引用**,不是运行时行为 —— 加一条新的 ``FROM python:...``
 本身不会红任何测试(它照样能构建),只会在某个繁忙的早上变成又一条假红。
