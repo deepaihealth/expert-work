@@ -24,7 +24,7 @@ COPY services/ services/
 RUN uv sync --frozen --no-dev --no-editable --package expert-work-sandbox-supervisor
 
 
-FROM python:3.12-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

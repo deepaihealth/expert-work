@@ -105,6 +105,9 @@ jobs:
       - name: protected pins guard (PROD-7 / X-14 P2)
         run: uv run python tools/ci/check_protected_pins.py
 
+      - name: image registry guard (X-8)
+        run: uv run python tools/ci/check_image_registry.py
+
   typecheck:
     name: Typecheck (mypy)
     runs-on: ubuntu-latest

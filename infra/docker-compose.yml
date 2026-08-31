@@ -259,7 +259,7 @@ services:
     # ``allkeys-lru`` keeps the hottest tenant buckets when memory is
     # tight; budget keys are short-lived (per month) so eviction is a
     # non-issue.
-    image: redis:7-alpine
+    image: public.ecr.aws/docker/library/redis:7-alpine
     container_name: expert-work-redis
     command:
       - "redis-server"
@@ -342,7 +342,7 @@ services:
     # dev / mTLS tests — it pulls in the control-plane stack via the
     # ``depends_on`` below.
     profiles: ["proxy"]
-    image: nginx:1.27-alpine
+    image: public.ecr.aws/docker/library/nginx:1.27-alpine
     container_name: expert-work-nginx
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -617,7 +617,7 @@ services:
     # reach it directly, only via the proxy. ``e2e`` profile — started
     # only when the e2e test explicitly names it.
     profiles: ["e2e"]
-    image: python:3.12-alpine
+    image: public.ecr.aws/docker/library/python:3.12-alpine
     container_name: expert-work-mock-upstream
     command: ["python", "/app/echo_server.py"]
     volumes:
@@ -748,7 +748,7 @@ services:
   # reuses the existing MinIO for blob storage (separate ``langfuse`` bucket).
   langfuse-postgres:
     profiles: ["observability"]
-    image: postgres:16-alpine
+    image: public.ecr.aws/docker/library/postgres:16-alpine
     container_name: expert-work-langfuse-postgres
     environment:
       POSTGRES_USER: ${EXPERT_WORK_LANGFUSE_DB_USER:-langfuse}
@@ -790,7 +790,7 @@ services:
     # Dedicated Redis — Langfuse's queue requires ``noeviction`` (dropping
     # queued events would silently lose traces), incompatible with the
     # quota Redis's ``allkeys-lru``.
-    image: redis:7-alpine
+    image: public.ecr.aws/docker/library/redis:7-alpine
     container_name: expert-work-langfuse-redis
     command: ["redis-server", "--maxmemory-policy", "noeviction"]
     healthcheck:

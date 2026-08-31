@@ -53,7 +53,7 @@ ENV UV_CONCURRENT_DOWNLOADS=8 \
 RUN uv sync --frozen --no-dev --no-editable --package expert-work-control-plane
 
 
-FROM python:3.12-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

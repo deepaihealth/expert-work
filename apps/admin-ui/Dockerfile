@@ -15,7 +15,7 @@
 # files (no native binaries reach the final image), so it always runs on
 # the build machine's native arch — cross-building for amd64 from an
 # Apple-Silicon host skips QEMU emulation for the whole pnpm/Vite step.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS build
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:22-alpine AS build
 WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
@@ -51,7 +51,7 @@ RUN cd docs-site && pnpm install --frozen-lockfile && pnpm build
 # nginx-unprivileged ships pre-hardened for non-root K8s pods (listens on
 # 8080, master process already runs as an unprivileged uid) — avoids
 # hand-rolling the chown/USER dance stock nginx:alpine needs for that.
-FROM nginxinc/nginx-unprivileged:1.27-alpine
+FROM public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine
 
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY --from=build /app/docs-site/.vitepress/dist /usr/share/nginx/html/docs

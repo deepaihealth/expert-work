@@ -42,7 +42,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture(scope="module")
 def redis_container() -> Iterator[RedisContainer]:
-    with RedisContainer("redis:7-alpine") as container:
+    with RedisContainer("public.ecr.aws/docker/library/redis:7-alpine") as container:
         yield container
 
 

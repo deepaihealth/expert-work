@@ -47,6 +47,12 @@ def postgres_container() -> Iterator[PostgresContainer]:
     extension, Stream J.3) — a superset of stock Postgres, so every
     pre-J.3 migration / test is unaffected.
 
+    **X-8 余项**:这是全仓最后一个仍从 Docker Hub 拉的镜像,不是漏改 ——
+    官方镜像都搬到了 ``public.ecr.aws/docker/library``(见
+    ``tools/ci/check_image_registry.py``),但 pgvector 不是官方镜像,
+    ECR Public / GHCR / quay 三处都探过,没有第二个公共源。要摘掉它只能
+    自建镜像仓(GHCR + 一条定时 ``imagetools create``)。
+
     Requires Docker daemon available; tests using this fixture should
     be marked ``@pytest.mark.integration``.
     """

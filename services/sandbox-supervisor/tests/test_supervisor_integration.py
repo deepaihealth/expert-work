@@ -103,7 +103,7 @@ _PROXY_HOSTNAME = "credential-proxy.internal"
 #: endpoint a sandbox IS allowed to reach (the real proxy lands in F.10).
 _STUB_PROXY = "expert-work-test-proxy"
 #: Base image for the stub proxy — already local after the sandbox build.
-_STUB_IMAGE = "python:3.12-alpine"
+_STUB_IMAGE = "public.ecr.aws/docker/library/python:3.12-alpine"
 #: ``infra/sandbox-image/`` — the Dockerfile's build context.
 _IMAGE_CONTEXT = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image"
 

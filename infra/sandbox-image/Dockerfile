@@ -67,7 +67,7 @@
 #     writable-user path, created by `useradd -m` below) to stay out of the
 #     way too. The run root itself stays a bare mount point with nothing
 #     baked under it.
-FROM python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
