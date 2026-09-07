@@ -1,0 +1,56 @@
+# PROD cluster AlbConfig + IngressClass — the ALB instance every public
+# hostname (主站 / Langfuse / 沙箱网关) CNAMEs to.
+#
+# 勘误(2026-09-07 生产开荒实测):albconfig-listeners-patch.yaml 头注说 test 的
+# AlbConfig 是「装 ack-sandbox-manager 组件时自动建的」——生产上装完组件只出现了
+# sandbox-manager 的 Ingress(class=alb),AlbConfig / IngressClass 都没有,等了
+# 4 分钟也没有。test 的那份大概率来自建集群向导的「ALB Ingress → 新建实例」。
+# 生产建集群时选了「暂不创建」,所以这里手工建,by hand,不进 kustomize
+# (与 test 同理:sandbox-system 的 Ingress 也骑这个实例,所有权是共享的):
+#
+#   kubectl --kubeconfig ~/.kube/expert-work-prod.yaml apply -f infra/k8s/cluster/prod/albconfig.yaml
+#
+# 形态照 test 集群 `kubectl get albconfig alb -o yaml` 抄:Fixed 公网地址、
+# 两个可用区各一个交换机(ALB 最少两个;id 来自 kube-system/ack-cluster-profile
+# 的 vsw-zone)、80 HTTP + 443 HTTPS。
+#
+# - CertificateId 与 test 相同:同一张 *.deepaihealth.com 泛域名证书(DigiCert DV,
+#   有效期至 2027-01-17),数字证书管理服务里的 CertIdentifier 是账号级的,
+#   两个 ALB 实例可以共用。到期换证时两份 AlbConfig 一起改。
+# - idleTimeout 60 / requestTimeout 180 是产品上限(不提工单),SSE 靠心跳帧
+#   续命——同 test 文件头注。
+# - 后续改监听照旧用 merge patch 整段替换 listeners(必须带 80,那是沙箱网关的)。
+apiVersion: alibabacloud.com/v1
+kind: AlbConfig
+metadata:
+  name: alb
+spec:
+  config:
+    name: expert-work-prod
+    addressType: Internet
+    addressAllocatedMode: Fixed
+    zoneMappings:
+      - vSwitchId: vsw-bp1xumod1z9ltvhvtc02p   # cn-hangzhou-j
+      - vSwitchId: vsw-bp1djdop0m69qe1u10dte   # cn-hangzhou-b
+  listeners:
+    - port: 80
+      protocol: HTTP
+    - port: 443
+      protocol: HTTPS
+      idleTimeout: 60
+      requestTimeout: 180
+      certificates:
+        - CertificateId: 25878622-cn-hangzhou
+          IsDefault: true
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: ingress.k8s.alibabacloud/alb
+  parameters:
+    apiGroup: alibabacloud.com
+    kind: AlbConfig
+    name: alb
+    scope: Cluster
