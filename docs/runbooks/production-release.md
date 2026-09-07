@@ -133,7 +133,7 @@ kubectl create secret generic wecom-alert-webhook -n expert-work \
 tools/deploy/release.sh prod        # 交互确认输入 'prod'
 ```
 
-= build 双镜像(admin-ui 烤 prod OIDC)→ 钉 newTag → migrate(空库全量)→
+= build 三镜像(control-plane / credential-proxy 裸 sha,admin-ui 烤 prod OIDC)→ 钉 newTag → migrate(空库全量)→
 apply → rollout → smoke。**第一跑预期在 control-plane rollout 卡住**:prod 直上
 `sql_encrypted` 后端,lifespan 启动即解析 OSS `secret://` ref,金库还是空的 →
 CrashLoopBackOff。这不是故障,是鸡生蛋:表结构(migrate)已就位,先去 §1.6

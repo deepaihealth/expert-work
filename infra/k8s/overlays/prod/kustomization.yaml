@@ -31,11 +31,13 @@ images:
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
     newTag: PROD_PLACEHOLDER_TAG
-  # credential-proxy 变更频率低,tag 跨环境同源 —— 与 test overlay 同步钉,
-  # 它升级时两个 overlay 一起改。
+  # credential-proxy 与 control-plane 同 tag,release.sh 一起构建、一起钉
+  # (2026-09-07 起)。此前这里手工钉 94f1a371 并写着「它升级时两个 overlay
+  # 一起改」—— 结果 B-31 ② 的 /admin 闸(#1399)合了 30 多小时没进过任何
+  # 环境;「变更时手工改」这一步没有人盯着变更。smoke 校验两边 tag 相等。
   - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-    newTag: 94f1a371
+    newTag: PROD_PLACEHOLDER_TAG
   - name: grafana/grafana
     newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
   - name: grafana/tempo
