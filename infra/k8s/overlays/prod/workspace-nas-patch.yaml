@@ -9,6 +9,6 @@ metadata:
 spec:
   csi:
     volumeAttributes:
-      server: PROD_PLACEHOLDER_NAS_MOUNT_TARGET
+      server: 000vw03zalgl6ewrw8s-uds66.cn-hangzhou.nas.aliyuncs.com
       path: /workspaces
       vers: "3"

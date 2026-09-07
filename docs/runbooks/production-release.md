@@ -82,9 +82,10 @@ export KUBECONFIG=~/.kube/expert-work-prod.yaml
 # namespace 先行 —— §1.4 的 create secret 都指定 -n expert-work,
 # namespace 要到 apply -k 才会出现,所以单独提前建:
 kubectl apply -f infra/k8s/base/namespace.yaml
-# AlbConfig 监听(prod 变体):照 infra/k8s/cluster/albconfig-listeners-patch.yaml
-# 的头注新建 prod 文件(prod 有自己的 ALB 实例与证书 id,勿复用 test 的),
-# kubectl patch albconfig alb --type merge --patch-file <prod 文件>
+# AlbConfig + IngressClass(2026-09-07 开荒实测:装沙箱组件**不会**自动建 ALB,
+# 集群向导又选了「暂不创建实例」,所以整份手建;证书 id 与 test 同一张泛域名证书):
+kubectl apply -f infra/k8s/cluster/prod/albconfig.yaml
+# 生产已于 2026-09-07 建好(alb-39zoe38yejn3yljs7t),重复 apply 幂等。
 # 拉镜像凭据(2026-09-07 盘 test 集群补记:base 的 Deployment 没写 imagePullSecrets,
 # 靠 namespace 默认 ServiceAccount 挂的 acr-pull 拉私有 ACR;不建 = 全部 ImagePullBackOff)。
 # 用户名 = 阿里云账号全名,密码 = ACR 个人版「访问凭证 → 固定密码」(workstation-setup.md §2):

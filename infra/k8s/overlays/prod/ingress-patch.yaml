@@ -1,5 +1,4 @@
-# Production ALB routing — PROD_PLACEHOLDER_* until prod is actually
-# provisioned. Mirrors overlays/test/ingress-patch.yaml structure; see
+# Production ALB routing(2026-09-07 填入真域名). Mirrors overlays/test/ingress-patch.yaml structure; see
 # that file's comments for why spec.rules is a full replacement and for
 # annotation-name caveats.
 apiVersion: networking.k8s.io/v1
@@ -15,7 +14,7 @@ metadata:
     # infra/k8s/cluster/albconfig-listeners-patch.yaml.
 spec:
   rules:
-    - host: PROD_PLACEHOLDER_DOMAIN
+    - host: expert-work.deepaihealth.com
       http:
         paths:
           - path: /v1
