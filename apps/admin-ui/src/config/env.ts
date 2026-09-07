@@ -62,3 +62,27 @@ export function readKeycloakBaseUrl(): string | undefined {
   const raw = readEnv("VITE_KEYCLOAK_BASE_URL");
   return raw === undefined ? undefined : raw.replace(/\/+$/, "");
 }
+
+export type BuildEnv = "test" | "prod";
+
+export interface BuildInfo {
+  /** git 短 sha —— 与发版记录 PR、rollback.sh 的 tag 一一对应。 */
+  version?: string;
+  /** 发版脚本自己的 env_name;不是猜域名猜出来的。 */
+  env?: BuildEnv;
+  /** 构建时刻,ISO 8601 UTC。 */
+  builtAt?: string;
+}
+
+/** 「关于」弹窗的数据源。三个值由 tools/deploy/build-push.sh 在发版时烤进
+ *  admin-ui 镜像(``VITE_APP_VERSION`` / ``VITE_APP_ENV`` / ``VITE_BUILD_TIME``);
+ *  三个镜像同 sha 由 smoke 校验,所以这里的 sha 就是后端在跑的 sha。本地 dev
+ *  三个都空 → 弹窗显示「本地开发」,不装作是线上。 */
+export function readBuildInfo(): BuildInfo {
+  const env = readEnv("VITE_APP_ENV");
+  return {
+    version: readEnv("VITE_APP_VERSION"),
+    env: env === "test" || env === "prod" ? env : undefined,
+    builtAt: readEnv("VITE_BUILD_TIME"),
+  };
+}

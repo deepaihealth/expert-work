@@ -1,5 +1,6 @@
 import { Button, Dropdown, Tooltip } from "antd";
-import { Bell, LogOut, Moon, Search, Sun, UserCircle2 } from "lucide-react";
+import { Bell, Info, LogOut, Moon, Search, Sun, UserCircle2 } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useAuth } from "../auth/AuthContext";
@@ -7,12 +8,14 @@ import { useTheme } from "../theme/ThemeContext";
 import { TenantSwitcher } from "./TenantSwitcher";
 import { useCommandPalette } from "./CommandPalette";
 import { LanguageSwitcher } from "./LanguageSwitcher";
+import { AboutModal } from "./AboutModal";
 
 export function Topbar() {
   const { t } = useTranslation();
   const { mode, toggle } = useTheme();
   const { open } = useCommandPalette();
   const { identity, logout } = useAuth();
+  const [aboutOpen, setAboutOpen] = useState(false);
 
   return (
     <>
@@ -84,6 +87,12 @@ export function Topbar() {
             },
             { type: "divider" },
             {
+              key: "about",
+              label: t("common.about"),
+              icon: <Info size={14} strokeWidth={1.5} />,
+              onClick: () => setAboutOpen(true),
+            },
+            {
               key: "logout",
               label: t("common.sign_out"),
               icon: <LogOut size={14} strokeWidth={1.5} />,
@@ -104,6 +113,8 @@ export function Topbar() {
           />
         </Tooltip>
       </Dropdown>
+
+      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} />
     </>
   );
 }

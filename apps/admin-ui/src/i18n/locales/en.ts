@@ -11,6 +11,7 @@ export interface TranslationKeys {
   common: {
     sign_in: string;
     sign_out: string;
+    about: string;
     refresh: string;
     loading: string;
     cancel: string;
@@ -27,6 +28,16 @@ export interface TranslationKeys {
     copied: string;
     tenant_switched_readonly: string;
     cross_tenant_readonly: string;
+  };
+  about: {
+    title: string;
+    version: string;
+    environment: string;
+    env_test: string;
+    env_prod: string;
+    env_local: string;
+    last_updated: string;
+    unknown: string;
   };
   theme: {
     switch_to_light: string;
@@ -3110,6 +3121,7 @@ const en: TranslationKeys = {
   common: {
     sign_in: "Sign in",
     sign_out: "Sign out",
+    about: "About",
     refresh: "Refresh",
     loading: "Loading…",
     cancel: "Cancel",
@@ -3128,6 +3140,16 @@ const en: TranslationKeys = {
       "Viewing another tenant (read-only) — switch back to your home tenant to make changes",
     cross_tenant_readonly:
       "The all-tenants view is read-only — switch into a specific tenant to make changes",
+  },
+  about: {
+    title: "About Expert Work",
+    version: "Version",
+    environment: "Environment",
+    env_test: "Test",
+    env_prod: "Production",
+    env_local: "Local dev",
+    last_updated: "Last updated",
+    unknown: "Unknown",
   },
   theme: {
     switch_to_light: "Switch to Light",
