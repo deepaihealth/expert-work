@@ -8,7 +8,7 @@
  * config page, where config / quotas / credentials are edited.
  */
 import { startTransition, useCallback, useEffect, useState } from "react";
-import { Alert, App, Button, Popconfirm, Table, Tag, Typography } from "antd";
+import { Alert, App, Button, Modal, Popconfirm, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { Building } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -18,11 +18,13 @@ import {
   activateTenant,
   deactivateTenant,
   listTenants,
+  resendFirstAdmin,
   type TenantSummary,
 } from "../api/tenants";
 import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { CreateTenantDrawer } from "../components/CreateTenantDrawer";
+import { OneTimeCredentialPanel } from "../components/OneTimeCredentialPanel";
 import { PageHeader } from "../components/PageHeader";
 
 export function SettingsTenants() {
@@ -37,6 +39,10 @@ export function SettingsTenants() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
+  /** One-time credential from "Resend first-admin credentials" (password mode). */
+  const [credential, setCredential] = useState<{ account: string; password: string } | null>(
+    null,
+  );
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -78,6 +84,26 @@ export function SettingsTenants() {
       }
     },
     [message, t, reload],
+  );
+
+  // Platform-scope compensation for a tenant whose first admin never got a
+  // usable credential (Keycloak reset failed at create time, or the one-time
+  // panel was dismissed). The per-tenant "Resend" needs that very admin's
+  // session, so it is unreachable for them — this is the way back in.
+  const resendCredentials = useCallback(
+    async (id: string) => {
+      try {
+        const result = await resendFirstAdmin(id);
+        if (result.initial_password) {
+          setCredential({ account: result.email, password: result.initial_password });
+        } else {
+          message.success(t("settings_tenants.resend_first_admin_sent"));
+        }
+      } catch {
+        message.error(t("settings_tenants.resend_first_admin_failed"));
+      }
+    },
+    [message, t],
   );
 
   // The scope change and the navigation must land in ONE commit. Shell's
@@ -145,6 +171,13 @@ export function SettingsTenants() {
           >
             {t("settings_tenants.manage")}
           </Button>
+          <Button
+            size="small"
+            data-testid={`st-resend-first-admin-${r.tenant_id}`}
+            onClick={() => resendCredentials(r.tenant_id)}
+          >
+            {t("settings_tenants.resend_first_admin")}
+          </Button>
           {r.status === "active" ? (
             <Popconfirm
               title={t("settings_tenants.deactivate_confirm")}
@@ -170,6 +203,25 @@ export function SettingsTenants() {
 
   return (
     <div data-testid="st-root">
+      <Modal
+        open={credential !== null}
+        onCancel={() => setCredential(null)}
+        title={t("credential_panel.title")}
+        destroyOnHidden
+        footer={
+          <Button type="primary" onClick={() => setCredential(null)} data-testid="st-credential-close">
+            {t("settings_create_tenant.credentials_close")}
+          </Button>
+        }
+      >
+        {credential !== null && (
+          <OneTimeCredentialPanel
+            account={credential.account}
+            password={credential.password}
+            loginUrl={window.location.origin}
+          />
+        )}
+      </Modal>
       <PageHeader
         icon={<Building size={18} strokeWidth={1.5} />}
         title={t("settings_tenants.page_title")}

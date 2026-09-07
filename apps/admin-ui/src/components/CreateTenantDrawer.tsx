@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   createTenant,
+  resendFirstAdmin,
   type CreatedTenant,
   type CreateTenantBody,
   type FirstAdminSummary,
@@ -62,11 +63,17 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
     account: string;
     password: string;
   } | null>(null);
+  /** Password mode, Keycloak's reset-password step failed at create time: the
+   *  admin exists but cannot sign in. Shown as a warning with a regenerate
+   *  button instead of the plain "created" toast (2026-09-07 prod incident). */
+  const [pendingAdmin, setPendingAdmin] = useState<FirstAdminSummary | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
 
   const reset = useCallback(() => {
     setCreatedId(null);
     setFirstAdmin(null);
     setCredentialResult(null);
+    setPendingAdmin(null);
     form.resetFields();
   }, [form]);
 
@@ -116,6 +123,11 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
         // view instead of the usual toast + form reset — the password must
         // stay visible (and copyable) until the admin explicitly closes.
         setCredentialResult({ account: admin.email, password: initialPassword });
+      } else if (admin?.credential_pending) {
+        // Tenant + admin exist, but no password came back: keep the form
+        // view, surface the gap loudly, and offer the platform-scope resend.
+        setPendingAdmin(admin);
+        message.warning(t("settings_create_tenant.credential_pending_title"));
       } else {
         message.success(t("settings_create_tenant.created"));
         form.resetFields();
@@ -132,6 +144,28 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
       setSubmitting(false);
     }
   }, [form, message, onCreated, t]);
+
+  const regenerate = useCallback(async () => {
+    if (createdId === null) return;
+    setRegenerating(true);
+    try {
+      const result = await resendFirstAdmin(createdId);
+      if (result.initial_password) {
+        setCredentialResult({ account: result.email, password: result.initial_password });
+        setPendingAdmin(null);
+      } else {
+        message.error(t("settings_create_tenant.regenerate_failed"));
+      }
+    } catch (err) {
+      message.error(
+        err instanceof ApiError
+          ? `${err.code}: ${err.message}`
+          : t("settings_create_tenant.regenerate_failed"),
+      );
+    } finally {
+      setRegenerating(false);
+    }
+  }, [createdId, message, t]);
 
   return (
     <Drawer
@@ -213,6 +247,29 @@ export function CreateTenantDrawer({ open, onClose, onCreated }: CreateTenantDra
                 </span>
               }
               data-testid="ct-created"
+            />
+          )}
+          {pendingAdmin !== null && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={t("settings_create_tenant.credential_pending_title")}
+              description={t("settings_create_tenant.credential_pending_body", {
+                email: pendingAdmin.email,
+              })}
+              action={
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={regenerating}
+                  onClick={regenerate}
+                  data-testid="ct-regenerate-password"
+                >
+                  {t("settings_create_tenant.regenerate_password")}
+                </Button>
+              }
+              data-testid="ct-credential-pending"
             />
           )}
           <Form form={form} layout="vertical" initialValues={{ plan: "free" }} data-testid="ct-form">

@@ -188,3 +188,113 @@ async def test_keycloak_unavailable_returns_502(
         )
     assert resp.status_code == 502
     assert resp.json()["detail"]["code"] == "KEYCLOAK_UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# password 模式下「密码没生成」的可见性 + 平台侧补偿入口(2026-09-07 生产首发实发:
+# 建租户弹窗只弹绿色「已创建」,平台管理员切进租户是只读点不了「重发」,租户锁死)。
+# ---------------------------------------------------------------------------
+
+
+def _password_mode(settings: Settings) -> Settings:
+    return settings.model_copy(update={"member_provisioning_mode": "password"})
+
+
+@pytest.mark.asyncio
+async def test_password_mode_happy_path_reports_credential_not_pending(
+    settings: Settings, lifecycle: Lifecycle, jwt_verifier: JWTVerifier
+) -> None:
+    kc = FakeKeycloakAdminClient()
+    client, sys_admin_id, _app = await _make_client(
+        _password_mode(settings), lifecycle, jwt_verifier, kc
+    )
+    async with client:
+        resp = await client.post(
+            "/v1/tenants",
+            json={"display_name": "Acme", "first_admin_email": "boss@acme.com"},
+            headers=_headers(sys_admin_id),
+        )
+    assert resp.status_code == 201, resp.text
+    fa = resp.json()["data"]["first_admin"]
+    assert isinstance(fa["initial_password"], str) and fa["initial_password"]
+    assert fa["credential_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_password_reset_failure_is_flagged_and_platform_resend_recovers(
+    settings: Settings, lifecycle: Lifecycle, jwt_verifier: JWTVerifier
+) -> None:
+    """Keycloak 建号成功但 reset_password 失败:租户/成员照常建(不回滚),响应里
+    ``credential_pending=True`` 让前端不能装没看见;平台管理员随后经
+    ``POST /v1/tenants/{id}/first-admin/resend`` 重铸密码,不需要租户内身份。"""
+    kc = FakeKeycloakAdminClient()
+    kc.reset_password_unavailable = True
+    client, sys_admin_id, app = await _make_client(
+        _password_mode(settings), lifecycle, jwt_verifier, kc
+    )
+    async with client:
+        resp = await client.post(
+            "/v1/tenants",
+            json={"display_name": "Acme", "first_admin_email": "boss@acme.com"},
+            headers=_headers(sys_admin_id),
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()["data"]
+        tenant_id = data["tenant_id"]
+        fa = data["first_admin"]
+        assert fa["initial_password"] is None
+        assert fa["credential_pending"] is True
+        assert kc.password_resets == []
+
+        # Keycloak 恢复后,平台侧重发。
+        kc.reset_password_unavailable = False
+        resp = await client.post(
+            f"/v1/tenants/{tenant_id}/first-admin/resend",
+            headers=_headers(sys_admin_id),
+        )
+    assert resp.status_code == 200, resp.text
+    out = resp.json()["data"]
+    assert out["member_id"] == fa["member_id"]
+    assert out["email"] == "boss@acme.com"
+    assert isinstance(out["initial_password"], str) and out["initial_password"]
+    assert out["credential_pending"] is False
+    # 真的打到了 Keycloak:同一个用户、同一个明文、temporary=True(首登强制改密)。
+    assert kc.password_resets == [(fa["keycloak_user_id"], out["initial_password"], True)]
+    # 成员仍是 invited(登录激活才翻),没有多出第二个成员行。
+    members = await app.state.tenant_member_repo.list_for_tenant(tenant_id=UUID(tenant_id))
+    assert [(m.email, m.status, m.role) for m in members] == [("boss@acme.com", "invited", "admin")]
+
+
+@pytest.mark.asyncio
+async def test_first_admin_resend_is_platform_only(
+    fake_kc_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    client, sys_admin_id, _app, _kc = fake_kc_app
+    resp = await client.post(
+        "/v1/tenants",
+        json={"display_name": "Acme", "first_admin_email": "boss@acme.com"},
+        headers=_headers(sys_admin_id),
+    )
+    tenant_id = resp.json()["data"]["tenant_id"]
+    # 租户内普通 admin(非 system_admin)不能碰平台级入口。
+    stranger = {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=UUID(tenant_id), subject=str(uuid4()))}"
+    }
+    resp = await client.post(f"/v1/tenants/{tenant_id}/first-admin/resend", headers=stranger)
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_first_admin_resend_404_when_tenant_has_no_invited_admin(
+    fake_kc_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    client, sys_admin_id, _app, _kc = fake_kc_app
+    resp = await client.post(
+        "/v1/tenants", json={"display_name": "NoAdmin Co"}, headers=_headers(sys_admin_id)
+    )
+    tenant_id = resp.json()["data"]["tenant_id"]
+    resp = await client.post(
+        f"/v1/tenants/{tenant_id}/first-admin/resend", headers=_headers(sys_admin_id)
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"]["code"] == "FIRST_ADMIN_NOT_RESENDABLE"

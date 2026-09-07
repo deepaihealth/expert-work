@@ -20,13 +20,31 @@ interface PostCall {
 }
 
 let postCalls: PostCall[];
+let resendCalls: string[];
 
-/** ``data`` payload merged into the create-tenant success response, per test. */
-function installAdapter(dataOverride: Record<string, unknown> = {}): void {
+/** ``data`` payload merged into the create-tenant success response, per test;
+ *  ``resendData`` is what ``POST /v1/tenants/{id}/first-admin/resend`` returns. */
+function installAdapter(
+  dataOverride: Record<string, unknown> = {},
+  resendData: Record<string, unknown> | null = null,
+): void {
   postCalls = [];
+  resendCalls = [];
   apiClient.defaults.adapter = (config) => {
     const url = config.url ?? "";
     const method = (config.method ?? "get").toLowerCase();
+    const resend = /^\/v1\/tenants\/([^/]+)\/first-admin\/resend$/.exec(url);
+    if (resend && method === "post") {
+      resendCalls.push(resend[1]);
+      return Promise.resolve({
+        data: { success: true, data: resendData ?? {}, error: null },
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    }
     if (url === "/v1/tenants" && method === "post") {
       const body =
         typeof config.data === "string" ? JSON.parse(config.data) : (config.data ?? {});
@@ -172,5 +190,53 @@ describe("CreateTenantDrawer one-time credential result", () => {
     // Existing behavior unchanged: form stays visible, no dedicated close button.
     expect(screen.getByTestId("ct-form")).toBeInTheDocument();
     expect(screen.queryByTestId("ct-close-saved")).not.toBeInTheDocument();
+  });
+});
+
+describe("CreateTenantDrawer credential pending (password mode, Keycloak reset failed)", () => {
+  const pendingAdmin = {
+    member_id: "m1",
+    email: "admin@acme.example",
+    status: "invited",
+    keycloak_user_id: "kc-1",
+    initial_password: null,
+    credential_pending: true,
+  };
+
+  it("shows a warning instead of the plain success toast, then regenerates via first-admin resend", async () => {
+    installAdapter(
+      { first_admin: pendingAdmin },
+      { ...pendingAdmin, initial_password: "lark-opal-fern-2048", credential_pending: false },
+    );
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await user.type(screen.getByTestId("ct-display-name"), "乐毅大公司");
+    await user.type(screen.getByTestId("ct-first-admin-email"), "admin@acme.example");
+    await user.click(screen.getByTestId("ct-submit"));
+
+    // The missing password must be visible, not swallowed by "Tenant created."
+    expect(await screen.findByTestId("ct-credential-pending")).toBeInTheDocument();
+    expect(screen.queryByTestId("one-time-credential-panel")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("ct-regenerate-password"));
+
+    expect(await screen.findByTestId("one-time-credential-panel")).toBeInTheDocument();
+    expect(screen.getByText("lark-opal-fern-2048")).toBeInTheDocument();
+    expect(resendCalls).toEqual(["11111111-1111-1111-1111-111111111111"]);
+    expect(screen.queryByTestId("ct-credential-pending")).not.toBeInTheDocument();
+  });
+
+  it("does not show the warning for the email flow (initial_password null, not pending)", async () => {
+    installAdapter({ first_admin: { ...pendingAdmin, credential_pending: false } });
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await user.type(screen.getByTestId("ct-display-name"), "乐毅大公司");
+    await user.type(screen.getByTestId("ct-first-admin-email"), "admin@acme.example");
+    await user.click(screen.getByTestId("ct-submit"));
+
+    await screen.findByTestId("ct-created");
+    expect(screen.queryByTestId("ct-credential-pending")).not.toBeInTheDocument();
   });
 });
