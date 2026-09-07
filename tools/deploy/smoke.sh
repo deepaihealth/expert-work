@@ -145,6 +145,18 @@ env_replicas="$(kubectl -n expert-work exec "${POD}" -- printenv EXPERT_WORK_REP
     || echo MISSING)"
 check "EXPERT_WORK_REPLICA_COUNT matches spec.replicas" "${env_replicas}" "${spec_replicas}"
 
+# credential-proxy 必须与 control-plane 同 tag。2026-09-07 勘误:此前它不在
+# release.sh 里,test/prod overlay 手工钉死 94f1a371(2026-08-04 构建),
+# B-31 ② 的 /admin 闸(#1399)合了 30 多小时没进过任何环境 —— 集群里 GET
+# /admin/allowlist 无 token 返 405 而不是 503。两边 tag 不等 = 有人又把它
+# 从发布路径上摘了,红在这里而不是等下次侦察。
+echo "== images =="
+cp_tag="$(kubectl -n expert-work get deploy control-plane \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')"
+proxy_tag="$(kubectl -n expert-work get deploy credential-proxy \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')"
+check "credential-proxy tag matches control-plane" "${proxy_tag}" "${cp_tag}"
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \

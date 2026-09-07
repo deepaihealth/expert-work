@@ -6,6 +6,9 @@
 #   control-plane  services/control-plane/Dockerfile, context = repo root
 #                  (the uv workspace build needs packages/ + services/).
 #   admin-ui       apps/admin-ui/Dockerfile, context = apps/admin-ui
+#   credential-proxy  services/credential-proxy/Dockerfile, context = repo root
+#                  (2026-09-07 加入:此前不在这里,test/prod overlay 手工钉死
+#                  94f1a371,B-31 ② #1399 合了 30 多小时没进过任何环境)
 #                  (not part of the pnpm workspace — see that Dockerfile's
 #                  own header comment).
 #
@@ -26,7 +29,7 @@
 # and falls back to token-paste login (no OIDC configured).
 #
 # Usage:
-#   tools/deploy/build-push.sh [--images control-plane,admin-ui] [--tag <tag>] [--push|--no-push] \
+#   tools/deploy/build-push.sh [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \
 #       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \
 #       [--langfuse-base-url <url>]
 #
@@ -42,7 +45,7 @@ set -euo pipefail
 
 readonly REGISTRY="crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com"
 readonly NAMESPACE="expert-work"
-readonly DEFAULT_IMAGES="control-plane,admin-ui"
+readonly DEFAULT_IMAGES="control-plane,admin-ui,credential-proxy"
 
 #: repo root — tools/deploy/build-push.sh → two parents up.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -64,14 +67,14 @@ langfuse_base_url="${VITE_LANGFUSE_BASE_URL:-}"
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 [--images control-plane,admin-ui] [--tag <tag>] [--push|--no-push] \\
+Usage: $0 [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \\
     [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \\
     [--langfuse-base-url <url>]
 
 Builds (and optionally pushes) expert-work images to Aliyun ACR.
 
 Options:
-  --images <list>       comma-separated subset of: control-plane,admin-ui (default: both)
+  --images <list>       comma-separated subset of: control-plane,admin-ui,credential-proxy (default: all three)
   --tag <tag>           image tag (default: \$(git rev-parse --short HEAD))
   --push                push after building (requires 'docker login ${REGISTRY}')
   --no-push             build only, skip push (default)
@@ -209,8 +212,12 @@ for image in "${selected[@]}"; do
                 build_image "admin-ui" "${REPO_ROOT}/apps/admin-ui/Dockerfile" "${REPO_ROOT}/apps/admin-ui"
             fi
             ;;
+        credential-proxy)
+            # Same workspace build as control-plane (uv --package), context = repo root.
+            build_image "credential-proxy" "${REPO_ROOT}/services/credential-proxy/Dockerfile" "${REPO_ROOT}"
+            ;;
         *)
-            echo "Unknown image: ${image} (expected: control-plane, admin-ui)" >&2
+            echo "Unknown image: ${image} (expected: control-plane, admin-ui, credential-proxy)" >&2
             exit 2
             ;;
     esac

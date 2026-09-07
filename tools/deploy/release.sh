@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # One-command release to an expert-work cluster environment (W2 spec §3.3).
 #
-#   tools/deploy/release.sh test [--tag <sha>] [--images control-plane,admin-ui] [--dry-run]
+#   tools/deploy/release.sh test [--tag <sha>] [--images control-plane,admin-ui,credential-proxy] [--dry-run]
 #
 # Steps (in order):
-#   1. build + push both images via build-push.sh
+#   1. build + push all three images via build-push.sh
+#      (credential-proxy joined 2026-09-07 — before that it was hand-pinned
+#      in both overlays and #1399's admin gate never reached any cluster)
 #      (control-plane :<tag>; admin-ui :<tag>-test with the env's OIDC +
 #      Langfuse build args baked in — see build-push.sh header for why
 #      the admin-ui image is environment-specific)
@@ -31,11 +33,11 @@ readonly SCRIPT_DIR REPO_ROOT
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 <env> [--tag <sha>] [--images control-plane,admin-ui] [--dry-run] [--yes]
+Usage: $0 <env> [--tag <sha>] [--images control-plane,admin-ui,credential-proxy] [--dry-run] [--yes]
 
   env         target environment: test | prod
   --tag       image tag basis (default: current git short HEAD)
-  --images    subset to build/deploy (default: both)
+  --images    subset to build/deploy (default: all three)
   --dry-run   print every step without executing anything
   --yes       skip the interactive prod confirmation (CI / scripted use)
 
@@ -52,7 +54,7 @@ env_name="$1"
 shift
 
 tag=""
-images="control-plane,admin-ui"
+images="control-plane,admin-ui,credential-proxy"
 dry_run=0
 assume_yes=0
 while [[ $# -gt 0 ]]; do
@@ -194,9 +196,10 @@ readonly ACR="crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-
 # ------------------------------------------------------------- 1. build+push
 if [[ ",${images}," == *",admin-ui,"* ]]; then
     # admin-ui gets its env-specific tag in a SEPARATE build-push call so
-    # control-plane keeps the bare sha tag.
-    if [[ ",${images}," == *",control-plane,"* ]]; then
-        run "${SCRIPT_DIR}/build-push.sh" --images control-plane --tag "${tag}" --push
+    # the bare-sha images (control-plane, credential-proxy) keep their tag.
+    bare_images="$(printf '%s' ",${images}," | sed -e 's/,admin-ui,/,/' -e 's/^,//' -e 's/,$//')"
+    if [[ -n "${bare_images}" ]]; then
+        run "${SCRIPT_DIR}/build-push.sh" --images "${bare_images}" --tag "${tag}" --push
     fi
     run "${SCRIPT_DIR}/build-push.sh" --images admin-ui --tag "${admin_ui_tag}" --push \
         --oidc-issuer "${OIDC_ISSUER}" \
@@ -223,6 +226,9 @@ if [[ ",${images}," == *",control-plane,"* ]]; then
 fi
 if [[ ",${images}," == *",admin-ui,"* ]]; then
     set_new_tag "${ACR}/admin-ui" "${admin_ui_tag}"
+fi
+if [[ ",${images}," == *",credential-proxy,"* ]]; then
+    set_new_tag "${ACR}/credential-proxy" "${tag}"
 fi
 
 # --------------------------------------------------------- 3. migrate+apply

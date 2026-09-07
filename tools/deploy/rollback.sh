@@ -3,7 +3,10 @@
 # (W2 spec §3.3). Image tags live in ACR forever, so rollback is a
 # seconds-level image switch — no rebuild.
 #
-#   tools/deploy/rollback.sh <env> <tag> [--images control-plane,admin-ui] [--dry-run]
+#   tools/deploy/rollback.sh <env> <tag> [--images control-plane,admin-ui,credential-proxy] [--dry-run]
+#
+#   Tags older than 2026-09-07 have no credential-proxy image (it joined the
+#   release path that day) — roll those back with --images control-plane,admin-ui.
 #
 # <tag> is the CONTROL-PLANE tag of the release to return to (the bare
 # main sha); admin-ui is switched to <tag><env-suffix> in lockstep, the
@@ -20,7 +23,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 <env> <tag> [--images control-plane,admin-ui] [--dry-run]
+Usage: $0 <env> <tag> [--images control-plane,admin-ui,credential-proxy] [--dry-run]
 
   env         target environment: test | prod
   tag         control-plane tag to roll back to (bare main sha);
@@ -36,7 +39,7 @@ env_name="$1"
 tag="$2"
 shift 2
 
-images="control-plane,admin-ui"
+images="control-plane,admin-ui,credential-proxy"
 dry_run=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -97,6 +100,10 @@ fi
 if [[ ",${images}," == *",admin-ui,"* ]]; then
     run kubectl -n expert-work set image deploy/admin-ui \
         "admin-ui=${ACR}/admin-ui:${tag}${ADMIN_UI_TAG_SUFFIX}"
+fi
+if [[ ",${images}," == *",credential-proxy,"* ]]; then
+    run kubectl -n expert-work set image deploy/credential-proxy \
+        "credential-proxy=${ACR}/credential-proxy:${tag}"
 fi
 
 if [[ "${dry_run}" -eq 0 ]]; then
