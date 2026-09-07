@@ -40,6 +40,8 @@
 
 ### 1.1 本机接线(不进 git)
 
+新机器或换电脑:工具、登录、kubeconfig 从哪下,先按 [workstation-setup.md](./workstation-setup.md) 走一遍。
+
 ```sh
 # kubeconfig
 cp <下载的凭据> ~/.kube/expert-work-prod.yaml

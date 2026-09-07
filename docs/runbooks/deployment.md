@@ -4,6 +4,10 @@
 > 深度专题(蓝绿脚本、Postgres、TLS、备份)在对应 runbook,本手册串起全程并链接它们。
 >
 > 落实 Stream I(发布/回滚)+ Stream ACCT(首装向导)。设计见 [STREAM-I-DESIGN](../streams/STREAM-I-DESIGN.md) / [STREAM-ACCT-DESIGN](../streams/STREAM-ACCT-DESIGN.md)。
+>
+> **集群(ACS + kustomize)路径先看这两份**:新机器 / 换电脑 → [workstation-setup.md](./workstation-setup.md);
+> 测试发版 = `tools/deploy/release.sh test`(惯例在 workstation-setup §5);生产 → [production-release.md](./production-release.md)。
+> 下文 §6 / §8 / §14 讲的是 docker-compose 蓝绿(ECS 单机)路径,与集群无关。
 
 ## 目录
 
