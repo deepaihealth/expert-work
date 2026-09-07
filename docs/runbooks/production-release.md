@@ -153,7 +153,9 @@ tools/deploy/release.sh prod        # 交互确认输入 'prod'
 = build 三镜像(control-plane / credential-proxy 裸 sha,admin-ui 烤 prod OIDC)→ 钉 newTag → migrate(空库全量)→
 apply → rollout → smoke。**第一跑预期在 control-plane rollout 卡住**:prod 直上
 `sql_encrypted` 后端,lifespan 启动即解析 OSS `secret://` ref,金库还是空的 →
-CrashLoopBackOff。这不是故障,是鸡生蛋:表结构(migrate)已就位,先去 §1.6
+CrashLoopBackOff。**卡住了先看 `kubectl logs` 最后的异常,别默认就是空金库**——
+2026-09-07 首发第一跑的真因是 KEK 格式(见 secrets.env.example 勘误),和金库无关。
+这不是故障,是鸡生蛋:表结构(migrate)已就位,先去 §1.6
 seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
 `kubectl -n expert-work rollout restart deploy/control-plane`)转绿。smoke 的
 公网检查在 DNS 生效前也会红,先看 `/healthz/ready` 与 pods 两项。
@@ -174,9 +176,18 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
      --image=crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:$TAG \
      --overrides='{"spec":{"containers":[{"name":"vault-seed","image":"crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:'$TAG'","command":["sleep","3600"],"envFrom":[{"configMapRef":{"name":"control-plane-config"}},{"secretRef":{"name":"control-plane-secrets"}}]}]}}'
    kubectl -n expert-work wait --for=condition=Ready pod/vault-seed --timeout=180s
-   # ① KC admin-client secret(值 = 步骤 1 重置出的 expert-work-api-internal client secret):
-   kubectl -n expert-work exec vault-seed -- \
-     python -m control_plane.seed_keycloak_secret --value '<client secret>'
+   # ① KC admin-client secret(值 = 步骤 1 重置出的 expert-work-api-internal client secret)。
+   # 2026-09-07 实做:值不经 argv,从 keycloak pod 用 kcadm 读出直接管道灌进 seed pod 的
+   # stdin,CLI 走 EXPERT_WORK_KEYCLOAK_ADMIN_CLIENT_SECRET 环境变量(--name 三条同此法):
+   kubectl -n expert-work exec -i keycloak-0 -- bash -c 'K=/opt/keycloak/bin/kcadm.sh; \
+     $K config credentials --server http://localhost:8080/kc --realm master \
+       --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" >/dev/null 2>&1; \
+     AID=$($K get clients -r expert-work -q clientId=expert-work-api-internal --fields id --format csv --noquotes); \
+     $K get clients/$AID/client-secret -r expert-work --fields value --format csv --noquotes' \
+   | kubectl -n expert-work exec -i vault-seed -- sh -c 'read -r V; \
+       EXPERT_WORK_KEYCLOAK_ADMIN_CLIENT_SECRET="$V" python -m control_plane.seed_keycloak_secret'
+   # (老写法,值会进 shell history:)
+   #   python -m control_plane.seed_keycloak_secret --value '<client secret>'
    # ②③ OSS AK/SK(configmap 的 EXPERT_WORK_OBJECT_STORE_*_REF 两个 secret:// ref
    # 所指;--name 走同一 CLI,PROD-5 加的通用模式):
    kubectl -n expert-work exec vault-seed -- \
