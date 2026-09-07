@@ -12,7 +12,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base
+- ../../base
 
 # Deployed image tags — same release conventions as overlays/test/
 # (fresh tag every release, `-rN` for same-source rebuilds, ACS caches
@@ -21,61 +21,57 @@ resources:
   # The prod cluster VPC cannot reach docker.io / quay.io either — same
   # constraint as test; every upstream image is remapped to the SAME ACR
   # mirror copies (mirror once, both clusters pull the same bits).
-images:
-  - name: clickhouse/clickhouse-server
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
-    newTag: 24.12-alpine-r1
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-    newTag: PROD_PLACEHOLDER_TAG
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-    newTag: PROD_PLACEHOLDER_TAG
   # credential-proxy 与 control-plane 同 tag,release.sh 一起构建、一起钉
   # (2026-09-07 起)。此前这里手工钉 94f1a371 并写着「它升级时两个 overlay
   # 一起改」—— 结果 B-31 ② 的 /admin 闸(#1399)合了 30 多小时没进过任何
   # 环境;「变更时手工改」这一步没有人盯着变更。smoke 校验两边 tag 相等。
-  - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-    newTag: PROD_PLACEHOLDER_TAG
-  - name: grafana/grafana
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
-  - name: grafana/tempo
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
-  - name: langfuse/langfuse
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
-  - name: langfuse/langfuse-worker
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
-  - name: otel/opentelemetry-collector
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
-    newTag: 0.119.0-r1
-  - name: prom/alertmanager
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
-  - name: prom/prometheus
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
-  - name: quay.io/keycloak/keycloak
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
-    newTag: "25.0"
-  - name: searxng/searxng
-    newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
-    newTag: "2026-07-29"
+images:
+- name: clickhouse/clickhouse-server
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/clickhouse-server
+  newTag: 24.12-alpine-r1
+- name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
+  newTag: 2d5742c6-prod
+- name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
+  newTag: 2d5742c6
+- name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
+  newTag: 2d5742c6
+- name: grafana/grafana
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
+- name: grafana/tempo
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/tempo
+- name: langfuse/langfuse
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse
+- name: langfuse/langfuse-worker
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/langfuse-worker
+- name: otel/opentelemetry-collector
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/opentelemetry-collector
+  newTag: 0.119.0-r1
+- name: prom/alertmanager
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/alertmanager
+- name: prom/prometheus
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/prometheus
+- name: quay.io/keycloak/keycloak
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/keycloak
+  newTag: "25.0"
+- name: searxng/searxng
+  newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/searxng
+  newTag: "2026-07-29"
 
 # Same VPC constraint as test: upstream default engines unreachable —
 # mainland-engine-only settings(见 searxng-settings-cn.yml 头注)。
 configMapGenerator:
-  - behavior: replace
-    files:
-      - settings.yml=searxng-settings-cn.yml
-    name: searxng-settings
+- behavior: replace
+  files:
+  - settings.yml=searxng-settings-cn.yml
+  name: searxng-settings
 
 patches:
-  - path: configmap-patch.yaml
-  - path: ingress-patch.yaml
-  - path: keycloak-patch.yaml
-  - path: langfuse-configmap-patch.yaml
-  - path: langfuse-ingress-patch.yaml
-  - path: workspace-nas-patch.yaml
-
-# Secrets (control-plane-secrets / keycloak-secrets / langfuse-secrets /
-# wecom-alert-webhook) are NOT built by kustomize here — see
-# secrets.env.example and infra/k8s/base/secrets.example.yaml.
+- path: configmap-patch.yaml
+- path: ingress-patch.yaml
+- path: keycloak-patch.yaml
+- path: langfuse-configmap-patch.yaml
+- path: langfuse-ingress-patch.yaml
+- path: workspace-nas-patch.yaml
