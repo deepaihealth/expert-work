@@ -24,7 +24,7 @@
 | 资源 | 要求 | 产出物 |
 |---|---|---|
 | ACS prod 集群(杭州) | 装 ack-sandbox-manager 组件(记下 adminApiKey)+ ALB Ingress controller | kubeconfig → `~/.kube/expert-work-prod.yaml` |
-| RDS PG16 | 三库三账号:应用库 + `keycloak` + `langfuse`,**全部非 superuser** | host + 三组账号密码 |
+| RDS PG16 | 三库三账号:应用库 + `keycloak` + `langfuse`,**全部非 superuser**。**应用账号建成 RDS「高权限账号」**(非 superuser,但带 CREATEROLE/BYPASSRLS):迁移 0005 要 `CREATE ROLE audit_reader NOLOGIN BYPASSRLS`,普通账号建不了;test 实测 `expert_work_dev` 正是此形态(rolsuper=false)。keycloak / langfuse 用普通账号,各自做自己库的 owner | host + 三组账号密码 |
 | Redis 社区版 7.0 | **实例级 `maxmemory-policy=noeviction`**(部署时 `CONFIG GET` 验证);DB 0=平台 / DB 1=Langfuse | host + 密码 |
 | OSS bucket | 平台文档/产物 + `langfuse/` 前缀共 bucket;RAM AK/SK | endpoint / bucket / region / AK/SK |
 | 通用型 NAS | 挂载点 + 手工建 `/workspaces` 目录(mount 后 mkdir;回收站开 7 天,照 test 勘误 #1144) | 挂载点域名 |
@@ -85,8 +85,24 @@ kubectl apply -f infra/k8s/base/namespace.yaml
 # AlbConfig 监听(prod 变体):照 infra/k8s/cluster/albconfig-listeners-patch.yaml
 # 的头注新建 prod 文件(prod 有自己的 ALB 实例与证书 id,勿复用 test 的),
 # kubectl patch albconfig alb --type merge --patch-file <prod 文件>
+# 拉镜像凭据(2026-09-07 盘 test 集群补记:base 的 Deployment 没写 imagePullSecrets,
+# 靠 namespace 默认 ServiceAccount 挂的 acr-pull 拉私有 ACR;不建 = 全部 ImagePullBackOff)。
+# 用户名 = 阿里云账号全名,密码 = ACR 个人版「访问凭证 → 固定密码」(workstation-setup.md §2):
+kubectl -n expert-work create secret docker-registry acr-pull \
+  --docker-server=crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com \
+  --docker-username='<阿里云账号全名>' --docker-password='<ACR 固定密码>'
+kubectl -n expert-work patch serviceaccount default \
+  -p '{"imagePullSecrets":[{"name":"acr-pull"}]}'
+# SandboxSet 在 default namespace,Secret 不能跨 namespace 引用,复制一份
+# (infra/k8s/sandbox/sandboxset.yaml 头注同一配方):
+kubectl -n expert-work get secret acr-pull -o jsonpath='{.data.\.dockerconfigjson}' \
+  | base64 -d > /tmp/acr-cfg.json
+kubectl -n default create secret docker-registry acr-pull \
+  --from-file=.dockerconfigjson=/tmp/acr-cfg.json && rm -f /tmp/acr-cfg.json
 # SandboxSet(namespace 语义见文件头注,by hand,不进 kustomize):
 kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
+# NAS 上建工作区根目录(PV path=/workspaces,目录不存在则挂载失败)。挂载点是
+# NFSv3,从任一能到 NAS 的 pod 挂根路径 mkdir,或先临时把 PV path 改成 / 建目录。
 ```
 
 ### 1.4 Secrets(六个 + 企微)
