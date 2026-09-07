@@ -53,21 +53,23 @@ def compose_stack() -> Iterator[DockerCompose]:
         # ``mock-upstream Pulling`` → ``toomanyrequests: Rate exceeded``。
         # 每多拉一个用不到的镜像,就多一次踩限流的机会。
         services=["postgres", "pgbouncer"],
-        pull=True,
+        # ``pull=False``:镜像由 CI 的预拉步骤(tools/ci/prepull_images.py,带退避)
+        # 先放进本机;``pull=True`` 会再去 registry 核对 manifest,限流一到照样
+        # 失败,本地缓存等于白拉。镜像真不在时 ``up`` 自己会拉。
+        pull=False,
         wait=True,
     )
     try:
         with stack:
             yield stack
     except subprocess.CalledProcessError as exc:
-        # X-8 余项:pull 挂了要说清是**哪个镜像**。testcontainers 走 check_call,
+        # X-8 余项:起栈挂了要说清是**哪个镜像**。testcontainers 走 check_call,
         # CalledProcessError 身上没有 output,原样抛出去只剩一句 exit status 1。
+        # 重跑 pull 只拉本 fixture 那几个服务 —— 拉整份 compose 会自己再撞一次限流。
         cmd = exc.cmd if isinstance(exc.cmd, list) else [str(exc.cmd)]
-        if "pull" not in " ".join(cmd):
-            raise
         pytest.fail(
-            "compose 起栈失败在 pull 这一步 —— 带输出重跑的结果:\n"
-            + explain_compose_pull_failure(_INFRA_DIR)
+            f"compose 起栈失败({' '.join(cmd)[:80]})—— 带输出重跑 pull 的结果:\n"
+            + explain_compose_pull_failure(_INFRA_DIR, services=["postgres", "pgbouncer"])
         )
 
 

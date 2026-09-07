@@ -54,6 +54,23 @@ def test_the_helper_never_raises_on_top_of_the_original_failure() -> None:
     assert "重跑 pull 也失败了" in out
 
 
+def test_services_scope_the_rerun_to_what_the_fixture_actually_pulled() -> None:
+    """重跑不带 services 就是整份 compose —— 会多拉用不到的镜像,自己再撞一次限流,
+    报出来的是别的镜像的错(2026-09-07 实发)。"""
+    seen: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    explain_compose_pull_failure("/infra", services=["postgres", "pgbouncer"], runner=run)
+
+    assert seen == [
+        ["docker", "compose", "-f", "docker-compose.yml", "pull", "postgres", "pgbouncer"]
+    ]
+
+
 def test_long_output_is_truncated_not_dumped_whole() -> None:
     """CI 日志里贴一兆 pull 进度条,等于把真正的报错埋掉。"""
     out = explain_compose_pull_failure(
