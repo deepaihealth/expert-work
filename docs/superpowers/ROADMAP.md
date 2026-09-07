@@ -33,9 +33,9 @@
   测试环境 `afe00ebb`,两页真栈验收 15/15,记录 PR #1222 已合并(`72a5421b`)。
   设计 `docs/superpowers/specs/2026-08-17-debug-console-redesign-design.md`;遗留见下文「D · 调试台 program follow-up」。
 - **仍然有效的剩余项**(2026-08-31 复核)= 「待产品拍板」P-1~P-5、「其它 program 挂起项」X-1 / X-3~X-14 / X-15 ①、
-  「小 backlog」B-1~B-7、B-9~B-18、B-21、B-23、B-24、B-27~B-31 ①、B-33、B-38、B-40、B-41、
+  「小 backlog」B-1~B-7、B-9~B-18、B-21、B-23、B-24、B-27~B-31 ①、B-33、B-38、B-40、B-42、
   「调试台 follow-up」D-7。已销案的:D-1~D-6、B-8、B-19、B-20 主体、B-22、B-25、B-26、B-34、
-  **B-35 / B-36 / B-37 / B-39**、**B-31 ② / B-32(08-31 发布前必修批)**、X-2、**X-15 ②**、X-16。
+  **B-35 / B-36 / B-37 / B-39**、**B-31 ② / B-32(08-31 发布前必修批)**、**B-41**、X-2、**X-8 主体**、**X-15 ②**、X-16。
   X-3 起与 D 节为 2026-08-20 从各 program 记忆汇集补录,
   **开工前先按行内注明的来源核实现状**(记忆反映的是记录时点;本文件已两次因未核实而误报进度)。
 
@@ -476,8 +476,8 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 | B-38 | **(#1392/#1393 明写的边界,2026-08-30)委派上下文只覆盖「本轮用户附件」**:文档路径与图片引用已结构性进子代种子消息并活过检查点续跑,但**用户偏好、历史轮的附件、跨轮上下文仍不进子代** —— 与 [[B-37]] 同族(子代不继承对话是刻意设计,缺的是「共享约定」通道)。真栈上翻过的车是主 Agent 漏抄文件名导致 worker 选错文件;同类风险在别的维度上仍在。要不要再开通路、开哪些,等下一次实证 |
 | ~~B-39~~ | ~~#1392/#1393 的真栈复验~~ **✅ 两半全过(2026-08-31,测试环境 `7ed71857`)**。判据不看模型行为,看**检查点** —— 子代跑在自己的 sub_thread_id 上,种子 `HumanMessage` 落进 `checkpoint_blobs`,而 `[attachments]` 这个字面标记只可能出现在子代种子里(父消息里是 `[file attached: …]`)。**①附件到达子代**:`pf-probe` 传文档起一轮派了 3 个 worker,3 个子线程种子里都读到 `- uploads/b39-probe-doc.md`;对照排除误读 —— 父线程含 `[file attached:` 9 条、含 `[attachments]` **0 条**。另实证 `turn_documents` / `turn_image_refs` 是真实被 checkpoint 持久化的通道。**②审批续跑不丢**:给 `pf-probe` 配 `approval_required_tools` 后,run 撞 `write_file` 闸 `paused`(审批单 `policy_gate`)→ 对外 API 批准 → continuation `is_resume=True` `graph_input=None` 恢复并 `success` → **新增** 2 个子代线程,种子仍带 `- uploads/b39-resume-doc.md`(判据用「新增」而非总数,排除拿暂停前的旧证据充数)。**过程勘误**:探针脚本一度打印「没停在审批闸」,那是 SSE end 帧没被解析到的误判,查库才见 `status=paused` —— 别拿脚本输出当被观测之物 |
 | B-40 | **(2026-08-30 记账)对接方文件名乱码修复的我方验收** —— 根因已定位在对方 `busboy`/`multer`(见进度节),对方修完待发。发版后我方查库里新上传行的 `ref` / `filename` 两列贴给对方。**验收判据是「有没有汉字」,不是「有没有下划线」**:我方 `_safe_workspace_name` 的 `[^\w.-]+` 清洗里 `\w` 是 Unicode 感知的,汉字原样保留,但空格 / 全角括号会变下划线 —— 正确结果长这样 `uploads/糖尿病健康管理AI_SOP_内部试用版_v1.1.docx`。另:`user_upload.filename` 存的是清洗后的叶子名,**原始文件名全平台不留**,对方已明确不需要、不加字段 |
-| B-41 | **(#1370 修复时留的同构问题,2026-08-29)嵌套执行的双计是否只在耗时上** —— 过程条把子智能体墙钟计了两遍(父工具行 + 展开的 subagent 行各带一份),已修;但 **token / 成本 / 产物计数是不是同一个形状的双计,当时没查**。#1374(worker token 计入本轮总数)与 #1367(产物行补 worker 产物)都是「补漏」方向的修,不构成对「有没有重复计」的回答。查法=构造一次带 worker 的 run,把三类计数分别按「父行」「子行」拆开对账 |
-
+| ~~B-41~~ | ~~嵌套执行的双计是否只在耗时上~~ **✅ 已查清(2026-08-31,PR #1403)。结论:只有耗时那一路是双计,已修;另三路都不是** —— 但**其中一路的不变式从没被钉住**。逐路对账:**耗时**=双计(同一段墙钟既进父工具行又进 subagent 行),#1370 已修且有测试;**token**=不双计,靠两件事同时成立 ——(a)孙 worker 的 end 帧也直达父 run 的 bridge(`_child_run` 向下透传 `worker_event_sink`),(b)每个 end 帧只装自己那份(子代跑在自己线程上,回父侧只是一条不带 `usage_metadata` 的 `ToolMessage`);**成本**=token 的纯函数(`costCnyOf` = `summary.usage` × 费率卡),token 不双计它就不双计;**产物**=`turnArtifacts` 按名去重,且「两个源同名」这一情形真有测试盖住。**真正的发现**:token 那条不变式在**三处被声称、零处被钉住** —— `_usage_of` 的 docstring、`turn_summary.ts` 的注释,以及一条名叫 `counts each worker once across a whole delegation tree` 的测试;而那条测试的 fixture 因为 helper 把 `worker_id`/`parent_worker_id`/`depth` 全写死,实际是**同一个 w-1 的 end 帧发了三遍**,没有树,所以任何嵌套相关的回归都不可能让它变红(同 [[verify-where-it-can-fail]]、[[description-is-not-the-thing]])。已补两条真嵌套的钉子(前端两层树 + 后端「父的账不含从孙那儿回来的东西」),变异自证:后端读一下 `additional_kwargs` → `3300330 == 330` 红(一万倍,正是那个形状);前端只认 `depth === 1` → 两条齐红 | ✅ |
+| B-42 | **(B-41 查证顺带发现,2026-08-31)整轮成本按主 Agent 的费率给 worker 的 token 计价** —— 不是双计,是**错价**。`TurnBlock.costCnyOf` 是 `summary.usage × 单张费率卡`,而那张卡是「the agent model's rate, fetched once per (provider, model)」(`PlaygroundTab.tsx:240`);自 #1374 起 `summary.usage` **含 worker 的 token**,而 #1322 允许 `dynamic_workers.model` 给 worker 换模型 —— 两个 PR 各自都对,合起来就错。量级不小:线上 run f562fa69 里 worker 占 3,317,974 / 主线 175,137,**95% 的计价 token 来自 worker**。**前端修不了**:`build_worker_end_frame` 根本不带模型名(`outcome`/`iteration_used`/`llm_call_count`/`wall_clock_ms`/`usage` 五个字段),数据源里没有这笔信息。修法=end 帧补 `model`(或 provider+model)+ 前端按模型分别取费率卡累加。**计费不受影响** —— 那条走 `token_usage` 行 + rollup,按 `{parent}-worker` 逐次调用记全,与本条无关;错的只有控制台显示的那个数 |
 ---
 
 ## D · 调试台 program follow-up —— D-1~D-6 ✅ 全清(D-1~D-4 于 2026-08-20,D-5/D-6 于 2026-08-23);**仅剩 D-7**
@@ -530,11 +530,13 @@ usage/tenant_config/tenant_quotas 这几族;真扫出来还有 `api_keys` 6 + `m
 1. ~~**X-8 / CI 镜像离 Docker Hub**~~ **✅ 已交付(#1402)** —— 原**提到第一位**。08-27 四次、08-29~30 两次、
    **08-31 又一次(PR #1398 的 integration 跑满 30 分钟换一条假红)**。
    这条的成本不在「做它要多久」,在于它每周都在收利息,且发布当天再撞一次会很难受。
-2. **B-41** 嵌套执行双计的同构核查(token / 成本 / 产物)—— 廉价,耗时那一路已实证会错到
-   「思考时长 > 总耗时」。
-3. **B-31 ①** credential-proxy 失效链断头 —— **扩容前必接**;token 已随 ② 就位,
+2. ~~**B-41** 嵌套执行双计的同构核查~~ **✅ 已查清(#1403)**:只有耗时那一路是双计(#1370 已修),
+   token / 成本 / 产物都不是。但 token 的不变式**在三处被声称、零处被钉住**,已补两条真嵌套的钉子。
+3. **B-42** 整轮成本按主 Agent 的费率给 worker 的 token 计价(B-41 顺带查出)—— 不是双计是**错价**;
+   线上那个 run 里 **95% 的计价 token 来自 worker**。前端修不了,`build_worker_end_frame` 不带模型名。
+4. **B-31 ①** credential-proxy 失效链断头 —— **扩容前必接**;token 已随 ② 就位,
    走 HTTP 失效方案的前置条件已满足。
-4. **B-33** 模型温度约束进 catalog —— 现在靠厂商 400 当校验器。
+5. **B-33** 模型温度约束进 catalog —— 现在靠厂商 400 当校验器。
 
 ### 等外部
 

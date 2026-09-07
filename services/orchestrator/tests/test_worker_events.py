@@ -390,3 +390,54 @@ def test_usage_of_sums_ai_messages_and_reports_none_when_unreported() -> None:
 
     assert _usage_of([AIMessage(content="x"), SystemMessage(content="s")]) is None
     assert _usage_of([]) is None
+
+
+def test_a_workers_account_excludes_what_came_back_from_its_child() -> None:
+    """B-41 —— 嵌套委派的另一半不变式:**父 worker 的账不含孙 worker 的 token**。
+
+    整棵树只被数一次,靠的是两件事同时成立:
+
+    1. 孙 worker 的 end 帧也直达父 run 的 bridge(``_child_run`` 把
+       ``worker_event_sink`` 向下透传),消费者累加所有 end 帧即得整棵树;
+    2. **而每个 worker 的 end 帧只装它自己那份** —— 子代跑在自己的线程上,
+       回到父这边只是一条 ``ToolMessage``,不带 ``usage_metadata``。
+
+    少了第 2 条就是双计(和过程条耗时那次一模一样:同一段时间既进工具行又进
+    subagent 行,44m23s 反超 23m45s 的总墙钟)。少了第 1 条则是漏计。
+
+    这条钉的是第 2 条。它防的是一次很自然的「改进」:为了让父帧自包含,把子
+    帧的 usage 也并进父帧 —— 那正好把不变式打破。素材因此**刻意**把孙的
+    token 摆在几个顺手就会被读到的位置(正文、``additional_kwargs``、
+    ``response_metadata``),只有严格只认 ``usage_metadata`` 的实现才会绿。
+
+    第 1 条是前端属性,钉在
+    ``turn_summary.test.ts`` 的 "counts a nested worker and its parent once each"。
+    """
+    from orchestrator.tools._child_run import _usage_of
+
+    child_tokens = {"input_tokens": 3_000_000, "output_tokens": 300_000, "total_tokens": 3_300_000}
+    parent_messages = [
+        AIMessage(
+            content="先派个孙 worker",
+            usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110},
+        ),
+        # 孙 worker 的结果回到父这边的形态:一条工具消息。
+        ToolMessage(
+            content=f"worker 完成,用了 {child_tokens['total_tokens']} tokens",
+            tool_call_id="tc-child",
+            additional_kwargs={"usage": dict(child_tokens)},
+            response_metadata={"token_usage": dict(child_tokens)},
+        ),
+        AIMessage(
+            content="汇总",
+            usage_metadata={"input_tokens": 200, "output_tokens": 20, "total_tokens": 220},
+        ),
+    ]
+
+    usage = _usage_of(parent_messages)
+
+    assert usage is not None
+    # 父自己的两次调用:110 + 220。孙的 3_300_000 一分都不能进来。
+    assert usage["total_tokens"] == 330
+    assert usage["input_tokens"] == 300
+    assert usage["output_tokens"] == 30
