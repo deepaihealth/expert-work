@@ -196,12 +196,16 @@ jobs:
     # ("567 passed" printed, then "operation was canceled"). 40 buys
     # burst headroom and matches the unit job.
     #
-    # 2026-08-31 (X-8): the structural fix landed for the *official* images —
-    # every ``library/`` reference now pulls from
-    # ``public.ecr.aws/docker/library`` (guard: tools/ci/check_image_registry.py).
-    # ``pgvector/pgvector:pg16`` is the one Docker Hub pull left: it is not an
-    # official image and has no second public source, so keep the generous
-    # budget and ``continue-on-error`` until it too is mirrored.
+    # 2026-08-31 (X-8): official images moved to ``public.ecr.aws/docker/library``
+    # (guard: tools/ci/check_image_registry.py). 2026-09-07 correction: ECR
+    # Public throttles anonymous pulls per source IP too — five red runs that
+    # day, all ``toomanyrequests: Rate exceeded`` on nginx / mock-upstream /
+    # python base images, whenever 3-5 runs started within a few minutes.
+    # Docker Hub pulls still left: pgvector/pgvector, edoburu/pgbouncer,
+    # searxng/searxng. Mitigation below = pre-pull with backoff OUTSIDE the
+    # pytest clock (tools/ci/prepull_images.py) + fixtures with ``pull=False``
+    # so a locally cached image is not re-validated against a throttled
+    # registry. The structural fix is a self-hosted GHCR mirror (backlog).
     timeout-minutes: 40
     continue-on-error: true
     steps:
@@ -218,6 +222,14 @@ jobs:
 
       - name: Sync workspace
         run: uv sync --frozen
+
+      - name: Pre-pull images (backoff on registry throttling)
+        # Computes the image set (compose full+proxy profiles + Dockerfile
+        # FROMs the suite builds + docker-run constants) and pulls each with
+        # a 15/30/60/90/120s backoff. Never fails the job: whatever is still
+        # missing is left for the tests, whose failure message names the
+        # image (expert_work.testing.explain_compose_pull_failure).
+        run: uv run python tools/ci/prepull_images.py
 
       - name: Run pytest (integration)
         # --timeout: second gate behind the per-command docker timeouts in

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 
@@ -76,6 +76,7 @@ class InMemorySecretStore:
 def explain_compose_pull_failure(
     infra_dir: str | os.PathLike[str],
     *,
+    services: Sequence[str] = (),
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> str:
     """把 ``docker compose pull`` 的真实报错捞回来,给测试的失败信息用。
@@ -90,11 +91,15 @@ def explain_compose_pull_failure(
     所以这里带 ``capture_output`` 重跑同一条命令:要么复现出真报错,要么这次
     成功——后者本身就说明上一次是偶发/限流,同样是有用的信息。
 
+    ``services`` 要与 fixture 起的那几个一致:不传就是整份 compose,重跑会多拉
+    用不到的镜像 —— 2026-09-07 的一次诊断就因此自己又撞了一次限流,报出来的是
+    另一个镜像的错。
+
     ``runner`` 可注入,好让这个函数自己能被单测证明真的会把 stderr 吐出来。
     """
     try:
         probe = runner(
-            ["docker", "compose", "-f", "docker-compose.yml", "pull"],
+            ["docker", "compose", "-f", "docker-compose.yml", "pull", *services],
             cwd=str(infra_dir),
             capture_output=True,
             text=True,
