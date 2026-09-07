@@ -38,10 +38,19 @@ ARG VITE_OIDC_AUDIENCE=""
 # (config/env.ts readLangfuseBaseUrl → buildLangfuseTraceUrl). Empty =
 # the link stays hidden, same fallback shape as the OIDC trio.
 ARG VITE_LANGFUSE_BASE_URL=""
+# 「关于」弹窗的三个值(config/env.ts readBuildInfo):release.sh 经 build-push.sh
+# 传进来 —— 版本 = git 短 sha、环境 = 发版脚本自己的 env_name、构建时刻。
+# 空 = 本地 dev 构建,弹窗显示「本地开发」而不是装作线上。
+ARG VITE_APP_VERSION=""
+ARG VITE_APP_ENV=""
+ARG VITE_BUILD_TIME=""
 ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER} \
     VITE_OIDC_CLIENT_ID=${VITE_OIDC_CLIENT_ID} \
     VITE_OIDC_AUDIENCE=${VITE_OIDC_AUDIENCE} \
-    VITE_LANGFUSE_BASE_URL=${VITE_LANGFUSE_BASE_URL}
+    VITE_LANGFUSE_BASE_URL=${VITE_LANGFUSE_BASE_URL} \
+    VITE_APP_VERSION=${VITE_APP_VERSION} \
+    VITE_APP_ENV=${VITE_APP_ENV} \
+    VITE_BUILD_TIME=${VITE_BUILD_TIME}
 
 RUN pnpm build
 

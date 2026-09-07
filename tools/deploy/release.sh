@@ -205,7 +205,10 @@ if [[ ",${images}," == *",admin-ui,"* ]]; then
         --oidc-issuer "${OIDC_ISSUER}" \
         --oidc-client-id "${OIDC_CLIENT_ID}" \
         --oidc-audience "${OIDC_AUDIENCE}" \
-        --langfuse-base-url "${LANGFUSE_BASE_URL}"
+        --langfuse-base-url "${LANGFUSE_BASE_URL}" \
+        --app-version "${tag}" \
+        --app-env "${env_name}" \
+        --build-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 else
     run "${SCRIPT_DIR}/build-push.sh" --images "${images}" --tag "${tag}" --push
 fi

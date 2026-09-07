@@ -13,6 +13,7 @@ const zhCN: TranslationKeys = {
   common: {
     sign_in: "登录",
     sign_out: "退出登录",
+    about: "关于",
     refresh: "刷新",
     loading: "加载中…",
     cancel: "取消",
@@ -29,6 +30,16 @@ const zhCN: TranslationKeys = {
     copied: "已复制",
     tenant_switched_readonly: "已切入租户，只读视角——写操作请切回归属租户",
     cross_tenant_readonly: "全部租户视图为只读——写操作请切入具体租户",
+  },
+  about: {
+    title: "关于 Expert Work",
+    version: "版本",
+    environment: "环境",
+    env_test: "测试环境",
+    env_prod: "生产环境",
+    env_local: "本地开发",
+    last_updated: "最后更新",
+    unknown: "未知",
   },
   theme: {
     switch_to_light: "切换到浅色模式",

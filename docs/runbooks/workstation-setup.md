@@ -78,6 +78,7 @@ tools/deploy/release.sh test          # build → 钉 newTag → apply → rollo
 
 1. **每次必须 fresh tag**(脚本默认取 git short HEAD)。ACS 的镜像缓存按 tag 命中、不回源查 registry,重推同 tag 等于没发。
 2. **smoke 全绿 + canary PASS** 才算发成功;红了 `tools/deploy/rollback.sh test <上一版 tag>`。
+   发完打开界面右上角头像菜单 →「关于」,版本 / 环境 / 更新时间应与本次一致(值是发版时烤进镜像的)。
 3. **提交记录 PR**:脚本故意把 overlay 的 `newTag` 改动留在工作树不提交。开 PR,标题
    `chore(deploy): test newTag <新 tag>(一句话摘要)`,正文写:上一版 tag → 新 tag、
    本次带上去的 PR 列表、是否含迁移、smoke/canary 输出块。样板:#1396。

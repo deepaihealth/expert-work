@@ -31,7 +31,7 @@
 # Usage:
 #   tools/deploy/build-push.sh [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \
 #       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \
-#       [--langfuse-base-url <url>]
+#       [--langfuse-base-url <url>] [--app-version <sha>] [--app-env test|prod] [--build-time <iso8601>]
 #
 # Examples:
 #   tools/deploy/build-push.sh --no-push                  # build only, both images
@@ -64,12 +64,19 @@ oidc_audience="${VITE_OIDC_AUDIENCE:-}"
 # W2-PR3 — Langfuse UI origin for the debug console deep link; baked at
 # build time like the OIDC trio (env-specific image when set).
 langfuse_base_url="${VITE_LANGFUSE_BASE_URL:-}"
+# "About" dialog (admin-ui config/env.ts readBuildInfo): version = the image
+# tag (git short sha), env = release.sh's env_name, build time. Baked like the
+# OIDC trio; release.sh passes all three, a bare build-push leaves them empty
+# and the dialog says "local dev".
+app_version="${VITE_APP_VERSION:-}"
+app_env="${VITE_APP_ENV:-}"
+build_time="${VITE_BUILD_TIME:-}"
 
 usage() {
     cat >&2 <<EOF
 Usage: $0 [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \\
     [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \\
-    [--langfuse-base-url <url>]
+    [--langfuse-base-url <url>] [--app-version <sha>] [--app-env test|prod] [--build-time <iso8601>]
 
 Builds (and optionally pushes) expert-work images to Aliyun ACR.
 
@@ -82,6 +89,9 @@ Options:
   --oidc-client-id <id> admin-ui build arg VITE_OIDC_CLIENT_ID (default: \$VITE_OIDC_CLIENT_ID, else unset)
   --oidc-audience <aud> admin-ui build arg VITE_OIDC_AUDIENCE (default: \$VITE_OIDC_AUDIENCE, else unset)
   --langfuse-base-url <url> admin-ui build arg VITE_LANGFUSE_BASE_URL (default: \$VITE_LANGFUSE_BASE_URL, else unset)
+  --app-version <sha>   admin-ui build arg VITE_APP_VERSION — shown in the About dialog
+  --app-env <env>       admin-ui build arg VITE_APP_ENV (test|prod) — shown in the About dialog
+  --build-time <iso>    admin-ui build arg VITE_BUILD_TIME — shown in the About dialog
 
 Any --oidc-* / --langfuse-* value set makes the built admin-ui image
 environment-specific — see the admin-ui OIDC paragraph in this file's
@@ -120,6 +130,21 @@ while [[ $# -gt 0 ]]; do
         --langfuse-base-url)
             [[ $# -ge 2 && -n "$2" ]] || usage
             langfuse_base_url="$2"
+            shift 2
+            ;;
+        --app-version)
+            [[ $# -ge 2 && -n "$2" ]] || usage
+            app_version="$2"
+            shift 2
+            ;;
+        --app-env)
+            [[ $# -ge 2 && -n "$2" ]] || usage
+            app_env="$2"
+            shift 2
+            ;;
+        --build-time)
+            [[ $# -ge 2 && -n "$2" ]] || usage
+            build_time="$2"
             shift 2
             ;;
         --push)
@@ -205,6 +230,9 @@ for image in "${selected[@]}"; do
             [[ -n "${oidc_client_id}" ]] && admin_ui_build_args+=(--build-arg "VITE_OIDC_CLIENT_ID=${oidc_client_id}")
             [[ -n "${oidc_audience}" ]] && admin_ui_build_args+=(--build-arg "VITE_OIDC_AUDIENCE=${oidc_audience}")
             [[ -n "${langfuse_base_url}" ]] && admin_ui_build_args+=(--build-arg "VITE_LANGFUSE_BASE_URL=${langfuse_base_url}")
+            [[ -n "${app_version}" ]] && admin_ui_build_args+=(--build-arg "VITE_APP_VERSION=${app_version}")
+            [[ -n "${app_env}" ]] && admin_ui_build_args+=(--build-arg "VITE_APP_ENV=${app_env}")
+            [[ -n "${build_time}" ]] && admin_ui_build_args+=(--build-arg "VITE_BUILD_TIME=${build_time}")
             if [[ ${#admin_ui_build_args[@]} -gt 0 ]]; then
                 build_image "admin-ui" "${REPO_ROOT}/apps/admin-ui/Dockerfile" "${REPO_ROOT}/apps/admin-ui" \
                     "${admin_ui_build_args[@]}"
