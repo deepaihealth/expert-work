@@ -560,10 +560,20 @@ async def test_totals_bucket_keeps_legacy_null_provider_as_its_own_bucket(
     让消费者决定怎么兜底,而不是这里替它猜。"""
     tenant = uuid4()
     await _priced_usage(
-        store, tenant_id=tenant, trace_id="t", provider=None, model="m", agent_name="a", inp=1, out=1
+        store,
+        tenant_id=tenant,
+        trace_id="t",
+        provider=None,
+        model="m",
+        agent_name="a",
+        inp=1,
+        out=1,
     )
     await _priced_usage(
         store, tenant_id=tenant, trace_id="t", provider="p", model="m", agent_name="a", inp=2, out=2
     )
     buckets = (await store.totals_by_trace_ids(["t"]))["t"].by_model
-    assert [(b.provider, b.model, b.input_tokens) for b in buckets] == [(None, "m", 1), ("p", "m", 2)]
+    assert [(b.provider, b.model, b.input_tokens) for b in buckets] == [
+        (None, "m", 1),
+        ("p", "m", 2),
+    ]

@@ -99,8 +99,8 @@ Per-kind `data`:
   summaries: `{type: "ai", content_excerpt, tool_calls?: [{name,
   args_excerpt}]}` or `{type: "tool", name, tool_result_excerpt, …}`. All
   excerpts are truncated; they are a progress view, not the full transcript.
-- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`, and
-  `usage` (optional, see below).
+- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`,
+  `usage` and `usage_by_model` (both optional, see below).
 
 ### A worker's token usage
 
@@ -115,6 +115,35 @@ The `end` frame carries a `usage` block with the tokens that worker spent:
   "output_token_details": {"reasoning": 20000}
 }
 ```
+
+Next to it, `usage_by_model` splits the same account by the model that spent
+it — one entry per `(provider, model)`, each carrying `provider`, `model` and
+the same fields as `usage`. The entries sum to `usage`. A worker runs on one
+model, so today the list has one entry, but a worker's model is **not
+necessarily the parent's** (`dynamic_workers.model`), and `usage` alone does
+not say which rate applies:
+
+```json
+[
+  {
+    "provider": "zhipu",
+    "model": "glm-5.3",
+    "input_tokens": 3200000,
+    "output_tokens": 117974,
+    "total_tokens": 3317974,
+    "input_token_details": {"cache_read": 900000, "cache_creation": 7},
+    "output_token_details": {"reasoning": 20000}
+  }
+]
+```
+
+Price a run by summing each entry's tokens at that entry's own
+`(provider, model)` rate. When `usage_by_model` is absent (the worker's model
+was not known when the frame was built), fall back to pricing `usage` at the
+parent agent's rate — that is the pre-B-42 behaviour, and it is exact whenever
+the worker shares the parent's model. The run's persisted rollup
+(`tokens.usage_by_model` on the run / conversation records) carries the same
+split, computed from the `token_usage` rows instead of the frames.
 
 Three things to know when you add up a run's tokens:
 

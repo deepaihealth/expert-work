@@ -86,7 +86,11 @@ from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.persistence.token_usage_store import TokenTotals, TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    ModelTokenTotals,
+    TokenTotals,
+    TokenUsageStore,
+)
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import (
     AgentSpec,
@@ -2164,12 +2168,32 @@ _RUN_LIST_SECONDS = expert_work_histogram(
 )
 
 
+def _bucket_to_dict(bucket: ModelTokenTotals) -> dict[str, Any]:
+    """One ``usage_by_model`` entry — the ``tokens`` counters keyed by the
+    ``(provider, model)`` pair a rate card prices by (B-42)."""
+    return {
+        "provider": bucket.provider,
+        "model": bucket.model,
+        "input_tokens": bucket.input_tokens,
+        "output_tokens": bucket.output_tokens,
+        "cache_creation_tokens": bucket.cache_creation_tokens,
+        "cache_read_tokens": bucket.cache_read_tokens,
+        "total_tokens": bucket.total_tokens,
+        "llm_calls": bucket.llm_calls,
+    }
+
+
 def _tokens_to_dict(tokens: TokenTotals | None) -> dict[str, Any] | None:
     """Serialise a run's aggregated token usage (``None`` → no usage recorded).
 
     The Runs list + detail read this to show "what happened" without a
     Langfuse round-trip; the numbers come from expert_work's own ``token_usage``
     (G.9), joined to the run by ``trace_id``.
+
+    ``usage_by_model`` (B-42) is the same account split by ``(provider,
+    model)``: a worker on ``dynamic_workers.model`` shares the run's trace
+    with the main line, and only the split lets the console price each part
+    at its own rate. Bucket sums equal the top-level counters.
     """
     if tokens is None:
         return None
@@ -2181,6 +2205,7 @@ def _tokens_to_dict(tokens: TokenTotals | None) -> dict[str, Any] | None:
         "total_tokens": tokens.total_tokens,
         "llm_calls": tokens.llm_calls,
         "models": list(tokens.models),
+        "usage_by_model": [_bucket_to_dict(b) for b in tokens.by_model],
     }
 
 

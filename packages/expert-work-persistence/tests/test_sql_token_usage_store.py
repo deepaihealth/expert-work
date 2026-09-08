@@ -169,7 +169,12 @@ async def test_totals_by_trace_ids_buckets_by_provider_and_model(
             ("anthropic", "claude-sonnet-4-6", 2),
             ("zhipu", "glm-5.3", 1),
         ]
-        for field in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"):
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_tokens",
+            "cache_read_tokens",
+        ):
             assert sum(getattr(b, field) for b in totals.by_model) == getattr(totals, field), field
     finally:
         await engine.dispose()

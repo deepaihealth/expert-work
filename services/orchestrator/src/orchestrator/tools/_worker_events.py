@@ -78,6 +78,7 @@ def build_worker_end_frame(
     llm_call_count: int,
     wall_clock_ms: int,
     usage: Mapping[str, Any] | None = None,
+    usage_by_model: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Worker 终局帧。
 
@@ -86,6 +87,14 @@ def build_worker_end_frame(
     ``output_tokens`` / ``total_tokens`` / ``input_token_details`` /
     ``output_token_details``),消费者因此可以复用现成的解析,不必为
     worker 另写一套。
+
+    ``usage_by_model``(B-42)—— 同一笔账按 ``(provider, model)`` 分桶:
+    每桶 = ``{"provider", "model"}`` + 与 ``usage`` 同构的字段,桶的和等于
+    ``usage``。``usage`` 只说「烧了多少」不说「按谁的价」;worker 可以换
+    模型(``dynamic_workers.model``),父侧只知道主 Agent 的模型,没有这
+    张明细就只能整轮按主 Agent 的费率算 —— 线上 run f562fa69 里 95% 的
+    计价 token 来自 worker,全按错的价。分桶拿不到(模型未知)时同样
+    **不写这个键**,消费者退回按主 Agent 费率的老算法。
 
     没有它,父侧的每个消费者都只看得到主线消耗:前端 ``turn_summary.ts``
     第一行就是 ``if (evt.event !== "updates") continue;``,worker 事件整个
@@ -103,6 +112,8 @@ def build_worker_end_frame(
     }
     if usage is not None:
         data["usage"] = dict(usage)
+    if usage_by_model is not None:
+        data["usage_by_model"] = [dict(bucket) for bucket in usage_by_model]
     return _envelope(ident, kind="end", wseq=wseq, data=data)
 
 

@@ -42,6 +42,29 @@ _SET_AUDIT_READER_ROLE = text("SET LOCAL ROLE audit_reader")
 
 
 @dataclass(frozen=True)
+class ModelTokenTotals:
+    """One ``(provider, model)`` bucket of a trace's usage — B-42.
+
+    Same counters as :class:`TokenTotals`, keyed by the pair the rate card
+    prices by. ``provider`` is ``None`` for legacy rows (the column predates
+    Stream Y-3); a NULL provider is its own bucket, never merged into a named
+    one — the same model name can be priced differently by two providers.
+    """
+
+    provider: str | None
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    llm_calls: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
 class TokenTotals:
     """Aggregated token usage for one trace.
 
@@ -49,6 +72,13 @@ class TokenTotals:
     ``run_id`` column), so this is the per-run token summary the Runs
     list + detail render. ``llm_calls`` is the number of usage rows
     (≈ LLM calls); ``models`` is the distinct models the run touched.
+
+    ``by_model`` (B-42) splits the same rows by ``(provider, model)`` —
+    every counter here equals the sum of that counter across the buckets.
+    A run whose worker ran on a different model (``dynamic_workers.model``)
+    shares this trace with its main line; only the split lets a consumer
+    price each part at its own rate instead of the main model's.
+    Sorted by ``(provider, model)`` with a NULL provider first.
     """
 
     input_tokens: int = 0
@@ -57,10 +87,62 @@ class TokenTotals:
     cache_read_tokens: int = 0
     llm_calls: int = 0
     models: tuple[str, ...] = ()
+    by_model: tuple[ModelTokenTotals, ...] = ()
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+
+def _bucket_sort_key(bucket: ModelTokenTotals) -> tuple[int, str, str]:
+    # NULL provider sorts first (SQL NULLS FIRST has no in-memory twin, so
+    # both stores sort in Python with this one key).
+    return (0 if bucket.provider is None else 1, bucket.provider or "", bucket.model)
+
+
+def merge_model_buckets(totals: Sequence[TokenTotals]) -> tuple[ModelTokenTotals, ...]:
+    """Merge several traces' ``by_model`` buckets (a thread's runs) into one
+    list — same ``(provider, model)`` folds together, sorted like a single
+    trace's. Only the buckets are merged; callers keep summing the top-level
+    counters themselves (a :class:`TokenTotals` built without buckets would
+    otherwise lose its counters here)."""
+    merged: dict[tuple[str | None, str], ModelTokenTotals] = {}
+    for t in totals:
+        for b in t.by_model:
+            key = (b.provider, b.model)
+            prev = merged.get(key)
+            merged[key] = (
+                b
+                if prev is None
+                else replace(
+                    prev,
+                    input_tokens=prev.input_tokens + b.input_tokens,
+                    output_tokens=prev.output_tokens + b.output_tokens,
+                    cache_creation_tokens=prev.cache_creation_tokens + b.cache_creation_tokens,
+                    cache_read_tokens=prev.cache_read_tokens + b.cache_read_tokens,
+                    llm_calls=prev.llm_calls + b.llm_calls,
+                )
+            )
+    return tuple(sorted(merged.values(), key=_bucket_sort_key))
+
+
+def _totals_from_buckets(buckets: Sequence[ModelTokenTotals]) -> TokenTotals:
+    """Fold a trace's ``(provider, model)`` buckets into its :class:`TokenTotals`.
+
+    Both stores aggregate per bucket and fold here, so "the counters equal
+    the sum of the buckets" holds by construction rather than by two
+    parallel aggregations agreeing.
+    """
+    ordered = tuple(sorted(buckets, key=_bucket_sort_key))
+    return TokenTotals(
+        input_tokens=sum(b.input_tokens for b in ordered),
+        output_tokens=sum(b.output_tokens for b in ordered),
+        cache_creation_tokens=sum(b.cache_creation_tokens for b in ordered),
+        cache_read_tokens=sum(b.cache_read_tokens for b in ordered),
+        llm_calls=sum(b.llm_calls for b in ordered),
+        models=tuple(sorted({b.model for b in ordered if b.model})),
+        by_model=ordered,
+    )
 
 
 @dataclass(frozen=True)
@@ -256,33 +338,26 @@ class InMemoryTokenUsageStore(TokenUsageStore):
 
     async def totals_by_trace_ids(self, trace_ids: Sequence[str]) -> dict[str, TokenTotals]:
         wanted = {t for t in trace_ids if t}
-        inputs: dict[str, int] = {}
-        outputs: dict[str, int] = {}
-        cache_create: dict[str, int] = {}
-        cache_read: dict[str, int] = {}
-        calls: dict[str, int] = {}
-        models: dict[str, set[str]] = {}
+        # (trace_id, provider, model) → running bucket; folded per trace below.
+        buckets: dict[tuple[str, str | None, str], ModelTokenTotals] = {}
         for r in self._rows:
             tid = r.trace_id
             if tid is None or tid not in wanted:
                 continue
-            inputs[tid] = inputs.get(tid, 0) + r.input_tokens
-            outputs[tid] = outputs.get(tid, 0) + r.output_tokens
-            cache_create[tid] = cache_create.get(tid, 0) + r.cache_creation_tokens
-            cache_read[tid] = cache_read.get(tid, 0) + r.cache_read_tokens
-            calls[tid] = calls.get(tid, 0) + 1
-            models.setdefault(tid, set()).add(r.model)
-        return {
-            tid: TokenTotals(
-                input_tokens=inputs[tid],
-                output_tokens=outputs[tid],
-                cache_creation_tokens=cache_create[tid],
-                cache_read_tokens=cache_read[tid],
-                llm_calls=calls[tid],
-                models=tuple(sorted(m for m in models[tid] if m)),
+            key = (tid, r.provider, r.model)
+            prev = buckets.get(key) or ModelTokenTotals(provider=r.provider, model=r.model)
+            buckets[key] = replace(
+                prev,
+                input_tokens=prev.input_tokens + r.input_tokens,
+                output_tokens=prev.output_tokens + r.output_tokens,
+                cache_creation_tokens=prev.cache_creation_tokens + r.cache_creation_tokens,
+                cache_read_tokens=prev.cache_read_tokens + r.cache_read_tokens,
+                llm_calls=prev.llm_calls + 1,
             )
-            for tid in calls
-        }
+        per_trace: dict[str, list[ModelTokenTotals]] = {}
+        for (tid, _provider, _model), bucket in buckets.items():
+            per_trace.setdefault(tid, []).append(bucket)
+        return {tid: _totals_from_buckets(bs) for tid, bs in per_trace.items()}
 
     async def totals_by_users(
         self,
@@ -483,36 +558,44 @@ class DbTokenUsageStore(TokenUsageStore):
         ids = [t for t in dict.fromkeys(trace_ids) if t]  # dedup, drop empty
         if not ids:
             return {}
+        # B-42 — one aggregate row per (trace, provider, model); the per-trace
+        # totals are folded from those buckets in Python (``_totals_from_buckets``)
+        # so the counters equal the bucket sums by construction.
         stmt = (
             select(
                 TokenUsageRow.trace_id,
+                TokenUsageRow.provider,
+                TokenUsageRow.model,
                 func.coalesce(func.sum(TokenUsageRow.input_tokens), 0),
                 func.coalesce(func.sum(TokenUsageRow.output_tokens), 0),
                 func.coalesce(func.sum(TokenUsageRow.cache_creation_tokens), 0),
                 func.coalesce(func.sum(TokenUsageRow.cache_read_tokens), 0),
                 func.count(),
-                func.array_agg(func.distinct(TokenUsageRow.model)),
             )
             # Tenant scoping rides on RLS (the sessionmaker sets the tenant GUC),
             # so ``trace_id`` collisions across tenants can't leak — a foreign
             # tenant's rows are invisible to this session.
             .where(TokenUsageRow.trace_id.in_(ids))
-            .group_by(TokenUsageRow.trace_id)
+            .group_by(TokenUsageRow.trace_id, TokenUsageRow.provider, TokenUsageRow.model)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
-        return {
-            row[0]: TokenTotals(
-                input_tokens=int(row[1]),
-                output_tokens=int(row[2]),
-                cache_creation_tokens=int(row[3]),
-                cache_read_tokens=int(row[4]),
-                llm_calls=int(row[5]),
-                models=tuple(sorted(m for m in (row[6] or []) if m)),
+        per_trace: dict[str, list[ModelTokenTotals]] = {}
+        for row in rows:
+            if row[0] is None:
+                continue
+            per_trace.setdefault(row[0], []).append(
+                ModelTokenTotals(
+                    provider=row[1],
+                    model=row[2],
+                    input_tokens=int(row[3]),
+                    output_tokens=int(row[4]),
+                    cache_creation_tokens=int(row[5]),
+                    cache_read_tokens=int(row[6]),
+                    llm_calls=int(row[7]),
+                )
             )
-            for row in rows
-            if row[0] is not None
-        }
+        return {tid: _totals_from_buckets(bs) for tid, bs in per_trace.items()}
 
     async def totals_by_users(
         self,

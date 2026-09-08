@@ -298,6 +298,7 @@ async def run_child_to_result(
             metadata=trajectory_metadata,
         )
         if sink is not None:
+            partial_usage = _usage_of(partial_msgs)
             await _emit_worker_frame(
                 sink,
                 build_worker_end_frame(
@@ -307,7 +308,8 @@ async def run_child_to_result(
                     iteration_used=partial_steps,
                     llm_call_count=sum(1 for m in partial_msgs if isinstance(m, AIMessage)),
                     wall_clock_ms=int((time.monotonic() - start_monotonic) * 1000),
-                    usage=_usage_of(partial_msgs),
+                    usage=partial_usage,
+                    usage_by_model=_usage_by_model_of(child, partial_usage),
                 ),
             )
         raise
@@ -336,6 +338,7 @@ async def run_child_to_result(
         outcome = "failed"
 
     if sink is not None:
+        usage = _usage_of(messages)
         await _emit_worker_frame(
             sink,
             build_worker_end_frame(
@@ -351,7 +354,8 @@ async def run_child_to_result(
                 iteration_used=step_count,
                 llm_call_count=llm_call_count,
                 wall_clock_ms=wall_clock_ms,
-                usage=_usage_of(messages),
+                usage=usage,
+                usage_by_model=_usage_by_model_of(child, usage),
             ),
         )
 
@@ -553,6 +557,27 @@ def _usage_of(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
         "input_token_details": {"cache_read": cache_read, "cache_creation": cache_creation},
         "output_token_details": {"reasoning": reasoning},
     }
+
+
+def _usage_by_model_of(
+    child: BuiltAgent, usage: Mapping[str, Any] | None
+) -> list[dict[str, Any]] | None:
+    """B-42 —— 把 ``usage`` 记在 worker **自己**的 ``(provider, model)`` 名下。
+
+    父侧只知道主 Agent 的模型,而 ``dynamic_workers.model`` 可以给 worker
+    换模型;不带模型名回传,前端只能整轮按主 Agent 的费率计价 —— 错价
+    (run f562fa69 里 95% 的计价 token 来自 worker)。
+
+    一个 worker 一个模型,所以这里恒是单桶;形状仍是「桶列表」,与
+    ``token_usage`` 汇总接口的 ``usage_by_model`` 同构,消费者一套解析
+    走两处。桶记的是**配置里的**模型名,与 ``token_usage`` 记账同口径
+    (备用模型接管的调用也记在主模型名下 —— 计费就是这么记的,这里不另起
+    一套)。``usage`` 为 ``None`` 或子代模型未知 → ``None``(键缺席),
+    消费者退回老算法;绝不编一个空桶列表让「未知」变成「零成本」。
+    """
+    if usage is None or child.model_provider is None or child.model_name is None:
+        return None
+    return [{"provider": child.model_provider, "model": child.model_name, **usage}]
 
 
 async def _fetch_partial(

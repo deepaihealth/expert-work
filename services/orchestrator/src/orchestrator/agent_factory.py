@@ -1186,6 +1186,10 @@ async def build_agent(
         # platform hard cap by ``AgentRuntime.new_worker_spawn_budget``.
         worker_max_concurrent=spec.spec.dynamic_workers.max_concurrent,
         worker_max_per_run=spec.spec.dynamic_workers.max_per_run,
+        # B-42 — the pair a child run stamps onto its end frame's
+        # ``usage_by_model`` (same source as the token_usage middleware).
+        model_provider=spec.spec.model.provider,
+        model_name=spec.spec.model.name,
     )
 
 

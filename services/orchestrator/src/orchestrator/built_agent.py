@@ -101,3 +101,13 @@ class BuiltAgent:
     #: platform hard cap. ``None`` = manifest didn't ask → platform default.
     worker_max_concurrent: int | None = None
     worker_max_per_run: int | None = None
+    #: B-42 — the build's configured ``(provider, model)`` (``spec.model``),
+    #: the same pair the token-usage middleware bakes into every
+    #: ``token_usage`` row. A child run stamps its own pair onto its end
+    #: frame's ``usage_by_model`` so the parent side can price a worker's
+    #: tokens at the *worker's* rate — ``dynamic_workers.model`` may differ
+    #: from the parent's, and the parent otherwise only knows its own.
+    #: ``None`` (test stubs / legacy construction) → the frame omits the
+    #: bucket list and consumers fall back to the parent's rate.
+    model_provider: str | None = None
+    model_name: str | None = None
